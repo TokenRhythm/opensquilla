@@ -26,6 +26,7 @@ from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from opensquilla import __version__
+from opensquilla.agents.limits import MAX_SPAWN_DEPTH
 from opensquilla.application.config_secrets import (
     _PUBLIC_SECRET_EXACT_KEYS as _PUBLIC_SECRET_EXACT_KEYS,
 )
@@ -40,6 +41,10 @@ from opensquilla.application.config_secrets import (
 )
 from opensquilla.application.config_secrets import (
     redact_public_config as redact_public_config,
+)
+from opensquilla.engine.subagent_failure_fallback import (
+    DEFAULT_SUBAGENT_FAILURE_FALLBACK_THRESHOLD,
+    DEFAULT_SUBAGENT_MAX_ITERATIONS,
 )
 from opensquilla.gateway.config_migration import (
     LATEST_CONFIG_VERSION,
@@ -126,10 +131,7 @@ class AuthConfig(BaseSettings):
             ipaddress.IPv4Network(value)
             for value in ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
         )
-        private_v6 = tuple(
-            ipaddress.IPv6Network(value)
-            for value in ("::1/128", "fc00::/7")
-        )
+        private_v6 = tuple(ipaddress.IPv6Network(value) for value in ("::1/128", "fc00::/7"))
         normalized: list[str] = []
         for raw in values:
             network = ipaddress.ip_network(str(raw).strip(), strict=False)
@@ -347,7 +349,8 @@ class PermissionsConfig(BaseModel):
 class TaskRuntimeConfig(BaseModel):
     """Server-side task-runtime queue settings."""
 
-    max_concurrency: int = Field(default=8, ge=1)
+    max_concurrency: int = Field(default=16, ge=1)
+    parent_max_concurrency: int = Field(default=8, ge=1)
     max_pending_per_session: int = Field(default=64, ge=1)
     # Per-channel-adapter in-flight semaphore (separate from
     # task_runtime._global_sem). Configured here so OPENSQUILLA_CHANNEL_INFLIGHT_CAP
@@ -388,9 +391,7 @@ class TaskRuntimeConfig(BaseModel):
             PendingOverflowPolicy(value)
         except ValueError as exc:
             valid = ", ".join(member.value for member in PendingOverflowPolicy)
-            raise ValueError(
-                f"pending_overflow_policy must be one of {{{valid}}}"
-            ) from exc
+            raise ValueError(f"pending_overflow_policy must be one of {{{valid}}}") from exc
         return value
 
     @field_validator("pending_overflow_policy_per_channel")
@@ -404,8 +405,7 @@ class TaskRuntimeConfig(BaseModel):
                 PendingOverflowPolicy(policy)
             except ValueError as exc:
                 raise ValueError(
-                    f"pending_overflow_policy_per_channel[{channel!r}] "
-                    f"must be one of {{{valid}}}"
+                    f"pending_overflow_policy_per_channel[{channel!r}] must be one of {{{valid}}}"
                 ) from exc
         return value
 
@@ -436,6 +436,7 @@ class LlmProviderConfig(BaseSettings):
     # reporting for models the catalog does not know (e.g. direct DashScope
     # model ids that never appear in the OpenRouter catalog fetch).
     context_window_tokens: int = 0
+    seed: int | None = None
     temperature: float | None = None
     top_p: float | None = None
     # Optional global thinking level: off|minimal|low|medium|high|xhigh|adaptive.
@@ -664,9 +665,8 @@ class LlmEnsembleConfig(BaseSettings):
                 "llm_ensemble.min_successful_proposers cannot exceed the "
                 f"custom_b5 proposer count ({len(proposers)})"
             )
-        if (
-            self.target_successful_proposers is not None
-            and self.target_successful_proposers > len(proposers)
+        if self.target_successful_proposers is not None and self.target_successful_proposers > len(
+            proposers
         ):
             raise ValueError(
                 "llm_ensemble.target_successful_proposers cannot exceed the "
@@ -1054,9 +1054,7 @@ class MemoryConfig(BaseSettings):
 
     # Flush (pre-compaction memory save)
     flush_enabled: bool = False
-    flush_triggers: list[FlushTrigger] = Field(
-        default_factory=lambda: list(DEFAULT_FLUSH_TRIGGERS)
-    )
+    flush_triggers: list[FlushTrigger] = Field(default_factory=lambda: list(DEFAULT_FLUSH_TRIGGERS))
     flush_pre_compaction: bool = False
     flush_timeout_seconds: float = 15.0
     flush_background_timeout_seconds: float = 120.0
@@ -1351,9 +1349,7 @@ class SquillaRouterConfig(BaseSettings):
             "upgrade_to_c3_compaction_enabled" not in values
             and "upgrade_to_t3_compaction_enabled" in values
         ):
-            values["upgrade_to_c3_compaction_enabled"] = values[
-                "upgrade_to_t3_compaction_enabled"
-            ]
+            values["upgrade_to_c3_compaction_enabled"] = values["upgrade_to_t3_compaction_enabled"]
         if "default_tier" in values:
             values["default_tier"] = normalize_text_tier(values.get("default_tier")) or values.get(
                 "default_tier"
@@ -1441,6 +1437,10 @@ class CompactionLlmConfig(BaseSettings):
     # cancellation races with commit completion.
     total_timeout_seconds: float = Field(default=120.0, gt=0.0)
     heartbeat_interval_seconds: float = Field(default=15.0, gt=0.0)
+    # Bound the retained summary independently from the parent request's
+    # provider-visible max_tokens. Exact suffix compaction preserves that
+    # parent field and enforces this budget locally.
+    max_output_tokens: int = Field(default=1024, ge=1)
     enabled: bool = True
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
     protected_recent_messages: int = Field(default=0, ge=0)
@@ -1472,9 +1472,7 @@ def validate_compaction_deployment_write(payload: dict[str, Any]) -> None:
     provider = str(compaction.get("provider") or "").strip()
     model = str(compaction.get("model") or "").strip()
     if provider and not model:
-        raise ValueError(
-            "compaction.provider requires compaction.model when saving config"
-        )
+        raise ValueError("compaction.provider requires compaction.model when saving config")
 
 
 class SessionNamingConfig(BaseSettings):
@@ -1636,9 +1634,7 @@ class AudioElevenLabsProviderConfig(BaseModel):
 
 
 class AudioProvidersConfig(BaseModel):
-    elevenlabs: AudioElevenLabsProviderConfig = Field(
-        default_factory=AudioElevenLabsProviderConfig
-    )
+    elevenlabs: AudioElevenLabsProviderConfig = Field(default_factory=AudioElevenLabsProviderConfig)
 
 
 class AudioTTSConfig(BaseModel):
@@ -1693,15 +1689,14 @@ class ConfiguredChannelEntry(BaseModel):
             value = value.split(",")
         if not isinstance(value, list | tuple | set | frozenset):
             return value
-        return list(
-            dict.fromkeys(str(item).strip() for item in value if str(item).strip())
-        )
+        return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
 
     @model_validator(mode="after")
     def _validate_dm_access(self) -> ConfiguredChannelEntry:
         if self.dm_access == "allowlist" and not self.allowed_senders:
             raise ValueError("dm_access=allowlist requires allowed_senders")
         return self
+
     # Group conversations are isolated by sender by default. Deployments that
     # intentionally want one transcript shared by the whole room can opt in.
     group_session_scope: Literal["per_sender", "shared_room"] = "per_sender"
@@ -1766,9 +1761,7 @@ class FeishuChannelEntry(ConfiguredChannelEntry):
             and not self.verification_token.strip()
             and not self.encrypt_key.strip()
         ):
-            raise ValueError(
-                "feishu webhook channels require verification_token or encrypt_key"
-            )
+            raise ValueError("feishu webhook channels require verification_token or encrypt_key")
         return self
 
 
@@ -1819,9 +1812,7 @@ class WeComChannelEntry(ConfiguredChannelEntry):
     def validate_wecom_mode(self) -> WeComChannelEntry:
         if self.connection_mode == "websocket":
             missing = [
-                field
-                for field in ("bot_id", "bot_secret")
-                if not str(getattr(self, field)).strip()
+                field for field in ("bot_id", "bot_secret") if not str(getattr(self, field)).strip()
             ]
             if missing:
                 raise ValueError(
@@ -1903,9 +1894,7 @@ class TelegramChannelEntry(ConfiguredChannelEntry):
             if not self.webhook_url:
                 raise ValueError("webhook_url is required for telegram webhook mode")
             if not self.webhook_secret_token:
-                raise ValueError(
-                    "webhook_secret_token is required for telegram webhook mode"
-                )
+                raise ValueError("webhook_secret_token is required for telegram webhook mode")
         return self
 
 
@@ -1940,10 +1929,6 @@ class AgentSubagentDefaults(BaseModel):
     current behavior". Only ``cascade_on_parent_kill`` has a non-None default
     because killing children is the safer behavior when in doubt.
     """
-
-    model: str | None = None
-    """Default LLM model for subagents spawned under this agent. ``None`` →
-    fall back to caller's model (current behavior)."""
 
     max_children_per_session: int | None = None
     """Max active children one parent session can hold. ``None`` → no
@@ -2035,23 +2020,77 @@ class AgentDefaults(BaseModel):
     subagents: AgentSubagentDefaults | None = None
 
 
+class SubagentIterationBudgetTierConfig(BaseModel):
+    """Soft warning and hard tool cutoff for one effort tier."""
+
+    soft: int = Field(ge=1)
+    hard: int = Field(ge=2)
+
+    @model_validator(mode="after")
+    def _soft_precedes_hard(self) -> SubagentIterationBudgetTierConfig:
+        if self.soft >= self.hard:
+            raise ValueError("soft iteration limit must be below hard iteration limit")
+        return self
+
+
+class SubagentIterationBudgetConfig(BaseModel):
+    """Iteration budgets selected from the existing child model route."""
+
+    mode: Literal["router"] = "router"
+    fallback_tier: Literal["small", "medium", "large"] = "medium"
+    small: SubagentIterationBudgetTierConfig = Field(
+        default_factory=lambda: SubagentIterationBudgetTierConfig(soft=6, hard=10)
+    )
+    medium: SubagentIterationBudgetTierConfig = Field(
+        default_factory=lambda: SubagentIterationBudgetTierConfig(soft=12, hard=20)
+    )
+    large: SubagentIterationBudgetTierConfig = Field(
+        default_factory=lambda: SubagentIterationBudgetTierConfig(soft=24, hard=36)
+    )
+
+
 class SubagentsGatewayConfig(BaseModel):
     """Gateway-level subagent governance knobs."""
 
+    max_spawn_depth: int = Field(default=MAX_SPAWN_DEPTH, ge=1)
+    """Maximum recursive subagent depth. Main sessions are depth 0."""
+
+    max_task_attempts: int = Field(default=3, ge=1)
+    """Maximum execution instances for one semantic delegated task."""
+
+    delegation_policy: Literal["off", "aggressive"] = "aggressive"
+    """Parent-side delegation policy. ``aggressive`` asks agents to consider
+    delegation when work is worth splitting; ``off`` removes that prompt."""
+
     enforce_disabled_agents: bool = False
-    """When True, ``sessions_spawn`` rejects requests targeting an agent whose
+    """When True, delegated work rejects an agent profile whose
     ``enabled=False``. Default off so existing deployments are unaffected."""
 
     subagent_reserved_slots: int = Field(default=2, ge=0)
-    """Number of slots in ``task_runtime.max_concurrency`` reserved for
-    non-subagent tasks so a fan-out parent never starves itself."""
+    """Legacy shared-pool reservation retained for config compatibility.
+    Gateway TaskRuntime now uses ``task_runtime.parent_max_concurrency`` and
+    lets children borrow otherwise-idle parent capacity."""
 
     archive_after_minutes: int = Field(default=60, ge=0)
     """Minutes after a subagent session goes terminal before its transcript
     is archived. ``0`` disables auto-archive."""
 
-    prompt_compact: bool = False
-    """When enabled, subagent bootstrap prompts keep only AGENTS.md and TOOLS.md."""
+    prompt_compact: bool = True
+    """Keep subagent bootstrap prompts to AGENTS.md and TOOLS.md by default."""
+
+    failure_fallback_threshold: int = Field(
+        default=DEFAULT_SUBAGENT_FAILURE_FALLBACK_THRESHOLD,
+        ge=1,
+    )
+    """Consecutive failed tool rounds before a subagent returns failure."""
+
+    max_iterations: int = Field(default=DEFAULT_SUBAGENT_MAX_ITERATIONS, ge=1)
+    """Legacy fallback cap for child turns without router budget metadata."""
+
+    iteration_budget: SubagentIterationBudgetConfig = Field(
+        default_factory=SubagentIterationBudgetConfig
+    )
+    """Router-selected soft and hard child iteration budgets."""
 
 
 class MetaSkillPersistenceConfig(BaseSettings):
@@ -2286,8 +2325,7 @@ class ModelOverrideConfig(BaseModel):
         if normalized not in KNOWN_REASONING_FORMATS:
             allowed = ", ".join(sorted(KNOWN_REASONING_FORMATS))
             raise ValueError(
-                f"reasoning_format {value!r} is not a known dialect; "
-                f"expected one of {allowed}"
+                f"reasoning_format {value!r} is not a known dialect; expected one of {allowed}"
             )
         return normalized
 
@@ -2504,33 +2542,23 @@ class GatewayConfig(BaseSettings):
         }
         if "provider" not in fields_set:
             profile = str(getattr(self.squilla_router, "tier_profile", "") or "")
-            router_fields_set = set(
-                getattr(self.squilla_router, "model_fields_set", set())
-            )
-            legacy_intent = bool(
-                {"model", "base_url", "api_key", "api_key_env"} & fields_set
-            ) or (
+            router_fields_set = set(getattr(self.squilla_router, "model_fields_set", set()))
+            legacy_intent = bool({"model", "base_url", "api_key", "api_key_env"} & fields_set) or (
                 "tier_profile" in router_fields_set
                 and profile.strip().lower() == LEGACY_DEFAULT_LLM_PROVIDER
             )
             credential_hints = {
                 hint
                 for hint in (
-                    credential_provider_hint(
-                        llm.api_key if "api_key" in fields_set else ""
-                    ),
+                    credential_provider_hint(llm.api_key if "api_key" in fields_set else ""),
                     credential_provider_hint(
                         "",
-                        api_key_env=(
-                            llm.api_key_env if "api_key_env" in fields_set else ""
-                        ),
+                        api_key_env=(llm.api_key_env if "api_key_env" in fields_set else ""),
                     ),
                 )
                 if hint
             }
-            origin_hint = endpoint_provider_hint(
-                llm.base_url if "base_url" in fields_set else ""
-            )
+            origin_hint = endpoint_provider_hint(llm.base_url if "base_url" in fields_set else "")
             explicit_profile_hint = (
                 LEGACY_DEFAULT_LLM_PROVIDER
                 if "tier_profile" in router_fields_set
@@ -2583,16 +2611,13 @@ class GatewayConfig(BaseSettings):
                 }
             elif legacy_intent or (env_openrouter and not env_tokenrhythm):
                 provider = LEGACY_DEFAULT_LLM_PROVIDER
-                explicit_openrouter = (
-                    strong_hints == {LEGACY_DEFAULT_LLM_PROVIDER}
-                    or (env_openrouter and not env_tokenrhythm and not legacy_intent)
+                explicit_openrouter = strong_hints == {LEGACY_DEFAULT_LLM_PROVIDER} or (
+                    env_openrouter and not env_tokenrhythm and not legacy_intent
                 )
                 resolution = {
                     "status": "legacy_inferred",
                     "effective_provider": provider,
-                    "source": (
-                        "strong_evidence" if explicit_openrouter else "legacy_compat"
-                    ),
+                    "source": ("strong_evidence" if explicit_openrouter else "legacy_compat"),
                     "reason_code": (
                         "providerless_openrouter_evidence"
                         if explicit_openrouter
@@ -2781,9 +2806,7 @@ class GatewayConfig(BaseSettings):
     search_provider: str = "duckduckgo"
     search_api_key: str = ""
     search_api_key_env: str = ""
-    search_max_results: int = Field(
-        default=DEFAULT_SEARCH_MAX_RESULTS, ge=1, le=MAX_SEARCH_RESULTS
-    )
+    search_max_results: int = Field(default=DEFAULT_SEARCH_MAX_RESULTS, ge=1, le=MAX_SEARCH_RESULTS)
     search_proxy: str = ""
     search_use_env_proxy: bool = False
     search_fallback_policy: Literal["off", "network"] = "off"
@@ -2852,6 +2875,36 @@ class GatewayConfig(BaseSettings):
                     )
                 else:
                     self.task_runtime.max_concurrency = task_val
+
+        parent_env = os.environ.get("OPENSQUILLA_TASK_PARENT_MAX_CONCURRENCY")
+        if parent_env is not None:
+            try:
+                parent_val = int(parent_env)
+            except (ValueError, TypeError):
+                _log.warning(
+                    "OPENSQUILLA_TASK_PARENT_MAX_CONCURRENCY=%r is not a valid integer; "
+                    "falling back to parent_max_concurrency=%d",
+                    parent_env,
+                    self.task_runtime.parent_max_concurrency,
+                )
+            else:
+                if parent_val < 1:
+                    _log.warning(
+                        "OPENSQUILLA_TASK_PARENT_MAX_CONCURRENCY=%r is below minimum 1; "
+                        "falling back to parent_max_concurrency=%d",
+                        parent_env,
+                        self.task_runtime.parent_max_concurrency,
+                    )
+                else:
+                    self.task_runtime.parent_max_concurrency = parent_val
+
+        if self.task_runtime.parent_max_concurrency > self.task_runtime.max_concurrency:
+            _log.warning(
+                "parent_max_concurrency=%d exceeds max_concurrency=%d; clamping parent limit",
+                self.task_runtime.parent_max_concurrency,
+                self.task_runtime.max_concurrency,
+            )
+            self.task_runtime.parent_max_concurrency = self.task_runtime.max_concurrency
 
         channel_env = os.environ.get("OPENSQUILLA_CHANNEL_INFLIGHT_CAP")
         if channel_env is not None:
@@ -2938,6 +2991,7 @@ class GatewayConfig(BaseSettings):
             "capture_roll_max_chars": str(self.memory.capture_roll_max_chars),
             "dream_enabled": str(self.memory.dream.enabled).lower(),
         }
+
     _runtime_secret_paths: set[str] = PrivateAttr(default_factory=set)
     # Paths whose secret value was explicitly entered by the operator (set by
     # ``clear_runtime_secret``): value-coincidence redaction heuristics in
@@ -3342,9 +3396,7 @@ class GatewayConfig(BaseSettings):
 
         cfg = cls()
         default_config_path = (
-            candidates[0]
-            if candidates
-            else default_opensquilla_home().expanduser() / "config.toml"
+            candidates[0] if candidates else default_opensquilla_home().expanduser() / "config.toml"
         )
         cls._apply_profile_path_overrides(cfg, default_config_path)
         cfg._mark_env_absorbed_secrets(None)
@@ -3395,6 +3447,7 @@ def _rewrite_migrated_config_best_effort(path: Path, migration: Any) -> None:
             path,
             error,
         )
+
 
 # Wildcard addresses that expose the gateway on every interface. Used by the
 # boot banner and the install-script post-install message.

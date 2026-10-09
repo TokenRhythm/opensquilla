@@ -112,6 +112,9 @@ class CompactionExecutionTarget:
         repr=False,
         compare=False,
     )
+    # Zero preserves the historical behavior: the visible summary inherits the
+    # provider's total generation budget unless a caller separates the two.
+    max_summary_tokens: int = 0
 
     def __post_init__(self) -> None:
         if not callable(getattr(self.provider, "chat", None)):
@@ -122,6 +125,8 @@ class CompactionExecutionTarget:
             raise ValueError("context_window_tokens must be non-negative")
         if self.max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
+        if self.max_summary_tokens < 0:
+            raise ValueError("max_summary_tokens must be non-negative")
         if self.provider_request_max_chars < 0:
             raise ValueError("provider_request_max_chars must be non-negative")
         if not self.deployment_fingerprint:
@@ -130,6 +135,12 @@ class CompactionExecutionTarget:
                 "deployment_fingerprint",
                 _default_deployment_fingerprint(self.provider_id, self.model),
             )
+
+    @property
+    def visible_summary_token_budget(self) -> int:
+        """Maximum retained summary tokens, excluding private reasoning."""
+
+        return self.max_summary_tokens or self.max_output_tokens
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,7 +235,6 @@ def _resolved_target_budgets(
     )
     requested_output = max(1, int(max_output_tokens or 0))
     resolved_output = min(
-        DEFAULT_COMPACTION_OUTPUT_TOKENS,
         requested_output,
         catalog_output if catalog_output > 0 else requested_output,
         resolved_window,
@@ -260,6 +270,7 @@ def build_compaction_llm_plan_from_provider_config(
     deployment_fingerprint: str = "",
     portable: bool = True,
     source: str = "provider_config",
+    replay_provider_state: bool = False,
 ) -> CompactionExecutionPlan:
     """Build an isolated auxiliary provider from a complete deployment config."""
 
@@ -280,9 +291,10 @@ def build_compaction_llm_plan_from_provider_config(
         config,
         model=model,
         provider_routing=dict(config.provider_routing),
-        # A summary request contains freshly serialized portable messages.
-        # Provider-private state from the consumer turn must never be replayed.
-        replay_provider_state=False,
+        # Portable prefix compaction starts from freshly serialized messages.
+        # Exact suffix compaction instead opts in so its parent request remains
+        # byte-for-byte replayable through the provider adapter.
+        replay_provider_state=replay_provider_state,
     )
     provider = build_provider_from_config(isolated)
     return CompactionExecutionPlan(
@@ -394,6 +406,7 @@ def resolve_compaction_execution_plan(
     session_key: str = "",
     credential_pool_acquirer: CredentialPoolAcquirer | None = None,
     credential_pool_failure_reporter: Callable[[str, str, Any], None] | None = None,
+    active_only: bool = False,
 ) -> CompactionExecutionPlan | None:
     """Freeze the ordered physical targets for one compaction operation.
 
@@ -462,6 +475,21 @@ def resolve_compaction_execution_plan(
                 source=identity.source,
                 credential_pool=resolution_metadata.get("credential_pool"),
             )
+
+    if active_only:
+        add_config(active_provider_config, source="active_deployment")
+        if candidates:
+            return CompactionExecutionPlan(
+                candidates=(candidates[0],),
+                max_calls=1,
+            )
+        fallback_plan = build_compaction_execution_plan_from_provider(
+            active_provider,
+            context_window_tokens=context_window_tokens,
+            max_calls=1,
+            source="active_deployment",
+        )
+        return fallback_plan
 
     explicit_provider = str(
         getattr(compaction_config, "provider", "") or ""

@@ -7,6 +7,7 @@ import pytest
 from opensquilla.gateway.compaction_target import (
     GatewayConsumerBudget,
     build_gateway_consumer_admission,
+    limit_gateway_consumer_budget,
     resolve_gateway_compaction_target,
     resolve_gateway_consumer_budget,
 )
@@ -96,6 +97,9 @@ def test_model_only_compaction_stays_on_current_provider() -> None:
     assert target.plan is not None
     assert provider_connection_config(target.provider).api_key == "current-provider-secret"
     assert ctx.provider_selector.clone_calls == 0
+    assert target.plan is not None
+    assert provider_connection_config(target.provider).api_key == "current-provider-secret"
+    assert ctx.provider_selector.clone_calls == 0
     assert current.model == "gpt-turn"
     assert current.replay_provider_state is True
 
@@ -123,9 +127,75 @@ def test_model_only_compaction_ignores_stale_session_provider_provenance() -> No
     assert target.provider_id == "openai"
     assert target.model == "gpt-summary"
     assert target.source == "selector_current"
+
+
+def test_active_only_ignores_compaction_override_and_inherits_recorded_model() -> None:
+    config = GatewayConfig()
+    config.compaction.provider = "anthropic"
+    config.compaction.model = "summary-model"
+    config.llm_profiles["openai"] = LlmProviderProfile(
+        api_key="recorded-provider-secret",
+        base_url="https://api.openai.com/v1",
+    )
+    current = ProviderConfig(
+        provider="ollama",
+        model="selector-fallback-model",
+        base_url="http://127.0.0.1:11434",
+    )
+    session = SimpleNamespace(
+        session_key="agent:main:webchat:active-only",
+        provider_override=None,
+        model_provider="openai",
+        model_override=None,
+        model="parent-model",
+        auth_profile_override=None,
+    )
+
+    target = resolve_gateway_compaction_target(
+        _ctx(config, current),
+        session,
+        active_only=True,
+    )
+
+    assert target.provider_id == "openai"
+    assert target.model == "parent-model"
+    assert target.source == "session_model_provider"
     assert target.plan is not None
-    assert provider_connection_config(target.provider).api_key == "current-provider-secret"
-    assert ctx.provider_selector.clone_calls == 0
+    assert len(target.plan.candidates) == 1
+    assert target.plan.max_calls == 1
+    assert provider_connection_config(target.provider).api_key == "recorded-provider-secret"
+
+
+def test_active_only_honors_configured_compaction_output_budget() -> None:
+    config = GatewayConfig(
+        compaction={"max_output_tokens": 4096},
+    )
+    config.llm_profiles["openrouter"] = LlmProviderProfile(
+        api_key="recorded-provider-secret",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    current = ProviderConfig(
+        provider="ollama",
+        model="selector-fallback-model",
+        base_url="http://127.0.0.1:11434",
+    )
+    session = SimpleNamespace(
+        session_key="agent:main:webchat:active-output-budget",
+        provider_override=None,
+        model_provider="openrouter",
+        model_override=None,
+        model="z-ai/glm-5.2",
+        auth_profile_override=None,
+    )
+
+    target = resolve_gateway_compaction_target(
+        _ctx(config, current),
+        session,
+        active_only=True,
+    )
+
+    assert target.plan is not None
+    assert target.plan.primary.max_output_tokens == 4096
 
 
 def test_manual_consumer_budget_uses_stable_base_not_last_routed_model() -> None:
@@ -166,6 +236,37 @@ def test_manual_consumer_budget_uses_stable_base_not_last_routed_model() -> None
     assert budget.next_request_reserve_chars == (
         budget.next_request_reserve_tokens * 4
     )
+
+
+def test_manual_consumer_physical_budget_is_not_clamped_by_history_soft_cap() -> None:
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro-0813",
+            "api_key": "dummy-key",
+            "context_window_tokens": 0,
+            "max_tokens": 0,
+        },
+        context_budget_tokens=100_000,
+    )
+    current = ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-pro-0813",
+        api_key="dummy-key",
+    )
+
+    physical_budget = resolve_gateway_consumer_budget(
+        _ctx(config, current),
+        SimpleNamespace(session_key="agent:main:webchat:physical-budget"),
+    )
+    logical_budget = limit_gateway_consumer_budget(physical_budget, 100_000)
+    physical_admission, _fingerprint = build_gateway_consumer_admission(
+        physical_budget
+    )
+
+    assert physical_budget.context_window_tokens == 1_048_576
+    assert logical_budget.context_window_tokens == 100_000
+    assert physical_admission("x" * 64_000, []) is True
 
 
 def test_manual_consumer_admission_uses_exact_adapter_projection() -> None:

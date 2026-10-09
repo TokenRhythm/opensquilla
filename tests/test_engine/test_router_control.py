@@ -187,7 +187,7 @@ async def test_squilla_router_applies_hold_before_normal_classification(monkeypa
 
     out = await apply_squilla_router(ctx)
 
-    assert out.model == "anthropic/claude-opus-4.8"
+    assert out.model == cfg.tiers["c3"]["model"]
     assert out.metadata["routing_source"] == "router_control_hold"
     assert out.metadata["router_control_hold_applied"] is True
     assert out.metadata["router_control_target_tier"] == "c3"

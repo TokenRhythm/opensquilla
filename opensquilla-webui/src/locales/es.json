@@ -1963,7 +1963,6 @@
     "loading": "Cargando sesiones…",
     "loadMore": "Cargar más sesiones",
     "unknownAgent": "Agente desconocido",
-    "deletedAgent": "Agente eliminado · {id}",
     "msgCount": "{count} msj.",
     "error": {
       "load": "No se pudieron cargar las sesiones."
@@ -3888,6 +3887,15 @@
       "commandDisable": "Desactivar Coding mode.",
       "activeLabel": "Coding ACTIVO",
       "disableLabel": "Desactivar Coding mode"
+    },
+    "complexTaskMode": {
+      "enableLabel": "Activar modo de tareas complejas",
+      "disableLabel": "Desactivar modo de tareas complejas"
+    },
+    "singleAgentMode": {
+      "enableLabel": "Activar modo de tarea completa",
+      "disableLabel": "Desactivar modo de tarea completa",
+      "resultLabel": "Resultado del agente"
     },
     "composer": {
       "executionMode": "Modo de ejecución",

@@ -92,7 +92,7 @@ def test_optional_sticky_tier_blocks_downgrade_without_margin_gate():
 
     assert decision.route_class == "R3"
     assert decision.sticky_applied is True
-    assert decision.selected_model == "anthropic/claude-opus-4.8"
+    assert decision.selected_model == config["tier_registry"]["XL"][0]
 
 
 def test_optional_sticky_tier_still_blocks_downgrade_after_margin_upgrade():
@@ -109,7 +109,7 @@ def test_optional_sticky_tier_still_blocks_downgrade_after_margin_upgrade():
 
     assert decision.route_class == "R3"
     assert decision.sticky_applied is True
-    assert decision.selected_model == "anthropic/claude-opus-4.8"
+    assert decision.selected_model == config["tier_registry"]["XL"][0]
 
 
 def test_aux_downgrade_can_lower_high_route_when_enabled_and_not_margin_upgraded():

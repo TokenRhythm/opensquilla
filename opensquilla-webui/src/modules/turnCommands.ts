@@ -84,6 +84,9 @@ export interface TurnSendParams {
   workspaceId?: string
   collaborationMode?: CollaborationMode
   initialRoutingMode?: GatewayModelRoutingMode
+  /** Freeze whether this turn's root agent is orchestration-only. */
+  complexTaskMode?: boolean
+  singleAgentMode?: boolean
   forkBeforeMessageId?: string
   displayText?: string
   attachments?: TurnSendAttachment[]

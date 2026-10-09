@@ -22,6 +22,8 @@ OPENROUTER_DEFAULT_PROVIDER_ROUTING = {
     "anthropic/claude-opus-4.8": "anthropic",
     "anthropic/claude-sonnet-4.6": "anthropic",
     "deepseek/deepseek-v4-flash": "deepseek",
+    "deepseek/deepseek-v4-flash-0731": "deepseek",
+    "deepseek/deepseek-v4-pro-0813": "deepseek",
     "google/gemini-3.5-flash": "google",
     "moonshotai/kimi-k2.6": "moonshotai",
     "openai/gpt-5.4-mini": "openai",

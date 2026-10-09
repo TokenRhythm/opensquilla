@@ -150,6 +150,7 @@ class PromptAssemblerPort(Protocol):
         bootstrap_context_mode: str | None,
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
+        tool_context: ToolContext | None = None,
     ) -> str | tuple[str, str]: ...
 
 @runtime_checkable
@@ -443,6 +444,7 @@ class PromptAssemblerStage:
                 if restricted_tool_boundary
                 else getattr(inp.effective_tool_context, "workspace_dir", None)
             ),
+            tool_context=inp.effective_tool_context,
         )
 
         # 2. Fetch router context (transcript-driven)
@@ -642,7 +644,7 @@ class PromptAssemblerStage:
             tool_profile=turn.metadata.get("tool_profile"),
         )
 
-        # 9. Resolve model_id: pipeline-routed > explicit param > selector current
+        # 9. Resolve model_id: explicit param > pipeline-routed > selector current
         selector_model = ""
         if inp.cloned_selector is not None:
             try:
@@ -661,7 +663,7 @@ class PromptAssemblerStage:
         if turn.metadata.get("routed_provider_blocked") and selector_model:
             resolved_model = selector_model
         else:
-            resolved_model = getattr(turn, "model", None) or inp.model or selector_model
+            resolved_model = inp.model or getattr(turn, "model", None) or selector_model
         # Turn-call records describe the configured deployment, not the
         # generic adapter family.  A DashScope/DeepSeek deployment runs through
         # OpenAIProvider and a MiniMax deployment may run through

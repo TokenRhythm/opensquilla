@@ -15,7 +15,7 @@ from opensquilla.engine.steps.inject_subagent_grounding import (
     _SUBAGENT_GROUNDING,
     inject_subagent_grounding,
 )
-from opensquilla.tools.builtin.sessions import _SUBAGENT_SYSTEM_PROMPT
+from opensquilla.engine.subagent_delegation import SUBAGENT_EXECUTION_PROMPT
 
 
 @dataclass
@@ -47,6 +47,18 @@ async def test_subagent_session_re_injects_when_missing() -> None:
 
 
 @pytest.mark.asyncio
+async def test_single_agent_child_keeps_full_result_contract_after_compaction() -> None:
+    ctx = _ctx("agent:main:subagent:single", "Be helpful.")
+    ctx.metadata["single_agent_mode"] = True
+
+    out = await inject_subagent_grounding(ctx)
+
+    assert "full final answer" in out.system_prompt
+    assert "short summary" in out.system_prompt
+    assert SUBAGENT_EXECUTION_PROMPT not in out.system_prompt
+
+
+@pytest.mark.asyncio
 async def test_bare_subagent_session_key_re_injects_when_missing() -> None:
     ctx = _ctx("subagent:abcd1234", "Be helpful.")
     out = await inject_subagent_grounding(ctx)
@@ -56,7 +68,17 @@ async def test_bare_subagent_session_key_re_injects_when_missing() -> None:
 
 
 def test_fallback_grounding_matches_spawn_prompt() -> None:
-    assert _SUBAGENT_GROUNDING == _SUBAGENT_SYSTEM_PROMPT
+    assert _SUBAGENT_GROUNDING == SUBAGENT_EXECUTION_PROMPT
+
+
+def test_subagent_grounding_defines_minimum_task_contract() -> None:
+    assert _SUBAGENT_GROUNDING.startswith("Your role: complete the assigned task")
+    assert "Meet every assigned acceptance criterion" in _SUBAGENT_GROUNDING
+    assert "add useful substeps to the shared task list" in _SUBAGENT_GROUNDING
+    assert "do not repeat completed work" in _SUBAGENT_GROUNDING
+    assert "Return only a concise outcome to the parent" in _SUBAGENT_GROUNDING
+    assert '"status":"completed|failed"' in _SUBAGENT_GROUNDING
+    assert "incomplete items" not in _SUBAGENT_GROUNDING
 
 
 @pytest.mark.asyncio

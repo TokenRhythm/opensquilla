@@ -231,15 +231,7 @@ async def test_openai_image_provider_keeps_output_format_in_images_payload(
             return None
 
         def json(self) -> dict:
-            return {
-                "data": [
-                    {
-                        "b64_json": base64.b64encode(_test_png_bytes()).decode(
-                            "ascii"
-                        )
-                    }
-                ]
-            }
+            return {"data": [{"b64_json": base64.b64encode(_test_png_bytes()).decode("ascii")}]}
 
     class FakeClient:
         async def __aenter__(self):
@@ -353,13 +345,7 @@ async def test_qwen_token_plan_image_provider_uses_native_contract(monkeypatch) 
         def json(self) -> dict:
             return {
                 "output": {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": [{"type": "image", "image": image_url}]
-                            }
-                        }
-                    ]
+                    "choices": [{"message": {"content": [{"type": "image", "image": image_url}]}}]
                 },
                 "usage": {
                     "input_tokens": 12,
@@ -407,8 +393,7 @@ async def test_qwen_token_plan_image_provider_uses_native_contract(monkeypatch) 
     )
 
     assert (
-        captured["url"]
-        == f"{QWEN_TOKEN_PLAN_IMAGE_BASE_URL}"
+        captured["url"] == f"{QWEN_TOKEN_PLAN_IMAGE_BASE_URL}"
         "/services/aigc/multimodal-generation/generation"
     )
     assert captured["headers"] == {
@@ -556,11 +541,7 @@ async def test_openrouter_model_ref_keeps_provider_for_routing_but_not_wire_mode
                     {
                         "message": {
                             "images": [
-                                {
-                                    "image_url": {
-                                        "url": f"data:image/png;base64,{encoded_image}"
-                                    }
-                                }
+                                {"image_url": {"url": f"data:image/png;base64,{encoded_image}"}}
                             ]
                         }
                     }
@@ -719,9 +700,7 @@ def test_image_generation_availability_allows_endpointless_registered_provider()
                 provider=self.provider_id,
             )
 
-    configure_image_generation(
-        ImageGenerationConfig(enabled=True, primary="synthetic/image-model")
-    )
+    configure_image_generation(ImageGenerationConfig(enabled=True, primary="synthetic/image-model"))
     image_generation.register_image_generation_provider(FakeProvider())
     try:
         assert image_generation_available()
@@ -755,11 +734,7 @@ async def test_image_provider_sends_correlation_only_for_explicit_tokenrhythm_or
                     {
                         "message": {
                             "images": [
-                                {
-                                    "image_url": {
-                                        "url": "data:image/png;base64,b3BlbnNxdWlsbGE="
-                                    }
-                                }
+                                {"image_url": {"url": "data:image/png;base64,b3BlbnNxdWlsbGE="}}
                             ]
                         }
                     }
@@ -815,10 +790,7 @@ async def test_image_provider_sends_correlation_only_for_explicit_tokenrhythm_or
     assert captured_headers[0][TOKENRHYTHM_SESSION_ID_HEADER] == "session-1"
     assert captured_headers[0][TOKENRHYTHM_TURN_ID_HEADER] == "turn-1"
     assert captured_headers[0][TOKENRHYTHM_EXECUTION_ID_HEADER] == "image-execution-1"
-    assert (
-        captured_headers[0][TOKENRHYTHM_CALL_KIND_HEADER]
-        == "auxiliary.image_generation"
-    )
+    assert captured_headers[0][TOKENRHYTHM_CALL_KIND_HEADER] == "auxiliary.image_generation"
     assert TOKENRHYTHM_SESSION_ID_HEADER not in captured_headers[1]
     assert TOKENRHYTHM_SESSION_ID_HEADER not in captured_headers[2]
 
@@ -885,10 +857,7 @@ async def test_image_generation_fallback_operation_derives_one_correlation() -> 
     assert fallback_correlation.session_id == request_correlation.session_id
     assert fallback_correlation.turn_id == request_correlation.turn_id
     assert fallback_correlation.execution_id == request_correlation.execution_id
-    assert (
-        fallback_correlation.call_kind
-        == "auxiliary.image_generation.provider_fallback"
-    )
+    assert fallback_correlation.call_kind == "auxiliary.image_generation.provider_fallback"
 
 
 @pytest.mark.asyncio
@@ -1412,9 +1381,7 @@ def test_image_generation_llm_key_does_not_cross_endpoint_origin(monkeypatch) ->
         enabled=True,
         primary="openai/gpt-image-1",
         providers=ImageGenerationProvidersConfig(
-            openai=ImageGenerationOpenAIProviderConfig(
-                base_url="https://other.example.com/v1"
-            )
+            openai=ImageGenerationOpenAIProviderConfig(base_url="https://other.example.com/v1")
         ),
     )
 
@@ -1665,9 +1632,7 @@ def test_vision_provider_resolves_demoted_primary_from_profile(monkeypatch) -> N
         squilla_router_config=config.squilla_router,
     )
     try:
-        resolved = media._resolve_vision_provider_config(
-            default_model="openai/gpt-4o-mini"
-        )
+        resolved = media._resolve_vision_provider_config(default_model="openai/gpt-4o-mini")
     finally:
         media.configure_image_generation(None)
 
@@ -1896,6 +1861,41 @@ async def test_text_media_llm_uses_provider_native_message(monkeypatch) -> None:
     assert message.content == "Analyze this\n\n---\nExtracted text"
 
 
+def test_text_media_llm_inherits_gateway_provider_routing(monkeypatch) -> None:
+    _clear_vision_provider_env(monkeypatch)
+
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.tools.builtin import media
+
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "synthetic-key",
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider_routing": {
+                "deepseek/deepseek-v4-pro": "deepseek",
+            },
+        }
+    )
+    media.configure_image_generation(
+        config.image_generation,
+        gateway_config=config,
+        llm_config=config.llm,
+        squilla_router_config=config.squilla_router,
+    )
+    try:
+        resolved = media._resolve_provider_config(
+            "LLM",
+            default_model="openai/gpt-4o-mini",
+        )
+    finally:
+        media.configure_image_generation(None)
+
+    assert resolved.model == "deepseek/deepseek-v4-pro"
+    assert resolved.provider_routing["deepseek/deepseek-v4-pro"] == "deepseek"
+
+
 def test_image_generation_uses_provider_specific_api_key(monkeypatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -2085,14 +2085,12 @@ async def test_tokenrhythm_image_provider_uses_images_api_and_b64_response(
     )
     monkeypatch.setattr(
         "opensquilla.provider.image_generation.tokenrhythm_install_id_headers",
-        lambda _provider_kind, _base_url: {
-            "X-OpenSquilla-Install-Id": "synthetic-install-id"
-        },
+        lambda _provider_kind, _base_url: {"X-OpenSquilla-Install-Id": "synthetic-install-id"},
     )
 
-    result = await TokenRhythmImageGenerationProvider(
-        api_key="synthetic-tokenrhythm-key"
-    ).generate(_tokenrhythm_image_request())
+    result = await TokenRhythmImageGenerationProvider(api_key="synthetic-tokenrhythm-key").generate(
+        _tokenrhythm_image_request()
+    )
 
     assert captured["url"] == "https://tokenrhythm.studio/v1/images/generations"
     assert captured["json"] == {
@@ -2149,9 +2147,7 @@ async def test_direct_image_provider_redacts_only_errors_that_echo_install_id(
         "opensquilla.provider.image_generation.redact_tokenrhythm_install_ids",
         lambda text: text.replace(install_id, "***"),
     )
-    provider = TokenRhythmImageGenerationProvider(
-        api_key="synthetic-tokenrhythm-key"
-    )
+    provider = TokenRhythmImageGenerationProvider(api_key="synthetic-tokenrhythm-key")
 
     with pytest.raises(RuntimeError) as redacted:
         await provider.generate(_tokenrhythm_image_request())
@@ -2199,18 +2195,14 @@ async def test_tokenrhythm_image_http_error_drops_retained_install_id(
     )
     monkeypatch.setattr(
         "opensquilla.provider.image_generation.tokenrhythm_install_id_headers",
-        lambda *_args, **_kwargs: {
-            "X-OpenSquilla-Install-Id": install_id
-        },
+        lambda *_args, **_kwargs: {"X-OpenSquilla-Install-Id": install_id},
     )
     monkeypatch.setattr(
         "opensquilla.provider.error_redaction.redact_tokenrhythm_install_ids",
         lambda text: text.replace(install_id, "***"),
     )
 
-    provider = TokenRhythmImageGenerationProvider(
-        api_key="synthetic-tokenrhythm-key"
-    )
+    provider = TokenRhythmImageGenerationProvider(api_key="synthetic-tokenrhythm-key")
     with pytest.raises(httpx.HTTPStatusError) as raised:
         await provider.generate(_tokenrhythm_image_request())
 
@@ -2258,9 +2250,7 @@ async def test_tokenrhythm_image_invalid_json_drops_retained_install_id(
     )
     monkeypatch.setattr(
         "opensquilla.provider.image_generation.tokenrhythm_install_id_headers",
-        lambda *_args, **_kwargs: {
-            "X-OpenSquilla-Install-Id": install_id
-        },
+        lambda *_args, **_kwargs: {"X-OpenSquilla-Install-Id": install_id},
     )
     monkeypatch.setattr(
         "opensquilla.provider.image_generation.redact_tokenrhythm_install_ids",
@@ -2323,9 +2313,9 @@ async def test_tokenrhythm_image_provider_downloads_url_through_secure_helper(
         fake_download,
     )
 
-    result = await TokenRhythmImageGenerationProvider(
-        api_key="synthetic-tokenrhythm-key"
-    ).generate(_tokenrhythm_image_request())
+    result = await TokenRhythmImageGenerationProvider(api_key="synthetic-tokenrhythm-key").generate(
+        _tokenrhythm_image_request()
+    )
 
     assert captured == {"url": image_url, "timeout": 12.0}
     assert result.image_bytes == _test_png_bytes()
@@ -2344,15 +2334,7 @@ async def test_tokenrhythm_image_provider_omits_metadata_on_custom_host(
             return None
 
         def json(self) -> dict:
-            return {
-                "data": [
-                    {
-                        "b64_json": base64.b64encode(_test_png_bytes()).decode(
-                            "ascii"
-                        )
-                    }
-                ]
-            }
+            return {"data": [{"b64_json": base64.b64encode(_test_png_bytes()).decode("ascii")}]}
 
     class FakeClient:
         async def __aenter__(self):

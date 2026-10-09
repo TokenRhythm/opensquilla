@@ -1139,6 +1139,28 @@ async def stream_response_gateway(
                             status_line,
                             deps=stream_deps,
                         )
+                    elif event_name == "session.event.warning":
+                        message_text = str(event.get("message") or "Warning")
+                        await _finish_text_delta_stream(
+                            renderer,
+                            stream_deps,
+                            streaming_plane,
+                            source="gateway",
+                            turn_id=session_key,
+                        )
+                        _emit_tui_domain_event(
+                            stream_deps,
+                            kind=KIND_WARNING,
+                            source="gateway",
+                            payload={"message": message_text, "code": event.get("code")},
+                            turn_id=session_key,
+                        )
+                        await renderer_status(
+                            renderer,
+                            message_text,
+                            style="yellow",
+                            deps=stream_deps,
+                        )
                     elif event_name.startswith("session.event.task_group."):
                         await _finish_text_delta_stream(
                             renderer,

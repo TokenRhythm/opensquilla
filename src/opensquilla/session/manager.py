@@ -24,6 +24,7 @@ from opensquilla.engine.steps.inject_time_prefix import stamp as _stamp_time_pre
 from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.session.compaction import (
     CompactionConfig,
+    CompactionParentRequest,
     CompactionRequest,
     CompactionResult,
     arm_compaction_deadline,
@@ -499,6 +500,7 @@ def _frozen_compaction_prefix_hash(
     flush_receipt_status: str | None,
     config: CompactionConfig,
     consumer_admission_fingerprint: str = "",
+    force_admission: bool = False,
 ) -> str:
     """Hash the frozen source plus output- and persistence-affecting settings."""
 
@@ -524,6 +526,7 @@ def _frozen_compaction_prefix_hash(
         "coverage_blocking": config.coverage_blocking,
         "compaction_profile": config.compaction_profile,
         "protected_recent_messages": config.protected_recent_messages,
+        "force_admission": force_admission,
         "consumer_admission_fingerprint": consumer_admission_fingerprint,
     }
     digest.update(_stable_json(request_shape).encode("utf-8"))
@@ -1341,23 +1344,11 @@ class SessionManager:
         if callable(revoke_goal_lease):
             revoke_goal_lease(session_key, session_id=session_id)
         try:
-            from opensquilla.gateway.subagent_announce import _tracker as _spawn_tracker
-
-            _spawn_tracker.evict(session_key)
-        except Exception:
-            pass
-        try:
             from opensquilla.engine.steps.squilla_router import (
                 _history_store as _routing_store,
             )
 
             _routing_store.evict(session_key)
-        except Exception:
-            pass
-        try:
-            from opensquilla.tools.builtin.sessions import evict_spawn_lock
-
-            evict_spawn_lock(session_key)
         except Exception:
             pass
         try:
@@ -2884,6 +2875,7 @@ class SessionManager:
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         consumer_admission: Callable[[str, list[dict[str, Any]]], Any] | None = None,
         consumer_admission_fingerprint: str = "",
+        parent_request: CompactionParentRequest | None = None,
     ) -> str:
         """
         Compact the session transcript when context is filling up.
@@ -2904,6 +2896,7 @@ class SessionManager:
             mutation_context=mutation_context,
             consumer_admission=consumer_admission,
             consumer_admission_fingerprint=consumer_admission_fingerprint,
+            parent_request=parent_request,
             **correlation_kwargs,
         )
         return (
@@ -2930,6 +2923,8 @@ class SessionManager:
         protected_boundary_message_id: str | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
+        force_admission: bool = False,
+        parent_request: CompactionParentRequest | None = None,
     ) -> CompactionResult:
         """Compact the session transcript and return full compaction metadata."""
 
@@ -3036,6 +3031,7 @@ class SessionManager:
                 flush_receipt_status=flush_receipt_status,
                 config=effective_config,
                 consumer_admission_fingerprint=consumer_admission_fingerprint,
+                force_admission=force_admission,
             ),
             target_fingerprint=_compaction_target_fingerprint(effective_config),
         )
@@ -3064,6 +3060,8 @@ class SessionManager:
                 consumer_admission=consumer_admission,
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
+                force_admission=force_admission,
+                parent_request=parent_request,
             ),
         )
         if is_owner:
@@ -3108,6 +3106,8 @@ class SessionManager:
         consumer_admission: Callable[[str, list[dict[str, Any]]], Any] | None,
         expected_session_id: str | None,
         expected_session_epoch: int | None,
+        force_admission: bool,
+        parent_request: CompactionParentRequest | None,
     ) -> CompactionResult:
         """Generate and atomically install one frozen compaction candidate."""
 
@@ -3123,6 +3123,8 @@ class SessionManager:
                 summary_replay_renderer=_durable_summary_replay,
                 consumer_admission=consumer_admission,
                 provider_request_correlation=provider_request_correlation,
+                force_admission=force_admission,
+                parent_request=parent_request,
             )
         )
 

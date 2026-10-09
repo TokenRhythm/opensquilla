@@ -202,6 +202,7 @@ def test_dsml_policy_names_only_exact_packaged_model_ids() -> None:
             "deepseek-v4-flash",
             "deepseek-v4-flash-0731",
             "deepseek-v4-pro",
+            "deepseek-v4-pro-0813",
         },
         "tokenrhythm": {
             "deepseek-v4-flash",
@@ -215,7 +216,9 @@ def test_dsml_policy_names_only_exact_packaged_model_ids() -> None:
         },
         "openrouter": {
             "deepseek/deepseek-v4-flash",
+            "deepseek/deepseek-v4-flash-0731",
             "deepseek/deepseek-v4-pro",
+            "deepseek/deepseek-v4-pro-0813",
         },
     }
 
@@ -247,6 +250,7 @@ def test_dsml_policy_accepts_only_the_configured_provider_model_pair() -> None:
         ("deepseek", "deepseek-v4-flash"),
         ("deepseek", "deepseek-v4-flash-0731"),
         ("deepseek", "deepseek-v4-pro"),
+        ("deepseek", "deepseek-v4-pro-0813"),
         ("tokenrhythm", "deepseek-v4-flash"),
         ("tokenrhythm", "deepseek-v4-flash-0731"),
         ("tokenrhythm", "deepseek-v4-pro"),
@@ -254,7 +258,9 @@ def test_dsml_policy_accepts_only_the_configured_provider_model_pair() -> None:
         ("tokenrhythm", "tokenrhythm/deepseek-v4-flash-0731"),
         ("tokenrhythm", "tokenrhythm/deepseek-v4-pro"),
         ("openrouter", "deepseek/deepseek-v4-flash"),
+        ("openrouter", "deepseek/deepseek-v4-flash-0731"),
         ("openrouter", "deepseek/deepseek-v4-pro"),
+        ("openrouter", "deepseek/deepseek-v4-pro-0813"),
     }
 
     for provider_kind, model in allowed:
@@ -274,7 +280,8 @@ def test_dsml_policy_rejects_near_misses_and_wrong_providers() -> None:
         ("tokenrhythm", "deepseek-v4-pro-0813"),
         ("tokenrhythm", "tokenrhythm/deepseek-v4-pro-0813-preview"),
         ("openrouter", "deepseek-v4-flash"),
-        ("openrouter", "deepseek/deepseek-v4-flash-0731"),
+        ("openrouter", "deepseek/deepseek-v4-flash-0731-preview"),
+        ("openrouter", "deepseek/deepseek-v4-pro-0813-preview"),
         ("openrouter", "vendor/deepseek-v4-pro"),
         ("openai", "deepseek-v4-flash"),
         ("dashscope", "deepseek-v4-pro"),

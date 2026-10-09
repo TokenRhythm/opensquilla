@@ -12,6 +12,19 @@ from opensquilla.application.turn_admission import (
     SteerTurn,
     TurnAdmission,
 )
+from opensquilla.application.turn_acceptance import _orchestration_root_metadata
+
+
+def test_single_agent_root_metadata_reuses_complex_runtime_with_distinct_flag() -> None:
+    metadata = _orchestration_root_metadata(
+        "turn-synthetic",
+        complex_task_mode=False,
+        single_agent_mode=True,
+    )
+
+    assert metadata["complex_task_mode"] is True
+    assert metadata["single_agent_mode"] is True
+    assert metadata["orchestration_task_id"] == "turn-synthetic"
 
 
 @dataclass

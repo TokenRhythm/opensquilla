@@ -142,9 +142,7 @@ class ProviderActivityEvent:
     kind: Literal["provider_activity"] = field(default="provider_activity", init=False)
     schema_version: int = 1
     activity_id: str = ""
-    phase: Literal["requesting", "reasoning", "retry_wait", "retrying", "fallback"] = (
-        "requesting"
-    )
+    phase: Literal["requesting", "reasoning", "retry_wait", "retrying", "fallback"] = "requesting"
     reason: Literal[
         "initial",
         "rate_limited",
@@ -362,7 +360,7 @@ class DoneEvent:
     # Appended for compatibility with existing positional construction.
     provider: str = ""
     # Historical output-token count for the parent assistant message itself.
-    # Aggregated output_tokens may also include completed in-process subagents.
+    # Aggregated output_tokens may also include completed delegated executions.
     message_output_tokens: int | None = None
     # Number of non-free usage components whose cost could not be determined.
     missing_cost_entries: int = 0
@@ -683,6 +681,13 @@ class AgentConfig:
     # gate works even on providers/paths that never report real dollars.
     max_turn_cost_usd: float = 0.0
     max_turn_tool_errors: int = 0
+    # Positive only for subagent runs. Stops consecutive all-failed tool rounds
+    # with a deterministic structured result instead of another model call.
+    subagent_failure_fallback_threshold: int = 0
+    # Child effort and soft warning selected by the existing model router.
+    subagent_effort_tier: str = ""
+    subagent_soft_iteration_limit: int = 0
+    seed: int | None = None
     temperature: float | None = None
     top_p: float | None = None
     thinking: bool | ThinkingLevel = False
@@ -807,8 +812,8 @@ class AgentConfig:
     tool_use_argument_provider_request_max_chars: int = 0
     tool_use_argument_projection_enabled: bool = False
     tool_result_external_keep_recent: int = 2
-    tool_failure_loop_block_threshold: int = 3
-    repeated_tool_call_recovery_threshold: int = 0
+    tool_failure_loop_block_threshold: int = 0
+    repeated_tool_call_recovery_threshold: int = 3
     # Extra tool names covered by repeated-identical-call recovery, on top of
     # the built-in read-only set. Set via OPENSQUILLA_TOOL_REPEAT_NUDGE_TOOLS
     # (comma-separated); the threshold is tunable via

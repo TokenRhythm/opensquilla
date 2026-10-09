@@ -58,6 +58,25 @@ class _SequenceProvider:
             yield event
 
 
+class _RepeatingReasoningProvider:
+    provider_name = "openrouter"
+
+    def __init__(self, limit: int = 10_000) -> None:
+        self.limit = limit
+        self.yielded = 0
+
+    async def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        del messages, tools, config
+        for _ in range(self.limit):
+            self.yielded += 1
+            yield ReasoningDeltaEvent(text="The")
+
+
 class _CapturingTurnLog:
     def __init__(self) -> None:
         self.records: list[dict[str, Any]] = []
@@ -712,3 +731,17 @@ async def test_selector_exposes_reasoning_only_leg_after_visible_commit() -> Non
         for event in events
     )
     assert any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_selector_stops_repeating_reasoning_before_pretext_buffering() -> None:
+    provider = _RepeatingReasoningProvider()
+
+    class _Selector:
+        current_config = SimpleNamespace(provider="openrouter", model="primary/model")
+
+    wrapper = _SelectorFallbackProvider(provider, _Selector())
+    events = [event async for event in wrapper.chat([Message(role="user", content="hi")])]
+
+    assert provider.yielded < provider.limit
+    assert any(isinstance(event, ErrorEvent) for event in events)

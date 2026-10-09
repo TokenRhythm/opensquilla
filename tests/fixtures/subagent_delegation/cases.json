@@ -1,0 +1,100 @@
+[
+  {
+    "id": "simple_exact_reply",
+    "category": "simple",
+    "expected_delegation": false,
+    "minimum_delegate_calls": 0,
+    "prompt": "只回复 OK，不要解释。"
+  },
+  {
+    "id": "simple_arithmetic",
+    "category": "simple",
+    "expected_delegation": false,
+    "minimum_delegate_calls": 0,
+    "prompt": "计算 37 × 24，只给出结果。"
+  },
+  {
+    "id": "simple_translation",
+    "category": "simple",
+    "expected_delegation": false,
+    "minimum_delegate_calls": 0,
+    "prompt": "把这句话翻译成英文：今天天气很好。"
+  },
+  {
+    "id": "simple_rewrite",
+    "category": "simple",
+    "expected_delegation": false,
+    "minimum_delegate_calls": 0,
+    "prompt": "把“这个方案非常非常好”改得更简洁。"
+  },
+  {
+    "id": "simple_tiny_edit",
+    "category": "simple",
+    "expected_delegation": false,
+    "minimum_delegate_calls": 0,
+    "prompt": "把变量名 usernmae 修正为 username，只说明修改结果。"
+  },
+  {
+    "id": "decomposable_database_comparison",
+    "category": "decomposable",
+    "expected_delegation": true,
+    "minimum_delegate_calls": 2,
+    "prompt": "比较 PostgreSQL 和 MySQL 在事务、索引、复制机制和运维成本方面的差异，最后给出选型建议。"
+  },
+  {
+    "id": "decomposable_timeout_diagnosis",
+    "category": "decomposable",
+    "expected_delegation": true,
+    "minimum_delegate_calls": 2,
+    "prompt": "调查一个异步服务偶发超时的问题，分别分析数据库连接池、慢查询、重试风暴和队列积压，最后汇总排查顺序。"
+  },
+  {
+    "id": "decomposable_release_review",
+    "category": "decomposable",
+    "expected_delegation": true,
+    "minimum_delegate_calls": 2,
+    "prompt": "对一个准备发布的 Web 服务做发布前审查：检查架构风险、安全风险、测试缺口和回滚方案，输出综合结论。"
+  },
+  {
+    "id": "decomposable_trip_plan",
+    "category": "decomposable",
+    "expected_delegation": true,
+    "minimum_delegate_calls": 2,
+    "prompt": "规划一次东京五日旅行，同时研究交通、住宿区域、每日景点和雨天备选方案，再合成一份行程。"
+  },
+  {
+    "id": "decomposable_research_synthesis",
+    "category": "decomposable",
+    "expected_delegation": true,
+    "minimum_delegate_calls": 2,
+    "prompt": "研究向量检索、BM25 和混合检索三种方案，各自总结原理、优缺点和适用场景，最后做综合比较。"
+  },
+  {
+    "id": "decomposable_migration_plan",
+    "category": "decomposable",
+    "expected_delegation": true,
+    "minimum_delegate_calls": 2,
+    "prompt": "设计把单体应用拆成三个服务的迁移方案，独立评估数据边界、API 兼容、部署切换和验证策略，然后整合计划。"
+  },
+  {
+    "id": "decomposable_launch_plan",
+    "category": "decomposable",
+    "expected_delegation": true,
+    "minimum_delegate_calls": 2,
+    "prompt": "为一个新 SaaS 产品制定上线计划，分别分析市场定位、技术准备、客户支持和上线风险，最后给出时间表。"
+  },
+  {
+    "id": "decomposable_design_decision",
+    "category": "decomposable",
+    "expected_delegation": true,
+    "minimum_delegate_calls": 2,
+    "prompt": "比较事件驱动架构和定时批处理两种设计，分别评估性能、可靠性、成本和可维护性，最后推荐一种。"
+  },
+  {
+    "id": "decomposable_code_change",
+    "category": "decomposable",
+    "expected_delegation": true,
+    "minimum_delegate_calls": 2,
+    "prompt": "当前工作区中已有一个 Python 服务代码库。给它增加速率限制功能，需要先定位集成点、设计实现、补充测试并做独立代码审查。"
+  }
+]

@@ -1963,7 +1963,6 @@
     "loading": "Chargement des sessions…",
     "loadMore": "Charger plus de sessions",
     "unknownAgent": "Agent inconnu",
-    "deletedAgent": "Agent supprimé · {id}",
     "msgCount": "{count} msg",
     "error": {
       "load": "Impossible de charger les sessions."
@@ -3888,6 +3887,15 @@
       "commandDisable": "Désactiver Coding mode.",
       "activeLabel": "Coding ACTIVÉ",
       "disableLabel": "Désactiver Coding mode"
+    },
+    "complexTaskMode": {
+      "enableLabel": "Activer le mode tâches complexes",
+      "disableLabel": "Désactiver le mode tâches complexes"
+    },
+    "singleAgentMode": {
+      "enableLabel": "Activer le mode tâche complète",
+      "disableLabel": "Désactiver le mode tâche complète",
+      "resultLabel": "Résultat de l'agent"
     },
     "composer": {
       "executionMode": "Mode d'exécution",

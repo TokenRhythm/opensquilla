@@ -48,6 +48,7 @@ _DEEPSEEK_DSML_MODEL_IDS = (
     "deepseek-v4-flash",
     "deepseek-v4-flash-0731",
     "deepseek-v4-pro",
+    "deepseek-v4-pro-0813",
 )
 _TOKENRHYTHM_DSML_MODEL_IDS = (
     "deepseek-v4-flash",
@@ -88,7 +89,9 @@ _TOKENRHYTHM_V4_LOW_EFFORT_MODEL_IDS = frozenset(
 )
 _OPENROUTER_DSML_MODEL_IDS = (
     "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-0731",
     "deepseek/deepseek-v4-pro",
+    "deepseek/deepseek-v4-pro-0813",
 )
 
 

@@ -858,15 +858,15 @@ async def test_standalone_path_command_runs_as_plain_message(
     assert "attachments" not in captured["kwargs"]
 
 
-def test_chat_workspace_strict_resolution_matches_agent_precedence(
+def test_chat_workspace_strict_resolution_uses_shared_cli_precedence(
     monkeypatch,
     tmp_path,
 ) -> None:
-    from opensquilla.cli.agent_cmd import _resolve_workspace_strict
+    from opensquilla.cli.runtime_config import resolve_workspace_strict
 
     monkeypatch.setenv("OPENSQUILLA_WORKSPACE_STRICT", "false")
     assert (
-        _resolve_workspace_strict(
+        resolve_workspace_strict(
             cli_value=True,
             config_value=False,
             entrypoint_default=bool(tmp_path),
@@ -874,7 +874,7 @@ def test_chat_workspace_strict_resolution_matches_agent_precedence(
         is True
     )
     assert (
-        _resolve_workspace_strict(
+        resolve_workspace_strict(
             cli_value=None,
             config_value=True,
             entrypoint_default=bool(tmp_path),
@@ -883,7 +883,7 @@ def test_chat_workspace_strict_resolution_matches_agent_precedence(
     )
     monkeypatch.delenv("OPENSQUILLA_WORKSPACE_STRICT")
     assert (
-        _resolve_workspace_strict(
+        resolve_workspace_strict(
             cli_value=None,
             config_value=True,
             entrypoint_default=False,
@@ -891,7 +891,7 @@ def test_chat_workspace_strict_resolution_matches_agent_precedence(
         is True
     )
     assert (
-        _resolve_workspace_strict(
+        resolve_workspace_strict(
             cli_value=None,
             config_value=None,
             entrypoint_default=True,
@@ -1856,10 +1856,20 @@ async def test_gateway_chat_does_not_forward_workspace_fields() -> None:
 
     async def fake_call(method: str, params: dict[str, object]) -> dict[str, object]:
         calls.append((method, params))
+        if method == "sessions.send":
+            client._recv_queue.put_nowait(
+                {
+                    "event": "session.event.done",
+                    "payload": {
+                        "session_key": params["key"],
+                        "client_message_id": params["client_message_id"],
+                    },
+                }
+            )
+            return {"client_message_id": params["client_message_id"]}
         return {}
 
     client._call = fake_call  # type: ignore[method-assign]
-    client._recv_queue.put_nowait({"event": "session.event.done", "payload": {}})
 
     events = [
         event
@@ -1917,13 +1927,8 @@ async def test_gateway_client_follows_background_task_group_until_terminal() -> 
     client = GatewayClient()
     calls: list[tuple[str, dict[str, object]]] = []
 
-    async def fake_call(method: str, params: dict[str, object]) -> dict[str, object]:
-        calls.append((method, params))
-        return {}
-
-    client._call = fake_call  # type: ignore[method-assign]
     group_id = "subagent:agent:main:abc123:task-parent"
-    for frame in (
+    frames = [
         {"event": "session.event.task_group.waiting", "payload": {"group_id": group_id}},
         {"event": "session.event.done", "payload": {"reason": "parent_yielded"}},
         {
@@ -1936,8 +1941,27 @@ async def test_gateway_client_follows_background_task_group_until_terminal() -> 
             "event": "session.event.task_group.done",
             "payload": {"group_id": group_id, "delivery_status": "not_applicable"},
         },
-    ):
-        client._recv_queue.put_nowait(frame)
+    ]
+
+    async def fake_call(method: str, params: dict[str, object]) -> dict[str, object]:
+        calls.append((method, params))
+        if method == "sessions.send":
+            for frame in frames:
+                if frame["event"] in {
+                    "session.event.done",
+                    "task.succeeded",
+                }:
+                    frame["payload"].update(
+                        {
+                            "session_key": params["key"],
+                            "client_message_id": params["client_message_id"],
+                        }
+                    )
+                client._recv_queue.put_nowait(frame)
+            return {"client_message_id": params["client_message_id"]}
+        return {}
+
+    client._call = fake_call  # type: ignore[method-assign]
 
     events = [
         event
@@ -1968,16 +1992,26 @@ async def test_gateway_client_does_not_wait_for_late_task_group_after_done() -> 
     client = GatewayClient()
 
     async def fake_call(method: str, params: dict[str, object]) -> dict[str, object]:
+        if method == "sessions.send":
+            client._recv_queue.put_nowait(
+                {
+                    "event": "session.event.done",
+                    "payload": {
+                        "session_key": params["key"],
+                        "client_message_id": params["client_message_id"],
+                    },
+                }
+            )
+            client._recv_queue.put_nowait(
+                {
+                    "event": "session.event.task_group.synthesizing",
+                    "payload": {"group_id": "late-group"},
+                }
+            )
+            return {"client_message_id": params["client_message_id"]}
         return {}
 
     client._call = fake_call  # type: ignore[method-assign]
-    client._recv_queue.put_nowait({"event": "session.event.done", "payload": {}})
-    client._recv_queue.put_nowait(
-        {
-            "event": "session.event.task_group.synthesizing",
-            "payload": {"group_id": "late-group"},
-        }
-    )
 
     events = [
         event
@@ -1998,16 +2032,29 @@ async def test_gateway_client_does_not_end_on_untracked_task_group_terminal() ->
     client = GatewayClient()
 
     async def fake_call(method: str, params: dict[str, object]) -> dict[str, object]:
+        if method == "sessions.send":
+            client._recv_queue.put_nowait(
+                {
+                    "event": "session.event.task_group.done",
+                    "payload": {
+                        "group_id": "untracked-group",
+                        "delivery_status": "not_applicable",
+                    },
+                }
+            )
+            client._recv_queue.put_nowait(
+                {
+                    "event": "session.event.done",
+                    "payload": {
+                        "session_key": params["key"],
+                        "client_message_id": params["client_message_id"],
+                    },
+                }
+            )
+            return {"client_message_id": params["client_message_id"]}
         return {}
 
     client._call = fake_call  # type: ignore[method-assign]
-    client._recv_queue.put_nowait(
-        {
-            "event": "session.event.task_group.done",
-            "payload": {"group_id": "untracked-group", "delivery_status": "not_applicable"},
-        }
-    )
-    client._recv_queue.put_nowait({"event": "session.event.done", "payload": {}})
 
     events = [
         event
@@ -2280,6 +2327,11 @@ async def test_gateway_stream_renders_task_group_status_without_buffer_pollution
                 "pending_count": 2,
             }
             yield {
+                "event": "session.event.warning",
+                "code": "task_concurrency_limit_queued",
+                "message": "Concurrency limit reached; task queued.",
+            }
+            yield {
                 "event": "session.event.task_group.synthesizing",
                 "group_id": "group-1",
                 "child_count": 2,
@@ -2351,10 +2403,11 @@ async def test_gateway_stream_renders_task_group_status_without_buffer_pollution
     assert result.text == "answer"
     assert renderer.buffer == "answer"
     assert renderer.finalized is True
-    assert len(renderer.statuses) == 3
+    assert len(renderer.statuses) == 4
     assert "waiting" in renderer.statuses[0]
-    assert "synthesizing" in renderer.statuses[1]
-    assert "complete" in renderer.statuses[2]
+    assert "Concurrency limit reached" in renderer.statuses[1]
+    assert "synthesizing" in renderer.statuses[2]
+    assert "complete" in renderer.statuses[3]
 
 
 @pytest.mark.asyncio

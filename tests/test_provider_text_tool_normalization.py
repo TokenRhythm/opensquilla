@@ -582,8 +582,11 @@ def test_text_tool_profile_is_provider_and_model_scoped(
     ("provider_kind", "model"),
     [
         ("deepseek", "deepseek-v4-flash-0731"),
+        ("deepseek", "deepseek-v4-pro-0813"),
         ("tokenrhythm", "tokenrhythm/deepseek-v4-pro"),
         ("openrouter", "deepseek/deepseek-v4-flash"),
+        ("openrouter", "deepseek/deepseek-v4-flash-0731"),
+        ("openrouter", "deepseek/deepseek-v4-pro-0813"),
     ],
 )
 def test_dsml_executes_only_for_exact_packaged_provider_model_pairs(
@@ -3985,7 +3988,7 @@ def test_provider_import_before_tools_does_not_freeze_builtin_registry() -> None
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.tools import get_default_registry
 names = set(get_default_registry().list_names())
-required = {"cron", "gateway", "agents_list", "sessions_list"}
+required = {"cron", "gateway", "delegate_task", "interrupt_agent"}
 missing = sorted(required - names)
 assert not missing, missing
 """

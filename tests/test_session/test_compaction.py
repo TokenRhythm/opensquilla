@@ -10,6 +10,7 @@ from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
     _api_round_groups,
+    _build_compaction_prompt,
     arm_compaction_deadline,
     await_compaction_phase,
     build_compaction_config_from_provider,
@@ -38,6 +39,58 @@ def _make_entries(n: int, tokens_each: int = 100) -> list[dict]:
     ]
 
 
+def test_compaction_prompt_suffix_preserves_context_before_instruction(monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+
+    system, user = _build_compaction_prompt(
+        "context A\ncontext B",
+        "Preserve exact IDs.",
+        "Focus on current work.",
+    )
+
+    assert system == ""
+    assert user.startswith("context A\ncontext B")
+    assert user.index("context B") < user.index("You are a conversation compactor")
+    assert user.index("You are a conversation compactor") < user.index("Preserve exact IDs.")
+    assert user.index("Preserve exact IDs.") < user.index("Focus on current work.")
+
+
+def test_compaction_prompt_prefix_remains_default(monkeypatch) -> None:
+    monkeypatch.delenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", raising=False)
+
+    system, user = _build_compaction_prompt("context A", "Preserve exact IDs.", None)
+
+    assert system.startswith("You are a conversation compactor")
+    assert "Preserve exact IDs." in system
+    assert user.endswith("context A")
+
+
+@pytest.mark.asyncio
+async def test_force_admission_compacts_with_native_cut_below_window() -> None:
+    entries = _make_entries(8, tokens_each=100)
+
+    normal = await compact_context(
+        CompactionRequest(
+            session_id="normal",
+            entries=entries,
+            context_window_tokens=10_000,
+        )
+    )
+    forced = await compact_context(
+        CompactionRequest(
+            session_id="forced",
+            entries=entries,
+            context_window_tokens=10_000,
+            force_admission=True,
+        )
+    )
+
+    assert normal.skip_reason == "within_compaction_budget"
+    assert normal.removed_count == 0
+    assert forced.removed_count > 0
+    assert forced.kept_entries
+
+
 def test_api_round_groups_keep_user_role_tool_result_with_its_call() -> None:
     active_user = {"role": "user", "content": "inspect the file"}
     tool_call = {
@@ -51,9 +104,7 @@ def test_api_round_groups_keep_user_role_tool_result_with_its_call() -> None:
     }
     next_assistant = {"role": "assistant", "content": "The file is valid."}
 
-    groups = _api_round_groups(
-        [active_user, tool_call, tool_result, next_assistant]
-    )
+    groups = _api_round_groups([active_user, tool_call, tool_result, next_assistant])
 
     assert groups[0] == [active_user, tool_call, tool_result]
     assert groups[1] == [next_assistant]
@@ -596,10 +647,10 @@ def test_provider_config_preserves_profile_when_compaction_llm_disabled():
 
 @pytest.mark.asyncio
 async def test_compaction_source_is_llm_when_all_chunks_use_llm(monkeypatch):
-    calls: list[str] = []
+    calls: list[dict] = []
 
     async def fake_llm(**kwargs):
-        calls.append(kwargs["chunk_text"])
+        calls.append(kwargs)
         return "LLM summary"
 
     monkeypatch.setattr("opensquilla.session.compaction.call_compaction_llm", fake_llm)
@@ -610,11 +661,12 @@ async def test_compaction_source_is_llm_when_all_chunks_use_llm(monkeypatch):
             session_id="s1",
             entries=entries,
             context_window_tokens=500,
-            config=CompactionConfig(model="test/model", api_key="test-key"),
+            config=CompactionConfig(model="test/model", api_key="test-key", seed=42),
         )
     )
 
     assert calls
+    assert calls[0]["seed"] == 42
     assert result.removed_count > 0
     assert result.summary_source == "llm"
 
@@ -733,9 +785,7 @@ async def test_coding_profile_preserves_configured_recent_tail():
     assert result.quality_report["protected_tail_preserved"] is True
     assert result.quality_report["fits_context_window"] is True
     assert result.quality_report["passes_structural_gate"] is True
-    assert compaction_result_payload(result)["quality_report"][
-        "passes_structural_gate"
-    ] is True
+    assert compaction_result_payload(result)["quality_report"]["passes_structural_gate"] is True
 
 
 @pytest.mark.asyncio
@@ -768,9 +818,7 @@ async def test_quality_report_marks_compaction_that_still_exceeds_window():
     assert result.skip_reason == "quality_gate_failed"
     assert result.quality_report["fits_context_window"] is False
     assert result.quality_report["passes_structural_gate"] is False
-    assert compaction_result_payload(result)["quality_report"][
-        "fits_context_window"
-    ] is False
+    assert compaction_result_payload(result)["quality_report"]["fits_context_window"] is False
 
 
 @pytest.mark.asyncio
@@ -1347,11 +1395,7 @@ async def test_call_compaction_llm_adds_tokenrhythm_app_attribution(monkeypatch)
             return None
 
         def json(self) -> dict:
-            return {
-                "choices": [
-                    {"message": {"content": f"summary echoed {install_id}"}}
-                ]
-            }
+            return {"choices": [{"message": {"content": f"summary echoed {install_id}"}}]}
 
     class FakeClient:
         async def __aenter__(self):
@@ -1372,9 +1416,7 @@ async def test_call_compaction_llm_adds_tokenrhythm_app_attribution(monkeypatch)
     )
     monkeypatch.setattr(
         "opensquilla.session.compaction.tokenrhythm_install_id_headers",
-        lambda _provider_kind, _base_url: {
-            "X-OpenSquilla-Install-Id": install_id
-        },
+        lambda _provider_kind, _base_url: {"X-OpenSquilla-Install-Id": install_id},
     )
     monkeypatch.setattr(
         "opensquilla.session.compaction.redact_tokenrhythm_install_ids",
@@ -1452,6 +1494,7 @@ async def test_call_compaction_llm_privacy_switch_removes_correlation_on_wire(
 
     class FakeResponse:
         text = ""
+
         def raise_for_status(self) -> None:
             return None
 
@@ -1563,9 +1606,7 @@ async def test_call_compaction_llm_cancellation_does_not_retain_install_id(
     )
     monkeypatch.setattr(
         "opensquilla.session.compaction.tokenrhythm_install_id_headers",
-        lambda _provider_kind, _base_url: {
-            "X-OpenSquilla-Install-Id": install_id
-        },
+        lambda _provider_kind, _base_url: {"X-OpenSquilla-Install-Id": install_id},
     )
     monkeypatch.setattr(
         "opensquilla.engine.usage_http.reserve_direct_usage_call",

@@ -253,8 +253,7 @@ def test_openrouter_normal_request_omits_keepalive_affinity_header(
 
 def _payload_tool_descriptions(payload: dict[str, Any]) -> str:
     return "\n".join(
-        str(tool["function"].get("description", ""))
-        for tool in payload.get("tools", [])
+        str(tool["function"].get("description", "")) for tool in payload.get("tools", [])
     )
 
 
@@ -423,10 +422,7 @@ def test_openrouter_stream_timeout_emits_heartbeat_before_non_stream_fallback(
 
     assert isinstance(event, ProviderHeartbeatEvent)
     assert event.phase == "llm_fallback"
-    assert any(
-        item["event"] == "openrouter.stream_timeout_fallback_started"
-        for item in captured
-    )
+    assert any(item["event"] == "openrouter.stream_timeout_fallback_started" for item in captured)
 
 
 def test_stream_timeout_fallback_preserves_tokenrhythm_correlation_headers(
@@ -528,6 +524,7 @@ def test_stream_timeout_fallback_drops_stale_install_id_after_hot_disable(
             return FailingResponse()
 
     monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", CapturingClient)
+
     def install_headers(
         _provider_kind: str,
         _base_url: str,
@@ -620,9 +617,7 @@ def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
 
     assert isinstance(event, ProviderHeartbeatEvent)
     assert event.phase == "llm_fallback"
-    assert any(
-        item["event"] == "dashscope.non_stream_fallback_started" for item in captured
-    )
+    assert any(item["event"] == "dashscope.non_stream_fallback_started" for item in captured)
 
 
 def test_dashscope_stream_timeout_strict_off_does_not_fallback(
@@ -757,10 +752,7 @@ def test_tokenrhythm_chat_adds_app_attribution_headers(
     assert captured["headers"].get("HTTP-Referer") == "https://opensquilla.ai"
     assert captured["headers"].get("X-Title") == "OpenSquilla"
     if expects_install_id:
-        assert (
-            captured["headers"].get("X-OpenSquilla-Install-Id")
-            == "synthetic-install-id"
-        )
+        assert captured["headers"].get("X-OpenSquilla-Install-Id") == "synthetic-install-id"
     else:
         assert "X-OpenSquilla-Install-Id" not in captured["headers"]
     assert "synthetic-install-id" not in json.dumps(captured["payload"], sort_keys=True)
@@ -999,10 +991,7 @@ def test_tokenrhythm_list_models_adds_app_attribution_headers(
     assert captured["url"] == "https://tokenrhythm.studio/v1/models"
     assert captured["headers"].get("HTTP-Referer") == "https://opensquilla.ai"
     assert captured["headers"].get("X-Title") == "OpenSquilla"
-    assert (
-        captured["headers"].get("X-OpenSquilla-Install-Id")
-        == "synthetic-install-id"
-    )
+    assert captured["headers"].get("X-OpenSquilla-Install-Id") == "synthetic-install-id"
 
 
 def test_openrouter_list_models_reports_openrouter_provider(monkeypatch: Any) -> None:
@@ -1096,15 +1085,12 @@ def test_openrouter_stream_header_generation_id_is_traced_and_joined_to_response
     events = _collect_events(provider, ChatConfig())
 
     assert any(isinstance(event, DoneEvent) for event in events)
-    rows = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
-    ]
+    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
     header_row = next(row for row in rows if row["event"] == "llm.response_headers")
     assert header_row["response_ids"] == ["gen-stream-header-1"]
-    assert next(row for row in rows if row["event"] == "llm.response")[
-        "response_ids"
-    ] == ["gen-stream-header-1"]
+    assert next(row for row in rows if row["event"] == "llm.response")["response_ids"] == [
+        "gen-stream-header-1"
+    ]
     assert "x-debug-secret" not in json.dumps(rows, sort_keys=True).lower()
     assert "must-not-be-traced" not in json.dumps(rows, sort_keys=True)
 
@@ -1140,10 +1126,7 @@ def test_openrouter_http_error_header_generation_id_is_traced_without_other_head
     events = _collect_events(provider, ChatConfig())
 
     assert next(event for event in events if isinstance(event, ErrorEvent)).code == "503"
-    rows = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
-    ]
+    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
     assert [row["event"] for row in rows] == [
         "llm.request",
         "llm.response_headers",
@@ -1193,9 +1176,7 @@ def test_openrouter_header_generation_id_survives_local_stream_cancellation(
         kwargs["transport"] = transport
         return real_async_client(*args, **kwargs)
 
-    monkeypatch.setattr(
-        "opensquilla.provider.openai.httpx.AsyncClient", patched_async_client
-    )
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", patched_async_client)
     provider = OpenAIProvider(
         api_key="test",
         model="deepseek/deepseek-v4-flash",
@@ -1223,10 +1204,7 @@ def test_openrouter_header_generation_id_survives_local_stream_cancellation(
 
     asyncio.run(run_and_cancel())
 
-    rows = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
-    ]
+    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
     assert [row["event"] for row in rows] == [
         "llm.request",
         "llm.response_headers",
@@ -1290,10 +1268,7 @@ def test_openrouter_non_stream_header_generation_id_is_joined_to_response(
     events = asyncio.run(collect_fallback())
 
     assert any(isinstance(event, DoneEvent) for event in events)
-    rows = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
-    ]
+    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
     assert [row["event"] for row in rows] == [
         "llm.request",
         "llm.response_headers",
@@ -1398,10 +1373,7 @@ def test_openai_compatible_provider_terminalizes_cancelled_stream_trace(
 
     asyncio.run(_run())
 
-    rows = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
-    ]
+    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
     assert [row["event"] for row in rows] == ["llm.request", "llm.error"]
     assert rows[0]["call_id"] == rows[1]["call_id"]
     assert rows[1]["code"] == "cancelled"
@@ -1423,11 +1395,24 @@ def test_llm_trace_request_metadata_carries_compaction_proof(
         provider_kind="dashscope",
     )
 
-    events = _collect_events(provider, ChatConfig(provider_request_max_chars=100_000))
+    events = _collect_events(
+        provider,
+        ChatConfig(
+            provider_request_max_chars=100_000,
+            provider_request_correlation=ProviderRequestCorrelation(
+                session_id="session-id",
+                turn_id="turn-id",
+                execution_id="execution-id",
+                call_kind="auxiliary.compaction",
+            ),
+        ),
+    )
 
     assert any(isinstance(event, DoneEvent) for event in events)
     rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
     request_proof = rows[0]["metadata"]["request_proof"]
+    assert rows[0]["metadata"]["call_kind"] == "auxiliary.compaction"
+    assert rows[-1]["metadata"]["call_kind"] == "auxiliary.compaction"
     assert request_proof["compaction_tier"] == 0
     assert request_proof["retry_count"] == 0
     assert "compaction_tiny_guard_chars" in request_proof
@@ -1636,10 +1621,7 @@ def test_strict_source_edit_profile_provider_payload_exposes_exact_tool_surface(
 
     _collect_events(provider, cfg, tools=tools)
 
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
+    tool_names = {tool["function"]["name"] for tool in captured["payload"]["tools"]}
     assert tool_names == STRICT_SOURCE_EDIT_TOOL_NAMES
     assert STRICT_SOURCE_EDIT_FORBIDDEN_TOOL_NAMES.isdisjoint(tool_names)
 
@@ -1671,10 +1653,7 @@ def test_source_edit_v2_profile_provider_payload_exposes_exact_tool_surface(
 
     _collect_events(provider, cfg, tools=tools)
 
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
+    tool_names = {tool["function"]["name"] for tool in captured["payload"]["tools"]}
     assert tool_names == SOURCE_EDIT_V2_TOOL_NAMES
     assert STRICT_SOURCE_EDIT_FORBIDDEN_TOOL_NAMES.isdisjoint(tool_names)
 
@@ -1706,10 +1685,7 @@ def test_balanced_source_edit_profile_provider_payload_exposes_exact_tool_surfac
 
     _collect_events(provider, cfg, tools=tools)
 
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
+    tool_names = {tool["function"]["name"] for tool in captured["payload"]["tools"]}
     assert tool_names == BALANCED_SOURCE_EDIT_TOOL_NAMES
     assert {"write_file", "edit_file", "apply_patch", "execute_code"}.isdisjoint(tool_names)
 
@@ -1741,10 +1717,7 @@ def test_patch_fallback_source_edit_profile_provider_payload_adds_only_apply_pat
 
     _collect_events(provider, cfg, tools=tools)
 
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
+    tool_names = {tool["function"]["name"] for tool in captured["payload"]["tools"]}
     assert tool_names == PATCH_FALLBACK_SOURCE_EDIT_TOOL_NAMES
     assert {"write_file", "edit_file", "execute_code"}.isdisjoint(tool_names)
 
@@ -1770,10 +1743,7 @@ def test_scaffold_edit_profile_provider_payload_exposes_exact_tool_surface(
 
     _collect_events(provider, ChatConfig(), tools=tools)
 
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
+    tool_names = {tool["function"]["name"] for tool in captured["payload"]["tools"]}
     assert tool_names == SCAFFOLD_EDIT_TOOL_NAMES
     assert SCAFFOLD_FORBIDDEN_TOOL_NAMES.isdisjoint(tool_names)
     assert "apply_patch" not in tool_names
@@ -1803,10 +1773,7 @@ def test_scaffold_patch_profile_provider_payload_adds_only_apply_patch(
 
     _collect_events(provider, ChatConfig(), tools=tools)
 
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
+    tool_names = {tool["function"]["name"] for tool in captured["payload"]["tools"]}
     assert tool_names == SCAFFOLD_PATCH_TOOL_NAMES
     assert SCAFFOLD_FORBIDDEN_TOOL_NAMES.isdisjoint(tool_names)
     descriptions = _payload_tool_descriptions(captured["payload"])
@@ -3337,9 +3304,10 @@ def test_dashscope_repeated_history_tool_calls_preserves_duplicate_replay_protoc
 
     messages = captured["payload"]["messages"]
     tool_call_messages = _assistant_tool_call_messages(messages)
-    assert [
-        message["tool_calls"][0]["id"] for message in tool_call_messages
-    ] == ["call_1", "call_2"]
+    assert [message["tool_calls"][0]["id"] for message in tool_call_messages] == [
+        "call_1",
+        "call_2",
+    ]
     for message in tool_call_messages:
         raw_args = message["tool_calls"][0]["function"]["arguments"]
         assert json.loads(raw_args) == {"action": "poll", "session_id": "abc"}
@@ -3403,9 +3371,10 @@ def test_dashscope_repeated_non_process_tool_calls_preserves_duplicate_replay_pr
 
     messages = captured["payload"]["messages"]
     tool_call_messages = _assistant_tool_call_messages(messages)
-    assert [
-        message["tool_calls"][0]["id"] for message in tool_call_messages
-    ] == ["call_1", "call_2"]
+    assert [message["tool_calls"][0]["id"] for message in tool_call_messages] == [
+        "call_1",
+        "call_2",
+    ]
     for message in tool_call_messages:
         raw_args = message["tool_calls"][0]["function"]["arguments"]
         assert json.loads(raw_args) == {"path": "/tmp/example.txt"}
@@ -3471,9 +3440,10 @@ def test_dashscope_repeated_exec_command_history_preserves_duplicate_replay_prot
 
     messages = captured["payload"]["messages"]
     tool_call_messages = _assistant_tool_call_messages(messages)
-    assert [
-        message["tool_calls"][0]["id"] for message in tool_call_messages
-    ] == ["call_1", "call_2"]
+    assert [message["tool_calls"][0]["id"] for message in tool_call_messages] == [
+        "call_1",
+        "call_2",
+    ]
     for message in tool_call_messages:
         raw_args = message["tool_calls"][0]["function"]["arguments"]
         assert json.loads(raw_args) == {"command": command}
@@ -3563,9 +3533,11 @@ def test_dashscope_repeated_exec_command_summary_preserves_structured_history(
 
     messages = captured["payload"]["messages"]
     tool_call_messages = _assistant_tool_call_messages(messages)
-    assert [
-        message["tool_calls"][0]["id"] for message in tool_call_messages
-    ] == ["call_1", "call_edit", "call_2"]
+    assert [message["tool_calls"][0]["id"] for message in tool_call_messages] == [
+        "call_1",
+        "call_edit",
+        "call_2",
+    ]
     tool_messages = _tool_messages(messages)
     assert [message["tool_call_id"] for message in tool_messages] == [
         "call_1",
@@ -3632,9 +3604,10 @@ def test_dashscope_repeated_apply_patch_history_preserves_duplicate_replay_proto
 
     messages = captured["payload"]["messages"]
     tool_call_messages = _assistant_tool_call_messages(messages)
-    assert [
-        message["tool_calls"][0]["id"] for message in tool_call_messages
-    ] == ["call_1", "call_2"]
+    assert [message["tool_calls"][0]["id"] for message in tool_call_messages] == [
+        "call_1",
+        "call_2",
+    ]
     for message in tool_call_messages:
         raw_args = message["tool_calls"][0]["function"]["arguments"]
         assert json.loads(raw_args) == {"patch": patch}
@@ -4622,6 +4595,36 @@ def test_openrouter_still_sends_temperature(monkeypatch: Any) -> None:
     assert captured["payload"]["temperature"] == 0
 
 
+def test_openrouter_sends_seed_when_configured(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-pro",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    _collect(provider, ChatConfig(seed=42))
+
+    assert captured["payload"]["seed"] == 42
+
+
+def test_openrouter_omits_seed_by_default(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-pro",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    _collect(provider, ChatConfig())
+
+    assert "seed" not in captured["payload"]
+
+
 def test_openai_payload_omits_top_p_by_default(monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
@@ -5142,10 +5145,7 @@ def test_stream_dashscope_rejects_qwen_text_tool_call_with_schema_errors(
         events = _collect_events(provider, ChatConfig(), tools=[tool])
 
     assert not any(isinstance(event, ToolUseEndEvent) for event in events)
-    assert any(
-        item["event"] == "provider.qwen_text_tool_call_rejected_schema"
-        for item in captured
-    )
+    assert any(item["event"] == "provider.qwen_text_tool_call_rejected_schema" for item in captured)
 
 
 def test_stream_dashscope_ignores_empty_tool_call_chunks(
@@ -5214,9 +5214,7 @@ def test_stream_dashscope_ignores_empty_tool_call_chunks(
         events = _collect_events(provider, ChatConfig(), tools=[tool])
 
     assert not any(isinstance(event, ToolUseEndEvent) for event in events)
-    assert any(
-        item["event"] == "dashscope.stream_tool_chunk_sanitized" for item in captured
-    )
+    assert any(item["event"] == "dashscope.stream_tool_chunk_sanitized" for item in captured)
 
 
 def test_stream_dashscope_canonicalizes_repaired_edit_file_aliases(
@@ -6325,6 +6323,7 @@ def test_tencent_token_plan_thinking_payload_and_url_join(monkeypatch: Any) -> N
     assert captured["url"] == "https://api.lkeap.cloud.tencent.com/plan/v3/chat/completions"
     assert captured["payload"]["thinking"] == {"type": "enabled"}
     assert captured["payload"]["reasoning_effort"] == "low"
+
 
 def test_openrouter_routing_pin_strict_env_sends_only_without_fallbacks(
     monkeypatch: Any,

@@ -120,9 +120,7 @@ def _gate_payload(ctx: TurnContext) -> dict[str, Any]:
     return {
         "current_user_text": _truncate(ctx.semantic_message, 1200),
         "recent_user_texts": [
-            _truncate(item, 600)
-            for item in history_user_texts[-4:]
-            if isinstance(item, str)
+            _truncate(item, 600) for item in history_user_texts[-4:] if isinstance(item, str)
         ],
         "prev_assistant_text": _truncate(
             ctx.metadata.get("router_prev_assistant_text"),
@@ -171,11 +169,7 @@ async def _call_gate_provider(ctx: TurnContext) -> str:
     budget_model = (
         execution_target.model
         if isinstance(execution_target, VisionFollowupGateExecutionTarget)
-        else str(
-            ctx.metadata.get("router_vision_followup_gate_model", "")
-            or ctx.model
-            or ""
-        )
+        else str(ctx.metadata.get("router_vision_followup_gate_model", "") or ctx.model or "")
     )
     cfg = _router_cfg(ctx)
     timeout = float(getattr(cfg, "vision_followup_gate_timeout_seconds", 3.0) or 3.0)
@@ -203,6 +197,7 @@ async def _call_gate_provider(ctx: TurnContext) -> str:
     )
     config = ChatConfig(
         max_tokens=budget.max_output_tokens,
+        seed=getattr(getattr(ctx.config, "llm", None), "seed", None),
         temperature=0,
         timeout=timeout,
         system=system_prompt,
@@ -281,8 +276,7 @@ def _apply_explicit_opt_out(ctx: TurnContext) -> None:
 def _current_text_explicitly_opts_out_image(ctx: TurnContext) -> bool:
     text = str(ctx.semantic_message or ctx.message or "")
     if not text.strip() or (
-        not _IMAGE_REF_RE.search(text)
-        and not any(ref in text for ref in _ZH_IMAGE_REFS)
+        not _IMAGE_REF_RE.search(text) and not any(ref in text for ref in _ZH_IMAGE_REFS)
     ):
         return False
     return bool(_IMAGE_OPTOUT_RE.search(text))
@@ -311,15 +305,10 @@ def _apply_unknown_fallback(ctx: TurnContext, *, source: str, reason: str) -> No
     cfg = _router_cfg(ctx)
     recent_limit = int(getattr(cfg, "vision_followup_gate_fallback_recent_turns", 2) or 0)
     policy = str(
-        getattr(cfg, "vision_followup_gate_unknown_policy", "image_if_recent")
-        or "image_if_recent"
+        getattr(cfg, "vision_followup_gate_unknown_policy", "image_if_recent") or "image_if_recent"
     )
     turns = _turns_since_last_image(ctx)
-    needs_image = (
-        policy == "image_if_recent"
-        and turns is not None
-        and turns <= recent_limit
-    )
+    needs_image = policy == "image_if_recent" and turns is not None and turns <= recent_limit
     ctx.metadata["router_vision_followup_gate_decision"] = "unknown"
     ctx.metadata["router_vision_followup_gate_confidence"] = 0.0
     ctx.metadata["router_vision_followup_gate_reason"] = reason

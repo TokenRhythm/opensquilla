@@ -203,6 +203,32 @@ def _document_context(params: dict[str, Any]) -> DocumentTurnContext | None:
     return DocumentTurnContext(document.strip(), head.strip())
 
 
+def _complex_task_mode(params: dict[str, Any]) -> bool:
+    camel = params.get("complexTaskMode")
+    snake = params.get("complex_task_mode")
+    if camel is not None and snake is not None and camel != snake:
+        raise ValueError("complexTaskMode and complex_task_mode must match")
+    value = camel if camel is not None else snake
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError("complexTaskMode must be a boolean")
+    return value
+
+
+def _single_agent_mode(params: dict[str, Any]) -> bool:
+    camel = params.get("singleAgentMode")
+    snake = params.get("single_agent_mode")
+    if camel is not None and snake is not None and camel != snake:
+        raise ValueError("singleAgentMode and single_agent_mode must match")
+    value = camel if camel is not None else snake
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError("singleAgentMode must be a boolean")
+    return value
+
+
 def decode_admit_turn(
     params: dict[str, Any],
     *,
@@ -212,6 +238,10 @@ def decode_admit_turn(
     pending_input: PendingInputGuard | None = None,
     fingerprint_params: dict[str, Any] | None = None,
 ) -> AdmitTurn:
+    complex_task_mode = _complex_task_mode(params)
+    single_agent_mode = _single_agent_mode(params)
+    if complex_task_mode and single_agent_mode:
+        raise ValueError("complexTaskMode and singleAgentMode are mutually exclusive")
     if "message" not in params:
         raise ValueError("params.message is required")
     message = params["message"]
@@ -289,5 +319,7 @@ def decode_admit_turn(
             "collaborationMode", params.get("collaboration_mode")
         ),
         initial_routing_mode=cast(InitialRoutingMode | None, routing),
+        complex_task_mode=complex_task_mode,
+        single_agent_mode=single_agent_mode,
         pending_input=pending_input,
     )

@@ -409,10 +409,7 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
     budget = None
     if config is None:
         config = ChatConfig(provider_request_correlation=correlation)
-    elif (
-        correlation is not None
-        and getattr(config, "provider_request_correlation", None) is None
-    ):
+    elif correlation is not None and getattr(config, "provider_request_correlation", None) is None:
         config = config.model_copy(
             update={"provider_request_correlation": correlation},
         )
@@ -431,9 +428,7 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
         budget = resolve_auxiliary_request_budget(
             provider,
             max_output_tokens=int(getattr(config, "max_tokens", 0) or 0),
-            provider_request_max_chars=int(
-                getattr(config, "provider_request_max_chars", 0) or 0
-            ),
+            provider_request_max_chars=int(getattr(config, "provider_request_max_chars", 0) or 0),
         )
     config = config.model_copy(
         update={
@@ -574,9 +569,7 @@ async def _image_generate_impl(
     if not getattr(config, "enabled", False):
         raise ToolError("Image generation is disabled")
     if not _image_generation_binding_is_active(config):
-        raise ToolError(
-            "Image generation is inactive because its bound LLM provider is not active"
-        )
+        raise ToolError("Image generation is inactive because its bound LLM provider is not active")
 
     candidates = _resolve_image_generation_candidates(model, config)
     if not candidates:
@@ -1048,8 +1041,10 @@ def _configured_provider_config(provider_name: str, model: str):
         api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         base_url = base_url or os.environ.get("ANTHROPIC_BASE_URL", "")
     elif provider_name == "openrouter":
-        api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "") or os.environ.get(
-            "OPENAI_API_KEY", ""
+        api_key = (
+            api_key
+            or os.environ.get("OPENROUTER_API_KEY", "")
+            or os.environ.get("OPENAI_API_KEY", "")
         )
         base_url = base_url or os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     else:
@@ -1080,18 +1075,23 @@ def _resolve_vision_provider_config(*, default_model: str):
 
 
 def _resolve_provider_config(scope: str, *, default_model: str):
-    from opensquilla.provider.selector import ProviderConfig
-
     provider_name = (
         os.environ.get(f"OPENSQUILLA_{scope}_PROVIDER")
         or os.environ.get("OPENSQUILLA_LLM_PROVIDER")
+        or _config_value(_media_llm_config, "provider", "")
         or "openrouter"
     )
     model = (
         os.environ.get(f"OPENSQUILLA_{scope}_MODEL")
         or os.environ.get("OPENSQUILLA_LLM_MODEL")
+        or _config_value(_media_llm_config, "model", "")
         or default_model
     )
+
+    if _media_gateway_config is not None:
+        return _configured_provider_config(provider_name, model)
+
+    from opensquilla.provider.selector import ProviderConfig
 
     if provider_name == "anthropic":
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -1389,9 +1389,7 @@ def _tts_voice_settings(
     settings: dict[str, Any] = {}
     resolved_stability = _bounded_float(
         "Stability",
-        stability
-        if stability is not None
-        else getattr(tts_config, "stability", None),
+        stability if stability is not None else getattr(tts_config, "stability", None),
     )
     resolved_similarity = _bounded_float(
         "Similarity boost",
@@ -1440,9 +1438,7 @@ def _shared_voice_summary(voice: dict[str, Any]) -> dict[str, Any]:
 
 def _provider_quota_exceeded(error: RuntimeError) -> bool:
     text = str(error).lower()
-    return "quota_exceeded" in text or (
-        "credits remaining" in text and "required" in text
-    )
+    return "quota_exceeded" in text or ("credits remaining" in text and "required" in text)
 
 
 def _short_song_preview_lyrics(lyrics: str) -> str:
@@ -1566,12 +1562,9 @@ async def voice_convert(
         )
     provider_config = _audio_provider_config(config)
     model_id = str(
-        getattr(provider_config, "voice_conversion_model", "")
-        or "eleven_multilingual_sts_v2"
+        getattr(provider_config, "voice_conversion_model", "") or "eleven_multilingual_sts_v2"
     )
-    output_format = str(
-        getattr(provider_config, "music_output_format", "") or "mp3_44100_128"
-    )
+    output_format = str(getattr(provider_config, "music_output_format", "") or "mp3_44100_128")
     resolved, audio_bytes, mime_type = await _resolve_supported_audio_file_for_tool(
         tool_name="voice_convert",
         path=source_audio,
@@ -1837,8 +1830,7 @@ async def music_generate(
                 prompt=final_prompt,
                 model_id=str(getattr(provider_config, "music_model", "") or "music_v1"),
                 output_format=str(
-                    getattr(provider_config, "music_output_format", "")
-                    or "mp3_44100_128"
+                    getattr(provider_config, "music_output_format", "") or "mp3_44100_128"
                 ),
                 duration_seconds=duration_seconds,
                 force_instrumental=True,
@@ -1896,9 +1888,7 @@ async def song_generate(
     provider = _elevenlabs_provider(config)
     lyrics_text = lyrics.strip()
     model_id = str(getattr(provider_config, "music_model", "") or "music_v1")
-    output_format = str(
-        getattr(provider_config, "music_output_format", "") or "mp3_44100_128"
-    )
+    output_format = str(getattr(provider_config, "music_output_format", "") or "mp3_44100_128")
     try:
         result = await provider.generate_music(
             MusicGenerationRequest(
@@ -2109,9 +2099,7 @@ async def voice_search(
         },
         "voice": {
             "type": "string",
-            "description": (
-                "ElevenLabs voice identifier. Uses audio.tts.voice when omitted."
-            ),
+            "description": ("ElevenLabs voice identifier. Uses audio.tts.voice when omitted."),
         },
         "output_path": {
             "type": "string",
@@ -2138,9 +2126,7 @@ async def voice_search(
         },
         "similarity_boost": {
             "type": "number",
-            "description": (
-                "Optional ElevenLabs similarity boost voice setting (0.0 to 1.0)."
-            ),
+            "description": ("Optional ElevenLabs similarity boost voice setting (0.0 to 1.0)."),
             "minimum": 0.0,
             "maximum": 1.0,
         },

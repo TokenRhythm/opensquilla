@@ -159,6 +159,8 @@ class AdmitTurn:
     queue_mode: str | None = None
     initial_collaboration_mode: InitialCollaborationMode | None = None
     initial_routing_mode: InitialRoutingMode | None = None
+    complex_task_mode: bool = False
+    single_agent_mode: bool = False
     pending_input: PendingInputGuard | None = None
 
     # Only internal Plan/background producers supply these controls. Gateway

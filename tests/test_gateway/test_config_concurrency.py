@@ -11,14 +11,17 @@ import pytest
 from opensquilla.gateway.config import GatewayConfig
 
 
-def test_fresh_install_task_concurrency_defaults_to_eight() -> None:
-    assert GatewayConfig().task_runtime.max_concurrency == 8
+def test_fresh_install_task_concurrency_uses_split_sixteen_slot_pool() -> None:
+    config = GatewayConfig().task_runtime
+    assert config.max_concurrency == 16
+    assert config.parent_max_concurrency == 8
 
 
-def test_generated_config_example_uses_desktop_default_eight() -> None:
+def test_generated_config_example_uses_split_sixteen_slot_pool() -> None:
     example = Path(__file__).resolve().parents[2] / "opensquilla.toml.example"
     payload = tomllib.loads(example.read_text(encoding="utf-8"))
-    assert payload["task_runtime"]["max_concurrency"] == 8
+    assert payload["task_runtime"]["max_concurrency"] == 16
+    assert payload["task_runtime"]["parent_max_concurrency"] == 8
 
 
 def test_task_max_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -31,14 +34,14 @@ def test_task_max_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_invalid_env_fallback(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Invalid task concurrency falls back to the fresh-install default 8."""
+    """Invalid task concurrency falls back to the fresh-install default 16."""
     monkeypatch.setenv("OPENSQUILLA_TASK_MAX_CONCURRENCY", "abc")
     import logging
 
     with caplog.at_level(logging.WARNING):
         config = GatewayConfig()
 
-    assert config.task_runtime.max_concurrency == 8
+    assert config.task_runtime.max_concurrency == 16
     assert any(
         "OPENSQUILLA_TASK_MAX_CONCURRENCY" in record.message
         for record in caplog.records
@@ -80,14 +83,14 @@ def test_channel_inflight_cap_invalid_fallback(
 def test_zero_env_fallback(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """OPENSQUILLA_TASK_MAX_CONCURRENCY=0 falls back to default 8 with a warning."""
+    """OPENSQUILLA_TASK_MAX_CONCURRENCY=0 falls back to default 16 with a warning."""
     monkeypatch.setenv("OPENSQUILLA_TASK_MAX_CONCURRENCY", "0")
     import logging
 
     with caplog.at_level(logging.WARNING):
         config = GatewayConfig()
 
-    assert config.task_runtime.max_concurrency == 8
+    assert config.task_runtime.max_concurrency == 16
     assert any(
         "OPENSQUILLA_TASK_MAX_CONCURRENCY" in record.message
         for record in caplog.records
@@ -98,14 +101,14 @@ def test_zero_env_fallback(
 def test_negative_env_fallback(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """OPENSQUILLA_TASK_MAX_CONCURRENCY=-5 falls back to default 8 with a warning."""
+    """OPENSQUILLA_TASK_MAX_CONCURRENCY=-5 falls back to default 16 with a warning."""
     monkeypatch.setenv("OPENSQUILLA_TASK_MAX_CONCURRENCY", "-5")
     import logging
 
     with caplog.at_level(logging.WARNING):
         config = GatewayConfig()
 
-    assert config.task_runtime.max_concurrency == 8
+    assert config.task_runtime.max_concurrency == 16
     assert any(
         "OPENSQUILLA_TASK_MAX_CONCURRENCY" in record.message
         for record in caplog.records
@@ -118,6 +121,7 @@ def test_explicit_legacy_task_concurrency_is_preserved() -> None:
 
     config = GatewayConfig(task_runtime={"max_concurrency": 4})
     assert config.task_runtime.max_concurrency == 4
+    assert config.task_runtime.parent_max_concurrency == 4
 
 
 def test_explicit_legacy_task_concurrency_env_is_preserved(
@@ -126,7 +130,16 @@ def test_explicit_legacy_task_concurrency_env_is_preserved(
     """The legacy four-slot environment override remains authoritative."""
 
     monkeypatch.setenv("OPENSQUILLA_TASK_MAX_CONCURRENCY", "4")
-    assert GatewayConfig().task_runtime.max_concurrency == 4
+    config = GatewayConfig().task_runtime
+    assert config.max_concurrency == 4
+    assert config.parent_max_concurrency == 4
+
+
+def test_parent_concurrency_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_TASK_PARENT_MAX_CONCURRENCY", "6")
+    config = GatewayConfig().task_runtime
+    assert config.max_concurrency == 16
+    assert config.parent_max_concurrency == 6
 
 
 def test_channel_zero_env_fallback(

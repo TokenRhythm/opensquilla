@@ -319,9 +319,7 @@ class ProviderActivityEvent:
     kind: Literal["provider_activity"] = field(default="provider_activity", init=False)
     schema_version: int = 1
     activity_id: str = ""
-    phase: Literal["requesting", "reasoning", "retry_wait", "retrying", "fallback"] = (
-        "requesting"
-    )
+    phase: Literal["requesting", "reasoning", "retry_wait", "retrying", "fallback"] = "requesting"
     reason: Literal[
         "initial",
         "rate_limited",
@@ -552,6 +550,7 @@ class ChatConfig(BaseModel):
     """Runtime options for a single chat call."""
 
     max_tokens: int = 16384
+    seed: int | None = None
     temperature: float | None = None
     top_p: float | None = None
     system: str | None = None
@@ -636,9 +635,7 @@ class ChatConfig(BaseModel):
 
     def model_post_init(self, __context: Any) -> None:
         if self.thinking_budget_explicit is None:
-            self.thinking_budget_explicit = (
-                "thinking_budget_tokens" in self.model_fields_set
-            )
+            self.thinking_budget_explicit = "thinking_budget_tokens" in self.model_fields_set
         if self.provider_request_max_chars_explicit_cap is None:
             self.provider_request_max_chars_explicit_cap = (
                 max(0, int(self.provider_request_max_chars or 0))
@@ -806,9 +803,7 @@ class FailureInjector:
     assertions.
     """
 
-    script: list[Literal["succeed"] | ProviderFailureKind | Exception] = field(
-        default_factory=list
-    )
+    script: list[Literal["succeed"] | ProviderFailureKind | Exception] = field(default_factory=list)
     consumed: list[Literal["succeed"] | ProviderFailureKind | Exception] = field(
         default_factory=list, init=False
     )

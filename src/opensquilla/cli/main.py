@@ -110,8 +110,7 @@ def _load_env_for_active_home() -> None:
 _preactivate_profile_from_argv(sys.argv)
 
 _RECOVERY_OFFLINE = (
-    os.environ.get("OPENSQUILLA_RECOVERY_OFFLINE", "").strip().lower()
-    in {"1", "true", "yes", "on"}
+    os.environ.get("OPENSQUILLA_RECOVERY_OFFLINE", "").strip().lower() in {"1", "true", "yes", "on"}
     or _top_level_command(sys.argv) == "recovery"
     or _is_offline_import_verification(sys.argv)
 )
@@ -127,8 +126,6 @@ if not _RECOVERY_OFFLINE:
     _load_env_for_active_home()
     warn_if_proxy_ignored()
 
-from opensquilla.cli.agent_cmd import run_agent_command  # noqa: E402
-from opensquilla.cli.agents_cmd import agents_app  # noqa: E402
 from opensquilla.cli.bundle_cmd import bundle_command  # noqa: E402
 from opensquilla.cli.channels_cmd import channels_app  # noqa: E402
 from opensquilla.cli.codetask_cmd import codetask_app  # noqa: E402
@@ -182,10 +179,10 @@ def _main_callback(
         _load_env_for_active_home()
         warn_if_proxy_ignored()
 
+
 # ── Sub-apps ─────────────────────────────────────────────────────────────────
 
 app.add_typer(channels_app, name="channels")
-app.add_typer(agents_app, name="agents")
 app.add_typer(config_app, name="config")
 app.add_typer(cost_app, name="cost")
 app.add_typer(diagnostics_app, name="diagnostics")
@@ -324,8 +321,7 @@ def memory_index_cmd(
         print_json(payload)
         return
     console.print(
-        f"memory index agent={payload.get('agentId', agent_id)} "
-        f"force={bool(payload.get('force'))}"
+        f"memory index agent={payload.get('agentId', agent_id)} force={bool(payload.get('force'))}"
     )
 
 
@@ -935,190 +931,6 @@ app.add_typer(replay_app, name="replay")
 # ── top-level commands ────────────────────────────────────────────────────────
 
 
-@app.command("agent")
-def agent(
-    message: str = typer.Option(..., "--message", "-m", help="Message to send"),
-    agent_id: str = typer.Option("main", "--agent", help="Agent identifier"),
-    session_id: str = typer.Option("", "--session-id", help="Session key/id to use"),
-    model: str = typer.Option("", "--model", help="Model override"),
-    workspace: str = typer.Option("", "--workspace", help="Workspace root for this run"),
-    workspace_strict: bool | None = typer.Option(
-        None,
-        "--workspace-strict/--no-workspace-strict",
-        help="Restrict read-side file tools to --workspace",
-    ),
-    workspace_lockdown: bool = typer.Option(
-        False,
-        "--workspace-lockdown",
-        help=(
-            "Opt in to automation write containment: writes must stay under "
-            "--workspace or --scratch-dir."
-        ),
-    ),
-    workspace_lockdown_deny_paths: list[str] = typer.Option(
-        [],
-        "--workspace-lockdown-deny-paths",
-        help=(
-            "Workspace-relative write deny glob(s) for automation containment; "
-            "repeat or comma-separate."
-        ),
-    ),
-    scratch_dir: str = typer.Option(
-        "",
-        "--scratch-dir",
-        help="Directory for temporary scripts, logs, debug output, and candidate patches.",
-    ),
-    timeout: float | None = typer.Option(
-        None, "--timeout", "-T", help="Total agent timeout in seconds (0=unlimited)"
-    ),
-    max_iterations: int | None = typer.Option(
-        None,
-        "--max-iterations",
-        min=0,
-        help="Maximum agent model/tool loop iterations (0=unlimited)",
-    ),
-    iteration_timeout_seconds: float | None = typer.Option(
-        None,
-        "--iteration-timeout-seconds",
-        help="Per-iteration timeout in seconds (one LLM call + its tool executions)",
-    ),
-    tool_timeout_seconds: float | None = typer.Option(
-        None,
-        "--tool-timeout-seconds",
-        help="Per-tool execution timeout in seconds",
-    ),
-    request_timeout_seconds: float | None = typer.Option(
-        None,
-        "--request-timeout-seconds",
-        help="Single LLM HTTP/streaming request timeout in seconds",
-    ),
-    max_provider_retries: int | None = typer.Option(
-        None,
-        "--max-provider-retries",
-        min=0,
-        help="Maximum provider-level retries for transient errors",
-    ),
-    length_capped_continuations: int | None = typer.Option(
-        None,
-        "--length-capped-continuations",
-        min=1,
-        help="Maximum automatic continuations after provider output reaches its length limit",
-    ),
-    thinking: str = typer.Option(
-        "",
-        "--thinking",
-        help="Thinking level override: off|minimal|low|medium|high|xhigh|adaptive",
-    ),
-    transcript_path: str = typer.Option(
-        "", "--transcript-path", help="Write benchmark-compatible JSONL transcript"
-    ),
-    usage_path: str = typer.Option("", "--usage-path", help="Write usage JSON to this file"),
-    event_stream_stderr: bool = typer.Option(
-        False,
-        "--event-stream-stderr",
-        help="Write stable v1 progress event JSONL to stderr",
-    ),
-    session_db_path: str = typer.Option(
-        ":memory:",
-        "--session-db-path",
-        help="Persistent session SQLite path for cross-invocation replay",
-    ),
-    no_memory_capture: bool = typer.Option(
-        False,
-        "--no-memory-capture",
-        help="Do not write this invocation to durable searchable memory",
-    ),
-    file_paths: list[str] = typer.Option(
-        [],
-        "--file",
-        "-f",
-        help="Attach a local file; repeat for multiple files",
-    ),
-    unattended: bool = typer.Option(
-        True,
-        "--unattended/--interactive",
-        help=(
-            "Run without a live approval surface. Unattended is the default for "
-            "single-shot automation."
-        ),
-    ),
-    stateless: bool = typer.Option(
-        False,
-        "--stateless/--no-stateless",
-        help="Use clean-room prompt bootstrap; does not change --unattended semantics.",
-    ),
-    clean_room: bool = typer.Option(
-        False,
-        "--clean-room",
-        help="Alias for --stateless.",
-    ),
-    stateless_keep_project_rules: bool = typer.Option(
-        False,
-        "--stateless-keep-project-rules",
-        help="With clean-room bootstrap, keep AGENTS.md project rules only.",
-    ),
-    permissions: str | None = typer.Option(
-        None,
-        "--permissions",
-        help=(
-            "Permission profile for single-shot runs: restricted, bypass, or full. "
-            "Defaults to OPENSQUILLA_AGENT_PERMISSIONS, then permissions.default_mode."
-        ),
-    ),
-    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
-) -> None:
-    """Run a single agent turn for automation."""
-    from opensquilla.cli.output import emit_error
-    from opensquilla.recovery import ProfileLockBusyError, guarded_desktop_profile
-
-    try:
-        with guarded_desktop_profile():
-            run_agent_command(
-                message=message,
-                agent_id=agent_id,
-                session_id=session_id,
-                model=model,
-                workspace=workspace,
-                workspace_strict=workspace_strict,
-                workspace_lockdown=workspace_lockdown,
-                workspace_lockdown_deny_paths=workspace_lockdown_deny_paths,
-                scratch_dir=scratch_dir,
-                thinking=thinking,
-                timeout=timeout,
-                max_iterations=max_iterations,
-                iteration_timeout_seconds=iteration_timeout_seconds,
-                tool_timeout_seconds=tool_timeout_seconds,
-                request_timeout_seconds=request_timeout_seconds,
-                max_provider_retries=max_provider_retries,
-                length_capped_continuations=length_capped_continuations,
-                transcript_path=transcript_path,
-                usage_path=usage_path,
-                event_stream_stderr=event_stream_stderr,
-                session_db_path=session_db_path,
-                no_memory_capture=no_memory_capture,
-                file_paths=file_paths,
-                unattended=unattended,
-                stateless=stateless,
-                clean_room=clean_room,
-                stateless_keep_project_rules=stateless_keep_project_rules,
-                permissions=permissions,
-                json_output=json_output,
-            )
-    except ProfileLockBusyError:
-        emit_error(
-            "This profile is already in use by another OpenSquilla writer. "
-            "The standalone 'opensquilla agent' command cannot share a profile with "
-            "another writer, including an active Desktop Gateway. To use a running "
-            "Gateway, use a Gateway-backed command such as 'opensquilla chat' (set "
-            "OPENSQUILLA_GATEWAY_URL and OPENSQUILLA_GATEWAY_TOKEN when needed); "
-            "otherwise, set both OPENSQUILLA_STATE_DIR and "
-            "OPENSQUILLA_GATEWAY_STATE_DIR to isolated directories for this agent run.",
-            json_output=json_output,
-            code="profile_lock_busy",
-        )
-        raise typer.Exit(code=1) from None
-
-
 @app.command("chat")
 def chat(
     model: str = typer.Option("", "--model", "-m", help="Model override"),
@@ -1244,6 +1056,7 @@ def reset_cmd(
         typer.echo("  Flush mode: skipped (empty transcript)")
     else:
         typer.echo(f"  Flush mode: {mode}")
+
 
 @app.command("version")
 def version_cmd(

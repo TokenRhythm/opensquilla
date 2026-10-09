@@ -108,11 +108,15 @@ def test_default_registry_removes_obsolete_wrapper_tools_but_keeps_canonical_too
     assert registry.get("generate_image") is None
     assert registry.get("spawn_subagent") is None
     assert registry.get("send_message") is None
+    assert registry.get("sessions_spawn") is None
+    assert registry.get("sessions_send") is None
+    assert registry.get("sessions_yield") is None
+    assert registry.get("agents_list") is None
+    assert registry.get("subagents") is None
 
     assert registry.get("image_generate") is not None
-    assert registry.get("sessions_spawn") is not None
-    assert registry.get("sessions_send") is not None
-    assert registry.get("subagents") is not None
+    assert registry.get("delegate_task") is not None
+    assert registry.get("interrupt_agent") is not None
 
 
 def test_retired_update_plan_selector_is_ignored_for_upgrade_compatibility() -> None:
@@ -132,7 +136,7 @@ def test_retired_update_plan_selector_is_ignored_for_upgrade_compatibility() -> 
     assert "update_plan" not in {tool.name for tool in registry.to_tool_definitions(ctx)}
 
 
-def test_owner_schema_keeps_canonical_tools_and_subagents_stays_explicit_only() -> None:
+def test_owner_schema_keeps_only_new_agent_controls() -> None:
     import opensquilla.tools.builtin  # noqa: F401
     from opensquilla.tools.registry import get_default_registry
 
@@ -140,8 +144,14 @@ def test_owner_schema_keeps_canonical_tools_and_subagents_stays_explicit_only() 
     owner_ctx = ToolContext(is_owner=True, caller_kind=CallerKind.AGENT)
 
     default_names = {tool.name for tool in registry.to_tool_definitions(owner_ctx)}
-    assert {"create_pptx", "image_generate", "sessions_spawn", "sessions_send"} <= default_names
-    assert "subagents" not in default_names
+    assert {"create_pptx", "image_generate", "delegate_task", "interrupt_agent"} <= default_names
+    assert {
+        "agents_list",
+        "sessions_send",
+        "sessions_spawn",
+        "sessions_yield",
+        "subagents",
+    }.isdisjoint(default_names)
 
     surfaced_ctx = ToolContext(
         is_owner=True,
@@ -149,7 +159,7 @@ def test_owner_schema_keeps_canonical_tools_and_subagents_stays_explicit_only() 
         surfaced_tools={"subagents"},
     )
     surfaced_names = {tool.name for tool in registry.to_tool_definitions(surfaced_ctx)}
-    assert "subagents" in surfaced_names
+    assert "subagents" not in surfaced_names
     assert "create_pptx" in surfaced_names
 
 
@@ -301,8 +311,7 @@ def test_verified_channel_admin_matches_web_owner_runtime_tool_visibility() -> N
     web_names = {tool.name for tool in registry.to_tool_definitions(web_owner_ctx)}
 
     assert channel_names == web_names
-    assert "agents_list" in channel_names
-    assert {"agents_list", "subagents"}.isdisjoint(channel_admin_ctx.denied_tools)
+    assert {"agents_list", "subagents"}.isdisjoint(channel_names)
 
 
 def test_channel_media_policy_surfaces_basic_pptx_fallback_explicitly() -> None:
@@ -334,7 +343,7 @@ def test_channel_media_policy_surfaces_basic_pptx_fallback_explicitly() -> None:
 
     names = {tool.name for tool in registry.to_tool_definitions(ctx)}
 
-    assert names == {"session_status", "create_pptx"}
+    assert names == {"create_pptx"}
 
 
 def test_channel_runtime_profile_exposes_explicit_category_tools_not_host_mutation() -> None:
@@ -468,6 +477,30 @@ async def test_effective_tools_hide_private_memory_reads_for_cron_and_subagents(
 
     assert cron_names == {"read_file"}
     assert subagent_names == {"read_file"}
+
+
+@pytest.mark.asyncio
+async def test_subagent_keeps_recursive_agent_controls_when_runtime_exists() -> None:
+    registry = ToolRegistry()
+    registry.register(_spec("delegate_task"), _handler)
+    registry.register(_spec("interrupt_agent"), _handler)
+    registry.register(_spec("task_board"), _handler)
+
+    names = {
+        tool["name"]
+        for tool in await registry.effective_tools(
+            session_key="agent:main:subagent:run-1",
+            agent_id="main",
+            caller_kind=CallerKind.SUBAGENT,
+            interaction_mode=InteractionMode.UNATTENDED,
+            tool_surface_capabilities=ToolSurfaceCapabilities(
+                session_manager=True,
+                task_runtime=True,
+            ),
+        )
+    }
+
+    assert names == {"delegate_task", "interrupt_agent", "task_board"}
 
 
 @pytest.mark.asyncio
@@ -695,7 +728,7 @@ async def test_dispatch_denies_private_memory_reads_for_shared_sessions() -> Non
 @pytest.mark.asyncio
 async def test_catalog_and_effective_names_agree_for_unattended_cli_context() -> None:
     registry = ToolRegistry()
-    registry.register(_spec("sessions_spawn"), _handler)
+    registry.register(_spec("delegate_task"), _handler)
     registry.register(_spec("sessions_list"), _handler)
     registry.register(_spec("read_file"), _handler)
 

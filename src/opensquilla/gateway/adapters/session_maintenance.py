@@ -73,6 +73,7 @@ from opensquilla.provider.types import (
 )
 from opensquilla.session.compaction import (
     CompactionConfig,
+    CompactionParentRequest,
     arm_compaction_deadline,
     await_compaction_phase,
     build_compaction_config_from_provider,
@@ -118,9 +119,11 @@ def _require_session_key(params: dict[str, Any] | None) -> str:
 @dataclass(frozen=True, slots=True)
 class _GatewayCompactionPlan:
     budget: GatewayConsumerBudget
+    physical_budget: GatewayConsumerBudget
     config: CompactionConfig
     compaction_correlation: ProviderRequestCorrelation | None
     flush_correlation: ProviderRequestCorrelation | None
+    parent_request: CompactionParentRequest | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,8 +255,24 @@ class GatewaySessionMaintenancePorts(
         operation_deadline: float,
     ) -> SessionCompactionPlan:
         raw_session = session.runtime_value if session is not None else None
-        budget = self._consumer_budget(session, requested_tokens)
-        target = resolve_gateway_compaction_target(self._context, raw_session)
+        physical_budget = resolve_gateway_consumer_budget(self._context, raw_session)
+        budget = limit_gateway_consumer_budget(physical_budget, requested_tokens)
+        parent_request_getter = getattr(
+            self._context.turn_runner,
+            "compaction_parent_request",
+            None,
+        )
+        parent_request = (
+            parent_request_getter(self._session_key(session))
+            if callable(parent_request_getter) and session is not None
+            else None
+        )
+        target = resolve_gateway_compaction_target(
+            self._context,
+            raw_session,
+            active_only=True,
+            replay_provider_state=parent_request is not None,
+        )
         config = build_compaction_config_from_provider(
             target.provider,
             model_override=target.model or effective_session_model(raw_session),
@@ -285,9 +304,11 @@ class GatewaySessionMaintenancePorts(
         )
         runtime = _GatewayCompactionPlan(
             budget=budget,
+            physical_budget=physical_budget,
             config=config,
             compaction_correlation=compaction_correlation,
             flush_correlation=flush_correlation,
+            parent_request=parent_request,
         )
         return SessionCompactionPlan(
             context_window_tokens=budget.context_window_tokens,
@@ -438,12 +459,13 @@ class GatewaySessionMaintenancePorts(
                 "flush_receipt_status": memory.receipt_status,
                 "provider_request_correlation": runtime.compaction_correlation,
                 "context_window_chars": runtime.budget.provider_request_max_chars,
+                "parent_request": runtime.parent_request,
             }
             for name, value in optional.items():
                 if value is not None and _accepts_keyword_arg(compact_with_result, name):
                     kwargs[name] = value
             consumer_admission, consumer_admission_fingerprint = (
-                build_gateway_consumer_admission(runtime.budget)
+                build_gateway_consumer_admission(runtime.physical_budget)
             )
             if _accepts_keyword_arg(compact_with_result, "consumer_admission"):
                 kwargs["consumer_admission"] = consumer_admission
@@ -469,7 +491,7 @@ class GatewaySessionMaintenancePorts(
                 raise SessionCompactionPhaseTimeoutError(exc.phase) from exc
             summary = str(getattr(result, "summary", "") or "")
             removed_count = int(getattr(result, "removed_count", 0) or 0)
-            return SessionCompactionExecutionResult(
+            execution_result = SessionCompactionExecutionResult(
                 applied=bool(
                     summary
                     and (
@@ -502,6 +524,15 @@ class GatewaySessionMaintenancePorts(
                 skip_reason=str(getattr(result, "skip_reason", "") or ""),
                 quality_report=dict(getattr(result, "quality_report", None) or {}),
             )
+            if execution_result.applied:
+                clear_parent_request = getattr(
+                    self._context.turn_runner,
+                    "clear_compaction_parent_request",
+                    None,
+                )
+                if callable(clear_parent_request):
+                    clear_parent_request(command.session_key)
+            return execution_result
 
         try:
             summary = await await_compaction_phase(

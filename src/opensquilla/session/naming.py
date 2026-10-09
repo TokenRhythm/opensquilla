@@ -65,8 +65,10 @@ _TOKENRHYTHM_TITLE_MAX_TOKENS = 1024
 _OPENROUTER_REASONING_DEFAULT_MODELS = frozenset(
     {
         "deepseek/deepseek-v4",
+        "deepseek/deepseek-v4-flash-0731",
         "deepseek/deepseek-v4-pro",
         "deepseek/deepseek-v4-pro-20260423",
+        "deepseek/deepseek-v4-pro-0813",
         "z-ai/glm-4.5",
         "z-ai/glm-4.5-air",
         "z-ai/glm-5",

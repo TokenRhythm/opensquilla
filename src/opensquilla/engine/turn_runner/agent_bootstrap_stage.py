@@ -42,19 +42,11 @@ if TYPE_CHECKING:
     from opensquilla.provider.types import ModelCapabilities, ProviderRequestCorrelation
     from opensquilla.tools.types import ToolContext
 
-_PROGRESS_WATCHDOG_MODES = frozenset({"off", "log", "warn_model", "block"})
 _TOOL_LOOP_OBSERVER_MODES = frozenset({"off", "log"})
 _SOURCE_DIFF_PRESERVATION_MODES = frozenset({"off", "log", "block"})
 _SOURCE_DIFF_CANDIDATE_MODES = frozenset({"off", "log", "warn_model"})
 _RUNTIME_STATE_CAPSULE_MODES = frozenset({"off", "log", "inject"})
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
-
-
-def _progress_watchdog_mode_from_env() -> Literal["off", "log", "warn_model", "block"]:
-    raw = os.environ.get("OPENSQUILLA_PROGRESS_WATCHDOG_MODE", "off").strip().lower()
-    if raw in _PROGRESS_WATCHDOG_MODES:
-        return raw  # type: ignore[return-value]
-    return "off"
 
 
 def _tool_loop_observer_mode_from_env() -> Literal["off", "log"]:
@@ -69,9 +61,7 @@ def _runtime_recovery_mode_from_env() -> Literal["off", "log", "warn_model"]:
 
 
 def _final_diff_contract_mode_from_env() -> Literal["off", "log", "warn_model"]:
-    return normalize_runtime_recovery_mode(
-        os.environ.get("OPENSQUILLA_FINAL_DIFF_CONTRACT_MODE")
-    )
+    return normalize_runtime_recovery_mode(os.environ.get("OPENSQUILLA_FINAL_DIFF_CONTRACT_MODE"))
 
 
 def _normalize_source_diff_preservation_mode(
@@ -302,8 +292,7 @@ def _patch_hygiene_block_from_env(
     if raw in _PATCH_HYGIENE_BLOCK_MODES:
         return raw  # type: ignore[return-value]
     raise ValueError(
-        f"{_PATCH_HYGIENE_BLOCK_ENV} must be one of: "
-        + ", ".join(_PATCH_HYGIENE_BLOCK_MODES)
+        f"{_PATCH_HYGIENE_BLOCK_ENV} must be one of: " + ", ".join(_PATCH_HYGIENE_BLOCK_MODES)
     )
 
 
@@ -345,9 +334,7 @@ def _strict_bool_from_env(name: str, default: bool = False) -> bool:
         return False
     raise ValueError(
         f"{name} must be one of: "
-        + ", ".join(
-            sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF)
-        )
+        + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
     )
 
 
@@ -412,6 +399,7 @@ class _ResolvedCatalog:
     # default.
     auto_max_tokens: int = 0
     auto_max_tokens_known: bool = False
+    seed: int | None = None
     temperature: float | None = None
     top_p: float | None = None
     # Explicit provider-request proof budget (chars); 0 keeps the derived path.
@@ -773,6 +761,10 @@ class AgentBootstrapStage:
         inp: AgentBootstrapStageInput,
     ) -> StageOutcome[AgentBootstrapStageOutput]:
         # Local imports keep the module import-cycle-free.
+        from opensquilla.engine.subagent_failure_fallback import (
+            DEFAULT_SUBAGENT_FAILURE_FALLBACK_THRESHOLD,
+            DEFAULT_SUBAGENT_MAX_ITERATIONS,
+        )
         from opensquilla.engine.turn_runner.outcome import StageOutcome
         from opensquilla.engine.types import AgentConfig
 
@@ -786,6 +778,67 @@ class AgentBootstrapStage:
             request_timeout=inp.request_timeout,
             max_provider_retries=inp.max_provider_retries,
         )
+        effective_max_iterations = budgets.max_iterations
+        effective_max_iterations_source = budgets.max_iterations_source
+        subagent_failure_fallback_threshold = 0
+        subagent_effort_tier = ""
+        subagent_soft_iteration_limit = 0
+        is_orchestration_child = bool(
+            inp.run_kind == "subagent"
+            and inp.tool_context is not None
+            and getattr(inp.tool_context, "orchestration_activation_id", None)
+        )
+        if inp.run_kind == "subagent" and not is_orchestration_child:
+            turn_config = getattr(inp.turn, "config", None)
+            subagents_config = getattr(turn_config, "subagents", None)
+            route_metadata = getattr(inp.turn, "metadata", {})
+            route_hard_limit = route_metadata.get("subagent_iteration_hard_limit")
+            route_soft_limit = route_metadata.get("subagent_iteration_soft_limit")
+            subagent_effort_tier = str(route_metadata.get("subagent_effort_tier") or "")
+            try:
+                route_hard_limit = int(route_hard_limit or 0)
+                route_soft_limit = int(route_soft_limit or 0)
+            except (TypeError, ValueError):
+                route_hard_limit = 0
+                route_soft_limit = 0
+            if route_hard_limit > 0:
+                subagent_max_iterations = route_hard_limit
+                subagent_max_iterations_source = "subagent router budget"
+                subagent_soft_iteration_limit = route_soft_limit
+            else:
+                subagent_max_iterations = max(
+                    1,
+                    int(
+                        getattr(
+                            subagents_config,
+                            "max_iterations",
+                            DEFAULT_SUBAGENT_MAX_ITERATIONS,
+                        )
+                        or DEFAULT_SUBAGENT_MAX_ITERATIONS
+                    ),
+                )
+                subagent_max_iterations_source = "subagent config"
+            subagent_failure_fallback_threshold = max(
+                1,
+                int(
+                    getattr(
+                        subagents_config,
+                        "failure_fallback_threshold",
+                        DEFAULT_SUBAGENT_FAILURE_FALLBACK_THRESHOLD,
+                    )
+                    or DEFAULT_SUBAGENT_FAILURE_FALLBACK_THRESHOLD
+                ),
+            )
+            if effective_max_iterations <= 0 or subagent_max_iterations < effective_max_iterations:
+                effective_max_iterations = subagent_max_iterations
+                effective_max_iterations_source = subagent_max_iterations_source
+            if effective_max_iterations > 1 and subagent_soft_iteration_limit > 0:
+                subagent_soft_iteration_limit = min(
+                    subagent_soft_iteration_limit,
+                    effective_max_iterations - 1,
+                )
+            else:
+                subagent_soft_iteration_limit = 0
 
         # 2. Resolve max_tokens, context_window, capabilities from catalog.
         # Prefer the exact in-process ProviderConfig when the selector wrapper
@@ -801,16 +854,11 @@ class AgentBootstrapStage:
             "active_deployment_config",
             None,
         )
-        deployment = (
-            active_deployment_config()
-            if callable(active_deployment_config)
-            else None
-        )
+        deployment = active_deployment_config() if callable(active_deployment_config) else None
         if (
             deployment is not None
             and callable(deployment_lookup)
-            and str(getattr(deployment, "model", "") or "").strip()
-            == inp.resolved_model
+            and str(getattr(deployment, "model", "") or "").strip() == inp.resolved_model
         ):
             catalog = deployment_lookup(
                 deployment,
@@ -846,9 +894,7 @@ class AgentBootstrapStage:
         # safe for turn metadata and make catalog-vs-provider failures
         # distinguishable without exposing attachment names or contents.
         inp.turn.metadata["resolved_output_cap_tokens"] = int(catalog.max_tokens)
-        inp.turn.metadata["resolved_context_window_tokens"] = int(
-            catalog.context_window
-        )
+        inp.turn.metadata["resolved_context_window_tokens"] = int(catalog.context_window)
 
         # 3. Build AgentConfig auxiliaries (thinking, projection, store, mem cfg)
         aux = self._agent_config_builder.build_auxiliaries(
@@ -867,9 +913,7 @@ class AgentBootstrapStage:
             and catalog.capabilities is not None
             and getattr(catalog.capabilities, "supports_tools", False)
         )
-        private_fallback_limits: list[
-            tuple[Any, int, int, ModelCapabilities | None]
-        ] = []
+        private_fallback_limits: list[tuple[Any, int, int, ModelCapabilities | None]] = []
         private_fallback_vision_support: list[
             tuple[Any, Literal["supported", "unsupported", "unknown"]]
         ] = []
@@ -880,12 +924,8 @@ class AgentBootstrapStage:
         )
         if callable(fallback_deployment_configs):
             for deployment in fallback_deployment_configs():
-                fallback_model = str(
-                    getattr(deployment, "model", "") or ""
-                ).strip()
-                fallback_provider = str(
-                    getattr(deployment, "provider", "") or ""
-                ).strip()
+                fallback_model = str(getattr(deployment, "model", "") or "").strip()
+                fallback_provider = str(getattr(deployment, "provider", "") or "").strip()
                 if not fallback_model or not fallback_provider:
                     continue
                 fallback_catalog = (
@@ -923,11 +963,7 @@ class AgentBootstrapStage:
                         fallback_catalog.capabilities,
                     ),
                 )
-        route_provider = str(
-            agent_metadata.get("routed_provider")
-            or inp.active_provider_id
-            or ""
-        )
+        route_provider = str(agent_metadata.get("routed_provider") or inp.active_provider_id or "")
         fallback_sources = (
             agent_metadata.get("router_fallback_chain"),
             agent_metadata.get("selector_execution_chain"),
@@ -941,9 +977,7 @@ class AgentBootstrapStage:
                 fallback_model = str(raw_fallback.get("model") or "").strip()
                 if not fallback_model:
                     continue
-                fallback_provider = str(
-                    raw_fallback.get("provider") or route_provider
-                ).strip()
+                fallback_provider = str(raw_fallback.get("provider") or route_provider).strip()
                 if (fallback_provider, fallback_model) in fallback_capabilities:
                     continue
                 fallback_catalog = self._model_catalog.lookup(
@@ -972,9 +1006,7 @@ class AgentBootstrapStage:
             None,
         )
         if callable(configure_private_fallback_vision_support):
-            configure_private_fallback_vision_support(
-                private_fallback_vision_support
-            )
+            configure_private_fallback_vision_support(private_fallback_vision_support)
         configure_fallback_limits = getattr(
             inp.provider,
             "configure_fallback_limits",
@@ -1001,8 +1033,14 @@ class AgentBootstrapStage:
             effective_thinking=aux.thinking,
             fallback_capabilities=fallback_capabilities,
         )
-        agent_metadata["agent_max_iterations"] = budgets.max_iterations
-        agent_metadata["agent_max_iterations_source"] = budgets.max_iterations_source
+        agent_metadata["agent_max_iterations"] = effective_max_iterations
+        agent_metadata["agent_max_iterations_source"] = effective_max_iterations_source
+        if inp.run_kind == "subagent" and not is_orchestration_child:
+            agent_metadata["subagent_iteration_budget"] = {
+                "effort_tier": subagent_effort_tier or "legacy",
+                "soft_limit": subagent_soft_iteration_limit,
+                "hard_limit": effective_max_iterations,
+            }
 
         # 4. Construct AgentConfig (declarative, single call site)
         #
@@ -1022,7 +1060,7 @@ class AgentBootstrapStage:
         # collapsed to ContextVar lookups, and sub-Agents ended up using
         # the process default workspace instead of the configured one.
         agent_config = AgentConfig(
-            max_iterations=budgets.max_iterations,
+            max_iterations=effective_max_iterations,
             system_prompt=inp.final_prompt,
             cache_breakpoints=inp.cache_breakpoints,
             request_context_prompt=inp.request_context_prompt,
@@ -1036,18 +1074,20 @@ class AgentBootstrapStage:
             tool_timeout=budgets.tool_timeout,
             request_timeout=budgets.request_timeout,
             max_provider_retries=budgets.max_provider_retries,
+            subagent_failure_fallback_threshold=(subagent_failure_fallback_threshold),
+            subagent_effort_tier=subagent_effort_tier,
+            subagent_soft_iteration_limit=subagent_soft_iteration_limit,
             length_capped_continuations=(
                 inp.length_capped_continuations
                 if inp.length_capped_continuations is not None
                 else AgentConfig().length_capped_continuations
             ),
             max_tokens=catalog.max_tokens,
+            seed=catalog.seed,
             temperature=catalog.temperature,
             top_p=catalog.top_p,
             context_window_tokens=catalog.context_window,
-            context_window_tokens_global_override=(
-                catalog.context_window_tokens_global_override
-            ),
+            context_window_tokens_global_override=(catalog.context_window_tokens_global_override),
             provider_request_proof_max_chars=catalog.provider_request_proof_max_chars,
             provider_request_proof_max_chars_explicit=(
                 catalog.provider_request_proof_max_chars > 0
@@ -1109,19 +1149,6 @@ class AgentBootstrapStage:
             tool_result_store_max_bytes=aux.tool_result_store_max_bytes,
             tool_result_store_disk_budget_bytes=(aux.tool_result_store_disk_budget_bytes),
             tool_result_store_retention_seconds=(aux.tool_result_store_retention_seconds),
-            progress_watchdog_mode=_progress_watchdog_mode_from_env(),
-            progress_watchdog_repeated_tool_error_threshold=_positive_int_from_env(
-                "OPENSQUILLA_PROGRESS_WATCHDOG_TOOL_ERROR_THRESHOLD",
-                AgentConfig().progress_watchdog_repeated_tool_error_threshold,
-            ),
-            progress_watchdog_repeated_provider_failure_threshold=_positive_int_from_env(
-                "OPENSQUILLA_PROGRESS_WATCHDOG_PROVIDER_FAILURE_THRESHOLD",
-                AgentConfig().progress_watchdog_repeated_provider_failure_threshold,
-            ),
-            progress_watchdog_repeated_failure_anchor_threshold=_positive_int_from_env(
-                "OPENSQUILLA_PROGRESS_WATCHDOG_FAILURE_ANCHOR_THRESHOLD",
-                AgentConfig().progress_watchdog_repeated_failure_anchor_threshold,
-            ),
             post_write_convergence_enabled=_bool_from_env(
                 "OPENSQUILLA_POST_WRITE_CONVERGENCE",
                 AgentConfig().post_write_convergence_enabled,
@@ -1225,13 +1252,6 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE",
                 AgentConfig().mid_budget_no_diff_nudge,
             ),
-            repeated_tool_call_recovery_threshold=_nonnegative_int_from_env(
-                "OPENSQUILLA_TOOL_REPEAT_NUDGE_THRESHOLD",
-                AgentConfig().repeated_tool_call_recovery_threshold,
-            ),
-            repeated_tool_call_recovery_extra_tools=_name_tuple_from_env(
-                "OPENSQUILLA_TOOL_REPEAT_NUDGE_TOOLS",
-            ),
             provider_history_dedup_enabled=_bool_from_env(
                 "OPENSQUILLA_PROVIDER_HISTORY_DEDUP",
                 AgentConfig().provider_history_dedup_enabled,
@@ -1297,8 +1317,8 @@ class AgentBootstrapStage:
                 agent=agent,
                 agent_config=agent_config,
                 effective_runtime_timeout=budgets.runtime_timeout,
-                effective_max_iterations=budgets.max_iterations,
-                effective_max_iterations_source=budgets.max_iterations_source,
+                effective_max_iterations=effective_max_iterations,
+                effective_max_iterations_source=effective_max_iterations_source,
                 effective_iteration_timeout=budgets.iteration_timeout,
                 effective_tool_timeout=budgets.tool_timeout,
                 effective_request_timeout=budgets.request_timeout,

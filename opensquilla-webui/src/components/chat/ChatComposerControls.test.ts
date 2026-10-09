@@ -5,10 +5,21 @@ import composerSource from './ChatComposer.vue?raw'
 import viewSource from '../../views/ChatView.vue?raw'
 import appearanceSource from '../settings/SettingsAppearancePanel.vue?raw'
 import slashSource from '../../composables/chat/useChatSlashCommands.ts?raw'
+import sendSource from '../../composables/chat/useChatSend.ts?raw'
 import en from '../../locales/en.json'
 import zhHans from '../../locales/zh-Hans.json'
 
 describe('ChatComposer control hierarchy', () => {
+  it('offers a mutually exclusive complete-task mode and forwards it with the turn', () => {
+    expect(composerSource).toContain('data-testid="single-agent-mode-toggle"')
+    expect(viewSource).toContain(':single-agent-mode-enabled="singleAgentModeEnabled"')
+    expect(viewSource).toContain('@set-single-agent-mode-enabled="setSingleAgentModeEnabled"')
+    expect(sendSource).toContain('params.singleAgentMode = singleAgentMode')
+    expect(en.chat.singleAgentMode.enableLabel).toBe('Enable complete-task mode')
+    expect(en.chat.singleAgentMode.disableLabel).toBe('Disable complete-task mode')
+    expect(zhHans.chat.singleAgentMode.enableLabel).toBe('开启完整任务模式')
+    expect(zhHans.chat.singleAgentMode.disableLabel).toBe('关闭完整任务模式')
+  })
   it('keeps legacy execution mode choices out of the composer settings panel', () => {
     expect(composerSource).not.toContain('ChatComposerSettings')
     expect(composerSource).not.toContain('chat.composer.executionMode')
@@ -86,6 +97,18 @@ describe('ChatComposer control hierarchy', () => {
     expect(viewSource).toContain('codingModeSettingsBusy,')
     expect(viewSource).toContain('setCodingModeEnabled,')
     expect(viewSource).toContain('@set-coding-mode-enabled="setComposerCodingModeEnabled"')
+  })
+
+  it('threads the per-turn complex-task switch into immutable send attempts', () => {
+    expect(composerSource).toContain(':aria-pressed="complexTaskModeEnabled ? \'true\' : \'false\'"')
+    expect(composerSource).toContain("emit('setComplexTaskModeEnabled', !complexTaskModeEnabled)")
+    expect(viewSource).toContain(':complex-task-mode-enabled="complexTaskModeEnabled"')
+    expect(viewSource).toContain('@set-complex-task-mode-enabled="setComplexTaskModeEnabled"')
+    expect(viewSource).toContain('complexTaskModeEnabled,')
+    expect(sendSource).toContain('params.complexTaskMode = complexTaskMode')
+    expect(sendSource).toContain('complexTaskMode: boolean')
+    expect(en.chat.complexTaskMode.enableLabel).toBe('Enable complex task mode')
+    expect(zhHans.chat.complexTaskMode.enableLabel).toBe('开启复杂任务模式')
   })
 
   it('completes Slash candidates without executing them from the suggestion menu', () => {

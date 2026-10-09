@@ -497,6 +497,23 @@ async def test_dispatch_redacts_secret_like_tool_result_content() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dispatch_redacts_quoted_json_password_result() -> None:
+    handler = build_tool_handler(_build_registry())
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="tc-json-secret",
+            tool_name="echo",
+            arguments={"value": '{"password": "json_password", "name": "visible"}'},
+        )
+    )
+
+    assert result.is_error is False
+    assert "json_password" not in result.content
+    assert result.content == '{"password": [REDACTED], "name": "visible"}'
+
+
+@pytest.mark.asyncio
 async def test_dispatch_rejects_unparsed_raw_tool_arguments_before_handler() -> None:
     handler = build_tool_handler(_build_registry())
 
@@ -1621,6 +1638,59 @@ async def test_dispatch_execution_policy_stores_raw_snapshot_for_truncated_exec_
 
 
 @pytest.mark.asyncio
+async def test_dispatch_stores_complete_truncated_delegate_result(tmp_path) -> None:
+    registry = ToolRegistry()
+    raw_output = json.dumps(
+        {
+            "status": "completed",
+            "session_id": "agent-session-1",
+            "summary": "found the implementation",
+            "deliverable": "complete evidence\n" + ("detail\n" * 1_000),
+            "follow_up": "reuse agent-session-1",
+            "unresolved": [],
+        }
+    )
+
+    async def delegate_task() -> str:
+        return raw_output
+
+    registry.register(
+        ToolSpec(name="delegate_task", description="delegate", parameters={}),
+        delegate_task,
+    )
+    ctx = ToolContext(
+        session_key="agent:main:session-1",
+        agent_id="main",
+        tool_result_store_dir=str(tmp_path / "tool-results"),
+        tool_result_store_session_id="session-1",
+        tool_result_retrieval_available=True,
+        tool_result_budget_policy=ToolResultBudgetPolicy(
+            max_single_tool_result_chars=512,
+        ),
+    )
+
+    result = await build_tool_handler(registry, ctx)(
+        ToolCall(
+            tool_use_id="tc-large-delegate",
+            tool_name="delegate_task",
+            arguments={},
+        )
+    )
+
+    payload = json.loads(result.content)
+    assert payload["status"] == "completed"
+    assert payload["session_id"] == "agent-session-1"
+    assert payload["result_truncated"] is True
+    assert payload["tool_result_handle"].startswith("tr-")
+    assert "retrieve_tool_result" in payload["retrieve_hint"]
+    stored = ToolResultStore(tmp_path / "tool-results").read(
+        payload["tool_result_handle"],
+        session_id="session-1",
+    )
+    assert stored.content == raw_output
+
+
+@pytest.mark.asyncio
 async def test_dispatch_does_not_emit_handle_when_retrieval_is_not_visible(
     tmp_path,
 ) -> None:
@@ -2655,50 +2725,6 @@ async def test_dispatch_run_budget_applies_to_subagent_current_context() -> None
     assert second.execution_status is not None
     assert second.execution_status["status"] == "unknown"
     assert second.execution_status["reason"] == "tool_run_budget_exhausted"
-
-
-@pytest.mark.asyncio
-async def test_dispatch_preserves_sessions_yield_control_json_when_bounding() -> None:
-    registry = ToolRegistry()
-
-    async def sessions_yield() -> str:
-        return json.dumps(
-            {
-                "status": "yielded",
-                "waited": False,
-                "message": "Current turn yielded; wait for pushed session events.",
-                "yield_message": "y" * 1000,
-            }
-        )
-
-    registry.register(
-        ToolSpec(
-            name="sessions_yield",
-            description="yield",
-            parameters={},
-            result_budget_class="control",
-        ),
-        sessions_yield,
-    )
-    handler = build_tool_handler(
-        registry,
-        ToolContext(
-            tool_result_budget_policy=ToolResultBudgetPolicy(max_single_tool_result_chars=160)
-        ),
-    )
-
-    result = await handler(
-        ToolCall(tool_use_id="tc-yield", tool_name="sessions_yield", arguments={})
-    )
-
-    payload = json.loads(result.content)
-    assert payload["status"] == "yielded"
-    assert payload["waited"] is False
-    assert payload["result_truncated"] is True
-    assert "tool_result_budget_applied" not in payload
-    assert "result_returned_chars" not in payload
-    assert "budget_class" not in payload
-    assert len(result.content) < 500
 
 
 @pytest.mark.asyncio

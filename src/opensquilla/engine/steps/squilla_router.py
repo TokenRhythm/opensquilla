@@ -1806,7 +1806,11 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     if semantic_message is None:
         semantic_message = ctx.message
     routing_message = getattr(ctx, "routing_hint", None) or semantic_message
-    if ":subagent:" in ctx.session_key:
+    # Child turns keep the model selected at spawn. The spawn path opts in
+    # once with the bounded task text, before the child session is created.
+    if ":subagent:" in ctx.session_key and not ctx.metadata.get(
+        "subagent_spawn_routing"
+    ):
         return ctx
 
     rollout_phase: str = getattr(router_cfg, "rollout_phase", "observe")

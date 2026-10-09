@@ -73,6 +73,21 @@ log = structlog.get_logger(__name__)
 _SESSION_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
 
 
+def _orchestration_root_metadata(
+    turn_id: str,
+    *,
+    complex_task_mode: bool,
+    single_agent_mode: bool = False,
+) -> dict[str, Any]:
+    return {
+        "orchestration_run_id": turn_id,
+        "orchestration_session_id": f"orchestration-root:{turn_id}",
+        "orchestration_task_id": turn_id,
+        "complex_task_mode": complex_task_mode or single_agent_mode,
+        "single_agent_mode": single_agent_mode,
+    }
+
+
 class DurableTurnAdmission:
     """Own explicit ingress intent and one durable acceptance implementation."""
 
@@ -1022,6 +1037,14 @@ async def _accept_turn(
             # envelope so PromptAnnotation candidate loops never fall back to
             # the legacy one-shot writer merely because task metadata is late.
             "task_id": turn_id,
+            # Every admitted root turn receives a lazy orchestration identity.
+            # Ordinary turns may choose not to delegate; Complex Task Mode uses
+            # the same identity but structurally limits the root to controls.
+            **_orchestration_root_metadata(
+                turn_id,
+                complex_task_mode=command.complex_task_mode,
+                single_agent_mode=command.single_agent_mode,
+            ),
             "turn_context_intent": "send",
             "turn_context_revision": 1,
             **(

@@ -104,6 +104,51 @@ def test_explicit_provider_and_model_are_first_and_do_not_leak_secrets(
     assert repr(plan.primary.provider) not in rendered
 
 
+def test_active_only_uses_current_physical_deployment_and_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+    built_configs: list[ProviderConfig],
+) -> None:
+    active = _config("anthropic", "current-model", api_key="current-secret")
+    fallback = _config("ollama", "fallback-model")
+
+    def explicit_resolution_forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("active-only compaction must not resolve another deployment")
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction_deployment.resolve_provider_deployment",
+        explicit_resolution_forbidden,
+    )
+
+    plan = resolve_compaction_execution_plan(
+        app_config=object(),
+        active_provider=None,
+        active_provider_config=active,
+        previous_deployment_identities=(
+            CompactionDeploymentIdentity(
+                provider_id="openai",
+                model="previous-model",
+                source="previous_turn_deployment",
+            ),
+        ),
+        fallback_provider_configs=(fallback,),
+        compaction_config=SimpleNamespace(provider="openai", model="summary-model"),
+        context_window_tokens=32_000,
+        session_key="session-1",
+        active_only=True,
+    )
+
+    assert isinstance(plan, CompactionExecutionPlan)
+    assert [(target.provider_id, target.model, target.source) for target in plan.candidates] == [
+        ("anthropic", "current-model", "active_deployment"),
+    ]
+    assert plan.max_calls == 1
+    assert len(built_configs) == 1
+    assert built_configs[0].provider == active.provider
+    assert built_configs[0].model == active.model
+    assert built_configs[0].api_key == active.api_key
+    assert built_configs[0].replay_provider_state is False
+
+
 def test_explicit_target_uses_runtime_credential_pool_acquirer(
     monkeypatch: pytest.MonkeyPatch,
     built_configs: list[ProviderConfig],

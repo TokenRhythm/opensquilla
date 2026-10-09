@@ -55,6 +55,7 @@ class _RecordingPromptAssembler:
         bootstrap_context_mode,
         fresh_user_session=False,
         workspace_dir=None,
+        tool_context=None,
     ):
         self.calls += 1
         self.last_kwargs = dict(
@@ -66,6 +67,7 @@ class _RecordingPromptAssembler:
             bootstrap_context_mode=bootstrap_context_mode,
             fresh_user_session=fresh_user_session,
             workspace_dir=workspace_dir,
+            tool_context=tool_context,
         )
         prompt_metadata.update(self.metadata_to_emit)
         return self.base_prompt
@@ -731,13 +733,14 @@ async def test_explicit_model_override_reconciles_routed_model_and_clears_saving
     stage = _make_stage(executor=executor)
     inp = _make_input(cloned_selector=selector, model="claude-haiku-4.5")
 
-    await stage.run(inp)
+    out = await stage.run(inp)
 
     # routed_model realigned to the model that actually ran; savings dropped.
     assert turn.metadata["routed_model"] == "claude-haiku-4.5"
     assert turn.metadata["savings_pct"] == 0.0
     assert turn.metadata["savings_max_price_per_m"] == 0.0
     assert turn.metadata["savings_routed_price_per_m"] == 0.0
+    assert out.output.resolved_model == "claude-haiku-4.5"
 
 
 @pytest.mark.asyncio

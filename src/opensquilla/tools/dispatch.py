@@ -780,8 +780,8 @@ def _invalid_argument_guidance(
             details += " new_text alone cannot identify where to edit."
         if tool_visible("apply_patch"):
             details += (
-                " For complex or large edits, prefer apply_patch with a small "
-                "unified diff instead of retrying malformed edit_file JSON."
+                " For complex or large edits, use a small apply_patch unified diff "
+                "or retry edit_file with complete valid JSON."
             )
         else:
             details += (

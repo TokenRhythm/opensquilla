@@ -1963,7 +1963,6 @@
     "loading": "セッションを読み込み中…",
     "loadMore": "さらにセッションを読み込む",
     "unknownAgent": "不明なエージェント",
-    "deletedAgent": "削除済みエージェント · {id}",
     "msgCount": "{count} 件",
     "error": {
       "load": "セッションを読み込めませんでした。"
@@ -3888,6 +3887,15 @@
       "commandDisable": "Coding mode を無効にする。",
       "activeLabel": "Coding 有効",
       "disableLabel": "Coding mode を無効にする"
+    },
+    "complexTaskMode": {
+      "enableLabel": "複雑タスクモードを有効にする",
+      "disableLabel": "複雑タスクモードを無効にする"
+    },
+    "singleAgentMode": {
+      "enableLabel": "完結タスクモードを有効にする",
+      "disableLabel": "完結タスクモードを無効にする",
+      "resultLabel": "エージェントの結果"
     },
     "composer": {
       "executionMode": "実行モード",

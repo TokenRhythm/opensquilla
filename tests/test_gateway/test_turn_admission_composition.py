@@ -121,6 +121,23 @@ async def test_wire_surfaces_execute_one_shared_turn_application_once(
             assert command.mode == semantic
 
 
+async def test_single_agent_mode_survives_both_gateway_turn_surfaces() -> None:
+    ports = _RecordingPorts()
+    adapter = GatewayTurnAdmissionAdapter(
+        TurnAdmission(ingress=ports, cancellation=ports, steering=ports)
+    )
+    await adapter.admit(
+        {"sessionKey": "agent:main:webchat:single", "message": "do the task", "singleAgentMode": True},
+        surface="webchat",
+    )
+    await adapter.admit(
+        {"key": "agent:main:webchat:single", "message": "do the task", "singleAgentMode": True},
+        surface="session",
+    )
+    assert len(ports.commands) == 2
+    assert all(isinstance(command, AdmitTurn) and command.single_agent_mode for command in ports.commands)
+
+
 def test_rpc_loader_is_the_only_fixed_turn_composition_boundary() -> None:
     loader = (ROOT / "src/opensquilla/gateway/rpc/__init__.py").read_text(encoding="utf-8")
     chat_import = loader.index("import opensquilla.gateway.rpc_chat as _rpc_chat")
@@ -147,15 +164,11 @@ from opensquilla.gateway.rpc import get_dispatcher
 methods = (
     "chat.send",
     "chat.abort",
-    "sessions.send",
-    "sessions.abort",
-    "sessions.steer.v2",
-    "sessions.steer",
     "chat.clarify_submit",
 )
 assert rpc_chat._turn_admission_adapter_factory is rpc_sessions.build_gateway_turn_admission_adapter
 registry = get_dispatcher()
-assert len(registry.list_methods()) == 306
+assert len(registry.list_methods()) == 300
 for method in methods:
     entry = registry.get_entry(method)
     assert entry is not None

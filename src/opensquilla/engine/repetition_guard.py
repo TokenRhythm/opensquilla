@@ -19,6 +19,7 @@ from typing import Any
 
 import structlog
 
+from opensquilla.provider import ReasoningDeltaEvent as ProviderReasoningDelta
 from opensquilla.provider import TextDeltaEvent as ProviderTextDelta
 
 log = structlog.get_logger(__name__)
@@ -489,11 +490,20 @@ async def guard_provider_text_stream(
     stream: AsyncIterator[Any],
     *,
     policy: RepetitionGuardPolicy | None = None,
+    include_reasoning: bool = False,
 ) -> AsyncIterator[Any]:
-    """Pass through provider events until repeated text crosses the policy."""
+    """Pass through provider events until guarded output crosses the policy.
+
+    Reasoning remains unguarded by default because some direct providers own
+    their own hidden-reasoning limits.  Selector wrappers opt in before their
+    pre-text buffer so a reasoning-only loop cannot grow that buffer forever.
+    Text and reasoning use independent guards to avoid treating a transition
+    between the two channels as one repeated segment.
+    """
 
     active_policy = policy or RepetitionGuardPolicy()
-    guard = StreamingRepetitionGuard(active_policy)
+    text_guard = StreamingRepetitionGuard(active_policy)
+    reasoning_guard = StreamingRepetitionGuard(active_policy) if include_reasoning else None
     stream_iter = stream.__aiter__()
     closer = _IdempotentStreamCloser(
         stream_iter,
@@ -503,14 +513,20 @@ async def guard_provider_text_stream(
         async for event in stream_iter:
             kind = str(getattr(event, "kind", "") or "")
             if kind in {"tool_use_start", "tool_use_end"}:
-                guard.reset()
+                text_guard.reset()
+                if reasoning_guard is not None:
+                    reasoning_guard.reset()
                 yield event
                 continue
-            if not isinstance(event, ProviderTextDelta):
+            if isinstance(event, ProviderTextDelta):
+                event_guard = text_guard
+            elif reasoning_guard is not None and isinstance(event, ProviderReasoningDelta):
+                event_guard = reasoning_guard
+            else:
                 yield event
                 continue
 
-            accepted_text, detection = guard.feed(event.text)
+            accepted_text, detection = event_guard.feed(event.text)
             if accepted_text:
                 yield replace(event, text=accepted_text)
             elif detection is None:

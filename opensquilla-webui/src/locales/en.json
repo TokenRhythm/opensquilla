@@ -2051,7 +2051,6 @@
     "loading": "Loading sessions…",
     "loadMore": "Load more sessions",
     "unknownAgent": "Unknown agent",
-    "deletedAgent": "Deleted agent · {id}",
     "msgCount": "{count} msg",
     "error": {
       "load": "Could not load sessions."
@@ -3978,6 +3977,15 @@
       "commandDisable": "Disable Coding mode.",
       "activeLabel": "Coding ON",
       "disableLabel": "Disable Coding mode"
+    },
+    "complexTaskMode": {
+      "enableLabel": "Enable complex task mode",
+      "disableLabel": "Disable complex task mode"
+    },
+    "singleAgentMode": {
+      "enableLabel": "Enable complete-task mode",
+      "disableLabel": "Disable complete-task mode",
+      "resultLabel": "Agent result"
     },
     "composer": {
       "executionMode": "Execution mode",

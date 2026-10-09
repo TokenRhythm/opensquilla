@@ -62,12 +62,12 @@ def _make_storage() -> Any:
     return storage
 
 
-def test_task_runtime_constructor_defaults_to_eight_slots() -> None:
+def test_task_runtime_constructor_defaults_to_sixteen_slots() -> None:
     async def turn_handler(_run: Any) -> None:
         return None
 
     runtime = TaskRuntime(storage=_make_storage(), turn_handler=turn_handler)
-    assert runtime._max_concurrency == 8
+    assert runtime._max_concurrency == 16
 
 
 # ---------------------------------------------------------------------------

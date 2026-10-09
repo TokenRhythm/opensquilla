@@ -28,6 +28,7 @@ from opensquilla.engine.usage_accounting import (
 )
 from opensquilla.provider import ChatConfig, Message
 from opensquilla.provider import DoneEvent as ProviderDone
+from opensquilla.provider import ReasoningDeltaEvent as ProviderReasoning
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
@@ -450,6 +451,20 @@ async def test_guard_closes_upstream_once_before_raising() -> None:
 
     assert upstream.close_calls == 1
     assert 4_096 <= len("".join(emitted)) <= 5_120
+
+
+@pytest.mark.asyncio
+async def test_guard_leaves_hidden_reasoning_to_provider_limits() -> None:
+    async def stream() -> AsyncIterator[Any]:
+        for _ in range(2_048):
+            yield ProviderReasoning(text="ubee")
+        yield ProviderDone()
+
+    events = [event async for event in guard_provider_text_stream(stream())]
+
+    assert len(events) == 2_049
+    assert "".join(event.text for event in events[:-1]) == "ubee" * 2_048
+    assert events[-1].kind == "done"
 
 
 @pytest.mark.asyncio

@@ -2051,7 +2051,6 @@
     "loading": "正在加载任务…",
     "loadMore": "加载更多会话",
     "unknownAgent": "未知智能体",
-    "deletedAgent": "已删除的智能体 · {id}",
     "msgCount": "{count} 条消息",
     "error": {
       "load": "无法加载任务。"
@@ -3978,6 +3977,15 @@
       "commandDisable": "关闭 Coding mode。",
       "activeLabel": "Coding 已开启",
       "disableLabel": "关闭 Coding mode"
+    },
+    "complexTaskMode": {
+      "enableLabel": "开启复杂任务模式",
+      "disableLabel": "关闭复杂任务模式"
+    },
+    "singleAgentMode": {
+      "enableLabel": "开启完整任务模式",
+      "disableLabel": "关闭完整任务模式",
+      "resultLabel": "子智能体结果"
     },
     "composer": {
       "executionMode": "执行模式",

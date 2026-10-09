@@ -116,6 +116,7 @@ from opensquilla.engine.outcome import outcome_from_error, turn_outcome_details
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.pricing import PriceEntry, lookup_price
 from opensquilla.engine.prompt_cache_keepalive import PromptCacheKeepaliveCandidate
+from opensquilla.engine.repetition_guard import guard_provider_text_stream
 from opensquilla.engine.route_plan import record_execution_leg
 from opensquilla.engine.router_decision import build_router_decision_event
 from opensquilla.engine.turn_policy import resolve_turn_policy
@@ -631,7 +632,7 @@ def _is_deepseek_model_id(model: str) -> bool:
 # Any tool name absent from this set is treated as mutex (serial dispatch).
 _SAFE_TOOL_NAMES: frozenset[str] = frozenset(
     {
-        "agents_list",
+        "delegate_task",
         "git_diff",
         "git_log",
         "git_status",
@@ -678,6 +679,8 @@ _IMAGE_ANALYSIS_TOOL_POLICY = _ToolConcurrencyPolicy(
     max_inflight=2,
     limit_key=("media", "image_analysis"),
 )
+
+
 def _get_tool_concurrency_policy(
     tool_name: str,
     arguments: Mapping[str, Any] | None = None,
@@ -688,25 +691,6 @@ def _get_tool_concurrency_policy(
         return _IMAGE_ANALYSIS_TOOL_POLICY
     if tool_name in _SAFE_TOOL_NAMES:
         return _CONCURRENT_TOOL_POLICY
-    if tool_name == "sessions_send":
-        session_key = (arguments or {}).get("session_key")
-        if isinstance(session_key, str) and session_key.strip():
-            return _ToolConcurrencyPolicy(
-                mode="keyed",
-                key=("sessions_send", session_key.strip()),
-            )
-        return _MUTEX_TOOL_POLICY
-    if tool_name == "sessions_spawn":
-        from opensquilla.tools.types import current_tool_context  # noqa: PLC0415
-
-        ctx = current_tool_context.get()
-        parent_key = parent_session_key or (ctx.session_key if ctx is not None else None)
-        if parent_key:
-            return _ToolConcurrencyPolicy(
-                mode="keyed",
-                key=("sessions_spawn", parent_key),
-            )
-        return _MUTEX_TOOL_POLICY
     return _MUTEX_TOOL_POLICY
 
 
@@ -1010,37 +994,6 @@ def _strip_context_summary_marker(content: str) -> str:
     return content
 
 
-def _subagent_terminal_history_notice(entry: Any) -> str | None:
-    """Render trusted non-success subagent completions for the next model turn."""
-    if getattr(entry, "role", None) != "system":
-        return None
-    if getattr(entry, "provenance_kind", None) != "internal_system":
-        return None
-    if getattr(entry, "provenance_source_tool", None) != "subagent_completion":
-        return None
-    content = getattr(entry, "content", None)
-    if not isinstance(content, str) or not content:
-        return None
-    try:
-        payload = json.loads(content)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(payload, dict) or payload.get("type") != "subagent_completion":
-        return None
-    status = str(payload.get("status") or "").strip().lower()
-    if status not in {"cancelled", "failed", "timeout", "abandoned"}:
-        return None
-    child_session_key = str(payload.get("child_session_key") or "unknown")[:200]
-    terminal_reason = str(payload.get("terminal_reason") or status)[:120]
-    return (
-        "[Trusted runtime status] "
-        f'Subagent {child_session_key} finished with status "{status}" '
-        f'(reason: "{terminal_reason}"). It is no longer running. '
-        "Do not wait for it or call sessions_yield for it. Continue from this terminal "
-        "state unless the user asks to start a replacement subagent."
-    )
-
-
 def _format_compaction_summary_context(summary_texts: list[str]) -> str | None:
     """Render durable summaries as request-scoped context, newest context preserved."""
     return format_compaction_summary_context(summary_texts)
@@ -1162,9 +1115,8 @@ def _bounded_tool_result_metadata(
             _add_bounded_tool_result_metadata(metadata, key, diagnostics[key])
 
         diagnostic_attempts = diagnostics.get("provider_attempts")
-        if (
-            "provider_attempt_count" not in metadata
-            and isinstance(diagnostic_attempts, list | tuple)
+        if "provider_attempt_count" not in metadata and isinstance(
+            diagnostic_attempts, list | tuple
         ):
             metadata["provider_attempt_count"] = len(diagnostic_attempts)
 
@@ -1485,11 +1437,7 @@ def _artifact_delivery_effective_publish_name(
         raw_name = arguments.get("name")
         requested_name = raw_name if isinstance(raw_name, str) else None
         artifact_name = (requested_name or target_name).strip() or target_name
-        if (
-            requested_name
-            and not Path(artifact_name).suffix
-            and Path(target_name).suffix
-        ):
+        if requested_name and not Path(artifact_name).suffix and Path(target_name).suffix:
             artifact_name = f"{artifact_name}{Path(target_name).suffix}"
     except (OSError, RuntimeError, ValueError):
         return None
@@ -1562,6 +1510,7 @@ def _artifact_delivery_target_keys(
             keys.append(root_path_key)
     return tuple(dict.fromkeys(keys))
 
+
 def _artifact_delivery_failure_notice(*, partial: bool = False) -> str:
     if partial:
         return (
@@ -1617,17 +1566,6 @@ def _should_add_artifact_delivery_failure_notice(
     if not failure_summaries:
         return False
     return _ARTIFACT_DELIVERY_FAILURE_MARKER not in final_text
-
-
-_SUBAGENT_TASK_PROTOCOL: Final[str] = (
-    "You are a spawned subagent. Execute only the delegated task and return "
-    "a compact result for the parent agent to use. Prefer a direct answer; "
-    "call tools only when the task explicitly requires external state, files, "
-    "network data, or tool output. If the delegated task asks you to reply with "
-    "an exact phrase, only reply, output a sentinel token, or avoid explanation, "
-    "Do not call tools and return exactly that requested text. Do not treat "
-    "uppercase sentinel-like strings as shell commands, filenames, or config keys."
-)
 
 
 def _should_use_selector_fallback(provider_name: str, event: ProviderErrorEvent) -> bool:
@@ -1759,9 +1697,7 @@ _SELECTOR_MAX_RETRY_AFTER_SECONDS: Final[float] = 900.0
 _SELECTOR_REASONING_TRUNCATED_NOTICE: Final[str] = (
     "[Earlier model reasoning was truncated for display.]\n\n"
 )
-_SELECTOR_PRE_TEXT_BUFFER_OVERFLOW_CODE: Final[str] = (
-    "provider_pretext_buffer_exhausted"
-)
+_SELECTOR_PRE_TEXT_BUFFER_OVERFLOW_CODE: Final[str] = "provider_pretext_buffer_exhausted"
 _SELECTOR_PRE_TEXT_BUFFER_OVERFLOW_MESSAGE: Final[str] = (
     "The model response exceeded the safe pre-answer buffer limit."
 )
@@ -1837,9 +1773,7 @@ class _SelectorPreTextBuffer:
     @staticmethod
     def _event_buffer_bytes(event: Any) -> int:
         if isinstance(event, ProviderToolUseDeltaEvent):
-            return len(event.tool_use_id.encode("utf-8")) + len(
-                event.json_fragment.encode("utf-8")
-            )
+            return len(event.tool_use_id.encode("utf-8")) + len(event.json_fragment.encode("utf-8"))
         try:
             payload = asdict(event)
             serialized = json.dumps(
@@ -1896,11 +1830,7 @@ class _SelectorPreTextBuffer:
         if isinstance(event, ProviderToolUseStartEvent):
             tool_use_id = str(event.tool_use_id or "")
             tool_name = str(event.tool_name or "")
-            if (
-                not tool_use_id
-                or not tool_name
-                or tool_use_id in self._seen_tool_use_ids
-            ):
+            if not tool_use_id or not tool_name or tool_use_id in self._seen_tool_use_ids:
                 self._mark_protocol_error()
                 return False
             self._seen_tool_use_ids.add(tool_use_id)
@@ -1963,13 +1893,10 @@ class _SelectorPreTextBuffer:
             return
         if isinstance(event, ProviderToolUseDeltaEvent):
             fragment = str(event.json_fragment or "")
-            byte_count = len(event.tool_use_id.encode("utf-8")) + len(
-                fragment.encode("utf-8")
-            )
+            byte_count = len(event.tool_use_id.encode("utf-8")) + len(fragment.encode("utf-8"))
             tail = self._entries[-1] if self._entries else None
             if not (
-                isinstance(tail, _BufferedToolUseDeltas)
-                and tail.tool_use_id == event.tool_use_id
+                isinstance(tail, _BufferedToolUseDeltas) and tail.tool_use_id == event.tool_use_id
             ):
                 tail = _BufferedToolUseDeltas(tool_use_id=event.tool_use_id)
                 self._entries.append(tail)
@@ -2174,8 +2101,7 @@ def _selector_retry_after_deadline_error(
 ) -> ProviderErrorEvent:
     return ProviderErrorEvent(
         message=(
-            "The model provider requested a retry delay beyond this turn's "
-            "remaining deadline."
+            "The model provider requested a retry delay beyond this turn's remaining deadline."
         ),
         code="provider_retry_after_deadline",
         retry_after_s=retry_after_s,
@@ -2302,20 +2228,15 @@ class _SelectorFallbackProvider:
         metadata = provider_metadata(self._provider)
         if metadata.provider_kind == "ensemble":
             raise ValueError(
-                "A selector-wrapped ensemble cannot be cloned as a single "
-                "subagent deployment."
+                "A selector-wrapped ensemble cannot be cloned as a single subagent deployment."
             )
 
         remaining_chain = getattr(self._selector, "remaining_chain", None)
         if not callable(remaining_chain):
-            raise ValueError(
-                "The active selector cannot freeze an independent subagent chain."
-            )
+            raise ValueError("The active selector cannot freeze an independent subagent chain.")
         chain = list(remaining_chain())
         if not chain or not all(isinstance(cfg, ProviderConfig) for cfg in chain):
-            raise ValueError(
-                "The active selector did not expose a concrete deployment chain."
-            )
+            raise ValueError("The active selector did not expose a concrete deployment chain.")
 
         def clone_config(cfg: ProviderConfig) -> ProviderConfig:
             return replace(
@@ -2331,11 +2252,7 @@ class _SelectorFallbackProvider:
         )
         frozen_selector.override_model(model)
         frozen_provider = frozen_selector.resolve()
-        metadata_copy = (
-            dict(self._turn_metadata)
-            if isinstance(self._turn_metadata, dict)
-            else None
-        )
+        metadata_copy = dict(self._turn_metadata) if isinstance(self._turn_metadata, dict) else None
         return _SelectorFallbackProvider(
             frozen_provider,
             frozen_selector,
@@ -2362,9 +2279,7 @@ class _SelectorFallbackProvider:
     @property
     def active_provider_id(self) -> str:
         """Configured identity of the selector deployment serving this turn."""
-        return str(
-            getattr(self._selector, "active_provider_id", "") or self.provider_name
-        )
+        return str(getattr(self._selector, "active_provider_id", "") or self.provider_name)
 
     def disable_provider_state_replay(self) -> None:
         """Rebuild the active fallback chain without provider-private replay."""
@@ -2625,14 +2540,10 @@ class _SelectorFallbackProvider:
         # compatibility fallback when an embedded caller did not run the
         # bootstrap configurator above.
         route_plan = (
-            self._turn_metadata.get("route_plan")
-            if isinstance(self._turn_metadata, dict)
-            else None
+            self._turn_metadata.get("route_plan") if isinstance(self._turn_metadata, dict) else None
         )
         fallback_chain = (
-            route_plan.get("fallback_chain")
-            if isinstance(route_plan, Mapping)
-            else None
+            route_plan.get("fallback_chain") if isinstance(route_plan, Mapping) else None
         )
         if isinstance(fallback_chain, list):
             for candidate in fallback_chain:
@@ -2669,11 +2580,9 @@ class _SelectorFallbackProvider:
         if isinstance(correlation, ProviderRequestCorrelation) and not (
             correlation.call_kind.endswith(".provider_fallback")
         ):
-            updates["provider_request_correlation"] = (
-                derive_provider_request_correlation(
-                    correlation,
-                    call_kind=f"{correlation.call_kind}.provider_fallback",
-                )
+            updates["provider_request_correlation"] = derive_provider_request_correlation(
+                correlation,
+                call_kind=f"{correlation.call_kind}.provider_fallback",
             )
 
         context_window, effective_max_tokens = self._active_fallback_limits()
@@ -2687,9 +2596,7 @@ class _SelectorFallbackProvider:
             updates["max_tokens"] = physical_max_tokens
 
         current_config = getattr(self._selector, "current_config", None)
-        provider_id = str(
-            getattr(current_config, "provider", "") or self.provider_name
-        ).strip()
+        provider_id = str(getattr(current_config, "provider", "") or self.provider_name).strip()
         model = str(getattr(current_config, "model", "") or "").strip()
         if model:
             deployment_identity = _fallback_deployment_identity(current_config)
@@ -2788,12 +2695,16 @@ class _SelectorFallbackProvider:
                 if bool(getattr(config, "thinking", False))
                 else 0
             )
-            fallback_proof_cap = ContextBudgetGovernor.from_values(
-                context_window_tokens=context_window,
-                max_output_tokens=physical_max_tokens,
-                thinking_budget_tokens=thinking_budget_tokens,
-                context_overflow_threshold=AgentConfig().context_overflow_threshold,
-            ).snapshot().provider_request_max_chars
+            fallback_proof_cap = (
+                ContextBudgetGovernor.from_values(
+                    context_window_tokens=context_window,
+                    max_output_tokens=physical_max_tokens,
+                    thinking_budget_tokens=thinking_budget_tokens,
+                    context_overflow_threshold=AgentConfig().context_overflow_threshold,
+                )
+                .snapshot()
+                .provider_request_max_chars
+            )
             explicit_proof_cap = _non_negative_int(
                 getattr(config, "provider_request_max_chars_explicit_cap", 0)
             )
@@ -3209,10 +3120,12 @@ class _SelectorFallbackProvider:
         }
         if getattr(active_provider, "execution_context_aware", False):
             primary_chat_kwargs["execution_context"] = execution_context
-
         def primary_stream_factory() -> AsyncGenerator[Any, None]:
             return _selector_safe_stream(
-                lambda: active_provider.chat(messages, **primary_chat_kwargs),
+                lambda: guard_provider_text_stream(
+                    active_provider.chat(messages, **primary_chat_kwargs),
+                    include_reasoning=True,
+                ),
                 content_started=lambda: emitted_user_visible_content,
             )
 
@@ -3499,12 +3412,9 @@ class _SelectorFallbackProvider:
                         None,
                     )
                     retry_after_hint = _provider_retry_after_hint(event)
-                    if (
-                        retry_after_hint > 0
-                        and _same_provider_authority(
-                            failed_authority_config,
-                            fallback_authority_config,
-                        )
+                    if retry_after_hint > 0 and _same_provider_authority(
+                        failed_authority_config,
+                        fallback_authority_config,
                     ):
                         retry_reason = _provider_activity_reason_for_error(
                             active_provider_id or self.provider_name,
@@ -3543,6 +3453,7 @@ class _SelectorFallbackProvider:
                         self._turn_metadata["router_fallback_reason"] = (
                             "local_admission_escalation"
                         )
+                    self._skip_benched_fallbacks()
                     self._realign_routed_model_after_fallback()
                     self._last_executed_model = fallback_model
                     # The phase frame is yielded before the fallback adapter is
@@ -3576,19 +3487,22 @@ class _SelectorFallbackProvider:
                     )
                     def fallback_stream_factory() -> AsyncGenerator[Any, None]:
                         return _selector_safe_stream(
-                            lambda: fallback_provider.chat(
-                                messages,
-                                tools=tools,
-                                config=fallback_config,
-                                **(
-                                    {"execution_context": execution_context}
-                                    if getattr(
-                                        fallback_provider,
-                                        "execution_context_aware",
-                                        False,
-                                    )
-                                    else {}
+                            lambda: guard_provider_text_stream(
+                                fallback_provider.chat(
+                                    messages,
+                                    tools=tools,
+                                    config=fallback_config,
+                                    **(
+                                        {"execution_context": execution_context}
+                                        if getattr(
+                                            fallback_provider,
+                                            "execution_context_aware",
+                                            False,
+                                        )
+                                        else {}
+                                    ),
                                 ),
+                                include_reasoning=True,
                             ),
                             content_started=lambda: fallback_committed,
                         )
@@ -3648,9 +3562,7 @@ class _SelectorFallbackProvider:
                                 now_monotonic = time.monotonic()
                                 first_reasoning = fallback_reasoning_started_at_ms == 0
                                 if first_reasoning:
-                                    fallback_reasoning_started_at_ms = (
-                                        time.time_ns() // 1_000_000
-                                    )
+                                    fallback_reasoning_started_at_ms = time.time_ns() // 1_000_000
                                 if (
                                     first_reasoning
                                     or now_monotonic - fallback_reasoning_last_pulse_at
@@ -3682,9 +3594,7 @@ class _SelectorFallbackProvider:
                             ):
                                 fallback_buffer.append(fallback_event)
                                 if fallback_buffer.protocol_error:
-                                    invalid_order_error = (
-                                        _selector_invalid_stream_order_error()
-                                    )
+                                    invalid_order_error = _selector_invalid_stream_order_error()
                                     self._record_health_failure(invalid_order_error)
                                     yield invalid_order_error
                                     return
@@ -3704,9 +3614,7 @@ class _SelectorFallbackProvider:
                                 yield invalid_order_error
                                 return
                             if _is_non_empty_provider_text_delta(fallback_event):
-                                for buffered_event in fallback_buffer.drain(
-                                    successful_leg=True
-                                ):
+                                for buffered_event in fallback_buffer.drain(successful_leg=True):
                                     yield buffered_event
                                 fallback_committed = True
                                 self._record_health_success()
@@ -3717,17 +3625,14 @@ class _SelectorFallbackProvider:
                                     fallback_buffer.drain(successful_leg=False)
                                     incomplete_error = ProviderErrorEvent(
                                         message=(
-                                            "Provider stream ended with an incomplete "
-                                            "tool call"
+                                            "Provider stream ended with an incomplete tool call"
                                         ),
                                         code="incomplete_tool_stream",
                                     )
                                     self._record_health_failure(incomplete_error)
                                     yield incomplete_error
                                     return
-                                tool_leg_committed = (
-                                    fallback_buffer.has_completed_tool_call
-                                )
+                                tool_leg_committed = fallback_buffer.has_completed_tool_call
                                 for buffered_event in fallback_buffer.drain(
                                     # A no-text/no-tool Done is classified by
                                     # Agent as an invalid or reasoning-only
@@ -3933,9 +3838,7 @@ def _render_preview_only_attachment_text(
         else "read_full: material path unavailable."
     )
     truncation = (
-        f"\n\n[attachment preview truncated: {len(decoded)} chars total]"
-        if truncated
-        else ""
+        f"\n\n[attachment preview truncated: {len(decoded)} chars total]" if truncated else ""
     )
     return (
         "[large text attachment materialized]\n"
@@ -4090,10 +3993,7 @@ def _extract_xlsx_text(raw_bytes: bytes) -> str:
                 if row_index >= _XLSX_MAX_ROWS_PER_SHEET:
                     rows.append(f"[sheet truncated at {_XLSX_MAX_ROWS_PER_SHEET} rows]")
                     break
-                cells = [
-                    "" if value is None else str(value)
-                    for value in row[:_XLSX_MAX_COLS]
-                ]
+                cells = ["" if value is None else str(value) for value in row[:_XLSX_MAX_COLS]]
                 if any(cells):
                     rows.append(",".join(cells))
             if rows:
@@ -4172,13 +4072,9 @@ def _extract_office_attachment_text(
     except ValueError:
         raise
     except ImportError as exc:  # pragma: no cover - dependency is declared
-        raise ValueError(
-            f"office text extraction requires a missing dependency: {exc}"
-        ) from exc
+        raise ValueError(f"office text extraction requires a missing dependency: {exc}") from exc
     except Exception as exc:  # noqa: BLE001 - parsers raise many error types
-        raise ValueError(
-            f"office attachment {filename!r} could not be read: {exc}"
-        ) from exc
+        raise ValueError(f"office attachment {filename!r} could not be read: {exc}") from exc
     if not extracted:
         raise ValueError(f"office attachment {filename!r} has no extractable text")
     if cancel_check is not None:
@@ -4326,9 +4222,7 @@ def _extract_msg_text(raw_bytes: bytes) -> str:
     return rendered.strip()
 
 
-def _extract_email_attachment_text(
-    raw_bytes: bytes, filename: str, media_type: str
-) -> str:
+def _extract_email_attachment_text(raw_bytes: bytes, filename: str, media_type: str) -> str:
     """Extract text from an email attachment.
 
     .eml/.mbox use the stdlib email/mailbox parsers (zero dependency); .msg uses
@@ -4343,9 +4237,7 @@ def _extract_email_attachment_text(
     except ValueError:
         raise
     except Exception as exc:  # noqa: BLE001 - email parsers raise many error types
-        raise ValueError(
-            f"email attachment {filename!r} could not be read: {exc}"
-        ) from exc
+        raise ValueError(f"email attachment {filename!r} could not be read: {exc}") from exc
     if not extracted:
         raise ValueError(f"email attachment {filename!r} has no extractable text")
     return _truncate_attachment_text(extracted)
@@ -4427,17 +4319,14 @@ def _resolve_identity_prompt_mode(config: object) -> str:
     if env_prompt_mode:
         if env_prompt_mode not in allowed_modes:
             raise ValueError(
-                "OPENSQUILLA_PROMPT_MODE must be one of: "
-                + ", ".join(sorted(allowed_modes))
+                "OPENSQUILLA_PROMPT_MODE must be one of: " + ", ".join(sorted(allowed_modes))
             )
         return env_prompt_mode
 
     prompt_cfg = getattr(config, "prompt", None)
     prompt_mode = str(getattr(prompt_cfg, "mode", "auto") or "auto")
     if prompt_mode not in allowed_modes:
-        raise ValueError(
-            "prompt.mode must be one of: " + ", ".join(sorted(allowed_modes))
-        )
+        raise ValueError("prompt.mode must be one of: " + ", ".join(sorted(allowed_modes)))
     if prompt_mode != "auto":
         return prompt_mode
 
@@ -4468,9 +4357,7 @@ def _resolve_patch_evidence_protocol(config: object) -> bool:
             return False
         raise ValueError(
             f"{_PATCH_EVIDENCE_PROTOCOL_ENV} must be one of: "
-            + ", ".join(
-                sorted(_PATCH_EVIDENCE_PROTOCOL_ON | _PATCH_EVIDENCE_PROTOCOL_OFF)
-            )
+            + ", ".join(sorted(_PATCH_EVIDENCE_PROTOCOL_ON | _PATCH_EVIDENCE_PROTOCOL_OFF))
         )
 
     prompt_cfg = getattr(config, "prompt", None)
@@ -4500,9 +4387,7 @@ def _resolve_finalize_evidence_gate(config: object) -> bool:
             return False
         raise ValueError(
             f"{_FINALIZE_EVIDENCE_GATE_ENV} must be one of: "
-            + ", ".join(
-                sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF)
-            )
+            + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
         )
 
     prompt_cfg = getattr(config, "prompt", None)
@@ -4671,6 +4556,7 @@ class TurnRunner:
         self._usage_event_sink = usage_event_sink
         self._prompt_cache_keepalive_recorder = prompt_cache_keepalive_recorder
         self._prompt_cache_keepalive_armed = prompt_cache_keepalive_armed
+        self._compaction_parent_requests: dict[str, Any] = {}
         # Populated alongside the existing session-id lookup so live usage
         # events retain reset fencing without a second storage round trip.
         self._usage_session_epoch_by_key: dict[str, int] = {}
@@ -4937,8 +4823,8 @@ class TurnRunner:
     ) -> ToolContext:
         attachments_cfg = getattr(self._config, "attachments", None)
         media_root = self._attachment_media_root()
-        session_id, session_epoch, workspace_id = (
-            await self._resolve_session_identity_for_log(session_key)
+        session_id, session_epoch, workspace_id = await self._resolve_session_identity_for_log(
+            session_key
         )
         if not session_id:
             session_id = session_key.split(":")[-1] or session_key
@@ -5129,6 +5015,16 @@ class TurnRunner:
         self._prompt_cache_keepalive_recorder = recorder
         self._prompt_cache_keepalive_armed = armed
 
+    def compaction_parent_request(self, session_key: str) -> Any | None:
+        """Return the latest runtime-only physical request for one session."""
+
+        return self._compaction_parent_requests.get(session_key)
+
+    def clear_compaction_parent_request(self, session_key: str) -> None:
+        """Discard a snapshot after its transcript has been compacted."""
+
+        self._compaction_parent_requests.pop(session_key, None)
+
     @contextlib.asynccontextmanager
     async def _session_write_context(self, session_key: str) -> AsyncIterator[None]:
         lock = self.get_session_lock(session_key)
@@ -5233,14 +5129,10 @@ class TurnRunner:
             router_control_replay_depth=router_control_replay_depth,
             router_control_turn_hold_applied=False,
             tool_description_overrides=(
-                resolved_description_overrides[0]
-                if resolved_description_overrides
-                else None
+                resolved_description_overrides[0] if resolved_description_overrides else None
             ),
             tool_description_overrides_source=(
-                resolved_description_overrides[1]
-                if resolved_description_overrides
-                else None
+                resolved_description_overrides[1] if resolved_description_overrides else None
             ),
         )
         configured_state_dir = getattr(self._turn_config(), "state_dir", None)
@@ -5879,7 +5771,10 @@ class TurnRunner:
                 resolved=resolved_model,
                 squilla_router_tier=pa_out.squilla_router_tier,
             )
+            active_provider_id = getattr(cloned_selector, "active_provider_id", "") or provider_name
             if tool_context is not None:
+                tool_context.active_model = resolved_model or None
+                tool_context.active_provider = str(active_provider_id or "").strip() or None
                 tool_context.router_control_config = getattr(
                     self._turn_config(), "squilla_router", None
                 )
@@ -5888,9 +5783,6 @@ class TurnRunner:
                 tool_context.router_control_turn_hold_applied = bool(
                     turn.metadata.get("router_control_hold_applied")
                 )
-            active_provider_id = (
-                getattr(cloned_selector, "active_provider_id", "") or provider_name
-            )
             runtime_timeout_override = self._web_chat_runtime_timeout_override(
                 session_key,
                 explicit=timeout,
@@ -5962,6 +5854,19 @@ class TurnRunner:
                     )
             elif keepalive_capture_enabled:
                 keepalive_capture_enabled = False
+            parent_capture_setter = getattr(
+                agent,
+                "set_compaction_parent_request_capture_enabled",
+                None,
+            )
+            if callable(parent_capture_setter):
+                parent_capture_setter(
+                    os.environ.get(
+                        "OPENSQUILLA_COMPACTION_PROMPT_LAYOUT",
+                        "prefix",
+                    ).strip().lower()
+                    == "suffix"
+                )
                 log.warning(
                     "turn_runner.prompt_cache_keepalive_capture_unavailable",
                     session_key=session_key,
@@ -6060,20 +5965,31 @@ class TurnRunner:
 
             previous_deployment_identities: list[CompactionDeploymentIdentity] = []
             if self._session_manager is not None:
+                log.debug(
+                    "compaction.session_deployment_lookup_started",
+                    session_key=session_key,
+                )
                 try:
-                    compaction_session = await self._session_manager.get_session(
-                        session_key
+                    async with asyncio.timeout(2.0):
+                        compaction_session = await self._session_manager.get_session(session_key)
+                except TimeoutError:
+                    compaction_session = None
+                    log.warning(
+                        "compaction.session_deployment_lookup_timed_out",
+                        session_key=session_key,
+                        timeout_seconds=2.0,
                     )
                 except Exception:  # noqa: BLE001 - optional provenance candidate
                     compaction_session = None
+                log.debug(
+                    "compaction.session_deployment_lookup_finished",
+                    session_key=session_key,
+                    found=compaction_session is not None,
+                )
                 if compaction_session is not None:
                     current_identity = (
-                        str(
-                            getattr(selector_current_config, "provider", "") or ""
-                        ).strip(),
-                        str(
-                            getattr(selector_current_config, "model", "") or ""
-                        ).strip(),
+                        str(getattr(selector_current_config, "provider", "") or "").strip(),
+                        str(getattr(selector_current_config, "model", "") or "").strip(),
                     )
                     recorded_provider = str(
                         getattr(compaction_session, "model_provider", None) or ""
@@ -6086,9 +6002,7 @@ class TurnRunner:
                     override_provider = str(
                         getattr(compaction_session, "provider_override", None) or ""
                     ).strip()
-                    selected_model = str(
-                        getattr(compaction_session, "model", None) or ""
-                    ).strip()
+                    selected_model = str(getattr(compaction_session, "model", None) or "").strip()
                     previous_identities: list[tuple[str, str, str]] = []
                     if recorded_provider and recorded_model:
                         previous_identities.append(
@@ -6157,6 +6071,7 @@ class TurnRunner:
                 session_key=session_key,
                 credential_pool_acquirer=acquire_profile_credential,
                 credential_pool_failure_reporter=report_profile_credential_failure,
+                active_only=True,
             )
 
             def _refresh_compaction_plan_for_operation() -> Any | None:
@@ -6173,57 +6088,36 @@ class TurnRunner:
                 )
                 fresh_window = 0
                 fresh_model = str(getattr(fresh_current, "model", "") or "")
-                fresh_provider = str(
-                    getattr(fresh_current, "provider", "") or ""
-                )
+                fresh_provider = str(getattr(fresh_current, "provider", "") or "")
                 if fresh_model and self._model_catalog is not None:
-                    llm_cfg = (
-                        getattr(self._config, "llm", None)
-                        if self._config
-                        else None
-                    )
-                    fresh_window, _fresh_window_source = (
-                        resolve_effective_context_window(
-                            self._model_catalog,
-                            fresh_model,
-                            provider=fresh_provider,
-                            global_override=(
-                                getattr(llm_cfg, "context_window_tokens", 0) or 0
-                            ),
-                        )
+                    llm_cfg = getattr(self._config, "llm", None) if self._config else None
+                    fresh_window, _fresh_window_source = resolve_effective_context_window(
+                        self._model_catalog,
+                        fresh_model,
+                        provider=fresh_provider,
+                        global_override=(getattr(llm_cfg, "context_window_tokens", 0) or 0),
                     )
                 return resolve_compaction_execution_plan(
                     app_config=self._turn_config(),
                     active_provider=provider,
                     active_provider_config=fresh_current,
-                    previous_deployment_identities=(
-                        previous_deployment_identities
-                    ),
+                    previous_deployment_identities=(previous_deployment_identities),
                     fallback_provider_configs=fresh_chain[1:],
                     compaction_config=configured_compaction,
                     context_window_tokens=fresh_window,
                     session_key=session_key,
                     credential_pool_acquirer=acquire_profile_credential,
-                    credential_pool_failure_reporter=(
-                        report_profile_credential_failure
-                    ),
+                    credential_pool_failure_reporter=(report_profile_credential_failure),
+                    active_only=True,
                 )
 
             stable_consumer_window_tokens = compaction_context_window_tokens
             stable_consumer_max_output_tokens = agent.config.max_tokens
             stable_consumer_model_id = agent.config.model_id
             stable_consumer_capabilities = agent.config.model_capabilities
-            stable_consumer_proof_max_chars = (
-                agent.config.provider_request_proof_max_chars
-            )
-            stable_consumer_metadata = provider_metadata(
-                durable_base_consumer_provider
-            )
-            llm_cfg = (
-                getattr(self._config, "llm", None)
-                if self._config
-                else None
-            )
+            stable_consumer_proof_max_chars = agent.config.provider_request_proof_max_chars
+            stable_consumer_metadata = provider_metadata(durable_base_consumer_provider)
+            llm_cfg = getattr(self._config, "llm", None) if self._config else None
             if (
                 bool(turn.metadata.get("routing_applied", False))
                 and self._model_catalog is not None
@@ -6233,9 +6127,9 @@ class TurnRunner:
                     base_model,
                 ) = _stable_consumer_execution_identity(turn.metadata)
                 if base_model:
-                    configured_llm_provider = str(
-                        getattr(llm_cfg, "provider", "") or ""
-                    ).strip().lower()
+                    configured_llm_provider = (
+                        str(getattr(llm_cfg, "provider", "") or "").strip().lower()
+                    )
                     base_global_window = (
                         getattr(llm_cfg, "context_window_tokens", 0) or 0
                         if configured_llm_provider == base_provider.lower()
@@ -6258,12 +6152,10 @@ class TurnRunner:
                         or agent.config.max_tokens
                     )
                     stable_consumer_model_id = base_model
-                    stable_consumer_capabilities = (
-                        self._model_catalog.get_capabilities(
-                            base_model,
-                            provider_name=base_provider,
-                            base_url=stable_consumer_metadata.base_url,
-                        )
+                    stable_consumer_capabilities = self._model_catalog.get_capabilities(
+                        base_model,
+                        provider_name=base_provider,
+                        base_url=stable_consumer_metadata.base_url,
                     )
                     stable_consumer_proof_max_chars = (
                         int(
@@ -6301,14 +6193,10 @@ class TurnRunner:
                     context_window_tokens=stable_consumer_window_tokens,
                     max_output_tokens=stable_consumer_max_output_tokens,
                     model_capabilities=stable_consumer_capabilities,
-                    provider_request_proof_max_chars=(
-                        stable_consumer_proof_max_chars
-                    ),
+                    provider_request_proof_max_chars=(stable_consumer_proof_max_chars),
                 )
             agent.config.compaction_execution_plan = compaction_plan
-            agent.config.compaction_execution_plan_factory = (
-                _refresh_compaction_plan_for_operation
-            )
+            agent.config.compaction_execution_plan_factory = _refresh_compaction_plan_for_operation
             history_capacity_tokens = max(
                 1,
                 int(compaction_context_window_tokens),
@@ -6326,9 +6214,7 @@ class TurnRunner:
                 "build_compaction_consumer_admission",
                 None,
             )
-            if callable(preflight_history_capacity) and callable(
-                build_consumer_admission
-            ):
+            if callable(preflight_history_capacity) and callable(build_consumer_admission):
                 (
                     history_capacity_tokens,
                     history_capacity_chars,
@@ -6339,14 +6225,10 @@ class TurnRunner:
                     attachment_messages=extra_msgs,
                     context_window_tokens=compaction_context_window_tokens,
                     consumer_provider=durable_base_consumer_provider,
-                    consumer_max_output_tokens=(
-                        stable_consumer_max_output_tokens
-                    ),
+                    consumer_max_output_tokens=(stable_consumer_max_output_tokens),
                     consumer_model_id=stable_consumer_model_id,
                     consumer_model_capabilities=stable_consumer_capabilities,
-                    consumer_provider_request_max_chars=(
-                        stable_consumer_proof_max_chars
-                    ),
+                    consumer_provider_request_max_chars=(stable_consumer_proof_max_chars),
                 )
                 (
                     consumer_admission,
@@ -6361,9 +6243,7 @@ class TurnRunner:
                     max_output_tokens=stable_consumer_max_output_tokens,
                     consumer_model_id=stable_consumer_model_id,
                     consumer_model_capabilities=stable_consumer_capabilities,
-                    consumer_provider_request_max_chars=(
-                        stable_consumer_proof_max_chars
-                    ),
+                    consumer_provider_request_max_chars=(stable_consumer_proof_max_chars),
                 )
             else:
                 log.debug(
@@ -6462,9 +6342,7 @@ class TurnRunner:
                     source_snapshot = await capture_compaction_source(
                         session_key,
                         boundary_message_id=(
-                            bound_user_message_id
-                            if history_has_persisted_user
-                            else None
+                            bound_user_message_id if history_has_persisted_user else None
                         ),
                         **capture_kwargs,
                     )
@@ -6501,12 +6379,8 @@ class TurnRunner:
                     if source_is_entry_aligned:
                         compaction_source_entries = source_entries
                         compaction_source_preimage = source_snapshot.preimage
-                        compaction_source_boundary_message_id = (
-                            source_snapshot.boundary_message_id
-                        )
-                        compaction_source_boundary_entry_id = (
-                            source_snapshot.boundary_entry_id
-                        )
+                        compaction_source_boundary_message_id = source_snapshot.boundary_message_id
+                        compaction_source_boundary_entry_id = source_snapshot.boundary_entry_id
                     else:
                         # ``CompactionEvent.removed_count`` is a provider
                         # Message count. Only use it as a durable row boundary
@@ -6686,6 +6560,27 @@ class TurnRunner:
             fin_out = fin_outcome.require_output()
             final_text = fin_out.final_text
             turn_segments = fin_out.turn_segments
+            if fin_out.transcript_appended and not error_message:
+                parent_request_getter = getattr(
+                    agent,
+                    "compaction_parent_request",
+                    None,
+                )
+                try:
+                    parent_request = (
+                        parent_request_getter()
+                        if callable(parent_request_getter)
+                        else None
+                    )
+                except Exception:  # noqa: BLE001 - observer cannot fail a turn
+                    parent_request = None
+                    log.warning(
+                        "turn_runner.compaction_parent_request_failed",
+                        session_key=session_key,
+                        exc_info=True,
+                    )
+                if parent_request is not None:
+                    self._compaction_parent_requests[session_key] = parent_request
             if (
                 fin_out.transcript_appended
                 and not error_message
@@ -6906,10 +6801,7 @@ class TurnRunner:
             elif (
                 raw_segment_text == raw_partial_text
                 and segment_normalization.changed
-                and (
-                    not partial_normalization.changed
-                    or segment_text == partial_text
-                )
+                and (not partial_normalization.changed or segment_text == partial_text)
             ):
                 # A completed tool boundary is also a presentation boundary.
                 # Prefer a validated deletion-only segment projection when the
@@ -6926,9 +6818,7 @@ class TurnRunner:
                         reconciled_segments.append(segment)
                         continue
                     if partial_text and not inserted_text:
-                        reconciled_segments.append(
-                            {"type": "text", "text": partial_text}
-                        )
+                        reconciled_segments.append({"type": "text", "text": partial_text})
                         inserted_text = True
                 if partial_text and not inserted_text:
                     reconciled_segments.append({"type": "text", "text": partial_text})
@@ -7121,9 +7011,7 @@ class TurnRunner:
                     provider_boundary_failure_kind,
                 )
                 error_code = event_code
-                error_message = safe_provider_failure_message(
-                    provider_boundary_failure_kind
-                )
+                error_message = safe_provider_failure_message(provider_boundary_failure_kind)
             elif isinstance(exc, UsageAccountingUnavailableError):
                 event_code = str(
                     getattr(exc, "code", UsageAccountingUnavailableError.code)
@@ -7136,8 +7024,7 @@ class TurnRunner:
             else:
                 event_code = (
                     error_code
-                    if error_code
-                    in {"provider_request_too_large", "provider_output_truncated"}
+                    if error_code in {"provider_request_too_large", "provider_output_truncated"}
                     else "agent_error"
                 )
             log.error(
@@ -7151,9 +7038,7 @@ class TurnRunner:
             if turn_obj is not None:
                 try:
                     fallback_hops = int(
-                        (getattr(turn_obj, "metadata", None) or {}).get(
-                            "router_fallback_hops", 0
-                        )
+                        (getattr(turn_obj, "metadata", None) or {}).get("router_fallback_hops", 0)
                     )
                 except (TypeError, ValueError):
                     fallback_hops = 0
@@ -7173,9 +7058,7 @@ class TurnRunner:
                 # into turn_errors; the stable kind/code above is sufficient.
                 exc=None if provider_boundary_failure_kind else exc,
                 provider=(
-                    type(provider_for_log).__name__
-                    if provider_for_log is not None
-                    else None
+                    type(provider_for_log).__name__ if provider_for_log is not None else None
                 ),
                 model=resolved_model or None,
                 fallback_hops=fallback_hops,
@@ -7214,9 +7097,7 @@ class TurnRunner:
                     "turn_error",
                     {
                         "error_type": type(exc).__name__,
-                        "provider_failure_kind": (
-                            provider_boundary_failure_kind or None
-                        ),
+                        "provider_failure_kind": (provider_boundary_failure_kind or None),
                         "message_chars": len(str(exc)),
                     },
                 )
@@ -7409,8 +7290,8 @@ class TurnRunner:
     async def _resolve_session_id_for_log(self, session_key: str) -> str | None:
         """Best-effort lookup of the transcript identity for observability."""
 
-        session_id, _session_epoch, _workspace_id = (
-            await self._resolve_session_identity_for_log(session_key)
+        session_id, _session_epoch, _workspace_id = await self._resolve_session_identity_for_log(
+            session_key
         )
         return session_id
 
@@ -8127,6 +8008,13 @@ class TurnRunner:
         """Build tool definitions and handler from registry, filtered by ToolContext."""
         if self._tool_registry is None:
             return [], None
+        strict_subagent_tools = (
+            frozenset(ctx.allowed_tools)
+            if ctx is not None
+            and ctx.caller_kind is CallerKind.SUBAGENT
+            and ctx.allowed_tools is not None
+            else None
+        )
         from opensquilla.skills.meta.enabled import (
             is_meta_auto_trigger_enabled,
             is_meta_skill_enabled,
@@ -8150,10 +8038,7 @@ class TurnRunner:
             and not getattr(skill, "disable_model_invocation", False)
             for skill in loaded_skills
         )
-        plan_mode = (
-            ctx is not None
-            and str(getattr(ctx, "collaboration_mode", "default")) == "plan"
-        )
+        plan_mode = ctx is not None and str(getattr(ctx, "collaboration_mode", "default")) == "plan"
         attached_plan_run = bool(
             ctx is not None and str(getattr(ctx, "plan_run_id", "") or "").strip()
         )
@@ -8211,9 +8096,7 @@ class TurnRunner:
         if metadata is not None:
             metadata["meta_skill_enabled"] = meta_skill_enabled
             if skill_catalog is not None:
-                metadata["skill_catalog_generation"] = int(
-                    getattr(skill_catalog, "generation", 0)
-                )
+                metadata["skill_catalog_generation"] = int(getattr(skill_catalog, "generation", 0))
 
         if ctx is not None:
             caller_ctx = ctx
@@ -8260,6 +8143,12 @@ class TurnRunner:
             coding_mode = bool(getattr(skills_cfg, "coding_mode", False))
             ctx.denied_tools.update(coding_mode_denied_tools(coding_mode))
             ctx.coding_mode = coding_mode
+            if strict_subagent_tools is not None:
+                ctx.allowed_tools = (
+                    set(strict_subagent_tools)
+                    if ctx.allowed_tools is None
+                    else set(ctx.allowed_tools) & strict_subagent_tools
+                )
             # Policy/profile/runtime layers above may add tools. A restricted
             # turn's capability ceiling is applied last and can never be
             # widened by those lower-authority layers.
@@ -8302,6 +8191,33 @@ class TurnRunner:
             ctx,
         )
         if ctx is not None:
+            from opensquilla.engine.subagent_delegation import (
+                apply_complex_root_tool_ceiling,
+                is_complex_root,
+            )
+
+            if is_complex_root(ctx):
+                authorized_names = frozenset(
+                    definition.name for definition in authorized_tool_defs
+                )
+                ctx = apply_complex_root_tool_ceiling(
+                    ctx,
+                    authorized_tool_names=authorized_names,
+                )
+                if ctx is not caller_ctx:
+                    caller_ctx.allowed_tools = (
+                        set(ctx.allowed_tools) if ctx.allowed_tools is not None else None
+                    )
+                    caller_ctx.exclusive_tools = ctx.exclusive_tools
+                    caller_ctx.orchestration_worker_template_tools = (
+                        ctx.orchestration_worker_template_tools
+                    )
+                assert ctx.exclusive_tools is not None
+                tool_defs = [
+                    definition
+                    for definition in tool_defs
+                    if definition.name in ctx.exclusive_tools
+                ]
             if ctx is not caller_ctx:
                 caller_ctx.authorized_tool_names = ctx.authorized_tool_names
                 caller_ctx.disclosed_tool_names = ctx.disclosed_tool_names
@@ -8328,10 +8244,7 @@ class TurnRunner:
             skill.name
             for skill in loaded_skills
             if not getattr(skill, "disable_model_invocation", False)
-            and (
-                meta_skill_enabled
-                or getattr(skill, "kind", "skill") != "meta"
-            )
+            and (meta_skill_enabled or getattr(skill, "kind", "skill") != "meta")
         }
         tool_handler = build_tool_handler(
             self._tool_registry,
@@ -8575,8 +8488,6 @@ class TurnRunner:
                             ]
                         )
                 extra["Execution Context"] = "\n".join(lines)
-        if ctx.caller_kind is CallerKind.SUBAGENT:
-            extra["Subagent Task Protocol"] = _SUBAGENT_TASK_PROTOCOL
         if str(getattr(ctx, "collaboration_mode", "default")) == "plan":
             active_revision = getattr(ctx, "active_plan_revision_id", None)
             active_line = (
@@ -8766,6 +8677,7 @@ class TurnRunner:
         bootstrap_context_mode: str | None = None,
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
+        tool_context: ToolContext | None = None,
     ) -> str | tuple[str, str]:
         """Assemble identity system prompt via Jinja2 template.
 
@@ -9013,13 +8925,43 @@ class TurnRunner:
         )
         if volatile_block:
             dynamic_blocks.append(volatile_block)
+        from opensquilla.engine.subagent_delegation import (
+            render_subagent_delegation_prompt,
+            resolve_subagent_delegation_policy,
+        )
+
+        is_subagent_session = bool(session_key and is_subagent_key(session_key))
+        subagent_delegation_block = (
+            ""
+            if is_subagent_session
+            else render_subagent_delegation_prompt(
+                self._turn_config(),
+                tool_defs,
+                context=tool_context,
+            )
+        )
+        if prompt_metadata is not None:
+            prompt_metadata["subagent_delegation_policy"] = (
+                "child"
+                if is_subagent_session
+                else (
+                    resolve_subagent_delegation_policy(self._turn_config())
+                    if tool_defs
+                    and any(getattr(td, "name", "") == "delegate_task" for td in tool_defs)
+                    else "unavailable"
+                )
+            )
+        if subagent_delegation_block:
+            base_prompt = (
+                f"{base_prompt}\n\n"
+                f"## Subagent Delegation Policy\n\n{subagent_delegation_block}"
+            )
         if tool_defs and any(getattr(td, "name", "") == "router_control" for td in tool_defs):
             router_block = render_router_control_prompt_block(
                 getattr(self._turn_config(), "squilla_router", None)
             )
             if router_block:
                 dynamic_blocks.append(f"## Router Control\n\n{router_block}")
-
         if dynamic_blocks:
             return base_prompt, "\n\n".join(dynamic_blocks)
         return base_prompt
@@ -9142,9 +9084,7 @@ class TurnRunner:
         router_cfg = getattr(self._turn_config(), "squilla_router", None)
         if router_cfg is None:
             return None
-        configured_model = str(
-            getattr(router_cfg, "vision_followup_gate_model", "") or ""
-        ).strip()
+        configured_model = str(getattr(router_cfg, "vision_followup_gate_model", "") or "").strip()
         if configured_model:
             return configured_model
         tier_name = str(getattr(router_cfg, "vision_followup_gate_tier", "c0") or "").strip()
@@ -9218,9 +9158,7 @@ class TurnRunner:
                         agent_run_id=execution_id,
                         turn_id=execution_id,
                         parent_turn_id=(
-                            parent.turn_id or parent.execution_id
-                            if parent is not None
-                            else None
+                            parent.turn_id or parent.execution_id if parent is not None else None
                         ),
                         session_id=parent.session_id if parent is not None else None,
                         session_epoch=parent.session_epoch if parent is not None else 0,
@@ -9231,8 +9169,7 @@ class TurnRunner:
             with bind_usage_accounting_scope(scope):
                 stream = (
                     gate_provider.chat(messages, tools=tools, config=config)
-                    if scope is not None
-                    and provider_accounts_physical_usage(gate_provider)
+                    if scope is not None and provider_accounts_physical_usage(gate_provider)
                     else account_provider_stream(
                         lambda: gate_provider.chat(
                             messages,
@@ -9502,12 +9439,8 @@ class TurnRunner:
             )
         initial_provider_config = getattr(cloned_selector, "current_config", None)
         if initial_provider_config is not None:
-            durable_base_provider = str(
-                getattr(initial_provider_config, "provider", "") or ""
-            )
-            durable_base_model = str(
-                getattr(initial_provider_config, "model", "") or ""
-            )
+            durable_base_provider = str(getattr(initial_provider_config, "provider", "") or "")
+            durable_base_model = str(getattr(initial_provider_config, "model", "") or "")
             initial_metadata["executed_provider"] = durable_base_provider
             initial_metadata["executed_model"] = durable_base_model
             # ``executed_*`` follows the routed/fallback leg later. Keep a
@@ -9582,24 +9515,41 @@ class TurnRunner:
                 1,
             )
         if vision_sticky_remaining > 0:
-            initial_metadata["router_vision_sticky_remaining"] = int(
-                vision_sticky_remaining
-            )
+            initial_metadata["router_vision_sticky_remaining"] = int(vision_sticky_remaining)
         if turns_since_last_image is not None:
-            initial_metadata["router_turns_since_last_image"] = int(
-                turns_since_last_image
-            )
+            initial_metadata["router_turns_since_last_image"] = int(turns_since_last_image)
         if last_image_turn_text:
             initial_metadata["router_last_image_turn_text"] = last_image_turn_text
         if vision_candidate_turns > 0:
-            initial_metadata["router_vision_candidate_turns"] = int(
-                vision_candidate_turns
-            )
+            initial_metadata["router_vision_candidate_turns"] = int(vision_candidate_turns)
         if flags_text_override:
             initial_metadata["router_flags_text_override"] = flags_text_override
         if tool_context is not None:
             initial_metadata["channel_kind"] = tool_context.channel_kind
             initial_metadata["channel_id"] = tool_context.channel_id
+            from opensquilla.engine.subagent_delegation import is_complex_root
+
+            if is_complex_root(tool_context):
+                # Runtime-only routing fact. The task text still goes through
+                # the configured tree router; this only lets the router apply
+                # the coordinator capability floor to the Complex-mode root.
+                initial_metadata["complex_task_root"] = True
+            subagent_effort_tier = str(
+                getattr(tool_context, "subagent_effort_tier", "") or ""
+            )
+            if subagent_effort_tier:
+                initial_metadata["subagent_effort_tier"] = subagent_effort_tier
+            for metadata_key in (
+                "subagent_iteration_soft_limit",
+                "subagent_iteration_hard_limit",
+            ):
+                budget_value = getattr(tool_context, metadata_key, 0)
+                if (
+                    isinstance(budget_value, int)
+                    and not isinstance(budget_value, bool)
+                    and budget_value > 0
+                ):
+                    initial_metadata[metadata_key] = budget_value
             artifact_context = getattr(tool_context, "artifact_context", None)
             artifact_format = getattr(artifact_context, "artifact_format", None)
             artifact_operation = getattr(artifact_context, "operation_class", None)
@@ -9658,8 +9608,7 @@ class TurnRunner:
         )
         planning_turn = (
             tool_context is not None
-            and str(getattr(tool_context, "collaboration_mode", "default"))
-            == "plan"
+            and str(getattr(tool_context, "collaboration_mode", "default")) == "plan"
         )
         pipeline_steps: list[TurnStep] = [resolve_model]
         if not restricted_tool_boundary:
@@ -10129,6 +10078,10 @@ class TurnRunner:
                 )
             else:
                 turn.metadata["ensemble_enabled"] = True
+                turn.metadata.setdefault(
+                    "routed_model_before_ensemble",
+                    turn.model or getattr(current_provider_config, "model", ""),
+                )
                 tier_scoped_ensemble = bool(tier_ensemble_mode) and (
                     not ensemble_globally_enabled
                     or tier_ensemble_binding == "legacy"
@@ -10139,10 +10092,6 @@ class TurnRunner:
                 if tier_scoped_ensemble:
                     turn.metadata["ensemble_tier_binding"] = tier_ensemble_binding
                 turn.metadata["ensemble_selection_mode"] = selection_mode
-                turn.metadata.setdefault(
-                    "routed_model_before_ensemble",
-                    turn.model or getattr(current_provider_config, "model", ""),
-                )
                 fixed_provider = provider
                 ensemble_provider = build_ensemble_provider_from_config(
                     config=self._turn_config(),
@@ -10151,13 +10100,9 @@ class TurnRunner:
                     turn_metadata=turn.metadata,
                     _enable_member_request_budget_rebinding=True,
                     _model_catalog=self._model_catalog,
-                    _context_overflow_threshold=(
-                        AgentConfig().context_overflow_threshold
-                    ),
+                    _context_overflow_threshold=(AgentConfig().context_overflow_threshold),
                     _credential_pool_acquirer=acquire_profile_credential,
-                    _credential_pool_failure_reporter=(
-                        report_profile_credential_failure
-                    ),
+                    _credential_pool_failure_reporter=(report_profile_credential_failure),
                     _session_key=turn.session_key,
                     _fallback_selector=cloned_selector,
                     _artifact_mutation=artifact_requires_aggregator_ensemble,
@@ -10475,13 +10420,6 @@ class TurnRunner:
                         if restricted_turn
                         else _strip_context_summary_marker(raw_content)
                     )
-                )
-            subagent_notice = _subagent_terminal_history_notice(entry)
-            if subagent_notice is not None:
-                return HistoryReplayEntryProjection(
-                    terminal_notice=subagent_notice,
-                    persisted_token_count=persisted_token_count,
-                    last_entry_was_user=False,
                 )
             if role not in {"user", "assistant"}:
                 return HistoryReplayEntryProjection()
@@ -10998,9 +10936,7 @@ class TurnRunner:
             if image_turn_count:
                 context["history_has_recent_image"] = True
                 context["history_image_turn_count"] = image_turn_count
-                turns_since_last_image = (
-                    len(recent_user_contents) - image_positions[-1] - 1
-                )
+                turns_since_last_image = len(recent_user_contents) - image_positions[-1] - 1
                 context["turns_since_last_image"] = turns_since_last_image
                 context["vision_candidate_turns"] = candidate_turns
                 absolute_image_index = (
@@ -11017,9 +10953,7 @@ class TurnRunner:
                     or 0
                 )
                 if sticky_turns > 0 and turns_since_last_image < sticky_turns:
-                    context["vision_sticky_remaining"] = (
-                        sticky_turns - turns_since_last_image
-                    )
+                    context["vision_sticky_remaining"] = sticky_turns - turns_since_last_image
 
         for entry in reversed(entries):
             if getattr(entry, "role", None) != "assistant":
@@ -11352,9 +11286,7 @@ class TurnRunner:
                 intent_summary=build_intent_summary(message),
                 trace_id=trace_id or turn_id,
                 decision_id=(
-                    turn_obj.metadata.get("router_decision_id")
-                    if turn_obj is not None
-                    else None
+                    turn_obj.metadata.get("router_decision_id") if turn_obj is not None else None
                 ),
                 tool_profile=prompt_report.tool_profile if prompt_report else None,
                 prompt_hash=prompt_hash,
@@ -11376,9 +11308,7 @@ class TurnRunner:
                 skill_count=prompt_report.skill_count if prompt_report else 0,
                 skills_prompt_chars=prompt_report.skills_prompt_chars if prompt_report else 0,
                 memory_md_present=prompt_report.memory_md_present if prompt_report else False,
-                daily_notes_omitted=(
-                    prompt_report.daily_notes_omitted if prompt_report else False
-                ),
+                daily_notes_omitted=(prompt_report.daily_notes_omitted if prompt_report else False),
                 daily_notes_count_before_omit=(
                     prompt_report.daily_notes_count_before_omit if prompt_report else 0
                 ),
@@ -11439,9 +11369,7 @@ class TurnRunner:
                     prompt_report.session_flush_fallback_reason if prompt_report else None
                 ),
                 image_route_reason=(
-                    turn_obj.metadata.get("image_route_reason")
-                    if turn_obj is not None
-                    else None
+                    turn_obj.metadata.get("image_route_reason") if turn_obj is not None else None
                 ),
                 vision_followup_gate_decision=(
                     turn_obj.metadata.get("router_vision_followup_gate_decision")
@@ -11455,9 +11383,7 @@ class TurnRunner:
                 ),
                 vision_followup_gate_reason=(
                     build_vision_followup_gate_reason_code(
-                        decision=turn_obj.metadata.get(
-                            "router_vision_followup_gate_decision"
-                        ),
+                        decision=turn_obj.metadata.get("router_vision_followup_gate_decision"),
                         source=turn_obj.metadata.get("router_vision_followup_gate_source"),
                         reason=turn_obj.metadata.get("router_vision_followup_gate_reason"),
                         fallback=turn_obj.metadata.get("router_vision_followup_fallback"),
@@ -11798,11 +11724,7 @@ class TurnRunner:
 
         compaction_config = None
         configured_compaction = getattr(getattr(self, "_config", None), "compaction", None)
-        if (
-            compaction_provider is not None
-            or compaction_model
-            or configured_compaction is not None
-        ):
+        if compaction_provider is not None or compaction_model or configured_compaction is not None:
             from opensquilla.session.compaction import build_compaction_config_from_provider
 
             compaction_config = build_compaction_config_from_provider(
@@ -11833,12 +11755,10 @@ class TurnRunner:
         total_chars = checkpoint_chars + estimate_entries_model_replay_chars(transcript)
         durable_prefix_end = len(transcript) - protected_suffix_count
         durable_history_tokens = checkpoint_tokens + sum(
-            estimate_entry_model_replay_tokens(entry)
-            for entry in transcript[:durable_prefix_end]
+            estimate_entry_model_replay_tokens(entry) for entry in transcript[:durable_prefix_end]
         )
-        durable_history_chars = (
-            checkpoint_chars
-            + estimate_entries_model_replay_chars(transcript[:durable_prefix_end])
+        durable_history_chars = checkpoint_chars + estimate_entries_model_replay_chars(
+            transcript[:durable_prefix_end]
         )
         safety_margin = float(
             getattr(compaction_config or CompactionConfig(), "safety_margin", 1.2) or 1.2
@@ -11891,15 +11811,12 @@ class TurnRunner:
             else 0
         )
         if (
-            (
-                protected_request_tokens > 0
-                and protected_request_tokens * safety_margin > history_window_tokens
-            )
-            or (
-                history_capacity_chars is not None
-                and protected_request_chars > 0
-                and protected_request_chars * safety_margin > int(history_capacity_chars)
-            )
+            protected_request_tokens > 0
+            and protected_request_tokens * safety_margin > history_window_tokens
+        ) or (
+            history_capacity_chars is not None
+            and protected_request_chars > 0
+            and protected_request_chars * safety_margin > int(history_capacity_chars)
         ):
             log.info(
                 "t3_upgrade_compaction.skipped",
@@ -12085,10 +12002,7 @@ class TurnRunner:
                 deterministic_receipt_safe=checkpoint_saved and not requires_safe_receipt,
                 required=self._pre_compaction_flush_enabled(),
             )
-            if (
-                requires_safe_receipt
-                and not memory_status.allows_destructive_compaction
-            ):
+            if requires_safe_receipt and not memory_status.allows_destructive_compaction:
                 log.warning(
                     "t3_upgrade_compaction.skipped",
                     session_key=session_key,
@@ -12151,9 +12065,7 @@ class TurnRunner:
                     compact_method,
                     "provider_request_correlation",
                 ):
-                    compact_kwargs["provider_request_correlation"] = (
-                        provider_request_correlation
-                    )
+                    compact_kwargs["provider_request_correlation"] = provider_request_correlation
                 if _accepts_keyword_arg(compact_method, "consumer_admission"):
                     compact_kwargs["consumer_admission"] = consumer_admission
                 if _accepts_keyword_arg(
@@ -12442,11 +12354,7 @@ class TurnRunner:
         )
 
         configured_compaction = getattr(getattr(self, "_config", None), "compaction", None)
-        if (
-            compaction_provider is not None
-            or compaction_model
-            or configured_compaction is not None
-        ):
+        if compaction_provider is not None or compaction_model or configured_compaction is not None:
             compaction_config = build_compaction_config_from_provider(
                 compaction_provider,
                 model_override=compaction_model,
@@ -12512,32 +12420,23 @@ class TurnRunner:
         total_chars = checkpoint_chars + estimate_entries_model_replay_chars(transcript)
         durable_prefix_end = len(transcript) - protected_suffix_count
         durable_history_tokens = checkpoint_tokens + sum(
-            estimate_entry_model_replay_tokens(entry)
-            for entry in transcript[:durable_prefix_end]
+            estimate_entry_model_replay_tokens(entry) for entry in transcript[:durable_prefix_end]
         )
-        durable_history_chars = (
-            checkpoint_chars
-            + estimate_entries_model_replay_chars(transcript[:durable_prefix_end])
+        durable_history_chars = checkpoint_chars + estimate_entries_model_replay_chars(
+            transcript[:durable_prefix_end]
         )
         ratio = self._preflight_compact_ratio()
         threshold = int(history_window_tokens * ratio)
         char_threshold = (
-            int(int(history_capacity_chars) * ratio)
-            if history_capacity_chars is not None
-            else None
+            int(int(history_capacity_chars) * ratio) if history_capacity_chars is not None else None
         )
         durable_token_pressure = durable_history_tokens > threshold
         durable_char_pressure = bool(
-            char_threshold is not None
-            and durable_history_chars > char_threshold
+            char_threshold is not None and durable_history_chars > char_threshold
         )
         if not durable_token_pressure and not durable_char_pressure:
-            if (
-                total_tokens > threshold
-                or (
-                    char_threshold is not None
-                    and total_chars > char_threshold
-                )
+            if total_tokens > threshold or (
+                char_threshold is not None and total_chars > char_threshold
             ):
                 log.info(
                     "preflight_compaction.skipped",
@@ -12578,15 +12477,12 @@ class TurnRunner:
         )
         safety_margin = float(getattr(compaction_config, "safety_margin", 1.2) or 1.2)
         if (
-            (
-                protected_request_tokens > 0
-                and protected_request_tokens * safety_margin > history_window_tokens
-            )
-            or (
-                history_capacity_chars is not None
-                and protected_request_chars > 0
-                and protected_request_chars * safety_margin > int(history_capacity_chars)
-            )
+            protected_request_tokens > 0
+            and protected_request_tokens * safety_margin > history_window_tokens
+        ) or (
+            history_capacity_chars is not None
+            and protected_request_chars > 0
+            and protected_request_chars * safety_margin > int(history_capacity_chars)
         ):
             log.info(
                 "preflight_compaction.skipped",
@@ -12783,10 +12679,7 @@ class TurnRunner:
                 deterministic_receipt_safe=checkpoint_saved and not requires_safe_receipt,
                 required=self._pre_compaction_flush_enabled(),
             )
-            if (
-                requires_safe_receipt
-                and not memory_status.allows_destructive_compaction
-            ):
+            if requires_safe_receipt and not memory_status.allows_destructive_compaction:
                 log.warning(
                     "preflight_compaction.skipped",
                     session_key=session_key,
@@ -12850,9 +12743,7 @@ class TurnRunner:
                     compact_method,
                     "provider_request_correlation",
                 ):
-                    compact_kwargs["provider_request_correlation"] = (
-                        provider_request_correlation
-                    )
+                    compact_kwargs["provider_request_correlation"] = provider_request_correlation
                 if _accepts_keyword_arg(compact_method, "consumer_admission"):
                     compact_kwargs["consumer_admission"] = consumer_admission
                 if _accepts_keyword_arg(
@@ -13010,9 +12901,7 @@ class TurnRunner:
             )
             return
         if not result:
-            skip_reason = str(
-                getattr(compaction_result, "skip_reason", None) or "empty_summary"
-            )
+            skip_reason = str(getattr(compaction_result, "skip_reason", None) or "empty_summary")
             if skip_reason == "stale_preimage":
                 notify_compaction(
                     session_key,
@@ -13344,12 +13233,7 @@ class TurnRunner:
         """Wait for detached pre-compaction writes for exactly these sessions."""
 
         keys = tuple(
-            sorted(
-                {
-                    canonicalize_session_key(session_key)
-                    for session_key in session_keys
-                }
-            )
+            sorted({canonicalize_session_key(session_key) for session_key in session_keys})
         )
         if not keys:
             return
@@ -13358,12 +13242,7 @@ class TurnRunner:
             pending = {
                 task
                 for session_key in keys
-                if (
-                    task := self._active_pre_compaction_flush_tasks.get(
-                        session_key
-                    )
-                )
-                is not None
+                if (task := self._active_pre_compaction_flush_tasks.get(session_key)) is not None
                 and not task.done()
             }
             pending.update(
@@ -13602,11 +13481,7 @@ class TurnRunner:
         kept_entries = [self._emergency_replay_entry(raw) for raw in result.kept_entries]
         if len(kept_entries) >= len(transcript):
             return False
-        summary = (
-            "Emergency request-scoped compaction\n"
-            f"Reason: {reason}\n\n"
-            f"{result.summary}"
-        )
+        summary = f"Emergency request-scoped compaction\nReason: {reason}\n\n{result.summary}"
         self._emergency_compaction_overrides[session_key] = _EmergencyCompactionOverride(
             summary=summary,
             kept_entries=kept_entries,
@@ -14009,9 +13884,7 @@ class TurnRunner:
                 )
             )
             replay_compaction_id = (
-                replayed_compaction_ids[0]
-                if replayed_compaction_ids
-                else new_compaction_id()
+                replayed_compaction_ids[0] if replayed_compaction_ids else new_compaction_id()
             )
             notify_compaction(
                 session_key,
@@ -14160,9 +14033,7 @@ class TurnRunner:
                     except (binascii.Error, ValueError):
                         omitted.append(f"[attachment unavailable: {label} ({media_type})]")
                     else:
-                        replay_blocks.append(
-                            ContentBlockImage(media_type=media_type, data=data)
-                        )
+                        replay_blocks.append(ContentBlockImage(media_type=media_type, data=data))
                         preserved_image = True
                     continue
                 if isinstance(sha_ref, str) and sha_ref and media_root and session_id:
@@ -14366,10 +14237,7 @@ class TurnRunner:
                     raise ValueError(f"attachments[{index}].data must be valid base64") from exc
             max_bytes = _attachment_size_limit_for_mime(
                 media_type,
-                staged=(
-                    att.get("_was_staged") is True
-                    and _can_stage_attachment_mime(media_type)
-                ),
+                staged=(att.get("_was_staged") is True and _can_stage_attachment_mime(media_type)),
             )
             if len(raw_bytes) > max_bytes:
                 raise ValueError(f"attachments[{index}] exceeds the {max_bytes} byte limit")
@@ -14446,16 +14314,11 @@ class TurnRunner:
                     )
                 except ValueError as exc:
                     extracted_office_text = (
-                        "[attachment unavailable: document text could not be "
-                        f"extracted: {exc}]"
+                        f"[attachment unavailable: document text could not be extracted: {exc}]"
                     )
                 if material_marker:
-                    extracted_office_text = "\n\n".join(
-                        [extracted_office_text, material_marker]
-                    )
-                wrapped = _render_file_context_block(
-                    filename, media_type, extracted_office_text
-                )
+                    extracted_office_text = "\n\n".join([extracted_office_text, material_marker])
+                wrapped = _render_file_context_block(filename, media_type, extracted_office_text)
                 attachment_blocks.append(ContentBlockText(text=wrapped))
             elif media_type in _EMAIL_ATTACHMENT_MIMES:
                 try:
@@ -14464,22 +14327,14 @@ class TurnRunner:
                     )
                 except ValueError as exc:
                     extracted_email_text = (
-                        "[attachment unavailable: email could not be "
-                        f"extracted: {exc}]"
+                        f"[attachment unavailable: email could not be extracted: {exc}]"
                     )
                 if material_marker:
-                    extracted_email_text = "\n\n".join(
-                        [extracted_email_text, material_marker]
-                    )
-                wrapped = _render_file_context_block(
-                    filename, media_type, extracted_email_text
-                )
+                    extracted_email_text = "\n\n".join([extracted_email_text, material_marker])
+                wrapped = _render_file_context_block(filename, media_type, extracted_email_text)
                 attachment_blocks.append(ContentBlockText(text=wrapped))
             elif media_type in _ENGINE_TEXT_FAMILY_MIMES:
-                if (
-                    is_attachment_ref(att)
-                    and att.get("_provider_inline_policy") == "preview_only"
-                ):
+                if is_attachment_ref(att) and att.get("_provider_inline_policy") == "preview_only":
                     decoded_text = _render_preview_only_attachment_text(
                         att,
                         filename=filename,

@@ -1963,7 +1963,6 @@
     "loading": "Sitzungen werden geladen…",
     "loadMore": "Weitere Sitzungen laden",
     "unknownAgent": "Unbekannter Agent",
-    "deletedAgent": "Gelöschter Agent · {id}",
     "msgCount": "{count} Nachr.",
     "error": {
       "load": "Sitzungen konnten nicht geladen werden."
@@ -3888,6 +3887,15 @@
       "commandDisable": "Coding mode deaktivieren.",
       "activeLabel": "Coding AN",
       "disableLabel": "Coding mode deaktivieren"
+    },
+    "complexTaskMode": {
+      "enableLabel": "Modus für komplexe Aufgaben aktivieren",
+      "disableLabel": "Modus für komplexe Aufgaben deaktivieren"
+    },
+    "singleAgentMode": {
+      "enableLabel": "Modus für vollständige Aufgaben aktivieren",
+      "disableLabel": "Modus für vollständige Aufgaben deaktivieren",
+      "resultLabel": "Agentenergebnis"
     },
     "composer": {
       "executionMode": "Ausführungsmodus",

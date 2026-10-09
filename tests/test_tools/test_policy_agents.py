@@ -5,7 +5,6 @@ from opensquilla.gateway.routing import build_cron_route_envelope, tool_context_
 from opensquilla.scheduler.types import CronJob
 from opensquilla.tools.policy import apply_tool_policy_from_config
 from opensquilla.tools.types import (
-    CRON_AGENT_DENY,
     SUBAGENT_TOOL_DENY,
     CallerKind,
     ToolContext,
@@ -29,7 +28,7 @@ def test_tool_policy_reads_direct_gateway_agents_list() -> None:
         config=cfg,
     )
 
-    assert result.allowed_tools == {"session_status", "memory_search"}
+    assert result.allowed_tools == {"memory_search"}
 
 
 def test_cron_route_tool_policy_can_only_narrow_or_extend_cron_baseline() -> None:
@@ -52,7 +51,7 @@ def test_cron_route_tool_policy_can_only_narrow_or_extend_cron_baseline() -> Non
 
     assert envelope.metadata["tool_policy"] == job.tool_policy
     assert result.caller_kind is CallerKind.CRON
-    assert result.allowed_tools == {"session_status"}
+    assert result.allowed_tools == set()
     assert "web_fetch" in result.denied_tools
     assert "exec_command" in result.denied_tools
 
@@ -84,11 +83,9 @@ def test_owner_cron_route_does_not_apply_non_owner_cron_allowlist() -> None:
     assert "exec_command" not in result.denied_tools
 
 
-def test_policy_deny_lists_do_not_reference_removed_agent_wrapper_tools() -> None:
-    assert "spawn_subagent" not in SUBAGENT_TOOL_DENY
-    assert "send_message" not in SUBAGENT_TOOL_DENY
-    assert "spawn_subagent" not in CRON_AGENT_DENY
-    assert "send_message" not in CRON_AGENT_DENY
+def test_subagent_policy_allows_the_new_delegation_controls() -> None:
+    assert "delegate_task" not in SUBAGENT_TOOL_DENY
+    assert "interrupt_agent" not in SUBAGENT_TOOL_DENY
 
 
 def test_messaging_group_does_not_revive_removed_agent_send_wrapper() -> None:
@@ -103,7 +100,7 @@ def test_messaging_group_does_not_revive_removed_agent_send_wrapper() -> None:
 
     assert result.allowed_tools is not None
     assert "message" in result.allowed_tools
-    assert "sessions_send" in result.allowed_tools
+    assert "sessions_send" not in result.allowed_tools
     assert "send_message" not in result.allowed_tools
 
 
@@ -112,9 +109,7 @@ def test_channel_media_group_expands_safe_file_authoring_tools() -> None:
         "channels": {
             "feishu": {
                 "groups": {
-                    "oc_demo": {
-                        "tools": {"profile": "minimal", "also_allow": ["channel:media"]}
-                    }
+                    "oc_demo": {"tools": {"profile": "minimal", "also_allow": ["channel:media"]}}
                 }
             }
         }
@@ -141,7 +136,6 @@ def test_channel_media_group_expands_safe_file_authoring_tools() -> None:
     )
 
     assert result.allowed_tools == {
-        "session_status",
         "create_csv",
         "create_xlsx",
         "create_pptx",
@@ -154,9 +148,7 @@ def test_channel_perm_group_is_empty_until_explicit_tools_exist() -> None:
         "channels": {
             "feishu": {
                 "groups": {
-                    "oc_demo": {
-                        "tools": {"profile": "minimal", "also_allow": ["channel:perm"]}
-                    }
+                    "oc_demo": {"tools": {"profile": "minimal", "also_allow": ["channel:perm"]}}
                 }
             }
         }
@@ -175,7 +167,7 @@ def test_channel_perm_group_is_empty_until_explicit_tools_exist() -> None:
         config=cfg,
     )
 
-    assert result.allowed_tools == {"session_status"}
+    assert result.allowed_tools == set()
 
 
 def test_channel_sender_policy_can_enable_drive_for_one_sender() -> None:
@@ -186,9 +178,7 @@ def test_channel_sender_policy_can_enable_drive_for_one_sender() -> None:
                     "oc_demo": {
                         "tools": {
                             "profile": "minimal",
-                            "toolsBySender": {
-                                "id:ou_allowed": {"also_allow": ["channel:drive"]}
-                            },
+                            "toolsBySender": {"id:ou_allowed": {"also_allow": ["channel:drive"]}},
                         }
                     }
                 }
@@ -220,5 +210,5 @@ def test_channel_sender_policy_can_enable_drive_for_one_sender() -> None:
         config=cfg,
     )
 
-    assert allowed.allowed_tools == {"session_status", "create_pptx"}
-    assert other.allowed_tools == {"session_status"}
+    assert allowed.allowed_tools == {"create_pptx"}
+    assert other.allowed_tools == set()

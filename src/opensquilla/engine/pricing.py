@@ -404,6 +404,14 @@ _PRICING_TABLE: list[tuple[str, PriceEntry]] = [
     ("stepfun/step-3.5-flash", PriceEntry(0.10, 0.30)),
     ("z-ai/glm-4.5-air", PriceEntry(0.13, 0.85)),
     ("minimax/minimax-m2.5", PriceEntry(0.118, 0.99)),
+    (
+        "deepseek/deepseek-v4-flash-0731",
+        PriceEntry(0.14, 0.28, cache_read_per_m=0.028),
+    ),
+    (
+        "deepseek/deepseek-v4-pro-0813",
+        PriceEntry(1.32, 3.96, cache_read_per_m=0.044),
+    ),
     ("deepseek/deepseek-v4-flash", PriceEntry(0.14, 0.28, cache_read_per_m=0.0028)),
     ("deepseek/deepseek-v4-pro", PriceEntry(0.435, 0.87, cache_read_per_m=0.003625)),
     ("deepseek/deepseek-v3.2", PriceEntry(0.26, 0.38)),

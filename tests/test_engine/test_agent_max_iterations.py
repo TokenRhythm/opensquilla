@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig, ToolResult
-from opensquilla.engine.subagent import SubagentSpec
 from opensquilla.engine.types import ArtifactEvent, ErrorEvent
 from opensquilla.engine.usage import UsageTracker, model_usage_cost_fields
 from opensquilla.engine.usage_accounting import UsageCallResult, UsageCallStart
@@ -32,6 +32,7 @@ from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStart,
 )
 from opensquilla.provider.types import ProviderBillingReceipt
+from opensquilla.tools.types import CallerKind, ToolContext
 
 
 class _RecordingUsageSink:
@@ -53,9 +54,16 @@ class _RecordingUsageSink:
 class _LoopingToolProvider:
     provider_name = "fake"
 
-    def __init__(self, *, final_on_call: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        final_on_call: int | None = None,
+        vary_arguments: bool = False,
+    ) -> None:
         self.final_on_call = final_on_call
+        self.vary_arguments = vary_arguments
         self.calls: list[list[Message]] = []
+        self.tools: list[list[Any] | None] = []
 
     def chat(
         self,
@@ -64,6 +72,7 @@ class _LoopingToolProvider:
         config: ChatConfig | None = None,
     ) -> AsyncIterator[Any]:
         self.calls.append(messages)
+        self.tools.append(tools)
         call_number = len(self.calls)
         return self._stream(call_number)
 
@@ -78,7 +87,7 @@ class _LoopingToolProvider:
         yield ProviderToolUseEnd(
             tool_use_id=tool_id,
             tool_name="echo",
-            arguments={"value": "again"},
+            arguments={"value": f"again-{call_number}" if self.vary_arguments else "again"},
         )
         yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
 
@@ -86,6 +95,33 @@ class _LoopingToolProvider:
         return []
 
 
+class _LoopingRetrievalProvider:
+    provider_name = "fake"
+
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.calls.append(messages)
+        return self._stream(len(self.calls))
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        tool_id = f"search-{call_number}"
+        yield ProviderToolUseStart(tool_use_id=tool_id, tool_name="web_search")
+        yield ProviderToolUseEnd(
+            tool_use_id=tool_id,
+            tool_name="web_search",
+            arguments={"query": f"query-{call_number}"},
+        )
+        yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+
+    async def list_models(self) -> list[Any]:
+        return []
 
 
 class _ToolThenProviderErrorProvider:
@@ -118,6 +154,7 @@ class _ToolThenProviderErrorProvider:
 
     async def list_models(self) -> list[Any]:
         return []
+
 
 class _DoneUsageProvider:
     provider_name = "fake"
@@ -307,6 +344,38 @@ def _echo_definition() -> ToolDefinition:
     )
 
 
+def _apply_patch_definition() -> ToolDefinition:
+    return ToolDefinition(
+        name="apply_patch",
+        description="Apply a patch.",
+        input_schema=ToolInputSchema(properties={}, required=[]),
+    )
+
+
+def _web_search_definition() -> ToolDefinition:
+    return ToolDefinition(
+        name="web_search",
+        description="Search.",
+        input_schema=ToolInputSchema(
+            properties={"query": {"type": "string"}},
+            required=["query"],
+        ),
+    )
+
+
+async def _same_source_search(call: Any) -> ToolResult:
+    return ToolResult(
+        tool_use_id=call.tool_use_id,
+        tool_name=call.tool_name,
+        content=json.dumps(
+            {
+                "ok": True,
+                "results": [{"url": "https://example.com/source"}],
+            }
+        ),
+    )
+
+
 def _publish_artifact_definition() -> ToolDefinition:
     return ToolDefinition(
         name="publish_artifact",
@@ -340,9 +409,8 @@ async def _artifact_tool(call: Any) -> ToolResult:
     )
 
 
-def test_agent_iteration_defaults_are_unbounded() -> None:
+def test_agent_iteration_defaults_keep_main_unbounded() -> None:
     assert AgentConfig().max_iterations == 0
-    assert SubagentSpec(task="check").max_iterations == 0
     assert AgentConfig().max_turn_llm_calls == 0
     assert AgentConfig().max_turn_input_tokens == 0
     assert AgentConfig().max_turn_output_tokens == 0
@@ -353,7 +421,7 @@ def test_agent_iteration_defaults_are_unbounded() -> None:
 
 @pytest.mark.asyncio
 async def test_agent_default_max_iterations_allows_long_tool_loop_to_finish() -> None:
-    provider = _LoopingToolProvider(final_on_call=101)
+    provider = _LoopingToolProvider(final_on_call=101, vary_arguments=True)
     agent = Agent(
         provider=provider,
         config=AgentConfig(),
@@ -383,9 +451,7 @@ async def test_agent_finalizes_when_tool_loop_reaches_max_iterations() -> None:
     assert len(provider.calls) == 2
     assert provider.calls[-1][-1].role == "user"
     assert "Do not call tools" in str(provider.calls[-1][-1].content)
-    assert "Do not call tools" not in "\n".join(
-        str(message.content) for message in agent._history
-    )
+    assert "Do not call tools" not in "\n".join(str(message.content) for message in agent._history)
     assert not any(event.kind == "state" and event.state.value == "error" for event in events)
     assert not any(event.kind == "error" and event.code == "max_iterations" for event in events)
     assert any(event.kind == "done" and event.text == "done" for event in events)
@@ -405,11 +471,7 @@ async def test_agent_reports_partial_max_iterations_after_finalization_attempt_f
 
     assert len(provider.calls) == 2
     assert not any(event.kind == "state" and event.state.value == "error" for event in events)
-    assert any(
-        event.kind == "done"
-        and "best partial result" in event.text
-        for event in events
-    )
+    assert any(event.kind == "done" and "best partial result" in event.text for event in events)
 
 
 @pytest.mark.asyncio
@@ -484,8 +546,7 @@ async def test_agent_synthesizes_final_artifact_response_without_provider_call()
     assert not any(isinstance(event, ErrorEvent) for event in events)
     assert not any(event.kind == "warning" for event in events)
     assert any(
-        event.kind == "done"
-        and event.text == "The generated file is ready: report.txt."
+        event.kind == "done" and event.text == "The generated file is ready: report.txt."
         for event in events
     )
 
@@ -507,8 +568,7 @@ async def test_agent_synthesizes_final_artifact_response_before_extra_llm_call()
     assert not any(isinstance(event, ErrorEvent) for event in events)
     assert not any(event.kind == "warning" for event in events)
     assert any(
-        event.kind == "done"
-        and event.text == "The generated file is ready: report.txt."
+        event.kind == "done" and event.text == "The generated file is ready: report.txt."
         for event in events
     )
 
@@ -555,8 +615,7 @@ async def test_agent_stops_when_turn_llm_call_budget_is_exceeded() -> None:
 
     assert len(provider.calls) == 1
     assert any(
-        event.kind == "error" and event.code == "turn_llm_call_budget_exceeded"
-        for event in events
+        event.kind == "error" and event.code == "turn_llm_call_budget_exceeded" for event in events
     )
 
 
@@ -609,7 +668,10 @@ async def test_agent_done_event_uses_current_turn_real_billed_usage_delta() -> N
 
 
 @pytest.mark.asyncio
-async def test_agent_enriches_model_usage_breakdown_with_estimated_costs() -> None:
+async def test_agent_enriches_model_usage_breakdown_with_estimated_costs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
     tracker = UsageTracker()
     session_key = "agent:test:webchat:ensemble-costs"
     agent = Agent(
@@ -925,9 +987,7 @@ async def test_done_then_error_receipt_reconciles_gate_ledger_and_report() -> No
     ) == (150, 15, 10, 10, 3)
     assert done.session_totals is not None
     assert done.session_totals.billed_cost == pytest.approx(0.75)
-    assert sum(row["billed_cost_usd"] for row in done.model_usage_breakdown) == pytest.approx(
-        0.75
-    )
+    assert sum(row["billed_cost_usd"] for row in done.model_usage_breakdown) == pytest.approx(0.75)
     tracker_snapshot = tracker.session_snapshot(session_key)
     assert tracker_snapshot is not None
     assert tracker_snapshot.billed_cost == pytest.approx(0.75)
@@ -1049,32 +1109,26 @@ async def test_error_receipt_variants_use_canonical_billed_budget_semantics(
 
     assert (
         any(
-            event.kind == "error"
-            and event.code == "turn_billed_cost_budget_exceeded"
+            event.kind == "error" and event.code == "turn_billed_cost_budget_exceeded"
             for event in events
         )
         is expect_budget_error
     )
     assert len(provider.calls) == 1
     assert len(sink.finalized) == 1
-    assert sink.finalized[0][1].billed_cost_nanos == round(
-        expected_billed * 1_000_000_000
-    )
+    assert sink.finalized[0][1].billed_cost_nanos == round(expected_billed * 1_000_000_000)
     assert done.billed_cost == pytest.approx(expected_billed)
     assert done.session_totals is not None
     assert done.session_totals.billed_cost == pytest.approx(expected_billed)
     tracker_snapshot = tracker.session_snapshot(session_key)
     assert tracker_snapshot is not None
     assert tracker_snapshot.billed_cost == pytest.approx(expected_billed)
-    assert sum(
-        row["billed_cost_usd"] for row in done.model_usage_breakdown
-    ) == pytest.approx(expected_billed)
+    assert sum(row["billed_cost_usd"] for row in done.model_usage_breakdown) == pytest.approx(
+        expected_billed
+    )
     receipt = row_overrides.get("billing_receipt")
     if isinstance(receipt, ProviderBillingReceipt) and receipt.status == "pending":
-        assert all(
-            row["cost_source"] != "provider_billed"
-            for row in done.model_usage_breakdown
-        )
+        assert all(row["cost_source"] != "provider_billed" for row in done.model_usage_breakdown)
 
 
 class _DoneAndErrorSamePhysicalCallProvider:
@@ -1187,9 +1241,7 @@ async def test_two_billed_error_retries_are_each_counted_once() -> None:
     )
     assert len(sink.started) == 3
     assert len(sink.finalized) == 3
-    assert {call.event_id for call, _ in sink.finalized} == {
-        call.event_id for call in sink.started
-    }
+    assert {call.event_id for call, _ in sink.finalized} == {call.event_id for call in sink.started}
     assert sum(result.billed_cost_nanos for _, result in sink.finalized) == 750_000_000
     assert done.billed_cost == pytest.approx(0.75)
     tracker_snapshot = tracker.session_snapshot(session_key)
@@ -1295,14 +1347,10 @@ async def test_error_receipt_report_uses_member_prices_without_tracker(
     assert len(sink.finalized) == 1
     assert sink.finalized[0][1].estimated_cost_nanos == 0
     breakdown_cost = sum(row["cost_usd"] for row in done.model_usage_breakdown)
-    breakdown_billed = sum(
-        row["billed_cost_usd"] for row in done.model_usage_breakdown
-    )
+    breakdown_billed = sum(row["billed_cost_usd"] for row in done.model_usage_breakdown)
     assert done.cost_usd == pytest.approx(breakdown_cost)
     assert done.billed_cost == pytest.approx(breakdown_billed)
-    assert done.cost_source == (
-        "mixed" if include_billed_row else "opensquilla_estimate"
-    )
+    assert done.cost_source == ("mixed" if include_billed_row else "opensquilla_estimate")
     assert all(row["model"] != "outer-unpriced" for row in done.model_usage_breakdown)
 
 
@@ -1329,3 +1377,149 @@ async def test_agent_stops_when_turn_tool_error_budget_is_exceeded() -> None:
         event.kind == "error" and event.code == "turn_tool_error_budget_exceeded"
         for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_subagent_fallback_stops_changed_tool_failures_after_three_rounds() -> None:
+    provider = _LoopingToolProvider(vary_arguments=True)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=16,
+            subagent_failure_fallback_threshold=3,
+        ),
+        tool_definitions=[_echo_definition()],
+        tool_handler=_error_tool,
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 3
+    terminal = next(event for event in events if event.kind == "error")
+    assert terminal.code == "subagent_tool_failure_fallback"
+    assert json.loads(terminal.message) == {
+        "error": "Three consecutive tool rounds failed without progress."
+    }
+
+
+@pytest.mark.asyncio
+async def test_subagent_retrieval_stall_stops_without_injecting_model_guidance() -> None:
+    provider = _LoopingRetrievalProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=16,
+            subagent_failure_fallback_threshold=3,
+        ),
+        tool_definitions=[_web_search_definition()],
+        tool_handler=_same_source_search,
+    )
+
+    events = [event async for event in agent.run_turn("find one source")]
+
+    assert len(provider.calls) == 5
+    assert all(
+        len(
+            [
+                message
+                for message in call
+                if message.role == "user" and isinstance(message.content, str)
+            ]
+        )
+        == 1
+        for call in provider.calls
+    )
+    terminal = next(event for event in events if event.kind == "error")
+    assert terminal.code == "subagent_retrieval_stalled"
+    assert json.loads(terminal.message) == {
+        "error": "Four consecutive retrieval attempts added no new sources."
+    }
+
+
+@pytest.mark.asyncio
+async def test_subagent_iteration_cap_gets_one_tool_free_wrapup_call() -> None:
+    provider = _LoopingToolProvider(final_on_call=4)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=3,
+            subagent_soft_iteration_limit=1,
+            subagent_effort_tier="small",
+            subagent_failure_fallback_threshold=3,
+        ),
+        tool_definitions=[_echo_definition()],
+        tool_handler=_echo_tool,
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 4
+    assert provider.tools[0]
+    assert provider.tools[1]
+    assert provider.tools[2]
+    assert provider.tools[3] is None
+    assert all(
+        len(
+            [
+                message
+                for message in provider.calls[index]
+                if message.role == "user" and isinstance(message.content, str)
+            ]
+        )
+        == 1
+        for index in (1, 2)
+    )
+    assert '"status":"completed|failed"' in str(provider.calls[3][-1].content)
+    assert '"retry_same_agent":true|false' in str(provider.calls[3][-1].content)
+    assert not any(event.kind == "error" for event in events)
+    assert any(event.kind == "done" and event.text == "done" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_subagent_iteration_cap_uses_structured_wrapup_with_fallback_disabled() -> None:
+    provider = _LoopingToolProvider(final_on_call=2)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            subagent_failure_fallback_threshold=0,
+        ),
+        tool_definitions=[_echo_definition()],
+        tool_handler=_echo_tool,
+        tool_context=ToolContext(caller_kind=CallerKind.SUBAGENT),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert provider.tools[1] is None
+    assert '"status":"completed|failed"' in str(provider.calls[1][-1].content)
+    assert '"retry_same_agent":true|false' in str(provider.calls[1][-1].content)
+    assert not any(event.kind == "error" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_subagent_soft_limit_does_not_inject_model_guidance() -> None:
+    provider = _LoopingToolProvider(final_on_call=4)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=3,
+            subagent_soft_iteration_limit=1,
+            subagent_effort_tier="small",
+            subagent_failure_fallback_threshold=3,
+        ),
+        tool_definitions=[_echo_definition(), _apply_patch_definition()],
+        tool_handler=_echo_tool,
+    )
+
+    events = [event async for event in agent.run_turn("implement the bug fix")]
+
+    assert len(
+        [
+            message
+            for message in provider.calls[1]
+            if message.role == "user" and isinstance(message.content, str)
+        ]
+    ) == 1
+    assert not any(event.kind == "error" for event in events)

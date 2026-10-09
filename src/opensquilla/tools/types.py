@@ -272,6 +272,29 @@ class ToolContext:
     disclosed_tool_names: set[str] = field(default_factory=set, repr=False)
     tool_search_index: Any | None = field(default=None, repr=False)
     tool_search_namespaces: dict[str, str] = field(default_factory=dict, repr=False)
+    # Physical deployment selected for the current turn. Session tools use
+    # these runtime-only values when a child route fails and must inherit the
+    # parent that is actually executing, rather than a target-agent default.
+    active_model: str | None = None
+    active_provider: str | None = None
+    # Durable delegated-work identity. These fields are set only after an
+    # OrchestrationRun admits the turn; generic chat sessions leave them None.
+    orchestration_run_id: str | None = None
+    orchestration_session_id: str | None = None
+    orchestration_task_id: str | None = None
+    orchestration_activation_id: str | None = None
+    orchestration_worker_template_tools: frozenset[str] | None = field(
+        default=None,
+        repr=False,
+    )
+    orchestration_complex_mode: bool = False
+    orchestration_single_mode: bool = False
+    # Router-selected subagent work budget. These runtime-only values bridge
+    # the durable RouteEnvelope into the engine TurnContext; ordinary agent
+    # turns leave them at their neutral defaults.
+    subagent_effort_tier: str = ""
+    subagent_iteration_soft_limit: int = 0
+    subagent_iteration_hard_limit: int = 0
 
     def __post_init__(self) -> None:
         # A restricted turn's ceiling is an authority boundary, not a policy
@@ -367,8 +390,6 @@ SUBAGENT_TOOL_DENY: frozenset[str] = frozenset(
     {
         "cron",
         "gateway",
-        "agents_list",
-        "subagents",
         "memory_get",
         "memory_search",
         "session_search",
@@ -409,8 +430,6 @@ CRON_AGENT_ALLOW: frozenset[str] = frozenset(
 CRON_AGENT_DENY: frozenset[str] = frozenset(
     {
         "cron",
-        "agents_list",
-        "subagents",
         "message",
         "exec_command",
         "background_process",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
@@ -11,6 +12,7 @@ from opensquilla.channels.admission import (
     has_verified_channel_admin_stamp,
 )
 from opensquilla.channels.types import IncomingMessage
+from opensquilla.result_budget import build_web_retrieval_tool_run_budget_policy
 from opensquilla.run_mode import RunMode, execution_target, normalize_run_mode
 from opensquilla.sandbox.run_context import (
     normalize_scope,
@@ -42,6 +44,26 @@ class SourceKind(StrEnum):
 
 PRINCIPAL_HOST_EXECUTE_METADATA_KEY = "principal_host_execute"
 _ARTIFACT_MUTATION_WRITER_NAMES = frozenset({"document_apply", "document_patch"})
+
+_SUBAGENT_RETRIEVAL_BUDGETS = {
+    "small": (4, 6, 60_000, 12_000, 5),
+    "medium": (8, 8, 100_000, 20_000, 8),
+    "large": (12, 12, 160_000, 30_000, 10),
+}
+
+
+def _subagent_retrieval_budget(metadata: dict[str, Any]) -> Any | None:
+    values = _SUBAGENT_RETRIEVAL_BUDGETS.get(str(metadata.get("subagent_effort_tier") or ""))
+    if values is None:
+        return None
+    search_calls, fetch_calls, text_chars, single_fetch_chars, search_results = values
+    return build_web_retrieval_tool_run_budget_policy(
+        max_web_search_calls_per_turn=search_calls,
+        max_web_fetch_calls_per_turn=fetch_calls,
+        max_external_text_chars_per_turn=text_chars,
+        max_single_fetch_chars=single_fetch_chars,
+        max_web_search_results=search_results,
+    )
 
 
 @dataclass(frozen=True)
@@ -379,13 +401,18 @@ def build_subagent_route_envelope(
     run_id: str | None = None,
     parent_task_id: str | None = None,
     spawn_depth: int = 0,
-    origin: str = "sessions_spawn",
+    origin: str = "delegate_task",
     principal_is_owner: bool | None = None,
     principal_host_execute: bool | None = None,
     elevated: str | None = None,
     run_mode: str | RunMode | None = None,
     sandbox_run_context: Any | None = None,
     sandbox_mounts: list[dict[str, Any]] | None = None,
+    tools: list[str] | None = None,
+    tools_are_final: bool = False,
+    effort_tier: str | None = None,
+    iteration_soft_limit: int | None = None,
+    iteration_hard_limit: int | None = None,
 ) -> RouteEnvelope:
     """Build a route for a child subagent run."""
     metadata: dict[str, Any] = {
@@ -403,6 +430,16 @@ def build_subagent_route_envelope(
         and parent_session_epoch >= 0
     ):
         metadata["parent_session_epoch"] = parent_session_epoch
+    if tools is not None:
+        metadata["subagent_tools"] = list(tools)
+    if tools_are_final:
+        metadata["subagent_tools_are_final"] = True
+    if effort_tier in {"small", "medium", "large"}:
+        metadata["subagent_effort_tier"] = effort_tier
+    if isinstance(iteration_soft_limit, int) and iteration_soft_limit > 0:
+        metadata["subagent_iteration_soft_limit"] = iteration_soft_limit
+    if isinstance(iteration_hard_limit, int) and iteration_hard_limit > 0:
+        metadata["subagent_iteration_hard_limit"] = iteration_hard_limit
     if principal_is_owner is not None:
         metadata["principal_is_owner"] = bool(principal_is_owner)
     if principal_host_execute is not None:
@@ -516,6 +553,17 @@ def _filtered_legacy_sandbox_mounts(value: Any) -> list[dict[str, Any]]:
     return mounts
 
 
+def _positive_int_metadata(metadata: Mapping[str, Any], key: str) -> int:
+    value = metadata.get(key)
+    if isinstance(value, bool):
+        return 0
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
 def tool_context_from_envelope(
     envelope: RouteEnvelope,
     *,
@@ -559,7 +607,15 @@ def tool_context_from_envelope(
             allowed_tools = set(CRON_AGENT_ALLOW)
             denied_tools = set(CRON_AGENT_DENY)
     elif caller_kind is CallerKind.SUBAGENT:
-        denied_tools = set(SUBAGENT_TOOL_DENY)
+        if not bool(envelope.metadata.get("subagent_tools_are_final")):
+            denied_tools = set(SUBAGENT_TOOL_DENY)
+        requested_tools = envelope.metadata.get("subagent_tools")
+        if isinstance(requested_tools, list):
+            allowed_tools = {
+                name.strip()
+                for name in requested_tools
+                if isinstance(name, str) and name.strip()
+            }
     guest_safe = bool(envelope.metadata.get("guest_safe"))
     if guest_safe:
         from opensquilla.tools.visibility import guest_safe_tool_allowlist
@@ -741,6 +797,11 @@ def tool_context_from_envelope(
         allowed_tools=allowed_tools,
         denied_tools=denied_tools,
         surfaced_tools=surfaced_tools,
+        tool_run_budget_policy=(
+            _subagent_retrieval_budget(envelope.metadata)
+            if caller_kind is CallerKind.SUBAGENT
+            else None
+        ),
         elevated=elevated,
         tool_policy=(
             envelope.metadata.get("tool_policy") if cron_trusted else None
@@ -760,6 +821,73 @@ def tool_context_from_envelope(
             str(envelope.metadata["active_plan_revision_id"])
             if envelope.metadata.get("active_plan_revision_id")
             else None
+        ),
+        orchestration_run_id=(
+            str(envelope.metadata["orchestration_run_id"])
+            if envelope.metadata.get("orchestration_run_id")
+            else (
+                str(envelope.metadata["task_id"])
+                if envelope.metadata.get("task_id")
+                else None
+            )
+        ),
+        orchestration_session_id=(
+            str(envelope.metadata["orchestration_session_id"])
+            if envelope.metadata.get("orchestration_session_id")
+            else envelope.session_id
+        ),
+        orchestration_task_id=(
+            str(envelope.metadata["orchestration_task_id"])
+            if envelope.metadata.get("orchestration_task_id")
+            else (
+                str(envelope.metadata["task_id"])
+                if envelope.metadata.get("task_id")
+                else None
+            )
+        ),
+        orchestration_activation_id=(
+            str(envelope.metadata["orchestration_activation_id"])
+            if envelope.metadata.get("orchestration_activation_id")
+            else None
+        ),
+        orchestration_worker_template_tools=(
+            frozenset(
+                str(name)
+                for name in envelope.metadata["orchestration_worker_template_tools"]
+                if isinstance(name, str) and name
+            )
+            if isinstance(
+                envelope.metadata.get("orchestration_worker_template_tools"),
+                list,
+            )
+            else None
+        ),
+        orchestration_complex_mode=bool(
+            envelope.metadata.get("complex_task_mode", False)
+        ),
+        orchestration_single_mode=bool(
+            envelope.metadata.get("single_agent_mode", False)
+        ),
+        subagent_effort_tier=(
+            str(envelope.metadata.get("subagent_effort_tier") or "")
+            if caller_kind is CallerKind.SUBAGENT
+            else ""
+        ),
+        subagent_iteration_soft_limit=(
+            _positive_int_metadata(
+                envelope.metadata,
+                "subagent_iteration_soft_limit",
+            )
+            if caller_kind is CallerKind.SUBAGENT
+            else 0
+        ),
+        subagent_iteration_hard_limit=(
+            _positive_int_metadata(
+                envelope.metadata,
+                "subagent_iteration_hard_limit",
+            )
+            if caller_kind is CallerKind.SUBAGENT
+            else 0
         ),
         plan_run_id=(
             str(envelope.metadata["plan_run_id"])

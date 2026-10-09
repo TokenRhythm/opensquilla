@@ -584,17 +584,17 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
         config=config,
         provider_selector=slash_services.provider_selector,
     )
-    consumer_budget = resolve_gateway_consumer_budget(
+    physical_consumer_budget = resolve_gateway_consumer_budget(
         gateway_context,
         session,
     )
     consumer_budget = limit_gateway_consumer_budget(
-        consumer_budget,
+        physical_consumer_budget,
         max(1, int(configured_context_cap or 1)),
     )
     context_window = consumer_budget.context_window_tokens
     consumer_admission, consumer_admission_fingerprint = (
-        build_gateway_consumer_admission(consumer_budget)
+        build_gateway_consumer_admission(physical_consumer_budget)
     )
     target = resolve_gateway_compaction_target(
         gateway_context,

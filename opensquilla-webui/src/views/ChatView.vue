@@ -203,8 +203,6 @@
           :strip-time-prefix="stripTimePrefix"
           :render-markdown="renderMarkdown"
           :fmt-tok="fmtTok"
-          :subagent-summary="subagentSummary"
-          :subagent-body="subagentBody"
           :tool-call-groups="toolCallGroups"
           :is-tool-group-open="isToolGroupOpen"
           :is-tool-item-open="isToolItemOpen"
@@ -221,7 +219,6 @@
           :scroll-epoch="scrollEpoch"
           :goal="currentGoalRun"
           :goal-elapsed="goalLastElapsed"
-          :resolve-session-availability="resolveCreatedSessionAvailability"
           @fork-conversation="forkConversation"
           @edit-message="editMessage"
           @edit-attachment="editAttachmentResource"
@@ -234,7 +231,6 @@
           @toggle-tool-group="toggleToolGroup"
           @toggle-tool-item="toggleToolItem"
           @show-tool-result="showToolResultModal"
-          @open-session="switchToSession"
           @resolve-interrupt="resolveInterrupt"
           @extend-interrupt="extendInterrupt"
           @clarify-submit="submitClarify"
@@ -248,6 +244,17 @@
             <RouterFxStrip v-if="shouldRenderRouterStrip(msg)" :message="msg" />
           </template>
         </ChatMessageList>
+        <section
+          v-for="result in delegatedResultItems"
+          :key="result.taskId"
+          class="chat-delegated-result"
+          :data-task-id="result.taskId"
+          :aria-label="t('chat.singleAgentMode.resultLabel')"
+        >
+          <h3>{{ t('chat.singleAgentMode.resultLabel') }}</h3>
+          <div v-if="result.deliverable" class="chat-markdown" v-html="renderMarkdown(result.deliverable)" />
+          <p v-else>{{ result.error || result.summary }}</p>
+        </section>
         </div>
 
         <!-- Manual or turn-boundary compaction has no assistant turn to own
@@ -650,6 +657,8 @@
       :session-routing-available="sessionRoutingAvailable"
       :coding-mode-enabled="codingModeEnabled"
       :coding-mode-settings-busy="codingModeSettingsBusy"
+      :complex-task-mode-enabled="complexTaskModeEnabled"
+      :single-agent-mode-enabled="singleAgentModeEnabled"
       :goal-draft-armed="goalDraftArmed"
       :goal-mode-available="goalUiAvailable"
       :goal-mode-busy="goalBusy || planModeBusy || replanActive"
@@ -687,6 +696,8 @@
       @set-run-mode="setComposerRunMode"
       @set-session-routing-mode="setComposerSessionRoutingMode"
       @set-coding-mode-enabled="setComposerCodingModeEnabled"
+      @set-complex-task-mode-enabled="setComplexTaskModeEnabled"
+      @set-single-agent-mode-enabled="setSingleAgentModeEnabled"
       @set-collaboration-mode="setCollaborationMode"
       @arm-goal="void activateGoalComposerMode()"
       @disarm-goal="disarmGoalMode"
@@ -775,12 +786,9 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
-import {
-  SESSION_DIRECTORY_KEY,
-  SessionDirectoryError,
-  isCronSessionKey,
-} from '@/modules/sessionDirectory'
+import { isCronSessionKey } from '@/modules/sessionDirectory'
 import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
+import { DELEGATED_RESULTS_KEY, type DelegatedResult } from '@/modules/delegatedResults'
 import { PENDING_INPUT_QUEUE_KEY } from '@/modules/pendingInputQueue'
 import { APP_SETTINGS_KEY } from '@/modules/appSettings'
 import { PROVIDER_CONFIGURATION_KEY } from '@/modules/providerConfiguration'
@@ -1098,9 +1106,6 @@ import {
   shouldCaptureFilePaste,
 } from '@/utils/chat/attachments'
 import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
-import {
-  projectSessionCreationRouterPresentation,
-} from '@/utils/chat/sessionCreationRouterPresentation'
 import { createPendingInputWal } from '@/utils/chat/pendingInputWal'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
 import { shouldDisableLandingSuggestions } from '@/utils/chat/landingSuggestions'
@@ -1167,9 +1172,6 @@ const gatewayConnectionState = computed(() => gatewayAccess.availability === 'av
 const pendingInputQueue = inject(PENDING_INPUT_QUEUE_KEY, null)
 const sessionRouting = inject(SESSION_ROUTING_KEY) as SessionRouting | undefined
 if (!sessionRouting) throw new Error('SessionRouting was not provided')
-const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
-if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
-const sessionDirectory = injectedSessionDirectory
 const injectedSessionLifecycle = inject(SESSION_LIFECYCLE_KEY)
 if (!injectedSessionLifecycle) throw new Error('SessionLifecycle was not provided')
 const sessionLifecycle = injectedSessionLifecycle
@@ -1228,15 +1230,6 @@ if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provi
 const artifactWorkbench = injectedArtifactWorkbench
 if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 
-async function resolveCreatedSessionAvailability(sessionKey: string): Promise<boolean> {
-  try {
-    await sessionDirectory.resolve({ key: sessionKey })
-    return true
-  } catch (error: unknown) {
-    if (error instanceof SessionDirectoryError && error.code === 'not-found') return false
-    throw error
-  }
-}
 const sandboxSetupStore = useSandboxSetupStore()
 const {
   ensuring: sandboxSetupPending,
@@ -1329,6 +1322,46 @@ const { enabled: composerFxEnabled } = useComposerFloatingPreference()
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+const injectedDelegatedResults = inject(DELEGATED_RESULTS_KEY)
+if (!injectedDelegatedResults) throw new Error('DelegatedResults was not provided')
+const delegatedResults = injectedDelegatedResults
+const delegatedResultItems = ref<DelegatedResult[]>([])
+async function loadDelegatedResults(key: string) {
+  try {
+    const results = await delegatedResults.list(key)
+    if (sessionKey.value === key) delegatedResultItems.value = results
+  } catch {
+    // A disconnected Gateway cannot hydrate results; the next connection retries.
+  }
+}
+async function loadDelegatedResult(taskId: string) {
+  const key = sessionKey.value
+  if (!key) return
+  try {
+    const result = await delegatedResults.get(key, taskId)
+    if (sessionKey.value !== key) return
+    delegatedResultItems.value = [
+      ...delegatedResultItems.value.filter(item => item.taskId !== taskId),
+      result,
+    ]
+  } catch {
+    void loadDelegatedResults(key)
+  }
+}
+watch([sessionKey, gatewayConnectionState], ([key, state]) => {
+  delegatedResultItems.value = []
+  if (key && state === 'connected') void loadDelegatedResults(key)
+}, { immediate: true })
+const complexTaskModeEnabled = ref(false)
+const singleAgentModeEnabled = ref(false)
+function setComplexTaskModeEnabled(enabled: boolean) {
+  complexTaskModeEnabled.value = enabled
+  if (enabled) singleAgentModeEnabled.value = false
+}
+function setSingleAgentModeEnabled(enabled: boolean) {
+  singleAgentModeEnabled.value = enabled
+  if (enabled) complexTaskModeEnabled.value = false
+}
 function clearPendingComposerScrollIntent() {
   pendingComposerScrollIntent = null
   if (composerScrollIntentTimer !== null) {
@@ -2305,7 +2338,6 @@ const chatRenderedMessages = useChatRenderedMessages({
   renderMarkdown,
   stripGeneratedArtifactMarkers,
   stripTimePrefix,
-  isSubagentCompletionMessage,
   timeTranslator: t,
 })
 const { renderedMessages } = chatRenderedMessages
@@ -2317,10 +2349,7 @@ const {
   messages: renderedMessages,
   isStreaming,
 })
-const sessionCreationRouterPresentation = computed(() => (
-  projectSessionCreationRouterPresentation(renderedMessages.value, isStreaming.value)
-))
-const visibleRenderedMessages = computed(() => sessionCreationRouterPresentation.value.messages)
+const visibleRenderedMessages = renderedMessages
 
 function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
   // Always surface the router strip — the live ensemble strip is the primary
@@ -3332,6 +3361,8 @@ const chatSend = useChatSend({
   modelRoutingSettingsBusy,
   imageInputAdmission,
   initialRoutingMode,
+  complexTaskModeEnabled,
+  singleAgentModeEnabled,
   elevatedMode,
   runMode,
   pendingAttachments,
@@ -3850,6 +3881,7 @@ function onPlanQuestionnaireTouchEnd() {
 const rpcEventHandlers = useChatRpcEventHandlers({
   conversationRuntime,
   sessionKey,
+  onDelegatedResultReady: taskId => { void loadDelegatedResult(taskId) },
   currentEpoch,
   lastStreamSeq,
   streamGeneration,
@@ -3885,6 +3917,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   saveWidgetState,
   onSessionSubscribed: () => {
     if (isDraftRoute()) metaDraftRecovery.retry(draftAgentId())
+    if (sessionKey.value) void loadDelegatedResults(sessionKey.value)
     return handleAuthoritativeSessionSubscription(sessionKey.value)
   },
   handleSessionConnectionState: state =>
@@ -4818,31 +4851,6 @@ function sessionRunStatus(source: ChatRunStatusSource | null | undefined): ChatR
   if (active && (activeStatus === 'queued' || activeStatus === 'running' || activeStatus === 'approval_pending')) status = activeStatus
   const task = active || last || null
   return { status, label: runStatusLabelText(status, stateSource), task }
-}
-
-/* ── Subagent ──────────────────────────────────────────────────────── */
-
-function isSubagentCompletionMessage(role: string, text: string, options?: ChatMessage): boolean {
-  if (role !== 'system' || !text) return false
-  if (options?.provenanceSourceTool === 'subagent_completion') return true
-  try {
-    const parsed = JSON.parse(text)
-    return parsed && parsed.type === 'subagent_completion'
-  } catch { return false }
-}
-
-function subagentSummary(text: string): string {
-  try {
-    const parsed = JSON.parse(text)
-    return t('chat.subagentPrefix') + (parsed.child_session_key || parsed.session_key || 'completion')
-  } catch { return t('chat.subagentCompletion') }
-}
-
-function subagentBody(text: string): string {
-  try {
-    const parsed = JSON.parse(text)
-    return JSON.stringify(parsed, null, 2)
-  } catch { return text }
 }
 
 /* ── Artifacts ─────────────────────────────────────────────────────── */
@@ -7085,5 +7093,19 @@ watch(
   padding: 0.75rem 1rem;
   color: var(--text-muted);
   text-align: center;
+}
+
+.chat-delegated-result {
+  margin: 1rem auto;
+  padding: 1rem 1.25rem;
+  max-width: 52rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+}
+
+.chat-delegated-result h3 {
+  margin: 0 0 0.75rem;
+  font-size: 0.875rem;
 }
 </style>

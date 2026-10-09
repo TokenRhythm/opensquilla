@@ -25,6 +25,14 @@ class _CapturingSelector:
         self.synced = cfg
 
 
+def test_llm_seed_loads_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_LLM_SEED", "42")
+
+    cfg = GatewayConfig()
+
+    assert cfg.llm.seed == 42
+
+
 def test_boot_resolves_direct_provider_env_key_and_base_url(
     monkeypatch,
 ) -> None:
@@ -329,6 +337,8 @@ def test_openrouter_runtime_uses_default_provider_routing() -> None:
     runtime = resolve_llm_runtime_config(cfg)
 
     assert runtime.provider_routing["deepseek/deepseek-v4-flash"] == "deepseek"
+    assert runtime.provider_routing["deepseek/deepseek-v4-flash-0731"] == "deepseek"
+    assert runtime.provider_routing["deepseek/deepseek-v4-pro-0813"] == "deepseek"
     assert runtime.provider_routing["z-ai/glm-5.1"] == "z-ai"
     assert runtime.provider_routing["z-ai/glm-5.2"] == "z-ai"
     assert runtime.provider_routing["anthropic/claude-opus-4.8"] == "anthropic"
@@ -350,6 +360,8 @@ def test_openrouter_runtime_provider_routing_overrides_default() -> None:
     runtime = resolve_llm_runtime_config(cfg)
 
     assert runtime.provider_routing["deepseek/deepseek-v4-flash"] == "deepseek"
+    assert runtime.provider_routing["deepseek/deepseek-v4-flash-0731"] == "deepseek"
+    assert runtime.provider_routing["deepseek/deepseek-v4-pro-0813"] == "deepseek"
     assert runtime.provider_routing["z-ai/glm-5.2"] == "z-ai/special"
     assert runtime.provider_routing["anthropic/claude-opus-4.8"] == "anthropic"
     assert runtime.provider_routing["moonshotai/kimi-k2.6"] == "moonshotai"

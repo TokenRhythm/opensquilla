@@ -5695,7 +5695,7 @@ class TestSessionsAbort:
                 return 1
 
         monkeypatch.setattr(
-            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_task",
+            "opensquilla.tools.builtin.shell.cancel_background_processes_for_task",
             cancel_task_background,
         )
         monkeypatch.setattr(
@@ -5830,7 +5830,7 @@ class TestSessionsAbort:
                 return 1
 
         monkeypatch.setattr(
-            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_task",
+            "opensquilla.tools.builtin.shell.cancel_background_processes_for_task",
             cancel_task_background,
         )
         monkeypatch.setattr(
@@ -5997,14 +5997,9 @@ class TestSessionsAbort:
                     self.active_tasks[child_key] = "task-child"
                 return SimpleNamespace(task_id=task_id, status="cancelled")
 
-        background_cancel_calls: list[str] = []
         persisted_cancel_calls: list[str] = []
         approval_cancel_calls: list[str] = []
         emitted: list[tuple[str, str, dict[str, Any]]] = []
-
-        async def cancel_background(session_key: str) -> int:
-            background_cancel_calls.append(session_key)
-            return 1
 
         async def cancel_persisted(_state_dir: object, session_key: str) -> int:
             persisted_cancel_calls.append(session_key)
@@ -6024,10 +6019,6 @@ class TestSessionsAbort:
         ) -> None:
             emitted.append((session_key, event_name, payload))
 
-        monkeypatch.setattr(
-            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_session",
-            cancel_background,
-        )
         monkeypatch.setattr(
             "opensquilla.process_tree.cancel_persisted_processes_for_session",
             cancel_persisted,
@@ -6061,7 +6052,6 @@ class TestSessionsAbort:
         ]
         assert runtime.successful_cancel_calls == [session.session_key, grandchild_key, child_key]
         assert runtime.wait_calls == ["task-parent", "task-grandchild", "task-child"]
-        assert background_cancel_calls == [session.session_key, child_key, grandchild_key]
         assert persisted_cancel_calls == [session.session_key, child_key, grandchild_key]
         assert approval_cancel_calls == [
             session.session_key,
@@ -6203,13 +6193,8 @@ class TestSessionsAbort:
             async def wait(self, task_id: str):
                 return next(row for row in rows if row.task_id == task_id)
 
-        completion_calls: list[tuple[str, str]] = []
         process_calls: list[tuple[str, str]] = []
         owned_cleanup_complete = asyncio.Event()
-
-        async def cancel_completion(session_key: str, task_id: str) -> int:
-            completion_calls.append((session_key, task_id))
-            return 0
 
         async def cancel_processes(session_key: str, task_id: str) -> int:
             process_calls.append((session_key, task_id))
@@ -6220,10 +6205,6 @@ class TestSessionsAbort:
                 owned_cleanup_complete.set()
             return 0
 
-        monkeypatch.setattr(
-            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_task",
-            cancel_completion,
-        )
         monkeypatch.setattr(
             "opensquilla.tools.builtin.shell.cancel_background_processes_for_task",
             cancel_processes,
@@ -6259,7 +6240,7 @@ class TestSessionsAbort:
             (child_key, "task-child"),
             (grandchild_key, "task-grandchild"),
         ]
-        assert completion_calls == process_calls == [
+        assert process_calls == [
             (root_key, "task-root"),
             (child_key, "task-child"),
             (grandchild_key, "task-grandchild"),
@@ -6490,9 +6471,6 @@ class TestSessionsAbort:
                     cancel_cancelled.set()
                 return 1
 
-        async def cancel_background(_session_key: str) -> int:
-            return 0
-
         async def session_tree_keys(_session_manager: Any, root_key: str) -> tuple[str, ...]:
             return (root_key,)
 
@@ -6500,10 +6478,6 @@ class TestSessionsAbort:
             return None
 
         monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.05)
-        monkeypatch.setattr(
-            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_session",
-            cancel_background,
-        )
         # Keep setup operations inside the shared budget regardless of runner
         # scheduling, then expire that same budget once Runtime.cancel starts.
         # asyncio's own monotonic clock remains real, so its timeout still
@@ -7435,7 +7409,7 @@ class TestSessionsDelete:
         original_delete = manager._storage.delete_session
 
         async def observed_delete(key: str) -> None:
-            assert active_fences == {"background", "runtime", "direct", "write"}
+            assert active_fences == {"runtime", "direct", "write"}
             order.append("delete")
             await original_delete(key)
 
@@ -7448,34 +7422,29 @@ class TestSessionsDelete:
         ) -> None:
             assert session_key == session.session_key
             assert session_id == session.session_id
-            assert active_fences == {"background", "runtime", "direct", "write"}
+            assert active_fences == {"runtime", "direct", "write"}
             order.append("evict")
 
         manager.evict_session_runtime_state = evict_runtime_state  # type: ignore[attr-defined]
 
         async def drain_router(keys: list[str]) -> None:
             assert keys == [session.session_key]
-            assert active_fences == {"background", "runtime", "direct", "write"}
+            assert active_fences == {"runtime", "direct", "write"}
             order.append("router-drain")
 
         async def drain_turn(keys: list[str]) -> None:
             assert keys == [session.session_key]
-            assert active_fences == {"background", "runtime", "direct", "write"}
+            assert active_fences == {"runtime", "direct", "write"}
             order.append("turn-drain")
 
         original_expire = _isolated_approval_queue.expire_pending_for_session
 
         def observed_expire(key: str) -> int:
             assert key == session.session_key
-            assert active_fences == {"background", "runtime", "direct", "write"}
+            assert active_fences == {"runtime", "direct", "write"}
             order.append("expire")
             return original_expire(key)
 
-        monkeypatch.setattr(
-            rpc_sessions,
-            "quiesce_background_completion_sessions",
-            lambda keys: fence("background", keys),
-        )
         monkeypatch.setattr(
             rpc_sessions,
             "get_agent_task_registry",
@@ -7513,7 +7482,6 @@ class TestSessionsDelete:
 
         assert res.ok is True
         assert order == [
-            "background:enter",
             "runtime:enter",
             "direct:enter",
             "write:enter",
@@ -7525,7 +7493,6 @@ class TestSessionsDelete:
             "write:exit",
             "direct:exit",
             "runtime:exit",
-            "background:exit",
         ]
 
     @pytest.mark.asyncio
@@ -7982,6 +7949,49 @@ class TestSessionsContextCompact:
         assert correlation.call_kind == "auxiliary.compaction"
 
     @pytest.mark.asyncio
+    async def test_context_compact_forwards_runtime_parent_request(
+        self,
+        dispatcher,
+        session,
+        monkeypatch,
+    ):
+        manager = FakeSessionManager([session])
+        parent_request = object()
+        target_calls: list[dict[str, Any]] = []
+        original_resolver = session_maintenance_adapter.resolve_gateway_compaction_target
+
+        def capture_target(*args: Any, **kwargs: Any):
+            target_calls.append(dict(kwargs))
+            return original_resolver(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.adapters.session_maintenance.resolve_gateway_compaction_target",
+            capture_target,
+        )
+        turn_runner = SimpleNamespace(
+            compaction_parent_request=lambda key: (
+                parent_request if key == session.session_key else None
+            )
+        )
+        ctx = make_ctx(session_manager=manager, turn_runner=turn_runner)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.contextCompact",
+            {"key": session.session_key, "contextWindowTokens": 1234},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert manager.compact_kwargs[0]["parent_request"] is parent_request
+        assert target_calls == [
+            {
+                "active_only": True,
+                "replay_provider_state": True,
+            }
+        ]
+
+    @pytest.mark.asyncio
     async def test_context_compact_client_window_cannot_expand_stable_consumer(
         self,
         dispatcher,
@@ -8033,6 +8043,52 @@ class TestSessionsContextCompact:
         assert compact_kwargs["context_window_chars"] > 0
         assert callable(compact_kwargs["consumer_admission"])
         assert len(compact_kwargs["consumer_admission_fingerprint"]) == 64
+
+    @pytest.mark.asyncio
+    async def test_context_compact_keeps_soft_window_out_of_consumer_admission(
+        self,
+        dispatcher,
+        session,
+    ):
+        manager = FakeSessionManager([session])
+        config = GatewayConfig(
+            llm={
+                "provider": "openrouter",
+                "model": "deepseek/deepseek-v4-pro-0813",
+                "api_key": "dummy-key",
+                "context_window_tokens": 0,
+                "max_tokens": 0,
+            },
+            context_budget_tokens=100_000,
+            memory={"flush_enabled": False},
+        )
+        current = ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro-0813",
+            api_key="dummy-key",
+        )
+        selector = SimpleNamespace(
+            current_config=current,
+            remaining_chain=lambda: [current],
+        )
+        ctx = make_ctx(
+            session_manager=manager,
+            provider_selector=selector,
+            config=config,
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.contextCompact",
+            {"key": session.session_key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert manager.compact_calls[0][:2] == (session.session_key, 100_000)
+        compact_kwargs = manager.compact_kwargs[0]
+        assert compact_kwargs["context_window_chars"] == 102_000
+        assert compact_kwargs["consumer_admission"]("x" * 64_000, []) is True
 
     @pytest.mark.asyncio
     async def test_context_compact_emits_started_and_completed_events(
@@ -9998,69 +10054,6 @@ class TestSessionsMessagesSubscribe:
         }
         assert manager._storage.list_agent_tasks_calls == [key]
 
-    @pytest.mark.asyncio
-    async def test_messages_subscribe_reports_background_run_mode_lock(
-        self, dispatcher, ctx_with_sessions, session, monkeypatch
-    ):
-        background_called = False
-
-        async def _active_group_ids(_key: str) -> list[str]:
-            nonlocal background_called
-            background_called = True
-            return ["group-live"]
-
-        async def _active_override(_key: str):
-            nonlocal background_called
-            background_called = True
-            return SimpleNamespace(run_mode=SimpleNamespace(value="trusted"))
-
-        monkeypatch.setattr(
-            "opensquilla.gateway.subagent_announce.active_background_completion_group_ids",
-            _active_group_ids,
-        )
-        monkeypatch.setattr(
-            "opensquilla.gateway.subagent_announce."
-            "active_background_completion_run_mode_override",
-            _active_override,
-        )
-
-        res = await dispatcher.dispatch(
-            "r1",
-            "sessions.messages.subscribe",
-            {"key": session.session_key},
-            ctx_with_sessions,
-        )
-
-        assert res.ok is True
-        assert res.payload["run_mode_lock"] == {
-            "locked": True,
-            "runMode": "safe",
-            "source": "background",
-        }
-        assert background_called is True
-
-    @pytest.mark.asyncio
-    async def test_messages_subscribe_reports_authoritative_active_task_groups(
-        self, dispatcher, ctx_with_sessions, session, monkeypatch
-    ):
-        async def _active_group_ids(key: str) -> list[str]:
-            assert key == session.session_key
-            return ["group-live"]
-
-        monkeypatch.setattr(
-            "opensquilla.gateway.subagent_announce.active_background_completion_group_ids",
-            _active_group_ids,
-        )
-
-        res = await dispatcher.dispatch(
-            "r1",
-            "sessions.messages.subscribe",
-            {"key": session.session_key},
-            ctx_with_sessions,
-        )
-
-        assert res.ok is True
-        assert res.payload["active_task_group_ids"] == ["group-live"]
 
     @pytest.mark.asyncio
     async def test_messages_subscribe_hydrates_pending_user_input(

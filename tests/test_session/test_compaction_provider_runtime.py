@@ -16,13 +16,20 @@ from opensquilla.provider.protocol import ProviderConnectionConfig, ProviderMeta
 from opensquilla.provider.selector import ProviderConfig, build_provider_from_config
 from opensquilla.provider.types import (
     ChatConfig,
+    ContentBlockText,
+    ContentBlockToolResult,
+    ContentBlockToolUse,
     DoneEvent,
     ErrorEvent,
+    Message,
     ProviderRequestCorrelation,
     ReasoningDeltaEvent,
     TextDeltaEvent,
+    ToolDefinition,
+    ToolInputSchema,
 )
 from opensquilla.session.compaction import (
+    CompactionParentRequest,
     CompactionRequest,
     arm_compaction_deadline,
     build_compaction_config_from_provider,
@@ -104,6 +111,17 @@ class _Provider:
 
     async def list_models(self) -> list[Any]:
         return []
+
+
+def test_compaction_target_defaults_visible_summary_budget_to_generation_budget() -> None:
+    target = CompactionExecutionTarget(
+        provider=_Provider(lambda: _Stream([])),
+        provider_id="openrouter",
+        model="provider/model",
+        max_output_tokens=32,
+    )
+
+    assert getattr(target, "visible_summary_token_budget", None) == 32
 
 
 @dataclass
@@ -277,6 +295,55 @@ def test_full_config_plan_has_candidate_shape_and_no_secret_repr(
     assert runtime_config.api_key == ""
 
 
+def test_compaction_plan_honors_configured_output_budget_above_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.session.compaction_deployment.build_provider_from_config",
+        lambda _config: _Provider(_successful_stream),
+    )
+
+    plan = build_compaction_llm_plan_from_provider_config(
+        ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro-0813",
+            api_key="super-secret",
+        ),
+        context_window_tokens=1_048_576,
+        max_output_tokens=4096,
+    )
+
+    assert plan.primary.max_output_tokens == 4096
+    assert plan.primary.visible_summary_token_budget == 4096
+
+
+def test_suffix_plan_can_preserve_provider_state_for_exact_parent_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[ProviderConfig] = []
+
+    def fake_factory(config: ProviderConfig) -> _Provider:
+        captured.append(config)
+        return _Provider(_successful_stream)
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction_deployment.build_provider_from_config",
+        fake_factory,
+    )
+
+    build_compaction_llm_plan_from_provider_config(
+        ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="super-secret",
+            replay_provider_state=False,
+        ),
+        replay_provider_state=True,
+    )
+
+    assert captured[0].replay_provider_state is True
+
+
 def test_builder_uses_provider_plan_only_when_bound_model_matches() -> None:
     provider = _Provider(_successful_stream)
 
@@ -352,6 +419,230 @@ async def test_provider_compaction_disables_tools_and_thinking_and_accounts_usag
     assert sink.starts[0].model == "provider/model"
     assert len(sink.finalized) == 1
     assert sink.unknown == []
+
+
+@pytest.mark.asyncio
+async def test_suffix_reuses_parent_request_prefix_and_appends_one_instruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(_successful_stream)
+    plan = CompactionExecutionPlan(
+        candidates=(
+            CompactionExecutionTarget(
+                provider=provider,
+                provider_id="openrouter",
+                model="provider/model",
+                max_output_tokens=768,
+                provider_request_max_chars=120_000,
+            ),
+        )
+    )
+    parent_messages = (
+        Message(role="user", content="Inspect the repository."),
+        Message(
+            role="assistant",
+            content=[
+                ContentBlockText(text="I will inspect it."),
+                ContentBlockToolUse(
+                    id="call-1",
+                    name="file_read",
+                    input={"path": "README.md"},
+                ),
+            ],
+        ),
+        Message(
+            role="user",
+            content=[
+                ContentBlockToolResult(
+                    tool_use_id="call-1",
+                    content="repository contents",
+                )
+            ],
+        ),
+    )
+    parent_tools = (
+        ToolDefinition(
+            name="file_read",
+            description="Read one file.",
+            input_schema=ToolInputSchema(
+                properties={"path": {"type": "string"}},
+                required=["path"],
+            ),
+        ),
+    )
+    parent_config = ChatConfig(
+        system="exact parent system",
+        cache_mode="on",
+        cache_breakpoints=[{"type": "ephemeral"}],
+        max_tokens=4096,
+        seed=42,
+        temperature=0.35,
+        top_p=0.9,
+        thinking=True,
+        thinking_budget_tokens=8192,
+        thinking_budget_explicit=True,
+        tool_choice="auto",
+        output_json_schema={"type": "object"},
+        output_json_schema_strict=False,
+        candidate_output_mode="normal",
+        physical_attempt_limit=2,
+        provider_request_correlation=ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="parent-turn",
+            execution_id="parent-execution",
+            call_kind="agent.chat",
+        ),
+    )
+    compaction_correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="compaction-turn",
+        execution_id="compaction-execution",
+        call_kind="auxiliary.compaction",
+    )
+    parent_messages_before = tuple(
+        message.model_copy(deep=True) for message in parent_messages
+    )
+    parent_tools_before = tuple(tool.model_copy(deep=True) for tool in parent_tools)
+    parent_config_before = parent_config.model_copy(deep=True)
+
+    result = await call_compaction_provider(
+        "flattened content must not be sent",
+        "Preserve exact IDs.",
+        plan,
+        custom_instructions="Keep only task-relevant state.",
+        parent_messages=parent_messages,
+        parent_tools=parent_tools,
+        parent_chat_config=parent_config,
+        provider_request_correlation=compaction_correlation,
+    )
+
+    assert result == "portable summary"
+    messages, tools, config = provider.calls[0]
+    assert tuple(messages[:-1]) == parent_messages
+    assert len(messages) == len(parent_messages) + 1
+    assert messages[-1].role == "user"
+    assert "You are a conversation compactor" in str(messages[-1].content)
+    assert "Preserve exact IDs." in str(messages[-1].content)
+    assert "Keep only task-relevant state." in str(messages[-1].content)
+    assert "flattened content must not be sent" not in str(messages[-1].content)
+    assert tuple(tools or ()) == parent_tools
+    assert config is not None
+    assert config.model_copy(update={"provider_request_correlation": None}) == (
+        parent_config.model_copy(update={"provider_request_correlation": None})
+    )
+    assert config.provider_request_correlation is compaction_correlation
+    assert config.physical_attempt_limit == parent_config.physical_attempt_limit
+    assert config.candidate_output_mode == parent_config.candidate_output_mode
+    assert parent_messages == parent_messages_before
+    assert parent_tools == parent_tools_before
+    assert parent_config == parent_config_before
+
+
+@pytest.mark.asyncio
+async def test_suffix_compact_context_reuses_complete_parent_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(_successful_stream)
+    config = build_compaction_config_from_provider(
+        provider,
+        context_window_tokens=8_000,
+    )
+    config.safety_margin = 1.0
+    entries = _entries(20)
+    transcript_messages = tuple(
+        Message(role=entry["role"], content=entry["content"])
+        for entry in entries
+    )
+    parent_messages = (
+        Message(role="user", content="runtime context outside the durable transcript"),
+        *transcript_messages,
+        Message(role="user", content="current provider-only request suffix"),
+    )
+    parent_config = ChatConfig(
+        system="exact active system",
+        cache_mode="on",
+        tool_choice="auto",
+    )
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="structured-parent-prefix",
+            entries=entries,
+            context_window_tokens=500,
+            config=config,
+            parent_request=CompactionParentRequest.from_call(
+                parent_messages,
+                (),
+                parent_config,
+            ),
+        )
+    )
+
+    assert result.summary_source == "llm"
+    assert result.removed_count > 0
+    messages, tools, sent_config = provider.calls[0]
+    assert tuple(messages[:-1]) == parent_messages
+    assert len(messages) == len(parent_messages) + 1
+    assert tools == []
+    assert sent_config is not None
+    assert sent_config.system == "exact active system"
+
+
+@pytest.mark.asyncio
+async def test_suffix_parent_failure_never_switches_compaction_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    primary = _Provider(
+        lambda: _Stream([ErrorEvent(message="primary unavailable", code="unavailable")])
+    )
+    forbidden_fallback = _Provider(_successful_stream)
+    config = build_compaction_config_from_provider(primary)
+    config.llm_plan = CompactionExecutionPlan(
+        candidates=(
+            CompactionExecutionTarget(
+                provider=primary,
+                provider_id="openrouter",
+                model="parent/model",
+                context_window_tokens=8_000,
+                source="active_deployment",
+            ),
+            CompactionExecutionTarget(
+                provider=forbidden_fallback,
+                provider_id="openrouter",
+                model="other/model",
+                context_window_tokens=8_000,
+                source="selector_fallback",
+            ),
+        ),
+        max_calls=2,
+    )
+    config.safety_margin = 1.0
+    entries = _entries(20)
+    parent_messages = tuple(
+        Message(role=entry["role"], content=entry["content"])
+        for entry in entries
+    )
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="no-compact-model-switch",
+            entries=entries,
+            context_window_tokens=500,
+            config=config,
+            parent_request=CompactionParentRequest.from_call(
+                parent_messages,
+                None,
+                ChatConfig(system="parent system"),
+            ),
+        )
+    )
+
+    assert result.summary_source == "fallback"
+    assert len(primary.calls) == 1
+    assert forbidden_fallback.calls == []
 
 
 @pytest.mark.asyncio
@@ -488,6 +779,71 @@ async def test_provider_output_within_local_token_cap_is_accepted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reasoning_does_not_consume_visible_summary_token_budget() -> None:
+    provider = _Provider(
+        lambda: _Stream(
+            [
+                ReasoningDeltaEvent(text="private reasoning " * 64),
+                TextDeltaEvent(text="portable summary"),
+                DoneEvent(
+                    output_tokens=10,
+                    reasoning_tokens=8,
+                    reasoning_content="private reasoning " * 64,
+                ),
+            ]
+        )
+    )
+    plan = CompactionExecutionPlan(
+        candidates=(
+            CompactionExecutionTarget(
+                provider=provider,
+                provider_id="openai_codex",
+                model="gpt-5-codex",
+                max_output_tokens=16,
+            ),
+        )
+    )
+
+    result = await call_compaction_provider("old", "", plan)
+
+    assert result == "portable summary"
+    assert provider.calls[0][2] is not None
+    assert provider.calls[0][2].max_tokens == 16
+    assert provider.streams[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_visible_summary_budget_is_independent_from_generation_budget() -> None:
+    provider = _Provider(
+        lambda: _Stream(
+            [
+                ReasoningDeltaEvent(text="private reasoning"),
+                TextDeltaEvent(text="portable summary"),
+                DoneEvent(output_tokens=3, reasoning_tokens=1),
+            ]
+        )
+    )
+    plan = CompactionExecutionPlan(
+        candidates=(
+            CompactionExecutionTarget(
+                provider=provider,
+                provider_id="openrouter",
+                model="provider/model",
+                max_output_tokens=32,
+                max_summary_tokens=1,
+            ),
+        )
+    )
+
+    result = await call_compaction_provider("old", "", plan)
+
+    assert result is None
+    assert provider.calls[0][2] is not None
+    assert provider.calls[0][2].max_tokens == 32
+    assert provider.streams[0].closed is True
+
+
+@pytest.mark.asyncio
 async def test_visible_output_exactly_at_cap_needs_no_reasoning_reserve() -> None:
     provider = _Provider(
         lambda: _Stream(
@@ -603,7 +959,7 @@ async def test_scoped_cancellation_is_not_blocked_by_hanging_usage_terminal() ->
 
 
 @pytest.mark.asyncio
-async def test_scoped_output_cap_cleanup_is_not_blocked_by_hanging_usage_terminal() -> None:
+async def test_scoped_output_cap_drains_terminal_usage_before_fallback() -> None:
     provider = _Provider(
         lambda: _Stream(
             [
@@ -622,31 +978,20 @@ async def test_scoped_output_cap_cleanup_is_not_blocked_by_hanging_usage_termina
             ),
         )
     )
-    sink = _CancellationResistantSink()
-    sink.before_unknown = lambda: provider.streams[0].closed
+    sink = _Sink()
 
     async def run() -> str | None:
         with bind_usage_accounting_scope(_usage_scope(sink)):
             return await call_compaction_provider("old", "", plan)
 
-    try:
-        result = await asyncio.wait_for(run(), timeout=1.0)
-        await asyncio.wait_for(sink.unknown_started.wait(), timeout=1.0)
-        await asyncio.wait_for(sink.unknown_cancelled.wait(), timeout=1.0)
-        assert result is None
-        assert provider.streams[0].closed is True
-        assert sink.raw_closed_when_unknown_started is True
-        assert len(sink.starts) == 1
-        assert sink.finalized == []
-        assert [(call.event_id, reason) for call, reason in sink.unknown] == [
-            (
-                sink.starts[0].event_id,
-                "provider_stream_ended_without_usage",
-            )
-        ]
-    finally:
-        sink.release_unknown.set()
-        await asyncio.wait_for(sink.unknown_finished.wait(), timeout=1.0)
+    result = await asyncio.wait_for(run(), timeout=1.0)
+
+    assert result is None
+    assert provider.streams[0].closed is True
+    assert len(sink.starts) == 1
+    assert len(sink.finalized) == 1
+    assert sink.finalized[0][0].event_id == sink.starts[0].event_id
+    assert sink.unknown == []
 
 
 @pytest.mark.asyncio

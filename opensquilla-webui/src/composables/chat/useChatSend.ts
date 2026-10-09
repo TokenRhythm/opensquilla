@@ -175,6 +175,8 @@ interface SendAttempt {
   intent: string | null
   initialCollaborationMode: CollaborationMode | null
   initialRoutingMode: GatewayModelRoutingMode | null
+  complexTaskMode: boolean
+  singleAgentMode: boolean
   forkBeforeMessageId: string | null
   workspaceId: string | null
   restoreComposerOnHandoffFailure?: boolean
@@ -209,6 +211,8 @@ interface ExplicitSendPayload {
   initialCollaborationMode?: CollaborationMode | null
   documentContext?: TurnDocumentContext | null
   initialRoutingMode?: GatewayModelRoutingMode | null
+  complexTaskMode?: boolean
+  singleAgentMode?: boolean
 }
 
 interface ComposerSnapshot {
@@ -223,6 +227,8 @@ interface ComposerSnapshot {
   workspaceId: string | null
   initialCollaborationMode: CollaborationMode | null
   initialRoutingMode: GatewayModelRoutingMode | null
+  complexTaskMode: boolean
+  singleAgentMode: boolean
   queueOwnerRequestId: string | null
 }
 
@@ -458,6 +464,8 @@ function matchesRecoveredDraft(
     intent: string | null
     initialCollaborationMode: CollaborationMode | null
     initialRoutingMode: GatewayModelRoutingMode | null
+    complexTaskMode: boolean
+    singleAgentMode: boolean
     forkBeforeMessageId: string | null
     workspaceId: string | null
   },
@@ -470,6 +478,8 @@ function matchesRecoveredDraft(
     attempt.intent === input.intent &&
     attempt.initialCollaborationMode === input.initialCollaborationMode &&
     attempt.initialRoutingMode === input.initialRoutingMode &&
+    attempt.complexTaskMode === input.complexTaskMode &&
+    attempt.singleAgentMode === input.singleAgentMode &&
     attempt.forkBeforeMessageId === input.forkBeforeMessageId &&
     attempt.workspaceId === input.workspaceId &&
     sameSendableAttachments(input.attachments, attempt)
@@ -506,6 +516,8 @@ export interface UseChatSendOptions {
   pendingSessionIntent: Ref<string | null>
   initialCollaborationMode: Readonly<Ref<CollaborationMode>>
   initialRoutingMode: Readonly<Ref<GatewayModelRoutingMode | null>>
+  complexTaskModeEnabled?: Readonly<Ref<boolean>>
+  singleAgentModeEnabled?: Readonly<Ref<boolean>>
   pendingForkBeforeMessageId: Ref<string | null>
   promptAnnotationIds?: Readonly<Ref<readonly string[]>>
   promptAnnotationSnapshots?: (ids: readonly string[]) => PromptAnnotationSnapshot[]
@@ -796,6 +808,8 @@ export function useChatSend(options: UseChatSendOptions) {
       workspaceId: pendingWorkspaceForIntent(intent),
       initialCollaborationMode: initialModeForIntent(intent),
       initialRoutingMode: initialRoutingModeForIntent(intent),
+      complexTaskMode: options.complexTaskModeEnabled?.value === true,
+      singleAgentMode: options.singleAgentModeEnabled?.value === true,
       queueOwnerRequestId: queueOwnerContext?.sessionKey === options.sessionKey.value
         ? queueOwnerContext.ownerRequestId
         : null,
@@ -826,6 +840,8 @@ export function useChatSend(options: UseChatSendOptions) {
       options.inputText.value === snapshot.inputText
       && JSON.stringify(currentPromptAnnotationIds()) === JSON.stringify(snapshot.promptAnnotationIds)
       && options.pendingSessionIntent.value === snapshot.intent
+      && (options.complexTaskModeEnabled?.value === true) === snapshot.complexTaskMode
+      && (options.singleAgentModeEnabled?.value === true) === snapshot.singleAgentMode
       && options.pendingForkBeforeMessageId.value === snapshot.forkBeforeMessageId
       && pendingWorkspaceForIntent(options.pendingSessionIntent.value) === snapshot.workspaceId
       && options.pendingAttachments.value.length === snapshot.attachmentRefs.length
@@ -844,6 +860,8 @@ export function useChatSend(options: UseChatSendOptions) {
       initialCollaborationMode: snapshot.initialCollaborationMode,
       documentContext: snapshot.documentContext,
       initialRoutingMode: snapshot.initialRoutingMode,
+      complexTaskMode: snapshot.complexTaskMode,
+      singleAgentMode: snapshot.singleAgentMode,
     }
   }
 
@@ -2347,6 +2365,8 @@ export function useChatSend(options: UseChatSendOptions) {
         intent: composerSnapshot.intent,
         initialCollaborationMode: composerSnapshot.initialCollaborationMode,
         initialRoutingMode: composerSnapshot.initialRoutingMode,
+        complexTaskMode: composerSnapshot.complexTaskMode,
+        singleAgentMode: composerSnapshot.singleAgentMode,
         forkBeforeMessageId: composerSnapshot.forkBeforeMessageId,
         workspaceId: composerSnapshot.workspaceId,
       })
@@ -2732,6 +2752,18 @@ export function useChatSend(options: UseChatSendOptions) {
     )
       ? sendOpts.payload.initialRoutingMode ?? null
       : initialRoutingModeForIntent(intent)
+    const complexTaskMode = (
+      sendOpts.payload
+      && 'complexTaskMode' in sendOpts.payload
+    )
+      ? sendOpts.payload.complexTaskMode === true
+      : options.complexTaskModeEnabled?.value === true
+    const singleAgentMode = (
+      sendOpts.payload
+      && 'singleAgentMode' in sendOpts.payload
+    )
+      ? sendOpts.payload.singleAgentMode === true
+      : options.singleAgentModeEnabled?.value === true
     const initialSendableAttachments = sourceAttachments.filter(isSendableAttachment)
     const requestedDocumentContext = intent === null
       ? sendOpts.payload
@@ -2766,6 +2798,8 @@ export function useChatSend(options: UseChatSendOptions) {
           intent,
           initialCollaborationMode,
           initialRoutingMode,
+          complexTaskMode,
+          singleAgentMode,
           forkBeforeMessageId,
           workspaceId,
         })
@@ -2956,6 +2990,8 @@ export function useChatSend(options: UseChatSendOptions) {
         params.collaborationMode = initialCollaborationMode
       }
       if (initialRoutingMode) params.initialRoutingMode = initialRoutingMode
+      params.complexTaskMode = complexTaskMode
+      params.singleAgentMode = singleAgentMode
       if (forkBeforeMessageId) params.forkBeforeMessageId = forkBeforeMessageId
       if (attachmentsToSend.length > 0 || sendOpts.includeEmptyAttachments) {
         params.displayText = userText
@@ -2975,6 +3011,8 @@ export function useChatSend(options: UseChatSendOptions) {
         intent,
         initialCollaborationMode,
         initialRoutingMode,
+        complexTaskMode,
+        singleAgentMode,
         forkBeforeMessageId,
         workspaceId,
         ...(sendOpts.acceptedVisibleReplay
@@ -3504,6 +3542,8 @@ export function useChatSend(options: UseChatSendOptions) {
         intent: null,
         initialCollaborationMode: null,
         initialRoutingMode: null,
+        complexTaskMode: options.complexTaskModeEnabled?.value === true,
+        singleAgentMode: options.singleAgentModeEnabled?.value === true,
         forkBeforeMessageId,
         workspaceId: null,
       },
@@ -3519,6 +3559,8 @@ export function useChatSend(options: UseChatSendOptions) {
           workspaceId: null,
           initialCollaborationMode: null,
           initialRoutingMode: null,
+          complexTaskMode: options.complexTaskModeEnabled?.value === true,
+          singleAgentMode: options.singleAgentModeEnabled?.value === true,
         },
         preserveComposer: true,
         retryAttempt: usageBarrierReplayAttempt,
@@ -3856,6 +3898,8 @@ export function useChatSend(options: UseChatSendOptions) {
     const hiddenInitialRoutingMode = initialRoutingModeForIntent(hiddenSessionIntent)
     if (hiddenSessionIntent) params.intent = hiddenSessionIntent
     if (hiddenInitialRoutingMode) params.initialRoutingMode = hiddenInitialRoutingMode
+    params.complexTaskMode = options.complexTaskModeEnabled?.value === true
+    params.singleAgentMode = options.singleAgentModeEnabled?.value === true
     if (displayText && displayText !== providerText) params.displayText = displayText
     params.source = chatSourceMetadata(options)
 
@@ -3876,6 +3920,8 @@ export function useChatSend(options: UseChatSendOptions) {
       intent: hiddenSessionIntent,
       initialCollaborationMode: null,
       initialRoutingMode: hiddenInitialRoutingMode,
+      complexTaskMode: options.complexTaskModeEnabled?.value === true,
+      singleAgentMode: options.singleAgentModeEnabled?.value === true,
       forkBeforeMessageId: null,
       workspaceId: null,
       params,

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from opensquilla.channels.types import IncomingMessage
 from opensquilla.gateway.boot import (
     _task_runtime_envelope_host_execute,
@@ -98,7 +100,89 @@ def test_internal_route_builders_preserve_exact_session_owner() -> None:
     )
 
 
-def test_unattended_cli_denies_runtime_dependent_tools_but_keeps_session_reads() -> None:
+def test_subagent_route_exposes_only_requested_tools() -> None:
+    envelope = build_subagent_route_envelope(
+        session_key="subagent:parent:child",
+        parent_session_key="agent:main:parent",
+        tools=["read_file", "grep_search"],
+    )
+
+    ctx = tool_context_from_envelope(envelope, is_owner=True)
+
+    assert ctx.allowed_tools == {"read_file", "grep_search"}
+    assert "memory_get" in ctx.denied_tools
+
+
+def test_orchestration_subagent_uses_already_resolved_final_tools() -> None:
+    envelope = build_subagent_route_envelope(
+        session_key="subagent:parent:orchestrated-child",
+        parent_session_key="agent:main:parent",
+        tools=["document_read", "publish_artifact", "read_file"],
+        tools_are_final=True,
+    )
+
+    ctx = tool_context_from_envelope(envelope, is_owner=True)
+
+    assert ctx.allowed_tools == {"document_read", "publish_artifact", "read_file"}
+    assert ctx.denied_tools == set()
+
+
+def test_subagent_route_carries_iteration_budget() -> None:
+    envelope = build_subagent_route_envelope(
+        session_key="subagent:parent:child",
+        parent_session_key="agent:main:parent",
+        effort_tier="large",
+        iteration_soft_limit=24,
+        iteration_hard_limit=36,
+    )
+
+    assert envelope.metadata["subagent_effort_tier"] == "large"
+    assert envelope.metadata["subagent_iteration_soft_limit"] == 24
+    assert envelope.metadata["subagent_iteration_hard_limit"] == 36
+
+    context = tool_context_from_envelope(envelope, is_owner=True)
+
+    assert context.subagent_effort_tier == "large"
+    assert context.subagent_iteration_soft_limit == 24
+    assert context.subagent_iteration_hard_limit == 36
+
+
+@pytest.mark.parametrize(
+    ("effort_tier", "search_limit", "fetch_limit", "text_limit"),
+    [
+        ("small", 4, 6, 60_000),
+        ("medium", 8, 8, 100_000),
+        ("large", 12, 12, 160_000),
+    ],
+)
+def test_subagent_effort_tier_bounds_retrieval_without_changing_parent_defaults(
+    effort_tier: str,
+    search_limit: int,
+    fetch_limit: int,
+    text_limit: int,
+) -> None:
+    child = tool_context_from_envelope(
+        build_subagent_route_envelope(
+            session_key=f"subagent:parent:{effort_tier}",
+            parent_session_key="agent:main:parent",
+            effort_tier=effort_tier,
+        )
+    )
+
+    assert child.tool_run_budget_policy is not None
+    assert child.tool_run_budget_policy.max_web_search_calls_per_turn == search_limit
+    assert child.tool_run_budget_policy.max_web_fetch_calls_per_turn == fetch_limit
+    assert child.tool_run_budget_policy.max_external_text_chars_per_turn == text_limit
+
+    parent = tool_context_from_envelope(
+        build_cli_route_envelope(
+            session_key="agent:main:parent",
+            agent_id="main",
+        )
+    )
+    assert parent.tool_run_budget_policy is None
+
+def test_unattended_cli_denies_runtime_dependent_delegation_tools() -> None:
     envelope = build_cli_route_envelope(
         session_key="agent:main:auto",
         interaction_mode=InteractionMode.UNATTENDED,
@@ -109,11 +193,9 @@ def test_unattended_cli_denies_runtime_dependent_tools_but_keeps_session_reads()
         capabilities=ToolSurfaceCapabilities(session_manager=True),
     )
 
-    assert "sessions_spawn" in ctx.denied_tools
+    assert "delegate_task" in ctx.denied_tools
+    assert "interrupt_agent" in ctx.denied_tools
     assert "gateway" in ctx.denied_tools
-    assert "sessions_list" not in ctx.denied_tools
-    assert "sessions_history" not in ctx.denied_tools
-    assert "session_status" not in ctx.denied_tools
 
 
 def test_default_elevated_mode_only_keeps_full_for_owner_tool_context() -> None:

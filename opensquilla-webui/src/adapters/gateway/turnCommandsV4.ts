@@ -344,6 +344,8 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     workspaceId,
     collaborationMode,
     initialRoutingMode,
+    complexTaskMode,
+    singleAgentMode,
     forkBeforeMessageId,
     displayText,
     attachments,
@@ -361,6 +363,8 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     workspace_id: legacyWorkspaceId,
     collaboration_mode: legacyCollaborationMode,
     initial_routing_mode: legacyInitialRoutingMode,
+    complex_task_mode: _legacyComplexTaskMode,
+    single_agent_mode: _legacySingleAgentMode,
     fork_before_message_id: legacyForkBeforeMessageId,
     display_text: legacyDisplayText,
     ...extensions
@@ -417,6 +421,8 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
       : legacyInitialRoutingMode !== undefined
         ? { initial_routing_mode: legacyInitialRoutingMode }
         : {}),
+    ...(complexTaskMode !== undefined ? { complexTaskMode } : {}),
+    ...(singleAgentMode !== undefined ? { singleAgentMode } : {}),
     ...(forkBeforeMessageId !== undefined
       ? { forkBeforeMessageId }
       : legacyForkBeforeMessageId !== undefined

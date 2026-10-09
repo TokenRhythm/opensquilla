@@ -179,6 +179,10 @@ class GatewayTurnAdmissionAdapter:
             "document_context",
             "initialRoutingMode",
             "initial_routing_mode",
+            "complexTaskMode",
+            "complex_task_mode",
+            "singleAgentMode",
+            "single_agent_mode",
         ):
             if name in params:
                 target = {

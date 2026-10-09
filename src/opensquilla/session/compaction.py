@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
@@ -31,6 +32,7 @@ from opensquilla.provider.types import (
     Message,
     ReasoningDeltaEvent,
     TextDeltaEvent,
+    ToolDefinition,
     derive_provider_request_correlation,
 )
 from opensquilla.redaction import redact_error_text
@@ -68,6 +70,7 @@ class CompactionConfig:
     default_parts: int = 2
     identifier_policy: str = "strict"  # strict | custom | off
     model: str | None = None  # None = use session model
+    seed: int | None = None
     api_key: str = field(default="", repr=False)
     base_url: str = "https://openrouter.ai/api/v1"
     timeout_seconds: float = 90.0
@@ -119,6 +122,32 @@ class CompactionConfig:
     protect_semantic_tail: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class CompactionParentRequest:
+    """Exact prompt prefix owned by the active physical parent request."""
+
+    messages: tuple[Message, ...]
+    tools: tuple[ToolDefinition, ...] | None
+    chat_config: ChatConfig = field(repr=False, compare=False)
+
+    @classmethod
+    def from_call(
+        cls,
+        messages: Sequence[Message],
+        tools: Sequence[ToolDefinition] | None,
+        chat_config: ChatConfig,
+    ) -> CompactionParentRequest:
+        return cls(
+            messages=tuple(message.model_copy(deep=True) for message in messages),
+            tools=(
+                tuple(tool.model_copy(deep=True) for tool in tools)
+                if tools is not None
+                else None
+            ),
+            chat_config=chat_config.model_copy(deep=True),
+        )
+
+
 @dataclass
 class CompactionRequest:
     session_id: str
@@ -158,6 +187,16 @@ class CompactionRequest:
     # Additive runtime provenance. Kept at the end so legacy positional
     # construction retains the original public field ordering.
     context_window_source: str = "consumer_capacity"
+    # Benchmark/manual callers may bypass only the admission threshold while
+    # retaining native cut selection and safety protections.
+    force_admission: bool = False
+    # Runtime-only exact request prefix. Suffix compaction may reuse it, but
+    # must never serialize it into durable session state or logs.
+    parent_request: CompactionParentRequest | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass
@@ -252,6 +291,7 @@ def build_compaction_config_from_provider(
 
     cfg = CompactionConfig(timeout_seconds=timeout)
     for attr in (
+        "seed",
         "compaction_profile",
         "protected_recent_messages",
         "total_timeout_seconds",
@@ -593,14 +633,10 @@ def _apply_protected_tail(
 ) -> int:
     protected_recent = effective_protected_recent_messages(cfg)
     protected_start = (
-        max(0, len(entries) - protected_recent)
-        if protected_recent > 0
-        else len(entries)
+        max(0, len(entries) - protected_recent) if protected_recent > 0 else len(entries)
     )
     semantic_start = (
-        _semantic_protected_tail_start(entries)
-        if cfg.protect_semantic_tail
-        else len(entries)
+        _semantic_protected_tail_start(entries) if cfg.protect_semantic_tail else len(entries)
     )
     return min(cut, protected_start, semantic_start)
 
@@ -623,17 +659,15 @@ def _nested_tool_result_segments(entry: dict[str, Any]) -> list[dict[str, Any]]:
         segment
         for segment in tool_calls
         if isinstance(segment, dict)
-        and (
-            str(segment.get("type") or "").strip().lower() == "tool_result"
-            or "result" in segment
-        )
+        and (str(segment.get("type") or "").strip().lower() == "tool_result" or "result" in segment)
     ]
 
 
 def _execution_status_is_live(value: Any) -> bool:
     status, reason, preservation_class = _execution_status_parts(value)
     return bool(
-        status in {
+        status
+        in {
             "pending",
             "running",
             "in_progress",
@@ -643,7 +677,8 @@ def _execution_status_is_live(value: Any) -> bool:
             "requires_action",
             "awaiting_approval",
         }
-        or reason in {
+        or reason
+        in {
             "background_running",
             "pending",
             "queued",
@@ -671,9 +706,7 @@ def _api_round_requires_raw(entries: list[dict[str, Any]]) -> bool:
                 if not isinstance(segment, dict):
                     continue
                 segment_type = str(segment.get("type") or "").strip().lower()
-                segment_id = str(
-                    segment.get("tool_use_id") or segment.get("id") or ""
-                ).strip()
+                segment_id = str(segment.get("tool_use_id") or segment.get("id") or "").strip()
                 is_result = segment_type == "tool_result" or "result" in segment
                 is_call = bool(
                     segment_type in {"tool_use", "function"}
@@ -704,9 +737,7 @@ def _api_round_requires_raw(entries: list[dict[str, Any]]) -> bool:
             unstructured_call_open = True
 
         if _is_tool_result_entry(entry) and not nested_results:
-            if _execution_status_is_live(
-                entry.get("execution_status") or entry.get("status")
-            ):
+            if _execution_status_is_live(entry.get("execution_status") or entry.get("status")):
                 return True
             result_id = str(entry.get("tool_call_id") or "").strip()
             if result_id:
@@ -717,16 +748,9 @@ def _api_round_requires_raw(entries: list[dict[str, Any]]) -> bool:
 
     last = entries[-1] if entries else None
     unanswered_user = bool(
-        last is not None
-        and last.get("role") == "user"
-        and not _is_tool_result_entry(last)
+        last is not None and last.get("role") == "user" and not _is_tool_result_entry(last)
     )
-    return bool(
-        unanswered_user
-        or pending_ids
-        or unidentified_calls > 0
-        or unstructured_call_open
-    )
+    return bool(unanswered_user or pending_ids or unidentified_calls > 0 or unstructured_call_open)
 
 
 def _semantic_protected_tail_start(
@@ -754,17 +778,14 @@ def _retreat_to_turn_boundary(entries: list[dict[str, Any]], cut: int) -> int:
             result_start = cut
             while result_start > 0 and _is_tool_result_entry(entries[result_start - 1]):
                 result_start -= 1
-            if result_start > 0 and _is_assistant_tool_call_entry(
-                entries[result_start - 1]
-            ):
+            if result_start > 0 and _is_assistant_tool_call_entry(entries[result_start - 1]):
                 cut = result_start - 1
                 continue
             if result_start != cut:
                 cut = result_start
                 continue
         if not (
-            _is_assistant_tool_call_entry(entries[cut - 1])
-            and _is_tool_result_entry(first_kept)
+            _is_assistant_tool_call_entry(entries[cut - 1]) and _is_tool_result_entry(first_kept)
         ):
             return cut
         cut -= 1
@@ -812,22 +833,15 @@ def _compaction_quality_report(
     if protected_recent > 0:
         protected_tail = entries[-protected_recent:]
         protected_tail_preserved = (
-            len(kept) >= len(protected_tail)
-            and kept[-len(protected_tail) :] == protected_tail
+            len(kept) >= len(protected_tail) and kept[-len(protected_tail) :] == protected_tail
         )
-    compression_ratio = (
-        float(tokens_after) / float(tokens_before)
-        if tokens_before > 0
-        else 1.0
-    )
+    compression_ratio = float(tokens_after) / float(tokens_before) if tokens_before > 0 else 1.0
     # The caller passes the consumer history capacity after its own reserves.
     # Safety margin controls when compaction starts; applying it again to the
     # candidate double-counts headroom and rejects otherwise admissible output.
     fits_context_window = bool(tokens_after <= context_window_tokens)
     fits_character_window = bool(
-        context_window_chars is None
-        or chars_after is None
-        or chars_after <= context_window_chars
+        context_window_chars is None or chars_after is None or chars_after <= context_window_chars
     )
     reduces_tokens = tokens_after < tokens_before
     # Message-count recovery removes wire-message cardinality rather than
@@ -839,10 +853,7 @@ def _compaction_quality_report(
         and protected_tail_preserved
         and fits_context_window
         and fits_character_window
-        and (
-            reduces_tokens
-            or trigger == "message_count"
-        )
+        and (reduces_tokens or trigger == "message_count")
     )
     return {
         "profile": str(getattr(cfg, "compaction_profile", "conversation") or "conversation"),
@@ -864,6 +875,7 @@ def _api_round_groups(
 
     groups: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
+
     def flush() -> None:
         nonlocal current
         if current:
@@ -911,11 +923,7 @@ def _retreat_to_api_round_boundary(
 ) -> int:
     """Move a cut earlier to the nearest complete API-round boundary."""
 
-    eligible = [
-        boundary
-        for boundary in _api_round_boundaries(entries)
-        if boundary <= cut
-    ]
+    eligible = [boundary for boundary in _api_round_boundaries(entries) if boundary <= cut]
     if not eligible:
         return 0
     return _retreat_to_turn_boundary(entries, max(eligible))
@@ -963,9 +971,7 @@ def _compaction_target_input_budget(
     plan = request.config.llm_plan
     target = target or (plan.primary if plan is not None else None)
     context_window = int(
-        getattr(target, "context_window_tokens", 0)
-        or request.context_window_tokens
-        or 0
+        getattr(target, "context_window_tokens", 0) or request.context_window_tokens or 0
     )
     output_reserve = int(getattr(target, "max_output_tokens", 0) or 1024)
     framing_reserve = max(128, context_window // 20)
@@ -1007,20 +1013,12 @@ def _fit_compaction_input_to_target(
             previous_summary,
             chunk_projection,
         )
-        while (
-            chunk_projection
-            and _estimate_tokens(deterministic) > budget
-        ):
+        while chunk_projection and _estimate_tokens(deterministic) > budget:
             current_tokens = max(1, _estimate_tokens(chunk_projection))
             excess = max(1, _estimate_tokens(deterministic) - budget)
             target_chars = max(
                 0,
-                int(
-                    len(chunk_projection)
-                    * max(0, current_tokens - excess)
-                    / current_tokens
-                    * 0.8
-                ),
+                int(len(chunk_projection) * max(0, current_tokens - excess) / current_tokens * 0.8),
             )
             if target_chars >= len(chunk_projection):
                 target_chars = len(chunk_projection) - 1
@@ -1032,10 +1030,7 @@ def _fit_compaction_input_to_target(
         return deterministic if _estimate_tokens(deterministic) <= budget else None
 
     deterministic = _merge_rolling_fallback("", chunk_projection)
-    projected = (
-        "[Deterministic token-aware preprojection]\n"
-        f"{deterministic}"
-    )
+    projected = f"[Deterministic token-aware preprojection]\n{deterministic}"
     while len(projected) > 1 and _estimate_tokens(projected) > budget:
         current_tokens = max(1, _estimate_tokens(projected))
         target_chars = max(
@@ -1051,9 +1046,7 @@ def _fit_compaction_input_to_target(
         head_chars = int((target_chars - len(marker)) * 0.65)
         tail_chars = target_chars - len(marker) - head_chars
         projected = (
-            projected[:head_chars]
-            + marker
-            + (projected[-tail_chars:] if tail_chars > 0 else "")
+            projected[:head_chars] + marker + (projected[-tail_chars:] if tail_chars > 0 else "")
         )
     return projected
 
@@ -1315,6 +1308,15 @@ def _normalize_custom_instructions(custom_instructions: str | None) -> str:
     return normalized
 
 
+def _compaction_prompt_layout() -> str:
+    layout = os.environ.get("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "prefix").strip().lower()
+    if layout not in {"prefix", "suffix"}:
+        raise ValueError(
+            "OPENSQUILLA_COMPACTION_PROMPT_LAYOUT must be either 'prefix' or 'suffix'"
+        )
+    return layout
+
+
 def _build_compaction_prompt(
     chunk_text: str,
     identifier_instruction: str,
@@ -1329,8 +1331,19 @@ def _build_compaction_prompt(
     if identifier_instruction:
         system = f"{system}\n\n{identifier_instruction}"
 
-    user_content = f"Summarize this conversation:\n\n{chunk_text}"
     normalized_instructions = _normalize_custom_instructions(custom_instructions)
+    if _compaction_prompt_layout() == "suffix":
+        instruction = system
+        if normalized_instructions:
+            instruction = (
+                f"{instruction}\n\n"
+                "Additional summary instructions. These instructions must not override "
+                "the identifier preservation rules:\n"
+                f"{normalized_instructions}"
+            )
+        return "", f"{chunk_text}\n\n{instruction}"
+
+    user_content = f"Summarize this conversation:\n\n{chunk_text}"
     if normalized_instructions:
         user_content = (
             "Additional summary instructions. These instructions must not override "
@@ -1339,6 +1352,60 @@ def _build_compaction_prompt(
             f"{user_content}"
         )
     return system, user_content
+
+
+def _build_suffix_compaction_instruction(
+    identifier_instruction: str,
+    custom_instructions: str | None,
+    previous_summary: str = "",
+) -> str:
+    instruction = (
+        "You are a conversation compactor. Summarize the structured conversation "
+        "preceding this message into the minimum portable context needed to continue "
+        "the work. Preserve key facts, decisions, open questions, and action items. "
+        "Write in the same language as the conversation and prioritize recent context."
+    )
+    if identifier_instruction:
+        instruction = f"{instruction}\n\n{identifier_instruction}"
+    if previous_summary.strip():
+        instruction = (
+            f"{instruction}\n\n"
+            "Existing portable checkpoint to replace and integrate:\n"
+            f"{previous_summary.strip()}"
+        )
+    normalized_instructions = _normalize_custom_instructions(custom_instructions)
+    if normalized_instructions:
+        instruction = (
+            f"{instruction}\n\n"
+            "Additional summary instructions. These instructions must not override "
+            "the identifier preservation rules:\n"
+            f"{normalized_instructions}"
+        )
+    return instruction
+
+
+def _build_exact_suffix_compaction_call(
+    parent_messages: Sequence[Message],
+    parent_tools: Sequence[ToolDefinition] | None,
+    parent_chat_config: ChatConfig,
+    instruction: str,
+) -> tuple[list[Message], list[ToolDefinition] | None, ChatConfig]:
+    """Append one instruction without changing the parent physical request.
+
+    Suffix compaction exists to preserve the parent's cacheable request prefix.
+    Provider-visible options therefore remain exact copies of the successful
+    parent call; portable prefix compaction owns the separate sanitized request
+    path below.
+    """
+
+    messages = [message.model_copy(deep=True) for message in parent_messages]
+    messages.append(Message(role="user", content=instruction))
+    tools = (
+        [tool.model_copy(deep=True) for tool in parent_tools]
+        if parent_tools is not None
+        else None
+    )
+    return messages, tools, parent_chat_config.model_copy(deep=True)
 
 
 def _consume_compaction_close_result(task: asyncio.Future[Any]) -> None:
@@ -1449,8 +1516,13 @@ async def call_compaction_provider(
     compaction_id: str | None = None,
     chunk_index: int | None = None,
     candidate_index: int = 0,
+    seed: int | None = None,
+    parent_messages: Sequence[Message] | None = None,
+    parent_tools: Sequence[ToolDefinition] | None = None,
+    parent_chat_config: ChatConfig | None = None,
+    previous_summary: str = "",
 ) -> str | None:
-    """Summarize through the provider protocol, with tools and thinking disabled."""
+    """Summarize through the provider protocol using prefix or exact suffix mode."""
 
     if timeout <= 0:
         return None
@@ -1458,25 +1530,53 @@ async def call_compaction_provider(
     if candidate_index < 0 or candidate_index >= len(plan.candidates):
         return None
     deployment = plan.candidates[candidate_index]
-    system, user_content = _build_compaction_prompt(
-        chunk_text,
-        identifier_instruction,
-        custom_instructions,
+    exact_suffix = bool(
+        _compaction_prompt_layout() == "suffix"
+        and parent_messages is not None
+        and parent_chat_config is not None
     )
-    messages = [Message(role="user", content=user_content)]
-    chat_config = ChatConfig(
-        max_tokens=deployment.max_output_tokens,
-        temperature=0,
-        system=system,
-        thinking=False,
-        thinking_budget_explicit=False,
-        timeout=timeout,
-        provider_request_max_chars=deployment.provider_request_max_chars,
-        tool_choice=None,
-        candidate_output_mode="inert_artifact",
-        physical_attempt_limit=1,
-        provider_request_correlation=provider_request_correlation,
-    )
+    if exact_suffix:
+        assert parent_messages is not None
+        assert parent_chat_config is not None
+        messages, tools, chat_config = _build_exact_suffix_compaction_call(
+            parent_messages,
+            parent_tools,
+            parent_chat_config,
+            _build_suffix_compaction_instruction(
+                identifier_instruction,
+                custom_instructions,
+                previous_summary,
+            ),
+        )
+        if provider_request_correlation is not None:
+            # Correlation is runtime-only and excluded from the provider payload.
+            # Rebind it to this physical operation while preserving every
+            # provider-visible field copied from the parent request.
+            chat_config = chat_config.model_copy(
+                update={"provider_request_correlation": provider_request_correlation}
+            )
+    else:
+        system, user_content = _build_compaction_prompt(
+            chunk_text,
+            identifier_instruction,
+            custom_instructions,
+        )
+        messages = [Message(role="user", content=user_content)]
+        tools = None
+        chat_config = ChatConfig(
+            max_tokens=deployment.max_output_tokens,
+            seed=seed,
+            temperature=0,
+            system=system,
+            thinking=False,
+            thinking_budget_explicit=False,
+            timeout=timeout,
+            provider_request_max_chars=deployment.provider_request_max_chars,
+            tool_choice=None,
+            candidate_output_mode="inert_artifact",
+            physical_attempt_limit=1,
+            provider_request_correlation=provider_request_correlation,
+        )
 
     # Keep this import local: engine types import session lifecycle helpers
     # while the session package initializes this module.
@@ -1494,22 +1594,24 @@ async def call_compaction_provider(
         provider=deployment.provider_id,
         model=deployment.model,
         deployment_source=deployment.source,
+        prompt_layout=_compaction_prompt_layout(),
         timeout_seconds=timeout,
     )
     try:
         if provider_accounts_physical_usage(deployment.provider):
             provider_stream = deployment.provider.chat(
                 messages,
-                tools=None,
+                tools=tools,
                 config=chat_config,
             )
             accounted_stream = provider_stream
         else:
+
             def _start_provider_stream() -> Any:
                 nonlocal provider_stream
                 provider_stream = deployment.provider.chat(
                     messages,
-                    tools=None,
+                    tools=tools,
                     config=chat_config,
                 )
                 return provider_stream
@@ -1521,24 +1623,26 @@ async def call_compaction_provider(
             )
 
         chunks: list[str] = []
-        reasoning_chunks: list[str] = []
         saw_done = False
         reported_output_tokens = 0
-        terminal_reasoning_content = ""
+        reported_reasoning_tokens = 0
+        output_budget_exceeded = False
 
-        def _enforce_output_budget() -> None:
+        def _output_exceeds_budget() -> bool:
             visible_text = "".join(chunks)
             visible_tokens = _estimate_tokens(visible_text) if visible_text else 0
-            streamed_reasoning = "".join(reasoning_chunks)
-            reasoning_text = streamed_reasoning or terminal_reasoning_content
-            reasoning_tokens = _estimate_tokens(reasoning_text) if reasoning_text else 0
-            estimated_output_tokens = visible_tokens + reasoning_tokens
-            if max(reported_output_tokens, estimated_output_tokens) > (
-                deployment.max_output_tokens
-            ):
-                raise _CompactionProviderError(
-                    "provider output exceeded compaction token budget"
-                )
+            reported_visible_tokens = max(
+                0,
+                reported_output_tokens - reported_reasoning_tokens,
+            )
+            visible_budget_exceeded = max(
+                reported_visible_tokens,
+                visible_tokens,
+            ) > deployment.visible_summary_token_budget
+            generation_budget_exceeded = (
+                reported_output_tokens > deployment.max_output_tokens
+            )
+            return visible_budget_exceeded or generation_budget_exceeded
 
         async with asyncio.timeout(timeout):
             async for event in accounted_stream:
@@ -1549,17 +1653,19 @@ async def call_compaction_provider(
                     raise _CompactionProviderError(message)
                 if isinstance(event, TextDeltaEvent) or getattr(event, "kind", "") == "text_delta":
                     text = str(getattr(event, "text", "") or "")
-                    if text:
+                    if text and not output_budget_exceeded:
                         chunks.append(text)
-                        _enforce_output_budget()
+                        output_budget_exceeded = _output_exceeds_budget()
+                        if output_budget_exceeded:
+                            chunks.clear()
                 elif (
                     isinstance(event, ReasoningDeltaEvent)
                     or getattr(event, "kind", "") == "reasoning_delta"
                 ):
-                    reasoning_text = str(getattr(event, "text", "") or "")
-                    if reasoning_text:
-                        reasoning_chunks.append(reasoning_text)
-                        _enforce_output_budget()
+                    # Reasoning is billed and accounted by the provider stream,
+                    # but it is not retained in the compacted summary and must
+                    # not consume the visible-summary budget.
+                    continue
                 elif isinstance(event, DoneEvent) or getattr(event, "kind", "") == "done":
                     # Usage accounting finalizes on the same terminal event.
                     saw_done = True
@@ -1567,16 +1673,20 @@ async def call_compaction_provider(
                         0,
                         int(getattr(event, "output_tokens", 0) or 0),
                     )
-                    terminal_reasoning_content = str(
-                        getattr(event, "reasoning_content", "") or ""
+                    reported_reasoning_tokens = max(
+                        0,
+                        int(getattr(event, "reasoning_tokens", 0) or 0),
                     )
-                    _enforce_output_budget()
+                    if not output_budget_exceeded:
+                        output_budget_exceeded = _output_exceeds_budget()
                     continue
 
         if not saw_done:
             raise _CompactionProviderError(
                 "provider stream ended before a terminal completion event"
             )
+        if output_budget_exceeded:
+            raise _CompactionProviderError("provider output exceeded compaction token budget")
         result = "".join(chunks).strip()
         if not result:
             raise _CompactionProviderError("provider returned an empty summary")
@@ -1622,6 +1732,7 @@ async def call_compaction_llm(
     provider_request_correlation: ProviderRequestCorrelation | None = None,
     compaction_id: str | None = None,
     chunk_index: int | None = None,
+    seed: int | None = None,
 ) -> str | None:
     """Legacy raw OpenAI-compatible summary helper.
 
@@ -1643,16 +1754,18 @@ async def call_compaction_llm(
         custom_instructions,
     )
 
+    wire_messages = [{"role": "user", "content": user_content}]
+    if system:
+        wire_messages.insert(0, {"role": "system", "content": system})
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_content},
-        ],
+        "messages": wire_messages,
         "max_tokens": 1024,
         "temperature": 0,
         "stream": False,
     }
+    if seed is not None:
+        payload["seed"] = seed
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -1671,8 +1784,7 @@ async def call_compaction_llm(
     from opensquilla.engine.usage_http import reserve_direct_usage_call
 
     usage = await reserve_direct_usage_call(
-        provider=provider
-        or ("openrouter" if "openrouter.ai" in url.lower() else "openai_compat"),
+        provider=provider or ("openrouter" if "openrouter.ai" in url.lower() else "openai_compat"),
         model=model,
         base_url=url,
     )
@@ -1682,6 +1794,7 @@ async def call_compaction_llm(
         compaction_id=compaction_id,
         chunk_index=chunk_index,
         model=model,
+        prompt_layout=_compaction_prompt_layout(),
         timeout_seconds=timeout,
     )
     cancelled = False
@@ -1779,17 +1892,12 @@ def _fit_structured_summary_current_status(
     """Bound duplicative prose while preserving structured obligation fields."""
 
     budget = max(1, int(max_tokens or 0))
-    char_budget = (
-        max(1, int(max_chars))
-        if max_chars is not None
-        else None
-    )
+    char_budget = max(1, int(max_chars)) if max_chars is not None else None
 
     def fits() -> bool:
         rendered = render_structured_summary(summary)
-        return (
-            _estimate_tokens(rendered) <= budget
-            and (char_budget is None or len(rendered) <= char_budget)
+        return _estimate_tokens(rendered) <= budget and (
+            char_budget is None or len(rendered) <= char_budget
         )
 
     if fits():
@@ -1871,10 +1979,7 @@ def _find_turn_boundary_cut(
         group_tokens = sum(_entry_tokens(entry) for entry in group)
         group_chars = estimate_entries_model_replay_chars(group)
         fits_tokens = kept_tokens + group_tokens <= keep_budget
-        fits_chars = bool(
-            keep_char_budget is None
-            or kept_chars + group_chars <= keep_char_budget
-        )
+        fits_chars = bool(keep_char_budget is None or kept_chars + group_chars <= keep_char_budget)
         if not fits_tokens or not fits_chars:
             break
         kept_tokens += group_tokens
@@ -1919,17 +2024,12 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         if prev_summary and request.summary_replay_renderer is not None
         else prev_summary
     )
-    previous_summary_tokens = (
-        _estimate_tokens(previous_replay)
-        if previous_replay
-        else 0
-    )
+    previous_summary_tokens = _estimate_tokens(previous_replay) if previous_replay else 0
     total_tokens = raw_entry_tokens + previous_summary_tokens
     total_chars = estimate_entries_model_replay_chars(entries) + len(previous_replay)
     over_token_budget = total_tokens * cfg.safety_margin > window
     over_character_budget = bool(
-        request.context_window_chars is not None
-        and total_chars > request.context_window_chars
+        request.context_window_chars is not None and total_chars > request.context_window_chars
     )
 
     if not entries and not prev_summary:
@@ -1968,6 +2068,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     # still run even when the transcript already fits the token window.
     if (
         forced_cut is None
+        and not request.force_admission
         and not over_token_budget
         and not over_character_budget
     ):
@@ -1997,10 +2098,28 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         kept = entries[cut:]
         to_compact = entries[:cut]
     else:
-        keep_budget = window // 2
+        selection_window = window
+        if request.force_admission and not over_token_budget and not over_character_budget:
+            # Native token-driven compaction normally retains half of the
+            # consumer window. For a forced below-threshold operation, treat
+            # the current raw transcript size as the effective admission
+            # window, then reuse the same native boundary and safety logic.
+            selection_window = min(window, max(1, raw_entry_tokens))
+        keep_budget = max(1, selection_window // 2)
+        selection_char_window = request.context_window_chars
+        if (
+            selection_char_window is not None
+            and request.force_admission
+            and not over_token_budget
+            and not over_character_budget
+        ):
+            selection_char_window = min(
+                int(selection_char_window),
+                max(1, estimate_entries_model_replay_chars(entries)),
+            )
         keep_char_budget = (
-            max(1, int(request.context_window_chars) // 2)
-            if request.context_window_chars is not None
+            max(1, int(selection_char_window) // 2)
+            if selection_char_window is not None
             else None
         )
         # compaction: use turn-boundary-aware cut instead of raw token split.
@@ -2086,6 +2205,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     processed_chunk_count = len(chunks) + prepruned_chunk_count
 
     candidate_index = 0
+    parent_entry_indices = {id(entry): index for index, entry in enumerate(entries)}
     for chunk_index, chunk in enumerate(chunks, start=1):
         llm_result: str | None = None
         chunk_text = _rolling_chunk_text(rolling_summary, chunk)
@@ -2113,6 +2233,30 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                     break
                 cfg.last_attempted_target = deployment
                 llm_kwargs: dict[str, Any] = {}
+                if _compaction_prompt_layout() == "suffix" and request.parent_request is not None:
+                    positions = [
+                        parent_entry_indices.get(id(entry), -1)
+                        for entry in chunk
+                    ]
+                    expected_positions = list(range(len(chunk)))
+                    parent_messages = request.parent_request.messages
+                    if positions != expected_positions:
+                        log.warning(
+                            "compaction.parent_prefix_unavailable",
+                            compaction_id=cfg.operation_id,
+                            chunk_index=chunk_index,
+                            entry_count=len(entries),
+                            parent_message_count=len(parent_messages),
+                        )
+                        break
+                    llm_kwargs.update(
+                        {
+                            "parent_messages": parent_messages,
+                            "parent_tools": request.parent_request.tools,
+                            "parent_chat_config": request.parent_request.chat_config,
+                            "previous_summary": rolling_summary,
+                        }
+                    )
                 if request.provider_request_correlation is not None:
                     llm_kwargs["provider_request_correlation"] = (
                         derive_provider_request_correlation(
@@ -2139,13 +2283,20 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                     compaction_id=cfg.operation_id,
                     chunk_index=chunk_index,
                     candidate_index=candidate_index,
+                    seed=cfg.seed,
                     **llm_kwargs,
                 )
                 require_compaction_time(cfg, phase="summarizing")
                 if llm_result:
                     cfg.successful_target = deployment
                     break
-                candidate_index += 1
+                if _compaction_prompt_layout() == "suffix":
+                    # A suffix call is bound to the physical parent deployment.
+                    # Provider failure falls back deterministically, never to
+                    # a different model in an older compatibility plan.
+                    candidate_index = len(cfg.llm_plan.candidates)
+                else:
+                    candidate_index += 1
         elif legacy_raw and _reserve_compaction_llm_call(cfg):
             legacy_llm_kwargs: dict[str, Any] = {}
             if request.provider_request_correlation is not None:
@@ -2173,6 +2324,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                 provider=cfg.provider,
                 compaction_id=cfg.operation_id,
                 chunk_index=chunk_index,
+                seed=cfg.seed,
                 **legacy_llm_kwargs,
             )
             require_compaction_time(cfg, phase="summarizing")
@@ -2224,20 +2376,14 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     # Reserve the complete probe, including its tiny body, so token-boundary
     # interactions cannot make the wrapper estimate optimistic.
     wrapper_tokens = _estimate_tokens(probed_wrapper) if probed_wrapper else 0
-    wrapper_chars = (
-        max(0, len(probed_wrapper) - len(wrapper_probe))
-        if probed_wrapper
-        else 0
-    )
+    wrapper_chars = max(0, len(probed_wrapper) - len(wrapper_probe)) if probed_wrapper else 0
     _fit_structured_summary_current_status(
         structured_summary,
         max_tokens=max(1, window - kept_tokens - wrapper_tokens),
         max_chars=(
             max(
                 1,
-                int(request.context_window_chars)
-                - kept_chars
-                - wrapper_chars,
+                int(request.context_window_chars) - kept_chars - wrapper_chars,
             )
             if request.context_window_chars is not None
             else None
@@ -2412,13 +2558,9 @@ async def compact_context(request: CompactionRequest) -> CompactionResult:
             "pressure_kind": request.trigger,
             "physical_call_count": int(cfg.llm_calls_started),
             "latency_ms": (
-                max(0, int((time.monotonic() - started_at) * 1000))
-                if started_at is not None
-                else 0
+                max(0, int((time.monotonic() - started_at) * 1000)) if started_at is not None else 0
             ),
-            "consumer_window_source": str(
-                request.context_window_source or "consumer_capacity"
-            ),
+            "consumer_window_source": str(request.context_window_source or "consumer_capacity"),
             "consumer_window_tokens": max(
                 0,
                 int(request.context_window_tokens or 0),

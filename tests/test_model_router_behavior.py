@@ -223,6 +223,38 @@ async def test_full_rollout_applies_routed_model_thinking_and_p0_prompt(
 
 
 @pytest.mark.asyncio
+async def test_subagent_routes_only_during_spawn_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy = fake_strategy(
+        monkeypatch,
+        "c2",
+        0.91,
+        {
+            "route_class": "R2",
+            "thinking_mode": "T2",
+            "prompt_policy": "P1",
+        },
+    )
+    session_key = "agent:worker:subagent:abc123"
+
+    child_turn = make_context("Analyze the failure.", session_key=session_key)
+    original_model = child_turn.model
+    skipped = await apply_squilla_router(child_turn)
+
+    assert skipped.model == original_model
+    assert strategy.calls == 0
+
+    spawn_selection = make_context("Analyze the failure.", session_key=session_key)
+    spawn_selection.metadata["subagent_spawn_routing"] = True
+    routed = await apply_squilla_router(spawn_selection)
+
+    assert strategy.calls == 1
+    assert routed.metadata["routed_tier"] == "c2"
+    assert routed.model == "z-ai/glm-5.2"
+
+
+@pytest.mark.asyncio
 async def test_router_records_lower_text_tier_fallback_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

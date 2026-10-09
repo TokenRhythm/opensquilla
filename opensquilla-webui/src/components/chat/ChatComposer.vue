@@ -239,6 +239,38 @@
               <span>{{ t('chat.codingMode.activeLabel') }}</span>
               <Icon name="x" :size="12" aria-hidden="true" />
             </button>
+            <button
+              type="button"
+              class="btn btn--icon btn--ghost chat-complex-task-mode-btn"
+              :class="{ 'is-active': complexTaskModeEnabled }"
+              :title="t(complexTaskModeEnabled
+                ? 'chat.complexTaskMode.disableLabel'
+                : 'chat.complexTaskMode.enableLabel')"
+              :aria-label="t(complexTaskModeEnabled
+                ? 'chat.complexTaskMode.disableLabel'
+                : 'chat.complexTaskMode.enableLabel')"
+              :aria-pressed="complexTaskModeEnabled ? 'true' : 'false'"
+              data-testid="complex-task-mode-toggle"
+              @click="emit('setComplexTaskModeEnabled', !complexTaskModeEnabled)"
+            >
+              <Icon name="agents" :size="17" />
+            </button>
+            <button
+              type="button"
+              class="btn btn--icon btn--ghost chat-complex-task-mode-btn"
+              :class="{ 'is-active': singleAgentModeEnabled }"
+              :title="t(singleAgentModeEnabled
+                ? 'chat.singleAgentMode.disableLabel'
+                : 'chat.singleAgentMode.enableLabel')"
+              :aria-label="t(singleAgentModeEnabled
+                ? 'chat.singleAgentMode.disableLabel'
+                : 'chat.singleAgentMode.enableLabel')"
+              :aria-pressed="singleAgentModeEnabled ? 'true' : 'false'"
+              data-testid="single-agent-mode-toggle"
+              @click="emit('setSingleAgentModeEnabled', !singleAgentModeEnabled)"
+            >
+              <Icon name="agents" :size="17" />
+            </button>
             <div
               v-if="sessionRoutingAvailable"
               ref="modelRoutingAnchorEl"
@@ -498,6 +530,8 @@ const props = withDefaults(defineProps<{
   sessionRoutingAvailable?: boolean
   codingModeEnabled?: boolean
   codingModeSettingsBusy?: boolean
+  complexTaskModeEnabled?: boolean
+  singleAgentModeEnabled?: boolean
   addMenuAvoidElement?: HTMLElement | null
   goalDraftArmed?: boolean
   goalModeAvailable?: boolean
@@ -530,6 +564,8 @@ const props = withDefaults(defineProps<{
   canChooseProject: true,
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
+  complexTaskModeEnabled: false,
+  singleAgentModeEnabled: false,
   sessionRoutingAvailable: true,
   sessionRoutingControlBlocked: false,
   goalDraftArmed: false,
@@ -552,6 +588,8 @@ const emit = defineEmits<{
   setRunMode: [mode: SandboxRunMode]
   setSessionRoutingMode: [mode: ModelRoutingMode]
   setCodingModeEnabled: [enabled: boolean]
+  setComplexTaskModeEnabled: [enabled: boolean]
+  setSingleAgentModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
   armGoal: []
   disarmGoal: []
@@ -1001,6 +1039,21 @@ defineExpose<ChatComposerExpose>({
 .chat-coding-mode-chip:disabled {
   cursor: default;
   opacity: var(--state-disabled-opacity);
+}
+.chat-complex-task-mode-btn {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-muted);
+}
+.chat-complex-task-mode-btn.btn--ghost:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--accent) 18%, transparent);
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-surface));
+  color: var(--accent);
+}
+.chat-complex-task-mode-btn.btn--ghost.is-active {
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-surface));
+  color: var(--accent);
 }
 .chat-project-choose {
   flex-shrink: 0;

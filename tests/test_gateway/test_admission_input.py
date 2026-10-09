@@ -76,6 +76,68 @@ def test_explicit_fingerprint_payload_keeps_original_shape():
     assert original == {"message": "A" * LARGE_PASTE_CHARS, "attachments": []}
 
 
+@pytest.mark.parametrize("alias", ["complexTaskMode", "complex_task_mode"])
+def test_complex_task_mode_is_a_strict_per_turn_boolean(alias):
+    enabled = decode_admit_turn(
+        {"key": "agent:main:synthetic", "message": "hello", alias: True}
+    )
+    disabled = decode_admit_turn(
+        {"key": "agent:main:synthetic", "message": "hello", alias: False}
+    )
+
+    assert enabled.complex_task_mode is True
+    assert disabled.complex_task_mode is False
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        decode_admit_turn(
+            {"key": "agent:main:synthetic", "message": "hello", alias: "true"}
+        )
+
+
+def test_complex_task_mode_changes_turn_request_identity():
+    ordinary = {"key": "agent:main:synthetic", "message": "hello"}
+    complex_request = {**ordinary, "complexTaskMode": True}
+
+    assert request_fingerprint(ordinary) != request_fingerprint(complex_request)
+
+
+@pytest.mark.parametrize("alias", ["singleAgentMode", "single_agent_mode"])
+def test_single_agent_mode_is_a_strict_per_turn_boolean(alias):
+    enabled = decode_admit_turn(
+        {"key": "agent:main:synthetic", "message": "hello", alias: True}
+    )
+    disabled = decode_admit_turn(
+        {"key": "agent:main:synthetic", "message": "hello", alias: False}
+    )
+
+    assert enabled.single_agent_mode is True
+    assert disabled.single_agent_mode is False
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        decode_admit_turn(
+            {"key": "agent:main:synthetic", "message": "hello", alias: "true"}
+        )
+
+
+def test_single_agent_and_complex_modes_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        decode_admit_turn(
+            {
+                "key": "agent:main:synthetic",
+                "message": "hello",
+                "singleAgentMode": True,
+                "complexTaskMode": True,
+            }
+        )
+
+
+def test_single_agent_mode_changes_turn_request_identity():
+    ordinary = {"key": "agent:main:synthetic", "message": "hello"}
+    single_request = {**ordinary, "singleAgentMode": True}
+
+    assert request_fingerprint(ordinary) != request_fingerprint(single_request)
+
+
 @pytest.mark.parametrize("document", [False, True])
 def test_identity_retains_annotation_and_document_alias_normalization(document):
     params = {"key": "agent:main:synthetic", "message": "edit"}

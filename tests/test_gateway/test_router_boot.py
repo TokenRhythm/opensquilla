@@ -25,6 +25,8 @@ from opensquilla.gateway.boot import (
     _register_dream_crons,
     _sandbox_settings_for_runtime,
     _task_runtime_envelope_owner,
+    _task_runtime_max_concurrency,
+    _task_runtime_parent_max_concurrency,
     _task_runtime_turn_hard_deadline_s,
     _warn_workspace_state_mismatch,
     build_flush_service,
@@ -51,6 +53,7 @@ from opensquilla.gateway.routing import (
     build_channel_route_envelope,
     build_cli_route_envelope,
     build_cron_route_envelope,
+    build_subagent_route_envelope,
     tool_context_from_envelope,
 )
 from opensquilla.onboarding.mutations import upsert_channel
@@ -220,6 +223,14 @@ def test_task_runtime_hard_deadline_honors_explicit_config() -> None:
     config.task_runtime.turn_hard_deadline_s = 12.5
 
     assert _task_runtime_turn_hard_deadline_s(config) == 12.5
+
+
+def test_task_runtime_preserves_single_slot_hard_cap() -> None:
+    config = GatewayConfig()
+    config.task_runtime.max_concurrency = 1
+
+    assert _task_runtime_max_concurrency(config) == 1
+    assert _task_runtime_parent_max_concurrency(config) == 1
 
 
 def test_gateway_server_close_releases_pid_lock_when_shutdown_step_fails() -> None:
@@ -861,6 +872,57 @@ async def test_task_runtime_turn_uses_authenticated_channel_admin_boundary(
     assert tool_context.is_owner is expected_owner
     assert tool_context.channel_admin_verified is expected_owner
     assert tool_context.run_mode == "safe"
+
+
+@pytest.mark.asyncio
+async def test_subagent_runtime_uses_minimal_bootstrap_context() -> None:
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
+        return None
+
+    config = GatewayConfig(
+        agent_stream_heartbeat_interval_seconds=0.0,
+        agent_stream_idle_timeout_seconds=1.0,
+    )
+    envelope = build_subagent_route_envelope(
+        session_key="agent:main:subagent:child",
+        parent_session_key="agent:main:parent",
+        agent_id="main",
+        tools=["read_file"],
+    )
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id="child-task",
+        session_key=envelope.session_key,
+        message="Goal: inspect one file\nOutput format: findings",
+        envelope=envelope,
+        attachments=[],
+        input_provenance={},
+        run_kind="subagent",
+        no_memory_capture=True,
+        ingress_pipeline_steps=[],
+        semantic_message=None,
+        stream_event_sink=None,
+    )
+    runner = RecordingTurnRunner()
+
+    await dispatch_task_runtime_turn(
+        run,
+        config=config,
+        session_manager=None,
+        turn_runner=runner,
+        event_emitter=emit,
+    )
+
+    assert runner.calls[0]["bootstrap_context_mode"] == "stateless_keep_project_rules"
+    assert runner.calls[0]["tool_context"].allowed_tools == {"read_file"}
 
 
 @pytest.mark.parametrize(
@@ -3215,7 +3277,7 @@ async def test_task_runtime_turn_applies_cron_job_tool_policy() -> None:
     )
 
     tool_context = runner.calls[0]["tool_context"]
-    assert tool_context.allowed_tools == {"session_status"}
+    assert tool_context.allowed_tools == set()
     assert "exec_command" in tool_context.denied_tools
     assert "web_fetch" in tool_context.denied_tools
 

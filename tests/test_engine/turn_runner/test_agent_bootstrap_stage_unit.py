@@ -242,10 +242,12 @@ def _make_turn(
     *,
     metadata: dict[str, Any] | None = None,
     tool_defs: list[Any] | None = None,
+    config: Any = None,
 ):
     return SimpleNamespace(
         metadata=dict(metadata or {}),
         tool_defs=list(tool_defs or []),
+        config=config,
     )
 
 
@@ -272,6 +274,7 @@ def _make_input(
     max_provider_retries=None,
     length_capped_continuations=None,
     active_provider_id="",
+    run_kind="agent",
 ):
     return AgentBootstrapStageInput(
         provider=provider if provider is not None else object(),
@@ -295,6 +298,7 @@ def _make_input(
         max_provider_retries=max_provider_retries,
         length_capped_continuations=length_capped_continuations,
         active_provider_id=active_provider_id,
+        run_kind=run_kind,
     )
 
 
@@ -355,16 +359,138 @@ async def test_exclusive_tool_context_marks_agent_as_restricted_turn() -> None:
     stage = _make_stage()
 
     restricted = await stage.run(
-        _make_input(
-            tool_context=ToolContext(
-                exclusive_tools={"document_inspect"}
-            )
-        )
+        _make_input(tool_context=ToolContext(exclusive_tools={"document_inspect"}))
     )
     ordinary = await stage.run(_make_input(tool_context=ToolContext()))
 
     assert restricted.output.agent_config.restricted_turn is True
     assert ordinary.output.agent_config.restricted_turn is False
+
+
+@pytest.mark.asyncio
+async def test_subagent_bootstrap_applies_child_fallback_and_iteration_cap() -> None:
+    stage = _make_stage(
+        budgets=_RecordingTimeoutBudget(
+            _ResolvedBudgets(
+                runtime_timeout=60.0,
+                max_iterations=0,
+                max_iterations_source="gateway config",
+                iteration_timeout=30.0,
+                tool_timeout=20.0,
+                request_timeout=120.0,
+                max_provider_retries=3,
+            )
+        )
+    )
+    config = SimpleNamespace(
+        subagents=SimpleNamespace(
+            failure_fallback_threshold=4,
+            max_iterations=18,
+        )
+    )
+
+    out = await stage.run(_make_input(turn=_make_turn(config=config), run_kind="subagent"))
+
+    assert out.output.effective_max_iterations == 18
+    assert out.output.effective_max_iterations_source == "subagent config"
+    assert out.output.agent_config.subagent_failure_fallback_threshold == 4
+
+
+@pytest.mark.asyncio
+async def test_orchestration_child_does_not_enable_semantic_progress_watchdog(monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_PROGRESS_WATCHDOG_MODE", "block")
+    stage = _make_stage()
+
+    child = await stage.run(
+        _make_input(
+            tool_context=ToolContext(
+                orchestration_activation_id="activation-1",
+            ),
+            run_kind="subagent",
+        )
+    )
+    ordinary = await stage.run(_make_input(run_kind="agent"))
+
+    assert child.output.agent_config.progress_watchdog_mode == "off"
+    assert ordinary.output.agent_config.progress_watchdog_mode == "off"
+
+
+@pytest.mark.asyncio
+async def test_orchestration_child_does_not_apply_generic_subagent_iteration_caps() -> None:
+    stage = _make_stage(
+        budgets=_RecordingTimeoutBudget(
+            replace(
+                _default_budgets(),
+                max_iterations=0,
+                max_iterations_source="gateway config",
+            )
+        )
+    )
+    turn = _make_turn(
+        metadata={
+            "subagent_effort_tier": "small",
+            "subagent_iteration_soft_limit": 6,
+            "subagent_iteration_hard_limit": 10,
+        },
+        config=SimpleNamespace(
+            subagents=SimpleNamespace(
+                failure_fallback_threshold=3,
+                max_iterations=16,
+            )
+        ),
+    )
+
+    out = await stage.run(
+        _make_input(
+            turn=turn,
+            run_kind="subagent",
+            tool_context=ToolContext(orchestration_activation_id="activation-1"),
+        )
+    )
+
+    assert out.output.effective_max_iterations == 0
+    assert out.output.effective_max_iterations_source == "gateway config"
+    assert out.output.agent_config.subagent_soft_iteration_limit == 0
+    assert out.output.agent_config.subagent_failure_fallback_threshold == 0
+    assert "subagent_iteration_budget" not in out.output.agent_config.metadata
+
+
+@pytest.mark.asyncio
+async def test_subagent_bootstrap_prefers_router_iteration_budget_metadata() -> None:
+    stage = _make_stage(
+        budgets=_RecordingTimeoutBudget(
+            replace(
+                _default_budgets(),
+                max_iterations=0,
+                max_iterations_source="gateway config",
+            )
+        )
+    )
+    turn = _make_turn(
+        metadata={
+            "subagent_effort_tier": "large",
+            "subagent_iteration_soft_limit": 24,
+            "subagent_iteration_hard_limit": 36,
+        },
+        config=SimpleNamespace(
+            subagents=SimpleNamespace(
+                failure_fallback_threshold=3,
+                max_iterations=16,
+            )
+        ),
+    )
+
+    out = await stage.run(_make_input(turn=turn, run_kind="subagent"))
+
+    assert out.output.effective_max_iterations == 36
+    assert out.output.effective_max_iterations_source == "subagent router budget"
+    assert out.output.agent_config.subagent_effort_tier == "large"
+    assert out.output.agent_config.subagent_soft_iteration_limit == 24
+    assert out.output.agent_config.metadata["subagent_iteration_budget"] == {
+        "effort_tier": "large",
+        "soft_limit": 24,
+        "hard_limit": 36,
+    }
 
 
 @pytest.mark.asyncio
@@ -389,19 +515,7 @@ async def test_post_write_convergence_env_threads_to_agent_config(monkeypatch) -
 
     assert enabled_out.output.agent_config.post_write_convergence_enabled is True
     assert enabled_out.output.agent_config.post_write_convergence_warn_threshold == 4
-    assert (
-        enabled_out.output.agent_config.post_write_convergence_finalize_after_warning
-        == 2
-    )
-
-
-@pytest.mark.asyncio
-async def test_tool_repeat_nudge_threshold_env_zero_disables_recovery(monkeypatch) -> None:
-    stage = _make_stage()
-    monkeypatch.setenv("OPENSQUILLA_TOOL_REPEAT_NUDGE_THRESHOLD", "0")
-    out = await stage.run(_make_input())
-
-    assert out.output.agent_config.repeated_tool_call_recovery_threshold == 0
+    assert enabled_out.output.agent_config.post_write_convergence_finalize_after_warning == 2
 
 
 @pytest.mark.asyncio
@@ -470,9 +584,7 @@ async def test_reasoning_cap_and_mid_budget_nudge_env_thread_to_agent_config(
 @pytest.mark.asyncio
 async def test_source_diff_preservation_config_threads_to_agent_config(monkeypatch) -> None:
     monkeypatch.delenv("OPENSQUILLA_SOURCE_DIFF_PRESERVATION_MODE", raising=False)
-    builder = _RecordingAgentConfigBuilder(
-        aux=_default_aux(source_diff_preservation_mode="block")
-    )
+    builder = _RecordingAgentConfigBuilder(aux=_default_aux(source_diff_preservation_mode="block"))
     stage = _make_stage(aux=builder)
     out = await stage.run(_make_input())
 
@@ -482,9 +594,7 @@ async def test_source_diff_preservation_config_threads_to_agent_config(monkeypat
 @pytest.mark.asyncio
 async def test_source_diff_preservation_env_overrides_config(monkeypatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_SOURCE_DIFF_PRESERVATION_MODE", "off")
-    builder = _RecordingAgentConfigBuilder(
-        aux=_default_aux(source_diff_preservation_mode="block")
-    )
+    builder = _RecordingAgentConfigBuilder(aux=_default_aux(source_diff_preservation_mode="block"))
     stage = _make_stage(aux=builder)
     out = await stage.run(_make_input())
 
@@ -621,9 +731,10 @@ async def test_bootstrap_installs_known_fallback_limits_on_provider_wrapper() ->
         ("provider-b", "fallback/model"): (32_000, 8_192),
         ("provider-b", "unknown/model"): (200_000, 0),
     }
-    assert turn.metadata["route_plan"]["fallback_chain"][0]["capabilities"][
-        "effective_max_tokens"
-    ] == 8_192
+    assert (
+        turn.metadata["route_plan"]["fallback_chain"][0]["capabilities"]["effective_max_tokens"]
+        == 8_192
+    )
 
 
 @pytest.mark.asyncio
@@ -777,9 +888,7 @@ async def test_unverified_ensemble_aggregator_overrides_inherited_tool_denial() 
     )
 
     assert out.output.model_capabilities == ModelCapabilities(supports_tools=True)
-    assert out.output.agent_config.model_capabilities == ModelCapabilities(
-        supports_tools=True
-    )
+    assert out.output.agent_config.model_capabilities == ModelCapabilities(supports_tools=True)
     assert out.output.agent_config.model_tools_capability_verified is False
 
 
@@ -803,9 +912,7 @@ async def test_case03_per_call_iteration_timeout_threaded() -> None:
 
 @pytest.mark.asyncio
 async def test_case04_session_max_iterations_threaded() -> None:
-    budgets = _RecordingTimeoutBudget(
-        budgets=replace(_default_budgets(), max_iterations=5)
-    )
+    budgets = _RecordingTimeoutBudget(budgets=replace(_default_budgets(), max_iterations=5))
     stage = _make_stage(budgets=budgets)
     inp = _make_input(max_iterations=5)
     out = await stage.run(inp)
@@ -817,9 +924,7 @@ async def test_case04_session_max_iterations_threaded() -> None:
 async def test_case05_no_model_catalog_fallback() -> None:
     """Catalog fallback when adapter returns 8192/200_000/None."""
     catalog = _RecordingModelCatalog(
-        catalog=_ResolvedCatalog(
-            max_tokens=8192, context_window=200_000, capabilities=None
-        )
+        catalog=_ResolvedCatalog(max_tokens=8192, context_window=200_000, capabilities=None)
     )
     stage = _make_stage(catalog=catalog)
     inp = _make_input()
@@ -838,6 +943,7 @@ async def test_catalog_sampling_controls_thread_to_agent_config() -> None:
             max_tokens=8192,
             context_window=200_000,
             capabilities=None,
+            seed=42,
             temperature=1.0,
             top_p=0.95,
         )
@@ -846,6 +952,7 @@ async def test_catalog_sampling_controls_thread_to_agent_config() -> None:
 
     out = await stage.run(_make_input())
 
+    assert out.output.agent_config.seed == 42
     assert out.output.agent_config.temperature == 1.0
     assert out.output.agent_config.top_p == 0.95
 
@@ -872,9 +979,7 @@ async def test_global_context_window_override_threads_to_agent_config() -> None:
 async def test_case06_model_with_capabilities_and_projection_limit() -> None:
     caps = SimpleNamespace(supports_reasoning=True)
     catalog = _RecordingModelCatalog(
-        catalog=_ResolvedCatalog(
-            max_tokens=8192, context_window=200_000, capabilities=caps
-        )
+        catalog=_ResolvedCatalog(max_tokens=8192, context_window=200_000, capabilities=caps)
     )
     aux_builder = _RecordingAgentConfigBuilder(
         aux=replace(
@@ -923,9 +1028,7 @@ async def test_fresh_diagnostic_env_overrides_agent_token_config(monkeypatch) ->
 async def test_text_only_tool_recovery_env_overrides_config(monkeypatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_TEXT_ONLY_TOOL_RECOVERY_MODE", "warn_model")
     stage = _make_stage(
-        aux=_RecordingAgentConfigBuilder(
-            aux=_default_aux(text_only_tool_recovery_mode="off")
-        )
+        aux=_RecordingAgentConfigBuilder(aux=_default_aux(text_only_tool_recovery_mode="off"))
     )
 
     out = await stage.run(_make_input())
@@ -937,9 +1040,7 @@ async def test_text_only_tool_recovery_env_overrides_config(monkeypatch) -> None
 async def test_finalize_evidence_gate_config_value_propagates(monkeypatch) -> None:
     monkeypatch.delenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", raising=False)
     stage = _make_stage(
-        aux=_RecordingAgentConfigBuilder(
-            aux=replace(_default_aux(), finalize_evidence_gate=True)
-        )
+        aux=_RecordingAgentConfigBuilder(aux=replace(_default_aux(), finalize_evidence_gate=True))
     )
 
     out = await stage.run(_make_input())
@@ -951,9 +1052,7 @@ async def test_finalize_evidence_gate_config_value_propagates(monkeypatch) -> No
 async def test_finalize_evidence_gate_env_off_overrides_config(monkeypatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", "off")
     stage = _make_stage(
-        aux=_RecordingAgentConfigBuilder(
-            aux=replace(_default_aux(), finalize_evidence_gate=True)
-        )
+        aux=_RecordingAgentConfigBuilder(aux=replace(_default_aux(), finalize_evidence_gate=True))
     )
 
     out = await stage.run(_make_input())
@@ -981,9 +1080,7 @@ async def test_case06b_dispatch_tool_result_budget_propagates() -> None:
 async def test_case08_sync_manager_warm() -> None:
     sync_manager = SimpleNamespace(label="memsync")
     snap = _RecordingMemorySnapshot(
-        result=_MemorySnapshotResult(
-            sync_manager=sync_manager, private_memory_allowed=True
-        )
+        result=_MemorySnapshotResult(sync_manager=sync_manager, private_memory_allowed=True)
     )
     factory = _RecordingAgentFactory()
     stage = _make_stage(snapshot=snap, factory=factory)
@@ -998,9 +1095,7 @@ async def test_case08_sync_manager_warm() -> None:
 @pytest.mark.asyncio
 async def test_case09_private_memory_disabled() -> None:
     snap = _RecordingMemorySnapshot(
-        result=_MemorySnapshotResult(
-            sync_manager=None, private_memory_allowed=False
-        )
+        result=_MemorySnapshotResult(sync_manager=None, private_memory_allowed=False)
     )
     stage = _make_stage(snapshot=snap)
     inp = _make_input()
@@ -1012,9 +1107,7 @@ async def test_case09_private_memory_disabled() -> None:
 async def test_case10_snapshot_already_exists() -> None:
     """Stage returns whatever the port reports — port handles existence check."""
     snap = _RecordingMemorySnapshot(
-        result=_MemorySnapshotResult(
-            sync_manager=None, private_memory_allowed=True
-        )
+        result=_MemorySnapshotResult(sync_manager=None, private_memory_allowed=True)
     )
     stage = _make_stage(snapshot=snap)
     inp = _make_input()
@@ -1039,10 +1132,7 @@ async def test_case11_max_iterations_zero_threads_as_unlimited() -> None:
     assert out.output.effective_max_iterations_source == "explicit argument"
     assert out.output.agent_config.max_iterations == 0
     assert out.output.agent_config.metadata["agent_max_iterations"] == 0
-    assert (
-        out.output.agent_config.metadata["agent_max_iterations_source"]
-        == "explicit argument"
-    )
+    assert out.output.agent_config.metadata["agent_max_iterations_source"] == "explicit argument"
 
 
 @pytest.mark.asyncio

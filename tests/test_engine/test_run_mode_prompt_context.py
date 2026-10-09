@@ -45,3 +45,15 @@ def test_legacy_trusted_prompt_uses_safe_mode_guidance() -> None:
         "starts sandboxed"
     )
     assert install_guidance in execution_context
+
+
+def test_subagent_context_does_not_duplicate_grounding_protocol() -> None:
+    ctx = ToolContext(
+        caller_kind=CallerKind.SUBAGENT,
+        run_mode="safe",
+        workspace_dir="/workspace/.opensquilla/workspace",
+    )
+
+    extra = TurnRunner._extra_context_for_tool_context(ctx)
+
+    assert "Subagent Task Protocol" not in extra
