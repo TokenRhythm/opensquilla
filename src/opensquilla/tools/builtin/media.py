@@ -1311,10 +1311,12 @@ def _video_job_receipt(job_id: str) -> _VideoJobReceipt | None:
         return _video_job_sessions.get(job_id)
 
 
-def _remember_video_completion(job_id: str, result: Any, payload: str) -> None:
+def _remember_video_completion(job_id: str, result: Any, payload: str | None = None) -> None:
     """Retain a local result so status checks do not download or deliver it twice."""
 
-    completed_payload = payload if json.loads(payload).get("status") == "ok" else None
+    completed_payload = (
+        payload if payload is not None and json.loads(payload).get("status") == "ok" else None
+    )
     with _video_job_sessions_lock:
         receipt = _video_job_sessions.get(job_id)
         if receipt is not None:
@@ -1323,6 +1325,40 @@ def _remember_video_completion(job_id: str, result: Any, payload: str) -> None:
                 completed_result=result,
                 completed_payload=completed_payload,
             )
+
+
+async def _complete_video_delivery(
+    job_id: str, result: Any, *, max_bytes: int, source: str
+) -> str:
+    """Retain the download and settle publication before releasing its job lock."""
+
+    _remember_video_completion(job_id, result)
+
+    async def publish_and_remember() -> str:
+        payload = await _video_result_payload(result, max_bytes=max_bytes, source=source)
+        if job_id != result.job_id:
+            response = json.loads(payload)
+            response["job_id"] = job_id
+            payload = json.dumps(response)
+        _remember_video_completion(job_id, result, payload)
+        return payload
+
+    # The worker can continue after its caller is cancelled. Keep this task
+    # and the caller's receipt lock until publication and its cache settle.
+    completion_task = asyncio.create_task(publish_and_remember())
+    cancelled: asyncio.CancelledError | None = None
+    while not completion_task.done():
+        try:
+            await asyncio.shield(completion_task)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+        except Exception:
+            break
+    try:
+        return completion_task.result()
+    finally:
+        if cancelled is not None:
+            raise cancelled
 
 
 def video_status_available(ctx: ToolContext | None = None) -> bool:
@@ -1555,15 +1591,9 @@ async def video_generate(
         except Exception as exc:
             raise ToolError("Video generation failed unexpectedly") from exc
         handle = remember_job(result.job_id)
-        payload = await _video_result_payload(
-            result, max_bytes=int(config.max_output_bytes), source="video_generate"
+        return await _complete_video_delivery(
+            handle, result, max_bytes=int(config.max_output_bytes), source="video_generate"
         )
-        if handle != result.job_id:
-            response = json.loads(payload)
-            response["job_id"] = handle
-            payload = json.dumps(response)
-        _remember_video_completion(handle, result, payload)
-        return payload
 
 
 @tool(
@@ -1659,15 +1689,10 @@ async def video_status(job_id: str, filename: str | None = None) -> str:
         if receipt is not None and receipt.completed_result is not None:
             saved_result = receipt.completed_result
             if Path(saved_result.output_path).is_file():
-                payload = await _video_result_payload(
-                    saved_result, max_bytes=int(config.max_output_bytes), source="video_status"
+                return await _complete_video_delivery(
+                    safe_job_id, saved_result,
+                    max_bytes=int(config.max_output_bytes), source="video_status",
                 )
-                if safe_job_id != saved_result.job_id:
-                    response = json.loads(payload)
-                    response["job_id"] = safe_job_id
-                    payload = json.dumps(response)
-                _remember_video_completion(safe_job_id, saved_result, payload)
-                return payload
         target = _resolve_generated_video_path(filename, tool_name="video_status")
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -1708,15 +1733,9 @@ async def video_status(job_id: str, filename: str | None = None) -> str:
             raise ToolError(f"Video status failed: {exc}") from exc
         except Exception as exc:
             raise ToolError("Video status failed unexpectedly") from exc
-        payload = await _video_result_payload(
-            result, max_bytes=int(config.max_output_bytes), source="video_status"
+        return await _complete_video_delivery(
+            safe_job_id, result, max_bytes=int(config.max_output_bytes), source="video_status"
         )
-        if safe_job_id != result.job_id:
-            response = json.loads(payload)
-            response["job_id"] = safe_job_id
-            payload = json.dumps(response)
-        _remember_video_completion(safe_job_id, result, payload)
-        return payload
 
 
 # ---------------------------------------------------------------------------

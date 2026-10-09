@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 import re
 import tempfile
@@ -26,6 +25,7 @@ from opensquilla.provider.video_generation import (
     VideoGenerationSubmissionUnknown,
     VideoJobAcceptedCallback,
     _publish_video_without_clobber,
+    read_video_json,
 )
 from opensquilla.provider.video_generation_policy import is_valid_video_generation_base_url
 from opensquilla.secrets import clean_header_secret
@@ -136,18 +136,7 @@ def _remaining(deadline: float, *, job_id: str | None = None) -> float:
 
 
 async def _read_json(response: httpx.Response) -> dict[str, object]:
-    body = bytearray()
-    async for chunk in response.aiter_bytes():
-        body.extend(chunk)
-        if len(body) > _MAX_JSON_BYTES:
-            raise VideoGenerationError("Gemini video JSON response exceeds the size limit")
-    try:
-        value = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise VideoGenerationError("Gemini video endpoint returned invalid JSON") from None
-    if not isinstance(value, dict):
-        raise VideoGenerationError("Gemini video endpoint returned invalid JSON")
-    return value
+    return await read_video_json(response, max_bytes=_MAX_JSON_BYTES, label="Gemini video")
 
 
 async def _submit(
@@ -169,6 +158,7 @@ async def _submit(
     if resolution is not None:
         parameters["resolution"] = resolution
     body = {"instances": [{"prompt": prompt}], "parameters": parameters}
+    accepted_job_id: str | None = None
     try:
         async with asyncio.timeout(_remaining(deadline)):
             async with client.stream(
@@ -191,12 +181,23 @@ async def _submit(
                     job_id = _safe_operation(payload.get("name"), model=model)
                 except VideoGenerationError:
                     raise VideoGenerationSubmissionUnknown() from None
+                accepted_job_id = job_id
                 if on_job_accepted is not None:
                     on_job_accepted(job_id)
     except httpx.HTTPError as exc:
         redacted_httpx_error(exc, api_key=api_key)
+        if accepted_job_id is not None:
+            raise VideoGenerationPending(
+                "Video submission was accepted; check it again using its job ID",
+                job_id=accepted_job_id,
+            ) from None
         raise VideoGenerationSubmissionUnknown() from None
     except TimeoutError:
+        if accepted_job_id is not None:
+            raise VideoGenerationPending(
+                "Video submission was accepted; check it again using its job ID",
+                job_id=accepted_job_id,
+            ) from None
         raise VideoGenerationSubmissionUnknown() from None
     return job_id
 

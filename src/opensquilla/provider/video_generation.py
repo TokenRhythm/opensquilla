@@ -9,7 +9,7 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
@@ -183,21 +183,70 @@ def _remaining(deadline: float, *, job_id: str | None = None) -> float:
     return seconds
 
 
-async def _read_json(response: httpx.Response) -> dict[str, object]:
-    body = bytearray()
-    async for chunk in response.aiter_bytes():
-        body.extend(chunk)
-        if len(body) > _MAX_JSON_BYTES:
-            raise VideoGenerationError("OpenRouter video JSON response exceeds the size limit")
+class _JsonBodyStream(httpx.AsyncByteStream):
+    """Borrow payload reads while the original response owns transport cleanup."""
+
+    def __init__(self, stream: httpx.AsyncByteStream, *, max_bytes: int, label: str) -> None:
+        self._stream = stream
+        self._max_bytes = max_bytes
+        self._label = label
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        received = 0
+        async for chunk in self._stream:
+            received += len(chunk)
+            if received > self._max_bytes:
+                raise VideoGenerationError(f"{self._label} JSON response exceeds the size limit")
+            # Keep content decoders' input chunks small, independently of the
+            # transport's chunk sizes. The decoded body has its own limit.
+            for start in range(0, len(chunk), 4096):
+                yield chunk[start:start + 4096]
+
+    async def aclose(self) -> None:
+        # HTTPX's EOF close applies to this borrowed view. The actual stream
+        # remains owned by the original response context until acceptance is recorded.
+        pass
+
+
+async def read_video_json(
+    response: httpx.Response, *, max_bytes: int, label: str
+) -> dict[str, object]:
+    """Decode and validate bounded JSON before closing the original HTTP stream."""
+
+    body: bytes | bytearray
+    if response.is_stream_consumed:
+        # Preloaded responses already hold decoded content; decoding again
+        # would corrupt compressed responses used by in-process transports.
+        body = response.content
+        if len(body) > max_bytes or response.num_bytes_downloaded > max_bytes:
+            raise VideoGenerationError(f"{label} JSON response exceeds the size limit")
+    else:
+        if not isinstance(response.stream, httpx.AsyncByteStream):
+            raise VideoGenerationError(f"{label} endpoint returned an invalid response stream")
+        borrowed = httpx.Response(
+            response.status_code,
+            headers=response.headers,
+            stream=_JsonBodyStream(response.stream, max_bytes=max_bytes, label=label),
+        )
+        decoded_body = bytearray()
+        async for chunk in borrowed.aiter_bytes():
+            if len(decoded_body) + len(chunk) > max_bytes:
+                raise VideoGenerationError(f"{label} JSON response exceeds the size limit")
+            decoded_body.extend(chunk)
+        body = decoded_body
     try:
         result = json.loads(body)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         if isinstance(exc, json.JSONDecodeError):
             exc.doc = ""
-        raise VideoGenerationError("OpenRouter video endpoint returned invalid JSON") from None
+        raise VideoGenerationError(f"{label} endpoint returned invalid JSON") from None
     if not isinstance(result, dict):
-        raise VideoGenerationError("OpenRouter video endpoint returned invalid JSON")
+        raise VideoGenerationError(f"{label} endpoint returned invalid JSON")
     return result
+
+
+async def _read_json(response: httpx.Response) -> dict[str, object]:
+    return await read_video_json(response, max_bytes=_MAX_JSON_BYTES, label="OpenRouter video")
 
 
 def _error_text(value: object, *, api_key: str) -> str:
@@ -344,6 +393,7 @@ async def _submit(
         body["aspect_ratio"] = aspect_ratio
     if resolution is not None:
         body["resolution"] = resolution
+    accepted_job_id: str | None = None
     try:
         async with asyncio.timeout(_remaining(deadline)):
             async with client.stream(
@@ -363,12 +413,23 @@ async def _submit(
                     job_id = _safe_job_id(payload.get("id"))
                 except VideoGenerationError:
                     raise VideoGenerationSubmissionUnknown() from None
+                accepted_job_id = job_id
                 if on_job_accepted is not None:
                     on_job_accepted(job_id)
     except httpx.HTTPError as exc:
         redacted_httpx_error(exc, api_key=api_key)
+        if accepted_job_id is not None:
+            raise VideoGenerationPending(
+                "Video submission was accepted; check it again using its job ID",
+                job_id=accepted_job_id,
+            ) from None
         raise VideoGenerationSubmissionUnknown() from None
     except TimeoutError:
+        if accepted_job_id is not None:
+            raise VideoGenerationPending(
+                "Video submission was accepted; check it again using its job ID",
+                job_id=accepted_job_id,
+            ) from None
         raise VideoGenerationSubmissionUnknown() from None
     polling_url = _polling_url(api_root, job_id, payload.get("polling_url"))
     return job_id, polling_url, payload
