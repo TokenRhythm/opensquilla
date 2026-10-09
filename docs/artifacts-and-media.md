@@ -193,9 +193,34 @@ Generate a clean product mockup image for this landing page.
 Image provider support depends on configured provider credentials, optional
 dependencies, and runtime policy.
 
+## Video Generation
+
+After [configuring video generation](configuration.md#video-generation), ask
+for a short clip in chat. The Agent may call `video_generate` with a text
+prompt and optional duration, aspect ratio, resolution, or workspace filename.
+The selected OpenRouter, Gemini, xAI, Qwen, Qwen Token Plan, or TokenRhythm
+video model produces an MP4 in the
+workspace, which the tool registers as an artifact for Web UI or supported
+channel delivery. This release supports text-to-video only.
+
+Generation may take several minutes. If the tool returns `pending` and a
+`job_id`, the Agent can call `video_status` with that ID to continue checking
+and deliver the finished MP4. `video_status` checks the existing job without
+submitting another generation request. If submission has an unknown outcome
+and no job ID was returned, do not automatically retry: a second request
+could create and charge for another video. If the MP4 was saved but artifact
+registration fails, the result reports `generated_delivery_failed` and keeps
+the workspace path.
+For non-owner callers, resuming a job requires the same Gateway process to
+retain its job record and the same provider credential; a restart or credential
+rotation can prevent recovery. A retained job keeps its original provider and
+model even when the configured route changes. Its status tool remains available
+to the same session if video generation is later disabled. Video tools are
+unavailable to subagents in this release.
+
 ## Text to Speech and Media Helpers
 
-The media tool family includes image, PDF, and TTS helpers. Availability can
+The media tool family includes image, video, PDF, and TTS helpers. Availability can
 depend on provider config, optional dependencies, and runtime policy.
 
 Use media helpers when the requested output is naturally a file or asset rather

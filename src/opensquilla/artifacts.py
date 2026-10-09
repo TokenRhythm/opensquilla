@@ -1398,18 +1398,101 @@ class ArtifactStore:
         disk_budget_bytes: int | None = DEFAULT_ARTIFACT_DISK_BUDGET_BYTES,
         visibility: str = "listed",
     ) -> ArtifactRef:
-        payload = native_io_path(path).read_bytes()
-        return self.publish_bytes(
-            payload,
-            session_id=session_id,
-            session_key=session_key,
-            name=name or Path(path).name,
-            mime=mime,
-            source=source,
-            max_bytes=max_bytes,
-            disk_budget_bytes=disk_budget_bytes,
-            visibility=visibility,
-        )
+        if visibility not in {"listed", "internal"}:
+            raise ArtifactError("artifact visibility must be listed or internal")
+        with native_io_path(path).open("rb") as source_file:
+            source_stat = os.fstat(source_file.fileno())
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise ArtifactPathError("artifact source must be a regular file")
+            if max_bytes is not None and source_stat.st_size > max_bytes:
+                raise ArtifactBudgetError(
+                    f"artifact exceeds per-file budget ({source_stat.st_size} > {max_bytes})"
+                )
+            current = self._disk_usage_bytes() if disk_budget_bytes is not None else 0
+            if disk_budget_bytes is not None and current + source_stat.st_size > disk_budget_bytes:
+                raise ArtifactBudgetError(
+                    "artifact material exceeds disk budget "
+                    f"({current} + {source_stat.st_size} > {disk_budget_bytes})"
+                )
+
+            session_id = _validate_non_empty("session_id", session_id)
+            session_key = _validate_non_empty("session_key", session_key)
+            artifact_id = self.allocate_artifact_id()
+            safe_name = _safe_filename(name or Path(path).name)
+            safe_mime = _safe_mime(mime)
+            created_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            artifact_dir = self._artifact_dir(session_id, artifact_id)
+            native_artifact_dir = native_io_path(artifact_dir)
+            native_artifact_dir.mkdir(parents=True, exist_ok=False)
+            try:
+                # Keep the ownership proof first so restart recovery can remove
+                # an interrupted import even before its metadata exists.
+                _atomic_write_bytes(
+                    artifact_dir / ARTIFACT_OWNERSHIP_MARKER_NAME,
+                    (artifact_id + "\n").encode("ascii"),
+                )
+                material_path = artifact_dir / ARTIFACT_MATERIAL_NAME
+                temp_path = artifact_dir / f".{secrets.token_hex(8)}"
+                digest = hashlib.sha256()
+                size = 0
+                with native_io_path(temp_path).open("xb") as target_file:
+                    while chunk := source_file.read(1024 * 1024):
+                        next_size = size + len(chunk)
+                        if max_bytes is not None and next_size > max_bytes:
+                            raise ArtifactBudgetError(
+                                f"artifact exceeds per-file budget ({next_size} > {max_bytes})"
+                            )
+                        if (
+                            disk_budget_bytes is not None
+                            and current + next_size > disk_budget_bytes
+                        ):
+                            raise ArtifactBudgetError(
+                                "artifact material exceeds disk budget "
+                                f"({current} + {next_size} > {disk_budget_bytes})"
+                            )
+                        target_file.write(chunk)
+                        digest.update(chunk)
+                        size = next_size
+                    if size == 0:
+                        raise ArtifactBudgetError("artifact payload is empty")
+                    target_file.flush()
+                    os.fsync(target_file.fileno())
+                os.replace(native_io_path(temp_path), native_io_path(material_path))
+
+                thumbnail_bytes = _build_thumbnail(material_path, safe_mime)
+                ref = ArtifactRef(
+                    id=artifact_id,
+                    sha256=digest.hexdigest(),
+                    name=safe_name,
+                    mime=safe_mime,
+                    size=size,
+                    session_id=session_id,
+                    session_key=session_key,
+                    source=source,
+                    created_at=created_at,
+                    download_url=artifact_download_url(artifact_id),
+                    has_thumbnail=thumbnail_bytes is not None,
+                )
+                if thumbnail_bytes is not None:
+                    _atomic_write_bytes(artifact_dir / ARTIFACT_THUMBNAIL_NAME, thumbnail_bytes)
+                if visibility == "internal":
+                    _atomic_write_bytes(artifact_dir / ARTIFACT_INTERNAL_MARKER_NAME, b"1\n")
+                _atomic_write_bytes(
+                    artifact_dir / "meta.json",
+                    json.dumps(ref.to_dict(), ensure_ascii=False, sort_keys=True).encode("utf-8"),
+                )
+            except BaseException:
+                for item in sorted(native_artifact_dir.glob("*"), reverse=True):
+                    try:
+                        item.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                try:
+                    native_artifact_dir.rmdir()
+                except OSError:
+                    pass
+                raise
+            return ref
 
     def publish_bundle(
         self,
@@ -1563,10 +1646,15 @@ class ArtifactStore:
         native_path = native_io_path(path)
         if not native_path.exists():
             raise ArtifactNotFoundError("artifact material not found")
-        payload = native_path.read_bytes()
-        if hashlib.sha256(payload).hexdigest() != ref.sha256:
+        digest = hashlib.sha256()
+        size = 0
+        with native_path.open("rb") as material_file:
+            while chunk := material_file.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+        if digest.hexdigest() != ref.sha256:
             raise ArtifactIntegrityError("artifact material hash mismatch")
-        if len(payload) != ref.size:
+        if size != ref.size:
             raise ArtifactIntegrityError("artifact material size mismatch")
         return ref, path
 
@@ -2636,7 +2724,7 @@ class ArtifactStore:
         return total
 
 
-def _build_thumbnail(payload: bytes, mime: str) -> bytes | None:
+def _build_thumbnail(payload: bytes | Path, mime: str) -> bytes | None:
     """Render a small webp thumbnail for image artifacts.
 
     Returns the encoded webp bytes, or None when the artifact is not an image,
@@ -2649,7 +2737,10 @@ def _build_thumbnail(payload: bytes, mime: str) -> bytes | None:
     try:
         from PIL import Image
 
-        with Image.open(io.BytesIO(payload)) as image:
+        image_source = (
+            io.BytesIO(payload) if isinstance(payload, bytes) else native_io_path(payload)
+        )
+        with Image.open(image_source) as image:
             image.load()
             if image.mode in ("RGBA", "LA", "P"):
                 source = image.convert("RGBA")

@@ -3,8 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, reactive, ref, type App } from 'vue'
 import { createPinia } from 'pinia'
 import i18n, { loadLocaleMessages } from '@/i18n'
+import { APP_SETTINGS_KEY, type AppSettings } from '@/modules/appSettings'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { OBSERVABILITY_KEY } from '@/modules/observability'
+import { SETUP_WORKFLOW_KEY, type SetupWorkflow } from '@/modules/setupWorkflow'
 import SettingsDialog from './SettingsDialog.vue'
 
 let catalogApi: Record<string, any>
@@ -23,6 +25,10 @@ vi.mock('@/composables/setup/useSetupCatalog', () => ({
     { id: 'capabilities', label: 'Capabilities', icon: 'skills', client: false, group: 'ai' },
   ],
   useSetupCatalog: () => catalogApi,
+}))
+
+vi.mock('@/components/setup/SetupCapabilitiesPanel.vue', () => ({
+  default: { template: '<div data-testid="capabilities-panel"></div>' },
 }))
 
 vi.mock('vue-router', () => ({
@@ -119,12 +125,18 @@ function mockCatalog() {
   }
 }
 
-async function mountDialog(gatewayOverrides: Record<string, unknown> = {}) {
+async function mountDialog(
+  gatewayOverrides: Record<string, unknown> = {},
+  appSettings?: AppSettings,
+  setupWorkflow?: Partial<SetupWorkflow>,
+) {
   const el = document.createElement('div')
   document.body.appendChild(el)
   app = createApp(SettingsDialog)
   app.use(i18n)
   app.use(createPinia())
+  if (appSettings) app.provide(APP_SETTINGS_KEY, appSettings)
+  if (setupWorkflow) app.provide(SETUP_WORKFLOW_KEY, setupWorkflow as SetupWorkflow)
   app.provide(GATEWAY_ACCESS_KEY, {
     availability: 'unavailable',
     requiresCredential: false,
@@ -288,6 +300,133 @@ describe('SettingsDialog save-all pending state', () => {
     expect(dirtyBar?.textContent).toContain('放弃路由更改')
     expect(dirtyBar?.textContent).toContain('保存路由更改')
     expect(dirtyBar?.textContent).not.toContain('Model Routing')
+  })
+})
+
+describe('SettingsDialog video draft exit guard', () => {
+  it('loads video settings on first visit and refreshes only credential status on return', async () => {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    controls.hasUnsavedChanges.value = false
+    catalogApi.dirtySections.value = []
+    const readAll = vi.fn().mockResolvedValue({
+      video_generation: {
+        enabled: false,
+        provider: '',
+        primary: '',
+        duration_seconds: null,
+        max_duration_seconds: 8,
+        aspect_ratio: '16:9',
+        allowed_aspect_ratios: ['16:9', '9:16'],
+        resolution: '720p',
+        allowed_resolutions: ['720p', '1080p'],
+        providers: {
+          openrouter: { base_url: 'https://openrouter.ai/api/v1', api_key_env: 'OPENROUTER_API_KEY' },
+          gemini: { base_url: 'https://generativelanguage.googleapis.com/v1beta', api_key_env: 'GEMINI_API_KEY' },
+        },
+      },
+    })
+    const catalog = vi.fn().mockResolvedValue({})
+    const status = vi.fn()
+      .mockResolvedValueOnce({ videoGenerationState: { credentialOptions: [] } })
+      .mockResolvedValue({ videoGenerationState: { credentialOptions: [{
+        providerId: 'openrouter', available: true, source: 'video_env', envKey: 'VIDEO_TEST_KEY',
+      }] } })
+    const el = await mountDialog({}, { readAll } as unknown as AppSettings, { catalog, status })
+    expect(el.querySelector('[data-testid="video-generation-settings"]')).toBeNull()
+    expect(catalog).not.toHaveBeenCalled()
+    expect(readAll).not.toHaveBeenCalled()
+    expect(status).not.toHaveBeenCalled()
+
+    catalogApi.section.value = 'capabilities'
+    await vi.waitFor(() => expect(status).toHaveBeenCalledOnce())
+    const details = el.querySelector<HTMLDetailsElement>('[data-testid="video-generation-settings"]')!
+    const provider = details.querySelector<HTMLSelectElement>('[name="setup_video_provider"]')!
+    provider.value = 'openrouter'
+    provider.dispatchEvent(new Event('change', { bubbles: true }))
+    await nextTick()
+    const model = details.querySelector<HTMLInputElement>('[name="setup_provider_video_primary"]')!
+    model.value = 'google/veo-3.1-fast'
+    model.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    catalogApi.section.value = 'general'
+    await nextTick()
+    expect(details.hidden).toBe(true)
+    catalogApi.section.value = 'capabilities'
+    await vi.waitFor(() => expect(status).toHaveBeenCalledTimes(2))
+    expect(el.querySelector('[data-testid="video-generation-settings"]')).toBe(details)
+    expect(model.value).toBe('google/veo-3.1-fast')
+    expect(catalog).toHaveBeenCalledOnce()
+    expect(readAll).toHaveBeenCalledOnce()
+    expect(details.querySelector('.video-settings__credential-status')?.textContent)
+      .toContain(i18n.global.t('setup.video.videoEnvKeyAvailable', { name: 'VIDEO_TEST_KEY' }))
+  })
+
+  async function mountVideoDraft() {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    controls.hasUnsavedChanges.value = false
+    catalogApi.dirtySections.value = []
+    catalogApi.section.value = 'capabilities'
+    routeState.params.section = 'capabilities'
+    const patch = vi.fn().mockResolvedValue({ restartRequired: false })
+    const settings = {
+      readAll: vi.fn().mockResolvedValue({
+        video_generation: {
+          enabled: false,
+          provider: '',
+          primary: '',
+          duration_seconds: null,
+          max_duration_seconds: 8,
+          aspect_ratio: '16:9',
+          allowed_aspect_ratios: ['16:9', '9:16'],
+          resolution: '720p',
+          allowed_resolutions: ['720p', '1080p'],
+        },
+      }),
+      patch,
+    } as unknown as AppSettings
+    const el = await mountDialog({}, settings)
+    await Promise.resolve()
+    await nextTick()
+    const provider = el.querySelector<HTMLSelectElement>('[name="setup_video_provider"]')!
+    provider.value = 'openrouter'
+    provider.dispatchEvent(new Event('change', { bubbles: true }))
+    await nextTick()
+    const model = el.querySelector<HTMLInputElement>('[name="setup_provider_video_primary"]')!
+    model.value = 'google/veo-3.1-fast'
+    model.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    return { el, patch }
+  }
+
+  it('preserves an unsaved video draft across sections and saves it on exit', async () => {
+    const { el, patch } = await mountVideoDraft()
+    catalogApi.section.value = 'general'
+    await nextTick()
+    expect(el.querySelector<HTMLInputElement>('[name="setup_provider_video_primary"]')?.value).toBe('google/veo-3.1-fast')
+    expect(el.querySelector<HTMLDetailsElement>('[data-testid="video-generation-settings"]')?.hidden).toBe(true)
+
+    const allowed = await leaveGuard!({ path: '/sessions' })
+
+    expect(allowed).toBe(true)
+    expect(confirmChoiceAction).toHaveBeenCalledOnce()
+    expect(patch).toHaveBeenCalledExactlyOnceWith([
+      { path: 'video_generation.provider', value: 'openrouter' },
+      { path: 'video_generation.primary', value: 'google/veo-3.1-fast' },
+    ])
+  })
+
+  it('lets an operator discard an unsaved video draft on exit without writing', async () => {
+    const { patch } = await mountVideoDraft()
+    confirmChoiceAction.mockResolvedValueOnce('secondary')
+
+    const allowed = await leaveGuard!({ path: '/sessions' })
+
+    expect(allowed).toBe(true)
+    expect(confirmChoiceAction).toHaveBeenCalledOnce()
+    expect(patch).not.toHaveBeenCalled()
   })
 })
 

@@ -25,7 +25,8 @@ test('production references exactly match the reviewed target policy', () => {
   const result = evaluateProductionTargets()
   assert.deepEqual(result.failures, [])
   assert.ok(result.targets.includes('method:skills.install.status:result'))
-  assert.equal(result.targets.length, 204)
+  assert.equal(result.targets.length, 205)
+  assert.ok(result.targets.includes('method:onboarding.videoGeneration.models.discover:result'))
   assert.ok(result.targets.includes('method:logs.tail:result'))
   for (const method of [
     'router.feedback.submit', 'router.selflearning.status',

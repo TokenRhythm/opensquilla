@@ -7,6 +7,7 @@ export interface SetupCatalog {
   readonly routerProfiles?: readonly Record<string, unknown>[]
   readonly memoryEmbeddingProviders?: readonly Record<string, unknown>[]
   readonly imageGenerationProviders?: readonly Record<string, unknown>[]
+  readonly videoGenerationProviders?: readonly Record<string, unknown>[]
   readonly audioProviders?: readonly Record<string, unknown>[]
   readonly [key: string]: unknown
 }
@@ -192,6 +193,7 @@ export type ResettableCapability = 'search' | 'image_generation' | 'audio' | 'me
 export interface SetupCatalogPort {
   catalog(options?: SetupRequestOptions): Promise<SetupCatalog>
   discoverImageGenerationModels(providerId: string, options?: SetupRequestOptions): Promise<SetupDiscoveryResult>
+  discoverVideoGenerationModels?(providerId: string, options?: SetupRequestOptions): Promise<SetupDiscoveryResult>
 }
 export interface SetupStatusPort { status(options?: SetupRequestOptions): Promise<SetupStatus> }
 

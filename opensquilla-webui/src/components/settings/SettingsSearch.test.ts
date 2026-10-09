@@ -68,6 +68,7 @@ describe('SettingsSearch', () => {
 
   it.each([
     ['setup.memory.title', 'capabilities', en.setup.memory.title],
+    ['setup.video.title', 'capabilities', en.setup.video.title],
     ['settings.memoryOverview.autoCaptureLabel', 'advanced', en.settings.memoryOverview.autoCaptureLabel],
   ])('indexes %s under its current settings page', async (labelKey, section, label) => {
     const { input, host, select } = mountSearch()

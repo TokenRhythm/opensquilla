@@ -196,6 +196,13 @@
               @reset-capability="resetCapability"
             />
           </template>
+          <VideoGenerationSettings
+            v-if="videoSettingsInitialized"
+            :hidden="!loaded || section !== 'capabilities'"
+            ref="videoSettingsRef"
+            @dirty-change="videoDirty = $event"
+            @busy-change="videoBusy = $event"
+          />
           </fieldset>
         </div>
         </div>
@@ -240,6 +247,7 @@ import SetupProviderPanel from '@/components/setup/SetupProviderPanel.vue'
 import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
 import SetupModelStrategyPanel from '@/components/setup/SetupModelStrategyPanel.vue'
 import SetupCapabilitiesPanel from '@/components/setup/SetupCapabilitiesPanel.vue'
+import VideoGenerationSettings from '@/components/setup/VideoGenerationSettings.vue'
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
 import SettingsSearch from '@/components/settings/SettingsSearch.vue'
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
@@ -363,6 +371,18 @@ const railRef = ref<HTMLElement | null>(null)
 const panelRef = ref<HTMLElement | null>(null)
 const closeBtn = ref<HTMLButtonElement | null>(null)
 const closeSavePending = ref(false)
+const videoSettingsRef = ref<InstanceType<typeof VideoGenerationSettings> | null>(null)
+const videoDirty = ref(false)
+const videoBusy = ref(false)
+const videoSettingsInitialized = ref(false)
+watch([loaded, section], ([ready, activeSection], previous) => {
+  if (!ready || activeSection !== 'capabilities') return
+  if (!videoSettingsInitialized.value) {
+    videoSettingsInitialized.value = true
+  } else if (previous?.[1] !== 'capabilities') {
+    void videoSettingsRef.value?.refreshCredentialStatus()
+  }
+}, { immediate: true })
 
 // Keep the active section's rail tab in view — on mobile the rail scrolls
 // horizontally, so a deep-linked or later section would otherwise sit off-screen.
@@ -436,10 +456,11 @@ const displayConfigPath = computed(() => configPath.value || '~/.opensquilla/con
 // their editor owns Save/Cancel. They still participate in every path that
 // unmounts Settings so browser navigation cannot silently discard credentials.
 const hasSettingsExitDraft = computed(() => (
-  hasUnsavedChanges.value || providerDraftDirty.value
+  hasUnsavedChanges.value || providerDraftDirty.value || videoDirty.value
 ))
 const hasPendingSettingsWrite = computed(() => (
   saveAllPending.value
+  || videoBusy.value
   || providerSavePending.value
   || primaryMutationPending.value
   || modelStrategyRoutingBusy.value
@@ -536,10 +557,10 @@ async function selectSearchResult(id: string, labelKey: string) {
   const label = labelKey ? t(labelKey) : ''
   const explicitTarget = targetId ? panel.querySelector<HTMLElement>(`#${targetId}`) : null
   const matched = label
-    ? Array.from(panel.querySelectorAll<HTMLElement>('label, .control-row__label, .capability-card__title, h3, h4'))
+    ? Array.from(panel.querySelectorAll<HTMLElement>('label, .control-row__label, .capability-card__title, .video-settings__title, h3, h4'))
       .find(element => element.textContent?.trim() === label)
     : undefined
-  const row = matched?.closest<HTMLElement>('.control-row, .capability-card')
+  const row = matched?.closest<HTMLElement>('.control-row, .capability-card, .video-settings')
   // A section-only result must not focus an unrelated action at the top of
   // that section. Exact setting rows can focus their own native control.
   const target = explicitTarget
@@ -721,6 +742,7 @@ async function saveExitChanges(): Promise<boolean> {
   try {
     if (providerDraftDirty.value && !(await saveProvider())) return false
     if (hasUnsavedChanges.value) await saveDirtySections()
+    if (videoDirty.value && !(await videoSettingsRef.value?.save())) return false
     await nextTick()
     return !hasSettingsExitDraft.value
   } finally {
@@ -767,6 +789,7 @@ const removeLeaveGuard = router.beforeEach(async (to) => {
 })
 
 function isVisibleInDetails(element: HTMLElement): boolean {
+  if (element.closest('[hidden], [inert]')) return false
   for (let disclosure = element.parentElement?.closest('details'); disclosure;
     disclosure = disclosure.parentElement?.closest('details')) {
     // Only the first direct summary and its descendants remain visible when

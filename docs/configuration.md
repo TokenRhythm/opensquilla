@@ -244,6 +244,87 @@ your install to see the current catalog.
 
 Read: [`providers-and-models.md`](providers-and-models.md)
 
+## Video Generation
+
+Video generation is disabled by default. Select a provider and one of its
+text-to-video models in Settings, or configure them in TOML:
+
+```toml
+[video_generation]
+enabled = true
+provider = "gemini"
+primary = "veo-3.1-fast-generate-preview"
+duration_seconds = 8
+max_duration_seconds = 8
+aspect_ratio = "16:9"
+allowed_aspect_ratios = ["16:9", "9:16"]
+resolution = "720p"
+allowed_resolutions = ["720p", "1080p"]
+timeout_seconds = 600
+max_output_bytes = 104857600 # 100 MiB
+
+# Optional: choose the native API endpoint and key reference for this provider.
+[video_generation.providers.gemini]
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_API_KEY"
+```
+
+OpenRouter uses a raw model ID such as `google/veo-3.1-fast`. Gemini uses a
+native model ID such as `veo-3.1-fast-generate-preview`. The other supported
+provider IDs are `xai`, `qwen`, `tokenrhythm`, and `qwen_token_plan`; use each
+provider's native video model ID in `primary`. `qwen` uses the standard
+DashScope video API, while `qwen_token_plan` uses its separate subscription
+endpoint and credential. These are video-capable routes; an image provider is
+not automatically a video provider. Existing configurations with `primary`
+but no `provider` continue to use OpenRouter. A new installation does not
+select a provider automatically.
+
+Each `video_generation.providers.<provider>` section accepts `base_url`,
+`api_key_env`, and an optional direct `api_key`. Settings can save a direct key
+or use a Gateway environment variable. The default API roots are the providers'
+official endpoints. Their default environment variables are `OPENROUTER_API_KEY`,
+`GEMINI_API_KEY`, `XAI_API_KEY`,
+`DASHSCOPE_API_KEY`, `TOKENRHYTHM_API_KEY`, and `QWEN_TOKEN_PLAN_API_KEY`.
+Set `base_url` to a compatible native API endpoint for a different region or
+an operator-controlled proxy; set `api_key_env` to an explicit environment
+variable when the endpoint is on a different origin. For example:
+
+```toml
+[video_generation]
+enabled = true
+provider = "qwen"
+primary = "wan2.7-t2v"
+
+[video_generation.providers.qwen]
+base_url = "https://dashscope-intl.aliyuncs.com/api/v1"
+api_key_env = "VIDEO_QWEN_API_KEY"
+```
+
+Custom endpoints must use HTTPS, except for an HTTP loopback service. A video
+provider cannot target another built-in provider's official origin. Default
+provider environment keys and model-service credentials do not follow a
+custom endpoint to a different origin unless the key reference was explicitly
+configured for that endpoint. A matching primary model-service or profile
+credential can be reused when its endpoint has the same origin. No video key
+is needed when the same provider's image generation key already covers that
+origin. A direct video key entered in Settings is stored in the local Gateway
+configuration, tied to its endpoint, and redacted from settings reads. The tools
+appear only when video generation is enabled and the selected model and credential are
+available. An existing accepted job can still expose `video_status` for recovery
+after the generation setting is disabled. The official OpenRouter model catalog
+is checked before submission. Gemini Veo 3.1 supports 4, 6, or 8 second clips;
+1080p requires 8 seconds.
+
+The defaults allow agent-selected clips within an 8 second maximum. When neither
+the tool call nor the config specifies a duration, each adapter selects a
+provider-appropriate duration within the configured maximum and sends it explicitly.
+The schema permits an operator maximum up to 60
+seconds. The timeout can be 30–1800 seconds; the output cap can be 1–500 MiB.
+The video cap replaces the ordinary 30 MiB artifact per-file limit for these
+outputs. The separate aggregate artifact disk budget remains 512 MiB by
+default; configure `[attachments].artifact_disk_budget_bytes` if needed.
+See [video generation and recovery](artifacts-and-media.md#video-generation).
+
 ## Router Configuration
 
 Router modes:

@@ -19,6 +19,10 @@ def setup_status(config: Any, *, is_owner: bool) -> SetupStatus:
     from opensquilla.onboarding.next_steps import env_recovery_commands
     from opensquilla.onboarding.probe_history import load_probe_history
     from opensquilla.onboarding.status import get_onboarding_status
+    from opensquilla.provider.video_generation_catalog import (
+        list_video_generation_provider_catalog_entries,
+    )
+    from opensquilla.tools.builtin.media import video_generation_credential_status
 
     status = get_onboarding_status(
         config,
@@ -31,6 +35,15 @@ def setup_status(config: Any, *, is_owner: bool) -> SetupStatus:
         and credential.get("source") in {"explicit", "env"}
     )
     config_path = getattr(config, "config_path", None)
+    video_config = config.video_generation
+    video_credential_options = [
+        video_generation_credential_status(
+            config,
+            provider_id=spec.provider_id,
+            base_url=getattr(video_config.providers, spec.provider_id).base_url,
+        )
+        for spec in list_video_generation_provider_catalog_entries()
+    ]
     return cast(
         SetupStatus,
         {
@@ -48,6 +61,12 @@ def setup_status(config: Any, *, is_owner: bool) -> SetupStatus:
             "imageGenerationPrimary": status.image_generation_primary,
             "imageGenerationEnvKey": status.image_generation_env_key,
             "imageGenerationState": status.image_generation_state,
+            "videoGenerationState": {
+                "enabled": video_config.enabled,
+                "providerId": video_config.effective_provider,
+                "primary": video_config.primary,
+                "credentialOptions": video_credential_options,
+            },
             "audioConfigured": status.audio_configured,
             "audioEnabled": status.audio_enabled,
             "audioSource": status.audio_source,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -190,6 +191,39 @@ def test_artifact_download_reports_not_found_and_integrity_errors(tmp_path: Path
 
     assert missing.status_code == 404
     assert mismatch.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_artifact_download_integrity_check_runs_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opensquilla.application.artifact_workbench import ArtifactContentQuery
+    from opensquilla.gateway.adapters.artifact_content import GatewayArtifactContentPort
+    from opensquilla.gateway.config import AttachmentsConfig, GatewayConfig
+
+    ref = _publish(tmp_path, payload=b"\x00" * (2 * 1024 * 1024), mime="video/mp4")
+    main_thread = threading.get_ident()
+    worker_threads: list[int] = []
+    original = ArtifactStore.resolve_for_download
+
+    def record_resolution(
+        store: ArtifactStore, artifact_id: str, *, session_id: str
+    ) -> tuple[object, Path]:
+        worker_threads.append(threading.get_ident())
+        return original(store, artifact_id, session_id=session_id)
+
+    monkeypatch.setattr(ArtifactStore, "resolve_for_download", record_resolution)
+    port = GatewayArtifactContentPort(
+        GatewayConfig(attachments=AttachmentsConfig(media_root=str(tmp_path))),
+        session_manager=_FakeSessionManager("session-1"),
+    )
+    material = await port.artifact_content(
+        ArtifactContentQuery("agent:main:webchat:ok", ref.id)
+    )
+
+    assert material.path == ArtifactStore(tmp_path).path_for(ref)
+    assert material.media_type == "video/mp4"
+    assert worker_threads and all(thread != main_thread for thread in worker_threads)
 
 
 def test_artifact_native_open_owner_opens_html_copy(tmp_path: Path, monkeypatch) -> None:

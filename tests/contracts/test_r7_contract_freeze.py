@@ -178,9 +178,9 @@ def test_contract_inventory_freezes_all_webui_reachable_wire_names() -> None:
     assert not {"router.selflearning.status", "router.feedback.submit"} & {
         spec.wire_name for spec in specs
     }
-    assert len(specs) == 212
+    assert len(specs) == 213
     assert Counter(spec.contract_type for spec in specs) == {
-        "method": 202,
+        "method": 203,
         "event": 10,
     }
     assert {spec.wire_name for spec in specs if spec.wire_name.startswith("agents.")} == {

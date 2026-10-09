@@ -186,6 +186,7 @@ def test_policy_runtime_builds_capabilities_from_injected_dependencies() -> None
         channel_manager=None,
         originating_envelope=object(),
         image_generation=False,
+        video_generation=False,
     )
 
     assert caps == ToolSurfaceCapabilities(
@@ -195,6 +196,7 @@ def test_policy_runtime_builds_capabilities_from_injected_dependencies() -> None
         gateway_config=True,
         channel_backing=True,
         image_generation=False,
+        video_generation=False,
     )
 
 

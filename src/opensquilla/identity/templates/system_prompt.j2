@@ -155,6 +155,19 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 {% endif -%}
 {% endif -%}
 
+{% set has_video_gen = tools and "video_generate" in tools -%}
+{% if prompt_mode == "full" -%}
+## Video Generation
+
+{% if has_video_gen -%}
+- When the user asks you to create a video, call `video_generate` with a clear visual prompt and the needed parameters. Do not claim a video was generated until the tool confirms delivery.
+- If `video_generate` returns a pending job ID, use `video_status` with that ID to resume checking. Do not submit the same generation again just because polling timed out.
+{% else -%}
+- Video generation is unavailable in this session. If the user requests a video, say so plainly.
+{% endif -%}
+
+{% endif -%}
+
 {% if tools and "memory_search" in tools and prompt_mode != "none" -%}
 {% set has_memory_get = tools and "memory_get" in tools -%}
 ## Memory Recall

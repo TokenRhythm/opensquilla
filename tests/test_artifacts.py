@@ -954,6 +954,179 @@ def test_artifact_store_enforces_per_file_and_disk_budgets(tmp_path: Path) -> No
         )
 
 
+def test_publish_file_streams_large_material_and_download_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "generated.mp4"
+    material_size = DEFAULT_ARTIFACT_MAX_BYTES + 1024
+    with source.open("wb") as output:
+        output.seek(material_size - 1)
+        output.write(b"v")
+
+    def forbid_read_bytes(_path: Path) -> bytes:
+        raise AssertionError("large artifact material must be streamed")
+
+    monkeypatch.setattr(Path, "read_bytes", forbid_read_bytes)
+    store = ArtifactStore(tmp_path / "media")
+    ref = store.publish_file(
+        source,
+        session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        mime="video/mp4",
+        source="video_generate",
+        max_bytes=material_size,
+    )
+    resolved_ref, material_path = store.resolve_for_download(ref.id, session_id="session-1")
+
+    assert resolved_ref == ref
+    assert ref.name == "generated.mp4"
+    assert ref.size == material_size
+    assert ref.has_thumbnail is False
+    assert material_path.stat().st_size == material_size
+    with material_path.open("rb") as material_file:
+        assert material_file.read(1) == b"\x00"
+        material_file.seek(-1, os.SEEK_END)
+        assert material_file.read(1) == b"v"
+
+
+@pytest.mark.parametrize(
+    ("max_bytes", "disk_budget_bytes", "message"),
+    [
+        (4, None, "per-file budget"),
+        (None, 4, "disk budget"),
+    ],
+)
+def test_publish_file_checks_known_size_before_creating_artifact(
+    tmp_path: Path,
+    max_bytes: int | None,
+    disk_budget_bytes: int | None,
+    message: str,
+) -> None:
+    source = tmp_path / "large.mp4"
+    source.write_bytes(b"abcde")
+    store = ArtifactStore(tmp_path / "media")
+
+    with pytest.raises(ArtifactBudgetError, match=message):
+        store.publish_file(
+            source,
+            session_id="session-1",
+            session_key="agent:main:webchat:session-1",
+            mime="video/mp4",
+            source="video_generate",
+            max_bytes=max_bytes,
+            disk_budget_bytes=disk_budget_bytes,
+        )
+
+    assert not (tmp_path / "media" / "artifacts").exists()
+
+
+@pytest.mark.parametrize(
+    ("max_bytes", "disk_budget_bytes", "message"),
+    [
+        (4, None, "per-file budget"),
+        (None, 4, "disk budget"),
+    ],
+)
+def test_publish_file_rejects_growth_and_removes_partial_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    max_bytes: int | None,
+    disk_budget_bytes: int | None,
+    message: str,
+) -> None:
+    source = tmp_path / "growing.mp4"
+    source.write_bytes(b"abc")
+    original_open = Path.open
+
+    class GrowingReader:
+        def __init__(self, file: io.BufferedReader) -> None:
+            self.file = file
+            self.chunks = iter((b"abc", b"def", b""))
+
+        def __enter__(self) -> GrowingReader:
+            self.file.__enter__()
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.file.__exit__(*args)
+
+        def fileno(self) -> int:
+            return self.file.fileno()
+
+        def read(self, _size: int) -> bytes:
+            return next(self.chunks)
+
+    def open_with_growth(path: Path, *args: object, **kwargs: object):
+        file = original_open(path, *args, **kwargs)
+        return GrowingReader(file) if path == source else file
+
+    monkeypatch.setattr(Path, "open", open_with_growth)
+    store = ArtifactStore(tmp_path / "media")
+    with pytest.raises(ArtifactBudgetError, match=message):
+        store.publish_file(
+            source,
+            session_id="session-1",
+            session_key="agent:main:webchat:session-1",
+            mime="video/mp4",
+            source="video_generate",
+            max_bytes=max_bytes,
+            disk_budget_bytes=disk_budget_bytes,
+        )
+
+    artifact_root = tmp_path / "media" / "artifacts"
+    assert not any(path.is_file() for path in artifact_root.rglob("*"))
+
+
+def test_publish_file_cleans_material_when_metadata_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.artifacts as artifacts_module
+
+    source = tmp_path / "generated.mp4"
+    source.write_bytes(b"video")
+    write_bytes = artifacts_module._atomic_write_bytes
+
+    def fail_metadata(path: Path, data: bytes) -> None:
+        if path.name == "meta.json":
+            raise OSError("metadata write failed")
+        write_bytes(path, data)
+
+    monkeypatch.setattr(artifacts_module, "_atomic_write_bytes", fail_metadata)
+    store = ArtifactStore(tmp_path / "media")
+    with pytest.raises(OSError, match="metadata write failed"):
+        store.publish_file(
+            source,
+            session_id="session-1",
+            session_key="agent:main:webchat:session-1",
+            mime="video/mp4",
+            source="video_generate",
+        )
+
+    artifact_root = tmp_path / "media" / "artifacts"
+    assert not any(path.is_file() for path in artifact_root.rglob("*"))
+
+
+def test_publish_file_preserves_image_thumbnail(tmp_path: Path) -> None:
+    from PIL import Image
+
+    source = tmp_path / "chart.png"
+    Image.new("RGB", (8, 8), color="red").save(source)
+    store = ArtifactStore(tmp_path / "media")
+
+    ref = store.publish_file(
+        source,
+        session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        mime="image/png",
+        source="image_generate",
+    )
+
+    assert ref.has_thumbnail is True
+    assert store.resolve_thumbnail_for_download(ref.id, session_id="session-1") is not None
+
+
 def test_artifact_budget_defaults_are_open_source_sized() -> None:
     assert DEFAULT_ARTIFACT_MAX_BYTES == 30 * 1024 * 1024
     assert DEFAULT_ARTIFACT_DISK_BUDGET_BYTES == 512 * 1024 * 1024
