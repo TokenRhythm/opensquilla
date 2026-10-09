@@ -20,9 +20,12 @@ from dataclasses import dataclass, replace
 from typing import Any, Final, Literal, Protocol, cast
 
 MODE: Final = "four_tier_mapping"
-SCHEMA_VERSION: Final = "fixed-four-tier-v2-v3"
+SCHEMA_VERSION: Final = "fixed-four-tier-v2-v4"
 LEGACY_SCHEMA_VERSIONS: Final = frozenset({"fixed-four-tier-v2-mock-v2"})
-RULE_VERSION: Final = "fixed-four-tier-v2-rules-v1"
+READABLE_SCHEMA_VERSIONS: Final = frozenset(
+    {SCHEMA_VERSION, "fixed-four-tier-v2-v3", *LEGACY_SCHEMA_VERSIONS}
+)
+RULE_VERSION: Final = "fixed-four-tier-v2-rules-v2"
 MOCK_CLASSIFIER_VERSION: Final = "random-mock-v2"
 FEATURE_SCHEMA_VERSION: Final = "fixed-four-tier-v2-features-mock-v2"
 FEATURE_VECTOR_DIM: Final = 413
@@ -35,6 +38,7 @@ type Tier = Literal["c0", "c1", "c2", "c3"]
 type ClassifierSource = Literal["rule", "classifier", "fallback", "not_run"]
 type ClassifierRunStatus = Literal["ran", "not_run", "error"]
 type ContextAction = Literal["keep", "reset"]
+type QualityFailureReason = Literal["explicit_correction", "validation_failure", "no_progress"]
 type FeatureAuditInputContract = Literal[
     "legacy_mock_snapshot",
     "canonical_router_input",
@@ -50,6 +54,7 @@ type AttachmentModality = Literal[
 
 INTENTS: Final[tuple[Intent, ...]] = ("continue", "redo", "new_task")
 TIERS: Final[tuple[Tier, ...]] = ("c0", "c1", "c2", "c3")
+QUALITY_FAILURE_REASONS: Final = ("explicit_correction", "validation_failure", "no_progress")
 FIXED_FOUR_TIER_DEPLOYMENT_SPECS: Final[
     tuple[tuple[Tier, str, str, Literal["thinking", "max"], str], ...]
 ] = (
@@ -108,10 +113,13 @@ def fixed_four_tier_semantic_policy_config(
     host-local paths in the policy fingerprint made the same Manifest produce
     different policy identities after an otherwise transparent deployment
     move.  The exact ``model_set_id`` and Manifest Hash remain part of the
-    projection, as do authorization, thresholds, and the frozen ladder.
+    projection, as do authorization and the frozen ladder. Deprecated confidence
+    thresholds no longer affect v4 decisions and are excluded from its identity.
     """
 
     payload = dict(value)
+    for field in ("intent_min_confidence", "tier_min_confidence", "min_margin"):
+        payload.pop(field, None)
     raw_classifier = payload.get("classifier")
     if isinstance(raw_classifier, Mapping):
         classifier = dict(raw_classifier)
@@ -120,6 +128,12 @@ def fixed_four_tier_semantic_policy_config(
             classifier.pop("metadata_db", None)
         payload["classifier"] = classifier
     return payload
+
+
+def _argmax_label(probabilities: Mapping[str, float], labels: Sequence[str]) -> str:
+    """Resolve ties by the fixed class order, independently of mapping order."""
+
+    return max(labels, key=probabilities.__getitem__)
 
 
 def _is_sha256(value: str) -> bool:
@@ -401,8 +415,8 @@ class ClassificationAudit:
     final: str
     reason: str
     version: str | None
-    # Serialized through the owning decision's Jev classifier identity; old
-    # traces and every other classifier retain strict probability validation.
+    # Jev alone supplies independent tier probabilities rather than a normalized
+    # distribution. The owning decision identity authorizes this exception.
     probability_argmax: bool = False
 
     def __post_init__(self) -> None:
@@ -456,9 +470,8 @@ class ClassificationAudit:
                     raise ValueError("four_tier_mapping classifier audit has invalid probabilities")
                 normalized[label] = float(raw_probability)
             if not normalized or (
-                not self.probability_argmax and not math.isclose(
-                    sum(normalized.values()), 1.0, rel_tol=1e-6, abs_tol=1e-6
-                )
+                not self.probability_argmax
+                and not math.isclose(sum(normalized.values()), 1.0, rel_tol=1e-6, abs_tol=1e-6)
             ):
                 raise ValueError("four_tier_mapping classifier audit has invalid probabilities")
             if self.probability_argmax and set(normalized) != set(TIERS):
@@ -487,16 +500,16 @@ class ClassificationAudit:
                     "four_tier_mapping classifier audit prediction is not in probabilities"
                 )
             maximum = max(self.probabilities.values())
-            winners = [
-                label for label, probability in self.probabilities.items() if probability == maximum
-            ]
-            if self.probability_argmax:
-                winners = [max(TIERS, key=lambda label: self.probabilities[label])]
-            if winners != [self.prediction] or not math.isclose(
-                float(self.confidence),
-                maximum,
-                rel_tol=1e-6,
-                abs_tol=1e-6,
+            label_order = INTENTS if set(self.probabilities) == set(INTENTS) else TIERS
+            if (
+                set(self.probabilities) != set(label_order)
+                or (_argmax_label(self.probabilities, label_order) != self.prediction)
+                or not math.isclose(
+                    float(self.confidence),
+                    maximum,
+                    rel_tol=1e-6,
+                    abs_tol=1e-6,
+                )
             ):
                 raise ValueError("four_tier_mapping classifier audit output is inconsistent")
             if self.source == "classifier" and self.final != self.prediction:
@@ -544,6 +557,9 @@ class RoutingRequest:
     attachment_count: int = 0
     attachment_modalities: tuple[AttachmentModality, ...] | None = None
     control_event: str | None = None
+    quality_failure_reason: QualityFailureReason | None = None
+    quality_retry_budget_remaining: int = 0
+    quality_retry_already_used: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str):
@@ -572,6 +588,19 @@ class RoutingRequest:
             raise ValueError("previous_assistant_usage must be an object when provided")
         if self.previous_outcome not in {"success", "failure", "clarification", "unknown"}:
             raise ValueError("previous_outcome is invalid")
+        if (
+            self.quality_failure_reason is not None
+            and self.quality_failure_reason not in QUALITY_FAILURE_REASONS
+        ):
+            raise ValueError("quality_failure_reason is invalid")
+        if (
+            isinstance(self.quality_retry_budget_remaining, bool)
+            or not isinstance(self.quality_retry_budget_remaining, int)
+            or self.quality_retry_budget_remaining < 0
+        ):
+            raise ValueError("quality_retry_budget_remaining must be a non-negative integer")
+        if not isinstance(self.quality_retry_already_used, bool):
+            raise ValueError("quality_retry_already_used must be a boolean")
         if (
             not isinstance(self.route_history, tuple)
             or len(self.route_history) > 5
@@ -985,6 +1014,8 @@ class FixedFourTierDecision:
     feature_vector_status: str
     effective_mock_seed: int | None
     schema_version: str = SCHEMA_VERSION
+    quality_escalation_reason: QualityFailureReason | None = None
+    quality_escalation_used: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.intent, ClassificationAudit) or not isinstance(
@@ -993,7 +1024,7 @@ class FixedFourTierDecision:
             raise ValueError("four_tier_mapping decision classifier audit is malformed")
         if not isinstance(self.feature_input_audit, FeatureInputAudit):
             raise ValueError("four_tier_mapping decision feature input audit is malformed")
-        if self.schema_version not in {SCHEMA_VERSION, *LEGACY_SCHEMA_VERSIONS}:
+        if self.schema_version not in READABLE_SCHEMA_VERSIONS:
             raise ValueError("four_tier_mapping decision schema_version is incompatible")
         if self.classifier_backend not in {"random_mock", "registered_model", "injected", "jev"}:
             raise ValueError("four_tier_mapping decision classifier backend is incompatible")
@@ -1056,16 +1087,25 @@ class FixedFourTierDecision:
                 self.tier.source == "classifier"
                 and self.tier.reason == "classifier_argmax_selected"
             )
-            redo_blocked = (
-                self.intent.final == "redo"
+            allowed_blocked_intents = (
+                {"continue", "redo"} if self.schema_version == SCHEMA_VERSION else {"redo"}
+            )
+            downgrade_blocked = (
+                self.intent.final in allowed_blocked_intents
                 and self.tier.source == "fallback"
-                and self.tier.reason == "redo_downgrade_blocked"
+                and self.tier.reason == f"{self.intent.final}_downgrade_blocked"
                 and self.previous_tier in TIERS
                 and self.final_tier == self.previous_tier
                 and self.tier.prediction in TIERS
                 and TIERS.index(self.tier.prediction) < TIERS.index(self.previous_tier)
             )
-            if not (selected or redo_blocked):
+            quality_upgrade = (
+                self.schema_version == SCHEMA_VERSION
+                and self.quality_escalation_used
+                and self.tier.source == "fallback"
+                and self.tier.reason == "quality_failure_upgrade"
+            )
+            if not (selected or downgrade_blocked or quality_upgrade):
                 raise ValueError("Jev argmax audit cannot use confidence or validation fallback")
         for field_name, value in (
             ("route_id", self.route_id),
@@ -1121,6 +1161,54 @@ class FixedFourTierDecision:
         ):
             raise ValueError("model decision cannot carry a mock seed")
 
+        if (
+            self.quality_escalation_reason is not None
+            and self.quality_escalation_reason not in QUALITY_FAILURE_REASONS
+        ):
+            raise ValueError("four_tier_mapping decision has invalid quality escalation reason")
+        if not isinstance(self.quality_escalation_used, bool):
+            raise ValueError("four_tier_mapping decision has invalid quality escalation flag")
+        if self.schema_version != SCHEMA_VERSION:
+            if self.quality_escalation_reason is not None or self.quality_escalation_used:
+                raise ValueError("old four_tier_mapping decisions cannot carry quality escalation")
+            for classifier_audit in (self.intent, self.tier):
+                if classifier_audit.probabilities is not None and not (
+                    classifier_audit is self.tier
+                    and jev_argmax
+                    and classifier_audit.probability_argmax
+                ):
+                    maximum = max(classifier_audit.probabilities.values())
+                    if (
+                        sum(value == maximum for value in classifier_audit.probabilities.values())
+                        != 1
+                    ):
+                        raise ValueError("old four_tier_mapping decisions require a unique argmax")
+        if self.quality_escalation_used and (
+            self.quality_escalation_reason is None
+            or self.previous_tier is None
+            or self.intent.final == "new_task"
+            or TIERS.index(self.final_tier) != TIERS.index(self.previous_tier) + 1
+            or self.tier.source != "fallback"
+            or self.tier.reason != "quality_failure_upgrade"
+            or (
+                self.tier.prediction is not None
+                and TIERS.index(cast(Tier, self.tier.prediction)) >= TIERS.index(self.final_tier)
+            )
+        ):
+            raise ValueError("four_tier_mapping quality escalation must upgrade exactly one tier")
+        if self.schema_version == SCHEMA_VERSION:
+            if self.tier.run_status not in {"ran", "error"}:
+                raise ValueError("v4 tier classification must run on every user turn")
+            if self.intent.source == "fallback" and self.intent.run_status == "ran":
+                raise ValueError("v4 intent decisions cannot filter a valid argmax")
+            if (
+                self.intent.final == "new_task"
+                and self.tier.source == "fallback"
+                and self.tier.run_status == "ran"
+            ):
+                raise ValueError("v4 new-task decisions cannot filter a valid argmax")
+            if self.tier.reason == "quality_failure_upgrade" and not self.quality_escalation_used:
+                raise ValueError("quality upgrade requires its audited flag")
         intent = cast(Intent, self.intent.final)
         if intent == "new_task":
             if (
@@ -1140,7 +1228,7 @@ class FixedFourTierDecision:
                 or self.history_turns_to_keep != self.task_turn_index
             ):
                 raise ValueError("four_tier_mapping active-task decision is inconsistent")
-            if intent == "continue":
+            if intent == "continue" and self.schema_version != SCHEMA_VERSION:
                 if (
                     self.final_tier != self.previous_tier
                     or self.tier_snapshot_hash is not None
@@ -1152,14 +1240,38 @@ class FixedFourTierDecision:
                 expected_switch_reason = "continue_hold"
             else:
                 if self.tier.source in {"rule", "not_run"}:
-                    raise ValueError("four_tier_mapping redo tier audit is inconsistent")
+                    raise ValueError("four_tier_mapping active-task tier audit is inconsistent")
                 if TIERS.index(self.final_tier) < TIERS.index(self.previous_tier):
-                    raise ValueError("four_tier_mapping redo decision cannot downgrade")
+                    raise ValueError("four_tier_mapping active-task decision cannot downgrade")
                 if self.tier_snapshot_hash is None:
-                    raise ValueError("four_tier_mapping redo decision lacks a tier snapshot")
+                    raise ValueError("four_tier_mapping active-task decision lacks a tier snapshot")
                 expected_switch_reason = (
-                    "redo_upgrade" if self.final_tier != self.previous_tier else "redo_hold"
+                    f"{intent}_quality_upgrade"
+                    if self.quality_escalation_used
+                    else f"{intent}_upgrade"
+                    if self.final_tier != self.previous_tier
+                    else f"{intent}_hold"
                 )
+                if self.schema_version == SCHEMA_VERSION and not self.quality_escalation_used:
+                    if self.tier.run_status == "error":
+                        if self.final_tier != self.previous_tier:
+                            raise ValueError(
+                                "failed tier classification must hold the current tier"
+                            )
+                    elif self.tier.prediction is not None:
+                        expected_tier = TIERS[
+                            max(
+                                TIERS.index(self.previous_tier),
+                                TIERS.index(cast(Tier, self.tier.prediction)),
+                            )
+                        ]
+                        if self.final_tier != expected_tier:
+                            raise ValueError("active-task tier differs from argmax/hold policy")
+                        if (
+                            self.tier.source == "fallback"
+                            and self.tier.reason != f"{intent}_downgrade_blocked"
+                        ):
+                            raise ValueError("active-task tier has invalid policy override")
         if intent == "new_task" and self.tier.source in {"rule", "not_run"}:
             raise ValueError("four_tier_mapping new-task tier audit is inconsistent")
         if self.switch_reason != expected_switch_reason:
@@ -1172,6 +1284,14 @@ class FixedFourTierDecision:
         model: str | None = None,
     ) -> dict[str, Any]:
         return {
+            **(
+                {
+                    "quality_escalation_reason": self.quality_escalation_reason,
+                    "quality_escalation_used": self.quality_escalation_used,
+                }
+                if self.schema_version == SCHEMA_VERSION
+                else {}
+            ),
             "mode": MODE,
             "schema_version": self.schema_version,
             "route_id": self.route_id,
@@ -1210,8 +1330,14 @@ class FixedFourTierDecision:
         if value.get("mode") != MODE:
             raise ValueError("four_tier_mapping decision mode is incompatible")
         schema_version_value = value.get("schema_version")
-        if schema_version_value not in {SCHEMA_VERSION, *LEGACY_SCHEMA_VERSIONS}:
+        if schema_version_value not in READABLE_SCHEMA_VERSIONS:
             raise ValueError("four_tier_mapping decision schema_version is incompatible")
+        quality_fields = {"quality_escalation_reason", "quality_escalation_used"}
+        if schema_version_value == SCHEMA_VERSION:
+            if not quality_fields.issubset(value):
+                raise ValueError("v4 decision is missing quality escalation audit")
+        elif quality_fields.intersection(value):
+            raise ValueError("old decisions cannot carry quality escalation audit")
         feature_schema_value = value.get("feature_schema_version")
         feature_dim_value = value.get("feature_vector_dim")
         feature_status_value = value.get("feature_vector_status")
@@ -1324,10 +1450,11 @@ class FixedFourTierDecision:
                 reason=reason_value,
                 version=version_value,
                 probability_argmax=(
-                    name == "tier" and run_status == "ran"
+                    name == "tier"
+                    and run_status == "ran"
                     and classifier_backend_value == "jev"
-                    and isinstance(value.get("classifier_identity"), Mapping)
-                    and value["classifier_identity"].get("tier_selection_mode")
+                    and isinstance(classifier_identity_value, Mapping)
+                    and classifier_identity_value.get("tier_selection_mode")
                     == "probability_argmax.v1"
                 ),
             )
@@ -1339,14 +1466,8 @@ class FixedFourTierDecision:
                 classifier_probabilities = cast(Mapping[str, float], result.probabilities)
                 classifier_confidence = cast(float, result.confidence)
                 maximum = max(classifier_probabilities.values())
-                winners = [
-                    label
-                    for label, probability in classifier_probabilities.items()
-                    if probability == maximum
-                ]
-                if result.probability_argmax:
-                    winners = [max(TIERS, key=lambda label: classifier_probabilities[label])]
-                if winners != [result.prediction] or not math.isclose(
+                winner = _argmax_label(classifier_probabilities, allowed_labels)
+                if winner != result.prediction or not math.isclose(
                     classifier_confidence,
                     maximum,
                     rel_tol=1e-6,
@@ -1434,6 +1555,12 @@ class FixedFourTierDecision:
             feature_vector_status=cast(str, feature_status_value),
             effective_mock_seed=cast(int | None, effective_seed_value),
             schema_version=cast(str, schema_version_value),
+            quality_escalation_reason=value.get("quality_escalation_reason"),
+            quality_escalation_used=(
+                cast(bool, value.get("quality_escalation_used"))
+                if schema_version_value == SCHEMA_VERSION
+                else False
+            ),
         )
 
 
@@ -1490,7 +1617,7 @@ class FixedFourTierTaskState:
         }
         if set(payload) != expected_keys:
             raise ValueError("four_tier_mapping task state payload shape is incompatible")
-        if payload.get("schema_version") not in {SCHEMA_VERSION, *LEGACY_SCHEMA_VERSIONS}:
+        if payload.get("schema_version") not in READABLE_SCHEMA_VERSIONS:
             raise ValueError("four_tier_mapping task state schema_version is incompatible")
         task_id = payload.get("task_id")
         tier_value = payload.get("tier")
@@ -1746,23 +1873,6 @@ def _feature_input_audit(
     )
 
 
-def _probability_margin(probabilities: Mapping[str, float] | None) -> float | None:
-    if probabilities is None:
-        return None
-    values: list[float] = []
-    for raw in probabilities.values():
-        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-            return None
-        value = float(raw)
-        if not math.isfinite(value) or value < 0.0 or value > 1.0:
-            return None
-        values.append(value)
-    if not values:
-        return None
-    values.sort(reverse=True)
-    return values[0] - (values[1] if len(values) > 1 else 0.0)
-
-
 def _classifier_audit(
     *,
     classifier: IntentClassifier | TierClassifier,
@@ -1770,8 +1880,6 @@ def _classifier_audit(
     allowed: Sequence[str],
     probability_labels: Sequence[str],
     fallback: str,
-    min_confidence: float,
-    min_margin: float,
 ) -> ClassificationAudit:
     version = str(getattr(classifier, "version", "") or "") or None
     try:
@@ -1797,15 +1905,15 @@ def _classifier_audit(
     ):
         # The Jev adapter has already validated the four finite probabilities.
         # Do not apply local-model confidence, margin, sum or tie fallbacks.
-        probabilities = cast(Mapping[str, float], result.probabilities)
-        prediction = max(TIERS, key=lambda label: probabilities[label])
+        jev_probabilities = cast(Mapping[str, float], result.probabilities)
+        jev_prediction = max(TIERS, key=lambda label: jev_probabilities[label])
         return ClassificationAudit(
             source="classifier",
             run_status="ran",
-            prediction=prediction,
-            probabilities=dict(probabilities),
-            confidence=probabilities[prediction],
-            final=prediction,
+            prediction=jev_prediction,
+            probabilities=dict(jev_probabilities),
+            confidence=jev_probabilities[jev_prediction],
+            final=jev_prediction,
             reason="classifier_argmax_selected",
             version=result.version or version,
             probability_argmax=True,
@@ -1853,17 +1961,17 @@ def _classifier_audit(
     if confidence is None and probabilities is not None:
         confidence = probabilities.get(prediction)
     max_probability = max(probabilities.values()) if probabilities else None
-    max_labels = (
-        [label for label, value in probabilities.items() if value == max_probability]
-        if probabilities is not None and max_probability is not None
-        else []
+    winner = (
+        _argmax_label(probabilities, probability_labels)
+        if probabilities_valid and probabilities is not None
+        else None
     )
     if (
         not probabilities_valid
         or result_version is None
         or prediction not in allowed
-        or len(max_labels) != 1
-        or max_labels[0] != prediction
+        or probabilities is None
+        or probabilities.get(prediction) != max_probability
         or isinstance(confidence, bool)
         or not isinstance(confidence, (int, float))
         or not math.isfinite(float(confidence))
@@ -1885,19 +1993,8 @@ def _classifier_audit(
             version=result_version,
         )
 
+    prediction = cast(str, winner)
     normalized_confidence = float(confidence)
-    margin = _probability_margin(probabilities)
-    if normalized_confidence < min_confidence or margin is None or margin <= min_margin:
-        return ClassificationAudit(
-            source="fallback",
-            run_status="ran",
-            prediction=prediction,
-            probabilities=probabilities,
-            confidence=normalized_confidence,
-            final=fallback,
-            reason="classifier_uncertain",
-            version=result_version,
-        )
     return ClassificationAudit(
         source="classifier",
         run_status="ran",
@@ -2034,10 +2131,7 @@ class FixedFourTierV2Router:
             "tier_classifier_version": str(getattr(self._tier_classifier, "version", "") or ""),
             "effective_mock_seed": self._effective_mock_seed,
             "default_new_task_tier": default_new_task_tier,
-            "intent_min_confidence": intent_min_confidence,
-            "tier_min_confidence": tier_min_confidence,
-            "min_margin": min_margin,
-            "config": dict(policy_config or {}),
+            "config": fixed_four_tier_semantic_policy_config(policy_config or {}),
         }
         self._policy_hash = _snapshot_hash(policy_payload)
 
@@ -2216,8 +2310,6 @@ class FixedFourTierV2Router:
             allowed=INTENTS,
             probability_labels=INTENTS,
             fallback="continue",
-            min_confidence=self._intent_min_confidence,
-            min_margin=self._min_margin,
         )
 
     def _tier_decision(
@@ -2227,31 +2319,11 @@ class FixedFourTierV2Router:
         state: FixedFourTierTaskState | None,
         snapshot: Mapping[str, Any],
     ) -> tuple[ClassificationAudit, dict[str, Any] | None]:
-        if intent == "continue":
-            if state is None:  # Defensive invariant; the intent gate normally prevents this.
-                raise FixedFourTierRoutingError(
-                    "continue requires an active task",
-                    reason="continue_without_active_task",
-                )
-            return (
-                ClassificationAudit(
-                    source="not_run",
-                    run_status="not_run",
-                    prediction=None,
-                    probabilities=None,
-                    confidence=None,
-                    final=state.tier,
-                    reason="continue_keeps_current_tier",
-                    version=None,
-                ),
-                None,
-            )
-
-        if intent == "redo":
+        if intent in {"continue", "redo"}:
             if state is None:
                 raise FixedFourTierRoutingError(
-                    "redo requires an active task",
-                    reason="redo_without_active_task",
+                    f"{intent} requires an active task",
+                    reason=f"{intent}_without_active_task",
                 )
             policy_allowed = TIERS[TIERS.index(state.tier) :]
             fallback: Tier = state.tier
@@ -2264,15 +2336,13 @@ class FixedFourTierV2Router:
                 allowed=TIERS,
                 probability_labels=TIERS,
                 fallback=fallback,
-                min_confidence=self._tier_min_confidence,
-                min_margin=self._min_margin,
             )
             if audit.source == "classifier" and cast(Tier, audit.final) not in policy_allowed:
                 audit = replace(
                     audit,
                     source="fallback",
                     final=state.tier,
-                    reason="redo_downgrade_blocked",
+                    reason=f"{intent}_downgrade_blocked",
                 )
             return audit, tier_snapshot
 
@@ -2285,8 +2355,6 @@ class FixedFourTierV2Router:
             allowed=TIERS,
             probability_labels=TIERS,
             fallback=self._default_new_task_tier,
-            min_confidence=self._tier_min_confidence,
-            min_margin=self._min_margin,
         )
         return audit, tier_snapshot
 
@@ -2310,6 +2378,11 @@ class FixedFourTierV2Router:
         )
 
         routing_snapshot = self._snapshot(request, state, include_control_event=True)
+        routing_snapshot["quality_escalation_control"] = {
+            "reason": request.quality_failure_reason,
+            "budget_remaining": request.quality_retry_budget_remaining,
+            "already_used": request.quality_retry_already_used,
+        }
         classifier_snapshot = self._snapshot(request, state, include_control_event=False)
         feature_input_audit = _feature_input_audit(
             request,
@@ -2330,6 +2403,24 @@ class FixedFourTierV2Router:
             state=state,
             snapshot=classifier_snapshot,
         )
+        quality_escalation_used = False
+        if (
+            state is not None
+            and intent != "new_task"
+            and request.quality_failure_reason is not None
+            and request.quality_retry_budget_remaining > 0
+            and not request.quality_retry_already_used
+            and state.tier != "c3"
+        ):
+            remedial_tier = TIERS[TIERS.index(state.tier) + 1]
+            if TIERS.index(cast(Tier, tier_audit.final)) < TIERS.index(remedial_tier):
+                tier_audit = replace(
+                    tier_audit,
+                    source="fallback",
+                    final=remedial_tier,
+                    reason="quality_failure_upgrade",
+                )
+                quality_escalation_used = True
         final_tier_value = tier_audit.final
         if final_tier_value not in TIERS:
             raise FixedFourTierRoutingError(
@@ -2365,12 +2456,13 @@ class FixedFourTierV2Router:
             context_action = "keep"
             history_turns_to_keep = state.turn_count
             task_turn_index = state.turn_count
-            if intent == "redo" and final_tier != state.tier:
-                switch_reason = "redo_upgrade"
-            elif intent == "redo":
-                switch_reason = "redo_hold"
-            else:
-                switch_reason = "continue_hold"
+            switch_reason = (
+                f"{intent}_quality_upgrade"
+                if quality_escalation_used
+                else f"{intent}_upgrade"
+                if final_tier != state.tier
+                else f"{intent}_hold"
+            )
             next_state = FixedFourTierTaskState(
                 task_id=state.task_id,
                 tier=final_tier,
@@ -2419,6 +2511,8 @@ class FixedFourTierV2Router:
             feature_vector_dim=self._feature_vector_dim,
             feature_vector_status=self._feature_vector_status,
             effective_mock_seed=self._effective_mock_seed,
+            quality_escalation_reason=request.quality_failure_reason,
+            quality_escalation_used=quality_escalation_used,
         )
         return decision, next_state
 

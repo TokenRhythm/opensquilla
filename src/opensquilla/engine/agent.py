@@ -4967,6 +4967,8 @@ class Agent:
             max(0, int(getattr(self.config, "max_provider_retries", 0) or 0)),
         )
         agent_retry_additional_calls_used = 0
+        quality_retry_attempted = False
+
         visited_provider_retry_rosters: set[str] = set()
         visited_provider_retry_request_fingerprints: set[
             tuple[
@@ -5174,6 +5176,45 @@ class Agent:
             provider_request_max_chars=self._provider_request_proof_max_chars(),
             tool_choice=None,
         )
+        async def _try_fixed_quality_retry(reason: str, messages: list[Message]) -> bool:
+            nonlocal quality_retry_attempted, agent_retry_additional_calls_used
+            nonlocal chat_cfg, thinking_enabled, thinking_budget
+            callback = getattr(self.provider, "prepare_quality_retry", None)
+            if (
+                quality_retry_attempted
+                or not callable(callback)
+                or agent_retry_additional_calls_used >= agent_retry_budget
+                or (self.config.metadata or {}).get("fixed_four_tier_v2_decision_id") is None
+            ):
+                return False
+            quality_retry_attempted = True
+            updates = await callback(
+                reason, provider_retry_scope_id,
+                agent_retry_budget - agent_retry_additional_calls_used, messages,
+            )
+            if updates is None:
+                return False
+            # The callback has preflighted, reserved the shared physical budget,
+            # and atomically committed its durable effective tier.  Keep the
+            # current messages and wrapper so history and the scope survive.
+            agent_retry_additional_calls_used += 1
+            for field_name, value in updates.items():
+                setattr(self.config, field_name, value)
+            thinking_enabled, thinking_budget = self.config.resolve_thinking(prompt=thinking_prompt)
+            chat_cfg = chat_cfg.model_copy(update={
+                "max_tokens": self.config.max_tokens,
+                "model_capabilities": self.config.model_capabilities,
+                "thinking": thinking_enabled,
+                "thinking_budget_tokens": thinking_budget,
+                "thinking_level": self.config.thinking,
+            })
+            self._write_turn_call_log(
+                "fixed_four_tier_quality_retry", action="apply", reason=reason,
+                model=self.config.model_id, provider=self.config.provider_id,
+                budget=agent_retry_budget, used=agent_retry_additional_calls_used,
+            )
+            return True
+
         provider_retry_thinking_config: ChatConfig | None = None
         _thinking_fallback_done = False
         _disable_thinking_for_next_provider_call = False
@@ -5914,6 +5955,9 @@ class Agent:
                 message=f"Agent turn timed out after {self.config.timeout}s",
                 code="agent_runtime_timeout",
             )
+
+        if (self.config.metadata or {}).get("_fixed_four_tier_explicit_correction") is True:
+            await _try_fixed_quality_retry("explicit_correction", turn_messages)
 
         try:
             while True:
@@ -10036,6 +10080,7 @@ class Agent:
                         reason="repeated_identical_tool_call",
                         details=repeated_tool_call_recovery_details or {},
                     )
+                    await _try_fixed_quality_retry("no_progress", turn_messages)
                     yield WarningEvent(
                         code="repeated_tool_call_recovery",
                         message=(
@@ -11975,6 +12020,17 @@ class Agent:
                     _finish_artifact_delivery_without_provider()
                     break
                 last_executed_results = list(executed_results)
+                if not turn_yielded and any(
+                    result.is_error
+                    and isinstance(result.execution_status, Mapping)
+                    and result.execution_status.get("reason") in {
+                        "invalid_arguments", "retryable_tool_input_error",
+                        "schema_validation_failed", "output_validation_failed",
+                        "invalid_tool_arguments", "invalid_json", "format_validation_failed",
+                    }
+                    for result in executed_results
+                ):
+                    await _try_fixed_quality_retry("validation_failure", turn_messages)
                 if turn_yielded:
                     break
 

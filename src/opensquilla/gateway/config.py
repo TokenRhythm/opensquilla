@@ -892,16 +892,23 @@ class FixedFourTierV2Config(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["fixed-four-tier-v2-v3"] = "fixed-four-tier-v2-v3"
-    # New v3 configurations must choose a backend explicitly. Legacy v1/v2
+    schema_version: Literal["fixed-four-tier-v2-v4"] = "fixed-four-tier-v2-v4"
+    # New configurations must choose a backend explicitly. Legacy v1/v2
     # payloads are normalized to ``random_mock`` by the compatibility validator
     # below, but a newly enabled production route must never silently dispatch
     # paid traffic from a process-random classifier.
     classifier: FixedFourTierV2ClassifierConfig
     default_new_task_tier: Literal["c0", "c1", "c2", "c3"] = "c1"
-    intent_min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-    tier_min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-    min_margin: float = Field(default=0.05, ge=0.0, le=1.0)
+    # Retained for old configuration files; v4 selects argmax without gates.
+    intent_min_confidence: float = Field(
+        default=0.5, ge=0.0, le=1.0, description="Compatibility field; ignored by v4 routing."
+    )
+    tier_min_confidence: float = Field(
+        default=0.5, ge=0.0, le=1.0, description="Compatibility field; ignored by v4 routing."
+    )
+    min_margin: float = Field(
+        default=0.05, ge=0.0, le=1.0, description="Compatibility field; ignored by v4 routing."
+    )
     tiers: dict[
         Literal["c0", "c1", "c2", "c3"],
         FixedFourTierV2TierConfig,
@@ -914,11 +921,14 @@ class FixedFourTierV2Config(BaseModel):
             return value
         payload = copy.deepcopy(dict(value))
         schema_version = payload.get("schema_version")
+        if schema_version == "fixed-four-tier-v2-v3":
+            # v3 already carries an explicit registered/mock classifier.
+            payload["schema_version"] = "fixed-four-tier-v2-v4"
         if schema_version in {
             "fixed-four-tier-v2-mock-v1",
             "fixed-four-tier-v2-mock-v2",
         }:
-            payload["schema_version"] = "fixed-four-tier-v2-v3"
+            payload["schema_version"] = "fixed-four-tier-v2-v4"
             payload.pop("max_session_states", None)
             if schema_version == "fixed-four-tier-v2-mock-v1":
                 tiers = payload.get("tiers")

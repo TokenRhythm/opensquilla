@@ -79,7 +79,7 @@ DEPRECATED_AGENT_TOKEN_SAVING_LEAVES: frozenset[str] = frozenset(
 )
 _LEGACY_LLM_ENSEMBLE_TIMEOUT_SECONDS = frozenset({120.0, 300.0})
 _DEFAULT_LLM_ENSEMBLE_TIMEOUT_SECONDS = 3600.0
-_FIXED_FOUR_TIER_SCHEMA = "fixed-four-tier-v2-v3"
+_FIXED_FOUR_TIER_SCHEMA = "fixed-four-tier-v2-v4"
 _LEGACY_FIXED_FOUR_TIER_SCHEMAS = frozenset(
     {
         "fixed-four-tier-v2-mock-v1",
@@ -650,6 +650,12 @@ def _normalize_fixed_four_tier_classifier(builder: _MigrationBuilder) -> None:
         return
 
     prefix = "llm_ensemble.four_tier_mapping"
+    if schema_version == "fixed-four-tier-v2-v3":
+        # Upgrade policy semantics without inventing a mock classifier.
+        route["schema_version"] = _FIXED_FOUR_TIER_SCHEMA
+        builder.changes.append(
+            f"{prefix}.schema_version: {schema_version} -> {_FIXED_FOUR_TIER_SCHEMA}"
+        )
     if legacy_schema:
         route["schema_version"] = _FIXED_FOUR_TIER_SCHEMA
         builder.changes.append(

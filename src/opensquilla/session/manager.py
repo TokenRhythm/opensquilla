@@ -1638,6 +1638,21 @@ class SessionManager:
             updated_at_ms=updated_at_ms,
         )
 
+    async def commit_fixed_four_tier_quality_upgrade(
+        self,
+        *,
+        route_id: str,
+        expected_version: int,
+        quality_retry: dict[str, Any],
+        updated_at_ms: int,
+    ) -> FixedFourTierState:
+        return await self._storage.commit_fixed_four_tier_quality_upgrade(
+            route_id=route_id,
+            expected_version=expected_version,
+            quality_retry=quality_retry,
+            updated_at_ms=updated_at_ms,
+        )
+
     async def settle_fixed_four_tier_decision(
         self,
         *,

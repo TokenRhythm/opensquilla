@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from opensquilla.engine.routing.fixed_four_tier_v2 import (
+    INTENTS,
     ClassifierPrediction,
     Tier,
 )
@@ -156,10 +157,8 @@ def _probabilities(
 
 def _winner(probabilities: Mapping[str, float]) -> tuple[str, float]:
     maximum = max(probabilities.values())
-    winners = [label for label, value in probabilities.items() if value == maximum]
-    if len(winners) != 1:
-        raise RegisteredModelRuntimeError("registered model returned a tied argmax")
-    return winners[0], maximum
+    labels = INTENTS if set(probabilities) == set(INTENTS) else tuple(probabilities)
+    return max(labels, key=probabilities.__getitem__), maximum
 
 
 class RegisteredModelClassifier:
@@ -381,7 +380,12 @@ class RegisteredModelClassifier:
         label, confidence = _winner(probabilities)
         decision_field = "intent_decision" if allowed_tiers is None else "tier_decision"
         expected_decision = label if allowed_tiers is None else label.upper()
-        if getattr(prediction, decision_field, None) != expected_decision:
+        reported_decision = getattr(prediction, decision_field, None)
+        reported_label = str(reported_decision or "").lower()
+        if (
+            reported_decision != expected_decision
+            and probabilities.get(reported_label) != confidence
+        ):
             raise RegisteredModelRuntimeError(
                 "registered model decision does not match its probability argmax"
             )

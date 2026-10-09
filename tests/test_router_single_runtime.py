@@ -357,6 +357,20 @@ class _FixedRouteSessionManager:
         self.state = state
         return state
 
+    async def commit_fixed_four_tier_quality_upgrade(self, **kwargs: Any) -> Any:
+        from opensquilla.session.storage import FixedFourTierStateConflictError
+
+        if self.state.version != kwargs["expected_version"]:
+            raise FixedFourTierStateConflictError("changed")
+        retry = kwargs["quality_retry"]
+        self.state = self.state.model_copy(
+            update={
+                "tier": retry["to_tier"],
+                "version": self.state.version + 1,
+            }
+        )
+        return self.state
+
     async def settle_fixed_four_tier_decision(self, **kwargs: Any) -> bool:
         assert kwargs["route_id"] in self.decisions
         self.settlements.append(dict(kwargs))
@@ -2182,7 +2196,7 @@ async def test_registered_four_tier_real_resolver_builds_complete_router_input(
     )
 
     assert len(instances) == 1
-    assert len(instances[0].calls) == 1
+    assert len(instances[0].calls) == 2
     snapshot, allowed_tiers = instances[0].calls[0]
     assert allowed_tiers is None
     router_input = snapshot["router_input"]
@@ -8841,3 +8855,297 @@ async def test_multiple_physical_receipt_commit_flips_next_real_aggregator_ranki
     }
     cached_row = affinity_scores[f"openrouter:{cached_aggregator}"]
     assert cached_row["cache_affinity"]["score_adjustment"] > 0.0
+
+
+async def _quality_retry_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, Any, Any]:
+    from opensquilla.engine.pipeline import TurnContext
+
+    config = _fixed_four_tier_v2_config(mock_seed=7)
+    inherited = ProviderConfig(provider="openrouter", model="openai/gpt-5.5", api_key="fake")
+    selector = _Selector(inherited)
+    manager = _FixedRouteSessionManager()
+    manager.transcript = [
+        SimpleNamespace(
+            message_id="quality-input",
+            role="user",
+            content="read the file",
+            turn_usage=None,
+        )
+    ]
+    runner = TurnRunner(
+        provider_selector=selector, session_manager=manager, config=config, model_catalog=_Catalog()
+    )
+    from opensquilla.engine.routing.fixed_four_tier_v2 import (
+        ClassifierPrediction,
+        FixedFourTierV2Router,
+    )
+
+    class FixedTier:
+        version = "test"
+
+        def predict(self, snapshot: Any, allowed_tiers: Any) -> Any:
+            return ClassifierPrediction(
+                label="c1",
+                probabilities={"c0": 0.0, "c1": 1.0, "c2": 0.0, "c3": 0.0},
+                confidence=1.0,
+                version=self.version,
+            )
+
+    runner._fixed_four_tier_v2_router_for_config = lambda config: FixedFourTierV2Router(
+        tier_classifier=FixedTier()
+    )
+    turn = TurnContext(
+        message="read the file",
+        session_key="agent:main:quality",
+        config=config,
+        provider=_NoChatProvider(),
+        model=inherited.model,
+        tool_defs=[],
+        system_prompt="system",
+        attachments=[],
+        metadata={},
+    )
+    wrapper = await runner._resolve_fixed_four_tier_v2_provider(
+        turn=turn,
+        provider=turn.provider,
+        cloned_selector=selector,
+        turn_config=config,
+        ensemble_cfg=config.llm_ensemble,
+        turn_absolute_deadline=None,
+        bound_user_message_id="quality-input",
+    )
+    assert manager.state.tier == "c1"
+    return wrapper, manager, turn
+
+
+@pytest.mark.parametrize("reason", ["validation_failure", "no_progress", "explicit_correction"])
+async def test_quality_retry_preserves_wrapper_and_scope_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+) -> None:
+    wrapper, manager, turn = await _quality_retry_runtime(monkeypatch)
+    original = wrapper.primary
+    assert wrapper.begin_provider_retry_scope("scope", max_additional_physical_requests=2)
+    updates = await wrapper.prepare_quality_retry(
+        reason, "scope", 2, [Message(role="user", content="keep history")]
+    )
+    assert updates["model_id"] == "deepseek/deepseek-v4-pro"
+    assert wrapper.primary is not original
+    assert manager.state.tier == "c2" and manager.state.task_turn_count == 1
+    assert manager.state.version == 2
+    trace = turn.metadata["fixed_four_tier_v2_decision"]
+    assert trace["final_tier"] == "c1"
+    assert trace["quality_retry"]["to_tier"] == "c2"
+    assert wrapper.quality_retry_remaining("scope") == 1
+    assert await wrapper.prepare_quality_retry(reason, "scope", 1, []) is None
+    assert wrapper.reserve_provider_retry_physical_request("scope") is True
+    assert wrapper.reserve_provider_retry_physical_request("scope") is False
+
+
+async def test_quality_retry_failed_commit_refunds_without_activation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper, manager, turn = await _quality_retry_runtime(monkeypatch)
+    original = wrapper.primary
+
+    async def conflict(**kwargs: Any) -> Any:
+        raise RuntimeError("CAS conflict")
+
+    manager.commit_fixed_four_tier_quality_upgrade = conflict
+    assert wrapper.begin_provider_retry_scope("scope", max_additional_physical_requests=1)
+    assert await wrapper.prepare_quality_retry("validation_failure", "scope", 1, []) is None
+    assert wrapper.primary is original and manager.state.tier == "c1"
+    assert wrapper.quality_retry_remaining("scope") == 1
+    assert "quality_retry" not in turn.metadata["fixed_four_tier_v2_decision"]
+
+
+async def test_quality_retry_post_commit_cancellation_finishes_activation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper, manager, turn = await _quality_retry_runtime(monkeypatch)
+    committed, release = asyncio.Event(), asyncio.Event()
+    original_commit = manager.commit_fixed_four_tier_quality_upgrade
+
+    async def commit_then_pause(**kwargs: Any) -> Any:
+        result = await original_commit(**kwargs)
+        committed.set()
+        await release.wait()
+        return result
+
+    manager.commit_fixed_four_tier_quality_upgrade = commit_then_pause
+    assert wrapper.begin_provider_retry_scope("scope", max_additional_physical_requests=1)
+    task = asyncio.create_task(wrapper.prepare_quality_retry("validation_failure", "scope", 1, []))
+    await committed.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert manager.state.tier == "c2"
+    assert wrapper.active_model_id == "deepseek/deepseek-v4-pro"
+    assert turn.metadata["fixed_four_tier_v2_decision"]["quality_retry"]["used"] is True
+    assert wrapper.quality_retry_remaining("scope") == 0
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("你刚才的答案不正确，重新算。", True),
+        ("你的答案有误，重新算。", True),
+        ("你的答案有错误，请重算", True),
+        ("你的答案没有错误，继续下一步", False),
+        ("你的答案没错，继续", False),
+        ("你的答案不是错误的，不需要重算", False),
+        ("你的答案没有明显错误", False),
+        ("你的答案不需要纠正", False),
+        ("你的答案有错误但不需要纠正", False),
+        ("Your answer is not wrong, continue", False),
+        ("Your answer is not incorrect", False),
+        ("Your answer has not been incorrect", False),
+        ("Your answer has no errors", False),
+        ("Your answer is not entirely incorrect", False),
+        ("Your answer is not wrong. That calculation is incorrect.", False),
+        ("Your answer is incorrect. Do not remove existing functions.", True),
+        ("Your answer is not only wrong but invalid", True),
+        ("你的答案没有错误。不对的是下面这个示例。", False),
+        ("你的答案不正确。不要改变其他代码。", True),
+        ("Your previous answer was wrong", True),
+        ("Your answer is incorrect", True),
+        ("Explain why an incorrect answer fails validation", False),
+        ("Please find the wrong answer in this dataset", False),
+        ("不对，请重新计算。", True),
+        ("不对", True),
+        ("编写程序检查你的答案错误时怎么处理", False),
+        ("解释这句话：your answer is wrong", False),
+    ],
+)
+def test_quality_correction_is_specific_to_prior_answer(message: str, expected: bool) -> None:
+    from opensquilla.engine.runtime import _fixed_route_explicit_correction
+
+    assert _fixed_route_explicit_correction(message, "previous answer") is expected
+    assert _fixed_route_explicit_correction(message, None) is False
+
+
+@pytest.mark.parametrize(
+    "kind", ["validation_failure", "no_progress", "timeout", "permission_denied"]
+)
+async def test_agent_runs_quality_retry_on_observed_signal_only(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    from opensquilla.provider import DoneEvent, TextDeltaEvent, ToolUseEndEvent, ToolUseStartEvent
+    from opensquilla.provider.selector import ModelSelector
+
+    calls: list[str] = []
+
+    class Scripted:
+        provider_name = "openrouter"
+
+        def __init__(self, model: str) -> None:
+            self.active_model_id = model
+
+        async def chat(self, messages: Any, tools: Any = None, config: Any = None) -> Any:
+            calls.append(self.active_model_id)
+            if self.active_model_id == "deepseek/deepseek-v4-flash" and len(calls) <= (
+                3 if kind == "no_progress" else 1
+            ):
+                yield ToolUseStartEvent(tool_use_id=f"call-{len(calls)}", tool_name="read_file")
+                yield ToolUseEndEvent(
+                    tool_use_id=f"call-{len(calls)}",
+                    tool_name="read_file",
+                    arguments={"path": "file.txt"},
+                )
+                yield DoneEvent(
+                    stop_reason="tool_use",
+                    model=self.active_model_id,
+                    provider="openrouter",
+                    input_tokens=2,
+                    output_tokens=1,
+                )
+            else:
+                yield TextDeltaEvent(text="done")
+                yield DoneEvent(
+                    model=self.active_model_id,
+                    provider="openrouter",
+                    input_tokens=2,
+                    output_tokens=1,
+                )
+
+    monkeypatch.setattr(ModelSelector, "resolve", lambda self: Scripted(self.current_config.model))
+    wrapper, manager, turn = await _quality_retry_runtime(monkeypatch)
+    from opensquilla.execution_status import runtime_execution_status
+
+    async def tool(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="content" if kind == "no_progress" else "bad input",
+            is_error=kind != "no_progress",
+            execution_status=runtime_execution_status(
+                "success" if kind == "no_progress" else "error",
+                reason="invalid_arguments" if kind == "validation_failure" else kind,
+            ),
+        )
+
+    agent = Agent(
+        provider=wrapper,
+        config=AgentConfig(
+            model_id=wrapper.active_model_id,
+            provider_id="openrouter",
+            max_iterations=6,
+            max_provider_retries=1,
+            metadata=turn.metadata,
+            repeated_tool_call_recovery_threshold=2,
+            repeated_tool_call_recovery_extra_tools=["read_file"],
+        ),
+        tool_definitions=[
+            ToolDefinition(name="read_file", description="read", input_schema=ToolInputSchema())
+        ],
+        tool_handler=tool,
+    )
+    events = [event async for event in agent.run_turn("read the file")]
+    assert any(event.kind == "done" for event in events)
+    expected = "c2" if kind in {"validation_failure", "no_progress"} else "c1"
+    assert manager.state.tier == expected
+    assert calls[0] == "deepseek/deepseek-v4-flash"
+    assert calls[-1] == ("deepseek/deepseek-v4-pro" if expected == "c2" else calls[0])
+    assert not wrapper._retry_scope_local_remaining
+
+
+async def test_quality_retry_preflight_refusal_preserves_model_and_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider import ModelCapabilities
+
+    wrapper, manager, turn = await _quality_retry_runtime(monkeypatch)
+    original = wrapper.primary
+    turn.tool_defs = [
+        ToolDefinition(name="read_file", description="read", input_schema=ToolInputSchema())
+    ]
+    monkeypatch.setattr(
+        _Catalog,
+        "get_capabilities",
+        lambda self, model_id, **kwargs: ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=model_id != "deepseek/deepseek-v4-pro",
+        ),
+    )
+    assert wrapper.begin_provider_retry_scope("scope", max_additional_physical_requests=1)
+    assert await wrapper.prepare_quality_retry("validation_failure", "scope", 1, []) is None
+    assert wrapper.primary is original and manager.state.tier == "c1"
+    assert wrapper.quality_retry_remaining("scope") == 1
+
+
+async def test_quality_retry_refuses_native_scope_and_exhausted_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper, manager, turn = await _quality_retry_runtime(monkeypatch)
+    assert wrapper.begin_provider_retry_scope("empty", max_additional_physical_requests=0)
+    assert await wrapper.prepare_quality_retry("validation_failure", "empty", 1, []) is None
+    assert wrapper.begin_provider_retry_scope("scope", max_additional_physical_requests=1)
+    wrapper._retry_scope_provider_bindings["scope"] = object()
+    assert await wrapper.prepare_quality_retry("validation_failure", "scope", 1, []) is None
+    assert manager.state.tier == "c1"
+    assert wrapper.quality_retry_remaining("scope") == 1

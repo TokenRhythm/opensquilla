@@ -267,15 +267,41 @@ def test_first_turn_gating_and_canonical_decision_roundtrip() -> None:
     assert FixedFourTierDecision.from_trace(decision.trace()) == decision
 
 
-def test_continue_keeps_tier_and_records_gated_tier_not_run() -> None:
-    classifier, calls = _classifier(_response("continue", "c3"))
+@pytest.mark.parametrize(
+    "predicted,expected,reason",
+    [
+        ("c0", "c2", "continue_downgrade_blocked"),
+        ("c2", "c2", "classifier_argmax_selected"),
+        ("c3", "c3", "classifier_argmax_selected"),
+    ],
+)
+def test_continue_reclassifies_tier_and_keeps_task_context(
+    predicted: str, expected: str, reason: str
+) -> None:
+    classifier, calls = _classifier(_response("continue", predicted))
     router = FixedFourTierV2Router(intent_classifier=classifier, tier_classifier=classifier)
-    decision, _ = router.decide(_request(), FixedFourTierTaskState("active", "c1", 1))
+    request = _request(
+        task_anchor="原任务锚点",
+        user_history=("原任务", "补充复杂约束"),
+        previous_assistant_text="原来的回答",
+    )
+    decision, state = router.decide(request, FixedFourTierTaskState("active", "c2", 1))
     assert decision.intent.final == "continue"
     assert decision.intent.run_status == "ran"
-    assert decision.tier.run_status == "not_run"
-    assert decision.final_tier == "c1"
+    assert decision.tier.run_status == "ran"
+    assert decision.tier.prediction == predicted
+    assert decision.tier.reason == reason
+    assert decision.final_tier == state.tier == expected
+    assert decision.task_id == state.task_id == "active"
+    assert decision.context_action == "keep"
+    assert state.turn_count == 2
     assert len(calls) == 1
+    input_state = json.loads(calls[0].content)["state"]
+    assert input_state["active_route_tier"] == "C2"
+    assert input_state["task_anchor"] == "原任务锚点"
+    assert input_state["history_user"] == ["原任务", "补充复杂约束"]
+    assert input_state["previous_answer"] == "原来的回答"
+    assert FixedFourTierDecision.from_trace(decision.trace()) == decision
 
 
 @pytest.mark.parametrize(
@@ -343,13 +369,16 @@ def test_non_argmax_tier_ignores_raw_choice_without_rewriting_receipt() -> None:
     assert FixedFourTierDecision.from_trace(decision.trace()) == decision
 
 
-@pytest.mark.parametrize("fields", [
-    {},
-    {"choice": "invalid", "confidence": None},
-    {"choice": "c0", "confidence": 0.0},
-    {"choice": "c0", "confidence": True},
-    {"choice": "c0", "confidence": float("nan")},
-])
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},
+        {"choice": "invalid", "confidence": None},
+        {"choice": "c0", "confidence": 0.0},
+        {"choice": "c0", "confidence": True},
+        {"choice": "c0", "confidence": float("nan")},
+    ],
+)
 def test_tier_choice_and_confidence_are_not_required_or_used(fields: dict[str, Any]) -> None:
     body = _response()
     body["answers"]["tier"] = {
@@ -359,8 +388,10 @@ def test_tier_choice_and_confidence_are_not_required_or_used(fields: dict[str, A
     }
     classifier, calls = _classifier(body)
     router = FixedFourTierV2Router(
-        intent_classifier=classifier, tier_classifier=classifier,
-        tier_min_confidence=0.99, min_margin=0.99,
+        intent_classifier=classifier,
+        tier_classifier=classifier,
+        tier_min_confidence=0.99,
+        min_margin=0.99,
     )
     decision, _ = router.decide(_request())
     assert decision.final_tier == "c3"
@@ -371,11 +402,14 @@ def test_tier_choice_and_confidence_are_not_required_or_used(fields: dict[str, A
     assert FixedFourTierDecision.from_trace(decision.trace()) == decision
 
 
-@pytest.mark.parametrize("probabilities, expected", [
-    ({"c3": 0.5, "c2": 0.5, "c1": 0, "c0": 0}, "c2"),
-    ({"c3": 0.25, "c2": 0.25, "c1": 0.25, "c0": 0.25}, "c0"),
-    ({"c3": 0, "c2": 0, "c1": 0, "c0": 0}, "c0"),
-])
+@pytest.mark.parametrize(
+    "probabilities, expected",
+    [
+        ({"c3": 0.5, "c2": 0.5, "c1": 0, "c0": 0}, "c2"),
+        ({"c3": 0.25, "c2": 0.25, "c1": 0.25, "c0": 0.25}, "c0"),
+        ({"c3": 0, "c2": 0, "c1": 0, "c0": 0}, "c0"),
+    ],
+)
 def test_tier_argmax_ties_ignore_json_key_order(probabilities, expected) -> None:
     body = _response()
     body["answers"]["tier"]["probabilities"] = probabilities
@@ -412,8 +446,9 @@ def test_non_argmax_intent_uses_original_active_task_continue_fallback() -> None
     assert decision.intent.final == "continue"
     assert decision.intent.source == "fallback"
     assert decision.intent.reason == "invalid_classifier_result"
-    assert decision.final_tier == "c2"
-    assert decision.tier.run_status == "not_run"
+    assert decision.final_tier == "c3"
+    assert decision.tier.run_status == "ran"
+    assert decision.tier.reason == "classifier_argmax_selected"
     assert events[-1]["response"]["answers"]["intent"] == body["answers"]["intent"]
     assert events[-1]["response"]["answers"]["tier"]["choice"] == "c3"
 
@@ -459,8 +494,9 @@ def test_invalid_intent_probability_sum_uses_original_active_task_continue_fallb
     assert decision.intent.final == "continue"
     assert decision.intent.source == "fallback"
     assert decision.intent.reason == "invalid_classifier_result"
-    assert decision.final_tier == "c2"
-    assert decision.tier.run_status == "not_run"
+    assert decision.final_tier == "c3"
+    assert decision.tier.run_status == "ran"
+    assert decision.tier.reason == "classifier_argmax_selected"
     assert events[-1]["response"]["answers"]["intent"] == body["answers"]["intent"]
     assert events[-1]["response"]["answers"]["tier"]["choice"] == "c3"
 
@@ -508,3 +544,132 @@ def test_decision_rejects_fake_native_identity_and_mock_seed() -> None:
     identity["execution_mode"] = "native_embedded"
     with pytest.raises(ValueError, match="remote identity"):
         replace(decision, classifier_identity=identity)
+
+
+def _v3_trace(decision: FixedFourTierDecision) -> dict[str, Any]:
+    """Retain the v3 wire shape, which predates both quality audit fields."""
+    trace = decision.trace()
+    trace["schema_version"] = "fixed-four-tier-v2-v3"
+    trace.pop("quality_escalation_reason")
+    trace.pop("quality_escalation_used")
+    return trace
+
+
+@pytest.mark.parametrize(
+    "probabilities",
+    [
+        {"c3": 0.4, "c2": 0.4, "c1": 0.1, "c0": 0.1},
+        {"c3": 0.4, "c2": 0.4, "c1": 0.04, "c0": 0.01},
+        {"c0": 0.02, "c1": 0.07, "c2": 0.8, "c3": 0.1},
+    ],
+)
+def test_v3_jev_argmax_trace_preserves_ties_and_non_normalized_probabilities(
+    probabilities: dict[str, float],
+) -> None:
+    body = _response()
+    body["answers"]["tier"].update(choice="c3", probabilities=probabilities)
+    classifier, calls = _classifier(body)
+    decision, _ = FixedFourTierV2Router(
+        intent_classifier=classifier, tier_classifier=classifier
+    ).decide(_request())
+    trace = _v3_trace(decision)
+
+    restored = FixedFourTierDecision.from_trace(trace)
+
+    assert len(calls) == 1
+    assert restored.schema_version == "fixed-four-tier-v2-v3"
+    assert restored.classifier_backend == "jev"
+    assert restored.classifier_identity == classifier.identity
+    assert restored.feature_vector_status == "remote_evaluated"
+    assert restored.feature_vector_dim is None
+    assert restored.feature_input_audit.input_contract == "canonical_router_input"
+    assert restored.tier.probability_argmax is True
+    assert restored.tier.probabilities == probabilities
+    assert restored.final_tier == "c2"
+    assert restored.trace() == trace
+
+
+@pytest.mark.parametrize("mutation", ["selection_mode", "remote_status", "backend", "mock_seed"])
+def test_v3_jev_argmax_trace_remains_bound_to_remote_identity(mutation: str) -> None:
+    classifier, _ = _classifier()
+    decision, _ = FixedFourTierV2Router(
+        intent_classifier=classifier, tier_classifier=classifier
+    ).decide(_request())
+    trace = _v3_trace(decision)
+    if mutation == "selection_mode":
+        trace["classifier_identity"]["tier_selection_mode"] = "probability_argmax.v999"
+    elif mutation == "remote_status":
+        trace["feature_vector_status"] = "mock_not_materialized"
+    elif mutation == "backend":
+        trace["classifier_backend"] = "random_mock"
+    else:
+        trace["effective_mock_seed"] = 1
+
+    with pytest.raises(ValueError):
+        FixedFourTierDecision.from_trace(trace)
+
+
+def test_v3_jev_argmax_identity_does_not_relax_intent_tie_validation() -> None:
+    classifier, _ = _classifier(_response("redo", "c2"))
+    decision, _ = FixedFourTierV2Router(
+        intent_classifier=classifier, tier_classifier=classifier
+    ).decide(_request(), FixedFourTierTaskState("active", "c1", 1))
+    trace = _v3_trace(decision)
+    trace["intent"].update(
+        probabilities={"continue": 0.0, "redo": 0.5, "new_task": 0.5},
+        confidence=0.5,
+    )
+
+    with pytest.raises(ValueError):
+        FixedFourTierDecision.from_trace(trace)
+
+
+def test_v4_jev_intent_tie_uses_fixed_order_despite_vendor_choice() -> None:
+    body = _response("new_task", "c3")
+    body["answers"]["intent"].update(
+        confidence=0.99,
+        probabilities={"new_task": 0.4, "redo": 0.2, "continue": 0.4},
+    )
+    events: list[dict[str, Any]] = []
+    classifier, calls = _classifier(body, events=events)
+    decision, _ = FixedFourTierV2Router(
+        intent_classifier=classifier,
+        tier_classifier=classifier,
+        intent_min_confidence=0.99,
+        min_margin=0.99,
+    ).decide(_request(), FixedFourTierTaskState("active", "c1", 1))
+
+    assert len(calls) == 1
+    assert decision.intent.prediction == decision.intent.final == "continue"
+    assert decision.intent.confidence == 0.4
+    assert decision.final_tier == "c3"
+    assert decision.context_action == "keep"
+    assert events[-1]["response"]["answers"]["intent"]["choice"] == "new_task"
+    assert FixedFourTierDecision.from_trace(decision.trace()) == decision
+
+
+def test_v4_jev_quality_upgrade_preserves_non_normalized_tier_audit() -> None:
+    body = _response("continue", "c0")
+    probabilities = {"c0": 0.3, "c1": 0.2, "c2": 0.1, "c3": 0.05}
+    body["answers"]["tier"]["probabilities"] = probabilities
+    events: list[dict[str, Any]] = []
+    classifier, calls = _classifier(body, events=events)
+    decision, state = FixedFourTierV2Router(
+        intent_classifier=classifier, tier_classifier=classifier
+    ).decide(
+        _request(quality_failure_reason="validation_failure", quality_retry_budget_remaining=1),
+        FixedFourTierTaskState("active", "c1", 1),
+    )
+
+    assert len(calls) == 1
+    assert decision.tier.prediction == "c0"
+    assert decision.tier.probabilities == probabilities
+    assert decision.tier.probability_argmax is True
+    assert decision.tier.reason == "quality_failure_upgrade"
+    assert decision.final_tier == state.tier == "c2"
+    assert decision.quality_escalation_reason == "validation_failure"
+    assert decision.quality_escalation_used is True
+    assert decision.switch_reason == "continue_quality_upgrade"
+    assert decision.context_action == "keep"
+    assert events[-1]["response"]["answers"]["tier"]["probabilities"] == probabilities
+    assert FixedFourTierDecision.from_trace(decision.trace()) == decision

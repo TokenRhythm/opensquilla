@@ -105,6 +105,9 @@ def _request(
     tool_state: Mapping[str, Any] | None = None,
     attachments: tuple[Mapping[str, Any], ...] = (),
     input_message_id: str | None = None,
+    quality_failure_reason: str | None = None,
+    quality_retry_budget_remaining: int = 0,
+    quality_retry_already_used: bool = False,
     attachment_count: int = 0,
     attachment_modalities: tuple[str, ...] | None = None,
 ) -> RoutingRequest:
@@ -113,6 +116,9 @@ def _request(
         request_id=request_id,
         message=message,
         input_message_id=input_message_id,
+        quality_failure_reason=quality_failure_reason,
+        quality_retry_budget_remaining=quality_retry_budget_remaining,
+        quality_retry_already_used=quality_retry_already_used,
         control_event=control_event,
         task_anchor=task_anchor,
         user_history=user_history,
@@ -202,17 +208,24 @@ def test_first_request_is_new_task_and_skips_intent_classifier() -> None:
     assert snapshot["task_reset_mask"] is True
 
 
-def test_continue_keeps_tier_context_and_skips_tier_classifier() -> None:
+@pytest.mark.parametrize(
+    ("predicted_tier", "final_tier", "source"),
+    [("c0", "c1", "fallback"), ("c1", "c1", "classifier"), ("c3", "c3", "classifier")],
+)
+def test_continue_reclassifies_tier_without_downgrade_and_keeps_context(
+    predicted_tier: str,
+    final_tier: str,
+    source: str,
+) -> None:
     intent = _ScriptedIntentClassifier([_prediction("continue")])
-    tier = _ScriptedTierClassifier([_prediction("c1")])
+    tier = _ScriptedTierClassifier([_prediction("c1"), _prediction(predicted_tier)])
     router = FixedFourTierV2Router(
         intent_classifier=intent,
         tier_classifier=tier,
         route_id_factory=_id_factory("route"),
         task_id_factory=_id_factory("task"),
     )
-    first, state = router.decide(_request("request-1"))
-
+    first, state = router.decide(_request("request-1", input_message_id="input-1"))
     decision, next_state = router.decide(
         _request(
             "request-2",
@@ -226,17 +239,26 @@ def test_continue_keeps_tier_context_and_skips_tier_classifier() -> None:
     assert decision.task_id == first.task_id
     assert decision.intent.source == "classifier"
     assert decision.intent.final == "continue"
-    assert decision.tier.source == "not_run"
-    assert decision.tier.run_status == "not_run"
-    assert decision.tier.prediction is None
-    assert decision.tier.probabilities is None
-    assert decision.final_tier == "c1"
+    assert decision.tier.source == source
+    assert decision.tier.run_status == "ran"
+    assert decision.tier.prediction == predicted_tier
+    assert decision.tier.probabilities is not None
+    assert decision.tier_snapshot_hash is not None
+    assert decision.final_tier == final_tier
+    assert decision.switch_reason == ("continue_upgrade" if final_tier != "c1" else "continue_hold")
     assert decision.context_action == "keep"
     assert decision.history_turns_to_keep == 1
     assert next_state.version == 2
     assert next_state.turn_count == 2
-    assert len(tier.calls) == 1
-    json.dumps(decision.trace(provider="openrouter", model="model-c1"))
+    assert next_state.task_start_input_message_id == "input-1"
+    assert len(tier.calls) == 2
+    snapshot, allowed = tier.calls[1]
+    assert allowed == TIERS
+    assert snapshot.get("task_reset_mask", False) is False
+    assert snapshot["task_user_history"] == ["请处理这个请求"]
+    assert snapshot["previous_assistant_text"] == "第一轮回答"
+    trace = json.loads(json.dumps(decision.trace(provider="openrouter", model="model-c1")))
+    assert FixedFourTierDecision.from_trace(trace) == decision
 
 
 def test_explicit_redo_bypasses_intent_and_never_downgrades() -> None:
@@ -316,6 +338,7 @@ def test_classifier_failures_use_conservative_fallbacks() -> None:
     tier = _ScriptedTierClassifier(
         [
             RuntimeError("local tier unavailable"),
+            RuntimeError("local tier unavailable"),
         ]
     )
     router = FixedFourTierV2Router(
@@ -335,7 +358,8 @@ def test_classifier_failures_use_conservative_fallbacks() -> None:
     assert continued.intent.source == "fallback"
     assert continued.intent.run_status == "error"
     assert continued.intent.final == "continue"
-    assert continued.tier.run_status == "not_run"
+    assert continued.tier.run_status == "error"
+    assert continued.tier.source == "fallback"
     assert continued.final_tier == "c1"
 
 
@@ -351,7 +375,7 @@ def test_classifier_authorization_failure_is_not_downgraded_to_fallback() -> Non
         router.decide(_request("request-revoked"))
 
 
-def test_uncertain_redo_holds_current_tier() -> None:
+def test_low_confidence_redo_uses_argmax_and_upgrades() -> None:
     intent = _ScriptedIntentClassifier([])
     tier = _ScriptedTierClassifier(
         [
@@ -375,10 +399,10 @@ def test_uncertain_redo_holds_current_tier() -> None:
         state,
     )
 
-    assert decision.tier.source == "fallback"
+    assert decision.tier.source == "classifier"
     assert decision.tier.run_status == "ran"
-    assert decision.tier.reason == "classifier_uncertain"
-    assert decision.final_tier == "c1"
+    assert decision.tier.reason == "classifier_selected"
+    assert decision.final_tier == "c3"
 
 
 def test_seeded_random_mocks_are_replayable() -> None:
@@ -1080,6 +1104,8 @@ def test_legacy_mock_v2_decision_trace_remains_rehydratable() -> None:
     trace["schema_version"] = "fixed-four-tier-v2-mock-v2"
     trace.pop("classifier_backend")
     trace.pop("classifier_identity")
+    trace.pop("quality_escalation_reason")
+    trace.pop("quality_escalation_used")
 
     restored = FixedFourTierDecision.from_trace(trace)
 
@@ -1238,3 +1264,350 @@ def test_malformed_classifier_probabilities_fail_safe_without_fake_audit_values(
     assert decision.tier.reason == "invalid_classifier_result"
     assert decision.tier.probabilities is None
     assert decision.final_tier == "c1"
+
+
+def test_low_confidence_and_small_margin_select_argmax_for_both_heads() -> None:
+    intent = _ScriptedIntentClassifier(
+        [
+            _prediction(
+                "new_task",
+                confidence=0.34,
+                probabilities={"continue": 0.33, "redo": 0.33, "new_task": 0.34},
+            )
+        ]
+    )
+    tier = _ScriptedTierClassifier(
+        [
+            _prediction("c1"),
+            _prediction(
+                "c2",
+                confidence=0.26,
+                probabilities={"c0": 0.25, "c1": 0.25, "c2": 0.26, "c3": 0.24},
+            ),
+        ]
+    )
+    router = FixedFourTierV2Router(
+        intent_classifier=intent,
+        tier_classifier=tier,
+        intent_min_confidence=1.0,
+        tier_min_confidence=1.0,
+        min_margin=1.0,
+        task_id_factory=_id_factory("task"),
+    )
+    first, state = router.decide(_request("first"))
+    decision = router.route(_request("second", "unrelated request"), state)
+
+    assert decision.intent.source == "classifier"
+    assert decision.intent.final == "new_task"
+    assert decision.tier.source == "classifier"
+    assert decision.final_tier == "c2"
+    assert decision.task_id != first.task_id
+    assert decision.context_action == "reset"
+    assert FixedFourTierDecision.from_trace(decision.trace()) == decision
+
+
+def test_tied_probability_argmax_uses_fixed_class_order() -> None:
+    # Mapping insertion order must not decide tied classifications.
+    intent = _ScriptedIntentClassifier(
+        [
+            _prediction(
+                "continue",
+                confidence=1 / 3,
+                probabilities={"new_task": 1 / 3, "redo": 1 / 3, "continue": 1 / 3},
+            )
+        ]
+    )
+    tier = _ScriptedTierClassifier(
+        [
+            _prediction(
+                "c0",
+                confidence=0.25,
+                probabilities={"c3": 0.25, "c2": 0.25, "c1": 0.25, "c0": 0.25},
+            ),
+            _prediction(
+                "c2",
+                confidence=0.4,
+                probabilities={"c3": 0.4, "c2": 0.4, "c1": 0.1, "c0": 0.1},
+            ),
+        ]
+    )
+    router = FixedFourTierV2Router(intent_classifier=intent, tier_classifier=tier)
+    first, state = router.decide(_request("first"))
+    decision = router.route(_request("second"), state)
+
+    assert first.final_tier == "c0"
+    assert decision.intent.final == "continue"
+    assert decision.intent.source == "classifier"
+    assert decision.final_tier == "c2"
+    assert decision.tier.source == "classifier"
+    assert FixedFourTierDecision.from_trace(decision.trace()) == decision
+
+
+def test_ignored_confidence_thresholds_do_not_change_policy_hash() -> None:
+    def route(
+        intent_threshold: float, tier_threshold: float, margin: float
+    ) -> FixedFourTierDecision:
+        return FixedFourTierV2Router(
+            mock_seed=7,
+            intent_min_confidence=intent_threshold,
+            tier_min_confidence=tier_threshold,
+            min_margin=margin,
+            policy_config={
+                "intent_min_confidence": intent_threshold,
+                "tier_min_confidence": tier_threshold,
+                "min_margin": margin,
+            },
+        ).route(_request("same-request"))
+
+    assert route(0.0, 0.0, 0.0).policy_hash == route(1.0, 1.0, 1.0).policy_hash
+
+
+@pytest.mark.parametrize("reason", ["explicit_correction", "validation_failure", "no_progress"])
+def test_quality_failure_adds_one_tier_from_current_and_keeps_context(reason: str) -> None:
+    router = FixedFourTierV2Router(
+        intent_classifier=_ScriptedIntentClassifier([_prediction("continue")]),
+        tier_classifier=_ScriptedTierClassifier([_prediction("c1"), _prediction("c0")]),
+    )
+    first, state = router.decide(_request("first", input_message_id="anchor"))
+    decision, next_state = router.decide(
+        _request(
+            "second",
+            quality_failure_reason=reason,
+            quality_retry_budget_remaining=1,
+            user_history=("original request",),
+        ),
+        state,
+    )
+
+    assert decision.final_tier == "c2"
+    assert decision.task_id == first.task_id
+    assert decision.context_action == "keep"
+    assert next_state.task_start_input_message_id == "anchor"
+    trace = decision.trace()
+    assert trace["quality_escalation_used"] is True
+    assert trace["quality_escalation_reason"] == reason
+    assert FixedFourTierDecision.from_trace(trace) == decision
+
+
+@pytest.mark.parametrize(
+    ("current", "prediction", "budget", "used", "reason", "expected", "retry_used"),
+    [
+        ("c1", "c1", 0, False, "validation_failure", "c1", False),
+        ("c1", "c1", 1, True, "validation_failure", "c1", False),
+        ("c3", "c0", 1, False, "validation_failure", "c3", False),
+        ("c1", "c1", 1, False, None, "c1", False),
+        ("c0", "c2", 1, False, "validation_failure", "c2", False),
+    ],
+)
+def test_quality_retry_respects_budget_once_top_tier_and_does_not_stack(
+    current: str,
+    prediction: str,
+    budget: int,
+    used: bool,
+    reason: str | None,
+    expected: str,
+    retry_used: bool,
+) -> None:
+    router = FixedFourTierV2Router(
+        intent_classifier=_ScriptedIntentClassifier([_prediction("continue")]),
+        tier_classifier=_ScriptedTierClassifier([_prediction(current), _prediction(prediction)]),
+    )
+    _, state = router.decide(_request("first"))
+    decision = router.route(
+        _request(
+            "second",
+            quality_failure_reason=reason,
+            quality_retry_budget_remaining=budget,
+            quality_retry_already_used=used,
+        ),
+        state,
+    )
+
+    assert decision.final_tier == expected
+    assert decision.trace()["quality_escalation_used"] is retry_used
+    assert FixedFourTierDecision.from_trace(decision.trace()) == decision
+
+
+def test_new_task_quality_signal_does_not_upgrade_unrelated_task() -> None:
+    router = FixedFourTierV2Router(
+        tier_classifier=_ScriptedTierClassifier([_prediction("c1"), _prediction("c0")]),
+    )
+    _, state = router.decide(_request("first"))
+    decision = router.route(
+        _request(
+            "second",
+            control_event="new_task",
+            quality_failure_reason="explicit_correction",
+            quality_retry_budget_remaining=1,
+        ),
+        state,
+    )
+
+    assert decision.final_tier == "c0"
+    assert decision.context_action == "reset"
+    assert decision.trace()["quality_escalation_used"] is False
+
+
+def test_quality_retry_trace_rejects_invalid_or_forged_usage() -> None:
+    router = FixedFourTierV2Router(
+        tier_classifier=_ScriptedTierClassifier([_prediction("c1")]),
+    )
+    trace = router.route(_request("first")).trace()
+    for patch in (
+        {"quality_escalation_used": "true"},
+        {"quality_escalation_used": True, "quality_escalation_reason": "validation_failure"},
+        {"quality_escalation_reason": "rate_limit"},
+    ):
+        with pytest.raises(ValueError):
+            FixedFourTierDecision.from_trace({**trace, **patch})
+
+
+def test_legacy_v3_continue_trace_remains_readable_with_original_tier_audit() -> None:
+    router = FixedFourTierV2Router(
+        intent_classifier=_ScriptedIntentClassifier([_prediction("continue")]),
+        tier_classifier=_ScriptedTierClassifier([_prediction("c1"), _prediction("c1")]),
+    )
+    _, state = router.decide(_request("first"))
+    trace = router.route(_request("second"), state).trace()
+    trace["schema_version"] = "fixed-four-tier-v2-v3"
+    trace["tier_snapshot_hash"] = None
+    trace["tier"] = {
+        "source": "not_run",
+        "run_status": "not_run",
+        "prediction": None,
+        "probabilities": None,
+        "confidence": None,
+        "final": "c1",
+        "reason": "continue_keeps_current_tier",
+        "version": None,
+    }
+    trace.pop("quality_escalation_used", None)
+    trace.pop("quality_escalation_reason", None)
+
+    restored = FixedFourTierDecision.from_trace(trace)
+    assert restored.schema_version == "fixed-four-tier-v2-v3"
+    assert restored.tier.run_status == "not_run"
+    assert restored.context_action == "keep"
+
+    forged = copy.deepcopy(trace)
+    forged["final_tier"] = "c2"
+    forged["tier"]["final"] = "c2"
+    forged["switched"] = True
+    forged["switch_reason"] = "continue_upgrade"
+    with pytest.raises(ValueError):
+        FixedFourTierDecision.from_trace(forged)
+
+
+@pytest.mark.parametrize("field", ["quality_escalation_reason", "quality_escalation_used"])
+def test_v4_trace_requires_both_quality_audit_fields(field: str) -> None:
+    trace = FixedFourTierV2Router(mock_seed=7).route(_request("first")).trace()
+    del trace[field]
+
+    with pytest.raises(ValueError):
+        FixedFourTierDecision.from_trace(trace)
+
+
+def test_quality_escalation_cannot_replace_a_higher_classifier_prediction() -> None:
+    router = FixedFourTierV2Router(
+        intent_classifier=_ScriptedIntentClassifier([_prediction("continue")]),
+        tier_classifier=_ScriptedTierClassifier([_prediction("c1"), _prediction("c0")]),
+    )
+    _, state = router.decide(_request("first"))
+    trace = router.route(
+        _request(
+            "second",
+            quality_failure_reason="validation_failure",
+            quality_retry_budget_remaining=1,
+        ),
+        state,
+    ).trace()
+    trace["tier"]["prediction"] = "c3"
+    trace["tier"]["probabilities"] = {"c0": 0.0, "c1": 0.0, "c2": 0.0, "c3": 1.0}
+    trace["tier"]["confidence"] = 1.0
+
+    with pytest.raises(ValueError):
+        FixedFourTierDecision.from_trace(trace)
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"quality_failure_reason": "rate_limit"},
+        {"quality_retry_budget_remaining": True},
+        {"quality_retry_budget_remaining": -1},
+        {"quality_retry_budget_remaining": 1.0},
+        {"quality_retry_already_used": "false"},
+    ],
+)
+def test_quality_control_rejects_invalid_types_and_infrastructure_reasons(
+    patch: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        RoutingRequest(session_id="session-a", request_id="request-a", message="request", **patch)
+
+
+def test_quality_control_is_audited_without_entering_classifier_features() -> None:
+    intent = _ScriptedIntentClassifier([_prediction("continue")])
+    tier = _ScriptedTierClassifier([_prediction("c1"), _prediction("c1")])
+    router = FixedFourTierV2Router(intent_classifier=intent, tier_classifier=tier)
+    _, state = router.decide(_request("first"))
+    decision = router.route(
+        _request(
+            "second",
+            quality_failure_reason="validation_failure",
+            quality_retry_budget_remaining=1,
+        ),
+        state,
+    )
+
+    assert decision.trace()["quality_escalation_used"] is True
+    for snapshot in (intent.snapshots[0], tier.calls[1][0]):
+        assert "quality_escalation_control" not in snapshot
+        assert "quality_failure_reason" not in snapshot
+        assert "quality_retry_budget_remaining" not in snapshot
+        assert "quality_retry_already_used" not in snapshot
+
+
+def test_v4_continue_rejects_skipped_tier_classification() -> None:
+    router = FixedFourTierV2Router(
+        intent_classifier=_ScriptedIntentClassifier([_prediction("continue")]),
+        tier_classifier=_ScriptedTierClassifier([_prediction("c1"), _prediction("c1")]),
+    )
+    _, state = router.decide(_request("first"))
+    trace = router.route(_request("second"), state).trace()
+    trace["tier"] = {
+        "source": "not_run",
+        "run_status": "not_run",
+        "prediction": None,
+        "probabilities": None,
+        "confidence": None,
+        "final": "c1",
+        "reason": "continue_keeps_current_tier",
+        "version": None,
+    }
+    trace["tier_snapshot_hash"] = None
+
+    with pytest.raises(ValueError):
+        FixedFourTierDecision.from_trace(trace)
+
+
+@pytest.mark.parametrize("schema", ["fixed-four-tier-v2-v3", "fixed-four-tier-v2-mock-v2"])
+@pytest.mark.parametrize(
+    "patch",
+    [{"quality_escalation_reason": None}, {"quality_escalation_used": False}],
+)
+def test_old_trace_rejects_quality_field_injection(
+    schema: str,
+    patch: dict[str, object],
+) -> None:
+    trace = FixedFourTierV2Router(mock_seed=7).route(_request("first")).trace()
+    trace["schema_version"] = schema
+    trace.pop("quality_escalation_reason")
+    trace.pop("quality_escalation_used")
+    if schema == "fixed-four-tier-v2-mock-v2":
+        trace.pop("classifier_backend")
+        trace.pop("classifier_identity")
+    trace.update(patch)
+
+    with pytest.raises(ValueError):
+        FixedFourTierDecision.from_trace(trace)

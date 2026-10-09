@@ -344,7 +344,7 @@ def test_fixed_four_tier_compat_migration_is_always_run_and_idempotent(
     assert result.changed is True
     route = result.payload["llm_ensemble"]["four_tier_mapping"]
     assert route == {
-        "schema_version": "fixed-four-tier-v2-v3",
+        "schema_version": "fixed-four-tier-v2-v4",
         "classifier": {"backend": "random_mock", "seed": 17},
     }
     assert (
@@ -371,7 +371,7 @@ def test_fixed_four_tier_top_level_seed_normalizes_in_current_schema() -> None:
             "config_version": migration_module.LATEST_CONFIG_VERSION,
             "llm_ensemble": {
                 "four_tier_mapping": {
-                    "schema_version": "fixed-four-tier-v2-v3",
+                    "schema_version": "fixed-four-tier-v2-v4",
                     "mock_seed": 19,
                 }
             },
@@ -399,7 +399,7 @@ def test_v1_selection_only_four_tier_config_materializes_explicit_legacy_mock() 
     assert result.changed is True
     assert result.payload["config_version"] == 2
     assert result.payload["llm_ensemble"]["four_tier_mapping"] == {
-        "schema_version": "fixed-four-tier-v2-v3",
+        "schema_version": "fixed-four-tier-v2-v4",
         "classifier": {"backend": "random_mock"},
     }
     assert any("legacy random_mock" in change for change in result.changes)
@@ -435,7 +435,7 @@ def test_load_from_toml_persists_fixed_four_tier_compat_migration(
 
     route = cfg.llm_ensemble.four_tier_mapping
     assert route is not None
-    assert route.schema_version == "fixed-four-tier-v2-v3"
+    assert route.schema_version == "fixed-four-tier-v2-v4"
     assert route.mock_seed == 23
     [backup] = list(tmp_path.glob("config.toml.backup.*"))
     assert backup.read_text(encoding="utf-8") == original
@@ -443,7 +443,7 @@ def test_load_from_toml_persists_fixed_four_tier_compat_migration(
     migrated = tomllib.loads(toml_path.read_text(encoding="utf-8"))
     migrated_route = migrated["llm_ensemble"]["four_tier_mapping"]
     assert migrated_route == {
-        "schema_version": "fixed-four-tier-v2-v3",
+        "schema_version": "fixed-four-tier-v2-v4",
         "classifier": {"backend": "random_mock", "seed": 23},
     }
 
@@ -808,3 +808,92 @@ def test_gateway_config_accepts_text_only_tool_recovery_mode() -> None:
     cfg = GatewayConfig.model_validate({"text_only_tool_recovery_mode": "warn_model"})
 
     assert cfg.text_only_tool_recovery_mode == "warn_model"
+
+
+
+def test_four_tier_v3_migration_preserves_registered_classifier(tmp_path: Path) -> None:
+    classifier = {
+        "backend": "registered_model",
+        "artifact_root": str(tmp_path / "artifacts"),
+        "metadata_db": str(tmp_path / "models.sqlite"),
+        "model_set_id": "registered-test-router",
+        "expected_manifest_hash": "sha256:" + "a" * 64,
+        "allow_candidate": True,
+    }
+    payload = {
+        "config_version": migration_module.LATEST_CONFIG_VERSION,
+        "llm_ensemble": {
+            "four_tier_mapping": {
+                "schema_version": "fixed-four-tier-v2-v3",
+                "classifier": classifier,
+                "tier_min_confidence": 0.8,
+            },
+        },
+    }
+    original = copy.deepcopy(payload)
+    result = migration_module.migrate_config_payload(payload)
+    assert payload == original
+    route = result.payload["llm_ensemble"]["four_tier_mapping"]
+    assert route == {
+        "schema_version": "fixed-four-tier-v2-v4",
+        "classifier": classifier,
+        "tier_min_confidence": 0.8,
+    }
+    assert result.changed is True
+    assert result.removed_fields == ()
+    assert migration_module.migrate_config_payload(result.payload).changed is False
+
+
+def test_four_tier_v3_migration_without_classifier_stays_invalid() -> None:
+    result = migration_module.migrate_config_payload({
+        "llm_ensemble": {
+            "four_tier_mapping": {"schema_version": "fixed-four-tier-v2-v3"},
+        },
+    })
+    route = result.payload["llm_ensemble"]["four_tier_mapping"]
+    assert route == {"schema_version": "fixed-four-tier-v2-v4"}
+    with pytest.raises(ValidationError, match="classifier"):
+        GatewayConfig.model_validate(result.payload)
+
+
+
+def test_load_from_toml_persists_v3_upgrade_without_changing_registered_model(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "registered.toml"
+    original = "\n".join([
+        f"config_version = {migration_module.LATEST_CONFIG_VERSION}",
+        "[llm_ensemble]",
+        "enabled = true",
+        'mode = "single"',
+        'selection_mode = "four_tier_mapping"',
+        "[llm_ensemble.four_tier_mapping]",
+        'schema_version = "fixed-four-tier-v2-v3"',
+        "tier_min_confidence = 0.8",
+        "[llm_ensemble.four_tier_mapping.classifier]",
+        'backend = "registered_model"',
+        f'artifact_root = "{tmp_path / "artifacts"}"',
+        f'metadata_db = "{tmp_path / "models.sqlite"}"',
+        'model_set_id = "registered-test-router"',
+        'expected_manifest_hash = "sha256:' + "a" * 64 + '"',
+        "allow_candidate = true",
+        "",
+    ])
+    path.write_text(original)
+    cfg = GatewayConfig.load_from_toml(path)
+    route = cfg.llm_ensemble.four_tier_mapping
+    assert route is not None
+    assert route.schema_version == "fixed-four-tier-v2-v4"
+    assert route.classifier.backend == "registered_model"
+    assert route.classifier.model_set_id == "registered-test-router"
+    assert route.classifier.allow_candidate is True
+    assert route.tier_min_confidence == 0.8
+    migrated = tomllib.loads(path.read_text())["llm_ensemble"]["four_tier_mapping"]
+    assert migrated["schema_version"] == "fixed-four-tier-v2-v4"
+    assert migrated["classifier"]["backend"] == "registered_model"
+    [backup] = list(tmp_path.glob("registered.toml.backup.*"))
+    assert backup.read_text() == original
+    persisted = path.read_text()
+    GatewayConfig.load_from_toml(path)
+    assert path.read_text() == persisted
+    assert len(list(tmp_path.glob("registered.toml.backup.*"))) == 1

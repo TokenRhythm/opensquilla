@@ -300,7 +300,7 @@ def test_episode_mode_runs_production_intent_and_continuity_rules(tmp_path: Path
     assert decisions["a-continue"]["final_intent"] == "continue"
     assert decisions["a-continue"]["final_tier"] == "C1"
     assert decisions["a-continue"]["previous_tier"] == "C1"
-    assert decisions["a-continue"]["route_trace"]["tier"]["run_status"] == "not_run"
+    assert decisions["a-continue"]["route_trace"]["tier"]["run_status"] == "ran"
     assert decisions["m-redo"]["final_intent"] == "redo"
     assert decisions["m-redo"]["final_tier"] == "C3"
     assert decisions["m-redo"]["switch_reason"] == "redo_upgrade"
@@ -309,6 +309,7 @@ def test_episode_mode_runs_production_intent_and_continuity_rules(tmp_path: Path
     assert _FakeRegisteredModelClassifier.instances[0].calls == [
         ("initial", True),
         ("continue this", False),
+        ("continue this", True),
         ("upgrade on redo", True),
     ]
 
@@ -1066,3 +1067,55 @@ assert not any(
     )
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("schema_version", ["fixed-four-tier-v2-v3", "fixed-four-tier-v2-v4"])
+def test_worker_normalizes_complete_canonical_router_config(
+    tmp_path: Path, schema_version: str
+) -> None:
+    original = _config(tmp_path).model_dump(mode="json")
+    original["schema_version"] = schema_version
+    path = tmp_path / "config.json"
+    payload = worker.canonical_json_bytes(original)
+    path.write_bytes(payload)
+    config, input_bytes = worker._load_router_config(path)
+    assert input_bytes == payload
+    assert config.schema_version == "fixed-four-tier-v2-v4"
+    assert config.classifier.model_dump(mode="json") == original["classifier"]
+    assert path.read_bytes() == payload
+
+
+@pytest.mark.parametrize("schema_version", ["fixed-four-tier-v2-v3", "fixed-four-tier-v2-v4"])
+def test_worker_legacy_config_still_requires_complete_canonical_input(
+    tmp_path: Path, schema_version: str
+) -> None:
+    original = _config(tmp_path).model_dump(mode="json")
+    original["schema_version"] = schema_version
+    path = tmp_path / "config.json"
+    incomplete = json.loads(json.dumps(original))
+    incomplete["classifier"].pop("allow_candidate")
+    path.write_bytes(worker.canonical_json_bytes(incomplete))
+    with pytest.raises(worker.BenchmarkRouteOnlyError, match="complete canonical"):
+        worker._load_router_config(path)
+    path.write_text(json.dumps(original, indent=2))
+    with pytest.raises(worker.BenchmarkRouteOnlyError, match="canonical"):
+        worker._load_router_config(path)
+
+
+def test_worker_v3_and_v4_configs_execute_identical_policy(tmp_path: Path) -> None:
+    request_path = _artifacts(
+        tmp_path,
+        routing_session_mode="independent",
+        rows=[{"item_id": "a", "input": _route_input("hard problem")}],
+    )
+    config_path = Path(json.loads(request_path.read_bytes())["router_config"])
+    config = json.loads(config_path.read_bytes())
+    config["schema_version"] = "fixed-four-tier-v2-v3"
+    config_path.write_bytes(worker.canonical_json_bytes(config))
+    legacy = worker.run_route_only(request_path, tmp_path / "legacy")
+    legacy_decisions = (tmp_path / "legacy" / worker.DECISIONS_FILENAME).read_bytes()
+    config["schema_version"] = "fixed-four-tier-v2-v4"
+    config_path.write_bytes(worker.canonical_json_bytes(config))
+    current = worker.run_route_only(request_path, tmp_path / "current")
+    assert legacy == current
+    assert legacy_decisions == (tmp_path / "current" / worker.DECISIONS_FILENAME).read_bytes()

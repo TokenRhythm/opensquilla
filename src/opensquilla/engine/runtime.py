@@ -1415,6 +1415,51 @@ _FIXED_ROUTE_FAILURE_OUTCOME_RE: Final[re.Pattern[str]] = re.compile(
 )
 
 
+def _fixed_route_explicit_correction(message: str, previous_answer: str | None) -> bool:
+    """Accept an unnegated first-clause correction of the prior answer."""
+    if not previous_answer:
+        return False
+    if re.match(r"^\s*(?:不对|错了|答错了)(?:$|[，,。.！!\s])", message):
+        return True
+    evaluation = re.match(
+        r"^\s*(?:(?P<chinese>"
+        r"(?:你(?:的|刚才(?:的)?)|刚才(?:的)?|上(?:一|个)(?:轮)?(?:的)?)\s*"
+        r"(?:回答|答案|计算|结果|推理))|"
+        r"(?:your(?: previous)?|the previous|that)\s+"
+        r"(?:answer|response|calculation|result))",
+        message,
+        re.IGNORECASE,
+    )
+    if evaluation is None:
+        return False
+    # Evaluate only the clause describing this answer. Later task instructions,
+    # quoted examples, or a negation about a different result are not evidence.
+    assessment = re.split(r"[，,。！？.!?;；\n]", message[evaluation.end() :], maxsplit=1)[0]
+    if evaluation.group("chinese") is not None:
+        negated = re.search(
+            r"(?:没有|没|并非|不是|不算|无).{0,4}(?:错误|错|不对|有误|不正确)|"
+            r"(?:不需要|无需|不用)(?:再)?(?:纠正|修正|重算)",
+            assessment,
+        )
+        return negated is None and bool(
+            re.search(r"^.{0,12}(?:不对|有误|错误|错了|不正确)", assessment)
+        )
+    negated = re.search(
+        r"\b(?:not|never)\s+(?:(?:necessarily|entirely|completely|actually|really|"
+        r"at|all|been)\s+){0,3}(?:wrong|incorrect|invalid)\b|"
+        r"\bno\s+(?:(?:major|obvious|actual|real)\s+)?errors?\b",
+        assessment,
+        re.IGNORECASE,
+    )
+    return negated is None and bool(
+        re.search(
+            r"^.{0,20}\b(?:wrong|incorrect|invalid)\b",
+            assessment,
+            re.IGNORECASE,
+        )
+    )
+
+
 def _fixed_route_tool_call_names(value: Any) -> tuple[str, ...]:
     """Extract only observable tool names from a persisted assistant row."""
 
@@ -3081,6 +3126,36 @@ class _SelectorFallbackProvider:
                 return False
         self._retry_scope_local_remaining[scope_id] = remaining - physical_request_count
         return True
+
+    def quality_retry_remaining(self, scope_id: str) -> int:
+        remaining = self._retry_scope_local_remaining.get(scope_id)
+        return remaining if isinstance(remaining, int) and not isinstance(remaining, bool) else 0
+
+    def reserve_quality_retry(self, scope_id: str) -> bool:
+        if (
+            scope_id not in self._retry_scope_provider_bindings
+            or self._retry_scope_provider_bindings[scope_id] is not None
+        ):
+            return False
+        return self.reserve_provider_retry_physical_request(scope_id)
+
+    def refund_quality_retry(self, scope_id: str) -> None:
+        # Only reservations against this local, non-native ledger are eligible.
+        if self._retry_scope_provider_bindings.get(scope_id) is None:
+            self._retry_scope_local_remaining[scope_id] = self.quality_retry_remaining(scope_id) + 1
+
+    async def prepare_quality_retry(
+        self,
+        reason: str,
+        scope_id: str,
+        remaining_budget: int,
+        messages: Sequence[Any],
+    ) -> dict[str, Any] | None:
+        callback = self.__dict__.get("_quality_retry_callback")
+        if not callable(callback) or self.quality_retry_remaining(scope_id) <= 0:
+            return None
+        result = await callback(reason, scope_id, remaining_budget, messages)
+        return cast(dict[str, Any] | None, result)
 
     def can_handoff_provider_retry_scope_to(
         self,
@@ -9494,9 +9569,15 @@ class TurnRunner:
                         "four_tier_mapping regenerate child has no exact task boundary",
                         reason="redo_child_task_boundary_unavailable",
                     )
+                parent_retry = parent_decision.route_trace.get("quality_retry")
+                parent_effective_tier = (
+                    parent_retry["to_tier"]
+                    if isinstance(parent_retry, Mapping)
+                    else parent_decision.final_tier
+                )
                 task_state = FixedFourTierTaskState(
                     task_id=parent_decision.task_id,
-                    tier=cast(Tier, parent_decision.final_tier),
+                    tier=cast(Tier, parent_effective_tier),
                     # The stored index is the pre-route task count. Reusing it
                     # makes the regenerated turn replace, rather than append
                     # after, the original answer in the semantic task.
@@ -9739,9 +9820,18 @@ class TurnRunner:
                 recent_routes = recent_routes[-5:]
         route_history: list[dict[str, Any]] = []
         for historical_route in recent_routes:
-            history_entry: dict[str, Any] = {
-                "tier_id": str(getattr(historical_route, "final_tier", "") or "").upper()
-            }
+            historical_trace = getattr(historical_route, "route_trace", None)
+            historical_retry = (
+                historical_trace.get("quality_retry")
+                if isinstance(historical_trace, Mapping)
+                else None
+            )
+            effective_history_tier = (
+                historical_retry.get("to_tier")
+                if isinstance(historical_retry, Mapping) and historical_retry.get("used") is True
+                else getattr(historical_route, "final_tier", "")
+            )
+            history_entry: dict[str, Any] = {"tier_id": str(effective_history_tier or "").upper()}
             tier_audit = getattr(historical_route, "tier", None)
             probabilities = (
                 tier_audit.get("probabilities") if isinstance(tier_audit, Mapping) else None
@@ -10114,7 +10204,15 @@ class TurnRunner:
                 reason="decision_persistence_failed",
             ) from exc
 
-        try:
+        async def _prepare_fixed_tier_provider(
+            target_provider: str,
+            target_model: str,
+            reasoning: str,
+            deployment_version: str,
+            metadata: dict[str, Any],
+            *,
+            working_context_tokens: int = 0,
+        ) -> tuple[Any, Any, int, int, str, int, int, int, int, Any, int]:
             if not target_provider or not target_model or reasoning not in {"thinking", "max"}:
                 raise FixedFourTierRoutingError(
                     "four_tier_mapping selected tier is incomplete",
@@ -10240,6 +10338,7 @@ class TurnRunner:
             current_input_tokens = metadata.get("material_estimated_tokens")
             if not isinstance(current_input_tokens, int) or isinstance(current_input_tokens, bool):
                 current_input_tokens = max(1, (len(turn.semantic_message) + 3) // 4)
+            current_input_tokens = max(current_input_tokens, working_context_tokens)
             from opensquilla.session.compaction import (
                 estimate_entry_model_replay_tokens,
             )
@@ -10352,6 +10451,40 @@ class TurnRunner:
                 guarded_provider,
                 direct_selector,
                 turn_metadata=metadata,
+            )
+            return (
+                direct_provider,
+                selected_config,
+                max_tokens,
+                context_window,
+                context_window_source,
+                estimated_input_tokens,
+                history_tokens,
+                system_tokens,
+                estimated_total_tokens,
+                capabilities,
+                tool_schema_tokens,
+            )
+
+        try:
+            (
+                direct_provider,
+                selected_config,
+                max_tokens,
+                context_window,
+                context_window_source,
+                estimated_input_tokens,
+                history_tokens,
+                system_tokens,
+                estimated_total_tokens,
+                capabilities,
+                tool_schema_tokens,
+            ) = await _prepare_fixed_tier_provider(
+                target_provider,
+                target_model,
+                reasoning,
+                deployment_version,
+                metadata,
             )
         except asyncio.CancelledError:
             await _finish_required_cancel_cleanup(
@@ -10527,6 +10660,170 @@ class TurnRunner:
                 "provider_after_rewrite": target_provider,
             }
         )
+
+        async def _quality_retry(
+            reason: str,
+            scope_id: str,
+            remaining_budget: int,
+            messages: Sequence[Any],
+        ) -> dict[str, Any] | None:
+            # The original classification stays immutable.  This is an
+            # execution retry, authorized only by concrete quality evidence.
+            live_trace = metadata.get("fixed_four_tier_v2_decision")
+            if (
+                reason not in {"explicit_correction", "validation_failure", "no_progress"}
+                or remaining_budget <= 0
+                or not isinstance(live_trace, Mapping)
+                or live_trace.get("quality_retry") is not None
+                or live_trace.get("schema_version") != SCHEMA_VERSION
+                or live_trace.get("quality_escalation_used") is True
+                or decision.final_tier == "c3"
+            ):
+                return None
+            from opensquilla.engine.routing.fixed_four_tier_v2 import TIERS
+
+            upgraded_tier = TIERS[TIERS.index(decision.final_tier) + 1]
+            upgraded_config = tiers.get(upgraded_tier)
+            upgraded_provider = (
+                str(getattr(upgraded_config, "provider", "") or "").strip().casefold()
+            )
+            upgraded_model = str(getattr(upgraded_config, "model", "") or "").strip()
+            upgraded_reasoning = (
+                str(getattr(upgraded_config, "reasoning", "") or "").strip().casefold()
+            )
+            upgraded_version = str(getattr(upgraded_config, "deployment_version", "") or "").strip()
+            candidate_metadata = dict(metadata)
+            context_tokens = max(
+                1,
+                len(
+                    json.dumps(
+                        [message.model_dump(mode="json") for message in messages],
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                )
+                // 3,
+            )
+            try:
+                (
+                    candidate,
+                    candidate_config,
+                    candidate_max_tokens,
+                    candidate_window,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    candidate_capabilities,
+                    _,
+                ) = await _prepare_fixed_tier_provider(
+                    upgraded_provider,
+                    upgraded_model,
+                    upgraded_reasoning,
+                    upgraded_version,
+                    candidate_metadata,
+                    working_context_tokens=context_tokens,
+                )
+                # Reserve from the existing wrapper scope only after preflight.
+                # It refuses native-scope handoffs whose balance is unproven.
+                if not direct_provider.reserve_quality_retry(scope_id):
+                    return None
+                retry_trace = {
+                    "from_tier": decision.final_tier,
+                    "to_tier": upgraded_tier,
+                    "reason": reason,
+                    "used": True,
+                    "provider": upgraded_provider,
+                    "model": upgraded_model,
+                    "reasoning": upgraded_reasoning,
+                    "deployment_version": upgraded_version or None,
+                    "additional_requests_reserved": 1,
+                    "budget_remaining": direct_provider.quality_retry_remaining(scope_id),
+                    "preflight": "passed",
+                }
+                quality_cancelled = False
+                commit_task = asyncio.create_task(
+                    session_manager.commit_fixed_four_tier_quality_upgrade(
+                        route_id=decision.route_id,
+                        expected_version=durable_next_state.version,
+                        quality_retry=retry_trace,
+                        updated_at_ms=time.time_ns() // 1_000_000,
+                    )
+                )
+                try:
+                    committed = await asyncio.shield(commit_task)
+                except asyncio.CancelledError:
+                    quality_cancelled = True
+                    try:
+                        committed = await _finish_required_cancel_cleanup(commit_task)
+                    except BaseException:
+                        direct_provider.refund_quality_retry(scope_id)
+                        raise
+                except BaseException:
+                    direct_provider.refund_quality_retry(scope_id)
+                    raise
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("fixed_four_tier_v2.quality_retry_refused", exc_info=True)
+                return None
+            # The CAS write precedes activation. No provider request is started
+            # during construction, and assignments below cannot fail.
+            candidate_guard = candidate.primary
+            current_guard = direct_provider.primary
+            for name in (
+                "_fixed_route_confirmed_physical_requests",
+                "_fixed_route_executed_provider",
+                "_fixed_route_executed_model",
+            ):
+                setattr(candidate_guard, name, getattr(current_guard, name, None))
+            candidate_guard._turn_metadata = metadata
+            direct_provider._provider = candidate_guard
+            direct_provider._selector = candidate._selector
+            effective_trace = copy.deepcopy(dict(live_trace))
+            effective_trace["quality_retry"] = retry_trace
+            effective_trace["state_version_after"] = committed.version
+            metadata["fixed_four_tier_v2_decision"] = effective_trace
+            metadata.update(
+                {
+                    "routed_tier": upgraded_tier,
+                    "routed_model": upgraded_model,
+                    "routed_provider": upgraded_provider,
+                    "fixed_four_tier_v2_selected_provider": upgraded_provider,
+                    "fixed_four_tier_v2_selected_model": upgraded_model,
+                    "_router_single_frozen_catalog": candidate_guard.router_single_frozen_catalog,
+                    "_router_single_managed_provider_thinking_level": (
+                        "high" if upgraded_reasoning == "thinking" else "max"
+                    ),
+                    "requested_provider": upgraded_provider,
+                    "requested_model": upgraded_model,
+                    "resolved_model": upgraded_model,
+                }
+            )
+            if quality_cancelled:
+                raise asyncio.CancelledError
+            from opensquilla.engine.types import ThinkingLevel
+
+            return {
+                "model_id": upgraded_model,
+                "provider_id": upgraded_provider,
+                "max_tokens": candidate_max_tokens,
+                "context_window_tokens": candidate_window,
+                "model_capabilities": candidate_capabilities,
+                "thinking": ThinkingLevel.HIGH
+                if upgraded_reasoning == "thinking"
+                else ThinkingLevel.MAX,
+            }
+
+        if (
+            task_state is not None
+            and decision.intent.final != "new_task"
+            and decision.final_tier == task_state.tier
+            and _fixed_route_explicit_correction(route_request.message, previous_assistant_text)
+        ):
+            metadata["_fixed_four_tier_explicit_correction"] = True
+        direct_provider._quality_retry_callback = _quality_retry
         # Initial pipeline metadata describes the pre-route provider; neither
         # it nor this resolver may claim physical execution before chat starts.
         metadata.pop("executed_provider", None)

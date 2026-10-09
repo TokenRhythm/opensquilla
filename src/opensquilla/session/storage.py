@@ -1021,6 +1021,67 @@ def _fixed_four_tier_claim_decision_identity_mismatches(
     return mismatches
 
 
+def _validate_fixed_four_tier_quality_retry(trace: Mapping[str, Any]) -> None:
+    retry = trace.get("quality_retry")
+    if retry is None:
+        return
+    from opensquilla.engine.routing.fixed_four_tier_v2 import (
+        FIXED_FOUR_TIER_DEPLOYMENT_SPECS,
+        SCHEMA_VERSION,
+    )
+
+    if (
+        trace.get("schema_version") != SCHEMA_VERSION
+        or trace.get("quality_escalation_used") is True
+    ):
+        raise ValueError("four_tier_mapping quality retry requires an unused v4 decision")
+    tiers = ("c0", "c1", "c2", "c3")
+    if not isinstance(retry, Mapping):
+        raise ValueError("four_tier_mapping quality retry must be an object")
+    if set(retry) != {
+        "from_tier",
+        "to_tier",
+        "reason",
+        "used",
+        "provider",
+        "model",
+        "reasoning",
+        "deployment_version",
+        "additional_requests_reserved",
+        "budget_remaining",
+        "preflight",
+    }:
+        raise ValueError("four_tier_mapping quality retry shape is incompatible")
+    source = retry.get("from_tier")
+    target = retry.get("to_tier")
+    if (
+        source != trace.get("final_tier")
+        or source not in tiers[:-1]
+        or target != tiers[tiers.index(source) + 1]
+        or retry.get("reason") not in {"explicit_correction", "validation_failure", "no_progress"}
+        or retry.get("used") is not True
+        or retry.get("preflight") != "passed"
+        or retry.get("additional_requests_reserved") != 1
+        or isinstance(retry.get("additional_requests_reserved"), bool)
+        or isinstance(retry.get("budget_remaining"), bool)
+        or not isinstance(retry.get("budget_remaining"), int)
+        or retry["budget_remaining"] < 0
+        or retry.get("reasoning") not in {"thinking", "max"}
+        or any(
+            not isinstance(retry.get(key), str) or not retry[key].strip()
+            for key in ("provider", "model")
+        )
+        or trace.get("state_committed") is not True
+    ):
+        raise ValueError("four_tier_mapping quality retry evidence is invalid")
+    target_spec = next(spec for spec in FIXED_FOUR_TIER_DEPLOYMENT_SPECS if spec[0] == target)
+    if (
+        tuple(retry.get(key) for key in ("provider", "model", "reasoning", "deployment_version"))
+        != target_spec[1:]
+    ):
+        raise ValueError("four_tier_mapping quality retry deployment is incompatible")
+
+
 def _validate_fixed_four_tier_decision_trace(
     trace: object,
     *,
@@ -1153,6 +1214,8 @@ def _validate_fixed_four_tier_decision_trace(
                 or session_key_hash != hashlib.sha256(session_key.encode("utf-8")).hexdigest()
             ):
                 raise ValueError("four_tier_mapping decision session key hash is inconsistent")
+
+        _validate_fixed_four_tier_quality_retry(trace)
 
         preflight = trace.get("preflight")
         if not is_legacy_trace and (
@@ -6647,6 +6710,114 @@ class SessionStorage:
                     )
         return state
 
+    async def commit_fixed_four_tier_quality_upgrade(
+        self,
+        *,
+        route_id: str,
+        expected_version: int,
+        quality_retry: dict[str, Any],
+        updated_at_ms: int,
+    ) -> FixedFourTierState:
+        """CAS one execution-only upgrade, retaining the original classification."""
+        if (
+            not isinstance(route_id, str)
+            or not route_id.strip()
+            or isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version <= 0
+            or isinstance(updated_at_ms, bool)
+            or not isinstance(updated_at_ms, int)
+            or updated_at_ms < 0
+        ):
+            raise ValueError("invalid four_tier_mapping quality retry identity")
+        async with self._write_transaction("commit_fixed_four_tier_quality_upgrade") as conn:
+            async with conn.execute(
+                "SELECT * FROM fixed_four_tier_decisions WHERE route_id = ?",
+                (route_id,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise FixedFourTierStateConflictError("quality retry route is unavailable")
+            record = _deserialize_fixed_four_tier_decision_row(dict(row))
+            trace = copy.deepcopy(record["route_trace"])
+            _validate_fixed_four_tier_decision_trace(trace, persisted_row=record)
+            if (
+                record.get("execution_status") != "pending"
+                or record.get("state_committed") is not True
+                or trace.get("quality_retry") is not None
+                or record.get("state_version_after") != expected_version
+            ):
+                raise FixedFourTierStateConflictError("quality retry route is not eligible")
+            async with conn.execute(
+                "SELECT * FROM fixed_four_tier_states WHERE session_id = ?",
+                (record["session_id"],),
+            ) as cur:
+                state_row = await cur.fetchone()
+            if state_row is None:
+                raise FixedFourTierStateConflictError("quality retry task is unavailable")
+            state = _strict_fixed_four_tier_model(
+                FixedFourTierState,
+                _deserialize_row(dict(state_row)),
+                subject="task state",
+            )
+            async with conn.execute(
+                "SELECT session_id, epoch FROM sessions WHERE session_key = ?",
+                (state.session_key,),
+            ) as cur:
+                session = await cur.fetchone()
+            async with conn.execute(
+                "SELECT status, lease_expires_at_ms FROM fixed_four_tier_request_claims "
+                "WHERE claim_id = ? AND route_id = ?",
+                (record["claim_id"], route_id),
+            ) as cur:
+                claim = await cur.fetchone()
+            if (
+                state.version != expected_version
+                or state.last_route_id != route_id
+                or state.session_epoch != record["session_epoch"]
+                or state.last_request_id != record["request_id"]
+                or state.task_turn_count != record["task_turn_index"] + 1
+                or state.task_start_input_message_id != record["task_start_input_message_id"]
+                or state.task_id != record["task_id"]
+                or state.tier != record["final_tier"]
+                or session is None
+                or session["session_id"] != state.session_id
+                or int(session["epoch"] or 0) != state.session_epoch
+                or claim is None
+                or claim["status"] != "materialized"
+                or int(claim["lease_expires_at_ms"]) <= updated_at_ms
+            ):
+                raise FixedFourTierStateConflictError("quality retry task changed before commit")
+            trace["quality_retry"] = copy.deepcopy(quality_retry)
+            trace["state_version_after"] = expected_version + 1
+            prospective = {
+                **record,
+                "route_trace": trace,
+                "state_version_after": expected_version + 1,
+            }
+            _validate_fixed_four_tier_decision_trace(trace, persisted_row=prospective)
+            state.tier = quality_retry["to_tier"]
+            state.version += 1
+            state.updated_at_ms = updated_at_ms
+            await conn.execute(
+                "UPDATE fixed_four_tier_states SET tier = ?, version = ?, updated_at_ms = ? "
+                "WHERE session_id = ? AND version = ? AND last_route_id = ?",
+                (
+                    state.tier,
+                    state.version,
+                    updated_at_ms,
+                    state.session_id,
+                    expected_version,
+                    route_id,
+                ),
+            )
+            await conn.execute(
+                "UPDATE fixed_four_tier_decisions SET route_trace = ?, state_version_after = ?, "
+                "updated_at_ms = ? WHERE route_id = ?",
+                (_serialize(trace), state.version, updated_at_ms, route_id),
+            )
+        return state
+
     async def settle_fixed_four_tier_decision(
         self,
         *,
@@ -6793,6 +6964,10 @@ class SessionStorage:
                 raise FixedFourTierStateConflictError(
                     "four_tier_mapping pending decision has no active request claim"
                 )
+            if route_trace is not None and route_trace.get("quality_retry") != decoded_existing[
+                "route_trace"
+            ].get("quality_retry"):
+                raise FixedFourTierStateConflictError("quality retry receipt is immutable")
             prospective_decision = {**decoded_existing, **fields}
             if terminal and decoded_existing.get("terminal_at_ms") is not None:
                 prospective_decision["terminal_at_ms"] = decoded_existing["terminal_at_ms"]

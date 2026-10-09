@@ -279,7 +279,7 @@ def test_fixed_four_tier_v2_defaults_match_the_frozen_ladder() -> None:
     route = cfg.llm_ensemble.four_tier_mapping
     assert route is not None
     assert route.mock_seed == 20260826
-    assert route.schema_version == "fixed-four-tier-v2-v3"
+    assert route.schema_version == "fixed-four-tier-v2-v4"
     assert route.classifier == FixedFourTierV2RandomMockClassifierConfig(seed=20260826)
     assert route.model_dump(mode="json")["classifier"] == {
         "backend": "random_mock",
@@ -616,7 +616,7 @@ def test_fixed_four_tier_legacy_config_migrates_without_mutating_input(
 
     assert legacy == original
     assert migrated is not None
-    assert migrated.schema_version == "fixed-four-tier-v2-v3"
+    assert migrated.schema_version == "fixed-four-tier-v2-v4"
     assert migrated.classifier == FixedFourTierV2RandomMockClassifierConfig(seed=17)
     assert migrated.mock_seed == 17
     assert {tier: deployment.deployment_version for tier, deployment in migrated.tiers.items()} == {
@@ -3285,3 +3285,38 @@ def test_tree_baseline_uses_shared_session_pinned_profile_pool(
         assert second_keys == ({key_a, key_b} - {first_key})
     finally:
         reset_profile_credential_pools()
+
+
+@pytest.mark.parametrize("schema_version", ["fixed-four-tier-v2-v3", "fixed-four-tier-v2-v4"])
+def test_four_tier_config_upgrade_preserves_registered_identity(
+    tmp_path: Path, schema_version: str
+) -> None:
+    classifier = {
+        "backend": "registered_model",
+        "artifact_root": str(tmp_path / "artifacts"),
+        "metadata_db": str(tmp_path / "models.sqlite"),
+        "model_set_id": "registered-test-router",
+        "expected_manifest_hash": "sha256:" + "a" * 64,
+        "allow_candidate": True,
+    }
+    payload = {
+        "schema_version": schema_version,
+        "classifier": classifier,
+        "intent_min_confidence": 0.9,
+        "tier_min_confidence": 0.8,
+        "min_margin": 0.4,
+    }
+    original = copy.deepcopy(payload)
+    route = FixedFourTierV2Config.model_validate(payload)
+    assert payload == original
+    assert route.schema_version == "fixed-four-tier-v2-v4"
+    assert isinstance(route.classifier, FixedFourTierV2RegisteredModelClassifierConfig)
+    assert route.classifier.model_dump(mode="json") == classifier
+    assert route.intent_min_confidence == 0.9
+    assert route.tier_min_confidence == 0.8
+    assert route.min_margin == 0.4
+
+
+def test_four_tier_v3_upgrade_does_not_invent_mock_classifier() -> None:
+    with pytest.raises(ValidationError, match="classifier"):
+        FixedFourTierV2Config.model_validate({"schema_version": "fixed-four-tier-v2-v3"})

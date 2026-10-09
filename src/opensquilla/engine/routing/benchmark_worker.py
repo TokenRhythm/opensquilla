@@ -53,6 +53,7 @@ from pydantic import (
 from opensquilla import __version__ as opensquilla_version
 from opensquilla.engine.routing.fixed_four_tier_v2 import (
     FIXED_FOUR_TIER_DEPLOYMENT_SPECS,
+    SCHEMA_VERSION,
     FixedFourTierTaskState,
     FixedFourTierV2Router,
     RoutingRequest,
@@ -202,9 +203,11 @@ class _RegisteredClassifierConfig(_FrozenModel):
 
 
 class _FourTierConfig(_FrozenModel):
-    schema_version: Literal["fixed-four-tier-v2-v3"]
+    # Validate original canonical bytes before normalizing v3 to current policy.
+    schema_version: Literal["fixed-four-tier-v2-v3", "fixed-four-tier-v2-v4"]
     classifier: _RegisteredClassifierConfig
     default_new_task_tier: Literal["c0", "c1", "c2", "c3"]
+    # Compatibility fields: current routing uses argmax without these gates.
     intent_min_confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     tier_min_confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     min_margin: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
@@ -827,9 +830,10 @@ def _load_router_config(path: Path) -> tuple[_FourTierConfig, bytes]:
         ) from exc
     if canonical_json_bytes(config.model_dump(mode="json")) != payload:
         raise BenchmarkRouteOnlyError(
-            "router config must be the complete canonical current-version policy"
+            "router config must be the complete canonical policy"
         )
-    return config, payload
+    # Keep the supplied bytes as provenance; execute the normalized v4 policy.
+    return config.model_copy(update={"schema_version": SCHEMA_VERSION}), payload
 
 
 def _load_model_pool(

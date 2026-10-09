@@ -1894,7 +1894,10 @@ async def test_fixed_route_replay_rejects_tampered_duplicate_semantic_column(
         await storage.close()
 
 
-async def test_fixed_route_replay_accepts_legacy_mock_v2_trace_with_matching_row() -> None:
+@pytest.mark.parametrize("legacy_schema", ["fixed-four-tier-v2-mock-v2", "fixed-four-tier-v2-v3"])
+async def test_fixed_route_replay_accepts_legacy_trace_with_matching_row(
+    legacy_schema: str,
+) -> None:
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -1931,25 +1934,28 @@ async def test_fixed_route_replay_accepts_legacy_mock_v2_trace_with_matching_row
             updated_at_ms=1_500,
         )
         legacy_trace = dict(committed_trace)
-        legacy_trace["schema_version"] = "fixed-four-tier-v2-mock-v2"
-        legacy_trace.pop("classifier_backend")
-        legacy_trace.pop("classifier_identity")
-        for field_name in (
-            "session_id",
-            "session_epoch",
-            "claim_id",
-            "execution_id",
-            "session_key_hash",
-            "input_message_id",
-            "task_start_input_message_id",
-            "redo_parent_route_id",
-            "state_version_before",
-            "provider",
-            "model",
-            "reasoning",
-            "deployment_version",
-        ):
-            legacy_trace.pop(field_name)
+        legacy_trace["schema_version"] = legacy_schema
+        legacy_trace.pop("quality_escalation_used", None)
+        legacy_trace.pop("quality_escalation_reason", None)
+        if legacy_schema == "fixed-four-tier-v2-mock-v2":
+            legacy_trace.pop("classifier_backend")
+            legacy_trace.pop("classifier_identity")
+            for field_name in (
+                "session_id",
+                "session_epoch",
+                "claim_id",
+                "execution_id",
+                "session_key_hash",
+                "input_message_id",
+                "task_start_input_message_id",
+                "redo_parent_route_id",
+                "state_version_before",
+                "provider",
+                "model",
+                "reasoning",
+                "deployment_version",
+            ):
+                legacy_trace.pop(field_name)
         async with storage._write_transaction("test_seed_legacy_fixed_route") as conn:
             await conn.execute(
                 """
@@ -1958,7 +1964,7 @@ async def test_fixed_route_replay_accepts_legacy_mock_v2_trace_with_matching_row
                 WHERE route_id = ?
                 """,
                 (
-                    "fixed-four-tier-v2-mock-v2",
+                    legacy_schema,
                     json.dumps(legacy_trace),
                     decision.route_id,
                 ),
@@ -1973,7 +1979,7 @@ async def test_fixed_route_replay_accepts_legacy_mock_v2_trace_with_matching_row
         )
 
         assert restored is not None
-        assert restored.route_trace["schema_version"] == "fixed-four-tier-v2-mock-v2"
+        assert restored.route_trace["schema_version"] == legacy_schema
         assert [record.route_id for record in history] == [decision.route_id]
     finally:
         await storage.close()
@@ -2239,3 +2245,173 @@ async def test_startup_reconciliation_rolls_back_claim_and_decision_together(
         ).fetchone()
     assert claim_status == ("materialized",)
     assert decision_status == ("pending",)
+
+
+async def _quality_committed_storage() -> tuple[Any, Any, Any, Any]:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session = await manager.create("agent:main:quality-commit")
+    claim = _claim(
+        session,
+        claim_id="quality-claim",
+        execution_id="quality-execution",
+        claimed_at_ms=1000,
+        lease_expires_at_ms=20000,
+    )
+    assert (await storage.claim_fixed_four_tier_request(claim))[0]
+    record = _decision(session, claim)
+    assert record.final_tier == "c1"
+    await storage.stage_fixed_four_tier_decision(record)
+    state = FixedFourTierState(
+        session_id=session.session_id,
+        session_key=session.session_key,
+        session_epoch=session.epoch,
+        version=1,
+        task_id=record.task_id,
+        tier=record.final_tier,
+        task_turn_count=record.task_turn_index + 1,
+        task_start_input_message_id=record.task_start_input_message_id,
+        last_request_id=record.request_id,
+        last_route_id=record.route_id,
+        updated_at_ms=2000,
+    )
+    await storage.commit_fixed_four_tier_decision(
+        route_id=record.route_id,
+        state=state,
+        expected_version=None,
+        route_trace=_committed_trace(record.route_trace, state_version=1),
+        updated_at_ms=2000,
+    )
+    return storage, manager, session, record
+
+
+def _quality_receipt() -> dict[str, Any]:
+    return {
+        "from_tier": "c1",
+        "to_tier": "c2",
+        "reason": "validation_failure",
+        "used": True,
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-pro",
+        "reasoning": "max",
+        "deployment_version": "deepseek-v4-pro-0731",
+        "additional_requests_reserved": 1,
+        "budget_remaining": 0,
+        "preflight": "passed",
+    }
+
+
+async def test_quality_upgrade_is_atomic_once_and_retains_original_decision() -> None:
+    storage, manager, session, record = await _quality_committed_storage()
+    try:
+        from opensquilla.engine.routing.fixed_four_tier_v2 import FIXED_FOUR_TIER_DEPLOYMENT_SPECS
+
+        receipt = _quality_receipt()
+        receipt["deployment_version"] = next(
+            spec[4] for spec in FIXED_FOUR_TIER_DEPLOYMENT_SPECS if spec[0] == "c2"
+        )
+        upgraded = await manager.commit_fixed_four_tier_quality_upgrade(
+            route_id=record.route_id, expected_version=1, quality_retry=receipt, updated_at_ms=3000
+        )
+        assert upgraded.tier == "c2" and upgraded.version == 2 and upgraded.task_turn_count == 1
+        assert upgraded.task_id == record.task_id
+        saved = await storage.get_fixed_four_tier_decision_by_route(record.route_id)
+        assert saved.final_tier == "c1" and saved.route_trace["quality_retry"] == receipt
+        with pytest.raises(FixedFourTierStateConflictError):
+            await storage.commit_fixed_four_tier_quality_upgrade(
+                route_id=record.route_id,
+                expected_version=2,
+                quality_retry=receipt,
+                updated_at_ms=3001,
+            )
+        assert (await storage.get_fixed_four_tier_state(session.session_id)).tier == "c2"
+        changed = dict(saved.route_trace)
+        del changed["quality_retry"]
+        with pytest.raises(FixedFourTierStateConflictError, match="immutable"):
+            await storage.settle_fixed_four_tier_decision(
+                route_id=record.route_id,
+                execution_status="succeeded",
+                route_trace=changed,
+                updated_at_ms=4000,
+            )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize(
+    "mutation", ["jump", "deployment", "schema", "budget_bool", "already_used"]
+)
+async def test_quality_upgrade_invalid_evidence_keeps_state_unchanged(mutation: str) -> None:
+    storage, manager, session, record = await _quality_committed_storage()
+    try:
+        from opensquilla.engine.routing.fixed_four_tier_v2 import FIXED_FOUR_TIER_DEPLOYMENT_SPECS
+
+        receipt = _quality_receipt()
+        receipt["deployment_version"] = next(
+            spec[4] for spec in FIXED_FOUR_TIER_DEPLOYMENT_SPECS if spec[0] == "c2"
+        )
+        if mutation == "jump":
+            receipt["to_tier"] = "c3"
+        if mutation == "deployment":
+            receipt["model"] = "unapproved/model"
+        if mutation == "budget_bool":
+            receipt["budget_remaining"] = False
+        if mutation == "schema":
+            receipt["unexpected"] = True
+        if mutation == "already_used":
+            # A stale expected version must fail before touching either table.
+            expected_version = 2
+        else:
+            expected_version = 1
+        with pytest.raises((ValueError, FixedFourTierStateConflictError)):
+            await storage.commit_fixed_four_tier_quality_upgrade(
+                route_id=record.route_id,
+                expected_version=expected_version,
+                quality_retry=receipt,
+                updated_at_ms=3000,
+            )
+        current = await storage.get_fixed_four_tier_state(session.session_id)
+        assert current.tier == "c1" and current.version == 1
+        saved = await storage.get_fixed_four_tier_decision_by_route(record.route_id)
+        assert "quality_retry" not in saved.route_trace
+        injected = {**saved.route_trace, "quality_retry": receipt}
+        with pytest.raises(FixedFourTierStateConflictError, match="immutable"):
+            await storage.settle_fixed_four_tier_decision(
+                route_id=record.route_id,
+                execution_status="failed",
+                route_trace=injected,
+                updated_at_ms=4000,
+            )
+    finally:
+        await storage.close()
+
+
+async def test_quality_upgrade_rejects_legacy_v3_receipt() -> None:
+    storage, manager, session, record = await _quality_committed_storage()
+    try:
+        saved = await storage.get_fixed_four_tier_decision_by_route(record.route_id)
+        legacy_trace = dict(saved.route_trace)
+        legacy_trace["schema_version"] = "fixed-four-tier-v2-v3"
+        legacy_trace.pop("quality_escalation_reason")
+        legacy_trace.pop("quality_escalation_used")
+        await storage.conn.execute(
+            "UPDATE fixed_four_tier_decisions SET route_trace = ?, config_version = ? "
+            "WHERE route_id = ?",
+            (json.dumps(legacy_trace), "fixed-four-tier-v2-v3", record.route_id),
+        )
+        await storage.conn.commit()
+        assert (
+            await storage.get_fixed_four_tier_decision_by_route(record.route_id)
+        ).config_version == "fixed-four-tier-v2-v3"
+        with pytest.raises(ValueError):
+            await storage.commit_fixed_four_tier_quality_upgrade(
+                route_id=record.route_id,
+                expected_version=1,
+                quality_retry=_quality_receipt(),
+                updated_at_ms=3000,
+            )
+        current = await storage.get_fixed_four_tier_state(session.session_id)
+        assert current.tier == "c1" and current.version == 1
+    finally:
+        await storage.close()

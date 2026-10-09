@@ -68,6 +68,8 @@ class _Runner:
         self.prediction_schema_version = "local_routing_prediction.v1"
         self.intent_decision = "continue"
         self.tier_decision = "C2"
+        self.intent_probabilities = {"new_task": 0.05, "continue": 0.9, "redo": 0.05}
+        self.tier_probabilities = {"C0": 0.1, "C1": 0.2, "C2": 0.6, "C3": 0.1}
         self.identity = SimpleNamespace(
             model_dump=lambda **_: {
                 "schema_version": "local_runner_identity.v2",
@@ -97,8 +99,8 @@ class _Runner:
         return SimpleNamespace(
             schema_version=self.prediction_schema_version,
             identity=self.identity,
-            intent_probabilities={"new_task": 0.05, "continue": 0.9, "redo": 0.05},
-            tier_probabilities={"C0": 0.1, "C1": 0.2, "C2": 0.6, "C3": 0.1},
+            intent_probabilities=self.intent_probabilities,
+            tier_probabilities=self.tier_probabilities,
             intent_decision=self.intent_decision,
             tier_decision=self.tier_decision,
         )
@@ -387,3 +389,57 @@ def test_registered_model_close_closes_reader_when_runner_close_fails(
     classifier.close()
     assert classifier._runner.close_calls == 1
     assert _Registry.instances[0].close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("head", "probabilities", "decision", "expected"),
+    [
+        (
+            "intent",
+            {"new_task": 0.34, "continue": 0.33, "redo": 0.33},
+            "new_task",
+            "new_task",
+        ),
+        (
+            "tier",
+            {"C0": 0.25, "C1": 0.25, "C2": 0.26, "C3": 0.24},
+            "C2",
+            "c2",
+        ),
+        (
+            "intent",
+            {"redo": 1 / 3, "new_task": 1 / 3, "continue": 1 / 3},
+            "continue",
+            "continue",
+        ),
+        (
+            "intent",
+            {"redo": 1 / 3, "new_task": 1 / 3, "continue": 1 / 3},
+            "new_task",
+            "continue",
+        ),
+        (
+            "tier",
+            {"C3": 0.25, "C2": 0.25, "C1": 0.25, "C0": 0.25},
+            "C0",
+            "c0",
+        ),
+    ],
+)
+def test_registered_model_accepts_low_probability_and_fixed_order_tied_argmax(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    head: str,
+    probabilities: dict[str, float],
+    decision: str,
+    expected: str,
+) -> None:
+    classifier = _load(monkeypatch, tmp_path)
+    setattr(classifier._runner, f"{head}_probabilities", probabilities)
+    setattr(classifier._runner, f"{head}_decision", decision)
+    snapshot = {"router_input": {"current_request": "route me"}}
+
+    result = classifier.predict(snapshot, None if head == "intent" else ("c0", "c1", "c2", "c3"))
+    assert result.label == expected
+    assert result.confidence == pytest.approx(max(probabilities.values()))
+    classifier.close()
