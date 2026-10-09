@@ -24,6 +24,7 @@ from opensquilla.provider.video_generation import (
     VideoGenerationPending,
     VideoGenerationResult,
     VideoGenerationSubmissionUnknown,
+    VideoJobAcceptedCallback,
     _publish_video_without_clobber,
 )
 from opensquilla.provider.video_generation_policy import is_valid_video_generation_base_url
@@ -160,6 +161,7 @@ async def _submit(
     aspect_ratio: str | None,
     resolution: str | None,
     deadline: float,
+    on_job_accepted: VideoJobAcceptedCallback | None = None,
 ) -> str:
     parameters: dict[str, object] = {"durationSeconds": str(duration)}
     if aspect_ratio is not None:
@@ -185,15 +187,18 @@ async def _submit(
                     payload = await _read_json(response)
                 except VideoGenerationError:
                     raise VideoGenerationSubmissionUnknown() from None
+                try:
+                    job_id = _safe_operation(payload.get("name"), model=model)
+                except VideoGenerationError:
+                    raise VideoGenerationSubmissionUnknown() from None
+                if on_job_accepted is not None:
+                    on_job_accepted(job_id)
     except httpx.HTTPError as exc:
         redacted_httpx_error(exc, api_key=api_key)
         raise VideoGenerationSubmissionUnknown() from None
     except TimeoutError:
         raise VideoGenerationSubmissionUnknown() from None
-    try:
-        return _safe_operation(payload.get("name"), model=model)
-    except VideoGenerationError:
-        raise VideoGenerationSubmissionUnknown() from None
+    return job_id
 
 
 def _error_text(value: object, *, api_key: str) -> str:
@@ -502,6 +507,7 @@ async def generate_gemini_video(
     timeout_seconds: float = 600.0,
     poll_interval_seconds: float = 10.0,
     max_bytes: int = _DEFAULT_MAX_BYTES,
+    on_job_accepted: VideoJobAcceptedCallback | None = None,
 ) -> VideoGenerationResult:
     """Submit one Veo request, poll its operation, then save the first MP4."""
 
@@ -537,6 +543,7 @@ async def generate_gemini_video(
             aspect_ratio=aspect_ratio,
             resolution=resolution,
             deadline=deadline,
+            on_job_accepted=on_job_accepted,
         )
         return await _complete_job(
             client,

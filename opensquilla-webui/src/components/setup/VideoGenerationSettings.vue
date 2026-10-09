@@ -95,6 +95,8 @@ const fallbackSuggestedModels: Record<ConfiguredVideoProvider, string[]> = {
 }
 const catalogProviders = ref<Partial<Record<ConfiguredVideoProvider, {
   label: string
+  baseUrl: string
+  apiKeyEnv: string
   defaultModel: string
   models: string[]
 }>>>({})
@@ -119,6 +121,12 @@ const providerDefaults: Record<ConfiguredVideoProvider, { baseUrl: string; apiKe
     apiKeyEnv: 'QWEN_TOKEN_PLAN_API_KEY',
   },
   tokenrhythm: { baseUrl: 'https://tokenrhythm.studio/v1', apiKeyEnv: 'TOKENRHYTHM_API_KEY' },
+}
+function providerDefaultConnection(id: ConfiguredVideoProvider): VideoProviderConnection {
+  return {
+    baseUrl: catalogProviders.value[id]?.baseUrl || providerDefaults[id].baseUrl,
+    apiKeyEnv: catalogProviders.value[id]?.apiKeyEnv || providerDefaults[id].apiKeyEnv,
+  }
 }
 const credentialHintKeys: Record<ConfiguredVideoProvider, string> = {
   openrouter: 'setup.video.openrouterCredentialHint',
@@ -234,7 +242,7 @@ const credentialStatus = computed(() => {
   }
   if (isCustomProviderOrigin(provider.value, baseUrl.value.trim())) {
     const selectedEnv = apiKeyEnv.value.trim()
-    return selectedEnv && selectedEnv !== providerDefaults[provider.value].apiKeyEnv
+    return selectedEnv && selectedEnv !== providerDefaultConnection(provider.value).apiKeyEnv
       ? t('setup.video.customCredentialHint', { name: selectedEnv })
       : t('setup.video.customCredentialMissingHint')
   }
@@ -244,13 +252,14 @@ const credentialStatus = computed(() => {
 const credentialHint = computed(() => {
   if (!isVideoProvider(provider.value)) return t('setup.video.credentialHint')
   const selectedEnv = apiKeyEnv.value.trim()
-  const configured = providerDefaults[provider.value]
+  const configured = providerDefaultConnection(provider.value)
   if (isCustomProviderOrigin(provider.value, baseUrl.value.trim())) {
     return selectedEnv && selectedEnv !== configured.apiKeyEnv
       ? t('setup.video.customCredentialHint', { name: selectedEnv })
       : t('setup.video.customCredentialMissingHint')
   }
-  if (selectedEnv && selectedEnv !== configured.apiKeyEnv) {
+  if (selectedEnv && (selectedEnv !== configured.apiKeyEnv
+    || configured.apiKeyEnv !== providerDefaults[provider.value].apiKeyEnv)) {
     return t('setup.video.selectedEnvCredentialHint', { name: selectedEnv })
   }
   return t(credentialHintKeys[provider.value])
@@ -270,7 +279,7 @@ function providerOrigin(endpoint: string): string {
 function isCustomProviderOrigin(id: ConfiguredVideoProvider, endpoint: string): boolean {
   if (!endpoint) return false
   try {
-    return providerOrigin(endpoint) !== providerOrigin(providerDefaults[id].baseUrl)
+    return providerOrigin(endpoint) !== providerOrigin(providerDefaultConnection(id).baseUrl)
   } catch {
     return false
   }
@@ -282,6 +291,18 @@ function providerDraft(): VideoProviderDraft {
     baseUrl: baseUrl.value.trim(),
     apiKeyEnv: apiKeyEnv.value.trim(),
   }
+}
+
+function savedCredentialAvailable(
+  id: ConfiguredVideoProvider,
+  connection: VideoProviderConnection,
+): boolean {
+  const savedConnection = savedProviderDrafts.get(id)
+  // Gateway credential status describes the saved connection, not draft edits.
+  return credentialOptions.value[id]?.available === true
+    && connection.baseUrl.trim() === savedConnection?.baseUrl
+    && connection.apiKeyEnv.trim() === savedConnection?.apiKeyEnv
+    && !(provider.value === id && clearDirectKeyRequested.value)
 }
 
 function providerSettingsDraft(): Partial<Record<ConfiguredVideoProvider, VideoProviderConnection>> {
@@ -344,6 +365,8 @@ async function loadProviderCatalog(): Promise<void> {
       next[id] = {
         label: typeof entry.label === 'string' && entry.label.trim()
           ? entry.label : fallbackVideoProviders.find(item => item.id === id)!.label,
+        baseUrl: typeof entry.defaultBaseUrl === 'string' ? entry.defaultBaseUrl.trim() : '',
+        apiKeyEnv: typeof entry.envKey === 'string' ? entry.envKey.trim() : '',
         defaultModel,
         models: suggestions.length ? suggestions : defaultModel ? [defaultModel] : fallbackSuggestedModels[id],
       }
@@ -463,7 +486,7 @@ function providerConnectionError(
   }
   const origin = providerOrigin(endpoint)
   if ((Object.keys(providerDefaults) as ConfiguredVideoProvider[]).some(other => (
-    other !== id && providerOrigin(providerDefaults[other].baseUrl) === origin
+    other !== id && providerOrigin(providerDefaultConnection(other).baseUrl) === origin
   ))) return t('setup.video.invalidBaseUrl')
   const selectedEnv = connection.apiKeyEnv.trim()
   if (selectedEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(selectedEnv)) {
@@ -475,7 +498,7 @@ function providerConnectionError(
   const savedDirectKey = storedDirectKeys.value.has(id)
   const replacementEnv = Boolean(savedConnection && selectedEnv
     && selectedEnv !== savedConnection.apiKeyEnv
-    && selectedEnv !== providerDefaults[id].apiKeyEnv)
+    && selectedEnv !== providerDefaultConnection(id).apiKeyEnv)
   if (savedDirectKey && !directKeyEntered && !clearRequested && savedConnection
     && endpoint !== savedConnection.baseUrl && !replacementEnv) {
     return t('setup.video.existingDirectKeyEndpointChanged')
@@ -483,8 +506,9 @@ function providerConnectionError(
   const keepsSavedDirectKey = savedDirectKey && !clearRequested && savedConnection
     && endpoint === savedConnection.baseUrl
     && selectedEnv === savedConnection.apiKeyEnv
-  if (isCustomProviderOrigin(id, endpoint) && !directKeyEntered && !keepsSavedDirectKey && (
-    !selectedEnv || selectedEnv === providerDefaults[id].apiKeyEnv
+  if (isCustomProviderOrigin(id, endpoint) && !directKeyEntered && !keepsSavedDirectKey
+    && !savedCredentialAvailable(id, connection) && (
+    !selectedEnv || selectedEnv === providerDefaultConnection(id).apiKeyEnv
   )) return t('setup.video.customEndpointNeedsEnv')
   return ''
 }

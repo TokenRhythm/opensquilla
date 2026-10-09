@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
@@ -30,6 +31,9 @@ _JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
 _ASPECT_RATIOS = {"16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "21:9", "9:21"}
 _RESOLUTIONS = {"480p", "720p", "1080p", "1K", "2K", "4K"}
+
+# Called synchronously once a valid provider job ID is known, before further awaits.
+VideoJobAcceptedCallback = Callable[[str], None]
 
 
 class VideoGenerationError(RuntimeError):
@@ -333,6 +337,7 @@ async def _submit(
     aspect_ratio: str | None,
     resolution: str | None,
     deadline: float,
+    on_job_accepted: VideoJobAcceptedCallback | None = None,
 ) -> tuple[str, str, dict[str, object]]:
     body: dict[str, object] = {"model": model, "prompt": prompt, "duration": duration}
     if aspect_ratio is not None:
@@ -354,14 +359,16 @@ async def _submit(
                     payload = await _read_json(response)
                 except VideoGenerationError:
                     raise VideoGenerationSubmissionUnknown() from None
+                try:
+                    job_id = _safe_job_id(payload.get("id"))
+                except VideoGenerationError:
+                    raise VideoGenerationSubmissionUnknown() from None
+                if on_job_accepted is not None:
+                    on_job_accepted(job_id)
     except httpx.HTTPError as exc:
         redacted_httpx_error(exc, api_key=api_key)
         raise VideoGenerationSubmissionUnknown() from None
     except TimeoutError:
-        raise VideoGenerationSubmissionUnknown() from None
-    try:
-        job_id = _safe_job_id(payload.get("id"))
-    except VideoGenerationError:
         raise VideoGenerationSubmissionUnknown() from None
     polling_url = _polling_url(api_root, job_id, payload.get("polling_url"))
     return job_id, polling_url, payload
@@ -591,6 +598,7 @@ async def generate_openrouter_video(
     timeout_seconds: float = 600.0,
     poll_interval_seconds: float = 30.0,
     max_bytes: int = _DEFAULT_MAX_BYTES,
+    on_job_accepted: VideoJobAcceptedCallback | None = None,
 ) -> VideoGenerationResult:
     """Submit exactly one paid request, then poll and save its first MP4 output."""
 
@@ -644,6 +652,7 @@ async def generate_openrouter_video(
             aspect_ratio=aspect_ratio,
             resolution=resolution,
             deadline=deadline,
+            on_job_accepted=on_job_accepted,
         )
         return await _complete_job(
             client,

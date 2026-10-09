@@ -6,28 +6,10 @@ import ipaddress
 from urllib.parse import urlsplit
 
 from opensquilla.endpoint_identity import base_url_allows_credential_reuse
-from opensquilla.provider.qwen_token_plan import (
-    QWEN_TOKEN_PLAN_API_KEY_ENV,
-    QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
+from opensquilla.video_generation_defaults import (
+    VIDEO_GENERATION_DEFAULT_ENV_KEYS,
+    VIDEO_GENERATION_OFFICIAL_BASE_URLS,
 )
-
-VIDEO_GENERATION_OFFICIAL_BASE_URLS: dict[str, str] = {
-    "openrouter": "https://openrouter.ai/api/v1",
-    "gemini": "https://generativelanguage.googleapis.com/v1beta",
-    "xai": "https://api.x.ai/v1",
-    "qwen": "https://dashscope.aliyuncs.com/api/v1",
-    "tokenrhythm": "https://tokenrhythm.studio/v1",
-    "qwen_token_plan": QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
-}
-
-VIDEO_GENERATION_DEFAULT_ENV_KEYS: dict[str, str] = {
-    "openrouter": "OPENROUTER_API_KEY",
-    "gemini": "GEMINI_API_KEY",
-    "xai": "XAI_API_KEY",
-    "qwen": "DASHSCOPE_API_KEY",
-    "tokenrhythm": "TOKENRHYTHM_API_KEY",
-    "qwen_token_plan": QWEN_TOKEN_PLAN_API_KEY_ENV,
-}
 
 
 def is_valid_video_generation_base_url(value: str) -> bool:

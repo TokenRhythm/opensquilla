@@ -211,6 +211,9 @@ and no job ID was returned, do not automatically retry: a second request
 could create and charge for another video. If the MP4 was saved but artifact
 registration fails, the result reports `generated_delivery_failed` and keeps
 the workspace path.
+Once a provider returns a valid job ID, the Gateway retains its job record
+even if the turn is stopped or times out. Recovery still requires that ID;
+stopping before a tool result does not return it to the Agent automatically.
 For non-owner callers, resuming a job requires the same Gateway process to
 retain its job record and the same provider credential; a restart or credential
 rotation can prevent recovery. A retained job keeps its original provider and

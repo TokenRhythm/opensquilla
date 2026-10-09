@@ -18,6 +18,7 @@ from opensquilla.provider.video_generation import (
     VideoGenerationPending,
     VideoGenerationResult,
     VideoGenerationSubmissionUnknown,
+    VideoJobAcceptedCallback,
 )
 from opensquilla.provider.video_generation_policy import is_valid_video_generation_base_url
 from opensquilla.secrets import clean_header_secret
@@ -129,6 +130,7 @@ async def _submit(
     aspect_ratio: str,
     resolution: str,
     deadline: float,
+    on_job_accepted: VideoJobAcceptedCallback | None = None,
 ) -> str:
     body = {
         "model": model,
@@ -155,15 +157,18 @@ async def _submit(
                     payload = await _read_json(response)
                 except VideoGenerationError:
                     raise VideoGenerationSubmissionUnknown() from None
+                try:
+                    job_id = _safe_task_id(payload.get("id"))
+                except VideoGenerationError:
+                    raise VideoGenerationSubmissionUnknown() from None
+                if on_job_accepted is not None:
+                    on_job_accepted(job_id)
     except httpx.HTTPError as exc:
         redacted_httpx_error(exc, api_key=api_key)
         raise VideoGenerationSubmissionUnknown() from None
     except TimeoutError:
         raise VideoGenerationSubmissionUnknown() from None
-    try:
-        return _safe_task_id(payload.get("id"))
-    except VideoGenerationError:
-        raise VideoGenerationSubmissionUnknown() from None
+    return job_id
 
 
 async def _poll_until_complete(
@@ -287,6 +292,7 @@ async def generate_tokenrhythm_video(
     timeout_seconds: float = 600.0,
     poll_interval_seconds: float = 10.0,
     max_bytes: int = _DEFAULT_MAX_BYTES,
+    on_job_accepted: VideoJobAcceptedCallback | None = None,
 ) -> VideoGenerationResult:
     api_root = _api_root(base_url)
     secret = clean_header_secret(api_key, label="TokenRhythm video API key")
@@ -320,6 +326,7 @@ async def generate_tokenrhythm_video(
             aspect_ratio=aspect_ratio or "16:9",
             resolution=resolution or "720p",
             deadline=deadline,
+            on_job_accepted=on_job_accepted,
         )
         return await _complete_job(
             client,

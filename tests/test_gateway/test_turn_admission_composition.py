@@ -148,7 +148,8 @@ methods = (
 assert rpc_chat._turn_admission_adapter_factory is rpc_sessions.build_gateway_turn_admission_adapter
 registry = get_dispatcher()
 # Includes durable receipts and execution logs after workflow and agent admin retirement.
-assert len(registry.list_methods()) == 269
+assert len(registry.list_methods()) == 270
+assert registry.get_entry("onboarding.videoGeneration.models.discover") is not None
 assert registry.get_entry("router.feedback.submit") is None
 assert registry.get_entry("router.selflearning.status") is None
 assert registry.get_entry("workspaces.references.read") is not None

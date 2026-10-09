@@ -28,8 +28,8 @@ from opensquilla.application.config_secrets import (
 from opensquilla.application.config_secrets import (
     restore_redacted_values as _restore_redacted_values,
 )
-from opensquilla.provider.environment import environment_value
-from opensquilla.provider.video_generation_policy import VIDEO_GENERATION_OFFICIAL_BASE_URLS
+from opensquilla.environment import environment_value
+from opensquilla.video_generation_defaults import VIDEO_GENERATION_OFFICIAL_BASE_URLS
 
 type SettingsValue = (
     None | bool | int | float | str | list["SettingsValue"] | dict[str, "SettingsValue"]

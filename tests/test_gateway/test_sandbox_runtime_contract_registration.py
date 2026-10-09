@@ -159,7 +159,8 @@ PRODUCTION_HANDLER_NAMES = {
 def test_production_registry_uses_contract_wrappers_without_surface_drift() -> None:
     registry = get_dispatcher()
 
-    assert len(registry.list_methods()) == 269
+    assert len(registry.list_methods()) == 270
+    assert registry.get_entry("onboarding.videoGeneration.models.discover") is not None
     assert registry.get_entry("router.feedback.submit") is None
     assert registry.get_entry("router.selflearning.status") is None
     assert registry.get_entry("workspaces.references.read") is not None

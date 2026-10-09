@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
+import hmac
 import io
 import json
 import os
 import re
+import secrets
 import threading
 import uuid
-from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -31,10 +31,6 @@ from opensquilla.attachment_workspace import (
 )
 from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_BYTES
 from opensquilla.contracts.image_validation import validate_image_bytes
-from opensquilla.endpoint_identity import (
-    base_url_allows_credential_reuse,
-    credential_env_for_endpoint,
-)
 from opensquilla.engine.usage_accounting import (
     account_provider_stream,
     current_usage_accounting_scope,
@@ -82,18 +78,28 @@ from opensquilla.provider.image_generation_credentials import (
     resolve_image_generation_credential,
 )
 from opensquilla.provider.image_generation_policy import (
-    IMAGE_GENERATION_OFFICIAL_BASE_URLS,
     conflicting_image_generation_endpoint_provider,
     is_valid_image_generation_base_url,
-    resolve_image_generation_base_url,
 )
 from opensquilla.provider.protocol import provider_metadata
 from opensquilla.provider.types import ChatConfig, derive_provider_request_correlation
+from opensquilla.provider.video_generation_credentials import (
+    VideoGenerationCredential as _VideoCredential,
+)
+from opensquilla.provider.video_generation_credentials import (
+    resolve_video_generation_credential,
+)
+from opensquilla.provider.video_generation_credentials import (
+    video_generation_base_url as _video_base_url,
+)
+from opensquilla.provider.video_generation_credentials import (
+    video_generation_credential_status as video_generation_credential_status,
+)
+from opensquilla.provider.video_generation_credentials import (
+    video_generation_provider as _video_provider,
+)
 from opensquilla.provider.video_generation_policy import (
-    VIDEO_GENERATION_DEFAULT_ENV_KEYS,
     VIDEO_GENERATION_OFFICIAL_BASE_URLS,
-    conflicting_video_generation_endpoint_provider,
-    is_valid_video_generation_base_url,
 )
 from opensquilla.sandbox.operation_runtime import SandboxOperation, SandboxToolDescriptor
 from opensquilla.tools.fetch_work import run_blocking_fetch_work
@@ -129,15 +135,7 @@ _video_gateway_config: Any | None = None
 _video_job_sessions: dict[str, _VideoJobReceipt] = {}
 _video_job_sessions_lock = threading.Lock()
 _MAX_TRACKED_VIDEO_JOBS = 1024
-
-
-@dataclass(frozen=True)
-class _VideoCredential:
-    available: bool
-    api_key: str = field(default="", repr=False)
-    env_key: str = ""
-    source: str = "none"
-    owner: str = "none"
+_VIDEO_JOB_FINGERPRINT_KEY = secrets.token_bytes(32)
 
 
 @dataclass(frozen=True)
@@ -1019,114 +1017,6 @@ def _resolve_video_generation_config() -> Any:
     return VideoGenerationConfig()
 
 
-def _video_provider(config: Any) -> str:
-    provider = str(getattr(config, "provider", "") or "").strip().lower()
-    if not provider and str(getattr(config, "primary", "") or "").strip():
-        # Legacy configs contained only an OpenRouter model ID.
-        return "openrouter"
-    return provider
-
-
-def _video_provider_config(config: Any, provider: str) -> Any | None:
-    providers = getattr(config, "providers", None)
-    return getattr(providers, provider, None) if providers is not None else None
-
-
-def _video_base_url(config: Any, provider: str) -> str:
-    default = VIDEO_GENERATION_OFFICIAL_BASE_URLS.get(provider, "")
-    selected = _video_provider_config(config, provider)
-    return str(getattr(selected, "base_url", default) or default).strip()
-
-
-def _video_env_was_authored(
-    provider: str, provider_config: Any | None, gateway_config: Any | None
-) -> bool:
-    setting_name = f"OPENSQUILLA_VIDEO_GENERATION_PROVIDERS__{provider.upper()}__API_KEY_ENV"
-    if environment_value(setting_name):
-        return True
-    raw = getattr(gateway_config, "_persist_raw_base", None)
-    if isinstance(raw, Mapping):
-        section = raw.get("video_generation")
-        providers = section.get("providers") if isinstance(section, Mapping) else None
-        candidate = providers.get(provider) if isinstance(providers, Mapping) else None
-        return isinstance(candidate, Mapping) and "api_key_env" in candidate
-    fields_set = getattr(provider_config, "model_fields_set", None)
-    return isinstance(fields_set, set) and "api_key_env" in fields_set
-
-
-def _image_env_was_authored_for_video(
-    provider: str, provider_config: Any | None, gateway_config: Any | None
-) -> bool:
-    setting_name = f"OPENSQUILLA_IMAGE_GENERATION_PROVIDERS__{provider.upper()}__API_KEY_ENV"
-    if environment_value(setting_name):
-        return True
-    raw = getattr(gateway_config, "_persist_raw_base", None)
-    if isinstance(raw, Mapping):
-        section = raw.get("image_generation")
-        providers = section.get("providers") if isinstance(section, Mapping) else None
-        candidate = providers.get(provider) if isinstance(providers, Mapping) else None
-        return isinstance(candidate, Mapping) and "api_key_env" in candidate
-    fields_set = getattr(provider_config, "model_fields_set", None)
-    return isinstance(fields_set, set) and "api_key_env" in fields_set
-
-
-def _image_video_credential(
-    *, provider: str, endpoint: str, gateway_config: Any | None
-) -> _VideoCredential | None:
-    if gateway_config is None or provider not in IMAGE_GENERATION_OFFICIAL_BASE_URLS:
-        return None
-    image = getattr(gateway_config, "image_generation", None)
-    providers = getattr(image, "providers", None)
-    image_provider = getattr(providers, provider, None)
-    if image_provider is None:
-        return None
-    default_endpoint = IMAGE_GENERATION_OFFICIAL_BASE_URLS[provider]
-    image_endpoint = resolve_image_generation_base_url(
-        provider_id=provider,
-        provider_config=image_provider,
-        llm_config=getattr(gateway_config, "llm", None),
-        default_base_url=default_endpoint,
-        gateway_config=gateway_config,
-    )
-    if (
-        not is_valid_image_generation_base_url(image_endpoint)
-        or conflicting_image_generation_endpoint_provider(provider, image_endpoint) is not None
-        or not base_url_allows_credential_reuse(image_endpoint, endpoint)
-    ):
-        return None
-    direct_key = str(getattr(image_provider, "api_key", "") or "").strip()
-    if direct_key:
-        return _VideoCredential(
-            available=True, api_key=direct_key, source="image_direct", owner="image"
-        )
-    default_env = VIDEO_GENERATION_DEFAULT_ENV_KEYS[provider]
-    configured_env = str(getattr(image_provider, "api_key_env", default_env) or "").strip()
-    authored_env = _image_env_was_authored_for_video(provider, image_provider, gateway_config)
-    env_key = credential_env_for_endpoint(
-        configured_env=configured_env,
-        configured_explicitly=authored_env,
-        default_env=default_env,
-        default_base_url=default_endpoint,
-        effective_base_url=image_endpoint,
-    )
-    if not env_key:
-        return None
-    image_key = environment_value(env_key).strip()
-    if image_key:
-        return _VideoCredential(
-            available=True,
-            api_key=image_key,
-            env_key=env_key,
-            source="image_env",
-            owner="image",
-        )
-    if authored_env:
-        return _VideoCredential(
-            available=False, env_key=env_key, source="missing_env", owner="image"
-        )
-    return None
-
-
 def _video_credential(
     *,
     provider: str | None = None,
@@ -1135,122 +1025,17 @@ def _video_credential(
     base_url: str | None = None,
     gateway_config: Any | None = None,
 ) -> _VideoCredential:
-    config = config if config is not None else _resolve_video_generation_config()
+    resolved = config if config is not None else _resolve_video_generation_config()
     gateway = gateway_config if gateway_config is not None else _video_gateway_config
-    selected = provider or _video_provider(config)
-    default_env = VIDEO_GENERATION_DEFAULT_ENV_KEYS.get(selected)
-    default_endpoint = VIDEO_GENERATION_OFFICIAL_BASE_URLS.get(selected)
-    if not default_env or not default_endpoint:
-        return _VideoCredential(available=False)
-    endpoint = base_url or _video_base_url(config, selected)
-    if (
-        not is_valid_video_generation_base_url(endpoint)
-        or conflicting_video_generation_endpoint_provider(selected, endpoint) is not None
-    ):
-        return _VideoCredential(available=False)
-    provider_config = _video_provider_config(config, selected)
-    direct_key = str(getattr(provider_config, "api_key", "") or "").strip()
-    stale_direct_key = False
-    if direct_key:
-        bound_endpoint = str(getattr(provider_config, "api_key_base_url", "") or "").strip()
-        if not bound_endpoint or not base_url_allows_credential_reuse(bound_endpoint, endpoint):
-            stale_direct_key = True
-        else:
-            direct_key_path = f"video_generation.providers.{selected}.api_key"
-            runtime_secret_paths = getattr(gateway, "_runtime_secret_paths", ())
-            from_environment = direct_key_path in runtime_secret_paths
-            return _VideoCredential(
-                available=True,
-                api_key=direct_key,
-                env_key=(
-                    f"OPENSQUILLA_VIDEO_GENERATION_PROVIDERS__{selected.upper()}__API_KEY"
-                    if from_environment
-                    else ""
-                ),
-                source="video_env_injected_direct" if from_environment else "video_direct",
-                owner="video",
-            )
-    configured_env = str(getattr(provider_config, "api_key_env", default_env) or "").strip()
-    authored_env = _video_env_was_authored(selected, provider_config, gateway)
-    if stale_direct_key and not authored_env:
-        return _VideoCredential(available=False, owner="video")
-    env_key = credential_env_for_endpoint(
-        configured_env=configured_env,
-        configured_explicitly=authored_env,
-        default_env=default_env,
-        default_base_url=default_endpoint,
-        effective_base_url=endpoint,
-    )
-    if env_key:
-        direct_key = environment_value(env_key).strip()
-        if direct_key:
-            return _VideoCredential(
-                available=True,
-                api_key=direct_key,
-                env_key=env_key,
-                source="video_env",
-                owner="video",
-            )
-        if authored_env:
-            return _VideoCredential(
-                available=False, env_key=env_key, source="missing_env", owner="video"
-            )
-    if stale_direct_key:
-        return _VideoCredential(available=False, owner="video")
-    image_credential = _image_video_credential(
-        provider=selected, endpoint=endpoint, gateway_config=gateway
-    )
-    if image_credential is not None:
-        return image_credential
     ctx = current_tool_context.get() if runtime else None
-    resolution = resolve_image_generation_credential(
-        provider_id=selected,
-        provider_config=None,
-        default_env_key="",
-        default_base_url=default_endpoint,
-        effective_base_url=endpoint,
-        gateway_config=gateway,
-        model=str(getattr(config, "primary", "") or ""),
+    return resolve_video_generation_credential(
+        resolved,
+        provider_id=provider,
         runtime=runtime,
+        base_url=base_url,
+        gateway_config=gateway,
         session_key=str(ctx.session_key or "") if ctx is not None else "",
-        # Only a matching model-service endpoint may supply a fallback key.
-        include_image_credentials=False,
     )
-    return _VideoCredential(
-        available=resolution.available,
-        api_key=resolution.api_key,
-        env_key=resolution.env_key,
-        source="llm_fallback" if resolution.available else resolution.source,
-        owner=resolution.owner,
-    )
-
-
-def video_generation_credential_status(
-    gateway_config: Any, *, provider_id: str, base_url: str | None = None
-) -> dict[str, object]:
-    """Describe one video route's credential without exposing its value."""
-
-    provider = str(provider_id or "").strip().lower()
-    credential = _VideoCredential(available=False)
-    if provider in VIDEO_GENERATION_OFFICIAL_BASE_URLS and (base_url is None or base_url.strip()):
-        try:
-            credential = _video_credential(
-                provider=provider,
-                runtime=False,
-                config=getattr(gateway_config, "video_generation", None),
-                base_url=base_url,
-                gateway_config=gateway_config,
-            )
-        except Exception:
-            credential = _VideoCredential(available=False)
-    return {
-        "providerId": provider,
-        "available": credential.available,
-        "source": credential.source,
-        "owner": credential.owner,
-        "envKey": credential.env_key,
-        "clearable": credential.available and credential.source == "video_direct",
-    }
 
 
 def video_generation_available(config: Any | None = None) -> bool:
@@ -1477,6 +1262,12 @@ async def _video_result_payload(result: Any, *, max_bytes: int, source: str) -> 
     return json.dumps(payload)
 
 
+def _video_credential_fingerprint(api_key: str) -> str:
+    """Bind token identity to this process without retaining the token itself."""
+
+    return hmac.digest(_VIDEO_JOB_FINGERPRINT_KEY, api_key.encode("utf-8"), "sha256").hex()
+
+
 def _remember_video_job(
     job_id: str,
     api_key: str,
@@ -1484,13 +1275,15 @@ def _remember_video_job(
     model: str,
     base_url: str | None = None,
     credential_env: str = "",
+    *,
+    status_lock: asyncio.Lock | None = None,
 ) -> str:
     """Scope resumable jobs to the session that created them."""
 
     ctx = current_tool_context.get()
     if ctx is None or not ctx.session_key:
         return job_id
-    fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    fingerprint = _video_credential_fingerprint(api_key)
     receipt = _VideoJobReceipt(
         session_key=ctx.session_key,
         credential_fingerprint=fingerprint,
@@ -1499,6 +1292,7 @@ def _remember_video_job(
         base_url=base_url or VIDEO_GENERATION_OFFICIAL_BASE_URLS.get(provider, ""),
         native_job_id=job_id,
         credential_env=credential_env,
+        status_lock=status_lock if status_lock is not None else asyncio.Lock(),
     )
     with _video_job_sessions_lock:
         existing = _video_job_sessions.get(job_id)
@@ -1554,12 +1348,12 @@ def _video_job_access_allowed(job_id: str, api_key: str, provider: str) -> bool:
         return True
     if not ctx.session_key:
         return False
-    fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    fingerprint = _video_credential_fingerprint(api_key)
     receipt = _video_job_receipt(job_id)
     return (
         receipt is not None
         and receipt.session_key == ctx.session_key
-        and receipt.credential_fingerprint == fingerprint
+        and hmac.compare_digest(receipt.credential_fingerprint, fingerprint)
         and receipt.provider == provider
     )
 
@@ -1671,93 +1465,105 @@ async def video_generate(
     )
     target = _resolve_generated_video_path(filename, tool_name="video_generate")
     target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        generate, _resume = _video_adapter(provider)
-        extra = {"provider": provider} if provider in {"qwen", "qwen_token_plan"} else {}
-        result = await generate(
-            base_url=base_url,
-            api_key=credential.api_key,
-            model=str(config.primary),
-            prompt=prompt.strip(),
-            duration=duration,
-            max_duration_seconds=int(config.max_duration_seconds),
-            aspect_ratio=aspect,
-            resolution=size,
-            output_path=target,
-            timeout_seconds=float(config.timeout_seconds),
-            max_bytes=int(config.max_output_bytes),
-            **extra,
-        )
-    except VideoGenerationSubmissionUnknown as exc:
-        return json.dumps(
-            {
-                "status": "submission_unknown",
-                "provider": provider,
-                "note": str(exc),
-            }
-        )
-    except VideoGenerationError as exc:
-        if exc.recoverable and exc.job_id:
-            handle = _remember_video_job(
-                exc.job_id,
+    status_lock = asyncio.Lock()
+    accepted_job_id: str | None = None
+    accepted_handle: str | None = None
+
+    def remember_job(job_id: str) -> str:
+        nonlocal accepted_job_id, accepted_handle
+        if accepted_job_id is not None and accepted_job_id != job_id:
+            raise VideoGenerationError(
+                "Video provider returned a different job ID",
+                job_id=accepted_job_id,
+                recoverable=True,
+            )
+        if accepted_handle is None:
+            accepted_job_id = job_id
+            accepted_handle = _remember_video_job(
+                job_id,
                 credential.api_key,
                 provider,
                 str(config.primary),
                 base_url,
                 getattr(credential, "env_key", ""),
+                status_lock=status_lock,
             )
+        return accepted_handle
+
+    def on_job_accepted(job_id: str) -> None:
+        remember_job(job_id)
+
+    # Status checks can see accepted jobs immediately, but wait for this call
+    # to finish or settle cancellation before retrieving or publishing them.
+    async with status_lock:
+        try:
+            generate, _resume = _video_adapter(provider)
+            extra = {"provider": provider} if provider in {"qwen", "qwen_token_plan"} else {}
+            result = await generate(
+                base_url=base_url,
+                api_key=credential.api_key,
+                model=str(config.primary),
+                prompt=prompt.strip(),
+                duration=duration,
+                max_duration_seconds=int(config.max_duration_seconds),
+                aspect_ratio=aspect,
+                resolution=size,
+                output_path=target,
+                timeout_seconds=float(config.timeout_seconds),
+                max_bytes=int(config.max_output_bytes),
+                on_job_accepted=on_job_accepted,
+                **extra,
+            )
+        except VideoGenerationSubmissionUnknown as exc:
             return json.dumps(
                 {
-                    "status": "pending",
-                    "job_id": handle,
+                    "status": "submission_unknown",
                     "provider": provider,
-                    "note": (
-                        "The job may still complete. Call video_status with this job_id; "
-                        "do not submit it again."
-                    ),
+                    "note": str(exc),
                 }
             )
-        if exc.job_id:
-            handle = _remember_video_job(
-                exc.job_id,
-                credential.api_key,
-                provider,
-                str(config.primary),
-                base_url,
-                getattr(credential, "env_key", ""),
-            )
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "job_id": handle,
-                    "provider": provider,
-                    "error": str(exc),
-                    "note": (
-                        "The job or its download failed. Do not generate it again automatically. "
-                        "Use video_status with this job_id if retrieval may recover."
-                    ),
-                }
-            )
-        raise ToolError(f"Video generation failed: {exc}") from exc
-    except Exception as exc:
-        raise ToolError("Video generation failed unexpectedly") from exc
-    handle = _remember_video_job(
-        result.job_id,
-        credential.api_key,
-        provider,
-        str(config.primary),
-        base_url,
-        getattr(credential, "env_key", ""),
-    )
-    payload = await _video_result_payload(
-        result, max_bytes=int(config.max_output_bytes), source="video_generate"
-    )
-    if handle != result.job_id:
-        response = json.loads(payload)
-        response["job_id"] = handle
-        payload = json.dumps(response)
-    _remember_video_completion(handle, result, payload)
-    return payload
+        except VideoGenerationError as exc:
+            if exc.recoverable and exc.job_id:
+                handle = remember_job(exc.job_id)
+                return json.dumps(
+                    {
+                        "status": "pending",
+                        "job_id": handle,
+                        "provider": provider,
+                        "note": (
+                            "The job may still complete. Call video_status with this job_id; "
+                            "do not submit it again."
+                        ),
+                    }
+                )
+            if exc.job_id:
+                handle = remember_job(exc.job_id)
+                return json.dumps(
+                    {
+                        "status": "failed",
+                        "job_id": handle,
+                        "provider": provider,
+                        "error": str(exc),
+                        "note": (
+                            "The job or its download failed. "
+                            "Do not generate it again automatically. "
+                            "Use video_status with this job_id if retrieval may recover."
+                        ),
+                    }
+                )
+            raise ToolError(f"Video generation failed: {exc}") from exc
+        except Exception as exc:
+            raise ToolError("Video generation failed unexpectedly") from exc
+        handle = remember_job(result.job_id)
+        payload = await _video_result_payload(
+            result, max_bytes=int(config.max_output_bytes), source="video_generate"
+        )
+        if handle != result.job_id:
+            response = json.loads(payload)
+            response["job_id"] = handle
+            payload = json.dumps(response)
+        _remember_video_completion(handle, result, payload)
+        return payload
 
 
 @tool(
@@ -1818,15 +1624,17 @@ async def video_status(job_id: str, filename: str | None = None) -> str:
         candidate_matches = (
             credential.available
             and bool(credential.api_key)
-            and hashlib.sha256(credential.api_key.encode("utf-8")).hexdigest()
-            == receipt.credential_fingerprint
+            and hmac.compare_digest(
+                _video_credential_fingerprint(credential.api_key), receipt.credential_fingerprint
+            )
         )
         if not candidate_matches and receipt.credential_env:
             remembered_key = environment_value(receipt.credential_env).strip()
             if (
                 remembered_key
-                and hashlib.sha256(remembered_key.encode("utf-8")).hexdigest()
-                == receipt.credential_fingerprint
+                and hmac.compare_digest(
+                    _video_credential_fingerprint(remembered_key), receipt.credential_fingerprint
+                )
             ):
                 credential = _VideoCredential(
                     available=True,

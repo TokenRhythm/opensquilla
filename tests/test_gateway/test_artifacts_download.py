@@ -10,6 +10,7 @@ import pytest
 from pptx import Presentation
 
 from opensquilla.artifacts import ArtifactStore
+from opensquilla.paths import native_io_path
 
 
 class _FakeSessionManager:
@@ -221,7 +222,7 @@ async def test_artifact_download_integrity_check_runs_off_event_loop(
         ArtifactContentQuery("agent:main:webchat:ok", ref.id)
     )
 
-    assert material.path == ArtifactStore(tmp_path).path_for(ref)
+    assert material.path == native_io_path(ArtifactStore(tmp_path).path_for(ref))
     assert material.media_type == "video/mp4"
     assert worker_threads and all(thread != main_thread for thread in worker_threads)
 

@@ -33,6 +33,15 @@ const videoConfig = {
   },
 }
 
+const proxyVideoConfig = {
+  ...videoConfig,
+  enabled: true, provider: 'xai', primary: 'grok-imagine-video-1.5',
+  providers: {
+    ...videoConfig.providers,
+    xai: { base_url: 'https://video-proxy.example.test/v1', api_key_env: 'XAI_API_KEY' },
+  },
+}
+
 async function mountSettings(section: unknown = videoConfig, workflow?: Partial<SetupWorkflow>) {
   const readAll = vi.fn().mockResolvedValue(section === null
     ? {}
@@ -569,6 +578,121 @@ describe('video generation settings', () => {
       .toHaveBeenCalledWith('tokenrhythm'))
     expect(el.querySelector('[data-testid="video-model-status"]')?.textContent)
       .toContain(i18n.global.t('setup.video.tokenrhythmModelUnverified'))
+  })
+
+  it('uses gateway endpoint and environment defaults for connection validation', async () => {
+    const configured = {
+      ...videoConfig,
+      provider: 'xai', primary: 'grok-imagine-video-1.5',
+      providers: {
+        ...videoConfig.providers,
+        xai: { base_url: 'https://video-service.example.test/v1', api_key_env: 'GATEWAY_XAI_KEY' },
+      },
+    }
+    const { el, patch } = await mountSettings(configured, {
+      catalog: vi.fn().mockResolvedValue({ videoGenerationProviders: [{
+        providerId: 'xai', runtimeSupported: true,
+        defaultBaseUrl: 'https://video-service.example.test/v1', envKey: 'GATEWAY_XAI_KEY',
+      }, {
+        providerId: 'openrouter', runtimeSupported: true,
+        defaultBaseUrl: 'https://model-router.example.test/api/v1', envKey: 'GATEWAY_ROUTER_KEY',
+      }] }),
+      status: vi.fn().mockResolvedValue({}),
+    })
+    await input(el, 'setup_video_duration', '6')
+    expect(el.querySelector('[role="alert"]')).toBeNull()
+    expect(el.querySelector('.video-settings__hint')?.textContent)
+      .toContain(i18n.global.t('setup.video.selectedEnvCredentialHint', { name: 'GATEWAY_XAI_KEY' }))
+    expect(saveButton(el).disabled).toBe(false)
+    saveButton(el).click()
+    await vi.waitFor(() => expect(patch).toHaveBeenCalledExactlyOnceWith([
+      { path: 'video_generation.duration_seconds', value: 6 },
+    ]))
+    await vi.waitFor(() => expect(saveButton(el).disabled).toBe(true))
+    await input(el, 'setup_video_base_url', 'https://video-proxy.example.test/v1')
+    expect(el.querySelector('[role="alert"]')?.textContent)
+      .toBe(i18n.global.t('setup.video.customEndpointNeedsEnv'))
+    await input(el, 'setup_video_api_key_env', 'VIDEO_PROXY_KEY')
+    expect(el.querySelector('[role="alert"]')).toBeNull()
+    await input(el, 'setup_video_base_url', 'https://model-router.example.test/api/v1')
+    expect(el.querySelector('[role="alert"]')?.textContent)
+      .toBe(i18n.global.t('setup.video.invalidBaseUrl'))
+  })
+
+  it.each(['duration', 'disable'])('saves %s changes for a proxy with an available default environment key', async (change) => {
+    const { el, patch } = await mountSettings(proxyVideoConfig, {
+      catalog: vi.fn().mockResolvedValue({}),
+      status: vi.fn().mockResolvedValue({ videoGenerationState: { credentialOptions: [{
+        providerId: 'xai', available: true, source: 'video_env', owner: 'video', envKey: 'XAI_API_KEY',
+      }] } }),
+    })
+    await vi.waitFor(() => expect(el.querySelector('.video-settings__credential-status')?.textContent)
+      .toContain(i18n.global.t('setup.video.videoEnvKeyAvailable', { name: 'XAI_API_KEY' })))
+    expect(el.querySelector('.video-settings__hint')?.textContent)
+      .not.toContain(i18n.global.t('setup.video.customCredentialMissingHint'))
+    if (change === 'duration') {
+      await input(el, 'setup_video_duration', '6')
+    } else {
+      const toggle = el.querySelector<HTMLInputElement>('[name="setup_video_enabled"]')!
+      toggle.checked = false
+      toggle.dispatchEvent(new Event('change', { bubbles: true }))
+      await nextTick()
+    }
+    expect(el.querySelector('[role="alert"]')).toBeNull()
+    expect(saveButton(el).disabled).toBe(false)
+    saveButton(el).click()
+    await vi.waitFor(() => expect(patch).toHaveBeenCalledExactlyOnceWith([
+      change === 'duration'
+        ? { path: 'video_generation.duration_seconds', value: 6 }
+        : { path: 'video_generation.enabled', value: false },
+    ]))
+    await vi.waitFor(() => expect(saveButton(el).disabled).toBe(true))
+  })
+
+  it.each([
+    { providerId: 'xai', available: false, source: 'missing_env', envKey: 'XAI_API_KEY' },
+    { providerId: 'openrouter', available: true, source: 'video_env', envKey: 'OPENROUTER_API_KEY' },
+  ])('rejects an unverified proxy default environment key with status $providerId/$available', async (credential) => {
+    const status = vi.fn().mockResolvedValue({ videoGenerationState: { credentialOptions: [credential] } })
+    const { el, patch } = await mountSettings(proxyVideoConfig, {
+      catalog: vi.fn().mockResolvedValue({}), status,
+    })
+    await vi.waitFor(() => expect(status).toHaveBeenCalledOnce())
+    await input(el, 'setup_video_duration', '6')
+    expect(el.querySelector('[role="alert"]')?.textContent)
+      .toBe(i18n.global.t('setup.video.customEndpointNeedsEnv'))
+    expect(saveButton(el).disabled).toBe(true)
+    expect(patch).not.toHaveBeenCalled()
+  })
+
+  it('does not carry an available proxy credential into changed connection settings', async () => {
+    const { el, patch } = await mountSettings(proxyVideoConfig, {
+      catalog: vi.fn().mockResolvedValue({}),
+      status: vi.fn().mockResolvedValue({ videoGenerationState: { credentialOptions: [{
+        providerId: 'xai', available: true, source: 'video_env', owner: 'video', envKey: 'XAI_API_KEY',
+      }] } }),
+    })
+    await vi.waitFor(() => expect(el.querySelector('[role="alert"]')).toBeNull())
+    for (const endpoint of ['https://video-proxy.example.test/v2', 'https://other-proxy.example.test/v1']) {
+      await input(el, 'setup_video_base_url', endpoint)
+      expect(el.querySelector('[role="alert"]')?.textContent)
+        .toBe(i18n.global.t('setup.video.customEndpointNeedsEnv'))
+      expect(el.querySelector('.video-settings__credential-status')?.textContent)
+        .not.toContain(i18n.global.t('setup.video.videoEnvKeyAvailable', { name: 'XAI_API_KEY' }))
+      expect(saveButton(el).disabled).toBe(true)
+    }
+    for (const endpoint of ['http://remote.example.test/v1', 'https://openrouter.ai/api/v1']) {
+      await input(el, 'setup_video_base_url', endpoint)
+      expect(el.querySelector('[role="alert"]')?.textContent)
+        .toBe(i18n.global.t('setup.video.invalidBaseUrl'))
+      expect(saveButton(el).disabled).toBe(true)
+    }
+    await input(el, 'setup_video_base_url', 'https://video-proxy.example.test/v1')
+    await input(el, 'setup_video_api_key_env', '')
+    expect(el.querySelector('[role="alert"]')?.textContent)
+      .toBe(i18n.global.t('setup.video.customEndpointNeedsEnv'))
+    expect(saveButton(el).disabled).toBe(true)
+    expect(patch).not.toHaveBeenCalled()
   })
 
   it('sends a pasted video key only on save and never keeps it across provider switches', async () => {

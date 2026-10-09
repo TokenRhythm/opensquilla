@@ -18,6 +18,7 @@ from opensquilla.provider.video_generation import (
     VideoGenerationPending,
     VideoGenerationResult,
     VideoGenerationSubmissionUnknown,
+    VideoJobAcceptedCallback,
 )
 from opensquilla.provider.video_generation_policy import is_valid_video_generation_base_url
 from opensquilla.secrets import clean_header_secret
@@ -138,6 +139,7 @@ async def _submit(
     aspect_ratio: str,
     resolution: str,
     deadline: float,
+    on_job_accepted: VideoJobAcceptedCallback | None = None,
 ) -> str:
     parameters: dict[str, object] = {"duration": duration}
     if model.startswith(("wan2.6-", "wan2.5-", "wan2.2-", "wanx2.1-")):
@@ -167,16 +169,21 @@ async def _submit(
                     payload = await _read_json(response)
                 except VideoGenerationError:
                     raise VideoGenerationSubmissionUnknown() from None
+                output = payload.get("output")
+                try:
+                    job_id = _safe_task_id(
+                        output.get("task_id") if isinstance(output, dict) else None
+                    )
+                except VideoGenerationError:
+                    raise VideoGenerationSubmissionUnknown() from None
+                if on_job_accepted is not None:
+                    on_job_accepted(job_id)
     except httpx.HTTPError as exc:
         redacted_httpx_error(exc, api_key=api_key)
         raise VideoGenerationSubmissionUnknown() from None
     except TimeoutError:
         raise VideoGenerationSubmissionUnknown() from None
-    output = payload.get("output")
-    try:
-        return _safe_task_id(output.get("task_id") if isinstance(output, dict) else None)
-    except VideoGenerationError:
-        raise VideoGenerationSubmissionUnknown() from None
+    return job_id
 
 
 async def _poll_until_complete(
@@ -306,6 +313,7 @@ async def generate_qwen_video(
     poll_interval_seconds: float = 10.0,
     max_bytes: int = _DEFAULT_MAX_BYTES,
     provider: str = "qwen",
+    on_job_accepted: VideoJobAcceptedCallback | None = None,
 ) -> VideoGenerationResult:
     api_root = _api_root(base_url)
     secret = clean_header_secret(api_key, label="DashScope video API key")
@@ -339,6 +347,7 @@ async def generate_qwen_video(
             aspect_ratio=aspect_ratio or "16:9",
             resolution=resolution or "720p",
             deadline=deadline,
+            on_job_accepted=on_job_accepted,
         )
         return await _complete_job(
             client,

@@ -34,6 +34,7 @@ from opensquilla.artifacts import (
     strip_artifact_markers_from_text,
 )
 from opensquilla.engine.types import ToolCall
+from opensquilla.paths import native_io_path
 from opensquilla.tools.builtin.artifacts import publish_artifact
 from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.registry import ToolRegistry, get_default_registry
@@ -1059,7 +1060,7 @@ def test_publish_file_rejects_growth_and_removes_partial_artifact(
 
     def open_with_growth(path: Path, *args: object, **kwargs: object):
         file = original_open(path, *args, **kwargs)
-        return GrowingReader(file) if path == source else file
+        return GrowingReader(file) if path == native_io_path(source) else file
 
     monkeypatch.setattr(Path, "open", open_with_growth)
     store = ArtifactStore(tmp_path / "media")
