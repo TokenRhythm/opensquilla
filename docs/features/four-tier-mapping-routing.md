@@ -37,7 +37,7 @@ allow_candidate = true
 The training package must be installed in the same Python environment as
 OpenSquilla. `artifact_root`, `metadata_db`, `model_set_id`, and the expected
 Manifest Hash are all required, so a typo or mutable/unregistered model fails
-before routing. Every new v3 configuration must explicitly include the
+before routing. Every new v4 configuration must explicitly include the
 `classifier` block; omitting it fails configuration validation instead of
 silently selecting a random model. A `CANDIDATE` model is rejected unless
 `allow_candidate=true` is explicit. That switch allows the candidate to drive
@@ -73,10 +73,10 @@ The ladder is immutable:
 All four tier keys, provider/model identities, reasoning levels and deployment
 labels are frozen. Config validation rejects overrides, including mutation of
 the nested mapping after load. Old `mock_seed` v1/v2 configurations migrate to
-the v3 `classifier.backend="random_mock"` shape without changing their seed.
+the v4 `classifier.backend="random_mock"` shape without changing their seed.
 An old config file that contained only the four-tier selection mode is migrated
 once to an explicit random classifier so the formerly implicit behavior is
-visible; newly constructed v3 configs do not receive that compatibility path.
+visible; newly constructed v4 configs do not receive that compatibility path.
 
 The current OpenRouter model IDs for C1 and C2 are aliases rather than dated
 IDs. The route records the requested deployment label and
@@ -90,13 +90,27 @@ provider/catalog identity that exposes it.
    not use the intent head. Recognized command-like text such as `/new`,
    `/redo`, “新建任务” and “重新生成” follows the same rule path.
 2. With no active durable task, the request starts a new task.
-3. `continue` keeps the current tier and ignores the tier head.
-4. `redo` uses the tier head but may only keep or upgrade the current tier. A
-   predicted downgrade is blocked and becomes a hold.
+3. Every new user turn runs tier classification, including `continue` and
+   `redo`. A higher predicted tier upgrades the active task; a lower predicted
+   tier is blocked and becomes a hold. Ordinary tool calls within the same
+   user turn keep the selected provider.
+4. Intent and tier classification select the largest class probability
+   directly. Confidence and probability-margin thresholds are no longer used.
+   Ties use the fixed label order for deterministic replay.
 5. `new_task` applies the task-reset mask and selects from C0–C3 again.
-6. Intent classifier error or uncertainty falls back to `continue`. Redo tier
-   error or uncertainty holds the current tier. New-task tier error or
-   uncertainty uses `default_new_task_tier` (C1 by default).
+6. Only classifier exceptions or invalid outputs use the error fallback:
+   intent falls back to `continue`; an active-task tier holds; a new-task tier
+   uses `default_new_task_tier` (C1 by default).
+7. Explicit answer corrections, validation failures or repeated lack of
+   progress can request one one-tier quality upgrade per user turn. It consumes
+   the existing retry budget; C3 cannot upgrade further. Network errors,
+   timeouts and rate limits remain provider retries without a quality upgrade.
+
+Current decisions use `fixed-four-tier-v2-v4` and rules v2. Stored v3 decisions
+remain readable under their original policy; they are not rewritten as v4.
+Deprecated confidence/margin config fields remain readable but have no effect
+on routing or the current policy hash. A quality retry has its own durable
+receipt and effective provider binding, preserving the original classification.
 
 `continue` and `redo` keep the same task ID and task-scoped generation
 context. `new_task` creates a new task ID and removes unrelated prior-task
