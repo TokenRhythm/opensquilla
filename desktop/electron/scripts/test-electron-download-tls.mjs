@@ -1,27 +1,69 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, KeyObject, webcrypto } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
+import { createRequire } from 'node:module';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
 
-// Public synthetic fixtures are trusted only by the isolated test child.
-const certPath = fileURLToPath(new URL('./fixtures/download-proxy/synthetic.cert.pem', import.meta.url));
-const cert = await readFile(certPath);
-const key = await readFile(new URL('./fixtures/download-proxy/synthetic.key.pem', import.meta.url));
+// Resolve certificate APIs from the same locked build dependency as the downloader.
+const require = createRequire(import.meta.url);
+const builderRequire = createRequire(require.resolve('app-builder-lib/package.json'));
+const pki = builderRequire('pkijs');
+const asn1 = builderRequire('asn1js');
 const artifact = Buffer.from('synthetic installer TLS download');
 const checksum = createHash('sha256').update(artifact).digest('hex');
+
+async function createSyntheticCertificate() {
+  const keys = await webcrypto.subtle.generateKey({
+    name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048,
+    publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256',
+  }, true, ['sign', 'verify']);
+  const engine = new pki.CryptoEngine({ crypto: webcrypto, subtle: webcrypto.subtle });
+  const certificate = new pki.Certificate({
+    version: 2,
+    serialNumber: new asn1.Integer({ value: 1 }),
+    notBefore: new pki.Time({ value: new Date(Date.now() - 60_000) }),
+    notAfter: new pki.Time({ value: new Date(Date.now() + 86_400_000) }),
+  });
+  for (const name of [certificate.subject, certificate.issuer]) {
+    name.typesAndValues.push(new pki.AttributeTypeAndValue({
+      type: '2.5.4.3', value: new asn1.Utf8String({ value: 'localhost' }),
+    }));
+  }
+  const constraints = new pki.BasicConstraints({ cA: true });
+  const names = new pki.AltName({ altNames: [
+    new pki.GeneralName({ type: 2, value: 'localhost' }),
+    new pki.GeneralName({
+      type: 7, value: new asn1.OctetString({ valueHex: new Uint8Array([127, 0, 0, 1]).buffer }),
+    }),
+  ] });
+  certificate.extensions = [
+    new pki.Extension({
+      extnID: '2.5.29.19', critical: true, extnValue: constraints.toSchema().toBER(false),
+    }),
+    new pki.Extension({ extnID: '2.5.29.17', extnValue: names.toSchema().toBER(false) }),
+  ];
+  await certificate.subjectPublicKeyInfo.importKey(keys.publicKey, engine);
+  await certificate.sign(keys.privateKey, 'SHA-256', engine);
+  const encoded = Buffer.from(certificate.toSchema().toBER(false)).toString('base64');
+  return {
+    cert: `-----BEGIN CERTIFICATE-----\n${encoded.match(/.{1,64}/g).join('\n')}\n-----END CERTIFICATE-----\n`,
+    key: KeyObject.from(keys.privateKey).export({ format: 'pem', type: 'pkcs8' }),
+  };
+}
 
 for (const wrongHostname of [false, true]) {
   test(`installer HTTPS proxy ${wrongHostname ? 'rejects mismatched hosts' : 'preserves custom CA'}`, {
     timeout: 15_000,
   }, async () => {
+    // The private key stays in memory; only this test's child trusts its temporary certificate.
+    const { cert, key } = await createSyntheticCertificate();
     let received = 0;
     let tunnels = 0;
     const sockets = new Set();
@@ -44,7 +86,9 @@ for (const wrongHostname of [false, true]) {
       socket.on('error', () => upstream.destroy());
     });
     const cache = await mkdtemp(join(tmpdir(), 'opensquilla-download-tls-'));
+    const certPath = join(cache, 'synthetic.cert.pem');
     try {
+      await writeFile(certPath, cert);
       origin.listen(0, '127.0.0.1');
       proxy.listen(0, '127.0.0.1');
       await Promise.all([once(origin, 'listening'), once(proxy, 'listening')]);
