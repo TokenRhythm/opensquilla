@@ -787,7 +787,7 @@ export class RpcClient {
       try {
         handler(...args);
       } catch (error) {
-        console.error(`[rpc] "${event}" listener failed`, error);
+        console.error('[rpc] "%s" listener failed', event, error);
       }
     }
   }

@@ -1264,7 +1264,7 @@ describe('RpcClient', () => {
     expect(() => establishConnection(socket)).not.toThrow()
     expect(throwingListener).toHaveBeenCalledOnce()
     expect(siblingListener).toHaveBeenCalledOnce()
-    expect(consoleError).toHaveBeenCalledWith('[rpc] "_hello" listener failed', error)
+    expect(consoleError).toHaveBeenCalledWith('[rpc] "%s" listener failed', '_hello', error)
 
     await vi.advanceTimersByTimeAsync(55_000)
     expect(socket.sent).toContain('{"type":"ping"}')
@@ -1274,7 +1274,7 @@ describe('RpcClient', () => {
     client.disconnect()
   })
 
-  it('isolates event listener failures and still notifies siblings and wildcard listeners', () => {
+  it.each(['demo.event', 'demo.%s.%c'])('isolates %s listener failures and still notifies siblings and wildcard listeners', event => {
     const client = new RpcClient()
     const error = new Error('event listener failed')
     const wildcardError = new Error('wildcard listener failed')
@@ -1284,25 +1284,25 @@ describe('RpcClient', () => {
     client.connect('ws://rpc.test')
     const socket = MockWebSocket.instances[0]
     establishConnection(socket)
-    client.on('demo.event', () => { throw error })
-    client.on('demo.event', siblingListener)
+    client.on(event, () => { throw error })
+    client.on(event, siblingListener)
     client.on('*', () => { throw wildcardError })
     client.on('*', wildcardListener)
 
     expect(() => socket.receive({
       type: 'event',
-      event: 'demo.event',
+      event,
       payload: { ok: true },
       meta: { source: 'test' },
     })).not.toThrow()
     expect(siblingListener).toHaveBeenCalledWith({ ok: true }, { source: 'test' })
     expect(wildcardListener).toHaveBeenCalledWith(
-      'demo.event',
+      event,
       { ok: true },
       { source: 'test' },
     )
-    expect(consoleError).toHaveBeenCalledWith('[rpc] "demo.event" listener failed', error)
-    expect(consoleError).toHaveBeenCalledWith('[rpc] "*" listener failed', wildcardError)
+    expect(consoleError).toHaveBeenCalledWith('[rpc] "%s" listener failed', event, error)
+    expect(consoleError).toHaveBeenCalledWith('[rpc] "%s" listener failed', '*', wildcardError)
     client.disconnect()
   })
 
@@ -1320,7 +1320,7 @@ describe('RpcClient', () => {
     expect(() => socket.close()).not.toThrow()
     expect(client.state).toBe('disconnected')
     expect(siblingListener).toHaveBeenCalledWith('disconnected')
-    expect(consoleError).toHaveBeenCalledWith('[rpc] "_state" listener failed', error)
+    expect(consoleError).toHaveBeenCalledWith('[rpc] "%s" listener failed', '_state', error)
 
     await vi.advanceTimersByTimeAsync(499)
     expect(MockWebSocket.instances).toHaveLength(1)
@@ -1347,7 +1347,7 @@ describe('RpcClient', () => {
       actual: 3,
       event: 'demo.event',
     })
-    expect(consoleError).toHaveBeenCalledWith('[rpc] "_gap" listener failed', error)
+    expect(consoleError).toHaveBeenCalledWith('[rpc] "%s" listener failed', '_gap', error)
     expect(socket.readyState).toBe(MockWebSocket.CLOSED)
 
     await vi.advanceTimersByTimeAsync(499)
