@@ -73,6 +73,23 @@ describe('chat fork hand-off contract', () => {
     expect(chatViewSource).toContain("if (handoffAction === 'returning')")
   })
 
+  it('carries the parent project binding onto the fork child before navigating', () => {
+    // Without this, the optimistic sidebar row synthesized for the child (the
+    // sessions.list snapshot does not carry it yet) has no workspaceId and
+    // floats to the section's top level instead of nesting under the project.
+    expect(chatViewSource).toContain(
+      'freshTaskDraft.materializedWorkspaceBySession.value[parentKey]',
+    )
+    expect(chatViewSource).toContain(
+      'freshTaskDraft.bindMaterializedProjectTask(childKey, forkWorkspaceId)',
+    )
+    const bindIndex = chatViewSource.indexOf(
+      'freshTaskDraft.bindMaterializedProjectTask(childKey, forkWorkspaceId)',
+    )
+    expect(bindIndex).toBeGreaterThan(chatViewSource.indexOf('const childKey = res.key'))
+    expect(bindIndex).toBeLessThan(chatViewSource.indexOf('query: { session: childKey }'))
+  })
+
   it('invalidates every asynchronous fork continuation when the view unmounts', () => {
     expect(chatViewSource).toContain('forkTransitionLifetime.dispose()')
     expect(chatViewSource).toContain('forkTransition.value = null')

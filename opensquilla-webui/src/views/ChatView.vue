@@ -5641,6 +5641,15 @@ async function forkConversation(throughTurnId?: string) {
       clearForkTransition(generation)
       return
     }
+    // The fork result carries only the child key; the sidebar row synthesized
+    // before the next sessions.list snapshot would otherwise have no project
+    // binding and float to the section's top level. Mirror adoptResponseSession:
+    // carry the parent's project onto the child until the durable row confirms it.
+    const forkWorkspaceId = freshTaskDraft.materializedWorkspaceBySession.value[parentKey]
+      || boundWorkspaceId.value
+    if (forkWorkspaceId) {
+      freshTaskDraft.bindMaterializedProjectTask(childKey, forkWorkspaceId)
+    }
     forkTransition.value = {
       ...forkTransition.value,
       childKey,
