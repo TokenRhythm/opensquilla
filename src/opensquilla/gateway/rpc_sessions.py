@@ -321,6 +321,42 @@ log = structlog.get_logger(__name__)
 # adapter with durable recovery receipts without changing the wire contract.
 _V2_READ_LEASES: dict[tuple[str, str], dict[str, Any]] = {}
 _V2_READ_OPEN_BY_CONNECTION: dict[tuple[str, str], str] = {}
+_V2_READ_CONNECTION_OWNERS: dict[str, object] = {}
+
+
+def _clear_v2_read_connection(conn_id: str, owner: object) -> None:
+    """Retire only the leases owned by this physical connection."""
+    if _V2_READ_CONNECTION_OWNERS.get(conn_id) is not owner:
+        return
+    _V2_READ_CONNECTION_OWNERS.pop(conn_id, None)
+    for identity, state in tuple(_V2_READ_LEASES.items()):
+        if identity[0] == conn_id:
+            state["status"] = "retired"
+            _V2_READ_LEASES.pop(identity, None)
+    for identity in tuple(_V2_READ_OPEN_BY_CONNECTION):
+        if identity[0] == conn_id:
+            _V2_READ_OPEN_BY_CONNECTION.pop(identity, None)
+
+
+def _own_v2_read_connection(ctx: RpcContext) -> None:
+    from opensquilla.gateway.websocket import get_registry
+
+    connection = get_registry().get(ctx.conn_id)
+    if (
+        connection is None or connection.principal != ctx.principal
+        or connection._closing
+    ):
+        raise RpcHandlerError("READ_STALE", "Read connection is no longer current", accepted=False)
+    previous = _V2_READ_CONNECTION_OWNERS.get(ctx.conn_id)
+    if previous is connection:
+        return
+    if previous is not None:
+        _clear_v2_read_connection(ctx.conn_id, previous)
+    _V2_READ_CONNECTION_OWNERS[ctx.conn_id] = connection
+    # Keep this owner until disconnect, even when explicit close empties its
+    # leases. Reopening a view on the same socket must not register twice.
+    conn_id = ctx.conn_id
+    connection.add_transport_cleanup(lambda: _clear_v2_read_connection(conn_id, connection))
 
 
 def _v2_read_progress(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -3653,7 +3689,7 @@ class _GatewayCancellationPorts(CancellationPrimitives):
         queue = get_approval_queue()
         resolve_async = getattr(queue, "resolve_pending_for_session_async", None)
         if callable(resolve_async):
-            return await resolve_async(key, approved=False)
+            return cast(int, await resolve_async(key, approved=False))
         # Keep lightweight test/adaptor queues compatible while never running
         # their legacy synchronous SQLite call on the Gateway loop.
         resolve_sync = getattr(queue, "resolve_pending_for_session", None)
@@ -4522,17 +4558,18 @@ def _v2_cursor_decode(
         ) from exc
     if not isinstance(decoded, dict) or decoded.get("v") != 1:
         raise RpcHandlerError("HISTORY_STALE", "The history cursor is invalid; reload history")
+    cursor = decoded.get("cursor")
     if (
         decoded.get("key") != key
         or decoded.get("session_id") != session_id
         or decoded.get("session_epoch") != session_epoch
         or decoded.get("direction") != direction
-        or not isinstance(decoded.get("cursor"), str)
+        or not isinstance(cursor, str)
     ):
         raise RpcHandlerError(
             "REBASE_REQUIRED", "The history cursor belongs to an older session view"
         )
-    return decoded["cursor"]
+    return cursor
 
 
 def _v2_history_item(
@@ -4632,10 +4669,13 @@ async def _handle_sessions_read_open_v2(params: dict | None, ctx: RpcContext) ->
         session_epoch
     ):
         raise RpcHandlerError("REBASE_REQUIRED", "Session epoch changed", accepted=False)
+    # Identity reads above may yield across disconnect. Bind to the current
+    # socket immediately before retaining state, with no intervening await.
+    _own_v2_read_connection(ctx)
     lease_key = (ctx.conn_id, key)
     existing_id = _V2_READ_OPEN_BY_CONNECTION.get(lease_key)
     if existing_id is not None and (ctx.conn_id, existing_id) in _V2_READ_LEASES:
-        return _V2_READ_LEASES[(ctx.conn_id, existing_id)]["open_result"]
+        return cast(dict[str, Any], _V2_READ_LEASES[(ctx.conn_id, existing_id)]["open_result"])
     replay = get_session_streams().replay(key, None)
     stream_generation = str(getattr(replay, "stream_generation", "unknown"))
     stream_seq = max(0, int(getattr(replay, "current_stream_seq", 0)))
