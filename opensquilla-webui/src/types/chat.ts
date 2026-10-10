@@ -755,6 +755,8 @@ export interface ChatMessage {
   /** Display body completeness, separate from history page completeness. */
   previewComplete?: boolean
   historyPayloadPreview?: import('@/modules/sessionReadLifecycle').SessionReadPayloadPreview
+  /** Locally hydrated details, retained only across the same storage revision. */
+  detailsCompleteRevision?: string
   contentRevision?: string
   contentAvailability?: 'ready' | 'preparing' | 'unavailable'
   /** Bounded history has no safe contentRef for this row; body remains authoritative in storage. */

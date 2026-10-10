@@ -14,6 +14,22 @@ from opensquilla.session.models import TranscriptEntry
 from opensquilla.session.storage import SessionStorage
 
 
+def test_short_body_with_clipped_details_has_independent_versioned_read_reference():
+    entry = SimpleNamespace(
+        session_key="agent:main:webchat:details", session_id="sid", message_id="mid",
+        role="assistant", content="Complete answer", reasoning_content="思考\n" * 10000,
+        tool_calls=[], content_revision="legacy-v1:active:1:1:0:15", content_source="active",
+    )
+    message = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+    assert message["text"] == "Complete answer"
+    assert message["contentPreviewComplete"] is True
+    assert message["historyPayloadPreview"]["detailsTruncated"] is True
+    assert message["contentRef"] == {
+        "version": 1, "sessionKey": entry.session_key, "sessionId": "sid", "messageId": "mid",
+        "view": "display", "byteLength": 15, "source": "active", "revision": entry.content_revision,
+    }
+
+
 @pytest.mark.asyncio
 async def test_finalizer_inline_8m_body_fits_v2_page_and_hydrates_without_changing_replay(
     tmp_path, monkeypatch,

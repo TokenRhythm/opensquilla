@@ -241,6 +241,20 @@ export function mergeLiveOnlyFields(
     }
   }
 
+  if (serverContentRevision && prev.detailsCompleteRevision === serverContentRevision
+    && prev.contentRef && server.contentRef
+    && prev.contentRef.sessionKey === server.contentRef.sessionKey
+    && prev.contentRef.sessionId === server.contentRef.sessionId
+    && prev.contentRef.messageId === server.contentRef.messageId
+    && prev.contentRef.source === server.contentRef.source
+    && server.historyPayloadPreview?.detailsTruncated) {
+    merged.reasoning = prev.reasoning
+    merged.reasoningBlocks = prev.reasoningBlocks
+    merged.tool_calls = prev.tool_calls
+    merged.timeline = prev.timeline
+    merged.detailsCompleteRevision = serverContentRevision
+    merged.historyPayloadPreview = { ...server.historyPayloadPreview, detailsTruncated: false }
+  }
   return merged
 }
 

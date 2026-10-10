@@ -53,6 +53,14 @@ class SessionContentReaderStorageAdapter(ContentReader):
     ) -> str:
         return await self._storage.read_legacy_display_text(ref, max_bytes=max_bytes)
 
+    async def read_display_details(
+        self,
+        ref: LegacyContentRef,
+        *,
+        max_bytes: int = MAX_DISPLAY_CONTENT_BYTES,
+    ) -> str:
+        return await self._storage.read_legacy_display_details(ref, max_bytes=max_bytes)
+
 
 def build_content_reader(
     storage: SessionStorage,

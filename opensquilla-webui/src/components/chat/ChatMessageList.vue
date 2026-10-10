@@ -101,6 +101,7 @@
           v-else-if="messages[entry.index].displayRole === 'assistant'"
           :message="hydratedMessage(messages[entry.index], entry.index)"
           :index="entry.index"
+          :load-history-details="loadHistoryDetails"
           :share-mode="shareMode"
           :share-selected="selectedMessageIds.has(chatMessageKey(messages[entry.index], entry.index))"
           :share-message-id="chatMessageKey(messages[entry.index], entry.index)"
@@ -139,6 +140,7 @@
           @open-artifact="$emit('openArtifact', $event)"
           @toggle-tool-group="$emit('toggleToolGroup', $event)"
           @toggle-tool-item="$emit('toggleToolItem', $event)"
+          @details-disclosure="(message, open) => $emit('detailsDisclosure', message, open)"
           @show-tool-result="(content, title, context) => $emit('showToolResult', content, title, context)"
           @open-session="$emit('openSession', $event)"
           @resolve-interrupt="(id, decision) => $emit('resolveInterrupt', id, decision)"
@@ -230,6 +232,7 @@ import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 
 const props = defineProps<{
   messages: ChatRenderedMessage[]
+  loadHistoryDetails?: (message: ChatRenderedMessage) => Promise<void>
   shareMode: boolean
   selectedMessageIds: Set<string>
   stripTimePrefix: (text: string) => string
@@ -299,6 +302,7 @@ const emit = defineEmits<{
   openArtifact: [artifact: ArtifactPayload]
   toggleToolGroup: [groupId: string]
   toggleToolItem: [renderKey: string]
+  detailsDisclosure: [message: ChatRenderedMessage, open: boolean]
   showToolResult: [content: string, title: string, context?: ToolResultContext]
   openSession: [sessionKey: string]
   forkConversation: [throughTurnId?: string]

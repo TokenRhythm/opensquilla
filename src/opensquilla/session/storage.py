@@ -3239,6 +3239,20 @@ class SessionStorage:
                 END
                 """
             )
+            await self._conn.execute(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS trg_{table}_details_revision
+                AFTER UPDATE OF reasoning_content, tool_calls, turn_context ON {table}
+                WHEN NOT (NEW.reasoning_content IS OLD.reasoning_content)
+                  OR NOT (NEW.tool_calls IS OLD.tool_calls)
+                  OR NOT (NEW.turn_context IS OLD.turn_context)
+                BEGIN
+                    UPDATE {table}
+                    SET content_revision = OLD.content_revision + 1
+                    WHERE id = NEW.id;
+                END
+                """
+            )
         await self._conn.commit()
 
     async def _migrate_transcript_turn_usage_column(self) -> None:
@@ -16348,6 +16362,72 @@ class SessionStorage:
                 f"display content exceeds {max_bytes} bytes"
             )
         return text
+
+    async def read_legacy_display_details(
+        self,
+        ref: LegacyContentRef,
+        *,
+        max_bytes: int = MAX_DISPLAY_CONTENT_BYTES,
+    ) -> str:
+        """Read complete display details on demand, without loading the message body."""
+        from opensquilla.application.content_reader import ContentExportLimitError
+
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+            raise ValueError("display details max_bytes must be a positive integer")
+        table = {
+            "active": "transcript_entries", "compacted": "compacted_transcript_entries",
+        }.get(ref.source)
+        if table is None or not ref.revision:
+            raise ContentNotFoundError("legacy details require a versioned content reference")
+        identity = "id" if ref.source == "active" else "original_entry_id"
+        # Check the same revision and the combined payload size in the SQL read.
+        # A large tool result must not cross into Python before the display cap
+        # is enforced; reasoning/details updates invalidate this revision too.
+        rows = await self._read_history_query(
+            f"""WITH selected AS (
+                SELECT message_id, role, reasoning_content, tool_calls, turn_context,
+                       coalesce(length(CAST(reasoning_content AS BLOB)), 0)
+                       + coalesce(length(CAST(tool_calls AS BLOB)), 0)
+                       + coalesce(length(CAST(turn_context AS BLOB)), 0) AS detail_bytes
+                FROM {table} WHERE session_id = ? AND message_id = ?
+                  AND 'legacy-v1:{ref.source}:' || {identity} || ':' || created_at || ':'
+                    || content_revision || ':' || length(CAST(content AS BLOB)) = ?
+                LIMIT 1
+            ) SELECT message_id, role, detail_bytes,
+                     CASE WHEN detail_bytes <= ? THEN reasoning_content END AS reasoning_content,
+                     CASE WHEN detail_bytes <= ? THEN tool_calls END AS tool_calls,
+                     CASE WHEN detail_bytes <= ? THEN turn_context END AS turn_context
+              FROM selected""",
+            (ref.session_id, ref.message_id, ref.revision, max_bytes, max_bytes, max_bytes),
+            operation="content_details",
+        )
+        if not rows:
+            raise ContentNotFoundError("legacy transcript details changed or were not found")
+        row = rows[0]
+        if row["detail_bytes"] > max_bytes:
+            raise ContentExportLimitError(f"display details exceed {max_bytes} bytes")
+
+        def project_details() -> str:
+            from opensquilla.chat.history import transcript_entries_to_chat_messages
+
+            payload = dict(row)
+            payload.pop("detail_bytes")
+            entry = TranscriptEntry(
+                session_id=ref.session_id, content="", **_deserialize_row(payload)
+            )
+            messages = transcript_entries_to_chat_messages([entry], content_mode="legacy")
+            message = messages[0] if messages else {}
+            projected = {
+                key: message[key] for key in (
+                    "id", "message_id", "role", "reasoning_content", "tool_calls", "turn_context",
+                ) if key in message
+            }
+            text = json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+            if len(text.encode("utf-8")) > max_bytes:
+                raise ContentExportLimitError(f"display details exceed {max_bytes} bytes")
+            return text
+
+        return await asyncio.to_thread(project_details)
 
     async def delete_transcript(self, session_id: str) -> None:
         async with self._write_transaction("delete_transcript") as conn:

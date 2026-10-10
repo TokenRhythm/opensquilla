@@ -19,6 +19,12 @@ export interface ContentRangeCacheOptions {
   readonly maxEntries?: number
 }
 
+export interface ContentDetails {
+  readonly messageId: string
+  readonly reasoning: string
+  readonly toolCalls: Record<string, unknown>[]
+}
+
 const DEFAULT_CHUNK_BYTES = 256 * 1024
 const DEFAULT_MAX_BYTES = 8 * 1024 * 1024
 const DEFAULT_MAX_ENTRIES = 32
@@ -150,7 +156,27 @@ export class ContentRangeCache {
     options: { signal?: AbortSignal } = {},
   ): Promise<string> {
     if (ref.view !== 'display') throw new RangeError('display view is required')
-    const url = `${this.baseUrl}?sessionKey=${encode(ref.sessionKey)}&sessionId=${encode(ref.sessionId)}&messageId=${encode(ref.messageId)}${ref.source ? `&source=${encode(ref.source)}` : ''}${ref.revision ? `&revision=${encode(ref.revision)}` : ''}&view=display&export=1`
+    return this.readProjection(ref, 'display', options)
+  }
+
+  async readDetails(ref: ContentRangeRef, options: { signal?: AbortSignal } = {}): Promise<ContentDetails> {
+    const value = JSON.parse(await this.readProjection(ref, 'details', options))
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+      || value.message_id !== ref.messageId || value.role !== 'assistant'
+      || (value.reasoning_content != null && typeof value.reasoning_content !== 'string')
+      || (value.tool_calls != null && (!Array.isArray(value.tool_calls)
+        || value.tool_calls.some((call: unknown) => !call || typeof call !== 'object' || Array.isArray(call))))) {
+      throw new Error('content.read.v1 returned invalid details')
+    }
+    return { messageId: value.message_id, reasoning: value.reasoning_content ?? '', toolCalls: value.tool_calls ?? [] }
+  }
+
+  private async readProjection(
+    ref: ContentRangeRef,
+    view: 'display' | 'details',
+    options: { signal?: AbortSignal },
+  ): Promise<string> {
+    const url = `${this.baseUrl}?sessionKey=${encode(ref.sessionKey)}&sessionId=${encode(ref.sessionId)}&messageId=${encode(ref.messageId)}${ref.source ? `&source=${encode(ref.source)}` : ''}${ref.revision ? `&revision=${encode(ref.revision)}` : ''}&view=${view}&export=1`
     const response = await this.fetcher(url, {
       method: 'GET',
       cache: 'no-store',

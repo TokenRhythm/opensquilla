@@ -145,6 +145,7 @@ const props = withDefaults(defineProps<{
 })
 
 const { t } = useI18n()
+const emit = defineEmits<{ openChange: [open: boolean] }>()
 const bodyId = `assistant-activity-body-${useId()}`
 const initialOpen = () => props.defaultOpen
 const open = ref(readAssistantActivityExpansion(
@@ -164,6 +165,7 @@ function toggleOpen() {
 watch(open, expanded => {
   writeAssistantActivityExpansion(props.stateKey, expanded, props.continuityKey, manuallyToggled.value)
 })
+watch(open, expanded => emit('openChange', expanded), { immediate: true, flush: 'post' })
 
 watch(() => [props.stateKey, props.continuityKey] as const, ([key, continuityKey]) => {
   manuallyToggled.value = readAssistantActivityManualChoice(key, continuityKey) !== undefined

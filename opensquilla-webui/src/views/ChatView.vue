@@ -236,6 +236,8 @@
           @open-artifact="openArtifact"
           @toggle-tool-group="toggleToolGroup"
           @toggle-tool-item="toggleToolItem"
+          @details-disclosure="(message, open) => historyDetails.setExpanded(message.contentRef, open)"
+          :load-history-details="message => historyDetails.setExpanded(message.contentRef, true)"
           @show-tool-result="showToolResultModal"
           @open-session="switchToSession"
           @resolve-interrupt="resolveInterrupt"
@@ -900,6 +902,7 @@ import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCent
 import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
 import { GOAL_CONTINUITY_KEY, type GoalContinuity } from '@/modules/goalContinuity'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
+import { useChatHistoryDetails } from '@/composables/chat/useChatHistoryDetails'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
 import {
@@ -2532,6 +2535,7 @@ const chatHistory = useChatHistory({
     }
   },
 })
+const historyDetails = useChatHistoryDetails({ sessionKey, messages })
 const {
   historySessionKey,
   historyState,

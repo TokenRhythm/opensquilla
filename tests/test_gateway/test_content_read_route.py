@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -34,6 +35,9 @@ class _Storage:
 
     async def read_legacy_display_text(self, ref, *, max_bytes=8 * 1024 * 1024):
         return "displayed hello"
+
+    async def read_legacy_display_details(self, ref, *, max_bytes=8 * 1024 * 1024):
+        return json.dumps({"id": "mid", "role": "assistant", "reasoning_content": "思考" * 15000})
 
 
 class _Manager:
@@ -80,6 +84,15 @@ def test_content_read_v1_range_and_export_are_bounded(monkeypatch) -> None:
         assert display_response.text == "displayed hello"
         assert display_response.headers["X-Content-View"] == "display"
         assert display_response.headers["Cache-Control"] == "no-store"
+
+        details_response = client.get(
+            "/api/content/read", params={**params, "view": "details", "export": "1"},
+        )
+        assert details_response.status_code == 200
+        assert details_response.json()["reasoning_content"] == "思考" * 15000
+        assert details_response.headers["X-Content-View"] == "details"
+        assert details_response.headers["Cache-Control"] == "no-store"
+        assert details_response.headers["X-Content-Bytes"] == str(len(details_response.content))
 
         missing_export = client.get(
             "/api/content/read",
@@ -155,7 +168,8 @@ def test_content_read_v1_rejects_unknown_source_instead_of_falling_back(monkeypa
     assert response.json()["code"] == "INVALID_PARAMS"
 
 
-def test_content_read_v1_enforces_guest_session_ownership(monkeypatch) -> None:
+@pytest.mark.parametrize("view", ["raw", "display", "details"])
+def test_content_read_v1_enforces_guest_session_ownership(monkeypatch, view) -> None:
     import opensquilla.gateway.app as gateway_app
 
     storage = _Storage()
@@ -168,6 +182,7 @@ def test_content_read_v1_enforces_guest_session_ownership(monkeypatch) -> None:
         "sessionKey": "agent:main:webchat:default",
         "sessionId": "sid",
         "messageId": "mid",
+        "view": view, "export": "1",
     }
     with TestClient(app, client=("10.1.2.3", 51200)) as client:
         response = client.get(
@@ -197,7 +212,10 @@ def test_content_read_v1_enforces_guest_session_ownership(monkeypatch) -> None:
         (["operator.admin"], 200),
     ],
 )
-def test_content_read_requires_transcript_read_scope(monkeypatch, scopes, expected_status) -> None:
+@pytest.mark.parametrize("view", ["raw", "display", "details"])
+def test_content_read_requires_transcript_read_scope(
+    monkeypatch, scopes, expected_status, view,
+) -> None:
     import opensquilla.gateway.app as gateway_app
 
     storage = _Storage()
@@ -214,11 +232,16 @@ def test_content_read_requires_transcript_read_scope(monkeypatch, scopes, expect
                 "sessionId": "sid",
                 "messageId": "mid",
                 "export": "1",
+                "view": view,
             },
         )
 
     assert response.status_code == expected_status
     if expected_status == 403:
         assert response.json()["code"] == "UNAUTHORIZED"
-    else:
+    elif view == "raw":
         assert response.text == storage.body.decode("utf-8")
+    elif view == "details":
+        assert response.json()["reasoning_content"] == "思考" * 15000
+    else:
+        assert response.text == "displayed hello"

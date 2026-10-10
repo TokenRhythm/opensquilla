@@ -863,9 +863,9 @@ def create_gateway_app(
                 status_code=400,
             )
         view = str(request.query_params.get("view") or "raw").lower()
-        if view not in {"raw", "display"}:
+        if view not in {"raw", "display", "details"}:
             return JSONResponse(
-                {"error": "view must be raw or display", "code": "INVALID_PARAMS"},
+                {"error": "view must be raw, display or details", "code": "INVALID_PARAMS"},
                 status_code=400,
             )
         # Guests are accepted on the same local read surface as chat.history;
@@ -920,7 +920,7 @@ def create_gateway_app(
             if requested_revision and requested_revision != (ref.revision or ""):
                 raise ContentNotFoundError("legacy transcript content changed")
             export = str(request.query_params.get("export") or "").lower() in {"1", "true", "yes"}
-            if view == "display":
+            if view in {"display", "details"}:
                 if not export:
                     return JSONResponse(
                         {
@@ -929,15 +929,20 @@ def create_gateway_app(
                         },
                         status_code=400,
                     )
-                text = await reader.read_display_text(
-                    ref,
-                    max_bytes=MAX_CONTENT_EXPORT_BYTES,
+                read = (
+                    reader.read_display_details if view == "details" else reader.read_display_text
                 )
-                response = Response(text, media_type="text/plain; charset=utf-8")
+                text = await read(ref, max_bytes=MAX_CONTENT_EXPORT_BYTES)
+                response = Response(
+                    text,
+                    media_type=(
+                        "application/json" if view == "details" else "text/plain; charset=utf-8"
+                    ),
+                )
                 response.headers["X-Content-Ref"] = f"{session_id}/{message_id}"
                 if ref.revision:
                     response.headers["X-Content-Revision"] = ref.revision
-                response.headers["X-Content-View"] = "display"
+                response.headers["X-Content-View"] = view
                 response.headers["X-Content-Bytes"] = str(len(text.encode("utf-8")))
                 response.headers["Cache-Control"] = "no-store"
                 return response

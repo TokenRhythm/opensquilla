@@ -376,7 +376,8 @@
 </template>
 
 <script lang="ts">
-import { defineComponent, h, type PropType } from 'vue'
+import { defineComponent, h, inject, onBeforeUnmount, type PropType } from 'vue'
+import { HISTORY_DETAILS_READY } from '@/modules/historyDetails'
 import { useI18n } from 'vue-i18n'
 import type { ChatToolCallRenderItem, ToolResultContext } from '@/types/chat'
 import {
@@ -601,6 +602,25 @@ const ToolRowSections = defineComponent({
   emits: ['showResult'],
   setup(props, { emit }) {
     const { t } = useI18n()
+    const historyDetailsReady = inject(HISTORY_DETAILS_READY, undefined)
+    let disposed = false
+    onBeforeUnmount(() => { disposed = true })
+    async function showSection(section: 'input' | 'result') {
+      const toolId = props.call.toolId
+      const ready = historyDetailsReady?.()
+      if (ready === false) return
+      if (ready && typeof ready !== 'boolean') {
+        if (!(await ready)) return
+        await nextTick()
+        if (disposed || toolId !== props.call.toolId) return
+      }
+      const call = props.call
+      const kind = section === 'input' ? 'input' : call.isError ? 'error' : 'result'
+      emit('showResult', section === 'input' ? call.inputRaw || call.inputPreview : call.result,
+        `${props.label} · ${t(kind === 'input' ? 'shared.runTrace.sectionInput'
+          : kind === 'error' ? 'shared.runTrace.sectionError' : 'shared.runTrace.sectionResult')}`,
+        toolResultContext(call, kind))
+    }
     return () => {
       const call = props.call
       const sections = []
@@ -622,12 +642,7 @@ const ToolRowSections = defineComponent({
                 class: 'step-view-btn',
                 onClick: (event: Event) => {
                   event.stopPropagation()
-                  emit(
-                    'showResult',
-                    fullInput,
-                    `${props.label} · ${t('shared.runTrace.sectionInput')}`,
-                    toolResultContext(call, 'input'),
-                  )
+                  void showSection('input')
                 },
               }, t('shared.runTrace.viewFull'))
             : null,
@@ -671,12 +686,7 @@ const ToolRowSections = defineComponent({
                 class: 'step-view-btn',
                 onClick: (event: Event) => {
                   event.stopPropagation()
-                  emit(
-                    'showResult',
-                    call.result,
-                    `${props.label} · ${kindLabel}`,
-                    toolResultContext(call, call.isError ? 'error' : 'result'),
-                  )
+                  void showSection('result')
                 },
               }, t('shared.runTrace.viewFull'))
             : null,
@@ -779,6 +789,7 @@ defineSlots<{
 
 const emit = defineEmits<{
   toggleGroup: [groupId: string]
+  openChange: [open: boolean]
   toggleItem: [renderKey: string]
   showResult: [content: string, title: string, context?: ToolResultContext]
 }>()
@@ -1024,6 +1035,7 @@ const showBulkControl = computed(
   () => props.showBulkToggle === true && bulkToggleTargets.value.length > 1,
 )
 const anyBulkTargetOpen = computed(() => bulkToggleTargets.value.some(target => target.open))
+watch(anyBulkTargetOpen, open => emit('openChange', open), { immediate: true, flush: 'post' })
 const bulkToggleLabel = computed(() => t(
   anyBulkTargetOpen.value ? 'chat.tool.collapseAll' : 'chat.tool.expandAll',
 ))

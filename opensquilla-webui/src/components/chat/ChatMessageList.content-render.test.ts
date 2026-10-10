@@ -1,9 +1,12 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createApp, h, nextTick, reactive, type App } from 'vue'
+import { createApp, h, nextTick, reactive, ref, type App } from 'vue'
 import { createPinia } from 'pinia'
 import i18n from '@/i18n'
-import type { ChatRenderedMessage } from '@/types/chat'
+import type { ChatMessage, ChatRenderedMessage, RawToolCallPayload } from '@/types/chat'
+import { useChatHistoryDetails } from '@/composables/chat/useChatHistoryDetails'
+import { useChatRenderedMessages } from '@/composables/chat/useChatRenderedMessages'
+import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import { ContentRangeCache } from '@/utils/chat/contentRangeCache'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
@@ -23,20 +26,38 @@ const message = (overrides: Partial<ChatRenderedMessage> = {}): ChatRenderedMess
   ...overrides,
 })
 
-async function mount(messages: ChatRenderedMessage[]) {
+async function mount(messages: ChatRenderedMessage[], historyMessages?: ChatMessage[]) {
   const host = document.createElement('div')
   document.body.appendChild(host)
   const { renderMarkdown } = useChatTextRendering()
+  const canonical = ref(historyMessages ?? [])
+  const openTools = reactive(new Set<string>())
+  const showResult = vi.fn()
   const props = reactive({
     messages, sessionKey, shareMode: false, selectedMessageIds: new Set<string>(),
     stripTimePrefix: (value: string) => value, renderMarkdown,
     fmtTok: (value: number) => String(value), subagentSummary: (value: string) => value,
     subagentBody: (value: string) => value, toolCallGroups: () => [],
-    isToolGroupOpen: () => false, isToolItemOpen: () => false,
+    isToolGroupOpen: (key: string) => openTools.has(key), isToolItemOpen: (key: string) => openTools.has(key),
     toolGroupStatusText: () => '', toolStatusText: () => '', toolSecondaryText: () => '',
     copyMessage: async () => true, downloadAttachment: async () => true,
   })
-  const app = createApp({ setup: () => () => h(ChatMessageList, props) })
+  const app = createApp({ setup: () => {
+    const key = ref(sessionKey)
+    const details = useChatHistoryDetails({ sessionKey: key, messages: canonical })
+    const projected = historyMessages ? useChatRenderedMessages({
+      messages: canonical, sessionKey: key, routerSlots: ref([]), routerModels: ref({}), routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(false), routerVisualMode: ref('real_candidates'), renderMarkdown,
+      stripGeneratedArtifactMarkers: text => text, stripTimePrefix: text => text, isSubagentCompletionMessage: () => false,
+    }).renderedMessages : undefined
+    const toggle = (id: string) => { if (!openTools.delete(id)) openTools.add(id) }
+    return () => h(ChatMessageList, {
+      ...props, messages: projected?.value ?? props.messages,
+      loadHistoryDetails: (message: ChatRenderedMessage) => details.setExpanded(message.contentRef, true),
+      onDetailsDisclosure: (message: ChatRenderedMessage, open: boolean) => details.setExpanded(message.contentRef, open),
+      onToggleToolGroup: toggle, onToggleToolItem: toggle, onShowToolResult: showResult,
+    })
+  } })
   const http = httpTransportTestDouble()
   app.use(i18n)
   app.use(createPinia())
@@ -48,16 +69,85 @@ async function mount(messages: ChatRenderedMessage[]) {
   app.mount(host)
   apps.push(app)
   for (let index = 0; index < 6; index++) { await Promise.resolve(); await nextTick() }
-  return { host, props }
+  return { host, props, canonical, showResult }
 }
 
 afterEach(() => {
   apps.splice(0).forEach(app => app.unmount())
   document.body.innerHTML = ''
   vi.restoreAllMocks()
+  clearAssistantActivityExpansionState()
 })
 
 describe('automatic content through the real assistant renderer', () => {
+  it.each(['immediate', 'delayed', 'closed', 'replaced', 'failed'])('loads complete details and shares an existing read with the full viewer (%s)', async mode => {
+    const reasoning = '深入思考🙂'.repeat(3_000)
+    const input = { data: 'long input '.repeat(3_000) }
+    const result = 'full-result-'.repeat(3_000)
+    const segments: RawToolCallPayload[] = [
+      { type: 'tool_use', tool_use_id: 'tool', name: 'details_probe', input },
+      { type: 'tool_result', tool_use_id: 'tool', name: 'details_probe', result },
+      { type: 'text', text: 'Final answer', presentation: 'answer' },
+    ]
+    let release!: () => void
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(() => {
+      const response = () => new Response(JSON.stringify({
+        message_id: 'answer', role: 'assistant', reasoning_content: reasoning, tool_calls: segments,
+      }))
+      return mode === 'immediate' ? Promise.resolve(response())
+        : new Promise((resolve, reject) => { release = () => mode === 'failed'
+          ? reject(new Error('details unavailable')) : resolve(response()) })
+    })
+    const bodyRead = vi.spyOn(ContentRangeCache.prototype, 'readDisplay')
+    const { host, canonical, showResult } = await mount([], [{
+      role: 'assistant', text: 'Final answer', messageId: 'answer', ts: 1, previewComplete: true,
+      contentRef: { ...message().contentRef!, revision: 'r1' }, contentRevision: 'r1',
+      historyPayloadPreview: { detailsTruncated: true }, reasoning: { text: reasoning.slice(0, 30), seconds: 3 },
+      tool_calls: [{ ...segments[0], input: { data: 'preview data '.repeat(60) } },
+        { ...segments[1], result: 'preview result '.repeat(60) }, segments[2]],
+    }])
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(bodyRead).not.toHaveBeenCalled()
+    const activity = host.querySelector<HTMLButtonElement>('.assistant-activity__summary')!
+    expect(activity).not.toBeNull()
+    activity.click()
+    if (mode !== 'immediate') {
+      await nextTick()
+      const row = host.querySelector<HTMLButtonElement>('.tool-row')!
+      if (row.getAttribute('aria-expanded') !== 'true') row.click()
+      await nextTick()
+      host.querySelector<HTMLButtonElement>('.activity-tool-details__view')!.click()
+      expect(showResult).not.toHaveBeenCalled()
+      if (mode === 'closed') activity.click()
+      if (mode === 'replaced') canonical.value = []
+      await nextTick()
+      release()
+    }
+    for (let i = 0; i < 16; i++) { await Promise.resolve(); await nextTick() }
+    expect(fetcher).toHaveBeenCalledOnce()
+    expect(fetcher.mock.calls[0]?.[0]).toContain('view=details&export=1')
+    if (mode === 'closed' || mode === 'replaced' || mode === 'failed') {
+      expect(showResult).not.toHaveBeenCalled()
+      if (mode !== 'replaced') expect(canonical.value[0]?.reasoning?.text).toBe(reasoning.slice(0, 30))
+      return
+    }
+    expect(canonical.value[0]?.reasoning?.text).toBe(reasoning)
+    expect(host.querySelector('.thinking-fold__body')?.textContent).toBe(reasoning)
+    if (mode === 'immediate') {
+      const toolRow = host.querySelector<HTMLButtonElement>('.tool-row')!
+      expect(toolRow).not.toBeNull()
+      if (toolRow.getAttribute('aria-expanded') !== 'true') toolRow.click()
+      await nextTick()
+      const fullButton = host.querySelector<HTMLButtonElement>('.activity-tool-details__view')!
+      expect(fullButton).not.toBeNull()
+      fullButton.click()
+    }
+    expect(showResult.mock.calls[0]?.[0]).toContain(input.data)
+    expect(showResult.mock.calls[0]?.[0]).toContain(result.trimEnd())
+    expect(host.querySelector('.chat-history-content-page')).toBeNull()
+    expect(host.querySelector('[data-testid="chat-history-content-hydration"]')).toBeNull()
+  })
+
   it('renders hydrated Markdown once without a separate reader or stale timeline preview', async () => {
     const body = '## 完整回答🙂\n\n**正文已恢复**\n\n- 条目一\n- 条目二\n'
     const prefix = body.slice(0, 5)

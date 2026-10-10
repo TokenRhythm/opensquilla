@@ -9,6 +9,23 @@ const ref = {
 }
 
 describe('ContentRangeCache', () => {
+  it('reads semantic details with the same revision fence and bounded stream as display bodies', async () => {
+    const value = { message_id: ref.messageId, role: 'assistant', reasoning_content: '思考'.repeat(15_000), tool_calls: [] }
+    const fetcher = vi.fn(async () => new Response(JSON.stringify(value)))
+    const cache = new ContentRangeCache({ fetcher })
+    await expect(cache.readDetails({ ...ref, revision: 'r1' })).resolves.toMatchObject({ reasoning: value.reasoning_content })
+    expect(fetcher).toHaveBeenCalledWith(expect.stringContaining('&revision=r1&view=details&export=1'), expect.anything())
+    await expect(new ContentRangeCache({ fetcher, maxBytes: 1_024 }).readDetails(ref)).rejects.toThrow('too large')
+  })
+
+  it.each([
+    { message_id: 'other', role: 'assistant', tool_calls: [] },
+    { message_id: ref.messageId, role: 'user', tool_calls: [] },
+    { message_id: ref.messageId, role: 'assistant', tool_calls: [null] },
+  ])('rejects unrelated or malformed detail projections', async value => {
+    const cache = new ContentRangeCache({ fetcher: async () => new Response(JSON.stringify(value)) })
+    await expect(cache.readDetails(ref)).rejects.toThrow('invalid details')
+  })
   it('coalesces identical in-flight reads and bounds the range', async () => {
     let release!: () => void
     const fetcher = vi.fn(() => new Promise<Response>(resolve => {

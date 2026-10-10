@@ -59,6 +59,13 @@ class ContentReader(Protocol):
         max_bytes: int = MAX_DISPLAY_CONTENT_BYTES,
     ) -> str: ...
 
+    async def read_display_details(
+        self,
+        ref: LegacyContentRef,
+        *,
+        max_bytes: int = MAX_DISPLAY_CONTENT_BYTES,
+    ) -> str: ...
+
 
 async def iter_content_ranges(
     reader: ContentReader,

@@ -23,6 +23,61 @@ from opensquilla.session.storage import SessionStorage
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["active", "compacted"])
+async def test_history_details_restore_without_reading_or_replacing_body(tmp_path, source):
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    reasoning = "thinking 中文\n" * 4000
+    segments = [
+        {"type": "text", "text": "Complete answer", "activity_order": 1},
+        {"type": "tool_use", "id": "tool-1", "name": "write_file",
+         "input": {"path": "page.html", "content": "<html>中文</html>" * 3000},
+         "activity_order": 2},
+        {"type": "tool_result", "tool_use_id": "tool-1", "content": "result\n" * 5000,
+         "activity_order": 3},
+    ]
+    try:
+        await storage.append_transcript_entry(TranscriptEntry(
+            session_id="sid", session_key="agent:main:webchat:details", message_id="mid",
+            role="assistant", content="Complete answer", reasoning_content=reasoning,
+            tool_calls=segments, created_at=1,
+        ))
+        if source == "compacted":
+            await storage.conn.execute("""
+                INSERT INTO compacted_transcript_entries
+                  (session_id, session_key, message_id, role, content, tool_calls,
+                   reasoning_content, created_at, archived_at, original_entry_id,
+                   content_byte_length, content_revision)
+                SELECT session_id, session_key, message_id, role, content, tool_calls,
+                       reasoning_content, created_at, 2, id, content_byte_length, content_revision
+                FROM transcript_entries
+            """)
+            await storage.conn.commit()
+        ref = await storage.get_legacy_content_ref("sid", "mid", source=source)
+        details = json.loads(await storage.read_legacy_display_details(ref))
+        assert details["reasoning_content"] == reasoning
+        assert details["tool_calls"][0]["text"] == "Complete answer"
+        assert details["tool_calls"][1]["input"] == segments[1]["input"]
+        assert details["tool_calls"][2]["content"] == segments[2]["content"]
+        assert [s["activity_order"] for s in details["tool_calls"]] == [1, 2, 3]
+        assert "text" not in details
+        assert "assistant_replay" not in details
+        with pytest.raises(ContentExportLimitError):
+            await storage.read_legacy_display_details(ref, max_bytes=1024)
+        table = "transcript_entries" if source == "active" else "compacted_transcript_entries"
+        await storage.conn.execute(
+            f"UPDATE {table} SET reasoning_content = ? WHERE message_id = ?",
+            (reasoning.replace("thinking", "replaced"), "mid"),
+        )
+        await storage.conn.commit()
+        with pytest.raises(ContentNotFoundError):
+            await storage.read_legacy_display_details(ref)
+        current = await storage.get_legacy_content_ref("sid", "mid", source=source)
+        assert current.revision != ref.revision
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_legacy_content_range_reads_only_requested_bytes(tmp_path) -> None:
     body = '{"text":"' + ("x你好" * 350_000) + '"}'
     storage = await SessionStorage.open(tmp_path / "sessions.db")
@@ -97,14 +152,16 @@ async def test_legacy_content_range_rejects_same_length_row_replacement(tmp_path
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["active", "compacted"])
+@pytest.mark.parametrize("view", ["display", "details"])
 async def test_display_read_rejects_same_length_update_after_ref_check(
-    tmp_path, monkeypatch, source: str,
+    tmp_path, monkeypatch, source: str, view: str,
 ) -> None:
     storage = await SessionStorage.open(tmp_path / "sessions.db")
     try:
         await storage.append_transcript_entry(TranscriptEntry(
             session_id="sid", session_key="agent:main:webchat:default", message_id="mid",
-            role="assistant", content="original body", created_at=1,
+            role="assistant", content="original body", reasoning_content="original body",
+            created_at=1,
         ))
         if source == "compacted":
             entry = (await storage.get_transcript("sid"))[0]
@@ -120,25 +177,31 @@ async def test_display_read_rejects_same_length_update_after_ref_check(
 
         async def replace_before_display(sql, params, *, operation, **kwargs):
             nonlocal replaced
-            if operation == "content_display" and not replaced:
+            if operation == f"content_{view}" and not replaced:
                 replaced = True
                 table = (
                     "transcript_entries" if source == "active" else "compacted_transcript_entries"
                 )
+                column = "content" if view == "display" else "reasoning_content"
                 await storage.conn.execute(
-                    f"UPDATE {table} SET content = ? WHERE session_id = ? AND message_id = ?",
+                    f"UPDATE {table} SET {column} = ? WHERE session_id = ? AND message_id = ?",
                     ("replaced body", "sid", "mid"),
                 )
                 await storage.conn.commit()
             return await read_query(sql, params, operation=operation, **kwargs)
 
         monkeypatch.setattr(storage, "_read_history_query", replace_before_display)
+        read = (storage.read_legacy_display_text if view == "display"
+                else storage.read_legacy_display_details)
         with pytest.raises(ContentNotFoundError):
-            await storage.read_legacy_display_text(ref)
+            await read(ref)
         current = await storage.get_legacy_content_ref("sid", "mid", source=source)
         assert current.revision != ref.revision
         assert current.byte_length == ref.byte_length
-        assert await storage.read_legacy_display_text(current) == "replaced body"
+        result = await read(current)
+        assert (result if view == "display" else json.loads(result)["reasoning_content"]) == (
+            "replaced body"
+        )
     finally:
         await storage.close()
 

@@ -177,8 +177,8 @@ def _bound_history_display_payloads(message: dict[str, Any]) -> None:
             ):
                 text_cut = True
                 return
-        # These fields have no display-body range reader. Explicitly disclose
-        # their partial details instead of presenting a shortened value as full.
+        # Details are restored by the existing disclosure's on-demand read,
+        # independently of whether the message body needs hydration.
         preview["detailsTruncated"] = True
         if path[0] == "reasoning_content":
             preview["reasoningUtf16Length"] = (
@@ -921,5 +921,23 @@ def transcript_entries_to_chat_messages(
             continue
         if content_mode == "bounded":
             _bound_history_display_payloads(msg)
+            if (
+                msg.get("historyPayloadPreview", {}).get("detailsTruncated")
+                and "contentRef" not in msg and not content_metadata_pending
+                and all(isinstance(value, str) and value for value in (
+                    content_session_key, content_session_id, content_message_id,
+                ))
+            ):
+                msg["contentRef"] = {
+                    "version": 1, "sessionKey": content_session_key,
+                    "sessionId": content_session_id, "messageId": content_message_id,
+                    "view": "display", "byteLength": content_byte_length,
+                }
+                revision = getattr(projected_entry, "content_revision", None)
+                if isinstance(revision, str) and revision:
+                    msg["contentRef"]["revision"] = revision
+                source = getattr(projected_entry, "content_source", None)
+                if source in {"active", "compacted"}:
+                    msg["contentRef"]["source"] = source
         messages.append(msg)
     return messages
