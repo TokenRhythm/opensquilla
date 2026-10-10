@@ -1136,7 +1136,11 @@ def _query_offline_account() -> dict[str, str] | None:
             "-NoProfile",
             "-Command",
             "$ErrorActionPreference='Stop'; "
-            f"$u=Get-LocalUser -Name '{OFFLINE_USERNAME}' -ErrorAction SilentlyContinue; "
+            # SilentlyContinue leaves $? false for a missing account, making
+            # powershell.exe exit 1 even with no output. Only absence is a
+            # normal first-setup result; other lookup errors must propagate.
+            f"try {{ $u=Get-LocalUser -Name '{OFFLINE_USERNAME}' -ErrorAction Stop }} "
+            "catch [Microsoft.PowerShell.Commands.UserNotFoundException] { $u=$null }; "
             "if ($null -ne $u) { @{sid=$u.SID.Value; description=$u.Description} "
             "| ConvertTo-Json -Compress }",
         ],

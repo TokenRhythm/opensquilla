@@ -111,6 +111,62 @@ def test_new_credential_survives_network_install_failure(profile, monkeypatch):
     assert not setup.setup_marker_is_current(marker)
 
 
+def test_first_setup_persists_owned_pending_identity_before_readiness(profile, monkeypatch):
+    marker = setup.default_setup_marker_path(profile)
+    environments = []
+
+    def create(command, **kwargs):
+        assert "new-password" not in repr(command)
+        environments.append(kwargs["env"])
+        assert not marker.exists()
+        return SimpleNamespace(returncode=0, stdout="S-1-sandbox", stderr="")
+
+    monkeypatch.setattr(setup.subprocess, "run", create)
+    result = setup.ensure_offline_sandbox_user(marker.parent, profile_path=profile)
+
+    assert len(environments) == 1
+    assert environments[0]["OPENSQUILLA_SANDBOX_EXPECTED_SID"] == ""
+    assert environments[0]["OPENSQUILLA_SANDBOX_DESCRIPTION"] == (
+        "OpenSquilla sandbox owner=S-1-owner"
+    )
+    pending = setup.read_setup_marker(marker)
+    assert pending is not None and pending.setup_state == "pending"
+    assert pending.network is not None
+    assert pending.network.offline_user_sid == result["sid"] == "S-1-sandbox"
+    assert pending.network.protected_password == result["protectedPassword"]
+    assert result["protectedPassword"] == "protected:new-password"
+    assert not setup.setup_marker_is_current(marker)
+
+
+@pytest.mark.parametrize("stage", ["lookup", "protect", "create"])
+def test_first_setup_failure_never_publishes_identity(profile, monkeypatch, stage):
+    marker = setup.default_setup_marker_path(profile)
+
+    def fail(*args, **kwargs):
+        raise OSError("first_setup_failed")
+
+    if stage == "lookup":
+        monkeypatch.setattr(setup, "_query_offline_account", fail)
+        monkeypatch.setattr(identity, "protect_password", fail_if_called)
+    elif stage == "protect":
+        monkeypatch.setattr(identity, "protect_password", fail)
+    monkeypatch.setattr(
+        setup.subprocess,
+        "run",
+        (
+            lambda *args, **kwargs: SimpleNamespace(
+                returncode=1, stdout="", stderr="first_setup_failed"
+            )
+        )
+        if stage == "create"
+        else fail_if_called,
+    )
+
+    with pytest.raises(OSError, match="first_setup_failed"):
+        setup.ensure_offline_sandbox_user(marker.parent, profile_path=profile)
+    assert not marker.exists()
+
+
 @pytest.mark.parametrize(
     "description",
     ["OpenSquilla sandbox owner=S-1-owner", "OpenSquilla offline sandbox network identity"],
