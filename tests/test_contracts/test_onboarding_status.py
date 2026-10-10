@@ -205,7 +205,22 @@ VIDEO_GENERATION_STATE_KEYS = frozenset(
     {"enabled", "providerId", "primary", "credentialOptions"}
 )
 VIDEO_GENERATION_CREDENTIAL_OPTION_KEYS = frozenset(
-    {"providerId", "available", "source", "owner", "envKey", "clearable"}
+    {
+        "providerId",
+        "available",
+        "source",
+        "owner",
+        "envKey",
+        "clearable",
+        # Additive, secret-free connection provenance for shared credentials.
+        # Older gateways omit these fields; clients retain compatibility defaults.
+        "baseUrl",
+        "baseUrlSource",
+        "baseUrlAuthored",
+        "apiKeyEnvAuthored",
+        "sharedBaseUrl",
+        "sharedCredentialAvailable",
+    }
 )
 
 
