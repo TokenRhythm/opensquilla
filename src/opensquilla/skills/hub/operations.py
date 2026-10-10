@@ -12,6 +12,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -27,10 +28,13 @@ def operation_database(journal_path: Path) -> Path:
 
 
 async def run_operation_worker[Result](
-    function: Callable[..., Result], /, *args: Any, **kwargs: Any,
+    function: Callable[..., Result], /, *args: Any, _settling: bool = False, **kwargs: Any,
 ) -> Result:
     """Drain an owned SQLite worker before delivering caller cancellation."""
-    operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    context = contextvars.copy_context()
+    operation = asyncio.get_running_loop().run_in_executor(
+        None, context.run, partial(function, *args, **kwargs),
+    )
     cancellation: asyncio.CancelledError | None = None
     while not operation.done():
         try:
@@ -41,7 +45,7 @@ async def run_operation_worker[Result](
             if cancellation is None:
                 raise
             break
-    if cancellation is not None:
+    if cancellation is not None and not _settling:
         try:
             operation.result()
         except BaseException:
@@ -411,6 +415,78 @@ class InstallOperations:
         self.store = store
         self.tasks: dict[tuple[str, str], asyncio.Task[dict[str, Any]]] = {}
         self._claim_lock = asyncio.Lock()
+        self._closing = False
+        self._admissions: set[asyncio.Future[Any]] = set()
+        self._started: set[asyncio.Task[Any]] = set()
+        self._shutdown_cancelled: set[asyncio.Task[Any]] = set()
+        self._settlement_failed = False
+
+    def _own_admission(self, task: asyncio.Task[Any]) -> None:
+        self._admissions.add(task)
+
+        def finished(done: asyncio.Task[Any]) -> None:
+            self._admissions.discard(done)
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(finished)
+
+    def _settle(
+        self, owner: str, operation_id: str, result: dict[str, Any] | None,
+        fallback: dict[str, Any],
+    ) -> dict[str, Any]:
+        # One physical worker owns the complete receipt sequence, including
+        # global Task cancellation during event-loop shutdown.
+        try:
+            settled = result
+            if settled is None:
+                settled = self.store.read_existing(owner, operation_id).get("result") or fallback
+            self.store.finish(owner, operation_id, settled, update_details=True)
+            return dict(self.store.read_existing(owner, operation_id)["result"])
+        except Exception:
+            self._settlement_failed = True
+            raise
+
+    async def close(self, *, timeout: float | None = None) -> bool:
+        """Stop admission and drain owners; false keeps shared resources leased."""
+        self._closing = True
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + max(0.0, timeout)
+        while True:
+            for key, task in tuple(self.tasks.items()):
+                if task.cancelled():
+                    settlement = asyncio.create_task(run_operation_worker(
+                        self._settle, *key, None, self._cancelled_result(), _settling=True,
+                    ))
+                    self.tasks[key] = settlement
+
+                    def settled(done: asyncio.Task[dict[str, Any]], key=key) -> None:
+                        if not done.cancelled():
+                            self._settlement_failed |= done.exception() is not None
+                            self.tasks.pop(key, None)
+
+                    settlement.add_done_callback(settled)
+            for task in tuple(self.tasks.values()):
+                if (task in self._started and not task.done()
+                        and task not in self._shutdown_cancelled):
+                    self._shutdown_cancelled.add(task)
+                    task.cancel()
+            pending = {
+                task for task in (*self._admissions, *self.tasks.values()) if not task.done()
+            }
+            if not pending:
+                break
+            remaining = None if deadline is None else max(0.0, deadline - loop.time())
+            if remaining == 0:
+                return False
+            # wait() does not propagate cancellation to physical owners. A
+            # cancelled closer leaves the closed admission fence in place.
+            await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+        return not self._settlement_failed
+
+    @staticmethod
+    def _cancelled_result() -> dict[str, Any]:
+        return {"success": False, "cancelled": True, "message": "Skill installation cancelled"}
 
     async def run(
         self,
@@ -419,15 +495,37 @@ class InstallOperations:
         request: dict[str, Any],
         install: Callable[[], Awaitable[Mapping[str, Any]]],
     ) -> dict[str, Any]:
+        done = asyncio.get_running_loop().create_future()
+        self._admissions.add(done)
+        try:
+            return await self._run(owner, operation_id, request, install)
+        finally:
+            self._admissions.discard(done)
+            done.set_result(None)
+
+    async def _run(
+        self,
+        owner: str,
+        operation_id: str,
+        request: dict[str, Any],
+        install: Callable[[], Awaitable[Mapping[str, Any]]],
+    ) -> dict[str, Any]:
+        if self._closing:
+            raise RuntimeError("Skill installation service is closing")
         signature = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
         key = (owner, operation_id)
 
         async def execute() -> dict[str, Any]:
+            task = asyncio.current_task()
+            assert task is not None
+            self._started.add(task)
             context = InstallOperation(self.store, owner, operation_id)
             token = _CURRENT.set(context)
             result: dict[str, Any] | None = None
             fallback: dict[str, Any] = {}
             try:
+                if self._closing:
+                    raise asyncio.CancelledError
                 result = dict(await install())
             except asyncio.CancelledError:
                 fallback = {
@@ -439,36 +537,42 @@ class InstallOperations:
                 fallback = {"success": False, "message": str(exc)}
             finally:
                 _CURRENT.reset(token)
-            async def settle() -> dict[str, Any]:
-                settled = result
-                if settled is None:
-                    receipt = await self.store.read_async(owner, operation_id)
-                    settled = receipt.get("result") or fallback
-                # This owner completes the whole read/write/read sequence even
-                # if every RPC waiter disconnects or cancellation repeats.
-                await self.store.finish_async(owner, operation_id, settled, update_details=True)
-                return dict((await self.store.read_async(owner, operation_id))["result"])
+            return await run_operation_worker(
+                self._settle, owner, operation_id, result, fallback, _settling=True,
+            )
 
-            settlement = asyncio.create_task(settle(), name=f"skill-install-settle-{operation_id}")
-            while not settlement.done():
-                try:
-                    await asyncio.shield(settlement)
-                except asyncio.CancelledError:
-                    continue
-            return settlement.result()
+        def finished(done: asyncio.Task[dict[str, Any]]) -> None:
+            self._started.discard(done)
+            self._shutdown_cancelled.discard(done)
+            # A Task cancelled before its first instruction has no finally.
+            # Keep it owned so close() can persist its terminal receipt.
+            if not done.cancelled():
+                self._settlement_failed |= done.exception() is not None
+                self.tasks.pop(key, None)
 
         async def claim() -> asyncio.Task[dict[str, Any]] | None:
             # Creation and task registration are one loop-owned admission step.
             # A disconnected waiter cannot strand a durable running receipt.
             async with self._claim_lock:
-                if await run_operation_worker(self.store.create, owner, operation_id, signature):
+                if self._closing:
+                    raise RuntimeError("Skill installation service is closing")
+                if await run_operation_worker(
+                    self.store.create, owner, operation_id, signature, _settling=True,
+                ):
+                    current = asyncio.current_task()
+                    if self._closing or (current is not None and current.cancelling()):
+                        await run_operation_worker(
+                            self._settle, owner, operation_id, None, self._cancelled_result(),
+                            _settling=True,
+                        )
+                        return None
                     task = asyncio.create_task(execute(), name=f"skill-install-{operation_id}")
                     self.tasks[key] = task
-                    task.add_done_callback(lambda done: self.tasks.pop(key, None))
+                    task.add_done_callback(finished)
                 return self.tasks.get(key)
 
         claim_task = asyncio.create_task(claim(), name=f"skill-install-claim-{operation_id}")
-        claim_task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        self._own_admission(claim_task)
         existing_task = await asyncio.shield(claim_task)
         if existing_task is not None:
             try:
@@ -481,7 +585,7 @@ class InstallOperations:
                     "cancelled": True,
                     "message": "Skill installation cancelled",
                 }
-                await self.store.finish_async(owner, operation_id, cancelled)
+                await run_operation_worker(self._settle, owner, operation_id, None, cancelled)
                 receipt = await self.store.read_async(owner, operation_id)
                 return dict(receipt.get("result") or cancelled)
         receipt = await self.store.read_async(owner, operation_id)
@@ -490,14 +594,21 @@ class InstallOperations:
         raise ValueError("operationId is already running; query install status")
 
     async def cancel(self, owner: str, operation_id: str) -> dict[str, Any]:
+        if self._closing:
+            raise RuntimeError("Skill installation service is closing")
+        done = asyncio.get_running_loop().create_future()
+        self._admissions.add(done)
+        try:
+            return await self._cancel(owner, operation_id)
+        finally:
+            self._admissions.discard(done)
+            done.set_result(None)
+
+    async def _cancel(self, owner: str, operation_id: str) -> dict[str, Any]:
         def reserve_cancellation() -> None:
             if self.store.read_existing(owner, operation_id)["state"] == "unknown":
                 self.store.create(owner, operation_id, "")
-                self.store.finish(
-                    owner, operation_id,
-                    {"success": False, "cancelled": True,
-                     "message": "Skill installation cancelled"},
-                )
+                self._settle(owner, operation_id, None, self._cancelled_result())
 
         async with self._claim_lock:
             task = self.tasks.get((owner, operation_id))
@@ -513,14 +624,8 @@ class InstallOperations:
             except asyncio.CancelledError:
                 if not task.cancelled():
                     raise
-                await self.store.finish_async(
-                    owner,
-                    operation_id,
-                    {
-                        "success": False,
-                        "cancelled": True,
-                        "message": "Skill installation cancelled",
-                    },
+                await run_operation_worker(
+                    self._settle, owner, operation_id, None, self._cancelled_result(),
                 )
         receipt = await self.store.read_async(owner, operation_id)
         result = receipt.get("result") or {

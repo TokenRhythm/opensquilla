@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import sqlite3
 import threading
 import time
@@ -22,6 +23,7 @@ from opensquilla.skills.hub.operations import (
     InstallOperation,
     InstallOperationStore,
     operation_database,
+    run_operation_worker,
 )
 from opensquilla.skills.hub.router import SourceRouter
 from opensquilla.skills.hub.transaction import managed_root_identity
@@ -537,3 +539,450 @@ async def test_status_terminal_cap_uses_root_scope_and_rowid_tie_order(tmp_path:
         assert db.execute("SELECT count(*) FROM skill_installs").fetchone()[0] == 1001
     service.journal_path.write_text("retained journal", encoding="utf-8")
     assert (await _status(service, oldest)).payload["state"] == "succeeded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["receipt", "postflight", "staging", "rollback"])
+async def test_global_task_cancellation_keeps_worker_guard_and_context(kind: str) -> None:
+    from opensquilla.skills.hub.management import _run_postflight_worker
+    from opensquilla.skills.io_worker import check_staging_cancelled, run_staging_worker
+
+    context = contextvars.ContextVar("test_skill_owner", default="missing")
+    token = context.set("owner")
+    entered, release = threading.Event(), threading.Event()
+    guard = asyncio.Lock()
+    observed: list[str] = []
+
+    def work():
+        observed.append(context.get())
+        entered.set()
+        assert release.wait(5)
+        if kind == "staging":
+            with pytest.raises(InterruptedError):
+                check_staging_cancelled()
+        return "proof"
+
+    async def guarded():
+        async with guard:
+            if kind == "receipt":
+                return await run_operation_worker(work)
+            if kind == "staging":
+                return await run_staging_worker(work)
+            return await _run_postflight_worker(work, _settling=kind == "rollback")
+
+    before = asyncio.all_tasks()
+    owner = asyncio.create_task(guarded())
+    try:
+        while not entered.is_set():
+            await asyncio.sleep(.001)
+        cancelled = asyncio.all_tasks() - before
+        for task in cancelled:
+            task.cancel()
+        await asyncio.sleep(.01)
+        owner.cancel()
+        await asyncio.sleep(.01)
+        assert not owner.done()
+        assert guard.locked()
+    finally:
+        release.set()
+        result = (await asyncio.gather(owner, return_exceptions=True))[0]
+        context.reset(token)
+    assert observed == ["owner"]
+    assert not guard.locked()
+    if kind == "rollback":
+        assert result == "proof"
+    else:
+        assert isinstance(result, asyncio.CancelledError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["claim", "settlement", "committed"])
+async def test_global_cancellation_settles_durable_install_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str,
+) -> None:
+    service = _service(tmp_path)
+    await service.prepare_install_operations()
+    operations = service.install_operations
+    operation_id = str(uuid.uuid4())
+    entered, release = threading.Event(), threading.Event()
+    installs = 0
+    original = getattr(operations.store, "create" if boundary == "claim" else "finish"
+                       if boundary == "committed" else "read_existing")
+
+    def blocked(*args, **kwargs):
+        result = original(*args, **kwargs)
+        entered.set()
+        assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(operations.store, original.__name__, blocked)
+
+    async def install():
+        nonlocal installs
+        installs += 1
+        if boundary == "settlement":
+            raise RuntimeError("controlled failure")
+        return {"success": True, "message": "committed proof"}
+
+    before = asyncio.all_tasks()
+    waiter = asyncio.create_task(operations.run("owner", operation_id, {}, install))
+    try:
+        while not entered.is_set():
+            await asyncio.sleep(.001)
+        cancellation_set = asyncio.all_tasks() - before
+        for task in cancellation_set:
+            task.cancel()
+        await asyncio.sleep(.01)
+        assert any(not task.done() for task in cancellation_set)
+    finally:
+        release.set()
+        await asyncio.gather(*cancellation_set, return_exceptions=True)
+        await asyncio.gather(waiter, return_exceptions=True)
+    assert await operations.close()
+    receipt = await operations.store.read_async("owner", operation_id)
+    assert receipt["state"] == {"claim": "cancelled", "settlement": "failed",
+                                "committed": "succeeded"}[boundary]
+    assert installs == (0 if boundary == "claim" else 1)
+
+
+@pytest.mark.asyncio
+async def test_close_drains_claim_and_rejects_new_admission_without_starting_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path)
+    await service.prepare_install_operations()
+    operations = service.install_operations
+    operation_id = str(uuid.uuid4())
+    entered, release = threading.Event(), threading.Event()
+    original = operations.store.create
+
+    def blocked(*args):
+        result = original(*args)
+        entered.set()
+        assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(operations.store, "create", blocked)
+
+    async def forbidden():
+        raise AssertionError("close must fence a claimed but unstarted install")
+
+    waiter = asyncio.create_task(operations.run("owner", operation_id, {}, forbidden))
+    try:
+        while not entered.is_set():
+            await asyncio.sleep(.001)
+        assert not await service.close(timeout=.01)
+        with pytest.raises(RuntimeError, match="closing"):
+            await operations.run("owner", str(uuid.uuid4()), {}, forbidden)
+        with pytest.raises(RuntimeError, match="closing"):
+            await operations.cancel("owner", str(uuid.uuid4()))
+        closer = asyncio.create_task(service.close())
+        await asyncio.sleep(.01)
+        assert not closer.done()
+    finally:
+        release.set()
+    assert (await waiter)["cancelled"]
+    assert await closer
+    assert await service.close()
+    assert (await operations.store.read_async("owner", operation_id))["state"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_close_finishes_task_cancelled_before_first_instruction(tmp_path: Path) -> None:
+    from opensquilla.skills.hub.operations import InstallOperations
+
+    store = InstallOperationStore(tmp_path / "operations.db", root_id="root")
+    operations = InstallOperations(store)
+    operation_id = str(uuid.uuid4())
+    store.create("owner", operation_id, "signature")
+
+    async def forbidden():
+        raise AssertionError("cancelled task cannot start")
+
+    task = asyncio.create_task(forbidden())
+    operations.tasks[("owner", operation_id)] = task
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert await operations.close()
+    assert store.read_existing("owner", operation_id)["state"] == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rollback_fails", [False, True])
+async def test_shutdown_global_cancel_preserves_actual_install_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rollback_fails: bool,
+) -> None:
+    managed = tmp_path / "managed"
+    loader = SkillLoader(managed_dir=managed, snapshot_path=tmp_path / "snapshot.json")
+    loader.reload(force=True, reason="test.shutdown-cancel")
+    source = FakeImmutableSource({
+        "SKILL.md": "---\nname: demo\ndescription: Shutdown fixture.\n---\n# Demo\n",
+    })
+    service = _install_service(tmp_path, source, loader=loader)
+    operations = service.install_operations
+    operation_id = str(uuid.uuid4())
+    postflight, restoring = threading.Event(), threading.Event()
+    release_postflight, release_restore = threading.Event(), threading.Event()
+    checkpoint = operations.store.checkpoint_rollback
+
+    def blocked_postflight(*args, **kwargs):
+        postflight.set()
+        assert release_postflight.wait(10)
+        raise RuntimeError("controlled postflight failure")
+
+    def blocked_checkpoint(*args):
+        restoring.set()
+        assert release_restore.wait(10)
+        return checkpoint(*args)
+
+    def failed_restore(*args, **kwargs):
+        restoring.set()
+        assert release_restore.wait(10)
+        raise OSError("controlled rollback failure")
+
+    monkeypatch.setattr(loader, "reload_verified", blocked_postflight)
+    monkeypatch.setattr(operations.store, "checkpoint_rollback", blocked_checkpoint)
+    if rollback_fails:
+        monkeypatch.setattr("opensquilla.skills.hub.transaction._restore_lockfile", failed_restore)
+
+    async def install():
+        return (await service.install("demo", "fake")).to_dict()
+
+    async def wait_for_thread(event):
+        async with asyncio.timeout(10):
+            while not event.is_set():
+                await asyncio.sleep(.001)
+
+    before = asyncio.all_tasks()
+    waiter = asyncio.create_task(operations.run("owner", operation_id, {}, install))
+    try:
+        await wait_for_thread(postflight)
+        closer = asyncio.create_task(service.close())
+        await asyncio.sleep(.01)
+        release_postflight.set()
+        await wait_for_thread(restoring)
+        cancellation_set = asyncio.all_tasks() - before
+        for task in cancellation_set:
+            task.cancel()
+        await asyncio.sleep(.01)
+        assert any(not task.done() for task in operations.tasks.values())
+        assert service.journal_path.exists()
+    finally:
+        release_postflight.set()
+        release_restore.set()
+    await asyncio.gather(waiter, closer, *operations.tasks.values(), return_exceptions=True)
+    assert await service.close()
+    receipt = await operations.store.read_async("owner", operation_id)
+    assert receipt["state"] == ("recovery_required" if rollback_fails else "cancelled")
+    assert receipt["result"]["rollbackPerformed"] is not rollback_fails
+    assert service.journal_path.exists() is rollback_fails
+    assert not service._mutation_lock.locked()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reserve_cancel", [False, True])
+async def test_failed_claim_settlement_prevents_clean_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reserve_cancel: bool,
+) -> None:
+    service = _service(tmp_path)
+    operations = service.install_operations
+    operation_id = str(uuid.uuid4())
+    entered, release = threading.Event(), threading.Event()
+    create = operations.store.create
+
+    def blocked_create(*args):
+        result = create(*args)
+        entered.set()
+        assert release.wait(5)
+        return result
+
+    def failed_finish(*args, **kwargs):
+        raise sqlite3.OperationalError("controlled terminal receipt failure")
+
+    monkeypatch.setattr(operations.store, "create", blocked_create)
+    monkeypatch.setattr(operations.store, "finish", failed_finish)
+
+    async def forbidden():
+        raise AssertionError("install must not run during close")
+
+    waiter = asyncio.create_task(
+        operations.cancel("owner", operation_id) if reserve_cancel
+        else operations.run("owner", operation_id, {}, forbidden),
+    )
+    try:
+        while not entered.is_set():
+            await asyncio.sleep(.001)
+        closer = asyncio.create_task(service.close())
+        await asyncio.sleep(.01)
+    finally:
+        release.set()
+    with pytest.raises(sqlite3.OperationalError, match="terminal receipt"):
+        await waiter
+    assert not await closer
+    assert not await service.close()
+    assert operations.store.read_existing("owner", operation_id)["state"] == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["uninstall", "update"])
+async def test_close_drains_direct_mutation_without_waiting_for_rpc_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str,
+) -> None:
+    from opensquilla.skills.hub.lockfile import Lockfile
+    from opensquilla.skills.hub.management import _run_postflight_worker
+
+    managed = tmp_path / "managed"
+    loader = SkillLoader(managed_dir=managed, snapshot_path=tmp_path / "snapshot.json")
+    loader.reload(force=True, reason="test.direct-mutation-close")
+    source = FakeImmutableSource({
+        "SKILL.md": "---\nname: demo\ndescription: Direct mutation.\n---\n# Demo\n",
+    })
+    service = _install_service(tmp_path, source, loader=loader)
+    assert (await service.install("demo", "fake")).success
+    initial_lock = Lockfile.load(service.lockfile_path).get("demo")
+    source.revision = "b" * 40
+    entered, release = threading.Event(), threading.Event()
+    rpc_wait = asyncio.Event()
+    mutation_returned = asyncio.Event()
+
+    def postflight():
+        entered.set()
+        assert release.wait(10)
+        raise RuntimeError("postflight must roll back")
+
+    async def blocked_postflight(**kwargs):
+        await _run_postflight_worker(postflight)
+
+    monkeypatch.setattr(
+        service, "_reload_uninstall_and_verify" if action == "uninstall" else "_reload_and_verify",
+        blocked_postflight,
+    )
+
+    async def rpc():
+        try:
+            await getattr(service, action)(
+                "demo", **({"force": True} if action == "update" else {}),
+            )
+        except asyncio.CancelledError:
+            mutation_returned.set()
+        await rpc_wait.wait()
+
+    owner = asyncio.create_task(rpc())
+    try:
+        async with asyncio.timeout(10):
+            while not entered.is_set():
+                await asyncio.sleep(.001)
+        first = asyncio.create_task(service.close())
+        await asyncio.sleep(.01)
+        second = asyncio.create_task(service.close())
+        owner.cancel()
+        await asyncio.sleep(.01)
+        assert not first.done() and not second.done()
+        assert service._mutation_owners
+    finally:
+        release.set()
+    assert await asyncio.wait_for(first, timeout=10)
+    assert await asyncio.wait_for(second, timeout=10)
+    assert mutation_returned.is_set() and not owner.done()
+    assert not service._mutation_owners
+    assert (managed / "demo" / "SKILL.md").exists()
+    assert Lockfile.load(service.lockfile_path).get("demo") == initial_lock
+    assert not service.journal_path.exists()
+    for method in (service.install, service.update, service.uninstall):
+        with pytest.raises(RuntimeError, match="closing"):
+            await method("demo", **({"source_id": "fake"} if method == service.install else {}))
+    rpc_wait.set()
+    await owner
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_cancel_method_not_its_rpc_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operations = _service(tmp_path).install_operations
+    operation_id = str(uuid.uuid4())
+    entered, release = threading.Event(), threading.Event()
+    returned, rpc_release = asyncio.Event(), asyncio.Event()
+    finish = operations.store.finish
+
+    def blocked_finish(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return finish(*args, **kwargs)
+
+    monkeypatch.setattr(operations.store, "finish", blocked_finish)
+
+    async def rpc():
+        result = await operations.cancel("owner", operation_id)
+        assert result["cancelled"]
+        returned.set()
+        await rpc_release.wait()
+
+    owner = asyncio.create_task(rpc())
+    try:
+        async with asyncio.timeout(5):
+            while not entered.is_set():
+                await asyncio.sleep(.001)
+        closing = asyncio.create_task(operations.close(timeout=2))
+        await asyncio.sleep(.01)
+        assert not closing.done()
+    finally:
+        release.set()
+    assert await closing
+    assert returned.is_set() and not owner.done()
+    rpc_release.set()
+    await owner
+
+
+@pytest.mark.asyncio
+async def test_close_tracks_waiter_fallback_after_task_cancelled_before_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operations = _service(tmp_path).install_operations
+    operation_id = str(uuid.uuid4())
+    entered, second_finished, release = threading.Event(), threading.Event(), threading.Event()
+    finish = operations.store.finish
+    create_task = asyncio.create_task
+    count = 0
+    count_lock = threading.Lock()
+
+    def cancel_new_install(coro, **kwargs):
+        task = create_task(coro, **kwargs)
+        if kwargs.get("name") == f"skill-install-{operation_id}":
+            task.cancel()
+        return task
+
+    def blocked_first_finish(*args, **kwargs):
+        nonlocal count
+        with count_lock:
+            count += 1
+            first = count == 1
+        if first:
+            entered.set()
+            assert release.wait(5)
+        result = finish(*args, **kwargs)
+        if not first:
+            second_finished.set()
+        return result
+
+    monkeypatch.setattr(asyncio, "create_task", cancel_new_install)
+    monkeypatch.setattr(operations.store, "finish", blocked_first_finish)
+
+    async def forbidden():
+        raise AssertionError("cancelled task must not start")
+
+    waiter = asyncio.create_task(operations.run("owner", operation_id, {}, forbidden))
+    try:
+        async with asyncio.timeout(5):
+            while not entered.is_set():
+                await asyncio.sleep(.001)
+        closer = asyncio.create_task(operations.close(timeout=2))
+        async with asyncio.timeout(5):
+            while not second_finished.is_set():
+                await asyncio.sleep(.001)
+        assert not closer.done()
+    finally:
+        release.set()
+    assert (await waiter)["cancelled"]
+    assert await closer
+    assert operations.store.read_existing("owner", operation_id)["state"] == "cancelled"

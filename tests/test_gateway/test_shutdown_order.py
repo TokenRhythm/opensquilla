@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -458,3 +460,94 @@ async def test_service_close_cancels_deferred_warmup_before_catalog_coordinator(
 
     assert warmup_task.cancelled()
     assert close_observations == [True]
+
+
+@pytest.mark.asyncio
+async def test_service_close_drains_installer_before_shared_catalog(tmp_path: Path) -> None:
+    from opensquilla.skills.hub.operations import run_operation_worker
+    from tests.test_skills.test_install_operation_io import _service
+
+    management = _service(tmp_path)
+    operations = management.install_operations
+    entered, release = threading.Event(), threading.Event()
+    order: list[str] = []
+    operation_id = str(uuid.uuid4())
+
+    def work():
+        entered.set()
+        assert release.wait(5)
+        order.append("worker_finished")
+
+    async def install():
+        await run_operation_worker(work)
+        return {"success": True}
+
+    class Catalog:
+        async def close(self):
+            receipt = operations.store.read_existing("owner", operation_id)
+            assert receipt["state"] == "cancelled"
+            order.append("catalog_closed")
+
+    services = ServiceContainer(
+        config=GatewayConfig(), skill_management_service=management,
+        model_catalog_refresh_coordinator=Catalog(),
+    )
+    waiter = asyncio.create_task(operations.run("owner", operation_id, {}, install))
+    try:
+        while not entered.is_set():
+            await asyncio.sleep(.001)
+        closing = asyncio.create_task(services.close())
+        await asyncio.sleep(.01)
+        assert not closing.done() and not order
+    finally:
+        release.set()
+    await closing
+    assert (await waiter)["cancelled"]
+    assert order == ["worker_finished", "catalog_closed"]
+    await services.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_keeps_resources_and_profile_lease_for_unsettled_install(
+    tmp_path: Path,
+) -> None:
+    from tests.test_skills.test_install_operation_io import _service
+
+    server, _, services, _ = _gateway_server_for_ws_close_test()
+    management = _service(tmp_path)
+    management.close = AsyncMock(return_value=False)
+    services.skill_management_service = management
+    server._pid_lock = MagicMock()
+    registry = MagicMock()
+    registry.broadcast = AsyncMock()
+    registry.all.return_value = []
+    with patch("opensquilla.gateway.boot.get_registry", return_value=registry):
+        result = await server.close()
+    assert result is not None and not result.clean
+    services.close.assert_not_awaited()
+    server._pid_lock.release.assert_not_called()
+    management.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_gateway_close_keeps_install_profile_lease(tmp_path: Path) -> None:
+    from tests.test_skills.test_install_operation_io import _service
+
+    server, _, services, _ = _gateway_server_for_ws_close_test()
+    management = _service(tmp_path)
+    entered = asyncio.Event()
+
+    async def blocked_close(**kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    management.close = blocked_close
+    services.skill_management_service = management
+    server._pid_lock = MagicMock()
+    closer = asyncio.create_task(server.close())
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    closer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closer
+    services.close.assert_not_awaited()
+    server._pid_lock.release.assert_not_called()

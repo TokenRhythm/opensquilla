@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import hmac
 import os
@@ -12,11 +13,12 @@ import time
 import unicodedata
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import ExitStack, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
+from functools import partial, wraps
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 import structlog
 import yaml
@@ -177,7 +179,10 @@ async def _run_postflight_worker(
     diagnostics; the original exception still determines the terminal outcome.
     """
 
-    operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    context = contextvars.copy_context()
+    operation = asyncio.get_running_loop().run_in_executor(
+        None, context.run, partial(function, *args, **kwargs),
+    )
     cancellation: asyncio.CancelledError | None = None
     while not operation.done():
         try:
@@ -1178,6 +1183,27 @@ def _update_precondition(entry: LockEntry) -> tuple[str, str, str, str, str]:
     )
 
 
+def _owned_mutation[**Params, Result](
+    function: Callable[Params, Awaitable[Result]],
+) -> Callable[Params, Awaitable[Result]]:
+    @wraps(function)
+    async def owned(*args: Params.args, **kwargs: Params.kwargs) -> Result:
+        service = cast("SkillManagementService", args[0])
+        if service._closing:
+            raise RuntimeError("Skill installation service is closing")
+        task = asyncio.current_task()
+        assert task is not None
+        done = asyncio.get_running_loop().create_future()
+        service._mutation_owners[done] = task
+        try:
+            return await function(*args, **kwargs)
+        finally:
+            service._mutation_owners.pop(done, None)
+            done.set_result(None)
+
+    return owned
+
+
 class SkillManagementService:
     """Dependency-injected, transactional Community Skill manager."""
 
@@ -1203,6 +1229,8 @@ class SkillManagementService:
         self._install_operations: InstallOperations | None = None
         self._install_operations_preparation_lock = asyncio.Lock()
         self._install_operations_recovered = False
+        self._closing = False
+        self._mutation_owners: dict[asyncio.Future[None], asyncio.Task[Any]] = {}
         self._recovery_required_diagnostics: tuple[SkillDiagnostic, ...] = ()
         bind_lockfile = getattr(loader, "bind_managed_lockfile", None)
         if callable(bind_lockfile):
@@ -1212,12 +1240,36 @@ class SkillManagementService:
     @property
     def install_operations(self) -> InstallOperations:
         if self._install_operations is None:
+            if self._closing:
+                raise RuntimeError("Skill installation service is closing")
             self._install_operations = InstallOperations(InstallOperationStore(
                 operation_database(self._journal_path),
                 root_id=managed_root_identity(self._managed_dir),
                 initialize=False,
             ))
         return self._install_operations
+
+    async def close(self, *, timeout: float | None = None) -> bool:
+        """Settle owned installs before the Gateway closes their dependencies."""
+        self._closing = True
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + max(0.0, timeout)
+
+        def remaining() -> float | None:
+            return None if deadline is None else max(0.0, deadline - loop.time())
+
+        # Track method completion, not the RPC Task's entire connection lifetime.
+        # The methods own rollback and publication fences even without a receipt.
+        for task in set(self._mutation_owners.values()):
+            if not task.cancelling():
+                task.cancel()
+        operations_clean = True
+        if self._install_operations is not None:
+            operations_clean = await self._install_operations.close(timeout=remaining())
+        pending = set(self._mutation_owners)
+        if pending:
+            _, pending = await asyncio.wait(pending, timeout=remaining())
+        return operations_clean and not pending
 
     async def prepare_install_operations(self, *, recover_orphans: bool = False) -> None:
         """Prepare receipts after the composition root has acquired its writer lease."""
@@ -2066,6 +2118,7 @@ class SkillManagementService:
             compatibility=_entry_compatibility(entry),
         )
 
+    @_owned_mutation
     async def install(
         self,
         identifier: str,
@@ -3068,6 +3121,7 @@ class SkillManagementService:
         finally:
             publication_stack.close()
 
+    @_owned_mutation
     async def update(
         self,
         name: str | None = None,
@@ -3229,6 +3283,7 @@ class SkillManagementService:
             )
         return results
 
+    @_owned_mutation
     async def uninstall(
         self,
         name: str = "",
