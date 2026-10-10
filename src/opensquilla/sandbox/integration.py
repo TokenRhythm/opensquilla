@@ -54,7 +54,7 @@ from opensquilla.sandbox.elevation import (
     ElevationGateResult,
     consume_approved_elevation,
     effective_approval_reviewer,
-    gate_elevated_action,
+    gate_elevated_action_async,
 )
 from opensquilla.sandbox.escalation import (
     build_network_approval_params,
@@ -2204,7 +2204,7 @@ async def escalate_backend_denial(
             target=" ".join(request.argv),
         ),
     )
-    return gate_elevated_action(
+    return await gate_elevated_action_async(
         action,
         approval_id=None,
         session_key=_resolve_session_id(rt, None),
@@ -2309,6 +2309,26 @@ def consume_backend_denial_retry(
     )
 
 
+
+async def consume_backend_denial_retry_async(
+    approval_id: str | None,
+    request: SandboxRequest,
+    policy: SandboxPolicy,
+    *,
+    runtime: SandboxRuntime | None = None,
+) -> ElevationGateResult | None:
+    """Validate and consume an exact backend retry without blocking the loop."""
+    if not approval_id:
+        return None
+    rt = runtime or get_runtime()
+    if rt is None:
+        return None
+    result = await rt.approval_queue.run_operation_async(
+        consume_backend_denial_retry, approval_id, request, policy, runtime=rt,
+    )
+    return cast(ElevationGateResult | None, result)
+
+
 def _runtime_is_full_host_access(runtime: SandboxRuntime) -> bool:
     try:
         from opensquilla.tools.run_mode import current_run_mode, full_host_access_active
@@ -2338,6 +2358,7 @@ __all__ = [
     "build_request",
     "configure_runtime",
     "consume_backend_denial_retry",
+    "consume_backend_denial_retry_async",
     "current_managed_network_proxy_url",
     "escalate_backend_denial",
     "escalate_unavailable_backend_in_managed_mode",

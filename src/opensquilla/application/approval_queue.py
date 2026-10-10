@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import ntpath
 import os
@@ -13,14 +14,16 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
+from functools import partial
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from opensquilla.paths import state_dir
 
 VALID_APPROVAL_MODES = frozenset({"auto-approve", "auto-deny", "prompt"})
 VALID_ELEVATED_MODES = frozenset({"on", "bypass", "full"})
 VALID_RUN_MODES = frozenset({"safe", "full"})
+_OperationResult = TypeVar("_OperationResult")
 
 
 def _native_db_path(path: str | Path) -> str:
@@ -514,12 +517,47 @@ class ApprovalQueue:
         """Run one durable queue operation off the Gateway event loop.
 
         The single async lock is the queue's maintenance/transaction owner:
-        it prevents two ``to_thread`` calls from sharing one sqlite connection
+        it prevents two workers from sharing one sqlite connection
         while still allowing unrelated Gateway RPCs to continue scheduling.
         """
-        self._notification_loop = asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
+        self._notification_loop = loop
         async with self._async_lock:
-            return await asyncio.to_thread(operation, *args, **kwargs)
+            # An executor Future survives task-wide shutdown cancellation. Keep
+            # the owner until its transaction has committed or rolled back,
+            # even if the caller is cancelled more than once.
+            context = contextvars.copy_context()
+            worker = loop.run_in_executor(None, context.run, partial(operation, *args, **kwargs))
+            cancellation: asyncio.CancelledError | None = None
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError as exc:
+                    if cancellation is None:
+                        cancellation = exc
+                except BaseException:
+                    break
+            try:
+                result = worker.result()
+            except BaseException as exc:
+                if cancellation is not None:
+                    raise cancellation from exc
+                raise
+            if cancellation is not None:
+                raise cancellation
+            return result
+
+    async def run_operation_async(
+        self, operation: Callable[..., _OperationResult], *args: Any, **kwargs: Any,
+    ) -> _OperationResult:
+        """Run a composite approval check/consume under the queue's async owner."""
+        def guarded() -> _OperationResult:
+            # Legacy sync callers share this connection as well. Keep their
+            # mutations outside the complete validation/consume sequence.
+            with self._sync_lock:
+                return operation(*args, **kwargs)
+
+        return cast(_OperationResult, await self._run_async(guarded))
 
     async def request_async(self, namespace: str = "exec", params: dict | None = None) -> str:
         return cast(str, await self._run_async(self.request, namespace, params))

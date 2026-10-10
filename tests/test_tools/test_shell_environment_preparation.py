@@ -5,6 +5,7 @@ import os
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -336,7 +337,10 @@ async def test_safe_managed_mount_preparation_runs_off_loop(
     monkeypatch.setattr(shell, "_managed_skill_environment", lambda env: env)
     monkeypatch.setattr(shell, "_shell_runtime_preflight", lambda *args, **kwargs: None)
     monkeypatch.setattr(shell, "gate_action", gate)
-    monkeypatch.setattr(shell, "consume_backend_denial_retry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        shell, "consume_backend_denial_retry_async",
+        AsyncMock(side_effect=lambda *args, **kwargs: None),
+    )
     monkeypatch.setattr(shell, "_policy_with_managed_toolchain_mounts", mounts)
     token = current_tool_context.set(context)
     try:
