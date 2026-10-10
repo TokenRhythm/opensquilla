@@ -51,6 +51,26 @@ class VideoGenerationError(RuntimeError):
         self.recoverable = recoverable
 
 
+class VideoGenerationRejected(VideoGenerationError):  # noqa: N818
+    """A known submission refusal with bounded, allowlisted diagnostic metadata."""
+
+    def __init__(self, http_status: int, *, error_code: str = "") -> None:
+        if isinstance(http_status, bool) or not isinstance(http_status, int):
+            raise ValueError("Video rejection status must be an HTTP client error")
+        if not 400 <= http_status <= 499:
+            raise ValueError("Video rejection status must be an HTTP client error")
+        self.http_status = http_status
+        self.error_code = (
+            "MODEL_ACCESS_DENIED"
+            if http_status == 403 and error_code == "MODEL_ACCESS_DENIED"
+            else ""
+        )
+        message = f"Video submission returned HTTP {http_status}"
+        if self.error_code:
+            message += f" ({self.error_code})"
+        super().__init__(message)
+
+
 class VideoGenerationPending(VideoGenerationError):  # noqa: N818
     """The accepted job can be checked again without another paid submission."""
 

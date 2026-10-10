@@ -15,6 +15,7 @@ from opensquilla.provider.error_redaction import redact_upstream_error_text, red
 from opensquilla.provider.video_generation import (
     VideoGenerationError,
     VideoGenerationPending,
+    VideoGenerationRejected,
     VideoGenerationResult,
     VideoGenerationSubmissionUnknown,
     VideoJobAcceptedCallback,
@@ -26,6 +27,8 @@ from opensquilla.secrets import clean_header_secret
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 _TASK = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _MAX_JSON_BYTES = 4 * 1024 * 1024
+_MAX_REJECTION_JSON_BYTES = 64 * 1024
+_REJECTION_READ_TIMEOUT_SECONDS = 1.0
 _DEFAULT_MAX_BYTES = 100 * 1024 * 1024
 _TRANSIENT_HTTP = {429, 500, 502, 503, 504}
 
@@ -50,6 +53,26 @@ def _remaining(deadline: float, *, job_id: str | None = None) -> float:
 
 async def _read_json(response: httpx.Response) -> dict[str, object]:
     return await read_video_json(response, max_bytes=_MAX_JSON_BYTES, label="TokenRhythm video")
+
+
+async def _rejection_code(response: httpx.Response, *, api_key: str) -> str:
+    try:
+        async with asyncio.timeout(_REJECTION_READ_TIMEOUT_SECONDS):
+            payload = await read_video_json(
+                response,
+                max_bytes=_MAX_REJECTION_JSON_BYTES,
+                label="TokenRhythm video rejection",
+            )
+    except httpx.HTTPError as exc:
+        redacted_httpx_error(exc, api_key=api_key)
+        return ""
+    except (TimeoutError, VideoGenerationError):
+        return ""
+    error = payload.get("error")
+    codes = (payload.get("code"), error.get("code") if isinstance(error, dict) else None)
+    if response.status_code == 403 and "MODEL_ACCESS_DENIED" in codes:
+        return "MODEL_ACCESS_DENIED"
+    return ""
 
 
 def _safe_task_id(value: object) -> str:
@@ -129,6 +152,7 @@ async def _submit(
         "ratio": aspect_ratio,
     }
     accepted_job_id: str | None = None
+    rejection: VideoGenerationRejected | None = None
     try:
         async with asyncio.timeout(_remaining(deadline)):
             async with client.stream(
@@ -140,6 +164,13 @@ async def _submit(
                 if response.status_code != 202:
                     if response.status_code >= 500:
                         raise VideoGenerationSubmissionUnknown()
+                    if 400 <= response.status_code <= 499:
+                        # Record refusal before reading optional diagnostics; a body or
+                        # stream-close timeout cannot make this submission ambiguous.
+                        rejection = VideoGenerationRejected(response.status_code)
+                        code = await _rejection_code(response, api_key=api_key)
+                        rejection = VideoGenerationRejected(response.status_code, error_code=code)
+                        raise rejection
                     raise VideoGenerationError(
                         f"TokenRhythm video submission returned HTTP {response.status_code}"
                     )
@@ -156,6 +187,8 @@ async def _submit(
                     on_job_accepted(job_id)
     except httpx.HTTPError as exc:
         redacted_httpx_error(exc, api_key=api_key)
+        if rejection is not None:
+            raise rejection from None
         if accepted_job_id is not None:
             raise VideoGenerationPending(
                 "Video submission was accepted; check it again using its job ID",
@@ -163,6 +196,8 @@ async def _submit(
             ) from None
         raise VideoGenerationSubmissionUnknown() from None
     except TimeoutError:
+        if rejection is not None:
+            raise rejection from None
         if accepted_job_id is not None:
             raise VideoGenerationPending(
                 "Video submission was accepted; check it again using its job ID",

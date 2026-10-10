@@ -5,12 +5,15 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from opensquilla.gateway.config import GatewayConfig, VideoGenerationConfig
 from opensquilla.provider import video_generation
 from opensquilla.provider.video_generation_policy import VIDEO_GENERATION_OFFICIAL_BASE_URLS
+from opensquilla.tool_boundary import ToolCall
 from opensquilla.tools.builtin import media
+from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.policy_runtime import (
     ToolSurfaceCapabilities,
     detect_runtime_tool_surface_capabilities,
@@ -936,6 +939,66 @@ async def test_completed_video_status_reuses_result_without_duplicate_delivery(
         if job_id:
             with media._video_job_sessions_lock:
                 media._video_job_sessions.pop(job_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known_code", [True, False])
+async def test_tokenrhythm_rejection_is_actionable_without_echoed_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, known_code: bool
+) -> None:
+    from opensquilla.provider import tokenrhythm_video_generation
+
+    key = "synthetic-provider-credential"
+    prompt = "A synthetic clip of a green triangle"
+    requests: list[httpx.Request] = []
+    original_client = httpx.AsyncClient
+
+    def reject(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "POST"
+        return httpx.Response(
+            403,
+            json={
+                "code": "MODEL_ACCESS_DENIED" if known_code else key,
+                "message": f"Untrusted response echo: {key} {prompt}",
+            },
+        )
+
+    def fake_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return original_client(*args, transport=httpx.MockTransport(reject), **kwargs)
+
+    monkeypatch.setattr(tokenrhythm_video_generation.httpx, "AsyncClient", fake_client)
+    gateway = GatewayConfig.model_validate({
+        "llm": {"provider": "tokenrhythm", "api_key": key},
+        "video_generation": {
+            "enabled": True, "provider": "tokenrhythm", "primary": "wan3.0-video",
+            "duration_seconds": 2, "max_duration_seconds": 2,
+        },
+    })
+    context = _context(tmp_path, artifacts=True)
+    media.configure_video_generation(gateway.video_generation, gateway_config=gateway)
+    try:
+        handler = build_tool_handler(get_default_registry(), context)
+        result = await handler(ToolCall(
+            tool_use_id="synthetic-video-rejection", tool_name="video_generate",
+            arguments={"prompt": prompt, "filename": "rejected.mp4"},
+        ))
+    finally:
+        media.configure_video_generation(None)
+
+    envelope = json.loads(result.content)
+    assert result.is_error is True
+    assert set(envelope) == {"status", "tool", "error_class", "user_message", "retry_allowed"}
+    assert envelope["error_class"] == "SafeToolError"
+    assert envelope["retry_allowed"] is False
+    assert "HTTP 403" in envelope["user_message"]
+    assert ("MODEL_ACCESS_DENIED" in envelope["user_message"]) is known_code
+    assert ("preview accounts" in envelope["user_message"]) is known_code
+    assert key not in result.content and prompt not in result.content
+    assert "Untrusted response echo" not in result.content
+    assert len(requests) == 1
+    assert context.published_artifacts == []
+    assert not (tmp_path / "workspace" / "rejected.mp4").exists()
 
 
 @pytest.mark.asyncio

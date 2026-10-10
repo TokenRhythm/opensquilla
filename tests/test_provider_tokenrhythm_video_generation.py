@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -15,6 +16,7 @@ from opensquilla.provider.tokenrhythm_video_generation import (
 from opensquilla.provider.video_generation import (
     VideoGenerationError,
     VideoGenerationPending,
+    VideoGenerationRejected,
     VideoGenerationSubmissionUnknown,
 )
 
@@ -204,6 +206,154 @@ async def test_ambiguous_submission_is_not_retried(
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         raise httpx.ReadTimeout("synthetic timeout", request=request)
+
+    _install_transport(monkeypatch, handler)
+    with pytest.raises(VideoGenerationSubmissionUnknown):
+        await _generate(tmp_path / "clip.mp4")
+    assert [request.method for request in requests] == ["POST"]
+
+
+@pytest.mark.parametrize(
+    "status,payload,expected_code",
+    [
+        (403, {"code": "MODEL_ACCESS_DENIED"}, "MODEL_ACCESS_DENIED"),
+        (403, {"error": {"code": "MODEL_ACCESS_DENIED"}}, "MODEL_ACCESS_DENIED"),
+        (403, {"code": "UNKNOWN_ERROR"}, ""),
+        (401, {"code": "MODEL_ACCESS_DENIED"}, ""),
+        (429, {"error": {"code": "RATE_LIMITED"}}, ""),
+        (403, {"error": "MODEL_ACCESS_DENIED"}, ""),
+        (403, {"code": ["MODEL_ACCESS_DENIED"]}, ""),
+        (403, {"code": {"value": "MODEL_ACCESS_DENIED"}}, ""),
+    ],
+)
+async def test_submission_refusal_keeps_only_status_and_allowlisted_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status: int,
+    payload: dict[str, object],
+    expected_code: str,
+) -> None:
+    requests: list[httpx.Request] = []
+    accepted: list[str] = []
+    response_payload = {
+        **payload,
+        "message": "synthetic-test-key A quiet city street at dawn https://private.test/path",
+        "request_id": "private-request-id",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status, json=response_payload)
+
+    _install_transport(monkeypatch, handler)
+    output = tmp_path / "clip.mp4"
+    with pytest.raises(VideoGenerationRejected) as raised:
+        await _generate(output, on_job_accepted=accepted.append)
+
+    refusal = raised.value
+    assert refusal.http_status == status
+    assert refusal.error_code == expected_code
+    assert refusal.job_id is None
+    assert refusal.recoverable is False
+    assert "synthetic-test-key" not in str(refusal)
+    assert "quiet city" not in str(refusal)
+    assert "private" not in str(refusal)
+    assert accepted == []
+    assert not output.exists()
+    assert [request.method for request in requests] == ["POST"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"not JSON: synthetic-test-key",
+        b"[]",
+        b'{"code":"MODEL_ACCESS_DENIED","message":"' + b"x" * (64 * 1024) + b'"}',
+    ],
+)
+async def test_invalid_or_oversized_refusal_body_preserves_known_http_rejection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: bytes
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(403, stream=httpx.ByteStream(body))
+
+    _install_transport(monkeypatch, handler)
+    with pytest.raises(VideoGenerationRejected) as raised:
+        await _generate(tmp_path / "clip.mp4")
+
+    assert raised.value.http_status == 403
+    assert raised.value.error_code == ""
+    assert "synthetic-test-key" not in str(raised.value)
+    assert [request.method for request in requests] == ["POST"]
+
+
+class _RefusalStream(httpx.AsyncByteStream):
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+
+    async def __aiter__(self):
+        if self.mode in {"body_deadline", "body_timeout"}:
+            await asyncio.Event().wait()
+        if self.mode == "body_error":
+            raise httpx.ReadError("synthetic-test-key response error")
+        yield b'{"code":"MODEL_ACCESS_DENIED"}'
+
+    async def aclose(self) -> None:
+        if self.mode == "close_error":
+            raise httpx.ReadError("synthetic-test-key close error")
+        if self.mode == "close_timeout":
+            raise TimeoutError("synthetic close timeout")
+        if self.mode == "close_deadline":
+            await asyncio.Event().wait()
+
+
+@pytest.mark.parametrize(
+    "mode,expected_code",
+    [
+        ("body_deadline", ""),
+        ("body_timeout", ""),
+        ("body_error", ""),
+        ("close_error", "MODEL_ACCESS_DENIED"),
+        ("close_timeout", "MODEL_ACCESS_DENIED"),
+        ("close_deadline", "MODEL_ACCESS_DENIED"),
+    ],
+)
+async def test_refusal_survives_diagnostic_read_or_stream_close_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str, expected_code: str
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(403, stream=_RefusalStream(mode))
+
+    _install_transport(monkeypatch, handler)
+    monkeypatch.setattr(
+        tokenrhythm_video_generation,
+        "_REJECTION_READ_TIMEOUT_SECONDS",
+        0.01 if mode == "body_timeout" else 1.0,
+    )
+    with pytest.raises(VideoGenerationRejected) as raised:
+        await _generate(tmp_path / "clip.mp4", timeout_seconds=0.05)
+
+    assert raised.value.http_status == 403
+    assert raised.value.error_code == expected_code
+    assert "synthetic-test-key" not in str(raised.value)
+    assert [request.method for request in requests] == ["POST"]
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+async def test_server_error_submission_remains_unknown_without_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, status: int
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status, json={"code": "MODEL_ACCESS_DENIED"})
 
     _install_transport(monkeypatch, handler)
     with pytest.raises(VideoGenerationSubmissionUnknown):

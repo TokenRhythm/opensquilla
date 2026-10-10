@@ -1505,6 +1505,7 @@ async def video_generate(
 ) -> str:
     from opensquilla.provider.video_generation import (
         VideoGenerationError,
+        VideoGenerationRejected,
         VideoGenerationSubmissionUnknown,
     )
 
@@ -1586,6 +1587,15 @@ async def video_generate(
                     "note": str(exc),
                 }
             )
+        except VideoGenerationRejected as exc:
+            message = f"{provider} rejected video generation (HTTP {exc.http_status})."
+            if provider == "tokenrhythm" and exc.error_code == "MODEL_ACCESS_DENIED":
+                message = (
+                    "TokenRhythm rejected video generation (HTTP 403, MODEL_ACCESS_DENIED). "
+                    "The selected video model is limited to approved preview accounts. "
+                    "Model access must be enabled by TokenRhythm before retrying."
+                )
+            raise SafeToolError(message) from None
         except VideoGenerationError as exc:
             if exc.recoverable and exc.job_id:
                 handle = remember_job(exc.job_id)
