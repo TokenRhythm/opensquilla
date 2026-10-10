@@ -720,7 +720,6 @@ const virtualizationEnabled = computed(() => (
   virtualizationAllowed.value && !props.shareMode && !props.virtualizationDisabled
   && Boolean(props.scrollContainer) && props.messages.length >= 60
 ))
-const MAX_NON_VIRTUALIZED_ROWS = 120
 const forcedIndexes = computed(() => {
   const forced = new Set<number>()
   props.messages.forEach((message, index) => {
@@ -836,15 +835,11 @@ const variableLayout = computed(() => {
   // Populate the same geometry even when an export renders every row.
   const totalSize = virtualizer.value.getTotalSize()
   if (!virtualizationEnabled.value) {
-    // Share/export views intentionally render every row. Interactive views
-    // without a scroll container still get a hard DOM ceiling so a large
-    // history cannot freeze the renderer before virtualization is available.
-    const first = props.shareMode
-      ? 0
-      : Math.max(0, messageKeys.value.length - MAX_NON_VIRTUALIZED_ROWS)
-    const entries = messageKeys.value.slice(first).map((key, index) => ({
+    // Without virtualization every loaded row must remain reachable by
+    // ordinary scrolling and message navigation.
+    const entries = messageKeys.value.map((key, index) => ({
       key,
-      index: first + index,
+      index,
       gapBefore: 0,
     }))
     if (hasTrailing.value) entries.push({
@@ -854,7 +849,7 @@ const variableLayout = computed(() => {
     })
     return {
       entries,
-      topSpacer: first > 0 ? first * 76 : 0,
+      topSpacer: 0,
       bottomSpacer: props.bottomPadding ?? 0,
     }
   }

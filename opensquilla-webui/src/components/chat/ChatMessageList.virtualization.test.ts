@@ -58,6 +58,7 @@ async function mountList(options: {
   trailing?: boolean
   bottomPadding?: number
   withoutScrollContainer?: boolean
+  virtualizationDisabled?: boolean
   fitsViewport?: boolean
 } = {}) {
   const container = document.createElement('div')
@@ -80,6 +81,7 @@ async function mountList(options: {
   const componentProps = reactive({
     messages: options.messages ?? Array.from({ length: 200 }, (_, index) => message(index)),
     scrollContainer: options.withoutScrollContainer ? undefined : container,
+    virtualizationDisabled: options.virtualizationDisabled ?? false,
     shareMode: options.shareMode ?? false,
     forceMountMessageKeys: options.forceMountMessageKeys,
     followLiveEdge: options.followLiveEdge,
@@ -615,9 +617,42 @@ describe('ChatMessageList long-history virtualization', () => {
 
     window.localStorage.setItem('opensquilla.chat.virtualizeHistory', '0')
     const rollback = await mountList()
-    expect(rollback.host.querySelectorAll('[data-testid="chat-message-row"]')).toHaveLength(120)
+    expect(rollback.host.querySelectorAll('[data-testid="chat-message-row"]')).toHaveLength(200)
     expect(rollback.api.isVirtualized()).toBe(false)
   })
+
+  it.each(['rollback', 'disabled', 'no-container'] as const)(
+    'keeps the oldest row reachable before and after prepend in the %s fallback', async fallback => {
+      if (fallback === 'rollback') window.localStorage.setItem('opensquilla.chat.virtualizeHistory', '0')
+      const { host, api, container, props } = await mountList({
+        virtualizationDisabled: fallback === 'disabled',
+        withoutScrollContainer: fallback === 'no-container',
+        messages: Array.from({ length: 200 }, (_, index) => message(index + 50)),
+        followLiveEdge: false,
+      })
+      expect(api.isVirtualized()).toBe(false)
+      expect((await api.ensureMessageVisible(0))?.textContent).toContain('Prompt 50')
+      expect(host.querySelectorAll('[data-testid="chat-message-row"]')).toHaveLength(200)
+      expect(host.querySelector('[data-testid="chat-history-top-spacer"]')).toBeNull()
+
+      props.messages = [...Array.from({ length: 50 }, (_, index) => message(index)), ...props.messages]
+      await nextTick()
+      await nextTick()
+      expect(host.querySelectorAll('[data-testid="chat-message-row"]')).toHaveLength(250)
+      expect((await api.ensureMessageVisible(0))?.textContent).toContain('Prompt 0')
+      expect((await api.ensureMessageVisible(50))?.textContent).toContain('Prompt 50')
+      expect((await api.ensureMessageVisible(249))?.textContent).toContain('Prompt 249')
+
+      if (fallback !== 'no-container') {
+        api.scrollToMessage(0, { align: 'start' })
+        await nextTick()
+        expect(container.scrollTop).toBe(0)
+      }
+      api.releaseEnsuredMessage()
+      await nextTick()
+      expect(host.querySelector('[data-chat-message-index="0"]')?.textContent).toContain('Prompt 0')
+    },
+  )
 
   it('measures the trailing stream in the same virtual range and reserves bottom space once', async () => {
     const { host } = await mountList({ trailing: true, bottomPadding: 24 })
@@ -629,9 +664,9 @@ describe('ChatMessageList long-history virtualization', () => {
     expect(bottom.style.height).toBe('24px')
   })
 
-  it('caps history for legacy embedders without a scroll container', async () => {
+  it('renders complete history for legacy embedders without a scroll container', async () => {
     const { host, api } = await mountList({ withoutScrollContainer: true })
-    expect(host.querySelectorAll('[data-testid="chat-message-row"]')).toHaveLength(120)
+    expect(host.querySelectorAll('[data-testid="chat-message-row"]')).toHaveLength(200)
     expect(api.isVirtualized()).toBe(false)
   })
 
