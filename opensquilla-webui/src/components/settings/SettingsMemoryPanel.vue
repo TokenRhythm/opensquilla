@@ -63,6 +63,9 @@ let pollTimer: ReturnType<typeof setTimeout> | null = null
 let slowTimer: ReturnType<typeof setTimeout> | null = null
 let stateEnterResolver: (() => void) | null = null
 let focusHeadingAfterEnter = false
+let disposed = false
+const observationController = new AbortController()
+let pollWork: Promise<void> | null = null
 
 const exportPrompt = computed(() => {
   // This prompt intentionally contains a literal "<name>" placeholder. Read
@@ -230,13 +233,15 @@ function handleStateEntered() {
 }
 
 async function loadInfo() {
+  if (disposed) return
   state.value = 'loading'
   lastOperation.value = 'info'
   errorCode.value = ''
   previewErrorVisible.value = false
   retryErrorVisible.value = false
   try {
-    const result = await memoryImport.info()
+    const result = await memoryImport.info({ signal: observationController.signal })
+    if (disposed) return
     info.value = result
     recentImport.value = result.recentImport
     if (result.draftJob) {
@@ -245,6 +250,7 @@ async function loadInfo() {
       state.value = result.available ? 'input' : 'unsupported'
     }
   } catch (error) {
+    if (disposed) return
     if (isMethodMissing(error)) {
       state.value = 'unsupported'
       return
@@ -284,6 +290,7 @@ async function requestPreview() {
   if (!previewRequestId.value) previewRequestId.value = createRequestId()
   state.value = 'analyzing'
   await analyzingEntered
+  if (disposed) return
 
   try {
     const result = await memoryImport.start({
@@ -323,25 +330,33 @@ function armSlowNotice(current: ImportJob) {
 }
 
 function scheduleJobPoll() {
-  if (!importJob.value || document.hidden) return
+  if (disposed || !importJob.value || document.hidden) return
   if (!['queued', 'analyzing', 'cancelling'].includes(importJob.value.status)) return
   if (pollTimer) clearTimeout(pollTimer)
   pollTimer = setTimeout(() => void pollJob(), 2000)
 }
 
-async function pollJob() {
+function pollJob(): Promise<void> {
   const current = importJob.value
-  if (!current || document.hidden) return
-  try {
-    const result = await memoryImport.status(current.jobId)
-    await handleJob(result)
-  } catch (error) {
-    errorCode.value = memoryImportErrorCode(error)
-    state.value = 'error'
-  }
+  if (disposed || !current || document.hidden) return Promise.resolve()
+  if (pollWork) return pollWork
+  const work = Promise.resolve().then(async () => {
+    if (disposed) return
+    try {
+      const result = await memoryImport.status(current.jobId, { signal: observationController.signal })
+      if (!disposed && importJob.value?.jobId === current.jobId) await handleJob(result)
+    } catch (error) {
+      if (disposed) return
+      errorCode.value = memoryImportErrorCode(error)
+      state.value = 'error'
+    }
+  }).finally(() => { if (pollWork === work) pollWork = null })
+  pollWork = work
+  return work
 }
 
 async function handleJob(current: ImportJob) {
+  if (disposed) return
   clearJobTimers()
   retryErrorVisible.value = false
   importJob.value = current
@@ -576,6 +591,9 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  disposed = true
+  observationController.abort()
+  stateEnterResolver?.()
   if (copyResetTimer) clearTimeout(copyResetTimer)
   clearJobTimers()
   document.removeEventListener('visibilitychange', handleVisibilityChange)

@@ -5,6 +5,7 @@ import { localizeImageActionableDetail, useSetupCatalog } from './useSetupCatalo
 import { LEGACY_OPENROUTER_MODEL_OPTIONS } from './useSetupEnsembleForm'
 import { PROVIDER_CREDENTIAL_REVEAL_TIMEOUT_MS } from './useSetupProviderForm'
 import { SetupWorkflowError } from '@/modules/setupWorkflow'
+import { AppSettingsError } from '@/modules/appSettings'
 import type { GatewayAvailability } from '@/modules/gatewayAccess'
 
 const rpcCall = vi.hoisted(() => vi.fn())
@@ -1363,13 +1364,16 @@ describe('useSetupCatalog effective model limits', () => {
     })
     const { api, app } = await mountCatalog()
 
-    await vi.waitFor(() => expect(discoverCalls).toBe(1))
+    // Initial settings hydration must not probe an arbitrary provider
+    // endpoint. Discovery starts only after the user leaves and re-enters
+    // the Provider section (or uses the explicit refresh action).
+    expect(discoverCalls).toBe(0)
 
     api.setSection('behavior')
     await nextTick()
     api.setSection('provider')
     await nextTick()
-    expect(discoverCalls).toBe(1)
+    await vi.waitFor(() => expect(discoverCalls).toBe(1))
 
     releaseFirstDiscovery()
     await vi.waitFor(() => expect(api.providerPanel.value.connection.modelSource).toBe('live'))
@@ -1689,15 +1693,11 @@ describe('useSetupCatalog model strategy IA', () => {
     })
     const { api, app } = await mountCatalog()
 
+    expect(requests).toEqual([])
     api.updateProviderField('api_key', 'unsaved-selected-provider-key')
     api.setSection('modelStrategy')
-    await vi.waitFor(() => expect(requests).toHaveLength(4))
+    await vi.waitFor(() => expect(requests).toHaveLength(3))
 
-    expect(requests).toContainEqual({
-      providerId: 'tokenrhythm',
-      model: 'deepseek-v4-pro',
-      cacheOnly: true,
-    })
     expect(requests).toContainEqual({
       providerId: 'tokenrhythm',
       apiKey: 'unsaved-selected-provider-key',
@@ -1707,7 +1707,7 @@ describe('useSetupCatalog model strategy IA', () => {
     expect(requests).toContainEqual({ providerId: 'openrouter', cacheOnly: true })
     expect(requests).toContainEqual({ providerId: 'anthropic', cacheOnly: true })
     expect(requests.filter(request => request.apiKey !== undefined)).toHaveLength(1)
-    expect(discoveryMethods.filter(method => method === 'onboarding.models.discover')).toHaveLength(2)
+    expect(discoveryMethods.filter(method => method === 'onboarding.models.discover')).toHaveLength(1)
     expect(discoveryMethods.filter(method => method === 'onboarding.llmProfile.models.discover')).toHaveLength(2)
 
     const byProvider = api.routerPanel.value.discoveredModelsByProvider
@@ -2298,6 +2298,124 @@ describe('useSetupCatalog model strategy IA', () => {
     app.unmount()
   })
 
+  it.each([true, false])('confirms behavior-only saving as %s without rereading unrelated settings', async enabled => {
+    mockConfigSequence([{
+      naming: { enabled: !enabled, timeout_seconds: 18 },
+      privacy: { disable_network_observability: true },
+    }])
+    const { api, app } = await mountCatalog()
+    rpcCall.mockClear()
+    pushToast.mockClear()
+    try {
+      api.setAutoSessionTitles(enabled)
+      await api.saveDirtySections()
+
+      expect(rpcCall.mock.calls).toEqual([['config.patch.safe', {
+        patches: { 'naming.enabled': enabled },
+      }]])
+      expect(api.config.value.naming).toEqual({ enabled, timeout_seconds: 18 })
+      expect(api.config.value.privacy).toEqual({ disable_network_observability: true })
+      expect(api.behaviorPanel.value.autoSessionTitles).toBe(enabled)
+      expect(api.sectionDirty('general')).toBe(false)
+      expect(api.saveAllPending.value).toBe(false)
+      expect(pushToast).toHaveBeenCalledOnce()
+
+      api.setAutoSessionTitles(!enabled)
+      expect(api.sectionDirty('general')).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it('acknowledges only the submitted behavior value and retains a newer draft', async () => {
+    mockConfigSequence([{ naming: { enabled: false } }])
+    const { api, app } = await mountCatalog()
+    let releaseSave!: (result: { restartRequired: boolean }) => void
+    rpcCall.mockClear()
+    rpcCall.mockImplementationOnce(() => new Promise(resolve => { releaseSave = resolve }))
+    try {
+      api.setAutoSessionTitles(true)
+      const saving = api.saveDirtySections()
+      expect(api.saveAllPending.value).toBe(true)
+      api.setAutoSessionTitles(false)
+
+      releaseSave({ restartRequired: false })
+      await saving
+
+      expect(api.config.value.naming?.enabled).toBe(true)
+      expect(api.behaviorPanel.value.autoSessionTitles).toBe(false)
+      expect(api.sectionDirty('general')).toBe(true)
+      expect(api.saveAllPending.value).toBe(false)
+
+      await api.saveDirtySections()
+      expect(rpcCall.mock.calls).toEqual([
+        ['config.patch.safe', { patches: { 'naming.enabled': true } }],
+        ['config.patch.safe', { patches: { 'naming.enabled': false } }],
+      ])
+      expect(api.config.value.naming?.enabled).toBe(false)
+      expect(api.sectionDirty('general')).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it.each([
+    ['rejection', new AppSettingsError('invalid', 'Synthetic rejected preference')],
+    ['timeout', new AppSettingsError('unavailable', 'Synthetic RPC request timed out')],
+  ] as const)('retains the behavior draft after %s without success or an automatic retry', async (_kind, error) => {
+    mockConfigSequence([{ naming: { enabled: false } }])
+    const { api, app } = await mountCatalog()
+    rpcCall.mockClear()
+    pushToast.mockClear()
+    rpcCall.mockRejectedValueOnce(error)
+    try {
+      api.setAutoSessionTitles(true)
+      await api.saveDirtySections()
+
+      expect(rpcCall.mock.calls).toEqual([['config.patch.safe', {
+        patches: { 'naming.enabled': true },
+      }]])
+      expect(api.config.value.naming?.enabled).toBe(false)
+      expect(api.behaviorPanel.value.autoSessionTitles).toBe(true)
+      expect(api.sectionDirty('general')).toBe(true)
+      expect(api.saveAllPending.value).toBe(false)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(expect.any(String), { tone: 'danger' })
+    } finally { app.unmount() }
+  })
+
+  it('waits for another dirty section while retaining an acknowledged behavior save if that section fails', async () => {
+    let rejectModelSave!: (error: Error) => void
+    const modelSave = new Promise((_resolve, reject) => { rejectModelSave = reject })
+    mockConfigSequence([{
+      llm: { provider: 'openrouter', model: 'openrouter/auto' },
+      naming: { enabled: false },
+      squilla_router: { enabled: false },
+      llm_ensemble: { enabled: false },
+    }])
+    const { api, app } = await mountCatalog()
+    rpcCall.mockClear()
+    rpcCall.mockImplementation(async method => {
+      if (method === 'config.patch.safe') return { restartRequired: false }
+      if (method === 'config.patch') return modelSave
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    try {
+      api.setAutoSessionTitles(true)
+      api.setFixedModel('deepseek/deepseek-v4-pro')
+      const saving = api.saveDirtySections()
+      await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith('config.patch', {
+        patches: { 'llm.model': 'deepseek/deepseek-v4-pro' },
+      }))
+      expect(api.saveAllPending.value).toBe(true)
+      expect(api.config.value.naming?.enabled).toBe(true)
+      expect(api.sectionDirty('general')).toBe(false)
+
+      rejectModelSave(new Error('Synthetic model save failure'))
+      await saving
+
+      expect(api.saveAllPending.value).toBe(false)
+      expect(api.sectionDirty('general')).toBe(false)
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(rpcCall.mock.calls.map(([method]) => method)).toEqual(['config.patch.safe', 'config.patch'])
+    } finally { app.unmount() }
+  })
+
   it('snapshots save-all work and reloads once after every dirty section is persisted', async () => {
     let configReads = 0
     rpcCall.mockImplementation(async (method: string) => {
@@ -2389,8 +2507,9 @@ describe('useSetupCatalog model strategy IA', () => {
 
     expect(rpcCall.mock.calls.filter(call => call[0] === 'config.patch.safe'))
       .toHaveLength(1)
-    expect(configReads).toBe(2)
+    expect(configReads).toBe(1)
     expect(api.saveAllPending.value).toBe(false)
+    expect(api.sectionDirty('general')).toBe(false)
     app.unmount()
   })
 
@@ -3732,7 +3851,7 @@ describe('useSetupCatalog configured provider management', () => {
     app.unmount()
   })
 
-  it('loads the saved active provider catalog without probing or dirtying the editor', async () => {
+  it('loads the saved active provider catalog on Provider re-entry without probing or dirtying the editor', async () => {
     rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
       if (method === 'onboarding.catalog') return { providers }
       if (method === 'onboarding.status') return statusWithDeepSeek()
@@ -3750,6 +3869,10 @@ describe('useSetupCatalog configured provider management', () => {
     })
     const { api, app } = await mountCatalog()
 
+    expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.models.discover')).toBe(false)
+    api.setSection('behavior')
+    await nextTick()
+    api.setSection('provider')
     await vi.waitFor(() => expect(api.providerPanel.value.connection.models).toHaveLength(1))
     expect(api.providerPanel.value.connection).toMatchObject({
       phase: 'unverified',
@@ -3803,6 +3926,8 @@ describe('useSetupCatalog configured provider management', () => {
     })
     const { api, app } = await mountCatalog()
 
+    expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.models.discover')).toBe(false)
+    await api.refreshProviderModels()
     await vi.waitFor(() => expect(
       rpcCall.mock.calls.some(call => call[0] === 'onboarding.models.discover'),
     ).toBe(true))
@@ -5221,7 +5346,6 @@ describe('useSetupCatalog configured provider management', () => {
     ))
     expect(rpcCall).toHaveBeenCalledWith('onboarding.models.discover', {
       providerId: 'openai',
-      model: 'gpt-4.1-mini',
       cacheOnly: true,
     })
     await vi.waitFor(() => expect(
