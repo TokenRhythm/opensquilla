@@ -109,6 +109,12 @@ def test_packaged_smoke_requires_safe_success_and_explicit_windows_provisioning(
     assert "frozen: true, backend" in smoke
     assert "writeDenied: true, networkDenied: true" in smoke
     assert "process.argv.includes('--provision-windows-sandbox')" in smoke
+    assert "--allow-safe-setup-unavailable" in smoke
+    assert "elevation_required" in smoke
+    assert "SAFE_ENVIRONMENT_BLOCKED" in smoke
+    assert "!provisionRequested" in smoke
+    assert "pathIsFile(join(tempHome, '.opensquilla', 'sandbox', 'setup_marker.json'))" in smoke
+    assert "setup_marker\\.json/.test(message)" not in smoke
     assert "npm run verify:gateway-smoke -- --provision-windows-sandbox" in workflow
     jobs = yaml.safe_load(workflow)["jobs"]
     for platform in ("macos", "windows"):

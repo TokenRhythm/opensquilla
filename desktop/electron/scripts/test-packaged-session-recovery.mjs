@@ -138,12 +138,24 @@ async function configureSyntheticRecoveryProvider(baseUrl) {
   const raw = await readFile(configPath, 'utf8')
   assert.equal(raw.split(/\r?\n/, 1)[0], `# Synthetic ${label} release-preservation profile`,
     'recovered-send verification requires its explicitly seeded synthetic profile')
-  const headings = [...raw.matchAll(/^\[llm\]\r?$/gm)]
+  // The release-preservation seed contains absolute profile roots.  The
+  // packaged probe is intentionally run from a disposable copy, so stale
+  // roots would make Gateway read a different profile than the one recorded
+  // by the harness and produce false recovery/viewport failures.  Rebind only
+  // this explicitly synthetic fixture before launch; a real user profile is
+  // rejected by the header assertion above and is never rewritten.
+  const profileRoot = resolve(userDataDir, 'opensquilla')
+  const rebound = raw
+    .replace(/^state_dir = .*$/m, `state_dir = ${JSON.stringify(resolve(profileRoot, 'state'))}`)
+    .replace(/^workspace_dir = .*$/m, `workspace_dir = ${JSON.stringify(resolve(profileRoot, 'workspace'))}`)
+  assert.match(rebound, new RegExp(`^state_dir = ${escapeRegExp(JSON.stringify(resolve(profileRoot, 'state')))}$`, 'm'))
+  assert.match(rebound, new RegExp(`^workspace_dir = ${escapeRegExp(JSON.stringify(resolve(profileRoot, 'workspace')))}$`, 'm'))
+  const headings = [...rebound.matchAll(/^\[llm\]\r?$/gm)]
   assert.equal(headings.length, 1, 'the synthetic profile must have one LLM section')
   const start = headings[0].index
-  const next = raw.indexOf('\n[', start + 1)
-  const end = next < 0 ? raw.length : next
-  const section = raw.slice(start, end)
+  const next = rebound.indexOf('\n[', start + 1)
+  const end = next < 0 ? rebound.length : next
+  const section = rebound.slice(start, end)
   assert.match(section, /^provider = "ollama"\r?$/m)
   assert.ok(section.includes(`model = "${recoveryModel}"`), 'the profile must use the synthetic model')
   const updated = section.replace(/^base_url = "http:\/\/127\.0\.0\.1:11434"\r?$/m,
@@ -151,7 +163,11 @@ async function configureSyntheticRecoveryProvider(baseUrl) {
   assert.notEqual(updated, section, 'the synthetic baseline endpoint must be present')
   // Existing profile config is authoritative over Desktop's credential cache.
   // Only this disposable send probe redirects its synthetic provider endpoint.
-  await writeFile(configPath, raw.slice(0, start) + updated + raw.slice(end), 'utf8')
+  await writeFile(configPath, rebound.slice(0, start) + updated + rebound.slice(end), 'utf8')
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 async function captureRecoveryFailure() {
