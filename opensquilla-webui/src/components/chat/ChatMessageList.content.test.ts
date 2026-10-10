@@ -153,13 +153,13 @@ describe('ChatMessageList inline history content', () => {
     }
   })
 
-  it('discloses clipped tool/reasoning details independently of full-answer hydration', async () => {
+  it('keeps internal detail-preview metadata out of the conversation', async () => {
     const { host } = await mountList([assistant({
       text: 'Complete answer', previewComplete: true,
       historyPayloadPreview: { detailsTruncated: true, reasoningUtf16Length: 90000 },
     })])
-    expect(host.querySelector('[data-testid="chat-history-detail-preview"]')?.textContent)
-      .toContain(i18n.global.t('historyContent.detailsPreview'))
+    expect(host.querySelector('[data-testid="chat-history-detail-preview"]')).toBeNull()
+    expect(host.querySelector('[role="status"]')).toBeNull()
     expect(host.querySelector('[data-testid="chat-history-content-hydration"]')).toBeNull()
     expect(host.querySelector('[data-testid="assistant-body"]')?.textContent).toBe('Complete answer')
   })

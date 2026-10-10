@@ -60,14 +60,6 @@
             {{ contentHydrationError(messages[entry.index], entry.index) }}
           </span>
         </div>
-        <div
-          v-if="messages[entry.index].historyPayloadPreview?.detailsTruncated"
-          class="chat-history-content-hydration"
-          data-testid="chat-history-detail-preview"
-          role="status"
-        >
-          {{ t('historyContent.detailsPreview') }}
-        </div>
         <slot
           v-if="messages[entry.index].isRouterStrip"
           name="router-strip"
