@@ -159,10 +159,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         if auth_mode == "token":
             token = self._extract_token(request)
-            from opensquilla.gateway.auth import resolve_auth
+            from opensquilla.gateway.auth import resolve_auth_async
 
             peer_ip = request.client.host if request.client is not None else None
-            principal = resolve_auth(
+            principal = await resolve_auth_async(
                 self._config,
                 auth_params={"token": token} if token else {},
                 role_claim="operator",

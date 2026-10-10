@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import re
@@ -127,6 +128,37 @@ def permission_fingerprint(
     return hashlib.sha256(payload).hexdigest()
 
 
+async def run_auth_database_operation[Result](operation: Callable[[], Result]) -> Result:
+    """Keep a complete auth database operation and its cleanup off-loop.
+
+    SQLite work cannot be stopped by cancelling its awaiter. Retain ownership
+    until the worker has committed/rolled back and closed its connections,
+    including when cancellation is requested more than once.
+    """
+
+    worker = asyncio.get_running_loop().run_in_executor(
+        None, contextvars.copy_context().run, operation,
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except BaseException:
+            break
+    try:
+        result = worker.result()
+    except BaseException as exc:
+        if cancellation is not None:
+            raise cancellation from exc
+        raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 class TokenStore:
     """Small SQLite-backed store sharing the migrated sessions database."""
 
@@ -141,7 +173,7 @@ class TokenStore:
         return connection
 
     def _ensure_schema(self) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sandbox_tokens (
@@ -202,7 +234,7 @@ class TokenStore:
             source_kind=str(source_kind),
             created_at=created_at,
         )
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute(
                 """
                 INSERT INTO sandbox_tokens (
@@ -234,7 +266,7 @@ class TokenStore:
         secret = match.group("secret") if match is not None else ""
         row: sqlite3.Row | None = None
         if public_id:
-            with self._connect() as connection:
+            with closing(self._connect()) as connection:
                 row = connection.execute(
                     "SELECT * FROM sandbox_tokens WHERE public_id = ?",
                     (public_id,),
@@ -246,7 +278,7 @@ class TokenStore:
             return None
 
         used_at = int(time.time())
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute(
                 "UPDATE sandbox_tokens SET last_used_at = ?, last_peer = ? "
                 "WHERE public_id = ? AND revoked_at IS NULL",
@@ -255,7 +287,7 @@ class TokenStore:
         return self._record_from_row(row)
 
     def revoke(self, public_id: str) -> bool:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             cursor = connection.execute(
                 "UPDATE sandbox_tokens SET revoked_at = ?, "
                 "authorization_revision = authorization_revision + 1 "
@@ -323,9 +355,8 @@ class TokenStore:
     ) -> AuthorizationDecision:
         """Read current authority on a worker thread, never on the Gateway loop."""
 
-        return await asyncio.to_thread(
-            self.get_active_authorization_decision,
-            public_id,
+        return await run_auth_database_operation(
+            lambda: self.get_active_authorization_decision(public_id),
         )
 
     async def verify_async(
@@ -333,12 +364,12 @@ class TokenStore:
     ) -> TokenRecord | None:
         """Verify a token without performing SQLite I/O on the event loop."""
 
-        return await asyncio.to_thread(self.verify, token, peer_ip=peer_ip)
+        return await run_auth_database_operation(lambda: self.verify(token, peer_ip=peer_ip))
 
     def list_active(self) -> tuple[TokenRecord, ...]:
         """List active token metadata without ever loading or returning secrets."""
 
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             rows = connection.execute(
                 "SELECT * FROM sandbox_tokens WHERE revoked_at IS NULL "
                 "ORDER BY created_at DESC, public_id ASC"
@@ -428,5 +459,6 @@ __all__ = [
     "TokenStore",
     "default_auth_failure_limiter",
     "permission_fingerprint",
+    "run_auth_database_operation",
     "token_public_id",
 ]

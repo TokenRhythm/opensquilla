@@ -43,7 +43,12 @@ from opensquilla.gateway.scopes import (
     is_loopback_bind,
     normalize_operator_scopes,
 )
-from opensquilla.gateway.token_store import TokenRecord, TokenStore, token_public_id
+from opensquilla.gateway.token_store import (
+    TokenRecord,
+    TokenStore,
+    run_auth_database_operation,
+    token_public_id,
+)
 
 if TYPE_CHECKING:
     from opensquilla.gateway.config import GatewayConfig
@@ -405,3 +410,26 @@ def resolve_auth(
     except ValueError as exc:
         log.warning("auth.failed", mode=config.auth.mode, error=str(exc))
         return None
+
+
+async def resolve_auth_async(
+    config: GatewayConfig,
+    auth_params: dict,
+    role_claim: str,
+    *,
+    peer_ip: str | None = None,
+) -> Principal | None:
+    """Resolve live request auth without running named-token SQLite on-loop.
+
+    No-auth, ordinary legacy and Desktop credentials retain their immediate
+    resolver path. Only named-token candidates can open the SQLite store;
+    include construction and usage-record commit in the worker operation.
+    """
+
+    def operation() -> Principal | None:
+        return resolve_auth(config, auth_params, role_claim, peer_ip=peer_ip)
+
+    token = str((auth_params or {}).get("token") or "")
+    if config.auth.mode == "token" and token.startswith("osq_"):
+        return await run_auth_database_operation(operation)
+    return operation()

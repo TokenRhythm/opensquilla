@@ -263,7 +263,7 @@ def create_gateway_app(
         return response
 
     async def api_config(request: Request) -> JSONResponse:
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         result = await dispatcher.dispatch("_http", "config.get", None, ctx)
         if result.ok:
             return JSONResponse(result.payload or {})
@@ -271,7 +271,7 @@ def create_gateway_app(
         return JSONResponse({"error": msg}, status_code=_rpc_status_code(result))
 
     async def api_sessions(request: Request) -> JSONResponse:
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         params: dict[str, object] = {}
         raw_limit = request.query_params.get("limit")
         if raw_limit:
@@ -307,7 +307,7 @@ def create_gateway_app(
             body = await request.json()
         except Exception:
             return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         result = await dispatcher.dispatch("_http", "chat.send", body, ctx)
         if result.ok:
             return _with_http_guest_cookie(
@@ -400,7 +400,7 @@ def create_gateway_app(
         503 when no run loop is attached (app built without a server — e.g. in
         tests or embedded ``run=False`` use).
         """
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         if not ctx.principal.is_owner:
             return JSONResponse({"error": "owner privileges required"}, status_code=403)
         request_shutdown = getattr(request.app.state, "request_shutdown", None)
@@ -476,7 +476,7 @@ def create_gateway_app(
         return response
 
     async def api_usage(request: Request) -> JSONResponse:
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         result = await dispatcher.dispatch("_http", "usage.status", None, ctx)
         if result.ok:
             # Merge breakdown from usage.cost into the status response
@@ -494,7 +494,7 @@ def create_gateway_app(
             "_http",
             "sandbox.policy.get",
             {},
-            _make_ctx(request),
+            await _make_ctx(request),
         )
         if result.ok:
             return JSONResponse(result.payload or {})
@@ -510,7 +510,7 @@ def create_gateway_app(
             "_http",
             "sandbox.policy.update",
             params if isinstance(params, dict) else None,
-            _make_ctx(request),
+            await _make_ctx(request),
         )
         if result.ok:
             return JSONResponse(result.payload or {})
@@ -528,8 +528,8 @@ def create_gateway_app(
             payload["details"] = error.details
         return JSONResponse(payload, status_code=status)
 
-    def _make_ctx(request: Request | None = None, role_claim: str = "operator") -> RpcContext:
-        from opensquilla.gateway.auth import Principal, resolve_auth
+    async def _make_ctx(request: Request | None = None, role_claim: str = "operator") -> RpcContext:
+        from opensquilla.gateway.auth import Principal, resolve_auth_async
 
         principal = (
             getattr(request.state, "principal", None)
@@ -546,7 +546,7 @@ def create_gateway_app(
                 if guest_session_key:
                     auth_params["guestSessionKey"] = guest_session_key
             peer_ip = request.client.host if request is not None and request.client else None
-            principal = resolve_auth(
+            principal = await resolve_auth_async(
                 config,
                 auth_params=auth_params,
                 role_claim=role_claim,
@@ -600,7 +600,7 @@ def create_gateway_app(
         )
 
     async def api_channels_status(request: Request) -> JSONResponse:
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         result = await dispatcher.dispatch("_http", "channels.status", None, ctx)
         if result.ok:
             return JSONResponse(result.payload or {"channels": []})
@@ -612,7 +612,7 @@ def create_gateway_app(
             body = await request.json()
         except Exception:
             return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         result = await dispatcher.dispatch("_http", "channels.logout", body, ctx)
         if result.ok:
             return JSONResponse(result.payload or {"ok": True})
@@ -620,7 +620,7 @@ def create_gateway_app(
         return JSONResponse({"error": msg}, status_code=_rpc_status_code(result, default=400))
 
     async def api_channel_pairings(request: Request) -> JSONResponse:
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         result = await dispatcher.dispatch(
             "_http",
             "channels.pairings",
@@ -640,7 +640,7 @@ def create_gateway_app(
             body = await request.json()
         except Exception:
             return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         result = await dispatcher.dispatch("_http", method, body, ctx)
         if result.ok:
             return JSONResponse(result.payload or {"ok": True})
@@ -660,7 +660,7 @@ def create_gateway_app(
         )
 
     async def api_approvals(request: Request) -> JSONResponse:
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         result = await dispatcher.dispatch("_http", "exec.approvals.get", None, ctx)
         if not result.ok:
             return JSONResponse(
@@ -692,7 +692,7 @@ def create_gateway_app(
                 {"error": "mode must be prompt, auto-approve, or auto-deny"},
                 status_code=400,
             )
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         result = await dispatcher.dispatch(
             "_http",
             "exec.approvals.set",
@@ -728,7 +728,7 @@ def create_gateway_app(
         namespace = body.get("namespace", "exec")
         if not approval_id:
             return JSONResponse({"error": "id is required"}, status_code=400)
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         method = "plugin.approval.resolve" if namespace == "plugin" else "exec.approval.resolve"
         resolve_params = {
             "id": approval_id,
@@ -755,7 +755,7 @@ def create_gateway_app(
             body = await request.json()
         except Exception:
             return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         if not ctx.principal.is_owner:
             return JSONResponse({"error": "owner privileges required"}, status_code=403)
         session_key = str(body.get("sessionKey") or body.get("session_key") or "").strip()
@@ -791,7 +791,7 @@ def create_gateway_app(
     # ── Agents / Cron HTTP endpoints ────────────────────────────────────────
 
     async def api_agents(request: Request) -> JSONResponse:
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         result = await dispatcher.dispatch("_http", "agents.list", None, ctx)
         if result.ok:
             return JSONResponse(result.payload or {"agents": []})
@@ -801,7 +801,7 @@ def create_gateway_app(
         )
 
     async def api_cron(request: Request) -> JSONResponse:
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         result = await dispatcher.dispatch("_http", "cron.list", None, ctx)
         if result.ok:
             return JSONResponse(
@@ -816,7 +816,7 @@ def create_gateway_app(
     async def api_chat_history(request: Request) -> JSONResponse:
         """GET /api/chat/history?sessionKey=xxx — return chat transcript."""
         session_key = request.query_params.get("sessionKey", "agent:main:webchat:default")
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         result = await dispatcher.dispatch(
             "_http", "chat.history", {"sessionKey": session_key}, ctx
         )
@@ -843,7 +843,7 @@ def create_gateway_app(
         streaming export for callers that explicitly need text.
         """
 
-        ctx = _make_ctx(request)
+        ctx = await _make_ctx(request)
         principal = ctx.principal
         session_key = str(request.query_params.get("sessionKey") or "").strip()
         session_id = str(request.query_params.get("sessionId") or "").strip()
