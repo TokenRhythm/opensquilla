@@ -129,13 +129,15 @@ def test_pty_probe_reports_real_tty_when_backend_is_installed(tmp_path: Path) ->
 
 @pytest.mark.parametrize("failure", ["read", "timeout", "initialization"])
 def test_pty_probe_cleans_child_after_failure(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], failure: str
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], failure: str,
+    tmp_path: Path,
 ) -> None:
     from opensquilla.tools import pty_backend
 
     handle = object()
     terminated = []
     waited = []
+    monkeypatch.setenv("CI_REPORT_DIR", str(tmp_path))
 
     def spawn(*args, **kwargs):
         if failure == "initialization":
@@ -178,15 +180,73 @@ def test_pty_probe_cleans_child_after_failure(
     }[failure]
     assert terminated == [handle]
     assert waited == [handle]
+    diagnostic = json.loads((tmp_path / "pty-probe-failures.jsonl").read_text())
+    assert diagnostic["phase"] in {
+        "read": {"read"}, "timeout": {"read", "post-exit-drain"},
+        "initialization": {"spawn"},
+    }[failure]
+    assert diagnostic["cleanupAttempted"] is True
+    assert diagnostic["cleanupCompleted"] is True
+    assert diagnostic["outputBytes"] == 0
+    assert diagnostic["sawTtyMarker"] is False
+    assert diagnostic["errorTypes"][0] == {
+        "read": "RuntimeError", "timeout": "TimeoutError", "initialization": "PtyBackendError",
+    }[failure]
+
+
+def test_pty_probe_diagnostic_keeps_only_safe_state_and_preserves_attempts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path,
+) -> None:
+    from opensquilla.tools import pty_backend
+
+    monkeypatch.setenv("CI_REPORT_DIR", str(tmp_path))
+    monkeypatch.setenv("SYNTHETIC_SECRET", "do-not-record-this-value")
+    handle = object()
+    monkeypatch.setattr(pty_backend, "spawn_pty", lambda *args, **kwargs: handle)
+
+    async def terminate(current):
+        stopped.set()
+
+    async def wait(current):
+        await stopped.wait()
+        return 0
+
+    monkeypatch.setattr(pty_backend, "wait_pty", wait)
+    monkeypatch.setattr(pty_backend, "terminate_pty", terminate)
+    namespace = runpy.run_path(str(ENTRY))
+    for _ in range(2):
+        stopped = asyncio.Event()
+        chunks = iter([b"opensquilla-pty-o", b"k\n", b"private terminal text"])
+
+        async def read(current):
+            chunk = next(chunks, None)
+            if chunk is None:
+                raise RuntimeError("synthetic failure")
+            return chunk
+
+        monkeypatch.setattr(pty_backend, "read_pty", read)
+        assert namespace["_run_desktop_pty_probe"]() == 1
+    assert len(capsys.readouterr().out.splitlines()) == 2
+    payload = (tmp_path / "pty-probe-failures.jsonl").read_text()
+    attempts = [json.loads(line) for line in payload.splitlines()]
+    assert len(attempts) == 2
+    assert all(row["sawTtyMarker"] for row in attempts)
+    assert all(row["outputBytes"] == len(b"opensquilla-pty-ok\nprivate terminal text")
+               for row in attempts)
+    assert all(row["phase"] == "read" for row in attempts)
+    assert all(row["waitCompletedBeforeCleanup"] is False for row in attempts)
+    assert "private terminal text" not in payload
+    assert "do-not-record-this-value" not in payload
 
 
 def test_pty_probe_drains_tail_after_process_exit(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path,
 ) -> None:
     from opensquilla.tools import pty_backend
 
     handle = object()
     chunks = iter([b"opensquilla-pty-ok\n", b"late-tail\n", b""])
+    monkeypatch.setenv("CI_REPORT_DIR", str(tmp_path))
 
     monkeypatch.setattr(pty_backend, "spawn_pty", lambda *args, **kwargs: handle)
 
@@ -211,6 +271,7 @@ def test_pty_probe_drains_tail_after_process_exit(
         "ioMode": "pty",
         "returncode": 0,
     }
+    assert not (tmp_path / "pty-probe-failures.jsonl").exists()
 
 
 def test_pty_probe_waits_for_process_when_reader_eof_arrives_first(
