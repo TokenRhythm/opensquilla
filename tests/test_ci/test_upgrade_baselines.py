@@ -604,15 +604,19 @@ def test_packaged_recovery_transport_contract_runs_in_desktop_node_ci() -> None:
         assert native_test.relative_to(ROOT).as_posix() in inputs
 
 
-def test_packaged_gateway_readiness_budget_and_terminal_errors() -> None:
+def test_packaged_gateway_readiness_budget_and_terminal_errors(tmp_path: Path) -> None:
     node = shutil.which("node")
     if not node:
         pytest.skip("Node.js is required for the packaged readiness contract")
-    result = subprocess.run(
-        [node, "--input-type=module", "-e", r"""
+    script = r"""
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeSync } from 'node:fs';
+const phase = (name, terminal) => writeSync(2, JSON.stringify({
+  event: 'packaged_readiness_contract', phase: name, terminal, at: Date.now(),
+}) + '\n');
+phase('entry');
 const source = readFileSync('desktop/electron/scripts/test-packaged-session-recovery.mjs', 'utf8');
+phase('source-loaded');
 const start = source.indexOf('  gatewayReadinessStartedAt = performance.now()');
 const end = source.indexOf('  // The preceding release-upgrade launch', start);
 assert.ok(start > 0 && end > start);
@@ -620,7 +624,9 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const run = new AsyncFunction('waitFor', 'page', 'assert', 'performance', 'console',
   'DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS',
   'let gatewayReadinessStartedAt, lastGatewayConnection;\n' + source.slice(start, end));
+phase('compiled');
 for (const terminal of ['ready', 'error', 'stopped', 'starting']) {
+  phase('case-start', terminal);
   let calls = 0;
   const logs = [];
   const page = { evaluate: async () => ({
@@ -650,11 +656,29 @@ for (const terminal of ['ready', 'error', 'stopped', 'starting']) {
     assert.equal(calls, terminal === 'starting' ? 3 : 2);
     assert.deepEqual(logs, []);
   }
+  phase('case-end', terminal);
 }
-"""],
-        cwd=ROOT, capture_output=True, text=True, timeout=15, check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+phase('complete');
+"""
+    # Keep the original process deadline independent of Windows pipe-reader
+    # threads, and retain the last completed phase if the child times out.
+    stdout_path = tmp_path / "node-stdout.log"
+    stderr_path = tmp_path / "node-stderr.log"
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        try:
+            result = subprocess.run(
+                [node, "--input-type=module", "-e", script],
+                cwd=ROOT, stdout=stdout_file, stderr=stderr_file, timeout=15, check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            error.add_note(
+                f"Captured stdout: {stdout_path.read_text(encoding='utf-8', errors='replace')!r}\n"
+                f"Captured stderr: {stderr_path.read_text(encoding='utf-8', errors='replace')!r}"
+            )
+            raise
+    stdout = stdout_path.read_text(encoding="utf-8")
+    stderr = stderr_path.read_text(encoding="utf-8")
+    assert result.returncode == 0, stdout + stderr
 
 
 @pytest.mark.parametrize(

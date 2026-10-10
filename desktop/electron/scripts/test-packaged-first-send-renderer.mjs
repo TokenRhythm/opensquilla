@@ -24,6 +24,7 @@ import {
   FIRST_SEND_REPORT_VERSION,
   MAIN_CONSOLE_JOURNAL,
   evaluateFirstSendEvidence,
+  firstSendRendererSnapshot,
   installMainConsoleObservation,
   markMainConsoleCleanup,
   observeRendererPages,
@@ -188,7 +189,7 @@ let runError
 let rendererPage
 let electronProcessIdentity
 let failureRendererSnapshot
-let rendererObservation = { pages: new Map(), subframePageIds: new Set(), pageErrorDetails: [], consoleErrorDetails: [] }
+let rendererObservation = { pages: new Map(), subframePageIds: new Set(), pageErrorDetails: [], consoleErrorDetails: [], sessionStreamWarnings: [] }
 let targetPageId = null
 let targetWebContentsId = null
 let mainObservationInstalled = false
@@ -215,19 +216,7 @@ function reportPhase(phase, details = {}) {
 
 async function captureRendererFailure(page) {
   if (!page) return null
-  return captureFirstSendDiagnostic(() => page.evaluate(() => ({
-    pathname: location.pathname,
-    sessionMaterialized: new URL(location.href).searchParams.has('session'),
-    connected: Boolean(document.querySelector('.conn-pill.connected')),
-    sendButtonDisabled: document.querySelector('.chat-send-btn.btn--primary')?.disabled ?? null,
-    assistantMessages: document.querySelectorAll('.msg-ai').length,
-    assistantAnswers: document.querySelectorAll('.msg-ai-text').length,
-    errorBoundaries: document.querySelectorAll('.error-boundary').length,
-    // Only error-card text from this fresh synthetic profile is retained;
-    // exclude message bodies, inputs, session identifiers and URL queries.
-    sessionErrors: [...document.querySelectorAll('.msg-error-card__text')]
-      .slice(0, 5).map(element => (element.textContent || '').slice(0, 500)),
-  })))
+  return captureFirstSendDiagnostic(() => page.evaluate(firstSendRendererSnapshot))
 }
 
 async function browserRpcSnapshot(page) {
@@ -557,6 +546,7 @@ try {
     event: 'packaged_first_send_failure_diagnostics',
     processes: electronProcessSnapshot(electronProcessIdentity),
     renderer: failureRendererSnapshot,
+    sessionStreamWarnings: rendererObservation.sessionStreamWarnings,
   }))
 } finally {
   reportPhase('cleanup-start', { failed: Boolean(runError) })
@@ -593,6 +583,7 @@ const renderer = {
   consoleErrors: rendererObservation.consoleErrorDetails.length,
   pageErrorDetails: rendererObservation.pageErrorDetails,
   consoleErrorDetails: rendererObservation.consoleErrorDetails,
+  sessionStreamWarnings: rendererObservation.sessionStreamWarnings,
 }
 const journal = await readEvidenceLog(resolve(userDataDir, MAIN_CONSOLE_JOURNAL))
 const observation = {
