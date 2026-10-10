@@ -181,9 +181,10 @@ import {
   parseNativeWorkbenchAnnotationOverlayCloseRequest,
   parseNativeWorkbenchAnnotationOverlayShowRequest,
 } from './native-workbench-annotation-contract.js'
-import { DesktopBrowserServer, DESKTOP_BROWSER_URL_ENV, DESKTOP_BROWSER_TOKEN_ENV } from './desktop-browser.js'
+import { DesktopBrowserError, DesktopBrowserServer, DESKTOP_BROWSER_URL_ENV, DESKTOP_BROWSER_TOKEN_ENV } from './desktop-browser.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 import { installDesktopReloadShortcuts } from './desktop-reload-shortcuts.js'
+import { createBrowserReloadGuard } from './desktop-browser-reload-guard.js'
 import {
   buildRendererConsoleLogEntry,
   isLiveMainFrameConsoleMessage,
@@ -1022,6 +1023,7 @@ const desktopBrowser = new DesktopBrowserServer(
     targetRef: entry.targetRef, navigationCode: entry.navigationCode }),
   (request, signal) => nativeWorkbenchSurfaces.executeBrowserMcp(request, signal),
 )
+const guardBrowserReload = createBrowserReloadGuard(() => nativeWorkbenchSurfaces.closeBrowserTabs())
 
 function activeDesktopProfile(): DesktopProfilePaths {
   return primaryProfilePaths(app.getPath('userData'))
@@ -3722,6 +3724,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   en: {
     'menu.edit': 'Edit',
     'menu.view': 'View',
+    'menu.reload': 'Reload',
+    'menu.forceReload': 'Force Reload',
     'menu.window': 'Window',
     'menu.checkForUpdates': 'Check for Updates…',
     'menu.relaunchToUpdate': 'Relaunch to Update',
@@ -3859,6 +3863,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   'zh-Hans': {
     'menu.edit': '编辑',
     'menu.view': '视图',
+    'menu.reload': '重新加载',
+    'menu.forceReload': '强制重新加载',
     'menu.window': '窗口',
     'menu.checkForUpdates': '检查更新…',
     'menu.relaunchToUpdate': '重启以更新',
@@ -3996,6 +4002,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   ja: {
     'menu.edit': '編集',
     'menu.view': '表示',
+    'menu.reload': '再読み込み',
+    'menu.forceReload': '強制再読み込み',
     'menu.window': 'ウインドウ',
     'menu.checkForUpdates': 'アップデートを確認…',
     'menu.relaunchToUpdate': '再起動してアップデート',
@@ -4130,6 +4138,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   fr: {
     'menu.edit': 'Édition',
     'menu.view': 'Affichage',
+    'menu.reload': 'Recharger',
+    'menu.forceReload': 'Forcer le rechargement',
     'menu.window': 'Fenêtre',
     'menu.checkForUpdates': 'Rechercher les mises à jour…',
     'menu.relaunchToUpdate': 'Relancer pour mettre à jour',
@@ -4264,6 +4274,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   de: {
     'menu.edit': 'Bearbeiten',
     'menu.view': 'Ansicht',
+    'menu.reload': 'Neu laden',
+    'menu.forceReload': 'Neu laden ohne Cache',
     'menu.window': 'Fenster',
     'menu.checkForUpdates': 'Nach Updates suchen…',
     'menu.relaunchToUpdate': 'Zum Aktualisieren neu starten',
@@ -4398,6 +4410,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   es: {
     'menu.edit': 'Edición',
     'menu.view': 'Ver',
+    'menu.reload': 'Recargar',
+    'menu.forceReload': 'Forzar recarga',
     'menu.window': 'Ventana',
     'menu.checkForUpdates': 'Buscar actualizaciones…',
     'menu.relaunchToUpdate': 'Reiniciar para actualizar',
@@ -4937,8 +4951,10 @@ function createApplicationMenu(): void {
         // Disable reload while the onboarding wizard is open: its state lives only
         // in the renderer of a one-shot data: URL, so a reload would silently wipe
         // the in-progress setup (typed key, provider, step, tier edits).
-        { role: 'reload', enabled: currentOnboardingWindow() === null },
-        { role: 'forceReload', enabled: currentOnboardingWindow() === null },
+        { label: desktopT('menu.reload'), accelerator: 'CmdOrCtrl+R', enabled: currentOnboardingWindow() === null,
+          click: () => reloadDesktopWindow(false) },
+        { label: desktopT('menu.forceReload'), accelerator: 'CmdOrCtrl+Shift+R', enabled: currentOnboardingWindow() === null,
+          click: () => reloadDesktopWindow(true) },
         { role: 'toggleDevTools' },
         { type: 'separator' },
         { role: 'resetZoom' },
@@ -5286,6 +5302,17 @@ function handleMainWindowClose(window: BrowserWindow, event: Electron.Event): vo
     return
   }
   void promptForMainWindowClose(window)
+}
+
+function reloadDesktopWindow(ignoreCache: boolean): void {
+  if (currentOnboardingWindow()) return
+  const window = currentMainWindow()
+  if (!window || window.isDestroyed()) return
+  void guardBrowserReload(() => {
+    if (window.isDestroyed() || window.webContents.isDestroyed()) return
+    if (ignoreCache) window.webContents.reloadIgnoringCache()
+    else window.webContents.reload()
+  })
 }
 
 function installEditingContextMenu(window: BrowserWindow): void {
@@ -9685,9 +9712,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      // Electron disables Chromium's built-in PDF plugin by default. The
-      // Workbench intentionally uses the native PDF viewer for PDF artifacts;
-      // keep the renderer sandboxed while enabling that viewer.
+      // Keep document viewing enabled without changing renderer isolation.
       plugins: true,
     },
   })
@@ -9704,6 +9729,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
       window.webContents,
       window.webContents,
       () => currentOnboardingWindow() === null,
+      () => reloadDesktopWindow(false),
     )
   }
   installEditingContextMenu(window)
@@ -9805,7 +9831,15 @@ async function createMainWindow(): Promise<BrowserWindow> {
   // while keeping the full opensquillaDesktop IPC bridge. SPA route changes use
   // history.pushState and are unaffected.
   const guardMainWindowNavigation = (event: Electron.Event, targetUrl: string) => {
-    if (isAllowedMainWindowNavigation(targetUrl)) return
+    if (isAllowedMainWindowNavigation(targetUrl)) {
+      if (nativeWorkbenchSurfaces.hasBrowserTabs()) {
+        event.preventDefault()
+        void guardBrowserReload(() => {
+          if (!window.isDestroyed()) void window.webContents.loadURL(targetUrl).catch(() => undefined)
+        })
+      }
+      return
+    }
     event.preventDefault()
     if (/^https?:\/\//i.test(targetUrl) || targetUrl.startsWith('mailto:')) {
       void shell.openExternal(targetUrl)
@@ -9821,12 +9855,12 @@ async function createMainWindow(): Promise<BrowserWindow> {
       details.preventDefault()
     }
   })
-  window.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
-    // Native child views sit above the renderer DOM. A full document change
-    // must remove them before boot/recovery/another Control UI can become
-    // visible; same-document SPA navigation keeps the Workbench lifecycle in
-    // Vue and is intentionally left alone.
-    if (isMainFrame && !isInPlace) releaseRendererOwnedArtifactPreviews()
+  window.webContents.on('did-navigate', () => {
+    // did-start-navigation precedes the cancellable will-navigate event.
+    // Only a committed document may discard its predecessor's child views;
+    // a cancelled reload must preserve their unsaved state. SPA route changes
+    // do not emit did-navigate and retain the Workbench lifecycle in Vue.
+    releaseRendererOwnedArtifactPreviews()
   })
 
   window.on('close', (event) => handleMainWindowClose(window, event))
@@ -12933,7 +12967,8 @@ ipcMain.handle('desktop:workbench:surface:create', async (event, payload: unknow
     }
     return await nativeWorkbenchSurfaces.createSurface(request)
   } catch (error) {
-    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+    return { ok: false, message: error instanceof Error ? error.message : String(error),
+      ...(error instanceof DesktopBrowserError ? { code: error.code } : {}) }
   }
 })
 ipcMain.handle('desktop:workbench:surface:navigate', async (event, payload: unknown) => {
@@ -15490,7 +15525,19 @@ async function drainOwnedGatewayForQuit(
   return exited || hasGatewayProcessExited(child)
 }
 
+let browserQuitClosePromise: Promise<boolean> | null = null
 app.on('before-quit', (event) => {
+  if (!systemSessionEnding && !updateApplying && nativeWorkbenchSurfaces.hasBrowserTabs()) {
+    event.preventDefault()
+    if (!browserQuitClosePromise) {
+      browserQuitClosePromise = nativeWorkbenchSurfaces.closeBrowserTabs()
+      void browserQuitClosePromise.then(accepted => {
+        browserQuitClosePromise = null
+        if (accepted) app.quit()
+      }, () => { browserQuitClosePromise = null })
+    }
+    return
+  }
   desktopUpdateCheckScheduler.stop()
   // Windows session shutdown cannot wait on our normal asynchronous quit
   // drain. Let the OS-owned close proceed and synchronously signal the current

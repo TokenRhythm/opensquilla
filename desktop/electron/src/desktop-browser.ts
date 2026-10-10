@@ -55,6 +55,8 @@ export interface DesktopBrowserRequest extends DesktopBrowserAction {
   maxChars?: number
   downloadId?: string
   uploadFile?: BrowserUploadFile
+  /** Authenticated Gateway request to transfer a downloaded PDF into its workspace. */
+  exportPdf?: boolean
 }
 
 export type DesktopBrowserObservationReason = 'observation_missing' | 'observation_mismatch'

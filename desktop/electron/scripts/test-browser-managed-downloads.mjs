@@ -64,6 +64,50 @@ await unicode.finish(Buffer.from('a😀b'))
 const unicodeResult = await unicodeArm.completed
 assert.equal((await store.inspect(owner, unicodeResult.downloadId, 2)).text, 'a')
 
+const pdfArm = await store.arm(owner, new AbortController().signal)
+const pdf = new Download()
+pdf.filename = '../synthetic-paper.pdf'
+pdf.mime = 'application/pdf'
+store.capture(owner, pdf)
+const pdfBytes = Buffer.from('%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n')
+await pdf.finish(pdfBytes)
+const pdfReceipt = await pdfArm.completed
+const pdfExport = await store.exportPdf(owner, pdfReceipt.downloadId)
+assert.equal(pdfExport.byteLength, pdfBytes.length)
+assert.equal(Buffer.from(pdfExport.dataBase64, 'base64').compare(pdfBytes), 0)
+assert.match(pdfExport.sha256, /^[0-9a-f]{64}$/)
+assert.equal(JSON.stringify(pdfExport).includes(pdf.path), false)
+await assert.rejects(store.exportPdf(other, pdfReceipt.downloadId), error => error.code === 'DOWNLOAD_NOT_FOUND')
+await assert.rejects(store.exportPdf({ ...owner, targetRef: 'other-page' }, pdfReceipt.downloadId),
+  error => error.code === 'DOWNLOAD_NOT_FOUND')
+
+const fakePdfArm = await store.arm(owner, new AbortController().signal)
+const fakePdf = new Download()
+fakePdf.filename = 'synthetic-fake.pdf'
+fakePdf.mime = 'application/pdf'
+store.capture(owner, fakePdf)
+await fakePdf.finish(Buffer.from('<html>Not a PDF</html>'))
+const fakePdfReceipt = await fakePdfArm.completed
+await assert.rejects(store.exportPdf(owner, fakePdfReceipt.downloadId), error => error.code === 'DOWNLOAD_NOT_PDF')
+
+const wrongMimeArm = await store.arm(owner, new AbortController().signal)
+const wrongMime = new Download()
+wrongMime.filename = 'synthetic-text.txt'
+wrongMime.mime = 'text/plain'
+store.capture(owner, wrongMime)
+await wrongMime.finish(pdfBytes)
+const wrongMimeReceipt = await wrongMimeArm.completed
+await assert.rejects(store.exportPdf(owner, wrongMimeReceipt.downloadId), error => error.code === 'DOWNLOAD_NOT_PDF')
+
+const genericPdfArm = await store.arm(owner, new AbortController().signal)
+const genericPdf = new Download()
+genericPdf.filename = 'synthetic-generic.bin'
+genericPdf.mime = 'application/octet-stream'
+store.capture(owner, genericPdf)
+await genericPdf.finish(pdfBytes)
+const genericPdfReceipt = await genericPdfArm.completed
+assert.equal((await store.exportPdf(owner, genericPdfReceipt.downloadId)).sha256, pdfExport.sha256)
+
 const largeArm = await store.arm(owner, new AbortController().signal)
 const large = new Download()
 large.total = BROWSER_DOWNLOAD_MAX_BYTES + 1
@@ -86,6 +130,7 @@ await assert.rejects(waiting.completed, error => error.code === 'TARGET_NOT_FOUN
 assert.equal(store.capture(other, new Download()), false)
 await store.disposePage(owner)
 await assert.rejects(store.inspect(owner, receipt.downloadId), error => error.code === 'DOWNLOAD_NOT_FOUND')
+await assert.rejects(store.exportPdf(owner, pdfReceipt.downloadId), error => error.code === 'DOWNLOAD_NOT_FOUND')
 await assert.rejects(access(dirname(item.path)))
 await assert.rejects(access(dirname(binary.path)))
 await assert.rejects(access(dirname(unicode.path)))

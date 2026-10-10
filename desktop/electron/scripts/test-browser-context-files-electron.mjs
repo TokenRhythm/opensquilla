@@ -1,11 +1,34 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+function pdfFixture() {
+  const stream = 'BT /F1 18 Tf 72 720 Td (Synthetic managed download) Tj ET'
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
+  ]
+  let body = '%PDF-1.4\n'
+  const offsets = []
+  for (const [index, object] of objects.entries()) {
+    offsets.push(Buffer.byteLength(body))
+    body += `${index + 1} 0 obj\n${object}\nendobj\n`
+  }
+  const xref = Buffer.byteLength(body)
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`
+  for (const offset of offsets) body += `${String(offset).padStart(10, '0')} 00000 n \n`
+  body += `trailer\n<< /Root 1 0 R /Size ${objects.length + 1} >>\nstartxref\n${xref}\n%%EOF\n`
+  return Buffer.from(body, 'ascii')
+}
 
 if (!process.versions.electron) {
   if (process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY
@@ -36,15 +59,39 @@ if (!process.versions.electron) {
   process.exit(code)
 } else {
   const { app, BrowserWindow } = await import('electron')
+  const { DesktopBrowserMcp } = await import('../dist/desktop-browser-mcp.js')
   const { NativeWorkbenchSurfaceManager } = await import('../dist/native-workbench-surface.js')
   app.commandLine.appendSwitch('disable-gpu')
   app.on('window-all-closed', () => {})
   void (async () => {
     await app.whenReady()
+    const trace = step => { if (process.env.OPENSQUILLA_CONTEXT_TRACE === '1') console.error(`[context-files] ${step}`) }
     let manager, owner
     let exitCode = 0
     const text = 'Synthetic download\n\nPreserved paragraph — 文字\n'
+    const pdfBytes = pdfFixture()
     const web = createServer((request, response) => {
+      const authenticated = String(request.headers.cookie ?? '').split(';')
+        .some(cookie => cookie.trim() === 'synthetic-pdf-auth=granted')
+      if (request.url === '/pdf/synthetic-paper' || request.url === '/asset.pdf') {
+        if (!authenticated) {
+          response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
+          response.end('Authentication required')
+          return
+        }
+      }
+      if (request.url === '/pdf/synthetic-paper') {
+        response.writeHead(200, { 'content-type': 'application/pdf', 'content-length': pdfBytes.length })
+        response.end(pdfBytes)
+        return
+      }
+      if (request.url === '/asset.pdf') {
+        response.writeHead(200, { 'content-type': 'application/pdf',
+          'content-disposition': 'attachment; filename="synthetic-paper.pdf"',
+          'content-length': pdfBytes.length })
+        response.end(pdfBytes)
+        return
+      }
       if (request.url === '/asset') {
         response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8',
           'content-disposition': 'attachment; filename="synthetic-note.txt"' })
@@ -54,6 +101,8 @@ if (!process.versions.electron) {
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
       response.end(`<!doctype html><title>Context and files</title>
         <a href="/asset" download>Download sample</a>
+        <a href="/asset.pdf" download>Download PDF sample</a>
+        <a href="/pdf/synthetic-paper" target="_blank">Download inline PDF</a>
         <a href="/asset" download onclick="return confirm('Confirm synthetic download?')">Confirm download</a>
         <label>Upload sample<input type="file" aria-label="Upload sample"></label>
         <output id="upload-result">No uploaded file</output><script>
@@ -82,13 +131,19 @@ if (!process.versions.electron) {
       const record = target => [...manager.surfaces.values()].find(value => value.targetRef === target.targetRef)
       const evaluate = (target, expression) => record(target).view.webContents.executeJavaScript(expression)
       const first = await call({ operation: 'open', url: origin })
-      await evaluate(first, "localStorage.setItem('synthetic-session-value', 'retained')")
+      trace('first page opened')
+      await evaluate(first, "localStorage.setItem('synthetic-session-value', 'retained'); document.cookie = 'synthetic-pdf-auth=granted; SameSite=Lax'")
       const shared = await call({ operation: 'open', url: origin, contextTargetRef: first.targetRef })
+      trace('shared page opened')
       const isolated = await call({ operation: 'open', url: origin })
+      trace('isolated page opened')
       assert.equal(record(first).previewSession, record(shared).previewSession)
       assert.notEqual(record(first).previewSession, record(isolated).previewSession)
       assert.equal(await evaluate(shared, "localStorage.getItem('synthetic-session-value')"), 'retained')
       assert.equal(await evaluate(isolated, "localStorage.getItem('synthetic-session-value')"), null)
+      assert.match(await evaluate(shared, 'document.cookie'), /synthetic-pdf-auth=granted/)
+      assert.doesNotMatch(await evaluate(isolated, 'document.cookie'), /synthetic-pdf-auth=granted/)
+      trace('storage isolation checked')
       await evaluate(first, "window.channel.postMessage('same-context-message')")
       const messageDeadline = Date.now() + 1000
       while (!await evaluate(shared, 'window.received') && Date.now() < messageDeadline) {
@@ -96,11 +151,15 @@ if (!process.versions.electron) {
       }
       assert.equal(await evaluate(shared, 'window.received'), 'same-context-message')
       assert.equal(await evaluate(isolated, 'window.received'), undefined)
+      trace('broadcast isolation checked')
       const count = manager.surfaces.size
       await assert.rejects(call({ sessionKey: 'another-task', operation: 'open', url: origin,
         contextTargetRef: first.targetRef }), error => error.code === 'TARGET_NOT_FOUND')
+      trace('cross-task context denied')
       assert.equal(manager.surfaces.size, count)
+      trace('closing first page')
       await call({ operation: 'tab', tabAction: 'close', targetRef: first.targetRef })
+      trace('first page closed')
       assert.equal(await evaluate(shared, "localStorage.getItem('synthetic-session-value')"), 'retained')
       await assert.rejects(call({ operation: 'open', url: origin, contextTargetRef: first.targetRef }),
         error => error.code === 'TARGET_NOT_FOUND')
@@ -115,6 +174,7 @@ if (!process.versions.electron) {
       let observed = await call({ operation: 'observe', targetRef: shared.targetRef })
       let ref = observed.observation.refs.find(value => value.name === 'Download sample').ref
       const downloaded = await call({ operation: 'act', targetRef: shared.targetRef, action: 'download', ref })
+      trace('text downloaded')
       assert.equal(downloaded.download.name, 'synthetic-note.txt')
       const inspected = await call({ operation: 'snapshot', targetRef: shared.targetRef,
         downloadId: downloaded.download.downloadId })
@@ -123,9 +183,66 @@ if (!process.versions.electron) {
         downloadId: downloaded.download.downloadId }), error => error.code === 'DOWNLOAD_NOT_FOUND')
 
       observed = await call({ operation: 'observe', targetRef: shared.targetRef })
+      ref = observed.observation.refs.find(value => value.name === 'Download PDF sample').ref
+      const pdfDownload = await call({ operation: 'act', targetRef: shared.targetRef, action: 'download', ref })
+      trace('PDF downloaded')
+      assert.equal(pdfDownload.download.name, 'synthetic-paper.pdf')
+      const mcp = new DesktopBrowserMcp((request, signal) => manager.executeBrowserMcp(request, signal))
+      const pdfResponse = await mcp.handle({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: {
+        name: 'browser_inspect', arguments: {
+          targetRef: shared.targetRef, downloadId: pdfDownload.download.downloadId,
+        }, _meta: { sessionKey: 'synthetic-task', operationId: 'synthetic-pdf-inspect', exportPdf: true },
+      } }, AbortSignal.timeout(15_000))
+      trace('PDF private export returned')
+      assert.equal(pdfResponse.result.isError, false, JSON.stringify(pdfResponse.result.structuredContent))
+      const privateExport = pdfResponse.result._meta['opensquilla/pdfExport']
+      assert.equal(privateExport.downloadId, pdfDownload.download.downloadId)
+      assert.equal(privateExport.mimeType, 'application/pdf')
+      assert.equal(privateExport.byteLength, pdfBytes.length)
+      assert.equal(privateExport.sha256, createHash('sha256').update(pdfBytes).digest('hex'))
+      assert.equal(Buffer.from(privateExport.dataBase64, 'base64').compare(pdfBytes), 0)
+      assert.equal(JSON.stringify(pdfResponse.result.content).includes(privateExport.dataBase64), false)
+      assert.equal(JSON.stringify(pdfResponse.result.structuredContent).includes(privateExport.dataBase64), false)
+      assert.equal('pdfExport' in pdfResponse.result.structuredContent, false)
+
+      const otherPagePdf = await mcp.handle({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+        name: 'browser_inspect', arguments: {
+          targetRef: isolated.targetRef, downloadId: pdfDownload.download.downloadId,
+        }, _meta: { sessionKey: 'synthetic-task', operationId: 'synthetic-other-page-pdf', exportPdf: true },
+      } }, AbortSignal.timeout(15_000))
+      assert.equal(otherPagePdf.result.isError, true)
+      assert.equal(otherPagePdf.result.structuredContent.code, 'DOWNLOAD_NOT_FOUND')
+      assert.equal(otherPagePdf.result._meta, undefined)
+
+      const textResponse = await mcp.handle({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: {
+        name: 'browser_inspect', arguments: {
+          targetRef: shared.targetRef, downloadId: downloaded.download.downloadId,
+        }, _meta: { sessionKey: 'synthetic-task', operationId: 'synthetic-text-inspect', exportPdf: true },
+      } }, AbortSignal.timeout(15_000))
+      assert.equal(textResponse.result.isError, false)
+      assert.equal(textResponse.result._meta, undefined)
+      assert.equal(textResponse.result.structuredContent.download.text, text)
+
+      observed = await call({ operation: 'observe', targetRef: shared.targetRef })
+      ref = observed.observation.refs.find(value => value.name === 'Download inline PDF').ref
+      const inlinePdf = await call({ operation: 'act', targetRef: shared.targetRef, action: 'download', ref })
+      trace('inline PDF downloaded')
+      assert.equal(inlinePdf.download.state, 'completed', 'Inline PDF must be captured without a viewer navigation')
+      assert.equal(inlinePdf.download.mimeType, 'application/pdf')
+      const inlineRead = await mcp.handle({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: {
+        name: 'browser_inspect', arguments: {
+          targetRef: shared.targetRef, downloadId: inlinePdf.download.downloadId,
+        }, _meta: { sessionKey: 'synthetic-task', operationId: 'synthetic-inline-pdf', exportPdf: true },
+      } }, AbortSignal.timeout(15_000))
+      assert.equal(inlineRead.result.isError, false)
+      assert.equal(inlineRead.result._meta['opensquilla/pdfExport'].sha256,
+        createHash('sha256').update(pdfBytes).digest('hex'))
+
+      observed = await call({ operation: 'observe', targetRef: shared.targetRef })
       ref = observed.observation.refs.find(value => value.name === 'Confirm download').ref
       const started = Date.now()
       const blocked = await call({ operation: 'act', targetRef: shared.targetRef, action: 'download', ref })
+      trace('confirm download blocked')
       assert.ok(Date.now() - started < 5000, 'Report the dialog promptly, without waiting for the 15-second request deadline')
       assert.equal(blocked.execution.state, 'blocked')
       assert.equal(blocked.download.state, 'not_captured')
@@ -152,6 +269,7 @@ if (!process.versions.electron) {
         dataBase64: Buffer.from('Uploaded synthetic contents').toString('base64') }
       const uploaded = await call({ operation: 'act', targetRef: shared.targetRef, action: 'upload', chooserId: pending.chooserId,
         fileId: file.fileId, uploadFile: file })
+      trace('file uploaded')
       assert.equal(uploaded.performed, true)
       assert.equal(uploaded.uploaded.name, file.name)
       assert.equal(await evaluate(shared, 'document.querySelector("input").files[0].name'), file.name)

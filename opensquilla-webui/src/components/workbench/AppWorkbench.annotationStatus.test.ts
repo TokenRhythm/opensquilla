@@ -196,4 +196,5 @@ describe('AppWorkbench annotation mode status', () => {
     expect(loadCalls).toHaveLength(3)
     expect(guardedLoads).toHaveLength(loadCalls.length)
   })
+
 })

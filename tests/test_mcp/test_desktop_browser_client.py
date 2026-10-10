@@ -223,6 +223,7 @@ async def test_unavailable_context_is_hidden_and_denied(browser, mock_http, chan
         {"nativeImageEvidence": ["image-forged"]},
         {"observationPolicy": {"effectiveMode": "auto"}},
         {"recoveryScope": "chosen-scope"},
+        {"exportPdf": True},
         {"actions": [{"action": "click", "_meta": {"observationMode": "auto"}}]},
     ],
 )
