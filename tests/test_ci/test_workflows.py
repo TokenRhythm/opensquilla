@@ -2008,6 +2008,24 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
             encoding="utf-8"
         )
     assert "--retries=0" in session_recovery["run"]
+    modern_recovery = next(
+        step for step in steps
+        if step.get("name") == "Run cross-platform modern session recovery contracts"
+    )
+    browser_commands = [
+        *session_recovery["run"].split("npm run test:e2e --")[1:],
+        *modern_recovery["run"].split("npm run test:e2e --")[1:],
+    ]
+    # Zero-retry failures need traces on the first attempt, inside the uploaded
+    # tree. Separate output directories prevent later suites deleting evidence.
+    browser_cases = (
+        "session-hang-recovery", "plan-goal-runtime", "modern-session-recovery",
+    )
+    assert len(browser_commands) == len(browser_cases)
+    for command, case in zip(browser_commands, browser_cases, strict=True):
+        assert "--retries=0" in command
+        assert "--trace retain-on-failure" in command
+        assert f'--output "${{CI_REPORT_DIR}}/{case}-results"' in command
     recovery_spec = Path("opensquilla-webui/e2e/history-hydration.spec.ts").read_text(
         encoding="utf-8"
     )
