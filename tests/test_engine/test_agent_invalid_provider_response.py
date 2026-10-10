@@ -27,6 +27,7 @@ from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseDeltaEvent as ProviderToolUseDelta
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
+from opensquilla.provider.retry_after import ProviderRetryAfterCooldowns
 from opensquilla.provider.types import ContentBlockImage
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
@@ -2290,6 +2291,15 @@ async def test_protocol_recovery_respects_remaining_provider_retry_budget() -> N
 async def test_protocol_recovery_wait_respects_turn_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    # Reach retry_wait regardless of host scheduling, then expire the real
+    # asyncio timeout scope at the unchanged turn deadline.
+    monkeypatch.setattr(loop, "time", lambda: now)
+    monkeypatch.setattr(
+        "opensquilla.provider.retry_after._provider_retry_after_cooldowns",
+        ProviderRetryAfterCooldowns(clock=loop.time),
+    )
     provider = _SequenceProvider(
         [
             [ProviderError(message="invalid tool stream", code="provider_protocol_error")],
@@ -2297,10 +2307,20 @@ async def test_protocol_recovery_wait_respects_turn_deadline(
         ]
     )
     sleep_calls: list[float] = []
+    retry_sleep_cancelled = False
 
     async def blocking_retry_sleep(delay: float) -> None:
+        nonlocal now, retry_sleep_cancelled
         sleep_calls.append(delay)
-        await asyncio.Event().wait()
+        now += agent.config.timeout
+        release = asyncio.Event()
+        # Bound the fake wait even if deadline cancellation regresses.
+        loop.call_soon(release.set)
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            retry_sleep_cancelled = True
+            raise
 
     monkeypatch.setattr("opensquilla.engine.agent.sleep_before_retry", blocking_retry_sleep)
     agent = Agent(
@@ -2316,8 +2336,10 @@ async def test_protocol_recovery_wait_respects_turn_deadline(
     events = [event async for event in agent.run_turn("hello")]
 
     assert sleep_calls == [0.1]
+    assert retry_sleep_cancelled
     assert len(provider.calls) == 1
     assert any(event.kind == "error" and event.code == "agent_runtime_timeout" for event in events)
+    assert not any(event.kind == "done" for event in events)
 
 
 @pytest.mark.asyncio

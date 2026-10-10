@@ -40,6 +40,7 @@ from opensquilla.process_tree import (
     create_owned_subprocess_exec,
     create_owned_subprocess_shell,
 )
+from opensquilla.runtime_preparation import prepare_runtime as _prepare_shell_runtime
 from opensquilla.sandbox.backend.bubblewrap import (
     BubblewrapBackend,
     LinuxProxyBridgeHost,
@@ -7084,13 +7085,15 @@ async def _run_full_host_shell_command(
     """Execute directly on the host without sandbox policy or safety preflight."""
 
     runtime = get_runtime()
-    merged_env = _base_shell_environment()
+    merged_env = await _prepare_shell_runtime(_base_shell_environment)
     if env:
         merged_env.update(env)
-    merged_env = _managed_skill_environment(
-        _runtime_shell_environment(
-            merged_env,
-            require_bundled=_guest_requires_managed_runtime(),
+    merged_env = await _prepare_shell_runtime(
+        lambda: _managed_skill_environment(
+            _runtime_shell_environment(
+                merged_env,
+                require_bundled=_guest_requires_managed_runtime(),
+            )
         )
     )
     apply_utf8_child_env(merged_env)
@@ -7352,13 +7355,15 @@ async def exec_command(
         sensitive_block = _sensitive_shell_block("exec_command", command, workdir=cwd, stdin=stdin)
     if sensitive_block is not None:
         return sensitive_block
-    merged_env = _base_shell_environment()
+    merged_env = await _prepare_shell_runtime(_base_shell_environment)
     if env:
         merged_env.update(env)
-    merged_env = _managed_skill_environment(
-        _runtime_shell_environment(
-            merged_env,
-            require_bundled=_guest_requires_managed_runtime(),
+    merged_env = await _prepare_shell_runtime(
+        lambda: _managed_skill_environment(
+            _runtime_shell_environment(
+                merged_env,
+                require_bundled=_guest_requires_managed_runtime(),
+            )
         )
     )
     apply_utf8_child_env(merged_env)
@@ -7554,7 +7559,9 @@ async def exec_command(
                 backend_cwd = _sandbox_shell_backend_cwd(cwd, request)
                 backend_policy = request.policy
                 backend_policy = _policy_with_active_tool_mounts(backend_policy)
-                backend_policy = _policy_with_managed_toolchain_mounts(backend_policy)
+                backend_policy = await _prepare_shell_runtime(
+                    partial(_policy_with_managed_toolchain_mounts, backend_policy)
+                )
                 backend_policy = _policy_with_windows_shell_runtime_mounts(backend_policy, runtime)
                 backend_policy = _policy_with_wall_timeout(backend_policy, effective_timeout)
                 backend_policy = _trusted_managed_network_policy(backend_policy, runtime)
@@ -7716,11 +7723,16 @@ async def _start_host_background_process(
     """Start a host background process without sandbox policy or safety preflight."""
 
     session_id = str(uuid.uuid4())[:8]
-    base_env = dict(env) if env is not None else _base_shell_environment()
-    host_env = _managed_skill_environment(
-        _runtime_shell_environment(
-            base_env,
-            require_bundled=_guest_requires_managed_runtime(),
+    base_env = (
+        dict(env) if env is not None
+        else await _prepare_shell_runtime(_base_shell_environment)
+    )
+    host_env = await _prepare_shell_runtime(
+        lambda: _managed_skill_environment(
+            _runtime_shell_environment(
+                base_env,
+                require_bundled=_guest_requires_managed_runtime(),
+            )
         )
     )
     apply_utf8_child_env(host_env)
@@ -7984,10 +7996,10 @@ async def background_process(
         sensitive_block = _sensitive_shell_block("background_process", command, workdir=cwd)
     if sensitive_block is not None:
         return sensitive_block
-    merged_env = _base_shell_environment()
+    merged_env = await _prepare_shell_runtime(_base_shell_environment)
     if env:
         merged_env.update(env)
-    merged_env = _managed_skill_environment(merged_env)
+    merged_env = await _prepare_shell_runtime(partial(_managed_skill_environment, merged_env))
     _append_windows_app_alias_path(merged_env, runtime=runtime)
     merged_env = _dedupe_windows_env_keys(merged_env)
     runtime_unavailable = _shell_runtime_preflight(
@@ -8147,7 +8159,9 @@ async def background_process(
             backend_cwd = _sandbox_shell_backend_cwd(cwd, request)
             backend_policy = policy
             backend_policy = _policy_with_active_tool_mounts(backend_policy)
-            backend_policy = _policy_with_managed_toolchain_mounts(backend_policy)
+            backend_policy = await _prepare_shell_runtime(
+                partial(_policy_with_managed_toolchain_mounts, backend_policy)
+            )
             backend_policy = _policy_with_windows_shell_runtime_mounts(backend_policy, runtime)
             backend_policy = _policy_with_wall_timeout(backend_policy, effective_timeout)
             backend_policy = _trusted_managed_network_policy(backend_policy, runtime)

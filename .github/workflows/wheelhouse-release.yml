@@ -776,10 +776,17 @@ jobs:
 
       - name: Smoke packaged gateway
         working-directory: desktop/electron
+        shell: pwsh
         env:
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: "1"
           OPENSQUILLA_SMOKE_PROVISION_SANDBOX: "1"
-        run: npm run verify:gateway-smoke -- --provision-windows-sandbox
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
+            throw 'Windows Safe provisioning requires a disposable GitHub-hosted runner.'
+          }
+          # Select the disposable runner's real user profile; the child validates its SID.
+          $env:OPENSQUILLA_SMOKE_SANDBOX_PROFILE_ROOT = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.opensquilla'
+          npm run verify:gateway-smoke -- --provision-windows-sandbox
 
       - name: Record signed candidate identity
         shell: pwsh
@@ -1612,6 +1619,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: upgrade-diagnostics-macos-${{ matrix.baseline-version }}
+          overwrite: true
           retention-days: 7
           if-no-files-found: warn
           path: |
@@ -1759,6 +1767,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: upgrade-diagnostics-windows-${{ matrix.baseline-version }}-${{ matrix.install-mode }}
+          overwrite: true
           retention-days: 7
           if-no-files-found: warn
           path: |

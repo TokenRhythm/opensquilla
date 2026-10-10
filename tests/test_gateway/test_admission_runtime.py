@@ -8,13 +8,18 @@ import pytest
 
 from opensquilla.application.admission_errors import (
     AdmissionQueueFullError,
+    AdmissionResourceBusyError,
     AdmissionShuttingDownError,
 )
 from opensquilla.gateway.admission_input import decode_admit_turn
 from opensquilla.gateway.admission_runtime import GatewayAdmissionRuntime
 from opensquilla.gateway.attachment_ingest import AttachmentResolutionError
 from opensquilla.gateway.rpc import RpcHandlerError
-from opensquilla.gateway.task_runtime import TaskQueueFullError, TaskRuntimeShuttingDownError
+from opensquilla.gateway.task_runtime import (
+    TaskQueueFullError,
+    TaskResidentBusyError,
+    TaskRuntimeShuttingDownError,
+)
 from opensquilla.session.models import SessionIntent
 
 
@@ -57,7 +62,7 @@ def test_admission_normalization_preserves_frozen_legacy_source_classification(t
 
 
 @pytest.mark.parametrize("operation", ["reserve_turn", "start_turn"])
-@pytest.mark.parametrize("failure_kind", ["queue", "shutdown"])
+@pytest.mark.parametrize("failure_kind", ["queue", "resident", "shutdown"])
 async def test_runtime_rejection_keeps_typed_identity_for_application_rollback(
     tmp_path, monkeypatch, operation, failure_kind
 ):
@@ -65,12 +70,18 @@ async def test_runtime_rejection_keeps_typed_identity_for_application_rollback(
     failure = (
         TaskQueueFullError(session_key=key, max_pending=3)
         if failure_kind == "queue"
+        else TaskResidentBusyError(session_key=key, max_resident=256)
+        if failure_kind == "resident"
         else TaskRuntimeShuttingDownError(session_key=key)
     )
     helper = AsyncMock(side_effect=failure)
     monkeypatch.setattr(f"opensquilla.gateway.admission_runtime.{operation}_via_runtime", helper)
     ports = _ports(tmp_path)
-    expected = AdmissionQueueFullError if failure_kind == "queue" else AdmissionShuttingDownError
+    expected = (
+        AdmissionQueueFullError if failure_kind == "queue"
+        else AdmissionResourceBusyError if failure_kind == "resident"
+        else AdmissionShuttingDownError
+    )
     with pytest.raises(expected) as caught:
         await getattr(ports, operation)(
             object(),
@@ -88,6 +99,8 @@ async def test_runtime_rejection_keeps_typed_identity_for_application_rollback(
     assert caught.value.__cause__ is failure
     if failure_kind == "queue":
         assert caught.value.max_pending == 3
+    if failure_kind == "resident":
+        assert caught.value.max_resident == 256
     assert helper.await_count == 1
 
 

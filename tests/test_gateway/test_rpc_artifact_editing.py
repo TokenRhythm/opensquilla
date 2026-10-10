@@ -489,7 +489,15 @@ async def test_session_reset_and_delete_fence_documents(
     )
     assert opened.error is None
 
-    approval_queue = SimpleNamespace(expire_pending_for_session=lambda _key: None)
+    expired_sessions = []
+
+    async def expire_pending_for_session(session_key):
+        # The real async queue is awaited before the irreversible delete.
+        assert await env.storage.get_session(session_key) is not None
+        expired_sessions.append(session_key)
+        return 0
+
+    approval_queue = SimpleNamespace(expire_pending_for_session_async=expire_pending_for_session)
     monkeypatch.setattr(
         "opensquilla.gateway.approval_queue.get_approval_queue",
         lambda: approval_queue,
@@ -497,6 +505,8 @@ async def test_session_reset_and_delete_fence_documents(
     deleted = await _dispatch(env, "sessions.delete", {"key": SESSION_KEY})
     assert deleted.error is None, deleted.error
     assert deleted.payload["deleted"] == [SESSION_KEY]
+    assert deleted.payload["errors"] == []
+    assert expired_sessions == [SESSION_KEY]
 
     recreated = await env.manager.create(SESSION_KEY)
     assert recreated.session_id not in {

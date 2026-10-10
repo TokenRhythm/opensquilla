@@ -3645,6 +3645,12 @@ async def test_continuation_authority_loss_after_accept_compensates_before_activ
         assert task.status == AgentTaskStatus.ABANDONED
         assert task.terminal_reason == reason
         assert task.started_at is None
+        owner = task.details.get("admission_owner")
+        assert isinstance(owner, dict)
+        assert owner["resident_lease"] == "released"
+        assert owner["compute_lease"] == "not_acquired"
+        assert owner["settlement"] == "settled"
+        assert "cancellation_requested" not in task.details
         assert goal.status == ("active" if detached else "paused")
         assert goal.pause_reason == (None if detached else reason)
         assert goal.active_task_id is None
@@ -3754,6 +3760,12 @@ async def test_continuation_post_accept_read_failure_compensates_before_provider
         assert task is not None
         assert task.status == AgentTaskStatus.ABANDONED
         assert task.terminal_reason == "activation_failed"
+        owner = task.details.get("admission_owner")
+        assert isinstance(owner, dict)
+        assert owner["resident_lease"] == "released"
+        assert owner["compute_lease"] == "not_acquired"
+        assert owner["settlement"] == "settled"
+        assert "cancellation_requested" not in task.details
         assert goal is not None
         assert goal.status == "paused"
         assert goal.pause_reason == "activation_failed"

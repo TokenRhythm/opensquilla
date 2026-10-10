@@ -242,6 +242,15 @@ class RateLimitConfig(BaseSettings):
     enabled: bool = True
     max_requests: int = 100
     window_seconds: int = 60
+    # Content reads are a separate, bounded capability.  A transcript is
+    # deliberately read in 1 MiB ranges, so charging those requests to the
+    # small control/API bucket makes a normal history or export compete with
+    # startup traffic.  Keep an independent request budget instead of
+    # disabling abuse protection altogether.  The content endpoint enforces
+    # the per-range byte limit; this budget therefore caps the aggregate
+    # amount a client can read in one window as well.
+    content_max_requests: int = 1200
+    content_window_seconds: int = 60
 
 
 class ControlUiConfig(BaseSettings):
@@ -466,6 +475,10 @@ class TaskRuntimeConfig(BaseModel):
     """Server-side task-runtime queue settings."""
 
     max_concurrency: int = Field(default=8, ge=1)
+    # Resident admission spans reservations, queued/running turns and terminal
+    # settlement. It is separate from per-session pending limits so many
+    # sessions cannot exhaust the process with inert durable work.
+    max_resident_tasks: int = Field(default=256, ge=1)
     max_pending_per_session: int = Field(default=64, ge=1)
     # Per-channel-adapter in-flight semaphore (separate from
     # task_runtime._global_sem). Configured here so OPENSQUILLA_CHANNEL_INFLIGHT_CAP

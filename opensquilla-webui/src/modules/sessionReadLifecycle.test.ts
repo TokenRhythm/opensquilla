@@ -140,6 +140,18 @@ afterEach(() => {
 })
 
 describe('SessionReadLifecycle', () => {
+  it('forwards provisional identity only for the owning draft lease', async () => {
+    const { adapter, lifecycle } = harness([fixture('alpha')])
+    const open = vi.spyOn(adapter, 'open')
+    const draft = lifecycle.open({ sessionKey: 'alpha', includeInitialHistory: false, provisionalDraft: true })
+    await draft.live
+    expect(open.mock.calls[0]?.[0].provisionalDraft).toBe(true)
+    const durable = lifecycle.open({ sessionKey: 'alpha', includeInitialHistory: false })
+    await durable.live
+    expect(open.mock.calls[1]?.[0].provisionalDraft).toBeUndefined()
+    await durable.close()
+  })
+
   it.each([true, false])('marks remote retirement only after the close result (success=%s)', async success => {
     const adapter = new InMemorySessionReadPortAdapter([fixture('alpha')])
     const original = adapter.open.bind(adapter)

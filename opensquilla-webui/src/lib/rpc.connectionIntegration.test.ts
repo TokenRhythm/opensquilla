@@ -370,6 +370,7 @@ describe('production connection integration boundaries', () => {
     })
     const handshake = JSON.parse(socket.sent[0])
     expect(handshake.params.caps).toContain('transport.flow.v1')
+    expect(handshake.params.caps).toContain('transport.session-flow.v2')
     expect(handshake.params.caps).toContain('transport.probe.v1')
     socket.receive({
       type: 'event', event: 'session.event.text_delta', payload: { session_key: 'alpha', text_delta: 'x' },

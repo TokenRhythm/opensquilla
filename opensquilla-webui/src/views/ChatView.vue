@@ -236,6 +236,8 @@
           @open-artifact="openArtifact"
           @toggle-tool-group="toggleToolGroup"
           @toggle-tool-item="toggleToolItem"
+          @details-disclosure="(message, open) => historyDetails.setExpanded(message.contentRef, open)"
+          :load-history-details="message => historyDetails.setExpanded(message.contentRef, true)"
           @show-tool-result="showToolResultModal"
           @open-session="switchToSession"
           @resolve-interrupt="resolveInterrupt"
@@ -624,6 +626,7 @@
       :busy-send-mode="busySendMode"
       :has-send-content="composerHasSendContent"
       :send-pending="chatSend.sendPending.value"
+      :send-disabled="chatSend.sendHydrationBlocked.value"
       :is-streaming="isStreaming"
       :can-stop="canStop"
       :stop-targets-plan-run="composerStopsPlanRun"
@@ -729,6 +732,7 @@
       :open="composerSandboxSetupOpen"
       :pending="sandboxSetupPending"
       :outcome="sandboxSetupOutcome"
+      :repair-identity="sandboxIdentityRepairRequired"
       @cancel="cancelComposerSandboxSetup"
       @background="runComposerSandboxSetupInBackground"
       @confirm="void confirmComposerSandboxSetup()"
@@ -792,7 +796,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, inject, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, onScopeDispose, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
@@ -899,8 +903,10 @@ import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCent
 import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
 import { GOAL_CONTINUITY_KEY, type GoalContinuity } from '@/modules/goalContinuity'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
+import { useChatHistoryDetails } from '@/composables/chat/useChatHistoryDetails'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
+import { useChatMessageContent } from '@/composables/chat/useChatMessageContent'
 import {
   resolveChatHeaderTitle,
   useChatSessionTitles,
@@ -956,6 +962,7 @@ import {
 import {
   acquireSessionBootstrapAdmission,
   claimSessionBootstrapAdmission,
+  registerSessionBootstrapAdmissionOwner,
   optionalSessionRpcAllowed,
   optionalSessionReadOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
@@ -1294,6 +1301,12 @@ const {
 // entering the serialized Gateway queue ahead of session recovery.
 let releaseOptionalRpcAdmission: (() => void) | null =
   claimSessionBootstrapAdmission()
+const unregisterSessionBootstrapOwner = registerSessionBootstrapAdmissionOwner()
+onScopeDispose(() => {
+  unregisterSessionBootstrapOwner()
+  releaseOptionalRpcAdmission?.()
+  releaseOptionalRpcAdmission = null
+})
 let optionalRpcAdmissionGeneration = 0
 const appStore = useAppStore()
 const workbenchStore = useWorkbenchStore()
@@ -1702,10 +1715,15 @@ const composerAllowedRunModes = computed<SandboxRunMode[]>(() => allowedComposer
   allowedRunModes.value,
   sandboxSetupStatus.value,
   sandboxSetupRecovery.resolved.value,
+  sandboxSetupRecovery.available.value,
 ))
 const composerSafeSetupAvailable = computed(() =>
   !sandboxSetupPending.value && sandboxSetupRecovery.canSetup.value)
 const composerSandboxSetupOpen = ref(false)
+const sandboxIdentityRepairRequired = computed(() => (
+  sandboxSetupStatus.value?.detail?.includes('offline_identity_repair_required') === true
+  || sandboxSetupStore.status?.detail?.includes('offline_identity_repair_required') === true
+))
 
 async function refreshPostBootstrapMetadata() {
   await refreshRunModePreference()
@@ -2256,6 +2274,10 @@ const newTaskModel = useNewTaskModelSelection({
   capable: computed(() => gatewayAccess.chatSendInitialModel
     && gatewayAccess.isAvailable && gatewayAccess.isAuthenticated),
   connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
+  // Provider discovery is an optional network action. The composer starts it
+  // when the model picker is explicitly opened, so an unreachable provider
+  // cannot delay the first chat/sidebar control requests.
+  autoRefresh: false,
   routingMode: modelRoutingMode,
   busy: computed(() => isStreaming.value || modelRoutingSettingsBusy.value
     || acceptanceStopPending.value || acceptanceRecoveryPending.value),
@@ -2515,6 +2537,7 @@ const chatHistory = useChatHistory({
     }
   },
 })
+const historyDetails = useChatHistoryDetails({ sessionKey, messages })
 const {
   historySessionKey,
   historyState,
@@ -2664,7 +2687,11 @@ const voiceCapability = useSetupStatus<{ audioConfigured?: boolean }>(injectedSe
 })
 const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured === true)
 
+const { readMessageText } = useChatMessageContent(sessionKey)
+const messageActionSessionIdentity = () => JSON.stringify([sessionKey.value, currentEpoch.value])
 const chatMessageActions = useChatMessageActions({
+  sessionIdentity: messageActionSessionIdentity,
+  readMessageText,
   selectedSkills,
   localPathReferences: localPaths,
   restoreInput,
@@ -2807,6 +2834,7 @@ applySessionRunState = chatSessionSubscription.applySessionRunState
 
 const chatSessionBootstrap = useChatSessionBootstrap({
   sessionKey,
+  isProvisionalDraft: isProvisionalDraftSession,
   sessionReadLifecycle,
   loadHistory: async (context, retry) => (
     retry
@@ -3627,6 +3655,9 @@ const chatSend = useChatSend({
       freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
     }
     persistSession(key, { source: 'chatView.draftAccepted' })
+    // Acceptance created the durable session. The replacement read lease must
+    // no longer inherit the provisional intent still held by useChatSend.
+    pendingSessionIntent.value = null
     // The provisional draft bootstrap can finish before the Gateway creates
     // the first durable session. Re-register immediately after acceptance so
     // buffered text, tool, and reasoning frames replay into the first turn.
@@ -4749,6 +4780,8 @@ const currentChatTitle = computed(() => resolveChatHeaderTitle(
 ))
 
 const chatMarkdownExport = useChatMarkdownExport({
+  sessionIdentity: messageActionSessionIdentity,
+  readMessageText,
   messages: renderedMessages,
   currentTitle: currentChatTitle,
   aiGeneratedLabel,
@@ -4779,6 +4812,7 @@ async function setComposerRunMode(mode: SandboxRunMode): Promise<void> {
     sandboxSetupStatus.value,
     composerSafeSetupAvailable.value,
     sandboxSetupRecovery.resolved.value,
+    sandboxSetupRecovery.available.value,
   )
   if (action === 'ignore') return
   if (action === 'setup') {
@@ -4800,7 +4834,7 @@ function cancelComposerSandboxSetup(): void {
 
 async function confirmComposerSandboxSetup(): Promise<void> {
   if (sandboxSetupPending.value) return
-  const ready = await sandboxSetupStore.startSafeSetup()
+  const ready = await sandboxSetupStore.startSafeSetup({ repairIdentity: sandboxIdentityRepairRequired.value })
   if (sandboxSetupOutcome.value !== 'in_progress') composerSandboxSetupOpen.value = false
   await sandboxSetupRecovery.refresh()
   if (ready) {
@@ -7120,8 +7154,6 @@ onUnmounted(() => {
   conversationSessionRuntime.dispose()
   pendingSessionOptionalReads = null
   pendingFeatureToggleRefresh = false
-  releaseOptionalRpcAdmission?.()
-  releaseOptionalRpcAdmission = null
   cancelActiveProjectValidation()
   clearExecutionDockHideTimer()
   unsubs.forEach(fn => fn())

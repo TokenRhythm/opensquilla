@@ -41,6 +41,7 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
   const snapshots = new Map<string, { id: string; bytes: Buffer; subscribed: boolean }>()
   const rejectedResumes: Observed[] = []
   const heldSubscriptions: Observed[] = []
+  const hydratedPlanRevisions: string[] = []
   const sentHistory: Array<Record<string, unknown>> = []
   const liveFrames: string[] = []
   let activeTurn: { socket: WebSocketRoute; key: string; task: string } | null = null
@@ -181,6 +182,22 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
         emitTurn('task.running', { status: 'running' })
         return
       }
+      if (frame.method === 'sessions.messages.hydrate' && mode === 'lost-subscribe') {
+        // The initial read can predate the missed plan update. Recovery must
+        // fetch current control state rather than reinstall its cached Promise.
+        const revision = hydratedPlanRevisions.length === 0 ? 'initial-plan' : 'recovered-plan'
+        hydratedPlanRevisions.push(revision)
+        respond(sessionMessagesHydratePayload(key, {
+          ...metadata(),
+          currentPlan: {
+            revisionId: revision, planId: 'recovery-plan', generation: hydratedPlanRevisions.length,
+            title: revision === 'initial-plan' ? 'Outdated recovery proposal' : 'Current recovery proposal',
+            markdown: 'Synthetic proposal changed while delivery was unavailable.',
+            current: true, steps: [{ stepId: 'inspect', title: 'Inspect the recovered state' }],
+          },
+        }))
+        return
+      }
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
         'commands.list_for_surface': { commands: [] },
@@ -211,7 +228,7 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
   const tick = () => sockets.forEach(socket => socket.send(JSON.stringify({
     type: 'event', event: 'tick', payload: { time_ms: Date.now() }, seq: 1,
   })))
-  return { sockets, requests, held, staged, tick, rejectedResumes, heldSubscriptions,
+  return { sockets, requests, held, staged, tick, rejectedResumes, heldSubscriptions, hydratedPlanRevisions,
     beginReply: () => emitTurn('session.event.text_delta', { text: REPLY }),
     finishReply: () => {
       if (!activeTurn) throw new Error('No explicit user turn to finish')
@@ -280,7 +297,10 @@ test('automatically replaces a stale snapshot after a lost subscribe and hydrate
   expect(calls(gateway.requests, RELEASE).map(call => call.params.sync_revision)).toEqual([reads[0]!.params.sync_revision])
   expect(gateway.heldSubscriptions.length).toBeGreaterThan(0)
   expect(calls(gateway.requests, 'sessions.messages.subscribe')).toHaveLength(gateway.heldSubscriptions.length + 1)
-  expect(calls(gateway.requests, 'sessions.messages.hydrate')).toHaveLength(1)
+  expect(calls(gateway.requests, 'sessions.messages.hydrate')).toHaveLength(2)
+  expect(gateway.hydratedPlanRevisions).toEqual(['initial-plan', 'recovered-plan'])
+  await expect(page.getByText('Current recovery proposal', { exact: true })).toBeVisible()
+  await expect(page.getByText('Outdated recovery proposal', { exact: true })).toHaveCount(0)
   await expect(notice).toHaveCount(0)
   await expect(send).toBeEnabled()
   await expect(input).toHaveValue(DRAFT)
@@ -292,7 +312,8 @@ test('automatically replaces a stale snapshot after a lost subscribe and hydrate
   await expect(page.getByText('Synthetic cached history remains available.', { exact: true })).toHaveCount(1)
   await advance(page, 15_000)
   expect(calls(gateway.requests, RESUME)).toHaveLength(2)
-  expect(calls(gateway.requests, 'sessions.messages.hydrate')).toHaveLength(1)
+  expect(calls(gateway.requests, 'sessions.messages.hydrate')).toHaveLength(2)
+  expect(gateway.hydratedPlanRevisions).toEqual(['initial-plan', 'recovered-plan'])
   expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
   await expect(input).toHaveValue(DRAFT)
   expect(await input.evaluate(node => document.activeElement === node)).toBe(true)

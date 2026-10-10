@@ -4,7 +4,7 @@ import type { MemoryImportPreview, MemoryImportRecent } from '@/modules/memoryPr
 import { createV4MemoryProfileImport } from './memoryProfileImportV4'
 
 function harness(responses: Record<string, unknown>) {
-  const request = vi.fn(async (method: string) => {
+  const request = vi.fn(async (method: string, _params?: Record<string, unknown>, _options?: object) => {
     const value = responses[method]
     if (value instanceof Error) throw value
     return value
@@ -14,8 +14,8 @@ function harness(responses: Record<string, unknown>) {
     request,
     markUnsupported,
     transport: {
-      request,
-      ready: vi.fn(async () => undefined),
+      request: async <T>(...args: [string, Record<string, unknown>?, object?]) => await request(...args) as T,
+      ready: vi.fn(async (): Promise<void> => undefined),
       supports: vi.fn(() => true),
       markUnsupported,
     },
@@ -59,6 +59,33 @@ function preview(): MemoryImportPreview {
 }
 
 describe('v4 MemoryProfileImport Adapter', () => {
+  it.each(['info', 'status'] as const)('does not send a cancelled %s read after readiness completes', async (method) => {
+    const h = harness({})
+    let release!: () => void
+    h.transport.ready.mockImplementation(() => new Promise<void>(done => { release = done }))
+    const adapter = createV4MemoryProfileImport(h.transport)
+    const controller = new AbortController()
+    const pending = method === 'info'
+      ? adapter.info({ signal: controller.signal })
+      : adapter.status('job', { signal: controller.signal })
+    controller.abort()
+    release()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(h.request).not.toHaveBeenCalled()
+    expect(h.transport.ready).toHaveBeenCalledWith(expect.objectContaining({
+      signal: controller.signal, abortAction: 'reject', timeoutAction: 'reject',
+    }))
+  })
+
+  it('passes cancellation to a dispatched status observation', async () => {
+    const h = harness({ 'memory.import.status': job() })
+    const controller = new AbortController()
+    await createV4MemoryProfileImport(h.transport).status('job-1', { signal: controller.signal })
+    expect(h.request).toHaveBeenCalledWith('memory.import.status', expect.any(Object), expect.objectContaining({
+      signal: controller.signal, timeoutAction: 'reject', abortAction: 'reject',
+    }))
+  })
+
   it('normalizes compatibility aliases and owns start request details', async () => {
     const h = harness({
       'memory.import.info': {

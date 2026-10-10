@@ -73,6 +73,40 @@ _handle_transport_flow_update_contract = register_connection_recovery_contract(
 )
 
 
+async def _handle_session_flow_update_v2(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Dispatch per-subscription ACK/retire accounting on the owning socket."""
+    try:
+        validate_recovery_params("transport.sessionFlow.update.v2", params)
+    except ValueError as exc:
+        raise RpcHandlerError("INVALID_REQUEST", str(exc), accepted=False) from exc
+    assert isinstance(params, dict)
+    from opensquilla.gateway.websocket import get_registry
+
+    connection = get_registry().get(ctx.conn_id)
+    if connection is None or connection.principal != ctx.principal:
+        raise RpcHandlerError("UNAUTHORIZED", "Connection identity is no longer current")
+    try:
+        return connection.apply_session_flow_update_v2(params)
+    except ValueError as exc:
+        message = str(exc)
+        if "retired" in message.lower():
+            code = "LANE_RETIRED"
+        elif "current" in message or "negotiated" in message:
+            code = "FLOW_STALE"
+        else:
+            code = "INVALID_REQUEST"
+        raise RpcHandlerError(code, message, accepted=False) from exc
+
+
+_handle_session_flow_update_v2_contract = register_connection_recovery_contract(
+    get_dispatcher(),
+    "transport.sessionFlow.update.v2",
+    _handle_session_flow_update_v2,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 def _recovery_connection(ctx: RpcContext) -> WsConnection:
     from opensquilla.gateway.websocket import get_registry
 

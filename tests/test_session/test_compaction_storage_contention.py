@@ -154,8 +154,37 @@ async def test_directory_projection_work_is_bounded_by_requested_rows(
     storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
     try:
         node, _ = await seed(storage)
+        steps = 0
+
+        async def count_reader(reader):
+            set_progress_handler = reader.set_progress_handler
+
+            async def install_progress_handler(callback, interval):
+                if callback is None:
+                    return await set_progress_handler(None, 0)
+                ticks = 0
+
+                def progress():
+                    nonlocal steps, ticks
+                    steps += 1
+                    ticks += 1
+                    # Keep the real lease's deadline/cancellation callback.
+                    return callback() if ticks % interval == 0 else 0
+
+                await set_progress_handler(progress, 1)
+
+            monkeypatch.setattr(reader, "set_progress_handler", install_progress_handler)
+            return reader
+
+        open_reader = storage._open_recovery_reader
+
+        async def open_counted_reader():
+            return await count_reader(await open_reader())
+
+        monkeypatch.setattr(storage, "_open_recovery_reader", open_counted_reader)
 
         async def measure():
+            nonlocal steps
             steps = 0
 
             def progress():

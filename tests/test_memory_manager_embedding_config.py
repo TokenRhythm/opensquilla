@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 from pathlib import Path
@@ -97,6 +98,109 @@ async def _build_one(config: GatewayConfig, monkeypatch, tmp_path, *, session_st
         for manager in managers.values():
             await manager.close()
         raise
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_during", ["initialize", "sync_start"])
+@pytest.mark.parametrize("committed_count", [0, 2])
+async def test_build_memory_cancellation_closes_all_acquired_resources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cancel_during: str,
+    committed_count: int,
+) -> None:
+    from opensquilla.memory.manager import build_memory_managers
+
+    _patch_manager_dependencies(monkeypatch, tmp_path)
+    reached_boundary = asyncio.Event()
+    hold_boundary = asyncio.Event()
+    cancellations: list[asyncio.CancelledError] = []
+    created_stores: list[str] = []
+    created_syncs: list[str] = []
+    closed_resources: list[tuple[str, str]] = []
+    committed_agents = [f"ready-{index}" for index in range(committed_count)]
+    pending_agent = "pending"
+
+    async def wait_for_cancellation(agent_id: str, boundary: str) -> None:
+        if agent_id == pending_agent and cancel_during == boundary:
+            reached_boundary.set()
+            try:
+                await hold_boundary.wait()
+            except asyncio.CancelledError as exc:
+                cancellations.append(exc)
+                raise
+
+    class ControlledStore(_FakeStore):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.agent_id = Path(self.db_path).parent.name
+            created_stores.append(self.agent_id)
+
+        async def initialize(self) -> None:
+            await wait_for_cancellation(self.agent_id, "initialize")
+
+        async def close(self) -> None:
+            closed_resources.append((self.agent_id, "store"))
+            await super().close()
+
+    class ControlledSyncManager(_FakeSyncManager):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.agent_id = kwargs["store"].agent_id
+            created_syncs.append(self.agent_id)
+
+        async def start(self) -> None:
+            await super().start()
+            await wait_for_cancellation(self.agent_id, "sync_start")
+
+        async def stop(self) -> None:
+            closed_resources.append((self.agent_id, "sync"))
+            await super().stop()
+
+    class ControlledRetriever:
+        def __init__(self, store, **kwargs):
+            self.agent_id = store.agent_id
+
+        async def close(self) -> None:
+            closed_resources.append((self.agent_id, "retriever"))
+
+    monkeypatch.setattr("opensquilla.memory.store.LongTermMemoryStore", ControlledStore)
+    monkeypatch.setattr("opensquilla.memory.sync_manager.MemorySyncManager", ControlledSyncManager)
+    monkeypatch.setattr("opensquilla.memory.retrieval.MemoryRetriever", ControlledRetriever)
+    task = asyncio.create_task(
+        build_memory_managers(
+            GatewayConfig(memory={"embedding": {"provider": "none"}}),
+            [*committed_agents, pending_agent],
+        )
+    )
+    try:
+        await asyncio.wait_for(reached_boundary.wait(), timeout=5)
+        assert created_stores == [*committed_agents, pending_agent]
+        expected_syncs = [*committed_agents]
+        if cancel_during == "sync_start":
+            expected_syncs.append(pending_agent)
+        assert created_syncs == expected_syncs
+
+        task.cancel("memory startup cancelled")
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(task, timeout=5)
+        assert cancelled.value.args == ("memory startup cancelled",)
+        assert cancellations == [cancelled.value]
+        assert task.cancelled()
+
+        expected_cleanup = []
+        if cancel_during == "sync_start":
+            expected_cleanup.append((pending_agent, "sync"))
+        expected_cleanup.append((pending_agent, "store"))
+        for agent_id in committed_agents:
+            expected_cleanup.extend(
+                (agent_id, resource) for resource in ("sync", "retriever", "store")
+            )
+        assert closed_resources == expected_cleanup
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
 
 
 @pytest.mark.asyncio

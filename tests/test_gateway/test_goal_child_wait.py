@@ -247,7 +247,7 @@ async def test_duplicate_wake_admission_cannot_leave_finished_group_blocking_goa
             await asyncio.wait_for(duplicate, timeout=3)
 
 
-@pytest.mark.parametrize("case", ["ordinary", "paused", "replaced", "wrong_parent"])
+@pytest.mark.parametrize("case", ["ordinary", "paused", "replaced", "cleared", "wrong_parent"])
 async def test_completion_candidate_does_not_grant_unrelated_goal_authority(tmp_path, case):
     runs = []
 
@@ -273,6 +273,8 @@ async def test_completion_candidate_does_not_grant_unrelated_goal_authority(tmp_
         }
         if case == "paused":
             await _handle_goals_pause(mutation, stack.context)
+        elif case == "cleared":
+            await _handle_goals_clear(mutation, stack.context)
         elif case == "replaced":
             await _handle_goals_clear(mutation, stack.context)
             second = await _handle_goals_set(
@@ -289,14 +291,23 @@ async def test_completion_candidate_does_not_grant_unrelated_goal_authority(tmp_
             "source_tool": "other" if case == "ordinary" else "subagent_completion",
             "parent_task_id": "missing-parent" if case == "wrong_parent" else parent.task_id,
         }
+        previous_runs = len(runs)
         handle = await stack.runtime.send_with_envelope(
             parent.envelope,
             "Summarize the prior result without new Goal authority.",
             provenance=provenance,
         )
-        await stack.runtime.wait(handle.task_id, timeout=3)
+        terminal = await stack.runtime.wait(handle.task_id, timeout=3)
+        assert terminal.status == "succeeded"
+        assert len(runs) == previous_runs + 1
+        assert runs[-1].task_id == handle.task_id
         assert runs[-1].run_kind == "runtime_send"
         assert runs[-1].goal_context is None
+        assert runs[-1].envelope.tool_context(is_owner=True).goal_context is None
+        authority = terminal.details["activation_authority"]
+        assert authority["authority_kind"] == "goal_followup"
+        assert authority["session_epoch"] == parent.envelope.session_epoch
+        assert parent.envelope.metadata["activation_authority"]["authority_kind"] == "goal_lease"
         assert await stack.storage.get_goal(SOURCE_KEY) == before
 
 

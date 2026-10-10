@@ -1,6 +1,6 @@
 import { copySelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
 import { copyLocalPathReferences } from '@/types/localPathReferences'
-import { nextTick, type Ref } from 'vue'
+import { getCurrentScope, nextTick, onScopeDispose, watch, type Ref } from 'vue'
 import type {
   ChatMessage,
   ChatRenderedMessage,
@@ -15,6 +15,7 @@ import {
 } from '@/utils/chat/usageAccountingFailure'
 import { sanitizeAssistantPresentationSegments } from '@/utils/chat/silentSentinels'
 import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
+import { messageContentIdentity, needsCompleteMessageText, type ReadMessageText } from '@/utils/chat/historyMessageContent'
 
 export interface UseChatMessageActionsOptions {
   messages: Ref<ChatMessage[]>
@@ -23,6 +24,8 @@ export interface UseChatMessageActionsOptions {
   restoreInput?: (text: string, paths?: readonly string[]) => void
   selectedSkills?: Ref<SelectedSkillRef[]>
   isStreaming: Ref<boolean>
+  sessionIdentity?: () => string
+  readMessageText?: ReadMessageText
   sanitizeCopyText: (text: string, opts?: {
     assistantBoundary?: boolean
     provenance?: AssistantPresentationProvenance
@@ -73,6 +76,16 @@ interface EditRestorePoint {
 
 export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   let editRestorePoint: EditRestorePoint | null = null
+  let actionGeneration = 0
+  let pendingRead: AbortController | null = null
+
+  function cancelPendingAction(): boolean {
+    const wasPending = pendingRead !== null
+    actionGeneration += 1
+    pendingRead?.abort()
+    pendingRead = null
+    return wasPending
+  }
 
   function restoreInput(text: string, paths?: readonly string[]) {
     if (options.restoreInput) options.restoreInput(text, paths)
@@ -80,7 +93,45 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   }
 
   function discardEditRestorePoint() {
+    cancelPendingAction()
     editRestorePoint = null
+  }
+
+  if (options.sessionIdentity) watch(options.sessionIdentity, discardEditRestorePoint, { flush: 'sync' })
+  if (getCurrentScope()) onScopeDispose(discardEditRestorePoint)
+
+  function withCompleteText(
+    source: ChatMessage,
+    apply: (text: string, generation: number) => boolean | Promise<boolean>,
+  ): boolean | Promise<boolean> {
+    cancelPendingAction()
+    const generation = actionGeneration
+    if (!needsCompleteMessageText(source)) return apply(source.text || '', generation)
+    if (!options.readMessageText) return false
+    const transcript = options.messages.value
+    const rows = transcript.slice()
+    const identity = messageContentIdentity(source)
+    const session = options.sessionIdentity?.()
+    const draft = options.inputText.value
+    const paths = JSON.stringify(options.localPathReferences?.value)
+    const skills = JSON.stringify(options.selectedSkills?.value)
+    const fork = options.pendingForkBeforeMessageId.value
+    const current = () => generation === actionGeneration
+      && session === options.sessionIdentity?.()
+      && transcript === options.messages.value && identity === messageContentIdentity(source)
+      && transcript.length === rows.length && transcript.every((row, index) => row === rows[index])
+      && draft === options.inputText.value && paths === JSON.stringify(options.localPathReferences?.value)
+      && skills === JSON.stringify(options.selectedSkills?.value) && fork === options.pendingForkBeforeMessageId.value
+      && !options.isStreaming.value
+    const controller = new AbortController()
+    pendingRead = controller
+    return options.readMessageText({ ...source, contentRef: source.contentRef && { ...source.contentRef } }, controller.signal)
+      .then(text => current() && !controller.signal.aborted ? apply(text, generation) : false)
+      .catch(error => {
+        if (!controller.signal.aborted) console.warn('History message read failed:', error instanceof Error ? error.message : String(error))
+        return false
+      })
+      .finally(() => { if (pendingRead === controller) pendingRead = null })
   }
 
   function copyableMessageText(message: ChatRenderedMessage): string {
@@ -153,7 +204,8 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   }
 
   function sourceMessageIndex(message: ChatRenderedMessage): number {
-    if (typeof message.sourceIndex === 'number' && message.sourceIndex >= 0) {
+    if (typeof message.sourceIndex === 'number' && message.sourceIndex >= 0
+      && (!message.messageId || options.messages.value[message.sourceIndex]?.messageId === message.messageId)) {
       return message.sourceIndex
     }
     if (message.messageId) {
@@ -177,6 +229,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     }
     const usageBarrierRetry = isUsageAccountingBarrierMessage(message)
     const assistantIndex = sourceMessageIndex(message)
+    if (assistantIndex < 0 && (message.messageId || message.sourceIndex !== undefined)) return false
     const usageBarrierUserIndex = strictUsageBarrierRetryUserMessageIndex(
       options.messages.value,
       assistantIndex,
@@ -201,29 +254,41 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       options.notifyMessagePending?.()
       return false
     }
-    const userText = userMessage?.text || ''
-    if (usageBarrierRetry) {
-      return options.sendUsageBarrierReplay({
-        text: userText,
-        ...(userMessage?.localPathReferences?.length ? { localPathReferences: copyLocalPathReferences(userMessage.localPathReferences, userText) } : {}),
-        ...(userMessage?.selectedSkills?.length ? { selectedSkills: copySelectedSkills(userMessage.selectedSkills) } : {}),
-        forkBeforeMessageId,
+    return withCompleteText(userMessage!, (userText, generation) => {
+      if (usageBarrierRetry) {
+        return options.sendUsageBarrierReplay({
+          text: userText,
+          ...(userMessage?.localPathReferences?.length ? { localPathReferences: copyLocalPathReferences(userMessage.localPathReferences, userText) } : {}),
+          ...(userMessage?.selectedSkills?.length ? { selectedSkills: copySelectedSkills(userMessage.selectedSkills) } : {}),
+          forkBeforeMessageId,
+        })
+      }
+      // Ordinary regenerate remains composer-backed. Fail closed before any of
+      // its local mutations when live delivery cannot receive the resulting turn.
+      if (options.canDeliver && !options.canDeliver()) {
+        options.notifyDeliveryBlocked?.()
+        return false
+      }
+      editRestorePoint = null
+      options.pendingForkBeforeMessageId.value = forkBeforeMessageId
+      options.messages.value = options.messages.value.slice(0, userMsgIndex)
+      if (options.selectedSkills) options.selectedSkills.value = copySelectedSkills(userMessage?.selectedSkills)
+      restoreInput(userText, userMessage?.localPathReferences)
+      options.autoResizeTextarea()
+      const transcript = options.messages.value
+      const session = options.sessionIdentity?.()
+      const paths = JSON.stringify(options.localPathReferences?.value)
+      const skills = JSON.stringify(options.selectedSkills?.value)
+      nextTick(() => {
+        if (generation !== actionGeneration || session !== options.sessionIdentity?.()
+          || transcript !== options.messages.value || options.inputText.value !== userText
+          || paths !== JSON.stringify(options.localPathReferences?.value) || skills !== JSON.stringify(options.selectedSkills?.value)
+          || options.pendingForkBeforeMessageId.value !== forkBeforeMessageId
+          || options.isStreaming.value || (options.canDeliver && !options.canDeliver())) return
+        options.sendCurrentInput()
       })
-    }
-    // Ordinary regenerate remains composer-backed. Fail closed before any of
-    // its local mutations when live delivery cannot receive the resulting turn.
-    if (options.canDeliver && !options.canDeliver()) {
-      options.notifyDeliveryBlocked?.()
-      return false
-    }
-    discardEditRestorePoint()
-    options.pendingForkBeforeMessageId.value = forkBeforeMessageId
-    options.messages.value = options.messages.value.slice(0, userMsgIndex)
-    if (options.selectedSkills) options.selectedSkills.value = copySelectedSkills(userMessage?.selectedSkills)
-    restoreInput(userText, userMessage?.localPathReferences)
-    options.autoResizeTextarea()
-    nextTick(() => options.sendCurrentInput())
-    return true
+      return true
+    })
   }
 
   function editMessage(message: ChatRenderedMessage) {
@@ -242,33 +307,35 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       options.notifyMessagePending?.()
       return
     }
-    const text = sourceMessage.text || ''
-    // Everything below this line is undone by `cancelEdit`. Entering edit mode
-    // is not a decision the user has confirmed — the transcript shrinks to
-    // nothing on the first click, and until #1372 there was no way back:
-    // Escape cleared the composer and left the empty state on screen, which
-    // reads as the conversation having been deleted.
-    const previous = editRestorePoint
-    const continuesEdit = previous
-      && options.pendingForkBeforeMessageId.value === previous.forkBeforeMessageId
-    editRestorePoint = {
-      // Choosing an earlier message while editing is still uncommitted. Keep
-      // the complete transcript and draft from before the first edit.
-      messages: continuesEdit ? previous.messages : options.messages.value,
-      inputText: continuesEdit ? previous.inputText : options.inputText.value,
-      editedText: text,
-      localPathReferences: continuesEdit ? previous.localPathReferences : copyLocalPathReferences(options.localPathReferences?.value, options.inputText.value),
-      editedLocalPathReferences: copyLocalPathReferences(sourceMessage.localPathReferences, text),
-      selectedSkills: continuesEdit ? previous.selectedSkills : copySelectedSkills(options.selectedSkills?.value),
-      editedSkills: copySelectedSkills(sourceMessage?.selectedSkills),
-      forkBeforeMessageId,
-    }
-    options.pendingForkBeforeMessageId.value = forkBeforeMessageId
-    options.messages.value = options.messages.value.slice(0, msgIndex)
-    if (options.selectedSkills) options.selectedSkills.value = copySelectedSkills(sourceMessage?.selectedSkills)
-    restoreInput(text, sourceMessage.localPathReferences)
-    options.autoResizeTextarea()
-    options.focusComposer()
+    return withCompleteText(sourceMessage, text => {
+      // Everything below this line is undone by `cancelEdit`. Entering edit mode
+      // is not a decision the user has confirmed — the transcript shrinks to
+      // nothing on the first click, and until #1372 there was no way back:
+      // Escape cleared the composer and left the empty state on screen, which
+      // reads as the conversation having been deleted.
+      const previous = editRestorePoint
+      const continuesEdit = previous
+        && options.pendingForkBeforeMessageId.value === previous.forkBeforeMessageId
+      editRestorePoint = {
+        // Choosing an earlier message while editing is still uncommitted. Keep
+        // the complete transcript and draft from before the first edit.
+        messages: continuesEdit ? previous.messages : options.messages.value,
+        inputText: continuesEdit ? previous.inputText : options.inputText.value,
+        editedText: text,
+        localPathReferences: continuesEdit ? previous.localPathReferences : copyLocalPathReferences(options.localPathReferences?.value, options.inputText.value),
+        editedLocalPathReferences: copyLocalPathReferences(sourceMessage.localPathReferences, text),
+        selectedSkills: continuesEdit ? previous.selectedSkills : copySelectedSkills(options.selectedSkills?.value),
+        editedSkills: copySelectedSkills(sourceMessage?.selectedSkills),
+        forkBeforeMessageId,
+      }
+      options.pendingForkBeforeMessageId.value = forkBeforeMessageId
+      options.messages.value = options.messages.value.slice(0, msgIndex)
+      if (options.selectedSkills) options.selectedSkills.value = copySelectedSkills(sourceMessage?.selectedSkills)
+      restoreInput(text, sourceMessage.localPathReferences)
+      options.autoResizeTextarea()
+      options.focusComposer()
+      return true
+    })
   }
 
   /**
@@ -283,8 +350,9 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
    * session navigation. A second unsubmitted edit keeps the original snapshot.
    */
   function cancelEdit(): boolean {
+    const cancelledRead = cancelPendingAction()
     const restore = editRestorePoint
-    if (!restore || options.isStreaming.value) return false
+    if (!restore || options.isStreaming.value) return cancelledRead
     if (options.pendingForkBeforeMessageId.value !== restore.forkBeforeMessageId) {
       // Drifted, so there is nothing safe to restore — but the point stays.
       // Escape now consults this on every press, and discarding the undo on a

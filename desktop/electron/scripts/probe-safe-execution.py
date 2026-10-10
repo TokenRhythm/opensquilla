@@ -40,6 +40,20 @@ async def verify_safe_execution() -> dict[str, object]:
     )
 
     root = Path(os.environ["OPENSQUILLA_STATE_DIR"]).resolve()
+    provision_windows = (
+        sys.platform == "win32"
+        and os.environ.get("OPENSQUILLA_SMOKE_PROVISION_SANDBOX") == "1"
+    )
+    if provision_windows:
+        from opensquilla.sandbox.backend.windows_default_setup import (
+            _current_windows_user_sid,
+            _validated_elevated_setup_target,
+        )
+
+        _validated_elevated_setup_target({
+            "markerPath": str(root / "sandbox" / "setup_marker.json"),
+            "userSid": _current_windows_user_sid(),
+        })
     workspace_root = Path(os.environ.get("OPENSQUILLA_SMOKE_WORKSPACE_ROOT", str(root))).resolve()
     workspace = workspace_root / "safe-execution"
     # The explicit Windows CI provision path may select a fresh profile root;
@@ -49,7 +63,7 @@ async def verify_safe_execution() -> dict[str, object]:
     target = workspace / "read-only.txt"
     target.write_text("synthetic Safe fixture\n", encoding="utf-8")
     config = SimpleNamespace(state_dir=str(root / "state"))
-    if sys.platform == "win32" and os.environ.get("OPENSQUILLA_SMOKE_PROVISION_SANDBOX") == "1":
+    if provision_windows:
         # Let the product setup path request UAC through its existing elevated
         # helper.  Hosted Windows runners commonly use an unelevated token
         # even for an Administrator account; rejecting that token here would

@@ -39,7 +39,13 @@ GUEST_RPC_ALLOWLIST = frozenset(
         "sessions.messages.snapshot.read",
         "sessions.messages.resume",
         "sessions.messages.snapshot.release",
+        "sessions.read.open.v2",
+        "sessions.read.state.v2",
+        "sessions.read.install.v2",
+        "sessions.read.close.v2",
+        "sessions.history.page.v2",
         "transport.flow.update",
+        "transport.sessionFlow.update.v2",
         "sessions.messages.unsubscribe",
         "sessions.pending_inputs.enqueue",
         "sessions.pending_inputs.list",
@@ -65,6 +71,11 @@ _SESSION_KEY_FIELDS = {
     "sessions.messages.snapshot.read": ("key",),
     "sessions.messages.resume": ("key",),
     "sessions.messages.snapshot.release": ("key",),
+    "sessions.read.open.v2": ("key",),
+    "sessions.read.state.v2": ("key",),
+    "sessions.read.install.v2": ("key",),
+    "sessions.read.close.v2": ("key",),
+    "sessions.history.page.v2": ("key",),
     "sessions.messages.unsubscribe": ("key", "sessionKey"),
     "sessions.pending_inputs.enqueue": ("key", "sessionKey"),
     "sessions.pending_inputs.list": ("key", "sessionKey"),
@@ -183,7 +194,7 @@ class GuestRpcPolicy:
         if method == SESSIONS_LIST_METHOD:
             return params
 
-        if method == "transport.flow.update":
+        if method in {"transport.flow.update", "transport.sessionFlow.update.v2"}:
             # The handler operates on ctx.conn_id only and checks every key
             # against that connection's existing subscriptions. No authority
             # or subscription can be acquired through consumption feedback.

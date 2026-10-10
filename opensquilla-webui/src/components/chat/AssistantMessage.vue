@@ -49,6 +49,7 @@
           :default-open="activityDefaultOpen"
           :state-key="activityStateKey"
           :continuity-key="activityContinuityKey"
+          @open-change="activityDetailsOpen = $event"
         >
           <UnifiedAssistantActivityTimeline
             v-if="hasUnifiedActivityOrder"
@@ -175,8 +176,9 @@
           :blocks="reasoningBlocks"
           :pace-bursts="reasoningRevealPending"
           @reveal-complete="completeTerminalReasoningReveal"
+          @open-change="legacyReasoningOpen = $event"
         />
-        <ReasoningPart v-else-if="reasoningPart" :part="reasoningPart" />
+        <ReasoningPart v-else-if="reasoningPart" :part="reasoningPart" @open-change="legacyReasoningOpen = $event" />
         <ToolCallTimeline
           :items="visibleLegacyTimelineItems"
           :state-scope="toolStateScope"
@@ -187,6 +189,7 @@
           :tool-secondary-text="toolSecondaryText"
           @toggle-group="$emit('toggleToolGroup', $event)"
           @toggle-item="$emit('toggleToolItem', $event)"
+          @open-change="legacyToolsOpen = $event"
           @show-result="(content, title, context) => $emit('showToolResult', content, title, context)"
         >
           <template #interrupt="{ part }">
@@ -484,7 +487,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, provide, ref, watch } from 'vue'
+import { HISTORY_DETAILS_READY } from '@/modules/historyDetails'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
@@ -559,6 +563,7 @@ import {
 
 const props = defineProps<{
   message: ChatRenderedMessage
+  loadHistoryDetails?: (message: ChatRenderedMessage) => Promise<void>
   index: number
   shareMode: boolean
   shareSelected: boolean
@@ -596,6 +601,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   regenerate: [message: ChatRenderedMessage]
+  detailsDisclosure: [message: ChatRenderedMessage, open: boolean]
   toggleShare: [messageId: string]
   downloadArtifact: [artifact: ArtifactPayload]
   openArtifact: [artifact: ArtifactPayload]
@@ -1007,6 +1013,30 @@ const showActivityDisclosure = computed(() =>
   (activityProjection.value.canSeparateActivity && hasActivity.value)
   || props.message.activitySnapshotIncomplete === true,
 )
+const activityDetailsOpen = ref(false)
+const legacyReasoningOpen = ref(false)
+const legacyToolsOpen = ref(false)
+let detailsDisposed = false
+provide(HISTORY_DETAILS_READY, () => {
+  if (!props.message.historyPayloadPreview?.detailsTruncated) return true
+  if (!props.loadHistoryDetails) return false
+  const ref = props.message.contentRef
+  const identity = JSON.stringify(ref)
+  return props.loadHistoryDetails(props.message).then(async () => {
+    await nextTick()
+    return !detailsDisposed && identity === JSON.stringify(props.message.contentRef)
+      && props.message.historyPayloadPreview?.detailsTruncated === false
+      && (activityProjection.value.canSeparateActivity
+        ? activityDetailsOpen.value : legacyReasoningOpen.value || legacyToolsOpen.value)
+  })
+})
+watch(() => [
+  props.message.contentRef,
+  props.message.historyPayloadPreview?.detailsTruncated,
+  activityProjection.value.canSeparateActivity
+    ? activityDetailsOpen.value : legacyReasoningOpen.value || legacyToolsOpen.value,
+] as const, ([, truncated, open]) => emit('detailsDisclosure', props.message, Boolean(truncated && open)), { flush: 'post' })
+onBeforeUnmount(() => { detailsDisposed = true; emit('detailsDisclosure', props.message, false) })
 
 const toolFailureCount = computed(() =>
   visibleActivityItems.value.reduce((count, item) => {

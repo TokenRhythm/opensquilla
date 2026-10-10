@@ -1,4 +1,7 @@
 {
+  "historyContent": {
+    "unavailable": "当前仅显示预览，完整正文暂不可用。"
+  },
   "processes": {
     "title": "后台进程",
     "runningCount": "{count} 个运行中",
@@ -670,6 +673,7 @@
         "title": "配置安全模式",
         "description": "OpenSquilla 需要一次管理员授权，以创建隔离账户并配置文件与网络保护。仅首次配置或修复时需要。",
         "descriptionWithDuration": "OpenSquilla 需要一次管理员授权来创建隔离账户并配置安全保护。首次设置通常需要约 20–30 秒，期间请保持 OpenSquilla 打开。",
+        "repairIdentityDescription": "保存的沙箱登录凭据已失效。继续将修复内部沙箱账户，其他 OpenSquilla 数据环境可能需要重新准备 Safe。不会修改你的 Windows 登录密码。",
         "continue": "继续",
         "configuring": "正在配置…",
         "requestingApproval": "请确认 Windows 提示以继续。",
@@ -2954,6 +2958,7 @@
     },
     "jobs": {
       "errLoad": "加载定时任务失败",
+      "waitingForCapacity": "正在等待可用容量，将自动重试。",
       "noUpcomingRuns": "无即将运行的任务",
       "toastPaused": "任务已暂停",
       "toastResumed": "任务已恢复",

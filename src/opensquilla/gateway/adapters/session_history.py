@@ -15,7 +15,7 @@ leaving the v4 wire shape and all legacy fallback/error semantics untouched.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 
 import structlog
 
@@ -40,6 +40,37 @@ from opensquilla.session.storage import StorageBusyError
 
 log = structlog.get_logger(__name__)
 _MAX_HISTORY_CURSOR_INTEGER_TEXT = str(HISTORY_CURSOR_MAX_INTEGER)
+
+
+async def _read_page_bounded(
+    getter: Callable[..., Awaitable[object]],
+    session_key: str,
+    *,
+    limit: int,
+    before: HistoryCursor | None,
+    after: HistoryCursor | None,
+) -> object:
+    """Request a bounded page while retaining old manager-double compatibility."""
+    try:
+        return await getter(
+            session_key,
+            limit=limit,
+            before=before,
+            after=after,
+            content_mode="bounded",
+        )
+    except TypeError as exc:
+        # Older managers and characterization doubles do not know the new
+        # keyword.  Retry only that signature mismatch; never hide a TypeError
+        # raised by the actual page implementation.
+        if "content_mode" not in str(exc):
+            raise
+        return await getter(
+            session_key,
+            limit=limit,
+            before=before,
+            after=after,
+        )
 
 
 def parse_history_cursor(value: object) -> HistoryCursor | None:
@@ -134,7 +165,8 @@ class SessionHistoryStorageAdapter:
         page_getter = getattr(self._manager, "get_canonical_transcript_page", None)
         if callable(page_getter):
             try:
-                page = await page_getter(
+                page = await _read_page_bounded(
+                    page_getter,
                     session_key,
                     limit=limit,
                     before=before,
@@ -192,7 +224,12 @@ class SessionHistoryStorageAdapter:
         getter = getattr(self._manager, "get_transcript", None)
         if not callable(getter):
             return ()
-        transcript = await getter(session_key)
+        try:
+            transcript = await getter(session_key, content_mode="bounded")
+        except TypeError as exc:
+            if "content_mode" not in str(exc):
+                raise
+            transcript = await getter(session_key)
         return tuple(transcript or ())
 
     def application(self) -> SessionHistoryApplication:
@@ -233,7 +270,8 @@ class SessionHistoryStorageAdapter:
 
         if _needs_legacy_tool_lookbehind(entries[0]) and oldest_cursor is not None:
             try:
-                page = await page_getter(
+                page = await _read_page_bounded(
+                    page_getter,
                     session_key,
                     limit=1,
                     before=oldest_cursor,
@@ -257,7 +295,8 @@ class SessionHistoryStorageAdapter:
 
         if _needs_legacy_tool_lookahead(entries[-1]) and newest_cursor is not None:
             try:
-                page = await page_getter(
+                page = await _read_page_bounded(
+                    page_getter,
                     session_key,
                     limit=1,
                     before=None,

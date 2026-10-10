@@ -389,7 +389,13 @@ describe('private Gateway HTTP transport', () => {
     await expect(transport.requestJson('/api/value', {
       method: 'POST',
       json: circular,
-    })).rejects.toMatchObject({ kind: 'encode' })
+    })).rejects.toMatchObject({
+      kind: 'encode',
+      message: 'Gateway HTTP request could not be encoded as JSON.',
+      transportCause: expect.any(TypeError),
+      status: undefined,
+      payload: undefined,
+    })
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
@@ -805,6 +811,33 @@ describe('private Gateway HTTP transport', () => {
     })
     expect(cancelCalled).toBe(true)
     expect(reader.releaseLock).toHaveBeenCalled()
+  })
+
+  it('releases the underlying reader even when source cancellation rejects', async () => {
+    const cause = new Error('source cancellation failed')
+    const cancel = vi.fn(async () => { throw cause })
+    const source = new ReadableStream<Uint8Array>({ cancel })
+    const reader = source.getReader()
+    const releaseLock = vi.spyOn(reader, 'releaseLock')
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        body: { getReader: () => reader },
+      }) as unknown as Response),
+    })
+
+    const binary = await transport.requestBinary('/api/cancel-rejection')
+    const stream = binary.stream()!
+    await expect(stream.cancel('view-left')).rejects.toMatchObject({
+      kind: 'network',
+      transportCause: cause,
+    })
+    expect(cancel).toHaveBeenCalledExactlyOnceWith('view-left')
+    expect(releaseLock).toHaveBeenCalledOnce()
+    expect(source.locked).toBe(false)
   })
 
   it('rejects cross-origin, credentialed, and non-HTTP endpoints before fetch', async () => {

@@ -109,6 +109,8 @@
       "core-2",
       "gateway-sqlite-1",
       "gateway-sqlite-2",
+      "gateway-sqlite-3",
+      "gateway-sqlite-4",
       "recovery-migration-1",
       "recovery-migration-2",
       "desktop-installer-contracts-1",

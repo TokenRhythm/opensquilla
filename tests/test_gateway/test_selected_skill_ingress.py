@@ -114,6 +114,20 @@ def test_pending_queue_roundtrip_retains_skill_selection_and_blocks_steering(wit
         assert pending_input_projection(row)["workspaceFiles"] == [WORKSPACE_REF]
 
 
+def test_browser_skill_dependency_survives_pending_queue_roundtrip():
+    params = {
+        **PARAMS,
+        "selectedSkills": [{
+            "name": "browser-use", "instanceId": "bundled:browser-use", "digest": "digest-browser",
+        }],
+    }
+    command = decode_admit_turn(params)
+    payload = pending_input_payload(command, False)
+    assert payload["requiredServices"] == ["desktop_browser"]
+    restored = decode_admit_turn(payload)
+    assert restored.required_services == ("desktop_browser",)
+
+
 def test_skill_bearing_steer_is_non_text_input():
     command = decode_steering_command(
         {**PARAMS, "expectedTurnId": "turn-one", "selectedSkills": [REF]},

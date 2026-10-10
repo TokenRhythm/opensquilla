@@ -6,12 +6,14 @@ import asyncio
 import tomllib
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from opensquilla.application.app_settings import AppSettings, SettingChange
 from opensquilla.gateway.adapters.app_settings import GatewayAppSettingsPort
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.observability import settings_save
 
 
 class RecordingRuntime(GatewayAppSettingsPort):
@@ -302,3 +304,54 @@ def test_legacy_secret_imports_refer_to_the_single_policy_implementation() -> No
 
     assert legacy.restore_redacted_values is config_secrets.restore_redacted_values
     assert legacy.inherit_then_clear_explicit is config_secrets.inherit_then_clear_explicit
+
+
+@pytest.mark.parametrize("failure", [None, "persist", "selector"])
+async def test_save_diagnostics_identify_commit_without_changing_failure_semantics(
+    runtime, monkeypatch, failure,
+) -> None:
+    events = []
+    monkeypatch.setenv("OPENSQUILLA_SETTINGS_SAVE_DIAGNOSTICS", "1")
+    monkeypatch.setattr(settings_save, "_log", SimpleNamespace(
+        info=lambda event, **fields: events.append({"event": event, **fields}),
+    ))
+    runtime.fail_persist = failure == "persist"
+    runtime.fail_selector = failure == "selector"
+    with settings_save.settings_save_timing("private-request-text", "config.patch.safe"):
+        if failure:
+            with pytest.raises((OSError, RuntimeError)):
+                await AppSettings(runtime).patch_safe([SettingChange("naming.enabled", True)])
+        else:
+            await AppSettings(runtime).patch_safe([SettingChange("naming.enabled", True)])
+    phases = [event["phase"] for event in events]
+    assert phases[0] == "dispatch"
+    assert phases[-1] == "dispatch_finished"
+    assert phases.index("settings_lock_wait") < phases.index("settings_lock_acquired")
+    assert ("disk_committed" in phases) == (failure != "persist")
+    assert ("applied" in phases) == (failure is None)
+    saved = tomllib.loads(Path(runtime.config.config_path).read_text())
+    assert saved["naming"]["enabled"] == (failure != "persist")
+    assert "private-request-text" not in str(events)
+    assert all(event["request_id"].startswith("sha256:") for event in events)
+    elapsed = [event["elapsed_ms"] for event in events]
+    assert elapsed == sorted(elapsed)
+    before = len(events)
+    settings_save.settings_save_stage("outside_request")
+    assert len(events) == before
+
+
+async def test_save_diagnostics_disabled_and_logging_failure_do_not_affect_save(
+    runtime, monkeypatch,
+) -> None:
+    def broken_log(*args, **kwargs):
+        raise RuntimeError("diagnostic sink failed")
+
+    monkeypatch.setattr(settings_save, "_log", SimpleNamespace(info=broken_log))
+    monkeypatch.delenv("OPENSQUILLA_SETTINGS_SAVE_DIAGNOSTICS", raising=False)
+    with settings_save.settings_save_timing("request", "config.patch.safe"):
+        assert settings_save._current.get() is None
+        await AppSettings(runtime).patch_safe([SettingChange("naming.enabled", True)])
+    monkeypatch.setenv("OPENSQUILLA_SETTINGS_SAVE_DIAGNOSTICS", "1")
+    with settings_save.settings_save_timing("request", "config.patch.safe"):
+        await AppSettings(runtime).patch_safe([SettingChange("naming.enabled", False)])
+    assert runtime.config.naming.enabled is False

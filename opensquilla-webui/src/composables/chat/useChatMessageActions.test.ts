@@ -14,6 +14,7 @@ import type {
 } from '@/types/chat'
 import { copyTextWithFallback } from '@/utils/browser'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
+import type { ReadMessageText } from '@/utils/chat/historyMessageContent'
 
 vi.mock('@/utils/browser', () => ({
   copyTextWithFallback: vi.fn().mockResolvedValue(undefined),
@@ -1417,5 +1418,120 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
     expect(copyTextWithFallback).toHaveBeenCalledWith(
       'Working.\n\nPartial delivery.\n\nAI generated',
     )
+  })
+})
+
+
+describe('complete historical message actions', () => {
+  const body = '0123456789'.repeat(2048) + 'EXPECTED_FINAL_TAIL'
+  function fixture() {
+    const { options } = makeOptions([
+      { role: 'user', ts: 1, messageId: 'long-user', text: body.slice(0, 16384), previewComplete: false,
+        contentRef: { version: 1, sessionKey: 'session-a', sessionId: 'physical-a', messageId: 'long-user',
+          source: 'active', view: 'display', revision: 'revision-a' } },
+      { role: 'assistant', ts: 2, messageId: 'answer', text: 'answer' },
+    ])
+    const session = ref('session-a:0')
+    options.sessionIdentity = () => session.value
+    options.inputText.value = 'prior draft'
+    const read = vi.fn<ReadMessageText>(async () => body)
+    options.readMessageText = read
+    const api = useChatMessageActions(options)
+    return { api, options, read, session,
+      user: renderedMessage({ sourceIndex: 0, messageId: 'long-user' }),
+      assistant: renderedMessage({ role: 'assistant', displayRole: 'assistant', sourceIndex: 1, messageId: 'answer' }) }
+  }
+
+  it('edits the complete durable body and cancellation restores the transcript and draft', async () => {
+    const { api, options, read, user } = fixture()
+    const transcript = options.messages.value
+    const pending = api.editMessage(user)
+    expect(options.inputText.value).toBe('prior draft')
+    expect(options.messages.value).toBe(transcript)
+    expect(await pending).toBe(true)
+    expect(read.mock.calls[0]?.[0]).toMatchObject({ contentRef: { sessionId: 'physical-a', revision: 'revision-a' } })
+    expect(options.inputText.value).toBe(body)
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value).toBe(transcript)
+    expect(options.inputText.value).toBe('prior draft')
+  })
+
+  it('regenerates with the full user body, even when the rendered answer has already hydrated', async () => {
+    const { api, options, assistant } = fixture()
+    expect(await api.regenerateMessage(assistant)).toBe(true)
+    await nextTick()
+    expect(options.inputText.value).toBe(body)
+    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(options.pendingForkBeforeMessageId.value).toBe('long-user')
+  })
+
+  it.each(['edit', 'regenerate'] as const)('does not use a preview when %s cannot read the body', async operation => {
+    const { api, options, read, user, assistant } = fixture()
+    read.mockRejectedValue(new Error('incomplete range'))
+    const transcript = options.messages.value
+    expect(await (operation === 'edit' ? api.editMessage(user) : api.regenerateMessage(assistant))).toBe(false)
+    expect(options.messages.value).toBe(transcript)
+    expect(options.inputText.value).toBe('prior draft')
+    expect(options.pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.sendUsageBarrierReplay).not.toHaveBeenCalled()
+  })
+
+  it.each(['cancel', 'session', 'epoch', 'revision', 'draft', 'streaming', 'discard'] as const)(
+    'discards a late complete edit after %s changes', async change => {
+      const { api, options, read, user, session } = fixture()
+      let resolve!: (text: string) => void
+      read.mockImplementation(() => new Promise(done => { resolve = done }))
+      const transcript = options.messages.value
+      const request = api.editMessage(user)
+      if (change === 'cancel') expect(api.cancelEdit()).toBe(true)
+      if (change === 'session') { session.value = 'session-b:0'; session.value = 'session-a:0' }
+      if (change === 'epoch') session.value = 'session-a:1'
+      if (change === 'revision') options.messages.value[0]!.contentRef!.revision = 'new-revision'
+      if (change === 'draft') options.inputText.value = 'new draft'
+      if (change === 'streaming') options.isStreaming.value = true
+      if (change === 'discard') api.discardEditRestorePoint()
+      resolve(body)
+      expect(await request).toBe(false)
+      expect(options.messages.value).toBe(transcript)
+      expect(options.inputText.value).toBe(change === 'draft' ? 'new draft' : 'prior draft')
+      expect(options.pendingForkBeforeMessageId.value).toBeNull()
+      expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    },
+  )
+
+  it('supersedes an in-flight edit with a newer regenerate without applying the older read', async () => {
+    const { api, options, read, user, assistant } = fixture()
+    let resolve!: (text: string) => void
+    read.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+    const edit = api.editMessage(user)
+    expect(await api.regenerateMessage(assistant)).toBe(true)
+    resolve(body + 'STALE')
+    expect(await edit).toBe(false)
+    await nextTick()
+    expect(options.inputText.value).toBe(body)
+    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+  })
+
+  it('does not send a queued synchronous regenerate after navigating away and back', async () => {
+    const { api, options, assistant, session } = fixture()
+    options.messages.value[0]!.previewComplete = true
+    options.messages.value[0]!.text = body
+    expect(api.regenerateMessage(assistant)).toBe(true)
+    session.value = 'session-b:0'
+    session.value = 'session-a:0'
+    await nextTick()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it('reads the full body before a proven usage-barrier replay', async () => {
+    const { api, options, assistant } = fixture()
+    const outcome = safeUsageOutcome('turn', 'long-user')
+    options.messages.value[0]!.turnId = 'turn'
+    options.messages.value[1]!.turnOutcome = outcome
+    assistant.turnOutcome = outcome
+    expect(await api.regenerateMessage(assistant)).toBe(true)
+    expect(options.sendUsageBarrierReplay).toHaveBeenCalledWith({ text: body, forkBeforeMessageId: 'long-user' })
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
   })
 })

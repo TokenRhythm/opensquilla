@@ -143,6 +143,20 @@ export function resolvedStreamIdleTimeoutMs(value: number | null | undefined): n
 
 export function useChatStream(options: UseChatStreamOptions) {
   const isStreaming = ref(false)
+  const streamPreviewComplete = ref(true)
+  // A replay summary may omit persisted text. Keep that fact until history
+  // takes over, without stopping later live deltas from reaching the renderer.
+  let checkpointPreviewComplete = true
+
+  function markTextPreviewIncomplete() {
+    streamPreviewComplete.value = false
+    for (const checkpoint of streamCheckpoints) {
+      if (!checkpoint.message) continue
+      checkpoint.message.previewComplete = false
+      checkpoint.message.contentAvailability = 'preparing'
+    }
+  }
+
   const openToolGroups = ref<Set<string>>(new Set())
   const openToolItems = ref<Set<string>>(new Set())
   let checkpointedRaw = ''
@@ -337,6 +351,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     activeModelCallIteration = 0
     streamCheckpointSeq = 0
     streamCheckpoints.length = 0
+    checkpointPreviewComplete = true
+    streamPreviewComplete.value = true
     // A steer checkpoint deliberately resets only the current visible segment;
     // checkpointedRaw remains available to de-duplicate an authoritative
     // whole-turn final snapshot.
@@ -556,7 +572,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamIdlePausedForApproval.value = false
 
     if (streamBubble.value) {
-      // The accumulator's raw text is the canonical backend answer. Do not guess that visible
+      // Raw text is the backend answer (or its explicitly marked preview). Do not guess that visible
       // Markdown/XML is a leaked tool protocol: doing so mutates local history,
       // copy/export/share, and can disagree with the durable server transcript.
       const cleanedText = options.stripDirectiveTags(
@@ -601,6 +617,9 @@ export function useChatStream(options: UseChatStreamOptions) {
         role: 'assistant',
         clientId: createClientMessageId(),
         text: cleanedText,
+        ...(!streamPreviewComplete.value
+          ? { previewComplete: false, contentAvailability: 'preparing' as const }
+          : {}),
         ts: new Date().toISOString(),
         messageId: activeAssistantMessageId || undefined,
         turnId: activeStreamTurnId || undefined,
@@ -704,6 +723,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       hasToolBoundary(),
     )
     checkpointedRaw += currentStreamRaw()
+    checkpointPreviewComplete = checkpointPreviewComplete && streamPreviewComplete.value
     // A steer is another user message inside the same turn. Split only the
     // answer text so it stays chronologically above that message; the running
     // tools, artifacts, interrupts, reasoning and status history continue to
@@ -782,6 +802,10 @@ export function useChatStream(options: UseChatStreamOptions) {
       const current = options.messages.value[currentIndex]!
       current.text = cleanedText
       current.timeline = timeline
+      if (!streamPreviewComplete.value) {
+        current.previewComplete = false
+        current.contentAvailability = 'preparing'
+      }
       const desiredIndex = checkpointMessageInsertIndex(checkpoint)
       const moveTo = desiredIndex > currentIndex ? desiredIndex - 1 : desiredIndex
       if (moveTo !== currentIndex) {
@@ -795,6 +819,9 @@ export function useChatStream(options: UseChatStreamOptions) {
     options.messages.value.splice(insertIndex, 0, {
       role: 'assistant',
       text: cleanedText,
+      ...(!streamPreviewComplete.value
+        ? { previewComplete: false, contentAvailability: 'preparing' as const }
+        : {}),
       ts: new Date().toISOString(),
       clientId: checkpoint.messageClientId,
       turnId: checkpoint.turnId,
@@ -851,6 +878,7 @@ export function useChatStream(options: UseChatStreamOptions) {
 
     checkpoint.rawText += deltaText
     checkpointedRaw += deltaText
+    checkpointPreviewComplete = checkpointPreviewComplete && streamPreviewComplete.value
     setCheckpointText(checkpoint, checkpoint.rawText)
     noteStreamSignal()
     scheduleRender()
@@ -858,7 +886,10 @@ export function useChatStream(options: UseChatStreamOptions) {
   }
 
   function resetStreamForRouterReplay() {
+    const checkpointsComplete = checkpointPreviewComplete
     resetStreamState()
+    checkpointPreviewComplete = checkpointsComplete
+    streamPreviewComplete.value = checkpointsComplete
     streamBubble.value = true
     streamShowHeader.value = options.lastHeaderRole.value !== 'assistant'
     setStreamActivity('Switching model')
@@ -913,6 +944,9 @@ export function useChatStream(options: UseChatStreamOptions) {
     )
 
     clearRenderTimer()
+    // A replacement clears the current generation, but retained steer rows
+    // still own any actual gaps from a replay summary.
+    streamPreviewComplete.value = checkpointPreviewComplete
     const textSnapshot = typeof optionsArg.textSnapshot === 'string'
       ? optionsArg.textSnapshot
       : ''
@@ -1450,6 +1484,16 @@ export function useChatStream(options: UseChatStreamOptions) {
     // it intentionally clears stale text while preserving tool history.
     if (finalText == null) return
 
+    if (finalText === '') {
+      // An explicit empty/suppressed answer is authoritative. Missing text
+      // above deliberately does not take this path.
+      streamPreviewComplete.value = true
+    } else if (!streamPreviewComplete.value) {
+      // A final event alone cannot prove that an earlier stream gap is
+      // complete; authoritative history reconciles the missing content.
+      return
+    }
+
     const boundaryTail = reconcileCheckpointedText(finalText, modelCallSegments)
     const segmentFinalText = boundaryTail != null
       ? boundaryTail
@@ -1507,6 +1551,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     isStreaming,
     streamArtifacts,
     streamBubble,
+    streamPreviewComplete,
+    markTextPreviewIncomplete,
     streamHasVisibleOutput,
     streamTimelineItems,
     streamActivityVisible,

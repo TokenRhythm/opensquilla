@@ -24,6 +24,7 @@ from opensquilla.gateway.session_model_routing import accepted_model_routing_aud
 from opensquilla.gateway.task_runtime import (
     PendingOverflowPolicy,
     TaskQueueFullError,
+    TaskResidentBusyError,
     TaskRuntime,
 )
 from opensquilla.sandbox.run_mode import RunMode
@@ -49,10 +50,13 @@ class _TrackingStorage:
         self.records[record.task_id] = record
 
     async def update_agent_task(self, task_id: str, **fields: Any) -> None:
-        self.update_calls.append((task_id, fields))
+        self.update_calls.append((task_id, dict(fields)))
         record = self.records.get(task_id)
         if record is None:
             return
+        details_patch = fields.pop("details_patch", None)
+        if details_patch is not None:
+            record.details = {**(record.details or {}), **details_patch}
         for name, value in fields.items():
             setattr(record, name, value)
 
@@ -87,6 +91,7 @@ def _envelope(
     *,
     session_id: str | None = None,
     session_epoch: int | None = None,
+    required_services: tuple[str, ...] = (),
 ) -> RouteEnvelope:
     return RouteEnvelope(
         source_kind=SourceKind.WEB,
@@ -96,6 +101,7 @@ def _envelope(
         input_provenance={"kind": "synthetic-test"},
         session_id=session_id,
         session_epoch=session_epoch,
+        required_services=required_services,
     )
 
 
@@ -810,6 +816,64 @@ async def test_try_collect_atomically_mutates_only_after_persist_and_skips_repla
     )
 
 
+@pytest.mark.asyncio
+async def test_try_collect_atomically_unions_required_services() -> None:
+    """Collection must preserve delayed producer dependencies across inputs."""
+
+    storage = _TrackingStorage()
+    running_started = asyncio.Event()
+    release_running = asyncio.Event()
+    persist_details: list[dict[str, Any]] = []
+
+    async def handler(run: Any) -> None:
+        if run.message == "running":
+            running_started.set()
+            await release_running.wait()
+
+    runtime = TaskRuntime(
+        storage=storage,
+        turn_handler=handler,
+        max_concurrency=1,
+        service_snapshot=lambda: {
+            "mcp": {"status": "ready"},
+            "desktop_browser": {"status": "ready"},
+        },
+    )
+    session_key = "agent-1::collect-services"
+    running = await runtime.enqueue(_envelope(session_key), "running")
+    await asyncio.wait_for(running_started.wait(), timeout=1.0)
+    candidate_handle = await runtime.enqueue(
+        _envelope(session_key, required_services=("mcp",)),
+        "first",
+        mode="collect",
+    )
+    candidate = runtime._tasks[candidate_handle.task_id]
+
+    async def persist(_handle: Any, details: dict[str, Any]) -> _PersistenceResult:
+        persist_details.append(details)
+        return _PersistenceResult()
+
+    collected = await runtime.try_collect_atomically(
+        envelope=_envelope(session_key, required_services=("desktop_browser",)),
+        message="second",
+        run_kind="default",
+        no_memory_capture=False,
+        persist=persist,
+    )
+
+    assert collected is not None
+    assert persist_details[0]["required_services"] == ["mcp", "desktop_browser"]
+    assert candidate.envelope.required_services == ("mcp", "desktop_browser")
+
+    release_running.set()
+    assert (await runtime.wait(running.task_id, timeout=1.0)).status == (
+        AgentTaskStatus.SUCCEEDED
+    )
+    assert (await runtime.wait(candidate_handle.task_id, timeout=1.0)).status == (
+        AgentTaskStatus.SUCCEEDED
+    )
+
+
 @pytest.mark.parametrize(
     ("pending_mode", "later_mode"),
     [("full", "safe"), ("safe", "full")],
@@ -1477,6 +1541,52 @@ async def test_abort_releases_reserved_queue_capacity_and_all_runtime_state() ->
     assert runtime._reserved_overflow_victims == set()
     assert runtime._agent_active_sessions == {}
     assert runtime._agent_session_rr == {}
+
+
+@pytest.mark.asyncio
+async def test_global_resident_cap_rejects_before_side_effect_and_reuses_after_abort() -> None:
+    runtime = TaskRuntime(
+        storage=_TrackingStorage(), turn_handler=_noop_turn_handler,
+        max_resident_tasks=1,
+    )
+    first = await runtime.reserve(_envelope("agent-1::resident-cap"), "first")
+    with pytest.raises(TaskResidentBusyError) as caught:
+        await runtime.reserve(_envelope("agent-1::other-resident"), "rejected")
+    assert caught.value.max_resident == 1
+    assert len(runtime._reservations_by_session) == 1
+    assert runtime._resident_count == 1
+
+    await runtime.abort_reservation(first)
+    replacement = await runtime.reserve(_envelope("agent-1::other-resident"), "replacement")
+    assert runtime._resident_count == 1
+    await runtime.abort_reservation(replacement)
+    assert runtime._resident_count == 0
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_owner_counts_against_resident_admission() -> None:
+    runtime = TaskRuntime(
+        storage=_TrackingStorage(), turn_handler=_noop_turn_handler,
+        max_resident_tasks=1,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def auxiliary() -> None:
+        started.set()
+        await release.wait()
+
+    owner = asyncio.create_task(
+        runtime.run_auxiliary_if_idle("agent-1::aux-resident", auxiliary)
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    with pytest.raises(TaskResidentBusyError):
+        await runtime.reserve(_envelope("agent-1::blocked-by-aux"), "blocked")
+    release.set()
+    assert await asyncio.wait_for(owner, timeout=1) is True
+    replacement = await runtime.reserve(_envelope("agent-1::blocked-by-aux"), "allowed")
+    await runtime.abort_reservation(replacement)
+    assert runtime._resident_count == 0
 
 
 @pytest.mark.asyncio

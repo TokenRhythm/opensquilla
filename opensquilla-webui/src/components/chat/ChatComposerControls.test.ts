@@ -49,7 +49,9 @@ describe('ChatComposer control hierarchy', () => {
     expect(viewSource).toContain('@confirm="void confirmComposerSandboxSetup()"')
     expect(viewSource).toContain('@background="runComposerSandboxSetupInBackground"')
     expect(viewSource).toContain('useSandboxSetupStore')
-    expect(viewSource).toContain('sandboxSetupStore.startSafeSetup()')
+    expect(viewSource).toContain(
+      'sandboxSetupStore.startSafeSetup({ repairIdentity: sandboxIdentityRepairRequired.value })',
+    )
     expect(viewSource).not.toContain('completeComposerSafeSetup')
     expect(viewSource).toContain('composerRunModeSelectionAction')
   })
@@ -120,7 +122,9 @@ describe('ChatComposer model routing contract', () => {
     expect(composerSource).toContain('|| sessionRoutingBusy || inputDisabled')
     expect(composerSource).toContain(":aria-busy=\"sendPending || sessionRoutingBusy ? 'true' : 'false'\"")
     expect(composerSource).toContain(".chat-send-btn[aria-busy='true']:disabled")
-    expect(composerSource).toContain("'is-ready': hasSendContent && !sendBlockedMessage && !inputDisabled")
+    expect(composerSource).toContain(
+      "'is-ready': hasSendContent && !sendBlockedMessage && !sendDisabled && !inputDisabled",
+    )
     expect(en.chat.composer.routingUpdateBlocked)
       .toBe('Model routing is being updated. Wait before sending.')
   })

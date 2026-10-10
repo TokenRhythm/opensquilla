@@ -170,6 +170,8 @@ def test_offline_identity_setup_uses_inbox_windows_powershell(
     calls: list[list[str]] = []
     environments: list[dict[str, str]] = []
     monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setattr(mod, "_query_offline_account", lambda: None)
+    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-5-21-100-200-300-400")
     monkeypatch.setattr(mod, "_generate_offline_user_password", lambda: "A1!test-password")
     monkeypatch.setattr(identity_mod, "protect_password", lambda password: f"protected:{password}")
     monkeypatch.setattr(
@@ -185,11 +187,11 @@ def test_offline_identity_setup_uses_inbox_windows_powershell(
     result = mod.ensure_offline_sandbox_user(tmp_path / "sandbox")
 
     assert result["sid"] == "S-1-5-21-1-2-3-4"
-    assert calls[0][0].replace("/", "\\") == (
-        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    assert calls[0][0].replace("/", "\\").casefold() == (
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".casefold()
     )
-    assert environments[0]["PSModulePath"].replace("/", "\\") == (
-        r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
+    assert environments[0]["PSModulePath"].replace("/", "\\").casefold() == (
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules".casefold()
     )
 
 
@@ -289,3 +291,69 @@ def test_support_probe_rejects_legacy_firewall_network_marker(
 
     assert support.default_backend_available is True
     assert support.proxy_allowlist_enforced is False
+
+
+def test_elevated_helper_timeout_uses_process_id_for_tree_cleanup(monkeypatch) -> None:
+    """A ShellExecuteEx process HANDLE must never be passed as a PID."""
+
+    import ctypes
+
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    class _Fn:
+        def __init__(self, implementation):
+            self._implementation = implementation
+
+        def __call__(self, *args):
+            return self._implementation(*args)
+
+    calls: dict[str, object] = {"wait": 0, "tree_pid": None}
+
+    class _Shell:
+        def __init__(self):
+            self.ShellExecuteExW = _Fn(self._execute)
+
+        @staticmethod
+        def _execute(pointer):
+            pointer._obj.hProcess = 0x4444
+            return 1
+
+    class _Kernel:
+        def __init__(self):
+            self.WaitForSingleObject = _Fn(self._wait)
+            self.GetProcessId = _Fn(lambda handle: 4242)
+            self.GetExitCodeProcess = _Fn(lambda handle, code: 1)
+            self.TerminateProcess = _Fn(lambda handle, code: 1)
+            self.CloseHandle = _Fn(lambda handle: 1)
+
+        @staticmethod
+        def _wait(handle, timeout):
+            calls["wait"] = int(calls["wait"]) + 1
+            return 0x102 if calls["wait"] == 1 else 0
+
+    shell = _Shell()
+    kernel = _Kernel()
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda name, use_last_error=True: shell if name == "shell32" else kernel,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "SETUP_HELPER_WAIT_TIMEOUT_MS", 1)
+    monkeypatch.setattr(mod, "SETUP_HELPER_CLEANUP_WAIT_TIMEOUT_MS", 1)
+
+    def fake_tree_cleanup(pid: int) -> str:
+        calls["tree_pid"] = pid
+        return "taskkill_ok"
+
+    monkeypatch.setattr(mod, "_terminate_setup_helper_tree", fake_tree_cleanup)
+
+    with pytest.raises(OSError, match=r"helper_pid=4242; cleanup_tree=taskkill_ok"):
+        mod._shell_execute_runas_and_wait(
+            executable="powershell.exe",
+            parameters="-NoProfile -Command exit",
+            directory=".",
+        )
+
+    assert calls["tree_pid"] == 4242

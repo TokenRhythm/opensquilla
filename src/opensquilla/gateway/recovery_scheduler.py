@@ -42,6 +42,11 @@ class RecoveryOperation:
     started: bool = False
     task: asyncio.Task[None] | None = None
     cancel_callbacks: list[Callable[[], None]] = field(default_factory=list)
+    # A recovery request has exactly one terminal response.  The scheduler
+    # and the dispatcher race when a queued read is superseded, cancelled, or
+    # reaches its deadline, so this claim must live on the operation rather
+    # than in any one callback.
+    response_claimed: bool = False
 
     @property
     def scope_key(self) -> tuple[int, str]:
@@ -59,6 +64,14 @@ class RecoveryOperation:
         if self.task is not None and not self.task.done():
             self.task.cancel()
 
+    def claim_response(self) -> bool:
+        """Claim the single terminal response slot for this operation."""
+
+        if self.response_claimed:
+            return False
+        self.response_claimed = True
+        return True
+
 
 CURRENT_RECOVERY_OPERATION: ContextVar[RecoveryOperation | None] = ContextVar(
     "gateway_recovery_operation", default=None
@@ -71,6 +84,8 @@ class _Job:
     run: Callable[[], Awaitable[None]]
     finish: Callable[[], None]
     expire: Callable[[], None]
+    stale: Callable[[], None]
+    stale_reported: bool = False
     timer: asyncio.TimerHandle | None = None
 
 
@@ -118,6 +133,7 @@ class RecoveryScheduler:
         *,
         finish: Callable[[], None] = lambda: None,
         expire: Callable[[], None] = lambda: None,
+        stale: Callable[[], None] = lambda: None,
     ) -> bool:
         if (
             operation in self._jobs
@@ -126,7 +142,7 @@ class RecoveryScheduler:
             or not operation.current()
         ):
             return False
-        job = _Job(operation, run, finish, expire)
+        job = _Job(operation, run, finish, expire, stale)
         self._jobs[operation] = job
         self._waiting.setdefault(operation.connection_id, []).append(job)
         job.timer = asyncio.get_running_loop().call_later(
@@ -139,11 +155,16 @@ class RecoveryScheduler:
         return True
 
     def cancel(self, operation: RecoveryOperation) -> None:
-        operation.retire()
-        if operation in self._active:
-            return
         job = self._jobs.get(operation)
-        if job is not None:
+        if job is None:
+            operation.retire()
+            return
+        # Cancellation is a request-local terminal result as well.  Claim it
+        # before retiring the operation; an active task keeps its physical
+        # slot until cancellation cleanup reaches _done.
+        self._report_stale(job)
+        operation.retire()
+        if operation not in self._active:
             self._remove_waiting(job)
             self._finish(job)
         self._pump()
@@ -169,8 +190,39 @@ class RecoveryScheduler:
         if job is None:
             return
         if not operation.closed:
-            job.expire()
-        self.cancel(operation)
+            self._report_expire(job)
+        # Deadline expiry already emitted its terminal response. Retire the
+        # operation and finish it without also reporting the stale path.
+        operation.retire()
+        if operation not in self._active:
+            self._remove_waiting(job)
+            self._finish(job)
+        self._pump()
+
+    @staticmethod
+    def _report_stale(job: _Job) -> None:
+        if job.stale_reported or not job.operation.claim_response():
+            return
+        job.stale_reported = True
+        job.stale()
+
+    @staticmethod
+    def _report_expire(job: _Job) -> None:
+        if job.stale_reported or not job.operation.claim_response():
+            return
+        job.stale_reported = True
+        job.expire()
+
+    def _report_invalid(self, job: _Job) -> None:
+        """Report the terminal result for an operation that lost validity."""
+
+        operation = job.operation
+        if operation.response_claimed:
+            return
+        if time.monotonic() >= operation.deadline:
+            self._report_expire(job)
+        else:
+            self._report_stale(job)
 
     def _pump(self) -> None:
         while len(self._active) < MAX_RUNNING:
@@ -182,6 +234,7 @@ class RecoveryScheduler:
                     operation = job.operation
                     if not operation.current():
                         self._remove_waiting(job)
+                        self._report_stale(job)
                         operation.retire()
                         self._finish(job)
                         continue
@@ -215,11 +268,22 @@ class RecoveryScheduler:
         try:
             if job.operation.current():
                 await job.run()
+            else:
+                # A queued job can become stale after _pump selects it but
+                # before its task gets its first turn.  Do not silently drop
+                # that request.
+                self._report_invalid(job)
+                job.operation.retire()
         finally:
             CURRENT_RECOVERY_OPERATION.reset(token)
 
     def _done(self, job: _Job, task: asyncio.Task[None]) -> None:
         operation = job.operation
+        # If the dispatcher completed without claiming a response, or the
+        # physical task was invalidated while running, close the request with
+        # a bounded terminal result before releasing its slot.
+        if not operation.response_claimed:
+            self._report_invalid(job)
         self._active.pop(operation, None)
         self._active_keys.discard(operation.scope_key)
         count = self._active_connections.get(operation.connection_id, 1) - 1

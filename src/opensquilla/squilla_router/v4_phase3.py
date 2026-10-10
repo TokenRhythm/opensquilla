@@ -38,6 +38,20 @@ def default_bundle_dir() -> Path:
 def runtime_src_import_path(bundle_dir: Path) -> Iterator[None]:
     """Temporarily expose the copied bundle's ``runtime_src`` import root."""
     old_path = list(sys.path)
+    # A frozen Gateway may already contain a top-level ``src`` namespace in
+    # PyInstaller's module archive.  If that namespace wins before this
+    # bundle path is inserted, imports such as ``src.router.inference`` are
+    # resolved against the archive and can miss files that are intentionally
+    # shipped in the bundle's runtime_src tree.  The router runtime owns this
+    # namespace while it is active, so discard any preloaded copy and let the
+    # validated bundle provide the modules consistently in source and frozen
+    # executions.
+    stale_runtime_modules = [
+        name for name in sys.modules
+        if name == "src" or name.startswith("src.")
+    ]
+    for name in stale_runtime_modules:
+        sys.modules.pop(name, None)
     sys.path.insert(0, str(bundle_dir / "runtime_src"))
     try:
         yield
@@ -104,8 +118,19 @@ class V4Phase3Strategy:
         self._model_version = self._read_model_version()
 
         with runtime_src_import_path(self.bundle_dir):
-            from src.router.inference.core import InferenceCore
-            from src.router.inference.types import InferenceRequest
+            try:
+                from src.router.inference.core import InferenceCore
+                from src.router.inference.types import InferenceRequest
+            except Exception as exc:
+                # Keep frozen-runtime failures actionable: a missing module
+                # here is otherwise indistinguishable from a bad model file.
+                runtime_root = self.bundle_dir / "runtime_src"
+                raise RuntimeError(
+                    f"router runtime import failed: {exc}; "
+                    f"bundle={self.bundle_dir}; runtime_src={runtime_root.exists()}; "
+                    f"runtime_path={runtime_root in [Path(p) for p in sys.path]}; "
+                    f"sys_path_head={sys.path[:4]}"
+                ) from exc
 
             resolved_aux_head = (
                 bool(self._config.get("v4", {}).get("aux_head_inference", False))

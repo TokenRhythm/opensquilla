@@ -49,7 +49,8 @@ def _write_run(
         shard_dir = run_dir / f"windows-high-risk-{shard}-attempt-{attempt}"
         shard_dir.mkdir(parents=True)
         base_path = FILES_BY_SHARD[family]
-        path = base_path.replace(".py", "_second.py") if shard.endswith("-2") else base_path
+        path = (base_path.replace(".py", f"_{shard.rsplit('-', 1)[1]}.py")
+                if partitioned else base_path)
         metadata = {
             "schema_version": 1,
             "platform": "windows",
@@ -282,19 +283,22 @@ def _partitioned_observations(tmp_path: Path) -> list[Any]:
     ]
 
 
-def test_duration_builder_requires_all_eight_execution_shards(tmp_path: Path) -> None:
+def test_duration_builder_requires_all_ten_execution_shards(tmp_path: Path) -> None:
     observations = _partitioned_observations(tmp_path)
     payload = build_duration_payload(
         observations, expected_assignment_sha256="b" * 64,
         expected_partition_sha256="e" * 64,
     )
-    assert len(payload["weights_seconds"]) == 8
+    assert len(payload["weights_seconds"]) == 10
+    catalog = json.loads(Path(".github/ci/suites.v1.json").read_text(encoding="utf-8"))
+    assert tuple(catalog["full_python_matrix"]["windows"]) == DURATION_MODULE["WINDOWS_SHARD_NAMES"]
     assert all(value == {"parallel": 2.0, "serial": 0.0}
                for value in payload["phase_weights_seconds"].values())
-    assert len(payload["source_runs"][0]["execution"]) == 8
-    metadata_path = next((tmp_path / "run-500").rglob("windows-shard-metadata.json"))
+    assert len(payload["source_runs"][0]["execution"]) == 10
+    metadata_path = (tmp_path / "run-500" / "windows-high-risk-gateway-sqlite-4-attempt-1"
+                     / "windows-shard-metadata.json")
     metadata_path.unlink()
-    with pytest.raises(ValueError, match="expected 8 Windows shard metadata"):
+    with pytest.raises(ValueError, match="expected 10 Windows shard metadata"):
         load_run_directory(tmp_path / "run-500")
 
 

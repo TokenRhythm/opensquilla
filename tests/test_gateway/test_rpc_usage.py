@@ -300,6 +300,22 @@ class _FakeTranscriptSessionManager(_FakeSessionManager):
         return self._transcript
 
 
+class _FakeMetadataSessionManager(_FakeSessionManager):
+    def __init__(self, sessions, metadata):
+        super().__init__(sessions)
+        self._metadata = metadata
+        self.metadata_calls = 0
+        self.transcript_calls = 0
+
+    async def get_transcript_token_metadata(self, session_key):
+        self.metadata_calls += 1
+        return self._metadata
+
+    async def get_transcript(self, session_key, *args, **kwargs):
+        self.transcript_calls += 1
+        raise AssertionError("usage.status must not materialize transcript bodies")
+
+
 class _FakeIndexedSessionManager(_FakeSessionManager):
     def __init__(self, sessions):
         super().__init__(sessions)
@@ -490,6 +506,55 @@ def test_usage_status_requested_compacted_session_prefers_active_transcript_cont
     assert context_status["tokenSource"] == "transcript_estimate"
     assert context_status["contextTokens"] == 36_184
     assert context_status["pressure"] < 0.1
+
+
+def test_usage_status_uses_scalar_token_metadata_without_transcript_materialization() -> None:
+    session = SimpleNamespace(
+        session_key="agent:webchat:metadata",
+        status="finished",
+        context_tokens=None,
+        compaction_count=1,
+        model="deepseek-v4-flash",
+    )
+    sm = _FakeMetadataSessionManager(
+        [session],
+        {"entry_count": 3, "known_tokens": 36_184, "unknown_entries": 0},
+    )
+    payload = asyncio.run(
+        _read_usage_status(
+            {"sessionKey": session.session_key},
+            _ctx(session_manager=sm, usage_tracker=UsageTracker()),
+        )
+    )
+
+    context_status = payload["sessions"][0]["contextStatus"]
+    assert sm.metadata_calls == 1
+    assert sm.transcript_calls == 0
+    assert context_status["contextTokens"] == 36_184
+    assert context_status["tokenSource"] == "transcript_metadata"
+    assert context_status["contextEstimateComplete"] is True
+
+
+def test_usage_status_reports_unavailable_for_metadata_with_no_known_tokens() -> None:
+    session = SimpleNamespace(
+        session_key="agent:webchat:metadata-missing",
+        status="finished",
+        context_tokens=None,
+        compaction_count=1,
+        model="deepseek-v4-flash",
+    )
+    sm = _FakeMetadataSessionManager(
+        [session],
+        {"entry_count": 2, "known_tokens": 0, "unknown_entries": 2},
+    )
+    payload = asyncio.run(
+        _read_usage_status(
+            {"sessionKey": session.session_key},
+            _ctx(session_manager=sm, usage_tracker=UsageTracker()),
+        )
+    )
+    assert payload["sessions"][0]["contextStatus"] is None
+    assert sm.transcript_calls == 0
 
 
 def test_usage_status_exposes_session_timestamp_aliases() -> None:

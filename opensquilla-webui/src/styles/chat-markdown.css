@@ -9,6 +9,11 @@
  * horizontal rules, task lists) and mirrors the quote/link treatment for the
  * surfaces that lack a scoped copy. All colors come from base.css tokens. */
 
+.chat-markdown-plain {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* Tables — bare GFM output has no wrapper, so the table itself scrolls.
  * `display:block` lets the row groups re-establish their own table layout
  * (the proven pattern for a horizontally scrollable markdown table). */

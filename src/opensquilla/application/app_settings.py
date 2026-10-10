@@ -28,6 +28,7 @@ from opensquilla.application.config_secrets import (
 from opensquilla.application.config_secrets import (
     restore_redacted_values as _restore_redacted_values,
 )
+from opensquilla.observability.settings_save import settings_save_stage
 
 type SettingsValue = (
     None | bool | int | float | str | list["SettingsValue"] | dict[str, "SettingsValue"]
@@ -278,18 +279,24 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
     ) -> SettingsMutation:
         runtime = self._runtime
         self._last_write_persisted = False
+        settings_save_stage("candidate_built")
         provider = runtime.resolve_provider(candidate)
         # Persistence is the commit point. Later runtime failures do not undo it.
         async with runtime.mutation_scope(candidate):
+            settings_save_stage("persist_begin")
             runtime.persist(candidate)
             self._last_write_persisted = True
+            settings_save_stage("persist_finished")
             if before.config is not None:
                 runtime.replace(before.config, candidate)
         if before.config is not None:
             await runtime.notify_goal(before.previous)
         runtime.sync_provider(provider)
+        settings_save_stage("provider_synced")
         await runtime.sync_runtime(before.previous, candidate)
+        settings_save_stage("runtime_synced")
         await runtime.refresh_catalog(before.catalog, candidate)
+        settings_save_stage("catalog_refreshed")
         result = _change_meta(before.payload, _config_dump(candidate))
         if patched is not None:
             result["patched"] = patched
@@ -305,6 +312,7 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
                     section for section in result.get("liveApplied", []) if section != "memory"
                 ]
         await self._publish_routing(before, candidate, result)
+        settings_save_stage("applied")
         return result
 
     async def set(self, path: str, value: SettingsValue) -> SettingsMutation:
@@ -386,7 +394,9 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
         return await self._mutate(dict(patch), dict(changes))
 
     async def _mutate(self, patch: SettingsObject, changes: SettingsObject) -> SettingsMutation:
+        settings_save_stage("settings_lock_wait")
         async with _settings_lock(self._runtime.config):
+            settings_save_stage("settings_lock_acquired")
             return await self._mutate_unlocked(patch, changes)
 
     async def _mutate_unlocked(

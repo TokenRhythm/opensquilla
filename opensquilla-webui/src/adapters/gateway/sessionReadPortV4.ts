@@ -1,4 +1,4 @@
-import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import type { TransportCallOptions as RpcCallOptions, TransportLaneRetireReceipt } from './transportTypes'
 import {
   SESSIONS_MESSAGES_HYDRATE_METHOD,
   type SessionsMessagesHydrateParams,
@@ -29,6 +29,7 @@ import {
 import {
   SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD,
   type SessionsMessagesUnsubscribeParams,
+  type SessionsMessagesUnsubscribeResult,
 } from '@/contracts/generated/v4/sessionsMessagesUnsubscribe'
 import {
   validateSessionsMessagesUnsubscribeParams,
@@ -63,6 +64,12 @@ import {
   type SnapshotDeliveryReceipt,
   type SnapshotInstalledReceipt,
 } from './sessionSnapshotReadV4'
+import {
+  openV2SessionRead,
+  requestV2SessionHistory,
+  supportsSessionReadV2,
+  type SessionReadV2Lease,
+} from './sessionReadV2'
 
 const READY_TIMEOUT_MS = 7_000
 const READ_TIMEOUT_MS = 7_000
@@ -82,11 +89,15 @@ interface SessionReadV4Transport {
     abortAction?: 'reject' | 'reconnect'
   }): Promise<void>
   readonly generation: number
+  /** Explicit handshake bit; broad method probing alone is not sufficient to
+   * opt legacy callers into the recovery lease protocol. */
+  readonly sessionReadV2?: boolean
   supports?(method: string): boolean
   acknowledgeDelivery?(receipt: SnapshotDeliveryReceipt): Promise<void> | void
   resumeFlow?(receipt: SnapshotInstalledReceipt): Promise<void> | void
   recoveryVersion?(key: string): string
   snapshotInstalled?(key: string, version: string): void
+  retireLane?(receipt: TransportLaneRetireReceipt): Promise<void> | void
   waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void>
   failProtocol?(generation: number): void
 }
@@ -189,23 +200,37 @@ function subscriptionError(error: unknown): unknown {
 
 function snapshotInstallationHooks(
   staged: StagedSessionSnapshot | null,
+  modern: SessionReadV2Lease | null = null,
 ): Pick<SessionReadPortLive, 'confirmInstalled' | 'assertInstalledCurrent'> {
-  if (!staged) return {}
+  if (!staged && !modern) return {}
   // Keep each consumer bound to its exact snapshot. A later reconciliation
   // must not redirect an older confirmation to the replacement transfer.
   return {
     async confirmInstalled() {
       try {
-        await staged.confirmInstalled()
+        if (staged) await staged.confirmInstalled()
+        if (modern) {
+          const result = await modern.installConsumed(staged ? {
+            sessionId: staged.sessionId,
+            sessionEpoch: staged.sessionEpoch,
+            streamGeneration: staged.value.stream_generation,
+            streamSeq: staged.value.current_stream_seq,
+          } : undefined)
+          if (result.status !== 'installed') {
+            throw new SessionReadFailure('busy', 'Session replay is still catching up.', true)
+          }
+        }
       } catch (error) {
         throw mapSessionReadError(error)
       }
     },
     assertInstalledCurrent() {
-      try {
-        staged.assertInstalledCurrent()
-      } catch (error) {
-        throw mapSessionReadError(error)
+      if (staged) {
+        try {
+          staged.assertInstalledCurrent()
+        } catch (error) {
+          throw mapSessionReadError(error)
+        }
       }
     },
   }
@@ -513,6 +538,8 @@ export function createV4SessionReadPort(
       let transfer: SessionSnapshotTransfer | null = null
       let terminalSnapshotError: unknown = null
       let subscribedGeneration: number | null = null
+      let v2Lease: SessionReadV2Lease | null = null
+      let v2BaseApplied = false
 
       async function createContext(): Promise<OpenContext> {
         const admissionDeadline = performance.now() + READ_TIMEOUT_MS
@@ -526,6 +553,10 @@ export function createV4SessionReadPort(
           throw abortError('Session read closed before connection admission.')
         }
         const expectedGeneration = rpc.generation
+        // A local draft needs live admission before its first send, but has no
+        // durable identity for read-v2 until that send has been accepted.
+        const v2Enabled = !request.provisionalDraft
+          && rpc.sessionReadV2 === true && supportsSessionReadV2(rpc)
         const subscribeParams: SessionsMessagesSubscribeParams = {
           key: request.sessionKey,
           since_stream_generation: request.resumeFrom.streamGeneration,
@@ -583,32 +614,89 @@ export function createV4SessionReadPort(
           }
         }
         let acknowledgedSubscription: SessionsMessagesSubscribeResult | null = null
-        const subscribePromise = rpc.request(
-          SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
-          subscribeParams,
-          callOptions(
-            request.signal,
-            Math.max(1, admissionDeadline - performance.now()),
-            expectedGeneration,
-            generation => {
-              subscribedGeneration = generation
-              subscribeSent.sent(generation)
-            },
-          ),
-        ).then(raw => requireResult<SessionsMessagesSubscribeResult>(
-          SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
-          canonicalSessionMetadata(raw),
-          validateSessionsMessagesSubscribeResult,
-        )).then(result => {
-          if (result.key !== request.sessionKey || !result.subscribed) {
-            throw invalidContract(SESSIONS_MESSAGES_SUBSCRIBE_METHOD)
+        let admission: Promise<SessionsMessagesSubscribeResult> | null = null
+        function assertAdmissionCurrent() {
+          if (closed || request.signal.aborted || rpc.generation !== expectedGeneration
+            || owners.get(request.sessionKey) !== owner) throw abortError()
+        }
+        function fenceRebaseFailure(error: unknown): unknown {
+          const code = errorCode(error)
+          if (code === 'REBASE_REQUIRED' || code === 'READ_STALE'
+            || (error instanceof SessionReadFailure && error.kind === 'rebase-required')) {
+            try { assertAdmissionCurrent() } catch (obsolete) { return obsolete }
           }
-          acknowledgedSubscription = result
-          return result
-        }).catch(error => {
-          const projected = subscriptionError(error)
-          subscribeSent.failed(projected)
-          throw projected
+          return error
+        }
+        function ensureAdmission(initial = false): Promise<SessionsMessagesSubscribeResult> {
+          if (admission) return admission
+          const current = (async () => {
+            assertAdmissionCurrent()
+            if (!acknowledgedSubscription) {
+              const raw = await rpc.request(
+                SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
+                subscribeParams,
+                callOptions(
+                  request.signal,
+                  initial ? Math.max(1, admissionDeadline - performance.now()) : READ_TIMEOUT_MS,
+                  expectedGeneration,
+                  generation => {
+                    subscribedGeneration = generation
+                    subscribeSent.sent(generation)
+                  },
+                ),
+              )
+              assertAdmissionCurrent()
+              const result = requireResult<SessionsMessagesSubscribeResult>(
+                SESSIONS_MESSAGES_SUBSCRIBE_METHOD, canonicalSessionMetadata(raw),
+                validateSessionsMessagesSubscribeResult,
+              )
+              if (result.key !== request.sessionKey || !result.subscribed) {
+                throw invalidContract(SESSIONS_MESSAGES_SUBSCRIBE_METHOD)
+              }
+              acknowledgedSubscription = result
+            }
+            if (v2Enabled && !v2BaseApplied) {
+              if (!v2Lease) {
+                const modern = await openV2SessionRead(rpc, request.sessionKey, expectedGeneration, request.signal)
+                try {
+                  assertAdmissionCurrent()
+                } catch (error) {
+                  // Open is idempotent by connection/key. A replacement owner
+                  // may already have adopted this exact lease; do not close it.
+                  const currentOwner = owners.get(request.sessionKey)
+                  if (rpc.generation === expectedGeneration && (!currentOwner || currentOwner === owner)) {
+                    await modern.close()
+                  }
+                  throw error
+                }
+                // Own the lease before base installation can fail or cancel.
+                v2Lease = modern
+              }
+              const modern = v2Lease
+              const advertisedEpoch = numberValue(acknowledgedSubscription.epoch)
+              if (advertisedEpoch !== null && advertisedEpoch !== modern.sessionEpoch) {
+                throw new SessionReadContractError('Session read v2 identity changed during subscribe.')
+              }
+              const base = await modern.install({ baseApplied: true })
+              assertAdmissionCurrent()
+              if (base.status !== 'base_applied' && base.status !== 'catching_up' && base.status !== 'installed') {
+                throw new SessionReadFailure('busy', 'Session replay base is not available yet.', true)
+              }
+              v2BaseApplied = true
+            }
+            return acknowledgedSubscription
+          })().catch(error => {
+            throw subscriptionError(fenceRebaseFailure(error))
+          })
+          const observed = current.finally(() => {
+            if (admission === observed) admission = null
+          })
+          admission = observed
+          return observed
+        }
+        const subscribePromise = ensureAdmission(true).catch(error => {
+          subscribeSent.failed(error)
+          throw error
         })
         const snapshotPromise = subscribeSent.promise.then(() => readSnapshot(snapshotSent)).then(result => {
           if (result && result.key !== request.sessionKey) {
@@ -626,22 +714,29 @@ export function createV4SessionReadPort(
 
         const historySent = request.includeInitialHistory ? sentLatch() : null
         const initialHistory = historySent
-          ? liveFramesQueued.then(() => requestV4SessionHistory(
-              rpc,
-              request.sessionKey,
-              {
-                direction: 'latest',
-                limit: INITIAL_HISTORY_LIMIT,
-                signal: request.signal,
-              },
-              {
-                includeSummaries: true,
-                expectedGeneration,
-                onSent: historySent.sent,
-                policy: historyPolicy,
-                contractError: invalidContract,
-              },
-            )).catch(error => {
+          ? (v2Enabled ? Promise.all([liveFramesQueued, subscribePromise]) : liveFramesQueued).then(() => v2Enabled
+            ? requestV2SessionHistory(rpc, request.sessionKey, {
+                direction: 'latest', limit: INITIAL_HISTORY_LIMIT, signal: request.signal,
+              }, expectedGeneration, historySent.sent).then(result => {
+                historySent.sent(expectedGeneration)
+                return result
+              })
+            : requestV4SessionHistory(
+                rpc,
+                request.sessionKey,
+                {
+                  direction: 'latest',
+                  limit: INITIAL_HISTORY_LIMIT,
+                  signal: request.signal,
+                },
+                {
+                  includeSummaries: true,
+                  expectedGeneration,
+                  onSent: historySent.sent,
+                  policy: historyPolicy,
+                  contractError: invalidContract,
+                },
+              )).catch(error => {
               historySent.failed(error)
               throw error
             })
@@ -668,7 +763,7 @@ export function createV4SessionReadPort(
           activeTaskId: snapshot?.task_id ?? activeTaskId(subscription),
           initialMetadata: projectMetadata(subscription),
           snapshot: snapshot ? projectSnapshot(snapshot) : null,
-          ...snapshotInstallationHooks(stagedSnapshot),
+          ...snapshotInstallationHooks(stagedSnapshot, v2Lease),
           cursor: Object.freeze({
             sessionKey: request.sessionKey,
             sessionEpoch: subscription.epoch,
@@ -711,41 +806,28 @@ export function createV4SessionReadPort(
           if (reconciliation) return reconciliation
           const current = (async (): Promise<SessionReadPortLive> => {
             if (rpc.generation !== expectedGeneration) throw abortError('The connection generation changed.')
-            // An initial subscribe response can be lost although registration
-            // succeeded. Repeating that idempotent registration is safe; an
-            // established subscription never takes the unsubscribe/open path.
-            if (!acknowledgedSubscription) {
-              // Recovery may have just reacquired admission after ready failed.
-              // Join its in-flight registration before deciding to repeat it.
-              await subscribePromise.catch(() => {})
-            }
-            if (!acknowledgedSubscription) {
-              const raw = await rpc.request(
-                SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
-                subscribeParams,
-                callOptions(request.signal, READ_TIMEOUT_MS, expectedGeneration, generation => { subscribedGeneration = generation }),
-              )
-              const subscription = requireResult<SessionsMessagesSubscribeResult>(
-                SESSIONS_MESSAGES_SUBSCRIBE_METHOD, canonicalSessionMetadata(raw), validateSessionsMessagesSubscribeResult,
-              )
-              if (subscription.key !== request.sessionKey || !subscription.subscribed) {
-                throw invalidContract(SESSIONS_MESSAGES_SUBSCRIBE_METHOD)
-              }
-              acknowledgedSubscription = subscription
-            }
+            const subscription = await ensureAdmission()
             const snapshot = await readSnapshot(sentLatch())
             if (snapshot && snapshot.key !== request.sessionKey) {
               throw invalidContract(SESSIONS_MESSAGES_SNAPSHOT_METHOD)
             }
-            const subscription = acknowledgedSubscription
             // The completed snapshot precedes this hydration and is its latest
             // known lower bound. Reusing only the initial subscribe cursor could
             // keep old questions actionable forever after a missed terminal.
             // Legacy Gateways without snapshots retain the conservative bound.
             const metadata = supportsSnapshotRecovery(rpc)
-              ? projectMetadata(subscription)
+              ? Object.freeze({ ...projectMetadata(subscription), hydrationComplete: false })
               : await hydrate(rpc, request.sessionKey, request.signal, expectedGeneration, snapshot ?? subscription)
             assertSnapshotIdentity(metadata)
+            // A staged snapshot must be applied by the domain and confirmed
+            // before its watermark can prove read-v2 consumption. Its hook
+            // performs the final installation after that consumer step.
+            if (v2Lease && !stagedSnapshot) {
+              const install = await v2Lease.installConsumed()
+              if (install.status !== 'installed') {
+                throw new SessionReadFailure('busy', 'Session replay is still catching up.', true)
+              }
+            }
             if (closed || request.signal.aborted || rpc.generation !== expectedGeneration) throw abortError()
             initialHistoryAvailable = false
             return Object.freeze({
@@ -755,7 +837,7 @@ export function createV4SessionReadPort(
               activeTaskId: snapshot?.task_id ?? textValue(metadata.activeTask?.task_id, metadata.activeTask?.taskId),
               initialMetadata: metadata,
               snapshot: snapshot ? projectSnapshot(snapshot) : null,
-              ...snapshotInstallationHooks(stagedSnapshot),
+              ...snapshotInstallationHooks(stagedSnapshot, v2Lease),
               cursor: Object.freeze({
                 sessionKey: request.sessionKey,
                 sessionEpoch: metadata.epoch,
@@ -770,7 +852,9 @@ export function createV4SessionReadPort(
                 currentStreamSeq: snapshot.current_stream_seq,
               }) : null,
             })
-          })().catch(error => { throw mapSessionReadError(error) })
+          })().catch(error => {
+            throw mapSessionReadError(fenceRebaseFailure(error))
+          })
           const observed = current.finally(() => {
             if (reconciliation === observed) reconciliation = null
           })
@@ -794,6 +878,10 @@ export function createV4SessionReadPort(
             initialHistoryAvailable = false
             return initialHistory
           }
+          if (v2Enabled) {
+            await ensureAdmission()
+            return requestV2SessionHistory(rpc, request.sessionKey, historyRequest, expectedGeneration)
+          }
           return requestV4SessionHistory(
             rpc,
             request.sessionKey,
@@ -811,10 +899,8 @@ export function createV4SessionReadPort(
           if (closed || request.signal.aborted) return Promise.reject(abortError())
           if (retry) return retry
           const current = (async () => {
-            await criticalRequestsQueued
-            // Reconciliation may have recovered an initially lost ACK. Its
-            // metadata retry must not replay the original rejected promise.
-            const subscription = acknowledgedSubscription ?? await subscribePromise
+            const subscription = await ensureAdmission()
+            if (!v2Enabled) await criticalRequestsQueued
             return hydrate(
               rpc,
               request.sessionKey,
@@ -873,22 +959,40 @@ export function createV4SessionReadPort(
         owners.delete(request.sessionKey)
         const generation = subscribedGeneration
         if (generation === null || rpc.generation !== generation) return
+        const modern = v2Lease
+        v2Lease = null
+        const cleanup: Promise<unknown>[] = []
+        if (modern) {
+          try { cleanup.push(modern.close()) } catch (error) { cleanup.push(Promise.reject(error)) }
+        }
         const params: SessionsMessagesUnsubscribeParams = { key: request.sessionKey }
-        requireParams(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, params, validateSessionsMessagesUnsubscribeParams)
         const sent = sentLatch()
         try {
+          requireParams(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, params, validateSessionsMessagesUnsubscribeParams)
           const result = rpc.request(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, params, {
             ...releaseOptions(generation), onSent: sent.sent,
           })
           void result.then(value => {
             // In-memory ports may not implement onSent. A completed response
             // also proves that its frame was admitted.
-            requireResult(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, value, validateSessionsMessagesUnsubscribeResult)
+            const retireResult = requireResult<SessionsMessagesUnsubscribeResult>(
+              SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, value, validateSessionsMessagesUnsubscribeResult,
+            )
+            const retire = retireResult?.lane_retire
+            if (retire && rpc.retireLane) {
+              void Promise.resolve(rpc.retireLane(retire)).catch(() => {})
+            }
             sent.sent(generation)
           }).catch(error => { sent.failed(error) })
-          await sent.promise
+          cleanup.push(sent.promise)
         } catch (error) {
-          if (!isMissingMethod(error)) throw error
+          cleanup.push(Promise.reject(error))
+        }
+        // Both generation-pinned cleanup requests have started before yielding.
+        // A failed read-close must not suppress unsubscribe or its retire fence.
+        const results = await Promise.allSettled(cleanup)
+        for (const result of results) {
+          if (result.status === 'rejected' && !isMissingMethod(result.reason)) throw result.reason
         }
       }
 

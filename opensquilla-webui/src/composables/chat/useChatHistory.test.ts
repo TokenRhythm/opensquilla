@@ -98,6 +98,7 @@ function sessionReadMessage(
     model: value.model ?? null,
     inputTokens: value.inputTokens ?? null,
     outputTokens: value.outputTokens ?? null,
+    historyPayloadPreview: value.historyPayloadPreview,
     additional: value.additional ?? {},
   }
 }
@@ -3381,6 +3382,25 @@ describe('useChatHistory optimistic local rows', () => {
       activitySnapshotIncomplete: false,
       statusHistory: [{ action: 'provider:requesting', activityOrder: 4 }],
       reasoningBlocks: [{ id: 'reasoning-1', text: ' A😀 ', activityOrder: 6 }],
+    })
+
+    const preview = makeHistory(false, {
+      response: {
+        messages: [{
+          ...assistantMessage, reasoningContent: ' A',
+          historyPayloadPreview: { detailsTruncated: true, reasoningUtf16Length: 5, textUtf16Lengths: [8, 13] },
+          toolCalls: assistantMessage.toolCalls.map(segment => segment.type === 'text'
+            ? { ...segment, text: segment.text?.slice(0, 3) } : segment),
+        }],
+        turnOutcomes: [outcome], hasMore: false,
+      },
+    })
+    await preview.api.loadHistory()
+    expect(preview.messages.value[0]).toMatchObject({
+      historyPayloadPreview: { reasoningUtf16Length: 5, textUtf16Lengths: [8, 13] },
+      activitySnapshot: complete.messages.value[0]?.activitySnapshot,
+      activitySnapshotIncomplete: false,
+      reasoningBlocks: [{ id: 'reasoning-1', text: ' A', activityOrder: 6 }],
     })
 
     const corrupted = makeHistory(false, {

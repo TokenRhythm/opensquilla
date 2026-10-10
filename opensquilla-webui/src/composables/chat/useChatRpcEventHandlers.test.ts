@@ -4246,6 +4246,40 @@ describe('useChatRpcEventHandlers durable turn receipts', () => {
 })
 
 describe('recovery buffer consumption ownership', () => {
+  it('keeps a truncated replay summary incomplete through Done until committed history supplies its reader', () => {
+    vi.useFakeTimers()
+    const h = createHarness({ withCompactionRuntime: true, supportsTurnCommitted: true })
+    const payload = { key: h.sessionKey.value, task_id: 'task-preview', turn_id: 'turn-preview' }
+    h.activeStreamTaskId.value = 'task-preview'
+    try {
+      h.api.handlers.onWireEventFixture('session.event.text_delta', {
+        ...payload, stream_seq: 1, text: 'stored 8 KiB summary', text_truncated: true,
+        text_bytes: 8 * 1024 * 1024,
+      }, { replayed: true })
+      expect(h.streamRuntime!.foldedTurn.value.rawText).toBe('stored 8 KiB summary')
+      expect(h.streamRuntime!.streamPreviewComplete.value).toBe(false)
+      h.api.handlers.onWireEventFixture('session.event.text_delta', {
+        ...payload, stream_seq: 2, text: ' + current live text',
+      })
+      h.api.handlers.onWireEventFixture('session.event.done', {
+        ...payload, stream_seq: 3, reason: 'completed', text: 'short summary',
+      })
+      expect(h.messages.value.find(message => message.role === 'assistant')).toMatchObject({
+        text: 'stored 8 KiB summary + current live text', previewComplete: false, contentAvailability: 'preparing',
+      })
+      expect(h.api.awaitingCommitTaskIds.value.has('task-preview')).toBe(true)
+      h.api.handlers.onWireEventFixture('session.event.turn_committed', {
+        ...payload, schema_version: 1, session_key: h.sessionKey.value,
+        stream_seq: 4, status: 'succeeded', terminal_reason: 'completed', finished_at: 123,
+      })
+      expect(h.scheduleHistorySync).toHaveBeenCalledWith(true)
+    } finally {
+      h.streamRuntime!.cleanup()
+      h.stop()
+      vi.useRealTimers()
+    }
+  })
+
   function token(sequence: number) {
     return {
       kind: 'conversation' as const,

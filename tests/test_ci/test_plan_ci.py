@@ -349,10 +349,14 @@ def test_deleted_governed_test_uses_existing_parent_and_keeps_windows_shard(
     assert "deleted_test_targeted" in plan["reason_codes"]
 
 
+@pytest.mark.parametrize("path", [
+    "tests/functional/test_gateway_attachment_history_e2e.py",
+    "tests/test_gateway/test_rpc_approvals.py",
+    "tests/test_gateway/test_rpc_chat_branch_edit.py",
+])
 def test_test_only_change_selects_one_physical_windows_partition(
-    tmp_path: Path, suite_config: dict[str, Any]
+    tmp_path: Path, suite_config: dict[str, Any], path: str,
 ) -> None:
-    path = "tests/functional/test_gateway_attachment_history_e2e.py"
     _write_test_module(tmp_path, path)
 
     plan = plan_changes([path], repo=tmp_path, config=suite_config)
@@ -367,20 +371,42 @@ def test_test_only_change_selects_one_physical_windows_partition(
     }
 
 
-def test_windows_family_request_expands_only_its_two_physical_cells(
-    suite_config: dict[str, Any]
+@pytest.mark.parametrize(("family", "partitions"), [
+    ("gateway-sqlite", 4), ("core", 2), ("recovery-migration", 2),
+    ("desktop-installer-contracts", 2),
+])
+def test_windows_family_request_expands_only_its_physical_cells(
+    suite_config: dict[str, Any], family: str, partitions: int,
 ) -> None:
     python, platforms = MODULE["_execution_matrices"](
-        ["windows-high-risk"], set(), {"gateway-sqlite"}, False, suite_config
+        ["windows-high-risk"], set(), {family}, False, suite_config
     )
 
-    assert python == {
-        "ubuntu": [], "windows": ["gateway-sqlite-1", "gateway-sqlite-2"]
-    }
+    expected = [f"{family}-{partition}" for partition in range(1, partitions + 1)]
+    assert python == {"ubuntu": [], "windows": expected}
     assert platforms == [
         {"suite": "windows-high-risk", "os": "windows-latest", "shard": shard}
-        for shard in ("gateway-sqlite-1", "gateway-sqlite-2")
+        for shard in expected
     ]
+
+
+def test_windows_partition_fallback_matches_execution_selector(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    selector = runpy.run_path(".github/scripts/windows_test_shards.py")
+    paths = [f"tests/test_gateway/test_new_partition_fallback_{index}.py"
+             for index in range(32)]
+    snapshot = tmp_path / "partitions.json"
+    snapshot.write_text(json.dumps({
+        "schema_version": 1,
+        "partitions": {shard: [] for shard in suite_config["full_python_matrix"]["windows"]},
+    }))
+    actual = MODULE["_load_windows_test_partitions"](
+        snapshot, assignments={path: "gateway-sqlite" for path in paths},
+        allowed_shards=set(suite_config["full_python_matrix"]["windows"]),
+    )
+    assert actual == {path: selector["windows_shard_for_test"](path) for path in paths}
+    assert set(actual.values()) == {f"gateway-sqlite-{partition}" for partition in range(1, 5)}
 
 
 @pytest.mark.parametrize("invalid", ["missing-cell", "duplicate-file", "wrong-family"])

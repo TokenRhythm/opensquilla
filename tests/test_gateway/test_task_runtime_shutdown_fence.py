@@ -25,6 +25,9 @@ class _Storage:
         record = self.records.get(task_id)
         if record is None:
             return
+        details_patch = fields.pop("details_patch", None)
+        if details_patch is not None:
+            record.details = {**(record.details or {}), **details_patch}
         for name, value in fields.items():
             setattr(record, name, value)
 

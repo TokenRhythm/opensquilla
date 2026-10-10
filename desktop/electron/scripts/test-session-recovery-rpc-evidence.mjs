@@ -1,8 +1,77 @@
 import assert from 'node:assert/strict'
-import { createSessionRecoveryEvidence } from './session-recovery-rpc-evidence.mjs'
+import { createSessionRecoveryEvidence, createSessionRecoveryFault, sessionRecoveryFaultDomain } from './session-recovery-rpc-evidence.mjs'
 
 const KEY = 'synthetic:recovery'
 const PREFIX = 'sessions.messages.'
+// The packaged client sends these two requests together. Snapshot reads must
+// enter the history fault even though the legacy chat.history RPC is absent.
+const faultRequests = [
+  { type: 'req', id: 'subscribe', method: PREFIX + 'subscribe', params: { key: KEY } },
+  { type: 'req', id: 'read', method: PREFIX + 'snapshot.read',
+    params: { key: KEY, sync_revision: 'target-revision' } },
+]
+assert.deepEqual(faultRequests.map(frame => sessionRecoveryFaultDomain(frame, KEY)), ['live', 'history'])
+assert.equal(sessionRecoveryFaultDomain({ type: 'req', method: 'chat.history',
+  params: { sessionKey: KEY } }, KEY), 'history')
+for (const frame of faultRequests) {
+  assert.equal(sessionRecoveryFaultDomain({ ...frame, params: { key: 'synthetic:peer' } }, KEY), null)
+  assert.equal(sessionRecoveryFaultDomain({ ...frame, type: 'res' }, KEY), null)
+  assert.equal(sessionRecoveryFaultDomain({ ...frame, params: { sessionKey: KEY } }, KEY), null)
+}
+assert.equal(sessionRecoveryFaultDomain({ type: 'req', method: 'chat.history',
+  params: { sessionKey: 'synthetic:peer' } }, KEY), null)
+assert.equal(sessionRecoveryFaultDomain({ type: 'req', method: PREFIX + 'hydrate',
+  params: { key: KEY } }, KEY), null)
+assert.equal(sessionRecoveryFaultDomain(null, KEY), null)
+
+// Replay the current subscribe + snapshot.read exchange. Only the target's
+// successful READ response is held; the Gateway still creates a real proof.
+const fault = createSessionRecoveryFault(KEY)
+const forwarded = []
+const snapshotRequest = faultRequests[1]
+const snapshotResponse = { type: 'res', id: snapshotRequest.id, ok: true,
+  payload: { sync_revision: 'target-revision', snapshot_id: 'original-proof', data: 'PRIVATE-SNAPSHOT' } }
+assert.equal(fault.holdRequest(1, faultRequests[0]), 'live')
+assert.equal(fault.holdRequest(1, snapshotRequest), null)
+assert.equal(fault.holdRequest(1, { type: 'req', id: 'legacy', method: 'chat.history',
+  params: { sessionKey: KEY } }), 'history')
+for (const frame of faultRequests) {
+  assert.equal(fault.holdRequest(1, { ...frame, id: 'peer', params: { key: 'synthetic:peer' } }), null)
+}
+assert.equal(fault.holdResponse(1, { ...snapshotResponse, id: 'peer' }, () => assert.fail('peer held')), false)
+assert.equal(fault.holdResponse(2, snapshotResponse, () => assert.fail('wrong socket held')), false)
+assert.equal(fault.holdResponse(1, { ...snapshotResponse, type: 'event' }, () => assert.fail('event held')), false)
+assert.equal(fault.holdResponse(1, snapshotResponse, () => forwarded.push(snapshotResponse)), true)
+assert.deepEqual(forwarded, [])
+fault.release()
+fault.release()
+assert.deepEqual(forwarded, [snapshotResponse], 'release must forward the unmodified Gateway response exactly once')
+assert.equal(fault.holdResponse(1, snapshotResponse, () => assert.fail('duplicate held')), false)
+
+fault.holdRequest(1, snapshotRequest)
+assert.equal(fault.holdResponse(1, { ...snapshotResponse, ok: false, error: { code: 'BUSY' } },
+  () => assert.fail('error held')), false, 'Gateway errors must remain transparent')
+fault.holdRequest(1, snapshotRequest)
+fault.holdRequest(2, snapshotRequest)
+assert.equal(fault.holdResponse(1, snapshotResponse, () => assert.fail('closed response released')), true)
+assert.equal(fault.holdResponse(2, snapshotResponse, () => forwarded.push('other-socket')), true)
+fault.holdRequest(1, { ...snapshotRequest, id: 'pending-on-close' })
+fault.close(1)
+assert.equal(fault.holdResponse(1, { ...snapshotResponse, id: 'pending-on-close' },
+  () => assert.fail('closed pending response held')), false)
+fault.release()
+assert.deepEqual(forwarded, [snapshotResponse, 'other-socket'])
+fault.holdRequest(1, snapshotRequest)
+fault.release()
+assert.equal(fault.holdResponse(1, snapshotResponse, () => assert.fail('post-release response held')), false)
+
+const heldEvidence = createSessionRecoveryEvidence(KEY)
+heldEvidence.request(1, snapshotRequest, false)
+heldEvidence.response(1, snapshotResponse, true)
+assert.deepEqual(heldEvidence.snapshot().events.map(item => [item.direction, item.held]),
+  [['request', false], ['response', true]], 'evidence must distinguish forwarded requests from held responses')
+assert.doesNotMatch(JSON.stringify(heldEvidence.snapshot()), /PRIVATE-SNAPSHOT|data/)
+
 function trace({ hydrate = true, release = true, revision = 'replacement', unsubscribe = false } = {}) {
   let clock = 0
   let request = 0

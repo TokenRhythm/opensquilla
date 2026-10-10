@@ -490,7 +490,9 @@ class SessionStreamRegistry:
             # maintenance snapshot. Clients also fence broadcast frames by epoch.
             return enriched
 
-        event = BufferedSessionEvent(event_name=event_name, payload=enriched, stream_seq=stream_seq)
+        event = BufferedSessionEvent(
+            event_name=event_name, payload=enriched, stream_seq=stream_seq,
+        )
         events = self._events_by_session.setdefault(session_key, deque())
         events.append(event)
         if self._is_generation_reset(event_name):

@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterable
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 _TOKEN_PATTERN = re.compile(
     r"\Aosq_(?P<public_id>[a-z0-9-]{4,64})_(?P<secret>[A-Za-z0-9_-]{16,256})\Z"
@@ -34,6 +35,7 @@ class TokenRecord:
     capabilities: frozenset[str]
     source_kind: str
     created_at: int
+    authorization_revision: int = 1
     last_used_at: int | None = field(default=None, compare=False)
     last_peer: str | None = field(default=None, compare=False)
     revoked_at: int | None = None
@@ -43,6 +45,44 @@ class TokenRecord:
 class IssuedToken:
     token: str
     record: TokenRecord
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationDecision:
+    """Current token authority with an explicit storage outcome.
+
+    A missing/revoked token and an unavailable sessions database must not be
+    represented by the same ``None`` value.  The distinction lets callers
+    fail closed without turning transient storage faults into revocations.
+    """
+
+    status: Literal["allow", "deny", "unavailable"]
+    roles: frozenset[str] = frozenset()
+    scopes: frozenset[str] = frozenset()
+    capabilities: frozenset[str] = frozenset()
+    authorization_revision: int | None = None
+    permission_fingerprint: str | None = None
+
+    @classmethod
+    def allow(
+        cls,
+        roles: frozenset[str],
+        scopes: frozenset[str],
+        capabilities: frozenset[str],
+        authorization_revision: int | None = None,
+        permission_fingerprint: str | None = None,
+    ) -> AuthorizationDecision:
+        return cls(
+            "allow", roles, scopes, capabilities, authorization_revision, permission_fingerprint
+        )
+
+    @classmethod
+    def deny(cls) -> AuthorizationDecision:
+        return cls("deny")
+
+    @classmethod
+    def unavailable(cls) -> AuthorizationDecision:
+        return cls("unavailable")
 
 
 def token_public_id(token: object) -> str:
@@ -66,6 +106,25 @@ def _decode_set(raw: object) -> frozenset[str]:
     if not isinstance(values, list):
         return frozenset()
     return frozenset(str(value) for value in values)
+
+
+def permission_fingerprint(
+    roles: Iterable[str],
+    scopes: Iterable[str],
+    capabilities: Iterable[str],
+) -> str:
+    """Return a stable, secret-free digest of the effective grant."""
+
+    payload = json.dumps(
+        {
+            "roles": sorted({str(value) for value in roles}),
+            "scopes": sorted({str(value) for value in scopes}),
+            "capabilities": sorted({str(value) for value in capabilities}),
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 class TokenStore:
@@ -95,6 +154,7 @@ class TokenStore:
                     capabilities_json TEXT NOT NULL,
                     source_kind TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
+                    authorization_revision INTEGER NOT NULL DEFAULT 1,
                     last_used_at INTEGER,
                     last_peer TEXT,
                     revoked_at INTEGER
@@ -105,6 +165,15 @@ class TokenStore:
                 "CREATE INDEX IF NOT EXISTS idx_sandbox_tokens_active "
                 "ON sandbox_tokens(revoked_at, created_at)"
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(sandbox_tokens)")
+            }
+            if "authorization_revision" not in columns:
+                connection.execute(
+                    "ALTER TABLE sandbox_tokens ADD COLUMN "
+                    "authorization_revision INTEGER NOT NULL DEFAULT 1"
+                )
 
     def create(
         self,
@@ -139,8 +208,8 @@ class TokenStore:
                 INSERT INTO sandbox_tokens (
                     public_id, token_version, name, secret_digest, roles_json,
                     scopes_json, capabilities_json, source_kind, created_at,
-                    last_used_at, last_peer, revoked_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                    authorization_revision, last_used_at, last_peer, revoked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, NULL, NULL)
                 """,
                 (
                     record.public_id,
@@ -188,7 +257,8 @@ class TokenStore:
     def revoke(self, public_id: str) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE sandbox_tokens SET revoked_at = ? "
+                "UPDATE sandbox_tokens SET revoked_at = ?, "
+                "authorization_revision = authorization_revision + 1 "
                 "WHERE public_id = ? AND revoked_at IS NULL",
                 (int(time.time()), str(public_id)),
             )
@@ -200,7 +270,8 @@ class TokenStore:
         """Read current roles, scopes and capabilities without loading secrets."""
         with closing(self._connect()) as connection:
             row = connection.execute(
-                "SELECT roles_json, scopes_json, capabilities_json FROM sandbox_tokens "
+                "SELECT roles_json, scopes_json, capabilities_json, "
+                "authorization_revision FROM sandbox_tokens "
                 "WHERE public_id = ? AND revoked_at IS NULL",
                 (public_id,),
             ).fetchone()
@@ -211,6 +282,58 @@ class TokenStore:
             _decode_set(row["scopes_json"]),
             _decode_set(row["capabilities_json"]),
         )
+
+    def get_active_authorization_decision(
+        self, public_id: str,
+    ) -> AuthorizationDecision:
+        """Read current authority without conflating deny and unavailable.
+
+        This synchronous primitive is intentionally small and is also used by
+        the async wrapper below.  Callers handling a live Gateway request
+        should prefer :meth:`get_active_authorization_decision_async` so the
+        SQLite open/read stays off the event loop.
+        """
+
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT roles_json, scopes_json, capabilities_json, "
+                    "authorization_revision "
+                    "FROM sandbox_tokens WHERE public_id = ? "
+                    "AND revoked_at IS NULL",
+                    (str(public_id),),
+                ).fetchone()
+        except (OSError, sqlite3.Error):
+            return AuthorizationDecision.unavailable()
+        if row is None:
+            return AuthorizationDecision.deny()
+        roles = _decode_set(row["roles_json"])
+        scopes = _decode_set(row["scopes_json"])
+        capabilities = _decode_set(row["capabilities_json"])
+        return AuthorizationDecision.allow(
+            roles,
+            scopes,
+            capabilities,
+            int(row["authorization_revision"]),
+            permission_fingerprint(roles, scopes, capabilities),
+        )
+
+    async def get_active_authorization_decision_async(
+        self, public_id: str,
+    ) -> AuthorizationDecision:
+        """Read current authority on a worker thread, never on the Gateway loop."""
+
+        return await asyncio.to_thread(
+            self.get_active_authorization_decision,
+            public_id,
+        )
+
+    async def verify_async(
+        self, token: object, *, peer_ip: str | None = None,
+    ) -> TokenRecord | None:
+        """Verify a token without performing SQLite I/O on the event loop."""
+
+        return await asyncio.to_thread(self.verify, token, peer_ip=peer_ip)
 
     def list_active(self) -> tuple[TokenRecord, ...]:
         """List active token metadata without ever loading or returning secrets."""
@@ -234,6 +357,7 @@ class TokenStore:
             capabilities=_decode_set(row["capabilities_json"]),
             source_kind=str(row["source_kind"]),
             created_at=int(row["created_at"]),
+            authorization_revision=int(row["authorization_revision"]),
             last_used_at=(
                 int(row["last_used_at"]) if row["last_used_at"] is not None else None
             ),
@@ -297,10 +421,12 @@ def default_auth_failure_limiter() -> AuthFailureLimiter:
 
 
 __all__ = [
+    "AuthorizationDecision",
     "AuthFailureLimiter",
     "IssuedToken",
     "TokenRecord",
     "TokenStore",
     "default_auth_failure_limiter",
+    "permission_fingerprint",
     "token_public_id",
 ]

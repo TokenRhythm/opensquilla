@@ -9,6 +9,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
+import { crashAndReloadRenderer, hardKillAndReloadRenderer } from './packaged-renderer-fault.mjs'
 
 const MODEL = 'opensquilla-gateway-reliability'
 const ANSWER = 'Synthetic gateway reliability response.'
@@ -33,14 +34,24 @@ export function historyTurn(index) {
   return { message: `Synthetic retained history request ${index + 1}.`,
     answer: syntheticText(marker, HISTORY_ANSWER_BYTES) }
 }
-const FLOW_CAPS = ['transport.flow.v1', 'transport.recovery.v1']
+// The bundled desktop client must negotiate the same lane-ACK capability that
+// the Gateway exposes. Keeping this assertion in the packaged observer catches
+// stale dist/app.asar artifacts that would otherwise silently use v1.
+const FLOW_CAPS = ['transport.flow.v1', 'transport.recovery.v1', 'transport.session-flow.v2']
+const FLOW_V2_METHOD = 'transport.sessionFlow.update.v2'
+const READ_V2_METHODS = ['sessions.read.open.v2', 'sessions.read.state.v2',
+  'sessions.read.install.v2', 'sessions.read.close.v2', 'sessions.history.page.v2']
+const HISTORY_METHODS = ['chat.history', 'sessions.history.page.v2']
+const READ_FAILURE_CODES = new Set(['NOT_FOUND', 'SESSION_NOT_FOUND', 'SNAPSHOT_STALE',
+  'STORAGE_BUSY', 'TIMEOUT', 'RECOVERY_GAP', 'LEASE_STALE'])
 const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url))
 export const ORDINARY_PROFILE_ROOT = join(REPO_ROOT, '.cache', 'perf-ordinary-profile')
 export const ORDINARY_RUNS_ROOT = join(REPO_ROOT, '.cache', 'perf-ordinary-runs')
 const ORDINARY_PROFILE_MARKER = 'opensquilla-synthetic-ordinary-performance-v1'
 const METHODS = new Set(['connect', 'chat.send', 'chat.history', 'sessions.list',
   'sessions.subscribe', 'sessions.unsubscribe',
-  'sessions.messages.snapshot.read', 'sessions.messages.snapshot.release',
+  'sessions.messages.subscribe', 'sessions.messages.unsubscribe', ...READ_V2_METHODS,
+  'sessions.messages.snapshot.read', 'sessions.messages.snapshot.release', FLOW_V2_METHOD,
   'sessions.messages.resume', 'transport.flow.update', 'transport.probe',
   'onboarding.configure', 'onboarding.provider.configure'])
 const SAFE_FAILURE_REASONS = new Set([
@@ -101,8 +112,8 @@ export function parseArguments(args) {
     }
   }
   for (const key of ['--executable', '--workdir', '--output', '--scenario']) assert.ok(options[key], `Missing ${key}`)
-  assert.ok(['restart', 'late-ready', 'configuration', 'fresh-onboarding', 'history-streaming-restart'].includes(options['--scenario']),
-    'Supported scenarios: restart, late-ready, configuration, fresh-onboarding, history-streaming-restart. Nothing was launched.')
+  assert.ok(['restart', 'late-ready', 'configuration', 'fresh-onboarding', 'history-streaming-restart', 'renderer-crash-reload', 'renderer-hard-kill'].includes(options['--scenario']),
+    'Supported scenarios: restart, late-ready, configuration, fresh-onboarding, history-streaming-restart, renderer-crash-reload, renderer-hard-kill. Nothing was launched.')
   const result = { executable: resolve(options['--executable']), workdir: resolve(options['--workdir']),
     output: resolve(options['--output']), scenario: options['--scenario'], disableGpu: Boolean(options['--disable-gpu']),
     startupTiming: Boolean(options['--startup-timing']) }
@@ -266,6 +277,8 @@ export function syntheticConfig(profile, providerUrl, sseUrl, { longHistory = fa
     assert.equal(url.protocol, 'http:'); assert.equal(url.hostname, '127.0.0.1')
     assert.ok(url.port && !url.username && !url.password && !url.search && !url.hash)
   }
+  const lateReadyTimeoutSeconds = Number.parseInt(process.env.OPENSQUILLA_LATE_READY_TIMEOUT_SECONDS || '135', 10)
+  assert.ok(Number.isInteger(lateReadyTimeoutSeconds) && lateReadyTimeoutSeconds > 0 && lateReadyTimeoutSeconds <= 135)
   return ['config_version = 1', `state_dir = ${JSON.stringify(join(profile, 'state'))}`,
     `workspace_dir = ${JSON.stringify(join(profile, 'workspace'))}`,
     '[llm]', 'provider = "ollama"', `model = ${JSON.stringify(MODEL)}`,
@@ -273,9 +286,16 @@ export function syntheticConfig(profile, providerUrl, sseUrl, { longHistory = fa
     ...(longHistory ? ['max_tokens = 262144'] : []),
     '[squilla_router]', 'enabled = false', '[llm_ensemble]', 'enabled = false',
     '[naming]', 'enabled = false', '[privacy]', 'disable_network_observability = true',
-    ...(sseUrl ? ['[mcp]', 'enabled = true', 'connect_timeout_seconds = 135',
+    ...(sseUrl ? ['[mcp]', 'enabled = true', `connect_timeout_seconds = ${lateReadyTimeoutSeconds}`,
       '[[mcp.servers]]', 'name = "synthetic-late-ready"', 'transport = "sse"',
       `url = ${JSON.stringify(sseUrl)}`, 'tool_timeout_seconds = 180'] : []), ''].join('\n')
+}
+
+export function historyRereadReady(sockets, probe, currentSessionKey, userTexts, assistantTexts) {
+  return sockets.reduce((sum, socket) => sum + (socket.targetHistoryCompleted || 0), 0) > probe.historyReadsBefore
+    && currentSessionKey === probe.key
+    && userTexts.some(text => text.includes(MESSAGE))
+    && assistantTexts.some(text => text.includes(ANSWER))
 }
 
 function syntheticHistoryIds(messages, includeStreaming) {
@@ -288,8 +308,19 @@ function syntheticHistoryIds(messages, includeStreaming) {
     || messages.length > (HISTORY_TURNS + 1) * 2) return null
   const ids = new Map()
   for (const [index, [role, content]] of expected.entries()) {
+    // Bounded v4 history deliberately carries only a preview for large
+    // assistant rows.  Match the stable marker and require the ContentRef to
+    // advertise the original byte length; a full-body string on this wire
+    // would defeat the memory contract this probe is meant to verify.
+    const marker = role === 'assistant' && index < HISTORY_TURNS * 2
+      ? `Synthetic retained history answer ${Math.floor(index / 2) + 1}.`
+      : content
     const matches = messages.filter(message => message?.role === role
-      && typeof message.text === 'string' && message.text.includes(content))
+      && typeof message.text === 'string' && message.text.includes(marker)
+      && (role !== 'assistant' || !(index < HISTORY_TURNS * 2)
+        || message.text.includes(content)
+        || (Number.isSafeInteger(message.contentRef?.byteLength)
+          && message.contentRef.byteLength >= Buffer.byteLength(content))))
     if (matches.length !== 1) return null
     const id = matches[0].message_id ?? matches[0].id
     if (typeof id !== 'string' || !id.trim() || [...ids.values()].includes(id)) return null
@@ -307,10 +338,11 @@ export function observeFrame(summary, direction, payload, expectedStateDir, read
     if (METHODS.has(frame.method)) summary.methods[frame.method] = (summary.methods[frame.method] || 0) + 1
     if (frame.method === 'connect') summary.requestedCaps = FLOW_CAPS.filter(cap => Array.isArray(frame.params?.caps) && frame.params.caps.includes(cap))
     if (['onboarding.provider.configure', 'sessions.list', 'sessions.subscribe', 'sessions.unsubscribe',
+      'sessions.messages.subscribe', 'sessions.messages.unsubscribe', ...READ_V2_METHODS,
       'sessions.messages.snapshot.read', 'sessions.messages.resume', 'chat.history'].includes(frame.method) && typeof frame.id === 'string') {
       if (!Object.hasOwn(summary, '_requests')) Object.defineProperty(summary, '_requests', { value: new Map() })
       const targetRead = Boolean(readProbe.armed && readProbe.key
-        && ['sessions.messages.snapshot.read', 'chat.history'].includes(frame.method)
+        && ['sessions.messages.snapshot.read', ...HISTORY_METHODS].includes(frame.method)
         && (frame.params?.key ?? frame.params?.sessionKey) === readProbe.key)
       const targetResume = Boolean(readProbe.armed && readProbe.key && frame.method === 'sessions.messages.resume'
         && frame.params?.key === readProbe.key)
@@ -328,6 +360,12 @@ export function observeFrame(summary, direction, payload, expectedStateDir, read
     summary.responses ??= {}
     summary.responses[request.method] ??= { ok: 0, failed: 0 }
     summary.responses[request.method][ok ? 'ok' : 'failed'] += 1
+    if (!ok) {
+      const code = READ_FAILURE_CODES.has(frame.error?.code) ? frame.error.code : 'OTHER'
+      summary.responseErrors ??= {}
+      summary.responseErrors[request.method] ??= {}
+      summary.responseErrors[request.method][code] = (summary.responseErrors[request.method][code] || 0) + 1
+    }
     if (request.method === 'onboarding.provider.configure') {
       const key = ok ? 'configurationSucceeded' : 'configurationFailed'
       summary[key] = (summary[key] || 0) + 1
@@ -336,7 +374,7 @@ export function observeFrame(summary, direction, payload, expectedStateDir, read
       const rows = frame.payload?.sessions ?? frame.payload?.keys
       summary.lastListRows = Array.isArray(rows) ? rows.length : null
     }
-    if (currentProbe && request.targetRead && ok && (request.method === 'chat.history'
+    if (currentProbe && request.targetRead && ok && (HISTORY_METHODS.includes(request.method)
       || (Number.isInteger(frame.payload?.segment_count) && frame.payload.segment_count > 0
         && frame.payload.segment_index === frame.payload.segment_count - 1))) {
       summary.targetReadCompleted = (summary.targetReadCompleted || 0) + 1
@@ -344,13 +382,17 @@ export function observeFrame(summary, direction, payload, expectedStateDir, read
         summary.targetMultiSegmentCompleted = (summary.targetMultiSegmentCompleted || 0) + 1
       }
     }
-    if (currentProbe && request.targetRead && ok && request.method === 'chat.history') {
+    if (currentProbe && request.targetRead && ok && HISTORY_METHODS.includes(request.method)) {
+      const messages = request.method === 'sessions.history.page.v2'
+        ? (Array.isArray(frame.payload?.items)
+          ? frame.payload.items.map(item => ({ ...item.message, message_id: item.message_id })) : null)
+        : frame.payload?.messages
       summary.targetHistoryCompleted = (summary.targetHistoryCompleted || 0) + 1
       summary.targetHistoryMaxWireBytes = Math.max(summary.targetHistoryMaxWireBytes || 0, Buffer.byteLength(payload))
       summary.targetHistoryMaxMessages = Math.max(summary.targetHistoryMaxMessages || 0,
-        Array.isArray(frame.payload?.messages) ? frame.payload.messages.length : 0)
+        Array.isArray(messages) ? messages.length : 0)
       if (readProbe.historyPhase === 'capture' || readProbe.historyPhase === 'verify') {
-        const ids = syntheticHistoryIds(frame.payload?.messages, readProbe.historyPhase === 'verify')
+        const ids = syntheticHistoryIds(messages, readProbe.historyPhase === 'verify')
         if (ids) {
           // IDs stay in the private probe; reports contain only counts and booleans.
           if (readProbe.historyPhase === 'capture' && !readProbe.historyIds) readProbe.historyIds = ids
@@ -385,6 +427,8 @@ export function observeFrame(summary, direction, payload, expectedStateDir, read
     flow: Boolean(flow && typeof flow.delivery_epoch === 'string' && flow.window_frames > 0 && flow.window_bytes > 0),
     recoveryMethods: ['sessions.messages.resume', 'sessions.messages.snapshot.release']
       .every(method => hello.features?.methods?.includes(method)),
+    v2Method: hello.features?.methods?.includes(FLOW_V2_METHOD) === true,
+    sessionReadV2Methods: READ_V2_METHODS.every(method => hello.features?.methods?.includes(method)),
     stateDirMatches: typeof hello.snapshot?.state_dir === 'string'
       && resolve(hello.snapshot.state_dir).toLowerCase() === resolve(expectedStateDir).toLowerCase(),
     probeNonce: hello.policy?.transport_probe_nonce === true,
@@ -624,6 +668,13 @@ async function run(options) {
     return { url: `http://127.0.0.1:${server.address().port}`,
       close: () => shutdown.closeHttpServerWithDeadline(server, sockets, { label, timeoutMs: 5_000 }) }
   }
+  async function readinessAtPort(port, path) {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      signal: AbortSignal.timeout(5_000),
+    })
+    const payload = await response.json().catch(() => null)
+    return { status: response.status, payload }
+  }
   async function ready(connectedPhase, replacement) {
     await until(async () => {
       const value = await descriptor()
@@ -641,6 +692,7 @@ async function run(options) {
     assert.ok(record && records.has(ownerKey(record)), 'Ready requires an observed owner')
     assert.ok(await ownership.verifyDesktopGatewayOwnership(record), 'Ready listener identity verification')
     assert.ok(report.sockets.some(socket => !socket.closed && socket.hello?.flow && socket.hello.recoveryMethods
+      && socket.hello.v2Method
       && socket.hello.stateDirMatches && FLOW_CAPS.every(cap => socket.requestedCaps.includes(cap))),
     'The actual renderer must negotiate flow/recovery with this profile; a missed Hello is not a pass')
     return record
@@ -804,7 +856,10 @@ async function run(options) {
       }, 'native onboarding window', 165_000)
       assert.ok(wizard !== page && wizard.url().startsWith('data:text/html'), 'Fresh onboarding must be an actual trusted setup window')
       report.onboardingEntry = { trustedDataDocument: true, separateWindow: true, automaticFreshProfile: true }
-      const before = await ready()
+      // A fresh unconfigured profile intentionally has no Gateway owner yet.
+      // Capture that pre-save state without waiting for aggregate readiness;
+      // the real onboarding save is what creates the first configured owner.
+      const before = currentOwner()
       const sentinel = randomUUID()
       await bounded(page.evaluate(value => { window.__gatewayReliabilityDocument = value }, sentinel), 5_000)
       await wizard.locator('#providerSelectToggle').click()
@@ -824,29 +879,81 @@ async function run(options) {
       assert.equal(onboardingSaveEvidence(await desktopLogText()).successfulSaves, 1,
         'Fresh onboarding must finish a real persisted save')
       const after = await ready()
-      const replaced = !ownership.sameDesktopGatewayOwnershipInstance(before, after)
-      assert.equal(records.size, replaced ? 2 : 1, 'Gateway child count must reflect the actual save outcome')
+      const replaced = Boolean(before && !ownership.sameDesktopGatewayOwnershipInstance(before, after))
+      assert.equal(records.size, 1, 'Fresh onboarding must create exactly one configured Gateway child')
       if (replaced) assert.equal(shutdown.gatewayProcessSnapshot(before).alive, false, 'Old Gateway must actually exit')
       assert.equal(await bounded(page.evaluate(() => window.__gatewayReliabilityDocument), 5_000), sentinel,
         'Onboarding save must preserve the original renderer document')
-      report.onboardingSave = { settingsPersisted: true, successfulSaves: 1, childReplaced: replaced,
+      report.onboardingSave = { settingsPersisted: true, successfulSaves: 1, childStarted: !before,
+        childReplaced: replaced,
         ownerCount: records.size, originalDocumentPreserved: true }
       report.originalDocumentPreserved = true
       mark('native-onboarding-recovered')
     } else if (options.scenario === 'late-ready') {
-      mark('waiting-for-foreground-timeout')
-      await until(() => report.descriptorTransitions.some(value => value.status === 'error' && value.readinessTimeout), 'foreground readiness timeout', 165_000)
-      assert.ok(report.descriptorTransitions.find(value => value.status === 'error' && value.readinessTimeout).ms
-        - report.phases.find(value => value.phase === 'launch').ms >= 120_000, 'The real foreground budget must expire')
+      // S1 deliberately separates the durable core from optional MCP startup:
+      // Electron must become usable from /readyz/core while the historical
+      // aggregate /readyz remains pending until the 135s MCP budget settles.
+      const coreProbeStarted = performance.now()
+      const coreOwner = await ready('core-ready-before-legacy')
+      const core = await readinessAtPort(coreOwner.port, '/readyz/core')
+      const legacyPending = await readinessAtPort(coreOwner.port, '/readyz')
+      const coreProbeElapsedMs = Math.round(performance.now() - coreProbeStarted)
+      const optionalServices = core.payload?.services && typeof core.payload.services === 'object'
+        ? core.payload.services : {}
+      const optionalStates = Object.fromEntries(Object.entries(optionalServices)
+        .map(([name, descriptor]) => [name, descriptor && typeof descriptor === 'object'
+          ? descriptor.status : null]))
+      report.readinessProbe = {
+        coreStatus: core.status,
+        coreReady: core.payload?.ready === true,
+        coreProbeElapsedMs,
+        coreServices: optionalServices,
+        optionalStates,
+        legacyPendingStatus: legacyPending.status,
+        legacyPending: legacyPending.payload?.ready === false,
+      }
+      assert.equal(core.status, 200, 'Core readiness must be published before MCP settles')
+      assert.equal(core.payload?.ready, true, 'Core readiness payload must be true')
+      assert.equal(legacyPending.status, 503, 'Legacy readiness must retain aggregate semantics')
+      assert.equal(legacyPending.payload?.ready, false, 'Legacy readiness must remain pending')
+      assert.ok(Object.values(optionalStates).some(status => status === 'starting' || status === 'degraded'),
+        'Delayed optional integration must be observable as starting or degraded at core readiness')
+      report.coreReadyBeforeLegacy = true
+      // Deferred warmups start after core publication and are intentionally
+      // scheduled independently.  Wait for the synthetic MCP connection to
+      // be observed before sampling its in-flight state; otherwise a slow
+      // Windows scheduler can make this probe report a fixture race.
+      await until(() => sseRequests === 1, 'delayed MCP fixture request', 20_000)
+      const coreWhileMcpPending = await readinessAtPort(coreOwner.port, '/readyz/core')
+      report.readinessProbe.coreWhileMcpPendingStatus = coreWhileMcpPending.status
+      report.readinessProbe.coreWhileMcpPending = coreWhileMcpPending.payload?.ready === true
+      report.readinessProbe.coreWhileMcpServices = coreWhileMcpPending.payload?.services || {}
+      assert.equal(coreWhileMcpPending.status, 200, 'Core readiness must remain available while MCP is pending')
+      assert.equal(coreWhileMcpPending.payload?.ready, true, 'Core readiness must remain true while MCP is pending')
       assert.equal(sseRequests, 1, 'Delayed MCP fixture was actually reached exactly once')
       assert.equal(records.size, 1, 'The pre-readiness child must be identified')
-      const ownerAtError = [...records.values()][0]
-      report.foregroundTimeoutObserved = true
-      const recovered = await ready()
-      assert.ok(ownership.sameDesktopGatewayOwnershipInstance(ownerAtError, recovered), 'Late recovery must use the original child')
-      assert.equal(records.size, 1, 'Late recovery must not spawn a replacement')
+      const ownerAtCoreReady = [...records.values()][0]
+      // Avoid turning the intentionally pending SSE into a high-rate
+      // control-plane polling test. Sample once shortly before the configured
+      // deadline, then once after a bounded drain margin.
+      const lateReadyTimeoutSeconds = Number.parseInt(process.env.OPENSQUILLA_LATE_READY_TIMEOUT_SECONDS || '135', 10)
+      await delay(Math.max(0, lateReadyTimeoutSeconds - 15) * 1_000)
+      const legacyAfterWait = await readinessAtPort(ownerAtCoreReady.port, '/readyz')
+      report.readinessProbe.legacyAfterWaitStatus = legacyAfterWait.status
+      report.readinessProbe.legacyAfterWait = legacyAfterWait.payload?.ready === true
+      await delay(20_000)
+      const legacyTerminal = await readinessAtPort(ownerAtCoreReady.port, '/readyz')
+      report.readinessProbe.legacyTerminalStatus = legacyTerminal.status
+      report.readinessProbe.legacyTerminal = legacyTerminal.payload?.ready === true
+      assert.equal(legacyTerminal.status, 200, 'Legacy readiness must converge after optional drain')
+      const recovered = currentOwner()
+      assert.ok(recovered && ownership.sameDesktopGatewayOwnershipInstance(ownerAtCoreReady, recovered), 'Late optional recovery must use the original child')
+      assert.equal(records.size, 1, 'Optional recovery must not spawn a replacement')
       assert.equal(sseClosed, 1, 'Timed-out MCP connection must converge before ready')
+      report.legacyReadyAfterOptionalDrain = true
       mark('late-ready-recovered')
+    } else if (options.scenario === 'renderer-crash-reload' || options.scenario === 'renderer-hard-kill') {
+      await ready('initial-ui-connected')
     } else if (options.scenario === 'restart') {
       const before = await ready('initial-ui-connected')
       if (options.repeatProfile) {
@@ -989,6 +1096,62 @@ async function run(options) {
     assert.ok(sessionKey, 'The submitted session must materialize')
     readProbe.key = sessionKey
     readProbe.revision++
+    if (options.scenario === 'renderer-crash-reload' || options.scenario === 'renderer-hard-kill') {
+      const before = currentOwner()
+      const socketsBefore = report.sockets.length
+      const readsBeforeCrash = report.sockets.reduce((sum, socket) => sum + (socket.targetReadCompleted || 0), 0)
+      readProbe.armed = true
+      readProbe.revision++
+      mark('renderer-crash-injection')
+      const routeBeforeCrash = page.url()
+      // Both crash injection and Windows taskkill invalidate renderer CDP.
+      // Drain the observer before either fault so an unrelated monitor
+      // command cannot race teardown and abort the recovery assertions.
+      stopped = true
+      if (monitor) await monitor
+      const recoverRenderer = options.scenario === 'renderer-hard-kill' ? hardKillAndReloadRenderer : crashAndReloadRenderer
+      const rendererRecovery = await recoverRenderer(app, page, async () => {
+        let recovery
+        await until(async () => {
+          const records = structuredLogRecords(await desktopLogText())
+          const ready = records.find(item => item.event === 'renderer_recovery_ready')
+          const gone = records.find(item => item.event === 'renderer_process_gone'
+            && item.reason === (options.scenario === 'renderer-hard-kill' ? 'killed' : item.reason))
+          const interactive = records.filter(item => item.event === 'renderer_interactive'
+            && item.at && ready?.generation !== undefined).at(-1)
+          if (!ready || !interactive) return false
+          const recoveredSessionKey = new URL(interactive.url).searchParams.get('session')
+          const sameRoute = typeof interactive.url === 'string'
+            && interactive.url.startsWith('opensquilla-app://desktop/chat')
+            && Boolean(recoveredSessionKey)
+            && (!sessionKey || sessionKey === recoveredSessionKey)
+          recovery = { generation: ready.generation, processGoneReason: gone?.reason || null,
+            newRendererPid: ready.rendererPid, sameWindow: true, sameRoute, documentRebuilt: true,
+            routeBeforeCrash, recoveredRoute: interactive.url, sessionKey: sessionKey || null,
+            recoveredSessionKey: recoveredSessionKey || null }
+          return true
+        }, 'renderer recovery log', 45_000)
+        return recovery
+      })
+      report.rendererFault = rendererRecovery.evidence
+      mark('renderer-reload-connected')
+      const after = currentOwner()
+      assert.ok(after, 'Renderer recovery must retain a live Gateway owner')
+      assert.ok(ownership.sameDesktopGatewayOwnershipInstance(before, after), 'Renderer crash must preserve the Gateway owner')
+      assert.equal(records.size, 1, 'Renderer crash must not spawn duplicate Gateway owners')
+      await until(() => report.sockets.slice(socketsBefore).some(socket => !socket.closed && socket.hello?.stateDirMatches)
+        || report.sockets.length === socketsBefore,
+      'renderer authority recovery', 45_000)
+      assert.equal(chats, 1, 'Renderer recovery must not replay an accepted turn')
+      assert.equal(report.sockets.reduce((sum, socket) => sum + (socket.methods['chat.send'] || 0), 0), 1,
+        'Renderer recovery must not resend chat.send')
+      Object.assign(report.rendererFault, { ownerPreserved: true, authorityReadAfterReload: true,
+        singleSendPreserved: true, gatewayOwnerCount: records.size })
+      readProbe.armed = false
+      readProbe.revision++
+      mark('renderer-authority-recovered')
+    }
+    if (options.scenario !== 'renderer-crash-reload' && options.scenario !== 'renderer-hard-kill') {
     report.sidebarBeforeLeave = await bounded(page.evaluate(inspectSyntheticSidebar, sessionKey), 5_000)
     mark('history-session-captured')
     await enterSettledDraft()
@@ -1002,12 +1165,14 @@ async function run(options) {
     readProbe.armed = true
     readProbe.revision++
     readProbe.readsBefore = readsBefore
+    readProbe.historyReadsBefore = report.sockets.reduce((sum, socket) => sum + (socket.targetHistoryCompleted || 0), 0)
     readProbe.requestsBefore = report.sockets.reduce((sum, socket) => sum + (socket.targetReadRequests || 0), 0)
     mark('history-reread-click')
     await row.locator('.sidebar-history-item').click()
-    await until(async () => report.sockets.reduce((sum, socket) => sum + (socket.targetReadCompleted || 0), 0) > readsBefore
-      && new URL(page.url()).searchParams.get('session') === sessionKey
-      && (await page.locator('.msg-ai-text').allTextContents()).some(text => text.includes(ANSWER)), 'history re-read and visible answer', 45_000)
+    await until(async () => historyRereadReady(report.sockets, readProbe,
+      new URL(page.url()).searchParams.get('session'),
+      await page.locator('.msg-user-bubble').allTextContents(),
+      await page.locator('.msg-ai-text').allTextContents()), 'history re-read and visible answer', 45_000)
     mark('history-reread-complete')
     await verifySingleRenderedTurn()
     assert.equal(chats, expectedChats, 'Reopening history must not replay the turn')
@@ -1022,11 +1187,15 @@ async function run(options) {
     }
     checkpoint = await desktopLogText()
     mark('verified-before-cleanup')
+    }
   } catch (error) {
     failure = true
     // Assertion text is controlled by this script. Do not serialize arbitrary
     // Playwright errors (they can include URLs, tokens, inputs and DOM text).
     report.failure = { phase, kind: error?.name === 'AssertionError' ? 'assertion' : 'operation-failed', reason: safeFailureReason(error) }
+    if (process.env.OPENSQUILLA_DEBUG_NATIVE === '1') {
+      report.failure.debug = error?.message || String(error)
+    }
     if (page && readProbe.key) {
       report.sidebarAtFailure = await bounded(page.evaluate(inspectSyntheticSidebar, readProbe.key), 5_000).catch(() => ({ unavailable: true }))
       report.historyAtFailure = {

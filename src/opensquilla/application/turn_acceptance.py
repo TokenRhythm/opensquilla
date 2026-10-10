@@ -20,6 +20,7 @@ import structlog
 from opensquilla.application.admission_errors import (
     AdmissionError,
     AdmissionQueueFullError,
+    AdmissionResourceBusyError,
     AdmissionShuttingDownError,
     AdmissionUnavailableError,
 )
@@ -89,6 +90,7 @@ class DurableTurnAdmission:
             if command.receipt_replay_only:
                 return await _replay_retired_request(command, ports)
             try:
+                _ensure_required_services(command, ports)
                 if command.initial_model is not None or command.initial_provider is not None:
                     if command.intent != "new_chat" or not command.intent_was_provided:
                         raise ValueError("initialModel requires explicit new_chat intent")
@@ -164,6 +166,59 @@ class DurableTurnAdmission:
                 if command.surface == "webchat":
                     ports.clear_compaction_marker(command.session_key)
                 raise
+
+
+def _ensure_required_services(command: AdmitTurn, ports: AdmissionPrimitives) -> None:
+    """Reject dependent turns before durable acceptance while owners warm up."""
+    required = tuple(getattr(command, "required_services", ()) or ())
+    if not required:
+        return
+    services = getattr(ports, "startup_services", None)
+    if not isinstance(services, dict):
+        # A producer that declared a dependency must fail closed when the
+        # Gateway did not provide the readiness snapshot. Accepting here would
+        # recreate the original silent-tool-loss path in embedded callers.
+        raise AdmissionError(
+            "DEPENDENCY_UNAVAILABLE",
+            "Required external service readiness is unavailable.",
+            details={"services": list(required), "reason": "readiness_unknown"},
+            retryable=True,
+            retry_after_ms=1000,
+            accepted=False,
+        )
+    waiting: list[str] = []
+    unavailable: list[str] = []
+    for name in required:
+        descriptor = services.get(name)
+        if not isinstance(descriptor, dict):
+            unavailable.append(name)
+            continue
+        status = str(descriptor.get("status") or "").strip().lower()
+        if status in {"starting", "stopping"}:
+            waiting.append(name)
+        # ``disabled`` is valid only for an unrequested optional service. A
+        # producer that explicitly requires it must not be accepted while the
+        # service is disabled.
+        elif status != "ready":
+            unavailable.append(name)
+    if waiting:
+        raise AdmissionError(
+            "DEPENDENCY_STARTING",
+            "Required external service is still starting; retry this turn.",
+            details={"services": waiting, "retryable": True},
+            retryable=True,
+            retry_after_ms=500,
+            accepted=False,
+        )
+    if unavailable:
+        raise AdmissionError(
+            "DEPENDENCY_UNAVAILABLE",
+            "A required external service is unavailable.",
+            details={"services": unavailable},
+            retryable=True,
+            retry_after_ms=1000,
+            accepted=False,
+        )
 
 
 async def _replay_retired_request(
@@ -867,6 +922,12 @@ async def _accept_turn_in_scope(
         # Retain the original canonical input, including paths, even when a
         # client displayText or generated page context changes presentation.
         display_text = command.message
+    # 显式空 displayText 表示用户没有输入正文，附件的 provider 补充提示不能起名。
+    # 保留缺失字段的兼容路径，也不按提示词字面量过滤用户真实输入的同名文字。
+    title_message_text = (
+        display_text if display_text is not None else semantic_message_text or message_text
+    )
+    generate_title = generate_title and bool(title_message_text.strip())
     provider_message_text = message_text
 
     transcript_metadata: _TranscriptMetadata = {}
@@ -999,6 +1060,32 @@ async def _accept_turn_in_scope(
             ),
         },
     )
+
+    # The Gateway primitive resolves authority from the authenticated
+    # principal and stamps the resulting immutable snapshot onto the route.
+    # Client-supplied metadata is never trusted for this field.  Embedded
+    # callers that do not expose the resolver retain the legacy path until
+    # they adopt the same boundary.
+    resolve_activation_authority = getattr(
+        ports, "resolve_activation_authority", None
+    )
+    if callable(resolve_activation_authority):
+        authority = await resolve_activation_authority(
+            session_id=session_id,
+            session_epoch=int(getattr(route_envelope, "session_epoch", 0) or 0),
+        )
+        if not isinstance(authority, dict):
+            raise AdmissionUnavailableError(
+                "Activation authority could not be resolved"
+            )
+        route_envelope = ports.refine_route(
+            route_envelope,
+            metadata={
+                **route_envelope.metadata,
+                "activation_authority": authority,
+            },
+        )
+
     ingress_turn_context: dict[str, Any] = {
         "turn_id": turn_id,
         "client_request_id": ingress_identity.client_request_id,
@@ -1390,6 +1477,16 @@ async def _accept_turn_in_scope(
                 retryable=True,
                 accepted=False,
             ) from exc
+        except AdmissionResourceBusyError as exc:
+            _cleanup_rejected_guest_profile()
+            raise AdmissionError(
+                "RESOURCE_BUSY",
+                "The Gateway is at its resident task capacity. Retry shortly.",
+                details={"session_key": exc.session_key, "max_resident": exc.max_resident},
+                retryable=True,
+                retry_after_ms=250,
+                accepted=False,
+            ) from exc
         except AdmissionStorageBusyError as exc:
             _cleanup_rejected_guest_profile()
             raise AdmissionError(
@@ -1638,7 +1735,7 @@ async def _accept_turn_in_scope(
             try:
                 ports.schedule_auto_title(
                     key,
-                    semantic_message_text or message_text,
+                    title_message_text,
                     enabled=generate_title,
                     session_id=session_id,
                     root_turn_id=acceptance.receipt.task_id,
@@ -1878,7 +1975,7 @@ async def _accept_turn_in_scope(
                 try:
                     ports.schedule_auto_title(
                         key,
-                        semantic_message_text or message_text,
+                        title_message_text,
                         enabled=generate_title,
                     )
                 except Exception:  # noqa: BLE001 - turn is already accepted.
@@ -1997,7 +2094,7 @@ async def _accept_turn_in_scope(
         if generate_title:
             ports.schedule_auto_title(
                 key,
-                semantic_message_text or message_text,
+                title_message_text,
                 enabled=generate_title,
             )
         return {
@@ -2073,7 +2170,7 @@ async def _accept_turn_in_scope(
 
             if not isinstance(
                 exc,
-                (AdmissionQueueFullError, AdmissionShuttingDownError),
+                (AdmissionQueueFullError, AdmissionResourceBusyError, AdmissionShuttingDownError),
             ):
                 raise
 
@@ -2083,7 +2180,11 @@ async def _accept_turn_in_scope(
             # hand the orphan message_id to the client as an idempotency
             # token — clients must dedup before retrying.
             shutting_down = isinstance(exc, AdmissionShuttingDownError)
-            rollback_reason = "runtime_shutting_down" if shutting_down else "queue_full"
+            resource_busy = isinstance(exc, AdmissionResourceBusyError)
+            rollback_reason = (
+                "runtime_shutting_down" if shutting_down
+                else "resource_busy" if resource_busy else "queue_full"
+            )
             orphan_id, rollback_ok = await _rollback_persisted_user_message(rollback_reason)
 
             if rollback_ok:
@@ -2096,6 +2197,19 @@ async def _accept_turn_in_scope(
                             "rollback_message_id": orphan_id,
                         },
                         retryable=True,
+                        accepted=False,
+                    ) from exc
+                if isinstance(exc, AdmissionResourceBusyError):
+                    raise AdmissionError(
+                        "RESOURCE_BUSY",
+                        "The Gateway is at its resident task capacity. Retry shortly.",
+                        details={
+                            "session_key": exc.session_key,
+                            "max_resident": exc.max_resident,
+                            "rollback_message_id": orphan_id,
+                        },
+                        retryable=True,
+                        retry_after_ms=250,
                         accepted=False,
                     ) from exc
                 assert isinstance(exc, AdmissionQueueFullError)
@@ -2119,6 +2233,20 @@ async def _accept_turn_in_scope(
                     ),
                     details={
                         "session_key": exc.session_key,
+                        "orphan_message_id": orphan_id,
+                        "remediation": "client must dedup by message_id before retry",
+                    },
+                    retryable=False,
+                    accepted=True,
+                ) from exc
+            if isinstance(exc, AdmissionResourceBusyError):
+                raise AdmissionError(
+                    "RESOURCE_BUSY_DIRTY",
+                    "Resident task capacity is full and the accepted transcript entry "
+                    "could not be rolled back.",
+                    details={
+                        "session_key": exc.session_key,
+                        "max_resident": exc.max_resident,
                         "orphan_message_id": orphan_id,
                         "remediation": "client must dedup by message_id before retry",
                     },
@@ -2176,7 +2304,7 @@ async def _accept_turn_in_scope(
         if generate_title:
             ports.schedule_auto_title(
                 key,
-                semantic_message_text or message_text,
+                title_message_text,
                 enabled=generate_title,
                 session_id=session_id,
                 root_turn_id=turn_id,

@@ -475,7 +475,14 @@ class PendingInputQueue:
             and not confirmed
         ):
             raise PendingQueueRejectedError("control-command")
-        if turn.display_text is not None and display != control and not escaped:
+        # 纯附件保留空正文；provider 补充提示不属于用户输入。其余不匹配仍拒绝。
+        attachment_only = not display and bool(turn.attachments)
+        if (
+            turn.display_text is not None
+            and display != control
+            and not escaped
+            and not attachment_only
+        ):
             raise PendingQueueRejectedError("display-mismatch")
     @staticmethod
     def _client_identity(value: str | None, name: str) -> str:

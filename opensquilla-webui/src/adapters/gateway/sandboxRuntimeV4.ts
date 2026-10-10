@@ -96,6 +96,7 @@ import {
 } from '@/types/sandbox'
 
 interface SandboxRpcTransport {
+  readonly generation: number
   request<T = unknown>(
     method: string,
     params?: Record<string, unknown>,
@@ -121,7 +122,10 @@ interface SandboxCallLifecycle {
 const DEFAULT_TIMEOUT_MS = 15_000
 const SETUP_TIMEOUT_MS = 45_000
 const SETUP_RECONCILE_POLL_MS = 1_000
-const SETUP_RECONCILE_MAX_WAIT_MS = 120_000
+// The Windows launcher owns a 300 s total budget and up to 2 s cleanup.
+// Keep observing through that terminal result instead of freezing the dialog
+// at in_progress after the former 120 s client-only deadline.
+const SETUP_RECONCILE_MAX_WAIT_MS = 310_000
 
 function objectValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -518,7 +522,7 @@ export function createV4SandboxRuntime(
     skipReady = false,
   ): Promise<SandboxReadinessState> => {
     const status = await readSetupStatus(options, skipReady)
-    const capability = status === null || status.state === 'ready'
+    const capability = status === null || ['ready', 'setting_up', 'failed'].includes(status.state)
       ? await readCapability(options?.refreshCapability === true, options, skipReady)
       : null
     return { status, capability }
@@ -638,7 +642,7 @@ export function createV4SandboxRuntime(
           try {
             const value = await call<SetupEnsureResult>(
               SANDBOX_SETUP_ENSURE_METHOD,
-              undefined,
+              options?.repairIdentity === true ? { repairIdentity: true } : undefined,
               {
                 ...options,
                 timeoutMs: options?.timeoutMs ?? SETUP_TIMEOUT_MS,
@@ -797,11 +801,20 @@ export function createV4SandboxRuntime(
     async runtimeStatus(options) {
       if (!rpc.supports(SANDBOX_RUNTIME_STATUS_METHOD)) return null
       try {
-        const value = await call<RuntimeStatusResult>(
+        const readOptions: RpcCallOptions = {
+          ...requestOptions(options),
+          recoveryClass: 'safe-read',
+        }
+        await rpc.ready(readOptions)
+        if (options?.signal?.aborted) throw new DOMException('Runtime status read cancelled', 'AbortError')
+        const generation = rpc.generation
+        const value = await rpc.request<RuntimeStatusResult>(
           SANDBOX_RUNTIME_STATUS_METHOD,
           undefined,
-          options,
+          { ...readOptions, expectedGeneration: generation },
         )
+        if (options?.signal?.aborted) throw new DOMException('Runtime status read cancelled', 'AbortError')
+        if (generation !== rpc.generation) throw new SandboxError('unavailable', 'Runtime status connection changed', { retryable: true })
         return projectRuntimeStatus(value, SANDBOX_RUNTIME_STATUS_METHOD)
       } catch (error) {
         if (isMethodUnsupported(error)) {

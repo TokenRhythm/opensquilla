@@ -13,7 +13,11 @@ import pytest
 
 from opensquilla.compat import aiosqlite
 from opensquilla.session.models import SessionNode, TranscriptEntry
-from opensquilla.session.recovery_reads import ReadCancelToken, recovery_read_scope
+from opensquilla.session.recovery_reads import (
+    ReadCancelToken,
+    RecoveryReadPool,
+    recovery_read_scope,
+)
 from opensquilla.session.storage import (
     SessionStorage,
     StorageBusyError,
@@ -22,6 +26,20 @@ from opensquilla.session.storage import (
 from tests.helpers.sqlite_process_probe import run_sqlite_probe
 
 _CLOSE_PROBE = Path(__file__).resolve().parents[1] / "fixtures" / "recovery_close_probe.py"
+
+
+def test_application_and_storage_share_one_read_budget_scope() -> None:
+    from opensquilla import recovery_read_budget
+    from opensquilla.session import recovery_reads
+
+    assert recovery_reads.ReadCapacityError is recovery_read_budget.ReadCapacityError
+    assert recovery_reads.ReadCancelToken is recovery_read_budget.ReadCancelToken
+    assert recovery_reads.ReadBudget is recovery_read_budget.ReadBudget
+    assert recovery_reads.current_read_budget() is None
+    with recovery_read_scope("agent:main:webchat:shared", deadline=time.monotonic() + 1) as budget:
+        assert recovery_read_budget.current_read_budget() is budget
+        assert recovery_reads.current_read_budget() is budget
+    assert recovery_read_budget.current_read_budget() is None
 
 
 @pytest.fixture(params=[False, True], ids=["aiosqlite", "sqlite3-fallback"])
@@ -162,6 +180,137 @@ async def test_bulk_saturation_leaves_identity_capacity(
         await asyncio.gather(*reads, return_exceptions=True)
         for budget in budgets:
             await budget.drain()
+
+
+async def test_title_reads_have_unique_identity_when_monotonic_ns_is_constant(
+    storage: SessionStorage, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Windows Python 3.12 can return the same tick for distinct requests. Keep
+    # the deadline clock running while making that identity collision certain.
+    monkeypatch.setattr(time, "monotonic_ns", lambda: 123456789)
+    release = asyncio.Event()
+    admitted = asyncio.Event()
+    keys = []
+    remaining = []
+    original_initialize = storage._initialize_recovery_reader
+
+    async def initialize(reader: Any) -> None:
+        await release.wait()
+        await original_initialize(reader)
+
+    pool = RecoveryReadPool(storage._open_recovery_reader, initialize=initialize)
+    storage._recovery_read_pool = pool
+    original_run = pool.run
+
+    async def record_run(budget: Any, read: Any) -> Any:
+        keys.append(budget.key)
+        remaining.append(budget.remaining)
+        if len(keys) == 4:
+            admitted.set()
+        return await original_run(budget, read)
+
+    monkeypatch.setattr(pool, "run", record_run)
+    reads = [asyncio.create_task(method(["healthy"])) for method in (
+        storage.list_user_transcript_content_batch,
+        storage.list_canonical_user_transcript_content_batch,
+    ) for _ in range(2)]
+    try:
+        await asyncio.wait_for(admitted.wait(), 1)
+        assert len(set(keys)) == 4
+        assert pool.active_count == 4
+        assert all(1.5 < seconds <= 2.0 for seconds in remaining)
+    finally:
+        release.set()
+        results = await asyncio.gather(*reads, return_exceptions=True)
+    assert results == [{"healthy": ["synthetic history"]}] * 4
+    assert pool.active_count == 0
+
+
+async def test_saturated_title_read_does_not_bypass_pool(
+    storage: SessionStorage, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = NativeGate()
+    entered = 0
+    all_entered = threading.Event()
+    original_block = gate.block
+
+    def block() -> int:
+        nonlocal entered
+        entered += 1
+        if entered == 4:
+            all_entered.set()
+        return original_block()
+
+    monkeypatch.setattr(gate, "block", block)
+    await install_gate(storage, monkeypatch, gate)
+    reads = []
+    budgets = []
+    legacy_queries: list[str] = []
+    await storage._transcript_reader.set_trace_callback(legacy_queries.append)
+    await storage.conn.set_trace_callback(legacy_queries.append)
+    try:
+        for index in range(4):
+            with recovery_read_scope(
+                f"agent:main:webchat:identity-{index}",
+                deadline=time.monotonic() + 5,
+                workload="identity",
+            ) as budget:
+                reads.append(asyncio.create_task(storage._read_history_query(
+                    "SELECT recovery_test_gate()", (),
+                )))
+                budgets.append(budget)
+        assert await asyncio.to_thread(all_entered.wait, 2)
+        with pytest.raises(StorageBusyError) as caught:
+            await storage.list_user_transcript_content_batch(["healthy"])
+        assert caught.value.stage == "permit"
+        assert caught.value.resource == "session_storage_recovery_read_pool"
+        assert storage._recovery_read_pool.active_count == 4
+        assert storage._recovery_read_pool.physical_count == 4
+        assert legacy_queries == []
+    finally:
+        gate.release.set()
+        await asyncio.gather(*reads, return_exceptions=True)
+        for budget in budgets:
+            await budget.drain()
+        await storage._transcript_reader.set_trace_callback(None)
+        await storage.conn.set_trace_callback(None)
+
+
+async def test_title_deadline_does_not_fall_back_after_initialization_stalls(
+    storage: SessionStorage, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    budgets = []
+    legacy_queries: list[str] = []
+
+    async def initialize(reader: Any) -> None:
+        await release.wait()
+        await storage._initialize_recovery_reader(reader)
+
+    pool = RecoveryReadPool(storage._open_recovery_reader, initialize=initialize)
+    storage._recovery_read_pool = pool
+    original_run = pool.run
+
+    async def record_run(budget: Any, read: Any) -> Any:
+        budgets.append(budget)
+        return await original_run(budget, read)
+
+    monkeypatch.setattr(pool, "run", record_run)
+    await storage._transcript_reader.set_trace_callback(legacy_queries.append)
+    await storage.conn.set_trace_callback(legacy_queries.append)
+    try:
+        with pytest.raises(StorageBusyError) as caught:
+            await storage.list_user_transcript_content_batch(["healthy"])
+        assert caught.value.stage == "deadline"
+        assert caught.value.waited_ms >= 1900
+        assert pool.active_count == 1
+        assert legacy_queries == []
+    finally:
+        release.set()
+        for budget in budgets:
+            await budget.drain()
+        await storage._transcript_reader.set_trace_callback(None)
+        await storage.conn.set_trace_callback(None)
 
 
 async def test_deadline_interrupts_sql_and_clears_handler_before_reuse(

@@ -1,0 +1,913 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/sessions/sessions-history-page-v2.schema.json",
+  "title": "OpenSquilla sessions.history.page.v2 Contract",
+  "description": "Read one bounded, cursor-bound history page without materializing full content.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": {
+      "$ref": "#/$defs/RequestFrame"
+    },
+    "response": {
+      "$ref": "#/$defs/ResponseFrame"
+    }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": {
+      "tool": "datamodel-code-generator",
+      "version": "0.81.0",
+      "target": "pydantic_v2.BaseModel"
+    },
+    "typescript": {
+      "tool": "json-schema-to-typescript",
+      "version": "16.0.0"
+    },
+    "runtimeValidation": {
+      "tool": "ajv",
+      "version": "8.20.0",
+      "mode": "standalone-adapter-only"
+    }
+  },
+  "x-opensquilla-method": {
+    "name": "sessions.history.page.v2",
+    "kind": "query",
+    "scope": "operator.read",
+    "guestAllowed": true,
+    "idempotency": "read-only",
+    "timeout": {
+      "policy": "caller"
+    },
+    "capability": {
+      "kind": "method-availability",
+      "name": "sessions.history.v2"
+    },
+    "request": "#/$defs/RequestFrame",
+    "params": "#/$defs/Params",
+    "response": "#/$defs/ResponseFrame",
+    "result": "#/$defs/Result",
+    "errors": [
+      {
+        "code": "INVALID_REQUEST"
+      },
+      {
+        "code": "UNAUTHORIZED"
+      },
+      {
+        "code": "NOT_FOUND"
+      },
+      {
+        "code": "HISTORY_STALE"
+      },
+      {
+        "code": "REBASE_REQUIRED"
+      },
+      {
+        "code": "RESPONSE_TOO_LARGE"
+      },
+      {
+        "code": "STORAGE_BUSY"
+      },
+      {
+        "code": "INTERNAL_ERROR"
+      }
+    ]
+  },
+  "$defs": {
+    "RequestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "type": {
+          "const": "req"
+        },
+        "id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "sessions.history.page.v2"
+        },
+        "params": {
+          "$ref": "#/$defs/Params"
+        }
+      }
+    },
+    "OkResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": true
+        },
+        "payload": {
+          "$ref": "#/$defs/Result"
+        },
+        "error": {
+          "type": "null"
+        }
+      }
+    },
+    "ErrorResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "error"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": false
+        },
+        "payload": {
+          "type": "null"
+        },
+        "error": {
+          "$ref": "#/$defs/RpcError"
+        }
+      }
+    },
+    "ResponseFrame": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/OkResponseFrame"
+        },
+        {
+          "$ref": "#/$defs/ErrorResponseFrame"
+        }
+      ]
+    },
+    "Params": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "direction"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "session_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "session_epoch": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "before",
+            "after"
+          ]
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 1024
+        },
+        "target_items": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "target_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "projection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "include_content_refs": {
+              "type": "boolean"
+            },
+            "include_tool_metadata": {
+              "type": "boolean"
+            },
+            "include_outcomes": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "Result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "session_epoch",
+        "projection_revision",
+        "items",
+        "before_cursor",
+        "after_cursor",
+        "has_more_before",
+        "has_more_after",
+        "complete_for_requested_window",
+        "compaction_summaries",
+        "turn_outcomes",
+        "canonical_available",
+        "canonical_complete",
+        "history_scope"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "session_epoch": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "projection_revision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "items": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/HistoryItem"
+          }
+        },
+        "before_cursor": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 1024
+        },
+        "after_cursor": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 1024
+        },
+        "has_more_before": {
+          "type": "boolean"
+        },
+        "has_more_after": {
+          "type": "boolean"
+        },
+        "complete_for_requested_window": {
+          "type": "boolean"
+        },
+        "compaction_summaries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CompactionSummary"
+          }
+        },
+        "turn_outcomes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnOutcome"
+          }
+        },
+        "canonical_available": {
+          "type": "boolean"
+        },
+        "canonical_complete": {
+          "type": "boolean"
+        },
+        "history_scope": {
+          "enum": [
+            "complete",
+            "latest_window",
+            "compacted"
+          ]
+        }
+      }
+    },
+    "RpcError": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {},
+        "retryable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "accepted": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "ContentRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "content_id",
+        "session_id",
+        "session_epoch",
+        "revision",
+        "representation",
+        "byte_length",
+        "sha256",
+        "status",
+        "durable",
+        "expires_at"
+      ],
+      "properties": {
+        "content_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "session_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "session_epoch": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "view": {
+          "description": "Exact legacy content read view; absence is not proof that raw bytes are display-safe.",
+          "type": "string",
+          "enum": [
+            "raw",
+            "display"
+          ]
+        },
+        "source": {
+          "description": "Storage source for the same revision and message identity.",
+          "type": "string",
+          "enum": [
+            "active",
+            "compacted"
+          ]
+        },
+        "representation": {
+          "type": "string",
+          "enum": [
+            "text-utf8",
+            "json-utf8",
+            "binary"
+          ]
+        },
+        "byte_length": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "sealed",
+            "prefix"
+          ]
+        },
+        "durable": {
+          "type": "boolean"
+        },
+        "expires_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ContentHandle": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "availability",
+            "ref"
+          ],
+          "properties": {
+            "availability": {
+              "const": "ready"
+            },
+            "ref": {
+              "$ref": "#/$defs/ContentRef"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "availability",
+            "content_id",
+            "source_revision",
+            "operation_id"
+          ],
+          "properties": {
+            "availability": {
+              "const": "preparing"
+            },
+            "content_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "source_revision": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "operation_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          }
+        }
+      ]
+    },
+    "HistoryItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "message_id",
+        "item_id",
+        "order",
+        "role",
+        "preview",
+        "preview_complete",
+        "contents",
+        "message",
+        "source_revision",
+        "content_availability"
+      ],
+      "properties": {
+        "message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "item_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "order": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "preview": {
+          "type": "string",
+          "maxLength": 65536
+        },
+        "preview_complete": {
+          "type": "boolean",
+          "description": "Whether the displayed text is complete, independent of range availability and metadata preparation."
+        },
+        "contents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContentHandle"
+          }
+        },
+        "message": {
+          "$ref": "#/$defs/ChatHistoryMessage"
+        },
+        "source_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "content_availability": {
+          "type": "string",
+          "enum": [
+            "ready",
+            "preparing",
+            "unavailable"
+          ]
+        }
+      }
+    },
+    "ChatHistoryMessage": {
+      "description": "A projected transcript message. Role-specific activity, attachment, artifact, usage and provenance fields remain additive v4 extensions.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "integer",
+            "null"
+          ]
+        },
+        "message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": [
+            "number",
+            "string",
+            "null"
+          ]
+        },
+        "ts": {
+          "type": [
+            "number",
+            "string",
+            "null"
+          ]
+        },
+        "transcript_id": {
+          "type": [
+            "integer",
+            "string",
+            "null"
+          ]
+        },
+        "attachments": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "artifacts": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "tool_calls": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {}
+        },
+        "turn_context": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "usage": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "turn_usage": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "provenance_kind": {
+          "$ref": "#/$defs/NullableString"
+        },
+        "provenance_source_session_key": {
+          "$ref": "#/$defs/NullableString"
+        },
+        "provenance_source_tool": {
+          "$ref": "#/$defs/NullableString"
+        },
+        "pageContext": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PageContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "localPathReferences": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          },
+          "description": "Display-only explicit local paths matching the canonical message suffix; no file access authority."
+        },
+        "selectedSkills": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/SelectedSkillRef"
+          }
+        },
+        "contentUnavailableReason": {
+          "type": "string",
+          "description": "Machine-readable reason why a bounded legacy body has no safe contentRef; the authoritative body remains in storage.",
+          "enum": [
+            "content_metadata_pending",
+            "display_projection_too_large",
+            "content_reference_unavailable"
+          ]
+        }
+      }
+    },
+    "NullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "PageContext": {
+      "description": "Page references and user annotations only. Gateway normalization enforces UTF-8 byte limits and a 65536-byte serialized context limit; JSON Schema length bounds count characters. Page text and locator hints are untrusted context, not source identity or edit authority.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pagePath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "\\S",
+          "description": "Logical HTML page within the referenced document. The Gateway validates the current collection and source path; this hint does not grant access."
+        },
+        "targetRef": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "\\S",
+          "description": "Opaque page reference. The Gateway trims whitespace and enforces a 512-byte UTF-8 limit."
+        },
+        "resourceId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "\\S",
+          "description": "Opaque page reference. The Gateway trims whitespace and enforces a 512-byte UTF-8 limit."
+        },
+        "annotations": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/PageAnnotation"
+          }
+        }
+      }
+    },
+    "PageAnnotation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384,
+          "pattern": "\\S",
+          "description": "User annotation; must contain non-whitespace text and fit 16384 UTF-8 bytes."
+        },
+        "selectionText": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 16384,
+          "description": "The Gateway enforces a 16384-byte UTF-8 limit."
+        },
+        "locatorHint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 16384,
+          "description": "The Gateway enforces a 16384-byte UTF-8 limit."
+        }
+      }
+    },
+    "SelectedSkillRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "instanceId",
+        "digest"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "instanceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "digest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    },
+    "CompactionSummary": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": [
+            "integer",
+            "string",
+            "null"
+          ]
+        },
+        "compaction_id": {
+          "$ref": "#/$defs/NullableString"
+        },
+        "compaction_index": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "trigger_reason": {
+          "$ref": "#/$defs/NullableString"
+        },
+        "summary_text": {
+          "type": "string"
+        },
+        "summary_format": {
+          "type": "string"
+        },
+        "coverage_status": {
+          "type": "string"
+        },
+        "removed_count": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "kept_count": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "covered_through_id": {
+          "type": [
+            "integer",
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "TurnOutcome": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "turn_id",
+        "status",
+        "outcome"
+      ],
+      "properties": {
+        "turn_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "$ref": "#/$defs/NullableString"
+        },
+        "status": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "finished_at": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "outcome": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}

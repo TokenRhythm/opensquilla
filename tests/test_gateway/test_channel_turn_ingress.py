@@ -601,6 +601,12 @@ async def test_channel_activation_failure_returns_failed_accepted_handle(
         assert task is not None
         assert task.status == AgentTaskStatus.FAILED
         assert task.terminal_reason == "activation_failed"
+        owner = task.details.get("admission_owner")
+        assert isinstance(owner, dict)
+        assert owner["resident_lease"] == "released"
+        assert owner["compute_lease"] == "not_acquired"
+        assert owner["settlement"] == "settled"
+        assert "cancellation_requested" not in task.details
         assert stack.runtime._reservations_by_session == {}
 
 

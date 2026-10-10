@@ -74,16 +74,10 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
   })
 
   function coalesceAcceptedFrame(frame: Frame): void {
+    // Generation reset always discards these frames. Retaining their bodies
+    // would only duplicate the accumulator's display projection.
+    if (frame.kind === 'text' || frame.kind === 'thinking' || frame.kind === 'final-text') return
     const previous = acceptedFrames[acceptedFrames.length - 1]
-    if (previous?.kind === 'text' && frame.kind === 'text'
-      && previous.presentation === frame.presentation) {
-      previous.text += frame.text
-      return
-    }
-    if (previous?.kind === 'thinking' && frame.kind === 'thinking') {
-      previous.text += frame.text
-      return
-    }
     if (previous?.kind === 'tool-delta' && frame.kind === 'tool-delta'
       && previous.toolId === frame.toolId) {
       previous.fragment += frame.fragment
