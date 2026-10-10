@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -35,11 +34,17 @@ class _Storage:
     async def read_legacy_content_range(self, ref, *, offset=0, limit=1024 * 1024):
         return ContentRange(ref, offset, limit, self.body[offset : offset + limit])
 
-    async def read_legacy_display_text(self, ref, *, max_bytes=8 * 1024 * 1024):
-        return "displayed hello"
+    async def read_legacy_display_entry(self, ref, *, max_bytes=8 * 1024 * 1024):
+        return TranscriptEntry(
+            session_id=ref.session_id, message_id=ref.message_id,
+            role="assistant", content="displayed hello",
+        )
 
-    async def read_legacy_display_details(self, ref, *, max_bytes=8 * 1024 * 1024):
-        return json.dumps({"id": "mid", "role": "assistant", "reasoning_content": "思考" * 15000})
+    async def read_legacy_detail_entry(self, ref, *, max_bytes=8 * 1024 * 1024):
+        return TranscriptEntry(
+            session_id=ref.session_id, message_id=ref.message_id,
+            role="assistant", content="", reasoning_content="思考" * 15000,
+        )
 
 
 class _Manager:

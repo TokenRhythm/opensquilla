@@ -15,7 +15,7 @@ from typing import Any, Protocol, cast
 
 import structlog
 
-from opensquilla.session.recovery_reads import ReadCapacityError, current_read_budget
+from opensquilla.recovery_read_budget import ReadCapacityError, current_read_budget
 from opensquilla.session_key import canonicalize_session_key
 
 log = structlog.get_logger(__name__)

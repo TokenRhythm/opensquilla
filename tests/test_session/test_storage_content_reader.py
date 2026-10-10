@@ -21,8 +21,33 @@ from opensquilla.application.content_reader import (
     LegacyContentRef,
 )
 from opensquilla.chat.history import transcript_entries_to_chat_messages
+from opensquilla.gateway.adapters.content_reader import build_content_reader
 from opensquilla.session.models import TranscriptEntry
 from opensquilla.session.storage import SessionStorage
+
+
+def test_export_limit_error_is_shared_by_storage_and_application():
+    from opensquilla.content_reader import ContentExportLimitError as LeafExportLimitError
+
+    assert ContentExportLimitError is LeafExportLimitError
+
+
+@pytest.mark.asyncio
+async def test_details_projection_preserves_the_output_budget_above_storage(tmp_path):
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.append_transcript_entry(TranscriptEntry(
+            session_id="sid", message_id="m" * 160, role="assistant",
+            content="body", reasoning_content="short details", created_at=1,
+        ))
+        ref = await storage.get_legacy_content_ref("sid", "m" * 160)
+        entry = await storage.read_legacy_detail_entry(ref, max_bytes=100)
+        assert entry.reasoning_content == "short details"
+        assert entry.content == ""
+        with pytest.raises(ContentExportLimitError, match="display details exceed"):
+            await build_content_reader(storage).read_display_details(ref, max_bytes=100)
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -102,18 +127,18 @@ async def test_unindexed_display_reads_one_versioned_blob_on_its_worker(
         await storage.conn.commit()
         ref = await storage.get_legacy_content_ref("sid", "mid", source=source, allow_pending=True)
         assert ref.byte_length is None
-        assert await storage.read_legacy_display_text(ref) == body
+        assert await build_content_reader(storage).read_display_text(ref) == body
         assert events[0] == ("open", table, 91 if source == "compacted" else 1, True)
         assert events[1][:2] == ("read", len(body.encode()))
         assert events[1][2] != threading.get_ident()
         assert events[-1] == "closed"
         events.clear()
         with pytest.raises(ContentExportLimitError):
-            await storage.read_legacy_display_text(ref, max_bytes=100)
+            await build_content_reader(storage).read_display_text(ref, max_bytes=100)
         assert len(events) == 2 and events[-1] == "closed"  # No read before rejecting length.
         events.clear()
         deny_content = True
-        details = json.loads(await storage.read_legacy_display_details(ref))
+        details = json.loads(await build_content_reader(storage).read_display_details(ref))
         assert details["reasoning_content"] == "full thinking"
         assert events == []
         deny_content = False
@@ -122,7 +147,7 @@ async def test_unindexed_display_reads_one_versioned_blob_on_its_worker(
         )
         await storage.conn.commit()
         with pytest.raises(ContentNotFoundError):
-            await storage.read_legacy_display_text(ref)
+            await build_content_reader(storage).read_display_text(ref)
         assert events == []  # Reject the old version before opening any blob.
         # Keep the body unindexed after the ordinary content-update trigger.
         await storage.conn.execute(f"UPDATE {table} SET content_byte_length = NULL")
@@ -131,7 +156,7 @@ async def test_unindexed_display_reads_one_versioned_blob_on_its_worker(
             "sid", "mid", source=source, allow_pending=True,
         )
         block_read = True
-        task = asyncio.create_task(storage.read_legacy_display_text(current))
+        task = asyncio.create_task(build_content_reader(storage).read_display_text(current))
         assert await asyncio.to_thread(entered.wait, 2)
         task.cancel()
         closing = asyncio.create_task(storage.close())
@@ -164,9 +189,9 @@ async def test_unindexed_display_preserves_empty_and_utf8_validation(tmp_path, b
         ref = await storage.get_legacy_content_ref("sid", "mid", allow_pending=True)
         if isinstance(body, bytes):
             with pytest.raises(ContentEncodingError):
-                await storage.read_legacy_display_text(ref)
+                await build_content_reader(storage).read_display_text(ref)
         else:
-            assert await storage.read_legacy_display_text(ref) == ""
+            assert await build_content_reader(storage).read_display_text(ref) == ""
     finally:
         await storage.close()
 
@@ -202,7 +227,7 @@ async def test_history_details_restore_without_reading_or_replacing_body(tmp_pat
             """)
             await storage.conn.commit()
         ref = await storage.get_legacy_content_ref("sid", "mid", source=source)
-        details = json.loads(await storage.read_legacy_display_details(ref))
+        details = json.loads(await build_content_reader(storage).read_display_details(ref))
         assert details["reasoning_content"] == reasoning
         assert details["tool_calls"][0]["text"] == "Complete answer"
         assert details["tool_calls"][1]["input"] == segments[1]["input"]
@@ -211,7 +236,7 @@ async def test_history_details_restore_without_reading_or_replacing_body(tmp_pat
         assert "text" not in details
         assert "assistant_replay" not in details
         with pytest.raises(ContentExportLimitError):
-            await storage.read_legacy_display_details(ref, max_bytes=1024)
+            await build_content_reader(storage).read_display_details(ref, max_bytes=1024)
         table = "transcript_entries" if source == "active" else "compacted_transcript_entries"
         await storage.conn.execute(
             f"UPDATE {table} SET reasoning_content = ? WHERE message_id = ?",
@@ -219,7 +244,7 @@ async def test_history_details_restore_without_reading_or_replacing_body(tmp_pat
         )
         await storage.conn.commit()
         with pytest.raises(ContentNotFoundError):
-            await storage.read_legacy_display_details(ref)
+            await build_content_reader(storage).read_display_details(ref)
         current = await storage.get_legacy_content_ref("sid", "mid", source=source)
         assert current.revision != ref.revision
     finally:
@@ -340,8 +365,8 @@ async def test_display_read_rejects_same_length_update_after_ref_check(
             return await read_query(sql, params, operation=operation, **kwargs)
 
         monkeypatch.setattr(storage, "_read_history_query", replace_before_display)
-        read = (storage.read_legacy_display_text if view == "display"
-                else storage.read_legacy_display_details)
+        read = (build_content_reader(storage).read_display_text if view == "display"
+                else build_content_reader(storage).read_display_details)
         with pytest.raises(ContentNotFoundError):
             await read(ref)
         current = await storage.get_legacy_content_ref("sid", "mid", source=source)
@@ -447,7 +472,7 @@ async def test_semantic_content_reader_reapplies_history_projection(tmp_path) ->
             )
         )
         ref = await storage.get_legacy_content_ref("sid", "projected")
-        assert await storage.read_legacy_display_text(ref) == "shown"
+        assert await build_content_reader(storage).read_display_text(ref) == "shown"
     finally:
         await storage.close()
 
@@ -468,7 +493,7 @@ async def test_semantic_content_reader_projects_tool_result_json(tmp_path) -> No
             )
         )
         ref = await storage.get_legacy_content_ref("sid", "tool-json")
-        assert await storage.read_legacy_display_text(ref) == "safe output"
+        assert await build_content_reader(storage).read_display_text(ref) == "safe output"
     finally:
         await storage.close()
 
@@ -496,7 +521,7 @@ async def test_semantic_content_reader_rejects_large_raw_rows_before_projection(
             await storage.conn.commit()
         ref = await storage.get_legacy_content_ref("sid", "too-large", allow_pending=unindexed)
         with pytest.raises(ContentExportLimitError):
-            await storage.read_legacy_display_text(ref)
+            await build_content_reader(storage).read_display_text(ref)
     finally:
         await storage.close()
 
@@ -570,7 +595,7 @@ async def test_bounded_tool_envelope_keeps_semantic_read_reference(
         assert "contentUnavailableReason" not in message
         ref = await storage.get_legacy_content_ref("sid", "tool-json")
         assert message["contentRef"]["revision"] == ref.revision
-        text = await storage.read_legacy_display_text(ref)
+        text = await build_content_reader(storage).read_display_text(ref)
         assert text == displayed
         assert "internal-call-id" not in text
         assert "tool_result" not in text

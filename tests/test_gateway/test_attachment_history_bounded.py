@@ -15,6 +15,7 @@ from starlette.applications import Starlette
 
 from opensquilla.chat.history import transcript_entries_to_chat_messages
 from opensquilla.content_reader import ContentNotFoundError, ContentRangeError
+from opensquilla.gateway.adapters.content_reader import build_content_reader
 from opensquilla.gateway.adapters.session_history_projection import (
     _annotate_transcript_attachment_downloads,
 )
@@ -280,7 +281,7 @@ async def test_small_and_large_text_only_envelopes_keep_display_semantics(storag
     assert len(projected["attachments"]) == 1
     assert projected["contentRef"]["view"] == "display"
     ref = await storage.get_legacy_content_ref("sid", "mid")
-    assert await storage.read_legacy_display_text(ref) == "caption " * 4000
+    assert await build_content_reader(storage).read_display_text(ref) == "caption " * 4000
 
 
 @pytest.mark.asyncio
@@ -352,7 +353,7 @@ async def test_pending_caption_rejects_same_length_update_between_lookup_and_rea
     reference = await storage.get_legacy_content_ref(
         "sid", "mid", source=source, allow_pending=True
     )
-    read_unindexed = storage._read_unindexed_display_text
+    read_unindexed = storage._read_unindexed_display_entry
 
     async def update_before_caption(ref, *, max_bytes):
         await storage.conn.execute(
@@ -361,9 +362,9 @@ async def test_pending_caption_rejects_same_length_update_between_lookup_and_rea
         await storage.conn.commit()
         return await read_unindexed(ref, max_bytes=max_bytes)
 
-    monkeypatch.setattr(storage, "_read_unindexed_display_text", update_before_caption)
+    monkeypatch.setattr(storage, "_read_unindexed_display_entry", update_before_caption)
     with pytest.raises(ContentNotFoundError):
-        await storage.read_legacy_display_text(reference)
+        await build_content_reader(storage).read_display_text(reference)
 
 
 @pytest.mark.asyncio
@@ -386,9 +387,11 @@ async def test_caption_hydrates_when_image_envelope_exceeds_display_export_limit
     _, projected = await message(storage)
     assert projected["contentRef"]["view"] == "display"
     ref = await storage.get_legacy_content_ref("sid", "mid", source=source, allow_pending=True)
-    assert await storage.read_legacy_display_text(ref) == caption
+    assert await build_content_reader(storage).read_display_text(ref) == caption
     with pytest.raises(ContentNotFoundError):
-        await storage.read_legacy_display_text(replace(ref, revision=ref.revision + "stale"))
+        await build_content_reader(storage).read_display_text(
+            replace(ref, revision=ref.revision + "stale"),
+        )
     app = create_gateway_app(
         GatewayConfig(),
         session_manager=SimpleNamespace(storage=storage, get_session=storage.get_session),

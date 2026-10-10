@@ -1857,8 +1857,7 @@ def _decode_transcript_rows(rows: Sequence[Any]) -> list[TranscriptEntry]:
     return [TranscriptEntry(**_deserialize_row(dict(row))) for row in rows]
 
 
-def _project_legacy_display_row(row: Any, raw_bytes: bytes) -> str:
-    from opensquilla.chat.history import transcript_entries_to_chat_messages
+def _decode_legacy_display_row(row: Any, raw_bytes: bytes) -> TranscriptEntry:
     from opensquilla.content_reader import ContentEncodingError
 
     try:
@@ -1868,10 +1867,7 @@ def _project_legacy_display_row(row: Any, raw_bytes: bytes) -> str:
     payload = dict(row)
     payload["content"] = decoded
     payload.pop("content_byte_length", None)
-    entry = TranscriptEntry(**_deserialize_row(payload))
-    messages = transcript_entries_to_chat_messages([entry], content_mode="legacy")
-    text = messages[0].get("text") if messages else None
-    return text if isinstance(text, str) else ""
+    return TranscriptEntry(**_deserialize_row(payload))
 
 
 def _py_lower(value: Any) -> Any:
@@ -16221,10 +16217,11 @@ class SessionStorage:
         return ContentRange(ref=ref, offset=offset, limit=limit, data=data)
 
     @_serialized_read
-    async def _read_unindexed_display_text(self, ref: LegacyContentRef, *, max_bytes: int) -> str:
+    async def _read_unindexed_display_entry(
+        self, ref: LegacyContentRef, *, max_bytes: int,
+    ) -> TranscriptEntry:
         """Read one unknown-length body on the owned SQLite worker and snapshot."""
-        from opensquilla.application.content_reader import ContentExportLimitError
-        from opensquilla.content_reader import content_revision_matches
+        from opensquilla.content_reader import ContentExportLimitError, content_revision_matches
         from opensquilla.session.attachment_history import (
             MAX_INLINE_ENVELOPE_BYTES,
             USER_DISPLAY_TEXT_SQL,
@@ -16236,7 +16233,7 @@ class SessionStorage:
         identity = "id" if ref.source == "active" else "original_entry_id"
         reader = self.conn
 
-        def read() -> str:
+        def read() -> TranscriptEntry:
             connection = reader._conn
             owns_transaction = not connection.in_transaction
             if owns_transaction:
@@ -16305,36 +16302,32 @@ class SessionStorage:
             finally:
                 if owns_transaction:
                     connection.rollback()
-            text = _project_legacy_display_row(row, raw_bytes)
-            if len(text.encode("utf-8")) > max_bytes:
-                raise ContentExportLimitError(f"display content exceeds {max_bytes} bytes")
-            return text
+            return _decode_legacy_display_row(row, raw_bytes)
 
-        async def run() -> str:
+        async def run() -> TranscriptEntry:
             if isinstance(reader, aiosqlite._AsyncConnection):
                 async with reader._locked:
-                    return cast(str, await aiosqlite._run_sqlite_call(read))
-            return cast(str, await reader._execute(read))
+                    return cast(TranscriptEntry, await aiosqlite._run_sqlite_call(read))
+            return cast(TranscriptEntry, await reader._execute(read))
 
-        return cast(str, await self._finish_sqlite_call(run()))
+        return cast(TranscriptEntry, await self._finish_sqlite_call(run()))
 
-    async def read_legacy_display_text(
+    async def read_legacy_display_entry(
         self,
         ref: LegacyContentRef,
         *,
         max_bytes: int = MAX_DISPLAY_CONTENT_BYTES,
-    ) -> str:
-        """Return one bounded, history-projected display body.
+    ) -> TranscriptEntry:
+        """Return one bounded, version-fenced entry for display projection.
 
         ``read_legacy_content_range`` is deliberately a raw byte seam for
         callers that need an exact export.  The chat renderer cannot use that
         seam for rows whose persisted body contains protocol JSON, flattened
         tool markers, or legacy control prompts: hydrating those bytes would
-        put internal text back in the UI.  This method resolves the row,
-        applies the same canonical history projection as ``chat.history``,
-        and only then returns text.  The bounded cap is checked before the
-        SQL result crosses into Python, so a semantic read cannot turn into a
-        hidden unbounded body load.
+        put internal text back in the UI. The Gateway content-reader adapter
+        applies that projection after this storage-owned read. The bounded
+        cap is checked before the SQL result crosses into Python, so a display
+        read cannot turn into a hidden unbounded body load.
         """
 
         if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
@@ -16347,7 +16340,7 @@ class SessionStorage:
             raise ContentNotFoundError("legacy content source is invalid")
 
         if ref.byte_length is None:
-            return await self._read_unindexed_display_text(ref, max_bytes=max_bytes)
+            return await self._read_unindexed_display_entry(ref, max_bytes=max_bytes)
 
         from opensquilla.session.attachment_history import (
             MAX_INLINE_ENVELOPE_BYTES,
@@ -16382,23 +16375,20 @@ class SessionStorage:
             operation="user_caption_display",
         )
         if caption_rows:
-            from opensquilla.application.content_reader import ContentExportLimitError
-            from opensquilla.chat.history import transcript_entries_to_chat_messages
+            from opensquilla.content_reader import ContentExportLimitError
 
             caption = caption_rows[0]
             if caption[0] > max_bytes:
                 raise ContentExportLimitError(f"display content exceeds {max_bytes} bytes")
-            def project_caption() -> str:
+            def decode_caption() -> TranscriptEntry:
                 context = json.loads(caption[2]) if isinstance(caption[2], str) else caption[2]
-                entry = TranscriptEntry(session_id=ref.session_id, session_key=caption[3],
+                return TranscriptEntry(session_id=ref.session_id, session_key=caption[3],
                     message_id=ref.message_id,
                     role="user", content=json.dumps({"text": caption[1]}), turn_context=context)
-                projected = transcript_entries_to_chat_messages([entry], content_mode="legacy")
-                return projected[0]["text"] if projected else ""
 
-            return await asyncio.to_thread(project_caption)
+            return await asyncio.to_thread(decode_caption)
         if ref.byte_length > max_bytes:
-            from opensquilla.application.content_reader import ContentExportLimitError
+            from opensquilla.content_reader import ContentExportLimitError
 
             raise ContentExportLimitError(f"display content exceeds {max_bytes} bytes")
 
@@ -16445,33 +16435,23 @@ class SessionStorage:
         else:
             raw_bytes = bytes(raw or b"")
         if len(raw_bytes) > max_bytes:
-            from opensquilla.application.content_reader import ContentExportLimitError
+            from opensquilla.content_reader import ContentExportLimitError
 
             raise ContentExportLimitError(
                 f"display content exceeds {max_bytes} bytes"
             )
-        # Avoid importing chat history at module import time: storage is part
-        # of the lower layer and the history module already depends on its
-        # TranscriptEntry shape in normal Gateway paths.  Parsing a multi-MiB
-        # JSON body is also CPU work; keep it off the shared Gateway event
-        # loop just like the bounded SQLite read itself.
-        text = await asyncio.to_thread(_project_legacy_display_row, row, raw_bytes)
-        if len(text.encode("utf-8")) > max_bytes:
-            from opensquilla.application.content_reader import ContentExportLimitError
+        # Row decoding remains off the Gateway loop. Semantic chat projection
+        # belongs to the adapter above storage and keeps its own output cap.
+        return await asyncio.to_thread(_decode_legacy_display_row, row, raw_bytes)
 
-            raise ContentExportLimitError(
-                f"display content exceeds {max_bytes} bytes"
-            )
-        return text
-
-    async def read_legacy_display_details(
+    async def read_legacy_detail_entry(
         self,
         ref: LegacyContentRef,
         *,
         max_bytes: int = MAX_DISPLAY_CONTENT_BYTES,
-    ) -> str:
+    ) -> TranscriptEntry:
         """Read complete display details on demand, without loading the message body."""
-        from opensquilla.application.content_reader import ContentExportLimitError
+        from opensquilla.content_reader import ContentExportLimitError
 
         if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
             raise ValueError("display details max_bytes must be a positive integer")
@@ -16513,27 +16493,14 @@ class SessionStorage:
         if row["detail_bytes"] > max_bytes:
             raise ContentExportLimitError(f"display details exceed {max_bytes} bytes")
 
-        def project_details() -> str:
-            from opensquilla.chat.history import transcript_entries_to_chat_messages
-
+        def decode_details() -> TranscriptEntry:
             payload = dict(row)
             payload.pop("detail_bytes")
-            entry = TranscriptEntry(
+            return TranscriptEntry(
                 session_id=ref.session_id, content="", **_deserialize_row(payload)
             )
-            messages = transcript_entries_to_chat_messages([entry], content_mode="legacy")
-            message = messages[0] if messages else {}
-            projected = {
-                key: message[key] for key in (
-                    "id", "message_id", "role", "reasoning_content", "tool_calls", "turn_context",
-                ) if key in message
-            }
-            text = json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
-            if len(text.encode("utf-8")) > max_bytes:
-                raise ContentExportLimitError(f"display details exceed {max_bytes} bytes")
-            return text
 
-        return await asyncio.to_thread(project_details)
+        return await asyncio.to_thread(decode_details)
 
     async def delete_transcript(self, session_id: str) -> None:
         async with self._write_transaction("delete_transcript") as conn:

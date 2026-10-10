@@ -8,6 +8,10 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "src" / "opensquilla"
 
 APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
+    # Settings owners record opt-in, payload-free timings through a leaf with
+    # no OpenSquilla implementation imports; it never changes save semantics.
+    ("application", "observability"),
+    ("onboarding", "observability"),
     # Source adapters consume the transport-neutral install command's pure
     # identifier parser; application never imports the Skill implementation.
     ("skills", "application"),
@@ -441,3 +445,19 @@ def test_contracts_package_stays_implementation_free() -> None:
         "contracts must not import implementation packages: "
         + ", ".join(sorted(implementation_edges))
     )
+
+
+def test_settings_save_timing_stays_an_implementation_independent_leaf() -> None:
+    path = PACKAGE_ROOT / "observability" / "settings_save.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assert not [
+        name for name in _module_imports(tree, path) if name.startswith("opensquilla.")
+    ]
+
+
+def test_recovery_read_budget_stays_independent_of_implementation_packages() -> None:
+    path = PACKAGE_ROOT / "recovery_read_budget.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assert [name for name in _module_imports(tree, path) if name.startswith("opensquilla.")] == [
+        "opensquilla.session_key",
+    ]

@@ -28,6 +28,20 @@ from tests.helpers.sqlite_process_probe import run_sqlite_probe
 _CLOSE_PROBE = Path(__file__).resolve().parents[1] / "fixtures" / "recovery_close_probe.py"
 
 
+def test_application_and_storage_share_one_read_budget_scope() -> None:
+    from opensquilla import recovery_read_budget
+    from opensquilla.session import recovery_reads
+
+    assert recovery_reads.ReadCapacityError is recovery_read_budget.ReadCapacityError
+    assert recovery_reads.ReadCancelToken is recovery_read_budget.ReadCancelToken
+    assert recovery_reads.ReadBudget is recovery_read_budget.ReadBudget
+    assert recovery_reads.current_read_budget() is None
+    with recovery_read_scope("agent:main:webchat:shared", deadline=time.monotonic() + 1) as budget:
+        assert recovery_read_budget.current_read_budget() is budget
+        assert recovery_reads.current_read_budget() is budget
+    assert recovery_read_budget.current_read_budget() is None
+
+
 @pytest.fixture(params=[False, True], ids=["aiosqlite", "sqlite3-fallback"])
 def sqlite_backend(request: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(aiosqlite, "_FORCE_SQLITE3_FALLBACK", request.param)

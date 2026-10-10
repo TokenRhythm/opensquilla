@@ -2,15 +2,41 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+
 from opensquilla.application.content_reader import (
     MAX_CONTENT_RANGE_BYTES,
     MAX_DISPLAY_CONTENT_BYTES,
+    ContentExportLimitError,
     ContentRange,
     ContentReader,
     ContentSource,
     LegacyContentRef,
 )
+from opensquilla.chat.history import transcript_entries_to_chat_messages
+from opensquilla.session.models import TranscriptEntry
 from opensquilla.session.storage import SessionStorage
+
+
+def _project_display(entry: TranscriptEntry, *, details: bool, max_bytes: int) -> str:
+    messages = transcript_entries_to_chat_messages([entry], content_mode="legacy")
+    message = messages[0] if messages else {}
+    if details:
+        projected = {
+            key: message[key] for key in (
+                "id", "message_id", "role", "reasoning_content", "tool_calls", "turn_context",
+            ) if key in message
+        }
+        text = json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+    else:
+        value = message.get("text")
+        text = value if isinstance(value, str) else ""
+    if len(text.encode("utf-8")) > max_bytes:
+        if details:
+            raise ContentExportLimitError(f"display details exceed {max_bytes} bytes")
+        raise ContentExportLimitError(f"display content exceeds {max_bytes} bytes")
+    return text
 
 
 class SessionContentReaderStorageAdapter(ContentReader):
@@ -53,7 +79,8 @@ class SessionContentReaderStorageAdapter(ContentReader):
         *,
         max_bytes: int = MAX_DISPLAY_CONTENT_BYTES,
     ) -> str:
-        return await self._storage.read_legacy_display_text(ref, max_bytes=max_bytes)
+        entry = await self._storage.read_legacy_display_entry(ref, max_bytes=max_bytes)
+        return await asyncio.to_thread(_project_display, entry, details=False, max_bytes=max_bytes)
 
     async def read_display_details(
         self,
@@ -61,7 +88,8 @@ class SessionContentReaderStorageAdapter(ContentReader):
         *,
         max_bytes: int = MAX_DISPLAY_CONTENT_BYTES,
     ) -> str:
-        return await self._storage.read_legacy_display_details(ref, max_bytes=max_bytes)
+        entry = await self._storage.read_legacy_detail_entry(ref, max_bytes=max_bytes)
+        return await asyncio.to_thread(_project_display, entry, details=True, max_bytes=max_bytes)
 
 
 def build_content_reader(

@@ -16,6 +16,7 @@ from opensquilla.content_reader import (
     MAX_CONTENT_RANGE_BYTES,
     MAX_DISPLAY_CONTENT_BYTES,
     ContentEncodingError,
+    ContentExportLimitError,
     ContentMetadataPendingError,
     ContentNotFoundError,
     ContentRange,
@@ -27,10 +28,6 @@ from opensquilla.content_reader import (
 )
 
 MAX_CONTENT_EXPORT_BYTES = 8 * 1024 * 1024
-
-
-class ContentExportLimitError(ContentReadError):
-    """The caller requested a full export larger than the bounded export cap."""
 
 
 class ContentReader(Protocol):

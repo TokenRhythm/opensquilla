@@ -18,6 +18,10 @@ class ContentReadError(RuntimeError):
     """Base error for a legacy content read."""
 
 
+class ContentExportLimitError(ContentReadError):
+    """The caller requested a full export larger than the bounded export cap."""
+
+
 class ContentNotFoundError(ContentReadError):
     """The requested legacy transcript entry does not exist."""
 
@@ -92,6 +96,7 @@ def validate_content_range(offset: int, limit: int) -> tuple[int, int]:
 
 __all__ = [
     "ContentEncodingError",
+    "ContentExportLimitError",
     "ContentMetadataPendingError",
     "ContentNotFoundError",
     "ContentRange",
