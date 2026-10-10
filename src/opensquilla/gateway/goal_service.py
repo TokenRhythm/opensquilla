@@ -453,12 +453,54 @@ class GoalService:
         activation result and never mutates the continuity grant here.
         """
 
-        if str(snapshot.get("authority_kind") or "") != "goal_lease":
+        authority_kind = str(snapshot.get("authority_kind") or "")
+        if authority_kind not in {"goal_lease", "goal_followup"}:
             return True
         key = canonicalize_session_key(str(getattr(task.envelope, "session_key", "")))
         if not key:
             return False
         try:
+            if authority_kind == "goal_followup" and task.goal_context is None:
+                # Ordinary completions and promoted user inputs do not claim
+                # the parent's Goal merely by reusing its route.
+                # Revalidate the frozen caller even if that Goal was paused,
+                # cleared or replaced; never turn this into an unchecked
+                # legacy route or an internal-runtime permission grant.
+                if (
+                    task.run_kind not in {"runtime_send", "session_turn"}
+                    or snapshot.get("session_id") != task.envelope.session_id
+                    or snapshot.get("session_epoch") != task.envelope.session_epoch
+                ):
+                    return False
+                from opensquilla.gateway.websocket import get_registry
+
+                connection = get_registry().get(str(snapshot.get("owner_connection_id") or ""))
+                # Accepted child work can finish after disconnect/Clear. Its
+                # frozen caller still needs a live token-authority check, but
+                # does not need a transport lease merely to deliver a result.
+                principal = (
+                    getattr(connection, "principal", None) if connection
+                    else task.envelope.runtime_services.get("goal_activation_principal")
+                )
+                if (
+                    principal is None
+                    or _principal_identity(principal) != snapshot.get("principal_identity")
+                ):
+                    return False
+                from opensquilla.gateway.token_store import permission_fingerprint
+
+                if permission_fingerprint(
+                    (str(principal.role),), principal.scopes, principal.capabilities,
+                ) != snapshot.get("principal_permission_fingerprint"):
+                    return False
+                decision = await self._authority_decision(principal)
+                return self._decision_matches(principal, decision) and (
+                    decision.authorization_revision is None
+                    or decision.authorization_revision == snapshot.get("authorization_revision")
+                ) and (
+                    decision.permission_fingerprint is None
+                    or decision.permission_fingerprint == snapshot.get("permission_fingerprint")
+                )
             goal = await self._storage.get_goal(key)
             # A Goal can be explicitly cleared after its turn was durably
             # accepted.  That mutation revokes future Goal authority but must
@@ -918,6 +960,8 @@ class GoalService:
         self,
         envelope: RouteEnvelope,
         principal: Any,
+        *,
+        owner_connection_id: str,
     ) -> None:
         """Attach the same server-owned permit snapshot used by user sends.
 
@@ -965,7 +1009,13 @@ class GoalService:
             "permission_fingerprint": fingerprint,
             "authority_kind": authority_kind,
             "token_public_id": None,
+            "owner_connection_id": owner_connection_id,
+            "principal_identity": _principal_identity(principal),
+            "principal_permission_fingerprint": permission_fingerprint(
+                (str(principal.role),), principal.scopes, principal.capabilities,
+            ),
         }
+        envelope.runtime_services["goal_activation_principal"] = principal
 
     async def _prepare_execution_envelope(
         self,
@@ -1211,7 +1261,9 @@ class GoalService:
             session=session,
             principal=ctx.principal,
         )
-        await self._stamp_activation_authority(envelope, ctx.principal)
+        await self._stamp_activation_authority(
+            envelope, ctx.principal, owner_connection_id=ctx.conn_id,
+        )
 
         async def _accept_and_activate() -> Any:
             async with self._task_runtime.collect_admission(key):
@@ -2860,7 +2912,9 @@ class GoalService:
                 session=session,
                 principal=principal,
             )
-            await self._stamp_activation_authority(envelope, principal)
+            await self._stamp_activation_authority(
+                envelope, principal, owner_connection_id=lease.owner_connection_id,
+            )
         except Exception:
             log.warning(
                 "goal.continuation_execution_preflight_failed",

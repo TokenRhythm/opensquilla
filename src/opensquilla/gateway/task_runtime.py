@@ -606,6 +606,11 @@ def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
 
     metadata = dict(envelope.metadata)
     metadata.pop("selected_skills", None)
+    authority = metadata.get("activation_authority")
+    if isinstance(authority, Mapping) and authority.get("authority_kind") == "goal_lease":
+        # The route can outlive its Goal turn. Preserve its authenticated
+        # origin for revalidation, not the old task's exclusive Goal lease.
+        metadata["activation_authority"] = {**authority, "authority_kind": "goal_followup"}
     if metadata.get("guest_safe") is True:
         for key in (
             "guest_profile_root",
@@ -618,6 +623,7 @@ def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
     runtime_services = dict(envelope.runtime_services)
     runtime_services.pop("suspend_compute_slot", None)
     runtime_services.pop("update_progress", None)
+    runtime_services.pop("goal_context", None)
     return replace(
         envelope,
         metadata=metadata,
@@ -6802,7 +6808,9 @@ class TaskRuntime:
         # revoked after durable acceptance but before provider dispatch.
         authority_kind = str(snapshot.get("authority_kind") or "")
         validator = self._activation_authority_validator
-        if authority_kind == "goal_lease" and callable(validator):
+        if authority_kind in {"goal_lease", "goal_followup"}:
+            if not callable(validator):
+                raise RuntimeError("Goal activation authority validator is unavailable")
             result = validator(task, snapshot)
             if inspect.isawaitable(result):
                 result = await result
