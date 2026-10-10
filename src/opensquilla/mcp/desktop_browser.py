@@ -605,7 +605,8 @@ class DesktopBrowserMCPClient(MCPClient):
             structured = raw_result.get("structuredContent")
             download = structured.get("download") if isinstance(structured, dict) else None
             if (
-                not isinstance(download, dict)
+                not isinstance(structured, dict)
+                or not isinstance(download, dict)
                 or download.get("downloadId") != arguments["downloadId"]
                 or structured.get("targetRef") != arguments.get("targetRef")
             ):

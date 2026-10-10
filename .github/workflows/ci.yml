@@ -1022,6 +1022,7 @@ jobs:
       - name: Run desktop unit tests
         working-directory: desktop/electron
         run: |
+          npm run test:local-build
           node scripts/test-macos-keychain-patch.cjs
           node scripts/test-installer-progress-contract.mjs
           node --test scripts/test-gateway-integrity.mjs

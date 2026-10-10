@@ -58,15 +58,31 @@ if (!process.versions.electron) {
         response.end('Synthetic session-owned download')
         return
       }
+      let page
+      switch (request.url) {
+        case '/a': page = '/a'; break
+        case '/b': page = '/b'; break
+        case '/related-a': page = '/related-a'; break
+        case '/background-a': page = '/background-a'; break
+        case '/navigated-a': page = '/navigated-a'; break
+        case '/popup-a': page = '/popup-a'; break
+        default:
+          response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
+          response.end('Unknown fixture route')
+          return
+      }
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-      response.end(`<!doctype html><title>Session ${request.url}</title>
-        <h1>${request.url}</h1><textarea aria-label="Session draft"></textarea>
+      response.end(`<!doctype html><title>Session ${page}</title>
+        <h1>${page}</h1><textarea aria-label="Session draft"></textarea>
         <a href="/note" download>Download session note</a>
         <button onclick="window.open('/popup-a','shared-name')">Open related page</button>`)
     })
     try {
       await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
       const origin = `http://127.0.0.1:${server.address().port}`
+      const unknownPage = await fetch(`${origin}/a?probe=%3Cscript%3Ealert(1)%3C/script%3E`)
+      assert.equal(unknownPage.status, 404)
+      assert.equal(await unknownPage.text(), 'Unknown fixture route')
       owner = new BrowserWindow({ show: false, width: 900, height: 700,
         webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } })
       await owner.loadURL('data:text/html,<title>Synthetic session host</title>')

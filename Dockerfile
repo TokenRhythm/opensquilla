@@ -55,6 +55,7 @@ RUN apt-get update \
 
 # Copy minimal build context — everything else is in .dockerignore.
 COPY pyproject.toml README.md README.release.md ./
+COPY uv.lock ./uv.lock
 COPY hatch_build.py ./
 COPY scripts/verify_webui_artifact.py ./scripts/verify_webui_artifact.py
 COPY scripts/freeze_migration_registry.py ./scripts/freeze_migration_registry.py
@@ -94,8 +95,25 @@ if missing or pointers:
     )
 PY
 
-RUN pip install ".[recommended]" \
-    && rm -rf hatch_build.py scripts opensquilla-webui
+# Keep the SDK and its protocol types aligned with the version exercised by
+# source, frozen-runtime and container transport checks.
+RUN python - <<'MCP'
+import tomllib
+from pathlib import Path
+
+with Path("uv.lock").open("rb") as stream:
+    packages = tomllib.load(stream)["package"]
+constraints = []
+for name in ("mcp", "mcp-types"):
+    versions = {package["version"] for package in packages if package["name"] == name}
+    if len(versions) != 1:
+        raise SystemExit(f"Expected one locked version for {name}, got {sorted(versions)}")
+    constraints.append(f"{name}=={versions.pop()}")
+Path("mcp-constraints.txt").write_text("\n".join(constraints) + "\n", encoding="utf-8")
+MCP
+
+RUN pip install --constraint mcp-constraints.txt ".[recommended]" \
+    && rm -rf hatch_build.py scripts opensquilla-webui uv.lock mcp-constraints.txt
 
 # Persisted state root. The gateway writes config, state, logs, and the
 # workspace under OPENSQUILLA_STATE_DIR — mounting a volume here (see

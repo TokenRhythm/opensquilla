@@ -110,8 +110,18 @@ if (!process.versions.electron) {
         response.end('<!doctype html><title>Login required</title>Login required')
         return
       }
-      if (request.url === '/second' || request.url === '/child' || request.url === '/context') {
-        response.end(`<!doctype html><title>${request.url.slice(1)}</title><p id="identity">signed in</p>`)
+      const relatedPages = {
+        '/second': '<!doctype html><title>second</title><p id="identity">signed in</p>',
+        '/child': '<!doctype html><title>child</title><p id="identity">signed in</p>',
+        '/context': '<!doctype html><title>context</title><p id="identity">signed in</p>',
+      }
+      if (Object.hasOwn(relatedPages, request.url)) {
+        response.end(relatedPages[request.url])
+        return
+      }
+      if (request.url !== '/dashboard') {
+        response.writeHead(404)
+        response.end('Unknown fixture route')
         return
       }
       response.end(`<!doctype html><title>Dashboard</title>
@@ -188,6 +198,11 @@ if (!process.versions.electron) {
     try {
       await new Promise(resolve => web.listen(0, '127.0.0.1', resolve))
       const origin = `http://127.0.0.1:${web.address().port}`
+      const unknownPage = await fetch(`${origin}/second?probe=%3Cscript%3Ealert(1)%3C/script%3E`, {
+        headers: { cookie: 'sid=synthetic' },
+      })
+      assert.equal(unknownPage.status, 404)
+      assert.equal(await unknownPage.text(), 'Unknown fixture route')
       owner = new BrowserWindow({ show: false, width: 1100, height: 800,
         webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } })
       await owner.loadURL('data:text/html,<title>Browser foundation host</title>')

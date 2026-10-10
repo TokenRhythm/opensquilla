@@ -492,6 +492,40 @@ async def test_gateway_rejects_mismatched_private_receipt_without_exposing_bytes
     assert not (Path(browser_context.workspace_dir or "") / ".opensquilla").exists()
 
 
+@pytest.mark.parametrize("structured", [
+    None,
+    [],
+    {},
+    {"targetRef": "page-synthetic", "download": None},
+    {"targetRef": "page-synthetic", "download": {"downloadId": "download-foreign"}},
+    {"targetRef": "page-foreign", "download": {"downloadId": "download-synthetic"}},
+])
+async def test_gateway_rejects_invalid_pdf_receipt_before_materializing(
+    browser_context: ToolContext, monkeypatch: pytest.MonkeyPatch, structured: object,
+) -> None:
+    client = DesktopBrowserMCPClient(browser_context.desktop_browser)
+    client._pdf_download_export = True
+    packet = _export(_pdf_bytes())
+    request = AsyncMock(return_value={"result": {
+        "content": [], "isError": False, "structuredContent": structured,
+        "_meta": {"opensquilla/pdfExport": packet},
+    }})
+    monkeypatch.setattr(client, "_request", request)
+    context_token = current_tool_context.set(browser_context)
+    call_token = current_mcp_call_context.set(MCPCallContext("call-invalid-pdf-receipt"))
+    try:
+        result = await client.call_tool("browser_inspect", {
+            "targetRef": "page-synthetic", "downloadId": "download-synthetic",
+        })
+    finally:
+        current_mcp_call_context.reset(call_token)
+        current_tool_context.reset(context_token)
+    assert result.is_error
+    assert result.structured_content["code"] == "BROWSER_PROTOCOL_ERROR"
+    assert packet["dataBase64"] not in result.content
+    assert not (Path(browser_context.workspace_dir or "") / ".opensquilla").exists()
+
+
 async def test_text_download_on_new_desktop_still_returns_ordinary_inspect(
     browser_context: ToolContext, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

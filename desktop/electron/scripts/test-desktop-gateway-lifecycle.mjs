@@ -222,7 +222,7 @@ function mainExitHarness() {
       clear() {},
       revokeAll: () => { calls.order.push('preview-cleanup'); return previewCleanup.promise },
     },
-    nativeWorkbenchSurfaces: { destroyAll: async () => {} },
+    nativeWorkbenchSurfaces: { hasBrowserTabs: () => false, destroyAll: async () => {} },
     desktopBrowser: { close: async () => {} },
     destroyWindowsTray() {}, stopGateway() {},
     hasGatewayProcessExited: () => false,
