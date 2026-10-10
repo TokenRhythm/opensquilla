@@ -3056,7 +3056,7 @@ async def build_services(
             )
             if active is None or getattr(active, "_sandbox_run_context_fresh", False):
                 setattr(tool_context, "_sandbox_run_context_fresh", True)
-            pin_sandbox_policy(tool_context, config)
+            await asyncio.to_thread(pin_sandbox_policy, tool_context, config)
             return tool_context
 
         session_manager = SessionManager(

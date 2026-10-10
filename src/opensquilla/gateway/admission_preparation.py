@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import Awaitable, Callable
@@ -357,7 +358,7 @@ async def prepare_route(
             host_execute_allowed=host_execute_allowed, workspace_dir=run_context.workspace,
             workspace_strict=bool(getattr(config, "workspace_strict", True)),
         )
-        pin_sandbox_policy(tool_context, config)
+        await asyncio.to_thread(pin_sandbox_policy, tool_context, config)
         try:
             await validate_workspace_files(
                 command.workspace_files, session=session, storage=storage,

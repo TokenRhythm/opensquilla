@@ -152,7 +152,7 @@ async def native_selection_context(config: Any, manager: Any, key: str) -> tuple
         session_id=session.session_id,
         session_epoch=session.epoch,
     )
-    pin_sandbox_policy(tool_context, config)
+    await asyncio.to_thread(pin_sandbox_policy, tool_context, config)
     return session, storage, tool_context
 
 
