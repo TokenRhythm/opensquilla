@@ -4571,6 +4571,10 @@ def _v2_history_item(
         "contents": [],
     }
     if isinstance(ref, Mapping):
+        if pending:
+            # An unknown length can identify a semantic read but cannot
+            # advertise a ready byte-range handle.
+            return item
         ref_session = str(ref.get("sessionId") or session_id)
         ref_message = str(ref.get("messageId") or message_id)
         revision = ref.get("revision")

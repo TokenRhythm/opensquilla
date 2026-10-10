@@ -80,7 +80,7 @@ afterEach(() => {
 })
 
 describe('automatic content through the real assistant renderer', () => {
-  it.each(['immediate', 'delayed', 'closed', 'replaced', 'failed'])('loads complete details and shares an existing read with the full viewer (%s)', async mode => {
+  it.each(['immediate', 'pending', 'delayed', 'closed', 'replaced', 'failed'])('loads complete details and shares an existing read with the full viewer (%s)', async mode => {
     const reasoning = '深入思考🙂'.repeat(3_000)
     const input = { data: 'long input '.repeat(3_000) }
     const result = 'full-result-'.repeat(3_000)
@@ -94,14 +94,15 @@ describe('automatic content through the real assistant renderer', () => {
       const response = () => new Response(JSON.stringify({
         message_id: 'answer', role: 'assistant', reasoning_content: reasoning, tool_calls: segments,
       }))
-      return mode === 'immediate' ? Promise.resolve(response())
+      return mode === 'immediate' || mode === 'pending' ? Promise.resolve(response())
         : new Promise((resolve, reject) => { release = () => mode === 'failed'
           ? reject(new Error('details unavailable')) : resolve(response()) })
     })
     const bodyRead = vi.spyOn(ContentRangeCache.prototype, 'readDisplay')
     const { host, canonical, showResult } = await mount([], [{
       role: 'assistant', text: 'Final answer', messageId: 'answer', ts: 1, previewComplete: true,
-      contentRef: { ...message().contentRef!, revision: 'r1' }, contentRevision: 'r1',
+      contentRef: { ...message().contentRef!, revision: mode === 'pending' ? 'legacy-v1:active:1:1:0:pending' : 'r1',
+        byteLength: mode === 'pending' ? undefined : 32768 }, contentRevision: 'r1',
       historyPayloadPreview: { detailsTruncated: true }, reasoning: { text: reasoning.slice(0, 30), seconds: 3 },
       tool_calls: [{ ...segments[0], input: { data: 'preview data '.repeat(60) } },
         { ...segments[1], result: 'preview result '.repeat(60) }, segments[2]],
@@ -111,7 +112,7 @@ describe('automatic content through the real assistant renderer', () => {
     const activity = host.querySelector<HTMLButtonElement>('.assistant-activity__summary')!
     expect(activity).not.toBeNull()
     activity.click()
-    if (mode !== 'immediate') {
+    if (mode !== 'immediate' && mode !== 'pending') {
       await nextTick()
       const row = host.querySelector<HTMLButtonElement>('.tool-row')!
       if (row.getAttribute('aria-expanded') !== 'true') row.click()
@@ -133,7 +134,7 @@ describe('automatic content through the real assistant renderer', () => {
     }
     expect(canonical.value[0]?.reasoning?.text).toBe(reasoning)
     expect(host.querySelector('.thinking-fold__body')?.textContent).toBe(reasoning)
-    if (mode === 'immediate') {
+    if (mode === 'immediate' || mode === 'pending') {
       const toolRow = host.querySelector<HTMLButtonElement>('.tool-row')!
       expect(toolRow).not.toBeNull()
       if (toolRow.getAttribute('aria-expanded') !== 'true') toolRow.click()
@@ -146,6 +147,21 @@ describe('automatic content through the real assistant renderer', () => {
     expect(showResult.mock.calls[0]?.[0]).toContain(result.trimEnd())
     expect(host.querySelector('.chat-history-content-page')).toBeNull()
     expect(host.querySelector('[data-testid="chat-history-content-hydration"]')).toBeNull()
+  })
+
+  it('hydrates an unindexed body in the mounted row without waiting for metadata backfill', async () => {
+    const body = '完整旧正文🙂'.repeat(4000)
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(body))
+    const { host } = await mount([message({
+      contentAvailability: 'preparing',
+      contentRef: { version: 1, sessionKey, sessionId: 'session', messageId: 'answer',
+        view: 'display', source: 'active', revision: 'legacy-v1:active:1:1:0:pending' },
+    })])
+    await vi.waitFor(() => expect(host.querySelector('.assistant-answer .msg-ai-text')?.textContent?.trimEnd()).toBe(body))
+    expect(fetcher).toHaveBeenCalledOnce()
+    expect(fetcher.mock.calls[0]?.[0]).toContain('view=display&export=1')
+    expect(fetcher.mock.calls[0]?.[0]).toContain('revision=legacy-v1%3Aactive%3A1%3A1%3A0%3Apending')
+    expect(host.textContent).not.toContain('PREVIEW_ONLY')
   })
 
   it('renders hydrated Markdown once without a separate reader or stale timeline preview', async () => {

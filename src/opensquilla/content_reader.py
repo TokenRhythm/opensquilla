@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -40,7 +41,7 @@ class LegacyContentRef:
     session_id: str
     message_id: str
     source: ContentSource
-    byte_length: int
+    byte_length: int | None
     # Storage row revision used to reject same-length replacement races.
     revision: str | None = None
 
@@ -60,7 +61,19 @@ class ContentRange:
 
     @property
     def eof(self) -> bool:
+        if self.ref.byte_length is None:
+            raise ContentMetadataPendingError("raw ranges require indexed content length")
         return self.end >= self.ref.byte_length
+
+
+def content_revision_matches(requested: str, current: str | None) -> bool:
+    """A pending length is not a pending identity or content version."""
+    if requested == current:
+        return True
+    pending = re.fullmatch(r"(legacy-v1:(?:active|compacted):\d+:\d+:\d+):pending", requested)
+    return bool(pending and current and re.fullmatch(
+        re.escape(pending[1]) + r":\d+", current,
+    ))
 
 
 def validate_content_range(offset: int, limit: int) -> tuple[int, int]:
@@ -88,5 +101,6 @@ __all__ = [
     "LegacyContentRef",
     "MAX_CONTENT_RANGE_BYTES",
     "MAX_DISPLAY_CONTENT_BYTES",
+    "content_revision_matches",
     "validate_content_range",
 ]

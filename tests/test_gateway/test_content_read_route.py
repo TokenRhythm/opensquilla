@@ -23,7 +23,9 @@ class _Storage:
     async def get_session(self, key: str):
         return SimpleNamespace(session_key=key, session_id="sid")
 
-    async def get_legacy_content_ref(self, session_id: str, message_id: str, *, source=None):
+    async def get_legacy_content_ref(
+        self, session_id: str, message_id: str, *, source=None, allow_pending=False,
+    ):
         if (session_id, message_id) != ("sid", "mid"):
             from opensquilla.content_reader import ContentNotFoundError
 

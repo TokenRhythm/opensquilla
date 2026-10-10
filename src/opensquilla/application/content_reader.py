@@ -42,6 +42,7 @@ class ContentReader(Protocol):
         message_id: str,
         *,
         source: ContentSource | None = None,
+        allow_pending: bool = False,
     ) -> LegacyContentRef: ...
 
     async def read_range(
@@ -76,6 +77,8 @@ async def iter_content_ranges(
     """Iterate a body through bounded reads, never loading it all at once."""
 
     _, chunk_bytes = validate_content_range(0, chunk_bytes)
+    if ref.byte_length is None:
+        raise ContentMetadataPendingError("raw ranges require indexed content length")
     offset = 0
     while offset < ref.byte_length:
         chunk = await reader.read_range(ref, offset=offset, limit=chunk_bytes)

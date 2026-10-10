@@ -31,6 +31,20 @@ async function read(reference: Partial<ContentRef>) {
 }
 
 describe('v2 content read identity', () => {
+  it.each(['display', 'raw'] as const)('only preserves a pending %s identity for semantic reads', async view => {
+    const value = result()
+    const item = value.items[0]!
+    item.content_availability = 'preparing'
+    item.contents = []
+    const reference = { version: 1, sessionKey: 'key', sessionId: 'sid', messageId: 'mid',
+      source: 'active', view, revision: 'legacy-v1:active:12:1000:2:pending' }
+    Object.assign(item.message, { contentRef: reference, contentMetadataPending: true })
+    const page = await requestV2SessionHistory({ generation: 1, request: vi.fn().mockResolvedValue(value) },
+      'key', { direction: 'latest', limit: 10, signal: new AbortController().signal }, 1)
+    expect(page.messages[0]?.contentRef).toEqual(view === 'display' ? reference : undefined)
+    expect(page.messages[0]?.contentAvailability).toBe('preparing')
+  })
+
   it.each(['raw', 'display'] as const)('preserves explicit %s view and storage coordinates', async view => {
     const page = await read({ view })
     expect(page.messages[0]?.contentRef).toEqual({

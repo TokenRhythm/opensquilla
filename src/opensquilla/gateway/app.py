@@ -915,9 +915,16 @@ def create_gateway_app(
                 raise ContentNotFoundError("legacy content session generation was not found")
             source = source_param
             reader = build_content_reader(storage)
-            ref = await reader.get_ref(session_id, message_id, source=source)
+            ref = await reader.get_ref(
+                session_id, message_id, source=source,
+                allow_pending=view in {"display", "details"},
+            )
             requested_revision = str(request.query_params.get("revision") or "").strip()
-            if requested_revision and requested_revision != (ref.revision or ""):
+            from opensquilla.content_reader import content_revision_matches
+
+            if requested_revision and not content_revision_matches(
+                requested_revision, ref.revision,
+            ):
                 raise ContentNotFoundError("legacy transcript content changed")
             export = str(request.query_params.get("export") or "").lower() in {"1", "true", "yes"}
             if view in {"display", "details"}:

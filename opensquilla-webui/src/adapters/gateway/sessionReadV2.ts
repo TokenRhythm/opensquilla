@@ -222,7 +222,8 @@ function projectV2HistoryMessage(item: HistoryV2Item, key: string, index: number
   const message = projectHistoryMessage(item.message, index)
   const ref = item.content_availability === 'ready'
     ? message.contentRef ?? contentRef(item, key)
-    : undefined
+    : item.content_availability === 'preparing' && message.contentRef?.view === 'display'
+      ? message.contentRef : undefined
   return Object.freeze({
     ...message,
     id: item.item_id || item.message_id || `history:${index}`,

@@ -769,8 +769,8 @@ def transcript_entries_to_chat_messages(
         }
         if content_mode == "bounded" and content_metadata_pending:
             # Keep the preview usable while making the temporary state
-            # explicit.  No contentRef is emitted until the exact byte length
-            # is backfilled, so the client cannot issue an unsafe range read.
+            # explicit. Pending references only permit semantic reads; raw
+            # ranges still require the exact indexed byte length.
             msg["contentMetadataPending"] = True
         preview_complete = not (raw_body_truncated or display_truncated)
         if content_mode == "bounded":
@@ -939,5 +939,26 @@ def transcript_entries_to_chat_messages(
                 source = getattr(projected_entry, "content_source", None)
                 if source in {"active", "compacted"}:
                     msg["contentRef"]["source"] = source
+            if (
+                content_metadata_pending and "contentRef" not in msg
+                and (
+                    not preview_complete
+                    or msg.get("historyPayloadPreview", {}).get("detailsTruncated")
+                )
+                and all(isinstance(value, str) and value for value in (
+                    content_session_key, content_session_id, content_message_id,
+                ))
+            ):
+                revision = getattr(projected_entry, "content_revision", None)
+                source = getattr(projected_entry, "content_source", None)
+                if (
+                    isinstance(revision, str) and revision.endswith(":pending")
+                    and source in {"active", "compacted"}
+                ):
+                    msg["contentRef"] = {
+                        "version": 1, "sessionKey": content_session_key,
+                        "sessionId": content_session_id, "messageId": content_message_id,
+                        "view": "display", "revision": revision, "source": source,
+                    }
         messages.append(msg)
     return messages

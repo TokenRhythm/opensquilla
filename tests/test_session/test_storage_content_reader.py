@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import sqlite3
+import threading
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -20,6 +23,141 @@ from opensquilla.application.content_reader import (
 from opensquilla.chat.history import transcript_entries_to_chat_messages
 from opensquilla.session.models import TranscriptEntry
 from opensquilla.session.storage import SessionStorage
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["native", "fallback"])
+@pytest.mark.parametrize("source", ["active", "compacted"])
+async def test_unindexed_display_reads_one_versioned_blob_on_its_worker(
+    tmp_path, monkeypatch, backend, source,
+):
+    from opensquilla.compat import aiosqlite
+    monkeypatch.setattr(aiosqlite, "_FORCE_SQLITE3_FALLBACK", backend == "fallback")
+    monkeypatch.setattr(aiosqlite, "_prefer_native", True)
+    if backend == "native":
+        pytest.importorskip("aiosqlite")
+    events = []
+    deny_content = False
+    block_read = False
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Blob:
+        def __init__(self, blob): self.blob = blob
+        def __len__(self): return len(self.blob)
+        def __enter__(self): return self
+        def __exit__(self, *_):
+            self.blob.close()
+            events.append("closed")
+        def read(self, size):
+            events.append(("read", size, threading.get_ident()))
+            if block_read:
+                entered.set()
+                assert release.wait(5), "test did not release SQLite worker"
+            return self.blob.read(size)
+
+    class Connection(sqlite3.Connection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.set_authorizer(lambda action, _table, column, *_: sqlite3.SQLITE_DENY
+                if deny_content and action == sqlite3.SQLITE_READ and column == "content"
+                else sqlite3.SQLITE_OK)
+        def blobopen(self, table, column, row, *, readonly=False, **kwargs):
+            events.append(("open", table, row, readonly))
+            return Blob(super().blobopen(table, column, row, readonly=readonly, **kwargs))
+
+    connect = aiosqlite.connect
+    monkeypatch.setattr(
+        aiosqlite, "connect", lambda *args, **kwargs: connect(*args, **kwargs, factory=Connection),
+    )
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    body = "中文🙂\n" * 4096
+    table = "transcript_entries" if source == "active" else "compacted_transcript_entries"
+    try:
+        await storage.append_transcript_entry(TranscriptEntry(
+            session_id="sid", session_key="agent:main:webchat:legacy", message_id="mid",
+            role="assistant", content=body, reasoning_content="full thinking", created_at=1,
+        ))
+        if source == "compacted":
+            await storage.conn.execute("""
+                INSERT INTO compacted_transcript_entries
+                    (id, session_id, session_key, message_id, role, content, reasoning_content,
+                     created_at, archived_at, original_entry_id, content_revision)
+                SELECT 91, session_id, session_key, message_id, role, content, reasoning_content,
+                       created_at, 2, id, content_revision FROM transcript_entries
+            """)
+            await storage.conn.execute("DELETE FROM transcript_entries")
+        await storage.conn.execute(f"UPDATE {table} SET content_byte_length = NULL")
+        await storage.conn.commit()
+        ref = await storage.get_legacy_content_ref("sid", "mid", source=source, allow_pending=True)
+        assert ref.byte_length is None
+        assert await storage.read_legacy_display_text(ref) == body
+        assert events[0] == ("open", table, 91 if source == "compacted" else 1, True)
+        assert events[1][:2] == ("read", len(body.encode()))
+        assert events[1][2] != threading.get_ident()
+        assert events[-1] == "closed"
+        events.clear()
+        with pytest.raises(ContentExportLimitError):
+            await storage.read_legacy_display_text(ref, max_bytes=100)
+        assert len(events) == 2 and events[-1] == "closed"  # No read before rejecting length.
+        events.clear()
+        deny_content = True
+        details = json.loads(await storage.read_legacy_display_details(ref))
+        assert details["reasoning_content"] == "full thinking"
+        assert events == []
+        deny_content = False
+        await storage.conn.execute(
+            f"UPDATE {table} SET content = ?", (body.replace("中文", "替换"),),
+        )
+        await storage.conn.commit()
+        with pytest.raises(ContentNotFoundError):
+            await storage.read_legacy_display_text(ref)
+        assert events == []  # Reject the old version before opening any blob.
+        # Keep the body unindexed after the ordinary content-update trigger.
+        await storage.conn.execute(f"UPDATE {table} SET content_byte_length = NULL")
+        await storage.conn.commit()
+        current = await storage.get_legacy_content_ref(
+            "sid", "mid", source=source, allow_pending=True,
+        )
+        block_read = True
+        task = asyncio.create_task(storage.read_legacy_display_text(current))
+        assert await asyncio.to_thread(entered.wait, 2)
+        task.cancel()
+        closing = asyncio.create_task(storage.close())
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert not closing.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await closing
+        assert events[-1] == "closed"
+    finally:
+        release.set()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [None, "", b"\xff"])
+async def test_unindexed_display_preserves_empty_and_utf8_validation(tmp_path, body):
+    from opensquilla.content_reader import ContentEncodingError
+
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.append_transcript_entry(TranscriptEntry(
+            session_id="sid", message_id="mid", role="assistant", content="seed", created_at=1,
+        ))
+        await storage.conn.execute("UPDATE transcript_entries SET content = ?", (body,))
+        await storage.conn.execute("UPDATE transcript_entries SET content_byte_length = NULL")
+        await storage.conn.commit()
+        ref = await storage.get_legacy_content_ref("sid", "mid", allow_pending=True)
+        if isinstance(body, bytes):
+            with pytest.raises(ContentEncodingError):
+                await storage.read_legacy_display_text(ref)
+        else:
+            assert await storage.read_legacy_display_text(ref) == ""
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -325,7 +463,10 @@ async def test_semantic_content_reader_projects_tool_result_json(tmp_path) -> No
 
 
 @pytest.mark.asyncio
-async def test_semantic_content_reader_rejects_large_raw_rows_before_projection(tmp_path) -> None:
+@pytest.mark.parametrize("unindexed", [False, True])
+async def test_semantic_content_reader_rejects_large_raw_rows_before_projection(
+    tmp_path, unindexed,
+) -> None:
     body = "x" * (MAX_CONTENT_RANGE_BYTES * 8 + 1)
     storage = await SessionStorage.open(tmp_path / "sessions.db")
     try:
@@ -339,7 +480,10 @@ async def test_semantic_content_reader_rejects_large_raw_rows_before_projection(
                 created_at=1,
             )
         )
-        ref = await storage.get_legacy_content_ref("sid", "too-large")
+        if unindexed:
+            await storage.conn.execute("UPDATE transcript_entries SET content_byte_length = NULL")
+            await storage.conn.commit()
+        ref = await storage.get_legacy_content_ref("sid", "too-large", allow_pending=unindexed)
         with pytest.raises(ContentExportLimitError):
             await storage.read_legacy_display_text(ref)
     finally:

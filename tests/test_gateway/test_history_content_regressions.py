@@ -220,7 +220,11 @@ async def test_pending_sql_metadata_is_independent_of_actual_truncation(tmp_path
         message = transcript_entries_to_chat_messages(entries, content_mode="bounded")[0]
         assert message["text"] == ("small complete answer" if body.startswith("{") else body[:4096])
         assert message["contentPreviewComplete"] is (not truncated)
-        assert "contentRef" not in message
+        assert ("contentRef" in message) is truncated
+        if truncated:
+            assert message["contentRef"]["view"] == "display"
+            assert message["contentRef"]["revision"].endswith(":pending")
+            assert "byteLength" not in message["contentRef"]
         item = rpc_sessions._v2_history_item(message, session_id="sid", session_epoch=0, order=0)
         assert item["content_availability"] == "preparing"
         assert item["source_revision"].endswith(":pending")

@@ -1857,6 +1857,23 @@ def _decode_transcript_rows(rows: Sequence[Any]) -> list[TranscriptEntry]:
     return [TranscriptEntry(**_deserialize_row(dict(row))) for row in rows]
 
 
+def _project_legacy_display_row(row: Any, raw_bytes: bytes) -> str:
+    from opensquilla.chat.history import transcript_entries_to_chat_messages
+    from opensquilla.content_reader import ContentEncodingError
+
+    try:
+        decoded = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ContentEncodingError("legacy transcript content is not valid UTF-8") from exc
+    payload = dict(row)
+    payload["content"] = decoded
+    payload.pop("content_byte_length", None)
+    entry = TranscriptEntry(**_deserialize_row(payload))
+    messages = transcript_entries_to_chat_messages([entry], content_mode="legacy")
+    text = messages[0].get("text") if messages else None
+    return text if isinstance(text, str) else ""
+
+
 def _py_lower(value: Any) -> Any:
     """Unicode-aware lowercase for the ``py_lower`` SQL function.
 
@@ -16033,6 +16050,7 @@ class SessionStorage:
         *,
         source: ContentSource | None = None,
         actual_byte_length: bool = False,
+        allow_pending: bool = False,
     ) -> LegacyContentRef:
         """Return metadata for one legacy body without materializing it.
 
@@ -16116,21 +16134,21 @@ class SessionStorage:
         row_source = str(row[0])
         if row_source not in ("active", "compacted"):
             raise ContentNotFoundError("legacy transcript content source is invalid")
-        if row[4] is None:
+        if row[4] is None and not allow_pending:
             raise ContentMetadataPendingError(
                 "legacy transcript content metadata is still being indexed"
             )
         revision = None
-        if row[1] is not None and row[2] is not None and row[4] is not None:
+        if row[1] is not None and row[2] is not None:
             revision = (
                 f"legacy-v1:{row_source}:{int(row[1])}:{int(row[2])}:"
-                f"{int(row[3] or 0)}:{int(row[4])}"
+                f"{int(row[3] or 0)}:{int(row[4]) if row[4] is not None else 'pending'}"
             )
         return LegacyContentRef(
             session_id=session_id,
             message_id=message_id,
             source=cast(ContentSource, row_source),
-            byte_length=max(0, int(row[4] or 0)),
+            byte_length=max(0, int(row[4])) if row[4] is not None else None,
             revision=revision,
         )
 
@@ -16151,6 +16169,8 @@ class SessionStorage:
         """
 
         offset, limit = validate_content_range(offset, limit)
+        if ref.byte_length is None:
+            raise ContentMetadataPendingError("raw ranges require indexed content length")
         if offset > ref.byte_length:
             raise ContentRangeError("content range offset exceeds content length")
         table = {
@@ -16200,6 +16220,75 @@ class SessionStorage:
             raise ContentRangeError("storage returned an oversized content range")
         return ContentRange(ref=ref, offset=offset, limit=limit, data=data)
 
+    @_serialized_read
+    async def _read_unindexed_display_text(self, ref: LegacyContentRef, *, max_bytes: int) -> str:
+        """Read one unknown-length body on the owned SQLite worker and snapshot."""
+        from opensquilla.application.content_reader import ContentExportLimitError
+        from opensquilla.content_reader import content_revision_matches
+
+        table = {
+            "active": "transcript_entries", "compacted": "compacted_transcript_entries",
+        }[ref.source]
+        identity = "id" if ref.source == "active" else "original_entry_id"
+        reader = self.conn
+
+        def read() -> str:
+            connection = reader._conn
+            owns_transaction = not connection.in_transaction
+            if owns_transaction:
+                connection.execute("BEGIN").close()
+            try:
+                cursor = connection.execute(
+                    f"""SELECT id AS blob_rowid, {identity} AS id, session_id, session_key,
+                        message_id, role, tool_calls, tool_call_id, reasoning_content,
+                        turn_usage, turn_context, created_at, token_count,
+                        provenance_kind, provenance_origin_session_id,
+                        provenance_source_session_key,
+                        provenance_source_channel, provenance_source_tool, schema_version,
+                        content_revision, content_byte_length, typeof(content) AS content_type
+                        FROM {table} WHERE session_id = ? AND message_id = ? LIMIT 1""",
+                    (ref.session_id, ref.message_id),
+                )
+                try:
+                    row = cursor.fetchone()
+                finally:
+                    cursor.close()
+                if row is None:
+                    raise ContentNotFoundError("legacy transcript content was not found")
+                length = row["content_byte_length"]
+                revision = (
+                    f"legacy-v1:{ref.source}:{row['id']}:{row['created_at']}:"
+                    f"{row['content_revision']}:{length if length is not None else 'pending'}"
+                )
+                if not ref.revision or not content_revision_matches(ref.revision, revision):
+                    raise ContentNotFoundError("legacy transcript content changed")
+                if row["content_type"] == "null":
+                    raw_bytes = b""
+                else:
+                    with connection.blobopen(
+                        table, "content", row["blob_rowid"], readonly=True,
+                    ) as blob:
+                        if len(blob) > max_bytes:
+                            raise ContentExportLimitError(
+                                f"display content exceeds {max_bytes} bytes"
+                            )
+                        raw_bytes = blob.read(len(blob))
+            finally:
+                if owns_transaction:
+                    connection.rollback()
+            text = _project_legacy_display_row(row, raw_bytes)
+            if len(text.encode("utf-8")) > max_bytes:
+                raise ContentExportLimitError(f"display content exceeds {max_bytes} bytes")
+            return text
+
+        async def run() -> str:
+            if isinstance(reader, aiosqlite._AsyncConnection):
+                async with reader._locked:
+                    return cast(str, await aiosqlite._run_sqlite_call(read))
+            return cast(str, await reader._execute(read))
+
+        return cast(str, await self._finish_sqlite_call(run()))
+
     async def read_legacy_display_text(
         self,
         ref: LegacyContentRef,
@@ -16227,6 +16316,9 @@ class SessionStorage:
         }.get(ref.source)
         if table is None:
             raise ContentNotFoundError("legacy content source is invalid")
+
+        if ref.byte_length is None:
+            return await self._read_unindexed_display_text(ref, max_bytes=max_bytes)
 
         from opensquilla.session.attachment_history import (
             MAX_INLINE_ENVELOPE_BYTES,
@@ -16333,28 +16425,7 @@ class SessionStorage:
         # TranscriptEntry shape in normal Gateway paths.  Parsing a multi-MiB
         # JSON body is also CPU work; keep it off the shared Gateway event
         # loop just like the bounded SQLite read itself.
-        def project_display() -> str:
-            from opensquilla.chat.history import transcript_entries_to_chat_messages
-
-            try:
-                decoded = raw_bytes.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                from opensquilla.application.content_reader import ContentEncodingError
-
-                raise ContentEncodingError(
-                    "legacy transcript content is not valid UTF-8"
-                ) from exc
-            payload = dict(row)
-            payload["content"] = decoded
-            payload.pop("content_byte_length", None)
-            entry = TranscriptEntry(**_deserialize_row(payload))
-            messages = transcript_entries_to_chat_messages([entry], content_mode="legacy")
-            if not messages:
-                return ""
-            text = messages[0].get("text")
-            return text if isinstance(text, str) else ""
-
-        text = await asyncio.to_thread(project_display)
+        text = await asyncio.to_thread(_project_legacy_display_row, row, raw_bytes)
         if len(text.encode("utf-8")) > max_bytes:
             from opensquilla.application.content_reader import ContentExportLimitError
 
@@ -16380,6 +16451,11 @@ class SessionStorage:
         if table is None or not ref.revision:
             raise ContentNotFoundError("legacy details require a versioned content reference")
         identity = "id" if ref.source == "active" else "original_entry_id"
+        version = re.fullmatch(
+            rf"(legacy-v1:{ref.source}:\d+:\d+:\d+):(?:\d+|pending)", ref.revision,
+        )
+        if version is None:
+            raise ContentNotFoundError("legacy details require a versioned content reference")
         # Check the same revision and the combined payload size in the SQL read.
         # A large tool result must not cross into Python before the display cap
         # is enforced; reasoning/details updates invalidate this revision too.
@@ -16391,14 +16467,14 @@ class SessionStorage:
                        + coalesce(length(CAST(turn_context AS BLOB)), 0) AS detail_bytes
                 FROM {table} WHERE session_id = ? AND message_id = ?
                   AND 'legacy-v1:{ref.source}:' || {identity} || ':' || created_at || ':'
-                    || content_revision || ':' || length(CAST(content AS BLOB)) = ?
+                    || content_revision = ?
                 LIMIT 1
             ) SELECT message_id, role, detail_bytes,
                      CASE WHEN detail_bytes <= ? THEN reasoning_content END AS reasoning_content,
                      CASE WHEN detail_bytes <= ? THEN tool_calls END AS tool_calls,
                      CASE WHEN detail_bytes <= ? THEN turn_context END AS turn_context
               FROM selected""",
-            (ref.session_id, ref.message_id, ref.revision, max_bytes, max_bytes, max_bytes),
+            (ref.session_id, ref.message_id, version[1], max_bytes, max_bytes, max_bytes),
             operation="content_details",
         )
         if not rows:

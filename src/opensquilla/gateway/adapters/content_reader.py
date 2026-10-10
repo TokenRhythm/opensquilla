@@ -25,11 +25,13 @@ class SessionContentReaderStorageAdapter(ContentReader):
         message_id: str,
         *,
         source: ContentSource | None = None,
+        allow_pending: bool = False,
     ) -> LegacyContentRef:
         return await self._storage.get_legacy_content_ref(
             session_id,
             message_id,
             source=source,
+            allow_pending=allow_pending,
         )
 
     async def read_range(
