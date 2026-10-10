@@ -11,7 +11,7 @@ import {
   DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
 } from './packaged-smoke-helpers.mjs'
 import { assertConcurrentRecoveryTransport } from './session-recovery-transport-contract.mjs'
-import { createSessionRecoveryEvidence } from './session-recovery-rpc-evidence.mjs'
+import { createSessionRecoveryEvidence, createSessionRecoveryFault } from './session-recovery-rpc-evidence.mjs'
 import {
   captureElectronProcessIdentity,
   captureFirstSendDiagnostic,
@@ -59,6 +59,7 @@ let heldHistoryRequests = 0
 let heldSubscribeRequests = 0
 let serverTickCount = 0
 const rpcEvidence = createSessionRecoveryEvidence(sessionKey)
+const recoveryFault = createSessionRecoveryFault(sessionKey)
 let faultReleased = 0
 let provider
 
@@ -243,18 +244,21 @@ try {
     const server = client.connectToServer()
 
     client.onClose(() => {
+      recoveryFault.close(socketIndex)
       physicalCloseCount += 1
       if (!injectHang) healthyCloseCount += 1
     })
 
     client.onMessage((message) => {
+      let frame
       try {
-        const frame = JSON.parse(String(message))
-        const held = injectHang && (
-          (frame.method === 'chat.history' && frame.params?.sessionKey === sessionKey)
-          || (frame.method === 'sessions.messages.subscribe' && frame.params?.key === sessionKey)
-        )
-        rpcEvidence.request(socketIndex, frame, held)
+        frame = JSON.parse(String(message))
+      } catch {
+        // Non-JSON protocol frames must remain byte-transparent.
+      }
+      if (frame) {
+        const faultDomain = injectHang ? recoveryFault.holdRequest(socketIndex, frame) : null
+        rpcEvidence.request(socketIndex, frame, faultDomain !== null)
         if (
           frame?.type === 'req'
           && frame.method === 'sessions.messages.subscribe'
@@ -264,26 +268,12 @@ try {
           healthyNavigationSocketIds.add(socketIndex)
           healthySubscribeKeys.push(frame.params.key)
         }
-        if (frame?.type === 'req' && injectHang) {
-          if (
-            frame.method === 'chat.history'
-            && frame.params?.sessionKey === sessionKey
-          ) {
-            countTargetSocket()
-            heldHistoryRequests += 1
-            return
-          }
-          if (
-            frame.method === 'sessions.messages.subscribe'
-            && frame.params?.key === sessionKey
-          ) {
-            countTargetSocket()
-            heldSubscribeRequests += 1
-            return
-          }
+        if (faultDomain !== null) {
+          countTargetSocket()
+          if (faultDomain === 'history') heldHistoryRequests += 1
+          else heldSubscribeRequests += 1
+          return
         }
-      } catch {
-        // Non-JSON protocol frames must remain byte-transparent.
       }
       try {
         server.send(message)
@@ -294,23 +284,35 @@ try {
     })
 
     server.onMessage((message) => {
+      const forward = () => {
+        try {
+          client.send(message)
+        } catch {
+          // The client can close while the real Gateway emits a final tick.
+        }
+      }
+      let frame
       try {
-        const frame = JSON.parse(String(message))
-        rpcEvidence.response(socketIndex, frame)
+        frame = JSON.parse(String(message))
+      } catch {
+        // Non-JSON protocol frames must remain byte-transparent.
+      }
+      if (frame) {
+        const held = recoveryFault.holdResponse(socketIndex, frame, forward)
+        rpcEvidence.response(socketIndex, frame, held)
+        if (held) {
+          countTargetSocket()
+          heldHistoryRequests += 1
+          return
+        }
         if (typeof frame?.protocol === 'number') {
           socketPolicies.set(socketIndex, frame.policy)
         }
         if (frame?.type === 'event' && frame.event === 'tick') {
           serverTickCount += 1
         }
-      } catch {
-        // Non-JSON protocol frames must remain byte-transparent.
       }
-      try {
-        client.send(message)
-      } catch {
-        // The client can close while the real Gateway emits a final tick.
-      }
+      forward()
     })
   })
 
@@ -511,6 +513,7 @@ try {
 
   injectHang = false
   faultReleased = rpcEvidence.mark('fault-released')
+  recoveryFault.release()
   // No click, reload, route change or focus movement may be needed to recover.
   await waitFor(
     () => recoveredMessage.isVisible(),

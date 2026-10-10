@@ -2799,6 +2799,7 @@ def test_package_verifier_hard_fails_stale_runtime_and_boot_contract() -> None:
 def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway() -> None:
     package_json = json.loads(_read("desktop/electron/package.json"))
     recovery = _read("desktop/electron/scripts/test-packaged-session-recovery.mjs")
+    recovery_rpc = _read("desktop/electron/scripts/session-recovery-rpc-evidence.mjs")
     helpers = _read("desktop/electron/scripts/packaged-smoke-helpers.mjs")
 
     assert (
@@ -2812,10 +2813,21 @@ def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway
     assert "app.context().routeWebSocket" in recovery
     assert recovery.index("app.context().routeWebSocket") < recovery.index("app.firstWindow")
     assert recovery.index("page.reload") < recovery.index("page.goto(sessionUrl")
-    assert "chat.history" in recovery
-    assert "sessions.messages.subscribe" in recovery
-    assert "frame.params?.sessionKey === sessionKey" in recovery
-    assert "frame.params?.key === sessionKey" in recovery
+    for method in (
+        "chat.history", "sessions.messages.subscribe", "sessions.messages.snapshot.read",
+    ):
+        assert method in recovery_rpc
+    assert "frame?.type !== 'req'" in recovery_rpc
+    assert "frame.params?.sessionKey === sessionKey" in recovery_rpc
+    assert "frame.params?.key !== sessionKey" in recovery_rpc
+    assert "createSessionRecoveryFault(sessionKey)" in recovery
+    assert "injectHang ? recoveryFault.holdRequest(socketIndex, frame) : null" in recovery
+    assert "recoveryFault.holdResponse(socketIndex, frame, forward)" in recovery
+    assert "rpcEvidence.response(socketIndex, frame, held)" in recovery
+    assert "recoveryFault.close(socketIndex)" in recovery
+    assert recovery.index("rpcEvidence.mark('fault-released')") < recovery.index(
+        "recoveryFault.release()"
+    )
     assert "switchSessionKey = requiredOption('--switch-session-key')" in recovery
     assert "let targetSocketCounted = false" in recovery
     assert recovery.count("countTargetSocket()") == 2
