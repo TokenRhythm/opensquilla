@@ -6,6 +6,7 @@ import {
   MessageChannelMain,
   session,
   shell,
+  webContents,
   webFrameMain,
   type Certificate,
   type MessagePortMain,
@@ -1137,7 +1138,7 @@ export class NativeWorkbenchSurfaceManager {
   }
 
   private async loadBrowserDocument(record: NativeWorkbenchSurfaceRecord, url: string,
-    options?: Electron.LoadURLOptions, signal?: AbortSignal, reload = false): Promise<void> {
+    options?: Electron.LoadURLOptions, signal?: AbortSignal, reload = false, ignoreCache = false): Promise<void> {
     if (signal?.aborted) {
       throw new DesktopBrowserError('TIMEOUT', 'Browser navigation was cancelled before loading.', 409,
         { targetRef: record.targetRef, outcome: 'not_started', retryable: false, recovery: 'inspect' })
@@ -1189,7 +1190,10 @@ export class NativeWorkbenchSurfaceManager {
       record.contents.once('did-finish-load', finished)
       record.contents.on('did-fail-load', failed)
       record.contents.once('destroyed', destroyed)
-      try { record.contents.reload() } catch (error) { reject(error) }
+      try {
+        if (ignoreCache) record.contents.reloadIgnoringCache()
+        else record.contents.reload()
+      } catch (error) { reject(error) }
     }) : record.contents.loadURL(url, options)
     signal?.addEventListener('abort', cancel, { once: true })
     const navigation = Promise.race([raw, cancelled]).catch(async error => {
@@ -3496,6 +3500,7 @@ export class NativeWorkbenchSurfaceManager {
   async navigateSurface(
     request: NativeWorkbenchNavigationRequest,
     signal?: AbortSignal,
+    ignoreCache = false,
   ): Promise<NativeWorkbenchSurfaceResult> {
     const record = this.surfaces.get(request.surfaceId)
     if (!record || record.disposed) {
@@ -3555,8 +3560,10 @@ export class NativeWorkbenchSurfaceManager {
             const currentUrl = contents.getURL()
             const failedUrl = record.browserNavigationError?.url
             await this.loadBrowserDocument(record, failedUrl || currentUrl || record.documentUrl,
-              undefined, signal, !failedUrl || this.httpUrl(failedUrl)?.href === this.httpUrl(currentUrl)?.href)
-          } else contents.reload()
+              undefined, signal, !failedUrl || this.httpUrl(failedUrl)?.href === this.httpUrl(currentUrl)?.href,
+              ignoreCache)
+          } else if (ignoreCache) contents.reloadIgnoringCache()
+          else contents.reload()
           break
         case 'stop':
           if (contents.isLoading() || !record.browserDocumentReady) {
@@ -3615,6 +3622,18 @@ export class NativeWorkbenchSurfaceManager {
       return { ok: false, message: errorMessage(error),
         ...(record.browserNavigationError ? { code: 'NAVIGATION_FAILED', navigationError: record.browserNavigationError } : {}) }
     }
+  }
+
+  reloadFocusedBrowser(owner: BrowserWindow, ignoreCache = false): boolean {
+    const focusedContents = webContents.getFocusedWebContents()
+    const focused = focusedContents?.hostWebContents ?? focusedContents
+    const record = [...this.surfaces.values()].find(candidate => candidate.contents === focused
+      && candidate.kind === 'url-preview' && !candidate.disposed && !candidate.crashed
+      && !candidate.contents.isDestroyed() && candidate.owner === owner && candidate.view.getVisible())
+    if (!record) return false
+    void this.navigateSurface({ version: record.version as 2 | 3 | 4,
+      surfaceId: record.id, action: 'reload' }, undefined, ignoreCache)
+    return true
   }
 
   respondToPermission(
@@ -3953,14 +3972,14 @@ export class NativeWorkbenchSurfaceManager {
           && /^\s*attachment\s*(?:;|$)/i.test(disposition)) {
           browser.browserDownloadNavigation = { url: details.url, generation: browser.browserNavigationGeneration }
         }
-        if (browser && captureOwner && ['mainFrame', 'subFrame'].includes(details.resourceType)
+        if (browser && captureOwner && details.resourceType === 'mainFrame'
           && details.statusCode >= 200 && details.statusCode < 300
           && this.httpUrl(details.url) && this.v2TopLevelNavigationAllowed(browser, details.url)
           && Object.entries(details.responseHeaders ?? {}).some(([name, values]) =>
             name.toLowerCase() === 'content-type' && values.some(value => /^\s*application\/pdf\s*(?:;|$)/i.test(value)))) {
-          // Chromium normally navigates into its viewer. For this one armed
-          // agent action, retain the actual request and turn the response into
-          // a download handled by the existing bounded capture.
+          // Convert only the authorized tab navigation. An inline iframe PDF
+          // can be a preview generated before the requested export and must
+          // never consume the tab's download capture.
           if (details.resourceType === 'mainFrame') {
             browser.browserCapturedPdfNavigation = true
             browser.browserDownloadNavigation = { url: details.url, generation: browser.browserNavigationGeneration }
@@ -4631,6 +4650,36 @@ export class NativeWorkbenchSurfaceManager {
   private configureWebContents(record: NativeWorkbenchSurfaceRecord): void {
     const contents = record.contents
     if (record.kind === 'url-preview') {
+      contents.on('will-frame-navigate', event => {
+        if (!event.isMainFrame || record.disposed || contents.isDestroyed()
+          || record.owner.isDestroyed() || record.mode !== 'full'
+          || event.frame !== contents.mainFrame) return
+        let initiator: Electron.WebFrameMain | null | undefined
+        try { initiator = event.initiator?.top } catch { return }
+        const parent = [...this.surfaces.values()].find(candidate =>
+          candidate !== record && candidate.kind === 'url-preview' && candidate.mode === 'full'
+          && !candidate.disposed && !candidate.contents.isDestroyed() && candidate.browserDownloadAttempt
+          && candidate.previewSession === record.previewSession && candidate.scopeId === record.scopeId
+          && candidate.owner === record.owner && candidate.contents.mainFrame === initiator)
+        // Chromium identifies the real initiating frame even when an existing
+        // named tab is reused by script, late listeners or form.submit().
+        if (!parent || !this.v2TopLevelNavigationAllowed(record, event.url)
+          || !this.browserDownloads.isArmed({ sessionKey: parent.scopeId,
+            targetRef: parent.targetRef, webContentsId: parent.webContentsId })) {
+          // Keep a verified attempt through the destination's own landing-page
+          // redirect, and through a new popup's initial host loadURL path.
+          if ((initiator === contents.mainFrame || !initiator && !record.initialDocumentCommitted
+            && record.openerTargetRef === record.browserDownloadParent?.targetRef)
+            && this.v2TopLevelNavigationAllowed(record, event.url)
+            && record.browserDownloadParent && this.managedDownloadOwner(record)) return
+          record.browserDownloadParent = undefined
+          return
+        }
+        if (!this.browserDownloads.isArmed({ sessionKey: record.scopeId,
+          targetRef: record.targetRef, webContentsId: record.webContentsId })) record.browserDownloadParent = {
+          targetRef: parent.targetRef, attempt: parent.browserDownloadAttempt!,
+        }
+      })
       contents.on('found-in-page', (_event, result) => {
         if (record.browserFindRequestId !== result.requestId) return
         this.emit(record, 'find-state', { findQuery: record.browserFindQuery,
@@ -4954,7 +5003,9 @@ export class NativeWorkbenchSurfaceManager {
         && (input.key === 'F5' || input.key.toLowerCase() === 'r'
           && (process.platform === 'darwin' ? input.meta : input.control))) {
         event.preventDefault()
-        void this.navigateSurface({ version: record.version as 2 | 3 | 4, surfaceId: record.id, action: 'reload' })
+        const ignoreCache = input.shift || input.key === 'F5' && input.control
+        void this.navigateSurface({ version: record.version as 2 | 3 | 4,
+          surfaceId: record.id, action: 'reload' }, undefined, ignoreCache)
         return
       }
       if (input.type === 'keyDown' && input.key === 'Escape'

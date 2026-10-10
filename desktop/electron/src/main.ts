@@ -5308,6 +5308,7 @@ function reloadDesktopWindow(ignoreCache: boolean): void {
   if (currentOnboardingWindow()) return
   const window = currentMainWindow()
   if (!window || window.isDestroyed()) return
+  if (nativeWorkbenchSurfaces.reloadFocusedBrowser(window, ignoreCache)) return
   void guardBrowserReload(() => {
     if (window.isDestroyed() || window.webContents.isDestroyed()) return
     if (ignoreCache) window.webContents.reloadIgnoringCache()

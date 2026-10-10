@@ -329,7 +329,7 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
       const requestId = event.detail?.requestId || ''
       const native = this.context.nativeWorkbenchApi
       if (!requestId || !native?.respondToPermission) return
-      const allow = await this.options.confirmPermission({
+      const allow = this.context.isItemActive?.() === false ? false : await this.options.confirmPermission({
         permission: event.detail?.permission || 'unknown',
         requestingOrigin: event.detail?.requestingOrigin || '',
       })
@@ -337,7 +337,7 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
         version: 2,
         surfaceId: this.item.id,
         requestId,
-        allow,
+        allow: allow && this.context.isItemActive?.() !== false,
       })
       return
     }

@@ -280,8 +280,11 @@ export class WorkbenchRuntimeManager {
         this.renderStates.set(item.id, { ...current, ...patch })
       },
       isItemOpen: isCurrentRuntime,
+      isItemActive: () => isCurrentRuntime() && this.resumedItemIds.has(item.id),
       setExpanded: expanded => {
-        if (isCurrentRuntime()) this.options.setExpanded?.(expanded)
+        if (isCurrentRuntime() && this.resumedItemIds.has(item.id)) {
+          this.options.setExpanded?.(expanded)
+        }
       },
       reportError: error => this.reportError(error, item),
     }

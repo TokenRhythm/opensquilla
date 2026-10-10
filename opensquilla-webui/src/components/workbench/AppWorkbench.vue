@@ -2,7 +2,7 @@
   <WorkbenchHost
     :enabled="enabled"
     :allow-empty="Boolean(nativeApi)"
-    :route-active="routeActive"
+    :route-active="routeActive && store.activeSessionId === (sessionId || null)"
     :modal-blocked="surfaceBlocked"
     :aria-label="t('workbench.title')"
     :empty-label="t('workbench.empty')"
@@ -974,14 +974,24 @@ function onNativeSurfaceEvent(event: NativeWorkbenchSurfaceEvent) {
   if (event.type === 'browser-opened') {
     const detail = event.detail
     if (!detail?.url || !detail.sessionKey || !nativeApi) return
+    const existing = store.items.find(candidate => candidate.id === event.surfaceId)
+    if (existing && (existing.kind !== 'browser' || existing.scope.type !== 'session'
+      || existing.scope.id !== detail.sessionKey)) return
     const item = createBrowserWorkbenchItem({ scopeId: detail.sessionKey, url: detail.url })
     if (!item) return
     item.id = event.surfaceId
     item.title = detail.title || item.title
     item.payload = { ...item.payload, adoptedNativeSurface: true, targetRef: detail.targetRef,
       ...(detail.navigationError ? { navigationError: detail.navigationError } : {}) }
-    store.openItem(item, { activate: detail.sessionKey === props.sessionId })
+    store.openItem(item, { activate: props.enabled && props.routeActive
+      && detail.sessionKey === props.sessionId
+      && detail.sessionKey === store.activeSessionId })
     return
+  }
+  const browserItem = store.items.find(candidate => candidate.id === event.surfaceId)
+  if (browserItem?.kind === 'browser') {
+    if (event.detail?.sessionKey && (browserItem.scope.type !== 'session'
+      || browserItem.scope.id !== event.detail.sessionKey)) return
   }
   if (event.type === 'navigation-state' && event.detail?.url) {
     const item = store.items.find(candidate => candidate.id === event.surfaceId)
@@ -1220,7 +1230,7 @@ async function setSessionScopeSafely(sessionId: string | null) {
   const previousSessionId = store.activeSessionId
   if (previousSessionId === sessionId) return
   const staleItems = store.items.filter(item =>
-    item.scope.type === 'session' && item.scope.id !== sessionId)
+    item.scope.type === 'session' && item.scope.id !== sessionId && item.kind !== 'browser')
   for (const item of staleItems) {
     if (!await beforeCloseItem(item) || generation !== scopeChangeGeneration) return
   }

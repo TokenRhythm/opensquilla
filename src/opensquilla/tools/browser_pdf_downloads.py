@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextvars
 import hashlib
 import re
 from pathlib import Path
@@ -100,8 +101,24 @@ async def materialize_browser_pdf_export(
             )
         return result.rel_path
 
+    # Keep physical disk work owned until it settles. An executor Future also
+    # survives shutdown cancelling every Task, unlike a to_thread wrapper Task.
     try:
-        path = await asyncio.to_thread(write)
+        operation = asyncio.get_running_loop().run_in_executor(
+            None, contextvars.copy_context().run, write,
+        )
+        path = await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not operation.cancelled():
+            operation.exception()
+        raise
     except BrowserPdfDownloadError:
         raise
     except Exception:

@@ -125,6 +125,14 @@ async def test_managed_discovery_dispatch_and_trusted_call_context(browser, mock
         definitions = registry.to_tool_definitions(ctx)
         assert len(definitions) == len(BROWSER_MCP_TOOLS)
         assert all("_tool_use_id" not in d.input_schema.properties for d in definitions)
+        assert next(
+            d for d in definitions if d.name == "mcp__desktop-browser__browser_inspect"
+        ).cancellation_policy == "must_settle"
+        assert all(
+            d.cancellation_policy == "bounded"
+            for d in definitions if d.name != "mcp__desktop-browser__browser_inspect"
+        )
+        assert all("cancellation_policy" not in d.model_dump() for d in definitions)
     finally:
         await close_active_clients(owner="desktop-browser")
     assert all(registry.get(name) is None for name in BROWSER_MCP_TOOL_NAMES)
