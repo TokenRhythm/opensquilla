@@ -280,7 +280,7 @@ def test_ensure_offline_sandbox_user_uses_configured_short_name(monkeypatch, tmp
         return Completed()
 
     monkeypatch.setattr(mod, "_query_offline_account", lambda: None)
-    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-5-21-100-200-300-400")
     monkeypatch.setattr(
         mod,
         "_validated_elevated_setup_target",

@@ -1960,6 +1960,7 @@ jobs:
           set -euo pipefail
           uv run --no-sync pytest \
             tests/test_mcp tests/test_mcp_server \
+            tests/test_desktop/test_gateway_functional_probes.py::test_gateway_fresh_profile_reaches_healthz \
             tests/test_desktop/test_gateway_functional_probes.py::test_mcp_probe_uses_real_stdio_server_and_gateway \
             -vv --tb=short \
             2>&1 | tee "${CI_REPORT_DIR}/mcp-transports.log"

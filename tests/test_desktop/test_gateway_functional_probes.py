@@ -12,12 +12,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import pytest
 
 ENTRY = Path(__file__).resolve().parents[2] / "desktop/electron/scripts/gateway-entry.py"
+MIGRATIONS_DIR = ENTRY.parents[3] / "migrations"
 
 
 def isolated_environment(tmp_path: Path) -> dict[str, str]:
@@ -75,6 +76,54 @@ def _gateway_startup_diagnostics(tmp_path: Path) -> str:
                   "error_code": getattr(exc, "sqlite_errorname", None)}
     diagnostics.append(f"migration ledger: {json.dumps(ledger)}")
     return "\n\n".join(diagnostics)
+
+
+def _prepare_migrated_profile(environment: dict[str, str]) -> None:
+    """Seed the isolated Gateway profile before timing the MCP bridge startup."""
+
+    from opensquilla.persistence.migrator import apply_pending
+
+    database = Path(environment["OPENSQUILLA_STATE_DIR"]) / "state" / "sessions.db"
+    database.parent.mkdir(parents=True, exist_ok=True)
+    assert apply_pending(str(database), MIGRATIONS_DIR)
+
+
+@contextmanager
+def _running_gateway(tmp_path: Path, environment: dict[str, str]):
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    log_path = tmp_path / "gateway.log"
+    with log_path.open("w", encoding="utf-8") as log:
+        gateway = subprocess.Popen(
+            [sys.executable, str(ENTRY), "gateway", "run", "--bind", "127.0.0.1",
+             "--port", str(port), "--config", environment["OPENSQUILLA_GATEWAY_CONFIG_PATH"]],
+            env=environment, stdout=log, stderr=subprocess.STDOUT,
+        )
+        try:
+            yield gateway, port
+        finally:
+            gateway.terminate()
+            try:
+                gateway.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                gateway.kill()
+                gateway.wait(timeout=10)
+
+
+def _wait_for_gateway_healthz(gateway: subprocess.Popen, port: int, tmp_path: Path) -> None:
+    deadline = time.monotonic() + 40
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    while time.monotonic() < deadline:
+        assert gateway.poll() is None, _gateway_startup_diagnostics(tmp_path)
+        try:
+            with opener.open(f"http://127.0.0.1:{port}/healthz", timeout=1) as response:
+                if json.load(response).get("ok"):
+                    return
+        except (OSError, urllib.error.URLError):
+            pass
+        time.sleep(0.1)
+    pytest.fail(_gateway_startup_diagnostics(tmp_path))
 
 
 def test_document_probe_extracts_text_and_renders_a_decodable_image(tmp_path: Path) -> None:
@@ -303,57 +352,37 @@ def test_pty_probe_waits_for_process_when_reader_eof_arrives_first(
     assert json.loads(capsys.readouterr().out)["returncode"] == 0
 
 
-# Fresh-profile migrations and a real stdio server share the runner's process
-# and disk budget. Keep the startup deadline independent of parallel test load.
+@pytest.mark.ci_serial
+def test_gateway_fresh_profile_reaches_healthz(tmp_path: Path) -> None:
+    """Keep cold CLI startup/migration coverage separate from MCP assertions."""
+
+    environment = isolated_environment(tmp_path)
+    with _running_gateway(tmp_path, environment) as (gateway, port):
+        _wait_for_gateway_healthz(gateway, port, tmp_path)
+
+
 @pytest.mark.ci_serial
 def test_mcp_probe_uses_real_stdio_server_and_gateway(tmp_path: Path) -> None:
     from mcp_types import LATEST_PROTOCOL_VERSION
 
     environment = isolated_environment(tmp_path)
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
-    log_path = tmp_path / "gateway.log"
-    with log_path.open("w", encoding="utf-8") as log:
-        gateway = subprocess.Popen(
-            [sys.executable, str(ENTRY), "gateway", "run", "--bind", "127.0.0.1",
-             "--port", str(port), "--config", environment["OPENSQUILLA_GATEWAY_CONFIG_PATH"]],
-            env=environment, stdout=log, stderr=subprocess.STDOUT,
-        )
-        try:
-            deadline = time.monotonic() + 40
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            while time.monotonic() < deadline:
-                assert gateway.poll() is None, _gateway_startup_diagnostics(tmp_path)
-                try:
-                    with opener.open(f"http://127.0.0.1:{port}/healthz", timeout=1) as response:
-                        if json.load(response).get("ok"):
-                            break
-                except (OSError, urllib.error.URLError):
-                    pass
-                time.sleep(0.1)
-            else:
-                pytest.fail(_gateway_startup_diagnostics(tmp_path))
+    # Cold migration is covered by the dedicated smoke above; bridge timing
+    # starts from the same latest-schema profile for source and frozen probes.
+    _prepare_migrated_profile(environment)
+    with _running_gateway(tmp_path, environment) as (gateway, port):
+        _wait_for_gateway_healthz(gateway, port, tmp_path)
 
-            frozen_probe = os.environ.get("OPENSQUILLA_TEST_FROZEN_MCP_PROBE")
-            probe_command = [frozen_probe] if frozen_probe else [sys.executable, str(ENTRY)]
-            result = subprocess.run(
-                [*probe_command, "--_desktop-mcp-probe",
-                 f"ws://127.0.0.1:{port}/ws"],
-                env=environment, text=True, capture_output=True, timeout=60,
-            )
-            assert result.returncode == 0, result.stderr
-            assert json.loads(result.stdout) == {
-                "probe": "opensquilla-desktop-mcp", "sessions": 0,
-                "protocolVersion": LATEST_PROTOCOL_VERSION,
-                "tools": ["conversations_list", "events_wait", "messages_read",
-                          "messages_send", "session_resolve", "transcript_export"],
-                "resources": ["opensquilla://sessions"],
-            }
-        finally:
-            gateway.terminate()
-            try:
-                gateway.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                gateway.kill()
-                gateway.wait(timeout=10)
+        frozen_probe = os.environ.get("OPENSQUILLA_TEST_FROZEN_MCP_PROBE")
+        probe_command = [frozen_probe] if frozen_probe else [sys.executable, str(ENTRY)]
+        result = subprocess.run(
+            [*probe_command, "--_desktop-mcp-probe", f"ws://127.0.0.1:{port}/ws"],
+            env=environment, text=True, capture_output=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "probe": "opensquilla-desktop-mcp", "sessions": 0,
+            "protocolVersion": LATEST_PROTOCOL_VERSION,
+            "tools": ["conversations_list", "events_wait", "messages_read",
+                      "messages_send", "session_resolve", "transcript_export"],
+            "resources": ["opensquilla://sessions"],
+        }

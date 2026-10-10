@@ -171,7 +171,7 @@ def test_offline_identity_setup_uses_inbox_windows_powershell(
     environments: list[dict[str, str]] = []
     monkeypatch.setenv("SystemRoot", r"C:\Windows")
     monkeypatch.setattr(mod, "_query_offline_account", lambda: None)
-    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-5-21-100-200-300-400")
     monkeypatch.setattr(mod, "_generate_offline_user_password", lambda: "A1!test-password")
     monkeypatch.setattr(identity_mod, "protect_password", lambda password: f"protected:{password}")
     monkeypatch.setattr(

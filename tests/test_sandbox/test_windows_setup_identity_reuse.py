@@ -20,7 +20,7 @@ def profile(tmp_path, monkeypatch):
     monkeypatch.setattr(
         windows_setup_process, "_process_identity", lambda pid: f"created:{pid}",
     )
-    monkeypatch.setattr(setup, "_current_windows_user_sid", lambda: "S-1-owner")
+    monkeypatch.setattr(setup, "_current_windows_user_sid", lambda: "S-1-5-21-100-200-300-400")
     monkeypatch.setattr(setup, "_query_offline_account", lambda: None)
     monkeypatch.setattr(identity, "validate_offline_identity", lambda _identity: False)
     monkeypatch.setattr(identity, "protect_password", lambda value: "protected:" + value)
@@ -126,9 +126,10 @@ def test_first_setup_persists_owned_pending_identity_before_readiness(profile, m
 
     assert len(environments) == 1
     assert environments[0]["OPENSQUILLA_SANDBOX_EXPECTED_SID"] == ""
-    assert environments[0]["OPENSQUILLA_SANDBOX_DESCRIPTION"] == (
-        "OpenSquilla sandbox owner=S-1-owner"
+    assert environments[0]["OPENSQUILLA_SANDBOX_DESCRIPTION"] == setup._owner_description(
+        "S-1-5-21-100-200-300-400"
     )
+    assert len(environments[0]["OPENSQUILLA_SANDBOX_DESCRIPTION"]) <= 48
     pending = setup.read_setup_marker(marker)
     assert pending is not None and pending.setup_state == "pending"
     assert pending.network is not None
@@ -167,9 +168,54 @@ def test_first_setup_failure_never_publishes_identity(profile, monkeypatch, stag
     assert not marker.exists()
 
 
+def test_owner_description_preserves_complete_sid_and_rejects_other_owner():
+    owner = "S-1-5-21-123456789-987654321-1112131415-1617181920"
+    description = setup._owner_description(owner)
+    assert len(description) <= 48
+    assert setup._owner_description_matches(description, owner)
+    assert not setup._owner_description_matches(
+        description, "S-1-5-21-123456789-987654321-1112131415-1617181921"
+    )
+    assert not setup._owner_description_matches("OSq:not-base64!", owner)
+
+
+def test_owner_description_is_fixed_size_for_longest_legal_sid():
+    owner = "S-1-281474976710655-" + "-".join(["4294967295"] * 15)
+    description = setup._owner_description(owner)
+    assert description.startswith("OSq:")
+    assert len(description) == 47
+    assert setup._owner_description_matches(description, owner)
+
+
+def test_legacy_full_owner_description_remains_accepted(profile, monkeypatch):
+    marker = setup.default_setup_marker_path(profile)
+    setup.write_setup_marker(marker, network=network())
+    legacy = "OpenSquilla sandbox owner=S-1-5-21-100-200-300-400"
+    monkeypatch.setattr(
+        setup,
+        "_query_offline_account",
+        lambda: {"sid": "S-1-sandbox", "description": legacy},
+    )
+    calls = []
+
+    def run(*_args, **kwargs):
+        calls.append(kwargs["env"])
+        return SimpleNamespace(returncode=0, stdout="S-1-sandbox", stderr="")
+
+    monkeypatch.setattr(setup.subprocess, "run", run)
+    setup.ensure_offline_sandbox_user(marker.parent, profile_path=profile, repair_identity=True)
+    assert calls[0]["OPENSQUILLA_SANDBOX_EXPECTED_DESCRIPTION"] == legacy
+    assert calls[0]["OPENSQUILLA_SANDBOX_DESCRIPTION"] == setup._owner_description(
+        "S-1-5-21-100-200-300-400"
+    )
+
+
 @pytest.mark.parametrize(
     "description",
-    ["OpenSquilla sandbox owner=S-1-owner", "OpenSquilla offline sandbox network identity"],
+    [
+        "OpenSquilla sandbox owner=S-1-5-21-100-200-300-400",
+        "OpenSquilla offline sandbox network identity",
+    ],
 )
 def test_stale_identity_requires_explicit_repair(profile, monkeypatch, description):
     marker = setup.default_setup_marker_path(profile)
@@ -207,7 +253,9 @@ def test_explicit_legacy_repair_updates_only_two_known_owned_receipts(profile, m
     setup.ensure_offline_sandbox_user(desktop.parent, profile_path=profile, repair_identity=True)
     assert len(calls) == 1
     assert calls[0]["OPENSQUILLA_SANDBOX_EXPECTED_SID"] == "S-1-sandbox"
-    assert calls[0]["OPENSQUILLA_SANDBOX_DESCRIPTION"] == "OpenSquilla sandbox owner=S-1-owner"
+    assert calls[0]["OPENSQUILLA_SANDBOX_DESCRIPTION"] == setup._owner_description(
+        "S-1-5-21-100-200-300-400"
+    )
     for marker in (cli, desktop):
         assert (
             setup.read_setup_marker(marker).network.protected_password == "protected:new-password"
@@ -220,7 +268,10 @@ def test_explicit_repair_never_takes_over_unknown_identity(profile, monkeypatch,
     marker = setup.default_setup_marker_path(profile)
     if case != "missing_receipt":
         setup.write_setup_marker(marker, network=network())
-    account = {"sid": "S-1-sandbox", "description": "OpenSquilla sandbox owner=S-1-owner"}
+    account = {
+        "sid": "S-1-sandbox",
+        "description": setup._owner_description("S-1-5-21-100-200-300-400"),
+    }
     if case == "unknown_owner":
         account["description"] = "Other software account"
     if case == "wrong_sid":
@@ -258,12 +309,15 @@ def test_other_admin_can_repair_rules_without_reencrypting_credentials(profile, 
     monkeypatch.setattr(
         setup,
         "_query_offline_account",
-        lambda: {"sid": "S-1-sandbox", "description": "OpenSquilla sandbox owner=S-1-owner"},
+        lambda: {
+            "sid": "S-1-sandbox",
+            "description": setup._owner_description("S-1-5-21-100-200-300-400"),
+        },
     )
     monkeypatch.setattr(identity, "protect_password", fail_if_called)
     monkeypatch.setattr(identity, "unprotect_password", fail_if_called)
     result = setup.ensure_offline_sandbox_user(
-        desktop.parent, profile_path=profile, user_sid="S-1-owner"
+        desktop.parent, profile_path=profile, user_sid="S-1-5-21-100-200-300-400"
     )
     assert result["protectedPassword"] == "protected:old"
 
@@ -274,7 +328,11 @@ def test_other_admin_cannot_create_credentials_bound_to_the_wrong_user(profile, 
     monkeypatch.setattr(identity, "protect_password", fail_if_called)
     monkeypatch.setattr(setup.subprocess, "run", fail_if_called)
     with pytest.raises(OSError, match="credential_handoff_unavailable"):
-        setup.ensure_offline_sandbox_user(marker.parent, profile_path=profile, user_sid="S-1-owner")
+        setup.ensure_offline_sandbox_user(
+            marker.parent,
+            profile_path=profile,
+            user_sid="S-1-5-21-100-200-300-400",
+        )
 
 
 def test_token_sid_mismatch_is_rejected_and_handle_closed(monkeypatch):
@@ -324,7 +382,7 @@ def test_busy_machine_setup_does_not_overwrite_the_running_helpers_report(profil
 
     monkeypatch.setattr(setup, "_windows_setup_process_lock", busy)
     monkeypatch.setattr(setup, "establish_windows_network_setup", fail_if_called)
-    payload = setup._encode_setup_helper_payload(marker, user_sid="S-1-owner")
+    payload = setup._encode_setup_helper_payload(marker, user_sid="S-1-5-21-100-200-300-400")
     assert setup.elevated_setup_helper_main(["--elevated-helper", payload]) == 75
     assert setup.read_setup_helper_report(marker) == {"state": "running", "detail": "first helper"}
 

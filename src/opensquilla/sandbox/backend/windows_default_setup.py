@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import base64
 import csv
+import hashlib
 import json
 import os
 import secrets
@@ -1163,6 +1165,25 @@ def _query_offline_account() -> dict[str, str] | None:
     return {"sid": data["sid"], "description": str(data.get("description") or "")}
 
 
+_OWNER_DESCRIPTION_PREFIX = "OSq:"
+
+
+def _owner_description(caller_sid: str) -> str:
+    """Return a fixed-size receipt for the complete owner SID input."""
+
+    digest = hashlib.sha256(caller_sid.encode("utf-8")).digest()
+    return _OWNER_DESCRIPTION_PREFIX + base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _owner_description_matches(description: str, caller_sid: str) -> bool:
+    """Accept compact current receipts and the pre-limit full-SID format."""
+
+    return description in {
+        _owner_description(caller_sid),
+        f"OpenSquilla sandbox owner={caller_sid}",
+    }
+
+
 def ensure_offline_sandbox_user(
     state_root: Path,
     *,
@@ -1216,13 +1237,15 @@ def ensure_offline_sandbox_user(
         raise OSError("offline_identity_credential_handoff_unavailable")
 
     expected_sid = ""
+    expected_description = ""
     if account is not None:
         # Never reset a shared account merely because this profile has no
         # password. A repair is explicit and requires an ownership receipt.
         description = account["description"]
-        owner_description = f"OpenSquilla sandbox owner={caller_sid}"
         legacy_description = "OpenSquilla offline sandbox network identity"
-        if description not in {owner_description, legacy_description}:
+        if not (
+            _owner_description_matches(description, caller_sid) or description == legacy_description
+        ):
             raise OSError("offline_identity_owner_unknown")
         historical_marker = next(
             (
@@ -1244,11 +1267,12 @@ def ensure_offline_sandbox_user(
         if not repair_identity:
             raise OSError("offline_identity_repair_required")
         expected_sid = account["sid"]
+        expected_description = description
 
     # Protect before changing the account so a DPAPI error cannot orphan it.
     password = _generate_offline_user_password()
     protected = protect_password(password)
-    description = f"OpenSquilla sandbox owner={caller_sid}"
+    description = _owner_description(caller_sid)
     script = (
         "$ErrorActionPreference = 'Stop'; "
         f"$name = '{username}'; "
@@ -1279,7 +1303,7 @@ def ensure_offline_sandbox_user(
             "OPENSQUILLA_SANDBOX_PASSWORD": password,
             "OPENSQUILLA_SANDBOX_EXPECTED_SID": expected_sid,
             "OPENSQUILLA_SANDBOX_DESCRIPTION": description,
-            "OPENSQUILLA_SANDBOX_EXPECTED_DESCRIPTION": account["description"] if account else "",
+            "OPENSQUILLA_SANDBOX_EXPECTED_DESCRIPTION": (expected_description if account else ""),
             "PSModulePath": str(Path(powershell).parent / "Modules"),
         },
         capture_output=True,
