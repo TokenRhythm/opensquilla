@@ -629,6 +629,12 @@ describe('workbench runtime registry', () => {
     })
     expect(context.isItemOpen()).toBe(true)
     context.setExpanded(false)
+    expect(context.isItemActive?.()).toBe(false)
+    expect(setExpanded).not.toHaveBeenCalled()
+    manager.handle({ type: 'resume', item: descriptor })
+    await manager.flush()
+    expect(context.isItemActive?.()).toBe(true)
+    context.setExpanded(false)
     expect(setExpanded).toHaveBeenCalledWith(false)
     expect(setComponentHandle).toHaveBeenCalledWith({ provider: 'browser' })
     expect(handleComponentEvent).toHaveBeenCalledWith(

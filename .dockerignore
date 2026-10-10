@@ -74,5 +74,4 @@ opensquilla-webui/test-results
 src/opensquilla/gateway/static/dist
 
 # --- CI / local tooling -----------------------------------------------------
-uv.lock
 .pre-commit-config.yaml

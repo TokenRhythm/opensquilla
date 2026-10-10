@@ -235,10 +235,16 @@ class RendererTransport implements ConnectOverCDPTransport {
 
 type Anchor = { generation: number; element: ElementHandle<Element> }
 const MAX_REFS = 160
+const MAX_SNAPSHOT_NODES = 12_000
+const MAX_SNAPSHOT_SHADOW_ROOTS = 128
 const ACTION_TIMEOUT_MS = 10_000
 const MOUSE_MOTION_BUDGET_MS = 800
 type ViewportState = { width: number; height: number; deviceScaleFactor: number; scrollX: number; scrollY: number; revision: number; surfaceWidth?: number; surfaceHeight?: number }
 export type BrowserDialogState = { id: string; type: string; message: string; defaultValue?: string; openedAt: string; documentEpoch: number }
+export type BrowserPromptHost = {
+  state(): { id: string; message: string; defaultValue: string; openedAt: number | string } | null
+  respond(id: string, value: string | null): boolean
+}
 type VisualObservation = { observationId: string; imageId: string; documentEpoch: number; generation: number; viewport: ViewportState;
   capturedAt: number; imageWidth: number; imageHeight: number; dataBase64: string }
 type ActionResult = { action: DesktopBrowserRequest['action']; performed: boolean; execution?: Record<string, unknown>; browserState?: ReturnType<BrowserPlaywrightDriver['browserState']> }
@@ -290,7 +296,7 @@ export class BrowserPlaywrightDriver {
   readonly pointer: BrowserPointerController
 
   constructor(private readonly contents: WebContents, private readonly pointerVisible: () => boolean = () => true,
-    pointer?: BrowserPointerController) {
+    pointer?: BrowserPointerController, private readonly hostPrompt?: BrowserPromptHost) {
     this.pointer = pointer ?? new BrowserPointerController(contents, pointerVisible)
   }
 
@@ -374,8 +380,26 @@ export class BrowserPlaywrightDriver {
     this.anchors.clear()
   }
 
-  get pendingDialog(): BrowserDialogState | undefined { return this.dialogState ? { ...this.dialogState } : undefined }
+  get pendingDialog(): BrowserDialogState | undefined {
+    const host = this.hostPrompt?.state()
+    if (host) return { id: host.id, type: 'prompt', message: host.message.slice(0, 16_384),
+      defaultValue: host.defaultValue.slice(0, 16_384), openedAt: new Date(host.openedAt).toISOString(), documentEpoch: this.documentEpoch }
+    return this.dialogState ? { ...this.dialogState } : undefined
+  }
   get pendingFileChooser(): BrowserFileChooserState | undefined { return this.fileChooser ? { ...this.fileChooser.state } : undefined }
+
+  notifyHostPromptState(): void {
+    this.latestVisual = undefined
+    const pending = this.pendingDialog
+    if (pending) for (const notify of this.dialogWaiters) notify(pending)
+  }
+
+  finishNativeBeforeUnload(): void {
+    if (this.dialogState?.type !== 'beforeunload') return
+    this.dialogState = undefined
+    this.dialogSessionId = undefined
+    this.latestVisual = undefined
+  }
 
   private onFileChooser = (chooser: FileChooser): void => {
     this.fileChooser = { chooser, state: { chooserId: `chooser-${randomUUID()}`,
@@ -389,17 +413,24 @@ export class BrowserPlaywrightDriver {
 
   waitForPendingDialog(signal: AbortSignal): Promise<BrowserDialogState> {
     if (signal.aborted) return Promise.reject(new DesktopBrowserError('TIMEOUT', 'Dialog observation was cancelled.'))
-    if (this.dialogState) return Promise.resolve({ ...this.dialogState })
+    const pending = this.pendingDialog
+    if (pending) return Promise.resolve(pending)
     return new Promise((resolve, reject) => {
       const cleanup = () => { this.dialogWaiters.delete(notify); signal.removeEventListener('abort', abort) }
       const notify = (dialog: BrowserDialogState) => { cleanup(); resolve({ ...dialog }) }
       const abort = () => { cleanup(); reject(new DesktopBrowserError('TIMEOUT', 'Dialog observation was cancelled.')) }
       this.dialogWaiters.add(notify)
       signal.addEventListener('abort', abort, { once: true })
+      if (signal.aborted) abort()
+      else {
+        const current = this.pendingDialog
+        if (current) notify(current)
+      }
     })
   }
 
-  browserState() { return { capabilities: { jsPrompt: false }, dialogs: { pending: this.dialogState ? [{ ...this.dialogState }] : [] },
+  browserState() { const pending = this.pendingDialog
+    return { capabilities: { jsPrompt: Boolean(this.hostPrompt) }, dialogs: { pending: pending ? [pending] : [] },
     fileChoosers: { pending: this.fileChooser ? [{ ...this.fileChooser.state }] : [] } } }
 
   private onDialog(dialog: Record<string, unknown>): void {
@@ -407,7 +438,8 @@ export class BrowserPlaywrightDriver {
     this.dialogState = { id: `dialog-${randomUUID()}`, type: String(dialog.type), message: String(dialog.message ?? '').slice(0, 16_384),
       ...(dialog.type === 'prompt' ? { defaultValue: String(dialog.defaultPrompt ?? '').slice(0, 16_384) } : {}),
       openedAt: new Date().toISOString(), documentEpoch: this.documentEpoch }
-    for (const notify of this.dialogWaiters) notify(this.dialogState)
+    const pending = this.pendingDialog
+    if (pending) for (const notify of this.dialogWaiters) notify(pending)
   }
 
   async waitForIdle(): Promise<void> { await Promise.allSettled([...this.runningActions]) }
@@ -415,7 +447,7 @@ export class BrowserPlaywrightDriver {
   async handleDialog(request: DesktopBrowserRequest, assertCurrent: Guard, signal: AbortSignal): Promise<Record<string, unknown>> {
     assertCurrent()
     if (signal.aborted) throw new DesktopBrowserError('TIMEOUT', 'The dialog response was cancelled.')
-    const pending = this.dialogState
+    const pending = this.pendingDialog
     if (!pending || pending.id !== request.dialogId) throw new DesktopBrowserError('STALE_DIALOG', 'This dialog is no longer pending. Observe the page again.')
     if (this.resolvingDialog) throw new DesktopBrowserError('DIALOG_RESOLVING', 'A response to this dialog is already in progress.')
     if (typeof request.accept !== 'boolean') throw new DesktopBrowserError('INVALID_REQUEST', 'A dialog response must specify accept.')
@@ -424,6 +456,22 @@ export class BrowserPlaywrightDriver {
     }
     this.resolvingDialog = true
     try {
+      const host = this.hostPrompt?.state()
+      if (host?.id === pending.id) {
+        assertCurrent()
+        if (signal.aborted || this.documentEpoch !== pending.documentEpoch) {
+          throw new DesktopBrowserError('STALE_DIALOG', 'The pending dialog changed before its response.')
+        }
+        const value = request.accept ? request.promptText ?? pending.defaultValue ?? '' : null
+        if (!this.hostPrompt?.respond(pending.id, value)) {
+          throw new DesktopBrowserError('STALE_DIALOG', 'The pending dialog changed before its response.')
+        }
+        this.latestVisual = undefined
+        return { performed: true, dialogId: pending.id, browserState: this.browserState() }
+      }
+      if (this.dialogState?.id !== pending.id) {
+        throw new DesktopBrowserError('STALE_DIALOG', 'The pending dialog changed before its response.')
+      }
       if (!this.transport) throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The dialog connection ended.')
       await this.transport.respondToDialog(request.accept, request.promptText, () => {
         assertCurrent()
@@ -466,7 +514,7 @@ export class BrowserPlaywrightDriver {
     mode: 'auto' | 'dom' | 'hybrid' = 'auto'): Promise<Record<string, unknown>> {
     assertCurrent()
     if (signal.aborted) throw new DesktopBrowserError('TIMEOUT', 'The observation was cancelled.')
-    if (this.dialogState) return this.blockedObservation()
+    if (this.pendingDialog) return this.blockedObservation()
     let interrupted = false
     let notify!: (dialog: BrowserDialogState) => void
     const blocked = new Promise<Record<string, unknown>>(resolve => {
@@ -598,25 +646,44 @@ export class BrowserPlaywrightDriver {
         try {
           const text = await frame.locator('body').ariaSnapshot({ timeout: frame === page.mainFrame() ? ACTION_TIMEOUT_MS : 1500 })
           texts.push(`${modal ? '[Active modal]\n' : ''}${frame === page.mainFrame() ? '' : `[Frame ${frame.url().slice(0, 500)}]\n`}${text}`)
-          collection = await frame.evaluateHandle(limit => {
+          collection = await frame.evaluateHandle(({ limit, maxNodes, maxShadowRoots }) => {
             const visible = (node: Element) => {
               const rect = node.getBoundingClientRect(), style = getComputedStyle(node)
               return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'
             }
             const dialogs = Array.from(document.querySelectorAll('dialog:modal,[role="dialog"][aria-modal="true"],[role="alertdialog"]')).filter(visible)
             const root = dialogs.at(-1) ?? document
+            // Walk open shadow roots at their host's position in DOM order.
+            // The global node/root ceilings keep large or nested pages bounded.
+            const controls: Element[] = [], blocks: Element[] = [], textNodes: Element[] = []
+            const walkers = [document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)]
+            let seen = 0, shadows = 0
+            while (walkers.length && seen < maxNodes) {
+              const node = walkers.at(-1)!.nextNode() as Element | null
+              if (!node) { walkers.pop(); continue }
+              seen++
+              if (node.shadowRoot && shadows < maxShadowRoots) {
+                walkers.push(document.createTreeWalker(node.shadowRoot, NodeFilter.SHOW_ELEMENT))
+                shadows++
+              }
+              if (controls.length < 2400
+                && node.matches('a,button,input,textarea,select,summary,[role],[contenteditable],canvas')
+                && visible(node)) controls.push(node)
+              if (blocks.length < 2400
+                && node.matches('h1,h2,h3,p,label,pre,blockquote,article,section')
+                && visible(node)) blocks.push(node)
+              if (textNodes.length < 2400 && node.matches('div,span') && visible(node)
+                && (Array.from(node.childNodes).some(child => child.nodeType === Node.TEXT_NODE && child.textContent?.trim())
+                  || node.scrollWidth > node.clientWidth || node.scrollHeight > node.clientHeight)) textNodes.push(node)
+            }
             // Readable blocks augment the observation without displacing a
             // later control merely because a page contains many text nodes.
-            const controls = Array.from(root.querySelectorAll('a,button,input,textarea,select,summary,[role],[contenteditable],canvas'))
-              .slice(0, 2400).filter(visible)
-            const blocks = Array.from(root.querySelectorAll('h1,h2,h3,p,label,pre,blockquote,article,section'))
-              .slice(0, 2400).filter(visible)
-            const textNodes = Array.from(root.querySelectorAll('div,span')).slice(0, 2400).filter(node => visible(node)
-              && (Array.from(node.childNodes).some(child => child.nodeType === Node.TEXT_NODE && child.textContent?.trim())
-                || node.scrollWidth > node.clientWidth || node.scrollHeight > node.clientHeight))
-            return [...new Set([...controls, ...blocks, ...textNodes])].slice(0, limit)
-          }, MAX_REFS - refs.length)
+            return Object.assign([...new Set([...controls, ...blocks, ...textNodes])].slice(0, limit),
+              { truncated: walkers.length > 0 || shadows === maxShadowRoots })
+          }, { limit: MAX_REFS - refs.length, maxNodes: MAX_SNAPSHOT_NODES,
+            maxShadowRoots: MAX_SNAPSHOT_SHADOW_ROOTS })
           for (const [key, handle] of await collection.getProperties()) {
+            if (key === 'truncated') { truncated ||= await handle.jsonValue() === true; await handle.dispose(); continue }
             if (!/^\d+$/.test(key)) { await handle.dispose(); continue }
             const element = handle.asElement() as ElementHandle<Element> | null
             if (!element) { await handle.dispose(); continue }
@@ -636,8 +703,9 @@ export class BrowserPlaywrightDriver {
                 : textarea ? 'textbox' : select ? select.multiple || select.size > 1 ? 'listbox' : 'combobox'
                   : node.matches('a[href],area[href]') ? 'link'
                     : node.localName === 'summary' ? 'button' : node.localName
+              const nodeRoot = node.getRootNode() as Document | ShadowRoot
               const labelledBy = (node.getAttribute('aria-labelledby') ?? '').split(/\s+/).filter(Boolean)
-                .map(id => node.ownerDocument.getElementById(id)?.textContent ?? '').join(' ')
+                .map(id => nodeRoot.getElementById(id)?.textContent ?? '').join(' ')
               const labels = input?.labels ?? textarea?.labels ?? select?.labels ?? button?.labels
               const labelText = labels ? Array.from(labels, label => label.textContent ?? '').join(' ') : ''
               const buttonText = input && ['button', 'submit', 'reset'].includes(input.type)
@@ -791,13 +859,13 @@ export class BrowserPlaywrightDriver {
   async act(request: DesktopBrowserRequest, generation: number, assertCurrent: Guard, signal: AbortSignal): Promise<ActionResult> {
     assertCurrent()
     if (signal.aborted) throw new DesktopBrowserError('TIMEOUT', 'The browser action was cancelled.')
+    const blockedResult = (): ActionResult => ({ action: request.action, performed: false,
+      execution: { state: 'blocked', outcome: 'unknown', retryable: false, blockerId: this.pendingDialog?.id }, browserState: this.browserState() })
+    if (this.pendingDialog) return blockedResult()
     if (request.action === 'upload') return await this.uploadFile(request, generation, assertCurrent, signal)
     if (request.action === 'cancelUpload') return await this.cancelFileChooser(request, generation, assertCurrent, signal)
     if (this.fileChooser) throw new DesktopBrowserError('FILE_CHOOSER_PENDING', 'Complete or cancel the pending file chooser before another action.',
       409, { outcome: 'not_started', retryable: false, recovery: 'resolve_file_chooser' })
-    const blockedResult = (): ActionResult => ({ action: request.action, performed: false,
-      execution: { state: 'blocked', outcome: 'unknown', retryable: false, blockerId: this.dialogState?.id }, browserState: this.browserState() })
-    if (this.dialogState) return blockedResult()
     let interrupted = false
     let notify!: (dialog: BrowserDialogState) => void
     const blocked = new Promise<ActionResult>(resolve => {

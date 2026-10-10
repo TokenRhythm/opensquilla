@@ -76,7 +76,10 @@ def test_docker_build_validates_generated_webui_before_python_packaging() -> Non
     assert "COPY opensquilla-webui/ ./opensquilla-webui/" in dockerfile
     assert "COPY --from=webui-builder" in dockerfile
     assert dockerfile.index("COPY --from=webui-builder") < dockerfile.index(
-        'RUN pip install ".[recommended]"'
+        'RUN pip install --constraint mcp-constraints.txt ".[recommended]"'
+    )
+    assert dockerfile.index("RUN python - <<'MCP'") < dockerfile.index(
+        'RUN pip install --constraint mcp-constraints.txt ".[recommended]"'
     )
     assert "rm -rf hatch_build.py scripts opensquilla-webui" in dockerfile
     assert "!scripts/verify_webui_artifact.py" in _load_dockerignore_rules()

@@ -1438,7 +1438,10 @@ def test_desktop_local_packaging_builds_slim_package_without_runtime_fetch() -> 
 
     for local_script in ("dist:local", "pack:local"):
         public_script = local_script.removesuffix(":local")
-        assert scripts[local_script] == f"npm run {public_script}"
+        assert scripts[local_script] == f"node scripts/build-local.mjs {public_script}"
+        assert scripts[f"{local_script}:prepared"] == (
+            f"node scripts/build-local.mjs {public_script} --prepared"
+        )
         commands = scripts[public_script].split(" && ")
         assert "npm run fetch:runtimes" not in commands
         assert commands.index("npm run build:web") < commands.index("npm run build:gateway")
@@ -1449,6 +1452,12 @@ def test_desktop_local_packaging_builds_slim_package_without_runtime_fetch() -> 
         builder = "electron-builder --dir" if public_script == "pack" else "electron-builder"
         assert prepared.index("npm run verify:prepared") < prepared.index(builder)
         assert "npm run build:gateway" not in prepared
+
+    local_builder = _read("desktop/electron/scripts/build-local.mjs")
+    assert "platform !== 'darwin'" in local_builder
+    assert "await runScript(`${mode}${prepared ? ':prepared' : ''}`)" in local_builder
+    assert "signing.withLocalMacSigning" in local_builder
+    assert "await verifyLocalMacSignature(appPath, identity)" in local_builder
 
     runtime_resources = {
         (entry["from"], entry["to"])
@@ -3081,17 +3090,21 @@ def test_desktop_renderer_loss_revokes_artifact_preview_leases() -> None:
     )
     full_navigation = _section(
         create_window,
-        "window.webContents.on('did-start-navigation'",
+        "window.webContents.on('did-navigate'",
         "window.on('close'",
+    )
+    navigation_guard = _section(
+        create_window,
+        "const guardMainWindowNavigation",
+        "window.webContents.on('did-navigate'",
     )
 
     assert "void nativeWorkbenchSurfaces.destroyAll()" in cleanup
     assert "void artifactPreviewLeaseBroker.revokeAll()" in cleanup
     assert "releaseRendererOwnedArtifactPreviews()" in renderer_gone
-    assert (
-        "if (isMainFrame && !isInPlace) releaseRendererOwnedArtifactPreviews()"
-        in full_navigation
-    )
+    assert "releaseRendererOwnedArtifactPreviews()" in full_navigation
+    assert "window.webContents.on('did-start-navigation'" not in create_window
+    assert "releaseRendererOwnedArtifactPreviews()" not in navigation_guard
 
 
 def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:

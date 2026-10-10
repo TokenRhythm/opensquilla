@@ -41,6 +41,7 @@ _AUTHORITY_ARGUMENTS = frozenset(
         "observationPolicy",
         "recoveryScope",
         "uploadFile",
+        "exportPdf",
     }
 )
 _VALIDATION_FIELD = re.compile(
@@ -311,6 +312,7 @@ class DesktopBrowserMCPClient(MCPClient):
         self._tool_schemas: dict[str, dict[str, Any]] = {}
         self._coordinate_authority = False
         self._attachment_uploads = False
+        self._pdf_download_export = False
 
     async def connect(self) -> None:
         await self.close()
@@ -337,6 +339,9 @@ class DesktopBrowserMCPClient(MCPClient):
         self._attachment_uploads = (
             isinstance(browser, dict) and browser.get("attachmentUploads") is True
         )
+        self._pdf_download_export = (
+            isinstance(browser, dict) and browser.get("pdfDownloadExport") is True
+        )
         await self._request("notifications/initialized", {}, notification=True)
 
     async def close(self) -> None:
@@ -347,6 +352,7 @@ class DesktopBrowserMCPClient(MCPClient):
         self._tool_schemas = {}
         self._coordinate_authority = False
         self._attachment_uploads = False
+        self._pdf_download_export = False
 
     async def _request(
         self,
@@ -541,6 +547,14 @@ class DesktopBrowserMCPClient(MCPClient):
                 ]
             ).encode()
         ).hexdigest()
+        export_pdf = bool(
+            self._pdf_download_export
+            and name == "browser_inspect"
+            and isinstance(arguments.get("downloadId"), str)
+            and context.workspace_dir
+            and context.artifact_session_id
+            and context.artifact_media_root
+        )
         # Capture must precede generic image routing: a text-first route may
         # switch to a vision-capable continuation when it receives this result.
         requested_mode = arguments.get("observationMode", "auto")
@@ -563,6 +577,7 @@ class DesktopBrowserMCPClient(MCPClient):
                             context.usage_root_turn_id or context.task_id or context.session_key
                         ),
                         "observationMode": requested_mode,
+                        **({"exportPdf": True} if export_pdf else {}),
                         **({"uploadFile": upload_file} if upload_file is not None else {}),
                     },
                 },
@@ -575,7 +590,55 @@ class DesktopBrowserMCPClient(MCPClient):
                 **(result.structured_content or {}),
             )
             return result
+        raw_result = response.get("result")
+        private_meta = raw_result.pop("_meta", None) if isinstance(raw_result, dict) else None
+        pdf_export = (
+            private_meta.get("opensquilla/pdfExport")
+            if isinstance(private_meta, dict) else None
+        )
+        if pdf_export is not None:
+            if not export_pdf or not isinstance(raw_result, dict) or raw_result.get("isError"):
+                return _coordinate_unavailable(
+                    "BROWSER_PROTOCOL_ERROR", "The Desktop returned an unexpected PDF download.",
+                    "inspect",
+                )
+            structured = raw_result.get("structuredContent")
+            download = structured.get("download") if isinstance(structured, dict) else None
+            if (
+                not isinstance(structured, dict)
+                or not isinstance(download, dict)
+                or download.get("downloadId") != arguments["downloadId"]
+                or structured.get("targetRef") != arguments.get("targetRef")
+            ):
+                return _coordinate_unavailable(
+                    "BROWSER_PROTOCOL_ERROR", "The PDF download receipt did not match the page.",
+                    "inspect",
+                )
+            from opensquilla.tools.browser_pdf_downloads import (
+                BrowserPdfDownloadError,
+                materialize_browser_pdf_export,
+            )
+
+            try:
+                pdf_path = await materialize_browser_pdf_export(
+                    context, arguments["downloadId"], pdf_export,
+                )
+            except BrowserPdfDownloadError as error:
+                return _coordinate_unavailable(
+                    "BROWSER_PDF_EXPORT_FAILED", str(error), "inspect_or_retry",
+                )
+        else:
+            pdf_path = None
         result = MCPToolResult.from_response(response)
+        if pdf_path is not None:
+            assert result.structured_content is not None
+            download = result.structured_content["download"]
+            download["workspacePath"] = pdf_path
+            download["pdfReadable"] = True
+            note = json.dumps({"downloadId": arguments["downloadId"],
+                               "workspacePath": pdf_path, "pdfReadable": True})
+            result.content += "\n" + note
+            result.content_blocks.append({"type": "text", "text": note})
         if self._attachment_uploads and name in {
             "browser_tabs", "browser_open", "browser_navigate", "browser_reload",
             "browser_inspect", "browser_observe", "browser_batch", "browser_tab",

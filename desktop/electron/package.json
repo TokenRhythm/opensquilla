@@ -15,8 +15,11 @@
     "fetch:runtimes": "node scripts/fetch-bundled-runtimes.mjs",
     "build:web": "cd ../../opensquilla-webui && npm ci && npm run build",
     "dev": "npm run build && electron .",
-    "dist:local": "npm run dist",
-    "pack:local": "npm run pack",
+    "dist:local": "node scripts/build-local.mjs dist",
+    "pack:local": "node scripts/build-local.mjs pack",
+    "dist:local:prepared": "node scripts/build-local.mjs dist --prepared",
+    "pack:local:prepared": "node scripts/build-local.mjs pack --prepared",
+    "test:local-build": "node --test scripts/test-local-build.mjs scripts/test-mac-keychain-preferences.mjs scripts/test-build-download-proxy.mjs",
     "verify:prepared": "node scripts/verify-prepared-gateway.mjs",
     "verify:icons": "node scripts/verify-icon-config.mjs",
     "verify:package": "npm run verify:icons && node scripts/verify-package.mjs",
@@ -83,7 +86,8 @@
     "pack:prepared": "npm run build && npm run verify:prepared && electron-builder --dir && npm run verify:package",
     "dist:prepared": "npm run build && npm run verify:prepared && electron-builder && npm run verify:package",
     "test:desktop-browser": "npm run build && node scripts/test-desktop-browser.mjs && node scripts/test-desktop-browser-electron.mjs",
-    "test:browser-mcp": "npm run build && node scripts/test-browser-capability-contract.mjs && node scripts/test-browser-managed-downloads.mjs && node scripts/test-browser-ref-semantics.mjs && node scripts/test-browser-mouse-trajectory.mjs && node scripts/test-desktop-browser.mjs && node scripts/test-desktop-browser-mcp.mjs && node scripts/test-browser-visual-freshness.mjs && node scripts/test-browser-visual-recovery.mjs && node scripts/test-browser-playwright-attach.mjs && node scripts/test-browser-capabilities-electron.mjs && node scripts/test-browser-context-files-electron.mjs && node scripts/test-browser-pointer-electron.mjs && node scripts/test-desktop-browser-mcp-electron.mjs && node scripts/test-browser-native-dialog-electron.mjs && node scripts/test-browser-mcp-faults-electron.mjs && node scripts/test-browser-playwright-package.mjs",
+    "test:browser-foundations": "npm run build && node scripts/test-browser-navigation-contract.mjs && node scripts/test-browser-pdf-policy.mjs && node scripts/test-browser-reload-guard.mjs && node scripts/test-browser-host-navigation-electron.mjs && node scripts/test-browser-managed-downloads.mjs && node scripts/test-browser-foundations-electron.mjs && node scripts/test-browser-pdf-manager-electron.mjs && node scripts/test-browser-prompt-electron.mjs && node scripts/test-browser-prompt-manager-electron.mjs && node scripts/test-browser-context-files-electron.mjs && node scripts/test-browser-session-isolation-electron.mjs && node scripts/test-browser-activation-routing-electron.mjs",
+    "test:browser-mcp": "npm run build && node scripts/test-browser-capability-contract.mjs && node scripts/test-browser-managed-downloads.mjs && node scripts/test-browser-ref-semantics.mjs && node scripts/test-browser-mouse-trajectory.mjs && node scripts/test-desktop-browser.mjs && node scripts/test-desktop-browser-mcp.mjs && node scripts/test-browser-visual-freshness.mjs && node scripts/test-browser-visual-recovery.mjs && node scripts/test-browser-playwright-attach.mjs && node scripts/test-browser-capabilities-electron.mjs && node scripts/test-browser-context-files-electron.mjs && node scripts/test-browser-pointer-electron.mjs && node scripts/test-desktop-browser-mcp-electron.mjs && node scripts/test-browser-native-dialog-electron.mjs && node scripts/test-browser-mcp-faults-electron.mjs && node scripts/test-browser-playwright-package.mjs && node scripts/test-browser-navigation-contract.mjs && node scripts/test-browser-pdf-policy.mjs && node scripts/test-browser-reload-guard.mjs && node scripts/test-browser-host-navigation-electron.mjs && node scripts/test-browser-foundations-electron.mjs && node scripts/test-browser-pdf-manager-electron.mjs && node scripts/test-browser-prompt-electron.mjs && node scripts/test-browser-prompt-manager-electron.mjs && node scripts/test-browser-session-isolation-electron.mjs && node scripts/test-browser-activation-routing-electron.mjs",
     "test:live-html-harness": "node --test scripts/test-live-html-foreground.mjs scripts/test-live-html-diagnostics.mjs scripts/test-live-html-supplemental-scenarios.mjs",
     "test:live-html-browser": "node --test scripts/test-live-html-business.mjs"
   },
@@ -102,6 +106,11 @@
     "playwright": "~1.63.0",
     "typescript": "7.0.2",
     "ws": "^8.22.0"
+  },
+  "overrides": {
+    "global-agent@3.0.0": {
+      "roarr": "3.3.0"
+    }
   },
   "build": {
     "appId": "ai.opensquilla.desktop",

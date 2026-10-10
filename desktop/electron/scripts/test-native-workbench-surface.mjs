@@ -54,7 +54,7 @@ async function checkSubpageAnnotationFocus({
   const record = {
     kind: 'artifact-preview', expectedOrigin: 'http://p-test.localhost:1234',
     annotationDocumentGeneration: 1,
-    view: { webContents: { getURL: () => url } },
+    contents: { getURL: () => url },
   }
   let replaced = false
   const interrupt = phase => {
@@ -153,8 +153,8 @@ async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpeni
         url: request.payload.url, targetRef: `target-${request.surfaceId}`, visible: false,
         owner: { isDestroyed: () => ownerDestroyed },
         requestedRect: null,
-        view: { getBounds: () => ({ x: 0, y: 0, width: 960, height: 720 }),
-          webContents: { isDestroyed: () => false } },
+        view: { getBounds: () => ({ x: 0, y: 0, width: 960, height: 720 }) },
+        contents: { isDestroyed: () => false },
       }
       this.surfaces.set(request.surfaceId, openingRecord)
       await opening

@@ -157,6 +157,28 @@ describe('native Workbench platform bridge', () => {
     expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({ detail: { navigationError: null } }))
     emit?.({ version: 4, surfaceId: 'browser:fixture', type: 'navigation-state', detail: { navigationError: { code: 42 } } })
     expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({ detail: {} }))
+    emit?.({ version: 2, surfaceId: 'browser:fixture', type: 'find-requested' })
+    expect(listener).toHaveBeenLastCalledWith({ version: 2, surfaceId: 'browser:fixture', type: 'find-requested' })
+    emit?.({ version: 2, surfaceId: 'browser:fixture', type: 'find-state', detail: {
+      findQuery: 'synthetic', findMatches: 5, findActiveMatch: 3, findFinal: true,
+      zoomFactor: 1.25, ignored: 'value',
+    } })
+    expect(listener).toHaveBeenLastCalledWith({ version: 2, surfaceId: 'browser:fixture',
+      type: 'find-state', detail: { findQuery: 'synthetic', findMatches: 5,
+        findActiveMatch: 3, findFinal: true, zoomFactor: 1.25 } })
+    emit?.({ version: 2, surfaceId: 'browser:fixture', type: 'find-state', detail: {
+      findMatches: -2, findActiveMatch: 2.5, zoomFactor: Number.POSITIVE_INFINITY,
+    } })
+    expect(listener).toHaveBeenLastCalledWith({ version: 2, surfaceId: 'browser:fixture',
+      type: 'find-state', detail: {} })
+    const downloadId = 'download-12345678-1234-1234-1234-123456789abc'
+    emit?.({ version: 2, surfaceId: 'browser:fixture', type: 'download-state', detail: {
+      downloadId, downloadName: 'synthetic-note.txt', downloadState: 'completed',
+      receivedBytes: 100, totalBytes: 100, path: '/private/path',
+    } })
+    expect(listener).toHaveBeenLastCalledWith({ version: 2, surfaceId: 'browser:fixture',
+      type: 'download-state', detail: { downloadId, downloadName: 'synthetic-note.txt',
+        downloadState: 'completed', receivedBytes: 100, totalBytes: 100 } })
   })
 
   it('fails closed when only part of the shell bridge exists', () => {
@@ -178,6 +200,13 @@ describe('native Workbench platform bridge', () => {
       expected: { protocolVersions: [1, 2, 3, 4], modes: ['full'] },
     },
     {
+      name: 'host with browser reading and close controls',
+      getCapabilities: async () => ({ protocolVersions: [1, 2, 3, 4], modes: ['full'],
+        navigationActions: ['navigate', 'close', 'find', 'zoom', 'unknown'] }),
+      expected: { protocolVersions: [1, 2, 3, 4], modes: ['full'],
+        navigationActions: ['navigate', 'close', 'find', 'zoom'] },
+    },
+    {
       name: 'legacy host with an explicit limit',
       getCapabilities: async () => ({ protocolVersions: [1, 2], modes: ['offline'], maxSurfaces: 8 }),
       expected: { protocolVersions: [1, 2], modes: ['offline'], maxSurfaces: 8 },
@@ -192,7 +221,7 @@ describe('native Workbench platform bridge', () => {
       getCapabilities: async () => { throw new Error('unavailable') },
       expected: { protocolVersions: [1], modes: ['offline'] },
     },
-  ])('does not invent a surface limit for $name', async ({ getCapabilities, expected }) => {
+  ])('preserves supported capability fields for $name', async ({ getCapabilities, expected }) => {
     setDesktopApi({
       createWorkbenchSurface: async () => ({ ok: true }),
       setWorkbenchSurfaceRect: async () => ({ ok: true }),

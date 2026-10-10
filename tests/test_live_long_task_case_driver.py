@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -332,6 +334,75 @@ def test_gateway_restart_keeps_the_first_launch_port(
     assert launch_ports[1] == launch_ports[0]
 
 
+def test_gateway_health_ignores_ambient_proxy_and_global_opener(
+    startup_gateway, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = startup_gateway
+    health_requests: list[str] = []
+    proxy_requests: list[str] = []
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - HTTP server callback.
+            health_requests.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *_args) -> None:
+            pass
+
+    class ProxyHandler(HealthHandler):
+        def do_GET(self) -> None:  # noqa: N802 - HTTP server callback.
+            proxy_requests.append(self.path)
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    with (
+        ThreadingHTTPServer(("127.0.0.1", 0), HealthHandler) as health_server,
+        ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler) as proxy_server,
+    ):
+        threads = [
+            threading.Thread(target=server.serve_forever, daemon=True)
+            for server in (health_server, proxy_server)
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            gateway.port = health_server.server_port
+            proxy_url = f"http://127.0.0.1:{proxy_server.server_port}"
+            monkeypatch.setenv("http_proxy", proxy_url)
+            monkeypatch.setenv("HTTP_PROXY", proxy_url)
+            monkeypatch.setenv("no_proxy", "")
+            monkeypatch.setenv("NO_PROXY", "")
+            # Keep system bypass settings out of this synthetic environment.
+            monkeypatch.setattr(driver.urllib.request, "proxy_bypass", lambda _host: False)
+            monkeypatch.setattr(driver.urllib.request, "_opener", None)
+            with pytest.raises(driver.urllib.error.HTTPError) as caught:
+                driver.urllib.request.urlopen(f"{gateway.http_url}/health", timeout=1)
+            caught.value.close()
+            assert caught.value.code == 503
+            assert len(proxy_requests) == 1
+            assert health_requests == []
+
+            monkeypatch.setattr(
+                driver.subprocess, "Popen", lambda *_args, **_kwargs: SimpleNamespace(
+                    poll=lambda: None,
+                ),
+            )
+            gateway.start()
+
+            assert gateway._has_reached_health is True
+            assert health_requests == ["/health"]
+            assert len(proxy_requests) == 1
+        finally:
+            for server in (health_server, proxy_server):
+                server.shutdown()
+            for thread in threads:
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+
+
 def test_initial_github_windows_healthless_ownership_timeout_restarts_once(
     startup_gateway, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -394,7 +465,7 @@ def test_initial_github_windows_healthless_ownership_timeout_restarts_once(
     monkeypatch.setattr(
         driver.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0),
     )
-    monkeypatch.setattr(driver.urllib.request, "urlopen", health)
+    monkeypatch.setattr(gateway, "_open_health", health)
     monkeypatch.setattr(
         driver, "time",
         SimpleNamespace(monotonic=lambda: now[0], sleep=lambda seconds: now.__setitem__(
@@ -455,7 +526,7 @@ def test_initial_github_windows_healthless_ownership_restart_is_bounded_to_once(
         driver.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0),
     )
     monkeypatch.setattr(
-        driver.urllib.request, "urlopen",
+        gateway, "_open_health",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             driver.urllib.error.URLError("synthetic repeated cold-start stall"),
         ),
@@ -537,7 +608,7 @@ def test_gateway_startup_failure_keeps_safe_phase_evidence(
 
     monkeypatch.setattr(driver.subprocess, "Popen", launch)
     monkeypatch.setattr(driver, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=advance))
-    monkeypatch.setattr(driver.urllib.request, "urlopen", unavailable)
+    monkeypatch.setattr(gateway, "_open_health", unavailable)
     with pytest.raises(driver.DriverConfigurationError) as caught:
         gateway.start()
     message = str(caught.value)

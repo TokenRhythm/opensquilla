@@ -1612,6 +1612,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: upgrade-diagnostics-macos-${{ matrix.baseline-version }}
+          overwrite: true
           retention-days: 7
           if-no-files-found: warn
           path: |
@@ -1759,6 +1760,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: upgrade-diagnostics-windows-${{ matrix.baseline-version }}-${{ matrix.install-mode }}
+          overwrite: true
           retention-days: 7
           if-no-files-found: warn
           path: |
