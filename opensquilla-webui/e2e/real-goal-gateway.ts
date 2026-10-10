@@ -105,6 +105,7 @@ export async function startRealGoalGateway(options: {
   webuiOrigin: string
   scenario?: RealGoalGatewayScenario
   authMode?: 'none' | 'token'
+  initialSessionKeys?: readonly string[]
 }): Promise<RealGoalGateway> {
   const requestedFlow = process.env.OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED
     ?.trim().toLowerCase()
@@ -178,6 +179,7 @@ export async function startRealGoalGateway(options: {
         OPENSQUILLA_WEBUI_GOAL_E2E_RELEASE: secondReleaseFile,
         OPENSQUILLA_WEBUI_GOAL_E2E_SCENARIO: options.scenario || 'continuation',
         OPENSQUILLA_WEBUI_GOAL_E2E_AUTH_MODE: options.authMode || 'none',
+        OPENSQUILLA_WEBUI_GOAL_E2E_INITIAL_SESSION_KEYS: JSON.stringify(options.initialSessionKeys ?? []),
         OPENSQUILLA_WEBUI_GOAL_E2E_ORIGIN: options.webuiOrigin,
         OPENSQUILLA_HOME: stateDir,
         OPENSQUILLA_STATE_DIR: stateDir,
