@@ -18,17 +18,24 @@ from opensquilla.tools.registry import ToolRegistry
 
 
 async def seed_tasks(storage, keys, count):
-    await storage.conn.executemany(
-        """INSERT INTO agent_tasks
-        (task_id, session_key, source_kind, queue_mode, status, created_at, updated_at, details)
-        VALUES (?, ?, 'webui', 'followup', ?, ?, ?, ?)""",
-        [
-            (f"{key}-{index:04d}", key, "failed" if index == count - 1 else "succeeded",
-             index // 3, index // 3, '{"evidence":"exact-only"}')
-            for key in keys for index in range(count)
-        ],
-    )
-    await storage.conn.commit()
+    # The production connection uses autocommit. Seed the same ordered fixture
+    # in one transaction, then exercise the read bounds after it commits.
+    await storage.conn.execute("BEGIN")
+    try:
+        await storage.conn.executemany(
+            """INSERT INTO agent_tasks
+            (task_id, session_key, source_kind, queue_mode, status, created_at, updated_at, details)
+            VALUES (?, ?, 'webui', 'followup', ?, ?, ?, ?)""",
+            [
+                (f"{key}-{index:04d}", key, "failed" if index == count - 1 else "succeeded",
+                 index // 3, index // 3, '{"evidence":"exact-only"}')
+                for key in keys for index in range(count)
+            ],
+        )
+        await storage.conn.commit()
+    except BaseException:
+        await storage.conn.rollback()
+        raise
 
 
 @pytest.mark.asyncio
