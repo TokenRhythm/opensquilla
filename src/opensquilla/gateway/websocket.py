@@ -2595,7 +2595,9 @@ class WsConnection:
         except asyncio.CancelledError:
             raise
 
-    def _enqueue_frame(self, frame: _OutboundFrame) -> None:
+    def _enqueue_frame(
+        self, frame: _OutboundFrame, *, _allow_response_fallback: bool = True,
+    ) -> None:
         """Synchronous enqueue with classification-aware overflow.
 
         Caller has already verified ``_queue_enabled`` and ``not _closing``
@@ -2625,27 +2627,32 @@ class WsConnection:
                 # enter the outbox, so release that reservation here before
                 # taking either the dirty-session or force-close path.
                 self._release_outbound_budget(frame)
-                log.warning(
-                    "gateway.ws_flow_encode_or_budget_failed",
-                    conn_id=self.conn_id,
-                    exception_type=type(exc).__name__,
-                    failure_kind=(
-                        "stale_delivery" if isinstance(exc, FlowDeliveryStaleError)
-                        else "flow_admission"
-                    ),
-                    reason_code=(
-                        exc.reason_code if isinstance(exc, _FlowAdmissionError)
-                        else "flow_admission_unclassified"
-                    ),
-                    wire_bytes=exc.wire_bytes if isinstance(exc, _FlowAdmissionError) else None,
-                    requested_bytes=(
-                        exc.requested_bytes if isinstance(exc, _FlowAdmissionError) else None
-                    ),
-                    **diagnostics,
-                    exc_info=True,
-                )
+                if _allow_response_fallback:
+                    # Preserve the original failure once. A rejected fallback
+                    # uses the terminal cleanup below, not another diagnostic
+                    # containing the same request's error representation.
+                    log.warning(
+                        "gateway.ws_flow_encode_or_budget_failed",
+                        conn_id=self.conn_id,
+                        exception_type=type(exc).__name__,
+                        failure_kind=(
+                            "stale_delivery" if isinstance(exc, FlowDeliveryStaleError)
+                            else "flow_admission"
+                        ),
+                        reason_code=(
+                            exc.reason_code if isinstance(exc, _FlowAdmissionError)
+                            else "flow_admission_unclassified"
+                        ),
+                        wire_bytes=exc.wire_bytes if isinstance(exc, _FlowAdmissionError) else None,
+                        requested_bytes=(
+                            exc.requested_bytes if isinstance(exc, _FlowAdmissionError) else None
+                        ),
+                        **diagnostics,
+                        exc_info=True,
+                    )
                 if (
-                    isinstance(exc, _FlowAdmissionError)
+                    _allow_response_fallback
+                    and isinstance(exc, _FlowAdmissionError)
                     and exc.reason_code == "response_wire_limit"
                     and frame.res_frame is not None
                 ):
@@ -2657,6 +2664,9 @@ class WsConnection:
                     # or range-read path.  In particular, never claim
                     # ``accepted=False`` here: a mutation may already have
                     # been accepted before its response was encoded.
+                    # Echoing a near-limit request id can make even this
+                    # error too large. Attempt it only once through the same
+                    # wire and budget checks, then use terminal cleanup.
                     self._enqueue_frame(_OutboundFrame(
                         kind="res",
                         classification="control",
@@ -2670,7 +2680,7 @@ class WsConnection:
                             details={"max_payload_bytes": MAX_PAYLOAD_BYTES},
                         ),
                         is_control=True,
-                    ))
+                    ), _allow_response_fallback=False)
                     return
                 if isinstance(exc, FlowDeliveryStaleError):
                     # A stale snapshot response is recoverable.  Mark only its
