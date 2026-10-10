@@ -353,10 +353,10 @@ def test_sandbox_network_prompt_names_the_host() -> None:
     )
     assert len(adapter.sent) == 1
     message = adapter.sent[0]
-    assert "Network host: pypi.org" in message.content
+    assert message.content.splitlines()[1] == "Network host: pypi.org"
     assert "(unknown command)" not in message.content
     card_body = message.metadata["card"]["elements"][0]["text"]["content"]
-    assert "pypi.org" in card_body
+    assert card_body.splitlines()[1] == "**Network host:** `pypi.org`"
 
 
 def test_sandbox_bundle_prompt_names_the_bundle() -> None:

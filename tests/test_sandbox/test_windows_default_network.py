@@ -462,7 +462,7 @@ def test_run_elevated_setup_helper_does_not_write_timeout_receipt(monkeypatch, t
 def test_trusted_taskkill_path_ignores_spoofed_systemroot(monkeypatch) -> None:
     from opensquilla.sandbox.backend import windows_default_setup as mod
 
-    monkeypatch.setenv("SystemRoot", r"C:\Users\attacker\fake-root")
+    monkeypatch.setenv("SystemRoot", r"C:\untrusted-system-root")
     monkeypatch.setattr(
         mod,
         "_trusted_windows_system_directory",
@@ -477,7 +477,7 @@ def test_trusted_taskkill_path_ignores_spoofed_systemroot(monkeypatch) -> None:
 def test_trusted_powershell_path_ignores_spoofed_systemroot(monkeypatch) -> None:
     from opensquilla.sandbox.backend import windows_default_setup as mod
 
-    monkeypatch.setenv("SystemRoot", r"C:\Users\attacker\fake-root")
+    monkeypatch.setenv("SystemRoot", r"C:\untrusted-system-root")
     monkeypatch.setattr(
         mod,
         "_trusted_windows_system_directory",

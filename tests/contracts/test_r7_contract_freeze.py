@@ -178,9 +178,9 @@ def test_contract_inventory_freezes_all_webui_reachable_wire_names() -> None:
     assert not {"router.selflearning.status", "router.feedback.submit"} & {
         spec.wire_name for spec in specs
     }
-    assert len(specs) == 212
+    assert len(specs) == 218
     assert Counter(spec.contract_type for spec in specs) == {
-        "method": 202,
+        "method": 208,
         "event": 10,
     }
     assert {spec.wire_name for spec in specs if spec.wire_name.startswith("agents.")} == {
@@ -196,6 +196,12 @@ def test_contract_inventory_freezes_all_webui_reachable_wire_names() -> None:
         "sessions.messages.snapshot.read",
         "sessions.messages.resume",
         "sessions.messages.snapshot.release",
+        "sessions.read.open.v2",
+        "sessions.read.state.v2",
+        "sessions.read.install.v2",
+        "sessions.read.close.v2",
+        "sessions.history.page.v2",
+        "transport.sessionFlow.update.v2",
         "telemetry.product_active.record",
         "transport.flow.update",
         "transport.flow.dirty",
