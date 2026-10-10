@@ -37,8 +37,7 @@ export type ActivityToolTarget =
   | { kind: 'url'; text: string; url: string }
 
 const INLINE_TEXT_LIMIT = 140
-const SENSITIVE_KEY = [
-  '(?:[a-z0-9]+[_-])*',
+const SENSITIVE_KEY_NAME = [
   '(?:',
   'api[_-]?key',
   '|access[_-]?key',
@@ -55,6 +54,27 @@ const SENSITIVE_KEY = [
   '|credential',
   ')',
 ].join('')
+const SENSITIVE_KEY = `(?:[a-z0-9]+[_-])*${SENSITIVE_KEY_NAME}`
+const SENSITIVE_KEY_SUFFIX = new RegExp(`(?:^|[_-])${SENSITIVE_KEY_NAME}$`, 'i')
+
+function redactAssignments(source: string): string {
+  // Visit each maximal key once. Searching again at every hyphen in a long
+  // ordinary value makes the prefix matcher quadratic before it reaches '='.
+  const keys = /(?<![a-z0-9_-])([a-z0-9_-]+)[ \t]*[:=][ \t]*/gi
+  const value = /(?!(?:bearer|basic)\b)(?!\[redacted\])(?:"[^"]*"|'[^']*'|[^\s,;"'\}\]]+)/iy
+  const parts: string[] = []
+  let cursor = 0
+  for (let key = keys.exec(source); key; key = keys.exec(source)) {
+    if (!SENSITIVE_KEY_SUFFIX.test(key[1]!)) continue
+    value.lastIndex = keys.lastIndex
+    const secret = value.exec(source)
+    if (!secret) continue
+    parts.push(source.slice(cursor, secret.index), '[redacted]')
+    cursor = value.lastIndex
+    keys.lastIndex = cursor
+  }
+  return parts.length ? parts.join('') + source.slice(cursor) : source
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -91,10 +111,10 @@ function truncateInline(value: string, limit = INLINE_TEXT_LIMIT): string {
 }
 
 export function redactActivityDetail(value: string): string {
-  return String(value || '')
+  const redacted = String(value || '')
     .replace(
-      /([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+):([^@/\s]+)@/gi,
-      '$1[redacted]@',
+      /(?<![a-z0-9+.-])([a-z0-9+.-]+:\/\/)([^/\s:@]+):([^@/\s]+)@/gi,
+      (match, scheme: string) => /[a-z]/i.test(scheme) ? `${scheme}[redacted]@` : match,
     )
     .replace(
       /(authorization[ \t]*:[ \t]*bearer[ \t]+)[^\s"',;]+/gi,
@@ -115,13 +135,7 @@ export function redactActivityDetail(value: string): string {
       new RegExp(`("(?:${SENSITIVE_KEY})"\\s*:\\s*)"(?:[^"\\\\]|\\\\.)*"`, 'gi'),
       '$1"[redacted]"',
     )
-    .replace(
-      new RegExp(
-        `(^|[^a-z0-9])(${SENSITIVE_KEY}[ \\t]*[:=][ \\t]*)(?!(?:bearer|basic)\\b)(?!\\[redacted\\])(?:"[^"]*"|'[^']*'|[^\\s,;"'\\}\\]]+)`,
-        'gim',
-      ),
-      '$1$2[redacted]',
-    )
+  return redactAssignments(redacted)
     .replace(
       new RegExp(`([?&](?:${SENSITIVE_KEY})=)[^&#\\s]+`, 'gi'),
       '$1[redacted]',
