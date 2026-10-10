@@ -1,8 +1,13 @@
 /** OpenSquilla Web UI — WebSocket RPC client (TypeScript port). */
 
+import { TRANSPORT_SESSION_FLOW_V2_CAPABILITY } from '@/contracts/transportFlowCapabilities';
+
 const ANSWER_GENERATION_RESET_CAPABILITY = 'session.answer_generation_reset.v1';
 const TURN_COMMITTED_CAPABILITY = 'session.turn_committed.v1';
 const PROBE_CAPABILITY = 'transport.probe.v1';
+// Preserve this client-facing export while keeping the wire/method mapping in
+// one contract module.
+export const SESSION_FLOW_V2_CAPABILITY = TRANSPORT_SESSION_FLOW_V2_CAPABILITY;
 export const WEB_RPC_PROTOCOL_VERSION = 3 as const;
 
 export interface HelloOkFrame {
@@ -1143,7 +1148,11 @@ export class RpcClient {
                     ANSWER_GENERATION_RESET_CAPABILITY,
                     TURN_COMMITTED_CAPABILITY,
                     PROBE_CAPABILITY,
-                    ...(this._consumptionFlowEnabled ? ['transport.flow.v1', 'transport.recovery.v1'] : []),
+                    ...(this._consumptionFlowEnabled ? [
+                      'transport.flow.v1',
+                      'transport.recovery.v1',
+                      SESSION_FLOW_V2_CAPABILITY,
+                    ] : []),
                   ],
                   client: { name: 'opensquilla-web' },
                   ...authParams,

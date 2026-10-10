@@ -264,6 +264,9 @@ export function normalizeDisplayAttachment(
     mime,
   )
   const rawKind = typeof record.kind === 'string' ? record.kind : ''
+  const rawMissingReason = record.missingReason ?? record.missing_reason
+  const missingReason = typeof rawMissingReason === 'string'
+    ? rawMissingReason.trim().slice(0, 256) || undefined : undefined
   const kind: DisplayAttachment['kind'] = rawKind === 'staged' || sha
     ? 'staged'
     : rawKind === 'inline' || data || dataUrl
@@ -295,6 +298,7 @@ export function normalizeDisplayAttachment(
         ? record.download_url
         : undefined,
     sha256_ref: sha || undefined,
+    missingReason,
     attachmentId: typeof record.attachmentId === 'string' && record.attachmentId.trim()
       ? record.attachmentId.trim()
       : typeof record.attachment_id === 'string' && record.attachment_id.trim()

@@ -21,7 +21,7 @@ const NUMBER_FIELDS = `epoch stream_seq generation_epoch started_at emitted_at i
   retry_attempt retry_limit retry_after_ms finished_at iteration block_index ended_at applied_iteration
   revision proposer_index sample_index elapsed_ms heartbeat_at confidence current_stream_seq`.split(/\s+/)
 const BOOLEAN_FIELDS = `preserve_completed_tools terminal heartbeat synthetic_from_text is_error retryable
-  fallback_safe fallback routing_applied compacted refused safe_to_send applied user_visible usage_unknown replay_complete`.split(/\s+/)
+  fallback_safe fallback routing_applied compacted refused safe_to_send applied user_visible usage_unknown replay_complete text_truncated`.split(/\s+/)
 const CONTENT_FIELDS = ['input', 'arguments', 'result', 'content', 'output', 'error', 'decision', 'router_tier_snapshot'] as const
 
 function object(value: unknown): Record<string, unknown> {

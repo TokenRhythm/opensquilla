@@ -1,0 +1,388 @@
+"""SQLite integration coverage for the read-only legacy content seam."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+
+from opensquilla.application.content_reader import (
+    MAX_CONTENT_RANGE_BYTES,
+    ContentExportLimitError,
+    ContentMetadataPendingError,
+    ContentNotFoundError,
+    ContentRangeError,
+    LegacyContentRef,
+)
+from opensquilla.chat.history import transcript_entries_to_chat_messages
+from opensquilla.session.models import TranscriptEntry
+from opensquilla.session.storage import SessionStorage
+
+
+@pytest.mark.asyncio
+async def test_legacy_content_range_reads_only_requested_bytes(tmp_path) -> None:
+    body = '{"text":"' + ("x你好" * 350_000) + '"}'
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id="sid",
+                session_key="agent:main:webchat:default",
+                message_id="mid",
+                role="assistant",
+                content=body,
+                created_at=1,
+            )
+        )
+        ref = await storage.get_legacy_content_ref("sid", "mid")
+        assert ref.source == "active"
+        assert ref.byte_length == len(body.encode())
+
+        first = await storage.read_legacy_content_range(ref, offset=0, limit=17)
+        second = await storage.read_legacy_content_range(ref, offset=17, limit=31)
+        encoded = body.encode()
+        assert first.data == encoded[:17]
+        assert second.data == encoded[17:48]
+        assert len(first.data) <= first.limit
+        assert len(second.data) <= second.limit
+
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < ref.byte_length:
+            part = await storage.read_legacy_content_range(
+                ref, offset=offset, limit=64 * 1024
+            )
+            digest.update(part.data)
+            offset = part.end
+        assert digest.hexdigest() == hashlib.sha256(encoded).hexdigest()
+
+        with pytest.raises(ContentNotFoundError, match="changed"):
+            await storage.read_legacy_content_range(
+                replace(ref, byte_length=ref.byte_length + 1),
+                offset=0,
+                limit=17,
+            )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_content_range_rejects_same_length_row_replacement(tmp_path) -> None:
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id="sid",
+                session_key="agent:main:webchat:default",
+                message_id="mid",
+                role="user",
+                content="original body",
+                created_at=1,
+            )
+        )
+        ref = await storage.get_legacy_content_ref("sid", "mid")
+        await storage.conn.execute(
+            "UPDATE transcript_entries SET content = ? WHERE session_id = ? AND message_id = ?",
+            ("replaced body", "sid", "mid"),
+        )
+        await storage.conn.commit()
+        with pytest.raises(ContentNotFoundError, match="changed"):
+            await storage.read_legacy_content_range(ref, offset=0, limit=32)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["active", "compacted"])
+async def test_display_read_rejects_same_length_update_after_ref_check(
+    tmp_path, monkeypatch, source: str,
+) -> None:
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.append_transcript_entry(TranscriptEntry(
+            session_id="sid", session_key="agent:main:webchat:default", message_id="mid",
+            role="assistant", content="original body", created_at=1,
+        ))
+        if source == "compacted":
+            entry = (await storage.get_transcript("sid"))[0]
+            await storage._archive_transcript_entries(
+                node=SimpleNamespace(session_id="sid"), entries=[entry],
+                compaction_id="display-race", compaction_index=0, source_rows_validated=True,
+            )
+            await storage.conn.execute("DELETE FROM transcript_entries WHERE id = ?", (entry.id,))
+            await storage.conn.commit()
+        ref = await storage.get_legacy_content_ref("sid", "mid", source=source)
+        read_query = storage._read_history_query
+        replaced = False
+
+        async def replace_before_display(sql, params, *, operation, **kwargs):
+            nonlocal replaced
+            if operation == "content_display" and not replaced:
+                replaced = True
+                table = (
+                    "transcript_entries" if source == "active" else "compacted_transcript_entries"
+                )
+                await storage.conn.execute(
+                    f"UPDATE {table} SET content = ? WHERE session_id = ? AND message_id = ?",
+                    ("replaced body", "sid", "mid"),
+                )
+                await storage.conn.commit()
+            return await read_query(sql, params, operation=operation, **kwargs)
+
+        monkeypatch.setattr(storage, "_read_history_query", replace_before_display)
+        with pytest.raises(ContentNotFoundError):
+            await storage.read_legacy_display_text(ref)
+        current = await storage.get_legacy_content_ref("sid", "mid", source=source)
+        assert current.revision != ref.revision
+        assert current.byte_length == ref.byte_length
+        assert await storage.read_legacy_display_text(current) == "replaced body"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_content_metadata_backfill_is_bounded_and_restartable(tmp_path) -> None:
+    body = "你好" * 128
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id="sid",
+                session_key="agent:main:webchat:default",
+                message_id="pending",
+                role="assistant",
+                content=body,
+                created_at=1,
+            )
+        )
+        await storage.conn.execute(
+            "UPDATE transcript_entries SET content_byte_length = NULL "
+            "WHERE session_id = ? AND message_id = ?",
+            ("sid", "pending"),
+        )
+        await storage.conn.commit()
+
+        with pytest.raises(ContentMetadataPendingError):
+            await storage.get_legacy_content_ref("sid", "pending")
+
+        assert await storage.backfill_transcript_content_lengths(
+            batch_size=1, max_batches=1
+        ) == 1
+        ref = await storage.get_legacy_content_ref("sid", "pending")
+        assert ref.byte_length == len(body.encode("utf-8"))
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_content_reader_supports_empty_and_missing_entries(tmp_path) -> None:
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id="sid",
+                session_key="agent:main:webchat:default",
+                message_id="empty",
+                role="assistant",
+                content="",
+                created_at=1,
+            )
+        )
+        ref = await storage.get_legacy_content_ref("sid", "empty")
+        assert ref.byte_length == 0
+        eof = await storage.read_legacy_content_range(ref, offset=0, limit=1)
+        assert eof.data == b""
+        assert eof.eof
+        with pytest.raises(ContentRangeError):
+            await storage.read_legacy_content_range(ref, offset=1, limit=1)
+        with pytest.raises(ContentNotFoundError):
+            await storage.get_legacy_content_ref("sid", "missing")
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_content_range_cap_is_enforced_before_sql(tmp_path) -> None:
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        with pytest.raises(ContentRangeError):
+            await storage.read_legacy_content_range(
+                # The ref is synthetic; validation must happen before any
+                # database query and therefore before the missing row check.
+                ref=LegacyContentRef("sid", "mid", "active", 0),
+                limit=MAX_CONTENT_RANGE_BYTES + 1,
+            )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_semantic_content_reader_reapplies_history_projection(tmp_path) -> None:
+    body = '{"text":"' + ("x" * (20 * 1024)) + '","display_text":"shown"}'
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id="sid",
+                session_key="agent:main:webchat:default",
+                message_id="projected",
+                role="assistant",
+                content=body,
+                created_at=1,
+            )
+        )
+        ref = await storage.get_legacy_content_ref("sid", "projected")
+        assert await storage.read_legacy_display_text(ref) == "shown"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_semantic_content_reader_projects_tool_result_json(tmp_path) -> None:
+    body = '{"type":"tool_result","tool_use_id":"call-1","content":"safe output"}'
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id="sid",
+                session_key="agent:main:webchat:default",
+                message_id="tool-json",
+                role="tool",
+                content=body,
+                created_at=1,
+            )
+        )
+        ref = await storage.get_legacy_content_ref("sid", "tool-json")
+        assert await storage.read_legacy_display_text(ref) == "safe output"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_semantic_content_reader_rejects_large_raw_rows_before_projection(tmp_path) -> None:
+    body = "x" * (MAX_CONTENT_RANGE_BYTES * 8 + 1)
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id="sid",
+                session_key="agent:main:webchat:default",
+                message_id="too-large",
+                role="assistant",
+                content=body,
+                created_at=1,
+            )
+        )
+        ref = await storage.get_legacy_content_ref("sid", "too-large")
+        with pytest.raises(ContentExportLimitError):
+            await storage.read_legacy_display_text(ref)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_canonical_history_projects_small_envelope_without_extra_read(
+    tmp_path,
+) -> None:
+    body = '{"text":"' + ("x" * 20_000) + '","display_text":"shown"}'
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id="sid",
+                session_key="agent:main:webchat:default",
+                message_id="canonical-projected",
+                role="assistant",
+                content=body,
+                created_at=1,
+            )
+        )
+        entries, _ = await storage.get_canonical_transcript_page(
+            "sid", limit=1, content_mode="bounded"
+        )
+        message = transcript_entries_to_chat_messages(entries, content_mode="bounded")[0]
+        assert message["text"] == "shown"
+        assert message["contentPreviewComplete"] is True
+        assert "contentRef" not in message
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_path", ["active", "canonical", "compacted"])
+async def test_bounded_tool_envelope_keeps_semantic_read_reference(
+    tmp_path, read_path: str
+) -> None:
+    displayed = "safe output 中文\n" * 2000 + "TOOL-END"
+    body = json.dumps({
+        "type": "tool_result", "tool_use_id": "internal-call-id", "content": displayed,
+    }, ensure_ascii=False)
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.append_transcript_entry(TranscriptEntry(
+            session_id="sid", session_key="agent:main:webchat:default", message_id="tool-json",
+            role="tool", content=body, created_at=1,
+        ))
+        if read_path == "compacted":
+            entry = (await storage.get_transcript("sid"))[0]
+            await storage._archive_transcript_entries(
+                node=SimpleNamespace(session_id="sid"), entries=[entry],
+                compaction_id="tool-compaction", compaction_index=0, source_rows_validated=True,
+            )
+            await storage.conn.execute("DELETE FROM transcript_entries WHERE id = ?", (entry.id,))
+            await storage.conn.commit()
+        if read_path == "active":
+            entries = await storage.get_transcript("sid", content_mode="bounded")
+        else:
+            entries, _ = await storage.get_canonical_transcript_page(
+                "sid", limit=1, content_mode="bounded"
+            )
+        assert entries[0].content == body
+        assert not entries[0].content_truncated
+        message = transcript_entries_to_chat_messages(entries, content_mode="bounded")[0]
+        assert message["text"] == displayed.encode()[:16 * 1024].decode("utf-8", errors="ignore")
+        assert message["contentPreviewComplete"] is False
+        assert message["contentRef"]["view"] == "display"
+        assert message["contentRef"]["source"] == (
+            "compacted" if read_path == "compacted" else "active"
+        )
+        assert "contentUnavailableReason" not in message
+        ref = await storage.get_legacy_content_ref("sid", "tool-json")
+        assert message["contentRef"]["revision"] == ref.revision
+        text = await storage.read_legacy_display_text(ref)
+        assert text == displayed
+        assert "internal-call-id" not in text
+        assert "tool_result" not in text
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+    "x" * (128 * 1024),
+    json.dumps({"text": "x" * 20_000}),
+    '{"metadata":{"kind":"ordinary","version":1},"text":"' + "x" * 20_000,
+    json.dumps({"metadata": {"kind": "ordinary", "version": 1}, "text": "x" * 70_000}),
+], ids=["plain", "ordinary-json", "incomplete-json", "oversized-json"])
+async def test_bounded_storage_parse_budget_is_independent_of_envelope_kind(
+    tmp_path, body: str
+) -> None:
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.append_transcript_entry(TranscriptEntry(
+            session_id="sid", session_key="agent:main:webchat:default", message_id="ordinary",
+            role="assistant", content=body, created_at=1,
+        ))
+        active = await storage.get_transcript("sid", content_mode="bounded")
+        canonical, _ = await storage.get_canonical_transcript_page(
+            "sid", limit=1, content_mode="bounded"
+        )
+        expected = body if len(body.encode()) <= 64 * 1024 else body[:4096]
+        assert active[0].content == canonical[0].content == expected
+        assert active[0].content_truncated is (expected != body)
+        assert canonical[0].content_truncated is (expected != body)
+    finally:
+        await storage.close()

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type {
   SessionReadLease,
   SessionReadLifecycle,
+  SessionReadOpenRequest,
 } from '@/modules/sessionReadLifecycle'
 import { SessionReadFailure } from '@/modules/sessionReadLifecycle'
 import type { SessionSubscriptionOutcome } from './useChatSessionSubscription'
@@ -37,6 +38,7 @@ function createBootstrap(overrides: {
   connectionState?: Ref<string>
   metadataRecoveryError?: Ref<unknown>
   retryMetadata?: () => Promise<unknown>
+  isProvisionalDraft?: () => boolean
 } = {}) {
   const loadHistoryImplementation = overrides.loadHistory || (async () => ({ ok: true }))
   const loadHistory = vi.fn(async (
@@ -49,7 +51,7 @@ function createBootstrap(overrides: {
   const cancelSubscription = vi.fn()
   const closeLease = vi.fn(async () => undefined)
   let currentLease: SessionReadLease | null = null
-  const openSessionRead = vi.fn(() => {
+  const openSessionRead = vi.fn((_request: SessionReadOpenRequest) => {
     void currentLease?.close()
     currentLease = ({
       criticalRequestsQueued: overrides.criticalRequestsQueued?.() ?? Promise.resolve(),
@@ -78,6 +80,7 @@ function createBootstrap(overrides: {
     connectionState: overrides.connectionState,
     metadataRecoveryError: overrides.metadataRecoveryError,
     retryMetadata: overrides.retryMetadata,
+    isProvisionalDraft: overrides.isProvisionalDraft,
     cancelHistory,
     cancelSubscription,
   })
@@ -98,6 +101,24 @@ afterEach(() => {
 })
 
 describe('useChatSessionBootstrap', () => {
+  it('keeps draft identity on reconnect and retires it after first-send acceptance', async () => {
+    let draft = true
+    const h = createBootstrap({ isProvisionalDraft: () => draft })
+    await h.api.startSessionBootstrap({ includeHistory: false }).live
+    h.api.handleConnectionState('disconnected', false)
+    await h.api.handleConnectionState('connected', false)?.live
+    expect(h.openSessionRead.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(h.openSessionRead.mock.calls.every(args => args[0]?.provisionalDraft === true)).toBe(true)
+    expect(h.loadHistory).not.toHaveBeenCalled()
+    // ChatView clears the accepted intent before the existing forced bootstrap.
+    draft = false
+    await h.api.startSessionBootstrap({ includeHistory: false, force: true }).live
+    expect(h.openSessionRead).toHaveBeenLastCalledWith({
+      sessionKey: 'agent:main:webchat:bootstrap-test', includeInitialHistory: false,
+    })
+    h.api.cancelSessionBootstrap()
+  })
+
   it.each(['too-large', 'budget-exhausted'] as const)(
     'preserves %s from the bootstrap result into the Conversation recovery callback', async kind => {
       const terminal = new SessionReadFailure(kind, 'Explicit retry required', false)

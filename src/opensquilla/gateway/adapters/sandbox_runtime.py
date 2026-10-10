@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
+from weakref import WeakKeyDictionary
 
 from opensquilla.application.sandbox_runtime import (
     SandboxCapability,
@@ -59,7 +62,7 @@ from opensquilla.sandbox.setup_state import SetupResult
 from opensquilla.session.storage import SessionStorage
 
 SetupStatusReader = Callable[[Any], Awaitable[SetupResult]]
-SetupRunner = Callable[[Any], Awaitable[SetupResult]]
+SetupRunner = Callable[..., Awaitable[SetupResult]]
 CapabilityReader = Callable[..., Awaitable[CapabilityReport]]
 EventPublisher = Callable[[str, dict[str, str]], Awaitable[None]]
 
@@ -395,7 +398,9 @@ class GatewaySandboxSetupAdapter:
     async def read_setup_status(self) -> SandboxSetupStatus:
         return _setup_status(await self._status_reader(self._config))
 
-    async def ensure_setup(self) -> SandboxSetupStatus:
+    async def ensure_setup(self, *, repair_identity: bool = False) -> SandboxSetupStatus:
+        if repair_identity:
+            return _setup_status(await self._setup_runner(self._config, repair_identity=True))
         return _setup_status(await self._setup_runner(self._config))
 
     async def read_capability(self, *, refresh: bool) -> SandboxCapability:
@@ -558,22 +563,77 @@ class GatewaySandboxRunModeEventsAdapter:
         )
 
 
+@dataclass
+class _RuntimeStatusFlight:
+    future: asyncio.Future[RuntimePackStatus]
+    invalidated: bool = False
+
+
+_runtime_status_flights: WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, _RuntimeStatusFlight]
+] = WeakKeyDictionary()
+
+
 class GatewaySandboxRuntimePackAdapter:
     """Run blocking Runtime Pack operations outside the Gateway event loop."""
 
     def __init__(self, state_dir: str | Path | None) -> None:
         self._state_dir = state_dir
 
+    def _status_key(self) -> str:
+        from opensquilla.runtime_packs.manager import runtime_packs_root
+
+        return str(runtime_packs_root(self._state_dir).absolute())
+
+    def _invalidate_status(self) -> None:
+        flights = _runtime_status_flights.get(asyncio.get_running_loop(), {})
+        flight = flights.get(self._status_key())
+        if flight is not None:
+            flight.invalidated = True
+
     async def read_runtime_status(self) -> SandboxRuntimePackDocument:
         from opensquilla.runtime_packs import status_snapshot
 
-        status = await asyncio.to_thread(status_snapshot, self._state_dir)
-        return _runtime_status(status)
+        loop = asyncio.get_running_loop()
+        key = self._status_key()
+        while True:
+            flights = _runtime_status_flights.setdefault(loop, {})
+            flight = flights.get(key)
+            if flight is None:
+                context = contextvars.copy_context()
+                # Keep the physical executor Future, not a cancellable observer
+                # Task. Socket teardown cannot free this slot before I/O ends.
+                future = loop.run_in_executor(
+                    None, context.run, status_snapshot, self._state_dir,
+                )
+                flight = _RuntimeStatusFlight(future)
+                flights[key] = flight
+
+                def completed(
+                    result: asyncio.Future[RuntimePackStatus],
+                    pending: dict[str, _RuntimeStatusFlight] = flights,
+                    root: str = key,
+                ) -> None:
+                    current = pending.get(root)
+                    if current is not None and current.future is result:
+                        pending.pop(root)
+                    if not pending and _runtime_status_flights.get(loop) is pending:
+                        _runtime_status_flights.pop(loop, None)
+                    if not result.cancelled():
+                        result.exception()
+
+                future.add_done_callback(completed)
+            status = await asyncio.shield(flight.future)
+            if not flight.invalidated:
+                return _runtime_status(status)
+            # A mutation finished during this snapshot. Join one fresh read
+            # after physical completion instead of publishing its old result.
 
     async def install_runtime(self, component_id: str) -> SandboxRuntimeOperation:
         from opensquilla.runtime_packs import start_install
 
         operation = await asyncio.to_thread(start_install, component_id, self._state_dir)
+        self._invalidate_status()
         return _runtime_operation(operation)
 
     async def cancel_runtime(
@@ -592,12 +652,14 @@ class GatewaySandboxRuntimePackAdapter:
             )
         except RuntimePackError as exc:
             raise SandboxRuntimeOperationConflictError(component_id) from exc
+        self._invalidate_status()
         return _runtime_operation(operation)
 
     async def remove_runtime(self, component_id: str) -> SandboxRuntimeOperation:
         from opensquilla.runtime_packs import remove_component
 
         operation = await asyncio.to_thread(remove_component, component_id, self._state_dir)
+        self._invalidate_status()
         return _runtime_operation(operation)
 
     async def discard_runtime_download(
@@ -617,6 +679,7 @@ class GatewaySandboxRuntimePackAdapter:
             raise SandboxRuntimeDiscardError(component_id) from exc
         except RuntimePackError as exc:
             raise SandboxRuntimeOperationConflictError(component_id) from exc
+        self._invalidate_status()
         return _runtime_status(status)
 
 

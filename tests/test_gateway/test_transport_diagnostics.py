@@ -148,6 +148,93 @@ async def test_failed_admission_diagnostics_cannot_skip_cleanup_or_original_reco
     assert get_transport_budget().used == before
 
 
+async def test_oversized_response_returns_rpc_error_without_closing_socket(monkeypatch):
+    """C30 regression: a response wire overflow is request-scoped."""
+
+    before = get_transport_budget().used
+    monkeypatch.setattr(websocket, "MAX_PAYLOAD_BYTES", 512)
+    conn = WsConnection("oversized-response", AsyncMock())
+    conn._enable_flow()
+    conn._outbox = asyncio.Queue()
+    try:
+        conn._enqueue_frame(websocket._OutboundFrame(
+            kind="res",
+            classification="control",
+            payload=None,
+            event_name=None,
+            res_frame=ResFrame(id="large", ok=True, payload={"content": "x" * 4096}),
+        ))
+        assert not conn._closing
+        reply = conn._outbox.get_nowait()
+        assert reply.res_frame is not None
+        assert reply.res_frame.id == "large"
+        assert reply.res_frame.error is not None
+        assert reply.res_frame.error.code == "RESPONSE_TOO_LARGE"
+        assert reply.res_frame.error.accepted is None
+        assert reply.res_frame.error.details == {"max_payload_bytes": 512}
+
+        # The same socket can still carry a subsequent control response.
+        conn._enqueue_frame(websocket._OutboundFrame(
+            kind="res",
+            classification="control",
+            payload=None,
+            event_name=None,
+            res_frame=ResFrame(id="follow-up", ok=True, payload={"ok": True}),
+        ))
+        follow_up = conn._outbox.get_nowait()
+        assert follow_up.res_frame is not None
+        assert follow_up.res_frame.id == "follow-up"
+        conn._release_outbound_budget(reply)
+        conn._release_outbound_budget(follow_up)
+    finally:
+        conn._cleanup_transport()
+    assert get_transport_budget().used == before
+
+
+def test_wire_preflight_rejects_oversized_payload_before_recursive_protocol_copy(monkeypatch):
+    """A clearly oversized response/event never enters the full encoder."""
+
+    monkeypatch.setattr(websocket, "MAX_PAYLOAD_BYTES", 512)
+    original = websocket.encode_payload_for_protocol
+    original_model_copy = ResFrame.model_copy
+    large_calls: list[object] = []
+
+    def guarded(payload, *, protocol):
+        if isinstance(payload, dict) and len(str(payload.get("content", ""))) > 1024:
+            large_calls.append(payload)
+            raise AssertionError("oversized payload reached recursive protocol encoder")
+        return original(payload, protocol=protocol)
+
+    monkeypatch.setattr(websocket, "encode_payload_for_protocol", guarded)
+
+    def guarded_model_copy(self, *args, **kwargs):
+        payload = self.payload
+        if isinstance(payload, dict) and len(str(payload.get("content", ""))) > 1024:
+            raise AssertionError("oversized payload reached Pydantic frame serializer")
+        return original_model_copy(self, *args, **kwargs)
+
+    monkeypatch.setattr(ResFrame, "model_copy", guarded_model_copy)
+    conn = WsConnection("preflight", AsyncMock())
+    conn._enable_flow()
+    conn._outbox = asyncio.Queue()
+    try:
+        conn._enqueue_frame(websocket._OutboundFrame(
+            kind="res", classification="control", payload=None, event_name=None,
+            res_frame=ResFrame(id="large", ok=True, payload={"content": "x" * 4096}),
+        ))
+        response = conn._outbox.get_nowait()
+        assert response.res_frame is not None
+        assert response.res_frame.error is not None
+        assert response.res_frame.error.code == "RESPONSE_TOO_LARGE"
+        conn._enqueue_frame(websocket._OutboundFrame(
+            kind="event", classification="lossy", payload={"content": "x" * 4096},
+            event_name="session.event.text_delta", res_frame=None,
+        ))
+        assert large_calls == []
+    finally:
+        conn._cleanup_transport()
+
+
 def test_admission_failure_counters_include_acknowledged_inflight_reservations():
     before = get_transport_budget().used
     conn = WsConnection("diagnostic-inflight", AsyncMock())

@@ -12,6 +12,7 @@ const testState = vi.hoisted(() => ({
   hasLoaded: false,
   loading: false,
   error: null as string | null,
+  waitingForCapacity: false,
   openPanel: vi.fn(),
 }))
 
@@ -29,6 +30,7 @@ vi.mock('@/composables/cron/useCronJobs', async () => {
       hasLoaded: ref(testState.hasLoaded),
       loading: ref(testState.loading),
       error: ref(testState.error),
+      waitingForCapacity: ref(testState.waitingForCapacity),
       searchText: ref(''),
       viewMode: ref<'cards' | 'table'>('cards'),
       runningJobIds: ref(new Set<string>()),
@@ -59,6 +61,8 @@ vi.mock('@/composables/cron/useCronRuns', async () => {
   return { useCronRuns: () => ({
     runs: ref([]),
     runsLoading: ref(false),
+    waitingForCapacity: ref(false),
+    error: ref(null),
     loadRuns: vi.fn(async () => null),
   }) }
 })
@@ -152,6 +156,7 @@ beforeEach(() => {
   testState.hasLoaded = false
   testState.loading = false
   testState.error = null
+  testState.waitingForCapacity = false
   testState.openPanel.mockReset()
 })
 
@@ -242,5 +247,26 @@ describe('CronView automation hero states', () => {
     expect(host.querySelector('[data-testid="loading-spinner"]')).toBeNull()
     expect(host.querySelector('.automation-launch')).toBeNull()
     expect(host.querySelector('[data-testid="cron-job-list"]')).toBeNull()
+  })
+
+  it('retains cached jobs next to a refresh error', () => {
+    testState.hasLoaded = true
+    testState.jobs = [{ id: 'daily', enabled: true }]
+    testState.error = 'Permission denied'
+    const host = mountCronView()
+    expect(host.querySelector('[data-testid="error-state"]')).not.toBeNull()
+    expect(host.querySelector('[data-testid="cron-job-list"]')).not.toBeNull()
+    expect(host.querySelector('[data-testid="loading-spinner"]')).toBeNull()
+  })
+
+  it.each([false, true])('shows capacity waiting without an error or permanent spinner (cached=%s)', (cached) => {
+    testState.hasLoaded = cached
+    testState.jobs = cached ? [{ id: 'daily', enabled: true }] : []
+    testState.waitingForCapacity = true
+    const host = mountCronView()
+    expect(host.querySelector('[role="status"]')?.textContent).toContain('Retrying automatically')
+    expect(host.querySelector('[data-testid="error-state"]')).toBeNull()
+    expect(host.querySelector('[data-testid="loading-spinner"]')).toBeNull()
+    expect(Boolean(host.querySelector('[data-testid="cron-job-list"]'))).toBe(cached)
   })
 })

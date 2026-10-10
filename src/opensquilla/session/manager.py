@@ -2798,6 +2798,7 @@ class SessionManager:
         *,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
+        content_mode: str = "full",
     ) -> list[TranscriptEntry]:
         session_key = canonicalize_session_key(session_key)
         node = await self._storage.get_session(session_key)
@@ -2809,7 +2810,11 @@ class SessionManager:
             expected_session_epoch=expected_session_epoch,
             operation="transcript read",
         )
-        transcript = await self._storage.get_transcript(node.session_id, limit=limit)
+        transcript = await self._storage.get_transcript(
+            node.session_id,
+            limit=limit,
+            content_mode=content_mode,
+        )
         if expected_session_id is not None or expected_session_epoch is not None:
             current = await self._storage.get_session(session_key)
             if current is None:
@@ -2821,6 +2826,15 @@ class SessionManager:
                 operation="transcript read",
             )
         return transcript
+
+    async def get_transcript_token_metadata(self, session_key: str) -> dict[str, int | bool]:
+        """Return transcript token metadata without materializing message bodies."""
+
+        session_key = canonicalize_session_key(session_key)
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        return await self._storage.get_transcript_token_metadata(node.session_id)
 
     async def capture_compaction_source(
         self,
@@ -3116,6 +3130,7 @@ class SessionManager:
         limit: int,
         before: tuple[int, int] | None = None,
         after: tuple[int, int] | None = None,
+        content_mode: str = "full",
     ) -> CanonicalTranscriptPage:
         """Return a bounded canonical page without changing provider replay."""
         session_key = canonicalize_session_key(session_key)
@@ -3127,6 +3142,7 @@ class SessionManager:
             limit=limit,
             before=before,
             after=after,
+            content_mode=content_mode,
         )
         canonical_complete = await self._storage.is_canonical_transcript_complete(node.session_id)
         return CanonicalTranscriptPage(

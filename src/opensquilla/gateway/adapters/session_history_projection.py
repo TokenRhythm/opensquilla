@@ -549,6 +549,7 @@ def _annotate_transcript_attachment_downloads(
         for attachment in attachments:
             if not isinstance(attachment, dict):
                 continue
+            locator = attachment.pop("_history_source", None)
             sha = attachment.get("sha256_ref")
             if not isinstance(sha, str) or not sha:
                 continue
@@ -560,6 +561,13 @@ def _annotate_transcript_attachment_downloads(
                 f"/api/v1/attachments/{quote(sha, safe='')}?sessionKey={session_qs}"
                 f"&name={quote(name, safe='')}&mime={quote(mime, safe='')}"
             )
+            if isinstance(locator, dict):
+                attachment["download_url"] += (
+                    f"&messageId={quote(str(locator['message_id']), safe='')}"
+                    f"&attachmentIndex={int(locator['ordinal'])}"
+                    f"&revision={quote(str(locator['revision']), safe='')}"
+                    f"&source={quote(str(locator['source']), safe='')}"
+                )
     return messages
 
 
@@ -907,6 +915,11 @@ async def read_chat_history_v4(params: dict | None, ctx: RpcContext) -> dict:
         limit=None,
         previous_entry=previous_entry,
         next_entry=next_entry,
+        # The v4 history frame is control-plane traffic.  Keep legacy callers
+        # of the shared projector unchanged while making this wire path
+        # bounded; clients can range-read the remainder through
+        # ``content.read.v1`` using the emitted contentRef.
+        content_mode="bounded",
     )
     turn_outcomes = await _chat_history_turn_outcomes(
         ctx,

@@ -40,6 +40,7 @@ GUEST_RPC_ALLOWLIST = frozenset(
         "sessions.messages.resume",
         "sessions.messages.snapshot.release",
         "transport.flow.update",
+        "transport.sessionFlow.update.v2",
         "sessions.messages.unsubscribe",
         "sessions.pending_inputs.enqueue",
         "sessions.pending_inputs.list",
@@ -183,7 +184,7 @@ class GuestRpcPolicy:
         if method == SESSIONS_LIST_METHOD:
             return params
 
-        if method == "transport.flow.update":
+        if method in {"transport.flow.update", "transport.sessionFlow.update.v2"}:
             # The handler operates on ctx.conn_id only and checks every key
             # against that connection's existing subscriptions. No authority
             # or subscription can be acquired through consumption feedback.

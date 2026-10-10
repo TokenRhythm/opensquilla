@@ -47,7 +47,9 @@ def _is_artifact_preview_control_path(path: str) -> bool:
 
 
 
-_CONTROL_PLANE_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz"})
+_CONTROL_PLANE_PATHS = frozenset(
+    {"/health", "/healthz", "/ready", "/readyz", "/readyz/core"}
+)
 
 
 def _path_is_at_or_below(path: str, prefix: str) -> bool:
@@ -123,6 +125,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         "/healthz",
         "/ready",
         "/readyz",
+        "/readyz/core",
         # These exist only for a Desktop-spawned gateway and authenticate with
         # the per-instance ownership nonce instead of the operator API token.
         "/api/desktop/identity",
@@ -215,6 +218,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._config = config
         # {ip: [(timestamp, count), ...]}
         self._windows: dict[str, list[float]] = defaultdict(list)
+        # Content reads use their own bounded lane.  They are numerous by
+        # design (one request per bounded range), but must not consume the
+        # control/API budget used by startup and interactive RPCs.
+        self._content_windows: dict[str, list[float]] = defaultdict(list)
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if not self._config.rate_limit.enabled:
@@ -243,6 +250,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         client_ip = self._get_client_ip(request)
         now = time.time()
+        if request.method.upper() == "GET" and path == "/api/content/read":
+            content_window = self._config.rate_limit.content_window_seconds
+            content_max_req = self._config.rate_limit.content_max_requests
+            self._content_windows[client_ip] = [
+                t for t in self._content_windows[client_ip]
+                if now - t < content_window
+            ]
+            if len(self._content_windows[client_ip]) >= content_max_req:
+                return JSONResponse(
+                    {"error": "Too Many Requests", "code": "CONTENT_RATE_LIMITED"},
+                    status_code=429,
+                    headers={"Retry-After": str(max(1, int(content_window)))}
+                )
+            self._content_windows[client_ip].append(now)
+            return await call_next(request)  # type: ignore[no-any-return]
+
         window = self._config.rate_limit.window_seconds
         max_req = self._config.rate_limit.max_requests
 

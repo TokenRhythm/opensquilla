@@ -185,4 +185,48 @@ describe('interleaveHistoryModelCallSegments', () => {
 
     expect(interleaveHistoryModelCallSegments(messages)).toEqual(messages)
   })
+
+  it('carries one shared content reference and visible slices across transformed rows', () => {
+    const contentRef = {
+      version: 1 as const,
+      sessionKey: 'agent:main:webchat:bounded-history',
+      sessionId: 'session-1',
+      messageId: 'assistant-1',
+      view: 'display' as const,
+      byteLength: 20 * 1024,
+    }
+    const messages: ChatMessage[] = [
+      ...baseTurn(),
+      appliedSteer('steer-1', '调整', '2.0', 2),
+      {
+        role: 'assistant',
+        text: '前😀后续',
+        ts: 3,
+        messageId: 'assistant-1',
+        turnId: 'turn-1',
+        contentRef,
+        restoredFromHistory: true,
+        usage: {
+          model_call_segments: [{
+            model_call_id: '2.0',
+            iteration: 2,
+            start_codepoint: 2,
+            end_codepoint: 4,
+          }],
+        },
+      },
+    ]
+
+    const result = interleaveHistoryModelCallSegments(messages)
+    expect(result[1]).toMatchObject({
+      clientId: expect.stringContaining('history-model-call-segment:'),
+      contentRef,
+      contentSlice: { startCodepoint: 0, endCodepoint: 2 },
+    })
+    expect(result[3]).toMatchObject({
+      messageId: 'assistant-1',
+      contentRef,
+      contentSlice: { startCodepoint: 2, endCodepoint: 4 },
+    })
+  })
 })

@@ -407,7 +407,7 @@ function attachHistoryTurnOutcomes(
       ? outcome.activitySnapshot
       : undefined
     const snapshotReasoningBlocks = activitySnapshot?.complete
-      ? activityReasoningBlocks(activitySnapshot, message.reasoning?.text ?? '')
+      ? activityReasoningBlocks(activitySnapshot, message.reasoning?.text ?? '', message.historyPayloadPreview?.reasoningUtf16Length)
       : undefined
     const activitySnapshotComplete = Boolean(
       activitySnapshot?.complete
@@ -954,6 +954,14 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         ? historyActivityMarkers(msg.turnContext, suppressedCompactionIds)
         : undefined,
       messageId,
+      ...(msg.contentRef ? { contentRef: { ...msg.contentRef } } : {}),
+      ...(msg.previewComplete !== undefined ? { previewComplete: msg.previewComplete } : {}),
+      ...(msg.historyPayloadPreview ? { historyPayloadPreview: msg.historyPayloadPreview } : {}),
+      ...(msg.contentRevision ? { contentRevision: msg.contentRevision } : {}),
+      ...(msg.contentAvailability ? { contentAvailability: msg.contentAvailability } : {}),
+      ...(msg.contentUnavailableReason
+        ? { contentUnavailableReason: msg.contentUnavailableReason }
+        : {}),
       restoredFromHistory: true,
     }
   }

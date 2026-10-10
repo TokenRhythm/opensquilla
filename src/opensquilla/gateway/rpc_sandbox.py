@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import json
 import plistlib
@@ -10,7 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -87,7 +88,7 @@ from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.setup_runtime import (
     current_sandbox_capability_report,
     current_sandbox_setup_runtime_status,
-    ensure_sandbox_setup_auto,
+    request_sandbox_setup,
 )
 from opensquilla.sandbox.status import status_payload
 from opensquilla.session.keys import parse_agent_id
@@ -107,6 +108,34 @@ def _sandbox_token_store(ctx: RpcContext) -> TokenStore:
     if not state_dir:
         raise RpcUnavailableError("Sandbox token storage is unavailable.")
     return TokenStore(Path(str(state_dir)) / "sessions.db")
+
+
+async def _run_sandbox_token_operation[Result](
+    ctx: RpcContext, operation: Callable[[TokenStore], Result],
+) -> Result:
+    # Construction can migrate SQLite too. Keep the whole operation off-loop,
+    # and retain the request owner until physical completion even if cancelled.
+    worker = asyncio.get_running_loop().run_in_executor(
+        None, contextvars.copy_context().run, lambda: operation(_sandbox_token_store(ctx)),
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except BaseException:
+            break
+    try:
+        result = worker.result()
+    except BaseException as exc:
+        if cancellation is not None:
+            raise cancellation from exc
+        raise
+    if cancellation is not None:
+        raise cancellation
+    return result
 
 
 def _sandbox_token_payload(record: TokenRecord) -> dict[str, Any]:
@@ -701,7 +730,7 @@ def _sandbox_application(ctx: RpcContext) -> SandboxRuntime:
         setup=GatewaySandboxSetupAdapter(
             ctx.config,
             status_reader=current_sandbox_setup_runtime_status,
-            setup_runner=ensure_sandbox_setup_auto,
+            setup_runner=request_sandbox_setup,
             capability_reader=current_sandbox_capability_report,
         ),
         policy=GatewaySandboxPolicyAdapter(getattr(ctx.config, "state_dir", None)),
@@ -970,10 +999,11 @@ async def _handle_sandbox_token_list(params: dict | None, ctx: RpcContext) -> di
     _require_owner(ctx, "sandbox.tokens.list")
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
+    records = await _run_sandbox_token_operation(ctx, lambda store: store.list_active())
     return {
         "tokens": [
             _sandbox_token_payload(record)
-            for record in _sandbox_token_store(ctx).list_active()
+            for record in records
         ]
     }
 
@@ -991,11 +1021,14 @@ async def _handle_sandbox_token_create(params: dict | None, ctx: RpcContext) -> 
     capabilities = {"task.read", "task.submit"}
     if host_execute:
         capabilities.add("host.execute")
-    issued = _sandbox_token_store(ctx).create(
-        name=name.strip(),
-        roles={"operator"},
-        scopes={"operator.read", "operator.write"},
-        capabilities=capabilities,
+    issued = await _run_sandbox_token_operation(
+        ctx,
+        lambda store: store.create(
+            name=name.strip(),
+            roles={"operator"},
+            scopes={"operator.read", "operator.write"},
+            capabilities=capabilities,
+        ),
     )
     return {
         "token": issued.token,
@@ -1010,15 +1043,21 @@ async def _handle_sandbox_token_revoke(params: dict | None, ctx: RpcContext) -> 
     public_id = values.get("publicId")
     if not isinstance(public_id, str) or not public_id.strip():
         raise ValueError("params.publicId must be a non-empty string")
+    revoked = await _run_sandbox_token_operation(ctx, lambda store: store.revoke(public_id.strip()))
     return {
         "publicId": public_id.strip(),
-        "revoked": _sandbox_token_store(ctx).revoke(public_id.strip()),
+        "revoked": revoked,
     }
 
 
 async def _handle_sandbox_setup_ensure(params: dict | None, ctx: RpcContext) -> dict:
     _require_owner(ctx, "sandbox.setup.ensure")
-    return await _sandbox_payload(_sandbox_application(ctx).prepare())
+    repair_identity = params.get("repairIdentity", False) if isinstance(params, dict) else False
+    if type(repair_identity) is not bool:
+        raise ValueError("params.repairIdentity must be a boolean")
+    return await _sandbox_payload(
+        _sandbox_application(ctx).prepare(repair_identity=repair_identity),
+    )
 
 
 _handle_sandbox_setup_ensure_contract = register_sandbox_runtime_contract(

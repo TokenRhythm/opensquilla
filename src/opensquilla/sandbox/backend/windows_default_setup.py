@@ -5,15 +5,16 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import os
 import secrets
 import string
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,20 @@ from opensquilla.sandbox.backend.windows_default_network import WindowsNetworkSe
 SETUP_VERSION = 2
 OFFLINE_USERNAME = "OpenSquillaSandbox"
 SETUP_HELPER_REPORT = "setup_helper_report.json"
-SETUP_PROCESS_LOCK_TIMEOUT_MS = 10 * 60 * 1000
+SETUP_PROCESS_LOCK_TIMEOUT_MS = 0
+_SETUP_DEADLINE: ContextVar[float | None] = ContextVar("windows_setup_deadline", default=None)
+_SETUP_OWNER: ContextVar[dict[str, str] | None] = ContextVar("windows_setup_owner", default=None)
+# UAC/setup is an explicit operator action. Never wait forever when the
+# elevation prompt is unavailable (headless CI, disconnected desktop, or a
+# dismissed credential prompt); an orphaned helper must not hold Gateway
+# setup status indefinitely.
+SETUP_HELPER_WAIT_TIMEOUT_MS = 2 * 60 * 1000
+# A ShellExecuteEx process handle covers the elevated helper itself, but does
+# not own the PowerShell/icacls children it may have started.  Keep the tree
+# cleanup bounded as well: a timeout must return control to Gateway even when
+# taskkill is blocked by an ACL or a broken desktop session.
+SETUP_HELPER_CLEANUP_TIMEOUT_MS = 10 * 1000
+SETUP_HELPER_CLEANUP_WAIT_TIMEOUT_MS = 2 * 1000
 _DESKTOP_PRIMARY_HOME_PARTS = (
     "AppData",
     "Roaming",
@@ -38,9 +52,15 @@ _IDENTITY_READINESS_CACHE: dict[tuple[str, int, int], bool] = {}
 class WindowsDefaultSetupMarker:
     setup_version: int
     network: WindowsNetworkSetup | None = None
+    # A new setup attempt writes ``pending`` until ACL hardening has passed.
+    # Missing state on an older marker is treated as ``ready`` by the parser.
+    setup_state: str = "ready"
 
     def to_json(self) -> dict[str, object]:
-        payload: dict[str, object] = {"setupVersion": self.setup_version}
+        payload: dict[str, object] = {
+            "setupVersion": self.setup_version,
+            "setupState": self.setup_state,
+        }
         if self.network is not None:
             payload["network"] = self.network.to_json()
         return payload
@@ -75,8 +95,15 @@ def write_setup_marker(
     *,
     setup_version: int = SETUP_VERSION,
     network: WindowsNetworkSetup | None = None,
+    setup_state: str = "ready",
 ) -> None:
-    marker = WindowsDefaultSetupMarker(setup_version=setup_version, network=network)
+    if not isinstance(setup_state, str) or setup_state not in {"pending", "ready"}:
+        raise ValueError("invalid_windows_setup_marker_state")
+    marker = WindowsDefaultSetupMarker(
+        setup_version=setup_version,
+        network=network,
+        setup_state=setup_state,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_json_atomic_no_follow(path, marker.to_json())
 
@@ -91,8 +118,15 @@ def read_setup_marker(path: Path) -> WindowsDefaultSetupMarker | None:
     version = raw.get("setupVersion")
     if not isinstance(version, int):
         return None
+    setup_state = raw.get("setupState", "ready")
+    if not isinstance(setup_state, str) or setup_state not in {"pending", "ready"}:
+        return None
     network = _network_setup_from_json(raw.get("network"))
-    return WindowsDefaultSetupMarker(setup_version=version, network=network)
+    return WindowsDefaultSetupMarker(
+        setup_version=version,
+        network=network,
+        setup_state=setup_state,
+    )
 
 
 def _network_setup_from_json(raw: object) -> WindowsNetworkSetup | None:
@@ -130,19 +164,23 @@ def _network_setup_from_json(raw: object) -> WindowsNetworkSetup | None:
 
 def setup_marker_is_current(path: Path) -> bool:
     marker = read_setup_marker(path)
-    return marker is not None and marker.setup_version == SETUP_VERSION
+    return (
+        marker is not None
+        and marker.setup_version == SETUP_VERSION
+        and marker.setup_state == "ready"
+    )
 
 
 def setup_marker_proxy_allowlist_ready(path: Path, *, ports: tuple[int, ...]) -> bool:
     marker = read_setup_marker(path)
-    if marker is None or marker.setup_version != SETUP_VERSION:
+    if marker is None or marker.setup_version != SETUP_VERSION or marker.setup_state != "ready":
         return False
     if marker.network is None:
         return False
     return marker.network.is_current_for_ports(ports)
 
 
-def setup_marker_identity_ready(path: Path) -> bool:
+def setup_marker_identity_ready(path: Path, *, fresh: bool = False) -> bool:
     """Return whether the marker's offline account can actually log on.
 
     A current marker is not sufficient: the local account password can be
@@ -156,22 +194,22 @@ def setup_marker_identity_ready(path: Path) -> bool:
         cache_key = (str(path), stat_result.st_mtime_ns, stat_result.st_size)
     except OSError:
         return False
-    cached = _IDENTITY_READINESS_CACHE.get(cache_key)
+    cached = None if fresh else _IDENTITY_READINESS_CACHE.get(cache_key)
     if cached is not None:
         return cached
     marker = read_setup_marker(path)
     if marker is None or marker.network is None:
         return False
     network = marker.network
-    if not network.offline_username or not network.protected_password:
+    if network.offline_username != OFFLINE_USERNAME or not network.protected_password:
         return False
     try:
         from opensquilla.sandbox.backend.windows_default_identity import (
             OfflineSandboxIdentity,
-            logon_offline_identity,
+            validate_offline_identity,
         )
 
-        token = logon_offline_identity(
+        ready = validate_offline_identity(
             OfflineSandboxIdentity(
                 sid=network.offline_user_sid,
                 username=network.offline_username,
@@ -180,20 +218,6 @@ def setup_marker_identity_ready(path: Path) -> bool:
         )
     except (OSError, ValueError):
         ready = False
-    else:
-        try:
-            if not sys.platform.startswith("win"):
-                ready = False
-            else:
-                import ctypes
-                from ctypes import wintypes
-
-                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-                kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-                kernel32.CloseHandle.restype = wintypes.BOOL
-                ready = bool(kernel32.CloseHandle(wintypes.HANDLE(token)))
-        except Exception:
-            ready = False
     if len(_IDENTITY_READINESS_CACHE) >= 32:
         _IDENTITY_READINESS_CACHE.clear()
     _IDENTITY_READINESS_CACHE[cache_key] = ready
@@ -221,6 +245,10 @@ def write_setup_helper_report(
     detail: str | None = None,
 ) -> None:
     report: dict[str, object] = {"state": state}
+    owner = _SETUP_OWNER.get() or {}
+    for key in ("launcherPid", "launcherCreated"):
+        if key in owner:
+            report[key] = owner[key]
     if detail:
         report["detail"] = detail
     path = setup_helper_report_path(marker_path)
@@ -242,10 +270,19 @@ def read_setup_helper_report(marker_path: Path) -> dict[str, str] | None:
     report = {"state": state}
     if isinstance(detail, str) and detail:
         report["detail"] = detail
+    for key in ("launcherPid", "launcherCreated"):
+        if isinstance(raw.get(key), str):
+            report[key] = raw[key]
     return report
 
 
-def establish_windows_network_setup(path: Path) -> WindowsNetworkSetup:
+def establish_windows_network_setup(
+    path: Path,
+    *,
+    profile_path: Path | None = None,
+    user_sid: str | None = None,
+    repair_identity: bool = False,
+) -> WindowsNetworkSetup:
     from opensquilla.sandbox.backend.windows_default_firewall import (
         firewall_rule_specs,
         install_firewall_rules,
@@ -256,15 +293,46 @@ def establish_windows_network_setup(path: Path) -> WindowsNetworkSetup:
     )
     from opensquilla.sandbox.backend.windows_default_wfp import install_wfp_filters_for_user
 
-    identity = ensure_offline_sandbox_user(path.parent)
+    identity = ensure_offline_sandbox_user(
+        path.parent,
+        profile_path=profile_path,
+        user_sid=user_sid,
+        repair_identity=repair_identity,
+    )
     allowed_ports = (48123,)
+    # A valid credential and a current network installation are separate facts.
+    # Reusing another supported profile never modifies that source profile.
+    source = read_setup_marker(Path(identity.get("sourceMarker", str(path))))
+    if (
+        source is not None
+        and source.setup_state == "ready"
+        and source.network is not None
+        and source.network.offline_user_sid == identity["sid"]
+        and source.network.is_current_for_ports(allowed_ports)
+    ):
+        return source.network
+    pending = WindowsNetworkSetup(
+        offline_user_sid=identity["sid"],
+        allowed_proxy_ports=allowed_ports,
+        allow_local_binding=False,
+        firewall_rule_version=0,
+        wfp_rule_version=0,
+        offline_username=identity["username"],
+        protected_password=identity["protectedPassword"],
+    )
+    # Persist immediately: a firewall failure must not orphan a newly created
+    # account whose only password lived in this process.
+    write_setup_marker(path, network=pending, setup_state="pending")
     rules = firewall_rule_specs(
         offline_sid=identity["sid"],
         allowed_proxy_ports=allowed_ports,
         allow_local_binding=False,
     )
+    setup_command_timeout()
     install_firewall_rules(rules)
+    setup_command_timeout()
     install_wfp_filters_for_user(identity["sid"], allowed_proxy_ports=allowed_ports)
+    setup_command_timeout()
     return WindowsNetworkSetup(
         offline_user_sid=identity["sid"],
         allowed_proxy_ports=allowed_ports,
@@ -276,12 +344,36 @@ def establish_windows_network_setup(path: Path) -> WindowsNetworkSetup:
     )
 
 
-def run_elevated_setup_helper(path: Path, *, already_elevated: bool = False) -> None:
-    try:
-        setup_helper_report_path(path).unlink()
-    except FileNotFoundError:
-        pass
-    payload = _encode_setup_helper_payload(path, user_sid=_current_windows_user_sid())
+def setup_command_timeout() -> float:
+    """One setup budget, plus an owner fence before each mutation stage."""
+    payload = _SETUP_OWNER.get()
+    if payload is not None:
+        from opensquilla.sandbox.backend.windows_setup_process import require_setup_owner
+
+        require_setup_owner(payload)
+    deadline = _SETUP_DEADLINE.get()
+    remaining = 120.0 if deadline is None else deadline - time.monotonic()
+    if remaining <= 0:
+        raise OSError("windows_setup_deadline_exceeded")
+    return remaining
+
+
+def run_elevated_setup_helper(
+    path: Path,
+    *,
+    already_elevated: bool = False,
+    repair_identity: bool = False,
+) -> None:
+    caller_sid = _current_windows_user_sid()
+    # Reject unsupported test/custom targets before showing any UAC prompt.
+    _validated_elevated_setup_target({"markerPath": str(path), "userSid": caller_sid})
+    # A second launcher must not erase the report of a helper that currently
+    # owns the machine lock. The elevated owner overwrites its own report.
+    payload = _encode_setup_helper_payload(
+        path,
+        user_sid=caller_sid,
+        repair_identity=repair_identity,
+    )
     helper_args = ["--elevated-helper", payload]
     if already_elevated:
         # Use the same validated, locked setup and ACL repair for an admin
@@ -291,13 +383,23 @@ def run_elevated_setup_helper(path: Path, *, already_elevated: bool = False) -> 
         if not getattr(sys, "frozen", False):
             helper_args = ["-m", "opensquilla.sandbox.backend.windows_default_setup", *helper_args]
         parameters = subprocess.list2cmdline(helper_args)
+        # Only the elevated owner writes reports. Let launch/timeout errors
+        # propagate without overwriting a completed or concurrent attempt.
         exit_code = _shell_execute_runas_and_wait(
             executable=sys.executable,
             parameters=parameters,
             directory=str(_setup_helper_import_root()),
         )
+    if exit_code == 75:
+        raise OSError("windows_setup_busy")
     if exit_code != 0:
-        detail = _setup_helper_report_detail(path)
+        # Only exit 1 guarantees this helper wrote a failure report; target,
+        # lock and ownership failures return without touching another owner.
+        detail = (
+            _setup_helper_report_detail(path, owner=_decode_setup_helper_payload(payload))
+            if exit_code == 1
+            else None
+        )
         message = f"windows_setup_helper_failed: exit={exit_code}"
         if detail:
             message = f"{message}: {detail}"
@@ -315,8 +417,12 @@ def elevated_setup_helper_main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"windows_default_setup helper failed: {exc}", file=sys.stderr)
         return 2
+    deadline_token = _SETUP_DEADLINE.set(time.monotonic() + SETUP_HELPER_WAIT_TIMEOUT_MS / 1000)
+    owner_token = _SETUP_OWNER.set(payload)
     try:
+        setup_command_timeout()
         with _windows_setup_process_lock(marker_path):
+            setup_command_timeout()
             with _secure_setup_directory_lease(marker_path, profile_path) as lease:
                 if _windows_setup_is_ready(marker_path):
                     marker = read_setup_marker(marker_path)
@@ -336,14 +442,22 @@ def elevated_setup_helper_main(argv: list[str] | None = None) -> int:
                     return 0
                 write_setup_helper_report(marker_path, state="running")
                 try:
-                    network = establish_windows_network_setup(marker_path)
-                    # Account rotation happens inside network setup. Persist
-                    # the matching DPAPI credential before ACL hardening so a
-                    # later ACL failure cannot leave the old marker pointing
-                    # at a password that no longer exists. Storage readiness
-                    # remains false until the ACL pass succeeds, so this does
-                    # not advertise a partially repaired sandbox as usable.
-                    write_setup_marker(marker_path, network=network)
+                    network = establish_windows_network_setup(
+                        marker_path,
+                        profile_path=profile_path,
+                        user_sid=payload["userSid"],
+                        repair_identity=payload.get("repairIdentity") == "true",
+                    )
+                    # The account credential is already durable. Keep the
+                    # marker pending until ACL hardening commits; a failed or
+                    # interrupted pass must not advertise partial setup.
+                    # Readers must never consume partially repaired setup.
+                    if not setup_marker_is_current(marker_path):
+                        write_setup_marker(
+                            marker_path,
+                            network=network,
+                            setup_state="pending",
+                        )
                     lock_persistent_sandbox_dirs(
                         marker_path,
                         offline_sid=network.offline_user_sid,
@@ -351,6 +465,12 @@ def elevated_setup_helper_main(argv: list[str] | None = None) -> int:
                         lease=lease,
                     )
                     _validate_setup_directory_lease(lease, recursive=True)
+                    setup_command_timeout()
+                    write_setup_marker(
+                        marker_path,
+                        network=network,
+                        setup_state="ready",
+                    )
                     write_setup_helper_report(marker_path, state="ready", detail="setup_complete")
                     return 0
                 except Exception as exc:
@@ -367,13 +487,23 @@ def elevated_setup_helper_main(argv: list[str] | None = None) -> int:
                     return 1
     except Exception as exc:
         print(f"windows_default_setup helper failed: {exc}", file=sys.stderr)
-        return 2
+        return 75 if str(exc) == "windows_setup_busy" else 2
+    finally:
+        _SETUP_OWNER.reset(owner_token)
+        _SETUP_DEADLINE.reset(deadline_token)
 
 
-def _setup_helper_report_detail(marker_path: Path) -> str | None:
+def _setup_helper_report_detail(
+    marker_path: Path,
+    *,
+    owner: dict[str, str] | None = None,
+) -> str | None:
     report = read_setup_helper_report(marker_path)
     if report is None:
         return None
+    for key in ("launcherPid", "launcherCreated"):
+        if owner and key in owner and report.get(key) != owner[key]:
+            return None
     return report.get("detail") or report.get("state")
 
 
@@ -386,12 +516,22 @@ def _setup_helper_import_root() -> Path:
     return Path.cwd()
 
 
-def _encode_setup_helper_payload(path: Path, *, user_sid: str | None = None) -> str:
+def _encode_setup_helper_payload(
+    path: Path,
+    *,
+    user_sid: str | None = None,
+    repair_identity: bool = False,
+) -> str:
     import base64
 
     data = {"markerPath": str(path)}
     if user_sid:
         data["userSid"] = user_sid
+    if repair_identity:
+        data["repairIdentity"] = "true"
+    from opensquilla.sandbox.backend.windows_setup_process import enrich_setup_payload
+
+    data = enrich_setup_payload(data)
     raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
@@ -415,6 +555,13 @@ def _decode_setup_helper_payload(value: str) -> dict[str, str]:
         if not isinstance(user_sid, str) or not user_sid.startswith("S-1-"):
             raise OSError("windows_setup_helper_payload_invalid")
         result["userSid"] = user_sid
+    for key in ("ownerPid", "ownerCreated", "launcherPid", "launcherCreated", "repairIdentity"):
+        if key in payload:
+            if not isinstance(payload[key], str) or not payload[key]:
+                raise OSError("windows_setup_helper_payload_invalid")
+            result[key] = payload[key]
+    if result.get("repairIdentity", "false") not in {"false", "true"}:
+        raise OSError("windows_setup_helper_payload_invalid")
     return result
 
 
@@ -482,14 +629,15 @@ def _windows_setup_is_ready(marker_path: Path) -> bool:
         return False
     return (
         marker.setup_version == SETUP_VERSION
+        and marker.setup_state == "ready"
         and marker.network.is_current_for_ports(marker.network.allowed_proxy_ports)
-        and setup_marker_identity_ready(marker_path)
+        and setup_marker_identity_ready(marker_path, fresh=True)
     )
 
 
 @contextmanager
 def _windows_setup_process_lock(marker_path: Path) -> Iterator[None]:
-    """Serialize elevated setup helpers for one Windows profile.
+    """Serialize machine-wide account/rule mutation, never a UAC prompt.
 
     Gateway restarts can leave an already-elevated helper running. A named
     mutex prevents a replacement gateway from concurrently changing the
@@ -514,8 +662,7 @@ def _windows_setup_process_lock(marker_path: Path) -> Iterator[None]:
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
 
-    digest = hashlib.sha256(_setup_path_key(marker_path).encode("utf-8")).hexdigest()[:32]
-    mutex_name = rf"Local\OpenSquillaSandboxSetup-{digest}"
+    mutex_name = r"Global\OpenSquillaSandboxSetup-v1"
     handle = kernel32.CreateMutexW(None, False, mutex_name)
     if not handle:
         raise OSError(ctypes.get_last_error(), "windows_setup_mutex_create_failed")
@@ -529,7 +676,7 @@ def _windows_setup_process_lock(marker_path: Path) -> Iterator[None]:
         if wait_result in (wait_object_0, wait_abandoned):
             acquired = True
         elif wait_result == wait_timeout:
-            raise OSError("windows_setup_mutex_timeout")
+            raise OSError("windows_setup_busy")
         else:
             raise OSError(ctypes.get_last_error(), "windows_setup_mutex_wait_failed")
         yield
@@ -849,7 +996,7 @@ def _shell_execute_runas_and_wait(
 
     see_mask_nocloseprocess = 0x00000040
     sw_hide = 0
-    infinite = 0xFFFFFFFF
+    wait_timeout = 0x00000102
     wait_failed = 0xFFFFFFFF
     error_cancelled = 1223
 
@@ -880,6 +1027,10 @@ def _shell_execute_runas_and_wait(
     kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.GetProcessId.argtypes = [wintypes.HANDLE]
+    kernel32.GetProcessId.restype = wintypes.DWORD
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -898,10 +1049,54 @@ def _shell_execute_runas_and_wait(
             raise OSError("windows_setup_helper_cancelled")
         raise OSError(code, f"windows_setup_helper_launch_failed: {ctypes.FormatError(code)}")
     try:
-        wait_result = kernel32.WaitForSingleObject(info.hProcess, infinite)
+        wait_result = kernel32.WaitForSingleObject(info.hProcess, SETUP_HELPER_WAIT_TIMEOUT_MS)
         if wait_result == wait_failed:
             code = ctypes.get_last_error()
             raise OSError(code, f"windows_setup_helper_wait_failed: {ctypes.FormatError(code)}")
+        if wait_result == wait_timeout:
+            # Do not leave a helper mutating the profile/network boundary
+            # after the caller has reported setup failure.  The taskkill tree
+            # pass handles PowerShell/icacls descendants; the direct handle
+            # termination and bounded wait cover races where the tree changes
+            # between enumeration and termination.
+            try:
+                helper_pid = int(kernel32.GetProcessId(info.hProcess))
+            except Exception as exc:
+                helper_pid = 0
+                cleanup_tree = f"pid_lookup_error:{type(exc).__name__}"
+            else:
+                cleanup_tree = (
+                    _terminate_setup_helper_tree(helper_pid) if helper_pid else "pid_unavailable"
+                )
+            try:
+                if kernel32.TerminateProcess(info.hProcess, 124):
+                    cleanup_parent = "terminate_ok"
+                else:
+                    cleanup_parent = f"terminate_failed:{ctypes.get_last_error()}"
+            except Exception as exc:
+                cleanup_parent = f"terminate_error:{type(exc).__name__}"
+            try:
+                cleanup_wait = kernel32.WaitForSingleObject(
+                    info.hProcess,
+                    SETUP_HELPER_CLEANUP_WAIT_TIMEOUT_MS,
+                )
+            except Exception as exc:
+                cleanup_wait_status = f"wait_error:{type(exc).__name__}"
+            else:
+                if cleanup_wait == 0:
+                    cleanup_wait_status = "exited"
+                elif cleanup_wait == wait_timeout:
+                    cleanup_wait_status = "still_running"
+                elif cleanup_wait == wait_failed:
+                    cleanup_wait_status = f"wait_failed:{ctypes.get_last_error()}"
+                else:
+                    cleanup_wait_status = f"wait_result:{int(cleanup_wait)}"
+            raise OSError(
+                f"windows_setup_helper_timeout: waited {SETUP_HELPER_WAIT_TIMEOUT_MS}ms; "
+                f"helper_pid={helper_pid}; cleanup_tree={cleanup_tree}; "
+                f"cleanup_parent={cleanup_parent}; "
+                f"cleanup_wait={cleanup_wait_status}"
+            )
         exit_code = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(exit_code)):
             code = ctypes.get_last_error()
@@ -912,14 +1107,144 @@ def _shell_execute_runas_and_wait(
             kernel32.CloseHandle(info.hProcess)
 
 
-def ensure_offline_sandbox_user(state_root: Path) -> dict[str, str]:
-    from opensquilla.sandbox.backend.windows_default_identity import protect_password
+def _identity_marker_candidates(path: Path, profile_path: Path | None) -> tuple[Path, ...]:
+    candidates = [path]
+    if profile_path is not None:
+        candidates.extend(_allowed_setup_marker_paths(profile_path))
+    # Fixed canonical locations only; no scanning of other users or directories.
+    return tuple(dict.fromkeys(candidates))
 
-    state_root.mkdir(parents=True, exist_ok=True)
-    password = _generate_offline_user_password()
+
+def _read_credential_marker(path: Path) -> WindowsDefaultSetupMarker | None:
+    _validate_existing_non_reparse_components(path)
+    marker = read_setup_marker(path)
+    if (
+        marker is None
+        or marker.network is None
+        or marker.network.offline_username != OFFLINE_USERNAME
+        or not marker.network.protected_password
+    ):
+        return None
+    return marker
+
+
+def _query_offline_account() -> dict[str, str] | None:
+    powershell = _trusted_windows_powershell_path()
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-Command",
+            "$ErrorActionPreference='Stop'; "
+            f"$u=Get-LocalUser -Name '{OFFLINE_USERNAME}' -ErrorAction SilentlyContinue; "
+            "if ($null -ne $u) { @{sid=$u.SID.Value; description=$u.Description} "
+            "| ConvertTo-Json -Compress }",
+        ],
+        env={**os.environ, "PSModulePath": str(Path(powershell).parent / "Modules")},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=setup_command_timeout(),
+    )
+    if result.returncode:
+        raise OSError("offline_identity_lookup_failed")
+    if not result.stdout.strip():
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except (ValueError, TypeError) as exc:
+        raise OSError("offline_identity_lookup_failed") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("sid"), str):
+        raise OSError("offline_identity_lookup_failed")
+    return {"sid": data["sid"], "description": str(data.get("description") or "")}
+
+
+def ensure_offline_sandbox_user(
+    state_root: Path,
+    *,
+    profile_path: Path | None = None,
+    user_sid: str | None = None,
+    repair_identity: bool = False,
+) -> dict[str, str]:
+    from opensquilla.sandbox.backend.windows_default_identity import (
+        protect_password,
+        unprotect_password,
+    )
+
     username = OFFLINE_USERNAME
     if len(username) > 20:
         raise OSError("offline_user_name_too_long")
+    caller_sid = user_sid or _current_windows_user_sid()
+    helper_sid = _current_windows_user_sid()
+    same_user = helper_sid == caller_sid
+    candidates = _identity_marker_candidates(state_root / "setup_marker.json", profile_path)
+    markers = [(path, _read_credential_marker(path)) for path in candidates]
+    if same_user:
+        for source, marker in markers:
+            if marker is not None and setup_marker_identity_ready(source, fresh=True):
+                assert marker.network is not None
+                return {
+                    "sid": marker.network.offline_user_sid,
+                    "username": username,
+                    "protectedPassword": marker.network.protected_password or "",
+                    "sourceMarker": str(source),
+                }
+
+    account = _query_offline_account()
+    if not same_user:
+        # The elevated administrator cannot decrypt the caller's user-bound
+        # DPAPI blob. Existing credentials remain opaque and unchanged. Limit
+        # this path to the fixed account and its actual current SID; the caller
+        # checks execution readiness again after ACL/network repair.
+        for source, marker in markers:
+            if (
+                account is not None
+                and marker is not None
+                and marker.network is not None
+                and marker.network.offline_user_sid == account["sid"]
+            ):
+                return {
+                    "sid": account["sid"],
+                    "username": username,
+                    "protectedPassword": marker.network.protected_password or "",
+                    "sourceMarker": str(source),
+                }
+        raise OSError("offline_identity_credential_handoff_unavailable")
+
+    expected_sid = ""
+    if account is not None:
+        # Never reset a shared account merely because this profile has no
+        # password. A repair is explicit and requires an ownership receipt.
+        description = account["description"]
+        owner_description = f"OpenSquilla sandbox owner={caller_sid}"
+        legacy_description = "OpenSquilla offline sandbox network identity"
+        if description not in {owner_description, legacy_description}:
+            raise OSError("offline_identity_owner_unknown")
+        historical_marker = next(
+            (
+                marker
+                for _, marker in markers
+                if marker is not None
+                and marker.network is not None
+                and marker.network.offline_user_sid == account["sid"]
+            ),
+            None,
+        )
+        if historical_marker is None:
+            raise OSError("offline_identity_owner_unknown")
+        assert historical_marker.network is not None
+        try:
+            unprotect_password(historical_marker.network.protected_password or "")
+        except (OSError, ValueError) as exc:
+            raise OSError("offline_identity_owner_unknown") from exc
+        if not repair_identity:
+            raise OSError("offline_identity_repair_required")
+        expected_sid = account["sid"]
+
+    # Protect before changing the account so a DPAPI error cannot orphan it.
+    password = _generate_offline_user_password()
+    protected = protect_password(password)
+    description = f"OpenSquilla sandbox owner={caller_sid}"
     script = (
         "$ErrorActionPreference = 'Stop'; "
         f"$name = '{username}'; "
@@ -927,48 +1252,80 @@ def ensure_offline_sandbox_user(state_root: Path) -> dict[str, str]:
         "$password = ConvertTo-SecureString $plain -AsPlainText -Force; "
         "$user = Get-LocalUser -Name $name -ErrorAction SilentlyContinue; "
         "if ($null -eq $user) { "
+        "if ($env:OPENSQUILLA_SANDBOX_EXPECTED_SID) { throw 'offline_identity_changed' }; "
         "New-LocalUser -Name $name -Password $password "
-        "-Description 'OpenSquilla offline sandbox network identity' | Out-Null "
-        "} else { Set-LocalUser -Name $name -Password $password }; "
+        "-Description $env:OPENSQUILLA_SANDBOX_DESCRIPTION | Out-Null "
+        "} else { "
+        "if (-not $env:OPENSQUILLA_SANDBOX_EXPECTED_SID -or "
+        "$user.SID.Value -ne $env:OPENSQUILLA_SANDBOX_EXPECTED_SID -or "
+        "$user.Description -ne $env:OPENSQUILLA_SANDBOX_EXPECTED_DESCRIPTION) "
+        "{ throw 'offline_identity_changed' }; "
+        "Set-LocalUser -Name $name -Password $password "
+        "-Description $env:OPENSQUILLA_SANDBOX_DESCRIPTION }; "
         "$adsi = [ADSI]('WinNT://./' + $name + ',user'); "
         "if ([bool]$adsi.IsAccountLocked) { "
         "$adsi.IsAccountLocked = $false; $adsi.SetInfo() }; "
-        "$user = Get-LocalUser -Name $name; "
-        "$user.SID.Value"
+        "$user = Get-LocalUser -Name $name; $user.SID.Value"
     )
     powershell = _trusted_windows_powershell_path()
-    env = {
-        **os.environ,
-        "OPENSQUILLA_SANDBOX_PASSWORD": password,
-        # Keep PowerShell 7 compatibility modules out of inbox Windows
-        # PowerShell resolution; they can shadow Microsoft.PowerShell.Security.
-        "PSModulePath": str(Path(powershell).parent / "Modules"),
-    }
     completed = subprocess.run(
-        [
-            powershell,
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ],
-        env=env,
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        env={
+            **os.environ,
+            "OPENSQUILLA_SANDBOX_PASSWORD": password,
+            "OPENSQUILLA_SANDBOX_EXPECTED_SID": expected_sid,
+            "OPENSQUILLA_SANDBOX_DESCRIPTION": description,
+            "OPENSQUILLA_SANDBOX_EXPECTED_DESCRIPTION": account["description"] if account else "",
+            "PSModulePath": str(Path(powershell).parent / "Modules"),
+        },
         capture_output=True,
         text=True,
         check=False,
+        timeout=setup_command_timeout(),
     )
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise OSError(detail or "offline_user_missing")
-    sid = completed.stdout.strip().splitlines()[-1].strip()
-    if not sid:
+    lines = completed.stdout.strip().splitlines()
+    sid = lines[-1].strip() if lines else ""
+    if not sid.startswith("S-1-") or (expected_sid and sid != expected_sid):
         raise OSError("offline_user_missing")
-    return {
-        "sid": sid,
-        "username": OFFLINE_USERNAME,
-        "protectedPassword": protect_password(password),
-    }
+    state_root.mkdir(parents=True, exist_ok=True)
+    pending = WindowsNetworkSetup(
+        offline_user_sid=sid,
+        allowed_proxy_ports=(48123,),
+        allow_local_binding=False,
+        firewall_rule_version=0,
+        wfp_rule_version=0,
+        offline_username=username,
+        protected_password=protected,
+    )
+    write_setup_marker(state_root / "setup_marker.json", network=pending, setup_state="pending")
+    if expected_sid and profile_path is not None:
+        # Explicit recovery is the sole exception to source-read-only reuse.
+        # Keep this Windows user's two existing receipts usable after rotation;
+        # never enumerate or modify another Windows user's profile.
+        from dataclasses import replace
+
+        for source, old_marker in markers:
+            if (
+                source == state_root / "setup_marker.json"
+                or old_marker is None
+                or old_marker.network is None
+                or old_marker.network.offline_user_sid != sid
+            ):
+                continue
+            with _secure_setup_directory_lease(source, profile_path) as peer_lease:
+                setup_command_timeout()
+                _validate_setup_directory_lease(peer_lease, recursive=True)
+                write_setup_marker(
+                    source,
+                    network=replace(old_marker.network, protected_password=protected),
+                    setup_state=old_marker.setup_state,
+                    setup_version=old_marker.setup_version,
+                )
+    _IDENTITY_READINESS_CACHE.clear()
+    return {"sid": sid, "username": username, "protectedPassword": protected}
 
 
 def _trusted_windows_powershell_path() -> str:
@@ -979,10 +1336,82 @@ def _trusted_windows_powershell_path() -> str:
     present on supported Windows hosts and owns the LocalAccounts module.
     """
 
-    system_root = os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT") or ""
-    if system_root and "\x00" not in system_root:
-        return str(Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
-    return r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    return str(
+        Path(_trusted_windows_system_directory()) / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    )
+
+
+def _trusted_windows_system_directory() -> str:
+    """Return the system directory from the OS, never from a user env var."""
+
+    # ``SystemRoot`` is inherited process state and can be spoofed by a
+    # medium-integrity caller.  Resolve the directory through Kernel32 so the
+    # cleanup command cannot be redirected to a user-controlled executable.
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            get_system_directory = kernel32.GetSystemDirectoryW
+            get_system_directory.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+            get_system_directory.restype = wintypes.UINT
+            capacity = 260
+            while True:
+                buffer = ctypes.create_unicode_buffer(capacity)
+                length = int(get_system_directory(buffer, capacity))
+                if length == 0:
+                    raise OSError(ctypes.get_last_error(), "GetSystemDirectoryW failed")
+                # On insufficient capacity Windows returns the required size.
+                if length < capacity:
+                    return buffer.value
+                capacity = length + 1
+        except Exception:
+            # The fixed default is preferable to trusting SystemRoot.  This
+            # path is only reached on malformed API stubs or a broken host.
+            pass
+    return r"C:\Windows\System32"
+
+
+def _trusted_windows_taskkill_path() -> str:
+    """Return the inbox taskkill executable without consulting PATH.
+
+    This is used only for timeout cleanup of the helper process tree.  Using
+    the System32 path prevents a writable PATH entry from supplying the
+    cleanup binary, while still allowing tests to substitute the path.
+    """
+
+    return str(Path(_trusted_windows_system_directory()) / "taskkill.exe")
+
+
+def _terminate_setup_helper_tree(pid: int) -> str:
+    """Best-effort bounded cleanup for an elevated helper and its descendants.
+
+    ``ShellExecuteExW`` gives us a handle to the elevated process, not a
+    process-group handle.  ``taskkill /T /F`` is the Windows primitive that
+    walks the currently visible descendant tree.  The caller still performs a
+    direct ``TerminateProcess`` on the original handle and waits for it; this
+    helper reports the tree attempt explicitly so a failed cleanup cannot be
+    mistaken for a clean timeout.
+    """
+
+    if pid <= 0:
+        return "invalid_pid"
+    try:
+        completed = subprocess.run(
+            [_trusted_windows_taskkill_path(), "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=SETUP_HELPER_CLEANUP_TIMEOUT_MS / 1000,
+        )
+    except subprocess.TimeoutExpired:
+        return "taskkill_timeout"
+    except OSError as exc:
+        return f"taskkill_error:{type(exc).__name__}"
+    if completed.returncode == 0:
+        return "taskkill_ok"
+    return f"taskkill_failed:{completed.returncode}"
 
 
 def lock_persistent_sandbox_dirs(
@@ -1039,7 +1468,13 @@ def lock_persistent_sandbox_dirs(
                 if command_index not in skip_revalidation_indices:
                     _validate_setup_directory_lease(active_lease, recursive=True)
                 command.append("/L")
-                completed = subprocess.run(command, capture_output=True, text=True, check=False)
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=setup_command_timeout(),
+                )
                 if completed.returncode != 0:
                     detail = completed.stderr.strip() or completed.stdout.strip()
                     raise OSError(detail or f"persistent_sandbox_acl_failed: {root}")
@@ -1052,6 +1487,7 @@ def _current_windows_user_sid() -> str:
         capture_output=True,
         text=True,
         check=False,
+        timeout=setup_command_timeout(),
     )
     if completed.returncode != 0:
         raise OSError("persistent_sandbox_user_sid_unavailable")
@@ -1077,6 +1513,7 @@ __all__ = [
     "SETUP_VERSION",
     "OFFLINE_USERNAME",
     "SETUP_HELPER_REPORT",
+    "SETUP_HELPER_WAIT_TIMEOUT_MS",
     "WindowsDefaultSetupMarker",
     "default_setup_marker_path",
     "ensure_offline_sandbox_user",

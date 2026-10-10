@@ -119,6 +119,47 @@ def test_notifier_falls_back_to_text_without_cards() -> None:
     assert "/approve" in message.content
 
 
+def test_resolution_cleanup_uses_async_sqlite_owner() -> None:
+    """A resolved channel approval drops its code without a detached DB race."""
+
+    async def _run() -> None:
+        loop = asyncio.get_running_loop()
+        scheduled: list = []
+        remove = register_approval_channel_notifier(
+            get_approval_queue(),
+            session_manager=_FakeSessionManager(),
+            channel_manager_ref=lambda: _FakeChannelManager(_FakeAdapter(False)),
+            schedule=lambda coro: scheduled.append(loop.create_task(coro)),
+        )
+        try:
+            approval_id = get_approval_queue().request(
+                namespace="exec",
+                params={
+                    "toolName": "exec_command",
+                    "command": "rm target.txt",
+                    "sessionKey": "agent:main:chat",
+                    "senderId": "owner-1",
+                },
+            )
+            await asyncio.gather(*scheduled)
+            scheduled.clear()
+            code = get_approval_queue().channel_code_for_approval(approval_id)
+            assert code
+
+            await get_approval_queue().resolve_async(approval_id, False)
+            for _ in range(5):
+                await asyncio.sleep(0)
+                if scheduled:
+                    break
+            assert scheduled
+            await asyncio.gather(*scheduled)
+            assert resolve_short_code(code) is None
+        finally:
+            remove()
+
+    asyncio.run(_run())
+
+
 def test_notifier_ignores_non_channel_requests() -> None:
     adapter = _FakeAdapter(interactive_cards=True)
 

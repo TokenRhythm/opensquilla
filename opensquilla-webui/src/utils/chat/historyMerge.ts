@@ -77,6 +77,19 @@ export function mergeLiveOnlyFields(
   options: LiveFieldMergeOptions = {},
 ): ChatMessage {
   const merged: ChatMessage = { ...server }
+  const previousContentRevision = prev.contentRevision ?? prev.contentRef?.revision
+  const serverContentRevision = server.contentRevision ?? server.contentRef?.revision
+  const contentRevisionChanged = Boolean(previousContentRevision && serverContentRevision
+    && previousContentRevision !== serverContentRevision)
+
+  // A bounded refresh may return only a preview of a body already loaded in
+  // full. Retain it only with positive proof of the same content revision;
+  // length alone cannot distinguish a preview from a legitimate shorter edit.
+  if (previousContentRevision && previousContentRevision === serverContentRevision
+    && prev.previewComplete === true && server.previewComplete === false) {
+    merged.text = prev.text
+    merged.previewComplete = true
+  }
 
   // Keep the optimistic row identity after the backend assigns a durable
   // message id. Per-turn render keys use it to avoid remounting live surfaces
@@ -94,13 +107,18 @@ export function mergeLiveOnlyFields(
   // reasoning: server wins if it measured seconds; else keep the live seconds.
   const serverSeconds = prev.role === 'assistant' ? server.reasoning?.seconds ?? 0 : 0
   if (serverSeconds <= 0 && (prev.reasoning?.seconds ?? 0) > 0) {
-    merged.reasoning = prev.reasoning
+    if (server.reasoning) {
+      merged.reasoning = { ...server.reasoning, seconds: prev.reasoning!.seconds }
+    } else if (!contentRevisionChanged) {
+      merged.reasoning = prev.reasoning
+    }
   }
   // History currently persists the canonical concatenated reasoning text but
   // not its physical-call boundaries. Preserve the just-finished structured
   // blocks after this function has already proved both rows are the same turn.
   if (
-    !server.activitySnapshot?.complete
+    !contentRevisionChanged
+    && !server.activitySnapshot?.complete
     && !server.reasoningBlocks?.length
     && prev.reasoningBlocks?.length
   ) {
@@ -176,7 +194,7 @@ export function mergeLiveOnlyFields(
     if (prev.turnId) merged.turnId = prev.turnId
   }
   if (!server.turnOutcome && prev.turnOutcome) merged.turnOutcome = prev.turnOutcome
-  if (!server.activitySnapshot && prev.activitySnapshot) {
+  if (!contentRevisionChanged && !server.activitySnapshot && prev.activitySnapshot) {
     merged.activitySnapshot = prev.activitySnapshot
     merged.activitySnapshotIncomplete = prev.activitySnapshotIncomplete
   }
@@ -202,7 +220,8 @@ export function mergeLiveOnlyFields(
   // their grouped call ids survive the immediate history replacement. A
   // non-empty server timeline remains authoritative.
   if (
-    !server.activitySnapshot?.complete
+    !contentRevisionChanged
+    && !server.activitySnapshot?.complete
     && (server.timeline?.length ?? 0) === 0
     && (prev.timeline?.length ?? 0) > 0
   ) {
@@ -215,7 +234,7 @@ export function mergeLiveOnlyFields(
   // Approval/clarify interrupts are live event metadata. Canonical transcript
   // rows currently persist the surrounding text/tools but not these decisions,
   // so carry the in-flow timeline snapshot across the immediate history sync.
-  if ((prev.interrupts?.length ?? 0) > 0 && (server.interrupts?.length ?? 0) === 0) {
+  if (!contentRevisionChanged && (prev.interrupts?.length ?? 0) > 0 && (server.interrupts?.length ?? 0) === 0) {
     merged.interrupts = prev.interrupts
     if (prev.timeline?.some(segment => segment.type === 'interrupt')) {
       merged.timeline = prev.timeline

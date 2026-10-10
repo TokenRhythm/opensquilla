@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, SessionNode, SessionStatus
-from opensquilla.session.storage import SessionStorage, StaleEpochError
+from opensquilla.session.storage import (
+    ActivationPermitConflictError,
+    SessionStorage,
+    StaleEpochError,
+)
 
 
 @pytest.mark.asyncio
@@ -48,6 +52,172 @@ async def test_agent_task_create_cas_rejects_replaced_session_owner(tmp_path) ->
             )
 
         assert await storage.get_agent_task(stale.task_id) is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_activation_permit_claim_is_same_db_owner_and_authority_cas(tmp_path) -> None:
+    storage = SessionStorage(str(tmp_path / "sessions.db"))
+    await storage.connect()
+    key = "agent:main:webchat:activation-permit"
+    node = SessionNode(session_key=key, session_id="owner-a", epoch=4)
+    task = AgentTaskRecord(
+        task_id="activation-task",
+        session_key=key,
+        source_kind="webui",
+        queue_mode="followup",
+        run_kind="web_turn",
+        status=AgentTaskStatus.QUEUED,
+        details={
+            "activation_authority": {
+                "session_id": node.session_id,
+                "session_epoch": node.epoch,
+                "authorization_revision": 7,
+                "permission_fingerprint": "operator.write:v1",
+            }
+        },
+    )
+    await storage.upsert_session(node)
+    await storage.create_agent_task(task)
+    try:
+        permit = await storage.claim_activation_permit(
+            task.task_id,
+            session_key=key,
+            session_id=node.session_id,
+            session_epoch=node.epoch,
+            authorization_revision=7,
+            permission_fingerprint="operator.write:v1",
+        )
+        assert permit.state == "active"
+        assert permit.authorization_revision == 7
+        assert permit.permission_fingerprint == "operator.write:v1"
+        retry = await storage.claim_activation_permit(
+            task.task_id,
+            session_key=key,
+            session_id=node.session_id,
+            session_epoch=node.epoch,
+            authorization_revision=7,
+            permission_fingerprint="operator.write:v1",
+        )
+        assert retry.permit_id == permit.permit_id
+
+        with pytest.raises(ActivationPermitConflictError, match="authority snapshot changed"):
+            await storage.claim_activation_permit(
+                task.task_id,
+                session_key=key,
+                session_id=node.session_id,
+                session_epoch=node.epoch,
+                authorization_revision=8,
+                permission_fingerprint="operator.write:v1",
+            )
+
+        replacement = node.model_copy(update={"session_id": "owner-b", "epoch": 5})
+        await storage.upsert_session(replacement)
+        other = AgentTaskRecord(
+            task_id="activation-stale-owner",
+            session_key=key,
+            source_kind="webui",
+            queue_mode="followup",
+            run_kind="web_turn",
+            status=AgentTaskStatus.QUEUED,
+            details={
+                "activation_authority": {
+                    "session_id": node.session_id,
+                    "session_epoch": node.epoch,
+                    "authorization_revision": 7,
+                    "permission_fingerprint": "operator.write:v1",
+                }
+            },
+        )
+        await storage.create_agent_task(other)
+        with pytest.raises(ActivationPermitConflictError, match="owner generation"):
+            await storage.claim_activation_permit(
+                other.task_id,
+                session_key=key,
+                session_id=node.session_id,
+                session_epoch=node.epoch,
+                authorization_revision=7,
+                permission_fingerprint="operator.write:v1",
+            )
+        released = await storage.release_activation_permit(task.task_id, session_key=key)
+        assert released is not None and released.state == "released"
+        assert await storage.release_activation_permit(task.task_id, session_key=key) is not None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_activation_permit_requires_queued_task_and_exact_owner(tmp_path) -> None:
+    storage = SessionStorage(str(tmp_path / "sessions.db"))
+    await storage.connect()
+    key = "agent:main:webchat:activation-state"
+    node = SessionNode(session_key=key, session_id="owner", epoch=0)
+    await storage.upsert_session(node)
+    try:
+        done = AgentTaskRecord(
+            task_id="activation-done",
+            session_key=key,
+            source_kind="webui",
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+        await storage.create_agent_task(done)
+        with pytest.raises(ActivationPermitConflictError, match="queued task"):
+            await storage.claim_activation_permit(
+                done.task_id,
+                session_key=key,
+                session_id=node.session_id,
+                session_epoch=node.epoch,
+                authorization_revision=1,
+                permission_fingerprint="p",
+            )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_activation_permit_expiry_is_not_idempotent(tmp_path) -> None:
+    storage = SessionStorage(str(tmp_path / "sessions.db"))
+    await storage.connect()
+    key = "agent:main:webchat:activation-expiry"
+    node = SessionNode(session_key=key, session_id="owner", epoch=0)
+    await storage.upsert_session(node)
+    task = AgentTaskRecord(
+        task_id="activation-expired",
+        session_key=key,
+        source_kind="webui",
+        status=AgentTaskStatus.QUEUED,
+        details={
+            "activation_authority": {
+                "session_id": node.session_id,
+                "session_epoch": node.epoch,
+                "authorization_revision": 1,
+                "permission_fingerprint": "p",
+            }
+        },
+    )
+    await storage.create_agent_task(task)
+    try:
+        await storage.claim_activation_permit(
+            task.task_id,
+            session_key=key,
+            session_id=node.session_id,
+            session_epoch=node.epoch,
+            authorization_revision=1,
+            permission_fingerprint="p",
+            expires_at=1,
+        )
+        with pytest.raises(ActivationPermitConflictError, match="expired"):
+            await storage.claim_activation_permit(
+                task.task_id,
+                session_key=key,
+                session_id=node.session_id,
+                session_epoch=node.epoch,
+                authorization_revision=1,
+                permission_fingerprint="p",
+            )
+        permit = await storage.get_activation_permit(task.task_id)
+        assert permit is not None and permit.state == "expired"
     finally:
         await storage.close()
 

@@ -21,7 +21,9 @@ from __future__ import annotations
 import asyncio
 import builtins
 import contextlib
+import hashlib
 import inspect
+import json
 import time
 import uuid
 from collections import deque
@@ -44,10 +46,12 @@ from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
 from opensquilla.engine.agent_injection import PendingInputClaim, PendingInputProvider
 from opensquilla.engine.outcome import completed_outcome, outcome_from_error
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
+from opensquilla.gateway.session_events import build_sessions_changed_payload
 from opensquilla.gateway.session_lifecycle import (
     SessionTaskSnapshot,
     TaskLifecycleEvent,
     TaskLifecycleListener,
+    task_session_is_current,
 )
 from opensquilla.gateway.terminal_activity import (
     is_usage_accounting_barrier,
@@ -85,7 +89,73 @@ _TERMINAL_DETAIL_KEYS = frozenset({
     "terminal_assistant_message_content", "terminal_assistant_message_id",
     "usage_call_index", "no_prior_provider_dispatch", "replay_safe", "retry_after_ms",
     "subagent_group_outcome", "runtime_partial_failure_disclosure_required",
+    "admission_owner",
 })
+
+
+def _internal_activation_authority(envelope: RouteEnvelope) -> dict[str, Any] | None:
+    """Build the authority snapshot for non-UI producers at the runtime edge.
+
+    Web/CLI ingress receives an authority snapshot from the authenticated
+    ``GatewayAdmissionRuntime``.  Cron, channel and subagent producers enter
+    through their own adapters, so they do not pass through that RPC port.  A
+    task must still cross the same resident -> compute -> terminal boundary;
+    otherwise one producer can bypass the activation permit fence simply by
+    using a different adapter.
+
+    This is intentionally a local-runtime authority, not a token grant.  It
+    contains no secret or client supplied value and is only emitted when the
+    route has an exact session owner.  Named-token routes retain the stronger
+    TokenStore revision/fingerprint check supplied by RPC admission.
+    """
+
+    if envelope.source_kind not in {
+        SourceKind.CHANNEL,
+        SourceKind.CRON,
+        SourceKind.SUBAGENT,
+        SourceKind.SYSTEM,
+    }:
+        return None
+    session_id = envelope.session_id
+    session_epoch = envelope.session_epoch
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or isinstance(session_epoch, bool)
+        or not isinstance(session_epoch, int)
+        or session_epoch < 0
+    ):
+        # Owner-less legacy/system routes remain on the compatibility path.
+        # They cannot safely claim a durable permit because there is no
+        # session incarnation to bind it to.
+        return None
+    identity = {
+        "source_kind": envelope.source_kind.value,
+        "source_name": envelope.source_name,
+        "session_key": envelope.session_key,
+        "session_id": session_id,
+        "session_epoch": session_epoch,
+        "channel_id": envelope.channel_id,
+        "run_id": envelope.metadata.get("run_id"),
+        "parent_task_id": envelope.metadata.get("parent_task_id"),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "session_id": session_id,
+        "session_epoch": session_epoch,
+        "authorization_revision": 1,
+        "permission_fingerprint": f"internal:{fingerprint}",
+        "authority_kind": "internal_runtime",
+        "token_public_id": None,
+    }
 
 # ---------------------------------------------------------------------------
 # Core metrics — names are LOCKED. Do not rename without updating
@@ -1307,6 +1377,42 @@ class TaskRuntimeShuttingDownError(RuntimeError):
         self.session_key = session_key
 
 
+class TaskDependencyError(RuntimeError):
+    """A trusted producer dependency is not ready for runtime admission.
+
+    This is raised before a reservation is created, so callers can return a
+    retryable ``DEPENDENCY_STARTING``/``DEPENDENCY_UNAVAILABLE`` result
+    without leaving a queued task, transcript receipt, or provider dispatch.
+    """
+
+    def __init__(
+        self,
+        *,
+        session_key: str,
+        kind: str,
+        services: Sequence[str],
+    ) -> None:
+        self.session_key = session_key
+        self.kind = kind
+        self.services = tuple(services)
+        self.retryable = True
+        super().__init__(
+            f"required service dependency is {kind.lower()}: "
+            f"{', '.join(self.services)}"
+        )
+
+
+class TaskResidentBusyError(RuntimeError):
+    """Raised before durable admission when the process resident cap is full."""
+
+    def __init__(self, *, session_key: str, max_resident: int) -> None:
+        super().__init__(
+            f"task runtime resident capacity is full for session '{session_key}'"
+        )
+        self.session_key = session_key
+        self.max_resident = max_resident
+
+
 class _CollectIdentityRebindError(RuntimeError):
     """Legacy collect could not durably bind its prompt to the queued turn."""
 
@@ -1339,6 +1445,15 @@ def _clean_cancel_detail(value: str | None, default: str) -> str:
     return (safe.strip("_") or default)[:80]
 
 
+@dataclass
+class _TerminalRetry:
+    update: dict[str, Any]
+    session_key: str
+    session_id: str | None
+    session_epoch: int | None
+    persisted: bool = False
+
+
 class TaskRuntime:
     """Serialize same-session turns while allowing cross-session concurrency.
 
@@ -1359,6 +1474,52 @@ class TaskRuntime:
         """Return whether ``enqueue`` implements the exact queue-mode value."""
         return mode in cls.supported_queue_modes
 
+    def _ensure_required_services(self, envelope: RouteEnvelope) -> None:
+        """Fence trusted producer work before creating a runtime reservation."""
+
+        required = tuple(
+            dict.fromkeys(
+                name.strip().lower()
+                for name in (getattr(envelope, "required_services", ()) or ())
+                if isinstance(name, str) and name.strip()
+            )
+        )
+        if not required:
+            return
+        snapshot_fn = self._service_snapshot
+        snapshot = snapshot_fn() if callable(snapshot_fn) else None
+        if not isinstance(snapshot, Mapping):
+            raise TaskDependencyError(
+                session_key=envelope.session_key,
+                kind="DEPENDENCY_UNAVAILABLE",
+                services=required,
+            )
+        waiting: list[str] = []
+        unavailable: list[str] = []
+        for name in required:
+            descriptor = snapshot.get(name)
+            status = (
+                str(descriptor.get("status") or "").strip().lower()
+                if isinstance(descriptor, Mapping)
+                else ""
+            )
+            if status in {"starting", "stopping"}:
+                waiting.append(name)
+            elif status != "ready":
+                unavailable.append(name)
+        if waiting:
+            raise TaskDependencyError(
+                session_key=envelope.session_key,
+                kind="DEPENDENCY_STARTING",
+                services=waiting,
+            )
+        if unavailable:
+            raise TaskDependencyError(
+                session_key=envelope.session_key,
+                kind="DEPENDENCY_UNAVAILABLE",
+                services=unavailable,
+            )
+
     def __init__(
         self,
         *,
@@ -1369,6 +1530,7 @@ class TaskRuntime:
         lifecycle_listener: TaskLifecycleListener | None = None,
         max_concurrency: int = 8,
         max_pending_per_session: int | None = 64,
+        max_resident_tasks: int | None = 256,
         subagent_reserved_slots: int = 0,
         turn_hard_deadline_s: float | None = None,
         running_heartbeat_interval_s: float | None = 30.0,
@@ -1379,11 +1541,15 @@ class TaskRuntime:
         ),
         activation_listener: TaskActivationListener | None = None,
         idle_listener: RuntimeIdleListener | None = None,
+        service_snapshot: Callable[[], Mapping[str, Mapping[str, Any]]] | None = None,
+        activation_authority_validator: Callable[[Any, Mapping[str, Any]], Any] | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be >= 1")
         if max_pending_per_session is not None and max_pending_per_session < 1:
             raise ValueError("max_pending_per_session must be >= 1")
+        if max_resident_tasks is not None and max_resident_tasks < 1:
+            raise ValueError("max_resident_tasks must be >= 1")
         if subagent_reserved_slots < 0:
             raise ValueError("subagent_reserved_slots must be >= 0")
         if turn_hard_deadline_s is not None and turn_hard_deadline_s <= 0:
@@ -1413,6 +1579,8 @@ class TaskRuntime:
         self._terminal_listener = terminal_listener
         self._lifecycle_listener = lifecycle_listener
         self._max_pending_per_session = max_pending_per_session
+        self._max_resident_tasks = max_resident_tasks
+        self._resident_count = 0
         self._max_concurrency = max_concurrency
         self._subagent_reserved_slots = subagent_reserved_slots
         self._turn_hard_deadline_s = turn_hard_deadline_s
@@ -1422,6 +1590,17 @@ class TaskRuntime:
         self._pending_overflow_policy = pending_overflow_policy
         self._activation_listener = activation_listener
         self._idle_listener = idle_listener
+        # Some producer-owned admissions (currently Goal continuations) use a
+        # local lease whose authority source is outside sessions.db.  The
+        # validator runs at the final resident -> compute boundary, after the
+        # durable task row exists but immediately before RUNNING/provider
+        # dispatch.  It is deliberately optional so embedded legacy runtimes
+        # retain their compatibility path.
+        self._activation_authority_validator = activation_authority_validator
+        # Boot supplies a live view owned by ServiceContainer. Standalone and
+        # embedded runtimes may omit it; routes with no required services keep
+        # the historical zero-cost path.
+        self._service_snapshot = service_snapshot
         self._goal_service: Any | None = None
         from opensquilla.gateway.user_input_broker import StructuredUserInputBroker
 
@@ -1443,8 +1622,21 @@ class TaskRuntime:
         self._driver_state_changed = asyncio.Event()
         self._closing = False
         self._shutdown_task: asyncio.Task[TaskRuntimeShutdownResult] | None = None
+        # Restart recovery may meet optional services before they become ready,
+        # or resident capacity occupied by another recovered task. One owner
+        # retries those durable inputs on state changes, never on a busy timer.
+        self._steer_recovery_lock = asyncio.Lock()
+        self._steer_recovery_changed = asyncio.Event()
+        self._steer_recovery_task: asyncio.Task[None] | None = None
+        self._steer_recovery_generation = 0
         self._terminal_fallback_records: dict[str, AgentTaskRecord] = {}
-        self._terminal_pending_updates: dict[str, dict[str, Any]] = {}
+        self._terminal_pending_updates: dict[str, _TerminalRetry] = {}
+        # A terminal task whose first durable settlement failed remains a
+        # resident until the bounded retry either commits or retires it.  The
+        # runtime task is removed from ``_tasks`` before that retry finishes,
+        # so keep an explicit hold instead of releasing the admission slot at
+        # the in-memory pop boundary.
+        self._terminal_resident_holds: set[str] = set()
         self._terminal_retry_task: asyncio.Task[None] | None = None
         self._recent_terminal_records: deque[AgentTaskRecord] = deque(maxlen=128)
         self._pending_by_session: dict[str, list[_RuntimeTask]] = {}
@@ -1536,6 +1728,7 @@ class TaskRuntime:
             session_key=canonicalize_session_key(envelope.session_key),
         )
         _validate_route_session_owner(envelope)
+        self._ensure_required_services(envelope)
         queue_mode = mode or QueueMode.FOLLOWUP.value
         if not self.supports_queue_mode(queue_mode):
             valid = ", ".join(sorted(self.supported_queue_modes))
@@ -1755,7 +1948,13 @@ class TaskRuntime:
                 )
                 if busy:
                     return False
+                if (
+                    self._max_resident_tasks is not None
+                    and self._resident_count >= self._max_resident_tasks
+                ):
+                    return False
                 self._auxiliary_tasks_by_session[key] = current
+                self._resident_count += 1
                 self._signal_driver_state_changed()
 
         execution_lock = self._session_execution_locks.setdefault(key, asyncio.Lock())
@@ -1776,6 +1975,7 @@ class TaskRuntime:
             async with self._state_lock:
                 if self._auxiliary_tasks_by_session.get(key) is current:
                     self._auxiliary_tasks_by_session.pop(key, None)
+                    self._resident_count = max(0, self._resident_count - 1)
                     self._signal_driver_state_changed()
 
     @contextlib.asynccontextmanager
@@ -1928,6 +2128,13 @@ class TaskRuntime:
         changed = self._driver_state_changed
         self._driver_state_changed = asyncio.Event()
         changed.set()
+        if not self._closing and (
+            self._steer_recovery_task is None
+            or asyncio.current_task() is not self._steer_recovery_task
+        ):
+            # The retry's own reserve/abort is not new capacity. External
+            # changes during that pass must still wake the next pass.
+            self._steer_recovery_changed.set()
 
     async def _cancel_and_drain_session_drivers(
         self,
@@ -2178,6 +2385,7 @@ class TaskRuntime:
             session_key=canonicalize_session_key(envelope.session_key),
         )
         _validate_route_session_owner(envelope)
+        self._ensure_required_services(envelope)
         queue_mode = mode or "followup"
         normalized_message_ids = _ordered_message_ids(
             persisted_user_message_id,
@@ -2222,6 +2430,9 @@ class TaskRuntime:
                 "persisted_user_message_ids": normalized_message_ids,
                 "message_count": message_count,
                 "fresh_user_session": fresh_user_session,
+                "required_services": list(
+                    getattr(envelope, "required_services", ()) or ()
+                ),
             },
         )
         record.details = {
@@ -2232,6 +2443,19 @@ class TaskRuntime:
                 user_message_id=persisted_user_message_id,
             ),
         }
+        # ``activation_authority`` is stamped by the server-side admission
+        # primitive after authentication.  Internal producers (cron/channel/
+        # subagent/system) do not traverse the RPC admission port, therefore
+        # the runtime owns their local authority snapshot and deliberately
+        # ignores any client supplied value.  Web/CLI continue to accept only
+        # the mapping already stamped by their authenticated admission port.
+        internal_authority = _internal_activation_authority(envelope)
+        if internal_authority is not None:
+            record.details["activation_authority"] = internal_authority
+        else:
+            activation_authority = envelope.metadata.get("activation_authority")
+            if isinstance(activation_authority, Mapping):
+                record.details["activation_authority"] = dict(activation_authority)
         accepted_run_mode_payload = _accepted_run_mode_payload(
             accepted_run_mode_override,
         )
@@ -2333,11 +2557,32 @@ class TaskRuntime:
             runtime_task=runtime_task,
             update_envelope_cache=update_envelope_cache,
         )
+        # Persist the ownership contract alongside the task row.  The
+        # reservation is the resident lease; compute capacity is acquired only
+        # at RUNNING and terminal settlement remains the final release fence.
+        # Keeping this explicit makes adapter parity auditable and gives
+        # recovery/diagnostics a stable owner kind without exposing live locks.
+        record.details["admission_owner"] = {
+            "schema_version": 1,
+            "owner": "task_runtime",
+            "reservation_id": reservation.reservation_id,
+            "resident_lease": "held",
+            "compute_lease": "deferred",
+            "settlement": "required",
+        }
 
         async with self._state_lock:
             if self._closing and not _allow_during_shutdown:
                 raise TaskRuntimeShuttingDownError(
                     session_key=envelope.session_key,
+                )
+            if (
+                self._max_resident_tasks is not None
+                and self._resident_count >= self._max_resident_tasks
+            ):
+                raise TaskResidentBusyError(
+                    session_key=envelope.session_key,
+                    max_resident=self._max_resident_tasks,
                 )
             if (
                 not bypass_pending_limit
@@ -2377,6 +2622,7 @@ class TaskRuntime:
             self._reservations_by_session.setdefault(envelope.session_key, []).append(
                 reservation
             )
+            self._resident_count += 1
             self._signal_driver_state_changed()
         try:
             runtime_task.envelope = _materialize_guest_task_envelope(
@@ -2408,6 +2654,7 @@ class TaskRuntime:
                     reservation.overflow_victim.task_id
                 )
             reservation.aborted = True
+            self._resident_count = max(0, self._resident_count - 1)
             self._signal_driver_state_changed()
         _cleanup_guest_profile(reservation.runtime_task)
 
@@ -2740,6 +2987,12 @@ class TaskRuntime:
 
             runtime_task = reservation.runtime_task
             persisted_details = reservation.task_record.details
+            # Durable acceptance may add server-owned authority coordinates
+            # after ``reserve`` created the compatibility snapshot.  Refresh
+            # that snapshot before the driver can reach _mark_running; the
+            # activation permit must inspect the committed record, never an
+            # earlier in-memory copy.
+            runtime_task.record_snapshot = reservation.task_record.model_copy(deep=True)
             if isinstance(persisted_details, dict):
                 persisted_metadata = persisted_details.get("metadata")
                 if isinstance(persisted_metadata, dict):
@@ -3763,6 +4016,10 @@ class TaskRuntime:
             shutdown_task = self._shutdown_task
             if shutdown_task is None:
                 self._closing = True
+                self._steer_recovery_generation += 1
+                recovery_task = self._steer_recovery_task
+                if recovery_task is not None:
+                    recovery_task.cancel()
                 shutdown_task = asyncio.create_task(
                     self._shutdown_impl(
                         cancel=cancel,
@@ -3927,6 +4184,8 @@ class TaskRuntime:
                 }
                 if self._terminal_retry_task is not None and not self._terminal_retry_task.done():
                     auxiliaries.add(self._terminal_retry_task)
+                if self._steer_recovery_task is not None and not self._steer_recovery_task.done():
+                    auxiliaries.add(self._steer_recovery_task)
             if not drivers and reservations == 0 and not auxiliaries:
                 return True
 
@@ -3962,6 +4221,8 @@ class TaskRuntime:
             auxiliaries = len(self._auxiliary_tasks_by_session)
             if self._terminal_pending_updates:
                 auxiliaries += 1
+            if self._steer_recovery_task is not None and not self._steer_recovery_task.done():
+                auxiliaries += 1
         return drivers, reservations, auxiliaries
 
     async def _shutdown_result(
@@ -3974,10 +4235,11 @@ class TaskRuntime:
         if retry_task is not None and not retry_task.done():
             retry_task.cancel()
             await asyncio.gather(retry_task, return_exceptions=True)
-        if self._terminal_pending_updates:
+        unpersisted = sum(not retry.persisted for retry in self._terminal_pending_updates.values())
+        if unpersisted:
             log.warning(
                 "task_runtime.terminal_persistence_unresolved_at_shutdown",
-                task_count=len(self._terminal_pending_updates),
+                task_count=unpersisted,
             )
         return TaskRuntimeShutdownResult(
             clean=drivers == 0 and reservations == 0 and auxiliaries == 0,
@@ -4328,6 +4590,32 @@ class TaskRuntime:
                     collected_semantic_message = f"{first_semantic}\n\n{next_semantic}"
                 else:
                     collected_semantic_message = None
+                # A collect merges two independently admitted inputs.  Keep
+                # the dependency fence as the union of both envelopes so a
+                # later browser-use (or other delayed producer) cannot be
+                # hidden behind an already queued task that had no optional
+                # service requirement.  The caller has already checked the
+                # incoming envelope in ``enqueue``; the candidate was checked
+                # when it was reserved.
+                collected_required_services = tuple(
+                    dict.fromkeys(
+                        name.strip().lower()
+                        for source in (
+                            getattr(collected_owner_envelope, "required_services", ())
+                            or (),
+                            getattr(envelope, "required_services", ()) or (),
+                        )
+                        for name in source
+                        if isinstance(name, str) and name.strip()
+                    )
+                )
+                if collected_required_services != tuple(
+                    getattr(collected_owner_envelope, "required_services", ()) or ()
+                ):
+                    collected_owner_envelope = replace(
+                        collected_owner_envelope,
+                        required_services=collected_required_services,
+                    )
                 collected_message_ids = _ordered_message_ids(
                     candidate.persisted_user_message_id,
                     (
@@ -4378,6 +4666,8 @@ class TaskRuntime:
                     "fresh_user_session": candidate.fresh_user_session,
                     **_task_session_owner_payload(collected_owner_envelope),
                 }
+                if collected_required_services:
+                    details["required_services"] = list(collected_required_services)
                 handle = TaskHandle(
                     task_id=candidate.task_id,
                     session_key=envelope.session_key,
@@ -5297,6 +5587,11 @@ class TaskRuntime:
             input_provenance=input_provenance,
             metadata=metadata,
             session_epoch=owner[1],
+            required_services=tuple(
+                value.strip().lower()
+                for value in (details.get("required_services") or ())
+                if isinstance(value, str) and value.strip()
+            ),
         )
 
     async def _recovery_entries_for_task(
@@ -5336,6 +5631,8 @@ class TaskRuntime:
         ):
             return
         for task in await list_tasks():
+            if self._closing:
+                return
             entries = await self._recovery_entries_for_task(task)
             envelope = self._restart_recovery_envelope(task, entries)
             texts = [
@@ -5352,25 +5649,33 @@ class TaskRuntime:
             reservation: TaskReservation | None = None
             try:
                 async with self.collect_admission(envelope.session_key):
+                    # Existing in-memory ownership remains authoritative when
+                    # a later pass inspects a durable recovery candidate.
+                    if task.task_id in self._tasks:
+                        continue
                     if not await self._recovered_route_owner_is_current(envelope):
                         result["rejected"] += len(entries)
                         continue
-                    reservation = await self.reserve(
-                        envelope,
-                        "\n\n".join(texts),
-                        mode="followup",
-                        run_kind=task.run_kind,
-                        no_memory_capture=bool(
-                            details.get("no_memory_capture", False)
-                        ),
-                        semantic_message="\n\n".join(texts),
-                        persisted_user_message_id=message_ids[0],
-                        persisted_user_message_ids=message_ids,
-                        message_count=len(message_ids),
-                        fresh_user_session=False,
-                        task_id=task.task_id,
-                        update_envelope_cache=False,
-                    )
+                    try:
+                        reservation = await self.reserve(
+                            envelope,
+                            "\n\n".join(texts),
+                            mode="followup",
+                            run_kind=task.run_kind,
+                            no_memory_capture=bool(
+                                details.get("no_memory_capture", False)
+                            ),
+                            semantic_message="\n\n".join(texts),
+                            persisted_user_message_id=message_ids[0],
+                            persisted_user_message_ids=message_ids,
+                            message_count=len(message_ids),
+                            fresh_user_session=False,
+                            task_id=task.task_id,
+                            update_envelope_cache=False,
+                        )
+                    except (TaskDependencyError, TaskResidentBusyError) as exc:
+                        self._defer_steer_recovery(result, task.task_id, len(entries), exc)
+                        continue
                     await self._restore_durable_accepted_model_routing(
                         reservation,
                         task,
@@ -5380,6 +5685,12 @@ class TaskRuntime:
                         await self.abort_reservation(reservation)
                         continue
                     handle = await self.activate(reservation)
+            except TaskRuntimeShuttingDownError:
+                if reservation is not None and not reservation.activated:
+                    await self.abort_reservation(reservation)
+                if self._closing:
+                    return
+                raise
             except TaskQueueFullError:
                 result["rejected"] += len(entries)
                 continue
@@ -5391,6 +5702,65 @@ class TaskRuntime:
             result["task_ids"].append(handle.task_id)
 
     async def recover_stranded_steers(self) -> dict[str, Any]:
+        """Recover accepted inputs, retaining transiently blocked work for retry."""
+
+        async with self._steer_recovery_lock:
+            # Changes during the pass remain dirty, including a capacity
+            # release before the first deferred worker has been created.
+            self._steer_recovery_changed.clear()
+            result = await self._recover_stranded_steers_once()
+            if result["deferred"] and not self._closing:
+                task = self._steer_recovery_task
+                if task is None or task.done():
+                    self._steer_recovery_task = asyncio.create_task(
+                        self._retry_stranded_steers(self._steer_recovery_generation),
+                        name="gateway-steer-restart-recovery",
+                    )
+            return result
+
+    def notify_recovery_dependencies_changed(self) -> None:
+        """Wake existing restart work after an optional-service state change."""
+
+        if not self._closing:
+            self._steer_recovery_changed.set()
+
+    @staticmethod
+    def _defer_steer_recovery(
+        result: dict[str, Any], task_id: str, count: int,
+        error: TaskDependencyError | TaskResidentBusyError,
+    ) -> None:
+        result["deferred"] += count
+        log.info(
+            "task_runtime.steer_restart_recovery_deferred",
+            task_id=task_id,
+            reason=(error.kind if isinstance(error, TaskDependencyError) else "RESOURCE_BUSY"),
+            services=(error.services if isinstance(error, TaskDependencyError) else ()),
+        )
+
+    async def _retry_stranded_steers(self, generation: int) -> None:
+        owner = asyncio.current_task()
+        try:
+            while not self._closing and generation == self._steer_recovery_generation:
+                await self._steer_recovery_changed.wait()
+                self._steer_recovery_changed.clear()
+                if self._closing or generation != self._steer_recovery_generation:
+                    return
+                try:
+                    result = await self.recover_stranded_steers()
+                except Exception:
+                    # Retain the durable input and retry on the next real state
+                    # change. The owner's own reserve/abort signals are filtered
+                    # so a persistent error cannot spin the recovery task.
+                    log.exception("task_runtime.steer_restart_recovery_retry_failed")
+                    continue
+                if not result["deferred"]:
+                    return
+        finally:
+            if self._steer_recovery_task is owner:
+                self._steer_recovery_task = None
+            self._signal_driver_state_changed()
+
+    async def _recover_stranded_steers_once(self) -> dict[str, Any]:
         """Recover every durable ``steering`` input left by process death.
 
         Promotion ownership moves in the same transaction that creates the new
@@ -5405,8 +5775,11 @@ class TaskRuntime:
             "cancelled": 0,
             "rejected": 0,
             "resumed": 0,
+            "deferred": 0,
             "task_ids": [],
         }
+        if self._closing:
+            return result
         await self._resume_never_started_steer_recovery_tasks(result)
         list_inputs = getattr(self._storage, "list_stranded_steer_inputs", None)
         close_inputs = getattr(self._storage, "close_stranded_steer_inputs", None)
@@ -5423,6 +5796,8 @@ class TaskRuntime:
             grouped.setdefault(item.target_task.task_id, []).append(item)
 
         for target_task_id, items in grouped.items():
+            if self._closing:
+                return result
             items.sort(
                 key=lambda item: (
                     (
@@ -5531,6 +5906,13 @@ class TaskRuntime:
                         fresh_user_session=False,
                         update_envelope_cache=False,
                     )
+                except (TaskDependencyError, TaskResidentBusyError) as exc:
+                    self._defer_steer_recovery(result, target_task_id, len(entries), exc)
+                    continue
+                except TaskRuntimeShuttingDownError:
+                    if self._closing:
+                        return result
+                    raise
                 except TaskQueueFullError:
                     changed = await close_inputs(
                         target_task_id=target_task_id,
@@ -6273,21 +6655,33 @@ class TaskRuntime:
     async def _mark_running_claimed(self, task: _RuntimeTask) -> bool:
         await self._freeze_collaboration_context(task)
         await self._prepare_goal_context_for_activation(task)
+        await self._claim_activation_permit(task)
+        release_before_running = False
         async with self._state_lock:
             if (
                 task.terminal_closing
                 or task.status in TERMINAL_STATUSES
                 or task.cancel_requested
             ):
-                return False
-            task.status = AgentTaskStatus.RUNNING
-            self._remove_pending(task)
-            self._running_by_session[task.envelope.session_key] = task
+                release_before_running = True
+            else:
+                task.status = AgentTaskStatus.RUNNING
+                self._remove_pending(task)
+                self._running_by_session[task.envelope.session_key] = task
+        if release_before_running:
+            await self._release_activation_permit(task)
+            return False
         started_at = _epoch_time_ms()
         await self._storage.update_agent_task(
             task.task_id,
             status=AgentTaskStatus.RUNNING,
             started_at=started_at,
+        )
+        await self._persist_admission_owner_state(
+            task,
+            resident_lease="held",
+            compute_lease="held",
+            settlement="required",
         )
         if task.record_snapshot is not None:
             task.record_snapshot.started_at = started_at
@@ -6317,6 +6711,117 @@ class TaskRuntime:
             )
         )
         return True
+
+    async def _persist_admission_owner_state(
+        self,
+        task: _RuntimeTask,
+        *,
+        resident_lease: str,
+        compute_lease: str,
+        settlement: str,
+    ) -> None:
+        """Publish the resident/compute/settlement lifecycle atomically.
+
+        The in-memory reservation is authoritative for scheduling, while the
+        task row is the recovery/diagnostics projection.  Merge only the
+        admission-owner object so concurrent input, goal, or stream details
+        survive this lifecycle update.
+        """
+
+        record = task.record_snapshot
+        if record is None:
+            return
+        current = dict(record.details or {})
+        owner = dict(current.get("admission_owner") or {})
+        if not owner:
+            owner = {
+                "schema_version": 1,
+                "owner": "task_runtime",
+                "reservation_id": None,
+            }
+        owner.update(
+            {
+                "resident_lease": resident_lease,
+                "compute_lease": compute_lease,
+                "settlement": settlement,
+            }
+        )
+        current["admission_owner"] = owner
+        record.details = current
+        patch = getattr(self._storage, "patch_agent_task_details", None)
+        if callable(patch):
+            updated = patch(
+                task.task_id,
+                details_patch={"admission_owner": owner},
+            )
+            if inspect.isawaitable(updated):
+                updated = await updated
+            if isinstance(updated, AgentTaskRecord):
+                task.record_snapshot = updated
+
+    async def _claim_activation_permit(self, task: _RuntimeTask) -> None:
+        """Fence provider dispatch with a durable authority snapshot.
+
+        Only tasks carrying a server-produced ``activation_authority`` detail
+        opt into this stricter boundary.  Legacy embedders and old task rows
+        remain compatible until their ingress path can provide the snapshot;
+        they do not receive a fabricated authorization revision.  Once opted
+        in, absence of any required coordinate or storage capability is a
+        hard failure before the handler/provider is entered.
+        """
+        record = task.record_snapshot
+        details = record.details if record is not None else None
+        if not isinstance(details, dict):
+            return
+        snapshot = details.get("activation_authority")
+        if snapshot is None:
+            return
+        if not isinstance(snapshot, Mapping):
+            raise RuntimeError("invalid activation authority snapshot")
+        session_id = getattr(task.envelope, "session_id", None)
+        session_epoch = getattr(task.envelope, "session_epoch", None)
+        revision = snapshot.get("authorization_revision")
+        fingerprint = snapshot.get("permission_fingerprint")
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or isinstance(session_epoch, bool)
+            or not isinstance(session_epoch, int)
+            or session_epoch < 0
+            or isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 0
+            or not isinstance(fingerprint, str)
+            or not fingerprint
+        ):
+            raise RuntimeError("incomplete activation authority snapshot")
+        # Goal-owned leases are process-local and therefore cannot be
+        # revalidated by SessionStorage's named-token reader.  Give the owner
+        # one last async check at the exact provider fence.  This closes the
+        # acceptance -> RUNNING window where a token/connection could be
+        # revoked after durable acceptance but before provider dispatch.
+        authority_kind = str(snapshot.get("authority_kind") or "")
+        validator = self._activation_authority_validator
+        if authority_kind == "goal_lease" and callable(validator):
+            result = validator(task, snapshot)
+            if inspect.isawaitable(result):
+                result = await result
+            if result is not True:
+                raise RuntimeError("Goal activation authority is no longer current")
+        claim = getattr(self._storage, "claim_activation_permit", None)
+        if not callable(claim):
+            raise RuntimeError("activation permit storage is unavailable")
+        result = claim(
+            task.task_id,
+            session_key=task.envelope.session_key,
+            session_id=session_id,
+            session_epoch=session_epoch,
+            authorization_revision=revision,
+            permission_fingerprint=fingerprint,
+            expires_at=snapshot.get("expires_at"),
+        )
+        if inspect.isawaitable(result):
+            await result
 
     async def _prepare_goal_context_for_activation(self, task: _RuntimeTask) -> None:
         """Resolve a queued user's Goal candidate before the provider starts.
@@ -6472,6 +6977,27 @@ class TaskRuntime:
             error_class=settled_error_class,
             error_message=settled_error_message,
         )
+        await self._release_activation_permit(task)
+
+    async def _release_activation_permit(self, task: _RuntimeTask) -> None:
+        """Release a claimed permit on cancellation or terminal settlement."""
+        release = getattr(self._storage, "release_activation_permit", None)
+        if not callable(release):
+            return
+        try:
+            result = release(
+                task.task_id,
+                session_key=task.envelope.session_key,
+            )
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # noqa: BLE001 - terminal settlement is authoritative.
+            log.warning(
+                "task_runtime.activation_permit_release_failed",
+                task_id=task.task_id,
+                session_key=task.envelope.session_key,
+                exc_info=True,
+            )
 
     async def _mark_terminal_claimed(
         self,
@@ -6528,9 +7054,31 @@ class TaskRuntime:
             try:
                 from opensquilla.application.approval_queue import get_approval_queue
 
-                get_approval_queue().expire_pending_for_session(
-                    task.envelope.session_key,
+                approval_queue = get_approval_queue()
+                # The production queue exposes the async worker boundary, but
+                # older embedders and test doubles may only implement the
+                # synchronous method.  Treat a non-awaitable compatibility
+                # result as the legacy API instead of turning cleanup into a
+                # swallowed TypeError and leaving an orphaned approval open.
+                expire_async = getattr(
+                    approval_queue, "expire_pending_for_session_async", None,
                 )
+                if callable(expire_async):
+                    result = expire_async(task.envelope.session_key)
+                    if inspect.isawaitable(result):
+                        await result
+                    else:
+                        expire_sync = getattr(
+                            approval_queue, "expire_pending_for_session", None,
+                        )
+                        if callable(expire_sync):
+                            expire_sync(task.envelope.session_key)
+                else:
+                    expire_sync = getattr(
+                        approval_queue, "expire_pending_for_session", None,
+                    )
+                    if callable(expire_sync):
+                        expire_sync(task.envelope.session_key)
             except Exception as exc:  # noqa: BLE001 - terminalization must continue.
                 log.warning(
                     "task_runtime.approval_cleanup_failed",
@@ -6799,7 +7347,7 @@ class TaskRuntime:
                         session_key=task.envelope.session_key,
                         error=str(exc),
                     )
-            await self._notify_task_lifecycle(
+            lifecycle_notified = await self._notify_task_lifecycle(
                 TaskLifecycleEvent(
                     phase="terminal",
                     session_key=task.envelope.session_key,
@@ -6819,6 +7367,8 @@ class TaskRuntime:
                     ),
                 )
             )
+            if terminal_persisted and not lifecycle_notified:
+                self._schedule_terminal_retry(task, terminal_update, persisted=True)
             if (
                 promotion_result is not None
                 and promotion_result.deferred_notification is not None
@@ -6870,7 +7420,18 @@ class TaskRuntime:
                             self._agent_active_sessions.pop(agent_id, None)
                             self._agent_session_rr.pop(agent_id, None)
                 if self._tasks.get(task.task_id) is task:
-                    self._tasks.pop(task.task_id, None)
+                    if self._tasks.pop(task.task_id, None) is not None:
+                        # A resident slot spans reservation, queued/running
+                        # execution, and terminal settlement. If storage
+                        # compensation scheduled a retry, keep the slot held
+                        # after the in-memory ledger entry is removed. The
+                        # retry releases it only after the durable row is
+                        # committed or explicitly retired.
+                        retry = self._terminal_pending_updates.get(task.task_id)
+                        if retry is not None and not retry.persisted:
+                            self._terminal_resident_holds.add(task.task_id)
+                        else:
+                            self._resident_count = max(0, self._resident_count - 1)
             # A task releases its global slot before ordered terminal
             # persistence and lifecycle settlement. A waiter can therefore
             # wake while this just-finished session is still the RR head, go
@@ -7072,9 +7633,9 @@ class TaskRuntime:
             return
         await self._event_emitter(session_key, event_name, payload)
 
-    async def _notify_task_lifecycle(self, event: TaskLifecycleEvent) -> None:
+    async def _notify_task_lifecycle(self, event: TaskLifecycleEvent) -> bool:
         if self._lifecycle_listener is None:
-            return
+            return True
         try:
             snapshot = await self.session_task_snapshot(
                 event.session_key,
@@ -7103,6 +7664,8 @@ class TaskRuntime:
                 task_status=event.task_status,
                 exc_info=True,
             )
+            return False
+        return True
 
     def set_activation_listener(
         self,
@@ -7111,6 +7674,20 @@ class TaskRuntime:
         """Install the shared pre-running activation hook."""
 
         self._activation_listener = listener
+
+    def set_activation_authority_validator(
+        self,
+        validator: Callable[[Any, Mapping[str, Any]], Any] | None,
+    ) -> None:
+        """Install a final authority check for lease-backed admissions.
+
+        The callback must be async-safe and return ``True`` only when the
+        authority that created the durable task is still current.  It is
+        invoked outside the runtime state lock, so a slow token/database read
+        cannot block unrelated queue or terminal work.
+        """
+
+        self._activation_authority_validator = validator
 
     def set_idle_listener(self, listener: RuntimeIdleListener | None) -> None:
         """Install a post-driver cleanup idle hook."""
@@ -7230,6 +7807,24 @@ class TaskRuntime:
             )
         current_details = getattr(existing, "details", None)
         details = dict(current_details) if isinstance(current_details, dict) else {}
+        owner = dict(details.get("admission_owner") or {})
+        if owner:
+            # The terminal row is the recovery proof that the resident and
+            # compute leases have been released.  The in-memory slot is held
+            # until this write succeeds (or the bounded retry settles), so a
+            # failed write cannot make a later task over-admit work.
+            owner.update(
+                {
+                    "resident_lease": "released",
+                    "compute_lease": (
+                        "released"
+                        if task.execution_started
+                        else "not_acquired"
+                    ),
+                    "settlement": "settled",
+                }
+            )
+            details["admission_owner"] = owner
         metadata = dict(details.get("metadata") or {})
         metadata.pop("plan_result", None)
         plan_result = task.envelope.metadata.get("plan_result")
@@ -7497,12 +8092,30 @@ class TaskRuntime:
             # compensation committed. Status()/list() still use the fresh DB.
             self._recent_terminal_records.append(record)
 
-    def _schedule_terminal_retry(self, task: _RuntimeTask, update: dict[str, Any]) -> None:
+    def _schedule_terminal_retry(
+        self, task: _RuntimeTask, update: dict[str, Any], *, persisted: bool = False,
+    ) -> None:
         if not callable(getattr(type(self._storage), "settle_agent_task", None)):
             return
-        self._terminal_pending_updates[task.task_id] = dict(update)
+        self._terminal_pending_updates[task.task_id] = _TerminalRetry(
+            update=dict(update),
+            session_key=task.envelope.session_key,
+            session_id=task.envelope.session_id,
+            session_epoch=task.envelope.session_epoch,
+            persisted=persisted,
+        )
         if self._terminal_retry_task is None or self._terminal_retry_task.done():
             self._terminal_retry_task = asyncio.create_task(self._retry_terminal_updates())
+
+    async def _release_terminal_resident_hold(self, task_id: str) -> None:
+        """Release a resident slot after terminal retry settlement is final."""
+
+        async with self._state_lock:
+            if task_id not in self._terminal_resident_holds:
+                return
+            self._terminal_resident_holds.remove(task_id)
+            self._resident_count = max(0, self._resident_count - 1)
+            self._signal_driver_state_changed()
 
     async def _retry_terminal_updates(self) -> None:
         """Drain terminal writes without holding a session lane or execution slot."""
@@ -7514,36 +8127,62 @@ class TaskRuntime:
             while self._terminal_pending_updates:
                 await asyncio.sleep(delay)
                 attempt += 1
-                for task_id, update in list(self._terminal_pending_updates.items()):
-                    record = self._terminal_fallback_records.get(task_id)
-                    if record is None:
-                        self._terminal_pending_updates.pop(task_id, None)
-                        continue
-                    try:
-                        await self._persist_terminal_update(task_id, record.session_key, update)
-                    except AgentTaskTerminalConflictError as exc:
-                        # Goal fail-closed compensation may have settled this
-                        # task already. Retire the stale retry and projection.
-                        self._terminal_pending_updates.pop(task_id, None)
-                        self._terminal_fallback_records[task_id] = exc.record
+                for task_id, retry in list(self._terminal_pending_updates.items()):
+                    if not retry.persisted:
+                        record = self._terminal_fallback_records.get(task_id)
+                        if record is None:
+                            self._terminal_pending_updates.pop(task_id, None)
+                            await self._release_terminal_resident_hold(task_id)
+                            continue
+                        try:
+                            await self._persist_terminal_update(
+                                task_id, record.session_key, retry.update,
+                            )
+                        except AgentTaskTerminalConflictError as exc:
+                            # Goal compensation may have committed a different
+                            # terminal. Notify a reread without replaying ours.
+                            self._terminal_fallback_records[task_id] = exc.record
+                        except KeyError:
+                            self._terminal_pending_updates.pop(task_id, None)
+                            self._terminal_fallback_records.pop(task_id, None)
+                            await self._release_terminal_resident_hold(task_id)
+                            continue
+                        except Exception as exc:
+                            if attempt & (attempt - 1) == 0:
+                                log.warning(
+                                    "task_runtime.terminal_persist_retry_failed",
+                                    task_id=task_id, attempt=attempt,
+                                    error_class=type(exc).__name__,
+                                )
+                            continue
+                        retry.persisted = True
                         self._remember_compensated_terminal(task_id)
-                        continue
-                    except KeyError:
-                        # Explicit session deletion may remove the task while
-                        # this retry waits. Never recreate deleted runtime data.
-                        self._terminal_pending_updates.pop(task_id, None)
-                        self._terminal_fallback_records.pop(task_id, None)
-                        continue
+                        await self._release_terminal_resident_hold(task_id)
+                        log.info("task_runtime.terminal_persist_recovered", task_id=task_id)
+                    try:
+                        if await task_session_is_current(
+                            self._storage,
+                            session_key=retry.session_key,
+                            session_id=retry.session_id,
+                            session_epoch=retry.session_epoch,
+                        ):
+                            # Do not replay lifecycle/Goal settlement or write
+                            # an old task status over a successor's session.
+                            await self._emit(
+                                retry.session_key, "sessions.changed",
+                                build_sessions_changed_payload(
+                                    retry.session_key, "updated",
+                                    session_id=retry.session_id, epoch=retry.session_epoch,
+                                ),
+                            )
                     except Exception as exc:
                         if attempt & (attempt - 1) == 0:
                             log.warning(
-                                "task_runtime.terminal_persist_retry_failed",
+                                "task_runtime.terminal_directory_retry_failed",
                                 task_id=task_id, attempt=attempt, error_class=type(exc).__name__,
                             )
                         continue
                     self._terminal_pending_updates.pop(task_id, None)
-                    self._remember_compensated_terminal(task_id)
-                    log.info("task_runtime.terminal_persist_recovered", task_id=task_id)
                 delay = min(2.0, delay * 2)
         finally:
             self._signal_driver_state_changed()

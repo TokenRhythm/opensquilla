@@ -9,11 +9,19 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.gateway.auth import resolve_auth
+from opensquilla.gateway.rpc_sandbox import _handle_sandbox_token_revoke
 from opensquilla.gateway.rpc_sessions import _handle_sessions_send_contract
+from opensquilla.gateway.token_store import TokenStore
 from opensquilla.gateway.websocket import get_registry
 from opensquilla.session.goals import GoalConflictError
 from opensquilla.session.models import AgentTaskStatus
-from tests.test_gateway.test_goal_rpc import SOURCE_KEY, _open_goal_rpc_stack
+from tests.test_gateway.test_goal_rpc import (
+    _PRINCIPAL,
+    SOURCE_KEY,
+    _handle_goals_set,
+    _open_goal_rpc_stack,
+)
 
 
 def _context(run):
@@ -169,3 +177,74 @@ async def test_cancel_waits_for_natural_goal_binding_under_same_task_fence(tmp_p
         goal = await stack.storage.get_goal(SOURCE_KEY)
         assert goal is not None and goal.active_task_id == sent["task_id"]
         assert len(await stack.storage.list_agent_tasks(session_key=SOURCE_KEY)) == 1
+
+
+@pytest.mark.asyncio
+async def test_named_token_revoke_at_activation_fence_blocks_goal_provider_dispatch(tmp_path):
+    """Revocation after durable Goal acceptance must fail before the handler."""
+
+    validator_entered = asyncio.Event()
+    release_validator = asyncio.Event()
+    provider_started = asyncio.Event()
+    runs = []
+
+    async def handler(run):
+        runs.append(run)
+        provider_started.set()
+
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-activation-revoke.sqlite", handler=handler,
+    ) as stack:
+        state = tmp_path / "auth"
+        stack.context.config.state_dir = str(state)
+        stack.context.config.auth.mode = "token"
+        issued = TokenStore(state / "sessions.db").create(
+            name="Goal activation owner",
+            roles={"operator"},
+            scopes={"operator.read", "operator.write"},
+            capabilities={"host.execute", "task.read", "task.submit"},
+        )
+        principal = resolve_auth(
+            stack.context.config,
+            auth_params={"token": issued.token},
+            role_claim="operator",
+            peer_ip="192.168.1.7",
+        )
+        assert principal is not None and principal.authenticated
+        stack.context.principal = principal
+        connection = get_registry().get(stack.context.conn_id)
+        assert connection is not None
+        connection.principal = principal
+
+        original_validator = stack.runtime._activation_authority_validator
+        assert callable(original_validator)
+
+        async def blocked_validator(task, snapshot):
+            validator_entered.set()
+            await release_validator.wait()
+            return await original_validator(task, snapshot)
+
+        stack.runtime.set_activation_authority_validator(blocked_validator)
+        set_task = asyncio.create_task(
+            _handle_goals_set(
+                {
+                    "sessionKey": SOURCE_KEY,
+                    "objective": "Activation fence revoke",
+                    "clientRequestId": "00000000-0000-4000-8000-000000000901",
+                    "clientMessageId": "00000000-0000-4000-8000-000000000902",
+                },
+                stack.context,
+            )
+        )
+        await asyncio.wait_for(validator_entered.wait(), timeout=3)
+        owner_context = replace(stack.context, principal=_PRINCIPAL)
+        revoked = await _handle_sandbox_token_revoke(
+            {"publicId": issued.record.public_id}, owner_context,
+        )
+        assert revoked["revoked"] is True
+        release_validator.set()
+        response = await asyncio.wait_for(set_task, timeout=5)
+        task = await stack.runtime.wait(response["taskId"], timeout=5)
+        assert task.status == AgentTaskStatus.FAILED
+        assert not provider_started.is_set()
+        assert runs == []

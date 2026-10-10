@@ -7,13 +7,14 @@ import json
 import ntpath
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from opensquilla.paths import state_dir
 
@@ -126,6 +127,14 @@ class ApprovalQueue:
         self._node_settings: dict[str, ApprovalSettings] = {}
         self._session_run_modes: dict[str, str] = {}
         self._event_listeners: list[ApprovalEventListener] = []
+        # Async gateway handlers use the ``*_async`` port below.  SQLite is
+        # intentionally kept as the durable fact store, but all of its calls
+        # are serialized in one worker section so a lock/maintenance owner
+        # cannot stall the gateway event loop or interleave transactions.
+        self._async_lock = asyncio.Lock()
+        self._notification_loop: asyncio.AbstractEventLoop | None = None
+        self._sync_lock = threading.RLock()
+        self._memory_lock = threading.RLock()
 
         self._db_path = (
             Path(db_path) if db_path else _default_approval_queue_path()
@@ -136,12 +145,59 @@ class ApprovalQueue:
             native_db_path,
             timeout=30.0,
             check_same_thread=False,
+            # Keep implicit pysqlite transactions from leaking across the
+            # synchronous and async queue entry points.  Queue mutations use
+            # explicit BEGIN IMMEDIATE/commit pairs; autocommit makes a
+            # read or a small maintenance write unable to leave a hidden
+            # transaction that later collides with stale-claim cleanup.
+            isolation_level=None,
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
         self._init_schema()
         self._load_pending()
+        self._install_sync_guards()
+
+    def _install_sync_guards(self) -> None:
+        """Serialize every public sync SQLite operation on this connection.
+
+        The async facade already serializes its worker calls with
+        ``_async_lock``, but legacy callers still invoke methods such as
+        ``resolve`` and ``expire_pending`` directly from the event-loop
+        thread.  Both paths share one ``sqlite3.Connection``; without this
+        second, thread-level guard a worker can hold ``BEGIN IMMEDIATE``
+        while the legacy call attempts another transaction and receives
+        ``cannot start a transaction within a transaction``.
+        """
+        names = (
+            "channel_code_for_approval", "bind_channel_code", "resolve_channel_code",
+            "release_channel_code", "clear_channel_codes", "request", "get",
+            "update_params", "_rearm_deadline", "extend", "_expire_if_unresolved",
+            "expire_pending_for_session", "expire_pending", "expire_all_pending",
+            "expire_claimed_resolution", "resolve", "claim_resolution",
+            "finalize_claimed_resolution", "complete_claimed_resolution",
+            "release_resolution_claim", "reopen_resolved_approval", "consume",
+            "status", "list_pending", "resolve_pending_for_session", "close",
+        )
+        # Memory snapshots must not wait behind SQLite. Only database operations
+        # may acquire both locks, in database -> memory order.
+        memory_names = (
+            "set_elevated_mode", "get_elevated_mode", "set_run_mode", "get_run_mode",
+            "get_settings", "has_node_settings", "set_settings",
+        )
+        for name in (*names, *memory_names):
+            original = getattr(self, name)
+            if getattr(original, "_opensquilla_sync_guard", False):
+                continue
+            lock = self._memory_lock if name in memory_names else self._sync_lock
+
+            def guarded(*args: Any, _original=original, _lock=lock, **kwargs: Any) -> Any:
+                with _lock:
+                    return _original(*args, **kwargs)
+
+            guarded._opensquilla_sync_guard = True  # type: ignore[attr-defined]
+            setattr(self, name, guarded)
 
     def _init_schema(self) -> None:
         self._conn.executescript(
@@ -212,6 +268,11 @@ class ApprovalQueue:
         ).fetchone()
         return str(row["code"]) if row is not None else None
 
+    async def channel_code_for_approval_async(self, approval_id: str) -> str | None:
+        """Read a channel binding without blocking the Gateway loop."""
+        async with self._async_lock:
+            return await asyncio.to_thread(self.channel_code_for_approval, approval_id)
+
     def bind_channel_code(
         self,
         code: str,
@@ -256,6 +317,34 @@ class ApprovalQueue:
             return False
         return True
 
+    async def bind_channel_code_async(
+        self,
+        code: str,
+        *,
+        approval_id: str,
+        namespace: str,
+        session_key: str,
+        owner_sender_id: str,
+        origin_channel_name: str = "",
+        origin_channel_id: str = "",
+        origin_thread_id: str = "",
+        approver_policy: str = "requester_only",
+    ) -> bool:
+        """Persist a channel binding in the serialized SQLite worker."""
+        async with self._async_lock:
+            return await asyncio.to_thread(
+                self.bind_channel_code,
+                code,
+                approval_id=approval_id,
+                namespace=namespace,
+                session_key=session_key,
+                owner_sender_id=owner_sender_id,
+                origin_channel_name=origin_channel_name,
+                origin_channel_id=origin_channel_id,
+                origin_thread_id=origin_thread_id,
+                approver_policy=approver_policy,
+            )
+
     def resolve_channel_code(self, code: str) -> dict[str, str] | None:
         row = self._conn.execute(
             "SELECT code, approval_id, namespace, session_key, owner_sender_id, "
@@ -267,6 +356,11 @@ class ApprovalQueue:
             return None
         return {key: str(row[key] or "") for key in row.keys()}
 
+    async def resolve_channel_code_async(self, code: str) -> dict[str, str] | None:
+        """Resolve a channel code without blocking the Gateway loop."""
+        async with self._async_lock:
+            return await asyncio.to_thread(self.resolve_channel_code, code)
+
     def release_channel_code(self, approval_id: str) -> None:
         self._conn.execute(
             "DELETE FROM channel_approval_codes WHERE approval_id = ?",
@@ -274,9 +368,18 @@ class ApprovalQueue:
         )
         self._conn.commit()
 
+    async def release_channel_code_async(self, approval_id: str) -> None:
+        """Release a channel binding in the serialized SQLite worker."""
+        async with self._async_lock:
+            await asyncio.to_thread(self.release_channel_code, approval_id)
+
     def clear_channel_codes(self) -> None:
         self._conn.execute("DELETE FROM channel_approval_codes")
         self._conn.commit()
+
+    async def clear_channel_codes_async(self) -> None:
+        async with self._async_lock:
+            await asyncio.to_thread(self.clear_channel_codes)
 
     def _release_stale_claims(self) -> None:
         threshold = time.time() - self._claim_ttl_seconds
@@ -377,11 +480,172 @@ class ApprovalQueue:
             "approved": entry.approved,
             "resolution": entry.resolution,
         }
-        for listener in list(self._event_listeners):
+        listeners = list(self._event_listeners)
+
+        def _invoke(listener: ApprovalEventListener) -> None:
             try:
                 listener(event, info)
             except Exception:  # pragma: no cover — listeners are best-effort
+                pass
+
+        # A worker-thread mutation must not call create_task()/session stream
+        # code directly from that thread.  Marshal listeners back to the loop
+        # which owns the async gateway port.  Synchronous callers retain the
+        # historical inline notification behavior.
+        loop = self._notification_loop
+        if loop is not None and loop.is_running():
+            for listener in listeners:
+                loop.call_soon_threadsafe(_invoke, listener)
+            return
+        for listener in listeners:
+            _invoke(listener)
+
+    async def _run_async(self, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run one durable queue operation off the Gateway event loop.
+
+        The single async lock is the queue's maintenance/transaction owner:
+        it prevents two ``to_thread`` calls from sharing one sqlite connection
+        while still allowing unrelated Gateway RPCs to continue scheduling.
+        """
+        self._notification_loop = asyncio.get_running_loop()
+        async with self._async_lock:
+            return await asyncio.to_thread(operation, *args, **kwargs)
+
+    async def request_async(self, namespace: str = "exec", params: dict | None = None) -> str:
+        return cast(str, await self._run_async(self.request, namespace, params))
+
+    async def get_async(self, approval_id: str) -> PendingApproval:
+        return cast(PendingApproval, await self._run_async(self.get, approval_id))
+
+    async def status_async(self, approval_id: str) -> dict:
+        return cast(dict, await self._run_async(self.status, approval_id))
+
+    async def list_pending_async(self, namespace: str | None = None) -> list[dict]:
+        return cast(list[dict], await self._run_async(self.list_pending, namespace))
+
+    async def update_params_async(self, approval_id: str, params: dict) -> None:
+        await self._run_async(self.update_params, approval_id, params)
+
+    async def resolve_async(
+        self,
+        approval_id: str,
+        approved: bool,
+        *,
+        elevated_mode: str | None = None,
+        allow_idempotent: bool = True,
+        resolution_metadata: dict | None = None,
+    ) -> None:
+        await self._run_async(
+            self.resolve,
+            approval_id,
+            approved,
+            elevated_mode=elevated_mode,
+            allow_idempotent=allow_idempotent,
+            resolution_metadata=resolution_metadata,
+        )
+
+    async def wait_async(self, approval_id: str, timeout: float | None = None) -> bool:
+        """Wait without polling SQLite from the event-loop thread."""
+        if timeout is not None:
+            await self._run_async(self._rearm_deadline, approval_id, time.time() + timeout)
+        while True:
+            entry = await self.get_async(approval_id)
+            if entry.resolved and entry.claim_token is None:
+                return entry.approved
+            remaining = entry.deadline - time.time() if entry.deadline > 0 else None
+            if remaining is not None and remaining <= 0:
+                outcome = await self._run_async(self._expire_if_unresolved, approval_id)
+                if outcome is not None:
+                    return bool(outcome)
                 continue
+            # Do not hold the database owner while waiting for a user decision.
+            await asyncio.sleep(
+                self._poll_interval if remaining is None else min(self._poll_interval, remaining)
+            )
+
+    async def extend_async(self, approval_id: str, seconds: float) -> float:
+        return float(await self._run_async(self.extend, approval_id, seconds))
+
+    async def claim_resolution_async(
+        self, approval_id: str, *, resolution_metadata: dict | None = None
+    ) -> str:
+        return cast(
+            str,
+            await self._run_async(
+                self.claim_resolution,
+                approval_id,
+                resolution_metadata=resolution_metadata,
+            ),
+        )
+
+    async def finalize_claimed_resolution_async(
+        self,
+        approval_id: str,
+        claim_token: str,
+        approved: bool,
+        *,
+        elevated_mode: str | None = None,
+    ) -> None:
+        await self._run_async(
+            self.finalize_claimed_resolution,
+            approval_id,
+            claim_token,
+            approved,
+            elevated_mode=elevated_mode,
+        )
+
+    async def complete_claimed_resolution_async(
+        self, approval_id: str, claim_token: str, *, elevated_mode: str | None = None
+    ) -> None:
+        await self._run_async(
+            self.complete_claimed_resolution,
+            approval_id,
+            claim_token,
+            elevated_mode=elevated_mode,
+        )
+
+    async def release_resolution_claim_async(self, approval_id: str, claim_token: str) -> None:
+        await self._run_async(self.release_resolution_claim, approval_id, claim_token)
+
+    async def expire_claimed_resolution_async(self, approval_id: str, claim_token: str) -> None:
+        await self._run_async(self.expire_claimed_resolution, approval_id, claim_token)
+
+    async def reopen_resolved_approval_async(
+        self, approval_id: str, *, expected_approved: bool = True
+    ) -> None:
+        await self._run_async(
+            self.reopen_resolved_approval,
+            approval_id,
+            expected_approved=expected_approved,
+        )
+
+    async def consume_async(self, approval_id: str) -> None:
+        await self._run_async(self.consume, approval_id)
+
+    async def expire_pending_async(self, approval_id: str) -> bool:
+        return bool(await self._run_async(self.expire_pending, approval_id))
+
+    async def expire_pending_for_session_async(self, session_key: str) -> int:
+        return int(await self._run_async(self.expire_pending_for_session, session_key))
+
+    async def expire_all_pending_async(self) -> int:
+        return int(await self._run_async(self.expire_all_pending))
+
+    async def resolve_pending_for_session_async(
+        self,
+        session_key: str,
+        *,
+        approved: bool,
+        elevated_mode: str | None = None,
+    ) -> int:
+        return int(
+            await self._run_async(
+                self.resolve_pending_for_session,
+                session_key,
+                approved=approved,
+                elevated_mode=elevated_mode,
+            )
+        )
 
     def request(self, namespace: str = "exec", params: dict | None = None) -> str:
         payload = self._serialize_params(params or {})

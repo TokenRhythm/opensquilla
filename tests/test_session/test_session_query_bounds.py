@@ -12,7 +12,7 @@ from opensquilla.gateway.rpc_sessions import _list_task_rows_by_session, _list_t
 from opensquilla.gateway.subagent_announce import _list_latest_task_rows_for_sessions
 from opensquilla.session import storage as storage_module
 from opensquilla.session.models import SessionNode, TranscriptEntry
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import SessionStorage, StorageBusyError
 from opensquilla.tools.builtin.session_search import create_session_search_tool
 from opensquilla.tools.registry import ToolRegistry
 
@@ -125,15 +125,63 @@ async def test_successful_title_batch_never_reads_individual_transcripts(result)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("batch", ["missing", "error"])
-async def test_unavailable_title_batch_keeps_legacy_fallback(batch):
+async def test_only_missing_title_batch_uses_legacy_fallback(batch):
     storage = SimpleNamespace(get_transcript=AsyncMock(return_value=[
         SimpleNamespace(role="user", content="Fallback title"),
     ]))
-    if batch == "error":
-        storage.list_user_transcript_content_batch = AsyncMock(side_effect=RuntimeError("read"))
     sessions = [SessionNode(session_key="agent:main:webchat:legacy", session_id="legacy")]
+    if batch == "error":
+        failure = RuntimeError("read")
+        storage.list_user_transcript_content_batch = AsyncMock(side_effect=failure)
+        with pytest.raises(RuntimeError) as raised:
+            await _list_transcript_titles(storage, sessions)
+        assert raised.value is failure
+        storage.list_user_transcript_content_batch.assert_awaited_once_with(
+            ["legacy"], limit_per_session=3,
+        )
+        storage.get_transcript.assert_not_awaited()
+        return
     assert await _list_transcript_titles(storage, sessions) == {"legacy": "Fallback title"}
-    storage.get_transcript.assert_awaited_once_with("legacy", limit=8)
+    storage.get_transcript.assert_awaited_once_with(
+        "legacy", limit=8, content_mode="bounded"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        StorageBusyError(
+            "list_user_transcript_content_batch",
+            waited_ms=2_000,
+            retry_after_ms=250,
+        ),
+        TimeoutError("title batch deadline"),
+    ],
+)
+async def test_bounded_title_batch_failure_does_not_amplify_into_per_session_reads(failure):
+    storage = SimpleNamespace(
+        list_user_transcript_content_batch=AsyncMock(side_effect=failure),
+        get_transcript=AsyncMock(side_effect=AssertionError("unexpected fallback read")),
+    )
+    sessions = [SessionNode(session_key="agent:main:webchat:busy", session_id="busy")]
+
+    # A failed read must not look like an authoritative empty title result.
+    with pytest.raises(StorageBusyError) as raised:
+        await _list_transcript_titles(storage, sessions)
+    if isinstance(failure, StorageBusyError):
+        assert raised.value is failure
+    else:
+        assert raised.value.__cause__ is failure
+        assert raised.value.operation == "list_user_transcript_content_batch"
+        assert raised.value.stage == "deadline"
+        assert raised.value.resource == "session_transcript_titles"
+        assert raised.value.retry_after_ms == 250
+        assert raised.value.waited_ms >= 0
+    storage.list_user_transcript_content_batch.assert_awaited_once_with(
+        ["busy"], limit_per_session=3
+    )
+    storage.get_transcript.assert_not_awaited()
 
 
 @pytest.mark.asyncio

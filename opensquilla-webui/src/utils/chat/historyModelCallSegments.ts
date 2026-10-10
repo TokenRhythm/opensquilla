@@ -30,6 +30,7 @@ function syntheticAssistantSegment(
   text: string,
   segmentKey: string,
   projectRouter = false,
+  contentSlice?: ChatMessage['contentSlice'],
 ): ChatMessage {
   const routerUsage = projectRouter ? source.usage || source.turn_usage : undefined
   const routerModelCallId = String(
@@ -45,6 +46,12 @@ function syntheticAssistantSegment(
     clientId: `history-model-call-segment:${source.messageId || source.clientId || 'assistant'}:${segmentKey}`,
     turnId: source.turnId,
     restoredFromHistory: true,
+    ...(source.contentRef ? { contentRef: { ...source.contentRef } } : {}),
+    previewComplete: source.previewComplete,
+    contentRevision: source.contentRevision,
+    contentAvailability: source.contentAvailability,
+    contentUnavailableReason: source.contentUnavailableReason,
+    ...(contentSlice ? { contentSlice } : {}),
     ...(routerUsage ? { routerUsage } : {}),
     ...(routerModelCallId ? { routerModelCallId } : {}),
     ...(routerIteration ? { routerIteration } : {}),
@@ -109,6 +116,7 @@ function interleaveAssistantAt(
         codepoints.slice(0, firstStart).join(''),
         `prefix-${firstStart}`,
         true,
+        { startCodepoint: 0, endCodepoint: firstStart },
       ),
     )
   }
@@ -121,13 +129,29 @@ function interleaveAssistantAt(
       .join('')
     const isLast = segmentIndex === segments.length - 1
     if (isLast) {
-      replacement.push({ ...assistant, text })
+      replacement.push({
+        ...assistant,
+        text,
+        ...(assistant.contentRef
+          ? {
+              contentSlice: {
+                startCodepoint: segment.startCodepoint,
+                endCodepoint: segment.endCodepoint,
+              },
+            }
+          : {}),
+      })
     } else if (text) {
       replacement.push(
         syntheticAssistantSegment(
           assistant,
           text,
           `${segment.modelCallId}-${segment.startCodepoint}-${segment.endCodepoint}`,
+          false,
+          {
+            startCodepoint: segment.startCodepoint,
+            endCodepoint: segment.endCodepoint,
+          },
         ),
       )
     }

@@ -198,22 +198,12 @@ def _title(
     surface: str,
     transcript_title: str | None = None,
 ) -> str:
-    recover_refusal = _has_refused_chat_title(
-        session, effective_agent_id, session_kind, surface
+    stored = _metadata_title(
+        session, effective_agent_id, session_kind, surface,
+        include_generic=not bool(transcript_title),
     )
-    for attr in ("display_name", "derived_title", "subject"):
-        value = _display(getattr(session, attr, None))
-        if value:
-            if recover_refusal and attr in {"display_name", "derived_title"}:
-                continue
-            if (
-                session_kind == "chat"
-                and surface == "webchat"
-                and transcript_title
-                and _is_generic_webchat_title(value, effective_agent_id)
-            ):
-                continue
-            return value
+    if stored:
+        return stored
     if transcript_title:
         return transcript_title
     if session_kind == "chat" and surface == "webchat":
@@ -241,6 +231,57 @@ def _title(
             return f"{target}{suffix}"
         return f"{_humanize(surface)} conversation"
     return key or "Unknown session"
+
+
+def session_title_from_metadata(
+    session: Any, *, channel_types: dict[str, str] | None = None,
+) -> str:
+    """Return an authoritative stored title, excluding placeholders/refusals.
+
+    Read projections use the same precedence as the displayed title to avoid
+    fetching transcript text that cannot affect the result.
+    """
+    key = str(getattr(session, "session_key", "") or "")
+    origin = getattr(session, "origin", None)
+    origin_map = origin if isinstance(origin, dict) else {}
+    surface = _surface(session, key, origin_map, channel_types)
+    effective_agent_id = _effective_agent_id(session, key)
+    session_kind = _session_kind(session, key, surface, origin_map)
+    title = _metadata_title(
+        session, effective_agent_id, session_kind, surface, include_generic=True,
+    )
+    if (
+        session_kind == "chat" and surface == "webchat"
+        and _is_generic_webchat_title(title, effective_agent_id)
+    ):
+        # A leading placeholder is conditional on whether transcript text is
+        # available. Preserve that existing fallback rather than skipping its
+        # read merely because a later stored candidate would be meaningful.
+        return ""
+    return title
+
+
+def _metadata_title(
+    session: Any, effective_agent_id: str, session_kind: str, surface: str,
+    *, include_generic: bool = False,
+) -> str:
+    recover_refusal = _has_refused_chat_title(
+        session, effective_agent_id, session_kind, surface
+    )
+    for attr in ("display_name", "derived_title", "subject"):
+        value = _display(getattr(session, attr, None))
+        if value:
+            if recover_refusal and attr in {"display_name", "derived_title"}:
+                continue
+            if (
+                session_kind == "chat"
+                and surface == "webchat"
+                and not include_generic
+                and _is_generic_webchat_title(value, effective_agent_id)
+            ):
+                continue
+            return value
+    return ""
 
 
 def has_refused_chat_title(
@@ -590,6 +631,11 @@ def _content_text(content: Any) -> str:
                 return raw
         return raw
     if isinstance(content, dict):
+        # display_text 的空串表示用户只发了附件；不能退回 provider 补充提示，
+        # 也不能递归把附件文件名/base64 当成会话标题。缺失时保留旧客户端兼容。
+        display_text = content.get("display_text")
+        if isinstance(display_text, str):
+            return display_text.strip()
         for key in (
             "text",
             "message",

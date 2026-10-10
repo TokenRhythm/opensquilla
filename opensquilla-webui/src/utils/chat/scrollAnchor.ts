@@ -116,14 +116,23 @@ function textNodeOffset(root: HTMLElement, target: Text): number {
   return -1
 }
 
-function tokenAroundOffset(text: string, offset: number): { token: string; start: number } | null {
+/** Search near the caret without scanning a potentially multi-megabyte history row. */
+export function tokenAroundOffset(text: string, offset: number): { token: string; start: number } | null {
+  const boundedOffset = Math.max(0, Math.min(text.length, Math.trunc(offset)))
+  const windowStart = Math.max(0, boundedOffset - 64)
+  const windowEnd = Math.min(text.length, boundedOffset + 64)
+  const localText = text.slice(windowStart, windowEnd)
   let nearest: RegExpMatchArray | null = null
   let nearestDistance = Number.POSITIVE_INFINITY
-  for (const match of text.matchAll(/[A-Za-z0-9_\u00c0-\uffff-]{4,}/g)) {
-    const start = match.index ?? -1
+  for (const match of localText.matchAll(/[A-Za-z0-9_\u00c0-\uffff-]{4,}/g)) {
+    const start = (match.index ?? -1) + windowStart
     if (start < 0) continue
     const end = start + match[0].length
-    const distance = offset < start ? start - offset : offset > end ? offset - end : 0
+    const distance = boundedOffset < start
+      ? start - boundedOffset
+      : boundedOffset > end
+        ? boundedOffset - end
+        : 0
     if (distance < nearestDistance) {
       nearest = match
       nearestDistance = distance
@@ -131,9 +140,9 @@ function tokenAroundOffset(text: string, offset: number): { token: string; start
     if (distance === 0) break
   }
   if (!nearest || nearestDistance > 64) return null
-  const matchStart = nearest.index ?? 0
+  const matchStart = (nearest.index ?? 0) + windowStart
   const matchText = nearest[0]
-  const relativeOffset = Math.max(0, Math.min(matchText.length, offset - matchStart))
+  const relativeOffset = Math.max(0, Math.min(matchText.length, boundedOffset - matchStart))
   const chunkStart = matchText.length <= 32
     ? 0
     : Math.max(0, Math.min(matchText.length - 32, relativeOffset - 16))

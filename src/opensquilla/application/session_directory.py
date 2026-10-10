@@ -15,9 +15,23 @@ from typing import Any, Protocol, cast
 
 import structlog
 
+from opensquilla.session.recovery_reads import ReadCapacityError, current_read_budget
 from opensquilla.session_key import canonicalize_session_key
 
 log = structlog.get_logger(__name__)
+
+
+def _check_search_read_failure(error: Exception) -> None:
+    """Keep optional enrichment failures distinct from lost read ownership."""
+    budget = current_read_budget()
+    if budget is None:
+        return
+    budget.check()
+    # Storage preserves the pool's timeout/capacity error as the direct cause
+    # of its public busy error. Avoid depending on the concrete SQLite store.
+    read_failures = (ReadCapacityError, TimeoutError)
+    if isinstance(error, read_failures) or isinstance(error.__cause__, read_failures):
+        raise error
 
 
 class SessionDirectoryStorage(Protocol):
@@ -138,8 +152,9 @@ class SessionDirectory:
 
         The Gateway supplies presentation projection and optional batched title
         reads; the application never imports Gateway view or RPC code. Transcript
-        index and enrichment failures remain best-effort, while title-index failures
-        retain the historical propagation semantics of the v4 handler.
+        index and enrichment failures remain best-effort. A read deadline,
+        cancellation, or exhausted reader pool still propagates, rather than
+        being reported as a successful empty search.
         """
 
         normalized_query, normalized_limit = self.normalize_search_input(query, limit)
@@ -198,7 +213,8 @@ class SessionDirectory:
                 search_fts = getattr(self._storage, "search_transcript", None)
                 if callable(search_fts):
                     rows = await search_fts(normalized_query, limit=normalized_limit)
-        except Exception:
+        except Exception as exc:
+            _check_search_read_failure(exc)
             log.warning("sessions.search.transcript_failed", exc_info=True)
             rows = ()
 
@@ -218,7 +234,8 @@ class SessionDirectory:
             for _, canonical_key, _ in pending:
                 try:
                     session = await get_session(canonical_key)
-                except Exception:
+                except Exception as exc:
+                    _check_search_read_failure(exc)
                     session = None
                 if session is not None:
                     enriched_sessions.append(session)
@@ -280,15 +297,26 @@ class SessionDirectory:
                         for session_id, values in grouped.items()
                     }
                 )
-            except Exception:
+            except Exception as exc:
+                _check_search_read_failure(exc)
                 pass
         if not any(title_inputs.values()):
             get_transcript = getattr(self._storage, "get_transcript", None)
             if callable(get_transcript):
                 for session_id in session_ids:
                     try:
-                        entries = await get_transcript(session_id, limit=8)
-                    except Exception:
+                        try:
+                            entries = await get_transcript(
+                                session_id, limit=8, content_mode="bounded"
+                            )
+                        except TypeError as exc:
+                            # Older storage doubles do not expose the bounded
+                            # projection yet; retain their test/CLI contract.
+                            if "content_mode" not in str(exc):
+                                raise
+                            entries = await get_transcript(session_id, limit=8)
+                    except Exception as exc:
+                        _check_search_read_failure(exc)
                         continue
                     title_inputs[session_id] = [
                         str(getattr(entry, "content", "") or "")

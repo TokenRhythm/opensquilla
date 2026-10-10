@@ -1,4 +1,8 @@
 {
+  "historyContent": {
+    "detailsPreview": "Algunos razonamientos y detalles extensos de herramientas se muestran como vista previa.",
+    "unavailable": "Actualmente solo se muestra una vista previa. El texto completo no está disponible temporalmente."
+  },
   "processes": {
     "title": "Procesos en segundo plano",
     "runningCount": "{count} en ejecución",
@@ -657,6 +661,7 @@
       },
       "setup": {
         "title": "Configurar el modo Seguro", "description": "OpenSquilla necesita una autorización de administrador para crear una cuenta aislada y configurar la protección de archivos y red.", "descriptionWithDuration": "OpenSquilla necesita una autorización de administrador para crear una cuenta aislada y configurar las protecciones. La primera configuración suele tardar unos 20–30 segundos. Mantén OpenSquilla abierto.",
+        "repairIdentityDescription": "Las credenciales guardadas del entorno aislado ya no son válidas. Continuar reparará su cuenta interna; otros perfiles de OpenSquilla podrían tener que preparar Safe de nuevo. Tu contraseña de Windows no cambiará.",
         "continue": "Continuar", "configuring": "Configurando…", "requestingApproval": "Confirma el aviso de Windows para continuar.", "configuringProtection": "OpenSquilla está completando la configuración del modo Seguro. Mantén la aplicación abierta.", "takingLonger": "La primera configuración puede tardar unos minutos. La verificación se ejecutará automáticamente.", "elapsed": "{seconds} s transcurridos", "cancelled": "Configuración cancelada. El acceso completo no cambia; puedes volver a intentarlo.",
         "failed": "No se pudo configurar el modo Seguro. El acceso completo no cambia.", "verificationFailed": "La configuración terminó, pero falló la comprobación de seguridad. El acceso completo no cambia.",
         "runInBackground": "Configurar en segundo plano", "readyToast": "El modo Seguro está listo.", "failedToast": "No se pudo completar la configuración del modo Seguro. Vuelve a intentarlo desde el modo Seguro."
@@ -2872,6 +2877,7 @@
     },
     "jobs": {
       "errLoad": "No se pudieron cargar las tareas cron",
+      "waitingForCapacity": "Esperando capacidad disponible. Se reintentará automáticamente.",
       "noUpcomingRuns": "no hay ejecuciones próximas",
       "toastPaused": "Tarea en pausa",
       "toastResumed": "Tarea reanudada",

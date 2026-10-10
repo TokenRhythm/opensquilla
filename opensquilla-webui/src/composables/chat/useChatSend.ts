@@ -1210,6 +1210,14 @@ export function useChatSend(options: UseChatSendOptions) {
     return intent === 'new_chat' ? options.initialProvider?.value ?? null : null
   }
 
+  // Only known browser skills require the optional desktop browser service.
+  function requiredServicesForSkills(skills: readonly SelectedSkillRef[]): string[] {
+    return skills.some(skill => {
+      const name = String(skill.name || '').trim().toLowerCase()
+      return name === 'browser-use' || name === 'browser_use' || name === 'browseruse'
+    }) ? ['desktop_browser'] : []
+  }
+
   function consumeAcceptedComposer(attempt: SendAttempt): void {
     if (disposed) return
     if (options.sessionKey.value !== attempt.requestSessionKey) {
@@ -3039,6 +3047,8 @@ export function useChatSend(options: UseChatSendOptions) {
         sessionKey: requestSessionKey,
       }
       if (attemptSelectedSkills.length) params.selectedSkills = copySelectedSkills(attemptSelectedSkills)
+      const requiredServices = requiredServicesForSkills(attemptSelectedSkills)
+      if (requiredServices.length) params.requiredServices = requiredServices
       if (attemptLocalPathReferences.length) params.localPathReferences = [...attemptLocalPathReferences]
       if (attemptPageContext) params.pageContext = attemptPageContext
       if (attemptPageContext?.annotations?.length && !userText) params.displayText = ''

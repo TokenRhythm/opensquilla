@@ -1,4 +1,8 @@
 {
+  "historyContent": {
+    "detailsPreview": "Certains raisonnements et détails d’outils longs sont affichés en aperçu.",
+    "unavailable": "Seul un aperçu est affiché actuellement. Le texte complet est temporairement indisponible."
+  },
   "processes": {
     "title": "Processus en arrière-plan",
     "runningCount": "{count} en cours",
@@ -657,6 +661,7 @@
       },
       "setup": {
         "title": "Configurer le mode sûr", "description": "OpenSquilla a besoin d’une autorisation administrateur pour créer un compte isolé et configurer la protection des fichiers et du réseau.", "descriptionWithDuration": "OpenSquilla a besoin d’une autorisation administrateur pour créer un compte isolé et configurer les protections. La première configuration prend généralement environ 20 à 30 secondes. Gardez OpenSquilla ouvert.",
+        "repairIdentityDescription": "Les identifiants enregistrés du bac à sable ne sont plus valides. Continuer réparera son compte interne ; les autres profils OpenSquilla devront peut-être préparer Safe à nouveau. Votre mot de passe Windows ne changera pas.",
         "continue": "Continuer", "configuring": "Configuration…", "requestingApproval": "Confirmez l’invite Windows pour continuer.", "configuringProtection": "OpenSquilla termine la configuration du mode sûr. Gardez l’application ouverte.", "takingLonger": "La première configuration peut prendre quelques minutes. La vérification se lancera automatiquement.", "elapsed": "{seconds} s écoulées", "cancelled": "Configuration annulée. L’accès complet reste inchangé ; vous pouvez réessayer.",
         "failed": "Le mode sûr n’a pas pu être configuré. L’accès complet reste inchangé.", "verificationFailed": "La configuration est terminée, mais la vérification de sécurité a échoué. L’accès complet reste inchangé.",
         "runInBackground": "Configurer en arrière-plan", "readyToast": "Le mode sûr est prêt.", "failedToast": "La configuration du mode sûr n’a pas pu se terminer. Réessayez depuis le mode sûr."
@@ -2872,6 +2877,7 @@
     },
     "jobs": {
       "errLoad": "Échec du chargement des tâches cron",
+      "waitingForCapacity": "En attente de capacité disponible. Nouvelle tentative automatique.",
       "noUpcomingRuns": "aucune exécution à venir",
       "toastPaused": "Tâche mise en pause",
       "toastResumed": "Tâche reprise",

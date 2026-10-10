@@ -195,6 +195,59 @@ def _capture(params: dict[str, Any]) -> MemoryCapturePolicy:
     return MemoryCapturePolicy(bool(no_capture), provenance)
 
 
+def _required_services(params: dict[str, Any]) -> tuple[str, ...]:
+    """Decode the bounded producer dependency declaration.
+
+    ``requiredServices`` is an additive producer hint.  The bundled
+    ``browser-use`` skill is the one user-facing selection whose execution
+    contract is known to require the Desktop-owned browser bridge, so derive
+    that dependency here as well.  Keeping this inference at the Gateway
+    ingress boundary means queued/replayed inputs and older WebUI builds get
+    the same readiness fence; an omitted declaration can no longer silently
+    accept a turn whose selected skill needs the delayed browser service.
+    """
+    aliases = {
+        "browser": "desktop_browser",
+        "desktop-browser": "desktop_browser",
+        "desktopbrowser": "desktop_browser",
+    }
+    raw = params.get("requiredServices", params.get("required_services"))
+    if raw is None:
+        source = params.get("_source")
+        if isinstance(source, dict):
+            raw = source.get("requiredServices", source.get("required_services"))
+    if raw is not None and not isinstance(raw, (list, tuple)):
+        raise ValueError("requiredServices must be an array of strings")
+    values: list[str] = []
+    for value in raw or ():
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("requiredServices must contain non-empty strings")
+        name = aliases.get(value.strip().lower(), value.strip().lower())
+        if name not in values:
+            values.append(name)
+
+    # ``selectedSkills`` is part of the authenticated turn input and is
+    # validated again by the acceptance path.  Only infer the fixed bundled
+    # skill contract; arbitrary skill names never manufacture a service claim.
+    selected = params.get("selectedSkills")
+    if isinstance(selected, (list, tuple)):
+        for item in selected:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if isinstance(name, str) and name.strip().lower() in {
+                "browser-use",
+                "browser_use",
+                "browseruse",
+            }:
+                if "desktop_browser" not in values:
+                    values.append("desktop_browser")
+                break
+    if len(values) > 8:
+        raise ValueError("requiredServices may contain at most 8 services")
+    return tuple(values)
+
+
 
 
 def decode_admit_turn(
@@ -330,4 +383,5 @@ def decode_admit_turn(
         initial_model=initial_model,
         initial_provider=initial_provider,
         pending_input=pending_input,
+        required_services=_required_services(params),
     )

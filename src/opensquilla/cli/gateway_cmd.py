@@ -401,9 +401,26 @@ def run_gateway(
         if stall_watchdog is not None and stall_watchdog.start():
 
             async def _stall_heartbeat() -> None:
+                loop = asyncio.get_running_loop()
+                interval_s = 0.1
+                expected_wake = loop.time() + interval_s
                 while True:
+                    # Set the deadline before sleeping.  If the event loop is
+                    # blocked, the wake callback runs late and this delta is
+                    # the actual scheduling delay; resetting the deadline
+                    # before measuring would erase the very stall we need to
+                    # observe.
+                    await asyncio.sleep(interval_s)
+                    now = loop.time()
+                    stall_watchdog.record_loop_lag(
+                        max(0.0, now - expected_wake) * 1000.0,
+                        expected_wake_s=expected_wake,
+                        wake_s=now,
+                        wake_perf_ns=time.perf_counter_ns(),
+                        wake_ts=time.time(),
+                    )
                     stall_watchdog.beat()
-                    await asyncio.sleep(0.1)
+                    expected_wake = now + interval_s
 
             stall_heartbeat_task = asyncio.create_task(
                 _stall_heartbeat(), name="gateway-stall-heartbeat"
@@ -586,6 +603,13 @@ def run_gateway(
                     None,
                 ),
             )
+            # ``_force_process_exit`` uses an immediate process exit and does
+            # not unwind the outer ``finally`` below.  Flush opt-in stall
+            # diagnostics before taking that path so a forced shutdown keeps
+            # its loop-lag evidence instead of silently truncating the JSONL.
+            if stall_watchdog is not None:
+                stall_watchdog.stop()
+                stall_watchdog = None
             watchdog.disarm()
             _flush_shutdown_streams()
             _force_process_exit(exit_code)

@@ -15,7 +15,7 @@
       >
         <h4 id="sandbox-setup-dialog-title">{{ t('settings.sandbox.setup.title') }}</h4>
         <p id="sandbox-setup-dialog-description">
-          {{ t('settings.sandbox.setup.descriptionWithDuration') }}
+          {{ t(repairIdentity ? 'settings.sandbox.setup.repairIdentityDescription' : 'settings.sandbox.setup.descriptionWithDuration') }}
         </p>
         <p
           v-if="progressMessage"
@@ -63,6 +63,7 @@ const props = defineProps<{
   open: boolean
   pending: boolean
   outcome: SandboxSetupOutcome
+  repairIdentity?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -105,7 +106,7 @@ const progressMessage = computed(() => {
   return `${phase} ${t('settings.sandbox.setup.elapsed', { seconds: elapsedSeconds.value })}`
 })
 
-const quietFailure = computed(() => !props.pending && (
+const quietFailure = computed(() => !props.repairIdentity && !props.pending && (
   props.outcome === 'cancelled'
   || props.outcome === 'failed'
   || props.outcome === 'verification_failed'

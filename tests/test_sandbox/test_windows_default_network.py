@@ -127,6 +127,33 @@ def test_setup_marker_round_trips_network_state(tmp_path: Path) -> None:
     assert marker.network == network
 
 
+def test_legacy_setup_marker_without_state_remains_ready(tmp_path: Path) -> None:
+    from opensquilla.sandbox.backend.windows_default_setup import (
+        read_setup_marker,
+        setup_marker_is_current,
+    )
+
+    marker_path = tmp_path / "setup_marker.json"
+    marker_path.write_text('{"setupVersion": 2}\n', encoding="utf-8")
+
+    marker = read_setup_marker(marker_path)
+    assert marker is not None and marker.setup_state == "ready"
+    assert setup_marker_is_current(marker_path) is True
+
+
+@pytest.mark.parametrize("state", [[], {}, 1, "unknown"])
+def test_setup_marker_rejects_invalid_state(tmp_path: Path, state: object) -> None:
+    from opensquilla.sandbox.backend.windows_default_setup import read_setup_marker
+
+    marker_path = tmp_path / "setup_marker.json"
+    marker_path.write_text(
+        json.dumps({"setupVersion": 2, "setupState": state}),
+        encoding="utf-8",
+    )
+
+    assert read_setup_marker(marker_path) is None
+
+
 def test_legacy_firewall_marker_with_current_wfp_is_not_proxy_ready() -> None:
     from opensquilla.sandbox.backend.windows_default_network import (
         FIREWALL_RULE_VERSION,
@@ -199,7 +226,7 @@ def test_establish_windows_network_setup_passes_proxy_ports_to_wfp(
         "username": "OpenSquillaSandbox",
         "protectedPassword": "protected",
     }
-    monkeypatch.setattr(mod, "ensure_offline_sandbox_user", lambda path: identity)
+    monkeypatch.setattr(mod, "ensure_offline_sandbox_user", lambda path, **kwargs: identity)
     monkeypatch.setattr(
         windows_default_firewall,
         "firewall_rule_specs",
@@ -241,6 +268,13 @@ def test_ensure_offline_sandbox_user_uses_configured_short_name(monkeypatch, tmp
         commands.append(argv[-1])
         return Completed()
 
+    monkeypatch.setattr(mod, "_query_offline_account", lambda: None)
+    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+    monkeypatch.setattr(
+        mod,
+        "_validated_elevated_setup_target",
+        lambda payload: (Path(payload["markerPath"]), tmp_path),
+    )
     monkeypatch.setattr(mod, "OFFLINE_USERNAME", "ShortSandboxUser")
     monkeypatch.setattr(mod, "_generate_offline_user_password", lambda: "Password123!")
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
@@ -268,6 +302,11 @@ def test_run_elevated_setup_helper_launches_python_module_with_runas(
 
     monkeypatch.setattr(mod.sys, "executable", r"C:\Python312\python.exe")
     monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+    monkeypatch.setattr(
+        mod,
+        "_validated_elevated_setup_target",
+        lambda payload: (Path(payload["markerPath"]), tmp_path),
+    )
 
     def fake_runas(*, executable, parameters, directory):
         launched["executable"] = executable
@@ -301,6 +340,11 @@ def test_run_elevated_setup_helper_launches_frozen_helper_without_python_module(
     )
     monkeypatch.setattr(mod.sys, "frozen", True, raising=False)
     monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+    monkeypatch.setattr(
+        mod,
+        "_validated_elevated_setup_target",
+        lambda payload: (Path(payload["markerPath"]), tmp_path),
+    )
 
     def fake_runas(*, executable, parameters, directory):
         launched["executable"] = executable
@@ -327,11 +371,122 @@ def test_runas_setup_helper_uses_hidden_window() -> None:
     assert "sw_shownormal" not in source
 
 
+def test_timeout_cleanup_uses_trusted_taskkill_tree(monkeypatch) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    calls = []
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return Completed()
+
+    monkeypatch.setattr(
+        mod,
+        "_trusted_windows_system_directory",
+        lambda: r"C:\Windows\System32",
+    )
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+
+    assert mod._terminate_setup_helper_tree(4312) == "taskkill_ok"
+    assert calls == [
+        (
+            [r"C:\Windows\System32\taskkill.exe", "/PID", "4312", "/T", "/F"],
+            {
+                "capture_output": True,
+                "text": True,
+                "check": False,
+                "timeout": mod.SETUP_HELPER_CLEANUP_TIMEOUT_MS / 1000,
+            },
+        )
+    ]
+
+
+def test_timeout_cleanup_reports_taskkill_failure_without_claiming_success(monkeypatch) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    class Completed:
+        returncode = 5
+        stdout = ""
+        stderr = "Access is denied"
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *_args, **_kwargs: Completed())
+
+    assert mod._terminate_setup_helper_tree(4312) == "taskkill_failed:5"
+
+
+def test_run_elevated_setup_helper_does_not_write_timeout_receipt(monkeypatch, tmp_path) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    marker = tmp_path / "setup_marker.json"
+    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+    monkeypatch.setattr(
+        mod,
+        "_validated_elevated_setup_target",
+        lambda payload: (Path(payload["markerPath"]), tmp_path),
+    )
+
+    def fake_runas(**_kwargs):
+        mod.write_setup_helper_report(marker, state="running")
+        raise OSError(
+            "windows_setup_helper_timeout: waited 120000ms; "
+            "cleanup_tree=taskkill_failed:5; cleanup_parent=terminate_ok; "
+            "cleanup_wait=exited"
+        )
+
+    monkeypatch.setattr(mod, "_shell_execute_runas_and_wait", fake_runas)
+
+    with pytest.raises(OSError, match="windows_setup_helper_timeout"):
+        mod.run_elevated_setup_helper(marker)
+
+    # The elevated helper owns this report.  The medium-integrity parent must
+    # not race a late ``running``/``ready`` write with a synthetic timeout.
+    assert mod.read_setup_helper_report(marker) == {"state": "running"}
+
+
+def test_trusted_taskkill_path_ignores_spoofed_systemroot(monkeypatch) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    monkeypatch.setenv("SystemRoot", r"C:\Users\attacker\fake-root")
+    monkeypatch.setattr(
+        mod,
+        "_trusted_windows_system_directory",
+        lambda: r"C:\Windows\System32",
+    )
+
+    assert mod._trusted_windows_taskkill_path() == r"C:\Windows\System32\taskkill.exe"
+
+
+def test_trusted_powershell_path_ignores_spoofed_systemroot(monkeypatch) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    monkeypatch.setenv("SystemRoot", r"C:\Users\attacker\fake-root")
+    monkeypatch.setattr(
+        mod,
+        "_trusted_windows_system_directory",
+        lambda: r"C:\Windows\System32",
+    )
+
+    assert mod._trusted_windows_powershell_path() == (
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    )
+
+
 def test_run_elevated_setup_helper_reports_nonzero_exit(monkeypatch, tmp_path) -> None:
     from opensquilla.sandbox.backend import windows_default_setup as mod
 
     monkeypatch.setattr(mod, "_shell_execute_runas_and_wait", lambda **kwargs: 9)
     monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+    monkeypatch.setattr(
+        mod,
+        "_validated_elevated_setup_target",
+        lambda payload: (Path(payload["markerPath"]), tmp_path),
+    )
 
     with pytest.raises(OSError, match="windows_setup_helper_failed: exit=9"):
         mod.run_elevated_setup_helper(tmp_path / "setup_marker.json")
@@ -346,7 +501,7 @@ def test_elevated_setup_helper_main_writes_failure_report(monkeypatch, tmp_path)
     payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
     monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
 
-    def fail_setup(path):
+    def fail_setup(path, **kwargs):
         raise OSError("Set-LocalUser access denied")
 
     monkeypatch.setattr(mod, "establish_windows_network_setup", fail_setup)
@@ -400,15 +555,16 @@ def test_elevated_setup_helper_accepts_desktop_profile_marker(
         locked_roots.extend(lease.roots)
 
     monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
-    monkeypatch.setattr(mod, "establish_windows_network_setup", lambda _path: network)
+    monkeypatch.setattr(mod, "establish_windows_network_setup", lambda _path, **kwargs: network)
     monkeypatch.setattr(mod, "lock_persistent_sandbox_dirs", fake_lock)
 
     assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 0
     assert mod.read_setup_marker(marker) is not None
-    assert mod.read_setup_helper_report(marker) == {
-        "state": "ready",
-        "detail": "setup_complete",
-    }
+    report = mod.read_setup_helper_report(marker)
+    assert report is not None
+    assert report["state"] == "ready"
+    assert report["detail"] == "setup_complete"
+    assert report["launcherPid"] == mod._decode_setup_helper_payload(payload)["launcherPid"]
     assert locked_roots == [
         desktop_home / "sandbox",
         desktop_home / "sandbox-secrets",
@@ -442,7 +598,7 @@ def test_elevated_setup_persists_rotated_identity_before_acl_repair(
     )
 
     monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
-    monkeypatch.setattr(mod, "establish_windows_network_setup", lambda _path: network)
+    monkeypatch.setattr(mod, "establish_windows_network_setup", lambda _path, **kwargs: network)
     monkeypatch.setattr(
         mod,
         "lock_persistent_sandbox_dirs",
@@ -511,9 +667,39 @@ def test_windows_setup_readiness_uses_validated_desktop_marker(
             wfp_rule_version=WFP_RULE_VERSION,
         ),
     )
-    monkeypatch.setattr(mod, "setup_marker_identity_ready", lambda _path: True)
+    monkeypatch.setattr(mod, "setup_marker_identity_ready", lambda _path, **kwargs: True)
 
     assert mod._windows_setup_is_ready(marker) is True
+
+
+def test_windows_setup_pending_marker_is_not_consumable(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+    from opensquilla.sandbox.backend.windows_default_network import (
+        FIREWALL_RULE_VERSION,
+        WFP_RULE_VERSION,
+        WindowsNetworkSetup,
+    )
+
+    marker = tmp_path / "sandbox" / "setup_marker.json"
+    mod.write_setup_marker(
+        marker,
+        network=WindowsNetworkSetup(
+            offline_user_sid="S-1-offline",
+            allowed_proxy_ports=(48123,),
+            allow_local_binding=False,
+            firewall_rule_version=FIREWALL_RULE_VERSION,
+            wfp_rule_version=WFP_RULE_VERSION,
+        ),
+        setup_state="pending",
+    )
+    monkeypatch.setattr(mod, "setup_marker_identity_ready", lambda _path, **kwargs: True)
+
+    assert mod.setup_marker_is_current(marker) is False
+    assert mod.setup_marker_proxy_allowlist_ready(marker, ports=(48123,)) is False
+    assert mod._windows_setup_is_ready(marker) is False
 
 
 def test_elevated_setup_helper_serializes_mutation_and_rechecks_readiness(
@@ -547,7 +733,7 @@ def test_elevated_setup_helper_serializes_mutation_and_rechecks_readiness(
     monkeypatch.setattr(
         mod,
         "establish_windows_network_setup",
-        lambda _path: (_ for _ in ()).throw(OSError("stop after ordering check")),
+        lambda _path, **kwargs: (_ for _ in ()).throw(OSError("stop after ordering check")),
     )
 
     assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 1
@@ -584,7 +770,7 @@ def test_elevated_setup_helper_skips_duplicate_mutation_after_wait(
     monkeypatch.setattr(
         mod,
         "establish_windows_network_setup",
-        lambda _path: (_ for _ in ()).throw(AssertionError("setup must not run twice")),
+        lambda _path, **kwargs: (_ for _ in ()).throw(AssertionError("setup must not run twice")),
     )
     monkeypatch.setattr(
         mod,
@@ -638,7 +824,7 @@ def test_windows_setup_process_lock_releases_named_mutex(monkeypatch, tmp_path) 
 
     assert [name for name, _args in calls] == ["create", "wait", "body", "release", "close"]
     mutex_name = calls[0][1][2]
-    assert mutex_name.startswith("Local\\OpenSquillaSandboxSetup-")
+    assert mutex_name == "Global\\OpenSquillaSandboxSetup-v1"
     assert calls[1][1] == (123, mod.SETUP_PROCESS_LOCK_TIMEOUT_MS)
 
 
@@ -778,6 +964,11 @@ def test_lock_revalidates_tree_before_each_recursive_acl_mutation(monkeypatch, t
         lambda command, **_kwargs: commands.append(command) or Completed(),
     )
     monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+    monkeypatch.setattr(
+        mod,
+        "_validated_elevated_setup_target",
+        lambda payload: (Path(payload["markerPath"]), tmp_path),
+    )
 
     mod.lock_persistent_sandbox_dirs(marker, offline_sid="S-1-offline")
 
@@ -811,6 +1002,11 @@ def test_lock_batches_existing_child_acl_resets(monkeypatch, tmp_path) -> None:
         lambda command, **_kwargs: commands.append(command) or Completed(),
     )
     monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+    monkeypatch.setattr(
+        mod,
+        "_validated_elevated_setup_target",
+        lambda payload: (Path(payload["markerPath"]), tmp_path),
+    )
 
     mod.lock_persistent_sandbox_dirs(marker, offline_sid="S-1-offline")
 
@@ -1011,14 +1207,27 @@ def test_run_elevated_setup_helper_includes_failure_report_detail(
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
     def fake_runas(**kwargs):
+        owner = mod._decode_setup_helper_payload(kwargs["parameters"].split()[-1])
         report_path.write_text(
-            json.dumps({"state": "failed", "detail": "Set-LocalUser access denied"}),
+            json.dumps(
+                {
+                    "state": "failed",
+                    "detail": "Set-LocalUser access denied",
+                    "launcherPid": owner["launcherPid"],
+                    "launcherCreated": owner["launcherCreated"],
+                }
+            ),
             encoding="utf-8",
         )
         return 1
 
     monkeypatch.setattr(mod, "_shell_execute_runas_and_wait", fake_runas)
     monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+    monkeypatch.setattr(
+        mod,
+        "_validated_elevated_setup_target",
+        lambda payload: (Path(payload["markerPath"]), tmp_path),
+    )
 
     with pytest.raises(OSError, match="Set-LocalUser access denied"):
         mod.run_elevated_setup_helper(marker)

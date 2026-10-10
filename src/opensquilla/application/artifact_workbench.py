@@ -415,11 +415,29 @@ class DocumentContentQuery:
 class AttachmentContentQuery:
     session_key: str
     sha256: str
+    message_id: str | None = None
+    attachment_index: int | None = None
+    revision: str | None = None
+    source: str | None = None
 
     def __post_init__(self) -> None:
         _identity(self.session_key, "session key")
-        if len(self.sha256) != 64:
+        if len(self.sha256) != 64 or any(char not in "0123456789abcdef" for char in self.sha256):
             raise ValueError("attachment digest must be a SHA-256 value")
+        if any(
+            value is not None
+            for value in (self.message_id, self.attachment_index, self.revision, self.source)
+        ):
+            _identity(self.message_id, "attachment message id")
+            _identity(self.revision, "attachment revision")
+            if self.source not in {"active", "compacted"}:
+                raise ValueError("attachment source is invalid")
+            if (
+                not isinstance(self.attachment_index, int)
+                or isinstance(self.attachment_index, bool)
+                or not 0 <= self.attachment_index < 16
+            ):
+                raise ValueError("attachment index is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,9 +466,10 @@ class WorkingFileMaterial:
 
 @dataclass(frozen=True, slots=True)
 class ContentMaterial:
-    path: Path
+    path: Path | None
     media_type: str
     filename: str | None = None
+    data: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)

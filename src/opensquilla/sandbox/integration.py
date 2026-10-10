@@ -854,14 +854,12 @@ async def _ensure_windows_proxy_allowlist_setup(
     if not _windows_process_is_admin():
         return False
     try:
-        from opensquilla.sandbox.setup_state import (
-            SandboxSetupState,
-            ensure_sandbox_setup,
-        )
+        from opensquilla.sandbox.setup_runtime import ensure_sandbox_setup_auto
+        from opensquilla.sandbox.setup_state import SandboxSetupState
     except Exception:
         return False
     try:
-        result = await ensure_sandbox_setup(getattr(runtime, "settings", None))
+        result = await ensure_sandbox_setup_auto(getattr(runtime, "settings", None))
     except Exception:
         return False
     return getattr(result, "state", None) is SandboxSetupState.READY

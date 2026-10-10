@@ -78,6 +78,35 @@ class TaskLifecycleEvent:
 TaskLifecycleListener = Callable[[TaskLifecycleEvent], Awaitable[None]]
 
 
+async def task_session_is_current(
+    session_source: Any,
+    *,
+    session_key: str,
+    session_id: str | None,
+    session_epoch: int | None,
+) -> bool:
+    """Fence a directory invalidation to its original session incarnation.
+
+    Read failures propagate so a persistence retry can retry the notification.
+    Missing or replaced sessions definitively retire the notification.
+    """
+    if (
+        not isinstance(session_id, str) or not session_id
+        or not isinstance(session_epoch, int) or isinstance(session_epoch, bool)
+        or session_epoch < 0
+    ):
+        return False
+    get_session = getattr(session_source, "get_session", None)
+    if not callable(get_session):
+        return False
+    node = await get_session(session_key)
+    return (
+        node is not None
+        and getattr(node, "session_id", None) == session_id
+        and getattr(node, "epoch", None) == session_epoch
+    )
+
+
 def _now_ms() -> int:
     return int(datetime.now(UTC).timestamp() * 1000)
 

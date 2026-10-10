@@ -1,8 +1,37 @@
 // @vitest-environment happy-dom
 
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { marked } from 'marked'
 
 import { useChatTextRendering } from './useChatTextRendering'
+
+afterEach(() => vi.restoreAllMocks())
+
+describe('useChatTextRendering failure isolation', () => {
+  it('keeps the complete real 8 MiB single-line body readable when the Markdown lexer overflows', () => {
+    const body = '0123456789abcdef'.repeat(512 * 1024)
+    const { renderMarkdown, markdownCacheStats } = useChatTextRendering()
+    const html = renderMarkdown(body)
+    const host = document.createElement('div')
+    host.innerHTML = html
+    expect(host.textContent === body).toBe(true)
+    expect(host.querySelector('.chat-markdown-plain')).not.toBeNull()
+    expect(markdownCacheStats()).toEqual({ entries: 0, bytes: 0 })
+    expect(renderMarkdown('**Next message**')).toContain('<strong>Next message</strong>')
+  })
+
+  it('falls back to inert original text with line breaks and Unicode, then restores normal highlighting', () => {
+    const { renderMarkdown } = useChatTextRendering()
+    vi.spyOn(marked, 'parse').mockImplementationOnce(() => { throw new RangeError('parser overflow') })
+    const body = '<img src=x onerror="alert(1)">\n<script>alert(2)</script>\n中🙂 & **bold** $x^2$'
+    const host = document.createElement('div')
+    host.innerHTML = renderMarkdown(body, { highlight: false })
+    expect(host.textContent).toBe(body)
+    expect(host.querySelector('img,script')).toBeNull()
+    expect(host.textContent).not.toContain('\uE000')
+    expect(renderMarkdown('```js\nconst answer = 42\n```')).toContain('hljs-keyword')
+  })
+})
 
 // URI sanitizer regressions run against the real browser DOM in
 // e2e/markdown-reference-safety.spec.ts; happy-dom's Node.prototype.nodeName

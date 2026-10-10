@@ -3,6 +3,16 @@ import {
   type TransportFlowUpdateParams,
   type TransportFlowUpdateResult,
 } from '@/contracts/generated/v4/transportFlowUpdate'
+import {
+  type SessionFlowUpdateV2Params,
+  type SessionFlowUpdateV2Result,
+} from '@/contracts/generated/v4/transportSessionFlowV2'
+import { validateSessionFlowUpdateV2Params, validateSessionFlowUpdateV2Result } from '@/contracts/generated/v4/transportSessionFlowV2Validators.mjs'
+import {
+  TRANSPORT_SESSION_FLOW_V2_CAPABILITY,
+  TRANSPORT_SESSION_FLOW_V2_METHOD,
+  TRANSPORT_SESSION_FLOW_V2_SCHEMA_CAPABILITY,
+} from '@/contracts/transportFlowCapabilities'
 import type { TransportFlowDirtyPayload } from '@/contracts/generated/v4/transportFlowDirty'
 import {
   validateTransportFlowUpdateParams,
@@ -11,7 +21,7 @@ import {
 import { validateTransportFlowDirtyPayload } from '@/contracts/generated/v4/transportFlowDirtyValidators.mjs'
 import type {
   TransportCallOptions, TransportConsumptionHandler, TransportDeliveryReceipt,
-  TransportEventHandler, TransportInstalledReceipt,
+  TransportEventHandler, TransportInstalledReceipt, TransportLaneRetireReceipt,
   TransportRecoveryResult,
 } from './transportTypes'
 
@@ -36,6 +46,11 @@ function sessionKey(payload: unknown): string | null {
   const value = data?.session_key ?? data?.sessionKey ?? data?.key
   return typeof value === 'string' && value.length > 0 && value.length <= 4096 ? value : null
 }
+
+// Keep every retired epoch that the Gateway can legally retain. Evicting an
+// epoch while its physical frames may still be in flight lets a late frame
+// look like a new lane and can release the replacement ledger incorrectly.
+const MAX_LANE_EPOCH_HISTORY = 16
 
 /** One per app transport. Receipt completion means domain ownership, not paint. */
 export class TransportFlowV4 {
@@ -69,8 +84,18 @@ export class TransportFlowV4 {
   private invalidations = new Map<string, number>()
   private globalInvalidation = 0
   private consumedCursors = new Map<string, { generation: string; sequence: number }>()
+  private consumedWaiters = new Map<string, Set<() => void>>()
   private consumers = new Map<number, { key: string | null; work: Promise<void> }>()
   private recoveryGlobal = false
+  private sessionFlowV2 = false
+  private isolateSessionFlowUpdates = false
+  private laneAck = new Map<string, number>()
+  private laneSentAck = new Map<string, number>()
+  private laneRetired = new Map<string, { finalId: number }>()
+  private pendingRetires = new Map<string, { receipt: TransportLaneRetireReceipt; promise: Promise<void>; resolve: () => void; reject: (error: Error) => void }>()
+  private laneEpochByKey = new Map<string, string>()
+  private laneEpochHistory = new Map<string, Set<string>>()
+  private laneByDelivery = new Map<number, { epoch: string; key: string }>()
   private subscriptions: (() => void)[] = []
 
   constructor(private readonly source: FlowSource) {
@@ -113,6 +138,8 @@ export class TransportFlowV4 {
       || flow.window_bytes !== 4 * 1024 * 1024) return
     this.epoch = flow.delivery_epoch
     this.generation = this.source.connectionGeneration
+    this.sessionFlowV2 = flow.capability === TRANSPORT_SESSION_FLOW_V2_CAPABILITY
+      || flow.capability === TRANSPORT_SESSION_FLOW_V2_SCHEMA_CAPABILITY
   }
 
   reset(): void {
@@ -144,7 +171,18 @@ export class TransportFlowV4 {
     this.globalInvalidation = 0
     this.consumers.clear()
     this.consumedCursors.clear()
+    this.consumedWaiters.clear()
     this.recoveryGlobal = false
+    this.sessionFlowV2 = false
+    this.isolateSessionFlowUpdates = false
+    this.laneAck.clear()
+    this.laneSentAck.clear()
+    this.laneRetired.clear()
+    for (const waiter of this.pendingRetires.values()) waiter.reject(new Error('Connection changed'))
+    this.pendingRetires.clear()
+    this.laneEpochByKey.clear()
+    this.laneEpochHistory.clear()
+    this.laneByDelivery.clear()
   }
 
   close(): void {
@@ -184,6 +222,51 @@ export class TransportFlowV4 {
     const receipt = this.receipt(meta.flow)
     if (!receipt || receipt.delivery_id <= this.ack || this.pending.has(receipt.delivery_id)
       || this.completed.some(([start, end]) => start <= receipt.delivery_id && receipt.delivery_id <= end)) return
+    if (this.sessionFlowV2) {
+      const lane = record(meta.session_flow_v2)
+      const connectionEpoch = lane?.connection_epoch
+      const subscriptionEpoch = lane?.subscription_epoch
+      const laneDelivery = lane?.delivery_id
+      if (connectionEpoch !== this.epoch || subscriptionEpoch === undefined
+        || typeof subscriptionEpoch !== 'string' || !subscriptionEpoch
+        || laneDelivery !== receipt.delivery_id) {
+        this.requireRecovery([], true)
+        return
+      }
+      const key = sessionKey(payload)
+      if (!key) {
+        this.requireRecovery([], true)
+        return
+      }
+      const retired = this.laneRetired.get(subscriptionEpoch)
+      if (retired) {
+        // Unsubscribe owns disposal of this lane. Frames already in the
+        // FIFO writer may arrive before its confirmation, but cannot reopen
+        // the old consumer or generate an ordinary consumption ACK.
+        if (receipt.delivery_id <= retired.finalId) this.markComplete(receipt)
+        else this.requireRecovery([key], false)
+        return
+      }
+      const knownEpochs = this.laneEpochHistory.get(key) ?? new Set<string>()
+      const priorEpoch = this.laneEpochByKey.get(key)
+      if (priorEpoch && priorEpoch !== subscriptionEpoch && knownEpochs.has(subscriptionEpoch)) {
+        // A frame from an already retired subscription arrived after its key
+        // was replaced. Keep it out of the replacement lane ledger.
+        this.requireRecovery([], true)
+        return
+      }
+      if (knownEpochs.size >= MAX_LANE_EPOCH_HISTORY && !knownEpochs.has(subscriptionEpoch)) {
+        // The server rejects a seventeenth retained epoch. Do not evict an
+        // older fence on the client: a late physical frame for that epoch
+        // must remain stale rather than being reclassified as a new lane.
+        this.requireRecovery([], true)
+        return
+      }
+      knownEpochs.add(subscriptionEpoch)
+      this.laneEpochHistory.set(key, knownEpochs)
+      this.laneEpochByKey.set(key, subscriptionEpoch)
+      this.laneByDelivery.set(receipt.delivery_id, { epoch: subscriptionEpoch, key })
+    }
     // A valid peer has at most 128 ordinary deliveries and one recovery piece.
     // Do not allocate an unbounded sparse ACK map for malformed peers.
     const highestComplete = this.completed[this.completed.length - 1]?.[1] ?? this.ack
@@ -206,7 +289,7 @@ export class TransportFlowV4 {
       this.requireRecovery(key ? [key] : [], !key)
     }, 100))
     const work = this.source.consumeEvent(event, payload, meta).then(result => {
-      if (!this.current(revision) || recoveryRequired) return
+      if (!this.current(revision) || recoveryRequired || !this.pending.has(receipt.delivery_id)) return
       if (result === 'dirty') {
         const key = sessionKey(payload)
         if (key) this.dirty.set(key, (this.dirty.get(key) ?? 0) + 1)
@@ -224,11 +307,13 @@ export class TransportFlowV4 {
             sequence: previous?.generation === data.stream_generation
               ? Math.max(previous.sequence, data.stream_seq as number) : data.stream_seq as number,
           })
+          for (const notify of this.consumedWaiters.get(key) ?? []) notify()
+          this.consumedWaiters.delete(key)
         }
       }
       this.markComplete(receipt)
     }, () => {
-      if (!this.current(revision) || recoveryRequired) return
+      if (!this.current(revision) || recoveryRequired || !this.pending.has(receipt.delivery_id)) return
       const timer = this.observations.get(receipt.delivery_id)
       if (timer !== undefined) clearTimeout(timer)
       this.observations.delete(receipt.delivery_id)
@@ -249,6 +334,15 @@ export class TransportFlowV4 {
     const receipt = this.receipt(value)
     if (!receipt || receipt.delivery_id <= this.ack) return
     this.pending.delete(receipt.delivery_id)
+    if (this.sessionFlowV2) {
+      const lane = this.laneByDelivery.get(receipt.delivery_id)
+      if (lane && !this.laneRetired.has(lane.epoch)) {
+        this.laneAck.set(lane.epoch, Math.max(
+          this.laneAck.get(lane.epoch) ?? 0, receipt.delivery_id,
+        ))
+      }
+      this.laneByDelivery.delete(receipt.delivery_id)
+    }
     const unowned = this.unowned.get(receipt.delivery_id)
     this.unowned.delete(receipt.delivery_id)
     if (unowned?.key) {
@@ -272,7 +366,7 @@ export class TransportFlowV4 {
     while (this.completed[0] && this.completed[0][0] <= this.ack + 1) {
       this.ack = Math.max(this.ack, this.completed.shift()![1])
     }
-    this.schedule(this.ack - this.sentAck >= 32 ? 0 : 50)
+    this.schedule(this.sessionFlowV2 ? 0 : (this.ack - this.sentAck >= 32 ? 0 : 50))
   }
 
   /** Staging frees the one recovery slot even when earlier ordinary ACKs wait. */
@@ -291,6 +385,50 @@ export class TransportFlowV4 {
     // an ACK whose reply was lost. Never lose that valid discard responsibility.
     void this.flush()
     return promise
+  }
+
+  /** Confirm retirement by epoch so a replacement with the same key stays independent. */
+  retireLane(receipt: TransportLaneRetireReceipt): Promise<void> {
+    if (!this.enabled || !this.sessionFlowV2 || receipt.connection_epoch !== this.epoch) {
+      return Promise.reject(new Error('Session lane is not current'))
+    }
+    const previous = this.pendingRetires.get(receipt.subscription_epoch)
+    if (previous && JSON.stringify(previous.receipt) === JSON.stringify(receipt)) return previous.promise
+    if (!previous && this.pendingRetires.size >= 16) {
+      return Promise.reject(new Error('Too many pending lane retire confirmations'))
+    }
+    previous?.reject(new Error('Lane retire confirmation superseded'))
+    let resolve!: () => void
+    let reject!: (error: Error) => void
+    const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no })
+    this.pendingRetires.set(receipt.subscription_epoch, { receipt, promise, resolve, reject })
+    this.laneRetired.set(receipt.subscription_epoch, {
+      finalId: receipt.final_published_id,
+    })
+    this.laneAck.delete(receipt.subscription_epoch)
+    this.laneSentAck.delete(receipt.subscription_epoch)
+    for (const [id, lane] of this.laneByDelivery) {
+      if (lane.epoch === receipt.subscription_epoch && id <= receipt.final_published_id) {
+        this.markComplete({ delivery_epoch: this.epoch!, delivery_id: id })
+      }
+    }
+    void this.flush()
+    return promise
+  }
+
+  private forgetRetiredLane(epoch: string): void {
+    this.laneRetired.delete(epoch)
+    this.laneAck.delete(epoch)
+    this.laneSentAck.delete(epoch)
+    // The retire reply follows this lane's physical frames on the same FIFO
+    // socket. A single-record stale reply also ends this old responsibility;
+    // it cannot invalidate an unrelated lane. Remaining local consumers are
+    // fenced by pending membership, not permanent epoch history.
+    for (const [key, epochs] of this.laneEpochHistory) {
+      epochs.delete(epoch)
+      if (!epochs.size) this.laneEpochHistory.delete(key)
+      if (this.laneEpochByKey.get(key) === epoch) this.laneEpochByKey.delete(key)
+    }
   }
 
   async resumeFlow(receipt: TransportInstalledReceipt): Promise<void> {
@@ -334,16 +472,38 @@ export class TransportFlowV4 {
   }
 
   async waitForConsumption(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void> {
+    const revision = this.revision
     // The FIFO proof follows its tail events. Capture the consumers already
     // dispatched at that point, never an unrelated session's pending consumer.
     await Promise.all([...this.consumers.entries()]
       .filter(([id, item]) => item.key === key && !this.unowned.has(id))
       .map(([, item]) => item.work))
     if (cursor && cursor.toSeq > cursor.fromSeq) {
-      const consumed = this.consumedCursors.get(key)
-      if (!consumed || consumed.generation !== cursor.streamGeneration || consumed.sequence < cursor.toSeq) {
+      // Recovery replay is deliberately delivered in bounded batches. The
+      // first batch ACK may cause the Gateway to enqueue the next one, so a
+      // single cursor sample would incorrectly report SNAPSHOT_STALE. Keep
+      // waiting for the authoritative final waterline while the connection
+      // remains current; the caller's outer budget bounds this loop.
+      const knownCursor = this.consumedCursors.get(key)
+      if ((!knownCursor || knownCursor.generation !== cursor.streamGeneration)
+        && !this.resumes.has(key)
+        && ![...this.consumers.values()].some(item => item.key === key)) {
         throw Object.assign(new Error('Snapshot replay tail was not consumed.'), { code: 'SNAPSHOT_STALE' })
       }
+      for (let attempt = 0; attempt < 140; attempt++) {
+        const consumed = this.consumedCursors.get(key)
+        if (consumed?.generation === cursor.streamGeneration && consumed.sequence >= cursor.toSeq) return
+        if (!this.current(revision)) throw Object.assign(new Error('Snapshot replay tail was not consumed.'), { code: 'SNAPSHOT_STALE' })
+        let notify!: () => void
+        const notified = new Promise<void>(resolve => { notify = resolve })
+        const waiters = this.consumedWaiters.get(key) ?? new Set<() => void>()
+        waiters.add(notify)
+        this.consumedWaiters.set(key, waiters)
+        await Promise.race([notified, new Promise<void>(resolve => setTimeout(resolve, 50))])
+        waiters.delete(notify)
+        if (!waiters.size) this.consumedWaiters.delete(key)
+      }
+      throw Object.assign(new Error('Snapshot replay tail was not consumed.'), { code: 'SNAPSHOT_STALE' })
     }
   }
 
@@ -504,12 +664,146 @@ export class TransportFlowV4 {
     this.timer = setTimeout(() => { this.timer = null; void this.flush() }, delay)
   }
 
+  private async flushSessionFlowV2(): Promise<void> {
+    if (!this.enabled || this.inFlight || !this.sessionFlowV2) return
+    let consumed = [...this.laneAck.entries()]
+      .filter(([lane, id]) => !this.laneRetired.has(lane) && id > (this.laneSentAck.get(lane) ?? 0))
+      .slice(0, 16)
+      .map(([subscription_epoch, through_delivery_id]) => ({
+        subscription_epoch, through_delivery_id,
+      }))
+    let staged = [...this.staged.keys()].slice(0, 16).map(delivery_id => ({
+      delivery_epoch: this.epoch!, delivery_id,
+    }))
+    let discarded = [...this.pendingRetires.values()].slice(0, 16).map(({ receipt }) => ({
+      subscription_epoch: receipt.subscription_epoch,
+      retire_token: receipt.retire_token,
+      final_published_id: receipt.final_published_id,
+    }))
+    // A batch-level stale error does not identify the failed record. Retry
+    // individual responsibilities only on this exceptional path; never
+    // abandon another lane's valid ACK, staging or retire confirmation.
+    if (this.isolateSessionFlowUpdates) {
+      if (discarded.length) { discarded = discarded.slice(0, 1); staged = []; consumed = [] }
+      else if (staged.length) { staged = staged.slice(0, 1); consumed = [] }
+      else consumed = consumed.slice(0, 1)
+    }
+    if (!consumed.length && !staged.length && !discarded.length) return
+    const revision = this.revision
+    const params: SessionFlowUpdateV2Params = {
+      connection_epoch: this.epoch!,
+      ...(consumed.length
+        ? { consumed: consumed as SessionFlowUpdateV2Params['consumed'] }
+        : {}),
+      ...(staged.length
+        ? { staged_recovery: staged as SessionFlowUpdateV2Params['staged_recovery'] }
+        : {}),
+      ...(discarded.length
+        ? { discarded_lanes: discarded as SessionFlowUpdateV2Params['discarded_lanes'] }
+        : {}),
+    }
+    if (!validateSessionFlowUpdateV2Params(params)) return
+    this.inFlight = true
+    try {
+      const result = await this.source.request<SessionFlowUpdateV2Result>(
+        TRANSPORT_SESSION_FLOW_V2_METHOD, { ...params }, {
+          expectedGeneration: this.generation, timeoutMs: 7_000,
+          timeoutAction: 'reject', abortAction: 'reject',
+        },
+      )
+      if (!this.current(revision) || !validateSessionFlowUpdateV2Result(result)
+        || result.connection_epoch !== this.epoch) throw new Error('Invalid session flow v2 reply')
+      for (const item of consumed) {
+        const acknowledged = result.consumed.find(
+          value => value.subscription_epoch === item.subscription_epoch,
+        )
+        if (acknowledged && acknowledged.through_delivery_id >= item.through_delivery_id
+          && !this.laneRetired.has(item.subscription_epoch)) {
+          this.laneSentAck.set(item.subscription_epoch, acknowledged.through_delivery_id)
+        }
+      }
+      for (const item of staged) {
+        const acknowledged = result.staged_recovery.some(
+          value => value.delivery_epoch === item.delivery_epoch && value.delivery_id >= item.delivery_id,
+        )
+        if (acknowledged) {
+          this.staged.get(item.delivery_id)?.resolve()
+          this.staged.delete(item.delivery_id)
+        }
+      }
+      for (const item of discarded) {
+        const acknowledged = result.discarded_lanes.some(value =>
+          value.subscription_epoch === item.subscription_epoch
+          && value.retire_token === item.retire_token
+          && value.final_published_id >= item.final_published_id)
+        if (acknowledged) {
+          this.pendingRetires.get(item.subscription_epoch)?.resolve()
+          this.pendingRetires.delete(item.subscription_epoch)
+          this.forgetRetiredLane(item.subscription_epoch)
+        }
+      }
+    } catch (error) {
+      if (this.current(revision)) {
+        const failure = record(error)
+        const code = failure?.code ?? record(failure?.data)?.code
+        if (code === 'LANE_RETIRED' || code === 'FLOW_STALE' || code === 'NOT_FOUND') {
+          if (consumed.length + staged.length + discarded.length > 1) {
+            this.isolateSessionFlowUpdates = true
+            return
+          }
+          // Only a single-record failure identifies which responsibility is
+          // stale. Other queued records remain owned and will be retried.
+          for (const item of consumed) {
+            this.laneAck.delete(item.subscription_epoch)
+            this.laneSentAck.delete(item.subscription_epoch)
+          }
+          for (const item of staged) {
+            this.staged.get(item.delivery_id)?.reject(
+              error instanceof Error ? error : new Error(String(code)),
+            )
+            this.staged.delete(item.delivery_id)
+          }
+          for (const item of discarded) {
+            this.pendingRetires.get(item.subscription_epoch)?.reject(
+              error instanceof Error ? error : new Error(String(code)),
+            )
+            this.pendingRetires.delete(item.subscription_epoch)
+            this.forgetRetiredLane(item.subscription_epoch)
+          }
+        } else this.schedule(1000)
+      }
+    } finally {
+      if (this.current(revision)) {
+        this.inFlight = false
+        if ([...this.laneAck.entries()].some(([lane, id]) => id > (this.laneSentAck.get(lane) ?? 0))
+          || this.staged.size || this.pendingRetires.size) this.schedule(this.staged.size ? 0 : 50)
+        else {
+          this.isolateSessionFlowUpdates = false
+          if (this.dirty.size || this.resumes.size) this.schedule(0)
+        }
+      }
+    }
+  }
+
   private async flush(): Promise<void> {
     if (!this.enabled || this.inFlight) return
-    if (this.ack === this.sentAck && !this.dirty.size && !this.resumes.size && !this.staged.size) return
+    const hasSessionLaneWork = this.sessionFlowV2 && (
+      [...this.laneAck.entries()].some(([lane, id]) => id > (this.laneSentAck.get(lane) ?? 0))
+      || this.staged.size > 0 || this.pendingRetires.size > 0
+    )
+    if (hasSessionLaneWork) {
+      await this.flushSessionFlowV2()
+      return
+    }
+    // v2 owns ordinary credit release per subscription lane.  Dirty and
+    // snapshot-installation records still use the v1 recovery fields for
+    // compatibility, but never replay the global cumulative ACK.
+    if (this.sessionFlowV2 && !this.dirty.size && !this.resumes.size) return
+    if (!this.sessionFlowV2 && this.ack === this.sentAck
+      && !this.dirty.size && !this.resumes.size && !this.staged.size) return
     const revision = this.revision
     const modern = this.source.supportsRecovery?.() === true
-    const hasCredit = this.ack !== this.sentAck || this.staged.size > 0
+    const hasCredit = (!this.sessionFlowV2 && this.ack !== this.sentAck) || this.staged.size > 0
     // Give pending invalidation a turn after one credit batch even while
     // tokens keep arriving. Its stale ACK cannot consume any new credit.
     const dirtyOnly = modern && this.dirty.size > 0 && (!hasCredit || this.preferDirty)
@@ -520,7 +814,8 @@ export class TransportFlowV4 {
     const resumes = dirtyOnly ? [] : [...this.resumes.values()].slice(0, 1).map(waiter => waiter.receipt)
     const staged = dirtyOnly ? [] : [...this.staged.keys()].slice(0, 1)
     const params: TransportFlowUpdateParams = {
-      delivery_epoch: this.epoch!, ack_delivery_id: dirtyOnly ? this.sentAck : this.ack,
+      delivery_epoch: this.epoch!,
+      ack_delivery_id: dirtyOnly || this.sessionFlowV2 ? this.sentAck : this.ack,
       ...(keys.length ? { dirty_keys: keys } : {}),
       ...(resumes.length ? { resume: [resumes[0]] as [TransportInstalledReceipt] } : {}),
       ...(staged.length ? { staged_delivery_ids: [staged[0]] as [number] } : {}),

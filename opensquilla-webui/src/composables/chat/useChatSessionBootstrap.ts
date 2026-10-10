@@ -46,6 +46,7 @@ export interface SessionBootstrapRun {
 
 export interface UseChatSessionBootstrapOptions {
   sessionKey: Ref<string>
+  isProvisionalDraft?: () => boolean
   sessionReadLifecycle: SessionReadLifecycle
   loadHistory: (
     context: SessionBootstrapPhaseContext,
@@ -314,6 +315,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     const run = ownership.start(key, includeHistory, token => ({
       lease: options.sessionReadLifecycle.open({
         sessionKey: key,
+        ...(options.isProvisionalDraft?.() ? { provisionalDraft: true } : {}),
         includeInitialHistory: includeHistory,
       }),
       history: historyRuntime(token.deadlineAt),

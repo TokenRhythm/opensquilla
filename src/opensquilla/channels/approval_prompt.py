@@ -148,6 +148,38 @@ def bind_short_code(
             return code
 
 
+async def bind_short_code_async(
+    approval_id: str,
+    *,
+    namespace: str,
+    session_key: str,
+    owner_sender_id: str,
+    origin_channel_name: str = "",
+    origin_channel_id: str = "",
+    origin_thread_id: str = "",
+) -> str:
+    """Async channel binding for Gateway notification tasks."""
+    from opensquilla.gateway.approval_queue import get_approval_queue
+
+    queue = get_approval_queue()
+    existing = await queue.channel_code_for_approval_async(approval_id)
+    if existing is not None:
+        return existing
+    while True:
+        code = _mint_code()
+        if await queue.bind_channel_code_async(
+            code,
+            approval_id=approval_id,
+            namespace=namespace,
+            session_key=session_key,
+            owner_sender_id=owner_sender_id,
+            origin_channel_name=origin_channel_name,
+            origin_channel_id=origin_channel_id,
+            origin_thread_id=origin_thread_id,
+        ):
+            return code
+
+
 def resolve_short_code(code: str) -> _CodeBinding | None:
     """Look up a code's binding, or ``None`` for an unknown/expired code."""
     from opensquilla.gateway.approval_queue import get_approval_queue
@@ -167,11 +199,42 @@ def resolve_short_code(code: str) -> _CodeBinding | None:
     )
 
 
+async def resolve_short_code_async(code: str) -> _CodeBinding | None:
+    """Async channel-code lookup for Gateway channel dispatch."""
+    from opensquilla.gateway.approval_queue import get_approval_queue
+
+    raw = await get_approval_queue().resolve_channel_code_async(normalize_code(code))
+    if raw is None:
+        return None
+    return _CodeBinding(
+        approval_id=raw["approval_id"],
+        namespace=raw["namespace"],
+        session_key=raw["session_key"],
+        owner_sender_id=raw["owner_sender_id"],
+        origin_channel_name=raw["origin_channel_name"],
+        origin_channel_id=raw["origin_channel_id"],
+        origin_thread_id=raw["origin_thread_id"],
+        approver_policy=raw["approver_policy"],
+    )
+
+
 def release_short_code(approval_id: str) -> None:
     """Drop the binding for a resolved approval (best-effort, idempotent)."""
     from opensquilla.gateway.approval_queue import get_approval_queue
 
     get_approval_queue().release_channel_code(approval_id)
+
+
+async def release_short_code_async(approval_id: str) -> None:
+    """Drop a binding through the Gateway's serialized SQLite worker.
+
+    Resolution notifications are delivered on the Gateway event loop.  Keep
+    that path on the same async queue owner as bind/resolve so cleanup cannot
+    race another worker transaction on the shared connection.
+    """
+    from opensquilla.gateway.approval_queue import get_approval_queue
+
+    await get_approval_queue().release_channel_code_async(approval_id)
 
 
 def reset_short_codes() -> None:

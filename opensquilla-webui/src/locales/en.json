@@ -1,4 +1,8 @@
 {
+  "historyContent": {
+    "detailsPreview": "Some long reasoning and tool details are shown as previews.",
+    "unavailable": "Only a preview is currently shown. The full message is temporarily unavailable."
+  },
   "processes": {
     "title": "Background processes",
     "runningCount": "{count} running",
@@ -671,6 +675,7 @@
         "title": "Set up Safe mode",
         "description": "OpenSquilla needs one administrator approval to create an isolated account and configure file and network protection. This is only needed for first-time setup or repair.",
         "descriptionWithDuration": "OpenSquilla needs one administrator approval to create an isolated account and configure protection. First-time setup normally takes about 20–30 seconds. Keep OpenSquilla open during setup.",
+        "repairIdentityDescription": "The saved sandbox sign-in is no longer valid. Continuing will repair the internal sandbox account and may require other OpenSquilla profiles to prepare Safe again. Your Windows sign-in password will not change.",
         "continue": "Continue",
         "configuring": "Configuring…",
         "requestingApproval": "Confirm the Windows prompt to continue.",
@@ -2955,6 +2960,7 @@
     },
     "jobs": {
       "errLoad": "Failed to load cron jobs",
+      "waitingForCapacity": "Waiting for available capacity. Retrying automatically.",
       "noUpcomingRuns": "no upcoming runs",
       "toastPaused": "Job paused",
       "toastResumed": "Job resumed",

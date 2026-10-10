@@ -148,7 +148,10 @@ methods = (
 assert rpc_chat._turn_admission_adapter_factory is rpc_sessions.build_gateway_turn_admission_adapter
 registry = get_dispatcher()
 # Includes durable receipts and execution logs after workflow and agent admin retirement.
-assert len(registry.list_methods()) == 269
+# The v2 bounded history/read contracts add five deliberate production
+# methods; keep the exact count so an unrelated RPC cannot slip into the
+# registry during the refactor.
+assert len(registry.list_methods()) == 275
 assert registry.get_entry("router.feedback.submit") is None
 assert registry.get_entry("router.selflearning.status") is None
 assert registry.get_entry("workspaces.references.read") is not None

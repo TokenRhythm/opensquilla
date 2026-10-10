@@ -8,6 +8,7 @@ import {
   optionalSessionRpcAllowed,
   optionalSessionReadOptions,
   primeSessionBootstrapAdmission,
+  registerSessionBootstrapAdmissionOwner,
 } from './sessionBootstrapAdmission'
 
 afterEach(() => {
@@ -49,5 +50,34 @@ describe('session bootstrap admission', () => {
     expect(optionalSessionRpcAllowed.value).toBe(true)
     clearPrimedSessionBootstrapAdmission()
     expect(optionalSessionRpcAllowed.value).toBe(true)
+  })
+
+  it('does not prime over a retained view and restores priming after its disposal', () => {
+    const dispose = registerSessionBootstrapAdmissionOwner()
+    try {
+      primeSessionBootstrapAdmission()
+      expect(optionalSessionRpcAllowed.value).toBe(true)
+      const releaseBootstrap = claimSessionBootstrapAdmission()
+      expect(optionalSessionRpcAllowed.value).toBe(false)
+      primeSessionBootstrapAdmission()
+      releaseBootstrap()
+      expect(optionalSessionRpcAllowed.value).toBe(true)
+    } finally { dispose() }
+    dispose()
+    primeSessionBootstrapAdmission()
+    expect(optionalSessionRpcAllowed.value).toBe(false)
+  })
+
+  it('retiring an older view does not remove a newer view owner', () => {
+    const older = registerSessionBootstrapAdmissionOwner()
+    const newer = registerSessionBootstrapAdmissionOwner()
+    try {
+      older()
+      older()
+      primeSessionBootstrapAdmission()
+      expect(optionalSessionRpcAllowed.value).toBe(true)
+    } finally { newer() }
+    primeSessionBootstrapAdmission()
+    expect(optionalSessionRpcAllowed.value).toBe(false)
   })
 })

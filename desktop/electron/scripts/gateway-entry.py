@@ -330,6 +330,11 @@ if __name__ == "__main__":
 
         raise SystemExit(elevated_setup_helper_main(sys.argv[1:]))
 
+    if len(sys.argv) == 3 and sys.argv[1] == "--windows-setup-launcher":
+        from opensquilla.sandbox.backend.windows_setup_process import setup_launcher_main
+
+        raise SystemExit(setup_launcher_main(sys.argv[1:]))
+
     from opensquilla.startup_timing import startup_phase_end, startup_phase_start
 
     _cli_import_started = startup_phase_start("cli_import")

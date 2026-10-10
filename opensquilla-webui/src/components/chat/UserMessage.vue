@@ -98,23 +98,43 @@
       <div v-if="message.attachments?.length" class="msg-attachments">
         <template v-for="attachment in message.attachments" :key="attachment.renderKey">
           <span
-            v-if="!attachment.workspaceFile && isImageDisplayAttachment(attachment) && (attachment.dataUrl || attachment.data)"
+            v-if="!attachment.workspaceFile && isImageDisplayAttachment(attachment) && (attachment.dataUrl || attachment.data || remoteImagePreview(attachment))"
             class="msg-file-resource"
           >
             <button
               type="button"
               class="msg-thumb-button"
+              :ref="el => observeAttachmentPreview(attachment, el)"
               :title="attachmentPrimaryActionLabel(attachment)"
               :aria-label="attachmentPrimaryActionLabel(attachment)"
+              :aria-busy="attachmentPreviewPending(attachment)"
               @click.stop="previewImage(attachment, $event)"
             >
               <img
+                v-if="attachmentImageSrc(attachment)"
                 class="msg-thumb"
                 :src="attachmentImageSrc(attachment)"
                 :alt="attachment.name"
+                decoding="async"
               />
+              <span v-else class="msg-file-chip" role="status">
+                <span v-if="attachmentPreviewPending(attachment)" class="spinner msg-file-chip__spinner" aria-hidden="true" />
+                <Icon v-else name="image" :size="16" />
+                <span class="msg-file-chip__body">
+                  <span class="msg-file-chip__name">{{ attachment.name }}</span>
+                  <span class="msg-file-chip__meta">{{ attachmentPreviewFailed(attachment) ? t('chat.previewFailedShort') : t('chat.loadingPreview') }}</span>
+                </span>
+              </span>
             </button>
             <span v-if="!shareMode" class="msg-file-resource__actions">
+              <button
+                v-if="attachmentPreviewFailed(attachment)"
+                type="button"
+                :aria-label="t('chat.retryPreviewFor', { title: attachment.name })"
+                @click.stop="attachmentPreviewController(attachment)?.retry()"
+              >
+                <Icon name="refresh" :size="14" />
+              </button>
               <ImageCopyActions :source="{ kind: 'attachment', attachment }" :session-key="sessionKey" />
               <button
                 type="button"
@@ -172,15 +192,15 @@
               >
                 <Icon name="download" :size="14" />
               </button>
-              <span
-                v-if="attachmentUnavailableReason(attachment)"
-                class="msg-file-resource__unavailable"
-                data-testid="attachment-workbench-unavailable"
-                role="status"
-              >
-                {{ attachmentUnavailableReason(attachment) }}
-              </span>
             </span>
+          </span>
+          <span
+            v-if="!shareMode && attachmentUnavailableReason(attachment)"
+            class="msg-file-resource__unavailable"
+            data-testid="attachment-workbench-unavailable"
+            role="status"
+          >
+            {{ attachmentUnavailableReason(attachment) }}
           </span>
         </template>
       </div>
@@ -249,7 +269,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { computed, inject, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import TurnOutcomeStatus from '@/components/chat/TurnOutcomeStatus.vue'
@@ -264,7 +284,8 @@ import type {
 import { promptAnnotationTargetLabel } from '@/utils/chat/promptAnnotationPresentation'
 import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
-import { isImageDisplayAttachment } from '@/utils/chat/attachments'
+import { isImageAttachmentMime, isImageDisplayAttachment } from '@/utils/chat/attachments'
+import { ARTIFACT_WORKBENCH_KEY, type ArtifactPreviewController } from '@/modules/artifactWorkbench'
 import { fileTypeLabel } from '@/utils/fileType'
 import { localPathName, localPathPresentation } from '@/types/localPathReferences'
 import {
@@ -278,6 +299,7 @@ import {
 } from '@/workbench/resourceCapabilityPresentation'
 
 const { t } = useI18n()
+const artifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY, null)
 
 const props = defineProps<{
   message: ChatRenderedMessage
@@ -381,6 +403,8 @@ watch(
 
 onBeforeUnmount(() => {
   if (steerWaitDetailTimer !== undefined) clearTimeout(steerWaitDetailTimer)
+  for (const controller of attachmentPreviews.values()) controller.dispose()
+  attachmentPreviews.clear()
 })
 
 const steerStatusLabel = computed(() => {
@@ -401,6 +425,76 @@ const steerStatusLabel = computed(() => {
 const downloadingAttachments = reactive(new Set<string>())
 const failedDownloads = reactive(new Set<string>())
 
+// Share the existing lazy, concurrency-limited preview lifecycle. Attachment
+// bytes still go through its scoped, bounded content port; never put a remote
+// download URL directly into an image element.
+const attachmentPreviews = new Map<string, ArtifactPreviewController>()
+const IMAGE_PREVIEW_MAX_BYTES = 5 * 1024 * 1024 // Same ceiling as uploaded images.
+
+function remoteImagePreview(attachment: DisplayAttachment): boolean {
+  return Boolean(artifactWorkbench && !attachment.workspaceFile
+    && isImageDisplayAttachment(attachment) && !attachment.data && !attachment.dataUrl
+    && attachment.download_url)
+}
+
+function attachmentPreviewKey(attachment: DisplayAttachment): string {
+  return JSON.stringify([props.sessionKey, attachment.renderKey, attachment.download_url, attachment.sha256_ref])
+}
+
+function attachmentPreviewController(attachment: DisplayAttachment): ArtifactPreviewController | undefined {
+  if (!remoteImagePreview(attachment) || !artifactWorkbench) return undefined
+  const key = attachmentPreviewKey(attachment)
+  let controller = attachmentPreviews.get(key)
+  if (!controller) {
+    const sessionKey = props.sessionKey
+    controller = artifactWorkbench.previews.create({
+      fullSize: false,
+      maxBytes: IMAGE_PREVIEW_MAX_BYTES,
+      loadBlob: async signal => {
+        const result = await artifactWorkbench.content.fetchAttachment(attachment, {
+          sessionKey, signal, maxBytes: IMAGE_PREVIEW_MAX_BYTES,
+        })
+        if (!result.ok) throw new Error(result.message)
+        return result.blob
+      },
+      acceptBlob: blob => isImageAttachmentMime(blob.type),
+    })
+    attachmentPreviews.set(key, controller)
+  }
+  return controller
+}
+
+function observeAttachmentPreview(attachment: DisplayAttachment, element: unknown) {
+  if (element instanceof Element) {
+    const controller = attachmentPreviewController(attachment)
+    // Ref callbacks also run on state-driven rerenders. Failed previews wait
+    // for the existing explicit Retry action instead of starting a fetch loop.
+    if (controller?.state.value === 'idle') controller.observe(element)
+  } else attachmentPreviews.get(attachmentPreviewKey(attachment))?.observe(null)
+}
+
+function attachmentPreviewFailed(attachment: DisplayAttachment): boolean {
+  const state = attachmentPreviewController(attachment)?.state.value
+  return state === 'error' || state === 'timeout'
+}
+
+function attachmentPreviewPending(attachment: DisplayAttachment): boolean {
+  const state = attachmentPreviewController(attachment)?.state.value
+  return state === 'idle' || state === 'loading'
+}
+
+watch(
+  () => (props.message.attachments || []).filter(remoteImagePreview).map(attachmentPreviewKey),
+  keys => {
+    const retained = new Set(keys)
+    for (const [key, controller] of attachmentPreviews) {
+      if (retained.has(key)) continue
+      controller.dispose()
+      attachmentPreviews.delete(key)
+    }
+  },
+)
+
 function onMessageClick(event: MouseEvent) {
   if (!props.shareMode) return
   if ((event.target as HTMLElement | null)?.closest('button,a,input,textarea,select')) return
@@ -408,7 +502,9 @@ function onMessageClick(event: MouseEvent) {
 }
 
 function attachmentImageSrc(attachment: DisplayAttachment): string {
-  return attachment.dataUrl || `data:${attachment.mime || 'image/png'};base64,${attachment.data || ''}`
+  if (attachment.dataUrl) return attachment.dataUrl
+  if (attachment.data) return `data:${attachment.mime || 'image/png'};base64,${attachment.data}`
+  return attachmentPreviewController(attachment)?.objectUrl.value || ''
 }
 
 function attachmentDownloadLabel(attachment: DisplayAttachment): string {
@@ -489,7 +585,7 @@ function attachmentTarget(attachment: DisplayAttachment): string {
 }
 
 function attachmentUnavailableReason(attachment: DisplayAttachment): string {
-  return attachmentOpenReason(attachment)
+  return attachment.missingReason ? t('chat.previewFailedShort') : attachmentOpenReason(attachment)
 }
 
 function previewImage(attachment: DisplayAttachment, event: MouseEvent) {

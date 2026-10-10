@@ -1,4 +1,8 @@
 {
+  "historyContent": {
+    "detailsPreview": "Einige lange Überlegungen und Werkzeugdetails werden als Vorschau angezeigt.",
+    "unavailable": "Derzeit wird nur eine Vorschau angezeigt. Der vollständige Text ist vorübergehend nicht verfügbar."
+  },
   "processes": {
     "title": "Hintergrundprozesse",
     "runningCount": "{count} aktiv",
@@ -657,6 +661,7 @@
       },
       "setup": {
         "title": "Safe-Modus einrichten", "description": "OpenSquilla benötigt einmalig eine Administratorfreigabe, um ein isoliertes Konto sowie Datei- und Netzwerkschutz einzurichten.", "descriptionWithDuration": "OpenSquilla benötigt einmalig eine Administratorfreigabe, um ein isoliertes Konto und Schutzmaßnahmen einzurichten. Die Ersteinrichtung dauert normalerweise etwa 20–30 Sekunden. Lassen Sie OpenSquilla geöffnet.",
+        "repairIdentityDescription": "Die gespeicherten Sandbox-Anmeldedaten sind ungültig. Beim Fortfahren wird das interne Sandbox-Konto repariert. Andere OpenSquilla-Profile müssen Safe eventuell erneut einrichten. Ihr Windows-Anmeldekennwort bleibt unverändert.",
         "continue": "Weiter", "configuring": "Wird eingerichtet…", "requestingApproval": "Bestätigen Sie die Windows-Abfrage, um fortzufahren.", "configuringProtection": "OpenSquilla richtet den Safe-Modus fertig ein. Lassen Sie die App geöffnet.", "takingLonger": "Die Ersteinrichtung kann einige Minuten dauern. Die Überprüfung läuft automatisch.", "elapsed": "{seconds} s vergangen", "cancelled": "Einrichtung abgebrochen. Der Vollzugriff bleibt unverändert; Sie können es jederzeit erneut versuchen.",
         "failed": "Safe-Modus konnte nicht eingerichtet werden. Der Vollzugriff bleibt unverändert.", "verificationFailed": "Die Einrichtung ist fertig, aber die Sicherheitsprüfung ist fehlgeschlagen. Der Vollzugriff bleibt unverändert.",
         "runInBackground": "Im Hintergrund einrichten", "readyToast": "Der Safe-Modus ist bereit.", "failedToast": "Die Einrichtung des Safe-Modus konnte nicht abgeschlossen werden. Versuchen Sie es erneut über den Safe-Modus."
@@ -2872,6 +2877,7 @@
     },
     "jobs": {
       "errLoad": "Cron-Jobs konnten nicht geladen werden",
+      "waitingForCapacity": "Warten auf verfügbare Kapazität. Der Versuch wird automatisch wiederholt.",
       "noUpcomingRuns": "keine bevorstehenden Läufe",
       "toastPaused": "Job pausiert",
       "toastResumed": "Job fortgesetzt",

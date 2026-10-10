@@ -615,7 +615,7 @@ describe('ChatMessageList long-history virtualization', () => {
 
     window.localStorage.setItem('opensquilla.chat.virtualizeHistory', '0')
     const rollback = await mountList()
-    expect(rollback.host.querySelectorAll('[data-testid="chat-message-row"]')).toHaveLength(200)
+    expect(rollback.host.querySelectorAll('[data-testid="chat-message-row"]')).toHaveLength(120)
     expect(rollback.api.isVirtualized()).toBe(false)
   })
 
@@ -629,9 +629,9 @@ describe('ChatMessageList long-history virtualization', () => {
     expect(bottom.style.height).toBe('24px')
   })
 
-  it('renders full history for legacy embedders without a scroll container', async () => {
+  it('caps history for legacy embedders without a scroll container', async () => {
     const { host, api } = await mountList({ withoutScrollContainer: true })
-    expect(host.querySelectorAll('[data-testid="chat-message-row"]')).toHaveLength(200)
+    expect(host.querySelectorAll('[data-testid="chat-message-row"]')).toHaveLength(120)
     expect(api.isVirtualized()).toBe(false)
   })
 

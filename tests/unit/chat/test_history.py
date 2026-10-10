@@ -1,10 +1,107 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from opensquilla.chat.history import transcript_entries_to_chat_messages
+from opensquilla.content_reader import MAX_DISPLAY_CONTENT_BYTES
+
+
+@pytest.mark.parametrize("count", [100, 300])
+def test_bounded_history_preserves_many_tool_identities_and_control_metadata(count):
+    segments = [{
+        "type": "tool_use", "tool_use_id": f"call-{index}-" + "a" * 100,
+        "name": "diagnostic_" + "tool" * 20, "status": "completed",
+        "activity_order": index + 1, "stream_seq": index + 1000,
+        "tool_presentation": {"operationKey": "diagnostic.test", "argumentDisplay": "all"},
+        "input": {"query": "small", "count": index, "enabled": True},
+    } for index in range(count)]
+    entry = SimpleNamespace(
+        role="assistant", content="answer", tool_calls=segments,
+        turn_usage={"input_tokens": 12345, "output_tokens": 67890, "model": "model"},
+        turn_context={"turn_id": "turn", "input_mode": "normal"},
+    )
+    legacy = transcript_entries_to_chat_messages([entry])[0]
+    bounded = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+    assert bounded["tool_calls"] == legacy["tool_calls"]
+    assert bounded["usage"] == legacy["usage"]
+    assert bounded["turn_context"] == legacy["turn_context"]
+    assert "historyPayloadPreview" not in bounded
+    assert entry.tool_calls == segments
+
+
+def test_bounded_history_previews_nested_details_without_rewriting_segment_facts():
+    text = "🙂正文" * 10000
+    reasoning = "🙂思考" * 10000
+    segments = [
+        {"type": "text", "text": text, "presentation": "intermediate", "activity_order": 2},
+        {"type": "tool_use", "tool_use_id": "call", "name": "diagnostic_tool", "activity_order": 3,
+         "input": {"nested": {"body": "\x00" * 200000}, "number": 123, "enabled": True}},
+        {"type": "tool_result", "tool_use_id": "call", "name": "diagnostic_tool",
+         "activity_order": 4,
+         "content": [{"type": "text", "text": "result" * 100000}], "is_error": False},
+        {"type": "text", "text": text, "presentation": "answer", "activity_order": 5},
+    ]
+    entry = SimpleNamespace(role="assistant", content=text + "\n\n" + text,
+                            reasoning_content=reasoning, tool_calls=segments)
+    legacy = transcript_entries_to_chat_messages([entry])[0]
+    bounded = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+    assert len(json.dumps(bounded, ensure_ascii=False).encode()) < 200000
+    for before, after in zip(legacy["tool_calls"], bounded["tool_calls"], strict=True):
+        for key in ("type", "tool_use_id", "name", "activity_order", "presentation", "is_error"):
+            assert after.get(key) == before.get(key)
+    assert bounded["tool_calls"][1]["input"]["number"] == 123
+    assert bounded["tool_calls"][1]["input"]["enabled"] is True
+    assert bounded["tool_calls"][1]["input"]["nested"]["body"]
+    assert bounded["historyPayloadPreview"] == {
+        "detailsTruncated": True, "reasoningUtf16Length": len(reasoning.encode("utf-16-le")) // 2,
+        "textUtf16Lengths": [len(text.encode("utf-16-le")) // 2] * 2,
+    }
+    assert legacy["tool_calls"] == segments
+    assert entry.reasoning_content == reasoning
+
+
+def test_bounded_numeric_detail_containers_charge_full_scalar_wire_size():
+    segments = [{"type": "tool_result", "tool_use_id": f"call-{index}", "name": "diagnostic",
+                 "result": [9223372036854775807] * 256} for index in range(300)]
+    entry = SimpleNamespace(role="assistant", content="Done", tool_calls=segments)
+    message = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+    assert sum(len(json.dumps(segment["result"], separators=(",", ":")).encode())
+               for segment in message["tool_calls"]) <= 128 * 1024
+    assert all(
+        segment["result"] and all(number == 9223372036854775807 for number in segment["result"])
+        for segment in message["tool_calls"]
+    )
+    assert message["historyPayloadPreview"]["detailsTruncated"] is True
+
+
+@pytest.mark.parametrize("encoded", [False, True])
+def test_bounded_history_keeps_workspace_action_envelopes_and_previews_only_large_bodies(encoded):
+    result = {
+        "previewStatus": "registered", "documentId": "doc_test", "resourceId": "document:doc_test",
+        "open": {"resourceId": "document:doc_test"},
+        "entrypoint": "C:/workspace/" + "nested/" * 35 + "index.html", "workspace": "C:/workspace",
+    }
+    value = json.dumps(result, separators=(",", ":")) if encoded else result
+    segments = [
+        {"type": "tool_result", "tool_use_id": f"call-{index}", "name": "open_workspace_preview",
+         "result": value} for index in range(300)
+    ]
+    entry = SimpleNamespace(role="assistant", content="Done", tool_calls=segments)
+    message = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+    assert message["tool_calls"] == segments
+    assert "historyPayloadPreview" not in message
+    large = {**result, "stdout": "large output" * 100000}
+    entry.tool_calls = [{**segments[0], "result": json.dumps(large) if encoded else large}]
+    message = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+    projected = message["tool_calls"][0]["result"]
+    if encoded:
+        projected = json.loads(projected)
+    assert {key: value for key, value in projected.items() if key != "stdout"} == result
+    assert len(projected["stdout"].encode()) <= 16384
+    assert message["historyPayloadPreview"]["detailsTruncated"] is True
 
 
 def test_transcript_entries_to_chat_messages_preserves_usage_and_artifacts() -> None:
@@ -34,6 +131,292 @@ def test_transcript_entries_to_chat_messages_preserves_usage_and_artifacts() -> 
     assert messages[0]["output_tokens"] == 2
     assert messages[0]["model"] == "openai/test"
     assert "reasoning_content" not in messages[0]
+
+
+def test_bounded_history_projection_does_not_put_large_body_on_wire() -> None:
+    body = "x" * (26 * 1024 * 1024 + 17)
+    entry = SimpleNamespace(
+        id=44,
+        message_id="large-message",
+        session_id="session-1",
+        session_key="agent:main:webchat:bounded-history",
+        role="assistant",
+        content=body,
+        created_at="now",
+        provenance_kind=None,
+        provenance_source_session_key=None,
+        provenance_source_tool=None,
+        turn_usage=None,
+        tool_calls=None,
+    )
+
+    messages = transcript_entries_to_chat_messages([entry], content_mode="bounded")
+
+    assert len(messages) == 1
+    message = messages[0]
+    assert len(message["text"].encode("utf-8")) <= 16 * 1024
+    assert message["contentRef"] == {
+        "version": 1,
+        "sessionKey": "agent:main:webchat:bounded-history",
+        "sessionId": "session-1",
+        "messageId": "large-message",
+        "byteLength": len(body.encode("utf-8")),
+    }
+
+
+def test_bounded_history_content_ref_preserves_compacted_source() -> None:
+    body = "x" * (20 * 1024)
+    entry = SimpleNamespace(
+        id=47,
+        message_id="duplicate-message",
+        session_id="session-1",
+        session_key="agent:main:webchat:bounded-history",
+        role="user",
+        content=body,
+        content_byte_length=len(body.encode("utf-8")),
+        content_source="compacted",
+        created_at="now",
+        provenance_kind=None,
+        provenance_source_session_key=None,
+        provenance_source_tool=None,
+        turn_usage=None,
+        tool_calls=None,
+    )
+
+    message = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+
+    assert message["contentRef"]["source"] == "compacted"
+    assert message["contentRef"]["view"] == "raw"
+
+
+def test_bounded_history_complete_display_projection_needs_no_hydration() -> None:
+    body = '{"text":"' + ("x" * (20 * 1024)) + '","display_text":"shown"}'
+    entry = SimpleNamespace(
+        id=46,
+        message_id="projected-message",
+        session_id="session-1",
+        session_key="agent:main:webchat:bounded-history",
+        role="assistant",
+        content=body,
+        created_at="now",
+        provenance_kind=None,
+        provenance_source_session_key=None,
+        provenance_source_tool=None,
+        turn_usage=None,
+        tool_calls=None,
+    )
+
+    message = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+
+    assert message["text"] == "shown"
+    assert message["contentPreviewComplete"] is True
+    assert "contentRef" not in message
+
+
+def test_bounded_tool_result_json_projects_result_text_without_protocol_envelope() -> None:
+    body = '{"type":"tool_result","tool_use_id":"call-1","content":"' + (
+        "safe output " * 2_000
+    ) + '"}'
+    entry = SimpleNamespace(
+        id=52,
+        message_id="tool-json-result",
+        session_id="session-1",
+        session_key="agent:main:webchat:bounded-history",
+        role="tool",
+        content=body,
+        # A complete row can also carry bounded-storage metadata. Its safe
+        # projected preview must remain visible, unlike a cut JSON envelope.
+        content_byte_length=len(body.encode()),
+        created_at="now",
+        provenance_kind=None,
+        provenance_source_session_key=None,
+        provenance_source_tool=None,
+        turn_usage=None,
+        tool_calls=None,
+    )
+
+    message = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+
+    assert message["text"].startswith("safe output ")
+    assert "tool_result" not in message["text"]
+    assert message["contentRef"]["view"] == "display"
+
+
+def test_tool_result_block_list_projects_text_blocks() -> None:
+    entry = SimpleNamespace(
+        id=53,
+        message_id="tool-json-blocks",
+        session_id="session-1",
+        session_key="agent:main:webchat:bounded-history",
+        role="tool",
+        content=(
+            '[{"type":"tool_result","content":[{"type":"text","text":"line one"},'
+            '{"type":"text","text":"line two"}]}]'
+        ),
+        created_at="now",
+        provenance_kind=None,
+        provenance_source_session_key=None,
+        provenance_source_tool=None,
+        turn_usage=None,
+        tool_calls=None,
+    )
+
+    message = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+
+    assert message["text"] == "line one\nline two"
+
+
+def test_truncated_tool_result_envelope_fails_closed() -> None:
+    entry = SimpleNamespace(
+        id=54,
+        message_id="tool-json-truncated",
+        session_id="session-1",
+        session_key="agent:main:webchat:bounded-history",
+        role="tool",
+        content='{"type": "tool_result", "content": "incomplete',
+        created_at="now",
+        provenance_kind=None,
+        provenance_source_session_key=None,
+        provenance_source_tool=None,
+        turn_usage=None,
+        tool_calls=None,
+    )
+
+    message = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+
+    assert message["text"] == ""
+
+
+def test_bounded_history_does_not_leak_truncated_protocol_json_prefix() -> None:
+    body = '{"text":"' + ("x" * (20 * 1024)) + '","display_text":"shown"}'
+    entry = SimpleNamespace(
+        id=49,
+        message_id="truncated-json",
+        session_id="session-1",
+        session_key="agent:main:webchat:bounded-history",
+        role="assistant",
+        # Simulate the bounded SQL projection: only the prefix crossed the
+        # Python boundary, while content_byte_length retains the full size.
+        content=body[:4096],
+        content_byte_length=len(body.encode("utf-8")),
+        created_at="now",
+        provenance_kind=None,
+        provenance_source_session_key=None,
+        provenance_source_tool=None,
+        turn_usage=None,
+        tool_calls=None,
+    )
+
+    message = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+
+    assert message["text"] == ""
+    assert message["contentRef"]["view"] == "display"
+
+
+@pytest.mark.parametrize("role", ["assistant", "tool"])
+def test_bounded_history_marks_non_user_large_rows_as_semantic_view(role: str) -> None:
+    body = "visible " + ("x" * (20 * 1024))
+    entry = SimpleNamespace(
+        id=48,
+        message_id=f"{role}-large",
+        session_id="session-1",
+        session_key="agent:main:webchat:bounded-history",
+        role=role,
+        content=body,
+        created_at="now",
+        provenance_kind=None,
+        provenance_source_session_key=None,
+        provenance_source_tool=None,
+        turn_usage=None,
+        tool_calls=None,
+    )
+
+    message = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+
+    assert message["text"].startswith("visible ")
+    assert message["contentRef"]["view"] == "display"
+
+
+@pytest.mark.parametrize("role", ["assistant", "tool"])
+def test_bounded_history_marks_oversized_transformed_rows_unavailable(role: str) -> None:
+    # The raw JSON is deliberately larger than the semantic display reader's
+    # cap.  Its display_text is safe and short, but the authoritative body
+    # contains provider/tool protocol material that must not cross the wire.
+    body = (
+        '{"text":"'
+        + ("x" * (MAX_DISPLAY_CONTENT_BYTES + 1))
+        + '","display_text":"safe preview"}'
+    )
+    entry = SimpleNamespace(
+        id=50,
+        message_id=f"{role}-oversized-transformed",
+        session_id="session-1",
+        session_key="agent:main:webchat:bounded-history",
+        role=role,
+        content=body[:4096],
+        content_byte_length=len(body.encode("utf-8")),
+        created_at="now",
+        provenance_kind=None,
+        provenance_source_session_key=None,
+        provenance_source_tool=None,
+        turn_usage=None,
+        tool_calls=None,
+    )
+
+    message = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+
+    assert message["text"] == ""
+    assert "contentRef" not in message
+    assert message["contentUnavailableReason"] == "display_projection_too_large"
+    assert "x" * 1024 not in str(message)
+
+
+def test_bounded_history_marks_pending_metadata_without_unsafe_reference() -> None:
+    entry = SimpleNamespace(
+        id=51,
+        message_id="assistant-pending-content-size",
+        session_id="session-1",
+        session_key="agent:main:webchat:bounded-history",
+        role="assistant",
+        content='{"text":"protocol prefix that is not complete',
+        content_metadata_pending=True,
+        content_truncated=True,
+        created_at="now",
+        provenance_kind=None,
+        provenance_source_session_key=None,
+        provenance_source_tool=None,
+        turn_usage=None,
+        tool_calls=None,
+    )
+
+    message = transcript_entries_to_chat_messages([entry], content_mode="bounded")[0]
+
+    assert message["text"] == ""
+    assert message["contentMetadataPending"] is True
+    assert "contentRef" not in message
+    assert message["contentUnavailableReason"] == "content_metadata_pending"
+
+
+def test_legacy_history_projection_keeps_full_body_for_direct_callers() -> None:
+    body = "legacy body"
+    entry = SimpleNamespace(
+        id=45,
+        message_id="legacy-message",
+        session_id="session-1",
+        session_key="agent:main:webchat:legacy-history",
+        role="assistant",
+        content=body,
+        created_at="now",
+        provenance_kind=None,
+        provenance_source_session_key=None,
+        provenance_source_tool=None,
+        turn_usage=None,
+        tool_calls=None,
+    )
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["text"] == body
 
 
 def test_transcript_entries_to_chat_messages_rebuilds_artifact_thumbnail_url() -> None:

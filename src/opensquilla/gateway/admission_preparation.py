@@ -236,6 +236,7 @@ async def prepare_route(
             principal_is_owner=principal.is_owner,
             principal_host_execute=host_execute_allowed,
             run_mode=run_context.run_mode.value,
+            required_services=command.required_services,
         )
         route_envelope.metadata["structured_user_input"] = connection_supports_user_input(conn_id)
     else:
@@ -251,6 +252,7 @@ async def prepare_route(
             session_epoch=session_epoch,
             principal_is_owner=principal.is_owner,
             principal_host_execute=host_execute_allowed,
+            required_services=command.required_services,
         )
     apply_run_context_route_metadata(
         route_envelope,

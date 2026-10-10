@@ -729,6 +729,7 @@
       :open="composerSandboxSetupOpen"
       :pending="sandboxSetupPending"
       :outcome="sandboxSetupOutcome"
+      :repair-identity="sandboxIdentityRepairRequired"
       @cancel="cancelComposerSandboxSetup"
       @background="runComposerSandboxSetupInBackground"
       @confirm="void confirmComposerSandboxSetup()"
@@ -792,7 +793,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, inject, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, onScopeDispose, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
@@ -956,6 +957,7 @@ import {
 import {
   acquireSessionBootstrapAdmission,
   claimSessionBootstrapAdmission,
+  registerSessionBootstrapAdmissionOwner,
   optionalSessionRpcAllowed,
   optionalSessionReadOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
@@ -1294,6 +1296,12 @@ const {
 // entering the serialized Gateway queue ahead of session recovery.
 let releaseOptionalRpcAdmission: (() => void) | null =
   claimSessionBootstrapAdmission()
+const unregisterSessionBootstrapOwner = registerSessionBootstrapAdmissionOwner()
+onScopeDispose(() => {
+  unregisterSessionBootstrapOwner()
+  releaseOptionalRpcAdmission?.()
+  releaseOptionalRpcAdmission = null
+})
 let optionalRpcAdmissionGeneration = 0
 const appStore = useAppStore()
 const workbenchStore = useWorkbenchStore()
@@ -1702,10 +1710,15 @@ const composerAllowedRunModes = computed<SandboxRunMode[]>(() => allowedComposer
   allowedRunModes.value,
   sandboxSetupStatus.value,
   sandboxSetupRecovery.resolved.value,
+  sandboxSetupRecovery.available.value,
 ))
 const composerSafeSetupAvailable = computed(() =>
   !sandboxSetupPending.value && sandboxSetupRecovery.canSetup.value)
 const composerSandboxSetupOpen = ref(false)
+const sandboxIdentityRepairRequired = computed(() => (
+  sandboxSetupStatus.value?.detail?.includes('offline_identity_repair_required') === true
+  || sandboxSetupStore.status?.detail?.includes('offline_identity_repair_required') === true
+))
 
 async function refreshPostBootstrapMetadata() {
   await refreshRunModePreference()
@@ -2256,6 +2269,10 @@ const newTaskModel = useNewTaskModelSelection({
   capable: computed(() => gatewayAccess.chatSendInitialModel
     && gatewayAccess.isAvailable && gatewayAccess.isAuthenticated),
   connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
+  // Provider discovery is an optional network action. The composer starts it
+  // when the model picker is explicitly opened, so an unreachable provider
+  // cannot delay the first chat/sidebar control requests.
+  autoRefresh: false,
   routingMode: modelRoutingMode,
   busy: computed(() => isStreaming.value || modelRoutingSettingsBusy.value
     || acceptanceStopPending.value || acceptanceRecoveryPending.value),
@@ -2807,6 +2824,7 @@ applySessionRunState = chatSessionSubscription.applySessionRunState
 
 const chatSessionBootstrap = useChatSessionBootstrap({
   sessionKey,
+  isProvisionalDraft: isProvisionalDraftSession,
   sessionReadLifecycle,
   loadHistory: async (context, retry) => (
     retry
@@ -3627,6 +3645,9 @@ const chatSend = useChatSend({
       freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
     }
     persistSession(key, { source: 'chatView.draftAccepted' })
+    // Acceptance created the durable session. The replacement read lease must
+    // no longer inherit the provisional intent still held by useChatSend.
+    pendingSessionIntent.value = null
     // The provisional draft bootstrap can finish before the Gateway creates
     // the first durable session. Re-register immediately after acceptance so
     // buffered text, tool, and reasoning frames replay into the first turn.
@@ -4779,6 +4800,7 @@ async function setComposerRunMode(mode: SandboxRunMode): Promise<void> {
     sandboxSetupStatus.value,
     composerSafeSetupAvailable.value,
     sandboxSetupRecovery.resolved.value,
+    sandboxSetupRecovery.available.value,
   )
   if (action === 'ignore') return
   if (action === 'setup') {
@@ -4800,7 +4822,7 @@ function cancelComposerSandboxSetup(): void {
 
 async function confirmComposerSandboxSetup(): Promise<void> {
   if (sandboxSetupPending.value) return
-  const ready = await sandboxSetupStore.startSafeSetup()
+  const ready = await sandboxSetupStore.startSafeSetup({ repairIdentity: sandboxIdentityRepairRequired.value })
   if (sandboxSetupOutcome.value !== 'in_progress') composerSandboxSetupOpen.value = false
   await sandboxSetupRecovery.refresh()
   if (ready) {
@@ -7120,8 +7142,6 @@ onUnmounted(() => {
   conversationSessionRuntime.dispose()
   pendingSessionOptionalReads = null
   pendingFeatureToggleRefresh = false
-  releaseOptionalRpcAdmission?.()
-  releaseOptionalRpcAdmission = null
   cancelActiveProjectValidation()
   clearExecutionDockHideTimer()
   unsubs.forEach(fn => fn())

@@ -2,7 +2,7 @@ import { RpcClient, RpcTimeoutError } from '@/lib/rpc'
 import { createConversationEventHub } from '@/modules/conversationEventHub'
 import { createConversationEventTransport } from './conversationEventTransport'
 import { TransportFlowV4 } from './transportFlowV4'
-import type { TransportEventHandler } from './transportTypes'
+import type { TransportEventHandler, TransportLaneRetireReceipt } from './transportTypes'
 import { createSessionReadLifecycle, type SessionReadPortLease } from '@/modules/sessionReadLifecycle'
 import { createConversationRuntime } from '@/modules/conversationRuntime'
 import { createConversationSubscriptionLifecycle } from '@/modules/conversationSubscriptionLifecycle'
@@ -269,10 +269,7 @@ const openRequest = (
 })
 
 async function flushAsyncWork() {
-  await Promise.resolve()
-  await Promise.resolve()
-  await Promise.resolve()
-  await Promise.resolve()
+  for (let index = 0; index < 12; index++) await Promise.resolve()
 }
 
 const SNAPSHOT_READ = 'sessions.messages.snapshot.read'
@@ -313,6 +310,288 @@ function installationHarness(modern = true) {
   }
   return { ...base, rpc, resume, consume, resumeFlow }
 }
+
+const READ_OPEN_V2 = 'sessions.read.open.v2'
+const READ_STATE_V2 = 'sessions.read.state.v2'
+const READ_INSTALL_V2 = 'sessions.read.install.v2'
+const READ_CLOSE_V2 = 'sessions.read.close.v2'
+const HISTORY_V2 = 'sessions.history.page.v2'
+
+function v2AdmissionHarness() {
+  const base = makeHarness()
+  const progress = { status: 'installed', base_seq: 9, target_seq: 9, next_seq: 10, consumed_through_seq: 9 }
+  base.results.set(READ_OPEN_V2, {
+    lease_id: 'lease-alpha', recovery_id: 'recovery-alpha', session_id: 'id-alpha',
+    session_epoch: 3, connection_epoch: 'connection', subscription_epoch: 'subscription-alpha',
+    state_revision: 1, base_stream_generation: 'stream-1', base_stream_seq: 9,
+    state_manifest: { length: 0, sha256: 'a'.repeat(64), schema_version: 1, chunks: [] },
+  })
+  base.results.set(READ_STATE_V2, {
+    lease_id: 'lease-alpha', recovery_id: 'recovery-alpha', session_id: 'id-alpha',
+    session_epoch: 3, state_revision: 1, status: 'installed', progress,
+  })
+  base.results.set(READ_INSTALL_V2, {
+    lease_id: 'lease-alpha', recovery_id: 'recovery-alpha', status: 'installed', progress,
+  })
+  base.results.set(READ_CLOSE_V2, { lease_id: 'lease-alpha', closed: true, status: 'retired' })
+  base.results.set(HISTORY_V2, {
+    session_id: 'id-alpha', session_epoch: 3, projection_revision: 1,
+    before_cursor: null, after_cursor: null, has_more_before: false, has_more_after: false,
+    complete_for_requested_window: true, canonical_available: true, canonical_complete: true,
+    history_scope: 'complete', compaction_summaries: [], turn_outcomes: [], items: [],
+  })
+  const methods = new Set([READ_OPEN_V2, READ_STATE_V2, READ_INSTALL_V2, READ_CLOSE_V2, HISTORY_V2])
+  const original = base.requestMock.getMockImplementation()!
+  base.requestMock.mockImplementation(async (method, params, options) => {
+    const result = await original(method, params, options)
+    if (!result || typeof result !== 'object' || params?.key === 'alpha') return result
+    const key = String(params?.key)
+    const value = result as Record<string, unknown>
+    return {
+      ...value,
+      ...('key' in value ? { key } : {}),
+      ...('lease_id' in value ? { lease_id: `lease-${key}` } : {}),
+      ...('recovery_id' in value ? { recovery_id: `recovery-${key}` } : {}),
+      ...('session_id' in value ? { session_id: `id-${key}` } : {}),
+    }
+  })
+  return {
+    ...base,
+    rpc: {
+      ...base.rpc,
+      get generation() { return base.rpc.generation },
+      sessionReadV2: true,
+      supports: (method: string) => methods.has(method),
+      waitForConsumption: vi.fn(async () => {}),
+    },
+  }
+}
+
+describe('read-v2 admission and retirement ownership', () => {
+  const historyRequest = (signal: AbortSignal) => ({ direction: 'latest' as const, limit: 100, signal })
+
+  it('keeps an unmaterialized draft live across reconnect, then opens v2 after acceptance', async () => {
+    const h = v2AdmissionHarness()
+    const original = h.requestMock.getMockImplementation()!
+    let materialized = false
+    h.requestMock.mockImplementation(async (method, params, options) => {
+      if (method === READ_OPEN_V2 && !materialized) {
+        throw Object.assign(new Error('Session not found'), { code: 'NOT_FOUND' })
+      }
+      return original(method, params, options)
+    })
+    const port = createV4SessionReadPort(h.rpc)
+    for (let generation = 1; generation <= 2; generation++) {
+      h.setGeneration(generation)
+      const draft = port.open({ ...openRequest(), includeInitialHistory: false, provisionalDraft: true })
+      try {
+        const [live] = await Promise.all([draft.live, draft.metadata, draft.criticalRequestsQueued])
+        await live.confirmInstalled?.()
+        expect(live.sessionKey).toBe('alpha')
+      } finally { await draft.close() }
+    }
+    expect(h.requestMock.mock.calls.filter(([method]) => method === READ_OPEN_V2)).toHaveLength(0)
+    expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(2)
+    materialized = true
+    for (let generation = 2; generation <= 3; generation++) {
+      h.setGeneration(generation)
+      const durable = port.open(openRequest())
+      try {
+        const [live, page] = await Promise.all([durable.live, durable.readHistory(historyRequest(new AbortController().signal))])
+        await live.confirmInstalled?.()
+        expect(page.messages).toEqual([])
+      } finally { await durable.close() }
+    }
+    expect(h.calls.filter(call => call.method === READ_OPEN_V2)).toHaveLength(2)
+    expect(h.calls.filter(call => call.method === HISTORY_V2)).toHaveLength(2)
+    expect(h.calls.some(call => call.method === CHAT_HISTORY_METHOD)).toBe(false)
+  })
+
+  it('retains NOT_FOUND for an existing session even when initial history is skipped', async () => {
+    const h = v2AdmissionHarness()
+    const original = h.requestMock.getMockImplementation()!
+    h.requestMock.mockImplementation(async (method, params, options) => {
+      if (method === READ_OPEN_V2) throw Object.assign(new Error('Session not found'), { code: 'NOT_FOUND' })
+      return original(method, params, options)
+    })
+    const lease = createV4SessionReadPort(h.rpc).open({ ...openRequest(), includeInitialHistory: false })
+    try {
+      await expect(lease.live).rejects.toBeInstanceOf(SessionReadSessionMissingError)
+      await expect(lease.metadata).rejects.toBeInstanceOf(SessionReadSessionMissingError)
+      expect(h.requestMock.mock.calls.some(([method]) => method === READ_OPEN_V2)).toBe(true)
+    } finally { await lease.close() }
+  })
+
+  it('selects read-v2 after readiness negotiates capabilities for an already opened lease', async () => {
+    const h = v2AdmissionHarness()
+    const ready = deferred<void>()
+    let negotiated = false
+    const rpc = {
+      ...h.rpc,
+      get sessionReadV2() { return negotiated },
+      supports: (method: string) => negotiated && h.rpc.supports(method),
+      ready: vi.fn(() => ready.promise),
+    }
+    const signal = new AbortController().signal
+    const lease = createV4SessionReadPort(rpc).open(openRequest(signal))
+    const history = lease.readHistory(historyRequest(signal))
+    try {
+      expect(h.calls).toEqual([])
+      negotiated = true
+      ready.resolve()
+      const [live, page] = await Promise.all([lease.live, history, lease.metadata, lease.criticalRequestsQueued])
+      await live.confirmInstalled?.()
+      expect(h.calls.some(call => call.method === READ_OPEN_V2)).toBe(true)
+      expect(h.calls.some(call => call.method === HISTORY_V2)).toBe(true)
+      expect(h.calls.some(call => call.method === CHAT_HISTORY_METHOD)).toBe(false)
+      expect(page.messages).toEqual([])
+    } finally { await lease.close() }
+  })
+
+  it.each([SESSIONS_MESSAGES_SUBSCRIBE_METHOD, READ_OPEN_V2, READ_INSTALL_V2])(
+    'recovers a failed first %s through shared live/history/metadata admission', async method => {
+      const h = v2AdmissionHarness()
+      const successful = h.results.get(method)
+      h.results.set(method, new RpcTimeoutError(method, 7_000))
+      const signal = new AbortController().signal
+      const lease = createV4SessionReadPort(h.rpc).open(openRequest(signal))
+      try {
+        await Promise.all([
+          expect(lease.live).rejects.toMatchObject({ kind: 'timeout' }),
+          expect(lease.metadata).rejects.toMatchObject({ kind: 'timeout' }),
+          expect(lease.criticalRequestsQueued).rejects.toMatchObject({ kind: 'timeout' }),
+          expect(lease.readHistory(historyRequest(signal))).rejects.toMatchObject({ kind: 'timeout' }),
+        ])
+        h.results.set(method, successful)
+        const [live, page, metadata] = await Promise.all([
+          lease.reconcile(), lease.readHistory(historyRequest(signal)), lease.retryMetadata(),
+        ])
+        await live.confirmInstalled!()
+        expect(page.messages).toEqual([])
+        expect(metadata.hydrationComplete).toBe(true)
+        expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD))
+          .toHaveLength(method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD ? 2 : 1)
+        expect(h.calls.filter(call => call.method === READ_OPEN_V2))
+          .toHaveLength(method === READ_OPEN_V2 ? 2 : 1)
+        expect(h.calls.filter(call => call.method === READ_INSTALL_V2 && call.params?.base_applied))
+          .toHaveLength(method === READ_INSTALL_V2 ? 2 : 1)
+        expect(h.calls.filter(call => call.method === HISTORY_V2)).toHaveLength(1)
+        expect(h.calls.some(call => call.method === READ_STATE_V2)).toBe(true)
+      } finally { await lease.close() }
+    },
+  )
+
+  it('queues old A unsubscribe before a delayed read-close response can reach replacement A', async () => {
+    vi.useFakeTimers()
+    const h = v2AdmissionHarness()
+    const port = createV4SessionReadPort(h.rpc)
+    const old = port.open(openRequest())
+    await old.live
+    const delayed = deferred<unknown>()
+    const original = h.requestMock.getMockImplementation()!
+    let held = false
+    h.requestMock.mockImplementation((method, params, options) => {
+      if (!held && method === READ_CLOSE_V2 && params?.key === 'alpha') {
+        held = true
+        h.calls.push({ method, params, options })
+        return delayed.promise
+      }
+      return original(method, params, options)
+    })
+    const oldClose = old.close()
+    const beta = port.open({ ...openRequest(), sessionKey: 'beta' })
+    await beta.live
+    await beta.close()
+    const replacement = port.open(openRequest())
+    try {
+      await replacement.live
+      const unsubscribe = h.calls.findIndex(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)
+      const replacementSubscribe = h.calls.map(call => call.method).lastIndexOf(SESSIONS_MESSAGES_SUBSCRIBE_METHOD)
+      expect(unsubscribe).toBeGreaterThan(-1)
+      expect(unsubscribe).toBeLessThan(replacementSubscribe)
+      const countBeforeReply = h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD).length
+      setTimeout(() => delayed.resolve(h.results.get(READ_CLOSE_V2)), 200)
+      await vi.advanceTimersByTimeAsync(200)
+      await oldClose
+      expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(countBeforeReply)
+      await expect(replacement.reconcile()).resolves.toMatchObject({ sessionKey: 'alpha' })
+    } finally {
+      await replacement.close()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['read-close-throw', 'read-close-reject', 'unsubscribe-throw'] as const)(
+    'starts both cleanup requests despite %s', async failure => {
+      const h = v2AdmissionHarness()
+      const lease = createV4SessionReadPort(h.rpc).open(openRequest())
+      await lease.live
+      const original = h.requestMock.getMockImplementation()!
+      const failedMethod = failure === 'unsubscribe-throw' ? SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD : READ_CLOSE_V2
+      h.requestMock.mockImplementation((method, params, options) => {
+        if (method === failedMethod) {
+          h.calls.push({ method, params, options })
+          if (failure === 'read-close-reject') return Promise.reject(new Error(failure))
+          throw new Error(failure)
+        }
+        return original(method, params, options)
+      })
+      await expect(lease.close()).rejects.toThrow(failure)
+      expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(1)
+      expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(1)
+      await lease.close()
+      expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(1)
+    },
+  )
+
+  it('owns an opened lease while base installation is pending and never publishes it after close', async () => {
+    const h = v2AdmissionHarness()
+    const delayed = deferred<unknown>()
+    const installed = h.results.get(READ_INSTALL_V2)
+    h.results.set(READ_INSTALL_V2, delayed.promise)
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest(new AbortController().signal, false))
+    const live = expect(lease.live).rejects.toMatchObject({ kind: 'aborted' })
+    const metadata = expect(lease.metadata).rejects.toMatchObject({ kind: 'aborted' })
+    for (let index = 0; index < 12; index++) await flushAsyncWork()
+    expect(h.calls.some(call => call.method === READ_INSTALL_V2)).toBe(true)
+    await lease.close()
+    expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(1)
+    delayed.resolve(installed)
+    await Promise.all([live, metadata])
+    await expect(lease.reconcile()).rejects.toMatchObject({ name: 'AbortError' })
+    expect(h.calls.some(call => call.method === READ_STATE_V2)).toBe(false)
+  })
+
+  it.each(['closed', 'aborted', 'replacement'] as const)('fences a late open result after %s', async reason => {
+    const h = v2AdmissionHarness()
+    const opened = h.results.get(READ_OPEN_V2)
+    const delayed = deferred<unknown>()
+    h.results.set(READ_OPEN_V2, delayed.promise)
+    const port = createV4SessionReadPort(h.rpc)
+    const controller = new AbortController()
+    const old = port.open(openRequest(controller.signal, false))
+    const rejected = Promise.all([
+      expect(old.live).rejects.toMatchObject({ kind: 'aborted' }),
+      expect(old.metadata).rejects.toMatchObject({ kind: 'aborted' }),
+    ])
+    for (let index = 0; index < 12; index++) await flushAsyncWork()
+    expect(h.calls.filter(call => call.method === READ_OPEN_V2)).toHaveLength(1)
+    if (reason === 'aborted') controller.abort()
+    else await old.close()
+    h.results.set(READ_OPEN_V2, opened)
+    const replacement = reason === 'replacement' ? port.open(openRequest()) : null
+    if (replacement) await replacement.live
+    delayed.resolve(opened)
+    await rejected
+    expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(replacement ? 0 : 1)
+    if (replacement) {
+      await expect(replacement.reconcile()).resolves.toMatchObject({ sessionKey: 'alpha' })
+      await replacement.close()
+      expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(1)
+    }
+    await old.close()
+  })
+})
 
 describe('SessionReadPort installation error boundary', () => {
   it('stops automatic flow recovery at a terminal snapshot without ACKing its unowned delivery', async () => {
@@ -1446,6 +1725,28 @@ describe('v4 SessionReadPort Adapter', () => {
     await replacedLease.close()
     expect(replaced.calls.some(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD))
       .toBe(false)
+  })
+
+  it('forwards a negotiated unsubscribe lane-retire fence to the flow ledger', async () => {
+    const h = makeHarness()
+    const retireLane = vi.fn<(receipt: TransportLaneRetireReceipt) => Promise<void>>().mockResolvedValue(undefined)
+    h.results.set(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, {
+      lane_retire: {
+        connection_epoch: 'delivery-epoch',
+        subscription_epoch: 'subscription-epoch',
+        retire_token: 'retire-token',
+        final_published_id: 7,
+      },
+    })
+    const lease = createV4SessionReadPort({ ...h.rpc, retireLane }).open(openRequest())
+    await lease.live
+    await lease.close()
+    expect(retireLane).toHaveBeenCalledWith({
+      connection_epoch: 'delivery-epoch',
+      subscription_epoch: 'subscription-epoch',
+      retire_token: 'retire-token',
+      final_published_id: 7,
+    })
   })
 
   it('keeps a late malformed unsubscribe reply local after its successor has subscribed', async () => {

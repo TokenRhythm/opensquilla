@@ -131,6 +131,8 @@ export interface DisplayAttachment {
   localFile?: File
   download_url?: string
   sha256_ref?: string
+  /** Bounded server display diagnostic; it does not revoke a usable read source. */
+  missingReason?: string
   /** Session-scoped opaque identity for Workbench preview/import actions. */
   attachmentId?: string
   origin?: 'paste'
@@ -670,6 +672,12 @@ export interface ChatMaintenanceEvent {
   canonicalComplete?: boolean | null
 }
 
+/** Visible range in a durable assistant body shared by split history rows. */
+export interface ChatContentSlice {
+  startCodepoint: number
+  endCodepoint: number
+}
+
 export interface ChatMessage {
   role: ChatRole
   text: string
@@ -730,6 +738,30 @@ export interface ChatMessage {
   // `session.event.ensemble_progress` deltas before the final `done` arrives.
   ensemble?: ChatEnsembleMeta
   messageId?: string
+  /** Metadata-only pointer for bounded legacy transcript reads. */
+  contentRef?: {
+    version: 1
+    sessionKey: string
+    sessionId: string
+    messageId: string
+    source?: 'active' | 'compacted'
+    view?: 'raw' | 'display'
+    byteLength?: number
+    revision?: string
+    sha256?: string
+  }
+  /** Visible codepoint range when this row was split from a durable body. */
+  contentSlice?: ChatContentSlice
+  /** Display body completeness, separate from history page completeness. */
+  previewComplete?: boolean
+  historyPayloadPreview?: import('@/modules/sessionReadLifecycle').SessionReadPayloadPreview
+  contentRevision?: string
+  contentAvailability?: 'ready' | 'preparing' | 'unavailable'
+  /** Bounded history has no safe contentRef for this row; body remains authoritative in storage. */
+  contentUnavailableReason?:
+    | 'content_metadata_pending'
+    | 'display_projection_too_large'
+    | 'content_reference_unavailable'
   usage?: ChatUsagePayload
   turn_usage?: ChatUsagePayload
   model?: string
@@ -798,6 +830,17 @@ export interface ChatRenderedMessage {
   showHeader: boolean
   isStreaming?: boolean
   messageId?: string
+  /** Metadata-only pointer for bounded historical transcript content. */
+  contentRef?: ChatMessage['contentRef']
+  /** Visible codepoint range when this row was split from a durable body. */
+  contentSlice?: ChatContentSlice
+  /** Display body completeness, separate from history page completeness. */
+  previewComplete?: boolean
+  historyPayloadPreview?: ChatMessage['historyPayloadPreview']
+  contentRevision?: string
+  contentAvailability?: ChatMessage['contentAvailability']
+  /** Bounded history has no safe contentRef for this row; body remains authoritative in storage. */
+  contentUnavailableReason?: ChatMessage['contentUnavailableReason']
   restoredFromHistory?: boolean
   /** Durable server turn identity restored from transcript context once assigned. */
   turnId?: string

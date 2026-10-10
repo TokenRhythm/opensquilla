@@ -5,12 +5,15 @@ import type {
   TransportConsumptionHandler,
   TransportDeliveryReceipt,
   TransportInstalledReceipt,
+  TransportLaneRetireReceipt,
   TransportGapHandler,
   TransportRecoveryResult,
 } from './transportTypes'
 import { TransportFlowV4 } from './transportFlowV4'
 import type { SessionsMessagesSnapshotReadResult } from '@/contracts/generated/v4/sessionsMessagesSnapshotRead'
 import { validateSessionsMessagesSnapshotReadResult } from '@/contracts/generated/v4/sessionsMessagesSnapshotReadValidators.mjs'
+import type { SessionsMessagesUnsubscribeResult } from '@/contracts/generated/v4/sessionsMessagesUnsubscribe'
+import { validateSessionsMessagesUnsubscribeResult } from '@/contracts/generated/v4/sessionsMessagesUnsubscribeValidators.mjs'
 
 /**
  * Raw v4 transport capabilities.
@@ -27,10 +30,13 @@ export interface RpcTransport {
   ): Promise<T>
   ready(options?: TransportReadyOptions): Promise<void>
   supports(method: string): boolean
+  /** Capability bit for the fenced v2 session read protocol. */
+  readonly sessionReadV2: boolean
   readonly policy?: Readonly<Record<string, unknown>> | null
   markUnsupported(method: string): void
   acknowledgeDelivery?(receipt: TransportDeliveryReceipt): Promise<void> | void
   resumeFlow?(receipt: TransportInstalledReceipt): Promise<void> | void
+  retireLane?(receipt: TransportLaneRetireReceipt): Promise<void> | void
   recoveryVersion?(key: string): string
   snapshotInstalled?(key: string, version: string): void
   waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void>
@@ -62,6 +68,7 @@ export interface GatewayTransports {
 }
 
 interface RpcStoreTransportSource extends Pick<RpcTransport, 'policy' | 'acknowledgeDelivery' | 'resumeFlow'> {
+  retireLane?: RpcTransport['retireLane']
   readonly connectionGeneration: number
   call: RpcTransport['request']
   on(event: string, handler: TransportEventHandler): () => void
@@ -104,6 +111,13 @@ function consumptionFlow(source: RpcStoreTransportSource): TransportFlowV4 | und
       if (!value || typeof value !== 'object') return
       const detail = value as { generation?: unknown; payload?: unknown }
       if (detail.generation !== source.connectionGeneration) return
+      if (validateSessionsMessagesUnsubscribeResult(detail.payload)) {
+        const result = detail.payload as SessionsMessagesUnsubscribeResult
+        if (result?.lane_retire) {
+          void owner!.retireLane(result.lane_retire).catch(() => {})
+        }
+        return
+      }
       // A timed-out/aborted read no longer has a byte owner. Validate the
       // complete snapshot response before returning its one recovery credit;
       // a coincidental `delivery` field in another result is not sufficient.
@@ -127,12 +141,22 @@ export function createPrivateGatewayTransports(
   const deliveryOwner = flow ?? source
   return {
     rpc: {
+      get sessionReadV2() {
+        return [
+          'sessions.read.open.v2',
+          'sessions.read.state.v2',
+          'sessions.read.install.v2',
+          'sessions.read.close.v2',
+          'sessions.history.page.v2',
+        ].every(method => source.hasRpcMethod(method))
+      },
       recoveryVersion: key => flow?.recoveryVersion(key) ?? String(source.connectionGeneration),
       snapshotInstalled: (key, version) => flow?.snapshotInstalled(key, version),
       waitForConsumption: (key, cursor) => flow?.waitForConsumption(key, cursor) ?? Promise.resolve(),
       failProtocol: generation => { source.recoverConnectionGeneration?.(generation, 'Invalid snapshot recovery contract') },
       acknowledgeDelivery: deliveryOwner.acknowledgeDelivery?.bind(deliveryOwner),
       resumeFlow: deliveryOwner.resumeFlow?.bind(deliveryOwner),
+      retireLane: deliveryOwner.retireLane?.bind(deliveryOwner),
       request(method, params, options) {
         return source.call(method, params, options)
       },

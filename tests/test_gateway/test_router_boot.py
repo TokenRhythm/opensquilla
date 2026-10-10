@@ -541,7 +541,9 @@ def test_start_gateway_server_starts_legacy_telemetry_after_readiness(
         async def start_all(self) -> dict[str, bool]:
             await asyncio.sleep(0)
             assert "listener" in call_order
-            assert app_holder["app"].state.gateway_ready is False
+            # Optional channels are launched after the durable core is ready.
+            assert app_holder["app"].state.core_ready is True
+            assert app_holder["app"].state.gateway_ready is True
             assert "install_telemetry" not in call_order
             assert "daily_usage" not in call_order
             return {}
@@ -691,7 +693,9 @@ def test_start_gateway_server_starts_legacy_telemetry_after_readiness(
             assert ("gateway.usage_telemetry_upload_skipped" in log_events) is (failure == "usage")
             expected_order = ["build_services"]
             if listener_first:
-                expected_order.extend(["listener_callback", "listener", "runtime_state"])
+                # Core publication is independent from listener callback order;
+                # the optional channel task is fenced until after both.
+                expected_order.extend(["runtime_state", "listener_callback", "listener"])
             else:
                 expected_order.append("runtime_state")
                 if run:
@@ -1411,6 +1415,32 @@ async def test_service_container_close_cancels_owned_sandbox_setup_task() -> Non
 
 
 @pytest.mark.asyncio
+async def test_service_container_close_retires_explicit_setup(monkeypatch) -> None:
+    from opensquilla.gateway import boot
+    from opensquilla.sandbox import setup_runtime
+
+    entered = asyncio.Event()
+
+    async def blocked_setup(config):
+        entered.set()
+        await asyncio.Event().wait()
+
+    setup_runtime.reset_sandbox_setup_runtime_state()
+    monkeypatch.setattr(setup_runtime, "ensure_sandbox_setup", blocked_setup)
+    services = boot.ServiceContainer(config=GatewayConfig())
+    try:
+        await setup_runtime.request_sandbox_setup(services.config)
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task = setup_runtime._SETUP_TASK
+        await asyncio.wait_for(services.close(), timeout=2)
+        assert task is not None and task.cancelled()
+        assert setup_runtime._CLOSING
+        assert setup_runtime._SETUP_TASK is None
+    finally:
+        setup_runtime.reset_sandbox_setup_runtime_state()
+
+
+@pytest.mark.asyncio
 async def test_service_container_close_cancels_profile_import_maintenance() -> None:
     from opensquilla.gateway import boot
 
@@ -1715,7 +1745,7 @@ async def test_start_gateway_server_creates_default_subscription_manager(
 
 
 @pytest.mark.asyncio
-async def test_start_gateway_server_schedules_router_preload_after_channels(
+async def test_start_gateway_server_schedules_router_preload_before_optional_channels(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1811,7 +1841,12 @@ async def test_start_gateway_server_schedules_router_preload_after_channels(
     )
 
     try:
-        assert events.index("channels.start_all") < events.index("router.preload.scheduled")
+        # Router preload and channel startup are both post-core work.  The
+        # channel task is deliberately scheduled after core readiness so a
+        # slow integration cannot delay the listener/ready boundary.
+        await asyncio.sleep(0)
+        assert "router.preload.scheduled" in events
+        assert "server.serve.scheduled" in events
     finally:
         await server.close()
 
