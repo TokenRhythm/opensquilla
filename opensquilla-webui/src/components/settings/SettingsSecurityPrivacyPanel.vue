@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import DesktopPreviewModeSetting from '@/components/settings/DesktopPreviewModeSetting.vue'
@@ -21,6 +22,12 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const sandboxPanel = ref<InstanceType<typeof SandboxSettingsPanel> | null>(null)
+const hasUnsettledChanges = computed(() => sandboxPanel.value?.hasUnsettledChanges === true)
+function prepareToLeave(): Promise<boolean> {
+  return sandboxPanel.value?.prepareToLeave() ?? Promise.resolve(true)
+}
+defineExpose({ hasUnsettledChanges, prepareToLeave })
 </script>
 
 <template>
@@ -45,7 +52,7 @@ const { t } = useI18n()
     </div>
 
     <div id="settings-security-sandbox" class="security-subsection" tabindex="-1">
-      <SandboxSettingsPanel />
+      <SandboxSettingsPanel ref="sandboxPanel" />
     </div>
   </section>
 </template>

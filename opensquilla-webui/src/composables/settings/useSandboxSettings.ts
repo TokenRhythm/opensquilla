@@ -105,6 +105,10 @@ export function useSandboxSettings() {
     runtimes: '',
   })
   let saveQueue: Promise<void> = Promise.resolve()
+  const pendingSaveCount = ref(0)
+  const preparingToLeave = ref(false)
+  let leavePreparation: Promise<boolean> | null = null
+  let saveFailureVersion = 0
   let defaultRunModeSequence = 0
   const sectionSaveTimers: Partial<Record<SandboxPolicySection, ReturnType<typeof setTimeout>>> = {}
   let disposed = false
@@ -138,6 +142,13 @@ export function useSandboxSettings() {
     if (!baseline.value || !draft.value) return false
     return JSON.stringify(baseline.value[section]) !== JSON.stringify(draft.value[section])
   }
+
+  const hasUnsettledChanges = computed(() => (
+    pendingSaveCount.value > 0
+    || preparingToLeave.value
+    || defaultRunMode.value !== defaultRunModeBaseline.value
+    || (['files', 'commands', 'network', 'runtimes'] as const).some(sectionDirty)
+  ))
 
   async function load(): Promise<void> {
     loading.value = true
@@ -461,7 +472,14 @@ export function useSandboxSettings() {
   }
 
   function queueSave<T>(operation: () => Promise<T>): Promise<T> {
-    const queued = saveQueue.then(operation)
+    pendingSaveCount.value += 1
+    const queued = saveQueue.then(operation).then(result => {
+      if (result === false) saveFailureVersion += 1
+      return result
+    }, error => {
+      saveFailureVersion += 1
+      throw error
+    }).finally(() => { pendingSaveCount.value -= 1 })
     saveQueue = queued.then(() => undefined, () => undefined)
     return queued
   }
@@ -489,7 +507,7 @@ export function useSandboxSettings() {
       } catch (error) {
         if (sequence === defaultRunModeSequence) {
           defaultRunModeError.value = errorMessage(error)
-          defaultRunMode.value = defaultRunModeBaseline.value
+          if (!preparingToLeave.value) defaultRunMode.value = defaultRunModeBaseline.value
           reportSaveFailure()
         }
         return false
@@ -562,11 +580,11 @@ export function useSandboxSettings() {
               Object.assign(draft.value, { [other]: currentDraft[other] })
             }
           }
-          if (sectionChangedWhileSaving) {
+          if (sectionChangedWhileSaving || preparingToLeave.value) {
             Object.assign(draft.value, { [section]: currentDraft[section] })
           }
         }
-      } else if (!sectionChangedWhileSaving && baseline.value && draft.value) {
+      } else if (!preparingToLeave.value && !sectionChangedWhileSaving && baseline.value && draft.value) {
         Object.assign(draft.value, {
           [section]: JSON.parse(JSON.stringify(baseline.value[section])),
         })
@@ -610,6 +628,38 @@ export function useSandboxSettings() {
     sectionError[section] = ''
   }
 
+  function prepareToLeave(): Promise<boolean> {
+    if (leavePreparation) return leavePreparation
+    preparingToLeave.value = true
+    const failureVersion = saveFailureVersion
+    const sections = ['files', 'commands', 'network', 'runtimes'] as const
+    const work = (async () => {
+      while (true) {
+        for (const section of sections) clearSectionSaveTimer(section)
+        const observedQueue = saveQueue
+        await observedQueue
+        // An edit made while awaiting a save can arm another debounce timer.
+        for (const section of sections) clearSectionSaveTimer(section)
+        if (saveFailureVersion !== failureVersion) return false
+        // A successful save can append another save for newer edits.
+        if (saveQueue !== observedQueue) continue
+        if (defaultRunMode.value !== defaultRunModeBaseline.value) {
+          await setDefaultRunMode(defaultRunMode.value)
+        }
+        for (const section of sections) {
+          if (sectionDirty(section)) await flushSectionSave(section)
+        }
+        if (saveQueue === observedQueue) return true
+      }
+    })()
+    const tracked = work.finally(() => {
+      preparingToLeave.value = false
+      if (leavePreparation === tracked) leavePreparation = null
+    })
+    leavePreparation = tracked
+    return tracked
+  }
+
   return {
     loading,
     capabilityLoading,
@@ -639,6 +689,8 @@ export function useSandboxSettings() {
     sectionPending,
     sectionError,
     sectionDirty,
+    hasUnsettledChanges,
+    prepareToLeave,
     load,
     loadRuntimeStatus,
     setRuntimeViewActive,
