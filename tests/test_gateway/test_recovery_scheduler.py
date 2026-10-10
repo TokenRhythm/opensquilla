@@ -156,18 +156,37 @@ async def test_expire_then_cancel_claims_only_one_terminal_result():
     scheduler = RecoveryScheduler()
     item = operation(object(), "expire-race", "A")
     item.deadline = time.monotonic() + 0.01
+    expired = asyncio.Event()
+    finished = asyncio.Event()
     terminal: list[str] = []
+    finish_calls: list[bool] = []
+
+    async def run():
+        await asyncio.Future()
+
+    def expire():
+        terminal.append("expire")
+        expired.set()
+
+    def finish():
+        finish_calls.append(True)
+        finished.set()
+
     assert scheduler.submit(
         item,
-        lambda: _set(asyncio.Event()),
-        expire=lambda: terminal.append("expire"),
+        run,
+        finish=finish,
+        expire=expire,
         stale=lambda: terminal.append("stale"),
     )
-    await asyncio.sleep(0.03)
-    scheduler.cancel(item)
-    await asyncio.sleep(0)
+    await expired.wait()
     assert terminal == ["expire"]
-
+    scheduler.cancel(item)
+    await finished.wait()
+    assert terminal == ["expire"]
+    assert finish_calls == [True]
+    assert item.closed
+    assert scheduler.waiting == scheduler.running == 0
 
 async def test_dispatcher_response_claim_suppresses_late_stale():
     scheduler = RecoveryScheduler()

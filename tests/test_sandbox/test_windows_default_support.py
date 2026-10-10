@@ -338,6 +338,7 @@ def test_elevated_helper_timeout_uses_process_id_for_tree_cleanup(monkeypatch) -
         ctypes,
         "WinDLL",
         lambda name, use_last_error=True: shell if name == "shell32" else kernel,
+        raising=False,
     )
     monkeypatch.setattr(mod, "SETUP_HELPER_WAIT_TIMEOUT_MS", 1)
     monkeypatch.setattr(mod, "SETUP_HELPER_CLEANUP_WAIT_TIMEOUT_MS", 1)

@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -15,6 +15,17 @@ from opensquilla.sandbox.backend.windows_default_network import (
     network_proxy_env,
     proxy_ports_from_env,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fake_setup_process_identity(monkeypatch):
+    # These helper unit tests fake UAC and account APIs; keep the new owner
+    # fence intact while also faking its native Windows creation-time probe.
+    from opensquilla.sandbox.backend import windows_setup_process
+
+    monkeypatch.setattr(
+        windows_setup_process, "_process_identity", lambda pid: f"created:{pid}",
+    )
 
 
 def _symlink_or_skip(
@@ -394,17 +405,16 @@ def test_timeout_cleanup_uses_trusted_taskkill_tree(monkeypatch) -> None:
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
 
     assert mod._terminate_setup_helper_tree(4312) == "taskkill_ok"
-    assert calls == [
-        (
-            [r"C:\Windows\System32\taskkill.exe", "/PID", "4312", "/T", "/F"],
-            {
-                "capture_output": True,
-                "text": True,
-                "check": False,
-                "timeout": mod.SETUP_HELPER_CLEANUP_TIMEOUT_MS / 1000,
-            },
-        )
-    ]
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    assert PureWindowsPath(argv[0]) == PureWindowsPath(r"C:\Windows\System32\taskkill.exe")
+    assert argv[1:] == ["/PID", "4312", "/T", "/F"]
+    assert kwargs == {
+        "capture_output": True,
+        "text": True,
+        "check": False,
+        "timeout": mod.SETUP_HELPER_CLEANUP_TIMEOUT_MS / 1000,
+    }
 
 
 def test_timeout_cleanup_reports_taskkill_failure_without_claiming_success(monkeypatch) -> None:
@@ -459,7 +469,9 @@ def test_trusted_taskkill_path_ignores_spoofed_systemroot(monkeypatch) -> None:
         lambda: r"C:\Windows\System32",
     )
 
-    assert mod._trusted_windows_taskkill_path() == r"C:\Windows\System32\taskkill.exe"
+    assert PureWindowsPath(mod._trusted_windows_taskkill_path()) == PureWindowsPath(
+        r"C:\Windows\System32\taskkill.exe"
+    )
 
 
 def test_trusted_powershell_path_ignores_spoofed_systemroot(monkeypatch) -> None:
@@ -472,7 +484,7 @@ def test_trusted_powershell_path_ignores_spoofed_systemroot(monkeypatch) -> None
         lambda: r"C:\Windows\System32",
     )
 
-    assert mod._trusted_windows_powershell_path() == (
+    assert PureWindowsPath(mod._trusted_windows_powershell_path()) == PureWindowsPath(
         r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
     )
 

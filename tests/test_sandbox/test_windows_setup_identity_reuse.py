@@ -15,6 +15,11 @@ from opensquilla.sandbox.backend.windows_default_network import WindowsNetworkSe
 
 @pytest.fixture
 def profile(tmp_path, monkeypatch):
+    from opensquilla.sandbox.backend import windows_setup_process
+
+    monkeypatch.setattr(
+        windows_setup_process, "_process_identity", lambda pid: f"created:{pid}",
+    )
     monkeypatch.setattr(setup, "_current_windows_user_sid", lambda: "S-1-owner")
     monkeypatch.setattr(setup, "_query_offline_account", lambda: None)
     monkeypatch.setattr(identity, "validate_offline_identity", lambda _identity: False)
