@@ -167,6 +167,46 @@ async def test_capacity_replan_absorbs_only_new_complete_rounds(monkeypatch, for
 
 
 @pytest.mark.asyncio
+async def test_indivisible_oversized_round_skips_useless_checkpoint_shortening():
+    # One API round larger than the summarize deployment's whole input window.
+    # No checkpoint length can admit it, so the operation must not spend a
+    # model call shortening the rolling checkpoint before giving up — this
+    # failure replays identically on every later turn of the same session.
+    entries = [
+        {"role": "user", "content": "Early question one. " + "ordinary detail " * 40},
+        {"role": "assistant", "content": "Early answer one. " + "ordinary detail " * 40},
+        {"role": "user", "content": "Early question two. " + "ordinary detail " * 40},
+        {"role": "assistant", "content": "Early answer two. " + "ordinary detail " * 40},
+        {"role": "user", "content": "Giant automation transcript. " + "payload token " * 60000},
+        {"role": "assistant", "content": "Giant automation reply."},
+        {"role": "user", "content": "Current question."},
+        {"role": "assistant", "content": "Current answer."},
+    ]
+    cfg = synthetic_compaction_config(
+        summary="Earlier rounds are complete.",
+        protected_recent_messages=2,
+        protect_semantic_tail=False,
+    )
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="indivisible-oversized-round",
+            entries=entries,
+            config=cfg,
+            context_window_tokens=500,
+        )
+    )
+
+    assert result.skip_reason == "summary_failed"
+    assert result.failure_kind == "indivisible_round_exceeds_input"
+    assert not result.summary and result.removed_count == 0
+    assert result.kept_entries == entries
+    # Exactly one summarize call for the fitting prefix; the checkpoint
+    # shortening call that cannot change the outcome is not issued.
+    assert len(cfg.llm_plan.primary.provider.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_replan_exhaustion_leaves_original_history_and_checkpoint(monkeypatch):
     entries = history()
     monkeypatch.setattr("opensquilla.session.compaction._find_turn_boundary_cut", lambda *a, **k: 2)

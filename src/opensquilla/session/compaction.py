@@ -3657,6 +3657,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                 phase="summarizing",
             )
             single_round = len(_api_round_groups(chunk)) == 1
+            round_exceeds_input = False
             if fits is None and rolling_summary and single_round:
                 source_fits_full_generation = await await_compaction_phase(
                     asyncio.to_thread(fit_chunk, chunk, checkpoint=""),
@@ -3673,7 +3674,25 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                         cfg,
                         phase="summarizing",
                     )
-            if fits is None and rolling_summary:
+                    if fits is None:
+                        # Even with no checkpoint and a reduced generation
+                        # allowance this round cannot enter a summary request.
+                        # Shortening the checkpoint cannot change that outcome,
+                        # so spending a model call on it would be pure waste —
+                        # and this operation retries on every later turn.
+                        round_exceeds_input = True
+                        cfg.last_failure_kind = "indivisible_round_exceeds_input"
+                        log.warning(
+                            "compaction.indivisible_round_exceeds_input",
+                            compaction_id=cfg.operation_id,
+                            chunk_index=chunk_index,
+                            round_entry_count=len(chunk),
+                            round_tokens=_compaction_input_tokens(chunk),
+                            input_budget_tokens=_compaction_target_input_budget(
+                                request, deployment
+                            ),
+                        )
+            if fits is None and rolling_summary and not round_exceeds_input:
                 revised = await shorten(
                     rolling_summary,
                     chunk_index=chunk_index,
@@ -3688,7 +3707,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                         cfg,
                         phase="summarizing",
                     )
-            if fits is None and single_round:
+            if fits is None and single_round and not round_exceeds_input:
                 # Packing preserves the current generation allowance. Only an
                 # indivisible source round may use its smaller physical remainder;
                 # a multi-round batch must split instead of starving generation.
@@ -4204,6 +4223,8 @@ async def compact_context(request: CompactionRequest) -> CompactionResult:
         degraded_reason = "deterministic_fallback"
     if degraded_reason:
         telemetry["degraded_reason"] = degraded_reason
+    if result.failure_kind:
+        telemetry["failure_kind"] = str(result.failure_kind)
     result.quality_report = telemetry
     log.info(
         "compaction.operation_terminal",
@@ -4217,5 +4238,6 @@ async def compact_context(request: CompactionRequest) -> CompactionResult:
         target_model=telemetry.get("target_model"),
         target_source=telemetry.get("target_source"),
         degraded_reason=telemetry.get("degraded_reason"),
+        failure_kind=telemetry.get("failure_kind"),
     )
     return result
