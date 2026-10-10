@@ -99,6 +99,8 @@ def get_video_generation_provider_catalog_entry(
 
 
 def video_generation_provider_catalog_payload() -> list[dict[str, object]]:
+    """Advertise current setup choices while keeping legacy route metadata readable."""
+
     return [
         {
             "providerId": entry.provider_id,
@@ -112,6 +114,7 @@ def video_generation_provider_catalog_payload() -> list[dict[str, object]]:
             "defaultModelVerification": entry.default_model_verification,
         }
         for entry in _VIDEO_GENERATION_PROVIDER_CATALOG
+        if entry.provider_id in {"openrouter", "tokenrhythm"}
     ]
 
 

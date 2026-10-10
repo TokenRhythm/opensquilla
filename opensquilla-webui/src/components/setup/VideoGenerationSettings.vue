@@ -2,6 +2,7 @@
 import { computed, inject, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
+import Icon from '@/components/Icon.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import type { DiscoveredModel } from '@/composables/setup/useSetupProviderForm'
 import { APP_SETTINGS_KEY, type SettingChange } from '@/modules/appSettings'
@@ -22,6 +23,10 @@ type VideoCredentialOption = {
   source: string
   envKey: string
   clearable: boolean
+  owner: string
+  baseUrl: string
+  sharedBaseUrl: string
+  apiKeyEnvAuthored: boolean | undefined
 }
 type VideoDraft = {
   enabled: boolean
@@ -32,6 +37,7 @@ type VideoDraft = {
   maxDurationSeconds: string
   aspectRatio: VideoAspect
   resolution: VideoResolution
+  credentialChanges: Partial<Record<ConfiguredVideoProvider, 'env' | 'shared'>>
 }
 
 const { t } = useI18n()
@@ -57,7 +63,19 @@ const discoveredModels = ref<Partial<Record<ConfiguredVideoProvider, {
   verifiedIds: string[]
 }>>>({})
 const directApiKey = ref('')
-const clearDirectKeyRequested = ref(false)
+const credentialEditorOpen = ref(false)
+const credentialInputMode = ref<'key' | 'env'>('key')
+const credentialEnvDraft = ref('')
+const credentialEndpointDraft = ref('')
+const credentialEndpointDrafts = new Map<ConfiguredVideoProvider, string>()
+const credentialChanges = ref<VideoDraft['credentialChanges']>({})
+const sharedCredentialPreviousDrafts = new Map<ConfiguredVideoProvider, {
+  connection: VideoProviderConnection
+  intent?: 'env'
+}>()
+const clearDirectKeyRequested = computed(() => (
+  isVideoProvider(provider.value) && credentialChanges.value[provider.value] === 'shared'
+))
 const enabled = ref(false)
 const provider = ref<VideoProvider>('')
 const primary = ref('')
@@ -102,15 +120,21 @@ const catalogProviders = ref<Partial<Record<ConfiguredVideoProvider, {
 }>>>({})
 const videoProviders = computed(() => fallbackVideoProviders.filter(option => (
   option.id === 'openrouter'
+  || option.id === provider.value
   || (option.id === 'gemini' && providerFieldSupported.value)
   || supportedProviderIds.value.has(option.id)
 )).map(option => ({
   ...option,
   label: catalogProviders.value[option.id]?.label || option.label,
 })))
-const additionalProviders = computed(() => videoProviders.value.filter(option => (
-  option.id !== 'openrouter' && option.id !== 'gemini'
+const selectableProviders = computed(() => videoProviders.value.filter(option => (
+  option.id === 'openrouter'
+  || (option.id === 'tokenrhythm' && providerFieldSupported.value && providerSettingsSupported.value)
 )))
+const legacyProvider = computed(() => (
+  isVideoProvider(provider.value) && provider.value !== 'openrouter' && provider.value !== 'tokenrhythm'
+    ? fallbackVideoProviders.find(option => option.id === provider.value) : null
+))
 const providerDefaults: Record<ConfiguredVideoProvider, { baseUrl: string; apiKeyEnv: string }> = {
   openrouter: { baseUrl: 'https://openrouter.ai/api/v1', apiKeyEnv: 'OPENROUTER_API_KEY' },
   gemini: { baseUrl: 'https://generativelanguage.googleapis.com/v1beta', apiKeyEnv: 'GEMINI_API_KEY' },
@@ -193,12 +217,6 @@ const savedDirectKeyAvailable = computed(() => (
   && credentialOptions.value[provider.value]?.source === 'video_direct'
   && credentialOptions.value[provider.value]?.available === true
 ))
-const canClearDirectKey = computed(() => (
-  isVideoProvider(provider.value)
-  && storedDirectKeys.value.has(provider.value)
-  && credentialOptions.value[provider.value]?.source === 'video_direct'
-  && credentialOptions.value[provider.value]?.clearable === true
-))
 const environmentManagedDirectKey = computed(() => (
   isVideoProvider(provider.value)
   && credentialOptions.value[provider.value]?.source === 'video_env_injected_direct'
@@ -206,10 +224,43 @@ const environmentManagedDirectKey = computed(() => (
   && baseUrl.value.trim() === savedProviderDrafts.get(provider.value)?.baseUrl
   && apiKeyEnv.value.trim() === savedProviderDrafts.get(provider.value)?.apiKeyEnv
 ))
+const effectiveBaseUrl = computed(() => {
+  if (!isVideoProvider(provider.value)) return baseUrl.value.trim()
+  const savedConnection = savedProviderDrafts.get(provider.value)
+  const option = credentialOptions.value[provider.value]
+  if (credentialEndpointDraft.value && (directApiKey.value.trim() || credentialChanges.value[provider.value] === 'env')
+    && baseUrl.value.trim() === savedConnection?.baseUrl) return credentialEndpointDraft.value
+  return baseUrl.value.trim() === savedConnection?.baseUrl
+    && apiKeyEnv.value.trim() === savedConnection?.apiKeyEnv
+    && !clearDirectKeyRequested.value
+    ? option?.baseUrl || baseUrl.value.trim()
+    : baseUrl.value.trim()
+})
+const credentialAvailable = computed(() => (
+  isVideoProvider(provider.value)
+  && savedCredentialAvailable(provider.value, providerDraft())
+  && !directApiKey.value.trim()
+))
+const credentialInputVisible = computed(() => (
+  !legacyProvider.value && !clearDirectKeyRequested.value
+  && (credentialEditorOpen.value || !credentialAvailable.value)
+))
+const canRestoreSharedCredential = computed(() => {
+  if (!isVideoProvider(provider.value)) return false
+  const option = credentialOptions.value[provider.value]
+  if (option?.source === 'video_env_injected_direct' && !option.clearable) return false
+  return storedDirectKeys.value.has(provider.value)
+    || option?.apiKeyEnvAuthored === true
+    || (option?.apiKeyEnvAuthored === undefined && option?.source === 'video_env')
+    || clearDirectKeyRequested.value
+})
 const credentialStatus = computed(() => {
   if (!provider.value) return t('setup.video.credentialHint')
   if (directApiKey.value.trim()) return t('setup.video.directKeyPending')
-  if (clearDirectKeyRequested.value) return t('setup.video.directKeyClearPending')
+  if (clearDirectKeyRequested.value) return t('setup.video.sharedCredentialPending')
+  if (credentialChanges.value[provider.value] === 'env') {
+    return t('setup.video.environmentReferencePending', { name: apiKeyEnv.value.trim() })
+  }
   if (environmentManagedDirectKey.value) {
     return t('setup.video.directKeyManagedByEnvironment', {
       name: credentialOptions.value[provider.value]?.envKey || '',
@@ -217,8 +268,9 @@ const credentialStatus = computed(() => {
   }
   if (savedDirectKeyAvailable.value) return t('setup.video.directKeyConfigured')
   const savedConnection = savedProviderDrafts.get(provider.value)
-  const sameConnection = baseUrl.value.trim() === savedConnection?.baseUrl
-    && apiKeyEnv.value.trim() === savedConnection?.apiKeyEnv
+  const sameConnection = credentialAvailable.value
+    || (baseUrl.value.trim() === savedConnection?.baseUrl
+      && apiKeyEnv.value.trim() === savedConnection?.apiKeyEnv)
   if (sameConnection) {
     const option = credentialOptions.value[provider.value]
     if (option?.available) {
@@ -293,16 +345,104 @@ function providerDraft(): VideoProviderDraft {
   }
 }
 
+function resetCredentialEditor(): void {
+  directApiKey.value = ''
+  credentialEditorOpen.value = false
+  credentialInputMode.value = 'key'
+  credentialEnvDraft.value = ''
+  credentialEndpointDraft.value = ''
+}
+
+function openCredentialEditor(): void {
+  credentialEndpointDraft.value = effectiveBaseUrl.value
+  credentialEditorOpen.value = true
+  credentialInputMode.value = 'key'
+}
+
+function onCredentialModeChange(event: Event): void {
+  const value = (event.target as HTMLSelectElement).value
+  if (value !== 'key' && value !== 'env') return
+  directApiKey.value = ''
+  credentialInputMode.value = value
+  credentialEndpointDraft.value = effectiveBaseUrl.value
+  if (isVideoProvider(provider.value) && credentialChanges.value[provider.value] === 'env') {
+    apiKeyEnv.value = savedProviderDrafts.get(provider.value)?.apiKeyEnv || ''
+    const next = { ...credentialChanges.value }
+    delete next[provider.value]
+    credentialChanges.value = next
+    credentialEndpointDrafts.delete(provider.value)
+  }
+  credentialEnvDraft.value = ''
+}
+
+function onEnvironmentReferenceInput(event: Event): void {
+  if (!isVideoProvider(provider.value)) return
+  const value = (event.target as HTMLInputElement).value
+  directApiKey.value = ''
+  credentialEnvDraft.value = value
+  if (!credentialEndpointDraft.value) credentialEndpointDraft.value = effectiveBaseUrl.value
+  const next = { ...credentialChanges.value }
+  if (value.trim()) {
+    if (!credentialEndpointDrafts.has(provider.value)) {
+      credentialEndpointDrafts.set(provider.value, credentialEndpointDraft.value)
+    }
+    apiKeyEnv.value = value
+    next[provider.value] = 'env'
+  } else {
+    apiKeyEnv.value = savedProviderDrafts.get(provider.value)?.apiKeyEnv || ''
+    delete next[provider.value]
+    credentialEndpointDrafts.delete(provider.value)
+  }
+  credentialChanges.value = next
+}
+
+function restoreSharedCredential(): void {
+  if (!isVideoProvider(provider.value) || !canRestoreSharedCredential.value) return
+  resetCredentialEditor()
+  if (clearDirectKeyRequested.value) {
+    const previous = sharedCredentialPreviousDrafts.get(provider.value)
+    apiKeyEnv.value = previous?.connection.apiKeyEnv || ''
+    baseUrl.value = previous?.connection.baseUrl || ''
+    const next = { ...credentialChanges.value }
+    delete next[provider.value]
+    if (previous?.intent) next[provider.value] = previous.intent
+    credentialChanges.value = next
+    if (previous?.intent === 'env') {
+      credentialEditorOpen.value = true
+      credentialInputMode.value = 'env'
+      credentialEnvDraft.value = apiKeyEnv.value
+      credentialEndpointDraft.value = credentialEndpointDrafts.get(provider.value) || ''
+    }
+    sharedCredentialPreviousDrafts.delete(provider.value)
+    return
+  }
+  sharedCredentialPreviousDrafts.set(provider.value, {
+    connection: providerDraft(),
+    intent: credentialChanges.value[provider.value] === 'env' ? 'env' : undefined,
+  })
+  const sharedBaseUrl = credentialOptions.value[provider.value]?.sharedBaseUrl
+  if (sharedBaseUrl) baseUrl.value = sharedBaseUrl
+  apiKeyEnv.value = ''
+  credentialChanges.value = { ...credentialChanges.value, [provider.value]: 'shared' }
+}
+
 function savedCredentialAvailable(
   id: ConfiguredVideoProvider,
   connection: VideoProviderConnection,
 ): boolean {
   const savedConnection = savedProviderDrafts.get(id)
   // Gateway credential status describes the saved connection, not draft edits.
-  return credentialOptions.value[id]?.available === true
-    && connection.baseUrl.trim() === savedConnection?.baseUrl
+  const option = credentialOptions.value[id]
+  const endpoint = connection.baseUrl.trim() === savedConnection?.baseUrl
+    ? option?.baseUrl || connection.baseUrl.trim() : connection.baseUrl.trim()
+  let endpointMatches = false
+  try {
+    endpointMatches = providerOrigin(endpoint) === providerOrigin(option?.baseUrl || savedConnection?.baseUrl || '')
+  } catch { /* Invalid URLs are handled by connection validation. */ }
+  return option?.available === true
+    && endpointMatches
     && connection.apiKeyEnv.trim() === savedConnection?.apiKeyEnv
-    && !(provider.value === id && clearDirectKeyRequested.value)
+    && !credentialChanges.value[id]
 }
 
 function providerSettingsDraft(): Partial<Record<ConfiguredVideoProvider, VideoProviderConnection>> {
@@ -313,15 +453,21 @@ function providerSettingsDraft(): Partial<Record<ConfiguredVideoProvider, VideoP
       ? providerDraft()
       : providerDrafts.get(option.id)
     result[option.id] = {
-      baseUrl: values?.baseUrl.trim() || '',
-      apiKeyEnv: values?.apiKeyEnv.trim() || '',
+      baseUrl: (credentialChanges.value[option.id] === 'env' || (provider.value === option.id && directApiKey.value.trim()))
+        && values?.baseUrl.trim() === savedProviderDrafts.get(option.id)?.baseUrl
+        ? (credentialChanges.value[option.id] === 'env' ? credentialEndpointDrafts.get(option.id) : credentialEndpointDraft.value)
+          || credentialOptions.value[option.id]?.baseUrl || values?.baseUrl.trim() || ''
+        : values?.baseUrl.trim() || '',
+      apiKeyEnv: credentialChanges.value[option.id] === 'shared'
+        || (provider.value === option.id && directApiKey.value.trim()) ? '' : values?.apiKeyEnv.trim() || '',
     }
   }
   return result
 }
 
 function rememberProviderDraft(): void {
-  if (isVideoProvider(provider.value)) providerDrafts.set(provider.value, providerDraft())
+  if (!isVideoProvider(provider.value)) return
+  providerDrafts.set(provider.value, providerDraft())
 }
 
 function applyProviderDraft(id: VideoProvider): void {
@@ -427,6 +573,10 @@ async function loadCredentialStatus(): Promise<void> {
         source: typeof option.source === 'string' ? option.source : 'none',
         envKey: typeof option.envKey === 'string' ? option.envKey : '',
         clearable: option.clearable === true,
+        owner: typeof option.owner === 'string' ? option.owner : 'none',
+        baseUrl: typeof option.baseUrl === 'string' ? option.baseUrl : '',
+        sharedBaseUrl: typeof option.sharedBaseUrl === 'string' ? option.sharedBaseUrl : '',
+        apiKeyEnvAuthored: typeof option.apiKeyEnvAuthored === 'boolean' ? option.apiKeyEnvAuthored : undefined,
       }
       if (option.available === true && option.source === 'video_direct') {
         storedDirectKeys.value.add(id)
@@ -452,6 +602,7 @@ function draft(): VideoDraft {
     maxDurationSeconds: String(maxDurationSeconds.value).trim(),
     aspectRatio: aspectRatio.value,
     resolution: resolution.value,
+    credentialChanges: { ...credentialChanges.value },
   }
 }
 
@@ -494,9 +645,10 @@ function providerConnectionError(
   }
   const savedConnection = savedProviderDrafts.get(id)
   const directKeyEntered = provider.value === id && Boolean(directApiKey.value.trim())
-  const clearRequested = provider.value === id && clearDirectKeyRequested.value
+  const clearRequested = credentialChanges.value[id] === 'shared'
   const savedDirectKey = storedDirectKeys.value.has(id)
-  const replacementEnv = Boolean(savedConnection && selectedEnv
+  const authoredEnvRequested = credentialChanges.value[id] === 'env' && Boolean(selectedEnv)
+  const replacementEnv = authoredEnvRequested || Boolean(savedConnection && selectedEnv
     && selectedEnv !== savedConnection.apiKeyEnv
     && selectedEnv !== providerDefaultConnection(id).apiKeyEnv)
   if (savedDirectKey && !directKeyEntered && !clearRequested && savedConnection
@@ -506,15 +658,15 @@ function providerConnectionError(
   const keepsSavedDirectKey = savedDirectKey && !clearRequested && savedConnection
     && endpoint === savedConnection.baseUrl
     && selectedEnv === savedConnection.apiKeyEnv
-  if (isCustomProviderOrigin(id, endpoint) && !directKeyEntered && !keepsSavedDirectKey
-    && !savedCredentialAvailable(id, connection) && (
+  if (!clearRequested && isCustomProviderOrigin(id, endpoint) && !directKeyEntered && !keepsSavedDirectKey
+    && !authoredEnvRequested && !savedCredentialAvailable(id, connection) && (
     !selectedEnv || selectedEnv === providerDefaultConnection(id).apiKeyEnv
   )) return t('setup.video.customEndpointNeedsEnv')
   return ''
 }
 
 const validationError = computed(() => {
-  if (enabled.value) {
+  if (enabled.value && !legacyProvider.value) {
     if (!provider.value) return t('setup.video.invalidProvider')
     const model = primary.value.trim()
     const parts = model.split('/')
@@ -539,6 +691,11 @@ const validationError = computed(() => {
   for (const option of videoProviders.value) {
     const connection = connections[option.id]
     if (!connection) continue
+    const previous = savedProviderDrafts.get(option.id)
+    if (provider.value !== option.id && !credentialChanges.value[option.id]
+      && connection.baseUrl === previous?.baseUrl && connection.apiKeyEnv === previous?.apiKeyEnv) continue
+    if (legacyProvider.value?.id === option.id
+      && connection.baseUrl === previous?.baseUrl && connection.apiKeyEnv === previous?.apiKeyEnv) continue
     const issue = providerConnectionError(option.id, connection)
     if (issue) return provider.value === option.id
       ? issue
@@ -547,6 +704,13 @@ const validationError = computed(() => {
   const maximum = Number(maxDurationSeconds.value)
   if (!Number.isInteger(maximum) || maximum < 1 || maximum > 60) {
     return t('setup.video.invalidMaxDuration')
+  }
+  if (legacyProvider.value) {
+    const requested = String(durationSeconds.value).trim()
+    if (requested && (!Number.isInteger(Number(requested)) || Number(requested) < 1 || Number(requested) > maximum)) {
+      return t('setup.video.invalidDuration', { max: maximum })
+    }
+    return ''
   }
   const happyHorse = (provider.value === 'qwen' || provider.value === 'qwen_token_plan')
     && primary.value.trim().startsWith('happyhorse-')
@@ -605,13 +769,15 @@ async function load(): Promise<void> {
     providerDrafts.clear()
     savedProviderDrafts.clear()
     storedDirectKeys.value.clear()
-    directApiKey.value = ''
-    clearDirectKeyRequested.value = false
+    resetCredentialEditor()
+    credentialChanges.value = {}
+    credentialEndpointDrafts.clear()
+    sharedCredentialPreviousDrafts.clear()
     const providerSettings = record(video.providers)
     supportedProviderIds.value = new Set(
       Object.keys(providerSettings).filter(isVideoProvider),
     )
-    for (const option of videoProviders.value) {
+    for (const option of fallbackVideoProviders) {
       const settings = record(providerSettings[option.id])
       if (settings.api_key_configured === true || Boolean(settings.api_key)) {
         storedDirectKeys.value.add(option.id)
@@ -631,9 +797,6 @@ async function load(): Promise<void> {
     provider.value = isVideoProvider(video.provider)
       ? video.provider
       : savedPrimary ? 'openrouter' : ''
-    if (!providerSettingsSupported.value && provider.value !== 'openrouter' && provider.value !== 'gemini') {
-      provider.value = ''
-    }
     if (isVideoProvider(provider.value)) {
       const selected = providerDrafts.get(provider.value)!
       selected.primary = savedPrimary
@@ -684,15 +847,16 @@ async function save(): Promise<boolean> {
     if (connection.baseUrl !== (prior?.baseUrl || '')) {
       changes.push({ path: `video_generation.providers.${option.id}.base_url`, value: connection.baseUrl })
     }
-    if (connection.apiKeyEnv !== (prior?.apiKeyEnv || '')) {
+    if (connection.apiKeyEnv !== (prior?.apiKeyEnv || '') || next.credentialChanges[option.id]) {
       changes.push({ path: `video_generation.providers.${option.id}.api_key_env`, value: connection.apiKeyEnv })
+    }
+    if (next.credentialChanges[option.id] === 'shared') {
+      changes.push({ path: `video_generation.providers.${option.id}.api_key`, value: '' })
     }
   }
   const enteredKey = directApiKey.value.trim()
   if (isVideoProvider(provider.value) && enteredKey) {
     changes.push({ path: `video_generation.providers.${provider.value}.api_key`, value: enteredKey })
-  } else if (isVideoProvider(provider.value) && clearDirectKeyRequested.value) {
-    changes.push({ path: `video_generation.providers.${provider.value}.api_key`, value: '' })
   }
   if (!changes.length) return true
 
@@ -711,17 +875,30 @@ async function save(): Promise<boolean> {
           storedDirectKeys.value.delete(option.id)
         }
       }
+      if (next.credentialChanges[option.id] === 'shared') storedDirectKeys.value.delete(option.id)
+      if (next.credentialChanges[option.id] === 'env' && !(provider.value === option.id && enteredKey)) {
+        storedDirectKeys.value.delete(option.id)
+      }
     }
     if (isVideoProvider(provider.value) && enteredKey) storedDirectKeys.value.add(provider.value)
     if (isVideoProvider(provider.value) && clearDirectKeyRequested.value) {
       storedDirectKeys.value.delete(provider.value)
       credentialOptions.value = { ...credentialOptions.value, [provider.value]: undefined }
     }
-    directApiKey.value = ''
-    clearDirectKeyRequested.value = false
-    rememberProviderDraft()
+    for (const option of videoProviders.value) {
+      const connection = next.providerSettings[option.id]
+      const values = providerDrafts.get(option.id)
+      if (!connection || !values) continue
+      providerDrafts.set(option.id, { ...values, ...connection,
+        primary: provider.value === option.id ? primary.value.trim() : values.primary })
+    }
+    resetCredentialEditor()
+    credentialChanges.value = {}
+    credentialEndpointDrafts.clear()
+    sharedCredentialPreviousDrafts.clear()
+    if (isVideoProvider(provider.value)) applyProviderDraft(provider.value)
     for (const [id, values] of providerDrafts) savedProviderDrafts.set(id, { ...values })
-    saved.value = next
+    saved.value = draft()
     message.value = t(result.restartRequired
       ? 'setup.video.savedRestart'
       : 'setup.video.saved')
@@ -737,8 +914,10 @@ async function save(): Promise<boolean> {
 
 function discard(): void {
   if (!saved.value || busy.value) return
-  directApiKey.value = ''
-  clearDirectKeyRequested.value = false
+  resetCredentialEditor()
+  credentialChanges.value = {}
+  credentialEndpointDrafts.clear()
+  sharedCredentialPreviousDrafts.clear()
   enabled.value = saved.value.enabled
   providerDrafts.clear()
   for (const [id, values] of savedProviderDrafts) providerDrafts.set(id, { ...values })
@@ -755,25 +934,25 @@ function discard(): void {
 
 function onProviderChange(event: Event): void {
   const selected = (event.target as HTMLSelectElement).value
-  if (selected !== '' && !isVideoProvider(selected)) return
+  if (selected !== '' && selected !== 'openrouter' && selected !== 'tokenrhythm') return
   if (selected !== 'openrouter' && !providerFieldSupported.value) return
-  if (selected !== '' && selected !== 'openrouter' && selected !== 'gemini'
+  if (selected !== '' && selected !== 'openrouter'
     && !providerSettingsSupported.value) return
   if (provider.value === selected) return
-  directApiKey.value = ''
-  clearDirectKeyRequested.value = false
   rememberProviderDraft()
+  resetCredentialEditor()
   provider.value = selected
   applyProviderDraft(provider.value)
+  if (isVideoProvider(selected) && credentialChanges.value[selected] === 'env') {
+    credentialEditorOpen.value = true
+    credentialInputMode.value = 'env'
+    credentialEnvDraft.value = apiKeyEnv.value
+    credentialEndpointDraft.value = credentialEndpointDrafts.get(selected) || ''
+  }
   if (providerFieldSupported.value && isVideoProvider(selected) && !primary.value.trim()) {
     primary.value = providerDefaultModel(selected)
   }
   if (isVideoProvider(selected)) void discoverVideoModels(selected)
-}
-
-function toggleDirectKeyClear(): void {
-  directApiKey.value = ''
-  clearDirectKeyRequested.value = !clearDirectKeyRequested.value
 }
 
 defineExpose({ save, discard, refreshCredentialStatus: loadCredentialStatus })
@@ -830,15 +1009,14 @@ onMounted(() => {
             <select class="control-input" name="setup_video_provider" :value="provider" :disabled="busy"
               @change="onProviderChange">
               <option value="">{{ t('setup.video.providerPlaceholder') }}</option>
-              <option value="openrouter">OpenRouter</option>
-              <option v-if="providerFieldSupported" value="gemini">Google Gemini</option>
-              <template v-if="providerFieldSupported && providerSettingsSupported">
-                <option v-for="option in additionalProviders"
-                  :key="option.id" :value="option.id">{{ option.label }}</option>
-              </template>
+              <option v-for="option in selectableProviders" :key="option.id" :value="option.id">{{ option.label }}</option>
+              <option v-if="legacyProvider" :value="legacyProvider.id" disabled>{{ legacyProvider.label }}</option>
             </select>
           </span>
         </label>
+        <p v-if="legacyProvider" class="video-settings__hint" role="note" data-testid="video-legacy-provider-notice">
+          {{ t('setup.video.legacySelectionNotice', { provider: legacyProvider.label }) }}
+        </p>
         <p v-if="!providerFieldSupported" class="video-settings__hint">
           {{ t('setup.video.legacyProviderHint') }}
         </p>
@@ -846,16 +1024,12 @@ onMounted(() => {
           {{ t('setup.video.legacySettingsHint') }}
         </p>
 
-        <label v-if="provider === 'gemini'" class="control-row">
+        <label v-if="legacyProvider" class="control-row">
           <span class="control-row__label-block">
             <span class="control-row__label">{{ t('setup.video.modelLabel') }}</span>
-            <span class="control-row__desc">{{ t('setup.video.geminiModelHint') }}</span>
           </span>
           <span class="control-row__control">
-            <select v-model="primary" class="control-input" name="setup_video_gemini_model" :disabled="busy">
-              <option value="">{{ t('setup.video.modelPlaceholder') }}</option>
-              <option v-for="model in fallbackSuggestedModels.gemini" :key="model" :value="model">{{ model }}</option>
-            </select>
+            <input :value="primary" class="control-input" name="setup_video_legacy_model" readonly>
           </span>
         </label>
         <SetupModelCombobox
@@ -876,36 +1050,31 @@ onMounted(() => {
           {{ tokenRhythmModelStatus }}
         </p>
 
-        <template v-if="provider && providerSettingsSupported">
-          <label class="control-row">
-            <span class="control-row__label-block">
-              <span class="control-row__label">{{ t('setup.video.baseUrlLabel') }}</span>
-              <span class="control-row__desc">{{ t('setup.video.baseUrlHint') }}</span>
-            </span>
-            <span class="control-row__control">
-              <input v-model="baseUrl" class="control-input" name="setup_video_base_url"
-                type="url" inputmode="url" spellcheck="false" autocomplete="off"
-                :disabled="busy" placeholder="https://api.example.com/v1">
-            </span>
-          </label>
-          <label class="control-row">
-            <span class="control-row__label-block">
-              <span class="control-row__label">{{ t('setup.video.apiKeyEnvLabel') }}</span>
-              <span class="control-row__desc">{{ t('setup.video.apiKeyEnvHint') }}</span>
-            </span>
-            <span class="control-row__control">
-              <input v-model="apiKeyEnv" class="control-input" name="setup_video_api_key_env"
-                type="text" spellcheck="false" autocomplete="off" :disabled="busy">
-            </span>
-          </label>
+        <template v-if="provider && providerSettingsSupported && !legacyProvider">
           <div class="control-row">
             <span class="control-row__label-block">
               <span class="control-row__label">{{ t('setup.video.credentialSourceLabel') }}</span>
-              <span class="control-row__desc">{{ t('setup.video.directApiKeyHint') }}</span>
+              <span class="control-row__desc">{{ t('setup.video.credentialReuseHint') }}</span>
             </span>
             <span class="control-row__control video-settings__credential-control">
-              <span class="video-settings__credential-status" role="status">{{ credentialStatus }}</span>
-              <input v-model="directApiKey" class="control-input" name="setup_video_api_key"
+              <span class="video-settings__credential-card" :class="{ 'is-ready': credentialAvailable }" role="status">
+                <Icon :name="credentialAvailable ? 'check' : 'info'" :size="14" aria-hidden="true" />
+                <span class="video-settings__credential-status">{{ credentialStatus }}</span>
+              </span>
+              <span class="video-settings__endpoint" data-testid="video-effective-base-url">{{ effectiveBaseUrl }}</span>
+              <button v-if="credentialAvailable && !credentialEditorOpen && !environmentManagedDirectKey"
+                type="button" class="btn btn--ghost" :disabled="busy" data-testid="video-edit-credential"
+                @click="openCredentialEditor">{{ t(savedDirectKeyAvailable ? 'setup.video.replaceDedicatedCredential' : 'setup.video.useDedicatedCredential') }}</button>
+              <template v-if="credentialInputVisible">
+                <label class="video-settings__credential-mode">
+                  <span>{{ t('setup.video.credentialInputModeLabel') }}</span>
+                  <select :value="credentialInputMode" name="setup_video_credential_mode" class="control-input" :disabled="busy"
+                    @change="onCredentialModeChange">
+                    <option value="key">{{ t('setup.common.apiKey') }}</option>
+                    <option value="env">{{ t('setup.video.environmentReferenceOption') }}</option>
+                  </select>
+                </label>
+                <input v-if="credentialInputMode === 'key'" v-model="directApiKey" class="control-input" name="setup_video_api_key"
                 type="password" autocomplete="off" :disabled="busy"
                 data-1p-ignore data-bwignore data-form-type="other" data-lpignore="true"
                 data-protonpass-ignore="true"
@@ -913,15 +1082,38 @@ onMounted(() => {
                 :placeholder="savedDirectKeyAvailable
                   ? t('setup.video.directApiKeyKeepPlaceholder')
                   : t('setup.video.directApiKeyNewPlaceholder')"
-                @input="clearDirectKeyRequested = false">
-              <button v-if="canClearDirectKey" type="button" class="btn btn--ghost"
-                :disabled="busy" @click="toggleDirectKeyClear">
-                {{ t(clearDirectKeyRequested
-                  ? 'setup.video.cancelDirectKeyClear'
-                  : 'setup.video.clearDirectKey') }}
+                @input="credentialEndpointDraft ||= effectiveBaseUrl"
+                >
+                <label v-else class="video-settings__credential-mode">
+                  <span>{{ t('setup.video.apiKeyEnvLabel') }}</span>
+                  <input :value="credentialEnvDraft" class="control-input" name="setup_video_api_key_env"
+                    type="text" spellcheck="false" autocomplete="off" :disabled="busy"
+                    :placeholder="providerDefaultConnection(provider).apiKeyEnv" @input="onEnvironmentReferenceInput">
+                  <span class="control-row__desc">{{ t('setup.video.apiKeyEnvHint') }}</span>
+                </label>
+                <span v-if="credentialInputMode === 'key'" class="control-row__desc">{{ t('setup.video.directApiKeyHint') }}</span>
+              </template>
+              <button v-if="canRestoreSharedCredential" type="button" class="btn btn--ghost"
+                :disabled="busy" data-testid="video-restore-shared-credential" @click="restoreSharedCredential">
+                {{ t(clearDirectKeyRequested ? 'setup.video.cancelSharedCredential' : 'setup.video.restoreSharedCredential') }}
               </button>
             </span>
           </div>
+          <details class="video-settings__connection-options">
+            <summary>{{ t('setup.video.connectionOptions') }}</summary>
+            <label class="control-row">
+              <span class="control-row__label-block">
+                <span class="control-row__label">{{ t('setup.video.baseUrlLabel') }}</span>
+                <span class="control-row__desc">{{ t('setup.video.baseUrlHint') }}</span>
+              </span>
+              <span class="control-row__control">
+                <input :value="effectiveBaseUrl" class="control-input" name="setup_video_base_url"
+                  type="url" inputmode="url" spellcheck="false" autocomplete="off"
+                  :disabled="busy" placeholder="https://api.example.com/v1"
+                  @input="baseUrl = ($event.target as HTMLInputElement).value">
+              </span>
+            </label>
+          </details>
         </template>
 
         <label class="control-row">
@@ -969,7 +1161,7 @@ onMounted(() => {
         </label>
 
         <p class="video-settings__hint">
-          {{ credentialStatus }} {{ t('setup.video.credentialVerificationHint') }}
+          {{ t('setup.video.credentialVerificationHint') }}
         </p>
         <p v-if="validationError" class="video-settings__error" role="alert">{{ validationError }}</p>
         <p v-else-if="error" class="video-settings__error" role="alert">{{ error }}</p>
@@ -1026,7 +1218,13 @@ onMounted(() => {
 .video-settings__error { color: var(--danger); font-size: 13px; }
 .video-settings__message { color: var(--ok); font-size: 13px; }
 .video-settings__credential-control { display: grid; gap: 8px; }
+.video-settings__credential-card { display: flex; align-items: flex-start; gap: var(--sp-2); padding: var(--sp-3); border: 1px solid var(--border); border-radius: var(--radius-md); }
+.video-settings__credential-card.is-ready { color: var(--ok); }
 .video-settings__credential-status { color: var(--text-muted); font-size: 13px; line-height: 1.4; }
+.video-settings__credential-mode { display: grid; gap: var(--sp-2); font-size: 13px; }
+.video-settings__endpoint { overflow-wrap: anywhere; color: var(--text-muted); font-size: 12px; }
+.video-settings__connection-options { color: var(--text-muted); font-size: 13px; padding-block: var(--sp-3); }
+.video-settings__connection-options summary { cursor: pointer; }
 .video-settings__actions { display: flex; justify-content: flex-end; margin-top: var(--sp-3); }
 @media (prefers-reduced-motion: reduce) {
   .video-settings__chevron { transition: none; }

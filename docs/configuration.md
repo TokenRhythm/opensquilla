@@ -246,14 +246,16 @@ Read: [`providers-and-models.md`](providers-and-models.md)
 
 ## Video Generation
 
-Video generation is disabled by default. Select a provider and one of its
-text-to-video models in Settings, or configure them in TOML:
+Video generation is disabled by default. Select TokenRhythm or OpenRouter and
+one of its text-to-video models in Settings, or configure them in TOML. If the
+same Provider is already configured, its credential is reused without entering
+another key:
 
 ```toml
 [video_generation]
 enabled = true
-provider = "gemini"
-primary = "veo-3.1-fast-generate-preview"
+provider = "tokenrhythm"
+primary = "wan3.0-video"
 duration_seconds = 8
 max_duration_seconds = 8
 aspect_ratio = "16:9"
@@ -262,42 +264,46 @@ resolution = "720p"
 allowed_resolutions = ["720p", "1080p"]
 timeout_seconds = 600
 max_output_bytes = 104857600 # 100 MiB
-
-# Optional: choose the native API endpoint and key reference for this provider.
-[video_generation.providers.gemini]
-base_url = "https://generativelanguage.googleapis.com/v1beta"
-api_key_env = "GEMINI_API_KEY"
 ```
 
-OpenRouter uses a raw model ID such as `google/veo-3.1-fast`. Gemini uses a
-native model ID such as `veo-3.1-fast-generate-preview`. The other supported
-provider IDs are `xai`, `qwen`, `tokenrhythm`, and `qwen_token_plan`; use each
-provider's native video model ID in `primary`. `qwen` uses the standard
-DashScope video API, while `qwen_token_plan` uses its separate subscription
-endpoint and credential. These are video-capable routes; an image provider is
-not automatically a video provider. Existing configurations with `primary`
-but no `provider` continue to use OpenRouter. A new installation does not
-select a provider automatically.
+OpenRouter uses a raw model ID such as `google/veo-3.1-fast`; TokenRhythm uses
+its native model ID. The `wan3.0-video` example is documented by TokenRhythm;
+model access still depends on the account. Existing Gemini, xAI, Qwen, and
+Qwen Token Plan routes remain readable and usable for compatibility, but are
+not offered for new selections in Settings. Settings preserves an existing
+route until you explicitly select its replacement. Existing configurations
+with `primary` but no `provider` continue to use OpenRouter. A new installation
+does not select a provider automatically.
 
 Each `video_generation.providers.<provider>` section accepts `base_url`,
-`api_key_env`, and an optional direct `api_key`. Settings can save a direct key
-or use a Gateway environment variable. The default API roots are the providers'
-official endpoints. Their default environment variables are `OPENROUTER_API_KEY`,
-`GEMINI_API_KEY`, `XAI_API_KEY`,
-`DASHSCOPE_API_KEY`, `TOKENRHYTHM_API_KEY`, and `QWEN_TOKEN_PLAN_API_KEY`.
-Set `base_url` to a compatible native API endpoint for a different region or
-an operator-controlled proxy; set `api_key_env` to an explicit environment
-variable when the endpoint is on a different origin. For example:
+`api_key_env`, and an optional direct `api_key`. A direct API key and an
+environment-variable reference are alternative credential sources; you do not
+need to configure both. Settings shows the resolved credential source and
+offers an optional dedicated credential editor. Environment-variable names
+refer to values available to the Gateway process, rather than containing a key.
+You can explicitly return to shared credentials by removing the video key and
+video environment-variable reference.
+
+Without a dedicated video credential, a matching configured primary Provider
+or profile supplies the key. A video API URL that has not been explicitly set
+also follows that Provider's endpoint. Explicit video endpoints and credentials
+retain their own bindings. A default environment key or same-origin image
+credential can be used when no matching Provider is configured. The default
+environment names for the two selectable providers are `OPENROUTER_API_KEY`
+and `TOKENRHYTHM_API_KEY`.
+
+For a dedicated compatible proxy, choose its URL and an explicit environment
+reference, or enter a dedicated key in Settings. For example:
 
 ```toml
 [video_generation]
 enabled = true
-provider = "qwen"
-primary = "wan2.7-t2v"
+provider = "openrouter"
+primary = "google/veo-3.1-fast"
 
-[video_generation.providers.qwen]
-base_url = "https://dashscope-intl.aliyuncs.com/api/v1"
-api_key_env = "VIDEO_QWEN_API_KEY"
+[video_generation.providers.openrouter]
+base_url = "https://video.example.com/api/v1"
+api_key_env = "VIDEO_PROXY_API_KEY"
 ```
 
 Custom endpoints must use HTTPS, except for an HTTP loopback service. A video
@@ -307,13 +313,13 @@ custom endpoint to a different origin unless the key reference was explicitly
 configured for that endpoint. A matching primary model-service or profile
 credential can be reused when its endpoint has the same origin. No video key
 is needed when the same provider's image generation key already covers that
-origin. A direct video key entered in Settings is stored in the local Gateway
-configuration, tied to its endpoint, and redacted from settings reads. The tools
-appear only when video generation is enabled and the selected model and credential are
-available. An existing accepted job can still expose `video_status` for recovery
+origin when no matching model-service Provider is configured. A direct video
+key entered in Settings is stored in the local Gateway configuration, tied to
+its endpoint, and redacted from settings reads. The tools appear only when video
+generation is enabled and the selected model and credential are available. An
+existing accepted job can still expose `video_status` for recovery
 after the generation setting is disabled. The official OpenRouter model catalog
-is checked before submission. Gemini Veo 3.1 supports 4, 6, or 8 second clips;
-1080p requires 8 seconds.
+is checked before submission.
 
 The defaults allow agent-selected clips within an 8 second maximum. When neither
 the tool call nor the config specifies a duration, each adapter selects a

@@ -21,7 +21,6 @@ def resolve_video_generation_state(config: GatewayConfig) -> dict[str, object]:
             video_generation_credential_status(
                 config,
                 provider_id=spec.provider_id,
-                base_url=getattr(video.providers, spec.provider_id).base_url,
             )
             for spec in list_video_generation_provider_catalog_entries()
         ],

@@ -1024,6 +1024,12 @@ async def test_video_url_and_explicit_env_patch_replaces_old_direct_key(
         "owner": "video",
         "envKey": "VIDEO_PROXY_KEY",
         "clearable": False,
+        "baseUrl": "https://video-proxy.example/v1",
+        "baseUrlSource": "video",
+        "baseUrlAuthored": True,
+        "apiKeyEnvAuthored": True,
+        "sharedBaseUrl": "",
+        "sharedCredentialAvailable": False,
     }
 
 
@@ -1065,6 +1071,12 @@ async def test_clearing_video_direct_key_reuses_matching_image_key(
         "owner": "image",
         "envKey": "",
         "clearable": False,
+        "baseUrl": VIDEO_GENERATION_OFFICIAL_BASE_URLS["tokenrhythm"],
+        "baseUrlSource": "default",
+        "baseUrlAuthored": False,
+        "apiKeyEnvAuthored": False,
+        "sharedBaseUrl": "",
+        "sharedCredentialAvailable": False,
     }
 
 
@@ -1094,3 +1106,83 @@ async def test_video_generation_custom_endpoint_does_not_author_default_env(
     assert stored == {"base_url": "https://video-proxy.example/v1"}
     assert "api_key_env" in config.video_generation.providers.xai.model_fields_set
     assert "api_key_env" not in config._persist_raw_base["video_generation"]["providers"]["xai"]
+
+
+@pytest.mark.parametrize("source", ["direct", "env"])
+async def test_clearing_video_override_restores_provider_without_copying_its_key(
+    tmp_path, monkeypatch, source: str
+) -> None:
+    from opensquilla.onboarding.config_store import load_config
+    from opensquilla.tools.builtin import media
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("SYNTHETIC_MISSING_VIDEO_KEY", raising=False)
+    dedicated = {"api_key": "synthetic-video-override-key"} if source == "direct" else {
+        "api_key_env": "SYNTHETIC_MISSING_VIDEO_KEY"
+    }
+    config_path = tmp_path / "config.toml"
+    config = GatewayConfig.model_validate({
+        "config_path": str(config_path),
+        "llm": {"provider": "openrouter", "api_key": "synthetic-shared-provider-key",
+                "base_url": "https://provider-proxy.example/v1"},
+        "video_generation": {"enabled": True, "primary": "google/veo-3.1-fast",
+                             "providers": {"openrouter": dedicated}},
+    })
+    monkeypatch.setattr(media, "configure_video_generation", lambda *_args, **_kwargs: None)
+    before = media.video_generation_credential_status(config, provider_id="openrouter")
+    assert before["source"] == ("video_direct" if source == "direct" else "missing_env")
+    assert before["baseUrl"] == VIDEO_GENERATION_OFFICIAL_BASE_URLS["openrouter"]
+
+    await _handle_config_patch({"patches": {
+        "video_generation.providers.openrouter.api_key": "",
+        "video_generation.providers.openrouter.api_key_env": "",
+    }}, SimpleNamespace(config=config))
+
+    for candidate in (config, load_config(config_path)):
+        status = media.video_generation_credential_status(candidate, provider_id="openrouter")
+        assert candidate.video_generation.provider == ""
+        assert candidate.video_generation.effective_provider == "openrouter"
+        assert status["available"] is True
+        assert status["source"] == "llm_fallback"
+        assert status["baseUrl"] == "https://provider-proxy.example/v1"
+        assert status["baseUrlAuthored"] is False
+        assert status["apiKeyEnvAuthored"] is False
+        assert candidate.video_generation.providers.openrouter.api_key == ""
+    contents = config_path.read_text()
+    assert contents.count("synthetic-shared-provider-key") == 1
+    assert "synthetic-video-override-key" not in contents
+
+
+async def test_restore_provider_credential_for_existing_explicit_video_endpoint(
+    tmp_path, monkeypatch
+) -> None:
+    from opensquilla.onboarding.config_store import load_config
+    from opensquilla.tools.builtin import media
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    config_path = tmp_path / "config.toml"
+    config = GatewayConfig.model_validate({
+        "config_path": str(config_path),
+        "llm": {"provider": "openrouter", "api_key": "synthetic-shared-provider-key",
+                "base_url": "https://provider-proxy.example/v1"},
+        "video_generation": {"enabled": True, "primary": "google/veo-3.1-fast", "providers": {
+            "openrouter": {"base_url": VIDEO_GENERATION_OFFICIAL_BASE_URLS["openrouter"],
+                           "api_key": "synthetic-video-override-key"}
+        }},
+    })
+    monkeypatch.setattr(media, "configure_video_generation", lambda *_args, **_kwargs: None)
+    before = media.video_generation_credential_status(config, provider_id="openrouter")
+    assert before["baseUrlAuthored"] is True
+    assert before["sharedCredentialAvailable"] is True
+    await _handle_config_patch({"patches": {
+        "video_generation.providers.openrouter.api_key": "",
+        "video_generation.providers.openrouter.api_key_env": "",
+        "video_generation.providers.openrouter.base_url": before["sharedBaseUrl"],
+    }}, SimpleNamespace(config=config))
+    status = media.video_generation_credential_status(
+        load_config(config_path), provider_id="openrouter"
+    )
+    assert status["available"] is True
+    assert status["source"] == "llm_fallback"
+    assert status["baseUrl"] == "https://provider-proxy.example/v1"
+    assert status["baseUrlAuthored"] is True

@@ -11,6 +11,7 @@ from opensquilla.onboarding import video_generation_model_discovery as discovery
 from opensquilla.onboarding.setup_engine import setup_catalog_payload
 from opensquilla.provider.video_generation_catalog import (
     get_video_generation_provider_catalog_entry,
+    list_video_generation_provider_catalog_entries,
     video_generation_provider_catalog_payload,
 )
 from opensquilla.provider.video_generation_policy import (
@@ -22,14 +23,7 @@ from opensquilla.provider.video_generation_policy import (
 def test_video_provider_catalog_uses_runtime_endpoints_and_model_defaults() -> None:
     rows = video_generation_provider_catalog_payload()
 
-    assert {row["providerId"] for row in rows} == {
-        "openrouter",
-        "gemini",
-        "xai",
-        "qwen",
-        "qwen_token_plan",
-        "tokenrhythm",
-    }
+    assert [row["providerId"] for row in rows] == ["openrouter", "tokenrhythm"]
     for row in rows:
         provider_id = str(row["providerId"])
         assert row["envKey"] == VIDEO_GENERATION_DEFAULT_ENV_KEYS[provider_id]
@@ -41,6 +35,27 @@ def test_video_provider_catalog_uses_runtime_endpoints_and_model_defaults() -> N
     assert tokenrhythm["defaultModel"] == "wan3.0-video"
     assert tokenrhythm["defaultModelVerification"] == "documented"
     assert setup_catalog_payload("video") == {"videoGenerationProviders": rows}
+
+
+@pytest.mark.parametrize("section", [None, "video", "video-generation", "video_generation"])
+def test_setup_video_catalog_only_advertises_current_providers(section: str | None) -> None:
+    rows = setup_catalog_payload(section)["videoGenerationProviders"]
+
+    assert [row["providerId"] for row in rows] == ["openrouter", "tokenrhythm"]
+
+
+@pytest.mark.parametrize("provider_id", ["gemini", "xai", "qwen", "qwen_token_plan"])
+def test_legacy_video_metadata_remains_readable_for_existing_routes(provider_id: str) -> None:
+    entry = get_video_generation_provider_catalog_entry(provider_id)
+
+    assert entry in list_video_generation_provider_catalog_entries()
+    assert entry.provider_id == provider_id
+    assert entry.env_key == VIDEO_GENERATION_DEFAULT_ENV_KEYS[provider_id]
+    assert entry.default_base_url == VIDEO_GENERATION_OFFICIAL_BASE_URLS[provider_id]
+    assert entry.default_model in entry.suggested_models
+    assert provider_id not in {
+        row["providerId"] for row in video_generation_provider_catalog_payload()
+    }
 
 
 def test_video_catalog_rejects_unknown_provider() -> None:

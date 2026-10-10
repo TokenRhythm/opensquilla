@@ -1514,7 +1514,7 @@ async def video_generate(
         raise ToolError("Video prompt is too long")
     config, credential = _video_request_config()
     provider = _video_provider(config)
-    base_url = _video_base_url(config, provider)
+    base_url = _video_base_url(config, provider, gateway_config=_video_gateway_config)
     duration, aspect, size = _video_parameters(
         config,
         duration_seconds=duration_seconds,
@@ -1653,7 +1653,7 @@ async def video_status(job_id: str, filename: str | None = None) -> str:
     if receipt is None:
         config, credential = _video_request_config()
         provider = _video_provider(config)
-        base_url = _video_base_url(config, provider)
+        base_url = _video_base_url(config, provider, gateway_config=_video_gateway_config)
     else:
         ctx = current_tool_context.get()
         if ctx is not None and ctx.caller_kind is CallerKind.SUBAGENT:
@@ -1671,7 +1671,7 @@ async def video_status(job_id: str, filename: str | None = None) -> str:
             current_credential = _VideoCredential(available=False)
         if (
             _video_provider(config) == provider
-            and _video_base_url(config, provider) == base_url
+            and _video_base_url(config, provider, gateway_config=_video_gateway_config) == base_url
             and current_credential.available
         ):
             credential = current_credential

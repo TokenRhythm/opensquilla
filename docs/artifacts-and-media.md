@@ -198,8 +198,7 @@ dependencies, and runtime policy.
 After [configuring video generation](configuration.md#video-generation), ask
 for a short clip in chat. The Agent may call `video_generate` with a text
 prompt and optional duration, aspect ratio, resolution, or workspace filename.
-The selected OpenRouter, Gemini, xAI, Qwen, Qwen Token Plan, or TokenRhythm
-video model produces an MP4 in the
+The selected TokenRhythm or OpenRouter video model produces an MP4 in the
 workspace, which the tool registers as an artifact for Web UI or supported
 channel delivery. This release supports text-to-video only.
 

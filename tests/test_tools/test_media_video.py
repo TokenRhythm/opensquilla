@@ -100,7 +100,7 @@ def test_video_route_can_reuse_matching_primary_openrouter_credential(
         media.configure_video_generation(None)
 
 
-def test_dedicated_openrouter_key_overrides_unrelated_llm_endpoint(
+def test_saved_openrouter_provider_precedes_implicit_environment_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", "dedicated-video-key")
@@ -119,9 +119,67 @@ def test_dedicated_openrouter_key_overrides_unrelated_llm_endpoint(
     try:
         assert media.video_generation_available() is True
         _, credential = media._video_request_config()
-        assert credential.api_key == "dedicated-video-key"
+        assert credential.api_key == "proxy-only-key"
+        assert credential.source == "llm_fallback"
+        assert media._video_base_url(
+            gateway.video_generation, "openrouter", gateway_config=gateway
+        ) == "https://proxy.example/api/v1"
     finally:
         media.configure_video_generation(None)
+
+
+@pytest.mark.asyncio
+async def test_shared_provider_submission_and_recovery_keep_the_job_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    endpoint = "https://provider-proxy.example/videos/v1"
+    gateway = GatewayConfig.model_validate({
+        "llm": {"provider": "openrouter", "api_key": "synthetic-provider-video-key",
+                "base_url": endpoint},
+        "video_generation": {"enabled": True, "primary": "google/veo-3.1-fast"},
+    })
+    calls: list[dict[str, object]] = []
+
+    async def fake_generate(**kwargs: object) -> None:
+        calls.append(kwargs)
+        raise video_generation.VideoGenerationPending("waiting", job_id="shared-provider-job")
+
+    async def fake_resume(**kwargs: object) -> video_generation.VideoGenerationResult:
+        calls.append(kwargs)
+        path = kwargs["output_path"]
+        assert isinstance(path, Path)
+        path.write_bytes(b"\x00\x00\x00\x0cftypisom")
+        return video_generation.VideoGenerationResult(
+            job_id="shared-provider-job", output_path=path, model=str(kwargs["model"]),
+            bytes_written=12,
+        )
+
+    monkeypatch.setattr(video_generation, "generate_openrouter_video", fake_generate)
+    monkeypatch.setattr(video_generation, "resume_openrouter_video", fake_resume)
+    media.configure_video_generation(gateway.video_generation, gateway_config=gateway)
+    token = current_tool_context.set(_context(tmp_path, artifacts=True))
+    handle = ""
+    try:
+        pending = json.loads(await media.video_generate("A synthetic clip of a paper kite"))
+        handle = pending["job_id"]
+        assert media._video_job_receipt(handle).base_url == endpoint
+        gateway.llm.base_url = "https://provider-proxy.example/new-api/v1"
+        finished = json.loads(await media.video_status(handle))
+        assert finished["status"] == "ok"
+        gateway.llm.base_url = "https://another-provider-proxy.example/v1"
+        with pytest.raises(ToolError, match="unavailable in this session"):
+            await media.video_status(handle)
+    finally:
+        current_tool_context.reset(token)
+        media.configure_video_generation(None)
+        if handle:
+            with media._video_job_sessions_lock:
+                media._video_job_sessions.pop(handle, None)
+    assert [call["base_url"] for call in calls] == [endpoint, endpoint]
+    assert [call["api_key"] for call in calls] == [
+        "synthetic-provider-video-key", "synthetic-provider-video-key"
+    ]
 
 
 def test_tokenrhythm_video_reuses_same_origin_image_direct_key(
@@ -156,6 +214,12 @@ def test_tokenrhythm_video_reuses_same_origin_image_direct_key(
             "owner": "image",
             "envKey": "",
             "clearable": False,
+            "baseUrl": VIDEO_GENERATION_OFFICIAL_BASE_URLS["tokenrhythm"],
+            "baseUrlSource": "default",
+            "baseUrlAuthored": False,
+            "apiKeyEnvAuthored": False,
+            "sharedBaseUrl": "",
+            "sharedCredentialAvailable": False,
         }
     finally:
         media.configure_video_generation(None)
@@ -227,6 +291,12 @@ def test_video_reuses_image_env_for_matching_custom_origin(
         "owner": "image",
         "envKey": "IMAGE_PROXY_TOKEN",
         "clearable": False,
+        "baseUrl": "https://media-proxy.example/videos/v1",
+        "baseUrlSource": "video",
+        "baseUrlAuthored": True,
+        "apiKeyEnvAuthored": False,
+        "sharedBaseUrl": "",
+        "sharedCredentialAvailable": False,
     }
 
 
@@ -290,6 +360,12 @@ def test_stale_video_direct_key_can_use_authored_env_without_reusing_old_key(
         "owner": "video",
         "envKey": "VIDEO_PROXY_KEY",
         "clearable": False,
+        "baseUrl": "https://new-video-origin.example/v1",
+        "baseUrlSource": "video",
+        "baseUrlAuthored": True,
+        "apiKeyEnvAuthored": True,
+        "sharedBaseUrl": "",
+        "sharedCredentialAvailable": False,
     }
     media.configure_video_generation(gateway.video_generation, gateway_config=gateway)
     try:
