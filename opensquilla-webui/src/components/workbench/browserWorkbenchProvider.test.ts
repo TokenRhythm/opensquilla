@@ -382,6 +382,24 @@ describe('browser Workbench provider', () => {
     )
   })
 
+  it('retains the visible current page when the user cancels leaving unsaved changes', async () => {
+    const navigateSurface = vi.fn(async () => ({ ok: false, code: 'NAVIGATION_CANCELLED',
+      message: 'The page remains open because leaving was cancelled.' }))
+    const harness = await createHarness(nativeApi({ navigateSurface }))
+    await harness.runtime.handleSurfaceRect?.(visibleRect, harness.item)
+    const currentUrl = harness.renderState.currentUrl
+    await harness.runtime.handleComponentEvent?.({ type: 'browser-action', payload: {
+      action: 'navigate', url: 'https://example.test/other',
+    } }, harness.item)
+    expect(harness.renderState).toMatchObject({ currentUrl, errorMessage: '', loading: false,
+      navigationCancelSequence: 1 })
+    expect(harness.api.destroySurface).not.toHaveBeenCalled()
+    expect(harness.api.setSurfaceRect).not.toHaveBeenLastCalledWith(
+      expect.objectContaining({ visible: false }),
+    )
+    expect(harness.reportError).not.toHaveBeenCalled()
+  })
+
   it('tracks a native download and opens only its completed result', async () => {
     const navigateSurface = vi.fn(successfulResult)
     const harness = await createHarness(nativeApi({ navigateSurface }))

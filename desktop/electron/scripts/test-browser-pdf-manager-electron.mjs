@@ -87,7 +87,14 @@ if (!process.versions.electron) {
       }
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
       if (request.url === '/embedded.html') {
-        response.end('<!doctype html><title>Embedded</title><iframe src="/document.pdf"></iframe>')
+        response.end('<!doctype html><title>Embedded</title><style>body{margin:0}iframe{width:850px;height:600px;border:0}</style><iframe src="/document.pdf"></iframe>')
+      } else if (request.url === '/blob.html' || request.url === '/blob-copies.html'
+        || request.url === '/data.html') {
+        const embeddedUrl = request.url === '/data.html'
+          ? `"data:application/pdf;base64,${pdf.toString('base64')}"`
+          : `URL.createObjectURL(new Blob([Uint8Array.from(atob("${pdf.toString('base64')}"),char=>char.charCodeAt(0))],{type:"application/pdf"}))`
+        const copy = request.url === '/blob-copies.html' ? '<iframe></iframe>' : ''
+        response.end(`<!doctype html><title>Dynamic PDF</title><style>body{margin:0}iframe{width:850px;height:600px;border:0}</style><iframe></iframe>${copy}<script>const url=${embeddedUrl};for(const frame of document.querySelectorAll('iframe'))frame.src=url;</script>`)
       } else if (request.url === '/link.html') {
         response.end('<!doctype html><title>Link</title><a id="pdf" href="/document.pdf">PDF</a>')
       } else if (request.url === '/popup.html') {
@@ -110,11 +117,22 @@ if (!process.versions.electron) {
       const frames = frame => [frame, ...frame.frames.flatMap(frames)]
       const viewerLoaded = surface => Boolean(surface && frames(surface.view.webContents.mainFrame)
         .some(frame => frame.url === 'chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html'))
+      const viewerBooted = async surface => {
+        if (!surface) return false
+        const viewers = frames(surface.view.webContents.mainFrame).filter(frame =>
+          frame.url === 'chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html')
+        if (!viewers.length) return false
+        try {
+          const booted = await Promise.all(viewers.map(frame => frame.executeJavaScript(
+            "Boolean(document.querySelector('pdf-viewer')?.shadowRoot)")))
+          return booted.every(Boolean)
+        } catch { return false }
+      }
       const create = async (id, path) => {
         const result = await manager.createSurface({ version: 2, surfaceId: id,
           kind: 'url-preview', payload: { url: `${origin}${path}`, scopeId: 'pdf-test' } })
         assert.equal(result.ok, true, result.message)
-        await until(() => viewerLoaded(record(id)), `${id} PDF viewer`)
+        await until(() => viewerBooted(record(id)), `${id} PDF viewer boot`)
         return record(id)
       }
       const direct = await create('pdf-direct', '/document.pdf')
@@ -149,6 +167,27 @@ if (!process.versions.electron) {
         && event.detail?.findMatches === 0))
       await create('pdf-embedded', '/embedded.html')
       await create('pdf-redirect', '/redirect')
+      for (const [id, path] of [['pdf-blob', '/blob.html'],
+        ['pdf-blob-copies', '/blob-copies.html'], ['pdf-data', '/data.html']]) {
+        const dynamic = await create(id, path)
+        if (id === 'pdf-blob-copies') {
+          await until(() => frames(dynamic.view.webContents.mainFrame).filter(frame =>
+            frame.url === 'chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html').length === 2,
+          'both duplicate Blob PDF viewers')
+          await until(() => viewerBooted(dynamic), 'both duplicate Blob PDF viewers boot')
+        }
+        manager.setSurfaceRect({ surfaceId: id, x: 0, y: 0, width: 900, height: 650, visible: true })
+        manager.activateSurface(id)
+        await wait(1200)
+        const found = await manager.navigateSurface({ version: 2,
+          surfaceId: id, action: 'find', query: 'Synthetic' })
+        assert.equal(found.ok, true, found.message)
+        await until(() => events.some(event => event.surfaceId === id
+          && event.type === 'find-state' && event.detail?.findFinal
+          && event.detail?.findMatches >= 1), `${id} rendered PDF text`)
+        assert.equal((await manager.navigateSurface({ version: 2,
+          surfaceId: id, action: 'find-stop' })).ok, true)
+      }
 
       const link = await manager.createSurface({ version: 2, surfaceId: 'pdf-link',
         kind: 'url-preview', payload: { url: `${origin}/link.html`, scopeId: 'pdf-test' } })

@@ -762,40 +762,6 @@ export class BrowserPlaywrightDriver {
     return anchor
   }
 
-  /** Resolve a visible PDF link from a current DOM ref for the host's managed download. */
-  async resolveDirectPdfDownload(
-    ref: string | undefined, generation: number, assertCurrent: Guard, signal: AbortSignal,
-  ): Promise<string | undefined> {
-    return await this.run(assertCurrent, signal, async () => {
-      const anchor = await this.requireAnchor(ref, generation)
-      const href = async () => await anchor.element.evaluate(node => {
-        const link = node.closest('a[href],area[href]')
-        if (!(link instanceof HTMLAnchorElement || link instanceof HTMLAreaElement)
-          || link.hasAttribute('onclick') || link.onclick || link.closest('[inert]')) return undefined
-        const raw = link.getAttribute('href')
-        if (!raw) return undefined
-        let url: URL
-        try { url = new URL(raw, link.ownerDocument.baseURI) } catch { return undefined }
-        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return undefined
-        url.hash = ''
-        if (url.href.length > 8192) return undefined
-        const pathname = url.pathname.toLowerCase()
-        const directPdf = pathname.endsWith('.pdf') || /(?:^|\/)pdf(?:\/|$)/.test(pathname)
-          || [...url.searchParams].some(([key, value]) =>
-            ['format', 'type', 'filetype', 'extension'].includes(key.toLowerCase()) && value.toLowerCase() === 'pdf')
-          || /\.pdf$/i.test(link.getAttribute('download') ?? '')
-        return directPdf ? url.href : undefined
-      })
-      if (!await href()) return undefined
-      // The normal click path checks visibility, stability and hit target.
-      // Trial performs those checks without activating the link.
-      try { await anchor.element.click({ trial: true, timeout: ACTION_TIMEOUT_MS }) }
-      catch { return undefined }
-      assertCurrent()
-      return await href()
-    })
-  }
-
   async readText(request: DesktopBrowserRequest, generation: number, assertCurrent: Guard, signal: AbortSignal): Promise<Record<string, unknown>> {
     return await this.run(assertCurrent, signal, async () => {
       const anchor = await this.requireAnchor(request.ref, generation)

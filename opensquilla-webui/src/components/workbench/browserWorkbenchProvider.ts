@@ -94,6 +94,7 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
       downloadReceivedBytes: 0,
       downloadTotalBytes: 0,
       controlError: '',
+      navigationCancelSequence: 0,
     })
   }
 
@@ -222,6 +223,11 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
         ...(action === 'download-open' ? { downloadId: request.downloadId } : {}),
       })
       if (!result.ok) {
+        if (result.code === 'NAVIGATION_CANCELLED') {
+          this.context.updateRenderState({ loading: false, errorMessage: '', controlError: '',
+            navigationCancelSequence: Number(this.context.getRenderState().navigationCancelSequence || 0) + 1 })
+          return
+        }
         if (isReadingAction(action)) {
           this.context.updateRenderState({ controlError: result.message
             || this.options.t('workbench.browser.controlUnavailable') })
@@ -468,6 +474,7 @@ export function createBrowserWorkbenchDefinition(
       downloadReceivedBytes: Number(state.runtimeState.downloadReceivedBytes || 0),
       downloadTotalBytes: Number(state.runtimeState.downloadTotalBytes || 0),
       controlError: String(state.runtimeState.controlError || ''),
+      navigationCancelSequence: Number(state.runtimeState.navigationCancelSequence || 0),
     }),
     async createRuntime(item, context) {
       const runtime = new BrowserWorkbenchRuntime(item, context, options)

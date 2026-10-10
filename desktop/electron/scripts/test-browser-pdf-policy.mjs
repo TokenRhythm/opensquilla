@@ -80,4 +80,45 @@ for (let id = 100; id < 165; id++) {
 assert.equal(request(embedderCss, { ...pdfFrame, frameTreeNodeId: 100 }, 'stylesheet'), false)
 assert.equal(request(embedderCss, { ...pdfFrame, frameTreeNodeId: 164 }, 'stylesheet'), true)
 
+policy.clear()
+policy.observeResponse(response({ frame: { ...pdfFrame, url: 'about:blank' } }))
+assert.equal(request(embedderCss, pdfFrame, 'stylesheet'), true,
+  'HTTP response evidence precedes the PDF document commit')
+
+for (const dynamicUrl of ['blob:https://example.test/synthetic-pdf',
+  'data:application/pdf;base64,JVBERi0xLjQK']) {
+  policy.clear()
+  const dynamicFrame = { ...pdfFrame, url: dynamicUrl }
+  const dynamicViewer = { ...viewerFrame, parent: dynamicFrame, url: 'about:blank' }
+  const details = { url: viewer, method: 'GET', resourceType: 'subFrame',
+    webContentsId: 10, frame: dynamicViewer }
+  const tree = (mimeType, children = []) => ({ frameTree: { frame: { url: pageFrame.url,
+    mimeType: 'text/html' }, childFrames: [{ frame: { url: dynamicUrl, mimeType } }, ...children] } })
+  assert.equal(policy.needsFrameTree(details), true)
+  policy.observeFrameTree(details, tree('text/html'))
+  assert.equal(request(viewer, dynamicViewer, 'subFrame'), false)
+  policy.observeFrameTree(details, tree('application/pdf', [{ frame: { url: dynamicUrl,
+    mimeType: 'text/html' } }]))
+  assert.equal(request(viewer, dynamicViewer, 'subFrame'), false,
+    'A duplicated URL must not select a PDF ahead of an ambiguous HTML frame')
+  policy.observeFrameTree(details, { frameTree: { frame: { url: 'https://other.example.test/',
+    mimeType: 'text/html' }, childFrames: [{ frame: { url: dynamicUrl, mimeType: 'application/pdf' } }] } })
+  assert.equal(request(viewer, dynamicViewer, 'subFrame'), false, 'The complete ancestry must match')
+  policy.observeFrameTree(details, tree('application/pdf', Array.from({ length: 1024 }, (_, index) =>
+    ({ frame: { url: `https://example.test/extra-${index}`, mimeType: 'text/html' } }))))
+  assert.equal(request(viewer, dynamicViewer, 'subFrame'), false,
+    'Exceeding the canonical frame-tree budget must fail closed')
+  policy.observeFrameTree(details, tree('application/pdf', [{ frame: { url: dynamicUrl,
+    mimeType: 'application/pdf' } }]))
+  assert.equal(request(viewer, dynamicViewer, 'subFrame'), true)
+  assert.equal(request(embedderCss, dynamicFrame, 'stylesheet'), true)
+  assert.equal(request(resources, { ...dynamicViewer, url: viewer }, 'script'), true)
+  assert.equal(request(resources, { ...dynamicViewer, url: viewer }, 'script',
+    { webContentsId: 11 }), false, 'The canonical tree cannot grant another target')
+  assert.equal(request('chrome://settings/', { ...dynamicViewer, url: viewer }, 'script'), false)
+  request('data:text/html,synthetic', dynamicFrame, 'subFrame')
+  assert.equal(request(embedderCss, dynamicFrame, 'stylesheet'), false,
+    'A new dynamic document clears its predecessor grant')
+}
+
 console.log('Browser PDF resource policy tests passed')

@@ -26,6 +26,7 @@ function mountPanel() {
     downloadState: '' as '' | 'progressing' | 'completed' | 'cancelled' | 'interrupted',
     downloadReceivedBytes: 0,
     downloadTotalBytes: 0,
+    navigationCancelSequence: 0,
   })
   const onEvent = vi.fn((event: WorkbenchComponentEvent) => {
     if (event.type !== 'browser-action') return
@@ -93,6 +94,22 @@ it('changes only page zoom and resets to 100 percent', async () => {
     payload: { action: 'zoom', zoomFactor: 1 } })
   await nextTick()
   expect(element.querySelector('.browser-preview__zoom-value')?.textContent).toBe('100%')
+})
+
+it('restores the retained page address after a cancelled navigation', async () => {
+  const { element, props, onEvent } = mountPanel()
+  const address = element.querySelector<HTMLInputElement>('.browser-preview__address')!
+  address.value = 'https://example.test/other'
+  address.dispatchEvent(new Event('input', { bubbles: true }))
+  element.querySelector<HTMLFormElement>('.browser-preview__toolbar')!.dispatchEvent(
+    new Event('submit', { bubbles: true, cancelable: true }),
+  )
+  expect(onEvent).toHaveBeenLastCalledWith({ type: 'browser-action', payload: {
+    action: 'navigate', url: 'https://example.test/other',
+  } })
+  props.navigationCancelSequence++
+  await nextTick()
+  expect(address.value).toBe(props.currentUrl)
 })
 
 it('shows the latest download progress and opens a completed download', async () => {

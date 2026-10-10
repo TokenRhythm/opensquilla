@@ -188,14 +188,40 @@ This builds the shared Vue browser/Desktop artifact, bundles the gateway with
 PyInstaller, removes its staged duplicate UI copy, and emits desktop artifacts
 for the current platform under `dist/desktop-electron/`.
 
-`npm run pack` (unpacked directory) and `npm run dist` (installer) both build
-the WebUI and Gateway before packaging. The `:local` names are compatibility aliases.
-For a faster Electron-only rebuild after a successful Gateway build:
+Use `npm run pack:local` for an unpacked application, or `npm run dist:local`
+for installers. Both build the WebUI and Gateway before packaging. On macOS,
+these entries reuse a persistent signing identity in a dedicated build keychain
+outside the checkout. Every local bundle must retain the certificate-pinned
+application identity; signing or verification failure stops the build without
+an ad-hoc fallback. Local builds never publish artifacts.
+
+Signing passes the dedicated keychain explicitly, temporarily appends it to the
+existing ordered search list, and restores account preferences after success or
+failure. It does not change the default keychain or certificate trust. Retain
+this local identity across rebuilds: replacing it changes the application's
+Keychain identity. Credentials remain encrypted in their existing format; an
+older signing identity may require one native macOS authorization.
+
+The existing `pack`, `dist`, and release signing entries remain available. On
+Windows and Linux, the local entries delegate to those packaging commands.
+For a faster Electron-only rebuild after a matching successful Gateway build:
 
 ```bash
 cd desktop/electron
-npm run dist:prepared
+npm run pack:local:prepared
+# Or generate installers using the same local identity:
+npm run dist:local:prepared
 ```
+
+Run `npm run test:local-build` for offline packaging and preference-restoration
+checks. These tests mock signing and Keychain writes. Native integration tests
+require a disposable macOS account or VM; a temporary directory or changed
+`HOME` does not isolate account-wide Keychain preferences.
+
+Before replacing an installation, preserve its prior bundle and verify the new
+bundle's signature. Open the new app normally, without a launcher or storage
+override, and check Gateway connectivity with the existing user profile and
+opening, closing, and reopening the browser sidebar.
 
 The internal `pack:prepared` / `dist:prepared` entries reject missing or stale
 Gateway build records and changed runtime files before electron-builder runs.

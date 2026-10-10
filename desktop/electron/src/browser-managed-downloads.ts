@@ -37,6 +37,11 @@ export class BrowserManagedDownloads {
   private readonly records = new Map<string, DownloadRecord>()
   private readonly armed = new Map<number, DownloadRecord>()
 
+  isArmed(owner: BrowserDownloadOwner): boolean {
+    const record = this.armed.get(owner.webContentsId)
+    return Boolean(record && !record.settled && this.sameOwner(record, owner))
+  }
+
   async arm(owner: BrowserDownloadOwner, signal: AbortSignal) {
     if (signal.aborted) throw new DesktopBrowserError('TIMEOUT', 'The download request ended.', 504)
     if (this.armed.has(owner.webContentsId)) {

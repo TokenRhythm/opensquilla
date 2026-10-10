@@ -330,6 +330,45 @@ if (!process.versions.electron) {
         action: 'navigate', url: origin + '/dashboard' })).ok, true)
       await clickNamed({ targetRef: manualRecord.targetRef }, 'Guard close')
       dialog.showMessageBoxSync = () => 0
+      const retainedUrl = manualRecord.contents.getURL()
+      const navigationStayed = await manager.navigateSurface({ version: 2, surfaceId: manual.surfaceId,
+        action: 'navigate', url: origin + '/second' })
+      assert.equal(navigationStayed.ok, false)
+      assert.equal(navigationStayed.code, 'NAVIGATION_CANCELLED')
+      assert.equal(manualRecord.contents.getURL(), retainedUrl)
+      assert.equal(manualRecord.documentUrl, retainedUrl)
+      assert.equal(manualRecord.browserDocumentReady, true)
+      assert.equal(manualRecord.playwright.pendingDialog, undefined)
+      await call({ operation: 'observe', targetRef: manualRecord.targetRef })
+      for (const action of ['reload', 'back']) {
+        let asked = false
+        dialog.showMessageBoxSync = () => { asked = true; return 0 }
+        const cancelledNavigation = await manager.navigateSurface({ version: 2, surfaceId: manual.surfaceId, action })
+        if (action === 'reload') assert.equal(cancelledNavigation.code, 'NAVIGATION_CANCELLED')
+        await until(() => asked && !manualRecord.contents.isLoading(), `Stay after ${action}`)
+        assert.equal(manualRecord.contents.getURL(), retainedUrl)
+        assert.equal(manualRecord.documentUrl, retainedUrl)
+        assert.equal(manualRecord.browserDocumentReady, true)
+        await call({ operation: 'observe', targetRef: manualRecord.targetRef })
+      }
+      dialog.showMessageBoxSync = () => 1
+      assert.equal((await manager.navigateSurface({ version: 2, surfaceId: manual.surfaceId,
+        action: 'navigate', url: origin + '/second' })).ok, true)
+      assert.equal(manualRecord.contents.getURL(), origin + '/second')
+      assert.equal((await manager.navigateSurface({ version: 2, surfaceId: manual.surfaceId,
+        action: 'navigate', url: retainedUrl })).ok, true)
+      await clickNamed({ targetRef: manualRecord.targetRef }, 'Guard close')
+      await manager.navigateSurface({ version: 2, surfaceId: manual.surfaceId, action: 'back' })
+      await until(() => manualRecord.contents.getURL() === origin + '/second'
+        && manualRecord.browserDocumentReady, 'Leave and history navigation')
+      await manager.navigateSurface({ version: 2, surfaceId: manual.surfaceId, action: 'navigate', url: retainedUrl })
+      await clickNamed({ targetRef: manualRecord.targetRef }, 'Guard close')
+      await manager.navigateSurface({ version: 2, surfaceId: manual.surfaceId, action: 'reload' })
+      await until(async () => manualRecord.browserDocumentReady && !manualRecord.contents.isLoading()
+        && await evaluate({ targetRef: manualRecord.targetRef }, 'typeof window.onbeforeunload') !== 'function',
+      'Leave and page reload')
+      await clickNamed({ targetRef: manualRecord.targetRef }, 'Guard close')
+      dialog.showMessageBoxSync = () => 0
       const retained = await manager.destroySurface(manual.surfaceId)
       assert.equal(retained.code, 'CLOSE_CANCELLED')
       assert.equal(manager.surfaces.get(manual.surfaceId), manualRecord)
@@ -338,6 +377,15 @@ if (!process.versions.electron) {
       await clickNamed(parent, 'Guard close')
       assert.equal(await evaluate(parent, 'navigator.userActivation.hasBeenActive'), true)
       assert.equal(await evaluate(parent, 'typeof window.onbeforeunload'), 'function')
+      const parentUrl = record(parent).contents.getURL()
+      await assert.rejects(call({ operation: 'open', targetRef: parent.targetRef, url: origin + '/second' }),
+        error => error.code === 'NAVIGATION_CANCELLED')
+      await assert.rejects(call({ operation: 'reload', targetRef: parent.targetRef }),
+        error => error.code === 'NAVIGATION_CANCELLED')
+      assert.equal(record(parent).contents.getURL(), parentUrl)
+      assert.equal(record(parent).documentUrl, parentUrl)
+      assert.equal(record(parent).browserDocumentReady, true)
+      await call({ operation: 'observe', targetRef: parent.targetRef })
       assert.equal(await manager.closeBrowserTabs(), false,
         'An app quit must stop when a browser tab chooses to stay')
       assert.ok(manager.surfaces.has(record(parent).id))
@@ -357,7 +405,12 @@ if (!process.versions.electron) {
           destroyed: record(parent).view.webContents.isDestroyed(), jsAfterStay,
           state: stayed.observation }))
       await clickNamed(parent, 'Guard close')
-      dialog.showMessageBoxSync = () => { confirmations += 1; return 1 }
+      dialog.showMessageBoxSync = () => {
+        confirmations += 1
+        // A person can take longer than the runtime watchdog to choose Leave.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 11_000)
+        return 1
+      }
       const closingRecord = record(parent)
       const left = await manager.navigateSurface({ version: 2, surfaceId: closingRecord.id, action: 'close' })
       assert.equal(left.ok, true, JSON.stringify({ left, confirmations,

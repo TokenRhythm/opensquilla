@@ -190,6 +190,7 @@ const props = withDefaults(defineProps<{
   downloadReceivedBytes?: number
   downloadTotalBytes?: number
   controlError?: string
+  navigationCancelSequence?: number
 }>(), {
   canGoBack: false,
   canGoForward: false,
@@ -207,6 +208,7 @@ const props = withDefaults(defineProps<{
   downloadReceivedBytes: 0,
   downloadTotalBytes: 0,
   controlError: '',
+  navigationCancelSequence: 0,
 })
 
 const emit = defineEmits<{
@@ -239,6 +241,11 @@ const findCount = computed(() => props.findMatches === null || findText.value !=
 
 watch(() => props.currentUrl, value => {
   address.value = value
+  invalidAddress.value = false
+})
+
+watch(() => props.navigationCancelSequence, () => {
+  address.value = props.currentUrl
   invalidAddress.value = false
 })
 
