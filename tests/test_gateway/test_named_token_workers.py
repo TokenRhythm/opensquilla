@@ -22,7 +22,7 @@ from opensquilla.gateway.middleware import AuthMiddleware
 from opensquilla.gateway.origin_guard import request_principal_is_owner_async
 from opensquilla.gateway.rpc import RpcHandlerError
 from opensquilla.gateway.rpc_sessions import _GatewayAdmissionPrimitives
-from opensquilla.gateway.token_store import TokenStore
+from opensquilla.gateway.token_store import TokenStore, run_auth_database_operation
 from opensquilla.gateway.websocket import handle_ws_connection
 
 
@@ -53,7 +53,12 @@ def _trace_connections(monkeypatch):
             self.closed = True
 
     def connect(store):
-        connection = sqlite3.connect(store._path, timeout=10, factory=TrackedConnection)
+        database = (
+            store._path if store._initialize else f"{store._path.resolve().as_uri()}?mode=rw"
+        )
+        connection = sqlite3.connect(
+            database, uri=not store._initialize, timeout=10, factory=TrackedConnection,
+        )
         connection.row_factory = sqlite3.Row
         connections.append((threading.get_ident(), connection))
         return connection
@@ -70,7 +75,7 @@ def _assert_closed_off_loop(connections, loop_thread):
 
 
 @pytest.mark.parametrize("schema", ["cold", "warm", "missing_index", "old_revision"])
-async def test_named_resolver_includes_schema_read_and_committed_usage_off_loop(
+async def test_preparation_and_named_verification_keep_sqlite_off_loop(
     tmp_path, monkeypatch, schema,
 ):
     token = "osq_missing_abcdefghijklmnop"
@@ -83,6 +88,7 @@ async def test_named_resolver_includes_schema_read_and_committed_usage_off_loop(
                 connection.execute("ALTER TABLE sandbox_tokens DROP COLUMN authorization_revision")
     connections = _trace_connections(monkeypatch)
     loop_thread = threading.get_ident()
+    await run_auth_database_operation(lambda: TokenStore(tmp_path / "sessions.db"))
 
     principal = await auth.resolve_auth_async(
         _config(tmp_path), {"token": token}, "operator", peer_ip="192.168.1.7",
@@ -148,7 +154,7 @@ async def test_revoked_named_token_remains_invalid_and_never_promotes_owner(tmp_
 
 
 @pytest.mark.parametrize("configured_match", [False, True])
-async def test_usage_write_failure_preserves_existing_legacy_fallback(
+async def test_usage_write_failure_preserves_named_identity_without_legacy_promotion(
     tmp_path, configured_match,
 ):
     issued = _issue(tmp_path)
@@ -161,21 +167,22 @@ async def test_usage_write_failure_preserves_existing_legacy_fallback(
         _config(tmp_path, issued.token if configured_match else "legacy"),
         {"token": issued.token}, "operator", peer_ip="127.0.0.1",
     )
-    assert principal.auth_state == ("authenticated" if configured_match else "invalid")
-    assert principal.is_owner is configured_match
+    assert principal.auth_state == "authenticated"
+    assert principal.token_public_id == issued.record.public_id
+    assert principal.capabilities == issued.record.capabilities
+    assert not principal.is_owner
     with sqlite3.connect(tmp_path / "sessions.db") as connection:
         assert connection.execute("SELECT last_used_at FROM sandbox_tokens").fetchone() == (None,)
 
 
-@pytest.mark.parametrize("blocked_stage", ["_ensure_schema", "verify"])
 async def test_repeated_cancel_drains_usage_commit_and_connection_cleanup(
-    tmp_path, monkeypatch, blocked_stage,
+    tmp_path, monkeypatch,
 ):
     issued = _issue(tmp_path)
     loop = asyncio.get_running_loop()
     started = asyncio.Event()
     release = threading.Event()
-    original = getattr(TokenStore, blocked_stage)
+    original = TokenStore.verify
     connections = _trace_connections(monkeypatch)
 
     def blocked_operation(store, *args, **kwargs):
@@ -183,7 +190,7 @@ async def test_repeated_cancel_drains_usage_commit_and_connection_cleanup(
         assert release.wait(5)
         return original(store, *args, **kwargs)
 
-    monkeypatch.setattr(TokenStore, blocked_stage, blocked_operation)
+    monkeypatch.setattr(TokenStore, "verify", blocked_operation)
     task = asyncio.create_task(auth.resolve_auth_async(
         _config(tmp_path), {"token": issued.token}, "operator", peer_ip="192.168.1.8",
     ))
@@ -239,7 +246,7 @@ async def test_cancelled_direct_verify_drains_rollback_and_closes_connections(
         release.set()
     with pytest.raises(asyncio.CancelledError) as cancelled:
         await task
-    assert isinstance(cancelled.value.__cause__, sqlite3.IntegrityError)
+    assert cancelled.value.__cause__ is None
     _assert_closed_off_loop(connections, threading.get_ident())
     with sqlite3.connect(tmp_path / "sessions.db") as connection:
         assert connection.execute("SELECT last_used_at FROM sandbox_tokens").fetchone() == (None,)
@@ -307,7 +314,7 @@ async def test_actual_transport_auth_entry_uses_complete_worker(tmp_path, monkey
 
 
 @pytest.mark.parametrize("state", ["active", "revoked", "unavailable"])
-async def test_turn_authority_constructor_is_off_loop_and_preserves_decision(
+async def test_turn_authority_read_is_off_loop_and_preserves_decision(
     tmp_path, monkeypatch, state,
 ):
     issued = _issue(tmp_path)
@@ -321,14 +328,8 @@ async def test_turn_authority_constructor_is_off_loop_and_preserves_decision(
     admission._runtime_config = _config(tmp_path)
     connections = _trace_connections(monkeypatch)
     if state == "unavailable":
-        original = TokenStore._ensure_schema
-
-        def broken_schema(store):
-            assert threading.get_ident() != loop_thread
-            original(store)
-            raise sqlite3.OperationalError("synthetic schema failure")
-
-        monkeypatch.setattr(TokenStore, "_ensure_schema", broken_schema)
+        with sqlite3.connect(tmp_path / "sessions.db") as connection:
+            connection.execute("DROP TABLE sandbox_tokens")
     loop_thread = threading.get_ident()
     if state == "active":
         result = await admission.resolve_activation_authority(session_id="sid", session_epoch=0)
@@ -340,3 +341,126 @@ async def test_turn_authority_constructor_is_off_loop_and_preserves_decision(
         expected_code = "UNAUTHORIZED" if state == "revoked" else "AUTHORITY_UNAVAILABLE"
         assert caught.value.code == expected_code
     _assert_closed_off_loop(connections, loop_thread)
+
+
+@pytest.mark.parametrize("schema", ["missing_file", "missing_table", "old_revision"])
+async def test_unprepared_auth_fails_closed_without_preparing_or_creating_database(
+    tmp_path, schema,
+):
+    state_dir = tmp_path / "unprepared"
+    database = state_dir / "sessions.db"
+    token = "osq_missing_abcdefghijklmnop"
+    if schema != "missing_file":
+        token = _issue(state_dir).token
+        with sqlite3.connect(database) as connection:
+            if schema == "missing_table":
+                connection.execute("DROP TABLE sandbox_tokens")
+            else:
+                connection.execute("ALTER TABLE sandbox_tokens DROP COLUMN authorization_revision")
+        before = database.read_bytes()
+    principal = await auth.resolve_auth_async(
+        _config(state_dir), {"token": token}, "operator", peer_ip="127.0.0.1",
+    )
+    assert principal.auth_state == "invalid" and not principal.is_owner
+    if schema == "missing_file":
+        assert not state_dir.exists()
+    else:
+        assert database.read_bytes() == before
+    if schema == "old_revision":
+        await run_auth_database_operation(lambda: TokenStore(database))
+        restored = await auth.resolve_auth_async(
+            _config(state_dir), {"token": token}, "operator", peer_ip="127.0.0.1",
+        )
+        assert restored.auth_state == "authenticated" and not restored.is_owner
+
+
+async def test_repeated_auth_and_turn_authority_do_not_reprepare_schema(tmp_path, monkeypatch):
+    issued = _issue(tmp_path)
+
+    def unexpected(_store):
+        raise AssertionError("Request-time auth must not prepare the database")
+
+    monkeypatch.setattr(TokenStore, "_ensure_schema", unexpected)
+    config = _config(tmp_path)
+    admission = object.__new__(_GatewayAdmissionPrimitives)
+    admission._runtime_config = config
+    for _ in range(3):
+        principal = await auth.resolve_auth_async(
+            config, {"token": issued.token}, "operator", peer_ip="127.0.0.1",
+        )
+        assert principal.auth_state == "authenticated"
+        admission._principal = principal
+        result = await admission.resolve_activation_authority(session_id="sid", session_epoch=0)
+        assert result["authorization_revision"] == 1
+    with sqlite3.connect(tmp_path / "sessions.db") as connection:
+        connection.execute("UPDATE sandbox_tokens SET revoked_at = 1")
+    principal = await auth.resolve_auth_async(
+        config, {"token": issued.token}, "operator", peer_ip="127.0.0.1",
+    )
+    assert principal.auth_state == "invalid"
+    with pytest.raises(RpcHandlerError) as caught:
+        await admission.resolve_activation_authority(session_id="sid", session_epoch=0)
+    assert caught.value.code == "UNAUTHORIZED"
+
+
+@pytest.mark.parametrize("state", ["wrong_secret", "revoked", "read_error"])
+async def test_usage_failure_policy_does_not_allow_invalid_authority(tmp_path, state):
+    issued = _issue(tmp_path)
+    token = issued.token
+    with sqlite3.connect(tmp_path / "sessions.db") as connection:
+        connection.execute(
+            "CREATE TRIGGER reject_usage BEFORE UPDATE OF last_used_at ON sandbox_tokens "
+            "BEGIN SELECT RAISE(ABORT, 'synthetic usage failure'); END",
+        )
+        if state == "revoked":
+            connection.execute("UPDATE sandbox_tokens SET revoked_at = 1")
+        elif state == "read_error":
+            connection.execute("DROP TABLE sandbox_tokens")
+        else:
+            token = token[:-1] + ("A" if token[-1] != "A" else "B")
+    principal = await auth.resolve_auth_async(
+        _config(tmp_path), {"token": token}, "operator", peer_ip="127.0.0.1",
+    )
+    assert principal.auth_state == "invalid" and not principal.is_owner
+
+
+async def test_named_looking_legacy_credential_keeps_explicit_configured_fallback(tmp_path):
+    token = "osq_legacy_abcdefghijklmnop"
+    principal = await auth.resolve_auth_async(
+        _config(tmp_path, token), {"token": token}, "operator", peer_ip="127.0.0.1",
+    )
+    assert principal.auth_state == "authenticated" and principal.is_owner
+    assert principal.token_public_id == "legacy"
+    assert not (tmp_path / "sessions.db").exists()
+
+
+async def test_metadata_failure_keeps_http_named_authority_and_recovers_usage(tmp_path):
+    issued = _issue(tmp_path)
+    config = _config(tmp_path, issued.token)
+
+    async def whoami(request):
+        principal = request.state.principal
+        return JSONResponse({"public_id": principal.token_public_id, "owner": principal.is_owner})
+
+    app = Starlette(routes=[Route("/api/whoami", whoami)])
+    app.add_middleware(AuthMiddleware, config=config)
+    with sqlite3.connect(tmp_path / "sessions.db") as connection:
+        connection.execute(
+            "CREATE TRIGGER reject_usage BEFORE UPDATE OF last_used_at ON sandbox_tokens "
+            "BEGIN SELECT RAISE(ABORT, 'synthetic usage failure'); END",
+        )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1",
+    ) as client:
+        headers = {"Authorization": f"Bearer {issued.token}"}
+        response = await client.get("/api/whoami", headers=headers)
+        assert response.status_code == 200
+        assert response.json() == {"public_id": issued.record.public_id, "owner": False}
+        with sqlite3.connect(tmp_path / "sessions.db") as connection:
+            row = connection.execute("SELECT last_used_at FROM sandbox_tokens").fetchone()
+            assert row == (None,)
+            connection.execute("DROP TRIGGER reject_usage")
+        assert (await client.get("/api/whoami", headers=headers)).status_code == 200
+    with sqlite3.connect(tmp_path / "sessions.db") as connection:
+        row = connection.execute("SELECT last_used_at FROM sandbox_tokens").fetchone()
+        assert row[0] is not None

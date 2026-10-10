@@ -3034,6 +3034,14 @@ async def build_services(
             duration_ms=_elapsed_monotonic_ms(migrations_started_at),
         )
 
+        # Named authority is checked on every request, but schema maintenance
+        # runs once during durable service startup. Direct TokenStore callers
+        # (CLI and management operations) retain explicit eager preparation.
+        if config.state_dir:
+            from opensquilla.gateway.token_store import TokenStore
+
+            await _run_startup_worker(TokenStore, Path(config.state_dir) / "sessions.db")
+
     # ── Agent registry (built early so SessionManager can resolve agent configs) ─
     from opensquilla.agents.registry import AgentRegistry
 

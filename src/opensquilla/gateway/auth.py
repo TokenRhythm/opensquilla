@@ -371,7 +371,7 @@ def _verify_named_token(
     if not state_dir:
         return None
     try:
-        return TokenStore(Path(str(state_dir)) / "sessions.db").verify(
+        return TokenStore(Path(str(state_dir)) / "sessions.db", initialize=False).verify(
             token,
             peer_ip=peer_ip,
         )
@@ -423,7 +423,8 @@ async def resolve_auth_async(
 
     No-auth, ordinary legacy and Desktop credentials retain their immediate
     resolver path. Only named-token candidates can open the SQLite store;
-    include construction and usage-record commit in the worker operation.
+    include authority reading and usage-record commit in the worker operation.
+    Schema preparation belongs to startup, never to verification.
     """
 
     def operation() -> Principal | None:

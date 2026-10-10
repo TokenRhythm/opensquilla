@@ -17,6 +17,13 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
+
+import structlog
+
+from opensquilla.paths import native_io_path
+
+log = structlog.get_logger(__name__)
 
 _TOKEN_PATTERN = re.compile(
     r"\Aosq_(?P<public_id>[a-z0-9-]{4,64})_(?P<secret>[A-Za-z0-9_-]{16,256})\Z"
@@ -162,13 +169,23 @@ async def run_auth_database_operation[Result](operation: Callable[[], Result]) -
 class TokenStore:
     """Small SQLite-backed store sharing the migrated sessions database."""
 
-    def __init__(self, database_path: str | Path) -> None:
-        self._path = Path(database_path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_schema()
+    def __init__(self, database_path: str | Path, *, initialize: bool = True) -> None:
+        self._path = Path(database_path).expanduser()
+        self._initialize = initialize
+        if initialize:
+            native_io_path(self._path.parent).mkdir(parents=True, exist_ok=True)
+            self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self._path, timeout=10)
+        if self._initialize:
+            connection = sqlite3.connect(native_io_path(self._path), timeout=10)
+        else:
+            # Live verification must neither create a missing database nor
+            # repair a restored/old schema. Startup owns that preparation.
+            connection = sqlite3.connect(
+                "file:" + quote(str(native_io_path(self._path.resolve())), safe="/:")
+                + "?mode=rw", uri=True, timeout=10,
+            )
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -268,7 +285,10 @@ class TokenStore:
         if public_id:
             with closing(self._connect()) as connection:
                 row = connection.execute(
-                    "SELECT * FROM sandbox_tokens WHERE public_id = ?",
+                    "SELECT public_id, token_version, name, secret_digest, roles_json, "
+                    "scopes_json, capabilities_json, source_kind, created_at, "
+                    "authorization_revision, last_used_at, last_peer, revoked_at "
+                    "FROM sandbox_tokens WHERE public_id = ?",
                     (public_id,),
                 ).fetchone()
         expected_digest = bytes(row["secret_digest"]) if row is not None else _DUMMY_DIGEST
@@ -277,14 +297,23 @@ class TokenStore:
         if row is None or not valid_secret or row["revoked_at"] is not None:
             return None
 
-        used_at = int(time.time())
-        with closing(self._connect()) as connection, connection:
-            connection.execute(
-                "UPDATE sandbox_tokens SET last_used_at = ?, last_peer = ? "
-                "WHERE public_id = ? AND revoked_at IS NULL",
-                (used_at, peer_ip, public_id),
+        record = self._record_from_row(row)
+        try:
+            with closing(self._connect()) as connection, connection:
+                connection.execute(
+                    "UPDATE sandbox_tokens SET last_used_at = ?, last_peer = ? "
+                    "WHERE public_id = ? AND revoked_at IS NULL",
+                    (int(time.time()), peer_ip, public_id),
+                )
+        except (OSError, sqlite3.Error) as exc:
+            # Authority was established by the successful read above. Usage
+            # metadata is informational; failure must not turn a valid named
+            # token into an invalid credential or a broader legacy identity.
+            # Do not include arbitrary SQL error text, token data or peer IP.
+            log.warning(
+                "auth.named_token_usage_update_failed", error_type=type(exc).__name__,
             )
-        return self._record_from_row(row)
+        return record
 
     def revoke(self, public_id: str) -> bool:
         with closing(self._connect()) as connection, connection:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 from starlette.applications import Starlette
@@ -182,3 +183,77 @@ def test_named_token_authenticates_http_bearer_boundary(tmp_path) -> None:
         "publicId": issued.record.public_id,
         "capabilities": ["task.read"],
     }
+
+
+@pytest.mark.parametrize("failure_stage", ["open", "execute", "commit"])
+def test_usage_failure_rolls_back_without_invalidating_verified_authority(
+    tmp_path, monkeypatch, failure_stage,
+) -> None:
+    store = TokenStore(tmp_path / "sessions.db")
+    issued = store.create(
+        name="Usage failure", roles={"operator"}, scopes={"operator.read"},
+        capabilities={"task.read"},
+    )
+    original_connect = store._connect
+    connections = []
+
+    class FailingConnection(sqlite3.Connection):
+        closed = False
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            if failure_stage == "commit" and exc_type is None:
+                self.rollback()
+                raise sqlite3.OperationalError("synthetic commit failure")
+            return super().__exit__(exc_type, exc_value, traceback)
+
+        def close(self):
+            super().close()
+            self.closed = True
+
+    calls = 0
+
+    def connect():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_connect()
+        if failure_stage == "open":
+            raise OSError("synthetic usage connection failure")
+        connection = sqlite3.connect(store._path, factory=FailingConnection)
+        connection.row_factory = sqlite3.Row
+        connections.append(connection)
+        if failure_stage == "execute":
+            connection.set_authorizer(
+                lambda action, *_: sqlite3.SQLITE_DENY
+                if action == sqlite3.SQLITE_UPDATE else sqlite3.SQLITE_OK,
+            )
+        return connection
+
+    monkeypatch.setattr(store, "_connect", connect)
+    assert store.verify(issued.token, peer_ip="127.0.0.1") == issued.record
+    assert all(connection.closed for connection in connections)
+    with sqlite3.connect(store._path) as connection:
+        row = connection.execute("SELECT last_used_at, last_peer FROM sandbox_tokens").fetchone()
+        assert row == (None, None)
+
+
+@pytest.mark.parametrize("use_tilde", [False, True])
+def test_prepared_store_uri_keeps_unicode_and_reserved_path_characters(
+    tmp_path, monkeypatch, use_tilde,
+) -> None:
+    state_dir = tmp_path / "Token 数据 # 100%"
+    database = state_dir / "sessions.db"
+    if use_tilde:
+        expanded_database = database
+        original_expanduser = Path.expanduser
+        monkeypatch.setattr(
+            Path, "expanduser",
+            lambda path: expanded_database if path.parts[0] == "~" else original_expanduser(path),
+        )
+        database = Path("~/token-uri.db")
+    store = TokenStore(database)
+    issued = store.create(
+        name="URI", roles={"operator"}, scopes={"operator.read"}, capabilities={"task.read"},
+    )
+    reader = TokenStore(database, initialize=False)
+    assert reader.verify(issued.token) == issued.record

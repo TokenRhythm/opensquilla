@@ -138,6 +138,59 @@ async def test_migration_failure_prevents_storage_and_releases_owner(monkeypatch
     assert events == ["owner_acquired", "migration_failed", "owner_released"]
 
 
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+async def test_startup_prepares_named_token_store_once_and_drains_before_owner_release(
+    monkeypatch, migration_boot, outcome,
+):
+    from opensquilla.gateway.token_store import TokenStore
+
+    config, events = migration_boot
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    original = TokenStore._ensure_schema
+
+    def apply(*_):
+        events.append("migration_finished")
+        return []
+
+    def prepare(store):
+        assert threading.get_ident() != loop_thread
+        events.append("token_prepare_started")
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
+        original(store)
+        events.append("token_prepare_finished")
+        if outcome == "failure":
+            raise OSError("synthetic token preparation failure")
+
+    monkeypatch.setattr("opensquilla.persistence.migrator.apply_pending", apply)
+    monkeypatch.setattr(TokenStore, "_ensure_schema", prepare)
+    startup = asyncio.create_task(boot.start_gateway_server(config=config, run=False))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert events == ["owner_acquired", "migration_finished", "token_prepare_started"]
+        if outcome == "cancel":
+            for _ in range(2):
+                startup.cancel()
+                await asyncio.sleep(0)
+                assert not startup.done()
+                assert "owner_released" not in events
+    finally:
+        release.set()
+        expected = {
+            "success": StorageReachedError,
+            "failure": OSError,
+            "cancel": asyncio.CancelledError,
+        }[outcome]
+        with pytest.raises(expected):
+            await startup
+    assert events.count("token_prepare_started") == 1
+    assert events.index("token_prepare_finished") < events.index("owner_released")
+    assert ("storage_constructed" in events) is (outcome == "success")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("worker_fails", [False, True])
 async def test_cancelled_startup_drains_migration_before_releasing_owner(

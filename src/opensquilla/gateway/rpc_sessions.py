@@ -6728,7 +6728,7 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
                 )
             try:
                 decision: AuthorizationDecision = await run_auth_database_operation(
-                    lambda: TokenStore(Path(state_dir) / "sessions.db")
+                    lambda: TokenStore(Path(state_dir) / "sessions.db", initialize=False)
                     .get_active_authorization_decision(public_id),
                 )
             except Exception as exc:  # noqa: BLE001 - explicit unavailable state
