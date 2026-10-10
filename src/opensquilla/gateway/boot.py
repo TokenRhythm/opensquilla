@@ -494,6 +494,42 @@ async def _pause_dream_crons(*, scheduler: Any, jobs: list[Any], reason: str) ->
     return success
 
 
+def _bind_channel_service_readiness(
+    manager: Any, services: ServiceContainer, *, config_revision: str | int,
+) -> bool:
+    """Connect the existing adapter lifecycle to optional-service admission."""
+    from opensquilla.channels.manager import ChannelManager
+
+    if not isinstance(manager, ChannelManager):
+        return False
+    generation = services.optional_generation
+
+    def publish(name: str, status: str | None) -> None:
+        channel_name = name.strip().lower()
+        if not channel_name:
+            return
+        key = f"channel:{channel_name}"
+        previous = services.optional_services.get(key, {})
+        if generation != services.optional_generation:
+            # Shutdown may still remove readiness owned by this generation,
+            # but a late start/stop must never overwrite a replacement owner.
+            if status in {"ready", "starting"} or previous.get("generation") != generation:
+                return
+        if status is None:
+            services.optional_services.pop(key, None)
+            return
+        owner = services.optional_owners.get("channels")
+        services.optional_services[key] = {
+            "status": status,
+            "generation": generation,
+            "config_revision": config_revision,
+            "owner_generation": getattr(owner, "owner_generation", generation),
+        }
+
+    manager.set_service_status_callback(publish)
+    return True
+
+
 @dataclass
 class ServiceContainer:
     """Typed container for initialized services. Returned by build_services().
@@ -2397,6 +2433,7 @@ class GatewayServer:
                     # spend the whole timeout trying to turn a non-awaitable
                     # into a task and make shutdown exceed its bound.
                     if inspect.isawaitable(optional_task):
+                        optional_task = asyncio.ensure_future(optional_task)
                         optional_task.cancel()
                         try:
                             await asyncio.wait_for(optional_task, timeout=remaining(2.0))
@@ -2413,6 +2450,7 @@ class GatewayServer:
                         int(getattr(self._services, "optional_generation", 0) or 0) + 1
                     )
                     if inspect.isawaitable(warmup_task):
+                        warmup_task = asyncio.ensure_future(warmup_task)
                         warmup_task.cancel()
                         try:
                             await asyncio.wait_for(warmup_task, timeout=remaining(2.0))
@@ -4969,11 +5007,13 @@ async def start_gateway_server(
         # must never dispatch during scheduler catch-up or future ticks.
         await _disable_retired_skill_jobs(svc.cron_scheduler)
 
+        cron_scheduler = svc.cron_scheduler
+
         async def _start_cron_scheduler() -> str:
             # Startup catch-up can execute overdue jobs immediately. Gateway
             # callers defer that work until the durable core/listener boundary
             # has been published; standalone callers retain eager startup.
-            await svc.cron_scheduler.start()
+            await cron_scheduler.start()
             log.info("build_services.cron_scheduler_started")
             return "ready"
 
@@ -5062,6 +5102,9 @@ async def start_gateway_server(
                     diagnostics_state=diagnostics_state,
                 ),
             )
+            _bind_channel_service_readiness(
+                manager, svc, config_revision=service_config_revision,
+            )
             _cm_holder[0] = manager
         results: dict[str, str] = await manager.reconcile(config.channels.channels)
         return results
@@ -5119,6 +5162,9 @@ async def start_gateway_server(
     app.state.optional_generation = svc.optional_generation
     service_config_revision = getattr(
         svc, "config_revision", getattr(config, "config_version", 0)
+    )
+    channel_readiness_owned = _bind_channel_service_readiness(
+        channel_manager, svc, config_revision=service_config_revision,
     )
     for descriptor in optional_services.values():
         if isinstance(descriptor, dict):
@@ -5268,7 +5314,7 @@ async def start_gateway_server(
             "generation": generation,
         }
         configured_channel_names = getattr(channel_manager, "_channels", {})
-        if isinstance(configured_channel_names, dict):
+        if not channel_readiness_owned and isinstance(configured_channel_names, dict):
             for name in configured_channel_names:
                 channel_name = str(name).strip().lower()
                 if channel_name:
@@ -5290,7 +5336,7 @@ async def start_gateway_server(
                 # the aggregate owner so one failed adapter does not make a
                 # healthy adapter reject all incoming work.
                 channel_name = str(name).strip().lower()
-                if channel_name:
+                if channel_name and not channel_readiness_owned:
                     svc.optional_services[f"channel:{channel_name}"] = {
                         "status": "ready" if ok else "degraded",
                         "generation": generation,
@@ -5320,7 +5366,9 @@ async def start_gateway_server(
                 "generation": generation,
             }
             for name in (
-                configured_channel_names if isinstance(configured_channel_names, dict) else ()
+                configured_channel_names
+                if not channel_readiness_owned and isinstance(configured_channel_names, dict)
+                else ()
             ):
                 channel_name = str(name).strip().lower()
                 if channel_name:
@@ -5336,7 +5384,9 @@ async def start_gateway_server(
                 "error": type(exc).__name__,
             }
             for name in (
-                configured_channel_names if isinstance(configured_channel_names, dict) else ()
+                configured_channel_names
+                if not channel_readiness_owned and isinstance(configured_channel_names, dict)
+                else ()
             ):
                 channel_name = str(name).strip().lower()
                 if channel_name:

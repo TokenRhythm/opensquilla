@@ -109,6 +109,22 @@ class ChannelManager:
     # restart, stop). Without it, two concurrent CRUD RPCs interleave
     # stop/start on the same name and orphan dispatch/lease tasks.
     _mutate_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _stopping_channels: set[str] = field(default_factory=set)
+    _service_status_callback: Callable[[str, str | None], None] | None = None
+
+    def set_service_status_callback(
+        self, callback: Callable[[str, str | None], None],
+    ) -> None:
+        """Publish admission readiness synchronously with adapter lifecycle."""
+        self._service_status_callback = callback
+
+    def _publish_service_status(self, name: str, status: str | None) -> None:
+        if status in {"ready", "starting"} and (
+            self._stopping or name in self._stopping_channels
+        ):
+            return
+        if self._service_status_callback is not None:
+            self._service_status_callback(name, status)
 
     # ── Factory ──────────────────────────────────────────────
 
@@ -272,6 +288,15 @@ class ChannelManager:
 
     async def _safe_start(self, name: str) -> None:
         """Start a single channel with 30 s timeout, then launch dispatch loop."""
+        self._stopping_channels.discard(name)
+        self._publish_service_status(name, "starting")
+        try:
+            await self._start_channel(name)
+        except BaseException:
+            self._publish_service_status(name, "degraded")
+            raise
+
+    async def _start_channel(self, name: str) -> None:
         from opensquilla.gateway.channel_dispatch import _ChannelInFlightSet, _compute_channel_cap
 
         if self._stopping:
@@ -326,6 +351,9 @@ class ChannelManager:
         cap = _compute_channel_cap(self._config)
         in_flight = _ChannelInFlightSet(cap)
         self._in_flight_sets[name] = in_flight
+        # Inbound messages may already be queued by adapter.start(). Publish
+        # the concrete dependency before the dispatcher can consume any of them.
+        self._publish_service_status(name, "ready")
         self._tasks[name] = asyncio.create_task(
             self._dispatch_with_retry(name, key_builder, in_flight=in_flight),
             name=f"channel:{name}",
@@ -372,6 +400,8 @@ class ChannelManager:
                 self._transport_leases[name] = renewed
                 continue
             log.error("channel.transport_lease_lost", channel=name)
+            self._stopping_channels.add(name)
+            self._publish_service_status(name, "degraded")
             adapter = self._channels.get(name)
             if adapter is not None:
                 setattr(adapter, "_connected", False)
@@ -396,6 +426,7 @@ class ChannelManager:
 
         for attempt in range(self._max_retries + 1):
             try:
+                self._publish_service_status(name, "ready")
                 await run_channel_dispatch(
                     channel=self._channels[name],
                     turn_runner=self._turn_runner,
@@ -415,6 +446,7 @@ class ChannelManager:
             except asyncio.CancelledError:
                 raise  # intentional shutdown — never retry
             except Exception as exc:
+                self._publish_service_status(name, "degraded")
                 log.error(
                     "channel.dispatch_error",
                     channel=name,
@@ -438,6 +470,10 @@ class ChannelManager:
         """
         prev = self._dispatch_states.get(name)
         self._dispatch_states[name] = state
+        status = {"running": "ready", "restarting": "starting"}.get(state, "degraded")
+        self._publish_service_status(
+            name, status,
+        )
         if state == "running":
             # First time running (or resumed after a restart): stamp uptime.
             if prev != "running":
@@ -527,6 +563,8 @@ class ChannelManager:
     async def stop_all(self, *, timeout: float | None = None) -> None:
         """Drain within the Gateway's remaining budget, never per-job budgets."""
         self._stopping = True
+        for name in self._channels:
+            self._publish_service_status(name, "stopping")
         if timeout is None:
             await self._stop_all()
             return
@@ -590,6 +628,19 @@ class ChannelManager:
             await self._stop_channel_locked(name)
 
     async def _stop_channel_locked(self, name: str) -> None:
+        if name not in self._channels:
+            return
+        self._stopping_channels.add(name)
+        self._publish_service_status(name, "stopping")
+        try:
+            await self._stop_channel(name)
+        except BaseException:
+            self._publish_service_status(name, "degraded")
+            raise
+        else:
+            self._publish_service_status(name, "disabled")
+
+    async def _stop_channel(self, name: str) -> None:
         if self._delivery_store is not None:
             self._delivery_store.stop_accepting(name)
             await self._delivery_store.drain_channel(name)
@@ -656,6 +707,8 @@ class ChannelManager:
 
     def _uninstall_adapter(self, name: str) -> None:
         """Forget a stopped channel's runtime state (inverse of _install_adapter)."""
+        self._publish_service_status(name, None)
+        self._stopping_channels.discard(name)
         self._channels.pop(name, None)
         for side_map in (
             self._agent_ids,
