@@ -270,6 +270,7 @@ async def test_submission_refusal_keeps_only_status_and_allowlisted_code(
         b"[]",
         b'{"code":"MODEL_ACCESS_DENIED","message":"' + b"x" * (64 * 1024) + b'"}',
     ],
+    ids=["invalid-json", "wrong-shape", "oversized"],
 )
 async def test_invalid_or_oversized_refusal_body_preserves_known_http_rejection(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: bytes
