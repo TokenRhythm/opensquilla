@@ -484,13 +484,13 @@
                   v-else
                   key="send"
                   class="btn btn--icon btn--primary chat-send-btn"
-                  :class="{ 'is-ready': hasSendContent && !sendBlockedMessage && !inputDisabled }"
-                  :title="sendBlockedMessage || sendPending || sessionRoutingBusy || inputDisabled ? undefined
+                  :class="{ 'is-ready': hasSendContent && !sendBlockedMessage && !sendDisabled && !inputDisabled }"
+                  :title="sendBlockedMessage || sendPending || sendDisabled || sessionRoutingBusy || inputDisabled ? undefined
                     : showSkillQueueSend ? t('chat.sendQueues') : sendButtonTitle"
                   :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
                   :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
                   :aria-busy="sendPending || sessionRoutingBusy ? 'true' : 'false'"
-                  :disabled="sendPending || Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
+                  :disabled="sendPending || sendDisabled || Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
                   @click="emit('send')"
                 >
                   <LoadingSpinner v-if="sendPending" />
@@ -570,6 +570,7 @@ const props = withDefaults(defineProps<{
   busySendMode: 'queue' | 'steer'
   hasSendContent: boolean
   sendPending?: boolean
+  sendDisabled?: boolean
   isStreaming: boolean
   canStop: boolean
   stopTargetsPlanRun?: boolean

@@ -654,6 +654,14 @@ export function useChatSend(options: UseChatSendOptions) {
     composerSubmissionVersion.value
     return [...composerSubmissions.values()].some(entry => entry.sessionKey === options.sessionKey.value)
   })
+  const sendHydrationBlocked = computed(() => {
+    composerSubmissionVersion.value
+    acceptanceRecoveryVersion.value
+    // Receipt recovery and proven offline queues precede the ordinary task
+    // hydration guard. Keep those existing actions available in the UI.
+    return Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value
+      && !currentExactReplayAttempt() && !options.offlineQueueIdentity?.value)
+  })
 
   function noteAcceptanceRecoveryChanged() {
     if (disposed) return
@@ -2228,6 +2236,13 @@ export function useChatSend(options: UseChatSendOptions) {
     resumeQueueOnSuccess?: boolean
   }
 
+  function currentExactReplayAttempt(): SendAttempt | null {
+    return !responseHandoffBlocksCurrentSession()
+      && recoveredAttempt?.requiresIdempotentReplay
+      && recoveredAttempt.requestSessionKey === options.sessionKey.value
+      ? recoveredAttempt : null
+  }
+
   async function onSend(invocation: SendInvocation = {}) {
     if (disposed) return
     const key = options.sessionKey.value
@@ -2285,13 +2300,7 @@ export function useChatSend(options: UseChatSendOptions) {
     // In particular, do this before consulting the current annotation drafts:
     // the first request may already have consumed them and advanced the head.
     // Only live transport/admission state is allowed to block this exact replay.
-    const exactReplayAttempt = (
-      !handoffInFlight
-      && recoveredAttempt?.requiresIdempotentReplay
-      && recoveredAttempt.requestSessionKey === options.sessionKey.value
-    )
-      ? recoveredAttempt
-      : null
+    const exactReplayAttempt = currentExactReplayAttempt()
     if (exactReplayAttempt) {
       if (exactReplayAttempt.deliveryIdentity !== undefined
         && exactReplayAttempt.deliveryIdentity !== requestDeliveryIdentity) return
@@ -4039,6 +4048,7 @@ export function useChatSend(options: UseChatSendOptions) {
     },
     onSend,
     sendPending,
+    sendHydrationBlocked,
     onStop,
     sendQueuedSteer,
     sendQueuedFollowup,

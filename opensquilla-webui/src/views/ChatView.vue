@@ -626,6 +626,7 @@
       :busy-send-mode="busySendMode"
       :has-send-content="composerHasSendContent"
       :send-pending="chatSend.sendPending.value"
+      :send-disabled="chatSend.sendHydrationBlocked.value"
       :is-streaming="isStreaming"
       :can-stop="canStop"
       :stop-targets-plan-run="composerStopsPlanRun"
