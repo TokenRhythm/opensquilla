@@ -383,13 +383,23 @@ class ApprovalQueue:
 
     def _release_stale_claims(self) -> None:
         threshold = time.time() - self._claim_ttl_seconds
+        predicate = (
+            "resolved = 0 AND claim_token IS NOT NULL "
+            "AND (claim_started_at IS NULL OR claim_started_at <= ?)"
+        )
+        # Most reads have nothing to reclaim. Do not acquire SQLite's writer
+        # lock for an empty cleanup; a positive check still uses the original
+        # transaction and rechecks the same predicate after acquiring it.
+        if not self._conn.execute(
+            f"SELECT EXISTS(SELECT 1 FROM approval_queue WHERE {predicate})",
+            (threshold,),
+        ).fetchone()[0]:
+            return
         self._conn.execute("BEGIN IMMEDIATE")
         self._conn.execute(
             "UPDATE approval_queue "
             "SET claim_token = NULL, claim_started_at = NULL "
-            "WHERE resolved = 0 "
-            "AND claim_token IS NOT NULL "
-            "AND (claim_started_at IS NULL OR claim_started_at <= ?)",
+            f"WHERE {predicate}",
             (threshold,),
         )
         self._conn.commit()

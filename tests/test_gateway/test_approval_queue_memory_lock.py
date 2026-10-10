@@ -64,6 +64,12 @@ async def test_memory_state_does_not_wait_for_sqlite_worker(
     path = tmp_path / "approvals.sqlite"
     queue = ApprovalQueue(db_path=str(path))
     approval_id = queue.request("exec", {})
+    # An expired claim makes this read perform real cleanup. Empty reads no
+    # longer acquire the writer lock.
+    queue._conn.execute(
+        "UPDATE approval_queue SET claim_token = 'expired', claim_started_at = 0 "
+        "WHERE approval_id = ?", (approval_id,),
+    )
     queue.set_settings("prompt", allow_patterns=["original"], node_id="node")
     queue.set_run_mode("session", "full")
     sql_started = threading.Event()
@@ -108,6 +114,10 @@ async def test_sync_database_mutation_still_waits_for_async_database_worker(tmp_
     path = tmp_path / "approvals.sqlite"
     queue = ApprovalQueue(db_path=str(path))
     approval_id = queue.request("exec", {})
+    queue._conn.execute(
+        "UPDATE approval_queue SET claim_token = 'expired', claim_started_at = 0 "
+        "WHERE approval_id = ?", (approval_id,),
+    )
     sql_started = threading.Event()
     mutation_started = threading.Event()
     queue._conn.set_trace_callback(
