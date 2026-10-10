@@ -15,7 +15,7 @@ leaving the v4 wire shape and all legacy fallback/error semantics untouched.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 
 import structlog
 
@@ -43,7 +43,7 @@ _MAX_HISTORY_CURSOR_INTEGER_TEXT = str(HISTORY_CURSOR_MAX_INTEGER)
 
 
 async def _read_page_bounded(
-    getter: object,
+    getter: Callable[..., Awaitable[object]],
     session_key: str,
     *,
     limit: int,
@@ -52,7 +52,7 @@ async def _read_page_bounded(
 ) -> object:
     """Request a bounded page while retaining old manager-double compatibility."""
     try:
-        return await getter(  # type: ignore[misc]
+        return await getter(
             session_key,
             limit=limit,
             before=before,
@@ -65,7 +65,7 @@ async def _read_page_bounded(
         # raised by the actual page implementation.
         if "content_mode" not in str(exc):
             raise
-        return await getter(  # type: ignore[misc]
+        return await getter(
             session_key,
             limit=limit,
             before=before,

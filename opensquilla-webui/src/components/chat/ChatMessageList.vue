@@ -185,6 +185,7 @@
 import SkillLoadStatus from './SkillLoadStatus.vue'
 import {
   computed,
+  inject,
   nextTick,
   onBeforeUnmount,
   onMounted,
@@ -223,6 +224,8 @@ import { sandboxResumeMessageTurnId } from '@/utils/chat/sandboxResumeGuard'
 import { isProcessRestartOutcome, turnOutcomePresentation } from '@/utils/chat/turnOutcome'
 import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
 import { ContentRangeCache, type ContentRangeRef } from '@/utils/chat/contentRangeCache'
+import { HISTORY_CONTENT_READER_KEY } from '@/modules/historyContent'
+import { restoreHistoryTimelineText } from '@/utils/chat/historyMessageContent'
 import {
   isUsageAccountingBarrierMessage,
   strictUsageBarrierRetryUserMessageIndex,
@@ -430,7 +433,7 @@ let synchronizeScrollOffset: (() => void) | null = null
 // Hydrate mounted history previews into the existing message renderer.
 // Reads are serialized. Mounted content remains visible; only offscreen cached
 // bodies are evicted when the retained-content cache exceeds its budget.
-const contentRangeCache = new ContentRangeCache()
+const contentRangeCache = inject(HISTORY_CONTENT_READER_KEY, () => new ContentRangeCache())()
 const hydratedContent = reactive(new Map<string, string>())
 const hydratedContentBytes = new Map<string, number>()
 let hydratedContentTotalBytes = 0
@@ -530,36 +533,8 @@ function hydratedMessage(message: ChatRenderedMessage, index: number): ChatRende
 }
 
 function hydrateTimelineText(message: ChatRenderedMessage, text: string): ChatRenderedMessage['timelineItems'] {
-  const lengths = message.historyPayloadPreview?.textUtf16Lengths
-  const timeline = message.timelineItems
-  if (!lengths || !timeline || timeline.filter(item => item.type === 'text').length !== lengths.length) return undefined
-  // Finalizer stores either compact text or readable paragraph boundaries.
-  // Restore only when every prefix and original length agrees with the full
-  // semantic body. Tool/interrupt positions, presentation and activityOrder
-  // stay unchanged; an unrelated body falls back to canonical text.
-  for (const readable of [false, true]) {
-    let cursor = 0
-    let index = 0
-    let previous = ''
-    let valid = true
-    const restored = timeline.map(item => {
-      if (item.type !== 'text') return item
-      const length = lengths[index++]!
-      const preview = item.rawText ?? ''
-      if (readable && previous && !/\s$/.test(previous) && !/^\s/.test(preview)) {
-        if (text.slice(cursor, cursor + 2) !== '\n\n') valid = false
-        cursor += 2
-      }
-      const rawText = text.slice(cursor, cursor + length)
-      cursor += length
-      if (!Number.isSafeInteger(length) || length < preview.length || rawText.length !== length || !rawText.startsWith(preview)) valid = false
-      previous = rawText
-      return { ...item, rawText }
-    })
-    if (valid && cursor === text.length) return restored.map(item => item.type === 'text'
-      ? { ...item, html: props.renderMarkdown(item.rawText ?? '') } : item)
-  }
-  return undefined
+  return restoreHistoryTimelineText(message, text)?.map(item => item.type === 'text'
+    ? { ...item, html: props.renderMarkdown(item.rawText ?? '') } : item)
 }
 
 function rememberHydratedContent(key: string, text: string): void {

@@ -8,6 +8,9 @@ import { useChatHistoryDetails } from '@/composables/chat/useChatHistoryDetails'
 import { useChatRenderedMessages } from '@/composables/chat/useChatRenderedMessages'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import { ContentRangeCache } from '@/utils/chat/contentRangeCache'
+import { HISTORY_CONTENT_READER_KEY, type HistoryContentReaderFactory } from '@/modules/historyContent'
+import { createHistoryContentReader } from '@/adapters/gateway/historyContentV4'
+import { createPrivateHttpTransport } from '@/adapters/gateway/privateHttpTransport'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
 import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
@@ -26,7 +29,7 @@ const message = (overrides: Partial<ChatRenderedMessage> = {}): ChatRenderedMess
   ...overrides,
 })
 
-async function mount(messages: ChatRenderedMessage[], historyMessages?: ChatMessage[]) {
+async function mount(messages: ChatRenderedMessage[], historyMessages?: ChatMessage[], readerFactory?: HistoryContentReaderFactory) {
   const host = document.createElement('div')
   document.body.appendChild(host)
   const { renderMarkdown } = useChatTextRendering()
@@ -61,6 +64,7 @@ async function mount(messages: ChatRenderedMessage[], historyMessages?: ChatMess
   const http = httpTransportTestDouble()
   app.use(i18n)
   app.use(createPinia())
+  if (readerFactory) app.provide(HISTORY_CONTENT_READER_KEY, readerFactory)
   app.provide(GATEWAY_ACCESS_KEY, { isLocalOwner: false } as GatewayAccess)
   app.provide(ARTIFACT_WORKBENCH_KEY, {
     content: createV4ArtifactContentAccess(http),
@@ -76,10 +80,39 @@ afterEach(() => {
   apps.splice(0).forEach(app => app.unmount())
   document.body.innerHTML = ''
   vi.restoreAllMocks()
+  sessionStorage.clear()
   clearAssistantActivityExpansionState()
 })
 
 describe('automatic content through the real assistant renderer', () => {
+  it('uses the authenticated reader for both mounted body hydration and disclosed details', async () => {
+    sessionStorage.setItem('opensquilla.wsToken', 'synthetic-component-token')
+    const body = '## 完整正文\n\n**普通聊天正文🙂。**'
+    const reasoning = '完整思考🙂'.repeat(5000)
+    const fetcher = vi.fn(async (url: RequestInfo | URL, options?: RequestInit) => {
+      const authenticated = new Headers(options?.headers).get('Authorization') === 'Bearer synthetic-component-token'
+      if (!authenticated) return new Response('Unauthorized', { status: 401 })
+      return new Response(String(url).includes('view=details')
+        ? JSON.stringify({ message_id: 'answer', role: 'assistant', reasoning_content: reasoning,
+          tool_calls: [{ type: 'text', text: body, presentation: 'answer' }] })
+        : body)
+    })
+    const { host, canonical } = await mount([], [{
+      role: 'assistant', text: body.slice(0, 8), messageId: 'answer', ts: 1, previewComplete: false,
+      contentRef: { ...message().contentRef!, revision: 'r1' }, contentRevision: 'r1',
+      historyPayloadPreview: { detailsTruncated: true, textUtf16Lengths: [body.length] }, reasoning: { text: '思考预览', seconds: 1 },
+      tool_calls: [{ type: 'text', text: body.slice(0, 8), presentation: 'answer' }],
+    }], createHistoryContentReader(createPrivateHttpTransport({ baseUrl: 'http://localhost/', fetch: fetcher })))
+    await vi.waitFor(() => expect(host.textContent).toContain('普通聊天正文🙂。'))
+    host.querySelector<HTMLButtonElement>('.assistant-activity__summary')!.click()
+    await vi.waitFor(() => expect(canonical.value[0]?.reasoning?.text).toBe(reasoning))
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+      expect.stringContaining('view=display'), expect.stringContaining('view=details'),
+    ])
+    await vi.waitFor(() => expect([...host.querySelectorAll('strong')].map(node => node.textContent))
+      .toEqual(['普通聊天正文🙂。']))
+    expect(host.textContent?.split('完整正文')).toHaveLength(2)
+  })
   it.each(['immediate', 'pending', 'delayed', 'closed', 'replaced', 'failed'])('loads complete details and shares an existing read with the full viewer (%s)', async mode => {
     const reasoning = '深入思考🙂'.repeat(3_000)
     const input = { data: 'long input '.repeat(3_000) }

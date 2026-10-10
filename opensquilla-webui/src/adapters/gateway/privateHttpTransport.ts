@@ -35,6 +35,8 @@ export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 
 interface HttpRequestBase {
   keepalive?: boolean
+  range?: string
+  cache?: 'no-store'
   sessionKey?: string
   timeoutMs?: number
   signal?: AbortSignal
@@ -684,6 +686,7 @@ export function createPrivateHttpTransport(
         headers = new Headers()
         const token = authToken()?.trim() ?? ''
         if (token) headers.set('Authorization', `Bearer ${token}`)
+        if (requestOptions.range) headers.set('Range', requestOptions.range)
         const sessionKey = requestOptions.sessionKey?.trim() ?? ''
         if (sessionKey) headers.set('x-opensquilla-session-key', sessionKey)
         if (hasJson) headers.set('Content-Type', 'application/json')
@@ -712,6 +715,7 @@ export function createPrivateHttpTransport(
           body,
           credentials: externalArtifact ? 'omit' : 'same-origin',
           keepalive: requestOptions.keepalive,
+          cache: requestOptions.cache,
           redirect: 'error',
           signal: linkedSignal.signal,
         })

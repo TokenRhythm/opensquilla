@@ -905,6 +905,7 @@ import { useChatHistory } from '@/composables/chat/useChatHistory'
 import { useChatHistoryDetails } from '@/composables/chat/useChatHistoryDetails'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
+import { useChatMessageContent } from '@/composables/chat/useChatMessageContent'
 import {
   resolveChatHeaderTitle,
   useChatSessionTitles,
@@ -2685,7 +2686,11 @@ const voiceCapability = useSetupStatus<{ audioConfigured?: boolean }>(injectedSe
 })
 const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured === true)
 
+const { readMessageText } = useChatMessageContent(sessionKey)
+const messageActionSessionIdentity = () => JSON.stringify([sessionKey.value, currentEpoch.value])
 const chatMessageActions = useChatMessageActions({
+  sessionIdentity: messageActionSessionIdentity,
+  readMessageText,
   selectedSkills,
   localPathReferences: localPaths,
   restoreInput,
@@ -4774,6 +4779,8 @@ const currentChatTitle = computed(() => resolveChatHeaderTitle(
 ))
 
 const chatMarkdownExport = useChatMarkdownExport({
+  sessionIdentity: messageActionSessionIdentity,
+  readMessageText,
   messages: renderedMessages,
   currentTitle: currentChatTitle,
   aiGeneratedLabel,

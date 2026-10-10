@@ -291,20 +291,101 @@ async def test_unindexed_byte_length_does_not_hide_readable_image(storage):
     attachment = projected["attachments"][0]
     assert "missing_reason" not in attachment
     assert attachment["download_url"]
-    assert not projected.get("contentMetadataPending")
+    assert projected.get("contentMetadataPending")
+    assert projected["contentPreviewComplete"] is True
 
 
 @pytest.mark.asyncio
-async def test_caption_hydrates_when_image_envelope_exceeds_display_export_limit(storage):
+@pytest.mark.parametrize("archived", [False, True])
+async def test_unindexed_inline_caption_http_preserves_revision_and_image(storage, archived):
+    from opensquilla.gateway.app import create_gateway_app
+
+    caption = "图片正文🙂 café\n" * 3000
+    _, payloads = await append(storage, text=caption, archived=archived)
+    table = "compacted_transcript_entries" if archived else "transcript_entries"
+    await storage.conn.execute(f"UPDATE {table} SET content_byte_length = NULL")
+    await storage.conn.commit()
+    _, projected = await message(storage)
+    reference = projected["contentRef"]
+    attachment_url = projected["attachments"][0]["download_url"]
+    app = create_gateway_app(
+        GatewayConfig(auth=AuthConfig(mode="token", token="synthetic-test")),
+        session_manager=SimpleNamespace(storage=storage, get_session=storage.get_session),
+    )
+    params = {"sessionKey": KEY, "sessionId": "sid", "messageId": "mid",
+        "source": "compacted" if archived else "active", "revision": reference["revision"],
+        "view": "display", "export": "1"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+        base_url="http://127.0.0.1", headers={"Authorization": "Bearer synthetic-test"}) as client:
+        response = await client.get("/api/content/read", params=params)
+        assert response.status_code == 200
+        assert response.text == caption
+        assert reference["revision"].endswith(":pending")
+        assert "byteLength" not in reference
+        assert (await client.get("/api/content/read", params={**params,
+            "revision": reference["revision"].removesuffix("pending") + "1"})).status_code == 404
+        image = await client.get(attachment_url)
+        assert image.status_code == 200 and image.content == payloads[0]
+        await storage.backfill_transcript_content_lengths(batch_size=4)
+        assert (await client.get("/api/content/read", params=params)).text == caption
+        _, indexed = await message(storage)
+        assert not indexed["contentRef"]["revision"].endswith(":pending")
+        assert (await client.get("/api/content/read", params={**params,
+            "revision": indexed["contentRef"]["revision"]})).text == caption
+        await storage.conn.execute(
+            f"UPDATE {table} SET content = replace(content, 'provider-only', 'provider-next')"
+        )
+        await storage.conn.commit()
+        assert (await client.get("/api/content/read", params=params)).status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("archived", [False, True])
+async def test_pending_caption_rejects_same_length_update_between_lookup_and_read(
+    storage, monkeypatch, archived,
+):
+    await append(storage, text="caption🙂" * 4000, archived=archived)
+    table = "compacted_transcript_entries" if archived else "transcript_entries"
+    source = "compacted" if archived else "active"
+    await storage.conn.execute(f"UPDATE {table} SET content_byte_length = NULL")
+    await storage.conn.commit()
+    reference = await storage.get_legacy_content_ref(
+        "sid", "mid", source=source, allow_pending=True
+    )
+    read_unindexed = storage._read_unindexed_display_text
+
+    async def update_before_caption(ref, *, max_bytes):
+        await storage.conn.execute(
+            f"UPDATE {table} SET content = replace(content, 'provider-only', 'provider-next')"
+        )
+        await storage.conn.commit()
+        return await read_unindexed(ref, max_bytes=max_bytes)
+
+    monkeypatch.setattr(storage, "_read_unindexed_display_text", update_before_caption)
+    with pytest.raises(ContentNotFoundError):
+        await storage.read_legacy_display_text(reference)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unindexed", [False, True])
+@pytest.mark.parametrize("archived", [False, True])
+async def test_caption_hydrates_when_image_envelope_exceeds_display_export_limit(
+    storage, unindexed, archived,
+):
     from opensquilla.gateway.app import create_gateway_app
     payload = pixels()
     payload += bytes(5 * 1024 * 1024 - len(payload))
     caption = "visible caption 中文\n" * 1500
-    body, _ = await append(storage, text=caption, payloads=[payload, payload])
+    body, _ = await append(storage, text=caption, payloads=[payload, payload], archived=archived)
     assert len(body.encode()) > 8 * 1024 * 1024
+    source = "compacted" if archived else "active"
+    if unindexed:
+        table = "compacted_transcript_entries" if archived else "transcript_entries"
+        await storage.conn.execute(f"UPDATE {table} SET content_byte_length = NULL")
+        await storage.conn.commit()
     _, projected = await message(storage)
     assert projected["contentRef"]["view"] == "display"
-    ref = await storage.get_legacy_content_ref("sid", "mid")
+    ref = await storage.get_legacy_content_ref("sid", "mid", source=source, allow_pending=True)
     assert await storage.read_legacy_display_text(ref) == caption
     with pytest.raises(ContentNotFoundError):
         await storage.read_legacy_display_text(replace(ref, revision=ref.revision + "stale"))
@@ -316,7 +397,7 @@ async def test_caption_hydrates_when_image_envelope_exceeds_display_export_limit
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         response = await client.get("/api/content/read", params={
-            "sessionKey": KEY, "sessionId": "sid", "messageId": "mid", "source": "active",
+            "sessionKey": KEY, "sessionId": "sid", "messageId": "mid", "source": source,
             "revision": ref.revision, "view": "display", "export": "1",
         })
     assert response.status_code == 200

@@ -91,7 +91,7 @@ def _bounded_detail_payload(
         if len(path) >= 12:
             truncated(path)
             return {} if isinstance(value, dict) else []
-        items = (
+        items: list[tuple[Any, Any]] = (
             list(islice(value.items(), 256))
             if isinstance(value, dict) else list(enumerate(value[:256]))
         )
@@ -99,7 +99,7 @@ def _bounded_detail_payload(
             truncated(path)
         overhead = 2
         minimum = 0
-        selected = []
+        selected: list[tuple[Any, Any, int]] = []
         for key, item in items:
             cost = (_json_bytes(key) + 1 if isinstance(value, dict) else 0) + bool(selected)
             item_minimum = 4 if isinstance(item, (str, dict, list)) else _json_bytes(item)
@@ -110,7 +110,7 @@ def _bounded_detail_payload(
             minimum += item_minimum
             selected.append((key, item, item_minimum))
         remaining = budget - overhead
-        projected = {} if isinstance(value, dict) else []
+        projected: dict[Any, Any] | list[Any] = {} if isinstance(value, dict) else []
         for index, (key, item, item_minimum) in enumerate(selected):
             minimum -= item_minimum
             child_budget = min(

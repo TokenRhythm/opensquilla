@@ -28,8 +28,9 @@ from opensquilla.session.storage import SessionStorage
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ["native", "fallback"])
 @pytest.mark.parametrize("source", ["active", "compacted"])
+@pytest.mark.parametrize("role", ["assistant", "user"])
 async def test_unindexed_display_reads_one_versioned_blob_on_its_worker(
-    tmp_path, monkeypatch, backend, source,
+    tmp_path, monkeypatch, backend, source, role,
 ):
     from opensquilla.compat import aiosqlite
     monkeypatch.setattr(aiosqlite, "_FORCE_SQLITE3_FALLBACK", backend == "fallback")
@@ -65,6 +66,10 @@ async def test_unindexed_display_reads_one_versioned_blob_on_its_worker(
         def blobopen(self, table, column, row, *, readonly=False, **kwargs):
             events.append(("open", table, row, readonly))
             return Blob(super().blobopen(table, column, row, readonly=readonly, **kwargs))
+        def execute(self, sql, *args, **kwargs):
+            if "json_valid(content)" in sql:
+                events.append("caption_sql")
+            return super().execute(sql, *args, **kwargs)
 
     connect = aiosqlite.connect
     monkeypatch.setattr(
@@ -72,11 +77,17 @@ async def test_unindexed_display_reads_one_versioned_blob_on_its_worker(
     )
     storage = await SessionStorage.open(tmp_path / "sessions.db")
     body = "中文🙂\n" * 4096
+    # Scale the envelope threshold, without allocating an oversized image.
+    # A user body above it must be rejected by blob length before caption SQL.
+    monkeypatch.setattr(
+        "opensquilla.session.attachment_history.MAX_INLINE_ENVELOPE_BYTES",
+        len(body.encode()) - 1,
+    )
     table = "transcript_entries" if source == "active" else "compacted_transcript_entries"
     try:
         await storage.append_transcript_entry(TranscriptEntry(
             session_id="sid", session_key="agent:main:webchat:legacy", message_id="mid",
-            role="assistant", content=body, reasoning_content="full thinking", created_at=1,
+            role=role, content=body, reasoning_content="full thinking", created_at=1,
         ))
         if source == "compacted":
             await storage.conn.execute("""

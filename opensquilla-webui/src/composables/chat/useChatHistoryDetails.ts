@@ -1,7 +1,8 @@
-import { onScopeDispose, watch, type Ref } from 'vue'
+import { hasInjectionContext, inject, onScopeDispose, watch, type Ref } from 'vue'
 import type { ChatMessage, RawToolCallPayload } from '@/types/chat'
 import { activityReasoningBlocks } from '@/utils/chat/activitySnapshot'
 import { ContentRangeCache, type ContentRangeRef } from '@/utils/chat/contentRangeCache'
+import { HISTORY_CONTENT_READER_KEY } from '@/modules/historyContent'
 
 function identity(ref?: ContentRangeRef): string {
   return ref ? JSON.stringify([ref.sessionKey, ref.sessionId, ref.messageId, ref.source, ref.revision]) : ''
@@ -9,7 +10,8 @@ function identity(ref?: ContentRangeRef): string {
 
 /** Detail reads belong to the existing disclosure, never to a background history scan. */
 export function useChatHistoryDetails(options: { sessionKey: Ref<string>; messages: Ref<ChatMessage[]> }) {
-  const reader = new ContentRangeCache()
+  const createReader = hasInjectionContext() ? inject(HISTORY_CONTENT_READER_KEY, null) : null
+  const reader = createReader ? createReader() : new ContentRangeCache()
   const pending = new Map<string, { controller: AbortController; promise: Promise<void> }>()
 
   function cancel(key: string) {

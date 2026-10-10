@@ -14539,9 +14539,9 @@ class SessionStorage:
                         or ref.revision.rsplit(":", 1)[0] != page_revision.rsplit(":", 1)[0]
                     ):
                         raise ContentNotFoundError("attachment source changed")
-                    object.__setattr__(entry, "content_metadata_pending", False)
-                    object.__setattr__(entry, "content_byte_length", ref.byte_length)
-                    object.__setattr__(entry, "content_revision", ref.revision)
+                    # This resolved identity belongs to the attachment read.
+                    # Keep the page's pending body reference until storage
+                    # actually indexes its length; HTTP sees the same metadata.
                     if not (
                         indexed
                         and indexed.get("attachment_id") == attachment.get("attachment_id")
@@ -16120,7 +16120,7 @@ class SessionStorage:
             sql = sql.replace(
                 "content_byte_length AS byte_length", "length(CAST(content AS BLOB)) AS byte_length"
             )
-        params = (session_id, message_id)
+        params: tuple[str, ...] = (session_id, message_id)
         if source is None:
             params = (session_id, message_id, session_id, message_id)
         rows = await self._read_history_query(
@@ -16225,6 +16225,10 @@ class SessionStorage:
         """Read one unknown-length body on the owned SQLite worker and snapshot."""
         from opensquilla.application.content_reader import ContentExportLimitError
         from opensquilla.content_reader import content_revision_matches
+        from opensquilla.session.attachment_history import (
+            MAX_INLINE_ENVELOPE_BYTES,
+            USER_DISPLAY_TEXT_SQL,
+        )
 
         table = {
             "active": "transcript_entries", "compacted": "compacted_transcript_entries",
@@ -16268,11 +16272,36 @@ class SessionStorage:
                     with connection.blobopen(
                         table, "content", row["blob_rowid"], readonly=True,
                     ) as blob:
-                        if len(blob) > max_bytes:
+                        byte_length = len(blob)
+                        if byte_length <= max_bytes:
+                            raw_bytes = blob.read(byte_length)
+                        elif row["role"] == "user" and byte_length <= MAX_INLINE_ENVELOPE_BYTES:
+                            # The snapshot and version check above also fence
+                            # this caption read. Inspect only legal envelopes;
+                            # a huge ordinary body is rejected before any SQL
+                            # expression reads its content.
+                            caption_cursor = connection.execute(
+                                f"""SELECT {USER_DISPLAY_TEXT_SQL} FROM {table}
+                                    WHERE id = ? AND CASE WHEN json_valid(content)
+                                    THEN json_type(content, '$.text') = 'text'
+                                      AND json_type(content, '$.attachments') = 'array'
+                                      AND length(CAST({USER_DISPLAY_TEXT_SQL} AS BLOB)) <= ?
+                                    ELSE 0 END""",
+                                (row["blob_rowid"], max_bytes),
+                            )
+                            try:
+                                caption_row = caption_cursor.fetchone()
+                            finally:
+                                caption_cursor.close()
+                            if caption_row is None:
+                                raise ContentExportLimitError(
+                                    f"display content exceeds {max_bytes} bytes"
+                                )
+                            raw_bytes = json.dumps({"text": caption_row[0]}).encode("utf-8")
+                        else:
                             raise ContentExportLimitError(
                                 f"display content exceeds {max_bytes} bytes"
                             )
-                        raw_bytes = blob.read(len(blob))
             finally:
                 if owns_transaction:
                     connection.rollback()
@@ -16340,7 +16369,7 @@ class SessionStorage:
             f"""SELECT length(CAST({USER_DISPLAY_TEXT_SQL} AS BLOB)) AS display_bytes,
                        CASE WHEN length(CAST({USER_DISPLAY_TEXT_SQL} AS BLOB)) <= ?
                             THEN {USER_DISPLAY_TEXT_SQL} END AS display_text,
-                       turn_context
+                       turn_context, session_key
                 FROM {table} WHERE session_id = ? AND message_id = ? AND role = 'user'
                   AND 'legacy-v1:{ref.source}:' || {identity} || ':' || created_at || """
             f"""':' || content_revision || ':' || length(CAST(content AS BLOB)) = ?
@@ -16361,7 +16390,8 @@ class SessionStorage:
                 raise ContentExportLimitError(f"display content exceeds {max_bytes} bytes")
             def project_caption() -> str:
                 context = json.loads(caption[2]) if isinstance(caption[2], str) else caption[2]
-                entry = TranscriptEntry(session_id=ref.session_id, message_id=ref.message_id,
+                entry = TranscriptEntry(session_id=ref.session_id, session_key=caption[3],
+                    message_id=ref.message_id,
                     role="user", content=json.dumps({"text": caption[1]}), turn_context=context)
                 projected = transcript_entries_to_chat_messages([entry], content_mode="legacy")
                 return projected[0]["text"] if projected else ""
