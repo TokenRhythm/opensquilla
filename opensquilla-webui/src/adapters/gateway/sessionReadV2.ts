@@ -275,6 +275,7 @@ export async function requestV2SessionHistory(
   key: string,
   request: SessionReadPortHistoryRequest,
   expectedGeneration: number,
+  onSent?: (generation: number) => void,
 ): Promise<SessionReadHistoryPage> {
   const direction: HistoryV2Params['direction'] = request.direction === 'after' ? 'after' : 'before'
   const params: HistoryV2Params = {
@@ -289,7 +290,7 @@ export async function requestV2SessionHistory(
   const raw = await rpc.request(
     SESSIONS_HISTORY_PAGE_V2_METHOD,
     { ...params },
-    callOptions(expectedGeneration, request.signal),
+    { ...callOptions(expectedGeneration, request.signal), ...(onSent ? { onSent } : {}) },
   )
   const result = requireResult<HistoryV2Result>(
     SESSIONS_HISTORY_PAGE_V2_METHOD, raw, validateSessionsHistoryPageV2Result,
@@ -379,6 +380,11 @@ export async function openV2SessionRead(
     install,
     async installConsumed() {
       const current = await stateRead()
+      if (current.status === 'rebase_required' || current.status === 'retired') {
+        throw Object.assign(new Error('Session read v2 requires a fresh recovery base.'), {
+          code: current.status === 'rebase_required' ? 'REBASE_REQUIRED' : 'READ_STALE',
+        })
+      }
       const target = current.progress.target_seq
       if (target > state.lastConsumed) {
         if (!rpc.waitForConsumption) throw new Error('Session read v2 requires a consumption fence.')

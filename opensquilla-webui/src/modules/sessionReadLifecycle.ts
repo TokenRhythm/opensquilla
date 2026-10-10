@@ -341,7 +341,7 @@ export class SessionReadContractError extends Error {
   }
 }
 
-export type SessionReadFailureKind = 'aborted' | 'timeout' | 'busy' | 'unavailable' | 'too-large' | 'budget-exhausted'
+export type SessionReadFailureKind = 'aborted' | 'timeout' | 'busy' | 'unavailable' | 'too-large' | 'budget-exhausted' | 'rebase-required'
 
 /** Recoverable read failure projected by a transport Adapter. */
 export class SessionReadFailure extends Error {

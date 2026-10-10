@@ -614,6 +614,14 @@ export function createV4SessionReadPort(
           if (closed || request.signal.aborted || rpc.generation !== expectedGeneration
             || owners.get(request.sessionKey) !== owner) throw abortError()
         }
+        function fenceRebaseFailure(error: unknown): unknown {
+          const code = errorCode(error)
+          if (code === 'REBASE_REQUIRED' || code === 'READ_STALE'
+            || (error instanceof SessionReadFailure && error.kind === 'rebase-required')) {
+            try { assertAdmissionCurrent() } catch (obsolete) { return obsolete }
+          }
+          return error
+        }
         function ensureAdmission(initial = false): Promise<SessionsMessagesSubscribeResult> {
           if (admission) return admission
           const current = (async () => {
@@ -672,7 +680,9 @@ export function createV4SessionReadPort(
               v2BaseApplied = true
             }
             return acknowledgedSubscription
-          })().catch(error => { throw subscriptionError(error) })
+          })().catch(error => {
+            throw subscriptionError(fenceRebaseFailure(error))
+          })
           const observed = current.finally(() => {
             if (admission === observed) admission = null
           })
@@ -702,7 +712,7 @@ export function createV4SessionReadPort(
           ? (v2Enabled ? Promise.all([liveFramesQueued, subscribePromise]) : liveFramesQueued).then(() => v2Enabled
             ? requestV2SessionHistory(rpc, request.sessionKey, {
                 direction: 'latest', limit: INITIAL_HISTORY_LIMIT, signal: request.signal,
-              }, expectedGeneration).then(result => {
+              }, expectedGeneration, historySent.sent).then(result => {
                 historySent.sent(expectedGeneration)
                 return result
               })
@@ -801,7 +811,7 @@ export function createV4SessionReadPort(
             // keep old questions actionable forever after a missed terminal.
             // Legacy Gateways without snapshots retain the conservative bound.
             const metadata = supportsSnapshotRecovery(rpc)
-              ? projectMetadata(subscription)
+              ? Object.freeze({ ...projectMetadata(subscription), hydrationComplete: false })
               : await hydrate(rpc, request.sessionKey, request.signal, expectedGeneration, snapshot ?? subscription)
             assertSnapshotIdentity(metadata)
             if (v2Lease) {
@@ -834,7 +844,9 @@ export function createV4SessionReadPort(
                 currentStreamSeq: snapshot.current_stream_seq,
               }) : null,
             })
-          })().catch(error => { throw mapSessionReadError(error) })
+          })().catch(error => {
+            throw mapSessionReadError(fenceRebaseFailure(error))
+          })
           const observed = current.finally(() => {
             if (reconciliation === observed) reconciliation = null
           })

@@ -101,6 +101,151 @@ afterEach(() => {
 })
 
 describe('useChatSessionBootstrap', () => {
+  it.each(['initial', 'reconcile'])('replaces an obsolete read base after %s failure while retaining history', async source => {
+    vi.useFakeTimers()
+    const rebase = { ...LIVE_READY, authoritative: false,
+      error: new SessionReadFailure('rebase-required' as SessionReadFailure['kind'], 'Reload state', true) }
+    let attempts = 0
+    const h = createBootstrap({
+      connectionState: ref('connected'),
+      subscribeSession: async () => source === 'initial' && attempts++ === 0 ? rebase : LIVE_READY,
+      reconcileSession: async () => rebase,
+    })
+    try {
+      const initial = h.api.startSessionBootstrap()
+      await Promise.all([initial.live, initial.history])
+      if (source === 'reconcile') await h.api.retryLive()
+      await vi.advanceTimersByTimeAsync(500)
+      expect(h.openSessionRead).toHaveBeenCalledTimes(2)
+      expect(h.openSessionRead).toHaveBeenLastCalledWith({ sessionKey: 'agent:main:webchat:bootstrap-test', includeInitialHistory: false })
+      expect(h.closeLease).toHaveBeenCalledOnce()
+      expect(h.loadHistory).toHaveBeenCalledOnce()
+      expect(h.api.historyPhase.value).toBe('ready')
+      expect(h.api.livePhase.value).toBe('ready')
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
+  it('allows repeated rebases within the original deadline until the third base succeeds', async () => {
+    vi.useFakeTimers()
+    const deadlines: number[] = []
+    const h = createBootstrap({
+      connectionState: ref('connected'),
+      subscribeSession: async context => {
+        deadlines.push(context.deadlineAt)
+        return deadlines.length < 3 ? { ...LIVE_READY, authoritative: false,
+          error: new SessionReadFailure('rebase-required', 'Reload state', true) } : LIVE_READY
+      },
+    })
+    try {
+      await h.api.startSessionBootstrap().live
+      await vi.advanceTimersByTimeAsync(500)
+      expect(h.openSessionRead).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(h.openSessionRead).toHaveBeenCalledTimes(3)
+      expect(new Set(deadlines).size).toBe(1)
+      expect(h.api.livePhase.value).toBe('ready')
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
+  it('does not renew an exhausted rebase deadline and permits the existing explicit retry', async () => {
+    vi.useFakeTimers()
+    let failing = true
+    const h = createBootstrap({
+      connectionState: ref('connected'),
+      subscribeSession: async () => failing ? { ...LIVE_READY, authoritative: false,
+        error: new SessionReadFailure('rebase-required', 'Reload state', true) } : LIVE_READY,
+    })
+    try {
+      await h.api.startSessionBootstrap().live
+      await vi.advanceTimersByTimeAsync(136_000)
+      const attempts = h.openSessionRead.mock.calls.length
+      expect(attempts).toBeGreaterThan(2)
+      await vi.advanceTimersByTimeAsync(45_000)
+      expect(h.openSessionRead).toHaveBeenCalledTimes(attempts)
+      expect(h.api.livePhase.value).toBe('degraded')
+      failing = false
+      await expect(h.api.retryLive(true)).resolves.toMatchObject({ authoritative: true })
+      expect(h.openSessionRead).toHaveBeenCalledTimes(attempts + 1)
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
+  it('does not reopen a rebase failure after its owner has been cancelled', async () => {
+    vi.useFakeTimers()
+    const h = createBootstrap({ connectionState: ref('connected'), subscribeSession: async () => ({
+      ...LIVE_READY, authoritative: false,
+      error: new SessionReadFailure('rebase-required', 'Reload state', true),
+    }) })
+    await h.api.startSessionBootstrap().live
+    h.api.cancelSessionBootstrap()
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(h.openSessionRead).toHaveBeenCalledOnce()
+  })
+
+  it('restarts failed history when explicitly retrying an exhausted rebase budget', async () => {
+    vi.useFakeTimers()
+    let failing = true
+    const h = createBootstrap({
+      connectionState: ref('connected'),
+      loadHistory: async () => failing
+        ? { ok: false, error: new SessionReadFailure('unavailable', 'history failed', false) }
+        : { ok: true },
+      subscribeSession: async () => failing ? { ...LIVE_READY, authoritative: false,
+        error: new SessionReadFailure('rebase-required', 'Reload state', true) } : LIVE_READY,
+    })
+    try {
+      const initial = h.api.startSessionBootstrap()
+      await Promise.all([initial.live, initial.history])
+      await vi.advanceTimersByTimeAsync(136_000)
+      expect(h.api.historyPhase.value).toBe('error')
+      expect(h.api.livePhase.value).toBe('degraded')
+      failing = false
+      await expect(h.api.retryLive(true)).resolves.toMatchObject({ authoritative: true })
+      await vi.waitFor(() => expect(h.api.historyPhase.value).toBe('ready'))
+      expect(h.openSessionRead).toHaveBeenLastCalledWith({ sessionKey: 'agent:main:webchat:bootstrap-test', includeInitialHistory: true })
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
+  it('grants an explicit rebase retry a new deadline before the automatic timer observes expiry', async () => {
+    vi.useFakeTimers()
+    let calls = 0
+    const h = createBootstrap({ subscribeSession: async () => calls++ === 0 ? {
+      ...LIVE_READY, authoritative: false,
+      error: new SessionReadFailure('rebase-required', 'Reload state', true),
+    } : LIVE_READY })
+    try {
+      const run = h.api.startSessionBootstrap()
+      await Promise.all([run.live, run.history])
+      vi.setSystemTime(Date.now() + 120_001)
+      await expect(h.api.retryLive(true)).resolves.toMatchObject({ authoritative: true })
+      expect(h.openSessionRead).toHaveBeenCalledTimes(2)
+      expect(h.api.livePhase.value).toBe('ready')
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
+  it.each(['loading', 'error'])('restarts the %s history phase when replacing its obsolete lease', async phase => {
+    vi.useFakeTimers()
+    let read = 0
+    let release!: (value: SessionPhaseResult) => void
+    const pending = new Promise<SessionPhaseResult>(resolve => { release = resolve })
+    const h = createBootstrap({
+      loadHistory: async () => ++read === 1
+        ? phase === 'loading' ? pending : { ok: false, error: new SessionReadFailure('unavailable', 'history failed', false) }
+        : { ok: true },
+      subscribeSession: vi.fn().mockResolvedValueOnce({ ...LIVE_READY, authoritative: false,
+        error: new SessionReadFailure('rebase-required', 'Reload state', true) }).mockResolvedValue(LIVE_READY),
+    })
+    try {
+      const initial = h.api.startSessionBootstrap()
+      await initial.live
+      if (phase === 'error') await initial.history
+      expect(h.api.historyPhase.value).toBe(phase)
+      await h.api.retryLive()
+      await vi.waitFor(() => expect(h.api.historyPhase.value).toBe('ready'))
+      expect(h.openSessionRead).toHaveBeenLastCalledWith({ sessionKey: 'agent:main:webchat:bootstrap-test', includeInitialHistory: true })
+      expect(h.loadHistory).toHaveBeenCalledTimes(2)
+    } finally { release({ ok: true }); h.api.cancelSessionBootstrap() }
+  })
+
   it('keeps draft identity on reconnect and retires it after first-send acceptance', async () => {
     let draft = true
     const h = createBootstrap({ isProvisionalDraft: () => draft })

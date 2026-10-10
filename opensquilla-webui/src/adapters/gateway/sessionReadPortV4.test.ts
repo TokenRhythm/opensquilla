@@ -370,6 +370,63 @@ function v2AdmissionHarness() {
 describe('read-v2 admission and retirement ownership', () => {
   const historyRequest = (signal: AbortSignal) => ({ direction: 'latest' as const, limit: 100, signal })
 
+  it.each(['REBASE_REQUIRED', 'READ_STALE'])('projects %s as a read-base replacement request', code => {
+    expect(mapSessionReadError(Object.assign(new Error('Reload state'), { code })))
+      .toMatchObject({ kind: 'rebase-required', retryable: true })
+  })
+
+  it.each(['response', 'send'])('isolates a v2 history %s failure at the actual send boundary', async failure => {
+    const h = v2AdmissionHarness()
+    h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, subscribeResult({ ...metadataFields(false) }))
+    const error = Object.assign(new Error('History failed'), { code: 'CONTENT_TOO_LARGE' })
+    const original = h.requestMock.getMockImplementation()!
+    h.requestMock.mockImplementation(async (method, params, options) => {
+      if (method === HISTORY_V2) {
+        if (failure === 'response') options?.onSent?.(h.rpc.generation)
+        throw error
+      }
+      return original(method, params, options)
+    })
+    const request = openRequest()
+    const lease = createV4SessionReadPort(h.rpc).open(request)
+    try {
+      const results = await Promise.allSettled([
+        lease.live, lease.metadata, lease.criticalRequestsQueued,
+        lease.readHistory(historyRequest(request.signal)),
+      ])
+      expect(results.map(result => result.status)).toEqual(failure === 'response'
+        ? ['fulfilled', 'fulfilled', 'fulfilled', 'rejected']
+        : ['rejected', 'rejected', 'rejected', 'rejected'])
+      expect(h.calls.some(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toBe(failure === 'response')
+    } finally { await lease.close() }
+  })
+
+  it.each(['closed', 'replaced', 'generation'])('does not promote a late rebase error from a %s owner', async change => {
+    const h = v2AdmissionHarness()
+    const port = createV4SessionReadPort(h.rpc)
+    const lease = port.open(openRequest(undefined, false))
+    await lease.live
+    const delayed = deferred<unknown>()
+    const install = h.results.get(READ_INSTALL_V2)
+    h.results.set(READ_INSTALL_V2, delayed.promise)
+    const recovery = expect(lease.reconcile()).rejects.toMatchObject({ kind: 'aborted' })
+    await vi.waitFor(() => expect(h.calls.filter(call => call.method === READ_INSTALL_V2)).toHaveLength(2))
+    let replacement: SessionReadPortLease | undefined
+    if (change === 'closed') await lease.close()
+    else if (change === 'generation') h.setGeneration(h.rpc.generation + 1)
+    else {
+      h.results.set(READ_INSTALL_V2, install)
+      replacement = port.open(openRequest(undefined, false))
+      await replacement.live
+    }
+    delayed.reject(Object.assign(new Error('Old base expired'), { code: 'REBASE_REQUIRED' }))
+    await recovery
+    const closeCount = h.calls.filter(call => call.method === READ_CLOSE_V2).length
+    await lease.close()
+    expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(closeCount)
+    await replacement?.close()
+  })
+
   it('keeps an unmaterialized draft live across reconnect, then opens v2 after acceptance', async () => {
     const h = v2AdmissionHarness()
     const original = h.requestMock.getMockImplementation()!

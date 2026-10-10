@@ -27,7 +27,9 @@ export function mapSessionReadError(error: unknown): Error {
       error,
     )
   }
-  const kind = code === 'SNAPSHOT_TOO_LARGE'
+  const kind = code === 'REBASE_REQUIRED' || code === 'READ_STALE'
+    ? 'rebase-required'
+    : code === 'SNAPSHOT_TOO_LARGE'
     ? 'too-large'
     : code === 'RPC_ABORTED' || (error instanceof Error && error.name === 'AbortError')
     ? 'aborted'
@@ -40,7 +42,7 @@ export function mapSessionReadError(error: unknown): Error {
     kind,
     failure.message,
     code !== 'SNAPSHOT_TOO_LARGE' && (failure.retryable === true || kind === 'timeout'
-      || kind === 'busy' || code === 'SNAPSHOT_EXPIRED' || code === 'SNAPSHOT_STALE' || !code),
+      || kind === 'busy' || kind === 'rebase-required' || code === 'SNAPSHOT_EXPIRED' || code === 'SNAPSHOT_STALE' || !code),
     failure.retryAfterMs ?? 0,
     error,
   )
