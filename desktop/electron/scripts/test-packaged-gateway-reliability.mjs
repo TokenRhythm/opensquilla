@@ -1104,14 +1104,11 @@ async function run(options) {
       readProbe.revision++
       mark('renderer-crash-injection')
       const routeBeforeCrash = page.url()
-      // Windows taskkill can invalidate an in-flight CDP command before
-      // Playwright dispatches its page.crash event. Drain the observer first
-      // so the hard-kill probe measures the product's recovery logs rather
-      // than an unrelated monitor command racing the process teardown.
-      if (options.scenario === 'renderer-hard-kill') {
-        stopped = true
-        if (monitor) await monitor
-      }
+      // Both crash injection and Windows taskkill invalidate renderer CDP.
+      // Drain the observer before either fault so an unrelated monitor
+      // command cannot race teardown and abort the recovery assertions.
+      stopped = true
+      if (monitor) await monitor
       const recoverRenderer = options.scenario === 'renderer-hard-kill' ? hardKillAndReloadRenderer : crashAndReloadRenderer
       const rendererRecovery = await recoverRenderer(app, page, async () => {
         let recovery
