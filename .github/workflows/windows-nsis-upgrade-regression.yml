@@ -99,6 +99,7 @@ jobs:
         env:
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: '1'
           OPENSQUILLA_SMOKE_PROVISION_SANDBOX: '1'
+          OPENSQUILLA_FIRST_SEND_TRACE_PATH: ${{ runner.temp }}/security-first-send-trace.zip
         run: |
           if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
             throw 'Windows Safe provisioning requires a disposable GitHub-hosted runner.'
@@ -169,6 +170,7 @@ jobs:
           name: packaged-first-send-evidence
           path: |
             ${{ runner.temp }}/security-first-send-report.log
+            ${{ runner.temp }}/security-first-send-trace.zip
             ${{ runner.temp }}/security-first-send/logs/desktop.log*
             ${{ runner.temp }}/security-first-send/first-send-main-console.jsonl
           if-no-files-found: warn

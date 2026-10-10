@@ -183,6 +183,7 @@ assertSecretScrubbingBoundary()
 const executablePath = resolve(requiredOption('--executable'))
 const userDataDir = resolve(requiredOption('--user-data-dir'))
 const iterations = optionalIntegerOption('--iterations', DEFAULT_ITERATIONS)
+const tracePath = process.env.OPENSQUILLA_FIRST_SEND_TRACE_PATH
 let app
 let provider
 let runError
@@ -369,6 +370,7 @@ try {
       no_proxy: '127.0.0.1,localhost,::1',
     },
   })
+  if (tracePath) await app.context().tracing.start({ screenshots: true, snapshots: true })
   // Observe every available page before waiting for a URL, Gateway readiness,
   // or process diagnostics. The desktop log covers earlier trusted-frame
   // console events; none of those pre-observation errors can be waived.
@@ -454,6 +456,7 @@ try {
 
     const firstMessage = `Synthetic first send ${String(iteration).padStart(2, '0')}`
     await composer.fill(firstMessage)
+    assert.equal(await composer.inputValue(), firstMessage, 'first message must reach the composer before clicking send')
     const sendButton = page.locator('.chat-send-btn.btn--primary')
     await waitFor(async () => await sendButton.count() === 1 && !await sendButton.isDisabled(), 'enabled first send')
     const landingHeaderIdentity = await establishStableHeaderIdentity(header, iteration)
@@ -491,6 +494,7 @@ try {
 
     const followupMessage = `Synthetic follow-up ${String(iteration).padStart(2, '0')}`
     await composer.fill(followupMessage)
+    assert.equal(await composer.inputValue(), followupMessage, 'follow-up must reach the composer before clicking send')
     await page.locator('.chat-send-btn.btn--primary').click()
     await waitFor(
       () => observedChatSendCount(page, followupMessage).then(count => count === 1),
@@ -549,6 +553,10 @@ try {
     sessionStreamWarnings: rendererObservation.sessionStreamWarnings,
   }))
 } finally {
+  if (tracePath && app) {
+    const trace = await captureFirstSendDiagnostic(() => app.context().tracing.stop(runError ? { path: tracePath } : {}))
+    if (trace?.diagnosticError) console.error(`First-send trace capture failed: ${trace.diagnosticError}`)
+  }
   reportPhase('cleanup-start', { failed: Boolean(runError) })
   if (app && mainObservationInstalled) {
     const marked = await captureFirstSendDiagnostic(() => markMainConsoleCleanup(app))
