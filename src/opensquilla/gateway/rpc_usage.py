@@ -152,7 +152,7 @@ async def _context_status(
             ctx.session_manager, "get_transcript_token_metadata", None
         )
         metadata_attempted = callable(get_token_metadata)
-        if metadata_attempted:
+        if callable(get_token_metadata):
             try:
                 metadata = await get_token_metadata(session_key)
             except (

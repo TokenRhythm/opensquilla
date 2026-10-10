@@ -13,7 +13,8 @@ from typing import Protocol
 
 
 class _Sequenced(Protocol):
-    stream_seq: int
+    @property
+    def stream_seq(self) -> int: ...
 
 
 REPLAY_BATCH_FRAMES = 8

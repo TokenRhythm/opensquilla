@@ -11,7 +11,7 @@ from typing import Any, NotRequired, Protocol, TypedDict
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 
 
-def _identity(value: str, label: str) -> str:
+def _identity(value: object, label: str) -> str:
     normalized = value.strip() if isinstance(value, str) else ""
     if not normalized:
         raise ValueError(f"{label} is required")

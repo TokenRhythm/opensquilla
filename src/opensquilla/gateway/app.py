@@ -6,7 +6,7 @@ import functools
 import json
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar, cast
 
 import structlog
 from starlette.applications import Starlette
@@ -243,7 +243,7 @@ def create_gateway_app(
                 if isinstance(value, (str, int)) and not isinstance(value, bool):
                     item[field] = value if not isinstance(value, str) else value[:128]
             compact[name] = item
-        payload = {
+        payload: dict[str, object] = {
             "ready": is_ready,
             "status": "ready" if is_ready else "starting",
             "services": compact,
@@ -913,7 +913,7 @@ def create_gateway_app(
             session = await storage.get_session(session_key)
             if session is None or str(session.session_id) != session_id:
                 raise ContentNotFoundError("legacy content session generation was not found")
-            source = source_param
+            source = cast(Literal["active", "compacted"] | None, source_param)
             reader = build_content_reader(storage)
             ref = await reader.get_ref(
                 session_id, message_id, source=source,

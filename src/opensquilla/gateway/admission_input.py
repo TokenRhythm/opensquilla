@@ -234,8 +234,8 @@ def _required_services(params: dict[str, Any]) -> tuple[str, ...]:
         for item in selected:
             if not isinstance(item, dict):
                 continue
-            name = item.get("name")
-            if isinstance(name, str) and name.strip().lower() in {
+            skill_name = item.get("name")
+            if isinstance(skill_name, str) and skill_name.strip().lower() in {
                 "browser-use",
                 "browser_use",
                 "browseruse",

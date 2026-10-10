@@ -398,7 +398,8 @@ def run_gateway(
         # component that can sample the Gateway while its event loop is
         # synchronously blocked; normal clients pay no thread or file cost.
         stall_watchdog = GatewayStallWatchdog.from_environment()
-        if stall_watchdog is not None and stall_watchdog.start():
+        active_watchdog = stall_watchdog
+        if active_watchdog is not None and active_watchdog.start():
 
             async def _stall_heartbeat() -> None:
                 loop = asyncio.get_running_loop()
@@ -412,14 +413,14 @@ def run_gateway(
                     # observe.
                     await asyncio.sleep(interval_s)
                     now = loop.time()
-                    stall_watchdog.record_loop_lag(
+                    active_watchdog.record_loop_lag(
                         max(0.0, now - expected_wake) * 1000.0,
                         expected_wake_s=expected_wake,
                         wake_s=now,
                         wake_perf_ns=time.perf_counter_ns(),
                         wake_ts=time.time(),
                     )
-                    stall_watchdog.beat()
+                    active_watchdog.beat()
                     expected_wake = now + interval_s
 
             stall_heartbeat_task = asyncio.create_task(
@@ -434,7 +435,7 @@ def run_gateway(
                 except asyncio.CancelledError:
                     return
                 if error is not None:
-                    stall_watchdog.heartbeat_failed(error)
+                    active_watchdog.heartbeat_failed(error)
                     log.error(
                         "gateway.stall_heartbeat_failed",
                         error_type=type(error).__name__,

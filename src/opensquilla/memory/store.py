@@ -11,7 +11,7 @@ import re
 import struct
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
@@ -183,7 +183,7 @@ def _sqlite_vec_loadable_path() -> str:
     # modules and locating the extension must not hold the Gateway event loop.
     import sqlite_vec  # type: ignore
 
-    return sqlite_vec.loadable_path()
+    return cast(str, sqlite_vec.loadable_path())
 
 
 class LongTermMemoryStore:

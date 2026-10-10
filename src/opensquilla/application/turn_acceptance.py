@@ -2199,7 +2199,7 @@ async def _accept_turn_in_scope(
                         retryable=True,
                         accepted=False,
                     ) from exc
-                if resource_busy:
+                if isinstance(exc, AdmissionResourceBusyError):
                     raise AdmissionError(
                         "RESOURCE_BUSY",
                         "The Gateway is at its resident task capacity. Retry shortly.",
@@ -2239,7 +2239,7 @@ async def _accept_turn_in_scope(
                     retryable=False,
                     accepted=True,
                 ) from exc
-            if resource_busy:
+            if isinstance(exc, AdmissionResourceBusyError):
                 raise AdmissionError(
                     "RESOURCE_BUSY_DIRTY",
                     "Resident task capacity is full and the accepted transcript entry "

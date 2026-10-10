@@ -159,7 +159,7 @@ class WindowsDefaultBackend(Backend):
         private_mounts_are_required: bool,
     ) -> SandboxResult:
         structured_output = isinstance(request, SandboxOperation)
-        request, payload, helper_env, helper_argv = await prepare_runtime(
+        prepared_request, payload, helper_env, helper_argv = await prepare_runtime(
             partial(
                 _prepare_helper_launch,
                 request,
@@ -168,7 +168,7 @@ class WindowsDefaultBackend(Backend):
                 private_mounts_are_required=private_mounts_are_required,
             )
         )
-        wall = request.policy.limits.wall_timeout_s
+        wall = prepared_request.policy.limits.wall_timeout_s
         helper_wall = _helper_supervision_timeout(wall)
         started = time.monotonic()
         collection: asyncio.Task[tuple[BoundedOutput, HelperStderr]] | None = None
@@ -217,7 +217,7 @@ class WindowsDefaultBackend(Backend):
                 stderr="windows_default helper timed out",
                 wall_time_s=elapsed,
                 backend_used=self.name,
-                policy_used=request.policy.summary(),
+                policy_used=prepared_request.policy.summary(),
                 timed_out=True,
             )
         except Exception:
@@ -265,7 +265,7 @@ class WindowsDefaultBackend(Backend):
             stderr=stderr,
             wall_time_s=elapsed,
             backend_used=self.name,
-            policy_used=request.policy.summary(),
+            policy_used=prepared_request.policy.summary(),
             truncated_stdout=trunc_out,
             truncated_stderr=trunc_err,
             timed_out=proc.returncode == 124 and helper_timed_out,

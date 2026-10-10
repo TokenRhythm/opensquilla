@@ -18,7 +18,7 @@ class BoundedOutput:
         self.data = bytearray()
         self.truncated = False
 
-    def feed(self, chunk: bytes) -> None:
+    def feed(self, chunk: bytes | bytearray) -> None:
         remaining = self.limit - len(self.data)
         self.data.extend(chunk[:remaining])
         self.truncated |= len(chunk) > remaining
@@ -32,7 +32,7 @@ class HelperStderr(BoundedOutput):
         self.timed_out = False
         self.helper_error: str | None = None
 
-    def feed(self, chunk: bytes) -> None:
+    def feed(self, chunk: bytes | bytearray) -> None:
         self.pending.extend(chunk)
         prefixes = (HELPER_ERROR_PREFIX, HELPER_TIMEOUT_PREFIX)
         while self.pending:

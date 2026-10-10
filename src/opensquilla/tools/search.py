@@ -9,7 +9,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from typing import Any, cast
 
 import snowballstemmer  # type: ignore[import-untyped]
 from anyascii import anyascii
@@ -55,7 +55,7 @@ _MAX_CACHED_WORD_LENGTH = 128
 def _stem_word(word: str) -> str:
     # Snowball stemmers mutate internal cursors. Keep cache misses independent
     # even when separate threads build indexes concurrently.
-    return snowballstemmer.stemmer("english").stemWord(word)
+    return cast(str, snowballstemmer.stemmer("english").stemWord(word))
 
 
 @lru_cache(maxsize=4096)
