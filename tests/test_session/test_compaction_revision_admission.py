@@ -166,6 +166,69 @@ async def test_capacity_replan_absorbs_only_new_complete_rounds(monkeypatch, for
         )
 
 
+def _giant_round(shape: str) -> tuple[list[dict], list[dict]]:
+    """Return (prefix, giant-round) entries for a browser-automation turn.
+
+    Both shapes mirror the durable rows a real session stores: compaction runs
+    on the flattened user/assistant rows, not on structured provider messages
+    (the bundle recorded ``compaction_source_not_entry_aligned`` with 205
+    provider messages behind 8 durable rows).
+    """
+    prefix = [
+        {"role": "user", "content": "Early question one. " + "ordinary detail " * 40},
+        {"role": "assistant", "content": "Early answer one. " + "ordinary detail " * 40},
+        {"role": "user", "content": "Early question two. " + "ordinary detail " * 40},
+        {"role": "assistant", "content": "Early answer two. " + "ordinary detail " * 40},
+    ]
+    payload = "payload token " * 60000
+    if shape == "plain-user":
+        return prefix, [{"role": "user", "content": "Giant automation transcript. " + payload}]
+    # The bundle's shape: an oversized tool observation already flattened into
+    # one durable user row. Its content is not elided by historical-payload
+    # projection, so the single round truly cannot enter a summary request.
+    return prefix, [
+        {"role": "user", "content": "[Tool result (call-browser-1): snapshot " + payload + "]"}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["plain-user", "flattened-tool-result"])
+async def test_indivisible_oversized_round_skips_useless_checkpoint_shortening(shape):
+    # One API round larger than the summarize deployment's whole input window.
+    # No checkpoint length can admit it, so the operation must not spend a
+    # model call shortening the rolling checkpoint before giving up — this
+    # failure replays identically on every later turn of the same session.
+    prefix, giant = _giant_round(shape)
+    entries = [
+        *prefix,
+        *giant,
+        {"role": "user", "content": "Current question."},
+        {"role": "assistant", "content": "Current answer."},
+    ]
+    cfg = synthetic_compaction_config(
+        summary="Earlier rounds are complete.",
+        protected_recent_messages=2,
+        protect_semantic_tail=False,
+    )
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id=f"indivisible-oversized-round-{shape}",
+            entries=entries,
+            config=cfg,
+            context_window_tokens=500,
+        )
+    )
+
+    assert result.skip_reason == "summary_failed"
+    assert result.failure_kind == "indivisible_round_exceeds_input"
+    assert not result.summary and result.removed_count == 0
+    assert result.kept_entries == entries
+    # Exactly one summarize call for the fitting prefix; the checkpoint
+    # shortening call that cannot change the outcome is not issued.
+    assert len(cfg.llm_plan.primary.provider.calls) == 1
+
+
 @pytest.mark.asyncio
 async def test_replan_exhaustion_leaves_original_history_and_checkpoint(monkeypatch):
     entries = history()
