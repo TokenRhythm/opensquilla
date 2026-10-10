@@ -37,6 +37,13 @@ export function createCoalescedRefresh(options: CoalescedRefreshOptions): Coales
       pending = true
       return inFlight
     }
+    // This read satisfies invalidations queued before it starts. Events that
+    // arrive while it is running still set pending and request a follow-up.
+    pending = false
+    if (timer !== null) {
+      clearTimeout(timer)
+      timer = null
+    }
     let tracked: Promise<void>
     tracked = options.run().finally(() => {
       if (inFlight !== tracked) return
