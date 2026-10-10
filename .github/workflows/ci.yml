@@ -2165,6 +2165,9 @@ jobs:
             local name="$1"
             local script="$2"
             local attempt="$3"
+            if [[ "${RUNNER_OS}" == "Linux" && "${name}" == "profile-import-flow" ]]; then
+              local -x DEBUG="${DEBUG:+${DEBUG},}pw:browser"
+            fi
             local log_path="${CI_REPORT_DIR}/${name}-attempt-${attempt}.log"
             local telemetry_path="${CI_REPORT_DIR}/desktop-e2e-cases.jsonl"
             local telemetry=(
