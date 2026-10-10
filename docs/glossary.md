@@ -24,6 +24,15 @@ behavior depends on the surface, permission profile, and tool policy.
 
 Read: [`approvals-and-permissions.md`](approvals-and-permissions.md)
 
+## Budget
+
+A limit accumulated across a turn, which may include multiple LLM and tool calls.
+The six per-turn gates count LLM calls, input and output tokens, cost (billed,
+plus an estimate-backed cousin), and tool errors; attachment disk is a separate
+axis with its own budgets.
+
+Read: [`providers-and-models.md`](providers-and-models.md)
+
 ## Channel
 
 A messaging integration such as Telegram, Slack, Feishu/Lark, Discord, DingTalk,
@@ -107,12 +116,27 @@ turn.
 
 Read: [`features/squilla-router.md`](features/squilla-router.md)
 
+## Tier
+
+The canonical routing tiers are `c0`–`c3` (shown as C0–C3). Lowercase `t0`–`t3`
+are legacy tier aliases, and `R0`–`R3` are route classes mapping onto these tiers.
+Uppercase `T0`–`T3` separately name reasoning levels in the thinking-mode axis.
+
+Read: [`features/squilla-router.md`](features/squilla-router.md)
+
 ## Tool Compression
 
 A context-saving feature that keeps large tool results useful while sending a
 smaller preview to the model.
 
 Read: [`features/tool-compression.md`](features/tool-compression.md)
+
+## Turn
+
+One user-visible request plus everything the agent does to answer it: repeated LLM
+calls, tool calls, and reasoning passes. Budgets and cost rollups count turns.
+
+Read: [`diagnostics-and-replay.md`](diagnostics-and-replay.md)
 
 ## Workspace
 
