@@ -1024,6 +1024,8 @@ jobs:
         run: |
           node scripts/test-macos-keychain-patch.cjs
           node scripts/test-installer-progress-contract.mjs
+          node --test scripts/test-electron-download-proxy.mjs
+          node --test scripts/test-electron-download-tls.mjs
           node --test scripts/test-gateway-integrity.mjs
           node scripts/test-secret-storage-policy.mjs
           node scripts/test-update-resolver.mjs
@@ -1991,7 +1993,9 @@ jobs:
           import asyncio
           import json
           import sys
-          from importlib.metadata import version
+          from importlib.metadata import requires, version
+
+          from packaging.requirements import Requirement
 
           from mcp import Client
           from mcp_types import LATEST_PROTOCOL_VERSION
@@ -2000,9 +2004,18 @@ jobs:
           from opensquilla.mcp.types import MCPServerConfig
           from opensquilla.mcp_server import create_mcp_server
 
-          async def check():
+          def check_sdk_version():
               sdk_version = version("mcp")
-              assert sdk_version == "2.2.0", sdk_version
+              sdk_requirement = next(
+                  dependency
+                  for dependency in map(Requirement, requires("opensquilla") or ())
+                  if dependency.name == "mcp"
+              )
+              assert sdk_version in sdk_requirement.specifier, sdk_version
+              return sdk_version
+
+          async def check():
+              sdk_version = check_sdk_version()
               async with Client(create_mcp_server(), mode="auto") as server:
                   assert server.protocol_version == LATEST_PROTOCOL_VERSION
                   tools = sorted(tool.name for tool in (await server.list_tools()).tools)

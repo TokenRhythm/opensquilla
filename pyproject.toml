@@ -29,6 +29,7 @@ dependencies = [
     "mcp>=2.2.0,<3",
     # Security floors for HTTP and parsing dependencies used by base features.
     "aiohttp>=3.14.3",
+    "multidict>=6.9.1",
     "idna>=3.19",
     "urllib3>=2.7.0",
     "brotli>=1.1",
@@ -107,6 +108,7 @@ recommended = [
     "scikit-learn>=1.9.1",
     "onnxruntime>=1.30.0",
     "tokenizers>=0.23.2",
+    "fsspec>=2026.6.0",
     # Standard installations include the managed execution PTY backend.  The
     # imports remain lazy so ordinary closed/pipe execution keeps its startup
     # path; the explicit ``pty`` extra below remains for core/minimal callers.

@@ -425,6 +425,7 @@ METHOD_SCOPES: dict[str, str] = {
     "onboarding.search.configure": ADMIN_SCOPE,
     "onboarding.imageGeneration.configure": ADMIN_SCOPE,
     "onboarding.imageGeneration.models.discover": ADMIN_SCOPE,
+    "onboarding.videoGeneration.models.discover": ADMIN_SCOPE,
     "onboarding.audio.configure": ADMIN_SCOPE,
     "onboarding.capability.reset": ADMIN_SCOPE,
     "onboarding.channel.probe": ADMIN_SCOPE,

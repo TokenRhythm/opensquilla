@@ -6,6 +6,7 @@ import copy
 import ipaddress
 import logging
 import os
+import re
 import threading
 import warnings
 from enum import StrEnum
@@ -61,6 +62,12 @@ from opensquilla.provider.preset_registry import (
     get_preset,
     legacy_profile_ids,
     router_ladder_provider,
+)
+from opensquilla.provider.video_generation_policy import (
+    VIDEO_GENERATION_DEFAULT_ENV_KEYS,
+    VIDEO_GENERATION_OFFICIAL_BASE_URLS,
+    conflicting_video_generation_endpoint_provider,
+    is_valid_video_generation_base_url,
 )
 from opensquilla.router_tiers import (
     CUSTOM_B5_MAX_PROPOSERS,
@@ -168,10 +175,7 @@ class AuthConfig(BaseSettings):
             ipaddress.IPv4Network(value)
             for value in ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
         )
-        private_v6 = tuple(
-            ipaddress.IPv6Network(value)
-            for value in ("::1/128", "fc00::/7")
-        )
+        private_v6 = tuple(ipaddress.IPv6Network(value) for value in ("::1/128", "fc00::/7"))
         normalized: list[str] = []
         for raw in values:
             network = ipaddress.ip_network(str(raw).strip(), strict=False)
@@ -356,10 +360,7 @@ class PrivacyConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _migrate_scoped_telemetry_preferences(self) -> PrivacyConfig:
-        if (
-            self.reliability_diagnostics_enabled is False
-            or self.product_analytics_enabled is False
-        ):
+        if self.reliability_diagnostics_enabled is False or self.product_analytics_enabled is False:
             self.disable_network_observability = True
         for field_name in _SCOPED_TELEMETRY_CONSENT_FIELDS:
             setattr(self, field_name, None)
@@ -506,9 +507,7 @@ class TaskRuntimeConfig(BaseModel):
             PendingOverflowPolicy(value)
         except ValueError as exc:
             valid = ", ".join(member.value for member in PendingOverflowPolicy)
-            raise ValueError(
-                f"pending_overflow_policy must be one of {{{valid}}}"
-            ) from exc
+            raise ValueError(f"pending_overflow_policy must be one of {{{valid}}}") from exc
         return value
 
     @field_validator("pending_overflow_policy_per_channel")
@@ -522,8 +521,7 @@ class TaskRuntimeConfig(BaseModel):
                 PendingOverflowPolicy(policy)
             except ValueError as exc:
                 raise ValueError(
-                    f"pending_overflow_policy_per_channel[{channel!r}] "
-                    f"must be one of {{{valid}}}"
+                    f"pending_overflow_policy_per_channel[{channel!r}] must be one of {{{valid}}}"
                 ) from exc
         return value
 
@@ -758,8 +756,7 @@ class LlmEnsembleConfig(BaseSettings):
                 "llm_ensemble.min_successful_proposers"
             )
         if (
-            self.selection_mode
-            in STATIC_B5_SELECTION_MODES
+            self.selection_mode in STATIC_B5_SELECTION_MODES
             and self.target_successful_proposers is not None
             and self.target_successful_proposers > 4
         ):
@@ -819,9 +816,8 @@ class LlmEnsembleConfig(BaseSettings):
                 "llm_ensemble.min_successful_proposers cannot exceed the "
                 f"custom_b5 proposer count ({len(proposers)})"
             )
-        if (
-            self.target_successful_proposers is not None
-            and self.target_successful_proposers > len(proposers)
+        if self.target_successful_proposers is not None and self.target_successful_proposers > len(
+            proposers
         ):
             raise ValueError(
                 "llm_ensemble.target_successful_proposers cannot exceed the "
@@ -855,9 +851,7 @@ def _configured_static_b5_selection_modes(config: Any) -> tuple[str, ...]:
             getattr(router, "tiers", None),
             shared_selection_mode=global_mode,
         )
-        modes.extend(
-            mode for mode in tier_modes.values() if mode in STATIC_B5_SELECTION_MODES
-        )
+        modes.extend(mode for mode in tier_modes.values() if mode in STATIC_B5_SELECTION_MODES)
     return tuple(dict.fromkeys(modes))
 
 
@@ -1467,8 +1461,7 @@ class SquillaRouterConfig(BaseSettings):
                 )
                 if raw_enabled is not None and not isinstance(raw_enabled, bool):
                     raise ValueError(
-                        f"squilla_router.tiers.{tier_name}.ensemble_enabled "
-                        "must be a boolean"
+                        f"squilla_router.tiers.{tier_name}.ensemble_enabled must be a boolean"
                     )
             selection_mode = TierConfig.from_value(raw_tier).ensemble_selection_mode
             if selection_mode and selection_mode not in ROUTER_TIER_ENSEMBLE_SELECTION_MODES:
@@ -1677,6 +1670,256 @@ class ImageGenerationConfig(BaseSettings):
     )
 
 
+def _default_video_aspect_ratios() -> list[Literal["16:9", "9:16"]]:
+    return ["16:9", "9:16"]
+
+
+def _default_video_resolutions() -> list[Literal["720p", "1080p"]]:
+    return ["720p", "1080p"]
+
+
+_VIDEO_OPENROUTER_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
+_VIDEO_GEMINI_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
+_VIDEO_PROVIDER_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
+_VIDEO_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+class VideoGenerationProviderConfig(BaseModel):
+    base_url: str
+    api_key: str = ""
+    api_key_env: str
+    # Internal endpoint binding for a stored direct key. Generic config patches
+    # may change base_url without re-entering the key; the old key then remains
+    # unusable until the operator supplies a new key for the new origin.
+    api_key_base_url: str = Field(default="", json_schema_extra={"readOnly": True})
+
+    @field_validator("base_url")
+    @classmethod
+    def _validate_base_url(cls, value: str) -> str:
+        if not is_valid_video_generation_base_url(value):
+            raise ValueError("video provider base_url must be a safe HTTP(S) API root")
+        return value
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _validate_api_key_env(cls, value: str) -> str:
+        if value and not _VIDEO_ENV_NAME.fullmatch(value):
+            raise ValueError("video provider api_key_env must be an environment variable name")
+        return value
+
+    @model_validator(mode="after")
+    def _bind_new_direct_key(self) -> VideoGenerationProviderConfig:
+        if self.api_key and not self.api_key_base_url:
+            self.api_key_base_url = self.base_url
+        return self
+
+
+class VideoGenerationOpenRouterProviderConfig(VideoGenerationProviderConfig):
+    base_url: str = VIDEO_GENERATION_OFFICIAL_BASE_URLS["openrouter"]
+    api_key_env: str = VIDEO_GENERATION_DEFAULT_ENV_KEYS["openrouter"]
+
+
+class VideoGenerationGeminiProviderConfig(VideoGenerationProviderConfig):
+    base_url: str = VIDEO_GENERATION_OFFICIAL_BASE_URLS["gemini"]
+    api_key_env: str = VIDEO_GENERATION_DEFAULT_ENV_KEYS["gemini"]
+
+
+class VideoGenerationXaiProviderConfig(VideoGenerationProviderConfig):
+    base_url: str = VIDEO_GENERATION_OFFICIAL_BASE_URLS["xai"]
+    api_key_env: str = VIDEO_GENERATION_DEFAULT_ENV_KEYS["xai"]
+
+
+class VideoGenerationQwenProviderConfig(VideoGenerationProviderConfig):
+    base_url: str = VIDEO_GENERATION_OFFICIAL_BASE_URLS["qwen"]
+    api_key_env: str = VIDEO_GENERATION_DEFAULT_ENV_KEYS["qwen"]
+
+
+class VideoGenerationTokenRhythmProviderConfig(VideoGenerationProviderConfig):
+    base_url: str = VIDEO_GENERATION_OFFICIAL_BASE_URLS["tokenrhythm"]
+    api_key_env: str = VIDEO_GENERATION_DEFAULT_ENV_KEYS["tokenrhythm"]
+
+
+class VideoGenerationQwenTokenPlanProviderConfig(VideoGenerationProviderConfig):
+    base_url: str = VIDEO_GENERATION_OFFICIAL_BASE_URLS["qwen_token_plan"]
+    api_key_env: str = VIDEO_GENERATION_DEFAULT_ENV_KEYS["qwen_token_plan"]
+
+
+class VideoGenerationProvidersConfig(BaseModel):
+    openrouter: VideoGenerationOpenRouterProviderConfig = Field(
+        default_factory=VideoGenerationOpenRouterProviderConfig
+    )
+    gemini: VideoGenerationGeminiProviderConfig = Field(
+        default_factory=VideoGenerationGeminiProviderConfig
+    )
+    xai: VideoGenerationXaiProviderConfig = Field(default_factory=VideoGenerationXaiProviderConfig)
+    qwen: VideoGenerationQwenProviderConfig = Field(
+        default_factory=VideoGenerationQwenProviderConfig
+    )
+    tokenrhythm: VideoGenerationTokenRhythmProviderConfig = Field(
+        default_factory=VideoGenerationTokenRhythmProviderConfig
+    )
+    qwen_token_plan: VideoGenerationQwenTokenPlanProviderConfig = Field(
+        default_factory=VideoGenerationQwenTokenPlanProviderConfig
+    )
+
+    @model_validator(mode="after")
+    def _validate_provider_origins(self) -> VideoGenerationProvidersConfig:
+        for provider_id in VIDEO_GENERATION_OFFICIAL_BASE_URLS:
+            base_url = getattr(self, provider_id).base_url
+            conflicting_provider = conflicting_video_generation_endpoint_provider(
+                provider_id, base_url
+            )
+            if conflicting_provider is not None:
+                raise ValueError(
+                    f"video_generation.providers.{provider_id}.base_url points to "
+                    f"{conflicting_provider}'s official origin"
+                )
+        return self
+
+
+class VideoGenerationConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_VIDEO_GENERATION_",
+        env_nested_delimiter="__",
+    )
+
+    enabled: bool = False
+    # An omitted provider preserves the original OpenRouter-only config format.
+    # New configurations should select a provider explicitly.
+    provider: Literal[
+        "", "openrouter", "gemini", "xai", "qwen", "tokenrhythm", "qwen_token_plan"
+    ] = ""
+    primary: str = Field(
+        default="",
+        description=(
+            "Provider-native video model ID, such as google/veo-3.1-fast "
+            "for OpenRouter or veo-3.1-generate-preview for Gemini."
+        ),
+    )
+    # Leave duration unset to select the shortest duration advertised by the
+    # model within max_duration_seconds at request time.
+    duration_seconds: int | None = Field(default=None, ge=1, le=60)
+    max_duration_seconds: int = Field(default=8, ge=1, le=60)
+    aspect_ratio: Literal["16:9", "9:16"] = "16:9"
+    allowed_aspect_ratios: list[Literal["16:9", "9:16"]] = Field(
+        default_factory=_default_video_aspect_ratios
+    )
+    resolution: Literal["720p", "1080p"] = "720p"
+    allowed_resolutions: list[Literal["720p", "1080p"]] = Field(
+        default_factory=_default_video_resolutions
+    )
+    timeout_seconds: float = Field(default=600.0, ge=30.0, le=1800.0)
+    max_output_bytes: int = Field(default=100 * 1024 * 1024, ge=1, le=500 * 1024 * 1024)
+    providers: VideoGenerationProvidersConfig = Field(
+        default_factory=VideoGenerationProvidersConfig
+    )
+
+    @field_validator("primary")
+    @classmethod
+    def _normalize_primary(cls, value: str) -> str:
+        return value.strip()
+
+    @property
+    def effective_provider(
+        self,
+    ) -> Literal["", "openrouter", "gemini", "xai", "qwen", "tokenrhythm", "qwen_token_plan"]:
+        if self.provider:
+            return self.provider
+        return "openrouter" if self.primary else ""
+
+    @model_validator(mode="after")
+    def _validate_generation_settings(self) -> VideoGenerationConfig:
+        if self.enabled:
+            if not self.effective_provider:
+                raise ValueError("video_generation.provider and primary are required when enabled")
+            if self.effective_provider == "openrouter" and (
+                not _VIDEO_OPENROUTER_MODEL_ID.fullmatch(self.primary)
+                or any(segment in {"", ".", ".."} for segment in self.primary.split("/"))
+                or "/" not in self.primary
+            ):
+                raise ValueError(
+                    "video_generation.primary must be a raw OpenRouter model ID "
+                    "such as google/veo-3.1-fast"
+                )
+            if self.effective_provider == "gemini" and not _VIDEO_GEMINI_MODEL_ID.fullmatch(
+                self.primary
+            ):
+                raise ValueError(
+                    "video_generation.primary must be a Gemini model ID "
+                    "such as veo-3.1-generate-preview"
+                )
+            if self.effective_provider in {"xai", "qwen", "tokenrhythm", "qwen_token_plan"} and (
+                not _VIDEO_PROVIDER_MODEL_ID.fullmatch(self.primary)
+                or self.primary in {".", ".."}
+            ):
+                raise ValueError(
+                    "video_generation.primary must be a raw provider video model ID "
+                    "without a prefix"
+                )
+        if self.duration_seconds is not None and self.duration_seconds > self.max_duration_seconds:
+            raise ValueError("duration_seconds cannot exceed max_duration_seconds")
+        if self.effective_provider == "gemini":
+            if self.max_duration_seconds < 4:
+                raise ValueError("Gemini Veo max_duration_seconds must be at least 4")
+            if self.duration_seconds is not None and self.duration_seconds not in {4, 6, 8}:
+                raise ValueError("Gemini Veo duration_seconds must be 4, 6, or 8")
+            if self.resolution == "1080p":
+                if self.max_duration_seconds < 8:
+                    raise ValueError("Gemini Veo 1080p requires max_duration_seconds of at least 8")
+                if self.duration_seconds is not None and self.duration_seconds != 8:
+                    raise ValueError("Gemini Veo 1080p requires duration_seconds of 8")
+        if self.enabled:
+            if self.effective_provider in {"qwen", "qwen_token_plan", "tokenrhythm"}:
+                minimum = (
+                    3
+                    if self.effective_provider in {"qwen", "qwen_token_plan"}
+                    and self.primary.startswith("happyhorse-")
+                    else 2
+                )
+                if self.max_duration_seconds < minimum:
+                    raise ValueError(
+                        f"{self.effective_provider} max_duration_seconds must be at least {minimum}"
+                    )
+                if self.duration_seconds is not None and self.duration_seconds < minimum:
+                    raise ValueError(
+                        f"{self.effective_provider} duration_seconds must be at least {minimum}"
+                    )
+            provider_duration_max = {
+                "xai": 15,
+                "qwen": 15,
+                "qwen_token_plan": 15,
+                "tokenrhythm": 30,
+            }.get(self.effective_provider)
+            if (
+                provider_duration_max is not None
+                and self.duration_seconds is not None
+                and self.duration_seconds > provider_duration_max
+            ):
+                raise ValueError(
+                    f"{self.effective_provider} duration_seconds must be at most "
+                    f"{provider_duration_max}"
+                )
+            if (
+                self.effective_provider == "xai"
+                and self.primary == "grok-imagine-video"
+                and self.resolution == "1080p"
+            ):
+                raise ValueError("grok-imagine-video supports at most 720p")
+        if (
+            not self.allowed_aspect_ratios
+            or len(self.allowed_aspect_ratios) != len(set(self.allowed_aspect_ratios))
+            or self.aspect_ratio not in self.allowed_aspect_ratios
+        ):
+            raise ValueError("allowed_aspect_ratios must be unique and contain aspect_ratio")
+        if (
+            not self.allowed_resolutions
+            or len(self.allowed_resolutions) != len(set(self.allowed_resolutions))
+            or self.resolution not in self.allowed_resolutions
+        ):
+            raise ValueError("allowed_resolutions must be unique and contain resolution")
+        return self
+
+
 class AudioElevenLabsProviderConfig(BaseModel):
     base_url: str = "https://api.elevenlabs.io"
     api_key: str = ""
@@ -1688,9 +1931,7 @@ class AudioElevenLabsProviderConfig(BaseModel):
 
 
 class AudioProvidersConfig(BaseModel):
-    elevenlabs: AudioElevenLabsProviderConfig = Field(
-        default_factory=AudioElevenLabsProviderConfig
-    )
+    elevenlabs: AudioElevenLabsProviderConfig = Field(default_factory=AudioElevenLabsProviderConfig)
 
 
 class AudioTTSConfig(BaseModel):
@@ -1745,15 +1986,14 @@ class ConfiguredChannelEntry(BaseModel):
             value = value.split(",")
         if not isinstance(value, list | tuple | set | frozenset):
             return value
-        return list(
-            dict.fromkeys(str(item).strip() for item in value if str(item).strip())
-        )
+        return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
 
     @model_validator(mode="after")
     def _validate_dm_access(self) -> ConfiguredChannelEntry:
         if self.dm_access == "allowlist" and not self.allowed_senders:
             raise ValueError("dm_access=allowlist requires allowed_senders")
         return self
+
     # Group conversations are isolated by sender by default. Deployments that
     # intentionally want one transcript shared by the whole room can opt in.
     group_session_scope: Literal["per_sender", "shared_room"] = "per_sender"
@@ -1818,9 +2058,7 @@ class FeishuChannelEntry(ConfiguredChannelEntry):
             and not self.verification_token.strip()
             and not self.encrypt_key.strip()
         ):
-            raise ValueError(
-                "feishu webhook channels require verification_token or encrypt_key"
-            )
+            raise ValueError("feishu webhook channels require verification_token or encrypt_key")
         return self
 
 
@@ -1871,9 +2109,7 @@ class WeComChannelEntry(ConfiguredChannelEntry):
     def validate_wecom_mode(self) -> WeComChannelEntry:
         if self.connection_mode == "websocket":
             missing = [
-                field
-                for field in ("bot_id", "bot_secret")
-                if not str(getattr(self, field)).strip()
+                field for field in ("bot_id", "bot_secret") if not str(getattr(self, field)).strip()
             ]
             if missing:
                 raise ValueError(
@@ -1955,9 +2191,7 @@ class TelegramChannelEntry(ConfiguredChannelEntry):
             if not self.webhook_url:
                 raise ValueError("webhook_url is required for telegram webhook mode")
             if not self.webhook_secret_token:
-                raise ValueError(
-                    "webhook_secret_token is required for telegram webhook mode"
-                )
+                raise ValueError("webhook_secret_token is required for telegram webhook mode")
         return self
 
 
@@ -2249,8 +2483,7 @@ class ModelOverrideConfig(BaseModel):
         if normalized not in KNOWN_REASONING_FORMATS:
             allowed = ", ".join(sorted(KNOWN_REASONING_FORMATS))
             raise ValueError(
-                f"reasoning_format {value!r} is not a known dialect; "
-                f"expected one of {allowed}"
+                f"reasoning_format {value!r} is not a known dialect; expected one of {allowed}"
             )
         return normalized
 
@@ -2290,7 +2523,8 @@ class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
             # Old nested environment/dotenv settings can survive an upgrade
             # even after the TOML migration. Keep new explicit payloads strict.
             values["memory"] = {
-                key: value for key, value in memory.items()
+                key: value
+                for key, value in memory.items()
                 if key.lower() not in DEPRECATED_MEMORY_LEAVES
             }
         return values
@@ -2386,6 +2620,7 @@ class GatewayConfig(BaseSettings):
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
     goal: GoalConfig = Field(default_factory=GoalConfig)
     image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
+    video_generation: VideoGenerationConfig = Field(default_factory=VideoGenerationConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
@@ -2493,33 +2728,23 @@ class GatewayConfig(BaseSettings):
         }
         if "provider" not in fields_set:
             profile = str(getattr(self.squilla_router, "tier_profile", "") or "")
-            router_fields_set = set(
-                getattr(self.squilla_router, "model_fields_set", set())
-            )
-            legacy_intent = bool(
-                {"model", "base_url", "api_key", "api_key_env"} & fields_set
-            ) or (
+            router_fields_set = set(getattr(self.squilla_router, "model_fields_set", set()))
+            legacy_intent = bool({"model", "base_url", "api_key", "api_key_env"} & fields_set) or (
                 "tier_profile" in router_fields_set
                 and profile.strip().lower() == LEGACY_DEFAULT_LLM_PROVIDER
             )
             credential_hints = {
                 hint
                 for hint in (
-                    credential_provider_hint(
-                        llm.api_key if "api_key" in fields_set else ""
-                    ),
+                    credential_provider_hint(llm.api_key if "api_key" in fields_set else ""),
                     credential_provider_hint(
                         "",
-                        api_key_env=(
-                            llm.api_key_env if "api_key_env" in fields_set else ""
-                        ),
+                        api_key_env=(llm.api_key_env if "api_key_env" in fields_set else ""),
                     ),
                 )
                 if hint
             }
-            origin_hint = endpoint_provider_hint(
-                llm.base_url if "base_url" in fields_set else ""
-            )
+            origin_hint = endpoint_provider_hint(llm.base_url if "base_url" in fields_set else "")
             explicit_profile_hint = (
                 LEGACY_DEFAULT_LLM_PROVIDER
                 if "tier_profile" in router_fields_set
@@ -2572,16 +2797,13 @@ class GatewayConfig(BaseSettings):
                 }
             elif legacy_intent or (env_openrouter and not env_tokenrhythm):
                 provider = LEGACY_DEFAULT_LLM_PROVIDER
-                explicit_openrouter = (
-                    strong_hints == {LEGACY_DEFAULT_LLM_PROVIDER}
-                    or (env_openrouter and not env_tokenrhythm and not legacy_intent)
+                explicit_openrouter = strong_hints == {LEGACY_DEFAULT_LLM_PROVIDER} or (
+                    env_openrouter and not env_tokenrhythm and not legacy_intent
                 )
                 resolution = {
                     "status": "legacy_inferred",
                     "effective_provider": provider,
-                    "source": (
-                        "strong_evidence" if explicit_openrouter else "legacy_compat"
-                    ),
+                    "source": ("strong_evidence" if explicit_openrouter else "legacy_compat"),
                     "reason_code": (
                         "providerless_openrouter_evidence"
                         if explicit_openrouter
@@ -2668,9 +2890,14 @@ class GatewayConfig(BaseSettings):
                             # belong to the shipped ladder being upgraded.
                             tier.update(previous)
                             for key in (
-                                "provider", "model", "description", "supports_image",
-                                "ensemble_enabled", "ensemble_selection_mode",
-                                "ensembleEnabled", "ensembleSelectionMode",
+                                "provider",
+                                "model",
+                                "description",
+                                "supports_image",
+                                "ensemble_enabled",
+                                "ensemble_selection_mode",
+                                "ensembleEnabled",
+                                "ensembleSelectionMode",
                             ):
                                 tier.pop(key, None)
                                 if key in defaults[name]:
@@ -2848,9 +3075,7 @@ class GatewayConfig(BaseSettings):
     search_provider: str = "duckduckgo"
     search_api_key: str = ""
     search_api_key_env: str = ""
-    search_max_results: int = Field(
-        default=DEFAULT_SEARCH_MAX_RESULTS, ge=1, le=MAX_SEARCH_RESULTS
-    )
+    search_max_results: int = Field(default=DEFAULT_SEARCH_MAX_RESULTS, ge=1, le=MAX_SEARCH_RESULTS)
     search_proxy: str = ""
     search_use_env_proxy: bool = False
     search_fallback_policy: Literal["off", "network"] = "off"
@@ -3025,6 +3250,7 @@ class GatewayConfig(BaseSettings):
             "capture_roll_max_chars": str(self.memory.capture_roll_max_chars),
             "dream_enabled": str(self.memory.dream.enabled).lower(),
         }
+
     _runtime_secret_paths: set[str] = PrivateAttr(default_factory=set)
     # Paths whose secret value was explicitly entered by the operator (set by
     # ``clear_runtime_secret``): value-coincidence redaction heuristics in
@@ -3065,6 +3291,20 @@ class GatewayConfig(BaseSettings):
     def to_toml_dict(self) -> dict[str, Any]:
         """Convert config to a TOML-writable dict."""
         data: dict[str, Any] = self.model_dump(exclude_none=True, exclude_defaults=False)
+        video = data.get("video_generation")
+        video_providers = video.get("providers") if isinstance(video, dict) else None
+        if isinstance(video_providers, dict):
+            for provider_id, provider in video_providers.items():
+                if isinstance(provider, dict):
+                    if (
+                        f"video_generation.providers.{provider_id}.api_key"
+                        in self._runtime_secret_paths
+                    ):
+                        provider.pop("api_key", None)
+                    if not provider.get("api_key"):
+                        provider.pop("api_key", None)
+                    if not provider.get("api_key_base_url"):
+                        provider.pop("api_key_base_url", None)
         if not data.get("agents"):
             data.pop("agents", None)
         llm = data.get("llm")
@@ -3139,6 +3379,14 @@ class GatewayConfig(BaseSettings):
     def to_public_dict(self) -> dict[str, Any]:
         """Return a redacted config view safe for public control surfaces."""
         data = cast(dict[str, Any], redact_public_config(self.model_dump()))
+        video = data.get("video_generation")
+        video_providers = video.get("providers") if isinstance(video, dict) else None
+        if isinstance(video_providers, dict):
+            for provider in video_providers.values():
+                if isinstance(provider, dict):
+                    provider.pop("api_key_base_url", None)
+                    if not provider.get("api_key"):
+                        provider.pop("api_key", None)
         llm = data.get("llm")
         if isinstance(llm, dict):
             llm.pop("extra_body", None)
@@ -3463,9 +3711,7 @@ class GatewayConfig(BaseSettings):
 
         cfg = cls()
         default_config_path = (
-            candidates[0]
-            if candidates
-            else default_opensquilla_home().expanduser() / "config.toml"
+            candidates[0] if candidates else default_opensquilla_home().expanduser() / "config.toml"
         )
         cls._apply_profile_path_overrides(cfg, default_config_path)
         cfg._mark_env_absorbed_secrets(None)

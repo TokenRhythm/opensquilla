@@ -44,6 +44,8 @@ DEFAULT_MODEL_TOOL_NAMES: frozenset[str] = frozenset(
         "grep_search",
         "image",
         "image_generate",
+        "video_generate",
+        "video_status",
         "list_dir",
         "open_workspace_preview",
         "pdf",

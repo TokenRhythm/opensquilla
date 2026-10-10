@@ -61,6 +61,7 @@ class SetupCatalogEntry(TypedDict, total=False):
     suggestedModels: list[str]
     defaultDirectModel: str
     defaultModel: str
+    defaultModelVerification: str
     defaultTtsModel: str
     defaultTtsVoice: str
     defaultLanguageCode: str
@@ -93,6 +94,7 @@ class SetupCatalog(TypedDict):
     searchProviders: list[SetupCatalogEntry]
     channels: list[SetupCatalogEntry]
     imageGenerationProviders: list[SetupCatalogEntry]
+    videoGenerationProviders: list[SetupCatalogEntry]
     audioProviders: list[SetupCatalogEntry]
     memoryEmbeddingProviders: list[SetupCatalogEntry]
 
@@ -155,6 +157,7 @@ class SetupStatus(TypedDict):
     imageGenerationPrimary: str
     imageGenerationEnvKey: str
     imageGenerationState: dict[str, object]
+    videoGenerationState: dict[str, object]
     audioConfigured: bool
     audioEnabled: bool
     audioSource: str

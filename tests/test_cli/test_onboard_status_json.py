@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json as _json
 
+import pytest
 from typer.testing import CliRunner
 
 from opensquilla.cli.main import app
@@ -38,6 +39,7 @@ RPC_STATUS_KEYS = frozenset(
         "imageGenerationPrimary",
         "imageGenerationEnvKey",
         "imageGenerationState",
+        "videoGenerationState",
         "audioConfigured",
         "audioEnabled",
         "audioSource",
@@ -111,6 +113,71 @@ def test_status_json_is_a_superset_of_the_rpc_payload(tmp_path, monkeypatch):
     assert not missing, f"CLI status --json lost RPC keys: {sorted(missing)}"
     assert set(cli_payload) - set(rpc_payload) == {"sectionAliases"}
     assert cli_payload["capabilityConfiguration"] == rpc_payload["capabilityConfiguration"]
+    assert cli_payload["videoGenerationState"] == rpc_payload["videoGenerationState"]
+
+
+@pytest.mark.parametrize(
+    ("video_toml", "provider", "expected_source", "available", "clearable"),
+    [
+        ("", "openrouter", "missing_env", False, False),
+        (
+            '[video_generation]\nenabled = true\nprimary = "google/veo-3.1-fast"\n'
+            '[video_generation.providers.openrouter]\napi_key_env = "DUMMY_VIDEO_KEY"\n',
+            "openrouter", "video_env", True, False,
+        ),
+        (
+            '[video_generation]\nenabled = true\nprovider = "xai"\n'
+            'primary = "grok-imagine-video-1.5"\n'
+            '[video_generation.providers.xai]\napi_key = "synthetic-video-key"\n',
+            "xai", "video_direct", True, True,
+        ),
+        (
+            '[image_generation.providers.tokenrhythm]\napi_key = "synthetic-image-key"\n'
+            '[video_generation]\nenabled = true\nprovider = "tokenrhythm"\n'
+            'primary = "wan3.0-video"\n',
+            "tokenrhythm", "image_direct", True, False,
+        ),
+        (
+            '[image_generation.providers.tokenrhythm]\napi_key = "synthetic-image-key"\n'
+            '[video_generation]\nenabled = true\nprovider = "tokenrhythm"\n'
+            'primary = "wan3.0-video"\n'
+            '[video_generation.providers.tokenrhythm]\napi_key_env = "DUMMY_MISSING_VIDEO_KEY"\n',
+            "tokenrhythm", "missing_env", False, False,
+        ),
+    ],
+)
+def test_video_status_uses_shared_state_across_cli_rpc_and_onboarding(
+    tmp_path, monkeypatch, video_toml, provider, expected_source, available, clearable
+):
+    from opensquilla.gateway.rpc import RpcContext
+    from opensquilla.gateway.rpc_onboarding import _status_payload as rpc_status_payload
+    from opensquilla.onboarding.config_store import load_config
+    from opensquilla.onboarding.status import get_onboarding_status
+
+    target = _write_config(tmp_path, monkeypatch)
+    target.write_text(target.read_text(encoding="utf-8") + video_toml, encoding="utf-8")
+    monkeypatch.setenv("DUMMY_VIDEO_KEY", "synthetic-env-video-key")
+    monkeypatch.delenv("DUMMY_MISSING_VIDEO_KEY", raising=False)
+    config = load_config(target)
+
+    cli_payload = _status_json(target)
+    rpc_payload = rpc_status_payload(RpcContext(conn_id="video-status", config=config))
+    shared_state = get_onboarding_status(config).video_generation_state
+
+    assert set(rpc_payload) <= set(cli_payload)
+    assert cli_payload["videoGenerationState"] == shared_state
+    assert rpc_payload["videoGenerationState"] == shared_state
+    selected = next(
+        option for option in shared_state["credentialOptions"] if option["providerId"] == provider
+    )
+    assert selected["source"] == expected_source
+    assert selected["available"] is available
+    assert selected["clearable"] is clearable
+    assert "synthetic-video-key" not in repr(cli_payload)
+    assert "synthetic-image-key" not in repr(cli_payload)
+    assert "synthetic-env-video-key" not in repr(cli_payload)
+    if video_toml and 'provider = ' not in video_toml:
+        assert shared_state["providerId"] == "openrouter"
 
 
 def test_status_json_new_keys_carry_the_expected_values(tmp_path, monkeypatch):

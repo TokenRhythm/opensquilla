@@ -1,15 +1,19 @@
-"""Media built-in tools: image, image_generate, pdf, tts."""
+"""Media built-in tools: image, image_generate, video_generate, pdf, tts."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import io
 import json
 import os
 import re
+import secrets
 import threading
 import uuid
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -18,6 +22,7 @@ from opensquilla.artifacts import (
     DEFAULT_ARTIFACT_DISK_BUDGET_BYTES,
     DEFAULT_ARTIFACT_MAX_BYTES,
     ArtifactBudgetError,
+    ArtifactError,
     ArtifactStore,
     artifact_payload,
 )
@@ -58,6 +63,7 @@ from opensquilla.provider.correlation_context import (
     bind_provider_request_correlation,
     current_provider_request_correlation,
 )
+from opensquilla.provider.environment import environment_value
 from opensquilla.provider.image_generation import (
     ImageGenerationRequest,
     generate_with_fallbacks,
@@ -78,6 +84,24 @@ from opensquilla.provider.image_generation_policy import (
 )
 from opensquilla.provider.protocol import provider_metadata
 from opensquilla.provider.types import ChatConfig, derive_provider_request_correlation
+from opensquilla.provider.video_generation_credentials import (
+    VideoGenerationCredential as _VideoCredential,
+)
+from opensquilla.provider.video_generation_credentials import (
+    resolve_video_generation_credential,
+)
+from opensquilla.provider.video_generation_credentials import (
+    video_generation_base_url as _video_base_url,
+)
+from opensquilla.provider.video_generation_credentials import (
+    video_generation_credential_status as video_generation_credential_status,
+)
+from opensquilla.provider.video_generation_credentials import (
+    video_generation_provider as _video_provider,
+)
+from opensquilla.provider.video_generation_policy import (
+    VIDEO_GENERATION_OFFICIAL_BASE_URLS,
+)
 from opensquilla.sandbox.operation_runtime import SandboxOperation, SandboxToolDescriptor
 from opensquilla.tools.fetch_work import run_blocking_fetch_work
 from opensquilla.tools.path_policy import reject_foreign_host_path
@@ -88,6 +112,7 @@ from opensquilla.tools.types import (
     CallerKind,
     SafeToolError,
     SSRFBlockedError,
+    ToolContext,
     ToolError,
     UnsupportedURLSchemeError,
     current_tool_context,
@@ -102,7 +127,33 @@ _PDF_RENDER_SCALE = 2.0
 _PDF_TEXT_LIMIT = 50_000
 _MAX_REDIRECTS = 5
 _VISION_ANALYSIS_TIMEOUT_SECONDS = 180.0
+_OPENROUTER_VIDEO_BASE_URL = VIDEO_GENERATION_OFFICIAL_BASE_URLS["openrouter"]
+_GEMINI_VIDEO_BASE_URL = VIDEO_GENERATION_OFFICIAL_BASE_URLS["gemini"]
+_MAX_VIDEO_PROMPT_CHARS = 20_000
 _image_generation_config: Any | None = None
+_video_generation_config: Any | None = None
+_video_gateway_config: Any | None = None
+_video_job_sessions: dict[str, _VideoJobReceipt] = {}
+_video_job_sessions_lock = threading.Lock()
+_MAX_TRACKED_VIDEO_JOBS = 1024
+_VIDEO_JOB_FINGERPRINT_SALT = secrets.token_bytes(32)
+_VIDEO_JOB_FINGERPRINT_ITERATIONS = 600_000
+
+
+@dataclass(frozen=True)
+class _VideoJobReceipt:
+    session_key: str
+    credential_fingerprint: str
+    provider: str
+    model: str
+    base_url: str
+    native_job_id: str
+    credential_env: str = ""
+    completed_result: Any | None = field(default=None, repr=False)
+    completed_payload: str | None = field(default=None, repr=False)
+    status_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
+
+
 _audio_config: Any | None = None
 _media_gateway_config: Any | None = None
 _media_llm_config: Any | None = None
@@ -132,6 +183,18 @@ def configure_image_generation(
 def configure_audio(config: Any | None) -> None:
     global _audio_config
     _audio_config = config
+
+
+def configure_video_generation(
+    config: Any | None,
+    *,
+    gateway_config: Any | None = None,
+) -> None:
+    """Bind the optional video route without copying provider secrets."""
+
+    global _video_generation_config, _video_gateway_config
+    _video_generation_config = config
+    _video_gateway_config = gateway_config
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +232,9 @@ def configure_audio(config: Any | None) -> None:
     execution_timeout_seconds=_VISION_ANALYSIS_TIMEOUT_SECONDS,
 )
 async def image(
-    path: str, prompt: str = "Describe this image", _tool_use_id: str = "",
+    path: str,
+    prompt: str = "Describe this image",
+    _tool_use_id: str = "",
 ) -> str:
     if not prompt or not prompt.strip():
         raise ToolError("Prompt must not be empty")
@@ -252,11 +317,14 @@ async def _retain_downloaded_image(payload: bytes, mime: str) -> dict[str, str]:
     config = context.sandbox_gateway_config if context is not None else None
     if getattr(getattr(config, "attachments", None), "persist_transcripts", True) is False:
         return {
-            "local_path": "", "note": "No local copy retained: attachment persistence disabled.",
+            "local_path": "",
+            "note": "No local copy retained: attachment persistence disabled.",
         }
     if (
-        context is None or not context.workspace_dir
-        or not context.artifact_media_root or not context.artifact_session_id
+        context is None
+        or not context.workspace_dir
+        or not context.artifact_media_root
+        or not context.artifact_session_id
     ):
         return {"local_path": "", "note": "No local copy retained: session workspace unavailable."}
 
@@ -272,8 +340,10 @@ async def _retain_downloaded_image(payload: bytes, mime: str) -> dict[str, str]:
         working_files=context.attachment_working_files,
     )
     result = await asyncio.to_thread(
-        materializer.materialize_bytes, payload,
-        name=f"image.{mime.split('/', 1)[1]}", mime=mime,
+        materializer.materialize_bytes,
+        payload,
+        name=f"image.{mime.split('/', 1)[1]}",
+        mime=mime,
         session_id=context.artifact_session_id,
     )
     if result.available and result.rel_path:
@@ -510,10 +580,7 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
     budget = None
     if config is None:
         config = ChatConfig(provider_request_correlation=correlation)
-    elif (
-        correlation is not None
-        and getattr(config, "provider_request_correlation", None) is None
-    ):
+    elif correlation is not None and getattr(config, "provider_request_correlation", None) is None:
         config = config.model_copy(
             update={"provider_request_correlation": correlation},
         )
@@ -545,7 +612,8 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
             ),
             provider_request_max_chars=int(
                 (getattr(config, "provider_request_max_chars", 0) or 0)
-                if explicit_cap is None else explicit_cap
+                if explicit_cap is None
+                else explicit_cap
             ),
         )
     config = config.model_copy(
@@ -713,9 +781,7 @@ async def _image_generate_impl(
     if not getattr(config, "enabled", False):
         raise ToolError("Image generation is disabled")
     if not _image_generation_binding_is_active(config):
-        raise ToolError(
-            "Image generation is inactive because its bound LLM provider is not active"
-        )
+        raise ToolError("Image generation is inactive because its bound LLM provider is not active")
 
     candidates = _resolve_image_generation_candidates(model, config)
     if not candidates:
@@ -941,6 +1007,789 @@ def _resolve_generated_image_path(filename: str | None, output_format: str) -> P
 
 
 # ---------------------------------------------------------------------------
+# video_generate / video_status
+# ---------------------------------------------------------------------------
+
+
+def _resolve_video_generation_config() -> Any:
+    if _video_generation_config is not None:
+        return _video_generation_config
+    from opensquilla.gateway.config import VideoGenerationConfig
+
+    return VideoGenerationConfig()
+
+
+def _video_credential(
+    *,
+    provider: str | None = None,
+    runtime: bool,
+    config: Any | None = None,
+    base_url: str | None = None,
+    gateway_config: Any | None = None,
+) -> _VideoCredential:
+    resolved = config if config is not None else _resolve_video_generation_config()
+    gateway = gateway_config if gateway_config is not None else _video_gateway_config
+    ctx = current_tool_context.get() if runtime else None
+    return resolve_video_generation_credential(
+        resolved,
+        provider_id=provider,
+        runtime=runtime,
+        base_url=base_url,
+        gateway_config=gateway,
+        session_key=str(ctx.session_key or "") if ctx is not None else "",
+    )
+
+
+def video_generation_available(config: Any | None = None) -> bool:
+    """Only advertise video tools when the chosen route has a model and key."""
+
+    resolved = config if config is not None else _resolve_video_generation_config()
+    if (
+        not getattr(resolved, "enabled", False)
+        or not str(getattr(resolved, "primary", "") or "").strip()
+        or _video_provider(resolved) not in VIDEO_GENERATION_OFFICIAL_BASE_URLS
+    ):
+        return False
+    if _video_provider(resolved) == "gemini":
+        from opensquilla.provider.gemini_video_generation import GEMINI_VIDEO_MODELS
+
+        if str(getattr(resolved, "primary", "") or "") not in GEMINI_VIDEO_MODELS:
+            return False
+    try:
+        credential = _video_credential(
+            provider=_video_provider(resolved), runtime=False, config=resolved
+        )
+        return bool(credential.available and credential.api_key)
+    except Exception:
+        return False
+
+
+def _video_request_config() -> tuple[Any, Any]:
+    ctx = current_tool_context.get()
+    if ctx is not None and ctx.caller_kind is CallerKind.SUBAGENT:
+        raise ToolError("Video generation is unavailable to subagents")
+    config = _resolve_video_generation_config()
+    if not getattr(config, "enabled", False):
+        raise ToolError("Video generation is disabled")
+    model = str(getattr(config, "primary", "") or "").strip()
+    if not model:
+        raise ToolError("Video generation model is not configured")
+    provider = _video_provider(config)
+    if provider not in VIDEO_GENERATION_OFFICIAL_BASE_URLS:
+        raise ToolError("Video generation provider is not configured")
+    if provider == "gemini":
+        from opensquilla.provider.gemini_video_generation import GEMINI_VIDEO_MODELS
+
+        if model not in GEMINI_VIDEO_MODELS:
+            raise ToolError("Selected Gemini video model is not supported")
+    try:
+        credential = _video_credential(provider=provider, runtime=True, config=config)
+    except Exception as exc:
+        raise ToolError(f"{provider} credential for video generation is unavailable") from exc
+    if not credential.available or not credential.api_key:
+        raise ToolError(f"{provider} credential for video generation is unavailable")
+    return config, credential
+
+
+def _video_parameters(
+    config: Any,
+    *,
+    duration_seconds: int | None,
+    aspect_ratio: str | None,
+    resolution: str | None,
+) -> tuple[int | None, str, str]:
+    duration = (
+        getattr(config, "duration_seconds", None) if duration_seconds is None else duration_seconds
+    )
+    provider = _video_provider(config)
+    max_duration = int(getattr(config, "max_duration_seconds", 8))
+    provider_cap = {
+        "gemini": 8,
+        "xai": 15,
+        "qwen": 15,
+        "qwen_token_plan": 15,
+        "tokenrhythm": 30,
+    }.get(provider)
+    effective_max_duration = min(max_duration, provider_cap) if provider_cap else max_duration
+    minimum_duration = 1
+    if provider == "gemini":
+        minimum_duration = 4
+    elif provider in {"qwen", "qwen_token_plan"} and str(
+        getattr(config, "primary", "")
+    ).startswith("happyhorse-"):
+        minimum_duration = 3
+    elif provider in {"qwen", "qwen_token_plan", "tokenrhythm"}:
+        minimum_duration = 2
+    if duration is not None and (
+        isinstance(duration, bool)
+        or not isinstance(duration, int)
+        or not minimum_duration <= duration <= effective_max_duration
+    ):
+        raise ToolError(
+            f"duration_seconds must be between {minimum_duration} and "
+            f"{effective_max_duration} for {provider or 'video generation'}"
+        )
+    aspect = aspect_ratio or str(getattr(config, "aspect_ratio", "16:9"))
+    allowed_aspects = tuple(getattr(config, "allowed_aspect_ratios", (aspect,)))
+    if aspect not in allowed_aspects:
+        raise ToolError("aspect_ratio is not allowed by video generation configuration")
+    size = resolution or str(getattr(config, "resolution", "720p"))
+    allowed_resolutions = tuple(getattr(config, "allowed_resolutions", (size,)))
+    if size not in allowed_resolutions:
+        raise ToolError("resolution is not allowed by video generation configuration")
+    if provider == "gemini":
+        if duration is not None and duration not in {4, 6, 8}:
+            raise ToolError("Gemini Veo duration_seconds must be 4, 6, or 8")
+        if size == "1080p" and (max_duration < 8 or duration not in {None, 8}):
+            raise ToolError("Gemini Veo 1080p requires an 8-second duration limit")
+    if provider in {"qwen", "qwen_token_plan", "tokenrhythm"}:
+        if max_duration < minimum_duration:
+            raise ToolError(f"Selected video model requires at least {minimum_duration} seconds")
+    if provider == "xai" and str(getattr(config, "primary", "")) == "grok-imagine-video":
+        if size == "1080p":
+            raise ToolError("grok-imagine-video supports at most 720p")
+    return duration, aspect, size
+
+
+def _resolve_generated_video_path(
+    filename: str | None, *, tool_name: str, allow_existing: bool = False
+) -> Path:
+    raw = filename or f"generated-video-{uuid.uuid4().hex[:12]}.mp4"
+    reject_foreign_host_path(raw, platform=os.name)
+    ctx = current_tool_context.get()
+    root = (
+        Path(ctx.workspace_dir).expanduser().resolve(strict=False)
+        if ctx and ctx.workspace_dir
+        else Path.cwd().resolve(strict=False)
+    )
+    candidate = Path(raw).expanduser()
+    if candidate.suffix.lower() != ".mp4":
+        candidate = candidate.with_suffix(".mp4")
+    target = candidate if candidate.is_absolute() else root / candidate
+    resolved = target.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ToolError(f"Video output path is outside workspace: {filename}") from exc
+    if resolved.exists() and not allow_existing:
+        raise ToolError(f"Video output path already exists: {resolved}")
+    from opensquilla.tools.write_policy import gate_workspace_write_deny
+
+    gate_workspace_write_deny(
+        tool_name,
+        resolved,
+        original_path=raw,
+        workspace=root,
+    )
+    return resolved
+
+
+def _publish_generated_video_artifact(
+    target: Path,
+    *,
+    max_bytes: int,
+    source: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    ctx = current_tool_context.get()
+    if ctx is None:
+        return None, None
+    if ctx.caller_kind is CallerKind.SUBAGENT:
+        return None, "Subagent artifact delivery is unavailable"
+    if not ctx.artifact_media_root or not ctx.artifact_session_id or not ctx.session_key:
+        if ctx.caller_kind is CallerKind.CLI:
+            return None, None
+        return None, "Artifact delivery context is unavailable"
+    try:
+        ref = ArtifactStore(ctx.artifact_media_root).publish_file(
+            target,
+            session_id=ctx.artifact_session_id,
+            session_key=ctx.session_key,
+            name=target.name,
+            mime="video/mp4",
+            source=source,
+            max_bytes=max_bytes,
+            disk_budget_bytes=(
+                ctx.artifact_disk_budget_bytes
+                if ctx.artifact_disk_budget_bytes is not None
+                else DEFAULT_ARTIFACT_DISK_BUDGET_BYTES
+            ),
+        )
+    except ArtifactError as exc:
+        return None, str(exc)
+    except OSError:
+        return None, "Artifact storage is unavailable"
+    artifact = artifact_payload(ref)
+    ctx.published_artifacts.append(artifact)
+    return artifact, None
+
+
+async def _video_result_payload(result: Any, *, max_bytes: int, source: str) -> str:
+    target = Path(result.output_path)
+    try:
+        size_bytes = target.stat().st_size
+    except OSError:
+        size_bytes = None
+    payload: dict[str, Any] = {
+        "status": "ok" if size_bytes is not None else "generated_delivery_failed",
+        "path": str(target),
+        "provider": result.provider,
+        "model": result.model,
+        "job_id": result.job_id,
+        "mime_type": "video/mp4",
+        "size_bytes": size_bytes,
+    }
+    artifact: dict[str, Any] | None
+    delivery_error: str | None
+    if size_bytes is None:
+        artifact, delivery_error = None, "Generated file is unavailable"
+    else:
+        artifact, delivery_error = await asyncio.to_thread(
+            _publish_generated_video_artifact,
+            target,
+            max_bytes=max_bytes,
+            source=source,
+        )
+    if artifact is not None:
+        payload["artifact"] = {k: v for k, v in artifact.items() if k != "download_url"}
+        payload["artifact"]["registered_for_delivery"] = True
+        payload["artifact"]["delivery_managed_by_surface"] = True
+        payload["note"] = (
+            "The video is registered for delivery in this chat. "
+            "Do not publish or generate another copy for the same request."
+        )
+    elif delivery_error is not None:
+        payload["status"] = "generated_delivery_failed"
+        payload["delivery_error"] = delivery_error
+        payload["note"] = "The video was generated and saved locally. Do not generate it again."
+    return json.dumps(payload)
+
+
+def _video_credential_fingerprint(api_key: str) -> str:
+    """Bind token identity to this process without retaining the token itself."""
+
+    # The random salt stays private to this process. A KDF also protects weaker
+    # operator-authored credentials if a receipt fingerprint is exposed.
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        api_key.encode("utf-8"),
+        _VIDEO_JOB_FINGERPRINT_SALT,
+        _VIDEO_JOB_FINGERPRINT_ITERATIONS,
+        dklen=32,
+    ).hex()
+
+
+def _remember_video_job(
+    job_id: str,
+    api_key: str,
+    provider: str,
+    model: str,
+    base_url: str | None = None,
+    credential_env: str = "",
+    *,
+    status_lock: asyncio.Lock | None = None,
+    credential_fingerprint: str | None = None,
+) -> str:
+    """Scope resumable jobs to the session that created them."""
+
+    ctx = current_tool_context.get()
+    if ctx is None or not ctx.session_key:
+        return job_id
+    fingerprint = (
+        credential_fingerprint
+        if credential_fingerprint is not None
+        else _video_credential_fingerprint(api_key)
+    )
+    receipt = _VideoJobReceipt(
+        session_key=ctx.session_key,
+        credential_fingerprint=fingerprint,
+        provider=provider,
+        model=model,
+        base_url=base_url or VIDEO_GENERATION_OFFICIAL_BASE_URLS.get(provider, ""),
+        native_job_id=job_id,
+        credential_env=credential_env,
+        status_lock=status_lock if status_lock is not None else asyncio.Lock(),
+    )
+    with _video_job_sessions_lock:
+        existing = _video_job_sessions.get(job_id)
+        handle = job_id
+        if existing is not None:
+            while handle in _video_job_sessions:
+                handle = f"vjob-{uuid.uuid4().hex}"
+        _video_job_sessions[handle] = receipt
+        if len(_video_job_sessions) > _MAX_TRACKED_VIDEO_JOBS:
+            del _video_job_sessions[next(iter(_video_job_sessions))]
+    return handle
+
+
+def _video_job_receipt(job_id: str) -> _VideoJobReceipt | None:
+    with _video_job_sessions_lock:
+        return _video_job_sessions.get(job_id)
+
+
+def _remember_video_completion(job_id: str, result: Any, payload: str | None = None) -> None:
+    """Retain a local result so status checks do not download or deliver it twice."""
+
+    completed_payload = (
+        payload if payload is not None and json.loads(payload).get("status") == "ok" else None
+    )
+    with _video_job_sessions_lock:
+        receipt = _video_job_sessions.get(job_id)
+        if receipt is not None:
+            _video_job_sessions[job_id] = replace(
+                receipt,
+                completed_result=result,
+                completed_payload=completed_payload,
+            )
+
+
+async def _complete_video_delivery(
+    job_id: str, result: Any, *, max_bytes: int, source: str
+) -> str:
+    """Retain the download and settle publication before releasing its job lock."""
+
+    _remember_video_completion(job_id, result)
+
+    async def publish_and_remember() -> str:
+        payload = await _video_result_payload(result, max_bytes=max_bytes, source=source)
+        if job_id != result.job_id:
+            response = json.loads(payload)
+            response["job_id"] = job_id
+            payload = json.dumps(response)
+        _remember_video_completion(job_id, result, payload)
+        return payload
+
+    # The worker can continue after its caller is cancelled. Keep this task
+    # and the caller's receipt lock until publication and its cache settle.
+    completion_task = asyncio.create_task(publish_and_remember())
+    cancelled: asyncio.CancelledError | None = None
+    while not completion_task.done():
+        try:
+            await asyncio.shield(completion_task)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+        except Exception:
+            break
+    try:
+        return completion_task.result()
+    finally:
+        if cancelled is not None:
+            raise cancelled
+
+
+def video_status_available(ctx: ToolContext | None = None) -> bool:
+    """Keep recovery visible for a caller with a retained accepted job."""
+
+    if ctx is None:
+        with _video_job_sessions_lock:
+            return bool(_video_job_sessions)
+    if ctx.caller_kind is CallerKind.SUBAGENT:
+        return False
+    with _video_job_sessions_lock:
+        return any(
+            ctx.is_owner or (ctx.session_key and receipt.session_key == ctx.session_key)
+            for receipt in _video_job_sessions.values()
+        )
+
+
+def _video_job_access_allowed(
+    job_id: str,
+    api_key: str,
+    provider: str,
+    *,
+    credential_fingerprint: str | None = None,
+) -> bool:
+    ctx = current_tool_context.get()
+    if ctx is None:
+        return False
+    if ctx.is_owner:
+        return True
+    if not ctx.session_key:
+        return False
+    receipt = _video_job_receipt(job_id)
+    if receipt is None or receipt.session_key != ctx.session_key or receipt.provider != provider:
+        return False
+    fingerprint = (
+        credential_fingerprint
+        if credential_fingerprint is not None
+        else _video_credential_fingerprint(api_key)
+    )
+    return hmac.compare_digest(receipt.credential_fingerprint, fingerprint)
+
+
+def _video_job_model(job_id: str, configured_model: str) -> str:
+    receipt = _video_job_receipt(job_id)
+    return receipt.model if receipt is not None else configured_model
+
+
+def _video_adapter(provider: str) -> tuple[Any, Any]:
+    if provider == "openrouter":
+        from opensquilla.provider.video_generation import (
+            generate_openrouter_video,
+            resume_openrouter_video,
+        )
+
+        return generate_openrouter_video, resume_openrouter_video
+    if provider == "gemini":
+        from opensquilla.provider.gemini_video_generation import (
+            generate_gemini_video,
+            resume_gemini_video,
+        )
+
+        return generate_gemini_video, resume_gemini_video
+    if provider == "xai":
+        from opensquilla.provider.xai_video_generation import (
+            generate_xai_video,
+            resume_xai_video,
+        )
+
+        return generate_xai_video, resume_xai_video
+    if provider in {"qwen", "qwen_token_plan"}:
+        from opensquilla.provider.qwen_video_generation import (
+            generate_qwen_video,
+            resume_qwen_video,
+        )
+
+        return generate_qwen_video, resume_qwen_video
+    if provider == "tokenrhythm":
+        from opensquilla.provider.tokenrhythm_video_generation import (
+            generate_tokenrhythm_video,
+            resume_tokenrhythm_video,
+        )
+
+        return generate_tokenrhythm_video, resume_tokenrhythm_video
+    raise ToolError("Video generation provider is not configured")
+
+
+@tool(
+    name="video_generate",
+    description=(
+        "Generate a short MP4 video from a text prompt with the configured "
+        "video provider and model. The result is registered for web and channel delivery. "
+        "Generation can take several minutes; if a job remains pending, call video_status "
+        "with its job_id instead of generating again."
+    ),
+    params={
+        "prompt": {
+            "type": "string",
+            "description": "Visual description of the video to generate.",
+        },
+        "duration_seconds": {
+            "type": "integer",
+            "description": "Optional clip duration, within the operator's configured limit.",
+        },
+        "aspect_ratio": {
+            "type": "string",
+            "description": "Optional frame aspect ratio.",
+            "enum": ["16:9", "9:16"],
+        },
+        "resolution": {
+            "type": "string",
+            "description": "Optional video resolution.",
+            "enum": ["720p", "1080p"],
+        },
+        "filename": {
+            "type": "string",
+            "description": "Optional MP4 output filename or relative path in the workspace.",
+        },
+    },
+    required=["prompt"],
+    sandbox=SandboxToolDescriptor.media(kind="media.generate_video"),
+    execution_timeout_seconds=1860.0,
+)
+async def video_generate(
+    prompt: str,
+    duration_seconds: int | None = None,
+    aspect_ratio: str | None = None,
+    resolution: str | None = None,
+    filename: str | None = None,
+) -> str:
+    from opensquilla.provider.video_generation import (
+        VideoGenerationError,
+        VideoGenerationRejected,
+        VideoGenerationSubmissionUnknown,
+    )
+
+    if not prompt or not prompt.strip():
+        raise ToolError("Prompt must not be empty")
+    if len(prompt) > _MAX_VIDEO_PROMPT_CHARS:
+        raise ToolError("Video prompt is too long")
+    config, credential = _video_request_config()
+    provider = _video_provider(config)
+    base_url = _video_base_url(config, provider, gateway_config=_video_gateway_config)
+    duration, aspect, size = _video_parameters(
+        config,
+        duration_seconds=duration_seconds,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+    )
+    target = _resolve_generated_video_path(filename, tool_name="video_generate")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Finish the KDF before submission so accepting a paid job only registers
+    # its receipt synchronously, including when cancellation follows acceptance.
+    credential_fingerprint = await asyncio.to_thread(
+        _video_credential_fingerprint, credential.api_key
+    )
+    status_lock = asyncio.Lock()
+    accepted_job_id: str | None = None
+    accepted_handle: str | None = None
+
+    def remember_job(job_id: str) -> str:
+        nonlocal accepted_job_id, accepted_handle
+        if accepted_job_id is not None and accepted_job_id != job_id:
+            raise VideoGenerationError(
+                "Video provider returned a different job ID",
+                job_id=accepted_job_id,
+                recoverable=True,
+            )
+        if accepted_handle is None:
+            accepted_job_id = job_id
+            accepted_handle = _remember_video_job(
+                job_id,
+                credential.api_key,
+                provider,
+                str(config.primary),
+                base_url,
+                getattr(credential, "env_key", ""),
+                status_lock=status_lock,
+                credential_fingerprint=credential_fingerprint,
+            )
+        return accepted_handle
+
+    def on_job_accepted(job_id: str) -> None:
+        remember_job(job_id)
+
+    # Status checks can see accepted jobs immediately, but wait for this call
+    # to finish or settle cancellation before retrieving or publishing them.
+    async with status_lock:
+        try:
+            generate, _resume = _video_adapter(provider)
+            extra = {"provider": provider} if provider in {"qwen", "qwen_token_plan"} else {}
+            result = await generate(
+                base_url=base_url,
+                api_key=credential.api_key,
+                model=str(config.primary),
+                prompt=prompt.strip(),
+                duration=duration,
+                max_duration_seconds=int(config.max_duration_seconds),
+                aspect_ratio=aspect,
+                resolution=size,
+                output_path=target,
+                timeout_seconds=float(config.timeout_seconds),
+                max_bytes=int(config.max_output_bytes),
+                on_job_accepted=on_job_accepted,
+                **extra,
+            )
+        except VideoGenerationSubmissionUnknown as exc:
+            return json.dumps(
+                {
+                    "status": "submission_unknown",
+                    "provider": provider,
+                    "note": str(exc),
+                }
+            )
+        except VideoGenerationRejected as exc:
+            message = f"{provider} rejected video generation (HTTP {exc.http_status})."
+            if provider == "tokenrhythm" and exc.error_code == "MODEL_ACCESS_DENIED":
+                message = (
+                    "TokenRhythm rejected video generation (HTTP 403, MODEL_ACCESS_DENIED). "
+                    "The selected video model is limited to approved preview accounts. "
+                    "Model access must be enabled by TokenRhythm before retrying."
+                )
+            raise SafeToolError(message) from None
+        except VideoGenerationError as exc:
+            if exc.recoverable and exc.job_id:
+                handle = remember_job(exc.job_id)
+                return json.dumps(
+                    {
+                        "status": "pending",
+                        "job_id": handle,
+                        "provider": provider,
+                        "note": (
+                            "The job may still complete. Call video_status with this job_id; "
+                            "do not submit it again."
+                        ),
+                    }
+                )
+            if exc.job_id:
+                handle = remember_job(exc.job_id)
+                return json.dumps(
+                    {
+                        "status": "failed",
+                        "job_id": handle,
+                        "provider": provider,
+                        "error": str(exc),
+                        "note": (
+                            "The job or its download failed. "
+                            "Do not generate it again automatically. "
+                            "Use video_status with this job_id if retrieval may recover."
+                        ),
+                    }
+                )
+            raise ToolError(f"Video generation failed: {exc}") from exc
+        except Exception as exc:
+            raise ToolError("Video generation failed unexpectedly") from exc
+        handle = remember_job(result.job_id)
+        return await _complete_video_delivery(
+            handle, result, max_bytes=int(config.max_output_bytes), source="video_generate"
+        )
+
+
+@tool(
+    name="video_status",
+    description=(
+        "Resume checking an existing video job by job_id without creating "
+        "or charging for another generation. Deliver its MP4 when complete."
+    ),
+    params={
+        "job_id": {"type": "string", "description": "Job ID returned by video_generate."},
+        "filename": {
+            "type": "string",
+            "description": "Optional MP4 output filename or relative path in the workspace.",
+        },
+    },
+    required=["job_id"],
+    sandbox=SandboxToolDescriptor.media(kind="media.video_status"),
+    execution_timeout_seconds=1860.0,
+)
+async def video_status(job_id: str, filename: str | None = None) -> str:
+    from opensquilla.provider.video_generation import VideoGenerationError
+
+    if not job_id or not job_id.strip():
+        raise ToolError("job_id must not be empty")
+    safe_job_id = job_id.strip()
+    receipt = _video_job_receipt(safe_job_id)
+    native_job_id = receipt.native_job_id if receipt is not None else safe_job_id
+    credential_fingerprint: str | None = None
+    if receipt is None:
+        config, credential = _video_request_config()
+        provider = _video_provider(config)
+        base_url = _video_base_url(config, provider, gateway_config=_video_gateway_config)
+    else:
+        ctx = current_tool_context.get()
+        if ctx is not None and ctx.caller_kind is CallerKind.SUBAGENT:
+            raise ToolError("Video generation is unavailable to subagents")
+        if ctx is None or (
+            not ctx.is_owner and (not ctx.session_key or ctx.session_key != receipt.session_key)
+        ):
+            raise ToolError("Video job is unavailable in this session")
+        provider = receipt.provider
+        base_url = receipt.base_url
+        try:
+            config, current_credential = _video_request_config()
+        except ToolError:
+            config = _resolve_video_generation_config()
+            current_credential = _VideoCredential(available=False)
+        if (
+            _video_provider(config) == provider
+            and _video_base_url(config, provider, gateway_config=_video_gateway_config) == base_url
+            and current_credential.available
+        ):
+            credential = current_credential
+        else:
+            try:
+                credential = _video_credential(
+                    provider=provider, runtime=True, config=config, base_url=base_url
+                )
+            except Exception as exc:
+                raise ToolError(
+                    f"{provider} credential for video generation is unavailable"
+                ) from exc
+        if credential.available and credential.api_key:
+            credential_fingerprint = await asyncio.to_thread(
+                _video_credential_fingerprint, credential.api_key
+            )
+        candidate_matches = (
+            credential_fingerprint is not None
+            and hmac.compare_digest(credential_fingerprint, receipt.credential_fingerprint)
+        )
+        if not candidate_matches and receipt.credential_env:
+            remembered_key = environment_value(receipt.credential_env).strip()
+            if remembered_key:
+                if credential_fingerprint is None or remembered_key != credential.api_key:
+                    credential_fingerprint = await asyncio.to_thread(
+                        _video_credential_fingerprint, remembered_key
+                    )
+            if remembered_key and credential_fingerprint is not None and hmac.compare_digest(
+                credential_fingerprint, receipt.credential_fingerprint
+            ):
+                credential = _VideoCredential(
+                    available=True,
+                    api_key=remembered_key,
+                    env_key=receipt.credential_env,
+                )
+                candidate_matches = True
+        if not candidate_matches:
+            raise ToolError("Video job is unavailable in this session")
+    if not _video_job_access_allowed(
+        safe_job_id,
+        credential.api_key,
+        provider,
+        credential_fingerprint=credential_fingerprint,
+    ):
+        raise ToolError("Video job is unavailable in this session")
+    if filename is not None:
+        _resolve_generated_video_path(
+            filename, tool_name="video_status", allow_existing=True
+        )
+    receipt = _video_job_receipt(safe_job_id)
+    status_lock = receipt.status_lock if receipt is not None else asyncio.Lock()
+    async with status_lock:
+        receipt = _video_job_receipt(safe_job_id)
+        if receipt is not None and receipt.completed_payload is not None:
+            return receipt.completed_payload
+        if receipt is not None and receipt.completed_result is not None:
+            saved_result = receipt.completed_result
+            if Path(saved_result.output_path).is_file():
+                return await _complete_video_delivery(
+                    safe_job_id, saved_result,
+                    max_bytes=int(config.max_output_bytes), source="video_status",
+                )
+        target = _resolve_generated_video_path(filename, tool_name="video_status")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _generate, resume = _video_adapter(provider)
+            extra = {"provider": provider} if provider in {"qwen", "qwen_token_plan"} else {}
+            result = await resume(
+                base_url=base_url,
+                api_key=credential.api_key,
+                job_id=native_job_id,
+                model=_video_job_model(safe_job_id, str(config.primary)),
+                output_path=target,
+                timeout_seconds=float(config.timeout_seconds),
+                max_bytes=int(config.max_output_bytes),
+                **extra,
+            )
+        except VideoGenerationError as exc:
+            if exc.recoverable and exc.job_id:
+                return json.dumps(
+                    {
+                        "status": "pending",
+                        "job_id": safe_job_id,
+                        "provider": provider,
+                        "note": (
+                            "The job may still complete. Call video_status again later; "
+                            "do not resubmit it."
+                        ),
+                    }
+                )
+            if exc.job_id:
+                return json.dumps(
+                    {
+                        "status": "failed",
+                        "job_id": safe_job_id,
+                        "provider": provider,
+                        "error": str(exc),
+                    }
+                )
+            raise ToolError(f"Video status failed: {exc}") from exc
+        except Exception as exc:
+            raise ToolError("Video status failed unexpectedly") from exc
+        return await _complete_video_delivery(
+            safe_job_id, result, max_bytes=int(config.max_output_bytes), source="video_status"
+        )
+
+
+# ---------------------------------------------------------------------------
 # pdf
 # ---------------------------------------------------------------------------
 
@@ -976,15 +1825,20 @@ def _resolve_generated_image_path(filename: str | None, output_format: str) -> P
     sandbox=SandboxToolDescriptor.media(kind="media.read_pdf"),
 )
 async def pdf(
-    path: str, pages: str | None = None, prompt: str | None = None,
-    render: bool = False, _tool_use_id: str = "",
+    path: str,
+    pages: str | None = None,
+    prompt: str | None = None,
+    render: bool = False,
+    _tool_use_id: str = "",
 ) -> str:
     from opensquilla.tools.builtin import filesystem as fs
     from opensquilla.tools.document_readers import read_pdf_request
 
     context = current_tool_context.get()
     vision_unavailable = bool(
-        render and context is not None and context.image_analysis_target is not None
+        render
+        and context is not None
+        and context.image_analysis_target is not None
         and context.image_analysis_target() is None
     )
     effective_render = render and not vision_unavailable
@@ -1001,8 +1855,11 @@ async def pdf(
     if workspace is not None:
         sandbox_result = await fs._run_sandbox_operation_if_required(
             SandboxOperation.filesystem(
-                kind="read_file", workspace=workspace,
-                run_mode=fs._active_filesystem_run_mode(), path=p, paths=(p,),
+                kind="read_file",
+                workspace=workspace,
+                run_mode=fs._active_filesystem_run_mode(),
+                path=p,
+                paths=(p,),
                 display_path=path,
                 document_options={"pdf_request": True, "pages": pages, "render": effective_render},
             )
@@ -1172,8 +2029,10 @@ def _configured_provider_config(provider_name: str, model: str):
         api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         base_url = base_url or os.environ.get("ANTHROPIC_BASE_URL", "")
     elif provider_name == "openrouter":
-        api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "") or os.environ.get(
-            "OPENAI_API_KEY", ""
+        api_key = (
+            api_key
+            or os.environ.get("OPENROUTER_API_KEY", "")
+            or os.environ.get("OPENAI_API_KEY", "")
         )
         base_url = base_url or os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     else:
@@ -1513,9 +2372,7 @@ def _tts_voice_settings(
     settings: dict[str, Any] = {}
     resolved_stability = _bounded_float(
         "Stability",
-        stability
-        if stability is not None
-        else getattr(tts_config, "stability", None),
+        stability if stability is not None else getattr(tts_config, "stability", None),
     )
     resolved_similarity = _bounded_float(
         "Similarity boost",
@@ -1564,9 +2421,7 @@ def _shared_voice_summary(voice: dict[str, Any]) -> dict[str, Any]:
 
 def _provider_quota_exceeded(error: RuntimeError) -> bool:
     text = str(error).lower()
-    return "quota_exceeded" in text or (
-        "credits remaining" in text and "required" in text
-    )
+    return "quota_exceeded" in text or ("credits remaining" in text and "required" in text)
 
 
 def _short_song_preview_lyrics(lyrics: str) -> str:
@@ -1690,12 +2545,9 @@ async def voice_convert(
         )
     provider_config = _audio_provider_config(config)
     model_id = str(
-        getattr(provider_config, "voice_conversion_model", "")
-        or "eleven_multilingual_sts_v2"
+        getattr(provider_config, "voice_conversion_model", "") or "eleven_multilingual_sts_v2"
     )
-    output_format = str(
-        getattr(provider_config, "music_output_format", "") or "mp3_44100_128"
-    )
+    output_format = str(getattr(provider_config, "music_output_format", "") or "mp3_44100_128")
     resolved, audio_bytes, mime_type = await _resolve_supported_audio_file_for_tool(
         tool_name="voice_convert",
         path=source_audio,
@@ -1961,8 +2813,7 @@ async def music_generate(
                 prompt=final_prompt,
                 model_id=str(getattr(provider_config, "music_model", "") or "music_v1"),
                 output_format=str(
-                    getattr(provider_config, "music_output_format", "")
-                    or "mp3_44100_128"
+                    getattr(provider_config, "music_output_format", "") or "mp3_44100_128"
                 ),
                 duration_seconds=duration_seconds,
                 force_instrumental=True,
@@ -2020,9 +2871,7 @@ async def song_generate(
     provider = _elevenlabs_provider(config)
     lyrics_text = lyrics.strip()
     model_id = str(getattr(provider_config, "music_model", "") or "music_v1")
-    output_format = str(
-        getattr(provider_config, "music_output_format", "") or "mp3_44100_128"
-    )
+    output_format = str(getattr(provider_config, "music_output_format", "") or "mp3_44100_128")
     try:
         result = await provider.generate_music(
             MusicGenerationRequest(
@@ -2233,9 +3082,7 @@ async def voice_search(
         },
         "voice": {
             "type": "string",
-            "description": (
-                "ElevenLabs voice identifier. Uses audio.tts.voice when omitted."
-            ),
+            "description": ("ElevenLabs voice identifier. Uses audio.tts.voice when omitted."),
         },
         "output_path": {
             "type": "string",
@@ -2262,9 +3109,7 @@ async def voice_search(
         },
         "similarity_boost": {
             "type": "number",
-            "description": (
-                "Optional ElevenLabs similarity boost voice setting (0.0 to 1.0)."
-            ),
+            "description": ("Optional ElevenLabs similarity boost voice setting (0.0 to 1.0)."),
             "minimum": 0.0,
             "maximum": 1.0,
         },

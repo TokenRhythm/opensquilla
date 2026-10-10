@@ -537,6 +537,8 @@ def test_subagent_schema_hides_publish_artifact_without_artifact_context() -> No
     names = {tool.name for tool in registry.to_tool_definitions(subagent_ctx)}
 
     assert "publish_artifact" not in names
+    assert "video_generate" not in names
+    assert "video_status" not in names
 
 
 def test_owner_only_tools_are_hidden_from_non_owner_schema() -> None:

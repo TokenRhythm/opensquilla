@@ -50,6 +50,8 @@ _TOOL_GROUPS: Mapping[str, frozenset[str]] = {
         {
             "image",
             "image_generate",
+            "video_generate",
+            "video_status",
             "audio_provider_capabilities",
             "dubbing_download",
             "dubbing_generate",

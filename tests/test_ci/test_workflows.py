@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
 
 WORKFLOW_DIR = Path(".github/workflows")
 PR_TARGET_VALIDATOR = Path(".github/scripts/validate-pr-target-branch.sh")
@@ -2737,7 +2739,8 @@ def test_native_desktop_cells_run_source_and_frozen_mcp_probes() -> None:
     assert "docker run --rm -i --entrypoint python" in container["run"]
     assert "readonly" in container["run"]
     assert "docker image inspect --format '{{json .Size}}'" in container["run"]
-    assert 'sdk_version == "2.2.0"' in container["run"]
+    assert 'requires("opensquilla")' in container["run"]
+    assert "sdk_version in sdk_requirement.specifier" in container["run"]
     assert "create_mcp_server()" in container["run"]
     assert "MCPStdioClient(MCPServerConfig(" in container["run"]
     assert "set -euo pipefail" in container["run"]
@@ -2746,6 +2749,33 @@ def test_native_desktop_cells_run_source_and_frozen_mcp_probes() -> None:
     compile(container["run"].split("<<'PY'", 1)[1].split("\n", 1)[1].rsplit(
         "\nPY", 1
     )[0], "docker-mcp-smoke", "exec")
+
+
+@pytest.mark.parametrize("sdk_version,allowed", [
+    ("2.2.0", True), ("2.3.0", True), ("2.1.0", False), ("3.0.0", False),
+])
+def test_container_mcp_sdk_version_obeys_installed_package_contract(
+    sdk_version: str, allowed: bool,
+) -> None:
+    steps = _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+    container = next(step for step in steps if step.get("name") == (
+        "Build production Docker image and verify MCP"
+    ))
+    script = container["run"].split("<<'PY'", 1)[1].split("\n", 1)[1].rsplit("\nPY", 1)[0]
+    check = next(node for node in ast.parse(script).body
+                 if isinstance(node, ast.FunctionDef) and node.name == "check_sdk_version")
+    namespace = {
+        "version": lambda name: sdk_version,
+        "requires": lambda name: ["anyio>=4", "mcp>=2.2.0,<3"],
+        "Requirement": Requirement,
+    }
+    exec(compile(ast.Module(body=[check], type_ignores=[]), "docker-mcp-version", "exec"),
+         namespace)
+    if allowed:
+        assert namespace["check_sdk_version"]() == sdk_version
+    else:
+        with pytest.raises(AssertionError, match=re.escape(sdk_version)):
+            namespace["check_sdk_version"]()
 
 
 def test_native_desktop_cells_require_recommended_pty_before_managed_smoke() -> None:

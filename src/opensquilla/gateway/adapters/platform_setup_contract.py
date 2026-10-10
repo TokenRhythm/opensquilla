@@ -23,6 +23,7 @@ PLATFORM_SETUP_CONTRACT_METHODS: Final = (
     "onboarding.provider.probe",
     "onboarding.models.discover",
     "onboarding.imageGeneration.models.discover",
+    "onboarding.videoGeneration.models.discover",
     "onboarding.provider.credential.reveal",
     "onboarding.provider.credential.clear",
     "onboarding.llmProfile.upsert",

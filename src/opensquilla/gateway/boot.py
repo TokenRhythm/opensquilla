@@ -3136,6 +3136,13 @@ async def build_services(
     except Exception as e:
         log.warning("build_services.image_generation_config_failed", error=str(e))
 
+    try:
+        from opensquilla.tools.builtin.media import configure_video_generation
+
+        configure_video_generation(config.video_generation, gateway_config=config)
+    except Exception as e:
+        log.warning("build_services.video_generation_config_failed", error=str(e))
+
     # ── Memory tools (boot order 18) — per-agent stores ──────────────
     # Pre-bind to empty defaults so the ServiceContainer init below and
     # the deferred TurnRunner-ref callback both work even if the try

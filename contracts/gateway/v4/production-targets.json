@@ -614,6 +614,13 @@
     },
     {
       "kind": "method",
+      "wireName": "onboarding.videoGeneration.models.discover",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "onboarding.llmProfile.activate",
       "roles": [
         "result"

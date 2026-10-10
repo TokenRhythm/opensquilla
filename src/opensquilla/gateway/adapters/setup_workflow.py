@@ -48,6 +48,7 @@ def setup_status(config: Any, *, is_owner: bool) -> SetupStatus:
             "imageGenerationPrimary": status.image_generation_primary,
             "imageGenerationEnvKey": status.image_generation_env_key,
             "imageGenerationState": status.image_generation_state,
+            "videoGenerationState": status.video_generation_state,
             "audioConfigured": status.audio_configured,
             "audioEnabled": status.audio_enabled,
             "audioSource": status.audio_source,

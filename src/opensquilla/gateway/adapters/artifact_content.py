@@ -166,10 +166,14 @@ class GatewayArtifactContentPort(ArtifactContentPort):
             raise ContentNotFoundError("artifact not found")
         store = ArtifactStore(media_root_from_config(self._config))
         try:
-            ref, path = store.resolve_for_download(query.artifact_id, session_id=session_id)
+            ref, path = await asyncio.to_thread(
+                store.resolve_for_download, query.artifact_id, session_id=session_id
+            )
             if query.thumbnail:
-                thumbnail = store.resolve_thumbnail_for_download(
-                    query.artifact_id, session_id=session_id
+                thumbnail = await asyncio.to_thread(
+                    store.resolve_thumbnail_for_download,
+                    query.artifact_id,
+                    session_id=session_id,
                 )
                 if thumbnail is not None:
                     _thumbnail_ref, thumbnail_path = thumbnail
@@ -194,8 +198,10 @@ class GatewayArtifactContentPort(ArtifactContentPort):
             revision = await service.get_revision(revision_id)
             if revision.document_id != document.document_id:
                 raise ArtifactSessionNotFoundError("artifact revision not found")
-            ref, path = ArtifactStore(media_root_from_config(self._config)).resolve_for_download(
-                revision.artifact_id, session_id=session_id
+            ref, path = await asyncio.to_thread(
+                ArtifactStore(media_root_from_config(self._config)).resolve_for_download,
+                revision.artifact_id,
+                session_id=session_id,
             )
         except ArtifactIntegrityError as exc:
             raise ContentIntegrityError(str(exc)) from exc

@@ -33,6 +33,7 @@ CATALOG_TOP_LEVEL_KEYS = frozenset(
         "routerProfiles",
         "memoryEmbeddingProviders",
         "imageGenerationProviders",
+        "videoGenerationProviders",
         "audioProviders",
     }
 )

@@ -9212,6 +9212,8 @@ class TurnRunner:
             gateway_config=getattr(self, "_config", None) is not None,
             channel_backing=detected.channel_backing,
             image_generation=detected.image_generation,
+            video_generation=detected.video_generation,
+            video_status=detected.video_status,
             git_available=detected.git_available,
         )
         return resolve_runtime_tool_surface(ctx, capabilities=capabilities)
