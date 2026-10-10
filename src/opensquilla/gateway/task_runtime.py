@@ -887,6 +887,8 @@ class _RuntimeTask:
     no_memory_capture: bool
     record_snapshot: AgentTaskRecord | None = field(default=None, repr=False)
     terminal_details_loaded: bool = False
+    # Set only from storage's explicit, committed atomic-settlement receipt.
+    activation_permit_terminal_settled: bool = False
     input_mode: str = "user"
     persist_input: bool = False
     history_has_persisted_user: bool = True
@@ -6971,6 +6973,8 @@ class TaskRuntime:
 
     async def _release_activation_permit(self, task: _RuntimeTask) -> None:
         """Release a claimed permit on cancellation or terminal settlement."""
+        if task.activation_permit_terminal_settled:
+            return
         release = getattr(self._storage, "release_activation_permit", None)
         if not callable(release):
             return
@@ -7149,7 +7153,7 @@ class TaskRuntime:
         try:
             if task.terminal_details_loaded:
                 try:
-                    await self._persist_terminal_update(
+                    task.activation_permit_terminal_settled = await self._persist_terminal_update(
                         task.task_id, task.envelope.session_key, terminal_update,
                     )
                     terminal_persisted = True
@@ -8024,7 +8028,7 @@ class TaskRuntime:
             # but cannot replace details written by later audit/steer activity.
             return False
         try:
-            await self._persist_terminal_update(
+            task.activation_permit_terminal_settled = await self._persist_terminal_update(
                 task.task_id, task.envelope.session_key, terminal_update,
             )
         except Exception as exc:  # noqa: BLE001 - the in-memory terminal stays usable.
@@ -8045,15 +8049,26 @@ class TaskRuntime:
 
     async def _persist_terminal_update(
         self, task_id: str, session_key: str, update: dict[str, Any],
-    ) -> None:
+    ) -> bool:
+        from opensquilla.session.storage import AgentTaskSettlementReceipt
+
         details = update.get("details") or {}
+        atomic_permit_settled = False
         if not callable(getattr(type(self._storage), "settle_agent_task", None)):
             await self._storage.update_agent_task(task_id, **update)
         else:
             remove_keys = ["cancellation_requested"]
             if "applied_steer_evidence" not in details:
                 remove_keys.append("applied_steer_evidence")
-            await self._storage.settle_agent_task(
+            settle_with_receipt = getattr(
+                type(self._storage), "settle_agent_task_with_receipt", None,
+            )
+            settle = (
+                self._storage.settle_agent_task_with_receipt
+                if callable(settle_with_receipt)
+                else self._storage.settle_agent_task
+            )
+            receipt = await settle(
                 task_id,
                 session_key=session_key,
                 details_patch={
@@ -8062,6 +8077,11 @@ class TaskRuntime:
                 remove_detail_keys=remove_keys,
                 plan_result=(details.get("metadata") or {}).get("plan_result"),
                 **{key: value for key, value in update.items() if key != "details"},
+            )
+            atomic_permit_settled = (
+                isinstance(receipt, AgentTaskSettlementReceipt)
+                and receipt.task_id == task_id
+                and receipt.session_key == canonicalize_session_key(session_key)
             )
         # Successful terminal persistence may still lack complete presentation
         # evidence. Never reclaim its only remaining trace on that basis.
@@ -8074,6 +8094,7 @@ class TaskRuntime:
             get_session_streams().mark_terminal_persisted(
                 session_key, task_id, reconstructible=True,
             )
+        return atomic_permit_settled
 
     def _remember_compensated_terminal(self, task_id: str) -> None:
         record = self._terminal_fallback_records.pop(task_id, None)

@@ -435,6 +435,14 @@ class AgentTaskTerminalConflictError(ValueError):
         self.record = record
 
 
+@dataclass(frozen=True, slots=True)
+class AgentTaskSettlementReceipt:
+    """Proof that terminal state and the absence of an active permit committed."""
+
+    task_id: str
+    session_key: str
+
+
 _SQLITE_BUSY_TIMEOUT_MS = 100
 _SQLITE_STARTUP_BUSY_TIMEOUT_SECONDS = 5.0
 _INTERACTIVE_BUSY_BUDGET_SECONDS = 2.0
@@ -10692,10 +10700,9 @@ class SessionStorage:
             ):
                 pass
             # Keep the terminal task row and its provider admission permit in
-            # one writer transaction.  TaskRuntime still performs an
-            # idempotent release afterward for compatibility, while this
-            # boundary prevents a SQLite lock between those two calls from
-            # leaving a terminal task with a durable active permit.
+            # one writer transaction. This prevents a SQLite lock between
+            # settlement and a compatibility release from leaving a terminal
+            # task with a durable active permit.
             await conn.execute(
                 """
                 UPDATE activation_permits
@@ -10705,6 +10712,38 @@ class SessionStorage:
                 (fields["finished_at"], task_id, canonicalize_session_key(session_key)),
             )
         return record.model_copy(update=update)
+
+    # Capture the known atomic implementation independently of later public
+    # method overrides, including a class-level compatibility monkeypatch.
+    _atomic_terminal_settle_implementation = settle_agent_task
+
+    async def settle_agent_task_with_receipt(
+        self,
+        task_id: str,
+        **fields: Any,
+    ) -> AgentTaskSettlementReceipt | None:
+        """Settle a task, proving atomic permit release only for this implementation.
+
+        Keep ``settle_agent_task``'s record return contract for existing callers.
+        Overrides may implement a different transaction boundary, so their
+        successful return does not prove permit release. They still execute,
+        and the runtime retains its compatibility release in that case.
+        """
+
+        settle = self.settle_agent_task
+        proves_atomic_release = (
+            getattr(settle, "__func__", None)
+            is SessionStorage._atomic_terminal_settle_implementation
+        )
+        record = await settle(task_id, **fields)
+        if not proves_atomic_release:
+            return None
+        # The transaction context in settle_agent_task has exited successfully;
+        # cancellation or a failed commit cannot reach this receipt boundary.
+        return AgentTaskSettlementReceipt(
+            task_id=record.task_id,
+            session_key=canonicalize_session_key(record.session_key),
+        )
 
     @_serialized_read
     async def list_agent_tasks(
