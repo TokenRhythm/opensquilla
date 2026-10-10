@@ -95,7 +95,7 @@ export class TransportFlowV4 {
   private pendingRetires = new Map<string, { receipt: TransportLaneRetireReceipt; promise: Promise<void>; resolve: () => void; reject: (error: Error) => void }>()
   private laneEpochByKey = new Map<string, string>()
   private laneEpochHistory = new Map<string, Set<string>>()
-  private laneByDelivery = new Map<number, { epoch: string; key: string }>()
+  private laneByDelivery = new Map<number, { epoch: string; key: string; complete: boolean }>()
   private subscriptions: (() => void)[] = []
 
   constructor(private readonly source: FlowSource) {
@@ -126,6 +126,7 @@ export class TransportFlowV4 {
       controlInFlight: this.inFlight,
       observedConsumers: this.observations.size,
       completedRanges: this.completed.length,
+      retainedLaneDeliveries: this.laneByDelivery.size,
       dirtyKeyCount: this.dirty.size,
     })
   }
@@ -222,6 +223,14 @@ export class TransportFlowV4 {
     const receipt = this.receipt(meta.flow)
     if (!receipt || receipt.delivery_id <= this.ack || this.pending.has(receipt.delivery_id)
       || this.completed.some(([start, end]) => start <= receipt.delivery_id && receipt.delivery_id <= end)) return
+    // Completed receipts behind a lane's consumer hole still own credit.
+    // Count them as well as pending consumers before retaining another frame.
+    const highestComplete = this.completed[this.completed.length - 1]?.[1] ?? this.ack
+    if (this.pending.size >= 256 || this.laneByDelivery.size >= 256
+      || receipt.delivery_id > highestComplete + 512) {
+      this.requireRecovery([], true)
+      return
+    }
     if (this.sessionFlowV2) {
       const lane = record(meta.session_flow_v2)
       const connectionEpoch = lane?.connection_epoch
@@ -265,14 +274,7 @@ export class TransportFlowV4 {
       knownEpochs.add(subscriptionEpoch)
       this.laneEpochHistory.set(key, knownEpochs)
       this.laneEpochByKey.set(key, subscriptionEpoch)
-      this.laneByDelivery.set(receipt.delivery_id, { epoch: subscriptionEpoch, key })
-    }
-    // A valid peer has at most 128 ordinary deliveries and one recovery piece.
-    // Do not allocate an unbounded sparse ACK map for malformed peers.
-    const highestComplete = this.completed[this.completed.length - 1]?.[1] ?? this.ack
-    if (this.pending.size >= 256 || receipt.delivery_id > highestComplete + 512) {
-      this.requireRecovery([], true)
-      return
+      this.laneByDelivery.set(receipt.delivery_id, { epoch: subscriptionEpoch, key, complete: false })
     }
     const revision = this.revision
     this.pending.add(receipt.delivery_id)
@@ -337,11 +339,19 @@ export class TransportFlowV4 {
     if (this.sessionFlowV2) {
       const lane = this.laneByDelivery.get(receipt.delivery_id)
       if (lane && !this.laneRetired.has(lane.epoch)) {
-        this.laneAck.set(lane.epoch, Math.max(
-          this.laneAck.get(lane.epoch) ?? 0, receipt.delivery_id,
-        ))
+        lane.complete = true
+        // The wire ACK is cumulative within this subscription, not a maximum
+        // of arbitrary completions. Preserve receive order until the first
+        // unfinished owner; deliveries belonging to other lanes do not block.
+        for (const [id, queued] of this.laneByDelivery) {
+          if (queued.epoch !== lane.epoch) continue
+          if (!queued.complete) break
+          this.laneAck.set(lane.epoch, id)
+          this.laneByDelivery.delete(id)
+        }
+      } else {
+        this.laneByDelivery.delete(receipt.delivery_id)
       }
-      this.laneByDelivery.delete(receipt.delivery_id)
     }
     const unowned = this.unowned.get(receipt.delivery_id)
     this.unowned.delete(receipt.delivery_id)
@@ -410,6 +420,7 @@ export class TransportFlowV4 {
     for (const [id, lane] of this.laneByDelivery) {
       if (lane.epoch === receipt.subscription_epoch && id <= receipt.final_published_id) {
         this.markComplete({ delivery_epoch: this.epoch!, delivery_id: id })
+        this.laneByDelivery.delete(id)
       }
     }
     void this.flush()
@@ -420,6 +431,9 @@ export class TransportFlowV4 {
     this.laneRetired.delete(epoch)
     this.laneAck.delete(epoch)
     this.laneSentAck.delete(epoch)
+    for (const [id, lane] of this.laneByDelivery) {
+      if (lane.epoch === epoch) this.laneByDelivery.delete(id)
+    }
     // The retire reply follows this lane's physical frames on the same FIFO
     // socket. A single-record stale reply also ends this old responsibility;
     // it cannot invalidate an unrelated lane. Remaining local consumers are

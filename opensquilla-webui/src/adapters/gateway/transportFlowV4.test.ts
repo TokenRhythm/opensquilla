@@ -937,6 +937,112 @@ describe('session-flow v2 lane ledger', () => {
     })
   }
 
+  it('waits for the completed prefix of one lane without blocking another lane', async () => {
+    const h = harness()
+    const first = deferred<'applied'>()
+    h.consume.mockReturnValueOnce(first.promise)
+    h.helloV2()
+    laneFrame(h, 1, 'sub-a')
+    laneFrame(h, 2, 'sub-a')
+    laneFrame(h, 3, 'sub-b', 'beta')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.request).toHaveBeenCalledWith(V2_METHOD, expect.objectContaining({
+      consumed: [{ subscription_epoch: 'sub-b', through_delivery_id: 3 }],
+    }), expect.anything())
+    expect(h.request.mock.calls.some(([, params]) => JSON.stringify(params?.consumed ?? []).includes('sub-a'))).toBe(false)
+    expect(h.controller.diagnostics).toMatchObject({ pendingFrames: 1, retainedLaneDeliveries: 2 })
+
+    first.resolve('applied')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.request).toHaveBeenLastCalledWith(V2_METHOD, expect.objectContaining({
+      consumed: [{ subscription_epoch: 'sub-a', through_delivery_id: 2 }],
+    }), expect.anything())
+    expect(h.controller.diagnostics).toMatchObject({ pendingFrames: 0, retainedLaneDeliveries: 0 })
+  })
+
+  it('does not acknowledge past a failed receipt until recovery owns it', async () => {
+    const h = harness()
+    const recovery = deferred<boolean>()
+    h.consume.mockRejectedValueOnce(new Error('Consumer failed'))
+    h.recover.mockReturnValueOnce(recovery.promise)
+    h.helloV2()
+    laneFrame(h, 1, 'sub-a')
+    laneFrame(h, 2, 'sub-a')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.request).not.toHaveBeenCalled()
+    expect(h.controller.diagnostics).toMatchObject({ pendingFrames: 1, unownedFrames: 1 })
+
+    recovery.resolve(true)
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.request).toHaveBeenCalledWith(V2_METHOD, expect.objectContaining({
+      consumed: [{ subscription_epoch: 'sub-a', through_delivery_id: 2 }],
+    }), expect.anything())
+    expect(h.controller.diagnostics.retainedLaneDeliveries).toBe(0)
+  })
+
+  it('acknowledges only the prefix before a middle consumer hole', async () => {
+    const h = harness()
+    const middle = deferred<'applied'>()
+    h.consume.mockResolvedValueOnce('applied').mockReturnValueOnce(middle.promise)
+    h.helloV2()
+    laneFrame(h, 1, 'sub-a')
+    laneFrame(h, 2, 'sub-a')
+    laneFrame(h, 3, 'sub-a')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.request).toHaveBeenLastCalledWith(V2_METHOD, expect.objectContaining({
+      consumed: [{ subscription_epoch: 'sub-a', through_delivery_id: 1 }],
+    }), expect.anything())
+    middle.resolve('applied')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.request).toHaveBeenLastCalledWith(V2_METHOD, expect.objectContaining({
+      consumed: [{ subscription_epoch: 'sub-a', through_delivery_id: 3 }],
+    }), expect.anything())
+  })
+
+  it('bounds completed receipts retained behind a hole and clears them on reset', async () => {
+    const h = harness()
+    const first = deferred<'applied'>()
+    h.consume.mockReturnValueOnce(first.promise)
+    h.recover.mockReturnValue(new Promise(() => {}))
+    h.helloV2()
+    for (let id = 1; id <= 600; id++) {
+      laneFrame(h, id, 'sub-a')
+      await vi.advanceTimersByTimeAsync(0)
+    }
+    expect(h.consume).toHaveBeenCalledTimes(256)
+    expect(h.controller.diagnostics.retainedLaneDeliveries).toBe(256)
+    expect(h.request).not.toHaveBeenCalled()
+    expect(h.recover).toHaveBeenCalled()
+    h.controller.reset()
+    expect(h.controller.diagnostics.retainedLaneDeliveries).toBe(0)
+    first.resolve('applied')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.request).not.toHaveBeenCalled()
+  })
+
+  it('retires a consumer hole and its completed tail without leaking an ordinary ACK', async () => {
+    const h = harness()
+    const first = deferred<'applied'>()
+    h.consume.mockReturnValueOnce(first.promise)
+    h.helloV2()
+    laneFrame(h, 1, 'sub-old')
+    laneFrame(h, 2, 'sub-old')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.request).not.toHaveBeenCalled()
+    const retired = h.controller.retireLane({ connection_epoch: EPOCH,
+      subscription_epoch: 'sub-old', retire_token: 'old-token', final_published_id: 2 })
+    await vi.advanceTimersByTimeAsync(10)
+    await retired
+    expect(h.controller.diagnostics.retainedLaneDeliveries).toBe(0)
+    laneFrame(h, 3, 'sub-new')
+    first.resolve('applied')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.request.mock.calls.some(([, params]) => JSON.stringify(params?.consumed ?? []).includes('sub-old'))).toBe(false)
+    expect(h.request).toHaveBeenLastCalledWith(V2_METHOD, expect.objectContaining({
+      consumed: [{ subscription_epoch: 'sub-new', through_delivery_id: 3 }],
+    }), expect.anything())
+  })
+
   it('releases confirmed epoch history across thirty-two visits to the same session', async () => {
     const h = harness()
     h.helloV2()

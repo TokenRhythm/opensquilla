@@ -640,7 +640,9 @@ class FlowWindow:
         authority. Standalone legacy users retain the lazy-admission API.
         """
         retained = {lane for lane, _ in self._lane_epoch_states}
-        retained.update(delivery.lane for delivery in self.deliveries.values())
+        retained.update(
+            delivery.lane for delivery in self.deliveries.values() if delivery.lane is not None
+        )
         for lane, state in tuple(self._lane_states.items()):
             if state != "CLOSED" or lane in retained:
                 continue
