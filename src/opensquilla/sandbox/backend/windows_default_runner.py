@@ -20,6 +20,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
+from opensquilla.sandbox.backend.windows_default_output import (
+    HELPER_ERROR_MESSAGE_LIMIT,
+    PIPE_READ_SIZE,
+)
 from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 
 log = logging.getLogger(__name__)
@@ -166,12 +170,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 def _emit_helper_error(payload: HelperPayload | None, message: str) -> None:
     nonce = payload.helper_nonce if payload is not None else ""
     if nonce:
+        record: dict[str, Any] = {"nonce": nonce, "message": message[:HELPER_ERROR_MESSAGE_LIMIT]}
+        if len(message) > HELPER_ERROR_MESSAGE_LIMIT:
+            record["messageTruncated"] = True
         encoded = json.dumps(
-            {"nonce": nonce, "message": message},
+            record,
             ensure_ascii=True,
             separators=(",", ":"),
         )
-        print(f"{HELPER_ERROR_PREFIX}{encoded}", file=sys.stderr)
+        print(f"\n{HELPER_ERROR_PREFIX}{encoded}", file=sys.stderr)
         return
     print(message, file=sys.stderr)
 
@@ -2298,6 +2305,7 @@ def _finish_child_io(
     writer_thread: threading.Thread,
     reader_threads: Sequence[threading.Thread],
     writer_errors: Sequence[BaseException],
+    reader_errors: Sequence[BaseException] = (),
     close_writer: Callable[[], None],
     label: str,
     terminate: Callable[[], None],
@@ -2333,6 +2341,27 @@ def _finish_child_io(
         if not cancelled:
             cancel_and_close()
         raise OSError(f"{label} stdin writer failed: {writer_errors[0]}") from writer_errors[0]
+    if reader_errors and not ignore_writer_errors:
+        if not cancelled:
+            cancel_and_close()
+        raise OSError(f"{label} output forwarding failed: {reader_errors[0]}") from reader_errors[0]
+
+
+def _forward_child_output(
+    stream: Any, sink: Any, errors: list[BaseException], terminate: Callable[[], None],
+) -> None:
+    try:
+        while chunk := stream.read(PIPE_READ_SIZE):
+            remaining = memoryview(chunk)
+            while remaining:
+                written = sink.write(remaining)
+                if not isinstance(written, int) or written <= 0:
+                    raise OSError("output pipe write made no progress")
+                remaining = remaining[written:]
+            sink.flush()
+    except Exception as exc:
+        errors.append(exc)
+        terminate()
 
 
 def _cancel_child_pipe_io(kernel32: object, handles: Sequence[object]) -> None:
@@ -2519,7 +2548,7 @@ def _run_payload_as_offline_identity_native(
     job = HANDLE()
     job_assigned = False
     reader_threads: list[threading.Thread] = []
-    outputs: dict[str, bytes] = {"stdout": b"", "stderr": b""}
+    reader_errors: list[BaseException] = []
     try:
         sa = SECURITY_ATTRIBUTES()
         sa.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
@@ -2609,10 +2638,17 @@ def _run_payload_as_offline_identity_native(
         stderr_write = HANDLE()
 
         def read_pipe(name: str, handle: object) -> None:
-            raw_handle = getattr(handle, "value", handle)
-            fd = msvcrt.open_osfhandle(int(raw_handle), os.O_RDONLY | os.O_BINARY)
-            with os.fdopen(fd, "rb", closefd=True) as stream:
-                outputs[name] = stream.read()
+            try:
+                raw_handle = getattr(handle, "value", handle)
+                fd = msvcrt.open_osfhandle(int(raw_handle), os.O_RDONLY | os.O_BINARY)
+                with os.fdopen(fd, "rb", closefd=True) as stream:
+                    _forward_child_output(
+                        stream, getattr(sys, name).buffer, reader_errors,
+                        lambda: kernel32.TerminateJobObject(job, 125),
+                    )
+            except Exception as exc:
+                reader_errors.append(exc)
+                kernel32.TerminateJobObject(job, 125)
 
         for name, handle in (("stdout", stdout_read), ("stderr", stderr_read)):
             thread = threading.Thread(target=read_pipe, args=(name, handle), daemon=True)
@@ -2653,6 +2689,7 @@ def _run_payload_as_offline_identity_native(
             writer_thread=writer_thread,
             reader_threads=reader_threads,
             writer_errors=writer_errors,
+            reader_errors=reader_errors,
             close_writer=close_writer,
             label="offline helper",
             terminate=lambda: kernel32.TerminateJobObject(job, 125),
@@ -2663,8 +2700,6 @@ def _run_payload_as_offline_identity_native(
         )
         if wait_error is not None:
             raise wait_error
-        sys.stdout.buffer.write(outputs["stdout"])
-        sys.stderr.buffer.write(outputs["stderr"])
         if wait_result == WAIT_TIMEOUT:
             _emit_helper_timeout(payload)
         return exit_code
@@ -3174,7 +3209,7 @@ def _run_restricted_process_native_impl(
     job = HANDLE()
     process_info = PROCESS_INFORMATION()
     reader_threads: list[threading.Thread] = []
-    outputs: dict[str, bytes] = {"stdout": b"", "stderr": b""}
+    reader_errors: list[BaseException] = []
     job_assigned = False
 
     try:
@@ -3354,10 +3389,17 @@ def _run_restricted_process_native_impl(
         pipe_io_handles = (stdin_write, stdout_read, stderr_read)
 
         def read_pipe(name: str, handle: object) -> None:
-            raw_handle = getattr(handle, "value", handle)
-            fd = msvcrt.open_osfhandle(int(raw_handle), os.O_RDONLY | os.O_BINARY)
-            with os.fdopen(fd, "rb", closefd=True) as stream:
-                outputs[name] = stream.read()
+            try:
+                raw_handle = getattr(handle, "value", handle)
+                fd = msvcrt.open_osfhandle(int(raw_handle), os.O_RDONLY | os.O_BINARY)
+                with os.fdopen(fd, "rb", closefd=True) as stream:
+                    _forward_child_output(
+                        stream, getattr(sys, name).buffer, reader_errors,
+                        lambda: kernel32.TerminateJobObject(job, 125),
+                    )
+            except Exception as exc:
+                reader_errors.append(exc)
+                kernel32.TerminateJobObject(job, 125)
 
         for name, handle in (("stdout", stdout_read), ("stderr", stderr_read)):
             thread = threading.Thread(target=read_pipe, args=(name, handle), daemon=True)
@@ -3398,6 +3440,7 @@ def _run_restricted_process_native_impl(
             writer_thread=writer_thread,
             reader_threads=reader_threads,
             writer_errors=writer_errors,
+            reader_errors=reader_errors,
             close_writer=close_writer,
             label="restricted process",
             terminate=lambda: kernel32.TerminateJobObject(job, 125),
@@ -3408,8 +3451,6 @@ def _run_restricted_process_native_impl(
         )
         if wait_error is not None:
             raise wait_error
-        sys.stdout.buffer.write(outputs["stdout"])
-        sys.stderr.buffer.write(outputs["stderr"])
         if wait_result == WAIT_TIMEOUT:
             _emit_helper_timeout(payload)
         return exit_code

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
 import json
@@ -175,6 +176,14 @@ def _zero_embedding_usage(provider: EmbeddingProvider) -> dict[str, Any]:
         "provider": provider.provider_id,
         "cost_source": "none",
     }
+
+
+def _sqlite_vec_loadable_path() -> str:
+    # sqlite_vec imports NumPy on some installations. Importing its native
+    # modules and locating the extension must not hold the Gateway event loop.
+    import sqlite_vec  # type: ignore
+
+    return sqlite_vec.loadable_path()
 
 
 class LongTermMemoryStore:
@@ -490,22 +499,29 @@ class LongTermMemoryStore:
     async def _probe_vec_extension(self) -> None:
         """Attempt to load sqlite-vec extension."""
         assert self._db is not None
+        db = self._db
         try:
-            import sqlite_vec  # type: ignore
+            extension_path = await asyncio.to_thread(_sqlite_vec_loadable_path)
+            # A cancelled await has no continuation. A separately closed or
+            # replaced store must likewise not use the late preparation result.
+            if self._db is not db:
+                return
 
-            await self._db.enable_load_extension(True)
+            await db.enable_load_extension(True)
             try:
-                await self._db.load_extension(sqlite_vec.loadable_path())
+                await db.load_extension(extension_path)
             finally:
-                await self._db.enable_load_extension(False)
+                await db.enable_load_extension(False)
 
             # Create vec table if needed
             # We need to know embedding dims; defer table creation until first insert
-            self._vec_available = True
-            logger.info("sqlite_vec_loaded")
+            if self._db is db:
+                self._vec_available = True
+                logger.info("sqlite_vec_loaded")
         except Exception as e:
             logger.warning("sqlite_vec_unavailable", error=str(e))
-            self._vec_available = False
+            if self._db is db:
+                self._vec_available = False
 
     async def _ensure_vec_table(self, dims: int) -> None:
         """Create or verify the vec virtual table with correct dimensions."""
