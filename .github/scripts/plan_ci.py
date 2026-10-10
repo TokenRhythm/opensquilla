@@ -209,6 +209,7 @@ _SKILL_HUB_TESTS: Final = frozenset(
         "tests/test_engine/test_skill_install_settlement.py",
         "tests/test_gateway/test_skill_install_status.py",
         "tests/test_skills/test_hub_install_operations.py",
+        "tests/test_skills/test_install_operation_io.py",
         "tests/test_skills/test_staging_io_worker.py",
         "tests/test_skill_install_source.py",
         "tests/test_skills_hub_streaming.py",

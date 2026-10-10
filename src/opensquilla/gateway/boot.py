@@ -3483,8 +3483,11 @@ async def build_services(
             }
         )
         profile_home = default_opensquilla_home()
-        if profile_operation_lock_held_by_current_thread(profile_home):
-            recovery_diagnostics = recover_pending_skill_transaction(
+        profile_writer_lease = profile_operation_lock_held_by_current_thread(profile_home)
+        if profile_writer_lease:
+            from opensquilla.skills.hub.operations import run_operation_worker
+
+            recovery_diagnostics = await run_operation_worker(recover_pending_skill_transaction,
                 managed_dir=managed_skill_dir,
                 lockfile_path=profile_home / "skills-lock.json",
                 journal_path=skill_journal_path,
@@ -3556,6 +3559,10 @@ async def build_services(
             offline=False,
             startup_recovery_diagnostics=recovery_diagnostics,
         )
+        if profile_writer_lease:
+            await skill_management_service.prepare_install_operations(
+                recover_orphans=not managed_recovery_required,
+            )
 
         create_skill_tools(
             skill_loader,

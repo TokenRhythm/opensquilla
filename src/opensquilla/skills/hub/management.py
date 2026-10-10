@@ -54,7 +54,8 @@ from opensquilla.skills.hub.operations import (
     InstallOperationStore,
     current_install_operation,
     operation_database,
-    report_install_progress,
+    report_install_progress_async,
+    run_operation_worker,
 )
 from opensquilla.skills.hub.router import SourceRouter
 from opensquilla.skills.hub.scanner import ScanResult, scan_skill_tree
@@ -164,6 +165,7 @@ async def _run_postflight_worker(
     function: Callable[..., Any],
     /,
     *args: Any,
+    _settling: bool = False,
     **kwargs: Any,
 ) -> Any:
     """Keep transaction fences held until a postflight thread settles.
@@ -171,6 +173,8 @@ async def _run_postflight_worker(
     Cancelling ``asyncio.to_thread`` cannot stop its underlying thread. Defer
     caller cancellation, including repeated requests, until the worker exits so
     rollback cannot race a catalog reload that is still reading managed files.
+    Once exception settlement has begun, let recovery return its proof and
+    diagnostics; the original exception still determines the terminal outcome.
     """
 
     operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
@@ -184,7 +188,7 @@ async def _run_postflight_worker(
             if cancellation is None:
                 raise
             break
-    if cancellation is not None:
+    if cancellation is not None and not _settling:
         try:
             operation.result()
         except BaseException:
@@ -1197,6 +1201,8 @@ class SkillManagementService:
         self._mutation_lock = mutation_lock or mutation_lock_for(managed_dir)
         self._offline = offline or loader is None
         self._install_operations: InstallOperations | None = None
+        self._install_operations_preparation_lock = asyncio.Lock()
+        self._install_operations_recovered = False
         self._recovery_required_diagnostics: tuple[SkillDiagnostic, ...] = ()
         bind_lockfile = getattr(loader, "bind_managed_lockfile", None)
         if callable(bind_lockfile):
@@ -1209,9 +1215,25 @@ class SkillManagementService:
             self._install_operations = InstallOperations(InstallOperationStore(
                 operation_database(self._journal_path),
                 root_id=managed_root_identity(self._managed_dir),
+                initialize=False,
             ))
-        self._install_operations.store.recover_orphans(self._journal_path)
         return self._install_operations
+
+    async def prepare_install_operations(self, *, recover_orphans: bool = False) -> None:
+        """Prepare receipts after the composition root has acquired its writer lease."""
+        operations = self.install_operations
+
+        def prepare() -> bool:
+            operations.store.initialize()
+            if recover_orphans and not self._install_operations_recovered:
+                if self._journal_path.exists():
+                    return False
+                operations.store.recover_orphans(self._journal_path)
+                return True
+            return self._install_operations_recovered
+
+        async with self._install_operations_preparation_lock:
+            self._install_operations_recovered = await run_operation_worker(prepare)
 
     @property
     def managed_dir(self) -> Path:
@@ -2081,7 +2103,7 @@ class SkillManagementService:
             )
             return self._recovery_required_result(recovery_name)
 
-        report_install_progress("downloading")
+        await report_install_progress_async("downloading")
         transaction_id = uuid.uuid4().hex
         transaction_root = staging_root(self._managed_dir) / transaction_id
         raw_candidate = transaction_root / "_candidate"
@@ -2229,7 +2251,7 @@ class SkillManagementService:
                 resolution,
                 identifier,
             )
-            report_install_progress("scanning")
+            await report_install_progress_async("scanning")
             scan_result = await run_staging_worker(scan_skill_tree, candidate_dir)
             risk_confirmation_details: dict[str, Any] = {}
             risk_acknowledged = False
@@ -2335,7 +2357,7 @@ class SkillManagementService:
         success_result: InstallResult | None = None
         try:
             async with self._mutation_lock:
-                recovery = recover_pending_skill_transaction(
+                recovery = await _run_postflight_worker(recover_pending_skill_transaction,
                     managed_dir=self._managed_dir,
                     lockfile_path=self._lockfile_path,
                     journal_path=self._journal_path,
@@ -2696,7 +2718,7 @@ class SkillManagementService:
                     rollback=rollback,
                     lockfile_path=self._lockfile_path,
                 )
-                report_install_progress("committing")
+                await report_install_progress_async("committing")
                 fsync_staging_tree(candidate_dir)
                 fsync_directory(rollback.parent)
                 fsync_directory(rollback.parent.parent)
@@ -2876,7 +2898,7 @@ class SkillManagementService:
                 try:
                     operation = current_install_operation()
                     if operation is not None:
-                        operation.store.finish(
+                        await operation.store.finish_async(
                             operation.owner, operation.id, success_result.to_dict(),
                         )
                     if journal is not None:
@@ -2956,7 +2978,8 @@ class SkillManagementService:
                 )
             rollback_performed = False
             if journal is not None and path_is_occupied(self._journal_path):
-                recovery = recover_pending_skill_transaction(
+                recovery = await _run_postflight_worker(recover_pending_skill_transaction,
+                    _settling=True,
                     managed_dir=self._managed_dir,
                     lockfile_path=self._lockfile_path,
                     journal_path=self._journal_path,
@@ -3039,7 +3062,7 @@ class SkillManagementService:
                     payload["cancelled"] = not payload.get("recoveryRequired", False)
                     if payload["cancelled"]:
                         payload["message"] = "Skill installation cancelled"
-                    operation.store.finish(operation.owner, operation.id, payload)
+                    await operation.store.finish_async(operation.owner, operation.id, payload)
                 raise
             return failure_result
         finally:
@@ -3249,7 +3272,7 @@ class SkillManagementService:
         success_result: InstallResult | None = None
         try:
             async with self._mutation_lock:
-                recovery = recover_pending_skill_transaction(
+                recovery = await _run_postflight_worker(recover_pending_skill_transaction,
                     managed_dir=self._managed_dir,
                     lockfile_path=self._lockfile_path,
                     journal_path=self._journal_path,
@@ -3465,7 +3488,8 @@ class SkillManagementService:
                 )
             rollback_performed = False
             if journal is not None and path_is_occupied(self._journal_path):
-                recovery = recover_pending_skill_transaction(
+                recovery = await _run_postflight_worker(recover_pending_skill_transaction,
+                    _settling=True,
                     managed_dir=self._managed_dir,
                     lockfile_path=self._lockfile_path,
                     journal_path=self._journal_path,

@@ -1627,6 +1627,7 @@ def test_skill_hub_inputs_select_all_three_contract_platforms(
         "tests/test_migration/test_legacy_config_fixtures.py",
         "tests/test_skills/test_catalog_upgrade_retirement.py",
         "tests/unit/cli/tui/test_opentui_completion_catalog.py",
+        "tests/test_skills/test_install_operation_io.py",
     ],
 )
 def test_skill_hub_related_test_change_keeps_three_platform_suite(
