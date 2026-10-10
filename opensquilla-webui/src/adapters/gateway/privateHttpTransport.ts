@@ -104,6 +104,9 @@ function defaultAuthToken(): string {
 function invalidEndpoint(message: string, cause?: unknown): HttpTransportError {
   return new HttpTransportError('invalid-endpoint', message, undefined, undefined, cause)
 }
+function requestEncodingError(message: string, cause?: unknown): HttpTransportError {
+  return new HttpTransportError('encode', message, undefined, undefined, cause)
+}
 function resolveBaseUrl(value?: string | URL): URL {
   try {
     if (value instanceof URL) return new URL(value.href)
@@ -363,15 +366,7 @@ function managedBinaryStream(
   async function cancelReader(reason: unknown): Promise<void> {
     if (!readerCancelPromise) {
       try {
-        readerCancelPromise = Promise.resolve(reader.cancel(reason)).then(
-          () => {
-            releaseReader()
-          },
-          cause => {
-            releaseReader()
-            throw cause
-          },
-        )
+        readerCancelPromise = Promise.resolve(reader.cancel(reason)).finally(releaseReader)
       } catch (cause) {
         releaseReader()
         readerCancelPromise = Promise.reject(cause)
@@ -567,11 +562,7 @@ async function errorPayload(
       cause instanceof HttpTransportError
       && (cause.kind === 'timeout' || cause.kind === 'aborted')
     ) throw cause
-    try {
-      lifecycle.assertActive()
-    } catch (activeCause) {
-      throw activeCause
-    }
+    lifecycle.assertActive()
     return undefined
   } finally {
     try {
@@ -621,63 +612,42 @@ export function createPrivateHttpTransport(
     let timeoutValue: number | undefined
     try {
       if (requestOptions === null || typeof requestOptions !== 'object') {
-        throw new HttpTransportError('encode', 'Gateway HTTP request options are invalid.')
+        throw requestEncodingError('Gateway HTTP request options are invalid.')
       }
       callerSignal = requestOptions.signal
       timeoutValue = requestOptions.timeoutMs
       const requestedMethod = requestOptions.method
       if (requestedMethod !== undefined && !isHttpMethod(requestedMethod)) {
-        throw new HttpTransportError('encode', 'Gateway HTTP request method is invalid.')
+        throw requestEncodingError('Gateway HTTP request method is invalid.')
       }
       method = requestedMethod ?? 'GET'
       hasJson = Object.prototype.hasOwnProperty.call(requestOptions, 'json')
       hasForm = Object.prototype.hasOwnProperty.call(requestOptions, 'form')
       if (hasJson && hasForm) {
-        throw new HttpTransportError(
-          'encode',
-          'Gateway HTTP request cannot include both JSON and form bodies.',
-        )
+        throw requestEncodingError('Gateway HTTP request cannot include both JSON and form bodies.')
       }
       if ((hasJson || hasForm) && method === 'GET') {
-        throw new HttpTransportError(
-          'encode',
-          'Gateway HTTP GET requests cannot include a body.',
-        )
+        throw requestEncodingError('Gateway HTTP GET requests cannot include a body.')
       }
       if (hasJson) {
         try {
           body = JSON.stringify(requestOptions.json)
         } catch (cause) {
-          throw new HttpTransportError(
-            'encode',
-            'Gateway HTTP request could not be encoded as JSON.',
-            undefined,
-            undefined,
-            cause,
-          )
+          throw requestEncodingError('Gateway HTTP request could not be encoded as JSON.', cause)
         }
         if (body === undefined) {
-          throw new HttpTransportError(
-            'encode',
-            'Gateway HTTP request could not be encoded as JSON.',
-          )
+          throw requestEncodingError('Gateway HTTP request could not be encoded as JSON.')
         }
       } else if (hasForm) {
         const form = requestOptions.form
         if (!isFormBody(form)) {
-          throw new HttpTransportError('encode', 'Gateway HTTP form body is invalid.')
+          throw requestEncodingError('Gateway HTTP form body is invalid.')
         }
         body = form
       }
     } catch (cause) {
       if (cause instanceof HttpTransportError) throw cause
-      throw new HttpTransportError(
-        'encode',
-        'Gateway HTTP request options could not be encoded.',
-        undefined,
-        undefined,
-        cause,
-      )
+      throw requestEncodingError('Gateway HTTP request options could not be encoded.', cause)
     }
 
     let headers: Headers | undefined
@@ -691,13 +661,7 @@ export function createPrivateHttpTransport(
         if (sessionKey) headers.set('x-opensquilla-session-key', sessionKey)
         if (hasJson) headers.set('Content-Type', 'application/json')
       } catch (cause) {
-        throw new HttpTransportError(
-          'encode',
-          'Gateway HTTP request headers could not be constructed.',
-          undefined,
-          undefined,
-          cause,
-        )
+        throw requestEncodingError('Gateway HTTP request headers could not be constructed.', cause)
       }
     }
 
