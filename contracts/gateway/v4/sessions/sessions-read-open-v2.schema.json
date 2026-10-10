@@ -38,7 +38,7 @@
     "name": "sessions.read.open.v2",
     "kind": "command",
     "scope": "operator.read",
-    "guestAllowed": false,
+    "guestAllowed": true,
     "idempotency": "idempotent",
     "timeout": {
       "policy": "caller"

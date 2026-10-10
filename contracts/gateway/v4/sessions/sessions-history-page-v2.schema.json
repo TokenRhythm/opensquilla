@@ -38,7 +38,7 @@
     "name": "sessions.history.page.v2",
     "kind": "query",
     "scope": "operator.read",
-    "guestAllowed": false,
+    "guestAllowed": true,
     "idempotency": "read-only",
     "timeout": {
       "policy": "caller"

@@ -1013,7 +1013,7 @@
       "lifecycle": "stable",
       "name": "sessions.history.page.v2",
       "schema": "sessions/sessions-history-page-v2.schema.json",
-      "schemaSha256": "941f99a9bd83efbeb50af830004e79ad403b019ff5219b9afc6ff0eb1d479bba"
+      "schemaSha256": "e54807bac9f9facbe69bb6df2de6aa81f193550520aaa8276ca6b909279ae897"
     },
     {
       "lifecycle": "stable",
@@ -1145,25 +1145,25 @@
       "lifecycle": "stable",
       "name": "sessions.read.close.v2",
       "schema": "sessions/sessions-read-close-v2.schema.json",
-      "schemaSha256": "d7354096732eb3033ec332224a32e389e22633a9032e18836f9d5f0b7b0ae9be"
+      "schemaSha256": "0091426d6ca2bf456d26847ac417b398a6ccf7f1d9da5bfeeb11a4c843e356c7"
     },
     {
       "lifecycle": "stable",
       "name": "sessions.read.install.v2",
       "schema": "sessions/sessions-read-install-v2.schema.json",
-      "schemaSha256": "66a7c68bec94f90a3a788d9bea21c8e85e1ed8e2dccd20c7446b32829f2f1d3f"
+      "schemaSha256": "be2c5715177c43ada9d9349a12a55959e7d2ada30dfb96a612bf2dd8b4d11481"
     },
     {
       "lifecycle": "stable",
       "name": "sessions.read.open.v2",
       "schema": "sessions/sessions-read-open-v2.schema.json",
-      "schemaSha256": "c181b4b752e0f618290bde95c6178212698589a2a3a695af554a422476ee5b87"
+      "schemaSha256": "712333bb0c8badd642e57257dcb905dd80e8808c33d968fe8d4d45ebd7537405"
     },
     {
       "lifecycle": "stable",
       "name": "sessions.read.state.v2",
       "schema": "sessions/sessions-read-state-v2.schema.json",
-      "schemaSha256": "61d541c709c56576929f5e25d7aba940e5799c4d687b6b7cf32b5a4cd1dc47a6"
+      "schemaSha256": "dce53232d09ddffbf4a613798208953f4afb5caf0ec23250d9e103653d2732ed"
     },
     {
       "lifecycle": "stable",
@@ -1424,7 +1424,7 @@
     "generatorSha256": "a65290ff5b65a3d9a9246897d45fb50a0eb82fe15725ed71e9c028c9a1fd0934",
     "methodCount": 208,
     "schemaCount": 218,
-    "schemaTreeSha256": "2b3606269fa5ef8a7b8f3a69ab5e83f5b82bebd972f1e47ba76033fdfe55945c",
+    "schemaTreeSha256": "1889f80a5f4b89b739978f89b723a90f905b06f5183251562143242cafeb6605",
     "toolchains": {
       "legacyTypes": {
         "python": {
