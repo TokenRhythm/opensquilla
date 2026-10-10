@@ -1627,7 +1627,6 @@ def test_skill_hub_inputs_select_all_three_contract_platforms(
         "tests/test_migration/test_legacy_config_fixtures.py",
         "tests/test_skills/test_catalog_upgrade_retirement.py",
         "tests/unit/cli/tui/test_opentui_completion_catalog.py",
-        "tests/test_skills/test_install_operation_io.py",
     ],
 )
 def test_skill_hub_related_test_change_keeps_three_platform_suite(
@@ -1646,6 +1645,30 @@ def test_skill_hub_related_test_change_keeps_three_platform_suite(
         ("macos-latest", "default"),
         ("windows-latest", "default"),
     }
+
+
+def test_unregistered_skill_hub_test_keeps_full_fallback_and_execution_digest(
+    tmp_path: Path, suite_config: dict[str, Any]
+) -> None:
+    path = "tests/test_skills/test_install_operation_io.py"
+    first = _plan(tmp_path, suite_config, path)
+
+    assert first["full_fallback"] is True
+    assert first["reason_codes"] == ["unknown_path"]
+    assert first["python_targets"] == ["tests"]
+    assert _platform_cells(first, "skill-hub") == {
+        ("ubuntu-latest", "default"),
+        ("macos-latest", "default"),
+        ("windows-latest", "default"),
+    }
+
+    (tmp_path / path).write_text("# Changed regression boundary\n", encoding="utf-8")
+    second = _plan(tmp_path, suite_config, path)
+
+    assert (
+        first["suite_execution_digests"]["skill-hub"]
+        != second["suite_execution_digests"]["skill-hub"]
+    )
 
 
 @pytest.mark.parametrize(
