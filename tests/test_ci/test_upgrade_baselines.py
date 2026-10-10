@@ -604,6 +604,7 @@ def test_packaged_recovery_transport_contract_runs_in_desktop_node_ci() -> None:
         assert native_test.relative_to(ROOT).as_posix() in inputs
 
 
+@pytest.mark.ci_serial
 def test_packaged_gateway_readiness_budget_and_terminal_errors(tmp_path: Path) -> None:
     node = shutil.which("node")
     if not node:

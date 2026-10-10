@@ -503,6 +503,10 @@ def test_native_attachment_runtime_parity_is_marked_ci_serial(function_name: str
 
 def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_ci/test_upgrade_baselines.py"),
+        "test_packaged_gateway_readiness_budget_and_terminal_errors",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_desktop/test_gateway_functional_probes.py"),
         "test_mcp_probe_uses_real_stdio_server_and_gateway",
     )
