@@ -124,3 +124,40 @@ def test_packaged_smoke_requires_safe_success_and_explicit_windows_provisioning(
         )
         provisioning = step["env"].get("OPENSQUILLA_SMOKE_PROVISION_SANDBOX")
         assert provisioning == ("1" if platform == "windows" else None)
+
+
+@pytest.mark.parametrize(
+    ("workflow_name", "job_name"),
+    [
+        ("wheelhouse-release.yml", "build-desktop-windows"),
+        ("windows-nsis-upgrade-regression.yml", "build"),
+    ],
+)
+def test_windows_safe_smoke_selects_the_hosted_runners_canonical_profile(
+    workflow_name: str, job_name: str,
+) -> None:
+    workflow = yaml.safe_load(
+        (_ROOT / ".github/workflows" / workflow_name).read_text(encoding="utf-8")
+    )
+    job = workflow["jobs"][job_name]
+    assert job["runs-on"] == "windows-2022"
+    step, = [
+        step for step in job["steps"]
+        if step.get("env", {}).get("OPENSQUILLA_SMOKE_PROVISION_SANDBOX") == "1"
+    ]
+    assert step.get("shell", job.get("defaults", {}).get("run", {}).get("shell")) == "pwsh"
+    script = step["run"]
+    guard = "if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') {"
+    refusal = "throw 'Windows Safe provisioning requires a disposable GitHub-hosted runner.'"
+    target = (
+        "$env:OPENSQUILLA_SMOKE_SANDBOX_PROFILE_ROOT = "
+        "Join-Path ([Environment]::GetFolderPath('UserProfile')) '.opensquilla'"
+    )
+    command = "npm run verify:gateway-smoke -- --provision-windows-sandbox"
+    assert guard in script
+    assert refusal in script
+    assert target in script
+    assert (
+        script.index(guard) < script.index(refusal) < script.index(target) < script.index(command)
+    )
+    assert "--allow-safe-setup-unavailable" not in script
