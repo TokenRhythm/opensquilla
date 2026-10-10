@@ -367,6 +367,184 @@ function v2AdmissionHarness() {
   }
 }
 
+function snapshotV2ConsumptionHarness(target = 10) {
+  const h = v2AdmissionHarness()
+  const listeners = new Map<string, TransportEventHandler>()
+  const emit = (event: string, ...args: unknown[]) => listeners.get(event)?.(...args)
+  const flow = new TransportFlowV4({
+    connectionGeneration: h.rpc.generation,
+    on(event, handler) { listeners.set(event, handler); return () => { listeners.delete(event) } },
+    enableConsumptionFlow() {},
+    consumeEvent: async () => 'applied',
+    recoverGap: async () => true,
+    request: async <T>(_method: string, params: Record<string, unknown> = {}) => ({
+      connection_epoch: params.connection_epoch, consumed: params.consumed ?? [],
+      staged_recovery: params.staged_recovery ?? [], discarded_lanes: params.discarded_lanes ?? [],
+      lane_count: 1,
+    }) as T,
+  })
+  emit('_hello', { policy: { transport_flow: {
+    delivery_epoch: 'connection', window_frames: 128, window_bytes: 4 * 1024 * 1024,
+    capability: 'transport.session-flow.v2',
+  } } })
+  const snapshot = snapshotResult({ task_id: null, current_stream_seq: 10, events: [] })
+  const bytes = Buffer.from(JSON.stringify(snapshot))
+  let consumed = 9
+  let snapshotSessionId = 'id-alpha'
+  let resumeError: Error | null = null
+  let installTarget: number | null = null
+  const progress = () => ({
+    status: consumed >= target ? 'installed' : 'catching_up', base_seq: 9,
+    target_seq: target, next_seq: consumed + 1, consumed_through_seq: consumed,
+  })
+  const originalRequest = h.requestMock.getMockImplementation()!
+  h.requestMock.mockImplementation(async (method, params = {}, options) => {
+    if (![SNAPSHOT_READ, SNAPSHOT_RESUME, SNAPSHOT_RELEASE, READ_STATE_V2, READ_INSTALL_V2].includes(method)) {
+      return originalRequest(method, params, options)
+    }
+    h.calls.push({ method, params, options })
+    options?.onSent?.(h.rpc.generation)
+    if (method === SNAPSHOT_READ) return {
+      key: 'alpha', sync_revision: params.sync_revision, snapshot_id: `snapshot-${params.sync_revision}`,
+      segment_index: 0, segment_count: 1, byte_length: bytes.length,
+      encoding: 'base64-json-utf8', data: bytes.toString('base64'),
+      stream_generation: snapshot.stream_generation, current_stream_seq: snapshot.current_stream_seq,
+      task_id: null, session_id: snapshotSessionId, session_epoch: 3,
+    }
+    if (method === SNAPSHOT_RESUME) {
+      if (resumeError) throw resumeError
+      return {
+        ...params, session_id: snapshotSessionId, session_epoch: 3, replay_to_seq: snapshot.current_stream_seq,
+      }
+    }
+    if (method === SNAPSHOT_RELEASE) return { ...params, retired: true }
+    if (method === READ_INSTALL_V2 && typeof params.consumed_through_seq === 'number') {
+      consumed = params.consumed_through_seq
+      if (installTarget !== null) target = installTarget
+    }
+    return {
+      lease_id: 'lease-alpha', recovery_id: 'recovery-alpha', status: progress().status, progress: progress(),
+      ...(method === READ_STATE_V2 ? { session_id: 'id-alpha', session_epoch: 3, state_revision: 9 } : {}),
+    }
+  })
+  const waitForConsumption = vi.fn(flow.waitForConsumption.bind(flow))
+  const rpc = {
+    ...h.rpc,
+    supports: (method: string) => h.rpc.supports(method)
+      || [SNAPSHOT_READ, SNAPSHOT_RESUME, SNAPSHOT_RELEASE].includes(method),
+    waitForConsumption,
+    recoveryVersion: (key: string) => flow.recoveryVersion(key),
+    snapshotInstalled: (key: string, version: string) => flow.snapshotInstalled(key, version),
+  }
+  return {
+    ...h, rpc, flow, waitForConsumption,
+    replaceSnapshotSessionId(value: string) { snapshotSessionId = value },
+    failResume(error: Error) { resumeError = error },
+    advanceTargetAtInstall(value: number) { installTarget = value },
+    deliver(sequence: number) {
+      emit('*', 'session.event.text_delta', {
+        session_key: 'alpha', stream_generation: 'stream-1', stream_seq: sequence, text: 'tail',
+      }, {
+        flow: { delivery_epoch: 'connection', delivery_id: 1 },
+        session_flow_v2: { connection_epoch: 'connection', subscription_epoch: 'subscription-alpha', delivery_id: 1 },
+      })
+    },
+  }
+}
+
+describe('read-v2 consumption covered by an installed snapshot', () => {
+  it.each(['initial', 'reconcile'])('uses the newer %s snapshot without inventing transport receipts', async source => {
+    const h = snapshotV2ConsumptionHarness()
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest(undefined, false))
+    try {
+      let live = await lease.live
+      if (source === 'reconcile') live = await lease.reconcile()
+      expect(live.snapshot?.currentStreamSeq).toBe(10)
+      // The caller applies the returned snapshot before confirming its install.
+      await live.confirmInstalled!()
+      expect(h.waitForConsumption.mock.calls).toEqual([
+        ['alpha', { streamGeneration: 'stream-1', fromSeq: 10, toSeq: 10 }],
+      ])
+      expect(h.calls.filter(call => call.method === READ_INSTALL_V2).slice(-1)[0]?.params)
+        .toMatchObject({ consumed_through_seq: 10, ack_through_seq: 10 })
+      expect(h.flow.diagnostics.ackDeliveryId).toBe(0)
+      await expect(h.flow.waitForConsumption('alpha', {
+        streamGeneration: 'stream-1', fromSeq: 9, toSeq: 10,
+      })).rejects.toMatchObject({ code: 'SNAPSHOT_STALE' })
+    } finally { await lease.close(); h.flow.close() }
+  })
+
+  it('does not acknowledge a missing event after the snapshot watermark', async () => {
+    const h = snapshotV2ConsumptionHarness(11)
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest(undefined, false))
+    try {
+      const live = await lease.live
+      await expect(live.confirmInstalled!()).rejects.toMatchObject({
+        message: 'Snapshot replay tail was not consumed.', retryable: true,
+      })
+      expect(h.waitForConsumption).toHaveBeenLastCalledWith('alpha', {
+        streamGeneration: 'stream-1', fromSeq: 10, toSeq: 11,
+      })
+      expect(h.calls.filter(call => call.method === READ_INSTALL_V2)).toHaveLength(1)
+      expect(h.flow.diagnostics.ackDeliveryId).toBe(0)
+    } finally { await lease.close(); h.flow.close() }
+  })
+
+  it('installs when the real event consumer owns the tail after the snapshot', async () => {
+    const h = snapshotV2ConsumptionHarness(11)
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest(undefined, false))
+    try {
+      const live = await lease.live
+      h.deliver(11)
+      await flushAsyncWork()
+      await live.confirmInstalled!()
+      expect(h.waitForConsumption).toHaveBeenLastCalledWith('alpha', {
+        streamGeneration: 'stream-1', fromSeq: 10, toSeq: 11,
+      })
+      expect(h.calls.filter(call => call.method === READ_INSTALL_V2).slice(-1)[0]?.params)
+        .toMatchObject({ consumed_through_seq: 11, ack_through_seq: 11 })
+      expect(h.flow.diagnostics.ackDeliveryId).toBe(1)
+    } finally { await lease.close(); h.flow.close() }
+  })
+
+  it('refuses consumption proof from a different durable session identity', async () => {
+    const h = snapshotV2ConsumptionHarness()
+    h.replaceSnapshotSessionId('different-session')
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest(undefined, false))
+    try {
+      const live = await lease.live
+      await expect(live.confirmInstalled!()).rejects.toThrow('Installed snapshot does not match')
+      expect(h.calls.filter(call => call.method === READ_INSTALL_V2)).toHaveLength(1)
+    } finally { await lease.close(); h.flow.close() }
+  })
+
+  it('does not use the snapshot watermark before the server confirms its installation', async () => {
+    const h = snapshotV2ConsumptionHarness()
+    h.failResume(Object.assign(new Error('Snapshot no longer current'), { code: 'SNAPSHOT_STALE' }))
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest(undefined, false))
+    try {
+      const live = await lease.live
+      await expect(live.confirmInstalled!()).rejects.toThrow('Snapshot no longer current')
+      expect(h.waitForConsumption).not.toHaveBeenCalled()
+      expect(h.calls.filter(call => call.method === READ_STATE_V2)).toHaveLength(0)
+      expect(h.calls.filter(call => call.method === READ_INSTALL_V2)).toHaveLength(1)
+    } finally { await lease.close(); h.flow.close() }
+  })
+
+  it('rejects installation when the server still reports catching_up', async () => {
+    const h = snapshotV2ConsumptionHarness()
+    h.advanceTargetAtInstall(11)
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest(undefined, false))
+    try {
+      const live = await lease.live
+      await expect(live.confirmInstalled!()).rejects.toMatchObject({ kind: 'busy', retryable: true })
+      expect(h.calls.filter(call => call.method === READ_INSTALL_V2).slice(-1)[0]?.params)
+        .toMatchObject({ consumed_through_seq: 10, ack_through_seq: 10 })
+      expect(h.flow.diagnostics.ackDeliveryId).toBe(0)
+    } finally { await lease.close(); h.flow.close() }
+  })
+})
+
 describe('read-v2 admission and retirement ownership', () => {
   const historyRequest = (signal: AbortSignal) => ({ direction: 'latest' as const, limit: 100, signal })
 

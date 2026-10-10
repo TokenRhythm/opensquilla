@@ -148,8 +148,13 @@ export interface SessionReadV2Lease {
     consumedThroughSeq?: number
     ackThroughSeq?: number
   }): Promise<SessionReadV2Install>
-  /** Wait for the event consumer, then prove and install the current tail. */
-  installConsumed(): Promise<SessionReadV2Install>
+  /** A caller may supply only a snapshot whose installation has been confirmed. */
+  installConsumed(snapshot?: {
+    sessionId: string | null
+    sessionEpoch: number | null
+    streamGeneration: string
+    streamSeq: number
+  }): Promise<SessionReadV2Install>
   close(): Promise<SessionReadV2Close | null>
 }
 
@@ -379,7 +384,13 @@ export async function openV2SessionRead(
     baseStreamSeq: open.base_stream_seq,
     state: stateRead,
     install,
-    async installConsumed() {
+    async installConsumed(snapshot?: Parameters<SessionReadV2Lease['installConsumed']>[0]) {
+      if (snapshot && (snapshot.sessionId !== open.session_id
+        || snapshot.sessionEpoch !== open.session_epoch
+        || snapshot.streamGeneration !== open.base_stream_generation
+        || !Number.isSafeInteger(snapshot.streamSeq) || snapshot.streamSeq < 0)) {
+        throw new Error('Installed snapshot does not match the session read v2 lease.')
+      }
       const current = await stateRead()
       if (current.status === 'rebase_required' || current.status === 'retired') {
         throw Object.assign(new Error('Session read v2 requires a fresh recovery base.'), {
@@ -387,11 +398,16 @@ export async function openV2SessionRead(
         })
       }
       const target = current.progress.target_seq
-      if (target > state.lastConsumed) {
+      // Snapshot and read-v2 bases are captured independently. A confirmed
+      // snapshot can already cover part of this lease's tail without producing
+      // delta-consumption receipts. Keep that proof local to this install;
+      // never advance the transport's global event-consumption watermark.
+      const consumedBase = Math.max(state.lastConsumed, snapshot?.streamSeq ?? 0)
+      if (target > consumedBase) {
         if (!rpc.waitForConsumption) throw new Error('Session read v2 requires a consumption fence.')
         await rpc.waitForConsumption(key, {
           streamGeneration: open.base_stream_generation,
-          fromSeq: state.lastConsumed,
+          fromSeq: consumedBase,
           toSeq: target,
         })
       }

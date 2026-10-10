@@ -210,7 +210,12 @@ function snapshotInstallationHooks(
       try {
         if (staged) await staged.confirmInstalled()
         if (modern) {
-          const result = await modern.installConsumed()
+          const result = await modern.installConsumed(staged ? {
+            sessionId: staged.sessionId,
+            sessionEpoch: staged.sessionEpoch,
+            streamGeneration: staged.value.stream_generation,
+            streamSeq: staged.value.current_stream_seq,
+          } : undefined)
           if (result.status !== 'installed') {
             throw new SessionReadFailure('busy', 'Session replay is still catching up.', true)
           }
@@ -814,7 +819,10 @@ export function createV4SessionReadPort(
               ? Object.freeze({ ...projectMetadata(subscription), hydrationComplete: false })
               : await hydrate(rpc, request.sessionKey, request.signal, expectedGeneration, snapshot ?? subscription)
             assertSnapshotIdentity(metadata)
-            if (v2Lease) {
+            // A staged snapshot must be applied by the domain and confirmed
+            // before its watermark can prove read-v2 consumption. Its hook
+            // performs the final installation after that consumer step.
+            if (v2Lease && !stagedSnapshot) {
               const install = await v2Lease.installConsumed()
               if (install.status !== 'installed') {
                 throw new SessionReadFailure('busy', 'Session replay is still catching up.', true)
