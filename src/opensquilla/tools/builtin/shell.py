@@ -7085,7 +7085,9 @@ async def _run_full_host_shell_command(
     """Execute directly on the host without sandbox policy or safety preflight."""
 
     runtime = get_runtime()
-    merged_env = await _prepare_shell_runtime(_base_shell_environment)
+    # Resolve runtimes once, after caller overrides. The shared base helper
+    # already resolves them for Safe/Guest callers.
+    merged_env = dict(os.environ)
     if env:
         merged_env.update(env)
     merged_env = await _prepare_shell_runtime(
@@ -7723,10 +7725,12 @@ async def _start_host_background_process(
     """Start a host background process without sandbox policy or safety preflight."""
 
     session_id = str(uuid.uuid4())[:8]
-    base_env = (
-        dict(env) if env is not None
-        else await _prepare_shell_runtime(_base_shell_environment)
-    )
+    if env is not None:
+        base_env = dict(env)
+    elif full_host_access_active():
+        base_env = dict(os.environ)
+    else:
+        base_env = await _prepare_shell_runtime(_base_shell_environment)
     host_env = await _prepare_shell_runtime(
         lambda: _managed_skill_environment(
             _runtime_shell_environment(
