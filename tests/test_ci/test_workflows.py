@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -3300,14 +3301,6 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
             "tests/test_gateway/test_goal_rpc.py",
             "tests/test_tools/test_dispatch_legacy_coverage.py",
             "tests/unit/cli/repl/test_slash_bridge.py",
-            "tests/test_gateway/test_channel_turn_ingress.py",
-            "tests/test_gateway/test_plan_rpc.py",
-            "tests/test_gateway/test_goal_registry_cleanup.py",
-            "tests/test_gateway/test_task_runtime_terminal_cleanup.py",
-            "tests/test_gateway/test_task_runtime_wait_slots.py",
-            "tests/test_gateway/test_goal_turn_authority.py",
-            "tests/test_gateway/test_task_progress_projection.py",
-            "tests/functional/test_gateway_silent_reply_process_e2e.py",
             "tests/test_engine/test_cancelled_turn_segments.py",
             "tests/test_tools/test_shell_workdir.py",
             "tests/test_sandbox/test_shell_code_network_hints.py",
@@ -3316,9 +3309,11 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
         })
         selector = '"${family}"' if job_name == "windows-full" else '"${{ matrix.shard }}"'
         assert f'{selector} == "desktop-installer-contracts"' in preflight["run"]
-        assert f'{selector} == "gateway-sqlite"' in preflight["run"]
         assert '"${regression_args[@]}"' in preflight["run"]
         assert f"-o faulthandler_timeout={faulthandler_timeout}" in preflight["run"]
+    if job_name == "ubuntu-full":
+        expected_preflight_files.update(_GATEWAY_REGRESSION_FILES)
+        assert '"${{ matrix.shard }}" == "gateway-sqlite"' in preflight["run"]
     if job_name == "windows-full":
         expected_preflight_files.update({
             "tests/test_ci/test_windows_signatures.py",
@@ -3339,9 +3334,7 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
 @pytest.mark.parametrize(("family", "expected_file"), [
     ("core", "tests/test_ci/test_windows_signatures.py"),
     ("core", "tests/test_cli/test_chat_cmd.py"),
-    ("gateway-sqlite", "tests/test_gateway/test_goal_registry_cleanup.py"),
-    ("gateway-sqlite", "tests/test_gateway/test_task_runtime_wait_slots.py"),
-    ("gateway-sqlite", "tests/test_gateway/test_plan_rpc.py"),
+    ("gateway-sqlite", None),
     ("recovery-migration", "tests/test_sandbox/test_windows_shell_process_runtime.py"),
     ("recovery-migration", "tests/test_live_long_task_case_driver.py"),
     ("desktop-installer-contracts", "tests/test_ci/test_architecture_import_contracts.py"),
@@ -3367,4 +3360,30 @@ def test_windows_preflight_selects_regressions_for_physical_partitions(family, e
             [_bash_executable(), "-c", script],
             check=True, capture_output=True, text=True, timeout=10,
         )
-        assert expected_file in result.stdout.splitlines(), shard
+        if expected_file is None:
+            assert not result.stdout.strip(), shard
+        else:
+            assert expected_file in result.stdout.splitlines(), shard
+
+
+_GATEWAY_REGRESSION_FILES = {
+    "tests/test_gateway/test_channel_turn_ingress.py",
+    "tests/test_gateway/test_plan_rpc.py",
+    "tests/test_gateway/test_goal_registry_cleanup.py",
+    "tests/test_gateway/test_task_runtime_terminal_cleanup.py",
+    "tests/test_gateway/test_task_runtime_wait_slots.py",
+    "tests/test_gateway/test_goal_turn_authority.py",
+    "tests/test_gateway/test_task_progress_projection.py",
+    "tests/functional/test_gateway_silent_reply_process_e2e.py",
+}
+
+
+def test_gateway_preflight_regressions_keep_one_main_windows_partition():
+    runner = runpy.run_path(".github/scripts/windows_test_shards.py")
+    partitions = [
+        runner["files_for_shard"](Path.cwd(), shard)
+        for shard in runner["WINDOWS_SHARD_NAMES"]
+        if shard.startswith("gateway-sqlite-")
+    ]
+    for path in _GATEWAY_REGRESSION_FILES:
+        assert sum(path in files for files in partitions) == 1, path

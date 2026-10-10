@@ -940,14 +940,17 @@ def test_windows_execution_partitions_cover_every_file_once_within_its_family() 
     physical_files = {
         shard: set(validated_files_for_shard(root, shard)) for shard in WINDOWS_SHARD_NAMES
     }
-    assert len(physical_files) == 8
+    assert len(physical_files) == 10
+    catalog = json.loads(Path(".github/ci/suites.v1.json").read_text(encoding="utf-8"))
+    assert tuple(catalog["full_python_matrix"]["windows"]) == WINDOWS_SHARD_NAMES
     assert all(physical_files.values())
     assert set().union(*physical_files.values()) == discovered
     assert sum(map(len, physical_files.values())) == len(discovered)
     for family in SHARD_NAMES:
-        assert physical_files[f"{family}-1"] | physical_files[f"{family}-2"] == set(
-            files_for_shard(root, family)
-        )
+        family_files = [paths for shard, paths in physical_files.items()
+                        if shard_family(shard) == family]
+        assert len(family_files) == (4 if family == "gateway-sqlite" else 2)
+        assert set().union(*family_files) == set(files_for_shard(root, family))
     for path, physical in assignments.items():
         assert shard_family(physical) == shard_for_test(path)
         assert windows_shard_for_test(path) == physical
@@ -982,6 +985,15 @@ def test_windows_new_file_fallback_is_stable_and_keeps_environment_family() -> N
     for path, shard in first.items():
         assert shard in WINDOWS_SHARD_NAMES
         assert shard_family(shard) == shard_for_test(path)
+
+
+def test_gateway_new_file_fallback_uses_all_four_partitions() -> None:
+    paths = [f"tests/test_gateway/test_new_partition_fallback_{index}.py"
+             for index in range(32)]
+    assert not set(paths).intersection(partition_assignments())
+    assert {windows_shard_for_test(path) for path in paths} == {
+        f"gateway-sqlite-{partition}" for partition in range(1, 5)
+    }
 
 
 @pytest.mark.parametrize(
@@ -1623,17 +1635,22 @@ def test_windows_shard_runner_splits_parallel_and_serial_tests(tmp_path: Path) -
     assert metadata_payload["execution"]["parallel"]["workers"] == 2
 
 
+@pytest.mark.parametrize("selected_shard", ["core-1", "gateway-sqlite-3", "gateway-sqlite-4"])
 def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
-    tmp_path: Path,
+    tmp_path: Path, selected_shard: str,
 ) -> None:
     (tmp_path / "pyproject.toml").write_text(
         '[tool.pytest.ini_options]\nmarkers = ["ci_serial: serial CI contract"]\n',
         encoding="utf-8",
     )
-    test_dir = tmp_path / "tests"
-    test_dir.mkdir()
-    selected_path = "tests/test_partition_probe.py"
-    selected_shard = windows_shard_for_test(selected_path)
+    family = shard_family(selected_shard)
+    prefix = "tests/test_gateway" if family == "gateway-sqlite" else "tests"
+    (tmp_path / prefix).mkdir(parents=True)
+    selected_path = next(
+        f"{prefix}/test_partition_probe_{index}.py"
+        for index in range(100)
+        if windows_shard_for_test(f"{prefix}/test_partition_probe_{index}.py") == selected_shard
+    )
     (tmp_path / selected_path).write_text(
         "import os\nimport pytest\n\n"
         "def test_parallel():\n"
@@ -1644,9 +1661,9 @@ def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
         encoding="utf-8-sig",
     )
     unselected_path = next(
-        f"tests/test_partition_other_{index}.py"
+        f"{prefix}/test_partition_other_{index}.py"
         for index in range(100)
-        if windows_shard_for_test(f"tests/test_partition_other_{index}.py") != selected_shard
+        if windows_shard_for_test(f"{prefix}/test_partition_other_{index}.py") != selected_shard
     )
     (tmp_path / unselected_path).write_text(
         "def test_must_not_execute():\n    assert False, 'another physical partition'\n",
@@ -1689,7 +1706,7 @@ def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
     metadata = json.loads((reports / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["test_files"] == [selected_path]
     assert metadata["partition_sha256"] == partition_snapshot_fingerprint()
-    assert metadata["family"] == "core"
+    assert metadata["family"] == family
     junit = ET.parse(reports / "junit.xml").getroot()
     assert {test.get("name") for test in junit.iter("testcase")} == {
         "test_parallel",
