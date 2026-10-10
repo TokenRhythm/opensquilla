@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
+
 import pytest
 
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, SessionNode, SessionStatus
@@ -8,6 +11,72 @@ from opensquilla.session.storage import (
     SessionStorage,
     StaleEpochError,
 )
+
+
+@pytest.mark.asyncio
+async def test_running_state_and_owner_patch_commit_together_without_losing_concurrent_details(
+    tmp_path, monkeypatch,
+) -> None:
+    path = str(tmp_path / "running-publication.db")
+    storage = await SessionStorage.open(path)
+    observer = await SessionStorage.open(path)
+    entered, written, commit = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    update = None
+    gate_held = False
+    try:
+        await storage.create_agent_task(AgentTaskRecord(
+            task_id="running-publication", session_key="agent:main:webchat:publication",
+            details={"admission_owner": {"compute_lease": "deferred"}, "audit": {"revision": 1}},
+        ))
+        original = storage._write_transaction
+        publications = []
+
+        @asynccontextmanager
+        async def transaction(operation):
+            publications.append(operation)
+            entered.set()
+            async with original(operation) as conn:
+                yield conn
+                written.set()
+                await commit.wait()
+
+        monkeypatch.setattr(storage, "_write_transaction", transaction)
+        await storage._operation_lock.acquire()
+        gate_held = True
+        update = asyncio.create_task(storage.update_agent_task(
+            "running-publication", status=AgentTaskStatus.RUNNING, started_at=123,
+            details_patch={"admission_owner": {"compute_lease": "held"}},
+        ))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        await observer.patch_agent_task_details(
+            "running-publication", details_patch={"audit": {"revision": 2}},
+        )
+        storage._operation_lock.release()
+        gate_held = False
+        await asyncio.wait_for(written.wait(), timeout=2)
+        before = await observer.get_agent_task("running-publication")
+        assert before is not None and before.status == AgentTaskStatus.QUEUED
+        assert before.started_at is None
+        assert before.details == {
+            "admission_owner": {"compute_lease": "deferred"}, "audit": {"revision": 2},
+        }
+        commit.set()
+        result = await asyncio.wait_for(update, timeout=2)
+        after = await observer.get_agent_task("running-publication")
+        assert after == result
+        assert after.status == AgentTaskStatus.RUNNING and after.started_at == 123
+        assert after.details == {
+            "admission_owner": {"compute_lease": "held"}, "audit": {"revision": 2},
+        }
+        assert publications == ["update_agent_task"]
+    finally:
+        if gate_held:
+            storage._operation_lock.release()
+        commit.set()
+        if update is not None:
+            await asyncio.gather(update, return_exceptions=True)
+        await observer.close()
+        await storage.close()
 
 
 @pytest.mark.asyncio

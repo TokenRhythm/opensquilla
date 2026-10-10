@@ -56,6 +56,10 @@ class _Storage:
         return list(self.records.values())
 
     async def update_agent_task(self, task_id: str, **fields: Any) -> None:
+        details_patch = fields.pop("details_patch", None)
+        if details_patch is not None:
+            record = self.records[task_id]
+            record.details = {**(record.details or {}), **details_patch}
         for name, value in fields.items():
             setattr(self.records[task_id], name, value)
 

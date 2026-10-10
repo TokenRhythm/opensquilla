@@ -6678,17 +6678,7 @@ class TaskRuntime:
             await self._release_activation_permit(task)
             return False
         started_at = _epoch_time_ms()
-        await self._storage.update_agent_task(
-            task.task_id,
-            status=AgentTaskStatus.RUNNING,
-            started_at=started_at,
-        )
-        await self._persist_admission_owner_state(
-            task,
-            resident_lease="held",
-            compute_lease="held",
-            settlement="required",
-        )
+        await self._persist_running_state(task, started_at=started_at)
         if task.record_snapshot is not None:
             task.record_snapshot.started_at = started_at
         await self._emit(
@@ -6718,15 +6708,13 @@ class TaskRuntime:
         )
         return True
 
-    async def _persist_admission_owner_state(
+    async def _persist_running_state(
         self,
         task: _RuntimeTask,
         *,
-        resident_lease: str,
-        compute_lease: str,
-        settlement: str,
+        started_at: int,
     ) -> None:
-        """Publish the resident/compute/settlement lifecycle atomically.
+        """Publish RUNNING and its lease projection in the same commit.
 
         The in-memory reservation is authoritative for scheduling, while the
         task row is the recovery/diagnostics projection.  Merge only the
@@ -6735,9 +6723,7 @@ class TaskRuntime:
         """
 
         record = task.record_snapshot
-        if record is None:
-            return
-        current = dict(record.details or {})
+        current = dict(record.details or {}) if record is not None else {}
         owner = dict(current.get("admission_owner") or {})
         if not owner:
             owner = {
@@ -6747,23 +6733,19 @@ class TaskRuntime:
             }
         owner.update(
             {
-                "resident_lease": resident_lease,
-                "compute_lease": compute_lease,
-                "settlement": settlement,
+                "resident_lease": "held",
+                "compute_lease": "held",
+                "settlement": "required",
             }
         )
-        current["admission_owner"] = owner
-        record.details = current
-        patch = getattr(self._storage, "patch_agent_task_details", None)
-        if callable(patch):
-            updated = patch(
-                task.task_id,
-                details_patch={"admission_owner": owner},
-            )
-            if inspect.isawaitable(updated):
-                updated = await updated
-            if isinstance(updated, AgentTaskRecord):
-                task.record_snapshot = updated
+        updated = await self._storage.update_agent_task(
+            task.task_id,
+            status=AgentTaskStatus.RUNNING,
+            started_at=started_at,
+            details_patch={"admission_owner": owner},
+        )
+        if isinstance(updated, AgentTaskRecord):
+            task.record_snapshot = updated
 
     async def _claim_activation_permit(self, task: _RuntimeTask) -> None:
         """Fence provider dispatch with a durable authority snapshot.

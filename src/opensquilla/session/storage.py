@@ -10551,8 +10551,20 @@ class SessionStorage:
             )
         return progress
 
-    async def update_agent_task(self, task_id: str, **fields: Any) -> AgentTaskRecord:
-        if not fields:
+    async def update_agent_task(
+        self,
+        task_id: str,
+        *,
+        details_patch: Mapping[str, Any] | None = None,
+        **fields: Any,
+    ) -> AgentTaskRecord:
+        """Publish task fields and an owned details patch in one writer transaction."""
+        if details_patch is not None:
+            if not isinstance(details_patch, Mapping):
+                raise TypeError("details_patch must be a mapping")
+            if "details" in fields:
+                raise ValueError("details and details_patch cannot be supplied together")
+        if not fields and details_patch is None:
             existing = await self.get_agent_task(task_id)
             if existing is None:
                 raise KeyError(f"Agent task not found: {task_id}")
@@ -10563,10 +10575,19 @@ class SessionStorage:
         if unknown:
             raise ValueError(f"Unknown agent task fields: {', '.join(unknown)}")
         fields.setdefault("updated_at", _now_ms())
-        assignments = ", ".join(f"{name} = ?" for name in fields)
-        values = [_serialize(value) for value in fields.values()]
-        values.append(task_id)
         async with self._write_transaction("update_agent_task") as conn:
+            if details_patch is not None:
+                async with conn.execute(
+                    "SELECT details FROM agent_tasks WHERE task_id = ?", (task_id,),
+                ) as cur:
+                    current = await cur.fetchone()
+                if current is None:
+                    raise KeyError(f"Agent task not found: {task_id}")
+                details = _deserialize_row({"details": current["details"]}).get("details")
+                fields["details"] = {**(details or {}), **details_patch}
+            assignments = ", ".join(f"{name} = ?" for name in fields)
+            values = [_serialize(value) for value in fields.values()]
+            values.append(task_id)
             await conn.execute(
                 f"UPDATE agent_tasks SET {assignments} WHERE task_id = ?",
                 values,
