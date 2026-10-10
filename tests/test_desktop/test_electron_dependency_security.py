@@ -43,6 +43,7 @@ def test_electron_runtime_yaml_parser_includes_empty_merge_source_dos_fix() -> N
         ("@xmldom/xmldom", (0, 8, 15)),
         ("fast-uri", (3, 1, 6)),
         ("electron", (42, 5, 1)),
+        ("http-cache-semantics", (4, 3, 0)),
     ],
 )
 def test_all_locked_parser_and_session_copies_include_security_fixes(
@@ -70,6 +71,22 @@ def test_undici_security_floors_preserve_supported_parent_major_versions() -> No
             assert version >= (6, 28, 0)
         else:
             assert version >= (7, 29, 0)
+
+
+def test_installer_downloader_removes_unpatched_formatter_dependency() -> None:
+    manifest = json.loads((LOCK_PATH.parent / "package.json").read_text(encoding="utf-8"))
+    assert manifest["overrides"] == {
+        "@electron/get@3.1.0": {"global-agent@3.0.0": {"roarr": "3.0.0"}},
+    }
+    packages = _packages()
+    agents = [package for path, package in packages.items()
+              if path.endswith("/global-agent")]
+    assert agents
+    assert all(_version_tuple(package["version"]) == (3, 0, 0) for package in agents)
+    assert _version_tuple(packages["node_modules/roarr"]["version"]) == (3, 0, 0)
+    assert not any(path.endswith("/sprintf-js") for path in packages)
+    download_options = manifest["build"].get("electronDownload", {}).get("downloadOptions", {})
+    assert "cache" not in download_options
 
 
 def test_electron_build_dependencies_include_resource_exhaustion_fixes() -> None:

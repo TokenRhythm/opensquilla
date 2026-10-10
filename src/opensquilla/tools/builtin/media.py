@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import hmac
 import io
 import json
@@ -135,7 +136,8 @@ _video_gateway_config: Any | None = None
 _video_job_sessions: dict[str, _VideoJobReceipt] = {}
 _video_job_sessions_lock = threading.Lock()
 _MAX_TRACKED_VIDEO_JOBS = 1024
-_VIDEO_JOB_FINGERPRINT_KEY = secrets.token_bytes(32)
+_VIDEO_JOB_FINGERPRINT_SALT = secrets.token_bytes(32)
+_VIDEO_JOB_FINGERPRINT_ITERATIONS = 600_000
 
 
 @dataclass(frozen=True)
@@ -1265,7 +1267,15 @@ async def _video_result_payload(result: Any, *, max_bytes: int, source: str) -> 
 def _video_credential_fingerprint(api_key: str) -> str:
     """Bind token identity to this process without retaining the token itself."""
 
-    return hmac.digest(_VIDEO_JOB_FINGERPRINT_KEY, api_key.encode("utf-8"), "sha256").hex()
+    # The random salt stays private to this process. A KDF also protects weaker
+    # operator-authored credentials if a receipt fingerprint is exposed.
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        api_key.encode("utf-8"),
+        _VIDEO_JOB_FINGERPRINT_SALT,
+        _VIDEO_JOB_FINGERPRINT_ITERATIONS,
+        dklen=32,
+    ).hex()
 
 
 def _remember_video_job(
@@ -1277,13 +1287,18 @@ def _remember_video_job(
     credential_env: str = "",
     *,
     status_lock: asyncio.Lock | None = None,
+    credential_fingerprint: str | None = None,
 ) -> str:
     """Scope resumable jobs to the session that created them."""
 
     ctx = current_tool_context.get()
     if ctx is None or not ctx.session_key:
         return job_id
-    fingerprint = _video_credential_fingerprint(api_key)
+    fingerprint = (
+        credential_fingerprint
+        if credential_fingerprint is not None
+        else _video_credential_fingerprint(api_key)
+    )
     receipt = _VideoJobReceipt(
         session_key=ctx.session_key,
         credential_fingerprint=fingerprint,
@@ -1376,7 +1391,13 @@ def video_status_available(ctx: ToolContext | None = None) -> bool:
         )
 
 
-def _video_job_access_allowed(job_id: str, api_key: str, provider: str) -> bool:
+def _video_job_access_allowed(
+    job_id: str,
+    api_key: str,
+    provider: str,
+    *,
+    credential_fingerprint: str | None = None,
+) -> bool:
     ctx = current_tool_context.get()
     if ctx is None:
         return False
@@ -1384,14 +1405,15 @@ def _video_job_access_allowed(job_id: str, api_key: str, provider: str) -> bool:
         return True
     if not ctx.session_key:
         return False
-    fingerprint = _video_credential_fingerprint(api_key)
     receipt = _video_job_receipt(job_id)
-    return (
-        receipt is not None
-        and receipt.session_key == ctx.session_key
-        and hmac.compare_digest(receipt.credential_fingerprint, fingerprint)
-        and receipt.provider == provider
+    if receipt is None or receipt.session_key != ctx.session_key or receipt.provider != provider:
+        return False
+    fingerprint = (
+        credential_fingerprint
+        if credential_fingerprint is not None
+        else _video_credential_fingerprint(api_key)
     )
+    return hmac.compare_digest(receipt.credential_fingerprint, fingerprint)
 
 
 def _video_job_model(job_id: str, configured_model: str) -> str:
@@ -1501,6 +1523,11 @@ async def video_generate(
     )
     target = _resolve_generated_video_path(filename, tool_name="video_generate")
     target.parent.mkdir(parents=True, exist_ok=True)
+    # Finish the KDF before submission so accepting a paid job only registers
+    # its receipt synchronously, including when cancellation follows acceptance.
+    credential_fingerprint = await asyncio.to_thread(
+        _video_credential_fingerprint, credential.api_key
+    )
     status_lock = asyncio.Lock()
     accepted_job_id: str | None = None
     accepted_handle: str | None = None
@@ -1523,6 +1550,7 @@ async def video_generate(
                 base_url,
                 getattr(credential, "env_key", ""),
                 status_lock=status_lock,
+                credential_fingerprint=credential_fingerprint,
             )
         return accepted_handle
 
@@ -1621,6 +1649,7 @@ async def video_status(job_id: str, filename: str | None = None) -> str:
     safe_job_id = job_id.strip()
     receipt = _video_job_receipt(safe_job_id)
     native_job_id = receipt.native_job_id if receipt is not None else safe_job_id
+    credential_fingerprint: str | None = None
     if receipt is None:
         config, credential = _video_request_config()
         provider = _video_provider(config)
@@ -1629,6 +1658,10 @@ async def video_status(job_id: str, filename: str | None = None) -> str:
         ctx = current_tool_context.get()
         if ctx is not None and ctx.caller_kind is CallerKind.SUBAGENT:
             raise ToolError("Video generation is unavailable to subagents")
+        if ctx is None or (
+            not ctx.is_owner and (not ctx.session_key or ctx.session_key != receipt.session_key)
+        ):
+            raise ToolError("Video job is unavailable in this session")
         provider = receipt.provider
         base_url = receipt.base_url
         try:
@@ -1651,20 +1684,23 @@ async def video_status(job_id: str, filename: str | None = None) -> str:
                 raise ToolError(
                     f"{provider} credential for video generation is unavailable"
                 ) from exc
-        candidate_matches = (
-            credential.available
-            and bool(credential.api_key)
-            and hmac.compare_digest(
-                _video_credential_fingerprint(credential.api_key), receipt.credential_fingerprint
+        if credential.available and credential.api_key:
+            credential_fingerprint = await asyncio.to_thread(
+                _video_credential_fingerprint, credential.api_key
             )
+        candidate_matches = (
+            credential_fingerprint is not None
+            and hmac.compare_digest(credential_fingerprint, receipt.credential_fingerprint)
         )
         if not candidate_matches and receipt.credential_env:
             remembered_key = environment_value(receipt.credential_env).strip()
-            if (
-                remembered_key
-                and hmac.compare_digest(
-                    _video_credential_fingerprint(remembered_key), receipt.credential_fingerprint
-                )
+            if remembered_key:
+                if credential_fingerprint is None or remembered_key != credential.api_key:
+                    credential_fingerprint = await asyncio.to_thread(
+                        _video_credential_fingerprint, remembered_key
+                    )
+            if remembered_key and credential_fingerprint is not None and hmac.compare_digest(
+                credential_fingerprint, receipt.credential_fingerprint
             ):
                 credential = _VideoCredential(
                     available=True,
@@ -1674,7 +1710,12 @@ async def video_status(job_id: str, filename: str | None = None) -> str:
                 candidate_matches = True
         if not candidate_matches:
             raise ToolError("Video job is unavailable in this session")
-    if not _video_job_access_allowed(safe_job_id, credential.api_key, provider):
+    if not _video_job_access_allowed(
+        safe_job_id,
+        credential.api_key,
+        provider,
+        credential_fingerprint=credential_fingerprint,
+    ):
         raise ToolError("Video job is unavailable in this session")
     if filename is not None:
         _resolve_generated_video_path(

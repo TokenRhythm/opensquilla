@@ -345,7 +345,7 @@ async def test_stop_during_video_publication_settles_once_before_concurrent_stat
         resumed = await asyncio.wait_for(status_task, timeout=1)
         assert not resumed.is_error
         assert json.loads(resumed.content)["status"] == "ok"
-        assert json.loads(resumed.content)["path"].endswith("/initial.mp4")
+        assert Path(json.loads(resumed.content)["path"]).name == "initial.mp4"
         receipt = media._video_job_receipt(_JOB)
         assert receipt is not None
         assert receipt.completed_payload == resumed.content
