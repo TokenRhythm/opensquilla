@@ -2475,6 +2475,7 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "composer-paste.spec.ts",
         "ensemble-new-task-legacy-turn.spec.ts",
         "goal-mode.spec.ts",
+        "history-content-reading.spec.ts",
         "history-hydration.spec.ts",
         "idle-chat-recovery.spec.ts",
         "modern-session-recovery.spec.ts",
