@@ -15,7 +15,12 @@ import {
 } from '@/utils/chat/usageAccountingFailure'
 import { sanitizeAssistantPresentationSegments } from '@/utils/chat/silentSentinels'
 import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
-import { messageContentIdentity, needsCompleteMessageText, type ReadMessageText } from '@/utils/chat/historyMessageContent'
+import {
+  messageContentIdentity,
+  needsCompleteMessageText,
+  restoreHistoryTimelineText,
+  type ReadMessageText,
+} from '@/utils/chat/historyMessageContent'
 
 export interface UseChatMessageActionsOptions {
   messages: Ref<ChatMessage[]>
@@ -74,10 +79,26 @@ interface EditRestorePoint {
   forkBeforeMessageId: string
 }
 
+function copyBodyIdentity(message: ChatMessage | ChatRenderedMessage): string {
+  const ref = message.contentRef
+  if (!ref) return messageContentIdentity(message)
+  return JSON.stringify([message.role, message.turnId, message.contentRevision,
+    ref.version, ref.sessionKey, ref.sessionId, ref.messageId, ref.source, ref.view,
+    ref.revision, ref.byteLength, ref.sha256])
+}
+
 export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   let editRestorePoint: EditRestorePoint | null = null
   let actionGeneration = 0
   let pendingRead: AbortController | null = null
+  let copyGeneration = 0
+  let pendingCopyRead: AbortController | null = null
+
+  function cancelPendingCopy() {
+    copyGeneration += 1
+    pendingCopyRead?.abort()
+    pendingCopyRead = null
+  }
 
   function cancelPendingAction(): boolean {
     const wasPending = pendingRead !== null
@@ -97,8 +118,13 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     editRestorePoint = null
   }
 
-  if (options.sessionIdentity) watch(options.sessionIdentity, discardEditRestorePoint, { flush: 'sync' })
-  if (getCurrentScope()) onScopeDispose(discardEditRestorePoint)
+  function discardSessionActions() {
+    discardEditRestorePoint()
+    cancelPendingCopy()
+  }
+
+  if (options.sessionIdentity) watch(options.sessionIdentity, discardSessionActions, { flush: 'sync' })
+  if (getCurrentScope()) onScopeDispose(discardSessionActions)
 
   function withCompleteText(
     source: ChatMessage,
@@ -190,8 +216,42 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   }
 
   async function copyMessage(msg: ChatRenderedMessage): Promise<boolean> {
+    cancelPendingCopy()
+    const generation = copyGeneration
+    let controller: AbortController | undefined
     try {
-      const text = copyableMessageText(msg)
+      let complete = msg
+      if (needsCompleteMessageText(msg)) {
+        if (!options.readMessageText) return false
+        const requested = {
+          ...msg,
+          contentRef: msg.contentRef && { ...msg.contentRef },
+          contentSlice: msg.contentSlice && { ...msg.contentSlice },
+        }
+        const session = options.sessionIdentity?.()
+        const identity = copyBodyIdentity(requested)
+        const source = options.messages.value[sourceMessageIndex(msg)]
+        const sourceIdentity = source && copyBodyIdentity(source)
+        const ownerId = source?.contentRef?.messageId
+        controller = new AbortController()
+        pendingCopyRead = controller
+        const text = await options.readMessageText(requested, controller.signal)
+        const currentSource = ownerId
+          ? options.messages.value.find(row => row.messageId === ownerId)
+          : options.messages.value[sourceMessageIndex(requested)]
+        // Hydration may replace the aggregate with slices of the same body.
+        // Keep the clicked scope, but require its durable owner and body identity
+        // to remain current; composer changes do not cancel a Copy.
+        if (controller.signal.aborted || generation !== copyGeneration
+          || session !== options.sessionIdentity?.() || identity !== copyBodyIdentity(msg)
+          || (source && (!currentSource || sourceIdentity !== copyBodyIdentity(currentSource)
+            || sourceIdentity !== copyBodyIdentity(source)))) return false
+        complete = {
+          ...requested, text,
+          timelineItems: restoreHistoryTimelineText(requested, text) ?? requested.timelineItems,
+        }
+      }
+      const text = copyableMessageText(complete)
       if (!text) return false
       const isAssistant = (msg.displayRole || msg.role) === 'assistant'
       const label = isAssistant ? options.aiGeneratedLabel?.().trim() : ''
@@ -200,6 +260,8 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     } catch (err) {
       console.warn('Copy failed:', err instanceof Error ? err.message : String(err))
       return false
+    } finally {
+      if (pendingCopyRead === controller) pendingCopyRead = null
     }
   }
 
