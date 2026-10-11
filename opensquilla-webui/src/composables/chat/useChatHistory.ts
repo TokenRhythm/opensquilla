@@ -47,7 +47,7 @@ import {
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
 import { dedupeTerminalErrorNotices, hasTerminalErrorNotice } from '@/utils/chat/terminalErrorNotices'
 import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
-import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
+import { interleaveHistoryModelCallSegments, interleaveHydratedHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
 import { normalizePromptAnnotationSnapshot } from '@/utils/chat/promptAnnotationHistory'
 
 function recordArray<T extends Record<string, unknown>>(value: unknown): T[] {
@@ -1723,11 +1723,20 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     loadEarlierPending = false
   }
 
+  function reconcileHydratedContent(
+    message: Pick<ChatMessage, 'messageId' | 'contentRef' | 'contentRevision'>,
+    text: string,
+  ) {
+    if (message.contentRef?.sessionKey !== options.sessionKey.value) return
+    options.messages.value = interleaveHydratedHistoryModelCallSegments(options.messages.value, message, text)
+  }
+
   return {
     historySessionKey,
     historyState,
     loadHistory,
     reconcileHistory,
+    reconcileHydratedContent,
     loadEarlierHistory,
     retryHistory,
     markSessionMissing,

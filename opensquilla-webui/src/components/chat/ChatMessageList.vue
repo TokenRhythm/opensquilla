@@ -306,6 +306,7 @@ const emit = defineEmits<{
   toggleToolGroup: [groupId: string]
   toggleToolItem: [renderKey: string]
   detailsDisclosure: [message: ChatRenderedMessage, open: boolean]
+  contentHydrated: [message: ChatRenderedMessage, text: string]
   showToolResult: [content: string, title: string, context?: ToolResultContext]
   openSession: [sessionKey: string]
   forkConversation: [throughTurnId?: string]
@@ -479,10 +480,8 @@ function canHydrateContent(message: ChatRenderedMessage): boolean {
     message.turnRunKind === 'plan_implementation'
     || message.provenanceKind === 'plan_implementation'
   ) return false
-  // A transformed assistant segment shares the canonical row's contentRef.
-  // Only the canonical row owns the automatic read; all slices update
-  // from that shared result and must never issue duplicate display exports.
-  if (message.clientId?.startsWith('history-model-call-segment:')) return false
+  // Split rows share a content identity and the serialized read/cache. A mounted
+  // slice can restore an evicted body even when its canonical row is offscreen.
   if (message.contentRef?.view === 'display') {
     return ['user', 'assistant', 'tool'].includes(message.displayRole)
   }
@@ -491,8 +490,7 @@ function canHydrateContent(message: ChatRenderedMessage): boolean {
 
 function showContentHydrationStatus(message: ChatRenderedMessage, index: number): boolean {
   if (props.shareMode || message.previewComplete === true) return false
-  if (message.clientId?.startsWith('history-model-call-segment:')
-    || message.turnRunKind === 'plan_implementation' || message.provenanceKind === 'plan_implementation') return false
+  if (message.turnRunKind === 'plan_implementation' || message.provenanceKind === 'plan_implementation') return false
   const key = contentHydrationKey(message, index)
   if (hydratedContent.has(key)) return false
   return Boolean(contentRefFor(message) && canHydrateContent(message))
@@ -602,6 +600,7 @@ async function hydrateContent(message: ChatRenderedMessage, index: number): Prom
       : await contentRangeCache.readText(ref, { signal: controller.signal })
     if (generation === contentHydrationGeneration && !controller.signal.aborted) {
       rememberHydratedContent(key, text)
+      emit('contentHydrated', message, text)
     }
   } catch (error) {
     if (!controller.signal.aborted && generation === contentHydrationGeneration) {
@@ -866,6 +865,14 @@ watch(() => [props.shareMode, props.sessionKey, props.scrollEpoch, ...renderEntr
   // Failed reads retain their explicit retry state instead of polling.
   for (const key of hydrationAttempted) if (!mounted.has(key)) hydrationAttempted.delete(key)
   trimHydratedContent()
+  // Pagination or a history refresh can supply Steer anchors after the body was
+  // cached. Reconcile against that body without retaining it in parent state.
+  for (const { index } of renderEntries.value) {
+    const message = props.messages[index]
+    if (!message || message.contentSlice || message.displayRole !== 'assistant' || !canHydrateContent(message)) continue
+    const text = hydratedContent.get(contentHydrationKey(message, index))
+    if (text !== undefined) emit('contentHydrated', message, text)
+  }
   void hydrateMountedContent()
 }, { immediate: true, flush: 'post' })
 

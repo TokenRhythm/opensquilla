@@ -1,10 +1,12 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createApp, h, nextTick, reactive, ref, type App } from 'vue'
+import { createApp, h, nextTick, reactive, ref, toRef, type App } from 'vue'
 import { createPinia } from 'pinia'
 import i18n from '@/i18n'
 import type { ChatMessage, ChatRenderedMessage, RawToolCallPayload } from '@/types/chat'
 import { useChatHistoryDetails } from '@/composables/chat/useChatHistoryDetails'
+import { useChatHistory } from '@/composables/chat/useChatHistory'
+import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
 import { useChatRenderedMessages } from '@/composables/chat/useChatRenderedMessages'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import { ContentRangeCache } from '@/utils/chat/contentRangeCache'
@@ -33,7 +35,7 @@ async function mount(messages: ChatRenderedMessage[], historyMessages?: ChatMess
   const host = document.createElement('div')
   document.body.appendChild(host)
   const { renderMarkdown } = useChatTextRendering()
-  const canonical = ref(historyMessages ?? [])
+  const canonical = ref(interleaveHistoryModelCallSegments(historyMessages ?? []))
   const openTools = reactive(new Set<string>())
   const showResult = vi.fn()
   const props = reactive({
@@ -46,7 +48,12 @@ async function mount(messages: ChatRenderedMessage[], historyMessages?: ChatMess
     copyMessage: async () => true, downloadAttachment: async () => true,
   })
   const app = createApp({ setup: () => {
-    const key = ref(sessionKey)
+    const key = toRef(props, 'sessionKey')
+    const history = useChatHistory({
+      sessionKey: key, messages: canonical, sessionReadLeaseReader: { current: () => null },
+      lastHeaderRole: ref(''), lastHeaderDay: ref(''), stripTimePrefix: value => value,
+      scrollToBottom: () => {},
+    })
     const details = useChatHistoryDetails({ sessionKey: key, messages: canonical })
     const projected = historyMessages ? useChatRenderedMessages({
       messages: canonical, sessionKey: key, routerSlots: ref([]), routerModels: ref({}), routerTierConfigs: ref({}),
@@ -58,6 +65,7 @@ async function mount(messages: ChatRenderedMessage[], historyMessages?: ChatMess
       ...props, messages: projected?.value ?? props.messages,
       loadHistoryDetails: (message: ChatRenderedMessage) => details.setExpanded(message.contentRef, true),
       onDetailsDisclosure: (message: ChatRenderedMessage, open: boolean) => details.setExpanded(message.contentRef, open),
+      onContentHydrated: (message: ChatRenderedMessage, text: string) => history.reconcileHydratedContent(message, text),
       onToggleToolGroup: toggle, onToggleToolItem: toggle, onShowToolResult: showResult,
     })
   } })
@@ -85,6 +93,78 @@ afterEach(() => {
 })
 
 describe('automatic content through the real assistant renderer', () => {
+  it.each([1, 2])('reconstructs %i persisted Steer boundaries after delayed full-body hydration', async count => {
+    const parts = ['前😀'.repeat(80), '中🙂'.repeat(70), '后🚀'.repeat(60)].slice(0, count + 1)
+    const body = parts.join('')
+    let finish!: (text: string) => void
+    const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay')
+      .mockImplementation(() => new Promise(resolve => { finish = resolve }))
+    const rows: ChatMessage[] = [{ role: 'user', text: '原始问题', ts: 1, messageId: 'original', turnId: 'turn' }]
+    const segments = parts.slice(1).map((part, index) => {
+      rows.push({ role: 'user', text: `调整${index + 1}`, ts: index + 2, messageId: `steer-${index}`,
+        turnId: 'turn', inputDisposition: 'applied', steerModelCallId: `${index + 2}.0`, steerAppliedIteration: index + 2 })
+      const start = Array.from(parts.slice(0, index + 1).join('')).length
+      return { model_call_id: `${index + 2}.0`, iteration: index + 2, start_codepoint: start,
+        end_codepoint: start + Array.from(part).length }
+    })
+    const preview = Array.from(body).slice(0, 8).join('')
+    rows.push({ role: 'assistant', text: preview, ts: 5, messageId: 'answer', turnId: 'turn',
+      previewComplete: false, contentRef: { ...message().contentRef!, revision: 'r1' }, contentRevision: 'r1',
+      usage: { model_call_segments: segments }, restoredFromHistory: true })
+    const { host, canonical } = await mount([], rows)
+    expect(read).toHaveBeenCalledTimes(1)
+    expect(host.textContent).not.toContain(parts[0])
+    finish(body)
+    for (let index = 0; index < 8; index++) { await Promise.resolve(); await nextTick() }
+    const expected = ['原始问题', ...parts.flatMap((part, index) => index ? [`调整${index}`, part] : [part])]
+    const renderedRows = [...host.querySelectorAll('[data-testid="chat-message-row"]')]
+    expect(renderedRows).toHaveLength(expected.length)
+    expected.forEach((text, index) => expect(renderedRows[index]?.textContent).toContain(text))
+    expect(canonical.value.filter(row => row.role === 'assistant').map(row => row.text).join('')).toBe(preview)
+    expect(canonical.value.filter(row => row.messageId === 'answer')).toHaveLength(1)
+    expect(read).toHaveBeenCalledTimes(1)
+  })
+
+  it('uses the cached full body when an earlier history page supplies the Steer anchor', async () => {
+    const prefix = '前😀'.repeat(80)
+    const suffix = '后🙂'.repeat(70)
+    const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay').mockResolvedValue(prefix + suffix)
+    const assistant: ChatMessage = { role: 'assistant', text: '前', ts: 3, messageId: 'answer', turnId: 'turn',
+      previewComplete: false, contentRef: message().contentRef, usage: { model_call_segments: [{ model_call_id: '2.0',
+        iteration: 2, start_codepoint: Array.from(prefix).length, end_codepoint: Array.from(prefix + suffix).length }] } }
+    const { host, canonical } = await mount([], [assistant])
+    expect(canonical.value).toHaveLength(1)
+    canonical.value = [{ role: 'user', text: '调整', ts: 2, messageId: 'steer', turnId: 'turn',
+      inputDisposition: 'applied', steerModelCallId: '2.0', steerAppliedIteration: 2 }, ...canonical.value]
+    for (let index = 0; index < 8; index++) { await Promise.resolve(); await nextTick() }
+    const rows = [...host.querySelectorAll('[data-testid="chat-message-row"]')]
+    expect(rows).toHaveLength(3)
+    expect(rows.map(row => row.textContent)).toEqual([expect.stringContaining(prefix), expect.stringContaining('调整'), expect.stringContaining(suffix)])
+    expect(read).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not apply a delayed Steer body after switching sessions', async () => {
+    let finish!: (text: string) => void
+    const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay')
+      .mockImplementation(() => new Promise(resolve => { finish = resolve }))
+    const { host, props, canonical } = await mount([], [
+      { role: 'user', text: '旧调整', ts: 2, messageId: 'steer', turnId: 'turn', inputDisposition: 'applied',
+        steerModelCallId: '2.0', steerAppliedIteration: 2 },
+      { role: 'assistant', text: '前', ts: 3, messageId: 'answer', turnId: 'turn', previewComplete: false,
+        contentRef: message().contentRef, usage: { model_call_segments: [{ model_call_id: '2.0', iteration: 2,
+          start_codepoint: 2, end_codepoint: 4 }] } },
+    ])
+    props.sessionKey = 'another-session'
+    canonical.value = [{ role: 'assistant', text: '新会话正文', ts: 4, messageId: 'answer', previewComplete: true }]
+    await nextTick()
+    finish('前😀后续')
+    for (let index = 0; index < 8; index++) { await Promise.resolve(); await nextTick() }
+    expect(read.mock.calls[0]?.[1]?.signal?.aborted).toBe(true)
+    expect(canonical.value.map(row => row.text)).toEqual(['新会话正文'])
+    expect(host.textContent).toContain('新会话正文')
+    expect(host.textContent).not.toContain('前😀')
+    expect(host.textContent).not.toContain('旧调整')
+  })
   it('uses the authenticated reader for both mounted body hydration and disclosed details', async () => {
     sessionStorage.setItem('opensquilla.wsToken', 'synthetic-component-token')
     const body = '## 完整正文\n\n**普通聊天正文🙂。**'

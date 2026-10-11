@@ -237,6 +237,7 @@
           @toggle-tool-group="toggleToolGroup"
           @toggle-tool-item="toggleToolItem"
           @details-disclosure="(message, open) => historyDetails.setExpanded(message.contentRef, open)"
+          @content-hydrated="chatHistory.reconcileHydratedContent"
           :load-history-details="message => historyDetails.setExpanded(message.contentRef, true)"
           @show-tool-result="showToolResultModal"
           @open-session="switchToSession"

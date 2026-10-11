@@ -384,4 +384,19 @@ describe('ChatMessageList inline history content', () => {
     expect(read).toHaveBeenCalledOnce()
     expect([...host.querySelectorAll('[data-testid="assistant-body"]')].map(node => node.textContent)).toEqual(['A😀世界Z', '世界'])
   })
+
+  it('lets a mounted synthetic slice restore its shared body while the canonical row is offscreen', async () => {
+    const segment = assistant({ id: 'slice', clientId: 'history-model-call-segment:slice', text: '',
+      previewComplete: false, contentSlice: { startCodepoint: 2, endCodepoint: 4 } })
+    const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay')
+      .mockRejectedValueOnce(new Error('body unavailable')).mockResolvedValueOnce('A😀世界Z')
+    const { host } = await mountList([segment])
+    await settleHydration()
+    expect(host.textContent).toContain('body unavailable')
+    host.querySelector<HTMLButtonElement>('.chat-history-content-hydration__button')!.click()
+    await settleHydration()
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(host.querySelector('[data-testid="assistant-body"]')?.textContent).toBe('世界')
+    expect(host.querySelector('[data-testid="chat-history-content-hydration"]')).toBeNull()
+  })
 })
