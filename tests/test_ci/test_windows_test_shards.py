@@ -547,6 +547,10 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
         "test_transaction_recovery_locks_parked_backup_before_restoring_target",
     )
     assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/functional/test_gateway_session_routing_e2e.py"),
+        "test_real_gateway_websocket_session_routing_contract",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/functional/test_gateway_silent_reply_process_e2e.py"),
         "test_real_gateway_suppresses_goal_sentinel_everywhere",
     )
