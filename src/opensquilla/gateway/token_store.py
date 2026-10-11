@@ -281,31 +281,42 @@ class TokenStore:
         match = _TOKEN_PATTERN.fullmatch(str(token or ""))
         public_id = match.group("public_id") if match is not None else ""
         secret = match.group("secret") if match is not None else ""
-        row: sqlite3.Row | None = None
-        if public_id:
-            with closing(self._connect()) as connection:
-                row = connection.execute(
-                    "SELECT public_id, token_version, name, secret_digest, roles_json, "
-                    "scopes_json, capabilities_json, source_kind, created_at, "
-                    "authorization_revision, last_used_at, last_peer, revoked_at "
-                    "FROM sandbox_tokens WHERE public_id = ?",
-                    (public_id,),
-                ).fetchone()
-        expected_digest = bytes(row["secret_digest"]) if row is not None else _DUMMY_DIGEST
-        supplied_digest = _secret_digest(secret)
-        valid_secret = secrets.compare_digest(expected_digest, supplied_digest)
-        if row is None or not valid_secret or row["revoked_at"] is not None:
+        if not public_id:
+            secrets.compare_digest(_DUMMY_DIGEST, _secret_digest(secret))
             return None
 
-        record = self._record_from_row(row)
+        record: TokenRecord | None = None
         try:
-            with closing(self._connect()) as connection, connection:
-                connection.execute(
-                    "UPDATE sandbox_tokens SET last_used_at = ?, last_peer = ? "
-                    "WHERE public_id = ? AND revoked_at IS NULL",
-                    (int(time.time()), peer_ip, public_id),
-                )
+            with closing(self._connect()) as connection:
+                with closing(
+                    connection.execute(
+                        "SELECT public_id, token_version, name, secret_digest, roles_json, "
+                        "scopes_json, capabilities_json, source_kind, created_at, "
+                        "authorization_revision, last_used_at, last_peer, revoked_at "
+                        "FROM sandbox_tokens WHERE public_id = ?",
+                        (public_id,),
+                    )
+                ) as cursor:
+                    row = cursor.fetchone()
+                expected_digest = bytes(row["secret_digest"]) if row is not None else _DUMMY_DIGEST
+                supplied_digest = _secret_digest(secret)
+                valid_secret = secrets.compare_digest(expected_digest, supplied_digest)
+                if row is None or not valid_secret or row["revoked_at"] is not None:
+                    return None
+
+                # Finish the read before opening the usage transaction. Reuse
+                # this request's connection without retaining a read cursor or
+                # sharing authority/connection state with another request.
+                record = self._record_from_row(row)
+                with connection:
+                    connection.execute(
+                        "UPDATE sandbox_tokens SET last_used_at = ?, last_peer = ? "
+                        "WHERE public_id = ? AND revoked_at IS NULL",
+                        (int(time.time()), peer_ip, public_id),
+                    )
         except (OSError, sqlite3.Error) as exc:
+            if record is None:
+                raise
             # Authority was established by the successful read above. Usage
             # metadata is informational; failure must not turn a valid named
             # token into an invalid credential or a broader legacy identity.

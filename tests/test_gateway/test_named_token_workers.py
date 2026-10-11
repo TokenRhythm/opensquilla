@@ -264,6 +264,67 @@ async def test_async_named_resolver_preserves_role_and_peer_rejection(tmp_path, 
         assert principal is None
 
 
+@pytest.mark.parametrize("commit_fails", [False, True])
+async def test_cancelled_verify_waits_for_usage_transaction_and_connection_close(
+    tmp_path, monkeypatch, commit_fails,
+):
+    issued = _issue(tmp_path)
+    store = TokenStore(tmp_path / "sessions.db", initialize=False)
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    entered = asyncio.Event()
+    release = threading.Event()
+    connections = []
+
+    class BlockingCommitConnection(sqlite3.Connection):
+        closed = False
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            assert threading.get_ident() != loop_thread
+            assert self.in_transaction
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(5), "Test did not release the usage transaction"
+            if commit_fails:
+                self.rollback()
+                raise sqlite3.OperationalError("synthetic usage commit failure")
+            return super().__exit__(exc_type, exc_value, traceback)
+
+        def close(self):
+            assert threading.get_ident() != loop_thread
+            super().close()
+            self.closed = True
+
+    def connect():
+        connection = sqlite3.connect(store._path, factory=BlockingCommitConnection)
+        connection.row_factory = sqlite3.Row
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(store, "_connect", connect)
+    task = asyncio.create_task(store.verify_async(issued.token, peer_ip="127.0.0.2"))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert len(connections) == 1 and not connections[0].closed
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert connections[0].closed
+    with sqlite3.connect(store._path) as connection:
+        row = connection.execute(
+            "SELECT last_used_at, last_peer FROM sandbox_tokens",
+        ).fetchone()
+    if commit_fails:
+        assert row == (None, None)
+    else:
+        assert row[0] is not None and row[1] == "127.0.0.2"
+
+
 @pytest.mark.parametrize("boundary", ["http", "websocket"])
 async def test_actual_transport_auth_entry_uses_complete_worker(tmp_path, monkeypatch, boundary):
     issued = _issue(tmp_path)
