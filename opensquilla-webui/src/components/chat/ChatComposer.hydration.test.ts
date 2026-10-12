@@ -119,7 +119,7 @@ it('keeps Send disabled through a metadata failure and enables one click after a
   const blocked = computed(() => liveBlocked.value
     || (['resolving', 'unavailable', 'removed'].includes(project.status.value) ? 'Project resolving' : ''))
   const subject = sendHarness({ taskOwnership: ownership, sendBlockedReason: liveBlocked })
-  let sending = Promise.resolve()
+  let sending: ReturnType<typeof subject.api.onSend> = Promise.resolve(undefined)
   const onSend = vi.fn(() => { sending = subject.api.onSend() })
   const el = document.createElement('div')
   document.body.appendChild(el)

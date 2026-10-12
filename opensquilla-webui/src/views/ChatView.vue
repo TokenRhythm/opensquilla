@@ -3363,7 +3363,7 @@ const chatGoals = useChatGoals({
     return outcome.authoritative
   },
   onSetAccepted: projectAcceptedGoalMessage,
-  notify: message => pushToast(message, { duration: 6000 }),
+  notify: message => pushToast(message, { tone: 'danger', duration: 6000 }),
 })
 applyGoalSnapshot = snapshot => { chatGoals.applyHydration(snapshot) }
 const {

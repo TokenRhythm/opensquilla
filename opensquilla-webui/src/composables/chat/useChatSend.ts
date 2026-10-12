@@ -2273,6 +2273,7 @@ export function useChatSend(options: UseChatSendOptions) {
     textOverride?: string
     cancelIfComposerChanged?: boolean
     resumeQueueOnSuccess?: boolean
+    preflightGuard?: () => boolean
   }
 
   function currentExactReplayAttempt(): SendAttempt | null {
@@ -2297,7 +2298,7 @@ export function useChatSend(options: UseChatSendOptions) {
     try {
       const onAccepted = invocation.resumeQueueOnSuccess
         ? options.capturePendingAutoSendResume?.() : undefined
-      await sendComposerInput(invocation, onAccepted)
+      return await sendComposerInput(invocation, onAccepted)
     } finally {
       composerSubmissions.delete(token)
       if (!disposed) composerSubmissionVersion.value += 1
@@ -2353,8 +2354,9 @@ export function useChatSend(options: UseChatSendOptions) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
       if (!deliveryStillMatches()) return
+      if (invocation.preflightGuard?.() === false) return
       if (replayBlockedReason?.value) return
-      await dispatchSend(exactReplayAttempt.text, {
+      return await dispatchSend(exactReplayAttempt.text, {
         composerText,
         draftIds: exactReplayAttempt.draftIds,
         queueMode: exactReplayAttempt.queueMode,
@@ -2363,7 +2365,6 @@ export function useChatSend(options: UseChatSendOptions) {
         preDispatchGuard: deliveryStillMatches,
         onAccepted,
       })
-      return
     }
 
     const matchesRecoveredComposer = () => Boolean(recoveredAttempt && matchesRecoveredDraft(recoveredAttempt, {
@@ -2419,6 +2420,7 @@ export function useChatSend(options: UseChatSendOptions) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
       if (!deliveryStillMatches()) return
+      if (invocation.preflightGuard?.() === false) return
       if (!queueOwnerMatchesSnapshot(composerSnapshot)) return
       if (options.sendBlockedReason?.value) return
       if (
@@ -2438,7 +2440,7 @@ export function useChatSend(options: UseChatSendOptions) {
       recoveredAttempt &&
       matchesRecoveredComposer()
     ) {
-      await dispatchSend(text, {
+      return await dispatchSend(text, {
         composerText,
         draftIds: recoveredAttempt.draftIds,
         queueMode: recoveredAttempt.queueMode,
@@ -2448,7 +2450,6 @@ export function useChatSend(options: UseChatSendOptions) {
         preDispatchGuard: deliveryStillMatches,
         onAccepted,
       })
-      return
     }
 
     const slashClassification = !bypassSlashCommand
@@ -2599,7 +2600,7 @@ export function useChatSend(options: UseChatSendOptions) {
 
     if (!hasPayload || !deliveryStillMatches()) return
 
-    await dispatchSend(text, {
+    return await dispatchSend(text, {
       composerText,
       draftIds: composerSnapshot.draftIds,
       payload: payloadFromSnapshot(composerSnapshot),
@@ -3712,20 +3713,40 @@ export function useChatSend(options: UseChatSendOptions) {
           duration: 8000,
           ...(canRetry ? { action: {
             label: i18n.global.t('chat.retry'),
-            onClick: () => {
-              if (
-                recoveredAttempt !== attempt
-                || options.sessionKey.value !== requestSessionKey
-                || attempt.deliveryIdentity !== options.deliveryIdentity?.value
-                || !composerMatchesSnapshot(restoredSnapshot)
-                || options.sendBlockedReason?.value
-                || options.offlineQueueIdentity?.value
-                || options.stream.isStreaming.value
-                || hasAuthoritativeWork()
-              ) return
+            onClick: async () => {
+              const unavailable = (key: string) => ({
+                handled: false as const,
+                message: i18n.global.t(key),
+                tone: 'info' as const,
+                removeAction: true,
+              })
+              if (disposed || options.sessionKey.value !== requestSessionKey) {
+                return unavailable('chat.toast.retryOriginalSession')
+              }
+              if (!composerMatchesSnapshot(restoredSnapshot)) {
+                return unavailable('chat.toast.retryDraftChanged')
+              }
+              const canStillRetry = () => !disposed
+                && options.sessionKey.value === requestSessionKey
+                && composerMatchesSnapshot(restoredSnapshot)
+                && recoveredAttempt === attempt
+                && attempt.deliveryIdentity === options.deliveryIdentity?.value
+                && !options.sendBlockedReason?.value
+                && !options.offlineQueueIdentity?.value
+                && !options.stream.isStreaming.value
+                && !hasAuthoritativeWork()
+                && (!options.taskOwnership || options.taskOwnership.hydrationResolved.value)
+              if (!canStillRetry()) return unavailable('chat.toast.retryUnavailable')
+              const handled = (outcome: ChatSendOutcome | undefined) => outcome && outcome !== 'not_sent'
+                ? true : unavailable('chat.toast.retryUnavailable')
               if (separateExplicitDraft) {
-                void dispatchSend(attempt.text, {
+                if (options.validateActiveProjectBeforeSend && await refreshedActiveProjectBlocksSend()) {
+                  return unavailable('chat.toast.retryUnavailable')
+                }
+                if (!canStillRetry()) return unavailable('chat.toast.retryUnavailable')
+                return dispatchSend(attempt.text, {
                   retryAttempt: attempt, preserveComposer: true, draftIds: attempt.draftIds,
+                  preDispatchGuard: () => options.sessionKey.value === requestSessionKey,
                   payload: {
                     selectedSkills: copySelectedSkills(attempt.selectedSkills),
                     localPathReferences: [...attempt.localPathReferences],
@@ -3735,9 +3756,12 @@ export function useChatSend(options: UseChatSendOptions) {
                     initialCollaborationMode: attempt.initialCollaborationMode,
                     initialRoutingMode: attempt.initialRoutingMode,
                   },
-                })
+                }).then(handled)
               } else {
-                void onSend()
+                return onSend({
+                  cancelIfComposerChanged: true,
+                  preflightGuard: canStillRetry,
+                }).then(handled)
               }
             },
           } } : {}),

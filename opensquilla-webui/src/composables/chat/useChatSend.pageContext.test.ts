@@ -555,3 +555,84 @@ it('consumes the accepted skill snapshot before acknowledged annotations mutate 
   expect(draftIds.value).toEqual([])
   expect(result.options.selectedSkills!.value).toEqual([])
 })
+
+describe('send failure notification recovery', () => {
+  const notifications = useToasts()
+  function clear() { for (const toast of [...notifications.toasts.value]) notifications.dismissToast(toast.id) }
+  beforeEach(clear)
+  afterEach(clear)
+
+  async function rejectedSend() {
+    const blocked = ref<string | null>(null)
+    const identity = ref<string | null>('synthetic-identity')
+    const result = createHarness({ inputText: ref('Original message'), draftIds: ref([]), sendBlockedReason: blocked, deliveryIdentity: identity })
+    result.rpc.call.mockRejectedValueOnce(new TurnCommandError('rejected', 'Try again', 'NOT_READY', false, true))
+    await result.api.onSend()
+    const toast = notifications.toasts.value.find(item => item.action)!
+    expect(toast?.action).toBeDefined()
+    expect(toast.tone).toBe('danger')
+    expect(result.options.inputText.value).toBe('Original message')
+    return { ...result, toast, blocked, identity }
+  }
+
+  it('hands a valid retry to the existing send flow once and dismisses only its own notice', async () => {
+    const result = await rejectedSend()
+    const firstId = result.rpc.call.mock.calls[0]?.[1].clientRequestId
+    await Promise.all([
+      notifications.runToastAction(result.toast.id, 'Failed'),
+      notifications.runToastAction(result.toast.id, 'Failed'),
+    ])
+    expect(result.rpc.call).toHaveBeenCalledTimes(2)
+    expect(result.rpc.call.mock.calls[1]?.[1].clientRequestId).toBe(firstId)
+    expect(notifications.toasts.value.some(t => t.id === result.toast.id)).toBe(false)
+  })
+
+  it.each(['session', 'draft', 'identity', 'blocked', 'streaming', 'disposed'])('invalidates %s recovery without sending or losing the current draft', async kind => {
+    const result = await rejectedSend()
+    if (kind === 'session') result.options.sessionKey.value = 'agent:main:webchat:other'
+    if (kind === 'draft') result.options.inputText.value = 'New draft'
+    if (kind === 'identity') result.identity.value = 'different-profile'
+    if (kind === 'blocked') result.blocked.value = 'blocked'
+    if (kind === 'streaming') result.options.stream.isStreaming.value = true
+    if (kind === 'disposed') result.api.dispose()
+    const draft = result.options.inputText.value
+    await notifications.runToastAction(result.toast.id, 'Failed')
+    expect(result.rpc.call).toHaveBeenCalledOnce()
+    expect(result.options.inputText.value).toBe(draft)
+    expect(notifications.toasts.value).toHaveLength(1)
+    expect(notifications.toasts.value[0]).toMatchObject({ id: result.toast.id, tone: 'info' })
+    expect(notifications.toasts.value[0]?.action).toBeUndefined()
+    expect(notifications.toasts.value[0]?.message).not.toBe('Try again')
+  })
+
+  it('does not consume a new send failure emitted during the retry', async () => {
+    const result = await rejectedSend()
+    result.rpc.call.mockRejectedValueOnce(new TurnCommandError('rejected', 'Still unavailable', 'NOT_READY', false, true))
+    await notifications.runToastAction(result.toast.id, 'Failed')
+    expect(result.rpc.call).toHaveBeenCalledTimes(2)
+    expect(notifications.toasts.value).toHaveLength(1)
+    expect(notifications.toasts.value[0]?.id).not.toBe(result.toast.id)
+    expect(notifications.toasts.value[0]?.tone).toBe('danger')
+    expect(notifications.toasts.value[0]?.action).toBeDefined()
+  })
+
+  it.each(['blocked', 'rejected', 'draft', 'session', 'streaming'])('retains feedback when async send preflight becomes %s', async kind => {
+    const result = await rejectedSend()
+    result.options.validateActiveProjectBeforeSend = vi.fn(async () => {
+      await Promise.resolve()
+      if (kind === 'rejected') throw new Error('Project unavailable')
+      if (kind === 'blocked') return 'workspace-unavailable'
+      if (kind === 'draft') result.options.inputText.value = 'New draft during preflight'
+      if (kind === 'session') result.options.sessionKey.value = 'agent:main:webchat:other'
+      if (kind === 'streaming') result.options.stream.isStreaming.value = true
+      return null
+    })
+    await notifications.runToastAction(result.toast.id, 'Failed')
+    expect(result.rpc.call).toHaveBeenCalledOnce()
+    expect(result.options.inputText.value).toBe(kind === 'draft' ? 'New draft during preflight' : 'Original message')
+    expect(notifications.toasts.value).toHaveLength(1)
+    expect(notifications.toasts.value[0]).toMatchObject({ id: result.toast.id, tone: 'info' })
+    expect(notifications.toasts.value[0]?.action).toBeUndefined()
+    expect(notifications.toasts.value[0]?.message).not.toBe('Try again')
+  })
+})
