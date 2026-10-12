@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Callable
 from dataclasses import replace
@@ -22,12 +23,18 @@ from opensquilla.sandbox.run_context import (
     PackageBundleGrant,
     PublicNetworkGrant,
     RunContext,
+    _get_session_run_context,
+    _persist_run_context,
     get_run_context,
     normalize_scope,
     normalize_workspace_path,
     persist_run_context,
 )
 from opensquilla.sandbox.run_mode import RunMode
+from opensquilla.sandbox.user_grants_worker import (
+    run_user_grants_worker,
+    user_grants_operation,
+)
 
 
 def _normalize_bundle_id(bundle_id: Any) -> str:
@@ -73,6 +80,10 @@ def _upsert_user_public_network_grant(grant: PublicNetworkGrant) -> None:
     )
 
 
+async def _apply_user_store(operation: Callable[[], None]) -> None:
+    await run_user_grants_worker(operation)
+
+
 async def _persist_then_apply_user_store(
     session_manager: Any,
     session_key: str,
@@ -81,18 +92,23 @@ async def _persist_then_apply_user_store(
     updated: RunContext,
     apply_user_store: Callable[[], None] | None = None,
 ) -> RunContext:
-    persisted = await persist_run_context(session_manager, session_key, updated)
-    if apply_user_store is None:
-        return persisted
-    try:
-        apply_user_store()
-    except Exception as exc:
+    # Acquire before persisting: queued cancellation cannot leave a partial
+    # update, and a failed write cannot roll back a later queued mutation.
+    async with user_grants_operation() as operation:
+        persisted = await _persist_run_context(session_manager, session_key, updated)
+        if apply_user_store is None:
+            return persisted
         try:
-            await persist_run_context(session_manager, session_key, existing)
-        except Exception as rollback_exc:
-            raise exc from rollback_exc
-        raise
-    return persisted
+            await operation.run(apply_user_store)
+        except Exception as exc:
+            try:
+                await operation.wait(asyncio.create_task(
+                    _persist_run_context(session_manager, session_key, existing),
+                ))
+            except Exception as rollback_exc:
+                raise exc from rollback_exc
+            raise
+        return persisted
 
 
 async def set_workspace(
@@ -197,12 +213,12 @@ async def add_mount_grant(
 
     if grant in existing.mounts:
         if apply_user_store is not None:
-            apply_user_store()
+            await _apply_user_store(apply_user_store)
         return existing
     mounts = tuple(m for m in existing.mounts if m.path != grant.path) + (grant,)
     if mounts == existing.mounts:
         if apply_user_store is not None:
-            apply_user_store()
+            await _apply_user_store(apply_user_store)
         return existing
     return await _persist_then_apply_user_store(
         session_manager,
@@ -240,13 +256,6 @@ async def remove_mount_grant(
     removal_paths = {normalized_path, storage_path, path}
     target_scope = str(scope or "").strip().lower()
 
-    session_existing = await get_run_context(
-        session_manager,
-        session_key,
-        config=config,
-        workspace=workspace,
-        include_user_grants=False,
-    )
     if target_scope in {"chat", "workspace"}:
         remove_user = target_scope == "workspace"
         remove_chat = target_scope == "chat"
@@ -254,20 +263,27 @@ async def remove_mount_grant(
         remove_user = True
         remove_chat = True
 
-    mounts = tuple(
-        m
-        for m in session_existing.mounts
-        if not (m.path in removal_paths and (remove_chat or m.scope == target_scope))
-    )
-    if mounts != session_existing.mounts:
-        await persist_run_context(
-            session_manager,
-            session_key,
-            replace(session_existing, mounts=mounts, source="saved"),
+    async with user_grants_operation() as operation:
+        session_existing = await _get_session_run_context(
+            session_manager, session_key, config=config, workspace=workspace,
         )
-    if remove_user:
-        for removal_path in removal_paths:
-            user_grants.remove_mount_grant(removal_path)
+        mounts = tuple(
+            m
+            for m in session_existing.mounts
+            if not (m.path in removal_paths and (remove_chat or m.scope == target_scope))
+        )
+        if mounts != session_existing.mounts:
+            await _persist_run_context(
+                session_manager,
+                session_key,
+                replace(session_existing, mounts=mounts, source="saved"),
+            )
+        if remove_user:
+            def remove_user_mounts() -> None:
+                for removal_path in removal_paths:
+                    user_grants.remove_mount_grant(removal_path)
+
+            await operation.run(remove_user_mounts)
     return await get_run_context(
         session_manager,
         session_key,
@@ -307,12 +323,12 @@ async def add_domain_grant(
 
     if grant in existing.domains:
         if apply_user_store is not None:
-            apply_user_store()
+            await _apply_user_store(apply_user_store)
         return existing
     domains = tuple(d for d in existing.domains if d.domain != grant.domain) + (grant,)
     if domains == existing.domains:
         if apply_user_store is not None:
-            apply_user_store()
+            await _apply_user_store(apply_user_store)
         return existing
     return await _persist_then_apply_user_store(
         session_manager,
@@ -393,14 +409,14 @@ async def add_public_network_grant(
 
     if grant in existing.public_network:
         if apply_user_store is not None:
-            apply_user_store()
+            await _apply_user_store(apply_user_store)
         return existing
     public_network = tuple(
         item for item in existing.public_network if item.scope != grant.scope
     ) + (grant,)
     if public_network == existing.public_network:
         if apply_user_store is not None:
-            apply_user_store()
+            await _apply_user_store(apply_user_store)
         return existing
     return await _persist_then_apply_user_store(
         session_manager,
@@ -425,13 +441,6 @@ async def remove_domain_grant(
         raise ValueError(decision.reason)
     normalized = decision.normalized
     target_scope = str(scope or "").strip().lower()
-    session_existing = await get_run_context(
-        session_manager,
-        session_key,
-        config=config,
-        workspace=workspace,
-        include_user_grants=False,
-    )
     if target_scope in {"chat", "workspace"}:
         remove_user = target_scope == "workspace"
         remove_chat = target_scope == "chat"
@@ -439,19 +448,23 @@ async def remove_domain_grant(
         remove_user = True
         remove_chat = True
 
-    domains = tuple(
-        d
-        for d in session_existing.domains
-        if not (d.domain == normalized and (remove_chat or d.scope == target_scope))
-    )
-    if domains != session_existing.domains:
-        await persist_run_context(
-            session_manager,
-            session_key,
-            replace(session_existing, domains=domains, source="saved"),
+    async with user_grants_operation() as operation:
+        session_existing = await _get_session_run_context(
+            session_manager, session_key, config=config, workspace=workspace,
         )
-    if remove_user:
-        user_grants.remove_domain_grant(normalized)
+        domains = tuple(
+            d
+            for d in session_existing.domains
+            if not (d.domain == normalized and (remove_chat or d.scope == target_scope))
+        )
+        if domains != session_existing.domains:
+            await _persist_run_context(
+                session_manager,
+                session_key,
+                replace(session_existing, domains=domains, source="saved"),
+            )
+        if remove_user:
+            await operation.run(lambda: user_grants.remove_domain_grant(normalized))
     return await get_run_context(
         session_manager,
         session_key,
@@ -490,14 +503,14 @@ async def enable_bundle_grant(
 
     if grant in existing.bundles:
         if apply_user_store is not None:
-            apply_user_store()
+            await _apply_user_store(apply_user_store)
         return existing
     bundles = tuple(b for b in existing.bundles if b.bundle_id != grant.bundle_id) + (
         grant,
     )
     if bundles == existing.bundles:
         if apply_user_store is not None:
-            apply_user_store()
+            await _apply_user_store(apply_user_store)
         return existing
     return await _persist_then_apply_user_store(
         session_manager,
@@ -541,7 +554,7 @@ async def disable_bundle_grant(
     bundles = tuple(b for b in existing.bundles if b.bundle_id != normalized_bundle_id)
     bundles = bundles + (grant,)
     if bundles == existing.bundles:
-        user_grants.remove_bundle_grant(normalized_bundle_id)
+        await _apply_user_store(lambda: user_grants.remove_bundle_grant(normalized_bundle_id))
         return existing
     return await _persist_then_apply_user_store(
         session_manager,
