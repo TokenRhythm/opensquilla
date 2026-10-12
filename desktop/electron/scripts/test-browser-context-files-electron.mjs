@@ -102,6 +102,17 @@ if (!process.versions.electron) {
         response.end(pdfBytes)
         return
       }
+      if (request.url === '/redirect-asset.pdf') {
+        response.writeHead(302, { location: '/asset.pdf' })
+        response.end()
+        return
+      }
+      if (request.url === '/slow-page') {
+        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+        response.write('<!doctype html><title>Replacement document</title>')
+        setTimeout(() => response.end('<h1>Replacement document ready</h1>'), 750)
+        return
+      }
       if (request.url === '/asset') {
         response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8',
           'content-disposition': 'attachment; filename="synthetic-note.txt"' })
@@ -113,6 +124,9 @@ if (!process.versions.electron) {
         <a href="/asset" download>Download sample</a>
         <a href="/asset">Native attachment navigation</a>
         <a href="/asset.pdf" download>Download PDF sample</a>
+        <a href="/asset.pdf">Native PDF attachment navigation</a>
+        <a href="/redirect-asset.pdf">Redirected PDF attachment navigation</a>
+        <a href="/slow-page">Slow navigation</a>
         <a href="/pdf/synthetic-paper" target="_blank">Download inline PDF</a>
         <a id="generated-pdf" download="synthetic-generated.pdf">Download generated PDF</a>
         <a href="/pdf/referrer-paper" target="_blank">Download referrer PDF</a>
@@ -163,7 +177,7 @@ if (!process.versions.electron) {
     })
     try {
       await new Promise(resolve => web.listen(0, '127.0.0.1', resolve))
-      owner = new BrowserWindow({ show: false, width: 900, height: 700,
+      owner = new BrowserWindow({ show: process.env.OPENSQUILLA_CONTEXT_NATIVE_SAVE_PROBE === '1', width: 900, height: 700,
         webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } })
       await owner.loadURL('data:text/html,<title>Browser context test host</title>')
       manager = new NativeWorkbenchSurfaceManager({ getWindow: () => owner, emit() {} })
@@ -238,6 +252,82 @@ if (!process.versions.electron) {
       nativeObserved = await call({ operation: 'observe', targetRef: shared.targetRef })
       assert.ok(nativeObserved.observation.refs.some(value => value.name === 'Download sample'))
       trace('ordinary attachment navigation retains document readiness')
+
+      const downloadEvents = []
+      const sharedRecord = record(shared)
+      const noteDownloadEvent = name => downloadEvents.push({ name,
+        url: sharedRecord.contents.getURL(), documentUrl: sharedRecord.documentUrl,
+        ready: sharedRecord.browserDocumentReady, previous: sharedRecord.browserPreviousDocument,
+        navigation: sharedRecord.browserDownloadNavigation, generation: sharedRecord.browserNavigationGeneration })
+      for (const event of ['did-start-navigation', 'did-fail-load', 'did-stop-loading', 'did-frame-navigate']) {
+        sharedRecord.contents.on(event, () => noteDownloadEvent(event))
+      }
+      const htmlSibling = await call({ operation: 'open', url: origin, contextTargetRef: shared.targetRef })
+      const pdfSibling = await call({ operation: 'open', url: origin + '/pdf/background-paper', contextTargetRef: shared.targetRef })
+      const secondPdfSibling = await call({ operation: 'open', url: origin + '/pdf/second-background-paper', contextTargetRef: shared.targetRef })
+      manager.setSurfaceRect({ surfaceId: sharedRecord.id, x: 0, y: 0, width: 850, height: 650, visible: true })
+      manager.setSurfaceRect({ surfaceId: record(secondPdfSibling).id, x: 0, y: 0, width: 850, height: 650, visible: true })
+      assert.equal(manager.activeSurfaceId, record(secondPdfSibling).id)
+      for (const [index, name] of ['Native PDF attachment navigation', 'Redirected PDF attachment navigation',
+        'Native PDF attachment navigation', 'Native PDF attachment navigation'].entries()) {
+        const path = join(userDownloadDirectory, `native-${index}.pdf`)
+        const getUrl = sharedRecord.contents.getURL.bind(sharedRecord.contents)
+        if (index === 2) sharedRecord.previewSession.prependOnceListener('will-download', () => {
+          // Expose a provisional URL until the event returns. This exercises the
+          // native dialog ordering where the retained page is not yet exposed.
+          sharedRecord.contents.getURL = () => origin + '/asset.pdf'
+        })
+        const saved = new Promise((resolve, reject) => {
+          sharedRecord.previewSession.once('will-download', (_event, item, contents) => {
+            noteDownloadEvent('will-download')
+            assert.equal(contents.id, sharedRecord.webContentsId, 'A background attachment belongs to its source page')
+            if (index === 2) {
+              assert.equal(sharedRecord.browserDocumentReady, false)
+              assert.equal(sharedRecord.browserPreviousDocument?.ready, true,
+                'Do not discard the retained document while its URL is provisional')
+              sharedRecord.contents.getURL = getUrl
+            }
+            if (index === 3) {
+              item.once('done', (_event, state) => state === 'cancelled' ? resolve() : reject(new Error(state)))
+              item.cancel()
+              return
+            }
+            if (process.env.OPENSQUILLA_CONTEXT_NATIVE_SAVE_PROBE !== '1' || index !== 0) item.setSavePath(path)
+            else {
+              item.setSaveDialogOptions({ title: 'Synthetic PDF save probe', defaultPath: path })
+              console.error(`Synthetic native save probe ready: ${path}`)
+            }
+            item.once('done', (_event, state) => state === 'completed' ? resolve() : reject(new Error(state)))
+          })
+        })
+        const page = await call({ operation: 'observe', targetRef: shared.targetRef })
+        await call({ operation: 'act', targetRef: shared.targetRef, action: 'click',
+          ref: page.observation.refs.find(value => value.name === name).ref })
+        await saved
+        if (index !== 3) assert.deepEqual(await readFile(path), pdfBytes)
+        const readyDeadline = Date.now() + 2000
+        while (!sharedRecord.browserDocumentReady && Date.now() < readyDeadline) await new Promise(resolve => setTimeout(resolve, 20))
+        assert.equal(sharedRecord.browserDocumentReady, true, JSON.stringify(downloadEvents))
+        await call({ operation: 'observe', targetRef: shared.targetRef })
+      }
+      trace(`native PDF attachment events ${JSON.stringify(downloadEvents)}`)
+      const staleGeneration = sharedRecord.browserNavigationGeneration
+      const replaced = manager.navigateSurface({ version: 4, surfaceId: sharedRecord.id,
+        action: 'navigate', url: origin + '/slow-page' })
+      const startedDeadline = Date.now() + 2000
+      while (sharedRecord.documentUrl !== origin + '/slow-page' && Date.now() < startedDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      assert.equal(sharedRecord.browserDocumentReady, false)
+      sharedRecord.browserDownloadNavigation = { url: origin + '/asset.pdf',
+        generation: staleGeneration, confirmed: true }
+      manager.restoreBrowserDocumentAfterDownload(sharedRecord)
+      assert.equal(sharedRecord.browserDocumentReady, false, 'A late attachment receipt must not ready a different navigation')
+      assert.equal((await replaced).ok, true)
+      assert.equal(sharedRecord.documentUrl, origin + '/slow-page')
+      assert.equal(sharedRecord.browserDownloadNavigation, undefined)
+      await call({ operation: 'open', targetRef: shared.targetRef, url: origin })
+      for (const sibling of [htmlSibling, pdfSibling, secondPdfSibling]) await manager.destroySurface(record(sibling).id, true)
 
       let observed = await call({ operation: 'observe', targetRef: shared.targetRef })
       let ref = observed.observation.refs.find(value => value.name === 'Download sample').ref

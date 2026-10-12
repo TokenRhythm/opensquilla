@@ -55,7 +55,14 @@ if (!process.versions.electron) {
     let owner, manager
     let exitCode = 0
     let hostRequests = 0
+    let trustedUnloads = 0
     const web = createServer((request, response) => {
+      if (request.url === '/trusted-unload') {
+        trustedUnloads++
+        response.writeHead(204)
+        response.end()
+        return
+      }
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
       if (request.url === '/host') {
         hostRequests++
@@ -65,7 +72,11 @@ if (!process.versions.electron) {
           <button id="guard">Arm unsaved state</button><script>
           document.querySelector('#guard').onclick = () => {
             window.pageState = 'retained';
-            window.onbeforeunload = () => true;
+            window.onbeforeunload = event => {
+              if (!event.isTrusted) return;
+              navigator.sendBeacon('/trusted-unload');
+              return true;
+            };
           };
           </script>`)
       } else response.end('<!doctype html><title>Other</title>')
@@ -100,6 +111,8 @@ if (!process.versions.electron) {
 
       const call = request => manager.executeBrowserMcp({ sessionKey: 'synthetic-task',
         observationMode: 'dom', ...request }, AbortSignal.timeout(20_000))
+      const clean = await call({ operation: 'open', url: `${origin}/clean` })
+      const cleanRecord = [...manager.surfaces.values()].find(value => value.targetRef === clean.targetRef)
       const page = await call({ operation: 'open', url: `${origin}/page` })
       const record = [...manager.surfaces.values()].find(value => value.targetRef === page.targetRef)
       assert.ok(record)
@@ -107,6 +120,12 @@ if (!process.versions.electron) {
       const ref = observed.observation.refs.find(value => value.name === 'Arm unsaved state')?.ref
       assert.ok(ref)
       await call({ operation: 'act', targetRef: page.targetRef, action: 'click', ref })
+      const secondPage = await call({ operation: 'open', url: `${origin}/page` })
+      const secondRecord = [...manager.surfaces.values()].find(value => value.targetRef === secondPage.targetRef)
+      const secondObserved = await call({ operation: 'observe', targetRef: secondPage.targetRef })
+      await call({ operation: 'act', targetRef: secondPage.targetRef, action: 'click',
+        ref: secondObserved.observation.refs.find(value => value.name === 'Arm unsaved state').ref })
+      await cleanRecord.contents.executeJavaScript("window.cleanState = 'retained'")
       assert.equal(await record.contents.executeJavaScript('navigator.userActivation.hasBeenActive'), true)
       assert.equal(await record.contents.executeJavaScript('window.pageState'), 'retained')
       await owner.webContents.executeJavaScript("window.controlState='retained'")
@@ -116,6 +135,7 @@ if (!process.versions.electron) {
       void owner.webContents.executeJavaScript('location.reload()').catch(() => undefined)
       await until(() => Boolean(decision), 'guarded host reload')
       assert.equal(await decision, false)
+      assert.equal(confirmations, 1, 'A batch has one non-destructive decision')
       assert.ok(events.indexOf('did-start') !== -1 && events.indexOf('did-start') < events.indexOf('will-navigate'),
         `A cancellable navigation must not release a child at did-start: ${JSON.stringify(events)}`)
       assert.equal(events.includes('did-navigate'), false)
@@ -124,7 +144,62 @@ if (!process.versions.electron) {
       assert.equal(manager.surfaces.get(record.id), record)
       assert.equal(record.contents.isDestroyed(), false)
       assert.equal(await record.contents.executeJavaScript('window.pageState'), 'retained')
+      assert.equal(await secondRecord.contents.executeJavaScript('window.pageState'), 'retained')
+      assert.equal(await cleanRecord.contents.executeJavaScript('window.cleanState'), 'retained')
+      assert.equal(manager.surfaces.size, 3, 'Stay retains clean and dirty pages in their original order')
+      assert.equal(trustedUnloads, 0, 'A cancelled batch never starts native closes')
       assert.equal(await owner.webContents.executeJavaScript('window.controlState'), 'retained')
+
+      const beforeConcurrent = confirmations
+      const concurrent = await Promise.all([manager.closeBrowserTabs(), manager.closeBrowserTabs()])
+      assert.deepEqual(concurrent, [false, false])
+      assert.equal(confirmations, beforeConcurrent + 1, 'Concurrent quit/reload requests share one decision')
+      assert.equal(manager.surfaces.size, 3)
+      let newRecord
+      dialog.showMessageBoxSync = () => {
+        newRecord = manager.allocateSurface({ version: 4, surfaceId: 'new-page-during-close',
+          kind: 'url-preview', payload: { url: 'about:blank', scopeId: 'synthetic-task' } }, owner)
+        return 1
+      }
+      assert.equal(await manager.closeBrowserTabs(), false, 'A new page during the decision requires fresh approval')
+      assert.equal(manager.surfaces.size, 4)
+      assert.equal(await cleanRecord.contents.executeJavaScript('window.cleanState'), 'retained')
+      await manager.destroySurface(newRecord.id, true)
+
+      const originalClose = cleanRecord.contents.close.bind(cleanRecord.contents)
+      let releaseClose, closeStarted
+      const started = new Promise(resolve => { closeStarted = resolve })
+      cleanRecord.contents.close = options => {
+        releaseClose = () => originalClose(options)
+        closeStarted()
+      }
+      let raceConfirmations = 0
+      dialog.showMessageBoxSync = () => { raceConfirmations++; return 1 }
+      const changingBatch = manager.closeBrowserTabs()
+      await started
+      await call({ operation: 'open', targetRef: secondPage.targetRef, url: origin + '/replacement' })
+      assert.equal(raceConfirmations, 2, 'A navigation waiting behind another close must obtain its own native decision')
+      assert.equal(secondRecord.contents.getURL(), origin + '/replacement')
+      releaseClose()
+      assert.equal(await changingBatch, false, 'A replaced document cannot inherit batch approval')
+      assert.equal(record.contents.isDestroyed(), false, 'Stop before closing further original pages after a batch changes')
+      assert.equal(secondRecord.contents.isDestroyed(), false)
+      cleanRecord.contents.close = originalClose
+
+      const guardedClose = record.contents.close.bind(record.contents)
+      record.contents.close = options => {
+        // A competing navigation can acquire ownership after the snapshot but
+        // before Chromium reports the close's beforeunload decision.
+        record.browserNavigationOwner = { url: record.contents.getURL(), started: true,
+          cancelled: false, supersede() {}, cancel() {} }
+        guardedClose(options)
+      }
+      assert.equal(await manager.closeBrowserTabs(), false, 'An invalidated native close grant cancels the batch')
+      assert.equal(record.contents.isDestroyed(), false, 'Cancellation must not enter the watchdog destruction fallback')
+      assert.equal(await record.contents.executeJavaScript('window.pageState'), 'retained')
+      record.contents.close = guardedClose
+      record.browserNavigationOwner = undefined
+      await until(() => trustedUnloads === 2, 'trusted handlers during the cancelled competing close')
 
       decision = undefined
       events.length = 0
@@ -141,8 +216,9 @@ if (!process.versions.electron) {
       assert.equal(await owner.webContents.executeJavaScript('window.controlState'), undefined)
       assert.equal(record.contents.isDestroyed(), true)
       assert.equal(manager.surfaces.size, 0)
+      await until(() => trustedUnloads === 3, 'trusted beforeunload handlers during approved close')
       assert.ok(confirmations >= 2)
-      console.log('Browser host navigation passed: cancelled renderer reload retains dirty tabs and JS state; accepted reload commits and cleans up.')
+      console.log('Browser host navigation passed: batch cancellation retains every clean/dirty page; concurrent and changed batches are guarded; approved reload runs trusted handlers and cleans up.')
     } catch (error) {
       exitCode = 1
       console.error(error)

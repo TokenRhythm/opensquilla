@@ -158,7 +158,7 @@ interface NativeWorkbenchSurfaceRecord {
   browserDownloadAttempt?: string
   browserDownloadParent?: { targetRef: string; attempt: string }
   browserCapturedPdfNavigation?: boolean
-  browserDownloadNavigation?: { url: string; generation: number }
+  browserDownloadNavigation?: { url: string; generation: number; confirmed?: boolean }
   /** WebRTC guard for an offline preview. */
   offlineRealmGuardInstalled: boolean
   /** CDP id for the offline WebRTC guard. */
@@ -804,6 +804,8 @@ const BASIC_AUTH_PROMPT_HTML = `<!doctype html>
  * permission and lifecycle policy is still enforced here in the main process.
  */
 export class NativeWorkbenchSurfaceManager {
+  private browserTabsClosePromise?: Promise<boolean>
+  private browserTabsCloseApproved?: { record: NativeWorkbenchSurfaceRecord; generation: number; url: string; invalid: boolean }
   private readonly surfaces = new Map<string, NativeWorkbenchSurfaceRecord>()
   private readonly surfaceQueues = new Map<string, Promise<void>>()
   private readonly recordCleanups = new Set<Promise<void>>()
@@ -1237,8 +1239,8 @@ export class NativeWorkbenchSurfaceManager {
   }
 
   /** Recover the retained document after a navigation ended before committing. */
-  private restoreBrowserDocumentAfterAbortedNavigation(record: NativeWorkbenchSurfaceRecord): void {
-    if (record.disposed || record.contents.isDestroyed()) return
+  private restoreBrowserDocumentAfterAbortedNavigation(record: NativeWorkbenchSurfaceRecord): boolean {
+    if (record.disposed || record.contents.isDestroyed()) return false
     const currentUrl = this.httpUrl(record.contents.getURL())?.href
     const previous = record.browserPreviousDocument
     if (previous && currentUrl && currentUrl === this.httpUrl(previous.url)?.href) {
@@ -1246,10 +1248,22 @@ export class NativeWorkbenchSurfaceManager {
       record.browserDocumentReady = previous.ready
       record.browserNavigationStopped = previous.stopped
       record.browserNavigationError = previous.error
+      record.browserPreviousDocument = undefined
     } else if (currentUrl) record.documentUrl = currentUrl
-    record.browserPreviousDocument = undefined
     if (record.browserDocumentReady) this.emit(record, 'ready')
     this.emitNavigationState(record)
+    return Boolean(previous && currentUrl && currentUrl === this.httpUrl(previous.url)?.href)
+  }
+
+  private restoreBrowserDocumentAfterDownload(record: NativeWorkbenchSurfaceRecord): void {
+    const navigation = record.browserDownloadNavigation
+    const previous = record.browserPreviousDocument
+    if (!navigation?.confirmed || navigation.generation !== record.browserNavigationGeneration
+      || !previous || record.disposed || record.contents.isDestroyed()
+      || record.browserNavigationStopped || record.browserNavigationError
+      || record.contents.isLoadingMainFrame()
+      || this.httpUrl(record.contents.getURL())?.href !== this.httpUrl(previous.url)?.href) return
+    if (this.restoreBrowserDocumentAfterAbortedNavigation(record)) record.browserDownloadNavigation = undefined
   }
 
   private waitForBrowserHostBlocker(record: NativeWorkbenchSurfaceRecord, signal: AbortSignal): Promise<void> {
@@ -3692,6 +3706,7 @@ export class NativeWorkbenchSurfaceManager {
   /** User tab closure must finish before removing its UI or clearing its session. */
   private requestBrowserClose(record: NativeWorkbenchSurfaceRecord): Promise<boolean> {
     if (record.disposed || record.contents.isDestroyed()) return Promise.resolve(true)
+    if (this.browserTabsClosePromise && this.browserTabsCloseApproved?.record !== record) return Promise.resolve(false)
     if (record.browserClosePromise) return record.browserClosePromise
     const contents = record.contents
     const pendingPrompt = record.prompt?.state()
@@ -3740,10 +3755,59 @@ export class NativeWorkbenchSurfaceManager {
   }
 
   async closeBrowserTabs(): Promise<boolean> {
-    for (const record of [...this.surfaces.values()]) {
-      if (record.kind === 'url-preview' && !await this.requestBrowserClose(record)) return false
-    }
-    return true
+    if (this.browserTabsClosePromise) return this.browserTabsClosePromise
+    // Individual native closes are destructive even for clean documents. The
+    // batch must obtain one decision before admitting any of them.
+    const closing = Promise.resolve().then(async () => {
+      const records = [...this.surfaces.values()].filter(record => record.kind === 'url-preview'
+        && !record.disposed && !record.contents.isDestroyed())
+      if (!records.length) return true
+      if (records.some(record => record.browserClosePromise || record.owner.isDestroyed())) return false
+      const snapshot = records.map(record => ({ record, url: record.contents.getURL(),
+        generation: record.annotationDocumentGeneration }))
+      const chinese = app.getLocale().toLowerCase().startsWith('zh')
+      const approved = dialog.showMessageBoxSync(records[0]!.owner, {
+        type: 'question',
+        buttons: chinese ? ['保留网页', '关闭所有网页'] : ['Keep pages', 'Close all pages'],
+        title: chinese ? '关闭所有网页？' : 'Close all pages?',
+        message: chinese
+          ? `关闭所有会话的 ${records.length} 个网页，网页中未保存的内容可能丢失。`
+          : `Close ${records.length} web pages across all sessions? Unsaved changes in these pages may be lost.`,
+        defaultId: 0, cancelId: 0, noLink: true,
+      }) === 1
+      if (!approved) return false
+      const unchanged = (entry: typeof snapshot[number]) => !entry.record.disposed
+        && !entry.record.contents.isDestroyed() && this.surfaces.get(entry.record.id) === entry.record
+        && entry.record.annotationDocumentGeneration === entry.generation
+        && entry.record.contents.getURL() === entry.url
+      const current = [...this.surfaces.values()].filter(record => record.kind === 'url-preview'
+        && !record.disposed && !record.contents.isDestroyed())
+      // Changes while the user decides require a fresh decision. In particular,
+      // a new tab must never inherit approval for an earlier batch.
+      if (current.length !== records.length || current.some(record => !records.includes(record))
+        || snapshot.some(entry => !unchanged(entry))) return false
+      try {
+        for (const [index, entry] of snapshot.entries()) {
+          if (snapshot.slice(index).some(pending => !unchanged(pending))) return false
+          const grant = { ...entry, invalid: false }
+          this.browserTabsCloseApproved = grant
+          let closed
+          try { closed = await this.requestBrowserClose(entry.record) }
+          finally { this.browserTabsCloseApproved = undefined }
+          if (!closed) {
+            if (grant.invalid || !unchanged(entry) || entry.record.browserNavigationOwner
+              || entry.record.contents.isLoadingMainFrame()) return false
+            // The user already approved discarding this exact document. A
+            // renderer that cannot complete its close must not stall shutdown.
+            await this.destroyRecord(entry.record)
+          }
+        }
+        return !this.hasBrowserTabs()
+      } finally { this.browserTabsCloseApproved = undefined }
+    })
+    this.browserTabsClosePromise = closing
+    try { return await closing }
+    finally { if (this.browserTabsClosePromise === closing) this.browserTabsClosePromise = undefined }
   }
 
   private async destroySurfaceNow(surfaceId: string): Promise<NativeWorkbenchSurfaceResult> {
@@ -4154,8 +4218,15 @@ export class NativeWorkbenchSurfaceManager {
       const downloadNavigation = record.browserDownloadNavigation
       if (downloadNavigation?.generation === record.browserNavigationGeneration
         && item.getURLChain().includes(downloadNavigation.url)) {
-        record.browserDownloadNavigation = undefined
-        this.restoreBrowserDocumentAfterAbortedNavigation(record)
+        downloadNavigation.confirmed = true
+        this.restoreBrowserDocumentAfterDownload(record)
+        // A native save dialog can outlive the provisional navigation. Retain
+        // the confirmed receipt until Chromium exposes the original document;
+        // completion/cancellation and loading events may arrive in either order.
+        item.once('done', () => this.restoreBrowserDocumentAfterDownload(record))
+        void record.contents.executeJavaScript('0').then(() => {
+          this.restoreBrowserDocumentAfterDownload(record)
+        }, () => undefined)
       }
       if (captureOwner && this.browserDownloads.capture(captureOwner, item)) return
       // Leaving the save path unset makes Electron show its native confirmation
@@ -4706,6 +4777,21 @@ export class NativeWorkbenchSurfaceManager {
         })
       })
       contents.on('will-prevent-unload', event => {
+        const approved = this.browserTabsCloseApproved
+        if (approved?.record === record) {
+          // Preserve Chromium's trusted beforeunload/unload execution after the
+          // explicit batch decision; there is no second, partially destructive
+          // series of user decisions.
+          record.playwright?.finishNativeBeforeUnload()
+          if (record.annotationDocumentGeneration === approved.generation
+            && contents.getURL() === approved.url && !record.browserNavigationOwner
+            && !contents.isLoadingMainFrame()) event.preventDefault()
+          else {
+            approved.invalid = true
+            record.browserCloseCancelled?.()
+          }
+          return
+        }
         const chinese = app.getLocale().toLowerCase().startsWith('zh')
         record.browserCloseWatchdog?.pause()
         let leave = false
@@ -4924,6 +5010,7 @@ export class NativeWorkbenchSurfaceManager {
       (_event, _targetUrl, isInPlace, isMainFrame) => {
         if (!isMainFrame || !(record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION)) return
         if (!isInPlace) {
+          record.browserDownloadNavigation = undefined
           record.revisionInteracted = false
           const navigation = record.browserNavigationOwner
           if (!navigation || navigation.started || navigation.url !== _targetUrl) {
@@ -4966,6 +5053,7 @@ export class NativeWorkbenchSurfaceManager {
         }
         if (isMainFrame && record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION) {
           record.browserPreviousDocument = undefined
+          record.browserDownloadNavigation = undefined
           this.rejectPendingPermissions(record)
           if (httpResponseCode === 410) this.emit(record, 'capability-expired')
           if (
@@ -5044,7 +5132,10 @@ export class NativeWorkbenchSurfaceManager {
       this.emit(record, 'loading')
       this.emitNavigationState(record)
     })
-    contents.on('did-stop-loading', () => this.emitNavigationState(record))
+    contents.on('did-stop-loading', () => {
+      this.restoreBrowserDocumentAfterDownload(record)
+      this.emitNavigationState(record)
+    })
     contents.on('page-title-updated', () => this.emitNavigationState(record))
     contents.on('did-navigate-in-page', (_event, targetUrl, isMainFrame) => {
       if (!isMainFrame) return
@@ -5095,7 +5186,11 @@ export class NativeWorkbenchSurfaceManager {
       }, () => { /* The dom-ready observer reports initialization failure. */ })
     })
     contents.on('did-fail-load', (_event, errorCode, errorDescription, failedUrl, isMainFrame, processId, routingId) => {
-      if (record.disposed || errorCode === -3) return
+      if (record.disposed) return
+      if (errorCode === -3) {
+        if (isMainFrame) this.restoreBrowserDocumentAfterDownload(record)
+        return
+      }
       if (!isMainFrame) {
         const frame = webFrameMain.fromId(processId, routingId) ?? null
         if (record.kind === 'url-preview' && this.pdfPolicies.get(record.previewSession)?.isViewerResourceRequest({

@@ -67,7 +67,7 @@ if (!process.versions.electron) {
   }
   process.exit(code)
 } else {
-  const { app, BrowserWindow } = await import('electron')
+  const { app, BrowserWindow, dialog } = await import('electron')
   const { NativeWorkbenchSurfaceManager } = await import('../dist/native-workbench-surface.js')
   app.commandLine.appendSwitch('disable-gpu')
   app.on('window-all-closed', () => {})
@@ -217,7 +217,11 @@ if (!process.versions.electron) {
       assert.ok(Date.now() - singleCloseStarted < 2000, 'A PDF tab should close promptly')
       await until(() => !manager.surfaces.has('pdf-direct'), 'closed PDF record cleanup')
       const allCloseStarted = Date.now()
-      assert.equal(await manager.closeBrowserTabs(), true)
+      const originalDialog = dialog.showMessageBoxSync
+      try {
+        dialog.showMessageBoxSync = () => 1
+        assert.equal(await manager.closeBrowserTabs(), true)
+      } finally { dialog.showMessageBoxSync = originalDialog }
       assert.ok(Date.now() - allCloseStarted < 2000, 'The remaining PDF tabs should close promptly')
       console.log('Browser PDF manager Electron tests passed')
     } finally {
