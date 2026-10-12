@@ -3185,6 +3185,7 @@ async def edit_source(
                 path=p,
                 logical_path=Path(logical_tool_path(path, base=workspace)),
                 paths=(p,),
+                display_path=display_path,
                 expected_revision=expected_revision,
                 edits=tuple(edits),
             ),
@@ -3202,24 +3203,22 @@ async def edit_source(
                 )
             if status == "contract_error":
                 raise RetryableToolInputError(str(getattr(sandbox_result, "message", "")))
-            original_result = metadata.get("original")
-            updated_result = metadata.get("updated")
+            changed_result = metadata.get("changed")
+            diff_summary_result = metadata.get("diffSummary")
             before_revision_result = metadata.get("beforeRevision")
             after_revision_result = metadata.get("afterRevision")
             before_fingerprint = metadata.get("beforeFingerprint")
             after_fingerprint = metadata.get("afterFingerprint")
             if (
                 status != "applied"
-                or not isinstance(original_result, str)
-                or not isinstance(updated_result, str)
+                or not isinstance(changed_result, bool)
+                or not isinstance(diff_summary_result, str)
                 or not isinstance(before_revision_result, str)
                 or not isinstance(after_revision_result, str)
                 or not isinstance(before_fingerprint, dict)
                 or not isinstance(after_fingerprint, dict)
             ):
                 raise ToolError("edit_source worker returned an invalid revision receipt.")
-            original = original_result
-            updated = updated_result
             before_revision = before_revision_result
             after_revision = after_revision_result
             receipt = record_semantic_mutation_receipt(
@@ -3237,7 +3236,7 @@ async def edit_source(
                 },
             )
             workspace_epoch = receipt["workspace_epoch"] if receipt is not None else None
-            if updated != original:
+            if changed_result:
                 record_workspace_file_write(p, operation="edit_source", created=False)
                 refresh_workspace_file_read_state(p, operation="edit_source")
                 record_scratch_file_write(p)
@@ -3247,11 +3246,11 @@ async def edit_source(
                 {
                     "status": "applied",
                     "path": display_path,
-                    "changed": updated != original,
+                    "changed": changed_result,
                     "before_revision": before_revision,
                     "after_revision": after_revision,
                     "workspace_epoch": workspace_epoch,
-                    "diff_summary": build_diff_summary(original, updated, path=display_path),
+                    "diff_summary": diff_summary_result,
                     "recoverableBackups": list(backup_summaries),
                 },
                 ensure_ascii=False,

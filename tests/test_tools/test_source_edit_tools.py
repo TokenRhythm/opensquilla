@@ -567,6 +567,50 @@ async def test_edit_source_applies_revision_gated_line_edit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [True, False])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+async def test_edit_source_consumes_compact_worker_receipt_without_losing_semantics(
+    workspace_context: tuple[Path, ToolContext], monkeypatch, changed: bool, newline: str,
+) -> None:
+    from opensquilla.sandbox import filesystem_worker
+    from opensquilla.sandbox.operation_runtime import SandboxOperationResult
+
+    workspace, ctx = workspace_context
+    target = workspace / "src" / "app.py"
+    target.parent.mkdir()
+    original = newline.join(["alpha", "beta", "gamma", ""])
+    replacement = ("BETA" if changed else "beta") + newline
+    updated = original.replace("beta" + newline, replacement)
+    target.write_bytes(original.encode("utf-8"))
+    before_revision = filesystem.source_revision_for_path(target)
+    calls = []
+
+    async def worker(operation, **_kwargs):
+        calls.append(operation)
+        reply = filesystem_worker._run(operation.to_payload())
+        assert "original" not in reply and "updated" not in reply
+        return SandboxOperationResult.from_worker_stdout(json.dumps(reply))
+
+    monkeypatch.setattr(filesystem, "_run_sandbox_operation_if_required", worker)
+    payload = json.loads(await _original_async(filesystem.edit_source)(
+        "src/app.py", expected_revision=before_revision,
+        edits=[{"start_line": 2, "end_line": 2, "replacement": replacement}],
+    ))
+    assert len(calls) == 1
+    assert target.read_bytes().decode("utf-8") == updated
+    assert payload["status"] == "applied"
+    assert payload["path"] == "src/app.py"
+    assert payload["changed"] is changed
+    assert payload["before_revision"] == before_revision
+    assert payload["after_revision"] == filesystem.source_revision_for_path(target)
+    assert payload["diff_summary"] == filesystem.build_diff_summary(
+        original, updated, path="src/app.py",
+    )
+    assert payload["workspace_epoch"] == int(changed)
+    assert ctx.workspace_mutation_receipts[-1]["changed"] is changed
+
+
+@pytest.mark.asyncio
 async def test_edit_source_noop_does_not_increment_workspace_epoch(
     workspace_context: tuple[Path, ToolContext],
 ) -> None:

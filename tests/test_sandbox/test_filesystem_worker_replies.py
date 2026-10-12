@@ -141,3 +141,39 @@ async def test_windows_structured_output_uses_finite_budget() -> None:
     assert len(captured.data) == 128 and captured.truncated
     assert process.stdout.payload == b""
     assert bytes(errors.data) == b"diagnostic"
+
+
+async def test_large_source_edit_keeps_success_receipt_below_private_transport_cap(
+    tmp_path: Path,
+) -> None:
+    # Two full source copies alone exceed the real production pipe budget.
+    # The file mutation is actual; only the process streams are in-memory.
+    original = "x" * (33 * 1024 * 1024) + "\nbefore\n"
+    updated = original.removesuffix("before\n") + "after\n"
+    assert len(original.encode()) + len(updated.encode()) > seatbelt.MAX_FILESYSTEM_REPLY_BYTES
+    path = tmp_path / "large-source.txt"
+    path.write_bytes(original.encode())
+    before_revision = filesystem_worker._source_revision(original.encode())
+    reply = filesystem_worker._edit_source({
+        "path": str(path), "logicalPath": str(path), "workspace": str(tmp_path),
+        "displayPath": "large-source.txt", "expectedRevision": before_revision,
+        "edits": [{"start_line": 2, "end_line": 2, "replacement": "after\n"}],
+    })
+    assert path.read_bytes() == updated.encode()
+    assert "original" not in reply and "updated" not in reply
+    encoded = json.dumps(reply, ensure_ascii=False).encode()
+    assert len(encoded) < 32_768
+    captured, _errors = await windows_default._collect_process_output(
+        _Process(encoded, b""), expected_nonce="receipt",
+        stdout_byte_cap=windows_default.MAX_FILESYSTEM_REPLY_BYTES,
+    )
+    assert not captured.truncated
+    result = SandboxOperationResult.from_worker_stdout(captured.data.decode())
+    assert result.metadata["status"] == "applied"
+    assert result.metadata["changed"] is True
+    assert result.metadata["beforeRevision"] == before_revision
+    assert result.metadata["afterRevision"] == filesystem_worker._source_revision(updated.encode())
+    assert result.metadata["beforeFingerprint"]["size"] == len(original.encode())
+    assert result.metadata["afterFingerprint"]["size"] == len(updated.encode())
+    assert result.metadata["diffSummary"].startswith("--- a/large-source.txt\n")
+    assert "diff_summary_truncated" in result.metadata["diffSummary"]
