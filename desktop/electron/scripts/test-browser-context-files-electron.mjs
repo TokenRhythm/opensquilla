@@ -58,7 +58,7 @@ if (!process.versions.electron) {
   }
   process.exit(code)
 } else {
-  const { app, BrowserWindow } = await import('electron')
+  const { app, BrowserWindow, dialog } = await import('electron')
   const { DesktopBrowserMcp } = await import('../dist/desktop-browser-mcp.js')
   const { NativeWorkbenchSurfaceManager } = await import('../dist/native-workbench-surface.js')
   app.commandLine.appendSwitch('disable-gpu')
@@ -71,7 +71,24 @@ if (!process.versions.electron) {
     const text = 'Synthetic download\n\nPreserved paragraph — 文字\n'
     const pdfBytes = pdfFixture()
     const pdfRequests = []
+    const heldAttachments = new Map()
+    const holdAttachment = key => {
+      let arrived
+      const held = { ready: new Promise(resolve => { arrived = resolve }), response: undefined,
+        arrived: () => arrived(), release: () => {
+          held.response.writeHead(200, { 'content-type': 'application/pdf',
+            'content-disposition': 'attachment; filename="synthetic-held.pdf"',
+            'content-length': pdfBytes.length })
+          held.response.end(pdfBytes)
+        } }
+      heldAttachments.set('/held.pdf?' + key, held)
+      return held
+    }
+    const nativeEvents = []
     const web = createServer((request, response) => {
+      const held = heldAttachments.get(request.url)
+      if (held) { held.response = response; held.arrived(); return }
+      if (request.url === '/failed-page') { request.socket.destroy(); return }
       if (request.url === '/login') {
         response.writeHead(302, { location: '/',
           'set-cookie': 'synthetic-pdf-auth=granted; HttpOnly; SameSite=Lax; Path=/' })
@@ -127,6 +144,7 @@ if (!process.versions.electron) {
       }
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
       response.end(`<!doctype html><title>Context and files</title>
+        <button onclick="window.onbeforeunload = () => true">Guard manual navigation</button>
         <a href="/asset" download>Download sample</a>
         <a href="/asset">Native attachment navigation</a>
         <a href="/asset.pdf" download>Download PDF sample</a>
@@ -186,7 +204,8 @@ if (!process.versions.electron) {
       owner = new BrowserWindow({ show: process.env.OPENSQUILLA_CONTEXT_NATIVE_SAVE_PROBE === '1', width: 900, height: 700,
         webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } })
       await owner.loadURL('data:text/html,<title>Browser context test host</title>')
-      manager = new NativeWorkbenchSurfaceManager({ getWindow: () => owner, emit() {} })
+      manager = new NativeWorkbenchSurfaceManager({ getWindow: () => owner, getPrivilegedGatewayUrl: () => 'https://gateway.example.invalid/',
+        emit: event => nativeEvents.push(event) })
       const origin = `http://127.0.0.1:${web.address().port}`
       const call = request => manager.executeBrowserMcp({ sessionKey: 'synthetic-task',
         observationMode: 'dom', ...request }, AbortSignal.timeout(15_000))
@@ -390,6 +409,184 @@ if (!process.versions.electron) {
       const uiAfter = await uiCall({ operation: 'observe', targetRef: uiSource.targetRef })
       assert.ok(uiAfter.observation.refs.some(value => value.name === 'Native PDF attachment navigation'))
       for (const surface of [uiSource, record(uiRelated), record(uiPdf)]) await manager.destroySurface(surface.id, true)
+
+      {
+        // The host address bar carries a trusted intent even though loadURL has
+        // no renderer user gesture. Raw requests and Agent navigation do not.
+        const manualNavigate = request => typeof manager.navigateSurfaceFromControlUi === 'function'
+          ? manager.navigateSurfaceFromControlUi(request) : manager.navigateSurface(request)
+        const manualCreate = request => typeof manager.createSurfaceFromControlUi === 'function'
+          ? manager.createSurfaceFromControlUi(request) : manager.createSurface(request)
+        const nativeDownload = (source, name, cancel = false) => new Promise(resolve => {
+          const listener = (event, item, contents) => {
+            if (contents?.id !== source.webContentsId) return
+            source.previewSession.removeListener('will-download', listener)
+            if (event.defaultPrevented) { resolve({ blocked: true }); return }
+            assert.equal(item.hasUserGesture(), false, 'Address navigation must exercise the missing guest gesture')
+            assert.equal(item.getSaveDialogOptions().title, 'Save preview download')
+            item.once('done', (_event, state) => resolve({ blocked: false, state }))
+            if (cancel) item.cancel()
+            else item.setSavePath(join(userDownloadDirectory, name))
+          }
+          source.previewSession.on('will-download', listener)
+        })
+        const manualId = 'synthetic-manual-address'
+        assert.equal((await manager.createSurface({ version: 2, surfaceId: manualId, kind: 'url-preview',
+          payload: { url: origin + '/login', scopeId: 'synthetic-manual-task' } })).ok, true)
+        const manualSource = manager.surfaces.get(manualId)
+        const manualCall = request => manager.executeBrowserMcp({ sessionKey: 'synthetic-manual-task',
+          observationMode: 'dom', ...request }, AbortSignal.timeout(15_000))
+        for (const [index, path] of ['/asset.pdf', '/redirect-asset.pdf', '/asset.pdf#page=2'].entries()) {
+          const saved = nativeDownload(manualSource, `address-${index}.pdf`)
+          const result = await manualNavigate({ version: 2, surfaceId: manualId, action: 'navigate', url: origin + path })
+          assert.equal(result.ok, true, 'A trusted address attachment is a download outcome, not ERR_FAILED')
+          assert.deepEqual(await saved, { blocked: false, state: 'completed' })
+          assert.deepEqual(await readFile(join(userDownloadDirectory, `address-${index}.pdf`)), pdfBytes)
+          assert.equal(manualSource.documentUrl, origin + '/')
+          assert.equal(manualSource.browserDocumentReady, true)
+          assert.equal(manualSource.browserNavigationError, undefined)
+          assert.equal(manualSource.browserNavigationOwner, undefined)
+          await manualCall({ operation: 'observe', targetRef: manualSource.targetRef })
+        }
+        trace('manual address direct and redirected attachment saved')
+        assert.equal((await manualNavigate({ version: 2, surfaceId: manualId, action: 'navigate',
+          url: 'https://gateway.example.invalid/' })).code, 'NAVIGATION_BLOCKED')
+        assert.equal(manualSource.browserNavigationOwner, undefined)
+        const unarmedSaved = nativeDownload(manualSource, 'must-not-save.pdf')
+        await assert.rejects(manualCall({ operation: 'open', targetRef: manualSource.targetRef,
+          url: origin + '/asset.pdf', manualDownload: true }), error => ['NAVIGATION_FAILED', 'PAGE_NOT_READY'].includes(error.code))
+        assert.deepEqual(await unarmedSaved, { blocked: true }, 'Agent navigation cannot forge host authority')
+        assert.equal((await manualNavigate({ version: 2, surfaceId: manualId, action: 'navigate', url: origin })).ok, true)
+        const cancelledSave = nativeDownload(manualSource, 'cancelled-address.pdf', true)
+        assert.equal((await manualNavigate({ version: 2, surfaceId: manualId,
+          action: 'navigate', url: origin + '/asset.pdf' })).ok, true)
+        assert.deepEqual(await cancelledSave, { blocked: false, state: 'cancelled' })
+        assert.equal(manualSource.browserNavigationOwner, undefined)
+        const afterCancel = nativeDownload(manualSource, 'must-not-save-after-cancel.pdf')
+        assert.equal((await manager.navigateSurface({ version: 2, surfaceId: manualId,
+          action: 'navigate', url: origin + '/asset.pdf' })).ok, false)
+        assert.deepEqual(await afterCancel, { blocked: true })
+        await manualNavigate({ version: 2, surfaceId: manualId, action: 'navigate', url: origin })
+
+        // A fresh tab has no retained page to mark ready after saving its URL.
+        const newId = 'synthetic-manual-download-only'
+        const newDownload = new Promise(resolve => {
+          const listener = (event, item, contents) => {
+            const source = manager.surfaces.get(newId)
+            if (contents?.id !== source?.webContentsId) return
+            manualSource.previewSession.removeListener('will-download', listener)
+            if (event.defaultPrevented) { resolve({ blocked: true }); return }
+            assert.equal(item.hasUserGesture(), false)
+            assert.equal(item.getSaveDialogOptions().title, 'Save preview download')
+            item.setSavePath(join(userDownloadDirectory, 'new-tab-address.pdf'))
+            item.once('done', (_event, state) => resolve({ blocked: false, state }))
+          }
+          manualSource.previewSession.on('will-download', listener)
+        })
+        const fresh = await manualCreate({ version: 2, surfaceId: newId, kind: 'url-preview',
+          payload: { url: origin + '/asset.pdf', scopeId: 'synthetic-manual-task', contextTargetRef: manualSource.targetRef } })
+        assert.equal(fresh.ok, true)
+        assert.equal(fresh.navigationError, undefined)
+        assert.equal(fresh.code, undefined)
+        assert.deepEqual(await newDownload, { blocked: false, state: 'completed' })
+        const newSource = manager.surfaces.get(newId)
+        assert.equal(newSource.browserDocumentReady, false)
+        const downloadOnly = manager.getBrowserTarget(newId)
+        assert.equal(downloadOnly.pageState, 'download')
+        assert.equal(downloadOnly.url, origin + '/asset.pdf')
+        assert.equal(downloadOnly.title, 'Download: synthetic-paper.pdf')
+        const newState = nativeEvents.filter(event => event.surfaceId === newId && event.type === 'navigation-state').at(-1)
+        assert.equal(newState.detail.loading, false)
+        assert.equal(newState.detail.navigationError, null)
+        await assert.rejects(manualCall({ operation: 'observe', targetRef: newSource.targetRef }),
+          error => error.code === 'PAGE_NOT_READY' && error.details.pageState === 'download')
+        assert.deepEqual(await readFile(join(userDownloadDirectory, 'new-tab-address.pdf')), pdfBytes)
+        await manager.destroySurface(newId, true)
+        const failureId = 'synthetic-manual-failed-source'
+        assert.equal((await manualCreate({ version: 2, surfaceId: failureId, kind: 'url-preview',
+          payload: { url: origin + '/failed-page', scopeId: 'synthetic-manual-task', contextTargetRef: manualSource.targetRef } })).ok, true)
+        const failureSource = manager.surfaces.get(failureId)
+        assert.equal(failureSource.browserDocumentReady, false)
+        assert.ok(failureSource.browserNavigationError)
+        const failureSave = nativeDownload(failureSource, 'failed-source-address.pdf')
+        assert.equal((await manualNavigate({ version: 2, surfaceId: failureId,
+          action: 'navigate', url: origin + '/asset.pdf' })).ok, true)
+        assert.deepEqual(await failureSave, { blocked: false, state: 'completed' })
+        assert.equal(manager.getBrowserTarget(failureId).pageState, 'download')
+        assert.equal(failureSource.browserNavigationError, undefined)
+        assert.equal(failureSource.browserDocumentReady, false)
+        await manager.destroySurface(failureId, true)
+        trace('new host tab download state is accurate')
+
+        const sibling = await manualCall({ operation: 'open', url: origin, contextTargetRef: manualSource.targetRef })
+        const siblingRecord = record(sibling)
+        const held = holdAttachment('background-owner')
+        const backgroundSave = nativeDownload(manualSource, 'background-address.pdf')
+        const pending = manualNavigate({ version: 2, surfaceId: manualId, action: 'navigate', url: origin + '/held.pdf?background-owner' })
+        await held.ready
+        manager.setSurfaceRect({ surfaceId: siblingRecord.id, x: 0, y: 0, width: 850, height: 650, visible: true })
+        const otherSaved = nativeDownload(siblingRecord, 'must-not-save-other-page.pdf')
+        await assert.rejects(manualCall({ operation: 'open', targetRef: sibling.targetRef, url: origin + '/asset.pdf' }),
+          error => ['NAVIGATION_FAILED', 'PAGE_NOT_READY'].includes(error.code))
+        assert.deepEqual(await otherSaved, { blocked: true }, 'One page cannot borrow another pending address intent')
+        await assert.rejects(call({ operation: 'open', targetRef: manualSource.targetRef, url: origin + '/asset.pdf' }),
+          error => error.code === 'TARGET_NOT_FOUND')
+        held.release()
+        assert.equal((await pending).ok, true)
+        assert.deepEqual(await backgroundSave, { blocked: false, state: 'completed' })
+        assert.equal(manager.activeSurfaceId, siblingRecord.id)
+        assert.equal(manualSource.browserDocumentReady, true)
+        assert.equal(manualSource.scopeId, 'synthetic-manual-task')
+        const ownedDownload = nativeEvents.findLast(event => event.surfaceId === manualId
+          && event.type === 'download-state' && event.detail.downloadState === 'completed')
+        assert.ok(ownedDownload)
+        await manualNavigate({ version: 4, surfaceId: siblingRecord.id, action: 'navigate', url: origin })
+        const pair = [manualSource, siblingRecord].map((source, index) => {
+          const held = holdAttachment('concurrent-' + index)
+          const saved = nativeDownload(source, `concurrent-${index}.pdf`)
+          const pending = manualNavigate({ version: source.version, surfaceId: source.id, action: 'navigate',
+            url: origin + '/held.pdf?concurrent-' + index })
+          return { held, saved, pending, source }
+        })
+        await Promise.all(pair.map(value => value.held.ready))
+        pair[1].held.release()
+        pair[0].held.release()
+        for (const [index, value] of pair.entries()) {
+          assert.equal((await value.pending).ok, true)
+          assert.deepEqual(await value.saved, { blocked: false, state: 'completed' })
+          assert.deepEqual(await readFile(join(userDownloadDirectory, `concurrent-${index}.pdf`)), pdfBytes)
+          assert.equal(value.source.browserNavigationOwner, undefined)
+        }
+        trace('manual intents remain page scoped and concurrent')
+
+        for (const action of ['stop', 'supersede']) {
+          const held = holdAttachment(action)
+          const pending = manualNavigate({ version: 2, surfaceId: manualId, action: 'navigate', url: origin + '/held.pdf?' + action })
+          await held.ready
+          const staleOwner = manualSource.browserNavigationOwner
+          if (action === 'stop') await manualNavigate({ version: 2, surfaceId: manualId, action: 'stop' })
+          else await manualNavigate({ version: 2, surfaceId: manualId, action: 'navigate', url: origin })
+          assert.equal(staleOwner.manualDownload, false)
+          held.release()
+          assert.equal((await pending).ok, false)
+          await manualNavigate({ version: 2, surfaceId: manualId, action: 'navigate', url: origin })
+        }
+        const originalDialog = dialog.showMessageBoxSync
+        try {
+          manager.setSurfaceRect({ surfaceId: manualId, x: 0, y: 0, width: 850, height: 650, visible: true })
+          const guardObserved = await manualCall({ operation: 'observe', targetRef: manualSource.targetRef })
+          await manualCall({ operation: 'act', targetRef: manualSource.targetRef, action: 'click',
+            ref: guardObserved.observation.refs.find(value => value.name === 'Guard manual navigation').ref })
+          dialog.showMessageBoxSync = () => 0
+          const stayed = await manualNavigate({ version: 2, surfaceId: manualId, action: 'navigate', url: origin + '/second' })
+          assert.equal(stayed.code, 'NAVIGATION_CANCELLED')
+          assert.equal(manualSource.browserNavigationOwner, undefined)
+          assert.equal(manualSource.browserDocumentReady, true)
+          await manualSource.contents.executeJavaScript('window.onbeforeunload = null')
+        } finally { dialog.showMessageBoxSync = originalDialog }
+        for (const source of [manualSource, siblingRecord]) await manager.destroySurface(source.id, true)
+        trace('Stop Stay and replacement revoke manual intent')
+      }
 
       let observed = await call({ operation: 'observe', targetRef: shared.targetRef })
       let ref = observed.observation.refs.find(value => value.name === 'Download sample').ref

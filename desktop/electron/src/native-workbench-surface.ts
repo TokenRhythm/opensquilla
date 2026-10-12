@@ -140,7 +140,8 @@ interface NativeWorkbenchSurfaceRecord {
   popupAnnounced?: boolean
   browserNavigationPromise?: Promise<void>
   browserNavigationGeneration: number
-  browserNavigationOwner?: { url: string; started: boolean; cancelled: boolean; supersede(): void; cancel(): void }
+  browserNavigationOwner?: { url: string; started: boolean; cancelled: boolean;
+    manualDownload: boolean; downloadAccepted: boolean; acceptDownload(): void; supersede(): void; cancel(): void }
   browserPreviousDocument?: { url: string; ready: boolean; stopped: boolean;
     error?: { url: string; code: string; errorCode?: number; message: string } }
   browserNavigationError?: { url: string; code: string; errorCode?: number; message: string }
@@ -159,6 +160,7 @@ interface NativeWorkbenchSurfaceRecord {
   browserDownloadParent?: { targetRef: string; attempt: string }
   browserCapturedPdfNavigation?: boolean
   browserDownloadNavigation?: { url: string; generation: number; confirmed?: boolean }
+  browserDownloadedDocument?: { url: string; name: string }
   /** WebRTC guard for an offline preview. */
   offlineRealmGuardInstalled: boolean
   /** CDP id for the offline WebRTC guard. */
@@ -844,11 +846,16 @@ export class NativeWorkbenchSurfaceManager {
     return record.pointer
   }
 
+  async createSurfaceFromControlUi(request: NativeWorkbenchCreateRequest): Promise<NativeWorkbenchSurfaceResult> {
+    return await this.createSurface(request, false, undefined, undefined, true)
+  }
+
   async createSurface(
     request: NativeWorkbenchCreateRequest,
     prepareBrowser = false,
     signal?: AbortSignal,
     context?: { sessionKey: string; targetRef: string },
+    manualDownload = false,
   ): Promise<NativeWorkbenchSurfaceResult> {
     const pending = this.surfaces.get(request.surfaceId)
     if (pending) {
@@ -861,7 +868,7 @@ export class NativeWorkbenchSurfaceManager {
     }
     return await this.queueSurfaceOperation(
       request.surfaceId,
-      () => this.createSurfaceNow(request, prepareBrowser, signal, context),
+      () => this.createSurfaceNow(request, prepareBrowser, signal, context, manualDownload),
     )
   }
 
@@ -992,6 +999,7 @@ export class NativeWorkbenchSurfaceManager {
     prepareBrowser = false,
     signal?: AbortSignal,
     context?: { sessionKey: string; targetRef: string },
+    manualDownload = false,
   ): Promise<NativeWorkbenchSurfaceResult> {
     const previous = this.surfaces.get(request.surfaceId)
     if (previous?.kind === 'url-preview' && !await this.requestBrowserClose(previous)) {
@@ -1060,7 +1068,7 @@ export class NativeWorkbenchSurfaceManager {
         if (record.kind === 'url-preview') {
           // Versions 2 and 3 acknowledge creation after initial navigation settles.
           await this.loadBrowserDocument(record, record.documentUrl, undefined, signal, false, false,
-            record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4)
+            record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4, manualDownload)
         } else {
           await record.contents.loadURL(record.documentUrl)
         }
@@ -1144,7 +1152,7 @@ export class NativeWorkbenchSurfaceManager {
 
   private async loadBrowserDocument(record: NativeWorkbenchSurfaceRecord, url: string,
     options?: Electron.LoadURLOptions, signal?: AbortSignal, reload = false, ignoreCache = false,
-    returnOnBlocker = true): Promise<void> {
+    returnOnBlocker = true, manualDownload = false): Promise<void> {
     if (signal?.aborted) {
       throw new DesktopBrowserError('TIMEOUT', 'Browser navigation was cancelled before loading.', 409,
         { targetRef: record.targetRef, outcome: 'not_started', retryable: false, recovery: 'inspect' })
@@ -1165,6 +1173,7 @@ export class NativeWorkbenchSurfaceManager {
       { targetRef: record.targetRef, outcome: 'unknown', retryable: false, recovery: 'inspect' })
     const cancel = () => {
       if (!isCurrent()) { rejectCancellation(superseded()); return }
+      if (record.browserNavigationOwner) record.browserNavigationOwner.manualDownload = false
       record.browserNavigationStopped = true
       if (record.kind === 'url-preview') this.noteBrowserNavigationFailure(record, url, 'ERR_TIMED_OUT')
       rejectCancellation(record.browserNavigationError ? this.browserNavigationFailure(record)
@@ -1174,10 +1183,15 @@ export class NativeWorkbenchSurfaceManager {
     const userCancelled = () => new DesktopBrowserError('NAVIGATION_CANCELLED',
       'The page remains open because leaving was cancelled.', 409,
       { targetRef: record.targetRef, outcome: 'not_started', retryable: false, recovery: 'inspect' })
+    let acceptDownload!: () => void
+    const downloadReceipt = new Promise<void>(resolve => { acceptDownload = resolve })
     const owner = { url: this.httpUrl(url)?.href ?? url, started: false, cancelled: false,
-      supersede: () => rejectCancellation(superseded()), cancel: () => {
+      manualDownload, downloadAccepted: false,
+      acceptDownload: () => { owner.downloadAccepted = true; acceptDownload() },
+      supersede: () => { owner.manualDownload = false; rejectCancellation(superseded()) }, cancel: () => {
         if (!isCurrent()) return
         owner.cancelled = true
+        owner.manualDownload = false
         this.restoreBrowserDocumentAfterAbortedNavigation(record)
         rejectCancellation(userCancelled())
       } }
@@ -1211,6 +1225,21 @@ export class NativeWorkbenchSurfaceManager {
         record.playwright?.finishNativeBeforeUnload()
         throw userCancelled()
       }
+      const receipt = record.browserDownloadNavigation
+      if (isCurrent() && owner.manualDownload && owner.started && !record.browserNavigationStopped
+        && receipt?.generation === generation && /ERR_(?:FAILED|ABORTED)/.test(String(error))) {
+        // Chromium can reject loadURL before dispatching the attachment event.
+        // Headers alone never authorize a successful download outcome.
+        let timeout: NodeJS.Timeout | undefined
+        try {
+          await Promise.race([downloadReceipt, cancelled,
+            new Promise<void>(resolve => { timeout = setTimeout(resolve, 5_000) })])
+        } finally { if (timeout) clearTimeout(timeout) }
+      }
+      if (isCurrent() && owner.downloadAccepted) {
+        this.restoreBrowserDocumentAfterDownload(record)
+        return
+      }
       if (record.kind === 'url-preview' && String(error).includes('ERR_ABORTED')) throw superseded()
       if (isCurrent() && !String(error).includes('ERR_ABORTED')) {
         if (record.kind === 'url-preview') {
@@ -1226,6 +1255,7 @@ export class NativeWorkbenchSurfaceManager {
       }
       throw error
     }).finally(() => {
+      owner.manualDownload = false
       detachReload()
       signal?.removeEventListener('abort', cancel)
       if (record.browserNavigationPromise === navigation) record.browserNavigationPromise = undefined
@@ -1265,9 +1295,15 @@ export class NativeWorkbenchSurfaceManager {
     const navigation = record.browserDownloadNavigation
     const previous = record.browserPreviousDocument
     if (!navigation?.confirmed || navigation.generation !== record.browserNavigationGeneration
-      || !previous || record.disposed || record.contents.isDestroyed()
-      || record.browserNavigationStopped || record.browserNavigationError
-      || record.contents.isLoadingMainFrame()
+      || record.disposed || record.contents.isDestroyed()
+      || record.browserNavigationStopped || record.browserNavigationError) return
+    if (record.browserDownloadedDocument) {
+      record.browserPreviousDocument = undefined
+      record.browserDownloadNavigation = undefined
+      this.emitNavigationState(record)
+      return
+    }
+    if (!previous || record.contents.isLoadingMainFrame()
       || this.httpUrl(record.contents.getURL())?.href !== this.httpUrl(previous.url)?.href) return
     if (this.restoreBrowserDocumentAfterAbortedNavigation(record)) record.browserDownloadNavigation = undefined
   }
@@ -1923,12 +1959,14 @@ export class NativeWorkbenchSurfaceManager {
   private describeBrowserRecord(record: NativeWorkbenchSurfaceRecord) {
     return {
       targetRef: record.targetRef, surfaceId: record.id, sessionKey: record.scopeId,
-      url: record.browserNavigationError?.url || this.httpUrl(record.contents.getURL())?.href || record.documentUrl,
-      title: record.contents.getTitle(), kind: record.kind,
+      url: record.browserNavigationError?.url || record.browserDownloadedDocument?.url
+        || this.httpUrl(record.contents.getURL())?.href || record.documentUrl,
+      title: record.browserDownloadedDocument ? `Download: ${record.browserDownloadedDocument.name}`
+        : record.contents.getTitle(), kind: record.kind,
       active: this.activeSurfaceId === record.id,
       pageState: record.browserUnresponsive || this.unresponsiveWindows.has(record.owner) ? 'unresponsive'
         : record.browserNavigationError ? 'navigation_failed'
-          : record.browserDocumentReady ? 'ready' : 'loading',
+          : record.browserDocumentReady ? 'ready' : record.browserDownloadedDocument ? 'download' : 'loading',
       ...(record.browserNavigationError ? { navigationError: record.browserNavigationError } : {}),
       ...(record.openerTargetRef ? { openerTargetRef: record.openerTargetRef } : {}),
       ...(record.contextTargetRef ? { contextTargetRef: record.contextTargetRef } : {}),
@@ -2187,10 +2225,13 @@ export class NativeWorkbenchSurfaceManager {
           throw this.browserNavigationFailure(record, request.operation)
         }
         if (!record.browserDocumentReady || !record.cdpReady) {
-          throw new DesktopBrowserError('PAGE_NOT_READY', 'The browser page is still loading or unavailable.', 409,
+          throw new DesktopBrowserError('PAGE_NOT_READY', record.browserDownloadedDocument
+            ? 'A download was started in this tab. Open a web page to read its document.'
+            : 'The browser page is still loading or unavailable.', 409,
             { targetRef: record.targetRef, operation: request.operation,
-              pageState: record.browserDocumentReady ? 'initializing' : 'loading',
-              outcome: 'not_started', retryable: true })
+              pageState: record.browserDocumentReady ? 'initializing' : record.browserDownloadedDocument ? 'download' : 'loading',
+              outcome: 'not_started', retryable: !record.browserDownloadedDocument,
+              ...(record.browserDownloadedDocument ? { recovery: 'change_url' } : {}) })
         }
         const page = await driver()
         const generation = record.annotationDocumentGeneration
@@ -3517,10 +3558,15 @@ export class NativeWorkbenchSurfaceManager {
     ])
   }
 
+  async navigateSurfaceFromControlUi(request: NativeWorkbenchNavigationRequest): Promise<NativeWorkbenchSurfaceResult> {
+    return await this.navigateSurface(request, undefined, false, request.action === 'navigate')
+  }
+
   async navigateSurface(
     request: NativeWorkbenchNavigationRequest,
     signal?: AbortSignal,
     ignoreCache = false,
+    manualDownload = false,
   ): Promise<NativeWorkbenchSurfaceResult> {
     const record = this.surfaces.get(request.surfaceId)
     if (!record || record.disposed) {
@@ -3564,7 +3610,7 @@ export class NativeWorkbenchSurfaceManager {
             }
           }
           if (record.kind === 'url-preview') {
-            await this.loadBrowserDocument(record, request.url!, undefined, signal)
+            await this.loadBrowserDocument(record, request.url!, undefined, signal, false, false, true, manualDownload)
           } else {
             await contents.loadURL(request.url!)
           }
@@ -3586,6 +3632,7 @@ export class NativeWorkbenchSurfaceManager {
           else contents.reload()
           break
         case 'stop':
+          record.browserNavigationOwner?.supersede()
           if (contents.isLoading() || !record.browserDocumentReady) {
             record.browserNavigationStopped = true
             record.browserDocumentReady = false
@@ -4209,9 +4256,20 @@ export class NativeWorkbenchSurfaceManager {
     previewSession.on('will-download', (event, item, webContents) => {
       const record = member(webContents?.id)
       const captureOwner = record && this.managedDownloadOwner(record)
+      const navigation = record?.browserNavigationOwner
+      const receipt = record?.browserDownloadNavigation
+      const chain = navigation?.manualDownload && receipt ? item.getURLChain() : []
+      // Only the trusted host address operation can lend one gesture to its
+      // current main-frame attachment, including permitted HTTP redirects.
+      const manualDownload = record?.kind === 'url-preview' && record.mode === 'full'
+        && navigation?.manualDownload && navigation.started && !navigation.cancelled
+        && !record.browserNavigationStopped
+        && receipt?.generation === record.browserNavigationGeneration
+        && chain.includes(navigation.url) && chain.includes(receipt.url)
+        && chain.every(url => this.v2TopLevelNavigationAllowed(record, url))
       if (
         !record
-        || (!captureOwner && !nativeWorkbenchDownloadAllowed(item.hasUserGesture()))
+        || (!captureOwner && !manualDownload && !nativeWorkbenchDownloadAllowed(item.hasUserGesture()))
       ) {
         event.preventDefault()
         this.emit(record ?? ownerRecord, 'blocked-action', {
@@ -4220,6 +4278,15 @@ export class NativeWorkbenchSurfaceManager {
           reason: 'user-gesture-required',
         })
         return
+      }
+      if (manualDownload && navigation) {
+        navigation.manualDownload = false
+        navigation.acceptDownload()
+        if (!record.initialDocumentCommitted || record.browserPreviousDocument?.error) {
+          record.browserDownloadedDocument = { url: receipt!.url, name: item.getFilename() }
+          record.browserDocumentReady = false
+          record.browserNavigationError = undefined
+        }
       }
       const downloadNavigation = record.browserDownloadNavigation
       if (downloadNavigation?.generation === record.browserNavigationGeneration
@@ -4262,6 +4329,7 @@ export class NativeWorkbenchSurfaceManager {
         })
         report('progressing')
       }
+      this.emitNavigationState(record)
     })
     previewSession.webRequest.onBeforeRequest({ urls: ['<all_urls>'] }, (details, callback) => {
       const browser = member(details.webContentsId)
@@ -5017,6 +5085,7 @@ export class NativeWorkbenchSurfaceManager {
         if (!isMainFrame || !(record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION)) return
         if (!isInPlace) {
           record.browserDownloadNavigation = undefined
+          record.browserDownloadedDocument = undefined
           record.revisionInteracted = false
           const navigation = record.browserNavigationOwner
           if (!navigation || navigation.started || navigation.url !== _targetUrl) {
@@ -5417,12 +5486,13 @@ export class NativeWorkbenchSurfaceManager {
     }
     this.emit(record, 'navigation-state', {
       targetRef: record.targetRef, sessionKey: record.scopeId,
-      url: record.browserNavigationError?.url || contents.getURL() || record.documentUrl,
-      title: contents.getTitle(),
-      loading: !record.browserNavigationError && contents.isLoading(),
+      url: record.browserNavigationError?.url || record.browserDownloadedDocument?.url || contents.getURL() || record.documentUrl,
+      title: record.browserDownloadedDocument ? `Download: ${record.browserDownloadedDocument.name}` : contents.getTitle(),
+      loading: !record.browserNavigationError && !record.browserDownloadedDocument && contents.isLoading(),
       navigationError: record.browserNavigationError ?? null,
       pageState: record.browserUnresponsive || this.unresponsiveWindows.has(record.owner) ? 'unresponsive'
-        : record.browserNavigationError ? 'navigation_failed' : record.browserDocumentReady ? 'ready' : 'loading',
+        : record.browserNavigationError ? 'navigation_failed' : record.browserDocumentReady ? 'ready'
+          : record.browserDownloadedDocument ? 'download' : 'loading',
       canGoBack: contents.navigationHistory.canGoBack(),
       canGoForward: contents.navigationHistory.canGoForward(),
     })

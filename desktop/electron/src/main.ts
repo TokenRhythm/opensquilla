@@ -13293,7 +13293,7 @@ ipcMain.handle('desktop:workbench:surface:create', async (event, payload: unknow
         }
       }
     }
-    return await nativeWorkbenchSurfaces.createSurface(request)
+    return await nativeWorkbenchSurfaces.createSurfaceFromControlUi(request)
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error),
       ...(error instanceof DesktopBrowserError ? { code: error.code } : {}) }
@@ -13305,7 +13305,7 @@ ipcMain.handle('desktop:workbench:surface:navigate', async (event, payload: unkn
     return { ok: false, message: 'OpenSquilla Desktop is shutting down.' }
   }
   try {
-    return await nativeWorkbenchSurfaces.navigateSurface(
+    return await nativeWorkbenchSurfaces.navigateSurfaceFromControlUi(
       parseNativeWorkbenchNavigationRequest(payload),
     )
   } catch (error) {

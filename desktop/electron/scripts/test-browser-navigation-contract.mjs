@@ -58,4 +58,9 @@ for (const contextTargetRef of ['', 'x'.repeat(129), 'bad\nref', 123]) {
     payload: { ...browserCreate.payload, contextTargetRef } }), Error)
 }
 
+assert.deepEqual(parse({ action: 'navigate', url: 'https://example.test/', manualDownload: true }),
+  { ...base, action: 'navigate', url: 'https://example.test/' })
+assert.deepEqual(parseNativeWorkbenchCreateRequest({ ...browserCreate, manualDownload: true,
+  payload: { ...browserCreate.payload, manualDownload: true } }), browserCreate)
+
 console.log('Browser navigation contract tests passed')
