@@ -328,7 +328,7 @@ test.describe('Settings modal', () => {
     await expect(dirtybar).toBeVisible()
     await expect(dirtybar).toContainText('Unsaved changes in Model Routing')
     await dirtybar.getByRole('button', { name: 'Save' }).click()
-    await expect(page.locator('.toast', { hasText: /Router saved/ }).first()).toBeVisible()
+    await expect(page.locator('.toast', { hasText: 'Settings saved.' }).first()).toBeVisible()
     await expect(dirtybar).toBeHidden({ timeout: 10000 })
 
     await page.reload()
@@ -502,7 +502,7 @@ test.describe('Settings modal', () => {
     await capture().setChecked(!initial)
     await expect(dirtybar()).toContainText('Unsaved changes in Advanced')
     await dirtybar().getByRole('button', { name: 'Save', exact: true }).click()
-    await expect(page.locator('.toast', { hasText: 'Conversation capture saved.' }).first()).toBeVisible()
+    await expect(page.locator('.toast', { hasText: 'Settings saved.' }).first()).toBeVisible()
     await expect(dirtybar()).toBeHidden({ timeout: 10000 })
 
     // Reload: the persisted value must survive a fresh modal.

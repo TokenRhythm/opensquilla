@@ -1039,7 +1039,7 @@
       "routerOutcomeSynchronized": "Router の推奨階層を保存済みの主用プロバイダーに同期しました。",
       "routerOutcomePreserved": "保存済みの Router 階層を保持しました。",
       "routerOutcomeDisabled": "モデルルーティングはオフです。保存済みの階層を保持しました。",
-      "primarySavedAdditionalFailed": "プロバイダーを保存しましたが、追加設定を保存できませんでした。再試行する前に設定を確認してください。",
+      "primarySavedAdditionalFailed": "プロバイダーは保存されました。残りの設定を保存できませんでした。編集内容は保持されています。",
       "title": "プロバイダー",
       "pageTitle": "モデルサービス",
       "pageDesc": "プロバイダーを接続し、認証情報とモデルを管理します。",
@@ -1357,7 +1357,7 @@
       "routerUseRecommended": "切り替え先の推奨ルートを使用",
       "routerDisablePreserve": "ルートを保持して Router をオフ",
       "alreadyActive": "対象プロバイダーは既に主用です。この認証情報の編集は保存されていません。",
-      "primarySaveUncertain": "保存結果を確認できません。下書きを保持しました。再試行前に保存済み設定を確認してください。主用になっていても認証情報の編集が保存されたとは限りません。"
+      "primarySaveUncertain": "保存結果を確認できませんでした。下書きは保持されています。"
     },
     "preset": {
       "modeCustom": "カスタム"
@@ -1379,8 +1379,8 @@
       "resetUpgradeHint": "推奨階層を一度に適用するには Gateway を更新してください。",
       "operationPending": "別のプロバイダーまたはルーティング操作が進行中です。",
       "activationUpgradeHint": "この Gateway は Router を安全に有効化できるか確認できません。更新してプロバイダーの競合を確認・解決してください。",
-      "savedRefreshFailed": "保存しましたが、最新の設定を取得できませんでした。次の変更の前に設定を再読み込みしてください。",
-      "resultUncertain": "保存結果が不明です。再試行する前に更新された設定を確認してください。",
+      "savedRefreshFailed": "保存しました。最新の設定を表示できないため、後で再読み込みしてください。",
+      "resultUncertain": "保存結果を確認できませんでした。変更内容は保持されています。",
       "resetTitle": "{provider} の推奨階層を使用しますか？",
       "resetBody": "保存済みと未保存の Router 階層の編集を {provider} の推奨階層に置き換えますか？現在のモードと Router スイッチは維持されます。他の未保存設定は保持されます。",
       "resetConfirm": "推奨階層に置き換える",
@@ -2075,8 +2075,16 @@
       "channelDisabled": "チャンネルを無効化しました。再起動が必要です。",
       "channelDisabledLive": "チャネルを無効化して停止しました。",
       "providerSavedAndActivated": "{provider} を保存し主用に設定しました。",
-      "modelStrategyPartialSaved": "一部のモデル設定は保存されました。主用への変更は完了していません。未保存の編集はフォームに保持されています。",
-      "modelStrategyPartialSaveUncertain": "一部のモデル設定は保存されました。主用への切り替え結果を確認できませんでした。保存済みの状態を確認してください。残りの編集はフォームに保持されています。"
+      "modelStrategyPartialSaved": "一部のモデル設定は保存されました。残りの編集はフォームに保持されています。",
+      "modelStrategyPartialSaveUncertain": "一部の設定は保存されました。残りの保存結果は確認できていません。変更内容は保持されています。",
+      "modelSettingsSaved": "モデル設定を保存しました。",
+      "modelSettingsSavedRestart": "モデル設定を保存しました。再起動が必要です。",
+      "settingsSaved": "設定を保存しました。",
+      "settingsSavedRestart": "設定を保存しました。再起動が必要です。",
+      "settingsPartialSaved": "保存済み：{saved}。{detail}",
+      "settingsSaveStopped": "保存を中止しました。残りの編集は保持されています。",
+      "settingsSaveCancelledPartial": "保存済み：{saved}。残りの変更は保持されています。",
+      "saveResultRestart": "{message} 再起動が必要です。"
     },
     "needs": {
       "noApiKey": "API キーは不要です。",

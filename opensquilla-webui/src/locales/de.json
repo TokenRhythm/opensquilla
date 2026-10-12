@@ -1039,7 +1039,7 @@
       "routerOutcomeSynchronized": "Router-Empfehlungen folgen jetzt dem gespeicherten Hauptanbieter.",
       "routerOutcomePreserved": "Gespeicherte Router-Stufen wurden beibehalten.",
       "routerOutcomeDisabled": "Modellrouting ist deaktiviert; gespeicherte Ebenen wurden beibehalten.",
-      "primarySavedAdditionalFailed": "Der Anbieter wurde gespeichert, weitere Einstellungen jedoch nicht. Prüfen Sie die Einstellungen vor einem erneuten Versuch.",
+      "primarySavedAdditionalFailed": "Der Anbieter wurde gespeichert. Die übrigen Einstellungen konnten nicht gespeichert werden; ihre Änderungen wurden behalten.",
       "title": "Anbieter",
       "pageTitle": "Modelldienst",
       "pageDesc": "Anbieter verbinden und ihre Zugangsdaten und Modelle verwalten.",
@@ -1357,7 +1357,7 @@
       "routerUseRecommended": "Empfohlene Routen des Zielanbieters verwenden",
       "routerDisablePreserve": "Routen behalten und Router deaktivieren",
       "alreadyActive": "Der Zielanbieter ist bereits primär. Diese Änderung der Zugangsdaten wurde nicht gespeichert.",
-      "primarySaveUncertain": "Das Speicherergebnis ist unklar. Ihr Entwurf wurde behalten. Prüfen Sie vor einem erneuten Versuch die Konfiguration; ein primärer Anbieter bestätigt nicht die Speicherung der Zugangsdaten."
+      "primarySaveUncertain": "Das Speicherergebnis konnte nicht bestätigt werden. Dein Entwurf wurde beibehalten."
     },
     "preset": {
       "modeCustom": "benutzerdefiniert"
@@ -1379,8 +1379,8 @@
       "resetUpgradeHint": "Gateway aktualisieren, um empfohlene Stufen atomar zu übernehmen.",
       "operationPending": "Ein Anbieter- oder Routingvorgang läuft bereits.",
       "activationUpgradeHint": "Dieses Gateway kann die sichere Router-Aktivierung nicht bestätigen. Aktualisieren Sie es, um Anbieterkonflikte zu prüfen und zu lösen.",
-      "savedRefreshFailed": "Gespeichert, aber die Einstellungen konnten nicht neu geladen werden. Vor weiteren Änderungen erneut laden.",
-      "resultUncertain": "Das Speicherergebnis ist unbekannt. Prüfen Sie die aktualisierten Einstellungen vor einem erneuten Versuch.",
+      "savedRefreshFailed": "Gespeichert. Die aktuellen Einstellungen sind vorübergehend nicht verfügbar. Bitte später neu laden.",
+      "resultUncertain": "Das Speicherergebnis konnte nicht bestätigt werden. Deine Änderungen wurden beibehalten.",
       "resetTitle": "Empfohlene Stufen von {provider} verwenden?",
       "resetBody": "Gespeicherte und ungespeicherte Router-Stufen durch Empfehlungen von {provider} ersetzen? Modus und Router-Schalter bleiben unverändert. Andere ungespeicherte Einstellungen bleiben erhalten.",
       "resetConfirm": "Durch Empfehlungen ersetzen",
@@ -2075,8 +2075,16 @@
       "channelDisabled": "Kanal deaktiviert. Neustart erforderlich.",
       "channelDisabledLive": "Kanal deaktiviert und gestoppt.",
       "providerSavedAndActivated": "{provider} wurde gespeichert und als primär festgelegt.",
-      "modelStrategyPartialSaved": "Einige Modelleinstellungen wurden gespeichert. Der Wechsel des primären Anbieters wurde nicht abgeschlossen; übrige Änderungen bleiben im Formular.",
-      "modelStrategyPartialSaveUncertain": "Einige Modelleinstellungen wurden gespeichert. Der Wechsel des primären Anbieters konnte nicht bestätigt werden; prüfen Sie den gespeicherten Zustand. Übrige Änderungen bleiben im Formular."
+      "modelStrategyPartialSaved": "Einige Modelleinstellungen wurden gespeichert. Übrige Änderungen bleiben im Formular.",
+      "modelStrategyPartialSaveUncertain": "Einige Einstellungen wurden gespeichert. Das Ergebnis der übrigen Speichervorgänge konnte nicht bestätigt werden; deine Änderungen wurden beibehalten.",
+      "modelSettingsSaved": "Modelleinstellungen gespeichert.",
+      "modelSettingsSavedRestart": "Modelleinstellungen gespeichert. Neustart erforderlich.",
+      "settingsSaved": "Einstellungen gespeichert.",
+      "settingsSavedRestart": "Einstellungen gespeichert. Neustart erforderlich.",
+      "settingsPartialSaved": "Gespeichert: {saved}. {detail}",
+      "settingsSaveStopped": "Speichern gestoppt. Übrige Änderungen wurden behalten.",
+      "settingsSaveCancelledPartial": "Gespeichert: {saved}. Die übrigen Änderungen wurden beibehalten.",
+      "saveResultRestart": "{message} Neustart erforderlich."
     },
     "needs": {
       "noApiKey": "Kein API-Schlüssel erforderlich.",

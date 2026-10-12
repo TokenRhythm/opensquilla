@@ -224,6 +224,118 @@ async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('avai
 }
 
 describe('primary provider transitions', () => {
+  it('keeps a cancelled settings-wide save silent when no earlier write was acknowledged', async () => {
+    const { api, app } = await primaryTransitionScenario(false, method => {
+      if (method === 'onboarding.llmProfile.activate') throw routerConflictForPrimary()
+      return { changed: true }
+    })
+    try {
+      api.setFixedProvider('tokenrhythm')
+      api.updateProviderField('api_key', 'synthetic-unsubmitted-key')
+      rpcCall.mockClear()
+      pushToast.mockClear()
+      await api.saveDirtySections()
+      expect(pushToast).not.toHaveBeenCalled()
+      expect(confirmChoiceAction).toHaveBeenCalledTimes(1)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.llmProfile.activate')).toHaveLength(1)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(0)
+      expect(api.modelStrategyPanel.value.single.providerId).toBe('tokenrhythm')
+      expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe('synthetic-unsubmitted-key')
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it.each(['earlier-section', 'model-substep', 'both'] as const)('reports only acknowledged changes after cancellation in one neutral result (%s)', async preceding => {
+    const scenario = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'onboarding.llmProfile.activate') throw routerConflictForPrimary()
+      if (method === 'config.patch.safe') Object.assign(scenario.saved, { naming: { enabled: false } })
+      if (method === 'onboarding.router.configure') scenario.saved.squilla_router.tiers = params?.tiers as typeof scenario.saved.squilla_router.tiers
+      return { changed: true, restartRequired: true }
+    })
+    const { api, app } = scenario
+    try {
+      if (preceding !== 'model-substep') api.setAutoSessionTitles(false)
+      if (preceding !== 'earlier-section') api.updateTierField('c1', 'model', 'openai/gpt-custom')
+      api.setFixedProvider('tokenrhythm')
+      api.updateCapabilityField('image', 'size', '512x512')
+      rpcCall.mockClear()
+      pushToast.mockClear()
+      await api.saveDirtySections()
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('Remaining edits were kept. Restart required.'), { tone: 'info' })
+      const message = pushToast.mock.calls[0]?.[0] as string
+      expect(message).toMatch(/^Saved:/)
+      if (preceding !== 'model-substep') expect(message).toContain('Session behavior')
+      expect(message.match(/Restart required/g)).toHaveLength(1)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.llmProfile.activate')).toHaveLength(1)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(preceding === 'earlier-section' ? 0 : 1)
+      expect(rpcCall.mock.calls.some(([method]) => method === 'onboarding.imageGeneration.configure')).toBe(false)
+      expect(api.modelStrategyPanel.value.single.providerId).toBe('tokenrhythm')
+      expect(api.sectionDirty('capabilities')).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it.each(['batch', 'model-substep'] as const)('keeps an acknowledged restart requirement when a later write fails (%s)', async scope => {
+    const { api, app } = await primaryTransitionScenario(false, method => {
+      if (method === (scope === 'batch' ? 'onboarding.router.configure' : 'onboarding.ensemble.configure')) {
+        throw new SetupWorkflowError('forbidden', 'Synthetic later rejection')
+      }
+      return { changed: true, restartRequired: true }
+    })
+    try {
+      if (scope === 'batch') api.setAutoSessionTitles(false)
+      else api.setEnsembleProposerMaxRetries(2)
+      api.updateTierField('c1', 'model', 'openai/gpt-custom')
+      rpcCall.mockClear()
+      pushToast.mockClear()
+      if (scope === 'batch') await api.saveDirtySections()
+      else expect(await api.saveModelStrategy()).toBe(false)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('Synthetic later rejection'), { tone: 'warn' })
+      const message = pushToast.mock.calls[0]?.[0] as string
+      expect(message.endsWith('Restart required.')).toBe(true)
+      expect(message.match(/Restart required/g)).toHaveLength(1)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(scope === 'batch' ? 0 : 1)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.router.configure')).toHaveLength(1)
+    } finally { app.unmount() }
+  })
+
+  it.each(['modelStrategy', 'provider'] as const)('keeps the restart requirement after a successful %s write and failed refresh', async section => {
+    const { api, app } = await primaryTransitionScenario(false, () => ({ changed: true, restartRequired: true }))
+    try {
+      if (section === 'modelStrategy') api.updateModelStrategyThinking('high')
+      if (section === 'provider') api.updateProviderField('api_key', 'synthetic-new-key')
+      const original = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method, params) => {
+        if (method === 'config.get') throw new Error('refresh unavailable')
+        return original(method, params)
+      })
+      rpcCall.mockClear()
+      pushToast.mockClear()
+      const save = { behavior: api.saveBehavior, modelStrategy: api.saveModelStrategy, provider: api.saveProvider }[section]
+      expect(await save()).toBe(false)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith('Saved. Updated settings are temporarily unavailable; refresh later. Restart required.', { tone: 'warn' })
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(1)
+    } finally { app.unmount() }
+  })
+
+  it('keeps the restart requirement when the provider was saved but a later setting was rejected', async () => {
+    const { api, app } = await primaryTransitionScenario(false, method => {
+      if (method === 'config.patch') throw new AppSettingsError('forbidden', 'Synthetic patch rejection')
+      return { changed: true, restartRequired: true }
+    })
+    try {
+      api.updateProviderField('api_key', 'synthetic-new-key')
+      api.updateLlmThinking('high')
+      rpcCall.mockClear()
+      pushToast.mockClear()
+      expect(await api.saveProvider()).toBe(false)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('Synthetic patch rejection'), { tone: 'warn' })
+      expect(pushToast.mock.calls[0]?.[0]).toMatch(/Restart required\.$/)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.provider.configure')).toHaveLength(1)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.patch')).toHaveLength(1)
+      expect(api.providerPanel.value.llmThinking).toBe('high')
+    } finally { app.unmount() }
+  })
+
   it.each(['first', 'list', 'save-and-activate', 'routing'] as const)('keeps drafts and submits no resolution when %s is cancelled', async entry => {
     const { api, app } = await primaryTransitionScenario(entry === 'first', method => {
       if (['onboarding.provider.configure', 'onboarding.llmProfile.activate', 'onboarding.llmProfile.upsertAndActivate'].includes(method)) throw routerConflictForPrimary()
@@ -315,7 +427,7 @@ describe('primary provider transitions', () => {
       expect(api.routerPanel.value.tierRows.find(row => row.name === 'c1')?.provider).toBe('tokenrhythm')
       expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe('synthetic-unacknowledged')
       expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.llmProfile.upsertAndActivate')).toHaveLength(1)
-      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('does not confirm'), { tone: 'danger' })
+      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('The save result could not be confirmed. Your draft was kept.'), { tone: 'danger' })
     } finally { app.unmount() }
   })
 
@@ -343,7 +455,7 @@ describe('primary provider transitions', () => {
       expect(api.config.value.llm_ensemble?.proposer_max_retries).toBe(2)
       const writes = rpcCall.mock.calls.map(([method]) => method).filter(method => ['onboarding.router.configure', 'onboarding.ensemble.configure', 'onboarding.llmProfile.activate'].includes(method))
       expect(writes).toEqual(['onboarding.router.configure', 'onboarding.ensemble.configure', 'onboarding.llmProfile.activate'])
-      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Some model settings were saved. The primary change could not be confirmed'), { tone: 'danger' })
+      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Some settings were saved. The remaining save result could not be confirmed'), { tone: 'warn' })
       expect(pushToast.mock.calls.some(([message]) => String(message).includes('was not completed'))).toBe(false)
       expect(confirmChoiceAction).not.toHaveBeenCalled()
     } finally { app.unmount() }
@@ -365,7 +477,7 @@ describe('primary provider transitions', () => {
       await expect(api.saveModelStrategy()).resolves.toBe(false)
       const writes = rpcCall.mock.calls.map(([method]) => method).filter(method => ['onboarding.router.configure', 'onboarding.ensemble.configure', 'onboarding.llmProfile.activate'].includes(method))
       expect(writes).toEqual(['onboarding.router.configure', 'onboarding.ensemble.configure', 'onboarding.llmProfile.activate'])
-      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Some model settings were saved'), { tone: 'danger' })
+      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Saved:'), { tone: 'info' })
       expect(api.modelStrategyPanel.value.single.providerId).toBe('tokenrhythm')
       expect(api.config.value.llm?.provider).toBe('openrouter')
       rpcCall.mockClear()
@@ -1886,7 +1998,7 @@ describe('useSetupCatalog model strategy IA', () => {
     api.setEnsembleMinSuccessful(1)
     expect(api.sectionDirty('modelStrategy')).toBe(false)
     expect(pushToast).toHaveBeenCalledWith(
-      expect.stringContaining('save result is unknown'),
+      expect.stringContaining('The save result could not be confirmed'),
       { tone: 'danger' },
     )
     app.unmount()
@@ -2044,7 +2156,7 @@ describe('useSetupCatalog model strategy IA', () => {
     ]))
     expect(api.sectionDirty('modelStrategy')).toBe(true)
     expect(pushToast).toHaveBeenCalledWith(
-      expect.stringContaining('save result is unknown'),
+      expect.stringContaining('The save result could not be confirmed'),
       { tone: 'danger' },
     )
     app.unmount()
@@ -2278,7 +2390,7 @@ describe('useSetupCatalog model strategy IA', () => {
     expect(api.sectionDirty('provider')).toBe(false)
     expect(api.providerDraftDirty.value).toBe(true)
 
-    await api.discardChanges()
+    api.cancelProviderEdit()
     expect(api.modelStrategyPanel.value.single.model).toBe('openrouter/auto')
     expect(api.sectionDirty('modelStrategy')).toBe(false)
     expect(api.providerDraftDirty.value).toBe(false)
@@ -2358,6 +2470,7 @@ describe('useSetupCatalog model strategy IA', () => {
   it.each([
     ['rejection', new AppSettingsError('invalid', 'Synthetic rejected preference')],
     ['timeout', new AppSettingsError('unavailable', 'Synthetic RPC request timed out')],
+    ['invalid-response', new Error('config.patch.safe returned an invalid response')],
   ] as const)('retains the behavior draft after %s without success or an automatic retry', async (_kind, error) => {
     mockConfigSequence([{ naming: { enabled: false } }])
     const { api, app } = await mountCatalog()
@@ -2376,6 +2489,9 @@ describe('useSetupCatalog model strategy IA', () => {
       expect(api.sectionDirty('general')).toBe(true)
       expect(api.saveAllPending.value).toBe(false)
       expect(pushToast).toHaveBeenCalledExactlyOnceWith(expect.any(String), { tone: 'danger' })
+      if (_kind !== 'rejection') {
+        expect(pushToast).toHaveBeenCalledWith('The save result could not be confirmed. Your changes were kept.', { tone: 'danger' })
+      }
     } finally { app.unmount() }
   })
 
@@ -2389,11 +2505,12 @@ describe('useSetupCatalog model strategy IA', () => {
       llm_ensemble: { enabled: false },
     }])
     const { api, app } = await mountCatalog()
+    const original = rpcCall.getMockImplementation()!
     rpcCall.mockClear()
-    rpcCall.mockImplementation(async method => {
+    rpcCall.mockImplementation(async (method, params) => {
       if (method === 'config.patch.safe') return { restartRequired: false }
       if (method === 'config.patch') return modelSave
-      throw new Error(`Unexpected RPC method: ${method}`)
+      return original(method, params)
     })
     try {
       api.setAutoSessionTitles(true)
@@ -2412,7 +2529,8 @@ describe('useSetupCatalog model strategy IA', () => {
       expect(api.saveAllPending.value).toBe(false)
       expect(api.sectionDirty('general')).toBe(false)
       expect(api.sectionDirty('modelStrategy')).toBe(true)
-      expect(rpcCall.mock.calls.map(([method]) => method)).toEqual(['config.patch.safe', 'config.patch'])
+      expect(rpcCall.mock.calls.filter(([method]) => method.startsWith('config.patch')).map(([method]) => method)).toEqual(['config.patch.safe', 'config.patch'])
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(1)
     } finally { app.unmount() }
   })
 
@@ -7592,7 +7710,7 @@ describe('recommended Router reset and activation safety', () => {
     expect(confirmChoiceAction).not.toHaveBeenCalled()
     await api.resetRecommendedRouter()
     expect(rpcCall.mock.calls.filter(([method]) => method === 'models.routing.resetRecommended')).toHaveLength(1)
-    expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('save result is unknown'), { tone: 'danger' })
+    expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('The save result could not be confirmed'), { tone: 'danger' })
     app.unmount()
   })
 
@@ -7613,6 +7731,105 @@ describe('recommended Router reset and activation safety', () => {
 
 
 describe('capacity save integration', () => {
+  it('keeps a secondary provider selected with its unsaved fields when global drafts are discarded', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      await api.requestSelectConfiguredProvider('tokenrhythm')
+      api.updateProviderField('model', 'secondary-draft-model')
+      api.updateProviderField('api_key', 'synthetic-secondary-draft-key')
+      api.setRouterDefaultTier('c2')
+      await api.discardChanges()
+      expect(api.hasUnsavedChanges.value).toBe(false)
+      expect(api.providerDraftDirty.value).toBe(true)
+      expect(api.providerPanel.value.providerSelected).toBe('tokenrhythm')
+      expect(api.providerPanel.value.providerFieldValue({ name: 'model', label: 'Model' })).toBe('secondary-draft-model')
+      expect(api.providerPanel.value.providerFieldValue({ name: 'api_key', label: 'Key' })).toBe('synthetic-secondary-draft-key')
+    } finally { app.unmount() }
+  })
+
+  it('retains both global and provider drafts if reading the saved settings fails during discard', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      const target = { provider: 'openrouter', model: 'openai/gpt-4.1-mini' }
+      api.modelCapacity.ensure(target)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBeGreaterThan(0))
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'modelStrategy')
+      api.updateProviderField('api_key', 'synthetic-retained-provider-key')
+      api.setRouterDefaultTier('c2')
+      const original = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method, params) => {
+        if (method === 'config.get') throw new Error('synthetic refresh failure')
+        return original(method, params)
+      })
+      await api.discardChanges()
+      expect(api.hasUnsavedChanges.value).toBe(true)
+      expect(api.providerDraftDirty.value).toBe(true)
+      expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
+      expect(api.providerPanel.value.providerFieldValue({ name: 'api_key', label: 'Key' })).toBe('synthetic-retained-provider-key')
+      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('synthetic refresh failure'), { tone: 'danger' })
+    } finally { app.unmount() }
+  })
+
+  it('discards global drafts without losing the provider editor or its capacity changes', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      const providerTarget = { provider: 'openrouter', model: 'openai/gpt-4.1-mini' }
+      const routingTarget = { provider: 'tokenrhythm', model: 'gpt-4.1-mini' }
+      api.modelCapacity.ensure(providerTarget)
+      api.modelCapacity.ensure(routingTarget)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBe(2))
+      api.modelCapacity.update(providerTarget, { contextWindow: '65536', maxOutputTokens: '' }, 'provider:openrouter')
+      api.modelCapacity.update(routingTarget, { contextWindow: '32768', maxOutputTokens: '' }, 'modelStrategy')
+      api.updateProviderField('model', 'provider-draft-model')
+      api.updateProviderField('api_key', 'synthetic-unsaved-provider-key')
+      api.updateLlmThinking('high')
+      api.updateLlmTimeout(180)
+      api.setRouterDefaultTier('c2')
+      rpcCall.mockClear()
+
+      await api.discardChanges()
+
+      expect(api.hasUnsavedChanges.value).toBe(false)
+      expect(api.providerDraftDirty.value).toBe(true)
+      expect(api.providerPanel.value.providerSelected).toBe('openrouter')
+      expect(api.providerPanel.value.providerFieldValue({ name: 'api_key', label: 'Key' })).toBe('synthetic-unsaved-provider-key')
+      expect(api.modelStrategyPanel.value.single.model).toBe('provider-draft-model')
+      expect(api.providerPanel.value.llmThinking).toBe('high')
+      expect(api.providerPanel.value.llmTimeoutSeconds).toBe(180)
+      expect(api.modelCapacity.values(providerTarget).contextWindow).toBe('65536')
+      expect(api.modelCapacity.dirty('provider:openrouter')).toBe(true)
+      expect(api.modelCapacity.dirty('modelStrategy')).toBe(false)
+      expect(rpcCall.mock.calls.some(([method]) => /configure|patch|activate/.test(method))).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('does not restore discarded routing snapshots when the retained provider draft is cancelled', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      const target = { provider: 'openrouter', model: 'openai/gpt-4.1-mini' }
+      api.modelCapacity.ensure(target)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBeGreaterThan(0))
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'modelStrategy')
+      api.setFixedModel('routing-draft-model')
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.modelCapacity.update(target, { contextWindow: '131072', maxOutputTokens: '' }, 'provider:openrouter')
+      api.updateProviderField('model', 'provider-draft-model')
+      api.updateLlmThinking('low')
+      await api.discardChanges()
+      expect(api.providerDraftDirty.value).toBe(true)
+      expect(api.modelStrategyPanel.value.single.model).toBe('provider-draft-model')
+      expect(api.modelCapacity.values(target).contextWindow).toBe('131072')
+      api.cancelProviderEdit()
+      expect(api.hasUnsavedChanges.value).toBe(false)
+      expect(api.providerDraftDirty.value).toBe(false)
+      expect(api.modelStrategyPanel.value.single.model).toBe('openai/gpt-4.1-mini')
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('')
+      expect(api.modelCapacity.dirty('modelStrategy')).toBe(false)
+      expect(api.modelCapacity.dirty('provider:openrouter')).toBe(false)
+    } finally { app.unmount() }
+  })
+
   it.each(['131072', ''])('restores the prior routing draft when provider editing is cancelled after entering %s', async value => {
     const { api, app } = await primaryTransitionScenario()
     try {
@@ -7648,7 +7865,7 @@ describe('capacity save integration', () => {
         scenario.saved.squilla_router.tiers.c0.model = String((params?.tiers as Record<string, { model: string }>).c0!.model)
         return { changed: true }
       }
-      if (method === 'config.patch.safe') throw new Error('synthetic style save failure')
+      if (method === 'config.patch.safe') throw new AppSettingsError('invalid', 'synthetic style save failure')
       return { changed: true }
     })
     const { api, app } = scenario
@@ -7660,7 +7877,7 @@ describe('capacity save integration', () => {
       api.setRouterVisualMode('legacy_grid')
       api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'modelStrategy')
       expect(await api.saveModelStrategy()).toBe(false)
-      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Saved: Intelligent model routing. Not saved: Routing decision panel style, Model settings.'), { tone: 'danger' })
+      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Saved: Intelligent model routing. Not saved: Routing decision panel style, Model settings.'), { tone: 'warn' })
       expect(api.modelStrategyPanel.value.router.routerVisualMode).toBe('legacy_grid')
       expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
       rpcCall.mockClear()
@@ -7675,7 +7892,7 @@ describe('capacity save integration', () => {
         scenario.saved.squilla_router.tiers.c0.model = String((params?.tiers as Record<string, { model: string }>).c0!.model)
         return { changed: true }
       }
-      if (method === 'config.patch' && params?.patch) throw new Error('synthetic capacity save failure')
+      if (method === 'config.patch' && params?.patch) throw new AppSettingsError('invalid', 'synthetic capacity save failure')
       return { changed: true }
     })
     const { api, app } = scenario
@@ -7688,7 +7905,7 @@ describe('capacity save integration', () => {
       expect(await api.saveModelStrategy()).toBe(false)
       expect(api.modelStrategyPanel.value.router.tierRows[0]?.model).toBe('saved-new-route')
       expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
-      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Saved: Intelligent model routing. Not saved: Model settings.'), { tone: 'danger' })
+      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Saved: Intelligent model routing. Not saved: Model settings.'), { tone: 'warn' })
       rpcCall.mockClear()
       await api.saveModelStrategy({ reload: false })
       expect(rpcCall.mock.calls.some(([method]) => method === 'onboarding.router.configure')).toBe(false)
@@ -7714,21 +7931,26 @@ describe('capacity save integration', () => {
       expect(api.modelCapacity.dirty(scope)).toBe(false)
     } finally { app.unmount() }
   })
-  it('retains a rejected capacity patch and submits no second write for invalid values', async () => {
+  it.each(['provider', 'modelStrategy'] as const)('retains an unacknowledged capacity patch and submits no second write for invalid values (%s)', async location => {
     const { api, app } = await primaryTransitionScenario(false, method => {
-      if (method === 'config.patch') throw new Error('synthetic disk failure')
+      if (method === 'config.patch') throw new AppSettingsError('unavailable', 'transport timeout')
       return { changed: true }
     })
     try {
       const target = { provider: 'openrouter', model: 'example.v1/model:latest' }
       api.modelCapacity.ensure(target)
       await Promise.resolve(); await Promise.resolve(); await nextTick()
-      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'modelStrategy')
-      expect(await api.saveModelStrategy({ reload: false })).toBe(false)
-      expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
-      api.modelCapacity.update(target, { contextWindow: '-1', maxOutputTokens: '' }, 'modelStrategy')
+      const scope = location === 'provider' ? 'provider:openrouter' : 'modelStrategy'
+      const save = location === 'provider' ? api.saveProvider : api.saveModelStrategy
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, scope)
       rpcCall.mockClear()
-      expect(await api.saveModelStrategy({ reload: false })).toBe(false)
+      expect(await save({ reload: false })).toBe(false)
+      expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(0)
+      expect(pushToast).toHaveBeenCalledWith('The save result could not be confirmed. Your changes were kept.', { tone: 'danger' })
+      api.modelCapacity.update(target, { contextWindow: '-1', maxOutputTokens: '' }, scope)
+      rpcCall.mockClear()
+      expect(await save({ reload: false })).toBe(false)
       expect(rpcCall).not.toHaveBeenCalled()
     } finally { app.unmount() }
   })
@@ -7920,6 +8142,326 @@ describe('partial thinking save acknowledgement', () => {
   })
 })
 
+
+describe('settings operation feedback', () => {
+  it.each([false, true])('keeps a first model-write timeout honest without replaying (batch: %s)', async batch => {
+    const { api, app } = await primaryTransitionScenario(false, method => {
+      if (method === 'onboarding.router.configure') throw new SetupWorkflowError('unavailable', 'transport timeout')
+      return { changed: true }
+    })
+    try {
+      api.setRouterMode('disabled')
+      rpcCall.mockClear()
+      pushToast.mockClear()
+      if (batch) await api.saveDirtySections()
+      else expect(await api.saveModelStrategy()).toBe(false)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith('The save result could not be confirmed. Your changes were kept.', { tone: 'danger' })
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.router.configure')).toHaveLength(1)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(batch ? 1 : 0)
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it.each(['modelStrategy', 'provider'] as const)('does not label an unacknowledged capacity write as unsaved after another write succeeded (%s)', async section => {
+    const { api, app } = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'config.patch' && params?.patch) throw new AppSettingsError('unavailable', 'transport timeout')
+      return { changed: true }
+    })
+    try {
+      const target = { provider: 'openrouter', model: 'example.v1/model:latest' }
+      api.modelCapacity.ensure(target)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBeGreaterThan(0))
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, section === 'provider' ? 'provider:openrouter' : 'modelStrategy')
+      if (section === 'provider') api.updateLlmThinking('high')
+      else api.updateModelStrategyThinking('high')
+      rpcCall.mockClear()
+      pushToast.mockClear()
+      expect(await (section === 'provider' ? api.saveProvider() : api.saveModelStrategy())).toBe(false)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith('Some settings were saved. The remaining save result could not be confirmed; your changes were kept.', { tone: 'warn' })
+      expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
+      expect(rpcCall.mock.calls.filter(([method, params]) => method === 'config.patch' && params?.patch)).toHaveLength(1)
+    } finally { app.unmount() }
+  })
+
+  it('rebases an individually saved section without clearing unrelated drafts or credentials', async () => {
+    const scenario = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'onboarding.search.configure') Object.assign(scenario.saved, { search_max_results: params?.maxResults })
+      return { changed: true }
+    })
+    const { api, app } = scenario
+    try {
+      api.setAutoSessionTitles(false)
+      api.updateProviderField('api_key', 'unsubmitted-provider-key')
+      api.setFixedModel('unsaved-model')
+      api.updateCapabilityField('image', 'apiKey', 'unsubmitted-image-key')
+      api.updateCapabilityField('search', 'maxResults', 25)
+      pushToast.mockClear()
+      expect(await api.saveSearch()).toBe(true)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith('Search saved.')
+      expect(api.behaviorPanel.value.autoSessionTitles).toBe(false)
+      expect(api.modelStrategyPanel.value.single.model).toBe('unsaved-model')
+      expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe('unsubmitted-provider-key')
+      expect(api.sectionDirty('general')).toBe(true)
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(api.sectionDirty('capabilities')).toBe(true)
+      rpcCall.mockClear()
+      await api.saveDirtySections()
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.search.configure')).toHaveLength(0)
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.imageGeneration.configure', expect.objectContaining({ apiKey: 'unsubmitted-image-key' }))
+    } finally { app.unmount() }
+  })
+
+  it.each(['unknownSection', 'partialModel', 'unknownPrimary'] as const)('uses one read-back for the entire failed batch (%s)', async failure => {
+    const scenario = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'config.patch.safe') Object.assign(scenario.saved, { naming: { enabled: false } })
+      if (method === 'onboarding.router.configure') scenario.saved.squilla_router.enabled = params?.enabled === true
+      if (method === 'onboarding.search.configure' && failure === 'unknownSection') throw new SetupWorkflowError('unavailable', 'transport timeout')
+      if (method === 'onboarding.ensemble.configure' && failure === 'partialModel') throw new SetupWorkflowError('forbidden', 'Ensemble disabled')
+      if (method === 'onboarding.llmProfile.activate' && failure === 'unknownPrimary') throw new SetupWorkflowError('unavailable', 'transport timeout')
+      return { changed: true }
+    })
+    const { api, app } = scenario
+    try {
+      api.setAutoSessionTitles(false)
+      if (failure === 'unknownSection') api.updateCapabilityField('search', 'maxResults', 25)
+      if (failure === 'partialModel') {
+        api.setRouterMode('disabled')
+        api.setEnsembleProposerMaxRetries(2)
+      }
+      if (failure === 'unknownPrimary') api.setFixedProvider('tokenrhythm')
+      rpcCall.mockClear()
+      pushToast.mockClear()
+      await api.saveDirtySections()
+      expect(pushToast).toHaveBeenCalledTimes(1)
+      expect(pushToast.mock.calls[0]?.[1]).toEqual({ tone: 'warn' })
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(1)
+      expect(api.sectionDirty('general')).toBe(false)
+      const failedMethod = { unknownSection: 'onboarding.search.configure', partialModel: 'onboarding.ensemble.configure', unknownPrimary: 'onboarding.llmProfile.activate' }[failure]
+      expect(rpcCall.mock.calls.filter(([method]) => method === failedMethod)).toHaveLength(1)
+    } finally { app.unmount() }
+  })
+
+  it('combines primary-save completion and its Router outcome in one notification', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.updateProviderField('api_key', 'synthetic-primary-draft')
+      pushToast.mockClear()
+      expect(await api.saveProvider()).toBe(true)
+      expect(pushToast).toHaveBeenCalledTimes(1)
+      expect(pushToast.mock.calls[0]?.[0]).toContain('saved')
+      expect(pushToast.mock.calls[0]?.[0]).toContain('Saved Router tiers were preserved.')
+    } finally { app.unmount() }
+  })
+
+  it('emits one notification for a settings-wide save and rebases only its submitted sections', async () => {
+    const scenario = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'config.patch.safe') Object.assign(scenario.saved, { naming: { enabled: false } })
+      if (method === 'onboarding.router.configure') scenario.saved.squilla_router.enabled = params?.enabled === true
+      return { changed: true }
+    })
+    const { api, app } = scenario
+    try {
+      api.setAutoSessionTitles(false)
+      api.setRouterMode('disabled')
+      api.updateProviderField('api_key', 'unsubmitted-provider-draft')
+      pushToast.mockClear()
+      await api.saveDirtySections()
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith('Settings saved.')
+      expect(api.sectionDirty('general')).toBe(false)
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+      expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe('unsubmitted-provider-draft')
+    } finally { app.unmount() }
+  })
+
+  it.each([false, true])('combines batch partial success and the rejection while retaining remaining drafts (read-back fails: %s)', async readbackFails => {
+    const scenario = await primaryTransitionScenario(false, (method) => {
+      if (method === 'config.patch.safe') Object.assign(scenario.saved, { naming: { enabled: false } })
+      if (method === 'onboarding.router.configure') throw new SetupWorkflowError('forbidden', 'Routing changes are disabled')
+      return { changed: true }
+    })
+    const { api, app } = scenario
+    try {
+      api.setAutoSessionTitles(false)
+      api.setRouterMode('disabled')
+      api.updateCapabilityField('image', 'size', '512x512')
+      if (readbackFails) {
+        const original = rpcCall.getMockImplementation()!
+        rpcCall.mockImplementation(async (method, params) => {
+          if (method === 'config.get') throw new Error('refresh unavailable')
+          return original(method, params)
+        })
+      }
+      pushToast.mockClear()
+      await api.saveDirtySections()
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('Saved: Session behavior.'), { tone: 'warn' })
+      expect(pushToast.mock.calls[0]?.[0]).toContain('Routing changes are disabled')
+      expect(api.behaviorPanel.value.autoSessionTitles).toBe(false)
+      if (!readbackFails) expect(api.sectionDirty('general')).toBe(false)
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(api.sectionDirty('capabilities')).toBe(true)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.router.configure')).toHaveLength(1)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.imageGeneration.configure')).toHaveLength(0)
+    } finally { app.unmount() }
+  })
+
+  it.each([false, true])('reports batch acknowledged writes with a failed final read as one warning (restart: %s)', async restartRequired => {
+    const { api, app } = await primaryTransitionScenario(false, method => ({ restartRequired: restartRequired && method === 'config.patch.safe' }))
+    try {
+      api.setAutoSessionTitles(false)
+      api.setRouterMode('disabled')
+      const original = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method, params) => {
+        if (method === 'config.get') throw new Error('refresh unavailable')
+        return original(method, params)
+      })
+      pushToast.mockClear()
+      await api.saveDirtySections()
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(`Saved. Updated settings are temporarily unavailable; refresh later.${restartRequired ? ' Restart required.' : ''}`, { tone: 'warn' })
+      expect(api.behaviorPanel.value.autoSessionTitles).toBe(false)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.router.configure')).toHaveLength(1)
+    } finally { app.unmount() }
+  })
+
+  it('keeps the restart requirement in the single combined success notification', async () => {
+    const { api, app } = await primaryTransitionScenario(false, method => ({ restartRequired: method === 'config.patch.safe' }))
+    try {
+      api.setAutoSessionTitles(false)
+      api.setRouterMode('disabled')
+      pushToast.mockClear()
+      await api.saveDirtySections()
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith('Settings saved. Restart required.')
+    } finally { app.unmount() }
+  })
+
+  it.each(['search', 'image', 'audio'] as const)('keeps a single %s save acknowledged when its subsequent refresh fails', async section => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.setAutoSessionTitles(false)
+      api.updateCapabilityField('search', 'maxResults', 25)
+      api.updateCapabilityField('image', 'size', '512x512')
+      api.updateCapabilityField('audio', 'ttsVoice', 'draft-voice')
+      const original = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method, params) => {
+        if (method === 'config.get') throw new Error('refresh unavailable')
+        return original(method, params)
+      })
+      pushToast.mockClear()
+      const save = { behavior: api.saveBehavior, search: api.saveSearch, image: api.saveImage, audio: api.saveAudio }[section]
+      expect(await save()).toBe(false)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith('Saved. Updated settings are temporarily unavailable; refresh later.', { tone: 'warn' })
+      expect(api.behaviorPanel.value.autoSessionTitles).toBe(false)
+      expect(api.sectionDirty('capabilities')).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it('combines a lost save response and failed read-back into one notice without losing the key draft or replaying', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      await api.requestAddProvider('tokenrhythm')
+      api.updateProviderField('api_key', 'synthetic-draft')
+      const original = rpcCall.getMockImplementation()!
+      let submitted = false
+      rpcCall.mockImplementation(async (method, params) => {
+        if (method === 'onboarding.llmProfile.upsertAndActivate') {
+          submitted = true
+          throw new SetupWorkflowError('unavailable', 'transport timeout')
+        }
+        if (submitted && method === 'config.get') throw new Error('refresh unavailable')
+        return original(method, params)
+      })
+      pushToast.mockClear()
+      expect(await api.saveProviderAndActivate()).toBe(false)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith('The save result could not be confirmed. Your draft was kept.', { tone: 'danger' })
+      expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe('synthetic-draft')
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.llmProfile.upsertAndActivate')).toHaveLength(1)
+    } finally { app.unmount() }
+  })
+
+  it('distinguishes an acknowledged provider save from a failed refresh in one warning', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      await api.requestAddProvider('tokenrhythm')
+      api.updateProviderField('api_key', 'synthetic-draft')
+      const original = rpcCall.getMockImplementation()!
+      let submitted = false
+      rpcCall.mockImplementation(async (method, params) => {
+        if (method === 'onboarding.llmProfile.upsert') submitted = true
+        if (submitted && method === 'config.get') throw new Error('refresh unavailable')
+        return original(method, params)
+      })
+      pushToast.mockClear()
+      expect(await api.saveProvider()).toBe(false)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith('Saved. Updated settings are temporarily unavailable; refresh later.', { tone: 'warn' })
+      expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe('synthetic-draft')
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.llmProfile.upsert')).toHaveLength(1)
+    } finally { app.unmount() }
+  })
+
+  it('keeps a definite rejection reason and does not silently retry', async () => {
+    const { api, app } = await primaryTransitionScenario(false, method => {
+      if (method === 'onboarding.llmProfile.upsertAndActivate') throw new SetupWorkflowError('forbidden', 'Policy denies this provider')
+      return { changed: true }
+    })
+    try {
+      await api.requestAddProvider('tokenrhythm')
+      api.updateProviderField('api_key', 'synthetic-draft')
+      pushToast.mockClear()
+      expect(await api.saveProviderAndActivate()).toBe(false)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('Policy denies this provider'), { tone: 'danger' })
+      expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe('synthetic-draft')
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.llmProfile.upsertAndActivate')).toHaveLength(1)
+    } finally { app.unmount() }
+  })
+
+  it('reports a multi-step model save once, after all writes and the read-back succeed', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.setRouterMode('disabled')
+      api.setEnsembleProposerMaxRetries(2)
+      pushToast.mockClear()
+      expect(await api.saveModelStrategy()).toBe(true)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith('Model settings saved.')
+    } finally { app.unmount() }
+  })
+
+  it('reports an acknowledged model save with a failed read-back once as a warning', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.setRouterMode('disabled')
+      api.setEnsembleProposerMaxRetries(2)
+      const original = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method, params) => {
+        if (method === 'config.get') throw new Error('refresh unavailable')
+        return original(method, params)
+      })
+      pushToast.mockClear()
+      expect(await api.saveModelStrategy()).toBe(false)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith('Saved. Updated settings are temporarily unavailable; refresh later.', { tone: 'warn' })
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.router.configure')).toHaveLength(1)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.ensemble.configure')).toHaveLength(1)
+    } finally { app.unmount() }
+  })
+
+  it('merges partial success, a definite rejection and a failed read-back into one warning', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.setRouterMode('disabled')
+      api.setEnsembleProposerMaxRetries(2)
+      const original = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method, params) => {
+        if (method === 'onboarding.ensemble.configure') throw new SetupWorkflowError('invalid', 'Minimum candidate count is two')
+        if (method === 'config.get') throw new Error('refresh unavailable')
+        return original(method, params)
+      })
+      pushToast.mockClear()
+      expect(await api.saveModelStrategy()).toBe(false)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('Minimum candidate count is two'), { tone: 'warn' })
+      expect(pushToast.mock.calls[0]?.[0]).toContain('Some model settings were saved')
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.ensemble.configure')).toHaveLength(1)
+    } finally { app.unmount() }
+  })
+})
 
 describe('unacknowledged provider thinking patches', () => {
   async function rejectedPatchScenario(committed = false, readbackFails = false) {

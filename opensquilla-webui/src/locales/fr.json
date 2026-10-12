@@ -1039,7 +1039,7 @@
       "routerOutcomeSynchronized": "Les recommandations du Router suivent le fournisseur principal enregistré.",
       "routerOutcomePreserved": "Les niveaux enregistrés du Router ont été conservés.",
       "routerOutcomeDisabled": "Le routage des modèles est désactivé ; les niveaux enregistrés ont été conservés.",
-      "primarySavedAdditionalFailed": "Le fournisseur a été enregistré, mais les paramètres supplémentaires n’ont pas pu l’être. Vérifiez-les avant de réessayer.",
+      "primarySavedAdditionalFailed": "Le fournisseur a été enregistré. Les autres paramètres n’ont pas pu être enregistrés ; leurs modifications sont conservées.",
       "title": "Fournisseur",
       "pageTitle": "Service de modèles",
       "pageDesc": "Connectez des fournisseurs et gérez leurs identifiants et modèles.",
@@ -1357,7 +1357,7 @@
       "routerUseRecommended": "Utiliser les routes recommandées du fournisseur cible",
       "routerDisablePreserve": "Conserver les routes et désactiver Router",
       "alreadyActive": "Le fournisseur cible est déjà principal. Cette modification des identifiants n’a pas été enregistrée.",
-      "primarySaveUncertain": "Le résultat de l’enregistrement est incertain. Le brouillon a été conservé. Vérifiez la configuration avant de réessayer ; un fournisseur actif ne confirme pas la sauvegarde des identifiants."
+      "primarySaveUncertain": "Le résultat de l’enregistrement n’a pas pu être confirmé. Votre brouillon a été conservé."
     },
     "preset": {
       "modeCustom": "personnalisé"
@@ -1379,8 +1379,8 @@
       "resetUpgradeHint": "Mettez à jour le Gateway pour appliquer les niveaux recommandés en une seule opération.",
       "operationPending": "Une opération de fournisseur ou de routage est en cours.",
       "activationUpgradeHint": "Ce Gateway ne peut pas confirmer une activation sûre du Router. Mettez-le à jour pour examiner et résoudre les conflits de fournisseurs.",
-      "savedRefreshFailed": "Enregistré, mais les paramètres n’ont pas pu être actualisés. Rechargez-les avant toute autre modification.",
-      "resultUncertain": "Le résultat de l’enregistrement est inconnu. Vérifiez les paramètres actualisés avant de réessayer.",
+      "savedRefreshFailed": "Enregistré. Les paramètres actualisés sont temporairement indisponibles ; actualisez plus tard.",
+      "resultUncertain": "Le résultat de l’enregistrement n’a pas pu être confirmé. Vos modifications ont été conservées.",
       "resetTitle": "Utiliser les niveaux recommandés de {provider} ?",
       "resetBody": "Remplacer les modifications enregistrées et non enregistrées des niveaux du Router par les recommandations de {provider} ? Le mode et l’interrupteur du Router restent inchangés. Les autres paramètres non enregistrés sont conservés.",
       "resetConfirm": "Remplacer par les recommandations",
@@ -2075,8 +2075,16 @@
       "channelDisabled": "Canal désactivé. Redémarrage requis.",
       "channelDisabledLive": "Canal désactivé et arrêté.",
       "providerSavedAndActivated": "{provider} a été enregistré et défini comme principal.",
-      "modelStrategyPartialSaved": "Certains paramètres ont été enregistrés. Le changement de fournisseur principal n’a pas abouti ; les modifications restantes sont conservées.",
-      "modelStrategyPartialSaveUncertain": "Certains paramètres ont été enregistrés. Le changement de fournisseur principal n’a pas pu être confirmé ; vérifiez l’état enregistré. Les modifications restantes sont conservées."
+      "modelStrategyPartialSaved": "Certains paramètres du modèle ont été enregistrés. Les modifications restantes sont conservées dans le formulaire.",
+      "modelStrategyPartialSaveUncertain": "Certains paramètres ont été enregistrés. Le résultat des autres enregistrements n’a pas pu être confirmé ; vos modifications ont été conservées.",
+      "modelSettingsSaved": "Paramètres du modèle enregistrés.",
+      "modelSettingsSavedRestart": "Paramètres du modèle enregistrés. Redémarrage nécessaire.",
+      "settingsSaved": "Paramètres enregistrés.",
+      "settingsSavedRestart": "Paramètres enregistrés. Redémarrage nécessaire.",
+      "settingsPartialSaved": "Enregistré : {saved}. {detail}",
+      "settingsSaveStopped": "L’enregistrement a été arrêté. Les modifications restantes sont conservées.",
+      "settingsSaveCancelledPartial": "Enregistré : {saved}. Les autres modifications sont conservées.",
+      "saveResultRestart": "{message} Un redémarrage est nécessaire."
     },
     "needs": {
       "noApiKey": "Aucune clé API requise.",

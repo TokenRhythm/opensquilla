@@ -1039,7 +1039,7 @@
       "routerOutcomeSynchronized": "Router recommendations now follow the saved primary provider.",
       "routerOutcomePreserved": "Saved Router tiers were preserved.",
       "routerOutcomeDisabled": "Model Routing was turned off; saved tiers were preserved.",
-      "primarySavedAdditionalFailed": "The provider was saved, but additional settings could not be saved. Review settings before retrying.",
+      "primarySavedAdditionalFailed": "The provider was saved. Remaining settings could not be saved; their edits were kept.",
       "title": "Provider",
       "pageTitle": "Model Service",
       "pageDesc": "Connect providers and manage their credentials and models.",
@@ -1357,7 +1357,7 @@
       "routerUseRecommended": "Use the target provider’s recommended routes",
       "routerDisablePreserve": "Keep routes and turn Router off",
       "alreadyActive": "The target provider is already primary. This credential edit was not saved.",
-      "primarySaveUncertain": "The save result could not be confirmed. Your draft was kept. Check the saved configuration before retrying; an active provider alone does not confirm that credential edits were saved."
+      "primarySaveUncertain": "The save result could not be confirmed. Your draft was kept."
     },
     "preset": {
       "modeCustom": "custom tiers"
@@ -1379,8 +1379,8 @@
       "resetUpgradeHint": "Upgrade the Gateway to use recommended tiers in one operation.",
       "operationPending": "Another provider or routing operation is in progress.",
       "activationUpgradeHint": "This Gateway cannot confirm safe Router activation. Upgrade the Gateway to review and resolve provider conflicts.",
-      "savedRefreshFailed": "Saved, but the updated settings could not be refreshed. Reload settings before making another change.",
-      "resultUncertain": "The save result is unknown. Review refreshed settings before trying again.",
+      "savedRefreshFailed": "Saved. Updated settings are temporarily unavailable; refresh later.",
+      "resultUncertain": "The save result could not be confirmed. Your changes were kept.",
       "resetTitle": "Use {provider} recommended tiers?",
       "resetBody": "Replace saved and unsaved Router tier edits with {provider} recommended tiers? The current mode and Router switch stay unchanged. Other unsaved settings are kept.",
       "resetConfirm": "Replace recommended tiers",
@@ -2075,8 +2075,16 @@
       "channelDisabled": "Channel disabled. Restart required.",
       "channelDisabledLive": "Channel disabled and stopped.",
       "providerSavedAndActivated": "{provider} was saved and set as primary.",
-      "modelStrategyPartialSaved": "Some model settings were saved. The primary change was not completed; remaining edits are still in the form.",
-      "modelStrategyPartialSaveUncertain": "Some model settings were saved. The primary change could not be confirmed; check the saved state. Remaining edits are still in the form."
+      "modelStrategyPartialSaved": "Some model settings were saved. Remaining edits are still in the form.",
+      "modelStrategyPartialSaveUncertain": "Some settings were saved. The remaining save result could not be confirmed; your changes were kept.",
+      "modelSettingsSaved": "Model settings saved.",
+      "modelSettingsSavedRestart": "Model settings saved. Restart required.",
+      "settingsSaved": "Settings saved.",
+      "settingsSavedRestart": "Settings saved. Restart required.",
+      "settingsPartialSaved": "Saved: {saved}. {detail}",
+      "settingsSaveStopped": "Saving stopped. Remaining edits were kept.",
+      "settingsSaveCancelledPartial": "Saved: {saved}. Remaining edits were kept.",
+      "saveResultRestart": "{message} Restart required."
     },
     "needs": {
       "noApiKey": "No API key required.",

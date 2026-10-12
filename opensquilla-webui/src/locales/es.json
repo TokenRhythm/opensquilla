@@ -1039,7 +1039,7 @@
       "routerOutcomeSynchronized": "Las recomendaciones del Router siguen al proveedor principal guardado.",
       "routerOutcomePreserved": "Se conservaron los niveles guardados del Router.",
       "routerOutcomeDisabled": "El enrutamiento de modelos está desactivado; se conservaron los niveles guardados.",
-      "primarySavedAdditionalFailed": "El proveedor se guardó, pero otros ajustes no pudieron guardarse. Revísalos antes de reintentar.",
+      "primarySavedAdditionalFailed": "El proveedor se guardó. No se pudieron guardar los ajustes restantes; se conservaron sus cambios.",
       "title": "Proveedor",
       "pageTitle": "Servicio de modelos",
       "pageDesc": "Conecta proveedores y gestiona sus credenciales y modelos.",
@@ -1357,7 +1357,7 @@
       "routerUseRecommended": "Usar las rutas recomendadas del proveedor de destino",
       "routerDisablePreserve": "Conservar las rutas y desactivar Router",
       "alreadyActive": "El proveedor de destino ya es el principal. Este cambio de credenciales no se guardó.",
-      "primarySaveUncertain": "No se pudo confirmar el guardado. Se conservó el borrador. Comprueba la configuración antes de reintentar; un proveedor activo no confirma que se hayan guardado las credenciales."
+      "primarySaveUncertain": "No se pudo confirmar el resultado del guardado. Se conservó tu borrador."
     },
     "preset": {
       "modeCustom": "personalizado"
@@ -1379,8 +1379,8 @@
       "resetUpgradeHint": "Actualiza el Gateway para aplicar los niveles recomendados en una sola operación.",
       "operationPending": "Hay otra operación de proveedor o enrutamiento en curso.",
       "activationUpgradeHint": "Este Gateway no puede confirmar una activación segura del Router. Actualízalo para revisar y resolver los conflictos de proveedores.",
-      "savedRefreshFailed": "Guardado, pero no se pudieron actualizar los ajustes. Recárgalos antes de hacer otro cambio.",
-      "resultUncertain": "Se desconoce el resultado del guardado. Revisa los ajustes actualizados antes de reintentar.",
+      "savedRefreshFailed": "Guardado. Los ajustes actualizados no están disponibles temporalmente; actualiza más tarde.",
+      "resultUncertain": "No se pudo confirmar el resultado del guardado. Se conservaron tus cambios.",
       "resetTitle": "¿Usar niveles recomendados de {provider}?",
       "resetBody": "¿Reemplazar las ediciones guardadas y sin guardar de los niveles del Router por las recomendaciones de {provider}? El modo y el interruptor del Router no cambian. Los demás ajustes sin guardar se conservan.",
       "resetConfirm": "Reemplazar por recomendaciones",
@@ -2075,8 +2075,16 @@
       "channelDisabled": "Canal desactivado. Se requiere reiniciar.",
       "channelDisabledLive": "Canal deshabilitado y detenido.",
       "providerSavedAndActivated": "Se guardó {provider} y se estableció como principal.",
-      "modelStrategyPartialSaved": "Se guardaron algunos ajustes. El cambio del proveedor principal no se completó; los cambios pendientes siguen en el formulario.",
-      "modelStrategyPartialSaveUncertain": "Se guardaron algunos ajustes. No se pudo confirmar el cambio del proveedor principal; comprueba el estado guardado. Los cambios pendientes siguen en el formulario."
+      "modelStrategyPartialSaved": "Se guardaron algunos ajustes del modelo. Los cambios restantes siguen en el formulario.",
+      "modelStrategyPartialSaveUncertain": "Se guardaron algunos ajustes. No se pudo confirmar el resultado de los demás guardados; se conservaron tus cambios.",
+      "modelSettingsSaved": "Ajustes del modelo guardados.",
+      "modelSettingsSavedRestart": "Ajustes del modelo guardados. Es necesario reiniciar.",
+      "settingsSaved": "Ajustes guardados.",
+      "settingsSavedRestart": "Ajustes guardados. Es necesario reiniciar.",
+      "settingsPartialSaved": "Guardado: {saved}. {detail}",
+      "settingsSaveStopped": "Se detuvo el guardado. Se conservaron los cambios restantes.",
+      "settingsSaveCancelledPartial": "Guardado: {saved}. Se conservaron los cambios restantes.",
+      "saveResultRestart": "{message} Es necesario reiniciar."
     },
     "needs": {
       "noApiKey": "No se requiere clave API.",
