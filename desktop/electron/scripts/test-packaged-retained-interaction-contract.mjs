@@ -9,7 +9,7 @@ import { runInNewContext } from 'node:vm'
 import { AUDIT_MARKER, AUDIT_PURPOSE, assertNoExistingDesktop, assertPreservedInputs, assertStopEvidence, auditMessages, parseAuditManifest, parseSyntheticCredential, sha256, verifyAuditInputs } from './fixtures/packaged-retained-interaction/contract.mjs'
 import { installRetainedRpcProbe } from './fixtures/packaged-retained-interaction/browser-probe.mjs'
 import { startRetainedProvider } from './fixtures/packaged-retained-interaction/provider.mjs'
-import { collectRetainedGatewayDiagnostics } from './fixtures/packaged-retained-interaction/diagnostics.mjs'
+import { collectRetainedGatewayDiagnostics, sameLogFileIdentity } from './fixtures/packaged-retained-interaction/diagnostics.mjs'
 import { captureFirstSendDiagnostic } from './packaged-first-send-cleanup.mjs'
 
 // Pure fixture/loopback tests: never execute the dummy .exe, Electron, Gateway,
@@ -57,6 +57,16 @@ async function diagnosticFixture(t) {
   for (const path of [join(plan.userDataDir, 'logs'), join(plan.profile, 'logs')]) await mkdir(path)
   return { ...f, plan, gatewayLog: join(plan.userDataDir, 'logs/gateway.log'), debugLog: join(plan.profile, 'logs/debug.log') }
 }
+
+test('log identity permits only Windows unknown path device without weakening inode checks', () => {
+  for (const platform of ['win32', 'linux', 'darwin']) {
+    assert.equal(sameLogFileIdentity({ dev: 123, ino: 456 }, { dev: 123, ino: 456 }, platform), true)
+    assert.equal(sameLogFileIdentity({ dev: 123, ino: 456 }, { dev: 789, ino: 456 }, platform), false)
+    assert.equal(sameLogFileIdentity({ dev: 0, ino: 456 }, { dev: 123, ino: 456 }, platform), platform === 'win32')
+    assert.equal(sameLogFileIdentity({ dev: 0, ino: 456 }, { dev: 123, ino: 789 }, platform), false)
+    assert.equal(sameLogFileIdentity({ dev: 123, ino: 456 }, { dev: 0, ino: 456 }, platform), false)
+  }
+})
 
 test('failure diagnostics retain database holder and exception evidence while redacting credentials', async t => {
   const { plan, gatewayLog, debugLog } = await diagnosticFixture(t)

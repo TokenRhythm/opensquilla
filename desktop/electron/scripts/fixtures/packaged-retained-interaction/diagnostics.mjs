@@ -12,6 +12,14 @@ function unsafePath() {
   return Object.assign(new Error('Diagnostic log path is not a regular synthetic-profile file'), { code: 'UNSAFE_PATH' })
 }
 
+export function sameLogFileIdentity(before, opened, platform = process.platform) {
+  // Node 22 on Windows reports dev=0 for path stat/lstat while fstat returns
+  // the volume ID. Only that unknown-device value is compatible; inode and
+  // every available device identity must still match.
+  return before.ino === opened.ino && (before.dev === opened.dev
+    || (platform === 'win32' && before.dev === 0))
+}
+
 async function canonicalDirectory(path) {
   const info = await lstat(path)
   if (!info.isDirectory() || info.isSymbolicLink() || !samePath(await realpath(path), path)) throw unsafePath()
@@ -25,7 +33,7 @@ async function logTail(path, userDataDir) {
   const handle = await open(path, 'r')
   try {
     const info = await handle.stat()
-    if (!info.isFile() || info.dev !== before.dev || info.ino !== before.ino || info.nlink !== 1) throw unsafePath()
+    if (!info.isFile() || !sameLogFileIdentity(before, info) || info.nlink !== 1) throw unsafePath()
     const start = Math.max(0, info.size - MAX_LOG_BYTES)
     const buffer = Buffer.alloc(Math.min(info.size, MAX_LOG_BYTES))
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, start)
