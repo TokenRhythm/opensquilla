@@ -36,6 +36,13 @@ function source() {
 }
 
 describe('createV4GatewayAccess', () => {
+  it('projects only a stopped automatic recovery as a connection blocker', () => {
+    for (const lifecycle of ['stopped', 'connecting', 'connected', 'recovering', 'blocked'] as const) {
+      const raw = { ...source(), lifecycle, error: 'Temporary descriptor lookup failure' }
+      expect(createV4GatewayAccess(raw).connectionBlocked).toBe(lifecycle === 'blocked')
+    }
+    expect(createV4GatewayAccess(source()).connectionBlocked).toBe(false)
+  })
   beforeEach(() => {
     vi.stubGlobal('localStorage', memoryStorage())
     vi.stubGlobal('location', new URL('http://gateway.example/control/usage'))

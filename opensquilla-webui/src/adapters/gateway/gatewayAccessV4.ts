@@ -23,6 +23,7 @@ interface GatewayAccessSource {
   readonly resumeSource?: import('@/platform/types').DesktopResumeSource | null
   readonly runtimeStarting?: boolean
   readonly error: string | null
+  readonly lifecycle?: 'stopped' | 'connecting' | 'connected' | 'recovering' | 'blocked'
   readonly isLocalOwner: boolean
   getConnectionEndpoint(): string | null
   readonly canManageProjectWorkspaces: boolean
@@ -213,6 +214,9 @@ export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAcces
     },
     get connectionError() {
       return source.error
+    },
+    get connectionBlocked() {
+      return source.lifecycle === 'blocked'
     },
     get connectedGatewayHost() {
       return connectedGatewayHost(source)

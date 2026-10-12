@@ -453,7 +453,7 @@
             <span
               ref="sendControlEl"
               class="chat-send-control"
-              :class="{ 'is-hint-dismissed': sendHintDismissed }"
+              :class="{ 'is-hint-dismissed': sendHintDismissed, 'is-hint-requested': sendHintRequested }"
               :tabindex="sendControlHint ? 0 : undefined"
               :role="sendControlHint ? 'group' : undefined"
               :aria-label="sendControlHint ? t('chat.send') : undefined"
@@ -557,6 +557,7 @@ interface ChatComposerExpose {
   focusTextarea: (options?: { preserveFocus?: boolean }) => void
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
+  showSendBlockedHint: () => void
 }
 
 const props = withDefaults(defineProps<{
@@ -580,6 +581,8 @@ const props = withDefaults(defineProps<{
   sendButtonTitle: string
   sendBlockedMessage?: string
   showImageInputWarning?: boolean
+  /** Opt in only when the blocking reason has no existing inline explanation. */
+  showSendBlockedTooltip?: boolean
   inputDisabled?: boolean
   runMode: SandboxRunMode
   allowedRunModes: SandboxRunMode[]
@@ -695,11 +698,19 @@ const showSkillQueueSend = computed(() => props.canStop
   && props.selectedSkills.length > 0
   && props.hasSendContent)
 
-const sendControlHint = computed(() => props.showImageInputWarning
+const sendControlHint = computed(() => (props.showImageInputWarning || props.showSendBlockedTooltip)
   && (!props.canStop || showSkillQueueSend.value)
   ? props.sendBlockedMessage || '' : '')
 const sendHintDismissed = ref(false)
+const sendHintRequested = ref(false)
 const sendControlEl = ref<HTMLElement | null>(null)
+
+function showSendBlockedHint() {
+  if (!sendControlHint.value) return
+  // Enter stays in the editor: reuse the same hint without moving its caret.
+  sendHintDismissed.value = false
+  sendHintRequested.value = true
+}
 
 function focusSendHint(event: PointerEvent) {
   if (!sendControlHint.value || (props.canStop && !showSkillQueueSend.value)) return
@@ -714,6 +725,7 @@ function focusSendHint(event: PointerEvent) {
 function dismissSendHint(event: KeyboardEvent) {
   if (!sendControlHint.value || sendHintDismissed.value) return
   sendHintDismissed.value = true
+  sendHintRequested.value = false
   // Stop can coexist with skill queue Send; preserve its document shortcut.
   if (props.canStop) return
   event.preventDefault()
@@ -724,11 +736,12 @@ useDocumentEvent('keydown', event => {
   if (event.key !== 'Escape') return
   const hint = sendControlEl.value?.querySelector<HTMLElement>('.chat-send-tooltip')
   // Hover does not move focus out of the editor. Close its visible hint before
-  // Escape reaches the editor's clear-draft shortcut; Stop keeps its shortcut.
-  if (hint && getComputedStyle(hint).visibility === 'visible') dismissSendHint(event)
+  // Escape reaches the editor; Stop keeps its shortcut.
+  if (sendHintRequested.value || (hint && getComputedStyle(hint).visibility === 'visible')) dismissSendHint(event)
 }, { capture: true })
 
 const inputText = defineModel<string>({ required: true })
+watch([sendControlHint, inputText], () => { sendHintRequested.value = false })
 const composerEl = ref<HTMLElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 
@@ -1077,6 +1090,7 @@ defineExpose<ChatComposerExpose>({
   focusTextarea,
   isTextareaFocused,
   resizeTextarea,
+  showSendBlockedHint,
 })
 </script>
 
@@ -2278,6 +2292,7 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-send-control:not(.is-hint-dismissed):hover > .chat-send-tooltip,
+.chat-send-control:not(.is-hint-dismissed).is-hint-requested > .chat-send-tooltip,
 .chat-send-control:not(.is-hint-dismissed):focus-within > .chat-send-tooltip {
   visibility: visible;
 }

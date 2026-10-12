@@ -22,6 +22,8 @@ describe('App status and navigation ownership', () => {
     expect(status).not.toContain('v-if="isChatRoute"')
     expect(status).toContain('@open-connection="openConnectionSettings"')
     expect(status).toContain('@open-approval="openBlockedApprovalSession"')
+    expect(status).toContain(':connection-notice-visible="connectionNoticeVisible"')
+    expect(appSource).toContain('Number(connectionNoticeVisible.value)')
     expect(appSource).toContain('<WorkbenchToggle')
     expect(appSource).toContain('@open-deliverables="chatRouteHeader.invoke(\'openDeliverables\')"')
   })

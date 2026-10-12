@@ -1,9 +1,10 @@
 // @vitest-environment happy-dom
-import { createApp, h, nextTick, reactive, type App } from 'vue'
+import { computed, createApp, h, nextTick, reactive, ref, type App } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import i18n from '@/i18n'
 import type { SystemHeaderLayout } from '@/utils/headerLayout'
 import ChatSystemStatus from './ChatSystemStatus.vue'
+import { CONNECTION_NOTICE_DELAY_MS, useDelayedNotice } from '@/composables/useDelayedNotice'
 
 const mounted: App[] = []
 type StatusProps = {
@@ -14,22 +15,27 @@ type StatusProps = {
   canManageConnection: boolean
   connectionNoticeVisible?: boolean
 }
-async function mountStatus(overrides: Partial<StatusProps> = {}) {
+async function mountStatus(overrides: Partial<StatusProps> = {}, delayed = false) {
   const props = reactive<StatusProps>({ layout: 'wide', connectionState: 'connected',
     connectionLabel: 'Connected', approvalCount: 0, canManageConnection: true, ...overrides })
   const events = { connection: vi.fn(), approval: vi.fn() }
+  const blocked = ref(false)
   const host = document.createElement('header')
   document.body.appendChild(host)
   const app = createApp({ setup: () => {
+    const visible = useDelayedNotice(
+      computed(() => props.connectionState !== 'connected'), blocked, undefined, CONNECTION_NOTICE_DELAY_MS,
+    )
     return () => h('div', [
     h('button', { 'data-testid': 'chat-session-actions-trigger' }, 'Session actions'),
     h(ChatSystemStatus, { ...props,
+      ...(delayed ? { connectionNoticeVisible: visible.value } : {}),
       onOpenConnection: events.connection, onOpenApproval: events.approval }),
   ]) } })
   mounted.push(app)
   app.use(i18n).mount(host)
   await nextTick()
-  return { host, props, events }
+  return { host, props, events, blocked }
 }
 function byId(host: HTMLElement, id: string) {
   return host.querySelector<HTMLButtonElement>(`[data-testid="${id}"]`)
@@ -38,6 +44,47 @@ beforeEach(() => { i18n.global.locale.value = 'en' })
 afterEach(() => { mounted.splice(0).forEach(app => app.unmount()); document.body.innerHTML = ''; vi.useRealTimers() })
 
 describe('direct system status controls', () => {
+  it('adds no icon, copy or layout container during a short automatic reconnect', async () => {
+    vi.useFakeTimers()
+    const { host, props } = await mountStatus({}, true)
+    props.connectionState = 'disconnected'
+    props.connectionLabel = 'Disconnected'
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(byId(host, 'chat-system-status')).toBeNull()
+    props.connectionState = 'connecting'
+    props.connectionLabel = 'Reconnecting'
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(3_000)
+    expect(byId(host, 'connection-status')).toBeNull()
+    props.connectionState = 'connected'
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(byId(host, 'chat-system-status')).toBeNull()
+  })
+  it('keeps approvals available during the grace period and shows a lasting outage once', async () => {
+    vi.useFakeTimers()
+    const { host, props } = await mountStatus({ connectionState: 'disconnected', approvalCount: 1 }, true)
+    expect(byId(host, 'connection-status')).toBeNull()
+    expect(byId(host, 'chat-system-approval')).not.toBeNull()
+    await vi.advanceTimersByTimeAsync(1_000)
+    props.connectionState = 'connecting'
+    props.connectionLabel = 'Reconnecting'
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(3_999)
+    expect(byId(host, 'connection-status')).toBeNull()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(byId(host, 'connection-status')?.textContent).toContain('Reconnecting')
+    expect(host.querySelectorAll('[data-testid="connection-status"]')).toHaveLength(1)
+  })
+  it('does not delay a rejected connection that requires user action', async () => {
+    vi.useFakeTimers()
+    const { host, blocked, events } = await mountStatus({ connectionState: 'disconnected' }, true)
+    blocked.value = true
+    await nextTick()
+    byId(host, 'connection-status')!.click()
+    expect(events.connection).toHaveBeenCalledOnce()
+  })
   it.each(['wide', 'compact', 'tight'] as const)('has no healthy connection chrome or generic status menu at %s', async layout => {
     const { host } = await mountStatus({ layout })
     expect(byId(host, 'chat-system-status')).toBeNull()

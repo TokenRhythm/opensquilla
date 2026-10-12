@@ -35,6 +35,8 @@ export interface GatewayAccess {
   /** The local supervisor is preparing the runtime; no connection has failed. */
   readonly isRuntimeStarting: boolean
   readonly connectionError: string | null
+  /** Automatic recovery has stopped because this connection was rejected. */
+  readonly connectionBlocked?: boolean
   /** Host and port of the healthy connection, without credentials or URL suffixes. */
   readonly connectedGatewayHost?: string | null
   readonly requiresCredential: boolean

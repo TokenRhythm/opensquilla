@@ -233,6 +233,7 @@
           :layout="systemHeaderLayout"
           :connection-state="effectiveConnectionState"
           :connection-label="connectionStateLabel"
+          :connection-notice-visible="connectionNoticeVisible"
           :approval-count="appStore.approvalCount"
           :can-manage-connection="webConfigEnabled"
           @open-connection="openConnectionSettings"
@@ -425,6 +426,7 @@ import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useDesktopUpdatePresentation } from './composables/useDesktopUpdatePresentation'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
+import { CONNECTION_NOTICE_DELAY_MS, useDelayedNotice } from './composables/useDelayedNotice'
 import { useDocumentEvent } from './composables/useDocumentEvent'
 import { hasOpenDialogLayer } from './composables/useDialogA11y'
 import {
@@ -598,6 +600,14 @@ const connectionStateLabel = computed(() => getPlatform().id === 'web' && gatewa
   : gatewayConnectionPhase.value === 'healthy' || gatewayConnectionPhase.value === 'disconnected'
   ? t(`chrome.connectionState.${effectiveConnectionState.value}`)
   : t(`chrome.connectionState.${gatewayConnectionPhase.value}`))
+// Only the presentation waits. RPC readiness, sending and recovery keep using
+// their real state. A rejected connection cannot recover silently, so show it now.
+const connectionNoticeVisible = useDelayedNotice(
+  computed(() => effectiveConnectionState.value !== 'connected'),
+  computed(() => gatewayAccess.connectionBlocked === true),
+  computed(() => gatewayAccess.isRuntimeStarting),
+  CONNECTION_NOTICE_DELAY_MS,
+)
 // afterEach only fires on navigation, so a same-route language switch needs an
 // explicit re-localize of the tab title.
 watch(() => appStore.locale, () => {
@@ -772,7 +782,7 @@ watch(currentSessionKey, markCurrentSessionReadIfVisible, {
 
 // Shared status controls use the actual topbar geometry on every route.
 const systemHeaderPressureCount = computed(() => (
-  Number(effectiveConnectionState.value !== 'connected')
+  Number(connectionNoticeVisible.value)
   + Number(appStore.approvalCount > 0)
 ))
 const systemHeaderLayout = useSystemHeaderLayout({

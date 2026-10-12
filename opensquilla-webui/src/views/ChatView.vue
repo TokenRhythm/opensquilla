@@ -646,6 +646,7 @@
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
       :send-blocked-message="composerSendBlockedMessage"
+      :show-send-blocked-tooltip="composerSendBlockedTooltip"
       :show-image-input-warning="!forkTransition && !modelRoutingMutationBusy
         && imageInputAdmission === 'blocked' && Boolean(modelImageSendBlockedMessage)"
       :input-disabled="Boolean(dockedPlanQuestionnaire)
@@ -1194,6 +1195,7 @@ interface ChatComposerHandle {
   focusTextarea: (options?: { preserveFocus?: boolean }) => void
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
+  showSendBlockedHint: () => void
 }
 
 type Message = ChatMessage
@@ -3853,7 +3855,10 @@ watch(composerSameTurnSteerAvailable, (available) => {
 async function onComposerSend() {
   // All composer submission modes, including keyboard-driven plan revision,
   // share the same fail-closed delivery gate.
-  if (composerSendBlockedMessage.value) return
+  if (composerSendBlockedMessage.value) {
+    composerRef.value?.showSendBlockedHint()
+    return
+  }
   // Serialize session-routing and plan mutations before accepting another
   // composer turn, so the send cannot race either CAS update.
   if (modelRoutingMutationBusy.value || planModeBusy.value) return
@@ -4507,6 +4512,7 @@ const recoveryNoticeState = computed(() => historyState.value.sessionMissing
 const recoveryNoticeVisible = useChatRecoveryNotice(
   recoveryNoticeState,
   computed(() => gatewayAccess.isRuntimeStarting),
+  computed(() => gatewayAccess.connectionBlocked === true),
 )
 
 const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession({
@@ -4684,6 +4690,17 @@ const composerSendBlockedMessage = computed(() =>
   || (offlineQueueIdentity.value ? null : effectiveSendBlockedReason.value)
   || (offlineQueueIdentity.value ? '' : activeProjectComposerBlockMessage.value),
 )
+
+const composerSendBlockedTooltip = computed(() => {
+  // Preserve the blocking priority above. Project, annotation and fork UI
+  // already explain their own state; only otherwise silent gates need a hint.
+  if (browserUseSelectionPending.value || forkTransition.value) return false
+  if (modelImageSendBlockedMessage.value) return true
+  if (offlineQueueIdentity.value || projectBindingBusy.value) return false
+  if (deliveryBlockedReason.value) return true
+  if (promptAnnotationSendBlockedReason.value) return false
+  return Boolean(newTaskModelSendBlockedReason.value)
+})
 
 const sendButtonTitle = computed(() => {
   if (replanActive.value) return t('chat.plan.reviseSend')
