@@ -2762,6 +2762,7 @@
   },
   "cronSkills": {
     "view": {
+      "refreshFailed": "Aktualisierung fehlgeschlagen. Die zuletzt geladenen Automatisierungen werden angezeigt.",
       "title": "Cron-Jobs",
       "subtitle": "Zeitgesteuerte Aufgaben — orchestrieren Sie Erinnerungen, Agentendurchläufe und wiederkehrende Arbeit.",
       "searchPlaceholder": "Jobs durchsuchen…",
@@ -2911,6 +2912,7 @@
       "selectJob": "{name} auswählen"
     },
     "runHistory": {
+      "loadFailed": "Der Ausführungsverlauf konnte nicht geladen werden",
       "eyebrow": "Laufverlauf",
       "loading": "Wird geladen…",
       "empty": "Noch kein Laufverlauf.",
@@ -3306,6 +3308,8 @@
       "toastSearchFailed": "Suche fehlgeschlagen: {error}"
     },
     "skills": {
+      "loadFailed": "Skills konnten nicht geladen werden",
+      "refreshFailed": "Aktualisierung fehlgeschlagen. Die zuletzt geladenen Skills werden angezeigt.",
       "statusReady": "bereit",
       "statusNoDeps": "keine Abhängigkeiten deklariert",
       "statusNeedsDeps": "benötigt Abhängigkeiten",

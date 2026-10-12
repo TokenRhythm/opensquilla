@@ -2762,6 +2762,7 @@
   },
   "cronSkills": {
     "view": {
+      "refreshFailed": "No se pudo actualizar. Se muestran las últimas automatizaciones cargadas.",
       "title": "Tareas cron",
       "subtitle": "Tareas activadas por tiempo: orquesta recordatorios, turnos de agentes y trabajo recurrente.",
       "searchPlaceholder": "Buscar tareas…",
@@ -2911,6 +2912,7 @@
       "selectJob": "Seleccionar {name}"
     },
     "runHistory": {
+      "loadFailed": "No se pudo cargar el historial de ejecuciones",
       "eyebrow": "Historial de ejecuciones",
       "loading": "Cargando…",
       "empty": "Aún no hay historial de ejecuciones.",
@@ -3306,6 +3308,8 @@
       "toastSearchFailed": "Error al buscar: {error}"
     },
     "skills": {
+      "loadFailed": "No se pudieron cargar las habilidades",
+      "refreshFailed": "No se pudo actualizar. Se muestran las últimas habilidades cargadas.",
       "statusReady": "lista",
       "statusNoDeps": "sin dependencias declaradas",
       "statusNeedsDeps": "necesita dependencias",

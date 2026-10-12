@@ -2762,6 +2762,7 @@
   },
   "cronSkills": {
     "view": {
+      "refreshFailed": "刷新失败，仍显示上次加载的定时任务。",
       "title": "定时任务",
       "subtitle": "时间驱动的任务——编排提醒、智能体回合和周期性工作。",
       "searchPlaceholder": "搜索任务…",
@@ -2911,6 +2912,7 @@
       "selectJob": "选择 {name}"
     },
     "runHistory": {
+      "loadFailed": "无法加载运行记录",
       "eyebrow": "运行历史",
       "loading": "加载中…",
       "empty": "暂无运行历史。",
@@ -3306,6 +3308,8 @@
       "toastSearchFailed": "搜索失败：{error}"
     },
     "skills": {
+      "loadFailed": "无法加载技能",
+      "refreshFailed": "刷新失败，仍显示上次加载的技能。",
       "statusReady": "就绪",
       "statusNoDeps": "未声明依赖",
       "statusNeedsDeps": "需要依赖",

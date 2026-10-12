@@ -24,6 +24,9 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
   const pushToast = vi.fn()
   const routeState = ref<{ query: { skill?: string } }>({ query: {} })
   const allSkills = ref<Array<{ name: string; active?: boolean; install_id?: string }>>([])
+  const catalogLoading = ref(false)
+  const catalogHasLoaded = ref(true)
+  const catalogError = ref<string | null>(null)
   const detail = vi.fn(async (skill: { name: string }) => ({ ...skill, content: 'Synthetic content' }))
   const push = vi.fn(async () => undefined)
   const listCandidates = vi.fn(async () => ({ generation: 1, candidates: [{ name: 'synthetic-target', instanceId: 'skill:synthetic', digest: 'a'.repeat(64), kind: 'skill', disabled: false, ready: true }] }))
@@ -149,6 +152,9 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     skillLayerLabel: (key: string) => `label:${key}`,
     useSkillsCatalog: () => ({
       allSkills,
+      loading: catalogLoading,
+      hasLoaded: catalogHasLoaded,
+      error: catalogError,
       filterText: ref(''),
       statusFilter: ref('all'),
       visibleLayerGroups: ref([{ key: 'community', skills: [] }]),
@@ -205,6 +211,9 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     viewActive,
     routeState,
     allSkills,
+    catalogLoading,
+    catalogHasLoaded,
+    catalogError,
     detail,
     push,
     listCandidates,
@@ -230,6 +239,31 @@ afterEach(() => {
 })
 
 describe('SkillsView stats navigation', () => {
+  it('distinguishes loading, a first-load failure, and stale catalog content', async () => {
+    const state = await mountSkillsView()
+    state.catalogHasLoaded.value = false
+    state.catalogLoading.value = true
+    await state.nextTick()
+    expect(state.el.querySelector('[aria-busy="true"]')).not.toBeNull()
+    expect(state.el.querySelector('[data-testid="skill-group"]')).toBeNull()
+
+    state.catalogLoading.value = false
+    state.catalogError.value = 'offline'
+    await state.nextTick()
+    expect(state.el.querySelector('.error-state')).not.toBeNull()
+    expect(state.el.querySelector('[data-testid="skill-group"]')).toBeNull()
+    state.loadData.mockClear()
+    state.el.querySelector<HTMLButtonElement>('.error-state__retry')!.click()
+    await state.nextTick()
+    expect(state.loadData).toHaveBeenCalledOnce()
+
+    state.catalogHasLoaded.value = true
+    await state.nextTick()
+    expect(state.el.querySelector('.error-state')).toBeNull()
+    expect(state.el.querySelector('[data-testid="skill-group"]')).not.toBeNull()
+    expect(state.el.querySelector('.sk-catalog-status button')).not.toBeNull()
+    state.app.unmount()
+  })
   it('opens the catalog detail dialog from an installed registry result', async () => {
     const { app, el, allSkills, detail, nextTick } = await mountSkillsView()
     allSkills.value = [{ name: 'synthetic-installed', install_id: 'install:synthetic', active: true }]

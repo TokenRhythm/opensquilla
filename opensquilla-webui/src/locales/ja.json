@@ -2762,6 +2762,7 @@
   },
   "cronSkills": {
     "view": {
+      "refreshFailed": "更新できませんでした。前回読み込んだ定期タスクを表示しています。",
       "title": "スケジュールジョブ",
       "subtitle": "時間駆動のタスクです — リマインダー、エージェントのターン、定期的な作業を編成します。",
       "searchPlaceholder": "ジョブを検索…",
@@ -2911,6 +2912,7 @@
       "selectJob": "{name} を選択"
     },
     "runHistory": {
+      "loadFailed": "実行履歴を読み込めませんでした",
       "eyebrow": "実行履歴",
       "loading": "読み込み中…",
       "empty": "実行履歴はまだありません。",
@@ -3306,6 +3308,8 @@
       "toastSearchFailed": "検索に失敗しました: {error}"
     },
     "skills": {
+      "loadFailed": "スキルを読み込めませんでした",
+      "refreshFailed": "更新できませんでした。前回読み込んだスキルを表示しています。",
       "statusReady": "準備完了",
       "statusNoDeps": "依存関係の宣言なし",
       "statusNeedsDeps": "依存関係が必要",

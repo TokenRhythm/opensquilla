@@ -11,8 +11,11 @@
     </div>
     <div class="cron-detail__runs">
       <p v-if="waiting" class="cron-muted" role="status">{{ t('cronSkills.jobs.waitingForCapacity') }}</p>
-      <p v-else-if="error" class="cron-muted" role="alert">{{ error }}</p>
-      <p v-else-if="loading" class="cron-muted">{{ t('cronSkills.runHistory.loading') }}</p>
+      <p v-else-if="error" class="cron-runs__error" role="status">
+        <span>{{ t('cronSkills.runHistory.loadFailed') }}</span>
+        <button type="button" class="btn btn--ghost" :disabled="loading" @click="emit('retry')">{{ t('shared.errorState.retry') }}</button>
+      </p>
+      <p v-else-if="loading && runs.length === 0" class="cron-muted">{{ t('cronSkills.runHistory.loading') }}</p>
       <p v-else-if="runs.length === 0" class="cron-muted">{{ t('cronSkills.runHistory.empty') }}</p>
       <DataTable
         v-if="runs.length > 0"
@@ -74,6 +77,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: []
+  retry: []
   openChat: [sessionKey: string]
 }>()
 
@@ -114,6 +118,16 @@ function stringField(source: Record<string, unknown>, key: string): string {
 </script>
 
 <style scoped>
+.cron-runs__error {
+  align-items: center;
+  color: var(--text-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 13px;
+  gap: 8px;
+  line-height: 20px;
+  margin: 0;
+}
 .cron-detail {
   background: var(--bg-surface);
   border: 1px solid var(--border);

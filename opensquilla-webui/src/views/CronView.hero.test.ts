@@ -204,6 +204,16 @@ describe('CronView automation hero states', () => {
     expect(testState.replaceRoute).not.toHaveBeenCalled()
   })
 
+  it('keeps the last loaded jobs and summary when a refresh fails', () => {
+    testState.hasLoaded = true
+    testState.jobs = [{ id: 'daily', name: 'Daily summary', enabled: true }]
+    testState.error = 'refresh offline'
+    const host = mountCronView()
+    expect(host.querySelector('[data-testid="error-state"]')).toBeNull()
+    expect(host.querySelector('.automation-launch--compact')).not.toBeNull()
+    expect(host.querySelector('[data-testid="cron-job-list"]')).not.toBeNull()
+    expect(host.querySelector('.cron-refresh-status button')).not.toBeNull()
+  })
   it('shows a neutral loading state before the first list response', () => {
     const host = mountCronView()
 
@@ -292,7 +302,8 @@ describe('CronView automation hero states', () => {
     testState.jobs = [{ id: 'daily', enabled: true }]
     testState.error = 'Permission denied'
     const host = mountCronView()
-    expect(host.querySelector('[data-testid="error-state"]')).not.toBeNull()
+    expect(host.querySelector('.cron-refresh-status[role="status"]')).not.toBeNull()
+    expect(host.querySelector('.cron-refresh-status button')).not.toBeNull()
     expect(host.querySelector('[data-testid="cron-job-list"]')).not.toBeNull()
     expect(host.querySelector('[data-testid="loading-spinner"]')).toBeNull()
   })

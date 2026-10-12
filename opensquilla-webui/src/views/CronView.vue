@@ -37,7 +37,7 @@
     </header>
 
     <section
-      v-if="cronJobs.hasLoaded.value && !cronJobs.error.value"
+      v-if="cronJobs.hasLoaded.value"
       class="automation-launch"
       :class="{ 'automation-launch--compact': cronJobs.jobs.value.length > 0 }"
       :aria-labelledby="cronJobs.jobs.value.length > 0 ? 'automation-status-title' : 'automation-empty-title'"
@@ -126,8 +126,12 @@
       </button>
     </div>
     <p v-if="notificationTargetStatus" class="cron-refresh-status" role="status">{{ notificationTargetStatus }}</p>
+    <p v-if="cronJobs.error.value && cronJobs.hasLoaded.value" class="cron-refresh-status" role="status">
+      <span>{{ t('cronSkills.view.refreshFailed') }}</span>
+      <button type="button" class="btn btn--ghost" :disabled="cronJobs.loading.value" @click="cronJobs.loadData">{{ t('shared.errorState.retry') }}</button>
+    </p>
     <ErrorState
-      v-if="cronJobs.error.value"
+      v-if="cronJobs.error.value && !cronJobs.hasLoaded.value"
       :message="cronJobs.error.value"
       :on-retry="cronJobs.loadData"
     />
@@ -178,6 +182,7 @@
       :waiting="cronRuns.waitingForCapacity.value"
       :error="cronRuns.error.value"
       @close="selectedId = null"
+      @retry="cronRuns.loadRuns(selectedId)"
       @open-chat="openRunChat"
     />
 

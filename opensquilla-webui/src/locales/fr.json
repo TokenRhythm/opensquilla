@@ -2762,6 +2762,7 @@
   },
   "cronSkills": {
     "view": {
+      "refreshFailed": "Actualisation impossible. Les dernières automatisations chargées restent affichées.",
       "title": "Tâches cron",
       "subtitle": "Tâches déclenchées par le temps — orchestrez rappels, tours d'agent et travail récurrent.",
       "searchPlaceholder": "Rechercher des tâches…",
@@ -2911,6 +2912,7 @@
       "selectJob": "Sélectionner {name}"
     },
     "runHistory": {
+      "loadFailed": "Impossible de charger l’historique des exécutions",
       "eyebrow": "Historique des exécutions",
       "loading": "Chargement…",
       "empty": "Aucun historique d'exécution pour l'instant.",
@@ -3306,6 +3308,8 @@
       "toastSearchFailed": "Échec de la recherche : {error}"
     },
     "skills": {
+      "loadFailed": "Impossible de charger les compétences",
+      "refreshFailed": "Actualisation impossible. Les dernières compétences chargées restent affichées.",
       "statusReady": "prêt",
       "statusNoDeps": "aucune dépendance déclarée",
       "statusNeedsDeps": "dépendances requises",

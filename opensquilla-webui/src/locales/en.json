@@ -2762,6 +2762,7 @@
   },
   "cronSkills": {
     "view": {
+      "refreshFailed": "Could not refresh. Showing the last loaded automations.",
       "title": "Cron Jobs",
       "subtitle": "Time-driven tasks — orchestrate reminders, agent turns, and recurring work.",
       "searchPlaceholder": "Search jobs…",
@@ -2911,6 +2912,7 @@
       "selectJob": "Select {name}"
     },
     "runHistory": {
+      "loadFailed": "Could not load run history",
       "eyebrow": "Run history",
       "loading": "Loading…",
       "empty": "No run history yet.",
@@ -3306,6 +3308,8 @@
       "toastSearchFailed": "Search failed: {error}"
     },
     "skills": {
+      "loadFailed": "Could not load skills",
+      "refreshFailed": "Could not refresh. Showing the last loaded skills.",
       "statusReady": "ready",
       "statusNoDeps": "no deps declared",
       "statusNeedsDeps": "needs deps",
