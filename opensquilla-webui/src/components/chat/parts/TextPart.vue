@@ -65,9 +65,7 @@ import {
   type WorkspacePreviewLink,
 } from '@/utils/chat/workspacePreviews'
 import { copyTextWithFallback, downloadBlob, isMacPlatform } from '@/utils/browser'
-import { decorateCodeBlocks } from '@/utils/chat/codeBlockChrome'
-import { decorateMarkdownImages } from '@/utils/markdown/imageLightbox'
-import { renderMermaidBlocks } from '@/utils/markdown/mermaidRenderer'
+import { useMarkdownEnhancements } from '@/composables/chat/useMarkdownEnhancements'
 import { usePlatform } from '@/platform'
 import { requestBrowserWorkbenchOpen } from '@/workbench/browserItems'
 import { useWorkbenchStore } from '@/workbench/store'
@@ -235,6 +233,7 @@ function showFileMenu(event: MouseEvent | KeyboardEvent, preview: WorkspacePrevi
   void fileMenu.value?.show(event, workspacePreviewOpenAction(preview, props.sessionKey))
 }
 const rootEl = ref<HTMLDivElement | null>(null)
+useMarkdownEnhancements(rootEl, { version: () => props.part.html })
 const missingCitationIds = ref<number[]>([])
 const mentionedPreviewIds = ref<string[]>([])
 const unmentionedPreviews = computed(() => props.workspacePreviews.filter(
@@ -253,21 +252,6 @@ const missingCitationLabel = computed(() =>
 function labelFor(sourceId: number): string {
   const source = props.sources[sourceId - 1]
   return source ? source.title || source.domain : ''
-}
-
-function mermaidLabels() {
-  return {
-    zoomIn: t('chat.mermaid.zoomIn'),
-    zoomOut: t('chat.mermaid.zoomOut'),
-    reset: t('chat.mermaid.reset'),
-    copyCode: t('chat.mermaid.copyCode'),
-    copied: t('chat.copied'),
-    copyFailed: t('chat.toast.copyFailed'),
-    exportPng: t('chat.mermaid.exportPng'),
-    loadFailed: t('chat.mermaid.loadFailed'),
-    viewSource: t('chat.mermaid.viewSource'),
-    syntaxErrorAt: (line: number, excerpt: string) => t('chat.mermaid.syntaxErrorAt', { line, excerpt }),
-  }
 }
 
 // After `v-html` has applied the sanitized body, upgrade any `[n]` that maps to
@@ -292,15 +276,6 @@ function decorate() {
       missingCitationIds.value = props.sources.length > 0 ? ids : []
     },
   })
-  decorateCodeBlocks(root, {
-    copy: t('chat.copy'),
-    copied: t('chat.copied'),
-    copyFailed: t('chat.toast.copyFailed'),
-  })
-  decorateMarkdownImages(root, t('chat.closePreview'))
-  if (root.querySelector('code.language-mermaid')) {
-    void renderMermaidBlocks(root, mermaidLabels()).catch(() => { /* failed fences keep their source */ })
-  }
   decorateBrowserLinks()
   decorateWorkspaceFiles(root)
 }
@@ -313,7 +288,7 @@ function decorateBrowserLinks() {
     || !platform.capabilities.hasNativeWorkbenchSurfaces
   ) return
   for (const anchor of root.querySelectorAll<HTMLAnchorElement>('a[href]')) {
-    if (!/^https?:/i.test(anchor.href)) continue
+    if (anchor.closest('svg') || !/^https?:/i.test(anchor.href)) continue
     const next = anchor.nextElementSibling
     if (next?.classList.contains('link-side-browser-btn')) continue
     const button = document.createElement('button')

@@ -42,12 +42,15 @@ def _client(path_prefix: str = "/control") -> TestClient:
     return TestClient(app)
 
 
-def test_csp_allows_blob_images_for_artifact_previews() -> None:
+def test_csp_allows_artifact_previews_and_public_https_markdown_images() -> None:
     response = _client().get("/control/ping")
 
     assert response.status_code == 200
     csp = response.headers.get("content-security-policy", "")
-    assert "img-src 'self' data: blob:;" in csp, csp
+    directives = [directive.strip() for directive in csp.split(";") if directive.strip()]
+    assert [directive for directive in directives if directive.startswith("img-src ")] == [
+        "img-src 'self' data: blob: https:"
+    ], csp
     assert "font-src 'self' data:;" in csp, csp
 
 

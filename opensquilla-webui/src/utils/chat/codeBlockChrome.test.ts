@@ -3,14 +3,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { decorateCodeBlocks } from './codeBlockChrome'
-import { closeImageLightbox, decorateMarkdownImages, openImageLightbox } from '@/utils/markdown/imageLightbox'
 
 const labels = { copy: 'Copy', copied: 'Copied', copyFailed: 'Copy failed' }
-const closeLabel = 'Close preview'
 
 afterEach(() => {
   document.body.innerHTML = ''
-  closeImageLightbox()
 })
 
 describe('decorateCodeBlocks', () => {
@@ -45,48 +42,5 @@ describe('decorateCodeBlocks', () => {
       expect(writeText).toHaveBeenCalledWith('print(1)')
       expect(button.getAttribute('aria-label')).toBe('Copied')
     })
-  })
-})
-
-describe('markdown image lightbox', () => {
-  it('decorates images and opens a dialog with the image source', () => {
-    const root = document.createElement('div')
-    root.innerHTML = '<img src="https://example.com/a.png" alt="diagram">'
-    decorateMarkdownImages(root, closeLabel)
-    const img = root.querySelector('img')
-    expect(img?.classList.contains('md-img')).toBe(true)
-
-    img?.click()
-    const overlay = document.querySelector('.md-img-lightbox')
-    expect(overlay).not.toBeNull()
-    expect(overlay?.getAttribute('role')).toBe('dialog')
-    const shown = overlay?.querySelector('img')
-    expect(shown?.getAttribute('src')).toBe('https://example.com/a.png')
-    expect(overlay?.querySelector('.md-img-lightbox__close')?.getAttribute('aria-label')).toBe(closeLabel)
-  })
-
-  it('closes on Escape and is idempotent across re-decoration', () => {
-    const root = document.createElement('div')
-    root.innerHTML = '<img src="https://example.com/a.png" alt="">'
-    decorateMarkdownImages(root, closeLabel)
-    decorateMarkdownImages(root, closeLabel)
-    expect(root.querySelectorAll('img')).toHaveLength(1)
-
-    openImageLightbox('https://example.com/a.png', 'alt text', closeLabel)
-    expect(document.querySelector('.md-img-lightbox')).not.toBeNull()
-    document.querySelector('.md-img-lightbox')?.dispatchEvent(
-      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }),
-    )
-    expect(document.querySelector('.md-img-lightbox')).toBeNull()
-  })
-
-  it('replaces an open lightbox instead of stacking', () => {
-    openImageLightbox('https://example.com/1.png', '', closeLabel)
-    openImageLightbox('https://example.com/2.png', '', closeLabel)
-    expect(document.querySelectorAll('.md-img-lightbox')).toHaveLength(1)
-    const shown = document.querySelector('.md-img-lightbox img') as HTMLImageElement
-    expect(shown.getAttribute('src')).toBe('https://example.com/2.png')
-    closeImageLightbox()
-    expect(document.querySelector('.md-img-lightbox')).toBeNull()
   })
 })

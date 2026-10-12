@@ -3596,6 +3596,9 @@
       "reset": "表示をリセット",
       "copyCode": "ソースをコピー",
       "exportPng": "PNG を書き出し",
+      "exportFailed": "図を書き出せませんでした。",
+      "tooLarge": "図が大きすぎるためプレビューできません。ソースはコピーできます。",
+      "blockedResource": "図に未対応のリソース URL が含まれています。ソースは以下で確認できます。",
       "loadFailed": "mermaid モジュールの読み込みに失敗しました",
       "viewSource": "ソースを表示",
       "syntaxErrorAt": "{line} 行目に構文エラー：{excerpt}"

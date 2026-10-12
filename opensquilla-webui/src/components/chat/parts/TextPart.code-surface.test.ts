@@ -26,7 +26,7 @@ describe('assistant code block surface', () => {
   })
 
   it('keeps the answer text on the shared chrome pass', () => {
-    expect(textPartSource).toContain('decorateCodeBlocks')
+    expect(textPartSource).toContain('useMarkdownEnhancements')
     expect(textPartSource).not.toContain('.code-copy-btn {')
   })
 

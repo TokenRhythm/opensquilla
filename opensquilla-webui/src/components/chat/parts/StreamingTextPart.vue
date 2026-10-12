@@ -13,12 +13,11 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { ref, watch } from 'vue'
 import type { RenderMarkdownOptions } from '@/composables/chat/useChatTextRendering'
-import { decorateCodeBlocks } from '@/utils/chat/codeBlockChrome'
-import { decorateMarkdownImages } from '@/utils/markdown/imageLightbox'
-import { preloadMermaid, renderMermaidBlocks } from '@/utils/markdown/mermaidRenderer'
+import { useMarkdownEnhancements } from '@/composables/chat/useMarkdownEnhancements'
+import { createMarkdownRenderBudget } from '@/utils/markdown/renderCore'
+import { preloadMermaid } from '@/utils/markdown/mermaidRenderer'
 
 const OPEN_BLOCK_LIMIT = 16 * 1024
 const PLAIN_CHUNK_SIZE = 8 * 1024
@@ -27,8 +26,6 @@ const props = defineProps<{
   rawText: string
   renderMarkdown: (text: string, opts?: RenderMarkdownOptions) => string
 }>()
-
-const { t } = useI18n()
 
 interface RichBlock {
   key: string
@@ -51,12 +48,20 @@ type CommittedBlock = RichBlock | PlainBlock
 const committedBlocks = ref<CommittedBlock[]>([])
 const tail = ref('')
 const rootEl = ref<HTMLDivElement | null>(null)
+const resetEpoch = ref(0)
+let renderBudget = createMarkdownRenderBudget()
+
+useMarkdownEnhancements(rootEl, {
+  version: () => committedBlocks.value.length,
+  incremental: true,
+  resetVersion: () => resetEpoch.value,
+})
 
 let acceptedRaw = ''
 let committedOffset = 0
 let scanOffset = 0
-let inFence = false
-let inDisplayMath = false
+let fence: { character: string; length: number } | null = null
+let displayMath: '$$' | '\\[' | null = null
 let blockSequence = 0
 
 function resetState(): void {
@@ -65,9 +70,10 @@ function resetState(): void {
   acceptedRaw = ''
   committedOffset = 0
   scanOffset = 0
-  inFence = false
-  inDisplayMath = false
-  blockSequence = 0
+  fence = null
+  displayMath = null
+  resetEpoch.value += 1
+  renderBudget = createMarkdownRenderBudget()
 }
 
 function appendRichBlock(raw: string, endOffset: number): void {
@@ -77,13 +83,13 @@ function appendRichBlock(raw: string, endOffset: number): void {
     committedBlocks.value.push({
       key: `rich-${blockSequence++}`,
       kind: 'rich',
-      // A committed block renders exactly once — never re-parsed on later
-      // flushes — so the one-time highlight/math cost is bounded per block
-      // (oversized code falls back to plain text inside the renderer).
+      // Immutable commits share one budget for the entire live answer. Once
+      // exhausted, later blocks retain complete escaped source.
       html: props.renderMarkdown(blockText, {
         highlight: true,
         cache: 'none',
         math: 'full',
+        budget: renderBudget,
       }),
     })
   }
@@ -120,14 +126,21 @@ function freezeLongOpenTail(raw: string): void {
   }
 }
 
+function scanDisplayMath(line: string): void {
+  for (const marker of line.matchAll(/\$\$|\\\[|\\\]/g)) {
+    const offset = marker.index ?? 0
+    let escapes = 0
+    for (let index = offset - 1; index >= 0 && line[index] === '\\'; index--) escapes += 1
+    if (escapes % 2 === 1) continue
+    if (!displayMath && (marker[0] === '$$' || marker[0] === '\\[')) displayMath = marker[0]
+    else if ((displayMath === '$$' && marker[0] === '$$') || (displayMath === '\\[' && marker[0] === '\\]')) displayMath = null
+  }
+}
+
 function update(raw: string): void {
   raw = String(raw || '')
   if (!raw.startsWith(acceptedRaw)) resetState()
   acceptedRaw = raw
-
-  // Start loading the mermaid chunk while the fence is still streaming so it
-  // has usually arrived by the time the block commits and renders.
-  if (raw.includes('```mermaid')) preloadMermaid()
 
   while (scanOffset < raw.length) {
     const newline = raw.indexOf('\n', scanOffset)
@@ -136,58 +149,30 @@ function update(raw: string): void {
     const line = raw.slice(scanOffset, newline)
     const trimmed = line.trim()
 
-    if (/^(?:```|~~~)/.test(trimmed)) {
-      inFence = !inFence
-    } else if (!inFence) {
-      const mathMarkers = line.match(/\$\$/g)?.length ?? 0
-      if (mathMarkers % 2 === 1) inDisplayMath = !inDisplayMath
+    if (fence) {
+      const closing = /^ {0,3}(`+|~+)[ \t\r]*$/.exec(line)?.[1]
+      if (closing && closing[0] === fence.character && closing.length >= fence.length) fence = null
+    } else if (displayMath) {
+      scanDisplayMath(line)
+    } else {
+      const opening = /^ {0,3}(`{3,}|~{3,})([^\r]*)\r?$/.exec(line)
+      if (opening && (opening[1]![0] !== '`' || !opening[2]!.includes('`'))) {
+        fence = { character: opening[1]![0]!, length: opening[1]!.length }
+        if (/^\s*mermaid(?:\s|$)/i.test(opening[2]!)) preloadMermaid()
+      } else {
+        scanDisplayMath(line)
+      }
     }
 
     scanOffset = lineEnd
-    if (!trimmed && !inFence && !inDisplayMath) appendRichBlock(raw, lineEnd)
+    // Keep the separator boundary: closing a fence alone can still be inside
+    // a continuous Markdown list, whose next item must share the same parse.
+    if (!trimmed && !fence && !displayMath) appendRichBlock(raw, lineEnd)
   }
 
   freezeLongOpenTail(raw)
   tail.value = raw.slice(committedOffset)
 }
-
-// Committed blocks are stable (appended, keyed, never re-rendered), so one
-// idempotent pass after each DOM flush adds the same chrome the settled
-// TextPart gets: copy buttons, mermaid diagrams, click-to-zoom images.
-function mermaidLabels() {
-  return {
-    zoomIn: t('chat.mermaid.zoomIn'),
-    zoomOut: t('chat.mermaid.zoomOut'),
-    reset: t('chat.mermaid.reset'),
-    copyCode: t('chat.mermaid.copyCode'),
-    copied: t('chat.copied'),
-    copyFailed: t('chat.toast.copyFailed'),
-    exportPng: t('chat.mermaid.exportPng'),
-    loadFailed: t('chat.mermaid.loadFailed'),
-    viewSource: t('chat.mermaid.viewSource'),
-    syntaxErrorAt: (line: number, excerpt: string) => t('chat.mermaid.syntaxErrorAt', { line, excerpt }),
-  }
-}
-
-function decorate(): void {
-  const root = rootEl.value
-  if (!root) return
-  const labels = {
-    copy: t('chat.copy'),
-    copied: t('chat.copied'),
-    copyFailed: t('chat.toast.copyFailed'),
-  }
-  for (const block of root.querySelectorAll<HTMLElement>('.streaming-rich-block')) {
-    decorateCodeBlocks(block, labels)
-    decorateMarkdownImages(block, t('chat.closePreview'))
-    if (block.querySelector('code.language-mermaid')) {
-      void renderMermaidBlocks(block, mermaidLabels()).catch(() => { /* failed fences keep their source */ })
-    }
-  }
-}
-
-watch(() => committedBlocks.value.length, decorate, { flush: 'post' })
-onMounted(decorate)
 
 watch(() => props.rawText, update, { immediate: true })
 </script>

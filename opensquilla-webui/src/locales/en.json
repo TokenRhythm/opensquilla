@@ -3681,6 +3681,9 @@
       "reset": "Reset view",
       "copyCode": "Copy source",
       "exportPng": "Export PNG",
+      "exportFailed": "Could not export the diagram.",
+      "tooLarge": "Diagram too large to preview. Source is available to copy.",
+      "blockedResource": "This diagram contains an unsupported resource URL. Its source is available below.",
       "loadFailed": "The mermaid module failed to load",
       "viewSource": "View source",
       "syntaxErrorAt": "Syntax error on line {line}: {excerpt}"

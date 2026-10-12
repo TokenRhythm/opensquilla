@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { marked } from 'marked'
+import { Parser } from 'marked'
 
 import { useChatTextRendering } from './useChatTextRendering'
 
@@ -22,7 +22,7 @@ describe('useChatTextRendering failure isolation', () => {
 
   it('falls back to inert original text with line breaks and Unicode, then restores normal highlighting', () => {
     const { renderMarkdown } = useChatTextRendering()
-    vi.spyOn(marked, 'parse').mockImplementationOnce(() => { throw new RangeError('parser overflow') })
+    vi.spyOn(Parser, 'parse').mockImplementationOnce(() => { throw new RangeError('parser overflow') })
     const body = '<img src=x onerror="alert(1)">\n<script>alert(2)</script>\n中🙂 & **bold** $x^2$'
     const host = document.createElement('div')
     host.innerHTML = renderMarkdown(body, { highlight: false })

@@ -3596,6 +3596,9 @@
       "reset": "Ansicht zurücksetzen",
       "copyCode": "Quellcode kopieren",
       "exportPng": "PNG exportieren",
+      "exportFailed": "Das Diagramm konnte nicht exportiert werden.",
+      "tooLarge": "Diagramm zu groß für die Vorschau. Der Quellcode kann kopiert werden.",
+      "blockedResource": "Das Diagramm enthält eine nicht unterstützte Ressourcen-URL. Der Quellcode ist unten verfügbar.",
       "loadFailed": "Das mermaid-Modul konnte nicht geladen werden",
       "viewSource": "Quelltext anzeigen",
       "syntaxErrorAt": "Syntaxfehler in Zeile {line}: {excerpt}"

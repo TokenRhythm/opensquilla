@@ -17,11 +17,19 @@ const BLOCKED_TARGETS = [
   'src/example.py:2-4',
 ]
 
+const TINY_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lXcAAAAASUVORK5CYII='
+
 // Exercise the shipped renderer in a real DOM: DOMPurify relies on native
 // Node prototype getters, which happy-dom does not implement equivalently.
 // All Gateway messages are synthetic; no model, credentials or external API.
 async function stubGatewayWithAnswer(page: Page, session: string, text: string, marker: string): Promise<void> {
-  await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+  await page.addInitScript(() => {
+    localStorage.setItem('opensquilla-locale', 'en')
+    localStorage.setItem('opensquilla-theme', 'light')
+  })
+  await page.route('https://example.com/ok.png', route => route.fulfill({
+    contentType: 'image/png', body: Buffer.from(TINY_PNG, 'base64'),
+  }))
   await page.route('**/api/**', route => route.fulfill({ json: {} }))
   await page.routeWebSocket(/\/ws$/, ws => {
     ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
@@ -97,7 +105,7 @@ test('renders only vetted markdown image sources and live mermaid fences', async
     '![Relative image](./local.png)',
     '![Svg data image](data:image/svg+xml;base64,PHN2Zy8+)',
     // Allowed: raster data URI.
-    '![Tiny png](data:image/png;base64,iVBORw0KGgo=)',
+    `![Tiny png](data:image/png;base64,${TINY_PNG})`,
     // Live diagram + a broken fence that must keep its source.
     ['```mermaid', 'flowchart TD', '  a --> b', '```'].join('\n'),
     ['```mermaid', 'not a diagram at all <<<', '```'].join('\n'),
@@ -114,7 +122,10 @@ test('renders only vetted markdown image sources and live mermaid fences', async
   await expect(answer.locator('img[src^="javascript:"]')).toHaveCount(0)
   await expect(answer.locator('img[src="./local.png"]')).toHaveCount(0)
   await expect(answer.locator('img[src^="data:image/svg+xml"]')).toHaveCount(0)
-  await expect(answer.locator('img[src^="data:image/png;base64,iVBORw0KGgo="]')).toHaveCount(1)
+  await expect(answer.locator('img[src^="data:image/png;base64,"]')).toHaveCount(1)
+  await expect.poll(() => answer.locator('img[alt="Ok image"]').evaluate(
+    image => (image as HTMLImageElement).naturalWidth,
+  )).toBe(1)
 
   // The mermaid chunk loads lazily and renders the valid fence live; the
   // broken one becomes an error card that still exposes the source text.
@@ -127,4 +138,57 @@ test('renders only vetted markdown image sources and live mermaid fences', async
   await expect(answer.locator('.mermaid-err-src')).toContainText('not a diagram at all <<<')
   // Click-to-zoom chrome is bound to the decorated images.
   await expect(answer.locator('img.md-img')).toHaveCount(2)
+})
+
+test('markdown image preview owns keyboard focus and restores it on close', async ({ page }) => {
+  await stubGatewayWithAnswer(page, 'agent:main:webchat:markdown-image-focus',
+    'Image focus fixture.\n\n![Ok image](https://example.com/ok.png)', 'image-focus')
+  const image = page.locator('.msg-ai-text img[alt="Ok image"]')
+  await image.focus()
+  await image.press('Enter')
+  const dialog = page.locator('.md-img-lightbox')
+  await expect(dialog).toBeVisible()
+  await page.keyboard.press('Tab')
+  await expect.poll(() => dialog.evaluate(root => root.contains(document.activeElement))).toBe(true)
+  await page.keyboard.press('Shift+Tab')
+  await expect.poll(() => dialog.evaluate(root => root.contains(document.activeElement))).toBe(true)
+  await page.keyboard.press('Escape')
+  await expect(dialog).toHaveCount(0)
+  await expect(image).toBeFocused()
+  await image.press('Enter')
+  await expect(dialog).toBeVisible()
+  await page.getByRole('button', { name: 'Close preview', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+})
+
+test('mermaid links use the common navigation policy and theme changes refresh diagrams', async ({ page }) => {
+  await stubGatewayWithAnswer(page, 'agent:main:webchat:markdown-diagram-policy', [
+    'Diagram policy fixture.',
+    '```mermaid',
+    'flowchart TD',
+    '  A[Documentation] --> B[Local file]',
+    '  click A "https://example.com/docs"',
+    '  click B "file:///C:/Windows/win.ini"',
+    '```',
+  ].join('\n'), 'diagram-policy')
+  const diagram = page.locator('.mermaid-svg-wrap > svg')
+  await expect(diagram).toBeVisible({ timeout: 20_000 })
+  // Mermaid emits SVG xlink:href on some graph types; inspect both SVG URI
+  // representations instead of silently missing an unsafe namespaced link.
+  const links = await diagram.locator('a').evaluateAll(anchors => anchors.map(anchor => ({
+    href: anchor.getAttribute('href') || anchor.getAttribute('xlink:href') || '',
+    rel: anchor.getAttribute('rel'),
+    target: anchor.getAttribute('target'),
+  })))
+  expect(links.some(link => link.href.startsWith('file:'))).toBe(false)
+  expect(links).toContainEqual({ href: 'https://example.com/docs', rel: 'noopener noreferrer', target: '_blank' })
+  const firstId = await diagram.getAttribute('id')
+  await page.locator('.sidebar-foot button[data-icon="settings"]').click()
+  await page.locator('#settings-rail-interface').click()
+  await page.locator('input[name="appearance-theme"][value="dark"]').check({ force: true })
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+  await page.keyboard.press('Escape')
+  await expect(diagram).toBeVisible()
+  await expect.poll(() => diagram.getAttribute('id')).not.toBe(firstId)
+  await expect(page.locator('.mermaid-toolbar')).toHaveCount(1)
 })

@@ -5,8 +5,8 @@ import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentine
 // Chat-bubble facade over the shared markdown pipeline (utils/markdown/
 // renderCore.ts): adds the chat-message-specific presentation transforms
 // (directive tags, generated-artifact markers), the LRU HTML cache, and the
-// copy-text sanitizer. Streaming committed blocks and artifact previews call
-// renderMarkdownCore directly.
+// copy-text sanitizer. Streaming uses this facade with a message-wide budget;
+// artifacts call the core without chat-specific transforms.
 
 const DIRECTIVE_TAG_RE = /\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*/g
 const GENERATED_ARTIFACT_MARKER_RE = /(?:^|\s*)\[generated artifact omitted:\s*[^\]\n]+?\]\s*/gi
@@ -49,7 +49,7 @@ export function useChatTextRendering() {
     // Cache key is namespaced by highlight mode so a plain streaming render is
     // never served where a highlighted one is expected (and vice versa).
     const highlight = opts?.highlight !== false
-    const cacheMode = opts?.cache ?? 'settled'
+    const cacheMode = opts?.budget ? 'none' : opts?.cache ?? 'settled'
     const mathMode = opts?.math ?? 'full'
     const cacheKey = `${highlight ? 'H' : 'P'}${mathMode === 'full' ? 'M' : 'D'}\n${text}`
     if (cacheMode === 'settled') {
@@ -63,13 +63,7 @@ export function useChatTextRendering() {
       }
     }
 
-    let html: string
-    try {
-      html = renderMarkdownCore(text, { highlight, math: mathMode })
-    } catch {
-      const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-      html = `<div class="chat-markdown-plain">${escaped}</div>`
-    }
+    const html = renderMarkdownCore(text, { highlight, math: mathMode, budget: opts?.budget })
 
     if (cacheMode === 'settled') {
       // UTF-16 code units are a conservative and deterministic approximation

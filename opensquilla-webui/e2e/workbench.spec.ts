@@ -1007,6 +1007,39 @@ test.describe('Application Workbench', () => {
     await expect(modeSelect).toHaveValue('offline')
   })
 
+  test('Markdown workbench preview shares diagrams, math, code and image interactions', async ({ page }) => {
+    await openWorkbenchSession(page)
+    await page.route('**/api/v1/artifacts/workbench-guide', route => route.fulfill({
+      contentType: 'text/markdown',
+      body: [
+        '# Shared rich preview',
+        '$\\sqrt{x^2 + y^2}$',
+        '```js\nconst literal = "$x$";\n```',
+        '```mermaid\nflowchart TD\n  A[Read] --> B[Preview]\n```',
+        `![Preview image](data:image/png;base64,${PNG_1x1.toString('base64')})`,
+      ].join('\n\n'),
+    }))
+    await (await deliverablesHeaderAction(page)).click()
+    const workbench = page.getByTestId('workbench-host')
+    await workbench.getByTestId('workbench-artifact-switcher').selectOption({ label: 'guide.md' })
+    const preview = workbench.locator('.artifact-preview__markdown')
+    await expect(preview.locator('.katex')).toHaveCount(1)
+    await expect(preview.locator('code.language-js')).toContainText('"$x$"')
+    await expect(preview.locator('code.language-js .katex')).toHaveCount(0)
+    await expect(preview.locator('pre > .code-copy-btn')).toHaveCount(1)
+    await expect(preview.locator('.mermaid-svg-wrap > svg')).toBeVisible({ timeout: 20_000 })
+    const image = preview.locator('img.md-img')
+    await image.focus()
+    await image.press('Enter')
+    await expect(page.locator('.md-img-lightbox')).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(page.locator('.md-img-lightbox')).toHaveCount(0)
+    await expect(image).toBeFocused()
+    await workbench.getByTestId('workbench-artifact-switcher').selectOption({ label: 'notes.txt' })
+    await expect(workbench.locator('.artifact-preview__text')).toContainText('Workbench notes stay mounted.')
+    await expect(page.locator('[data-mermaid-host]')).toHaveCount(0)
+  })
+
   test('header opens the latest preview and uses a compact artifact switcher', async ({ page }) => {
     const requests = new Map<string, number>()
     await openWorkbenchSession(page, requests)

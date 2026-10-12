@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, ref } from 'vue'
 
 import {
@@ -16,6 +16,82 @@ describe('useDialogA11y modal stack', () => {
     app?.unmount()
     app = null
     document.body.innerHTML = ''
+    vi.restoreAllMocks()
+  })
+
+  it('restores an invoker only after native-surface occlusion has removed its inert ancestor', async () => {
+    const Host = defineComponent({
+      setup() {
+        const open = ref(false)
+        const modal = ref<HTMLElement | null>(null)
+        const blocked = useNativeSurfaceOcclusionState()
+        useDialogA11y(modal, open, () => { open.value = false })
+        return () => h('div', [
+          h('section', { id: 'workbench', inert: blocked.value ? true : undefined }, [
+            h('button', { id: 'inert-invoker', onClick: () => { open.value = true } }, 'Open'),
+          ]),
+          open.value ? h('section', { ref: modal, role: 'dialog' }, [h('button', 'Close')]) : null,
+        ])
+      },
+    })
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    app = createApp(Host)
+    app.mount(root)
+    const invoker = document.querySelector<HTMLButtonElement>('#inert-invoker')!
+    invoker.focus()
+    invoker.click()
+    await nextTick()
+    await nextTick()
+    expect(invoker.closest('[inert]')).not.toBeNull()
+    const focus = invoker.focus.bind(invoker)
+    const blockedAttempts: boolean[] = []
+    vi.spyOn(invoker, 'focus').mockImplementation(() => {
+      const blocked = Boolean(invoker.closest('[inert]'))
+      blockedAttempts.push(blocked)
+      // Happy DOM does not enforce inert focus; simulate Chromium's contract.
+      if (!blocked) focus()
+    })
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+    await nextTick()
+    await nextTick()
+    expect(blockedAttempts).toEqual([false])
+    expect(document.activeElement).toBe(invoker)
+  })
+
+  it('does not restore stale focus when another dialog opens during the close flush', async () => {
+    let handoff = () => {}
+    const Host = defineComponent({
+      setup() {
+        const firstOpen = ref(false)
+        const secondOpen = ref(false)
+        const firstRoot = ref<HTMLElement | null>(null)
+        const secondRoot = ref<HTMLElement | null>(null)
+        useDialogA11y(firstRoot, firstOpen, () => { firstOpen.value = false })
+        useDialogA11y(secondRoot, secondOpen, () => { secondOpen.value = false })
+        handoff = () => { firstOpen.value = false; secondOpen.value = true }
+        return () => h('div', [
+          h('button', { id: 'handoff-invoker', onClick: () => { firstOpen.value = true } }, 'Open'),
+          firstOpen.value ? h('section', { ref: firstRoot }, [h('button', 'First')]) : null,
+          secondOpen.value ? h('section', { ref: secondRoot }, [h('button', { id: 'handoff-target' }, 'Second')]) : null,
+        ])
+      },
+    })
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    app = createApp(Host)
+    app.mount(root)
+    const invoker = document.querySelector<HTMLButtonElement>('#handoff-invoker')!
+    invoker.focus()
+    invoker.click()
+    await nextTick()
+    await nextTick()
+    const staleFocus = vi.spyOn(invoker, 'focus')
+    handoff()
+    await nextTick()
+    await nextTick()
+    expect(staleFocus).not.toHaveBeenCalled()
+    expect(document.activeElement).toBe(document.querySelector('#handoff-target'))
   })
 
   it('lets only the topmost dialog own Tab and Escape, then restores each invoker', async () => {
@@ -84,6 +160,7 @@ describe('useDialogA11y modal stack', () => {
       key: 'Escape', bubbles: true, cancelable: true,
     }))
     await nextTick()
+    await nextTick()
     expect(document.querySelector('[aria-label="Upper"]')).toBeNull()
     expect(document.querySelector('[aria-label="Lower"]')).toBeTruthy()
     expect(document.activeElement).toBe(upperTrigger)
@@ -91,6 +168,7 @@ describe('useDialogA11y modal stack', () => {
     document.dispatchEvent(new KeyboardEvent('keydown', {
       key: 'Escape', bubbles: true, cancelable: true,
     }))
+    await nextTick()
     await nextTick()
     expect(document.querySelector('[aria-label="Lower"]')).toBeNull()
     expect(document.activeElement).toBe(lowerTrigger)
