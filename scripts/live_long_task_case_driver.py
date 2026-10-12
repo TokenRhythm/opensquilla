@@ -98,7 +98,7 @@ _MAX_BROWSER_RESULT_BYTES: Final = 64 * 1024
 _HISTORY_SETTLE_TIMEOUT_SECONDS: Final = 5.0
 _HISTORY_SETTLE_EVENT_WAIT_SECONDS: Final = 0.05
 _STARTUP_PHASES: Final = frozenset({
-    "config", "ownership", "services", "profile_recovery", "app",
+    "config", "ownership", "runtime_import", "services", "profile_recovery", "app",
     "runtime_state", "listener", "gateway_ready",
 })
 _STARTUP_LOG_TAIL_BYTES: Final = 64 * 1024
