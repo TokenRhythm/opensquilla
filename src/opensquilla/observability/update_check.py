@@ -6,8 +6,8 @@ and compares it with the running version, so the Control UI (and the
 is available" notice. This is intentionally passive: it never downloads or
 installs anything, never blocks startup, and never raises.
 
-The result is cached under the state dir with a 24h TTL so each passive channel
-check performs at most one network attempt per day. The check honours the
+Successful results are cached under the state dir for 24h; failed attempts
+retry after a short backoff so repaired network settings can recover. The check honours the
 global network-observability veto plus its dedicated legacy update switch, and
 is skipped automatically in CI and test environments.
 
@@ -65,6 +65,7 @@ LEGACY_V1_RELEASE_TAG_PAGE = "https://github.com/opensquilla/opensquilla/release
 DEFAULT_RELEASES_PAGE = DEFAULT_RELEASES_INDEX_PAGE
 
 DEFAULT_TTL_SECONDS = 24 * 60 * 60
+FAILED_ATTEMPT_RETRY_SECONDS = 5 * 60
 DEFAULT_TIMEOUT_SECONDS = 3.0
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -152,7 +153,7 @@ def refresh_update_check(
                 # v1 stable caches predate attempt throttling. Their last
                 # successful check is the best compatible throttle anchor.
                 last_attempt = state.get("checked_ts")
-            if not force and _is_fresh(last_attempt, ttl_seconds):
+            if not force and _is_fresh(last_attempt, _attempt_ttl(state, ttl_seconds)):
                 info = _info_from_state(
                     state,
                     current=current,
@@ -372,7 +373,13 @@ def _refresh_due(path: Path, channel: _UpdateChannel, ttl_seconds: int) -> bool:
     last_attempt = state.get("last_attempt_ts")
     if not isinstance(last_attempt, (int, float)):
         last_attempt = state.get("checked_ts")
-    return not _is_fresh(last_attempt, ttl_seconds)
+    return not _is_fresh(last_attempt, _attempt_ttl(state, ttl_seconds))
+
+
+def _attempt_ttl(state: dict[str, Any], ttl_seconds: int) -> int:
+    if state.get("last_error"):
+        return min(ttl_seconds, FAILED_ATTEMPT_RETRY_SECONDS)
+    return ttl_seconds
 
 
 def _cached_latest(state: dict[str, Any]) -> str | None:
@@ -634,11 +641,15 @@ def _fetch_latest_release(
     try:
         import httpx
 
+        from opensquilla.observability.http_client import observability_httpx_kwargs
+
         headers = {
             "Accept": "application/json",
             "User-Agent": f"opensquilla/{current_version}",
         }
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        with httpx.Client(
+            timeout=timeout, follow_redirects=True, **observability_httpx_kwargs()
+        ) as client:
             response = client.get(endpoint, headers=headers)
         if response.status_code != 200:
             return None, None, f"http_status_{response.status_code}"

@@ -203,6 +203,65 @@ def test_force_bypasses_ttl(tmp_path: Path, monkeypatch) -> None:
     assert len(fetch.calls) == 2
 
 
+@pytest.mark.parametrize("ttl_seconds,backoff", [(86400, 300), (60, 60)])
+def test_failure_retries_after_short_backoff_without_discarding_candidate(
+    tmp_path: Path, monkeypatch, ttl_seconds: int, backoff: int,
+) -> None:
+    _enable(monkeypatch)
+    clock = [1000]
+    monkeypatch.setattr(update_check, "_now_ts", lambda: clock[0])
+    state_path = tmp_path / "update_check.json"
+    monkeypatch.setattr(update_check, "_fetch_latest_release", _fake_fetch("0.5.7"))
+    update_check.refresh_update_check(state_path=state_path, version="0.5.6")
+    offline = _fake_fetch(None, None, "offline")
+    monkeypatch.setattr(update_check, "_fetch_latest_release", offline)
+    failed = update_check.refresh_update_check(
+        state_path=state_path, version="0.5.6", force=True,
+    )
+    assert failed.latest_version == "0.5.7" and failed.error == "offline"
+    recovered = _fake_fetch("0.5.8")
+    monkeypatch.setattr(update_check, "_fetch_latest_release", recovered)
+    clock[0] += backoff - 1
+    monkeypatch.setattr(update_check, "_CACHED_INFO", {})
+    cached = update_check.refresh_update_check(
+        state_path=state_path, version="0.5.6", ttl_seconds=ttl_seconds,
+    )
+    assert cached.error == "offline" and recovered.calls == []
+    clock[0] += 1
+    result = update_check.refresh_update_check(
+        state_path=state_path, version="0.5.6", ttl_seconds=ttl_seconds,
+    )
+    assert result.latest_version == "0.5.8" and result.error is None
+    assert len(recovered.calls) == 1
+    # Successful checks return to the normal cache duration.
+    clock[0] += ttl_seconds - 1
+    update_check.refresh_update_check(
+        state_path=state_path, version="0.5.6", ttl_seconds=ttl_seconds,
+    )
+    assert len(recovered.calls) == 1
+
+
+def test_background_check_retries_failed_attempt_after_backoff(tmp_path: Path, monkeypatch):
+    _enable(monkeypatch)
+    clock = [1000]
+    monkeypatch.setattr(update_check, "_now_ts", lambda: clock[0])
+    state_path = tmp_path / "update_check.json"
+    monkeypatch.setattr(update_check, "_fetch_latest_release", _fake_fetch(None, None, "offline"))
+    update_check.refresh_update_check(state_path=state_path, version="0.5.6")
+    recovered = _fake_fetch("0.5.7")
+    monkeypatch.setattr(update_check, "_fetch_latest_release", recovered)
+    assert update_check.start_background_update_check(
+        state_path=state_path, version="0.5.6",
+    ) is None
+    clock[0] += update_check.FAILED_ATTEMPT_RETRY_SECONDS
+    worker = update_check.start_background_update_check(state_path=state_path, version="0.5.6")
+    assert worker is not None
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert len(recovered.calls) == 1
+    assert _load(state_path)["last_error"] is None
+
+
 def test_disabled_env_skips_network(tmp_path: Path, monkeypatch) -> None:
     _enable(monkeypatch)
     monkeypatch.setenv(update_check.UPDATE_CHECK_DISABLED_ENV, "1")

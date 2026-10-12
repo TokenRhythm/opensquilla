@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -136,7 +137,7 @@ async def _handle_memory_list(params: dict | None, ctx: RpcContext) -> dict[str,
         raise ValueError("params must be an object")
     agent_id, manager = _require_memory_manager(ctx, (params or {}).get("agentId"))
     root = _memory_root(manager)
-    rows = _memory_source_rows(root)
+    rows = await asyncio.to_thread(_memory_source_rows, root)
     return {"agentId": agent_id, "count": len(rows), "files": rows}
 
 
@@ -254,23 +255,15 @@ def _read_memory_content(
     return "".join(parts), selected_line_count, truncated
 
 
-@_d.method("memory.show", scope="operator.read")
-async def _handle_memory_show(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    if not isinstance(params, dict):
-        raise ValueError("params must be an object")
-    raw_path = str(params.get("path") or "")
-    agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
-
-    _validate_memory_path(raw_path)
-
-    from_line = params.get("fromLine")
-    if from_line is not None:
-        from_line = _int_param(params, "fromLine", 1, minimum=1, maximum=1_000_000)
-    lines = params.get("lines")
-    if lines is not None:
-        lines = _int_param(params, "lines", 1, minimum=1, maximum=_MAX_MEMORY_SHOW_LINES)
-
-    root = _memory_root(manager).resolve()
+def _read_memory_source(
+    root: Path,
+    raw_path: str,
+    *,
+    from_line: int | None,
+    lines: int | None,
+) -> tuple[str, int, bool]:
+    """Keep filesystem authorization and the bounded read in one worker."""
+    root = root.resolve()
     file_path = (root / raw_path).resolve()
     try:
         file_path.relative_to(root)
@@ -286,8 +279,32 @@ async def _handle_memory_show(params: dict | None, ctx: RpcContext) -> dict[str,
     ):
         raise ValueError("memory source is too large; request a line slice")
 
-    content, selected_line_count, truncated = _read_memory_content(
+    return _read_memory_content(
         file_path,
+        from_line=from_line,
+        lines=lines,
+    )
+
+
+@_d.method("memory.show", scope="operator.read")
+async def _handle_memory_show(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    raw_path = str(params.get("path") or "")
+    agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
+    _validate_memory_path(raw_path)
+
+    from_line = params.get("fromLine")
+    if from_line is not None:
+        from_line = _int_param(params, "fromLine", 1, minimum=1, maximum=1_000_000)
+    lines = params.get("lines")
+    if lines is not None:
+        lines = _int_param(params, "lines", 1, minimum=1, maximum=_MAX_MEMORY_SHOW_LINES)
+
+    content, selected_line_count, truncated = await asyncio.to_thread(
+        _read_memory_source,
+        _memory_root(manager),
+        raw_path,
         from_line=from_line,
         lines=lines,
     )

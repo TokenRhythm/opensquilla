@@ -753,7 +753,12 @@ def _database_safety_code(path: Path) -> str | None:
 
     snapshots: list[_DatabaseSourceSnapshot] = []
     try:
-        with tempfile.TemporaryDirectory(prefix="opensquilla-db-inspect-") as temporary:
+        # A scanner or a late-created file can prevent Windows from removing
+        # the disposable snapshot. Cleanup must not replace the inspection
+        # result or abort Gateway startup; validation errors keep their codes.
+        with tempfile.TemporaryDirectory(
+            prefix="opensquilla-db-inspect-", ignore_cleanup_errors=True
+        ) as temporary:
             snapshot_root = Path(temporary)
             with contextlib.suppress(OSError):
                 snapshot_root.chmod(0o700)

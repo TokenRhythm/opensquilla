@@ -333,9 +333,12 @@ def _utc_now() -> str:
 
 async def _post_payload(endpoint: str, payload: dict[str, Any]) -> tuple[bool, str | None]:
     try:
-        import httpx
+        from opensquilla.observability.http_client import create_observability_async_client
 
-        async with httpx.AsyncClient(timeout=install_telemetry.DEFAULT_TIMEOUT_SECONDS) as client:
+        client = await create_observability_async_client(
+            timeout=install_telemetry.DEFAULT_TIMEOUT_SECONDS
+        )
+        async with client:
             response = await client.post(
                 endpoint,
                 json=payload,
