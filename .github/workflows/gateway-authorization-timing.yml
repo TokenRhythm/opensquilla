@@ -1,0 +1,104 @@
+name: Gateway authorization timing
+
+"on":
+  pull_request:
+    paths:
+      - src/opensquilla/sandbox/run_context.py
+      - src/opensquilla/sandbox/run_context_service.py
+      - src/opensquilla/sandbox/user_grants.py
+      - src/opensquilla/sandbox/user_grants_worker.py
+      - tests/test_sandbox/test_user_grants_*.py
+      - scripts/compare_gateway_timing.py
+      - tests/functional/test_gateway_silent_reply_process_e2e.py
+      - .github/workflows/gateway-authorization-timing.yml
+  workflow_dispatch:
+    inputs:
+      baseline_sha:
+        description: Full baseline commit SHA with identical dependency inputs
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gateway-authorization-timing-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  timing:
+    name: Gateway timing (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.15"
+          enable-cache: true
+      - name: Install identical comparison dependencies
+        run: uv sync --extra dev --extra recommended --extra mcp --frozen
+      - name: Compare offline Gateway startup and Default first turn
+        shell: bash
+        env:
+          TIMING_BASE: ${{ inputs.baseline_sha || github.event.pull_request.base.sha }}
+          TIMING_PLATFORM: ${{ matrix.os }}
+        run: |
+          uv run --no-sync python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          baseline_sha = os.environ["TIMING_BASE"]
+          if not re.fullmatch(r"[0-9a-f]{40}", baseline_sha):
+              raise ValueError("Expected a full baseline commit SHA")
+          candidate = Path.cwd().resolve()
+          candidate_sha = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"], text=True,
+          ).strip()
+          baseline = Path(tempfile.mkdtemp(prefix="gateway-baseline-", dir=candidate.parent))
+          output = Path(os.environ["RUNNER_TEMP"]) / "gateway-timing" / "timing.json"
+          subprocess.run(["git", "worktree", "add", "--detach", str(baseline), baseline_sha], check=True)
+          try:
+              subprocess.run([
+                  sys.executable, "scripts/compare_gateway_timing.py",
+                  "--baseline-root", str(baseline), "--candidate-root", str(candidate),
+                  "--baseline-sha", baseline_sha, "--candidate-sha", candidate_sha,
+                  "--samples", "3", "--output", str(output),
+              ], check=True)
+              report = json.loads(output.read_text(encoding="utf-8"))
+              with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+                  summary.write("## Offline Gateway timing — " + os.environ["TIMING_PLATFORM"] + "\n\n")
+                  summary.write("Three alternating samples per source; offline provider, not model TTFT.\n\n")
+                  summary.write("| Metric | Baseline median (ms) | Candidate median (ms) | Ratio |\n")
+                  summary.write("| --- | ---: | ---: | ---: |\n")
+                  for metric, ratio in report["candidate_over_baseline"].items():
+                      before = report["median_ms"]["baseline"][metric]
+                      after = report["median_ms"]["candidate"][metric]
+                      summary.write(f"| {metric} | {before} | {after} | {ratio} |\n")
+          finally:
+              subprocess.run(["git", "worktree", "remove", "--force", str(baseline)], check=True)
+          PY
+      - name: Preserve exact-source timing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-authorization-timing-${{ matrix.os }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gateway-timing/timing.json
+          if-no-files-found: error
+          retention-days: 14
