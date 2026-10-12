@@ -174,12 +174,19 @@ def _local_user_authorized_list(sid: str) -> str:
 
 
 def install_firewall_rules(specs: tuple[FirewallRuleSpec, ...]) -> None:
-    script = "$ErrorActionPreference = 'Stop'; " + "; ".join(
-        powershell_firewall_commands(specs)
-    )
+    script = "$ErrorActionPreference = 'Stop'; " + "; ".join(powershell_firewall_commands(specs))
+    # Firewall provisioning runs inside the elevated helper.  Resolve the
+    # inbox Windows PowerShell binary through the same kernel32-backed path
+    # used by the helper itself; a bare ``powershell`` would allow an inherited
+    # PATH entry to select a user-controlled executable at the elevation
+    # boundary.  Keep the import lazy because setup imports this module while
+    # starting the provisioning operation.
+    from opensquilla.sandbox.backend.windows_default_setup import setup_command_timeout
+
+    powershell = _trusted_windows_powershell_path()
     completed = subprocess.run(
         [
-            "powershell",
+            powershell,
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
@@ -189,10 +196,28 @@ def install_firewall_rules(specs: tuple[FirewallRuleSpec, ...]) -> None:
         capture_output=True,
         text=True,
         check=False,
+        timeout=setup_command_timeout(),
     )
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise SandboxBackendError(f"firewall_rule_install_failed: {detail}")
+
+
+def _trusted_windows_powershell_path() -> str:
+    """Return the setup module's trusted inbox PowerShell path.
+
+    The import is intentionally deferred: ``windows_default_setup`` imports
+    this module from its provisioning function, so a module-level import would
+    make the path helper depend on import order.  Deferring it preserves the
+    existing dependency direction while sharing the System32 resolution that
+    uses ``GetSystemDirectoryW`` rather than ``SystemRoot`` or ``PATH``.
+    """
+
+    from opensquilla.sandbox.backend.windows_default_setup import (
+        _trusted_windows_powershell_path as resolve_path,
+    )
+
+    return resolve_path()
 
 
 __all__ = [

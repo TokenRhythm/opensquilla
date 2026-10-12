@@ -96,10 +96,13 @@ def test_desktop_opens_local_new_task_route_without_control_ui_dependency() -> N
     assert "await window.loadURL(DESKTOP_RENDERER_URL)" in main_ts
     assert "/control/chat/new" not in main_ts
     assert "waitForControlUi" not in main_ts
-    assert "probe: (remainingMs) => readinessCheck(url, remainingMs)" in _section(
+    readiness = _section(
         main_ts,
         "async function waitForGateway",
         "function hasGatewayProcessExited",
+    )
+    assert readiness.index("if (preflight && !await preflight(remainingMs)) return false") < (
+        readiness.index("return await readinessCheck(url, remainingMs)")
     )
 
 
@@ -433,7 +436,11 @@ def test_desktop_boot_resume_waits_for_the_existing_owned_gateway() -> None:
     )
     assert "gatewayProcess === child" in resume_owned
     assert "gatewayProfileKey !== desktopProfileKey()" in resume_owned
-    assert "await waitForGateway(url, childExitMessage)" in resume_owned
+    assert "await waitForGateway(\n    url,\n    childExitMessage," in resume_owned
+    assert (
+        "remainingMs => verifyOwnedGatewayLaunch(child, "
+        "{ emitDiagnostic: false, timeoutMs: remainingMs })"
+    ) in resume_owned
     assert "waitForControlUi" not in resume_owned
     assert "await verifyOwnedGatewayLaunch(child)" in resume_owned
     assert "|| !isCurrent()" in resume_owned
@@ -800,6 +807,60 @@ def test_boot_progress_reports_only_completed_startup_milestones() -> None:
         "  await recoverVerifiedOrphanGatewayBeforeSpawn()"
         not in start_gateway
     )
+
+
+def test_startup_stage_telemetry_covers_each_process_boundary_without_granting_readiness() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    assert "type DesktopStartupStage =" in main_ts
+    for stage in (
+        "profile-inspect",
+        "profile-reconcile",
+        "orphan-owner",
+        "gateway-spawn",
+        "core-ready",
+        "ownership",
+        "legacy-ready",
+        "websocket-connected",
+        "tool-ready",
+    ):
+        assert f"'{stage}'" in main_ts
+    assert "startup_stage_attempt_started" in main_ts
+    assert "startup_stage_attempt_finished" in main_ts
+    assert "stageElapsedMs" in main_ts
+    assert "const startupStageAttempt = beginDesktopStartupStageAttempt()" in main_ts
+
+    recovery_cli = _section(
+        main_ts,
+        "async function runRecoveryCli(",
+        "async function inspectDesktopProfile(",
+    )
+    assert "observeDesktopStartupStage('profile-inspect'" in recovery_cli
+    assert "observeDesktopStartupStage('profile-reconcile'" in recovery_cli
+
+    start_gateway = _section(
+        main_ts,
+        "async function startGateway(): Promise<GatewayState>",
+        "async function startGatewayWithPortRecovery",
+    )
+    assert start_gateway.index("observeDesktopStartupStage('gateway-spawn'") < start_gateway.index(
+        "const child = spawn("
+    )
+    spawn_index = start_gateway.index("const child = spawn(")
+    core_index = start_gateway.index("observeDesktopStartupStage('core-ready'", spawn_index)
+    wait_index = start_gateway.index("await waitForGateway(", spawn_index)
+    assert wait_index < core_index
+    ownership_index = start_gateway.index("observeDesktopStartupStage('ownership'", spawn_index)
+    assert core_index < ownership_index
+    assert ownership_index < start_gateway.index(
+        "observeDesktopStartupStage('legacy-ready'", spawn_index
+    )
+
+    # The renderer hand-off is explicitly an observation boundary. Returning a
+    # descriptor or a status snapshot must not be presented as a proven WebSocket
+    # or tool registration handshake.
+    assert "boundary: 'gateway-connection-ipc'" in main_ts
+    assert "boundary: 'gateway-status-ipc'" in main_ts
+    assert "observed: false" in main_ts
 
 
 def test_boot_and_native_window_backgrounds_match_control_ui_theme_tokens() -> None:
@@ -1761,7 +1822,13 @@ def test_unverified_or_legacy_gateway_record_never_grants_stop_authority() -> No
     shutdown = recovery.index("requestVerifiedDesktopGatewayShutdown(current)")
     assert verification < shutdown
     assert "gateway_ownership_record_untrusted" in recovery
-    assert "gateway_ownership_not_verified" in recovery
+    coordinator = _section(
+        main_ts,
+        "const desktopGatewayOwnershipVerification =",
+        "function verifiedOrphanGatewayError",
+    )
+    assert "onVerificationFailed: (record, diagnostic, exitReason)" in coordinator
+    assert "gateway_ownership_not_verified" in coordinator
     assert "return" in recovery[verification:shutdown]
     # The old gateway.pid schema has no port/profile/nonce proof and remains
     # deliberately absent from this recovery authority path.
@@ -1818,7 +1885,7 @@ def test_desktop_gateway_exit_classifies_newer_config_validation_errors() -> Non
     assert "let childExitMessage: string | null = null" in start
     assert "appendGatewayOutputTail(gatewayOutputTail, chunk)" in start
     assert "classifyGatewayExitMessage(exitMessage, gatewayOutputTail)" in start
-    assert "await waitForGateway(url, () => childExitMessage)" in start
+    assert "await waitForGateway(\n    url,\n    () => childExitMessage," in start
     assert "waitForGatewayReadiness({" in wait
     assert "primaryTimeoutMs: 45_000" in wait
     assert (
@@ -2732,6 +2799,7 @@ def test_package_verifier_hard_fails_stale_runtime_and_boot_contract() -> None:
 def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway() -> None:
     package_json = json.loads(_read("desktop/electron/package.json"))
     recovery = _read("desktop/electron/scripts/test-packaged-session-recovery.mjs")
+    recovery_rpc = _read("desktop/electron/scripts/session-recovery-rpc-evidence.mjs")
     helpers = _read("desktop/electron/scripts/packaged-smoke-helpers.mjs")
 
     assert (
@@ -2745,10 +2813,21 @@ def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway
     assert "app.context().routeWebSocket" in recovery
     assert recovery.index("app.context().routeWebSocket") < recovery.index("app.firstWindow")
     assert recovery.index("page.reload") < recovery.index("page.goto(sessionUrl")
-    assert "chat.history" in recovery
-    assert "sessions.messages.subscribe" in recovery
-    assert "frame.params?.sessionKey === sessionKey" in recovery
-    assert "frame.params?.key === sessionKey" in recovery
+    for method in (
+        "chat.history", "sessions.messages.subscribe", "sessions.messages.snapshot.read",
+    ):
+        assert method in recovery_rpc
+    assert "frame?.type !== 'req'" in recovery_rpc
+    assert "frame.params?.sessionKey === sessionKey" in recovery_rpc
+    assert "frame.params?.key !== sessionKey" in recovery_rpc
+    assert "createSessionRecoveryFault(sessionKey)" in recovery
+    assert "injectHang ? recoveryFault.holdRequest(socketIndex, frame) : null" in recovery
+    assert "recoveryFault.holdResponse(socketIndex, frame, forward)" in recovery
+    assert "rpcEvidence.response(socketIndex, frame, held)" in recovery
+    assert "recoveryFault.close(socketIndex)" in recovery
+    assert recovery.index("rpcEvidence.mark('fault-released')") < recovery.index(
+        "recoveryFault.release()"
+    )
     assert "switchSessionKey = requiredOption('--switch-session-key')" in recovery
     assert "let targetSocketCounted = false" in recovery
     assert recovery.count("countTargetSocket()") == 2
@@ -3092,6 +3171,44 @@ def test_desktop_renderer_loss_revokes_artifact_preview_leases() -> None:
         "if (isMainFrame && !isInPlace) releaseRendererOwnedArtifactPreviews()"
         in full_navigation
     )
+
+
+def test_desktop_renderer_crash_has_bounded_same_window_recovery_fence() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    create_window = _section(
+        main_ts,
+        "async function createMainWindow(): Promise<BrowserWindow>",
+        "function currentMainWindow",
+    )
+    renderer_gone = _section(
+        create_window,
+        "window.webContents.on('render-process-gone'",
+        "window.webContents.on('unresponsive'",
+    )
+    assert "rendererRecoveryGeneration" in renderer_gone
+    assert "let cancelRendererRecovery: (() => void) | null = null" in create_window
+    # A new crash retires the previous listener/timer before reloading, while
+    # retaining its failed-attempt count. Runtime ordering is covered by the
+    # Electron renderer logging/recovery script.
+    assert renderer_gone.index("cancelRendererRecovery?.()") < renderer_gone.index(
+        "rendererRecoveryFailureCount += 1"
+    ) < renderer_gone.index("window.webContents.reload()")
+    assert "cancelRendererRecovery = () => finish('stale')" in renderer_gone
+    assert "if (finished) return" in renderer_gone
+    assert "clearTimeout(timeout)" in renderer_gone
+    assert "removeListener('did-finish-load', onReady)" in renderer_gone
+    assert "cancelRendererRecovery = null" in renderer_gone
+    assert "recoveryGeneration === rendererRecoveryGeneration" in renderer_gone
+    assert "rendererRecoveryFailureCount >= 3" in renderer_gone
+    assert "rendererRecoveryFailureWindowStartedAt >= 60_000" in renderer_gone
+    assert "setTimeout(() => finish('timeout'), 30_000)" in renderer_gone
+    assert "renderer_recovery_scheduled" in renderer_gone
+    assert "renderer_recovery_ready" in renderer_gone
+    assert "rendererPid: window.webContents.getOSProcessId()" in renderer_gone
+    assert "renderer_recovery_exhausted" in renderer_gone
+    assert "window.webContents.reload()" in renderer_gone
+    assert "did-finish-load" in renderer_gone
+    assert "appExitPhase !== 'running'" in renderer_gone
 
 
 def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:

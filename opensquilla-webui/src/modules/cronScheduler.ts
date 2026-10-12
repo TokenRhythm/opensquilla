@@ -45,13 +45,24 @@ export interface CronSubscription {
   close(): void
 }
 
+export interface CronReadOptions {
+  readonly signal?: AbortSignal
+}
+
+export class CronReadUnavailableError extends Error {
+  constructor(message: string, readonly retryAfterMs = 0) {
+    super(message)
+    this.name = 'CronReadUnavailableError'
+  }
+}
+
 export interface CronScheduler {
-  listJobs(): Promise<readonly CronJob[]>
+  listJobs(options?: CronReadOptions): Promise<readonly CronJob[]>
   saveJob(input: CronJobMutation, options: { readonly existing: boolean }): Promise<void>
   setEnabled(jobId: string, enabled: boolean): Promise<void>
   runNow(jobId: string): Promise<CronRunOutcome>
   remove(jobId: string): Promise<void>
-  listRuns(jobId: string, limit?: number): Promise<readonly CronRun[]>
+  listRuns(jobId: string, limit?: number, options?: CronReadOptions): Promise<readonly CronRun[]>
   subscribe(listener: (event: CronRunFinished) => void): CronSubscription
 }
 

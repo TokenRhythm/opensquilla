@@ -58,6 +58,88 @@ async def test_sandbox_setup_status_returns_platform_payload(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
+async def test_setup_does_not_hold_the_same_connection_ordinary_queue(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from opensquilla.gateway import rpc_sandbox
+    from opensquilla.gateway.websocket import WsConnection
+    from opensquilla.sandbox import setup_runtime
+    from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
+
+    setup_runtime.reset_sandbox_setup_runtime_state()
+    release = asyncio.Event()
+    completed = []
+    setup_calls = 0
+
+    async def blocked_setup(_config):
+        nonlocal setup_calls
+        setup_calls += 1
+        await release.wait()
+        return SetupResult(SandboxSetupState.READY, "win32", "ready")
+
+    monkeypatch.setattr(setup_runtime, "ensure_sandbox_setup", blocked_setup)
+    monkeypatch.setattr("opensquilla.sandbox.integration.initialize_runtime_backend", AsyncMock())
+    connection = SimpleNamespace(
+        _ordinary_queue=asyncio.Queue(),
+        _ordinary_stopped=False,
+        _ordinary_worker=None,
+        release_transport_bytes=lambda _size: None,
+    )
+    ctx = _ctx()
+
+    async def ensure():
+        result = await rpc_sandbox._handle_sandbox_setup_ensure({}, ctx)
+        assert result["state"] == "setting_up"
+        completed.append("ensure")
+
+    async def status():
+        result = await rpc_sandbox._handle_sandbox_setup_status({}, ctx)
+        assert result["state"] == "setting_up"
+        completed.append("status")
+
+    async def ordinary_request(name):
+        completed.append(name)
+
+    try:
+        for request in (ensure(), status(), ordinary_request("Full"), ordinary_request("chat")):
+            connection._ordinary_queue.put_nowait((request, 0, None, None))
+        # Exercise the production serialized queue, not concurrent direct calls.
+        worker = asyncio.create_task(WsConnection._run_ordinary_requests(connection))
+        connection._ordinary_worker = worker
+        await asyncio.wait_for(worker, 1)
+        await asyncio.sleep(0)
+        assert completed == ["ensure", "status", "Full", "chat"]
+        assert setup_calls == 1
+        assert not release.is_set()
+        await rpc_sandbox._handle_sandbox_setup_ensure({}, ctx)
+        assert setup_calls == 1
+    finally:
+        release.set()
+        if setup_runtime._SETUP_TASK:
+            await setup_runtime._SETUP_TASK
+        setup_runtime.reset_sandbox_setup_runtime_state()
+
+
+@pytest.mark.asyncio
+async def test_identity_repair_requires_explicit_boolean_parameter(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from opensquilla.gateway import rpc_sandbox
+    from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
+
+    runner = AsyncMock(return_value=SetupResult(SandboxSetupState.SETTING_UP, "win32", "running"))
+    monkeypatch.setattr(rpc_sandbox, "request_sandbox_setup", runner)
+    ctx = _ctx()
+    await rpc_sandbox._handle_sandbox_setup_ensure({}, ctx)
+    runner.assert_awaited_with(ctx.config)
+    await rpc_sandbox._handle_sandbox_setup_ensure({"repairIdentity": True}, ctx)
+    runner.assert_awaited_with(ctx.config, repair_identity=True)
+    with pytest.raises(ValueError, match="boolean"):
+        await rpc_sandbox._handle_sandbox_setup_ensure({"repairIdentity": "true"}, ctx)
+
+
+@pytest.mark.asyncio
 async def test_sandbox_setup_status_returns_setting_up_payload(monkeypatch) -> None:
     from opensquilla.gateway import rpc_sandbox
     from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
@@ -122,7 +204,7 @@ async def test_sandbox_setup_ensure_returns_platform_payload(monkeypatch) -> Non
             requires_admin=True,
         )
 
-    monkeypatch.setattr(rpc_sandbox, "ensure_sandbox_setup_auto", fake_ensure)
+    monkeypatch.setattr(rpc_sandbox, "request_sandbox_setup", fake_ensure)
 
     payload = await rpc_sandbox._handle_sandbox_setup_ensure({}, _ctx())
 

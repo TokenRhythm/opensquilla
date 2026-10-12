@@ -679,6 +679,7 @@ const {
   loadSessions,
   loadMoreSessions,
   cancelPendingRequests,
+  applyConfirmedTitle,
 } = useSessions(sessionDirectory)
 const { bottomRoutes, workNav } = useNavigation()
 const { pushToast } = useToasts()
@@ -764,8 +765,8 @@ const { agents, loadAgents } = useAgentOptions(agentCatalog, optionalSessionRead
 const mobileKeyboardOpen = ref(false)
 const commandPaletteOpen = ref(false)
 const localChatSessions = ref<Record<string, { effectiveAgentId: string; title: string; updatedAt: number }>>({})
-// Pending optimistic renames, keyed by session key; cleared after the next list
-// reload returns the backend's canonical title.
+// Pending optimistic renames, keyed by session key; confirmed names enter the
+// existing list before the temporary override is removed.
 const renameOverrides = ref<Record<string, string>>({})
 
 const chatSessionTitles = computed(() => (
@@ -1135,6 +1136,9 @@ watch(
 )
 
 watch(allSessions, sessions => {
+  // Only positive directory confirmation retires a provisional row; an
+  // absent key may simply be outside the loaded page.
+  removeLocalSessions(new Set(sessions.map(item => item.key)))
   for (const item of sessions) {
     if (!item.key || !item.workspaceId) continue
     freshTaskDraft.confirmMaterializedProjectTask(item.key, item.workspaceId)
@@ -1527,7 +1531,11 @@ async function onProjectDeleteHistory(workspaceId: string) {
       sessions: allSessions.value,
       deletedSessionKeys: result.deletedSessionKeys,
     })
-    sessionTaskAttention.removeMany(result.deletedSessionKeys)
+    const deleted = new Set(result.deletedSessionKeys)
+    removeLocalSessions(deleted)
+    sessionTaskAttention.removeMany(deleted)
+    appStore.removePendingApprovalsForSessions(deleted)
+    dispatchLocalSessionsDeleted(deleted, APP_SESSION_SYNC_SOURCE)
     await loadSessions()
     if (leaveDeletedTask) void openDefaultDraft()
     pushToast(t('workspaces.historyDeleted'), { tone: 'ok' })
@@ -1613,25 +1621,34 @@ async function switchToSession(key: string, source = 'app.switchToSession') {
   if ($route.path === '/chat' && $route.query.session === key) closeSidebarDrawer()
 }
 
-// Optimistic rename: show the new title immediately, then persist through the
-// SessionLifecycle seam and reload so the backend's canonical title wins. The
-// override clears once the reload lands.
+// Only the current rename may update local display state. Later authoritative
+// list snapshots can still rename or remove the row normally.
+let sessionRenameSequence = 0
+const pendingSessionRenames = new Map<string, number>()
 async function onRenameSession({ key, title }: { key: string; title: string }) {
   const next = title.trim()
   if (!key || !next) return
+  const sequence = ++sessionRenameSequence
+  pendingSessionRenames.set(key, sequence)
   renameOverrides.value = { ...renameOverrides.value, [key]: next }
-  const local = localChatSessions.value[key]
-  if (local) localChatSessions.value[key] = { ...local, title: next }
   try {
     await sessionLifecycle.rename({ key, title: next })
+    if (pendingSessionRenames.get(key) !== sequence) return
+    applyConfirmedTitle(key, next)
+    const local = localChatSessions.value[key]
+    if (local) localChatSessions.value[key] = { ...local, title: next }
     pushToast('Session renamed', { tone: 'ok' })
   } catch (err: unknown) {
+    if (pendingSessionRenames.get(key) !== sequence) return
     console.warn('[App] session rename error:', errorMessage(err))
     pushToast('Failed to rename session', { tone: 'danger' })
   } finally {
-    await loadSessions()
-    const { [key]: _dropped, ...rest } = renameOverrides.value
-    renameOverrides.value = rest
+    if (pendingSessionRenames.get(key) === sequence) {
+      pendingSessionRenames.delete(key)
+      const { [key]: _dropped, ...rest } = renameOverrides.value
+      renameOverrides.value = rest
+      await loadSidebarData()
+    }
   }
 }
 

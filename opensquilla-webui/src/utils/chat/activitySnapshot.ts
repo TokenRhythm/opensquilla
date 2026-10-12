@@ -489,10 +489,13 @@ export function activityStatusHistory(snapshot: ActivitySnapshotV2): StatusPart[
 export function activityReasoningBlocks(
   snapshot: ActivitySnapshotV2,
   reasoningText: string,
+  originalUtf16Length?: number,
 ): ReasoningBlock[] | undefined {
-  if ((snapshot.reasoningUtf16Length ?? 0) !== reasoningText.length) return undefined
+  const originalLength = originalUtf16Length ?? reasoningText.length
+  if (!Number.isSafeInteger(originalLength) || originalLength < reasoningText.length
+    || (snapshot.reasoningUtf16Length ?? 0) !== originalLength) return undefined
   const entries = snapshot.entries.filter(entry => entry.type === 'reasoning')
-  if (!entries.length) return reasoningText.length === 0 ? [] : undefined
+  if (!entries.length) return originalLength === 0 ? [] : undefined
   const blocks: ReasoningBlock[] = []
   let previousEnd = 0
   for (const entry of entries) {
@@ -503,11 +506,16 @@ export function activityReasoningBlocks(
     const rawStatus = safeText(entry.status, 32)
     if (
       start === undefined || end === undefined || end < start
-      || end > reasoningText.length || startedAt === undefined
+      || end > originalLength || startedAt === undefined
       || endedAt === undefined || endedAt < startedAt || !rawStatus
     ) return undefined
-    const separator = reasoningText.slice(previousEnd, start)
-    if (blocks.length === 0 ? separator !== '' : separator !== '\n') return undefined
+    // A preview is a prefix, not a new transcript. Validate visible separators
+    // and the original offset adjacency; never move later blocks to the front.
+    if (start !== (blocks.length === 0 ? 0 : previousEnd + 1)) return undefined
+    if (start <= reasoningText.length) {
+      const separator = reasoningText.slice(previousEnd, start)
+      if (blocks.length === 0 ? separator !== '' : separator !== '\n') return undefined
+    }
     blocks.push({
       id: entry.id,
       index: safeInteger(entry.block_index) ?? blocks.length,
@@ -588,17 +596,21 @@ export function activitySnapshotMatchesMessage(
   message: ChatMessage,
 ): boolean {
   if (!snapshot.complete) return false
-  if (activityReasoningBlocks(snapshot, message.reasoning?.text ?? '') === undefined) {
+  if (activityReasoningBlocks(snapshot, message.reasoning?.text ?? '', message.historyPayloadPreview?.reasoningUtf16Length) === undefined) {
     return false
   }
   const textEntries = snapshot.entries
     .filter(entry => entry.type === 'segment' && entry.segment_type === 'text')
     .sort((a, b) => Number(a.text_index) - Number(b.text_index))
   const transcriptTexts = transcriptTextSegments(message)
+  const originalLengths = message.historyPayloadPreview?.textUtf16Lengths
   if (
     textEntries.length !== transcriptTexts.length
+    || (originalLengths !== undefined && originalLengths.length !== transcriptTexts.length)
     || textEntries.some((entry, index) => (
-      Number(entry.text_utf16_length) !== transcriptTexts[index]!.length
+      (originalLengths !== undefined && (!Number.isSafeInteger(originalLengths[index])
+        || originalLengths[index]! < transcriptTexts[index]!.length))
+      || Number(entry.text_utf16_length) !== (originalLengths?.[index] ?? transcriptTexts[index]!.length)
     ))
   ) return false
 

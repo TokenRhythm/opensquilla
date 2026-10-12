@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { runInNewContext } from 'node:vm'
 import {
   SHUTDOWN_CANCELLATION,
   evaluateFirstSendEvidence,
+  firstSendRendererSnapshot,
   observeRendererPages,
   parseEvidenceLog,
   summarizeDesktopLog,
@@ -191,6 +193,67 @@ if (process.argv.includes('--fixture-json')) {
     assert.deepEqual(observed.consoleErrorDetails.map(record => [record.pageId, record.phase, record.line]),
       [[1, 'electron-launch-start', 42], [2, 'electron-cleanup-start', 42]])
     assert.deepEqual(observed.pageErrorDetails.map(record => record.message), ['startup before connected', 'cleanup failure'])
+  })
+
+  test('renderer failure snapshots expose recovery state without reading chat or input contents', () => {
+    let state = 'live-connecting'
+    const privateContent = { get textContent() { assert.fail('message content was read') },
+      get value() { assert.fail('input value was read') } }
+    const elements = {
+      '.conn-pill.connected': {},
+      '.chat-send-btn.btn--primary': { disabled: true, getAttribute: () => 'true' },
+      '.chat-textarea': Object.assign(Object.create(privateContent), { disabled: true }),
+      '.chat-session-recovery-status': { getAttribute: () => state,
+        querySelector: () => assert.fail('notice text was read') },
+    }
+    const document = { querySelector: selector => elements[selector] ?? null,
+      querySelectorAll: selector => selector === '.msg-ai' ? [privateContent] : [] }
+    // Exercise the same self-contained serialization boundary as page.evaluate.
+    const capture = () => JSON.parse(JSON.stringify(runInNewContext(
+      `(${firstSendRendererSnapshot.toString()})()`,
+      { document, location: { pathname: '/chat',
+        href: 'https://example.invalid/chat?session=synthetic-private-session' }, URL },
+    )))
+    assert.deepEqual(capture(), {
+      pathname: '/chat', sessionMaterialized: true, connected: true,
+      sendButtonDisabled: true, sendButtonAriaBusy: true, textareaDisabled: true,
+      recoveryNoticePresent: true, recoveryState: 'live-connecting',
+      assistantMessages: 1, assistantAnswers: 0, errorBoundaries: 0, sessionErrors: [],
+    })
+    state = 'live-degraded'
+    assert.equal(capture().recoveryState, 'live-degraded')
+    state = 'synthetic-private-state'
+    assert.equal(capture().recoveryState, null)
+    assert.doesNotMatch(JSON.stringify(capture()), /synthetic-private/)
+    for (const key of Object.keys(elements)) delete elements[key]
+    const missing = capture()
+    assert.equal(missing.recoveryNoticePresent, false)
+    assert.equal(missing.sendButtonAriaBusy, null)
+    assert.equal(missing.textareaDisabled, null)
+  })
+
+  test('only subscription warnings contribute allowlisted codes without raw warning text', () => {
+    const page = new EventEmitter()
+    const mainFrame = {}
+    page.mainFrame = () => mainFrame
+    page.frames = () => [mainFrame]
+    const context = new EventEmitter()
+    context.pages = () => [page]
+    const observed = observeRendererPages(context, () => 'iteration-start')
+    const emit = (type, text) => page.emit('console', { type: () => type, text: () => text })
+    emit('warning', 'Unrelated warning STORAGE_BUSY synthetic-secret')
+    emit('log', 'Session stream subscription failed: STORAGE_BUSY synthetic-secret')
+    emit('warning', 'Session stream subscription failed: STORAGE_BUSY synthetic-secret')
+    emit('warning', 'Session stream subscription failed: synthetic-secret-and-unknown-error')
+    assert.deepEqual(observed.sessionStreamWarnings.map(({ pageId, phase, code }) => ({ pageId, phase, code })), [
+      { pageId: 1, phase: 'iteration-start', code: 'STORAGE_BUSY' },
+      { pageId: 1, phase: 'iteration-start', code: null },
+    ])
+    assert.doesNotMatch(JSON.stringify(observed.sessionStreamWarnings), /synthetic-secret|subscription failed/)
+    assert.deepEqual(observed.consoleErrorDetails, [])
+    const fixture = evidenceFixture(0)
+    fixture.renderer.sessionStreamWarnings = observed.sessionStreamWarnings
+    assert.deepEqual(evaluateFirstSendEvidence(fixture).failures, [])
   })
 
   test('subframe history survives detach and invalidates earlier or later cancellation attribution', () => {

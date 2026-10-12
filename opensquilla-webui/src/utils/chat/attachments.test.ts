@@ -79,6 +79,16 @@ describe('model-input image detection', () => {
 })
 
 describe('attachment display normalization', () => {
+  it('keeps a bounded missing reason without dropping an independently usable read source', () => {
+    const attachment = normalizeDisplayAttachment({ name: 'synthetic.png', mime: 'image/png',
+      missing_reason: `  ${'unavailable'.repeat(40)}  `, download_url: '/api/v1/attachments/synthetic' })
+    expect(attachment.missingReason).toBe('unavailable'.repeat(40).slice(0, 256))
+    expect(attachment.download_url).toBe('/api/v1/attachments/synthetic')
+    expect(normalizeDisplayAttachment({ missing_reason: { unexpected: true } }).missingReason).toBeUndefined()
+    expect(normalizeDisplayAttachment({ missing_reason: '  ' }).missingReason).toBeUndefined()
+    expect(normalizeDisplayAttachment(attachment).missingReason).toBe(attachment.missingReason)
+  })
+
   it('preserves the workspace target from history without inventing attachment storage identity', () => {
     const workspaceFile = { workspaceId: 'project-fixture', relativePath: 'docs/notes.md',
       name: 'notes.md', mime: 'text/markdown', size: 14 }

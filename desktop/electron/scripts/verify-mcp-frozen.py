@@ -55,10 +55,12 @@ def main() -> int:
     result = subprocess.run(
         [sys.executable, "-m", "pytest",
          "tests/test_desktop/test_gateway_functional_probes.py::"
+         "test_gateway_fresh_profile_reaches_healthz",
+         "tests/test_desktop/test_gateway_functional_probes.py::"
          "test_mcp_probe_uses_real_stdio_server_and_gateway", "-q"],
         cwd=root, env=environment,
     )
-    print(f"MCP-only frozen probe artifacts: {output}", flush=True)
+    print(f"MCP frozen probe artifacts: {output}", flush=True)
     return result.returncode
 
 

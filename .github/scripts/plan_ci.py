@@ -209,11 +209,13 @@ _SKILL_HUB_TESTS: Final = frozenset(
         "tests/test_engine/test_skill_install_settlement.py",
         "tests/test_gateway/test_skill_install_status.py",
         "tests/test_skills/test_hub_install_operations.py",
+        "tests/test_skills/test_install_operation_io.py",
         "tests/test_skills/test_staging_io_worker.py",
         "tests/test_skill_install_source.py",
         "tests/test_skills_hub_streaming.py",
         "tests/test_skills_hub_streaming_faults.py",
         "tests/test_skills/test_hub_management_service.py",
+        "tests/test_skills/test_hub_rollback_serialization.py",
         "tests/test_skills/test_hub_scanner.py",
         "tests/test_skills/test_hub_transaction_recovery.py",
         "tests/test_skills/test_hub_transaction_process_gates.py",
@@ -606,9 +608,15 @@ def _load_windows_test_partitions(
             if family is not None and shard.rsplit("-", 1)[0] != family:
                 raise PlanError(f"Windows test partition changed family ownership: {test_path}")
             physical[test_path] = str(shard)
+    partitions_by_family: dict[str, list[str]] = {}
+    for shard in sorted(allowed_shards):
+        partitions_by_family.setdefault(shard.rsplit("-", 1)[0], []).append(shard)
     return {
         test_path: physical.get(test_path)
-        or f"{family}-{int(hashlib.sha256(test_path.encode('utf-8')).hexdigest(), 16) % 2 + 1}"
+        or partitions_by_family[family][
+            int(hashlib.sha256(test_path.encode("utf-8")).hexdigest(), 16)
+            % len(partitions_by_family[family])
+        ]
         for test_path, family in assignments.items()
     }
 
@@ -674,10 +682,10 @@ def load_config(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
     expected_windows = {
         f"{family}-{partition}"
         for family in python_matrix["ubuntu"]
-        for partition in (1, 2)
+        for partition in range(1, 5 if family == "gateway-sqlite" else 3)
     }
     if set(python_matrix["windows"]) != expected_windows:
-        raise PlanError("Windows matrix must define two physical shards per Python family")
+        raise PlanError("Windows matrix must define four gateway shards and two per other family")
 
     assignments_path = value.get(_WINDOWS_ASSIGNMENTS_CONFIG_KEY)
     if (
@@ -1595,7 +1603,10 @@ def _execution_matrices(
         if shard in config["full_python_matrix"]["windows"]:
             physical_windows_shards.add(shard)
         elif shard in config["full_python_matrix"]["ubuntu"]:
-            physical_windows_shards.update(f"{shard}-{partition}" for partition in (1, 2))
+            physical_windows_shards.update(
+                physical for physical in config["full_python_matrix"]["windows"]
+                if physical.rsplit("-", 1)[0] == shard
+            )
         else:
             raise PlanError(f"unknown Windows execution shard: {shard}")
     python_matrix = {

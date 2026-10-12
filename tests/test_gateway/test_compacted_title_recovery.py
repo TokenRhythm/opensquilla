@@ -194,12 +194,8 @@ async def test_compacted_title_batch_contains_only_affected_sessions(
         assert set(canonical_batch.await_args.args[0]) == affected_ids
         assert canonical_batch.await_args.kwargs == {"limit_per_session": 3}
         canonical_batch.reset_mock()
-        if method == "sessions.list":
-            active_batch.assert_awaited_once()
-            assert not (set(active_batch.await_args.args[0]) & affected_ids)
-            active_batch.reset_mock()
-        else:
-            active_batch.assert_not_awaited()
+        # Every unaffected row has an authoritative stored title.
+        active_batch.assert_not_awaited()
     full_active.assert_not_awaited()
     full_canonical.assert_not_awaited()
     assert await storage.list_sessions() == before
@@ -219,8 +215,7 @@ async def test_normal_titles_do_not_add_canonical_reads(
 
     listed = await _dispatch(manager, "sessions.list")
     assert listed["sessions"][0]["title"] == "Sample database guide"
-    active_batch.assert_awaited_once()
-    active_batch.reset_mock()
+    active_batch.assert_not_awaited()
     preview = await _dispatch(manager, "sessions.preview")
     assert preview["previews"][0]["title"] == "Sample database guide"
     active_batch.assert_not_awaited()

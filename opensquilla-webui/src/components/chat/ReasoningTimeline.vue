@@ -24,6 +24,7 @@ import type { ReasoningBlock, ReasoningBlockStatus } from '@/types/turnlog'
 
 const emit = defineEmits<{
   revealComplete: []
+  openChange: [open: boolean]
 }>()
 
 const props = defineProps<{
@@ -60,6 +61,8 @@ const LARGE_BURST_CHARS = 96
 const REVEAL_CHARS_PER_FRAME = 32
 
 const visibleBlocks = computed(() => props.blocks.filter(block => block.text))
+watch(() => visibleBlocks.value.some(block => openById.get(block.id) === true),
+  open => emit('openChange', open), { immediate: true, flush: 'post' })
 
 function prefersReducedMotion(): boolean {
   return typeof window !== 'undefined'

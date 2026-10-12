@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -656,7 +657,10 @@ async def test_file_delete_preserves_symlink_referent(tmp_path, monkeypatch) -> 
         sandbox_policy=SandboxPolicy(),
         sandbox_gateway_config=SimpleNamespace(state_dir=str(tmp_path / "state")),
     )
-    monkeypatch.setattr(shell, "gate_elevated_action", lambda *_a, **_k: _AllowedGate())
+    monkeypatch.setattr(
+        shell, "gate_elevated_action_async",
+        AsyncMock(side_effect=lambda *_a, **_k: _AllowedGate()),
+    )
     token = current_tool_context.set(context)
     try:
         result = await shell._gate_recursive_delete(
@@ -1210,7 +1214,7 @@ async def test_recursive_delete_requires_warning_before_mutation(
         reviewed_actions.append(action)
         return _PendingGate()
 
-    monkeypatch.setattr(shell, "gate_elevated_action", _capture_action)
+    monkeypatch.setattr(shell, "gate_elevated_action_async", AsyncMock(side_effect=_capture_action))
     token = current_tool_context.set(context)
     try:
         result = await shell._gate_recursive_delete(
@@ -1249,7 +1253,10 @@ async def test_approved_recursive_delete_is_backed_up_then_removed(
         sandbox_policy=SandboxPolicy(),
         sandbox_gateway_config=SimpleNamespace(state_dir=str(tmp_path / "state")),
     )
-    monkeypatch.setattr(shell, "gate_elevated_action", lambda *_a, **_k: _AllowedGate())
+    monkeypatch.setattr(
+        shell, "gate_elevated_action_async",
+        AsyncMock(side_effect=lambda *_a, **_k: _AllowedGate()),
+    )
     offloaded: list[str] = []
 
     async def inline_to_thread(function, *args, **kwargs):
@@ -1294,7 +1301,9 @@ async def test_literal_file_delete_uses_the_same_approval_and_backup_gate(
         sandbox_gateway_config=SimpleNamespace(state_dir=str(tmp_path / "state")),
     )
     gates = iter((_PendingGate(), _AllowedGate()))
-    monkeypatch.setattr(shell, "gate_elevated_action", lambda *_a, **_k: next(gates))
+    monkeypatch.setattr(
+        shell, "gate_elevated_action_async", AsyncMock(side_effect=lambda *_a, **_k: next(gates)),
+    )
     token = current_tool_context.set(context)
     try:
         first = await shell._gate_recursive_delete(
@@ -1338,7 +1347,9 @@ async def test_missing_state_dir_is_reported_only_after_first_delete_approval(
         sandbox_gateway_config=SimpleNamespace(state_dir=""),
     )
     gates = iter((_PendingGate(), _AllowedGate(), _PendingGate()))
-    monkeypatch.setattr(shell, "gate_elevated_action", lambda *_a, **_k: next(gates))
+    monkeypatch.setattr(
+        shell, "gate_elevated_action_async", AsyncMock(side_effect=lambda *_a, **_k: next(gates)),
+    )
     token = current_tool_context.set(context)
     try:
         first = await shell._gate_recursive_delete(
@@ -1381,7 +1392,9 @@ async def test_file_delete_with_backup_disabled_warns_then_deletes_without_backu
         sandbox_gateway_config=SimpleNamespace(state_dir=str(tmp_path / "state")),
     )
     gates = iter((_PendingGate(), _AllowedGate()))
-    monkeypatch.setattr(shell, "gate_elevated_action", lambda *_a, **_k: next(gates))
+    monkeypatch.setattr(
+        shell, "gate_elevated_action_async", AsyncMock(side_effect=lambda *_a, **_k: next(gates)),
+    )
     token = current_tool_context.set(context)
     try:
         first = await shell._gate_recursive_delete(
@@ -1423,7 +1436,9 @@ async def test_denied_file_delete_keeps_the_exact_target(
         sandbox_gateway_config=SimpleNamespace(state_dir=str(tmp_path / "state")),
     )
     gates = iter((_PendingGate(), _DeniedGate()))
-    monkeypatch.setattr(shell, "gate_elevated_action", lambda *_a, **_k: next(gates))
+    monkeypatch.setattr(
+        shell, "gate_elevated_action_async", AsyncMock(side_effect=lambda *_a, **_k: next(gates)),
+    )
     token = current_tool_context.set(context)
     try:
         first = await shell._gate_recursive_delete(
@@ -1493,7 +1508,10 @@ async def test_recursive_delete_detects_target_change_after_approval(
         sandbox_policy=SandboxPolicy(),
         sandbox_gateway_config=SimpleNamespace(state_dir=str(tmp_path / "state")),
     )
-    monkeypatch.setattr(shell, "gate_elevated_action", lambda *_a, **_k: _PendingGate())
+    monkeypatch.setattr(
+        shell, "gate_elevated_action_async",
+        AsyncMock(side_effect=lambda *_a, **_k: _PendingGate()),
+    )
     token = current_tool_context.set(context)
     try:
         first = await shell._gate_recursive_delete(
@@ -1503,7 +1521,10 @@ async def test_recursive_delete_detects_target_change_after_approval(
         )
         assert json.loads(first or "{}")["approval_id"] == "pending"
         data.write_text("changed", encoding="utf-8")
-        monkeypatch.setattr(shell, "gate_elevated_action", lambda *_a, **_k: _AllowedGate())
+        monkeypatch.setattr(
+            shell, "gate_elevated_action_async",
+            AsyncMock(side_effect=lambda *_a, **_k: _AllowedGate()),
+        )
         result = await shell._gate_recursive_delete(
             f"Remove-Item -Recurse -Force '{target}'",
             cwd=str(tmp_path / "workspace"),

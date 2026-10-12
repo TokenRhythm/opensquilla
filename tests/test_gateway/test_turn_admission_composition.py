@@ -148,7 +148,9 @@ methods = (
 assert rpc_chat._turn_admission_adapter_factory is rpc_sessions.build_gateway_turn_admission_adapter
 registry = get_dispatcher()
 # Includes durable receipts and execution logs after workflow and agent admin retirement.
-assert len(registry.list_methods()) == 270
+# The v2 recovery contracts and video discovery add seven production methods.
+# Keep the exact count so an unrelated RPC cannot slip into the registry.
+assert len(registry.list_methods()) == 276
 assert registry.get_entry("onboarding.videoGeneration.models.discover") is not None
 assert registry.get_entry("router.feedback.submit") is None
 assert registry.get_entry("router.selflearning.status") is None

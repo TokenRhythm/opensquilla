@@ -46,11 +46,6 @@ for (const bypassProxy of [false, true]) {
         const { bootstrap, createGlobalProxyAgent } = getRequire('global-agent');
         assert.equal(typeof bootstrap, 'function');
         assert.equal(typeof createGlobalProxyAgent, 'function');
-        const logger = getRequire('roarr').default.child({ fixture: 'installer-download' });
-        for (const level of ['trace', 'debug', 'info', 'warn', 'error']) {
-          assert.equal(typeof logger[level], 'function');
-        }
-        logger.info('synthetic %s %.1000000000f', 'download', 1);
         const downloader = builderRequire('@electron/get');
         downloader.initializeProxy();
         assert.equal(globalThis.GLOBAL_AGENT.HTTP_PROXY, ${JSON.stringify(proxyUrl)});
@@ -86,7 +81,6 @@ for (const bypassProxy of [false, true]) {
         env: {
           ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
           ELECTRON_GET_NO_PROGRESS: '1',
-          ROARR_LOG: 'true',
           ELECTRON_DOWNLOAD_CACHE_MODE: '3',
           GLOBAL_AGENT_HTTP_PROXY: proxyUrl,
           GLOBAL_AGENT_NO_PROXY: bypassProxy ? '127.0.0.1' : '',

@@ -99,7 +99,13 @@ jobs:
         env:
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: '1'
           OPENSQUILLA_SMOKE_PROVISION_SANDBOX: '1'
+          OPENSQUILLA_FIRST_SEND_TRACE_PATH: ${{ runner.temp }}/security-first-send-trace.zip
         run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
+            throw 'Windows Safe provisioning requires a disposable GitHub-hosted runner.'
+          }
+          # Select the disposable runner's real user profile; the child validates its SID.
+          $env:OPENSQUILLA_SMOKE_SANDBOX_PROFILE_ROOT = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.opensquilla'
           $inventory = 'dist/desktop-electron/win-unpacked/resources/runtime/gateway/dependency-inventory.json'
           python .github/scripts/audit_dependencies.py --repo . --python-only --python-inventory $inventory --output-dir "$env:RUNNER_TEMP/frozen-dependency-audit"
           if ($LASTEXITCODE -ne 0) { throw 'Frozen dependency audit failed' }
@@ -164,6 +170,7 @@ jobs:
           name: packaged-first-send-evidence
           path: |
             ${{ runner.temp }}/security-first-send-report.log
+            ${{ runner.temp }}/security-first-send-trace.zip
             ${{ runner.temp }}/security-first-send/logs/desktop.log*
             ${{ runner.temp }}/security-first-send/first-send-main-console.jsonl
           if-no-files-found: warn

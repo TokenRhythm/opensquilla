@@ -42,6 +42,67 @@ def logon_offline_identity(identity: OfflineSandboxIdentity) -> int:
     return _logon_user_native(identity.username, password)
 
 
+def validate_offline_identity(identity: OfflineSandboxIdentity) -> bool:
+    """Fresh setup-only check, including recreated-account SID mismatches.
+
+    Keep this out of status polling and tool preparation; setup is an explicit
+    operation and must not trust the runtime readiness cache.
+    """
+    token = logon_offline_identity(identity)
+    try:
+        return _token_user_sid(token) == identity.sid
+    finally:
+        _close_token(token)
+
+
+def _close_token(token: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle(wintypes.HANDLE(token))
+
+
+def _token_user_sid(token: int) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class TokenUser(ctypes.Structure):
+        _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
+
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [wintypes.LPVOID]
+    kernel32.LocalFree.restype = wintypes.LPVOID
+    needed = wintypes.DWORD()
+    advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))
+    if not needed.value:
+        raise OSError("offline_identity_sid_unavailable")
+    buffer = ctypes.create_string_buffer(needed.value)
+    if not advapi32.GetTokenInformation(token, 1, buffer, needed, ctypes.byref(needed)):
+        raise OSError("offline_identity_sid_unavailable")
+    sid = wintypes.LPWSTR()
+    if not advapi32.ConvertSidToStringSidW(TokenUser.from_buffer(buffer).Sid, ctypes.byref(sid)):
+        raise OSError("offline_identity_sid_unavailable")
+    try:
+        return str(sid.value)
+    finally:
+        kernel32.LocalFree(sid)
+
+
 def protect_password(password: str) -> str:
     return _protect_password_native(password)
 

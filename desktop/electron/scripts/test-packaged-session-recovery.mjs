@@ -11,7 +11,7 @@ import {
   DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
 } from './packaged-smoke-helpers.mjs'
 import { assertConcurrentRecoveryTransport } from './session-recovery-transport-contract.mjs'
-import { createSessionRecoveryEvidence } from './session-recovery-rpc-evidence.mjs'
+import { createSessionRecoveryEvidence, createSessionRecoveryFault } from './session-recovery-rpc-evidence.mjs'
 import {
   captureElectronProcessIdentity,
   captureFirstSendDiagnostic,
@@ -59,6 +59,7 @@ let heldHistoryRequests = 0
 let heldSubscribeRequests = 0
 let serverTickCount = 0
 const rpcEvidence = createSessionRecoveryEvidence(sessionKey)
+const recoveryFault = createSessionRecoveryFault(sessionKey)
 let faultReleased = 0
 let provider
 
@@ -138,12 +139,24 @@ async function configureSyntheticRecoveryProvider(baseUrl) {
   const raw = await readFile(configPath, 'utf8')
   assert.equal(raw.split(/\r?\n/, 1)[0], `# Synthetic ${label} release-preservation profile`,
     'recovered-send verification requires its explicitly seeded synthetic profile')
-  const headings = [...raw.matchAll(/^\[llm\]\r?$/gm)]
+  // The release-preservation seed contains absolute profile roots.  The
+  // packaged probe is intentionally run from a disposable copy, so stale
+  // roots would make Gateway read a different profile than the one recorded
+  // by the harness and produce false recovery/viewport failures.  Rebind only
+  // this explicitly synthetic fixture before launch; a real user profile is
+  // rejected by the header assertion above and is never rewritten.
+  const profileRoot = resolve(userDataDir, 'opensquilla')
+  const rebound = raw
+    .replace(/^state_dir = .*$/m, `state_dir = ${JSON.stringify(resolve(profileRoot, 'state'))}`)
+    .replace(/^workspace_dir = .*$/m, `workspace_dir = ${JSON.stringify(resolve(profileRoot, 'workspace'))}`)
+  assert.match(rebound, new RegExp(`^state_dir = ${escapeRegExp(JSON.stringify(resolve(profileRoot, 'state')))}$`, 'm'))
+  assert.match(rebound, new RegExp(`^workspace_dir = ${escapeRegExp(JSON.stringify(resolve(profileRoot, 'workspace')))}$`, 'm'))
+  const headings = [...rebound.matchAll(/^\[llm\]\r?$/gm)]
   assert.equal(headings.length, 1, 'the synthetic profile must have one LLM section')
   const start = headings[0].index
-  const next = raw.indexOf('\n[', start + 1)
-  const end = next < 0 ? raw.length : next
-  const section = raw.slice(start, end)
+  const next = rebound.indexOf('\n[', start + 1)
+  const end = next < 0 ? rebound.length : next
+  const section = rebound.slice(start, end)
   assert.match(section, /^provider = "ollama"\r?$/m)
   assert.ok(section.includes(`model = "${recoveryModel}"`), 'the profile must use the synthetic model')
   const updated = section.replace(/^base_url = "http:\/\/127\.0\.0\.1:11434"\r?$/m,
@@ -151,7 +164,11 @@ async function configureSyntheticRecoveryProvider(baseUrl) {
   assert.notEqual(updated, section, 'the synthetic baseline endpoint must be present')
   // Existing profile config is authoritative over Desktop's credential cache.
   // Only this disposable send probe redirects its synthetic provider endpoint.
-  await writeFile(configPath, raw.slice(0, start) + updated + raw.slice(end), 'utf8')
+  await writeFile(configPath, rebound.slice(0, start) + updated + rebound.slice(end), 'utf8')
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 async function captureRecoveryFailure() {
@@ -227,18 +244,21 @@ try {
     const server = client.connectToServer()
 
     client.onClose(() => {
+      recoveryFault.close(socketIndex)
       physicalCloseCount += 1
       if (!injectHang) healthyCloseCount += 1
     })
 
     client.onMessage((message) => {
+      let frame
       try {
-        const frame = JSON.parse(String(message))
-        const held = injectHang && (
-          (frame.method === 'chat.history' && frame.params?.sessionKey === sessionKey)
-          || (frame.method === 'sessions.messages.subscribe' && frame.params?.key === sessionKey)
-        )
-        rpcEvidence.request(socketIndex, frame, held)
+        frame = JSON.parse(String(message))
+      } catch {
+        // Non-JSON protocol frames must remain byte-transparent.
+      }
+      if (frame) {
+        const faultDomain = injectHang ? recoveryFault.holdRequest(socketIndex, frame) : null
+        rpcEvidence.request(socketIndex, frame, faultDomain !== null)
         if (
           frame?.type === 'req'
           && frame.method === 'sessions.messages.subscribe'
@@ -248,26 +268,12 @@ try {
           healthyNavigationSocketIds.add(socketIndex)
           healthySubscribeKeys.push(frame.params.key)
         }
-        if (frame?.type === 'req' && injectHang) {
-          if (
-            frame.method === 'chat.history'
-            && frame.params?.sessionKey === sessionKey
-          ) {
-            countTargetSocket()
-            heldHistoryRequests += 1
-            return
-          }
-          if (
-            frame.method === 'sessions.messages.subscribe'
-            && frame.params?.key === sessionKey
-          ) {
-            countTargetSocket()
-            heldSubscribeRequests += 1
-            return
-          }
+        if (faultDomain !== null) {
+          countTargetSocket()
+          if (faultDomain === 'history') heldHistoryRequests += 1
+          else heldSubscribeRequests += 1
+          return
         }
-      } catch {
-        // Non-JSON protocol frames must remain byte-transparent.
       }
       try {
         server.send(message)
@@ -278,23 +284,35 @@ try {
     })
 
     server.onMessage((message) => {
+      const forward = () => {
+        try {
+          client.send(message)
+        } catch {
+          // The client can close while the real Gateway emits a final tick.
+        }
+      }
+      let frame
       try {
-        const frame = JSON.parse(String(message))
-        rpcEvidence.response(socketIndex, frame)
+        frame = JSON.parse(String(message))
+      } catch {
+        // Non-JSON protocol frames must remain byte-transparent.
+      }
+      if (frame) {
+        const held = recoveryFault.holdResponse(socketIndex, frame, forward)
+        rpcEvidence.response(socketIndex, frame, held)
+        if (held) {
+          countTargetSocket()
+          heldHistoryRequests += 1
+          return
+        }
         if (typeof frame?.protocol === 'number') {
           socketPolicies.set(socketIndex, frame.policy)
         }
         if (frame?.type === 'event' && frame.event === 'tick') {
           serverTickCount += 1
         }
-      } catch {
-        // Non-JSON protocol frames must remain byte-transparent.
       }
-      try {
-        client.send(message)
-      } catch {
-        // The client can close while the real Gateway emits a final tick.
-      }
+      forward()
     })
   })
 
@@ -495,6 +513,7 @@ try {
 
   injectHang = false
   faultReleased = rpcEvidence.mark('fault-released')
+  recoveryFault.release()
   // No click, reload, route change or focus movement may be needed to recover.
   await waitFor(
     () => recoveredMessage.isVisible(),

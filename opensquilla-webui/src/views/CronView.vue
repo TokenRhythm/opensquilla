@@ -131,12 +131,19 @@
       :on-retry="cronJobs.loadData"
     />
 
-    <div v-else-if="!cronJobs.hasLoaded.value || (cronJobs.loading.value && cronJobs.jobs.value.length === 0)" class="state">
+    <div v-if="cronJobs.waitingForCapacity.value" class="state" role="status">
+      <p>{{ t('cronSkills.jobs.waitingForCapacity') }}</p>
+      <button type="button" class="btn btn--ghost" :disabled="cronJobs.loading.value" @click="cronJobs.loadData">
+        {{ t('shared.errorState.retry') }}
+      </button>
+    </div>
+
+    <div v-else-if="!cronJobs.error.value && !cronJobs.hasLoaded.value" class="state">
       <LoadingSpinner />
     </div>
 
     <CronJobList
-      v-else-if="cronJobs.jobs.value.length > 0"
+      v-if="cronJobs.jobs.value.length > 0"
       :jobs="cronJobs.filteredSortedJobs.value"
       :total-jobs="cronJobs.jobs.value.length"
       :search-text="cronJobs.searchText.value"
@@ -167,6 +174,8 @@
       :job="selectedJob"
       :runs="cronRuns.runs.value"
       :loading="cronRuns.runsLoading.value"
+      :waiting="cronRuns.waitingForCapacity.value"
+      :error="cronRuns.error.value"
       @close="selectedId = null"
       @open-chat="openRunChat"
     />

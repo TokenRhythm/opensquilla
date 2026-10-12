@@ -94,6 +94,16 @@ def _unavailable_status() -> RuntimePackStatus:
     )
 
 
+def management_supported(state_dir: str | Path | None = None) -> bool:
+    """Check catalog/platform support without inspecting installed components."""
+
+    try:
+        return get_runtime_pack_service(state_dir).management_supported
+    except Exception:
+        _LOG.debug("Runtime Pack management is unavailable", exc_info=True)
+        return False
+
+
 def status_snapshot(
     state_dir: str | Path | None = None,
 ) -> RuntimePackStatus:
@@ -256,6 +266,7 @@ __all__ = [
     "discover_catalog_path",
     "get_runtime_pack_service",
     "load_default_catalog",
+    "management_supported",
     "remove_component",
     "resolve_component_binary",
     "runtime_packs_root",

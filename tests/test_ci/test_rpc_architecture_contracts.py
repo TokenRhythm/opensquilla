@@ -133,8 +133,8 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Retire router learning status and training feedback (two generated methods).
 # Retire the three advanced agent administration methods.
 # Add video-generation model discovery without changing existing method names.
-RUNTIME_RPC_METHOD_BASELINE = 270
-RUNTIME_RPC_METHOD_DIGEST = "a58ffce916956d12d6a333620115f88e0ef914d05c7a766aca4062b8f459854f"
+RUNTIME_RPC_METHOD_BASELINE = 276
+RUNTIME_RPC_METHOD_DIGEST = "bbbdbc03db0735074506ce88b2406082116f560fbd560a04916d988a113df523"
 STATIC_RPC_DECORATOR_BASELINE = 63
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -1492,10 +1492,14 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     for method in (
         "sessions.messages.snapshot.read", "transport.flow.update", "sessions.executionLog.read",
         "sessions.messages.resume", "sessions.messages.snapshot.release",
+        "sessions.history.page.v2", "sessions.read.close.v2", "sessions.read.install.v2",
+        "sessions.read.open.v2", "sessions.read.state.v2", "transport.sessionFlow.update.v2",
     ):
         entry = registry.get_entry(method)
         assert entry is not None
+        assert entry.name == method
         assert entry.required_scope == "operator.read"
+        assert entry.generated_contract_name == method
         assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
         assert entry.handler.__name__ == "handle_contract_method"
 

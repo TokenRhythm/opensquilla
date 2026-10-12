@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from opensquilla.application.admission_errors import (
     AdmissionQueueFullError,
+    AdmissionResourceBusyError,
     AdmissionShuttingDownError,
 )
 from opensquilla.application.admission_views import AdmissionSessionIntent
@@ -28,7 +29,11 @@ from opensquilla.gateway.session_model_routing import (
     capture_prepared_session_model_routing_config,
 )
 from opensquilla.gateway.session_services import get_session_storage
-from opensquilla.gateway.task_runtime import TaskQueueFullError, TaskRuntimeShuttingDownError
+from opensquilla.gateway.task_runtime import (
+    TaskQueueFullError,
+    TaskResidentBusyError,
+    TaskRuntimeShuttingDownError,
+)
 from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
 from opensquilla.paths import media_root_from_config
 from opensquilla.session.models import SessionIntent
@@ -50,6 +55,8 @@ async def _translate_runtime_rejection() -> AsyncIterator[None]:
         yield
     except TaskQueueFullError as exc:
         raise AdmissionQueueFullError(exc.session_key, exc.max_pending) from exc
+    except TaskResidentBusyError as exc:
+        raise AdmissionResourceBusyError(exc.session_key, exc.max_resident) from exc
     except TaskRuntimeShuttingDownError as exc:
         raise AdmissionShuttingDownError(exc.session_key) from exc
 

@@ -46,6 +46,7 @@ from opensquilla.gateway.config_migration import (
     migrate_config_payload,
     rewrite_migrated_config_best_effort,
 )
+from opensquilla.observability.settings_save import settings_save_stage
 from opensquilla.paths import default_opensquilla_home, native_io_path
 
 log = structlog.get_logger(__name__)
@@ -627,7 +628,9 @@ def _config_write_lock(target: Path) -> Iterator[None]:
     if os.fstat(fd).st_size == 0:
         os.write(fd, b"\0")
     with os.fdopen(fd, "r+b", buffering=0) as fh:
+        settings_save_stage("file_lock_wait")
         _lock_config_file(fh)
+        settings_save_stage("file_lock_acquired")
         try:
             yield
         finally:
@@ -959,6 +962,7 @@ def persist_config(
 
         # Re-validate to catch any invariant breakage that survived model_dump.
         GatewayConfig.model_validate(copy.deepcopy(merged))
+        settings_save_stage("persist_validated")
         next_baseline = copy.deepcopy(current_dump) if same_path else None
         next_raw_base = copy.deepcopy(merged) if same_path else None
 
@@ -1001,7 +1005,10 @@ def persist_config(
         else:
             if backup and target_io.exists():
                 backup_path = make_config_backup(target)
+            settings_save_stage("backup_finished")
             atomic_write_config(target, merged)
+
+        settings_save_stage("disk_committed")
 
         config.consume_force_persist_path_segments(force_paths)
 

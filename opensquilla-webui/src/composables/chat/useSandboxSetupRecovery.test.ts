@@ -40,6 +40,29 @@ function runtime(options: {
 }
 
 describe('useSandboxSetupRecovery', () => {
+  it('keeps existing Safe capability during a check and clears it after invalidity', async () => {
+    vi.useFakeTimers()
+    const readiness = vi.fn()
+      .mockResolvedValueOnce({ status: status('setting_up'), capability: { available: true } })
+      .mockResolvedValueOnce({ status: status('setting_up'), capability: { available: false } })
+      .mockResolvedValueOnce({ status: status('failed'), capability: null })
+    const scope = effectScope()
+    const recovery = scope.run(() => useSandboxSetupRecovery({
+      sandbox: runtime({ readiness }), connectionState: ref('connected'), runMode: ref('safe'),
+    }))!
+    await Promise.resolve()
+    expect(recovery.available.value).toBe(true)
+    expect(recovery.visible.value).toBe(false)
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(recovery.available.value).toBe(false)
+    expect(recovery.visible.value).toBe(true)
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(recovery.status.value?.state).toBe('failed')
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(readiness).toHaveBeenCalledTimes(3)
+    scope.stop()
+  })
+
   it('can defer the first read until session bootstrap admits it', async () => {
     const sandbox = runtime()
     const scope = effectScope()
