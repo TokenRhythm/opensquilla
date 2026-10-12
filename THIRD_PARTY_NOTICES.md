@@ -58,9 +58,9 @@ SOFTWARE.
 ## Markdown diagrams and rich rendering
 
 The Web UI dynamically bundles [Mermaid](https://github.com/mermaid-js/mermaid)
-11.17.2. Diagram interaction and sequence-diagram compatibility helpers were
-adapted from [browsa](https://github.com/xiaohuzai/browsa), including its preview
-height estimates and semicolon retry behavior. OpenSquilla owns the Vue
+11.17.2 (npm package `mermaid`). Diagram interaction and sequence-diagram
+compatibility helpers were adapted from [browsa](https://github.com/xiaohuzai/browsa),
+including its preview height estimates and semicolon retry behavior. OpenSquilla owns the Vue
 lifecycle, resource policy, and shared rendering integration. Both upstreams
 are MIT licensed; their notices are retained here.
 
