@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import threading
 from pathlib import Path
@@ -243,6 +244,85 @@ def test_edit_diff_preserves_final_newline_change() -> None:
     assert "-before\n\\ No newline at end of file\n+before\n" in snapshot["content"]
 
 
+@pytest.mark.parametrize("change", ["replace", "insert", "delete", "append", "multiple"])
+def test_local_diff_keeps_original_unified_hunks_and_line_numbers(change: str) -> None:
+    before = [f"line {index}\n" for index in range(80)]
+    after = before.copy()
+    if change == "replace":
+        after[50] = "changed\n"
+    elif change == "insert":
+        after[50:50] = ["inserted\n", "another\n"]
+    elif change == "delete":
+        del after[50:52]
+    elif change == "append":
+        after.append("final without newline")
+    else:
+        after[25] = "first change\n"
+        after[50] = "second change\n"
+    expected = "".join(
+        line if line.endswith("\n") else line + "\n\\ No newline at end of file\n"
+        for line in difflib.unified_diff(before, after, fromfile="source.txt", tofile="source.txt")
+    )
+    assert build_file_edit_snapshot("source.txt", "".join(before), "".join(after)) == {
+        "kind": "edit", "path": "source.txt", "content": expected,
+    }
+
+
+@pytest.mark.parametrize("replacement", ["after\n", "", "after\ninserted\n"])
+def test_repeated_unchanged_lines_keep_complete_local_diff(replacement: str) -> None:
+    original = "same\n" * 1500 + "before\n" + "same\n" * 1500
+    updated = original.replace("before\n", replacement)
+    snapshot = build_file_edit_snapshot("source.txt", original, updated)
+    after_count = 6 + len(replacement.splitlines())
+    expected = (
+        "--- source.txt\n+++ source.txt\n"
+        f"@@ -1498,7 +1498,{after_count} @@\n"
+        + " same\n" * 3 + "-before\n"
+        + "".join("+" + line for line in replacement.splitlines(keepends=True))
+        + " same\n" * 3
+    )
+    assert snapshot == {"kind": "edit", "path": "source.txt", "content": expected}
+
+
+def test_reordered_small_file_never_enters_unbounded_diff_matching(monkeypatch) -> None:
+    from opensquilla import file_snapshot
+
+    original = "".join(f"line_{index:05d}\n" for index in range(8000))
+    updated = "".join(f"line_{index ^ 1:05d}\n" for index in range(8000))
+    calls = []
+
+    def unexpected_diff(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("over-budget input reached SequenceMatcher")
+
+    monkeypatch.setattr(file_snapshot.difflib, "unified_diff", unexpected_diff)
+    snapshot = build_file_edit_snapshot("reordered.txt", original, updated)
+    assert snapshot == {
+        "kind": "edit", "path": "reordered.txt", "content": "", "content_unavailable": True,
+    }
+    assert calls == []
+
+
+def test_large_file_local_edit_matches_only_bounded_context(monkeypatch) -> None:
+    from opensquilla import file_snapshot
+
+    original = "".join(f"line_{index:05d}\n" for index in range(90_000))
+    updated = original.replace("line_45000\n", "changed\n")
+    observed = []
+    original_diff = difflib.unified_diff
+
+    def record_input(before, after, **kwargs):
+        observed.append((len(before), len(after)))
+        return original_diff(before, after, **kwargs)
+
+    monkeypatch.setattr(file_snapshot.difflib, "unified_diff", record_input)
+    snapshot = build_file_edit_snapshot("large.txt", original, updated)
+    assert observed == [(7, 7)]
+    assert "@@ -44998,7 +44998,7 @@\n" in snapshot["content"]
+    assert "-line_45000\n+changed\n" in snapshot["content"]
+    assert "content_unavailable" not in snapshot
+
+
 async def test_edit_display_diff_does_not_block_the_event_loop(tmp_path, monkeypatch):
     """The mutation is complete while slow display capture runs elsewhere."""
     path = tmp_path / "source.txt"
@@ -278,7 +358,7 @@ async def test_edit_display_diff_does_not_block_the_event_loop(tmp_path, monkeyp
     assert "-before\n+after\n" in result.file_snapshot["content"]
 
 
-@pytest.mark.parametrize("limit", ["input", "lines", "output", "failure"])
+@pytest.mark.parametrize("limit", ["input", "lines", "work", "output", "failure"])
 async def test_display_capture_limits_never_fail_a_successful_edit(tmp_path, monkeypatch, limit):
     from opensquilla import file_snapshot
 
@@ -288,6 +368,8 @@ async def test_display_capture_limits_never_fail_a_successful_edit(tmp_path, mon
         monkeypatch.setattr(file_snapshot, "MAX_EDIT_SNAPSHOT_INPUT_BYTES", 4)
     elif limit == "lines":
         monkeypatch.setattr(file_snapshot, "MAX_EDIT_SNAPSHOT_LINES", 1)
+    elif limit == "work":
+        monkeypatch.setattr(file_snapshot, "MAX_EDIT_SNAPSHOT_LINE_PAIRS", 1)
     elif limit == "output":
         monkeypatch.setattr(file_snapshot, "MAX_EDIT_SNAPSHOT_BYTES", 4)
     else:

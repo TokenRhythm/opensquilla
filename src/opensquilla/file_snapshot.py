@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +19,10 @@ _INLINE_BYTE_LIMIT = 4 * 1024
 MAX_EDIT_SNAPSHOT_INPUT_BYTES = 16 * 1024 * 1024
 MAX_EDIT_SNAPSHOT_LINES = 100_000
 MAX_EDIT_SNAPSHOT_BYTES = 8 * 1024 * 1024
+# SequenceMatcher can take quadratic time even on small, reordered files.
+# Apply this budget to the differing region, keeping ordinary local edits cheap.
+MAX_EDIT_SNAPSHOT_LINE_PAIRS = 1_000_000
+_HUNK_HEADER = re.compile(r"^@@ -(\d+)(,\d+)? \+(\d+)(,\d+)? @@(.*)$")
 # JSON may escape each UTF-8 byte into six ASCII bytes; leave room for metadata.
 MAX_FILESYSTEM_REPLY_BYTES = 64 * 1024 * 1024
 log = logging.getLogger(__name__)
@@ -89,9 +94,31 @@ def build_file_edit_snapshot(path: str, original: str, updated: str) -> dict[str
         after = updated.splitlines(keepends=True)
         if max(len(before), len(after)) > MAX_EDIT_SNAPSHOT_LINES:
             return unavailable
+        prefix = 0
+        while prefix < min(len(before), len(after)) and before[prefix] == after[prefix]:
+            prefix += 1
+        before_end, after_end = len(before), len(after)
+        while (
+            before_end > prefix and after_end > prefix
+            and before[before_end - 1] == after[after_end - 1]
+        ):
+            before_end -= 1
+            after_end -= 1
+        # Retain the same three context lines that unified_diff normally emits.
+        # Cropping also prevents repeated unchanged lines inflating match work.
+        offset = max(0, prefix - 3)
+        before = before[offset:min(len(before), before_end + 3)]
+        after = after[offset:min(len(after), after_end + 3)]
+        if len(before) * len(after) > MAX_EDIT_SNAPSHOT_LINE_PAIRS:
+            return unavailable
         lines: list[str] = []
         retained_bytes = 0
         for line in difflib.unified_diff(before, after, fromfile=path, tofile=path):
+            if offset and (header := _HUNK_HEADER.match(line)):
+                line = (
+                    f"@@ -{int(header[1]) + offset}{header[2] or ''} "
+                    f"+{int(header[3]) + offset}{header[4] or ''} @@{header[5]}\n"
+                )
             literal = line if line.endswith("\n") else line + "\n\\ No newline at end of file\n"
             retained_bytes += len(literal.encode("utf-8"))
             if retained_bytes > MAX_EDIT_SNAPSHOT_BYTES:
