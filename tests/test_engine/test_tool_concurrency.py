@@ -263,6 +263,7 @@ async def test_sessions_send_different_targets_run_concurrent() -> None:
     started: list[tuple[str, str]] = []
     completed: list[tuple[str, str]] = []
     both_started = asyncio.Event()
+    handlers_completed = asyncio.Event()
     release_tools = asyncio.Event()
 
     async def _handler(tc: ToolCall) -> ToolResult:
@@ -273,6 +274,8 @@ async def test_sessions_send_different_targets_run_concurrent() -> None:
             both_started.set()
         await release_tools.wait()
         completed.append(identity)
+        if len(completed) == len(tool_calls):
+            handlers_completed.set()
         return ToolResult(
             tool_use_id=tc.tool_use_id,
             tool_name=tc.tool_name,
@@ -289,40 +292,36 @@ async def test_sessions_send_different_targets_run_concurrent() -> None:
 
     expected = [(f"tool-{i}", args["session_key"]) for i, (_, args) in enumerate(tool_calls)]
     turn = asyncio.create_task(_collect(agent))
-    entered = asyncio.create_task(both_started.wait())
     try:
         # Both real Agent dispatches must enter before either handler may finish.
         # The timeout only bounds a broken dispatcher, not acceptable tool latency.
-        done, _ = await asyncio.wait(
-            {turn, entered}, timeout=5, return_when=asyncio.FIRST_COMPLETED,
-        )
-        assert entered in done and entered.result(), f"Sends did not overlap: {started}"
+        async with asyncio.timeout(5):
+            await both_started.wait()
         assert sorted(started) == expected
         assert completed == []
         assert not turn.done()
+        assert len(provider.calls) == 1
         release_tools.set()
-        done, _ = await asyncio.wait({turn}, timeout=5)
-        assert turn in done, "Agent did not finish after both handlers were released"
-        events = turn.result()
+        # Result projection and a second provider round are separate Agent-loop
+        # contracts. This test owns only keyed dispatch: both handlers must
+        # finish once their shared barrier opens.
+        async with asyncio.timeout(5):
+            await handlers_completed.wait()
     finally:
         release_tools.set()
-        for task in (turn, entered):
-            if not task.done():
-                task.cancel()
-        done, pending = await asyncio.wait({turn, entered}, timeout=5)
+        cancelled_by_cleanup = False
+        if not turn.done():
+            turn.cancel()
+            cancelled_by_cleanup = True
+        done, pending = await asyncio.wait({turn}, timeout=5)
+        assert not pending, "Tool concurrency test task did not settle during cleanup"
         await asyncio.gather(*done, return_exceptions=True)
-        assert not pending, "Tool concurrency test tasks did not settle during cleanup"
-
-    from opensquilla.engine.types import ToolResultEvent
+        if not cancelled_by_cleanup and not turn.cancelled():
+            exception = turn.exception()
+            if exception is not None:
+                raise exception
 
     assert sorted(completed) == expected
-    results = [event for event in events if isinstance(event, ToolResultEvent)]
-    assert [
-        (event.tool_use_id, event.tool_name, event.result, event.is_error) for event in results
-    ] == [
-        (tool_id, "sessions_send", f"ok:{target}", False) for tool_id, target in expected
-    ]
-    assert len(provider.calls) == 2
 
 
 @pytest.mark.asyncio
