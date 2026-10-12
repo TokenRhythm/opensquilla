@@ -75,7 +75,7 @@ async def test_onboarding_catalog_returns_providers_and_channels(tmp_path, monke
     image_provider_ids = {p["providerId"] for p in payload["imageGenerationProviders"]}
     assert {"openai", "openrouter"} <= image_provider_ids
     audio_provider_ids = {p["providerId"] for p in payload["audioProviders"]}
-    assert {"elevenlabs"} <= audio_provider_ids
+    assert {"elevenlabs", "atlascloud"} <= audio_provider_ids
     assert all("whatYouNeed" in p for p in payload["audioProviders"])
     memory_provider_ids = {p["providerId"] for p in payload["memoryEmbeddingProviders"]}
     assert {

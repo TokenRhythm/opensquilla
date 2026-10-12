@@ -47,6 +47,37 @@ _AUDIO_PROVIDER_DATA: dict[str, dict[str, Any]] = {
         "default_tts_model": "eleven_multilingual_v2",
         "default_tts_voice": "21m00Tcm4TlvDq8ikWAM",
         "default_language_code": "",
+        "readme_scenarios": (
+            "text-to-speech",
+            "speech-to-text",
+            "voice cloning",
+            "voice conversion",
+            "dubbing",
+            "music and singing",
+        ),
+        "what_you_need": (
+            "API key via ELEVENLABS_API_KEY or a one-time paste.",
+            "A default TTS voice id for generated speech.",
+            "Optional language code to guide accent and pronunciation.",
+        ),
+    },
+    "atlascloud": {
+        "label": "Atlas Cloud Audio",
+        "env_key": "ATLASCLOUD_API_KEY",
+        "default_base_url": "https://api.atlascloud.ai",
+        "default_tts_model": "elevenlabs/v3/text-to-speech",
+        "default_tts_voice": "hpp4J3VqNfWAUOO0d1Us",
+        "default_language_code": "",
+        "readme_scenarios": (
+            "text-to-speech",
+            "instrumental music",
+            "music and singing",
+        ),
+        "what_you_need": (
+            "API key via ATLASCLOUD_API_KEY or a one-time paste.",
+            "An Atlas Cloud TTS voice id for generated speech.",
+            "Optional language code to guide pronunciation.",
+        ),
     },
 }
 
@@ -127,19 +158,8 @@ def list_audio_provider_setup_specs() -> list[AudioProviderSetupSpec]:
             deployment="cloud",
             blocking=False,
             can_probe=False,
-            readme_scenarios=(
-                "text-to-speech",
-                "speech-to-text",
-                "voice cloning",
-                "voice conversion",
-                "dubbing",
-                "music and singing",
-            ),
-            what_you_need=(
-                f"API key via {data['env_key']} or a one-time paste.",
-                "A default TTS voice id for generated speech.",
-                "Optional language code to guide accent and pronunciation.",
-            ),
+            readme_scenarios=tuple(data["readme_scenarios"]),
+            what_you_need=tuple(data["what_you_need"]),
             fields=_fields_for(data),
         )
         for provider_id, data in _AUDIO_PROVIDER_DATA.items()
