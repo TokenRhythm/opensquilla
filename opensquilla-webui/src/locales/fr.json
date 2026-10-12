@@ -3723,7 +3723,7 @@
     "placeholder": "Envoyer un message...",
     "placeholderCompact": "Message...",
     "placeholderLanding": "Assignez une tâche ou demandez n'importe quoi",
-    "aiDisclaimer": "Contenu généré par l’IA, fourni à titre indicatif. Vérifiez les informations importantes.",
+    "aiDisclaimer": "L’IA peut se tromper. Vérifiez les informations importantes.",
     "aiGeneratedLabel": "Contenu généré par l’IA, fourni à titre indicatif.",
     "removeAttachment": "Supprimer la pièce jointe",
     "remove": "Supprimer",

@@ -32,9 +32,8 @@ export interface UseChatComposerShortcutsOptions {
   handleLongPaste?: (text: string, event?: InputEvent) => boolean
   /**
    * Undo an uncommitted message edit, returning whether it had one to undo.
-   * Escape has to offer this before it clears the composer: edit mode has no
-   * other exit, and clearing the draft on its own leaves the truncated
-   * transcript on screen (#1372).
+   * Escape exits edit mode and restores its saved draft/transcript (#1372).
+   * An ordinary draft is never discarded by this shortcut.
    */
   cancelMessageEdit?: () => boolean
   isSafariWebKit?: () => boolean
@@ -141,23 +140,12 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
     }
 
     if (e.key === 'Escape' && !options.isStreaming.value) {
-      // An uncommitted edit outranks clearing the draft, and is offered before
-      // the guards below rather than inside them. Those guards exist for the
-      // draft-clearing behaviour: an empty composer, or a non-empty pending
-      // queue, used to mean Escape did nothing here. While an edit is live
-      // that would leave the truncated transcript on screen with no way out,
-      // which is the defect this is fixing, one queued message away.
-      // Streaming still belongs to Stop.
+      // Cancel edits even with an empty input or pending queue. Otherwise keep
+      // the draft, its persistence and native undo history intact. Streaming
+      // still belongs to the document-level Stop shortcut.
       if (options.cancelMessageEdit?.()) {
         e.preventDefault()
         resetInputHistory()
-        return
-      }
-      if (options.pendingQueue.value.length === 0 && options.inputText.value) {
-        e.preventDefault()
-        clearTextareaUndoState()
-        options.inputText.value = ''
-        options.autoResizeTextarea()
         return
       }
     }

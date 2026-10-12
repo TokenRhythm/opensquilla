@@ -47,6 +47,7 @@ function harness(over: {
   canQueueMore?: boolean
   safari?: boolean
   slashOpen?: boolean
+  isStreaming?: boolean
   filteredSlashCmds?: ChatSlashCommand[]
   cancelMessageEdit?: () => boolean
   handleLongPaste?: (text: string) => boolean
@@ -75,7 +76,7 @@ function harness(over: {
     slashOpen: ref(over.slashOpen ?? false),
     slashIdx: ref(0),
     filteredSlashCmds: ref(over.filteredSlashCmds ?? []),
-    isStreaming: ref(false),
+    isStreaming: ref(over.isStreaming ?? false),
     isSafariWebKit: () => over.safari ?? false,
     handleLongPaste: over.handleLongPaste,
     ...spies,
@@ -468,15 +469,27 @@ describe('Escape and message edits', () => {
     expect(inputText.value).toBe('draft')
   })
 
-  it('still clears the draft when there is no edit to cancel', () => {
+  it('preserves an ordinary draft and leaves Escape unclaimed when no edit is live', () => {
     const { api, inputText, spies } = harness({ inputText: 'just a draft' })
 
     const e = keydown({ key: 'Escape', target: field('just a draft', 'end') })
     api.onTextareaKeydown(e)
 
     expect(spies.cancelMessageEdit).toHaveBeenCalledOnce()
-    expect(inputText.value).toBe('')
-    expect(e.preventDefault).toHaveBeenCalledOnce()
+    expect(inputText.value).toBe('just a draft')
+    expect(spies.autoResizeTextarea).not.toHaveBeenCalled()
+    expect(e.preventDefault).not.toHaveBeenCalled()
+  })
+
+  it('leaves streaming Escape to Stop without changing the queued draft', () => {
+    const { api, inputText, spies } = harness({ inputText: 'next request', isStreaming: true })
+    const e = keydown({ key: 'Escape', target: field('next request', 'end') })
+
+    api.onTextareaKeydown(e)
+
+    expect(inputText.value).toBe('next request')
+    expect(spies.cancelMessageEdit).not.toHaveBeenCalled()
+    expect(e.preventDefault).not.toHaveBeenCalled()
   })
 
   it('leaves the slash menu Escape alone', () => {

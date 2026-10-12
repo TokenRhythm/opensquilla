@@ -3723,7 +3723,7 @@
     "placeholder": "发送消息……",
     "placeholderCompact": "消息……",
     "placeholderLanding": "分配任务或提出任何问题",
-    "aiDisclaimer": "内容由 AI 生成，仅供参考，请核实重要信息。",
+    "aiDisclaimer": "AI 可能出错，请核实重要信息。",
     "aiGeneratedLabel": "内容由 AI 生成，仅供参考。",
     "removeAttachment": "移除附件",
     "remove": "移除",

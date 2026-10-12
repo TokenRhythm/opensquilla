@@ -125,7 +125,7 @@ describe('ChatComposer image-send guard', () => {
     expect(send.disabled).toBe(true)
     send.click()
     expect(onSend).not.toHaveBeenCalled()
-    expect(el.querySelector('.chat-ai-disclaimer')?.textContent).toBe(i18n.global.t('chat.aiDisclaimer'))
+    expect(el.querySelector('.chat-ai-disclaimer')).toBeNull()
     app.unmount()
   })
 

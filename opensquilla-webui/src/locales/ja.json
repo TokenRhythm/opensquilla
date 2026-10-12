@@ -3723,7 +3723,7 @@
     "placeholder": "メッセージを送信...",
     "placeholderCompact": "メッセージ...",
     "placeholderLanding": "タスクを割り当てるか、何でも質問してください",
-    "aiDisclaimer": "AI により生成された内容です。参考情報としてご利用いただき、重要な情報はご確認ください。",
+    "aiDisclaimer": "AI は間違えることがあります。重要な情報は確認してください。",
     "aiGeneratedLabel": "AI により生成された内容です。参考情報としてご利用ください。",
     "removeAttachment": "添付を削除",
     "remove": "削除",
