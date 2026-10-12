@@ -47,7 +47,7 @@ describe('RunTrace Markdown ownership', () => {
     document.body.append(host)
     const app = createApp(defineComponent(() => () => h(RunTrace, {
       items: messages.value, presentation: 'activity',
-      isToolGroupOpen: () => false, isToolItemOpen: () => false,
+      isToolGroupOpen: () => undefined, isToolItemOpen: () => undefined,
     }))).use(i18n)
     app.mount(host)
     try {

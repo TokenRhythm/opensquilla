@@ -55,7 +55,7 @@ describe('activitySnapshot v2', () => {
       { text: 'A', activityOrder: 6, id: 'reasoning-1' },
     ])
     const timeline: ChatStreamTimelineItem[] = [{ type: 'text', key: 'first', rawText: 'fi', html: 'fi' }]
-    expect(applyActivityOrdersToTimeline(timeline, snapshot)[0]?.activityOrder).toBe(31)
+    expect(applyActivityOrdersToTimeline(timeline, snapshot, message.historyPayloadPreview?.textUtf16Lengths)[0]?.activityOrder).toBe(31)
     expect(activitySnapshotMatchesMessage(snapshot, { ...message, historyPayloadPreview: undefined })).toBe(false)
     expect(activitySnapshotMatchesMessage(snapshot, {
       ...message, historyPayloadPreview: { ...message.historyPayloadPreview, textUtf16Lengths: [6] },
@@ -76,6 +76,56 @@ describe('activitySnapshot v2', () => {
     ])
     expect(activityReasoningBlocks(physical, 'A😀 wrong', 10)).toBeUndefined()
   })
+  it('retains chronology when persistence joins adjacent final answer and delivery text', () => {
+    const coalesced: ActivitySnapshotV2 = {
+      ...snapshot,
+      entries: [...snapshot.entries,
+        { type: 'segment', id: 'text:1', order: 51, segment_type: 'text', text_index: 1, text_utf16_length: 8 },
+        { type: 'phase', id: 'write:3:61', order: 61, kind: 'write', phase: 'writing', round: 3 },
+        { type: 'segment', id: 'text:2', order: 61, segment_type: 'text', text_index: 2, text_utf16_length: 4 },
+      ],
+    }
+    const message: ChatMessage = {
+      role: 'assistant', text: 'firstanswer😀note', ts: 1,
+      reasoning: { text: 'A😀', seconds: 2 },
+      tool_calls: [
+        { type: 'text', text: 'first', presentation: 'intermediate' },
+        { type: 'tool_use', tool_use_id: 'tool-1', name: 'skill_view', input: {} },
+        { type: 'tool_result', tool_use_id: 'tool-1', name: 'skill_view', result: 'ok' },
+        { type: 'text', text: 'answer😀note', presentation: 'answer' },
+      ],
+    }
+    expect(activitySnapshotMatchesMessage(coalesced, message)).toBe(true)
+    expect(activityReasoningBlocks(coalesced, 'A😀')?.[0]?.activityOrder).toBe(6)
+    const textItems: ChatStreamTimelineItem[] = ['first', 'answer😀note'].map((rawText, index) => ({
+      type: 'text', key: `text-${index}`, rawText, html: rawText,
+      presentation: index === 1 ? 'answer' : 'intermediate',
+    }))
+    expect(applyActivityOrdersToTimeline(textItems, coalesced).map(item => item.activityOrder)).toEqual([31, 51])
+    expect(textItems.map(item => item.type === 'text' ? item.rawText : '')).toEqual(['first', 'answer😀note'])
+
+    // Matching lengths never authorizes crossing another kind of activity.
+    for (const barrier of [
+      { type: 'phase', kind: 'provider', phase: 'reasoning' },
+      { type: 'segment', segment_type: 'tool' },
+      { type: 'reasoning' }, { type: 'interrupt' }, { type: 'maintenance' },
+    ] as const) {
+      const separated = { ...coalesced, entries: coalesced.entries.map(entry =>
+        entry.id === 'write:3:61' ? { ...entry, ...barrier } : entry) }
+      expect(applyActivityOrdersToTimeline(textItems, separated)).toBe(textItems)
+    }
+    for (const presentation of ['intermediate', undefined] as const) {
+      expect(activitySnapshotMatchesMessage(coalesced, {
+        ...message, tool_calls: message.tool_calls?.map(segment =>
+          segment.text === 'answer😀note' ? { ...segment, presentation } : segment),
+      })).toBe(false)
+    }
+    expect(activitySnapshotMatchesMessage(coalesced, {
+      ...message, tool_calls: message.tool_calls?.map(segment =>
+        segment.text === 'answer😀note' ? { ...segment, text: 'answer😀' } : segment),
+    })).toBe(false)
+  })
+
   it('restores temporary maintenance without promoting it to a saved summary', () => {
     const normalized = normalizeActivitySnapshot({
       version: 2, task_id: 'turn-1', turn_id: 'turn-1',

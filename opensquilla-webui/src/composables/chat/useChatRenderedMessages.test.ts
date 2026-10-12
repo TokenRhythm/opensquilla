@@ -74,6 +74,31 @@ describe('useChatRenderedMessages scheduled provenance', () => {
     expect(row?.contentSlice).toBeUndefined()
   })
 
+  it('preserves live authoritative chronology after finalization without a history snapshot', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: 'Inspecting.Done.', ts: 1,
+      tool_calls: [{ tool_use_id: 'read-1', name: 'read_file', groupId: 'read-group',
+        input: 'sample.txt', result: 'contents', activityOrder: 30 }],
+      timeline: [
+        { type: 'text', raw: 'Inspecting.', presentation: 'intermediate', activityOrder: 20 },
+        { type: 'tool-group', groupId: 'read-group', activityOrder: 30 },
+        { type: 'text', raw: 'Done.', presentation: 'answer', activityOrder: 50 },
+      ],
+      reasoningBlocks: [{ id: 'thought-1', index: 0, text: 'Check the file.', contentKind: 'reasoning',
+        startedAt: 900, endedAt: 1000, status: 'completed', activityOrder: 10 },
+      { id: 'thought-2', index: 1, text: 'Summarize.', contentKind: 'reasoning',
+        startedAt: 200, endedAt: 300, status: 'completed', activityOrder: 40 }],
+    }])
+    const message = api.renderedMessages.value[0]!
+    expect(message.timelineItems?.map(item => item.activityOrder)).toEqual([20, 30, 50])
+    expect(message.toolCalls?.[0]?.activityOrder).toBe(30)
+    expect(message.timelineItems?.[1]?.type === 'tool-group'
+      && message.timelineItems[1].group.calls[0]?.activityOrder).toBe(30)
+    expect(message.timelineItems?.filter(item => item.type === 'text').map(item => item.presentation))
+      .toEqual(['intermediate', 'answer'])
+    expect(message.reasoningBlocks?.map(block => block.activityOrder)).toEqual([10, 40])
+  })
+
   it('keeps persisted sources and labels live cron completions before history arrives', () => {
     const api = renderedMessagesFor([
       { role: 'user', text: 'Run the inventory check.', ts: 1, provenanceKind: 'cron' },

@@ -138,8 +138,8 @@
           @toggle-share="$emit('toggleShareMessage', $event)"
           @download-artifact="$emit('downloadArtifact', $event)"
           @open-artifact="$emit('openArtifact', $event)"
-          @toggle-tool-group="$emit('toggleToolGroup', $event)"
-          @toggle-tool-item="$emit('toggleToolItem', $event)"
+          @toggle-tool-group="(id, open) => $emit('toggleToolGroup', id, open)"
+          @toggle-tool-item="(id, open) => $emit('toggleToolItem', id, open)"
           @details-disclosure="(message, open) => $emit('detailsDisclosure', message, open)"
           @show-tool-result="(content, title, context) => $emit('showToolResult', content, title, context)"
           @open-session="$emit('openSession', $event)"
@@ -244,8 +244,8 @@ const props = defineProps<{
   subagentSummary: (text: string) => string
   subagentBody: (text: string) => string
   toolCallGroups: (calls: ChatToolCall[], baseKey: string) => ChatToolCallGroup[]
-  isToolGroupOpen: (groupId: string) => boolean
-  isToolItemOpen: (renderKey: string) => boolean
+  isToolGroupOpen: (groupId: string) => boolean | undefined
+  isToolItemOpen: (renderKey: string) => boolean | undefined
   toolGroupStatusText: (group: ChatToolCallGroup) => string
   toolStatusText: (call: ChatToolCallRenderItem) => string
   toolSecondaryText: (call: ChatToolCallRenderItem) => string
@@ -303,8 +303,8 @@ const emit = defineEmits<{
   toggleShareMessage: [messageId: string]
   downloadArtifact: [artifact: ArtifactPayload]
   openArtifact: [artifact: ArtifactPayload]
-  toggleToolGroup: [groupId: string]
-  toggleToolItem: [renderKey: string]
+  toggleToolGroup: [groupId: string, open: boolean]
+  toggleToolItem: [renderKey: string, open: boolean]
   detailsDisclosure: [message: ChatRenderedMessage, open: boolean]
   contentHydrated: [message: ChatRenderedMessage, text: string]
   showToolResult: [content: string, title: string, context?: ToolResultContext]

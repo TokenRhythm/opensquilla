@@ -517,8 +517,9 @@
       "languageDesc": "インターフェースとチャンネルのシステム通知の表示言語です。ここにはすぐ反映され、ゲートウェイ全体の通知言語として保存されます。",
       "channelNoticeLocaleSyncPending": "インターフェースの言語は変更されましたが、チャンネルのシステム通知言語はまだ保存されていません。ゲートウェイの再接続時に再試行します。",
       "toolDetailsLabel": "ツール詳細のデフォルト表示",
-      "toolDetailsDesc": "自動はツール種別に従い、コンパクトは通常のツールを折りたたみ、展開はすべて開きます。エラーは既定で自動展開されますが、手動で折りたためます。",
-      "toolDetailsExpanded": "展開",
+      "toolDetailsDesc": "ツール詳細の初期状態のみを設定し、手動の選択を優先します。エラーの概要は常に表示され、思考は個別に折りたたまれます。",
+      "toolDetailsCollapsed": "既定で折りたたむ",
+      "toolDetailsExpanded": "既定で展開",
       "visualEffectsLabel": "視覚効果",
       "visualEffectsDesc": "会話内のモデルルーティング判断と回答の切り替えをアニメーション表示します。",
       "composerFxLabel": "フローティング入力欄",
@@ -541,9 +542,7 @@
       "sidebarWidthResizableStatus": "現在のデスクトップ幅: {current}px。",
       "sidebarWidthClampedStatus": "保存値は {saved}px、現在のウィンドウでは {current}px です。",
       "sidebarWidthCompactStatus": "コンパクト表示では {current}px を使用します。デスクトップ設定の {saved}px は保持されます。",
-      "sidebarWidthDrawerStatus": "ドロワー表示では {current}px を使用します。デスクトップ設定の {saved}px は保持されます。",
-      "toolDetailsAuto": "自動",
-      "toolDetailsCompact": "コンパクト"
+      "sidebarWidthDrawerStatus": "ドロワー表示では {current}px を使用します。デスクトップ設定の {saved}px は保持されます。"
     },
     "dataMigration": {
       "title": "データとバックアップ",
@@ -3858,7 +3857,7 @@
     "jumpToLatest": "最新に移動",
     "latest": "最新",
     "thinking": "思考中",
-    "thoughtProcess": "思考プロセス",
+    "thoughtProcess": "思考",
     "thinkingForSeconds": "思考中 · {seconds} 秒",
     "thoughtForSeconds": "{seconds} 秒間思考",
     "thoughtForMinutes": "{minutes} 分 {seconds} 秒間思考",
@@ -4007,6 +4006,7 @@
     "workedForSeconds": "{seconds} 秒間作業",
     "workedForMinutes": "{minutes} 分 {seconds} 秒間作業",
     "activityDurationSeconds": "{seconds} 秒",
+    "activityElapsed": "所要時間 {duration}",
     "activityDurationMinutes": "{minutes} 分 {seconds} 秒",
     "activity": {
       "lifecycle": {
@@ -4021,7 +4021,7 @@
       "provider": {
         "waiting": "モデルを待機中",
         "responded": "モデル応答",
-        "reasoning": "深く思考中",
+        "reasoning": "思考",
         "rateLimited": "レート制限 · {seconds}秒後に再試行",
         "retryWait": "{seconds}秒後に再試行",
         "retrying": "再試行中 {attempt}/{limit}",

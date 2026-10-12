@@ -17,6 +17,7 @@ function makeStream(
   renderMarkdown = vi.fn((t: string, _o?: { highlight?: boolean }) => `<p>${t}</p>`),
   streamIdleTimeoutMs?: () => number | undefined,
   interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map()),
+  toolStateScope?: () => string,
 ) {
   const scrollToBottom = vi.fn()
   const messages = ref<ChatMessage[]>([])
@@ -35,6 +36,7 @@ function makeStream(
     scrollToBottom,
     streamIdleTimeoutMs,
     interruptState,
+    toolStateScope,
   })
   return {
     api,
@@ -68,6 +70,74 @@ describe('useChatStream render coalescing', () => {
     expect(resolvedStreamIdleTimeoutMs(undefined)).toBe(DEFAULT_STREAM_IDLE_TIMEOUT_MS)
     expect(resolvedStreamIdleTimeoutMs(0)).toBe(DEFAULT_STREAM_IDLE_TIMEOUT_MS)
     expect(resolvedStreamIdleTimeoutMs(Number.NaN)).toBe(DEFAULT_STREAM_IDLE_TIMEOUT_MS)
+  })
+
+  it('keeps explicit tool choices through completion and a later turn', () => {
+    const { api } = makeStream()
+    api.startStreaming()
+    api.appendToolCall({ id: 'tool-1', name: 'web_search' })
+    api.toggleToolGroup('["session-a","turn:1"]:group-1', false)
+    api.toggleToolItem('["session-a","turn:1"]:tool-1', true)
+    expect(api.isToolItemOpen('["session-b","turn:1"]:tool-1')).toBeUndefined()
+    api.appendToolResult({ id: 'tool-1', name: 'web_search', result: 'ok' })
+    api.endStreaming()
+    expect(api.isToolGroupOpen('["session-a","turn:1"]:group-1')).toBe(false)
+    expect(api.isToolItemOpen('["session-a","turn:1"]:tool-1')).toBe(true)
+    api.startStreaming()
+    expect(api.isToolItemOpen('["session-a","turn:1"]:tool-1')).toBe(true)
+    expect(api.isToolItemOpen('["session-a","turn:2"]:tool-1')).toBeUndefined()
+    api.cleanup()
+  })
+
+  it.each([false, true])('retains a recorded file across live completion and settled history (reference=%s)', referenced => {
+    const { api, messages } = makeStream()
+    const fileSnapshot = { kind: 'write' as const, path: 'index.html', content: '<p>retained</p>'.repeat(2000),
+      ...(referenced ? { sha256_ref: 'a'.repeat(64), bytes: 2_000_000 } : {}) }
+    api.appendToolCall({ id: 'write-1', name: 'write_file', input: { path: 'index.html' } })
+    api.appendToolResult({ id: 'write-1', name: 'write_file', result: 'Written 28000 bytes',
+      file_snapshot: fileSnapshot })
+    expect(api.foldedTurn.value.toolCalls[0]?.fileSnapshot).toEqual(fileSnapshot)
+    expect(api.streamTimelineItems.value[0]).toMatchObject({ type: 'tool-group',
+      group: { calls: [expect.objectContaining({ fileSnapshot })] } })
+    api.endStreaming()
+    expect(messages.value[0]?.tool_calls?.[0]?.file_snapshot).toEqual(fileSnapshot)
+    api.cleanup()
+  })
+
+  it('migrates both boolean choices to the durable turn without replacing newer choices', () => {
+    const { api } = makeStream()
+    const previous = '["session-a","turn:local-user"]'
+    const next = '["session-a","turn:server-turn"]'
+    api.toggleToolItem(`${previous}:opened`, true)
+    api.toggleToolItem(`${previous}:closed`, false)
+    api.toggleToolGroup(`${previous}:batch`, false)
+    api.toggleToolItem(`${next}:opened`, false)
+    api.migrateToolDisclosureScope(previous, next)
+    expect(api.isToolItemOpen(`${next}:closed`)).toBe(false)
+    expect(api.isToolGroupOpen(`${next}:batch`)).toBe(false)
+    expect(api.isToolItemOpen(`${next}:opened`)).toBe(false)
+    expect(api.isToolItemOpen('["session-b","turn:server-turn"]:closed')).toBeUndefined()
+    api.cleanup()
+  })
+
+  it('prunes replaced live tools without discarding historical or retained choices', () => {
+    const scope = '["session-a","turn:2"]'
+    const { api } = makeStream(undefined, undefined, undefined, () => scope)
+    api.startStreaming()
+    api.appendToolCall({ id: 'completed', name: 'web_search' })
+    api.appendToolResult({ id: 'completed', name: 'web_search', result: 'ok' })
+    api.appendToolCall({ id: 'pending', name: 'web_search' })
+    api.toggleToolItem(`${scope}:completed`, false)
+    const groupId = api.foldedTurn.value.toolCalls.find(call => call.toolId === 'completed')!.groupId!
+    api.toggleToolGroup(`${scope}:${groupId}`, true)
+    api.toggleToolItem(`${scope}:pending`, true)
+    api.toggleToolItem('["session-a","turn:1"]:pending', false)
+    api.resetAnswerGeneration({ preserveCompletedTools: true })
+    expect(api.isToolItemOpen(`${scope}:completed`)).toBe(false)
+    expect(api.isToolGroupOpen(`${scope}:${groupId}`)).toBe(true)
+    expect(api.isToolItemOpen(`${scope}:pending`)).toBeUndefined()
+    expect(api.isToolItemOpen('["session-a","turn:1"]:pending')).toBe(false)
+    api.cleanup()
   })
 
   it('re-reads the projected timeout whenever the hard idle timer is reset', () => {
@@ -639,11 +709,10 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
-  it('hands an unfinished coarse reveal to the settled assistant row', () => {
+  it('hands arrived reasoning directly to the settled assistant row', () => {
     const { api, messages } = makeStream()
     const coarse = 'reasoning '.repeat(80)
     api.startStreaming()
-    api.noteReasoningPresentationDelta(coarse)
     api.appendFrame({
       kind: 'thinking-start',
       blockId: 'coarse-reasoning',
@@ -668,7 +737,6 @@ describe('useChatStream render coalescing', () => {
     api.appendDelta('answer')
     api.endStreaming()
 
-    expect(messages.value[0]?.reasoningPresentationPending).toBe(true)
     expect(messages.value[0]?.reasoningBlocks?.[0]?.text).toBe(coarse)
     api.cleanup()
   })

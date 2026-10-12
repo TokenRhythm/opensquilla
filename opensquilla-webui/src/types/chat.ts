@@ -713,8 +713,6 @@ export interface ChatMessage {
   reasoning?: ChatReasoning
   /** Structured physical-call reasoning retained across live-to-history sync. */
   reasoningBlocks?: import('./turnlog').ReasoningBlock[]
-  /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
-  reasoningPresentationPending?: boolean
   activitySnapshot?: ActivitySnapshotV2
   activitySnapshotIncomplete?: boolean
   /** Live physical execution model; never overwrites the logical route decision. */
@@ -897,8 +895,6 @@ export interface ChatRenderedMessage {
   reasoning?: ChatReasoning
   /** Structured physical-call reasoning retained across live-to-history sync. */
   reasoningBlocks?: import('./turnlog').ReasoningBlock[]
-  /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
-  reasoningPresentationPending?: boolean
   activitySnapshot?: ActivitySnapshotV2
   activitySnapshotIncomplete?: boolean
   interrupted?: boolean

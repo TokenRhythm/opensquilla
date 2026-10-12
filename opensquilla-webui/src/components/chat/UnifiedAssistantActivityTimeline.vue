@@ -12,6 +12,7 @@
         :data-activity-id="row.step.id || row.step.key"
         :data-activity-order="row.order"
         :projection="statusProjection(row.step)"
+        :executing="executing"
         :show-items="false"
         :state-scope="stateScope"
         :session-key="sessionKey"
@@ -23,22 +24,22 @@
       />
       <ReasoningTimeline
         v-else-if="row.type === 'reasoning'"
+        :session-key="sessionKey"
         data-activity-entry="true"
         data-activity-type="reasoning"
         :data-activity-id="row.blocks[0]?.id"
         :data-activity-order="row.order"
         :blocks="row.blocks"
-        :pace-bursts="reasoningPaceBursts"
+        :executing="executing"
         :collapse-active="reasoningCollapseActive"
         :nested="reasoningNested"
         :timeline-phase="reasoningTimelinePhase"
-        @reveal-complete="$emit('revealComplete')"
       />
       <AssistantActivityTimeline
         v-else
         :projection="itemProjection"
+        :executing="executing"
         :timeline-items="row.items"
-        preserve-item-groups
         :variant="variant"
         :state-scope="stateScope"
         :session-key="sessionKey"
@@ -48,8 +49,8 @@
         :tool-status-text="toolStatusText"
         :tool-secondary-text="toolSecondaryText"
         :tool-elapsed-text="toolElapsedText"
-        @toggle-group="$emit('toggleGroup', $event)"
-        @toggle-item="$emit('toggleItem', $event)"
+        @toggle-group="(id, open) => $emit('toggleGroup', id, open)"
+        @toggle-item="(id, open) => $emit('toggleItem', id, open)"
         @show-result="(content, title, context) => $emit('showResult', content, title, context)"
       >
         <template #interrupt="{ part }">
@@ -75,6 +76,7 @@ import type { ReasoningBlock } from '@/types/turnlog'
 import {
   type AssistantActivityStatusStep,
   type AssistantActivityTimelineProjection,
+  canMergeAssistantActivityOrder,
   isVisibleActivityStatusStep,
 } from '@/utils/chat/assistantActivity'
 
@@ -82,33 +84,32 @@ const props = withDefaults(defineProps<{
   projection: AssistantActivityTimelineProjection
   timelineItems?: ChatStreamTimelineItem[]
   reasoningBlocks?: ReasoningBlock[]
-  isToolGroupOpen: (groupId: string) => boolean
-  isToolItemOpen: (renderKey: string) => boolean
+  isToolGroupOpen: (groupId: string) => boolean | undefined
+  isToolItemOpen: (renderKey: string) => boolean | undefined
   toolGroupStatusText: (group: ChatToolCallGroup) => string
   toolStatusText: (call: ChatToolCallRenderItem) => string
   toolSecondaryText: (call: ChatToolCallRenderItem) => string
   toolElapsedText?: (call: ChatToolCallRenderItem) => string
   variant?: 'checklist'
   stateScope?: string
-  reasoningPaceBursts?: boolean
   sessionKey?: string
   reasoningCollapseActive?: boolean
   reasoningNested?: boolean
   reasoningTimelinePhase?: boolean
+  executing?: boolean
 }>(), {
   timelineItems: () => [],
   reasoningBlocks: () => [],
-  reasoningPaceBursts: false,
   reasoningCollapseActive: false,
   reasoningNested: true,
   reasoningTimelinePhase: true,
+  executing: false,
 })
 
 defineEmits<{
-  toggleGroup: [groupId: string]
-  toggleItem: [renderKey: string]
+  toggleGroup: [groupId: string, open: boolean]
+  toggleItem: [renderKey: string, open: boolean]
   showResult: [content: string, title: string, context?: ToolResultContext]
-  revealComplete: []
 }>()
 
 const { t } = useI18n()
@@ -159,6 +160,9 @@ function itemOrder(item: ChatStreamTimelineItem): number | undefined {
 }
 
 const rows = computed<ActivityRow[]>(() => {
+  if (!canMergeAssistantActivityOrder(
+    props.projection.statusSteps, props.reasoningBlocks, props.timelineItems,
+  )) return []
   const statusRows: AtomicRow[] = []
   const reasoningRows: AtomicRow[] = []
   const itemRows: AtomicRow[] = []

@@ -126,7 +126,6 @@ export interface ChatRpcStreamApi {
   // Accepted reasoning events enter the stream-owned turn log.
   appendFrame: (frame: FrameInput) => void
   setAcceptedActivityOrder?: (order: number | undefined) => void
-  noteReasoningPresentationDelta?: (text: string) => void
   getThinkingText?: () => string
 }
 
@@ -1069,7 +1068,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function appendThinkingDelta(text: string, payload: ConversationEventData) {
     if (!text) return
     if (!stream.isStreaming.value) stream.startStreaming()
-    stream.noteReasoningPresentationDelta?.(text)
     const current = streamThinking.value
     if (!current) {
       const now = Date.now()

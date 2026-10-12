@@ -113,6 +113,8 @@ export interface UseChatStreamOptions {
   interruptState?: Ref<ReadonlyMap<string, InterruptViewState>>
   /** Adapter-projected stream idle timeout. Read lazily across reconnects. */
   streamIdleTimeoutMs?: () => number | null | undefined
+  /** Session and owning turn scope used by the tool disclosure renderer. */
+  toolStateScope?: () => string
 }
 
 export interface StreamTaskClockSnapshot {
@@ -158,8 +160,10 @@ export function useChatStream(options: UseChatStreamOptions) {
     }
   }
 
-  const openToolGroups = ref<Set<string>>(new Set())
-  const openToolItems = ref<Set<string>>(new Set())
+  // Absence follows the display preference; either boolean is an explicit
+  // reader choice. Keep choices across live/history renderer remounts.
+  const openToolGroups = ref<Map<string, boolean>>(new Map())
+  const openToolItems = ref<Map<string, boolean>>(new Map())
   let checkpointedRaw = ''
   let checkpointedAcrossToolBoundary = false
   let activeStreamTurnId = ''
@@ -336,18 +340,13 @@ export function useChatStream(options: UseChatStreamOptions) {
   const MEDIUM_STREAM_CHARS = 8 * 1024
   const LARGE_STREAM_CHARS = 32 * 1024
   const HIDDEN_FLUSH_FALLBACK_MS = 250
-  const COARSE_REASONING_BURST_CHARS = 96
   let renderRaf: number | null = null
   let renderFallbackTimer: ReturnType<typeof setTimeout> | null = null
   let lastFlushAt = 0
   let renderDirty = false
-  let reasoningCharsSinceFlush = 0
-  const reasoningPresentationPending = ref(false)
 
   function resetStreamState() {
     acceptedActivityStartedAt = 0
-    reasoningCharsSinceFlush = 0
-    reasoningPresentationPending.value = false
     activeModelCallId = ''
     activeModelCallIteration = 0
     streamCheckpointSeq = 0
@@ -494,8 +493,6 @@ export function useChatStream(options: UseChatStreamOptions) {
     resetStreamState()
     const restoredStartedAt = normalizedTaskStartedAt(activityStartedAt) ?? 0
     setAcceptedActivityStartedAt(restoredStartedAt || undefined)
-    openToolGroups.value = new Set()
-    openToolItems.value = new Set()
     streamRound.value = 1
     streamTaskClockIdentity = ''
     streamTurnStartedAt.value = restoredStartedAt || Date.now()
@@ -633,7 +630,6 @@ export function useChatStream(options: UseChatStreamOptions) {
         // useful result.
         statusHistory: terminalFold.statusHistory.slice(),
         reasoningBlocks: terminalReasoningBlocks,
-        reasoningPresentationPending: reasoningPresentationPending.value || undefined,
         interrupted: wasAborted || undefined,
       })
       // Replacing the live block with canonical Markdown/KaTeX can change its
@@ -951,16 +947,21 @@ export function useChatStream(options: UseChatStreamOptions) {
     const textSnapshot = typeof optionsArg.textSnapshot === 'string'
       ? optionsArg.textSnapshot
       : ''
-    openToolGroups.value = new Set(
-      [...openToolGroups.value].filter(groupId => keptGroupIds.has(groupId)),
+    const scopePrefix = options.toolStateScope?.()
+    const currentPrefix = scopePrefix ? `${scopePrefix}:` : ''
+    const keepChoice = (id: string, retainedIds: Set<string>) => (
+      currentPrefix && !id.startsWith(currentPrefix)
+        ? true
+        : retainedIds.has(currentPrefix ? id.slice(currentPrefix.length) : id)
     )
-    openToolItems.value = new Set(
-      [...openToolItems.value].filter(toolId => keptToolIds.has(toolId)),
+    openToolGroups.value = new Map(
+      [...openToolGroups.value].filter(([id]) => keepChoice(id, keptGroupIds)),
+    )
+    openToolItems.value = new Map(
+      [...openToolItems.value].filter(([id]) => keepChoice(id, keptToolIds)),
     )
     checkpointedRaw = ''
     checkpointedAcrossToolBoundary = false
-    reasoningCharsSinceFlush = 0
-    reasoningPresentationPending.value = false
     streamRound.value = 1
     isStreaming.value = true
     streamBubble.value = true
@@ -1034,17 +1035,6 @@ export function useChatStream(options: UseChatStreamOptions) {
     }
   }
 
-  function noteReasoningPresentationDelta(text: string) {
-    reasoningCharsSinceFlush += text.length
-    if (reasoningCharsSinceFlush > COARSE_REASONING_BURST_CHARS) {
-      reasoningPresentationPending.value = true
-    }
-  }
-
-  function completeReasoningPresentation() {
-    reasoningPresentationPending.value = false
-  }
-
   function onRenderFrame() {
     renderRaf = null
     // Coalesce bursts to the frame clock but cap the heavy re-parse: if the last
@@ -1068,7 +1058,6 @@ export function useChatStream(options: UseChatStreamOptions) {
     if (!renderDirty) return
 
     publishTurnLog()
-    reasoningCharsSinceFlush = 0
     renderDirty = false
     if (options.autoScroll.value) options.scrollToBottom()
   }
@@ -1514,24 +1503,41 @@ export function useChatStream(options: UseChatStreamOptions) {
     if (changed) scheduleRender()
   }
 
-  function isToolGroupOpen(groupId: string): boolean {
-    return openToolGroups.value.has(groupId)
+  function isToolGroupOpen(groupId: string): boolean | undefined {
+    return openToolGroups.value.get(groupId)
   }
 
-  function toggleToolGroup(groupId: string) {
-    const next = new Set(openToolGroups.value)
-    next.has(groupId) ? next.delete(groupId) : next.add(groupId)
+  function toggleToolGroup(groupId: string, open: boolean) {
+    const next = new Map(openToolGroups.value)
+    next.set(groupId, open)
     openToolGroups.value = next
   }
 
-  function isToolItemOpen(itemId: string): boolean {
-    return openToolItems.value.has(itemId)
+  function isToolItemOpen(itemId: string): boolean | undefined {
+    return openToolItems.value.get(itemId)
   }
 
-  function toggleToolItem(itemId: string) {
-    const next = new Set(openToolItems.value)
-    next.has(itemId) ? next.delete(itemId) : next.add(itemId)
+  function toggleToolItem(itemId: string, open: boolean) {
+    const next = new Map(openToolItems.value)
+    next.set(itemId, open)
     openToolItems.value = next
+  }
+
+  // A durable turn id may arrive after the optimistic user row. Only the view,
+  // which knows both belong to the same session/turn, requests this migration.
+  function migrateToolDisclosureScope(previousScope: string, nextScope: string) {
+    if (!previousScope || !nextScope || previousScope === nextScope) return
+    const previousPrefix = `${previousScope}:`
+    const nextPrefix = `${nextScope}:`
+    for (const choices of [openToolGroups, openToolItems]) {
+      const next = new Map(choices.value)
+      for (const [id, open] of choices.value) {
+        if (!id.startsWith(previousPrefix)) continue
+        const nextId = `${nextPrefix}${id.slice(previousPrefix.length)}`
+        if (!next.has(nextId)) next.set(nextId, open)
+      }
+      choices.value = next
+    }
   }
 
   function clearRenderTimer() {
@@ -1611,13 +1617,12 @@ export function useChatStream(options: UseChatStreamOptions) {
     toggleToolGroup,
     isToolItemOpen,
     toggleToolItem,
+    migrateToolDisclosureScope,
     cleanup,
     // Event handlers append accepted frames; foldedTurn is the sole live
     // content projection.
     appendFrame,
     setAcceptedActivityOrder,
-    noteReasoningPresentationDelta,
-    completeReasoningPresentation,
     foldedTurn,
     getThinkingText: () => foldedTurn.value.thinkingText,
   }

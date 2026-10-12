@@ -328,6 +328,8 @@
             <ActivityDisclosure
               default-open
               lifecycle="working"
+              :continuity-key="liveActivityContinuityKey"
+              :executing="liveActivityExecuting"
               :step-count="executionDockRun?.status === 'running' ? 0 : liveActivityStepCount"
               :failure-count="liveActivityFailureCount"
               :phase-label="liveActivityPhaseLabel"
@@ -337,6 +339,7 @@
             >
               <UnifiedAssistantActivityTimeline
                 :session-key="sessionKey"
+                :executing="liveActivityExecuting"
                 v-if="liveHasUnifiedActivityOrder"
                 variant="checklist"
                 :projection="liveActivityProjection"
@@ -344,7 +347,6 @@
                 :reasoning-blocks="liveReasoningBlocks"
                 :reasoning-collapse-active="liveReasoningCollapseActive"
                 :reasoning-timeline-phase="false"
-                reasoning-pace-bursts
                 :state-scope="liveToolStateScope"
                 :is-tool-group-open="isToolGroupOpen"
                 :is-tool-item-open="isToolItemOpen"
@@ -352,7 +354,6 @@
                 :tool-status-text="toolStatusText"
                 :tool-secondary-text="toolSecondaryText"
                 :tool-elapsed-text="liveToolElapsedText"
-                @reveal-complete="completeReasoningPresentation"
                 @toggle-group="toggleToolGroup"
                 @toggle-item="toggleToolItem"
                 @show-result="showToolResultModal"
@@ -372,15 +373,16 @@
               <template v-else>
               <ReasoningTimeline
                 v-if="liveReasoningBlocks.length"
+                :executing="liveActivityExecuting"
+                :session-key="sessionKey"
                 :blocks="liveReasoningBlocks"
                 :collapse-active="liveReasoningCollapseActive"
-                pace-bursts
                 nested
-                @reveal-complete="completeReasoningPresentation"
               />
 
               <AssistantActivityTimeline
                 :session-key="sessionKey"
+                :executing="liveActivityExecuting"
                 v-if="
                   liveActivityTimelineItems.length
                   || liveActivityProjection.statusSteps.length
@@ -949,6 +951,7 @@ import {
 import { useSandboxReadinessRefresh } from '@/composables/chat/useSandboxReadinessRefresh'
 import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
+import { useChatTurnAnnouncement } from '@/composables/chat/useChatTurnAnnouncement'
 import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
 import { useChatPlans } from '@/composables/chat/useChatPlans'
 import { PLAN_CENTER_KEY, type PlanCenter } from '@/modules/planCenter'
@@ -999,6 +1002,7 @@ import {
   useChatSlashCommands,
 } from '@/composables/chat/useChatSlashCommands'
 import { useChatStream } from '@/composables/chat/useChatStream'
+import { useChatToolDisclosureScope } from '@/composables/chat/useChatToolDisclosureScope'
 import { useComposerFloatingPreference } from '@/composables/useComposerFloatingPreference'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
@@ -1175,8 +1179,8 @@ import {
   visibleChatHistoryRecoveryState,
 } from '@/utils/chat/sessionLoadState'
 import {
+  canMergeAssistantActivityOrder,
   isSemanticActivityStatusStep,
-  isVisibleActivityStatusStep,
   projectAssistantActivityTimeline,
   providerActivityRemainingSeconds,
   splitLiveAssistantTimeline,
@@ -1895,6 +1899,7 @@ const chatStream = useChatStream({
   scrollToBottom,
   interruptState,
   streamIdleTimeoutMs: () => gatewayAccess.streamIdleTimeoutMs,
+  toolStateScope: () => liveToolStateScope.value,
 })
 const {
   isStreaming,
@@ -1919,11 +1924,11 @@ const {
   toggleToolGroup,
   isToolItemOpen,
   toggleToolItem,
+  migrateToolDisclosureScope,
   cleanup: cleanupStream,
   foldedTurn,
   appendInterruptFrame,
   ensureInterruptBubble,
-  completeReasoningPresentation,
 } = chatStream
 useBrowserAutomationState({
   native: platform.workbench.native,
@@ -4178,7 +4183,17 @@ const liveCurrentPhaseCode = computed(() => [...liveActivityProjection.value.sta
 const liveReasoningCollapseActive = computed(() =>
   liveCurrentPhaseCode.value === 'chat.activity.lifecycle.answering',
 )
-const liveToolStateScope = computed(() => JSON.stringify([sessionKey.value || '', 'stream']))
+const {
+  stateScope: liveToolStateScope,
+  activityContinuityKey: liveActivityContinuityKey,
+} = useChatToolDisclosureScope({
+  sessionKey,
+  activeTaskId: activeStreamTaskId,
+  isStreaming,
+  messages,
+  renderedMessages,
+  migrateScope: migrateToolDisclosureScope,
+})
 // Elapsed readouts in the live turn round to whole seconds ("4s"), matching
 // streamPhaseElapsed. The shared tool formatter
 // (streamToolElapsedText, useChatStream.ts) emits tenths, so normalise its
@@ -4192,22 +4207,11 @@ const liveArtifacts = computed(() => foldedTurn.value.artifacts)
 const liveReasoningBlocks = computed<ReasoningBlock[]>(() =>
   foldedTurn.value.reasoningBlocks.filter(block => block.text),
 )
-function validLiveActivityOrder(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
-}
-const liveHasUnifiedActivityOrder = computed(() => {
-  const orders = [
-    ...liveActivityProjection.value.statusSteps
-      .filter(isVisibleActivityStatusStep)
-      .map(step => step.activityOrder),
-    ...liveReasoningBlocks.value.map(block => block.activityOrder),
-    ...liveActivityTimelineItems.value.map(item => (
-      item.activityOrder
-      ?? (item.type === 'tool-group' ? item.group.activityOrder : undefined)
-    )),
-  ]
-  return orders.length > 0 && orders.every(validLiveActivityOrder)
-})
+const liveHasUnifiedActivityOrder = computed(() => canMergeAssistantActivityOrder(
+  liveActivityProjection.value.statusSteps,
+  liveReasoningBlocks.value,
+  liveActivityTimelineItems.value,
+))
 // No clamp and no raw status count: the header chip must agree with the
 // visible body, which renders clusters plus only the semantic status steps.
 // A text-only turn therefore counts 0 and the disclosure's stepCount > 0
@@ -4225,6 +4229,16 @@ const liveInterruptParts = computed(() => foldedTurn.value.parts.filter(
 ))
 const livePendingInterruptParts = computed(() =>
   liveInterruptParts.value.filter(part => !part.resolution),
+)
+
+// Tool-start can survive an approval interrupt. Motion needs the live owner,
+// not just that persisted per-call flag, to confirm execution is still active.
+const liveActivityExecuting = computed(() =>
+  isStreaming.value
+  && runStatus.value.status === 'running'
+  && !streamActivityStale.value
+  && !isStopPending.value
+  && livePendingInterruptParts.value.length === 0,
 )
 
 const visiblePendingInterruptKeys = computed(() => {
@@ -4271,11 +4285,8 @@ watch(
   { flush: 'post', immediate: true },
 )
 
-// Feeds the persistent visually-hidden status region in the template. It only
-// fills on the true→false streaming transition (a live turn actually settled),
-// and empties as soon as the next turn starts so that setting the same
-// "Completed" text again is a fresh mutation screen readers re-announce.
-const turnSettledAnnouncement = ref('')
+// Reuse the hidden live region; outcome text follows the confirmed run state.
+const turnSettledAnnouncement = useChatTurnAnnouncement({ sessionKey, isStreaming, runStatus, t })
 
 function preserveTerminalAnswerAnchor() {
   const container = threadRef.value
@@ -4334,11 +4345,9 @@ function preserveTerminalAnswerAnchor() {
   void nextTick(() => window.requestAnimationFrame(restore))
 }
 
-watch(isStreaming, (streaming, wasStreaming) => {
-  if (streaming) turnSettledAnnouncement.value = ''
-  else if (wasStreaming) {
+watch([sessionKey, isStreaming], ([key, streaming], [previousKey, wasStreaming]) => {
+  if (key === previousKey && wasStreaming && !streaming) {
     preserveTerminalAnswerAnchor()
-    turnSettledAnnouncement.value = String(t('chat.activity.lifecycle.settled'))
   }
 }, { flush: 'pre' })
 

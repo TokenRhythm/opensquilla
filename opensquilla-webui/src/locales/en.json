@@ -517,8 +517,9 @@
       "languageDesc": "Display language for the interface and channel system notices. Applies instantly here and saves the Gateway-wide notice language.",
       "channelNoticeLocaleSyncPending": "The interface language changed, but the channel system-message language has not been saved yet. It will retry when the Gateway reconnects.",
       "toolDetailsLabel": "Tool details by default",
-      "toolDetailsDesc": "Auto follows the tool type; Compact collapses ordinary tools; Expanded opens them. Errors open automatically by default and can still be collapsed.",
-      "toolDetailsExpanded": "Expanded",
+      "toolDetailsDesc": "Sets the default for tool details only; manual choices take priority. Failure summaries remain visible. Thinking is folded independently.",
+      "toolDetailsCollapsed": "Collapsed by default",
+      "toolDetailsExpanded": "Expanded by default",
       "visualEffectsLabel": "Visual effects",
       "visualEffectsDesc": "Animate model-routing decisions and answer transitions in conversations.",
       "composerFxLabel": "Floating composer",
@@ -541,9 +542,7 @@
       "sidebarWidthResizableStatus": "Current desktop width: {current}px.",
       "sidebarWidthClampedStatus": "Saved {saved}px; this window currently uses {current}px.",
       "sidebarWidthCompactStatus": "Compact layout uses {current}px. Your desktop preference of {saved}px is preserved.",
-      "sidebarWidthDrawerStatus": "Drawer layout uses {current}px. Your desktop preference of {saved}px is preserved.",
-      "toolDetailsAuto": "Auto",
-      "toolDetailsCompact": "Compact"
+      "sidebarWidthDrawerStatus": "Drawer layout uses {current}px. Your desktop preference of {saved}px is preserved."
     },
     "dataMigration": {
       "title": "Data & backups",
@@ -3858,7 +3857,7 @@
     "jumpToLatest": "Jump to latest",
     "latest": "Latest",
     "thinking": "Thinking",
-    "thoughtProcess": "Thought process",
+    "thoughtProcess": "Thinking",
     "thinkingForSeconds": "Thinking · {seconds}s",
     "thoughtForSeconds": "Thought for {seconds}s",
     "thoughtForMinutes": "Thought for {minutes}m {seconds}s",
@@ -4007,6 +4006,7 @@
     "workedForSeconds": "Worked for {seconds}s",
     "workedForMinutes": "Worked for {minutes}m {seconds}s",
     "activityDurationSeconds": "{seconds}s",
+    "activityElapsed": "Time spent {duration}",
     "activityDurationMinutes": "{minutes}m {seconds}s",
     "activity": {
       "lifecycle": {
@@ -4021,7 +4021,7 @@
       "provider": {
         "waiting": "Waiting for model",
         "responded": "Model response",
-        "reasoning": "Thinking deeply",
+        "reasoning": "Thinking",
         "rateLimited": "Rate limited · retrying in {seconds}s",
         "retryWait": "Retrying in {seconds}s",
         "retrying": "Retrying {attempt}/{limit}",

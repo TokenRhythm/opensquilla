@@ -8,6 +8,10 @@ const expandedByKey = new Map<string, ExpansionState>()
 const durationByKey = new Map<string, number>()
 let expansionVersion = 0
 
+export function assistantActivityContinuityKey(sessionKey: string, turnKey: string): string {
+  return turnKey ? JSON.stringify([sessionKey, 'assistant-activity-turn', turnKey]) : ''
+}
+
 function readExpansionState(
   key: string,
   continuityKey = '',
@@ -48,6 +52,15 @@ export function writeAssistantActivityExpansion(
   const state = { expanded, manual, version: ++expansionVersion }
   if (key) expandedByKey.set(key, state)
   if (continuityKey) expandedByKey.set(continuityKey, state)
+}
+
+/** Adopt only an explicit choice when the optimistic turn receives its durable id. */
+export function migrateAssistantActivityExpansion(previousKey: string, nextKey: string): void {
+  if (!previousKey || !nextKey || previousKey === nextKey) return
+  const previous = expandedByKey.get(previousKey)
+  const current = expandedByKey.get(nextKey)
+  if (!previous?.manual || (current && current.version >= previous.version)) return
+  expandedByKey.set(nextKey, previous)
 }
 
 export function readAssistantActivityDuration(key: string, continuityKey = ''): number {

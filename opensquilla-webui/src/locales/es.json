@@ -517,8 +517,9 @@
       "languageDesc": "Idioma de visualización de la interfaz y de los mensajes del sistema de los canales. Se aplica aquí al instante y guarda el idioma de los mensajes para toda la puerta de enlace.",
       "channelNoticeLocaleSyncPending": "El idioma de la interfaz cambió, pero el idioma de los mensajes del sistema de los canales aún no se ha guardado. Se volverá a intentar cuando se reconecte la puerta de enlace.",
       "toolDetailsLabel": "Detalles de herramientas de forma predeterminada",
-      "toolDetailsDesc": "Automático sigue el tipo de herramienta; Compacto contrae las herramientas normales; Expandido las abre. Los errores se abren automáticamente de forma predeterminada y se pueden contraer manualmente.",
-      "toolDetailsExpanded": "Expandido",
+      "toolDetailsDesc": "Solo establece el estado inicial de los detalles; la selección manual tiene prioridad. Los resúmenes de errores siguen visibles. El razonamiento se contrae por separado.",
+      "toolDetailsCollapsed": "Contraído por defecto",
+      "toolDetailsExpanded": "Expandido por defecto",
       "visualEffectsLabel": "Efectos visuales",
       "visualEffectsDesc": "Anima las decisiones de enrutamiento de modelos y las transiciones de respuestas.",
       "composerFxLabel": "Compositor flotante",
@@ -541,9 +542,7 @@
       "sidebarWidthResizableStatus": "Ancho actual en el escritorio: {current}px.",
       "sidebarWidthClampedStatus": "Se guardaron {saved}px; esta ventana usa actualmente {current}px.",
       "sidebarWidthCompactStatus": "El diseño compacto usa {current}px. Se conserva tu preferencia de escritorio de {saved}px.",
-      "sidebarWidthDrawerStatus": "El diseño de cajón usa {current}px. Se conserva tu preferencia de escritorio de {saved}px.",
-      "toolDetailsAuto": "Automático",
-      "toolDetailsCompact": "Compacto"
+      "sidebarWidthDrawerStatus": "El diseño de cajón usa {current}px. Se conserva tu preferencia de escritorio de {saved}px."
     },
     "dataMigration": {
       "title": "Datos y copias de seguridad",
@@ -3858,7 +3857,7 @@
     "jumpToLatest": "Ir al más reciente",
     "latest": "Más reciente",
     "thinking": "Razonando",
-    "thoughtProcess": "Proceso de razonamiento",
+    "thoughtProcess": "Razonamiento",
     "thinkingForSeconds": "Razonando · {seconds} s",
     "thoughtForSeconds": "Razonó durante {seconds} s",
     "thoughtForMinutes": "Razonó durante {minutes} min {seconds} s",
@@ -4007,6 +4006,7 @@
     "workedForSeconds": "Trabajó durante {seconds} s",
     "workedForMinutes": "Trabajó durante {minutes} min {seconds} s",
     "activityDurationSeconds": "{seconds} s",
+    "activityElapsed": "Tiempo empleado {duration}",
     "activityDurationMinutes": "{minutes} min {seconds} s",
     "activity": {
       "lifecycle": {
@@ -4021,7 +4021,7 @@
       "provider": {
         "waiting": "Esperando al modelo",
         "responded": "Respuesta del modelo",
-        "reasoning": "Razonamiento profundo",
+        "reasoning": "Razonamiento",
         "rateLimited": "Límite de solicitudes · reintento en {seconds}s",
         "retryWait": "Reintento en {seconds}s",
         "retrying": "Reintentando {attempt}/{limit}",

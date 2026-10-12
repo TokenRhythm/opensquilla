@@ -517,8 +517,9 @@
       "languageDesc": "Langue d'affichage de l'interface et des messages système des canaux. Elle s'applique ici immédiatement et enregistre la langue des messages pour toute la passerelle.",
       "channelNoticeLocaleSyncPending": "La langue de l'interface a changé, mais la langue des messages système des canaux n'est pas encore enregistrée. Une nouvelle tentative aura lieu à la reconnexion de la passerelle.",
       "toolDetailsLabel": "Affichage par défaut des détails d'outil",
-      "toolDetailsDesc": "Automatique suit le type d'outil ; Compact réduit les outils ordinaires ; Développé les ouvre. Les erreurs s'ouvrent automatiquement par défaut et peuvent être repliées manuellement.",
-      "toolDetailsExpanded": "Développé",
+      "toolDetailsDesc": "Définit uniquement l'état initial des détails ; les choix manuels ont priorité. Les résumés d'erreurs restent visibles. La réflexion se replie indépendamment.",
+      "toolDetailsCollapsed": "Replié par défaut",
+      "toolDetailsExpanded": "Développé par défaut",
       "visualEffectsLabel": "Effets visuels",
       "visualEffectsDesc": "Anime les décisions de routage des modèles et les transitions des réponses.",
       "composerFxLabel": "Composeur flottant",
@@ -541,9 +542,7 @@
       "sidebarWidthResizableStatus": "Largeur actuelle sur ordinateur : {current} px.",
       "sidebarWidthClampedStatus": "Valeur enregistrée : {saved} px ; cette fenêtre utilise actuellement {current} px.",
       "sidebarWidthCompactStatus": "La disposition compacte utilise {current} px. Votre préférence sur ordinateur de {saved} px est conservée.",
-      "sidebarWidthDrawerStatus": "La disposition en tiroir utilise {current} px. Votre préférence sur ordinateur de {saved} px est conservée.",
-      "toolDetailsAuto": "Automatique",
-      "toolDetailsCompact": "Compact"
+      "sidebarWidthDrawerStatus": "La disposition en tiroir utilise {current} px. Votre préférence sur ordinateur de {saved} px est conservée."
     },
     "dataMigration": {
       "title": "Données et sauvegardes",
@@ -3858,7 +3857,7 @@
     "jumpToLatest": "Aller au plus récent",
     "latest": "Le plus récent",
     "thinking": "Réflexion",
-    "thoughtProcess": "Processus de réflexion",
+    "thoughtProcess": "Réflexion",
     "thinkingForSeconds": "Réflexion · {seconds} s",
     "thoughtForSeconds": "A réfléchi pendant {seconds} s",
     "thoughtForMinutes": "A réfléchi pendant {minutes} min {seconds} s",
@@ -4007,6 +4006,7 @@
     "workedForSeconds": "Travail effectué pendant {seconds} s",
     "workedForMinutes": "Travail effectué pendant {minutes} min {seconds} s",
     "activityDurationSeconds": "{seconds} s",
+    "activityElapsed": "Temps passé {duration}",
     "activityDurationMinutes": "{minutes} min {seconds} s",
     "activity": {
       "lifecycle": {
@@ -4021,7 +4021,7 @@
       "provider": {
         "waiting": "En attente du modèle",
         "responded": "Réponse du modèle",
-        "reasoning": "Réflexion approfondie",
+        "reasoning": "Réflexion",
         "rateLimited": "Limite atteinte · nouvel essai dans {seconds}s",
         "retryWait": "Nouvel essai dans {seconds}s",
         "retrying": "Nouvel essai {attempt}/{limit}",

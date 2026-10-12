@@ -1,9 +1,11 @@
 import type {
   ChatRenderedMessage,
   ChatStreamTimelineItem,
+  ChatToolCallGroup,
   ChatToolCallRenderItem,
 } from '@/types/chat'
 import type { ChatPart, StatusPart } from '@/types/parts'
+import type { ReasoningBlock } from '@/types/turnlog'
 import {
   compactionCompletedLabelCode,
   compactionSkippedLabelCode,
@@ -163,6 +165,45 @@ export interface AssistantActivityTimelineProjection {
    * arguments.
    */
   statusSteps: AssistantActivityStatusStep[]
+}
+
+/** Match the unified renderer's per-source ordering contract before selecting it. */
+export function canMergeAssistantActivityOrder(
+  statusSteps: readonly AssistantActivityStatusStep[],
+  reasoningBlocks: readonly ReasoningBlock[],
+  timelineItems: readonly ChatStreamTimelineItem[],
+): boolean {
+  // An old record may retain only an aggregate failure. Splitting that group
+  // would either discard the failure or falsely assign it to successful calls.
+  if (timelineItems.some(item => item.type === 'tool-group'
+    && hasUnattributedActivityGroupFailure(item.group))) return false
+  const validOrder = (value: unknown): value is number =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+  const sources: Array<Array<number | undefined>> = [
+    statusSteps.filter(isVisibleActivityStatusStep).map(step => step.activityOrder),
+    reasoningBlocks.filter(block => block.text).map(block => block.activityOrder),
+    timelineItems.flatMap(item => {
+      if (item.type !== 'tool-group') return [item.activityOrder]
+      const callOrders = item.group.calls.map(call => call.activityOrder).filter(validOrder)
+      const fallback = validOrder(item.activityOrder)
+        ? item.activityOrder
+        : validOrder(item.group.activityOrder)
+          ? item.group.activityOrder
+          : callOrders.length ? Math.min(...callOrders) : undefined
+      return item.group.calls.map(call => call.activityOrder ?? fallback)
+    }),
+  ]
+  return sources.some(source => source.length > 0)
+    && sources.every(source => source.every((order, index) =>
+      validOrder(order) && (index === 0 || order >= source[index - 1]!),
+    ))
+}
+
+export function hasUnattributedActivityGroupFailure(group: ChatToolCallGroup): boolean {
+  return group.calls.length > 1
+    && !group.isRunning
+    && (group.isError || group.status === 'error')
+    && group.calls.every(call => !call.isRunning && !call.isError && call.status !== 'error')
 }
 
 export interface ProjectAssistantActivityOptions {
@@ -1053,7 +1094,7 @@ export function isSemanticActivityStatusStep(step: AssistantActivityStatusStep):
     && code !== 'chat.activity.provider.reasoning'
 }
 
-/** Routine model phases shown as the small per-phase flow underneath the turn header. */
+/** Routine model phases used for live feedback and retained timing data. */
 export function isRoutineActivityPhaseStep(step: AssistantActivityStatusStep): boolean {
   return step.category !== 'maintenance' && (
     step.label.code === 'chat.activity.provider.waiting'
@@ -1074,9 +1115,10 @@ export function isBeforeReasoningActivityStatusStep(
 }
 
 /**
- * Status rows worth retaining in the finished activity record. Reasoning owns
- * a richer disclosure, so its status boundary is used for timing but is not
- * duplicated as an empty row.
+ * Status rows worth displaying in the activity transcript. Routine requesting
+ * and writing phases only describe the current live operation; their recorded
+ * boundaries still own timing but do not become completed work items.
+ * Reasoning owns its richer disclosure instead of an empty phase row.
  */
 export function isVisibleActivityStatusStep(step: AssistantActivityStatusStep): boolean {
   if (step.category === 'maintenance') return true
@@ -1086,7 +1128,7 @@ export function isVisibleActivityStatusStep(step: AssistantActivityStatusStep): 
     || step.label.code === 'chat.activity.provider.responded'
     || step.label.code === 'chat.activity.lifecycle.answering'
     || step.label.code === 'chat.activity.lifecycle.answerPrepared'
-  ) return true
+  ) return step.isCurrent
   if (step.label.code.startsWith('chat.activity.provider.')) return true
   return isSemanticActivityStatusStep(step)
 }

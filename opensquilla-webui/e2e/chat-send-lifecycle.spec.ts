@@ -257,6 +257,9 @@ for (const status of ['succeeded', 'failed', 'cancelled'] as const) {
     } else gateway.finish(status)
 
     await expect(stop).toHaveCount(0)
+    await expect(page.locator('.chat-turn-settled-announcer')).toHaveText(
+      status === 'succeeded' ? 'Completed' : status === 'failed' ? 'Failed' : 'Interrupted',
+    )
     await expect(send).toBeEnabled()
     await expect(input).toHaveValue('Synthetic next request without changing projects.')
     await send.click()
@@ -267,10 +270,24 @@ for (const status of ['succeeded', 'failed', 'cancelled'] as const) {
     expect(page.url()).toBe(originalUrl)
     expect(gateway.connectionCount()).toBe(1)
     await expect(stop).toBeVisible()
+    await expect(page.locator('.chat-turn-settled-announcer')).toHaveText('')
     gateway.finish('succeeded')
     await expect(send).toBeEnabled()
+    await expect(page.locator('.chat-turn-settled-announcer')).toHaveText('Completed')
   })
 }
+
+test('switching away from a live chat does not announce completion', async ({ page }) => {
+  const gateway = await installGateway(page)
+  await openChat(page)
+  await page.locator('.chat-textarea').fill('Synthetic request while navigating.')
+  await page.locator('.chat-send-btn[aria-label="Send"]').click()
+  await expect.poll(() => gateway.sends.length).toBe(1)
+  await expect(page.getByRole('button', { name: 'Stop current response' })).toBeVisible()
+  await page.locator('.sidebar-new-session').click()
+  await expect(page).toHaveURL(/\/chat\/new/)
+  await expect(page.locator('.chat-turn-settled-announcer')).toHaveText('')
+})
 
 test('pending admission is visible and a rejected send restores an editable retry', async ({ page }) => {
   const gateway = await installGateway(page, true)

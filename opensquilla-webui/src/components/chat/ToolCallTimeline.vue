@@ -1,6 +1,7 @@
 <template>
   <RunTrace
     :items="items"
+    :executing="executing"
     :variant="variant"
     :presentation="presentation"
     :state-scope="stateScope"
@@ -12,8 +13,8 @@
     :tool-status-text="toolStatusText"
     :tool-secondary-text="toolSecondaryText"
     :tool-elapsed-text="toolElapsedText"
-    @toggle-group="$emit('toggleGroup', $event)"
-    @toggle-item="$emit('toggleItem', $event)"
+    @toggle-group="(id, open) => $emit('toggleGroup', id, open)"
+    @toggle-item="(id, open) => $emit('toggleItem', id, open)"
     @open-change="$emit('openChange', $event)"
     @show-result="(content, title, context) => $emit('showResult', content, title, context)"
   >
@@ -32,10 +33,10 @@ import type {
   ToolResultContext,
 } from '@/types/chat'
 
-defineProps<{
+withDefaults(defineProps<{
   items: ChatStreamTimelineItem[]
-  isToolGroupOpen: (groupId: string) => boolean
-  isToolItemOpen: (renderKey: string) => boolean
+  isToolGroupOpen: (groupId: string) => boolean | undefined
+  isToolItemOpen: (renderKey: string) => boolean | undefined
   toolGroupStatusText: (group: ChatToolCallGroup) => string
   toolStatusText: (call: ChatToolCallRenderItem) => string
   toolSecondaryText: (call: ChatToolCallRenderItem) => string
@@ -44,12 +45,15 @@ defineProps<{
   presentation?: 'activity'
   stateScope?: string
   sessionKey?: string
-}>()
+  executing?: boolean
+}>(), {
+  executing: false,
+})
 
 defineEmits<{
-  toggleGroup: [groupId: string]
+  toggleGroup: [groupId: string, open: boolean]
+  toggleItem: [renderKey: string, open: boolean]
   openChange: [open: boolean]
-  toggleItem: [renderKey: string]
   showResult: [content: string, title: string, context?: ToolResultContext]
 }>()
 

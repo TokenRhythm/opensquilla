@@ -517,8 +517,9 @@
       "languageDesc": "Anzeigesprache der Oberfläche und der Systemhinweise in Kanälen. Sie gilt hier sofort und speichert die Hinweis-Sprache gatewayweit.",
       "channelNoticeLocaleSyncPending": "Die Oberflächensprache wurde geändert, aber die Sprache der Kanal-Systemhinweise ist noch nicht gespeichert. Beim erneuten Verbinden mit dem Gateway wird es erneut versucht.",
       "toolDetailsLabel": "Werkzeugdetails standardmäßig anzeigen",
-      "toolDetailsDesc": "Automatisch folgt dem Werkzeugtyp; Kompakt klappt normale Werkzeuge ein; Ausgeklappt öffnet sie. Fehler werden standardmäßig automatisch geöffnet und können manuell eingeklappt werden.",
-      "toolDetailsExpanded": "Ausgeklappt",
+      "toolDetailsDesc": "Gilt nur für Werkzeugdetails; manuelle Auswahl hat Vorrang. Fehlerübersichten bleiben sichtbar. Gedanken werden unabhängig eingeklappt.",
+      "toolDetailsCollapsed": "Standardmäßig eingeklappt",
+      "toolDetailsExpanded": "Standardmäßig ausgeklappt",
       "visualEffectsLabel": "Visuelle Effekte",
       "visualEffectsDesc": "Animiert Modell-Routing-Entscheidungen und Antwortübergänge in Unterhaltungen.",
       "composerFxLabel": "Schwebende Eingabeleiste",
@@ -541,9 +542,7 @@
       "sidebarWidthResizableStatus": "Aktuelle Desktop-Breite: {current}px.",
       "sidebarWidthClampedStatus": "Gespeichert sind {saved}px; dieses Fenster verwendet derzeit {current}px.",
       "sidebarWidthCompactStatus": "Das kompakte Layout verwendet {current}px. Deine Desktop-Einstellung von {saved}px bleibt erhalten.",
-      "sidebarWidthDrawerStatus": "Das Schubladenlayout verwendet {current}px. Deine Desktop-Einstellung von {saved}px bleibt erhalten.",
-      "toolDetailsAuto": "Automatisch",
-      "toolDetailsCompact": "Kompakt"
+      "sidebarWidthDrawerStatus": "Das Schubladenlayout verwendet {current}px. Deine Desktop-Einstellung von {saved}px bleibt erhalten."
     },
     "dataMigration": {
       "title": "Daten & Sicherungen",
@@ -3858,7 +3857,7 @@
     "jumpToLatest": "Zum Neuesten springen",
     "latest": "Neueste",
     "thinking": "Denkt nach",
-    "thoughtProcess": "Denkprozess",
+    "thoughtProcess": "Nachdenken",
     "thinkingForSeconds": "Denkt nach · {seconds}s",
     "thoughtForSeconds": "{seconds}s nachgedacht",
     "thoughtForMinutes": "{minutes}min {seconds}s nachgedacht",
@@ -4007,6 +4006,7 @@
     "workedForSeconds": "{seconds} Sek. gearbeitet",
     "workedForMinutes": "{minutes} Min. {seconds} Sek. gearbeitet",
     "activityDurationSeconds": "{seconds} Sek.",
+    "activityElapsed": "Zeitaufwand {duration}",
     "activityDurationMinutes": "{minutes} Min. {seconds} Sek.",
     "activity": {
       "lifecycle": {
@@ -4021,7 +4021,7 @@
       "provider": {
         "waiting": "Warten auf das Modell",
         "responded": "Modellantwort",
-        "reasoning": "Tiefes Nachdenken",
+        "reasoning": "Nachdenken",
         "rateLimited": "Ratenlimit · neuer Versuch in {seconds}s",
         "retryWait": "Neuer Versuch in {seconds}s",
         "retrying": "Neuer Versuch {attempt}/{limit}",

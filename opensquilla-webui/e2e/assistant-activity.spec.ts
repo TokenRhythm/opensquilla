@@ -16,6 +16,12 @@ const LIFECYCLE_SESSION_KEY = 'agent:main:webchat:e2e-assistant-activity-lifecyc
 const LIFECYCLE_TASK_ID = 'task-e2e-assistant-activity-lifecycle'
 const ACTIVITY_SCREENSHOT_DIR = process.env.OPENSQUILLA_ACTIVITY_SCREENSHOT_DIR || ''
 
+test.beforeEach(async ({ page }) => {
+  await page.route('**/api/approvals', route => route.fulfill({ json: { mode: 'prompt', pending: [], allowPatterns: [], denyPatterns: [] } }))
+  await page.route('**/api/system/update', route => route.fulfill({ json: { available: false } }))
+  await page.route('**/api/elevated-mode', route => route.fulfill({ json: { enabled: false } }))
+})
+
 async function captureActivityScreenshot(page: Page, name: string) {
   if (!ACTIVITY_SCREENSHOT_DIR) return
   fs.mkdirSync(ACTIVITY_SCREENSHOT_DIR, { recursive: true, mode: 0o700 })
@@ -162,7 +168,7 @@ async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
           skills: {},
         },
         'onboarding.status': { audioConfigured: false },
-        'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
+        'sandbox.run_mode.preference.get': { runMode: 'full', source: 'default' },
         'sandbox.capability.status': { available: false },
         'sessions.list': { sessions: [], count: 0, ts: now, has_more: false },
         'usage.status': { sessions: [] },
@@ -285,6 +291,7 @@ async function mockUnifiedTurnReceiptHistory(page: Page) {
         'sessions.messages.hydrate': sessionMessagesHydratePayload(
           sessionKey,
         ),
+        'sandbox.run_mode.preference.get': { runMode: 'full', source: 'default' },
         'usage.status': { sessions: [] },
       }
       ws.send(wsResponse(
@@ -434,6 +441,7 @@ async function mockControlledActivityLifecycle(
         'sessions.messages.hydrate': sessionMessagesHydratePayload(
           LIFECYCLE_SESSION_KEY,
         ),
+        'sandbox.run_mode.preference.get': { runMode: 'full', source: 'default' },
         'usage.status': { sessions: [] },
       }
       ws.send(wsResponse(
@@ -544,9 +552,8 @@ test.describe('Completed assistant activity disclosure', () => {
       backgroundColor: 'rgba(0, 0, 0, 0)',
       borderTopWidth: '0px',
       boxShadow: 'none',
-      // The chevron rests faintly visible so the disclosure affordance is
-      // discoverable without hover.
-      arrowOpacity: '0.34',
+      // Desktop chevrons appear on hover or keyboard focus, preserving quiet rows.
+      arrowOpacity: '0',
     })
     await summary.hover()
     await expect(summaryArrow).toHaveCSS('opacity', '0.8')
@@ -610,6 +617,8 @@ test.describe('Completed assistant activity disclosure', () => {
     await expect(details.locator('.activity-tool-details__window')).toHaveCSS('overflow-y', 'auto')
     await expect(details).not.toContainText('/private/')
     await expect(activity.locator('.tool-row-section')).toHaveCount(0)
+    await page.mouse.move(1, 1)
+    await expect(row).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
     const flatStyles = await activity.evaluate((element) => {
       const readAll = (selector: string) =>
         Array.from(element.querySelectorAll<HTMLElement>(selector)).map((target) => {
@@ -635,7 +644,6 @@ test.describe('Completed assistant activity disclosure', () => {
     for (const style of [
       ...flatStyles.cards,
       ...flatStyles.rows,
-      ...flatStyles.details,
     ]) {
       expect(style).toMatchObject({
         backgroundColor: 'rgba(0, 0, 0, 0)',
@@ -650,9 +658,12 @@ test.describe('Completed assistant activity disclosure', () => {
     await expect(activity).toHaveAttribute('data-share-expanded', 'false')
     expect(await summary.evaluate(element => document.activeElement === element)).toBe(true)
     await expect(answer).toBeVisible()
+    await summary.press('Enter')
+    await expect(row).toHaveAttribute('aria-expanded', 'true')
+    await expect(details).toBeVisible()
   })
 
-  test('keeps web-search URLs collapsed without exposing invocation parameters', async ({ page }) => {
+  test('keeps web-search URLs collapsed with a readable query summary', async ({ page }) => {
     await mockActivityHistory(page, { searchTargets: true })
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(`${SESSION_KEY}-search`))
     await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
@@ -665,7 +676,7 @@ test.describe('Completed assistant activity disclosure', () => {
     const targets = activity.locator('.tool-row-target--url')
     await expect(row).toHaveAttribute('aria-expanded', 'false')
     await expect(targets).toHaveCount(0)
-    await expect(activity).not.toContainText('private search query')
+    await expect(row).toContainText('private search query')
     await expect(activity).not.toContainText('INPUT')
     await expect(activity).not.toContainText('RESULT')
 
@@ -674,7 +685,7 @@ test.describe('Completed assistant activity disclosure', () => {
     await expect(targets).toHaveCount(2)
     await expect(targets.nth(0)).toContainText('https://example.test/one')
     await expect(targets.nth(1)).toContainText('https://docs.example.test/two')
-    await expect(activity).not.toContainText('private search query')
+    await expect(row).toContainText('private search query')
 
     await row.press('Space')
     await expect(row).toHaveAttribute('aria-expanded', 'false')
@@ -699,12 +710,15 @@ test.describe('Completed assistant activity disclosure', () => {
     await expect(activity).toHaveAttribute('data-share-expanded', 'true')
     await expect(errorRow).toHaveCount(1)
     await expect(errorRow).toBeVisible()
+    await expect(errorRow).toHaveAttribute('aria-expanded', 'false')
+    await errorRow.press('Enter')
     await expect(errorRow).toHaveAttribute('aria-expanded', 'true')
-    const failureDetail = activity.getByText('Tool unavailable', { exact: true })
+    const failureDetail = activity.locator('.activity-tool-details').getByText('Tool unavailable', { exact: true })
     await expect(failureDetail).toBeVisible()
     await errorRow.press('Enter')
     await expect(errorRow).toHaveAttribute('aria-expanded', 'false')
     await expect(failureDetail).not.toBeVisible()
+    await expect(activity.locator('.tool-row__error-summary')).toContainText('Tool unavailable')
     await errorRow.press('Space')
     await expect(errorRow).toHaveAttribute('aria-expanded', 'true')
     await expect(failureDetail).toBeVisible()
@@ -768,23 +782,23 @@ test.describe('Completed assistant activity disclosure', () => {
       const activity = page.getByTestId('assistant-activity')
       const summary = activity.locator('.assistant-activity__summary')
       await expect(activity).toHaveAttribute('data-share-expanded', 'false')
-      await expect(summary).toHaveText('Completed · 44s')
+      await expect(summary).toHaveText('Time spent 44s')
       await expect(summary).not.toContainText('Failed')
       await captureActivityScreenshot(page, `recovered-edit-${width}-collapsed`)
 
       await summary.press('Enter')
       await expect(activity).toHaveAttribute('data-share-expanded', 'true')
-      const toolBatch = activity.locator('.assistant-activity-tool-batch')
-      await toolBatch.locator('summary').click()
-      await expect(toolBatch).toHaveAttribute('open', '')
+      await expect(activity.locator('.assistant-activity-tool-batch')).toHaveCount(0)
       const errorRow = activity.locator('.tool-row--error')
       await expect(errorRow).toHaveCount(1)
       await expect(errorRow).toBeVisible()
+      await expect(errorRow).toHaveAttribute('aria-expanded', 'false')
+      await errorRow.press('Enter')
       await expect(activity.getByText(
         'old_text was not found; read the current file and retry.', { exact: true },
       )).toBeVisible()
       await expect(activity.locator('.tool-row[data-op="file.edit"]:not(.tool-row--error)')).toHaveCount(1)
-      await expect(summary).toHaveText('Completed · 44s')
+      await expect(summary).toHaveText('Time spent 44s')
       const pageOverflow = await page.evaluate(() =>
         document.documentElement.scrollWidth - document.documentElement.clientWidth,
       )
@@ -992,7 +1006,9 @@ test.describe('Live assistant activity lifecycle', () => {
       .toHaveAttribute('aria-hidden', 'true')
     await expect(liveActivity.locator('.assistant-activity__live-failure')).toHaveCount(0)
     await expect(liveActivity.locator('.assistant-activity-status__row')).toHaveCount(0)
+    await expect(liveSummary.locator('.activity-motion--active')).toHaveCount(0)
     const liveMotion = await liveActivity.evaluate((element) => ({
+      row: getComputedStyle(element.querySelector<HTMLElement>('.assistant-activity__live-head .activity-motion')!).animationName,
       dot: getComputedStyle(
         element.querySelector<HTMLElement>('.assistant-activity__live-dot')!,
       ).animationName,
@@ -1000,9 +1016,9 @@ test.describe('Live assistant activity lifecycle', () => {
         element.querySelector<HTMLElement>('.assistant-activity__live-label')!,
       ).animationName,
     }))
-    // The pulsing dot is the single working signal; the label is deliberately
-    // static (the shimmer gradient was removed as visual noise).
-    expect(liveMotion.dot).not.toBe('none')
+    // Expanded activity animates its current tool, not a duplicate header.
+    expect(liveMotion.row).toBe('none')
+    expect(liveMotion.dot).toBe('none')
     expect(liveMotion.label).toBe('none')
 
     lifecycle.emit('session.event.tool_use_start', {
@@ -1012,10 +1028,13 @@ test.describe('Live assistant activity lifecycle', () => {
     })
     const inspectRow = liveActivity.locator('.tool-row[data-op="file.inspect"]')
     await expect(inspectRow).toBeVisible()
+    await expect(inspectRow.locator('.activity-motion--active')).toBeVisible()
+    expect(await inspectRow.locator('.activity-motion').evaluate(element => getComputedStyle(element).animationName))
+      .toContain('activity-row-shimmer')
     await expect(inspectRow).not.toHaveAttribute('aria-expanded', /.+/)
     await expect(inspectRow.locator('.tool-row__activity-arrow')).toHaveCount(0)
     await expect(inspectRow.locator('.tool-row__bullet')).toHaveCount(0)
-    const inspectPath = liveActivity.locator('.tool-row-target--path')
+    const inspectPath = inspectRow.locator('.tool-row__arg')
     await expect(inspectPath).toHaveText('…/chat.ts')
     await expect(inspectPath).not.toHaveAttribute('role', 'button')
     await expect(liveActivity).not.toContainText('/private/project/chat.ts')
@@ -1023,7 +1042,7 @@ test.describe('Live assistant activity lifecycle', () => {
     // A cluster still in flight reads in the present tense; it settles into
     // the past tense once its result lands.
     const liveTimeline = liveActivity.getByTestId('assistant-unified-activity-timeline')
-    await expect(liveTimeline.getByText('Inspecting files', { exact: true })).toHaveCount(1)
+    await expect(inspectRow.locator('.tool-row__label')).toHaveText('Reading files')
 
     lifecycle.emit('session.event.tool_result', {
       tool_use_id: 'activity-inspect',
@@ -1032,7 +1051,7 @@ test.describe('Live assistant activity lifecycle', () => {
       result: 'read',
       execution_status: { status: 'success' },
     })
-    await expect(liveActivity.getByText('Inspected files', { exact: true })).toHaveCount(1)
+    await expect(inspectRow.locator('.tool-row__label')).toHaveText('Read')
     lifecycle.emit('session.event.text_delta', { text: 'Draft candidate.' })
 
     const draftCandidate = page.getByText('Draft candidate.', { exact: true })
@@ -1056,7 +1075,7 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(liveActivity.getByText('Draft candidate.', { exact: true })).toBeVisible()
     await expect(liveActivity.locator('.tool-row[data-op="command.run"]')).toBeVisible()
     await expect(liveStatus).toHaveText('Running commands')
-    await expect(liveTimeline.getByText('Running commands', { exact: true })).toHaveCount(1)
+    await expect(liveTimeline.getByText('Executing command', { exact: true })).toHaveCount(1)
 
     lifecycle.emit('session.event.tool_result', {
       tool_use_id: 'activity-verify',
@@ -1115,7 +1134,7 @@ test.describe('Live assistant activity lifecycle', () => {
 
   test('disables live activity motion when reduced motion is requested', async ({ page }) => {
     await page.emulateMedia({ reducedMotion: 'reduce' })
-    await mockControlledActivityLifecycle(page)
+    const lifecycle = await mockControlledActivityLifecycle(page)
     await page.goto(
       CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
     )
@@ -1126,7 +1145,16 @@ test.describe('Live assistant activity lifecycle', () => {
 
     const liveActivity = page.locator('.assistant-activity--live')
     await expect(liveActivity).toBeVisible()
+    lifecycle.emit('session.event.tool_use_start', {
+      tool_use_id: 'activity-reduced-motion', name: 'read_file',
+      input: { path: '/private/project/chat.ts' },
+    })
+    const activeRow = liveActivity.locator('.tool-row .activity-motion--active')
+    await expect(activeRow).toBeVisible()
+    await expect(activeRow).toHaveCSS('animation-name', 'none')
+    await expect(activeRow).toHaveCSS('mask-image', 'none')
     const liveMotion = await liveActivity.evaluate((element) => ({
+      row: getComputedStyle(element.querySelector<HTMLElement>('.assistant-activity__live-head .activity-motion')!).animationName,
       dot: getComputedStyle(
         element.querySelector<HTMLElement>('.assistant-activity__live-dot')!,
       ).animationName,
@@ -1134,7 +1162,7 @@ test.describe('Live assistant activity lifecycle', () => {
         element.querySelector<HTMLElement>('.assistant-activity__live-label')!,
       ).animationName,
     }))
-    expect(liveMotion).toEqual({ dot: 'none', label: 'none' })
+    expect(liveMotion).toEqual({ row: 'none', dot: 'none', label: 'none' })
   })
 })
 

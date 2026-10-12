@@ -92,7 +92,7 @@ describe('ActivityDisclosure lifecycle transitions', () => {
     expect(label?.textContent).toBe('Running')
   })
 
-  it('uses AA text tokens and no text shimmer for the live header', () => {
+  it('keeps readable text tokens and delegates motion without a second pulsing dot', () => {
     const rule = cssRule('.assistant-activity__summary')
     expect(rule).toContain('color: var(--text-muted);')
 
@@ -100,12 +100,12 @@ describe('ActivityDisclosure lifecycle transitions', () => {
     expect(elapsedRule).toContain('color: var(--text-muted);')
     expect(elapsedRule).toContain('font-size: inherit;')
 
-    // The pulsing dot is the single "working" signal: the shimmer treatment
-    // (gradient text + keyframes + its reduced-motion undo) must stay gone.
+    // The shared whole-row treatment owns motion; readable color tokens remain
+    // the static fallback, with no additional pulsing dot or local text effect.
     expect(activityDisclosureSource).not.toContain('assistant-activity-shimmer')
     expect(activityDisclosureSource).not.toContain('.assistant-activity__live-label.is-active')
     expect(activityDisclosureSource).not.toContain('background-clip: text')
-    expect(activityDisclosureSource).toContain('assistant-activity-pulse')
+    expect(activityDisclosureSource).not.toContain('assistant-activity-pulse')
   })
 
   it.each(['failed', 'interrupted'] as const)(
@@ -330,10 +330,9 @@ describe('ActivityDisclosure lifecycle transitions', () => {
 })
 
 describe('ActivityDisclosure resting affordance', () => {
-  it('keeps the disclosure arrow visible at rest with no transform offset', () => {
+  it('keeps the disclosure arrow hidden until hover or keyboard focus', () => {
     const arrowRule = cssRule('.assistant-activity__summary-arrow')
-    expect(arrowRule).toContain('opacity: 0.34;')
-    expect(arrowRule).not.toContain('opacity: 0;')
+    expect(arrowRule).toContain('opacity: 0;')
     expect(arrowRule).not.toContain('translateX(-')
   })
 
@@ -354,9 +353,9 @@ describe('ActivityDisclosure resting affordance', () => {
 })
 
 describe('ActivityDisclosure summary label', () => {
-  it('makes the completed outcome larger than its supporting phase rows', () => {
+  it('keeps the completed outcome compact and larger than supporting phase rows', () => {
     expect(cssRule('.assistant-activity--settled > .assistant-activity__summary'))
-      .toContain('font-size: 0.875rem;')
+      .toContain('font-size: 0.8125rem;')
     expect(activityDisclosureSource).toContain(
       '.assistant-activity--settled :deep(.assistant-activity-status__row)',
     )
@@ -427,6 +426,147 @@ describe('ActivityDisclosure summary label', () => {
 })
 
 describe('ActivityDisclosure live header', () => {
+  it('suspends nested live motion when an ancestor closes without resetting the nested choice', async () => {
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp({
+      render: () => h(ActivityDisclosure, { stepCount: 1, failureCount: 0 }, {
+        default: () => h(ActivityDisclosure, {
+          lifecycle: 'working', executing: true, stepCount: 1, failureCount: 0,
+        }),
+      }),
+    })
+    mountedApps.push(app)
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+
+    const outer = host.querySelector<HTMLButtonElement>('.assistant-activity__summary')!
+    const inner = host.querySelector<HTMLButtonElement>('.assistant-activity__live-head')!
+    expect(host.querySelector('.activity-motion--active')).toBeNull()
+    outer.click()
+    await nextTick()
+    expect(host.querySelector('.activity-motion--active')).not.toBeNull()
+
+    inner.click()
+    await nextTick()
+    expect(inner.getAttribute('aria-expanded')).toBe('true')
+    expect(host.querySelector('.activity-motion--active')).toBeNull()
+    outer.click()
+    await nextTick()
+    outer.click()
+    await nextTick()
+    expect(inner.getAttribute('aria-expanded')).toBe('true')
+    expect(host.querySelector('.activity-motion--active')).toBeNull()
+
+    inner.click()
+    await nextTick()
+    expect(host.querySelector('.activity-motion--active')).not.toBeNull()
+    outer.click()
+    await nextTick()
+    expect(host.querySelector('.activity-motion--active')).toBeNull()
+  })
+
+  it.each(['working', 'answering'] as const)(
+    'animates only the collapsed executing %s header and preserves manual disclosure',
+    async lifecycle => {
+      const host = mountDisclosure({
+        lifecycle,
+        executing: true,
+        stepCount: 2,
+        failureCount: 0,
+      })
+      await nextTick()
+
+      const summary = host.querySelector<HTMLButtonElement>('.assistant-activity__live-head')
+      expect(host.querySelector('.activity-motion--active')).not.toBeNull()
+      expect(summary?.getAttribute('aria-expanded')).toBe('false')
+
+      summary?.click()
+      await nextTick()
+      expect(host.querySelector('.activity-motion--active')).toBeNull()
+      expect(summary?.getAttribute('aria-expanded')).toBe('true')
+
+      summary?.click()
+      await nextTick()
+      expect(host.querySelector('.activity-motion--active')).not.toBeNull()
+      expect(summary?.getAttribute('aria-expanded')).toBe('false')
+    },
+  )
+
+  it.each(['Queued', 'Waiting for approval'])(
+    'keeps the live %s header static until execution is confirmed',
+    async phaseLabel => {
+      const props = reactive({
+        lifecycle: 'working' as const,
+        executing: false,
+        stepCount: 0,
+        failureCount: 0,
+        phaseLabel,
+      })
+      const host = mountDisclosure(props)
+      await nextTick()
+      expect(host.querySelector('.activity-motion--active')).toBeNull()
+      expect(host.querySelector('[role="status"]')?.textContent?.trim()).toBe(phaseLabel)
+
+      props.executing = true
+      props.phaseLabel = 'Running commands'
+      await nextTick()
+      expect(host.querySelector('.activity-motion--active')).not.toBeNull()
+      expect(host.querySelector('[role="status"]')?.textContent?.trim()).toBe('Running commands')
+    },
+  )
+
+  it('stops the collapsed header on stale signals and resumes only after fresh execution', async () => {
+    const props = reactive({
+      lifecycle: 'working' as const,
+      executing: true,
+      stepCount: 1,
+      failureCount: 0,
+      stale: false,
+    })
+    const host = mountDisclosure(props)
+    await nextTick()
+    expect(host.querySelector('.activity-motion--active')).not.toBeNull()
+
+    props.stale = true
+    await nextTick()
+    expect(host.querySelector('.activity-motion--active')).toBeNull()
+
+    props.stale = false
+    props.executing = false
+    await nextTick()
+    expect(host.querySelector('.activity-motion--active')).toBeNull()
+
+    props.executing = true
+    await nextTick()
+    expect(host.querySelector('.activity-motion--active')).not.toBeNull()
+  })
+
+  it.each(['settled', 'failed', 'interrupted'] as const)(
+    'stops immediately on %s and does not restart when history is expanded',
+    async terminal => {
+      const props = reactive({
+        lifecycle: 'working' as 'working' | typeof terminal,
+        executing: true,
+        stepCount: 1,
+        failureCount: 0,
+      })
+      const host = mountDisclosure(props)
+      await nextTick()
+      expect(host.querySelector('.activity-motion--active')).not.toBeNull()
+
+      props.lifecycle = terminal
+      await nextTick()
+      expect(host.querySelector('.activity-motion--active')).toBeNull()
+
+      host.querySelector<HTMLButtonElement>('.assistant-activity__summary')?.click()
+      await nextTick()
+      expect(host.querySelector('.activity-motion--active')).toBeNull()
+      expect(host.querySelector('.assistant-activity__body')?.getAttribute('aria-hidden')).toBe('false')
+    },
+  )
+
   it('still allows a live disclosure to be collapsed and expanded manually', async () => {
     const host = mountDisclosure({
       lifecycle: 'working',
@@ -556,7 +696,7 @@ describe('ActivityDisclosure stale state', () => {
       .toBe('true')
   })
 
-  it('removes the stale explanation and resumes the running indicator on progress', async () => {
+  it('removes the stale explanation without restarting the expanded header', async () => {
     const props = reactive({
       lifecycle: 'working' as const,
       stepCount: 1,
@@ -565,6 +705,7 @@ describe('ActivityDisclosure stale state', () => {
       phaseElapsedLabel: '24s',
       stale: true,
       defaultOpen: true,
+      executing: true,
     })
     const host = mountDisclosure(props)
     await nextTick()
@@ -577,12 +718,12 @@ describe('ActivityDisclosure stale state', () => {
 
     expect(host.querySelector('.assistant-activity__stale-note')).toBeNull()
     expect(host.querySelector('[role="status"]')?.textContent?.trim()).toBe('Waiting for model')
-    expect(host.querySelector('.assistant-activity__live-dot')?.classList.contains('is-active')).toBe(true)
+    expect(host.querySelector('.activity-motion--active')).toBeNull()
     expect(host.querySelector('.assistant-activity__phase-elapsed')?.textContent).toBe('Current step 0s')
     expect(host.querySelector('.assistant-activity__live-head')?.getAttribute('aria-expanded')).toBe('true')
   })
 
-  it('shows the working copy with the pulsing dot when live and not stale', async () => {
+  it('shows the working copy with a static dot when execution is not known', async () => {
     const host = mountDisclosure({
       lifecycle: 'working',
       stepCount: 0,
@@ -593,8 +734,9 @@ describe('ActivityDisclosure stale state', () => {
     const dot = host.querySelector('.assistant-activity__live-dot')
     expect(host.querySelector('.assistant-activity__live-label')?.textContent?.trim())
       .toBe('Working')
-    expect(dot?.classList.contains('is-active')).toBe(true)
+    expect(dot?.classList.contains('is-active')).toBe(false)
     expect(dot?.classList.contains('is-stale')).toBe(false)
+    expect(host.querySelector('.activity-motion--active')).toBeNull()
   })
 })
 
@@ -614,8 +756,9 @@ describe('ActivityDisclosure expanded boundary', () => {
     const innerRule = cssRule('.assistant-activity__body-inner')
     expect(innerRule).toContain('overflow: hidden;')
     expect(innerRule).not.toContain('border-left:')
-    expect(innerRule).toContain('padding: 0 0 0 0.75rem;')
-    expect(activityDisclosureSource).toContain('assistant-activity-item-enter')
+    expect(innerRule).toContain('padding: 0;')
+    expect(activityDisclosureSource).not.toContain('assistant-activity-item-enter')
+    expect(activityDisclosureSource).not.toContain('animation-delay:')
     expect(activityDisclosureSource)
       .not.toContain('.assistant-activity--settled[data-share-expanded="true"]::after')
   })

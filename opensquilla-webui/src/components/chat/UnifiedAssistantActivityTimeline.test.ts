@@ -1,11 +1,12 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { createApp, h, nextTick, type App } from 'vue'
+import { createApp, h, nextTick, ref, type App } from 'vue'
 
 import i18n from '@/i18n'
 import type { ChatStreamTimelineItem, ChatToolCallRenderItem } from '@/types/chat'
 import type { ReasoningBlock } from '@/types/turnlog'
 import { projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
+import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
 import UnifiedAssistantActivityTimeline from './UnifiedAssistantActivityTimeline.vue'
 
 const mounted: App[] = []
@@ -51,10 +52,58 @@ describe('UnifiedAssistantActivityTimeline', () => {
   beforeEach(() => {
     document.body.innerHTML = ''
     i18n.global.locale.value = 'en'
+    useToolDetailPreference().setMode('collapsed')
   })
   afterEach(() => {
     while (mounted.length) mounted.pop()?.unmount()
   })
+
+  it.each(['tool', 'reasoning'] as const)(
+    'keeps restored %s static and forwards the live execution gate through its adapters',
+    async kind => {
+      const call: ChatToolCallRenderItem = { ...tool('running-tool', 'exec', 1), isRunning: true, status: '' }
+      const items = kind === 'tool' ? [group(call)] : []
+      const reasoningBlocks: ReasoningBlock[] = kind === 'reasoning'
+        ? [{
+          id: 'running-reasoning', index: 0, text: 'Checking the result',
+          status: 'streaming', startedAt: 1_000, contentKind: 'reasoning', activityOrder: 1,
+        }]
+        : []
+      const projection = projectAssistantActivityTimeline(items, {
+        lifecycle: 'working', statusHistory: [], endedAt: 2_000,
+      })
+      const executing = ref<boolean | undefined>()
+      const root = document.createElement('div')
+      document.body.appendChild(root)
+      const app = createApp({
+        render: () => h(UnifiedAssistantActivityTimeline, {
+          projection,
+          timelineItems: items,
+          reasoningBlocks,
+          executing: executing.value,
+          isToolGroupOpen: () => undefined,
+          isToolItemOpen: () => undefined,
+          toolGroupStatusText: () => '',
+          toolStatusText: () => '',
+          toolSecondaryText: () => '',
+        }),
+      })
+      mounted.push(app)
+      app.use(i18n)
+      app.mount(root)
+      await nextTick()
+
+      // Persisted running/streaming flags alone must not replay a live effect.
+      expect(root.querySelectorAll('.activity-motion--active')).toHaveLength(0)
+      executing.value = true
+      await nextTick()
+      expect(root.querySelectorAll('.activity-motion--active')).toHaveLength(1)
+
+      executing.value = false
+      await nextTick()
+      expect(root.querySelectorAll('.activity-motion--active')).toHaveLength(0)
+    },
+  )
 
   it('renders the target multi-leg turn in stream order instead of fixed regions', async () => {
     const items: ChatStreamTimelineItem[] = [
@@ -71,6 +120,7 @@ describe('UnifiedAssistantActivityTimeline', () => {
       { action: 'write:1', label: 'Writing', at: 31_000, activityOrder: 31 },
       { action: 'provider:requesting', label: 'Waiting', at: 50_000, activityOrder: 50 },
       { action: 'provider:reasoning', label: 'Reasoning', at: 51_000, activityOrder: 51 },
+      { action: 'provider:fallback', label: 'Fallback', at: 55_000, activityOrder: 55 },
       { action: 'write:2', label: 'Writing', at: 140_000, activityOrder: 140 },
       { action: 'provider:requesting', label: 'Waiting', at: 3_744_000, activityOrder: 3744 },
       { action: 'provider:reasoning', label: 'Reasoning', at: 3_746_000, activityOrder: 3746 },
@@ -94,8 +144,8 @@ describe('UnifiedAssistantActivityTimeline', () => {
         projection,
         timelineItems: items,
         reasoningBlocks,
-        isToolGroupOpen: () => false,
-        isToolItemOpen: () => false,
+        isToolGroupOpen: () => undefined,
+        isToolItemOpen: () => undefined,
         toolGroupStatusText: () => '完成',
         toolStatusText: () => '完成',
         toolSecondaryText: () => '',
@@ -110,50 +160,46 @@ describe('UnifiedAssistantActivityTimeline', () => {
     const orders = entries
       .map(node => Number(node.getAttribute('data-activity-order')))
     expect(orders).toEqual([
-      4, 6, 31, 31, 41,
-      50, 52, 140, 140, 154,
-      3744, 3747, 3767, 3767, 3768, 3805,
+      6, 31, 41,
+      52, 55, 140, 154,
+      3747, 3767, 3768,
     ])
     expect(entries.map(node => node.getAttribute('data-activity-id'))).toEqual([
-      expect.any(String),
       'r1',
-      expect.any(String),
       'text-1',
       'tool:skill-view',
-      expect.any(String),
       'r2',
       expect.any(String),
       'text-2',
       'tool:write-file',
-      expect.any(String),
       'r3',
-      expect.any(String),
       'text-3',
       'tool:publish',
-      expect.any(String),
     ])
     const visible = root.textContent || ''
     let cursor = -1
     for (const token of [
-      'Model response',
       '思考一',
       '第一段',
-      'Used tools',
-      'Model response',
+      'Read skill',
       '思考二',
+      'Switching to backup model',
       '第二段',
-      'Edited files',
-      'Model response',
+      'Written',
       '思考三',
       '马上发布',
-      'Created artifacts',
-      'Answer composition',
+      'Create file',
     ]) {
       const next = visible.indexOf(token, cursor + 1)
       expect(next, `missing or reordered token: ${token}`).toBeGreaterThan(cursor)
       cursor = next
     }
     expect(root.textContent).toContain('马上发布')
+    expect(root.textContent).not.toContain('Model response')
+    expect(root.textContent).not.toContain('Answer composition')
+    // Hiding presentation rows must not remove timing or execution evidence.
+    expect(projection.statusSteps).toHaveLength(statusHistory.length)
+    expect(projection.statusSteps[projection.statusSteps.length - 1]?.durationSeconds).toBe(1)
   })
 
   it('stably projects hundreds of already ordered semantic items', async () => {
@@ -176,8 +222,8 @@ describe('UnifiedAssistantActivityTimeline', () => {
         projection,
         timelineItems: items,
         reasoningBlocks: [],
-        isToolGroupOpen: () => false,
-        isToolItemOpen: () => false,
+        isToolGroupOpen: () => undefined,
+        isToolItemOpen: () => undefined,
         toolGroupStatusText: () => '',
         toolStatusText: () => '',
         toolSecondaryText: () => '',

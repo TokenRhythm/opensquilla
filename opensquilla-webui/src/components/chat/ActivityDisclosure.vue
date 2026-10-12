@@ -21,40 +21,42 @@
       :aria-controls="bodyId"
       @click.stop="toggleOpen"
     >
-      <span
-        class="assistant-activity__live-dot"
-        :class="{ 'is-active': !stale, 'is-stale': stale }"
-        aria-hidden="true"
-      />
-      <span
-        class="assistant-activity__live-announcement"
-        role="status"
-        aria-live="polite"
-        aria-atomic="true"
-      >
-        <span class="assistant-activity__live-label" :class="{ 'is-stale': stale }">
-          {{ liveStatusLabel }}
+      <ActivityMotion :active="headerMotionActive">
+        <span
+          class="assistant-activity__live-dot"
+          :class="{ 'is-stale': stale }"
+          aria-hidden="true"
+        />
+        <span
+          class="assistant-activity__live-announcement"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          <span class="assistant-activity__live-label" :class="{ 'is-stale': stale }">
+            {{ liveStatusLabel }}
+          </span>
+          <span v-if="stale" class="assistant-activity__sr-only">
+            {{ t('chat.activity.stale') }}
+          </span>
         </span>
-        <span v-if="stale" class="assistant-activity__sr-only">
-          {{ t('chat.activity.stale') }}
+        <span
+          v-if="elapsedLabel"
+          class="assistant-activity__live-elapsed"
+          aria-hidden="true"
+        >
+          · {{ elapsedLabel }}
         </span>
-      </span>
-      <span
-        v-if="elapsedLabel"
-        class="assistant-activity__live-elapsed"
-        aria-hidden="true"
-      >
-        · {{ elapsedLabel }}
-      </span>
-      <span v-if="stepCount > 0" class="assistant-activity__live-step">
-        {{ t('chat.activity.liveStep', { n: stepCount }) }}
-      </span>
-      <Icon
-        class="assistant-activity__summary-arrow"
-        name="chevronRight"
-        :size="13"
-        aria-hidden="true"
-      />
+        <span v-if="stepCount > 0" class="assistant-activity__live-step">
+          {{ t('chat.activity.liveStep', { n: stepCount }) }}
+        </span>
+        <Icon
+          class="assistant-activity__summary-arrow"
+          name="chevronRight"
+          :size="13"
+          aria-hidden="true"
+        />
+      </ActivityMotion>
     </button>
     <button
       v-else
@@ -108,6 +110,11 @@
 import { computed, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ActivityMotion from './ActivityMotion.vue'
+import {
+  provideActivityDisclosureVisibility,
+  useActivityDisclosureVisibility,
+} from '@/composables/chat/useActivityDisclosureVisibility'
 import {
   readAssistantActivityExpansion,
   readAssistantActivityManualChoice,
@@ -126,6 +133,7 @@ const props = withDefaults(defineProps<{
   elapsedLabel?: string
   phaseElapsedLabel?: string
   stale?: boolean
+  executing?: boolean
   defaultOpen?: boolean
   stateKey?: string
   continuityKey?: string
@@ -139,6 +147,7 @@ const props = withDefaults(defineProps<{
   elapsedLabel: '',
   phaseElapsedLabel: '',
   stale: false,
+  executing: false,
   defaultOpen: false,
   stateKey: '',
   continuityKey: '',
@@ -153,6 +162,8 @@ const open = ref(readAssistantActivityExpansion(
   initialOpen(),
   props.continuityKey,
 ))
+const parentActivityVisible = useActivityDisclosureVisibility()
+provideActivityDisclosureVisibility(open)
 const manuallyToggled = ref(
   readAssistantActivityManualChoice(props.stateKey, props.continuityKey) !== undefined,
 )
@@ -160,6 +171,9 @@ const manuallyToggled = ref(
 function toggleOpen() {
   manuallyToggled.value = true
   open.value = !open.value
+  // Done can replace this live component before its queued watcher runs.
+  // Persist the click now so the canonical history reads the user's choice.
+  writeAssistantActivityExpansion(props.stateKey, open.value, props.continuityKey, true)
 }
 
 watch(open, expanded => {
@@ -184,6 +198,12 @@ watch(
 
 const isLive = computed(() =>
   props.lifecycle === 'working' || props.lifecycle === 'answering',
+)
+
+// A live turn can be queued or waiting for approval. The owner supplies the
+// execution signal; opening details moves motion to the actual current row.
+const headerMotionActive = computed(() =>
+  parentActivityVisible.value && isLive.value && props.executing && !open.value && !props.stale,
 )
 
 const liveStatusLabel = computed(() => props.phaseLabel || t('chat.activityWorking'))
@@ -232,7 +252,7 @@ const resolvedSummaryLabel = computed(() => {
   min-width: 0;
   min-height: 1.75rem;
   gap: 0.5rem;
-  padding: 0.1875rem 0.25rem;
+  padding: 0.1875rem 0;
   border: 0;
   border-radius: var(--radius-control);
   background: transparent;
@@ -261,10 +281,6 @@ const resolvedSummaryLabel = computed(() => {
   flex: 0 0 auto;
   border-radius: var(--radius-full);
   background: var(--accent);
-}
-
-.assistant-activity__live-dot.is-active {
-  animation: assistant-activity-pulse 2.3s var(--ease-standard) infinite;
 }
 
 .assistant-activity__live-dot.is-stale {
@@ -338,13 +354,19 @@ const resolvedSummaryLabel = computed(() => {
   color: var(--text-dim);
 }
 
+/* The shared mask supplies the dimming; do not dim small metadata twice. */
+.activity-motion--active .assistant-activity__live-elapsed,
+.activity-motion--active .assistant-activity__live-step {
+  color: var(--text);
+}
+
 .assistant-activity__summary {
   display: inline-flex;
   align-items: center;
   max-width: 100%;
   min-height: 1.75rem;
   gap: 0.375rem;
-  padding: 0.1875rem 0.25rem;
+  padding: 0.1875rem 0;
   border: 0;
   border-radius: var(--radius-control);
   background: transparent;
@@ -367,7 +389,7 @@ const resolvedSummaryLabel = computed(() => {
    deliberately inverted. */
 .assistant-activity--settled > .assistant-activity__summary {
   color: color-mix(in srgb, var(--text) 76%, transparent);
-  font-size: 0.875rem;
+  font-size: 0.8125rem;
 }
 
 .assistant-activity--settled > .assistant-activity__summary:hover {
@@ -398,7 +420,7 @@ const resolvedSummaryLabel = computed(() => {
 .assistant-activity__summary-arrow {
   flex: 0 0 auto;
   color: currentColor;
-  opacity: 0.34;
+  opacity: 0;
   transform-origin: center;
   transition:
     opacity var(--dur-fast) var(--ease-standard),
@@ -415,7 +437,6 @@ const resolvedSummaryLabel = computed(() => {
 
 .assistant-activity__summary[aria-expanded="true"] .assistant-activity__summary-arrow,
 .assistant-activity__live-head[aria-expanded="true"] .assistant-activity__summary-arrow {
-  opacity: 0.55;
   transform: rotate(90deg);
 }
 
@@ -454,11 +475,21 @@ const resolvedSummaryLabel = computed(() => {
   min-height: 0;
   min-width: 0;
   overflow: hidden;
-  gap: 0.25rem;
-  margin: 0.125rem 0 0.25rem;
-  padding: 0 0 0 0.75rem;
+  gap: 0;
+  margin: 0;
+  padding: 0;
   border: 0;
   background: transparent;
+}
+
+.assistant-activity[data-share-expanded="true"] > .assistant-activity__body > .assistant-activity__body-inner {
+  margin-top: 0.75rem;
+}
+
+/* Older history can render reasoning and the following item batch separately. */
+.assistant-activity__body-inner > :deep(.reasoning-timeline + .assistant-activity-timeline:has(> .activity-narration:first-child)),
+.assistant-activity__body-inner > :deep(.thinking-fold + .assistant-activity-timeline:has(> .activity-narration:first-child)) {
+  margin-top: 1.25rem;
 }
 
 /* Touch users need a larger target, while desktop keeps the compact reading
@@ -467,7 +498,7 @@ const resolvedSummaryLabel = computed(() => {
   .assistant-activity__live-head,
   .assistant-activity__summary {
     min-height: 2.75rem;
-    padding-inline: var(--sp-2);
+    padding-inline: 0;
   }
 }
 
@@ -475,51 +506,6 @@ const resolvedSummaryLabel = computed(() => {
   color: var(--text-muted);
   font-size: 0.75rem;
   line-height: 1.5;
-}
-
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body .assistant-activity__detail,
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.thinking-block),
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row),
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row) {
-  animation: assistant-activity-item-enter var(--dur-base) var(--ease-standard) backwards;
-}
-
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.thinking-block) {
-  animation-delay: 35ms;
-}
-
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row:nth-child(1)),
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row:nth-child(1)) {
-  animation-delay: 60ms;
-}
-
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row:nth-child(2)),
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row:nth-child(2)) {
-  animation-delay: 90ms;
-}
-
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row:nth-child(n + 3)),
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row:nth-child(n + 3)) {
-  animation-delay: 120ms;
-}
-
-@keyframes assistant-activity-pulse {
-  0%,
-  100% {
-    opacity: 0.7;
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 18%, transparent);
-  }
-  50% {
-    opacity: 1;
-    box-shadow: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 8%, transparent);
-  }
-}
-
-@keyframes assistant-activity-item-enter {
-  from {
-    opacity: 0;
-    transform: translateY(-0.1875rem);
-  }
 }
 
 @media (max-width: 480px) {
@@ -540,20 +526,10 @@ const resolvedSummaryLabel = computed(() => {
 
 @media (prefers-reduced-motion: reduce) {
   .assistant-activity__summary,
+  .assistant-activity__live-head,
   .assistant-activity__summary-arrow,
   .assistant-activity__body {
     transition: none;
-  }
-
-  .assistant-activity__live-dot.is-active {
-    animation: none;
-  }
-
-  .assistant-activity[data-share-expanded="true"] > .assistant-activity__body .assistant-activity__detail,
-  .assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.thinking-block),
-  .assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row),
-  .assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row) {
-    animation: none;
   }
 }
 </style>

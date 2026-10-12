@@ -531,12 +531,17 @@ export function activityReasoningBlocks(
   return blocks
 }
 
-function transcriptTextSegments(message: ChatMessage): string[] {
+interface TranscriptTextSpan {
+  text: string
+  presentation?: 'intermediate' | 'answer'
+}
+
+function transcriptTextSegments(message: ChatMessage): TranscriptTextSpan[] {
   if (Array.isArray(message.timeline) && message.timeline.length) {
     const timelineTexts = message.timeline.flatMap(segment => {
       if (segment?.type !== 'text') return []
       const value = segment.raw ?? segment.text
-      return typeof value === 'string' && value ? [value] : []
+      return typeof value === 'string' && value ? [{ text: value, presentation: segment.presentation }] : []
     })
     if (timelineTexts.length) return timelineTexts
   }
@@ -544,9 +549,9 @@ function transcriptTextSegments(message: ChatMessage): string[] {
   const segmentTexts = persisted.flatMap(segment => {
     if (segment?.type !== 'text') return []
     const value = segment.text ?? segment.raw
-    return typeof value === 'string' && value ? [value] : []
+    return typeof value === 'string' && value ? [{ text: value, presentation: segment.presentation }] : []
   })
-  return segmentTexts.length ? segmentTexts : message.text ? [message.text] : []
+  return segmentTexts.length ? segmentTexts : message.text ? [{ text: message.text }] : []
 }
 
 function transcriptTools(message: ChatMessage): Map<string, string> | undefined {
@@ -590,6 +595,46 @@ function transcriptClarifyIds(message: ChatMessage): Set<string> {
   return ids
 }
 
+/**
+ * Persistence can coalesce a final answer and an appended delivery note.
+ * Only the last explicitly marked answer span may consume adjacent snapshot
+ * text spans, and only write phases may separate them. All other activity is
+ * a hard boundary. Retain the first authoritative order without splitting or
+ * moving content and never infer order from timestamps.
+ */
+function activityTextOrders(snapshot: ActivitySnapshotV2, texts: TranscriptTextSpan[], originalLengths?: readonly number[]): number[] | undefined {
+  if (originalLengths && (originalLengths.length !== texts.length
+    || originalLengths.some((length, index) => !Number.isSafeInteger(length) || length < texts[index]!.text.length))) return undefined
+  const entries = snapshot.entries.flatMap((entry, position) => (
+    entry.type === 'segment' && entry.segment_type === 'text'
+      ? [{ entry, position }] : []
+  ))
+  const orders: number[] = []
+  let cursor = 0
+  for (const [textIndex, span] of texts.entries()) {
+    const expectedLength = originalLengths?.[textIndex] ?? span.text.length
+    const first = entries[cursor]
+    if (!first) return undefined
+    let length = 0
+    let previousPosition = first.position
+    while (length < expectedLength) {
+      const current = entries[cursor]
+      if (!current || Number(current.entry.text_index) !== cursor) return undefined
+      if (length > 0) {
+        if (textIndex !== texts.length - 1 || span.presentation !== 'answer') return undefined
+        if (snapshot.entries.slice(previousPosition + 1, current.position)
+          .some(entry => entry.type !== 'phase' || entry.kind !== 'write')) return undefined
+      }
+      length += Number(current.entry.text_utf16_length)
+      previousPosition = current.position
+      cursor += 1
+    }
+    if (length !== expectedLength) return undefined
+    orders.push(first.entry.order)
+  }
+  return cursor === entries.length ? orders : undefined
+}
+
 /** Validate every transcript reference before allowing a complete v2 to render. */
 export function activitySnapshotMatchesMessage(
   snapshot: ActivitySnapshotV2,
@@ -599,20 +644,8 @@ export function activitySnapshotMatchesMessage(
   if (activityReasoningBlocks(snapshot, message.reasoning?.text ?? '', message.historyPayloadPreview?.reasoningUtf16Length) === undefined) {
     return false
   }
-  const textEntries = snapshot.entries
-    .filter(entry => entry.type === 'segment' && entry.segment_type === 'text')
-    .sort((a, b) => Number(a.text_index) - Number(b.text_index))
   const transcriptTexts = transcriptTextSegments(message)
-  const originalLengths = message.historyPayloadPreview?.textUtf16Lengths
-  if (
-    textEntries.length !== transcriptTexts.length
-    || (originalLengths !== undefined && originalLengths.length !== transcriptTexts.length)
-    || textEntries.some((entry, index) => (
-      (originalLengths !== undefined && (!Number.isSafeInteger(originalLengths[index])
-        || originalLengths[index]! < transcriptTexts[index]!.length))
-      || Number(entry.text_utf16_length) !== (originalLengths?.[index] ?? transcriptTexts[index]!.length)
-    ))
-  ) return false
+  if (activityTextOrders(snapshot, transcriptTexts, message.historyPayloadPreview?.textUtf16Lengths) === undefined) return false
 
   const transcriptToolMap = transcriptTools(message)
   if (!transcriptToolMap) return false
@@ -633,15 +666,17 @@ export function activitySnapshotMatchesMessage(
 export function applyActivityOrdersToTimeline(
   items: ChatStreamTimelineItem[],
   snapshot: ActivitySnapshotV2 | undefined,
+  originalTextLengths?: readonly number[],
 ): ChatStreamTimelineItem[] {
   if (!snapshot?.complete) return items
-  const textOrder = new Map<number, number>()
+  const textOrder = activityTextOrders(snapshot, items.flatMap(item => (
+    item.type === 'text' ? [{ text: item.rawText ?? '', presentation: item.presentation }] : []
+  )), originalTextLengths)
+  if (!textOrder) return items
   const toolOrder = new Map<string, number>()
   const interruptOrder = new Map<string, number>()
   for (const entry of snapshot.entries) {
-    if (entry.type === 'segment' && entry.segment_type === 'text') {
-      textOrder.set(Number(entry.text_index), entry.order)
-    } else if (entry.type === 'segment' && entry.segment_type === 'tool') {
+    if (entry.type === 'segment' && entry.segment_type === 'tool') {
       toolOrder.set(String(entry.tool_use_id), entry.order)
     } else if (entry.type === 'interrupt') {
       interruptOrder.set(String(entry.reference_id), entry.order)
@@ -650,7 +685,7 @@ export function applyActivityOrdersToTimeline(
   let textIndex = 0
   return items.map((item): ChatStreamTimelineItem => {
     if (item.type === 'text') {
-      const activityOrder = textOrder.get(textIndex++)
+      const activityOrder = textOrder[textIndex++]
       return activityOrder === undefined ? item : { ...item, activityOrder }
     }
     if (item.type === 'interrupt') {

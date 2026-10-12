@@ -10,6 +10,8 @@ import type {
 } from '@/types/chat'
 import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
 import AssistantMessage from './AssistantMessage.vue'
+import ToolCallTimeline from './ToolCallTimeline.vue'
+import { createPinia } from 'pinia'
 
 const mountedApps: App[] = []
 
@@ -48,14 +50,9 @@ function timelineItems(): ChatStreamTimelineItem[] {
   }]
 }
 
-function flip(values: Set<string>, key: string): void {
-  if (values.has(key)) values.delete(key)
-  else values.add(key)
-}
-
 beforeEach(() => {
   i18n.global.locale.value = 'en'
-  useToolDetailPreference().setMode('auto')
+  useToolDetailPreference().setMode('collapsed')
   document.body.innerHTML = ''
 })
 
@@ -65,12 +62,89 @@ afterEach(() => {
 })
 
 describe('AssistantMessage tool disclosure scope', () => {
-  it('does not carry fallback message ids across sessions', async () => {
+  it('keeps a live choice when the completed message remounts with a different render key', async () => {
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const settled = ref(false)
+    const choices = reactive(new Map<string, boolean>())
+    const items = timelineItems()
+    if (items[0]?.type === 'tool-group') items[0].group.calls[0]!.renderKey = 'live:tool:shared-tool:0'
+    const message: ChatRenderedMessage = {
+      id: 'assistant-history',
+      role: 'assistant',
+      displayRole: 'assistant',
+      roleLabel: 'Assistant',
+      text: '',
+      timeStr: '',
+      showHeader: false,
+      turnKey: 'turn:owning-user',
+      timelineItems: timelineItems(),
+    }
+    const common = {
+      isToolGroupOpen: () => undefined,
+      isToolItemOpen: (id: string) => choices.get(id),
+      toolGroupStatusText: () => '',
+      toolStatusText: () => '',
+      toolSecondaryText: () => '',
+    }
+    const writeChoice = (id: string, open: boolean) => choices.set(id, open)
+    const Host = defineComponent({
+      setup: () => () => settled.value
+        ? h(AssistantMessage, {
+            ...common,
+            message,
+            index: 0,
+            sessionKey: 'session-a',
+            shareMode: false,
+            shareSelected: false,
+            shareMessageId: 'assistant-history',
+            renderMarkdown: (text: string) => text,
+            fmtTok: String,
+            toolCallGroups: () => [],
+            copyMessage: async () => true,
+            onToggleToolItem: writeChoice,
+          })
+        : h(ToolCallTimeline, {
+            ...common,
+            items,
+            stateScope: JSON.stringify(['session-a', 'turn:owning-user']),
+            onToggleItem: writeChoice,
+          }),
+    })
+    const app = createApp(Host)
+    mountedApps.push(app)
+    app.use(i18n)
+    app.use(createPinia())
+    app.mount(el)
+    await nextTick()
+    const row = () => el.querySelector<HTMLButtonElement>('.tool-row')
+    expect(row()?.getAttribute('aria-expanded')).toBe('false')
+    row()?.click()
+    await nextTick()
+    expect(row()?.getAttribute('aria-expanded')).toBe('true')
+    settled.value = true
+    await nextTick()
+    expect(row()?.getAttribute('aria-expanded')).toBe('true')
+    expect(choices.get(`${JSON.stringify(['session-a', 'turn:owning-user'])}:shared-tool`)).toBe(true)
+    useToolDetailPreference().setMode('expanded')
+    await nextTick()
+    row()?.click()
+    await nextTick()
+    useToolDetailPreference().setMode('collapsed')
+    await nextTick()
+    useToolDetailPreference().setMode('expanded')
+    await nextTick()
+    expect(row()?.getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it.each(['expanded', 'collapsed'] as const)('does not carry fallback message ids across sessions in %s mode', async mode => {
+    useToolDetailPreference().setMode(mode)
+    const initiallyOpen = mode === 'expanded'
     const el = document.createElement('div')
     document.body.appendChild(el)
     const sessionKey = ref('session-a')
-    const itemToggles = reactive(new Set<string>())
-    const onToggleToolItem = vi.fn((id: string) => flip(itemToggles, id))
+    const itemToggles = reactive(new Map<string, boolean>())
+    const onToggleToolItem = vi.fn((id: string, open: boolean) => itemToggles.set(id, open))
     const message: ChatRenderedMessage = {
       role: 'assistant',
       displayRole: 'assistant',
@@ -95,8 +169,8 @@ describe('AssistantMessage tool disclosure scope', () => {
           renderMarkdown: (text: string) => text,
           fmtTok: (value: number) => String(value),
           toolCallGroups: () => [],
-          isToolGroupOpen: () => false,
-          isToolItemOpen: (id: string) => itemToggles.has(id),
+          isToolGroupOpen: () => undefined,
+          isToolItemOpen: (id: string) => itemToggles.get(id),
           toolGroupStatusText: () => '',
           toolStatusText: () => '',
           toolSecondaryText: () => '',
@@ -109,27 +183,30 @@ describe('AssistantMessage tool disclosure scope', () => {
     const app = createApp(Host)
     mountedApps.push(app)
     app.use(i18n)
+    app.use(createPinia())
     app.mount(el)
     await nextTick()
 
     const row = () => el.querySelector<HTMLButtonElement>('.tool-row')
-    expect(row()?.getAttribute('aria-expanded')).toBe('false')
+    expect(row()?.getAttribute('aria-expanded')).toBe(String(initiallyOpen))
 
     row()?.click()
     await nextTick()
     expect(onToggleToolItem).toHaveBeenLastCalledWith(
       `${JSON.stringify(['session-a', 'assistant-0'])}:shared-tool`,
+      !initiallyOpen,
     )
-    expect(row()?.getAttribute('aria-expanded')).toBe('true')
+    expect(row()?.getAttribute('aria-expanded')).toBe(String(!initiallyOpen))
 
     sessionKey.value = 'session-b'
     await nextTick()
-    expect(row()?.getAttribute('aria-expanded')).toBe('false')
+    expect(row()?.getAttribute('aria-expanded')).toBe(String(initiallyOpen))
 
     row()?.click()
     await nextTick()
     expect(onToggleToolItem).toHaveBeenLastCalledWith(
       `${JSON.stringify(['session-b', 'assistant-0'])}:shared-tool`,
+      !initiallyOpen,
     )
     expect(itemToggles.size).toBe(2)
   })
