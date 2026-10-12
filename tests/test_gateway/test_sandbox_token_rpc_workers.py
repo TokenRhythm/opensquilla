@@ -263,6 +263,9 @@ async def test_repeated_cancellation_waits_for_one_committed_write(tmp_path, mon
 
 @pytest.mark.parametrize("cancel", [False, True])
 async def test_storage_failure_is_settled_without_retry(tmp_path, monkeypatch, cancel):
+    # Prepare the empty database before timing the failure/cancellation handshake.
+    # Constructor execution on the worker is covered separately above.
+    TokenStore(tmp_path / "sessions.db")
     started = threading.Event()
     release = threading.Event()
     calls = []

@@ -1591,6 +1591,9 @@ jobs:
               tests/test_gateway/test_native_attachment_import.py
               tests/test_gateway/test_recovery_scheduler.py
               tests/test_gateway/test_goal_user_input.py
+              tests/test_gateway/test_manual_compaction_contract.py
+              tests/test_gateway/test_sandbox_token_rpc_workers.py
+              tests/test_live_provider_profile_gateway_e2e.py
             )
           fi
           # Windows workers hit access violations during timed stack dumps.
