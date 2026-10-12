@@ -81,7 +81,9 @@ async function launch(name) {
   const app = await electron.launch({
     executablePath: plan.executablePath,
     args: ['--use-mock-keychain', `--user-data-dir=${plan.userDataDir}`],
-    env: { ...env, OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain', OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1', OPENSQUILLA_RECOVERY_OFFLINE: '1', OPENSQUILLA_TESTING: '0', GITHUB_ACTIONS: '0', NO_PROXY: '127.0.0.1,localhost,::1', no_proxy: '127.0.0.1,localhost,::1' },
+    // This synthetic fixture enables existing payload-free transaction timings
+    // (256 records per storage instance); SQL and probe budgets stay unchanged.
+    env: { ...env, OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain', OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1', OPENSQUILLA_RECOVERY_OFFLINE: '1', OPENSQUILLA_STORAGE_DIAGNOSTICS: '1', OPENSQUILLA_TESTING: '0', GITHUB_ACTIONS: '0', NO_PROXY: '127.0.0.1,localhost,::1', no_proxy: '127.0.0.1,localhost,::1' },
     timeout: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + timeoutMs,
   })
   active = { app, name }
