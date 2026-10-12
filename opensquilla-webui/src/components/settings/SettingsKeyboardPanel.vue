@@ -133,7 +133,7 @@ onBeforeUnmount(stopRecording)
   border-radius: var(--radius-sm);
   color: var(--text);
   font-family: var(--font-mono);
-  font-size: 0.6875rem;
+  font-size: var(--fs-xs);
   font-weight: 500;
   line-height: 1.4;
   padding: 2px 8px;

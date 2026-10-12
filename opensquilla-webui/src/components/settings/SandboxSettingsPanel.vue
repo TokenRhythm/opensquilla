@@ -976,7 +976,7 @@ onMounted(() => void load())
 .sandbox-detail {
   margin-top: 0.3rem;
   color: var(--text-muted);
-  font-size: 0.78rem;
+  font-size: var(--fs-xs);
   line-height: 1.45;
 }
 
@@ -1004,7 +1004,7 @@ onMounted(() => void load())
   border: 1px solid var(--border);
   border-radius: var(--radius-full);
   color: var(--text-muted);
-  font-size: 0.7rem;
+  font-size: 0.75rem;
 }
 
 .sandbox-settings__status.is-ready {
@@ -1015,7 +1015,7 @@ onMounted(() => void load())
 .sandbox-setup-result {
   padding: 0 0.2rem;
   color: var(--text-muted);
-  font-size: 0.76rem;
+  font-size: var(--fs-xs);
   line-height: 1.45;
 }
 
@@ -1061,7 +1061,7 @@ onMounted(() => void load())
   margin-top: 0.25rem;
   overflow: hidden;
   color: var(--text-muted);
-  font-size: 0.76rem;
+  font-size: var(--fs-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1088,7 +1088,7 @@ onMounted(() => void load())
   color: var(--text-muted);
   cursor: pointer;
   font: inherit;
-  font-size: 0.78rem;
+  font-size: var(--fs-xs);
   font-weight: 600;
 }
 
@@ -1151,7 +1151,7 @@ onMounted(() => void load())
 .sandbox-advanced-row small {
   overflow: hidden;
   color: var(--text-muted);
-  font-size: 0.73rem;
+  font-size: var(--fs-xs);
   font-weight: 400;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1201,7 +1201,7 @@ onMounted(() => void load())
 .sandbox-detail-header p {
   margin-top: 0.25rem;
   color: var(--text-muted);
-  font-size: 0.74rem;
+  font-size: var(--fs-xs);
   line-height: 1.4;
 }
 
@@ -1221,7 +1221,7 @@ onMounted(() => void load())
   color: var(--accent);
   cursor: pointer;
   font: inherit;
-  font-size: 0.8rem;
+  font-size: var(--fs-xs);
 }
 
 .sandbox-back span {
@@ -1241,7 +1241,7 @@ onMounted(() => void load())
 .sandbox-advanced-status p {
   margin-top: 0.2rem;
   color: var(--text-muted);
-  font-size: 0.74rem;
+  font-size: var(--fs-xs);
 }
 
 .sandbox-card {
@@ -1272,7 +1272,7 @@ onMounted(() => void load())
   min-width: 0;
   overflow-wrap: anywhere;
   color: var(--text);
-  font-size: 0.74rem;
+  font-size: var(--fs-xs);
 }
 
 .sandbox-rule > code,
@@ -1310,7 +1310,7 @@ onMounted(() => void load())
   border-inline-start: 3px solid var(--warn);
   background: color-mix(in srgb, var(--warn) 8%, transparent);
   color: var(--text-muted);
-  font-size: 0.76rem;
+  font-size: var(--fs-xs);
   line-height: 1.45;
 }
 
@@ -1328,7 +1328,7 @@ onMounted(() => void load())
   gap: 0.75rem;
   margin-block-end: 0.6rem;
   color: var(--danger);
-  font-size: 0.74rem;
+  font-size: var(--fs-xs);
 }
 
 .sandbox-runtime-row {
@@ -1357,7 +1357,7 @@ onMounted(() => void load())
 
 .sandbox-runtime-row__label small {
   overflow: hidden;
-  font-size: 0.73rem;
+  font-size: var(--fs-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1385,7 +1385,7 @@ onMounted(() => void load())
 
 .sandbox-runtime-error {
   color: var(--danger);
-  font-size: 0.72rem;
+  font-size: var(--fs-xs);
   line-height: 1.4;
 }
 
@@ -1401,12 +1401,12 @@ onMounted(() => void load())
 .sandbox-runtime-actions .btn {
   min-height: 30px;
   padding-block: 0.25rem;
-  font-size: 0.74rem;
+  font-size: var(--fs-xs);
 }
 
 .sandbox-lan-rules p {
   color: var(--text-muted);
-  font-size: 0.78rem;
+  font-size: var(--fs-xs);
 }
 
 .sandbox-lan-rules strong {

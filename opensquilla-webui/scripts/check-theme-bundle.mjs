@@ -25,8 +25,14 @@ const skinIds = existsSync(themesDir)
       .map((d) => d.name)
   : []
 
-if (skinIds.length === 0) {
-  console.log('Theme bundle guard: no expressive skins to check.')
+const worldIds = existsSync(themesDir)
+  ? readdirSync(themesDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && existsSync(join(themesDir, d.name, 'world.css')))
+      .map((d) => d.name)
+  : []
+
+if (skinIds.length === 0 && worldIds.length === 0) {
+  console.log('Theme bundle guard: no expressive skins or worlds to check.')
   process.exit(0)
 }
 
@@ -66,11 +72,6 @@ for (const id of skinIds) {
 // Its DESCENDANT rules ("[data-theme=<id>] <sel>") live in world.css; the eager
 // tokens.css only emits the palette root block ("[data-theme=<id>]{...}"), so a
 // trailing space after the attribute distinguishes world rules from the palette.
-const worldIds = existsSync(themesDir)
-  ? readdirSync(themesDir, { withFileTypes: true })
-      .filter((d) => d.isDirectory() && existsSync(join(themesDir, d.name, 'world.css')))
-      .map((d) => d.name)
-  : []
 const hasWorld = (text, id) =>
   text.includes(`[data-theme="${id}"] `) || text.includes(`[data-theme=${id}] `)
 for (const id of worldIds) {

@@ -45,7 +45,7 @@ select:focus,
 .btn {
   border: 0;
   border-radius: var(--radius-control);
-  font-weight: 560;
+  font-weight: 500;
   min-height: 36px;
   padding: 8px 14px;
 }
@@ -64,7 +64,7 @@ select:focus,
 }
 
 .btn--primary {
-  box-shadow: 0 5px 16px -9px color-mix(in srgb, var(--accent) 70%, transparent);
+  box-shadow: none;
 }
 
 /* One tactile vocabulary: controls compress a fraction on press, then return
@@ -164,7 +164,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 .sidebar-brand-text {
   font-family: var(--font-sans);
   font-size: 0.9375rem;
-  font-weight: 650;
+  font-weight: 600;
   letter-spacing: -0.02em;
 }
 
@@ -226,6 +226,12 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   padding: 9px 11px;
 }
 
+.sidebar-core .sidebar-new-session,
+.sidebar-core .sidebar-fn-item,
+.sidebar-foot .sidebar-fn-item {
+  gap: 12px;
+}
+
 .sidebar-core .sidebar-fn-item,
 .sidebar-core .sidebar-new-session {
   border: 0;
@@ -251,7 +257,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 
 .sidebar-core .sidebar-fn-item.is-active {
   box-shadow: none;
-  font-weight: 400;
+  font-weight: 500;
 }
 
 .sidebar-core .sidebar-fn-item.is-active:hover {
@@ -262,13 +268,22 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 .sidebar-zone-heading {
   align-items: center;
   gap: var(--sp-1);
-  min-height: 40px;
-  padding: 4px 10px;
+  min-height: 30px;
+  padding: 1px 10px;
 }
 
 .sidebar-recents-eyebrow,
 .sidebar-zone-heading__label {
-  font-size: var(--fs-sm);
+  font-size: 0.75rem;
+  font-weight: 400;
+  line-height: 20px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.sidebar-group__header {
+  min-height: 30px;
+  font-size: 0.75rem;
   font-weight: 400;
   line-height: 20px;
   letter-spacing: 0;
@@ -296,6 +311,15 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   min-height: 32px;
   padding: 0;
   width: 32px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .sidebar:not(.sidebar--drawer) .sidebar-zone-heading .sidebar-cmd-btn,
+  .sidebar:not(.sidebar--drawer) .sidebar-zone-heading .sidebar-bulk-mode-btn {
+    height: 28px;
+    min-height: 28px;
+    width: 28px;
+  }
 }
 
 .sidebar-task-search-btn {
@@ -396,7 +420,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   color: var(--sidebar-text-soft);
   cursor: pointer;
   font: inherit;
-  font-size: 10px;
+  font-size: 0.75rem;
   min-width: 0;
   padding: 6px 2px;
   white-space: nowrap;
@@ -406,7 +430,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   background: var(--sidebar-control-bg);
   box-shadow: var(--shadow-xs);
   color: var(--sidebar-text-strong);
-  font-weight: 620;
+  font-weight: 600;
 }
 
 .sidebar-task-statuses button:focus-visible {
@@ -416,9 +440,9 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 
 .sidebar-history-item {
   border-radius: var(--radius-control);
-  min-height: 42px;
+  min-height: 38px;
   overflow: hidden;
-  padding: 10px 11px;
+  padding: 8px 11px;
   position: relative;
 }
 
@@ -433,7 +457,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
       color-mix(in srgb, var(--accent) 9%, var(--sidebar-item-active)),
       var(--sidebar-item-active) 42%
     );
-  font-weight: 560;
+  font-weight: 500;
 }
 
 .sidebar-history-item.is-current::before {
@@ -466,11 +490,11 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 
 /* Shared page hierarchy. */
 .control-stage {
-  gap: var(--sp-8);
+  gap: var(--sp-6);
 }
 
 .control-stage--spacious {
-  gap: calc(var(--sp-8) + var(--sp-1));
+  gap: calc(var(--sp-5) + var(--sp-2));
 }
 
 .control-stage__header {
@@ -480,10 +504,10 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 
 .control-stage__title {
   font-family: var(--font-display);
-  font-size: clamp(2rem, 1.75rem + 0.65vw, 2.625rem);
-  font-weight: 680;
-  letter-spacing: -0.045em;
-  line-height: 1.08;
+  font-size: clamp(1.625rem, 1.5rem + 0.25vw, 1.75rem);
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1.25;
 }
 
 .control-stage__subtitle {
@@ -521,15 +545,15 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 }
 
 .control-stat__label {
-  font-weight: 550;
+  font-weight: 500;
   letter-spacing: 0;
   margin-bottom: var(--sp-2);
 }
 
 .control-stat__value {
-  font-size: 1.9rem;
-  font-weight: 650;
-  letter-spacing: -0.035em;
+  font-size: 1.875rem;
+  font-weight: 600;
+  letter-spacing: 0;
 }
 
 .control-panel {
@@ -543,7 +567,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 }
 
 .control-row__label {
-  font-weight: 560;
+  font-weight: 500;
 }
 
 .control-row__desc {
@@ -568,7 +592,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 .control-segmented__btn,
 .route-hub__tab {
   border-radius: var(--radius-sm);
-  font-weight: 540;
+  font-weight: 500;
   min-height: 32px;
   padding: 7px 13px;
 }
@@ -628,7 +652,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 }
 
 .content .hub .hub-attention-clear__text {
-  font-weight: 560;
+  font-weight: 500;
 }
 
 .content .hub .hub-list {
@@ -875,9 +899,9 @@ body > .settings-overlay .settings-modal .settings-modal__head {
 }
 
 body > .settings-overlay .settings-modal .settings-modal__title {
-  font-size: 1.25rem;
-  font-weight: 680;
-  letter-spacing: -0.025em;
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: 0;
 }
 
 body > .settings-overlay .settings-modal .settings-body {

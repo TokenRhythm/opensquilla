@@ -53,7 +53,7 @@
         :title="newChatHint ? `${t('chrome.newTaskTitle')} (${newChatHint})` : t('chrome.newTaskTitle')"
         @click="startNewChatInstant"
       >
-        <Icon name="plus" :size="16" />
+        <Icon name="plus" :size="17" />
         <span class="sidebar-new-session__label">{{ t('chrome.newTask') }}</span>
         <!-- Badge tracks the configured binding and hides when the shortcut is
              disabled (Settings → Keyboard), so it never advertises a dead key. -->
@@ -70,7 +70,7 @@
         :aria-current="isPrimaryNavActive(item.path) ? 'page' : undefined"
         @click="handleNavClick"
       >
-        <Icon :name="item.icon" :size="16" />
+        <Icon :name="sidebarNavIcons[item.icon] ?? item.icon" :size="17" />
         <span class="sidebar-fn-label">{{ item.title }}</span>
       </router-link>
     </div>
@@ -116,7 +116,7 @@
         data-icon="settings"
         @click="openSettings"
       >
-        <Icon name="settings" :size="16" />
+        <Icon name="settings-2" :size="17" />
         <span class="sidebar-fn-label">{{ t('chrome.settings') }}</span>
       </button>
       <SidebarDesktopUpdate @open="openDesktopUpdateSettings" />
@@ -405,6 +405,7 @@ import {
   type SidebarSectionRow,
 } from './composables/useSessions'
 import Icon from './components/Icon.vue'
+import type { IconName } from './utils/icons'
 import ErrorBoundary from './components/ErrorBoundary.vue'
 import ToastHost from './components/ToastHost.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
@@ -625,6 +626,11 @@ const {
   applyConfirmedTitle,
 } = useSessions(sessionDirectory)
 const { bottomRoutes, workNav } = useNavigation()
+const sidebarNavIcons: Partial<Record<IconName, IconName>> = {
+  skills: 'sparkles',
+  cron: 'clock-3',
+  usage: 'chart-no-axes-column',
+}
 const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()

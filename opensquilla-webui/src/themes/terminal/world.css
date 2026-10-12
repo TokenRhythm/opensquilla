@@ -7,10 +7,7 @@
 /* Structural tokens (mono type + hard corners) live in tokens.css so they apply
    before first paint (no reflow); this world layer is now purely decorative. */
 
-/* Amber glow + uppercase tracking on titles. */
-[data-theme="terminal"] h1,
-[data-theme="terminal"] h2,
-[data-theme="terminal"] h3,
+/* Amber glow + uppercase tracking on application titles, not content headings. */
 [data-theme="terminal"] .control-stage__title,
 [data-theme="terminal"] .view-title {
   text-transform: uppercase;
@@ -20,8 +17,8 @@
 
 /* Glow on elevated accent surfaces; sidebar destinations and stable semantic
    topbar states remain flat so the CRT treatment preserves urgency. */
-[data-theme="terminal"] .btn--primary {
-  box-shadow: var(--elev-1), 0 0 14px color-mix(in srgb, var(--accent) 35%, transparent);
+[data-theme="terminal"] .btn--primary:not(:focus-visible) {
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 16%, transparent);
 }
 
 [data-theme="terminal"] .topbar .topbar-state:is(
@@ -38,12 +35,13 @@
    rules that deliberately use the INSET ring (segmented controls and other
    overflow-clipped hosts), leaving keyboard focus clipped to invisibility. */
 
-/* Global CRT scanlines over the whole viewport (static, subtle). */
+/* Static CRT texture behind the app. It must never stripe reading glyphs or
+   reduce the contrast of code, prose, and controls. */
 [data-theme="terminal"] body::after {
   content: "";
   position: fixed;
   inset: 0;
-  z-index: 9998;
+  z-index: 0;
   pointer-events: none;
   opacity: 0.5;
   background-image: repeating-linear-gradient(
@@ -53,6 +51,11 @@
     transparent 1px,
     transparent 3px
   );
+}
+
+[data-theme="terminal"] #app {
+  position: relative;
+  z-index: 1;
 }
 
 /* A blinking amber cursor after the page title. */

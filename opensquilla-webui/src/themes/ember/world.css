@@ -10,12 +10,10 @@
    before first paint (no reflow); this world layer is now purely decorative. */
 
 /* --- Molten headings -------------------------------------------------------
-   Uppercase forge-plate lettering with a steady ember glow. The glow is a
+   Application titles use forge-plate lettering with a steady ember glow.
+   Markdown headings keep the same clear ink as the surrounding content. The glow is a
    static text-shadow (survives reduced motion); the *flicker* is added by an
    animated pseudo below, so body text is never touched. */
-[data-theme="ember"] h1,
-[data-theme="ember"] h2,
-[data-theme="ember"] h3,
 [data-theme="ember"] .control-stage__title,
 [data-theme="ember"] .view-title {
   text-transform: uppercase;
@@ -28,10 +26,8 @@
 /* Hard warm frame + ember bloom on elevated accent surfaces. Sidebar
    destinations remain flat and visually grouped. Semantic topbar controls opt
    in below only while they carry attention; healthy states stay quiet. */
-[data-theme="ember"] .btn--primary {
-  box-shadow: var(--elev-1),
-              0 0 16px color-mix(in srgb, var(--accent) 34%, transparent),
-              inset 0 0 0 1px color-mix(in srgb, var(--accent-secondary) 22%, transparent);
+[data-theme="ember"] .btn--primary:not(:focus-visible) {
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 16%, transparent);
 }
 
 [data-theme="ember"] .topbar .topbar-state:is(

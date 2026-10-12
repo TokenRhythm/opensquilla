@@ -459,15 +459,15 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
 }
 .sk-tile__name {
   font-family: inherit;
-  font-size: 13px;
-  font-weight: 650;
+  font-size: 14px;
+  font-weight: 600;
   line-height: 20px;
 }
 .sk-tile__desc {
   font-family: inherit;
   font-size: 13px;
-  line-height: 26px;
-  min-height: 52px;
+  line-height: 22px;
+  min-height: 44px;
 }
 .sk-tile__action {
   align-self: center;

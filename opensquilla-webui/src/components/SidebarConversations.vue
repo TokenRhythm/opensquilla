@@ -1375,7 +1375,7 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
                         count: row.workspaceTaskCount ?? 0,
                       })"
                     >
-                      <Icon name="folder" :size="15" />
+                      <Icon name="folder-outline" :size="17" />
                     </button>
                     <div class="sidebar-project-info-popover" role="tooltip">
                       <span class="sidebar-project-info-path">

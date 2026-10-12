@@ -446,6 +446,7 @@ pre {
   border: none;
   border-radius: var(--radius-md);
   color: var(--sidebar-text-strong);
+  font-family: inherit;
   font-size: var(--fs-sm);
   font-weight: 500;
   cursor: pointer;
@@ -985,10 +986,12 @@ pre {
 .sidebar-history-title,
 .sidebar-session-preview__title {
   font-family: var(--font-sans);
-  font-size: 0.828125rem;
-  font-weight: 500;
-  line-height: 1.35;
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  line-height: 20px;
 }
+
+.sidebar-history-item.is-current .sidebar-history-title { font-weight: 500; }
 
 .sidebar-history-title {
   flex: 1;

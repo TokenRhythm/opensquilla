@@ -67,9 +67,9 @@ describe('SidebarSessionHoverCard', () => {
     )?.[1]
     expect(sharedTypographyRule).toBeDefined()
     expect(sharedTypographyRule).toContain('font-family: var(--font-sans)')
-    expect(sharedTypographyRule).toContain('font-size: 0.828125rem')
-    expect(sharedTypographyRule).toContain('font-weight: 500')
-    expect(sharedTypographyRule).toContain('line-height: 1.35')
+    expect(sharedTypographyRule).toContain('font-size: var(--fs-sm)')
+    expect(sharedTypographyRule).toContain('font-weight: 400')
+    expect(sharedTypographyRule).toContain('line-height: 20px')
   })
 
   it('omits only the project row for an unbound session', () => {
