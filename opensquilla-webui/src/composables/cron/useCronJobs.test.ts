@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { isConnectionRecycleError, isJobFailed } from './useCronJobs'
-import { markCronFinishNotified, reminderToastPreview, wasCronFinishNotified } from '@/utils/cron/notifications'
+import { claimCronNotification, reminderToastPreview } from '@/utils/cron/notifications'
 
 describe('cron job recovery helpers', () => {
   it('recognizes transient recycled and closed connection failures', () => {
@@ -16,11 +16,11 @@ describe('cron job recovery helpers', () => {
     expect(isJobFailed({ id: 'c', lastStatus: 'ok', lastResult: null, error_count: 0 })).toBe(false)
   })
 
-  it('suppresses duplicate completion toasts for the same recent run', () => {
-    markCronFinishNotified('job-1', 1_000)
-    expect(wasCronFinishNotified('job-1', 10_000)).toBe(true)
-    expect(wasCronFinishNotified('job-1', 20_000)).toBe(false)
-    expect(wasCronFinishNotified('job-2', 10_000)).toBe(false)
+  it('claims one notification per run and kind rather than a time window', () => {
+    expect(claimCronNotification('job-1', 'failure')).toBe(true)
+    expect(claimCronNotification('job-1', 'failure')).toBe(false)
+    expect(claimCronNotification('job-1', 'reminder')).toBe(true)
+    expect(claimCronNotification('job-2', 'failure')).toBe(true)
   })
 
   it('normalizes and truncates reminder previews for transient toasts', () => {

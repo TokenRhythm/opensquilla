@@ -447,7 +447,7 @@ import { useNavigation } from './app/useNavigation'
 import { bindDesktopSessionDeepLinks } from './app/desktopSessionDeepLinks'
 import { normalizeAgentId } from './utils/chat/sessionKeys'
 import { effectiveChatConnectionState } from './utils/chat/chatConnectionState'
-import { reminderToastPreview } from './utils/cron/notifications'
+import { notifyCronRunFinished } from './utils/cron/notifications'
 import { installSessionNavigationDiagConsole, recordSessionNavigationDiag } from './utils/chat/sessionNavigationDiag'
 import { isMacPlatform } from './utils/browser'
 import { useShortcutsStore } from './stores/shortcuts'
@@ -465,7 +465,6 @@ import {
   optionalSessionRpcAllowed,
   optionalSessionReadOptions,
 } from './composables/chat/sessionBootstrapAdmission'
-import { markCronFinishNotified } from './utils/cron/notifications'
 import { AGENT_CATALOG_KEY } from './modules/agentCatalog'
 import {
   CRON_SCHEDULER_KEY,
@@ -670,39 +669,17 @@ const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 let cronFinishedSubscription: CronSubscription | null = null
 
 function handleCronRunFinished(event: CronRunFinished) {
-  const runId = typeof event.runId === 'string' ? event.runId : ''
-  const jobName = event.jobName?.trim() || t('cronSkills.jobs.unnamedTask')
-  markCronFinishNotified(runId)
-  if (event.success === false) {
-    pushToast(t('cronSkills.jobs.toastBackgroundFailed', { name: jobName }), {
-      tone: 'danger',
-      duration: 9_000,
-    })
-    return
-  }
-  const reminder = event.payloadKind === 'reminder'
-    ? reminderToastPreview(event.summary)
-    : ''
-  if (reminder) {
-    const sessionKey = event.sessionKey?.trim() || ''
-    pushToast(t('cronSkills.jobs.toastBackgroundReminder', {
-      name: jobName,
-      reminder,
-    }), {
-      tone: 'ok',
-      duration: 10_000,
-      action: sessionKey
-        ? {
-            label: t('cronSkills.jobs.toastViewReminder'),
-            onClick: () => switchToSession(sessionKey, 'cron.reminder_toast'),
-          }
-        : undefined,
-    })
-    return
-  }
-  pushToast(t('cronSkills.jobs.toastBackgroundComplete', { name: jobName }), {
-    tone: 'ok',
-    duration: 7_000,
+  notifyCronRunFinished(event, {
+    t,
+    pushToast,
+    openJob: async jobId => {
+      const failure = await router.push({ path: '/cron', query: jobId ? { job: jobId } : {} })
+      return !failure
+    },
+    openSession: async sessionKey => {
+      await switchToSession(sessionKey, 'cron.reminder_toast')
+      return $route.path === '/chat' && $route.query.session === sessionKey
+    },
   })
 }
 

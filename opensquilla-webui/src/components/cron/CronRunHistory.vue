@@ -22,7 +22,7 @@
         :empty-text="t('cronSkills.runHistory.empty')"
       >
         <template #status="{ row }">
-          <span :class="`status status--${row.status === 'ok' ? 'ok' : 'err'}`">{{ row.statusLabel }}</span>
+          <span :class="`status status--${row.status === 'ok' ? 'ok' : 'err'}`" :data-cron-failed-run="row.status === 'error' || row.status === 'fail' ? row.id : undefined">{{ row.statusLabel }}</span>
         </template>
         <template #reply="{ row }">
           <span class="cron-runs__reply">{{ row.reply }}</span>
@@ -53,6 +53,8 @@ interface CronRunHistoryJob {
 }
 
 interface CronRunHistoryRun {
+  id?: string
+  error?: string
   started_at?: string
   status?: string
   duration_ms?: number
@@ -86,12 +88,13 @@ const runColumns = computed(() => [
 
 const runRows = computed(() =>
   props.runs.map(run => ({
+    id: run.id,
     time: run.started_at ? relTime(run.started_at) : '—',
     status: run.status || 'unknown',
     statusLabel: run.status || t('cronSkills.runHistory.unknown'),
     duration: run.duration_ms != null ? run.duration_ms + 'ms' : '—',
     delivery: deliveryStatusText(run),
-    reply: run.summary ? run.summary.substring(0, 120) : '—',
+    reply: (run.error || run.summary || '').substring(0, 120) || '—',
     sessionKey: run.sessionKey ?? null,
   })),
 )

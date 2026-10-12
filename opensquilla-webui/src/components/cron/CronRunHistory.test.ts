@@ -1,6 +1,8 @@
 // @vitest-environment happy-dom
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createApp, h } from 'vue'
+import { createI18n } from 'vue-i18n'
+import type { CronRun } from '@/types/cron'
 import i18n from '@/i18n'
 import CronRunHistory from './CronRunHistory.vue'
 
@@ -20,5 +22,24 @@ describe('Cron history capacity state', () => {
     expect(host.querySelector('[role="alert"]')).toBeNull()
     expect(host.textContent).not.toContain(i18n.global.t('cronSkills.runHistory.empty'))
     expect(host.textContent?.includes('Saved run result')).toBe(cached)
+  })
+})
+
+function mountHistory(runs: CronRun[] = []) {
+  const onRetry = vi.fn()
+  const host = document.createElement('div')
+  document.body.appendChild(host)
+  const app = createApp({ render: () => h(CronRunHistory, { job: { id: 'job', name: 'Saved task' }, runs, loading: false, error: null, onRetry }) })
+  apps.push(app)
+  app.use(createI18n({ legacy: false, locale: 'en', missingWarn: false, fallbackWarn: false, messages: { en: {} } }))
+  app.mount(host)
+  return { host, onRetry }
+}
+
+describe('CronRunHistory request failures', () => {
+  it('renders the actual failed execution identity and error for notification visibility', () => {
+    const { host } = mountHistory([{ id: 'run-failed', status: 'error', error: 'Could not open workspace', summary: '' }])
+    expect(host.querySelector('[data-cron-failed-run="run-failed"]')).not.toBeNull()
+    expect(host.textContent).toContain('Could not open workspace')
   })
 })
