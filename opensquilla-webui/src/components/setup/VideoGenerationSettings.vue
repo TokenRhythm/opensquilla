@@ -972,6 +972,12 @@ function discard(): void {
   message.value = ''
 }
 
+function applyRecommendedDurations(): void {
+  if (busy.value) return
+  durationSeconds.value = ''
+  maxDurationSeconds.value = '8'
+}
+
 function onProviderChange(event: Event): void {
   const selected = (event.target as HTMLSelectElement).value
   if (selected !== '' && selected !== 'openrouter' && selected !== 'tokenrhythm') return
@@ -1160,7 +1166,7 @@ onMounted(() => {
             <span class="control-row__desc">{{ t('setup.video.defaultDurationHint') }}</span>
           </span>
           <span class="control-row__control">
-            <input v-model="durationSeconds" class="control-input" name="setup_video_duration"
+            <input v-model="durationSeconds" class="control-input video-settings__duration-input" name="setup_video_duration"
               type="number" :min="enabled ? durationBounds.minimum : 1"
               :max="enabled ? Math.min(Number(maxDurationSeconds), durationBounds.maximum) : maxDurationSeconds"
               step="1" inputmode="numeric"
@@ -1179,6 +1185,13 @@ onMounted(() => {
               step="1" inputmode="numeric" :disabled="busy">
           </span>
         </label>
+
+        <div class="video-settings__duration-recommendation">
+          <button type="button" class="btn btn--ghost" :disabled="busy"
+            data-testid="video-recommended-duration" @click="applyRecommendedDurations">
+            {{ t('setup.video.useRecommendedDurations') }}
+          </button>
+        </div>
 
         <label class="control-row">
           <span class="control-row__label-block"><span class="control-row__label">{{ t('setup.video.aspectLabel') }}</span></span>
@@ -1260,6 +1273,8 @@ onMounted(() => {
 .video-settings__credential-mode { display: grid; gap: var(--sp-2); font-size: 13px; }
 .video-settings__connection-options { color: var(--text-muted); font-size: 13px; padding-block: var(--sp-3); }
 .video-settings__connection-options summary { cursor: pointer; }
+.video-settings__duration-input { width: 160px; max-width: 100%; }
+.video-settings__duration-recommendation { display: flex; justify-content: flex-end; padding-block: var(--sp-2); }
 .video-settings__actions { display: flex; justify-content: flex-end; margin-top: var(--sp-3); }
 @media (prefers-reduced-motion: reduce) {
   .video-settings__chevron { transition: none; }

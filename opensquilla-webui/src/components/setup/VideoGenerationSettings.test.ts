@@ -115,6 +115,45 @@ describe('video generation settings', () => {
     expect(el.querySelector('.video-settings__status')?.textContent).toBe(i18n.global.t('setup.capabilities.statusAvailable'))
   })
 
+  it('applies recommended durations only to the draft, supports discard and saves just those fields', async () => {
+    const { el, patch, vm } = await mountSettings({
+      ...selectedConfig, enabled: true, duration_seconds: 2, max_duration_seconds: 2,
+    }, workflowFor(credential()))
+    await vm.refreshCredentialStatus()
+    await nextTick()
+    const duration = el.querySelector<HTMLInputElement>('[name="setup_video_duration"]')!
+    const maximum = el.querySelector<HTMLInputElement>('[name="setup_video_max_duration"]')!
+    const recommend = el.querySelector<HTMLButtonElement>('[data-testid="video-recommended-duration"]')!
+    expect(duration.value).toBe('2')
+    expect(maximum.value).toBe('2')
+    expect(saveButton(el).disabled).toBe(true)
+
+    await input(el, 'setup_video_duration', '8')
+    expect(el.querySelector('[role="alert"]')).not.toBeNull()
+    recommend.click()
+    await nextTick()
+    expect(duration.value).toBe('')
+    expect(maximum.value).toBe('8')
+    expect(el.querySelector('[role="alert"]')).toBeNull()
+    expect(saveButton(el).disabled).toBe(false)
+    expect(patch).not.toHaveBeenCalled()
+
+    vm.discard()
+    await nextTick()
+    expect(duration.value).toBe('2')
+    expect(maximum.value).toBe('2')
+    expect(saveButton(el).disabled).toBe(true)
+
+    recommend.click()
+    await nextTick()
+    expect(await vm.save()).toBe(true)
+    expect(patch).toHaveBeenCalledExactlyOnceWith([
+      { path: 'video_generation.duration_seconds', value: null },
+      { path: 'video_generation.max_duration_seconds', value: 8 },
+    ])
+    expect(saveButton(el).disabled).toBe(true)
+  })
+
   it('offers only TokenRhythm and OpenRouter as selectable providers', async () => {
     const { el } = await mountSettings()
     expect(Array.from(el.querySelectorAll<HTMLOptionElement>('[name="setup_video_provider"] option'), option => option.value))
