@@ -40,6 +40,7 @@ describe('Gateway Adapter composition', () => {
     })
 
     expect(Object.keys(adapters)).toEqual([
+      'historyContentReader',
       'gatewayAccess',
       'conversationEvents',
       'sessionReadLifecycleFactory',

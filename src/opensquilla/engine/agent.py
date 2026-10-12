@@ -1063,7 +1063,7 @@ def _pending_approval_payload(content: str) -> dict[str, Any] | None:
     return payload
 
 
-def _suspend_tool_request(
+async def _suspend_tool_request(
     tool_call: ToolCall,
     payload: dict[str, Any],
 ) -> SuspendedToolRequest:
@@ -1075,7 +1075,7 @@ def _suspend_tool_request(
     retry_context: dict[str, Any] = {}
     approval_session_key = ""
     try:
-        entry = get_approval_queue().get(str(payload["approval_id"]))
+        entry = await get_approval_queue().get_async(str(payload["approval_id"]))
         if isinstance(entry.params.get("action"), dict):
             raw_action = dict(entry.params["action"])
         for key in (
@@ -1133,7 +1133,7 @@ async def _wait_for_pending_approval_resolution(
         from opensquilla.gateway.approval_queue import get_approval_queue
 
         queue = get_approval_queue()
-        await queue.wait(
+        await queue.wait_async(
             approval_id,
             timeout=max(0.0, timeout) if timeout is not None else None,
         )
@@ -1158,7 +1158,7 @@ async def _review_pending_elevation_if_configured(
 
     queue = get_approval_queue()
     try:
-        entry = queue.get(approval_id)
+        entry = await queue.get_async(approval_id)
     except KeyError:
         return None
     params = entry.params
@@ -1187,7 +1187,7 @@ async def _review_pending_elevation_if_configured(
             }
         )
         try:
-            queue.update_params(approval_id, updated_params)
+            await queue.update_params_async(approval_id, updated_params)
         except ValueError:
             return None
         return None
@@ -1284,19 +1284,19 @@ async def _review_pending_elevation_if_configured(
         )
 
         try:
-            queue.update_params(approval_id, updated_params)
-            claim_token = queue.claim_resolution(approval_id)
+            await queue.update_params_async(approval_id, updated_params)
+            claim_token = await queue.claim_resolution_async(approval_id)
         except (KeyError, ValueError):
             # Another resolver won the race. Never override its decision.
             return None
         try:
-            queue.finalize_claimed_resolution(
+            await queue.finalize_claimed_resolution_async(
                 approval_id,
                 claim_token,
                 True,
             )
         except (KeyError, ValueError):
-            queue.release_resolution_claim(approval_id, claim_token)
+            await queue.release_resolution_claim_async(approval_id, claim_token)
             return None
 
         tool_context = current_tool_context.get()
@@ -1318,7 +1318,7 @@ async def _review_pending_elevation_if_configured(
         except BaseException:
             discard_approval_run_context_authority(approval_id)
             try:
-                queue.reopen_resolved_approval(
+                await queue.reopen_resolved_approval_async(
                     approval_id,
                     expected_approved=True,
                 )
@@ -1327,7 +1327,7 @@ async def _review_pending_elevation_if_configured(
             raise
         if published:
             try:
-                queue.complete_claimed_resolution(
+                await queue.complete_claimed_resolution_async(
                     approval_id,
                     claim_token,
                 )
@@ -1337,7 +1337,7 @@ async def _review_pending_elevation_if_configured(
         if not published:
             discard_approval_run_context_authority(approval_id)
             try:
-                queue.reopen_resolved_approval(
+                await queue.reopen_resolved_approval_async(
                     approval_id,
                     expected_approved=True,
                 )
@@ -1360,15 +1360,15 @@ async def _review_pending_elevation_if_configured(
                 human_confirmation=False,
             )
             try:
-                queue.update_params(approval_id, updated_params)
-                queue.resolve(approval_id, False)
+                await queue.update_params_async(approval_id, updated_params)
+                await queue.resolve_async(approval_id, False)
             except (KeyError, ValueError):
                 return None
     else:
         try:
-            queue.update_params(approval_id, updated_params)
+            await queue.update_params_async(approval_id, updated_params)
             if not requires_human_confirmation:
-                queue.resolve(approval_id, assessment.outcome == "allow")
+                await queue.resolve_async(approval_id, assessment.outcome == "allow")
         except (KeyError, ValueError):
             # Another resolver won the race. Never override its decision.
             return None
@@ -12364,7 +12364,7 @@ class Agent:
                         # Keep waiting and resuming the original tool call until it
                         # completes, or until the user denies any step.
                         while pending_approval is not None:
-                            suspended = _suspend_tool_request(tc, pending_approval)
+                            suspended = await _suspend_tool_request(tc, pending_approval)
                             assessment = await _review_pending_elevation_if_configured(
                                 pending_approval,
                                 transcript=turn_messages,
@@ -12399,7 +12399,7 @@ class Agent:
                                     )
 
                                     try:
-                                        approval_entry = get_approval_queue().get(
+                                        approval_entry = await get_approval_queue().get_async(
                                             str(pending_approval["approval_id"])
                                         )
                                     except KeyError:

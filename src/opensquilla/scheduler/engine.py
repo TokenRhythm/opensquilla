@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -76,6 +77,8 @@ class SchedulerEngine:
             max_jitter = cfg.get("max_jitter", 30.0)
 
         self._store = store
+        self._manual_run_tasks: set[asyncio.Task[ManualRunResult]] = set()
+        self._stopping = False
         self._ops = SchedulerOps(store, max_jitter=max_jitter, clock=clock)
 
         self._reaper: SessionReaper | None = None
@@ -208,8 +211,22 @@ class SchedulerEngine:
         """Alias for delete_job (used by admin tool)."""
         return await self.delete_job(job_id)
 
-    async def run_job_now(self, job_id: str) -> ManualRunResult:
+    async def run_job_now(
+        self, job_id: str, *, on_admitted: Callable[[], None] | None = None,
+    ) -> ManualRunResult:
         """Trigger immediate execution of a job."""
+        if self._stopping:
+            return ManualRunResult(status=ManualRunStatus.BLOCKED, reason="scheduler_stopping")
+        task = asyncio.create_task(
+            self._run_job_now(job_id, on_admitted=on_admitted), name=f"cron-manual-{job_id}",
+        )
+        self._manual_run_tasks.add(task)
+        task.add_done_callback(self._manual_run_tasks.discard)
+        return await task
+
+    async def _run_job_now(
+        self, job_id: str, *, on_admitted: Callable[[], None] | None,
+    ) -> ManualRunResult:
         job = await self._ops.get(job_id)
         if job is None:
             return ManualRunResult(
@@ -225,19 +242,46 @@ class SchedulerEngine:
                 error=f"No handler registered for key '{job.handler_key}'",
                 current_status=getattr(job.status, "value", str(job.status)),
             )
-        reservation = await self._store.reserve_manual_job(
-            job_id,
-            datetime.now(UTC),
-            source="manual",
-            owner="scheduler-manual",
+        reservation_task = asyncio.create_task(
+            self._store.reserve_manual_job(
+                job_id, datetime.now(UTC), source="manual", owner="scheduler-manual",
+            ),
         )
+        try:
+            reservation = await asyncio.shield(reservation_task)
+        except asyncio.CancelledError:
+            # SQLite may have committed before cancellation is delivered. Wait
+            # for its existing bounded operation and release only this token.
+            reservation = await reservation_task
+            if not isinstance(reservation, JobReservationRejected):
+                await self._store.release_reservation(job_id, reservation.token)
+            raise
         if isinstance(reservation, JobReservationRejected):
             return _manual_result_from_rejection(reservation)
-        exe = await execute_with_timeout(job, handler)
-        await self._store.save_execution(exe)
-        await apply_reserved_result(job.id, reservation.token, exe, self._store)
-        await notify_terminal_result(job, exe)
-        return ManualRunResult(status=ManualRunStatus.ACCEPTED, execution=exe)
+        job = reservation.job
+        handler = self._timer._handlers.get(job.handler_key)
+        if handler is None:
+            await self._store.release_reservation(job_id, reservation.token)
+            return ManualRunResult(
+                status=ManualRunStatus.NO_HANDLER, reason="no_handler",
+                error=f"No handler registered for key '{job.handler_key}'",
+                current_status=getattr(job.status, "value", str(job.status)),
+            )
+        try:
+            if on_admitted is not None:
+                on_admitted()
+        except Exception:
+            await self._store.release_reservation(job_id, reservation.token)
+            raise
+        try:
+            exe = await execute_with_timeout(job, handler)
+            await self._store.save_execution(exe)
+            await apply_reserved_result(job.id, reservation.token, exe, self._store)
+            await notify_terminal_result(job, exe)
+            return ManualRunResult(status=ManualRunStatus.ACCEPTED, execution=exe)
+        except asyncio.CancelledError:
+            await self._store.release_reservation(job.id, reservation.token)
+            raise
 
     # ------------------------------------------------------------------
     # Query — delegates to ops
@@ -261,12 +305,20 @@ class SchedulerEngine:
 
     async def start(self) -> None:
         """Start the scheduler: run catchup then begin the tick loop."""
+        self._stopping = False
         await self._timer.startup_catchup()
         await self._timer.start()
 
     async def stop(self) -> None:
         """Stop the scheduler tick loop and cancel all running tasks."""
+        self._stopping = True
         await self._timer.stop()
+        tasks = tuple(self._manual_run_tasks)
+        for task in tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def __aenter__(self) -> SchedulerEngine:
         await self.start()

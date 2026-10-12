@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { EffectScope } from 'vue'
 import type {
   SandboxRuntimeActionReceipt,
+  SandboxRequestOptions,
   SandboxSettingsRuntime,
 } from '@/modules/sandboxRuntime'
 import type {
@@ -86,13 +87,13 @@ async function createSandboxSettings(options: {
   policyConflict?: SandboxPolicy
   policyConflictGate?: Promise<unknown>
   runModeSetError?: Error
-  runtimeStatus?: SandboxRuntimePackStatus | null | (() => SandboxRuntimePackStatus | null | Promise<SandboxRuntimePackStatus | null>)
+  runtimeStatus?: SandboxRuntimePackStatus | null | ((options?: SandboxRequestOptions) => SandboxRuntimePackStatus | null | Promise<SandboxRuntimePackStatus | null>)
   runtimeStatusError?: Error
   runtimeAction?: (
     action: 'install' | 'cancel' | 'discard' | 'remove',
     componentId: string,
     operationId?: string,
-  ) => SandboxRuntimeActionReceipt
+  ) => SandboxRuntimeActionReceipt | Promise<SandboxRuntimeActionReceipt>
 } = {}) {
   vi.resetModules()
   const pushToast = vi.fn()
@@ -160,9 +161,9 @@ async function createSandboxSettings(options: {
     if (options.runModeSetError) throw options.runModeSetError
     return { runMode: mode, source: 'preference' }
   })
-  const runtimeStatus = vi.fn(async () => {
+  const runtimeStatus = vi.fn(async (request?: SandboxRequestOptions) => {
     if (options.runtimeStatusError) throw options.runtimeStatusError
-    if (typeof options.runtimeStatus === 'function') return await options.runtimeStatus()
+    if (typeof options.runtimeStatus === 'function') return await options.runtimeStatus(request)
     return options.runtimeStatus ?? null
   })
   const runtimeAction = (
@@ -745,12 +746,14 @@ describe('useSandboxSettings runtime packs', () => {
     })
     await settings.load()
     await settle()
+    settings.setRuntimeViewActive(true)
+    await settle()
 
     await expect(settings.discardRuntimeDownload('python')).resolves.toBe(false)
     await settle()
 
-    expect(operations.runtimeStatus).toHaveBeenCalledTimes(2)
-    expect(statusCalls).toBe(2)
+    expect(operations.runtimeStatus).toHaveBeenCalledTimes(3)
+    expect(statusCalls).toBe(3)
     expect(settings.runtimeStatus.value?.components[0]?.resumeBytes).toBe(0)
     expect(settings.runtimeActionError.python).toBe('cache is busy')
     expect(settings.runtimeActionPending.python).toBe(false)
@@ -781,7 +784,11 @@ describe('useSandboxSettings runtime packs', () => {
     const { scope, settings } = await createSandboxSettings({
       runtimeStatus: () => {
         statusCalls += 1
-        return statusCalls === 1 ? readyRuntimeStatus : staleStatus
+        if (statusCalls === 1) return readyRuntimeStatus
+        if (statusCalls === 2) return staleStatus
+        const refreshed = structuredClone(readyRuntimeStatus)
+        refreshed.components[0]!.operation = queuedOperation
+        return refreshed
       },
       runtimeAction: () => ({ kind: 'operation', operation: queuedOperation }),
     })
@@ -801,6 +808,73 @@ describe('useSandboxSettings runtime packs', () => {
     expect(settings.runtimeStatus.value?.components[0]?.operation?.operationId)
       .toBe('operation-1')
     expect(settings.runtimeStatusLoading.value).toBe(false)
+    expect(statusCalls).toBe(3)
+    scope.stop()
+  })
+
+  it('coalesces status reads and waits for an aborted observation before re-entry', async () => {
+    vi.useFakeTimers()
+    let resolveStatus!: (status: SandboxRuntimePackStatus) => void
+    const pending = new Promise<SandboxRuntimePackStatus>(resolve => { resolveStatus = resolve })
+    let calls = 0
+    const { operations, scope, settings } = await createSandboxSettings({
+      runtimeStatus: () => ++calls === 1 ? pending : readyRuntimeStatus,
+    })
+    settings.setRuntimeViewActive(true)
+    const joined = settings.loadRuntimeStatus()
+    for (let i = 0; i < 12; i++) {
+      settings.setRuntimeViewActive(false)
+      settings.setRuntimeViewActive(true)
+    }
+    expect(calls).toBe(1)
+    expect(operations.runtimeStatus.mock.calls[0]?.[0]?.signal?.aborted).toBe(true)
+    resolveStatus(readyRuntimeStatus)
+    await joined
+    await settle()
+    expect(calls).toBe(2)
+    expect(settings.runtimeStatus.value).toEqual(readyRuntimeStatus)
+    expect(settings.runtimeStatusError.value).toBe('')
+    scope.stop()
+  })
+
+  it('lets an accepted action finish after leaving without starting a fallback read', async () => {
+    let complete!: (receipt: SandboxRuntimeActionReceipt) => void
+    const action = new Promise<SandboxRuntimeActionReceipt>(resolve => { complete = resolve })
+    const noRows = { ...readyRuntimeStatus, components: [] }
+    const { operations, scope, settings } = await createSandboxSettings({
+      runtimeStatus: noRows, runtimeAction: () => action,
+    })
+    settings.setRuntimeViewActive(true)
+    await settle()
+    const accepted = settings.cancelRuntime('python', 'operation-1')
+    settings.setRuntimeViewActive(false)
+    complete({ kind: 'operation', operation: {
+      operationId: 'operation-1', componentId: 'python', kind: 'install', state: 'cancelled',
+      downloadedBytes: 0, totalBytes: 100, progressPercent: 0, source: null,
+      startedAtMs: 1, updatedAtMs: 2, error: null,
+    } })
+    await expect(accepted).resolves.toBe(true)
+    expect(operations.cancelRuntime).toHaveBeenCalledTimes(1)
+    expect(operations.runtimeStatus).toHaveBeenCalledTimes(1)
+    scope.stop()
+  })
+
+  it.each(['leave', 'dispose'] as const)('does not publish or start a tail read after %s', async ending => {
+    vi.useFakeTimers()
+    let resolveStatus!: (status: SandboxRuntimePackStatus) => void
+    const pending = new Promise<SandboxRuntimePackStatus>(resolve => { resolveStatus = resolve })
+    const { operations, scope, settings } = await createSandboxSettings({ runtimeStatus: () => pending })
+    settings.setRuntimeViewActive(true)
+    settings.setRuntimeViewActive(false)
+    settings.setRuntimeViewActive(true)
+    if (ending === 'dispose') scope.stop()
+    else settings.setRuntimeViewActive(false)
+    resolveStatus(readyRuntimeStatus)
+    await settle()
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(operations.runtimeStatus).toHaveBeenCalledTimes(1)
+    expect(settings.runtimeStatus.value).toBeNull()
+    expect(settings.runtimeStatusError.value).toBe('')
     scope.stop()
   })
 

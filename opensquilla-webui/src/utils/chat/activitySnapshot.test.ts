@@ -40,6 +40,42 @@ const snapshot: ActivitySnapshotV2 = {
 }
 
 describe('activitySnapshot v2', () => {
+  it('keeps original chronology for explicitly shortened reasoning and text previews', () => {
+    const message: ChatMessage = {
+      role: 'assistant', text: 'fi', ts: 1,
+      reasoning: { text: 'A', seconds: 0 },
+      tool_calls: [
+        { type: 'text', text: 'fi', presentation: 'intermediate' },
+        { type: 'tool_use', tool_use_id: 'tool-1', name: 'skill_view', input: { text: 'preview' } },
+      ],
+      historyPayloadPreview: { detailsTruncated: true, reasoningUtf16Length: 3, textUtf16Lengths: [5] },
+    }
+    expect(activitySnapshotMatchesMessage(snapshot, message)).toBe(true)
+    expect(activityReasoningBlocks(snapshot, 'A', 3)).toMatchObject([
+      { text: 'A', activityOrder: 6, id: 'reasoning-1' },
+    ])
+    const timeline: ChatStreamTimelineItem[] = [{ type: 'text', key: 'first', rawText: 'fi', html: 'fi' }]
+    expect(applyActivityOrdersToTimeline(timeline, snapshot)[0]?.activityOrder).toBe(31)
+    expect(activitySnapshotMatchesMessage(snapshot, { ...message, historyPayloadPreview: undefined })).toBe(false)
+    expect(activitySnapshotMatchesMessage(snapshot, {
+      ...message, historyPayloadPreview: { ...message.historyPayloadPreview, textUtf16Lengths: [6] },
+    })).toBe(false)
+    expect(activityReasoningBlocks(snapshot, 'A', 2)).toBeUndefined()
+  })
+
+  it('does not shift a later reasoning block into a clipped prefix', () => {
+    const physical: ActivitySnapshotV2 = {
+      ...snapshot, reasoningUtf16Length: 10,
+      entries: [
+        { ...snapshot.entries[2]!, text_start_utf16: 0, text_end_utf16: 3 },
+        { ...snapshot.entries[2]!, id: 'reasoning-2', order: 42, block_index: 1, text_start_utf16: 4, text_end_utf16: 10 },
+      ],
+    }
+    expect(activityReasoningBlocks(physical, 'A', 10)).toMatchObject([
+      { text: 'A', activityOrder: 6 }, { text: '', activityOrder: 42 },
+    ])
+    expect(activityReasoningBlocks(physical, 'A😀 wrong', 10)).toBeUndefined()
+  })
   it('restores temporary maintenance without promoting it to a saved summary', () => {
     const normalized = normalizeActivitySnapshot({
       version: 2, task_id: 'turn-1', turn_id: 'turn-1',

@@ -61,6 +61,7 @@ from opensquilla.gateway.scopes import (
     resolve_required_scope,
 )
 from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.observability.settings_save import settings_save_stage, settings_save_timing
 from opensquilla.session.storage import StorageBusyError
 
 log = structlog.get_logger(__name__)
@@ -189,6 +190,7 @@ class RpcContext:
     skill_management_service: Any = None  # Shared Community Skill mutation service
     skill_management_state: dict[str, Any] = field(default_factory=dict)
     cron_scheduler: Any = None  # SchedulerEngine instance (injected at boot)
+    cron_run_admitted: Callable[[], None] | None = None
     turn_runner: TurnRunner | None = None  # TurnRunner instance (injected at boot)
     task_runtime: Any = None  # TaskRuntime instance (injected at boot)
     heartbeat_service: Any = None  # Task-style heartbeat service (injected at boot)
@@ -207,6 +209,10 @@ class RpcContext:
     # Runtime-only preview lease and resource service. It remains inside the
     # Gateway process; public RPC payloads carry only scoped preview references.
     artifact_preview_service: Any = None
+    # Optional-service readiness negotiated by startup_services.v1 clients.
+    # This is metadata only; handlers must still return explicit dependency
+    # errors when a service is starting or degraded.
+    startup_services: dict[str, dict[str, Any]] | None = None
 
     @property
     def role(self) -> str:
@@ -356,7 +362,9 @@ class RpcRegistry:
         return self._methods.get(name)
 
     async def dispatch(self, req_id: str, method: str, params: Any, ctx: RpcContext) -> ResFrame:
-        response = await self._dispatch(req_id, method, params, ctx)
+        with settings_save_timing(req_id, method, getattr(ctx, "conn_id", "") or ""):
+            response = await self._dispatch(req_id, method, params, ctx)
+            settings_save_stage("response_error" if response.error else "response_ready")
         if isinstance(method, str) and method in _SEND_COMMAND_METHODS and response.error:
             error = response.error
             # Log the projected outcome even for early authorization/validation

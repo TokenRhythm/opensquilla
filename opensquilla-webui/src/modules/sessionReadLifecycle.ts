@@ -90,12 +90,37 @@ export interface SessionReadMessageProvenance {
   readonly sourceTool: string | null
 }
 
+export interface SessionReadContentRef {
+  readonly version: 1
+  readonly sessionKey: string
+  readonly sessionId: string
+  readonly messageId: string
+  readonly source?: 'active' | 'compacted'
+  /** Raw byte ranges are unsafe for protocol-transformed rows. */
+  readonly view?: 'raw' | 'display'
+  readonly byteLength?: number
+  readonly revision?: string
+  readonly sha256?: string
+}
+
+export type SessionReadContentUnavailableReason =
+  | 'content_metadata_pending'
+  | 'display_projection_too_large'
+  | 'content_reference_unavailable'
+
 export interface SessionReadTurnContext {
   readonly turnId: string | null
   readonly promotedTurnId: string | null
   readonly appliedIteration: number | null
   readonly activityMarkers: readonly unknown[]
   readonly additional: SessionReadJsonObject
+}
+
+/** Display previews retain original lengths for the durable activity references. */
+export interface SessionReadPayloadPreview {
+  readonly detailsTruncated?: boolean
+  readonly reasoningUtf16Length?: number
+  readonly textUtf16Lengths?: readonly number[]
 }
 
 export interface SessionReadMessage {
@@ -121,6 +146,14 @@ export interface SessionReadMessage {
   readonly model: string | null
   readonly inputTokens: number | null
   readonly outputTokens: number | null
+  readonly contentRef?: SessionReadContentRef
+  /** Completeness of the display body, independent of the history window. */
+  readonly previewComplete?: boolean
+  readonly historyPayloadPreview?: SessionReadPayloadPreview
+  /** Stable body revision, also present while content metadata is preparing. */
+  readonly contentRevision?: string
+  readonly contentAvailability?: 'ready' | 'preparing' | 'unavailable'
+  readonly contentUnavailableReason?: SessionReadContentUnavailableReason
   readonly additional: SessionReadJsonObject
 }
 
@@ -195,6 +228,8 @@ export interface SessionReadHistoryReader {
 
 export interface SessionReadOpenRequest {
   readonly sessionKey: string
+  /** Local new-chat intent, before its first send creates a durable session. */
+  readonly provisionalDraft?: boolean
   /** Queue the first latest-history frame behind subscribe/snapshot. Defaults to true. */
   readonly includeInitialHistory?: boolean
 }
@@ -230,6 +265,7 @@ export interface SessionReadPortCursor {
 
 export interface SessionReadPortOpenRequest {
   readonly sessionKey: string
+  readonly provisionalDraft?: boolean
   readonly includeInitialHistory: boolean
   readonly resumeFrom: SessionReadPortCursor
   readonly signal: AbortSignal
@@ -305,7 +341,7 @@ export class SessionReadContractError extends Error {
   }
 }
 
-export type SessionReadFailureKind = 'aborted' | 'timeout' | 'busy' | 'unavailable' | 'too-large' | 'budget-exhausted'
+export type SessionReadFailureKind = 'aborted' | 'timeout' | 'busy' | 'unavailable' | 'too-large' | 'budget-exhausted' | 'rebase-required'
 
 /** Recoverable read failure projected by a transport Adapter. */
 export class SessionReadFailure extends Error {
@@ -487,6 +523,7 @@ export function createSessionReadLifecycle(
       assertCurrent(state, options.subscriptions)
       const portLease = options.port.open({
         sessionKey,
+        ...(request.provisionalDraft ? { provisionalDraft: true } : {}),
         includeInitialHistory: request.includeInitialHistory !== false,
         resumeFrom: {
           streamGeneration: seed.streamGeneration,

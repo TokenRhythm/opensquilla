@@ -173,6 +173,19 @@ test('browser observation forwards every original frame and records terminal eve
   socket.incoming({ type: 'event', event: 'session.event.done', payload: { session_key: 'session-a', turn_id: 'task-a', reason: 'aborted', content: 'do not persist arbitrary transcript' } })
   assert.equal(assertStopEvidence(context.__retainedAuditRpc, 'session-a').taskId, 'task-a')
   assert.equal(JSON.stringify(context.__retainedAuditRpc).includes('do not persist'), false)
+  const request = JSON.stringify({ type: 'req', id: 'snapshot-1', method: 'sessions.snapshot', params: { token: 'private-token' } })
+  assert.equal(socket.send(request), 'original-return')
+  socket.incoming({ type: 'res', id: 'snapshot-1', ok: false, error: { code: 'SNAPSHOT_STALE', message: 'private-details' }, payload: { content: 'private-transcript' } })
+  const transport = JSON.parse(JSON.stringify(context.__retainedAuditRpc.transport))
+  assert.deepEqual(transport.slice(-2).map(({ at, ...entry }) => {
+    assert.equal(typeof at, 'number')
+    return entry
+  }), [
+    { type: 'req', id: 'snapshot-1', method: 'sessions.snapshot' },
+    { type: 'res', id: 'snapshot-1', ok: false, code: 'SNAPSHOT_STALE' },
+  ])
+  assert.equal(JSON.stringify(context.__retainedAuditRpc).includes('private-'), false)
+  assert.equal(socket.sent.at(-1), request, 'Diagnostics must forward the unmodified request')
 })
 
 async function providerFixture(t) {

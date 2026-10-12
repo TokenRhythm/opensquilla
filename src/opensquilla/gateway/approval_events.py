@@ -10,6 +10,7 @@ clients that ignore these events keep working unchanged.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Callable, Mapping
 from typing import Any, cast
@@ -343,25 +344,36 @@ def register_approval_event_bridge(
         event_name = approval_event_name(event, info)
         if event_name is None:
             return
-        payload = build_approval_event_payload(info)
-        session_key = str(payload.get("session_key") or "").strip()
-        if session_key:
-            # Approval events use their public, already-redacted projection.
-            # Recording before broadcast gives both the live client and the
-            # terminal v2 snapshot the same authoritative stream_seq.
-            payload = get_session_streams().record(
-                session_key,
+
+        async def _emit() -> None:
+            payload = build_approval_event_payload(info)
+            session_key = str(payload.get("session_key") or "").strip()
+            if session_key:
+                # The queue may have committed on its storage worker. Keep
+                # stream persistence off the Gateway loop as well.
+                payload = await asyncio.to_thread(
+                    get_session_streams().record,
+                    session_key,
+                    event_name,
+                    payload,
+                )
+            emit_coro = event_bridge.broadcast_scoped(
                 event_name,
                 payload,
+                required_scope=APPROVALS_SCOPE,
             )
-        emit_coro = event_bridge.broadcast_scoped(
-            event_name,
-            payload,
-            required_scope=APPROVALS_SCOPE,
-        )
+            try:
+                await emit_coro
+            except RuntimeError:
+                emit_coro.close()
+
         try:
-            schedule(emit_coro)
+            emit_task = _emit()
+            schedule(emit_task)
         except RuntimeError:
-            emit_coro.close()
+            # The gateway is shutting down; no new task can be scheduled.
+            if "emit_task" in locals():
+                emit_task.close()
+            return
 
     return cast("Callable[[], None]", queue.add_event_listener(_listener))

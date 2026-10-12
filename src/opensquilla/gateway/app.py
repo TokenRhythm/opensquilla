@@ -6,7 +6,7 @@ import functools
 import json
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar, cast
 
 import structlog
 from starlette.applications import Starlette
@@ -18,9 +18,20 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
 from opensquilla import __version__
+from opensquilla.application.content_reader import (
+    MAX_CONTENT_EXPORT_BYTES,
+    MAX_CONTENT_RANGE_BYTES,
+    ContentEncodingError,
+    ContentExportLimitError,
+    ContentMetadataPendingError,
+    ContentNotFoundError,
+    ContentRangeError,
+    read_utf8_text,
+)
 from opensquilla.contracts.generated.v4.sessions_list_metadata import (
     SESSIONS_LIST_METHOD,
 )
+from opensquilla.gateway.adapters.content_reader import build_content_reader
 from opensquilla.gateway.approval_events import build_approval_snapshot_item
 from opensquilla.gateway.approval_queue import get_approval_queue
 from opensquilla.gateway.config import GatewayConfig
@@ -38,7 +49,13 @@ from opensquilla.gateway.origin_guard import (
     request_origin_allowed,
 )
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
-from opensquilla.gateway.scopes import is_loopback_address, is_loopback_bind
+from opensquilla.gateway.scopes import (
+    READ_SCOPE,
+    authorize_call,
+    is_loopback_address,
+    is_loopback_bind,
+)
+from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.gateway.websocket import handle_ws_connection
 
 log = structlog.get_logger(__name__)
@@ -169,13 +186,81 @@ def create_gateway_app(
 
     async def ready(request: Request) -> JSONResponse:
         uptime = int((time.time() - _start_time) * 1000)
-        is_ready = bool(getattr(request.app.state, "gateway_ready", True))
+        # ``/ready`` and ``/readyz`` retain their historical aggregate
+        # meaning. Gateway-owned callers that need the durable core boundary
+        # use the additive ``/readyz/core`` endpoint. The fallback keeps
+        # embedded/test apps that do not install the new state compatible.
+        is_ready = bool(
+            getattr(
+                request.app.state,
+                "legacy_ready",
+                getattr(request.app.state, "gateway_ready", True),
+            )
+        )
         payload = {
             "ready": is_ready,
             "status": "ready" if is_ready else "starting",
             "uptime_ms": uptime,
         }
         return JSONResponse(payload, status_code=200 if is_ready else 503)
+
+    async def core_ready(request: Request) -> JSONResponse:
+        """Report readiness of the durable Gateway core only.
+
+        This deliberately excludes optional external integrations (channels,
+        MCP discovery and desktop-browser tools).  The endpoint is public like
+        the legacy readiness endpoint so a newly launched client can probe it
+        before it has obtained an operator token.
+        """
+        is_ready = bool(
+            getattr(
+                request.app.state,
+                "core_ready",
+                getattr(request.app.state, "gateway_ready", True),
+            )
+        )
+        services = getattr(request.app.state, "optional_services", {})
+        if not isinstance(services, dict):
+            services = {}
+        # Keep the core probe cheap and deterministic.  Optional-service
+        # descriptors are owned by integrations and may contain diagnostics,
+        # exception text or unbounded metadata; returning them verbatim would
+        # make a readiness request proportional to the slowest integration.
+        compact: dict[str, dict[str, object]] = {}
+        state_counts: dict[str, int] = {}
+        for raw_name, raw_descriptor in sorted(services.items(), key=lambda item: str(item[0])):
+            if not isinstance(raw_name, str):
+                continue
+            name = raw_name[:64]
+            descriptor = raw_descriptor if isinstance(raw_descriptor, dict) else {}
+            state = descriptor.get("state", descriptor.get("status", "unknown"))
+            state_text = state if isinstance(state, str) else "unknown"
+            state_text = state_text[:32]
+            state_counts[state_text] = state_counts.get(state_text, 0) + 1
+            item: dict[str, object] = {"status": state_text}
+            for field in ("config_revision", "configRevision", "generation", "owner_generation"):
+                value = descriptor.get(field)
+                if isinstance(value, (str, int)) and not isinstance(value, bool):
+                    item[field] = value if not isinstance(value, str) else value[:128]
+            compact[name] = item
+        payload: dict[str, object] = {
+            "ready": is_ready,
+            "status": "ready" if is_ready else "starting",
+            "services": compact,
+        }
+        response = JSONResponse(payload, status_code=200 if is_ready else 503)
+        if len(response.body) > 2048:
+            payload["services"] = {
+                "summary": {"count": len(services), "states": state_counts},
+                "truncated": True,
+            }
+            response = JSONResponse(payload, status_code=200 if is_ready else 503)
+        if len(response.body) > 2048:
+            # State names are bounded above, but retain a final hard ceiling
+            # even if a future caller supplies an unusual descriptor shape.
+            payload["services"] = {"summary": {"count": len(services)}, "truncated": True}
+            response = JSONResponse(payload, status_code=200 if is_ready else 503)
+        return response
 
     async def api_config(request: Request) -> JSONResponse:
         ctx = _make_ctx(request)
@@ -511,6 +596,7 @@ def create_gateway_app(
                 "artifact_preview_service",
                 None,
             ),
+            startup_services=getattr(app.state, "optional_services", None),
         )
 
     async def api_channels_status(request: Request) -> JSONResponse:
@@ -584,7 +670,7 @@ def create_gateway_app(
         settings = result.payload or {}
         mode = settings.get("mode", "prompt")
         queue = get_approval_queue()
-        pending = _human_actionable_approvals(queue.list_pending())
+        pending = _human_actionable_approvals(await queue.list_pending_async())
         items = [build_approval_snapshot_item(item, default_mode=mode) for item in pending]
         return JSONResponse(
             {
@@ -689,7 +775,7 @@ def create_gateway_app(
             return JSONResponse({"error": str(exc)}, status_code=400)
         resolved_pending = 0
         if mode in ("bypass", "full"):
-            resolved_pending = queue.resolve_pending_for_session(
+            resolved_pending = await queue.resolve_pending_for_session_async(
                 session_key,
                 approved=True,
                 elevated_mode=mode,
@@ -747,6 +833,191 @@ def create_gateway_app(
             ),
         )
 
+    async def api_content_read(request: Request) -> Response:
+        """Read one legacy transcript body through bounded ``content.read.v1``.
+
+        History payloads expose only a stable ``contentRef``.  This endpoint
+        validates the session generation before resolving that reference and
+        never puts a full legacy body into a WebSocket frame.  A normal request
+        returns one bounded binary range; ``export=1`` returns a bounded UTF-8
+        streaming export for callers that explicitly need text.
+        """
+
+        ctx = _make_ctx(request)
+        principal = ctx.principal
+        session_key = str(request.query_params.get("sessionKey") or "").strip()
+        session_id = str(request.query_params.get("sessionId") or "").strip()
+        message_id = str(request.query_params.get("messageId") or "").strip()
+        if not session_key or not session_id or not message_id:
+            return JSONResponse(
+                {
+                    "error": "sessionKey, sessionId and messageId are required",
+                    "code": "INVALID_PARAMS",
+                },
+                status_code=400,
+            )
+        source_param = request.query_params.get("source")
+        if source_param is not None and source_param not in {"active", "compacted"}:
+            return JSONResponse(
+                {"error": "source must be active or compacted", "code": "INVALID_PARAMS"},
+                status_code=400,
+            )
+        view = str(request.query_params.get("view") or "raw").lower()
+        if view not in {"raw", "display", "details"}:
+            return JSONResponse(
+                {"error": "view must be raw, display or details", "code": "INVALID_PARAMS"},
+                status_code=400,
+            )
+        # Guests are accepted on the same local read surface as chat.history;
+        # the session generation check below still prevents references to a
+        # different or deleted transcript. Invalid principals never reach the
+        # storage reader.
+        if principal.auth_state == "invalid":
+            return JSONResponse(
+                {"error": "content access is unauthorized", "code": "UNAUTHORIZED"},
+                status_code=403,
+            )
+        # This route is intentionally outside the RPC dispatcher, so apply
+        # the same guest ownership fence that ``chat.history`` receives from
+        # ``GuestRpcPolicy``.  A session id is not an authorization token:
+        # without this check a remote guest could copy another guest's
+        # sessionKey/sessionId pair and read its legacy transcript body.
+        from opensquilla.gateway.guest_rpc_policy import (
+            GuestRpcPolicy,
+            guest_owns_session_key,
+        )
+
+        if GuestRpcPolicy.is_guest(ctx) and not guest_owns_session_key(
+            getattr(principal, "guest_owner_id", None),
+            session_key,
+        ):
+            return JSONResponse(
+                {"error": "guest session is not owned by this browser", "code": "UNAUTHORIZED"},
+                status_code=403,
+            )
+        allowed, _ = authorize_call(
+            "chat.history", READ_SCOPE, principal.role, principal.scopes,
+        )
+        if not allowed:
+            return JSONResponse(
+                {"error": "transcript read scope is required", "code": "UNAUTHORIZED"},
+                status_code=403,
+            )
+        storage = get_session_storage(session_manager)
+        if storage is None:
+            return JSONResponse(
+                {"error": "session storage unavailable", "code": "UNAVAILABLE"},
+                status_code=503,
+            )
+        try:
+            session = await storage.get_session(session_key)
+            if session is None or str(session.session_id) != session_id:
+                raise ContentNotFoundError("legacy content session generation was not found")
+            source = cast(Literal["active", "compacted"] | None, source_param)
+            reader = build_content_reader(storage)
+            ref = await reader.get_ref(
+                session_id, message_id, source=source,
+                allow_pending=view in {"display", "details"},
+            )
+            requested_revision = str(request.query_params.get("revision") or "").strip()
+            from opensquilla.content_reader import content_revision_matches
+
+            if requested_revision and not content_revision_matches(
+                requested_revision, ref.revision,
+            ):
+                raise ContentNotFoundError("legacy transcript content changed")
+            export = str(request.query_params.get("export") or "").lower() in {"1", "true", "yes"}
+            if view in {"display", "details"}:
+                if not export:
+                    return JSONResponse(
+                        {
+                            "error": "display view requires export=1",
+                            "code": "DISPLAY_EXPORT_REQUIRED",
+                        },
+                        status_code=400,
+                    )
+                read = (
+                    reader.read_display_details if view == "details" else reader.read_display_text
+                )
+                text = await read(ref, max_bytes=MAX_CONTENT_EXPORT_BYTES)
+                response = Response(
+                    text,
+                    media_type=(
+                        "application/json" if view == "details" else "text/plain; charset=utf-8"
+                    ),
+                )
+                response.headers["X-Content-Ref"] = f"{session_id}/{message_id}"
+                if ref.revision:
+                    response.headers["X-Content-Revision"] = ref.revision
+                response.headers["X-Content-View"] = view
+                response.headers["X-Content-Bytes"] = str(len(text.encode("utf-8")))
+                response.headers["Cache-Control"] = "no-store"
+                return response
+            if export:
+                text = await read_utf8_text(
+                    reader,
+                    ref,
+                    max_bytes=MAX_CONTENT_EXPORT_BYTES,
+                )
+                response = Response(text, media_type="text/plain; charset=utf-8")
+                response.headers["X-Content-Ref"] = f"{session_id}/{message_id}"
+                if ref.revision:
+                    response.headers["X-Content-Revision"] = ref.revision
+                response.headers["X-Content-Bytes"] = str(ref.byte_length)
+                response.headers["Cache-Control"] = "no-store"
+                return response
+
+            offset_raw = request.query_params.get("offset", "0")
+            limit_raw = request.query_params.get("limit", str(MAX_CONTENT_RANGE_BYTES))
+            try:
+                offset = int(offset_raw)
+                limit = int(limit_raw)
+            except (TypeError, ValueError) as exc:
+                raise ContentRangeError("content range offset and limit must be integers") from exc
+            range_header = request.headers.get("range", "")
+            if range_header:
+                if not range_header.lower().startswith("bytes=") or "," in range_header:
+                    raise ContentRangeError("only one bytes range is supported")
+                spec = range_header[6:].strip()
+                start_text, _, end_text = spec.partition("-")
+                if not start_text:
+                    raise ContentRangeError("suffix byte ranges are not supported")
+                offset = int(start_text)
+                if end_text:
+                    end = int(end_text)
+                    limit = end - offset + 1
+            chunk = await reader.read_range(ref, offset=offset, limit=limit)
+            end = chunk.end - 1 if chunk.data else chunk.offset
+            response = Response(chunk.data, media_type="application/octet-stream")
+            response.status_code = 206 if range_header else 200
+            response.headers["Accept-Ranges"] = "bytes"
+            response.headers["Content-Range"] = f"bytes {chunk.offset}-{end}/{ref.byte_length}"
+            response.headers["X-Content-Ref"] = f"{session_id}/{message_id}"
+            if ref.revision:
+                response.headers["X-Content-Revision"] = ref.revision
+            response.headers["X-Content-Eof"] = "true" if chunk.eof else "false"
+            # Range responses are individually bounded but numerous. Do not
+            # let Chromium's HTTP cache retain an unbounded copy of a long
+            # transcript while the client walks its ranges; any reuse belongs
+            # to an explicit, bounded content-reader cache.
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        except (ContentRangeError, ValueError) as exc:
+            return JSONResponse({"error": str(exc), "code": "INVALID_RANGE"}, status_code=416)
+        except ContentExportLimitError as exc:
+            return JSONResponse({"error": str(exc), "code": "EXPORT_TOO_LARGE"}, status_code=413)
+        except ContentEncodingError as exc:
+            return JSONResponse({"error": str(exc), "code": "CONTENT_ENCODING"}, status_code=422)
+        except ContentMetadataPendingError as exc:
+            response = JSONResponse(
+                {"error": str(exc), "code": "CONTENT_METADATA_PENDING"},
+                status_code=503,
+            )
+            response.headers["Retry-After"] = "2"
+            return response
+        except ContentNotFoundError as exc:
+            return JSONResponse({"error": str(exc), "code": "NOT_FOUND"}, status_code=404)
+
     async def ws_endpoint(ws: WebSocket) -> None:
         await handle_ws_connection(
             ws,
@@ -776,6 +1047,7 @@ def create_gateway_app(
             memory_retrievers=memory_retrievers,
             prompt_cache_keepalive_service=prompt_cache_keepalive_service,
             skill_management_service=skill_management_service,
+            startup_services=getattr(app.state, "optional_services", None),
             artifact_preview_service=getattr(
                 app.state,
                 "artifact_preview_service",
@@ -796,10 +1068,12 @@ def create_gateway_app(
         Route("/healthz", health, methods=["GET"]),
         Route("/ready", ready, methods=["GET"]),
         Route("/readyz", ready, methods=["GET"]),
+        Route("/readyz/core", core_ready, methods=["GET"]),
         Route("/api/config", api_config, methods=["GET"]),
         Route("/api/sessions", api_sessions, methods=["GET"]),
         Route("/api/chat", _same_origin(api_chat), methods=["POST"]),
         Route("/api/chat/history", api_chat_history, methods=["GET"]),
+        Route("/api/content/read", api_content_read, methods=["GET"]),
         Route("/api/agents", api_agents, methods=["GET"]),
         Route("/api/cron", api_cron, methods=["GET"]),
         Route("/api/system/status", api_system_status, methods=["GET"]),

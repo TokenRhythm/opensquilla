@@ -654,6 +654,14 @@ export function useChatSend(options: UseChatSendOptions) {
     composerSubmissionVersion.value
     return [...composerSubmissions.values()].some(entry => entry.sessionKey === options.sessionKey.value)
   })
+  const sendHydrationBlocked = computed(() => {
+    composerSubmissionVersion.value
+    acceptanceRecoveryVersion.value
+    // Receipt recovery and proven offline queues precede the ordinary task
+    // hydration guard. Keep those existing actions available in the UI.
+    return Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value
+      && !currentExactReplayAttempt() && !options.offlineQueueIdentity?.value)
+  })
 
   function noteAcceptanceRecoveryChanged() {
     if (disposed) return
@@ -1208,6 +1216,14 @@ export function useChatSend(options: UseChatSendOptions) {
 
   function initialProviderForIntent(intent: string | null): string | null {
     return intent === 'new_chat' ? options.initialProvider?.value ?? null : null
+  }
+
+  // Only known browser skills require the optional desktop browser service.
+  function requiredServicesForSkills(skills: readonly SelectedSkillRef[]): string[] {
+    return skills.some(skill => {
+      const name = String(skill.name || '').trim().toLowerCase()
+      return name === 'browser-use' || name === 'browser_use' || name === 'browseruse'
+    }) ? ['desktop_browser'] : []
   }
 
   function consumeAcceptedComposer(attempt: SendAttempt): void {
@@ -2220,6 +2236,13 @@ export function useChatSend(options: UseChatSendOptions) {
     resumeQueueOnSuccess?: boolean
   }
 
+  function currentExactReplayAttempt(): SendAttempt | null {
+    return !responseHandoffBlocksCurrentSession()
+      && recoveredAttempt?.requiresIdempotentReplay
+      && recoveredAttempt.requestSessionKey === options.sessionKey.value
+      ? recoveredAttempt : null
+  }
+
   async function onSend(invocation: SendInvocation = {}) {
     if (disposed) return
     const key = options.sessionKey.value
@@ -2277,13 +2300,7 @@ export function useChatSend(options: UseChatSendOptions) {
     // In particular, do this before consulting the current annotation drafts:
     // the first request may already have consumed them and advanced the head.
     // Only live transport/admission state is allowed to block this exact replay.
-    const exactReplayAttempt = (
-      !handoffInFlight
-      && recoveredAttempt?.requiresIdempotentReplay
-      && recoveredAttempt.requestSessionKey === options.sessionKey.value
-    )
-      ? recoveredAttempt
-      : null
+    const exactReplayAttempt = currentExactReplayAttempt()
     if (exactReplayAttempt) {
       if (exactReplayAttempt.deliveryIdentity !== undefined
         && exactReplayAttempt.deliveryIdentity !== requestDeliveryIdentity) return
@@ -3039,6 +3056,8 @@ export function useChatSend(options: UseChatSendOptions) {
         sessionKey: requestSessionKey,
       }
       if (attemptSelectedSkills.length) params.selectedSkills = copySelectedSkills(attemptSelectedSkills)
+      const requiredServices = requiredServicesForSkills(attemptSelectedSkills)
+      if (requiredServices.length) params.requiredServices = requiredServices
       if (attemptLocalPathReferences.length) params.localPathReferences = [...attemptLocalPathReferences]
       if (attemptPageContext) params.pageContext = attemptPageContext
       if (attemptPageContext?.annotations?.length && !userText) params.displayText = ''
@@ -4029,6 +4048,7 @@ export function useChatSend(options: UseChatSendOptions) {
     },
     onSend,
     sendPending,
+    sendHydrationBlocked,
     onStop,
     sendQueuedSteer,
     sendQueuedFollowup,

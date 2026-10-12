@@ -29,6 +29,12 @@ export interface UseNewTaskModelSelectionOptions {
   routingMode: Readonly<Ref<ModelRoutingMode>>
   busy: Readonly<Ref<boolean>>
   connectionEpoch?: Readonly<Ref<number>>
+  /**
+   * Keep provider catalog discovery out of the initial Chat surface load.
+   * Callers still start it through the explicit refresh action (the model
+   * picker emits that action when opened).
+   */
+  autoRefresh?: boolean
   storage?: SelectionStorage | null
 }
 
@@ -85,6 +91,7 @@ export function useNewTaskModelSelection(options: UseNewTaskModelSelectionOption
   let controller: AbortController | null = null
   let inFlight: Promise<void> | null = null
   let selectionOperation = 0
+  let refreshRequested = false
 
   function persist(next: SavedSelection | null) {
     saved.value = next
@@ -166,6 +173,7 @@ export function useNewTaskModelSelection(options: UseNewTaskModelSelectionOption
   }
 
   function refresh(cacheFirst = false): Promise<void> {
+    refreshRequested = true
     if (!catalogAvailable.value) return Promise.resolve()
     if (inFlight) return inFlight
     const currentGeneration = generation
@@ -224,7 +232,7 @@ export function useNewTaskModelSelection(options: UseNewTaskModelSelectionOption
   }, { immediate: true })
   watch([catalogAvailable, () => options.connectionEpoch?.value], () => {
     invalidateCatalog()
-    if (catalogAvailable.value) void refresh(true)
+    if (catalogAvailable.value && (options.autoRefresh !== false || refreshRequested)) void refresh(true)
   }, { immediate: true })
   if (getCurrentScope()) onScopeDispose(() => {
     selectionOperation += 1

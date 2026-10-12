@@ -302,7 +302,7 @@ class SandboxUnavailableError(SandboxApplicationError):
 class SandboxSetupPort(Protocol):
     async def read_setup_status(self) -> SandboxSetupStatus: ...
 
-    async def ensure_setup(self) -> SandboxSetupStatus: ...
+    async def ensure_setup(self, *, repair_identity: bool = False) -> SandboxSetupStatus: ...
 
     async def read_capability(self, *, refresh: bool) -> SandboxCapability: ...
 
@@ -375,7 +375,9 @@ class SandboxRuntime:
     async def inspect_setup(self) -> SandboxSetupStatus:
         return await self._setup.read_setup_status()
 
-    async def prepare(self) -> SandboxSetupStatus:
+    async def prepare(self, *, repair_identity: bool = False) -> SandboxSetupStatus:
+        if repair_identity:
+            return await self._setup.ensure_setup(repair_identity=True)
         return await self._setup.ensure_setup()
 
     async def inspect_capability(self, *, refresh: bool = False) -> SandboxCapability:

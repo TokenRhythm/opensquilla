@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/transport/transport-session-flow-v2.schema.json",
+  "title": "OpenSquilla transport.sessionFlow.update.v2 Contract",
+  "description": "Per-subscription lane consumption, recovery staging, and retire confirmation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [],
+  "properties": {
+    "request": { "$ref": "#/$defs/SessionFlowUpdateV2RequestFrame" },
+    "response": { "$ref": "#/$defs/SessionFlowUpdateV2ResponseFrame" }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": { "tool": "datamodel-code-generator", "version": "0.81.0", "target": "pydantic_v2.BaseModel" },
+    "typescript": { "tool": "json-schema-to-typescript", "version": "16.0.0" },
+    "runtimeValidation": { "tool": "ajv", "version": "8.20.0", "mode": "standalone-adapter-only" }
+  },
+  "x-opensquilla-method": {
+    "name": "transport.sessionFlow.update.v2",
+    "kind": "command",
+    "scope": "operator.read",
+    "guestAllowed": true,
+    "idempotency": "idempotent",
+    "timeout": { "policy": "transport" },
+    "capability": { "kind": "method-availability", "name": "transport.sessionFlow.v2" },
+    "request": "#/$defs/SessionFlowUpdateV2RequestFrame",
+    "params": "#/$defs/SessionFlowUpdateV2Params",
+    "response": "#/$defs/SessionFlowUpdateV2ResponseFrame",
+    "result": "#/$defs/SessionFlowUpdateV2Result",
+    "errors": [
+      { "code": "INVALID_REQUEST" },
+      { "code": "UNAUTHORIZED" },
+      { "code": "FLOW_DISABLED" },
+      { "code": "FLOW_STALE" },
+      { "code": "LANE_RETIRED" },
+      { "code": "INTERNAL_ERROR" }
+    ]
+  },
+  "$defs": {
+    "RpcError": {
+      "type": "object", "additionalProperties": true,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" }, "message": { "type": "string" },
+        "details": {}, "retryable": { "type": ["boolean", "null"] },
+        "retry_after_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "accepted": { "type": ["boolean", "null"] }
+      }
+    },
+    "LaneConsumed": {
+      "type": "object", "additionalProperties": false,
+      "required": ["subscription_epoch", "through_delivery_id"],
+      "properties": {
+        "subscription_epoch": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "through_delivery_id": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "StagedRecovery": {
+      "type": "object", "additionalProperties": false,
+      "required": ["delivery_epoch", "delivery_id"],
+      "properties": {
+        "delivery_epoch": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "delivery_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+      }
+    },
+    "DiscardedLane": {
+      "type": "object", "additionalProperties": false,
+      "required": ["subscription_epoch", "retire_token", "final_published_id"],
+      "properties": {
+        "subscription_epoch": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "retire_token": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "final_published_id": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "SessionFlowUpdateV2Params": {
+      "type": "object", "additionalProperties": false,
+      "required": ["connection_epoch"],
+      "properties": {
+        "connection_epoch": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "consumed": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/LaneConsumed" } },
+        "staged_recovery": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/StagedRecovery" } },
+        "discarded_lanes": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/DiscardedLane" } }
+      }
+    },
+    "SessionFlowUpdateV2Result": {
+      "type": "object", "additionalProperties": false,
+      "required": ["connection_epoch", "consumed", "staged_recovery", "discarded_lanes"],
+      "properties": {
+        "connection_epoch": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "consumed": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/LaneConsumed" } },
+        "staged_recovery": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/StagedRecovery" } },
+        "discarded_lanes": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/DiscardedLane" } },
+        "lane_count": { "type": "integer", "minimum": 0, "maximum": 16 }
+      }
+    },
+    "SessionFlowUpdateV2RequestFrame": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "id", "method", "params"],
+      "properties": {
+        "type": { "const": "req" }, "id": { "type": "string" },
+        "method": { "const": "transport.sessionFlow.update.v2" },
+        "params": { "$ref": "#/$defs/SessionFlowUpdateV2Params" }
+      }
+    },
+    "SessionFlowUpdateV2OkResponseFrame": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "id", "ok", "payload"],
+      "properties": {
+        "type": { "const": "res" }, "id": { "type": "string" }, "ok": { "const": true },
+        "payload": { "$ref": "#/$defs/SessionFlowUpdateV2Result" }, "error": { "type": "null" }
+      }
+    },
+    "SessionFlowUpdateV2ErrorResponseFrame": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "id", "ok", "error"],
+      "properties": {
+        "type": { "const": "res" }, "id": { "type": "string" }, "ok": { "const": false },
+        "payload": { "type": "null" }, "error": { "$ref": "#/$defs/RpcError" }
+      }
+    },
+    "SessionFlowUpdateV2ResponseFrame": {
+      "oneOf": [
+        { "$ref": "#/$defs/SessionFlowUpdateV2OkResponseFrame" },
+        { "$ref": "#/$defs/SessionFlowUpdateV2ErrorResponseFrame" }
+      ]
+    }
+  }
+}

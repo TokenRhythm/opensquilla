@@ -1,4 +1,7 @@
 {
+  "historyContent": {
+    "unavailable": "現在はプレビューのみ表示しています。全文は現在利用できません。"
+  },
   "processes": {
     "title": "バックグラウンドプロセス",
     "runningCount": "{count} 件実行中",
@@ -657,6 +660,7 @@
       },
       "setup": {
         "title": "Safe モードを設定", "description": "OpenSquilla は、分離アカウントとファイル・ネットワーク保護を設定するために、一度だけ管理者の承認を必要とします。", "descriptionWithDuration": "OpenSquilla は、分離アカウントと安全保護を設定するために、一度だけ管理者の承認を必要とします。初回設定には通常約 20～30 秒かかります。設定中は OpenSquilla を開いたままにしてください。",
+        "repairIdentityDescription": "保存されたサンドボックス認証情報は無効です。続行すると内部アカウントを修復します。他の OpenSquilla プロファイルでは Safe の再設定が必要になる場合があります。Windows のログインパスワードは変更されません。",
         "continue": "続ける", "configuring": "設定中…", "requestingApproval": "続行するには、Windows の確認画面で承認してください。", "configuringProtection": "OpenSquilla が Safe モードの設定を完了しています。アプリは開いたままにしてください。", "takingLonger": "初回設定には数分かかる場合があります。確認は自動的に実行されます。", "elapsed": "経過 {seconds} 秒", "cancelled": "設定をキャンセルしました。完全アクセスは変更されていません。いつでも再試行できます。",
         "failed": "Safe モードを設定できませんでした。完全アクセスは変更されていません。", "verificationFailed": "設定は完了しましたが、安全性の確認に失敗しました。完全アクセスは変更されていません。",
         "runInBackground": "バックグラウンドで設定", "readyToast": "Safe モードの準備ができました。", "failedToast": "Safe モードの設定を完了できませんでした。Safe モードから再試行してください。"
@@ -2872,6 +2876,7 @@
     },
     "jobs": {
       "errLoad": "スケジュールジョブの読み込みに失敗しました",
+      "waitingForCapacity": "利用可能な容量を待っています。自動的に再試行します。",
       "noUpcomingRuns": "予定された実行はありません",
       "toastPaused": "ジョブを一時停止しました",
       "toastResumed": "ジョブを再開しました",

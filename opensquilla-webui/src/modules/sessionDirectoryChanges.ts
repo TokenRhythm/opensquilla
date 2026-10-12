@@ -43,8 +43,8 @@ export interface SessionDirectoryChanges {
   /**
    * Ask the Gateway Adapter to bind the logical directory lease on the current
    * connection. The operation is idempotent and never recycles a shared
-   * transport. It resolves after the attempt, including unavailable/forbidden
-   * Gateways, so callers can keep their polling fallback.
+   * transport. Unsupported/forbidden subscriptions resolve for compatibility;
+   * temporary failures reject so the caller can retry while reading snapshots.
    */
   resume(): Promise<void>
   /** Release local listeners and the logical lease owned by this Module. */

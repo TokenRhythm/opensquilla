@@ -226,6 +226,9 @@ def _routing(snapshot: dict[str, Any]) -> dict[str, Any]:
     return nested if isinstance(nested, dict) else snapshot
 
 
+# Exercise routing against a fresh Gateway without competing with parallel
+# migration workloads for its existing startup deadline.
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_real_gateway_websocket_session_routing_contract(
     tmp_path: Path,

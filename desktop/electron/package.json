@@ -103,6 +103,11 @@
     "typescript": "7.0.2",
     "ws": "^8.22.0"
   },
+  "overrides": {
+    "@electron/get@^3.0.0": {
+      "global-agent": "^4.1.3"
+    }
+  },
   "build": {
     "appId": "ai.opensquilla.desktop",
     "productName": "OpenSquilla",

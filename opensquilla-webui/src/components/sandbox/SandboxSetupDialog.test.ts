@@ -8,7 +8,7 @@ import SandboxSetupDialog from './SandboxSetupDialog.vue'
 
 let unmount: (() => void) | null = null
 
-function mountDialog(pending = false, outcome = 'idle', onBackground = vi.fn()) {
+function mountDialog(pending = false, outcome = 'idle', onBackground = vi.fn(), repairIdentity = false) {
   const host = document.createElement('div')
   document.body.appendChild(host)
   const app = createApp(SandboxSetupDialog, {
@@ -16,6 +16,7 @@ function mountDialog(pending = false, outcome = 'idle', onBackground = vi.fn()) 
     pending,
     outcome,
     onBackground,
+    repairIdentity,
   })
   app.use(createI18n({
     legacy: false,
@@ -29,6 +30,7 @@ function mountDialog(pending = false, outcome = 'idle', onBackground = vi.fn()) 
             setup: {
               title: 'Set up Safe mode',
               descriptionWithDuration: 'Administrator approval is required. First-time setup normally takes about 20–30 seconds. Keep OpenSquilla open.',
+              repairIdentityDescription: 'Repair the internal account. Other profiles may need setup again. Your Windows password will not change.',
               continue: 'Start setup',
               configuring: 'Configuring…',
               runInBackground: 'Run in background',
@@ -58,6 +60,15 @@ afterEach(() => {
 })
 
 describe('SandboxSetupDialog', () => {
+  it('requires a visible second confirmation before repairing an invalid identity', () => {
+    const body = mountDialog(false, 'failed', vi.fn(), true)
+    expect(body.textContent).toContain('Other profiles may need setup again')
+    expect(body.textContent).toContain('Your Windows password will not change')
+    expect(body.querySelector<HTMLButtonElement>('[data-testid="sandbox-setup-continue"]')?.disabled)
+      .toBe(false)
+    expect(body.textContent).toContain('Cancel')
+  })
+
   it('explains administrator approval and the measured duration before confirmation', () => {
     const body = mountDialog()
 
