@@ -1017,6 +1017,10 @@ export class NativeWorkbenchSurfaceManager {
     let interruptedNavigation: DesktopBrowserError | undefined
 
     try {
+      if (record.kind === 'url-preview' && !this.v2TopLevelNavigationAllowed(record, record.documentUrl)) {
+        this.reportPrivilegedGatewayBlock(record, record.documentUrl)
+        throw new DesktopBrowserError('NAVIGATION_BLOCKED', 'This URL is unavailable inside isolated previews.', 403)
+      }
       if (request.kind === 'artifact-html') {
         await this.configureLegacySession(
           record,
@@ -1053,18 +1057,17 @@ export class NativeWorkbenchSurfaceManager {
       owner.contentView.addChildView(record.view)
       this.emit(record, 'loading')
       try {
-        if (record.kind === 'url-preview'
-          && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4) {
-          await this.loadBrowserDocument(record, record.documentUrl, undefined, signal)
+        if (record.kind === 'url-preview') {
+          // Versions 2 and 3 acknowledge creation after initial navigation settles.
+          await this.loadBrowserDocument(record, record.documentUrl, undefined, signal, false, false,
+            record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4)
         } else {
           await record.contents.loadURL(record.documentUrl)
         }
       } catch (error) {
         // Browser targets retain their identity and recovery controls after a
-        // failed navigation. Earlier preview protocols keep terminal failure semantics.
-        if (record.kind !== 'url-preview'
-          || record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-          || record.disposed) throw error
+        // failed navigation, including tabs created by the version 2 Control UI.
+        if (record.kind !== 'url-preview' || record.disposed) throw error
         if (error instanceof DesktopBrowserError && ['PAGE_CHANGED', 'TIMEOUT'].includes(error.code)) {
           interruptedNavigation = error
         } else if (!record.browserNavigationError) throw error
@@ -1140,7 +1143,8 @@ export class NativeWorkbenchSurfaceManager {
   }
 
   private async loadBrowserDocument(record: NativeWorkbenchSurfaceRecord, url: string,
-    options?: Electron.LoadURLOptions, signal?: AbortSignal, reload = false, ignoreCache = false): Promise<void> {
+    options?: Electron.LoadURLOptions, signal?: AbortSignal, reload = false, ignoreCache = false,
+    returnOnBlocker = true): Promise<void> {
     if (signal?.aborted) {
       throw new DesktopBrowserError('TIMEOUT', 'Browser navigation was cancelled before loading.', 409,
         { targetRef: record.targetRef, outcome: 'not_started', retryable: false, recovery: 'inspect' })
@@ -1232,8 +1236,9 @@ export class NativeWorkbenchSurfaceManager {
     void navigation.catch(() => undefined)
     const listener = new AbortController()
     try {
-      await Promise.race([navigation, this.waitForBrowserHostBlocker(record, listener.signal),
-        ...(record.playwright ? [record.playwright.waitForPendingDialog(listener.signal).then(dialog =>
+      await Promise.race([navigation,
+        ...(returnOnBlocker ? [this.waitForBrowserHostBlocker(record, listener.signal)] : []),
+        ...(returnOnBlocker && record.playwright ? [record.playwright.waitForPendingDialog(listener.signal).then(dialog =>
           dialog.type === 'beforeunload' ? navigation : undefined)] : [])])
       if (owner.cancelled) throw userCancelled()
     } finally { listener.abort() }

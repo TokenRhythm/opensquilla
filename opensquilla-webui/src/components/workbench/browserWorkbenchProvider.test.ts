@@ -491,7 +491,7 @@ describe('browser Workbench provider', () => {
     expect(harness.renderState.errorMessage).toBe('Target unavailable.')
   })
 
-  it('keeps a failed initial navigation available for retry in the same surface', async () => {
+  it.each(['reload', 'navigate'])('keeps a failed initial navigation available for %s in the same surface', async action => {
     const api = nativeApi({
       createSurface: vi.fn(async () => ({ ok: true, navigationError })),
       navigateSurface: vi.fn(successfulResult),
@@ -500,8 +500,15 @@ describe('browser Workbench provider', () => {
     expect(harness.renderState).toMatchObject({ errorMessage: navigationError.message,
       currentUrl: navigationError.url, loading: false })
     expect(api.destroySurface).not.toHaveBeenCalled()
-    await harness.runtime.handleComponentEvent?.({ type: 'browser-action', payload: { action: 'reload' } }, harness.item)
-    expect(api.navigateSurface).toHaveBeenCalledWith(expect.objectContaining({ surfaceId: harness.item.id, action: 'reload' }))
+    const payload = { action, ...(action === 'navigate' ? { url: 'https://example.test/recovered' } : {}) }
+    await harness.runtime.handleComponentEvent?.({ type: 'browser-action', payload }, harness.item)
+    expect(api.navigateSurface).toHaveBeenLastCalledWith({ version: 2, surfaceId: harness.item.id,
+      ...payload })
+    await harness.runtime.handleNativeSurfaceEvent?.({ version: 2, surfaceId: harness.item.id,
+      type: 'navigation-state', detail: { url: 'https://example.test/recovered', loading: false,
+        navigationError: null } }, harness.item)
+    expect(harness.renderState).toMatchObject({ errorMessage: '', loading: false,
+      currentUrl: 'https://example.test/recovered' })
     expect(api.createSurface).toHaveBeenCalledOnce()
     expect(api.destroySurface).not.toHaveBeenCalled()
   })

@@ -81,6 +81,10 @@ if (!process.versions.electron) {
     const events = []
     const wave = waveFixture()
     const web = createServer((request, response) => {
+      if (request.url === '/disconnect') {
+        request.socket.destroy()
+        return
+      }
       if (request.url === '/image.svg') {
         response.writeHead(200, { 'content-type': 'image/svg+xml' })
         response.end('<svg xmlns="http://www.w3.org/2000/svg" width="32" height="16"><rect width="32" height="16" fill="teal"/></svg>')
@@ -207,7 +211,7 @@ if (!process.versions.electron) {
         webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } })
       await owner.loadURL('data:text/html,<title>Browser foundation host</title>')
       manager = new NativeWorkbenchSurfaceManager({ getWindow: () => owner,
-        emit: event => events.push(event) })
+        emit: event => events.push(event), getPrivilegedGatewayUrl: () => 'http://127.0.0.1:1' })
       const call = request => manager.executeBrowserMcp({ sessionKey: 'synthetic-task',
         observationMode: 'dom', ...request }, AbortSignal.timeout(20_000))
       const record = target => [...manager.surfaces.values()].find(value => value.targetRef === target.targetRef)
@@ -221,6 +225,56 @@ if (!process.versions.electron) {
         const observed = await call({ operation: 'observe', targetRef: target.targetRef })
         return await call({ operation: 'act', targetRef: target.targetRef,
           action: 'click', ref: refNamed(observed, name) })
+      }
+
+      for (const version of [2, 3, 4]) {
+        for (const [index, url] of ['file:///synthetic-unavailable', 'http://localhost:1/control'].entries()) {
+          const blockedId = `synthetic-blocked-initial-v${version}-${index}`
+          const blocked = await manager.createSurface({ version, surfaceId: blockedId, kind: 'url-preview',
+            payload: { url, scopeId: 'synthetic-task' } })
+          assert.equal(blocked.ok, false, 'Policy rejection must not create a recoverable document')
+          assert.equal(manager.surfaces.has(blockedId), false)
+          if (index === 1) assert.ok(events.some(event => event.surfaceId === blockedId
+            && event.type === 'blocked-action' && event.detail?.reason === 'privileged-origin-isolated'))
+        }
+        const surfaceId = `synthetic-initial-failure-v${version}`
+        const failedUrl = origin + '/disconnect'
+        const failed = await manager.createSurface({ version, surfaceId, kind: 'url-preview',
+          payload: { url: failedUrl, scopeId: 'synthetic-task' } })
+        assert.equal(failed.ok, true, 'A failed initial browser navigation must retain its tab')
+        assert.equal(failed.navigationError?.url, failedUrl)
+        assert.match(failed.navigationError?.code ?? '', /^ERR_/)
+        const retained = manager.surfaces.get(surfaceId)
+        assert.ok(retained)
+        const targetRef = retained.targetRef
+        const previewSession = retained.previewSession
+        const navigationError = retained.browserNavigationError
+        assert.equal(retained.browserDocumentReady, false)
+        for (const url of ['file:///synthetic-unavailable', 'http://localhost:1/control']) {
+          const denied = await manager.navigateSurface({ version, surfaceId, action: 'navigate', url })
+          assert.equal(denied.code, 'NAVIGATION_BLOCKED')
+          assert.equal(manager.surfaces.get(surfaceId), retained)
+          assert.equal(retained.browserNavigationError, navigationError,
+            'A blocked address must preserve the current failure and recovery target')
+        }
+        await assert.rejects(manager.executeBrowserMcp({ sessionKey: 'synthetic-foreign-task',
+          operation: 'open', targetRef, url: origin + '/login' }, AbortSignal.timeout(5000)),
+        error => error.code === 'TARGET_NOT_FOUND')
+        const foreignId = `synthetic-foreign-context-v${version}`
+        await assert.rejects(manager.createSurface({ version: 2, surfaceId: foreignId,
+          kind: 'url-preview', payload: { url: origin + '/login', scopeId: 'synthetic-foreign-task',
+            contextTargetRef: targetRef } }), error => error.code === 'TARGET_NOT_FOUND')
+        assert.equal(manager.surfaces.has(foreignId), false)
+        const recovered = await manager.navigateSurface({ version, surfaceId, action: 'navigate',
+          url: origin + '/login' })
+        assert.equal(recovered.ok, true, recovered.message)
+        assert.equal(manager.surfaces.get(surfaceId), retained)
+        assert.equal(retained.targetRef, targetRef)
+        assert.equal(retained.previewSession, previewSession)
+        assert.equal(retained.browserDocumentReady, true)
+        assert.equal(retained.browserNavigationError, undefined)
+        assert.equal(retained.contents.getURL(), origin + '/login')
+        await manager.destroySurface(surfaceId, true)
       }
 
       const parent = await call({ operation: 'open', url: origin + '/login' })
