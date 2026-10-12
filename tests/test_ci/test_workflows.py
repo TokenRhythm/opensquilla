@@ -2574,9 +2574,7 @@ def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
     assert checkout["with"]["lfs"] is True
     setup_node = next(step for step in steps if step.get("name") == "Set up Node.js")
     assert setup_node["uses"] == "actions/setup-node@v4"
-    assert setup_node["with"] == {
-        "node-version-file": "opensquilla-webui/.node-version"
-    }
+    assert setup_node["with"] == {"node-version": "22.23.3"}
     assert "if" not in setup_node
     versions = next(step for step in steps if step.get("name") == "Record tool versions")
     assert steps.index(checkout) < steps.index(setup_node) < steps.index(versions)

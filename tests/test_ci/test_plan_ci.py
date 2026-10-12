@@ -1482,7 +1482,6 @@ def test_python_dependency_changes_select_reviewed_full_ecosystem_coverage(
 @pytest.mark.parametrize(
     "path",
     [
-        "opensquilla-webui/package.json",
         "opensquilla-webui/package-lock.json",
         "opensquilla-webui/packages/editor/package.json",
     ],
@@ -1506,34 +1505,6 @@ def test_webui_dependency_changes_stay_in_webui_ecosystem(
     assert plan["desktop_matrix"] == []
     assert plan["python_matrix"] == {"ubuntu": [], "windows": []}
     assert plan["reason_codes"] == ["webui_dependency_changed"]
-
-
-def test_shared_node_version_change_selects_every_windows_native_shard(
-    tmp_path: Path, suite_config: dict[str, Any],
-) -> None:
-    plan = _plan(tmp_path, suite_config, "opensquilla-webui/.node-version")
-
-    assert plan["full_fallback"] is False
-    assert set(plan["required_suites"]) == {
-        "dependency-audit",
-        "frontend-artifact",
-        "frontend-validation",
-        "readme-locale",
-        "webui-chat-recovery",
-        "wheel-webui-roundtrip",
-        "windows-high-risk",
-        "windows-nsis-regression",
-        "workflow-lint",
-    }
-    assert plan["desktop_matrix"] == []
-    assert plan["python_matrix"] == {
-        "ubuntu": [],
-        "windows": suite_config["full_python_matrix"]["windows"],
-    }
-    assert _platform_cells(plan, "windows-high-risk") == {
-        ("windows-latest", shard)
-        for shard in suite_config["full_python_matrix"]["windows"]
-    }
 
 
 @pytest.mark.parametrize(
