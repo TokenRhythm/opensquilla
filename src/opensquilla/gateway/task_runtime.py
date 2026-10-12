@@ -4984,6 +4984,34 @@ class TaskRuntime:
                 promote_pending_steers=True,
             )
         except Exception as exc:  # noqa: BLE001 - runtime ledger records the class.
+            from opensquilla.session.storage import (
+                ActivationPermitConflictError,
+                ActivationPermitConflictReason,
+            )
+
+            if (
+                isinstance(exc, ActivationPermitConflictError)
+                and exc.reason
+                == ActivationPermitConflictReason.SESSION_RESET_INVALIDATED
+            ):
+                async with self._state_lock:
+                    if task.cancel_source is None:
+                        task.cancel_source = "sessions_reset"
+                    if task.cancel_reason is None:
+                        task.cancel_reason = "session_reset"
+                _emit_metric(
+                    "turn_cancellations_total",
+                    value=1,
+                    reason="interrupt",
+                    session_key=task.envelope.session_key,
+                )
+                await self._mark_terminal(
+                    task,
+                    AgentTaskStatus.CANCELLED,
+                    terminal_reason="cancelled",
+                    no_prior_provider_dispatch=True,
+                )
+                return
             terminal_reason = str(getattr(exc, "terminal_reason", None) or "error")
             failure_kind = str(getattr(exc, "failure_kind", None) or "") or None
             status = (
@@ -7882,6 +7910,7 @@ class TaskRuntime:
             }
             details["cancellation"] = cancellation
         details.pop("cancellation_requested", None)
+        details.pop("activation_invalidation", None)
         if status == AgentTaskStatus.SUCCEEDED:
             turn_outcome = completed_outcome().to_dict()
             details["turn_outcome"] = turn_outcome
@@ -8057,7 +8086,7 @@ class TaskRuntime:
         if not callable(getattr(type(self._storage), "settle_agent_task", None)):
             await self._storage.update_agent_task(task_id, **update)
         else:
-            remove_keys = ["cancellation_requested"]
+            remove_keys = ["cancellation_requested", "activation_invalidation"]
             if "applied_steer_evidence" not in details:
                 remove_keys.append("applied_steer_evidence")
             settle_with_receipt = getattr(
