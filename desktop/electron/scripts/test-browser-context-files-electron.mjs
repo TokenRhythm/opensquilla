@@ -72,6 +72,12 @@ if (!process.versions.electron) {
     const pdfBytes = pdfFixture()
     const pdfRequests = []
     const web = createServer((request, response) => {
+      if (request.url === '/login') {
+        response.writeHead(302, { location: '/',
+          'set-cookie': 'synthetic-pdf-auth=granted; HttpOnly; SameSite=Lax; Path=/' })
+        response.end()
+        return
+      }
       const authenticated = String(request.headers.cookie ?? '').split(';')
         .some(cookie => cookie.trim() === 'synthetic-pdf-auth=granted')
       if (request.url?.startsWith('/pdf/') || request.url === '/asset.pdf') {
@@ -235,6 +241,15 @@ if (!process.versions.electron) {
       assert.equal(saveOptions.title, 'Save preview download', 'Ordinary downloads retain the native confirmation path')
 
       userDownloadDirectory = await mkdtemp(join(tmpdir(), 'opensquilla-native-user-download-'))
+      const loginLoaded = new Promise(resolve => record(shared).contents.once('did-finish-load', resolve))
+      await call({ operation: 'open', targetRef: shared.targetRef, url: origin + '/login' })
+      await loginLoaded
+      await record(shared).browserViewportReady
+      assert.equal(record(shared).contents.getURL(), origin + '/')
+      assert.equal(record(shared).browserDocumentReady, true,
+        JSON.stringify({ documentUrl: record(shared).documentUrl, error: record(shared).browserNavigationError,
+          generation: record(shared).annotationDocumentGeneration }))
+      assert.equal(record(shared).documentUrl, origin + '/', 'A committed login redirect records its landing URL')
       const userDownloadPath = join(userDownloadDirectory, 'synthetic-note.txt')
       const userSaved = new Promise((resolve, reject) => {
         record(shared).previewSession.once('will-download', (_event, item) => {
@@ -248,7 +263,10 @@ if (!process.versions.electron) {
       await userSaved
       assert.equal(await readFile(userDownloadPath, 'utf8'), text)
       assert.equal(record(shared).contents.getURL(), origin + '/')
-      assert.equal(record(shared).browserDocumentReady, true, 'A user attachment download retains the live page')
+      assert.equal(record(shared).browserDocumentReady, true,
+        JSON.stringify({ message: 'A user attachment after a login redirect retains the live page',
+          documentUrl: record(shared).documentUrl, previous: record(shared).browserPreviousDocument,
+          navigation: record(shared).browserDownloadNavigation, url: record(shared).contents.getURL() }))
       nativeObserved = await call({ operation: 'observe', targetRef: shared.targetRef })
       assert.ok(nativeObserved.observation.refs.some(value => value.name === 'Download sample'))
       trace('ordinary attachment navigation retains document readiness')
@@ -336,6 +354,42 @@ if (!process.versions.electron) {
       assert.equal(sharedRecord.browserDownloadNavigation, undefined)
       await call({ operation: 'open', targetRef: shared.targetRef, url: origin })
       for (const sibling of [htmlSibling, pdfSibling, secondPdfSibling]) await manager.destroySurface(record(sibling).id, true)
+
+      const uiSourceId = 'synthetic-ui-redirect-source'
+      assert.equal((await manager.createSurface({ version: 2, surfaceId: uiSourceId, kind: 'url-preview',
+        payload: { url: origin + '/login', scopeId: 'synthetic-ui-task' } })).ok, true)
+      const uiSource = manager.surfaces.get(uiSourceId)
+      assert.equal(uiSource.documentUrl, origin + '/')
+      assert.equal(uiSource.contents.mainFrame.url, origin + '/')
+      assert.equal((await uiSource.previewSession.cookies.get({ name: 'synthetic-pdf-auth' }))[0].httpOnly, true)
+      const uiCall = request => manager.executeBrowserMcp({ sessionKey: 'synthetic-ui-task',
+        observationMode: 'dom', ...request }, AbortSignal.timeout(15_000))
+      const uiRelated = await uiCall({ operation: 'open', url: origin, contextTargetRef: uiSource.targetRef })
+      const uiPdf = await uiCall({ operation: 'open', url: origin + '/pdf/ui-related-paper', contextTargetRef: uiRelated.targetRef })
+      manager.setSurfaceRect({ surfaceId: uiSource.id, x: 0, y: 0, width: 850, height: 650, visible: true })
+      const backgroundAfterClick = () => manager.setSurfaceRect({ surfaceId: record(uiPdf).id,
+        x: 0, y: 0, width: 850, height: 650, visible: true })
+      uiSource.contents.once('did-start-navigation', backgroundAfterClick)
+      const uiSaved = new Promise((resolve, reject) => {
+        uiSource.previewSession.once('will-download', (_event, item) => {
+          item.setSavePath(join(userDownloadDirectory, 'ui-login-redirect.pdf'))
+          item.once('done', (_event, state) => state === 'completed' ? resolve() : reject(new Error(state)))
+        })
+      })
+      void uiSaved.catch(() => undefined)
+      const uiObserved = await uiCall({ operation: 'observe', targetRef: uiSource.targetRef })
+      await uiCall({ operation: 'act', targetRef: uiSource.targetRef, action: 'click',
+        ref: uiObserved.observation.refs.find(value => value.name === 'Native PDF attachment navigation').ref })
+      await uiSaved
+      assert.deepEqual(await readFile(join(userDownloadDirectory, 'ui-login-redirect.pdf')), pdfBytes)
+      assert.equal(manager.activeSurfaceId, record(uiPdf).id, 'Switching to the related PDF keeps the source in the background')
+      assert.equal(uiSource.browserDocumentReady, true, 'The UI-created source stays ready after its background download')
+      const uiTabs = await uiCall({ operation: 'list' })
+      assert.equal(uiTabs.targets.find(target => target.targetRef === uiSource.targetRef).pageState, 'ready')
+      await uiCall({ operation: 'snapshot', targetRef: uiSource.targetRef })
+      const uiAfter = await uiCall({ operation: 'observe', targetRef: uiSource.targetRef })
+      assert.ok(uiAfter.observation.refs.some(value => value.name === 'Native PDF attachment navigation'))
+      for (const surface of [uiSource, record(uiRelated), record(uiPdf)]) await manager.destroySurface(surface.id, true)
 
       let observed = await call({ operation: 'observe', targetRef: shared.targetRef })
       let ref = observed.observation.refs.find(value => value.name === 'Download sample').ref

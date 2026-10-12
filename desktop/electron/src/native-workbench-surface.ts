@@ -1150,7 +1150,8 @@ export class NativeWorkbenchSurfaceManager {
     const isCurrent = () => !record.disposed && !record.crashed
       && !record.contents.isDestroyed() && record.browserNavigationGeneration === generation
     if (record.kind === 'url-preview') {
-      record.browserPreviousDocument = { url: record.documentUrl, ready: record.browserDocumentReady,
+      record.browserPreviousDocument = { url: record.contents.mainFrame.url || record.contents.getURL() || record.documentUrl,
+        ready: record.browserDocumentReady,
         stopped: record.browserNavigationStopped, error: record.browserNavigationError }
       record.browserNavigationError = undefined
     }
@@ -5014,7 +5015,8 @@ export class NativeWorkbenchSurfaceManager {
           record.revisionInteracted = false
           const navigation = record.browserNavigationOwner
           if (!navigation || navigation.started || navigation.url !== _targetUrl) {
-            record.browserPreviousDocument = { url: record.documentUrl, ready: record.browserDocumentReady,
+            record.browserPreviousDocument = { url: contents.mainFrame.url || contents.getURL() || record.documentUrl,
+              ready: record.browserDocumentReady,
               stopped: record.browserNavigationStopped, error: record.browserNavigationError }
           }
           if (navigation && !navigation.started && navigation.url === _targetUrl) {
@@ -5052,6 +5054,14 @@ export class NativeWorkbenchSurfaceManager {
           record.initialDocumentCommitted = true
         }
         if (isMainFrame && record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION) {
+          const committed = record.kind === 'url-preview' && this.httpUrl(targetUrl)
+          if (committed && this.v2TopLevelNavigationAllowed(record, committed.href)) {
+            // A redirect commits a different URL from did-start-navigation's
+            // request. Future retained-document snapshots must describe the
+            // loaded page, including authenticated login redirect landings.
+            record.documentUrl = committed.href
+            record.initialDocumentCommitted = true
+          }
           record.browserPreviousDocument = undefined
           record.browserDownloadNavigation = undefined
           this.rejectPendingPermissions(record)
