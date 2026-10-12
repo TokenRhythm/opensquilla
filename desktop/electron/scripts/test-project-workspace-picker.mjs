@@ -32,6 +32,15 @@ assert.match(
   /ipcMain\.handle\('desktop:workspace:choose-directory',\s*async\s*\(event,\s*payload:\s*unknown\)/,
 )
 assert.match(workspaceHandler, /trustedControlUiIpc\(event\)/)
+assert.match(workspaceHandler, /const window = currentMainWindow\(\)/)
+assert.match(workspaceHandler, /if \(!window\) return null/)
+assert.match(
+  workspaceHandler,
+  /if \(process\.platform === 'darwin'\) app\.focus\(\{ steal: true \}\)/,
+)
+assert.match(workspaceHandler, /if \(window\.isMinimized\(\)\) window\.restore\(\)/)
+assert.match(workspaceHandler, /window\.show\(\)/)
+assert.match(workspaceHandler, /window\.focus\(\)/)
 assert.match(workspaceHandler, /projectDirectoryDialogOptions\(process\.platform,\s*payload\)/)
 assert.doesNotMatch(workspaceHandler, /title:\s*['"]Choose a project['"]/)
 assert.match(workspaceHandler, /choice\.canceled[\s\S]*return null/)
