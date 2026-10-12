@@ -65,7 +65,7 @@ async function openHistory(
     })
   })
   await page.goto('/control/chat?session=' + encodeURIComponent(SESSION))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
 }
 
 test('ordinary assistant history hydrates automatically and offers local retry after failure', async ({ page }) => {

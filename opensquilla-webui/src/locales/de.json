@@ -512,7 +512,7 @@
       "title": "Oberfläche",
       "desc": "Design und lokale Oberflächeneinstellungen für diesen Browser. Voreinstellungen werden sofort übernommen; eine benutzerdefinierte Breite wird mit Anwenden bestätigt.",
       "themeLabel": "Design",
-      "themeDesc": "Dem System folgen oder hell bzw. dunkel erzwingen. Der Schalter in der Seitenleiste ist eine Verknüpfung zu dieser Einstellung.",
+      "themeDesc": "Wählen Sie ein Design für die Oberfläche oder folgen Sie dem System, um automatisch zwischen Hell und Dunkel zu wechseln.",
       "languageLabel": "Sprache",
       "languageDesc": "Anzeigesprache der Oberfläche und der Systemhinweise in Kanälen. Sie gilt hier sofort und speichert die Hinweis-Sprache gatewayweit.",
       "channelNoticeLocaleSyncPending": "Die Oberflächensprache wurde geändert, aber die Sprache der Kanal-Systemhinweise ist noch nicht gespeichert. Beim erneuten Verbinden mit dem Gateway wird es erneut versucht.",

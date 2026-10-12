@@ -362,7 +362,7 @@ for (const width of [1280, 390]) {
     await page.setViewportSize({ width, height: 900 })
     const gateway = await installFakeGoalGateway(page, { goalRemoval: true })
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     const composer = page.locator('.chat-textarea')
     await expect(composer).toBeEditable()
     await page.getByRole('button', { name: 'Add', exact: true }).click()
@@ -429,7 +429,7 @@ test('Goal pause reasons remain visible after refresh', { tag: '@plan-goal-runti
 test('Goal mode renders mocked continuation snapshots without correctness polling', async ({ page }) => {
   const gateway = await installFakeGoalGateway(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
   const composer = page.locator('.chat-textarea')
   await expect(composer).toBeEditable({ timeout: 10_000 })
 
@@ -610,7 +610,7 @@ for (const placement of ['tail fallback', 'inline assistant outcome'] as const) 
     ] : []
     const gateway = await installFakeGoalGateway(page, { goalRemoval: true, history })
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
     if (inline) {
       await expect(page.locator('.msg-ai').filter({ hasText: GOAL_TERMINAL_REPLY }))
@@ -697,7 +697,7 @@ for (const placement of ['tail fallback', 'inline assistant outcome'] as const) 
     // A fresh hydration must not revive the completed Goal or remove history.
     const hydrateCount = gateway.methods.filter(method => method === 'sessions.messages.hydrate').length
     await page.reload()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect.poll(() => gateway.methods.filter(method => method === 'sessions.messages.hydrate').length)
       .toBeGreaterThan(hydrateCount)
     await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
@@ -714,7 +714,7 @@ for (const placement of ['tail fallback', 'inline assistant outcome'] as const) 
 test('Completed Goal removal confirmation cannot clear a replacement Goal', { tag: '@plan-goal-runtime' }, async ({ page }) => {
   const gateway = await installFakeGoalGateway(page, { goalRemoval: true })
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
   await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
   gateway.emitGoal(goalSnapshot({
     status: 'complete',
@@ -748,7 +748,7 @@ test('Composer Add menu stays above active Goal progress across responsive layou
   await page.emulateMedia({ colorScheme: 'dark', reducedMotion: 'no-preference' })
   const gateway = await installFakeGoalGateway(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
   await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
 
   gateway.emitGoal(goalSnapshot({
@@ -802,7 +802,7 @@ test('Composer Add menu stays above active Goal progress across responsive layou
     localStorage.setItem('opensquilla.composerFx', JSON.stringify({ enabled: false }))
   })
   await page.reload()
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
   await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
   await expect(page.locator('.chat')).not.toHaveClass(/chat--composer-floating/)
 
@@ -836,7 +836,7 @@ test('Composer Add menu stays above active Goal progress across responsive layou
 test('Session model routing stays above active Goal progress across responsive layouts', async ({ page }) => {
   const gateway = await installFakeGoalGateway(page, { sessionRouting: true })
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
   await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
 
   gateway.emitGoal(goalSnapshot({
@@ -936,7 +936,7 @@ test('Goal mode continues through a real Gateway, refresh, and deterministic pro
     await installStableHttpStubs(page)
 
     await page.goto(CONTROL_URL + 'chat')
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 15_000 })
     expectNegotiatedGoalFlow(rpcFrames, gateway.flowEnabled)
     const composer = page.locator('.chat-textarea')
     await expect(composer).toBeEditable({ timeout: 15_000 })
@@ -1067,7 +1067,7 @@ test('Goal mode continues through a real Gateway, refresh, and deterministic pro
     const reattachCountBeforeReload = sentRpcMethods
       .filter(method => method === 'goals.reattach').length
     await page.reload()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 15_000 })
     await expect.poll(
       () => sentRpcMethods.filter(method => method === 'goals.reattach').length,
       { timeout: 15_000 },
@@ -1215,7 +1215,7 @@ test('Goal lifecycle controls preserve the current Task and serialize later cont
     await installStableHttpStubs(page)
 
     await page.goto(CONTROL_URL + 'chat')
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 15_000 })
     expectNegotiatedGoalFlow(rpcFrames, gateway.flowEnabled)
     const composer = page.locator('.chat-textarea')
     await expect(composer).toBeEditable({ timeout: 15_000 })
@@ -1324,7 +1324,7 @@ test('Goal lifecycle controls preserve the current Task and serialize later cont
     // tracking or enqueue a third turn.
     const hydrateCountBeforeReload = sentRequests('sessions.messages.hydrate').length
     await page.reload()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 15_000 })
     const hydratePayload = await waitForRpcPayload(
       'sessions.messages.hydrate',
       hydrateCountBeforeReload + 1,
@@ -1461,7 +1461,7 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
     }
 
     await page.goto(`${isolatedRealGateway.controlUrl}chat/new`)
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 15_000 })
     expectNegotiatedGoalFlow(frames, isolatedRealGateway.flowEnabled)
     expect(socketUrls).toContain(
       isolatedRealGateway.webuiOrigin.replace(/^http:/, 'ws:') + '/ws',
@@ -1582,7 +1582,7 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
     const historyCountBeforeReload = sentRequests('sessions.history.page.v2').length
     const socketCountBeforeReload = socketUrls.length
     await page.reload()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 15_000 })
     await expect.poll(() => socketUrls.length, { timeout: 15_000 })
       .toBeGreaterThan(socketCountBeforeReload)
     await expect.poll(
@@ -1687,7 +1687,7 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
     const finalHistoryCount = sentRequests('sessions.history.page.v2').length
     const finalSocketCount = socketUrls.length
     await page.reload()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 15_000 })
     await expect.poll(() => socketUrls.length, { timeout: 15_000 })
       .toBeGreaterThan(finalSocketCount)
     await expect.poll(() => sentRequests('sessions.messages.hydrate').length, {

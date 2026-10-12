@@ -108,7 +108,7 @@
       @search="openCommandPalette"
     />
 
-    <!-- Fixed footer: settings + connection state -->
+    <!-- Fixed footer: settings and the desktop update entry -->
     <div class="sidebar-foot">
       <button
         type="button"
@@ -119,6 +119,7 @@
         <Icon name="settings" :size="16" />
         <span class="sidebar-fn-label">{{ t('chrome.settings') }}</span>
       </button>
+      <SidebarDesktopUpdate @open="openDesktopUpdateSettings" />
     </div>
   </nav>
 
@@ -172,14 +173,14 @@
       'main--tabbar-hidden': mobileKeyboardOpen,
     }"
   >
-    <header ref="topbarRef" class="topbar" :class="{ 'topbar--chat': isChatRoute }">
+    <header ref="topbarRef" class="topbar" :class="{ 'topbar--chat': isChatRoute }" :data-connection-state="effectiveConnectionState">
       <div class="topbar-left">
         <!-- Sidebar toggle — visible when sidebar is collapsed -->
         <button
           v-show="!appStore.sidebarOpen"
           ref="topbarSidebarToggleRef"
           class="sidebar-dock-toggle topbar-toggle"
-          :aria-label="t('chrome.expandSidebar')"
+          :aria-label="sidebarExpandLabel"
           aria-controls="sidebar-nav"
           :aria-expanded="appStore.sidebarOpen"
           :aria-keyshortcuts="sidebarToggleAriaShortcut"
@@ -188,6 +189,13 @@
           @click="toggleDock('topbar-button')"
         >
           <Icon name="sidebar-hidden" :size="18" />
+          <span
+            v-if="desktopUpdate.visible.value"
+            class="sidebar-update-dot"
+            :data-state="desktopUpdateSeverity"
+            data-testid="sidebar-update-dot"
+            aria-hidden="true"
+          ></span>
           <span id="sidebar-toggle-tip-collapsed" class="sidebar-toggle-tip" role="tooltip">
             <span>{{ t('chrome.toggleSidebar') }}</span>
             <kbd v-if="sidebarToggleHint">{{ sidebarToggleHint }}</kbd>
@@ -220,12 +228,8 @@
           @copy-gateway-link="chatRouteHeader.invoke('copyGatewayLink')"
         />
       </div>
-      <div
-        class="topbar-right"
-        :class="{ 'topbar-right--attention': appStore.approvalCount > 0 }"
-      >
+      <div class="topbar-right">
         <ChatSystemStatus
-          v-if="isChatRoute"
           :layout="systemHeaderLayout"
           :connection-state="effectiveConnectionState"
           :connection-label="connectionStateLabel"
@@ -233,75 +237,7 @@
           :can-manage-connection="webConfigEnabled"
           @open-connection="openConnectionSettings"
           @open-approval="openBlockedApprovalSession"
-          @open-update="openDesktopUpdateSettings"
         />
-        <template v-else>
-          <button
-            v-if="appStore.approvalCount > 0"
-            class="approval-inline"
-            @click="openBlockedApprovalSession"
-            :title="t('chrome.openBlockedSession')"
-          >
-            {{ t('chrome.approvalRequired') }}
-          </button>
-          <button
-            v-if="webConfigEnabled"
-            type="button"
-            class="conn-pill conn-pill--link"
-            :class="connectionState"
-            :title="t('chrome.connectionTitle', { state: connectionStateLabel })"
-            :aria-label="t('chrome.manageConnection')"
-            @click="openConnectionSettings"
-          >{{ connectionStateLabel }}</button>
-          <span v-else class="conn-pill" :class="connectionState">{{ connectionStateLabel }}</span>
-          <DesktopUpdateIndicator />
-        </template>
-        <LanguageSwitcher />
-        <div class="theme-menu-wrap">
-          <button
-            ref="themeButtonRef"
-            class="btn btn--icon btn--ghost"
-            :title="t('chrome.theme')"
-            :aria-label="t('chrome.theme')"
-            aria-haspopup="menu"
-            :aria-expanded="themeMenuOpen"
-            @click.stop="themeMenuOpen = !themeMenuOpen"
-          >
-            <Icon :name="themeIconName" :size="16" />
-          </button>
-          <div
-            v-if="themeMenuOpen"
-            class="theme-menu"
-            role="menu"
-            :aria-label="t('chrome.theme')"
-            data-chat-topbar-popover="theme"
-          >
-            <button
-              v-for="opt in themeOptions"
-              :key="opt.mode"
-              type="button"
-              class="theme-menu__item"
-              role="menuitemradio"
-              :aria-checked="appStore.theme === opt.mode"
-              @click="pickTheme(opt.mode)"
-            >
-              <Icon :name="opt.icon" :size="15" />
-              <span>{{ opt.labelKey ? t(opt.labelKey) : opt.label }}</span>
-              <Icon v-if="appStore.theme === opt.mode" class="theme-menu__check" name="check" :size="14" />
-            </button>
-            <button
-              type="button"
-              class="theme-menu__item theme-menu__item--more"
-              role="menuitem"
-              :title="t('chrome.moreThemesHint')"
-              @click="openMoreThemes"
-            >
-              <Icon name="chevronRight" :size="15" />
-              <span>{{ t('chrome.moreThemes') }}</span>
-              <Icon v-if="isCustomThemeActive" class="theme-menu__check" name="check" :size="14" />
-            </button>
-          </div>
-        </div>
         <WorkbenchToggle
           v-if="platform.capabilities.hasNativeWorkbenchSurfaces"
           :enabled="appStore.features.artifactWorkbench === true && isChatRoute"
@@ -450,7 +386,7 @@ import { SettingsBackgroundRoute, useSettingsRouteOverlay } from './router/setti
 import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
 import { getPlatform } from '@/platform'
-import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
+import { useAppStore, type PendingApproval } from './stores/app'
 import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
 import { PRODUCT_ACTIVITY_KEY } from './modules/productActivity'
 import { useProductActivity } from './composables/useProductActivity'
@@ -475,25 +411,24 @@ import ProjectWorkspaceCreateDialog from './components/ProjectWorkspaceCreateDia
 import ProjectWorkspaceEditDialog from './components/ProjectWorkspaceEditDialog.vue'
 import ProjectWorkspacePickerDialog from './components/ProjectWorkspacePickerDialog.vue'
 import UpdateBanner from './components/UpdateBanner.vue'
-import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
+import SidebarDesktopUpdate from './components/SidebarDesktopUpdate.vue'
 import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
 import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
-import LanguageSwitcher from './components/LanguageSwitcher.vue'
 import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import WorkbenchToggle from './components/workbench/WorkbenchToggle.vue'
 import { useWorkbenchStore } from './workbench/store'
 import { useDesktopUpdate } from './composables/useDesktopUpdate'
+import { useDesktopUpdatePresentation } from './composables/useDesktopUpdatePresentation'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
 import { useDocumentEvent } from './composables/useDocumentEvent'
-import { hasOpenDialogLayer, useDialogLayer } from './composables/useDialogA11y'
+import { hasOpenDialogLayer } from './composables/useDialogA11y'
 import {
   provideChatTopbarPopoverCoordinator,
-  useChatTopbarPopoverCoordination,
 } from './composables/useChatTopbarPopoverCoordinator'
 import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
 import {
@@ -508,7 +443,6 @@ import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
 import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
 import { bindDesktopSessionDeepLinks } from './app/desktopSessionDeepLinks'
-import { themePickerOptions, getManifest } from './themes/registry'
 import { normalizeAgentId } from './utils/chat/sessionKeys'
 import { effectiveChatConnectionState } from './utils/chat/chatConnectionState'
 import { reminderToastPreview } from './utils/cron/notifications'
@@ -584,7 +518,7 @@ const workbenchMaximized = computed(() => isChatRoute.value
   && appStore.features.artifactWorkbench === true
   && workbenchStore.expanded && workbenchStore.maximized)
 const topbarPopoverCoordinationEnabled = ref(true)
-const topbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(
+provideChatTopbarPopoverCoordinator(
   topbarPopoverCoordinationEnabled,
 )
 const chatRouteHeader = provideChatRouteHeaderBridge()
@@ -717,6 +651,10 @@ watch(
   },
 )
 const desktopUpdate = useDesktopUpdate()
+const { summary: desktopUpdateSummary, severity: desktopUpdateSeverity } = useDesktopUpdatePresentation(desktopUpdate)
+const sidebarExpandLabel = computed(() => desktopUpdate.visible.value
+  ? `${t('chrome.expandSidebar')}, ${desktopUpdateSummary.value}`
+  : t('chrome.expandSidebar'))
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
 let cronFinishedSubscription: CronSubscription | null = null
@@ -801,54 +739,6 @@ const sidebarToggleAriaShortcut = computed(() => {
   return parts.join('+')
 })
 
-const themeIconName = computed(() => {
-  if (appStore.theme === 'system') return 'monitor'
-  const active = getManifest(appStore.resolvedTheme)
-  return active?.icon ?? (appStore.resolvedTheme === 'dark' ? 'moon' : 'sun')
-})
-
-const themeMenuOpen = ref(false)
-useChatTopbarPopoverCoordination(
-  'theme',
-  themeMenuOpen,
-  topbarPopoverCoordinator,
-)
-const themeMenuIsTopmost = useDialogLayer(themeMenuOpen)
-const themeButtonRef = ref<HTMLButtonElement | null>(null)
-
-// The compact topbar menu deliberately lists only the basic modes (Light / Dark
-// / System). Custom value themes live in Settings → Appearance, reached via the
-// "More themes…" action below — see themePickerOptions({ scope }) in registry.ts.
-const themeOptions = themePickerOptions({ scope: 'basic' })
-
-// A custom value theme (chosen in Settings) is active but not shown in the basic
-// topbar menu; mark "More themes…" instead of leaving no selection indicator.
-const isCustomThemeActive = computed(
-  () => !themeOptions.some((o) => o.mode === appStore.theme),
-)
-
-function pickTheme(mode: ThemeMode) {
-  appStore.setTheme(mode)
-  themeMenuOpen.value = false
-  themeButtonRef.value?.focus()
-}
-
-// "More themes…": the full theme list lives in Settings → Appearance. Close the
-// menu and deep-link straight to that section.
-function openMoreThemes() {
-  themeMenuOpen.value = false
-  handleNavClick()
-  router.push('/settings/interface')
-}
-
-useDocumentEvent('click', (e) => {
-  if (!themeMenuOpen.value) return
-  const wrap = themeButtonRef.value?.closest('.theme-menu-wrap')
-  if (wrap && e.target instanceof Node && !wrap.contains(e.target)) {
-    themeMenuOpen.value = false
-  }
-})
-
 // Current session key from ChatView via URL
 const currentSessionKey = computed(() => {
   return ($route.query.session as string) || ''
@@ -880,15 +770,14 @@ watch(currentSessionKey, markCurrentSessionReadIfVisible, {
   immediate: true,
 })
 
-// Chat layout applies to both the session view and the draft route.
+// Shared status controls use the actual topbar geometry on every route.
 const systemHeaderPressureCount = computed(() => (
   Number(effectiveConnectionState.value !== 'connected')
   + Number(appStore.approvalCount > 0)
-  + Number(desktopUpdate.visible.value)
 ))
 const systemHeaderLayout = useSystemHeaderLayout({
   target: topbarRef,
-  active: isChatRoute,
+  active: computed(() => true),
   pressureCount: systemHeaderPressureCount,
 })
 const activeProjectDraftId = computed(() =>
@@ -927,7 +816,6 @@ const settingsOverlayOpen = computed(() =>
   webConfigEnabled && ($route.name === 'settings' || $route.name === 'settings-section'))
 const workbenchModalBlocked = computed(() =>
   commandPaletteOpen.value
-  || themeMenuOpen.value
   || settingsOverlayOpen.value
   || (appStore.sidebarOpen && isSidebarDrawer.value))
 
@@ -1600,8 +1488,8 @@ function onPaletteOpenSettings() {
 }
 
 function onPaletteToggleTheme() {
-  // Cycle the appearance mode through the same registry-driven order as the
-  // topbar picker (every selectable value theme + system), so the palette
+  // Cycle the appearance mode through the registry-driven order used by
+  // Settings (every selectable value theme + system), so the palette
   // never resets a custom theme back to 'light'.
   appStore.cycleTheme()
 }
@@ -1767,9 +1655,9 @@ function openConnectionSettings() {
   router.push('/settings/gateway#connection')
 }
 
-// Compact chat headers hand off to the complete Desktop update workflow rather
-// than recreating update actions inside the status summary.
+// The sidebar entry hands off to the complete Desktop update workflow.
 function openDesktopUpdateSettings() {
+  handleNavClick()
   router.push('/settings/gateway#updates')
 }
 
@@ -1901,12 +1789,6 @@ function handleKeydown(e: KeyboardEvent) {
   // run later and are covered separately by the shared dialog-layer guard.
   if (e.defaultPrevented) return
 
-  if (e.key === 'Escape' && themeMenuOpen.value && themeMenuIsTopmost.value) {
-    e.preventDefault()
-    themeMenuOpen.value = false
-    themeButtonRef.value?.focus()
-    return
-  }
   // Child topbar controls and routed dialogs install their Escape handlers
   // after App's listener. Let the current dialog-stack owner handle the key
   // instead of pre-emptively collapsing the mobile sidebar beneath it.
@@ -2095,18 +1977,30 @@ onUnmounted(() => {
   flex: 1;
 }
 
-/* Topbar connection pill as a button (web): inherits the base .conn-pill look
-   and state colors, adds button reset + an affordance that it is clickable. */
-.conn-pill--link {
-  cursor: pointer;
-  font-family: inherit;
+.sidebar-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
 }
-.conn-pill--link:hover {
-  filter: brightness(1.08);
+
+.sidebar-foot .sidebar-fn-item {
+  flex: 1 1 auto;
+  min-width: 0;
 }
-.conn-pill--link:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
-  outline-offset: 2px;
+
+.sidebar-update-dot {
+  position: absolute;
+  top: 5px;
+  inset-inline-end: 5px;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+  border: 1px solid var(--bg-surface);
+}
+
+.sidebar-update-dot[data-state='danger'] {
+  background: var(--danger);
 }
 
 /* Off-screen but screen-reader-reachable announcer for the approval count. */

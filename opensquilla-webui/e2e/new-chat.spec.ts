@@ -183,7 +183,7 @@ test.describe('New chat draft state', () => {
 
   test('New chat lands on a clean draft with no session key', async ({ page }) => {
     await page.goto(CONTROL_URL)
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     // The primary "New chat" button opens the draft instantly against the
     // preferred agent with no picker dialog.
@@ -203,14 +203,14 @@ test.describe('New chat draft state', () => {
 
   test('bare /chat opens the draft instead of restoring the last session', async ({ page }) => {
     await page.goto(CONTROL_URL)
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     // Seed a stored session the way a previous visit would.
     await page.evaluate(() => {
       localStorage.setItem('opensquilla_active_session', 'agent:main:webchat:seededprior')
     })
 
     await page.goto(CONTROL_URL + 'chat')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(page).toHaveURL(/\/chat\/new$/)
     expect(page.url()).not.toContain('session=')
@@ -223,19 +223,19 @@ test.describe('New chat draft state', () => {
 
   test('legacy ?newChat=1 and ?new=1 redirect to the draft route', async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat?newChat=1')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(page).toHaveURL(/\/chat\/new$/)
     expect(page.url()).not.toContain('newChat=')
 
     await page.goto(CONTROL_URL + 'chat?new=1&agent=main')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(page).toHaveURL(/\/chat\/new\?agent=main$/)
     expect(page.url()).not.toContain('new=1')
   })
 
   test('new task hides Agent selection while preserving Agent deep links', async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat/new?agent=research')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(page).toHaveURL(/\/chat\/new\?agent=research$/)
     await expect(page.locator('.chat-landing-agent')).toHaveCount(0)
@@ -249,7 +249,7 @@ test.describe('New chat draft state', () => {
     test.skip(!LIVE, 'Live gateway test; set OPENSQUILLA_E2E_LIVE=1 to run.')
 
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(page).toHaveURL(/\/chat\/new$/)
 
     const textarea = page.locator('.chat-textarea')

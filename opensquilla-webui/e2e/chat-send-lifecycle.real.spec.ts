@@ -9,7 +9,7 @@ test('real Gateway accepts the next chat turn without changing sessions', async 
   page.on('pageerror', error => rendererErrors.push(error.message))
   await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
   await page.goto(`${isolatedRealGateway.controlUrl}chat/new`)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 20_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 20_000 })
 
   const input = page.locator('.chat-textarea')
   const send = page.locator('.chat-send-btn[aria-label="Send"]')

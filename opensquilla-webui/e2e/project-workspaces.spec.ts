@@ -11,8 +11,8 @@ const CONTROL_URL = '/control/'
 
 async function openControl(page: Page) {
   await page.goto(CONTROL_URL)
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
-  await page.waitForSelector('.conn-pill.connected', { timeout: 10000 }).catch(() => {})
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state="connected"]', { timeout: 10000 }).catch(() => {})
   await expect(page.locator('#sidebar-nav')).toBeVisible()
 }
 
@@ -494,7 +494,7 @@ test.describe('Project workspaces', () => {
     await expect(message).toHaveValue('Continue this draft after refresh')
 
     await page.reload()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect(page.locator('.chat-project-chip')).toHaveAttribute('data-status', 'ready')
     await expect(message).toHaveValue('Continue this draft after refresh')
     await expect(page.locator('.attachment-chip')).toHaveCount(2)
@@ -640,7 +640,7 @@ test.describe('Project workspaces', () => {
     state.sent = true
 
     await page.goto(`/control/chat?session=${encodeURIComponent(state.sessionKey)}`)
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect(page.locator('.chat-project-chip')).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Choose project' })).toHaveCount(0)
 
@@ -661,10 +661,10 @@ test.describe('Project workspaces', () => {
     state.projectPresent = true
 
     await page.goto('/control/chat/new?agent=main&project=project-demo')
-    await expect(page.locator('.conn-pill.connecting')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connecting"]')).toBeVisible()
     await page.waitForTimeout(100)
     expect(await page.getByTestId('toast').count()).toBe(0)
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect.poll(() => state.workspaceListRequests).toBeGreaterThan(0)
     expect(await page.getByTestId('toast').count()).toBe(0)
   })

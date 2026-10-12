@@ -203,7 +203,7 @@ async function openChat(page: Page, sessionKey = SESSION_A, enabled = true) {
   }, enabled)
   await installMockGateway(page, sessionKey === SESSION_ATTACHMENTS)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(sessionKey))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
   const expectedText = sessionKey === SESSION_LONG
     ? 'Long answer line 1000:'
     : sessionKey === SESSION_B

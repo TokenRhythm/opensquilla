@@ -151,7 +151,7 @@ async function openDisabledDialog(page: Page, theme: 'dark' | 'light') {
   await page.addInitScript(value => localStorage.setItem('opensquilla-theme', value), theme)
   await installMockGateway(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
   await expect(page.getByText('Synthetic keepalive settings conversation.')).toBeVisible()
   await page.locator('.chat-composer').getByRole('button', { name: 'More' }).click()
   await page.getByTestId('chat-composer-action-keepalive').click()

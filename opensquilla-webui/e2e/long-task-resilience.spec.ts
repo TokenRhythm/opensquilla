@@ -342,7 +342,7 @@ test.describe('0.5.0 long-task resilience', () => {
     })
 
     await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(key)}`)
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect(page.getByRole('button', { name: 'Stop current response' })).toBeVisible()
     sequence = 1
     push(sockets[0]!, 'session.event.text_delta', {
@@ -354,7 +354,7 @@ test.describe('0.5.0 long-task resilience', () => {
     await composer.fill(draft)
 
     await sockets[0]!.close({ code: 1012, reason: 'Synthetic outage before terminal delivery' })
-    await expect(page.locator('.conn-pill.connected')).toHaveCount(0)
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toHaveCount(0)
     complete = true
     sequence = 3
     // The committed terminal text and outcome exist only in subsequent reads:
@@ -365,7 +365,7 @@ test.describe('0.5.0 long-task resilience', () => {
       && read.method === 'sessions.messages.snapshot')).toBe(true)
     await expect.poll(() => reads.some(read => read.connection === 2
       && read.method === 'sessions.messages.hydrate')).toBe(true)
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect(page.getByText(answer, { exact: true })).toHaveCount(1)
     await expect(page.getByRole('button', { name: 'Stop current response' })).toHaveCount(0)
     await expect(page.locator('.assistant-activity--live')).toHaveCount(0)
@@ -470,7 +470,7 @@ test.describe('0.5.0 long-task resilience', () => {
     })
 
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect.poll(() => sockets.length).toBe(1)
     await expect.poll(() => initialSnapshotComplete).toBe(true)
     await expect(
@@ -501,7 +501,7 @@ test.describe('0.5.0 long-task resilience', () => {
     // The topbar reports the shared transport; the session owns its separate
     // recovery notice and send gate until the subscription has recovered.
     const recoveringSession = page.getByText('Gateway connected. Restoring live updates for this session…', { exact: true })
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect(recoveringSession).toBeVisible()
     await page.locator('.chat-textarea').fill('Draft retained while this session reconnects')
     await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled()
@@ -674,14 +674,14 @@ test.describe('0.5.0 long-task resilience', () => {
     })
 
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(ROUTER_SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect.poll(() => initialSnapshotComplete).toBe(true)
     sockets[0]!.send(eventFrame('session.event.router_decision', routerPayload))
     await expect(page.locator('.router-fx')).toHaveCount(1)
 
     await sockets[0]!.close({ code: 1012, reason: 'deterministic reconnect' })
     await expect.poll(() => sockets.length, { timeout: 4_000 }).toBe(2)
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 4_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 4_000 })
     await expect(page.locator('.router-fx')).toHaveCount(1)
 
     sockets[1]!.send(eventFrame('session.event.done', {
@@ -707,7 +707,7 @@ test.describe('0.5.0 long-task resilience', () => {
 
     settledHistory = true
     await page.reload()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect(page.locator('.router-fx')).toHaveCount(1)
     await expect(page.getByText('The document is ready.', { exact: true })).toHaveCount(1)
   })
@@ -761,7 +761,7 @@ test.describe('0.5.0 long-task resilience', () => {
     })
 
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect.poll(() => snapshotComplete).toBe(true)
     const liveLabel = page.locator('.assistant-activity--live .assistant-activity__live-label')
     const sendActivity = async (streamSeq: number, payload: Record<string, unknown>) => {
@@ -969,7 +969,7 @@ test.describe('0.5.0 long-task resilience', () => {
     })
 
     await page.goto(origin + CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     const list = page.locator('.chat-message-list')
     const thread = page.locator('.chat-thread')
     await expect(list).toHaveAttribute('data-virtualized', 'true')
@@ -1670,7 +1670,7 @@ test.describe('0.5.0 long-task resilience', () => {
       }),
     }))
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect(page.locator('.chat')).toBeVisible()
     await dropSyntheticFile(page, {
       name: attachmentName,
@@ -1719,7 +1719,7 @@ test.describe('0.5.0 long-task resilience', () => {
 
     const listCallsBeforeReload = pendingListCalls
     await page.reload()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect.poll(() => pendingListCalls).toBeGreaterThan(listCallsBeforeReload)
     await expect(page.locator('.chat-pending-card').filter({ hasText: queuedText })).toBeVisible()
     await expect(page.locator('.chat-pending-attachments')).toContainText('1')
@@ -1730,7 +1730,7 @@ test.describe('0.5.0 long-task resilience', () => {
     await installGateway(secondPage)
     try {
       await secondPage.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-      await expect(secondPage.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+      await expect(secondPage.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
       await expect(
         secondPage.locator('.chat-pending-card').filter({ hasText: queuedText }),
       ).toBeVisible()
@@ -1772,7 +1772,7 @@ test.describe('0.5.0 long-task resilience', () => {
       expect(row).toBeNull()
 
       await page.reload()
-      await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+      await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
       await expect(page.locator('.msg-user').filter({ hasText: queuedText })).toHaveCount(1)
       await expect(page.locator('.msg-user .msg-attachments .msg-file-chip')).toHaveCount(1)
       await expect(page.locator('.msg-user .msg-file-chip')).toContainText(attachmentName)

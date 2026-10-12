@@ -184,7 +184,7 @@ async function openSeededSession(
 ) {
   const historyReads = await seedHistory(page, withMessages, options)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(key))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   await page.waitForSelector('.chat-header', { timeout: 10000 })
   await expect.poll(() => historyReads.length).toBeGreaterThan(0)
 }
@@ -259,7 +259,8 @@ async function installShareStageProbe(page: Page) {
 
 async function enterShareMode(page: Page) {
   await expect(page.locator('.msg-ai-main').last()).toBeVisible({ timeout: 10000 })
-  await page.getByRole('button', { name: 'Share' }).click()
+  await page.getByTestId('chat-session-actions-trigger').click()
+  await page.getByRole('menuitem', { name: 'Share', exact: true }).click()
   await expect(page.getByTestId('share-banner')).toBeVisible()
 }
 
@@ -312,6 +313,12 @@ test.describe('Share mode interaction shell', () => {
       return !!el && !!document.activeElement && el.contains(document.activeElement)
     })
     expect(bannerFocused).toBe(true)
+
+    await page.getByTestId('chat-session-actions-trigger').click()
+    await expect(page.getByTestId('chat-session-actions-menu')).toBeVisible()
+    await expect(page.getByTestId('chat-session-action-share')).toHaveCount(0)
+    await page.keyboard.press('Escape')
+    await expect(banner).toBeVisible()
   })
 
   test('checkbox indicators are always visible and selection drives the count', async ({ page }) => {
@@ -424,7 +431,10 @@ test.describe('Share mode interaction shell', () => {
     await page.keyboard.press('Escape')
     await expect(page.getByTestId('share-banner')).toHaveCount(0)
     await expect(page.locator('.chat-share-picker')).toHaveCount(0)
-    await expect(page.locator('.chat-header').getByRole('button', { name: 'Share' })).toBeVisible()
+    const menuTrigger = page.getByTestId('chat-session-actions-trigger')
+    await expect(menuTrigger).toBeFocused()
+    await menuTrigger.click()
+    await expect(page.getByRole('menuitem', { name: 'Share', exact: true })).toBeVisible()
   })
 
   test('banner Cancel ends the mode', async ({ page }) => {
@@ -433,28 +443,38 @@ test.describe('Share mode interaction shell', () => {
 
     await page.getByTestId('share-banner').getByRole('button', { name: 'Cancel' }).click()
     await expect(page.getByTestId('share-banner')).toHaveCount(0)
-    await expect(page.locator('.chat-header').getByRole('button', { name: 'Share' })).toBeVisible()
+    const menuTrigger = page.getByTestId('chat-session-actions-trigger')
+    await expect(menuTrigger).toBeFocused()
+    await menuTrigger.click()
+    await expect(page.getByRole('menuitem', { name: 'Share', exact: true })).toBeVisible()
   })
 
-  test('at 700px the entry button collapses to an icon that stays visible', async ({ page }) => {
+  test('at 700px sharing stays in the session menu with a mobile tap target', async ({ page }) => {
     await page.setViewportSize({ width: 700, height: 900 })
     await openSeededSession(page, SESSION_KEY, true)
     await expect(page.locator('.msg-ai-main').last()).toBeVisible({ timeout: 10000 })
 
-    const entry = page.getByTestId('chat-header-primary-action')
-    await expect(entry).toBeVisible()
-    await expect(entry).toHaveAttribute('data-action', 'share')
-    await expect(entry).toHaveAccessibleName('Share')
+    await expect(page.getByTestId('chat-header-primary-action')).toHaveCount(0)
+    const trigger = page.getByTestId('chat-session-actions-trigger')
+    await expect(trigger).toBeVisible()
+    await expect(trigger).toHaveAccessibleName('Session actions')
 
-    const iconBox = await entry.locator('svg').boundingBox()
+    const iconBox = await trigger.locator('svg').boundingBox()
     expect(iconBox).not.toBeNull()
     expect(iconBox!.width).toBeGreaterThan(0)
     expect(iconBox!.height).toBeGreaterThan(0)
 
     // Icon-only buttons keep a mobile-adequate tap target.
-    const entryBox = await entry.boundingBox()
+    const entryBox = await trigger.boundingBox()
     expect(entryBox!.width).toBeGreaterThanOrEqual(43)
     expect(entryBox!.height).toBeGreaterThanOrEqual(43)
+    await trigger.click()
+    const entry = page.getByRole('menuitem', { name: 'Share', exact: true })
+    await expect(entry).toBeVisible()
+    const menuEntryBox = await entry.boundingBox()
+    expect(menuEntryBox!.height).toBeGreaterThanOrEqual(43)
+    await entry.click()
+    await expect(page.getByTestId('share-banner')).toBeVisible()
   })
 
   test('at 375px the responsive session action opens share mode without occlusion', async ({ page }) => {
@@ -466,16 +486,14 @@ test.describe('Share mode interaction shell', () => {
     const layout = await header.getAttribute('data-layout')
     expect(layout).toMatch(/^(compact|tight)$/)
 
-    let entry = page.getByTestId('chat-header-primary-action')
-    if (layout === 'tight') {
-      await page.getByTestId('chat-session-actions-trigger').click()
-      entry = page.getByTestId('chat-session-action-share')
-    }
+    await expect(page.getByTestId('chat-header-primary-action')).toHaveCount(0)
+    await page.getByTestId('chat-session-actions-trigger').click()
+    const entry = page.getByRole('menuitem', { name: 'Share', exact: true })
     await expect(entry).toBeVisible()
     await expect(entry).toHaveAccessibleName('Share')
 
     // A tap at the action center must land on that action, not another piece
-    // of app chrome. This holds whether Share is primary or menu-contained.
+    // of app chrome, including the fixed-position narrow-screen menu.
     const hitIsEntry = await entry.evaluate((btn) => {
       const r = btn.getBoundingClientRect()
       const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)
@@ -491,12 +509,18 @@ test.describe('Share mode interaction shell', () => {
     await openSeededSession(page, SYSTEM_ONLY_SESSION_KEY, false)
     await expect(page.locator('.msg-system')).toBeVisible({ timeout: 10000 })
 
-    const entry = page.locator('.chat-header').getByRole('button', { name: 'Send a message first to share' })
+    await page.getByTestId('chat-session-actions-trigger').click()
+    const entry = page.getByTestId('chat-session-action-share')
     await expect(entry).toBeVisible()
     await expect(entry).toBeDisabled()
-    await expect(entry).toHaveAttribute('title', 'Send a message first to share')
+    await expect(entry).toHaveAttribute('aria-disabled', 'true')
+    await expect(entry).toContainText('Send a message first to share')
     const opacity = await entry.evaluate(el => parseFloat(getComputedStyle(el).opacity))
     expect(opacity).toBeGreaterThanOrEqual(0.6)
+    await entry.focus()
+    await page.keyboard.press('Enter')
+    await expect(page.getByTestId('share-banner')).toHaveCount(0)
+    await expect(page.getByTestId('chat-session-actions-menu')).toBeVisible()
   })
 
   test('Save opens the preview modal; Escape closes only the modal and keeps share mode', async ({ page }) => {
@@ -563,7 +587,7 @@ test.describe('Share mode interaction shell', () => {
     expect(probe!.text).not.toMatch(/\$\d/)
 
     // Escape closes the preview but leaves share mode active (the banner stays),
-    // and focus returns to the share banner — the header Share button is
+    // and focus returns to the share banner — the Share menu item is
     // unmounted while share mode is on, so the banner is the mode's anchor.
     await page.keyboard.press('Escape')
     await expect(dialog).toHaveCount(0)
@@ -575,7 +599,7 @@ test.describe('Share mode interaction shell', () => {
     expect(bannerFocusedAfterEscape).toBe(true)
   })
 
-  test('the modal close button dismisses the preview and returns focus to the Share entry', async ({ page }) => {
+  test('the modal close button dismisses the preview and returns focus to the share banner', async ({ page }) => {
     await openSeededSession(page, SESSION_KEY, true)
     await enterShareMode(page)
 

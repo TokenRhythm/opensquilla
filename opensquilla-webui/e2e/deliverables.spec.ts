@@ -105,7 +105,7 @@ async function openSeededSession(
   })
   await seedHistory(page, withArtifacts, options)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(key))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   await page.waitForSelector('.chat-header', { timeout: 10000 })
 }
 

@@ -17,6 +17,9 @@ const latestVersion = computed(() => update.latestVersion.value || t('updates.de
 const currentVersion = computed(() => state.value.currentVersion || t('updates.desktop.unknownVersion'))
 const manualInstall = computed(() => state.value.installMode === 'manual')
 const busy = computed(() => update.loading.value || update.actionBusy.value || status.value === 'downloading' || status.value === 'applying')
+const progress = computed(() => typeof state.value.progress === 'number' && Number.isFinite(state.value.progress)
+  ? Math.min(100, Math.max(0, Math.round(state.value.progress)))
+  : null)
 const sourceLabel = computed(() => {
   if (state.value.source === 'oss') return t('updates.desktop.sourceOss')
   if (state.value.source === 'github') return t('updates.desktop.sourceGithub')
@@ -95,6 +98,19 @@ const showLater = computed(() => state.value.canCheck && (status.value === 'avai
         <strong>{{ t('updates.desktop.source') }}</strong>
         {{ sourceLabel }}<template v-if="state.fallbackUsed"> · {{ t('updates.desktop.fallbackUsed') }}</template>
       </span>
+    </div>
+
+    <div v-if="status === 'downloading'" class="settings-update__progress">
+      <div
+        class="settings-update__track"
+        :class="{ 'is-indeterminate': progress === null }"
+        role="progressbar"
+        :aria-label="t('updates.desktop.downloadingStatus')"
+        :aria-valuenow="progress ?? undefined"
+        :aria-valuemin="0"
+        :aria-valuemax="100"
+      ><span :style="progress === null ? undefined : { width: `${progress}%` }"></span></div>
+      <span v-if="progress !== null" class="settings-update__percentage">{{ progress }}%</span>
     </div>
 
     <div class="control-row__control settings-update__actions">
@@ -184,4 +200,12 @@ const showLater = computed(() => state.value.canCheck && (status.value === 'avai
   flex-wrap: wrap;
   justify-content: flex-start;
 }
+
+.settings-update__progress { display: flex; align-items: center; gap: var(--sp-3); max-width: 420px; }
+.settings-update__track { flex: 1; height: 4px; background: var(--bg-hover); border-radius: var(--radius-full); overflow: hidden; }
+.settings-update__track span { display: block; height: 100%; background: var(--accent); border-radius: inherit; }
+.settings-update__track.is-indeterminate span { width: 35%; animation: settings-update-progress var(--dur-pulse) var(--ease-standard) infinite alternate; }
+.settings-update__percentage { color: var(--text-muted); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+@keyframes settings-update-progress { to { transform: translateX(180%); } }
+@media (prefers-reduced-motion: reduce) { .settings-update__track.is-indeterminate span { animation: none; } }
 </style>

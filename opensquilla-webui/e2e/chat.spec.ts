@@ -8,7 +8,7 @@ test.describe('Chat Page', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto(CONTROL_URL)
     // Wait for WebSocket connection
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   })
 
   test('page loads with correct title', async ({ page }) => {
@@ -38,7 +38,7 @@ test.describe('Chat Page', () => {
       'sessions.list': { sessions: [recent], count: 1, ts: 1_800_000_000, has_more: false },
     })
     await page.goto(CONTROL_URL)
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect(page.locator(`.sidebar-history-row[data-session-key="${recent.key}"]`)).toBeVisible()
 
     await page.locator('.sidebar-cmd-btn').click()
@@ -55,7 +55,7 @@ test.describe('Chat Page', () => {
   })
 
   test('command palette keeps the Skills & Channels hub together in Work', async ({ page }) => {
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect(page.locator('.chat-textarea')).toBeFocused()
     await page.locator('.sidebar-cmd-btn').click()
     const palette = page.getByRole('dialog', { name: 'Search and go to' })
@@ -169,7 +169,7 @@ test.describe('Chat Page', () => {
     await expect(page.locator('.sidebar-filter-chip')).toHaveCount(0)
 
     // Let the session list settle before inspecting sidebar text.
-    await page.waitForSelector('.conn-pill.connected', { timeout: 10000 }).catch(() => {})
+    await page.waitForSelector('.topbar[data-connection-state="connected"]', { timeout: 10000 }).catch(() => {})
     await page.waitForTimeout(800)
     await expect(page.locator('.sidebar-history-list, .sidebar-onboarding, .sidebar-history-empty').first()).toBeVisible()
 
@@ -181,29 +181,25 @@ test.describe('Chat Page', () => {
     await expect(page.locator('.sidebar-history-gap')).toHaveCount(0)
   })
 
-  test('theme menu picks a mode directly', async ({ page }) => {
+  test('Settings theme choice applies immediately and persists when the dialog closes', async ({ page }) => {
     const html = page.locator('html')
-
     await page.evaluate(() => localStorage.setItem('opensquilla-theme', 'light'))
     await page.reload()
-    await page.waitForSelector('.topbar .conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(html).toHaveAttribute('data-theme', 'light')
+    await expect(page.locator('.topbar .theme-menu-wrap')).toHaveCount(0)
 
-    const themeButton = page.getByRole('button', { name: 'Theme', exact: true })
-    await themeButton.click()
-    const menu = page.getByRole('menu', { name: 'Theme' })
-    await expect(menu).toBeVisible()
-    await expect(menu.getByRole('menuitemradio', { name: 'Light' })).toHaveAttribute('aria-checked', 'true')
-
-    await menu.getByRole('menuitemradio', { name: 'Dark' }).click()
+    await page.locator('.sidebar-foot button[data-icon="settings"]').click()
+    await page.locator('#settings-rail-interface').click()
+    await expect(page.locator('input[name="appearance-theme"][value="light"]')).toBeChecked()
+    await page.locator('.appearance-theme__opt:has(input[name="appearance-theme"][value="dark"])').click()
     await expect(html).toHaveAttribute('data-theme', 'dark')
-    await expect(menu).toHaveCount(0)
+    await expect(page.locator('input[name="appearance-theme"][value="dark"]')).toBeChecked()
 
-    // Escape closes without changing the mode.
-    await themeButton.click()
     await page.keyboard.press('Escape')
-    await expect(page.getByRole('menu', { name: 'Theme' })).toHaveCount(0)
+    await expect(page.locator('.settings-modal')).toHaveCount(0)
     await expect(html).toHaveAttribute('data-theme', 'dark')
+    await expect(page.locator('.sidebar-foot button[data-icon="settings"]')).toBeFocused()
   })
 
   test('chat input area is visible', async ({ page }) => {
@@ -213,12 +209,9 @@ test.describe('Chat Page', () => {
     await expect(page.locator('.chat-composer')).toBeVisible()
   })
 
-  test('connection status shows connected', async ({ page }) => {
-    const connPill = page.locator('.topbar .conn-pill')
-    await expect(connPill).toBeVisible()
-
-    const text = await connPill.textContent()
-    expect(text?.toLowerCase()).toMatch(/connected|connecting/)
+  test('a connected transport keeps the normal header quiet', async ({ page }) => {
+    await expect(page.locator('.topbar')).toHaveAttribute('data-connection-state', 'connected')
+    await expect(page.getByTestId('connection-status')).toHaveCount(0)
   })
 
   test('no console errors on load', async ({ page }) => {
@@ -246,7 +239,7 @@ test.describe('Chat Page', () => {
 test.describe('Chat Interaction', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   })
 
   test('can type in chat input', async ({ page }) => {
@@ -325,7 +318,7 @@ test.describe('Visual Regression', () => {
 
   test('chat page screenshot matches baseline', async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await page.waitForTimeout(500) // Let animations settle
 
     await expect(page).toHaveScreenshot('chat-page.png', {
@@ -336,7 +329,7 @@ test.describe('Visual Regression', () => {
 
   test('dark mode screenshot', async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     // Force dark theme
     await page.evaluate(() => {

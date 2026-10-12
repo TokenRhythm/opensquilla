@@ -67,7 +67,7 @@ async function mockApprovalsRoute(page: Page, getPending: () => MockApproval[]) 
 
 async function openMockedChat(page: Page) {
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 }
 
 test.describe('In-thread approval card (mocked snapshot)', () => {
@@ -221,7 +221,7 @@ test.describe('Approval flow (live gateway, Standard execution mode)', () => {
   test('blocked shell command surfaces a card; Allow once resumes the run', async ({ page }) => {
     test.slow()
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill.connected', { timeout: 15000 })
+    await page.waitForSelector('.topbar[data-connection-state="connected"]', { timeout: 15000 })
 
     const textarea = page.locator('.chat-textarea')
     // `rm` is on the shell warnlist, so this command blocks on approval; the
@@ -241,7 +241,7 @@ test.describe('Approval flow (live gateway, Standard execution mode)', () => {
   test('Deny terminates the command without scheduling another agent turn', async ({ page }) => {
     test.slow()
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill.connected', { timeout: 15000 })
+    await page.waitForSelector('.topbar[data-connection-state="connected"]', { timeout: 15000 })
 
     const textarea = page.locator('.chat-textarea')
     // Warnlisted command (see the Allow-once test): guaranteed to raise an approval.

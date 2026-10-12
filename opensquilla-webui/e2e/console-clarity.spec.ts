@@ -4,7 +4,7 @@ const CONTROL_URL = '/control/'
 
 async function openControl(page: Page, path = '') {
   await page.goto(CONTROL_URL + path)
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 }
 
 const settingsDialog = (page: Page) => page.getByRole('dialog', { name: 'Settings' })

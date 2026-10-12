@@ -51,7 +51,7 @@ async function seedHistoryWithArtifact(page: Page) {
 
 async function openDraftChat(page: Page) {
   await page.goto(CONTROL_URL + 'chat/new')
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 }
 
 test.describe('Failure toasts and composer copy', () => {
@@ -107,7 +107,7 @@ test.describe('Failure toasts and composer copy', () => {
       route.fulfill({ status: 500, body: 'internal error' }))
 
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     // The seeded history renders a real artifact chip with the English action label.
     const chip = page.locator('.msg-artifact-chip').first()

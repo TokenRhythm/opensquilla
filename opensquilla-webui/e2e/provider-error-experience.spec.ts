@@ -151,7 +151,7 @@ async function prepareGateway(page: Page, options: {
   })
 
   await page.goto('/control/chat?session=' + encodeURIComponent(sessionKey))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   return {
     runtimeErrors,
     sends: () => sends,
@@ -195,7 +195,7 @@ async function prepareGateway(page: Page, options: {
       const before = connections
       disconnect!()
       await expect.poll(() => connections).toBeGreaterThan(before)
-      await expect(page.locator('.conn-pill.connected')).toBeVisible()
+      await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     },
   }
 }

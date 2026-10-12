@@ -55,8 +55,7 @@
 /* -- ACCENT SURFACES: soft neon bloom ----------------------------------------
    Normal semantic topbar states are deliberately excluded: a healthy
    connection and a deliverable count are information, not attention. */
-[data-theme="vapor"] .btn--primary,
-[data-theme="vapor"] .conn-pill:not(.topbar-state) {
+[data-theme="vapor"] .btn--primary {
   box-shadow:
     var(--elev-1),
     0 0 18px color-mix(in srgb, var(--accent) 32%, transparent),

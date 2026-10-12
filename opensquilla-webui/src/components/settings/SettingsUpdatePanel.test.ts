@@ -60,6 +60,16 @@ beforeEach(() => {
 })
 
 describe('SettingsUpdatePanel', () => {
+  it.each([0, 37.8, 120, null])('shows real bounded download progress without inventing an unknown percentage (%s)', async (progress) => {
+    const { app, el } = await mountPanel(desktopUpdateApi({ status: 'downloading', progress }))
+    const track = el.querySelector('[role="progressbar"]')!
+    expect(track).not.toBeNull()
+    expect(track.getAttribute('aria-valuenow')).toBe(progress === null ? null : String(Math.min(100, Math.round(progress))))
+    expect(el.querySelector('.settings-update__percentage')?.textContent ?? '').toBe(progress === null ? '' : `${Math.min(100, Math.round(progress))}%`)
+    expect(Array.from(el.querySelectorAll('button')).every(button => button.disabled)).toBe(true)
+    app.unmount()
+  })
+
   it('shows available version details and starts download from Settings', async () => {
     const api = desktopUpdateApi({ status: 'available', latestVersion: '99.0.0' })
     const { app, el } = await mountPanel(api)

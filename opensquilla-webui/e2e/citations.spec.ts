@@ -6,7 +6,7 @@ const LIVE = process.env.OPENSQUILLA_E2E_LIVE === '1'
 test.describe('Inline citation pills', () => {
   test('idle chat renders no citation pills or sources row', async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(page.locator('.citation-pill')).toHaveCount(0)
     await expect(page.locator('.sources-row')).toHaveCount(0)
@@ -14,7 +14,7 @@ test.describe('Inline citation pills', () => {
 
   test('only [n] markers that map to a real source become pills', async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     // Drive the transform deterministically over a known-sanitized snippet with a
     // 3-element source list. `[2]` is in range → a focusable button.citation-pill;
@@ -108,7 +108,7 @@ test.describe('Inline citation pills', () => {
     test.setTimeout(240000)
 
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     const textarea = page.locator('.chat-textarea')
     await textarea.fill('Use your web search tool to find one recent headline about renewable energy, then answer in one sentence and cite the source inline as [1].')
@@ -124,7 +124,7 @@ test.describe('Inline citation pills', () => {
     // The invariant survives a reload through the history render path. Absence of
     // pills is acceptable both times — the model may not cite.
     await page.reload()
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await page.waitForTimeout(500)
     await assertCitationInvariant(page)
   })

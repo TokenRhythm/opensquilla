@@ -334,7 +334,7 @@ test('workspace navigation keeps one transport while the target subscription rec
   await expect.poll(() => wire.some(entry => (
     entry.method === 'sessions.messages.snapshot' && entry.key === SESSION_A
   ))).toBe(true)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
 
   const workspaceBRow = page.locator(`[data-session-key="${SESSION_B}"]`)
   await expect(workspaceBRow).toBeVisible()
@@ -386,7 +386,7 @@ test('workspace navigation keeps one transport while the target subscription rec
     `sessions.messages.snapshot:${SESSION_B}`,
   ])
   expect(wire.every(entry => entry.socketIndex === 0)).toBe(true)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
 
   const liveRecovery = page.locator(
     '[data-testid="chat-session-recovery-status"][data-recovery-state="live-connecting"]',
@@ -418,7 +418,7 @@ test('workspace navigation keeps one transport while the target subscription rec
   release('sessions.messages.subscribe', SESSION_B, subscriptionPayload(SESSION_B))
 
   await expect(liveRecovery).toHaveCount(0)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   await expect(composer).toHaveValue(PRESERVED_DRAFT)
   await expect(sendButton).toBeEnabled()
   expect(sockets).toHaveLength(1)

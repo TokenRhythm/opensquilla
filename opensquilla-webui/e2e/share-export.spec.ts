@@ -119,7 +119,7 @@ test.describe('Share export', () => {
     })
 
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     // One real turn so there are two bubbles to share. The prompt is CJK on
     // purpose: the title (and thus the filename slug) derives from the first
@@ -137,7 +137,9 @@ test.describe('Share export', () => {
     // Enter share mode via the keyboard path: this spec owns the export
     // pipeline, not the header layout, so it must not gate on pointer
     // reachability of the floating topbar cluster.
-    await page.getByRole('button', { name: /^Share/ }).first().focus()
+    await page.getByTestId('chat-session-actions-trigger').focus()
+    await page.keyboard.press('Enter')
+    await page.getByRole('menuitem', { name: 'Share', exact: true }).focus()
     await page.keyboard.press('Enter')
     const pickers = page.getByRole('button', { name: 'Add to share image' })
     await expect(pickers.first()).toBeVisible()

@@ -474,7 +474,7 @@ test.describe('Completed assistant activity disclosure', () => {
     await page.goto(
       CONTROL_URL + 'chat?session=' + encodeURIComponent(`${SESSION_KEY}-unified-receipts`),
     )
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
 
     const kinds = ['default', 'plan', 'goal', 'cron'] as const
     await expect(page.locator('.msg-ai .assistant-activity')).toHaveCount(0)
@@ -512,7 +512,7 @@ test.describe('Completed assistant activity disclosure', () => {
   test('keeps the canonical answer visible and supports keyboard disclosure', async ({ page }) => {
     await mockActivityHistory(page)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state="connected"]', { timeout: 10000 })
 
     const activity = page.getByTestId('assistant-activity')
     await expect(activity).toBeVisible()
@@ -666,7 +666,7 @@ test.describe('Completed assistant activity disclosure', () => {
   test('keeps web-search URLs collapsed with a readable query summary', async ({ page }) => {
     await mockActivityHistory(page, { searchTargets: true })
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(`${SESSION_KEY}-search`))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
 
     const activity = page.getByTestId('assistant-activity')
     const summary = activity.locator('.assistant-activity__summary')
@@ -696,7 +696,7 @@ test.describe('Completed assistant activity disclosure', () => {
     await mockActivityHistory(page, { failed: true })
     await page.setViewportSize({ width: 320, height: 844 })
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(`${SESSION_KEY}-failed`))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state="connected"]', { timeout: 10000 })
 
     const activity = page.getByTestId('assistant-activity')
     await expect(activity).toBeVisible()
@@ -772,7 +772,7 @@ test.describe('Completed assistant activity disclosure', () => {
       await page.emulateMedia({ reducedMotion: 'reduce' })
       const sessionKey = `${SESSION_KEY}-recovered-${width}`
       await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(sessionKey))
-      await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+      await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
       expect(new URL(page.url()).pathname).toBe('/control/chat')
       expect(new URL(page.url()).searchParams.get('session')).toBe(sessionKey)
       await expect(page).toHaveTitle(/OpenSquilla/)
@@ -833,7 +833,7 @@ test.describe('Completed assistant activity disclosure', () => {
             + 'chat?session='
             + encodeURIComponent(`${SESSION_KEY}-${width}-${theme}-${reducedMotion}`),
           )
-          await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+          await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
           await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
           await expect(page.locator('.msg-ai .msg-meta__more-btn')).toHaveCount(4)
           await expect(page.locator('.msg-ai .assistant-activity')).toHaveCount(0)
@@ -862,7 +862,7 @@ test.describe('Live assistant activity lifecycle', () => {
     await page.goto(
       CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
     )
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await page.locator('.chat-textarea').fill('Reconnect and finish this task.')
     await page.locator('.chat-send-btn[aria-label="Send"]').click()
 
@@ -927,7 +927,7 @@ test.describe('Live assistant activity lifecycle', () => {
     await page.goto(
       CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
     )
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
 
     await page.locator('.chat-textarea').fill('Recover after a tool failure.')
     await page.locator('.chat-send-btn[aria-label="Send"]').click()
@@ -982,7 +982,7 @@ test.describe('Live assistant activity lifecycle', () => {
     await page.goto(
       CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
     )
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
 
     await page.locator('.chat-textarea').fill('Inspect, draft, verify, and answer.')
     await page.locator('.chat-send-btn[aria-label="Send"]').click()
@@ -1138,7 +1138,7 @@ test.describe('Live assistant activity lifecycle', () => {
     await page.goto(
       CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
     )
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
 
     await page.locator('.chat-textarea').fill('Inspect, draft, verify, and answer.')
     await page.locator('.chat-send-btn[aria-label="Send"]').click()
@@ -1188,7 +1188,7 @@ test.describe('Silent assistant delivery lifecycle', () => {
     await page.goto(
       CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
     )
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
     await page.locator('.chat-textarea').fill('Run silently.')
     await page.locator('.chat-send-btn[aria-label="Send"]').click()
 
@@ -1230,7 +1230,7 @@ test.describe('Silent assistant delivery lifecycle', () => {
     await page.goto(
       CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
     )
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
     await page.locator('.chat-textarea').fill('Continue the Goal.')
     await page.locator('.chat-send-btn[aria-label="Send"]').click()
 
@@ -1318,7 +1318,7 @@ test.describe('Silent assistant delivery lifecycle', () => {
     await page.goto(
       CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
     )
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
     await page.locator('.chat-textarea').fill('Inspect silently.')
     await page.locator('.chat-send-btn[aria-label="Send"]').click()
 

@@ -365,7 +365,7 @@ async function mockBranchingEditRpc(
 test.describe('Conversation fork', () => {
   test('empty draft offers no fork action', async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(page.locator('.chat-textarea')).toBeVisible()
     await expect(page.locator(FORK_BUTTON)).toHaveCount(0)
@@ -374,7 +374,7 @@ test.describe('Conversation fork', () => {
   test('fork renders on every completed assistant turn', async ({ page }) => {
     await seedHistoryWithTwoTurns(page)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(page.locator('.msg-ai')).toHaveCount(2, { timeout: 10000 })
     await expect(page.locator(FORK_BUTTON)).toHaveCount(2)
@@ -389,7 +389,7 @@ test.describe('Conversation fork', () => {
     const capturedForks: CapturedForkRequest[] = []
     await seedHistoryWithTwoTurns(page, capturedForks)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(page.locator('.msg-ai')).toHaveCount(2, { timeout: 10000 })
 
     const firstAnswer = page.locator('.msg-ai').first()
@@ -427,7 +427,7 @@ test.describe('Conversation fork', () => {
     await mockBranchingEditRpc(page, capturedSends, historyRequests)
 
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(EDIT_PARENT_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(page.locator('.msg-user')).toHaveCount(3, { timeout: 10000 })
     await expect(page.locator('.msg-user').last()).toContainText('C marker must stay only on parent')
 
@@ -462,7 +462,7 @@ test.describe('Conversation fork', () => {
     // A fresh load proves the URL now addresses the child transcript, whose
     // canonical history ends at the edited B rather than replaying parent C.
     await page.reload()
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect.poll(() => historyRequests.filter(key => key === EDIT_CHILD_KEY).length).toBeGreaterThan(0)
     await expect(page.locator('.msg-user')).toHaveCount(2, { timeout: 10000 })
     await expect(page.locator('.chat-thread')).toContainText('B edited')
@@ -475,7 +475,7 @@ test.describe('Conversation fork', () => {
     test.setTimeout(300000)
 
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     // One real turn so the session exists with a transcript.
     const prompt = 'Reply with the single word: ok'
@@ -511,7 +511,7 @@ test.describe('Conversation fork', () => {
     // Hub: the fork lists under its parent with the FORK badge and indent,
     // and the parent still lists independently as a root row.
     await page.goto(CONTROL_URL + 'sessions')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await page.waitForTimeout(800)
     await expect(page.locator('.hub-ledger')).toBeVisible()
 

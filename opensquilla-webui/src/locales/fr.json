@@ -512,7 +512,7 @@
       "title": "Interface",
       "desc": "Thème et préférences d'interface locales à ce navigateur. Les préréglages s'appliquent immédiatement ; utilisez Appliquer pour une largeur personnalisée.",
       "themeLabel": "Thème",
-      "themeDesc": "Suivez votre système, ou forcez le mode clair ou sombre. Le bouton de la barre latérale est un raccourci vers ce même paramètre.",
+      "themeDesc": "Choisissez un thème pour l’interface, ou suivez votre système pour alterner automatiquement entre les modes clair et sombre.",
       "languageLabel": "Langue",
       "languageDesc": "Langue d'affichage de l'interface et des messages système des canaux. Elle s'applique ici immédiatement et enregistre la langue des messages pour toute la passerelle.",
       "channelNoticeLocaleSyncPending": "La langue de l'interface a changé, mais la langue des messages système des canaux n'est pas encore enregistrée. Une nouvelle tentative aura lieu à la reconnexion de la passerelle.",

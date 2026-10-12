@@ -188,7 +188,7 @@ async function openMockedChat(page: Page, capturedSends: CapturedSend[], options
   }
   await page.goto(url)
   await expect(page.locator('.chat-textarea')).toBeVisible()
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
 }
 
 async function dropFiles(page: Page, files: Array<{ name: string; type: string; text?: string; size?: number; base64?: string }>) {
@@ -545,7 +545,7 @@ test.describe('attachment drag upload', () => {
       }
       await page.reload()
       await expect(page.locator('.chat-textarea')).toBeVisible()
-      await expect(page.locator('.conn-pill.connected')).toBeVisible()
+      await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
       if (!durableDraftIdentity) {
         await expect(page.locator('.attachment-chip')).toHaveCount(0)
         return

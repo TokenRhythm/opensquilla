@@ -90,7 +90,7 @@ test.describe('Share export with an image artifact', () => {
     await page.route('**/api/v1/artifacts/**', route => fulfillPng(route))
     await seedHistory(page)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     // The assistant thumbnail must be a real, loaded <img> (its src is the
     // blob: URL) before we capture — otherwise the clone has nothing to embed.
@@ -102,7 +102,9 @@ test.describe('Share export with an image artifact', () => {
     const toast = page.getByText('Share export failed')
 
     // Enter share mode and select both bubbles, including the one with the image.
-    await page.getByRole('button', { name: /^Share/ }).first().focus()
+    await page.getByTestId('chat-session-actions-trigger').focus()
+    await page.keyboard.press('Enter')
+    await page.getByRole('menuitem', { name: 'Share', exact: true }).focus()
     await page.keyboard.press('Enter')
     const pickers = page.getByRole('button', { name: 'Add to share image' })
     await expect(pickers.first()).toBeVisible()

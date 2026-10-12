@@ -73,7 +73,7 @@ async function installWebBrowserUse(page: Page) {
     })
   })
   await page.goto('/control/chat?session=' + encodeURIComponent(SESSION_A))
-  await expect(page.locator('.conn-pill')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state]')).toBeVisible()
   await expect(page.getByTestId('topbar-workbench-toggle')).toHaveCount(0)
   await expect(page.getByTestId('workbench-host')).toBeHidden()
   expect(await page.evaluate(() => Boolean(window.opensquillaDesktop))).toBe(false)

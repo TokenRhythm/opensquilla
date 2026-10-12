@@ -191,7 +191,7 @@ for (const scenario of [
   }) => {
     const gateway = await installGateway(page, scenario.reason)
     await page.goto(CONTROL_URL + encodeURIComponent(SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
     await expect(page.locator('.msg-user')).toHaveCount(2)
     await expect.poll(() => gateway.methods.filter(method => method === 'sessions.routing.get').length)

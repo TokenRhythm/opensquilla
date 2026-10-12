@@ -385,7 +385,7 @@ async function installMockGateway(
 }
 
 export async function waitForTopbarStable(page: Page, theme?: string) {
-  await expect(page.locator('.conn-pill.connected').first()).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]').first()).toBeVisible({ timeout: 10_000 })
   await expect(page.getByTestId('route-header-host').locator('.chat-header')).toHaveCount(1)
   await expect(page.locator('.msg-ai-main').last()).toBeVisible({ timeout: 10_000 })
   if (theme) await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
@@ -416,7 +416,7 @@ export async function openTopbarSession(page: Page, options: TopbarScenario = {}
   await expect(page.locator('html')).toHaveAttribute('lang', locale)
   await waitForTopbarStable(page, theme)
   if (approvalCount > 0) {
-    await expect(page.getByTestId('chat-system-status')).toHaveAttribute('data-severity', 'danger')
+    await expect(page.getByTestId('chat-system-approval')).toBeVisible()
   }
 
   return {

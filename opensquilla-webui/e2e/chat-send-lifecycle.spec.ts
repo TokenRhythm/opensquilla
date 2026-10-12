@@ -229,7 +229,7 @@ async function openChat(page: Page, expectedState: 'idle' | 'running' = 'idle') 
   const root = process.env.OPENSQUILLA_E2E_NATIVE_DESKTOP === '1'
     ? 'opensquilla-app://desktop/' : '/control/'
   await page.goto(`${root}chat?session=${encodeURIComponent(SESSION)}`)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   const readyAction = expectedState === 'running'
     ? page.getByRole('button', { name: 'Stop current response' })
     : page.locator('.chat-send-btn[aria-label="Send"]')
@@ -333,7 +333,7 @@ for (const { changeAuthority, reload, label } of [
     const input = page.locator('.chat-textarea')
     const send = page.locator('.chat-send-btn[aria-label="Send"]')
     gateway.disconnect()
-    await expect(page.locator('.conn-pill.connected')).toHaveCount(0)
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toHaveCount(0)
     await input.fill('Synthetic never-sent offline draft.')
     await expect(send).toBeEnabled()
     await send.click()
@@ -344,7 +344,7 @@ for (const { changeAuthority, reload, label } of [
 
     gateway.reconnect(changeAuthority)
     if (reload) await page.reload()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     if (changeAuthority) {
       await expect(page.locator('.chat-pending-save-status')).toContainText('changed')
       expect(gateway.sends).toHaveLength(0)
@@ -368,7 +368,7 @@ test('a new browser tab recovers the original identity and durable offline draft
   const gateway = await installGateway(page, false, true)
   await openChat(page)
   gateway.disconnect()
-  await expect(page.locator('.conn-pill.connected')).toHaveCount(0)
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toHaveCount(0)
   await page.locator('.chat-textarea').fill('Synthetic durable draft for a replacement tab.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
   await expect(page.locator('.chat-pending-save-status')).toContainText('Saved locally')

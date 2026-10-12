@@ -66,7 +66,7 @@ async function openFixture(page: Page, text: string, theme: 'light' | 'dark' = '
   })
   await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
   const answer = page.locator('.msg-ai').filter({ hasText: 'Diagram rendering fixture.' })
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+  await expect(page.locator('.topbar')).toHaveAttribute('data-connection-state', 'connected', { timeout: 15_000 })
   await expect(answer).toHaveCount(1)
   return answer
 }

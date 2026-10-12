@@ -20,8 +20,7 @@
 
 /* Glow on elevated accent surfaces; sidebar destinations and stable semantic
    topbar states remain flat so the CRT treatment preserves urgency. */
-[data-theme="terminal"] .btn--primary,
-[data-theme="terminal"] .conn-pill:not(.topbar-state) {
+[data-theme="terminal"] .btn--primary {
   box-shadow: var(--elev-1), 0 0 14px color-mix(in srgb, var(--accent) 35%, transparent);
 }
 

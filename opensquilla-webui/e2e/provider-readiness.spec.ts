@@ -22,7 +22,7 @@ for (const configured of [true, false]) {
       },
     })
     await page.goto('/control/')
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect(page.getByRole('complementary', { name: 'Gateway setup needed' })).toHaveCount(0)
     await expect(page.locator('.sidebar-setup-banner')).toHaveCount(0)
 

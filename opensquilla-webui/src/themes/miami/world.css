@@ -54,8 +54,7 @@
 /* Soft pastel candy glow on elevated accent surfaces. Sidebar navigation stays
    flat so it remains visually behind modal scrims and matches adjacent rows.
    Semantic topbar controls opt in below only for actionable states. */
-[data-theme="miami"] .btn--primary,
-[data-theme="miami"] .conn-pill:not(.topbar-state) {
+[data-theme="miami"] .btn--primary {
   position: relative;
   overflow: hidden;
   box-shadow: var(--elev-1),
@@ -78,8 +77,7 @@
    only), pointer-events:none, tucked under the label. It rests fully invisible
    (opacity:0) so with reduced motion no frozen streak sits on the surface; the
    sweep animation is the only thing that makes it briefly glint. */
-[data-theme="miami"] .btn--primary::after,
-[data-theme="miami"] .conn-pill:not(.topbar-state)::after {
+[data-theme="miami"] .btn--primary::after {
   content: "";
   position: absolute;
   top: 0;
@@ -120,8 +118,7 @@
     animation: miami-hue-breathe var(--dur-pulse) ease-in-out infinite alternate; /* motion-allow */
   }
 
-  [data-theme="miami"] .btn--primary::after,
-  [data-theme="miami"] .conn-pill:not(.topbar-state)::after {
+  [data-theme="miami"] .btn--primary::after {
     animation: miami-sheen 9s linear infinite; /* motion-allow */
   }
 }

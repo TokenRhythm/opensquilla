@@ -493,7 +493,7 @@ function threadMetrics(page: Page) {
 async function openEnsembleScrollRetention(page: Page) {
   const stream = await mockEnsembleScrollRetention(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SCROLL_SESSION_KEY))
-  await page.waitForSelector('.conn-pill.connected', { timeout: 15000 })
+  await page.waitForSelector('.topbar[data-connection-state="connected"]', { timeout: 15000 })
   await page.locator('.chat-textarea').fill('Keep streaming while I read earlier content.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
   await expect.poll(
@@ -577,7 +577,7 @@ test('a tiny upward wheel pauses an active stream until the reader returns', asy
 test('ensemble routing reveals members incrementally from ensemble_progress events', async ({ page }) => {
   await mockStreamingEnsembleWithProgress(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(PROGRESS_SESSION_KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
   await page.locator('.chat-textarea').fill('Compare three model families and synthesize.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
@@ -604,7 +604,7 @@ test('ensemble routing reveals members incrementally from ensemble_progress even
 test('ensemble lifecycle replaces telemetry pending immediately and completes after aggregation', async ({ page }) => {
   const lifecycle = await mockControlledEnsembleLifecycle(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
   await page.locator('.chat-textarea').fill('Compare three slow candidates and synthesize.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
@@ -749,7 +749,7 @@ async function mockEnsembleModeWithTierDecision(page: Page) {
 test('ensemble mode does not render the tier candidate grid for the live turn', async ({ page }) => {
   await mockEnsembleModeWithTierDecision(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(TIER_SESSION_KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   await page.locator('.chat-textarea').fill('Synthesize an answer from several models.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
 
@@ -804,7 +804,7 @@ test('ensemble inspector stays open while the answer keeps streaming', async ({ 
     })
   })
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   await page.locator('.chat-textarea').fill('Compare and synthesize.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
 
@@ -833,7 +833,7 @@ async function openLiveEnsembleInspector(page: Page) {
 test('live ensemble strip animates the scan line, pulse dot, and running spinner', async ({ page }) => {
   await mockStreamingEnsembleWithProgress(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(PROGRESS_SESSION_KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   const strip = await openLiveEnsembleInspector(page)
 
   const scanAnim = await strip.locator('.router-fx-ensemble__scan').evaluate(el => getComputedStyle(el).animationName)
@@ -848,7 +848,7 @@ test('live ensemble strip disables all animation under prefers-reduced-motion', 
   await page.emulateMedia({ reducedMotion: 'reduce' })
   await mockStreamingEnsembleWithProgress(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(PROGRESS_SESSION_KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   const strip = await openLiveEnsembleInspector(page)
 
   const scanAnim = await strip.locator('.router-fx-ensemble__scan').evaluate(el => getComputedStyle(el).animationName)
@@ -863,7 +863,7 @@ for (const complexity of ['simple', 'medium', 'complex'] as const) {
   test(`completed ensemble trace stays in assistant meta for ${complexity} prompts`, async ({ page }) => {
     await mockEnsembleHistory(page, complexity)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(`${SESSION_KEY}-${complexity}`))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(page.locator('.router-fx[data-panel="llm-ensemble"]')).toHaveCount(0)
 
@@ -885,7 +885,7 @@ for (const complexity of ['simple', 'medium', 'complex'] as const) {
 test('live ensemble routing shows the strip alongside flat activity', async ({ page }) => {
   await mockStreamingEnsembleRun(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(STREAM_SESSION_KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
   await page.locator('.chat-textarea').fill('Build a tiny team collaboration app.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()

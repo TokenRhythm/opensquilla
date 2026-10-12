@@ -4,8 +4,8 @@ const CONTROL_URL = '/control/'
 
 async function openDraft(page: Page) {
   await page.goto(CONTROL_URL + 'chat/new')
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
-  await page.waitForSelector('.conn-pill.connected', { timeout: 10000 }).catch(() => {})
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state="connected"]', { timeout: 10000 }).catch(() => {})
 }
 
 test.describe('Empty draft state', () => {
@@ -58,7 +58,7 @@ test.describe('Empty draft state', () => {
     // The Sessions Hub "Start task" button hands the draft off with autosend,
     // so the composer fires immediately instead of parking on the empty state.
     await page.goto(CONTROL_URL + 'sessions')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     const taskText = 'Summarize the latest gateway logs'
     await page.locator('.hub-task__input').fill(taskText)

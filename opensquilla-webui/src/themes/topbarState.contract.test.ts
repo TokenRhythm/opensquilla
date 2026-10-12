@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
-import desktopUpdateSource from '@/components/DesktopUpdateIndicator.vue?raw'
+import desktopUpdateSource from '@/components/SidebarDesktopUpdate.vue?raw'
 import chatHeaderSource from '@/components/chat/ChatHeaderActions.vue?raw'
 import systemStatusSource from '@/components/chat/ChatSystemStatus.vue?raw'
 
@@ -22,23 +22,23 @@ describe('chat topbar semantic state contract', () => {
     expect(baseCssSource).toContain('--topbar-state-fill')
     expect(baseCssSource).toContain('--topbar-state-border')
     expect(baseCssSource).toContain('.topbar-state--connection[data-state="normal"]')
-    expect(baseCssSource).toContain('.topbar-state--system[data-state="normal"]')
+    expect(baseCssSource).not.toContain('.topbar-state--system')
   })
 
   it('keeps domain names in components while exposing severity through data-state', () => {
     expect(chatHeaderSource).toContain('topbar-state--deliverables')
     expect(chatHeaderSource).toContain('data-state="normal"')
 
-    for (const domain of ['connection', 'approval', 'update', 'system']) {
+    for (const domain of ['connection', 'approval']) {
       expect(systemStatusSource).toContain(`topbar-state--${domain}`)
     }
-    expect(systemStatusSource).toContain(':data-state="connectionSeverity"')
-    expect(systemStatusSource).toContain('data-state="danger"')
-    expect(systemStatusSource).toContain(':data-state="updateSeverity"')
-    expect(systemStatusSource).toContain(':data-state="severity"')
-    expect(systemStatusSource).toContain('highestSystemSeverity([')
+    expect(systemStatusSource).toContain("connectionState === 'disconnected' ? 'danger' : 'warning'")
+    expect(systemStatusSource).toContain('data-state="warning"')
+    expect(systemStatusSource).not.toContain('topbar-state--system')
+    expect(systemStatusSource).not.toContain('topbar-state--update')
 
-    expect(desktopUpdateSource).toContain('topbar-state--update')
+    expect(desktopUpdateSource).toContain('sidebar-desktop-update')
+    expect(desktopUpdateSource).not.toContain('topbar-state--update')
     expect(desktopUpdateSource).toContain(':data-state="severity"')
   })
 
@@ -54,7 +54,7 @@ describe('chat topbar semantic state contract', () => {
       expect(urgentSelector, id).toContain('[data-state="warning"]')
       expect(urgentSelector, id).toContain('[data-state="danger"]')
       expect(urgentSelector, id).not.toContain('[data-state="normal"]')
-      expect(source, id).toContain('.conn-pill:not(.topbar-state)')
+      expect(source, id).not.toContain('.conn-pill')
       expect(source, id).toContain('var(--topbar-state-channel)')
     }
   })

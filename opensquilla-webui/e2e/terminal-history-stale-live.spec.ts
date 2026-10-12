@@ -151,7 +151,7 @@ test('terminal history keeps activity-only output and rejects the same task stal
   await installStaleLiveFixture(page)
 
   await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_KEY)}`)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
   await expect(page.getByText('Stop after the provider retry.', { exact: true })).toBeVisible()
   await expect(page.getByRole('button', { name: /^Stopped/ })).toBeVisible()
 

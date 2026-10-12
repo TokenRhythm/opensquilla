@@ -84,7 +84,7 @@ test.describe('Long conversation history rail', () => {
     await page.setViewportSize({ width: 769, height: 900 })
     await seedLongHistory(page)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     const main = page.locator('#app-main')
     const sidebar = page.locator('.sidebar')
@@ -108,7 +108,7 @@ test.describe('Long conversation history rail', () => {
     await page.setViewportSize({ width: 1440, height: 900 })
     await seedLongHistory(page)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     const markers = page.getByTestId('conversation-minimap-marker')
     await expect(markers).toHaveCount(12, { timeout: 10000 })
@@ -149,7 +149,7 @@ test.describe('Long conversation history rail', () => {
     await page.setViewportSize({ width: 1440, height: 900 })
     await seedLongHistory(page)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     const thread = page.locator('.chat-thread')
     const markers = page.getByTestId('conversation-minimap-marker')
@@ -221,7 +221,7 @@ test.describe('Long conversation history rail', () => {
     await page.setViewportSize({ width: 1440, height: 900 })
     await seedLongHistory(page)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     const rail = page.getByTestId('conversation-minimap')
     const markers = page.getByTestId('conversation-minimap-marker')
@@ -276,7 +276,7 @@ test.describe('Long conversation history rail', () => {
     await page.setViewportSize({ width: 1440, height: 900 })
     await seedLongHistory(page)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     const rail = page.getByTestId('conversation-minimap')
     const markers = page.getByTestId('conversation-minimap-marker')

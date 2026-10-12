@@ -131,7 +131,7 @@ test('durable queued stays queued until running and an authoritative router deci
 }) => {
   const lifecycle = await mockQueuedRouterLifecycle(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
 
   await page.locator('.chat-textarea').fill('Wait for a real runtime slot.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()

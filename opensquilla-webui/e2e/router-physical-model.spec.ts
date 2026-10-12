@@ -277,7 +277,7 @@ async function installGateway(page: Page, { legacy = false, fusion = false } = {
 
 async function startTurn(page: Page) {
   await page.goto('/control/chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 15_000 })
   await page.locator('.chat-textarea').fill('Exercise the synthetic fallback chain.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
   await expect(page.locator('.router-fx')).toHaveCount(1)

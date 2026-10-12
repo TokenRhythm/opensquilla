@@ -241,7 +241,7 @@ async function openWorkbenchSession(
   })
   await installWorkbenchGateway(page, requests, artifacts)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill')).toBeVisible({ timeout: 10000 })
+  await expect(page.locator('.topbar[data-connection-state]')).toBeVisible({ timeout: 10000 })
   await expect(page.locator([
     '.msg-artifact-chip',
     '.msg-media-card',

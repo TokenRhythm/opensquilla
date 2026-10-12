@@ -6,8 +6,8 @@ const MOBILE_VIEWPORT = { width: 390, height: 844 }
 async function openMobileChat(page: Page) {
   await page.setViewportSize(MOBILE_VIEWPORT)
   await page.goto(CONTROL_URL + 'chat')
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
-  await page.waitForSelector('.conn-pill.connected', { timeout: 10000 }).catch(() => {})
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state="connected"]', { timeout: 10000 }).catch(() => {})
 }
 
 test.describe('Mobile bottom tab bar', () => {
@@ -107,7 +107,7 @@ test.describe('Mobile bottom tab bar', () => {
   test('the chat composer sits above the tab bar, not behind it', async ({ page }) => {
     await page.setViewportSize(MOBILE_VIEWPORT)
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     const composer = page.locator('.chat-composer')
     await expect(composer).toBeVisible()
@@ -122,7 +122,7 @@ test.describe('Mobile bottom tab bar', () => {
   test('desktop shows no tab bar', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 })
     await page.goto(CONTROL_URL + 'chat')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(page.locator('.mobile-tabbar')).toBeHidden()
   })

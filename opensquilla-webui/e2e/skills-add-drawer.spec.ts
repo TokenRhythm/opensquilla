@@ -301,7 +301,7 @@ async function openSkills(page: Page) {
     localStorage.setItem('opensquilla-theme', 'light')
   })
   await page.goto(CONTROL_URL)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 15_000 })
   await expect(page.getByTestId('skills-catalog')).toBeVisible({ timeout: 15_000 })
 }
 

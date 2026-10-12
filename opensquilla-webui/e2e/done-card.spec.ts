@@ -79,7 +79,7 @@ async function seedHistoryWithDeliverable(page: Page) {
 async function openSeededSession(page: Page) {
   await seedHistoryWithDeliverable(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 }
 
 test.describe('Deliverable endings', () => {
@@ -157,7 +157,7 @@ test.describe('Deliverable endings', () => {
     test.setTimeout(240000)
 
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     // Asking for a download nudges the agent to publish the file as an
     // artifact instead of stopping at a plain workspace write.

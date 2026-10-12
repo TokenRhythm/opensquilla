@@ -242,7 +242,7 @@ async function installMockGateway(
 
 async function openRunningSession(page: Page) {
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
   await expect(page.getByRole('textbox', { name: MESSAGE_TEXTBOX_NAME })).toBeEditable()
   await expect(page.getByRole('button', { name: /^(Stop .*response|停止.*回复)$/ })).toBeVisible()
   await expect(page.getByText(ORIGINAL_TEXT, { exact: true })).toBeVisible()

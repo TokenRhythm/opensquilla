@@ -227,7 +227,7 @@ test('keeps one task clock across A to B to A without sending again', async ({ p
   })
 
   await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
   await expect(page.locator('.chat-textarea')).toBeVisible()
 
   await page.locator('.chat-textarea').fill('Keep working while I switch sessions.')

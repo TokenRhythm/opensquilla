@@ -512,7 +512,7 @@
       "title": "Interface",
       "desc": "Theme and browser-local interface preferences. Presets apply instantly; custom widths use Apply.",
       "themeLabel": "Theme",
-      "themeDesc": "Follow your system, or force light or dark. The sidebar toggle is a shortcut to this same setting.",
+      "themeDesc": "Choose an interface theme, or follow your system to switch automatically between light and dark.",
       "languageLabel": "Language",
       "languageDesc": "Display language for the interface and channel system notices. Applies instantly here and saves the Gateway-wide notice language.",
       "channelNoticeLocaleSyncPending": "The interface language changed, but the channel system-message language has not been saved yet. It will retry when the Gateway reconnects.",

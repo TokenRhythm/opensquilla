@@ -259,11 +259,13 @@ async function checkDelayedStartup(page: Page, detachedMetadata: boolean) {
   await expect(composer).toHaveValue('Draft remains editable while history loads.')
   await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled()
   await expect(page.locator('.chat-empty')).toHaveCount(0)
-  const themeButton = page.getByRole('button', { name: 'Theme', exact: true })
-  await themeButton.click()
-  await expect(page.getByRole('menu', { name: 'Theme' })).toBeVisible()
+  // The surviving session menu must stay interactive while history hydrates.
+  const sessionActions = page.getByTestId('chat-session-actions-trigger')
+  await sessionActions.click()
+  await expect(page.getByTestId('chat-session-actions-menu')).toBeVisible()
   await page.keyboard.press('Escape')
-  await expect(page.getByRole('menu', { name: 'Theme' })).toHaveCount(0)
+  await expect(page.getByTestId('chat-session-actions-menu')).toHaveCount(0)
+  await expect(sessionActions).toBeFocused()
   await page.getByRole('button', { name: 'Send', exact: true }).click()
   await expect.poll(() => chatSendRequests).toBe(1)
 
@@ -374,7 +376,7 @@ test('keeps timed-out optional metadata request-local and sends on the same sock
   // Pass the actual 10-second request budget with its reply still held.
   await page.clock.runFor(10_100)
   expect(socketCount).toBe(1)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   await expect(composer).toHaveValue('Send while optional metadata is unavailable.')
   await expect(composer).toBeFocused()
   await expect(send).toBeEnabled()

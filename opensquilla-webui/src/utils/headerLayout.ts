@@ -31,13 +31,6 @@ export interface SystemHeaderLayoutInput extends HeaderInputCapability {
   pressureCount?: number
 }
 
-const SYSTEM_SEVERITY_RANK: Readonly<Record<SystemSeverity, number>> = {
-  normal: 0,
-  info: 1,
-  warning: 2,
-  danger: 3,
-}
-
 function finiteDimension(value: number): number {
   return Number.isFinite(value) ? Math.max(0, value) : 0
 }
@@ -135,17 +128,4 @@ export function resolveSystemHeaderLayout(
     && width < SYSTEM_HEADER_PRESSURE_WIDE_MIN_WIDTH
   )
   return capWide(layout, wideAllowed(input) && pressureAllowsWide)
-}
-
-/** Return the highest-severity status, using normal for an empty collection. */
-export function highestSystemSeverity(
-  severities: readonly SystemSeverity[],
-): SystemSeverity {
-  let highest: SystemSeverity = 'normal'
-  for (const severity of severities) {
-    if (SYSTEM_SEVERITY_RANK[severity] > SYSTEM_SEVERITY_RANK[highest]) {
-      highest = severity
-    }
-  }
-  return highest
 }

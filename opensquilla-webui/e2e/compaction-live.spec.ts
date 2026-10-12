@@ -238,7 +238,7 @@ test('real compaction preserves task facts and continues after a summary outage'
   await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
   if (resumePath) expect(resumePath).toMatch(/^\/control\/chat(?:\/[^?#]*)?(?:\?[^#]*)?$/)
   await page.goto(resumePath || '/control/chat/new')
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 30_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 30_000 })
   if (executionMode !== 'direct') {
     const mode = executionMode === 'router' ? 'squilla_router' : 'llm_ensemble'
     await page.locator('.chat-model-routing-btn').click()
@@ -438,7 +438,7 @@ This background is disposable. Keep the original task facts. Reply only BACKGROU
         expect(during.storage.canonical_message_digests?.[id]).toBe(hash)
       }
       await page.reload()
-      await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 30_000 })
+      await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 30_000 })
       expect(await page.locator('body').innerText()).not.toContain('Synthetic summary-only outage')
     } finally {
       await rm(faultFile, { force: true })

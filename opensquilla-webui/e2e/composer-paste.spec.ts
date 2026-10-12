@@ -8,7 +8,7 @@ test('clipboard paste restores send readiness after stale IME composition', asyn
     window.localStorage.setItem('opensquilla-locale', 'en')
   })
   await page.goto(CONTROL_URL)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
 
   const textarea = page.locator('.chat-textarea')
   const sendButton = page.locator('.chat-send-btn[aria-label="Send"]')
@@ -34,7 +34,7 @@ test('long plain-text clipboard paste becomes a pasted-text attachment', async (
     window.localStorage.setItem('opensquilla-locale', 'en')
   })
   await page.goto(CONTROL_URL)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
 
   const textarea = page.locator('.chat-textarea')
   await textarea.focus()
@@ -53,7 +53,7 @@ test('post-insertion paste fallback attaches text before send', async ({ page })
     window.localStorage.setItem('opensquilla-locale', 'en')
   })
   await page.goto(CONTROL_URL)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
 
   const textarea = page.locator('.chat-textarea')
   const instruction = 'Summarize the pasted text: '

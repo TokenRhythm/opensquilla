@@ -6,9 +6,9 @@ const UUID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 
 async function openControl(page: Page, path = '') {
   await page.goto(CONTROL_URL + path)
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   // Let the session list settle before inspecting the sidebar.
-  await page.waitForSelector('.conn-pill.connected', { timeout: 10000 }).catch(() => {})
+  await page.waitForSelector('.topbar[data-connection-state="connected"]', { timeout: 10000 }).catch(() => {})
   await page.waitForTimeout(800)
   await expect(
     page.locator('.sidebar-history-list, .sidebar-history-empty, .sidebar-onboarding').first(),
@@ -147,7 +147,7 @@ test.describe('Sidebar', () => {
     })
     const page = await context.newPage()
     await page.goto(CONTROL_URL)
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     const sidebar = page.locator('.sidebar')
     await expect(sidebar).not.toHaveClass(/docked/)
@@ -200,7 +200,7 @@ test.describe('Sidebar', () => {
       })
       const page = await context.newPage()
       await page.goto(CONTROL_URL)
-      await page.waitForSelector('.conn-pill', { timeout: 10000 })
+      await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
       await page.getByTestId('sidebar-toggle-collapsed').click()
 
       await expect(page.getByTestId('sidebar-resizer')).toHaveCount(0)
@@ -458,8 +458,8 @@ test.describe('Sidebar', () => {
 
   test('footer pins Settings; connection state shows in the topbar', async ({ page }) => {
     await page.goto(CONTROL_URL)
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
-    await page.waitForSelector('.conn-pill.connected', { timeout: 10000 }).catch(() => {})
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state="connected"]', { timeout: 10000 }).catch(() => {})
     await page.waitForTimeout(800)
 
     const foot = page.locator('.sidebar-foot')
@@ -478,11 +478,10 @@ test.describe('Sidebar', () => {
       }
     })
     expect(Math.abs(footerGeometry.bottomGap - footerGeometry.paddingBottom)).toBeLessThanOrEqual(1)
-    // Connection state is shown once, in the global topbar pill — not duplicated
-    // in the sidebar footer.
+    // Healthy transport does not add a duplicate status control to either area.
     await expect(foot.locator('.sidebar-conn')).toHaveCount(0)
-    const conn = (await page.locator('.topbar .conn-pill').innerText()).toLowerCase()
-    expect(conn).toMatch(/connected|connecting/)
+    await expect(page.locator('.topbar')).toHaveAttribute('data-connection-state', 'connected')
+    await expect(page.getByTestId('connection-status')).toHaveCount(0)
   })
 
   test('mobile drawer shows a scrim and tapping it closes the drawer', async ({ page }) => {

@@ -34,7 +34,7 @@ async function openSidebar(page: Page, count: number, current = 3) {
     },
   })
   await page.goto(`/control/chat?session=${encodeURIComponent(current === 3 ? SIDEBAR_ACTIVE_SESSION_KEY : key(current))}`)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   const list = page.locator(listSelector)
   await expect(list).toHaveAttribute('data-sidebar-loaded-count', String(Math.min(count, 200)))
   return { list, pages, renames }

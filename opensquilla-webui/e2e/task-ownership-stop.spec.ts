@@ -189,7 +189,7 @@ test.describe('P1-A task ownership and exact Stop release gate', () => {
     const gateway = await installOwnershipGateway(page)
 
     await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_KEY)}`)
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     const stop = page.getByRole('button', { name: 'Stop current response' })
     await expect(stop).toBeVisible({ timeout: 10_000 })
 

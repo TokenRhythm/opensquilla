@@ -512,7 +512,7 @@
       "title": "Interfaz",
       "desc": "Tema y preferencias de interfaz locales de este navegador. Los preajustes se aplican al instante; usa Aplicar para un ancho personalizado.",
       "themeLabel": "Tema",
-      "themeDesc": "Sigue tu sistema o fuerza el modo claro u oscuro. El conmutador de la barra lateral es un atajo a este mismo ajuste.",
+      "themeDesc": "Elige un tema para la interfaz o sigue la configuración del sistema para alternar automáticamente entre claro y oscuro.",
       "languageLabel": "Idioma",
       "languageDesc": "Idioma de visualización de la interfaz y de los mensajes del sistema de los canales. Se aplica aquí al instante y guarda el idioma de los mensajes para toda la puerta de enlace.",
       "channelNoticeLocaleSyncPending": "El idioma de la interfaz cambió, pero el idioma de los mensajes del sistema de los canales aún no se ha guardado. Se volverá a intentar cuando se reconecte la puerta de enlace.",

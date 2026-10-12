@@ -99,7 +99,7 @@ async function open(page: Page) {
   await expect(page).toHaveURL(/\/control\/chat\/new$/)
   await expect(page).toHaveTitle(/OpenSquilla/)
   await expect(page.locator('.chat-textarea')).toBeVisible()
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   await expect(page.locator('vite-error-overlay')).toHaveCount(0)
 }
 
@@ -343,7 +343,7 @@ for (const narrow of [false, true]) {
     const state = await install(page)
     const key = SIDEBAR_SESSIONS[0]!.key
     await page.goto(`/control/chat?session=${encodeURIComponent(key)}`)
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     const input = page.locator('.chat-textarea')
     await input.fill('Compare these files')
     await openMenu(page)

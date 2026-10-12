@@ -15,7 +15,7 @@ const SECTIONS = [
 const STATUSLESS_SECTIONS = ['Interface', 'Shortcuts', 'Memory & Export']
 
 const settingsRow = (page: import('@playwright/test').Page) =>
-  page.locator('.sidebar-foot button')
+  page.locator('.sidebar-foot button[data-icon="settings"]')
 
 const dialog = (page: import('@playwright/test').Page) =>
   page.locator('.settings-modal[role="dialog"]')
@@ -25,7 +25,7 @@ const railTab = (page: import('@playwright/test').Page, name: string) =>
 
 async function openFromSidebar(page: import('@playwright/test').Page) {
   await page.goto(CONTROL_URL)
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   await settingsRow(page).click()
   await expect(dialog(page)).toBeVisible()
   await expect(dialog(page)).toHaveAccessibleName('Settings')
@@ -254,7 +254,7 @@ test.describe('Settings modal', () => {
 
   test('opens Settings without applying the app route fade to the overlay', async ({ page }) => {
     await page.goto(CONTROL_URL)
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await page.evaluate(() => {
       const state = {
         overlaySeen: false,
@@ -332,7 +332,7 @@ test.describe('Settings modal', () => {
     await expect(dirtybar).toBeHidden({ timeout: 10000 })
 
     await page.reload()
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(dialog(page)).toBeVisible()
     await railTab(page, 'Model Routing').click()
     await dialog(page).getByTestId('router-advanced-options').locator('summary').click()
@@ -359,7 +359,7 @@ test.describe('Settings modal', () => {
 
   test('closing Settings restores the previous route view without blanking the outlet', async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(page.getByLabel('Message to send')).toBeVisible()
 
     await settingsRow(page).click()
@@ -374,7 +374,7 @@ test.describe('Settings modal', () => {
   test('legacy /settings/connection deep link opens Gateway and preserves its subsection', async ({ page }) => {
     // Land directly on a section with no in-app invoker.
     await page.goto(CONTROL_URL + 'settings/connection')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(dialog(page)).toBeVisible()
     await expect(railTab(page, 'Gateway')).toHaveAttribute('aria-selected', 'true')
     await expect(page).toHaveURL(/\/settings\/gateway#connection$/)
@@ -396,7 +396,7 @@ test.describe('Settings modal', () => {
 
   test('/config deep link redirects into the settings overlay', async ({ page }) => {
     await page.goto(CONTROL_URL + 'config')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(dialog(page)).toBeVisible()
     // /config now redirects to /settings (default section).
@@ -406,7 +406,7 @@ test.describe('Settings modal', () => {
 
   test('/setup deep link opens the readiness-selected AI configuration section', async ({ page }) => {
     await page.goto(CONTROL_URL + 'setup')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(dialog(page)).toBeVisible()
     // /setup redirects to /settings/auto (first not-ready section).
@@ -476,7 +476,7 @@ test.describe('Settings modal', () => {
 
   test('viewport opts out of horizontal overscroll so a trackpad swipe cannot pop history', async ({ page }) => {
     await page.goto(CONTROL_URL)
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     // Chromium turns a two-finger horizontal overscroll into history navigation;
     // with Settings and chat sessions living on the history stack that gesture
     // would dismiss them wholesale. Both propagation roots must opt out.
@@ -507,7 +507,7 @@ test.describe('Settings modal', () => {
 
     // Reload: the persisted value must survive a fresh modal.
     await page.reload()
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(dialog(page)).toBeVisible()
     await railTab(page, 'Advanced').click()
     await expect(capture()).toBeVisible()
@@ -518,7 +518,7 @@ test.describe('Settings modal', () => {
     await dirtybar().getByRole('button', { name: 'Save', exact: true }).click()
     await expect(dirtybar()).toBeHidden({ timeout: 10000 })
     await page.reload()
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(dialog(page)).toBeVisible()
     await railTab(page, 'Advanced').click()
     await expect(capture()).toBeVisible()
@@ -528,7 +528,7 @@ test.describe('Settings modal', () => {
   test('mobile: full-screen categories open details and return without a horizontal strip', async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 })
     await page.goto(CONTROL_URL + 'config')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(dialog(page)).toBeVisible()
 
     const modalBox = await dialog(page).boundingBox()
@@ -645,7 +645,7 @@ test.describe('Settings modal', () => {
     ))).toBe('expanded')
 
     await page.reload()
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(dialog(page)).toBeVisible()
     await expect(dialog(page).getByRole('radio', { name: 'Expanded by default', exact: true })).toBeChecked()
 

@@ -300,7 +300,7 @@ async function semanticActivity(page: Page): Promise<SemanticRow[]> {
 test('replays Activity exactly across active reload, terminal reloads, and restart', async ({ page }) => {
   const gateway = await installGatewayFixture(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
 
   const activeBefore = await semanticActivity(page)
   // Live mode intentionally retains only the current routine phase; settled

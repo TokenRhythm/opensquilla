@@ -77,7 +77,7 @@ test.describe('Chat topbar visual regression', () => {
       })
 
       if ((scenario.fixture.approvalCount ?? 0) > 99) {
-        const badge = page.getByTestId('chat-system-status-badge')
+        const badge = page.getByTestId('chat-system-approval').locator('.chat-system-status__count')
         await expect(badge).toHaveText('99+')
         const bounds = await badge.evaluate(element => {
           const box = element.getBoundingClientRect()

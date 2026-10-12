@@ -64,7 +64,7 @@ test('a remote non-owner sees the support boundary without local desktop log con
     if (request.url().endsWith('/api/v1/diagnostics/bundle')) requests.push(request.url())
   })
   await page.goto(SUPPORT_PATH)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   await expect(supportButton(page)).toBeVisible()
   await expect(supportButton(page)).toBeDisabled()
   await expect(page.locator('#settings-gateway-support')).toContainText(/owner/i)
@@ -90,7 +90,7 @@ test('an owner connection to another Gateway cannot download from the WebUI orig
     if (request.url().endsWith('/api/v1/diagnostics/bundle')) requests.push(request.url())
   })
   await page.goto(SUPPORT_PATH)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   await expect(page.locator('#conn-ws-url')).toHaveValue('ws://synthetic-remote.invalid/ws')
   await expect(supportButton(page)).toBeDisabled()
   await expect(page.locator('#support-bundle-unavailable')).toBeVisible()
@@ -178,7 +178,7 @@ test('legacy diagnostic links do not resume readiness or log polling', async ({ 
   })
   for (const legacy of ['overview', 'health', 'logs']) {
     await page.goto(`/control/${legacy}`)
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect(page).toHaveURL(legacy === 'logs'
       ? /\/settings\/gateway#logs$/ : /\/usage$/)
     await page.clock.runFor(65_000)
