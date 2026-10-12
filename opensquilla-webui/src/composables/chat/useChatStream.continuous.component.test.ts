@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { createApp, h, nextTick, ref } from 'vue'
 import { expect, it, vi } from 'vitest'
+import { createI18n } from 'vue-i18n'
 import type { ChatMessage } from '@/types/chat'
 import StreamingTextPart from '@/components/chat/parts/StreamingTextPart.vue'
 import { useChatStream } from './useChatStream'
@@ -19,6 +20,7 @@ it('renders newly arriving text past 1 MiB through the existing live message com
   const app = createApp({ setup: () => () => h(StreamingTextPart, {
     rawText: stream.foldedTurn.value.rawText, renderMarkdown,
   }) })
+  app.use(createI18n({ legacy: false, locale: 'en', fallbackLocale: 'en', missingWarn: false, messages: { en: {} } }))
   app.mount(host)
   try {
     const prefix = '0123456789abcdef'.repeat(65536)
