@@ -1453,6 +1453,11 @@ def _persisted_tool_result_segment(
         segment["tool_presentation"] = dict(event.tool_presentation)
     if event.execution_log_handle is not None:
         segment["execution_log_handle"] = event.execution_log_handle
+    if event.file_snapshot is not None and not event.is_error:
+        # This is the executed operation's display data, not model context or
+        # an expiring tool-result cache entry. Keep it with the transcript so
+        # archive, fork, and deletion share the session's existing lifecycle.
+        segment["file_snapshot"] = dict(event.file_snapshot)
     if event.execution_status is not None:
         segment["execution_status"] = normalize_execution_status(event.execution_status)
 

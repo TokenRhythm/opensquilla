@@ -1011,6 +1011,10 @@ _CREATE_IDX_TRANSCRIPT_CURSOR = """
 CREATE INDEX IF NOT EXISTS idx_transcript_session_cursor
 ON transcript_entries(session_id, created_at, id)
 """
+_CREATE_IDX_TRANSCRIPT_MESSAGE = """
+CREATE INDEX IF NOT EXISTS idx_transcript_session_message
+ON transcript_entries(session_id, message_id, created_at, id)
+"""
 _CREATE_IDX_TRANSCRIPT_TITLE_CANDIDATES = """
 CREATE INDEX IF NOT EXISTS idx_transcript_title_candidates
 ON transcript_entries(session_id, role, content_byte_length, created_at, id)
@@ -1060,6 +1064,10 @@ ON compacted_transcript_entries(session_key)
 _CREATE_IDX_COMPACTED_TRANSCRIPT_CURSOR = """
 CREATE INDEX IF NOT EXISTS idx_compacted_transcript_session_cursor
 ON compacted_transcript_entries(session_id, created_at, original_entry_id, id)
+"""
+_CREATE_IDX_COMPACTED_TRANSCRIPT_MESSAGE = """
+CREATE INDEX IF NOT EXISTS idx_compacted_transcript_session_message
+ON compacted_transcript_entries(session_id, message_id, created_at, original_entry_id, id)
 """
 _CREATE_IDX_COMPACTED_TRANSCRIPT_TITLE_CANDIDATES = """
 CREATE INDEX IF NOT EXISTS idx_compacted_transcript_title_candidates
@@ -2721,10 +2729,12 @@ class SessionStorage:
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_SESSION)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_KEY)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_CURSOR)
+        await self._conn.execute(_CREATE_IDX_TRANSCRIPT_MESSAGE)
         await self._conn.execute(_CREATE_COMPACTED_TRANSCRIPT)
         await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_SESSION)
         await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_KEY)
         await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_CURSOR)
+        await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_MESSAGE)
         await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_COMPACTION)
         await self._conn.execute(_CREATE_SUMMARIES)
         await self._conn.execute(_CREATE_IDX_SUMMARIES)
@@ -15037,6 +15047,69 @@ class SessionStorage:
         if row is None:
             return None
         return TranscriptEntry(**_deserialize_row(dict(row)))
+
+    async def get_canonical_transcript_replay(
+        self,
+        session_id: str,
+        message_id: str,
+        *,
+        max_bytes: int,
+    ) -> dict[str, Any] | None:
+        """Read one bounded replay envelope for an explicitly opened detail.
+
+        Byte admission happens in SQLite before the text crosses into Python.
+        Each indexed source contributes at most one candidate; a newer missing
+        or oversized replay does not fall back to an older version. Normal
+        history projections never need this potentially large internal data.
+        """
+        if max_bytes <= 0:
+            return None
+        sql = """
+            WITH active AS (
+                SELECT id, created_at,
+                    CASE WHEN length(CAST(assistant_replay AS BLOB)) <= ?
+                         THEN assistant_replay ELSE NULL END AS assistant_replay
+                FROM transcript_entries
+                WHERE session_id = ? AND message_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+            ), archived AS (
+                SELECT original_entry_id AS id, created_at,
+                    CASE WHEN length(CAST(assistant_replay AS BLOB)) <= ?
+                         THEN assistant_replay ELSE NULL END AS assistant_replay
+                FROM compacted_transcript_entries
+                WHERE session_id = ? AND message_id = ?
+                ORDER BY created_at DESC, original_entry_id DESC,
+                    compacted_transcript_entries.id DESC
+                LIMIT 1
+            ), candidates AS (
+                SELECT * FROM active
+                UNION ALL
+                SELECT * FROM archived
+            )
+            SELECT assistant_replay FROM candidates
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+        """
+        rows = await self._read_history_query(
+            sql, (max_bytes, session_id, message_id, max_bytes, session_id, message_id),
+        )
+        if not rows or not isinstance(rows[0]["assistant_replay"], str):
+            return None
+        raw = rows[0]["assistant_replay"]
+        budget = current_read_budget()
+        try:
+            if budget is None:
+                decoded = await asyncio.to_thread(json.loads, raw)
+            else:
+                budget.check()
+                task = asyncio.create_task(asyncio.to_thread(json.loads, raw))
+                self._pending_reader_operations.add(task)
+                task.add_done_callback(self._pending_reader_operations.discard)
+                decoded = await budget.wait_for(task)
+        except (json.JSONDecodeError, RecursionError):
+            return None
+        return decoded if isinstance(decoded, dict) else None
 
     @_serialized_read
     async def list_stranded_steer_inputs(self) -> list[StrandedSteerInput]:

@@ -16,6 +16,7 @@ from opensquilla.chat.flattened_tool_markers import (
     strip_confirmed_flattened_tool_result,
     strip_flattened_used_tool_lines,
 )
+from opensquilla.chat.legacy_file_snapshot import project_legacy_write_snapshots
 from opensquilla.content_reader import MAX_DISPLAY_CONTENT_BYTES
 from opensquilla.contracts.tool_presentation import (
     project_tool_arguments_payload,
@@ -910,7 +911,9 @@ def transcript_entries_to_chat_messages(
                 msg["cost_usd"] = float(usage.get("cost_usd") or 0.0)
         tool_calls = [*(silent_reply.segments or []), *legacy_segments]
         if tool_calls:
-            msg["tool_calls"] = _sanitize_display_protocol_payload(tool_calls)
+            msg["tool_calls"] = _sanitize_display_protocol_payload(
+                project_legacy_write_snapshots(tool_calls, msg["message_id"])
+            )
         if (
             silent_reply.suppressed
             and not content

@@ -49,6 +49,22 @@ class UploadStagingStore(Protocol):
     async def put_with_expiry(self, name: str, mime: str, payload: bytes) -> tuple[str, float]: ...
 
 
+def _verify_attachment_material(path: Path, expected_sha: str) -> None:
+    """Verify the entire immutable material without buffering it on the event loop."""
+
+    digest = hashlib.sha256()
+    try:
+        if not path.is_file():
+            raise ContentNotFoundError("attachment not found")
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ContentNotFoundError("attachment not found") from exc
+    if digest.hexdigest() != expected_sha:
+        raise ContentIntegrityError("attachment integrity check failed")
+
+
 class GatewayArtifactContentPort(ArtifactContentPort):
     def __init__(
         self,
@@ -249,14 +265,11 @@ class GatewayArtifactContentPort(ArtifactContentPort):
         except ValueError as exc:
             raise ContentNotFoundError("attachment not found") from exc
         native_path = native_io_path(path)
-        if not native_path.exists() or not native_path.is_file():
-            raise ContentNotFoundError("attachment not found")
-        try:
-            actual_sha = hashlib.sha256(native_path.read_bytes()).hexdigest()
-        except OSError as exc:
-            raise ContentNotFoundError("attachment not found") from exc
-        if actual_sha != query.sha256:
-            raise ContentIntegrityError("attachment integrity check failed")
+        await asyncio.to_thread(_verify_attachment_material, native_path, query.sha256)
+        # The integrity read yields to the event loop just like inline reads;
+        # do not publish old material under a concurrently replaced session.
+        if await self._session_id(query.session_key) != session_id:
+            raise ContentNotFoundError("attachment session changed")
         return ContentMaterial(native_path, "application/octet-stream")
 
     async def _session_id(self, session_key: str) -> str | None:

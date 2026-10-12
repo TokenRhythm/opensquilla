@@ -5520,6 +5520,9 @@ class Agent:
             tool_call=tool_call,
         )
         projected_result.execution_log_handle = result.execution_log_handle
+        projected_result.file_snapshot = (
+            dict(result.file_snapshot) if result.file_snapshot is not None else None
+        )
         if (
             result.execution_log_handle
             and projected_result.content != result.content
@@ -12293,6 +12296,7 @@ class Agent:
                                         tool_name=projected_pending.tool_name,
                                         result=projected_pending.content,
                                         execution_log_handle=projected_pending.execution_log_handle,
+                                        file_snapshot=projected_pending.file_snapshot,
                                         is_error=projected_pending.is_error,
                                         arguments=tc.arguments,
                                         execution_status=projected_pending.execution_status,
@@ -12345,6 +12349,7 @@ class Agent:
                             tool_name=projected_result.tool_name,
                             result=projected_result.content,
                             execution_log_handle=projected_result.execution_log_handle,
+                            file_snapshot=projected_result.file_snapshot,
                             is_error=projected_result.is_error,
                             arguments=tc.arguments,
                             execution_status=projected_result.execution_status,
@@ -12379,6 +12384,7 @@ class Agent:
                                     tool_name=projected_result.tool_name,
                                     result=projected_result.content,
                                     execution_log_handle=projected_result.execution_log_handle,
+                                    file_snapshot=projected_result.file_snapshot,
                                     is_error=projected_result.is_error,
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
@@ -12509,6 +12515,7 @@ class Agent:
                                     tool_name=projected_result.tool_name,
                                     result=projected_result.content,
                                     execution_log_handle=projected_result.execution_log_handle,
+                                    file_snapshot=projected_result.file_snapshot,
                                     is_error=projected_result.is_error,
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
@@ -12550,6 +12557,7 @@ class Agent:
                                     tool_name=projected_result.tool_name,
                                     result=projected_result.content,
                                     execution_log_handle=projected_result.execution_log_handle,
+                                    file_snapshot=projected_result.file_snapshot,
                                     is_error=projected_result.is_error,
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
@@ -12571,6 +12579,7 @@ class Agent:
                             tool_name=projected_result.tool_name,
                             result=projected_result.content,
                             execution_log_handle=projected_result.execution_log_handle,
+                            file_snapshot=projected_result.file_snapshot,
                             is_error=projected_result.is_error,
                             arguments=tc.arguments,
                             execution_status=projected_result.execution_status,

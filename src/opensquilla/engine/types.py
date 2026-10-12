@@ -229,6 +229,7 @@ class ToolResultEvent:
     generation_epoch: int = 0
     tool_presentation: dict[str, Any] | None = None
     execution_log_handle: str | None = None
+    file_snapshot: dict[str, Any] | None = None
 
 
 @dataclass
@@ -413,6 +414,12 @@ def public_agent_event_payload(event: Any) -> dict[str, Any]:
     if isinstance(event, DoneEvent):
         payload = asdict(replace(event, assistant_replay=None))
         payload.pop("assistant_replay", None)
+        return payload
+    if isinstance(event, ToolResultEvent) and event.is_error:
+        # A failed mutation must never advertise a successful file snapshot,
+        # including callers that construct events outside the tool dispatcher.
+        payload = asdict(replace(event, file_snapshot=None))
+        payload.pop("file_snapshot", None)
         return payload
     return asdict(event)
 

@@ -175,6 +175,10 @@ def _tool_call_content(tool_call: dict[str, Any]) -> str:
     function = tool_call.get("function")
     if isinstance(function, dict) and function.get("arguments") is not None:
         return str(function.get("arguments") or "")
+    if tool_call.get("type") == "tool_result" and "file_snapshot" in tool_call:
+        # File previews belong to the session transcript, not memory sidecars.
+        # Preserve real tool data with this key inside input/result payloads.
+        tool_call = {key: value for key, value in tool_call.items() if key != "file_snapshot"}
     return json.dumps(tool_call, ensure_ascii=False, sort_keys=True, default=str)
 
 

@@ -30,6 +30,7 @@ import structlog
 
 from opensquilla.engine.hooks import ToolHook, ToolHookCall, ToolHookResult
 from opensquilla.execution_status import normalize_execution_status
+from opensquilla.file_snapshot import retain_file_snapshot
 from opensquilla.result_budget import (
     DEFAULT_TOOL_RESULT_BUDGET_POLICY,
     DEFAULT_TOOL_RUN_BUDGET_POLICY,
@@ -76,6 +77,7 @@ from opensquilla.tools.types import (
     ProjectedToolArgumentsError,
     ToolContext,
     current_execution_log,
+    current_file_snapshot,
     current_tool_context,
 )
 
@@ -1431,6 +1433,8 @@ def build_tool_handler(
         token = current_tool_context.set(effective_ctx)
         execution_log: dict[str, str] = {}
         log_token = current_execution_log.set(execution_log)
+        file_snapshot: dict[str, Any] = {}
+        snapshot_token = current_file_snapshot.set(file_snapshot)
         tool_started_at = time.monotonic()
         raw_result: Any = None
         exception: BaseException | None = None
@@ -1515,8 +1519,19 @@ def build_tool_handler(
                         registered,
                     )
                     final_result.execution_log_handle = execution_log.get("handle")
+                    if (
+                        file_snapshot
+                        and exception is None
+                        and not final_result.is_error
+                        and (final_result.execution_status or {}).get("reason")
+                        != "approval_pending"
+                    ):
+                        final_result.file_snapshot = await retain_file_snapshot(
+                            file_snapshot, context=effective_ctx,
+                        )
                     return final_result
             finally:
+                current_file_snapshot.reset(snapshot_token)
                 current_execution_log.reset(log_token)
                 current_tool_context.reset(token)
 

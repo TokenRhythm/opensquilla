@@ -15,6 +15,7 @@ from collections.abc import Sequence
 from pathlib import Path, PurePath
 from typing import Any
 
+from opensquilla.file_snapshot import build_file_edit_snapshot
 from opensquilla.sandbox.directory_listing import format_directory_entry
 from opensquilla.sandbox.path_aliases import resolve_workspace_alias
 from opensquilla.sandbox.permissions import (
@@ -661,10 +662,12 @@ def _edit_text(payload: dict[str, Any]) -> dict[str, object]:
     count = original.count(old_text)
     if count > 1:
         raise ValueError(f"old_text matches {count} locations in {path}; be more specific")
-    _write_utf8_safely(path, original.replace(old_text, new_text, 1), create=False)
+    updated = original.replace(old_text, new_text, 1)
+    _write_utf8_safely(path, updated, create=False)
     return {
         "message": f"Edited {path}: replaced {len(old_text)} chars with {len(new_text)} chars",
         "created": False,
+        "file_snapshot": build_file_edit_snapshot(str(path), original, updated),
     }
 
 

@@ -648,6 +648,27 @@ def _json_text(value: Any) -> str:
         return str(value)
 
 
+def _tool_calls_without_display_snapshots(tool_calls: Any) -> Any:
+    """Exclude persisted file previews from provider-facing projections only.
+
+    A snapshot belongs to its tool-result segment, not the tool's result or
+    arguments. Do not recursively remove same-named fields from user data.
+    The canonical transcript retains the original segments unchanged.
+    """
+    if not isinstance(tool_calls, list):
+        return tool_calls
+    return [
+        {key: value for key, value in segment.items() if key != "file_snapshot"}
+        if (
+            isinstance(segment, dict)
+            and segment.get("type") == "tool_result"
+            and "file_snapshot" in segment
+        )
+        else segment
+        for segment in tool_calls
+    ]
+
+
 def estimate_entry_replay_tokens(entry: Any) -> int:
     """Estimate the compaction-input size of a persisted transcript entry."""
 
@@ -664,7 +685,7 @@ def estimate_entry_replay_tokens(entry: Any) -> int:
     content_tokens = max(persisted_tokens, estimated_content_tokens)
 
     extra_parts: list[str] = []
-    tool_calls = _entry_get(entry, "tool_calls")
+    tool_calls = _tool_calls_without_display_snapshots(_entry_get(entry, "tool_calls"))
     if tool_calls:
         tool_summary = _summarize_tool_calls_for_llm(tool_calls)
         extra_parts.append(tool_summary or _json_text(tool_calls))
@@ -754,7 +775,7 @@ def estimate_entry_model_replay_tokens(
         content_tokens = max(persisted_tokens, estimated_content_tokens)
 
     extra_parts: list[str] = []
-    tool_calls = _entry_get(entry, "tool_calls")
+    tool_calls = _tool_calls_without_display_snapshots(_entry_get(entry, "tool_calls"))
     if tool_calls:
         extra_parts.append(_json_text(tool_calls))
     tool_call_id = _entry_get(entry, "tool_call_id")
@@ -1095,6 +1116,8 @@ def _entry_model_replay_payload(
         return replay_payload
     for key in ("tool_calls", "tool_call_id", "reasoning_content"):
         value = _entry_get(entry, key)
+        if key == "tool_calls":
+            value = _tool_calls_without_display_snapshots(value)
         if value:
             payload[key] = value
     return payload
@@ -2152,7 +2175,9 @@ def _attachment_safe_obligation_entries(
     for entry in entries:
         safe_entry = dict(entry)
         if "tool_calls" in safe_entry:
-            safe_entry["tool_calls"] = _project_compaction_images(safe_entry.get("tool_calls"))
+            safe_entry["tool_calls"] = _project_compaction_images(
+                _tool_calls_without_display_snapshots(safe_entry.get("tool_calls"))
+            )
         content = str(entry.get("content") or "")
         session_id = str(entry.get("session_id") or "compaction")
         message_id = str(entry.get("message_id") or entry.get("id") or "unknown")
@@ -2208,7 +2233,7 @@ def _summarize_tool_value(value: Any) -> str:
 
 
 def _summarize_tool_calls_for_llm(tool_calls: Any) -> str:
-    tool_calls = _project_compaction_images(tool_calls)
+    tool_calls = _project_compaction_images(_tool_calls_without_display_snapshots(tool_calls))
     if not isinstance(tool_calls, list) or not tool_calls:
         return ""
     lines = ["[tool payload summary]"]

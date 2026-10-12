@@ -24,6 +24,7 @@ from xml.etree import ElementTree as ET
 
 import structlog
 
+from opensquilla.file_snapshot import build_file_edit_snapshot
 from opensquilla.sandbox.backup_vault import BackupReceiptSummary, summarize_backup_receipts
 from opensquilla.sandbox.destructive_backup import DestructiveBackupGate
 from opensquilla.sandbox.directory_listing import format_directory_entry
@@ -83,6 +84,7 @@ from opensquilla.tools.types import (
     SafeToolError,
     ToolError,
     WorkspaceAccessError,
+    current_file_snapshot,
     current_tool_context,
 )
 from opensquilla.tools.write_tracking import (
@@ -97,6 +99,12 @@ from opensquilla.tools.write_tracking import (
 )
 
 log = structlog.get_logger(__name__)
+
+
+def _capture_file_snapshot(snapshot: dict[str, Any]) -> None:
+    target = current_file_snapshot.get()
+    if target is not None:
+        target.update(snapshot)
 
 
 def _settlement_duration_bucket(duration_ms: int) -> str:
@@ -2339,6 +2347,7 @@ async def write_file(
             _write_full_host,
             settle=_settle_full_host,
         )
+        _capture_file_snapshot({"kind": "write", "path": path, "content": content})
         return f"Written {len(content)} bytes to {p}"
 
     approval, elevated, backup_summaries = await _gate_out_of_workspace_write(
@@ -2389,6 +2398,7 @@ async def write_file(
             record_scratch_file_write(p)
             _notify_memory_source_write(p)
             _notify_bootstrap_source_write(p)
+            _capture_file_snapshot({"kind": "write", "path": path, "content": content})
             return str(getattr(sandbox_result, "message")) + _backup_receipt_note(
                 backup_summaries
             )
@@ -2417,6 +2427,7 @@ async def write_file(
             _notify_bootstrap_source_write(p)
 
     await _run_executor_mutation(_write, settle=_settle_write)
+    _capture_file_snapshot({"kind": "write", "path": path, "content": content})
     return (
         f"Written {len(content)} bytes to {p}{_write_scope_suffix(p)}"
         f"{_backup_receipt_note(backup_summaries)}"
@@ -2924,6 +2935,9 @@ async def edit_file(
             _write_full_host,
             settle=_settle_full_host,
         )
+        _capture_file_snapshot(
+            await asyncio.to_thread(build_file_edit_snapshot, path, original, updated),
+        )
         if len(replacements) == 1:
             replacement = replacements[0]
             return (
@@ -2986,6 +3000,14 @@ async def edit_file(
                 record_scratch_file_write(p)
                 _notify_memory_source_write(p)
                 _notify_bootstrap_source_write(p)
+                metadata = getattr(sandbox_result, "metadata", {})
+                snapshot = metadata.get("file_snapshot") if isinstance(metadata, dict) else None
+                if (
+                    isinstance(snapshot, dict)
+                    and snapshot.get("kind") == "edit"
+                    and isinstance(snapshot.get("content"), str)
+                ):
+                    _capture_file_snapshot({**snapshot, "path": path})
                 return str(getattr(sandbox_result, "message")) + _backup_receipt_note(
                     backup_summaries
                 )
@@ -3027,6 +3049,9 @@ async def edit_file(
             _notify_bootstrap_source_write(p)
 
     await _run_executor_mutation(_write, settle=_settle_edit)
+    _capture_file_snapshot(
+        await asyncio.to_thread(build_file_edit_snapshot, path, original, updated),
+    )
     if len(replacements) == 1:
         replacement = replacements[0]
         return (

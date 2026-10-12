@@ -18,6 +18,7 @@ from functools import partial
 from pathlib import Path, PurePath
 from typing import Any
 
+from opensquilla.file_snapshot import MAX_FILESYSTEM_REPLY_BYTES
 from opensquilla.process_tree import (
     create_owned_subprocess_exec,
 )
@@ -183,28 +184,20 @@ class WindowsDefaultBackend(Backend):
             raise SandboxBackendError(f"helper_launch_failed: {exc}") from exc
 
         try:
-            if structured_output:
-                # Filesystem worker JSON has its own receipt contract; do not
-                # impose the ordinary process collector on structured results.
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(), timeout=helper_wall,
-                )
-                stderr_bytes, helper_timed_out = _extract_authenticated_helper_timeout(
-                    stderr_bytes, expected_nonce=str(payload["helperNonce"]),
-                )
-                trunc_out = trunc_err = False
-                helper_error = None
-            else:
-                collection = asyncio.create_task(
-                    _collect_process_output(proc, expected_nonce=str(payload["helperNonce"])),
-                )
-                captured, errors = await asyncio.wait_for(
-                    asyncio.shield(collection),
-                    timeout=helper_wall,
-                )
-                stdout_bytes, stderr_bytes = bytes(captured.data), bytes(errors.data)
-                trunc_out, trunc_err = captured.truncated, errors.truncated
-                helper_timed_out, helper_error = errors.timed_out, errors.helper_error
+            collection = asyncio.create_task(
+                _collect_process_output(
+                    proc, expected_nonce=str(payload["helperNonce"]),
+                    stdout_byte_cap=(
+                        MAX_FILESYSTEM_REPLY_BYTES if structured_output else _OUTPUT_BYTE_CAP
+                    ),
+                ),
+            )
+            captured, errors = await asyncio.wait_for(
+                asyncio.shield(collection), timeout=helper_wall,
+            )
+            stdout_bytes, stderr_bytes = bytes(captured.data), bytes(errors.data)
+            trunc_out, trunc_err = captured.truncated, errors.truncated
+            helper_timed_out, helper_error = errors.timed_out, errors.helper_error
         except asyncio.CancelledError:
             await _terminate_owned_helper(proc)
             raise
@@ -244,14 +237,13 @@ class WindowsDefaultBackend(Backend):
         if owner is not None:
             await _terminate_owned_helper(proc)
         elapsed = time.monotonic() - started
-        stdout, decode_trunc_out = _decode_capped(stdout_bytes)
+        stdout, decode_trunc_out = (
+            (decode_subprocess_output(stdout_bytes or b""), False)
+            if structured_output else _decode_capped(stdout_bytes)
+        )
         stderr, decode_trunc_err = _decode_capped(stderr_bytes)
         trunc_out |= decode_trunc_out
         trunc_err |= decode_trunc_err
-        if structured_output:
-            helper_error = _authenticated_helper_error(
-                stderr, expected_nonce=str(payload["helperNonce"]),
-            )
         if proc.returncode not in {None, 0} and helper_error is not None:
             if "helper_root_unavailable:" in helper_error:
                 detail = helper_error.split("helper_root_unavailable:", 1)[1].strip()
@@ -273,9 +265,9 @@ class WindowsDefaultBackend(Backend):
 
 
 async def _collect_process_output(
-    proc: Any, *, expected_nonce: str,
+    proc: Any, *, expected_nonce: str, stdout_byte_cap: int = _OUTPUT_BYTE_CAP,
 ) -> tuple[BoundedOutput, HelperStderr]:
-    output = BoundedOutput(_OUTPUT_BYTE_CAP)
+    output = BoundedOutput(stdout_byte_cap)
     errors = HelperStderr(_OUTPUT_BYTE_CAP, expected_nonce)
 
     async def drain(stream: asyncio.StreamReader, capture: BoundedOutput) -> None:

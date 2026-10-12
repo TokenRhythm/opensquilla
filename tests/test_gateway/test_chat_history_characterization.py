@@ -91,7 +91,9 @@ class _HistoryManager:
         limit: int,
         before: tuple[int, int] | None = None,
         after: tuple[int, int] | None = None,
+        content_mode: str = "full",
     ) -> dict[str, Any]:
+        assert content_mode == "bounded"
         self.canonical_calls.append(
             {"session_key": session_key, "limit": limit, "before": before, "after": after}
         )
@@ -132,7 +134,10 @@ class _HistoryManager:
             has_more = True
         return {"entries": page, "has_more": has_more, "canonical_complete": True}
 
-    async def get_transcript(self, session_key: str) -> list[TranscriptEntry]:
+    async def get_transcript(
+        self, session_key: str, *, content_mode: str = "full",
+    ) -> list[TranscriptEntry]:
+        assert content_mode == "bounded"
         self.active_calls.append(session_key)
         self._check_key(session_key)
         return list(self.entries)
