@@ -1406,6 +1406,11 @@ jobs:
           printf 'OPENSQUILLA_STATE_DIR=%s/opensquilla-state\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           printf 'OPENSQUILLA_LOG_DIR=%s/opensquilla-logs\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -1489,6 +1494,8 @@ jobs:
             python --version
             uv --version
             uv run pytest --version
+            node --version
+            node -p 'process.execPath'
           } >> "${CI_REPORT_DIR}/environment.txt" 2>&1
 
       - name: Provision distinct Windows test volumes
@@ -1561,6 +1568,8 @@ jobs:
             regression_args+=(
               tests/test_sandbox/test_windows_shell_process_runtime.py
               tests/test_live_long_task_case_driver.py
+              tests/test_ci/test_upgrade_baselines.py
+              tests/test_engine/test_runtime_router_fallback.py
             )
           elif [[ "${family}" == "core" ]]; then
             regression_args+=(
@@ -1571,6 +1580,12 @@ jobs:
               tests/test_tools/test_shell_workdir.py
               tests/test_sandbox/test_shell_code_network_hints.py
               tests/test_tools/test_shell_runtime_preflight.py
+              tests/test_tools/test_shell_blocking_launch.py
+              tests/test_ci/test_rpc_architecture_contracts.py
+            )
+          elif [[ "${family}" == "gateway-sqlite" ]]; then
+            regression_args+=(
+              tests/test_gateway/test_native_attachment_import.py
             )
           fi
           # Windows workers hit access violations during timed stack dumps.

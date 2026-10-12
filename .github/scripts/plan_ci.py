@@ -1808,6 +1808,9 @@ def plan_changes(
                     "wheel-webui-roundtrip",
                 }
             )
+            if path == "opensquilla-webui/.node-version":
+                suites.add("windows-high-risk")
+                windows_full_matrix = True
             reasons.add("webui_dependency_changed")
             continue
         if dependency_domain == "electron":
