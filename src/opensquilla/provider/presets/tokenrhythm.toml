@@ -1,0 +1,45 @@
+# Packaged SquillaRouter tier preset. Loaded by
+# opensquilla.provider.preset_registry. Curated but NOT persistable: the
+# tokenrhythm id never becomes a squilla_router.tier_profile value (the
+# accepted set stays pinned to the legacy nine — downgrade contract), so
+# provider saves and boot defaults apply these tiers inline instead.
+# No thinking_level on purpose: packaged routes preserve the provider-declared
+# default. Explicit turn settings may control exact official V4 models without
+# assigning the same reasoning dialect to the other families in this ladder.
+[preset]
+id = "tokenrhythm"
+provider = "tokenrhythm"
+label = "TokenRhythm"
+description = "Curated TokenRhythm router ladder (DeepSeek V4 Flash/Pro, Kimi K2.7 Code, GLM 5.2), applied as inline tiers."
+default_model = "deepseek-v4-pro"
+
+[tiers.c0]
+provider = "tokenrhythm"
+model = "deepseek-v4-flash"
+description = "fast DeepSeek V4 Flash route for trivial chat, short rewrites, extraction, and low-risk simple Q&A"
+supports_image = false
+
+[tiers.c1]
+provider = "tokenrhythm"
+model = "deepseek-v4-pro"
+description = "default balanced text model for normal agent work, coding assistance, debugging, and moderate analysis"
+supports_image = false
+
+[tiers.c2]
+provider = "tokenrhythm"
+model = "kimi-k2.7-code"
+description = "stronger Kimi K2.7 Code route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
+supports_image = false
+
+[tiers.c3]
+provider = "tokenrhythm"
+model = "glm-5.2"
+description = "Highest-tier GLM 5.2 route for difficult planning, deep review, complex debugging, and high-stakes synthesis"
+supports_image = false
+
+[tiers.image_model]
+provider = "tokenrhythm"
+model = "kimi-k2.6"
+description = "Image model: vision-capable route for user-supplied image attachments, screenshots, diagrams, and visual question answering"
+supports_image = true
+image_only = true

@@ -1,0 +1,136 @@
+You are working in a real software repository checked out at the current
+working directory. You will resolve the task below by changing the code and
+proving your change works.
+
+ENVIRONMENT
+- The repository is your workspace. You may read, edit, run tests, and run
+  shell commands here.
+- Put throwaway files (reproduction scripts, notes, the verification
+  manifest) under the scratch directory: {scratch_dir}
+  Do NOT leave scratch files inside the repository — they would pollute the
+  change.
+- Dependencies may NOT be installed yet. Installing them and getting the test
+  suite to run is part of your task.
+- You have network access (you may read documentation and fetch packages).
+{env_hints}
+TASK
+{task}
+
+HOW TO PROCEED
+
+WORK EFFICIENTLY — each tool call is a full model round-trip (tens of
+seconds); total wall time is dominated by the NUMBER of steps, not the work
+per step. Do as much as possible per step:
+- Batch exploration: prefer ONE shell command that runs several greps/reads
+  (e.g. `grep -rn PATTERN src/ ; sed -n '1,60p' a.py b.py`) over many tiny
+  single-purpose calls. Gather what you need in a few steps, not dozens.
+- Write complete files and make all related edits in as few calls as
+  possible; do not dribble one small change per step.
+- While iterating, run the TARGETED acceptance test (not the whole suite
+  every time); save the full regression for Phase 5.
+- Prefer a few large steps over many tiny ones. This does NOT mean cutting
+  corners — correctness still beats speed — it means not wasting round-trips.
+
+Phase 1 — UNDERSTAND
+  Restate the task in your own words. Identify the expected behavior change:
+  what is wrong or missing now, and what should be true after your change.
+
+Phase 2 — RUN THE PROJECT
+  Find how the project builds, installs, and tests (check CI config, README,
+  Makefile). Install only what you NEED to run the specific test you will
+  write — the minimal, fastest path (core deps + the relevant module), NOT
+  every optional extra, heavy model/data download, or unrelated component;
+  on a big repo a lighter install reaches red->green far faster. Then run
+  the existing tests (or the relevant subset) to confirm the harness works
+  before you change anything.
+
+Phase 3 — WRITE ACCEPTANCE TESTS FIRST (red)
+  TESTABILITY GATE — decide this FAST, up front, before sinking time: can
+  this change be proven by a DETERMINISTIC automated test you can run here?
+  Some changes cannot — e.g. UI/browser interaction or event-timing
+  behavior, things needing a real GUI/network/hardware, or an area of the
+  repo with no usable test harness. If it is NOT automatically testable, do
+  NOT burn the run trying to force a test: make the code change anyway, set
+  "testable": false with a concrete "not_testable_reason", and finish. Also
+  bail this way if, after a couple of HONEST attempts, you cannot get a test
+  to genuinely FAIL on the current code for the RIGHT reason — stop, mark it
+  not testable, explain why, and proceed; do NOT keep grinding until the
+  timeout.
+  When a real automated test IS feasible: write one or more tests that
+  encode the expected behavior from Phase 1, run them and CONFIRM THEY FAIL
+  on the current code. A test that passes immediately proves nothing — make
+  it genuinely fail for the right reason first.
+
+Phase 4 — IMPLEMENT (green)
+  Make the minimal change to non-test code so your acceptance tests pass.
+
+Phase 5 — REGRESSION
+  Run the project's existing test suite (or the relevant subset) and make
+  sure you did not break anything.
+
+Phase 6 — RECORD THE VERIFICATION MANIFEST (required)
+  Write a JSON file at {scratch_dir}/{manifest_name} describing how to verify
+  your work. The runner will independently re-run these. Schema:
+
+    {{
+      "testable": true,
+      "acceptance_tests": [
+        {{
+          "name": "short label",
+          "command": "exact shell command, run from the repo root",
+          "test_paths": ["path/to/the/test/file/you/added.py"]
+        }}
+      ],
+      "regression_command": "command that runs the existing suite (optional)",
+      "assumptions": ["any assumption you made about ambiguous requirements"],
+      "not_testable_reason": ""
+    }}
+
+  Rules for the manifest:
+  - "command" must exit 0 when your change is present and non-zero without it.
+  - "command" MUST be relative to the repository root. Do NOT `cd` to an
+    absolute path of this working copy. The runner runs the command from the
+    repo root AND re-runs it in a throwaway checkout of the original code to
+    confirm it fails there; an absolute `cd` back into this (already-fixed)
+    copy would defeat that check. Use a relative invocation, e.g.
+    `PYTHONPATH=src python -m pytest tests/test_x.py::test_y`.
+  - The runner re-runs "command" / "regression_command" in a PLAIN shell (your
+    venv is NOT activated; the red check also re-runs in a base worktree). Pick
+    the interpreter the SAME way you actually verified the test:
+      * uv project (a `uv.lock` exists): use `uv run` so test deps are
+        GUARANTEED present, e.g.
+        `PYTHONPATH=src uv run --locked python -m pytest tests/test_x.py::test_y`
+        (if pytest lives in an optional group, add the RIGHT flag: `--extra
+        <name>` for `[project.optional-dependencies]` (e.g. `--extra dev`), or
+        `--group <name>` for `[dependency-groups]` (e.g. `--group dev`)). The
+        runner pins UV_PROJECT to this repo, so
+        `uv run` reuses THIS repo's environment even in the base worktree. Use
+        `--locked` (NOT a bare `uv run`) so verification never rewrites uv.lock.
+      * non-uv project: use a BARE interpreter name — `python` if you made a
+        `.venv` (the runner makes `python`/`python3` resolve to it), else
+        `python3`. Ensure its test deps (pytest) are installed first.
+    EITHER way: ALWAYS keep imports repo-relative (`PYTHONPATH=src ...`); NEVER
+    write `.venv/bin/python` or any `.venv/...` path (the base worktree has
+    none), never `source .venv/bin/activate`, and do NOT rely on an editable /
+    `pip install -e` install — the red check must import the BASE code from the
+    worktree, not your fix.
+  - "test_paths" must list the test files you ADDED/CHANGED so the runner can
+    re-create the red state on the original code. This is required.
+  - If the task genuinely cannot be expressed as a DETERMINISTIC automated
+    test — pure docs or config, OR UI/browser/event-timing behavior, OR an
+    area with no usable test harness — set "testable": false and explain in
+    "not_testable_reason". Decide this EARLY (Phase 3), not after burning the
+    run.
+  - If you find the expected behavior ALREADY holds before any change, still
+    write the acceptance test and record your finding in "assumptions".
+  - Record any assumption you made when the task was ambiguous, so the user
+    can catch a wrong interpretation.
+
+Phase 7 — COMMIT
+  Commit your change on the current branch with a clear message. Do not
+  commit scratch files.
+
+Be thorough WHERE a test is feasible — getting it to truly go from red to
+green is more important than speed. But do NOT grind on an untestable
+change: a fast, honest "not_testable" with the change made beats burning
+the whole run failing to write a test.

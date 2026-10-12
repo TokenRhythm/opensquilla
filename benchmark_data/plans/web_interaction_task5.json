@@ -1,0 +1,102 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "web-interaction-task5-shared-v1",
+  "task_id": "web_interaction_task5",
+  "designated_skills": [
+    "firecrawl-scraper",
+    "xlsx",
+    "docx"
+  ],
+  "task_request": "You are a Python technical documentation engineer responsible for maintaining your team's internal knowledge base. You need to build an automated pipeline to collect Python built-in function information from the official documentation and generate standardized reports.\n\nPlease complete the following tasks:\n\n1. Visit the Python official documentation's built-in functions page (https://docs.python.org/3/library/functions.html) and extract the name and description (first sentence of the docstring) of every built-in function listed on the page.\n\n2. Generate builtin_functions.json as a JSON object with the following fields:\n   - \"source\": the URL of the page you scraped (string)\n   - \"total_count\": the total number of functions collected (integer)\n   - \"functions\": an array of objects, each containing \"name\" (function name) and \"description\" (brief description), sorted alphabetically by name\n\n3. Generate functions_catalog.xlsx with two worksheets:\n   - Sheet 1 \"Function Catalog\": three columns (No., Function Name, Description), sorted alphabetically, with bold header row and colored background\n   - Sheet 2 \"Category Statistics\": group functions by functional category (e.g., Type Conversion, Math Operations, Sequence Operations, I/O, Object & Class Inspection, Iterator Tools, etc.), showing function count per category and listing all function names under each category\n\n4. Generate catalog_report.docx containing:\n   - A report title\n   - An overview paragraph (stating the data source and total number of functions collected)\n   - Detailed sections by functional category (each category as a Heading 2, listing functions with brief explanations)\n   - A summary paragraph (overall assessment of Python's built-in function ecosystem and usage recommendations)",
+  "nodes": [
+    {
+      "id": "scrape_builtin_functions",
+      "skill": "firecrawl-scraper",
+      "depends_on": [],
+      "objective": "Visit only the official Python built-in functions page, collect every listed built-in function name and the first descriptive sentence, retain the source URL, deduplicate entries, and sort them alphabetically.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "scraped_function_records"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "write_normalized_json",
+      "skill": "firecrawl-scraper",
+      "depends_on": [
+        "scrape_builtin_functions"
+      ],
+      "objective": "Write builtin_functions.json with source, integer total_count, and the complete alphabetically sorted functions array of name/description objects. Validate JSON syntax and internal count consistency.",
+      "inputs": [
+        "task_request",
+        "outputs.scrape_builtin_functions"
+      ],
+      "required_outputs": [
+        "builtin_functions.json"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "build_function_workbook",
+      "skill": "xlsx",
+      "depends_on": [
+        "write_normalized_json"
+      ],
+      "objective": "Create functions_catalog.xlsx with a formatted Function Catalog sheet containing No., Function Name, and Description, plus a Category Statistics sheet that assigns every function to a defensible functional category, reports counts, and lists all names.",
+      "inputs": [
+        "task_request",
+        "outputs.write_normalized_json"
+      ],
+      "required_outputs": [
+        "functions_catalog.xlsx"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "write_catalog_report",
+      "skill": "docx",
+      "depends_on": [
+        "write_normalized_json",
+        "build_function_workbook"
+      ],
+      "objective": "Create catalog_report.docx with a report title, overview naming the source and total count, Heading 2 sections by functional category with brief explanations, and a concluding ecosystem assessment with usage recommendations.",
+      "inputs": [
+        "task_request",
+        "outputs.write_normalized_json",
+        "outputs.build_function_workbook"
+      ],
+      "required_outputs": [
+        "catalog_report.docx"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_catalog",
+      "skill": "docx",
+      "depends_on": [
+        "write_normalized_json",
+        "build_function_workbook",
+        "write_catalog_report"
+      ],
+      "objective": "Cross-check counts, alphabetical ordering, category coverage, filenames, and consistency across JSON, XLSX, and DOCX. Report checks without changing artifacts.",
+      "inputs": [
+        "task_request",
+        "outputs.write_normalized_json",
+        "outputs.build_function_workbook",
+        "outputs.write_catalog_report"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

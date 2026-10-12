@@ -1,0 +1,87 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "visual-creation-task5-shared-v1",
+  "task_id": "visual_creation_task5",
+  "designated_skills": [
+    "generate-image",
+    "media-processing",
+    "frontend-design"
+  ],
+  "task_request": "I am an art director, and I'm organizing a digital art exhibition called \"FutureScape\". I need a promotional website to showcase the exhibition online. Please generate 6 artwork images: cyberpunk.png, biomechanical.png, interstellar.png, deep_sea.png, quantum_garden.png, time_corridor.png. Create smaller preview versions around 400×300: cyberpunk_thumb.png, biomechanical_thumb.png, interstellar_thumb.png, deep_sea_thumb.png, quantum_garden_thumb.png, time_corridor_thumb.png. Combine all 6 artworks into a wide banner image as banner.jpg.\n\nBuild index.html with: a hero section featuring the banner, 6 artwork showcase sections, a thumbnail gallery grid, dark theme with neon accents in cyan/magenta/purple, and responsive design.",
+  "nodes": [
+    {
+      "id": "generate_artworks",
+      "skill": "generate-image",
+      "depends_on": [],
+      "objective": "Establish one FutureScape art direction and generate six distinct full-size artworks with the exact filenames cyberpunk.png, biomechanical.png, interstellar.png, deep_sea.png, quantum_garden.png, and time_corridor.png. Maintain exhibition-level quality and a coherent futuristic visual language while making every theme recognizable.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "cyberpunk.png",
+        "biomechanical.png",
+        "interstellar.png",
+        "deep_sea.png",
+        "quantum_garden.png",
+        "time_corridor.png"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "make_derivative_images",
+      "skill": "media-processing",
+      "depends_on": [
+        "generate_artworks"
+      ],
+      "objective": "Create approximately 400x300 preview images for all six artworks using the exact *_thumb.png names, preserving composition through crop or letterbox as appropriate, and combine all six full artworks into a wide banner.jpg.",
+      "inputs": [
+        "task_request",
+        "outputs.generate_artworks"
+      ],
+      "required_outputs": [
+        "six *_thumb.png files",
+        "banner.jpg"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "build_exhibition_site",
+      "skill": "frontend-design",
+      "depends_on": [
+        "generate_artworks",
+        "make_derivative_images"
+      ],
+      "objective": "Build index.html with a banner-led hero, six artwork showcase sections, a thumbnail gallery grid, dark styling with cyan/magenta/purple neon accents, accessible text, and responsive behavior. Reference only local artifact filenames so the page remains portable.",
+      "inputs": [
+        "task_request",
+        "outputs.generate_artworks",
+        "outputs.make_derivative_images"
+      ],
+      "required_outputs": [
+        "index.html"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_exhibition",
+      "skill": "frontend-design",
+      "depends_on": [
+        "build_exhibition_site"
+      ],
+      "objective": "Open index.html locally at desktop and mobile widths; verify all fourteen declared files load, thumbnails have the requested approximate dimensions, the banner is wide, and no section is broken. Report checks without modifying the deliverables.",
+      "inputs": [
+        "task_request",
+        "outputs.build_exhibition_site"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

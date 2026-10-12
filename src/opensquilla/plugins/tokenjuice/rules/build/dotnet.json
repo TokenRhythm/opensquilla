@@ -1,0 +1,36 @@
+{
+  "id": "build/dotnet",
+  "family": "build-dotnet",
+  "description": "Compact dotnet build and restore output while preserving diagnostics and final summaries.",
+  "match": {
+    "toolNames": ["exec"],
+    "argv0": ["dotnet"],
+    "argvIncludesAny": [["build"], ["restore"], ["publish"]]
+  },
+  "transforms": {
+    "stripAnsi": true,
+    "dedupeAdjacent": true,
+    "trimEmptyEdges": true
+  },
+  "summarize": {
+    "head": 12,
+    "tail": 12
+  },
+  "failure": {
+    "preserveOnFailure": true,
+    "head": 18,
+    "tail": 18
+  },
+  "counters": [
+    {
+      "name": "error",
+      "pattern": "error [A-Z]+\\d+|Build FAILED|failed",
+      "flags": "i"
+    },
+    {
+      "name": "warning",
+      "pattern": "warning [A-Z]+\\d+|warning",
+      "flags": "i"
+    }
+  ]
+}

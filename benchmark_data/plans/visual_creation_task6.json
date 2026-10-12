@@ -1,0 +1,82 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "visual-creation-task6-shared-v1",
+  "task_id": "visual_creation_task6",
+  "designated_skills": [
+    "generate-image",
+    "scroll-experience"
+  ],
+  "task_request": "I am a science museum curator, and I want to build an immersive online exhibit for our \"History of Human Space Exploration\" display. Please create a scrolling web page with 5 illustrated chapters. Generate illustrations for each milestone: chapter_1.png for Sputnik 1957, chapter_2.png for Apollo moon landing 1969, chapter_3.png for the Space Shuttle era, chapter_4.png for the ISS, and chapter_5.png for a Mars colonization concept.\n\nCreate index.html with full-screen sections for each chapter, smooth scrolling with layered depth effects, text animations that reveal content as you scroll, a progress indicator bar, and responsive design for different screen sizes.",
+  "nodes": [
+    {
+      "id": "define_exhibit_visual_system",
+      "skill": "generate-image",
+      "depends_on": [],
+      "objective": "Define a historically legible five-chapter illustration system for Sputnik 1957, Apollo 1969, the Space Shuttle era, the ISS, and a future Mars colony, with coherent color, typography-safe composition, aspect ratio, and narrative progression.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "five_chapter_prompt_spec"
+      ],
+      "write_access": false,
+      "network_access": false
+    },
+    {
+      "id": "generate_chapter_illustrations",
+      "skill": "generate-image",
+      "depends_on": [
+        "define_exhibit_visual_system"
+      ],
+      "objective": "Generate five coherent, distinct milestone illustrations and save them exactly as chapter_1.png through chapter_5.png, with visual details appropriate to each period and generous safe areas for web text overlays.",
+      "inputs": [
+        "task_request",
+        "outputs.define_exhibit_visual_system"
+      ],
+      "required_outputs": [
+        "chapter_1.png",
+        "chapter_2.png",
+        "chapter_3.png",
+        "chapter_4.png",
+        "chapter_5.png"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "build_scrolling_exhibit",
+      "skill": "scroll-experience",
+      "depends_on": [
+        "generate_chapter_illustrations"
+      ],
+      "objective": "Create index.html with five full-screen illustrated chapters, accurate milestone copy, smooth natural scrolling, layered depth effects, reveal animations, a progress bar, responsive mobile behavior, reduced-motion support, and local image references.",
+      "inputs": [
+        "task_request",
+        "outputs.generate_chapter_illustrations"
+      ],
+      "required_outputs": [
+        "index.html"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_exhibit",
+      "skill": "scroll-experience",
+      "depends_on": [
+        "build_scrolling_exhibit"
+      ],
+      "objective": "Open the site at desktop and mobile sizes, scroll through every chapter, verify all images, progress behavior, responsive layout and reduced-motion fallback, and report checks without modifying artifacts.",
+      "inputs": [
+        "task_request",
+        "outputs.build_scrolling_exhibit"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

@@ -1,0 +1,102 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "web-interaction-task1-shared-v1",
+  "task_id": "web_interaction_task1",
+  "designated_skills": [
+    "dev-browser",
+    "docx"
+  ],
+  "task_request": "I am a product manager, and our company is planning to build an online project management tool. I need you to research two major competitors — Trello and Asana — by browsing their websites.\n\nFor each product, capture at least 2 screenshots of key pages: the homepage and a features/product page. Save the screenshots as trello_homepage.png, trello_features.png, asana_homepage.png, and asana_features.png.\n\nThen produce a competitive analysis report saved as competitor_report.docx. The report should include:\n- An overview section introducing each competitor with the captured screenshots\n- A feature comparison table covering: task management, team collaboration, third-party integrations, and pricing model\n- A strengths and weaknesses analysis for each product\n- A recommendations section with differentiation strategies for our new product",
+  "nodes": [
+    {
+      "id": "capture_trello",
+      "skill": "dev-browser",
+      "depends_on": [],
+      "objective": "Browse Trello's official site and capture its homepage and a substantive features/product page as trello_homepage.png and trello_features.png. Record current feature, integration, collaboration and pricing evidence with URLs.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "trello_homepage.png",
+        "trello_features.png",
+        "trello_research_notes"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "capture_asana",
+      "skill": "dev-browser",
+      "depends_on": [],
+      "objective": "Browse Asana's official site and capture its homepage and a substantive features/product page as asana_homepage.png and asana_features.png. Record current feature, integration, collaboration and pricing evidence with URLs.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "asana_homepage.png",
+        "asana_features.png",
+        "asana_research_notes"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "synthesize_competition",
+      "skill": "docx",
+      "depends_on": [
+        "capture_trello",
+        "capture_asana"
+      ],
+      "objective": "Build an evidence-grounded comparison of task management, team collaboration, third-party integrations, pricing model, strengths, weaknesses, and differentiation opportunities. Separate observations from recommendations.",
+      "inputs": [
+        "task_request",
+        "outputs.capture_trello",
+        "outputs.capture_asana"
+      ],
+      "required_outputs": [
+        "comparison_brief"
+      ],
+      "write_access": false,
+      "network_access": false
+    },
+    {
+      "id": "write_competitor_report",
+      "skill": "docx",
+      "depends_on": [
+        "capture_trello",
+        "capture_asana",
+        "synthesize_competition"
+      ],
+      "objective": "Create competitor_report.docx with competitor overviews and embedded screenshots, the requested feature comparison table, strengths/weaknesses for each product, source URLs/retrieval date, and actionable differentiation recommendations.",
+      "inputs": [
+        "task_request",
+        "outputs.capture_trello",
+        "outputs.capture_asana",
+        "outputs.synthesize_competition"
+      ],
+      "required_outputs": [
+        "competitor_report.docx"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_competitor_pack",
+      "skill": "docx",
+      "depends_on": [
+        "write_competitor_report"
+      ],
+      "objective": "Check all four screenshots and the DOCX open, every requested comparison dimension and section is present, and claims align with captured sources. Report checks without edits.",
+      "inputs": [
+        "task_request",
+        "outputs.write_competitor_report"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

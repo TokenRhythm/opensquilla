@@ -1,0 +1,100 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "document-creation-task2-shared-v1",
+  "task_id": "document_creation_task2",
+  "designated_skills": [
+    "scroll-experience",
+    "pptx",
+    "docx"
+  ],
+  "task_request": "I am an AI researcher and I want to maximize the impact of my latest paper. The paper source files are in paper_src/. Please create three outputs to help me disseminate my work:\n\n1. Interactive HTML website as index.html with navigation and styling for online browsing.\n2. Conference talk slides as talk.pptx with at least 10 slides: cover, motivation, related work, methodology across 3+ slides, experiments across 2+ slides with data tables, and conclusion.\n3. Word summary as summary.docx with title as Heading 1, authors, abstract, key contributions as 3-5 bullets, methodology overview, and experimental findings as sections with Heading 2.",
+  "nodes": [
+    {
+      "id": "inspect_paper_source",
+      "skill": "docx",
+      "depends_on": [],
+      "objective": "Read the files under paper_src/ and extract the paper title, authors, abstract, contributions, methodology, experiment design, quantitative findings, and limitations into a source-grounded content brief. Preserve important numerical values and do not invent claims.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "paper_content_brief"
+      ],
+      "write_access": false,
+      "network_access": false
+    },
+    {
+      "id": "build_interactive_site",
+      "skill": "scroll-experience",
+      "depends_on": [
+        "inspect_paper_source"
+      ],
+      "objective": "Create index.html as a styled, navigable interactive paper website with logical sections, readable typography, responsive layout, and restrained scroll interactions that improve comprehension without hiding content.",
+      "inputs": [
+        "task_request",
+        "outputs.inspect_paper_source"
+      ],
+      "required_outputs": [
+        "index.html"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "build_word_summary",
+      "skill": "docx",
+      "depends_on": [
+        "inspect_paper_source"
+      ],
+      "objective": "Create summary.docx with the paper title as Heading 1, authors, abstract, 3-5 contribution bullets, and Heading 2 sections for methodology overview and experimental findings, all grounded in the source brief.",
+      "inputs": [
+        "task_request",
+        "outputs.inspect_paper_source"
+      ],
+      "required_outputs": [
+        "summary.docx"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "build_conference_talk",
+      "skill": "pptx",
+      "depends_on": [
+        "inspect_paper_source"
+      ],
+      "objective": "Create talk.pptx with at least ten slides: cover, motivation, related work, at least three methodology slides, at least two experiment slides with data tables, implications, and conclusion. Preserve the paper's claims and numbers.",
+      "inputs": [
+        "task_request",
+        "outputs.inspect_paper_source"
+      ],
+      "required_outputs": [
+        "talk.pptx"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_dissemination_set",
+      "skill": "docx",
+      "depends_on": [
+        "build_interactive_site",
+        "build_word_summary",
+        "build_conference_talk"
+      ],
+      "objective": "Check the HTML, DOCX, and PPTX open correctly, contain every requested section, and consistently represent the source paper. Report checks without changing outputs.",
+      "inputs": [
+        "task_request",
+        "outputs.build_interactive_site",
+        "outputs.build_word_summary",
+        "outputs.build_conference_talk"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

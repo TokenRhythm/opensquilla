@@ -1,0 +1,1743 @@
+{
+  "schema_version": 1,
+  "task_ids": [
+    "data_computation_task1",
+    "visual_creation_task5",
+    "document_creation_task2",
+    "web_interaction_task5",
+    "web_interaction_task4",
+    "document_creation_task3",
+    "motion_video_task3",
+    "visual_creation_task2",
+    "visual_creation_task6",
+    "document_creation_task6",
+    "visual_creation_task1",
+    "motion_video_task2",
+    "data_computation_task6",
+    "web_interaction_task2",
+    "web_interaction_task1",
+    "document_creation_task4",
+    "motion_video_task6",
+    "visual_creation_task3",
+    "web_interaction_task6",
+    "data_computation_task5"
+  ],
+  "sources": {
+    "agentskillos": {
+      "repository": "ynulihao/AgentSkillOS",
+      "revision": "c3cfae10ea34a13973c461273ad9c5cc4aa907fe",
+      "files": {
+        "benchmark/AgentSkillOS_bench/__init__.py": {
+          "sha256": "8ba069c2fda56f52720fc13d9e05dc4550d1055a6d2c0e667b70d0cd2af7917c",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/evaluators/__init__.py": {
+          "sha256": "fcf836ddd5fc7ce98bee38e28bae4fad77279bd8d381875fd6fe88324639f8dc",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/evaluators/objective/__init__.py": {
+          "sha256": "71a307aa3101076542fd03f432988c62dc23e4fb1b3d5e6cf0da5a742ec82587",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/evaluators/objective/document_evaluators.py": {
+          "sha256": "146d9bcc4d74fe4db81ce349013c4368beee34a9eec6275e1a47c438871eff3d",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/evaluators/objective/file_evaluators.py": {
+          "sha256": "ab25f847c5d29cf7496934a7a921cb09525d599ecbc0b8d732d27ddad56042db",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/evaluators/objective/format_evaluators.py": {
+          "sha256": "75af102cd8876f80cfe2f883012363ab33571a84df9b8e7c5c0e7809f4d5ff12",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/evaluators/objective/numeric_evaluators.py": {
+          "sha256": "70c5cab40241c09876bcdac0169599f979346850139446042b12dc42acfd5f23",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/evaluators/objective/pddl_evaluators.py": {
+          "sha256": "746217f39d03aa145935f4280d62562386fa73fff1086d9287124643448ab2cc",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/orchestrator.py": {
+          "sha256": "bc20b6d63d0540f6919ce92c0ae0ba5b9b67328956c48c33ceef7e3d420b2d78",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/registry.py": {
+          "sha256": "6765f83be5303f3b8f54a2dca8c939bfa29f058ff3ae974db4198a8a23b66cdc",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/data_computation_task1/penguins.csv": {
+          "sha256": "32f5c800d16127f8240e163f049b3e0ce807552f1bd28f12de54df0794f07386",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/01_introduction.tex": {
+          "sha256": "d082f292e33fe33d221e2c18c98156fb79a51f51ade5acca343db2829be3ebb6",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/02_related_work.tex": {
+          "sha256": "8d9ec32053412431240cad8119ca1c5a9b2e013b578a4b472fd3f9fe07be60f6",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/03_method.tex": {
+          "sha256": "4cd60c936f5d724712418814a6682f141eff5d9483101379eb73aff385a8c307",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/04_experiments.tex": {
+          "sha256": "3616a0bb2ef46b386e3736d72021d4fba4fdc77bf8b8b075791e8bf382f1d555",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/05_conclusion.tex": {
+          "sha256": "1075f35f286179090242c4bf086c3431c5efbe6c14c48fd1fb62055c38288705",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/06_appendix.tex": {
+          "sha256": "1412e0bc3c24a33ea83a18b459d2adfb24d8608541d7a34416f13ca5649174a8",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/Figures/ModalNet-19.png": {
+          "sha256": "6d40a44e2ec3f0cdab207c768a9085b6b908bbefa82c5af6613dc8233bee6a42",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/Figures/ModalNet-20.png": {
+          "sha256": "ba8a3ede5d40183ce8c18de249be60bec692646d53db108a3df51797a3c8634a",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/Figures/ModalNet-21.png": {
+          "sha256": "56d69ccc192b90c3b93e5e285ff892f74753f970103939b40291945e106e9f79",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/Figures/ModalNet-22.png": {
+          "sha256": "938988a43c0758e19cd57c4749b8859589cd0e5b8fe8dfc56e2fb35a915bb673",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/Figures/ModalNet-23.png": {
+          "sha256": "b6713b33692fc282e879c6f155eb4901dc16f795bca4adc160a8422123ccaa75",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/Figures/ModalNet-32.png": {
+          "sha256": "f9e73fa67da314706a08fb9ac9470ed719ecbba60fbc6a283515054bd4e992ff",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/background.tex": {
+          "sha256": "4293e7032a2f4f653cb340854b23dae41a1801ea6b487270732db19723918618",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/fancyhdr.sty": {
+          "sha256": "b56ec4434b9f4607529a4b23dc68ad8d4b94f1f631c8cddaf7da78140d53a5ea",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/iclr2021_conference.bst": {
+          "sha256": "aa6ecd33fca1301ae311c915e51acc46c4623ca2681356f9b3ace3f61d61694c",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/iclr2021_conference.sty": {
+          "sha256": "03fd4f96eccf48a3c79875aff82202cf2d875195695958cb4ec5bcc9ffbef708",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/iclr2021_conference_hacked.sty": {
+          "sha256": "4ca4d4ddea4af6c395a90004d2b7b582f74ce95a594b9e80ff6c188b7d823c19",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/images/compute_analysis/axial_flop.pdf": {
+          "sha256": "4e599173cf1bb75d88e208cfb18ced8f0c64225baaa76287827b967cd3890f5c",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/images/compute_analysis/axial_img_sec_core.pdf": {
+          "sha256": "4eed7ce7c438a2744ba8efbfbb832eeb7a4328a7b95722f30dceb458fe51a6b7",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/images/dataset_analysis/imagenet_5shot.pdf": {
+          "sha256": "6b5c1dad20d2dcb512d585e5b3b2573c30dc4757226f2dc66b9b2770b875db4e",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/images/dataset_analysis/imagenet_5shot.png": {
+          "sha256": "723b0be80a23235e5b78d33fb31d5c7919bff771b7f7b7c1463d91a069ee0753",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/images/dataset_analysis/transvolution-i1k-scaling.pdf": {
+          "sha256": "4cf5dfb2f7302da59e7eefbc32a5976648e3c293ffec6bc6719d45e375443f2b",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/images/finetune_vs_compute.png": {
+          "sha256": "b4bdae8da8a092c0d08a29fb5ab9dde0fb3307dfa2f8be043a1aa803eda518ff",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/images/finetune_vs_compute2.pdf": {
+          "sha256": "3b383155abf6ebae0d9ec58a1c2a340a9f90b248556397f7246b33e0d851a6a0",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/images/head_tokens.pdf": {
+          "sha256": "68f7bdf511394a7331ce771d6797c9bed99ca984492ee09341d0173643182657",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/images/img_sec_core.pdf": {
+          "sha256": "39f310ec5c34cf54679777ebabfe7d4a4e3f6f06cb1b8e6fc518a63d66fb0ad4",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/images/model_scheme.pdf": {
+          "sha256": "448359d53915b2a0cc47283dc1cb97d649a98036c40d629d20b4c2a8bc2a047b",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/images/visualizations/20201002_rgb_filter_pca.pdf": {
+          "sha256": "b989c70aa0d6bafa9ed6f5ddfb8374d20ec910b4cc624e49a9fb554f4740befc",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/images/vit-vtab.pdf": {
+          "sha256": "dfbaa3b1ffb67ed7a70244bd3c82506d9121cc489b9ba2438436815d90d845c3",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/introduction.tex": {
+          "sha256": "ece15efaec8325b6e88d2b90a3d7be0ee08b6b4c631d858877b806f862bd6553",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/main.bbl": {
+          "sha256": "db669e30d4686dada14596cface71b4bddea7cdea91a0721a67983c6e248ea8c",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/main.tex": {
+          "sha256": "db24ce86884c8bb14d05ec9f86c0536b23761a91aea1d49b9c55e6182f48c239",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/math_commands.tex": {
+          "sha256": "1597a55933b23a7154ae0d62db45d6da0571ac3a6ef8240151eff5fe3bbabf3b",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/model_architecture.tex": {
+          "sha256": "d524e853dc5f98bb482ee7289908b9640ee9e6ea38586c14c7c1ea0a5c0f5fdf",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/ms.tex": {
+          "sha256": "69a159fa848798bee868a9d394913745e3996ae274f2bc7cfc6d5fcd7a7438a0",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/natbib.sty": {
+          "sha256": "88bc70c0e48461934cab5b2accef06b74a8b3ac45ad03ccd3f2a6b7e0d6d530d",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/nips_2017.sty": {
+          "sha256": "f1af9ca822eac10140e9e55ca2f20a59ce20605c3bc32670d9108de95da7ff01",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/parameter_attention.tex": {
+          "sha256": "c698e2bfec0a0acfa2a6447ceabc920aa4b631df1a291647b7124ae9688aff5d",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/results.tex": {
+          "sha256": "da5281baf549caad349c796d51404537674acb72baec0ef9509c95748499b4c8",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/sqrt_d_trick.tex": {
+          "sha256": "db2dfbf394ad8b07c882f77735838f4f2dfbe585b0b5c69ef361e43daa7c906d",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/training.tex": {
+          "sha256": "34fa70917e3f58d02743393ff651be8d679a27cd51a4027180a0efc5ddd913e1",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/transvolution.bib": {
+          "sha256": "b79c7390654921213b8453d9d57b5cd5f46a889d12c70d94a55a882a030477af",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/vis/anaphora_resolution2_new.pdf": {
+          "sha256": "c0ae1f58eaeeb7638d35c81de72937385bc3646a6bf0107f51426c2544b860cd",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/vis/anaphora_resolution_new.pdf": {
+          "sha256": "adbd1c70e65ad463b8f405f805349144bef0aaa7efd9cb8da9874d2880fef348",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/vis/attending_to_head2_new.pdf": {
+          "sha256": "70e5f99d3dea638e1974c29f91a8fc394fa1d7862e9205044f339f911c69d6b3",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/vis/attending_to_head_new.pdf": {
+          "sha256": "f7e2a6931e8735af0fdd2ed71c219f769d7866edaf28ab19d3aebe9a0d032722",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/vis/making_more_difficult5_new.pdf": {
+          "sha256": "4533259d2f0e05bbbe5893d62af639c578d6e16c5077759a4645fae829a55d89",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/vis/making_more_difficult_new.pdf": {
+          "sha256": "99e0024b1019aee2c012d5ce1b75d4499a9ea8acf0d5ab22675f21f046cdc085",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/visualizations.tex": {
+          "sha256": "3833fb2220d95a20c1fe4f82264f8f95e2e7ea7f78383d8285a89cae9e6c2178",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/vtab_table.tex": {
+          "sha256": "ab26c741d4d222d767a7f9c7d3714b3437bcf57c465f91cf0c37f2a0bac5af4a",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task2/paper_src/why_self_attention.tex": {
+          "sha256": "b0f2e5cb18558766558c02387cafa4813dcd00c980e3676e5fc249029b6acab8",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/task_data/document_creation_task3/attention_is_all_you_need.pdf": {
+          "sha256": "bfaaec89262875f927cf1b38b2da2d775f3309b7bea3537f29b606ca67e79065",
+          "mode": "raw"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/data_computation_task1.json": {
+          "sha256": "78ff7b73816169c4137ab368bccd6e15a7959ad0fe4e946ef9a2495e8354af85",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/data_computation_task5.json": {
+          "sha256": "3ec9d68e3fe623f5d1e622463790fcd7fee5979bf27804a8c3a312005845d0d8",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/data_computation_task6.json": {
+          "sha256": "44ebdb2ef1ec5ceb661386a5fa8ded173486ec18cb9f40026907696fa64f40ee",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/document_creation_task2.json": {
+          "sha256": "31499b5f0f6e9594e2f968bd4b1a6e680cdd9aea3c09fc320024d10ca7fdbe9b",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/document_creation_task3.json": {
+          "sha256": "2f45164cb24a763463731e82a483dd1d59f3bae7fd66bf25a9f032bfa5ab7695",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/document_creation_task4.json": {
+          "sha256": "33c83b0514501b2b9ef7840b749832e3aa1e8beb2da4e61587162de6932c4c2a",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/document_creation_task6.json": {
+          "sha256": "b27e46b762b5a2a85269dfa8fa7370ac0a3045d246c6fb8febd20af20c8dda37",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/motion_video_task2.json": {
+          "sha256": "83bb361223d2b866ea05790a2de07778955da1cfa749afb5e78f58a3c88677a0",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/motion_video_task3.json": {
+          "sha256": "8b9e3f966893ea3e153c4bbfe46959bbd70328bc9dac79c8c4510c7c2c3f31f7",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/motion_video_task6.json": {
+          "sha256": "9e78e68666ed661bdd43c00ed3db0ece13ea5ee16e5a7e52920c206a032d7aab",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/visual_creation_task1.json": {
+          "sha256": "2c3ad55a947bf21984f4bdaf04be1e3388747edc7da152d1733cbc1c37f03be5",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/visual_creation_task2.json": {
+          "sha256": "83ecc1f270c34adfa2585506c69a8e48c7a554730c35596f8e418da12b23fed3",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/visual_creation_task3.json": {
+          "sha256": "360eefffccd9a8284de544ffd4444aff063f134e48e9da6e9e62264cf6284178",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/visual_creation_task5.json": {
+          "sha256": "542070a290f29e8b15ff2819e866e8e3ef3e4d248c5ac29a0ed8c0bc4ed22634",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/visual_creation_task6.json": {
+          "sha256": "57c67c94f3f71c74d430ca51a60354f3979fc2e83e6f4d06ca6845b598277ae2",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/web_interaction_task1.json": {
+          "sha256": "1e5ff23a09537879b6064389e5f68b99d28028a409947c7f25b62968aebd83be",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/web_interaction_task2.json": {
+          "sha256": "954ed1197727919480b665d354e169afe154a4f5d75b0b30014fd0d1186900c7",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/web_interaction_task4.json": {
+          "sha256": "6a1a2fbc5a5137ba3fd4304396cb14e4c147b7d9dd0fb8e709b9a443459a8019",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/web_interaction_task5.json": {
+          "sha256": "5921f26596531412045157ec3f4e19768dbbc940ea242fec598e320e633fd94c",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/tasks/web_interaction_task6.json": {
+          "sha256": "a6e77963804dceac1d660e79d5c0d486b5e770d4490fd1cf631a81ebe235b8ef",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/types.py": {
+          "sha256": "7c00da675f29e771ac2541c7bb68125025d1594489f0484ad30bf6dc416e76d2",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/utils/__init__.py": {
+          "sha256": "d40748e738bf5560dddb141f5c1663dc932cb2a3cea6cf35ab7b522811154ae5",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/utils/code_utils.py": {
+          "sha256": "836cdf29646da26bf3fca3084f76902611cfb2b0e76d95cf567553888bc4fed7",
+          "mode": "utf8-lf"
+        },
+        "benchmark/AgentSkillOS_bench/utils/file_utils.py": {
+          "sha256": "50c4a528269298573778ed90c2b9a020d212c5ed2b36803a5159cbf71a31fa95",
+          "mode": "utf8-lf"
+        },
+        "benchmark/__init__.py": {
+          "sha256": "9e95e241781edd818ca81aa3fa17493a8408214288edf2102c4fa06d1416d71f",
+          "mode": "utf8-lf"
+        },
+        "benchmark/base.py": {
+          "sha256": "911cfe0489cf8a2e805a834c2f9639c553ec4189b614407b5bd66286c08f3626",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/data-storytelling/SKILL.md": {
+          "sha256": "e9be42a3dcad5b44988bc5f3709ba0a9da7259ee393cb57836963d831bf704a8",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/SKILL.md": {
+          "sha256": "3f04e81004ba7a60d2580d6e3b3974418fbaca7d1ad02a7361dd64803060bcbe",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/bun.lock": {
+          "sha256": "c168fd1ac04fefeb3d5dc1c52a47be04f69b729b7457518d0d38888da1004172",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/references/scraping.md": {
+          "sha256": "44031cea3262dbf909d3657897b0b8bb30f0760520887f64e118b8f319cadddd",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/scripts/start-relay.ts": {
+          "sha256": "3bf40023aa5f930df6ba04368383929dc018566619e3c133c56c14f0e8568e5a",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/scripts/start-server.ts": {
+          "sha256": "3d9b915c089296494a483d9f677a69a98ca0028d8610c7c68da48164644dfd1c",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/server.sh": {
+          "sha256": "1f936c34f3a517f82f4987b51dd79d2786beec89eadacd6b109df4e661e42661",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/src/client.ts": {
+          "sha256": "bebed3126e9219cd03bfd6471c124dfafc82f4d540eceeff081d52af21d0729a",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/src/index.ts": {
+          "sha256": "d41ebe63d4355ef8bbac013e33a6896700db48487fab51f8198498eadd87eb46",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/src/relay.ts": {
+          "sha256": "871cf6213feeaaa326bbe50c18df26d96204c036b2e8c7f73ea4c16b9177e73e",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/src/snapshot/__tests__/snapshot.test.ts": {
+          "sha256": "7c71fa4851ca3f2f11f09a49926c1fcc493dc14a42e04b357198b4f6a024590b",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/src/snapshot/browser-script.ts": {
+          "sha256": "188c3a28d4f470efacddfd16f9b831d45fb849976b540cd10ebfeb6526cf66c1",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/src/snapshot/index.ts": {
+          "sha256": "2cb11d7bec4ff8719ecac9ad0564d2c9315c9d53d2fb882ba81a3754dc65d80d",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/src/snapshot/inject.ts": {
+          "sha256": "c45f227615f99f96faa1d9372bd3b30935b77c2b72173449bbf309ec8dc11ddb",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/src/types.ts": {
+          "sha256": "4284ffc83aa0f7f88929d612fa3f7f71c5a046a989e758f2c9e65e0fe7fd2dfc",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/tsconfig.json": {
+          "sha256": "8c934e8f17456a34832444adbf3eee8498f4726bf656024801dbfdc0b9f40270",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/dev-browser/vitest.config.ts": {
+          "sha256": "4980d8bbd031c2dbf5644867bf8a9ecc6dd088b5379f1d566be452e4f001eb92",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/LICENSE.txt": {
+          "sha256": "79f6d8f5b427252fa3b1c11ecdbdb6bf610b944f7530b4de78f770f38741cfaa",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/SKILL.md": {
+          "sha256": "0bd90681fcab2e282025ee14acf508b60bbd6c41ac6c3bf83c0dc14d52c37933",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/docx-js.md": {
+          "sha256": "83b4a2f88d058a10509fbc0b3b12b6933c407805f4d4afc955cd3fb939c16428",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml.md": {
+          "sha256": "a16f922797eeaa3670ea31c1e49d15b799613d03f39445c857a5dd3221aa3597",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/dml-chart.xsd": {
+          "sha256": "41b93bd8857cc68b1e43be2806a872d736a9bdd6566900062d8fdb57d7bbb354",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/dml-chartDrawing.xsd": {
+          "sha256": "3fd0586f2637b98bb9886f0e0b67d89e1cc987c2d158cc7deb5f5b9890ced412",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/dml-diagram.xsd": {
+          "sha256": "29b254ee0d10414a8504b5a08149c7baec35a60d5ff607d6b3f492aa36815f40",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/dml-lockedCanvas.xsd": {
+          "sha256": "5cb76dabd8b97d1e9308a1700b90c20139be4d50792d21a7f09789f5cccd6026",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/dml-main.xsd": {
+          "sha256": "5375417f0f5394b8dd1a7035b9679151f19a6b65df309dec10cfb4a420cb00e9",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/dml-picture.xsd": {
+          "sha256": "5d389d42befbebd91945d620242347caecd3367f9a3a7cf8d97949507ae1f53c",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/dml-spreadsheetDrawing.xsd": {
+          "sha256": "b4532b6d258832953fbb3ee4c711f4fe25d3faf46a10644b2505f17010d01e88",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/dml-wordprocessingDrawing.xsd": {
+          "sha256": "bdad416b096b61d37b71603b2c949484f9070c830bdaeba93bf35e15c8900614",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/pml.xsd": {
+          "sha256": "d173c3e5d61e42e2e3a97226c632fd2ab7cc481fc4e492365b87024ab546daff",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/shared-additionalCharacteristics.xsd": {
+          "sha256": "3c6709101c6aaa82888df5d8795c33f9e857196790eb320d9194e64be2b6bdd8",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/shared-bibliography.xsd": {
+          "sha256": "0b364451dc36a48dd6dae0f3b6ada05fd9b71e5208211f8ee5537d7e51a587e2",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/shared-commonSimpleTypes.xsd": {
+          "sha256": "e2abacbb9a55ce1365f8961bc1b1395bbc811e512b111000d8c333f98458dece",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/shared-customXmlDataProperties.xsd": {
+          "sha256": "0ef4bb354ff44b923564c4ddbdda5987919d220225129ec94614a618ceafc281",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/shared-customXmlSchemaProperties.xsd": {
+          "sha256": "0d103b99a4a8652f8871552a69d42d2a3760ac6a5e3ef02d979c4273257ff6a4",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/shared-documentPropertiesCustom.xsd": {
+          "sha256": "9c085407751b9061c1f996f6c39ce58451be22a8d334f09175f0e89e42736285",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/shared-documentPropertiesExtended.xsd": {
+          "sha256": "bc92e36ccd233722d4c5869bec71ddc7b12e2df56059942cce5a39065cc9c368",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/shared-documentPropertiesVariantTypes.xsd": {
+          "sha256": "7b5b7413e2c895b1e148e82e292a117d53c7ec65b0696c992edca57b61b4a74b",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/shared-math.xsd": {
+          "sha256": "3213ef1631606250f5010b42cad7ef716f7c59426367798e33c374c0ec391d3a",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/shared-relationshipReference.xsd": {
+          "sha256": "12264f3c03d738311cd9237d212f1c07479e70f0cbe1ae725d29b36539aef637",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/sml.xsd": {
+          "sha256": "beffeed56945c22a77440122c8bdc426f3fcbe7f3b12ea0976c770d1f8d54578",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/vml-main.xsd": {
+          "sha256": "f5ee623b08b6a66935e5aced2f5d8ad0fc71bf9e8e833cd490150c0fa94b8763",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/vml-officeDrawing.xsd": {
+          "sha256": "585bedc1313b40888dcc544cb74cd939a105ee674f3b1d3aa1cc6d34f70ff155",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/vml-presentationDrawing.xsd": {
+          "sha256": "133c9f64a5c5d573b78d0a474122b22506d8eadb5e063f67cdbbb8fa2f161d0e",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/vml-spreadsheetDrawing.xsd": {
+          "sha256": "6bdeb169c3717eb01108853bd9fc5a3750fb1fa5b82abbdd854d49855a40f519",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/vml-wordprocessingDrawing.xsd": {
+          "sha256": "475dcae1e7d1ea46232db6f8481040c15e53a52a3c256831d3df204212b0e831",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/wml.xsd": {
+          "sha256": "c2dd9f61f892deae6acd8d20771ea79b12018af25f3bf8d06639c8542d218cfd",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ISO-IEC29500-4_2016/xml.xsd": {
+          "sha256": "a539aa2fb154fa50e0f5cc97e6ad7cbc66f8ec3e3746f61ec6a8b0d5d15ecdf2",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ecma/fouth-edition/opc-contentTypes.xsd": {
+          "sha256": "9e0b7209fc69ab11987900404540969976000c5ebe4d4f58c43dc3842886bf3a",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ecma/fouth-edition/opc-coreProperties.xsd": {
+          "sha256": "451958454e8588dfc7cd945981ada142ca06ff3307937f5700df059c2b307fa8",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ecma/fouth-edition/opc-digSig.xsd": {
+          "sha256": "6de111e11403f7cd49027400755bae0ea1cabef2815f09bd40a24f0017613b24",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/ecma/fouth-edition/opc-relationships.xsd": {
+          "sha256": "f565adfef5a502044abc3a9153e157edc25af78304d335994afb958874b15e26",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/mce/mc.xsd": {
+          "sha256": "3a37e461ecf5a8670fdec34029703401f8728ab9c96ec1739a6ae58d55212413",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/microsoft/wml-2010.xsd": {
+          "sha256": "568b26ee156cb9549aa439ca2158965f77b7c1602b7e0316f40ac6cf586e35f2",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/microsoft/wml-2012.xsd": {
+          "sha256": "0fa75578a000439a7988ba0c59fdc69f774bbd416cbacc14d07125b3f686cb74",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/microsoft/wml-2018.xsd": {
+          "sha256": "be0ff793a22dd31384650c3a4da14c2fa8062751c2e97b0e5ee852bda13c60ad",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/microsoft/wml-cex-2018.xsd": {
+          "sha256": "fddc2b880cabb9005aebbc7e783e53c19fec1c03df7d0e2f2076a33a0fdfd081",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/microsoft/wml-cid-2016.xsd": {
+          "sha256": "127ca209fa73d7cb708449cb355c871867948a96e4a74f7bf5811ef62d17991d",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/microsoft/wml-sdtdatahash-2020.xsd": {
+          "sha256": "842e7163409c8d74f4d7088a8bc99500d80bc75332681a0980055b08f374a604",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/schemas/microsoft/wml-symex-2015.xsd": {
+          "sha256": "16f6f8072249f431370723c2cd8974672e0d9c897e00e97dd918079df934871b",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/scripts/pack.py": {
+          "sha256": "6fe762f45aff8c63fd95b9fcb1337b28921d6fa454e18a0e8158d4c8708d6d00",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/scripts/unpack.py": {
+          "sha256": "0bd17f76a1a4c388aba42c6d1d39015fa84e405c3e0692397fe12762bd632b58",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/scripts/validate.py": {
+          "sha256": "1ec252de8b14b07d16966c48906ccb1c45c68bcd23557ad31d8c50a27f5f8c0f",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/scripts/validation/__init__.py": {
+          "sha256": "83e0f035c5abea238d3f2c3968afbd511ed022b527b7c9cb60a9434cc34ff987",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/scripts/validation/base.py": {
+          "sha256": "f2c70d481613456e32b43869d1604b05c236c8da34b5b3967677a661cac7ba63",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/scripts/validation/docx.py": {
+          "sha256": "e65d6cda0525866a24cc847b2e883bd2416ae6f87b3f5b9e2784dfbb0ec13093",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/scripts/validation/pptx.py": {
+          "sha256": "00bf2623da1177b3948143a4ade2f1cda7cb389dee31960861913fa42ef1b00f",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/ooxml/scripts/validation/redlining.py": {
+          "sha256": "97abfdff4f08f43f9a4bb5c8a2f8fd483398b5b339592724e8635153b5507967",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/scripts/__init__.py": {
+          "sha256": "83e262a425814b72add701272b99ddcf9635251c5d4672bf9fc38d2b03f00d85",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/scripts/document.py": {
+          "sha256": "65f8569034a5893bd5ef0654be5168774fe81c0407b0c4ec80992db9fff91c0c",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/scripts/templates/comments.xml": {
+          "sha256": "87e218a3a295016ec855f2cd74495c416072f29c4846e86b527aec0a4d93ba21",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/scripts/templates/commentsExtended.xml": {
+          "sha256": "86bf401354c111102033ed147763faccb82479598f17777a3384c2f3e9fa0014",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/scripts/templates/commentsExtensible.xml": {
+          "sha256": "af5d057e16462ca172cea845e502bafb4f3e1b474a8d5848ffe92214853a4935",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/scripts/templates/commentsIds.xml": {
+          "sha256": "20168f7b237af091332f8348c548eb7f755f583185bb198359c5978155099d67",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/scripts/templates/people.xml": {
+          "sha256": "61db9900b579acd4c4f84ff7f40df47e77e9e780c40d5f5ef6a7beba41d62ec5",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/docx/scripts/utilities.py": {
+          "sha256": "62a4b689056501b91e2df2d1f4e6335818e421c7390e48050717ea8f461a0ed0",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/firecrawl-scraper/SKILL.md": {
+          "sha256": "11eadd0de3ebd0bc85914cb37c0a18daa4109833d604103cedda5a9335a21307",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/frontend-design/LICENSE.txt": {
+          "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/frontend-design/SKILL.md": {
+          "sha256": "b81e2ff87ed8fa4d6c377ccb127a7254c9e6a77e3ae94f21e6b514f7bb2945a0",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/generate-image/SKILL.md": {
+          "sha256": "9be05248d17333fe42d61c539b23f2db0072d1198c70b5546709d80d3fee1b7e",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/generate-image/scripts/generate_image.py": {
+          "sha256": "bdaaa937e0965919b1e272a1af36aff90d4a89ae9ece19984ab10b032b7618df",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/SKILL.md": {
+          "sha256": "a2d666e311f48289625e8611c09eb7db988b67e831e49db60d8b4285248cf7a9",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/references/common-workflows.md": {
+          "sha256": "4ebf9159c7e6955a49b7323c1a1e367a9e63e7722ed7a71157b3267f67c77f5a",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/references/ffmpeg-encoding.md": {
+          "sha256": "903682c3375524ce29a12f52c72e947ab114cee1187d88652360911d06a5759f",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/references/ffmpeg-filters.md": {
+          "sha256": "347447ae305410e5bb72a4934ad4fadeb91fdc12435551b038a7f895a49a72a0",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/references/ffmpeg-streaming.md": {
+          "sha256": "087eab32cf7336e7815158635a4487db9640d038a22bb01a269277393c5b510f",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/references/format-compatibility.md": {
+          "sha256": "900ac7216f595d94ae597096c2bf12cd62bfe0cf1841b143e4ac8564cd12e02f",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/references/imagemagick-batch.md": {
+          "sha256": "e9aefed340939dc2241df5a45f82a49516bd348b6340d2acb42b4a3cfdf30537",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/references/imagemagick-editing.md": {
+          "sha256": "61f9e9f4d7266db2ed6bd7774f4790c4146fab07c127413a1037b53af8096c0e",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/references/rmbg-background-removal.md": {
+          "sha256": "2311024465a5e1e3c379e58406fb18f5bb6c7e2c861134c8ff3f9e5364aaaada",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/references/troubleshooting.md": {
+          "sha256": "064e02fa485a5493e84f362736b13f1d30862e461be3d5074d11504ee5438997",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/scripts/README.md": {
+          "sha256": "8876aca16d9d78f900fb8cf370f09cc9369134a671a2f8b50788fb72ebd46ff4",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/scripts/batch-remove-background.sh": {
+          "sha256": "56c990116ccef526957766def641090242ad0b92609580b24b162e8ee7ae3cca",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/scripts/batch_resize.py": {
+          "sha256": "ce8e55a5546a0c49b84c8e97021a875db7be83f2f8f1a53ee1285e64d4e0b60e",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/scripts/media_convert.py": {
+          "sha256": "896961d11de1f7040243e388a82b30295e3224ec7b0afb4d023f4579c832e709",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/scripts/remove-background.sh": {
+          "sha256": "fe8caea66795c3d6b85c478de3e361f4983da486efa3813fda8bd1bcb792089e",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/scripts/remove-bg-node.js": {
+          "sha256": "1897902d7e6c9ed8837c9277021faaf54fb61c4d4360a09f5f4ea6bad730d7dd",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/scripts/requirements.txt": {
+          "sha256": "656461e5a959cc78eda21807a73b5c20e78e6bd116fa89c7606c82eeacaab221",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/scripts/tests/requirements.txt": {
+          "sha256": "7f336e73b484fac1a0807a6cfba48eefe79c12f3c348d988a708dda2d6df6d14",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/scripts/tests/test_batch_resize.py": {
+          "sha256": "ce898f6a8f10596399a4dfaadb1abc9e2a133e18e375e1b6a5b5e56faf6d0033",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/scripts/tests/test_media_convert.py": {
+          "sha256": "c067e325304b7cb84701a1481e2aa077ce8a29a04799a1b31a7768342d4c1f20",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/scripts/tests/test_video_optimize.py": {
+          "sha256": "483f996459f251f9f15affaca183e9bee558432a7b49903a87fff9d7da244273",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/media-processing/scripts/video_optimize.py": {
+          "sha256": "c2df1f79fc8314b94bade5e7ceee7b4d54459402a7f91bf12ebe71b640746b68",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/LICENSE.txt": {
+          "sha256": "79f6d8f5b427252fa3b1c11ecdbdb6bf610b944f7530b4de78f770f38741cfaa",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/SKILL.md": {
+          "sha256": "b6f25545bfb358739f1532f793458b5dbc87ee009933cb7c306b2d951ab6617f",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/html2pptx.md": {
+          "sha256": "f08ed7580969b796d9cd5ade93e2cdee981dcaf13cc5eb12e8d4a3700c2d6047",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml.md": {
+          "sha256": "09868e9f1786765421ecf3f0f49c77006738efda82a76df43ed87f7a9bfe2467",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/dml-chart.xsd": {
+          "sha256": "41b93bd8857cc68b1e43be2806a872d736a9bdd6566900062d8fdb57d7bbb354",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/dml-chartDrawing.xsd": {
+          "sha256": "3fd0586f2637b98bb9886f0e0b67d89e1cc987c2d158cc7deb5f5b9890ced412",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/dml-diagram.xsd": {
+          "sha256": "29b254ee0d10414a8504b5a08149c7baec35a60d5ff607d6b3f492aa36815f40",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/dml-lockedCanvas.xsd": {
+          "sha256": "5cb76dabd8b97d1e9308a1700b90c20139be4d50792d21a7f09789f5cccd6026",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/dml-main.xsd": {
+          "sha256": "5375417f0f5394b8dd1a7035b9679151f19a6b65df309dec10cfb4a420cb00e9",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/dml-picture.xsd": {
+          "sha256": "5d389d42befbebd91945d620242347caecd3367f9a3a7cf8d97949507ae1f53c",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/dml-spreadsheetDrawing.xsd": {
+          "sha256": "b4532b6d258832953fbb3ee4c711f4fe25d3faf46a10644b2505f17010d01e88",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/dml-wordprocessingDrawing.xsd": {
+          "sha256": "bdad416b096b61d37b71603b2c949484f9070c830bdaeba93bf35e15c8900614",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/pml.xsd": {
+          "sha256": "d173c3e5d61e42e2e3a97226c632fd2ab7cc481fc4e492365b87024ab546daff",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/shared-additionalCharacteristics.xsd": {
+          "sha256": "3c6709101c6aaa82888df5d8795c33f9e857196790eb320d9194e64be2b6bdd8",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/shared-bibliography.xsd": {
+          "sha256": "0b364451dc36a48dd6dae0f3b6ada05fd9b71e5208211f8ee5537d7e51a587e2",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/shared-commonSimpleTypes.xsd": {
+          "sha256": "e2abacbb9a55ce1365f8961bc1b1395bbc811e512b111000d8c333f98458dece",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/shared-customXmlDataProperties.xsd": {
+          "sha256": "0ef4bb354ff44b923564c4ddbdda5987919d220225129ec94614a618ceafc281",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/shared-customXmlSchemaProperties.xsd": {
+          "sha256": "0d103b99a4a8652f8871552a69d42d2a3760ac6a5e3ef02d979c4273257ff6a4",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/shared-documentPropertiesCustom.xsd": {
+          "sha256": "9c085407751b9061c1f996f6c39ce58451be22a8d334f09175f0e89e42736285",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/shared-documentPropertiesExtended.xsd": {
+          "sha256": "bc92e36ccd233722d4c5869bec71ddc7b12e2df56059942cce5a39065cc9c368",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/shared-documentPropertiesVariantTypes.xsd": {
+          "sha256": "7b5b7413e2c895b1e148e82e292a117d53c7ec65b0696c992edca57b61b4a74b",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/shared-math.xsd": {
+          "sha256": "3213ef1631606250f5010b42cad7ef716f7c59426367798e33c374c0ec391d3a",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/shared-relationshipReference.xsd": {
+          "sha256": "12264f3c03d738311cd9237d212f1c07479e70f0cbe1ae725d29b36539aef637",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/sml.xsd": {
+          "sha256": "beffeed56945c22a77440122c8bdc426f3fcbe7f3b12ea0976c770d1f8d54578",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/vml-main.xsd": {
+          "sha256": "f5ee623b08b6a66935e5aced2f5d8ad0fc71bf9e8e833cd490150c0fa94b8763",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/vml-officeDrawing.xsd": {
+          "sha256": "585bedc1313b40888dcc544cb74cd939a105ee674f3b1d3aa1cc6d34f70ff155",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/vml-presentationDrawing.xsd": {
+          "sha256": "133c9f64a5c5d573b78d0a474122b22506d8eadb5e063f67cdbbb8fa2f161d0e",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/vml-spreadsheetDrawing.xsd": {
+          "sha256": "6bdeb169c3717eb01108853bd9fc5a3750fb1fa5b82abbdd854d49855a40f519",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/vml-wordprocessingDrawing.xsd": {
+          "sha256": "475dcae1e7d1ea46232db6f8481040c15e53a52a3c256831d3df204212b0e831",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/wml.xsd": {
+          "sha256": "c2dd9f61f892deae6acd8d20771ea79b12018af25f3bf8d06639c8542d218cfd",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ISO-IEC29500-4_2016/xml.xsd": {
+          "sha256": "a539aa2fb154fa50e0f5cc97e6ad7cbc66f8ec3e3746f61ec6a8b0d5d15ecdf2",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ecma/fouth-edition/opc-contentTypes.xsd": {
+          "sha256": "9e0b7209fc69ab11987900404540969976000c5ebe4d4f58c43dc3842886bf3a",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ecma/fouth-edition/opc-coreProperties.xsd": {
+          "sha256": "451958454e8588dfc7cd945981ada142ca06ff3307937f5700df059c2b307fa8",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ecma/fouth-edition/opc-digSig.xsd": {
+          "sha256": "6de111e11403f7cd49027400755bae0ea1cabef2815f09bd40a24f0017613b24",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/ecma/fouth-edition/opc-relationships.xsd": {
+          "sha256": "f565adfef5a502044abc3a9153e157edc25af78304d335994afb958874b15e26",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/mce/mc.xsd": {
+          "sha256": "3a37e461ecf5a8670fdec34029703401f8728ab9c96ec1739a6ae58d55212413",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/microsoft/wml-2010.xsd": {
+          "sha256": "568b26ee156cb9549aa439ca2158965f77b7c1602b7e0316f40ac6cf586e35f2",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/microsoft/wml-2012.xsd": {
+          "sha256": "0fa75578a000439a7988ba0c59fdc69f774bbd416cbacc14d07125b3f686cb74",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/microsoft/wml-2018.xsd": {
+          "sha256": "be0ff793a22dd31384650c3a4da14c2fa8062751c2e97b0e5ee852bda13c60ad",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/microsoft/wml-cex-2018.xsd": {
+          "sha256": "fddc2b880cabb9005aebbc7e783e53c19fec1c03df7d0e2f2076a33a0fdfd081",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/microsoft/wml-cid-2016.xsd": {
+          "sha256": "127ca209fa73d7cb708449cb355c871867948a96e4a74f7bf5811ef62d17991d",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/microsoft/wml-sdtdatahash-2020.xsd": {
+          "sha256": "842e7163409c8d74f4d7088a8bc99500d80bc75332681a0980055b08f374a604",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/schemas/microsoft/wml-symex-2015.xsd": {
+          "sha256": "16f6f8072249f431370723c2cd8974672e0d9c897e00e97dd918079df934871b",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/scripts/pack.py": {
+          "sha256": "6fe762f45aff8c63fd95b9fcb1337b28921d6fa454e18a0e8158d4c8708d6d00",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/scripts/unpack.py": {
+          "sha256": "0bd17f76a1a4c388aba42c6d1d39015fa84e405c3e0692397fe12762bd632b58",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/scripts/validate.py": {
+          "sha256": "1ec252de8b14b07d16966c48906ccb1c45c68bcd23557ad31d8c50a27f5f8c0f",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/scripts/validation/__init__.py": {
+          "sha256": "83e0f035c5abea238d3f2c3968afbd511ed022b527b7c9cb60a9434cc34ff987",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/scripts/validation/base.py": {
+          "sha256": "f2c70d481613456e32b43869d1604b05c236c8da34b5b3967677a661cac7ba63",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/scripts/validation/docx.py": {
+          "sha256": "e65d6cda0525866a24cc847b2e883bd2416ae6f87b3f5b9e2784dfbb0ec13093",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/scripts/validation/pptx.py": {
+          "sha256": "00bf2623da1177b3948143a4ade2f1cda7cb389dee31960861913fa42ef1b00f",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/ooxml/scripts/validation/redlining.py": {
+          "sha256": "97abfdff4f08f43f9a4bb5c8a2f8fd483398b5b339592724e8635153b5507967",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/scripts/html2pptx.js": {
+          "sha256": "c675d09a54d6a002e8ca5917b9d24a6568aa8d455bb7abeb212d4f564dd07a34",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/scripts/inventory.py": {
+          "sha256": "adead8fe6270e520c397cec9fbee4d606ab10bb80f749e018b42ec894c60d2e5",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/scripts/rearrange.py": {
+          "sha256": "c04ac37916f398ba621b2d9e1e4c1a69225eaad6d7fb0ad116c237ddeb1b2b68",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/scripts/replace.py": {
+          "sha256": "8a590747551be847a904e3296fb2f35aa4e7feeb4970a61596c2375306462820",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/pptx/scripts/thumbnail.py": {
+          "sha256": "c21fd950b6ada7bd2f029885d3e56bc66b7ff061cc8404c492eb301664aa9e5d",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/xlsx/LICENSE.txt": {
+          "sha256": "79f6d8f5b427252fa3b1c11ecdbdb6bf610b944f7530b4de78f770f38741cfaa",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/xlsx/SKILL.md": {
+          "sha256": "020ccdb5932257b66c638ec1157ea248d57fa52c8c01f1f68b559b5970c7df35",
+          "mode": "utf8-lf"
+        },
+        "data/skill_seeds/xlsx/recalc.py": {
+          "sha256": "ab1ef0c94536bb23b6c6a3d32769b0401ec3cc85e73c247d574dd84ec73af15d",
+          "mode": "utf8-lf"
+        }
+      }
+    },
+    "scientific-skills": {
+      "repository": "k-dense-ai/claude-scientific-skills",
+      "revision": "390f5146bf3c1877cf15636a3dd7b775e4f0f185",
+      "files": {
+        "skills/citation-management/SKILL.md": {
+          "sha256": "e52459a2c78f6b51250ee418e53bb34494c2e35814e5b4a29cc293c6914c0141",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/assets/bibtex_template.bib": {
+          "sha256": "bf03cc646e6bc6aaba85d632b8e25b26c2830419892f3c17a7d844805d3a721e",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/assets/citation_checklist.md": {
+          "sha256": "305ff79e25b2654f1a5dc2163c03e7ab14e6c9578b1ea0f2d30f97195578d2c6",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/references/best_practices.md": {
+          "sha256": "925a5aa58b249006b3743f7d6df256ee8861f9dd97e0c27b5f5b4cfcf91f9b5f",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/references/bibtex_formatting.md": {
+          "sha256": "89fde5b4e04112ee62dcfe086780f000906681ec7b102c094c875c3656eaed6f",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/references/citation_validation.md": {
+          "sha256": "2428f93cc9b6bff8d8784f9a09063774df82225757a06a8213ebf2ef37aa522e",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/references/core_workflow.md": {
+          "sha256": "4d3cc7bfa74d9c3f9f5b34073b03eaa9ba11ad5104dac437ecca56774f886f2f",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/references/example_workflows.md": {
+          "sha256": "d1106cbd7c866cabb82dccd7b9763881d279ada64283016aa59d049c5bfda2f5",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/references/google_scholar_search.md": {
+          "sha256": "18e8af47001fd427692243d04b9c975c5454e9ce9929bfe42843775f3d845680",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/references/metadata_extraction.md": {
+          "sha256": "aa8be4ac76c6e274ce5ef2f034c6578e0f263baf71f030a0f2eeb92fcd810b45",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/references/pubmed_search.md": {
+          "sha256": "f25e7adf200fee05f83e3434e1a08b6ec25d1ee2563a19325b94e443ff7cde59",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/references/script_reference.md": {
+          "sha256": "e6f1a87d6cd25bd7043fc0e4c88693a327ad2a7019515408392c58cff408330d",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/references/search_strategies.md": {
+          "sha256": "a91bbd11c7246a5c03e64544bbc476d4089b397a55260f4979055ff177c9874f",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/scripts/_common.py": {
+          "sha256": "87540160163671b972c2fccb4d0a42db3cca2603c664d26d5da3ca5dbc7dfdd2",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/scripts/doi_to_bibtex.py": {
+          "sha256": "45dbdbc365e63c65dc7e32945186122dd1cd7cb003ca5fbe103876952b4d9171",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/scripts/extract_metadata.py": {
+          "sha256": "d4922e47d21e38e8b414bfa9772eeac8c3df856b7179f33cd45f89ff777d4422",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/scripts/format_bibtex.py": {
+          "sha256": "cc74fdc4d5819df8db3999e59f96469cebfb353ecf406a49a5a0fc60896707cb",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/scripts/search_google_scholar.py": {
+          "sha256": "839228bc7a9b4c3b23e4b0d5c4c13ff024db423deeec4908b13261367b19b90e",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/scripts/search_openalex.py": {
+          "sha256": "b98f276748a121b5fdd8a6a9066f4094b85f585b64ed292710ad589df2495a3f",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/scripts/search_pubmed.py": {
+          "sha256": "a01a8034775939264ffb0b5454956b15c7915babea6f1af2fd822b95e1082884",
+          "mode": "utf8-lf"
+        },
+        "skills/citation-management/scripts/validate_citations.py": {
+          "sha256": "b20abad7a10f722a7c404adc9884bec339fc960c82373698e73e49ba2015fba5",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/SKILL.md": {
+          "sha256": "be45bd1045f825f422ccf406114c486f77f06e9487320bb51900d420f82af208",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/assets/baposter_template.tex": {
+          "sha256": "2caa29d36e3269e84b1fb7a74a39814c7b7c8747573c46023fe2243cfe4ae45e",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/assets/beamerposter_template.tex": {
+          "sha256": "dc4bf4f9c344238e523492345c5108076b69f582a30b9534123bd1f23893c382",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/assets/poster_quality_checklist.md": {
+          "sha256": "1f2d89a68410b197f8d656cc29c3b798a7de83328ebf4c9dc042df4d71e67275",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/assets/tikzposter_template.tex": {
+          "sha256": "1f58c0ebe3281ed85fbc87f03632312028205a1bd585e35a7f4058515c58dda6",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/references/README.md": {
+          "sha256": "90f2c05757aa87043e59bfd057b1b685b0cfa1f63f89be42c920eae6ede33936",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/references/ai_graphics_for_posters.md": {
+          "sha256": "cc5c4319e28511e58be236de1a8041cc0471eddd3cdd4f1e661695a6879f7fe7",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/references/compilation_and_quality_control.md": {
+          "sha256": "b059bb5bbe041ca7229bd2d3909904a0e19865f50f9c79763c13225ccf7bad5f",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/references/latex_poster_packages.md": {
+          "sha256": "75a1be24675df874f17cbea891bcfd3fc16f17e29275dd3c62d79eb9a1e1f87b",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/references/latex_poster_reference.md": {
+          "sha256": "cb5c034726d3f2a479ebf16eb830394df55085cb0f12446be5832f1e9153ea4f",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/references/poster_content_guide.md": {
+          "sha256": "2af1cbfa45878041de15459ccbac49f85f810d045ed5231a011bee5f54641b26",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/references/poster_design_principles.md": {
+          "sha256": "6c3618133764687a19f30f563805bbf13996f818ba267cfbd5bbc908b9f7102b",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/references/poster_layout_design.md": {
+          "sha256": "f674c0fe352321b9bc0eb2be09d95379714a6b77624689ba100da4898c4f20df",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/references/poster_patterns_and_presentation.md": {
+          "sha256": "8b42305d892c1c4cb80f9c183d44922b1a6f3a0dd0b8536a3ec7860aa2d0eae4",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/scripts/generate_schematic.py": {
+          "sha256": "5cec9c14d164c9ea9ccf6425f2010c40f1b077dd0c9e30395564cdc793c334b2",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/scripts/generate_schematic_ai.py": {
+          "sha256": "af055204033d446cd8e4501de0a0d0aaa952bad7c365e559f2e3a80698704ce9",
+          "mode": "utf8-lf"
+        },
+        "skills/latex-posters/scripts/review_poster.sh": {
+          "sha256": "db1fcfcda80c0ae1be5ceb075ec9e7f00df6908aa1bc395c029f8dfcb97f43a9",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/SKILL.md": {
+          "sha256": "bb33f0629727ce39c7f5ce892d08d3b391c6faee38e82e187af8c3e4c960112d",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/assets/beamer_template_conference.tex": {
+          "sha256": "e4049409c316a50c73da7c87c2818a7a2d62878d0bcebef316abe95d86ab132c",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/assets/beamer_template_defense.tex": {
+          "sha256": "ce44a4933a70a9267514eb1950bfd64b6c18299c7a96cf5955b78778ce9a7d3e",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/assets/beamer_template_seminar.tex": {
+          "sha256": "94f19ea1919edb822c57c699e1611f87e00650caab7aee53edcf94d776ab5cf7",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/assets/powerpoint_design_guide.md": {
+          "sha256": "cc02bbaee20f194abee2c84b5a942efcad47c93ffa7fb55070c16715480c2d48",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/assets/timing_guidelines.md": {
+          "sha256": "0e85b73c1997000ed0c0efa0807536d3d9cf024bf043068d6564d44351e0ba83",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/references/beamer_guide.md": {
+          "sha256": "cb8a3c500ab9a3841c0e8559ad5894a4dad80fa3193589f28f5ca91e46d1c97b",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/references/common_pitfalls.md": {
+          "sha256": "1624aa65d42d52469a06727e6a68c5ba66cce311020f107659de7ca80654888b",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/references/data_visualization_slides.md": {
+          "sha256": "c79d5d9552d2f132dd3be1beb230c5c0da4f3f27f1ac04f7f6e571204bbab9ba",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/references/presentation_structure.md": {
+          "sha256": "deafc171b8951a43c9a8ae081158cab72fdb8dc4abc1334257ad594f454665f2",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/references/presentation_workflow.md": {
+          "sha256": "64e4e6f2b7483df1c7e629139df5dac605636ae3229f64d093f9a11aee5e4127",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/references/prompt_writing.md": {
+          "sha256": "a933302ac7afd1bb1b8f76d7f4c3f445a415029611c13b1af1a22535e0adcb4a",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/references/script_reference.md": {
+          "sha256": "b2bbd551f298e20910699bb1f98d552e10babcc8dfa1988c4cd71c7896a42d92",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/references/slide_capabilities.md": {
+          "sha256": "ed059ec294acec7f179ff39c3143f5cfa92589ba9d6cdeaeec8aa3cb0499803f",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/references/slide_design_principles.md": {
+          "sha256": "ee2d8f1b3ae0a849ee49e3e4d334c64ee3a1a79aee5ca28dbf43bbec822d98fa",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/references/talk_types_guide.md": {
+          "sha256": "60f374e4e8d361e36a4c738c1e9e56b80470927e28f59e5c9f715343d7da6f6d",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/references/visual_review_workflow.md": {
+          "sha256": "6d636d52fd3c6db84008fca1b96a39905539a12f28256337d6534a575c0b4632",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/scripts/generate_schematic.py": {
+          "sha256": "5cec9c14d164c9ea9ccf6425f2010c40f1b077dd0c9e30395564cdc793c334b2",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/scripts/generate_schematic_ai.py": {
+          "sha256": "af055204033d446cd8e4501de0a0d0aaa952bad7c365e559f2e3a80698704ce9",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/scripts/generate_slide_image.py": {
+          "sha256": "d85733018dfd71cc82c2f6472fe4ee06d66e970d135aeb72345fa35ea99224dd",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/scripts/generate_slide_image_ai.py": {
+          "sha256": "c5e4724641e0e11980034110974727699277e0a9240a4231d7179193f7c3579d",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/scripts/pdf_to_images.py": {
+          "sha256": "b572150da57890311e5dc55ed19f751c7b0f1f998cbda1e6392070f783dbd261",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/scripts/slides_to_pdf.py": {
+          "sha256": "265da6e1d722f6efb3dfd8a4acef260a54b3774a56471e73b31d771ad8a8420d",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-slides/scripts/validate_presentation.py": {
+          "sha256": "b30aacfd6fcbfb11ea8783577dc4b969786ac7dc56f1ab6f0ca0c1ce37b7b9b1",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/SKILL.md": {
+          "sha256": "e423d9a186260b5ae3a058cd2ece1f7fde534efc76b0e59d9aca137d42d3809e",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/assets/color_palettes.py": {
+          "sha256": "173d95887be654867db3602430ade84f6362ae80477c5373de0b44ce40375f57",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/assets/nature.mplstyle": {
+          "sha256": "1c0c6bcb4d6add27247f43541d8e588aa562f21c4c88c7eaa673a2eac63dfb35",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/assets/presentation.mplstyle": {
+          "sha256": "db47ccdf7267a39407a959141b851d72295a66489f01c9a23ec8e963a02144c8",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/assets/publication.mplstyle": {
+          "sha256": "45973599d92b27e5b156b4a23aa794795b5d83173633acb47e55658af304f999",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/assets/publisher_profiles.json": {
+          "sha256": "12633ca62d1b7539b40fa31c01aa5b266546a25734961a41fc79250a5b328b9b",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/references/color_palettes.md": {
+          "sha256": "9b6e7d74922d64e333aff67fd41c0b53891736f5d37b01f11e96225d2dc1bfc1",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/references/journal_requirements.md": {
+          "sha256": "17d36a91d5afc4975682038f36a3b13470e886f64d53b23100b3ea5688e07daa",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/references/matplotlib_examples.md": {
+          "sha256": "0f603898a5ac91757fec3dccd62bb5ee2e24e254fdebfb97f8d2b3ecec167dd5",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/references/publication_guidelines.md": {
+          "sha256": "abfd60dbf157dcf87d396e5859d100b8d98a25bfe8b802bfcc149b049300dc20",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/references/sources.md": {
+          "sha256": "186544985dba77fe948393483cd2c7fd2c4b543c04c1fc1bcc652190d0fb9cd0",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/scripts/_common.py": {
+          "sha256": "1bbbfb48500af7dd6df98076584085b2b2a24aee3024a7d9ce91dcb27ebd4b15",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/scripts/export_plan.py": {
+          "sha256": "29e33fbb4a8a4f558e0a190afda50721f7bcb0fabf39a4f2b8f465152d9f20bf",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/scripts/figure_export.py": {
+          "sha256": "5fc7dd947621b861b12fad2c053f80f465f686b92258c9a7991db618d62b8627",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/scripts/image_metadata.py": {
+          "sha256": "bd8df685ae0a31f92ab10ac5e5ac7472275d06a62e1543adb94a4de6bfe78693",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/scripts/palette_audit.py": {
+          "sha256": "3a90b3c9a4a39dde6a341dc3de7b99cd2bca4773c66564fc90cdc2706a5a8165",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/scripts/style_presets.py": {
+          "sha256": "3c811ecb16c012691b69e9f27993ef096977754c3a6e73d247e816a674efff21",
+          "mode": "utf8-lf"
+        },
+        "skills/scientific-visualization/scripts/style_preview.py": {
+          "sha256": "f96f2ec01b86423418446eebdd2ed887da83f0a1b54f499d920191d56a3542c0",
+          "mode": "utf8-lf"
+        }
+      }
+    },
+    "manim-skill": {
+      "repository": "adithya-s-k/manim_skill",
+      "revision": "cef045011722d285692e3381d12d4d637da56e18",
+      "files": {
+        "skills/manimce-best-practices/LICENSE.txt": {
+          "sha256": "c02371d11efe3579c38db2bb73258f939cc74ecd729d69128ad3c65c4138b009",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/SKILL.md": {
+          "sha256": "ae09751ec9e3e9389b85f923f4e34b706a32e01b18e378759163d1d855f90d4e",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/examples/3d_visualization.py": {
+          "sha256": "214dcd11b09b83025405050bc618cfa7d8749691e39f136a0b987de82e47ff95",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/examples/attention/__init__.py": {
+          "sha256": "6c13b542eb4c66701cb349a4c95606a8d9767711eb3155032136e75babe46f7f",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/examples/attention/helpers.py": {
+          "sha256": "82014263adf85db640774467ac6dae00798347b995b02d34d6664e6e917c1409",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/examples/attention/scenes.py": {
+          "sha256": "10aef8fc1d8c65d2043a95215f3b310ff1591f5aaab92139aa48969f50991533",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/examples/basic_animations.py": {
+          "sha256": "d95f075d90d5cb4114923d99a1b7ad167acfaf8343ae808b682adc3c830c7506",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/examples/graph_plotting.py": {
+          "sha256": "32f9c68313daf3b2a42e5e75e85d24b46628ef77872615eef798036840b52b83",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/examples/lorenz_attractor.py": {
+          "sha256": "eee8b2d5d5e6b10c61978c46921e1189c3d7a43b94cb6706f2505724f7e03392",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/examples/math_visualization.py": {
+          "sha256": "e890b6be5fd8322631f708b71ac8da7d9201d639d5676977313a659a1cb87ded",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/examples/updater_patterns.py": {
+          "sha256": "f372ad2991835320a2a2243dae5efb4ad7ddbcf8a82cebfd0f85760220ced635",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/3d.md": {
+          "sha256": "00857a259d770b43877c02aecc276e44adc1a8c69ae6f8a067a30ee9cc35223c",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/animation-groups.md": {
+          "sha256": "9eb1ebfc7bd91690a77b5626de309d4f9d49ba38d21938add04a9787a05db211",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/animations.md": {
+          "sha256": "6ad3596f9d4aa176f25847d97cad073a3cbefb078e28ae998047a8e873a17620",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/axes.md": {
+          "sha256": "5a0acdb55f332f9a7e31821078d088e987754bc252f5faa28bca31a53173f7dd",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/camera.md": {
+          "sha256": "cfa876df13e9b2d26e0bb40e8b210c7bc91359c6d6c1e4036d5eb3c90b6f3b48",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/cli.md": {
+          "sha256": "faee09f0f37f6aa41b94f762a9cdb8ef5536a1e6b1e9e3ac05de1680e576ba6b",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/colors.md": {
+          "sha256": "b8e63c042ab6d652bb3d42a3309e11cc4c62a7e06f3b9811a4bf2f822eda3020",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/config.md": {
+          "sha256": "9ef880d55b7c4d8c4b7aeabd6f095c42164f05cfb770e9a8ba25a184034c0c2a",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/creation-animations.md": {
+          "sha256": "0bdbf8cacf5137e4acd60bb29ae1bb03bf3e059aa08b7cc2faa43f81491d354f",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/graphing.md": {
+          "sha256": "8996cca86e2d3c6d032ddceb119724312ac29a1e462f835b040f931422187354",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/grouping.md": {
+          "sha256": "05330699f1b935eb9dd6cd5237592bd04ef56dbe9a50444983379b81d6e26dce",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/latex.md": {
+          "sha256": "9d244fe31662d734e182fd0d19ce147d9c93b3ee25cb5df137d29c4b186abee1",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/lines.md": {
+          "sha256": "d13858e8a4016a5bd0dca3b121c5679a8350541dc9d0779562d40fba1abe5443",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/mobjects.md": {
+          "sha256": "a96c8eef4c0e2830cbcbb32f3a25cf9eb30c2788cc593be5a8ca1a60b8fc4449",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/positioning.md": {
+          "sha256": "83230968eaf354cc5993c5c6736fb053cbda48cc7bdd110faf8a04dbb71f7106",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/scenes.md": {
+          "sha256": "7dc32c7c8bfd50d9266351f90cbfc59b2b71f610a37ea6a836af9946dc64b3ba",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/shapes.md": {
+          "sha256": "3054d04c9b8d9cb79cb4f8554a39be46e5a6c78d29a24109c7ab367ff6640133",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/styling.md": {
+          "sha256": "740e0bb7dc428db866cefeb0a7272f2c5e16f816e84a87976d146577bf94424e",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/text-animations.md": {
+          "sha256": "4c8478c1921f56e05b17802abe0666dde1c80ef75e66447d1c8a145fc33159c8",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/text.md": {
+          "sha256": "a4caeb70c295ef879ac718f7e722c4dd2b99805d887233bc217a6b91ae7b5c22",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/timing.md": {
+          "sha256": "0534df4e9b694da16a4993a22689e2dab4b7857df008248ee9fe655b97b2ec4e",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/transform-animations.md": {
+          "sha256": "3565293834394ecdcbf080504d8a015b44f85b5d3fc2b3493fd4d1ffd1903774",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/rules/updaters.md": {
+          "sha256": "b0520d45fc72380bd279df76b80028901a9273becfac61039f6c48e0a345c767",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/templates/basic_scene.py": {
+          "sha256": "fd47d30ecfd6b03a8baff4a9fb9e88c4cf023fed9b57cf405366e99cbf84c515",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/templates/camera_scene.py": {
+          "sha256": "51f46e59278a54415bfdf65124d3064ab58f0538716b964b381e69078d711010",
+          "mode": "utf8-lf"
+        },
+        "skills/manimce-best-practices/templates/threed_scene.py": {
+          "sha256": "73ef6dfb132472beb8b239d61c8538b2f1a37dd0e263682e650f9334c10ce023",
+          "mode": "utf8-lf"
+        }
+      }
+    },
+    "scroll-skill": {
+      "repository": "sickn33/antigravity-awesome-skills",
+      "revision": "b6ceca367a3b3ee90a273a3afa895960e8e9d7a5",
+      "files": {
+        "skills/scroll-experience/SKILL.md": {
+          "sha256": "4f32befc173fb89d8d20364fe096023667306a57b088857bc25b11ff033cf3d2",
+          "mode": "utf8-lf"
+        }
+      }
+    }
+  },
+  "skills": {
+    "citation-management": {
+      "source": "scientific-skills",
+      "path": "skills/citation-management",
+      "runtime_name": "citation-management"
+    },
+    "data-storytelling": {
+      "source": "agentskillos",
+      "path": "data/skill_seeds/data-storytelling",
+      "runtime_name": "data-storytelling"
+    },
+    "dev-browser": {
+      "source": "agentskillos",
+      "path": "data/skill_seeds/dev-browser",
+      "runtime_name": "dev-browser"
+    },
+    "docx": {
+      "source": "agentskillos",
+      "path": "data/skill_seeds/docx",
+      "runtime_name": "docx"
+    },
+    "firecrawl-scraper": {
+      "source": "agentskillos",
+      "path": "data/skill_seeds/firecrawl-scraper",
+      "runtime_name": "firecrawl-scraper"
+    },
+    "frontend-design": {
+      "source": "agentskillos",
+      "path": "data/skill_seeds/frontend-design",
+      "runtime_name": "frontend-design"
+    },
+    "generate-image": {
+      "source": "agentskillos",
+      "path": "data/skill_seeds/generate-image",
+      "runtime_name": "generate-image"
+    },
+    "latex-posters": {
+      "source": "scientific-skills",
+      "path": "skills/latex-posters",
+      "runtime_name": "latex-posters"
+    },
+    "manim": {
+      "source": "manim-skill",
+      "path": "skills/manimce-best-practices",
+      "runtime_name": "manimce-best-practices"
+    },
+    "media-processing": {
+      "source": "agentskillos",
+      "path": "data/skill_seeds/media-processing",
+      "runtime_name": "media-processing"
+    },
+    "pptx": {
+      "source": "agentskillos",
+      "path": "data/skill_seeds/pptx",
+      "runtime_name": "pptx"
+    },
+    "scientific-slides": {
+      "source": "scientific-skills",
+      "path": "skills/scientific-slides",
+      "runtime_name": "scientific-slides"
+    },
+    "scientific-visualization": {
+      "source": "scientific-skills",
+      "path": "skills/scientific-visualization",
+      "runtime_name": "scientific-visualization"
+    },
+    "scroll-experience": {
+      "source": "scroll-skill",
+      "path": "skills/scroll-experience",
+      "runtime_name": "scroll-experience"
+    },
+    "sympy": {
+      "source": "bundled",
+      "path": "skills/sympy",
+      "runtime_name": "sympy",
+      "files": {
+        "SKILL.md": {
+          "sha256": "4b23ffd0227bebe723e3a835153816cb1464c236fcb97e176e79ceb437048cf3",
+          "mode": "utf8-lf"
+        },
+        "scripts/hypothesis_tests.py": {
+          "sha256": "0a1d9919a3e4c696ebd6ba8fc5d45a8a04a195e896928543ef3830f33b324fa3",
+          "mode": "utf8-lf"
+        }
+      }
+    },
+    "xlsx": {
+      "source": "agentskillos",
+      "path": "data/skill_seeds/xlsx",
+      "runtime_name": "xlsx"
+    }
+  },
+  "plans": {
+    "data_computation_task1.json": {
+      "sha256": "ddf3c816167c2b58d0f59db6c7f210ee83734f69f47dbd8efb97297124b34ff6",
+      "mode": "utf8-lf"
+    },
+    "data_computation_task5.json": {
+      "sha256": "78cf4a30a10988cc761c4dd006da1911575fafefa60e1e265800dc343f760378",
+      "mode": "utf8-lf"
+    },
+    "data_computation_task6.json": {
+      "sha256": "0dbd8211bc51215893428bcedc87460819fc6449187484995427360e83907c5b",
+      "mode": "utf8-lf"
+    },
+    "document_creation_task2.json": {
+      "sha256": "07845ffaa248b5448638271a470392025fa6ce9f65e4e28686b6173114811b81",
+      "mode": "utf8-lf"
+    },
+    "document_creation_task3.json": {
+      "sha256": "52912c5a7641340bd9854736edc885363f9547eb9b57d866d388a9864e0e5400",
+      "mode": "utf8-lf"
+    },
+    "document_creation_task4.json": {
+      "sha256": "fb316bc46e4de03307c13da5f5d3b8a8c61e51806ef70fde7f8583f831cc3522",
+      "mode": "utf8-lf"
+    },
+    "document_creation_task6.json": {
+      "sha256": "07ccea3620109038802a1f742691dc292ab0d1adc73f3d051dfb5d91e79640ec",
+      "mode": "utf8-lf"
+    },
+    "motion_video_task2.json": {
+      "sha256": "8e0ae87dbbbde099adcd3478a7bde4f229527a9ba66e7956a22a4fc0a5ac1d74",
+      "mode": "utf8-lf"
+    },
+    "motion_video_task3.json": {
+      "sha256": "4ebe0d6135363e946e308fa033eaced9e71b4e8b42741a2a33473eba641328f0",
+      "mode": "utf8-lf"
+    },
+    "motion_video_task6.json": {
+      "sha256": "81fa54257a9232fc3539058f72f5344c2d05a4815fed664df8cd0879e57a43af",
+      "mode": "utf8-lf"
+    },
+    "visual_creation_task1.json": {
+      "sha256": "bb76b5c5f3b793ee1a35d5d61dfb41508fe0efd3bb654d0a949c329aa59eb942",
+      "mode": "utf8-lf"
+    },
+    "visual_creation_task2.json": {
+      "sha256": "977955b04340dac63c066f95079f8efd3878a1345dfbd8f36b51302dc6709d9b",
+      "mode": "utf8-lf"
+    },
+    "visual_creation_task3.json": {
+      "sha256": "df7930f61c100558026a304a8d6457920bf9c9ff959cb88e1fea1e0fb591b45a",
+      "mode": "utf8-lf"
+    },
+    "visual_creation_task5.json": {
+      "sha256": "d68bf52f1ebdff8222e240db9fe2ca3824dca7071f5dbe04509e1e9344182a57",
+      "mode": "utf8-lf"
+    },
+    "visual_creation_task6.json": {
+      "sha256": "4aafa40b83d4a800f0e6064b9b7c40fa73bd55e4d65bea8014f9dc2925a14b1c",
+      "mode": "utf8-lf"
+    },
+    "web_interaction_task1.json": {
+      "sha256": "a0d3416f65d91d7298d1c3c43d4ef3fad7ae88bd3c7265a4aacfbd5cd4b32c1a",
+      "mode": "utf8-lf"
+    },
+    "web_interaction_task2.json": {
+      "sha256": "7678792c191416f1f631037585de6b3cbc03ae22ce803fe205d93bb88da45544",
+      "mode": "utf8-lf"
+    },
+    "web_interaction_task4.json": {
+      "sha256": "4c322654c9cc77b25840588a753eeffacd256ff074d648a3ac5b63ebd250576a",
+      "mode": "utf8-lf"
+    },
+    "web_interaction_task5.json": {
+      "sha256": "01b2609460594cb097dc160f08b93232fd4e3104064ed90c87526ce46fb893e7",
+      "mode": "utf8-lf"
+    },
+    "web_interaction_task6.json": {
+      "sha256": "3357c5568e287d0be28fcd64b6cdb95908df9849fc5f3bb0246d0c263a548cdd",
+      "mode": "utf8-lf"
+    }
+  },
+  "public_template_differences": [
+    {
+      "source": "agentskillos",
+      "path": "data/skill_seeds/generate-image/SKILL.md",
+      "reason": "Handoff sanitizer replaced non-secret API key examples or setup-help strings; use the original pinned public template."
+    },
+    {
+      "source": "agentskillos",
+      "path": "data/skill_seeds/generate-image/scripts/generate_image.py",
+      "reason": "Handoff sanitizer replaced non-secret API key examples or setup-help strings; use the original pinned public template."
+    },
+    {
+      "source": "scientific-skills",
+      "path": "skills/latex-posters/scripts/generate_schematic.py",
+      "reason": "Handoff sanitizer replaced non-secret API key examples or setup-help strings; use the original pinned public template."
+    },
+    {
+      "source": "scientific-skills",
+      "path": "skills/latex-posters/scripts/generate_schematic_ai.py",
+      "reason": "Handoff sanitizer replaced non-secret API key examples or setup-help strings; use the original pinned public template."
+    },
+    {
+      "source": "scientific-skills",
+      "path": "skills/scientific-slides/scripts/generate_schematic.py",
+      "reason": "Handoff sanitizer replaced non-secret API key examples or setup-help strings; use the original pinned public template."
+    },
+    {
+      "source": "scientific-skills",
+      "path": "skills/scientific-slides/scripts/generate_schematic_ai.py",
+      "reason": "Handoff sanitizer replaced non-secret API key examples or setup-help strings; use the original pinned public template."
+    },
+    {
+      "source": "scientific-skills",
+      "path": "skills/scientific-slides/scripts/generate_slide_image.py",
+      "reason": "Handoff sanitizer replaced non-secret API key examples or setup-help strings; use the original pinned public template."
+    },
+    {
+      "source": "scientific-skills",
+      "path": "skills/scientific-slides/scripts/generate_slide_image_ai.py",
+      "reason": "Handoff sanitizer replaced non-secret API key examples or setup-help strings; use the original pinned public template."
+    }
+  ]
+}

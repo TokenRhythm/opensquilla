@@ -1,0 +1,37 @@
+# Packaged SquillaRouter tier preset. Loaded by
+# opensquilla.provider.preset_registry; tier data is a stable contract
+# consumed by gateway config validation and must round-trip exactly.
+[preset]
+id = "byteplus"
+provider = "byteplus"
+label = "BytePlus Ark"
+description = "Curated BytePlus Ark router tier ladder (c0-c3)."
+default_model = "seed-2-0-lite-260228"
+
+[tiers.c0]
+provider = "byteplus"
+model = "seed-2-0-lite-260228"
+description = "BytePlus fast route: Seed 2.0 Lite for low-latency, low-cost simple text tasks."
+thinking_level = "off"
+supports_image = false
+
+[tiers.c1]
+provider = "byteplus"
+model = "seed-2-0-lite-260228"
+description = "BytePlus balanced route: Seed 2.0 Lite for normal agent work with provider thinking available."
+thinking_level = "low"
+supports_image = false
+
+[tiers.c2]
+provider = "byteplus"
+model = "seed-2-0-lite-260228"
+description = "BytePlus strong route: Seed 2.0 Lite with medium thinking for multi-step text tasks."
+thinking_level = "medium"
+supports_image = false
+
+[tiers.c3]
+provider = "byteplus"
+model = "seed-2-0-lite-260228"
+description = "BytePlus highest route: Seed 2.0 Lite with high thinking for harder long-horizon text tasks."
+thinking_level = "high"
+supports_image = false

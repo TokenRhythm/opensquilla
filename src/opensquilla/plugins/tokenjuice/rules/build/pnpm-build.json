@@ -1,0 +1,44 @@
+{
+  "id": "build/pnpm-build",
+  "family": "build-script",
+  "description": "Compact pnpm build script output while preserving downstream warnings and failures.",
+  "onEmpty": "pnpm build: ok",
+  "match": {
+    "toolNames": ["exec"],
+    "argv0": ["pnpm"],
+    "argvIncludes": [["build"]],
+    "commandIncludes": ["pnpm build"]
+  },
+  "transforms": {
+    "stripAnsi": true,
+    "dedupeAdjacent": true,
+    "trimEmptyEdges": true
+  },
+  "filters": {
+    "skipPatterns": [
+      "^> .+$",
+      "^\\s*Done in .+$"
+    ]
+  },
+  "summarize": {
+    "head": 10,
+    "tail": 8
+  },
+  "failure": {
+    "preserveOnFailure": true,
+    "head": 14,
+    "tail": 14
+  },
+  "counters": [
+    {
+      "name": "error",
+      "pattern": "error",
+      "flags": "i"
+    },
+    {
+      "name": "warning",
+      "pattern": "warning|warn",
+      "flags": "i"
+    }
+  ]
+}

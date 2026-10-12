@@ -1,0 +1,67 @@
+{
+  "id": "git/diff",
+  "family": "git-diff",
+  "description": "Compact full git diff patch output while preserving file and hunk headers plus changed lines.",
+  "match": {
+    "toolNames": ["exec"],
+    "gitSubcommands": ["diff"],
+    "strictOutputRegex": "^diff --git\\s",
+    "commandIncludesAny": ["git diff ", "&& git diff ", "; git diff ", "\ngit diff "]
+  },
+  "transforms": {
+    "stripAnsi": true,
+    "dedupeAdjacent": true,
+    "trimEmptyEdges": true
+  },
+  "filters": {
+    "keepPatterns": [
+      "^diff --git\\s+.+",
+      "^new file mode\\s+.+",
+      "^deleted file mode\\s+.+",
+      "^similarity index\\s+.+",
+      "^rename from\\s+.+",
+      "^rename to\\s+.+",
+      "^Binary files .+ differ$",
+      "^---\\s+.+",
+      "^\\+\\+\\+\\s+.+",
+      "^@@\\s+.+",
+      "^\\+(?!\\+\\+\\+).+",
+      "^-(?!---).+",
+      "^\\\\ No newline at end of file$",
+      "^\\s*\\d+ files? changed.+",
+      "^\\s*create mode .+",
+      "^\\s*delete mode .+"
+    ]
+  },
+  "summarize": {
+    "head": 20,
+    "tail": 12
+  },
+  "failure": {
+    "preserveOnFailure": true,
+    "head": 24,
+    "tail": 16
+  },
+  "counters": [
+    {
+      "name": "changed file",
+      "pattern": "^diff --git\\s",
+      "flags": "m"
+    },
+    {
+      "name": "hunk",
+      "pattern": "^@@\\s",
+      "flags": "m"
+    },
+    {
+      "name": "added line",
+      "pattern": "^\\+(?!\\+\\+\\+).+",
+      "flags": "m"
+    },
+    {
+      "name": "removed line",
+      "pattern": "^-(?!---).+",
+      "flags": "m"
+    }
+  ]
+}

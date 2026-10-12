@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "plan_id": "agentskillos-visual-creation-task3-shared-v1",
+  "task_id": "visual_creation_task3",
+  "designated_skills": [
+    "generate-image",
+    "media-processing"
+  ],
+  "task_request": "Create a professional social-media content pack for the fictional artisan café Ember & Bloom. Produce latte_art.png as a warm overhead square latte-art photograph on a wooden table; pastry_display.png as a portrait flat-lay of croissants, tarts, muffins and scattered coffee beans on marble; cafe_interior.png as a landscape cozy café interior with Edison bulbs, exposed brick, plants and comfortable seating; promo_story.png as a vertical story-format Weekend Brunch Special graphic with appetizing food imagery and bold readable text; and preview_grid.png as a 2×2 composite of those four images with thin white borders. Keep all images visually coherent through an inviting earth-tone palette of browns, creams and warm golds, and save all declared files in {{WORKSPACE}}.",
+  "nodes": [
+    {
+      "id": "define_cafe_visual_system",
+      "objective": "Define a compact, production-ready visual system for Ember & Bloom before generation. Specify one consistent earth-tone palette, warm natural or Edison-bulb lighting, photographic styling, material cues, brand mood, safe areas and crop rules. Produce four filename-mapped prompts with deliberately distinct composition and required orientation, including an explicit text-safe region for the promotional story. Do not create or modify final images in this step.",
+      "skill": "generate-image",
+      "depends_on": [],
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "visual_system",
+        "four_filename_mapped_prompts"
+      ],
+      "write_access": false,
+      "network_access": false
+    },
+    {
+      "id": "generate_four_source_images",
+      "objective": "Use the configured image generation tool to create four genuine, non-placeholder images from the frozen visual system: latte_art.png in square composition, pastry_display.png in portrait composition, cafe_interior.png in landscape composition, and promo_story.png in vertical story composition with an appetizing brunch hero and clear text-safe region. Keep subjects distinct but palette, lighting and photographic finish coherent. Save the four exact filenames in the exact workspace and record provider/model, dimensions, hashes and generation prompts. Do not make copies of one image or programmatic placeholder art.",
+      "skill": "generate-image",
+      "depends_on": [
+        "define_cafe_visual_system"
+      ],
+      "inputs": [
+        "task_request",
+        "visual_system",
+        "four_filename_mapped_prompts",
+        "{{WORKSPACE}}"
+      ],
+      "required_outputs": [
+        "latte_art.png",
+        "pastry_display.png",
+        "cafe_interior.png",
+        "promo_story.png",
+        "generation_manifest"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "finish_social_assets",
+      "objective": "Deterministically finish the four generated images without replacing their visual content. Enforce suitable social orientations with high-quality cover cropping: square latte art, portrait pastry display, landscape café interior and approximately 9:16 promotional story. Apply restrained shared color finishing for palette consistency. Add an exact, bold and highly readable 'Weekend Brunch Special' overlay to promo_story.png using a safe high-contrast area, preserving the food image and adequate margins. Verify PNG decoding, dimensions, distinctness and legibility, and record all transformations.",
+      "skill": "media-processing",
+      "depends_on": [
+        "generate_four_source_images"
+      ],
+      "inputs": [
+        "task_request",
+        "generation_manifest",
+        "latte_art.png",
+        "pastry_display.png",
+        "cafe_interior.png",
+        "promo_story.png",
+        "{{WORKSPACE}}"
+      ],
+      "required_outputs": [
+        "four_finished_pngs",
+        "processing_manifest"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "compose_preview_grid",
+      "objective": "Create preview_grid.png as a clean square 2×2 social-media preview containing all four finished images exactly once. Use consistent cover crops without distortion, preserve important subjects and promotional text, and separate panels using thin uniform white borders with no unintended gaps. Do not alter the four source deliverables. Record panel-to-source mapping, canvas dimensions and hashes.",
+      "skill": "media-processing",
+      "depends_on": [
+        "finish_social_assets"
+      ],
+      "inputs": [
+        "task_request",
+        "processing_manifest",
+        "four_finished_pngs",
+        "{{WORKSPACE}}"
+      ],
+      "required_outputs": [
+        "preview_grid.png",
+        "grid_manifest"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_declared_deliverables",
+      "objective": "Perform a bounded read-only validation without repairing outputs. Confirm all five exact PNG files decode and are non-trivial; the four source images are visually distinct and match their requested subjects and orientations; the café pack shares a coherent warm earth-tone art direction; promo_story.png contains clearly readable exact Weekend Brunch Special text with safe margins; and preview_grid.png is a true 2×2 composite containing all four sources once with thin white borders and no distortion. Report concise PASS or FAIL evidence and confirm whether artifact hashes remained unchanged.",
+      "skill": "media-processing",
+      "depends_on": [
+        "compose_preview_grid"
+      ],
+      "inputs": [
+        "task_request",
+        "processing_manifest",
+        "grid_manifest",
+        "{{WORKSPACE}}"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

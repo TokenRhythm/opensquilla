@@ -1,0 +1,82 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "document-creation-task4-shared-v1",
+  "task_id": "document_creation_task4",
+  "designated_skills": [
+    "scientific-slides",
+    "dev-browser"
+  ],
+  "task_request": "I am a PhD student preparing for an academic seminar next week, and I need a polished slide deck that presents a critical review of my research area. Please create a professional academic presentation with at least 12 pages on \"Emergent Abilities and Alignment Techniques in Large Language Models\". It should cover: background and motivation, core concepts including emergent abilities and scaling laws, a comparison table of major alignment methods — RLHF, Constitutional AI, and DPO — with columns for pros, cons, and computational cost, a critical analysis section identifying open problems and limitations of current approaches, your recommended research directions, and a summary with references. The presentation should make a clear argument, not just survey the field. The slides should include rich visual content such as diagrams, charts, and illustrations to enhance understanding and engagement.\n\nOutput as presentation.pdf.",
+  "nodes": [
+    {
+      "id": "research_alignment_evidence",
+      "skill": "dev-browser",
+      "depends_on": [],
+      "objective": "Collect current primary or scholarly evidence on emergent abilities, scaling laws, RLHF, Constitutional AI and DPO, including representative diagrams/data suitable for an academic seminar. Record accurate citations, methodological caveats and computational-cost evidence.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "evidence_pack",
+        "reference_list"
+      ],
+      "write_access": false,
+      "network_access": true
+    },
+    {
+      "id": "form_critical_argument",
+      "skill": "scientific-slides",
+      "depends_on": [
+        "research_alignment_evidence"
+      ],
+      "objective": "Develop one defensible seminar thesis connecting scaling/emergence to alignment tradeoffs, with a fair RLHF/Constitutional AI/DPO pros-cons-cost comparison, open problems, limitations and prioritized research directions rather than a flat survey.",
+      "inputs": [
+        "task_request",
+        "outputs.research_alignment_evidence"
+      ],
+      "required_outputs": [
+        "argument_outline",
+        "slide_storyboard"
+      ],
+      "write_access": false,
+      "network_access": false
+    },
+    {
+      "id": "build_alignment_deck",
+      "skill": "scientific-slides",
+      "depends_on": [
+        "research_alignment_evidence",
+        "form_critical_argument"
+      ],
+      "objective": "Create presentation.pdf with at least twelve polished pages, rich but legible diagrams/charts/illustrations, the required alignment-method comparison table, critical analysis, research recommendations, summary and references. Make the argument visually and verbally coherent.",
+      "inputs": [
+        "task_request",
+        "outputs.research_alignment_evidence",
+        "outputs.form_critical_argument"
+      ],
+      "required_outputs": [
+        "presentation.pdf"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_alignment_deck",
+      "skill": "scientific-slides",
+      "depends_on": [
+        "build_alignment_deck"
+      ],
+      "objective": "Inspect page count, section/table coverage, citation accuracy, visual richness, argument continuity and projection readability. Report checks without modifying the PDF.",
+      "inputs": [
+        "task_request",
+        "outputs.build_alignment_deck"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

@@ -1,0 +1,106 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "data-computation-task1-shared-v1",
+  "task_id": "data_computation_task1",
+  "designated_skills": [
+    "pptx",
+    "docx",
+    "scientific-visualization",
+    "data-storytelling"
+  ],
+  "task_request": "I am a zoologist, and I need to present my research findings on penguins next week. I have collected observational data on different penguin species, stored at the path artifacts/penguins.csv, which contains several hundred samples with measurements of bill length, bill depth, flipper length, body mass, species, island, and sex.\n\nBased on these data, I would like to analyze the species-specific characteristics of different types of penguins. Please perform statistical analysis including: descriptive statistics per species, species comparison tests, and morphological differences between sexes within each species.\n\nGenerate at least 4 publication-quality figures (saved as PNG files) visualizing the key findings — for example, species comparison box plots, correlation scatter plots colored by species, and distribution plots.\n\nI need you to produce two deliverables:\n1. A professional and comprehensive analysis report on penguin species characteristics (report.docx), aimed at specialists, with embedded figures, statistical tables, and written interpretation of results.\n2. Academic-style slides (presentation.pptx) with at least 10 slides covering: title, data overview, methodology, key findings with visualizations, species comparisons, and conclusions. The slides should tell a coherent data story suitable for a research conference.",
+  "nodes": [
+    {
+      "id": "analyze_and_visualize",
+      "skill": "scientific-visualization",
+      "depends_on": [],
+      "objective": "Load artifacts/penguins.csv, clean and document the data, compute species-level descriptive statistics, run appropriate species comparisons and within-species sex comparisons, and save at least four publication-quality PNG figures plus reusable statistical tables and analysis notes.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "at least four PNG figures",
+        "statistical_tables",
+        "analysis_notes"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "shape_data_story",
+      "skill": "data-storytelling",
+      "depends_on": [
+        "analyze_and_visualize"
+      ],
+      "objective": "Turn the verified analysis into a specialist-facing narrative with a clear research question, methods-to-findings flow, species comparisons, sex differences, uncertainty, limitations, and conference-ready takeaways. Do not invent results not present in the analysis.",
+      "inputs": [
+        "task_request",
+        "outputs.analyze_and_visualize"
+      ],
+      "required_outputs": [
+        "report_narrative",
+        "slide_storyboard"
+      ],
+      "write_access": false,
+      "network_access": false
+    },
+    {
+      "id": "write_report",
+      "skill": "docx",
+      "depends_on": [
+        "analyze_and_visualize",
+        "shape_data_story"
+      ],
+      "objective": "Create report.docx as a professional comprehensive specialist report with the statistical tables, at least four embedded figures, methods, interpreted findings, limitations, and conclusions.",
+      "inputs": [
+        "task_request",
+        "outputs.analyze_and_visualize",
+        "outputs.shape_data_story"
+      ],
+      "required_outputs": [
+        "report.docx"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "build_presentation",
+      "skill": "pptx",
+      "depends_on": [
+        "analyze_and_visualize",
+        "shape_data_story"
+      ],
+      "objective": "Create presentation.pptx with at least ten academic-style slides covering title, data overview, methodology, key visualized findings, species comparisons, sex differences, limitations, and conclusions as one coherent conference story.",
+      "inputs": [
+        "task_request",
+        "outputs.analyze_and_visualize",
+        "outputs.shape_data_story"
+      ],
+      "required_outputs": [
+        "presentation.pptx"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_package",
+      "skill": "docx",
+      "depends_on": [
+        "write_report",
+        "build_presentation"
+      ],
+      "objective": "Open both deliverables and check that they are readable, contain the requested sections and figures, agree on the numerical findings, and live in the workspace root. Report checks without changing the artifacts.",
+      "inputs": [
+        "task_request",
+        "outputs.write_report",
+        "outputs.build_presentation"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

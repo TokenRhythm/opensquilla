@@ -1,0 +1,79 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "motion-video-task2-shared-v1",
+  "task_id": "motion_video_task2",
+  "designated_skills": [
+    "manim",
+    "sympy"
+  ],
+  "task_request": "I am a math education content creator, and I want to produce an educational video explaining Fourier series convergence. Please analyze the Fourier series of a square wave: f(x)=1 for 0<x<\\pi, f(x)=-1 for -\\pi<x<0, with period 2\\pi.\n\nCompute the Fourier coefficients b_n for n=1 to n=10 (exactly 10 coefficients, do NOT include a_0). Also compute partial sums for N=1, 3, 5, and 10 terms.\n\nSave the results to fourier_coefficients.json with:\n- A 'coefficients' array containing exactly 10 objects, each with 'n' (integer 1-10) and 'value' (the b_n coefficient value)\n- A 'partial_sums' object with keys 'N=1', 'N=3', 'N=5', 'N=10', where each contains an 'expression' field showing the formula using symbolic fractions with π (e.g., '(4/pi)*sin(x) + (4/(3*pi))*sin(3*x)'), not decimal approximations\n\nThen create fourier_animation.mp4 showing the square wave and how the Fourier approximation progressively improves. The animation must show 4 clearly distinct and separate stages for N=1, 3, 5, and 10, with visible transitions between each stage. Display the mathematical formulas (using fractions with π) in the animation. Ensure axis labels use clean formatting without excessive decimal places.",
+  "nodes": [
+    {
+      "id": "compute_fourier_series",
+      "skill": "sympy",
+      "depends_on": [],
+      "objective": "Derive the square-wave Fourier sine coefficients b_n for n=1 through 10 and symbolic partial-sum expressions for N=1,3,5,10. Write fourier_coefficients.json with exactly ten coefficient objects and exactly the four requested partial_sums keys, using symbolic pi fractions in expression strings.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "fourier_coefficients.json"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "verify_fourier_results",
+      "skill": "sympy",
+      "depends_on": [
+        "compute_fourier_series"
+      ],
+      "objective": "Independently verify parity, zero even coefficients, nonzero odd coefficients, coefficient count, expression keys, and representative numerical values. Produce a compact verified formula/stage brief without altering the JSON.",
+      "inputs": [
+        "task_request",
+        "outputs.compute_fourier_series"
+      ],
+      "required_outputs": [
+        "verified_stage_brief",
+        "json_validation"
+      ],
+      "write_access": false,
+      "network_access": false
+    },
+    {
+      "id": "animate_convergence",
+      "skill": "manim",
+      "depends_on": [
+        "verify_fourier_results"
+      ],
+      "objective": "Create fourier_animation.mp4 with the target square wave and four clearly separated stages N=1,3,5,10, visible transitions, symbolic pi-fraction formulas, readable axes without excessive decimals, and progressive convergence/Gibbs behavior.",
+      "inputs": [
+        "task_request",
+        "outputs.verify_fourier_results"
+      ],
+      "required_outputs": [
+        "fourier_animation.mp4"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_fourier_package",
+      "skill": "manim",
+      "depends_on": [
+        "animate_convergence"
+      ],
+      "objective": "Inspect the JSON and video for exact stage/count requirements, formula visibility, transitions, axis readability and playable media, reporting checks without edits.",
+      "inputs": [
+        "task_request",
+        "outputs.animate_convergence"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

@@ -1,0 +1,106 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "visual-creation-task2-shared-v1",
+  "task_id": "visual_creation_task2",
+  "designated_skills": [
+    "dev-browser",
+    "generate-image",
+    "docx"
+  ],
+  "task_request": "I am a product designer, and our company is planning to build a knowledge management software product. I need you to research multiple related products, specifically Notion, Confluence, and Obsidian, and produce a visual design style research report about them. Browse their official websites, capture a screenshot of each product's key interface (1 screenshot per product). Save the screenshots with these exact filenames: notion.png, confluence.png, obsidian.png. The visual style research report should be saved as report.docx and must include: the captured screenshots, a comparative analysis table covering layout style, color palette, typography, and icon design for each product, as well as a synthesis section with design recommendations. Then, based on the analysis, synthesize the design characteristics of these products and generate three design concept images for a knowledge management software to provide design inspiration. The design concept images should be saved as fusion_design_1.png, fusion_design_2.png, and fusion_design_3.png, respectively.",
+  "nodes": [
+    {
+      "id": "capture_product_interfaces",
+      "skill": "dev-browser",
+      "depends_on": [],
+      "objective": "Browse the official Notion, Confluence, and Obsidian sites and capture one representative key-interface screenshot per product with the exact filenames notion.png, confluence.png, and obsidian.png. Record source URLs and visible design evidence.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "notion.png",
+        "confluence.png",
+        "obsidian.png",
+        "source_notes"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "analyze_visual_systems",
+      "skill": "dev-browser",
+      "depends_on": [
+        "capture_product_interfaces"
+      ],
+      "objective": "Compare layout, color palette, typography, icon design, density, hierarchy, navigation, and interaction cues across the three products; derive explicit synthesis principles and design recommendations grounded in the captured evidence.",
+      "inputs": [
+        "task_request",
+        "outputs.capture_product_interfaces"
+      ],
+      "required_outputs": [
+        "comparative_analysis",
+        "design_recommendations"
+      ],
+      "write_access": false,
+      "network_access": false
+    },
+    {
+      "id": "generate_fusion_concepts",
+      "skill": "generate-image",
+      "depends_on": [
+        "analyze_visual_systems"
+      ],
+      "objective": "Generate three distinct but coherent knowledge-management interface concept images based on the synthesis, saving exactly fusion_design_1.png, fusion_design_2.png, and fusion_design_3.png. Avoid copying any single competitor and keep UI text visually plausible.",
+      "inputs": [
+        "task_request",
+        "outputs.analyze_visual_systems"
+      ],
+      "required_outputs": [
+        "fusion_design_1.png",
+        "fusion_design_2.png",
+        "fusion_design_3.png"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "write_design_report",
+      "skill": "docx",
+      "depends_on": [
+        "capture_product_interfaces",
+        "analyze_visual_systems",
+        "generate_fusion_concepts"
+      ],
+      "objective": "Create report.docx with all three captured screenshots, a comparative table covering the four requested dimensions, evidence-based synthesis and recommendations, and the three generated concepts with captions and interpretation.",
+      "inputs": [
+        "task_request",
+        "outputs.capture_product_interfaces",
+        "outputs.analyze_visual_systems",
+        "outputs.generate_fusion_concepts"
+      ],
+      "required_outputs": [
+        "report.docx"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_design_pack",
+      "skill": "docx",
+      "depends_on": [
+        "write_design_report"
+      ],
+      "objective": "Check all seven image files and report.docx open, filenames are exact, screenshots and concepts are embedded, and every comparison dimension is present. Report checks without changes.",
+      "inputs": [
+        "task_request",
+        "outputs.write_design_report"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

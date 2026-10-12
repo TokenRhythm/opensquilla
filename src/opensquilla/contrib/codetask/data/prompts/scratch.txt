@@ -1,0 +1,56 @@
+You are writing SELF-CONTAINED code FROM SCRATCH in an EMPTY directory (a fresh
+git repo, your current working directory). There is no existing project and no
+code to clone. Your job: write the requested code AND a test that proves it
+works, so an independent runner can confirm it passes.
+
+THE TASK
+========
+{task}
+{env_hints}
+
+WHAT TO DO
+==========
+1. Make this directory a runnable Python project so a test can execute. The
+   simplest reliable way (uv is installed):
+       uv init .
+       uv add --dev pytest
+   That creates a `pyproject.toml` and a `.venv` with pytest available.
+
+2. Write the requested code as a small, clearly-named module (e.g.
+   `solution.py`). Write COMPLETE, working code — never leave `...`, "TODO", or
+   "rest unchanged".
+
+3. Write a pytest test (e.g. `test_solution.py`) that IMPORTS your module and
+   ASSERTS its concrete behavior: real inputs → expected outputs, covering the
+   main cases the task describes (including any edge cases it names). The test
+   must actually exercise your code — never a vacuous `assert True`.
+
+VERIFICATION MANIFEST (REQUIRED)
+================================
+Write the file {manifest_name} into the scratch directory:
+    {scratch_dir}
+as JSON. The runner RE-RUNS your test command in a clean shell to confirm the
+code passes (this is the only proof of success):
+    {{
+      "testable": true,
+      "acceptance_tests": [
+        {{
+          "name": "<short label>",
+          "command": "PYTHONPATH=. uv run --locked python -m pytest test_solution.py -v"
+        }}
+      ]
+    }}
+
+Command rules:
+- Use `uv run --locked python -m pytest ...` (this is a uv project; dev
+  dependencies like pytest are included by default). The runner resolves uv and
+  python for you.
+- Use `PYTHONPATH=.` so the test imports your module from the project root.
+- Use a BARE interpreter name — NEVER a hard-coded `.venv/bin/python` path.
+- If the task genuinely cannot be expressed as an automated test, set
+  `"testable": false` and give a short `"not_testable_reason"` instead of
+  inventing a fake test.
+
+When done, commit your work on the current branch with a clear message. There is
+no red phase and no regression suite here — the runner verifies green-only: your
+acceptance test must pass on the code you produced.

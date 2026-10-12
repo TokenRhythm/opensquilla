@@ -1,0 +1,117 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "document-creation-task6-shared-v1",
+  "task_id": "document_creation_task6",
+  "designated_skills": [
+    "generate-image",
+    "scientific-slides"
+  ],
+  "task_request": "I am a university lecturer, and I'm preparing teaching materials on \"Quantum Computing Fundamentals\" for my undergraduate class. Please generate 3 illustrations: qubit.png showing a Bloch sphere visualization, gates.png showing Hadamard & CNOT gate operations, and circuit.png showing a simple quantum circuit diagram.\n\nCreate presentation.pdf with at least 8 pages covering: title page, classical vs quantum computing, qubits & superposition, quantum gates, quantum circuits, entanglement, applications, and summary with key takeaways.",
+  "nodes": [
+    {
+      "id": "plan_quantum_lesson",
+      "skill": "scientific-slides",
+      "depends_on": [],
+      "objective": "Create a concise undergraduate teaching arc of at least eight pages covering title, classical versus quantum computing, qubits and superposition, gates, circuits, entanglement, applications, and summary. Specify what each of the three requested figures must communicate and maintain notation consistency.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "slide_storyboard",
+        "figure_specifications"
+      ],
+      "write_access": false,
+      "network_access": false
+    },
+    {
+      "id": "generate_qubit_figure",
+      "skill": "generate-image",
+      "depends_on": [
+        "plan_quantum_lesson"
+      ],
+      "objective": "Generate qubit.png as a scientifically legible Bloch-sphere illustration with clearly labeled axes, state vector, and minimal clutter suitable for a lecture slide.",
+      "inputs": [
+        "task_request",
+        "outputs.plan_quantum_lesson"
+      ],
+      "required_outputs": [
+        "qubit.png"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "generate_gates_figure",
+      "skill": "generate-image",
+      "depends_on": [
+        "plan_quantum_lesson"
+      ],
+      "objective": "Generate gates.png showing Hadamard and CNOT operations with clear control/target conventions and pedagogically useful before/after meaning.",
+      "inputs": [
+        "task_request",
+        "outputs.plan_quantum_lesson"
+      ],
+      "required_outputs": [
+        "gates.png"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "generate_circuit_figure",
+      "skill": "generate-image",
+      "depends_on": [
+        "plan_quantum_lesson"
+      ],
+      "objective": "Generate circuit.png as a clean simple quantum circuit diagram with readable wires, gates, and measurement notation.",
+      "inputs": [
+        "task_request",
+        "outputs.plan_quantum_lesson"
+      ],
+      "required_outputs": [
+        "circuit.png"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "build_quantum_slides",
+      "skill": "scientific-slides",
+      "depends_on": [
+        "generate_qubit_figure",
+        "generate_gates_figure",
+        "generate_circuit_figure"
+      ],
+      "objective": "Create presentation.pdf with at least eight polished pages following the storyboard and embedding the three figures in their relevant sections. Use accessible contrast, large text, accurate notation, and clear takeaways.",
+      "inputs": [
+        "task_request",
+        "outputs.generate_qubit_figure",
+        "outputs.generate_gates_figure",
+        "outputs.generate_circuit_figure"
+      ],
+      "required_outputs": [
+        "presentation.pdf"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_quantum_package",
+      "skill": "scientific-slides",
+      "depends_on": [
+        "build_quantum_slides"
+      ],
+      "objective": "Inspect the PDF and figures for page count, section coverage, readability, scientific consistency, embedding, and exact filenames. Report checks without editing artifacts.",
+      "inputs": [
+        "task_request",
+        "outputs.build_quantum_slides"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

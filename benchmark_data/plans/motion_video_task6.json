@@ -1,0 +1,81 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "motion-video-task6-shared-v1",
+  "task_id": "motion_video_task6",
+  "designated_skills": [
+    "manim",
+    "scientific-slides"
+  ],
+  "task_request": "I am a calculus instructor, and I want to produce a teaching materials package on the concept of derivatives for my introductory calculus students. (1) Create an animation derivatives_animation.mp4 showing: the function f(x)=x² at the point x=1, where a secant line progressively approaches the tangent line as h decreases from 2 down to 0.01. Dynamically display the slope value as it changes, and annotate the final derivative f'(1)=2. Then show f(x)=sin(x) with its derivative f'(x)=cos(x) overlaid on the same axes. (2) Create a companion teaching handout derivatives_slides.pdf (at least 8 pages) covering: definition of a derivative, limit formula, geometric interpretation, common derivative formulas table, chain rule, and application examples.",
+  "nodes": [
+    {
+      "id": "plan_derivative_lesson",
+      "skill": "scientific-slides",
+      "depends_on": [],
+      "objective": "Design a coherent introductory lesson connecting the limit definition, secant-to-tangent geometry, common derivative formulas, chain rule, applications, and the relationship between sin(x) and cos(x). Specify an at-least-eight-page handout arc and synchronized animation beats.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "lesson_storyboard",
+        "animation_spec"
+      ],
+      "write_access": false,
+      "network_access": false
+    },
+    {
+      "id": "create_derivative_animation",
+      "skill": "manim",
+      "depends_on": [
+        "plan_derivative_lesson"
+      ],
+      "objective": "Create derivatives_animation.mp4: animate f(x)=x^2 at x=1 with a secant approaching the tangent as h decreases from 2 to 0.01, dynamically display slope, annotate f'(1)=2, then overlay sin(x) and cos(x) with clear labels and pacing.",
+      "inputs": [
+        "task_request",
+        "outputs.plan_derivative_lesson"
+      ],
+      "required_outputs": [
+        "derivatives_animation.mp4"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "create_derivative_handout",
+      "skill": "scientific-slides",
+      "depends_on": [
+        "plan_derivative_lesson"
+      ],
+      "objective": "Create derivatives_slides.pdf with at least eight pages covering definition, limit formula, geometry, common formulas table, chain rule, worked applications and a summary, with notation and visuals consistent with the animation.",
+      "inputs": [
+        "task_request",
+        "outputs.plan_derivative_lesson"
+      ],
+      "required_outputs": [
+        "derivatives_slides.pdf"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_derivative_package",
+      "skill": "scientific-slides",
+      "depends_on": [
+        "create_derivative_animation",
+        "create_derivative_handout"
+      ],
+      "objective": "Inspect both outputs for exact filenames, playable animation content, slope/tangent and sin/cos stages, handout page count and section coverage, notation consistency and readability. Report without changes.",
+      "inputs": [
+        "task_request",
+        "outputs.create_derivative_animation",
+        "outputs.create_derivative_handout"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

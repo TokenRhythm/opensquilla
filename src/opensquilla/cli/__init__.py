@@ -1,0 +1,1 @@
+"""OpenSquilla CLI package."""

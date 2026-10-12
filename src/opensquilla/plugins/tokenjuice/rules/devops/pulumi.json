@@ -1,0 +1,35 @@
+{
+  "id": "devops/pulumi",
+  "family": "iac-cli",
+  "description": "Compact Pulumi output while preserving resource changes, diagnostics, and deployment failures.",
+  "match": {
+    "toolNames": ["exec"],
+    "argv0": ["pulumi"]
+  },
+  "transforms": {
+    "stripAnsi": true,
+    "dedupeAdjacent": true,
+    "trimEmptyEdges": true
+  },
+  "summarize": {
+    "head": 12,
+    "tail": 12
+  },
+  "failure": {
+    "preserveOnFailure": true,
+    "head": 18,
+    "tail": 18
+  },
+  "counters": [
+    {
+      "name": "change",
+      "pattern": "\\+|~|-|Resources:",
+      "flags": "i"
+    },
+    {
+      "name": "error",
+      "pattern": "error:|failed|Diagnostics:",
+      "flags": "i"
+    }
+  ]
+}

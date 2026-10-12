@@ -1,0 +1,83 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "document-creation-task3-shared-v1",
+  "task_id": "document_creation_task3",
+  "designated_skills": [
+    "citation-management",
+    "docx",
+    "dev-browser"
+  ],
+  "task_request": "I am a PhD student studying natural language processing, and I want to deeply understand the foundational references behind the Transformer. The paper \"Attention Is All You Need\" (Vaswani et al., 2017) is provided as attention_is_all_you_need.pdf. Please read the last paragraph of the Background section — it cites 3 key papers. Find these 3 papers and write a 300-500 word academic summary for each, covering: the paper's core contribution, methodology overview, and its relationship to the Transformer.\n\nGenerate reference_summary.docx containing: a title, an introduction explaining the inspirations behind the Transformer, one section per paper (Heading 2), and a summary comparison table at the end. The document must end with a \"References\" section listing all 3 cited papers in APA format (Author, A. B. (Year). Title. Journal/Conference, Volume, Pages.). In the body text, use APA in-text citations such as (Kaiser & Sutskever, 2016) when referring to each paper.",
+  "nodes": [
+    {
+      "id": "identify_background_citations",
+      "skill": "citation-management",
+      "depends_on": [],
+      "objective": "Read attention_is_all_you_need.pdf and locate the last paragraph of the Background section. Identify exactly the three cited foundational papers using the PDF's citation markers and bibliography, and record accurate bibliographic metadata.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "three_identified_papers",
+        "citation_metadata"
+      ],
+      "write_access": false,
+      "network_access": false
+    },
+    {
+      "id": "research_foundational_papers",
+      "skill": "dev-browser",
+      "depends_on": [
+        "identify_background_citations"
+      ],
+      "objective": "Find reliable primary pages or papers for the three identified works and prepare a source-grounded brief for each covering core contribution, methodology, relationship to the Transformer, and accurate APA details.",
+      "inputs": [
+        "task_request",
+        "outputs.identify_background_citations"
+      ],
+      "required_outputs": [
+        "three_paper_briefs",
+        "source_urls"
+      ],
+      "write_access": false,
+      "network_access": true
+    },
+    {
+      "id": "write_reference_summary",
+      "skill": "docx",
+      "depends_on": [
+        "identify_background_citations",
+        "research_foundational_papers"
+      ],
+      "objective": "Create reference_summary.docx with title, an introduction to the Transformer's inspirations, one Heading 2 section per paper containing 300-500 words and APA in-text citations, a summary comparison table, and a final References section with all three complete APA entries.",
+      "inputs": [
+        "task_request",
+        "outputs.identify_background_citations",
+        "outputs.research_foundational_papers"
+      ],
+      "required_outputs": [
+        "reference_summary.docx"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_citations",
+      "skill": "citation-management",
+      "depends_on": [
+        "write_reference_summary"
+      ],
+      "objective": "Check that exactly three source papers are covered, each section is 300-500 words, metadata and in-text citations match the references, the comparison table is present, and the document ends with References. Report checks without editing the file.",
+      "inputs": [
+        "task_request",
+        "outputs.write_reference_summary"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

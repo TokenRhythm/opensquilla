@@ -1,0 +1,84 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "web-interaction-task4-shared-v1",
+  "task_id": "web_interaction_task4",
+  "designated_skills": [
+    "data-storytelling",
+    "scientific-visualization",
+    "frontend-design"
+  ],
+  "task_request": "I am a data journalist, and I want to create an interactive data storytelling piece about global temperature change for our publication's website. Please create an interactive HTML dashboard (dashboard.html) that tells the story of global temperature change. Data source: use global annual mean temperature anomaly data from 1880 to 2023 (obtainable from NASA GISS or reasonably simulated). The dashboard should include: (1) a title area and narrative introduction, (2) a time-series line chart with interactive hover showing specific year data, (3) a bar chart grouped by decade, (4) key milestone annotations (e.g., the Paris Agreement year), (5) data insight cards (3-4 key statistics), and (6) a responsive layout. Use D3.js or Chart.js for interactive charts.",
+  "nodes": [
+    {
+      "id": "prepare_temperature_series",
+      "skill": "scientific-visualization",
+      "depends_on": [],
+      "objective": "Obtain NASA GISS annual global temperature anomaly data for 1880-2023 or create a clearly disclosed reasonable simulation if retrieval fails. Normalize annual values, compute decade aggregates and 3-4 defensible key statistics, and prepare chart-ready data with milestone years.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "temperature_series",
+        "decade_aggregates",
+        "insight_statistics"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "design_climate_narrative",
+      "skill": "data-storytelling",
+      "depends_on": [
+        "prepare_temperature_series"
+      ],
+      "objective": "Define a concise journalistic narrative arc connecting long-run warming, decade change, recent extremes, milestones such as the Paris Agreement, and uncertainty/source disclosure. Provide exact copy for the introduction, annotations, and insight cards.",
+      "inputs": [
+        "task_request",
+        "outputs.prepare_temperature_series"
+      ],
+      "required_outputs": [
+        "narrative_copy",
+        "annotation_plan"
+      ],
+      "write_access": false,
+      "network_access": false
+    },
+    {
+      "id": "build_dashboard",
+      "skill": "frontend-design",
+      "depends_on": [
+        "prepare_temperature_series",
+        "design_climate_narrative"
+      ],
+      "objective": "Create a self-contained responsive dashboard.html using D3.js or Chart.js, with a title/introduction, hoverable annual line chart, decade bar chart, milestone annotations, 3-4 insight cards, accessible colors, and embedded or local data sufficient for offline viewing apart from the declared chart library.",
+      "inputs": [
+        "task_request",
+        "outputs.prepare_temperature_series",
+        "outputs.design_climate_narrative"
+      ],
+      "required_outputs": [
+        "dashboard.html"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_dashboard",
+      "skill": "frontend-design",
+      "depends_on": [
+        "build_dashboard"
+      ],
+      "objective": "Open dashboard.html at desktop and mobile widths, verify charts render, hover works, data spans 1880-2023, milestone annotations and all insight cards appear, and no console-breaking errors occur. Report checks without modifying the file.",
+      "inputs": [
+        "task_request",
+        "outputs.build_dashboard"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

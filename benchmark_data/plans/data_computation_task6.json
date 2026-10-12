@@ -1,0 +1,68 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "data-computation-task6-shared-v1",
+  "task_id": "data_computation_task6",
+  "designated_skills": [
+    "sympy",
+    "scientific-visualization"
+  ],
+  "task_request": "I am a numerical analysis student, and I need to complete a coursework project comparing numerical integration methods. Please compute the symbolic and numerical solutions for the following 4 definite integrals, and generate visualizations:\n\n1. $\\int_0^{\\pi} \\sin(x)\\,dx$\n2. $\\int_0^{1} e^{-x^2}\\,dx$\n3. $\\int_1^{e} \\ln(x)\\,dx$\n4. $\\int_0^{\\pi/2} \\sqrt{\\sin(x)}\\,dx$\n\nFor each integral, apply 3 numerical methods (Trapezoidal rule N=100, Simpson's rule N=100, Gaussian quadrature) and compute the numerical approximation and error.\n\nOutput integrals.json as a JSON object with an \"integrals\" key containing an array of 4 objects, i.e. {\"integrals\": [...]}, each object containing integral_id, integrand, bounds, exact_numeric, trapezoidal, simpson, gaussian_quadrature, and the error for each method.\n\nGenerate 5 figures: integral_1.png through integral_4.png (function curve with shaded area and exact value annotation) and error_comparison.png (a grouped bar chart comparing errors of the 3 methods across all 4 integrals on a logarithmic scale). All figures should be publication quality with LaTeX labels.",
+  "nodes": [
+    {
+      "id": "compute_integrals",
+      "skill": "sympy",
+      "depends_on": [],
+      "objective": "Compute symbolic or high-precision reference values for all four definite integrals and apply trapezoidal N=100, Simpson N=100, and Gaussian quadrature consistently. Calculate absolute errors and write integrals.json with an integrals array of exactly four fully populated objects.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "integrals.json",
+        "calculation_notes"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "render_integral_figures",
+      "skill": "scientific-visualization",
+      "depends_on": [
+        "compute_integrals"
+      ],
+      "objective": "Generate integral_1.png through integral_4.png with the function, shaded integration area, bounds and exact-value annotation, plus error_comparison.png as a publication-quality grouped logarithmic error chart across all methods/integrals with LaTeX labels.",
+      "inputs": [
+        "task_request",
+        "outputs.compute_integrals"
+      ],
+      "required_outputs": [
+        "integral_1.png",
+        "integral_2.png",
+        "integral_3.png",
+        "integral_4.png",
+        "error_comparison.png"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_integral_package",
+      "skill": "sympy",
+      "depends_on": [
+        "compute_integrals",
+        "render_integral_figures"
+      ],
+      "objective": "Recompute representative values and check JSON schema, method errors, four integral figures, logarithmic grouped comparison, labels and exact filenames. Report checks without modifying artifacts.",
+      "inputs": [
+        "task_request",
+        "outputs.compute_integrals",
+        "outputs.render_integral_figures"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

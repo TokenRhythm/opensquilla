@@ -1,0 +1,104 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "web-interaction-task2-shared-v1",
+  "task_id": "web_interaction_task2",
+  "designated_skills": [
+    "dev-browser",
+    "docx"
+  ],
+  "task_request": "I am a tech team lead, and I am responsible for curating a weekly AI newsletter for our engineering team. I need you to browse Hacker News (https://news.ycombinator.com) and curate content for this week's newsletter.\n\nFirst, take a screenshot of the Hacker News homepage and save it as hn_homepage.png. Then browse the listings and identify at least 5 articles related to AI, machine learning, or large language models. For each selected article, visit its linked page and take a screenshot of just the first visible viewport (no full-page scroll), saving them as article_1.png through article_5.png.\n\nCompile the curated content into newsletter.docx with the following structure:\n- Newsletter title and date\n- Editor's note: a brief overview of this week's AI landscape (100-200 words)\n- Article entries: for each article include the title, source URL, a summary (50-100 words), and reference the corresponding screenshot\n- Weekly trend summary: synthesize the common themes across the curated articles",
+  "nodes": [
+    {
+      "id": "capture_hn_homepage",
+      "skill": "dev-browser",
+      "depends_on": [],
+      "objective": "Open Hacker News and capture the current homepage as hn_homepage.png, recording the retrieval date and visible listing context.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "hn_homepage.png",
+        "homepage_listing_notes"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "curate_ai_articles",
+      "skill": "dev-browser",
+      "depends_on": [
+        "capture_hn_homepage"
+      ],
+      "objective": "From the visible listings identify at least five genuinely AI, machine-learning, or LLM-related articles, visit each linked page, and record title, source URL, source name, publication context, and evidence for a 50-100 word summary.",
+      "inputs": [
+        "task_request",
+        "outputs.capture_hn_homepage"
+      ],
+      "required_outputs": [
+        "five_article_briefs"
+      ],
+      "write_access": false,
+      "network_access": true
+    },
+    {
+      "id": "capture_article_viewports",
+      "skill": "dev-browser",
+      "depends_on": [
+        "curate_ai_articles"
+      ],
+      "objective": "Capture only the first visible viewport of each selected article page, no full-page scroll, as article_1.png through article_5.png in the same order as the curated briefs.",
+      "inputs": [
+        "task_request",
+        "outputs.curate_ai_articles"
+      ],
+      "required_outputs": [
+        "article_1.png",
+        "article_2.png",
+        "article_3.png",
+        "article_4.png",
+        "article_5.png"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "write_newsletter",
+      "skill": "docx",
+      "depends_on": [
+        "capture_hn_homepage",
+        "curate_ai_articles",
+        "capture_article_viewports"
+      ],
+      "objective": "Create newsletter.docx with title/date, a 100-200 word editor's note, at least five entries each containing title, URL, 50-100 word summary and corresponding screenshot reference/image, plus a weekly cross-article trend synthesis.",
+      "inputs": [
+        "task_request",
+        "outputs.capture_hn_homepage",
+        "outputs.curate_ai_articles",
+        "outputs.capture_article_viewports"
+      ],
+      "required_outputs": [
+        "newsletter.docx"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_newsletter",
+      "skill": "docx",
+      "depends_on": [
+        "write_newsletter"
+      ],
+      "objective": "Check exact screenshot filenames, five article entries, URL/summary alignment, word ranges, date/title/editor note/trend section, and document readability. Report checks without changes.",
+      "inputs": [
+        "task_request",
+        "outputs.write_newsletter"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

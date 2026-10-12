@@ -1,0 +1,44 @@
+# Copy this file to configs/local.toml and choose your model supplier.
+# This example uses OpenRouter. Replace all four model fields for TokenRhythm.
+# api_key_env names an environment variable; its value is the supplier's API key.
+[model]
+provider = "openrouter"
+name = "your-model-id"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+# For TokenRhythm, replace [model] above with:
+# provider = "tokenrhythm"
+# name = "your-tokenrhythm-model-id"
+# base_url = "https://tokenrhythm.studio/v1"
+# api_key_env = "TOKENRHYTHM_API_KEY"
+
+[runtime]
+max_parallelism = 4
+max_iterations = 20
+max_tokens = 8192
+# Per-Agent total/iteration budget, not a deadline for the whole DAG.
+timeout_seconds = 600
+# Per-model HTTP request timeout, also used by direct LLM steps.
+request_timeout = 120
+context_window_tokens = 128000
+
+[tools]
+# safe uses the native platform sandbox and does not approve elevation.
+# full explicitly allows native tool execution with this user's host access.
+run_mode = "safe"
+# Optional native tool names; omit allow to expose all standalone tools.
+# allow = ["read_file", "write_file", "exec_command", "execute_code"]
+# deny = ["git_commit"]
+
+[search]
+provider = "duckduckgo"
+max_results = 5
+# api_key_env = "SEARCH_API_KEY"
+
+# Optional vision deployment. Uses the same configuration keys as [model].
+# [vision]
+# provider = "openrouter"
+# name = "your-vision-model-id"
+# base_url = "https://openrouter.ai/api/v1"
+# api_key_env = "OPENROUTER_API_KEY"

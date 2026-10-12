@@ -1,0 +1,53 @@
+You are making a SMALL, TARGETED change to an EXISTING desktop application in
+the repository at the current working directory. The app is already built and
+working. Make ONLY the change the task asks for, keep everything else exactly as
+it is, and leave the app building cleanly.
+
+ENVIRONMENT
+- The repository ALREADY contains the app (package.json, src/, config files).
+- Put throwaway notes/scratch under: {scratch_dir} (NOT inside the repo).
+- You have network access and may install npm packages if the change needs one.
+{env_hints}
+TASK
+{task}
+
+EDIT RULES (follow exactly -- over-editing is a failure)
+1. INSPECT first: read package.json and the src/ tree to learn the app's
+   structure (pages, components, store, styles) BEFORE changing anything.
+2. DO NOT regenerate the whole app. DO NOT re-scaffold. DO NOT run
+   `npm create ...`. The app already exists -- never recreate it.
+3. DO NOT rewrite or recreate files that already exist unless the change truly
+   requires editing them. NEVER touch config files (package.json,
+   electron.vite.config.*, tsconfig*, electron-builder.*) unless the task needs it.
+4. Edit ONLY the exact files needed for THIS change -- no more, no less:
+   - "change X to Y" -> change only X to Y; preserve everything else.
+   - "change the color" -> edit only the relevant theme/style file.
+   - Add a feature/section -> create the new component/page file AND update ONLY
+     the parent that wires it in (the router or App) -- nothing else.
+   - "remove X" -> edit the file that contains X to remove it; do NOT create files.
+5. Do NOT "improve", redesign, or refactor anything you were not asked to change.
+   Preserve all existing functionality and design.
+6. Write COMPLETE files. Never truncate, never use "..." ellipsis.
+7. WORK EFFICIENTLY — each tool call is a full model round-trip; minimize the
+   NUMBER of steps. Batch your INSPECT reads into a few calls, and write each
+   changed file completely in one step using the file-writing tool
+   (write_file / create_*) rather than dribbling edits. The dedicated tool
+   works the same on every host OS; shell heredocs (`cat <<'EOF'`) are
+   bash-only and break under cmd.exe / PowerShell.
+   Aim to finish a typical edit in a handful of tool calls, not dozens.
+
+VERIFICATION (the runner re-checks with the FIXED build checklist -- keep it green)
+After your change, the runner runs from the repo root:
+    npm ci
+    npm run build
+    npx electron-builder        # host OS installer: --mac (.dmg) / --win (.exe) / --linux (.AppImage/.deb)
+So:
+- If you added an npm package, install it and make sure BOTH package.json and
+  package-lock.json are updated and consistent (the runner uses `npm ci`).
+- Make sure `npm run build` still type-checks and builds with NO errors; optionally
+  run electron-builder for the host OS (`--mac` / `--win` / `--linux`) to confirm packaging.
+- Do NOT commit node_modules, out, or dist.
+
+COMMIT
+Commit your change on the current branch with a clear message describing only
+what you changed.

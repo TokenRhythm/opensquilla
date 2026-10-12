@@ -1,0 +1,3 @@
+Check each statement against the supplied request.
+Mark supported facts as supported.
+Identify unsupported claims without inventing missing facts.

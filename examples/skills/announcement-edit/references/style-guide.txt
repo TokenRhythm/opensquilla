@@ -1,0 +1,6 @@
+Keep the title short and specific.
+Use familiar words and active verbs.
+Preserve the original request's factual details and language.
+Remove unsupported promises, dates, prices, and affiliations.
+Keep the final announcement under 150 words.
+Return the announcement directly, without commentary about the editing process.

@@ -1,0 +1,117 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "visual-creation-task1-shared-v1",
+  "task_id": "visual_creation_task1",
+  "designated_skills": [
+    "generate-image",
+    "latex-posters"
+  ],
+  "task_request": "I am a graduate researcher, and I need to create a conference poster for presenting my work on molecular property prediction using graph neural networks. Please create an A0 academic poster on \"Graph Neural Network-Based Molecular Property Prediction\". Generate 3 scientific figures: gnn_architecture.png showing the GNN architecture diagram, molecular_graph.png showing molecule-to-graph representation, and performance.png showing a performance comparison chart.\n\nBuild a 3-column poster, output as poster.pdf, with blue-green academic theme, including sections: Abstract, Introduction, Method with architecture figure, Molecular Representation, Experimental Results with performance figure, Conclusions, and References with 3-5 citations.",
+  "nodes": [
+    {
+      "id": "plan_academic_poster",
+      "skill": "latex-posters",
+      "depends_on": [],
+      "objective": "Plan an A0 three-column blue-green academic poster titled Graph Neural Network-Based Molecular Property Prediction, with the requested sections, 3-5 references, a clear reading order, visual hierarchy, and precise specifications for three scientific figures.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "poster_content_plan",
+        "figure_specifications"
+      ],
+      "write_access": false,
+      "network_access": false
+    },
+    {
+      "id": "generate_gnn_architecture",
+      "skill": "generate-image",
+      "depends_on": [
+        "plan_academic_poster"
+      ],
+      "objective": "Generate gnn_architecture.png as a clean scientific architecture diagram showing molecular graph input, message passing, pooling, and property prediction, with large readable labels.",
+      "inputs": [
+        "task_request",
+        "outputs.plan_academic_poster"
+      ],
+      "required_outputs": [
+        "gnn_architecture.png"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "generate_molecular_graph",
+      "skill": "generate-image",
+      "depends_on": [
+        "plan_academic_poster"
+      ],
+      "objective": "Generate molecular_graph.png showing a molecule-to-graph representation with atoms as nodes and bonds as edges, using a publication-ready scientific style.",
+      "inputs": [
+        "task_request",
+        "outputs.plan_academic_poster"
+      ],
+      "required_outputs": [
+        "molecular_graph.png"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "generate_performance_chart",
+      "skill": "generate-image",
+      "depends_on": [
+        "plan_academic_poster"
+      ],
+      "objective": "Generate performance.png as a legible comparison chart with coherent hypothetical-but-clearly-presented model labels and metrics suitable for the Experimental Results section.",
+      "inputs": [
+        "task_request",
+        "outputs.plan_academic_poster"
+      ],
+      "required_outputs": [
+        "performance.png"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "assemble_poster",
+      "skill": "latex-posters",
+      "depends_on": [
+        "generate_gnn_architecture",
+        "generate_molecular_graph",
+        "generate_performance_chart"
+      ],
+      "objective": "Build and compile poster.pdf as an A0 three-column blue-green academic poster containing Abstract, Introduction, Method with architecture figure, Molecular Representation, Experimental Results with performance figure, Conclusions, and 3-5 references. Keep text readable at poster scale and eliminate overflow.",
+      "inputs": [
+        "task_request",
+        "outputs.generate_gnn_architecture",
+        "outputs.generate_molecular_graph",
+        "outputs.generate_performance_chart"
+      ],
+      "required_outputs": [
+        "poster.pdf"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_poster",
+      "skill": "latex-posters",
+      "depends_on": [
+        "assemble_poster"
+      ],
+      "objective": "Inspect the compiled poster at full page and zoomed views, check A0 layout, columns, section coverage, figures, citations, margins, overflow, and readability, then report without modifying outputs.",
+      "inputs": [
+        "task_request",
+        "outputs.assemble_poster"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

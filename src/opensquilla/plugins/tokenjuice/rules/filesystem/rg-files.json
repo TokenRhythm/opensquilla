@@ -1,0 +1,34 @@
+{
+  "id": "filesystem/rg-files",
+  "family": "filesystem-inventory",
+  "description": "Compact rg --files output while preserving path samples and errors.",
+  "match": {
+    "toolNames": ["exec"],
+    "argv0": ["rg"],
+    "argvIncludes": [["--files"]]
+  },
+  "transforms": {
+    "stripAnsi": true,
+    "dedupeAdjacent": true,
+    "trimEmptyEdges": true
+  },
+  "summarize": {
+    "head": 8,
+    "tail": 6
+  },
+  "failure": {
+    "preserveOnFailure": true,
+    "head": 12,
+    "tail": 10
+  },
+  "counters": [
+    {
+      "name": "path",
+      "pattern": "^(?!rg: ).+\\S.*$"
+    },
+    {
+      "name": "error",
+      "pattern": "^rg: "
+    }
+  ]
+}

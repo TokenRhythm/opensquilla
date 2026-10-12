@@ -1,0 +1,80 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "motion-video-task3-shared-v1",
+  "task_id": "motion_video_task3",
+  "designated_skills": [
+    "manim",
+    "sympy"
+  ],
+  "task_request": "I am an AI course instructor, and I want to create a comprehensive 8-puzzle demonstration combining mathematical analysis, problem solving, and visualization for my students.\n\nInitial state: 7 2 4 / 5 _ 6 / 8 3 1, where _ is the blank. Goal state: 1 2 3 / 4 5 6 / 7 8 _.\n\nStep 1 — Mathematical analysis: Compute the total state space size for the 8-puzzle, determine how many configurations are solvable, verify whether this specific initial state can reach the goal state, and compute the Manhattan distance heuristic for the initial state. Save to puzzle_analysis.json with: total_configurations, solvable_configurations, initial_state, goal_state, inversion_count, is_solvable, manhattan_distance, and tile_distances array showing each of the 8 numbered tiles' (1-8) Manhattan distance.\n\nStep 2 — Find an optimal or near-optimal solution to the puzzle. Save the solution as puzzle_plan.txt with one move per line.\n\nStep 3 — Create puzzle_animation.mp4 showing the 3 \\times 3 grid with tiles sliding step-by-step according to your solution, with a move counter displayed, ending at the solved state.",
+  "nodes": [
+    {
+      "id": "analyze_and_solve_puzzle",
+      "skill": "sympy",
+      "depends_on": [],
+      "objective": "Compute the 8-puzzle state-space facts, inversion count, solvability, initial Manhattan distance and per-tile distances, then find an optimal or near-optimal legal path from the specified initial state to the goal. Write puzzle_analysis.json with every requested field and puzzle_plan.txt with exactly one legal move per line.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "puzzle_analysis.json",
+        "puzzle_plan.txt"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "verify_solution_path",
+      "skill": "sympy",
+      "depends_on": [
+        "analyze_and_solve_puzzle"
+      ],
+      "objective": "Replay puzzle_plan.txt from the initial state, prove every move is legal and the final state is the goal, and cross-check the JSON calculations. Do not change the two files; return a compact verified move-state sequence for animation.",
+      "inputs": [
+        "task_request",
+        "outputs.analyze_and_solve_puzzle"
+      ],
+      "required_outputs": [
+        "verified_move_sequence",
+        "analysis_validation"
+      ],
+      "write_access": false,
+      "network_access": false
+    },
+    {
+      "id": "animate_solution",
+      "skill": "manim",
+      "depends_on": [
+        "verify_solution_path"
+      ],
+      "objective": "Create puzzle_animation.mp4 with a readable 3x3 grid, tiles sliding through the verified sequence, a visible move counter, stable pacing, and an unmistakable solved final state. Use the exact declared filename.",
+      "inputs": [
+        "task_request",
+        "outputs.verify_solution_path"
+      ],
+      "required_outputs": [
+        "puzzle_animation.mp4"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_video_package",
+      "skill": "manim",
+      "depends_on": [
+        "animate_solution"
+      ],
+      "objective": "Inspect the video and the two text artifacts, confirm the animation follows the exact verified plan and ends solved, and report duration/readability/file checks without modifying outputs.",
+      "inputs": [
+        "task_request",
+        "outputs.animate_solution"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "data-computation-task5-shared-v1",
+  "task_id": "data_computation_task5",
+  "designated_skills": [
+    "sympy",
+    "xlsx"
+  ],
+  "task_request": "Perform the specified one-sided independent two-sample t-test, chi-square independence test, and one-way ANOVA on the three embedded datasets. Save the exact requested JSON schema to hypothesis_tests.json and create hypothesis_tests.xlsx with sheets T-Test, Chi-Square, and ANOVA, each containing raw data and computed results.",
+  "nodes": [
+    {
+      "id": "compute_and_write_json",
+      "skill": "sympy",
+      "depends_on": [],
+      "objective": "Using the full task request as the sole data source, execute the three requested statistical tests with the stated direction and alpha. Compute all requested statistics, p-values, conclusions, effect sizes, degrees of freedom, and group means. Write hypothesis_tests.json with exactly the requested top-level sections and fields. Preserve finite numeric values as JSON numbers and document the test/effect-size conventions used.",
+      "inputs": [
+        "task_request"
+      ],
+      "required_outputs": [
+        "hypothesis_tests.json",
+        "calculation_evidence"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "build_workbook",
+      "skill": "xlsx",
+      "depends_on": [
+        "compute_and_write_json"
+      ],
+      "objective": "Read hypothesis_tests.json and create hypothesis_tests.xlsx with exactly three worksheets named T-Test, Chi-Square, and ANOVA. Put the complete raw dataset for each test and the corresponding computed results on its matching sheet. Use clear titles, labeled tables, numeric formatting, readable column widths, and frozen headers where useful. Do not change hypothesis_tests.json.",
+      "inputs": [
+        "task_request",
+        "outputs.compute_and_write_json"
+      ],
+      "required_outputs": [
+        "hypothesis_tests.xlsx",
+        "workbook_manifest"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_deliverables",
+      "skill": "sympy,xlsx",
+      "depends_on": [
+        "compute_and_write_json",
+        "build_workbook"
+      ],
+      "objective": "Perform bounded read-only validation: independently recompute all three tests; verify JSON syntax, exact schema, finite numeric fields, direction and alpha, conclusions and effect sizes; open the workbook and verify exact sheet names, complete raw data, results, and agreement with JSON. Return concise PASS or FAIL checks with artifact_unchanged=true. Do not repair or modify either artifact.",
+      "inputs": [
+        "task_request",
+        "outputs.compute_and_write_json",
+        "outputs.build_workbook"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

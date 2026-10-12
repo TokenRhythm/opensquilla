@@ -1,0 +1,68 @@
+{
+  "schema_version": "lp4fm-canonical-plan-v1",
+  "plan_id": "web-interaction-task6-shared-v1",
+  "task_id": "web_interaction_task6",
+  "designated_skills": [
+    "dev-browser",
+    "xlsx"
+  ],
+  "task_request": "Collect at least 30 books from the first two pages of https://books.toscrape.com with title, numeric price, 1-5 rating, and availability. Create books_report.xlsx with Raw Data, Statistics, and Market Insights sheets, and create stats.json with the requested metrics, price-tier counts, and a concise price-rating insight. Save both outputs in the workspace root.",
+  "nodes": [
+    {
+      "id": "collect_and_normalize_books",
+      "skill": "dev-browser",
+      "depends_on": [],
+      "objective": "Visit exactly the first two catalogue pages of https://books.toscrape.com and extract every displayed book record, yielding at least 30 unique books. For each record capture title, price as a numeric value without the currency symbol, rating converted from the site's word class to an integer from 1 through 5, availability text, source page number, and source URL. Preserve source order, check duplicates and field completeness, and write scraped_books.json as traceability evidence. Do not reconstruct data from model memory.",
+      "inputs": [
+        "task_request",
+        "source URL"
+      ],
+      "required_outputs": [
+        "scraped_books.json",
+        "collection count and validation evidence"
+      ],
+      "write_access": true,
+      "network_access": true
+    },
+    {
+      "id": "build_market_report",
+      "skill": "xlsx",
+      "depends_on": [
+        "collect_and_normalize_books"
+      ],
+      "objective": "Read scraped_books.json and create books_report.xlsx with exactly three sheets named Raw Data, Statistics, and Market Insights. Raw Data must contain one row per book with Title, Price, Rating, and Availability; store Price and Rating as numbers, use readable formatting, freeze the header, and enable filters. Statistics must calculate total_books, average_price, max_price, min_price, and in_stock_count using spreadsheet formulas that reference Raw Data so values update automatically. Market Insights must segment Budget (<20), Mid-range (20-40 inclusive), and Premium (>40), with formula-driven count and average rating for each tier. Also write stats.json with the requested seven top-level fields, decimal numeric metrics, price_tiers keys budget/midrange/premium, and a 1-2 sentence market_insight based on the observed price-rating relationship.",
+      "inputs": [
+        "task_request",
+        "outputs.collect_and_normalize_books"
+      ],
+      "required_outputs": [
+        "books_report.xlsx",
+        "stats.json",
+        "workbook and metric construction evidence"
+      ],
+      "write_access": true,
+      "network_access": false
+    },
+    {
+      "id": "validate_deliverables",
+      "skill": "xlsx",
+      "depends_on": [
+        "collect_and_normalize_books",
+        "build_market_report"
+      ],
+      "objective": "Perform bounded read-only validation without repairing artifacts. Confirm books_report.xlsx and stats.json exist in the exact workspace and parse successfully; there are at least 30 unique source-backed books from pages 1 and 2; workbook sheet names are exact; Raw Data rows and numeric types match scraped_books.json; Statistics contains live formulas for all five metrics; Market Insights uses the required tier boundaries and formula-driven counts and average ratings; JSON contains every requested field and its values and tier counts agree with independently recomputed values from the raw records. Report concise PASS/FAIL findings and artifact_unchanged=true.",
+      "inputs": [
+        "task_request",
+        "outputs.collect_and_normalize_books",
+        "outputs.build_market_report"
+      ],
+      "required_outputs": [
+        "validation_summary",
+        "cross-format consistency evidence",
+        "artifact_unchanged"
+      ],
+      "write_access": false,
+      "network_access": false
+    }
+  ]
+}

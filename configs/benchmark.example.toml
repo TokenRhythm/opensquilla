@@ -1,0 +1,53 @@
+# Standalone benchmark deployment template. Copy to a local ignored config.
+# This selects an API deployment; it contains no tasks, trial data, or secrets.
+# Check availability and account permissions for this model before running.
+[model]
+provider = "openrouter"
+name = "z-ai/glm-5.2"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+# For TokenRhythm replace all four fields above, using its exact model ID:
+# provider = "tokenrhythm"
+# name = "YOUR_TOKENRHYTHM_MODEL_ID"
+# base_url = "https://tokenrhythm.studio/v1"
+# api_key_env = "TOKENRHYTHM_API_KEY"
+
+[runtime]
+# Native MetaSkill caps each Agent step at 30 tool-loop iterations.
+max_iterations = 30
+max_parallelism = 4
+# Explicit standalone budgets; they do not reproduce a historical live catalog.
+max_tokens = 16384
+context_window_tokens = 200000
+request_timeout = 120
+# Per-Agent total and iteration budget. The batch runner must enforce its own
+# whole-run deadline; this is not the original Gateway turn deadline.
+timeout_seconds = 5400
+# Sampling and thinking are omitted to retain native/provider defaults.
+# Add only values supported by the chosen model, for example:
+# temperature = 0.2
+# thinking = "high"
+
+[tools]
+# Trusted local benchmark Skills need explicit host access. This standalone
+# host retains native security grading; it is not the Gateway bypass profile.
+run_mode = "full"
+
+[search]
+provider = "duckduckgo"
+max_results = 5
+# api_key_env = "SEARCH_API_KEY"
+
+# Image analysis can use a separate model with the same four deployment keys.
+# [vision]
+# provider = "openrouter"
+# name = "YOUR_VISION_MODEL_ID"
+# base_url = "https://openrouter.ai/api/v1"
+# api_key_env = "OPENROUTER_API_KEY"
+
+# Image generation and other paid task-specific APIs may be called by external
+# Skill scripts. Their programs, models, and credential variables must be
+# supplied separately; [vision] configures analysis, not image generation.
+# Install each Skill's external dependencies and isolate its writable package,
+# caches, browser profile, temporary files, and outputs for every invocation.

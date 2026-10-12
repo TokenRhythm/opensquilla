@@ -1,0 +1,35 @@
+{
+  "id": "task/mise",
+  "family": "task-runner",
+  "description": "Compact mise output while preserving task results, tool installs, and failures.",
+  "match": {
+    "toolNames": ["exec"],
+    "argv0": ["mise"]
+  },
+  "transforms": {
+    "stripAnsi": true,
+    "dedupeAdjacent": true,
+    "trimEmptyEdges": true
+  },
+  "summarize": {
+    "head": 12,
+    "tail": 10
+  },
+  "failure": {
+    "preserveOnFailure": true,
+    "head": 18,
+    "tail": 18
+  },
+  "counters": [
+    {
+      "name": "install",
+      "pattern": "Downloading|Extracting|Installing|Installed",
+      "flags": "i"
+    },
+    {
+      "name": "error",
+      "pattern": "error|failed|not found|exit status",
+      "flags": "i"
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+Start with the heading Note.
+Put each supplied fact on a separate line.
+Do not add facts or contact external services.

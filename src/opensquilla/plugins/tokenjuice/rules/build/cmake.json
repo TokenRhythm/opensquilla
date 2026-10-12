@@ -1,0 +1,35 @@
+{
+  "id": "build/cmake",
+  "family": "build-native",
+  "description": "Compact cmake output while preserving configure errors, build failures, and final status.",
+  "match": {
+    "toolNames": ["exec"],
+    "argv0": ["cmake"]
+  },
+  "transforms": {
+    "stripAnsi": true,
+    "dedupeAdjacent": true,
+    "trimEmptyEdges": true
+  },
+  "summarize": {
+    "head": 12,
+    "tail": 10
+  },
+  "failure": {
+    "preserveOnFailure": true,
+    "head": 18,
+    "tail": 18
+  },
+  "counters": [
+    {
+      "name": "error",
+      "pattern": "CMake Error|error:|failed|FAILED",
+      "flags": "i"
+    },
+    {
+      "name": "warning",
+      "pattern": "CMake Warning|warning:",
+      "flags": "i"
+    }
+  ]
+}
