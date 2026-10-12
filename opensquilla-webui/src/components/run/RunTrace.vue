@@ -1427,7 +1427,7 @@ function fmtTok(n?: number | null): string {
 .msg-ai-text :deep(pre) {
   background: var(--code-block-bg);
   border: 1px solid var(--code-block-border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-control);
   padding: 0.625rem;
   overflow-x: auto;
   margin: 0.375rem 0;
@@ -1436,6 +1436,7 @@ function fmtTok(n?: number | null): string {
 .msg-ai-text :deep(pre code) {
   background: transparent;
   padding: 0;
+  color: var(--text);
 }
 
 .step-card {
@@ -1904,7 +1905,7 @@ button.tool-row:hover {
 .tool-timeline--activity .tool-row--running,
 .tool-timeline--activity .tool-row--error {
   min-height: 1.75rem;
-  padding: 0.25rem 0.125rem;
+  padding: 0.25rem 0;
   border-radius: 0;
   background: transparent;
   box-shadow: none;
@@ -2031,14 +2032,10 @@ button.tool-row:hover {
   background: transparent;
 }
 
-/* One indent scale for the whole fold: a row's text starts after its icon at
-   0.125rem padding + 0.875rem icon + 0.625rem gap = 1.625rem, and everything
-   subordinate to that row (detail bodies, narration, member rows) aligns to
-   the same origin. Each nesting level therefore adds 1.5rem (icon + gap);
-   the fold's containment comes from the disclosure body's single left rule,
-   not from per-level rules here. */
+/* The detail belongs to this row, not a nested level. Keep its outer edge
+   aligned with the row so repeated expansions do not form a staircase. */
 .tool-timeline--activity .tool-row-body {
-  padding: 0 0 0.125rem 1.625rem;
+  padding: 0 0 0.125rem;
 }
 
 .tool-timeline--activity .activity-tool-detail-enter-active {
@@ -2072,18 +2069,49 @@ button.tool-row:hover {
 }
 
 .tool-timeline--activity .msg-ai-text {
-  margin: 0.125rem 0 0.25rem 1.625rem;
-  color: var(--text-muted);
-  font-size: 0.8125rem;
-  line-height: 1.55;
-}
-
-.tool-timeline--activity .msg-ai-text :deep(p) {
+  display: flow-root;
   margin: 0;
+  color: var(--text);
+  font-size: var(--fs-md);
+  line-height: 1.7;
 }
 
 .tool-timeline--activity .msg-ai-text + .msg-ai-text {
-  margin-top: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.tool-timeline--activity .msg-ai-text + .step-card {
+  margin-top: 0.75rem;
+}
+
+.tool-timeline--activity .step-card + .msg-ai-text {
+  margin-top: 1.25rem;
+}
+
+.tool-timeline--activity .msg-ai-text :deep(p),
+.tool-timeline--activity .msg-ai-text :deep(ul),
+.tool-timeline--activity .msg-ai-text :deep(ol) {
+  margin: 0.75rem 0;
+}
+
+.tool-timeline--activity .msg-ai-text :deep(li) {
+  margin: 0.375rem 0;
+}
+
+.tool-timeline--activity .msg-ai-text :deep(pre) {
+  margin: 0.75rem 0;
+  padding: 0.75rem 0.875rem 0.875rem;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.65;
+}
+
+.tool-timeline--activity .msg-ai-text :deep(> :first-child) {
+  margin-top: 0;
+}
+
+.tool-timeline--activity .msg-ai-text :deep(> :last-child) {
+  margin-bottom: 0;
 }
 
 /* Completed, non-open rows soften and tuck in — kept for traceability, not

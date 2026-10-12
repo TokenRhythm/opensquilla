@@ -1250,7 +1250,7 @@ function fmtUsd(value: number): string {
 <style scoped>
 .assistant-activity-incomplete {
   margin: 0.375rem 0 0;
-  color: color-mix(in srgb, var(--text) 52%, transparent);
+  color: var(--text-muted);
   font-size: 0.75rem;
 }
 
@@ -1345,8 +1345,8 @@ function fmtUsd(value: number): string {
 
 .assistant-answer--separated {
   margin-top: 0;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--hairline);
+  padding-top: 1.5rem;
+  border-top: 0;
 }
 
 .plan-message-card {

@@ -708,6 +708,16 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
     color-mix(in srgb, var(--router-accent) 3%, var(--router-surface));
 }
 
+.router-fx-ensemble[aria-busy="false"] {
+  background: var(--router-surface);
+}
+
+.router-fx-ensemble[aria-busy="false"]:hover:not(:disabled),
+.router-fx-ensemble[aria-busy="false"][aria-expanded="true"] {
+  border-color: var(--border-strong);
+  background: color-mix(in srgb, var(--router-text) 3%, var(--router-surface));
+}
+
 .router-fx-ensemble:disabled {
   cursor: default;
 }
@@ -730,7 +740,7 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
 
 .router-fx-ensemble__dot.done {
   background: var(--ok);
-  box-shadow: 0 0 10px color-mix(in srgb, var(--ok) 58%, transparent);
+  box-shadow: none;
   animation: none;
 }
 
@@ -743,6 +753,11 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
   font-size: 12.5px;
   font-weight: 650;
   white-space: nowrap;
+}
+
+.router-fx-ensemble[aria-busy="false"] .router-fx-ensemble__label {
+  color: var(--text-muted);
+  font-weight: 400;
 }
 
 .router-fx-ensemble__meta {

@@ -321,6 +321,17 @@ function statusProjection(
 
 <style scoped>
 .assistant-unified-activity-timeline {
+  display: flow-root;
   min-width: 0;
+}
+
+/* A reasoning/phase row can split item batches. Apply the same narrative
+   boundary spacing across those batches without spacing every tool row. */
+.assistant-unified-activity-timeline > :deep([data-activity-type] + .assistant-activity-timeline:has(> .activity-narration:first-child)) {
+  margin-top: 1.25rem;
+}
+
+.assistant-unified-activity-timeline > :deep(.assistant-activity-timeline:has(> .activity-narration:last-child) + [data-activity-type]) {
+  margin-top: 0.75rem;
 }
 </style>

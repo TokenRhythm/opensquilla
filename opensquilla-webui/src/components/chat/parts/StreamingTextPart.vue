@@ -186,25 +186,33 @@ watch(() => props.rawText, update, { immediate: true })
   word-break: break-word;
 }
 
-.streaming-rich-block :deep(p) { margin: 0.375rem 0; }
-.streaming-rich-block :deep(p:first-child) { margin-top: 0; }
-.streaming-rich-block :deep(ul),
-.streaming-rich-block :deep(ol) { margin: 0.375rem 0; padding-left: 1.25rem; }
+/* A committed block ends with the shared 12px Markdown margin, including at
+   the boundary with the next block. Do not add a second container gap. */
+.streaming-rich-block :deep(> :first-child) { margin-top: 0; }
 .streaming-rich-block :deep(pre) {
-  margin: 0.375rem 0;
+  margin: 0.75rem 0;
+  padding: 0.75rem 0.875rem 0.875rem;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.65;
   overflow-x: auto;
   border: 1px solid var(--code-block-border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-control);
   background: var(--code-block-bg);
-  padding: 0.625rem;
 }
-.streaming-rich-block :deep(code) {
+.streaming-rich-block :deep(:not(pre) > code) {
   border-radius: var(--radius-sm);
   background: var(--bg-hover);
   padding: 0.0625rem 0.25rem;
   color: var(--text-muted);
   font-family: var(--font-mono);
-  font-size: 0.8125rem;
+  font-size: 0.9em;
+}
+.streaming-rich-block :deep(pre code) {
+  font: inherit;
+  background: transparent;
+  padding: 0;
+  color: var(--text);
 }
 
 .streaming-plain-block,

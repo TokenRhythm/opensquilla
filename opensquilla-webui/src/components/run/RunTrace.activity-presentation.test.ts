@@ -209,6 +209,15 @@ describe('RunTrace activity presentation', () => {
     )
   })
 
+  it('aligns the detail outer edge with its tool row without an extra indent', () => {
+    expect(ruleBody('.tool-timeline--activity .tool-row-body')).toContain(
+      'padding: 0 0 0.125rem;',
+    )
+    expect(ruleBody('.tool-timeline--activity .step-group-members')).toContain(
+      'padding-left: 1.5rem;',
+    )
+  })
+
   it('keeps disclosure arrows hidden at rest and enlarges touch targets', () => {
     expect(ruleBody('.tool-timeline--activity .tool-row__activity-arrow')).toContain('opacity: 0;')
     const mediaStart = runTraceSource.indexOf('@media (pointer: coarse)')

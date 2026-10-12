@@ -268,7 +268,24 @@ function InterruptSlotContent({ nodes }: { nodes?: VNode[] }) {
 
 <style scoped>
 .assistant-activity-timeline {
+  display: flow-root;
   min-width: 0;
+}
+
+/* Keep tool rows dense; only narrative boundaries receive reading space. */
+.assistant-activity-timeline > .activity-narration + .activity-narration {
+  margin-top: 0.75rem;
+}
+
+/* Both trace wrappers use display:contents; put spacing on the first real
+   row box, and do not give an empty interrupt slot a visible gap. */
+.assistant-activity-timeline > .activity-narration + :deep(.tool-timeline > .tool-row-group > :first-child:not(:empty)) {
+  margin-top: 0.75rem;
+}
+
+.assistant-activity-timeline > .tool-timeline + .activity-narration,
+.assistant-activity-timeline > .assistant-activity-status + .activity-narration {
+  margin-top: 1.25rem;
 }
 
 .assistant-activity-status {

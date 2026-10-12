@@ -39,7 +39,7 @@
       </template>
     </p>
     <p v-if="missingCitationLabel" class="msg-ai-citation-warning">
-      Some citations do not map to available sources: {{ missingCitationLabel }}
+      {{ t('chat.missingCitationSources', { citations: missingCitationLabel }) }}
     </p>
   </div>
 </template>
@@ -412,26 +412,26 @@ onBeforeUnmount(() => { fileRequest?.abort(); fileActionRequest?.abort() })
   color: inherit;
 }
 
-.msg-ai-text :deep(p) { margin: 0.375rem 0; }
-.msg-ai-text :deep(p:first-child) { margin-top: 0; }
-.msg-ai-text :deep(ul), .msg-ai-text :deep(ol) { margin: 0.375rem 0; padding-left: 1.25rem; }
-.msg-ai-text :deep(li) { margin: 0.125rem 0; }
-.msg-ai-text :deep(code) {
+/* Paragraph/list rhythm is shared with narration and streaming Markdown. */
+.msg-ai-text :deep(:not(pre) > code) {
   background: var(--bg-hover);
   padding: 0.0625rem 0.25rem;
   border-radius: var(--radius-sm);
   font-family: var(--font-mono);
-  font-size: 0.8125rem;
+  font-size: 0.9em;
   color: var(--text-muted);
 }
 .msg-ai-text :deep(pre) {
   background: var(--code-block-bg);
   border: 1px solid var(--code-block-border);
-  border-radius: var(--radius-md);
-  padding: 0.625rem;
+  border-radius: var(--radius-control);
+  padding: 0.75rem 0.875rem 0.875rem;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.65;
   overflow-x: auto;
-  margin: 0.375rem 0;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
+  margin: 0.75rem 0;
+  box-shadow: none;
 }
 .msg-ai-text :deep(pre.code-block) {
   /* Chrome for fenced code (header gradient, language label, copy button)
@@ -465,8 +465,10 @@ onBeforeUnmount(() => { fileRequest?.abort(); fileActionRequest?.abort() })
 }
 
 .msg-ai-text :deep(pre code) {
+  font: inherit;
   background: transparent;
   padding: 0;
+  color: var(--text);
 }
 
 .msg-ai-citation-warning {

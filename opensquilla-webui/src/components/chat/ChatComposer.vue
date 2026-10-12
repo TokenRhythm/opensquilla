@@ -1112,14 +1112,14 @@ defineExpose<ChatComposerExpose>({
 }
 
 .chat-composer--new-landing {
-  width: min(calc(100% - 48px), 820px);
+  width: min(calc(100% - 48px), var(--composer-col, 800px));
   margin: 0 auto;
   padding: 0;
   background: transparent;
 }
 
 .chat-composer-inner {
-  width: min(100%, var(--composer-col, 820px));
+  width: min(100%, var(--composer-col, 800px));
   margin: 0 auto;
 }
 
@@ -1826,73 +1826,72 @@ button.attachment-chip__primary:focus-visible {
    both rows the same full width so the fallback remains aligned instead of
    leaving the routing/send cluster floating on a separate edge. */
 @container chat-composer (max-width: 26rem) {
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) {
+  .chat-input-footer {
     flex-direction: column;
     align-items: stretch;
     gap: 0.375rem;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions {
+  .chat-input-footer > .chat-input-actions {
     width: 100%;
     flex: 0 0 auto;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--left {
+  .chat-input-footer > .chat-input-actions--left {
     flex-wrap: wrap;
     row-gap: 0.25rem;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--right {
+  .chat-input-footer > .chat-input-actions--right {
     align-self: stretch;
     margin-left: 0;
     justify-content: space-between;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-anchor {
+  .chat-input-footer .chat-more-actions-anchor {
     margin-left: auto;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-menu {
+  .chat-input-footer .chat-more-actions-menu {
     right: 0;
     left: auto;
   }
 }
 
-/* An active mode adds a chip to the first cluster. Reserve a complete row
-   before that chip can push More onto an isolated line. */
+/* Reserve separate rows before either action cluster overlaps the other,
+   including ordinary new-chat composers without an active mode chip. */
 @container chat-composer (min-width: 26rem) and (max-width: 36rem) {
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) {
+  .chat-input-footer {
     flex-wrap: wrap;
     gap: 0.375rem;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions {
+  .chat-input-footer > .chat-input-actions {
     flex: 1 1 100%;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--left {
+  .chat-input-footer > .chat-input-actions--left {
     flex-wrap: wrap;
     row-gap: 0.25rem;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--right {
+  .chat-input-footer > .chat-input-actions--right {
     justify-content: space-between;
     margin-left: 0;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-anchor {
+  .chat-input-footer .chat-more-actions-anchor {
     margin-left: auto;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-menu {
+  .chat-input-footer .chat-more-actions-menu {
     right: 0;
     left: auto;
   }
 }
 
-/* More is the only ordinary-mode popover whose trigger sits at the left edge.
-   Re-anchor it to the footer at narrow widths so the menu stays inside the
-   composer while its labels remain readable. */
+/* Anchor More to the footer at narrow widths so the menu stays inside the
+   composer regardless of which row contains its trigger. */
 @container chat-composer (max-width: 36rem) {
   .chat-input-footer {
     position: relative;

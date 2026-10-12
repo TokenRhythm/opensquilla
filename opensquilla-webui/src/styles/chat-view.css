@@ -9,14 +9,10 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-sm);
-  /* The one conversation column. Every turn-content box — user bubbles,
-     assistant messages, the live work card, the composer — aligns to this
-     same column so streaming and settled content share a left edge. Widens
-     a step on very large viewports so the thread is not a sliver. */
-  --chat-col: min(calc(100% - 48px), clamp(980px, 62vw, 1280px));
-  /* The input column: the composer panel and everything anchored to it
-     (slash menu, queue chips) is deliberately narrower than the thread. */
-  --composer-col: 820px;
+  /* Prose, activity and input share one readable column. Wide code stays
+     inside its own scrollable detail instead of stretching the transcript. */
+  --composer-col: 800px;
+  --chat-col: min(calc(100% - 48px), var(--composer-col));
 }
 
 .chat--new-landing {
@@ -204,6 +200,13 @@
      content's left edge) does not shift when the conversation grows a
      scrollbar mid-stream. */
   scrollbar-gutter: stable;
+}
+
+@media (min-width: 769px) {
+  .chat-thread {
+    /* Keep the reading column centred on the composer despite the scrollbar. */
+    scrollbar-gutter: stable both-edges;
+  }
 }
 
 /* Floating composer (existing conversation, toggle on): reserve the dock's
@@ -400,8 +403,8 @@
 /* Gateway-confirmed answer text streams in its final visual position. */
 .live-answer {
   margin-top: 0;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--hairline);
+  padding-top: 1.5rem;
+  border-top: 0;
 }
 
 /* ── Jump-to-latest pill (floats above the composer when scrolled up) ─── */
@@ -570,7 +573,7 @@
   bottom: calc(100% + var(--sp-2));
   left: 50%;
   z-index: 35;
-  width: min(calc(100% - 48px), var(--composer-col, 820px));
+  width: min(calc(100% - 48px), var(--composer-col, 800px));
   min-width: 0;
   pointer-events: none;
   transform: translateX(-50%);
@@ -621,7 +624,7 @@
 .goal-run-dock {
   position: relative;
   width: 100%;
-  max-width: var(--composer-col, 860px);
+  max-width: var(--composer-col, 800px);
   margin: 0 auto 8px;
 }
 
@@ -659,7 +662,7 @@
 }
 
 .chat--new-landing .chat-composer {
-  width: min(calc(100% - 48px), 820px);
+  width: min(calc(100% - 48px), var(--composer-col, 800px));
   margin: 0 auto;
   padding: 0;
   background: transparent;
@@ -1037,7 +1040,16 @@
   }
 
   .chat-thread {
-    padding: 0.75rem 0.75rem 1.5rem;
+    padding: 0.75rem 0 1.5rem;
+  }
+
+  .chat :deep(.msg-ai:not(.msg-ai--share-mode)) {
+    /* The shell includes the reserved scrollbar gutter. Measuring this column
+       against that shell avoids subtracting the gutter and mobile padding a
+       second time; its 12px edges now match the composer panel below. */
+    width: min(calc(100cqw - 24px), var(--composer-col));
+    max-width: none;
+    margin-inline: 12px 0;
   }
 
 }

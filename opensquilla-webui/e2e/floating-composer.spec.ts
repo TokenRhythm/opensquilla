@@ -663,7 +663,19 @@ test('preserves a non-virtualized reader anchor across width reflow', async ({ p
   // TanStack owns measurements even below the DOM-windowing threshold; native
   // anchoring must not apply a second correction to the same width reflow.
   await expect.poll(() => thread.evaluate(el => getComputedStyle(el).overflowAnchor)).toBe('none')
-  const wideAnchor = await visibleRowAnchor(page)
+  // Establish a specific row boundary as the reading position. A bottom-based
+  // offset alone can leave most of the previous row visible after dock-height
+  // changes; that row then correctly owns the anchor as its text reflows.
+  const targetRow = await visibleRowAnchor(page)
+  await thread.evaluate((el, key) => {
+    const row = Array.from(el.querySelectorAll<HTMLElement>('[data-testid="chat-message-row"]'))
+      .find(item => item.dataset.chatMessageKey === key)!
+    el.scrollTop += row.getBoundingClientRect().top - el.getBoundingClientRect().top - 16
+    el.dispatchEvent(new Event('scroll'))
+  }, targetRow.key)
+  await expect.poll(async () => Math.abs((await visibleRowAnchor(page, targetRow.key)).offset - 16))
+    .toBeLessThanOrEqual(1)
+  const wideAnchor = await visibleRowAnchor(page, targetRow.key)
 
   await page.setViewportSize({ width: 900, height: 760 })
   await expect.poll(async () => {
