@@ -2883,15 +2883,6 @@ function artifactToolbarItems(
   const artifact = artifactFromWorkbenchItem(item)
   if (!artifact) return []
   const items: WorkbenchToolbarItem[] = []
-  if (runtimeStateValue(state, 'missingResources', false)) {
-    items.push({
-      kind: 'status',
-      id: 'missing-resources',
-      icon: 'info',
-      label: options.t('workbench.artifactPreview.missingResources'),
-      text: options.t('workbench.artifactPreview.missingShort'),
-    })
-  }
   const previewState = runtimeStateValue<ArtifactPreviewResourceState>(
     state,
     'previewState',
@@ -2945,9 +2936,14 @@ function artifactToolbarItems(
       disabled: previewState === 'loading',
     })
   }
+  // Dependency diagnostics do not add a warning to the preview UI, including
+  // legacy Web previews that report a state without setting missingResources.
+  const hasLocalResourceWarning = runtimeStateValue(state, 'missingResources', false)
+    || previewState === 'missing-resource'
+    || runtimeStateValue<string>(state, 'previewCollectionStatus', '') === 'partial'
   if (
     runtimeStateValue<string>(state, 'previewReadiness', '') === 'ready-with-warnings'
-    && !runtimeStateValue(state, 'missingResources', false)
+    && !hasLocalResourceWarning
   ) {
     items.push({
       kind: 'status',

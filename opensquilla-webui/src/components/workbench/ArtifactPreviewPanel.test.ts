@@ -73,6 +73,60 @@ afterEach(() => {
 })
 
 describe('ArtifactPreviewPanel', () => {
+  it.each([
+    { surface: 'Web iframe', nativeHtml: false, source: 'partial lease', lease: true },
+    { surface: 'Desktop native', nativeHtml: true, source: 'partial lease', lease: true },
+    { surface: 'Web iframe', nativeHtml: false, source: 'legacy HTML', lease: false },
+    { surface: 'Desktop native', nativeHtml: true, source: 'legacy HTML', lease: false },
+  ])('keeps $source visible in $surface without a missing-resource notice', async ({ nativeHtml, lease }) => {
+    (window as unknown as TestWindow).happyDOM.settings.disableIframePageLoading = true
+    const launchUrl = 'http://preview.localhost/partial/index.html'
+    const blobUrl = 'about:blank#legacy-relative-resource'
+    const html = '<!doctype html><link rel="stylesheet" href="./style.css"><h1>Preview content</h1>'
+    const onNativeHtmlReady = vi.fn()
+    const requestBinary = vi.fn().mockResolvedValue(httpBinaryResponse(html, {
+      contentType: 'text/html',
+    }))
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue(blobUrl)
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+
+    const mounted = mountPanel({
+      artifact: artifact(),
+      nativeHtml,
+      onNativeHtmlReady,
+      previewCollectionStatus: lease ? 'partial' : 'not_applicable',
+      previewLaunchUrl: lease ? launchUrl : '',
+    }, httpTransportTestDouble({ requestBinary }))
+    await settlePreview()
+
+    expect(mounted.element.querySelector('[data-preview-state]')?.getAttribute('data-preview-state'))
+      .toBe(lease ? 'ready-with-warnings' : 'missing-resource')
+    expect(mounted.element.textContent).not.toContain(en.workbench.artifactPreview.missingResources)
+    expect(mounted.element.querySelector('[role="alert"]')).toBeNull()
+    if (nativeHtml) {
+      expect(mounted.element.querySelector('[data-workbench-native-surface-slot]'))
+        .toBeInstanceOf(HTMLElement)
+      expect(mounted.element.querySelector('.artifact-preview__frame--html')).toBeNull()
+    } else {
+      const frame = mounted.element.querySelector<HTMLIFrameElement>('.artifact-preview__frame--html')
+      expect(frame?.getAttribute('src')).toBe(lease ? launchUrl : blobUrl)
+      expect(frame?.getAttribute('sandbox')).toBe('allow-scripts')
+      expect(mounted.element.textContent).toContain(en.workbench.artifactPreview.offlineWebLimits)
+    }
+    if (lease) {
+      expect(requestBinary).not.toHaveBeenCalled()
+    } else {
+      expect(requestBinary).toHaveBeenCalledOnce()
+      if (nativeHtml) {
+        expect(onNativeHtmlReady).toHaveBeenCalledOnce()
+        const payload = onNativeHtmlReady.mock.calls[0]?.[0]
+        expect(payload.hasRelativeResources).toBe(true)
+        expect(new TextDecoder().decode(payload.data)).toContain('Preview content')
+      }
+    }
+    mounted.unmount()
+  })
+
   it('invalidates file actions after an opaque iframe navigates without changing preview permissions', async () => {
     // Load events are injected deterministically; do not make real DNS requests.
     (window as unknown as TestWindow).happyDOM.settings.disableIframePageLoading = true
@@ -426,22 +480,77 @@ describe('ArtifactPreviewPanel', () => {
     ['error', 'Preview failed'],
     ['crashed', 'The preview stopped'],
   ] as const)(
-    'renders the native %s state in the DOM recovery surface',
+    'recovers the native %s state by retrying the HTML request and delivering fresh bytes',
     async (nativeSurfaceState, expectedTitle) => {
+      const onNativeHtmlReady = vi.fn()
+      let requestNumber = 0
+      const requestBinary = vi.fn().mockImplementation(() => Promise.resolve(httpBinaryResponse(
+        `<!doctype html><h1>Native preview ${++requestNumber}</h1>`,
+        { contentType: 'text/html' },
+      )))
       const http = httpTransportTestDouble({
-        requestBinary: vi.fn(() => new Promise<TestHttpBinaryResponse>(() => undefined)),
+        requestBinary,
       })
 
       const mounted = mountPanel({
         artifact: artifact(),
         nativeHtml: true,
-        nativeSurfaceState,
+        onNativeHtmlReady,
       }, http)
+      await settlePreview()
+      expect(requestBinary).toHaveBeenCalledOnce()
+      expect(onNativeHtmlReady).toHaveBeenCalledOnce()
+
+      mounted.update({ nativeSurfaceState })
       await settlePreview()
 
       expect(mounted.element.textContent).toContain(expectedTitle)
       expect(mounted.element.querySelector('[role="alert"]')).not.toBeNull()
+      const retry = [...mounted.element.querySelectorAll<HTMLButtonElement>('[role="alert"] button')]
+        .find(button => button.textContent?.trim() === en.chat.retry)
+      expect(retry).toBeDefined()
+      retry!.click()
+      await settlePreview()
+
+      expect(requestBinary).toHaveBeenCalledTimes(2)
+      expect(requestBinary).toHaveBeenLastCalledWith(
+        '/api/v1/artifacts/artifact-1',
+        expect.objectContaining({ timeoutMs: 0 }),
+      )
+      expect(onNativeHtmlReady).toHaveBeenCalledTimes(2)
+      expect(new TextDecoder().decode(onNativeHtmlReady.mock.calls[1]?.[0].data))
+        .toContain('Native preview 2')
+      expect(mounted.element.querySelector('[role="alert"]')).toBeNull()
+      expect(mounted.element.querySelector('[data-workbench-native-surface-slot]'))
+        .toBeInstanceOf(HTMLElement)
       mounted.unmount()
     },
   )
+
+  it('keeps a failed Web HTML request retryable and renders the recovered iframe', async () => {
+    (window as unknown as TestWindow).happyDOM.settings.disableIframePageLoading = true
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank#recovered-preview')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const requestBinary = vi.fn()
+      .mockRejectedValueOnce(new HttpTransportError('http-status', 'Preview unavailable', 500))
+      .mockResolvedValueOnce(httpBinaryResponse('<!doctype html><h1>Recovered</h1>', {
+        contentType: 'text/html',
+      }))
+    const mounted = mountPanel({ artifact: artifact() }, httpTransportTestDouble({ requestBinary }))
+    await settlePreview()
+
+    expect(mounted.element.querySelector('[role="alert"]')?.textContent).toContain(en.chat.previewFailed)
+    expect(mounted.element.querySelector('.artifact-preview__frame--html')).toBeNull()
+    const retry = [...mounted.element.querySelectorAll<HTMLButtonElement>('[role="alert"] button')]
+      .find(button => button.textContent?.trim() === en.chat.retry)
+    expect(retry).toBeDefined()
+    retry!.click()
+    await settlePreview()
+
+    expect(requestBinary).toHaveBeenCalledTimes(2)
+    expect(mounted.element.querySelector('[role="alert"]')).toBeNull()
+    expect(mounted.element.querySelector('.artifact-preview__frame--html')?.getAttribute('src'))
+      .toBe('about:blank#recovered-preview')
+    mounted.unmount()
+  })
 })

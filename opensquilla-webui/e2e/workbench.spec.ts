@@ -256,8 +256,9 @@ async function openWorkbenchSession(
 async function installDesktopWorkbenchV2Bridge(
   page: Page,
   mode?: 'full' | 'offline',
+  options: { partialCollection?: boolean; failFirstSurface?: boolean } = {},
 ) {
-  await page.addInitScript(({ previewMode }) => {
+  await page.addInitScript(({ previewMode, partialCollection, failFirstSurface }) => {
     const initialMode = previewMode === 'offline' ? 'offline' : 'full'
     const expiresAt = '2099-01-01T00:00:00Z'
     const leaseResponse = (mode: 'full' | 'offline', sequence: number) => {
@@ -278,11 +279,11 @@ async function installDesktopWorkbenchV2Bridge(
           preview_origin: previewOrigin,
           idle_timeout_seconds: 28_800,
           source: {
-            kind: 'single_file',
-            collection_status: 'not_applicable',
+            kind: partialCollection ? 'bundle' : 'single_file',
+            collection_status: partialCollection ? 'partial' : 'not_applicable',
             file_count: 1,
             total_bytes: 80,
-            warning_codes: [],
+            warning_codes: partialCollection ? ['missing_dependency'] : [],
           },
         },
       }
@@ -359,6 +360,9 @@ async function installDesktopWorkbenchV2Bridge(
       }),
       createWorkbenchSurface: async (request: Record<string, unknown>) => {
         probe.createRequests.push(request)
+        if (failFirstSurface && probe.createRequests.length === 1) {
+          return { ok: false, message: 'Synthetic HTML main-document load failure' }
+        }
         const surfaceId = String(request.surfaceId || '')
         queueMicrotask(() => probe.surfaceListener?.({
           version: 2,
@@ -400,7 +404,7 @@ async function installDesktopWorkbenchV2Bridge(
     }
     testWindow.__opensquillaNativeWorkbenchProbe = probe
     testWindow.opensquillaDesktop = bridge
-  }, { previewMode: mode })
+  }, { previewMode: mode, ...options })
 }
 
 async function deliverablesHeaderAction(page: Page): Promise<Locator> {
@@ -958,6 +962,132 @@ test.describe('Application Workbench', () => {
       })).toBeGreaterThan(0)
     })
   }
+
+  test('Web HTML local-resource diagnostics stay silent while the page renders', async ({ page }) => {
+    await openWorkbenchSession(page)
+    await page.route('**/api/v1/artifacts/workbench-demo*', route => route.fulfill({
+      contentType: 'text/html',
+      body: '<!doctype html><title>Demo</title><p id="preview">Local-resource preview</p><img src="./missing.png">',
+    }))
+    await page.locator('.msg-artifact-chip', { hasText: 'demo.html' })
+      .getByRole('button', { name: 'Open demo.html' }).click()
+
+    const workbench = page.getByTestId('workbench-host')
+    // Exercise the real legacy Web scanner and resource controller, rather
+    // than assigning component state to simulate a missing dependency.
+    await expect(workbench.locator('.artifact-preview')).toHaveAttribute(
+      'data-preview-state', 'missing-resource',
+    )
+    await expect(workbench.frameLocator('.artifact-preview__frame--html').locator('#preview'))
+      .toHaveText('Local-resource preview')
+    await expect(page.locator('.app-workbench__warning')).toHaveCount(0)
+    await expect(workbench.getByText(/local resources|preview is running with warnings/i)).toHaveCount(0)
+    await expect(workbench.getByRole('alert')).toHaveCount(0)
+  })
+
+  test('Web HTML main-document failure keeps Retry and recovers', async ({ page }) => {
+    await openWorkbenchSession(page)
+    let failDocument = true
+    let documentRequests = 0
+    await page.route('**/api/v1/artifacts/workbench-demo*', route => {
+      documentRequests += 1
+      return failDocument
+        ? route.fulfill({ status: 500, body: 'Synthetic HTML main-document failure' })
+        : route.fulfill({
+          contentType: 'text/html',
+          body: '<!doctype html><p id="preview">Recovered HTML preview</p>',
+        })
+    })
+    await page.locator('.msg-artifact-chip', { hasText: 'demo.html' })
+      .getByRole('button', { name: 'Open demo.html' }).click()
+
+    const workbench = page.getByTestId('workbench-host')
+    const failure = workbench.getByRole('alert')
+    await expect(failure).toBeVisible()
+    await expect(failure.getByRole('button', { name: 'Retry', exact: true })).toBeVisible()
+    const failedRequestCount = documentRequests
+    failDocument = false
+    await failure.getByRole('button', { name: 'Retry', exact: true }).click()
+    await expect(workbench.frameLocator('.artifact-preview__frame--html').locator('#preview'))
+      .toHaveText('Recovered HTML preview')
+    expect(documentRequests).toBeGreaterThan(failedRequestCount)
+    await expect(failure).toHaveCount(0)
+    await expect(page.locator('.app-workbench__warning')).toHaveCount(0)
+  })
+
+  test('Desktop bridge partial collection and missing-resource events stay silent', async ({ page }) => {
+    // This covers the desktop renderer/bridge contract. The native Electron
+    // request and WebContents behavior are covered by the isolated smoke test.
+    await installDesktopWorkbenchV2Bridge(page, 'full', { partialCollection: true })
+    await openWorkbenchSession(page)
+    await page.locator('.msg-artifact-chip', { hasText: 'demo.html' })
+      .getByRole('button', { name: 'Open demo.html' }).click()
+    await page.evaluate(() => {
+      const probe = (window as unknown as {
+        __opensquillaNativeWorkbenchProbe: { releaseLease: () => void }
+      }).__opensquillaNativeWorkbenchProbe
+      probe.releaseLease()
+    })
+
+    const workbench = page.getByTestId('workbench-host')
+    const nativeSlot = workbench.locator('[data-workbench-native-surface-slot]')
+    await expect(nativeSlot).toBeVisible()
+    await expect(workbench.locator('.artifact-preview')).toHaveAttribute(
+      'data-preview-state', 'ready-with-warnings',
+    )
+    await expect(page.locator('.app-workbench__warning')).toHaveCount(0)
+    await expect(workbench.getByText(/local resources|preview is running with warnings/i)).toHaveCount(0)
+
+    await page.evaluate(() => {
+      const probe = (window as unknown as {
+        __opensquillaNativeWorkbenchProbe: {
+          createRequests: Array<{ surfaceId?: string }>
+          surfaceListener: ((payload: unknown) => void) | null
+        }
+      }).__opensquillaNativeWorkbenchProbe
+      const surfaceId = probe.createRequests.at(-1)?.surfaceId
+      if (!surfaceId || !probe.surfaceListener) throw new Error('Desktop preview was not attached')
+      probe.surfaceListener({
+        version: 2, surfaceId, type: 'missing-resource', detail: { path: '/missing.png' },
+      })
+      probe.surfaceListener({ version: 2, surfaceId, type: 'ready' })
+    })
+    await expect(nativeSlot).toBeVisible()
+    await expect(page.locator('.app-workbench__warning')).toHaveCount(0)
+    await expect(workbench.getByText(/local resources|preview is running with warnings/i)).toHaveCount(0)
+    await expect(workbench.getByRole('alert')).toHaveCount(0)
+  })
+
+  test('Desktop bridge main-document failure keeps Retry and recreates the preview', async ({ page }) => {
+    await installDesktopWorkbenchV2Bridge(page, 'full', { failFirstSurface: true })
+    await openWorkbenchSession(page)
+    await page.locator('.msg-artifact-chip', { hasText: 'demo.html' })
+      .getByRole('button', { name: 'Open demo.html' }).click()
+    await page.evaluate(() => {
+      const probe = (window as unknown as {
+        __opensquillaNativeWorkbenchProbe: { releaseLease: () => void }
+      }).__opensquillaNativeWorkbenchProbe
+      probe.releaseLease()
+    })
+
+    const workbench = page.getByTestId('workbench-host')
+    const failure = workbench.getByRole('alert')
+    await expect(failure).toBeVisible()
+    await expect(workbench.locator('[data-workbench-native-surface-slot]')).toHaveCount(0)
+    await failure.getByRole('button', { name: 'Retry', exact: true }).click()
+    await expect(workbench.locator('[data-workbench-native-surface-slot]')).toBeVisible()
+    await expect.poll(() => page.evaluate(() => {
+      const probe = (window as unknown as {
+        __opensquillaNativeWorkbenchProbe: {
+          createRequests: unknown[]
+          leaseRequests: unknown[]
+        }
+      }).__opensquillaNativeWorkbenchProbe
+      return { surfaces: probe.createRequests.length, leases: probe.leaseRequests.length }
+    })).toEqual({ surfaces: 2, leases: 2 })
+    await expect(failure).toHaveCount(0)
+    await expect(page.locator('.app-workbench__warning')).toHaveCount(0)
+  })
 
   test('preview mode switches immediately without a confirmation dialog', async ({ page }) => {
     await installDesktopWorkbenchV2Bridge(page)

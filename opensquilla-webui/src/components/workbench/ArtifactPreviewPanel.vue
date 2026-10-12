@@ -47,15 +47,6 @@
     </header>
 
     <p
-      v-if="preview.state.value === 'missing-resource'
-        || preview.state.value === 'ready-with-warnings'"
-      class="artifact-preview__notice"
-      role="status"
-    >
-      <Icon name="info" :size="14" />
-      <span>{{ t('workbench.artifactPreview.missingResources') }}</span>
-    </p>
-    <p
       v-if="showOfflineWebLimits"
       class="artifact-preview__notice"
       role="status"

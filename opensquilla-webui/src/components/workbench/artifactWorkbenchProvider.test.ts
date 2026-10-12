@@ -1973,7 +1973,7 @@ describe('artifact Workbench provider', () => {
     ]))
   })
 
-  it('keeps temporary mode selection separate from the saved default', async () => {
+  it.each(['complete', 'partial'] as const)('keeps a %s preview quiet while changing its temporary mode and saved default', async collectionStatus => {
     const requestedModes: string[] = []
     let leaseSequence = 0
     const createLease = vi.fn(async (request: { mode: 'full' | 'offline' }) => {
@@ -1994,10 +1994,10 @@ describe('artifact Workbench provider', () => {
           idle_timeout_seconds: 28_800,
           source: {
             kind: 'bundle' as const,
-            collection_status: 'complete' as const,
+            collection_status: collectionStatus,
             file_count: 2,
             total_bytes: 42,
-            warning_codes: [],
+            warning_codes: collectionStatus === 'partial' ? ['missing_dependency'] : [],
           },
         },
       }
@@ -2061,6 +2061,16 @@ describe('artifact Workbench provider', () => {
       reportError: vi.fn(),
     })
 
+    const toolbar = () => definition.getToolbarItems?.(item, {
+      active: true,
+      hostAvailable: true,
+      nativeSurface: true,
+      runtimeState: renderState,
+    }) || []
+    expect(renderState.previewCollectionStatus).toBe(collectionStatus)
+    expect(toolbar().map(item => item.id)).not.toContain('missing-resources')
+    expect(toolbar().map(item => item.id)).not.toContain('preview-warnings')
+
     await runtime.performAction?.('set-preview-mode-full', item)
     await runtime.performAction?.('set-preview-mode-full', item)
 
@@ -2069,6 +2079,8 @@ describe('artifact Workbench provider', () => {
     expect(createSurface).toHaveBeenLastCalledWith(expect.objectContaining({ version: 3 }))
     expect(renderState.previewDefaultMode).toBe('offline')
     expect(savePreviewPreferences).not.toHaveBeenCalled()
+    expect(toolbar().map(item => item.id)).not.toContain('missing-resources')
+    expect(toolbar().map(item => item.id)).not.toContain('preview-warnings')
 
     await runtime.performAction?.('set-default-preview-mode', item)
     await runtime.performAction?.('set-default-preview-mode', item)
@@ -2175,13 +2187,15 @@ describe('artifact Workbench provider', () => {
     }
     expect(definition.getToolbarItems?.(item, presentation)).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: 'missing-resources', kind: 'status' }),
         expect.objectContaining({
           id: 'toggle-remote-resources',
           kind: 'action',
           pressed: true,
         }),
       ]),
+    )
+    expect(definition.getToolbarItems?.(item, presentation)).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: 'missing-resources' })]),
     )
 
     const createsBeforeFailure = createSurface.mock.calls.length
@@ -2316,6 +2330,100 @@ describe('artifact Workbench provider', () => {
     expect(confirmRemoteResources).toHaveBeenCalledOnce()
     expect(createSurface).toHaveBeenCalledOnce()
     expect(harness.renderState.remoteResourcesEnabled).toBe(false)
+  })
+
+  it('keeps a native missing-resource event quiet through ready and refresh', async () => {
+    const nativeApi: NativeWorkbenchApi = {
+      createSurface: vi.fn(async () => ({ ok: true })),
+      setSurfaceRect: vi.fn(async () => ({ ok: true })),
+      activateSurface: vi.fn(async () => ({ ok: true })),
+      destroySurface: vi.fn(async () => ({ ok: true })),
+      onSurfaceEvent: vi.fn(() => () => undefined),
+    }
+    const harness = await createNativeRuntimeHarness(nativeApi)
+    const reload = vi.fn(async () => undefined)
+    await harness.runtime.setComponentHandle?.({ reload })
+    const toolbar = () => harness.definition.getToolbarItems?.(harness.item, {
+      active: true,
+      hostAvailable: true,
+      nativeSurface: true,
+      runtimeState: harness.renderState,
+    }) || []
+    try {
+      await harness.runtime.handleComponentEvent?.({
+        type: 'native-html-ready', payload: nativeResource(),
+      }, harness.item)
+      for (const type of ['missing-resource', 'ready'] as const) {
+        await harness.runtime.handleNativeSurfaceEvent?.({
+          version: 1, surfaceId: harness.item.id, type,
+        }, harness.item)
+        expect(toolbar().map(item => item.id)).not.toContain('missing-resources')
+        expect(toolbar().map(item => item.id)).not.toContain('preview-warnings')
+      }
+      expect(harness.renderState.missingResources).toBe(true)
+      expect(harness.renderState.nativeSurfaceState).toBe('ready')
+      expect(harness.pushToast).not.toHaveBeenCalled()
+
+      await harness.runtime.performAction?.('refresh', harness.item)
+      expect(reload).toHaveBeenCalledOnce()
+      await harness.runtime.handleComponentEvent?.({
+        type: 'native-html-ready', payload: nativeResource(),
+      }, harness.item)
+      await harness.runtime.handleNativeSurfaceEvent?.({
+        version: 1, surfaceId: harness.item.id, type: 'missing-resource',
+      }, harness.item)
+      expect(toolbar().map(item => item.id)).not.toContain('missing-resources')
+      expect(toolbar().map(item => item.id)).not.toContain('preview-warnings')
+    } finally {
+      await harness.runtime.dispose?.('closed')
+    }
+  })
+
+  it('does not turn a legacy web resource warning into a generic warning and keeps failed-page retry', async () => {
+    const renderState: Record<string, unknown> = {}
+    const reload = vi.fn(async () => undefined)
+    const item = createArtifactPreviewWorkbenchItem({
+      artifact, nativeHtml: false, sessionKey: 'session-a',
+    })
+    const definition = createArtifactWorkbenchDefinitions({
+      baseOrigin: 'http://localhost',
+      confirmRemoteResources: vi.fn(async () => true),
+      currentSessionId: () => 'session-a',
+      platform: { id: 'web', capabilities: {}, files: {} } as unknown as Platform,
+      pushToast: vi.fn(),
+      t: key => key,
+    }).find(candidate => candidate.kind === 'artifact-preview')!
+    const runtime = await definition.createRuntime!(item, {
+      getRenderState: () => renderState,
+      updateRenderState: patch => Object.assign(renderState, patch),
+      isItemOpen: () => true,
+      setExpanded: vi.fn(),
+      reportError: vi.fn(),
+    })
+    await runtime.setComponentHandle?.({ reload })
+    const toolbar = () => definition.getToolbarItems?.(item, {
+      active: true, hostAvailable: true, nativeSurface: false, runtimeState: renderState,
+    }) || []
+    try {
+      await runtime.handleComponentEvent?.({
+        type: 'preview-state-change', payload: 'missing-resource',
+      }, item)
+      expect(renderState.missingResources).toBe(false)
+      expect(toolbar().map(item => item.id)).not.toContain('missing-resources')
+      expect(toolbar().map(item => item.id)).not.toContain('preview-warnings')
+      expect(toolbar()).toContainEqual(expect.objectContaining({ id: 'refresh', disabled: false }))
+
+      await runtime.handleComponentEvent?.({
+        type: 'preview-state-change', payload: 'error',
+      }, item)
+      expect(renderState.previewState).toBe('error')
+      expect(renderState.previewReadiness).toBe('error')
+      expect(toolbar()).toContainEqual(expect.objectContaining({ id: 'refresh', disabled: false }))
+      await runtime.performAction?.('refresh', item)
+      expect(reload).toHaveBeenCalledOnce()
+    } finally {
+      await runtime.dispose?.('closed')
+    }
   })
 
   it('surfaces an offline network block as ready with warnings', async () => {
