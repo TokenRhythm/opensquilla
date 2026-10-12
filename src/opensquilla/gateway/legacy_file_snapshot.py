@@ -79,12 +79,24 @@ def _verified_write_payload(replay: dict[str, Any], snapshot: dict[str, Any]) ->
 def _persist_verified_write(
     replay: dict[str, Any], snapshot: dict[str, Any], *, media_root: Path,
     session_id: str, disk_budget_bytes: int | None,
-) -> None:
+) -> bool:
     payload = _verified_write_payload(replay, snapshot)
-    write_transcript_material(
+    _sha, _path, written = write_transcript_material(
         media_root=media_root, session_id=session_id, payload=payload,
         disk_budget_bytes=disk_budget_bytes,
     )
+    return written
+
+
+def _discard_recovered_material(material: Path) -> None:
+    """Undo only this recovery's write after its session generation disappears."""
+
+    material.unlink(missing_ok=True)
+    try:
+        material.parent.rmdir()
+    except OSError:
+        # Another recovery may still own a file here; never remove its content.
+        pass
 
 
 class LegacyFileSnapshotRecovery:
@@ -164,8 +176,18 @@ class LegacyFileSnapshotRecovery:
                 session.session_id, session.epoch,
             ):
                 raise ContentNotFoundError("historical file content unavailable")
-            await asyncio.to_thread(
+            written = await asyncio.to_thread(
                 _persist_verified_write, replay, snapshot, media_root=media_root,
                 session_id=session.session_id,
                 disk_budget_bytes=self._config.attachments.transcript_disk_budget_bytes,
             )
+            # Deletion can finish its material cleanup while the worker is
+            # hashing or writing. Fence again after it drains, otherwise this
+            # read-only request can recreate bytes for a deleted session.
+            current = await storage.get_session(session_key)
+            if current is None or (current.session_id, current.epoch) != (
+                session.session_id, session.epoch,
+            ):
+                if written and (current is None or current.session_id != session.session_id):
+                    await asyncio.to_thread(_discard_recovered_material, material)
+                raise ContentNotFoundError("historical file content unavailable")

@@ -6,6 +6,8 @@ import asyncio
 import copy
 import hashlib
 import json
+import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -199,6 +201,62 @@ async def test_unverifiable_replay_never_creates_material(stored_app, mutation, 
     assert not transcript_material_path(
         config.attachments.media_root, session.session_id, sha,
     ).exists()
+
+
+@pytest.mark.parametrize("replace_session", [False, True], ids=["delete", "delete-and-recreate"])
+async def test_recovery_cannot_recreate_deleted_session_material(
+    stored_app, monkeypatch, replace_session,
+):
+    from opensquilla.gateway import legacy_file_snapshot as recovery_module
+    from opensquilla.gateway.boot import build_session_material_cleanup
+    from opensquilla.session.material_cleanup import (
+        reset_session_material_cleanup,
+        set_session_material_cleanup,
+    )
+
+    store, session, config, client = stored_app
+    sha = await _save(store, session, "private historical file\n" * 1000)
+    material = transcript_material_path(config.attachments.media_root, session.session_id, sha)
+    workspace = Path(config.attachments.media_root).parent / "workspace"
+    workspace.mkdir()
+    config.workspace_dir = str(workspace)
+    entered = threading.Event()
+    release = threading.Event()
+    persist = recovery_module._persist_verified_write
+
+    def delayed_persist(*args, **kwargs):
+        entered.set()
+        assert release.wait(5), "recovery worker was not released"
+        return persist(*args, **kwargs)
+
+    monkeypatch.setattr(recovery_module, "_persist_verified_write", delayed_persist)
+    set_session_material_cleanup(build_session_material_cleanup(config))
+    request = asyncio.create_task(client.get(_url(sha), headers=HEADERS))
+    replacement_material = None
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 3), 4)
+        await store.delete_session(KEY)
+        assert await store.get_session(KEY) is None
+        assert not material.parent.exists()
+        if replace_session:
+            replacement = await SessionManager(store, inject_time_prefix=False).create(KEY)
+            assert replacement.session_id != session.session_id
+            replacement_material = transcript_material_path(
+                config.attachments.media_root, replacement.session_id, sha,
+            )
+            replacement_material.parent.mkdir(parents=True)
+            replacement_material.write_bytes(b"new session material")
+        release.set()
+        response = await asyncio.wait_for(request, 5)
+        assert response.status_code == 404
+        assert not material.exists()
+        assert not material.parent.exists()
+        if replacement_material is not None:
+            assert replacement_material.read_bytes() == b"new session material"
+    finally:
+        release.set()
+        await asyncio.gather(request, return_exceptions=True)
+        reset_session_material_cleanup()
 
 
 async def test_recovery_is_single_flight_and_limited_to_two_workers(tmp_path, monkeypatch):
