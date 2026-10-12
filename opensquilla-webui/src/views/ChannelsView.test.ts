@@ -922,16 +922,51 @@ describe('ChannelsView dashboard home', () => {
       await nextTick()
       ops.querySelector<HTMLButtonElement>('[aria-label="Approve access for Pending User"]')!.click()
       await flush()
-      // The approval committed but the grant failed: plain approve success
-      // plus an actionable warning — never a false admin-success toast.
-      expect(pushToast).toHaveBeenCalledWith('Approved pairing access for Pending User', { tone: 'ok' })
-      expect(pushToast).toHaveBeenCalledWith(
+      // The approval committed but the grant failed: one partial-success
+      // warning, without contradictory success and failure notifications.
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(
         'Approved Pending User, but the admin grant failed — retry from the members list.',
-        { tone: 'danger' },
+        { tone: 'warn' },
       )
       expect(pushToast).not.toHaveBeenCalledWith('Approved Pending User as a channel admin', { tone: 'ok' })
     } finally {
       app.unmount()
+    }
+  })
+
+  it('does not offer an acknowledged card approval again when the follow-up read fails', async () => {
+    let readFails = false
+    const ctx = await mountChannelsView({
+      adminGrantFails: true,
+      loadPairings: async () => {
+        if (readFails) throw new Error('read unavailable')
+        return { pairings: [
+          { pairingId: 'pair-pending', channelName: 'ops-slack', senderId: 'U-PENDING', senderName: 'Pending User', status: 'pending' },
+          { pairingId: 'pair-approved', channelName: 'ops-slack', senderId: 'U-APPROVED', senderName: 'Approved User', status: 'approved' },
+        ] }
+      },
+    })
+    try {
+      await ctx.flush()
+      const ops = channelCard(ctx.el, 'ops-slack')
+      const box = ops.querySelector<HTMLInputElement>('[aria-label="Approve Pending User as a channel admin"]')!
+      box.checked = true
+      box.dispatchEvent(new Event('change', { bubbles: true }))
+      await ctx.nextTick()
+      readFails = true
+      ops.querySelector<HTMLButtonElement>('[aria-label="Approve access for Pending User"]')!.click()
+      await ctx.flush()
+      await ctx.flush()
+      expect(ops.querySelector('[aria-label="Approve access for Pending User"]')).toBeNull()
+      const membersLabel = Array.from(ops.querySelectorAll('dt')).find(item => item.textContent?.trim() === 'Members')
+      expect(membersLabel?.nextElementSibling?.textContent).toBe('2')
+      expect(ctx.rpcCall.mock.calls.filter(([method]) => method === 'channels.pairing.approve')).toHaveLength(1)
+      expect(ctx.pushToast).toHaveBeenCalledExactlyOnceWith(
+        'Approved Pending User, but the admin grant failed — retry from the members list.',
+        { tone: 'warn' },
+      )
+    } finally {
+      ctx.app.unmount()
     }
   })
 })
@@ -1417,10 +1452,9 @@ describe('ChannelsView members section', () => {
       await nextTick()
       panel.querySelector<HTMLButtonElement>('[aria-label="Approve access for Pending User"]')!.click()
       await flush()
-      expect(pushToast).toHaveBeenCalledWith('Approved pairing access for Pending User', { tone: 'ok' })
-      expect(pushToast).toHaveBeenCalledWith(
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(
         'Approved Pending User, but the admin grant failed — retry from the members list.',
-        { tone: 'danger' },
+        { tone: 'warn' },
       )
       // The members list still reloads: the approval itself committed.
       expect(panel.querySelector('[aria-label="Approve access for Pending User"]')).toBeNull()

@@ -1003,12 +1003,21 @@ async function approvePairing(name: string, pairing: ChannelPairing | null, asAd
         pairing.pairingId,
         asAdmin,
       )
+      const facts = homeFacts.value[name]
+      if (facts?.pending?.some(item => item.pairingId === pairing.pairingId)) {
+        // This approval is acknowledged even if the following read fails.
+        // Remove only its pending row; unknown counts remain unknown.
+        homeFacts.value = { ...homeFacts.value, [name]: {
+          ...facts,
+          pending: facts.pending.filter(item => item.pairingId !== pairing.pairingId),
+          members: facts.members === null ? null : facts.members + 1,
+        } }
+      }
       // The backend commits the approval even when the admin grant fails
       // (adminGranted:false + warnings) — surface that instead of falsely
       // toasting an admin success.
       if (asAdmin && res?.adminGranted === false) {
-        pushToast(t('console.channels.pairings.approveSuccess', { sender }), { tone: 'ok' })
-        pushToast(t('console.channels.pairings.adminGrantFailedAfterApprove', { sender }), { tone: 'danger' })
+        pushToast(t('console.channels.pairings.adminGrantFailedAfterApprove', { sender }), { tone: 'warn' })
       } else {
         pushToast(
           t(asAdmin ? 'console.channels.pairings.approveAdminSuccess' : 'console.channels.pairings.approveSuccess', { sender }),
