@@ -638,6 +638,47 @@ def _index_receipts(
     return dict(by_event), by_item
 
 
+def _is_failed_unknown_event(event: object) -> bool:
+    """Whether an unknown-status usage event represents a genuinely failed call.
+
+    ``status='unknown'`` covers two very different situations:
+
+    - real failures (provider errors/exceptions, timeouts, cancellation,
+      process restarts) that returned nothing usable;
+    - successful calls whose provider simply did not report usage data
+      (``provider_stream_ended_without_usage``, ``missing_or_invalid_usage_receipt``)
+      — common with third-party OpenAI-compatible endpoints, Ollama, or
+      self-hosted gateways.
+
+    Failed calls must not fabricate a zero-usage model-card row; successful
+    third-party calls without usage data must stay visible so the user can
+    still see which models were actually used.
+    """
+    if _text(_first(event, "status", "state"), "finalized") != "unknown":
+        return False
+    reason = _text(
+        _first(event, "unknown_reason", "unknownReason"), "usage_unknown"
+    )
+    if reason in _FAILED_CALL_UNKNOWN_REASONS:
+        return True
+    return reason.startswith("provider_error:")
+
+
+_FAILED_CALL_UNKNOWN_REASONS = frozenset(
+    {
+        "cancelled",
+        "cancelled_before_provider_request",
+        "direct_request_failed",
+        "iteration_timeout",
+        "process_restarted",
+        "provider_error",
+        "provider_exception",
+        "total_timeout",
+        "usage_unknown",
+    }
+)
+
+
 def _group_models(
     events: Sequence[Any],
     items_by_event: Mapping[str, Sequence[Any]],
@@ -651,6 +692,15 @@ def _group_models(
 
     grouped: dict[tuple[str, str], list[tuple[Any, str, Any | None]]] = defaultdict(list)
     for event_id, event in event_by_id.items():
+        # Provider calls that genuinely failed (errors, timeouts, cancellation)
+        # carry zero tokens and zero cost. Counting them as a model entry
+        # would fabricate a model-card row for a call that returned nothing.
+        # Successful third-party calls whose provider did not report usage
+        # data are NOT failures: they stay visible so the user can still see
+        # which models were actually used. Totals keep their event/missing-
+        # entry counters either way, so coverage reporting is unchanged.
+        if _is_failed_unknown_event(event):
+            continue
         event_items = items_by_event.get(event_id)
         if not event_items:
             event_items = [event]
