@@ -576,6 +576,10 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
             "test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn",
         ),
         (
+            "tests/test_gateway/test_plan_rpc.py",
+            "test_explicit_implement_mode_is_pinned_at_queued_execution_boundary",
+        ),
+        (
             "tests/test_engine/test_tool_concurrency.py",
             "test_image_analysis_calls_have_dedicated_inflight_cap",
         ),
