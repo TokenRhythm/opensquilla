@@ -4,6 +4,7 @@
     :variant="variant"
     :presentation="presentation"
     :state-scope="stateScope"
+    :session-key="sessionKey"
     :show-bulk-toggle="presentation !== 'activity'"
     :is-tool-group-open="isToolGroupOpen"
     :is-tool-item-open="isToolItemOpen"
@@ -42,6 +43,7 @@ defineProps<{
   variant?: 'checklist'
   presentation?: 'activity'
   stateScope?: string
+  sessionKey?: string
 }>()
 
 defineEmits<{

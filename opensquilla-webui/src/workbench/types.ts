@@ -18,6 +18,7 @@ export type WorkbenchPanelKind =
   | 'browser'
   | 'frontend-preview'
   | 'file'
+  | 'tool-file-history'
   | 'diff'
   | 'terminal'
 

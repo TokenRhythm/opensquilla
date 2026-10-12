@@ -14,6 +14,7 @@
         :projection="statusProjection(row.step)"
         :show-items="false"
         :state-scope="stateScope"
+        :session-key="sessionKey"
         :is-tool-group-open="isToolGroupOpen"
         :is-tool-item-open="isToolItemOpen"
         :tool-group-status-text="toolGroupStatusText"
@@ -40,6 +41,7 @@
         preserve-item-groups
         :variant="variant"
         :state-scope="stateScope"
+        :session-key="sessionKey"
         :is-tool-group-open="isToolGroupOpen"
         :is-tool-item-open="isToolItemOpen"
         :tool-group-status-text="toolGroupStatusText"
@@ -89,6 +91,7 @@ const props = withDefaults(defineProps<{
   variant?: 'checklist'
   stateScope?: string
   reasoningPaceBursts?: boolean
+  sessionKey?: string
   reasoningCollapseActive?: boolean
   reasoningNested?: boolean
   reasoningTimelinePhase?: boolean

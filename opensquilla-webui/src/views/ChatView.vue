@@ -336,6 +336,7 @@
               :stale="streamActivityStale"
             >
               <UnifiedAssistantActivityTimeline
+                :session-key="sessionKey"
                 v-if="liveHasUnifiedActivityOrder"
                 variant="checklist"
                 :projection="liveActivityProjection"
@@ -379,6 +380,7 @@
               />
 
               <AssistantActivityTimeline
+                :session-key="sessionKey"
                 v-if="
                   liveActivityTimelineItems.length
                   || liveActivityProjection.statusSteps.length

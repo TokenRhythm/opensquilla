@@ -508,3 +508,18 @@ describe('execution log reference preservation', () => {
     }
   })
 })
+
+describe('recorded file snapshot preservation', () => {
+  it.each([false, true])('keeps success snapshots and discards failed snapshots in both reducers: isError=%s', isError => {
+    const fileSnapshot = { kind: 'edit' as const, path: 'a.ts', content: '-before\n+after' }
+    const event: Frame = {
+      kind: 'tool-result', seq: 0, toolId: 'edit-1', name: 'edit_file', input: '{}',
+      result: isError ? 'Permission denied' : 'Applied edit', fileSnapshot, isError, at: 1,
+    }
+    const accumulator = new TurnAccumulator()
+    accumulator.append(event)
+    for (const projection of [fold([event]), accumulator.snapshot(renderMarkdown, toolCallGroups)]) {
+      expect(projection.toolCalls[0]?.fileSnapshot).toEqual(isError ? undefined : fileSnapshot)
+    }
+  })
+})

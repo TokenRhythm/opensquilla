@@ -160,6 +160,12 @@ export interface AttachmentUploadReceipt {
   readonly ttlSeconds?: number
 }
 
+export interface AttachmentTextPreview {
+  readonly content: string
+  readonly truncated: boolean
+  readonly totalBytes: number
+}
+
 /** Authenticated artifact and attachment bytes without endpoint or header leakage. */
 export interface WorkingFileRequest {
   sessionKey: string
@@ -200,6 +206,15 @@ export interface ArtifactContentAccess {
     attachment: DisplayAttachment,
     request?: ArtifactAccessRequest,
   ): Promise<AttachmentFetchResult>
+  /** Bounded text projection; never substitutes for a complete attachment download. */
+  readAttachmentPreview?(
+    attachment: DisplayAttachment,
+    request?: ArtifactAccessRequest,
+  ): Promise<AttachmentTextPreview>
+  downloadAttachment?(
+    attachment: DisplayAttachment,
+    request?: ArtifactAccessRequest,
+  ): Promise<'saved' | 'cancelled'>
   uploadAttachment(file: File, mime: string): Promise<AttachmentUploadReceipt>
 }
 

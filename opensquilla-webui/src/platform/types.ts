@@ -230,6 +230,8 @@ export interface PlatformFilesApi {
   importAttachmentSelection?: (request: NativeAttachmentContext, token: string) => Promise<NativeAttachmentReceipt>
   cancelAttachmentSelections?: () => Promise<void>
   saveArtifact?: (payload: ArtifactOpenRequest) => Promise<{ status: 'saved' | 'cancelled' }>
+  /** Save retained session material without passing its body through the renderer. */
+  saveAttachment?: (payload: { gatewayInstanceId: string; sessionKey: string; sha256: string; name: string }) => Promise<{ status: 'saved' | 'cancelled' }>
   sourceFileAction?: (payload: {
     gatewayInstanceId: string
     sessionKey: string

@@ -181,12 +181,18 @@ export function createV4SessionInspection(
       }
       throw error
     }
+    // Fail before Unicode schema validation or code-point array allocation.
+    // Each requested code point occupies at most two UTF-16 code units.
+    if (raw && typeof raw.content === 'string' && raw.content.length > params.limit * 2) {
+      throw new SessionInspectionContractError('Execution log page exceeds its requested limit.')
+    }
     if (!validateSessionsExecutionLogReadResult(raw)) {
       throw contractError(SESSIONS_EXECUTION_LOG_READ_METHOD)
     }
     const returnedChars = Array.from(raw.content).length
     const end = raw.offset + returnedChars
-    if (raw.handle !== handle || raw.offset !== Math.min(offset, raw.chars)
+    if (returnedChars > params.limit
+      || raw.handle !== handle || raw.offset !== Math.min(offset, raw.chars)
       || raw.returned_chars !== returnedChars || end > raw.chars
       || raw.next_offset !== (end < raw.chars ? end : null)
       || (end < raw.chars && returnedChars === 0)) {

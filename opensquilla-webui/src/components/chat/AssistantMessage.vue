@@ -52,6 +52,7 @@
           @open-change="activityDetailsOpen = $event"
         >
           <UnifiedAssistantActivityTimeline
+            :session-key="sessionKey"
             v-if="hasUnifiedActivityOrder"
             :projection="visibleActivityProjection"
             :timeline-items="visibleActivityItems"
@@ -82,6 +83,7 @@
           </UnifiedAssistantActivityTimeline>
           <template v-else>
           <AssistantActivityTimeline
+            :session-key="sessionKey"
             v-if="hasBeforeReasoningActivity"
             :projection="visibleActivityProjection"
             status-position="before-reasoning"
@@ -111,6 +113,7 @@
             :timeline-phase="!hasPlan"
           />
           <AssistantActivityTimeline
+            :session-key="sessionKey"
             v-if="
               visibleActivityItems.length
               || hasAfterReasoningActivity
@@ -180,6 +183,7 @@
         />
         <ReasoningPart v-else-if="reasoningPart" :part="reasoningPart" @open-change="legacyReasoningOpen = $event" />
         <ToolCallTimeline
+          :session-key="sessionKey"
           :items="visibleLegacyTimelineItems"
           :state-scope="toolStateScope"
           :is-tool-group-open="isToolGroupOpen"

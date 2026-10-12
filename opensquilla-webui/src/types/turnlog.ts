@@ -1,5 +1,5 @@
 import type { ArtifactPayload } from '@/types/artifacts'
-import type { ToolPresentation } from '@/types/chat'
+import type { ToolFileSnapshot, ToolPresentation } from '@/types/chat'
 import type {
   InterruptApprovalData,
   InterruptClarifyData,
@@ -40,6 +40,7 @@ type FrameBody =
       name: string
       result: string
       executionLogHandle?: string
+      fileSnapshot?: ToolFileSnapshot
       isError: boolean
       input: string
       at: number

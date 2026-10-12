@@ -133,6 +133,8 @@ export interface DisplayAttachment {
   sha256_ref?: string
   /** Bounded server display diagnostic; it does not revoke a usable read source. */
   missingReason?: string
+  /** Exact historical write to recover lazily when its saved material is absent. */
+  fileSnapshotRef?: { messageId: string; toolUseId: string }
   /** Session-scoped opaque identity for Workbench preview/import actions. */
   attachmentId?: string
   origin?: 'paste'
@@ -228,6 +230,19 @@ export interface ChatRouterTierConfig {
   ensembleEnabled?: boolean
 }
 
+/** UI-only immutable content captured by a successful filesystem operation. */
+export interface ToolFileSnapshot {
+  kind: 'write' | 'edit'
+  path: string
+  content: string
+  /** Large bodies use session-owned material; content is only a transport preview. */
+  sha256_ref?: string
+  bytes?: number
+  /** Verified display marker; the backend validates original replay only on access. */
+  legacy_ref?: { message_id: string; tool_use_id: string; sha256: string; original_chars: number }
+  content_unavailable?: true
+}
+
 export interface ChatToolCall {
   toolId: string
   name: string
@@ -240,7 +255,11 @@ export interface ChatToolCall {
   isError: boolean
   result: string
   resultPreview: string
+  /** Persisted history may contain an excerpt instead of the full output. */
+  resultTruncated?: boolean
+  resultOriginalChars?: number
   executionLogHandle?: string
+  fileSnapshot?: ToolFileSnapshot
   sources?: unknown
   isOpen: boolean
   activityOrder?: number
@@ -462,6 +481,11 @@ export interface RawToolCallPayload extends Record<string, unknown> {
   tool_name?: string
   input?: unknown
   result?: unknown
+  file_snapshot?: ToolFileSnapshot
+  result_truncated?: boolean
+  result_original_chars?: number
+  resultTruncated?: boolean
+  resultOriginalChars?: number
   user_input_request?: unknown
   content?: unknown
   output?: unknown

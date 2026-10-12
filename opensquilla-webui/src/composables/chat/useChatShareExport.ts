@@ -406,6 +406,10 @@ function cleanupShareClone(clone: HTMLElement): HTMLElement {
     .forEach(element => element.remove())
 
   clone.querySelectorAll<HTMLElement>('*').forEach((element) => {
+    // The share is a document, not a snapshot of a scrolled tool viewport.
+    // Reset only the clone; the reader's live position stays untouched.
+    element.scrollTop = 0
+    element.scrollLeft = 0
     element.classList.remove(
       'msg-user--share-mode',
       'msg-user--share-selected',
@@ -494,6 +498,32 @@ function shareExportCss(): string {
     #${SHARE_STAGE_ID} .thinking-block__body {
       max-height: none !important;
       overflow-y: visible !important;
+    }
+
+    /* Include all currently rendered tool content. Retained log pagination is
+       deliberately not fetched here: any existing partial-content note stays
+       beside the loaded rows in the static image. */
+    #${SHARE_STAGE_ID} .activity-code-details,
+    #${SHARE_STAGE_ID} .activity-code-details__viewport,
+    #${SHARE_STAGE_ID} .activity-tool-details--bounded,
+    #${SHARE_STAGE_ID} .activity-tool-details__window {
+      height: auto !important;
+      max-height: none !important;
+      min-width: 0 !important;
+      max-width: 100% !important;
+      overflow: visible !important;
+      scrollbar-gutter: auto !important;
+    }
+
+    #${SHARE_STAGE_ID} .activity-code-details pre,
+    #${SHARE_STAGE_ID} .activity-code-details code,
+    #${SHARE_STAGE_ID} .activity-tool-details__preview {
+      width: 100% !important;
+      min-width: 0 !important;
+      max-width: 100% !important;
+      white-space: pre-wrap !important;
+      overflow-wrap: anywhere !important;
+      overflow: visible !important;
     }
 
     /* The live meta line is hover-dimmed; the static image has no hover. */

@@ -42,6 +42,7 @@ import { useChatTurnLog } from '@/composables/chat/useChatTurnLog'
 import type { ReasoningBlock } from '@/types/turnlog'
 import { isLegacySilentSentinelOnly } from '@/utils/chat/silentSentinels'
 import { createClientMessageId } from '@/utils/chat/messageIdentity'
+import { normalizeToolFileSnapshot } from '@/utils/chat/toolFileSnapshot'
 
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 630_000
 const THINKING_DELAY_MS = 400
@@ -1346,6 +1347,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         name: tc.name,
         result: content,
         executionLogHandle: payload.execution_log_handle,
+        fileSnapshot: isError ? undefined : normalizeToolFileSnapshot(payload.file_snapshot),
         isError,
         input,
         at: Date.now(),
@@ -1391,6 +1393,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       groupId: tc.groupId,
       result: tc.result,
       execution_log_handle: tc.executionLogHandle,
+      ...(tc.fileSnapshot && !tc.isError ? { file_snapshot: tc.fileSnapshot } : {}),
       is_error: tc.isError,
       isError: tc.isError,
       execution_status: tc.status ? { status: tc.status } : undefined,

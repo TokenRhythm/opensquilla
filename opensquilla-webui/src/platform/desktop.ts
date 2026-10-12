@@ -674,6 +674,8 @@ export function createDesktopPlatform(): Platform {
         ? { cancelAttachmentSelections: () => requireDesktopApi().cancelAttachmentSelections!() } : {}),
       ...(typeof window.opensquillaDesktop?.saveArtifact === 'function'
         ? { saveArtifact: payload => requireDesktopApi().saveArtifact!(payload) } : {}),
+      ...(typeof window.opensquillaDesktop?.saveAttachment === 'function'
+        ? { saveAttachment: payload => requireDesktopApi().saveAttachment!(payload) } : {}),
       ...(typeof window.opensquillaDesktop?.sourceFileAction === 'function'
         ? { sourceFileAction: payload => requireDesktopApi().sourceFileAction!(payload) } : {}),
       ...(typeof window.opensquillaDesktop?.workspaceFileAction === 'function'

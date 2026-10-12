@@ -6,6 +6,7 @@ import type {
   ChatSteerDisposition,
   ChatUsagePayload,
   ToolPresentation,
+  ToolFileSnapshot,
 } from '@/types/chat'
 
 /** Presentation facts accepted by the existing conversation reducer. Each fact
@@ -34,6 +35,7 @@ export type ConversationEventData = ConversationEventIdentity & {
   progress?: TaskProgressSnapshot
   modelCapacity?: import('./providerConfiguration').ModelCapacityFailure
   execution_log_handle?: string
+  file_snapshot?: ToolFileSnapshot
   reason?: string
   status?: string
   run_status?: string
@@ -200,7 +202,7 @@ export type ConversationEventContext = {
 
 type WithIdentity<K extends keyof ConversationEventData> = Pick<ConversationEventData, keyof ConversationEventIdentity | K>
 export type ConversationTextContent = WithIdentity<'text' | 'presentation' | 'model_call_id' | 'iteration' | 'text_truncated'>
-export type ConversationToolContent = WithIdentity<'id' | 'watchdogToolId' | 'name' | 'input' | 'input_delta' | 'arguments' | 'synthetic_from_text' | 'result' | 'approvalResult' | 'error' | 'is_error' | 'tool_presentation' | 'model_call_id' | 'iteration' | 'execution_log_handle'>
+export type ConversationToolContent = WithIdentity<'id' | 'watchdogToolId' | 'name' | 'input' | 'input_delta' | 'arguments' | 'synthetic_from_text' | 'result' | 'approvalResult' | 'error' | 'is_error' | 'tool_presentation' | 'model_call_id' | 'iteration' | 'execution_log_handle' | 'file_snapshot'>
 export type ConversationThinkingContent = WithIdentity<'text' | 'model_call_id' | 'iteration' | 'block_id' | 'block_index' | 'content_kind' | 'ended_at' | 'status'>
 export type ConversationCompactionContent = WithIdentity<'status' | 'compacted' | 'detail' | 'reason' | 'skip_reason' | 'source' | 'phase' | 'compaction_id' | 'sequence' | 'heartbeat' | 'heartbeat_at' | 'elapsed_ms' | 'stage' | 'refused' | 'safe_to_send' | 'applied' | 'durability' | 'user_visible' | 'intent'>
 /** The physical request model is optional for older Gateway producers. */

@@ -292,6 +292,7 @@ import { WORKSPACE_REFERENCES_KEY } from '@/modules/workspaceReferences'
 import { WORKSPACE_FILES_KEY } from '@/modules/workspaceFiles'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { createWorkspaceFileDefinition } from './workspaceFileProvider'
+import { createToolHistoryFileDefinition } from './toolHistoryFileProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
 import BrowserStartPanel from './BrowserStartPanel.vue'
 import { downloadBlob } from '@/utils/browser'
@@ -323,7 +324,7 @@ const referenceGateway = inject(GATEWAY_ACCESS_KEY, null)
 watch(() => [referenceGateway?.subscriptionEpoch, referenceGateway?.availability, referenceGateway?.isLocalOwner], () => {
   // A filesystem snapshot is valid only for the connection that authorized it.
   for (const item of [...store.items]) {
-    if (item.kind === 'file') store.closeItem(item.id, 'scope-changed')
+    if (item.kind === 'file' || item.kind === 'tool-file-history') store.closeItem(item.id, 'scope-changed')
   }
 })
 const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
@@ -528,6 +529,7 @@ if (workspaceReferences || workspaceFiles) {
     key => String(t(key)),
   ), { replace: true })
 }
+workbenchPanelRegistry.register(createToolHistoryFileDefinition(key => String(t(key)), artifactWorkbench.content), { replace: true })
 detachRuntime = attachWorkbenchRuntime(store, runtimeManager)
 const pageAnnotationSendQueue = new PageAnnotationSendQueue()
 let pageAnnotationSendFlush: Promise<void> | null = null

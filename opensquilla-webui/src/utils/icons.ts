@@ -11,7 +11,7 @@ export type IconName =
   | 'expand' | 'collapse'
   | 'panel-left-open' | 'panel-left-close' | 'panel-right-open' | 'panel-right-close'
   | 'sidebar-visible' | 'sidebar-hidden'
-  | 'clock' | 'microphone'
+  | 'clock' | 'microphone' | 'terminal'
   | 'cloud' | 'folder' | 'fileText' | 'fileCode' | 'image' | 'table' | 'externalLink'
   | 'keyboard' | 'languages' | 'shield' | 'lock'
   | 'target'
@@ -25,6 +25,7 @@ interface IconDef {
 }
 
 const ICONS: Record<IconName, IconDef> = {
+  terminal:   { path: '<path d="m4 5 6 7-6 7"/><path d="M13 19h7"/>', strokeWidth: 1.5 },
   chat:       { path: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>' },
   home:       { path: '<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>' },
   channels:   { path: '<rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>' },

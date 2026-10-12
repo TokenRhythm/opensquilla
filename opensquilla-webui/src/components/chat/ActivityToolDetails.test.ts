@@ -22,9 +22,6 @@ describe('ActivityToolDetails text hierarchy', () => {
     expect(ruleBody('.activity-tool-details__line--code')).toContain(
       'color: var(--text-muted);',
     )
-    expect(ruleBody('.activity-tool-details__fallback')).toContain(
-      'color: var(--text-muted);',
-    )
     const error = ruleBody('.activity-tool-details__line--error')
     expect(error).toContain('color: var(--text-muted);')
     expect(error).not.toContain('var(--danger)')
@@ -48,27 +45,12 @@ describe('ActivityToolDetails narrow-width layout', () => {
   })
 })
 
-describe('ActivityToolDetails interaction affordances', () => {
-  it('marks interactive target and code lines with a resting underline', () => {
-    const resting = ruleBody(
-      '.activity-tool-details__summary--interactive .activity-tool-details__line--target',
-    )
-    expect(resting).toContain('text-decoration: underline;')
-    expect(resting).toContain('text-decoration-style: dotted;')
-  })
-
-  it('gives the fallback affordance a real focus ring', () => {
-    const focused = ruleBody('.activity-tool-details__fallback:focus-visible')
-    expect(focused).toContain('box-shadow: var(--focus-ring);')
-  })
-})
-
 describe('ActivityToolDetails bounded window treatment', () => {
-  it('uses one borderless shadow container instead of nested cards', () => {
+  it('uses one scroll container without nested cards or a shadow layer', () => {
     const window = ruleBody('.activity-tool-details--bounded')
-    expect(window).toContain('max-height: min(20rem, 52vh);')
-    expect(window).toContain('border: 0;')
-    expect(window).toContain('box-shadow: var(--shadow-md);')
+    expect(window).toContain('max-height: min(20rem, 45vh);')
+    expect(window).toContain('border: 1px solid var(--border);')
+    expect(window).not.toContain('box-shadow:');
     expect(window).toContain('overflow: hidden;')
 
     const section = ruleBody('.activity-tool-details__section')
@@ -79,11 +61,10 @@ describe('ActivityToolDetails bounded window treatment', () => {
     expect(preview).toContain('background: transparent;')
   })
 
-  it('keeps the duplicate category title out and provides a bottom fade', () => {
+  it('does not mask retained content with a fade or a second disclosure', () => {
     expect(activityToolDetailsSource).not.toContain('activity-tool-details__title')
-    expect(ruleBody('.activity-tool-details__fade')).toContain(
-      'background: linear-gradient(to bottom, transparent, var(--bg-elevated));',
-    )
+    expect(activityToolDetailsSource).not.toContain('activity-tool-details__fade')
+    expect(activityToolDetailsSource).not.toContain('shared.runTrace.viewFull')
   })
 })
 

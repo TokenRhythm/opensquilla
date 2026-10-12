@@ -100,6 +100,7 @@
         :variant="variant"
         presentation="activity"
         :state-scope="stateScope"
+        :session-key="sessionKey"
         :is-tool-group-open="isToolGroupOpen"
         :is-tool-item-open="isToolItemOpen"
         :tool-group-status-text="toolGroupStatusText"
@@ -149,6 +150,7 @@ const props = withDefaults(defineProps<{
   toolElapsedText?: (call: ChatToolCallRenderItem) => string
   variant?: 'checklist'
   stateScope?: string
+  sessionKey?: string
   statusPosition?: 'all' | 'before-reasoning' | 'after-reasoning'
   showItems?: boolean
   preserveItemGroups?: boolean

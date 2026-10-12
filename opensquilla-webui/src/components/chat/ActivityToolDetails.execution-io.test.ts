@@ -84,7 +84,7 @@ describe('ActivityToolDetails execution I/O', () => {
       .toContain(reason)
   })
 
-  it('passes the I/O projection to the full result viewer', async () => {
+  it('keeps output and I/O fallback together without a second result viewer', async () => {
     const onShowResult = vi.fn()
     const { el } = await mountDetails(call({
       execution_id: 'fallback-1',
@@ -94,9 +94,10 @@ describe('ActivityToolDetails execution I/O', () => {
       output: 'ok',
     }), onShowResult)
 
-    el.querySelector<HTMLButtonElement>('.activity-tool-details__view')?.click()
-    await nextTick()
-    const context = onShowResult.mock.calls[0]?.[2] as { executionIo?: { kind?: string } } | undefined
-    expect(context?.executionIo?.kind).toBe('fallback')
+    expect(el.querySelector('.activity-tool-details__execution-io--fallback')?.textContent)
+      .toContain('PTY backend unavailable')
+    expect(el.querySelector('.activity-code-details__output')?.textContent).toBe('ok')
+    expect(el.querySelector('.activity-tool-details__view')).toBeNull()
+    expect(onShowResult).not.toHaveBeenCalled()
   })
 })

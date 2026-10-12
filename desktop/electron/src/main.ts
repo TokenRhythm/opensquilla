@@ -11,7 +11,7 @@ import { performance } from 'node:perf_hooks'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { NativeAttachmentSelections } from './native-attachments.js'
 import { chooseLocalFilePaths } from './native-path-picker.js'
-import { saveArtifactFile, performSourceFileAction, performWorkspaceFileAction, type SaveArtifactRequest, type SourceFileActionRequest, type WorkspaceFileActionRequest } from './resource-file-actions.js'
+import { saveArtifactFile, saveAttachmentFile, performSourceFileAction, performWorkspaceFileAction, type SaveArtifactRequest, type SaveAttachmentRequest, type SourceFileActionRequest, type WorkspaceFileActionRequest } from './resource-file-actions.js'
 import {
   DESKTOP_LOCALES,
   normalizeGatewayLocale,
@@ -13026,6 +13026,35 @@ ipcMain.handle('desktop:artifact:save', async (event, payload: SaveArtifactReque
     const choice = await dialog.showSaveDialog(window, { defaultPath: name })
     return choice.canceled ? null : choice.filePath || null
   })
+})
+ipcMain.handle('desktop:attachment:save', async (event, payload: SaveAttachmentRequest) => {
+  if (!trustedMainWindowControlIpc(event)) throw new Error('Untrusted attachment save request.')
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  event.sender.once('destroyed', abort)
+  try {
+    return await saveAttachmentFile(payload, {
+      signal: controller.signal,
+      connection: () => {
+        if (!trustedMainWindowControlIpc(event) || !gatewayState.owned || gatewayState.status !== 'ready') return null
+        const snapshot = desktopGatewayConnectionSnapshot()
+        if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken) return null
+        return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+          url: snapshot.httpUrl, authToken: snapshot.authToken }
+      },
+      choosePath: async name => {
+        const window = currentMainWindow()
+        if (!window) throw new Error('Main window unavailable')
+        const choice = await dialog.showSaveDialog(window, { defaultPath: name })
+        return choice.canceled ? null : choice.filePath || null
+      },
+    })
+  } catch {
+    // Local filesystem errors can contain host paths; keep them out of renderer IPC.
+    throw new Error('Attachment save failed')
+  } finally {
+    event.sender.removeListener('destroyed', abort)
+  }
 })
 ipcMain.handle('desktop:source-file:action', async (event, payload: SourceFileActionRequest) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted source file request.')

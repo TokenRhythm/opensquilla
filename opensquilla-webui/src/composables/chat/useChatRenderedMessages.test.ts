@@ -7,6 +7,7 @@ import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
 import type { TimeTranslator } from '@/utils/messageTime'
 import { workspacePreviewOpenAction, workspacePreviewsFromMessage } from '@/utils/chat/workspacePreviews'
+import { projectActivityToolDetail } from '@/utils/chat/activityToolDetails'
 
 function renderedMessagesForRouterVisualMode(
   visualMode: 'real_candidates' | 'legacy_grid',
@@ -84,6 +85,96 @@ describe('useChatRenderedMessages scheduled provenance', () => {
 
     expect(api.renderedMessages.value.map(message => message.provenanceKind))
       .toEqual(['cron', 'cron', undefined, undefined, 'cron'])
+  })
+})
+
+describe('historical tool result completeness', () => {
+  it.each(['persisted segments', 'activity snapshot', 'explicit timeline'].flatMap(mode =>
+    [false, true].map(referenced => ({ mode, referenced }))))(
+    'restores the file snapshot through $mode after input projection (reference=$referenced)', ({ mode, referenced }) => {
+      const snapshot = { kind: 'write' as const, path: 'index.html', content: '<p>complete</p>'.repeat(2000),
+        ...(referenced ? { sha256_ref: 'a'.repeat(64), bytes: 2_000_000 } : {}) }
+      const source: ChatMessage = {
+        role: 'assistant', text: '', ts: 1, restoredFromHistory: true,
+        tool_calls: [
+          { type: 'tool_use', tool_use_id: 'write-1', name: 'write_file', groupId: 'write-group',
+            input: { path: snapshot.path, content: '[historical_tool_argument_omitted]\nhead: partial' } },
+          { type: 'tool_result', tool_use_id: 'write-1', name: 'write_file', result: 'Written 28000 bytes',
+            file_snapshot: snapshot },
+        ],
+      }
+      if (mode === 'explicit timeline') source.timeline = [{ type: 'tool-group', groupId: 'write-group' }]
+      if (mode === 'activity snapshot') source.activitySnapshot = {
+        version: 2, taskId: 'history-turn', turnId: 'history-turn', complete: true, reasoningUtf16Length: 0,
+        entries: [{ type: 'segment', id: 'tool:write-1', order: 30,
+          segment_type: 'tool', tool_use_id: 'write-1', name: 'write_file' }],
+      }
+      const message = renderedMessagesFor([source]).renderedMessages.value[0]!
+      expect(message.toolCalls?.[0]?.fileSnapshot).toEqual(snapshot)
+      const timeline = message.timelineItems?.[0]
+      expect(timeline?.type).toBe('tool-group')
+      if (timeline?.type !== 'tool-group') throw new Error('Expected a file tool row')
+      const item = timeline.group.calls[0]!
+      expect(item.fileSnapshot).toEqual(snapshot)
+      expect(projectActivityToolDetail(item, 'file.write').codeView?.content).toBe(referenced ? '' : snapshot.content)
+    },
+  )
+
+  it.each(['persisted segments', 'activity snapshot', 'explicit timeline'] as const)(
+    'preserves retained-result metadata through %s',
+    mode => {
+      // Metadata shape from the installed z9x0q5gp README read. The file text is
+      // synthetic; only the actual retained/original lengths matter here.
+      const toolId = 'historical-read'
+      const result = 'x'.repeat(2000)
+      const source: ChatMessage = {
+        role: 'assistant', text: '', ts: 1, restoredFromHistory: true,
+        tool_calls: [
+          { type: 'tool_use', tool_use_id: toolId, name: 'read_file',
+            groupId: 'read-group', input: { path: 'README.md' } },
+          { type: 'tool_result', tool_use_id: toolId, name: 'read_file', result,
+            result_truncated: true, result_original_chars: 4186 },
+        ],
+      }
+      if (mode === 'explicit timeline') {
+        source.timeline = [{ type: 'tool-group', groupId: 'read-group' }]
+      }
+      if (mode === 'activity snapshot') {
+        source.activitySnapshot = {
+          version: 2, taskId: 'history-turn', turnId: 'history-turn', complete: true,
+          reasoningUtf16Length: 0,
+          entries: [{ type: 'segment', id: `tool:${toolId}`, order: 30,
+            segment_type: 'tool', tool_use_id: toolId, name: 'read_file' }],
+        }
+      }
+      const message = renderedMessagesFor([source]).renderedMessages.value[0]!
+      const expected = { toolId, result, resultTruncated: true, resultOriginalChars: 4186 }
+      expect(message.toolCalls?.[0]).toMatchObject(expected)
+      const timeline = message.timelineItems?.[0]
+      expect(timeline?.type).toBe('tool-group')
+      if (timeline?.type === 'tool-group') {
+        expect(timeline.group.calls[0]).toMatchObject(expected)
+        if (mode === 'activity snapshot') expect(timeline.activityOrder).toBe(30)
+      }
+      expect(source.tool_calls?.[1]?.result_truncated).toBe(true)
+      expect(source.tool_calls?.[1]?.result_original_chars).toBe(4186)
+    },
+  )
+
+  it('keeps explicit completeness false and ignores invalid original lengths', () => {
+    const message = renderedMessagesFor([{
+      role: 'assistant', text: '', ts: 1,
+      tool_calls: [{ type: 'tool_result', tool_use_id: 'complete-read', name: 'read_file',
+        result: 'retained output', resultTruncated: false, resultOriginalChars: -1 }],
+    }]).renderedMessages.value[0]!
+    expect(message.toolCalls?.[0]?.resultTruncated).toBe(false)
+    expect(message.toolCalls?.[0]?.resultOriginalChars).toBeUndefined()
+    const timeline = message.timelineItems?.[0]
+    expect(timeline?.type).toBe('tool-group')
+    if (timeline?.type === 'tool-group') {
+      expect(timeline.group.calls[0]?.resultTruncated).toBe(false)
+      expect(timeline.group.calls[0]?.resultOriginalChars).toBeUndefined()
+    }
   })
 })
 

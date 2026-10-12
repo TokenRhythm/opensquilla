@@ -255,6 +255,24 @@ describe('execution log inspection', () => {
     )
   })
 
+  it('accepts an exact-limit page of supplementary Unicode characters', async () => {
+    const harness = makeHarness()
+    harness.results.set(method, { ...firstPage, content: '🙂'.repeat(12000), returned_chars: 12000,
+      chars: 12000, next_offset: null })
+    const inspection = createV4SessionInspection(harness.rpc, { concurrentHistoryReads: () => true })
+    await expect(inspection.readExecutionLog('alpha', handle, 0)).resolves.toMatchObject({
+      content: '🙂'.repeat(12000), chars: 12000, nextOffset: null,
+    })
+  })
+
+  it('fast-rejects a huge page without scanning its code points', async () => {
+    const harness = makeHarness()
+    harness.results.set(method, { ...firstPage, content: 'x'.repeat(1000000), returned_chars: 1000000,
+      chars: 1000000, next_offset: null })
+    const inspection = createV4SessionInspection(harness.rpc, { concurrentHistoryReads: () => true })
+    await expect(inspection.readExecutionLog('alpha', handle, 0)).rejects.toThrow('requested limit')
+  })
+
   it('rejects invalid handles and offsets before making a request', async () => {
     const harness = makeHarness()
     const inspection = createV4SessionInspection(harness.rpc, { concurrentHistoryReads: () => true })

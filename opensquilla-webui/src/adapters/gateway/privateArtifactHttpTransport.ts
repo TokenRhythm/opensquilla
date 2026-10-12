@@ -95,6 +95,21 @@ export function runtimeAttachmentHttpBaseOrigin(): string {
   return runtimeArtifactHttpBaseOrigin()
 }
 
+/** Only retained, content-addressed session material can use the reference fallback. */
+export function attachmentReferenceHttpPath(sha256: unknown, locator?: { messageId: string; toolUseId: string }): string {
+  if (typeof sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(sha256)) return ''
+  const path = `/api/v1/attachments/${sha256.toLowerCase()}`
+  if (!locator) return path
+  if (!locator.messageId.trim() || !locator.toolUseId.trim()) return ''
+  const query = new URLSearchParams({ messageId: locator.messageId, toolUseId: locator.toolUseId })
+  return `${path}?${query}`
+}
+
+export function attachmentPreviewHttpPath(sha256: unknown, locator?: { messageId: string; toolUseId: string }): string {
+  const path = attachmentReferenceHttpPath(sha256, locator)
+  return path ? `${path}${path.includes('?') ? '&' : '?'}preview=1` : ''
+}
+
 function urlsShareArtifactOrigin(candidate: URL, base: URL): boolean {
   if (candidate.origin !== 'null' || base.origin !== 'null') {
     return candidate.origin === base.origin

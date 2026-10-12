@@ -3,6 +3,7 @@ import { normalizeTaskProgress } from '@/utils/chat/taskProgress'
 import type { ConversationCronResult, ConversationEventData, ConversationEventContext, ConversationRoutingSnapshot, ConversationUsage } from '@/modules/conversationEventContent'
 import type { ConversationEventProjection, ConversationSemanticEventKind } from '@/modules/conversationEvents'
 import { normalizeToolName, normalizeToolPresentation, toolResultIsError } from '@/utils/chat/toolDisplay'
+import { normalizeToolFileSnapshot } from '@/utils/chat/toolFileSnapshot'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 import { usageAccountingErrorCode } from '@/utils/chat/usageAccountingFailure'
 import type { DecodedConversationEvent } from './conversationEventsV4'
@@ -279,6 +280,10 @@ export function projectConversationContent(payload: unknown, kind?: Conversation
   }
   const toolPresentation = normalizeToolPresentation(source)
   if (toolPresentation) result.tool_presentation = toolPresentation
+  if (kind === 'tool-result' && !toolResultIsError(source)) {
+    const fileSnapshot = normalizeToolFileSnapshot(alias(source, 'file_snapshot'))
+    if (fileSnapshot) result.file_snapshot = fileSnapshot
+  }
   for (const key of ['active_task', 'last_task', 'changed_task']) {
     const value = task(source[key] || source[camel(key)])
     if (value !== undefined || key in source || camel(key) in source) result[key] = value

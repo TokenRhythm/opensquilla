@@ -259,6 +259,7 @@
                     :call="call"
                     :label="call.displayName"
                     :operation-key="operationKey(call)"
+                    :session-key="sessionKey"
                     @show-result="forwardShowResult"
                   />
                   <ToolRowSections
@@ -355,6 +356,7 @@
                   :call="call"
                   :label="item.group.label"
                   :operation-key="operationKey(call)"
+                  :session-key="sessionKey"
                   @show-result="forwardShowResult"
                 />
                 <ToolRowSections
@@ -778,6 +780,7 @@ const props = defineProps<{
   // History can preserve provider group and tool ids that repeat across
   // messages. Scope only ephemeral disclosure keys; render ids stay unchanged.
   stateScope?: string
+  sessionKey?: string
 }>()
 
 defineSlots<{

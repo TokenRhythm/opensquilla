@@ -1,4 +1,5 @@
 import { skillLoadsFromSegments } from '@/types/skillLoads'
+import { normalizeToolFileSnapshot } from '@/utils/chat/toolFileSnapshot'
 import { computed, type Ref } from 'vue'
 import type {
   ChatEnsembleMeta,
@@ -1603,6 +1604,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         call.isError = toolResultIsError(segment)
         call.status = call.isError ? 'error' : 'success'
         call.result = resultStr
+        Object.assign(call, toolResultMetadata(segment))
         if (typeof segment.execution_log_handle === 'string') {
           call.executionLogHandle = segment.execution_log_handle
         }
@@ -1929,6 +1931,27 @@ export function routerPanelDataset(mode: RouterVisualMode): string {
   return mode === 'legacy_grid' ? 'legacy-grid' : 'real-candidates'
 }
 
+function toolResultMetadata(value: {
+  resultTruncated?: unknown
+  resultOriginalChars?: unknown
+  result_truncated?: unknown
+  result_original_chars?: unknown
+  file_snapshot?: unknown
+  fileSnapshot?: unknown
+}): Pick<ChatToolCall, 'resultTruncated' | 'resultOriginalChars' | 'fileSnapshot'> {
+  const resultTruncated = value.resultTruncated ?? value.result_truncated
+  const resultOriginalChars = value.resultOriginalChars ?? value.result_original_chars
+  const fileSnapshot = normalizeToolFileSnapshot(value.fileSnapshot ?? value.file_snapshot)
+  return {
+    ...(fileSnapshot ? { fileSnapshot } : {}),
+    ...(typeof resultTruncated === 'boolean' ? { resultTruncated } : {}),
+    ...(typeof resultOriginalChars === 'number'
+      && Number.isSafeInteger(resultOriginalChars) && resultOriginalChars >= 0
+      ? { resultOriginalChars }
+      : {}),
+  }
+}
+
 function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall[] {
   if (!raw || !Array.isArray(raw)) return []
   const merged: ChatToolCall[] = []
@@ -1979,6 +2002,7 @@ function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall
       item.status = isError ? 'error' : 'success'
     }
     if (tc.sources !== undefined) item.sources = tc.sources
+    Object.assign(item, toolResultMetadata(tc))
     if (typeof tc.execution_log_handle === 'string') {
       item.executionLogHandle = tc.execution_log_handle
     }
@@ -2000,6 +2024,7 @@ function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall
     isError: item.isError,
     result: item.result,
     resultPreview: item.resultPreview,
+    ...toolResultMetadata(item),
     executionLogHandle: item.executionLogHandle,
     sources: item.sources,
     isOpen: false,

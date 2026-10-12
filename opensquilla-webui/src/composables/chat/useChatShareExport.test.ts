@@ -4,8 +4,14 @@ import { createApp, h, ref } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
+import ActivityCodeDetails from '@/components/chat/ActivityCodeDetails.vue'
+import ActivityToolDetails from '@/components/chat/ActivityToolDetails.vue'
+import activityCodeSource from '@/components/chat/ActivityCodeDetails.vue?raw'
+import activityToolSource from '@/components/chat/ActivityToolDetails.vue?raw'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
+import type { ActivityToolCodeView } from '@/utils/chat/activityToolDetails'
+import type { ChatToolCallRenderItem } from '@/types/chat'
 import { useChatTextRendering } from './useChatTextRendering'
 import { buildShareDom, staticAssetUrl, useChatShareExport } from './useChatShareExport'
 
@@ -353,6 +359,102 @@ describe('buildShareDom protocol-shaped documentation', () => {
     expect(stage.textContent).not.toContain('Hidden legacy output')
     expect(stage.textContent).toContain('Visible legacy output')
     expect(stage.textContent?.match(/Canonical answer/g)).toHaveLength(1)
+  })
+})
+
+describe('share export expanded tool content', () => {
+  const apps: ReturnType<typeof createApp>[] = []
+
+  afterEach(() => {
+    while (apps.length) apps.pop()?.unmount()
+    document.body.innerHTML = ''
+  })
+
+  function mountTool(render: () => ReturnType<typeof h>) {
+    const host = document.createElement('article')
+    host.dataset.shareMessageId = 'expanded-tool'
+    document.body.appendChild(host)
+    // Use the real renderer and its live stylesheet so the export must undo
+    // the actual capped/scrolling treatment, not a synthetic export fixture.
+    const style = document.createElement('style')
+    style.textContent = [activityCodeSource, activityToolSource]
+      .map(source => source.match(/<style[^>]*>([\s\S]*?)<\/style>/)?.[1] || '')
+      .join('\n')
+    document.body.appendChild(style)
+    const app = createApp({ render })
+    app.use(i18n)
+    app.mount(host)
+    apps.push(app)
+    return host
+  }
+
+  const longLine = `long-line-${'abcdef'.repeat(150)}-line-end`
+  const retainedText = ['first-loaded-line', longLine,
+    ...Array.from({ length: 80 }, (_, index) => `loaded line ${index}`), 'last-loaded-line'].join('\n')
+
+  it.each<ActivityToolCodeView>([
+    { kind: 'command', command: `echo ${longLine}`, output: retainedText, exitCode: 1, partial: true },
+    { kind: 'write', path: 'generated.html', language: 'html', content: retainedText },
+    { kind: 'edit', path: 'generated.svg', content: `--- before\n+++ after\n-${longLine}\n+${retainedText}` },
+  ])('exports every loaded $kind line without cropping or changing the live viewport', (view) => {
+    const host = mountTool(() => h(ActivityCodeDetails, { view }))
+    const original = host.querySelector<HTMLElement>('.activity-code-details__viewport')!
+    original.scrollTop = 260
+    original.scrollLeft = 170
+    const originalHtml = host.innerHTML
+    expect(getComputedStyle(original).overflow).toBe('auto')
+
+    const stage = buildShareDom([host])
+    document.body.appendChild(stage)
+    const shared = stage.querySelector<HTMLElement>('.activity-code-details__viewport')!
+    const viewportStyle = getComputedStyle(shared)
+    expect(shared.textContent).toBe(original.textContent)
+    expect(shared.textContent).toContain('first-loaded-line')
+    expect(shared.textContent).toContain('last-loaded-line')
+    expect(shared.textContent).toContain(longLine)
+    expect(viewportStyle.maxHeight).toBe('none')
+    expect(viewportStyle.overflow).toBe('visible')
+    expect(shared.scrollTop).toBe(0)
+    expect(shared.scrollLeft).toBe(0)
+    for (const code of shared.querySelectorAll<HTMLElement>('pre, code')) {
+      const style = getComputedStyle(code)
+      expect(style.whiteSpace).toBe('pre-wrap')
+      expect(style.overflowWrap).toBe('anywhere')
+      expect(style.width).toBe('100%')
+    }
+    // Retained-log incompleteness remains honest; exporting never fetches the
+    // missing pages or pretends the loaded rows are the complete result.
+    if (view.partial) expect(shared.querySelector('.activity-code-details__note')?.textContent)
+      .toBe(original.querySelector('.activity-code-details__note')?.textContent)
+    expect(stage.querySelector('[data-share-control]')).toBeNull()
+    expect(host.innerHTML).toBe(originalHtml)
+    expect(original.scrollTop).toBe(260)
+    expect(original.scrollLeft).toBe(170)
+    expect(getComputedStyle(original).overflow).toBe('auto')
+  })
+
+  it('uncaps both layers of a generic tool result and keeps its last loaded row', () => {
+    const call: ChatToolCallRenderItem = {
+      toolId: 'generic', renderKey: 'generic', name: 'custom_tool', displayName: 'Custom tool',
+      inputRaw: '', inputPreview: '', result: retainedText, resultPreview: retainedText.slice(0, 200),
+      isRunning: false, status: 'success', isError: false, isOpen: true,
+    }
+    const host = mountTool(() => h(ActivityToolDetails, { call, operationKey: 'tool.custom', label: 'Custom tool' }))
+    const original = host.querySelector<HTMLElement>('.activity-tool-details__window')!
+    original.scrollTop = 500
+    const stage = buildShareDom([host])
+    document.body.appendChild(stage)
+
+    for (const selector of ['.activity-tool-details--bounded', '.activity-tool-details__window']) {
+      const element = stage.querySelector<HTMLElement>(selector)!
+      expect(getComputedStyle(element).maxHeight).toBe('none')
+      expect(getComputedStyle(element).overflow).toBe('visible')
+      expect(element.scrollTop).toBe(0)
+    }
+    expect(stage.querySelector('.activity-tool-details__preview')?.textContent).toBe(retainedText)
+    expect(stage.querySelector('[data-share-control]')).toBeNull()
+    expect(original.scrollTop).toBe(500)
+    expect(host.querySelector('[data-testid="activity-tool-detail-copy"]')).not.toBeNull()
   })
 })
 
