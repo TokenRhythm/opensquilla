@@ -4632,7 +4632,9 @@
       "actionToggleTheme": "テーマを切り替え"
     },
     "toast": {
-      "dismiss": "通知を閉じる"
+      "dismiss": "通知を閉じる",
+      "actionPending": "処理中…",
+      "actionFailed": "操作を完了できませんでした。もう一度お試しください。"
     },
     "confirm": {
       "defaultPrimary": "確認"

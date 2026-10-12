@@ -335,7 +335,7 @@
   </nav>
 
   <Teleport to="body">
-    <ToastHost />
+    <ToastHost :mobile-tabbar-visible="!mobileKeyboardOpen" />
   </Teleport>
 
   <ConfirmModal />

@@ -4632,7 +4632,9 @@
       "actionToggleTheme": "Toggle theme"
     },
     "toast": {
-      "dismiss": "Dismiss notification"
+      "dismiss": "Dismiss notification",
+      "actionPending": "Working…",
+      "actionFailed": "The action could not be completed. Please try again."
     },
     "confirm": {
       "defaultPrimary": "Confirm"

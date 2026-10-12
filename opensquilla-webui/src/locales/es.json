@@ -4632,7 +4632,9 @@
       "actionToggleTheme": "Cambiar tema"
     },
     "toast": {
-      "dismiss": "Descartar notificación"
+      "dismiss": "Descartar notificación",
+      "actionPending": "Procesando…",
+      "actionFailed": "No se pudo completar la acción. Inténtalo de nuevo."
     },
     "confirm": {
       "defaultPrimary": "Confirmar"

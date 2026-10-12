@@ -4632,7 +4632,9 @@
       "actionToggleTheme": "切换主题"
     },
     "toast": {
-      "dismiss": "关闭通知"
+      "dismiss": "关闭通知",
+      "actionPending": "处理中…",
+      "actionFailed": "操作暂时未完成，请重试。"
     },
     "confirm": {
       "defaultPrimary": "确定"

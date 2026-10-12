@@ -4632,7 +4632,9 @@
       "actionToggleTheme": "Design umschalten"
     },
     "toast": {
-      "dismiss": "Benachrichtigung schließen"
+      "dismiss": "Benachrichtigung schließen",
+      "actionPending": "Wird ausgeführt…",
+      "actionFailed": "Die Aktion konnte nicht abgeschlossen werden. Bitte versuchen Sie es erneut."
     },
     "confirm": {
       "defaultPrimary": "Bestätigen"

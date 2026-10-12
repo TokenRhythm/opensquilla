@@ -4632,7 +4632,9 @@
       "actionToggleTheme": "Basculer le thème"
     },
     "toast": {
-      "dismiss": "Ignorer la notification"
+      "dismiss": "Ignorer la notification",
+      "actionPending": "En cours…",
+      "actionFailed": "L’action n’a pas pu être terminée. Veuillez réessayer."
     },
     "confirm": {
       "defaultPrimary": "Confirmer"
