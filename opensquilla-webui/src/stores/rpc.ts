@@ -136,13 +136,14 @@ export const useRpcStore = defineStore('rpc', () => {
     if (deliveryOriginSalt && (event.key === DELIVERY_SALT_KEY || event.key === null)
       && event.newValue !== deliveryOriginSalt) beginDeliveryIntent(null)
   }
-  window.addEventListener('storage', onDeliverySaltChanged)
+  const deliverySaltEventTarget = typeof window === 'undefined' ? null : window
+  deliverySaltEventTarget?.addEventListener('storage', onDeliverySaltChanged)
 
   onScopeDispose(() => {
     connectionDesired = false
     deliveryProof = null
     deliveryContext.value = null
-    window.removeEventListener('storage', onDeliverySaltChanged)
+    deliverySaltEventTarget?.removeEventListener('storage', onDeliverySaltChanged)
     cancelDescriptorRecovery()
     for (const unsubscribe of connectionSubscriptions.splice(0)) unsubscribe()
     client.value?.disconnect()

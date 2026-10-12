@@ -80,6 +80,10 @@ describe('useProjectWorkspaces', () => {
     setActivePinia(createPinia())
   })
 
+  it('creates the RPC store without browser globals', () => {
+    expect(useRpcStore().state).toBe('disconnected')
+  })
+
   it('distinguishes an unavailable project list from a successfully empty list', async () => {
     const rpc = useRpcStore()
     connectOwner(rpc)
