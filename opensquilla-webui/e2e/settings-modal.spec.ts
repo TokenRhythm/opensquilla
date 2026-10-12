@@ -28,6 +28,34 @@ async function openFromSidebar(page: import('@playwright/test').Page) {
   await page.waitForSelector('.conn-pill', { timeout: 10000 })
   await settingsRow(page).click()
   await expect(dialog(page)).toBeVisible()
+  await expect(dialog(page)).toHaveAccessibleName('Settings')
+}
+
+async function expectModelServiceLoaded(page: import('@playwright/test').Page) {
+  await expect(railTab(page, 'Model Service')).toHaveAttribute('aria-selected', 'true')
+  await expect(dialog(page).locator('.setup-provider-page')).toBeVisible()
+  await expect(dialog(page).locator('.settings-loading')).toHaveCount(0)
+}
+
+async function chooseSelectValue(page: import('@playwright/test').Page, name: string, value: string) {
+  const select = dialog(page).locator(`select[name="${name}"]`)
+  const label = await select.locator(`option[value="${value}"]`).textContent()
+  await select.locator('..').getByRole('combobox').click()
+  await dialog(page).getByRole('option', { name: label!.trim(), exact: true }).click()
+}
+
+async function editSearchProvider(page: import('@playwright/test').Page) {
+  await railTab(page, 'Capabilities').click()
+  const trigger = dialog(page).getByRole('button', { name: /^Web search/ })
+  if (await trigger.getAttribute('aria-expanded') !== 'true') await trigger.click()
+  const field = dialog(page).locator('select[name="setup_search_provider"]')
+  const original = await field.inputValue()
+  const next = await field.locator('option').evaluateAll((options, value) =>
+    (options as HTMLOptionElement[]).find(option => !option.disabled && option.value !== value)?.value,
+  original)
+  expect(next).toBeTruthy()
+  await chooseSelectValue(page, 'setup_search_provider', next!)
+  return { field, original }
 }
 
 test.describe('Settings modal', () => {
@@ -35,7 +63,7 @@ test.describe('Settings modal', () => {
     await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
   })
 
-  test('opens from the sidebar with the curated section rail and readiness banner', async ({ page }) => {
+  test('opens from the sidebar with AI configuration first and local readiness status', async ({ page }) => {
     await openFromSidebar(page)
 
     // Dialog a11y: focus moves into the modal on open, before any interaction.
@@ -52,16 +80,10 @@ test.describe('Settings modal', () => {
       await expect(dialog(page).getByRole('tab', { name, exact: true })).toBeVisible()
     }
 
-    // Readiness banner: quiet ready line or actionable count.
-    const banner = dialog(page).locator('.settings-banner')
-    await expect(banner).toBeVisible()
-    await expect(banner.locator('.settings-banner__row')).toContainText(/Ready to run|Action needed \(\d+\)/)
-
-    // CLI handoff disclosure expands with command groups and the config summary.
-    await banner.getByRole('button', { name: 'CLI handoff' }).click()
-    await expect(banner.locator('.setup-cli__group', { hasText: 'CLI handoff' })).toBeVisible()
-    await expect(banner.locator('.setup-cli__group', { hasText: 'CLI recipes' })).toBeVisible()
-    await expect(banner.locator('.setup-summary')).toContainText('Provider')
+    await expectModelServiceLoaded(page)
+    await expect(railTab(page, 'Model Service')).toHaveAttribute('aria-label', /Model Service: (Ready|Needs action|Review)/)
+    await expect(dialog(page).locator('.settings-banner')).toHaveCount(0)
+    await expect(dialog(page).getByRole('button', { name: 'CLI handoff' })).toHaveCount(0)
   })
 
   test('no YAML editor, raw key search, or guided-setup wording anywhere', async ({ page }) => {
@@ -180,7 +202,7 @@ test.describe('Settings modal', () => {
   test('keeps the SettingsDialog mounted when routing from default settings to a section', async ({ page }) => {
     await openFromSidebar(page)
     await expect(page).toHaveURL(/\/settings$/)
-    await expect(dialog(page).locator('.settings-banner')).toBeVisible()
+    await expectModelServiceLoaded(page)
     await expect(dialog(page).locator('.settings-loading')).toHaveCount(0)
 
     await page.evaluate(() => {
@@ -258,7 +280,7 @@ test.describe('Settings modal', () => {
 
     await settingsRow(page).click()
     await expect(dialog(page)).toBeVisible()
-    await expect(dialog(page).locator('.settings-banner')).toBeVisible()
+    await expectModelServiceLoaded(page)
     await page.waitForTimeout(200)
 
     const probe = await page.evaluate(() => {
@@ -280,26 +302,29 @@ test.describe('Settings modal', () => {
     expect(probe.routeFadeSeen).toBe(false)
   })
 
-  test('Model Routing section saves the routing panel style', async ({ page }) => {
+  test('Model Routing saves its fallback tier through the current dropdown', async ({ page }) => {
     test.setTimeout(90000)
     await openFromSidebar(page)
 
-    const visualMode = () => dialog(page).locator('select[name="setup_model_strategy_router_visual_mode"]')
+    const fallbackTier = () => dialog(page).locator('select[name="setup_model_strategy_router_default_tier"]')
+    const tierTrigger = () => fallbackTier().locator('..').getByRole('combobox')
+    const chooseTier = (value: string) => chooseSelectValue(page, 'setup_model_strategy_router_default_tier', value)
     const dirtybar = dialog(page).locator('.settings-dirtybar')
 
     await railTab(page, 'Model Routing').click()
     // The picker rides with the router details, so make the router strategy
     // active first if the gateway under test starts on another strategy (the
-    // strategy choice is then saved along with the style — acceptable for the
+    // strategy choice is then saved along with the tier — acceptable for the
     // disposable gateways this suite runs against).
     const routerCard = dialog(page).locator('[data-strategy-id="router"]')
     await expect(routerCard).toBeVisible()
     if ((await routerCard.getAttribute('aria-checked')) !== 'true') await routerCard.click()
-    await expect(visualMode()).toBeVisible()
-    const initial = await visualMode().inputValue()
-    const next = initial === 'legacy_grid' ? 'real_candidates' : 'legacy_grid'
+    await dialog(page).getByTestId('router-advanced-options').locator('summary').click()
+    await expect(tierTrigger()).toBeVisible()
+    const initial = await fallbackTier().inputValue()
+    const next = initial === 'c0' ? 'c1' : 'c0'
 
-    await visualMode().selectOption(next)
+    await chooseTier(next)
     await expect(dirtybar).toBeVisible()
     await expect(dirtybar).toContainText('Unsaved changes in Model Routing')
     await dirtybar.getByRole('button', { name: 'Save' }).click()
@@ -310,9 +335,10 @@ test.describe('Settings modal', () => {
     await page.waitForSelector('.conn-pill', { timeout: 10000 })
     await expect(dialog(page)).toBeVisible()
     await railTab(page, 'Model Routing').click()
-    await expect(visualMode()).toHaveValue(next)
+    await dialog(page).getByTestId('router-advanced-options').locator('summary').click()
+    await expect(fallbackTier()).toHaveValue(next)
 
-    await visualMode().selectOption(initial)
+    await chooseTier(initial)
     await dirtybar.getByRole('button', { name: 'Save' }).click()
     await expect(dirtybar).toBeHidden({ timeout: 10000 })
   })
@@ -378,7 +404,7 @@ test.describe('Settings modal', () => {
     await expect(railTab(page, 'Model Service')).toHaveAttribute('aria-selected', 'true')
   })
 
-  test('/setup deep link redirects into the overlay on the first not-ready section', async ({ page }) => {
+  test('/setup deep link opens the readiness-selected AI configuration section', async ({ page }) => {
     await page.goto(CONTROL_URL + 'setup')
     await page.waitForSelector('.conn-pill', { timeout: 10000 })
 
@@ -386,27 +412,21 @@ test.describe('Settings modal', () => {
     // /setup redirects to /settings/auto (first not-ready section).
     await expect(page).toHaveURL(/\/settings\/auto$/)
 
-    // The selected tab matches the readiness state: with everything ready it
-    // is Model Service, otherwise the first section whose rail dot needs action.
-    await expect(dialog(page).getByRole('tab', { selected: true })).toHaveCount(1)
-    const banner = dialog(page).locator('.settings-banner')
-    const ready = await banner.locator('.settings-banner__row').textContent()
-    if (ready && ready.includes('Ready to run')) {
-      await expect(railTab(page, 'Model Service')).toHaveAttribute('aria-selected', 'true')
-    } else {
-      const selected = dialog(page).getByRole('tab', { selected: true })
-      await expect(selected).toHaveAttribute('aria-label', /Needs action|Provider first|Missing/)
-    }
+    // Optional capability diagnostics stay in their own panel. The automatic
+    // destination remains an AI section with an accessible, associated panel.
+    const selected = dialog(page).getByRole('tab', { selected: true })
+    await expect(selected).toHaveCount(1)
+    await expect(selected).toHaveAttribute('id', /^settings-rail-(provider|modelStrategy|capabilities)$/)
+    await expect(dialog(page).getByRole('tabpanel')).toBeVisible()
+    await expect(dialog(page).getByRole('tabpanel')).toHaveAttribute('aria-labelledby', await selected.getAttribute('id') || '')
+    await expect(dialog(page).locator('.settings-loading')).toHaveCount(0)
+    await expect(dialog(page).locator('.settings-banner')).toHaveCount(0)
   })
 
   test('dirty edits raise the bar, guard close, and Discard restores values', async ({ page }) => {
     await openFromSidebar(page)
 
-    await railTab(page, 'Capabilities').click()
-    const maxResults = dialog(page).locator('input[name="setup_search_max_results"]')
-    await expect(maxResults).toBeVisible()
-    const original = await maxResults.inputValue()
-    await maxResults.fill(String(Number(original || '5') + 3))
+    const { field, original } = await editSearchProvider(page)
 
     const dirtybar = dialog(page).locator('.settings-dirtybar')
     await expect(dirtybar).toBeVisible()
@@ -422,18 +442,14 @@ test.describe('Settings modal', () => {
 
     await dirtybar.getByRole('button', { name: 'Discard' }).click()
     await expect(dirtybar).toBeHidden()
-    await expect(maxResults).toHaveValue(original)
+    await expect(field).toHaveValue(original)
   })
 
   test('history Back with dirty edits raises the discard confirm instead of silently closing', async ({ page }) => {
     await openFromSidebar(page)
 
-    await railTab(page, 'Capabilities').click()
+    const { field, original } = await editSearchProvider(page)
     await expect(page).toHaveURL(/\/settings\/capabilities$/)
-    const maxResults = dialog(page).locator('input[name="setup_search_max_results"]')
-    await expect(maxResults).toBeVisible()
-    const original = await maxResults.inputValue()
-    await maxResults.fill(String(Number(original || '5') + 3))
     await expect(dialog(page).locator('.settings-dirtybar')).toBeVisible()
 
     // History traversal (browser Back, a trackpad back-swipe) unmounts the
@@ -447,7 +463,7 @@ test.describe('Settings modal', () => {
     await expect(confirm).toBeHidden()
     await expect(dialog(page)).toBeVisible()
     await expect(page).toHaveURL(/\/settings\/capabilities$/)
-    await expect(maxResults).not.toHaveValue(original)
+    await expect(field).not.toHaveValue(original)
 
     // Accepting the discard lets the same Back proceed and close the overlay.
     await page.goBack()
@@ -563,10 +579,7 @@ test.describe('Settings modal', () => {
     await openFromSidebar(page)
     await railTab(page, 'Capabilities').click()
     await expect(dialog(page).getByRole('heading', { name: 'Web search' })).toBeVisible()
-
-    // Open the advanced search disclosure so its toggles render.
-    const advanced = dialog(page).getByText('Advanced search options')
-    if (await advanced.count()) await advanced.click()
+    await dialog(page).getByRole('button', { name: /^Image generation/ }).click()
 
     const checkboxes = dialog(page).locator('input[type="checkbox"]')
     const total = await checkboxes.count()
@@ -575,14 +588,14 @@ test.describe('Settings modal', () => {
     expect(await switches.count()).toBe(total)
   })
 
-  test('Appearance section applies theme instantly without a dirty bar', async ({ page }) => {
+  test('Interface section applies theme instantly without a dirty bar', async ({ page }) => {
     await openFromSidebar(page)
 
-    const appearanceTab = dialog(page).getByRole('tab', { name: 'Appearance' })
+    const appearanceTab = dialog(page).getByRole('tab', { name: 'Interface', exact: true })
     await expect(appearanceTab).toBeVisible()
     await appearanceTab.click()
     await expect(appearanceTab).toHaveAttribute('aria-selected', 'true')
-    await expect(dialog(page).getByRole('heading', { name: 'Appearance' })).toBeVisible()
+    await expect(dialog(page).getByRole('heading', { name: 'Interface', exact: true })).toBeVisible()
 
     // Theme radios flip the live document theme with no save step, and persist
     // to the same store the sidebar shortcut reads.
@@ -597,7 +610,7 @@ test.describe('Settings modal', () => {
 
     // Visual effects are a low-frequency browser preference and live here
     // instead of adding another popover to the chat composer.
-    const visualEffects = dialog(page).getByRole('switch', { name: 'Visual effects' })
+    const visualEffects = dialog(page).getByRole('switch', { name: 'Model routing display' })
     await expect(visualEffects).toBeVisible()
     await visualEffects.click()
     await expect(visualEffects).not.toBeChecked()
@@ -609,9 +622,9 @@ test.describe('Settings modal', () => {
     await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()
   })
 
-  test('Appearance persists the tool-detail default without a save step', async ({ page }) => {
+  test('Interface persists the tool-detail default without a save step', async ({ page }) => {
     await openFromSidebar(page)
-    await dialog(page).getByRole('tab', { name: 'Appearance' }).click()
+    await dialog(page).getByRole('tab', { name: 'Interface', exact: true }).click()
 
     const collapsed = dialog(page).getByRole('radio', { name: 'Collapsed by default', exact: true })
     const expanded = dialog(page).getByRole('radio', { name: 'Expanded by default', exact: true })

@@ -48,17 +48,13 @@ async function mountPanel(
 }
 
 function findCloseBehaviorSelect(el: HTMLElement): HTMLSelectElement {
-  const select = el.querySelector<HTMLSelectElement>(
-    '[data-testid="desktop-close-behavior-select"]',
-  )
+  const select = el.querySelector('[data-testid="desktop-close-behavior-select"]')?.closest('.control-select')?.querySelector<HTMLSelectElement>('select')
   if (!select) throw new Error('Desktop close behavior select was not rendered')
   return select
 }
 
 function findPreviewModeSelect(el: HTMLElement): HTMLSelectElement {
-  const select = el.querySelector<HTMLSelectElement>(
-    '[data-testid="desktop-preview-mode-select"]',
-  )
+  const select = el.querySelector('[data-testid="desktop-preview-mode-select"]')?.closest('.control-select')?.querySelector<HTMLSelectElement>('select')
   if (!select) throw new Error('Desktop preview mode select was not rendered')
   return select
 }
@@ -98,8 +94,14 @@ describe('DesktopRuntimePanel close behavior preference', () => {
     const label = el.querySelector<HTMLLabelElement>('.control-row__label')
     expect(label?.getAttribute('for')).toBe('desktop-close-behavior-select')
 
-    select.value = 'ask'
-    select.dispatchEvent(new Event('change', { bubbles: true }))
+    const trigger = el.querySelector<HTMLButtonElement>('[data-testid="desktop-close-behavior-select"]')!
+    expect(trigger.getAttribute('role')).toBe('combobox')
+    trigger.click()
+    await settle()
+    const ask = Array.from(el.querySelectorAll<HTMLElement>('[role="option"]'))
+      .find(option => option.textContent?.includes('Ask every time'))!
+    expect(ask).toBeTruthy()
+    ask.click()
     await settle()
 
     expect(saveDesktopPreferences).toHaveBeenCalledWith({

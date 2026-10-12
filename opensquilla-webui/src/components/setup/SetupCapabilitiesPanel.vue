@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import ControlSelect from '@/components/ControlSelect.vue'
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
@@ -279,16 +280,18 @@ function resetLabel(capabilityId: CapabilityId): string {
         <p class="capability-card__description">{{ capability.status }}</p>
 
         <template v-if="capability.id === 'search'">
-          <label class="control-row">
+          <label class="control-row" for="setup-search-provider">
             <div class="control-row__label-block">
               <span class="control-row__label">{{ t('setup.common.provider') }}</span>
               <span class="control-row__desc">{{ t('setup.capabilities.searchProviderHint') }}</span>
             </div>
             <div class="control-row__control">
-              <select
+              <ControlSelect
                 class="control-input"
                 :value="panel.form.searchProvider"
+                id="setup-search-provider"
                 name="setup_search_provider"
+                :aria-label="t('setup.common.provider')"
                 @change="onSearchProviderSelect"
               >
                 <option
@@ -296,7 +299,7 @@ function resetLabel(capabilityId: CapabilityId): string {
                   :key="provider.providerId"
                   :value="provider.providerId"
                 >{{ searchProviderLabel(provider) }}</option>
-              </select>
+              </ControlSelect>
             </div>
           </label>
           <p
@@ -361,14 +364,15 @@ function resetLabel(capabilityId: CapabilityId): string {
             </div>
           </div>
           <template v-if="panel.form.imageEnabled">
-            <label class="control-row">
+            <label class="control-row" for="setup-image-provider">
             <div class="control-row__label-block">
               <span class="control-row__label">{{ t('setup.common.provider') }}</span>
             </div>
             <div class="control-row__control">
-              <select
+              <ControlSelect
                 class="control-input"
                 :value="panel.form.imageProvider"
+                id="setup-image-provider"
                 name="setup_image_provider"
                 :aria-label="t('setup.capabilities.imageProviderSelectLabel')"
                 @change="onImageProviderSelect"
@@ -402,7 +406,7 @@ function resetLabel(capabilityId: CapabilityId): string {
                     :value="provider.providerId"
                   >{{ provider.label }}</option>
                 </optgroup>
-              </select>
+              </ControlSelect>
             </div>
           </label>
           <aside

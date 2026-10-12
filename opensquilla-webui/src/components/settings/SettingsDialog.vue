@@ -574,10 +574,13 @@ async function focusSearchResult(id: string, labelKey: string): Promise<void> {
   const row = matched?.closest<HTMLElement>('.control-row, .capability-card')
   // A section-only result must not focus an unrelated action at the top of
   // that section. Exact setting rows can focus their own native control.
-  const target = explicitTarget
+  const candidate = explicitTarget
     ?? row?.querySelector<HTMLElement>('input:not(:disabled), select:not(:disabled), button:not(:disabled)')
     ?? matched
     ?? panel
+  const target = candidate.matches('.control-select__native')
+    ? candidate.closest('.control-select')?.querySelector<HTMLElement>('.control-select__trigger') ?? candidate
+    : candidate
   // Search can target fields inside a collapsed connection disclosure. Open
   // every enclosing details element before scrolling or moving keyboard focus.
   for (let disclosure = target.closest<HTMLDetailsElement>('details'); disclosure;

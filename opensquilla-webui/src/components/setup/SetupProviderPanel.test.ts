@@ -2670,12 +2670,21 @@ describe('primary thinking control', () => {
       editor.querySelector<HTMLButtonElement>('.model-capacity-menu')!.click()
       await Promise.resolve(); await nextTick(); await nextTick()
       const dialog = document.querySelector('.model-capacity-dialog')!
-      const control = dialog.querySelector<HTMLSelectElement>('[data-testid="model-thinking-level"]')!
-      expect(control.value).toBe('high')
-      expect(Array.from(control.options, option => option.value)).toEqual(['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
-      control.value = ''
-      control.dispatchEvent(new Event('change', { bubbles: true }))
-      await nextTick()
+      const control = dialog.querySelector<HTMLButtonElement>('[data-testid="model-thinking-level"][role="combobox"]')!
+      const native = control.closest('.control-select')!.querySelector('select')!
+      expect(native.value).toBe('high')
+      expect(control.textContent).toContain('high')
+      expect(Array.from(native.options, option => option.value)).toEqual(['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+      control.click(); await nextTick(); await nextTick()
+      const list = document.getElementById(control.getAttribute('aria-controls')!)!
+      const choices = [...list.querySelectorAll<HTMLElement>('[role="option"]')]
+      const defaultLabel = i18n.global.t('setup.provider.thinkingDefault')
+      expect(choices.map(choice => choice.textContent?.trim())).toEqual([defaultLabel, 'off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+      expect(choices.find(choice => choice.getAttribute('aria-selected') === 'true')?.textContent?.trim()).toBe('high')
+      choices[0]!.click(); await nextTick(); await nextTick()
+      expect(control.getAttribute('aria-expanded')).toBe('false')
+      expect(control.textContent).toContain(defaultLabel)
+      expect(native.value).toBe('')
       expect(onUpdateLlmThinking).not.toHaveBeenCalled()
       dialog.querySelector<HTMLButtonElement>('.btn--primary')!.click()
       expect(onUpdateLlmThinking).toHaveBeenCalledWith('')

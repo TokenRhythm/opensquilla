@@ -152,6 +152,38 @@ afterEach(() => {
 })
 
 describe('SetupModelCombobox', () => {
+  it.each([1, 2])('selects the last model on the first ArrowUp with %s models', async count => {
+    const onUpdate = vi.fn()
+    const { el } = await mountCombobox({ models: MODELS.slice(0, count), onUpdate })
+    const input = await openList(el)
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }))
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    await nextTick()
+    expect(onUpdate).toHaveBeenCalledExactlyOnceWith(MODELS[count - 1]!.id)
+  })
+
+  it.each(['isComposing', 'keyCode'])('leaves IME Enter, arrows and Escape to the input method (%s)', async mode => {
+    const onUpdate = vi.fn()
+    const { el } = await mountCombobox({ onUpdate })
+    const input = await openList(el)
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
+    await nextTick()
+    const initialActive = input.getAttribute('aria-activedescendant')
+    const parentKeydown = vi.fn()
+    el.addEventListener('keydown', parentKeydown)
+    for (const key of ['Enter', 'ArrowDown', 'ArrowUp', 'Escape']) {
+      const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, isComposing: mode === 'isComposing' })
+      if (mode === 'keyCode') Object.defineProperty(event, 'keyCode', { value: 229 })
+      input.dispatchEvent(event)
+      await nextTick()
+      expect(event.defaultPrevented).toBe(false)
+      expect(input.getAttribute('aria-activedescendant')).toBe(initialActive)
+      expect(listbox()).not.toBeNull()
+    }
+    expect(onUpdate).not.toHaveBeenCalled()
+    expect(parentKeydown).not.toHaveBeenCalled()
+  })
+
   it('is a plain text input until opened — free text always works', async () => {
     const { el } = await mountCombobox({ value: 'my/custom-model' })
     const input = el.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')

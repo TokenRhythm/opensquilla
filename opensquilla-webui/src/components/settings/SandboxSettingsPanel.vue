@@ -132,10 +132,11 @@
             <strong>{{ t('settings.sandbox.files.backupTitle') }}</strong>
             <p>{{ t('settings.sandbox.files.backupDescription') }}</p>
           </div>
-          <label class="sandbox-switch">
-            <input v-model="draft.files.recursiveDeleteBackupEnabled" type="checkbox" @change="void flushSectionSave('files')" />
-            <span aria-hidden="true"></span>
-          </label>
+          <ControlSwitch
+            :checked="draft.files.recursiveDeleteBackupEnabled"
+            :aria-label="t('settings.sandbox.files.backupTitle')"
+            @change="setRecursiveDeleteBackup"
+          />
         </div>
         <label class="sandbox-field sandbox-field--compact">
           <span>{{ t('settings.sandbox.files.quota') }}</span>
@@ -154,13 +155,13 @@
       </article>
 
       <article v-if="activeView === 'commands'" class="sandbox-card">
-        <label class="sandbox-field">
+        <label class="sandbox-field" for="sandbox-system-tools">
           <span>{{ t('settings.sandbox.commands.systemTools') }}</span>
-          <select v-model="draft.commands.systemTools" @change="void flushSectionSave('commands')">
+          <ControlSelect id="sandbox-system-tools" :aria-label="t('settings.sandbox.commands.systemTools')" v-model="draft.commands.systemTools" @change="void flushSectionSave('commands')">
             <option value="auto">{{ t('settings.sandbox.commands.systemToolsAuto') }}</option>
             <option value="prompt">{{ t('settings.sandbox.commands.systemToolsPrompt') }}</option>
             <option value="disabled">{{ t('settings.sandbox.commands.systemToolsDisabled') }}</option>
-          </select>
+          </ControlSelect>
         </label>
 
         <RuleEditor
@@ -187,10 +188,11 @@
             <strong>{{ t('settings.sandbox.network.blockAll') }}</strong>
             <p>{{ t('settings.sandbox.network.blockAllDescription') }}</p>
           </div>
-          <label class="sandbox-switch">
-            <input v-model="draft.network.blockAllNetwork" type="checkbox" @change="void flushSectionSave('network')" />
-            <span aria-hidden="true"></span>
-          </label>
+          <ControlSwitch
+            :checked="draft.network.blockAllNetwork"
+            :aria-label="t('settings.sandbox.network.blockAll')"
+            @change="setBlockAllNetwork"
+          />
         </div>
         <TextRuleEditor
           v-model="allowDomain"
@@ -382,10 +384,12 @@
 </template>
 
 <script setup lang="ts">
+import ControlSelect from '@/components/ControlSelect.vue'
 import { computed, defineComponent, h, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { storeToRefs } from 'pinia'
 
+import ControlSwitch from '@/components/ControlSwitch.vue'
 import SandboxSetupDialog from '@/components/sandbox/SandboxSetupDialog.vue'
 import {
   useSandboxSettings,
@@ -433,6 +437,19 @@ const {
   prepareToLeave,
 } = useSandboxSettings()
 defineExpose({ hasUnsettledChanges, prepareToLeave })
+
+function setRecursiveDeleteBackup(enabled: boolean) {
+  if (!draft.value) return
+  draft.value.files.recursiveDeleteBackupEnabled = enabled
+  void flushSectionSave('files')
+}
+
+function setBlockAllNetwork(enabled: boolean) {
+  if (!draft.value) return
+  draft.value.network.blockAllNetwork = enabled
+  void flushSectionSave('network')
+}
+
 const sandboxSetupStore = useSandboxSetupStore()
 const {
   ensuring: sandboxSetupPending,
@@ -1275,50 +1292,9 @@ onMounted(() => void load())
 .sandbox-inline-form input,
 .sandbox-token-create > input,
 .sandbox-rule input,
-.sandbox-field select {
+.sandbox-field .control-select {
   flex: 1;
   min-width: 0;
-}
-
-.sandbox-switch {
-  position: relative;
-  display: inline-flex;
-}
-
-.sandbox-switch input {
-  position: absolute;
-  opacity: 0;
-  pointer-events: none;
-}
-
-.sandbox-switch span {
-  width: 38px;
-  height: 22px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-full);
-  background: var(--bg-hover);
-  cursor: pointer;
-}
-
-.sandbox-switch span::after {
-  display: block;
-  width: 16px;
-  height: 16px;
-  margin: 2px;
-  border-radius: var(--radius-full);
-  background: var(--text-muted);
-  content: '';
-  transition: transform var(--dur-fast) var(--ease-standard);
-}
-
-.sandbox-switch input:checked + span {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 20%, var(--bg-surface));
-}
-
-.sandbox-switch input:checked + span::after {
-  background: var(--accent);
-  transform: translateX(16px);
 }
 
 .sandbox-field {

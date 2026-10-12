@@ -19,7 +19,7 @@
           @change="onBoolChange"
         />
       </template>
-      <select
+      <ControlSelect
         v-else-if="field.type === 'select'"
         :id="fieldId"
         class="control-input"
@@ -28,7 +28,7 @@
         @change="onInputChange"
       >
         <option v-for="choice in field.choices" :key="choice" :value="choice">{{ choice }}</option>
-      </select>
+      </ControlSelect>
       <input
         v-else
         :id="fieldId"
@@ -45,6 +45,7 @@
 </template>
 
 <script setup lang="ts">
+import ControlSelect from '@/components/ControlSelect.vue'
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'

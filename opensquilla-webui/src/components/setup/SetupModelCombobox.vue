@@ -439,6 +439,10 @@ onBeforeUnmount(() => {
 })
 
 function onKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229) {
+    event.stopPropagation()
+    return
+  }
   if (!catalogAvailable.value) return
   if (event.key === 'Escape') {
     // Consume Escape only when it dismisses the list; a closed combobox lets
@@ -454,11 +458,12 @@ function onKeydown(event: KeyboardEvent) {
     event.preventDefault()
     if (!open.value) {
       openList()
-      return
     }
     if (!optionCount.value) return
     const delta = event.key === 'ArrowDown' ? 1 : -1
-    activeIndex.value = (activeIndex.value + delta + optionCount.value) % optionCount.value
+    activeIndex.value = activeIndex.value < 0
+      ? (delta > 0 ? 0 : optionCount.value - 1)
+      : (activeIndex.value + delta + optionCount.value) % optionCount.value
     scrollActiveOptionIntoView()
     return
   }

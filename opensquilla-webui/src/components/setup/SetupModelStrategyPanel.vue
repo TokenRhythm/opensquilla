@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import ControlSelect from '@/components/ControlSelect.vue'
 import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
@@ -343,6 +344,10 @@ function chooseFixedProviderOption(option: SetupProviderOption) {
 }
 
 function onFixedProviderTriggerKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229) {
+    event.stopPropagation()
+    return
+  }
   if (event.key === 'Tab' && fixedProviderMenuOpen.value) {
     closeFixedProviderMenu()
     return
@@ -377,7 +382,7 @@ function onFixedProviderTriggerKeydown(event: KeyboardEvent) {
     }
     return
   }
-  if (event.key === 'Enter' && fixedProviderMenuOpen.value) {
+  if ((event.key === 'Enter' || event.key === ' ') && fixedProviderMenuOpen.value) {
     event.preventDefault()
     const option = fixedProviderOptions.value[fixedProviderActiveIndex.value]
     if (option) chooseFixedProviderOption(option)
@@ -935,21 +940,23 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             <Icon class="setup-model-strategy__runtime-chevron" name="chevronDown" :size="15" aria-hidden="true" />
           </summary>
           <div class="setup-model-strategy__runtime-body">
-            <label class="control-row">
+            <label class="control-row" for="setup-model-strategy-router_default_tier">
               <div class="control-row__label-block">
                 <span class="control-row__label">{{ t('setup.modelStrategy.fallbackTierLabel') }}</span>
                 <span class="control-row__desc">{{ t('setup.modelStrategy.fallbackTierDesc') }}</span>
               </div>
               <div class="control-row__control">
-                <select
+                <ControlSelect
                   class="control-input"
                   :value="panel.router.routerDefaultTier"
+                  id="setup-model-strategy-router_default_tier"
                   name="setup_model_strategy_router_default_tier"
+                  :aria-label="t('setup.modelStrategy.fallbackTierLabel')"
                   :disabled="routerEditingDisabled"
                   @change="emit('updateRouterDefaultTier', ($event.target as HTMLSelectElement).value)"
                 >
                   <option v-for="tier in panel.router.textTiers" :key="tier" :value="tier">{{ panel.router.tierLabel(tier) }}</option>
-                </select>
+                </ControlSelect>
               </div>
             </label>
           </div>
@@ -1275,7 +1282,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
               <span class="setup-model-strategy__editor-title">
                 {{ t('setup.modelStrategy.replaceCandidateTitle', { model: replacementCandidate.model }) }}
               </span>
-              <select
+              <ControlSelect
                 class="control-input setup-model-strategy__candidate-provider"
                 name="setup_model_strategy_replace_candidate_provider"
                 :value="replacementProvider"
@@ -1290,7 +1297,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 >
                   {{ option.label }}
                 </option>
-              </select>
+              </ControlSelect>
               <SetupModelCombobox
                 cell
                 class="setup-model-strategy__candidate-model"
@@ -1334,7 +1341,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
               class="setup-model-strategy__editor"
               data-testid="ensemble-add-proposer-editor"
             >
-              <select
+              <ControlSelect
                 class="control-input setup-model-strategy__candidate-provider"
                 name="setup_model_strategy_add_candidate_provider"
                 :value="newCandidateProvider"
@@ -1349,7 +1356,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 >
                   {{ option.label }}
                 </option>
-              </select>
+              </ControlSelect>
               <SetupModelCombobox
                 cell
                 class="setup-model-strategy__candidate-model"
@@ -1507,7 +1514,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 </button>
               </div>
               <span class="setup-model-strategy__editor-label">{{ t('setup.modelStrategy.aggregatorOtherModel') }}</span>
-              <select
+              <ControlSelect
                 class="control-input setup-model-strategy__candidate-provider"
                 name="setup_model_strategy_aggregator_provider"
                 :value="aggregatorProvider"
@@ -1522,7 +1529,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 >
                   {{ option.label }}
                 </option>
-              </select>
+              </ControlSelect>
               <SetupModelCombobox
                 cell
                 class="setup-model-strategy__candidate-model"
@@ -1586,16 +1593,18 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             <Icon class="setup-model-strategy__runtime-chevron" name="chevronDown" :size="15" aria-hidden="true" />
           </summary>
           <div class="setup-model-strategy__runtime-body">
-            <label class="control-row">
+            <label class="control-row" for="setup-model-strategy-min_successful">
               <div class="control-row__label-block">
                 <span class="control-row__label">{{ t('setup.modelStrategy.successThresholdLabel') }}</span>
                 <span class="control-row__desc">{{ t('setup.modelStrategy.successThresholdDesc') }}</span>
               </div>
               <div class="control-row__control">
-                <select
+                <ControlSelect
                   class="control-input"
                   :value="displayedMinSuccessful"
+                  id="setup-model-strategy-min_successful"
                   name="setup_model_strategy_min_successful"
+                  :aria-label="t('setup.modelStrategy.successThresholdLabel')"
                   data-testid="ensemble-success-threshold"
                   @change="emit('updateEnsembleMinSuccessful', Number(($event.target as HTMLSelectElement).value))"
                 >
@@ -1605,10 +1614,10 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                       proposers: activeFacts.proposerCount,
                     }) }}
                   </option>
-                </select>
+                </ControlSelect>
               </div>
             </label>
-            <label class="control-row">
+            <label class="control-row" for="setup-model-strategy-all_failed_policy">
               <div class="control-row__label-block">
                 <span class="control-row__label">{{ t('setup.modelStrategy.failurePolicyLabel') }}</span>
                 <span v-if="panel.ensemble.allFailedPolicy === 'fallback_single'" class="control-row__desc">
@@ -1622,35 +1631,39 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 </span>
               </div>
               <div class="control-row__control">
-                <select
+                <ControlSelect
                   class="control-input"
                   :value="panel.ensemble.allFailedPolicy"
+                  id="setup-model-strategy-all_failed_policy"
                   name="setup_model_strategy_all_failed_policy"
+                  :aria-label="t('setup.modelStrategy.failurePolicyLabel')"
                   data-testid="ensemble-failure-policy"
                   @change="emit('updateEnsembleAllFailedPolicy', ($event.target as HTMLSelectElement).value)"
                 >
                   <option value="fallback_single">{{ t('setup.ensemble.allFailedFallback') }}</option>
                   <option value="error">{{ t('setup.ensemble.allFailedError') }}</option>
-                </select>
+                </ControlSelect>
               </div>
             </label>
-            <label class="control-row">
+            <label class="control-row" for="setup-model-strategy-proposer_max_retries">
               <div class="control-row__label-block">
                 <span class="control-row__label">{{ t('setup.modelStrategy.proposerRetriesLabel') }}</span>
                 <span class="control-row__desc">{{ t('setup.modelStrategy.proposerRetriesDesc') }}</span>
               </div>
               <div class="control-row__control">
-                <select
+                <ControlSelect
                   class="control-input"
                   :value="activeFacts.proposerMaxRetries"
+                  id="setup-model-strategy-proposer_max_retries"
                   name="setup_model_strategy_proposer_max_retries"
+                  :aria-label="t('setup.modelStrategy.proposerRetriesLabel')"
                   data-testid="ensemble-proposer-retries"
                   @change="emit('updateEnsembleProposerMaxRetries', Number(($event.target as HTMLSelectElement).value))"
                 >
                   <option v-for="retries in proposerRetryOptions" :key="retries" :value="retries">
                     {{ t('setup.modelStrategy.proposerRetriesOption', { count: retries }) }}
                   </option>
-                </select>
+                </ControlSelect>
               </div>
             </label>
             <div class="setup-model-strategy__runtime-limits">

@@ -373,6 +373,31 @@ describe('SandboxSettingsPanel', () => {
     expect(operations.updatePolicy).not.toHaveBeenCalled()
   }, 15_000)
 
+  it.each([
+    { view: 'files', field: 'recursiveDeleteBackupEnabled', initial: true },
+    { view: 'network', field: 'blockAllNetwork', initial: false },
+  ])('names the $view switch and saves its new value on keyboard activation', async ({ view, field, initial }) => {
+    const { el, operations } = await mountPanel()
+    el.querySelector<HTMLButtonElement>(`[data-testid="sandbox-open-${view}"]`)!.click()
+    await settle()
+    const toggle = el.querySelector<HTMLInputElement>('.sandbox-option [role="switch"]')!
+    const label = el.querySelector('.sandbox-option strong')!.textContent
+    expect(toggle).not.toBeNull()
+    expect(toggle.getAttribute('aria-label')).toBe(label)
+    expect(toggle.getAttribute('aria-checked')).toBe(String(initial))
+    expect(toggle.checked).toBe(initial)
+    toggle.focus()
+    expect(document.activeElement).toBe(toggle)
+    toggle.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+    await settle()
+    expect(toggle.checked).toBe(!initial)
+    expect(toggle.getAttribute('aria-checked')).toBe(String(!initial))
+    expect(operations.updatePolicy).toHaveBeenCalledOnce()
+    expect(operations.updatePolicy).toHaveBeenCalledWith(0, expect.objectContaining({
+      [view]: expect.objectContaining({ [field]: !initial }),
+    }))
+  })
+
   it('loads immutable file rules and immediately saves an added custom rule', async () => {
     const { el, operations } = await mountPanel()
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-files"]')!.click()

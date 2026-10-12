@@ -26,6 +26,25 @@ async function mount(duplicate = false, inline = false, resolver?: (items: Model
   return { host, form }
 }
 function button(text: string) { return [...document.querySelectorAll<HTMLButtonElement>('button')].find(el => el.textContent!.includes(text))! }
+function thinkingControl() {
+  return document.querySelector<HTMLButtonElement>('[data-testid="model-thinking-level"][role="combobox"]')!
+}
+function thinkingNativeValue() {
+  return thinkingControl().closest('.control-select')!.querySelector('select')!.value
+}
+async function chooseThinking(value: string) {
+  const control = thinkingControl()
+  control.click(); await flush()
+  expect(control.getAttribute('aria-expanded')).toBe('true')
+  const list = document.getElementById(control.getAttribute('aria-controls')!)!
+  const label = value || i18n.global.t('setup.provider.thinkingDefault')
+  const option = [...list.querySelectorAll<HTMLElement>('[role="option"]')].find(node => node.textContent?.trim() === label)!
+  expect(option).toBeTruthy()
+  option.click(); await flush()
+  expect(control.getAttribute('aria-expanded')).toBe('false')
+  expect(control.textContent).toContain(label)
+  expect(thinkingNativeValue()).toBe(value)
+}
 async function input(value: string) {
   const el = document.querySelector<HTMLInputElement>('.model-capacity-dialog input')!
   el.value = value; el.dispatchEvent(new Event('input', { bubbles: true })); await flush()
@@ -145,16 +164,17 @@ describe('thinking settings draft', () => {
     const { host } = await mount(false, false, undefined, { thinking: 'high', thinkingScope: 'proposer', onUpdateThinking })
     const trigger = host.querySelector<HTMLButtonElement>('.model-capacity-trigger')!
     trigger.click(); await flush()
-    let select = document.querySelector<HTMLSelectElement>('[data-testid="model-thinking-level"]')!
-    select.value = 'off'; select.dispatchEvent(new Event('change', { bubbles: true })); await flush()
+    expect(thinkingControl().textContent).toContain('high')
+    await chooseThinking('off')
+    expect(onUpdateThinking).not.toHaveBeenCalled()
     button('Cancel').click(); await flush()
     expect(onUpdateThinking).not.toHaveBeenCalled()
     trigger.click(); await flush()
-    select = document.querySelector<HTMLSelectElement>('[data-testid="model-thinking-level"]')!
-    expect(select.value).toBe('high')
+    expect(thinkingControl().textContent).toContain('high')
+    expect(thinkingNativeValue()).toBe('high')
     expect(document.querySelector('.model-capacity-dialog')!.textContent).toContain('Shared model settings')
     expect(document.querySelector('.model-capacity-dialog')!.textContent).not.toContain('setup.thinking.')
-    select.value = ''; select.dispatchEvent(new Event('change', { bubbles: true })); await flush()
+    await chooseThinking('')
     button('Done').click(); await flush()
     expect(onUpdateThinking).toHaveBeenCalledExactlyOnceWith('')
   })
@@ -184,9 +204,9 @@ describe('thinking without capacity metadata', () => {
     await flush(); await flush()
     expect(form.rows.size).toBe(0)
     expect(form.pending.has(capacityKey(target))).toBe(state === 'pending')
-    const select = document.querySelector<HTMLSelectElement>('[data-testid="model-thinking-level"]')!
-    select.value = 'high'; select.dispatchEvent(new Event('change', { bubbles: true }))
-    await flush()
+    expect(thinkingControl().textContent).toContain('low')
+    await chooseThinking('high')
+    expect(onUpdateThinking).not.toHaveBeenCalled()
     expect(button('Done').disabled).toBe(false)
     button('Done').click(); await flush()
     expect(onUpdateThinking).toHaveBeenCalledExactlyOnceWith('high')

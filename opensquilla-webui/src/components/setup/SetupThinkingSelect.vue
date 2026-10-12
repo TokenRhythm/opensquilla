@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import ControlSelect from '@/components/ControlSelect.vue'
 import { useI18n } from 'vue-i18n'
 defineProps<{ modelValue: string; disabled?: boolean; label?: string }>()
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
@@ -7,7 +8,7 @@ const levels = ['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh']
 </script>
 
 <template>
-  <select
+  <ControlSelect
     class="control-input control-input--narrow"
     :value="modelValue === 'none' ? 'off' : modelValue"
     :aria-label="label || t('setup.provider.thinkingLabel')"
@@ -15,5 +16,5 @@ const levels = ['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh']
     @change="emit('update:modelValue', ($event.target as HTMLSelectElement).value)"
   >
     <option v-for="level in levels" :key="level" :value="level">{{ level || t('setup.provider.thinkingDefault') }}</option>
-  </select>
+  </ControlSelect>
 </template>
