@@ -871,8 +871,10 @@ jobs:
           chat-send-lifecycle.real.spec.ts
           cross-window-sync.real.spec.ts
           composer-paste.spec.ts
+          durable-delivery.spec.ts
           history-content-reading.spec.ts
           history-hydration.spec.ts
+          http-delivery.spec.ts
           idle-chat-recovery.spec.ts
           modern-session-recovery.spec.ts
           provider-error-experience.spec.ts
