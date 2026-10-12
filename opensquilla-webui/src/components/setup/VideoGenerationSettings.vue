@@ -2,7 +2,7 @@
 import { computed, inject, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
-import Icon from '@/components/Icon.vue'
+import SetupCapabilityCredential from '@/components/setup/SetupCapabilityCredential.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import type { DiscoveredModel } from '@/composables/setup/useSetupProviderForm'
 import { APP_SETTINGS_KEY, type SettingChange } from '@/modules/appSettings'
@@ -300,6 +300,39 @@ const credentialStatus = computed(() => {
   }
   return credentialHint.value
 })
+
+const providerLabel = computed(() => videoProviders.value.find(option => option.id === provider.value)?.label || provider.value)
+const credentialTitle = computed(() => {
+  if (directApiKey.value.trim() || clearDirectKeyRequested.value
+    || (provider.value && credentialChanges.value[provider.value] === 'env')) {
+    return t('setup.video.unsaved')
+  }
+  if (!credentialAvailable.value) {
+    return t('setup.capabilities.imageCredentialMissingTitle', { provider: providerLabel.value })
+  }
+  const source = provider.value ? credentialOptions.value[provider.value]?.source : ''
+  if (source === 'llm_fallback') {
+    return t('setup.capabilities.imageCredentialLlmTitle', { provider: providerLabel.value })
+  }
+  if (source === 'image_direct' || source === 'image_env') {
+    return t('setup.video.credentialImageTitle', { provider: providerLabel.value })
+  }
+  if (source === 'video_direct' || source === 'video_env_injected_direct') {
+    return t('setup.video.credentialDedicatedTitle')
+  }
+  return t('setup.capabilities.imageCredentialEnvTitle', { provider: providerLabel.value })
+})
+const credentialRowHint = computed(() => {
+  if (!credentialAvailable.value) return t('setup.capabilities.imageCredentialMissingHint')
+  return t(savedDirectKeyAvailable.value || environmentManagedDirectKey.value
+    ? 'setup.video.credentialDedicatedHint' : 'setup.capabilities.imageCredentialReuseHint')
+})
+const credentialEditLabel = computed(() => (
+  credentialAvailable.value && !credentialEditorOpen.value && !environmentManagedDirectKey.value
+    ? t(savedDirectKeyAvailable.value
+      ? 'setup.capabilities.imageCredentialReplace' : 'setup.capabilities.imageCredentialUseDedicated')
+    : undefined
+))
 
 const credentialHint = computed(() => {
   if (!isVideoProvider(provider.value)) return t('setup.video.credentialHint')
@@ -611,6 +644,13 @@ const dirty = computed(() => saved.value !== null && (
   || Boolean(directApiKey.value.trim())
   || clearDirectKeyRequested.value
 ))
+const badgeReady = computed(() => Boolean(enabled.value && provider.value && primary.value.trim()
+  && credentialAvailable.value && !validationError.value))
+const badgeTone = computed(() => dirty.value ? 'is-warn'
+  : !enabled.value ? 'is-muted' : badgeReady.value ? 'is-ok' : 'is-warn')
+const badgeLabel = computed(() => t(dirty.value ? 'setup.video.unsaved'
+  : !enabled.value ? 'setup.capabilities.statusPending'
+    : badgeReady.value ? 'setup.capabilities.statusAvailable' : 'setup.capabilities.statusNeedsAction'))
 watch(dirty, value => emit('dirtyChange', value), { immediate: true })
 watch(busy, value => emit('busyChange', value), { immediate: true })
 
@@ -967,9 +1007,8 @@ onMounted(() => {
     <summary class="video-settings__summary">
       <span class="video-settings__title">{{ t('setup.video.title') }}</span>
       <span class="video-settings__summary-end">
-        <span v-if="phase === 'ready' && dirty" class="control-pill is-warn">{{ t('setup.video.unsaved') }}</span>
-        <span v-else-if="phase === 'ready'" class="control-pill" :class="enabled ? 'is-ok' : 'is-muted'">
-          {{ t(enabled ? 'setup.video.enabled' : 'setup.video.disabled') }}
+        <span v-if="phase === 'ready'" class="control-pill video-settings__status" :class="badgeTone">
+          {{ badgeLabel }}
         </span>
         <svg class="video-settings__chevron" aria-hidden="true" viewBox="0 0 20 20">
           <path d="m6 8 4 4 4-4" />
@@ -1053,18 +1092,16 @@ onMounted(() => {
         <template v-if="provider && providerSettingsSupported && !legacyProvider">
           <div class="control-row">
             <span class="control-row__label-block">
-              <span class="control-row__label">{{ t('setup.video.credentialSourceLabel') }}</span>
-              <span class="control-row__desc">{{ t('setup.video.credentialReuseHint') }}</span>
+              <span class="control-row__label">{{ t('setup.capabilities.imageCredentialLabel') }}</span>
+              <span class="control-row__desc">{{ credentialRowHint }}</span>
             </span>
             <span class="control-row__control video-settings__credential-control">
-              <span class="video-settings__credential-card" :class="{ 'is-ready': credentialAvailable }" role="status">
-                <Icon :name="credentialAvailable ? 'check' : 'info'" :size="14" aria-hidden="true" />
-                <span class="video-settings__credential-status">{{ credentialStatus }}</span>
-              </span>
-              <span class="video-settings__endpoint" data-testid="video-effective-base-url">{{ effectiveBaseUrl }}</span>
-              <button v-if="credentialAvailable && !credentialEditorOpen && !environmentManagedDirectKey"
-                type="button" class="btn btn--ghost" :disabled="busy" data-testid="video-edit-credential"
-                @click="openCredentialEditor">{{ t(savedDirectKeyAvailable ? 'setup.video.replaceDedicatedCredential' : 'setup.video.useDedicatedCredential') }}</button>
+              <SetupCapabilityCredential
+                class="video-settings__credential-card" :class="{ 'is-ready': credentialAvailable }"
+                :ready="credentialAvailable" :title="credentialTitle" :detail="credentialStatus"
+                :action-label="credentialEditLabel" :disabled="busy" action-test-id="video-edit-credential"
+                @action="openCredentialEditor"
+              />
               <template v-if="credentialInputVisible">
                 <label class="video-settings__credential-mode">
                   <span>{{ t('setup.video.credentialInputModeLabel') }}</span>
@@ -1108,6 +1145,7 @@ onMounted(() => {
               </span>
               <span class="control-row__control">
                 <input :value="effectiveBaseUrl" class="control-input" name="setup_video_base_url"
+                  data-testid="video-effective-base-url"
                   type="url" inputmode="url" spellcheck="false" autocomplete="off"
                   :disabled="busy" placeholder="https://api.example.com/v1"
                   @input="baseUrl = ($event.target as HTMLInputElement).value">
@@ -1189,16 +1227,16 @@ onMounted(() => {
 .video-settings__summary {
   align-items: center;
   cursor: pointer;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: var(--sp-3);
-  justify-content: space-between;
   list-style: none;
   padding: 17px 18px;
 }
 
 .video-settings__summary::-webkit-details-marker { display: none; }
 .video-settings__summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
-.video-settings__title { font-size: 15px; font-weight: 650; }
+.video-settings__title { overflow: hidden; font-size: 15px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .video-settings__summary-end { display: flex; align-items: center; gap: var(--sp-3); }
 .video-settings__chevron {
   width: 18px;
@@ -1214,15 +1252,12 @@ onMounted(() => {
 }
 .video-settings[open] .video-settings__chevron { transform: rotate(180deg); }
 .video-settings__panel { border-top: 1px solid var(--border); padding: 0 18px 16px; }
+.video-settings__description { margin: 14px 0 4px; }
 .video-settings__description, .video-settings__hint { color: var(--text-muted); font-size: 13px; line-height: 1.5; }
 .video-settings__error { color: var(--danger); font-size: 13px; }
 .video-settings__message { color: var(--ok); font-size: 13px; }
-.video-settings__credential-control { display: grid; gap: 8px; }
-.video-settings__credential-card { display: flex; align-items: flex-start; gap: var(--sp-2); padding: var(--sp-3); border: 1px solid var(--border); border-radius: var(--radius-md); }
-.video-settings__credential-card.is-ready { color: var(--ok); }
-.video-settings__credential-status { color: var(--text-muted); font-size: 13px; line-height: 1.4; }
+.video-settings__credential-control { display: grid; justify-content: stretch; width: min(100%, 360px); max-width: 360px; gap: 8px; }
 .video-settings__credential-mode { display: grid; gap: var(--sp-2); font-size: 13px; }
-.video-settings__endpoint { overflow-wrap: anywhere; color: var(--text-muted); font-size: 12px; }
 .video-settings__connection-options { color: var(--text-muted); font-size: 13px; padding-block: var(--sp-3); }
 .video-settings__connection-options summary { cursor: pointer; }
 .video-settings__actions { display: flex; justify-content: flex-end; margin-top: var(--sp-3); }

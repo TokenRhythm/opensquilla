@@ -82,13 +82,39 @@ async function editCredential(el: HTMLElement, mode: 'key' | 'env' = 'key') {
   await select(el, 'setup_video_credential_mode', mode)
 }
 function saveButton(el: HTMLElement) { return el.querySelector<HTMLButtonElement>('.video-settings__actions button')! }
-function sourceText(el: HTMLElement) { return el.querySelector('.video-settings__credential-status')?.textContent || '' }
+function sourceText(el: HTMLElement) { return el.querySelector('.video-settings__credential-card .capability-card__credential-detail')?.textContent || '' }
 async function restore(el: HTMLElement) {
   el.querySelector<HTMLButtonElement>('[data-testid="video-restore-shared-credential"]')!.click()
   await nextTick()
 }
 
 describe('video generation settings', () => {
+  it.each([
+    { enabled: false, available: true, primary: 'wan3.0-video', label: 'statusPending', tone: 'is-muted' },
+    { enabled: true, available: true, primary: 'wan3.0-video', label: 'statusAvailable', tone: 'is-ok' },
+    { enabled: true, available: false, primary: 'wan3.0-video', label: 'statusNeedsAction', tone: 'is-warn' },
+    { enabled: true, available: true, primary: '', label: 'statusNeedsAction', tone: 'is-warn' },
+  ])('shows $label for enabled=$enabled, credential=$available, model=$primary', async ({ enabled, available, primary, label, tone }) => {
+    const { el, vm } = await mountSettings({ ...selectedConfig, enabled, primary },
+      workflowFor(credential(available ? 'llm_fallback' : 'none', { available })))
+    await vm.refreshCredentialStatus()
+    await nextTick()
+    const badge = el.querySelector('.video-settings__status')!
+    expect(badge.textContent).toBe(i18n.global.t(`setup.capabilities.${label}`))
+    expect(badge.classList.contains(tone)).toBe(true)
+  })
+
+  it('marks a changed switch as unsaved and restores the saved readiness on discard', async () => {
+    const { el, vm } = await mountSettings({ ...selectedConfig, enabled: true }, workflowFor(credential()))
+    await vm.refreshCredentialStatus()
+    await toggle(el, false)
+    expect(el.querySelector('.video-settings__status')?.textContent).toBe(i18n.global.t('setup.video.unsaved'))
+    expect(el.querySelector('.video-settings__status')?.classList.contains('is-ok')).toBe(false)
+    vm.discard()
+    await nextTick()
+    expect(el.querySelector('.video-settings__status')?.textContent).toBe(i18n.global.t('setup.capabilities.statusAvailable'))
+  })
+
   it('offers only TokenRhythm and OpenRouter as selectable providers', async () => {
     const { el } = await mountSettings()
     expect(Array.from(el.querySelectorAll<HTMLOptionElement>('[name="setup_video_provider"] option'), option => option.value))
@@ -135,7 +161,7 @@ describe('video generation settings', () => {
     const { el, patch, vm } = await mountSettings(selectedConfig, workflowFor(credential('llm_fallback', {
       baseUrl: endpoint, baseUrlSource: 'profile', baseUrlAuthored: false,
     })))
-    await vi.waitFor(() => expect(el.querySelector('[data-testid="video-effective-base-url"]')?.textContent).toBe(endpoint))
+    await vi.waitFor(() => expect(el.querySelector<HTMLInputElement>('[data-testid="video-effective-base-url"]')?.value).toBe(endpoint))
     expect(el.querySelector<HTMLInputElement>('[name="setup_video_base_url"]')?.value).toBe(endpoint)
     await input(el, 'setup_video_duration', '6')
     await vm.save()
@@ -186,7 +212,7 @@ describe('video generation settings', () => {
     await editCredential(el)
     await input(el, 'setup_video_api_key', 'synthetic-address-bound-key')
     await vm.refreshCredentialStatus()
-    expect(el.querySelector('[data-testid="video-effective-base-url"]')?.textContent).toBe(endpoint)
+    expect(el.querySelector<HTMLInputElement>('[data-testid="video-effective-base-url"]')?.value).toBe(endpoint)
     await vm.save()
     expect(patch).toHaveBeenCalledExactlyOnceWith([
       { path: 'video_generation.providers.tokenrhythm.base_url', value: endpoint },

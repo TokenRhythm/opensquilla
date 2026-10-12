@@ -359,7 +359,7 @@ describe('SettingsDialog video draft exit guard', () => {
     expect(model.value).toBe('google/veo-3.1-fast')
     expect(catalog).toHaveBeenCalledOnce()
     expect(readAll).toHaveBeenCalledOnce()
-    expect(details.querySelector('.video-settings__credential-status')?.textContent)
+    expect(details.querySelector('.video-settings__credential-card .capability-card__credential-detail')?.textContent)
       .toContain(i18n.global.t('setup.video.videoEnvKeyAvailable', { name: 'VIDEO_TEST_KEY' }))
   })
 
