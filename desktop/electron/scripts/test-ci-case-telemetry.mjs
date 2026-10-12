@@ -652,6 +652,49 @@ try {
     'cli-pass',
     'cli-fail',
   ])
+  // This portable contract belongs in the existing Node owner, without a
+  // second interpreter launch from the Python upgrade suite.
+  {
+    const source = await readFile(join(scriptDir, 'test-packaged-session-recovery.mjs'), 'utf8')
+    const start = source.indexOf('  gatewayReadinessStartedAt = performance.now()')
+    const end = source.indexOf('  // The preceding release-upgrade launch', start)
+    assert.ok(start > 0 && end > start)
+    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+    const run = new AsyncFunction('waitFor', 'page', 'assert', 'performance', 'console',
+      'DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS',
+      'let gatewayReadinessStartedAt, lastGatewayConnection;\n' + source.slice(start, end))
+    for (const terminal of ['ready', 'error', 'stopped', 'starting']) {
+      let calls = 0
+      const logs = []
+      const page = { evaluate: async () => ({
+        status: ++calls === 1 ? 'starting' : terminal,
+        error: terminal === 'error' ? 'synthetic startup failure' : null,
+        authToken: 'must-never-appear-in-evidence',
+      }) }
+      const wait = async (check, label, budget) => {
+        assert.equal(budget, 120_000)
+        assert.equal(label, 'candidate Desktop Gateway readiness')
+        for (let i = 0; i < 3; i++) if (await check()) return
+        throw new Error('synthetic startup timeout')
+      }
+      const attempt = run(wait, page, assert, performance,
+        { error: value => logs.push(value) }, 120_000)
+      if (terminal === 'ready') {
+        await attempt
+        assert.equal(calls, 2)
+        assert.equal(JSON.parse(logs[0]).budgetMs, 120_000)
+      } else {
+        await assert.rejects(attempt, error => {
+          assert.ok(!error.message.includes('must-never-appear-in-evidence'))
+          assert.match(error.message, terminal === 'starting'
+            ? /synthetic startup timeout/ : /Candidate Gateway failed/)
+          return true
+        })
+        assert.equal(calls, terminal === 'starting' ? 3 : 2)
+        assert.deepEqual(logs, [])
+      }
+    }
+  }
   await import('./test-packaged-first-send-cleanup.mjs')
   await import('./test-session-recovery-transport-contract.mjs')
   await import('./test-session-recovery-rpc-evidence.mjs')

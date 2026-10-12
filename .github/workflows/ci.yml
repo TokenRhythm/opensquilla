@@ -946,14 +946,19 @@ jobs:
           --grep=@capacity
           --output=test-results/capacity
 
-      - name: Upload chat recovery traces
+      - name: Upload chat recovery evidence
         id: chat-traces
         continue-on-error: true
-        if: ${{ failure() }}
+        if: ${{ failure() || steps.webui-capacity.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: webui-chat-recovery-attempt-${{ github.run_attempt }}
-          path: opensquilla-webui/test-results/
+          # Successful capacity runs retain only the small metric reports.
+          # Failures still preserve the complete first-failure trace tree.
+          path: |
+            opensquilla-webui/test-results/capacity/**/long-task-performance.json
+            opensquilla-webui/test-results/capacity/**/sidebar-performance.json
+            ${{ job.status == 'failure' && 'opensquilla-webui/test-results/' || '' }}
           if-no-files-found: ignore
           retention-days: 14
 

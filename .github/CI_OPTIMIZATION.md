@@ -215,7 +215,7 @@ A read-only sample of the latest 20 completed runs created between 08:45 and
 11:00 UTC used each run's **first attempt**, including a failed first attempt
 whose later retry passed. It contained 10 successes, five failures and five
 cancellations. This short convenience sample is not an estimate of the long-term
-flake rate, and these runs do not contain the current unsubmitted changes.
+flake rate, and these runs do not contain the optimization candidate below.
 
 Nine non-cancelled, full 70-job runs had a median elapsed time of 23m49s and
 403.45 summed job minutes (not billed minutes). Windows desktop recovery
@@ -344,6 +344,37 @@ which separates process exit from inherited-pipe closure. Successful closes
 remain silent, listeners are removed, and no stream contents or environment
 values are collected. PID absence and taskkill 128 remain insufficient proof
 of Windows process-tree cleanup.
+
+### First published candidate and diagnostic follow-up
+
+Run `38261184881`, attempt 1, tests commit
+`cb6984b8eb0c6ccf7890b46b0d62bbd0dc5b5cf2`. Windows profiles passed in
+634 seconds, with all six native cases passing on their first attempt and no
+shutdown-failure or forced-cleanup event. The three earlier representative jobs
+took 1,130, 1,510 and 1,241 seconds. The same ten Windows preflight cells totaled
+329 seconds; ten earlier complete, non-cancelled first attempts had a median
+total of 976.5 seconds. Event, runner, cache and revision differences remain, so
+these observations do not establish a causal end-to-end CI speedup.
+
+All 35 Windows PTY cases and the four affected Windows migration/cleanup
+contracts passed. Two other required tests failed: an empty mutation observation
+after a successful real file write, and a Node readiness-contract child that
+timed out before its first synchronous phase log. Their direct implementations
+were unchanged in that candidate. Neither failure is dismissed as harmless or
+attributed to a specific root cause from the available logs.
+
+The portable readiness contract now runs in the existing required Desktop Node
+owner. All four terminal states, startup budget, error and redaction assertions
+remain; the Python suite no longer starts another Node process just for this
+contract. Real Git observation tests retain their deadlines and assertions,
+with bounded failure-report sections for Git/snapshot states and elapsed times.
+These reports contain no paths, command arguments or file contents.
+
+Successful browser capacity runs upload only their two small performance JSON
+reports through the existing diagnostic upload. Failures retain the full trace
+tree. Diagnostic upload errors still warn without overriding the required test
+result. First-attempt failures remain part of the evidence even when a later
+candidate passes.
 
 ## Modes
 
