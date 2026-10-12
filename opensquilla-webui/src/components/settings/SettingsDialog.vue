@@ -6,6 +6,7 @@
         v-if="visible"
         ref="modalRef"
         class="settings-modal"
+        :class="{ 'settings-modal--categories': showCategories }"
         role="dialog"
         aria-modal="true"
         aria-labelledby="settings-modal-title"
@@ -15,11 +16,11 @@
         :inert="settingsInteractionLocked ? true : undefined"
         :aria-busy="settingsInteractionLocked ? 'true' : undefined"
       >
-        <nav ref="railRef" class="settings-rail" role="tablist" :aria-label="t('settings.dialog.sections')" :aria-orientation="railOrientation">
+        <nav ref="railRef" v-show="!isMobile || showCategories" class="settings-rail" :role="isMobile ? undefined : 'tablist'" :inert="isMobile && !showCategories ? true : undefined" :aria-hidden="isMobile && !showCategories ? 'true' : undefined" :aria-label="t('settings.dialog.sections')" :aria-orientation="isMobile ? undefined : 'vertical'" @keydown="onRailKeydown">
           <template v-for="(s, i) in visibleSections" :key="s.id">
             <!-- Presentational group eyebrow: labels the rail without adding a
                  tab stop. Rendered when the group changes so each bin is headed
-                 once. Hidden on the mobile horizontal strip. -->
+                 once, including the mobile category list. -->
             <span
               v-if="s.group && (i === 0 || s.group !== visibleSections[i - 1]?.group)"
               class="settings-rail__group"
@@ -29,11 +30,12 @@
             <button
               :id="'settings-rail-' + s.id"
               type="button"
-              role="tab"
+              :role="isMobile ? undefined : 'tab'"
               class="settings-rail__item"
               :class="{ 'is-active': activeRailSection === s.id }"
-              :aria-selected="activeRailSection === s.id ? 'true' : 'false'"
-              :aria-controls="'settings-section-' + (activeRailSection === s.id ? section : s.id)"
+              :aria-selected="isMobile ? undefined : activeRailSection === s.id ? 'true' : 'false'"
+              :tabindex="isMobile || activeRailSection === s.id ? 0 : -1"
+              :aria-controls="isMobile ? undefined : 'settings-section-' + (activeRailSection === s.id ? section : s.id)"
               :aria-label="s.client ? t('settings.rail.' + s.id) : `${t('settings.rail.' + s.id)}: ${sectionStatus(s.id).label}${sectionDirty(s.id) ? t('settings.dialog.unsavedSuffix') : ''}`"
               @click="selectSection(s.id)"
             >
@@ -47,13 +49,17 @@
                 :title="sectionStatus(s.id).label"
                 aria-hidden="true"
               ></span>
+              <Icon v-if="isMobile" name="chevronRight" :size="16" aria-hidden="true" />
             </button>
           </template>
         </nav>
 
         <div class="settings-main">
           <header class="settings-modal__head">
-            <h2 id="settings-modal-title" class="settings-modal__title">{{ t('settings.dialog.title') }}</h2>
+            <button v-if="isMobile && !showCategories" type="button" class="btn btn--icon btn--ghost settings-modal__back" :disabled="settingsInteractionLocked" :aria-label="t('settings.dialog.backToCategories')" @click="showCategoryList">
+              <Icon name="chevronLeft" :size="18" aria-hidden="true" />
+            </button>
+            <h2 id="settings-modal-title" class="settings-modal__title">{{ isMobile && !showCategories ? t('settings.rail.' + activeRailSection) : t('settings.dialog.title') }}</h2>
             <SettingsSearch :is-desktop="isDesktop" :disabled="settingsInteractionLocked" @select="selectSearchResult" />
             <button
               ref="closeBtn"
@@ -71,9 +77,13 @@
         <div
           :id="'settings-section-' + section"
           ref="panelRef"
+          v-show="!showCategories"
           class="settings-panel"
-          role="tabpanel"
-          :aria-labelledby="'settings-rail-' + activeRailSection"
+          :role="isMobile ? 'region' : 'tabpanel'"
+          :inert="showCategories ? true : undefined"
+          :aria-hidden="showCategories ? 'true' : undefined"
+          :aria-labelledby="isMobile ? 'settings-modal-title' : 'settings-rail-' + activeRailSection"
+          tabindex="-1"
         >
           <fieldset
             class="settings-panel__interactions"
@@ -381,10 +391,10 @@ function prepareSandboxLeave(): Promise<boolean> {
   return work
 }
 
-// Keep the active section's rail tab in view — on mobile the rail scrolls
-// horizontally, so a deep-linked or later section would otherwise sit off-screen.
+// Keep the active destination in view without scrolling the hidden mobile rail.
 function scrollActiveTabIntoView() {
   void nextTick(() => {
+    if (isMobile.value && !showCategories.value) return
     const el = railRef.value?.querySelector<HTMLElement>('.settings-rail__item.is-active')
     if (!el) return
     const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
@@ -403,11 +413,14 @@ function resetActivePanelScroll() {
 // leave animation plays; the actual route navigation is deferred to onLeaveComplete.
 const visible = ref(true)
 const isMobile = ref(window.matchMedia('(max-width: 768px)').matches)
+// Returning to categories hides the existing form; it never remounts it or
+// changes the current section. Explicit destinations bypass the category list.
+const mobileView = ref<'list' | 'detail'>(route.params.section || route.hash ? 'detail' : 'list')
+const showCategories = computed(() => isMobile.value && mobileView.value === 'list')
 // Set once the user picks a section so the deep-link auto landing (which waits
 // on readiness data) never stomps navigation made while config was loading.
 let userNavigated = false
 
-const railOrientation = computed(() => (isMobile.value ? 'horizontal' : 'vertical'))
 const dirtySectionNames = computed(() => (
   dirtySections.value.map(s => t(`settings.rail.${s.id}`)).join(' · ')
 ))
@@ -530,17 +543,57 @@ function selectSection(id: string): boolean | Promise<boolean> {
     return leave.then(ok => {
       if (!ok) return false
       userNavigated = true
+      mobileView.value = 'detail'
       setSection(id)
+      if (isMobile.value) void nextTick(() => panelRef.value?.focus({ preventScroll: true }))
       if (route.params.section !== id) return router.replace({ path: `/settings/${id}` }).then(() => true)
       return true
     })
   }
   userNavigated = true
+  mobileView.value = 'detail'
   setSection(id)
   if (route.params.section !== id) {
     void router.replace({ path: `/settings/${id}` })
   }
+  if (isMobile.value) void nextTick(() => panelRef.value?.focus({ preventScroll: true }))
   return true
+}
+
+async function showCategoryList() {
+  if (settingsInteractionLocked.value) return
+  mobileView.value = 'list'
+  await nextTick()
+  const active = railRef.value?.querySelector<HTMLElement>('.settings-rail__item.is-active')
+  active?.focus({ preventScroll: true })
+  active?.scrollIntoView?.({ block: 'nearest' })
+}
+
+function onRailKeydown(event: KeyboardEvent) {
+  if (settingsInteractionLocked.value || event.altKey || event.ctrlKey || event.metaKey) return
+  const tabs = Array.from(railRef.value?.querySelectorAll<HTMLButtonElement>('.settings-rail__item') ?? [])
+  const target = event.target instanceof Element ? event.target.closest<HTMLButtonElement>('.settings-rail__item') : null
+  if (!target) return
+  const current = tabs.indexOf(target)
+  if (current < 0 || !tabs.length) return
+  const nextKey = 'ArrowDown'
+  const previousKey = 'ArrowUp'
+  let next: number
+  if (event.key === 'Home') next = 0
+  else if (event.key === 'End') next = tabs.length - 1
+  else if (event.key === nextKey) next = (current + 1) % tabs.length
+  else if (event.key === previousKey) next = (current + tabs.length - 1) % tabs.length
+  else return
+  event.preventDefault()
+  if (!isMobile.value) {
+    const selected = selectSection(visibleSections.value[next].id)
+    if (selected instanceof Promise) {
+      void selected.then(ok => { if (ok) tabs[next]?.focus() })
+      return
+    }
+    if (!selected) return
+  }
+  tabs[next].focus()
 }
 
 const SEARCH_TARGET_IDS: Record<string, string> = {
@@ -604,6 +657,7 @@ function selectSearchResult(id: string, labelKey: string) {
 // Resolve aliases and nested destinations. Old URLs are canonicalized with a
 // subsection hash so bookmarks keep landing on their original content.
 function applyRouteSection() {
+  if (route.params.section || route.hash) mobileView.value = 'detail'
   if (wantsAutoSection.value) {
     if (loaded.value && !userNavigated) selectInitialSection('auto')
     return
@@ -626,6 +680,7 @@ function applyRouteSection() {
 }
 
 function focusCompositeHash(): boolean {
+  if (showCategories.value) return false
   const targetId = COMPOSITE_HASH_TARGETS[route.hash]
   if (!targetId) return false
   const target = document.getElementById(targetId)
@@ -663,6 +718,7 @@ function applyProviderHash() {
 // Focus the first empty required input in the freshly-preselected panel;
 // rendered inputs don't always carry `required`, so fall back to first-empty.
 function focusFirstEmptyProviderInput() {
+  if (showCategories.value) return
   const panel = panelRef.value
   if (!panel) return
   const inputs = Array.from(panel.querySelectorAll<HTMLInputElement>(
@@ -681,18 +737,31 @@ function copyDisplayPath() {
   }
 }
 
-function sidebarSettingsButton(): HTMLElement | null {
-  return document.querySelector<HTMLElement>('.sidebar-foot button[data-icon="settings"]')
+function canRestoreFocus(element: HTMLElement | null): element is HTMLElement {
+  if (!element || element === document.body || !element.isConnected) return false
+  if (modalRef.value?.contains(element)) return false
+  if (element.matches(':disabled') || element.closest('[inert], [hidden], [aria-hidden="true"]')) return false
+  for (let ancestor: HTMLElement | null = element; ancestor; ancestor = ancestor.parentElement) {
+    const style = getComputedStyle(ancestor)
+    if (style.display === 'none' || style.visibility === 'hidden') return false
+  }
+  return true
 }
 
 // A usable focus-restore target: a real element still in the document that is
 // neither <body> (the cold-deep-link case, where activeElement was never a
 // meaningful invoker) nor inside the dialog itself (which is about to unmount).
 function usableInvoker(): HTMLElement | null {
-  if (!invokerEl || invokerEl === document.body) return null
-  if (!document.contains(invokerEl)) return null
-  if (modalRef.value?.contains(invokerEl)) return null
-  return invokerEl
+  return canRestoreFocus(invokerEl) ? invokerEl : null
+}
+
+function restoreSettingsFocus() {
+  const targets = [
+    usableInvoker(),
+    document.querySelector<HTMLElement>('.sidebar-foot button[data-icon="settings"]'),
+    document.querySelector<HTMLElement>('[data-testid="sidebar-toggle-collapsed"]'),
+  ]
+  targets.find(canRestoreFocus)?.focus({ preventScroll: true })
 }
 
 // Leave the overlay: restore focus first (the route change unmounts us), then
@@ -720,8 +789,7 @@ function closeOverlay(restoreFocus = true) {
   // focus back to the Settings row leaves a misleading orange keyboard ring.
   // Keyboard-triggered closes still restore focus synchronously.
   if (restoreFocus) {
-    const target = usableInvoker() ?? sidebarSettingsButton()
-    target?.focus()
+    restoreSettingsFocus()
   }
   invokerEl = null
   // Flip visibility to play the modal's leave transition; onLeaveComplete then
@@ -825,7 +893,7 @@ function isVisibleInDetails(element: HTMLElement): boolean {
 }
 
 function onDocumentKeydown(event: KeyboardEvent) {
-  if (event.defaultPrevented) return
+  if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return
   // The confirm modal owns the keyboard while it is open; let it handle Escape
   // so a single keypress cannot both dismiss the prompt and re-open it.
   if (confirmState.value || hasOpenDialogLayer()) return
@@ -839,7 +907,10 @@ function onDocumentKeydown(event: KeyboardEvent) {
   if (!rootEl) return
   const focusables = Array.from(rootEl.querySelectorAll<HTMLElement>(
     'button:not([disabled]), a[href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), summary, [tabindex]:not([tabindex="-1"])'))
-    .filter(isVisibleInDetails)
+    .filter(element => element.getAttribute('tabindex') !== '-1'
+      && !element.matches(':disabled')
+      && !element.closest('[inert], [hidden], [aria-hidden="true"]')
+      && isVisibleInDetails(element))
   if (focusables.length === 0) return
   const first = focusables[0]
   const last = focusables[focusables.length - 1]
@@ -855,7 +926,17 @@ function onDocumentKeydown(event: KeyboardEvent) {
 }
 
 function onViewportChange(event: MediaQueryListEvent) {
+  const active = document.activeElement
   isMobile.value = event.matches
+  // Do not leave keyboard focus inside a now-hidden rail or detail form.
+  void nextTick(() => {
+    if (active instanceof HTMLElement && (!active.isConnected || active.closest('[inert], [aria-hidden="true"]'))) {
+      const target = showCategories.value
+        ? railRef.value?.querySelector<HTMLElement>('.settings-rail__item.is-active')
+        : panelRef.value
+      target?.focus({ preventScroll: true })
+    }
+  })
 }
 
 // Keep the active section in sync as the route param changes (deep link, Back,
@@ -867,6 +948,7 @@ watch(routeParam, () => applyRouteSection())
 // #channel- hashes never reach this dialog: a router guard rewrites them to
 // the /channels workspace before the settings route resolves.)
 watch(() => route.hash, () => {
+  if (route.hash) mobileView.value = 'detail'
   applyProviderHash()
   applyCompositeHash()
 })
@@ -918,7 +1000,7 @@ onUnmounted(() => {
   // A route-driven unmount that did not go through closeOverlay (e.g. the user
   // pressed browser Back) still owes focus restoration: the real invoker, or
   // the sidebar Settings button for a cold deep link, never a detached node.
-  if (!closing) (usableInvoker() ?? sidebarSettingsButton())?.focus()
+  if (!closing) restoreSettingsFocus()
   invokerEl = null
 })
 </script>
@@ -982,13 +1064,14 @@ onUnmounted(() => {
   flex-wrap: wrap;
   flex-shrink: 0;
   gap: var(--sp-3);
-  padding: var(--sp-4) var(--sp-4) 0;
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--border);
 }
 
 .settings-modal__title {
   flex: 1;
   font-size: var(--fs-lg);
-  font-weight: 700;
+  font-weight: 600;
   margin: 0;
 }
 
@@ -1035,6 +1118,7 @@ onUnmounted(() => {
 }
 
 .settings-rail {
+  background: var(--bg);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -1055,6 +1139,7 @@ onUnmounted(() => {
   display: flex;
   font-size: var(--fs-sm);
   gap: var(--sp-2);
+  min-height: 40px;
   padding: var(--sp-2) var(--sp-3);
   text-align: left;
 }
@@ -1071,8 +1156,15 @@ onUnmounted(() => {
   font-weight: 600;
 }
 
+.settings-rail__item:focus-visible {
+  box-shadow: var(--focus-ring-inset);
+  outline: none;
+}
+
 .settings-rail__label {
   flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .settings-rail__dot {
@@ -1099,7 +1191,7 @@ onUnmounted(() => {
    Non-interactive, so it never enters the tab order. */
 .settings-rail__group {
   color: var(--text-dim);
-  font-size: 10px;
+  font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.08em;
   margin: var(--sp-3) 0 var(--sp-1);
@@ -1115,8 +1207,11 @@ onUnmounted(() => {
   flex: 1;
   min-width: 0;
   overflow-y: auto;
-  padding: var(--sp-4);
+  padding: var(--sp-5);
+  overscroll-behavior: contain;
 }
+
+.settings-panel:focus { outline: none; }
 
 .settings-panel__interactions {
   border: 0;
@@ -1152,7 +1247,8 @@ onUnmounted(() => {
   flex: 1;
 }
 
-/* Mobile: full screen, horizontal section chips */
+/* Mobile: category list -> detail. Both remain mounted so navigating back or
+   resizing cannot discard the currently edited form. */
 @media (max-width: 768px) {
   .settings-overlay {
     padding: 0;
@@ -1170,37 +1266,63 @@ onUnmounted(() => {
   }
 
   .settings-main {
-    width: 100%;
+    display: contents;
+  }
+
+  .settings-modal__head {
+    order: 0;
+    background: var(--bg-surface);
+    padding: var(--sp-3);
+    gap: var(--sp-2);
+  }
+
+  .settings-modal__title {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .settings-modal__back,
+  .settings-modal__close {
+    flex-shrink: 0;
+    min-width: 44px;
+    min-height: 44px;
   }
 
   .settings-rail {
-    border-bottom: 1px solid var(--border);
-    border-right: none;
-    flex-direction: row;
-    overflow-x: auto;
-    overflow-y: hidden;
-    padding: var(--sp-2);
+    order: 1;
+    border: 0;
+    flex: 1;
+    min-height: 0;
+    flex-direction: column;
+    overflow-y: auto;
+    padding: var(--sp-3);
     width: 100%;
-    /* Signal that the strip scrolls: fade the leading/trailing edges, and snap
-       tabs so they don't end mid-cut. (black = opaque in an alpha mask.) */
-    scroll-snap-type: x proximity;
-    -webkit-mask-image: linear-gradient(to right, transparent 0, black 16px, black calc(100% - 16px), transparent 100%);
-    mask-image: linear-gradient(to right, transparent 0, black 16px, black calc(100% - 16px), transparent 100%);
+    box-sizing: border-box;
   }
 
   .settings-rail__item {
     flex-shrink: 0;
-    min-height: 44px;
-    scroll-snap-align: start;
+    min-height: 48px;
   }
 
-  /* The horizontal chip strip stays flat — group eyebrows would break the row. */
   .settings-rail__group {
-    display: none;
+    margin-top: var(--sp-4);
   }
 
   .settings-panel {
+    order: 2;
+    min-height: 0;
+    background: var(--bg-surface);
     padding: var(--sp-3);
   }
+
+  .settings-dirtybar {
+    flex-wrap: wrap;
+    padding: var(--sp-3);
+    gap: var(--sp-2);
+  }
+
+  .settings-dirtybar__text { flex: 1 1 65%; }
+  .settings-dirtybar__spacer { display: none; }
 }
 </style>

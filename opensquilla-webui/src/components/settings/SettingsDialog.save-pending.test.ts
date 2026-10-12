@@ -406,6 +406,135 @@ describe('SettingsDialog search navigation', () => {
   })
 })
 
+describe('SettingsDialog rail keyboard navigation', () => {
+  async function mountRail(mobile = false) {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    controls.hasUnsavedChanges.value = false
+    catalogApi.loaded.value = false
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn((query: string) => ({
+        matches: mobile && query === '(max-width: 768px)',
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      })),
+    })
+    const el = await mountDialog()
+    return { el, controls }
+  }
+
+  async function pressKey(element: HTMLElement, key: string) {
+    element.focus()
+    const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+    element.dispatchEvent(event)
+    await nextTick()
+    return event
+  }
+
+  it.each([
+    { mobile: false, forward: 'ArrowDown', backward: 'ArrowUp', ignored: 'ArrowRight' },
+  ])('uses the visible rail orientation and one tab stop (mobile=$mobile)', async ({ mobile, forward, backward, ignored }) => {
+    const { el } = await mountRail(mobile)
+    const rail = el.querySelector<HTMLElement>('.settings-rail')!
+    const tabs = Array.from(rail.querySelectorAll<HTMLButtonElement>('[role="tab"]'))
+    expect(rail.getAttribute('aria-orientation')).toBe(mobile ? 'horizontal' : 'vertical')
+    expect(tabs.map(tab => tab.tabIndex)).toEqual([0, -1, -1, -1])
+
+    expect((await pressKey(tabs[0], ignored)).defaultPrevented).toBe(false)
+    expect(catalogApi.section.value).toBe('general')
+    expect((await pressKey(tabs[0], forward)).defaultPrevented).toBe(true)
+    expect(document.activeElement).toBe(tabs[1])
+    expect(catalogApi.section.value).toBe('gateway')
+    expect(tabs[1].getAttribute('aria-selected')).toBe('true')
+    expect(tabs.map(tab => tab.tabIndex)).toEqual([-1, 0, -1, -1])
+    expect(routerMock.replace).toHaveBeenLastCalledWith({ path: '/settings/gateway' })
+
+    await pressKey(tabs[1], 'End')
+    expect(document.activeElement).toBe(tabs[3])
+    expect(catalogApi.section.value).toBe('capabilities')
+    await pressKey(tabs[3], forward)
+    expect(document.activeElement).toBe(tabs[0])
+    await pressKey(tabs[0], backward)
+    expect(document.activeElement).toBe(tabs[3])
+    await pressKey(tabs[3], 'Home')
+    expect(document.activeElement).toBe(tabs[0])
+    expect(tabs.map(tab => tab.tabIndex)).toEqual([0, -1, -1, -1])
+  })
+
+  it('does not navigate by keyboard while settings writes are pending', async () => {
+    const { el, controls } = await mountRail()
+    controls.saveAllPending.value = true
+    await nextTick()
+    const selected = el.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')!
+    await pressKey(selected, 'End')
+    expect(catalogApi.section.value).toBe('general')
+    expect(routerMock.replace).not.toHaveBeenCalled()
+  })
+
+  it('uses a mobile category list and keeps the detail form mounted on return', async () => {
+    const { el, controls } = await mountRail(true)
+    controls.hasUnsavedChanges.value = false
+    await nextTick()
+    const panel = el.querySelector<HTMLElement>('.settings-panel')!
+    const form = panel.querySelector('.settings-panel__interactions')!
+    panel.scrollTop = 120
+    catalogApi.behaviorPanel.value.autoSessionTitles = true
+    el.querySelector<HTMLButtonElement>('.settings-modal__back')!.click()
+    await nextTick()
+    const rail = el.querySelector<HTMLElement>('.settings-rail')!
+    const categories = Array.from(rail.querySelectorAll<HTMLButtonElement>('.settings-rail__item'))
+    expect(rail.getAttribute('role')).toBeNull()
+    expect(categories.every(item => item.tabIndex === 0)).toBe(true)
+    expect(panel.hasAttribute('inert')).toBe(true)
+    expect(document.activeElement).toBe(categories[0])
+    await pressKey(categories[0], 'ArrowDown')
+    expect(document.activeElement).toBe(categories[1])
+    expect(catalogApi.section.value).toBe('general')
+    categories[0].click()
+    await nextTick()
+    expect(panel.hasAttribute('inert')).toBe(false)
+    expect(rail.hasAttribute('inert')).toBe(true)
+    expect(panel.querySelector('.settings-panel__interactions')).toBe(form)
+    expect(panel.scrollTop).toBe(120)
+    expect(catalogApi.behaviorPanel.value.autoSessionTitles).toBe(true)
+    expect(document.activeElement).toBe(panel)
+  })
+
+  it('opens generic mobile Settings on categories, while a deep link opens its detail', async () => {
+    mockCatalog().saveAllPending.value = false
+    catalogApi.loaded.value = false
+    routeState.params.section = undefined
+    routeState.path = '/settings'
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn(() => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() })),
+    })
+    const el = await mountDialog()
+    expect(el.querySelector('.settings-panel')?.hasAttribute('inert')).toBe(true)
+    expect(el.querySelector('.settings-rail')?.hasAttribute('inert')).toBe(false)
+    routeState.params.section = 'gateway'
+    routeState.hash = '#connection'
+    await nextTick()
+    await nextTick()
+    expect(el.querySelector('.settings-panel')?.hasAttribute('inert')).toBe(false)
+    expect(el.querySelector('.settings-rail')?.hasAttribute('inert')).toBe(true)
+    expect(document.activeElement?.id).toBe('settings-gateway-connection')
+  })
+
+  it('excludes hidden categories from the mobile detail focus loop', async () => {
+    const { el, controls } = await mountRail(true)
+    controls.hasUnsavedChanges.value = false
+    await nextTick()
+    const back = el.querySelector<HTMLButtonElement>('.settings-modal__back')!
+    back.focus()
+    back.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true }))
+    expect(document.activeElement?.closest('.settings-panel')).not.toBeNull()
+    expect(document.activeElement?.closest('.settings-rail')).toBeNull()
+    expect(document.activeElement?.closest('[inert]')).toBeNull()
+  })
+})
+
 describe('SettingsDialog keyboard focus loop', () => {
   async function mountHealthyGateway() {
     const controls = mockCatalog()
@@ -440,7 +569,7 @@ describe('SettingsDialog keyboard focus loop', () => {
       disclosure.dispatchEvent(new Event('toggle'))
       await nextTick()
     }
-    const first = el.querySelector<HTMLButtonElement>('#settings-rail-general')!
+    const first = el.querySelector<HTMLButtonElement>('#settings-rail-gateway')!
     const last = disclosure.querySelector<HTMLElement>(open ? '.conn-actions button:last-child' : 'summary')!
     expect(last).not.toBeNull()
 
@@ -459,7 +588,7 @@ describe('SettingsDialog keyboard focus loop', () => {
       <summary tabindex="0">Hidden later summary</summary>
     `
     el.querySelector('.settings-modal')!.appendChild(disclosure)
-    const first = el.querySelector<HTMLButtonElement>('#settings-rail-general')!
+    const first = el.querySelector<HTMLButtonElement>('#settings-rail-gateway')!
     const last = disclosure.querySelector<HTMLButtonElement>('summary button')!
 
     pressTab(first, true)
@@ -470,6 +599,27 @@ describe('SettingsDialog keyboard focus loop', () => {
 })
 
 describe('SettingsDialog exit protection', () => {
+  it.each(['inert', 'hidden', 'cold'])('restores the sidebar opener when the Settings entry is %s', async (state) => {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    controls.hasUnsavedChanges.value = false
+    catalogApi.dirtySections.value = []
+    const sidebar = document.createElement('div')
+    sidebar.className = 'sidebar-foot'
+    sidebar.innerHTML = '<button data-icon="settings">Settings</button>'
+    const invoker = sidebar.querySelector<HTMLButtonElement>('button')!
+    const opener = document.createElement('button')
+    opener.dataset.testid = 'sidebar-toggle-collapsed'
+    document.body.append(sidebar, opener)
+    if (state !== 'cold') invoker.focus()
+    const el = await mountDialog()
+    if (state === 'hidden') sidebar.style.display = 'none'
+    else sidebar.setAttribute('inert', '')
+    el.querySelector<HTMLButtonElement>('.settings-modal__head button')?.click()
+    await nextTick()
+    expect(document.activeElement).toBe(opener)
+  })
+
   it('does not leave a keyboard focus ring on Settings after a pointer close', async () => {
     const controls = mockCatalog()
     controls.saveAllPending.value = false

@@ -840,6 +840,7 @@
       "cliRecipes": "CLI 示例",
       "configSummary": "配置摘要",
       "sections": "设置分区",
+      "backToCategories": "返回设置分类",
       "openSection": "{label} — 打开{section}",
       "unsavedSuffix": "，有未保存的更改",
       "unsavedIn": "{sections}中有未保存的更改",

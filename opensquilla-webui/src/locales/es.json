@@ -840,6 +840,7 @@
       "cliRecipes": "Recetas de la CLI",
       "configSummary": "Resumen de configuración",
       "sections": "Secciones de ajustes",
+      "backToCategories": "Volver a las categorías de ajustes",
       "openSection": "{label} — abrir {section}",
       "unsavedSuffix": ", cambios sin guardar",
       "unsavedIn": "Cambios sin guardar en {sections}",

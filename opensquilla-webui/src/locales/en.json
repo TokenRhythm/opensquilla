@@ -840,6 +840,7 @@
       "cliRecipes": "CLI recipes",
       "configSummary": "Config summary",
       "sections": "Settings sections",
+      "backToCategories": "Back to settings categories",
       "openSection": "{label} — open {section}",
       "unsavedSuffix": ", unsaved changes",
       "unsavedIn": "Unsaved changes in {sections}",

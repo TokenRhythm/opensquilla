@@ -18,7 +18,7 @@ const settingsRow = (page: import('@playwright/test').Page) =>
   page.locator('.sidebar-foot button')
 
 const dialog = (page: import('@playwright/test').Page) =>
-  page.getByRole('dialog', { name: 'Settings' })
+  page.locator('.settings-modal[role="dialog"]')
 
 const railTab = (page: import('@playwright/test').Page, name: string) =>
   dialog(page).getByRole('tab', { name: new RegExp(`^${name}(?::|$)`) })
@@ -525,7 +525,7 @@ test.describe('Settings modal', () => {
     expect(await capture().isChecked()).toBe(initial)
   })
 
-  test('mobile: full-screen dialog with horizontal section chips', async ({ page }) => {
+  test('mobile: full-screen categories open details and return without a horizontal strip', async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 })
     await page.goto(CONTROL_URL + 'config')
     await page.waitForSelector('.conn-pill', { timeout: 10000 })
@@ -534,10 +534,17 @@ test.describe('Settings modal', () => {
     const modalBox = await dialog(page).boundingBox()
     expect(modalBox?.width).toBe(390)
 
-    const rail = dialog(page).getByRole('tablist', { name: 'Settings sections' })
-    await expect(rail).toHaveAttribute('aria-orientation', 'horizontal')
-    await railTab(page, 'Capabilities').click()
+    const rail = dialog(page).getByRole('navigation', { name: 'Settings sections' })
+    await expect(rail).toBeVisible()
+    await expect(dialog(page).getByRole('tablist')).toHaveCount(0)
+    await rail.getByRole('button', { name: /^Capabilities:/ }).click()
+    await expect(rail).toBeHidden()
+    await expect(dialog(page)).toHaveAccessibleName('Capabilities')
     await expect(dialog(page).getByRole('heading', { name: 'Web search' })).toBeVisible()
+    await dialog(page).getByRole('button', { name: 'Back to settings categories' }).click()
+    await expect(dialog(page)).toHaveAccessibleName('Settings')
+    await expect(rail).toBeVisible()
+    await expect(rail.getByRole('button', { name: /^Capabilities:/ })).toBeFocused()
 
     // No horizontal scroll on the page at 390px.
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)

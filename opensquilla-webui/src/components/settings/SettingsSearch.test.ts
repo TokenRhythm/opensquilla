@@ -28,6 +28,27 @@ async function search(input: HTMLInputElement, value: string) {
   await nextTick()
 }
 describe('SettingsSearch', () => {
+  it.each(['isComposing', 'keyCode'])('does not navigate or dismiss while IME owns the keyboard (%s)', async mode => {
+    const { input, host, select } = mountSearch('zh-Hans')
+    await search(input, zh.settings.appearance.themeLabel)
+    const parentKeydown = vi.fn()
+    host.addEventListener('keydown', parentKeydown)
+    for (const key of ['Enter', 'ArrowDown', 'ArrowUp', 'Escape']) {
+      const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, isComposing: mode === 'isComposing' })
+      if (mode === 'keyCode') Object.defineProperty(event, 'keyCode', { value: 229 })
+      input.dispatchEvent(event)
+      await nextTick()
+      expect(event.defaultPrevented).toBe(false)
+      expect(document.activeElement).toBe(input)
+      expect(input.value).toBe(zh.settings.appearance.themeLabel)
+      expect(host.querySelector('.settings-search__results')).not.toBeNull()
+    }
+    expect(select).not.toHaveBeenCalled()
+    expect(parentKeydown).not.toHaveBeenCalled()
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+    expect(select).toHaveBeenCalledExactlyOnceWith('interface', 'settings.appearance.themeLabel')
+  })
+
   it('finds a translated setting and supports keyboard selection without changing values', async () => {
     const { input, host, select } = mountSearch()
     await search(input, 'sidebar width')

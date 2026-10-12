@@ -840,6 +840,7 @@
       "cliRecipes": "CLI レシピ",
       "configSummary": "設定の概要",
       "sections": "設定セクション",
+      "backToCategories": "設定カテゴリーに戻る",
       "openSection": "{label} — {section} を開く",
       "unsavedSuffix": "、未保存の変更あり",
       "unsavedIn": "{sections} に未保存の変更があります",

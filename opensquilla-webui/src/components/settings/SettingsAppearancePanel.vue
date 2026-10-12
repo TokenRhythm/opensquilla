@@ -283,7 +283,7 @@ onBeforeUnmount(stopCustomStepRepeat)
       </div>
     </div>
 
-    <div class="control-row control-row--stack">
+    <div class="control-row">
       <div class="control-row__label-block">
         <span class="control-row__label">{{ t('settings.appearance.visualEffectsLabel') }}</span>
         <span class="control-row__desc">{{ t('settings.appearance.visualEffectsDesc') }}</span>
@@ -299,7 +299,7 @@ onBeforeUnmount(stopCustomStepRepeat)
       </div>
     </div>
 
-    <div class="control-row control-row--stack">
+    <div class="control-row">
       <div class="control-row__label-block">
         <span class="control-row__label">{{ t('settings.appearance.composerFxLabel') }}</span>
         <span class="control-row__desc">{{ t('settings.appearance.composerFxDesc') }}</span>

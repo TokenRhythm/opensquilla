@@ -49,6 +49,21 @@ function select(result: (typeof results.value)[number]) {
   focused.value = false
   emit('select', result.id, result.matchKey)
 }
+function onKeydown(event: KeyboardEvent) {
+  // The IME owns candidate confirmation/navigation. Do not prevent its default,
+  // and keep Escape from reaching the settings dialog while it is composing.
+  if (event.isComposing || event.keyCode === 229) {
+    event.stopPropagation()
+    return
+  }
+  if (event.key === 'Escape') clearSearch(event)
+  else if (event.key === 'ArrowDown') moveResult(event, 1)
+  else if (event.key === 'ArrowUp') moveResult(event, -1)
+  else if (event.key === 'Enter' && event.target === input.value && results.value[0]) {
+    event.preventDefault()
+    select(results.value[0])
+  }
+}
 function clearSearch(event: KeyboardEvent) {
   if (!query.value) return
   event.preventDefault()
@@ -74,9 +89,9 @@ function onFocusOut(event: FocusEvent) {
 </script>
 
 <template>
-  <div ref="root" class="settings-search" @focusin="focused = true" @focusout="onFocusOut" @keydown.esc="clearSearch" @keydown.down="moveResult($event, 1)" @keydown.up="moveResult($event, -1)">
+  <div ref="root" class="settings-search" @focusin="focused = true" @focusout="onFocusOut" @keydown="onKeydown">
     <Icon name="search" :size="15" aria-hidden="true" />
-    <input ref="input" v-model="query" type="search" :disabled="disabled" :aria-label="t('settings.search.label')" :placeholder="t('settings.search.label')" autocomplete="off" @keydown.enter.prevent="results[0] && select(results[0])">
+    <input ref="input" v-model="query" type="search" :disabled="disabled" :aria-label="t('settings.search.label')" :placeholder="t('settings.search.label')" autocomplete="off">
     <div v-if="showResults" role="group" class="settings-search__results" :aria-label="t('settings.search.results')">
       <button v-for="result in results" :key="result.id" type="button" class="settings-search__result" @keydown.enter.stop @click="select(result)">
         <Icon :name="result.icon" :size="16" aria-hidden="true" />

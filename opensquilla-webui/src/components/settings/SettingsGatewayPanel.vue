@@ -19,20 +19,6 @@ const { t } = useI18n()
       <p class="control-section__desc">{{ t(isDesktop ? 'settings.gateway.desktopDesc' : 'settings.gateway.desc') }}</p>
     </div>
 
-    <section
-      id="settings-gateway-support"
-      class="gateway-support"
-      aria-labelledby="settings-gateway-support-title"
-      tabindex="-1"
-    >
-      <h4 id="settings-gateway-support-title" class="gateway-support__title">{{ t('monitorSupport.title') }}</h4>
-      <div class="gateway-support__actions">
-        <GatewayLogViewer />
-        <DesktopLogLocationButton v-if="isDesktop" />
-        <SupportBundleButton />
-      </div>
-    </section>
-
     <div id="settings-gateway-connection" class="settings-composite" tabindex="-1">
       <SetupConnectionPanel :managed="isDesktop" />
     </div>
@@ -53,6 +39,19 @@ const { t } = useI18n()
     >
       <SettingsUpdatePanel />
     </section>
+    <section
+      id="settings-gateway-support"
+      class="settings-composite gateway-support"
+      aria-labelledby="settings-gateway-support-title"
+      tabindex="-1"
+    >
+      <h4 id="settings-gateway-support-title" class="gateway-support__title">{{ t('monitorSupport.title') }}</h4>
+      <div class="gateway-support__actions">
+        <GatewayLogViewer />
+        <DesktopLogLocationButton v-if="isDesktop" />
+        <SupportBundleButton />
+      </div>
+    </section>
   </section>
 </template>
 
@@ -62,9 +61,6 @@ const { t } = useI18n()
   align-items: center;
   flex-wrap: wrap;
   gap: var(--sp-3);
-  border-bottom: 1px solid var(--border);
-  margin-bottom: var(--sp-4);
-  padding-bottom: var(--sp-3);
 }
 
 .gateway-support__title {
