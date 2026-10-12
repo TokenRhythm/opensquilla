@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 
 const activeHolds = ref(0)
 let primedRelease: (() => void) | null = null
+const viewOwners = new Set<symbol>()
 
 /**
  * Optional, mount-time RPCs must not enter the Gateway's serialized dispatch
@@ -36,17 +37,24 @@ export function acquireSessionBootstrapAdmission(): () => void {
   return createSessionBootstrapAdmission()
 }
 
+/** Register a ChatView instance until its setup scope is disposed. */
+export function registerSessionBootstrapAdmissionOwner(): () => void {
+  const owner = Symbol('ChatView')
+  viewOwners.add(owner)
+  return () => { viewOwners.delete(owner) }
+}
+
 /**
  * Hold optional traffic while a lazy ChatView chunk is still resolving.
  *
  * Router navigation starts before App/Sidebar mounted hooks, so this closes
  * the otherwise-unavoidable gap where global metadata RPCs could enter the
  * Gateway's serial dispatcher before ChatView setup has a chance to run.
- * Priming is singleton/idempotent: query-only chat navigation reuses the
- * mounted ChatView and must not accumulate an owner nobody will claim.
+ * A retained ChatView (including one behind Settings) owns subsequent
+ * bootstrap holds itself. Only a future view setup can claim a router prime.
  */
 export function primeSessionBootstrapAdmission(): void {
-  if (primedRelease) return
+  if (viewOwners.size > 0 || primedRelease) return
   primedRelease = createSessionBootstrapAdmission()
 }
 

@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -61,7 +62,7 @@ def _allow_exact_elevation(monkeypatch, shell) -> list[object]:
         actions.append(action)
         return SimpleNamespace(allowed=True)
 
-    monkeypatch.setattr(shell, "gate_elevated_action", allow)
+    monkeypatch.setattr(shell, "gate_elevated_action_async", AsyncMock(side_effect=allow))
     return actions
 
 

@@ -1,4 +1,5 @@
 import { isRetiredControlMessage } from '@/utils/retiredFeatureState'
+import { createClientRequestId } from '@/utils/chat/messageIdentity'
 import { TurnCommandError } from '@/modules/turnCommands'
 import type {
   TurnCommands, TurnCommandRequestOptions, TurnReceiptRequest, TurnReceiptResult,
@@ -84,17 +85,18 @@ function hasPendingSteer(record: DeliveryWalRecord): boolean {
 /** Delivery owns only admission and exact Stop; socket, reads and event recovery keep their existing owners. */
 export function createDurableDelivery(options: DeliveryOptions): DurableDelivery {
   const now = options.now || Date.now
-  const owner = options.ownerId || crypto.randomUUID()
+  const owner = options.ownerId || createClientRequestId()
   const wal = options.wal
   const listeners = new Set<(record: DeliveryUpdate) => void>()
   const observed = new Map<string, string>()
   const changes = new Set<() => void>()
-  const summaries = new Map<string, DeliverySnapshot>()
+  const summaries = new Map<string, Omit<DeliverySnapshot, 'isCurrentIdentity'>>()
   const summaryIdentities = new Map<string, string>()
   const flights = new Map<string, Promise<TurnSendResponse | TurnSteerResponse>>()
   const handoffOwners = new Map<string, { owner: string; revision: number }>()
   const stopIntents = new Map<string, PendingStopIntent>()
   const volatileStopFlights = new Map<string, Promise<void>>()
+  const retryFlights = new Map<string, Promise<void>>()
   const controllers = new Set<AbortController>()
   const renewals = new Set<ReturnType<typeof setInterval>>()
   const controllerIdentities = new Map<AbortController, string>()
@@ -142,7 +144,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     const params = record.request?.kind === 'send' ? record.request.request.params : record.request?.request
     const text = params && ('displayText' in params && typeof params.displayText === 'string'
       ? params.displayText : 'message' in params ? params.message : undefined)
-    const summary: DeliverySnapshot = {
+    const summary: Omit<DeliverySnapshot, 'isCurrentIdentity'> = {
       id: record.ownerRequestId, sessionKey: record.requestSessionKey, phase: record.phase,
       stopPending: !!(record.stop && !record.stop.completed) || !!(intent && !intent.completed), ...(reason ? { waitReason: reason } : {}),
       stopAvailable: !!record.request && !record.paused && !record.stop?.requested && !intent
@@ -696,7 +698,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
           && (item.stop?.request?.taskId === request.taskId || taskIdentity(item) === request.taskId)) || null
       if (record) record = await update(record.ownerRequestId, current => ({ ...current, stop: { requested: true, request: structuredClone(request) } }))
       else {
-        const created = await wal!.prepareDelivery!({ schemaVersion: 2, ownerRequestId: `stop:${crypto.randomUUID()}`,
+        const created = await wal!.prepareDelivery!({ schemaVersion: 2, ownerRequestId: `stop:${createClientRequestId()}`,
           deliveryIdentity: identity, requestSessionKey: request.sessionKey, phase: 'accepted',
           stop: { requested: true, request: structuredClone(request) }, revision: 1, createdAt: now(), updatedAt: now() })
         record = created.record
@@ -705,7 +707,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       // A known exact task Stop remains best effort if durable storage fails.
       if (identity !== options.access.identity()) throw new TurnCommandError('session-changed', 'Stop identity changed', 'DELIVERY_IDENTITY_CHANGED', null)
       if (!identity) throw new TurnCommandError('unavailable', 'Stop identity unavailable', 'DELIVERY_IDENTITY_CHANGED', null)
-      const id = record?.ownerRequestId || `stop:${crypto.randomUUID()}`
+      const id = record?.ownerRequestId || `stop:${createClientRequestId()}`
       const frozen = structuredClone(request)
       const control: DeliveryWalRecord = { ...(record || { schemaVersion: 2, ownerRequestId: id,
         deliveryIdentity: identity, requestSessionKey: frozen.sessionKey, phase: 'accepted',
@@ -902,7 +904,8 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     snapshots: () => [...summaries.values()].map(summary => {
       const intent = stopIntents.get(summary.id)
       const sameIdentity = !!options.access.identity() && summaryIdentities.get(summary.id) === options.access.identity()
-      return { ...summary, stopPending: summary.stopPending || !!(intent && !intent.completed),
+      return { ...summary, isCurrentIdentity: sameIdentity,
+        stopPending: summary.stopPending || !!(intent && !intent.completed),
         stopAvailable: !!summary.stopAvailable && !intent && !disposed && !invalidated && sameIdentity,
         ...(summaryIdentities.has(summary.id) && !sameIdentity ? { waitReason: 'identity' as const } : {}),
         // A switch must not expose another account's request text while wake
@@ -912,15 +915,30 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     subscribe(listener) { changes.add(listener); return () => { changes.delete(listener) } },
     get: id => wal?.getDelivery?.(id) || Promise.resolve(null),
     async retry(id) {
-      if (id) {
-        manualRetries.add(id)
-        const intent = stopIntents.get(id)
-        if (intent) intent.paused = undefined
+      const identity = options.access.identity()
+      if (!identity || disposed || invalidated) return
+      if (!id) { await wake(); return }
+      const intent = stopIntents.get(id)
+      let recordIdentity = intent?.identity || summaryIdentities.get(id)
+      if (recordIdentity && recordIdentity !== identity) return
+      const existing = retryFlights.get(id)
+      if (existing) return existing
+      const currentIdentity = () => !disposed && !invalidated && options.access.identity() === identity
+      const operation = (async () => {
         try {
+          // A direct caller may not have observed this row yet. Establish its
+          // identity before changing a pause or recording a manual trigger.
+          if (!recordIdentity) recordIdentity = (await wal?.getDelivery?.(id))?.deliveryIdentity
+          if (!currentIdentity() || recordIdentity !== identity) return
+          summaryIdentities.set(id, identity)
+          manualRetries.add(id)
+          if (intent) intent.paused = undefined
           if (intent) await persistStopIntent(id, intent)
-          const record = await update(id, current => current.deliveryIdentity === options.access.identity() ? { ...current, paused: undefined } : null)
-          if (record) await round(record)
+          const record = await update(id, current => currentIdentity() && current.deliveryIdentity === identity
+            ? { ...current, paused: undefined } : null)
+          if (record && currentIdentity() && record.deliveryIdentity === identity) await round(record)
         } catch {
+          if (!currentIdentity() || recordIdentity !== identity) return
           if (intent) { reportStopStorage(id, intent); await recoverVolatileStop(id, intent) }
           else {
             const previous = summaries.get(id)
@@ -929,9 +947,9 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
             for (const listener of changes) listener()
           }
         }
-        return
-      }
-      await wake()
+      })().finally(() => { retryFlights.delete(id) })
+      retryFlights.set(id, operation)
+      await operation
     },
     wake,
     lookup,

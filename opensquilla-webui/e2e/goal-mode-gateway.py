@@ -30,6 +30,8 @@ from opensquilla.provider import (
     ToolUseEndEvent,
     ToolUseStartEvent,
 )
+from opensquilla.session.models import SessionNode
+from opensquilla.session.storage import SessionStorage
 
 MODEL = "qwen3:4b"
 OBJECTIVE = "Produce and verify a deterministic release report"
@@ -341,6 +343,19 @@ async def main() -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
     workspace_dir = state_dir / "workspace"
     workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    # Read-only browser fixtures need durable identities for the real V2 lease
+    # protocol. Seed these before Gateway startup without invoking a Provider.
+    initial_keys = json.loads(
+        os.environ.get("OPENSQUILLA_WEBUI_GOAL_E2E_INITIAL_SESSION_KEYS", "[]"),
+    )
+    if initial_keys:
+        storage = await SessionStorage.open(state_dir / "sessions.db")
+        try:
+            for key in initial_keys:
+                await storage.upsert_session(SessionNode(session_key=key, agent_id="main"))
+        finally:
+            await storage.close()
 
     config = GatewayConfig(
         host="127.0.0.1",

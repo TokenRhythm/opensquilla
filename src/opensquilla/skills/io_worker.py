@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 import threading
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 _STOP: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
@@ -23,7 +24,10 @@ async def run_staging_worker[T](function: Callable[..., T], /, *args: Any, **kwa
     """Keep the event loop responsive and join a cancelled worker before cleanup."""
     stop = threading.Event()
     token = _STOP.set(stop)
-    operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    context = contextvars.copy_context()
+    operation = asyncio.get_running_loop().run_in_executor(
+        None, context.run, partial(function, *args, **kwargs),
+    )
     cancellation: asyncio.CancelledError | None = None
     try:
         while not operation.done():

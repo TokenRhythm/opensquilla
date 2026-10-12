@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from opensquilla.sandbox.elevation import (
     ElevationAction,
     consume_approved_elevation,
     gate_elevated_action,
+    gate_elevated_action_async,
     request_elevation,
 )
 from opensquilla.tools.types import ToolContext, current_tool_context
@@ -386,3 +389,113 @@ def test_gate_elevated_action_requests_then_consumes_exact_approval(tmp_path: Pa
         assert queue.get(pending.approval_id or "").consumed is True
     finally:
         queue.close()
+
+
+async def test_async_elevation_preserves_channel_identity_and_single_consumption(tmp_path):
+    from opensquilla.tools.types import CallerKind
+
+    queue = ApprovalQueue(db_path=str(tmp_path / "async.sqlite"))
+    loop_thread = threading.get_ident()
+    sql_threads = []
+    queue._conn.set_trace_callback(lambda _sql: sql_threads.append(threading.get_ident()))
+    token = current_tool_context.set(ToolContext(
+        caller_kind=CallerKind.CHANNEL, is_owner=True, channel_admin_verified=True,
+        sender_id="authenticated-sender", session_key="channel:one", run_mode="safe",
+    ))
+    action = _shell_action("touch /exact")
+    try:
+        pending = await gate_elevated_action_async(
+            action, approval_id=None, session_key="channel:one", queue=queue,
+            reviewer="auto_review", metadata={"senderId": "spoofed"},
+        )
+        entry = await queue.get_async(pending.approval_id)
+        assert entry.params["senderId"] == "authenticated-sender"
+        assert entry.params["reviewer"] == "user"
+        await queue.resolve_async(pending.approval_id, True)
+        outcomes = await asyncio.gather(*(
+            gate_elevated_action_async(
+                action, approval_id=pending.approval_id, session_key="channel:one", queue=queue,
+            ) for _ in range(2)
+        ))
+        assert sorted(result.status for result in outcomes) == ["approval_invalid", "approved"]
+        assert (await queue.get_async(pending.approval_id)).consumed
+        assert sql_threads and loop_thread not in sql_threads
+    finally:
+        current_tool_context.reset(token)
+        queue.close()
+
+
+@pytest.mark.parametrize("mode,intent,status", [
+    ("full", "require_escalated", "full_host_access"),
+    ("safe", "use_default", "use_default"),
+])
+async def test_async_elevation_fast_paths_never_touch_queue(mode, intent, status):
+    class UnusableQueue:
+        def __getattribute__(self, _name):
+            raise AssertionError("fast path touched approval storage")
+
+    token = current_tool_context.set(ToolContext(is_owner=True, run_mode=mode))
+    try:
+        result = await gate_elevated_action_async(
+            replace(_shell_action("true"), sandbox_permissions=intent),
+            approval_id="unused", session_key="one", queue=UnusableQueue(),
+        )
+        assert result.status == status
+    finally:
+        current_tool_context.reset(token)
+
+
+@pytest.mark.parametrize("changed,status", [
+    ("action", "approval_action_mismatch"),
+    ("session", "approval_session_mismatch"),
+    ("sender", "approval_sender_mismatch"),
+])
+async def test_async_elevation_keeps_authority_binding(tmp_path, changed, status):
+    from opensquilla.tools.types import CallerKind
+
+    queue = ApprovalQueue(db_path=str(tmp_path / "binding.sqlite"))
+    ctx = ToolContext(
+        caller_kind=CallerKind.CHANNEL, is_owner=True, channel_admin_verified=True,
+        sender_id="sender-one", session_key="channel:one", run_mode="safe",
+    )
+    token = current_tool_context.set(ctx)
+    action = _shell_action("touch /exact")
+    try:
+        pending = await gate_elevated_action_async(
+            action, approval_id=None, session_key=ctx.session_key, queue=queue,
+        )
+        await queue.resolve_async(pending.approval_id, True)
+        if changed == "action":
+            action = replace(action, argv=("touch", "/different"))
+        elif changed == "session":
+            ctx.session_key = "channel:other"
+        else:
+            ctx.sender_id = "sender-two"
+        result = await gate_elevated_action_async(
+            action, approval_id=pending.approval_id, session_key=ctx.session_key, queue=queue,
+        )
+        assert result.status == status
+        assert not (await queue.get_async(pending.approval_id)).consumed
+    finally:
+        current_tool_context.reset(token)
+        queue.close()
+
+
+async def test_async_elevation_denied_reads_do_not_require_queue(monkeypatch):
+    from opensquilla.sandbox.permissions import FileSystemPermissionProfile
+
+    def unavailable():
+        raise AssertionError("denied reads must be rejected before accessing storage")
+
+    monkeypatch.setattr("opensquilla.gateway.approval_queue.get_approval_queue", unavailable)
+    token = current_tool_context.set(ToolContext(is_owner=True, run_mode="safe"))
+    try:
+        result = await gate_elevated_action_async(
+            _shell_action("touch /exact"), approval_id=None, session_key="one",
+            file_system_profile=FileSystemPermissionProfile(
+                entries=(), denied_read_globs=("**/private/**",),
+            ),
+        )
+        assert result.status == "elevation_forbidden_denied_reads"
+    finally:
+        current_tool_context.reset(token)

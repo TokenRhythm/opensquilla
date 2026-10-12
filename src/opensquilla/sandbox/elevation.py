@@ -628,6 +628,48 @@ def gate_elevated_action(
     )
 
 
+async def gate_elevated_action_async(
+    action: ElevationAction,
+    *,
+    approval_id: str | None,
+    session_key: str | None,
+    queue: ApprovalQueue | None = None,
+    reviewer: ApprovalReviewerName | None = None,
+    file_system_profile: FileSystemPermissionProfile | None = None,
+    metadata: dict[str, object] | None = None,
+) -> ElevationGateResult:
+    """Keep the complete fingerprint check and consume off the event loop."""
+    from opensquilla.tools.run_mode import full_host_access_active
+
+    if full_host_access_active() or action.sandbox_permissions != "require_escalated":
+        return gate_elevated_action(
+            action, approval_id=approval_id, session_key=session_key,
+        )
+    if file_system_profile is None:
+        from opensquilla.sandbox.integration import active_file_system_profile
+
+        file_system_profile = active_file_system_profile()
+    if file_system_profile is not None and not file_system_profile.unsandboxed_execution_allowed:
+        return gate_elevated_action(
+            action, approval_id=approval_id, session_key=session_key,
+            file_system_profile=file_system_profile,
+        )
+    if queue is None:
+        from opensquilla.gateway.approval_queue import get_approval_queue
+
+        queue = get_approval_queue()
+    return await queue.run_operation_async(
+        gate_elevated_action,
+        action,
+        approval_id=approval_id,
+        session_key=session_key,
+        queue=queue,
+        reviewer=reviewer,
+        file_system_profile=file_system_profile,
+        metadata=metadata,
+    )
+
+
 __all__ = [
     "ApprovalDisplay",
     "ApprovalDisplayKind",
@@ -640,5 +682,6 @@ __all__ = [
     "consume_approved_elevation",
     "effective_approval_reviewer",
     "gate_elevated_action",
+    "gate_elevated_action_async",
     "request_elevation",
 ]

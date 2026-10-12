@@ -289,7 +289,7 @@ export function createV4SessionDirectoryChanges(
         // Rebind automatically when a live consumer still owns the logical
         // lease. The composition root may also call resume() here to trigger
         // its snapshot refresh; bindLease() coalesces both requests.
-        if (resumeRequested && listeners.size > 0) void bindLease()
+        if (resumeRequested && listeners.size > 0) void bindLease().catch(() => {})
         return
       }
       // A server-side subscription belongs to the old physical connection;
@@ -338,6 +338,7 @@ export function createV4SessionDirectoryChanges(
     if (boundGeneration !== null && boundGeneration === rpc.generation) return
     if (bindWork) return bindWork
 
+    let generation = rpc.generation
     let work!: Promise<void>
     work = (async () => {
       try {
@@ -355,7 +356,7 @@ export function createV4SessionDirectoryChanges(
           abortAction: 'reject',
         })
         if (disposed || !resumeRequested || listeners.size === 0) return
-        const generation = rpc.generation
+        generation = rpc.generation
         if (boundGeneration === generation) return
         if (unavailableGeneration === generation) return
 
@@ -372,15 +373,17 @@ export function createV4SessionDirectoryChanges(
           releaseRequested = true
         }
       } catch (error) {
-        const generation = rpc.generation
-        if (isExpectedUnavailable(error)) {
+        if (isExpectedUnavailable(error) && rpc.generation === generation) {
           unavailableGeneration = generation
           if (errorCode(error) === 'METHOD_NOT_FOUND' || errorCode(error) === 'UNSUPPORTED') {
             rpc.markUnsupported?.(SESSIONS_SUBSCRIBE_METHOD)
           }
           return
         }
-        if (!disposed && resumeRequested) warn('Session directory subscription failed', error)
+        if (!disposed && resumeRequested) {
+          warn('Session directory subscription failed', error)
+          throw error
+        }
       } finally {
         if (bindWork === work) bindWork = null
         if (releaseRequested && !bindWork) void releaseLease()
@@ -395,7 +398,7 @@ export function createV4SessionDirectoryChanges(
   ): SessionDirectoryChangeSubscription {
     if (disposed) return { close() {} }
     listeners.add(listener)
-    if (resumeRequested) void bindLease()
+    if (resumeRequested) void bindLease().catch(() => {})
     let closed = false
     return {
       close() {

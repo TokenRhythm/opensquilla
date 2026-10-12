@@ -76,11 +76,14 @@ def test_docker_build_validates_generated_webui_before_python_packaging() -> Non
     assert "COPY opensquilla-webui/ ./opensquilla-webui/" in dockerfile
     assert "COPY --from=webui-builder" in dockerfile
     assert dockerfile.index("COPY --from=webui-builder") < dockerfile.index(
-        'RUN pip install --constraint mcp-constraints.txt ".[recommended]"'
+        'pip install --no-deps ".[recommended]"'
     )
-    assert dockerfile.index("RUN python - <<'MCP'") < dockerfile.index(
-        'RUN pip install --constraint mcp-constraints.txt ".[recommended]"'
+    assert "COPY pyproject.toml uv.lock README.md README.release.md ./" in dockerfile
+    assert "uv export --frozen --no-dev --extra recommended --no-emit-project" in dockerfile
+    assert (
+        "pip install --require-hashes --requirement /tmp/opensquilla-requirements.txt" in dockerfile
     )
+    assert "uv.lock" not in _load_dockerignore_rules()
     assert "rm -rf hatch_build.py scripts opensquilla-webui" in dockerfile
     assert "!scripts/verify_webui_artifact.py" in _load_dockerignore_rules()
     assert "opensquilla-webui/public/music" in _load_dockerignore_rules()

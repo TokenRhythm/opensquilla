@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import Awaitable, Callable
@@ -236,6 +237,7 @@ async def prepare_route(
             principal_is_owner=principal.is_owner,
             principal_host_execute=host_execute_allowed,
             run_mode=run_context.run_mode.value,
+            required_services=command.required_services,
         )
         route_envelope.metadata["structured_user_input"] = connection_supports_user_input(conn_id)
     else:
@@ -251,6 +253,7 @@ async def prepare_route(
             session_epoch=session_epoch,
             principal_is_owner=principal.is_owner,
             principal_host_execute=host_execute_allowed,
+            required_services=command.required_services,
         )
     apply_run_context_route_metadata(
         route_envelope,
@@ -355,7 +358,7 @@ async def prepare_route(
             host_execute_allowed=host_execute_allowed, workspace_dir=run_context.workspace,
             workspace_strict=bool(getattr(config, "workspace_strict", True)),
         )
-        pin_sandbox_policy(tool_context, config)
+        await asyncio.to_thread(pin_sandbox_policy, tool_context, config)
         try:
             await validate_workspace_files(
                 command.workspace_files, session=session, storage=storage,

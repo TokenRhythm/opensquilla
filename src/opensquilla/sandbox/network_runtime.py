@@ -170,7 +170,8 @@ class NetworkApprovalService:
         if params is None:
             return self._blocked(policy_request, decision.reason)
 
-        payload = self.approval_requester(
+        payload = await asyncio.to_thread(
+            self.approval_requester,
             params,
             message=(
                 "This network target is outside the current managed-network "
@@ -192,7 +193,7 @@ class NetworkApprovalService:
             await self._run_auto_review(payload, approval_id)
         queue = get_approval_queue()
         try:
-            approved = await queue.wait(
+            approved = await queue.wait_async(
                 approval_id,
                 timeout=self.approval_timeout_seconds,
             )
@@ -200,14 +201,14 @@ class NetworkApprovalService:
             # The originating client/proxy request is gone, so there is no
             # continuation left for this card to resume.
             try:
-                queue.expire_pending(approval_id)
+                await queue.expire_pending_async(approval_id)
             except (KeyError, ValueError):
                 pass
             discard_approval_run_context_authority(approval_id)
             raise
         if not approved:
             try:
-                entry = queue.get(approval_id)
+                entry = await queue.get_async(approval_id)
                 rationale = str(entry.params.get("reviewRationale") or "").strip()
             except KeyError:
                 rationale = ""
@@ -267,7 +268,7 @@ class NetworkApprovalService:
             try:
                 await callback(payload)
             except Exception as exc:
-                self._fail_auto_review_closed(
+                await self._fail_auto_review_closed(
                     approval_id,
                     f"Automatic network review failed closed: {str(exc) or type(exc).__name__}",
                 )
@@ -275,7 +276,7 @@ class NetworkApprovalService:
             from opensquilla.gateway.approval_queue import get_approval_queue
 
             try:
-                entry = get_approval_queue().get(approval_id)
+                entry = await get_approval_queue().get_async(approval_id)
             except KeyError:
                 return
             if not entry.resolved:
@@ -284,23 +285,23 @@ class NetworkApprovalService:
                     and entry.params.get("humanActionable") is True
                 ):
                     return
-                self._fail_auto_review_closed(
+                await self._fail_auto_review_closed(
                     approval_id,
                     "Automatic network review returned without a decision and failed closed.",
                 )
             return
-        self._fail_auto_review_closed(
+        await self._fail_auto_review_closed(
             approval_id,
             "Automatic network review was unavailable and failed closed.",
         )
 
     @staticmethod
-    def _fail_auto_review_closed(approval_id: str, rationale: str) -> None:
+    async def _fail_auto_review_closed(approval_id: str, rationale: str) -> None:
         from opensquilla.gateway.approval_queue import get_approval_queue
 
         queue = get_approval_queue()
         try:
-            entry = queue.get(approval_id)
+            entry = await queue.get_async(approval_id)
         except KeyError:
             return
         if entry.resolved:
@@ -315,8 +316,8 @@ class NetworkApprovalService:
                 "reviewRationale": rationale,
             }
         )
-        queue.update_params(approval_id, params)
-        queue.resolve(approval_id, False)
+        await queue.update_params_async(approval_id, params)
+        await queue.resolve_async(approval_id, False)
 
     async def _consume_temporary_grant_if_needed(self, decision: NetworkDecision) -> None:
         if not self.consume_temporary_grants:

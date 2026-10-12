@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createV4CronScheduler } from './cronSchedulerV4'
+import { CronReadUnavailableError } from '@/modules/cronScheduler'
 
 describe('CronScheduler v4 Adapter', () => {
   it('projects list and run history shapes without leaking wire envelopes', async () => {
@@ -15,7 +16,10 @@ describe('CronScheduler v4 Adapter', () => {
 
     await expect(scheduler.listJobs()).resolves.toEqual([{ id: 'daily', enabled: true }])
     await expect(scheduler.listRuns('daily', 3)).resolves.toEqual([{ summary: 'done' }])
-    expect(request).toHaveBeenLastCalledWith('cron.runs', { id: 'daily', limit: 3 })
+    expect(request).toHaveBeenLastCalledWith('cron.runs', { id: 'daily', limit: 3 }, expect.objectContaining({
+      recoveryClass: 'safe-read', expectedGeneration: 1, timeoutMs: 10_000,
+      timeoutAction: 'reject', abortAction: 'reject',
+    }))
   })
 
   it('owns one remote event lease for all domain subscribers', async () => {
@@ -105,5 +109,53 @@ describe('CronScheduler v4 Adapter', () => {
       .toMatchObject({ expectedGeneration: 2 })
 
     lease.close()
+  })
+
+  it('classifies explicit capacity once and leaves retries to the read owner', async () => {
+    const request = vi.fn().mockRejectedValue(Object.assign(new Error('Connection request queue is full'), {
+      code: 'UNAVAILABLE', retryable: true, retry_after_ms: 2000,
+    }))
+    const scheduler = createV4CronScheduler(
+      { generation: 7, request, ready: vi.fn(async () => undefined) }, { subscribe: vi.fn() },
+    )
+    await expect(scheduler.listJobs()).rejects.toMatchObject({ name: 'CronReadUnavailableError', retryAfterMs: 2000 })
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    Object.assign(new Error('Forbidden'), { code: 'FORBIDDEN', retryable: true }),
+    Object.assign(new Error('Scheduler unavailable'), { code: 'UNAVAILABLE', retryable: true }),
+    new Error('Failed to decode data'),
+  ])('does not classify a permanent or unrelated failure as capacity: %s', async failure => {
+    const scheduler = createV4CronScheduler(
+      { generation: 1, request: vi.fn().mockRejectedValue(failure), ready: vi.fn(async () => undefined) },
+      { subscribe: vi.fn() },
+    )
+    await expect(scheduler.listJobs()).rejects.toBe(failure)
+    expect(failure).not.toBeInstanceOf(CronReadUnavailableError)
+  })
+
+  it('rejects invalid data without retrying', async () => {
+    const request = vi.fn().mockResolvedValue([{ id: null }])
+    const scheduler = createV4CronScheduler(
+      { generation: 1, request, ready: vi.fn(async () => undefined) }, { subscribe: vi.fn() },
+    )
+    await expect(scheduler.listJobs()).rejects.toThrow('cron.list returned an invalid response')
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels before send and rejects a late result from a replaced generation', async () => {
+    const controller = new AbortController()
+    let generation = 1
+    const request = vi.fn(async () => { generation = 2; return [] })
+    const scheduler = createV4CronScheduler(
+      { get generation() { return generation }, request: request as never, ready: vi.fn(async () => undefined) },
+      { subscribe: vi.fn() },
+    )
+    controller.abort()
+    await expect(scheduler.listJobs({ signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
+    expect(request).not.toHaveBeenCalled()
+    await expect(scheduler.listJobs()).rejects.toThrow('Cron read connection changed')
+    expect(request).toHaveBeenCalledTimes(1)
   })
 })

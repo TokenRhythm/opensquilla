@@ -326,7 +326,7 @@
                     autocomplete="off"
                     :placeholder="t('cronSkills.registry.searchPlaceholder')"
                     @input="emit('update:registryQuery', ($event.target as HTMLInputElement).value)"
-                    @keydown.enter="emit('search', sourceMode)"
+                    @keydown.enter="!$event.repeat && emit('search', sourceMode)"
                   />
                 </div>
                 <button

@@ -9,6 +9,7 @@ blast radius is that entry — never the gateway.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,9 @@ import pytest
 
 import opensquilla.channels.manager as manager_module
 from opensquilla.channels.manager import ChannelManager
+from opensquilla.gateway.boot import ServiceContainer, _bind_channel_service_readiness
+from opensquilla.gateway.routing import RouteEnvelope
+from opensquilla.gateway.task_runtime import TaskDependencyError, TaskRuntime
 
 
 class _FakeAdapter:
@@ -101,6 +105,183 @@ async def _teardown(mgr: ChannelManager) -> None:
         await mgr.stop_channel(name)
     if mgr._delivery_store is not None:
         (await mgr._delivery_store.close())
+
+
+def _bind_readiness(manager: ChannelManager):
+    services = ServiceContainer(config=SimpleNamespace(), optional_generation=1)
+    assert _bind_channel_service_readiness(manager, services, config_revision=7)
+    runtime = object.__new__(TaskRuntime)
+    runtime._service_snapshot = lambda: services.optional_services
+
+    def admit(name: str) -> None:
+        runtime._ensure_required_services(RouteEnvelope(
+            source_kind="channel", source_name=name, agent_id="main", session_key="test",
+            required_services=(f"channel:{name}",),
+        ))
+
+    return services, admit
+
+
+async def test_hot_add_publishes_readiness_before_dispatch(
+    manager: ChannelManager, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services, admit = _bind_readiness(manager)
+    dispatched = asyncio.Event()
+
+    async def dispatch(**kwargs):
+        admit(kwargs["session_prefix"])
+        dispatched.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(manager_module, "run_channel_dispatch", dispatch)
+    try:
+        assert await manager.reconcile([_entry("hot")]) == {"hot": "started"}
+        await asyncio.wait_for(dispatched.wait(), timeout=1)
+        assert services.optional_services["channel:hot"] == {
+            "status": "ready", "generation": 1, "config_revision": 7, "owner_generation": 1,
+        }
+    finally:
+        await _teardown(manager)
+
+
+async def test_healthy_channel_does_not_wait_for_other_optional_startup(
+    manager: ChannelManager, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services, admit = _bind_readiness(manager)
+    release = asyncio.Event()
+    dispatched = asyncio.Event()
+
+    class SlowAdapter(_FakeAdapter):
+        async def start(self):
+            await release.wait()
+            await super().start()
+
+    async def dispatch(**kwargs):
+        admit(kwargs["session_prefix"])
+        if kwargs["session_prefix"] == "fast":
+            dispatched.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(manager_module, "run_channel_dispatch", dispatch)
+    for name, adapter in (("fast", _FakeAdapter), ("slow", SlowAdapter)):
+        entry = _entry(name)
+        manager._install_adapter(entry, adapter(entry))
+    start = asyncio.create_task(manager.start_all())
+    try:
+        await asyncio.wait_for(dispatched.wait(), timeout=1)
+        assert not start.done()
+        assert services.optional_services["channel:slow"]["status"] == "starting"
+        admit("fast")
+        with pytest.raises(TaskDependencyError, match="dependency_starting"):
+            admit("slow")
+    finally:
+        release.set()
+        await start
+        await _teardown(manager)
+
+
+async def test_readiness_tracks_failed_start_restart_stop_and_hot_remove(
+    manager: ChannelManager,
+) -> None:
+    services, admit = _bind_readiness(manager)
+    try:
+        assert await manager.reconcile([_entry("hot", fail_start=True)]) == {"hot": "failed"}
+        assert services.optional_services["channel:hot"]["status"] == "degraded"
+        with pytest.raises(TaskDependencyError, match="dependency_unavailable"):
+            admit("hot")
+        manager.get("hot").fail_start = False
+        await manager.restart_channel("hot")
+        admit("hot")
+        await manager.stop_channel("hot")
+        assert services.optional_services["channel:hot"]["status"] == "disabled"
+        with pytest.raises(TaskDependencyError, match="dependency_unavailable"):
+            admit("hot")
+        await manager.restart_channel("hot")
+        admit("hot")
+        assert await manager.reconcile([]) == {"hot": "removed"}
+        assert "channel:hot" not in services.optional_services
+        assert not manager._stopping_channels
+    finally:
+        await _teardown(manager)
+
+
+async def test_stopping_dispatch_cannot_republish_ready_during_drain(
+    manager: ChannelManager, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services, admit = _bind_readiness(manager)
+    draining = asyncio.Event()
+    release = asyncio.Event()
+
+    async def drain(name):
+        draining.set()
+        await release.wait()
+
+    await manager.reconcile([_entry("hot")])
+    monkeypatch.setattr(manager._delivery_store, "drain_channel", drain)
+    stop = asyncio.create_task(manager.stop_channel("hot"))
+    try:
+        await asyncio.wait_for(draining.wait(), timeout=1)
+        manager._set_dispatch_state("hot", "running")
+        assert services.optional_services["channel:hot"]["status"] == "stopping"
+        with pytest.raises(TaskDependencyError, match="dependency_starting"):
+            admit("hot")
+    finally:
+        release.set()
+        await stop
+        await _teardown(manager)
+
+
+async def test_dispatch_failure_clears_readiness_until_retry_or_manual_restart(
+    manager: ChannelManager, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services, admit = _bind_readiness(manager)
+    statuses = []
+    publish = manager._service_status_callback
+
+    def record(name, status):
+        statuses.append(status)
+        publish(name, status)
+
+    async def dispatch(**kwargs):
+        admit(kwargs["session_prefix"])
+        raise RuntimeError("synthetic dispatch failure")
+
+    manager.set_service_status_callback(record)
+    manager._max_retries = 1
+    manager._retry_backoff_initial = 0
+    manager._max_restart_cycles = 0
+    monkeypatch.setattr(manager_module, "run_channel_dispatch", dispatch)
+    try:
+        await manager.reconcile([_entry("hot")])
+        await asyncio.wait_for(manager._tasks["hot"], timeout=1)
+        assert statuses.count("degraded") >= 2
+        first_failure = statuses.index("degraded")
+        assert "ready" in statuses[first_failure + 1:]
+        assert manager._dispatch_states["hot"] == "dead"
+        assert services.optional_services["channel:hot"]["status"] == "degraded"
+        with pytest.raises(TaskDependencyError, match="dependency_unavailable"):
+            admit("hot")
+    finally:
+        await _teardown(manager)
+
+
+async def test_channel_readiness_generation_fences_late_start_and_old_cleanup(
+    manager: ChannelManager,
+) -> None:
+    services, admit = _bind_readiness(manager)
+    manager._publish_service_status("hot", "ready")
+    services.optional_generation += 1
+    manager._publish_service_status("hot", "stopping")
+    manager._publish_service_status("hot", "ready")
+    assert services.optional_services["channel:hot"]["status"] == "stopping"
+    replacement = ChannelManager({}, None, None)
+    assert _bind_channel_service_readiness(replacement, services, config_revision=8)
+    replacement._publish_service_status("hot", "ready")
+    manager._publish_service_status("hot", None)
+    manager._publish_service_status("hot", "degraded")
+    admit("hot")
+    assert services.optional_services["channel:hot"]["generation"] == 2
+    await _teardown(manager)
 
 
 async def test_add_starts_a_new_channel_live(manager: ChannelManager) -> None:

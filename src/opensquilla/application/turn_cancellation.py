@@ -58,7 +58,7 @@ class CancellationPrimitives(Protocol):
 
     async def cancel_processes(self, key: str) -> int: ...
 
-    def reject_approvals(self, key: str) -> int: ...
+    async def reject_approvals(self, key: str) -> int: ...
 
     async def drain(self, key: str, task_ids: tuple[str, ...], deadline: float) -> None: ...
 
@@ -300,7 +300,7 @@ class TurnCancellation:
                 )
                 cancelled_tasks += count
                 cancelled_this_pass += count
-                approvals += ports.reject_approvals(candidate)
+                approvals += await ports.reject_approvals(candidate)
                 if count > 0:
                     requested_tasks.update(new_tasks)
                     cancelled_sessions.add(candidate)

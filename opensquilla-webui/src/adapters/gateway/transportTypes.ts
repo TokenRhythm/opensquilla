@@ -5,6 +5,19 @@ export interface TransportDeliveryReceipt {
   delivery_id: number
 }
 
+export interface TransportLaneReceipt {
+  connection_epoch: string
+  subscription_epoch: string
+  delivery_id: number
+}
+
+export interface TransportLaneRetireReceipt {
+  connection_epoch: string
+  subscription_epoch: string
+  retire_token: string
+  final_published_id: number
+}
+
 export interface TransportInstalledReceipt {
   key: string
   snapshot_id: string

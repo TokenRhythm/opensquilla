@@ -368,6 +368,7 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     attachments,
     workspaceFiles,
     queueMode,
+    requiredServices,
     // Legacy aliases can exist in handoff WAL records written by an older
     // client. They are removed when a canonical value is present below, but
     // remain available as a fallback when only the old spelling was stored.
@@ -463,6 +464,7 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     ...(attachments !== undefined ? { attachments } : {}),
     ...(workspaceFiles !== undefined ? { workspaceFiles } : {}),
     ...(queueMode !== undefined ? { queueMode } : {}),
+    ...(requiredServices !== undefined ? { requiredServices } : {}),
   }
 }
 

@@ -311,6 +311,15 @@
           "items": {
             "$ref": "#/$defs/SelectedSkillRef"
           }
+        },
+        "contentUnavailableReason": {
+          "type": "string",
+          "description": "Machine-readable reason why a bounded legacy body has no safe contentRef; the authoritative body remains in storage.",
+          "enum": [
+            "content_metadata_pending",
+            "display_projection_too_large",
+            "content_reference_unavailable"
+          ]
         }
       }
     },

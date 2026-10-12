@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -91,7 +90,7 @@ async def test_windows_setup_status_reports_windows_default_ready(monkeypatch) -
     monkeypatch.setattr(
         setup_state,
         "_probe_windows_sandbox_support",
-        lambda: setup_state.WindowsSetupSupport(
+        lambda **_kwargs: setup_state.WindowsSetupSupport(
             default_backend_available=True,
             ctypes_available=True,
             token_api_available=True,
@@ -136,7 +135,7 @@ async def test_ensure_windows_setup_repairs_missing_network_boundary(
     monkeypatch.setattr(
         setup_state,
         "_probe_windows_sandbox_support",
-        lambda: setup_state.WindowsSetupSupport(
+        lambda **_kwargs: setup_state.WindowsSetupSupport(
             default_backend_available=True,
             ctypes_available=True,
             token_api_available=True,
@@ -151,7 +150,7 @@ async def test_ensure_windows_setup_repairs_missing_network_boundary(
         lambda marker_path: marker_path.write_text("{}"),
     )
 
-    result = await setup_state.ensure_sandbox_setup(SimpleNamespace())
+    result = setup_state._ensure_windows_setup_sync(SimpleNamespace())
 
     assert result.state is setup_state.SandboxSetupState.READY
     assert result.requires_admin is False
@@ -174,7 +173,7 @@ async def test_ensure_windows_setup_requires_admin_before_mutating(
     monkeypatch.setattr(
         setup_state,
         "_probe_windows_sandbox_support",
-        lambda: setup_state.WindowsSetupSupport(
+        lambda **_kwargs: setup_state.WindowsSetupSupport(
             default_backend_available=False,
             ctypes_available=True,
             token_api_available=True,
@@ -207,7 +206,7 @@ async def test_ensure_windows_setup_requires_admin_before_mutating(
         ),
     )
 
-    result = await setup_state.ensure_sandbox_setup(SimpleNamespace())
+    result = setup_state._ensure_windows_setup_sync(SimpleNamespace())
 
     assert result.state is setup_state.SandboxSetupState.READY
     assert result.requires_admin is False
@@ -215,57 +214,77 @@ async def test_ensure_windows_setup_requires_admin_before_mutating(
     assert calls == []
 
 
-async def test_ensure_windows_setup_keeps_event_loop_responsive_during_elevation(
-    monkeypatch,
-    tmp_path,
-) -> None:
+async def test_ensure_windows_setup_delegates_async_and_forwards_repair(monkeypatch) -> None:
+    from opensquilla.sandbox import setup_state
+    from opensquilla.sandbox.backend import windows_setup_process
+
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    calls = []
+
+    async def observe(config, *, repair_identity, on_unavailable):
+        calls.append(repair_identity)
+        entered.set()
+        await finish.wait()
+        return setup_state.SetupResult(setup_state.SandboxSetupState.READY, "win32", "ready")
+
+    monkeypatch.setattr(windows_setup_process, "run_windows_setup_process", observe)
+    monkeypatch.setattr(setup_state, "_platform_name", lambda: "win32")
+    task = asyncio.create_task(setup_state.ensure_sandbox_setup(None, repair_identity=True))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    assert not task.done()
+    finish.set()
+    result = await task
+    assert result.state is setup_state.SandboxSetupState.READY
+    assert calls == [True]
+
+
+async def test_launcher_invalidity_cannot_revoke_new_runtime(monkeypatch) -> None:
+    from opensquilla.sandbox import setup_runtime, setup_state
+    from opensquilla.sandbox.backend import windows_setup_process
+
+    setup_runtime.reset_sandbox_setup_runtime_state()
+    ready = setup_state.SetupResult(setup_state.SandboxSetupState.READY, "win32", "ready")
+    setup_runtime._LAST_RESULT = ready
+
+    async def observe(config, *, repair_identity, on_unavailable):
+        setup_runtime.reset_sandbox_setup_runtime_state()
+        setup_runtime._LAST_RESULT = ready
+        on_unavailable("old launcher failed")
+        return ready
+
+    monkeypatch.setattr(windows_setup_process, "run_windows_setup_process", observe)
+    try:
+        await setup_state._ensure_windows_setup(None)
+        assert setup_runtime._LAST_RESULT is ready
+    finally:
+        setup_runtime.reset_sandbox_setup_runtime_state()
+
+
+def test_invalid_setup_is_published_before_helper_mutation(monkeypatch, tmp_path) -> None:
     from opensquilla.sandbox import setup_state
 
-    marker = tmp_path / "setup_marker.json"
-
-    monkeypatch.setattr(setup_state.sys, "platform", "win32")
-    monkeypatch.setattr(setup_state, "_windows_setup_marker_path", lambda: marker)
-    monkeypatch.setattr(setup_state, "_windows_process_is_admin", lambda: False)
+    events = []
     monkeypatch.setattr(
         setup_state,
         "_probe_windows_sandbox_support",
-        lambda: setup_state.WindowsSetupSupport(
-            default_backend_available=False,
-            ctypes_available=True,
-            token_api_available=True,
-            acl_api_available=True,
-            setup_ready=False,
-            proxy_allowlist_enforced=False,
-        ),
+        lambda **kw: setup_state.WindowsSetupSupport(False, True, True, True, False, False),
     )
-
-    def slow_elevated_helper(_marker_path) -> None:
-        time.sleep(0.25)
-
+    monkeypatch.setattr(setup_state, "_windows_setup_marker_path", lambda: tmp_path / "marker")
+    monkeypatch.setattr(setup_state, "_windows_process_is_admin", lambda: False)
     monkeypatch.setattr(
-        setup_state,
-        "_run_windows_setup_helper_elevated",
-        slow_elevated_helper,
+        setup_state, "_run_windows_setup_helper_elevated", lambda path: events.append("mutate")
     )
     monkeypatch.setattr(
         setup_state,
         "_windows_default_setup_result",
-        lambda: setup_state.SetupResult(
-            state=setup_state.SandboxSetupState.READY,
-            platform="win32",
-            message="Windows default sandbox is ready.",
-            requires_admin=False,
-        ),
+        lambda: setup_state.SetupResult(setup_state.SandboxSetupState.READY, "win32", "ready"),
     )
-
-    started = time.perf_counter()
-    task = asyncio.create_task(setup_state.ensure_sandbox_setup(SimpleNamespace()))
-    await asyncio.sleep(0.02)
-    scheduler_delay = time.perf_counter() - started
-    result = await task
-
-    assert scheduler_delay < 0.15
+    result = setup_state._ensure_windows_setup_sync(
+        None, on_unavailable=lambda detail: events.append("unavailable")
+    )
     assert result.state is setup_state.SandboxSetupState.READY
+    assert events == ["unavailable", "mutate"]
 
 
 async def test_ensure_windows_setup_reports_elevated_helper_failure(
@@ -282,7 +301,7 @@ async def test_ensure_windows_setup_reports_elevated_helper_failure(
     monkeypatch.setattr(
         setup_state,
         "_probe_windows_sandbox_support",
-        lambda: setup_state.WindowsSetupSupport(
+        lambda **_kwargs: setup_state.WindowsSetupSupport(
             default_backend_available=False,
             ctypes_available=True,
             token_api_available=True,
@@ -297,7 +316,7 @@ async def test_ensure_windows_setup_reports_elevated_helper_failure(
         lambda marker_path: (_ for _ in ()).throw(OSError("elevated_setup_cancelled")),
     )
 
-    result = await setup_state.ensure_sandbox_setup(SimpleNamespace())
+    result = setup_state._ensure_windows_setup_sync(SimpleNamespace())
 
     assert result.state is setup_state.SandboxSetupState.FAILED
     assert result.requires_admin is True
@@ -314,7 +333,7 @@ async def test_windows_setup_status_reports_windows_default_not_setup(
     monkeypatch.setattr(
         setup_state,
         "_probe_windows_sandbox_support",
-        lambda: setup_state.WindowsSetupSupport(
+        lambda **_kwargs: setup_state.WindowsSetupSupport(
             default_backend_available=False,
             ctypes_available=True,
             token_api_available=True,
@@ -377,7 +396,9 @@ async def test_windows_setup_repairs_stale_offline_identity(
 
     monkeypatch.setattr(setup_state.sys, "platform", "win32")
     monkeypatch.setattr(setup_state, "_windows_process_is_admin", lambda: True)
-    monkeypatch.setattr(setup_state, "_probe_windows_sandbox_support", lambda: next(probes))
+    monkeypatch.setattr(
+        setup_state, "_probe_windows_sandbox_support", lambda **_kwargs: next(probes)
+    )
     monkeypatch.setattr(setup_state, "_windows_setup_marker_path", lambda: marker)
     monkeypatch.setattr(
         setup_state,
@@ -385,7 +406,7 @@ async def test_windows_setup_repairs_stale_offline_identity(
         lambda marker_path: marker_path.write_text("{}"),
     )
 
-    result = await setup_state.ensure_sandbox_setup(SimpleNamespace())
+    result = setup_state._ensure_windows_setup_sync(SimpleNamespace())
 
     assert result.state is setup_state.SandboxSetupState.READY
     assert result.detail == "proxy_allowlist=ready"
@@ -425,7 +446,9 @@ async def test_windows_setup_repairs_stale_identity_through_elevated_helper(
 
     monkeypatch.setattr(setup_state.sys, "platform", "win32")
     monkeypatch.setattr(setup_state, "_windows_process_is_admin", lambda: False)
-    monkeypatch.setattr(setup_state, "_probe_windows_sandbox_support", lambda: next(probes))
+    monkeypatch.setattr(
+        setup_state, "_probe_windows_sandbox_support", lambda **_kwargs: next(probes)
+    )
     monkeypatch.setattr(setup_state, "_windows_setup_marker_path", lambda: marker)
     monkeypatch.setattr(
         setup_state,
@@ -433,7 +456,7 @@ async def test_windows_setup_repairs_stale_identity_through_elevated_helper(
         lambda path: helper_calls.append(path),
     )
 
-    result = await setup_state.ensure_sandbox_setup(SimpleNamespace())
+    result = setup_state._ensure_windows_setup_sync(SimpleNamespace())
 
     assert result.state is setup_state.SandboxSetupState.READY
     assert result.detail == "proxy_allowlist=ready"
@@ -475,7 +498,9 @@ async def test_windows_setup_repairs_unwritable_persistent_storage(
 
     monkeypatch.setattr(setup_state.sys, "platform", "win32")
     monkeypatch.setattr(setup_state, "_windows_process_is_admin", lambda: False)
-    monkeypatch.setattr(setup_state, "_probe_windows_sandbox_support", lambda: next(probes))
+    monkeypatch.setattr(
+        setup_state, "_probe_windows_sandbox_support", lambda **_kwargs: next(probes)
+    )
     monkeypatch.setattr(setup_state, "_windows_setup_marker_path", lambda: marker)
     monkeypatch.setattr(
         setup_state,
@@ -483,7 +508,7 @@ async def test_windows_setup_repairs_unwritable_persistent_storage(
         lambda path: helper_calls.append(path),
     )
 
-    result = await setup_state.ensure_sandbox_setup(SimpleNamespace())
+    result = setup_state._ensure_windows_setup_sync(SimpleNamespace())
 
     assert result.state is setup_state.SandboxSetupState.READY
     assert helper_calls == [marker]
@@ -509,7 +534,7 @@ async def test_ensure_windows_setup_writes_marker_when_windows_checks_are_ready(
         wfp_rule_version=WFP_RULE_VERSION,
     )
 
-    def fake_probe() -> setup_state.WindowsSetupSupport:
+    def fake_probe(**_kwargs) -> setup_state.WindowsSetupSupport:
         ready = marker.exists()
         return setup_state.WindowsSetupSupport(
             default_backend_available=ready,
@@ -517,7 +542,7 @@ async def test_ensure_windows_setup_writes_marker_when_windows_checks_are_ready(
             token_api_available=True,
             acl_api_available=True,
             setup_ready=ready,
-                proxy_allowlist_enforced=ready,
+            proxy_allowlist_enforced=ready,
         )
 
     monkeypatch.setattr(setup_state.sys, "platform", "win32")
@@ -530,7 +555,7 @@ async def test_ensure_windows_setup_writes_marker_when_windows_checks_are_ready(
         lambda marker_path: marker_path.write_text("{}"),
     )
 
-    result = await setup_state.ensure_sandbox_setup(SimpleNamespace())
+    result = setup_state._ensure_windows_setup_sync(SimpleNamespace())
 
     assert result.state is setup_state.SandboxSetupState.READY
     assert result.requires_admin is False
@@ -545,7 +570,7 @@ def test_windows_setup_status_reports_network_ready(monkeypatch) -> None:
     monkeypatch.setattr(
         setup_state,
         "_probe_windows_sandbox_support",
-        lambda: setup_state.WindowsSetupSupport(
+        lambda **_kwargs: setup_state.WindowsSetupSupport(
             default_backend_available=True,
             ctypes_available=True,
             token_api_available=True,
@@ -615,7 +640,7 @@ async def test_ensure_windows_setup_records_network_marker(monkeypatch, tmp_path
     monkeypatch.setattr(
         mod,
         "_probe_windows_sandbox_support",
-        lambda: mod.WindowsSetupSupport(
+        lambda **_kwargs: mod.WindowsSetupSupport(
             default_backend_available=False,
             ctypes_available=True,
             token_api_available=True,
@@ -648,6 +673,6 @@ async def test_ensure_windows_setup_records_network_marker(monkeypatch, tmp_path
         ),
     )
 
-    result = await mod.ensure_sandbox_setup(config=object())
+    result = mod._ensure_windows_setup_sync(config=object())
 
     assert result.state == mod.SandboxSetupState.READY

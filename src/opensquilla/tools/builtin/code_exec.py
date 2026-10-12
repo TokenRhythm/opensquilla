@@ -24,11 +24,11 @@ from opensquilla.sandbox.denial_attribution import is_likely_sandbox_denied
 from opensquilla.sandbox.elevation import (
     ApprovalDisplay,
     ElevationAction,
-    gate_elevated_action,
+    gate_elevated_action_async,
 )
 from opensquilla.sandbox.integration import (
     SandboxRuntime,
-    consume_backend_denial_retry,
+    consume_backend_denial_retry_async,
     escalate_backend_denial,
     escalate_unavailable_backend_in_managed_mode,
     gate_action,
@@ -1394,7 +1394,7 @@ async def execute_code(
             justification=justification,
             prefix_rule=prefix_rule,
         )
-        gate = gate_elevated_action(
+        gate = await gate_elevated_action_async(
             action,
             approval_id=approval_id,
             session_key=ctx.session_key if ctx is not None else None,
@@ -1480,7 +1480,7 @@ async def execute_code(
             sandbox_enabled = False
             elevated_code_execution = True
         else:
-            retry_gate = consume_backend_denial_retry(
+            retry_gate = await consume_backend_denial_retry_async(
                 approval_id,
                 request,
                 _policy,

@@ -264,23 +264,29 @@ export function useChatTextRendering() {
       }
     }
 
-    // Toggle the shared code-highlight flag only across the synchronous parse;
-    // try/finally guarantees it is restored even if marked.parse throws, so a
-    // later highlighted render can never inherit a stale "plain" flag.
-    let rawHtml: string
-    const { text: stashedText, stash } = mathMode === 'defer'
-      ? { text, stash: [] as MathEntry[] }
-      : stashMath(text)
-    codeHighlightEnabled = highlight
+    let html: string
     try {
-      rawHtml = marked.parse(stashedText, { async: false, breaks: true }) as string
-    } finally {
-      codeHighlightEnabled = true
+      const { text: stashedText, stash } = mathMode === 'defer'
+        ? { text, stash: [] as MathEntry[] }
+        : stashMath(text)
+      // Restore the shared flag even when the synchronous parser fails.
+      codeHighlightEnabled = highlight
+      let rawHtml: string
+      try {
+        rawHtml = marked.parse(stashedText, { async: false, breaks: true }) as string
+      } finally {
+        codeHighlightEnabled = true
+      }
+      const sanitizedHtml = sanitizeMarkdownHtml(rawHtml)
+      html = stash.length > 0
+        ? sanitizeMarkdownHtml(restoreMath(sanitizedHtml, stash), true)
+        : sanitizedHtml
+    } catch {
+      // Pathological Markdown can overflow the parser (including a long plain
+      // line). Keep that message readable without failing the whole chat. Only
+      // escaped original text enters this constant wrapper, never parser HTML.
+      html = `<div class="chat-markdown-plain">${escapeHtml(text)}</div>`
     }
-    const sanitizedHtml = sanitizeMarkdownHtml(rawHtml)
-    const html = stash.length > 0
-      ? sanitizeMarkdownHtml(restoreMath(sanitizedHtml, stash), true)
-      : sanitizedHtml
 
     if (cacheMode === 'settled') {
       // UTF-16 code units are a conservative and deterministic approximation

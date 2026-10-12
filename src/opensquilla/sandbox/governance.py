@@ -404,9 +404,21 @@ class ApprovalGate:
             # The authenticated ingress identity takes precedence over any
             # call-site metadata so a tool cannot select another recipient.
             params.update(channel_routing)
-        approval_id = self._queue.request(namespace=self._namespace, params=params)
+        request_async = getattr(self._queue, "request_async", None)
+        if callable(request_async):
+            approval_id = await request_async(namespace=self._namespace, params=params)
+        else:
+            approval_id = await asyncio.to_thread(
+                self._queue.request,
+                self._namespace,
+                params,
+            )
         try:
-            approved = await self._queue.wait(approval_id, timeout=self._timeout)
+            wait_async = getattr(self._queue, "wait_async", None)
+            if callable(wait_async):
+                approved = await wait_async(approval_id, timeout=self._timeout)
+            else:
+                approved = await self._queue.wait(approval_id, timeout=self._timeout)
         except Exception:
             # Defensive: if the queue implementation itself errors, surface a
             # structured denial rather than crashing the tool call. The queue
@@ -420,7 +432,11 @@ class ApprovalGate:
                 and request.action_kind in _L3_HOST_EXEC_ACTIONS
             ):
                 try:
-                    self._queue.consume(approval_id)
+                    consume_async = getattr(self._queue, "consume_async", None)
+                    if callable(consume_async):
+                        await consume_async(approval_id)
+                    else:
+                        await asyncio.to_thread(self._queue.consume, approval_id)
                 except Exception as exc:
                     result = DenialResult(
                         reason=DenialReason.POLICY_DENIED,

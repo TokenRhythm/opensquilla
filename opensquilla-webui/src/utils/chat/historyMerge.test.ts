@@ -47,6 +47,38 @@ describe('rehomePromotedSteerRows', () => {
 })
 
 describe('mergeLiveOnlyFields', () => {
+  it('never restores an older body or its presentation after the content revision changes', () => {
+    const previous = msg({
+      messageId: 'answer', text: 'Old complete answer', contentRevision: 'r1', previewComplete: true,
+      reasoning: { text: 'Old reasoning', seconds: 8 },
+      timeline: [{ type: 'text', raw: 'Old complete answer', presentation: 'answer' }],
+    })
+    const merged = mergeLiveOnlyFields(previous, msg({
+      messageId: 'answer', text: 'New preview', contentRevision: 'r2', previewComplete: false,
+      timeline: [],
+    }))
+    expect(merged.text).toBe('New preview')
+    expect(merged.previewComplete).toBe(false)
+    expect(merged.timeline).toEqual([])
+    expect(merged.reasoning).toBeUndefined()
+  })
+
+  it('requires revision equality to keep a complete body and accepts a complete shorter answer', () => {
+    const previous = msg({ text: 'Old complete answer', contentRevision: 'r1', previewComplete: true })
+    expect(mergeLiveOnlyFields(previous, msg({ text: 'Unknown preview', previewComplete: false })).text)
+      .toBe('Unknown preview')
+    expect(mergeLiveOnlyFields(previous, msg({ text: 'Short edit', contentRevision: 'r1', previewComplete: true })).text)
+      .toBe('Short edit')
+  })
+
+  it('keeps measured reasoning duration without replacing the authoritative reasoning text', () => {
+    const merged = mergeLiveOnlyFields(
+      msg({ reasoning: { text: 'Old text', seconds: 8 } }),
+      msg({ reasoning: { text: 'Server text', seconds: 0 } }),
+    )
+    expect(merged.reasoning).toEqual({ text: 'Server text', seconds: 8 })
+  })
+
   it('keeps the optimistic identity across the first authoritative replacement', () => {
     const optimistic = msg({ clientId: 'local-turn' })
     const merged = mergeLiveOnlyFields(

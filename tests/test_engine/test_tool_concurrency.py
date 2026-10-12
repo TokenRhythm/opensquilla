@@ -260,17 +260,26 @@ async def test_sessions_send_different_targets_run_concurrent() -> None:
         ("sessions_send", {"session_key": "agent:main:child-a", "message": "one"}),
         ("sessions_send", {"session_key": "agent:main:child-b", "message": "two"}),
     ]
-    intervals: list[tuple[str, str, float, float]] = []
+    started: list[tuple[str, str]] = []
+    completed: list[tuple[str, str]] = []
+    both_started = asyncio.Event()
+    handlers_completed = asyncio.Event()
+    release_tools = asyncio.Event()
 
     async def _handler(tc: ToolCall) -> ToolResult:
         target = str(tc.arguments["session_key"])
-        start = time.monotonic()
-        await asyncio.sleep(_TOOL_SLEEP_S)
-        intervals.append((tc.tool_name, target, start, time.monotonic()))
+        identity = (tc.tool_use_id, target)
+        started.append(identity)
+        if len(started) == len(tool_calls):
+            both_started.set()
+        await release_tools.wait()
+        completed.append(identity)
+        if len(completed) == len(tool_calls):
+            handlers_completed.set()
         return ToolResult(
             tool_use_id=tc.tool_use_id,
             tool_name=tc.tool_name,
-            content="ok",
+            content=f"ok:{target}",
         )
 
     provider = _FixedToolCallArgsProvider(tool_calls)
@@ -281,14 +290,38 @@ async def test_sessions_send_different_targets_run_concurrent() -> None:
         tool_handler=_handler,
     )
 
-    t0 = time.monotonic()
-    await _collect(agent)
-    elapsed = time.monotonic() - t0
+    expected = [(f"tool-{i}", args["session_key"]) for i, (_, args) in enumerate(tool_calls)]
+    turn = asyncio.create_task(_collect(agent))
+    try:
+        # Both real Agent dispatches must enter before either handler may finish.
+        # The timeout only bounds a broken dispatcher, not acceptable tool latency.
+        async with asyncio.timeout(5):
+            await both_started.wait()
+        assert sorted(started) == expected
+        assert completed == []
+        assert not turn.done()
+        assert len(provider.calls) == 1
+        release_tools.set()
+        # Result projection and a second provider round are separate Agent-loop
+        # contracts. This test owns only keyed dispatch: both handlers must
+        # finish once their shared barrier opens.
+        async with asyncio.timeout(5):
+            await handlers_completed.wait()
+    finally:
+        release_tools.set()
+        cancelled_by_cleanup = False
+        if not turn.done():
+            turn.cancel()
+            cancelled_by_cleanup = True
+        done, pending = await asyncio.wait({turn}, timeout=5)
+        assert not pending, "Tool concurrency test task did not settle during cleanup"
+        await asyncio.gather(*done, return_exceptions=True)
+        if not cancelled_by_cleanup and not turn.cancelled():
+            exception = turn.exception()
+            if exception is not None:
+                raise exception
 
-    assert elapsed < 0.35, (
-        f"Expected sends to different sessions to overlap, got {elapsed:.3f} s."
-    )
-    assert len(intervals) == len(tool_calls)
+    assert sorted(completed) == expected
 
 
 @pytest.mark.asyncio

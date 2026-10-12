@@ -24,6 +24,7 @@ import {
   FIRST_SEND_REPORT_VERSION,
   MAIN_CONSOLE_JOURNAL,
   evaluateFirstSendEvidence,
+  firstSendRendererSnapshot,
   installMainConsoleObservation,
   markMainConsoleCleanup,
   observeRendererPages,
@@ -182,13 +183,14 @@ assertSecretScrubbingBoundary()
 const executablePath = resolve(requiredOption('--executable'))
 const userDataDir = resolve(requiredOption('--user-data-dir'))
 const iterations = optionalIntegerOption('--iterations', DEFAULT_ITERATIONS)
+const tracePath = process.env.OPENSQUILLA_FIRST_SEND_TRACE_PATH
 let app
 let provider
 let runError
 let rendererPage
 let electronProcessIdentity
 let failureRendererSnapshot
-let rendererObservation = { pages: new Map(), subframePageIds: new Set(), pageErrorDetails: [], consoleErrorDetails: [] }
+let rendererObservation = { pages: new Map(), subframePageIds: new Set(), pageErrorDetails: [], consoleErrorDetails: [], sessionStreamWarnings: [] }
 let targetPageId = null
 let targetWebContentsId = null
 let mainObservationInstalled = false
@@ -215,19 +217,7 @@ function reportPhase(phase, details = {}) {
 
 async function captureRendererFailure(page) {
   if (!page) return null
-  return captureFirstSendDiagnostic(() => page.evaluate(() => ({
-    pathname: location.pathname,
-    sessionMaterialized: new URL(location.href).searchParams.has('session'),
-    connected: Boolean(document.querySelector('.conn-pill.connected')),
-    sendButtonDisabled: document.querySelector('.chat-send-btn.btn--primary')?.disabled ?? null,
-    assistantMessages: document.querySelectorAll('.msg-ai').length,
-    assistantAnswers: document.querySelectorAll('.msg-ai-text').length,
-    errorBoundaries: document.querySelectorAll('.error-boundary').length,
-    // Only error-card text from this fresh synthetic profile is retained;
-    // exclude message bodies, inputs, session identifiers and URL queries.
-    sessionErrors: [...document.querySelectorAll('.msg-error-card__text')]
-      .slice(0, 5).map(element => (element.textContent || '').slice(0, 500)),
-  })))
+  return captureFirstSendDiagnostic(() => page.evaluate(firstSendRendererSnapshot))
 }
 
 async function browserRpcSnapshot(page) {
@@ -380,6 +370,7 @@ try {
       no_proxy: '127.0.0.1,localhost,::1',
     },
   })
+  if (tracePath) await app.context().tracing.start({ screenshots: true, snapshots: true })
   // Observe every available page before waiting for a URL, Gateway readiness,
   // or process diagnostics. The desktop log covers earlier trusted-frame
   // console events; none of those pre-observation errors can be waived.
@@ -465,6 +456,7 @@ try {
 
     const firstMessage = `Synthetic first send ${String(iteration).padStart(2, '0')}`
     await composer.fill(firstMessage)
+    assert.equal(await composer.inputValue(), firstMessage, 'first message must reach the composer before clicking send')
     const sendButton = page.locator('.chat-send-btn.btn--primary')
     await waitFor(async () => await sendButton.count() === 1 && !await sendButton.isDisabled(), 'enabled first send')
     const landingHeaderIdentity = await establishStableHeaderIdentity(header, iteration)
@@ -502,6 +494,7 @@ try {
 
     const followupMessage = `Synthetic follow-up ${String(iteration).padStart(2, '0')}`
     await composer.fill(followupMessage)
+    assert.equal(await composer.inputValue(), followupMessage, 'follow-up must reach the composer before clicking send')
     await page.locator('.chat-send-btn.btn--primary').click()
     await waitFor(
       () => observedChatSendCount(page, followupMessage).then(count => count === 1),
@@ -557,8 +550,13 @@ try {
     event: 'packaged_first_send_failure_diagnostics',
     processes: electronProcessSnapshot(electronProcessIdentity),
     renderer: failureRendererSnapshot,
+    sessionStreamWarnings: rendererObservation.sessionStreamWarnings,
   }))
 } finally {
+  if (tracePath && app) {
+    const trace = await captureFirstSendDiagnostic(() => app.context().tracing.stop(runError ? { path: tracePath } : {}))
+    if (trace?.diagnosticError) console.error(`First-send trace capture failed: ${trace.diagnosticError}`)
+  }
   reportPhase('cleanup-start', { failed: Boolean(runError) })
   if (app && mainObservationInstalled) {
     const marked = await captureFirstSendDiagnostic(() => markMainConsoleCleanup(app))
@@ -593,6 +591,7 @@ const renderer = {
   consoleErrors: rendererObservation.consoleErrorDetails.length,
   pageErrorDetails: rendererObservation.pageErrorDetails,
   consoleErrorDetails: rendererObservation.consoleErrorDetails,
+  sessionStreamWarnings: rendererObservation.sessionStreamWarnings,
 }
 const journal = await readEvidenceLog(resolve(userDataDir, MAIN_CONSOLE_JOURNAL))
 const observation = {

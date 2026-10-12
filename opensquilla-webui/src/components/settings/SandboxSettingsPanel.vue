@@ -35,7 +35,7 @@
             <button
               type="button"
               :class="{ 'is-selected': defaultRunMode === 'safe' }"
-              :disabled="(!capability?.available && !canRequestSandboxSetup) || sandboxSetupPending"
+              :disabled="!capability?.available && (!canRequestSandboxSetup || sandboxSetupPending)"
               data-testid="sandbox-safe-mode"
               @click="selectSafeMode"
             >
@@ -373,6 +373,7 @@
       :open="sandboxSetupConfirmOpen"
       :pending="sandboxSetupPending"
       :outcome="sandboxSetupOutcome"
+      :repair-identity="sandboxIdentityRepairRequired"
       @cancel="cancelSandboxSetup"
       @background="runSandboxSetupInBackground"
       @confirm="void continueSandboxSetup()"
@@ -428,13 +429,21 @@ const {
   adoptSavedDefaultRunMode,
   scheduleSectionSave,
   flushSectionSave,
+  hasUnsettledChanges,
+  prepareToLeave,
 } = useSandboxSettings()
+defineExpose({ hasUnsettledChanges, prepareToLeave })
 const sandboxSetupStore = useSandboxSetupStore()
 const {
   ensuring: sandboxSetupPending,
   outcome: sandboxSetupOutcome,
   intendedMode: sandboxSetupIntendedMode,
 } = storeToRefs(sandboxSetupStore)
+
+const sandboxIdentityRepairRequired = computed(() => (
+  sandboxSetupStatus.value?.detail?.includes('offline_identity_repair_required') === true
+  || sandboxSetupStore.status?.detail?.includes('offline_identity_repair_required') === true
+))
 
 const newFilePath = ref('')
 const approvalPrefix = ref('')
@@ -666,9 +675,7 @@ function runtimeInstallLabel(status: SandboxRuntimeComponentStatus): string {
 function selectSafeMode(): void {
   sandboxSetupStore.resetOutcome()
   sandboxSetupStore.noteRunModeSelection('safe')
-  const isWindows = capability.value?.platform === 'win32'
-  const setupReady = sandboxSetupStatus.value?.state === 'ready'
-  if (capability.value?.available && (!isWindows || setupReady)) {
+  if (capability.value?.available) {
     void setDefaultRunMode('safe')
     return
   }
@@ -687,7 +694,7 @@ function cancelSandboxSetup(): void {
 
 async function continueSandboxSetup(): Promise<void> {
   if (sandboxSetupPending.value) return
-  const ready = await sandboxSetupStore.startSafeSetup()
+  const ready = await sandboxSetupStore.startSafeSetup({ repairIdentity: sandboxIdentityRepairRequired.value })
   if (sandboxSetupOutcome.value !== 'in_progress') sandboxSetupConfirmOpen.value = false
   if (ready) {
     if (sandboxSetupIntendedMode.value === 'safe') adoptSavedDefaultRunMode('safe')

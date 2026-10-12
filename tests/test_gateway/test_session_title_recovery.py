@@ -18,6 +18,7 @@ from opensquilla.gateway.session_view import (
     build_session_view_item,
     derive_transcript_title,
     has_refused_chat_title,
+    session_title_from_metadata,
 )
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionNode
@@ -198,6 +199,22 @@ def test_custom_channel_title_uses_canonical_channel_classification() -> None:
     assert view["title"] == "Example first message"
 
 
+@pytest.mark.parametrize("field", ["derived_title", "subject"])
+@pytest.mark.parametrize("transcript_title", ["", "Example first message"])
+def test_metadata_read_optimization_preserves_leading_generic_title_priority(
+    field: str, transcript_title: str,
+) -> None:
+    session = SessionNode(
+        session_key="agent:main:webchat:metadata-priority", display_name="WebChat",
+        **{field: "Stored title"},
+    )
+    assert session_title_from_metadata(session) == ""
+    view = build_session_view_item(
+        session, entry_count=1, task_rows=[], now_ms=1, transcript_title=transcript_title,
+    )
+    assert view["title"] == ("Stored title" if transcript_title else "WebChat")
+
+
 @pytest.mark.asyncio
 async def test_recovery_keeps_batched_list_reads_and_existing_text_cleanup(
     manager: SessionManager, monkeypatch: pytest.MonkeyPatch
@@ -222,8 +239,7 @@ async def test_recovery_keeps_batched_list_reads_and_existing_text_cleanup(
 
     assert listed.ok, listed.error
     assert {row["key"]: row["title"] for row in listed.payload["sessions"]} == expected
-    batch.assert_awaited_once()
-    assert len(batch.await_args.args[0]) == 1
+    batch.assert_not_awaited()
     canonical_batch.assert_awaited_once()
     assert len(canonical_batch.await_args.args[0]) == 2
     single.assert_not_awaited()

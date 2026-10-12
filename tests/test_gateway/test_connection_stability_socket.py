@@ -44,7 +44,9 @@ class _RestrictedDispatcher:
             "test.next",
             "test.subscribe",
             "transport.flow.update",
+            "transport.sessionFlow.update.v2",
             "sessions.messages.snapshot.read",
+            "sessions.messages.unsubscribe",
         ]
 
     async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
@@ -58,6 +60,9 @@ class _RestrictedDispatcher:
             self.order.append(req_id)
         elif method == "test.subscribe":
             self.subscriptions.subscribe_messages(ctx.conn_id, params["key"])
+            connection = websocket.get_registry().get(ctx.conn_id)
+            if connection is not None:
+                connection._register_flow_subscription_epoch(params["key"])
         else:
             return await get_dispatcher().dispatch(req_id, method, params, ctx)
         return make_ok_res(req_id, {"method": method})
@@ -156,7 +161,7 @@ async def _request(client, observed, request_id, method, params):
 
 
 @asynccontextmanager
-async def _connected(gateway, *, flow=True):
+async def _connected(gateway, *, flow=True, session_flow_v2=False):
     async with connect(gateway.uri, max_size=MAX_PAYLOAD_BYTES, max_queue=256) as client:
         observed: list[dict] = []
         challenge = await _receive_until(client, observed, event="connect.challenge")
@@ -170,7 +175,11 @@ async def _connected(gateway, *, flow=True):
                     "params": {
                         "minProtocol": 3,
                         "maxProtocol": 3,
-                        "caps": ["transport.probe.v1", *(["transport.flow.v1"] if flow else [])],
+                        "caps": [
+                            "transport.probe.v1",
+                            *(["transport.flow.v1"] if flow else []),
+                            *(["transport.session-flow.v2"] if session_flow_v2 else []),
+                        ],
                     },
                 }
             )
@@ -179,6 +188,303 @@ async def _connected(gateway, *, flow=True):
         assert hello["policy"]["transport_probe_nonce"] is True
         assert hello["policy"]["client_ws_keepalive_timeout_ms"] == 0
         yield client, observed, hello
+
+
+async def test_real_socket_session_flow_v2_requires_and_exposes_v2_method(gateway_socket):
+    async with _connected(gateway_socket, session_flow_v2=True) as (client, frames, hello):
+        flow = hello["policy"]["transport_flow"]
+        assert flow["capability"] == "transport.session-flow.v2"
+        assert flow["lane_mode"] is True
+        response = await _request(
+            client,
+            frames,
+            "session-flow-v2-empty",
+            "transport.sessionFlow.update.v2",
+            {
+                "connection_epoch": flow["delivery_epoch"],
+                "consumed": [],
+                "staged_recovery": [],
+                "discarded_lanes": [],
+            },
+        )
+        assert response["ok"] is True
+        assert response["payload"]["connection_epoch"] == flow["delivery_epoch"]
+
+
+async def test_real_socket_session_flow_v2_switches_keep_snapshot_credit_usable(gateway_socket):
+    """Retired history must not invalidate ACKs for the next draft's snapshot."""
+    async with _connected(gateway_socket, session_flow_v2=True) as (client, frames, hello):
+        epoch = hello["policy"]["transport_flow"]["delivery_epoch"]
+        for index in range(32):
+            key = f"agent:main:socket-switch-{index}"
+            subscribed = await _request(
+                client, frames, f"subscribe-{index}", "test.subscribe", {"key": key},
+            )
+            assert subscribed["ok"]
+            retired = await _request(
+                client, frames, f"unsubscribe-{index}",
+                "sessions.messages.unsubscribe", {"key": key},
+            )
+            assert retired["ok"]
+            receipt = retired["payload"]["lane_retire"]
+            confirmed = await _request(
+                client, frames, f"retire-{index}", "transport.sessionFlow.update.v2",
+                {"connection_epoch": epoch, "discarded_lanes": [{
+                    field: receipt[field] for field in (
+                        "subscription_epoch", "retire_token", "final_published_id",
+                    )
+                }]},
+            )
+            assert confirmed["ok"], (index, confirmed)
+
+        # A new draft has no durable row; its read still needs an ACK before
+        # the browser can install authority and enable Send.
+        key = "agent:main:socket-new-draft"
+        await _request(client, frames, "subscribe-draft", "test.subscribe", {"key": key})
+        snapshot = await _request(
+            client, frames, "draft-snapshot", "sessions.messages.snapshot.read",
+            {"key": key, "sync_revision": "post-switch-draft"},
+        )
+        assert snapshot["ok"], snapshot
+        piece = snapshot["payload"]
+        assert piece["segment_count"] == 1
+        credit = await _request(
+            client, frames, "draft-credit", "transport.sessionFlow.update.v2",
+            {"connection_epoch": epoch, "staged_recovery": [piece["delivery"]]},
+        )
+        assert credit["ok"], credit
+        assert set(credit["payload"]) == {
+            "connection_epoch", "consumed", "staged_recovery", "discarded_lanes",
+        }
+        installed = await _request(
+            client, frames, "draft-install", "transport.flow.update",
+            {"delivery_epoch": epoch, "ack_delivery_id": 0, "resume": [{
+                "key": key, "snapshot_id": piece["snapshot_id"],
+                "sync_revision": piece["sync_revision"],
+                "stream_generation": piece["stream_generation"],
+                "stream_seq": piece["current_stream_seq"],
+            }]},
+        )
+        assert installed["ok"], installed
+        assert installed["payload"]["dirty_keys"] == []
+        conn = gateway_socket.registry.get(hello["server"]["conn_id"])
+        assert conn is not None and conn._flow is not None
+        assert not conn._flow.deliveries
+
+
+async def test_real_socket_session_flow_v2_retire_batch_accepts_old_lane_ack(gateway_socket):
+    """A retire request may race with the last ACK for the old lane.
+
+    The client batches both records in one v2 control RPC.  The old lane is
+    already removed from the subscription manager at that point, so the
+    server must validate the retire fence before rejecting the old ACK.
+    """
+    key = "agent:main:socket-v2-retire"
+    async with _connected(gateway_socket, session_flow_v2=True) as (client, frames, hello):
+        flow = hello["policy"]["transport_flow"]
+        await _request(client, frames, "subscribe-retire", "test.subscribe", {"key": key})
+        conn = gateway_socket.registry.get(hello["server"]["conn_id"])
+        assert conn is not None and conn._flow is not None
+        event = gateway_socket.streams.record(
+            key,
+            "session.event.text_delta",
+            {"task_id": "retire", "text": "old"},
+        )
+        await conn.send_event("session.event.text_delta", event)
+        delivered = await _receive_until(client, frames, event="session.event.text_delta")
+        delivery_id = delivered["meta"]["flow"]["delivery_id"]
+        subscription_epoch = delivered["meta"]["session_flow_v2"]["subscription_epoch"]
+        assert subscription_epoch == gateway_socket.subscriptions.get_message_subscription_epoch(
+            conn.conn_id, key,
+        )
+        await _request(
+            client,
+            frames,
+            "unsubscribe-retire",
+            "sessions.messages.unsubscribe",
+            {"key": key},
+        )
+        # The production unsubscribe handler returns the retire receipt.  Use
+        # the authoritative result from the RPC so this test exercises the
+        # exact client batch shape rather than an invented token.
+        unsubscribe = next(
+            frame for frame in reversed(frames)
+            if frame.get("type") == "res" and frame.get("id") == "unsubscribe-retire"
+        )
+        lane_retire = unsubscribe["payload"]["lane_retire"]
+        response = await _request(
+            client,
+            frames,
+            "retire-batch",
+            "transport.sessionFlow.update.v2",
+            {
+                "connection_epoch": flow["delivery_epoch"],
+                "consumed": [{
+                    "subscription_epoch": subscription_epoch,
+                    "through_delivery_id": delivery_id,
+                }],
+                "discarded_lanes": [{
+                    "subscription_epoch": lane_retire["subscription_epoch"],
+                    "retire_token": lane_retire["retire_token"],
+                    "final_published_id": lane_retire["final_published_id"],
+                }],
+            },
+        )
+        assert response["ok"], json.dumps(response, ensure_ascii=False)
+        assert not conn._flow.deliveries
+
+
+async def test_real_socket_session_flow_v2_retire_batch_disambiguates_two_lanes(gateway_socket):
+    """Connection-scoped epochs must not collide across simultaneous sessions."""
+    key_a = "agent:main:socket-v2-two-lanes-a"
+    key_b = "agent:main:socket-v2-two-lanes-b"
+    async with _connected(gateway_socket, session_flow_v2=True) as (client, frames, hello):
+        flow = hello["policy"]["transport_flow"]
+        await _request(client, frames, "subscribe-two-a", "test.subscribe", {"key": key_a})
+        await _request(client, frames, "subscribe-two-b", "test.subscribe", {"key": key_b})
+        conn = gateway_socket.registry.get(hello["server"]["conn_id"])
+        assert conn is not None and conn._flow is not None
+        for key, task_id in ((key_a, "two-a"), (key_b, "two-b")):
+            event = gateway_socket.streams.record(
+                key, "session.event.text_delta", {"task_id": task_id, "text": task_id},
+            )
+            await conn.send_event("session.event.text_delta", event)
+        delivered_a = await _receive_until(client, frames, event="session.event.text_delta")
+        delivered_b = await _receive_until(client, frames, event="session.event.text_delta")
+        by_task = {frame["payload"]["task_id"]: frame for frame in (delivered_a, delivered_b)}
+        assert set(by_task) == {"two-a", "two-b"}
+        epoch_a = by_task["two-a"]["meta"]["session_flow_v2"]["subscription_epoch"]
+        epoch_b = by_task["two-b"]["meta"]["session_flow_v2"]["subscription_epoch"]
+        assert epoch_a != epoch_b
+        await _request(
+            client, frames, "unsubscribe-two-a", "sessions.messages.unsubscribe", {"key": key_a}
+        )
+        unsubscribe = next(
+            frame for frame in reversed(frames)
+            if frame.get("type") == "res" and frame.get("id") == "unsubscribe-two-a"
+        )
+        lane_retire = unsubscribe["payload"]["lane_retire"]
+        response = await _request(
+            client,
+            frames,
+            "retire-two-a",
+            "transport.sessionFlow.update.v2",
+            {
+                "connection_epoch": flow["delivery_epoch"],
+                "consumed": [
+                    {
+                        "subscription_epoch": epoch_a,
+                        "through_delivery_id": by_task["two-a"]["meta"]["session_flow_v2"][
+                            "delivery_id"
+                        ],
+                    }
+                ],
+                "discarded_lanes": [
+                    {
+                        "subscription_epoch": lane_retire["subscription_epoch"],
+                        "retire_token": lane_retire["retire_token"],
+                        "final_published_id": lane_retire["final_published_id"],
+                    }
+                ],
+            },
+        )
+        assert response["ok"]
+
+
+async def test_real_socket_session_flow_v2_replacement_fences_idle_old_ack(gateway_socket):
+    """A same-key replacement fences an old ACK before its first new event."""
+    key = "agent:main:socket-v2-retire-idle"
+    async with _connected(gateway_socket, session_flow_v2=True) as (client, frames, hello):
+        flow = hello["policy"]["transport_flow"]
+        await _request(client, frames, "subscribe-idle-old", "test.subscribe", {"key": key})
+        conn = gateway_socket.registry.get(hello["server"]["conn_id"])
+        assert conn is not None and conn._flow is not None
+        event = gateway_socket.streams.record(
+            key,
+            "session.event.text_delta",
+            {"task_id": "retire-idle", "text": "old"},
+        )
+        await conn.send_event("session.event.text_delta", event)
+        delivered = await _receive_until(client, frames, event="session.event.text_delta")
+        old_delivery_id = delivered["meta"]["session_flow_v2"]["delivery_id"]
+        old_epoch = delivered["meta"]["session_flow_v2"]["subscription_epoch"]
+        await _request(
+            client,
+            frames,
+            "unsubscribe-idle-old",
+            "sessions.messages.unsubscribe",
+            {"key": key},
+        )
+        await _request(
+            client,
+            frames,
+            "subscribe-idle-new",
+            "test.subscribe",
+            {"key": key},
+        )
+        stale = await _request(
+            client,
+            frames,
+            "late-idle-old-ack",
+            "transport.sessionFlow.update.v2",
+            {
+                "connection_epoch": flow["delivery_epoch"],
+                "consumed": [{
+                    "subscription_epoch": old_epoch,
+                    "through_delivery_id": old_delivery_id,
+                }],
+                "staged_recovery": [],
+                "discarded_lanes": [],
+            },
+        )
+        assert stale["ok"] is False
+        assert stale["error"]["code"] in {"INVALID_REQUEST", "FLOW_STALE"}
+
+
+async def test_real_socket_session_flow_v2_ack_is_idempotent_and_rejects_future_id(gateway_socket):
+    key = "agent:main:socket-v2-ack-order"
+    async with _connected(gateway_socket, session_flow_v2=True) as (client, frames, hello):
+        flow = hello["policy"]["transport_flow"]
+        await _request(client, frames, "subscribe-ack-order", "test.subscribe", {"key": key})
+        conn = gateway_socket.registry.get(hello["server"]["conn_id"])
+        assert conn is not None and conn._flow is not None
+        event = gateway_socket.streams.record(
+            key,
+            "session.event.text_delta",
+            {"task_id": "ack-order", "text": "one"},
+        )
+        await conn.send_event("session.event.text_delta", event)
+        delivered = await _receive_until(client, frames, event="session.event.text_delta")
+        delivery_id = delivered["meta"]["flow"]["delivery_id"]
+        subscription_epoch = delivered["meta"]["session_flow_v2"]["subscription_epoch"]
+        params = {
+            "connection_epoch": flow["delivery_epoch"],
+            "consumed": [{
+                "subscription_epoch": subscription_epoch,
+                "through_delivery_id": delivery_id,
+            }],
+        }
+        first = await _request(
+            client, frames, "ack-order-1", "transport.sessionFlow.update.v2", params
+        )
+        assert first["ok"], first
+        assert not conn._flow.deliveries
+        duplicate = await _request(
+            client, frames, "ack-order-duplicate", "transport.sessionFlow.update.v2", params,
+        )
+        assert duplicate["ok"], duplicate
+        future = {
+            "connection_epoch": flow["delivery_epoch"],
+            "consumed": [{
+                "subscription_epoch": subscription_epoch,
+                "through_delivery_id": delivery_id + 99,
+            }],
+        }
+        rejected = await _request(
+            client, frames, "ack-order-future", "transport.sessionFlow.update.v2", future,
+        )
+        assert not rejected["ok"]
+        assert rejected["error"]["code"] in {"INVALID_REQUEST", "FLOW_STALE"}
 
 
 async def test_real_socket_slow_rpc_preserves_nonce_probe_and_fifo(gateway_socket):
