@@ -279,27 +279,35 @@ if (!process.versions.electron) {
         })
         const saved = new Promise((resolve, reject) => {
           sharedRecord.previewSession.once('will-download', (_event, item, contents) => {
-            noteDownloadEvent('will-download')
-            assert.equal(contents.id, sharedRecord.webContentsId, 'A background attachment belongs to its source page')
-            if (index === 2) {
-              assert.equal(sharedRecord.browserDocumentReady, false)
-              assert.equal(sharedRecord.browserPreviousDocument?.ready, true,
-                'Do not discard the retained document while its URL is provisional')
+            try {
+              noteDownloadEvent('will-download')
+              assert.equal(contents.id, sharedRecord.webContentsId, 'A background attachment belongs to its source page')
+              if (index === 2) {
+                assert.equal(sharedRecord.browserDocumentReady, false)
+                assert.equal(sharedRecord.browserPreviousDocument?.ready, true,
+                  'Do not discard the retained document while its URL is provisional')
+                sharedRecord.contents.getURL = getUrl
+              }
+              if (index === 3) {
+                item.once('done', (_event, state) => state === 'cancelled' ? resolve() : reject(new Error(state)))
+                item.cancel()
+                return
+              }
+              if (process.env.OPENSQUILLA_CONTEXT_NATIVE_SAVE_PROBE !== '1' || index !== 0) item.setSavePath(path)
+              else {
+                item.setSaveDialogOptions({ title: 'Synthetic PDF save probe', defaultPath: path })
+                console.error(`Synthetic native save probe ready: ${path}`)
+              }
+              item.once('done', (_event, state) => state === 'completed' ? resolve() : reject(new Error(state)))
+            } catch (error) {
               sharedRecord.contents.getURL = getUrl
-            }
-            if (index === 3) {
-              item.once('done', (_event, state) => state === 'cancelled' ? resolve() : reject(new Error(state)))
+              reject(error)
+              _event.preventDefault()
               item.cancel()
-              return
             }
-            if (process.env.OPENSQUILLA_CONTEXT_NATIVE_SAVE_PROBE !== '1' || index !== 0) item.setSavePath(path)
-            else {
-              item.setSaveDialogOptions({ title: 'Synthetic PDF save probe', defaultPath: path })
-              console.error(`Synthetic native save probe ready: ${path}`)
-            }
-            item.once('done', (_event, state) => state === 'completed' ? resolve() : reject(new Error(state)))
           })
         })
+        void saved.catch(() => undefined)
         const page = await call({ operation: 'observe', targetRef: shared.targetRef })
         await call({ operation: 'act', targetRef: shared.targetRef, action: 'click',
           ref: page.observation.refs.find(value => value.name === name).ref })
