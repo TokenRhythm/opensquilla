@@ -295,7 +295,7 @@ async function refresh() {
   color: inherit;
   transition: opacity var(--transition);
   animation: usage-fade-in var(--dur-enter) var(--ease-out) both;
-  animation-delay: calc(var(--i) * 30ms);
+  animation-delay: min(calc(var(--i) * 30ms), var(--dur-fast));
 }
 .usage-bar-row:hover {
   opacity: 0.85;
@@ -327,7 +327,8 @@ async function refresh() {
   top: 0;
   bottom: 0;
   left: 0;
-  border-radius: var(--radius-sm);
+  /* The track clips the outer corners; the two portions meet without a gap. */
+  border-radius: 0;
 }
 .usage-bar-row__fill--input {
   background: var(--accent);
@@ -632,7 +633,7 @@ async function refresh() {
   border-radius: var(--radius-sm);
   font-size: var(--fs-xs);
   animation: usage-fade-in var(--dur-base) var(--ease-out) both;
-  animation-delay: calc(var(--i) * 30ms);
+  animation-delay: min(calc(var(--i) * 30ms), var(--dur-fast));
 }
 .usage-expand__model {
   overflow: hidden;
@@ -671,6 +672,9 @@ async function refresh() {
   font-family: var(--font-mono);
   text-align: right;
 }
+.usage-expand__metric-label {
+  display: none;
+}
 
 /* Cost source badges */
 .usage-source {
@@ -678,8 +682,8 @@ async function refresh() {
   align-items: center;
   padding: 2px 8px;
   border-radius: var(--radius-sm);
-  font-size: 10.5px;
-  font-weight: 600;
+  font-size: 0.75rem;
+  font-weight: 500;
   border: 1px solid var(--border);
   background: var(--bg-elevated);
   color: var(--text-muted);
@@ -738,6 +742,13 @@ async function refresh() {
   to { opacity: 1; transform: translateY(0); }
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .usage-bar-row,
+  .usage-expand__row {
+    animation: none;
+  }
+}
+
 /* Responsive */
 @media (max-width: 720px) {
   .usage-stage__header {
@@ -752,14 +763,40 @@ async function refresh() {
     grid-template-columns: minmax(0, 100px) 1fr auto;
   }
   .usage-expand__row {
-    grid-template-columns: 1fr 80px;
-    gap: 4px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 12px;
   }
-  .usage-expand__share,
-  .usage-expand__tokens,
-  .usage-expand__cost,
+  .usage-expand__head {
+    flex-wrap: wrap;
+  }
+  .usage-expand__total {
+    flex-basis: 100%;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .usage-expand__model,
   .usage-expand__source {
+    grid-column: 1 / -1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+  .usage-expand__share {
     display: none;
+  }
+  .usage-expand__tokens,
+  .usage-expand__cost {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 4px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .usage-expand__metric-label {
+    display: inline;
+    color: var(--text-dim);
+    font-family: var(--font-sans);
   }
 }
 </style>

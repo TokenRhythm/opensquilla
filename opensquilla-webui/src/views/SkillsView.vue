@@ -1,6 +1,6 @@
 <template>
-  <div class="sk-stage control-stage control-stage--spacious">
-    <header class="sk-stage__header control-stage__header">
+  <div class="sk-stage control-stage control-stage--spacious control-stage--hub-actions">
+    <header class="sk-stage__header control-stage__header control-stage__header--hub-actions">
       <div class="sk-stage__title-block control-stage__title-block">
         <h1 class="sk-stage__title control-stage__title">{{ t('cronSkills.skillsView.title') }}</h1>
         <p class="sk-stage__subtitle control-stage__subtitle">{{ t('cronSkills.skillsView.subtitle') }}</p>

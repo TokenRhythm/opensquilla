@@ -27,8 +27,14 @@
           </span>
           <span class="usage-expand__share-pct">{{ m.share.toFixed(1) }}%</span>
         </div>
-        <div class="usage-expand__tokens" role="cell">{{ m.tokens.toLocaleString() }}</div>
-        <div class="usage-expand__cost" role="cell">{{ fmtCost(m.cost, { source: m }) }}</div>
+        <div class="usage-expand__tokens" role="cell">
+          <span class="usage-expand__metric-label">{{ t('usageLogs.metrics.tokens') }}</span>
+          <span>{{ m.tokens.toLocaleString() }}</span>
+        </div>
+        <div class="usage-expand__cost" role="cell">
+          <span class="usage-expand__metric-label">{{ t('usageLogs.metrics.cost') }}</span>
+          <span>{{ fmtCost(m.cost, { source: m }) }}</span>
+        </div>
         <div class="usage-expand__source" role="cell">
           <span
             class="usage-source"
