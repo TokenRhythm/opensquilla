@@ -1584,10 +1584,13 @@ jobs:
               tests/test_tools/test_shell_runtime_preflight.py
               tests/test_tools/test_shell_blocking_launch.py
               tests/test_ci/test_rpc_architecture_contracts.py
+              tests/test_skills/test_hub_management_service.py
             )
           elif [[ "${family}" == "gateway-sqlite" ]]; then
             regression_args+=(
               tests/test_gateway/test_native_attachment_import.py
+              tests/test_gateway/test_recovery_scheduler.py
+              tests/test_gateway/test_goal_user_input.py
             )
           fi
           # Windows workers hit access violations during timed stack dumps.

@@ -2,8 +2,24 @@
 
 import asyncio
 import time
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import pytest
+
+from opensquilla.gateway import recovery_scheduler
 from opensquilla.gateway.recovery_scheduler import RecoveryOperation, RecoveryScheduler
+
+
+@pytest.fixture
+def recovery_clock(monkeypatch):
+    clock = SimpleNamespace(now=0.0)
+    # Windows' monotonic clock can tick past a 10 ms deadline before submit.
+    # Replace only the scheduler's clock; asyncio keeps its real timeout clock.
+    monkeypatch.setattr(
+        recovery_scheduler, "time", SimpleNamespace(monotonic=lambda: clock.now),
+    )
+    return clock
 
 
 def operation(runtime, request_id, key, *, connection_id="connection", predecessors=()):
@@ -94,19 +110,39 @@ async def test_cancelling_queued_job_finishes_without_starting():
     assert scheduler.waiting == scheduler.running == 0
 
 
-async def test_deadline_includes_admission_wait_and_does_not_run_after_gate():
+async def test_deadline_includes_admission_wait_and_does_not_run_after_gate(recovery_clock):
     scheduler = RecoveryScheduler()
     gate = asyncio.get_running_loop().create_future()
     expired = asyncio.Event()
     started = asyncio.Event()
     item = operation(object(), "timed-out", "A", predecessors=(gate,))
-    item.deadline = time.monotonic() + 0.01
-    assert scheduler.submit(item, lambda: _set(started), expire=expired.set)
+    item.deadline = recovery_clock.now + 0.01
+    # Capture only submission's timer, leaving wait_for's real timer untouched.
+    with patch.object(asyncio.get_running_loop(), "call_later") as timer:
+        assert scheduler.submit(item, lambda: _set(started), expire=expired.set)
+    assert scheduler.waiting == 1
+    assert not expired.is_set()
+    timer.assert_called_once()
+    delay, callback, scheduled_item = timer.call_args.args
+    assert delay == pytest.approx(0.01)
+    recovery_clock.now = item.deadline
+    callback(scheduled_item)
     await asyncio.wait_for(expired.wait(), 1)
     gate.set_result(True)
     await asyncio.sleep(0)
     assert item.closed
     assert not started.is_set()
+    assert scheduler.waiting == scheduler.running == 0
+
+
+@pytest.mark.parametrize("elapsed", [0.01, 0.015625])
+def test_deadline_expired_before_admission_is_rejected(recovery_clock, elapsed):
+    scheduler = RecoveryScheduler()
+    item = operation(object(), "expired-before-submit", "A")
+    item.deadline = recovery_clock.now + 0.01
+    recovery_clock.now += elapsed
+    assert not scheduler.submit(item, lambda: _set(asyncio.Event()))
+    assert not item.started
     assert scheduler.waiting == scheduler.running == 0
 
 
@@ -152,16 +188,18 @@ async def test_running_job_that_loses_current_reports_stale_before_finish():
     assert scheduler.running == scheduler.waiting == 0
 
 
-async def test_expire_then_cancel_claims_only_one_terminal_result():
+async def test_expire_then_cancel_claims_only_one_terminal_result(recovery_clock):
     scheduler = RecoveryScheduler()
     item = operation(object(), "expire-race", "A")
-    item.deadline = time.monotonic() + 0.01
+    item.deadline = recovery_clock.now + 0.01
+    entered = asyncio.Event()
     expired = asyncio.Event()
     finished = asyncio.Event()
     terminal: list[str] = []
     finish_calls: list[bool] = []
 
     async def run():
+        entered.set()
         await asyncio.Future()
 
     def expire():
@@ -172,13 +210,20 @@ async def test_expire_then_cancel_claims_only_one_terminal_result():
         finish_calls.append(True)
         finished.set()
 
-    assert scheduler.submit(
-        item,
-        run,
-        finish=finish,
-        expire=expire,
-        stale=lambda: terminal.append("stale"),
-    )
+    with patch.object(asyncio.get_running_loop(), "call_later") as timer:
+        assert scheduler.submit(
+            item,
+            run,
+            finish=finish,
+            expire=expire,
+            stale=lambda: terminal.append("stale"),
+        )
+    await entered.wait()
+    timer.assert_called_once()
+    delay, callback, scheduled_item = timer.call_args.args
+    assert delay == pytest.approx(0.01)
+    recovery_clock.now = item.deadline
+    callback(scheduled_item)
     await expired.wait()
     assert terminal == ["expire"]
     scheduler.cancel(item)
