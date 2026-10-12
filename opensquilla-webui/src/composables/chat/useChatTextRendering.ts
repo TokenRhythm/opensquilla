@@ -63,7 +63,13 @@ export function useChatTextRendering() {
       }
     }
 
-    const html = renderMarkdownCore(text, { highlight, math: mathMode })
+    let html: string
+    try {
+      html = renderMarkdownCore(text, { highlight, math: mathMode })
+    } catch {
+      const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+      html = `<div class="chat-markdown-plain">${escaped}</div>`
+    }
 
     if (cacheMode === 'settled') {
       // UTF-16 code units are a conservative and deterministic approximation

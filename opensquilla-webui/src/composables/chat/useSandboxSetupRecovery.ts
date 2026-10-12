@@ -4,6 +4,7 @@ import type {
   SandboxSetupOutcome,
 } from '@/modules/sandboxRuntime'
 import type {
+  SandboxCapabilityReport,
   SandboxRunMode,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
@@ -19,6 +20,8 @@ export interface UseSandboxSetupRecoveryOptions {
 
 export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions) {
   const status = ref<SandboxSetupStatusPayload | null>(null)
+  const capability = ref<SandboxCapabilityReport | null>(null)
+  const available = computed(() => capability.value?.available === true)
   const resolved = ref(false)
   const loading = ref(false)
   const ensuring = ref(false)
@@ -33,6 +36,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
   const visible = computed(() =>
     active.value
     && options.runMode.value !== 'full'
+    && !available.value
     && !dismissed.value
     && status.value !== null
     && status.value.state !== 'ready')
@@ -66,8 +70,10 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     loading.value = true
     clearPoll()
     try {
-      const payload = (await options.sandbox.readiness()).status
+      const readiness = await options.sandbox.readiness()
+      const payload = readiness.status
       if (generation !== requestGeneration) return
+      capability.value = readiness.capability
       if (!payload) {
         // Keep following an already-authoritative setting_up state when a
         // transient/malformed response cannot advance it. schedulePoll remains
@@ -105,6 +111,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     try {
       const result = await options.sandbox.ensureReady()
       if (generation !== requestGeneration) return false
+      capability.value = result.capability
       if (result.status) applyStatus(result.status)
       outcome.value = result.outcome
       return result.ready
@@ -127,6 +134,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
       }
       else {
         status.value = null
+        capability.value = null
         resolved.value = false
         lastState = ''
         loading.value = false
@@ -150,6 +158,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
 
   return {
     status,
+    available,
     resolved,
     loading,
     ensuring,

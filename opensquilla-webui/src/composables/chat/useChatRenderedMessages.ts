@@ -438,6 +438,10 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         && !msg.text.trim()
         && !msg.attachments?.length
         && !msg.promptAnnotations?.length
+        && msg.previewComplete !== false
+        && msg.contentAvailability !== 'preparing'
+        && msg.contentAvailability !== 'unavailable'
+        && !msg.contentUnavailableReason
       ) {
         prevRole = ''
         continue
@@ -623,6 +627,13 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         ts: msg.ts ?? null,
         showHeader: !sameGroup,
         messageId: msg.messageId,
+        contentRef: msg.contentRef,
+        contentSlice: msg.contentSlice,
+        previewComplete: msg.previewComplete,
+        historyPayloadPreview: msg.historyPayloadPreview,
+        contentRevision: msg.contentRevision,
+        contentAvailability: msg.contentAvailability,
+        contentUnavailableReason: msg.contentUnavailableReason,
         restoredFromHistory: msg.restoredFromHistory,
         turnKey: `turn:${turnIdentity === 'turn-0' ? ownerKey : turnIdentity}`,
         turnId: messageTurnId || undefined,

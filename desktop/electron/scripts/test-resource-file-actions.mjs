@@ -7,6 +7,22 @@ import { join } from 'node:path'
 import * as fs from 'node:fs/promises'
 import { saveArtifactFile, performSourceFileAction, performWorkspaceFileAction, workspaceFileIdentityMatches } from '../dist/resource-file-actions.js'
 
+async function symlinkOrSkip(testContext, target, link) {
+  try {
+    await symlink(target, link)
+    return true
+  } catch (error) {
+    // Windows without Developer Mode or the SeCreateSymbolicLink privilege
+    // cannot create this fixture. Keep the product assertion visible while
+    // reporting the environment limitation as a skip instead of a failure.
+    if (process.platform === 'win32' && error?.code === 'EPERM') {
+      testContext.skip('Windows symlink fixture requires Developer Mode or SeCreateSymbolicLinkPrivilege')
+      return false
+    }
+    throw error
+  }
+}
+
 async function fixture(t) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'opensquilla-file-actions-')))
   t.after(() => rm(root, { recursive: true, force: true }))
@@ -102,7 +118,7 @@ for (const patch of [{ pagePath: 'index.html' }, { documentId: 'doc_other' }, { 
 test('rejects symlinks, outside workspace, remote and changed connections', async t => {
   const f = await sourceFixture(t)
   const link = join(f.root, 'link.html')
-  await symlink(f.page, link)
+  if (!await symlinkOrSkip(t, f.page, link)) return
   f.metadata.sourcePath = link
   await assert.rejects(performSourceFileAction(request, f.deps), /identity changed/)
   f.metadata.sourcePath = f.page
@@ -190,7 +206,7 @@ for (const patch of [{ path: '../build.py' }, { path: '/tmp/build.py' }, { path:
 test('workspace native actions reject symlink and connection changes', async t => {
   const f = await workspaceFixture(t)
   const link = join(f.root, 'link.py')
-  await symlink(f.page, link)
+  if (!await symlinkOrSkip(t, f.page, link)) return
   f.metadata.sourcePath = link
   await assert.rejects(performWorkspaceFileAction(workspaceRequest, f.deps), /identity changed/)
   f.metadata.sourcePath = f.page

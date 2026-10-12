@@ -91,8 +91,12 @@ export class MemoryProfileImportError extends Error {
   }
 }
 
+export interface MemoryImportReadOptions {
+  signal?: AbortSignal
+}
+
 export interface MemoryProfileImport {
-  info(): Promise<MemoryImportInfo>
+  info(options?: MemoryImportReadOptions): Promise<MemoryImportInfo>
   start(input: {
     rawText: string
     locale: string
@@ -100,7 +104,7 @@ export interface MemoryProfileImport {
     clientRequestId: string
     expected: MemoryImportProviderExpectation
   }): Promise<MemoryImportJob>
-  status(jobId: string): Promise<MemoryImportJob>
+  status(jobId: string, options?: MemoryImportReadOptions): Promise<MemoryImportJob>
   cancel(jobId: string, clientRequestId: string): Promise<MemoryImportJob>
   retry(
     jobId: string,

@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass, field, replace
 from functools import partial
+from importlib import import_module
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -57,11 +58,13 @@ from opensquilla.gateway.config import (
 from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
 from opensquilla.gateway.model_routing import model_routing_snapshot
 from opensquilla.gateway.rpc import get_dispatcher
+from opensquilla.gateway.service_owner import OptionalServiceOwner
 from opensquilla.gateway.session_events import build_sessions_changed_payload
 from opensquilla.gateway.session_lifecycle import (
     TaskLifecycleEvent,
     apply_task_lifecycle_to_session,
     session_status_for_task_status,
+    task_session_is_current,
 )
 from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.gateway.session_streams import get_session_streams, reset_session_streams
@@ -491,6 +494,42 @@ async def _pause_dream_crons(*, scheduler: Any, jobs: list[Any], reason: str) ->
     return success
 
 
+def _bind_channel_service_readiness(
+    manager: Any, services: ServiceContainer, *, config_revision: str | int,
+) -> bool:
+    """Connect the existing adapter lifecycle to optional-service admission."""
+    from opensquilla.channels.manager import ChannelManager
+
+    if not isinstance(manager, ChannelManager):
+        return False
+    generation = services.optional_generation
+
+    def publish(name: str, status: str | None) -> None:
+        channel_name = name.strip().lower()
+        if not channel_name:
+            return
+        key = f"channel:{channel_name}"
+        previous = services.optional_services.get(key, {})
+        if generation != services.optional_generation:
+            # Shutdown may still remove readiness owned by this generation,
+            # but a late start/stop must never overwrite a replacement owner.
+            if status in {"ready", "starting"} or previous.get("generation") != generation:
+                return
+        if status is None:
+            services.optional_services.pop(key, None)
+            return
+        owner = services.optional_owners.get("channels")
+        services.optional_services[key] = {
+            "status": status,
+            "generation": generation,
+            "config_revision": config_revision,
+            "owner_generation": getattr(owner, "owner_generation", generation),
+        }
+
+    manager.set_service_status_callback(publish)
+    return True
+
+
 @dataclass
 class ServiceContainer:
     """Typed container for initialized services. Returned by build_services().
@@ -515,6 +554,9 @@ class ServiceContainer:
     usage_tracker: UsageTracker | None = None
     usage_event_sink: Any = None
     usage_backfill_task: asyncio.Task[Any] | None = None
+    content_length_backfill_task: asyncio.Task[Any] | None = field(
+        default=None, repr=False
+    )
     sandbox_setup_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     # Best-effort profile normalization result exposed to the Desktop UI. The
     # sandbox decoder remains authoritative for runtime behavior; this field
@@ -554,6 +596,17 @@ class ServiceContainer:
     standalone_usage_telemetry: Any = None
     deferred_warmups: list[Callable[[], Any]] = field(default_factory=list)
     deferred_warmup_task: asyncio.Task[Any] | None = field(default=None, repr=False)
+    # Optional integrations are deliberately outside the core readiness
+    # boundary.  Keep their status in a shared mapping so /readyz/core can
+    # expose progress without making the probe wait for external systems.
+    optional_services: dict[str, dict[str, Any]] = field(default_factory=dict)
+    optional_generation: int = 0
+    # Revision of the live configuration snapshot used to start optional
+    # owners.  It is carried with every descriptor so a reload cannot make a
+    # late completion look current.
+    config_revision: str | int = 0
+    optional_owners: dict[str, OptionalServiceOwner] = field(default_factory=dict)
+    optional_start_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     _compaction_listener_remove: Callable[[], None] | None = None
     _approval_listener_remove: Callable[[], None] | None = None
     _approval_channel_notifier_remove: Callable[[], None] | None = None
@@ -585,6 +638,29 @@ class ServiceContainer:
                 pass
             except Exception:
                 log.debug("gateway.deferred_warmup_close_failed", exc_info=True)
+        # Invalidate and stop optional integration startup before closing the
+        # durable core.  The generation fence prevents a late completion from
+        # publishing a stale ready state after shutdown has begun.
+        self.optional_generation += 1
+        # Fence and stop every generic owner before closing the durable core.
+        # Owners cancel uncooperative starters without waiting for external
+        # network/SDK calls; their late completions are consumed and ignored.
+        for owner in tuple(getattr(self, "optional_owners", {}).values()):
+            try:
+                await owner.close()
+            except Exception:
+                log.debug("gateway.optional_owner_close_failed", exc_info=True)
+        self.optional_owners.clear()
+        optional_start_task = getattr(self, "optional_start_task", None)
+        if optional_start_task is not None:
+            try:
+                optional_start_task.cancel()
+                await optional_start_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.debug("gateway.optional_start_close_failed", exc_info=True)
+            self.optional_start_task = None
 
         skill_watcher = self.skill_watcher
         self.skill_watcher = None
@@ -638,6 +714,13 @@ class ServiceContainer:
             except (asyncio.CancelledError, Exception):
                 pass
             self.usage_backfill_task = None
+        if self.content_length_backfill_task is not None:
+            self.content_length_backfill_task.cancel()
+            try:
+                await self.content_length_backfill_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self.content_length_backfill_task = None
         sandbox_setup_task = self.sandbox_setup_task
         self.sandbox_setup_task = None
         if sandbox_setup_task is not None:
@@ -797,11 +880,11 @@ class ServiceContainer:
         try:
             from opensquilla.sandbox.integration import reset_runtime as reset_sandbox_runtime
             from opensquilla.sandbox.setup_runtime import (
-                reset_sandbox_setup_runtime_state,
+                shutdown_sandbox_setup_runtime,
             )
 
+            await shutdown_sandbox_setup_runtime()
             reset_sandbox_runtime()
-            reset_sandbox_setup_runtime_state()
         except Exception:
             pass
         # Clear the shared catalog installed by build_services() so a torn-down
@@ -1617,6 +1700,26 @@ def _make_task_session_lifecycle_listener(
             session_manager=session_manager,
         )
         if not changed:
+            # A durable task transition still invalidates the directory when
+            # the session row was already terminal or its projection failed.
+            if (
+                event.phase == "terminal"
+                and event.terminal_persisted
+                and await task_session_is_current(
+                    session_manager,
+                    session_key=event.session_key,
+                    session_id=event.session_id,
+                    session_epoch=event.session_epoch,
+                )
+            ):
+                await event_emitter(
+                    event.session_key,
+                    "sessions.changed",
+                    build_sessions_changed_payload(
+                        event.session_key, "updated",
+                        session_id=event.session_id, epoch=event.session_epoch,
+                    ),
+                )
             return
         if event.task_snapshot is None:
             # A callback identifies only the task that changed, not the
@@ -2314,6 +2417,51 @@ class GatewayServer:
             self._services is None or getattr(self._services, "task_runtime", None) is None
         )
         try:
+            # Fence optional integration startup before draining/stopping the
+            # core.  Otherwise a late channel/MCP completion could race the
+            # shutdown stop_all path and re-publish a stale ready state.
+            if self._services is not None:
+                optional_task = getattr(self._services, "optional_start_task", None)
+                if optional_task is not None:
+                    self._services.optional_generation = (
+                        int(getattr(self._services, "optional_generation", 0) or 0) + 1
+                    )
+                    # ``ServiceContainer`` stores asyncio Tasks here.  Tests
+                    # and embedders may provide a loose mock container,
+                    # though, where an unset attribute becomes a MagicMock.
+                    # Never feed such a value to ``asyncio.wait_for``: it can
+                    # spend the whole timeout trying to turn a non-awaitable
+                    # into a task and make shutdown exceed its bound.
+                    if inspect.isawaitable(optional_task):
+                        optional_task = asyncio.ensure_future(optional_task)
+                        optional_task.cancel()
+                        try:
+                            await asyncio.wait_for(optional_task, timeout=remaining(2.0))
+                        except (asyncio.CancelledError, TimeoutError):
+                            pass
+                        except Exception:
+                            log.debug("gateway.optional_start_shutdown_failed", exc_info=True)
+                    else:
+                        log.debug("gateway.optional_start_shutdown_skipped_non_awaitable")
+                    self._services.optional_start_task = None
+                warmup_task = getattr(self._services, "deferred_warmup_task", None)
+                if warmup_task is not None:
+                    self._services.optional_generation = (
+                        int(getattr(self._services, "optional_generation", 0) or 0) + 1
+                    )
+                    if inspect.isawaitable(warmup_task):
+                        warmup_task = asyncio.ensure_future(warmup_task)
+                        warmup_task.cancel()
+                        try:
+                            await asyncio.wait_for(warmup_task, timeout=remaining(2.0))
+                        except (asyncio.CancelledError, TimeoutError):
+                            pass
+                        except Exception:
+                            log.debug("gateway.deferred_warmup_shutdown_failed", exc_info=True)
+                    else:
+                        log.debug("gateway.deferred_warmup_shutdown_skipped_non_awaitable")
+                    self._services.deferred_warmup_task = None
+
             # Drain in-flight turns FIRST so replies are not lost. A bounded
             # shutdown can report residual drivers; in that case transports are
             # stopped below but stateful dependencies stay open until the process
@@ -2601,7 +2749,7 @@ def apply_model_catalog_overrides(catalog: ModelCatalog, config: GatewayConfig) 
         log.warning("model_catalog.user_override_rejected", error=str(exc))
 
 
-def _expire_restart_orphaned_approvals(
+async def _expire_restart_orphaned_approvals(
     session_storage: Any,
     approval_queue: Any,
 ) -> int:
@@ -2615,7 +2763,11 @@ def _expire_restart_orphaned_approvals(
     if callable(take_session_keys):
         take_session_keys()
     try:
-        expired = int(approval_queue.expire_all_pending() or 0)
+        expire_async = getattr(approval_queue, "expire_all_pending_async", None)
+        if callable(expire_async):
+            expired = int(await expire_async() or 0)
+        else:
+            expired = int(await asyncio.to_thread(approval_queue.expire_all_pending) or 0)
     except Exception:
         log.exception("approval.restart_recovery_failed")
         return 0
@@ -2625,6 +2777,38 @@ def _expire_restart_orphaned_approvals(
             expired_count=expired,
         )
     return expired
+
+
+async def _run_startup_worker[StartupResult](
+    function: Callable[..., StartupResult], *args: Any,
+) -> StartupResult:
+    """Await blocking startup work without releasing its ownership on cancellation."""
+
+    context = contextvars.copy_context()
+    # Retain the executor Future itself: cancelling all asyncio Tasks must not
+    # make an unfinished database writer look drained to the startup owner.
+    operation = asyncio.get_running_loop().run_in_executor(
+        None, partial(context.run, function, *args),
+    )
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not operation.cancelled():
+            operation.exception()
+        raise
+
+
+async def _apply_startup_migrations(db_path: str, migrations_dir: Path) -> list[str]:
+    from opensquilla.persistence.migrator import apply_pending
+
+    return await _run_startup_worker(apply_pending, db_path, migrations_dir)
 
 
 async def build_services(
@@ -2637,6 +2821,7 @@ async def build_services(
     extra_agent_ids: list[str] | None = None,
     seed_agent_workspaces: bool = True,
     defer_sandbox_startup: bool = False,
+    defer_external_services: bool = False,
     start_standalone_telemetry: bool = False,
 ) -> ServiceContainer:
     """Initialize reusable services without any gateway-specific side effects.
@@ -2644,7 +2829,9 @@ async def build_services(
     This is the standalone entry point for service construction. It builds
     all the pieces that both the ASGI gateway and the CLI ``--standalone``
     path need: session storage, provider selector, tool registry, memory,
-    skills, scheduler, search, and MCP discovery.
+    skills, scheduler, search, and MCP discovery.  Gateway callers may set
+    ``defer_external_services`` so integrations that can perform network or
+    subprocess I/O are scheduled after the durable core is ready.
 
     Managed-Skill crash recovery runs only when the current thread already
     owns :class:`ProfileOperationLock`. Callers without that capability still
@@ -2788,7 +2975,7 @@ async def build_services(
     # failing loud.
     storage_db_path = session_db_path
     if session_db_path != ":memory:":
-        from opensquilla.persistence.migrator import _native_sqlite_path, apply_pending
+        from opensquilla.persistence.migrator import _native_sqlite_path
 
         migrations_started_at = time.monotonic()
         log.info("build_services.migrations_started")
@@ -2799,7 +2986,7 @@ async def build_services(
             storage_db_path = _native_sqlite_path(session_db_path)
             os.makedirs(os.path.dirname(storage_db_path) or os.curdir, mode=0o700, exist_ok=True)
         migrations_dir = _resolve_migrations_dir()
-        applied = apply_pending(storage_db_path, migrations_dir)
+        applied = await _apply_startup_migrations(storage_db_path, migrations_dir)
         if applied:
             log.info("build_services.migrations_applied", count=len(applied), ids=applied)
         log.info(
@@ -2951,7 +3138,7 @@ async def build_services(
             )
     from opensquilla.application.approval_queue import get_approval_queue
 
-    _expire_restart_orphaned_approvals(
+    await _expire_restart_orphaned_approvals(
         session_storage,
         get_approval_queue(),
     )
@@ -3139,7 +3326,11 @@ async def build_services(
     # ── Memory tools (boot order 18) — per-agent stores ──────────────
     # Pre-bind to empty defaults so the ServiceContainer init below and
     # the deferred TurnRunner-ref callback both work even if the try
-    # block aborts.
+    # block aborts.  Desktop Gateway startup deliberately keeps these
+    # dictionaries stable: the TurnRunner and ServiceContainer receive the
+    # same objects, then the optional memory owner fills them after core
+    # readiness.  A memory/SQLite-vector warmup is useful, but it is not a
+    # prerequisite for accepting a session or serving the control UI.
     memory_managers: dict[str, MemoryManager] = {}
     memory_stores: dict[str, Any] = {}
     memory_retrievers: dict[str, Any] = {}
@@ -3147,58 +3338,95 @@ async def build_services(
     turn_capture_services: dict[str, Any] = {}
     memory_watchers: list[Any] = []
     _turn_runner_ref: list = []
-    memory_started_at = time.monotonic()
     memory_degraded = False
-    try:
-        from opensquilla.memory.manager import build_memory_managers
-        from opensquilla.tools.builtin.memory_tools import create_memory_tools
+    memory_deferred = bool(defer_external_services and _desktop_fast_start_enabled())
 
-        agent_ids = _configured_agent_ids(config, extra_agent_ids)
-        log.info("build_services.memory_started", agents=len(agent_ids))
-        memory_managers = await build_memory_managers(
-            config,
-            agent_ids,
-            session_storage=session_storage,
-        )
+    async def _initialize_memory_runtime() -> str:
+        """Populate the memory dictionaries, optionally after core ready.
 
-        # Derive legacy per-tier views from the managers. These remain in
-        # `ServiceContainer` until downstream consumers
-        # (TurnRunner, CLI, memory_tools) onto `memory_managers` directly.
-        memory_stores = {aid: m.store for aid, m in memory_managers.items()}
-        memory_retrievers = {aid: m.retriever for aid, m in memory_managers.items()}
-        memory_sync_managers = {aid: m.sync_manager for aid, m in memory_managers.items()}
-        turn_capture_services = {aid: m.turn_capture for aid, m in memory_managers.items()}
-        memory_watchers = [m.sync_manager for m in memory_managers.values()]
+        The dictionaries are intentionally mutated in place.  TurnRunner and
+        the channel RPC context capture those objects during boot; replacing
+        them here would leave the live runtime permanently pointed at an
+        empty snapshot.
+        """
 
-        # Deferred callback: TurnRunner doesn't exist yet, so we capture a
-        # mutable list ref that start_gateway_server() will populate later.
-        def _on_memory_write(agent_id: str) -> None:
-            if _turn_runner_ref:
-                _turn_runner_ref[0].refresh_memory_snapshot(agent_id)
+        nonlocal memory_degraded
+        memory_started_at = time.monotonic()
+        try:
+            from opensquilla.memory.manager import build_memory_managers
+            from opensquilla.tools.builtin.memory_tools import create_memory_tools
 
-        if memory_stores and memory_retrievers:
-            create_memory_tools(
-                stores=memory_stores,
-                retrievers=memory_retrievers,
-                memory_base=config.state_dir,
-                registry=tool_registry,
-                memory_source=getattr(config.memory, "source", "state"),
-                on_memory_write=_on_memory_write,
-                memory_config=config.memory,
-                workspace_base=config.workspace_dir
-                if getattr(config.memory, "source", "state") == "workspace"
-                else None,
+            agent_ids = _configured_agent_ids(config, extra_agent_ids)
+            log.info("build_services.memory_started", agents=len(agent_ids))
+            built_managers = await build_memory_managers(
+                config,
+                agent_ids,
+                session_storage=session_storage,
             )
-            log.info("build_services.memory_tools_registered", agents=list(memory_stores))
-    except Exception as e:
-        memory_degraded = True
-        log.warning("build_services.memory_tools_failed", error=str(e))
-    log.info(
-        "build_services.memory_ready",
-        agents=len(memory_managers),
-        degraded=memory_degraded,
-        duration_ms=_elapsed_monotonic_ms(memory_started_at),
-    )
+
+            # Keep the captured mapping identities stable for TurnRunner,
+            # channel RPC and shutdown even when this runs post-readiness.
+            memory_managers.clear()
+            memory_managers.update(built_managers)
+            memory_stores.clear()
+            memory_stores.update({aid: m.store for aid, m in built_managers.items()})
+            memory_retrievers.clear()
+            memory_retrievers.update({aid: m.retriever for aid, m in built_managers.items()})
+            memory_sync_managers.clear()
+            memory_sync_managers.update(
+                {aid: m.sync_manager for aid, m in built_managers.items()}
+            )
+            turn_capture_services.clear()
+            turn_capture_services.update(
+                {aid: m.turn_capture for aid, m in built_managers.items()}
+            )
+            memory_watchers.clear()
+            memory_watchers.extend(m.sync_manager for m in built_managers.values())
+
+            # Deferred callback: TurnRunner doesn't exist yet during eager
+            # construction, so capture a mutable list ref that
+            # start_gateway_server() populates later.
+            def _on_memory_write(agent_id: str) -> None:
+                if _turn_runner_ref:
+                    _turn_runner_ref[0].refresh_memory_snapshot(agent_id)
+
+            if memory_stores and memory_retrievers:
+                create_memory_tools(
+                    stores=memory_stores,
+                    retrievers=memory_retrievers,
+                    memory_base=config.state_dir,
+                    registry=tool_registry,
+                    memory_source=getattr(config.memory, "source", "state"),
+                    on_memory_write=_on_memory_write,
+                    memory_config=config.memory,
+                    workspace_base=config.workspace_dir
+                    if getattr(config.memory, "source", "state") == "workspace"
+                    else None,
+                )
+                log.info(
+                    "build_services.memory_tools_registered",
+                    agents=list(memory_stores),
+                )
+        except Exception as e:
+            memory_degraded = True
+            log.warning("build_services.memory_tools_failed", error=str(e))
+        log.info(
+            "build_services.memory_ready",
+            agents=len(memory_managers),
+            degraded=memory_degraded,
+            duration_ms=_elapsed_monotonic_ms(memory_started_at),
+            deferred=memory_deferred,
+        )
+        return "degraded" if memory_degraded else "ready"
+
+    if memory_deferred:
+        # OptionalServiceOwner adds generation fencing and makes shutdown
+        # cancel the in-flight store construction before core resources close.
+        _initialize_memory_runtime._optional_service_name = "memory"  # type: ignore[attr-defined]
+        deferred_warmups.append(_initialize_memory_runtime)
+        log.info("build_services.memory_deferred")
+    else:
+        await _initialize_memory_runtime()
 
     # ── Skill loader (boot order 19) ────────────────────────────────
     skill_loader = None
@@ -3412,30 +3640,43 @@ async def build_services(
     else:
         await _configure_search_provider()
 
-    # The Desktop owns this local MCP capability; it requires no user-managed
-    # server configuration. Older Desktop shells retain their native browser tool.
-    from opensquilla.browser import get_desktop_browser
+    async def _start_desktop_browser_service() -> str:
+        """Register the Desktop-owned browser tools after core readiness."""
+        from opensquilla.browser import get_desktop_browser
 
-    desktop_browser = get_desktop_browser()
-    if desktop_browser is not None:
-        from opensquilla.mcp.desktop_browser import DesktopBrowserMCPClient, browser_tool_policy
+        desktop_browser = get_desktop_browser()
+        if desktop_browser is None:
+            return "disabled"
+        from opensquilla.mcp.desktop_browser import (
+            DesktopBrowserMCPClient,
+            browser_tool_policy,
+        )
         from opensquilla.mcp.discovery import close_active_clients, register_client_tools
 
         try:
             await close_active_clients(owner="desktop-browser")
             names = await asyncio.wait_for(
                 register_client_tools(
-                    DesktopBrowserMCPClient(desktop_browser), tool_registry,
+                    DesktopBrowserMCPClient(desktop_browser),
+                    tool_registry,
                     spec_transform=browser_tool_policy,
                 ),
                 timeout=5,
             )
             log.info("build_services.desktop_browser_mcp_ready", tools=len(names))
+            return "ready"
+        except asyncio.CancelledError:
+            raise
         except Exception:
             log.info("build_services.desktop_browser_mcp_unavailable")
+            return "degraded"
 
-    # ── MCP discovery (boot order 22) ───────────────────────────────
-    if config.mcp.enabled and config.mcp.servers:
+    async def _start_mcp_services() -> str:
+        """Discover configured MCP servers without delaying core readiness."""
+        if not (config.mcp.enabled and config.mcp.servers):
+            if config.mcp.enabled:
+                log.info("build_services.mcp_enabled_no_servers")
+            return "disabled"
         from opensquilla.mcp.discovery import discover_and_register
         from opensquilla.mcp.types import MCPServerConfig
 
@@ -3474,6 +3715,8 @@ async def build_services(
                     duration_ms=_elapsed_monotonic_ms(server_started_at),
                     tool_count=len(names),
                 )
+            except asyncio.CancelledError:
+                raise
             except TimeoutError:
                 mcp_failures += 1
                 log.warning(
@@ -3509,8 +3752,21 @@ async def build_services(
             failures=mcp_failures,
             duration_ms=_elapsed_monotonic_ms(mcp_started_at),
         )
-    elif config.mcp.enabled:
-        log.info("build_services.mcp_enabled_no_servers")
+        return "ready" if mcp_failures == 0 else "degraded"
+
+    _start_desktop_browser_service._optional_service_name = "desktop_browser"  # type: ignore[attr-defined]
+    _start_mcp_services._optional_service_name = "mcp"  # type: ignore[attr-defined]
+
+    # The Desktop browser bridge and configured MCP servers may spawn
+    # subprocesses or make network requests.  A Gateway caller can explicitly
+    # defer them until the core listener is ready; standalone callers retain
+    # the historical eager behaviour.
+    if defer_external_services:
+        deferred_warmups.extend((_start_desktop_browser_service, _start_mcp_services))
+        log.info("build_services.external_services_deferred")
+    else:
+        await _start_desktop_browser_service()
+        await _start_mcp_services()
 
     # ── Router decision records (V017 router_decisions) ─────────────
     # The writer exists when
@@ -3682,6 +3938,43 @@ async def build_services(
         reliability_event_sink=reliability_event_sink,
         growth_event_sink=growth_event_sink,
         deferred_warmups=deferred_warmups,
+        config_revision=getattr(config, "config_version", 0),
+        optional_services={
+            "memory": {
+                "status": (
+                    "starting"
+                    if memory_deferred
+                    else ("degraded" if memory_degraded else "ready")
+                ),
+                "generation": 0,
+                "config_revision": getattr(config, "config_version", 0),
+                "owner_generation": 0,
+            },
+            "channels": {
+                "status": "starting",
+                "generation": 0,
+                "config_revision": getattr(config, "config_version", 0),
+                "owner_generation": 0,
+            },
+            "desktop_browser": {
+                "status": "starting",
+                "generation": 0,
+                "config_revision": getattr(config, "config_version", 0),
+                "owner_generation": 0,
+            },
+            "mcp": {
+                "status": "starting",
+                "generation": 0,
+                "config_revision": getattr(config, "config_version", 0),
+                "owner_generation": 0,
+            },
+            "cron": {
+                "status": "starting",
+                "generation": 0,
+                "config_revision": getattr(config, "config_version", 0),
+                "owner_generation": 0,
+            },
+        },
         sandbox_setup_task=sandbox_setup_task,
         sandbox_upgrade_report=sandbox_upgrade_report,
     )
@@ -3835,23 +4128,101 @@ def build_turn_runner_from_services(
     return runner
 
 
+def _notify_restart_recovery(svc: ServiceContainer) -> None:
+    runtime = getattr(svc, "task_runtime", None)
+    notify = getattr(runtime, "notify_recovery_dependencies_changed", None)
+    if callable(notify):
+        notify()
+
+
 async def _run_deferred_warmups(svc: ServiceContainer) -> None:
     warmups = list(getattr(svc, "deferred_warmups", []) or [])
+    legacy_ready_callback = getattr(svc, "_legacy_ready_callback", None)
     if not warmups:
+        svc._legacy_warmup_active = False  # type: ignore[attr-defined]
+        if callable(legacy_ready_callback):
+            legacy_ready_callback()
         return
+    svc._legacy_warmup_active = True  # type: ignore[attr-defined]
     log.info("gateway.deferred_warmups_started", count=len(warmups))
-    for warmup in warmups:
-        try:
-            result = warmup()
-            if inspect.isawaitable(result):
-                await result
-        except Exception as exc:  # noqa: BLE001 - warmups must not kill the gateway.
-            log.warning(
-                "gateway.deferred_warmup_failed",
-                warmup=getattr(warmup, "__name__", type(warmup).__name__),
-                error=str(exc),
-            )
-    log.info("gateway.deferred_warmups_ready", count=len(warmups))
+    generation = svc.optional_generation
+    try:
+        for warmup in warmups:
+            if generation != svc.optional_generation:
+                log.info("gateway.deferred_warmups_cancelled", generation=generation)
+                return
+            optional_name = getattr(warmup, "_optional_service_name", None)
+            if optional_name:
+                svc.optional_services.setdefault(optional_name, {})
+                descriptor = svc.optional_services[optional_name]
+                descriptor.update(
+                    {
+                        "status": "starting",
+                        "generation": generation,
+                        "config_revision": svc.config_revision,
+                    }
+                )
+                owner = svc.optional_owners.get(optional_name)
+                if owner is None:
+                    owner = OptionalServiceOwner(
+                        optional_name,
+                        warmup,
+                        config_revision=svc.config_revision,
+                        descriptor=descriptor,
+                    )
+                    svc.optional_owners[optional_name] = owner
+            try:
+                if optional_name:
+                    result = await owner.start_once()  # type: ignore[union-attr]
+                else:
+                    result = warmup()
+                    if inspect.isawaitable(result):
+                        result = await result
+                if optional_name and generation == svc.optional_generation:
+                    status = result if result in {"disabled", "ready", "degraded"} else "ready"
+                    svc.optional_services[optional_name].update(
+                        {
+                            "status": status,
+                            "generation": generation,
+                            "config_revision": svc.config_revision,
+                            "owner_generation": owner.owner_generation,  # type: ignore[union-attr]
+                        }
+                    )
+            except asyncio.CancelledError:
+                if optional_name:
+                    svc.optional_services[optional_name].update(
+                        {
+                            "status": "stopping",
+                            "generation": generation,
+                            "config_revision": svc.config_revision,
+                            "owner_generation": owner.owner_generation,  # type: ignore[union-attr]
+                        }
+                    )
+                raise
+            except Exception as exc:  # noqa: BLE001 - warmups must not kill the gateway.
+                if optional_name and generation == svc.optional_generation:
+                    svc.optional_services[optional_name].update(
+                        {
+                            "status": "degraded",
+                            "generation": generation,
+                            "config_revision": svc.config_revision,
+                            "owner_generation": owner.owner_generation,  # type: ignore[union-attr]
+                            "error": type(exc).__name__,
+                        }
+                    )
+                log.warning(
+                    "gateway.deferred_warmup_failed",
+                    warmup=getattr(warmup, "__name__", type(warmup).__name__),
+                    error=str(exc),
+                )
+            finally:
+                if generation == svc.optional_generation:
+                    _notify_restart_recovery(svc)
+        log.info("gateway.deferred_warmups_ready", count=len(warmups))
+    finally:
+        svc._legacy_warmup_active = False  # type: ignore[attr-defined]
+        if callable(legacy_ready_callback):
+            legacy_ready_callback()
 
 
 async def start_gateway_server(
@@ -3932,7 +4303,12 @@ async def start_gateway_server(
     from opensquilla.gateway.pidlock import GatewayPidLock
 
     _pid_lock = GatewayPidLock(_state_path(config, ""))
+    pid_lock_started_at = time.monotonic()
     _pid_lock.acquire()
+    log.info(
+        "gateway.pid_lock_acquired",
+        duration_ms=_elapsed_monotonic_ms(pid_lock_started_at),
+    )
 
     # The profile PID lock proves there is no live Gateway writer for this
     # runtime state. Reconcile exact persisted owners before any new turn can
@@ -3941,7 +4317,15 @@ async def start_gateway_server(
     try:
         from opensquilla.process_tree import reconcile_persisted_processes
 
-        await reconcile_persisted_processes(getattr(config, "state_dir", None))
+        reconcile_started_at = time.monotonic()
+        reconciled_process_count = await reconcile_persisted_processes(
+            getattr(config, "state_dir", None)
+        )
+        log.info(
+            "gateway.process_owner_reconciled",
+            count=reconciled_process_count,
+            duration_ms=_elapsed_monotonic_ms(reconcile_started_at),
+        )
     except Exception:
         log.warning("gateway.process_owner_reconcile_failed")
 
@@ -3960,9 +4344,15 @@ async def start_gateway_server(
             )
 
             desktop_profile_home = _desktop_ownership_profile_home(config)
+            ownership_started_at = time.monotonic()
             _desktop_gateway_ownership = activate_desktop_gateway_ownership(
                 profile_home=desktop_profile_home,
                 port=config.port,
+            )
+            log.info(
+                "gateway.desktop_ownership_activated",
+                enabled=_desktop_gateway_ownership is not None,
+                duration_ms=_elapsed_monotonic_ms(ownership_started_at),
             )
         except BaseException:
             _pid_lock.release()
@@ -3976,7 +4366,12 @@ async def start_gateway_server(
     # Only publish the new process-local generation after all applicable
     # ownership claims succeed and before any service can emit session events.
     try:
+        stream_reset_started_at = time.monotonic()
         reset_session_streams()
+        log.info(
+            "gateway.session_streams_reset",
+            duration_ms=_elapsed_monotonic_ms(stream_reset_started_at),
+        )
     except BaseException:
         _pid_lock.release()
         raise
@@ -3998,6 +4393,15 @@ async def start_gateway_server(
 
     # ── Reusable service initialization via build_services ───────────
     try:
+        # Frozen runtime modules are extracted on first import. Load only the
+        # module off-loop; TurnRunner/TaskRuntime and their owners are still
+        # constructed below on this loop after canonical recovery succeeds.
+        await _run_startup_worker(import_module, "opensquilla.engine.runtime")
+        startup_phase_started_at = _log_gateway_startup_phase(
+            "runtime_import",
+            startup_started_at=startup_started_at,
+            phase_started_at=startup_phase_started_at,
+        )
         svc = await build_services(
             config=config,
             session_manager=session_manager,
@@ -4006,6 +4410,7 @@ async def start_gateway_server(
             usage_tracker=usage_tracker,
             session_db_path=str(_state_path(config, "sessions.db")),
             defer_sandbox_startup=True,
+            defer_external_services=True,
         )
     except BaseException:
         _pid_lock.release()
@@ -4279,6 +4684,9 @@ async def start_gateway_server(
         terminal_listener=_subagent_completion_listener,
         lifecycle_listener=session_lifecycle_listener,
         max_concurrency=_task_runtime_max_concurrency(config),
+        max_resident_tasks=int(
+            getattr(config.task_runtime, "max_resident_tasks", 256)
+        ),
         max_pending_per_session=_task_runtime_max_pending_per_session(config),
         subagent_reserved_slots=int(
             getattr(getattr(config, "subagents", None), "subagent_reserved_slots", 0)
@@ -4289,6 +4697,7 @@ async def start_gateway_server(
         pending_overflow_policy=getattr(
             config.task_runtime, "pending_overflow_policy", "reject_newest"
         ),
+        service_snapshot=lambda: svc.optional_services,
     )
     from opensquilla.gateway.goal_service import GoalService
 
@@ -4311,9 +4720,11 @@ async def start_gateway_server(
     async def _ordered_task_lifecycle(event: TaskLifecycleEvent) -> None:
         # Session projection remains first. Goal settlement is independently
         # isolated so one observer cannot suppress the other.
+        projection_error: Exception | None = None
         try:
             await session_lifecycle_listener(event)
-        except Exception:
+        except Exception as exc:
+            projection_error = exc
             log.warning(
                 "gateway.session_lifecycle_projection_failed",
                 session_key=event.session_key,
@@ -4329,6 +4740,10 @@ async def start_gateway_server(
                 task_id=event.task_id,
                 exc_info=True,
             )
+        if projection_error is not None:
+            # The runtime retries directory invalidation only, never Goal
+            # settlement or the old task's session-state projection.
+            raise projection_error
 
     task_runtime.set_lifecycle_listener(_ordered_task_lifecycle)
     task_runtime.set_activation_listener(goal_service.on_task_activation)
@@ -4372,7 +4787,7 @@ async def start_gateway_server(
         steer_recovery = await recover_stranded_steers()
         if any(
             int(steer_recovery.get(field, 0) or 0)
-            for field in ("applied", "promoted", "cancelled", "rejected", "resumed")
+            for field in ("applied", "promoted", "cancelled", "rejected", "resumed", "deferred")
         ):
             log.info(
                 "gateway.steer_restart_recovery_completed",
@@ -4592,10 +5007,25 @@ async def start_gateway_server(
         # must never dispatch during scheduler catch-up or future ticks.
         await _disable_retired_skill_jobs(svc.cron_scheduler)
 
-        # Startup catch-up can execute overdue jobs immediately. Start only
-        # after delivery, terminal notifications, and every handler are ready.
-        await svc.cron_scheduler.start()
-        log.info("build_services.cron_scheduler_started")
+        cron_scheduler = svc.cron_scheduler
+
+        async def _start_cron_scheduler() -> str:
+            # Startup catch-up can execute overdue jobs immediately. Gateway
+            # callers defer that work until the durable core/listener boundary
+            # has been published; standalone callers retain eager startup.
+            await cron_scheduler.start()
+            log.info("build_services.cron_scheduler_started")
+            return "ready"
+
+        _start_cron_scheduler._optional_service_name = "cron"  # type: ignore[attr-defined]
+        # ``start_gateway_server`` is the Gateway-owned caller. Embedded
+        # ``run=False`` construction has no post-listener warmup task, so it
+        # retains eager scheduler startup for compatibility.
+        if run:
+            svc.deferred_warmups.append(_start_cron_scheduler)
+            log.info("build_services.cron_scheduler_deferred")
+        else:
+            await _start_cron_scheduler()
 
     # Build channel adapters (don't start yet -- app doesn't exist)
     webhook_routes: list = []
@@ -4672,6 +5102,9 @@ async def start_gateway_server(
                     diagnostics_state=diagnostics_state,
                 ),
             )
+            _bind_channel_service_readiness(
+                manager, svc, config_revision=service_config_revision,
+            )
             _cm_holder[0] = manager
         results: dict[str, str] = await manager.reconcile(config.channels.channels)
         return results
@@ -4715,6 +5148,28 @@ async def start_gateway_server(
         extra_routes=webhook_routes or None,
     )
     app.state.gateway_ready = False
+    app.state.core_ready = False
+    # Keep the historical aggregate readiness separate from the new durable
+    # core boundary. Electron uses /readyz/core; /readyz remains pending
+    # until deferred external integrations have reached a terminal state.
+    app.state.legacy_ready = False
+    optional_services = getattr(svc, "optional_services", None)
+    if not isinstance(optional_services, dict):
+        optional_services = {}
+        svc.optional_services = optional_services
+    app.state.optional_services = optional_services
+    svc.optional_generation = int(getattr(svc, "optional_generation", 0) or 0) + 1
+    app.state.optional_generation = svc.optional_generation
+    service_config_revision = getattr(
+        svc, "config_revision", getattr(config, "config_version", 0)
+    )
+    channel_readiness_owned = _bind_channel_service_readiness(
+        channel_manager, svc, config_revision=service_config_revision,
+    )
+    for descriptor in optional_services.values():
+        if isinstance(descriptor, dict):
+            descriptor.setdefault("config_revision", service_config_revision)
+            descriptor.setdefault("owner_generation", 0)
     app.state.desktop_gateway_ownership = _desktop_gateway_ownership
     if run:
         # Publish a shutdown trigger before uvicorn can expose the Desktop
@@ -4742,6 +5197,51 @@ async def start_gateway_server(
     gateway_ready_phase_emitted = False
     gateway_ready_wait_started_at = startup_phase_started_at
 
+    def _publish_legacy_ready_if_complete() -> None:
+        _notify_restart_recovery(svc)
+        if bool(getattr(app.state, "legacy_ready", False)):
+            return
+        if bool(getattr(svc, "_legacy_warmup_active", False)):
+            return
+        services = getattr(svc, "optional_services", {})
+        if isinstance(services, dict) and any(
+            isinstance(value, dict)
+            and value.get("status") in {"starting", "stopping"}
+            for value in services.values()
+        ):
+            return
+        app.state.legacy_ready = True
+        log.info(
+            "gateway.startup_phase",
+            phase="legacy_ready",
+            status="ready",
+            startup_elapsed_ms=_elapsed_monotonic_ms(startup_started_at, time.monotonic()),
+        )
+
+    svc._legacy_ready_callback = _publish_legacy_ready_if_complete  # type: ignore[attr-defined]
+    svc._legacy_warmup_active = bool(  # type: ignore[attr-defined]
+        run and getattr(svc, "deferred_warmups", None)
+    )
+    # Services absent from the deferred list are disabled for this generation;
+    # otherwise the legacy aggregate probe would wait forever on an unused
+    # integration whose default descriptor started as ``starting``.
+    deferred_names = (
+        {
+            getattr(warmup, "_optional_service_name", None)
+            for warmup in (getattr(svc, "deferred_warmups", None) or [])
+        }
+        if run
+        else set()
+    )
+    for optional_name, descriptor in getattr(svc, "optional_services", {}).items():
+        if (
+            isinstance(descriptor, dict)
+            and descriptor.get("status") == "starting"
+            and optional_name not in deferred_names
+            and optional_name != "channels"
+        ):
+            descriptor.update({"status": "disabled", "generation": svc.optional_generation})
+
     def _start_post_ready_observability() -> None:
         # A listening Gateway starts its V1 workers only after readiness.
         # Embedded app construction must not launch them. Standalone clients
@@ -4767,6 +5267,7 @@ async def start_gateway_server(
         if gateway_ready_phase_emitted or not listener_ready or not runtime_state_ready:
             return
         gateway_ready_phase_emitted = True
+        app.state.core_ready = True
         app.state.gateway_start_ready = True
         gateway_start_ready_event.set()
         ready_at = time.monotonic()
@@ -4793,6 +5294,111 @@ async def start_gateway_server(
                 svc.deferred_warmup_task = create_background_task(
                     _run_deferred_warmups(svc)
                 )
+        _publish_legacy_ready_if_complete()
+
+    async def _start_optional_channels(generation: int) -> None:
+        """Start channel adapters after the durable core is ready."""
+        owner_generation = int(
+            getattr(svc.optional_owners.get("channels"), "owner_generation", generation)
+            or generation
+        )
+        if channel_manager is None:
+            svc.optional_services["channels"] = {
+                "status": "disabled",
+                "generation": generation,
+            }
+            _publish_legacy_ready_if_complete()
+            return
+        svc.optional_services["channels"] = {
+            "status": "starting",
+            "generation": generation,
+        }
+        configured_channel_names = getattr(channel_manager, "_channels", {})
+        if not channel_readiness_owned and isinstance(configured_channel_names, dict):
+            for name in configured_channel_names:
+                channel_name = str(name).strip().lower()
+                if channel_name:
+                    svc.optional_services[f"channel:{channel_name}"] = {
+                        "status": "starting",
+                        "generation": generation,
+                        "config_revision": service_config_revision,
+                        "owner_generation": owner_generation,
+                    }
+        try:
+            results = await channel_manager.start_all()
+            if generation != svc.optional_generation:
+                return
+            start_errors_fn = getattr(channel_manager, "start_errors", None)
+            start_errors = start_errors_fn() if start_errors_fn is not None else {}
+            for name, ok in results.items():
+                # Channel ingress declares its concrete adapter as a required
+                # optional service. Keep per-adapter readiness separate from
+                # the aggregate owner so one failed adapter does not make a
+                # healthy adapter reject all incoming work.
+                channel_name = str(name).strip().lower()
+                if channel_name and not channel_readiness_owned:
+                    svc.optional_services[f"channel:{channel_name}"] = {
+                        "status": "ready" if ok else "degraded",
+                        "generation": generation,
+                        "config_revision": service_config_revision,
+                        "owner_generation": owner_generation,
+                    }
+                if ok:
+                    log.info("gateway.channel_started", channel=name)
+                else:
+                    details = start_errors.get(name, {})
+                    log.warning(
+                        "gateway.channel_failed",
+                        channel=name,
+                        error_type=details.get("error_type"),
+                        error=details.get("error"),
+                        exception=details.get("exception"),
+                    )
+            svc.optional_services["channels"] = {
+                "status": "ready" if all(results.values()) else "degraded",
+                "generation": generation,
+                "channels": results,
+            }
+            _publish_legacy_ready_if_complete()
+        except asyncio.CancelledError:
+            svc.optional_services["channels"] = {
+                "status": "stopping",
+                "generation": generation,
+            }
+            for name in (
+                configured_channel_names
+                if not channel_readiness_owned and isinstance(configured_channel_names, dict)
+                else ()
+            ):
+                channel_name = str(name).strip().lower()
+                if channel_name:
+                    svc.optional_services.setdefault(f"channel:{channel_name}", {}).update(
+                        {"status": "stopping", "generation": generation}
+                    )
+            _publish_legacy_ready_if_complete()
+            raise
+        except Exception as exc:  # noqa: BLE001 - one integration must not kill core.
+            svc.optional_services["channels"] = {
+                "status": "degraded",
+                "generation": generation,
+                "error": type(exc).__name__,
+            }
+            for name in (
+                configured_channel_names
+                if not channel_readiness_owned and isinstance(configured_channel_names, dict)
+                else ()
+            ):
+                channel_name = str(name).strip().lower()
+                if channel_name:
+                    svc.optional_services.setdefault(f"channel:{channel_name}", {}).update(
+                        {
+                            "status": "degraded",
+                            "generation": generation,
+                            "error": type(exc).__name__,
+                        }
+                    )
+            log.warning("gateway.channel_start_failed", error=str(exc))
+            _publish_legacy_ready_if_complete()
 
     server_handle = GatewayServer(app=app, config=config)
     server_handle._pid_lock = _pid_lock
@@ -4954,24 +5560,6 @@ async def start_gateway_server(
             )
         log.info("gateway.started", host=config.host, port=config.port)
 
-    # Start channels (after app is ready to receive webhooks)
-    if channel_manager is not None:
-        results = await channel_manager.start_all()
-        start_errors_fn = getattr(channel_manager, "start_errors", None)
-        start_errors = start_errors_fn() if start_errors_fn is not None else {}
-        for name, ok in results.items():
-            if ok:
-                log.info("gateway.channel_started", channel=name)
-            else:
-                details = start_errors.get(name, {})
-                log.warning(
-                    "gateway.channel_failed",
-                    channel=name,
-                    error_type=details.get("error_type"),
-                    error=details.get("error"),
-                    exception=details.get("exception"),
-                )
-
     if run and _desktop_router_preload_enabled():
         create_background_task(preload_squilla_router_runtime(config))
     elif run:
@@ -4985,9 +5573,34 @@ async def start_gateway_server(
         phase_started_at=startup_phase_started_at,
     )
     _publish_gateway_ready_if_complete()
+    # Channel start, unlike core readiness, may perform network I/O and spawn
+    # subprocesses.  Schedule it only after the listener/core boundary has
+    # been published and fence the task with the current owner generation.
+    channels_owner = OptionalServiceOwner(
+        "channels",
+        _start_optional_channels,
+        config_revision=service_config_revision,
+        descriptor=svc.optional_services.setdefault("channels", {}),
+    )
+    optional_owners = getattr(svc, "optional_owners", None)
+    if not isinstance(optional_owners, dict):
+        optional_owners = {}
+        setattr(svc, "optional_owners", optional_owners)
+    optional_owners["channels"] = channels_owner
+    svc.optional_start_task = create_background_task(channels_owner.start_once())
     usage_storage = get_session_storage(svc.session_manager)
     if usage_storage is not None and hasattr(usage_storage, "get_usage_backfill_batch"):
         from opensquilla.gateway.usage_backfill import run_usage_backfill
 
         svc.usage_backfill_task = create_background_task(run_usage_backfill(usage_storage))
+    if usage_storage is not None and hasattr(
+        usage_storage, "backfill_transcript_content_lengths"
+    ):
+        from opensquilla.gateway.content_length_backfill import (
+            run_content_length_backfill,
+        )
+
+        svc.content_length_backfill_task = create_background_task(
+            run_content_length_backfill(usage_storage)
+        )
     return server_handle

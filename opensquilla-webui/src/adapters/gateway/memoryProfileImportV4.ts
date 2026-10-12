@@ -6,13 +6,14 @@ import {
   type MemoryImportPreview,
   type MemoryImportProviderExpectation,
   type MemoryImportRecent,
+  type MemoryImportReadOptions,
   type MemoryImportTarget,
   type MemoryProfileImport,
 } from '@/modules/memoryProfileImport'
 
 interface RpcTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
-  ready(options?: { timeoutMs?: number }): Promise<void>
+  ready(options?: RpcCallOptions): Promise<void>
   supports(method: string): boolean
   markUnsupported(method: string): void
 }
@@ -184,29 +185,34 @@ function expectedParams(expected: MemoryImportProviderExpectation): Record<strin
 }
 
 export function createV4MemoryProfileImport(transport: RpcTransport): MemoryProfileImport {
-  const request = async (method: string, params: Record<string, unknown>): Promise<unknown> => {
+  const request = async (method: string, params: Record<string, unknown>, readOptions?: MemoryImportReadOptions): Promise<unknown> => {
     if (!transport.supports(method)) throw new MemoryProfileImportError('unsupported', 'METHOD_NOT_FOUND', 'Memory profile import is unsupported.')
-    await transport.ready({ timeoutMs: 8_000 })
+    await transport.ready({
+      timeoutMs: 8_000,
+      ...(readOptions ? { signal: readOptions.signal, timeoutAction: 'reject', abortAction: 'reject' } as const : {}),
+    })
+    if (readOptions?.signal?.aborted) throw new DOMException('Memory import read cancelled', 'AbortError')
     try {
       return await transport.request(method, { schemaVersion: SCHEMA_VERSION, agentId: AGENT_ID, ...params }, {
         timeoutMs: 15_000,
         timeoutAction: 'reject',
         abortAction: 'reject',
+        signal: readOptions?.signal,
       })
     } catch (error) {
       if (methodMissing(error)) transport.markUnsupported(method)
       throw mapError(error)
     }
   }
-  const validJob = async (method: string, params: Record<string, unknown>) => {
-    const result = job(await request(method, params))
+  const validJob = async (method: string, params: Record<string, unknown>, options?: MemoryImportReadOptions) => {
+    const result = job(await request(method, params, options))
     if (!result || result.schemaVersion !== SCHEMA_VERSION) throw invalid('Invalid memory profile import job.')
     return result
   }
 
   return {
-    async info() {
-      const result = info(await request(METHODS.info, {}))
+    async info(options) {
+      const result = info(await request(METHODS.info, {}, options))
       if (result.schemaVersion !== SCHEMA_VERSION) throw invalid('Invalid memory profile import information.')
       return result
     },
@@ -219,7 +225,7 @@ export function createV4MemoryProfileImport(transport: RpcTransport): MemoryProf
         ...expectedParams(input.expected),
       })
     },
-    async status(jobId) { return await validJob(METHODS.status, { jobId }) },
+    async status(jobId, options) { return await validJob(METHODS.status, { jobId }, options) },
     async cancel(jobId, clientRequestId) {
       return await validJob(METHODS.cancel, { jobId, clientRequestId })
     },

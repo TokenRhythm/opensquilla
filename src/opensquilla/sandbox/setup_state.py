@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -99,9 +100,11 @@ async def current_sandbox_setup_status(config: Any) -> SetupResult:
     return await _portable_setup_status(config, platform=platform)
 
 
-async def ensure_sandbox_setup(config: Any) -> SetupResult:
+async def ensure_sandbox_setup(config: Any, *, repair_identity: bool = False) -> SetupResult:
     platform = _platform_name()
     if platform == "win32":
+        if repair_identity:
+            return await _ensure_windows_setup(config, repair_identity=True)
         return await _ensure_windows_setup(config)
     if platform == "darwin":
         return await _ensure_macos_setup(config)
@@ -142,16 +145,33 @@ async def _windows_setup_status(config: Any) -> SetupResult:
     return await asyncio.to_thread(_windows_default_setup_result)
 
 
-async def _ensure_windows_setup(config: Any) -> SetupResult:
-    # Windows setup can wait for UAC consent and for the elevated helper to
-    # finish. Keep that blocking Win32 work off the gateway event loop so
-    # health checks, shutdown, and setup-status RPCs stay responsive.
-    return await asyncio.to_thread(_ensure_windows_setup_sync, config)
+async def _ensure_windows_setup(config: Any, *, repair_identity: bool = False) -> SetupResult:
+    # A cancelled thread cannot interrupt a native consent dialog. Keep the
+    # entire explicit operation in a disposable process, including admin calls.
+    from opensquilla.sandbox.backend.windows_setup_process import run_windows_setup_process
+    from opensquilla.sandbox.setup_runtime import (
+        mark_sandbox_capability_unavailable,
+        sandbox_setup_generation,
+    )
+
+    generation = sandbox_setup_generation()
+    return await run_windows_setup_process(
+        config,
+        repair_identity=repair_identity,
+        on_unavailable=lambda detail: mark_sandbox_capability_unavailable(
+            detail, generation=generation,
+        ),
+    )
 
 
-def _ensure_windows_setup_sync(config: Any) -> SetupResult:
+def _ensure_windows_setup_sync(
+    config: Any,
+    *,
+    on_unavailable: Callable[[str], None] | None = None,
+    repair_identity: bool = False,
+) -> SetupResult:
     _ = config
-    support = _probe_windows_sandbox_support()
+    support = _probe_windows_sandbox_support(fresh_identity=True)
     if support.default_backend_available and support.proxy_allowlist_enforced:
         return _windows_default_setup_result()
     if (
@@ -165,12 +185,15 @@ def _ensure_windows_setup_sync(config: Any) -> SetupResult:
             or not support.storage_ready
         )
     ):
+        if on_unavailable is not None:
+            on_unavailable("Windows sandbox identity, storage or network requires repair.")
         marker_path = _windows_setup_marker_path()
         try:
+            options = {"repair_identity": True} if repair_identity else {}
             if _windows_process_is_admin():
-                _run_windows_setup_helper_in_process(marker_path)
+                _run_windows_setup_helper_in_process(marker_path, **options)
             else:
-                _run_windows_setup_helper_elevated(marker_path)
+                _run_windows_setup_helper_elevated(marker_path, **options)
         except OSError as exc:
             return SetupResult(
                 state=SandboxSetupState.FAILED,
@@ -241,11 +264,15 @@ def _windows_default_setup_result() -> SetupResult:
     )
 
 
-def _probe_windows_sandbox_support() -> WindowsSetupSupport:
+def _probe_windows_sandbox_support(*, fresh_identity: bool = False) -> WindowsSetupSupport:
     from opensquilla.sandbox.backend.windows_default_support import (
         probe_windows_default_support,
     )
 
+    if fresh_identity:
+        from opensquilla.sandbox.backend.windows_default_setup import setup_marker_identity_ready
+
+        setup_marker_identity_ready(_windows_setup_marker_path(), fresh=True)
     support = probe_windows_default_support(proxy_ports=_windows_marker_proxy_ports())
     return WindowsSetupSupport(
         default_backend_available=support.default_backend_available,
@@ -288,10 +315,10 @@ def _windows_process_is_admin() -> bool:
         return False
 
 
-def _run_windows_setup_helper_in_process(path: Path) -> None:
+def _run_windows_setup_helper_in_process(path: Path, *, repair_identity: bool = False) -> None:
     from opensquilla.sandbox.backend.windows_default_setup import run_elevated_setup_helper
 
-    run_elevated_setup_helper(path, already_elevated=True)
+    run_elevated_setup_helper(path, already_elevated=True, repair_identity=repair_identity)
 
 
 def _establish_windows_network_setup(marker_path: Path):
@@ -311,10 +338,10 @@ def _write_windows_setup_marker(path: Path, *, network=None) -> None:
     write_setup_marker(path, network=network)
 
 
-def _run_windows_setup_helper_elevated(path: Path) -> None:
+def _run_windows_setup_helper_elevated(path: Path, *, repair_identity: bool = False) -> None:
     from opensquilla.sandbox.backend.windows_default_setup import run_elevated_setup_helper
 
-    run_elevated_setup_helper(path)
+    run_elevated_setup_helper(path, repair_identity=repair_identity)
 
 
 def _windows_setup_helper_report_detail(path: Path) -> str | None:

@@ -95,6 +95,8 @@ export interface TurnSendParams {
   workspaceFiles?: WorkspaceFileReference[]
   /** Explicit admission mode used by ordinary and queued sends. */
   queueMode?: string
+  /** Optional service dependencies inferred from selected producer skills. */
+  requiredServices?: string[]
   [key: string]: unknown
 }
 

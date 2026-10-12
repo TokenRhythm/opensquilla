@@ -27,8 +27,8 @@ import structlog
 
 from opensquilla.channels.approval_prompt import (
     ApprovalPromptRequest,
-    bind_short_code,
-    release_short_code,
+    bind_short_code_async,
+    release_short_code_async,
     render_approval_prompt,
 )
 from opensquilla.channels.contract import channel_capability_profile
@@ -163,6 +163,35 @@ def _deny_undeliverable(approval_id: str, reason: str, channel_name: str = "") -
         )
 
 
+async def _deny_undeliverable_async(
+    approval_id: str,
+    reason: str,
+    channel_name: str = "",
+) -> None:
+    """Run denial persistence off the Gateway event loop."""
+    log.warning(
+        "approval_notify.prompt_undeliverable",
+        approval_id=approval_id,
+        reason=reason,
+        channel=channel_name,
+    )
+    try:
+        await _get_queue().resolve_async(
+            approval_id,
+            False,
+            elevated_mode=None,
+            resolution_metadata={
+                "resolutionSource": "approval_delivery_failure",
+                "resolutionReason": reason,
+            },
+        )
+    except Exception:  # noqa: BLE001 - already resolved or expired.
+        log.info(
+            "approval_notify.fail_closed_deny_skipped",
+            approval_id=approval_id,
+        )
+
+
 async def _deliver_channel_prompt(
     info: dict[str, Any],
     *,
@@ -194,13 +223,13 @@ async def _deliver_channel_prompt(
     except Exception:
         return
     if node is None:
-        _deny_undeliverable(approval_id, "session_missing")
+        await _deny_undeliverable_async(approval_id, "session_missing")
         return
     channel_name = getattr(node, "last_channel", None)
     channel_id = getattr(node, "last_to", None)
     thread_id = getattr(node, "last_thread_id", None)
     if not channel_name:
-        _deny_undeliverable(approval_id, "no_delivery_channel")
+        await _deny_undeliverable_async(approval_id, "no_delivery_channel")
         return
 
     get_channel = getattr(channel_manager, "get", None)
@@ -208,10 +237,10 @@ async def _deliver_channel_prompt(
         return
     adapter = get_channel(channel_name)
     if adapter is None:
-        _deny_undeliverable(approval_id, "adapter_missing", str(channel_name))
+        await _deny_undeliverable_async(approval_id, "adapter_missing", str(channel_name))
         return
 
-    short_code = bind_short_code(
+    short_code = await bind_short_code_async(
         approval_id,
         namespace=str(info.get("namespace") or "exec"),
         session_key=session_key,
@@ -268,7 +297,7 @@ async def _deliver_channel_prompt(
             error_type=type(exc).__name__,
             error=str(exc),
         )
-        _deny_undeliverable(approval_id, "send_failed", str(channel_name))
+        await _deny_undeliverable_async(approval_id, "send_failed", str(channel_name))
 
 
 def register_approval_channel_notifier(
@@ -289,7 +318,18 @@ def register_approval_channel_notifier(
 
     def _listener(event: str, info: dict[str, Any]) -> None:
         if event == "resolved":
-            release_short_code(str(info.get("id") or ""))
+            approval_id = str(info.get("id") or "")
+            try:
+                # Resolution callbacks run on the Gateway loop.  Route
+                # cleanup through the queue's serialized async owner instead
+                # of concurrently using its shared SQLite connection from a
+                # detached thread.
+                cleanup_task = release_short_code_async(approval_id)
+                schedule(cleanup_task)
+            except RuntimeError:
+                # The gateway is already shutting down; cleanup is best effort.
+                if "cleanup_task" in locals():
+                    cleanup_task.close()
             return
         if event != "requested":
             return

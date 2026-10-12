@@ -16,6 +16,10 @@ export interface SandboxRequestOptions {
   readonly signal?: AbortSignal
 }
 
+export interface SandboxSetupOptions extends SandboxRequestOptions {
+  readonly repairIdentity?: boolean
+}
+
 export interface SandboxReadinessOptions extends SandboxRequestOptions {
   readonly refreshCapability?: boolean
 }
@@ -106,7 +110,7 @@ export interface SandboxReadiness {
   readiness(options?: SandboxReadinessOptions): Promise<SandboxReadinessState>
 
   /** Starts setup at most once, then verifies the authoritative capability. */
-  ensureReady(options?: SandboxRequestOptions): Promise<SandboxSetupResult>
+  ensureReady(options?: SandboxSetupOptions): Promise<SandboxSetupResult>
 }
 
 export interface SandboxPolicyAdministration {

@@ -7,12 +7,21 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc_sessions import _overlay_runtime_task_snapshot, _task_state_summary
-from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.gateway.task_runtime import TaskResidentBusyError, TaskRuntime
+from opensquilla.observability.log_privacy import private_log_event
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
 from opensquilla.session.storage import SessionStorage
+
+
+@pytest.fixture(autouse=True)
+def operational_logs():
+    """Use Gateway's exception projection without the default Rich rendering."""
+    with capture_logs(processors=[private_log_event]) as events:
+        yield events
 
 
 @pytest.mark.asyncio
@@ -44,7 +53,7 @@ async def test_terminal_settlement_survives_shared_storage_gate_contention(
 
     runtime = TaskRuntime(
         storage=storage, turn_handler=handler, event_emitter=emit,
-        running_heartbeat_interval_s=None,
+        running_heartbeat_interval_s=None, max_resident_tasks=1,
     )
     driver: asyncio.Task[None] | None = None
     try:
@@ -96,17 +105,32 @@ async def test_terminal_settlement_survives_shared_storage_gate_contention(
             assert durable.status == AgentTaskStatus.FAILED
             assert durable.finished_at == record.finished_at
             assert handle.task_id not in runtime._terminal_fallback_records
+            assert runtime._resident_count == 0
         else:
             # Persistent storage failure is reported honestly; do not pretend
             # an in-memory terminal result is a durable write.
             assert durable.status == AgentTaskStatus.RUNNING
             assert handle.task_id in runtime._terminal_fallback_records
             assert runtime._terminal_retry_task is not None
+            # The in-memory task is gone, but the unresolved durable write
+            # still owns its resident slot until the retry settles.
+            assert runtime._resident_count == 1
+            with pytest.raises(TaskResidentBusyError):
+                await runtime.enqueue(
+                    RouteEnvelope(
+                        source_kind=SourceKind.WEB,
+                        source_name="synthetic",
+                        agent_id="main",
+                        session_key="agent:main:webchat:terminal-contention-other",
+                    ),
+                    "must wait for terminal settlement",
+                )
             await asyncio.wait_for(asyncio.shield(runtime._terminal_retry_task), timeout=2)
             durable = await storage.get_agent_task(handle.task_id)
             assert durable is not None and durable.status == AgentTaskStatus.FAILED
             assert durable.finished_at == record.finished_at
             assert handle.task_id not in runtime._terminal_fallback_records
+            assert runtime._resident_count == 0
         assert len(terminal_events) == 1
     finally:
         fail_turn.set()
@@ -132,7 +156,7 @@ async def test_terminal_settlement_survives_shared_storage_gate_contention(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delete_task", [False, True])
 async def test_shutdown_reports_unresolved_terminal_write_without_leaking_retry(
-    tmp_path, delete_task,
+    tmp_path, delete_task, operational_logs,
 ):
     storage = await SessionStorage.open(str(tmp_path / "shutdown-contention.db"))
     storage._busy_budget_seconds = 0.01
@@ -143,7 +167,12 @@ async def test_shutdown_reports_unresolved_terminal_write_without_leaking_retry(
         await finish.wait()
         raise RuntimeError("synthetic failure")
 
-    runtime = TaskRuntime(storage=storage, turn_handler=handler, running_heartbeat_interval_s=None)
+    runtime = TaskRuntime(
+        storage=storage,
+        turn_handler=handler,
+        running_heartbeat_interval_s=None,
+        max_resident_tasks=1,
+    )
     held = False
     try:
         handle = await runtime.enqueue(RouteEnvelope(
@@ -156,6 +185,13 @@ async def test_shutdown_reports_unresolved_terminal_write_without_leaking_retry(
         held = True
         finish.set()
         await asyncio.wait_for(asyncio.shield(driver), timeout=2)
+        assert any(
+            event.get("event") == "task_runtime.activation_permit_release_failed"
+            and event.get("exception_type") == "StorageBusyError"
+            and event.get("log_level") == "warning"
+            for event in operational_logs
+        )
+        assert runtime._resident_count == 1
         if delete_task:
             # Delete while still holding the gate, before the retry can run.
             await storage.conn.execute(
@@ -167,6 +203,7 @@ async def test_shutdown_reports_unresolved_terminal_write_without_leaking_retry(
         result = await asyncio.wait_for(runtime.shutdown(cancel=False, timeout=0.05), timeout=2)
         assert result.clean == delete_task
         assert result.remaining_auxiliary_count == (0 if delete_task else 1)
+        assert runtime._resident_count == (0 if delete_task else 1)
         assert runtime._terminal_retry_task is not None and runtime._terminal_retry_task.done()
         if delete_task:
             assert handle.task_id not in runtime._terminal_fallback_records

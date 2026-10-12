@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { _electron as electron } from 'playwright'
 import { environmentWithoutProviderSecrets, requiredOption, waitFor } from './packaged-smoke-helpers.mjs'
-import { captureElectronProcessIdentity, closeElectronAndObserveExit } from './packaged-first-send-cleanup.mjs'
+import { captureElectronProcessIdentity, captureFirstSendDiagnostic, closeElectronAndObserveExit } from './packaged-first-send-cleanup.mjs'
 import { desktopShutdownEvidenceSince, gatewayProcessSnapshot } from './e2e-shutdown-helpers.mjs'
 import { desktopProfileFingerprint, loadDesktopGatewayOwnershipRecord, verifyDesktopGatewayOwnership } from '../dist/desktop-gateway-ownership.js'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
@@ -241,8 +241,13 @@ try {
   console.log(JSON.stringify({ ok: true, report: join(plan.outputDir, 'report.json') }))
 } catch (error) {
   Object.assign(report, { ok: false, status: 'failed', error: error.message, errorCode: error.code, errorSignal: error.signal, errorKilled: error.killed, failedAt: new Date().toISOString(), provider: provider?.snapshot(), activeProcess: active?.identity })
+  await persist()
   if (active?.page) {
-    try { await screenshot(active.page, 'failure') } catch { /* Keep the primary failure. */ }
+    report.pageErrorCount = active.pageErrors?.length ?? 0
+    const rpc = await captureFirstSendDiagnostic(() => snapshot(active.page))
+    report.failureRpc = rpc?.diagnosticError ? { unavailable: true } : rpc
+    await captureFirstSendDiagnostic(() => screenshot(active.page, 'failure'))
+    await persist()
   }
   // Freeze Stop evidence before cleanup. Closing this fixture cannot be
   // credited as a user cancellation. Only this launch's app may be asked to
@@ -258,6 +263,10 @@ try {
     }
   }
   if (active) report.operatorQuitRequired = true
+  if (outputCreated) {
+    try { await copyFile(plan.logPath, join(plan.outputDir, 'desktop.log')) }
+    catch (diagnosticError) { report.desktopLogDiagnosticError = diagnosticError.code || 'unavailable' }
+  }
   await persist()
   console.error(JSON.stringify({ ok: false, stage: report.stage, error: error.message, report: outputCreated ? join(plan.outputDir, 'report.json') : null }))
   process.exitCode = 1

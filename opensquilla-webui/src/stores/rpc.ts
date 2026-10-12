@@ -14,11 +14,11 @@ import {
 import type { DesktopGatewayConnection, DesktopResumeEvent, DesktopResumeSource } from '@/platform/types'
 import { getPlatform } from '@/platform'
 import { recordRpcResumeDiag, recordRpcTransportDiag } from '@/utils/chat/sessionNavigationDiag'
+import { DELIVERY_SALT_KEY, deliverySalt, deliveryTargetId as hashDeliveryTarget } from '@/utils/chat/deliveryIdentity'
 
 const WS_URL_KEY = 'opensquilla.wsUrl'
 const WS_TOKEN_KEY = 'opensquilla.wsToken'
 const CACHED_AUTH_KEY = 'opensquilla.cachedAuth'
-const DELIVERY_SALT_KEY = 'opensquilla.deliverySalt.v1'
 const CHAT_DRAFT_PREFIX = 'opensquilla.chat.draft:'
 
 function getDefaultRpcUrl(): string {
@@ -84,22 +84,6 @@ function saveConnectionSettings(url: string, token: string): void {
   } catch {}
 }
 
-async function deliverySalt(): Promise<string | null> {
-  const existing = localStorage.getItem(DELIVERY_SALT_KEY)
-  if (existing && /^[0-9a-f]{32}$/.test(existing)) return existing
-  // Queue WAL is origin-shared, so its salt must be too. Only create it under
-  // the same origin lock: a read/set race would strand the losing tab's rows.
-  // Older browsers can reuse a salt, but cannot safely create one without locks.
-  if (!navigator.locks?.request) return null
-  return navigator.locks.request(DELIVERY_SALT_KEY, () => {
-    const current = localStorage.getItem(DELIVERY_SALT_KEY)
-    if (current && /^[0-9a-f]{32}$/.test(current)) return current
-    const salt = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')
-    localStorage.setItem(DELIVERY_SALT_KEY, salt)
-    return salt
-  })
-}
-
 export const useRpcStore = defineStore('rpc', () => {
   const client = ref<RpcClient | null>(null)
   const state = ref<'disconnected' | 'connecting' | 'connected'>('disconnected')
@@ -125,6 +109,7 @@ export const useRpcStore = defineStore('rpc', () => {
   // persists here; raw target credentials never enter the queue identity.
   let deliveryIntent = 0
   let deliveryTargetId = ''
+  let deliveryOriginSalt: string | null = null
   let deliveryProof: Record<string, unknown> | null = null
   let browserConnectionUrl = ''
   // Track the endpoint admitted by this tab's connection owner, independently
@@ -147,10 +132,18 @@ export const useRpcStore = defineStore('rpc', () => {
   let descriptorRequestRevision = 0
   const connectionSubscriptions: Array<() => void> = []
 
+  function onDeliverySaltChanged(event: StorageEvent): void {
+    if (deliveryOriginSalt && (event.key === DELIVERY_SALT_KEY || event.key === null)
+      && event.newValue !== deliveryOriginSalt) beginDeliveryIntent(null)
+  }
+  const deliverySaltEventTarget = typeof window === 'undefined' ? null : window
+  deliverySaltEventTarget?.addEventListener('storage', onDeliverySaltChanged)
+
   onScopeDispose(() => {
     connectionDesired = false
     deliveryProof = null
     deliveryContext.value = null
+    deliverySaltEventTarget?.removeEventListener('storage', onDeliverySaltChanged)
     cancelDescriptorRecovery()
     for (const unsubscribe of connectionSubscriptions.splice(0)) unsubscribe()
     client.value?.disconnect()
@@ -230,6 +223,7 @@ export const useRpcStore = defineStore('rpc', () => {
   function beginDeliveryIntent(target: string | null): void {
     const intent = ++deliveryIntent
     deliveryTargetId = ''
+    deliveryOriginSalt = null
     deliveryProof = null
     deliveryContext.value = null
     if (!target) return
@@ -238,12 +232,15 @@ export const useRpcStore = defineStore('rpc', () => {
       try {
         const salt = await deliverySalt()
         if (!salt || intent !== deliveryIntent || !connectionDesired) return
-        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify([salt, target])))
+        deliveryOriginSalt = salt
+        const targetId = await hashDeliveryTarget(salt, target)
         if (intent !== deliveryIntent || !connectionDesired) return
-        deliveryTargetId = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+        if (localStorage.getItem(DELIVERY_SALT_KEY) !== salt) return
+        deliveryTargetId = targetId
         proveDeliveryContext(deliveryProof)
       } catch {
-        // Storage/crypto restrictions disable offline delivery, not startup.
+        // Keep transport startup independent. Delivery remains fenced until
+        // this exact target has a durable identity and fresh Hello proof.
       }
     })()
   }

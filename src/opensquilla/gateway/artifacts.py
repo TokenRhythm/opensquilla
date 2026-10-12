@@ -130,6 +130,8 @@ def register_artifact_routes(
                     request.query_params.get("revisionId"),
                 )
             )
+            if material.path is None:
+                raise ContentNotFoundError("artifact document has no file path")
         except ContentIntegrityError as exc:
             return JSONResponse(
                 {"error": str(exc), "code": "INTEGRITY_ERROR"},
@@ -163,6 +165,8 @@ def register_artifact_routes(
                     thumbnail=want_thumbnail,
                 )
             )
+            if material.path is None:
+                raise ContentNotFoundError("artifact has no file path")
         except ContentIntegrityError as exc:
             return JSONResponse({"error": str(exc), "code": "INTEGRITY_ERROR"}, status_code=409)
         except (ContentNotFoundError, ValueError):

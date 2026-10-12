@@ -110,6 +110,9 @@ export function useSandboxSettings() {
   let disposed = false
   let capabilityRequestGeneration = 0
   let runtimeStatusRequestGeneration = 0
+  let runtimeStatusWork: Promise<SandboxRuntimePackStatus | null> | null = null
+  let runtimeStatusController: AbortController | null = null
+  let runtimeStatusReloadNeeded = false
   let runtimeViewActive = false
   let runtimePollTimer: ReturnType<typeof setTimeout> | null = null
   let sandboxStartupPollTimer: ReturnType<typeof setTimeout> | null = null
@@ -213,7 +216,6 @@ export function useSandboxSettings() {
     const report = await loadCapability()
     if (disposed) return
     const status = sandboxSetupStatus.value
-    if (status && status.state !== 'ready') capability.value = null
     if (status !== null) sandboxStartupPending = status.state === 'setting_up'
     else if (report !== null) sandboxStartupPending = report.code === 'setting_up'
     // These reads only follow an initialization already in progress. Failed or
@@ -246,6 +248,8 @@ export function useSandboxSettings() {
     disposed = true
     capabilityRequestGeneration += 1
     runtimeStatusRequestGeneration += 1
+    runtimeStatusReloadNeeded = false
+    runtimeStatusController?.abort()
     if (runtimePollTimer) clearTimeout(runtimePollTimer)
     if (sandboxStartupPollTimer) clearTimeout(sandboxStartupPollTimer)
     for (const timer of Object.values(sectionSaveTimers)) {
@@ -278,28 +282,48 @@ export function useSandboxSettings() {
   async function loadRuntimeStatus(): Promise<SandboxRuntimePackStatus | null> {
     if (disposed || runtimeStatusSupported.value === false) return null
     clearRuntimePoll()
-    const requestGeneration = ++runtimeStatusRequestGeneration
-    runtimeStatusLoading.value = true
-    runtimeStatusError.value = ''
+    if (runtimeStatusWork) {
+      // Re-entry waits for the retired observation instead of overlapping it.
+      if (runtimeStatusController?.signal.aborted) runtimeStatusReloadNeeded = true
+      return runtimeStatusWork
+    }
+    const work = (async () => {
+      let result: SandboxRuntimePackStatus | null = null
+      do {
+        runtimeStatusReloadNeeded = false
+        const requestGeneration = runtimeStatusRequestGeneration
+        const controller = new AbortController()
+        runtimeStatusController = controller
+        runtimeStatusLoading.value = true
+        runtimeStatusError.value = ''
+        try {
+          const status = await sandbox.runtimeStatus({ signal: controller.signal })
+          if (disposed || controller.signal.aborted
+            || requestGeneration !== runtimeStatusRequestGeneration) continue
+          runtimeStatus.value = status
+          runtimeStatusSupported.value = status !== null
+          result = status
+        } catch (error) {
+          if (!disposed && !controller.signal.aborted
+            && requestGeneration === runtimeStatusRequestGeneration) {
+            runtimeStatusError.value = errorMessage(error)
+          }
+        }
+      } while (!disposed && runtimeStatusReloadNeeded && runtimeStatusSupported.value !== false)
+      return result
+    })()
+    runtimeStatusWork = work
     try {
-      const status = await sandbox.runtimeStatus()
-      if (disposed || requestGeneration !== runtimeStatusRequestGeneration) return null
-      if (!status) {
-        runtimeStatus.value = null
-        runtimeStatusSupported.value = false
-        return null
-      }
-      runtimeStatus.value = status
-      runtimeStatusSupported.value = true
-      return status
-    } catch (error) {
-      if (disposed || requestGeneration !== runtimeStatusRequestGeneration) return null
-      runtimeStatusError.value = errorMessage(error)
-      return null
+      return await work
     } finally {
-      if (!disposed && requestGeneration === runtimeStatusRequestGeneration) {
-        runtimeStatusLoading.value = false
-        scheduleRuntimePoll()
+      if (runtimeStatusWork === work) {
+        runtimeStatusWork = null
+        runtimeStatusController = null
+        if (!disposed) {
+          runtimeStatusLoading.value = false
+          if (runtimeStatusReloadNeeded) void loadRuntimeStatus()
+          else scheduleRuntimePoll()
+        }
       }
     }
   }
@@ -308,6 +332,12 @@ export function useSandboxSettings() {
     runtimeViewActive = active
     clearRuntimePoll()
     if (active) void loadRuntimeStatus()
+    else {
+      runtimeStatusRequestGeneration += 1
+      runtimeStatusReloadNeeded = false
+      runtimeStatusController?.abort()
+      runtimeStatusLoading.value = false
+    }
   }
 
   function applyRuntimeOperation(operation: SandboxRuntimeOperation): boolean {
@@ -343,20 +373,23 @@ export function useSandboxSettings() {
         return false
       }
       const receipt = await action()
+      if (disposed) return true
       clearRuntimePoll()
       runtimeStatusRequestGeneration += 1
+      runtimeStatusController?.abort()
+      runtimeStatusReloadNeeded = Boolean(runtimeStatusWork && runtimeViewActive)
       runtimeStatusLoading.value = false
       if (receipt.kind === 'status') {
         runtimeStatus.value = receipt.status
         runtimeStatusSupported.value = true
-      } else if (!applyRuntimeOperation(receipt.operation)) {
+      } else if (!applyRuntimeOperation(receipt.operation) && runtimeViewActive) {
         await loadRuntimeStatus()
       }
-      scheduleRuntimePoll()
+      if (!runtimeStatusWork) scheduleRuntimePoll()
       return true
     } catch (error) {
       runtimeActionError[componentId] = errorMessage(error)
-      if (actionKind === 'discard') void loadRuntimeStatus()
+      if (actionKind === 'discard' && runtimeViewActive) void loadRuntimeStatus()
       return false
     } finally {
       runtimeActionPending[componentId] = false

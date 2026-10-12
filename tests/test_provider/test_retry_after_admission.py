@@ -497,6 +497,62 @@ async def test_selector_physical_gate_waits_before_usage(cooling, monkeypatch):
     assert isinstance(events[-1], DoneEvent)
 
 
+@pytest.mark.parametrize("provider_name", ["anthropic", "kimi_coding_anthropic"])
+@pytest.mark.parametrize(("hint", "deadline_seconds"), [(700, 600), (901, None)])
+async def test_selector_overload_cooldown_uses_independent_fallback(
+    cooling, monkeypatch, provider_name, hint, deadline_seconds,
+):
+    _registry, clock = cooling
+
+    class AnthropicPhysicalProvider(PhysicalProvider):
+        def provider_metadata(self):
+            return replace(
+                super().provider_metadata(),
+                provider_name=provider_name,
+                provider_kind="anthropic",
+                provider_id=provider_name,
+            )
+
+    primary = AnthropicPhysicalProvider(provider_kind="anthropic", model="primary")
+    primary.provider_name = provider_name
+    fallback = PhysicalProvider(model="fallback", base_url="https://fallback.test/v1")
+    record_provider_retry_after(primary, ErrorEvent(code="503", retry_after_s=hint))
+    monkeypatch.setattr(
+        "opensquilla.provider.selector._build_provider",
+        lambda cfg: primary if cfg.model == "primary" else fallback,
+    )
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(provider=provider_name, model="primary", api_key="synthetic"),
+            fallbacks=[ProviderConfig(provider="openai", model="fallback", api_key="synthetic")],
+        )
+    )
+    wrapper = _SelectorFallbackProvider(selector.resolve(), selector)
+    events = [
+        event
+        async for event in wrapper.chat(
+            [Message(role="user", content="continue")],
+            config=ChatConfig(
+                turn_deadline_at_monotonic=(
+                    clock.now + deadline_seconds if deadline_seconds is not None else None
+                ),
+            ),
+        )
+    ]
+
+    assert primary.calls == []
+    assert len(fallback.calls) == 1
+    assert clock.sleeps == []
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert isinstance(events[-1], DoneEvent)
+    assert any(
+        event.kind == "provider_activity"
+        and event.phase == "fallback"
+        and event.reason == "provider_overloaded"
+        for event in events
+    )
+
+
 async def test_ensemble_lifecycle_gate_excludes_provider_timeout_and_start(cooling):
     registry, clock = cooling
     provider = PhysicalProvider()

@@ -5,9 +5,10 @@ import {
   desktopGatewayStartIdentityConflict,
   desktopProcessStartIdentity,
   loadDesktopGatewayOwnershipRecord,
-  verifyDesktopGatewayOwnership,
+  verifyDesktopGatewayOwnershipDetailed,
   type DesktopGatewayOwnershipRecord,
   type DesktopGatewayOwnershipRecordLoad,
+  type DesktopGatewayOwnershipVerificationDiagnostic,
 } from './desktop-gateway-ownership.js'
 
 const DEFAULT_IDENTITY_READY_TIMEOUT_MS = 45_000
@@ -38,6 +39,11 @@ export interface DesktopGatewayOwnershipVerificationOptions {
   processStartIdentity?: (pid: number) => string | null
   startIdentityConflicts?: (recorded: string, live: string | null) => boolean
   onPidRecycled?: (record: DesktopGatewayOwnershipRecord) => void
+  onVerificationFailed?: (
+    record: DesktopGatewayOwnershipRecord,
+    diagnostic: DesktopGatewayOwnershipVerificationDiagnostic,
+    exitReason: 'record_missing' | 'record_invalid' | 'record_replaced' | 'process_exited' | 'pid_recycled' | 'deadline',
+  ) => void
 }
 
 function processIdMayStillBeAlive(pid: number): boolean {
@@ -96,12 +102,13 @@ export class DesktopGatewayOwnershipVerificationCoordinator {
   private readonly verify: (
     record: DesktopGatewayOwnershipRecord,
     timeoutMs: number,
-  ) => Promise<boolean>
+  ) => Promise<DesktopGatewayOwnershipVerificationDiagnostic>
   private readonly load: (ownershipDir: string) => DesktopGatewayOwnershipRecordLoad
   private readonly processMayStillBeAlive: (pid: number) => boolean
   private readonly processStartIdentity: (pid: number) => string | null
   private readonly startIdentityConflicts: (recorded: string, live: string | null) => boolean
   private readonly onPidRecycled: (record: DesktopGatewayOwnershipRecord) => void
+  private readonly onVerificationFailed: NonNullable<DesktopGatewayOwnershipVerificationOptions['onVerificationFailed']>
 
   constructor(options: DesktopGatewayOwnershipVerificationOptions = {}) {
     this.identityReadyTimeoutMs = Math.max(
@@ -121,9 +128,14 @@ export class DesktopGatewayOwnershipVerificationCoordinator {
     this.wait = options.wait ?? (
       (timeoutMs) => new Promise((resolveWait) => setTimeout(resolveWait, timeoutMs))
     )
-    this.verify = options.verify ?? (
-      (record, timeoutMs) => verifyDesktopGatewayOwnership(record, { timeoutMs })
-    )
+    const verify = options.verify
+    this.verify = verify
+      ? async (record, timeoutMs) => {
+        const startedAt = this.now()
+        const ok = await verify(record, timeoutMs)
+        return { ok, stage: ok ? 'verified' : 'request', reason: ok ? 'verified' : 'verification_failed', elapsedMs: Math.max(0, this.now() - startedAt) }
+      }
+      : (record, timeoutMs) => verifyDesktopGatewayOwnershipDetailed(record, { timeoutMs })
     this.load = options.load ?? loadDesktopGatewayOwnershipRecord
     this.processMayStillBeAlive = options.processMayStillBeAlive ?? processIdMayStillBeAlive
     this.processStartIdentity = options.processStartIdentity ?? desktopProcessStartIdentity
@@ -131,6 +143,7 @@ export class DesktopGatewayOwnershipVerificationCoordinator {
       options.startIdentityConflicts ?? desktopGatewayStartIdentityConflict
     )
     this.onPidRecycled = options.onPidRecycled ?? (() => {})
+    this.onVerificationFailed = options.onVerificationFailed ?? (() => {})
   }
 
   async verifyWhenReady(
@@ -238,26 +251,38 @@ export class DesktopGatewayOwnershipVerificationCoordinator {
       // Always challenge first, including after the shared budget expires. This
       // lets a later startup phase recover an orphan that became ready after
       // the original poll, without granting authority from a cached result.
-      if (await this.verify(record, this.challengeTimeoutMs)) return true
+      const verification = await this.verify(record, this.challengeTimeoutMs)
+      if (verification.ok) return true
 
       const current = this.load(ownershipDir)
-      if (
-        current.status !== 'valid'
-        || ownershipRecordKey(ownershipDir, current.record) !== expectedKey
-        || !this.processMayStillBeAlive(record.pid)
-      ) return false
+      if (current.status !== 'valid') {
+        this.onVerificationFailed(record, verification, `record_${current.status}`)
+        return false
+      }
+      if (ownershipRecordKey(ownershipDir, current.record) !== expectedKey) {
+        this.onVerificationFailed(record, verification, 'record_replaced')
+        return false
+      }
+      if (!this.processMayStillBeAlive(record.pid)) {
+        this.onVerificationFailed(record, verification, 'process_exited')
+        return false
+      }
 
       if (!startIdentityChecked) {
         startIdentityChecked = true
         const liveStartIdentity = this.processStartIdentity(record.pid)
         if (this.startIdentityConflicts(record.start_identity, liveStartIdentity)) {
           this.onPidRecycled(record)
+          this.onVerificationFailed(record, verification, 'pid_recycled')
           return false
         }
       }
 
       const remainingMs = deadlineMs - this.now()
-      if (remainingMs <= 0) return false
+      if (remainingMs <= 0) {
+        this.onVerificationFailed(record, verification, 'deadline')
+        return false
+      }
       await this.wait(Math.min(this.pollIntervalMs, remainingMs))
     }
   }

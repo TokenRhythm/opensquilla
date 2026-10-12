@@ -42,6 +42,8 @@ function isChatRoutePath(path: string): boolean {
 // lazy route so optional shell RPCs cannot enter the Gateway's serialized
 // dispatcher ahead of session subscribe/snapshot/history. Query-only chat
 // navigation reuses the mounted view and owns its hold through the coordinator.
+// Priming also checks the live view owner: Settings can retain ChatView while
+// the URL temporarily leaves chat, so returning must not create another hold.
 router.beforeEach((to, from) => {
   const enteringChat = isChatRoutePath(to.path) && !isChatRoutePath(from.path)
   if (enteringChat) {

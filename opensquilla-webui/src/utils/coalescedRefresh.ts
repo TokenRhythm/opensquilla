@@ -50,7 +50,7 @@ export function createCoalescedRefresh(options: CoalescedRefreshOptions): Coales
   function schedule() {
     if (disposed) return
     pending = true
-    if (timer) clearTimeout(timer)
+    if (timer !== null) return
     timer = setTimeout(() => {
       timer = null
       flush()

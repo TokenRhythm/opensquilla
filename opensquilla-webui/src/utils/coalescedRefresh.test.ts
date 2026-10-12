@@ -13,6 +13,22 @@ afterEach(() => {
 })
 
 describe('createCoalescedRefresh', () => {
+  it('refreshes within the first event window while invalidations keep arriving', async () => {
+    vi.useFakeTimers()
+    const run = vi.fn().mockResolvedValue(undefined)
+    const refresh = createCoalescedRefresh({ run, allowed: () => true, delayMs: 150 })
+
+    for (let event = 0; event < 100; event++) {
+      refresh.schedule()
+      await vi.advanceTimersByTimeAsync(100)
+    }
+
+    expect(run).toHaveBeenCalledTimes(50)
+    refresh.dispose()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(run).toHaveBeenCalledTimes(50)
+  })
+
   it('runs a new authoritative refresh when an event arrives during a load', async () => {
     vi.useFakeTimers()
     const first = deferred()

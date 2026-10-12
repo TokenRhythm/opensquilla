@@ -6,6 +6,7 @@ import {
   createScrollHandoffGuard,
   restoreElementScrollAnchor,
   restoreTextScrollAnchor,
+  tokenAroundOffset,
 } from './scrollAnchor'
 
 function rect(top: number, bottom: number): DOMRect {
@@ -101,6 +102,26 @@ describe('semantic scroll handoff', () => {
     } finally {
       if (previousRangeRect) rangePrototype.getBoundingClientRect = previousRangeRect
       else Reflect.deleteProperty(rangePrototype, 'getBoundingClientRect')
+    }
+  })
+
+  it('bounds token scanning for a multi-megabyte text node', () => {
+    const originalMatchAll = String.prototype.matchAll
+    let largestScannedString = 0
+    String.prototype.matchAll = function matchAllBounded(this: string, pattern: RegExp) {
+      largestScannedString = Math.max(largestScannedString, this.length)
+      return originalMatchAll.call(this, pattern)
+    } as typeof String.prototype.matchAll
+    try {
+      const text = 'x'.repeat(6 * 1024 * 1024)
+      const offset = 3 * 1024 * 1024
+      const anchor = tokenAroundOffset(text, offset)
+      expect(anchor).not.toBeNull()
+      expect(anchor?.token).toHaveLength(32)
+      expect(anchor?.start).toBe(offset - 16)
+      expect(largestScannedString).toBeLessThanOrEqual(128)
+    } finally {
+      String.prototype.matchAll = originalMatchAll
     }
   })
 

@@ -7,6 +7,8 @@ export type DeliveryWaitReason = 'offline' | 'identity' | 'receipt-unsupported' 
 export interface DeliverySnapshot {
   id: string
   sessionKey: string
+  /** Derived from the current connection, never persisted with the request. */
+  isCurrentIdentity: boolean
   phase: DeliveryWalRecord['phase']
   stopPending: boolean
   /** The owner permits recording an exact Stop, even while offline. */

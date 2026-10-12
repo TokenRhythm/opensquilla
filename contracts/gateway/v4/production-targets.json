@@ -25,6 +25,46 @@
       ]
     },
     {
+      "kind": "method",
+      "wireName": "sessions.read.open.v2",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.read.state.v2",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.read.install.v2",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.read.close.v2",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.history.page.v2",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
       "kind": "event",
       "wireName": "transport.flow.dirty",
       "roles": [
@@ -34,6 +74,14 @@
     {
       "kind": "method",
       "wireName": "transport.flow.update",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "transport.sessionFlow.update.v2",
       "roles": [
         "params",
         "result"

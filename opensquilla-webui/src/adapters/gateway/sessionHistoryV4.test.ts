@@ -3,9 +3,39 @@ import { CHAT_HISTORY_METHOD, type ChatHistoryResult } from '@/contracts/generat
 import type { RpcCallOptions } from '@/lib/rpc'
 import { SessionReadSessionMissingError } from '@/modules/sessionReadLifecycle'
 import {
+  projectHistoryMessage,
   requestV4SessionHistory,
   type SessionHistoryV4Transport,
 } from './sessionHistoryV4'
+
+describe('shared history display content state', () => {
+  it('carries bounded detail preview references without treating the answer as unavailable', () => {
+    const projected = projectHistoryMessage({
+      role: 'assistant', text: 'preview', contentPreviewComplete: false,
+      historyPayloadPreview: { detailsTruncated: true, reasoningUtf16Length: 100, textUtf16Lengths: [200, 300] },
+    }, 0)
+    expect(projected.historyPayloadPreview).toEqual({
+      detailsTruncated: true, reasoningUtf16Length: 100, textUtf16Lengths: [200, 300],
+    })
+    expect(projected.contentUnavailableReason).toBeUndefined()
+    expect(projected.additional).not.toHaveProperty('historyPayloadPreview')
+    expect(projectHistoryMessage({ role: 'assistant', text: 'x', historyPayloadPreview: {
+      reasoningUtf16Length: -1, textUtf16Lengths: [NaN],
+    } }, 0).historyPayloadPreview).toEqual({})
+  })
+  it('keeps body completeness and revision while metadata is preparing', () => {
+    const projected = projectHistoryMessage({
+      role: 'assistant', text: '', contentPreviewComplete: false,
+      contentRevision: 'r1', contentMetadataPending: true,
+    }, 0)
+    expect(projected).toMatchObject({
+      text: '', previewComplete: false, contentRevision: 'r1',
+      contentAvailability: 'preparing', contentUnavailableReason: 'content_metadata_pending',
+    })
+    expect(projected.additional).not.toHaveProperty('contentPreviewComplete')
+    expect(projected.additional).not.toHaveProperty('contentMetadataPending')
+  })
+})
 
 async function readRoutingSnapshot(
   routerDecision: Record<string, unknown>,
@@ -274,5 +304,48 @@ describe('v4 SessionHistory Adapter', () => {
     expect(Object.isFrozen(message?.turnContext?.additional)).toBe(true)
     expect(Object.isFrozen(message?.turnContext?.additional.future_context)).toBe(true)
     expect(Object.isFrozen(message?.additional.additive_message)).toBe(true)
+  })
+
+  it('preserves an explicit bounded-content unavailability reason', async () => {
+    const result: ChatHistoryResult = {
+      messages: [{
+        id: 'oversized-tool',
+        role: 'tool',
+        text: 'safe preview',
+        contentUnavailableReason: 'display_projection_too_large',
+      }],
+      has_more: false,
+      oldest_cursor: null,
+      newest_cursor: null,
+      history_scope: 'complete',
+      loaded_count: 1,
+      page_size: 100,
+      canonical_available: true,
+      canonical_complete: true,
+      compaction_summaries: [],
+      turn_outcomes: [],
+    }
+    const transport: SessionHistoryV4Transport = {
+      async request<T>(
+        _method: string,
+        _params?: Record<string, unknown>,
+        _options?: RpcCallOptions,
+      ): Promise<T> {
+        return result as T
+      },
+    }
+    const page = await requestV4SessionHistory(
+      transport,
+      'session-1',
+      { direction: 'latest', limit: 100, signal: new AbortController().signal },
+      {
+        includeSummaries: true,
+        policy: { concurrentHistoryReads: () => true },
+        contractError: message => new Error(message),
+      },
+    )
+
+    expect(page.messages[0]?.contentUnavailableReason).toBe('display_projection_too_large')
+    expect(page.messages[0]?.additional).not.toHaveProperty('contentUnavailableReason')
   })
 })

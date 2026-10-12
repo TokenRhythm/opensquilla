@@ -18,6 +18,7 @@ const deadlineMs = Number.parseInt(process.env.OPENSQUILLA_GATEWAY_SMOKE_TIMEOUT
 const pollIntervalMs = 250
 const killGraceMs = 3_000
 const maxTailLines = 80
+const allowSafeSetupUnavailable = process.argv.includes('--allow-safe-setup-unavailable')
 const caProbeSuccessPattern = /\bopensquilla-desktop-ca-store-ok x509_ca=(\d+)\b/
 const documentFixtureText = 'OpenSquilla packaged document fixture'
 const strippedTlsEnvironmentKeys = new Set([
@@ -322,18 +323,34 @@ async function verifyGatewaySafeExecution(gatewayBinary, env, tempHome) {
     process.argv.includes('--provision-windows-sandbox')
     || process.env.OPENSQUILLA_SMOKE_PROVISION_SANDBOX === '1'
   )
+  // The diagnostic flag is allowed to skip Safe only for a fresh, explicitly
+  // unprovisioned Windows profile.  Do not classify an ACL, marker, identity,
+  // or network setup failure as an environment limitation merely because its
+  // error text happens to contain ``setup_marker.json``.  Explicit
+  // provisioning remains fail-closed and must either pass or report the real
+  // setup failure.
+  if (
+    allowSafeSetupUnavailable
+    && process.platform === 'win32'
+    && !provisionRequested
+    && !pathIsFile(join(tempHome, '.opensquilla', 'sandbox', 'setup_marker.json'))
+  ) {
+    const error = new Error('Windows Safe smoke requires an explicitly provisioned disposable profile.')
+    error.code = 'SAFE_ENVIRONMENT_BLOCKED'
+    error.safeReason = 'unprovisioned_isolated_profile'
+    throw error
+  }
   if (provisionRequested) {
-    console.log('Windows Safe smoke provisioning is explicitly enabled for this disposable runner.')
+    const setupRoot = process.env.OPENSQUILLA_SMOKE_SANDBOX_PROFILE_ROOT
+    if (!setupRoot) {
+      throw new Error('Windows Safe provisioning requires OPENSQUILLA_SMOKE_SANDBOX_PROFILE_ROOT: an explicitly selected canonical OpenSquilla profile of a disposable Windows user. A temporary HOME is not a valid system-account setup target.')
+    }
+    console.log('Windows Safe provisioning uses the explicitly selected disposable Windows user profile.')
     probeEnv.OPENSQUILLA_SMOKE_PROVISION_SANDBOX = '1'
-    // The elevated helper deliberately accepts only profile-scoped marker
-    // paths. Exercise the Safe child in that same profile-scoped workspace so
-    // its offline identity receives the ACL traversal grant that production
-    // workspaces use. This branch is limited to the disposable CI provision
-    // gate above.
-    const profileHome = process.env.USERPROFILE || process.env.HOME
-    if (!profileHome) throw new Error('Windows Safe smoke requires a user profile home.')
-    probeEnv.OPENSQUILLA_STATE_DIR = join(profileHome, '.opensquilla')
-    probeEnv.OPENSQUILLA_SMOKE_WORKSPACE_ROOT = join(profileHome, '.opensquilla')
+    // Never silently choose the caller's live profile. The child validates
+    // this explicit target against the real Windows SID before any write/UAC.
+    probeEnv.OPENSQUILLA_STATE_DIR = resolve(setupRoot)
+    probeEnv.OPENSQUILLA_SMOKE_WORKSPACE_ROOT = join(tempHome, '.opensquilla')
   }
   const backend = { darwin: 'seatbelt', win32: 'windows_default', linux: 'bubblewrap' }[process.platform]
   assert.deepEqual(functionalProbe(gatewayBinary, probeEnv, [
@@ -591,7 +608,17 @@ async function main() {
     verifyGatewayFilesystemWorker(gatewayBinary, env, join(workspaceDir, 'SOUL.md'))
     verifyGatewayDocument(gatewayBinary, env, documentPath)
     await verifyGatewayCodeExecution(gatewayBinary, env, tempHome)
-    await verifyGatewaySafeExecution(gatewayBinary, env, tempHome)
+    let safeExecution = { status: 'passed', backend: process.platform === 'win32' ? 'windows_default' : process.platform }
+    try {
+      await verifyGatewaySafeExecution(gatewayBinary, env, tempHome)
+    } catch (error) {
+      // Only the explicit fresh-profile diagnostic marker above may be
+      // downgraded.  A provisioning timeout or any other setup error remains
+      // a product/test failure, even when the allow flag is present.
+      if (error?.code !== 'SAFE_ENVIRONMENT_BLOCKED') throw error
+      safeExecution = { status: 'environment_blocked', reason: error.safeReason || 'elevation_required' }
+      console.warn(`Packaged Safe execution is environment-blocked: ${safeExecution.reason}`)
+    }
 
     const port = await findFreePort()
     child = spawn(gatewayBinary, ['gateway', 'run', '--port', String(port), '--bind', '127.0.0.1', '--config', config], {
@@ -617,7 +644,8 @@ async function main() {
     await waitForGateway(port, childExit, stdoutTail, stderrTail)
     await verifyControlUi(port, stdoutTail, stderrTail)
     verifyGatewayMcp(gatewayBinary, env, port)
-    console.log('OpenSquilla packaged gateway smoke passed.')
+    if (safeExecution.status === 'passed') console.log('OpenSquilla packaged gateway smoke passed.')
+    else console.log(`OpenSquilla packaged gateway smoke passed with Safe status=${safeExecution.status}; this is not a Safe product pass.`)
   } finally {
     if (child) await terminateChild(child, childClosed)
     await rm(tempHome, { recursive: true, force: true })
