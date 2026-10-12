@@ -51,7 +51,8 @@ export function useChatTextRendering() {
     const highlight = opts?.highlight !== false
     const cacheMode = opts?.budget ? 'none' : opts?.cache ?? 'settled'
     const mathMode = opts?.math ?? 'full'
-    const cacheKey = `${highlight ? 'H' : 'P'}${mathMode === 'full' ? 'M' : 'D'}\n${text}`
+    const diagrams = opts?.diagrams !== 'defer'
+    const cacheKey = `${highlight ? 'H' : 'P'}${mathMode === 'full' ? 'M' : 'D'}${diagrams ? 'G' : 'S'}${opts?.images === 'placeholder' ? 'I' : 'N'}\n${text}`
     if (cacheMode === 'settled') {
       const cached = markdownCache.get(cacheKey)
       if (cached !== undefined) {
@@ -63,7 +64,7 @@ export function useChatTextRendering() {
       }
     }
 
-    const html = renderMarkdownCore(text, { highlight, math: mathMode, budget: opts?.budget })
+    const html = renderMarkdownCore(text, opts)
 
     if (cacheMode === 'settled') {
       // UTF-16 code units are a conservative and deterministic approximation

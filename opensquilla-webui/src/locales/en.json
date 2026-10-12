@@ -62,10 +62,18 @@
     "copyContents": "Copy file contents"
   },
   "resourceActions": {
-    "more": "File actions", "preview": "Preview in app", "openSource": "Open with default app",
-    "reveal": "Show in file manager", "revealFinder": "Reveal in Finder", "revealExplorer": "Show in File Explorer",
-    "openCopy": "Open a local copy", "saveAs": "Save as…", "copyPath": "Copy path",
-    "copyGatewayPath": "Copy server path", "copyContents": "Copy file contents", "saved": "File saved",
+    "more": "File actions",
+    "preview": "Preview in app",
+    "openSource": "Open with default app",
+    "reveal": "Show in file manager",
+    "revealFinder": "Reveal in Finder",
+    "revealExplorer": "Show in File Explorer",
+    "openCopy": "Open a local copy",
+    "saveAs": "Save as…",
+    "copyPath": "Copy path",
+    "copyGatewayPath": "Copy server path",
+    "copyContents": "Copy file contents",
+    "saved": "File saved",
     "singleFile": "Save this HTML file only; linked styles, images and pages are not included.",
     "textOnly": "Copy supports UTF-8 text up to 1 MiB. Save this file instead.",
     "unavailable": "The current source file is unavailable. Existing previews and downloads are unchanged.",
@@ -228,12 +236,36 @@
     "pixels": "pixels",
     "empty": "No preview is available for this item.",
     "resources": {
-      "title": "Files", "count": "Files ({count})", "empty": "No files or links yet.",
-      "groups": { "files": "Files", "links": "Links", "attachments": "Files", "documents": "Files", "deliverables": "Files", "urls": "Links" },
-      "open": "Open {name}", "preparing": "Preparing editor…", "retry": "Retry", "preview": "Preview {name}", "download": "Download {name}", "edit": "Edit a copy of {name}", "publish": "Publish {name}",
-      "imported": "{name} is ready to edit.", "published": "{name} is ready to share.",
-      "publishUnavailable": "This document does not have a publishable current revision.", "actionFailed": "The workbench action failed.",
-      "unavailableReasons": { "htmlEncodingUnsupported": "This HTML is not valid UTF-8 and cannot be previewed or edited safely.", "htmlValidationFailed": "This HTML could not be validated for safe preview or editing.", "htmlEditTooLarge": "This HTML is too large to edit in the app. You can still download it.", "htmlPreviewTooLarge": "This HTML is too large to preview safely in the app. You can still download it.", "officeAdapterNotAvailable": "Office editing is not available yet.", "unsupported": "This action is not available for this resource." }
+      "title": "Files",
+      "count": "Files ({count})",
+      "empty": "No files or links yet.",
+      "groups": {
+        "files": "Files",
+        "links": "Links",
+        "attachments": "Files",
+        "documents": "Files",
+        "deliverables": "Files",
+        "urls": "Links"
+      },
+      "open": "Open {name}",
+      "preparing": "Preparing editor…",
+      "retry": "Retry",
+      "preview": "Preview {name}",
+      "download": "Download {name}",
+      "edit": "Edit a copy of {name}",
+      "publish": "Publish {name}",
+      "imported": "{name} is ready to edit.",
+      "published": "{name} is ready to share.",
+      "publishUnavailable": "This document does not have a publishable current revision.",
+      "actionFailed": "The workbench action failed.",
+      "unavailableReasons": {
+        "htmlEncodingUnsupported": "This HTML is not valid UTF-8 and cannot be previewed or edited safely.",
+        "htmlValidationFailed": "This HTML could not be validated for safe preview or editing.",
+        "htmlEditTooLarge": "This HTML is too large to edit in the app. You can still download it.",
+        "htmlPreviewTooLarge": "This HTML is too large to preview safely in the app. You can still download it.",
+        "officeAdapterNotAvailable": "Office editing is not available yet.",
+        "unsupported": "This action is not available for this resource."
+      }
     },
     "browser": {
       "newTab": "New tab",
@@ -481,8 +513,6 @@
       "channelNoticeLocaleSyncPending": "The interface language changed, but the channel system-message language has not been saved yet. It will retry when the Gateway reconnects.",
       "toolDetailsLabel": "Tool details by default",
       "toolDetailsDesc": "Auto follows the tool type; Compact collapses ordinary tools; Expanded opens them. Errors open automatically by default and can still be collapsed.",
-      "toolDetailsAuto": "Auto",
-      "toolDetailsCompact": "Compact",
       "toolDetailsExpanded": "Expanded",
       "visualEffectsLabel": "Visual effects",
       "visualEffectsDesc": "Animate model-routing decisions and answer transitions in conversations.",
@@ -506,7 +536,9 @@
       "sidebarWidthResizableStatus": "Current desktop width: {current}px.",
       "sidebarWidthClampedStatus": "Saved {saved}px; this window currently uses {current}px.",
       "sidebarWidthCompactStatus": "Compact layout uses {current}px. Your desktop preference of {saved}px is preserved.",
-      "sidebarWidthDrawerStatus": "Drawer layout uses {current}px. Your desktop preference of {saved}px is preserved."
+      "sidebarWidthDrawerStatus": "Drawer layout uses {current}px. Your desktop preference of {saved}px is preserved.",
+      "toolDetailsAuto": "Auto",
+      "toolDetailsCompact": "Compact"
     },
     "dataMigration": {
       "title": "Data & backups",
@@ -586,9 +618,18 @@
       "retryFailedTitle": "The preview could not be regenerated",
       "retryFailedDescription": "This regeneration request did not complete. The previous result remains unadopted and no files were changed. Try again or discard the import.",
       "jobStates": {
-        "cancelled": {"title": "Preview generation cancelled", "description": "The isolated source is retained for 24 hours. Regeneration may make at most two model calls because one result that does not pass validation can be retried once; the result may differ."},
-        "interrupted": {"title": "Preview generation interrupted", "description": "OpenSquilla restarted while the model was processing. The isolated source is still available. Regeneration may make at most two model calls because one result that does not pass validation can be retried once."},
-        "failed": {"title": "Preview generation failed", "description": "This attempt did not produce a validated, reviewable preview. No import decisions were adopted and no files were changed. The isolated source was retained; regeneration may make at most two model calls and the result may differ."}
+        "cancelled": {
+          "title": "Preview generation cancelled",
+          "description": "The isolated source is retained for 24 hours. Regeneration may make at most two model calls because one result that does not pass validation can be retried once; the result may differ."
+        },
+        "interrupted": {
+          "title": "Preview generation interrupted",
+          "description": "OpenSquilla restarted while the model was processing. The isolated source is still available. Regeneration may make at most two model calls because one result that does not pass validation can be retried once."
+        },
+        "failed": {
+          "title": "Preview generation failed",
+          "description": "This attempt did not produce a validated, reviewable preview. No import decisions were adopted and no files were changed. The isolated source was retained; regeneration may make at most two model calls and the result may differ."
+        }
       },
       "modelAnalysisTitle": "Model analysis (verify against the file changes)",
       "previewTitle": "Review every file change",
@@ -2749,15 +2790,60 @@
       "galleryEyebrow": "AUTOMATION GALLERY",
       "bulkDeleteConfirm": "Delete {count} selected automation jobs? This cannot be undone.",
       "templates": {
-        "ai-daily": { "title": "Daily AI news briefing", "description": "Summarize important AI news from the last 24 hours with verified source links.", "category": "News & intelligence", "schedule": "Daily at 08:00" },
-        "weekly-report": { "title": "Weekly work review", "description": "Summarize progress, risks, deliverables, and next week’s priorities.", "category": "Productivity", "schedule": "Friday at 17:30" },
-        "english-five": { "title": "Five English words a day", "description": "Create a lightweight vocabulary lesson with examples and a short quiz.", "category": "Learning", "schedule": "Daily at 09:00" },
-        "project-risk": { "title": "Project risk check", "description": "Review delays, errors, and open issues and report risk levels with recommendations.", "category": "Projects", "schedule": "Weekdays at 10:00" },
-        "knowledge-review": { "title": "Weekly knowledge review", "description": "Organize new notes and meeting records and produce a follow-up reading list.", "category": "Knowledge", "schedule": "Sunday at 18:00" },
-        "daily-idea": { "title": "Daily idea and fun fact", "description": "Share one reliable fact and one small, actionable idea.", "category": "Lifestyle", "schedule": "Daily at 12:00" },
-        "bedtime-story": { "title": "Daily bedtime story", "description": "Write a warm, imaginative short story suitable for reading with children.", "category": "Family", "schedule": "Daily at 20:30" },
-        "classic-movie": { "title": "Classic movie recommendation", "description": "Recommend one acclaimed classic film with a spoiler-free introduction.", "category": "Entertainment", "schedule": "Saturday at 19:00" },
-        "today-in-history": { "title": "Today in history", "description": "Select one reliable historical event from science, culture, or society.", "category": "Daily knowledge", "schedule": "Daily at 08:30" }
+        "ai-daily": {
+          "title": "Daily AI news briefing",
+          "description": "Summarize important AI news from the last 24 hours with verified source links.",
+          "category": "News & intelligence",
+          "schedule": "Daily at 08:00"
+        },
+        "weekly-report": {
+          "title": "Weekly work review",
+          "description": "Summarize progress, risks, deliverables, and next week’s priorities.",
+          "category": "Productivity",
+          "schedule": "Friday at 17:30"
+        },
+        "english-five": {
+          "title": "Five English words a day",
+          "description": "Create a lightweight vocabulary lesson with examples and a short quiz.",
+          "category": "Learning",
+          "schedule": "Daily at 09:00"
+        },
+        "project-risk": {
+          "title": "Project risk check",
+          "description": "Review delays, errors, and open issues and report risk levels with recommendations.",
+          "category": "Projects",
+          "schedule": "Weekdays at 10:00"
+        },
+        "knowledge-review": {
+          "title": "Weekly knowledge review",
+          "description": "Organize new notes and meeting records and produce a follow-up reading list.",
+          "category": "Knowledge",
+          "schedule": "Sunday at 18:00"
+        },
+        "daily-idea": {
+          "title": "Daily idea and fun fact",
+          "description": "Share one reliable fact and one small, actionable idea.",
+          "category": "Lifestyle",
+          "schedule": "Daily at 12:00"
+        },
+        "bedtime-story": {
+          "title": "Daily bedtime story",
+          "description": "Write a warm, imaginative short story suitable for reading with children.",
+          "category": "Family",
+          "schedule": "Daily at 20:30"
+        },
+        "classic-movie": {
+          "title": "Classic movie recommendation",
+          "description": "Recommend one acclaimed classic film with a spoiler-free introduction.",
+          "category": "Entertainment",
+          "schedule": "Saturday at 19:00"
+        },
+        "today-in-history": {
+          "title": "Today in history",
+          "description": "Select one reliable historical event from science, culture, or society.",
+          "category": "Daily knowledge",
+          "schedule": "Daily at 08:30"
+        }
       }
     },
     "deleteDialog": {
@@ -2879,39 +2965,39 @@
       "fdChannel": "A channel",
       "fdWebhook": "A webhook",
       "enabled": "Enabled",
-      "saveSchedule": "Save schedule"
-      ,"friendlyNamePlaceholder": "For example: Organize customer feedback every day"
-      ,"friendlyTypeCron": "Repeat at a scheduled time"
-      ,"friendlyTypeEvery": "Repeat at a fixed interval"
-      ,"friendlyTypeAt": "Run once at a specified time"
-      ,"executionFrequency": "Frequency"
-      ,"daily": "Daily"
-      ,"weekdays": "Weekdays"
-      ,"weekly": "Weekly"
-      ,"monthly": "Monthly"
-      ,"customAdvancedTime": "Custom advanced schedule"
-      ,"weekday": "Day of week"
-      ,"date": "Date"
-      ,"monthlyDay": "Day {day} of each month"
-      ,"specificTime": "Time"
-      ,"customTimeHint": "Use a more flexible schedule rule."
-      ,"openAdvancedTime": "Open advanced schedule"
-      ,"everyHowOften": "Repeat every"
-      ,"timeUnit": "Time unit"
-      ,"minutes": "Minutes"
-      ,"hours": "Hours"
-      ,"days": "Days"
-      ,"dateAndTime": "Date and time"
-      ,"friendlyMessagePlaceholder": "For example: Summarize today's customer feedback and suggest next steps"
-      ,"moreRuntimeSettings": "More runtime settings (optional)"
-      ,"advancedTimeHint": "Use this only when the schedule picker above is not flexible enough."
-      ,"timezoneSimpleHint": "Usually you do not need to change this."
-      ,"projectWorkspace": "Project workspace"
-      ,"defaultWorkspace": "Use the default workspace"
-      ,"noWorkspace": "No project workspace"
-      ,"workspaceUnavailable": "{name} (unavailable)"
-      ,"workspaceRequiredHint": "Choose the project this task should inspect. The task will read and work only in that project."
-      ,"workspaceOptionalHint": "Optional. Choose “No project workspace” for general tasks, or select a project when the task needs its files."
+      "saveSchedule": "Save schedule",
+      "friendlyNamePlaceholder": "For example: Organize customer feedback every day",
+      "friendlyTypeCron": "Repeat at a scheduled time",
+      "friendlyTypeEvery": "Repeat at a fixed interval",
+      "friendlyTypeAt": "Run once at a specified time",
+      "executionFrequency": "Frequency",
+      "daily": "Daily",
+      "weekdays": "Weekdays",
+      "weekly": "Weekly",
+      "monthly": "Monthly",
+      "customAdvancedTime": "Custom advanced schedule",
+      "weekday": "Day of week",
+      "date": "Date",
+      "monthlyDay": "Day {day} of each month",
+      "specificTime": "Time",
+      "customTimeHint": "Use a more flexible schedule rule.",
+      "openAdvancedTime": "Open advanced schedule",
+      "everyHowOften": "Repeat every",
+      "timeUnit": "Time unit",
+      "minutes": "Minutes",
+      "hours": "Hours",
+      "days": "Days",
+      "dateAndTime": "Date and time",
+      "friendlyMessagePlaceholder": "For example: Summarize today's customer feedback and suggest next steps",
+      "moreRuntimeSettings": "More runtime settings (optional)",
+      "advancedTimeHint": "Use this only when the schedule picker above is not flexible enough.",
+      "timezoneSimpleHint": "Usually you do not need to change this.",
+      "projectWorkspace": "Project workspace",
+      "defaultWorkspace": "Use the default workspace",
+      "noWorkspace": "No project workspace",
+      "workspaceUnavailable": "{name} (unavailable)",
+      "workspaceRequiredHint": "Choose the project this task should inspect. The task will read and work only in that project.",
+      "workspaceOptionalHint": "Optional. Choose “No project workspace” for general tasks, or select a project when the task needs its files."
     },
     "form": {
       "invalidTimezone": "Enter a valid time zone, such as Europe/Paris.",
@@ -3428,6 +3514,11 @@
     }
   },
   "chat": {
+    "diagram": {
+      "failed": "Could not render diagram · source retained",
+      "limited": "Diagram too large · source retained",
+      "alt": "Diagram"
+    },
     "modelSetup": {
       "notice": "Configure a model service before chatting.",
       "configure": "Configure model"
@@ -3538,7 +3629,14 @@
       "targetLabel": "Provider / model",
       "lastHitLabel": "Last cached tokens",
       "autoPauseLabel": "Auto-pause",
-      "states": { "off": "Off", "waiting": "Waiting for a stable prefix", "scheduled": "Scheduled", "probing": "Probing", "paused": "Idle limit reached; waiting for the next message", "stopped": "Stopped after a miss or error" }
+      "states": {
+        "off": "Off",
+        "waiting": "Waiting for a stable prefix",
+        "scheduled": "Scheduled",
+        "probing": "Probing",
+        "paused": "Idle limit reached; waiting for the next message",
+        "stopped": "Stopped after a miss or error"
+      }
     },
     "sendPending": "Sending…",
     "send": "Send",
@@ -3550,18 +3648,57 @@
     "stoppingResponse": "Stopping safely… New messages will be queued.",
     "messageToSend": "Message to send",
     "promptAnnotations": {
-      "label": "Annotations", "draftLabel": "Pending page annotations", "sentLabel": "Page annotations", "element": "Selected area",
+      "label": "Annotations",
+      "draftLabel": "Pending page annotations",
+      "sentLabel": "Page annotations",
+      "element": "Selected area",
       "targetLabel": "{kind}: {text}",
-      "targetKinds": { "heading": "Heading", "button": "Button", "link": "Link", "image": "Image", "input": "Input", "form": "Form", "section": "Section", "list": "List", "table": "Table", "text": "Text", "region": "Area", "element": "Selected area" },
-      "emptyDraft": "Add an instruction", "stale": "Couldn’t locate this area on the current page",
+      "targetKinds": {
+        "heading": "Heading",
+        "button": "Button",
+        "link": "Link",
+        "image": "Image",
+        "input": "Input",
+        "form": "Form",
+        "section": "Section",
+        "list": "List",
+        "table": "Table",
+        "text": "Text",
+        "region": "Area",
+        "element": "Selected area"
+      },
+      "emptyDraft": "Add an instruction",
+      "stale": "Couldn’t locate this area on the current page",
       "editingBlocked": "Add or cancel the annotation you are editing before sending.",
       "staleBlocked": "This area couldn’t be located on the current page. You can still send it to AI.",
-      "emptyBlocked": "Finish every artifact instruction before sending.", "tooLongBlocked": "Shorten artifact instructions to 16 KiB of UTF-8 text before sending.", "editLabel": "Edit artifact instruction",
-      "removeLabel": "Remove artifact instruction", "updateFailed": "The artifact instruction could not be saved.",
-      "discardFailed": "The artifact instruction could not be removed.", "focusUnavailable": "Couldn’t locate this area on the current page. You can still send it to AI.",
-      "reuseLabel": "Copy as new annotation", "reuseDescription": "Copy the modification request and choose its target on the page.", "reuseUnavailable": "This modification request could not be copied. Open the matching page and choose its target.", "applyPrompt": "Apply the attached page annotations.",
-      "status": { "unknown": "Couldn’t update page", "not_attempted": "Couldn’t update page", "applied": "Page updated", "appliedCorrected": "Page updated", "not_applied": "Couldn’t update page", "conflict": "Couldn’t update page", "ambiguous": "Checking update" },
-      "statusDetail": { "unknown": "Open the page to check.", "not_attempted": "No page update was made.", "applied": "", "not_applied": "Try again.", "conflict": "Open the page and try again.", "ambiguous": "Open the page to check before retrying." }
+      "emptyBlocked": "Finish every artifact instruction before sending.",
+      "tooLongBlocked": "Shorten artifact instructions to 16 KiB of UTF-8 text before sending.",
+      "editLabel": "Edit artifact instruction",
+      "removeLabel": "Remove artifact instruction",
+      "updateFailed": "The artifact instruction could not be saved.",
+      "discardFailed": "The artifact instruction could not be removed.",
+      "focusUnavailable": "Couldn’t locate this area on the current page. You can still send it to AI.",
+      "reuseLabel": "Copy as new annotation",
+      "reuseDescription": "Copy the modification request and choose its target on the page.",
+      "reuseUnavailable": "This modification request could not be copied. Open the matching page and choose its target.",
+      "applyPrompt": "Apply the attached page annotations.",
+      "status": {
+        "unknown": "Couldn’t update page",
+        "not_attempted": "Couldn’t update page",
+        "applied": "Page updated",
+        "appliedCorrected": "Page updated",
+        "not_applied": "Couldn’t update page",
+        "conflict": "Couldn’t update page",
+        "ambiguous": "Checking update"
+      },
+      "statusDetail": {
+        "unknown": "Open the page to check.",
+        "not_attempted": "No page update was made.",
+        "applied": "",
+        "not_applied": "Try again.",
+        "conflict": "Open the page and try again.",
+        "ambiguous": "Open the page to check before retrying."
+      }
     },
     "placeholder": "Send a message...",
     "placeholderCompact": "Message...",

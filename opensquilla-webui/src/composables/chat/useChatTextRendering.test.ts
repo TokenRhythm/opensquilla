@@ -44,9 +44,12 @@ describe('useChatTextRendering math', () => {
     const inline = renderMarkdown('Inline $x^2$ formula')
     const display = renderMarkdown('Block:\n\n$$\\frac{a}{b}$$')
 
-    expect(inline).toContain('class="katex"')
+    // Native browser coverage asserts the outer KaTeX/display wrappers and SVG.
+    // happy-dom drops an outer sanitized span; verify semantic output here.
+    expect(inline).toContain('class="katex-mathml"')
+    expect(inline).toContain('encoding="application/x-tex">x^2</annotation>')
     expect(inline).not.toContain('$x^2$')
-    expect(display).toContain('class="katex-display"')
+    expect(display).toContain('<mfrac>')
     expect(display).not.toContain('$$\\frac{a}{b}$$')
   })
 })

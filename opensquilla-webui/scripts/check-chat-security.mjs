@@ -138,6 +138,12 @@ assertPresent(
   'markdown sanitizer must drop non-task-list <input> elements (uponSanitizeElement + removeChild).',
 )
 
+assertPresent(
+  'src/composables/chat/useChatTextRendering.ts',
+  /const html = renderMarkdownCore\(text, opts\)/,
+  'chat Markdown must delegate to the shared sanitized renderer.',
+)
+
 if (failures.length > 0) {
   console.error(failures.join('\n'))
   process.exit(1)

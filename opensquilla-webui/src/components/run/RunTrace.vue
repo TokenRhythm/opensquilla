@@ -1,6 +1,5 @@
 <template>
   <div
-    ref="traceRoot"
     class="tool-timeline"
     :class="{
       'tool-timeline--checklist': variant === 'checklist',
@@ -86,14 +85,14 @@
         />
       </button>
     </div>
-    <div
+    <ActivityNarration
       v-else-if="item.type === 'text'"
+      :item="item"
       class="msg-ai-text"
       :data-activity-entry="presentation === 'activity' ? 'true' : undefined"
       :data-activity-type="presentation === 'activity' ? 'segment' : undefined"
       :data-activity-id="presentation === 'activity' ? item.key : undefined"
       :data-activity-order="presentation === 'activity' ? item.activityOrder : undefined"
-      v-html="item.html"
     />
     <div
       v-else-if="item.type === 'interrupt'"
@@ -376,7 +375,7 @@
 </template>
 
 <script lang="ts">
-import { defineComponent, h, inject, onBeforeUnmount, type PropType } from 'vue'
+import { defineComponent, h, inject, nextTick, onBeforeUnmount, type PropType } from 'vue'
 import { HISTORY_DETAILS_READY } from '@/modules/historyDetails'
 import { useI18n } from 'vue-i18n'
 import type { ChatToolCallRenderItem, ToolResultContext } from '@/types/chat'
@@ -701,7 +700,8 @@ export default { components: { ToolRowSections } }
 </script>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
+import ActivityNarration from '@/components/chat/ActivityNarration.vue'
 import Icon from '@/components/Icon.vue'
 import ActivityToolDetails from '@/components/chat/ActivityToolDetails.vue'
 import type {
@@ -719,7 +719,6 @@ import {
 } from '@/utils/chat/toolDisplay'
 import { toolState } from '@/utils/chat/toParts'
 import { composeTree, statusVisual, type StatusVisual } from '@/components/run/runTrace'
-import { copyTextWithFallback } from '@/utils/browser'
 import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
 import {
   hasActivityToolDetail,
@@ -794,101 +793,8 @@ const emit = defineEmits<{
   showResult: [content: string, title: string, context?: ToolResultContext]
 }>()
 
-const traceRoot = ref<HTMLElement | null>(null)
 const showAllRows = ref(false)
 
-function codeText(pre: HTMLPreElement): string {
-  const code = pre.querySelector('code')
-  return code?.textContent || ''
-}
-
-function hasCodeCopyButton(pre: HTMLPreElement): boolean {
-  return Array.from(pre.children).some(child => child.classList.contains('code-copy-btn'))
-}
-
-function setCodeCopyButtonState(button: HTMLButtonElement, state: 'idle' | 'copied' | 'error') {
-  const label = state === 'copied'
-    ? t('chat.copied')
-    : state === 'error'
-      ? t('chat.toast.copyFailed')
-      : t('chat.copy')
-  button.replaceChildren(createCodeCopyIcon(state))
-  button.title = label
-  button.setAttribute('aria-label', label)
-}
-
-function createCodeCopyIcon(state: 'idle' | 'copied' | 'error'): SVGSVGElement {
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
-  svg.setAttribute('viewBox', '0 0 24 24')
-  svg.setAttribute('width', '15')
-  svg.setAttribute('height', '15')
-  svg.setAttribute('aria-hidden', 'true')
-  svg.setAttribute('focusable', 'false')
-  svg.setAttribute('fill', 'none')
-  svg.setAttribute('stroke', 'currentColor')
-  svg.setAttribute('stroke-width', '2')
-  svg.setAttribute('stroke-linecap', 'round')
-  svg.setAttribute('stroke-linejoin', 'round')
-
-  if (state === 'copied') {
-    svg.appendChild(svgNode('polyline', { points: '20 6 9 17 4 12' }))
-    return svg
-  }
-  if (state === 'error') {
-    svg.appendChild(svgNode('path', { d: 'M18 6 6 18' }))
-    svg.appendChild(svgNode('path', { d: 'm6 6 12 12' }))
-    return svg
-  }
-
-  svg.appendChild(svgNode('rect', { width: '14', height: '14', x: '8', y: '8', rx: '2', ry: '2' }))
-  svg.appendChild(svgNode('path', { d: 'M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2' }))
-  return svg
-}
-
-function svgNode(tag: string, attrs: Record<string, string>): SVGElement {
-  const node = document.createElementNS('http://www.w3.org/2000/svg', tag)
-  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value)
-  return node
-}
-
-function decorateCodeBlocks() {
-  const root = traceRoot.value
-  if (!root) return
-  for (const pre of root.querySelectorAll<HTMLPreElement>('.msg-ai-text pre')) {
-    if (hasCodeCopyButton(pre)) continue
-    const text = codeText(pre)
-    if (!text) continue
-
-    pre.classList.add('code-block')
-    const button = document.createElement('button')
-    button.type = 'button'
-    button.className = 'code-copy-btn'
-    setCodeCopyButtonState(button, 'idle')
-    button.addEventListener('click', async event => {
-      event.preventDefault()
-      event.stopPropagation()
-      try {
-        await copyTextWithFallback(codeText(pre))
-        setCodeCopyButtonState(button, 'copied')
-        button.classList.add('is-copied')
-        window.setTimeout(() => {
-          if (!button.isConnected) return
-          setCodeCopyButtonState(button, 'idle')
-          button.classList.remove('is-copied')
-        }, 1600)
-      } catch {
-        setCodeCopyButtonState(button, 'error')
-        button.classList.add('is-error')
-        window.setTimeout(() => {
-          if (!button.isConnected) return
-          setCodeCopyButtonState(button, 'idle')
-          button.classList.remove('is-error')
-        }, 1600)
-      }
-    })
-    pre.appendChild(button)
-  }
-}
 // Chat passes `items` (proven group data); non-chat surfaces pass flat steps,
 // which compose into the same tool-group timeline shape so the markup never
 // branches on input source.
@@ -1128,24 +1034,6 @@ watch(defaultOpenSnapshot, (current, previous) => {
     }
   }
 }, { flush: 'sync' })
-
-const codeBlockDecorationSignature = computed(() => visibleItems.value
-  .map(item => item.type === 'text' ? `${item.key}:${item.html}` : item.key)
-  .join('|'))
-
-onMounted(async () => {
-  await nextTick()
-  decorateCodeBlocks()
-})
-
-watch(
-  codeBlockDecorationSignature,
-  async () => {
-    await nextTick()
-    decorateCodeBlocks()
-  },
-  { flush: 'post' },
-)
 
 function operationKey(call: ChatToolCallRenderItem): string {
   return toolOperationKey(call.name)
@@ -1492,72 +1380,7 @@ function fmtTok(n?: number | null): string {
   padding: 0.625rem;
   overflow-x: auto;
   margin: 0.375rem 0;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
-}
-.msg-ai-text :deep(pre.code-block) {
-  position: relative;
-  padding-top: 2.375rem;
-  background: linear-gradient(
-    to bottom,
-    var(--code-block-header-bg) 0,
-    var(--code-block-header-bg) 1.75rem,
-    var(--code-block-bg) 1.75rem,
-    var(--code-block-bg) 100%
-  );
-}
-
-.msg-ai-text :deep(pre.code-block > .code-lang) {
-  top: 0.375rem;
-  right: 2.5rem;
-  line-height: 1rem;
-  background: transparent;
-  color: var(--text-dim);
-}
-
-.msg-ai-text :deep(.code-copy-btn) {
-  position: absolute;
-  top: 0;
-  right: 0.25rem;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 1.75rem;
-  height: 1.75rem;
-  padding: 0;
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text);
-  opacity: 0.78;
-  cursor: pointer;
-  transition: color var(--transition), background var(--transition), opacity var(--transition);
-}
-
-.msg-ai-text :deep(.code-copy-btn svg) {
-  display: block;
-  width: 0.9375rem;
-  height: 0.9375rem;
-}
-
-.msg-ai-text :deep(.code-copy-btn:hover) {
-  color: var(--text);
-  opacity: 1;
-  background: var(--bg-hover);
-}
-
-.msg-ai-text :deep(.code-copy-btn:focus-visible) {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
-
-.msg-ai-text :deep(.code-copy-btn.is-copied) {
-  color: var(--ok);
-  opacity: 1;
-}
-
-.msg-ai-text :deep(.code-copy-btn.is-error) {
-  color: var(--danger);
-  opacity: 1;
+  box-shadow: none;
 }
 .msg-ai-text :deep(pre code) {
   background: transparent;

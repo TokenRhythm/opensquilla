@@ -1614,7 +1614,7 @@ function secureDesktopRendererDocument(response: Response): Response {
       "base-uri opensquilla-app://desktop",
       "object-src 'none'",
       "frame-ancestors 'none'",
-      "script-src 'self' opensquilla-app://desktop 'unsafe-inline'",
+      "script-src 'self' opensquilla-app://desktop 'unsafe-inline' 'wasm-unsafe-eval'",
       "style-src 'self' opensquilla-app://desktop 'unsafe-inline'",
       "img-src 'self' opensquilla-app://desktop blob: data: http: https:",
       "font-src 'self' opensquilla-app://desktop data:",
@@ -1647,7 +1647,12 @@ async function handleDesktopRendererRequest(request: Request): Promise<Response>
   const response = await electronNet.fetch(pathToFileURL(assetPath).href, {
     bypassCustomProtocolHandlers: true,
   })
-  return route.kind === 'spa' ? secureDesktopRendererDocument(response) : response
+  // Module workers get their CSP from the script response rather than the
+  // parent document. Keep local diagram workers under the same narrow WASM
+  // permission while continuing to disallow JavaScript string evaluation.
+  return route.kind === 'spa' || /\.m?js$/i.test(route.relativePath)
+    ? secureDesktopRendererDocument(response)
+    : response
 }
 
 function installDesktopRendererProtocol(): void {

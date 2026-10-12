@@ -2,6 +2,13 @@ import { copyTextWithFallback } from '@/utils/browser'
 import { getManifest } from '@/themes/registry'
 import { clampMermaidPreviewHeight, estimateMermaidPreviewHeight, formatMermaidParseError, renderMermaidWithRetry } from './mermaidUtils'
 import { isInternalSvgReference, isSafeMarkdownImageSource } from './markdownUris'
+import { DiagramTaskQueue } from './diagrams/queue'
+import { DiagramCache } from './diagrams/cache'
+import { renderGraphviz } from './diagrams/graphviz'
+import { checkGraphvizBudget } from './diagrams/budget'
+import { diagramPalette } from './diagrams/palette'
+import { sanitizeDiagramSvg as sanitizeGraphvizSvg } from './diagrams/sanitize'
+import { DiagramRenderError } from './diagrams/types'
 import { createSvgDiagram, updateSvgDiagramLabels, type SvgDiagram, type SvgDiagramLabels } from './svgDiagram'
 
 export interface MermaidRenderLabels extends SvgDiagramLabels {
@@ -16,19 +23,22 @@ export interface MermaidRenderOptions {
   signal?: AbortSignal
   themeId?: string
   onRendered?: (diagram: SvgDiagram) => void
-  budget?: { sourceChars: number, diagrams: number }
+  budget?: { sourceChars: number, diagrams: number, charged?: WeakSet<HTMLElement> }
+  /** Limit discovery without adding another rendering implementation. */
+  languages?: readonly string[]
 }
 
 type MermaidApi = typeof import('mermaid').default
 let mermaidLoading: Promise<MermaidApi> | null = null
 let initializedTheme: string | null = null
-let renderQueue: Promise<void> = Promise.resolve()
+const renderQueue = new DiagramTaskQueue()
+const renderCache = new DiagramCache()
 let mermaidSequence = 0
 const MAX_SOURCE_CHARS = 50_000
 const MAX_SURFACE_SOURCE_CHARS = 100_000
 const MAX_SURFACE_DIAGRAMS = 32
 const MIN_HOST_WIDTH = 280
-const sources = new WeakMap<HTMLElement, { source: string, error?: unknown, reason?: 'loadFailed' | 'tooLarge' | 'blockedResource' }>()
+const sources = new WeakMap<HTMLElement, { source: string, language: string, error?: unknown, reason?: 'loadFailed' | 'tooLarge' | 'blockedResource' }>()
 const claims = new WeakMap<HTMLPreElement, symbol>()
 class MermaidLoadError extends Error {}
 
@@ -73,10 +83,14 @@ function isCurrent(root: HTMLElement, pre: HTMLElement, signal?: AbortSignal): b
 // Mermaid owns global configuration. Serialize initialization and rendering
 // together; the library's render queue alone cannot protect initialize(). Other
 // future SVG engines can share the presentation without sharing this queue.
-function enqueueRender<T>(run: () => Promise<T>): Promise<T> {
-  const job = renderQueue.then(run)
-  renderQueue = job.then(() => {}, () => {})
-  return job
+async function enqueueRender(run: () => Promise<string>, signal?: AbortSignal): Promise<string> {
+  for (;;) {
+    try { return await renderQueue.add(run, signal) }
+    catch (error) {
+      if (!(error instanceof DiagramRenderError) || error.code !== 'busy') throw error
+      await renderQueue.waitForCapacity(signal)
+    }
+  }
 }
 
 // Reject unsupported image requests before Mermaid attaches its measurement
@@ -84,7 +98,10 @@ function enqueueRender<T>(run: () => Promise<T>): Promise<T> {
 export function hasUnsupportedMermaidImageSources(source: string): boolean {
   const template = document.createElement('template')
   template.innerHTML = source
-  if (template.content.querySelector('audio, video, source, picture')) return true
+  if (template.content.querySelector('script, iframe, object, embed, link, base, meta, form, input, audio, video, source, picture')) return true
+  for (const element of template.content.querySelectorAll('*')) {
+    if ([...element.attributes].some(attribute => /^on/i.test(attribute.name))) return true
+  }
   for (const image of template.content.querySelectorAll('img, image')) {
     if (image.hasAttribute('srcset')) return true
     const src = image.getAttribute('src') || image.getAttribute('href') || image.getAttribute('xlink:href') || ''
@@ -111,19 +128,31 @@ export function hasUnsupportedMermaidImageSources(source: string): boolean {
   return false
 }
 
-export async function renderMermaidBlocks(root: HTMLElement, labels: MermaidRenderLabels, options: MermaidRenderOptions = {}): Promise<void> {
+export function renderMermaidBlocks(root: HTMLElement, labels: MermaidRenderLabels, options: MermaidRenderOptions = {}): Promise<void> {
+  return renderMarkdownDiagrams(root, labels, { ...options, languages: ['mermaid'] })
+}
+
+/** Both diagram engines share admission, presentation and mounted ownership. */
+export async function renderMarkdownDiagrams(root: HTMLElement, labels: MermaidRenderLabels, options: MermaidRenderOptions = {}): Promise<void> {
   if (options.signal?.aborted || !root.isConnected) return
-  const allFences = [...root.querySelectorAll<HTMLPreElement>('pre')]
-    .filter(pre => pre.querySelector('code.language-mermaid'))
+  const candidates = root.matches('pre') ? [root as HTMLPreElement] : [...root.querySelectorAll<HTMLPreElement>('pre')]
+  const languageOf = (pre: HTMLElement) => ['mermaid', 'dot', 'graphviz'].find(language => pre.querySelector(`code.language-${language}`))
+  const allFences = candidates.filter(pre => { const language = languageOf(pre); return language && (!options.languages || options.languages.includes(language)) })
   const blocks = allFences.filter(pre => !claims.has(pre))
   if (!blocks.length) return
   const completed = options.budget ? [] : [...root.querySelectorAll<HTMLElement>('[data-mermaid-source-length]')]
   const budget = options.budget ?? {
     sourceChars: completed.reduce((sum, element) => sum + Number(element.dataset.mermaidSourceLength || 0), 0),
     diagrams: completed.length,
+    charged: new WeakSet<HTMLElement>(),
   }
-  budget.sourceChars += blocks.reduce((sum, pre) => sum + (pre.querySelector('code')?.textContent?.length || 0), 0)
-  budget.diagrams += blocks.length
+  const charged = budget.charged ??= new WeakSet<HTMLElement>()
+  for (const pre of blocks) {
+    if (charged.has(pre)) continue
+    charged.add(pre)
+    budget.sourceChars += pre.querySelector('code')?.textContent?.length || 0
+    budget.diagrams += 1
+  }
   const overSurfaceBudget = budget.sourceChars > MAX_SURFACE_SOURCE_CHARS || budget.diagrams > MAX_SURFACE_DIAGRAMS
   const token = Symbol('mermaid-render')
   for (const pre of blocks) {
@@ -145,41 +174,57 @@ export async function renderMermaidBlocks(root: HTMLElement, labels: MermaidRend
     for (const pre of blocks) {
       if (!current(pre)) continue
       const source = pre.querySelector('code')?.textContent || ''
+      const language = languageOf(pre)!
       let reason: 'tooLarge' | 'blockedResource' | undefined
-      if (overSurfaceBudget || source.length > MAX_SOURCE_CHARS) reason = 'tooLarge'
-      else if (hasUnsupportedMermaidImageSources(source)) reason = 'blockedResource'
+      if (overSurfaceBudget || source.length > MAX_SOURCE_CHARS || (language !== 'mermaid' && !checkGraphvizBudget(source))) reason = 'tooLarge'
+      else if (language === 'mermaid' && hasUnsupportedMermaidImageSources(source)) reason = 'blockedResource'
       if (reason) {
-        replaceError(pre, source, undefined, labels, reason)
+        replaceError(pre, source, undefined, labels, reason, language)
         continue
       }
-      pre.style.minHeight = `${clampMermaidPreviewHeight(estimateMermaidPreviewHeight(source))}px`
+      if (language === 'mermaid') pre.style.minHeight = `${clampMermaidPreviewHeight(estimateMermaidPreviewHeight(source))}px`
       try {
+        const palette = language === 'mermaid' ? undefined : diagramPalette(root)
+        const width = Math.max(root.clientWidth, MIN_HOST_WIDTH)
+        const key = JSON.stringify([language === 'graphviz' ? 'dot' : language, source, themeId, width, palette])
         const result = await enqueueRender(async () => {
-          if (!current(pre)) return null
-          const mermaid = await getMermaid()
-          if (!current(pre)) return null
-          initializeTheme(mermaid, themeId)
-          const host = document.createElement('div')
-          host.dataset.mermaidHost = '1'
-          host.style.cssText = `position:fixed;left:-9999px;top:0;width:${Math.max(root.clientWidth, MIN_HOST_WIDTH)}px;opacity:0;pointer-events:none`
-          document.body.appendChild(host)
-          const removeHost = () => host.remove()
-          options.signal?.addEventListener('abort', removeHost, { once: true })
-          try {
-            return await renderMermaidWithRetry(mermaid.render.bind(mermaid), `opensquilla-mermaid-${++mermaidSequence}`, source, host)
-          } finally {
-            options.signal?.removeEventListener('abort', removeHost)
-            host.remove()
+          if (!current(pre)) return ''
+          const cached = renderCache.get(key)
+          if (cached !== undefined) return cached
+          let svg: string
+          if (language !== 'mermaid') {
+            svg = sanitizeGraphvizSvg(await renderGraphviz(source, palette!, options.signal))
+          } else {
+            const mermaid = await getMermaid()
+            if (!current(pre)) return ''
+            initializeTheme(mermaid, themeId)
+            const host = document.createElement('div')
+            host.dataset.mermaidHost = '1'
+            host.style.cssText = `position:fixed;left:-9999px;top:0;width:${width}px;opacity:0;pointer-events:none`
+            document.body.appendChild(host)
+            const removeHost = () => host.remove()
+            options.signal?.addEventListener('abort', removeHost, { once: true })
+            try {
+              svg = (await renderMermaidWithRetry(mermaid.render.bind(mermaid), `opensquilla-mermaid-${++mermaidSequence}`, source, host)).svg
+            } finally {
+              options.signal?.removeEventListener('abort', removeHost)
+              host.remove()
+            }
           }
-        })
+          return svg
+        }, options.signal)
         if (!result || !current(pre)) continue
-        const diagram = createSvgDiagram(result.svg, source, labels)
+        const diagram = createSvgDiagram(result, source, labels)
+        // Only cache results accepted by the shared SVG boundary. Each mount
+        // namespaces IDs independently so cached definitions cannot collide.
+        renderCache.set(key, result)
         diagram.element.dataset.mermaidSourceLength = String(source.length)
-        sources.set(diagram.element, { source })
+        diagram.element.dataset.diagramLanguage = language
+        sources.set(diagram.element, { source, language })
         pre.replaceWith(diagram.element)
         options.onRendered?.(diagram)
       } catch (error) {
-        if (current(pre)) replaceError(pre, source, error, labels, error instanceof MermaidLoadError ? 'loadFailed' : undefined)
+        if (current(pre)) replaceError(pre, source, error, labels, error instanceof MermaidLoadError ? 'loadFailed' : error instanceof DiagramRenderError ? (error.code === 'budget' ? 'tooLarge' : 'loadFailed') : undefined, language)
       }
     }
   } finally {
@@ -195,10 +240,11 @@ function errorMessage(error: unknown, labels: MermaidRenderLabels): string {
   return parsed ? labels.syntaxErrorAt(parsed.line, parsed.excerpt.slice(0, 80)) : raw
 }
 
-function replaceError(pre: HTMLElement, source: string, error: unknown, labels: MermaidRenderLabels, reason?: 'loadFailed' | 'tooLarge' | 'blockedResource'): void {
-  const card = mermaidErrorCard(reason ? labels[reason] : errorMessage(error, labels), source, labels)
+function replaceError(pre: HTMLElement, source: string, error: unknown, labels: MermaidRenderLabels, reason?: 'loadFailed' | 'tooLarge' | 'blockedResource', language = 'mermaid'): void {
+  const card = mermaidErrorCard(reason ? labels[reason] : errorMessage(error, labels), source, labels, language)
   card.dataset.mermaidSourceLength = String(source.length)
-  sources.set(card, { source, error, reason })
+  sources.set(card, { source, language, error, reason })
+  card.dataset.diagramLanguage = language
   pre.replaceWith(card)
 }
 
@@ -208,7 +254,7 @@ export function restoreMermaidSources(root: HTMLElement): void {
     if (!entry) continue
     const pre = document.createElement('pre')
     const code = document.createElement('code')
-    code.className = 'hljs language-mermaid'
+    code.className = `hljs language-${entry.language}`
     code.textContent = entry.source
     pre.appendChild(code)
     element.replaceWith(pre)
@@ -220,8 +266,9 @@ export function updateMermaidLabels(root: HTMLElement, labels: MermaidRenderLabe
   for (const card of root.querySelectorAll<HTMLElement>('.mermaid-error')) {
     const entry = sources.get(card)
     if (!entry) continue
-    const next = mermaidErrorCard(entry.reason ? labels[entry.reason] : errorMessage(entry.error, labels), entry.source, labels)
+    const next = mermaidErrorCard(entry.reason ? labels[entry.reason] : errorMessage(entry.error, labels), entry.source, labels, entry.language)
     next.dataset.mermaidSourceLength = card.dataset.mermaidSourceLength || ''
+    next.dataset.diagramLanguage = entry.language
     const oldDetails = card.querySelector('details')
     const newDetails = next.querySelector('details')
     if (oldDetails && newDetails) newDetails.open = oldDetails.open
@@ -230,11 +277,11 @@ export function updateMermaidLabels(root: HTMLElement, labels: MermaidRenderLabe
   }
 }
 
-function mermaidErrorCard(message: string, source: string, labels: MermaidRenderLabels): HTMLElement {
+function mermaidErrorCard(message: string, source: string, labels: MermaidRenderLabels, language = 'mermaid'): HTMLElement {
   const card = document.createElement('div')
   card.className = 'mermaid-error'
   const chip = document.createElement('span')
-  chip.textContent = `⚠ Mermaid: ${message}`
+  chip.textContent = `⚠ ${language === 'mermaid' ? 'Mermaid' : 'Graphviz'}: ${message}`
   card.appendChild(chip)
   if (source) {
     const copyButton = document.createElement('button')
@@ -263,4 +310,21 @@ function mermaidErrorCard(message: string, source: string, labels: MermaidRender
     card.appendChild(details)
   }
   return card
+}
+
+/** Share clones cannot inherit WeakMap ownership. Restore only the clone. */
+export function restoreClonedDiagramSources(original: HTMLElement, clone: HTMLElement): void {
+  const originals = original.querySelectorAll<HTMLElement>('[data-mermaid-source-length]')
+  const copies = clone.querySelectorAll<HTMLElement>('[data-mermaid-source-length]')
+  originals.forEach((element, index) => {
+    const entry = sources.get(element)
+    const target = copies[index]
+    if (!entry || !target) return
+    const pre = document.createElement('pre')
+    const code = document.createElement('code')
+    code.className = `hljs language-${entry.language}`
+    code.textContent = entry.source
+    pre.appendChild(code)
+    target.replaceWith(pre)
+  })
 }

@@ -14,6 +14,7 @@ export interface UseChatTurnLogOptions {
       highlight?: boolean
       cache?: 'settled' | 'none'
       math?: 'full' | 'defer'
+      diagrams?: 'full' | 'defer'
     },
   ) => string
   toolCallGroups: (calls: ChatToolCall[] | undefined, baseKey: string) => ChatToolCallGroup[]
@@ -35,6 +36,7 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
     highlight: false,
     cache: 'none',
     math: 'defer',
+    diagrams: 'defer',
   })
 
   let currentSnapshot = accumulator.snapshot(

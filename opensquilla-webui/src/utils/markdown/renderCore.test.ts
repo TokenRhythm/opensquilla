@@ -104,3 +104,35 @@ describe('Markdown state and failure isolation', () => {
     expect(root.querySelectorAll('.katex')).toHaveLength(1)
   })
 })
+
+
+describe('session features on the shared core', () => {
+  it('preserves ordered starts and local, keyboard accessible footnotes', () => {
+    const root = host(renderMarkdownCore('Introduction\n\n4. Fourth\n5. Fifth\n\nA note[^a] and again[^a].\n\n[^a]: **Details** with $x$.'))
+    expect(root.querySelector('ol')?.getAttribute('start')).toBe('4')
+    expect(root.querySelectorAll('[data-markdown-footnote-ref="1"]')).toHaveLength(2)
+    expect(root.querySelector('[data-markdown-footnote="1"] strong')?.textContent).toBe('Details')
+    expect(root.querySelector('[data-markdown-footnote="1"] .katex')).not.toBeNull()
+    expect(root.querySelector('[data-markdown-footnote-back]')?.getAttribute('tabindex')).toBe('0')
+    expect(renderMarkdownCore('unresolved[^a]')).toContain('unresolved[^a]')
+  })
+
+  it('admits only completed diagram fences and honors deferred enhancement', () => {
+    for (const language of ['mermaid', 'dot', 'graphviz']) {
+      const source = fence('a -> b', language)
+      expect(host(renderMarkdownCore(source)).querySelector(`code.language-${language}`)).not.toBeNull()
+      expect(host(renderMarkdownCore(source, { diagrams: 'defer' })).querySelector(`code.language-${language}`)).toBeNull()
+      expect(host(renderMarkdownCore(`~~~${language}\na -> b`)).querySelector(`code.language-${language}`)).toBeNull()
+    }
+  })
+})
+
+
+it('renders numeric formulas while leaving currency amounts and escaped dollars as prose', () => {
+  const root = host(renderMarkdownCore(String.raw`$2^n$ and $2x + 1$, then \$2 and \$3; $5 and $10.`))
+  expect([...root.querySelectorAll('annotation')].map(node => node.textContent)).toEqual(['2^n', '2x + 1'])
+  expect(root.textContent).toContain('$2 and $3; $5 and $10.')
+  const prose = host(renderMarkdownCore('$5 and $10 and $x$'))
+  expect(prose.textContent).toContain('$5 and $10 and')
+  expect([...prose.querySelectorAll('annotation')].map(node => node.textContent)).toEqual(['x'])
+})

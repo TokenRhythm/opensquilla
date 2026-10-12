@@ -116,12 +116,16 @@ describe('StreamingTextPart', () => {
       raw.value += `block ${index}\n\n`
       await nextTick()
     }
-    const codePasses = queries.mock.calls.filter(([selector], index) => {
+    const passesByBlock = new Map<HTMLElement, number>()
+    queries.mock.calls.forEach(([selector], index) => {
       const element = queries.mock.contexts[index] as HTMLElement
-      return selector === 'pre' && element.classList.contains('streaming-rich-block')
+      if (selector !== 'pre' || !element.classList.contains('streaming-rich-block')) return
+      passesByBlock.set(element, (passesByBlock.get(element) ?? 0) + 1)
     })
-    // Copy and Mermaid detection each scan the new block; history is stable.
-    expect(codePasses).toHaveLength(60)
+    // Copy, viewport admission and engine detection each inspect only the new
+    // subtree. Every historical block retains its original fixed pass count.
+    expect(passesByBlock.size).toBe(30)
+    expect([...passesByBlock.values()]).toEqual(Array(30).fill(3))
     expect(host.querySelectorAll('.code-copy-btn')).toHaveLength(30)
   })
 

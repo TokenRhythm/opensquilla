@@ -356,7 +356,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         ):
             response.headers["content-security-policy"] = (
                 "default-src 'self'; "
-                "script-src 'self' 'unsafe-inline'; "
+                "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; "
+                "worker-src 'self'; "
                 "style-src 'self' 'unsafe-inline'; "
                 "img-src 'self' data: blob: https:; "
                 "connect-src 'self' ws: wss: http://*.localhost:*; "

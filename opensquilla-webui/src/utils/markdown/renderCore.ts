@@ -1,4 +1,4 @@
-import { Marked, type Tokens, type MarkedExtension } from 'marked'
+import { Marked, type Token, type Tokens, type MarkedExtension } from 'marked'
 import createDOMPurify from 'dompurify'
 import hljs from 'highlight.js/lib/common'
 import katex from 'katex'
@@ -33,6 +33,9 @@ export function createMarkdownRenderBudget(): MarkdownRenderBudget {
 export interface MarkdownCoreOptions {
   highlight?: boolean
   math?: 'full' | 'defer'
+  diagrams?: 'full' | 'defer'
+  /** Resource adapters resolve these inert placeholders with session authorization. */
+  images?: 'placeholder'
   /** A streaming message shares this budget across its committed blocks. */
   budget?: MarkdownRenderBudget
 }
@@ -65,6 +68,18 @@ function ensureSanitizers(): boolean {
       data.keepAttr = isSafeMarkdownLinkSource(data.attrValue)
     } else if (data.attrName === 'align') {
       data.keepAttr = (tag === 'th' || tag === 'td') && /^(left|center|right)$/.test(data.attrValue)
+    } else if (data.attrName === 'start') {
+      data.keepAttr = tag === 'ol' && /^-?\d{1,9}$/.test(data.attrValue)
+    } else if (data.attrName === 'data-markdown-image' || data.attrName === 'data-markdown-image-alt') {
+      data.keepAttr = tag === 'span'
+    } else if (/^data-markdown-footnote(?:-ref|-back)?$/.test(data.attrName)) {
+      data.keepAttr = (tag === 'a' || tag === 'li') && /^\d+$/.test(data.attrValue)
+    } else if (data.attrName === 'data-markdown-footnotes') {
+      data.keepAttr = tag === 'ol'
+    } else if (data.attrName === 'tabindex') {
+      data.keepAttr = tag === 'a' && data.attrValue === '0'
+    } else if (data.attrName === 'role') {
+      data.keepAttr = tag === 'a' && data.attrValue === 'link'
     } else if (data.attrName === 'type') {
       data.keepAttr = tag === 'input' && data.attrValue === 'checkbox'
     } else if (data.attrName === 'class') {
@@ -92,9 +107,9 @@ function ensureSanitizers(): boolean {
 function sanitizeMarkdown(html: string): string {
   const sanitized = purifier!.sanitize(html, {
     ALLOWED_TAGS: ['p', 'br', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 'blockquote', 'pre', 'code', 'strong', 'em', 'del', 'a', 'img', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'div', 'span', 'sup', 'input'],
-    ALLOWED_ATTR: ['href', 'title', 'alt', 'src', 'loading', 'decoding', 'referrerpolicy', 'target', 'rel', 'class', 'align', 'type', 'data-workspace-path', 'checked', 'disabled'],
+    ALLOWED_ATTR: ['href', 'title', 'alt', 'src', 'loading', 'decoding', 'referrerpolicy', 'target', 'rel', 'class', 'align', 'type', 'data-workspace-path', 'checked', 'disabled', 'start', 'role', 'tabindex', 'data-markdown-image', 'data-markdown-image-alt', 'data-markdown-footnote', 'data-markdown-footnote-ref', 'data-markdown-footnote-back', 'data-markdown-footnotes'],
     ALLOW_DATA_ATTR: false,
-    ADD_URI_SAFE_ATTR: ['align', 'type'],
+    ADD_URI_SAFE_ATTR: ['align', 'type', 'start', 'tabindex', 'data-markdown-image', 'data-markdown-image-alt', 'data-markdown-footnote', 'data-markdown-footnote-ref', 'data-markdown-footnote-back', 'data-markdown-footnotes'],
     ALLOWED_URI_REGEXP: /^(?:https?|mailto):/i,
   })
   // A malfunctioning DOM must not cause another raw-HTML render. Validate
@@ -136,14 +151,14 @@ function readMath(src: string, block: boolean): { raw: string; content: string; 
   const opening = src.startsWith('$$') ? '$$' : src.startsWith('\\[') ? '\\[' : src.startsWith('\\(') ? '\\(' : src.startsWith('$') ? '$' : ''
   if (!opening || (block && opening !== '$$' && opening !== '\\[')) return
   const closing = opening === '\\[' ? '\\]' : opening === '\\(' ? '\\)' : opening
-  if (opening === '$' && /[\s\d$]/.test(src[1] || ' ')) return
+  if (opening === '$' && /[\s$]/.test(src[1] || ' ')) return
   for (let index = opening.length; index < Math.min(src.length, MATH_MAX_CHARS); index += 1) {
     if ((opening === '$' || opening === '\\(') && src[index] === '\n') return
     if (src[index] === '\\' && !src.startsWith(closing, index)) { index += 1; continue }
     if (!src.startsWith(closing, index)) continue
     if (opening === '$' && (/\s/.test(src[index - 1]) || /[\d$]/.test(src[index + 1] || ''))) continue
     const content = src.slice(opening.length, index).trim()
-    if (!content) return
+    if (!content || (opening === '$' && /^\d/.test(content) && /(^|[^\\])\$/.test(content))) return
     return { raw: src.slice(0, index + closing.length), content, display: opening === '$$' || opening === '\\[' }
   }
   if (src.length >= MATH_MAX_CHARS) {
@@ -155,7 +170,11 @@ function readMath(src: string, block: boolean): { raw: string; content: string; 
   }
 }
 
+interface Footnote { raw: string; tokens: Token[]; number?: number }
+
 function renderContent(text: string, opts: MarkdownCoreOptions): string {
+  const notes = new Map<string, Footnote>()
+  const usedNotes: Footnote[] = []
   const budget = opts.budget ?? createMarkdownRenderBudget()
   const generated: string[] = []
   // Unpredictable markers cannot be forged using literal or entity-encoded
@@ -191,12 +210,53 @@ function renderContent(text: string, opts: MarkdownCoreOptions): string {
   ] }
   const parser = new Marked(strictStrikethrough, mathExtensions, {
     breaks: true,
+    extensions: [
+      {
+        name: 'footnoteDefinition', level: 'block',
+        start(src) { const match = /(?:^|\n) {0,3}\[\^[^\]\s]+\]:/.exec(src); return match ? match.index + (match[0].startsWith('\n') ? 1 : 0) : undefined },
+        tokenizer(src) {
+          const match = /^ {0,3}\[\^([^\]\s]+)\]:[ \t]*([^\n]*)(?:\n|$)/.exec(src)
+          if (!match) return
+          let raw = match[0]
+          let body = match[2]
+          const continuation = /^(?:(?:\n(?= {4}|\t))?(?: {4}|\t)[^\n]*(?:\n|$))/
+          let next: RegExpExecArray | null
+          while ((next = continuation.exec(src.slice(raw.length)))) {
+            raw += next[0]
+            body += `\n${next[0].replace(/^( {4}|\t)/gm, '').replace(/\n$/, '')}`
+          }
+          const key = match[1].toLowerCase()
+          // Duplicate definitions remain readable instead of silently losing text.
+          if (notes.has(key)) return { type: 'footnoteDefinition', raw, duplicate: true }
+          const note: Footnote = { raw, tokens: [] }
+          notes.set(key, note)
+          note.tokens = this.lexer.blockTokens(body)
+          return { type: 'footnoteDefinition', raw, key }
+        },
+        renderer(token) { return token.duplicate ? `<p>${escapeMarkdownHtml(token.raw)}</p>` : '' },
+      },
+      {
+        name: 'footnoteReference', level: 'inline',
+        start(src) { const index = src.indexOf('[^'); return index < 0 ? undefined : index },
+        tokenizer(src) { if (this.lexer.state.inRawBlock || this.lexer.state.inLink) return; const match = /^\[\^([^\]\s]+)\]/.exec(src); return match ? { type: 'footnoteReference', raw: match[0], key: match[1].toLowerCase() } : undefined },
+        renderer(token) {
+          const note = notes.get(token.key)
+          if (!note) return escapeMarkdownHtml(token.raw)
+          note.number ??= usedNotes.push(note)
+          return `<sup><a role="link" tabindex="0" data-markdown-footnote-ref="${note.number}">${note.number}</a></sup>`
+        },
+      },
+    ],
     renderer: {
       link(token: Tokens.Link): string | false {
         const path = workspaceFilePath(token.href, true)
         return path ? `<a data-workspace-path="${escapeMarkdownHtml(path)}">${this.parser.parseInline(token.tokens)}</a>` : false
       },
-      code({ text: code, lang }: Tokens.Code): string {
+      image(token: Tokens.Image): string | false {
+        return opts.images === 'placeholder' && !isSafeMarkdownImageSource(token.href)
+          ? `<span data-markdown-image="${escapeMarkdownHtml(token.href)}" data-markdown-image-alt="${escapeMarkdownHtml(token.text)}">${escapeMarkdownHtml(token.text)}</span>` : false
+      },
+      code({ text: code, lang, raw }: Tokens.Code): string {
         const language = (lang || '').trim().split(/\s+/)[0].toLowerCase()
         const highlight = opts.highlight !== false && Boolean(language) && code.length <= HIGHLIGHT_MAX_CHARS
           && code.length <= budget.highlightCharsRemaining && budget.highlightBlocksRemaining > 0 && Boolean(hljs.getLanguage(language))
@@ -207,12 +267,25 @@ function renderContent(text: string, opts: MarkdownCoreOptions): string {
           try { body = hljs.highlight(code, { language, ignoreIllegals: true }).value } catch { /* Plain source follows. */ }
         }
         const label = language ? `<span class="code-lang">${escapeMarkdownHtml(language)}</span>` : ''
-        const langClass = language ? ` language-${escapeMarkdownHtml(language)}` : ''
+        const fence = raw.match(/^ {0,3}(`{3,}|~{3,})/)?.[1]
+        const lines = raw.trimEnd().split('\n')
+        const closing = lines[lines.length - 1]?.trim() || ''
+        const closed = Boolean(fence && new RegExp(`^${fence[0]}{${fence.length},}$`).test(closing))
+        const diagram = /^(mermaid|dot|graphviz)$/.test(language)
+        const deferred = diagram && (opts.diagrams === 'defer' || !closed)
+        const langClass = language && !deferred ? ` language-${escapeMarkdownHtml(language)}` : ''
         return `<pre>${label}<code class="hljs${langClass}">${body || escapeMarkdownHtml(code)}</code></pre>\n`
       },
     },
   })
-  const html = sanitizeMarkdown(parser.parse(text, { async: false }) as string)
+  let rawHtml = parser.parse(text, { async: false }) as string
+  const renderedNotes: string[] = []
+  for (const note of usedNotes) {
+    renderedNotes.push(`<li data-markdown-footnote="${note.number}">${parser.parser(note.tokens)}<a role="link" tabindex="0" data-markdown-footnote-back="${note.number}">↩</a></li>`)
+  }
+  if (renderedNotes.length) rawHtml += `<hr><ol data-markdown-footnotes="">${renderedNotes.join('')}</ol>`
+  for (const note of notes.values()) if (!note.number) rawHtml += `<p>${escapeMarkdownHtml(note.raw)}</p>`
+  const html = sanitizeMarkdown(rawHtml)
   return html.replace(new RegExp(`${marker}(\\d+)\uE001`, 'g'), (_, index) => generated[Number(index)] || '')
 }
 

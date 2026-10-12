@@ -1,5 +1,6 @@
 <template>
   <div
+    ref="root"
     class="activity-narration activity-narration--plain"
     data-activity-entry="true"
     data-activity-type="segment"
@@ -10,31 +11,57 @@
 </template>
 
 <script setup lang="ts">
+import { ref } from 'vue'
 import type { ChatStreamTimelineItem } from '@/types/chat'
+import { useMarkdownEnhancements } from '@/composables/chat/useMarkdownEnhancements'
 
-defineProps<{
+const props = defineProps<{
   item: Extract<ChatStreamTimelineItem, { type: 'text' }>
 }>()
+const root = ref<HTMLElement | null>(null)
+useMarkdownEnhancements(root, { version: () => props.item.html })
 </script>
 
 <style scoped>
 .activity-narration {
+  display: flow-root;
   min-width: 0;
-  color: var(--text-muted);
-  font-size: 0.8125rem;
-  line-height: 1.58;
+  color: var(--text);
+  font-size: var(--fs-md);
+  line-height: 1.7;
   overflow-wrap: anywhere;
 }
 
 .activity-narration--plain {
-  margin: 0.375rem 0 0.625rem 1.625rem;
-}
-
-.activity-narration--plain :deep(p) {
   margin: 0;
 }
 
-.activity-narration--plain :deep(p + p) {
-  margin-top: 0.5rem;
+.activity-narration :deep(pre) {
+  max-width: 100%;
+  margin: 0.75rem 0;
+  overflow-x: auto;
+  padding: 0.75rem 0.875rem 0.875rem;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.65;
+  border: 1px solid var(--code-block-border);
+  border-radius: var(--radius-control);
+  background: var(--code-block-bg);
+  box-shadow: none;
+}
+.activity-narration :deep(pre code) {
+  background: transparent;
+  padding: 0;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+}
+
+.activity-narration :deep(> :first-child) {
+  margin-top: 0;
+}
+
+.activity-narration :deep(> :last-child) {
+  margin-bottom: 0;
 }
 </style>

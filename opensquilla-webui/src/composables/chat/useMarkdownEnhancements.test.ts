@@ -6,9 +6,9 @@ import { useMarkdownEnhancements } from './useMarkdownEnhancements'
 const calls = vi.hoisted(() => ({ copy: vi.fn(), images: vi.fn(), resetImages: vi.fn(), disposeImages: vi.fn(), render: vi.fn(), restore: vi.fn(), labels: vi.fn() }))
 const locale = ref('en')
 vi.mock('vue-i18n', () => ({ useI18n: () => ({ locale, t: (key: string) => `${locale.value}:${key}` }) }))
-vi.mock('@/utils/chat/codeBlockChrome', () => ({ decorateCodeBlocks: calls.copy }))
+vi.mock('@/utils/chat/codeBlockChrome', () => ({ createCodeBlockChrome: () => ({ decorate: calls.copy, updateLabels: vi.fn(), reset: vi.fn(), dispose: vi.fn() }) }))
 vi.mock('./useMarkdownImageLightbox', () => ({ useMarkdownImageLightbox: () => ({ decorate: calls.images, reset: calls.resetImages, dispose: calls.disposeImages }) }))
-vi.mock('@/utils/markdown/mermaidRenderer', () => ({ renderMermaidBlocks: calls.render, resolvedDiagramThemeId: () => document.documentElement.getAttribute('data-theme') || 'light', restoreMermaidSources: calls.restore, updateMermaidLabels: calls.labels }))
+vi.mock('@/utils/markdown/mermaidRenderer', () => ({ renderMarkdownDiagrams: calls.render, resolvedDiagramThemeId: () => document.documentElement.getAttribute('data-theme') || 'light', restoreMermaidSources: calls.restore, updateMermaidLabels: calls.labels }))
 
 let cleanup: (() => void) | undefined
 beforeEach(() => {
@@ -17,7 +17,7 @@ beforeEach(() => {
   locale.value = 'en'
   document.documentElement.setAttribute('data-theme', 'light')
 })
-afterEach(() => { cleanup?.(); cleanup = undefined; document.body.replaceChildren() })
+afterEach(() => { cleanup?.(); cleanup = undefined; document.body.replaceChildren(); vi.unstubAllGlobals() })
 
 function surface(incremental: boolean) {
   const blocks = ref<string[]>([])
@@ -96,4 +96,37 @@ describe('mounted Markdown enhancement owner', () => {
     expect(calls.labels).toHaveBeenCalledOnce()
     expect(calls.labels.mock.calls[0][1].copyCode).toBe('de:chat.mermaid.copyCode')
   })
+})
+
+
+it('defers offscreen engine work, aborts on exit and retries when visible again', async () => {
+  let notify!: IntersectionObserverCallback
+  const unobserve = vi.fn()
+  const disconnect = vi.fn()
+  vi.stubGlobal('IntersectionObserver', class {
+    constructor(callback: IntersectionObserverCallback) { notify = callback }
+    observe() {}
+    unobserve = unobserve
+    disconnect = disconnect
+  })
+  const pending: Array<{ signal: AbortSignal, finish: () => void }> = []
+  calls.render.mockImplementation((_root, _labels, options) => new Promise<void>(resolve => pending.push({ signal: options.signal, finish: resolve })))
+  const { blocks, owner } = surface(true)
+  blocks.value.push('<pre><code class="language-dot">digraph { a -> b }</code></pre>')
+  await nextTick()
+  const pre = document.querySelector('pre')!
+  expect(calls.render).not.toHaveBeenCalled()
+  const visible = (isIntersecting: boolean) => notify([{ target: pre, isIntersecting, time: 0, rootBounds: null, boundingClientRect: pre.getBoundingClientRect(), intersectionRect: pre.getBoundingClientRect(), intersectionRatio: isIntersecting ? 1 : 0 }], {} as IntersectionObserver)
+  visible(true)
+  expect(calls.render).toHaveBeenCalledOnce()
+  visible(false)
+  expect(pending[0].signal.aborted).toBe(true)
+  visible(true)
+  expect(calls.render).toHaveBeenCalledTimes(2)
+  expect(pending[1].signal.aborted).toBe(false)
+  pending.forEach(job => job.finish())
+  await owner.ready.value
+  expect(unobserve).toHaveBeenCalledOnce()
+  cleanup?.(); cleanup = undefined
+  expect(disconnect).toHaveBeenCalledOnce()
 })

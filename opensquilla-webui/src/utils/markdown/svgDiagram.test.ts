@@ -76,3 +76,23 @@ describe('diagram dimensions and retained source viewport', () => {
     diagram.dispose()
   })
 })
+
+
+describe('repeated and cached SVG identity', () => {
+  it('namespaces fragments, style selectors and accessible references per mount', () => {
+    const source = '<svg xmlns="http://www.w3.org/2000/svg" id="fff" viewBox="0 0 100 80" aria-labelledby="title"><title id="title">Same title</title><defs><marker id="arrow"><path d="M0 0L2 2"/></marker></defs><path marker-end="url(#arrow)"/><a href="#title"><text>Same text</text></a></svg>'
+    const first = createSvgDiagram(source, 'source', labels).element
+    const second = createSvgDiagram(source, 'source', labels).element
+    document.body.append(first, second)
+    const ids = [...document.querySelectorAll('[id]')].map(node => node.id)
+    expect(new Set(ids).size).toBe(ids.length)
+    for (const root of [first, second]) {
+      const titleId = root.querySelector('title')!.id
+      const arrowId = root.querySelector('marker')!.id
+      expect(root.querySelector('svg')?.getAttribute('aria-labelledby')).toBe(titleId)
+      expect(root.querySelector('a')?.getAttribute('href')).toBe(`#${titleId}`)
+      expect(root.querySelector('[marker-end]')?.getAttribute('marker-end')).toBe(`url(#${arrowId})`)
+      expect(root.textContent).toContain('Same text')
+    }
+  })
+})
