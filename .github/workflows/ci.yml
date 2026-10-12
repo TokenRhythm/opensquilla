@@ -1771,6 +1771,18 @@ jobs:
             tests/test_persistence/test_migration_compatibility.py
             tests/test_migrations/test_v045_goal_runtime_accounting.py
             tests/test_tools/test_plan_access.py
+            tests/test_sandbox/test_run_context.py
+            tests/test_sandbox/test_run_context_grants.py
+            tests/test_sandbox/test_user_grants_workers.py
+            tests/test_sandbox/test_user_grants_service_workers.py
+            tests/test_sandbox/test_user_grants_mutation_order.py
+            tests/test_sandbox/test_startup_without_canaries.py
+            tests/test_gateway/test_rpc_run_mode_preference.py
+            tests/test_gateway/test_rpc_sandbox_setup.py
+            tests/test_gateway/test_admission_preparation.py
+            tests/test_gateway/test_project_workspace_execution.py
+            tests/test_gateway/test_full_policy_preparation_workers.py
+            tests/test_gateway/test_sandbox_policy_workers.py
             tests/test_scripts/test_verify_webui_artifact.py
             tests/test_scripts/test_stage_webui_artifact.py
             tests/test_packaging/test_webui_build_contract.py
