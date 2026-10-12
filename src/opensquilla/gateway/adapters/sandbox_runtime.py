@@ -422,8 +422,35 @@ class GatewaySandboxPolicyAdapter:
             raise SandboxUnavailableError("Sandbox policy storage is unavailable.")
         return SandboxPolicyStore(Path(str(self._state_dir)) / "sessions.db")
 
+    async def _run_operation[Result](
+        self, operation: Callable[[SandboxPolicyStore], Result],
+    ) -> Result:
+        # Construction can initialize SQLite too. Keep it on the worker, and
+        # settle a submitted write before releasing its cancelled request owner.
+        worker = asyncio.get_running_loop().run_in_executor(
+            None, contextvars.copy_context().run, lambda: operation(self._store()),
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+            except BaseException:
+                break
+        try:
+            result = worker.result()
+        except BaseException as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+        if cancellation is not None:
+            raise cancellation
+        return result
+
     async def read_policy(self) -> SandboxPolicyDocument:
-        return _policy(self._store().read())
+        return _policy(await self._run_operation(lambda store: store.read()))
 
     async def read_policy_defaults(self) -> SandboxPolicyDefaults:
         return _legacy_policy_defaults()
@@ -434,7 +461,10 @@ class GatewaySandboxPolicyAdapter:
         policy: SandboxPolicyDocument,
     ) -> SandboxPolicyDocument:
         try:
-            saved = self._store().compare_and_swap(base_policy_version, _stored_policy(policy))
+            candidate = _stored_policy(policy)
+            saved = await self._run_operation(
+                lambda store: store.compare_and_swap(base_policy_version, candidate),
+            )
         except PolicyVersionConflict as exc:
             raise SandboxPolicyConflictError(
                 expected_version=base_policy_version,

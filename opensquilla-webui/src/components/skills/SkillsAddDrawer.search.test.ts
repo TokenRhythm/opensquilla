@@ -84,6 +84,30 @@ const skillHubResult: SkillRegistrySearchResult = {
 }
 
 describe('SkillsAddDrawer registry search integration', () => {
+  it('searches only on explicit submit, ignores held Enter, and joins rapid Enter presses', async () => {
+    const pending = deferred<SkillRegistrySearchResult>()
+    const search = vi.fn<SkillCatalog['search']>().mockReturnValue(pending.promise)
+    const { searches } = mountSearchDrawer(search)
+    await switchSource('clawhub')
+    await enterQuery('paper')
+    const input = document.querySelector<HTMLInputElement>('.sk-add-search-row input')!
+    expect(search).not.toHaveBeenCalled()
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', repeat: true, bubbles: true }))
+    expect(searches).toHaveLength(0)
+    expect(search).not.toHaveBeenCalled()
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    expect(searches).toHaveLength(2)
+    expect(search).toHaveBeenCalledTimes(1)
+    await nextTick()
+    expect(searchButton().disabled).toBe(true)
+    pending.resolve({ results: [{ name: 'Paper', identifier: 'paper', source: 'clawhub' }], diagnostics: [], message: '' })
+    await Promise.all(searches)
+    await nextTick()
+    expect(document.querySelector('.sk-add-result')?.textContent).toContain('Paper')
+    expect(searchButton().disabled).toBe(false)
+  })
+
   it('releases search controls on a market switch and ignores late source diagnostics', async () => {
     const clawHub = deferred<SkillRegistrySearchResult>()
     const search = vi.fn<SkillCatalog['search']>()

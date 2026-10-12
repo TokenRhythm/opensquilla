@@ -64,6 +64,12 @@ async def test_memory_state_does_not_wait_for_sqlite_worker(
     path = tmp_path / "approvals.sqlite"
     queue = ApprovalQueue(db_path=str(path))
     approval_id = queue.request("exec", {})
+    # An expired claim makes this read perform real cleanup. Empty reads no
+    # longer acquire the writer lock.
+    queue._conn.execute(
+        "UPDATE approval_queue SET claim_token = 'expired', claim_started_at = 0 "
+        "WHERE approval_id = ?", (approval_id,),
+    )
     queue.set_settings("prompt", allow_patterns=["original"], node_id="node")
     queue.set_run_mode("session", "full")
     sql_started = threading.Event()
@@ -108,6 +114,10 @@ async def test_sync_database_mutation_still_waits_for_async_database_worker(tmp_
     path = tmp_path / "approvals.sqlite"
     queue = ApprovalQueue(db_path=str(path))
     approval_id = queue.request("exec", {})
+    queue._conn.execute(
+        "UPDATE approval_queue SET claim_token = 'expired', claim_started_at = 0 "
+        "WHERE approval_id = ?", (approval_id,),
+    )
     sql_started = threading.Event()
     mutation_started = threading.Event()
     queue._conn.set_trace_callback(
@@ -138,4 +148,64 @@ async def test_sync_database_mutation_still_waits_for_async_database_worker(tmp_
             await reader
         if mutation is not None:
             await mutation
+        queue.close()
+
+
+@pytest.mark.parametrize("cancel_all", [False, True])
+async def test_cancelled_composite_keeps_owner_until_consumption_commits(tmp_path, cancel_all):
+    queue = ApprovalQueue(db_path=str(tmp_path / "cancel.sqlite"))
+    approval_id = queue.request("exec", {})
+    queue.resolve(approval_id, True)
+    entered = threading.Event()
+    release = threading.Event()
+    committed = threading.Event()
+
+    def consume():
+        entered.set()
+        assert release.wait(3)
+        queue.consume(approval_id)
+        committed.set()
+
+    task = asyncio.create_task(queue.run_operation_async(consume))
+    try:
+        await _wait_for_thread(entered)
+        if cancel_all:
+            # asyncio.run() cancels every remaining Task during shutdown.
+            current = asyncio.current_task()
+            for candidate in asyncio.all_tasks():
+                if candidate is not current:
+                    candidate.cancel()
+        else:
+            task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert queue._async_lock.locked()
+        assert not committed.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert committed.is_set()
+        assert queue.get(approval_id).consumed
+        assert not queue._async_lock.locked()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        queue.close()
+
+
+async def test_worker_cancellation_exception_does_not_spin_or_keep_owner(tmp_path):
+    queue = ApprovalQueue(db_path=str(tmp_path / "worker-cancel.sqlite"))
+
+    def cancelled_worker():
+        raise asyncio.CancelledError("worker cancelled")
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await queue.run_operation_async(cancelled_worker)
+        assert not queue._async_lock.locked()
+        approval_id = await queue.request_async("exec", {})
+        assert (await queue.get_async(approval_id)).approval_id == approval_id
+    finally:
         queue.close()

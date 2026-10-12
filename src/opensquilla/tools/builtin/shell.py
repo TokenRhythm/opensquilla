@@ -81,7 +81,7 @@ from opensquilla.sandbox.denial_attribution import is_likely_sandbox_denied
 from opensquilla.sandbox.elevation import (
     ApprovalDisplay,
     ElevationAction,
-    gate_elevated_action,
+    gate_elevated_action_async,
 )
 from opensquilla.sandbox.escalation import (
     build_path_approval_params,
@@ -104,7 +104,7 @@ from opensquilla.sandbox.integration import (
     SandboxRuntime,
     active_file_system_profile,
     active_sandbox_policy,
-    consume_backend_denial_retry,
+    consume_backend_denial_retry_async,
     escalate_backend_denial,
     escalate_unavailable_backend_in_managed_mode,
     gate_action,
@@ -920,7 +920,7 @@ async def _gate_recursive_delete(
             ),
         )
     context = current_tool_context.get()
-    gate = gate_elevated_action(
+    gate = await gate_elevated_action_async(
         pending.action,
         approval_id=approval_id,
         session_key=getattr(context, "session_key", None),
@@ -965,7 +965,7 @@ async def _gate_recursive_delete(
                 without_backup=True,
             ),
         )
-        second_gate = gate_elevated_action(
+        second_gate = await gate_elevated_action_async(
             override_pending.action,
             approval_id=None,
             session_key=getattr(context, "session_key", None),
@@ -1029,7 +1029,7 @@ async def _gate_recursive_delete(
     )
 
 
-def _gate_safe_command_approval(
+async def _gate_safe_command_approval(
     command: str,
     *,
     cwd: str | None,
@@ -1049,7 +1049,7 @@ def _gate_safe_command_approval(
         display=ApprovalDisplay(kind="run_command", target=command),
     )
     context = current_tool_context.get()
-    gate = gate_elevated_action(
+    gate = await gate_elevated_action_async(
         action,
         approval_id=approval_id,
         session_key=getattr(context, "session_key", None),
@@ -6063,7 +6063,7 @@ def _shell_elevation_action(
     )
 
 
-def _gate_shell_elevation(
+async def _gate_shell_elevation(
     action: ElevationAction,
     *,
     approval_id: str | None,
@@ -6075,7 +6075,7 @@ def _gate_shell_elevation(
             "message": "A precise justification is required for elevated execution.",
         }
     ctx = current_tool_context.get()
-    gate = gate_elevated_action(
+    gate = await gate_elevated_action_async(
         action,
         approval_id=approval_id,
         session_key=ctx.session_key if ctx is not None else None,
@@ -7085,7 +7085,9 @@ async def _run_full_host_shell_command(
     """Execute directly on the host without sandbox policy or safety preflight."""
 
     runtime = get_runtime()
-    merged_env = await _prepare_shell_runtime(_base_shell_environment)
+    # Resolve runtimes once, after caller overrides. The shared base helper
+    # already resolves them for Safe/Guest callers.
+    merged_env = dict(os.environ)
     if env:
         merged_env.update(env)
     merged_env = await _prepare_shell_runtime(
@@ -7391,7 +7393,7 @@ async def exec_command(
     if recursive_delete is not None:
         return recursive_delete
     if result.needs_approval:
-        command_approval = _gate_safe_command_approval(
+        command_approval = await _gate_safe_command_approval(
             command,
             cwd=cwd,
             reason=result.reason or "This high-risk command requires approval.",
@@ -7412,7 +7414,7 @@ async def exec_command(
         if hard_block is not None:
             return json.dumps(hard_block, ensure_ascii=False)
     if not host_execution and sandbox_permissions == "require_escalated":
-        elevation = _gate_shell_elevation(
+        elevation = await _gate_shell_elevation(
             _shell_elevation_action(
                 tool_name="exec_command",
                 action_kind="shell.exec",
@@ -7540,7 +7542,7 @@ async def exec_command(
             host_execution = True
             backend_retry_granted = True
         else:
-            retry_gate = consume_backend_denial_retry(
+            retry_gate = await consume_backend_denial_retry_async(
                 approval_id,
                 request,
                 policy,
@@ -7723,10 +7725,12 @@ async def _start_host_background_process(
     """Start a host background process without sandbox policy or safety preflight."""
 
     session_id = str(uuid.uuid4())[:8]
-    base_env = (
-        dict(env) if env is not None
-        else await _prepare_shell_runtime(_base_shell_environment)
-    )
+    if env is not None:
+        base_env = dict(env)
+    elif full_host_access_active():
+        base_env = dict(os.environ)
+    else:
+        base_env = await _prepare_shell_runtime(_base_shell_environment)
     host_env = await _prepare_shell_runtime(
         lambda: _managed_skill_environment(
             _runtime_shell_environment(
@@ -8024,7 +8028,7 @@ async def background_process(
     if recursive_delete is not None:
         return recursive_delete
     if result.needs_approval:
-        command_approval = _gate_safe_command_approval(
+        command_approval = await _gate_safe_command_approval(
             command,
             cwd=cwd,
             reason=result.reason or "This high-risk command requires approval.",
@@ -8048,7 +8052,7 @@ async def background_process(
         if hard_block is not None:
             return json.dumps(hard_block, ensure_ascii=False)
     if not host_execution and sandbox_permissions == "require_escalated":
-        elevation = _gate_shell_elevation(
+        elevation = await _gate_shell_elevation(
             _shell_elevation_action(
                 tool_name="background_process",
                 action_kind="shell.background",
@@ -8144,7 +8148,7 @@ async def background_process(
                 io_mode=io_mode,
                 notify_on_exit=notify_on_exit,
             )
-        retry_gate = consume_backend_denial_retry(
+        retry_gate = await consume_backend_denial_retry_async(
             approval_id,
             request,
             policy,

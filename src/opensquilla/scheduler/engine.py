@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -77,7 +78,9 @@ class SchedulerEngine:
             max_jitter = cfg.get("max_jitter", 30.0)
 
         self._store = store
+        self._reservation_owner = f"scheduler:{uuid.uuid4()}"
         self._manual_run_tasks: set[asyncio.Task[ManualRunResult]] = set()
+        self._manual_reservations: dict[str, asyncio.Task[ManualRunResult]] = {}
         self._stopping = False
         self._ops = SchedulerOps(store, max_jitter=max_jitter, clock=clock)
 
@@ -94,7 +97,13 @@ class SchedulerEngine:
             max_concurrent=cfg.get("max_concurrent_runs", 3),
             max_catchup=cfg.get("max_catchup_jobs", 5),
             reaper=self._reaper,
+            reservation_owner=self._reservation_owner,
+            reservation_is_active=self._manual_reservation_is_active,
         )
+
+    def _manual_reservation_is_active(self, owner: str) -> bool:
+        task = self._manual_reservations.get(owner)
+        return task is not None and not task.done()
 
     # ------------------------------------------------------------------
     # Handler registry — delegates to timer
@@ -217,15 +226,21 @@ class SchedulerEngine:
         """Trigger immediate execution of a job."""
         if self._stopping:
             return ManualRunResult(status=ManualRunStatus.BLOCKED, reason="scheduler_stopping")
+        owner = f"{self._reservation_owner}:manual:{uuid.uuid4()}"
         task = asyncio.create_task(
-            self._run_job_now(job_id, on_admitted=on_admitted), name=f"cron-manual-{job_id}",
+            self._run_job_now(job_id, owner=owner, on_admitted=on_admitted),
+            name=f"cron-manual-{job_id}",
         )
         self._manual_run_tasks.add(task)
+        # Register before the first await: SQLite can commit a reservation
+        # before its caller resumes. A BUSY retry has a different owner.
+        self._manual_reservations[owner] = task
         task.add_done_callback(self._manual_run_tasks.discard)
+        task.add_done_callback(lambda _task: self._manual_reservations.pop(owner, None))
         return await task
 
     async def _run_job_now(
-        self, job_id: str, *, on_admitted: Callable[[], None] | None,
+        self, job_id: str, *, owner: str, on_admitted: Callable[[], None] | None,
     ) -> ManualRunResult:
         job = await self._ops.get(job_id)
         if job is None:
@@ -244,7 +259,7 @@ class SchedulerEngine:
             )
         reservation_task = asyncio.create_task(
             self._store.reserve_manual_job(
-                job_id, datetime.now(UTC), source="manual", owner="scheduler-manual",
+                job_id, datetime.now(UTC), source="manual", owner=owner,
             ),
         )
         try:

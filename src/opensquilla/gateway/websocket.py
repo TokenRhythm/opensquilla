@@ -3217,7 +3217,7 @@ async def handle_ws_connection(
         params_raw = {}
 
     # Step 4: Resolve auth via server-side ScopeResolver
-    from opensquilla.gateway.auth import resolve_auth
+    from opensquilla.gateway.auth import resolve_auth_async
 
     auth_params = params_raw.get("auth")
     if not isinstance(auth_params, dict):
@@ -3226,7 +3226,7 @@ async def handle_ws_connection(
     if not isinstance(role_claim, str):
         role_claim = "operator"
     peer_ip = ws.client.host if ws.client is not None else None
-    principal = resolve_auth(
+    principal = await resolve_auth_async(
         config,
         auth_params=auth_params,
         role_claim=role_claim,

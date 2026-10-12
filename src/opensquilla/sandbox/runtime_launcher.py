@@ -111,9 +111,9 @@ def apply_bundled_runtime_path(
     # boot.  A finalized application-owned catalog takes precedence over the old
     # v0.5.3 bundled layout even when no optional component is installed.
     try:
-        from opensquilla.runtime_packs import apply_runtime_environment, status_snapshot
+        from opensquilla.runtime_packs import apply_runtime_environment, management_supported
 
-        if status_snapshot().management_supported:
+        if management_supported():
             return apply_runtime_environment(
                 result,
                 mode=mode,

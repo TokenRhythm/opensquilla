@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
+from collections.abc import Callable
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 
 from .jobs import (
@@ -21,7 +24,6 @@ from .types import (
     JobReservation,
     JobStatus,
     ScheduleKind,
-    clear_reservation,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,12 +48,16 @@ class SchedulerTimer:
         max_concurrent: int = 3,
         max_catchup: int = 5,
         reaper: object | None = None,
+        reservation_owner: str | None = None,
+        reservation_is_active: Callable[[str], bool] | None = None,
     ) -> None:
         self._store = store
         self._handlers = handlers
         self._max_concurrent = max_concurrent
         self._max_catchup = max_catchup
         self._reaper = reaper
+        self._reservation_owner = reservation_owner or f"scheduler:{uuid.uuid4()}"
+        self._reservation_is_active = reservation_is_active
         self._running: dict[str, asyncio.Task] = {}
         self._loop_task: asyncio.Task | None = None
         self._started = False
@@ -83,22 +89,34 @@ class SchedulerTimer:
         # executions cannot survive a restart, but pause/resume may have kept
         # their reservation while preserving the requested lifecycle state.
         recovered_ids: set[str] = set()
-        for job in await self._store.list_active():
-            was_running = job.status == JobStatus.RUNNING
-            if not was_running and not job.reservation_token:
-                continue
-            if was_running:
-                recovered_ids.add(job.id)
-                job.status = JobStatus.PENDING
-            job.updated_at = now
-            clear_reservation(job)
-            await self._store.save(job)
-            logger.info(
-                "startup_reset_stale id=%s name=%s previous_status=%s",
-                job.id,
-                job.name,
-                JobStatus.RUNNING.value if was_running else job.status.value,
-            )
+        for snapshot in await self._store.list_active():
+            job: CronJob | None = snapshot
+            while job is not None:
+                was_running = job.status == JobStatus.RUNNING
+                running = self._running.get(job.id)
+                active_owner = (
+                    job.reserved_by == self._reservation_owner
+                    and running is not None and not running.done()
+                ) or (
+                    self._reservation_is_active is not None
+                    and self._reservation_is_active(job.reserved_by)
+                )
+                if (
+                    (not was_running and not job.reservation_token)
+                    or active_owner
+                ):
+                    break
+                # A manual run can start before deferred Gateway warmup. Never
+                # clear its owner; retry only genuinely stale recovery snapshots.
+                if await self._store.recover_reservation(job, now):
+                    if was_running:
+                        recovered_ids.add(job.id)
+                    logger.info(
+                        "startup_reset_stale id=%s name=%s previous_status=%s",
+                        job.id, job.name, job.status.value,
+                    )
+                    break
+                job = await self._store.get(job.id)
 
         # Step 2: collect missed jobs
         missed: list[CronJob] = []
@@ -122,7 +140,7 @@ class SchedulerTimer:
                     job.id,
                     now,
                     source="startup",
-                    owner="scheduler-startup",
+                    owner=self._reservation_owner,
                 )
                 if isinstance(reservation, JobReservation):
                     reservations.append(reservation)
@@ -151,9 +169,11 @@ class SchedulerTimer:
                 # Leave AT jobs as-is — they'll be picked up on next tick
                 continue
             try:
+                previous = deepcopy(job)
                 job.next_run_at = _next_run(job, now)
-                job.updated_at = now
-                await self._store.save(job)
+                job.updated_at = max(now, previous.updated_at + timedelta(microseconds=1))
+                if not await self._store.update_configuration(job, previous):
+                    continue
                 logger.info("startup_fast_forward id=%s next_run=%s", job.id, job.next_run_at)
             except Exception:
                 logger.exception("startup_fast_forward_error id=%s", job.id)
@@ -231,7 +251,7 @@ class SchedulerTimer:
                     job.id,
                     now,
                     source="timer",
-                    owner="scheduler-timer",
+                    owner=self._reservation_owner,
                 )
                 if not isinstance(reservation, JobReservation):
                     logger.info(

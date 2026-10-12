@@ -1180,6 +1180,12 @@ export function useChatStream(options: UseChatStreamOptions) {
     if (typeof document === 'undefined') return
     if (document.hidden) clearStreamIdleTimer()
     else resetStreamIdleTimer({ progress: false })
+    if (renderDirty) {
+      // A frame already queued in the foreground may never run while hidden.
+      // Keep its unpublished deltas and move them to the current scheduler.
+      cancelRenderSchedule()
+      scheduleRender()
+    }
   }
 
   if (typeof document !== 'undefined') {
@@ -1527,6 +1533,10 @@ export function useChatStream(options: UseChatStreamOptions) {
 
   function clearRenderTimer() {
     renderDirty = false
+    cancelRenderSchedule()
+  }
+
+  function cancelRenderSchedule() {
     if (renderRaf !== null) {
       if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(renderRaf)
       renderRaf = null

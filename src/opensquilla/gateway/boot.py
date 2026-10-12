@@ -624,6 +624,10 @@ class ServiceContainer:
         an in-flight cron job or heartbeat tick can drive TurnRunner ->
         TurnCaptureService.capture_turn against an already-closed store.
         """
+        skill_management_service = self.skill_management_service
+        if skill_management_service is not None:
+            if not await skill_management_service.close():
+                raise RuntimeError("Skill installation settlement did not complete")
         # Desktop warmups may enter the catalog refresh boundary after first
         # paint. Stop that producer before closing the coordinator so a task
         # which has not started yet cannot recreate a fresh global coordinator
@@ -2407,6 +2411,8 @@ class GatewayServer:
         reason: str = "shutdown",
     ) -> TaskRuntimeShutdownResult | None:
         """Gracefully shut down: stop channels, broadcast shutdown, close WS, stop server."""
+        from opensquilla.skills.hub.management import SkillManagementService
+
         deadline = time.monotonic() + gateway_shutdown_deadline()
         def remaining(limit: float | None = None) -> float:
             budget = max(0.0, deadline - time.monotonic())
@@ -2416,6 +2422,15 @@ class GatewayServer:
         runtime_shutdown_clean = bool(
             self._services is None or getattr(self._services, "task_runtime", None) is None
         )
+        skill_management_service = (
+            getattr(self._services, "skill_management_service", None)
+            if self._services is not None else None
+        )
+        if isinstance(skill_management_service, SkillManagementService):
+            # Cancellation of close itself must not release the profile lease
+            # before this owner's explicit drain has reported success.
+            runtime_shutdown_clean = False
+        skills_shutdown_clean = True
         try:
             # Fence optional integration startup before draining/stopping the
             # core.  Otherwise a late channel/MCP completion could race the
@@ -2467,6 +2482,18 @@ class GatewayServer:
             # stopped below but stateful dependencies stay open until the process
             # watchdog terminates the Gateway.
             drain_budget = gateway_graceful_timeout()
+            if isinstance(skill_management_service, SkillManagementService):
+                try:
+                    skills_shutdown_clean = await skill_management_service.close(
+                        timeout=remaining(drain_budget),
+                    )
+                except Exception:
+                    skills_shutdown_clean = False
+                    log.exception("gateway.skill_install_shutdown_failed")
+                runtime_shutdown_clean = bool(
+                    skills_shutdown_clean
+                    and (self._services is None or self._services.task_runtime is None)
+                )
             goal_service = (
                 getattr(self._services, "goal_service", None)
                 if self._services is not None
@@ -2483,7 +2510,8 @@ class GatewayServer:
                         graceful=True, graceful_timeout=remaining(drain_budget)
                     )
                     runtime_shutdown_clean = (
-                        runtime_shutdown_result is None or runtime_shutdown_result.clean
+                        skills_shutdown_clean
+                        and (runtime_shutdown_result is None or runtime_shutdown_result.clean)
                     )
                 except Exception:
                     runtime_shutdown_clean = False
@@ -2496,6 +2524,17 @@ class GatewayServer:
                         remaining_auxiliary_count=0,
                     )
                     log.exception("gateway.task_runtime_shutdown_failed")
+
+            if not skills_shutdown_clean:
+                runtime_shutdown_result = (
+                    replace(runtime_shutdown_result, clean=False)
+                    if runtime_shutdown_result is not None else TaskRuntimeShutdownResult(
+                        clean=False, elapsed_ms=0, abandoned_task_count=0,
+                        remaining_driver_count=0, remaining_reservation_count=0,
+                        remaining_auxiliary_count=0,
+                    )
+                )
+                log.error("gateway.skill_install_shutdown_incomplete")
 
             if runtime_shutdown_result is not None and not runtime_shutdown_result.clean:
                 log.error(
@@ -2995,6 +3034,14 @@ async def build_services(
             duration_ms=_elapsed_monotonic_ms(migrations_started_at),
         )
 
+        # Named authority is checked on every request, but schema maintenance
+        # runs once during durable service startup. Direct TokenStore callers
+        # (CLI and management operations) retain explicit eager preparation.
+        if config.state_dir:
+            from opensquilla.gateway.token_store import TokenStore
+
+            await _run_startup_worker(TokenStore, Path(config.state_dir) / "sessions.db")
+
     # ── Agent registry (built early so SessionManager can resolve agent configs) ─
     from opensquilla.agents.registry import AgentRegistry
 
@@ -3056,7 +3103,7 @@ async def build_services(
             )
             if active is None or getattr(active, "_sandbox_run_context_fresh", False):
                 setattr(tool_context, "_sandbox_run_context_fresh", True)
-            pin_sandbox_policy(tool_context, config)
+            await asyncio.to_thread(pin_sandbox_policy, tool_context, config)
             return tool_context
 
         session_manager = SessionManager(
@@ -3483,8 +3530,11 @@ async def build_services(
             }
         )
         profile_home = default_opensquilla_home()
-        if profile_operation_lock_held_by_current_thread(profile_home):
-            recovery_diagnostics = recover_pending_skill_transaction(
+        profile_writer_lease = profile_operation_lock_held_by_current_thread(profile_home)
+        if profile_writer_lease:
+            from opensquilla.skills.hub.operations import run_operation_worker
+
+            recovery_diagnostics = await run_operation_worker(recover_pending_skill_transaction,
                 managed_dir=managed_skill_dir,
                 lockfile_path=profile_home / "skills-lock.json",
                 journal_path=skill_journal_path,
@@ -3556,6 +3606,10 @@ async def build_services(
             offline=False,
             startup_recovery_diagnostics=recovery_diagnostics,
         )
+        if profile_writer_lease:
+            await skill_management_service.prepare_install_operations(
+                recover_orphans=not managed_recovery_required,
+            )
 
         create_skill_tools(
             skill_loader,

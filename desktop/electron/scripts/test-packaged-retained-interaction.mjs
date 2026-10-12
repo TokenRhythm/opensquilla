@@ -14,6 +14,7 @@ import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js
 import { assertNoExistingDesktop, assertPreservedInputs, assertStopEvidence, auditMessages, sha256, verifyAuditInputs } from './fixtures/packaged-retained-interaction/contract.mjs'
 import { installRetainedRpcProbe } from './fixtures/packaged-retained-interaction/browser-probe.mjs'
 import { startRetainedProvider } from './fixtures/packaged-retained-interaction/provider.mjs'
+import { collectRetainedGatewayDiagnostics } from './fixtures/packaged-retained-interaction/diagnostics.mjs'
 
 // This is an opt-in native probe. It never creates/reconfigures a Desktop
 // profile, installs software, or weakens the existing fresh-profile gate.
@@ -80,7 +81,9 @@ async function launch(name) {
   const app = await electron.launch({
     executablePath: plan.executablePath,
     args: ['--use-mock-keychain', `--user-data-dir=${plan.userDataDir}`],
-    env: { ...env, OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain', OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1', OPENSQUILLA_RECOVERY_OFFLINE: '1', OPENSQUILLA_TESTING: '0', GITHUB_ACTIONS: '0', NO_PROXY: '127.0.0.1,localhost,::1', no_proxy: '127.0.0.1,localhost,::1' },
+    // This synthetic fixture enables existing payload-free transaction timings
+    // (256 records per storage instance); SQL and probe budgets stay unchanged.
+    env: { ...env, OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain', OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1', OPENSQUILLA_RECOVERY_OFFLINE: '1', OPENSQUILLA_STORAGE_DIAGNOSTICS: '1', OPENSQUILLA_TESTING: '0', GITHUB_ACTIONS: '0', NO_PROXY: '127.0.0.1,localhost,::1', no_proxy: '127.0.0.1,localhost,::1' },
     timeout: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + timeoutMs,
   })
   active = { app, name }
@@ -170,7 +173,7 @@ try {
   await mkdir(plan.outputDir)
   outputCreated = true
   Object.assign(report, { auditId: plan.auditId, sourceSha: plan.sourceSha, executableSha256: plan.executableSha256, credentialSha256: plan.credentialSha256, configSha256: plan.configSha256, markerSha256: plan.markerSha256 })
-  report.probeSources = await Promise.all(['test-packaged-retained-interaction.mjs', 'fixtures/packaged-retained-interaction/contract.mjs', 'fixtures/packaged-retained-interaction/provider.mjs', 'fixtures/packaged-retained-interaction/browser-probe.mjs'].map(async file => ({ file, sha256: sha256(await readFile(join(scriptDir, file))) })))
+  report.probeSources = await Promise.all(['test-packaged-retained-interaction.mjs', 'fixtures/packaged-retained-interaction/contract.mjs', 'fixtures/packaged-retained-interaction/provider.mjs', 'fixtures/packaged-retained-interaction/browser-probe.mjs', 'fixtures/packaged-retained-interaction/diagnostics.mjs'].map(async file => ({ file, sha256: sha256(await readFile(join(scriptDir, file))) })))
   await noExistingDesktop('retained-profile')
   await stage('preservation-before')
   await preserved('before')
@@ -242,6 +245,10 @@ try {
 } catch (error) {
   Object.assign(report, { ok: false, status: 'failed', error: error.message, errorCode: error.code, errorSignal: error.signal, errorKilled: error.killed, failedAt: new Date().toISOString(), provider: provider?.snapshot(), activeProcess: active?.identity })
   await persist()
+  if (outputCreated) {
+    report.gatewayDiagnostics = await captureFirstSendDiagnostic(() => collectRetainedGatewayDiagnostics(plan))
+    await persist()
+  }
   if (active?.page) {
     report.pageErrorCount = active.pageErrors?.length ?? 0
     const rpc = await captureFirstSendDiagnostic(() => snapshot(active.page))

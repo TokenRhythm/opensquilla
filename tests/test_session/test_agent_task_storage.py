@@ -217,6 +217,67 @@ async def test_activation_permit_claim_is_same_db_owner_and_authority_cas(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_reset_does_not_invalidate_a_task_after_its_activation_permit_claim(tmp_path) -> None:
+    storage = SessionStorage(str(tmp_path / "sessions.db"))
+    await storage.connect()
+    key = "agent:main:webchat:reset-after-permit"
+    node = SessionNode(session_key=key, session_id="owner-a", epoch=4)
+    task = AgentTaskRecord(
+        task_id="activation-claimed-before-reset",
+        session_key=key,
+        source_kind="webui",
+        queue_mode="followup",
+        run_kind="web_turn",
+        status=AgentTaskStatus.QUEUED,
+        details={
+            "session_id": node.session_id,
+            "session_epoch": node.epoch,
+            "activation_authority": {
+                "session_id": node.session_id,
+                "session_epoch": node.epoch,
+                "authorization_revision": 7,
+                "permission_fingerprint": "operator.write:v1",
+            },
+        },
+    )
+
+    async def _archive(_snapshot) -> None:
+        return None
+
+    try:
+        await storage.upsert_session(node)
+        await storage.create_agent_task(task)
+        permit = await storage.claim_activation_permit(
+            task.task_id,
+            session_key=key,
+            session_id=node.session_id,
+            session_epoch=node.epoch,
+            authorization_revision=7,
+            permission_fingerprint="operator.write:v1",
+        )
+        assert permit.state == "active"
+
+        replacement = node.model_copy(update={"session_id": "owner-b", "epoch": 5})
+        await storage.reset_session(
+            replacement,
+            expected_session_id=node.session_id,
+            expected_epoch=node.epoch,
+            archive_writer=_archive,
+        )
+
+        persisted = await storage.get_agent_task(task.task_id)
+        assert persisted is not None
+        assert persisted.status == AgentTaskStatus.QUEUED
+        assert persisted.details is not None
+        assert "activation_invalidation" not in persisted.details
+        durable_permit = await storage.get_activation_permit(task.task_id)
+        assert durable_permit is not None
+        assert durable_permit.state == "active"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_activation_permit_requires_queued_task_and_exact_owner(tmp_path) -> None:
     storage = SessionStorage(str(tmp_path / "sessions.db"))
     await storage.connect()

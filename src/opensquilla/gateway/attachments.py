@@ -53,7 +53,7 @@ def register_attachment_routes(
             or request.headers.get("x-opensquilla-session-key")
             or ""
         )
-        from opensquilla.gateway.auth import resolve_auth
+        from opensquilla.gateway.auth import resolve_auth_async
         from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, guest_owns_session_key
         from opensquilla.gateway.origin_guard import extract_http_token
 
@@ -66,7 +66,7 @@ def register_attachment_routes(
             guest_key = request.cookies.get("opensquilla_guest_session")
             if guest_key:
                 auth_params["guestSessionKey"] = guest_key
-            principal = resolve_auth(
+            principal = await resolve_auth_async(
                 config,
                 auth_params,
                 "operator",

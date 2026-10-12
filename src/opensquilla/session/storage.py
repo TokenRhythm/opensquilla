@@ -29,6 +29,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from enum import StrEnum
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, cast
 from uuid import uuid4
@@ -347,8 +348,23 @@ class ActivationPermit:
     schema_version: int = 1
 
 
+class ActivationPermitConflictReason(StrEnum):
+    """Stable causes that are safe for the runtime to classify."""
+
+    SESSION_RESET_INVALIDATED = "session_reset_invalidated"
+
+
 class ActivationPermitConflictError(RuntimeError):
     """The queued task or its authority snapshot no longer matches."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: ActivationPermitConflictReason | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 async def _verify_project_workspace_guard(
@@ -433,6 +449,14 @@ class AgentTaskTerminalConflictError(ValueError):
     def __init__(self, record: AgentTaskRecord) -> None:
         super().__init__("agent task already has a different terminal outcome")
         self.record = record
+
+
+@dataclass(frozen=True, slots=True)
+class AgentTaskSettlementReceipt:
+    """Proof that terminal state and the absence of an active permit committed."""
+
+    task_id: str
+    session_key: str
 
 
 _SQLITE_BUSY_TIMEOUT_MS = 100
@@ -10122,6 +10146,31 @@ class SessionStorage:
                     raise ActivationPermitConflictError(
                         "named-token authorization changed before activation"
                     )
+            invalidation = (
+                task_details.get("activation_invalidation")
+                if isinstance(task_details, Mapping)
+                else None
+            )
+            if isinstance(invalidation, Mapping):
+                replaced_epoch = invalidation.get("replaced_session_epoch")
+                replacement_session_id = invalidation.get("replacement_session_id")
+                replacement_epoch = invalidation.get("replacement_session_epoch")
+                if (
+                    invalidation.get("kind") == "session_reset"
+                    and invalidation.get("replaced_session_id") == session_id
+                    and not isinstance(replaced_epoch, bool)
+                    and replaced_epoch == session_epoch
+                    and isinstance(replacement_session_id, str)
+                    and replacement_session_id
+                    and replacement_session_id != session_id
+                    and not isinstance(replacement_epoch, bool)
+                    and isinstance(replacement_epoch, int)
+                    and replacement_epoch > session_epoch
+                ):
+                    raise ActivationPermitConflictError(
+                        "activation was invalidated by a session reset",
+                        reason=ActivationPermitConflictReason.SESSION_RESET_INVALIDATED,
+                    )
             if not await _matches_session_owner_on_conn(
                 conn,
                 session_key=session_key,
@@ -10692,10 +10741,9 @@ class SessionStorage:
             ):
                 pass
             # Keep the terminal task row and its provider admission permit in
-            # one writer transaction.  TaskRuntime still performs an
-            # idempotent release afterward for compatibility, while this
-            # boundary prevents a SQLite lock between those two calls from
-            # leaving a terminal task with a durable active permit.
+            # one writer transaction. This prevents a SQLite lock between
+            # settlement and a compatibility release from leaving a terminal
+            # task with a durable active permit.
             await conn.execute(
                 """
                 UPDATE activation_permits
@@ -10705,6 +10753,38 @@ class SessionStorage:
                 (fields["finished_at"], task_id, canonicalize_session_key(session_key)),
             )
         return record.model_copy(update=update)
+
+    # Capture the known atomic implementation independently of later public
+    # method overrides, including a class-level compatibility monkeypatch.
+    _atomic_terminal_settle_implementation = settle_agent_task
+
+    async def settle_agent_task_with_receipt(
+        self,
+        task_id: str,
+        **fields: Any,
+    ) -> AgentTaskSettlementReceipt | None:
+        """Settle a task, proving atomic permit release only for this implementation.
+
+        Keep ``settle_agent_task``'s record return contract for existing callers.
+        Overrides may implement a different transaction boundary, so their
+        successful return does not prove permit release. They still execute,
+        and the runtime retains its compatibility release in that case.
+        """
+
+        settle = self.settle_agent_task
+        proves_atomic_release = (
+            getattr(settle, "__func__", None)
+            is SessionStorage._atomic_terminal_settle_implementation
+        )
+        record = await settle(task_id, **fields)
+        if not proves_atomic_release:
+            return None
+        # The transaction context in settle_agent_task has exited successfully;
+        # cancellation or a failed commit cannot reach this receipt boundary.
+        return AgentTaskSettlementReceipt(
+            task_id=record.task_id,
+            session_key=canonicalize_session_key(record.session_key),
+        )
 
     @_serialized_read
     async def list_agent_tasks(
@@ -12766,6 +12846,82 @@ class SessionStorage:
                 (session_id,),
             )
 
+    @staticmethod
+    async def _invalidate_reset_generation_activation_on_conn(
+        conn: Any,
+        *,
+        session_key: str,
+        replaced_session_id: str,
+        replaced_session_epoch: int,
+        replacement_session_id: str,
+        replacement_session_epoch: int,
+        timestamp: int,
+    ) -> None:
+        """Persist a reset-only activation fence for work in the old generation.
+
+        The runtime remains the sole terminal writer.  This marker instead
+        makes the commit-to-activation gap unambiguous: an old queued task
+        that has not yet claimed its provider permit must settle as
+        reset-cancelled, while an unrelated stale owner/authority conflict
+        remains a failure.
+        """
+
+        async with conn.execute(
+            """
+            SELECT task.task_id, task.details
+            FROM agent_tasks AS task
+            WHERE task.session_key = ? AND task.status = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM activation_permits AS permit
+                  WHERE permit.task_id = task.task_id
+                    AND permit.session_key = task.session_key
+                    AND permit.state = 'active'
+              )
+            """,
+            (
+                session_key,
+                AgentTaskStatus.QUEUED.value,
+            ),
+        ) as cur:
+            task_rows = await cur.fetchall()
+        invalidation = {
+            "kind": "session_reset",
+            "replaced_session_id": replaced_session_id,
+            "replaced_session_epoch": replaced_session_epoch,
+            "replacement_session_id": replacement_session_id,
+            "replacement_session_epoch": replacement_session_epoch,
+        }
+        for task_row in task_rows:
+            details_raw = _deserialize_row({"details": task_row["details"]}).get("details")
+            details = dict(details_raw) if isinstance(details_raw, dict) else {}
+            owner_epoch = details.get("session_epoch")
+            if (
+                details.get("session_id") != replaced_session_id
+                or isinstance(owner_epoch, bool)
+                or not isinstance(owner_epoch, int)
+                or owner_epoch != replaced_session_epoch
+                or not isinstance(details.get("activation_authority"), Mapping)
+            ):
+                continue
+            if details.get("activation_invalidation") == invalidation:
+                continue
+            details["activation_invalidation"] = invalidation
+            await conn.execute(
+                """
+                UPDATE agent_tasks
+                SET details = ?, updated_at = ?
+                WHERE task_id = ? AND session_key = ? AND status = ?
+                """,
+                (
+                    _serialize(details),
+                    timestamp,
+                    task_row["task_id"],
+                    session_key,
+                    AgentTaskStatus.QUEUED.value,
+                ),
+            )
+
     async def reset_session(
         self,
         node: SessionNode,
@@ -12860,6 +13016,16 @@ class SessionStorage:
                     session_key=node.session_key,
                     expected_epoch=expected_epoch,
                 )
+            timestamp = _now_ms()
+            await self._invalidate_reset_generation_activation_on_conn(
+                conn,
+                session_key=node.session_key,
+                replaced_session_id=expected_session_id,
+                replaced_session_epoch=expected_epoch,
+                replacement_session_id=node.session_id,
+                replacement_session_epoch=int(node.epoch or 0),
+                timestamp=timestamp,
+            )
             await self._ensure_usage_baseline_for_session_on_conn(
                 conn,
                 session_key=node.session_key,
@@ -12880,7 +13046,6 @@ class SessionStorage:
                 """,
                 (node.session_key,),
             )
-            timestamp = _now_ms()
             active_placeholders = ", ".join(
                 "?" for _ in PLAN_RUN_ACTIVE_STATUSES
             )
@@ -13466,6 +13631,16 @@ class SessionStorage:
                             session_key=session_node.session_key,
                             expected_epoch=previous_epoch,
                         )
+                    timestamp = _now_ms()
+                    await self._invalidate_reset_generation_activation_on_conn(
+                        conn,
+                        session_key=session_node.session_key,
+                        replaced_session_id=reset_from_session_id,
+                        replaced_session_epoch=previous_epoch,
+                        replacement_session_id=session_node.session_id,
+                        replacement_session_epoch=int(session_node.epoch or 0),
+                        timestamp=timestamp,
+                    )
                     await self._ensure_usage_baseline_for_session_on_conn(
                         conn,
                         session_key=session_node.session_key,
@@ -13484,7 +13659,6 @@ class SessionStorage:
                         (session_node.session_key,),
                     )
 
-                    timestamp = _now_ms()
                     active_placeholders = ", ".join(
                         "?" for _ in PLAN_RUN_ACTIVE_STATUSES
                     )

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -62,8 +64,106 @@ async def test_environment_preparation_preserves_context_off_loop(
             await tool("echo ok", env={"OVERRIDE": "caller"})
     finally:
         current_tool_context.reset(token)
-    expected_runtime_calls = 1 if background else 2
+    expected_runtime_calls = 1 if full or background else 2
     assert calls == [*(["runtime"] * expected_runtime_calls), "skills"]
+
+
+@pytest.mark.parametrize("entrypoint", ["foreground", "background", "managed"])
+@pytest.mark.parametrize("caller_env", [None, {}, {"PATH": "caller"}, {"Path": "caller"}])
+async def test_full_environment_resolves_once_after_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    entrypoint: str,
+    caller_env: dict[str, str] | None,
+) -> None:
+    host_env = {"PATH": "host", "HOST_ONLY": "1"}
+    expected_base = (
+        {**host_env, **(caller_env or {})}
+        if entrypoint == "foreground" or caller_env is None
+        else dict(caller_env)
+    )
+    calls: list[str] = []
+    observed: list[dict[str, str]] = []
+    main_thread = threading.get_ident()
+    context = ToolContext(is_owner=True, workspace_dir=str(tmp_path), run_mode="full")
+    policy = StoredSandboxPolicy()
+
+    def apply(environment, *, mode, policy, require_bundled):
+        assert threading.get_ident() != main_thread
+        assert current_tool_context.get() is context
+        assert mode == "full"
+        assert not require_bundled
+        assert policy == active_sandbox_policy().runtimes
+        calls.append("runtime")
+        observed.append(dict(environment))
+        return {**environment, "RUNTIME_READY": "1"}
+
+    def skills(environment):
+        assert threading.get_ident() != main_thread
+        assert environment["RUNTIME_READY"] == "1"
+        calls.append("skills")
+        return {**environment, "SKILLS_READY": "1"}
+
+    def ready(_command, environment, **_kwargs):
+        assert environment["SKILLS_READY"] == "1"
+        expected_path = expected_base.get("Path", expected_base.get("PATH"))
+        if os.name == "nt" and expected_path is not None:
+            assert environment["PATH"] == expected_path
+            assert "Path" not in environment
+        assert environment.get("HOST_ONLY") == expected_base.get("HOST_ONLY")
+        raise EnvironmentReadyError
+
+    monkeypatch.setattr(shell.os, "environ", host_env)
+    monkeypatch.setattr(shell, "get_runtime", lambda: None)
+    monkeypatch.setattr(shell, "apply_bundled_runtime_path", apply)
+    monkeypatch.setattr(shell, "_managed_skill_environment", skills)
+    monkeypatch.setattr(shell, "_append_windows_app_alias_path", lambda *args, **kwargs: None)
+    monkeypatch.setattr(shell, "_runtime_unavailable_envelope", ready)
+    original_env = None if caller_env is None else dict(caller_env)
+    token = current_tool_context.set(context)
+    try:
+        with sandbox_policy_scope(policy), pytest.raises(EnvironmentReadyError):
+            if entrypoint == "background":
+                await shell.background_process("echo ok", env=caller_env)
+            else:
+                await shell.exec_command(
+                    "echo ok", env=caller_env,
+                    **({"yield_time_ms": 0} if entrypoint == "managed" else {}),
+                )
+    finally:
+        current_tool_context.reset(token)
+    assert calls == ["runtime", "skills"]
+    assert observed == [expected_base]
+    assert caller_env == original_env
+    assert host_env == {"PATH": "host", "HOST_ONLY": "1"}
+
+
+async def test_full_fallback_preserves_declared_runtime_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    modes: list[str] = []
+
+    def apply(environment, *, mode, **kwargs):
+        modes.append(mode)
+        return environment
+
+    def ready(*args, **kwargs):
+        raise EnvironmentReadyError
+
+    monkeypatch.setattr(shell, "get_runtime", lambda: None)
+    monkeypatch.setattr(shell, "full_host_access_active", lambda: True)
+    monkeypatch.setattr(shell, "apply_bundled_runtime_path", apply)
+    monkeypatch.setattr(shell, "_managed_skill_environment", lambda env: env)
+    monkeypatch.setattr(shell, "_runtime_unavailable_envelope", ready)
+    token = current_tool_context.set(
+        ToolContext(is_owner=True, workspace_dir=str(tmp_path), run_mode="safe"),
+    )
+    try:
+        with pytest.raises(EnvironmentReadyError):
+            await shell.exec_command("echo ok")
+    finally:
+        current_tool_context.reset(token)
+    assert modes == ["safe"]
 
 
 @pytest.mark.parametrize("full", [False, True])
@@ -237,7 +337,10 @@ async def test_safe_managed_mount_preparation_runs_off_loop(
     monkeypatch.setattr(shell, "_managed_skill_environment", lambda env: env)
     monkeypatch.setattr(shell, "_shell_runtime_preflight", lambda *args, **kwargs: None)
     monkeypatch.setattr(shell, "gate_action", gate)
-    monkeypatch.setattr(shell, "consume_backend_denial_retry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        shell, "consume_backend_denial_retry_async",
+        AsyncMock(side_effect=lambda *args, **kwargs: None),
+    )
     monkeypatch.setattr(shell, "_policy_with_managed_toolchain_mounts", mounts)
     token = current_tool_context.set(context)
     try:

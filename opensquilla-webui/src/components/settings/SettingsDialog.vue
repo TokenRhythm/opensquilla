@@ -106,6 +106,7 @@
           />
           <SettingsSecurityPrivacyPanel
             v-else-if="section === 'securityPrivacy'"
+            ref="securityPrivacyPanel"
             :panel="privacyPanel"
             :loaded="loaded"
             :is-desktop="isDesktop"
@@ -363,6 +364,22 @@ const railRef = ref<HTMLElement | null>(null)
 const panelRef = ref<HTMLElement | null>(null)
 const closeBtn = ref<HTMLButtonElement | null>(null)
 const closeSavePending = ref(false)
+const securityPrivacyPanel = ref<InstanceType<typeof SettingsSecurityPrivacyPanel> | null>(null)
+const sandboxLeavePending = ref(false)
+let sandboxLeaveWork: Promise<boolean> | null = null
+
+function prepareSandboxLeave(): Promise<boolean> {
+  if (sandboxLeaveWork) return sandboxLeaveWork
+  const panel = securityPrivacyPanel.value
+  if (!panel) return Promise.resolve(true)
+  sandboxLeavePending.value = true
+  const work = panel.prepareToLeave().finally(() => {
+    sandboxLeavePending.value = false
+    if (sandboxLeaveWork === work) sandboxLeaveWork = null
+  })
+  sandboxLeaveWork = work
+  return work
+}
 
 // Keep the active section's rail tab in view — on mobile the rail scrolls
 // horizontally, so a deep-linked or later section would otherwise sit off-screen.
@@ -446,10 +463,11 @@ const hasPendingSettingsWrite = computed(() => (
   || closeSavePending.value
 ))
 const settingsInteractionLocked = computed(() => (
-  saveAllPending.value || closeSavePending.value || primaryMutationPending.value
+  saveAllPending.value || closeSavePending.value || primaryMutationPending.value || sandboxLeavePending.value
 ))
 const shouldGuardBrowserUnload = computed(() => (
   hasSettingsExitDraft.value || hasPendingSettingsWrite.value
+  || securityPrivacyPanel.value?.hasUnsettledChanges === true
 ))
 
 function onBeforeUnload(event: BeforeUnloadEvent) {
@@ -502,12 +520,27 @@ const COMPOSITE_HASH_TARGETS: Record<string, string> = {
 // Only replace when the section actually changes — an unconditional replace on
 // first mount would strip an incoming `#provider-<id>` deep-link hash before
 // applyProviderHash could act on it.
-function selectSection(id: string) {
+function selectSection(id: string): boolean | Promise<boolean> {
+  if (settingsInteractionLocked.value) return false
+  const leave = id !== section.value
+    && securityPrivacyPanel.value?.hasUnsettledChanges === true
+    ? prepareSandboxLeave()
+    : null
+  if (leave) {
+    return leave.then(ok => {
+      if (!ok) return false
+      userNavigated = true
+      setSection(id)
+      if (route.params.section !== id) return router.replace({ path: `/settings/${id}` }).then(() => true)
+      return true
+    })
+  }
   userNavigated = true
   setSection(id)
   if (route.params.section !== id) {
     void router.replace({ path: `/settings/${id}` })
   }
+  return true
 }
 
 const SEARCH_TARGET_IDS: Record<string, string> = {
@@ -526,8 +559,7 @@ const SEARCH_TARGET_IDS: Record<string, string> = {
   'settings.sandbox.mode.title': 'settings-security-sandbox',
 }
 
-async function selectSearchResult(id: string, labelKey: string) {
-  selectSection(id)
+async function focusSearchResult(id: string, labelKey: string): Promise<void> {
   await nextTick()
   const panel = panelRef.value
   if (!panel || section.value !== id || settingsInteractionLocked.value) return
@@ -555,6 +587,15 @@ async function selectSearchResult(id: string, labelKey: string) {
   target.scrollIntoView?.({ block: 'nearest', behavior: 'auto' })
   if (!target.matches('input, select, button, [tabindex]')) target.tabIndex = -1
   target.focus({ preventScroll: true })
+}
+
+function selectSearchResult(id: string, labelKey: string) {
+  const selected = selectSection(id)
+  if (selected instanceof Promise) {
+    void selected.then(ok => { if (ok) void focusSearchResult(id, labelKey) })
+    return
+  }
+  if (selected) void focusSearchResult(id, labelKey)
 }
 
 // Resolve aliases and nested destinations. Old URLs are canonicalized with a
@@ -691,7 +732,7 @@ function closeOverlay(restoreFocus = true) {
 // after Vue has replaced the panel so keyboard and screen-reader users do not
 // remain focused on a control that just left the DOM.
 async function openDataMaintenance() {
-  selectSection('dataMigration')
+  if (!(await selectSection('dataMigration'))) return
   await nextTick()
   panelRef.value?.querySelector<HTMLElement>('[data-testid="data-migration-heading"]')?.focus()
 }
@@ -732,6 +773,7 @@ async function saveExitChanges(): Promise<boolean> {
 // them, save them, or discard them.
 async function requestClose(event?: MouseEvent): Promise<boolean> {
   if (hasPendingSettingsWrite.value) return false
+  if (!(await prepareSandboxLeave())) return false
   if (hasSettingsExitDraft.value) {
     const choice = await confirmExitChanges()
     if (choice === 'cancel') return false
@@ -754,8 +796,11 @@ async function requestClose(event?: MouseEvent): Promise<boolean> {
 // stale record and never fire on the real exit.
 const removeLeaveGuard = router.beforeEach(async (to) => {
   if (closing) return true
-  if (to.path === '/settings' || to.path.startsWith('/settings/')) return true
+  if (to.path === '/settings' || to.path.startsWith('/settings/')) {
+    return to.path === route.path || await prepareSandboxLeave()
+  }
   if (hasPendingSettingsWrite.value) return false
+  if (!(await prepareSandboxLeave())) return false
   if (!hasSettingsExitDraft.value) return true
   // requestClose already has the prompt up — hold this navigation instead of
   // stacking a second prompt (useConfirm cancels a pending request).

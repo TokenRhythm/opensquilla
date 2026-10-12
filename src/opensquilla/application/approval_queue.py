@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import ntpath
 import os
@@ -10,17 +11,20 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
+from functools import partial
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from opensquilla.paths import state_dir
 
 VALID_APPROVAL_MODES = frozenset({"auto-approve", "auto-deny", "prompt"})
 VALID_ELEVATED_MODES = frozenset({"on", "bypass", "full"})
 VALID_RUN_MODES = frozenset({"safe", "full"})
+_OperationResult = TypeVar("_OperationResult")
 
 
 def _native_db_path(path: str | Path) -> str:
@@ -135,6 +139,7 @@ class ApprovalQueue:
         self._notification_loop: asyncio.AbstractEventLoop | None = None
         self._sync_lock = threading.RLock()
         self._memory_lock = threading.RLock()
+        self._database_unavailable = False
 
         self._db_path = (
             Path(db_path) if db_path else _default_approval_queue_path()
@@ -192,12 +197,63 @@ class ApprovalQueue:
                 continue
             lock = self._memory_lock if name in memory_names else self._sync_lock
 
-            def guarded(*args: Any, _original=original, _lock=lock, **kwargs: Any) -> Any:
+            def guarded(
+                *args: Any, _original=original, _lock=lock,
+                _uses_database=name in names and name != "close", **kwargs: Any,
+            ) -> Any:
                 with _lock:
+                    if _uses_database:
+                        self._require_database_available()
                     return _original(*args, **kwargs)
 
             guarded._opensquilla_sync_guard = True  # type: ignore[attr-defined]
             setattr(self, name, guarded)
+
+    def _require_database_available(self) -> None:
+        if self._database_unavailable:
+            raise RuntimeError(
+                "Approval queue storage is unavailable after failed transaction cleanup",
+            )
+
+    def _rollback_transaction(self) -> None:
+        try:
+            self._conn.rollback()
+            if self._conn.in_transaction:
+                raise RuntimeError("Approval queue rollback did not settle its transaction")
+        except BaseException as cleanup_error:
+            # A collision retry must not reuse an uncertain connection, even
+            # when the original operation raised sqlite3.IntegrityError.
+            self._database_unavailable = True
+            with suppress(BaseException):
+                self._conn.close()
+            raise RuntimeError(
+                "Approval queue storage is unavailable after failed transaction cleanup",
+            ) from cleanup_error
+
+    @contextmanager
+    def _transaction(self) -> Iterator[None]:
+        """Own exactly one transaction, including cleanup after any failure.
+
+        Public operation guards already serialize this connection. A nested
+        transaction must not roll back a transaction owned by its caller.
+        Existing no-op/idempotent branches may explicitly roll back before
+        inspecting the durable state or returning.
+        """
+        self._require_database_available()
+        connection = self._conn
+        if connection.in_transaction:
+            raise RuntimeError("Approval queue transaction is already active")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield
+            if connection.in_transaction:
+                connection.commit()
+                if connection.in_transaction:
+                    raise RuntimeError("Approval queue commit did not settle its transaction")
+        except BaseException:
+            if not self._database_unavailable and connection.in_transaction:
+                self._rollback_transaction()
+            raise
 
     def _init_schema(self) -> None:
         self._conn.executescript(
@@ -291,29 +347,27 @@ class ApprovalQueue:
         if existing is not None:
             return existing == code
         try:
-            self._conn.execute("BEGIN IMMEDIATE")
-            self._conn.execute(
-                "INSERT INTO channel_approval_codes "
-                "(code, approval_id, namespace, session_key, owner_sender_id, "
-                "origin_channel_name, origin_channel_id, origin_thread_id, "
-                "approver_policy, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    code,
-                    approval_id,
-                    namespace,
-                    session_key,
-                    owner_sender_id,
-                    origin_channel_name,
-                    origin_channel_id,
-                    origin_thread_id,
-                    approver_policy,
-                    time.time(),
-                ),
-            )
-            self._conn.commit()
+            with self._transaction():
+                self._conn.execute(
+                    "INSERT INTO channel_approval_codes "
+                    "(code, approval_id, namespace, session_key, owner_sender_id, "
+                    "origin_channel_name, origin_channel_id, origin_thread_id, "
+                    "approver_policy, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        code,
+                        approval_id,
+                        namespace,
+                        session_key,
+                        owner_sender_id,
+                        origin_channel_name,
+                        origin_channel_id,
+                        origin_thread_id,
+                        approver_policy,
+                        time.time(),
+                    ),
+                )
         except sqlite3.IntegrityError:
-            self._conn.rollback()
             return False
         return True
 
@@ -383,16 +437,25 @@ class ApprovalQueue:
 
     def _release_stale_claims(self) -> None:
         threshold = time.time() - self._claim_ttl_seconds
-        self._conn.execute("BEGIN IMMEDIATE")
-        self._conn.execute(
-            "UPDATE approval_queue "
-            "SET claim_token = NULL, claim_started_at = NULL "
-            "WHERE resolved = 0 "
-            "AND claim_token IS NOT NULL "
-            "AND (claim_started_at IS NULL OR claim_started_at <= ?)",
-            (threshold,),
+        predicate = (
+            "resolved = 0 AND claim_token IS NOT NULL "
+            "AND (claim_started_at IS NULL OR claim_started_at <= ?)"
         )
-        self._conn.commit()
+        # Most reads have nothing to reclaim. Do not acquire SQLite's writer
+        # lock for an empty cleanup; a positive check still uses the original
+        # transaction and rechecks the same predicate after acquiring it.
+        if not self._conn.execute(
+            f"SELECT EXISTS(SELECT 1 FROM approval_queue WHERE {predicate})",
+            (threshold,),
+        ).fetchone()[0]:
+            return
+        with self._transaction():
+            self._conn.execute(
+                "UPDATE approval_queue "
+                "SET claim_token = NULL, claim_started_at = NULL "
+                f"WHERE {predicate}",
+                (threshold,),
+            )
 
     def _serialize_params(self, params: dict | None) -> str:
         return json.dumps(params or {}, ensure_ascii=False, sort_keys=True)
@@ -504,12 +567,47 @@ class ApprovalQueue:
         """Run one durable queue operation off the Gateway event loop.
 
         The single async lock is the queue's maintenance/transaction owner:
-        it prevents two ``to_thread`` calls from sharing one sqlite connection
+        it prevents two workers from sharing one sqlite connection
         while still allowing unrelated Gateway RPCs to continue scheduling.
         """
-        self._notification_loop = asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
+        self._notification_loop = loop
         async with self._async_lock:
-            return await asyncio.to_thread(operation, *args, **kwargs)
+            # An executor Future survives task-wide shutdown cancellation. Keep
+            # the owner until its transaction has committed or rolled back,
+            # even if the caller is cancelled more than once.
+            context = contextvars.copy_context()
+            worker = loop.run_in_executor(None, context.run, partial(operation, *args, **kwargs))
+            cancellation: asyncio.CancelledError | None = None
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError as exc:
+                    if cancellation is None:
+                        cancellation = exc
+                except BaseException:
+                    break
+            try:
+                result = worker.result()
+            except BaseException as exc:
+                if cancellation is not None:
+                    raise cancellation from exc
+                raise
+            if cancellation is not None:
+                raise cancellation
+            return result
+
+    async def run_operation_async(
+        self, operation: Callable[..., _OperationResult], *args: Any, **kwargs: Any,
+    ) -> _OperationResult:
+        """Run a composite approval check/consume under the queue's async owner."""
+        def guarded() -> _OperationResult:
+            # Legacy sync callers share this connection as well. Keep their
+            # mutations outside the complete validation/consume sequence.
+            with self._sync_lock:
+                return operation(*args, **kwargs)
+
+        return cast(_OperationResult, await self._run_async(guarded))
 
     async def request_async(self, namespace: str = "exec", params: dict | None = None) -> str:
         return cast(str, await self._run_async(self.request, namespace, params))
@@ -654,17 +752,15 @@ class ApprovalQueue:
             now = time.time()
             deadline = now + self._timeout if self._timeout else 0.0
             try:
-                self._conn.execute("BEGIN IMMEDIATE")
-                self._conn.execute(
-                    "INSERT INTO approval_queue "
-                    "(approval_id, namespace, params, created_at, resolved, approved, "
-                    "consumed, deadline, resolution, claim_token, claim_started_at) "
-                    "VALUES (?, ?, ?, ?, 0, 0, 0, ?, '', NULL, NULL)",
-                    (approval_id, namespace, payload, now, deadline),
-                )
-                self._conn.commit()
+                with self._transaction():
+                    self._conn.execute(
+                        "INSERT INTO approval_queue "
+                        "(approval_id, namespace, params, created_at, resolved, approved, "
+                        "consumed, deadline, resolution, claim_token, claim_started_at) "
+                        "VALUES (?, ?, ?, ?, 0, 0, 0, ?, '', NULL, NULL)",
+                        (approval_id, namespace, payload, now, deadline),
+                    )
             except sqlite3.IntegrityError:
-                self._conn.rollback()
                 continue
             break
 
@@ -693,28 +789,27 @@ class ApprovalQueue:
 
         payload = self._serialize_params(params)
         self._release_stale_claims()
-        self._conn.execute("BEGIN IMMEDIATE")
-        row = self._get_row(approval_id)
-        if row is None:
-            self._conn.rollback()
-            raise KeyError(f"Approval not found: {approval_id}")
-        entry = self._row_to_entry(row)
-        if entry.resolved or entry.claim_token:
-            self._conn.rollback()
-            raise ValueError(f"Approval is not pending: {approval_id}")
-        became_human_actionable = (
-            entry.params.get("humanActionable") is False
-            and params.get("humanActionable") is True
-        )
-        cursor = self._conn.execute(
-            "UPDATE approval_queue SET params = ? "
-            "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
-            (payload, approval_id),
-        )
-        if cursor.rowcount != 1:
-            self._conn.rollback()
-            raise ValueError(f"Approval params could not be updated: {approval_id}")
-        self._conn.commit()
+        with self._transaction():
+            row = self._get_row(approval_id)
+            if row is None:
+                self._rollback_transaction()
+                raise KeyError(f"Approval not found: {approval_id}")
+            entry = self._row_to_entry(row)
+            if entry.resolved or entry.claim_token:
+                self._rollback_transaction()
+                raise ValueError(f"Approval is not pending: {approval_id}")
+            became_human_actionable = (
+                entry.params.get("humanActionable") is False
+                and params.get("humanActionable") is True
+            )
+            cursor = self._conn.execute(
+                "UPDATE approval_queue SET params = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                (payload, approval_id),
+            )
+            if cursor.rowcount != 1:
+                self._rollback_transaction()
+                raise ValueError(f"Approval params could not be updated: {approval_id}")
         updated_entry = self.get(approval_id)
         self._pending[approval_id] = updated_entry
         if became_human_actionable:
@@ -754,17 +849,12 @@ class ApprovalQueue:
     def _rearm_deadline(self, approval_id: str, deadline: float) -> None:
         """Set a pending request's wall-clock deadline; no-op once resolved."""
         self._release_stale_claims()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        with self._transaction():
             cursor = self._conn.execute(
                 "UPDATE approval_queue SET deadline = ? "
                 "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
                 (deadline, approval_id),
             )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
         if cursor.rowcount != 1:
             return
         entry = self.get(approval_id)
@@ -776,27 +866,26 @@ class ApprovalQueue:
         if seconds <= 0:
             raise ValueError("seconds must be positive")
         self._release_stale_claims()
-        self._conn.execute("BEGIN IMMEDIATE")
-        row = self._get_row(approval_id)
-        if row is None:
-            self._conn.rollback()
-            raise KeyError(f"Approval not found: {approval_id}")
-        entry = self._row_to_entry(row)
-        if entry.claim_token:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            raise ValueError(f"Approval resolution in progress: {approval_id}")
-        if entry.resolved:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            return entry.deadline
-        new_deadline = float(entry.deadline or time.time()) + float(seconds)
-        self._conn.execute(
-            "UPDATE approval_queue SET deadline = ? "
-            "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
-            (new_deadline, approval_id),
-        )
-        self._conn.commit()
+        with self._transaction():
+            row = self._get_row(approval_id)
+            if row is None:
+                self._rollback_transaction()
+                raise KeyError(f"Approval not found: {approval_id}")
+            entry = self._row_to_entry(row)
+            if entry.claim_token:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                raise ValueError(f"Approval resolution in progress: {approval_id}")
+            if entry.resolved:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                return entry.deadline
+            new_deadline = float(entry.deadline or time.time()) + float(seconds)
+            self._conn.execute(
+                "UPDATE approval_queue SET deadline = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                (new_deadline, approval_id),
+            )
         entry = self.get(approval_id)
         self._notify_event("updated", entry)
         return entry.deadline
@@ -809,34 +898,33 @@ class ApprovalQueue:
     ) -> bool | None:
         """Resolve a lapsed request as expired, unless it was extended."""
         self._release_stale_claims()
-        self._conn.execute("BEGIN IMMEDIATE")
-        row = self._get_row(approval_id)
-        if row is None:
-            self._conn.rollback()
-            raise KeyError(f"Approval not found: {approval_id}")
-        entry = self._row_to_entry(row)
-        if entry.claim_token and not force:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            raise ValueError(f"Approval resolution in progress: {approval_id}")
-        if entry.resolved:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            entry._event.set()
-            return entry.approved
-        if not force and entry.deadline > time.time():
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            return None
-        claim_guard = "" if force else " AND claim_token IS NULL"
-        self._conn.execute(
-            "UPDATE approval_queue "
-            "SET resolved = 1, approved = 0, resolution = ?, "
-            "claim_token = NULL, claim_started_at = NULL "
-            f"WHERE approval_id = ? AND resolved = 0{claim_guard}",
-            (RESOLUTION_EXPIRED, approval_id),
-        )
-        self._conn.commit()
+        with self._transaction():
+            row = self._get_row(approval_id)
+            if row is None:
+                self._rollback_transaction()
+                raise KeyError(f"Approval not found: {approval_id}")
+            entry = self._row_to_entry(row)
+            if entry.claim_token and not force:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                raise ValueError(f"Approval resolution in progress: {approval_id}")
+            if entry.resolved:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                entry._event.set()
+                return entry.approved
+            if not force and entry.deadline > time.time():
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                return None
+            claim_guard = "" if force else " AND claim_token IS NULL"
+            self._conn.execute(
+                "UPDATE approval_queue "
+                "SET resolved = 1, approved = 0, resolution = ?, "
+                "claim_token = NULL, claim_started_at = NULL "
+                f"WHERE approval_id = ? AND resolved = 0{claim_guard}",
+                (RESOLUTION_EXPIRED, approval_id),
+            )
         entry = self.get(approval_id)
         entry._event.set()
         self._pending[approval_id] = entry
@@ -895,27 +983,26 @@ class ApprovalQueue:
     ) -> None:
         """Fail-close an approved claim whose side effect could not be applied."""
 
-        self._conn.execute("BEGIN IMMEDIATE")
-        row = self._get_row(approval_id)
-        if row is None:
-            self._conn.rollback()
-            raise KeyError(f"Approval not found: {approval_id}")
-        entry = self._row_to_entry(row)
-        if entry.claim_token != claim_token:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            raise ValueError(f"Approval resolution claim mismatch: {approval_id}")
-        cursor = self._conn.execute(
-            "UPDATE approval_queue "
-            "SET resolved = 1, approved = 0, consumed = 0, resolution = ?, "
-            "claim_token = NULL, claim_started_at = NULL "
-            "WHERE approval_id = ? AND claim_token = ?",
-            (RESOLUTION_EXPIRED, approval_id, claim_token),
-        )
-        if cursor.rowcount != 1:
-            self._conn.rollback()
-            raise ValueError(f"Approval could not be expired: {approval_id}")
-        self._conn.commit()
+        with self._transaction():
+            row = self._get_row(approval_id)
+            if row is None:
+                self._rollback_transaction()
+                raise KeyError(f"Approval not found: {approval_id}")
+            entry = self._row_to_entry(row)
+            if entry.claim_token != claim_token:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                raise ValueError(f"Approval resolution claim mismatch: {approval_id}")
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET resolved = 1, approved = 0, consumed = 0, resolution = ?, "
+                "claim_token = NULL, claim_started_at = NULL "
+                "WHERE approval_id = ? AND claim_token = ?",
+                (RESOLUTION_EXPIRED, approval_id, claim_token),
+            )
+            if cursor.rowcount != 1:
+                self._rollback_transaction()
+                raise ValueError(f"Approval could not be expired: {approval_id}")
         expired = self.get(approval_id)
         expired._event.set()
         self._pending[approval_id] = expired
@@ -931,61 +1018,60 @@ class ApprovalQueue:
         resolution_metadata: dict | None = None,
     ) -> None:
         self._release_stale_claims()
-        self._conn.execute("BEGIN IMMEDIATE")
-        row = self._get_row(approval_id)
-        if row is None:
-            self._conn.rollback()
-            raise KeyError(f"Approval not found: {approval_id}")
-        entry = self._row_to_entry(row)
-        if entry.claim_token:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            raise ValueError(f"Approval resolution in progress: {approval_id}")
-        if entry.resolved:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            entry._event.set()
-            if allow_idempotent and entry.approved == approved:
-                return
-            raise ValueError(f"Approval already resolved: {approval_id}")
-
-        if resolution_metadata:
-            merged_params = dict(entry.params)
-            merged_params.update(resolution_metadata)
-            cursor = self._conn.execute(
-                "UPDATE approval_queue "
-                "SET resolved = 1, approved = ?, resolution = ?, params = ? "
-                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
-                (
-                    1 if approved else 0,
-                    RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
-                    self._serialize_params(merged_params),
-                    approval_id,
-                ),
-            )
-        else:
-            cursor = self._conn.execute(
-                "UPDATE approval_queue "
-                "SET resolved = 1, approved = ?, resolution = ? "
-                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
-                (
-                    1 if approved else 0,
-                    RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
-                    approval_id,
-                ),
-            )
-        if cursor.rowcount != 1:
-            self._conn.rollback()
-            entry = self.get(approval_id)
+        with self._transaction():
+            row = self._get_row(approval_id)
+            if row is None:
+                self._rollback_transaction()
+                raise KeyError(f"Approval not found: {approval_id}")
+            entry = self._row_to_entry(row)
+            if entry.claim_token:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                raise ValueError(f"Approval resolution in progress: {approval_id}")
             if entry.resolved:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
                 entry._event.set()
                 if allow_idempotent and entry.approved == approved:
                     return
                 raise ValueError(f"Approval already resolved: {approval_id}")
-            if entry.claim_token:
-                raise ValueError(f"Approval resolution in progress: {approval_id}")
-            raise ValueError(f"Approval could not be resolved: {approval_id}")
-        self._conn.commit()
+
+            if resolution_metadata:
+                merged_params = dict(entry.params)
+                merged_params.update(resolution_metadata)
+                cursor = self._conn.execute(
+                    "UPDATE approval_queue "
+                    "SET resolved = 1, approved = ?, resolution = ?, params = ? "
+                    "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                    (
+                        1 if approved else 0,
+                        RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
+                        self._serialize_params(merged_params),
+                        approval_id,
+                    ),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "UPDATE approval_queue "
+                    "SET resolved = 1, approved = ?, resolution = ? "
+                    "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                    (
+                        1 if approved else 0,
+                        RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
+                        approval_id,
+                    ),
+                )
+            if cursor.rowcount != 1:
+                self._rollback_transaction()
+                entry = self.get(approval_id)
+                if entry.resolved:
+                    entry._event.set()
+                    if allow_idempotent and entry.approved == approved:
+                        return
+                    raise ValueError(f"Approval already resolved: {approval_id}")
+                if entry.claim_token:
+                    raise ValueError(f"Approval resolution in progress: {approval_id}")
+                raise ValueError(f"Approval could not be resolved: {approval_id}")
 
         entry = self.get(approval_id)
         entry.approved = bool(approved)
@@ -1005,51 +1091,50 @@ class ApprovalQueue:
         self._release_stale_claims()
         token = uuid.uuid4().hex
         now = time.time()
-        self._conn.execute("BEGIN IMMEDIATE")
-        row = self._get_row(approval_id)
-        if row is None:
-            self._conn.rollback()
-            raise KeyError(f"Approval not found: {approval_id}")
-        entry = self._row_to_entry(row)
-        if entry.claim_token:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            raise ValueError(f"Approval resolution in progress: {approval_id}")
-        if entry.resolved:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            entry._event.set()
-            raise ValueError(f"Approval already resolved: {approval_id}")
-        if resolution_metadata:
-            merged_params = dict(entry.params)
-            merged_params.update(resolution_metadata)
-            cursor = self._conn.execute(
-                "UPDATE approval_queue "
-                "SET claim_token = ?, claim_started_at = ?, params = ? "
-                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
-                (
-                    token,
-                    now,
-                    self._serialize_params(merged_params),
-                    approval_id,
-                ),
-            )
-        else:
-            cursor = self._conn.execute(
-                "UPDATE approval_queue "
-                "SET claim_token = ?, claim_started_at = ? "
-                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
-                (token, now, approval_id),
-            )
-        if cursor.rowcount != 1:
-            self._conn.rollback()
-            entry = self.get(approval_id)
-            if entry.resolved:
-                raise ValueError(f"Approval already resolved: {approval_id}")
+        with self._transaction():
+            row = self._get_row(approval_id)
+            if row is None:
+                self._rollback_transaction()
+                raise KeyError(f"Approval not found: {approval_id}")
+            entry = self._row_to_entry(row)
             if entry.claim_token:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
                 raise ValueError(f"Approval resolution in progress: {approval_id}")
-            raise ValueError(f"Approval could not be claimed: {approval_id}")
-        self._conn.commit()
+            if entry.resolved:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                entry._event.set()
+                raise ValueError(f"Approval already resolved: {approval_id}")
+            if resolution_metadata:
+                merged_params = dict(entry.params)
+                merged_params.update(resolution_metadata)
+                cursor = self._conn.execute(
+                    "UPDATE approval_queue "
+                    "SET claim_token = ?, claim_started_at = ?, params = ? "
+                    "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                    (
+                        token,
+                        now,
+                        self._serialize_params(merged_params),
+                        approval_id,
+                    ),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "UPDATE approval_queue "
+                    "SET claim_token = ?, claim_started_at = ? "
+                    "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                    (token, now, approval_id),
+                )
+            if cursor.rowcount != 1:
+                self._rollback_transaction()
+                entry = self.get(approval_id)
+                if entry.resolved:
+                    raise ValueError(f"Approval already resolved: {approval_id}")
+                if entry.claim_token:
+                    raise ValueError(f"Approval resolution in progress: {approval_id}")
+                raise ValueError(f"Approval could not be claimed: {approval_id}")
         self._pending[approval_id] = self.get(approval_id)
         return token
 
@@ -1061,36 +1146,35 @@ class ApprovalQueue:
         *,
         elevated_mode: str | None = None,
     ) -> None:
-        self._conn.execute("BEGIN IMMEDIATE")
-        row = self._get_row(approval_id)
-        if row is None:
-            self._conn.rollback()
-            raise KeyError(f"Approval not found: {approval_id}")
-        entry = self._row_to_entry(row)
-        if entry.resolved:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            entry._event.set()
-            raise ValueError(f"Approval already resolved: {approval_id}")
-        if entry.claim_token != claim_token:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            raise ValueError(f"Approval resolution claim mismatch: {approval_id}")
-        cursor = self._conn.execute(
-            "UPDATE approval_queue "
-            "SET resolved = 1, approved = ?, resolution = ? "
-            "WHERE approval_id = ? AND resolved = 0 AND claim_token = ?",
-            (
-                1 if approved else 0,
-                RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
-                approval_id,
-                claim_token,
-            ),
-        )
-        if cursor.rowcount != 1:
-            self._conn.rollback()
-            raise ValueError(f"Approval could not be finalized: {approval_id}")
-        self._conn.commit()
+        with self._transaction():
+            row = self._get_row(approval_id)
+            if row is None:
+                self._rollback_transaction()
+                raise KeyError(f"Approval not found: {approval_id}")
+            entry = self._row_to_entry(row)
+            if entry.resolved:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                entry._event.set()
+                raise ValueError(f"Approval already resolved: {approval_id}")
+            if entry.claim_token != claim_token:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                raise ValueError(f"Approval resolution claim mismatch: {approval_id}")
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET resolved = 1, approved = ?, resolution = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token = ?",
+                (
+                    1 if approved else 0,
+                    RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
+                    approval_id,
+                    claim_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                self._rollback_transaction()
+                raise ValueError(f"Approval could not be finalized: {approval_id}")
 
         row = self._get_row(approval_id)
         if row is None:
@@ -1109,36 +1193,35 @@ class ApprovalQueue:
         *,
         elevated_mode: str | None = None,
     ) -> None:
-        self._conn.execute("BEGIN IMMEDIATE")
-        row = self._get_row(approval_id)
-        if row is None:
-            self._conn.rollback()
-            raise KeyError(f"Approval not found: {approval_id}")
-        entry = self._row_to_entry(row)
-        if entry.resolved and entry.approved and entry.claim_token is None:
-            self._conn.rollback()
-            entry._event.set()
-            self._pending[approval_id] = entry
-            return
-        if not entry.resolved or not entry.approved:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            raise ValueError(f"Approval is not approved: {approval_id}")
-        if entry.claim_token != claim_token:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            raise ValueError(f"Approval resolution claim mismatch: {approval_id}")
-        cursor = self._conn.execute(
-            "UPDATE approval_queue "
-            "SET claim_token = NULL, claim_started_at = NULL "
-            "WHERE approval_id = ? AND resolved = 1 AND approved = 1 "
-            "AND claim_token = ?",
-            (approval_id, claim_token),
-        )
-        if cursor.rowcount != 1:
-            self._conn.rollback()
-            raise ValueError(f"Approval could not be completed: {approval_id}")
-        self._conn.commit()
+        with self._transaction():
+            row = self._get_row(approval_id)
+            if row is None:
+                self._rollback_transaction()
+                raise KeyError(f"Approval not found: {approval_id}")
+            entry = self._row_to_entry(row)
+            if entry.resolved and entry.approved and entry.claim_token is None:
+                self._rollback_transaction()
+                entry._event.set()
+                self._pending[approval_id] = entry
+                return
+            if not entry.resolved or not entry.approved:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                raise ValueError(f"Approval is not approved: {approval_id}")
+            if entry.claim_token != claim_token:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                raise ValueError(f"Approval resolution claim mismatch: {approval_id}")
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET claim_token = NULL, claim_started_at = NULL "
+                "WHERE approval_id = ? AND resolved = 1 AND approved = 1 "
+                "AND claim_token = ?",
+                (approval_id, claim_token),
+            )
+            if cursor.rowcount != 1:
+                self._rollback_transaction()
+                raise ValueError(f"Approval could not be completed: {approval_id}")
 
         entry = self.get(approval_id)
         entry._event.set()
@@ -1148,27 +1231,26 @@ class ApprovalQueue:
         del elevated_mode
 
     def release_resolution_claim(self, approval_id: str, claim_token: str) -> None:
-        self._conn.execute("BEGIN IMMEDIATE")
-        row = self._get_row(approval_id)
-        if row is None:
-            self._conn.rollback()
-            raise KeyError(f"Approval not found: {approval_id}")
-        entry = self._row_to_entry(row)
-        if entry.resolved:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            return
-        if entry.claim_token != claim_token:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            return
-        self._conn.execute(
-            "UPDATE approval_queue "
-            "SET claim_token = NULL, claim_started_at = NULL "
-            "WHERE approval_id = ? AND resolved = 0 AND claim_token = ?",
-            (approval_id, claim_token),
-        )
-        self._conn.commit()
+        with self._transaction():
+            row = self._get_row(approval_id)
+            if row is None:
+                self._rollback_transaction()
+                raise KeyError(f"Approval not found: {approval_id}")
+            entry = self._row_to_entry(row)
+            if entry.resolved:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                return
+            if entry.claim_token != claim_token:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                return
+            self._conn.execute(
+                "UPDATE approval_queue "
+                "SET claim_token = NULL, claim_started_at = NULL "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token = ?",
+                (approval_id, claim_token),
+            )
         self._pending[approval_id] = self.get(approval_id)
 
     def reopen_resolved_approval(
@@ -1177,64 +1259,62 @@ class ApprovalQueue:
         *,
         expected_approved: bool = True,
     ) -> None:
-        self._conn.execute("BEGIN IMMEDIATE")
-        row = self._get_row(approval_id)
-        if row is None:
-            self._conn.rollback()
-            raise KeyError(f"Approval not found: {approval_id}")
-        entry = self._row_to_entry(row)
-        if not entry.resolved:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            return
-        if entry.approved != expected_approved:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            raise ValueError(f"Approval resolved state mismatch: {approval_id}")
-        self._conn.execute(
-            "UPDATE approval_queue "
-            "SET resolved = 0, approved = 0, consumed = 0, "
-            "resolution = '', claim_token = NULL, claim_started_at = NULL "
-            "WHERE approval_id = ? AND resolved = 1 AND approved = ?",
-            (approval_id, 1 if expected_approved else 0),
-        )
-        self._conn.commit()
+        with self._transaction():
+            row = self._get_row(approval_id)
+            if row is None:
+                self._rollback_transaction()
+                raise KeyError(f"Approval not found: {approval_id}")
+            entry = self._row_to_entry(row)
+            if not entry.resolved:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                return
+            if entry.approved != expected_approved:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                raise ValueError(f"Approval resolved state mismatch: {approval_id}")
+            self._conn.execute(
+                "UPDATE approval_queue "
+                "SET resolved = 0, approved = 0, consumed = 0, "
+                "resolution = '', claim_token = NULL, claim_started_at = NULL "
+                "WHERE approval_id = ? AND resolved = 1 AND approved = ?",
+                (approval_id, 1 if expected_approved else 0),
+            )
         reopened = self.get(approval_id)
         reopened._event.clear()
         self._pending[approval_id] = reopened
 
     def consume(self, approval_id: str) -> None:
         self._release_stale_claims()
-        self._conn.execute("BEGIN IMMEDIATE")
-        row = self._get_row(approval_id)
-        if row is None:
-            self._conn.rollback()
-            raise KeyError(f"Approval not found: {approval_id}")
-        entry = self._row_to_entry(row)
-        if entry.claim_token:
-            self._conn.rollback()
-            self._pending[approval_id] = entry
-            raise ValueError(f"Approval resolution in progress: {approval_id}")
-        if not entry.resolved or not entry.approved:
-            self._conn.rollback()
-            raise ValueError(f"Approval is not approved: {approval_id}")
-        if entry.consumed:
-            self._conn.rollback()
-            raise ValueError(f"Approval already consumed: {approval_id}")
-        cursor = self._conn.execute(
-            "UPDATE approval_queue "
-            "SET consumed = 1 "
-            "WHERE approval_id = ? AND resolved = 1 AND approved = 1 "
-            "AND consumed = 0 AND claim_token IS NULL",
-            (approval_id,),
-        )
-        if cursor.rowcount != 1:
-            self._conn.rollback()
-            entry = self.get(approval_id)
+        with self._transaction():
+            row = self._get_row(approval_id)
+            if row is None:
+                self._rollback_transaction()
+                raise KeyError(f"Approval not found: {approval_id}")
+            entry = self._row_to_entry(row)
+            if entry.claim_token:
+                self._rollback_transaction()
+                self._pending[approval_id] = entry
+                raise ValueError(f"Approval resolution in progress: {approval_id}")
+            if not entry.resolved or not entry.approved:
+                self._rollback_transaction()
+                raise ValueError(f"Approval is not approved: {approval_id}")
             if entry.consumed:
+                self._rollback_transaction()
                 raise ValueError(f"Approval already consumed: {approval_id}")
-            raise ValueError(f"Approval is not approved: {approval_id}")
-        self._conn.commit()
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET consumed = 1 "
+                "WHERE approval_id = ? AND resolved = 1 AND approved = 1 "
+                "AND consumed = 0 AND claim_token IS NULL",
+                (approval_id,),
+            )
+            if cursor.rowcount != 1:
+                self._rollback_transaction()
+                entry = self.get(approval_id)
+                if entry.consumed:
+                    raise ValueError(f"Approval already consumed: {approval_id}")
+                raise ValueError(f"Approval is not approved: {approval_id}")
         entry = self.get(approval_id)
         self._pending.pop(approval_id, None)
 

@@ -6696,6 +6696,7 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
             AuthorizationDecision,
             TokenStore,
             permission_fingerprint,
+            run_auth_database_operation,
         )
 
         principal = self._principal
@@ -6726,9 +6727,9 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
                     accepted=False,
                 )
             try:
-                store = TokenStore(Path(state_dir) / "sessions.db")
-                decision: AuthorizationDecision = (
-                    await store.get_active_authorization_decision_async(public_id)
+                decision: AuthorizationDecision = await run_auth_database_operation(
+                    lambda: TokenStore(Path(state_dir) / "sessions.db", initialize=False)
+                    .get_active_authorization_decision(public_id),
                 )
             except Exception as exc:  # noqa: BLE001 - explicit unavailable state
                 raise RpcHandlerError(

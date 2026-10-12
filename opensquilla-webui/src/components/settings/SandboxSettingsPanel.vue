@@ -429,7 +429,10 @@ const {
   adoptSavedDefaultRunMode,
   scheduleSectionSave,
   flushSectionSave,
+  hasUnsettledChanges,
+  prepareToLeave,
 } = useSandboxSettings()
+defineExpose({ hasUnsettledChanges, prepareToLeave })
 const sandboxSetupStore = useSandboxSetupStore()
 const {
   ensuring: sandboxSetupPending,

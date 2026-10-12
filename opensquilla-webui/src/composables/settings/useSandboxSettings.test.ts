@@ -243,6 +243,115 @@ afterEach(() => {
 })
 
 describe('useSandboxSettings auto-save', () => {
+  it('flushes debounce before leaving without waiting for runtime status', async () => {
+    vi.useFakeTimers()
+    const { operations, scope, settings } = await createSandboxSettings({
+      runtimeStatus: () => new Promise(() => {}),
+    })
+    await settings.load()
+    settings.draft.value!.network.blockAllNetwork = true
+    settings.scheduleSectionSave('network')
+    expect(settings.hasUnsettledChanges.value).toBe(true)
+
+    await expect(settings.prepareToLeave()).resolves.toBe(true)
+    expect(operations.updatePolicy).toHaveBeenCalledOnce()
+    expect(settings.hasUnsettledChanges.value).toBe(false)
+    await vi.advanceTimersByTimeAsync(500)
+    expect(operations.updatePolicy).toHaveBeenCalledOnce()
+    scope.stop()
+  })
+
+  it('drains a save appended by an edit during an existing save', async () => {
+    const saves: Array<{ candidate: SandboxPolicy, resolve: (value: SandboxPolicy) => void }> = []
+    const { scope, settings } = await createSandboxSettings({
+      policyUpdate: params => new Promise<SandboxPolicy>(resolve => {
+        const candidate = structuredClone(params.policy as SandboxPolicy)
+        candidate.policyVersion = Number(params.basePolicyVersion) + 1
+        saves.push({ candidate, resolve })
+      }),
+    })
+    await settings.load()
+    settings.draft.value!.network.blockAllNetwork = true
+    const initialSave = settings.flushSectionSave('network')
+    await settle()
+    let left = false
+    const preparation = settings.prepareToLeave()
+    expect(settings.prepareToLeave()).toBe(preparation)
+    const leaving = preparation.then(result => { left = true; return result })
+    settings.draft.value!.network.denyDomains.push('new.example.com')
+    settings.scheduleSectionSave('network')
+    saves[0]!.resolve(saves[0]!.candidate)
+    await initialSave
+    await settle()
+    expect(saves).toHaveLength(2)
+    expect(left).toBe(false)
+    expect(saves[1]!.candidate.network.denyDomains).toEqual(['new.example.com'])
+    saves[1]!.resolve(saves[1]!.candidate)
+    await expect(leaving).resolves.toBe(true)
+    expect(settings.hasUnsettledChanges.value).toBe(false)
+    scope.stop()
+  })
+
+  it('keeps the draft and rejects leaving when the flushed save fails', async () => {
+    const { operations, scope, settings } = await createSandboxSettings({
+      policyUpdate: async () => { throw new Error('write rejected') },
+    })
+    await settings.load()
+    settings.draft.value!.network.blockAllNetwork = true
+    settings.scheduleSectionSave('network')
+    await expect(settings.prepareToLeave()).resolves.toBe(false)
+    expect(settings.draft.value!.network.blockAllNetwork).toBe(true)
+    expect(settings.sectionError.network).toBe('write rejected')
+    expect(settings.hasUnsettledChanges.value).toBe(true)
+    expect(operations.updatePolicy).toHaveBeenCalledOnce()
+    scope.stop()
+  })
+
+  it('rejects a conflicting leave save even when the new baseline matches the draft', async () => {
+    const currentPolicy = structuredClone(policy)
+    currentPolicy.policyVersion = 1
+    currentPolicy.network.blockAllNetwork = true
+    const { operations, scope, settings } = await createSandboxSettings({ policyConflict: currentPolicy })
+    await settings.load()
+    settings.draft.value!.network.blockAllNetwork = true
+    await expect(settings.prepareToLeave()).resolves.toBe(false)
+    expect(settings.sectionDirty('network')).toBe(false)
+    expect(settings.draft.value!.network.blockAllNetwork).toBe(true)
+    expect(settings.baseline.value!.policyVersion).toBe(1)
+    expect(operations.updatePolicy).toHaveBeenCalledOnce()
+    scope.stop()
+  })
+
+  it('waits for an already queued mode write before leaving', async () => {
+    let resolveMode!: (value: { runMode: 'safe', source: 'preference' }) => void
+    const { operations, scope, settings } = await createSandboxSettings()
+    operations.selectMode.mockImplementationOnce(() => new Promise(resolve => { resolveMode = resolve }))
+    await settings.load()
+    const saving = settings.setDefaultRunMode('safe')
+    let left = false
+    const leaving = settings.prepareToLeave().then(result => { left = true; return result })
+    await settle()
+    expect(left).toBe(false)
+    expect(settings.hasUnsettledChanges.value).toBe(true)
+    resolveMode({ runMode: 'safe', source: 'preference' })
+    await saving
+    await expect(leaving).resolves.toBe(true)
+    expect(operations.selectMode).toHaveBeenCalledOnce()
+    scope.stop()
+  })
+
+  it('retains a failed mode draft when its write is awaited by leaving', async () => {
+    const { scope, settings } = await createSandboxSettings({ runModeSetError: new Error('mode rejected') })
+    await settings.load()
+    const saving = settings.setDefaultRunMode('safe')
+    const leaving = settings.prepareToLeave()
+    await expect(saving).resolves.toBe(false)
+    await expect(leaving).resolves.toBe(false)
+    expect(settings.defaultRunMode.value).toBe('safe')
+    expect(settings.defaultRunModeBaseline.value).toBe('full')
+    scope.stop()
+  })
+
   it.each(['unavailable', 'setting_up'] as const)(
     'does not offer setup for %s', async setupState => {
       const { operations, scope, settings } = await createSandboxSettings({ desktop: true, setupState })
