@@ -1032,6 +1032,7 @@ def test_skill_hub_contract_is_integrated_into_canonical_ci() -> None:
         "tests/test_skills_hub_streaming.py",
         "tests/test_skills_hub_streaming_faults.py",
         "tests/test_skills/test_hub_management_service.py",
+        "tests/test_skills/test_hub_rollback_serialization.py",
         "tests/test_skills/test_hub_scanner.py",
         "tests/test_skills/test_hub_transaction_recovery.py",
         "tests/test_skills/test_hub_transaction_process_gates.py",

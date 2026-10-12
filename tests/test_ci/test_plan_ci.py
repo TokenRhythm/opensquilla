@@ -1647,10 +1647,13 @@ def test_skill_hub_related_test_change_keeps_three_platform_suite(
     }
 
 
+@pytest.mark.parametrize("path", [
+    "tests/test_skills/test_install_operation_io.py",
+    "tests/test_skills/test_hub_rollback_serialization.py",
+])
 def test_unregistered_skill_hub_test_keeps_full_fallback_and_execution_digest(
-    tmp_path: Path, suite_config: dict[str, Any]
+    tmp_path: Path, suite_config: dict[str, Any], path: str,
 ) -> None:
-    path = "tests/test_skills/test_install_operation_io.py"
     first = _plan(tmp_path, suite_config, path)
 
     assert first["full_fallback"] is True
