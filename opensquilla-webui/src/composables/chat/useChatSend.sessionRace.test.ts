@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
-import { ref } from 'vue'
+import { nextTick, ref } from 'vue'
 import type { ChatMessage, ChatPendingItem } from '@/types/chat'
 import { TurnCommandError, type TurnSendRequest, type TurnSendResponse, type TurnReceiptResult } from '@/modules/turnCommands'
 import { createPendingQueuePolicy } from '@/utils/chat/pendingQueuePolicy'
 import { decideSendResponseSession, type UseChatSendOptions } from './useChatSend'
 import { createChatSendHarness, memoryDeliveryWal } from './chatSendTestHarness'
 import { useChatSteerDelivery } from './useChatSteerDelivery'
+import type { DeliveryWalRecord } from '@/utils/chat/pendingInputWal'
 
 vi.mock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast: vi.fn() }) }))
 
@@ -96,6 +97,173 @@ describe('decideSendResponseSession', () => {
       action: 'ignore',
       reason: 'missing_response_session',
     })
+  })
+})
+
+function savedDelivery(id: string, overrides: Partial<DeliveryWalRecord> = {}): DeliveryWalRecord {
+  return {
+    schemaVersion: 2, ownerRequestId: id, deliveryIdentity: 'identity-A',
+    requestSessionKey: 'agent:main:webchat:test', phase: 'unknown', revision: 1, createdAt: 1, updatedAt: 1,
+    request: { kind: 'send', request: { kind: 'new-turn', params: {
+      sessionKey: 'agent:main:webchat:test', message: `original ${id}`,
+      clientRequestId: id, clientMessageId: `message-${id}`,
+    } } },
+    ...overrides,
+  }
+}
+
+describe('current identity delivery recovery', () => {
+  it.each([
+    ['unknown', false], ['unknown', true], ['rejected', false], ['rejected', true],
+  ] as const)('keeps a foreign %s draft isolated while allowing offline new content: changed=%s', async (acceptance, changed) => {
+    const identity = ref<string | null>('identity-A')
+    const offlineIdentity = ref<string | null>(null)
+    const h = queuedSendHarness({ deliveryIdentity: identity, offlineQueueIdentity: offlineIdentity })
+    const originalText = h.options.inputText.value
+    h.commands.send.mockRejectedValueOnce(new TurnCommandError(
+      acceptance === 'unknown' ? 'transport' : 'rejected', 'synthetic original failure', undefined,
+      acceptance === 'unknown' ? null : false, true,
+    ))
+    h.commands.lookupReceipt.mockResolvedValue({ status: 'unsupported' })
+    await h.api.onSend()
+    await h.options.durableDelivery.wake()
+    const originalId = h.commands.send.mock.calls[0]![0].params.clientRequestId!
+    const originalRecord = await h.options.pendingInputWal!.getDelivery!(originalId)
+    identity.value = 'identity-B'
+    offlineIdentity.value = 'identity-B'
+    h.options.inputText.value = changed ? 'new offline message for B' : originalText
+    await h.api.onSend()
+    expect(h.commands.send).toHaveBeenCalledOnce()
+    expect(h.commands.steer).not.toHaveBeenCalled()
+    expect(h.commands.cancel).not.toHaveBeenCalled()
+    expect(h.options.enqueuePendingInput).toHaveBeenCalledTimes(changed ? 1 : 0)
+    if (changed) expect(h.options.enqueuePendingInput).toHaveBeenCalledWith('new offline message for B', undefined, {
+      deliveryIdentity: 'identity-B',
+    })
+    expect(await h.options.pendingInputWal!.getDelivery!(originalId)).toEqual(originalRecord)
+  })
+
+  it('keeps an in-memory stopped acceptance scoped to its identity across a same-key switch', async () => {
+    const identity = ref<string | null>('identity-A')
+    const acceptanceStopPending = ref(false)
+    const h = queuedSendHarness({ deliveryIdentity: identity, acceptanceStopPending })
+    let reject!: (error: Error) => void
+    h.commands.send.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail }))
+    h.commands.lookupReceipt.mockResolvedValue({ status: 'unsupported' })
+    const sending = h.api.onSend()
+    await vi.waitFor(() => expect(h.commands.send).toHaveBeenCalledOnce())
+    h.api.onStop()
+    reject(new TurnCommandError('transport', 'synthetic ACK loss', undefined, null))
+    await sending
+    await h.options.durableDelivery.wake()
+    expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(true)
+    identity.value = 'identity-B'
+    await nextTick()
+    expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(false)
+    expect(h.api.durableStopPendingForCurrentSession.value).toBe(false)
+    expect(acceptanceStopPending.value).toBe(false)
+    h.options.inputText.value = 'new identity message'
+    await h.api.onSend()
+    expect(h.commands.send).toHaveBeenCalledTimes(2)
+    expect(h.options.enqueuePendingInput).not.toHaveBeenCalled()
+    identity.value = 'identity-A'
+    await nextTick()
+    expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(true)
+  })
+
+  it.each(['unknown', 'stop'] as const)('does not let a foreign %s block the same session and restores its projection on switch back', async state => {
+    const wal = memoryDeliveryWal()
+    const record = savedDelivery('original', state === 'stop'
+      ? { phase: 'accepted', response: { taskId: 'original-task' }, stop: { requested: true } } : {})
+    await wal.prepareDelivery!(record)
+    const identity = ref<string | null>('identity-B')
+    const h = queuedSendHarness({ pendingInputWal: wal, deliveryIdentity: identity })
+    await h.options.durableDelivery.wake()
+    expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(false)
+    expect(h.api.durableStopPendingForCurrentSession.value).toBe(false)
+    expect(h.api.acceptanceStopAvailableForCurrentSession.value).toBe(false)
+    expect(h.api.deliveryRecoveryEntries.value).toEqual([])
+    await h.api.onSend()
+    expect(h.commands.send).toHaveBeenCalledOnce()
+    expect(h.options.enqueuePendingInput).not.toHaveBeenCalled()
+    expect(h.commands.lookupReceipt).not.toHaveBeenCalled()
+    expect(await wal.getDelivery!('original')).toEqual(record)
+
+    identity.value = 'identity-A'
+    expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(true)
+    expect(h.api.durableStopPendingForCurrentSession.value).toBe(state === 'stop')
+    expect(h.api.acceptanceStopAvailableForCurrentSession.value).toBe(state === 'unknown')
+    expect(h.api.deliveryRecoveryEntries.value.map(item => item.id)).toEqual(['original'])
+    identity.value = null
+    expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(false)
+    expect(h.api.durableStopPendingForCurrentSession.value).toBe(false)
+    expect(h.api.deliveryRecoveryEntries.value).toEqual([])
+    identity.value = 'identity-B'
+    expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(false)
+  })
+
+  it.each(['budget', 'authority'] as const)('checks a saved %s request after remount without resending it', async reason => {
+    vi.useFakeTimers()
+    try {
+      const wal = memoryDeliveryWal()
+      await wal.prepareDelivery!(savedDelivery('original', reason === 'authority' ? { paused: 'authority' } : {}))
+      const h = queuedSendHarness({ pendingInputWal: wal, deliveryIdentity: ref('identity-A') })
+      const recovery = h.options.durableDelivery.wake()
+      await vi.advanceTimersByTimeAsync(6_000)
+      await recovery
+      const initialReads = h.commands.lookupReceipt.mock.calls.length
+      expect(initialReads).toBe(reason === 'budget' ? 4 : 0)
+      expect(h.api.deliveryRecoveryEntries.value[0]?.waitReason).toBe(reason === 'budget' ? 'budget' : 'permission')
+      await h.api.onSend()
+      expect(h.options.enqueuePendingInput).toHaveBeenCalledOnce()
+      expect(h.commands.send).not.toHaveBeenCalled()
+      h.commands.lookupReceipt.mockResolvedValue({ status: 'found', response: {
+        taskId: 'original-task', sessionKey: h.scope.sessionKey, taskStatus: 'succeeded',
+      } })
+      await h.api.checkDelivery('original')
+      expect(h.commands.lookupReceipt).toHaveBeenCalledTimes(initialReads + 1)
+      expect(h.commands.send).not.toHaveBeenCalled()
+      expect(h.commands.steer).not.toHaveBeenCalled()
+      expect(h.commands.cancel).not.toHaveBeenCalled()
+      expect(h.api.deliveryRecoveryEntries.value).toEqual([])
+      expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(false)
+      expect((await wal.getDelivery!('original'))?.phase).toBe('accepted')
+    } finally { vi.useRealTimers() }
+  })
+
+  it('coalesces duplicate checks and hides in-flight checks when identity or session changes', async () => {
+    const wal = memoryDeliveryWal()
+    await wal.prepareDelivery!(savedDelivery('first', { paused: 'authority' }))
+    await wal.prepareDelivery!(savedDelivery('second', { paused: 'authority' }))
+    const identity = ref<string | null>('identity-A')
+    const h = queuedSendHarness({ pendingInputWal: wal, deliveryIdentity: identity })
+    await h.options.durableDelivery.wake()
+    let finish!: (result: TurnReceiptResult) => void
+    h.commands.lookupReceipt.mockImplementation(() => new Promise(resolve => { finish = resolve }))
+    const checking = h.api.checkDelivery('first')
+    await h.api.checkDelivery('first')
+    await vi.waitFor(() => expect(h.commands.lookupReceipt).toHaveBeenCalledOnce())
+    expect(h.api.checkingDeliveryIds.value).toEqual(['first'])
+    expect(h.api.deliveryRecoveryEntries.value.map(item => item.id)).toEqual(['first', 'second'])
+    identity.value = 'identity-B'
+    await nextTick()
+    expect(h.api.deliveryRecoveryEntries.value).toEqual([])
+    expect(h.api.checkingDeliveryIds.value).toEqual([])
+    await h.api.checkDelivery('second')
+    expect(h.commands.lookupReceipt).toHaveBeenCalledOnce()
+    finish({ status: 'found', response: { taskId: 'original-task', taskStatus: 'succeeded' } })
+    await checking
+    expect(h.commands.send).not.toHaveBeenCalled()
+    identity.value = 'identity-A'
+    h.options.sessionKey.value = 'another-session'
+    expect(h.api.deliveryRecoveryEntries.value).toEqual([])
+    await h.api.checkDelivery('second')
+    expect(h.commands.lookupReceipt).toHaveBeenCalledOnce()
+    h.options.sessionKey.value = h.scope.sessionKey
+    h.commands.lookupReceipt.mockResolvedValue({ status: 'found', response: { taskId: 'second-task', taskStatus: 'succeeded' } })
+    await h.api.checkDelivery('second')
+    expect(h.commands.lookupReceipt).toHaveBeenCalledTimes(2)
+    expect(h.commands.send).not.toHaveBeenCalled()
   })
 })
 

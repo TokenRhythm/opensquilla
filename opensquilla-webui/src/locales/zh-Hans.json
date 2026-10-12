@@ -4619,6 +4619,9 @@
     }
   },
   "deliveryRecovery": {
+    "sessionTitle": "消息状态待确认",
+    "messageNumber": "第 {number} 条消息",
+    "checkStatus": "检查发送状态",
     "label": "待确认交付",
     "count": "有 {count} 项交付结果待确认",
     "show": "查看详情",

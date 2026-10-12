@@ -4535,6 +4535,9 @@
     }
   },
   "deliveryRecovery": {
+    "sessionTitle": "メッセージの状態を確認する必要があります",
+    "messageNumber": "メッセージ {number}",
+    "checkStatus": "送信状況を確認",
     "label": "送信結果の確認待ち",
     "count": "{count} 件の送信結果が確認待ちです",
     "show": "詳細を表示",

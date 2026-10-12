@@ -4535,6 +4535,9 @@
     }
   },
   "deliveryRecovery": {
+    "sessionTitle": "Nachrichtenstatus muss bestätigt werden",
+    "messageNumber": "Nachricht {number}",
+    "checkStatus": "Zustellstatus prüfen",
     "label": "Ausstehende Zustellprüfungen",
     "count": "{count} Zustellergebnisse müssen bestätigt werden",
     "show": "Details anzeigen",
