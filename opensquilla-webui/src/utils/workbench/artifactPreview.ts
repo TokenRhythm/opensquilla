@@ -79,7 +79,7 @@ export function responseMatchesArtifactPreviewKind(
 }
 
 export function renderArtifactMarkdown(markdown: string): string {
-  return renderMarkdownCore(markdown)
+  return renderMarkdownCore(markdown, { images: 'placeholder' })
 }
 
 const RESOURCE_ATTRIBUTE_PATTERN =

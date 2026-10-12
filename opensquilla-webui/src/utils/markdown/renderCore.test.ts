@@ -117,6 +117,16 @@ describe('session features on the shared core', () => {
     expect(renderMarkdownCore('unresolved[^a]')).toContain('unresolved[^a]')
   })
 
+  it('keeps public images in place and resolves private sources only in the workbench adapter', () => {
+    const markdown = '![Public](https://example.com/a.png)\n\n![Private](./a.png)'
+    const ordinary = host(renderMarkdownCore('![Public](https://example.com/a.png)'))
+    expect(ordinary.querySelectorAll('img')).toHaveLength(1)
+    expect(ordinary.querySelector('[data-markdown-image]')).toBeNull()
+    const artifact = host(renderArtifactMarkdown(markdown))
+    expect(artifact.querySelector('img')?.getAttribute('src')).toBe('https://example.com/a.png')
+    expect(artifact.querySelector('[data-markdown-image]')?.getAttribute('data-markdown-image')).toBe('./a.png')
+  })
+
   it('admits only completed diagram fences and honors deferred enhancement', () => {
     for (const language of ['mermaid', 'dot', 'graphviz']) {
       const source = fence('a -> b', language)

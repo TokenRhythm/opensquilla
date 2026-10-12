@@ -80,7 +80,7 @@ export interface ArtifactDocumentProvider {
 export interface WorkbenchResourceProvider {
   available(): boolean
   canImportDocuments(): boolean
-  list(sessionKey: string, options?: { types?: WorkbenchResourceType[]; limit?: number; signal?: AbortSignal }): Promise<WorkbenchResourcesListResponse>
+  list(sessionKey: string, options?: { types?: WorkbenchResourceType[]; limit?: number; signal?: AbortSignal; singlePage?: boolean }): Promise<WorkbenchResourcesListResponse>
   get(sessionKey: string, resource: WorkbenchResourceRef, signal?: AbortSignal): Promise<WorkbenchResource | null>
   open?(sessionKey: string, resource: WorkbenchResourceRef, request: { intent: 'edit-current'; expectedSha256?: string; idempotencyKey: string }, signal?: AbortSignal): Promise<WorkbenchResourceOpenResponse | null>
   createPreview?(sessionKey: string, resource: WorkbenchResourceRef, signal?: AbortSignal): Promise<WorkbenchPreviewResponse | null>
@@ -267,6 +267,8 @@ export interface NativeHtmlArtifactResource {
 
 export interface ArtifactPreviewResourceOptions {
   artifact: () => ArtifactPayload
+  /** Resolve only registered images in the current session, never arbitrary file paths. */
+  resolveMarkdownImage?: (source: string, signal: AbortSignal) => Promise<ArtifactPayload | null>
   createObjectUrl?: (blob: Blob) => string
   htmlCollectionStatus?: () => 'complete' | 'partial' | 'not_applicable'
   htmlLaunchUrl?: () => string
@@ -281,6 +283,8 @@ export interface ArtifactPreviewResourceController {
   errorCode: Ref<ArtifactPreviewResourceErrorCode | null>
   kind: Ref<ArtifactWorkbenchPreviewKind>
   markdownHtml: ShallowRef<string>
+  /** Ready image resources are patched into stable Markdown placeholders. */
+  markdownImages?: ShallowRef<ReadonlyMap<string, string>>
   objectUrl: ShallowRef<string>
   progress: Ref<number | null>
   relativeResources: ShallowRef<string[]>

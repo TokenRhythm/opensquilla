@@ -160,6 +160,28 @@ describe('workbench resource provider', () => {
     )
   })
 
+  it('returns just one resource page for bounded secondary readers without changing the wire request', async () => {
+    const call = vi.fn(async () => ({
+      resources: [{
+        resource: { type: 'deliverable', artifactId: 'chart' },
+        name: 'chart.svg', mime: 'image/svg+xml',
+        capabilities: { preview: true, download: true, edit: false, publish: false },
+        relations: {},
+      }],
+      totalCount: 500, hasMore: true, nextCursor: 'next-page',
+    }))
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
+    const controller = new AbortController()
+    const result = await provider.list('session-a', { types: ['deliverable'], limit: 200, signal: controller.signal, singlePage: true })
+    expect(result.resources).toHaveLength(1)
+    expect(result).toMatchObject({ totalCount: 500, hasMore: true, nextCursor: 'next-page' })
+    expect(call).toHaveBeenCalledExactlyOnceWith(
+      WORKBENCH_RESOURCE_RPC_METHODS.list,
+      { sessionKey: 'session-a', types: ['deliverable'], limit: 200 },
+      expect.objectContaining({ signal: controller.signal }),
+    )
+  })
+
   it('imports a source by explicit user action and preserves the receipt', async () => {
     const call = vi.fn(async () => ({
       document: {

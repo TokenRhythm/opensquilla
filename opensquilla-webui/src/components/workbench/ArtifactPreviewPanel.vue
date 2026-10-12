@@ -206,6 +206,7 @@ import {
   artifactIconName,
 } from '@/utils/chat/artifacts'
 import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
+import { applyMarkdownImageResources, createMarkdownImageResolver } from '@/utils/workbench/markdownImageResources'
 import { useMarkdownEnhancements } from '@/composables/chat/useMarkdownEnhancements'
 
 const props = withDefaults(defineProps<{
@@ -265,6 +266,9 @@ function onHtmlFrameLoad(event: Event) {
 
 const preview = artifactWorkbench.previews.createResource({
   artifact: () => props.artifact,
+  resolveMarkdownImage: artifactWorkbench.resources
+    ? createMarkdownImageResolver(artifactWorkbench.resources, () => props.artifact, () => props.sessionKey)
+    : undefined,
   htmlCollectionStatus: () => props.previewCollectionStatus,
   htmlLaunchUrl: () => props.previewLaunchUrl,
   htmlLeaseState: () => props.previewBlocked
@@ -279,6 +283,10 @@ const preview = artifactWorkbench.previews.createResource({
 })
 
 useMarkdownEnhancements(markdownPreviewEl, { version: () => preview.markdownHtml.value })
+
+watch([markdownPreviewEl, () => preview.markdownImages?.value], ([root, resources]) => {
+  if (root && resources) applyMarkdownImageResources(root, resources)
+}, { flush: 'post' })
 
 const resourceSignature = computed(() => [
   props.artifact.id || '',
@@ -721,6 +729,11 @@ defineExpose({
   max-width: 820px;
   padding: 24px 28px 64px;
   width: 100%;
+}
+
+.artifact-preview__markdown :deep([data-markdown-image] img) {
+  max-width: 100%;
+  height: auto;
 }
 
 .artifact-preview__text {

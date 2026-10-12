@@ -205,6 +205,7 @@ async function readResponseBytes(
   limit: number,
   signal: AbortSignal,
   onProgress: (progress: number | null) => void,
+  onReceived?: (bytes: number) => void,
 ): Promise<Uint8Array> {
   const total = contentLength(response)
   if (total !== null && total > limit) {
@@ -216,6 +217,7 @@ async function readResponseBytes(
   if (!body) {
     onProgress(null)
     const blob = await response.blob()
+    onReceived?.(blob.size)
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
     if (blob.size > limit) throw new ArtifactPreviewTooLargeError()
     return new Uint8Array(await blob.arrayBuffer())
@@ -233,6 +235,7 @@ async function readResponseBytes(
       if (done) break
       if (!value) continue
       received += value.byteLength
+      onReceived?.(received)
       if (received > limit) {
         await reader.cancel()
         throw new ArtifactPreviewTooLargeError()
@@ -262,6 +265,38 @@ function bytesToArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   ) as ArrayBuffer
 }
 
+export const MARKDOWN_IMAGE_BYTE_LIMIT = 5 * 1024 * 1024
+export const MARKDOWN_IMAGES_TOTAL_BYTE_LIMIT = 20 * 1024 * 1024
+export const MARKDOWN_IMAGE_COUNT_LIMIT = 24
+const IMAGE_MIMES = new Set(Object.values(GENERIC_IMAGE_MIME_BY_EXTENSION))
+
+function registeredMarkdownImage(source: string, baseOrigin: string): ArtifactPayload | null {
+  try {
+    const url = new URL(source, baseOrigin)
+    if (url.username || url.password) return null
+    if (!/^\/api\/v1\/(?:artifacts\/[^/]+|attachments\/[a-f\d]{64})$/i.test(url.pathname)) return null
+    // Session authorization comes from the bound transport, never Markdown.
+    url.search = ''
+    url.hash = ''
+    return { download_url: url.href }
+  } catch { return null }
+}
+
+function retainMarkdownImageFallback(placeholder: Element, source: string) {
+  const alt = placeholder.getAttribute('data-markdown-image-alt') || 'Image'
+  placeholder.textContent = alt
+  try {
+    const url = new URL(source)
+    if (url.protocol !== 'https:' || url.username || url.password) return
+    const link = document.createElement('a')
+    link.href = url.href
+    link.textContent = alt
+    link.target = '_blank'
+    link.rel = 'noopener noreferrer'
+    placeholder.replaceChildren(link)
+  } catch { /* Retain visible alt for missing local assets. */ }
+}
+
 export function createArtifactPreviewResource(
   http: Pick<ArtifactPreviewResourceHttpTransport, 'requestBinary'>,
   options: ArtifactPreviewResourceAdapterOptions,
@@ -273,6 +308,7 @@ export function createArtifactPreviewResource(
   const objectUrl = shallowRef('')
   const text = shallowRef('')
   const markdownHtml = shallowRef('')
+  const markdownImages = shallowRef<ReadonlyMap<string, string>>(new Map())
   const relativeResources = shallowRef<string[]>([])
 
   const createObjectUrl = options.createObjectUrl || defaultCreateObjectUrl
@@ -285,6 +321,7 @@ export function createArtifactPreviewResource(
   let stateBeforeSuspend: ArtifactPreviewResourceState = 'idle'
   let nativePayloadDelivered = false
   let objectUrlOwned = false
+  const markdownImageUrls = new Set<string>()
 
   function revokeCurrentObjectUrl() {
     if (!objectUrl.value) return
@@ -297,10 +334,72 @@ export function createArtifactPreviewResource(
 
   function clearOutput() {
     revokeCurrentObjectUrl()
+    for (const url of markdownImageUrls) {
+      try { revokeObjectUrl(url) } catch {}
+    }
+    markdownImageUrls.clear()
+    markdownImages.value = new Map()
     text.value = ''
     markdownHtml.value = ''
     relativeResources.value = []
     nativePayloadDelivered = false
+  }
+
+  function prepareMarkdownDocument(html: string): { html: string; sources: string[] } {
+    const template = document.createElement('template')
+    template.innerHTML = html
+    const placeholders = [...template.content.querySelectorAll('[data-markdown-image]')]
+    const sources = new Set<string>()
+    for (const placeholder of placeholders) {
+      const source = placeholder.getAttribute('data-markdown-image') || ''
+      retainMarkdownImageFallback(placeholder, source)
+      if (sources.size < MARKDOWN_IMAGE_COUNT_LIMIT) sources.add(source)
+    }
+    return { html: template.innerHTML, sources: [...sources].slice(0, MARKDOWN_IMAGE_COUNT_LIMIT) }
+  }
+
+  async function prepareMarkdownImages(sources: string[], baseOrigin: string, signal: AbortSignal): Promise<void> {
+    let received = 0
+    for (const source of sources) {
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
+      if (received < MARKDOWN_IMAGES_TOTAL_BYTE_LIMIT) {
+        try {
+          const remaining = Math.min(MARKDOWN_IMAGE_BYTE_LIMIT, MARKDOWN_IMAGES_TOTAL_BYTE_LIMIT - received)
+          let response: ArtifactPreviewResourceBinaryResponse | null = null
+          let candidate: ArtifactPayload | null = null
+          if (/^data:image\//i.test(source)) {
+            response = inlineWorkbenchAttachmentResponse(source, remaining)
+          } else {
+            candidate = registeredMarkdownImage(source, baseOrigin)
+            // The resolver rejects absolute/network paths and uses one bounded
+            // current-session catalog page. Never walk the user's filesystem.
+            candidate ??= await options.resolveMarkdownImage?.(source, signal) || null
+            if (!candidate || signal.aborted) continue
+            const request = bindArtifactBinaryRequest(http, candidate, { baseOrigin, policy: 'trusted-origin' })
+            if (!request) continue
+            response = await request.execute({ sessionKey: options.sessionKey?.() || '', signal, timeoutMs: 15_000 })
+          }
+          if (signal.aborted) { await cancelResponseBody(response); break }
+          const responseMime = (response.metadata.contentType || '').split(';', 1)[0]!.trim().toLowerCase()
+          const mime = responseMime === 'application/octet-stream' || !responseMime
+            ? GENERIC_IMAGE_MIME_BY_EXTENSION[artifactExtension(String(candidate?.name || ''))] || ''
+            : responseMime
+          if (!IMAGE_MIMES.has(mime)) { await cancelResponseBody(response); continue }
+          const alreadyReceived = received
+          const bytes = await readResponseBytes(response, remaining, signal, () => undefined, count => { received = alreadyReceived + count })
+          if (signal.aborted) break
+          // Even SVG stays in the inert image context; never inline SVG markup.
+          const url = createObjectUrl(new Blob([bytesToArrayBuffer(bytes)], { type: mime }))
+          markdownImageUrls.add(url)
+          // Publish each completed image independently. Never replace the
+          // Markdown HTML after it mounts: diagrams, focus and selection stay.
+          markdownImages.value = new Map(markdownImages.value).set(source, url)
+        } catch (error) {
+          if (signal.aborted || isAbortError(error)) throw error
+          // A single unavailable image does not discard the readable document.
+        }
+      }
+    }
   }
 
   function abortActive() {
@@ -461,8 +560,14 @@ export function createArtifactPreviewResource(
         }
         state.value = missing.length > 0 ? 'missing-resource' : 'ready'
       } else if (nextKind === 'markdown') {
-        markdownHtml.value = renderArtifactMarkdown(new TextDecoder().decode(bytes))
+        const document = prepareMarkdownDocument(renderArtifactMarkdown(new TextDecoder().decode(bytes)))
+        // Text remains readable while optional authorized images arrive. A slow
+        // image must never keep the entire document behind its loading state.
+        markdownHtml.value = document.html
         state.value = 'ready'
+        progress.value = 100
+        await prepareMarkdownImages(document.sources, baseOrigin, controller.signal)
+        if (disposed || suspended || run !== generation) return
       } else if (nextKind === 'text') {
         text.value = new TextDecoder().decode(bytes)
         state.value = 'ready'
@@ -578,6 +683,7 @@ export function createArtifactPreviewResource(
     errorCode,
     kind,
     markdownHtml,
+    markdownImages,
     objectUrl,
     progress,
     relativeResources,

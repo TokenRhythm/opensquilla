@@ -166,6 +166,12 @@ export function createRpcWorkbenchResourceProvider(
         )
         const hasMore = boolAt(response, 'hasMore', 'has_more')
         const nextCursor = stringAt(response, 'nextCursor', 'next_cursor')
+        // Bounded secondary consumers (such as Markdown images) must not walk
+        // an entire old session. Normal Workbench callers keep full pagination.
+        if (options.singlePage) return {
+          resources: [...resources.values()], totalCount,
+          hasMore, nextCursor: nextCursor || null,
+        }
         if (!hasMore) break
         if (!nextCursor || visitedCursors.has(nextCursor)) {
           throw new Error('Workbench resource pagination did not advance.')
