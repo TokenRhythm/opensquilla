@@ -260,17 +260,23 @@ async def test_sessions_send_different_targets_run_concurrent() -> None:
         ("sessions_send", {"session_key": "agent:main:child-a", "message": "one"}),
         ("sessions_send", {"session_key": "agent:main:child-b", "message": "two"}),
     ]
-    intervals: list[tuple[str, str, float, float]] = []
+    started: list[tuple[str, str]] = []
+    completed: list[tuple[str, str]] = []
+    both_started = asyncio.Event()
+    release_tools = asyncio.Event()
 
     async def _handler(tc: ToolCall) -> ToolResult:
         target = str(tc.arguments["session_key"])
-        start = time.monotonic()
-        await asyncio.sleep(_TOOL_SLEEP_S)
-        intervals.append((tc.tool_name, target, start, time.monotonic()))
+        identity = (tc.tool_use_id, target)
+        started.append(identity)
+        if len(started) == len(tool_calls):
+            both_started.set()
+        await release_tools.wait()
+        completed.append(identity)
         return ToolResult(
             tool_use_id=tc.tool_use_id,
             tool_name=tc.tool_name,
-            content="ok",
+            content=f"ok:{target}",
         )
 
     provider = _FixedToolCallArgsProvider(tool_calls)
@@ -281,14 +287,42 @@ async def test_sessions_send_different_targets_run_concurrent() -> None:
         tool_handler=_handler,
     )
 
-    t0 = time.monotonic()
-    await _collect(agent)
-    elapsed = time.monotonic() - t0
+    expected = [(f"tool-{i}", args["session_key"]) for i, (_, args) in enumerate(tool_calls)]
+    turn = asyncio.create_task(_collect(agent))
+    entered = asyncio.create_task(both_started.wait())
+    try:
+        # Both real Agent dispatches must enter before either handler may finish.
+        # The timeout only bounds a broken dispatcher, not acceptable tool latency.
+        done, _ = await asyncio.wait(
+            {turn, entered}, timeout=5, return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert entered in done and entered.result(), f"Sends did not overlap: {started}"
+        assert sorted(started) == expected
+        assert completed == []
+        assert not turn.done()
+        release_tools.set()
+        done, _ = await asyncio.wait({turn}, timeout=5)
+        assert turn in done, "Agent did not finish after both handlers were released"
+        events = turn.result()
+    finally:
+        release_tools.set()
+        for task in (turn, entered):
+            if not task.done():
+                task.cancel()
+        done, pending = await asyncio.wait({turn, entered}, timeout=5)
+        await asyncio.gather(*done, return_exceptions=True)
+        assert not pending, "Tool concurrency test tasks did not settle during cleanup"
 
-    assert elapsed < 0.35, (
-        f"Expected sends to different sessions to overlap, got {elapsed:.3f} s."
-    )
-    assert len(intervals) == len(tool_calls)
+    from opensquilla.engine.types import ToolResultEvent
+
+    assert sorted(completed) == expected
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+    assert [
+        (event.tool_use_id, event.tool_name, event.result, event.is_error) for event in results
+    ] == [
+        (tool_id, "sessions_send", f"ok:{target}", False) for tool_id, target in expected
+    ]
+    assert len(provider.calls) == 2
 
 
 @pytest.mark.asyncio
