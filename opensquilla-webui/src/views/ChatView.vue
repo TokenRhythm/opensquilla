@@ -149,6 +149,12 @@
           @dismiss="chatSessionBootstrap.dismissRecoveryNotice()"
           @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
         />
+        <ChatDeliveryRecoveryStatus
+          v-if="!forkTransition"
+          :entries="chatSend.deliveryRecoveryEntries.value"
+          :checking-ids="chatSend.checkingDeliveryIds.value"
+          @check="chatSend.checkDelivery"
+        />
         <div
           v-if="!forkTransition && showConfirmedEmptySession"
           class="chat-empty"
@@ -904,6 +910,7 @@ import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCent
 import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
 import { GOAL_CONTINUITY_KEY, type GoalContinuity } from '@/modules/goalContinuity'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
+import ChatDeliveryRecoveryStatus from '@/components/chat/ChatDeliveryRecoveryStatus.vue'
 import { useChatHistoryDetails } from '@/composables/chat/useChatHistoryDetails'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
@@ -5675,6 +5682,15 @@ async function forkConversation(throughTurnId?: string) {
     if (sessionKey.value !== parentKey) {
       clearForkTransition(generation)
       return
+    }
+    // The fork result carries only the child key; the sidebar row synthesized
+    // before the next sessions.list snapshot would otherwise have no project
+    // binding and float to the section's top level. Mirror adoptResponseSession:
+    // carry the parent's project onto the child until the durable row confirms it.
+    const forkWorkspaceId = freshTaskDraft.materializedWorkspaceBySession.value[parentKey]
+      || boundWorkspaceId.value
+    if (forkWorkspaceId) {
+      freshTaskDraft.bindMaterializedProjectTask(childKey, forkWorkspaceId)
     }
     forkTransition.value = {
       ...forkTransition.value,

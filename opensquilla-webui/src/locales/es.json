@@ -4535,6 +4535,9 @@
     }
   },
   "deliveryRecovery": {
+    "sessionTitle": "El estado del mensaje necesita confirmación",
+    "messageNumber": "Mensaje {number}",
+    "checkStatus": "Comprobar estado del envío",
     "label": "Comprobaciones de entrega pendientes",
     "count": "Hay {count} resultados de entrega por confirmar",
     "show": "Ver detalles",

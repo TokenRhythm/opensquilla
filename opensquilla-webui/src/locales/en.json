@@ -4620,6 +4620,9 @@
     }
   },
   "deliveryRecovery": {
+    "sessionTitle": "Message status needs confirmation",
+    "messageNumber": "Message {number}",
+    "checkStatus": "Check delivery status",
     "label": "Pending delivery checks",
     "count": "{count} delivery results need confirmation",
     "show": "View details",

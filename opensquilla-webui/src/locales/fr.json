@@ -4535,6 +4535,9 @@
     }
   },
   "deliveryRecovery": {
+    "sessionTitle": "L’état du message reste à confirmer",
+    "messageNumber": "Message {number}",
+    "checkStatus": "Vérifier l’envoi",
     "label": "Vérifications de livraison en attente",
     "count": "{count} résultats de livraison restent à confirmer",
     "show": "Voir les détails",
