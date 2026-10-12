@@ -589,19 +589,21 @@ def _remember_load_baseline(
     cfg.set_persist_snapshot(baseline, raw_payload if raw_payload else None)
 
 
-def _lock_config_file(fh: BinaryIO) -> None:
+def _lock_config_file(fh: BinaryIO, *, blocking: bool = True) -> None:
     if os.name == "nt":
         import msvcrt
 
         msvcrt_mod = cast(Any, msvcrt)
         fh.seek(0)
-        msvcrt_mod.locking(fh.fileno(), msvcrt_mod.LK_LOCK, 1)
+        mode = msvcrt_mod.LK_LOCK if blocking else msvcrt_mod.LK_NBLCK
+        msvcrt_mod.locking(fh.fileno(), mode, 1)
         return
 
     import fcntl
 
     fcntl_mod = cast(Any, fcntl)
-    fcntl_mod.flock(fh.fileno(), fcntl_mod.LOCK_EX)
+    flags = fcntl_mod.LOCK_EX | (0 if blocking else fcntl_mod.LOCK_NB)
+    fcntl_mod.flock(fh.fileno(), flags)
 
 
 def _unlock_config_file(fh: BinaryIO) -> None:
@@ -620,7 +622,7 @@ def _unlock_config_file(fh: BinaryIO) -> None:
 
 
 @contextmanager
-def _config_write_lock(target: Path) -> Iterator[None]:
+def _config_write_lock(target: Path, *, blocking: bool = True) -> Iterator[None]:
     """Serialize read/merge/replace against every shared persister process."""
     lock_path = target.with_name(f".{target.name}.lock")
     fd = os.open(native_io_path(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
@@ -628,7 +630,7 @@ def _config_write_lock(target: Path) -> Iterator[None]:
         os.write(fd, b"\0")
     with os.fdopen(fd, "r+b", buffering=0) as fh:
         settings_save_stage("file_lock_wait")
-        _lock_config_file(fh)
+        _lock_config_file(fh, blocking=blocking)
         settings_save_stage("file_lock_acquired")
         try:
             yield

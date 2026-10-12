@@ -1,5 +1,5 @@
 <template>
-  <div class="msg-ai-text streaming-text-part">
+  <div ref="rootEl" class="msg-ai-text streaming-text-part">
     <template v-for="block in committedBlocks" :key="block.key">
       <div
         v-if="block.kind === 'rich'"
@@ -15,6 +15,9 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import type { RenderMarkdownOptions } from '@/composables/chat/useChatTextRendering'
+import { useMarkdownEnhancements } from '@/composables/chat/useMarkdownEnhancements'
+import { createMarkdownRenderBudget } from '@/utils/markdown/renderCore'
+import { preloadMermaid } from '@/utils/markdown/mermaidRenderer'
 
 const OPEN_BLOCK_LIMIT = 16 * 1024
 const PLAIN_CHUNK_SIZE = 8 * 1024
@@ -44,12 +47,21 @@ type CommittedBlock = RichBlock | PlainBlock
 // ahead of its already-displayed prefix.
 const committedBlocks = ref<CommittedBlock[]>([])
 const tail = ref('')
+const rootEl = ref<HTMLDivElement | null>(null)
+const resetEpoch = ref(0)
+let renderBudget = createMarkdownRenderBudget()
+
+useMarkdownEnhancements(rootEl, {
+  version: () => committedBlocks.value.length,
+  incremental: true,
+  resetVersion: () => resetEpoch.value,
+})
 
 let acceptedRaw = ''
 let committedOffset = 0
 let scanOffset = 0
-let inFence = false
-let inDisplayMath = false
+let fence: { character: string; length: number } | null = null
+let displayMath: '$$' | '\\[' | null = null
 let blockSequence = 0
 
 function resetState(): void {
@@ -58,9 +70,10 @@ function resetState(): void {
   acceptedRaw = ''
   committedOffset = 0
   scanOffset = 0
-  inFence = false
-  inDisplayMath = false
-  blockSequence = 0
+  fence = null
+  displayMath = null
+  resetEpoch.value += 1
+  renderBudget = createMarkdownRenderBudget()
 }
 
 function appendRichBlock(raw: string, endOffset: number): void {
@@ -70,10 +83,13 @@ function appendRichBlock(raw: string, endOffset: number): void {
     committedBlocks.value.push({
       key: `rich-${blockSequence++}`,
       kind: 'rich',
+      // Immutable commits share one budget for the entire live answer. Once
+      // exhausted, later blocks retain complete escaped source.
       html: props.renderMarkdown(blockText, {
-        highlight: false,
+        highlight: true,
         cache: 'none',
-        math: 'defer',
+        math: 'full',
+        budget: renderBudget,
       }),
     })
   }
@@ -110,6 +126,17 @@ function freezeLongOpenTail(raw: string): void {
   }
 }
 
+function scanDisplayMath(line: string): void {
+  for (const marker of line.matchAll(/\$\$|\\\[|\\\]/g)) {
+    const offset = marker.index ?? 0
+    let escapes = 0
+    for (let index = offset - 1; index >= 0 && line[index] === '\\'; index--) escapes += 1
+    if (escapes % 2 === 1) continue
+    if (!displayMath && (marker[0] === '$$' || marker[0] === '\\[')) displayMath = marker[0]
+    else if ((displayMath === '$$' && marker[0] === '$$') || (displayMath === '\\[' && marker[0] === '\\]')) displayMath = null
+  }
+}
+
 function update(raw: string): void {
   raw = String(raw || '')
   if (!raw.startsWith(acceptedRaw)) resetState()
@@ -122,15 +149,25 @@ function update(raw: string): void {
     const line = raw.slice(scanOffset, newline)
     const trimmed = line.trim()
 
-    if (/^(?:```|~~~)/.test(trimmed)) {
-      inFence = !inFence
-    } else if (!inFence) {
-      const mathMarkers = line.match(/\$\$/g)?.length ?? 0
-      if (mathMarkers % 2 === 1) inDisplayMath = !inDisplayMath
+    if (fence) {
+      const closing = /^ {0,3}(`+|~+)[ \t\r]*$/.exec(line)?.[1]
+      if (closing && closing[0] === fence.character && closing.length >= fence.length) fence = null
+    } else if (displayMath) {
+      scanDisplayMath(line)
+    } else {
+      const opening = /^ {0,3}(`{3,}|~{3,})([^\r]*)\r?$/.exec(line)
+      if (opening && (opening[1]![0] !== '`' || !opening[2]!.includes('`'))) {
+        fence = { character: opening[1]![0]!, length: opening[1]!.length }
+        if (/^\s*mermaid(?:\s|$)/i.test(opening[2]!)) preloadMermaid()
+      } else {
+        scanDisplayMath(line)
+      }
     }
 
     scanOffset = lineEnd
-    if (!trimmed && !inFence && !inDisplayMath) appendRichBlock(raw, lineEnd)
+    // Keep the separator boundary: closing a fence alone can still be inside
+    // a continuous Markdown list, whose next item must share the same parse.
+    if (!trimmed && !fence && !displayMath) appendRichBlock(raw, lineEnd)
   }
 
   freezeLongOpenTail(raw)

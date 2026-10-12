@@ -10,14 +10,21 @@ rewritten just to receive the stamp.
 
 from __future__ import annotations
 
+import logging
+import math
+import os
+import subprocess
+import sys
 import tomllib
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 import tomli_w
 
+import opensquilla.gateway.config as gateway_config_module
 import opensquilla.gateway.config_migration as migration_module
 import opensquilla.gateway.rpc_config  # noqa: F401  ensures RPC registration
 from opensquilla.gateway.auth import Principal
@@ -40,6 +47,22 @@ _LEGACY_ENSEMBLE_TIMEOUTS = {
     "proposer_timeout_seconds": 300.0,
     "aggregator_timeout_seconds": 300.0,
 }
+
+_MIGRATING_TOML = (
+    b"# keep my upgrade notes\n"
+    b"port = 18795\n"
+    b"[llm_ensemble]\n"
+    b"enabled = true\n"
+    b"proposer_timeout_seconds = 300.0\n"
+    b"aggregator_timeout_seconds = 300.0\n"
+)
+
+_CONFIG_LOADERS = [
+    GatewayConfig.load,
+    GatewayConfig.load_from_toml,
+    config_store.load_config,
+]
+_CONFIG_LOADER_IDS = ["gateway", "toml", "onboarding"]
 
 
 def _write_toml(path: Path, payload: dict[str, Any]) -> Path:
@@ -160,6 +183,331 @@ def test_migrated_config_write_syncs_before_publication(
 
     assert synced_fds, "the migrated config bytes must reach disk before os.replace"
     assert list(tmp_path.glob("config.toml.backup.*"))
+
+
+def test_migrated_config_write_keeps_concurrent_edits(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    toml_path = tmp_path / "config.toml"
+    raw = (
+        "# keep me\n"
+        "config_version = 1\n"
+        "[gateway]\n"
+        "port = 18795\n"
+        "[sandbox]\n"
+        "auto_setup = true\n"
+    )
+    toml_path.write_text(raw, encoding="utf-8")
+    result = migrate_config_payload(tomllib.loads(raw))
+    assert result.changed
+
+    # Migration persistence must not overwrite an edit made since validation.
+    concurrent_bytes = raw.replace("18795", "18801").encode("utf-8")
+    toml_path.write_bytes(concurrent_bytes)
+
+    with caplog.at_level(logging.WARNING, logger="opensquilla.gateway.config_migration"):
+        migration_module.rewrite_migrated_config_best_effort(toml_path, result)
+
+    assert toml_path.read_bytes() == concurrent_bytes
+    assert not list(tmp_path.glob("config.toml.backup.*"))
+    records = [
+        r for r in caplog.records if getattr(r, "rewrite", None) == "skipped-conflict"
+    ]
+    assert records
+    assert "memory" in records[-1].getMessage()
+
+
+@pytest.mark.parametrize("loader", _CONFIG_LOADERS, ids=_CONFIG_LOADER_IDS)
+@pytest.mark.parametrize("edit", ["value", "invalid", "deleted"])
+def test_upgrade_load_survives_changed_source(
+    loader: Callable[[Path], GatewayConfig],
+    edit: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Only disk persistence is refused; the validated in-memory upgrade loads."""
+    target = tmp_path / "config.toml"
+    target.write_bytes(_MIGRATING_TOML)
+    concurrent_bytes = (
+        _MIGRATING_TOML.replace(b"18795", b"18801")
+        if edit == "value"
+        else b"port = \n"
+    )
+    rewrite = migration_module.rewrite_migrated_config_best_effort
+
+    def edit_then_rewrite(path: Path, migration: Any) -> None:
+        if edit == "deleted":
+            path.unlink()
+        else:
+            path.write_bytes(concurrent_bytes)
+        rewrite(path, migration)
+
+    monkeypatch.setattr(
+        gateway_config_module, "rewrite_migrated_config_best_effort", edit_then_rewrite
+    )
+    monkeypatch.setattr(config_store, "rewrite_migrated_config_best_effort", edit_then_rewrite)
+
+    with caplog.at_level(logging.WARNING, logger="opensquilla.gateway.config_migration"):
+        loaded = loader(target)
+
+    assert loaded.port == 18795
+    assert loaded.llm_ensemble.proposer_timeout_seconds == 3600.0
+    assert loaded.config_version == LATEST_CONFIG_VERSION
+    if edit == "deleted":
+        assert not target.exists()
+    else:
+        assert target.read_bytes() == concurrent_bytes
+    assert not list(tmp_path.glob("config.toml.backup.*"))
+    assert any("memory" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("loader", _CONFIG_LOADERS, ids=_CONFIG_LOADER_IDS)
+def test_upgrade_load_survives_symlink_resolution_race(
+    loader: Callable[[Path], GatewayConfig],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    target = tmp_path / "config.toml"
+    target.write_bytes(_MIGRATING_TOML)
+    rewrite = migration_module.rewrite_migrated_config_best_effort
+    target_io = migration_module.native_io_path(target)
+    original_is_symlink = Path.is_symlink
+
+    def resolve_loop(path: Path, *args: Any, **kwargs: Any) -> Path:
+        raise RuntimeError("synthetic symlink loop after validation")
+
+    def rewrite_after_link_changed(path: Path, migration: Any) -> None:
+        # Inject only after initial parsing and validation have succeeded.
+        with monkeypatch.context() as context:
+            context.setattr(
+                Path, "is_symlink", lambda p: p == target_io or original_is_symlink(p)
+            )
+            context.setattr(Path, "resolve", resolve_loop)
+            rewrite(path, migration)
+
+    monkeypatch.setattr(
+        gateway_config_module, "rewrite_migrated_config_best_effort", rewrite_after_link_changed
+    )
+    monkeypatch.setattr(
+        config_store, "rewrite_migrated_config_best_effort", rewrite_after_link_changed
+    )
+
+    with caplog.at_level(logging.WARNING, logger="opensquilla.gateway.config_migration"):
+        loaded = loader(target)
+
+    assert loaded.port == 18795
+    assert loaded.llm_ensemble.proposer_timeout_seconds == 3600.0
+    assert loaded.config_version == LATEST_CONFIG_VERSION
+    assert target.read_bytes() == _MIGRATING_TOML
+    assert not list(tmp_path.glob("config.toml.backup.*"))
+    assert any(getattr(r, "rewrite", None) == "skipped-conflict" for r in caplog.records)
+
+
+@pytest.mark.parametrize("loader", _CONFIG_LOADERS, ids=_CONFIG_LOADER_IDS)
+@pytest.mark.parametrize("failure_stage", ["lock", "backup", "replace"])
+def test_upgrade_load_does_not_require_migration_write_access(
+    loader: Callable[[Path], GatewayConfig],
+    failure_stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    target = tmp_path / "config.toml"
+    target.write_bytes(_MIGRATING_TOML)
+
+    def write_denied(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError(f"synthetic {failure_stage} denial")
+
+    if failure_stage == "lock":
+        monkeypatch.setattr(config_store, "_lock_config_file", write_denied)
+    elif failure_stage == "backup":
+        monkeypatch.setattr(migration_module, "make_config_backup", write_denied)
+    else:
+        monkeypatch.setattr(migration_module, "atomic_replace_bytes", write_denied)
+
+    with caplog.at_level(logging.WARNING, logger="opensquilla.gateway.config_migration"):
+        loaded = loader(target)
+
+    assert loaded.llm_ensemble.proposer_timeout_seconds == 3600.0
+    assert loaded.config_version == LATEST_CONFIG_VERSION
+    assert target.read_bytes() == _MIGRATING_TOML
+    assert any("memory" in r.getMessage() for r in caplog.records)
+
+
+def test_upgrade_load_does_not_wait_for_another_process_write_lock(tmp_path: Path) -> None:
+    """A locked profile stays loadable, including native Windows locking."""
+    target = tmp_path / "config.toml"
+    target.write_bytes(_MIGRATING_TOML)
+    script = """
+import sys
+import time
+from opensquilla.gateway.config import GatewayConfig
+
+started = time.monotonic()
+config = GatewayConfig.load(sys.argv[1])
+assert time.monotonic() - started < 5, "startup waited for the config write lock"
+assert config.llm_ensemble.proposer_timeout_seconds == 3600.0
+print("upgrade-load-succeeded")
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "src")
+    env["OPENSQUILLA_STATE_DIR"] = str(tmp_path / "isolated-state")
+
+    with config_store._config_write_lock(target):
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(target)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert "upgrade-load-succeeded" in result.stdout
+    assert "memory" in result.stderr
+    assert target.read_bytes() == _MIGRATING_TOML
+    assert not list(tmp_path.glob("config.toml.backup.*"))
+
+
+@pytest.mark.parametrize("loader", _CONFIG_LOADERS, ids=_CONFIG_LOADER_IDS)
+def test_unsupported_lossless_upgrade_uses_safe_full_rewrite(
+    loader: Callable[[Path], GatewayConfig],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    target = tmp_path / "config.toml"
+    target.write_bytes(_MIGRATING_TOML)
+
+    def unsupported_patch(*args: Any, **kwargs: Any) -> bytes:
+        raise migration_module.LosslessTomlPatchError("unsupported TOML layout")
+
+    monkeypatch.setattr(migration_module, "patch_import_config", unsupported_patch)
+
+    with caplog.at_level(logging.WARNING, logger="opensquilla.gateway.config_migration"):
+        loaded = loader(target)
+
+    assert loaded.llm_ensemble.proposer_timeout_seconds == 3600.0
+    written = tomllib.loads(target.read_text(encoding="utf-8"))
+    assert written["config_version"] == LATEST_CONFIG_VERSION
+    backups = list(tmp_path.glob("config.toml.backup.*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == _MIGRATING_TOML
+    assert any(getattr(r, "rewrite", None) == "full-reserialize" for r in caplog.records)
+
+
+@pytest.mark.parametrize("force_fallback", [False, True], ids=["lossless", "fallback"])
+def test_migration_keeps_edit_made_during_temp_fsync(
+    force_fallback: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    target = tmp_path / "config.toml"
+    target.write_bytes(_MIGRATING_TOML)
+    migration = migrate_config_payload(tomllib.loads(_MIGRATING_TOML.decode("utf-8")))
+    concurrent_bytes = _MIGRATING_TOML.replace(b"18795", b"18801")
+    original_fsync = migration_module.os.fsync
+
+    def edit_during_fsync(fd: int) -> None:
+        original_fsync(fd)
+        target.write_bytes(concurrent_bytes)
+
+    monkeypatch.setattr(migration_module.os, "fsync", edit_during_fsync)
+    if force_fallback:
+        def unsupported_patch(*args: Any, **kwargs: Any) -> bytes:
+            raise migration_module.LosslessTomlPatchError("unsupported TOML layout")
+
+        monkeypatch.setattr(migration_module, "patch_import_config", unsupported_patch)
+
+    with caplog.at_level(logging.WARNING, logger="opensquilla.gateway.config_migration"):
+        migration_module.rewrite_migrated_config_best_effort(target, migration)
+
+    assert target.read_bytes() == concurrent_bytes
+    backups = list(tmp_path.glob("config.toml.backup.*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == _MIGRATING_TOML
+    assert not list(tmp_path.glob(".config.toml.*.tmp"))
+    assert any(getattr(r, "rewrite", None) == "skipped-conflict" for r in caplog.records)
+
+
+def test_migration_preserves_concurrent_comment_only_edit(tmp_path: Path) -> None:
+    target = tmp_path / "config.toml"
+    migration = migrate_config_payload(tomllib.loads(_MIGRATING_TOML.decode("utf-8")))
+    target.write_bytes(_MIGRATING_TOML.replace(b"# keep my upgrade notes", b"# newly edited notes"))
+
+    migration_module.rewrite_migrated_config_best_effort(target, migration)
+
+    assert b"# newly edited notes" in target.read_bytes()
+    assert tomllib.loads(target.read_text(encoding="utf-8")) == migration.payload
+
+
+@pytest.mark.parametrize("concurrent_edit", [False, True], ids=["unchanged", "conflict"])
+def test_migration_handles_unchanged_nan_values_without_missing_real_conflicts(
+    concurrent_edit: bool, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    raw = _MIGRATING_TOML + b"\n[operator_notes]\nreading = nan\nvalues = [nan, 1]\n"
+    target = tmp_path / "config.toml"
+    migration = migrate_config_payload(tomllib.loads(raw.decode("utf-8")))
+    disk_bytes = raw.replace(b"18795", b"18801") if concurrent_edit else raw
+    target.write_bytes(disk_bytes)
+
+    with caplog.at_level(logging.WARNING, logger="opensquilla.gateway.config_migration"):
+        migration_module.rewrite_migrated_config_best_effort(target, migration)
+
+    if concurrent_edit:
+        assert target.read_bytes() == disk_bytes
+        assert not list(tmp_path.glob("config.toml.backup.*"))
+        assert any(getattr(r, "rewrite", None) == "skipped-conflict" for r in caplog.records)
+    else:
+        written = tomllib.loads(target.read_text(encoding="utf-8"))
+        assert written["config_version"] == LATEST_CONFIG_VERSION
+        assert written["llm_ensemble"]["proposer_timeout_seconds"] == 3600.0
+        assert math.isnan(written["operator_notes"]["reading"])
+        assert math.isnan(written["operator_notes"]["values"][0])
+        assert written["operator_notes"]["values"][1] == 1
+        backups = list(tmp_path.glob("config.toml.backup.*"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == raw
+
+
+@pytest.mark.parametrize(
+    ("original_value", "edited_value"),
+    [("1", "true"), ("1", "1.0"), ("1.0", "1")],
+    ids=["integer-to-boolean", "integer-to-float", "float-to-integer"],
+)
+def test_migration_keeps_concurrent_toml_type_changes(
+    original_value: str,
+    edited_value: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # NaN exercises the real whole-file fallback rather than a mocked patcher.
+    raw = _MIGRATING_TOML + (
+        "\n[memory]\nmmr_lambda = nan\n"
+        '[llm]\nprovider = "custom"\n'
+        f"[llm.extra_body]\nvalue = {original_value}\n"
+    ).encode()
+    target = tmp_path / "config.toml"
+    migration = migrate_config_payload(tomllib.loads(raw.decode("utf-8")))
+    assert migration.changed
+    GatewayConfig(**migration.payload)
+    disk_bytes = raw.replace(
+        f"value = {original_value}\n".encode(),
+        f"value = {edited_value}\n".encode(),
+    )
+    target.write_bytes(disk_bytes)
+
+    with caplog.at_level(logging.WARNING, logger="opensquilla.gateway.config_migration"):
+        migration_module.rewrite_migrated_config_best_effort(target, migration)
+
+    assert target.read_bytes() == disk_bytes
+    assert not list(tmp_path.glob("config.toml.backup.*"))
+    assert any(getattr(r, "rewrite", None) == "skipped-conflict" for r in caplog.records)
 
 
 def test_config_backups_keep_only_the_newest_n(tmp_path: Path) -> None:
@@ -343,27 +691,60 @@ def test_round_trip_persists_stamp_and_stays_unchanged(tmp_path: Path) -> None:
     assert migrate_config_payload(raw).changed is False
 
 
-def test_migrating_load_writes_stamp_into_rewritten_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize("loader", _CONFIG_LOADERS, ids=_CONFIG_LOADER_IDS)
+def test_migrating_load_writes_stamp_into_rewritten_file(
+    loader: Callable[[Path], GatewayConfig], tmp_path: Path
+) -> None:
     """When a real migration fires, the rewritten file must carry the stamp;
     a missed stamp would re-run the one-time migration on every future load."""
-    toml_path = _write_toml(
-        tmp_path / "config.toml",
-        {"llm_ensemble": dict(_LEGACY_ENSEMBLE_TIMEOUTS)},
-    )
+    toml_path = tmp_path / "config.toml"
+    toml_path.write_bytes(_MIGRATING_TOML)
 
-    cfg = GatewayConfig.load(toml_path)
+    cfg = loader(toml_path)
 
     assert cfg.llm_ensemble.proposer_timeout_seconds == 3600.0
-    assert list(tmp_path.glob("config.toml.backup.*"))
+    backups = list(tmp_path.glob("config.toml.backup.*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == _MIGRATING_TOML
     text = toml_path.read_text(encoding="utf-8")
+    assert "# keep my upgrade notes" in text
     assert f"config_version = {LATEST_CONFIG_VERSION}" in text
     assert "proposer_timeout_seconds = 3600.0" in text
 
     # The stamped file must load cleanly with no further rewrite.
     stamped_bytes = toml_path.read_bytes()
-    again = GatewayConfig.load(toml_path)
+    again = loader(toml_path)
     assert again.llm_ensemble.proposer_timeout_seconds == 3600.0
     assert toml_path.read_bytes() == stamped_bytes
+    assert list(tmp_path.glob("config.toml.backup.*")) == backups
+
+
+@pytest.mark.parametrize("loader_name", ["gateway", "onboarding"])
+def test_read_only_upgrade_never_attempts_persistence(
+    loader_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "config.toml"
+    target.write_bytes(_MIGRATING_TOML)
+
+    def unexpected_rewrite(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("read-only loads must not acquire the write lock or rewrite")
+
+    monkeypatch.setattr(
+        gateway_config_module, "rewrite_migrated_config_best_effort", unexpected_rewrite
+    )
+    monkeypatch.setattr(config_store, "rewrite_migrated_config_best_effort", unexpected_rewrite)
+
+    loaded = (
+        GatewayConfig.load(target, read_only=True)
+        if loader_name == "gateway"
+        else config_store.load_config(target, persist_migrations=False)
+    )
+
+    assert loaded.llm_ensemble.proposer_timeout_seconds == 3600.0
+    assert loaded.config_version == LATEST_CONFIG_VERSION
+    assert target.read_bytes() == _MIGRATING_TOML
+    assert not list(tmp_path.glob("config.toml.backup.*"))
+    assert not (tmp_path / ".config.toml.lock").exists()
 
 
 # ---------------------------------------------------------------------------
