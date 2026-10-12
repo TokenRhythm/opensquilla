@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections import deque
 from typing import Any, cast
 
 from opensquilla.application.observability import (
@@ -33,14 +35,15 @@ class _GatewayLogReaderRuntime(LogReaderPort):
 
         return cast(
             LogStatusResult,
-            read_log_status(
+            await asyncio.to_thread(
+                read_log_status,
                 config=getattr(self._ctx, "config", None),
                 diagnostics_state=getattr(self._ctx, "diagnostics_state", None),
             ),
         )
 
     async def tail(self, query: LogTailQuery) -> LogTailResult:
-        return cast(LogTailResult, read_log_tail(query))
+        return cast(LogTailResult, await asyncio.to_thread(read_log_tail, query))
 
 
 async def _logs_status_contract(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
@@ -61,7 +64,7 @@ async def _handle_logs_trace(params: dict | None, ctx: RpcContext) -> dict[str, 
     if not trace_id:
         return {"trace_id": "", "events": [], "count": 0, "total": 0}
 
-    events = load_trace_events(trace_id)
+    events = await asyncio.to_thread(load_trace_events, trace_id)
     limited = events[-limit:]
     return {
         "trace_id": trace_id,
@@ -81,22 +84,21 @@ def read_log_tail(query: LogTailQuery) -> dict[str, Any]:
     if query.cursor >= file_size:
         return {"lines": [], "cursor": file_size, "has_more": False}
 
+    # Stream the file in a worker and retain only the requested tail. A large
+    # log must not be materialized with readlines(), nor may a byte-window
+    # shortcut hide older matching records when a level filter is applied.
+    lines: deque[str] = deque(maxlen=query.limit)
+    matched = 0
     with open(log_file, encoding="utf-8", errors="replace") as f:
         f.seek(query.cursor)
-        raw_lines = f.readlines()
+        while line := f.readline():
+            if query.level and query.level not in line.upper():
+                continue
+            matched += 1
+            lines.append(line.rstrip())
         new_cursor = f.tell()
 
-    # Apply level filter if specified
-    if query.level:
-        filtered = [ln for ln in raw_lines if query.level in ln.upper()]
-    else:
-        filtered = raw_lines
-
-    # Limit output
-    has_more = len(filtered) > query.limit
-    lines = [ln.rstrip() for ln in filtered[-query.limit :]]
-
-    return {"lines": lines, "cursor": new_cursor, "has_more": has_more}
+    return {"lines": list(lines), "cursor": new_cursor, "has_more": matched > query.limit}
 
 
 async def _logs_tail_contract(params: dict | None, ctx: RpcContext) -> dict[str, Any]:

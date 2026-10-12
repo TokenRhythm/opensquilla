@@ -6,9 +6,11 @@ import copy
 import datetime
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
+import tomllib
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -19,6 +21,7 @@ import tomli_w
 from pydantic import TypeAdapter
 
 from opensquilla.config_version import LATEST_CONFIG_VERSION as LATEST_CONFIG_VERSION
+from opensquilla.lossless_toml import LosslessTomlPatchError, patch_import_config
 from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.search.types import MAX_SEARCH_RESULTS
 
@@ -144,6 +147,9 @@ _LEGACY_SKILL_FILTER_WARNED = False
 @dataclass(frozen=True)
 class ConfigMigrationResult:
     payload: dict[str, Any]
+    # Pre-migration payload exactly as validated at load time, so the write
+    # path can patch the on-disk bytes from it to ``payload``.
+    original: dict[str, Any]
     changes: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     removed_fields: tuple[str, ...] = ()
@@ -153,6 +159,7 @@ class ConfigMigrationResult:
 @dataclass
 class _MigrationBuilder:
     payload: dict[str, Any]
+    original: dict[str, Any]
     changes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     removed_fields: list[str] = field(default_factory=list)
@@ -161,6 +168,7 @@ class _MigrationBuilder:
         changed = bool(self.changes or self.removed_fields)
         return ConfigMigrationResult(
             payload=self.payload,
+            original=self.original,
             changes=tuple(self.changes),
             warnings=tuple(self.warnings),
             removed_fields=tuple(self.removed_fields),
@@ -405,7 +413,7 @@ def migrate_config_payload(
     still reports changes and migration warnings, but no compatibility log,
     process warning, logging record, or process warning sentinel is touched.
     """
-    builder = _MigrationBuilder(payload=copy.deepcopy(data))
+    builder = _MigrationBuilder(payload=copy.deepcopy(data), original=copy.deepcopy(data))
 
     _strip_retired_product_features(builder)
     _strip_removed_sandbox_fields(builder)
@@ -939,8 +947,32 @@ _MIGRATIONS: list[tuple[int, Callable[[_MigrationBuilder], None]]] = [
 ]
 
 
-def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
-    """Atomically replace one TOML config file (same-dir temp, fsync, 0600).
+class ConfigMigrationConflictError(ValueError):
+    """A migration must not replace a config changed since validation."""
+
+
+def _same_toml_payload(left: Any, right: Any) -> bool:
+    """Compare parsed TOML without treating unchanged NaN values as conflicts."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _same_toml_payload(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _same_toml_payload(a, b) for a, b in zip(left, right, strict=True)
+        )
+    if isinstance(left, float) and isinstance(right, float):
+        if math.isnan(left) and math.isnan(right):
+            return True
+    return bool(left == right)
+
+
+def atomic_replace_bytes(
+    target: str | Path, data: bytes, *, expected_bytes: bytes | None = None
+) -> None:
+    """Atomically replace one config file with exact bytes (same-dir temp, fsync, 0600).
 
     Every writer that replaces ``config.toml`` converges on this helper so the
     crash-durability contract lives in exactly one place. The recovery module
@@ -949,19 +981,24 @@ def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
     there.
     """
 
-    target = Path(path)
+    target_path = Path(target)
     fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{target.name}.",
+        prefix=f".{target_path.name}.",
         suffix=".tmp",
-        dir=os.fspath(native_io_path(target.parent)),
+        dir=os.fspath(native_io_path(target_path.parent)),
     )
     try:
         with os.fdopen(fd, "wb") as fh:
-            tomli_w.dump(payload, fh)
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, native_io_path(target))
+        if (
+            expected_bytes is not None
+            and native_io_path(target_path).read_bytes() != expected_bytes
+        ):
+            raise ConfigMigrationConflictError("source config changed while preparing migration")
+        os.replace(tmp_name, native_io_path(target_path))
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -970,25 +1007,76 @@ def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
         raise
 
 
+def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
+    """Atomically replace one TOML config file with serialized ``payload``.
+
+    Serialization stays here; the byte-landing contract lives in
+    :func:`atomic_replace_bytes`, which every writer that replaces
+    ``config.toml`` converges on.
+    """
+    atomic_replace_bytes(path, tomli_w.dumps(payload).encode("utf-8"))
+
+
 def backup_and_write_migrated_config(
     path: str | Path,
     payload: dict[str, Any],
     result: ConfigMigrationResult,
 ) -> Path:
-    """Back up and atomically replace a migrated user config file."""
+    """Back up and atomically replace a migrated user config file.
+
+    Only a source matching the validated payload may be migrated. Unsupported
+    lossless patches retain the previous full-serialization fallback, but a
+    changed source never falls back to writing the stale payload. A nonblocking
+    shared write lock keeps startup from waiting on another config persister;
+    both rewrite paths also verify the source bytes immediately before replace.
+    """
+    # Import after GatewayConfig has finished loading its module: config_store
+    # itself imports the config models and migration helpers.
+    from opensquilla.onboarding.config_store import _config_write_lock, _logical_path_from_io
+
     target = Path(path)
-    backup = make_config_backup(target)
-    atomic_write_config(target, payload)
-    os.chmod(native_io_path(target), 0o600)
+    target_io = native_io_path(target)
+    if target_io.is_symlink():
+        try:
+            target = _logical_path_from_io(target_io.resolve())
+        except RuntimeError as exc:
+            # A link changed into a loop after validation must not block load.
+            raise ConfigMigrationConflictError(
+                "source config link changed since validation"
+            ) from exc
+        target_io = native_io_path(target)
+    rewrite = "comment-preserving"
+    lossless_error: str | None = None
+    with _config_write_lock(target, blocking=False):
+        source_bytes = target_io.read_bytes()
+        try:
+            source_payload = tomllib.loads(source_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise ConfigMigrationConflictError("source config changed since validation") from exc
+        if not _same_toml_payload(source_payload, result.original):
+            raise ConfigMigrationConflictError("source config changed since validation")
+        try:
+            patched = patch_import_config(source_bytes, result.original, payload)
+        except LosslessTomlPatchError as exc:
+            rewrite = "full-reserialize"
+            lossless_error = str(exc)
+            patched = tomli_w.dumps(payload).encode("utf-8")
+        backup = make_config_backup(target)
+        atomic_replace_bytes(target, patched, expected_bytes=source_bytes)
+        os.chmod(target_io, 0o600)
+    extra: dict[str, Any] = {
+        "path": str(target),
+        "backup": str(backup),
+        "changes": list(result.changes),
+        "removed_fields": list(result.removed_fields),
+        "warnings": list(result.warnings),
+        "rewrite": rewrite,
+    }
+    if lossless_error is not None:
+        extra["lossless_error"] = lossless_error
     logging.getLogger(__name__).warning(
         "OpenSquilla config migrated",
-        extra={
-            "path": str(target),
-            "backup": str(backup),
-            "changes": list(result.changes),
-            "removed_fields": list(result.removed_fields),
-            "warnings": list(result.warnings),
-        },
+        extra=extra,
     )
     return backup
 
@@ -999,11 +1087,19 @@ def rewrite_migrated_config_best_effort(
     """Persist an already validated migration without making writes a load prerequisite."""
     try:
         backup_and_write_migrated_config(path, migration.payload, migration)
+    except ConfigMigrationConflictError as error:
+        logging.getLogger(__name__).warning(
+            "OpenSquilla config migration skipped for %s (%s); running from the "
+            "migrated payload in memory without overwriting the changed file.",
+            path,
+            error,
+            extra={"path": str(path), "rewrite": "skipped-conflict"},
+        )
     except OSError as error:
         logging.getLogger(__name__).warning(
             "OpenSquilla config migration could not rewrite %s (%s); running "
-            "from the migrated payload in memory. Make the file writable to "
-            "persist the migration and silence this warning.",
+            "from the migrated payload in memory. Persistence will be retried "
+            "on a later load.",
             path,
             error,
         )

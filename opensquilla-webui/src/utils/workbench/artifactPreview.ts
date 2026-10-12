@@ -1,13 +1,9 @@
-import createDOMPurify from 'dompurify'
-import { marked } from 'marked'
+import { renderMarkdownCore } from '@/utils/markdown/renderCore'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { artifactExtension, artifactMime, artifactName } from '@/utils/chat/artifacts'
-import { strictStrikethrough } from '@/utils/markdown/strikethrough'
 
-// `marked` is a shared singleton, so declare the rule here too: a markdown
-// artifact renders the same text as the chat bubble it came from, and must not
-// depend on whether the chat renderer happens to have been imported first.
-marked.use(strictStrikethrough)
+// Markdown previews share parsing, sanitization, budgets and escaped-source
+// failure isolation with chat. Resource transport stays in the workbench.
 
 export const ARTIFACT_TEXT_PREVIEW_LIMIT = 5 * 1024 * 1024
 export const ARTIFACT_BINARY_PREVIEW_LIMIT = 30 * 1024 * 1024
@@ -26,14 +22,6 @@ const HTML_EXTENSIONS = new Set(['htm', 'html', 'xhtml'])
 const MARKDOWN_EXTENSIONS = new Set(['markdown', 'md', 'mdown', 'mkd'])
 const TEXT_EXTENSIONS = new Set(['log', 'text', 'txt'])
 const IMAGE_EXTENSIONS = new Set(['avif', 'bmp', 'gif', 'ico', 'jpeg', 'jpg', 'png', 'svg', 'webp'])
-const MARKDOWN_ALLOWED_TAGS = new Set([
-  'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'EM', 'H1', 'H2', 'H3', 'H4',
-  'H5', 'H6', 'HR', 'LI', 'OL', 'P', 'PRE', 'STRONG', 'TABLE', 'TBODY',
-  'TD', 'TH', 'THEAD', 'TR', 'UL',
-])
-const MARKDOWN_DROP_WITH_CONTENT = new Set([
-  'AUDIO', 'BASE', 'FORM', 'IFRAME', 'OBJECT', 'SCRIPT', 'STYLE', 'SVG', 'VIDEO',
-])
 
 function normalizedMime(value: unknown): string {
   return typeof value === 'string'
@@ -91,57 +79,7 @@ export function responseMatchesArtifactPreviewKind(
 }
 
 export function renderArtifactMarkdown(markdown: string): string {
-  const raw = marked.parse(markdown, {
-    async: false,
-    breaks: true,
-    gfm: true,
-  }) as string
-  if (typeof window === 'undefined') return ''
-  const purifier = createDOMPurify(window)
-  const purified = purifier.sanitize(raw, {
-    ALLOWED_TAGS: [
-      'a', 'blockquote', 'br', 'code', 'del', 'em', 'h1', 'h2', 'h3',
-      'h4', 'h5', 'h6', 'hr', 'li', 'ol', 'p', 'pre', 'strong', 'table',
-      'tbody', 'td', 'th', 'thead', 'tr', 'ul',
-    ],
-    ALLOWED_ATTR: ['href', 'title'],
-    ALLOWED_URI_REGEXP: /^(?:https?|mailto|#):/i,
-  })
-  // DOMPurify is the primary sanitizer. Some lightweight DOM test runtimes do
-  // not fully implement the browser APIs it relies on, so validate its output
-  // and apply the same allow-list with native DOM traversal as defense-in-depth.
-  const candidate = /<(?:script|style|iframe|object|svg|form)\b|javascript:/i.test(purified)
-    ? raw
-    : purified
-  return enforceArtifactMarkdownAllowList(candidate)
-}
-
-function enforceArtifactMarkdownAllowList(html: string): string {
-  const template = document.createElement('template')
-  template.innerHTML = html
-  const elements = [...template.content.querySelectorAll('*')]
-  for (const element of elements) {
-    if (!MARKDOWN_ALLOWED_TAGS.has(element.tagName)) {
-      if (MARKDOWN_DROP_WITH_CONTENT.has(element.tagName)) element.remove()
-      else element.replaceWith(document.createTextNode(element.textContent || ''))
-      continue
-    }
-    for (const attribute of [...element.attributes]) {
-      const allowed = attribute.name === 'title'
-        || (element.tagName === 'A' && attribute.name === 'href')
-      if (!allowed) element.removeAttribute(attribute.name)
-    }
-    if (element.tagName === 'A') {
-      const href = element.getAttribute('href') || ''
-      if (!/^(?:https?|mailto|#):/i.test(href)) {
-        element.removeAttribute('href')
-      } else if (/^https?:/i.test(href)) {
-        element.setAttribute('target', '_blank')
-        element.setAttribute('rel', 'noopener noreferrer')
-      }
-    }
-  }
-  return template.innerHTML
+  return renderMarkdownCore(markdown)
 }
 
 const RESOURCE_ATTRIBUTE_PATTERN =

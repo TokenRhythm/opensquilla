@@ -201,17 +201,22 @@ describe('artifact HTML isolation', () => {
 })
 
 describe('artifact Markdown rendering', () => {
-  it('keeps Markdown structure while stripping active content', () => {
-    const output = renderArtifactMarkdown(`
+  it('keeps source readable without executing active content', () => {
+    const source = `
 # Notes
 
 <script>window.pwned = true</script>
 
 [unsafe](javascript:alert(1))
-    `)
+    `
+    const output = renderArtifactMarkdown(source)
+    const root = document.createElement('div')
+    root.innerHTML = output
 
-    expect(output).toContain('<h1>Notes</h1>')
-    expect(output).not.toContain('<script')
-    expect(output).not.toContain('javascript:')
+    expect(root.textContent).toContain('Notes')
+    expect(root.querySelector('script')).toBeNull()
+    expect(root.querySelector('a[href^="javascript:"]')).toBeNull()
+    // A sanitizer failure keeps the full source; no second raw HTML pipeline.
+    if (root.querySelector('.chat-markdown-plain')) expect(root.textContent).toBe(source)
   })
 })

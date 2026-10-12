@@ -484,6 +484,8 @@ describe('WorkbenchHost', () => {
 
     expect(mounted.store.expanded).toBe(false)
     expect(hasOpenDialogLayer()).toBe(false)
+    // Focus restoration runs after the close flush has released inert DOM.
+    await nextTick()
     expect(document.activeElement).toBe(trigger)
   })
 
