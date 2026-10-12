@@ -5839,9 +5839,11 @@ async def test_natural_create_attaches_to_ordinary_running_rpc_task(
 
 async def test_three_empty_automatic_turns_pause_without_counting_user_turn(tmp_path: Path) -> None:
     runs: list[TaskRun] = []
+    started_runs: asyncio.Queue[TaskRun] = asyncio.Queue()
 
     async def handler(run: TaskRun) -> None:
         runs.append(run)
+        started_runs.put_nowait(run)
         task = await stack.storage.get_agent_task(run.task_id)
         assert task is not None
         details = dict(task.details)
@@ -5870,17 +5872,17 @@ async def test_three_empty_automatic_turns_pause_without_counting_user_turn(tmp_
         wire_lifecycle=True,
     ) as stack:
         await _handle_goals_set(_set_params(), stack.context)
-        # Each turn makes durable SQLite writes. Bound each settlement instead
-        # of requiring all four turns to share one two-second CI deadline.
-        for expected_turns in range(1, 5):
-            await _wait_for_goal(
-                stack.storage,
-                lambda value, expected=expected_turns: value.turns_settled >= expected,
-            )
-        goal = await _wait_for_goal(
-            stack.storage,
-            lambda value: value.status == "paused" and value.active_task_id is None,
-        )
+        # Goal settlement precedes the driver's idle hook. Observe each real
+        # automatic admission and complete terminal settlement instead of
+        # repeatedly polling SQLite while waiting for the next turn.
+        # Ten seconds is a hang watchdog, not a per-turn throughput contract.
+        for _ in range(4):
+            run = await asyncio.wait_for(started_runs.get(), timeout=10.0)
+            task = await stack.runtime.wait(run.task_id, timeout=10.0)
+            assert task.status == AgentTaskStatus.SUCCEEDED
+        goal = await stack.storage.get_goal(SOURCE_KEY)
+        assert goal is not None
+        assert goal.status == "paused" and goal.active_task_id is None
         assert goal.pause_reason == "empty_continuations"
         assert goal.turns_started == goal.turns_settled == 4
         assert len(runs) == 4

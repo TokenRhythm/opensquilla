@@ -141,6 +141,22 @@ def _parse_junit(
     return nodes, dict(file_seconds)
 
 
+def _matching_phase_markers(parallel: object, serial: object) -> bool:
+    """Accept legacy phases or the runner's paired, identical base filter."""
+
+    if (parallel, serial) == ("not ci_serial", "ci_serial"):
+        return True
+    suffix = ") and (not ci_serial)"
+    if (
+        not isinstance(parallel, str)
+        or not parallel.startswith("(")
+        or not parallel.endswith(suffix)
+    ):
+        return False
+    base = parallel[1:-len(suffix)]
+    return bool(base.strip()) and serial == f"({base}) and (ci_serial)"
+
+
 def load_run_directory(run_dir: Path) -> RunObservation:
     """Load a complete legacy or partitioned Windows run or fail closed."""
 
@@ -217,8 +233,11 @@ def load_run_directory(run_dir: Path) -> RunObservation:
             or type(parallel.get("workers")) is not int
             or parallel["workers"] < 1
             or parallel.get("dist") != "loadfile"
-            or parallel.get("marker") != "not ci_serial"
-            or serial != {"workers": 1, "marker": "ci_serial"}
+            or not isinstance(serial, dict)
+            or set(serial) != {"workers", "marker"}
+            or type(serial.get("workers")) is not int
+            or serial["workers"] != 1
+            or not _matching_phase_markers(parallel.get("marker"), serial.get("marker"))
         ):
             raise ValueError(f"invalid execution configuration in {metadata_path}")
         execution_by_shard[str(shard)] = execution

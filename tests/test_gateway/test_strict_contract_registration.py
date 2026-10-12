@@ -126,7 +126,6 @@ def test_strict_contract_factories_use_generated_identity_scope_and_provenance(
 @pytest.mark.parametrize(
     "method",
     (
-        "models.routing.set",
         *EXPECTED_APPROVAL_METHODS,
         *EXPECTED_MEMORY_PROFILE_IMPORT_METHODS,
         *EXPECTED_SESSION_CONTROL_METHODS,

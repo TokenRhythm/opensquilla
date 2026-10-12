@@ -10,6 +10,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import traceback
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -61,9 +62,24 @@ async def test_windows_pty_reads_ready_bytes_without_executor_capacity(monkeypat
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["kill", "timeout", "eof"])
 @pytest.mark.parametrize("detached", [False, True])
-async def test_real_pty_cleans_descendant_tree(action, detached, tmp_path) -> None:
+async def test_real_pty_cleans_descendant_tree(
+    action, detached, tmp_path, monkeypatch, request,
+) -> None:
     from opensquilla.process_tree import _strict_process_start_identity
 
+    launch_errors: list[str] = []
+    original_spawn = shell.spawn_pty
+
+    def observe_spawn(*args, **kwargs):
+        try:
+            return original_spawn(*args, **kwargs)
+        except Exception as exc:
+            # The tool envelope intentionally flattens launch failures. Retain
+            # their causal chain here so native CI failures remain diagnosable.
+            launch_errors.append("".join(traceback.format_exception(exc)))
+            raise
+
+    monkeypatch.setattr(shell, "spawn_pty", observe_spawn)
     child_pid = tmp_path / "child.pid"
     child = tmp_path / "child.py"
     child.write_text(
@@ -100,6 +116,10 @@ async def test_real_pty_cleans_descendant_tree(action, detached, tmp_path) -> No
             runtime=None, io_mode="pty",
         )
         execution_id = shell._session_id_from_start_result(result)
+        if not execution_id and launch_errors:
+            request.node.add_report_section(
+                "call", "native PTY launch exception chain", "\n".join(launch_errors),
+            )
         assert execution_id, result
         session = shell._bg_sessions[execution_id]
         assert session.io_mode_used == "pty", result

@@ -40,7 +40,7 @@ function timeoutError(label, timeoutMs) {
   return error
 }
 
-async function withDeadline(operation, label, timeoutMs) {
+export async function withDeadline(operation, label, timeoutMs) {
   const controller = new AbortController()
   try {
     return await Promise.race([
@@ -161,7 +161,66 @@ function childHasExited(child) {
   return child.exitCode !== null || child.signalCode !== null
 }
 
-async function forceElectronProcessExit(child, phase, emit) {
+function observeElectronShutdown(app) {
+  const startedAt = performance.now()
+  const events = []
+  const listeners = []
+  let child = null
+  let childError = null
+  try { child = app.process() } catch (error) { childError = error?.message || String(error) }
+  const state = () => {
+    if (!child) return { diagnosticError: childError || 'Electron child process is unavailable.' }
+    let pidPresent = null
+    if (Number.isSafeInteger(child.pid) && child.pid > 0) {
+      try { process.kill(child.pid, 0); pidPresent = true }
+      catch (error) { if (error?.code === 'ESRCH') pidPresent = false }
+    }
+    return {
+      pid: child.pid ?? null,
+      exitCode: child.exitCode ?? null,
+      signalCode: child.signalCode ?? null,
+      killed: child.killed ?? false,
+      // A PID probe is diagnostic only; absence never proves tree cleanup.
+      pidPresent,
+      stdio: Object.fromEntries(['stdin', 'stdout', 'stderr'].map(name => [name,
+        child[name] ? {
+          destroyed: child[name].destroyed,
+          readableEnded: child[name].readableEnded,
+          writableFinished: child[name].writableFinished,
+        } : null,
+      ])),
+    }
+  }
+  const record = (event, details = {}) => {
+    // These are one-shot lifecycle observations, never stdout or stderr data.
+    if (events.length < 32) events.push({
+      event, at: new Date().toISOString(), elapsedMs: performance.now() - startedAt, ...details,
+    })
+  }
+  const listen = (target, event, listener) => {
+    if (!target?.once) return
+    target.once(event, listener)
+    listeners.push(() => target.removeListener(event, listener))
+  }
+  listen(child, 'exit', (code, signal) => record('child-exit', { code, signal }))
+  listen(child, 'close', (code, signal) => record('child-close', { code, signal }))
+  for (const name of ['stdin', 'stdout', 'stderr']) {
+    for (const event of name === 'stdin' ? ['finish', 'close'] : ['end', 'close']) {
+      listen(child?.[name], event, () => record(`${name}-${event}`))
+    }
+  }
+  record('close-start', { process: state() })
+  return {
+    child,
+    state,
+    record,
+    snapshot: () => ({ process: state(), events: [...events] }),
+    dispose: () => { for (const remove of listeners) remove() },
+  }
+}
+
+async function forceElectronProcessExit(child, phase, emit, observation) {
+  observation.record('force-start', { process: observation.state() })
   if (childHasExited(child)) {
     const processTreeReaped = process.platform !== 'win32'
     return {
@@ -180,12 +239,16 @@ async function forceElectronProcessExit(child, phase, emit) {
       fallback: () => {
         if (!childHasExited(child)) child.kill('SIGKILL')
       },
-      onFailure: failure => emit(JSON.stringify({
-        event: 'desktop_e2e_process_tree_termination_failed',
-        phase,
-        ...failure,
-      })),
+      onFailure: failure => {
+        observation.record('tree-termination-failed', { ...failure, process: observation.state() })
+        emit(JSON.stringify({
+          event: 'desktop_e2e_process_tree_termination_failed',
+          phase,
+          ...failure,
+        }))
+      },
     })
+    observation.record('tree-termination-result', { processTreeReaped })
   } else {
     try {
       child.kill('SIGKILL')
@@ -219,6 +282,10 @@ export async function closeElectronWithDeadline({
   timeoutMs = 15_000,
   diagnosticTimeoutMs = 3_000,
 }) {
+  // Playwright's Windows process() is the shell wrapper. Its close protocol
+  // waits for child 'close' (including stdio), not just the OS process 'exit'.
+  // Capture the owned handle and events before close can dispose its dispatcher.
+  const observation = observeElectronShutdown(app)
   try {
     await withDeadline(() => app.close(), `${phase} Electron shutdown`, timeoutMs)
     return {
@@ -229,21 +296,11 @@ export async function closeElectronWithDeadline({
       processTreeReaped: false,
     }
   } catch (cause) {
+    observation.record('close-failed', { process: observation.state() })
     const snapshot = await boundedDiagnostics(diagnostics, diagnosticTimeoutMs)
-    let child = null
-    const processState = (() => {
-      try {
-        child = app.process()
-        return {
-          pid: child?.pid ?? null,
-          exitCode: child?.exitCode ?? null,
-          signalCode: child?.signalCode ?? null,
-          killed: child?.killed ?? false,
-        }
-      } catch (error) {
-        return { diagnosticError: error?.message || String(error) }
-      }
-    })()
+    observation.record('diagnostics-complete', { process: observation.state() })
+    const child = observation.child
+    const { pidPresent: _pidPresent, stdio: _stdio, ...processState } = observation.state()
     const detail = {
       event: 'desktop_e2e_electron_shutdown_failed',
       phase,
@@ -251,14 +308,24 @@ export async function closeElectronWithDeadline({
       error: cause?.stack || cause?.message || String(cause),
       process: processState,
       diagnostics: snapshot,
+      shutdownObservation: observation.snapshot(),
     }
     emit(JSON.stringify(detail))
     const forcedExit = child
-      ? await forceElectronProcessExit(child, phase, emit)
+      ? await forceElectronProcessExit(child, phase, emit, observation)
       : {
           error: new Error('Electron child process was unavailable for forced shutdown.'),
           processTreeReaped: false,
         }
+    observation.record('cleanup-complete', { process: observation.state() })
+    emit(JSON.stringify({
+      event: 'desktop_e2e_electron_shutdown_cleanup',
+      phase,
+      forcedExitSucceeded: child !== null && forcedExit.error === null,
+      processTreeReaped: forcedExit.processTreeReaped,
+      error: forcedExit.error?.message || null,
+      shutdownObservation: observation.snapshot(),
+    }))
     const error = new Error(
       `DESKTOP_E2E_ELECTRON_SHUTDOWN_FAILED: phase=${phase} `
       + `cause=${cause?.message || String(cause)} `
@@ -272,6 +339,9 @@ export async function closeElectronWithDeadline({
       closeErrorCode: typeof cause?.code === 'string' ? cause.code : null,
       forcedExitSucceeded: child !== null && forcedExit.error === null,
       processTreeReaped: forcedExit.processTreeReaped,
+      shutdownObservation: observation.snapshot(),
     }
+  } finally {
+    observation.dispose()
   }
 }

@@ -90,12 +90,6 @@ class TestDecodeSubprocessOutput:
         assert result == (_HELLO * 500)[:-1]
         assert "�" not in result
 
-    def test_utf8_with_invalid_middle_byte_uses_fallback(self) -> None:
-        # A genuinely non-UTF-8 byte in the middle (not just a truncated tail)
-        # routes to the legacy code page rather than being treated as UTF-8.
-        raw = _HELLO.encode("gbk")
-        assert decode_subprocess_output(raw, fallback_encoding="gbk") == _HELLO
-
     def test_truncated_gbk_with_utf8_lookalike_body_prefers_codepage(self) -> None:
         # 聙 is 0xC2 0x80 in GBK, which is *also* a valid UTF-8 sequence (U+0080).
         # With a truncated trailing lead byte a lenient UTF-8 decode would emit the

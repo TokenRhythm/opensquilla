@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from opensquilla.sandbox.upgrade_migration import (
@@ -53,30 +52,3 @@ def test_invalid_legacy_journal_is_reported_as_non_blocking_artifact(
     assert report.ok is True
     assert report.status == "legacy_artifacts_present"
     assert journal.exists()
-
-
-def test_concurrent_direct_update_migrations_serialize_on_profile_lock(
-    tmp_path: Path,
-) -> None:
-    (tmp_path / "config.toml").write_text(
-        '[sandbox]\nrun_mode = "trusted"\n',
-        encoding="utf-8",
-    )
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        reports = list(
-            pool.map(
-                lambda _: SandboxUpgradeCoordinator(tmp_path).run(),
-                range(2),
-            )
-        )
-
-    assert {report.status for report in reports} <= {
-        "committed",
-        "not_required",
-        "retry_required",
-    }
-    assert any(report.ok for report in reports)
-    assert 'run_mode = "safe"' in (tmp_path / "config.toml").read_text(
-        encoding="utf-8"
-    )

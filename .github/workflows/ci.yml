@@ -769,6 +769,8 @@ jobs:
   webui-chat-recovery:
     name: WebUI chat recovery
     needs: [plan-ci, frontend-artifact]
+    outputs:
+      capacity_result: ${{ steps.webui-capacity.outcome }}
     if: ${{ !cancelled() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'webui-chat-recovery') }}
     # Use a runner that permits the real unprivileged Bubblewrap sandbox without
     # changing host security policy. Migrate before Ubuntu 22.04 retires in April 2027.
@@ -807,6 +809,15 @@ jobs:
 
       - name: Install Gateway dependencies
         run: uv sync --frozen
+
+      - name: Validate renderer capacity inventory
+        id: capacity-inventory
+        # Pure WebUI plans do not select Python shards. Run the existing
+        # admission contract here before a new tag can escape both phases.
+        run: >-
+          uv run --no-sync pytest
+          tests/test_ci/test_workflows.py::test_browser_capacity_phase_cannot_be_skipped_behind_a_green_browser_job
+          -q
 
       - name: Install and verify Linux guest sandbox
         shell: bash
@@ -916,7 +927,24 @@ jobs:
           --project=chromium
           --workers=1
           --retries=0
+          --grep-invert=@capacity
           --output=test-results/virtualization
+
+      - name: Run production-dist renderer capacity contracts
+        id: webui-capacity
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'webui-capacity') }}
+        working-directory: opensquilla-webui
+        # Reuse the installed browser and verified artifact; the aggregate gate
+        # checks this outcome separately, so a planned-but-skipped phase fails.
+        run: >-
+          npm run test:e2e --
+          long-task-resilience.spec.ts
+          sidebar-virtualization.spec.ts
+          --project=chromium
+          --workers=1
+          --retries=0
+          --grep=@capacity
+          --output=test-results/capacity
 
       - name: Upload chat recovery traces
         id: chat-traces
@@ -1156,10 +1184,11 @@ jobs:
           TARGETED_PYTEST_TARGETS: ${{ needs.plan-ci.outputs.python_targets }}
         run: |
           set -euo pipefail
-          markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
+          markers="not stress and not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
 
           pytest_targets=(
             tests/unit
+            tests/test_ci/test_plan_ci.py::test_stress_inventory_cannot_disappear_between_default_and_dedicated_lanes
           )
           if [[ -n "${TARGETED_PYTEST_TARGETS}" ]]; then
             IFS=',' read -r -a affected_targets <<< "${TARGETED_PYTEST_TARGETS}"
@@ -1258,52 +1287,13 @@ jobs:
         run: |
           set -euo pipefail
           uv run python -c "import pathlib, subprocess, sys, opensquilla; print('cwd:', pathlib.Path.cwd().resolve()); print('git:', subprocess.check_output(['git', 'rev-parse', '--show-toplevel', 'HEAD'], text=True).strip()); print('python:', sys.executable); print('package:', pathlib.Path(opensquilla.__file__).resolve())"
-          regression_args=()
-          if [[ "${{ matrix.shard }}" == "desktop-installer-contracts" ]]; then
-            # Recheck every failed or unfinished file from this shard before
-            # starting its full run; other shards retain the environment probe.
-            regression_args+=(
-              tests/test_ci/test_architecture_import_contracts.py
-              tests/test_engine/turn_runner/test_stage_test_boundaries.py
-              tests/test_engine/test_runtime_artifacts.py
-              tests/test_engine/test_tool_concurrency.py
-              tests/test_engine/test_tokenjuice_tool_result_projection.py
-              tests/test_tools/test_tool_upgrade_compatibility.py
-              tests/test_gateway/test_goal_rpc.py
-              tests/test_tools/test_dispatch_legacy_coverage.py
-              tests/unit/cli/repl/test_slash_bridge.py
-            )
-          elif [[ "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
-            regression_args+=(
-              tests/test_gateway/test_channel_turn_ingress.py
-              tests/test_gateway/test_plan_rpc.py
-              tests/test_gateway/test_goal_registry_cleanup.py
-              tests/test_gateway/test_task_runtime_terminal_cleanup.py
-              tests/test_gateway/test_task_runtime_wait_slots.py
-              tests/test_gateway/test_goal_turn_authority.py
-              tests/test_gateway/test_task_progress_projection.py
-              tests/functional/test_gateway_silent_reply_process_e2e.py
-            )
-          elif [[ "${{ matrix.shard }}" == "recovery-migration" ]]; then
-            regression_args+=(
-              tests/test_sandbox/test_windows_shell_process_runtime.py
-              tests/test_live_long_task_case_driver.py
-            )
-          elif [[ "${{ matrix.shard }}" == "core" ]]; then
-            regression_args+=(
-              tests/test_cli/test_chat_cmd.py
-              tests/test_engine/test_cancelled_turn_segments.py
-              tests/test_tools/test_shell_workdir.py
-              tests/test_sandbox/test_shell_code_network_hints.py
-              tests/test_tools/test_shell_runtime_preflight.py
-            )
-          fi
+          # Shard regressions run in the full step below. Keep the small
+          # environment smoke common to every runner here.
           uv run pytest \
             tests/test_sandbox/test_trusted_sandbox_execution.py \
             tests/test_tools/test_approval_unification.py \
             tests/test_live_multi_provider_matrix.py \
             tests/test_live_provider_profile_smoke.py \
-            "${regression_args[@]}" \
             -vv --tb=short -o faulthandler_timeout=60 --maxfail=3 \
             2>&1 | tee "${CI_REPORT_DIR}/preflight.log"
 
@@ -1311,7 +1301,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
+          markers="not stress and not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
 
           worker_args=()
           if [[ "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
@@ -1361,6 +1351,41 @@ jobs:
         if: ${{ !cancelled() && steps.ubuntu-report.outcome == 'failure' }}
         shell: bash
         run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
+
+  python-stress:
+    name: Python capacity and soak tests
+    needs: plan-ci
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-stress') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.15"
+      - name: Install locked test dependencies
+        run: uv sync --frozen --extra dev
+      - name: Run isolated capacity checks
+        # One controller process, no xdist pool or duplicate preflight. Keep
+        # this target list in sync when admitting another stress test.
+        run: >-
+          uv run --no-sync pytest
+          tests/test_gateway/test_task_runtime_terminal_cleanup.py
+          -m stress -n 0 -vv --tb=short --durations=10
+          --junitxml=${{ runner.temp }}/python-stress.xml
+      - name: Preserve capacity check results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-stress-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/python-stress.xml
+          if-no-files-found: error
+          retention-days: 14
 
   windows-full:
     name: Windows high-risk (${{ matrix.shard }})
@@ -1537,6 +1562,8 @@ jobs:
 
       - name: Preflight offline test environment
         shell: bash
+        env:
+          PLANNED_WINDOWS_SHARDS: ${{ toJSON(fromJSON(needs.plan-ci.outputs.python_matrix).windows) }}
         run: |
           set -euo pipefail
           uv run python -c "import pathlib, subprocess, sys, opensquilla; print('cwd:', pathlib.Path.cwd().resolve()); print('git:', subprocess.check_output(['git', 'rev-parse', '--show-toplevel', 'HEAD'], text=True).strip()); print('python:', sys.executable); print('package:', pathlib.Path(opensquilla.__file__).resolve())"
@@ -1544,8 +1571,7 @@ jobs:
           shard="${{ matrix.shard }}"
           family="${shard%-*}"
           if [[ "${family}" == "desktop-installer-contracts" ]]; then
-            # Recheck every failed or unfinished file from this shard before
-            # starting its full run; other shards retain the environment probe.
+            # Retain regression smoke for sibling partitions in this family.
             regression_args+=(
               tests/test_ci/test_architecture_import_contracts.py
               tests/test_engine/turn_runner/test_stage_test_boundaries.py
@@ -1573,6 +1599,19 @@ jobs:
               tests/test_tools/test_shell_runtime_preflight.py
             )
           fi
+          # Every selected physical owner is mandatory in CI result. Retain
+          # sibling smoke only when its owner is absent from this partial plan.
+          # Invalid/missing plans or failed inventory must stop before filtering.
+          if (( ${#regression_args[@]} )); then
+            owned_files=$(uv run python .github/scripts/windows_test_shards.py list "${shard}" --planned-windows-shards "${PLANNED_WINDOWS_SHARDS}" | tr -d '\r')
+            sibling_regressions=()
+            for path in "${regression_args[@]}"; do
+              if ! grep -Fxq -- "${path}" <<< "${owned_files}"; then
+                sibling_regressions+=("${path}")
+              fi
+            done
+            regression_args=("${sibling_regressions[@]}")
+          fi
           # Windows workers hit access violations during timed stack dumps.
           # Related frame-race report: python/cpython#140815. Disable only
           # this diagnostic timer; keep fatal-error handling enabled.
@@ -1589,7 +1628,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
+          markers="not stress and not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
           maxfail_args=()
           if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "merge_group" ]]; then
             maxfail_args+=(--maxfail=3)
@@ -2085,20 +2124,14 @@ jobs:
           set -euo pipefail
           npm run test:e2e -- \
             history-hydration.spec.ts \
+            plan-presentation.spec.ts task-progress.spec.ts goal-mode.spec.ts \
             --project=chromium \
             --workers=1 \
-            --grep "@session-hang-recovery" \
+            --grep "@session-hang-recovery|@plan-goal-runtime" \
             --retries=0 \
             --trace retain-on-failure \
             --output "${CI_REPORT_DIR}/session-hang-recovery-results" \
             2>&1 | tee "${CI_REPORT_DIR}/session-hang-recovery.log"
-          npm run test:e2e -- \
-            plan-presentation.spec.ts task-progress.spec.ts goal-mode.spec.ts \
-            --project=chromium --workers=1 --retries=0 \
-            --grep "@plan-goal-runtime" \
-            --trace retain-on-failure \
-            --output "${CI_REPORT_DIR}/plan-goal-runtime-results" \
-            2>&1 | tee "${CI_REPORT_DIR}/plan-goal-runtime.log"
 
       - name: Run cross-platform modern session recovery contracts
         if: ${{ (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' }}
@@ -2857,6 +2890,7 @@ jobs:
       - desktop-check
       - ubuntu-quality
       - ubuntu-full
+      - python-stress
       - windows-full
       - macos-recovery
       - desktop-recovery-e2e
@@ -2964,10 +2998,12 @@ jobs:
           RESULT_DESKTOP: ${{ needs.desktop-check.result }}
           RESULT_UBUNTU: ${{ needs.ubuntu-quality.result }}
           RESULT_UBUNTU_FULL: ${{ needs.ubuntu-full.result }}
+          RESULT_PYTHON_STRESS: ${{ needs.python-stress.result }}
           RESULT_WINDOWS_FULL: ${{ needs.windows-full.result }}
           RESULT_MACOS_RECOVERY: ${{ needs.macos-recovery.result }}
           RESULT_DESKTOP_RECOVERY_E2E: ${{ needs.desktop-recovery-e2e.result }}
           RESULT_WEBUI_CHAT_RECOVERY: ${{ needs.webui-chat-recovery.result }}
+          RESULT_WEBUI_CAPACITY: ${{ needs.webui-chat-recovery.outputs.capacity_result || 'skipped' }}
           RESULT_SKILL_HUB: ${{ needs.skill-hub.result }}
           RESULT_WINDOWS_NSIS: ${{ needs.windows-nsis-regression.result }}
           RESULT_RELEASE: ${{ needs.release-packaging.result }}

@@ -57,10 +57,12 @@
     "macos-recovery",
     "managed-toolchain",
     "python-full",
+    "python-stress",
     "readme-locale",
     "release-packaging",
     "skill-hub",
     "tui",
+    "webui-capacity",
     "webui-chat-recovery",
     "wheel-webui-roundtrip",
     "windows-high-risk",
@@ -268,6 +270,15 @@
         "src/opensquilla/gateway/static/**"
       ]
     },
+    "webui-capacity": {
+      "execution_inputs": [
+        "opensquilla-webui/**",
+        "pyproject.toml",
+        "uv.lock",
+        "src/opensquilla/gateway/**",
+        "src/opensquilla/session/**"
+      ]
+    },
     "webui-chat-recovery": {
       "execution_inputs": [
         "opensquilla-webui/e2e/**",
@@ -353,6 +364,14 @@
     "python-full": {
       "execution_inputs": [
         "**"
+      ]
+    },
+    "python-stress": {
+      "execution_inputs": [
+        "src/opensquilla/**",
+        "tests/**",
+        "pyproject.toml",
+        "uv.lock"
       ]
     },
     "windows-high-risk": {

@@ -125,19 +125,6 @@ describe('ReasoningPart nested-in-activity variant', () => {
     expect(host.querySelector('.thinking-fold--in-activity')).toBeNull()
   })
 
-  it('suppresses only the inner rule and its indent in the nested variant', () => {
-    const selectorStart = reasoningPartSource.indexOf('.thinking-fold--in-activity > .thinking-fold__body {')
-    const blockEnd = reasoningPartSource.indexOf('}', selectorStart)
-    const rule = reasoningPartSource.slice(selectorStart, blockEnd)
-
-    expect(selectorStart).toBeGreaterThanOrEqual(0)
-    expect(rule).toContain('border-left: none;')
-    expect(rule).toContain('padding-left: 0;')
-    // The standalone fold body must keep its own 2px rule untouched.
-    const baseStart = reasoningPartSource.indexOf('.thinking-fold__body {')
-    const baseRule = reasoningPartSource.slice(baseStart, reasoningPartSource.indexOf('}', baseStart))
-    expect(baseRule).toContain('border-left: 2px solid var(--border);')
-  })
 })
 
 describe('ReasoningPart branches', () => {

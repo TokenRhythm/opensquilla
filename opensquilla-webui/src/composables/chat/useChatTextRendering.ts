@@ -12,7 +12,10 @@ const GENERATED_ARTIFACT_MARKER_RE = /(?:^|\s*)\[generated artifact omitted:\s*[
 const TIME_PREFIX_RE = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+\-]\d{2}:\d{2} (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Za-z0-9_+\-/]+\]\n/
 
 const MARKDOWN_CACHE_MAX_BYTES = 8 * 1024 * 1024
-const MARKDOWN_CACHE_MAX_ITEM_BYTES = 256 * 1024
+// Count source and HTML as UTF-16 below. A 128 KiB answer therefore needs more
+// than 512 KiB here; keep it reusable by timeline/answer projections and later
+// history refreshes without allowing one entry to consume the whole cache.
+const MARKDOWN_CACHE_MAX_ITEM_BYTES = MARKDOWN_CACHE_MAX_BYTES / 8
 const MATH_SCAN_RE = /(```[\s\S]*?```|`[^`\n]+?`|\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([^)\n]+?\\\)|\$(?![\s\d])(?:\\\$|[^$\n])+?(?<![\s])\$)/g
 const MATH_SENTINEL_RE = /\uE000M(\d+)\uE001/g
 // Highlighting is synchronous inside the streaming render path; past this

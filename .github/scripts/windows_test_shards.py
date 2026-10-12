@@ -505,6 +505,29 @@ def files_for_shard(root: Path, shard: str) -> tuple[str, ...]:
     return tuple(path for path in discover_test_files(root) if selector(path) == shard)
 
 
+def files_for_planned_windows_shards(
+    root: Path, current_shard: str, planned_json: str,
+) -> tuple[str, ...]:
+    """List only files whose physical owner must run in this Windows matrix."""
+
+    planned = json.loads(planned_json)
+    if (
+        not isinstance(planned, list)
+        or not planned
+        or any(not isinstance(shard, str) or shard not in WINDOWS_SHARD_NAMES for shard in planned)
+        or len(set(planned)) != len(planned)
+        or current_shard not in planned
+    ):
+        raise ValueError(
+            "planned Windows shards must be unique physical shards including this cell"
+        )
+    selected = set(planned)
+    return tuple(
+        path for path in discover_test_files(root)
+        if windows_shard_for_test(path) in selected
+    )
+
+
 def validated_files_for_shard(root: Path, shard: str) -> tuple[str, ...]:
     """Return one shard after validating the complete offline file inventory."""
 
@@ -593,6 +616,7 @@ def _write_run_metadata(
     files: tuple[str, ...],
     *,
     parallel_workers: int,
+    marker_expression: str | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -616,11 +640,11 @@ def _write_run_metadata(
             "parallel": {
                 "workers": parallel_workers,
                 "dist": "loadfile",
-                "marker": "not ci_serial",
+                "marker": _phase_marker(marker_expression, "not ci_serial"),
             },
             "serial": {
                 "workers": 1,
-                "marker": "ci_serial",
+                "marker": _phase_marker(marker_expression, "ci_serial"),
             },
         },
     }
@@ -875,6 +899,10 @@ def _pytest_phase_inputs(
 
 
 def _phase_marker(base_expression: str | None, selection: str) -> str:
+    # Our explicit -m replaces pytest's addopts. Match the ordinary repository
+    # default unless the caller deliberately supplies a marker, including "".
+    if base_expression is None:
+        base_expression = "not stress"
     if not base_expression:
         return selection
     return f"({base_expression}) and ({selection})"
@@ -1006,12 +1034,14 @@ def _run(args: argparse.Namespace) -> int:
     args.junit.parent.mkdir(parents=True, exist_ok=True)
     args.summary.parent.mkdir(parents=True, exist_ok=True)
     args.summary.write_text("pytest_status=started\n", encoding="utf-8")
+    pytest_args, marker_expression = _pytest_phase_inputs(args.pytest_args)
     if args.metadata is not None:
         _write_run_metadata(
             args.metadata,
             args.shard,
             files,
             parallel_workers=args.workers,
+            marker_expression=marker_expression,
         )
     if not files:
         error = ValueError(f"Windows shard {args.shard!r} has no tests")
@@ -1020,7 +1050,6 @@ def _run(args: argparse.Namespace) -> int:
         _write_failure_summary(args.junit, args.summary, 2)
         return 2
 
-    pytest_args, marker_expression = _pytest_phase_inputs(args.pytest_args)
     parallel_junit = _phase_junit_path(args.junit, "parallel")
     serial_junit = _phase_junit_path(args.junit, "serial")
     runner_error_junit = _phase_junit_path(args.junit, "runner-error")
@@ -1131,7 +1160,13 @@ def _run(args: argparse.Namespace) -> int:
 
 
 def _list(args: argparse.Namespace) -> int:
-    for path in files_for_shard(args.root.resolve(), args.shard):
+    root = args.root.resolve()
+    files = (
+        files_for_planned_windows_shards(root, args.shard, args.planned_windows_shards)
+        if args.planned_windows_shards is not None
+        else files_for_shard(root, args.shard)
+    )
+    for path in files:
         print(path)
     return 0
 
@@ -1178,6 +1213,10 @@ def _parser() -> argparse.ArgumentParser:
     list_parser = subparsers.add_parser("list", help="list files assigned to one shard")
     list_parser.add_argument("shard", choices=(*SHARD_NAMES, *WINDOWS_SHARD_NAMES))
     list_parser.add_argument("--root", type=Path, default=Path.cwd())
+    list_parser.add_argument(
+        "--planned-windows-shards",
+        help="JSON physical Windows matrix whose mandatory owners replace preflight repeats",
+    )
     list_parser.set_defaults(handler=_list)
 
     report_parser = subparsers.add_parser(

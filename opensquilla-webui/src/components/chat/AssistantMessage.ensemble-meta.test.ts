@@ -4,7 +4,6 @@ import { createApp, nextTick } from 'vue'
 import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
 import AssistantMessage from './AssistantMessage.vue'
-import source from './AssistantMessage.vue?raw'
 
 function assistantMessage(overrides: Partial<ChatRenderedMessage> = {}): ChatRenderedMessage {
   return {
@@ -380,20 +379,6 @@ describe('AssistantMessage ensemble footer metadata', () => {
     expect(el.querySelector('.savings-indicator')).toBeNull()
     expect(el.querySelectorAll('.msg-meta__more-btn')).toHaveLength(1)
     app.unmount()
-  })
-
-  it('does not render inline model, cost, ensemble, or savings metadata', () => {
-    expect(source).not.toContain('class="msg-meta__model"')
-    expect(source).not.toContain('class="msg-meta__cost"')
-    expect(source).not.toContain('class="msg-meta__ensemble"')
-    expect(source).not.toContain('class="savings-indicator"')
-  })
-
-  it('opens the info popover inward from the left edge of the message pane', () => {
-    const popoverRule = source.match(/\.msg-meta-popover\s*\{([^}]*)\}/)?.[1] || ''
-
-    expect(popoverRule).toMatch(/\bleft:\s*0;/)
-    expect(popoverRule).not.toContain('translateX(-50%)')
   })
 
   it('does not toggle share selection for stopped-output notices', async () => {

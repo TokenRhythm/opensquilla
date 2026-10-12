@@ -613,6 +613,18 @@ def test_ci_result_gate_checks_frontend_artifact_independently() -> None:
     assert not any("WebUI chat recovery" in error for error in errors)
 
 
+def test_ci_result_gate_requires_the_planned_capacity_phase_even_when_browser_job_passes() -> None:
+    env = _env_for(BASELINE_SUITES | {"webui-chat-recovery", "webui-capacity"})
+    assert check_ci_results(env) == []
+    for result in ("failure", "cancelled", "skipped", ""):
+        env["RESULT_WEBUI_CAPACITY"] = result
+        errors = check_ci_results(env)
+        assert any("WebUI capacity" in error and "success" in error for error in errors)
+        assert not any("WebUI chat recovery" in error for error in errors)
+    env.pop("RESULT_WEBUI_CAPACITY")
+    assert any("WebUI capacity" in error for error in check_ci_results(env))
+
+
 def test_ci_result_gate_rejects_missing_suite_result_mapping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
