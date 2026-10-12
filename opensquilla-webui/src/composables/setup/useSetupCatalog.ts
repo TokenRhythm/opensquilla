@@ -2205,40 +2205,6 @@ const actionItems = computed<SettingsActionItem[]>(() => {
   return items
 })
 
-const configCliArg = computed(() => {
-  const path = status.value.configPath
-  return path ? ` --config ${shellArg(path)}` : ''
-})
-
-const envRecoveryCommands = computed(() => {
-  const cmds = Array.isArray(status.value.envRecoveryCommands) ? status.value.envRecoveryCommands : []
-  return cmds
-    .filter(entry => entry && entry.command)
-    .map(entry => ({ label: entry.label || t('setup.command.setEnvKey'), command: entry.command || '' }))
-})
-
-const fixCommands = computed(() => {
-  if (!envRecoveryCommands.value.length) return []
-  return [
-    ...envRecoveryCommands.value,
-    { label: t('setup.command.restartAfterEnv'), command: `opensquilla gateway restart${configCliArg.value}` },
-  ]
-})
-
-const handoffCommands = computed(() => [
-  { label: t('setup.command.cliOnboarding'), command: `opensquilla onboard --if-needed${configCliArg.value}` },
-  { label: t('setup.command.checkStatus'), command: `opensquilla onboard status${configCliArg.value}` },
-])
-
-const recipeCommands = computed(() => [
-  { label: t('setup.command.providerOptions'), command: `opensquilla onboard catalog providers${configCliArg.value}` },
-  { label: t('setup.command.routerTiers'), command: `opensquilla onboard catalog router${configCliArg.value}` },
-  { label: t('setup.command.searchOptions'), command: `opensquilla onboard catalog search${configCliArg.value}` },
-  { label: t('setup.command.channelOptions'), command: `opensquilla onboard catalog channels${configCliArg.value}` },
-  { label: t('setup.command.imageOptions'), command: `opensquilla onboard catalog image${configCliArg.value}` },
-  { label: t('setup.command.memoryOptions'), command: `opensquilla onboard catalog memory${configCliArg.value}` },
-])
-
 const configSummary = computed(() => {
   const rows: Array<{ label: string; value: string }> = [
     { label: t('setup.summary.provider'), value: providerSummary.value },
@@ -4579,12 +4545,6 @@ function tierLabel(tier: string): string {
   return t(routerTierLabelKey(tier))
 }
 
-function shellArg(value: string): string {
-  const text = String(value || '')
-  if (/^[A-Za-z0-9_@%+=:,./~-]+$/.test(text)) return text
-  return `'${text.replace(/'/g, `'\''`)}'`
-}
-
 async function copyText(text: string, successMessage: string) {
   if (!text) return
   try {
@@ -4625,9 +4585,6 @@ async function copyConfigPath() {
     providerEnvKey,
     hasSetupAction,
     actionItems,
-    fixCommands,
-    handoffCommands,
-    recipeCommands,
     configSummary,
     configPath,
     selectInitialSection,
