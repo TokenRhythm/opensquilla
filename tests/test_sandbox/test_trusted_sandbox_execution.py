@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,11 +16,28 @@ async def test_shell_echo_succeeds_when_git_is_unavailable(
     run_mode: str,
     tmp_path: Path,
     unavailable_git_runtime: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from opensquilla.sandbox.backend.noop import NoopBackend
     from opensquilla.sandbox.config import SandboxSettings
     from opensquilla.sandbox.integration import configure_runtime, reset_runtime
     from opensquilla.tools.builtin import shell
 
+    backend_outcomes: list[dict[str, int | bool]] = []
+    backend_run = NoopBackend.run
+
+    async def observe_run(self, request):
+        outcome = await backend_run(self, request)
+        backend_outcomes.append({
+            "returncode": outcome.returncode,
+            "timed_out": outcome.timed_out,
+            "wall_time_ms": int(outcome.wall_time_s * 1000),
+            "stdout_bytes": len(outcome.stdout.encode("utf-8", errors="replace")),
+            "stderr_bytes": len(outcome.stderr.encode("utf-8", errors="replace")),
+        })
+        return outcome
+
+    monkeypatch.setattr(NoopBackend, "run", observe_run)
     configure_runtime(
         SandboxSettings(run_mode="safe", backend="noop", allow_legacy_mode=True),
         workspace=tmp_path,
@@ -36,14 +54,18 @@ async def test_shell_echo_succeeds_when_git_is_unavailable(
         )
     )
     try:
-        result = await shell.exec_command("echo opensquilla_no_git", workdir=str(tmp_path))
+        # Bound cold Windows shell startup while testing Git-unavailable execution.
+        result = await shell.exec_command(
+            "echo opensquilla_no_git", workdir=str(tmp_path),
+            timeout=120 if os.name == "nt" else None,
+        )
     finally:
         current_tool_context.reset(token)
         reset_runtime()
 
-    assert "opensquilla_no_git" in result
-    assert "exit_code=0" in result
-    assert unavailable_git_runtime.resolution_calls
+    assert "opensquilla_no_git" in result, backend_outcomes
+    assert "exit_code=0" in result, backend_outcomes
+    assert unavailable_git_runtime.resolution_calls, backend_outcomes
 
 
 @pytest.mark.parametrize("run_mode", ["safe", "full"])
