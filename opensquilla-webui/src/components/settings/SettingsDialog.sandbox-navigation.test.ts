@@ -108,7 +108,7 @@ async function mountDialog() {
     throw new Error('This navigation must not install or remove a runtime')
   }
   const sandbox: SandboxRuntime = {
-    loadSettings: vi.fn(async () => ({ policy: structuredClone(initialPolicy), defaults: {}, preference: { runMode: 'full' } })),
+    loadSettings: vi.fn<SandboxRuntime['loadSettings']>(async () => ({ policy: structuredClone(initialPolicy), defaults: {}, preference: { runMode: 'full' } })),
     updatePolicy,
     readiness: vi.fn(async () => ({ status: null, capability: null })),
     ensureReady: unexpectedRuntimeAction,
