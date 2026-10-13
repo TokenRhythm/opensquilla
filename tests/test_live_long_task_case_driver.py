@@ -412,8 +412,9 @@ def test_initial_github_windows_healthless_ownership_timeout_restarts_once(
     assert gateway._startup_recovery_used is True
 
 
+@pytest.mark.parametrize("runtime_imported", [False, True])
 def test_initial_github_windows_healthless_ownership_restart_is_bounded_to_once(
-    startup_gateway, monkeypatch: pytest.MonkeyPatch,
+    startup_gateway, monkeypatch: pytest.MonkeyPatch, runtime_imported: bool,
 ) -> None:
     gateway = startup_gateway
     now = [0.0]
@@ -438,7 +439,10 @@ def test_initial_github_windows_healthless_ownership_restart_is_bounded_to_once(
         launched_ports.append(int(command[command.index("--port") + 1]))
         log = gateway.root / "gateway.stdout.log"
         with log.open("a", encoding="utf-8") as stream:
-            for phase in ("config", "ownership"):
+            phases = ["config", "ownership"]
+            if runtime_imported:
+                phases.append("runtime_import")
+            for phase in phases:
                 stream.write(json.dumps({
                     "event": "gateway.startup_phase",
                     "phase": phase,
@@ -470,8 +474,8 @@ def test_initial_github_windows_healthless_ownership_restart_is_bounded_to_once(
     with pytest.raises(driver.DriverConfigurationError):
         gateway.start()
 
-    assert launched_ports == [42001, 42001]
-    assert gateway._startup_recovery_used is True
+    assert launched_ports == ([42001] if runtime_imported else [42001, 42001])
+    assert gateway._startup_recovery_used is (not runtime_imported)
 
 
 @pytest.mark.parametrize(
@@ -509,16 +513,18 @@ def test_initial_github_windows_startup_recovery_fails_closed_outside_exact_sign
 
 
 @pytest.mark.parametrize("exit_code", [17, None])
+@pytest.mark.parametrize("phase_name", ["runtime_import", "services"])
 @pytest.mark.parametrize("prefix", [
     "", "2026-09-18T13:00:00+00:00 [INFO] opensquilla.gateway.boot: ",
 ])
 def test_gateway_startup_failure_keeps_safe_phase_evidence(
     startup_gateway, monkeypatch: pytest.MonkeyPatch, exit_code: int | None, prefix: str,
+    phase_name: str,
 ) -> None:
     gateway = startup_gateway
     secret = "synthetic-secret-must-never-appear"
     phase = {
-        "event": "gateway.startup_phase", "phase": "services", "status": "ready",
+        "event": "gateway.startup_phase", "phase": phase_name, "status": "ready",
         "duration_ms": 12, "startup_elapsed_ms": 34,
         "message": secret, "path": str(gateway.root),
     }
@@ -548,7 +554,7 @@ def test_gateway_startup_failure_keeps_safe_phase_evidence(
         "elapsed_ms": 0 if exit_code is not None else 45_000,
         "exit_code": exit_code,
         "last_health_status": None if exit_code is not None else 503,
-        "phases": {"services": {
+        "phases": {phase_name: {
             "status": "ready", "duration_ms": 12, "startup_elapsed_ms": 34,
         }},
     }
