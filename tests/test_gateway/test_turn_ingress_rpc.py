@@ -2816,10 +2816,45 @@ async def test_public_send_continues_automation_session_with_queue_and_replay(
         assert pending.details["session_id"] == session.session_id
         assert pending.details["session_epoch"] == session.epoch
 
+        first_task_id = first.payload["task_id"]
+        second_task_id = second.payload["task_id"]
+        assert stack.received_runs[0].task_id == first_task_id
+        # The shared event currently describes the first handler. Clear it
+        # before releasing that handler so the next signal belongs to the
+        # queued task, whose durable activation is a separate readiness phase.
+        stack.handler_started.clear()
         stack.release_handler.set()
-        for accepted in (first, second):
-            terminal = await stack.runtime.wait(accepted.payload["task_id"], timeout=2.0)
-            assert str(terminal.status) == "succeeded"
+        phase = "terminal"
+        task_id = first_task_id
+        try:
+            for task_id in (first_task_id, second_task_id):
+                if task_id == second_task_id:
+                    phase = "handler readiness"
+                    await stack.wait_until_running()
+                    assert [run.task_id for run in stack.received_runs] == [
+                        first_task_id, second_task_id,
+                    ]
+                phase = "terminal"
+                # Keep both terminal-settlement budgets, including the first
+                # task's durable writes, unchanged.
+                terminal = await stack.runtime.wait(task_id, timeout=2.0)
+                assert str(terminal.status) == "succeeded"
+        except TimeoutError as exc:
+            states = {
+                key: {"status": str(task.status), "done": task.done.is_set()}
+                for key, task in stack.runtime._tasks.items()
+            }
+            drivers = {
+                key: [repr(driver) for driver in tasks]
+                for key, tasks in stack.runtime._driver_tasks_by_session.items()
+            }
+            exc.add_note(
+                f"automation task timeout: task_id={task_id}; phase={phase}; "
+                f"first_task_id={first_task_id}; second_task_id={second_task_id}; "
+                f"received_task_ids={[run.task_id for run in stack.received_runs]}; "
+                f"task_states={states}; drivers={drivers}"
+            )
+            raise
         assert len(stack.received_runs) == 2
         for run in stack.received_runs:
             assert run.envelope.session_key == cron_key

@@ -29,9 +29,8 @@ failure, cancellation, or an unexpected skip cannot satisfy the gate.
 
 The first capacity check is the 10,000-task terminal-cleanup soak. Its task count,
 collection-size bounds, and 200 MiB memory ceiling remain intact. Its bounded
-hang guard is 300 seconds and reports completed-task progress on timeout; the
-former 60-second guard was not a product throughput SLO. Normal success,
-exception, queue handoff, and lock ownership
+hang guard retains main's 60 seconds and reports completed-task progress on
+timeout. Normal success, exception, queue handoff, and lock ownership
 contracts stay in ordinary platform shards. The soak uses fake task storage,
 an empty-approval port, and real in-process stream snapshots. Its replay cache
 retains the two events needed for the synthetic turn; replay-history sizing and
@@ -497,3 +496,12 @@ Run the normal locked dependency sync first and preserve `UV_CACHE_DIR` when
 isolating a local test profile. An unavailable cached dependency is an error,
 never a reason to skip the test or retry online. The installed interpreter runs
 with `-I` and must resolve migrations beneath its own environment prefix.
+
+For queued real-storage RPC tests, readiness must identify the task it observed.
+Clear the first handler's signal before releasing it, then observe and verify
+the queued handler before starting its existing terminal-settlement budget.
+Reuse the bounded durable-readiness guard; retain both two-second terminal
+waits, replay identity, transcript, and reopen assertions. Timeout diagnostics
+record the task identity, phase, task states, and owned drivers. Slow SQLite
+holds show where time was spent, but do not by themselves identify the cause of
+slow runner I/O or prove that a specific historical failure waited on that task.
