@@ -210,6 +210,7 @@
           <VideoGenerationSettings
             v-if="videoSettingsInitialized"
             :hidden="!loaded || section !== 'capabilities'"
+            :show-actions="false"
             ref="videoSettingsRef"
             @dirty-change="videoDirty = $event"
             @busy-change="videoBusy = $event"
@@ -220,16 +221,16 @@
       </div>
 
       <div
-        v-if="loaded && hasUnsavedChanges"
+        v-if="loaded && hasUnsavedSettingsChanges"
         class="settings-dirtybar"
         :aria-busy="settingsInteractionLocked ? 'true' : undefined"
       >
         <span class="settings-dirtybar__pulse" aria-hidden="true"></span>
         <span class="settings-dirtybar__text" role="status" aria-live="polite" aria-atomic="true">
-          {{ settingsInteractionLocked ? t('settings.dialog.savingChanges') : dirtyBarText }}
+          {{ settingsInteractionLocked ? dirtyBarPendingText : dirtyBarText }}
         </span>
         <span class="settings-dirtybar__spacer"></span>
-        <button type="button" class="btn" :disabled="settingsFormLocked" @click="discardChanges">
+        <button type="button" class="btn" :disabled="settingsFormLocked" @click="discardSettingsChanges">
           {{ dirtyDiscardLabel }}
         </button>
         <button
@@ -237,8 +238,8 @@
           class="btn btn--primary"
           :disabled="settingsFormLocked"
           :aria-busy="settingsInteractionLocked ? 'true' : undefined"
-          @click="saveDirtySections"
-        >{{ settingsInteractionLocked ? t('settings.dialog.savingChanges') : dirtySaveLabel }}</button>
+          @click="saveSettingsChanges"
+        >{{ settingsInteractionLocked ? dirtyBarPendingText : dirtySaveLabel }}</button>
       </div>
 
       </section>
@@ -307,9 +308,9 @@ const {
   configPath,
   selectInitialSection,
   sectionStatus,
-  sectionDirty,
+  sectionDirty: catalogSectionDirty,
   providerDraftDirty,
-  dirtySections,
+  dirtySections: catalogDirtySections,
   hasUnsavedChanges,
   saveAllPending,
   providerSavePending,
@@ -382,6 +383,8 @@ const railRef = ref<HTMLElement | null>(null)
 const panelRef = ref<HTMLElement | null>(null)
 const closeBtn = ref<HTMLButtonElement | null>(null)
 const closeSavePending = ref(false)
+const settingsSavePending = ref(false)
+const settingsDiscardPending = ref(false)
 const videoSettingsRef = ref<InstanceType<typeof VideoGenerationSettings> | null>(null)
 const videoDirty = ref(false)
 const videoBusy = ref(false)
@@ -441,6 +444,19 @@ const showCategories = computed(() => isMobile.value && mobileView.value === 'li
 // on readiness data) never stomps navigation made while config was loading.
 let userNavigated = false
 
+function sectionDirty(id: string): boolean {
+  return catalogSectionDirty(id) || (id === 'capabilities' && videoDirty.value)
+}
+const dirtySections = computed(() => {
+  if (!videoDirty.value || catalogDirtySections.value.some(item => item.id === 'capabilities')) {
+    return catalogDirtySections.value
+  }
+  const capabilities = SETTINGS_SECTIONS.find(item => item.id === 'capabilities')
+  return capabilities ? [...catalogDirtySections.value, capabilities] : catalogDirtySections.value
+})
+const hasUnsavedSettingsChanges = computed(() => hasUnsavedChanges.value || videoDirty.value)
+const dirtyBarPendingText = computed(() => t(settingsDiscardPending.value
+  ? 'shared.loading' : 'settings.dialog.savingChanges'))
 const dirtySectionNames = computed(() => (
   dirtySections.value.map(s => t(`settings.rail.${s.id}`)).join(' · ')
 ))
@@ -486,7 +502,7 @@ const displayConfigPath = computed(() => configPath.value || '~/.opensquilla/con
 // their editor owns Save/Cancel. They still participate in every path that
 // unmounts Settings so browser navigation cannot silently discard credentials.
 const hasSettingsExitDraft = computed(() => (
-  hasUnsavedChanges.value || providerDraftDirty.value || videoDirty.value
+  hasUnsavedSettingsChanges.value || providerDraftDirty.value
 ))
 const hasPendingSettingsWrite = computed(() => (
   saveAllPending.value
@@ -495,9 +511,12 @@ const hasPendingSettingsWrite = computed(() => (
   || primaryMutationPending.value
   || modelStrategyRoutingBusy.value
   || closeSavePending.value
+  || settingsSavePending.value
+  || settingsDiscardPending.value
 ))
 const settingsInteractionLocked = computed(() => (
   saveAllPending.value || closeSavePending.value || primaryMutationPending.value || sandboxLeavePending.value
+  || settingsSavePending.value || settingsDiscardPending.value || videoBusy.value
 ))
 // A routing-mode write must not claim that unrelated manual drafts are saving.
 const settingsFormLocked = computed(() => settingsInteractionLocked.value || modelStrategyRoutingBusy.value)
@@ -846,6 +865,60 @@ function confirmExitChanges() {
   })
 }
 
+// Video owns its provider-scoped patch, but shares the same visible save and
+// discard actions as the other capabilities. Keep a single lock across both
+// requests so a second click cannot interleave writes or lose a newer draft.
+type SettingsSaveResult = 'saved' | 'video-error' | 'incomplete'
+async function persistSettingsChanges(): Promise<SettingsSaveResult> {
+  if (hasUnsavedChanges.value) {
+    await saveDirtySections()
+    if (hasUnsavedChanges.value) return 'incomplete'
+  }
+  if (videoDirty.value && !(await videoSettingsRef.value?.save())) {
+    return 'video-error'
+  }
+  await nextTick()
+  return hasUnsavedSettingsChanges.value ? 'incomplete' : 'saved'
+}
+
+async function revealVideoSaveError(): Promise<void> {
+  if (!(await selectSection('capabilities'))) return
+  await nextTick()
+  const videoPanel = panelRef.value?.querySelector<HTMLDetailsElement>('[data-testid="video-generation-settings"]')
+  if (!videoPanel) return
+  videoPanel.open = true
+  const alert = videoPanel.querySelector<HTMLElement>('[role="alert"]')
+  videoPanel.scrollIntoView({ block: 'nearest' })
+  if (alert) {
+    alert.tabIndex = -1
+    alert.focus({ preventScroll: true })
+  }
+}
+
+async function saveSettingsChanges(): Promise<boolean> {
+  if (hasPendingSettingsWrite.value || settingsInteractionLocked.value) return false
+  settingsSavePending.value = true
+  let result: SettingsSaveResult = 'incomplete'
+  try {
+    result = await persistSettingsChanges()
+    return result === 'saved'
+  } finally {
+    settingsSavePending.value = false
+    if (result === 'video-error') await revealVideoSaveError()
+  }
+}
+
+async function discardSettingsChanges(): Promise<void> {
+  if (hasPendingSettingsWrite.value || settingsInteractionLocked.value) return
+  settingsDiscardPending.value = true
+  try {
+    if (hasUnsavedChanges.value) await discardChanges()
+    if (videoDirty.value) videoSettingsRef.value?.discard()
+  } finally {
+    settingsDiscardPending.value = false
+  }
+}
+
 // Save every kind of Settings draft before allowing an exit. Provider drafts
 // have their own save path, while the remaining sections share the dirty bar.
 // If validation or a request fails, their dirty state remains and the dialog
@@ -853,14 +926,14 @@ function confirmExitChanges() {
 async function saveExitChanges(): Promise<boolean> {
   if (closeSavePending.value || hasPendingSettingsWrite.value) return false
   closeSavePending.value = true
+  let result: SettingsSaveResult = 'incomplete'
   try {
     if (providerDraftDirty.value && !(await saveProvider())) return false
-    if (hasUnsavedChanges.value) await saveDirtySections()
-    if (videoDirty.value && !(await videoSettingsRef.value?.save())) return false
-    await nextTick()
-    return !hasSettingsExitDraft.value
+    result = await persistSettingsChanges()
+    return result === 'saved' && !hasSettingsExitDraft.value
   } finally {
     closeSavePending.value = false
+    if (result === 'video-error') await revealVideoSaveError()
   }
 }
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject, onMounted, ref, watch } from 'vue'
+import { computed, inject, onMounted, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import SetupCapabilityCredential from '@/components/setup/SetupCapabilityCredential.vue'
@@ -34,13 +34,19 @@ type VideoDraft = {
   primary: string
   providerSettings: Partial<Record<ConfiguredVideoProvider, VideoProviderConnection>>
   durationSeconds: string
-  maxDurationSeconds: string
   aspectRatio: VideoAspect
   resolution: VideoResolution
   credentialChanges: Partial<Record<ConfiguredVideoProvider, 'env' | 'shared'>>
 }
 
 const { t } = useI18n()
+withDefaults(defineProps<{ showActions?: boolean }>(), { showActions: true })
+const modelStatusId = `video-model-status-${useId()}`
+const durationHintId = `video-duration-hint-${useId()}`
+const durationErrorId = `video-duration-error-${useId()}`
+const preferencesOpen = ref(false)
+const connectionOpen = ref(false)
+const panel = ref<HTMLDetailsElement | null>(null)
 const emit = defineEmits<{
   dirtyChange: [dirty: boolean]
   busyChange: [busy: boolean]
@@ -62,6 +68,8 @@ const discoveredModels = ref<Partial<Record<ConfiguredVideoProvider, {
   source: string
   verifiedIds: string[]
 }>>>({})
+const modelDiscoveryState = ref<Partial<Record<ConfiguredVideoProvider, 'loading' | 'ready' | 'error'>>>({})
+const modelDiscoveryRequests = new Map<ConfiguredVideoProvider, number>()
 const directApiKey = ref('')
 const credentialEditorOpen = ref(false)
 const credentialInputMode = ref<'key' | 'env'>('key')
@@ -81,8 +89,9 @@ const provider = ref<VideoProvider>('')
 const primary = ref('')
 const baseUrl = ref('')
 const apiKeyEnv = ref('')
-const durationSeconds = ref<string | number>('')
-const maxDurationSeconds = ref<string | number>('8')
+// Preserve the exact draft: native number inputs sanitize incomplete values to
+// empty strings, which would otherwise silently save an automatic duration.
+const durationSeconds = ref('')
 const aspectRatio = ref<VideoAspect>('16:9')
 const resolution = ref<VideoResolution>('720p')
 const allowedAspectRatios = ref<VideoAspect[]>(['16:9', '9:16'])
@@ -131,6 +140,8 @@ const selectableProviders = computed(() => videoProviders.value.filter(option =>
   option.id === 'openrouter'
   || (option.id === 'tokenrhythm' && providerFieldSupported.value && providerSettingsSupported.value)
 )))
+const recommendedProvider = computed(() => selectableProviders.value.find(option => option.id === 'tokenrhythm'))
+const otherProviders = computed(() => selectableProviders.value.filter(option => option.id !== recommendedProvider.value?.id))
 const legacyProvider = computed(() => (
   isVideoProvider(provider.value) && provider.value !== 'openrouter' && provider.value !== 'tokenrhythm'
     ? fallbackVideoProviders.find(option => option.id === provider.value) : null
@@ -188,7 +199,7 @@ function providerDefaultModel(id: ConfiguredVideoProvider): string {
     || ''
 }
 const modelSource = computed(() => (
-  provider.value ? discoveredModels.value[provider.value]?.source || 'catalog' : 'none'
+  provider.value ? discoveredModels.value[provider.value]?.source === 'live' ? 'live' : 'catalog' : 'none'
 ))
 const durationBounds = computed(() => {
   if (provider.value === 'gemini') return { minimum: 4, maximum: 8 }
@@ -197,16 +208,60 @@ const durationBounds = computed(() => {
     return { minimum: primary.value.trim().startsWith('happyhorse-') ? 3 : 2, maximum: 15 }
   }
   if (provider.value === 'xai') return { minimum: 1, maximum: 15 }
-  return { minimum: 1, maximum: 60 }
+  // OpenRouter resolves supported durations from the selected model at request
+  // time; do not invent a generic upper bound for an unknown model.
+  return { minimum: 1, maximum: null }
 })
-const tokenRhythmModelStatus = computed(() => {
-  if (provider.value !== 'tokenrhythm' || primary.value.trim() !== 'wan3.0-video') return ''
-  const discovered = discoveredModels.value.tokenrhythm
-  if (discovered?.verifiedIds.includes('wan3.0-video')) return t('setup.video.tokenrhythmModelListed')
-  if (discovered?.source === 'live' && !discovered.models.some(item => item.id === 'wan3.0-video')) {
-    return t('setup.video.tokenrhythmModelNotListed')
+const automaticDurationHint = computed(() => {
+  const seconds = provider.value === 'tokenrhythm' || provider.value === 'qwen' || provider.value === 'qwen_token_plan'
+    ? 5
+    : provider.value === 'xai' ? 8
+      : provider.value === 'gemini' ? resolution.value === '1080p' ? 8 : 4 : null
+  return seconds === null
+    ? t('setup.video.automaticDurationModelHint')
+    : t('setup.video.automaticDurationHint', { seconds })
+})
+const durationError = computed(() => {
+  const requested = durationSeconds.value.trim()
+  if (!requested) return ''
+  const duration = Number(requested)
+  if (!/^\d+$/.test(requested) || !Number.isSafeInteger(duration) || duration < 1) {
+    return t('setup.video.invalidDuration')
   }
-  return t('setup.video.tokenrhythmModelUnverified')
+  // Preserve old routes on unrelated saves, while validating edits against the
+  // selected provider's supported range just like new configurations.
+  const unchangedLegacy = legacyProvider.value && saved.value
+    && requested === saved.value.durationSeconds && (!enabled.value || enabled.value === saved.value.enabled)
+    && resolution.value === saved.value.resolution
+  if (unchangedLegacy) return ''
+  if (enabled.value && durationBounds.value.maximum !== null
+    && (duration < durationBounds.value.minimum || duration > durationBounds.value.maximum)) {
+    return t('setup.video.invalidProviderDuration', durationBounds.value)
+  }
+  if (provider.value === 'gemini') {
+    if (resolution.value === '1080p' && duration !== 8) return t('setup.video.invalidGemini1080p')
+    if (![4, 6, 8].includes(duration)) return t('setup.video.invalidGeminiDuration')
+  }
+  return ''
+})
+const modelDiscoveryBusy = computed(() => Boolean(provider.value
+  && modelDiscoveryState.value[provider.value] === 'loading'))
+const modelStatus = computed(() => {
+  if (!provider.value || legacyProvider.value) return ''
+  if (modelDiscoveryBusy.value) return t('setup.video.refreshingModels')
+  if (modelDiscoveryState.value[provider.value] === 'error') return t('setup.video.modelCheckFailed')
+  const discovered = discoveredModels.value[provider.value]
+  if (discovered?.source === 'documented') return t('setup.video.modelCatalogFallback')
+  const model = primary.value.trim()
+  if (!model) return t('setup.video.modelHint')
+  if (discovered?.source === 'live') {
+    if (discovered.verifiedIds.includes(model)) return t('setup.video.modelListed')
+    if (!discovered.models.some(item => item.id === model)) return t('setup.video.modelNotListed')
+  }
+  if (discovered?.source === 'catalog' && discovered.models.some(item => item.id === model)) {
+    return t('setup.video.modelCatalogListed')
+  }
+  return t('setup.video.modelUnverified')
 })
 const savedDirectKeyAvailable = computed(() => (
   isVideoProvider(provider.value)
@@ -558,9 +613,13 @@ async function loadProviderCatalog(): Promise<void> {
 
 async function discoverVideoModels(id: ConfiguredVideoProvider): Promise<void> {
   if (!setupWorkflow?.discoverVideoGenerationModels) return
+  const requestId = (modelDiscoveryRequests.get(id) || 0) + 1
+  modelDiscoveryRequests.set(id, requestId)
+  modelDiscoveryState.value = { ...modelDiscoveryState.value, [id]: 'loading' }
   try {
     const result = await setupWorkflow.discoverVideoGenerationModels(id)
-    if (result.ok !== true || !Array.isArray(result.models)) return
+    if (modelDiscoveryRequests.get(id) !== requestId) return
+    if (result.ok !== true || !Array.isArray(result.models)) throw new Error('Model discovery failed')
     const verifiedIds: string[] = []
     const models = result.models.flatMap(item => {
       const row = record(item)
@@ -579,11 +638,20 @@ async function discoverVideoModels(id: ConfiguredVideoProvider): Promise<void> {
     })
     discoveredModels.value = {
       ...discoveredModels.value,
-      [id]: { models, source: result.source === 'live' ? 'live' : 'catalog', verifiedIds },
+      [id]: { models, source: result.source === 'live' ? 'live'
+        : result.source === 'documented' ? 'documented' : 'catalog', verifiedIds },
     }
+    modelDiscoveryState.value = { ...modelDiscoveryState.value, [id]: 'ready' }
   } catch {
-    // A discovery failure leaves the documented examples available for entry.
+    if (modelDiscoveryRequests.get(id) !== requestId) return
+    modelDiscoveryState.value = { ...modelDiscoveryState.value, [id]: 'error' }
   }
+}
+
+function refreshModels(): void {
+  if (busy.value || modelDiscoveryBusy.value || !provider.value) return
+  // Discovery reads the public/catalog list, independently of credential drafts.
+  void discoverVideoModels(provider.value)
 }
 
 let credentialStatusRequestId = 0
@@ -632,7 +700,6 @@ function draft(): VideoDraft {
     primary: primary.value.trim(),
     providerSettings: providerSettingsDraft(),
     durationSeconds: String(durationSeconds.value).trim(),
-    maxDurationSeconds: String(maxDurationSeconds.value).trim(),
     aspectRatio: aspectRatio.value,
     resolution: resolution.value,
     credentialChanges: { ...credentialChanges.value },
@@ -649,8 +716,8 @@ const badgeReady = computed(() => Boolean(enabled.value && provider.value && pri
 const badgeTone = computed(() => dirty.value ? 'is-warn'
   : !enabled.value ? 'is-muted' : badgeReady.value ? 'is-ok' : 'is-warn')
 const badgeLabel = computed(() => t(dirty.value ? 'setup.video.unsaved'
-  : !enabled.value ? 'setup.capabilities.statusPending'
-    : badgeReady.value ? 'setup.capabilities.statusAvailable' : 'setup.capabilities.statusNeedsAction'))
+  : !enabled.value ? 'setup.video.disabledStatus'
+    : badgeReady.value ? 'setup.video.configured' : 'setup.capabilities.statusNeedsAction'))
 watch(dirty, value => emit('dirtyChange', value), { immediate: true })
 watch(busy, value => emit('busyChange', value), { immediate: true })
 
@@ -741,51 +808,11 @@ const validationError = computed(() => {
       ? issue
       : t('setup.video.providerSettingsInvalid', { provider: option.label, detail: issue })
   }
-  const maximum = Number(maxDurationSeconds.value)
-  if (!Number.isInteger(maximum) || maximum < 1 || maximum > 60) {
-    return t('setup.video.invalidMaxDuration')
-  }
-  if (legacyProvider.value) {
-    const requested = String(durationSeconds.value).trim()
-    if (requested && (!Number.isInteger(Number(requested)) || Number(requested) < 1 || Number(requested) > maximum)) {
-      return t('setup.video.invalidDuration', { max: maximum })
-    }
-    return ''
-  }
-  const happyHorse = (provider.value === 'qwen' || provider.value === 'qwen_token_plan')
-    && primary.value.trim().startsWith('happyhorse-')
-  if (enabled.value && happyHorse && maximum < 3) return t('setup.video.invalidHappyHorseMaxDuration')
-  if (provider.value === 'gemini' && maximum < 4) {
-    return t('setup.video.invalidGeminiMaxDuration')
-  }
-  if (enabled.value && maximum < durationBounds.value.minimum) {
-    return t('setup.video.invalidProviderMaxDuration', durationBounds.value)
-  }
-  if (provider.value === 'gemini' && resolution.value === '1080p' && maximum < 8) {
-    return t('setup.video.invalidGemini1080p')
-  }
+  if (durationError.value) return durationError.value
+  if (legacyProvider.value) return ''
   if (enabled.value && provider.value === 'xai' && primary.value.trim() === 'grok-imagine-video'
     && resolution.value === '1080p') {
     return t('setup.video.invalidXai1080p')
-  }
-  const requested = String(durationSeconds.value).trim()
-  const duration = requested ? Number(requested) : null
-  if (requested) {
-    if (duration === null || !Number.isInteger(duration) || duration < 1 || duration > maximum) {
-      return t('setup.video.invalidDuration', { max: maximum })
-    }
-  }
-  if (enabled.value && happyHorse && duration !== null && duration < 3) {
-    return t('setup.video.invalidHappyHorseDuration')
-  }
-  if (enabled.value && duration !== null && (
-    duration < durationBounds.value.minimum || duration > durationBounds.value.maximum
-  )) return t('setup.video.invalidProviderDuration', durationBounds.value)
-  if (provider.value === 'gemini' && resolution.value === '1080p' && duration !== null && duration !== 8) {
-    return t('setup.video.invalidGemini1080p')
-  }
-  if (provider.value === 'gemini' && duration !== null && ![4, 6, 8].includes(duration)) {
-    return t('setup.video.invalidGeminiDuration')
   }
   return ''
 })
@@ -847,9 +874,6 @@ async function load(): Promise<void> {
     durationSeconds.value = typeof video.duration_seconds === 'number'
       ? String(video.duration_seconds)
       : ''
-    maxDurationSeconds.value = typeof video.max_duration_seconds === 'number'
-      ? String(video.max_duration_seconds)
-      : '8'
     aspectRatio.value = video.aspect_ratio === '9:16' ? '9:16' : '16:9'
     resolution.value = video.resolution === '1080p' ? '1080p' : '720p'
     saved.value = draft()
@@ -862,7 +886,13 @@ async function load(): Promise<void> {
 
 async function save(): Promise<boolean> {
   if (!dirty.value) return true
-  if (!settings || phase.value !== 'ready' || busy.value || validationError.value) return false
+  if (!settings || phase.value !== 'ready' || busy.value) return false
+  if (validationError.value) {
+    if (panel.value) panel.value.open = true
+    preferencesOpen.value = true
+    connectionOpen.value = true
+    return false
+  }
   const next = draft()
   const previous = saved.value
   if (!previous) return false
@@ -873,7 +903,6 @@ async function save(): Promise<boolean> {
       : []),
     ['primary', 'primary', next.primary],
     ['durationSeconds', 'duration_seconds', next.durationSeconds ? Number(next.durationSeconds) : null],
-    ['maxDurationSeconds', 'max_duration_seconds', Number(next.maxDurationSeconds)],
     ['aspectRatio', 'aspect_ratio', next.aspectRatio],
     ['resolution', 'resolution', next.resolution],
   ]
@@ -965,7 +994,6 @@ function discard(): void {
   if (isVideoProvider(provider.value)) providerDrafts.get(provider.value)!.primary = saved.value.primary
   applyProviderDraft(provider.value)
   durationSeconds.value = saved.value.durationSeconds
-  maxDurationSeconds.value = saved.value.maxDurationSeconds
   aspectRatio.value = saved.value.aspectRatio
   resolution.value = saved.value.resolution
   error.value = ''
@@ -975,11 +1003,10 @@ function discard(): void {
 function applyRecommendedDurations(): void {
   if (busy.value) return
   durationSeconds.value = ''
-  maxDurationSeconds.value = '8'
 }
 
-function onProviderChange(event: Event): void {
-  const selected = (event.target as HTMLSelectElement).value
+function selectProvider(selected: string): void {
+  if (busy.value) return
   if (selected !== '' && selected !== 'openrouter' && selected !== 'tokenrhythm') return
   if (selected !== 'openrouter' && !providerFieldSupported.value) return
   if (selected !== '' && selected !== 'openrouter'
@@ -1001,6 +1028,19 @@ function onProviderChange(event: Event): void {
   if (isVideoProvider(selected)) void discoverVideoModels(selected)
 }
 
+function onProviderChange(event: Event): void {
+  selectProvider((event.target as HTMLSelectElement).value)
+}
+
+function setEnabled(value: boolean): void {
+  enabled.value = value
+  if (value && !provider.value) {
+    selectProvider(recommendedProvider.value?.id || 'openrouter')
+    // Legacy gateways infer OpenRouter from the model without a provider field.
+    if (provider.value && !primary.value.trim()) primary.value = providerDefaultModel(provider.value)
+  }
+}
+
 defineExpose({ save, discard, refreshCredentialStatus: loadCredentialStatus })
 
 onMounted(() => {
@@ -1009,7 +1049,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <details class="video-settings" data-testid="video-generation-settings">
+  <details ref="panel" class="video-settings" data-testid="video-generation-settings">
     <summary class="video-settings__summary">
       <span class="video-settings__title">{{ t('setup.video.title') }}</span>
       <span class="video-settings__summary-end">
@@ -1034,6 +1074,7 @@ onMounted(() => {
         <div class="control-row">
           <div class="control-row__label-block">
             <span class="control-row__label">{{ t('setup.video.enableLabel') }}</span>
+            <span class="control-row__desc">{{ t('setup.video.enabledHint') }}</span>
           </div>
           <div class="control-row__control">
             <ControlSwitch
@@ -1041,11 +1082,12 @@ onMounted(() => {
               :checked="enabled"
               :disabled="busy"
               :aria-label="t('setup.video.enableLabel')"
-              @change="enabled = $event"
+              @change="setEnabled"
             />
           </div>
         </div>
 
+        <div :hidden="!enabled && !validationError" data-testid="video-configuration">
         <label class="control-row">
           <span class="control-row__label-block">
             <span class="control-row__label">{{ t('setup.video.providerLabel') }}</span>
@@ -1053,8 +1095,13 @@ onMounted(() => {
           <span class="control-row__control">
             <select class="control-input" name="setup_video_provider" :value="provider" :disabled="busy"
               @change="onProviderChange">
-              <option value="">{{ t('setup.video.providerPlaceholder') }}</option>
-              <option v-for="option in selectableProviders" :key="option.id" :value="option.id">{{ option.label }}</option>
+              <option value="" disabled>{{ t('setup.video.providerPlaceholder') }}</option>
+              <optgroup v-if="recommendedProvider" :label="t('setup.capabilities.imageRecommendedGroup')">
+                <option :value="recommendedProvider.id">{{ recommendedProvider.label }} · {{ t('setup.capabilities.imageRecommendedBadge') }}</option>
+              </optgroup>
+              <optgroup v-if="otherProviders.length" :label="t('setup.capabilities.imageOtherProvidersGroup')">
+                <option v-for="option in otherProviders" :key="option.id" :value="option.id">{{ option.label }}</option>
+              </optgroup>
               <option v-if="legacyProvider" :value="legacyProvider.id" disabled>{{ legacyProvider.label }}</option>
             </select>
           </span>
@@ -1077,23 +1124,27 @@ onMounted(() => {
             <input :value="primary" class="control-input" name="setup_video_legacy_model" readonly>
           </span>
         </label>
-        <SetupModelCombobox
-          v-else-if="provider"
-          :field="{
-            name: 'video_primary',
-            label: t('setup.video.modelLabel'),
-            description: t('setup.video.modelHint'),
-            placeholder: modelPlaceholder,
-          }"
-          :value="primary"
-          :models="modelSuggestions"
-          :model-source="modelSource"
-          :disabled="busy"
-          @update="primary = $event"
-        />
-        <p v-if="tokenRhythmModelStatus" class="video-settings__hint" data-testid="video-model-status">
-          {{ tokenRhythmModelStatus }}
-        </p>
+        <div v-else-if="provider" class="control-row video-settings__model-row">
+          <div class="control-row__label-block">
+            <label for="setup-provider-video_primary" class="control-row__label">{{ t('setup.video.modelLabel') }}</label>
+            <span :id="`${modelStatusId}-hint`" class="control-row__desc">{{ t('setup.video.modelHint') }}</span>
+          </div>
+          <div class="control-row__control video-settings__model-control">
+            <SetupModelCombobox
+              :field="{ name: 'video_primary', label: t('setup.video.modelLabel'), placeholder: modelPlaceholder }"
+              :value="primary" :models="modelSuggestions" :model-source="modelSource"
+              cell input-class="control-input" :disabled="busy"
+              :external-description-id="`${modelStatusId}-hint ${modelStatusId}`"
+              @update="primary = $event"
+            />
+            <div class="video-settings__model-feedback">
+              <span :id="modelStatusId" class="video-settings__hint" data-testid="video-model-status" role="status">{{ modelStatus }}</span>
+              <button v-if="setupWorkflow?.discoverVideoGenerationModels" type="button" class="btn btn--ghost"
+                :disabled="busy || modelDiscoveryBusy" :aria-busy="modelDiscoveryBusy" :aria-describedby="modelStatusId"
+                data-testid="video-refresh-models" @click="refreshModels">{{ t('setup.video.refreshModels') }}</button>
+            </div>
+          </div>
+        </div>
 
         <template v-if="provider && providerSettingsSupported && !legacyProvider">
           <div class="control-row">
@@ -1142,57 +1193,16 @@ onMounted(() => {
               </button>
             </span>
           </div>
-          <details class="video-settings__connection-options">
-            <summary>{{ t('setup.video.connectionOptions') }}</summary>
-            <label class="control-row">
-              <span class="control-row__label-block">
-                <span class="control-row__label">{{ t('setup.video.baseUrlLabel') }}</span>
-                <span class="control-row__desc">{{ t('setup.video.baseUrlHint') }}</span>
-              </span>
-              <span class="control-row__control">
-                <input :value="effectiveBaseUrl" class="control-input" name="setup_video_base_url"
-                  data-testid="video-effective-base-url"
-                  type="url" inputmode="url" spellcheck="false" autocomplete="off"
-                  :disabled="busy" placeholder="https://api.example.com/v1"
-                  @input="baseUrl = ($event.target as HTMLInputElement).value">
-              </span>
-            </label>
-          </details>
         </template>
 
-        <label class="control-row">
-          <span class="control-row__label-block">
-            <span class="control-row__label">{{ t('setup.video.defaultDurationLabel') }}</span>
-            <span class="control-row__desc">{{ t('setup.video.defaultDurationHint') }}</span>
-          </span>
-          <span class="control-row__control">
-            <input v-model="durationSeconds" class="control-input video-settings__duration-input" name="setup_video_duration"
-              type="number" :min="enabled ? durationBounds.minimum : 1"
-              :max="enabled ? Math.min(Number(maxDurationSeconds), durationBounds.maximum) : maxDurationSeconds"
-              step="1" inputmode="numeric"
-              :disabled="busy" :placeholder="t('setup.video.providerDefault')">
-          </span>
-        </label>
-
-        <label class="control-row">
-          <span class="control-row__label-block">
-            <span class="control-row__label">{{ t('setup.video.maxDurationLabel') }}</span>
-            <span class="control-row__desc">{{ t('setup.video.providerMaxDurationHint', durationBounds) }}</span>
-          </span>
-          <span class="control-row__control">
-            <input v-model="maxDurationSeconds" class="control-input" name="setup_video_max_duration"
-              type="number" :min="enabled ? durationBounds.minimum : 1" max="60"
-              step="1" inputmode="numeric" :disabled="busy">
-          </span>
-        </label>
-
-        <div class="video-settings__duration-recommendation">
-          <button type="button" class="btn btn--ghost" :disabled="busy"
-            data-testid="video-recommended-duration" @click="applyRecommendedDurations">
-            {{ t('setup.video.useRecommendedDurations') }}
-          </button>
-        </div>
-
+        <details class="video-settings__preferences" :open="preferencesOpen"
+          @toggle="preferencesOpen = ($event.target as HTMLDetailsElement).open">
+          <summary>
+            <span>{{ t('setup.video.preferences') }}</span>
+            <span class="video-settings__hint">{{ t('setup.video.preferencesSummary', {
+              aspect: aspectRatio, resolution,
+            }) }}</span>
+          </summary>
         <label class="control-row">
           <span class="control-row__label-block"><span class="control-row__label">{{ t('setup.video.aspectLabel') }}</span></span>
           <span class="control-row__control">
@@ -1211,13 +1221,54 @@ onMounted(() => {
           </span>
         </label>
 
-        <p class="video-settings__hint">
-          {{ t('setup.video.credentialVerificationHint') }}
-        </p>
+        </details>
+        <details v-if="provider"
+          class="video-settings__connection-options" :open="connectionOpen"
+          @toggle="connectionOpen = ($event.target as HTMLDetailsElement).open">
+          <summary>{{ t('setup.video.connectionOptions') }}</summary>
+          <label class="control-row">
+            <span class="control-row__label-block">
+              <span class="control-row__label">{{ t('setup.video.defaultDurationLabel') }}</span>
+              <span :id="durationHintId" class="control-row__desc">
+                {{ t('setup.video.defaultDurationHint') }}
+                <span v-if="!durationSeconds.trim()" class="video-settings__automatic-duration">{{ automaticDurationHint }}</span>
+              </span>
+            </span>
+            <span class="control-row__control video-settings__duration-control">
+              <input v-model="durationSeconds" class="control-input video-settings__duration-input" name="setup_video_duration"
+                type="text" inputmode="numeric" autocomplete="off" spellcheck="false"
+                :aria-invalid="Boolean(durationError)"
+                :aria-describedby="durationError ? `${durationHintId} ${durationErrorId}` : durationHintId"
+                :disabled="busy" :placeholder="t('setup.video.providerDefault')">
+              <span v-if="durationError" :id="durationErrorId" class="video-settings__error">{{ durationError }}</span>
+            </span>
+          </label>
+          <div v-if="durationSeconds.trim()" class="video-settings__duration-recommendation">
+            <button type="button" class="btn btn--ghost" :disabled="busy"
+              data-testid="video-recommended-duration" @click="applyRecommendedDurations">
+              {{ t('setup.video.useRecommendedDurations') }}
+            </button>
+          </div>
+          <label v-if="providerSettingsSupported && !legacyProvider" class="control-row control-row--stack">
+            <span class="control-row__label-block">
+              <span class="control-row__label">{{ t('setup.video.baseUrlLabel') }}</span>
+              <span class="control-row__desc">{{ t('setup.video.baseUrlHint') }}</span>
+            </span>
+            <span class="control-row__control">
+              <input :value="effectiveBaseUrl" class="control-input" name="setup_video_base_url"
+                data-testid="video-effective-base-url" type="url" inputmode="url" spellcheck="false" autocomplete="off"
+                :disabled="busy" placeholder="https://api.example.com/v1"
+                @input="baseUrl = ($event.target as HTMLInputElement).value">
+            </span>
+          </label>
+        </details>
+        </div>
         <p v-if="validationError" class="video-settings__error" role="alert">{{ validationError }}</p>
         <p v-else-if="error" class="video-settings__error" role="alert">{{ error }}</p>
         <p v-if="message" class="video-settings__message" role="status">{{ message }}</p>
-        <div class="video-settings__actions">
+        <div v-if="showActions" class="video-settings__actions">
+          <button v-if="dirty" type="button" class="btn btn--ghost" :disabled="busy"
+            data-testid="video-discard" @click="discard">{{ t('common.discard') }}</button>
           <button type="button" class="btn btn--primary" :disabled="busy || !dirty || Boolean(validationError)"
             :aria-busy="busy ? 'true' : undefined" @click="save">
             {{ t('setup.video.save') }}
@@ -1269,13 +1320,28 @@ onMounted(() => {
 .video-settings__description, .video-settings__hint { color: var(--text-muted); font-size: 13px; line-height: 1.5; }
 .video-settings__error { color: var(--danger); font-size: 13px; }
 .video-settings__message { color: var(--ok); font-size: 13px; }
+.video-settings__model-row { align-items: flex-start; }
+.video-settings__model-control { display: grid; justify-content: stretch; width: min(100%, 360px); min-width: 0; gap: var(--sp-2); }
+.video-settings__model-feedback { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-2); }
+.video-settings__model-feedback .video-settings__hint { font-size: 12px; }
+.video-settings__model-feedback button { flex-shrink: 0; padding: 0; font-size: 12px; }
 .video-settings__credential-control { display: grid; justify-content: stretch; width: min(100%, 360px); max-width: 360px; gap: 8px; }
 .video-settings__credential-mode { display: grid; gap: var(--sp-2); font-size: 13px; }
 .video-settings__connection-options { color: var(--text-muted); font-size: 13px; padding-block: var(--sp-3); }
 .video-settings__connection-options summary { cursor: pointer; }
+.video-settings__preferences { border-bottom: 1px solid var(--border); }
+.video-settings__preferences > summary { padding-block: var(--sp-3); cursor: pointer; font-size: 13px; }
+.video-settings__preferences > summary .video-settings__hint { margin-left: var(--sp-3); }
 .video-settings__duration-input { width: 160px; max-width: 100%; }
+.video-settings__duration-control { display: grid; justify-items: end; gap: var(--sp-2); }
+.video-settings__automatic-duration { display: block; }
 .video-settings__duration-recommendation { display: flex; justify-content: flex-end; padding-block: var(--sp-2); }
-.video-settings__actions { display: flex; justify-content: flex-end; margin-top: var(--sp-3); }
+.video-settings__actions { display: flex; justify-content: flex-end; gap: var(--sp-2); margin-top: var(--sp-3); }
+@media (max-width: 640px) {
+  .video-settings__model-row { flex-direction: column; align-items: stretch; }
+  .video-settings__model-control, .video-settings__credential-control { width: 100%; max-width: none; }
+  .video-settings__preferences > summary .video-settings__hint { display: block; margin: var(--sp-1) 0 0; }
+}
 @media (prefers-reduced-motion: reduce) {
   .video-settings__chevron { transition: none; }
 }

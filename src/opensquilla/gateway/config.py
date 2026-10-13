@@ -1809,10 +1809,8 @@ class VideoGenerationConfig(BaseSettings):
             "for OpenRouter or veo-3.1-generate-preview for Gemini."
         ),
     )
-    # Leave duration unset to select the shortest duration advertised by the
-    # model within max_duration_seconds at request time.
-    duration_seconds: int | None = Field(default=None, ge=1, le=60)
-    max_duration_seconds: int = Field(default=8, ge=1, le=60)
+    # Leave duration unset to use the provider/model default at request time.
+    duration_seconds: int | None = Field(default=None, ge=1)
     aspect_ratio: Literal["16:9", "9:16"] = "16:9"
     allowed_aspect_ratios: list[Literal["16:9", "9:16"]] = Field(
         default_factory=_default_video_aspect_ratios
@@ -1826,6 +1824,16 @@ class VideoGenerationConfig(BaseSettings):
     providers: VideoGenerationProvidersConfig = Field(
         default_factory=VideoGenerationProvidersConfig
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_retired_duration_limit(cls, data: Any) -> Any:
+        # Older profiles stored an extra operator cap. It no longer affects
+        # requests; tolerate even invalid legacy values without exposing a
+        # configurable field or weakening validation of the remaining fields.
+        if isinstance(data, dict):
+            return {key: value for key, value in data.items() if key != "max_duration_seconds"}
+        return data
 
     @field_validator("primary")
     @classmethod
@@ -1869,16 +1877,10 @@ class VideoGenerationConfig(BaseSettings):
                     "video_generation.primary must be a raw provider video model ID "
                     "without a prefix"
                 )
-        if self.duration_seconds is not None and self.duration_seconds > self.max_duration_seconds:
-            raise ValueError("duration_seconds cannot exceed max_duration_seconds")
         if self.effective_provider == "gemini":
-            if self.max_duration_seconds < 4:
-                raise ValueError("Gemini Veo max_duration_seconds must be at least 4")
             if self.duration_seconds is not None and self.duration_seconds not in {4, 6, 8}:
                 raise ValueError("Gemini Veo duration_seconds must be 4, 6, or 8")
             if self.resolution == "1080p":
-                if self.max_duration_seconds < 8:
-                    raise ValueError("Gemini Veo 1080p requires max_duration_seconds of at least 8")
                 if self.duration_seconds is not None and self.duration_seconds != 8:
                     raise ValueError("Gemini Veo 1080p requires duration_seconds of 8")
         if self.enabled:
@@ -1889,10 +1891,6 @@ class VideoGenerationConfig(BaseSettings):
                     and self.primary.startswith("happyhorse-")
                     else 2
                 )
-                if self.max_duration_seconds < minimum:
-                    raise ValueError(
-                        f"{self.effective_provider} max_duration_seconds must be at least {minimum}"
-                    )
                 if self.duration_seconds is not None and self.duration_seconds < minimum:
                     raise ValueError(
                         f"{self.effective_provider} duration_seconds must be at least {minimum}"

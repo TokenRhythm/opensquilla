@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tomllib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +24,8 @@ def test_video_generation_defaults_to_disabled_without_a_model() -> None:
     assert config.video_generation.effective_provider == ""
     assert config.video_generation.primary == ""
     assert config.video_generation.duration_seconds is None
-    assert config.video_generation.max_duration_seconds == 8
+    assert "max_duration_seconds" not in config.to_public_dict()["video_generation"]
+    assert "max_duration_seconds" not in VideoGenerationConfig.model_json_schema()["properties"]
     assert config.video_generation.aspect_ratio == "16:9"
     assert config.video_generation.allowed_aspect_ratios == ["16:9", "9:16"]
     assert config.video_generation.resolution == "720p"
@@ -42,6 +44,55 @@ def test_video_generation_keeps_legacy_openrouter_model_when_provider_is_omitted
     assert config.provider == ""
     assert config.effective_provider == "openrouter"
     assert config.primary == "google/veo-3.1-fast"
+
+
+@pytest.mark.parametrize("legacy_limit", [8, 0, -1, 60, None, True, "invalid", [8]])
+def test_retired_video_duration_limit_is_ignored(legacy_limit: object) -> None:
+    config = VideoGenerationConfig(
+        enabled=True,
+        provider="tokenrhythm",
+        primary="wan3.0-video",
+        duration_seconds=20,
+        max_duration_seconds=legacy_limit,
+    )
+
+    assert config.duration_seconds == 20
+    assert "max_duration_seconds" not in config.model_dump()
+
+
+@pytest.mark.parametrize("duration", [61, 120])
+def test_openrouter_default_duration_is_checked_against_model_at_request_time(
+    duration: int,
+) -> None:
+    config = VideoGenerationConfig(
+        enabled=True, provider="openrouter", primary="vendor/video-model", duration_seconds=duration
+    )
+    assert config.duration_seconds == duration
+
+
+@pytest.mark.parametrize("legacy_limit", ["8", '"invalid"', "-1"])
+def test_legacy_video_duration_limit_loads_and_is_removed_on_save(
+    tmp_path: Path, legacy_limit: str
+) -> None:
+    from opensquilla.onboarding.config_store import persist_config
+
+    path = tmp_path / "config.toml"
+    original = (
+        '[video_generation]\nenabled = true\nprovider = "tokenrhythm"\n'
+        'primary = "wan3.0-video"\nduration_seconds = 20\n'
+        f"max_duration_seconds = {legacy_limit}\n"
+    )
+    path.write_text(original, encoding="utf-8")
+    config = GatewayConfig.load(path, read_only=True)
+    assert path.read_text(encoding="utf-8") == original
+    assert config.video_generation.duration_seconds == 20
+    assert "max_duration_seconds" not in config.to_public_dict()["video_generation"]
+
+    persist_config(config, path=path, backup=False)
+    stored = tomllib.loads(path.read_text(encoding="utf-8"))["video_generation"]
+    assert "max_duration_seconds" not in stored
+    assert stored["duration_seconds"] == 20
+    assert stored["primary"] == "wan3.0-video"
 
 
 def test_video_generation_requires_a_provider_native_model_when_enabled() -> None:
@@ -409,9 +460,7 @@ async def test_manual_video_key_without_binding_keeps_original_origin_after_url_
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"max_duration_seconds": 3}, "max_duration_seconds must be at least 4"),
         ({"duration_seconds": 5}, "duration_seconds must be 4, 6, or 8"),
-        ({"resolution": "1080p", "max_duration_seconds": 6}, "1080p requires max_duration_seconds"),
         ({"resolution": "1080p", "duration_seconds": 6}, "1080p requires duration_seconds"),
     ],
 )
@@ -439,10 +488,6 @@ def test_gemini_video_generation_rejects_unsupported_duration_settings(
 def test_video_generation_duration_matches_provider_adapter_limits(
     provider: str, model: str, minimum: int, maximum: int
 ) -> None:
-    with pytest.raises(ValidationError):
-        VideoGenerationConfig(
-            enabled=True, provider=provider, primary=model, max_duration_seconds=minimum - 1
-        )
     if minimum > 1:
         with pytest.raises(ValidationError, match=f"duration_seconds must be at least {minimum}"):
             VideoGenerationConfig(
@@ -467,7 +512,7 @@ def test_video_generation_duration_matches_provider_adapter_limits(
     compatible = VideoGenerationConfig(
         enabled=True, provider=provider, primary=model, max_duration_seconds=60
     )
-    assert compatible.max_duration_seconds == 60
+    assert "max_duration_seconds" not in compatible.model_dump()
 
 
 def test_gemini_video_generation_accepts_legacy_large_limit_without_explicit_duration() -> None:
@@ -477,7 +522,8 @@ def test_gemini_video_generation_accepts_legacy_large_limit_without_explicit_dur
         primary="veo-3.1-generate-preview",
         max_duration_seconds=60,
     )
-    assert config.max_duration_seconds == 60
+    assert config.duration_seconds is None
+    assert "max_duration_seconds" not in config.model_dump()
 
 
 def test_xai_original_grok_model_rejects_1080p_default() -> None:
@@ -494,12 +540,6 @@ def test_xai_original_grok_model_rejects_1080p_default() -> None:
 @pytest.mark.parametrize(
     "draft",
     [
-        {"provider": "tokenrhythm", "primary": "wan3.0-video", "max_duration_seconds": 1},
-        {
-            "provider": "qwen_token_plan",
-            "primary": "happyhorse-1.1-t2v",
-            "max_duration_seconds": 2,
-        },
         {
             "provider": "xai",
             "primary": "grok-imagine-video",
@@ -540,9 +580,9 @@ def test_gemini_video_generation_accepts_supported_duration_settings(overrides: 
     assert config.effective_provider == "gemini"
 
 
-def test_gemini_video_duration_limits_apply_before_enabling() -> None:
-    with pytest.raises(ValidationError, match="max_duration_seconds must be at least 4"):
-        VideoGenerationConfig(provider="gemini", max_duration_seconds=3)
+def test_gemini_video_duration_rules_apply_before_enabling() -> None:
+    with pytest.raises(ValidationError, match="duration_seconds must be 4, 6, or 8"):
+        VideoGenerationConfig(provider="gemini", duration_seconds=3)
 
 
 def test_legacy_openrouter_video_route_keeps_its_duration_rules() -> None:
@@ -560,13 +600,10 @@ def test_legacy_openrouter_video_route_keeps_its_duration_rules() -> None:
 
 @pytest.mark.parametrize("provider", ["qwen", "qwen_token_plan"])
 def test_happyhorse_video_requires_at_least_three_seconds(provider: str) -> None:
-    with pytest.raises(ValidationError, match="at least 3"):
-        VideoGenerationConfig(
-            enabled=True,
-            provider=provider,
-            primary="happyhorse-1.1-t2v",
-            max_duration_seconds=2,
-        )
+    config = VideoGenerationConfig(
+        enabled=True, provider=provider, primary="happyhorse-1.1-t2v", max_duration_seconds=2
+    )
+    assert config.duration_seconds is None
     with pytest.raises(ValidationError, match="at least 3"):
         VideoGenerationConfig(
             enabled=True,
@@ -580,9 +617,6 @@ def test_happyhorse_video_requires_at_least_three_seconds(provider: str) -> None
     ("overrides", "field"),
     [
         ({"duration_seconds": 0}, "duration_seconds"),
-        ({"duration_seconds": 61}, "duration_seconds"),
-        ({"max_duration_seconds": 0}, "max_duration_seconds"),
-        ({"duration_seconds": 9}, "max_duration_seconds"),
         ({"aspect_ratio": "1:1"}, "aspect_ratio"),
         ({"allowed_aspect_ratios": []}, "allowed_aspect_ratios"),
         ({"allowed_aspect_ratios": ["16:9", "16:9"]}, "allowed_aspect_ratios"),
@@ -626,7 +660,7 @@ def test_video_generation_accepts_nested_settings_and_round_trips() -> None:
     assert stored["primary"] == "google/veo-3.1-fast"
     assert stored["provider"] == ""
     assert stored["duration_seconds"] == 8
-    assert stored["max_duration_seconds"] == 8
+    assert "max_duration_seconds" not in stored
     assert stored["aspect_ratio"] == "9:16"
     assert stored["allowed_aspect_ratios"] == ["9:16"]
     assert stored["resolution"] == "1080p"
@@ -691,7 +725,7 @@ def test_video_generation_accepts_environment_configuration(monkeypatch) -> None
     assert config.video_generation.enabled is True
     assert config.video_generation.effective_provider == "openrouter"
     assert config.video_generation.primary == "google/veo-3.1-fast"
-    assert config.video_generation.max_duration_seconds == 6
+    assert "max_duration_seconds" not in config.video_generation.model_dump()
 
 
 def test_video_generation_accepts_explicit_gemini_environment_configuration(monkeypatch) -> None:

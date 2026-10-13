@@ -77,7 +77,6 @@ async def _generate(path: Path, **overrides: object):
         "model": _MODEL,
         "prompt": "A quiet city street at dawn",
         "duration": 5,
-        "max_duration_seconds": 8,
         "aspect_ratio": "16:9",
         "resolution": "720p",
         "output_path": path,
@@ -184,18 +183,19 @@ async def test_unsupported_model_option_is_rejected_before_paid_post(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("durations", "include_durations", "limit", "expected"),
+    ("durations", "include_durations", "expected"),
     [
-        ([12, 6, 4], True, 8, 4),
-        (None, False, 3, 3),
+        ([12, 6, 4], True, 4),
+        ([12], True, 12),
+        ([120], True, 120),
+        (None, False, 5),
     ],
 )
-async def test_omitted_duration_posts_explicit_bounded_model_duration(
+async def test_omitted_duration_posts_shortest_supported_model_duration(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     durations: list[int] | None,
     include_durations: bool,
-    limit: int,
     expected: int,
 ) -> None:
     posts: list[dict[str, object]] = []
@@ -214,16 +214,15 @@ async def test_omitted_duration_posts_explicit_bounded_model_duration(
 
     _install_transport(monkeypatch, handler)
     destination = tmp_path / "clip.mp4"
-    await _generate(destination, duration=None, max_duration_seconds=limit)
+    await _generate(destination, duration=None)
     assert destination.read_bytes() == _MP4
     assert len(posts) == 1
     assert posts[0]["duration"] == expected
-    assert expected <= limit
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("durations", [[12], []])
-async def test_omitted_duration_without_supported_bounded_option_rejects_before_post(
+@pytest.mark.parametrize("durations", [[], [0], [True]])
+async def test_omitted_duration_with_invalid_model_options_rejects_before_post(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, durations: list[int]
 ) -> None:
     requests: list[httpx.Request] = []
@@ -239,16 +238,16 @@ async def test_omitted_duration_without_supported_bounded_option_rejects_before_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("limit", [0, 4])
-async def test_duration_limit_rejects_invalid_or_over_limit_before_network(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, limit: int
+@pytest.mark.parametrize("duration", [0, -1, True, 1.5])
+async def test_invalid_duration_rejects_before_network(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, duration: object
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
     _install_transport(monkeypatch, handler)
     with pytest.raises(VideoGenerationError, match="duration"):
-        await _generate(tmp_path / "clip.mp4", max_duration_seconds=limit)
+        await _generate(tmp_path / "clip.mp4", duration=duration)
 
 
 @pytest.mark.asyncio

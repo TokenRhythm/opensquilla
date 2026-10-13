@@ -423,8 +423,112 @@ describe('SettingsDialog video draft exit guard', () => {
     model.value = 'google/veo-3.1-fast'
     model.dispatchEvent(new Event('input', { bubbles: true }))
     await nextTick()
-    return { el, patch }
+    return { el, patch, controls }
   }
+
+  it('includes a video-only draft in the shared save bar and capability rail', async () => {
+    const { el, patch, controls } = await mountVideoDraft()
+    const bar = el.querySelector('.settings-dirtybar')!
+    expect(bar.textContent).toContain(i18n.global.t('settings.rail.capabilities'))
+    expect(el.querySelector('#settings-rail-capabilities .settings-rail__dirty')).not.toBeNull()
+    expect(el.querySelector('.video-settings__actions')).toBeNull()
+    bar.querySelector<HTMLButtonElement>('button.btn--primary')!.click()
+
+    await vi.waitFor(() => expect(el.querySelector('.settings-dirtybar')).toBeNull())
+    expect(patch).toHaveBeenCalledExactlyOnceWith([
+      { path: 'video_generation.provider', value: 'openrouter' },
+      { path: 'video_generation.primary', value: 'google/veo-3.1-fast' },
+    ])
+    expect(controls.saveDirtySections).not.toHaveBeenCalled()
+  })
+
+  it('discards a video-only draft from the shared bar without reloading or writing', async () => {
+    const { el, patch, controls } = await mountVideoDraft()
+    el.querySelector<HTMLButtonElement>('.settings-dirtybar button')!.click()
+    await nextTick()
+
+    expect(el.querySelector('.settings-dirtybar')).toBeNull()
+    expect(el.querySelector<HTMLSelectElement>('[name="setup_video_provider"]')?.value).toBe('')
+    expect(controls.discardChanges).not.toHaveBeenCalled()
+    expect(patch).not.toHaveBeenCalled()
+    expect(await leaveGuard!({ path: '/sessions' })).toBe(true)
+    expect(confirmChoiceAction).not.toHaveBeenCalled()
+  })
+
+  it('counts image and video edits as one capability section and locks both save stages', async () => {
+    const { el, patch, controls } = await mountVideoDraft()
+    controls.hasUnsavedChanges.value = true
+    catalogApi.dirtySections.value = [{ id: 'capabilities', label: 'Capabilities' }]
+    let finishCatalogSave!: () => void
+    controls.saveDirtySections.mockImplementation(() => new Promise<void>(resolve => {
+      finishCatalogSave = () => {
+        controls.hasUnsavedChanges.value = false
+        catalogApi.dirtySections.value = []
+        resolve()
+      }
+    }))
+    let finishVideoSave!: () => void
+    patch.mockImplementation(() => new Promise(resolve => {
+      finishVideoSave = () => resolve({ restartRequired: false })
+    }))
+    await nextTick()
+    const bar = el.querySelector('.settings-dirtybar')!
+    expect(bar.textContent).toContain(i18n.global.t('settings.dialog.unsavedIn', {
+      sections: i18n.global.t('settings.rail.capabilities'),
+    }))
+    const save = bar.querySelector<HTMLButtonElement>('button.btn--primary')!
+    save.click()
+    await nextTick()
+    expect(controls.saveDirtySections).toHaveBeenCalledOnce()
+    expect(patch).not.toHaveBeenCalled()
+    expect(save.disabled).toBe(true)
+    expect(el.querySelector<HTMLFieldSetElement>('.settings-panel__interactions')?.disabled).toBe(true)
+    save.click()
+    expect(controls.saveDirtySections).toHaveBeenCalledOnce()
+
+    finishCatalogSave()
+    await vi.waitFor(() => expect(patch).toHaveBeenCalledOnce())
+    expect(save.disabled).toBe(true)
+    expect(await leaveGuard!({ path: '/sessions' })).toBe(false)
+    finishVideoSave()
+    await vi.waitFor(() => expect(el.querySelector('.settings-dirtybar')).toBeNull())
+    expect(el.querySelector<HTMLFieldSetElement>('.settings-panel__interactions')?.disabled).toBe(false)
+  })
+
+  it('retains the video draft when a shared capability save does not complete', async () => {
+    const { el, patch, controls } = await mountVideoDraft()
+    controls.hasUnsavedChanges.value = true
+    catalogApi.dirtySections.value = [{ id: 'capabilities', label: 'Capabilities' }]
+    el.querySelector<HTMLButtonElement>('.settings-dirtybar button.btn--primary')!.click()
+    await nextTick()
+    await nextTick()
+
+    expect(controls.saveDirtySections).toHaveBeenCalledOnce()
+    expect(patch).not.toHaveBeenCalled()
+    expect(el.querySelector('.settings-dirtybar')).not.toBeNull()
+    await vi.waitFor(() => expect(el.querySelector<HTMLButtonElement>('.settings-dirtybar button.btn--primary')?.disabled).toBe(false))
+  })
+
+  it('keeps a failed video save editable and protected by the exit guard', async () => {
+    const { el, patch } = await mountVideoDraft()
+    catalogApi.section.value = 'general'
+    routeState.params.section = 'general'
+    await nextTick()
+    patch.mockRejectedValueOnce(new Error('Video settings could not be saved'))
+    el.querySelector<HTMLButtonElement>('.settings-dirtybar button.btn--primary')!.click()
+    await vi.waitFor(() => expect(el.textContent).toContain('Video settings could not be saved'))
+    await vi.waitFor(() => expect(catalogApi.section.value).toBe('capabilities'))
+    expect(el.querySelector<HTMLDetailsElement>('[data-testid="video-generation-settings"]')?.open).toBe(true)
+    expect(el.querySelector<HTMLDetailsElement>('[data-testid="video-generation-settings"]')?.hidden).toBe(false)
+    expect(document.activeElement?.textContent).toContain('Video settings could not be saved')
+    expect(el.querySelector('.settings-dirtybar')).not.toBeNull()
+    expect(el.querySelector<HTMLButtonElement>('.settings-dirtybar button.btn--primary')?.disabled).toBe(false)
+
+    confirmChoiceAction.mockResolvedValueOnce('cancel')
+    expect(await leaveGuard!({ path: '/sessions' })).toBe(false)
+    expect(confirmChoiceAction).toHaveBeenCalledOnce()
+    expect(patch).toHaveBeenCalledOnce()
+  })
 
   it('preserves an unsaved video draft across sections and saves it on exit', async () => {
     const { el, patch } = await mountVideoDraft()

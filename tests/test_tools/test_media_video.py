@@ -547,7 +547,7 @@ async def test_video_generate_registers_mp4_for_delivery_and_uses_selected_param
 
     assert len(calls) == 1
     assert calls[0]["duration"] == 8
-    assert calls[0]["max_duration_seconds"] == config.max_duration_seconds
+    assert "max_duration_seconds" not in calls[0]
     assert calls[0]["aspect_ratio"] == "9:16"
     assert calls[0]["resolution"] == "1080p"
     assert calls[0]["max_bytes"] == config.max_output_bytes
@@ -678,7 +678,7 @@ async def test_web_video_without_artifact_context_reports_delivery_failure(
 
 
 @pytest.mark.asyncio
-async def test_video_generation_rejects_parameters_outside_operator_limits(
+async def test_video_generation_rejects_invalid_parameters(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -696,7 +696,7 @@ async def test_video_generation_rejects_parameters_outside_operator_limits(
     token = current_tool_context.set(_context(tmp_path))
     try:
         with pytest.raises(ToolError, match="duration_seconds"):
-            await media.video_generate("A short clip", duration_seconds=9)
+            await media.video_generate("A short clip", duration_seconds=0)
         with pytest.raises(ToolError, match="outside workspace"):
             await media.video_generate("A short clip", filename="../outside.mp4")
     finally:
@@ -714,7 +714,6 @@ async def test_gemini_parameters_fail_before_video_submission(
         enabled=True,
         provider="gemini",
         primary="veo-3.1-fast-generate-preview",
-        max_duration_seconds=6,
     )
     monkeypatch.setattr(
         media, "_video_request_config", lambda: (config, SimpleNamespace(api_key="test-key"))
@@ -729,7 +728,7 @@ async def test_gemini_parameters_fail_before_video_submission(
         with pytest.raises(ToolError, match="4, 6, or 8"):
             await media.video_generate("A city skyline", duration_seconds=5)
         with pytest.raises(ToolError, match="1080p"):
-            await media.video_generate("A city skyline", resolution="1080p")
+            await media.video_generate("A city skyline", duration_seconds=6, resolution="1080p")
     finally:
         current_tool_context.reset(token)
 
@@ -744,19 +743,71 @@ async def test_gemini_parameters_fail_before_video_submission(
         ("tokenrhythm", "wan3.0-video", 30),
     ],
 )
-def test_video_parameters_cap_agent_requests_without_rejecting_legacy_configured_limit(
+def test_video_parameters_apply_provider_duration_limits(
     provider: str, model: str, cap: int
 ) -> None:
     config = VideoGenerationConfig(
         enabled=True, provider=provider, primary=model, max_duration_seconds=60
     )
-    assert media._video_parameters(
-        config, duration_seconds=None, aspect_ratio=None, resolution=None
-    )[0] is None
+    assert (
+        media._video_parameters(config, duration_seconds=None, aspect_ratio=None, resolution=None)[
+            0
+        ]
+        is None
+    )
     with pytest.raises(ToolError, match=f"between .* and {cap} for {provider}"):
         media._video_parameters(
             config, duration_seconds=cap + 1, aspect_ratio=None, resolution=None
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured_duration", "request_duration", "expected"),
+    [(None, 10, 10), (None, 20, 20), (12, None, 12), (12, 20, 20), (None, None, None)],
+)
+async def test_tokenrhythm_duration_precedence_ignores_retired_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_duration: int | None,
+    request_duration: int | None,
+    expected: int | None,
+) -> None:
+    from opensquilla.provider import tokenrhythm_video_generation
+
+    config = VideoGenerationConfig(
+        enabled=True,
+        provider="tokenrhythm",
+        primary="wan3.0-video",
+        duration_seconds=configured_duration,
+        max_duration_seconds=8,
+    )
+    monkeypatch.setattr(
+        media, "_video_request_config", lambda: (config, SimpleNamespace(api_key="test-key"))
+    )
+    calls: list[dict[str, object]] = []
+
+    async def fake_generate(**kwargs: object) -> video_generation.VideoGenerationResult:
+        calls.append(kwargs)
+        path = kwargs["output_path"]
+        assert isinstance(path, Path)
+        path.write_bytes(b"\x00\x00\x00\x0cftypisom")
+        return video_generation.VideoGenerationResult(
+            job_id="duration-job", output_path=path, model=str(kwargs["model"]), bytes_written=12
+        )
+
+    monkeypatch.setattr(tokenrhythm_video_generation, "generate_tokenrhythm_video", fake_generate)
+    token = current_tool_context.set(_context(tmp_path, artifacts=True))
+    try:
+        response = json.loads(
+            await media.video_generate("A short clip", duration_seconds=request_duration)
+        )
+    finally:
+        current_tool_context.reset(token)
+    assert response["status"] == "ok"
+    assert len(calls) == 1
+    assert calls[0]["duration"] == expected
+    assert "max_duration_seconds" not in calls[0]
 
 
 def test_xai_original_grok_model_rejects_1080p_request_override() -> None:

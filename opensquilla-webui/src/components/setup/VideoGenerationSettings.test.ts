@@ -37,12 +37,12 @@ function credential(source = 'llm_fallback', overrides: Record<string, unknown> 
     apiKeyEnvAuthored: false, ...overrides,
   }
 }
-async function mountSettings(section: unknown = videoConfig, workflow?: Partial<SetupWorkflow>) {
+async function mountSettings(section: unknown = videoConfig, workflow?: Partial<SetupWorkflow>, props?: { showActions: boolean }) {
   const readAll = vi.fn().mockResolvedValue(section === null ? {} : { video_generation: section })
   const patch = vi.fn().mockResolvedValue({ restartRequired: false })
   const el = document.createElement('div')
   document.body.appendChild(el)
-  app = createApp(VideoGenerationSettings)
+  app = createApp(VideoGenerationSettings, props)
   app.use(i18n)
   app.provide(APP_SETTINGS_KEY, { readAll, patch } as unknown as AppSettings)
   if (workflow) app.provide(SETUP_WORKFLOW_KEY, workflow as SetupWorkflow)
@@ -81,8 +81,10 @@ async function editCredential(el: HTMLElement, mode: 'key' | 'env' = 'key') {
   await nextTick()
   await select(el, 'setup_video_credential_mode', mode)
 }
-function saveButton(el: HTMLElement) { return el.querySelector<HTMLButtonElement>('.video-settings__actions button')! }
+function saveButton(el: HTMLElement) { return el.querySelector<HTMLButtonElement>('.video-settings__actions .btn--primary')! }
 function sourceText(el: HTMLElement) { return el.querySelector('.video-settings__credential-card .capability-card__credential-detail')?.textContent || '' }
+function modelStatus(el: HTMLElement) { return el.querySelector('[data-testid="video-model-status"]')?.textContent || '' }
+function refreshModelsButton(el: HTMLElement) { return el.querySelector<HTMLButtonElement>('[data-testid="video-refresh-models"]')! }
 async function restore(el: HTMLElement) {
   el.querySelector<HTMLButtonElement>('[data-testid="video-restore-shared-credential"]')!.click()
   await nextTick()
@@ -90,17 +92,17 @@ async function restore(el: HTMLElement) {
 
 describe('video generation settings', () => {
   it.each([
-    { enabled: false, available: true, primary: 'wan3.0-video', label: 'statusPending', tone: 'is-muted' },
-    { enabled: true, available: true, primary: 'wan3.0-video', label: 'statusAvailable', tone: 'is-ok' },
-    { enabled: true, available: false, primary: 'wan3.0-video', label: 'statusNeedsAction', tone: 'is-warn' },
-    { enabled: true, available: true, primary: '', label: 'statusNeedsAction', tone: 'is-warn' },
+    { enabled: false, available: true, primary: 'wan3.0-video', label: 'setup.video.disabledStatus', tone: 'is-muted' },
+    { enabled: true, available: true, primary: 'wan3.0-video', label: 'setup.video.configured', tone: 'is-ok' },
+    { enabled: true, available: false, primary: 'wan3.0-video', label: 'setup.capabilities.statusNeedsAction', tone: 'is-warn' },
+    { enabled: true, available: true, primary: '', label: 'setup.capabilities.statusNeedsAction', tone: 'is-warn' },
   ])('shows $label for enabled=$enabled, credential=$available, model=$primary', async ({ enabled, available, primary, label, tone }) => {
     const { el, vm } = await mountSettings({ ...selectedConfig, enabled, primary },
       workflowFor(credential(available ? 'llm_fallback' : 'none', { available })))
     await vm.refreshCredentialStatus()
     await nextTick()
     const badge = el.querySelector('.video-settings__status')!
-    expect(badge.textContent).toBe(i18n.global.t(`setup.capabilities.${label}`))
+    expect(badge.textContent).toBe(i18n.global.t(label))
     expect(badge.classList.contains(tone)).toBe(true)
   })
 
@@ -112,28 +114,25 @@ describe('video generation settings', () => {
     expect(el.querySelector('.video-settings__status')?.classList.contains('is-ok')).toBe(false)
     vm.discard()
     await nextTick()
-    expect(el.querySelector('.video-settings__status')?.textContent).toBe(i18n.global.t('setup.capabilities.statusAvailable'))
+    expect(el.querySelector('.video-settings__status')?.textContent).toBe(i18n.global.t('setup.video.configured'))
   })
 
-  it('applies recommended durations only to the draft, supports discard and saves just those fields', async () => {
+  it('resets only the default duration, supports discard and never writes the removed maximum', async () => {
     const { el, patch, vm } = await mountSettings({
       ...selectedConfig, enabled: true, duration_seconds: 2, max_duration_seconds: 2,
     }, workflowFor(credential()))
     await vm.refreshCredentialStatus()
     await nextTick()
     const duration = el.querySelector<HTMLInputElement>('[name="setup_video_duration"]')!
-    const maximum = el.querySelector<HTMLInputElement>('[name="setup_video_max_duration"]')!
-    const recommend = el.querySelector<HTMLButtonElement>('[data-testid="video-recommended-duration"]')!
     expect(duration.value).toBe('2')
-    expect(maximum.value).toBe('2')
+    expect(el.querySelector('[name="setup_video_max_duration"]')).toBeNull()
     expect(saveButton(el).disabled).toBe(true)
 
-    await input(el, 'setup_video_duration', '8')
+    await input(el, 'setup_video_duration', '31')
     expect(el.querySelector('[role="alert"]')).not.toBeNull()
-    recommend.click()
+    el.querySelector<HTMLButtonElement>('[data-testid="video-recommended-duration"]')!.click()
     await nextTick()
     expect(duration.value).toBe('')
-    expect(maximum.value).toBe('8')
     expect(el.querySelector('[role="alert"]')).toBeNull()
     expect(saveButton(el).disabled).toBe(false)
     expect(patch).not.toHaveBeenCalled()
@@ -141,24 +140,103 @@ describe('video generation settings', () => {
     vm.discard()
     await nextTick()
     expect(duration.value).toBe('2')
-    expect(maximum.value).toBe('2')
     expect(saveButton(el).disabled).toBe(true)
 
-    recommend.click()
+    el.querySelector<HTMLButtonElement>('[data-testid="video-recommended-duration"]')!.click()
     await nextTick()
     expect(await vm.save()).toBe(true)
     expect(patch).toHaveBeenCalledExactlyOnceWith([
       { path: 'video_generation.duration_seconds', value: null },
-      { path: 'video_generation.max_duration_seconds', value: 8 },
     ])
     expect(saveButton(el).disabled).toBe(true)
   })
 
-  it('offers only TokenRhythm and OpenRouter as selectable providers', async () => {
-    const { el } = await mountSettings()
-    expect(Array.from(el.querySelectorAll<HTMLOptionElement>('[name="setup_video_provider"] option'), option => option.value))
-      .toEqual(['', 'openrouter', 'tokenrhythm'])
+  it('recommends TokenRhythm first without changing a blank installation on load', async () => {
+    const { el, patch } = await mountSettings()
+    const providerSelect = el.querySelector<HTMLSelectElement>('[name="setup_video_provider"]')!
+    expect(Array.from(providerSelect.options, option => option.value)).toEqual(['', 'tokenrhythm', 'openrouter'])
+    expect(providerSelect.options[0]?.disabled).toBe(true)
+    const groups = Array.from(providerSelect.querySelectorAll('optgroup'))
+    expect(groups.map(group => group.label)).toEqual([
+      i18n.global.t('setup.capabilities.imageRecommendedGroup'),
+      i18n.global.t('setup.capabilities.imageOtherProvidersGroup'),
+    ])
+    expect(groups[0]?.querySelector('option')?.textContent).toContain(`TokenRhythm · ${i18n.global.t('setup.capabilities.imageRecommendedBadge')}`)
+    expect(providerSelect.value).toBe('')
+    expect(saveButton(el).disabled).toBe(true)
+    expect(patch).not.toHaveBeenCalled()
     expect(el.querySelector('.video-settings__chevron path')).not.toBeNull()
+  })
+
+  it('defaults a newly enabled configuration to TokenRhythm and can discard before saving', async () => {
+    const { el, patch, vm } = await mountSettings()
+    await toggle(el, true)
+    expect(el.querySelector<HTMLSelectElement>('[name="setup_video_provider"]')?.value).toBe('tokenrhythm')
+    expect(el.querySelector<HTMLInputElement>('[name="setup_provider_video_primary"]')?.value).toBe('wan3.0-video')
+    expect(saveButton(el).disabled).toBe(false)
+    expect(patch).not.toHaveBeenCalled()
+    el.querySelector<HTMLButtonElement>('[data-testid="video-discard"]')!.click()
+    await nextTick()
+    expect(el.querySelector<HTMLInputElement>('[name="setup_video_enabled"]')?.checked).toBe(false)
+    expect(el.querySelector<HTMLSelectElement>('[name="setup_video_provider"]')?.value).toBe('')
+    expect(saveButton(el).disabled).toBe(true)
+    expect(el.querySelector('[data-testid="video-discard"]')).toBeNull()
+    await toggle(el, true)
+    expect(await vm.save()).toBe(true)
+    expect(patch).toHaveBeenCalledExactlyOnceWith([
+      { path: 'video_generation.enabled', value: true },
+      { path: 'video_generation.provider', value: 'tokenrhythm' },
+      { path: 'video_generation.primary', value: 'wan3.0-video' },
+    ])
+  })
+
+  it('defaults to OpenRouter when the Gateway does not support TokenRhythm settings', async () => {
+    const { el, patch, vm } = await mountSettings({ ...videoConfig, providers: { openrouter: providers.openrouter } })
+    await toggle(el, true)
+    expect(el.querySelector<HTMLSelectElement>('[name="setup_video_provider"]')?.value).toBe('openrouter')
+    expect(await vm.save()).toBe(true)
+    expect(patch).toHaveBeenCalledExactlyOnceWith([
+      { path: 'video_generation.enabled', value: true },
+      { path: 'video_generation.provider', value: 'openrouter' },
+      { path: 'video_generation.primary', value: 'google/veo-3.1-fast' },
+    ])
+  })
+
+  it('hides disabled configuration while preserving a saved OpenRouter provider and model', async () => {
+    const { el, patch, vm } = await mountSettings({ ...videoConfig, enabled: true, provider: 'openrouter', primary: 'vendor/custom-video' })
+    const configuration = el.querySelector<HTMLElement>('[data-testid="video-configuration"]')!
+    expect(configuration.hidden).toBe(false)
+    await toggle(el, false)
+    expect(configuration.hidden).toBe(true)
+    expect(configuration.querySelector('summary')?.closest('[hidden]')).toBe(configuration)
+    expect(el.querySelector('[name="setup_video_provider"]')?.closest('[hidden]')).toBe(configuration)
+    expect(await vm.save()).toBe(true)
+    expect(patch).toHaveBeenCalledExactlyOnceWith([{ path: 'video_generation.enabled', value: false }])
+    await toggle(el, true)
+    expect(configuration.hidden).toBe(false)
+    expect(el.querySelector<HTMLSelectElement>('[name="setup_video_provider"]')?.value).toBe('openrouter')
+    expect(el.querySelector<HTMLInputElement>('[name="setup_provider_video_primary"]')?.value).toBe('vendor/custom-video')
+    expect(await vm.save()).toBe(true)
+    expect(patch).toHaveBeenLastCalledWith([{ path: 'video_generation.enabled', value: true }])
+  })
+
+  it('keeps duration in collapsed advanced options and aspect and resolution in preferences', async () => {
+    const { el, patch, vm } = await mountSettings({ ...selectedConfig, enabled: true }, undefined, { showActions: false })
+    const preferences = el.querySelector<HTMLDetailsElement>('details.video-settings__preferences')!
+    const advanced = el.querySelector<HTMLDetailsElement>('details.video-settings__connection-options')!
+    expect(preferences.open).toBe(false)
+    expect(advanced.open).toBe(false)
+    for (const name of ['setup_video_aspect', 'setup_video_resolution']) {
+      expect(preferences.querySelector(`[name="${name}"]`), name).not.toBeNull()
+    }
+    expect(preferences.querySelector('[name="setup_video_duration"]')).toBeNull()
+    expect(el.querySelector('[name="setup_video_max_duration"]')).toBeNull()
+    expect(advanced.querySelector('[name="setup_video_duration"]')).not.toBeNull()
+    expect(advanced.querySelector('[name="setup_video_base_url"]')).not.toBeNull()
+    await input(el, 'setup_video_duration', '6')
+    expect(el.querySelector('.video-settings__actions')).toBeNull()
+    expect(await vm.save()).toBe(true)
+    expect(patch).toHaveBeenCalledExactlyOnceWith([{ path: 'video_generation.duration_seconds', value: 6 }])
   })
 
   it('patches only the selected provider, model and enabled state on first setup', async () => {
@@ -525,6 +603,24 @@ describe('video generation settings', () => {
     expect(patch).toHaveBeenLastCalledWith([{ path: 'video_generation.enabled', value: false }])
   })
 
+  it.each([
+    { duration: 5, resolution: '720p' },
+    { duration: 6, resolution: '1080p' },
+  ])('disables a saved legacy Gemini $duration-second $resolution route without rewriting its duration', async ({ duration, resolution }) => {
+    const { el, patch, vm } = await mountSettings({
+      ...videoConfig, enabled: true, provider: 'gemini', primary: 'veo-3.1-generate-preview',
+      duration_seconds: duration, resolution,
+    })
+    expect(el.querySelector<HTMLInputElement>('[name="setup_video_duration"]')?.value).toBe(String(duration))
+    await toggle(el, false)
+    expect(el.querySelector('[role="alert"]')).toBeNull()
+    expect(el.querySelector<HTMLElement>('[data-testid="video-configuration"]')?.hidden).toBe(true)
+    expect(await vm.save()).toBe(true)
+    expect(patch).toHaveBeenCalledExactlyOnceWith([{ path: 'video_generation.enabled', value: false }])
+    expect(el.querySelector<HTMLInputElement>('[name="setup_video_duration"]')?.value).toBe(String(duration))
+    expect(el.querySelector<HTMLSelectElement>('[name="setup_video_resolution"]')?.value).toBe(resolution)
+  })
+
   it('replaces a legacy provider only after explicit selection and restores it on discard', async () => {
     const { el, patch, vm } = await mountSettings({ ...videoConfig, provider: 'xai', primary: 'grok-imagine-video-1.5' })
     await select(el, 'setup_video_provider', 'tokenrhythm')
@@ -562,6 +658,20 @@ describe('video generation settings', () => {
     expect(patch).toHaveBeenCalledExactlyOnceWith([{ path: 'video_generation.primary', value: 'google/veo-3.1-fast' }])
   })
 
+  it('fills the OpenRouter model on first enable for legacy gateways without authoring unsupported fields', async () => {
+    const legacy = Object.fromEntries(Object.entries(videoConfig).filter(([key]) => key !== 'provider' && key !== 'providers'))
+    const { el, patch, vm } = await mountSettings(legacy)
+    await toggle(el, true)
+    expect(el.querySelector<HTMLSelectElement>('[name="setup_video_provider"]')?.value).toBe('openrouter')
+    expect(el.querySelector<HTMLInputElement>('[name="setup_provider_video_primary"]')?.value).toBe('google/veo-3.1-fast')
+    expect(el.querySelector('[role="alert"]')).toBeNull()
+    expect(await vm.save()).toBe(true)
+    expect(patch).toHaveBeenCalledExactlyOnceWith([
+      { path: 'video_generation.enabled', value: true },
+      { path: 'video_generation.primary', value: 'google/veo-3.1-fast' },
+    ])
+  })
+
   it('does not offer saving when Gateway has no video section', async () => {
     const { el, patch } = await mountSettings(null)
     expect(el.textContent).toContain(i18n.global.t('setup.video.unsupported'))
@@ -572,12 +682,12 @@ describe('video generation settings', () => {
   it('validates OpenRouter models, duration bounds and clearing the optional duration', async () => {
     const { el, patch, vm } = await mountSettings({ ...videoConfig, duration_seconds: 8 })
     await toggle(el, true)
-    expect(saveButton(el).disabled).toBe(true)
+    expect(saveButton(el).disabled).toBe(false)
     await select(el, 'setup_video_provider', 'openrouter')
     await input(el, 'setup_provider_video_primary', 'invalid model')
     expect(saveButton(el).disabled).toBe(true)
     await input(el, 'setup_provider_video_primary', 'google/veo-3.1-fast')
-    await input(el, 'setup_video_duration', '9')
+    await input(el, 'setup_video_duration', '2.5')
     expect(saveButton(el).disabled).toBe(true)
     await input(el, 'setup_video_duration', '')
     await vm.save()
@@ -592,13 +702,109 @@ describe('video generation settings', () => {
     await input(el, 'setup_provider_video_primary', 'tokenrhythm/wan3.0-video')
     expect(el.querySelector('[role="alert"]')?.textContent).toBe(i18n.global.t('setup.video.invalidNativeModel'))
     await input(el, 'setup_provider_video_primary', 'wan3.0-video')
-    await input(el, 'setup_video_max_duration', '1')
+    await input(el, 'setup_video_duration', '1')
     expect(saveButton(el).disabled).toBe(true)
-    await input(el, 'setup_video_max_duration', '30')
     await input(el, 'setup_video_duration', '31')
     expect(saveButton(el).disabled).toBe(true)
     await input(el, 'setup_video_duration', '2')
     expect(el.querySelector('[role="alert"]')).toBeNull()
+  })
+
+  it('saves a supported duration beyond an older configuration maximum without writing a new cap', async () => {
+    const { el, patch, vm } = await mountSettings({ ...selectedConfig, enabled: true, max_duration_seconds: 8 })
+    await input(el, 'setup_video_duration', '10')
+    expect(el.querySelector('[role="alert"]')).toBeNull()
+    expect(await vm.save()).toBe(true)
+    expect(patch).toHaveBeenCalledExactlyOnceWith([{ path: 'video_generation.duration_seconds', value: 10 }])
+  })
+
+  it('saves an OpenRouter default longer than 60 seconds without applying a legacy cap', async () => {
+    const { el, patch, vm } = await mountSettings({
+      ...videoConfig, enabled: true, provider: 'openrouter', primary: 'vendor/custom-video', max_duration_seconds: 8,
+    })
+    await input(el, 'setup_video_duration', '120')
+    expect(el.querySelector('[role="alert"]')).toBeNull()
+    expect(await vm.save()).toBe(true)
+    expect(patch).toHaveBeenCalledExactlyOnceWith([{ path: 'video_generation.duration_seconds', value: 120 }])
+  })
+
+  it.each(['0', '2.5', '1e2', '9007199254740992'])('rejects OpenRouter duration %s unless it is a positive safe integer', async value => {
+    const { el, patch, vm } = await mountSettings({
+      ...videoConfig, enabled: true, provider: 'openrouter', primary: 'vendor/custom-video', duration_seconds: 5,
+    })
+    await input(el, 'setup_video_duration', value)
+    expect(el.querySelector<HTMLInputElement>('[name="setup_video_duration"]')?.value).toBe(value)
+    expect(el.querySelector('[name="setup_video_duration"]')?.getAttribute('aria-invalid')).toBe('true')
+    expect(await vm.save()).toBe(false)
+    expect(patch).not.toHaveBeenCalled()
+  })
+
+  it.each(['1', '31', '2.5', '1e1', '0x10', 'invalid'])('retains invalid duration draft %s without silently saving null', async value => {
+    const { el, patch, vm } = await mountSettings({ ...selectedConfig, enabled: true, duration_seconds: 5 })
+    const duration = el.querySelector<HTMLInputElement>('[name="setup_video_duration"]')!
+    expect(duration.type).toBe('text')
+    expect(duration.inputMode).toBe('numeric')
+    await input(el, 'setup_video_duration', value)
+    expect(duration.value).toBe(value)
+    expect(duration.getAttribute('aria-invalid')).toBe('true')
+    expect(el.querySelector('[role="alert"]')).not.toBeNull()
+    expect(await vm.save()).toBe(false)
+    expect(duration.value).toBe(value)
+    expect(patch).not.toHaveBeenCalled()
+    vm.discard()
+    await nextTick()
+    expect(duration.value).toBe('5')
+    expect(duration.getAttribute('aria-invalid')).not.toBe('true')
+  })
+
+  it('clears an explicit default duration to null and leaves an untouched blank default unsaved', async () => {
+    const { el, patch, vm } = await mountSettings({ ...selectedConfig, enabled: true, duration_seconds: 5 })
+    await input(el, 'setup_video_duration', '')
+    expect(el.querySelector('[role="alert"]')).toBeNull()
+    expect(await vm.save()).toBe(true)
+    expect(patch).toHaveBeenCalledExactlyOnceWith([{ path: 'video_generation.duration_seconds', value: null }])
+    expect(await vm.save()).toBe(true)
+    expect(el.querySelector('[data-testid="video-recommended-duration"]')).toBeNull()
+    expect(saveButton(el).disabled).toBe(true)
+    expect(await vm.save()).toBe(true)
+    expect(patch).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not author an untouched blank duration on load or save', async () => {
+    const { el, patch, vm } = await mountSettings({ ...selectedConfig, enabled: true })
+    expect(el.querySelector<HTMLInputElement>('[name="setup_video_duration"]')?.value).toBe('')
+    expect(el.querySelector('[data-testid="video-recommended-duration"]')).toBeNull()
+    expect(saveButton(el).disabled).toBe(true)
+    expect(await vm.save()).toBe(true)
+    expect(patch).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { provider: 'tokenrhythm', primary: 'wan3.0-video', duration: 31 },
+    { provider: 'xai', primary: 'grok-imagine-video-1.5', duration: 2.5 },
+  ])('preserves a saved invalid $provider duration on load and discard without writing', async ({ provider, primary, duration }) => {
+    const { el, patch, vm } = await mountSettings({ ...videoConfig, enabled: true, provider, primary, duration_seconds: duration })
+    const field = el.querySelector<HTMLInputElement>('[name="setup_video_duration"]')!
+    expect(field.value).toBe(String(duration))
+    expect(saveButton(el).disabled).toBe(true)
+    expect(await vm.save()).toBe(true)
+    expect(patch).not.toHaveBeenCalled()
+    await input(el, 'setup_video_duration', '6')
+    vm.discard()
+    await nextTick()
+    expect(field.value).toBe(String(duration))
+    expect(saveButton(el).disabled).toBe(true)
+    expect(patch).not.toHaveBeenCalled()
+  })
+
+  it('preserves an unchanged legacy route duration when saving an unrelated preference', async () => {
+    const { el, patch, vm } = await mountSettings({
+      ...videoConfig, enabled: true, provider: 'xai', primary: 'grok-imagine-video-1.5', duration_seconds: 20,
+    })
+    await select(el, 'setup_video_aspect', '9:16')
+    expect(await vm.save()).toBe(true)
+    expect(patch).toHaveBeenCalledExactlyOnceWith([{ path: 'video_generation.aspect_ratio', value: '9:16' }])
+    expect(el.querySelector<HTMLInputElement>('[name="setup_video_duration"]')?.value).toBe('20')
   })
 
   it('rejects unsafe and conflicting endpoint URLs and invalid env names before RPC', async () => {
@@ -628,7 +834,7 @@ describe('video generation settings', () => {
     expect(el.querySelector('[role="alert"]')).toBeNull()
   })
 
-  it('uses Gateway catalog and discovery while retaining documented model verification', async () => {
+  it('uses Gateway catalog and live discovery for the selected model', async () => {
     const { el } = await mountSettings(selectedConfig, {
       catalog: vi.fn().mockResolvedValue({ videoGenerationProviders: [{
         providerId: 'tokenrhythm', label: 'TokenRhythm', defaultModel: 'wan3.0-video',
@@ -638,6 +844,110 @@ describe('video generation settings', () => {
       discoverVideoGenerationModels: vi.fn().mockResolvedValue({ ok: true, source: 'live', models: [{ id: 'wan3.0-video', verified: true }] }),
     })
     await vi.waitFor(() => expect(el.querySelector('[data-testid="video-model-status"]')?.textContent)
-      .toContain(i18n.global.t('setup.video.tokenrhythmModelListed')))
+      .toContain(i18n.global.t('setup.video.modelListed')))
+  })
+
+  it.each([
+    { provider: 'tokenrhythm', primary: 'custom-video', missing: 'another-video' },
+    { provider: 'openrouter', primary: 'vendor/custom-video', missing: 'vendor/another-video' },
+  ])('checks the current $provider model instead of only the default example', async ({ provider, primary, missing }) => {
+    const { el } = await mountSettings({ ...videoConfig, enabled: true, provider, primary }, {
+      ...workflowFor(credential()),
+      discoverVideoGenerationModels: vi.fn().mockResolvedValue({
+        ok: true, source: 'live', models: [{ id: primary, verified: true }],
+      }),
+    })
+    await vi.waitFor(() => expect(modelStatus(el)).toBe(i18n.global.t('setup.video.modelListed')))
+    await input(el, 'setup_provider_video_primary', missing)
+    expect(modelStatus(el)).toBe(i18n.global.t('setup.video.modelNotListed'))
+    await input(el, 'setup_provider_video_primary', primary)
+    expect(modelStatus(el)).toBe(i18n.global.t('setup.video.modelListed'))
+  })
+
+  it.each([
+    { source: 'catalog', verified: true, label: 'modelCatalogListed' },
+    { source: 'documented', verified: false, label: 'modelCatalogFallback' },
+    { source: 'live', verified: false, label: 'modelUnverified' },
+  ])('distinguishes $source discovery from verified live availability', async ({ source, verified, label }) => {
+    const { el } = await mountSettings({ ...selectedConfig, enabled: true }, {
+      ...workflowFor(credential()),
+      discoverVideoGenerationModels: vi.fn().mockResolvedValue({
+        ok: true, source, models: [{ id: selectedConfig.primary, verified }],
+      }),
+    })
+    await vi.waitFor(() => expect(modelStatus(el)).toBe(i18n.global.t(`setup.video.${label}`)))
+    expect(modelStatus(el)).not.toBe(i18n.global.t('setup.video.modelListed'))
+  })
+
+  it('reports an undiscovered custom model as unverified', async () => {
+    const { el } = await mountSettings({ ...selectedConfig, enabled: true, primary: 'custom-video' })
+    expect(modelStatus(el)).toBe(i18n.global.t('setup.video.modelUnverified'))
+    expect(el.querySelector('[data-testid="video-refresh-models"]')).toBeNull()
+  })
+
+  it.each(['rejected', 'unsuccessful'])('shows a %s discovery failure and recovers through Refresh without saving', async failure => {
+    const discover = vi.fn().mockResolvedValue({
+      ok: true, source: 'live', models: [{ id: selectedConfig.primary, verified: true }],
+    })
+    if (failure === 'rejected') discover.mockRejectedValueOnce(new Error('synthetic discovery failure'))
+    else discover.mockResolvedValueOnce({ ok: false, source: 'live', models: [] })
+    const { el, patch } = await mountSettings({ ...selectedConfig, enabled: true }, {
+      ...workflowFor(credential()), discoverVideoGenerationModels: discover,
+    })
+    await vi.waitFor(() => expect(modelStatus(el)).toBe(i18n.global.t('setup.video.modelCheckFailed')))
+    expect(refreshModelsButton(el).disabled).toBe(false)
+    refreshModelsButton(el).click()
+    await vi.waitFor(() => expect(modelStatus(el)).toBe(i18n.global.t('setup.video.modelListed')))
+    expect(discover).toHaveBeenCalledTimes(2)
+    expect(discover).toHaveBeenLastCalledWith('tokenrhythm')
+    expect(patch).not.toHaveBeenCalled()
+    expect(saveButton(el).disabled).toBe(true)
+  })
+
+  it('allows public model refresh while connection and credential drafts are unsaved and prevents duplicate refreshes', async () => {
+    let resolveRefresh!: (result: unknown) => void
+    const discover = vi.fn().mockResolvedValueOnce({
+      ok: true, source: 'catalog', models: [{ id: selectedConfig.primary, verified: false }],
+    }).mockImplementationOnce(() => new Promise(resolve => { resolveRefresh = resolve }))
+    const { el, patch } = await mountSettings({ ...selectedConfig, enabled: true }, {
+      ...workflowFor(credential()), discoverVideoGenerationModels: discover,
+    })
+    await vi.waitFor(() => expect(modelStatus(el)).toBe(i18n.global.t('setup.video.modelCatalogListed')))
+    await input(el, 'setup_video_base_url', 'https://video-proxy.example.test/v1')
+    await input(el, 'setup_video_api_key', 'synthetic-unsaved-video-key')
+    expect(refreshModelsButton(el).disabled).toBe(false)
+    refreshModelsButton(el).click()
+    await nextTick()
+    expect(refreshModelsButton(el).disabled).toBe(true)
+    refreshModelsButton(el).click()
+    expect(discover).toHaveBeenCalledTimes(2)
+    expect(discover.mock.calls).toEqual([['tokenrhythm'], ['tokenrhythm']])
+    expect(patch).not.toHaveBeenCalled()
+    resolveRefresh({ ok: true, source: 'live', models: [{ id: selectedConfig.primary, verified: true }] })
+    await vi.waitFor(() => expect(modelStatus(el)).toBe(i18n.global.t('setup.video.modelListed')))
+    expect(refreshModelsButton(el).disabled).toBe(false)
+    expect(el.querySelector<HTMLInputElement>('[name="setup_video_api_key"]')?.value).toBe('synthetic-unsaved-video-key')
+    expect(el.textContent).not.toContain('synthetic-unsaved-video-key')
+    expect(patch).not.toHaveBeenCalled()
+  })
+
+  it('keeps the newest discovery result when an older request for the same provider finishes last', async () => {
+    let resolveFirst!: (result: unknown) => void
+    const discover = vi.fn().mockImplementationOnce(() => new Promise(resolve => { resolveFirst = resolve }))
+      .mockResolvedValueOnce({ ok: true, source: 'live', models: [{ id: 'google/veo-3.1-fast', verified: true }] })
+      .mockResolvedValueOnce({ ok: true, source: 'live', models: [{ id: selectedConfig.primary, verified: true }] })
+    const { el, patch } = await mountSettings({ ...selectedConfig, enabled: true }, {
+      ...workflowFor(credential()), discoverVideoGenerationModels: discover,
+    })
+    await vi.waitFor(() => expect(discover).toHaveBeenCalledTimes(1))
+    await select(el, 'setup_video_provider', 'openrouter')
+    await select(el, 'setup_video_provider', 'tokenrhythm')
+    await vi.waitFor(() => expect(modelStatus(el)).toBe(i18n.global.t('setup.video.modelListed')))
+    expect(discover.mock.calls).toEqual([['tokenrhythm'], ['openrouter'], ['tokenrhythm']])
+    resolveFirst({ ok: true, source: 'live', models: [] })
+    await Promise.resolve()
+    await nextTick()
+    expect(modelStatus(el)).toBe(i18n.global.t('setup.video.modelListed'))
+    expect(patch).not.toHaveBeenCalled()
   })
 })

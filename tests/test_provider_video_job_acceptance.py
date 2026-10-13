@@ -191,7 +191,6 @@ def _parameters(path: Path, model: str) -> dict[str, Any]:
         "model": model,
         "prompt": "A paper kite above a field",
         "duration": 8,
-        "max_duration_seconds": 8,
         "aspect_ratio": "16:9",
         "resolution": "720p",
         "output_path": path,

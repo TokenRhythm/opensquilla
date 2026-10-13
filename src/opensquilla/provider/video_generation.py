@@ -152,7 +152,6 @@ def _validate_request(
     model: str,
     prompt: str,
     duration: int | None,
-    max_duration_seconds: int | None,
     aspect_ratio: str | None,
     resolution: str | None,
     output_path: Path,
@@ -168,15 +167,6 @@ def _validate_request(
         isinstance(duration, bool) or not isinstance(duration, int) or duration < 1
     ):
         raise VideoGenerationError("Video duration must be a positive whole number")
-    if max_duration_seconds is not None:
-        if (
-            isinstance(max_duration_seconds, bool)
-            or not isinstance(max_duration_seconds, int)
-            or max_duration_seconds < 1
-        ):
-            raise VideoGenerationError("Video duration limit must be a positive whole number")
-        if duration is not None and duration > max_duration_seconds:
-            raise VideoGenerationError("Video duration exceeds the configured limit")
     if aspect_ratio is not None and aspect_ratio not in _ASPECT_RATIOS:
         raise VideoGenerationError("Unsupported video aspect ratio")
     if resolution is not None and resolution not in _RESOLUTIONS:
@@ -220,7 +210,7 @@ class _JsonBodyStream(httpx.AsyncByteStream):
             # Keep content decoders' input chunks small, independently of the
             # transport's chunk sizes. The decoded body has its own limit.
             for start in range(0, len(chunk), 4096):
-                yield chunk[start:start + 4096]
+                yield chunk[start : start + 4096]
 
     async def aclose(self) -> None:
         # HTTPX's EOF close applies to this borrowed view. The actual stream
@@ -317,7 +307,6 @@ async def _validate_model_options(
     api_key: str,
     model: str,
     duration: int | None,
-    max_duration_seconds: int,
     aspect_ratio: str | None,
     resolution: str | None,
     deadline: float,
@@ -348,7 +337,7 @@ async def _validate_model_options(
         raise VideoGenerationError(f"OpenRouter video model {model} is not available")
     supported_durations = entry.get("supported_durations")
     if supported_durations is None:
-        selected_duration = duration if duration is not None else min(5, max_duration_seconds)
+        selected_duration = duration if duration is not None else 5
     else:
         if (
             not isinstance(supported_durations, list)
@@ -362,14 +351,7 @@ async def _validate_model_options(
                 f"OpenRouter video model {model} has invalid supported durations"
             )
         if duration is None:
-            bounded_durations = [
-                value for value in supported_durations if value <= max_duration_seconds
-            ]
-            if not bounded_durations:
-                raise VideoGenerationError(
-                    f"OpenRouter video model {model} has no duration within the configured limit"
-                )
-            selected_duration = min(bounded_durations)
+            selected_duration = min(supported_durations)
         else:
             selected_duration = duration
             if selected_duration not in supported_durations:
@@ -672,7 +654,6 @@ async def generate_openrouter_video(
     model: str,
     prompt: str,
     duration: int | None,
-    max_duration_seconds: int,
     aspect_ratio: str | None,
     resolution: str | None,
     output_path: Path,
@@ -692,7 +673,6 @@ async def generate_openrouter_video(
         model=model,
         prompt=prompt,
         duration=duration,
-        max_duration_seconds=max_duration_seconds,
         aspect_ratio=aspect_ratio,
         resolution=resolution,
         output_path=destination,
@@ -713,7 +693,6 @@ async def generate_openrouter_video(
                 api_key=secret,
                 model=model,
                 duration=duration,
-                max_duration_seconds=max_duration_seconds,
                 aspect_ratio=aspect_ratio,
                 resolution=resolution,
                 deadline=deadline,
@@ -721,7 +700,7 @@ async def generate_openrouter_video(
         else:
             # Compatible gateways may expose the job API without OpenRouter's
             # optional model catalog. The explicit operator route owns checks.
-            selected_duration = duration if duration is not None else min(5, max_duration_seconds)
+            selected_duration = duration if duration is not None else 5
         job_id, polling_url, submitted = await _submit(
             client,
             api_root=api_root,
@@ -773,7 +752,6 @@ async def resume_openrouter_video(
         model=model,
         prompt="resume",
         duration=None,
-        max_duration_seconds=None,
         aspect_ratio=None,
         resolution=None,
         output_path=destination,
