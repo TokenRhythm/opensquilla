@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { EventEmitter } from 'node:events'
+import { EventEmitter, once } from 'node:events'
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, relative, resolve } from 'node:path'
 import vm from 'node:vm'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import ts from '@typescript/typescript6'
 import { DesktopWriterAdmission } from '../dist/desktop-writer-admission.js'
 import { DesktopQuitBudget } from '../dist/desktop-quit.js'
@@ -46,6 +47,90 @@ assert.equal(beforeQuitCallbacks.length, 1, 'exercise the single actual producti
 const extracted = names.map((name) => declarations.get(name).getText(parsed)).join('\n')
 const compiled = ts.transpileModule(`${extracted}\nconst beforeQuit = ${beforeQuitCallbacks[0]};\nglobalThis.subject = { applyWindowsInstaller, restoreWindowsUpdateCache, windowsInstallerActionsSupported, downloadDesktopUpdate, revalidateReadyWindowsInstaller, beforeQuit, handleMainWindowClose };`,
   { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+
+// Load the native fixture's actual extraction list and host template as well.
+// A separate set of VM globals cannot catch a missing binding in that host.
+{
+  const runner = ts.createSourceFile('runner.mjs', await readFile(
+    new URL('./test-windows-update-electron.mjs', import.meta.url), 'utf8',
+  ), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
+  let nativeNames
+  function findNames(node) {
+    if (ts.isVariableDeclaration(node) && node.name.getText(runner) === 'names') {
+      assert.ok(ts.isArrayLiteralExpression(node.initializer))
+      nativeNames = node.initializer.elements.map(value => {
+        assert.ok(ts.isStringLiteral(value))
+        return value.text
+      })
+    }
+    ts.forEachChild(node, findNames)
+  }
+  findNames(runner)
+  assert.ok(nativeNames?.includes('holdQuitForTaskConfirmation'))
+  const scheduler = parsed.statements.find(statement => ts.isVariableStatement(statement)
+    && statement.declarationList.declarations.some(declaration => declaration.name.getText(parsed) === 'desktopUpdateCheckScheduler'))
+  assert.ok(scheduler)
+  const nativeDeclarations = ts.transpileModule([
+    ...nativeNames.map(name => declarations.get(name).getText(parsed)),
+    scheduler.getText(parsed),
+    `app.on('before-quit', ${beforeQuitCallbacks[0]});`,
+  ].join('\n'), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+  const template = await readFile(
+    new URL('./fixtures/windows-update-electron/main.template.mjs', import.meta.url), 'utf8',
+  )
+  const host = ts.createSourceFile('host.mjs', template, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
+  const body = host.statements.filter(statement => !ts.isImportDeclaration(statement))
+    .map(statement => statement.getFullText(host)).join('\n')
+    .replace('// PRODUCTION_DECLARATIONS', nativeDeclarations)
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+  for (const deferredQuit of [false, true]) {
+    const logs = [], exits = []
+    const app = new EventEmitter()
+    app.whenReady = () => new Promise(() => {})
+    app.quit = () => app.emit('before-quit', electronEvent())
+    app.exit = code => { exits.push(code) }
+    app.getVersion = () => '0.5.4'
+    const fixture = await new AsyncFunction(
+      'app', 'protocol', 'spawn', 'once', 'appendFileSync', 'readFileSync', 'join', 'pathToFileURL', 'process',
+      `${body}\nreturn {
+        startSyntheticGateway, liveLifecycleOwnedGatewayProcesses,
+        setUpdating(value) { updateApplying = value },
+        pendingQuit() { return quitRequestedDuringUpdateDrain },
+        confirmationPending() { return quitConfirmationPromise },
+        phase() { return appExitPhase },
+      };`,
+    )(
+      app, { registerSchemesAsPrivileged() {} },
+      () => {
+        const child = new EventEmitter()
+        Object.assign(child, { pid: 54327, exitCode: null, signalCode: null })
+        child.stdin = { end() { child.exitCode = 0; child.emit('exit', 0) } }
+        queueMicrotask(() => child.emit('spawn'))
+        return child
+      },
+      once, (_path, line) => logs.push(JSON.parse(line)),
+      () => JSON.stringify({ packageRoot: fileURLToPath(new URL('..', import.meta.url)), nodePath: 'synthetic-node' }),
+      join, pathToFileURL, { platform: 'win32', env: {} },
+    )
+    await fixture.startSyntheticGateway()
+    if (deferredQuit) {
+      fixture.setUpdating(true)
+      app.quit()
+      assert.equal(fixture.pendingQuit(), true)
+      assert.equal(fixture.liveLifecycleOwnedGatewayProcesses().length, 1)
+      assert.deepEqual(exits, [])
+      fixture.setUpdating(false)
+    }
+    app.quit()
+    await until(() => exits.length > 0, 'native fixture ordinary quit')
+    assert.deepEqual(exits, [0])
+    assert.equal(fixture.liveLifecycleOwnedGatewayProcesses().length, 0)
+    assert.equal(fixture.phase(), 'committed')
+    assert.equal(fixture.confirmationPending(), null)
+    assert.ok(logs.findIndex(row => row.event === 'gateway_exit')
+      < logs.findIndex(row => row.event === 'phase' && row.to === 'committed'))
+  }
+}
 
 function deferred() {
   let resolve

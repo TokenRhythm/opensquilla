@@ -307,4 +307,19 @@ for (const activity of ['active', 'unknown']) {
   assert.equal(ending.quit, 0)
 }
 
+// A recovered live Gateway does not prove that an earlier hard-crashed POSIX
+// launch has no remaining tools. Its retained scope still requires consent.
+{
+  const scenario = createScenario({ platform: 'darwin', activity: 'idle' })
+  const crashedChild = {}
+  scenario.env.gatewayProcessCleanupContexts.set(crashedChild, { synthetic: true })
+  scenario.env.hasGatewayProcessExited = child => child === crashedChild
+  scenario.handlers.holdQuitForTaskConfirmation(scenario.closeEvent())
+  await until(() => scenario.shownQuitDialog === 1)
+  assert.equal(scenario.quit, 0)
+  assert.equal(scenario.hidden, 0)
+  await settleConfirmation(scenario, true)
+  assert.equal(scenario.quit, 1)
+}
+
 console.log('desktop close confirmation checks passed')

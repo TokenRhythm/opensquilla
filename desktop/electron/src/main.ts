@@ -16171,7 +16171,12 @@ async function quitOwnedGateway(
       const result = record
         ? await requestVerifiedDesktopGatewayQuit(record, { remainingMs })
         : { kind: 'unreachable' as const }
-      desktopLog('quit_gateway_shutdown_requested', { pid: child.pid, ...result })
+      desktopLog('quit_gateway_shutdown_requested', {
+        pid: child.pid,
+        ...result,
+        accepted: result.kind === 'quit_accepted',
+        alreadyStopping: false,
+      })
       return result
     },
     legacyDrain: () => drainOwnedGatewayForLegacyQuit(child, '', true, true),

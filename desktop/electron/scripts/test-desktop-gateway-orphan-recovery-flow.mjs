@@ -20,6 +20,7 @@ import {
   closeElectronWithDeadline,
   desktopShutdownEvidenceSince,
   gatewayProcessSnapshot,
+  requestElectronQuitWithConfirmation,
 } from './e2e-shutdown-helpers.mjs'
 import { execFileWithDiagnostics } from './e2e-subprocess-diagnostics.mjs'
 
@@ -124,13 +125,16 @@ async function phaseDiagnostics(app, userDataDir, phase) {
   }
 }
 
-async function closeDesktopForPhase(app, userDataDir, phaseName) {
+async function closeDesktopForPhase(app, userDataDir, phaseName, { expectQuitConfirmation = false } = {}) {
   const phase = createPhaseBudget(phaseName, ELECTRON_SHUTDOWN_TIMEOUT_MS)
   const desktopLogPath = join(userDataDir, 'logs', 'desktop.log')
   const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
   const shutdown = await closeElectronWithDeadline({
     app,
     phase: phase.name,
+    ...(expectQuitConfirmation ? {
+      requestClose: options => requestElectronQuitWithConfirmation(app, options),
+    } : {}),
     timeoutMs: phase.timeoutMs,
     diagnostics: () => phaseDiagnostics(app, userDataDir, phase),
   })
@@ -525,6 +529,9 @@ try {
     secondApp,
     userDataDir,
     'successful-electron-shutdown',
+    // The deliberately crashed POSIX launch retains unverified process owners.
+    // Accept its normal interruption prompt through the production dialog.
+    { expectQuitConfirmation: process.platform !== 'win32' },
   )
   secondApp = null
   const ownershipReleased = await waitForDesktopGatewayOwnershipRelease(

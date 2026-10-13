@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import ts from '@typescript/typescript6'
 
 import {
   DESKTOP_QUIT_TERMINATION_MS, DesktopQuitBudget, quitGatewayWithinBudget,
 } from '../dist/desktop-quit.js'
 import { stopAndJoinLifecycleProcesses } from '../dist/gateway-lifecycle.js'
+import {
+  evaluateFirstSendEvidence, parseEvidenceLog, summarizeDesktopLog,
+} from './packaged-first-send-evidence.mjs'
 
 const source = ts.createSourceFile(
   'main.js', readFileSync(new URL('../dist/main.js', import.meta.url), 'utf8'),
@@ -123,6 +128,58 @@ function harness({ exited = false, platform = 'darwin', complete = true } = {}) 
 async function withBudget(test) {
   const budget = new DesktopQuitBudget(100, 1000)
   try { await test(budget) } finally { budget.dispose() }
+}
+
+// Feed the production shutdown-request log to the packaged acceptance gate.
+// Keep every other field valid, so rejected requests cannot borrow a later
+// clean process exit as evidence that graceful shutdown was accepted.
+const firstSendFixtures = [0, 1].map(cancellations => JSON.parse(execFileSync(
+  process.execPath,
+  [fileURLToPath(new URL('./test-packaged-first-send-evidence.mjs', import.meta.url)),
+    '--fixture-json', ...(cancellations === 0 ? ['--no-cancellation'] : [])],
+  { encoding: 'utf8' },
+)).result)
+for (const response of [
+  { kind: 'quit_accepted', remainingMs: 10_000, totalRemainingMs: 15_000 },
+  { kind: 'rejected' },
+  { kind: 'unsupported' },
+  { kind: 'unreachable' },
+]) {
+  await withBudget(async budget => {
+    const h = harness({ platform: 'win32' })
+    const records = []
+    h.env.desktopLog = (event, detail) => records.push({ event, ...detail })
+    h.env.requestVerifiedDesktopGatewayQuit = async () => response
+    h.env.quitGatewayWithinBudget = async ({ requestQuit }) => {
+      assert.equal(await requestQuit(10_000), response)
+      return true
+    }
+    assert.equal(await h.handlers.quitOwnedGateway(h.child, budget), true)
+    const request = records.find(record => record.event === 'quit_gateway_shutdown_requested')
+    assert.deepEqual(request, {
+      event: 'quit_gateway_shutdown_requested', pid: h.child.pid, ...response,
+      accepted: response.kind === 'quit_accepted', alreadyStopping: false,
+    })
+    for (const original of firstSendFixtures) {
+      const fixture = structuredClone(original)
+      assert.deepEqual(evaluateFirstSendEvidence(fixture).failures, [])
+      const index = fixture.desktopLog.records.findIndex(
+        record => record.event === 'quit_gateway_shutdown_requested',
+      )
+      fixture.desktopLog.records[index] = { at: fixture.desktopLog.records[index].at, ...request }
+      fixture.desktopLog = summarizeDesktopLog(parseEvidenceLog(
+        fixture.desktopLog.records.map(record => JSON.stringify(record)).join('\n') + '\n',
+      ))
+      const failures = evaluateFirstSendEvidence(fixture).failures
+      if (response.kind === 'quit_accepted') {
+        assert.deepEqual(failures, [])
+        assert.equal(fixture.desktopLog.expectedShutdownCancellationCount, fixture.renderer.consoleErrors)
+      } else {
+        assert.ok(failures.includes('invalid natural Quit evidence'), response.kind)
+        assert.equal(fixture.desktopLog.expectedShutdownCancellationCount, 0)
+      }
+    }
+  })
 }
 
 for (const platform of ['darwin', 'linux']) {

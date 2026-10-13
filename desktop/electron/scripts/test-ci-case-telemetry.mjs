@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { EventEmitter, once } from 'node:events'
+import { EventEmitter, getEventListeners, once } from 'node:events'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { createConnection } from 'node:net'
@@ -19,8 +19,10 @@ import {
   closeHttpServerWithDeadline,
   desktopShutdownEvidenceSince,
   gatewayProcessSnapshot,
+  requestElectronQuitWithConfirmation,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
+import { buildDesktopQuitDialogHtml } from '../dist/desktop-quit-dialog.js'
 import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
@@ -30,6 +32,123 @@ const outputPath = join(root, 'reports', 'cases.jsonl')
 const emitted = []
 
 try {
+  // Exercise the actual quit document's click handler without Electron. Only
+  // this explicit request callback may accept the expected interruption prompt.
+  for (const mode of ['confirm', 'missing-window', 'missing-exit', 'early-exit', 'already-exited', 'wrong-window', 'click-failed']) {
+    const calls = []
+    const child = new EventEmitter()
+    Object.assign(child, { exitCode: mode === 'already-exited' ? 0 : null, signalCode: null })
+    const app = new EventEmitter()
+    app.process = () => child
+    app.close = () => assert.fail('expected confirmation must precede Playwright app.close')
+    const listeners = new Map()
+    const html = buildDesktopQuitDialogHtml({
+      title: 'Synthetic quit', message: 'Synthetic unknown activity', detail: 'Synthetic cleanup',
+      keepRunning: 'Keep running', confirm: 'Stop tasks and quit',
+    })
+    runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], {
+      document: {
+        getElementById: id => ({
+          addEventListener: (event, callback) => listeners.set(`${id}:${event}`, callback),
+          focus() {},
+        }),
+      },
+      window: {
+        addEventListener() {},
+        opensquillaDesktop: { quitDialogRespond: response => {
+          calls.push(`ipc:${response}`)
+          if (mode !== 'missing-exit') {
+            child.exitCode = 0
+            child.emit('exit', 0)
+          }
+        } },
+      },
+    })
+    const page = {
+      url: () => mode === 'wrong-window' ? 'opensquilla-app://desktop/' : 'data:text/html;charset=utf-8,synthetic',
+      locator: selector => ({
+        waitFor: async options => {
+          assert.ok(['[role="dialog"]', '#keep'].includes(selector))
+          assert.ok(options.timeout > 0 && options.timeout <= 100)
+        },
+        click: async options => {
+          assert.equal(selector, '#confirm')
+          assert.ok(options.timeout > 0 && options.timeout <= 100)
+          if (mode === 'click-failed') throw new Error('synthetic confirmation click failed')
+          calls.push('click')
+          listeners.get('confirm:click')()
+        },
+      }),
+    }
+    app.evaluate = async callback => callback({ app: { quit() {
+      calls.push('quit-request')
+      if (mode === 'early-exit') {
+        child.exitCode = 0
+        child.emit('exit', 0)
+      } else if (mode !== 'missing-window' && mode !== 'already-exited') {
+        app.emit('window', page)
+      }
+    } } })
+    const abort = new AbortController()
+    let seenSignal
+    const run = requestElectronQuitWithConfirmation(app, { signal: abort.signal, timeoutMs: 100 })
+    if (mode.startsWith('missing-')) setImmediate(() => abort.abort())
+    if (mode === 'confirm') {
+      await run
+      assert.deepEqual(calls, ['quit-request', 'click', 'ipc:confirm'])
+      // Verify that the shared shutdown helper supplies its one deadline's
+      // abort signal to custom requests and cancels it after completion.
+      const result = await closeElectronWithDeadline({
+        app, phase: 'synthetic-confirmed-quit', timeoutMs: 100,
+        requestClose: async options => {
+          assert.equal(options.timeoutMs, 100)
+          assert.equal(options.signal.aborted, false)
+          seenSignal = options.signal
+        },
+      })
+      assert.equal(result.closed, true)
+      assert.equal(seenSignal.aborted, true)
+    } else {
+      await assert.rejects(run, mode.startsWith('missing-')
+        ? /Expected quit confirmation timed out/
+        : mode === 'click-failed' ? /synthetic confirmation click failed/
+        : mode === 'wrong-window' ? /Expected the self-contained/ : /before the expected/)
+      if (mode !== 'missing-exit') assert.ok(!calls.includes('ipc:confirm'))
+    }
+    assert.equal(app.listenerCount('window'), 0)
+    assert.equal(child.listenerCount('exit'), 0)
+    assert.equal(getEventListeners(abort.signal, 'abort').length, 0)
+  }
+
+  {
+    const child = new EventEmitter()
+    Object.assign(child, { exitCode: null, signalCode: null, killed: false })
+    child.kill = signal => {
+      child.signalCode = signal
+      child.killed = true
+      child.emit('exit', null, signal)
+    }
+    const app = new EventEmitter()
+    app.process = () => child
+    app.evaluate = async callback => callback({ app: { quit() {} } })
+    let sharedSignal
+    const result = await closeElectronWithDeadline({
+      app, phase: 'synthetic-missing-quit-dialog', timeoutMs: 25, emit() {},
+      requestClose: options => {
+        sharedSignal = options.signal
+        assert.equal(options.timeoutMs, 25)
+        return requestElectronQuitWithConfirmation(app, options)
+      },
+    })
+    assert.equal(result.closed, false, 'a missing expected prompt must remain a failure')
+    assert.equal(result.closeErrorCode, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
+    assert.equal(sharedSignal.aborted, true)
+    assert.equal(child.killed, true)
+    assert.equal(app.listenerCount('window'), 0)
+    assert.equal(child.listenerCount('exit'), 0)
+    assert.equal(getEventListeners(sharedSignal, 'abort').length, 0)
+  }
+
   for (const scheme of [
     'windows-creation-filetime:', 'linux-proc-start-ticks:', 'posix-ps-lstart:',
   ]) {

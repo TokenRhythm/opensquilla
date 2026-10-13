@@ -235,8 +235,9 @@ async def test_launch_cancellation_waits_for_owner_row_deletion(monkeypatch):
     owner = process_tree.ProcessTreeOwner(proc, proc.pid, persisted_owner=reference)
     proc._opensquilla_process_tree_owner = owner
 
-    def delete(row):
+    def delete(row, *, cleanup_complete):
         assert row is reference
+        assert cleanup_complete is True
         loop.call_soon_threadsafe(deleting.set)
         assert release.wait(5)
         deleted.append(row)
@@ -348,8 +349,9 @@ async def test_cancelled_posix_retirement_releases_and_reaps_empty_anchor(monkey
         waited.append(True)
         return 0
 
-    def delete(row):
+    def delete(row, *, cleanup_complete):
         assert row is reference
+        assert cleanup_complete is True
         loop.call_soon_threadsafe(deleting.set)
         assert release.wait(5)
 
