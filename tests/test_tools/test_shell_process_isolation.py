@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shlex
@@ -85,6 +86,91 @@ def _process_test_python() -> str:
     if os.path.exists("/usr/bin/python3"):
         return "/usr/bin/python3"
     return sys.executable
+
+
+def _real_exec_diagnostic(session: shell._BgSession) -> dict[str, object]:
+    collector = session.collector_task
+    stack = []
+    awaited = collector.get_coro() if collector is not None else None
+    for _ in range(12):
+        frame = getattr(awaited, "cr_frame", None)
+        if frame is not None:
+            stack.append(f"{frame.f_code.co_name}:{frame.f_lineno}")
+        awaited = getattr(awaited, "cr_await", None)
+        if awaited is None:
+            break
+    owner = session.process_tree
+    return {
+        "execution_id": session.session_id,
+        "pid": session.process.pid,
+        "process_returncode": session.process.returncode,
+        "session_returncode": session.returncode,
+        "done": session.done,
+        "timed_out": session.timed_out,
+        "killed": session.killed,
+        "io_mode": session.io_mode_used,
+        "collector_done": collector.done() if collector is not None else None,
+        "collector_cancelled": collector.cancelled() if collector is not None else None,
+        "collector_await_stack": stack,
+        "capture": session.output_capture.describe(),
+        # Query the already-owned Job only; is_active() can close an empty Job.
+        "windows_job_active_processes": (
+            owner.windows_job.active_process_count()
+            if owner is not None and owner.windows_job is not None else None
+        ),
+    }
+
+
+@contextlib.asynccontextmanager
+async def _owned_real_exec(session_key: str, task_id: str):
+    """Keep failure evidence and reap only sessions started by this test scope."""
+    existing = set(shell._bg_sessions)
+    token = current_tool_context.set(_ctx(session_key, task_id=task_id))
+    observed: dict[str, object] = {}
+    failure: BaseException | None = None
+    cleanup_failure: BaseException | None = None
+    try:
+        yield observed
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        try:
+            sessions = [
+                session for execution_id, session in tuple(shell._bg_sessions.items())
+                if execution_id not in existing
+                and session.session_key == session_key and session.task_id == task_id
+            ]
+            if failure is not None:
+                failure.add_note(f"real exec observations: {json.dumps(observed)}")
+                for session in sessions:
+                    try:
+                        failure.add_note(json.dumps(_real_exec_diagnostic(session)))
+                    except Exception as exc:
+                        failure.add_note(f"real exec diagnostic failed: {exc!r}")
+            for session in sessions:
+                try:
+                    await shell._stop_bg_session(session)
+                except BaseException as exc:
+                    cleanup_failure = cleanup_failure or exc
+                    (failure or cleanup_failure).add_note(f"owned session stop failed: {exc!r}")
+                try:
+                    # _stop_bg_session suppresses its collector timeout. Explicitly
+                    # drain and verify instead of letting registry reset hide it.
+                    if session.collector_task is not None:
+                        await asyncio.wait_for(
+                            asyncio.shield(session.collector_task),
+                            timeout=shell._BACKGROUND_KILL_TIMEOUT,
+                        )
+                    assert session.done, "owned session did not finalize"
+                    assert session.process_tree is None or not session.process_tree.is_active()
+                except BaseException as exc:
+                    cleanup_failure = cleanup_failure or exc
+                    (failure or cleanup_failure).add_note(f"owned session drain failed: {exc!r}")
+        finally:
+            current_tool_context.reset(token)
+        if failure is None and cleanup_failure is not None:
+            raise cleanup_failure
 
 
 @pytest.fixture(autouse=True)
@@ -519,37 +605,31 @@ async def test_exec_command_writes_optional_stdin() -> None:
 async def test_exec_command_yield_returns_handle_and_process_waits_for_same_run() -> None:
     """The unified start path must spawn once and expose its result to process."""
 
-    token = current_tool_context.set(
-        _ctx("agent:main:unified-exec", task_id="task-unified-exec")
-    )
-    try:
+    async with _owned_real_exec("agent:main:unified-exec", "task-unified-exec") as observed:
         command = _python_shell_command(
             "import time; print('started', flush=True); time.sleep(0.2); print('done')"
         )
         started = await shell.exec_command(command, timeout=5.0, yield_time_ms=0)
         payload = json.loads(started)
+        observed["started"] = payload
         execution_id = payload["execution_id"]
         assert payload["session"]["status"] == "running"
 
         waited = json.loads(
             await shell.process(action="wait", execution_id=execution_id, timeout=5.0)
         )
+        observed["waited"] = waited
         assert waited["execution_id"] == execution_id
         assert waited["exited"] is True
         assert waited["session"]["status"] == "done"
         assert waited["session"]["returncode"] == 0
         assert "started" in waited["output"]
         assert "done" in waited["output"]
-    finally:
-        current_tool_context.reset(token)
 
 
 @pytest.mark.asyncio
 async def test_unified_exec_pipe_accepts_process_submit_and_eof() -> None:
-    token = current_tool_context.set(
-        _ctx("agent:main:unified-pipe", task_id="task-unified-pipe")
-    )
-    try:
+    async with _owned_real_exec("agent:main:unified-pipe", "task-unified-pipe") as observed:
         command = _python_shell_command(
             "import sys; print('READY', flush=True); print('INPUT:' + sys.stdin.read())"
         )
@@ -560,6 +640,7 @@ async def test_unified_exec_pipe_accepts_process_submit_and_eof() -> None:
                 io_mode="pipe",
             )
         )
+        observed["started"] = started
         execution_id = started["execution_id"]
         written = json.loads(
             await shell.process(
@@ -574,10 +655,9 @@ async def test_unified_exec_pipe_accepts_process_submit_and_eof() -> None:
         waited = json.loads(
             await shell.process(action="wait", execution_id=execution_id, timeout=5.0)
         )
+        observed["waited"] = waited
         assert waited["session"]["returncode"] == 0
         assert "INPUT:payload" in waited["output"]
-    finally:
-        current_tool_context.reset(token)
 
 
 @pytest.mark.platform_pty
