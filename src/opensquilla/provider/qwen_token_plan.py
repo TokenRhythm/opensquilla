@@ -8,15 +8,18 @@ two protocol profiles cannot drift.
 
 from __future__ import annotations
 
-QWEN_TOKEN_PLAN_API_KEY_ENV = "QWEN_TOKEN_PLAN_API_KEY"
+from opensquilla.video_generation_defaults import (
+    QWEN_TOKEN_PLAN_API_KEY_ENV as QWEN_TOKEN_PLAN_API_KEY_ENV,
+)
+from opensquilla.video_generation_defaults import (
+    QWEN_TOKEN_PLAN_IMAGE_BASE_URL as QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
+)
+
 QWEN_TOKEN_PLAN_OPENAI_BASE_URL = (
     "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
 )
 QWEN_TOKEN_PLAN_ANTHROPIC_BASE_URL = (
     "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic"
-)
-QWEN_TOKEN_PLAN_IMAGE_BASE_URL = (
-    "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1"
 )
 
 # Team is the superset of the personal plan.  Exact spellings matter: the

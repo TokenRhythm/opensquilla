@@ -36,6 +36,8 @@ class ToolSurfaceCapabilities:
     gateway_config: bool = False
     channel_backing: bool = False
     image_generation: bool = True
+    video_generation: bool = False
+    video_status: bool = False
     # Default True preserves compatibility for callers that construct a
     # capability snapshot explicitly rather than using the live detector.
     git_available: bool = True
@@ -78,6 +80,33 @@ def _detect_image_generation_capability() -> bool:
         return False
 
 
+def _detect_video_generation_capability() -> bool:
+    try:
+        from opensquilla.tools.builtin.media import video_generation_available
+
+        return video_generation_available()
+    except Exception:
+        return False
+
+
+def _detect_video_status_capability() -> bool:
+    try:
+        from opensquilla.tools.builtin.media import video_status_available
+
+        return video_status_available()
+    except Exception:
+        return False
+
+
+def _video_status_context_available(ctx: ToolContext) -> bool:
+    try:
+        from opensquilla.tools.builtin.media import video_status_available
+
+        return video_status_available(ctx)
+    except Exception:
+        return False
+
+
 def _detect_git_capability() -> bool:
     """Return whether background Git can be launched without platform prompts."""
 
@@ -100,6 +129,8 @@ def tool_surface_capabilities_from_runtime(
     channel_manager: object | None = None,
     originating_envelope: object | None = None,
     image_generation: bool | None = None,
+    video_generation: bool | None = None,
+    video_status: bool | None = None,
     git_available: bool | None = None,
 ) -> ToolSurfaceCapabilities:
     """Build tool-surface capabilities from injected runtime dependencies."""
@@ -114,6 +145,16 @@ def tool_surface_capabilities_from_runtime(
             _detect_image_generation_capability()
             if image_generation is None
             else image_generation
+        ),
+        video_generation=(
+            _detect_video_generation_capability()
+            if video_generation is None
+            else video_generation
+        ),
+        video_status=(
+            _detect_video_status_capability()
+            if video_status is None and video_generation is None
+            else bool(video_status)
         ),
         git_available=(
             _detect_git_capability() if git_available is None else git_available
@@ -146,6 +187,12 @@ def resolve_runtime_tool_surface(
 
     if not caps.image_generation:
         denied_tools |= set(_IMAGE_GENERATION_TOOL_NAMES)
+    if not caps.video_generation:
+        denied_tools.add("video_generate")
+    if not caps.video_generation and not (
+        caps.video_status and _video_status_context_available(ctx)
+    ):
+        denied_tools.add("video_status")
     if not caps.session_manager:
         denied_tools |= set(_SESSION_READ_TOOL_NAMES | _SESSION_RUNTIME_TOOL_NAMES)
     if not caps.task_runtime:
@@ -208,5 +255,7 @@ def detect_runtime_tool_surface_capabilities(
         gateway_config=gateway_config,
         channel_backing=channel_backing,
         image_generation=_detect_image_generation_capability(),
+        video_generation=_detect_video_generation_capability(),
+        video_status=_detect_video_status_capability(),
         git_available=_detect_git_capability(),
     )

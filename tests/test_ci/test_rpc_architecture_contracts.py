@@ -132,8 +132,9 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Retire 19 generated MetaSkill methods and nine legacy workflow methods.
 # Retire router learning status and training feedback (two generated methods).
 # Retire the three advanced agent administration methods.
-RUNTIME_RPC_METHOD_BASELINE = 275
-RUNTIME_RPC_METHOD_DIGEST = "bb550c7d3d3f70eefea7e9d233ee892abf4e2c28b77a9460c2da60b1228f77f1"
+# Add video-generation model discovery without changing existing method names.
+RUNTIME_RPC_METHOD_BASELINE = 276
+RUNTIME_RPC_METHOD_DIGEST = "bbbdbc03db0735074506ce88b2406082116f560fbd560a04916d988a113df523"
 STATIC_RPC_DECORATOR_BASELINE = 63
 
 # Physical lines in the sessions/runtime slice remain tracked for the final

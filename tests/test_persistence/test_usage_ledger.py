@@ -115,6 +115,9 @@ async def test_cancelling_queued_usage_reservation_does_not_reach_caller_boundar
 async def test_queued_usage_reservations_are_committed_before_returning(tmp_path):
     path = tmp_path / "sessions.db"
     storage = await SessionStorage.open(str(path))
+    # This checks durable queue completion; twelve serial writes can exceed the
+    # interactive busy budget on a loaded worker even while each write progresses.
+    storage._busy_budget_seconds = 30.0
     queued = [asyncio.Event() for _ in range(12)]
     returned = []
     await storage._operation_lock.acquire()
@@ -139,7 +142,7 @@ async def test_queued_usage_reservations_are_committed_before_returning(tmp_path
         await asyncio.wait_for(asyncio.gather(*(event.wait() for event in queued)), timeout=2)
         assert not returned
         storage._operation_lock.release()
-        await asyncio.gather(*pending)
+        await asyncio.wait_for(asyncio.gather(*pending), timeout=30)
         assert len(set(returned)) == len(queued)
         assert not storage.conn.in_transaction
     finally:
