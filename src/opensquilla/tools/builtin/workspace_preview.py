@@ -18,6 +18,8 @@ from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
         "for preview and visual feedback. "
         "Keeps the original source files. This does not build, start a server, or end the turn. "
         "Omit bundle options when reopening an existing page to retain its collection scope. "
+        "Use presentation=inline for a self-contained Visualize HTML snapshot in chat; "
+        "place the returned marker in a standalone inline-code paragraph of your response. "
         "previewStatus reports resource readiness, not confirmation that a client displayed it."
     ),
     params={
@@ -33,6 +35,10 @@ from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
             "type": "string",
             "description": "Dedicated workspace subdirectory; required only for directory mode.",
         },
+        "presentation": {
+            "type": "string", "enum": ["workbench", "inline"],
+            "description": "Default workbench. inline snapshots one UTF-8 HTML file (max 1 MiB).",
+        },
     },
     required=["path"],
     owner_only=True,
@@ -42,6 +48,7 @@ from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
 )
 async def open_workspace_preview(
     path: str, bundle: str | None = None, bundle_root: str | None = None,
+    presentation: str = "workbench",
 ) -> str:
     context = current_tool_context.get()
     if context is None or context.workspace_preview_opener is None:
@@ -49,8 +56,11 @@ async def open_workspace_preview(
     if not context.is_owner or context.guest_safe:
         raise ToolError("WORKSPACE_PREVIEW_UNAVAILABLE: This session cannot open workspace pages.")
     try:
+        if presentation not in {"workbench", "inline"}:
+            raise ValueError("invalid workspace preview presentation")
+        options = {"presentation": presentation} if presentation == "inline" else {}
         result = await context.workspace_preview_opener(
-            context, path=path, bundle=bundle, bundle_root=bundle_root,
+            context, path=path, bundle=bundle, bundle_root=bundle_root, **options,
         )
     except (ArtifactConflictError, ProjectWorkspaceStateError, OSError, ValueError) as exc:
         raise ToolError(f"WORKSPACE_PREVIEW_FAILED: {exc}") from exc

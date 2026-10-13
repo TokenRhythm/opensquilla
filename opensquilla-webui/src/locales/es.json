@@ -1,4 +1,20 @@
 {
+  "visualize": {
+    "reload": "Reload",
+    "collapse": "Collapse",
+    "expand": "Expand",
+    "error": "Canvas could not load.",
+    "loading": "Loading interactive canvas…",
+    "continue": "Add to conversation",
+    "dismiss": "Dismiss",
+    "drafted": "Added to the composer. Review and send to continue.",
+    "unavailable": "Reconnect to load this canvas.",
+    "integrity": "The saved canvas does not match this revision.",
+    "trial": "Visualize trial",
+    "trialIntro": "Try the same interactive canvas used in conversation. Adjust a control, reload, and add a follow-up to the draft.",
+    "draft": "Follow-up draft",
+    "reset": "Clear draft"
+  },
   "historyContent": {
     "unavailable": "Actualmente solo se muestra una vista previa. El texto completo no está disponible temporalmente."
   },

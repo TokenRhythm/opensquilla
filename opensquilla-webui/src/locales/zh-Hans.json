@@ -1,4 +1,20 @@
 {
+  "visualize": {
+    "reload": "重新加载",
+    "collapse": "收起",
+    "expand": "展开",
+    "error": "画布加载失败。",
+    "loading": "正在加载交互画布…",
+    "continue": "加入对话草稿",
+    "dismiss": "忽略",
+    "drafted": "已加入输入框，检查后发送即可继续。",
+    "unavailable": "请重新连接后加载画布。",
+    "integrity": "画布内容与保存的版本不一致。",
+    "trial": "Visualize 试用",
+    "trialIntro": "这里使用与聊天相同的交互画布。试着调整参数、重新加载，再将当前选择加入对话草稿。",
+    "draft": "后续提问草稿",
+    "reset": "清空草稿"
+  },
   "historyContent": {
     "unavailable": "当前仅显示预览，完整正文暂不可用。"
   },

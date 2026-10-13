@@ -292,9 +292,18 @@ export async function openArtifactBlobUrl(
 
 export function createV4ArtifactContentAccess(http: ArtifactAccessHttpTransport): Pick<
   ArtifactContentAccess,
-  'fetchArtifact' | 'openArtifact' | 'openArtifactBlob' | 'clearPreviewStorage'
+  'fetchArtifact' | 'openArtifact' | 'openArtifactBlob' | 'clearPreviewStorage' | 'fetchVisualize'
 > {
   return {
+    async fetchVisualize(request) {
+      if (!/^doc_[\w-]+$/.test(request.documentId) || !/^rev_[\w-]+$/.test(request.revisionId)) throw new Error('Invalid Visualize revision')
+      const fetched = await fetchArtifactBlob(http, {
+        download_url: `/api/v1/artifact-documents/${encodeURIComponent(request.documentId)}?revisionId=${encodeURIComponent(request.revisionId)}`,
+        mime: 'text/html',
+      }, { sessionKey: request.sessionKey, signal: request.signal, maxBytes: request.maxBytes, requireSameOrigin: true })
+      if (!fetched.ok) throw new Error(fetched.message)
+      return fetched.blob
+    },
     fetchArtifact: (artifact, request) => fetchArtifactBlob(http, artifact, runtimeOptions(request)),
     openArtifact: (artifact, request) => openArtifactViaGateway(http, artifact, runtimeOptions(request)),
     openArtifactBlob: (artifact, request) => openArtifactBlobUrl(http, artifact, runtimeOptions(request)),

@@ -1,6 +1,7 @@
 <template>
   <div ref="rootEl" class="msg-ai-text streaming-text-part">
-    <template v-for="block in committedBlocks" :key="block.key">
+    <VisualizeBody v-if="visualizeReceipts?.length" :html="visualizeHtml" :receipts="visualizeReceipts" :session-key="sessionKey" :fallback="false" />
+    <template v-else v-for="block in committedBlocks" :key="block.key">
       <div
         v-if="block.kind === 'rich'"
         class="streaming-rich-block"
@@ -8,12 +9,14 @@
       />
       <span v-else class="streaming-plain-block">{{ block.text }}</span>
     </template>
-    <span v-if="tail" class="streaming-tail">{{ tail }}</span>
+    <span v-if="tail && !visualizeReceipts?.length" class="streaming-tail">{{ tail }}</span>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import VisualizeBody from '@/components/chat/VisualizeBody.vue'
+import type { VisualizeReceipt } from '@/visualize/types'
+import { computed, ref, watch } from 'vue'
 import type { RenderMarkdownOptions } from '@/composables/chat/useChatTextRendering'
 import { useMarkdownEnhancements } from '@/composables/chat/useMarkdownEnhancements'
 import { createMarkdownRenderBudget } from '@/utils/markdown/renderCore'
@@ -23,9 +26,13 @@ const OPEN_BLOCK_LIMIT = 16 * 1024
 const PLAIN_CHUNK_SIZE = 8 * 1024
 
 const props = defineProps<{
+  sessionKey?: string
+  visualizeReceipts?: VisualizeReceipt[]
   rawText: string
   renderMarkdown: (text: string, opts?: RenderMarkdownOptions) => string
 }>()
+
+const visualizeHtml = computed(() => props.visualizeReceipts?.length ? props.renderMarkdown(props.rawText) : '')
 
 interface RichBlock {
   key: string

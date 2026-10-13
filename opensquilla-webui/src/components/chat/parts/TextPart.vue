@@ -21,7 +21,7 @@
       @action="handleWorkspaceFileAction"
     />
     <ResourceActionsMenu ref="fileMenu" :session-key="sessionKey" @open="emit('openResource', $event)" />
-    <div v-if="part.html" ref="rootEl" class="msg-ai-text" data-chat-find-body v-html="part.html" />
+    <div v-if="part.html || visualizeReceipts.length" ref="rootEl" class="msg-ai-text" data-chat-find-body><VisualizeBody :html="part.html" :receipts="visualizeReceipts" :session-key="sessionKey" /></div>
     <p v-if="unmentionedPreviews.length" class="workspace-preview-fallback">
       <span>{{ t('workbench.artifactDocument.preview') }}: </span>
       <template v-for="(preview, index) in unmentionedPreviews" :key="workspacePreviewIdentity(preview)">
@@ -45,6 +45,8 @@
 </template>
 
 <script setup lang="ts">
+import VisualizeBody from '@/components/chat/VisualizeBody.vue'
+import type { VisualizeReceipt } from '@/visualize/types'
 import { computed, inject, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import { getActivePinia } from 'pinia'
 import WorkspaceFilePreview from '@/components/chat/WorkspaceFilePreview.vue'
@@ -76,11 +78,12 @@ const props = withDefaults(
   defineProps<{
     part: Extract<ChatPart, { type: 'text' }>
     sources?: SourcePart[]
+    visualizeReceipts?: VisualizeReceipt[]
     workspacePreviews?: WorkspacePreviewLink[]
     sessionKey?: string
     preferWorkspaceWorkbench?: boolean
   }>(),
-  { sources: () => [], workspacePreviews: () => [], preferWorkspaceWorkbench: false },
+  { sources: () => [], visualizeReceipts: () => [], workspacePreviews: () => [], preferWorkspaceWorkbench: false },
 )
 
 const emit = defineEmits<{

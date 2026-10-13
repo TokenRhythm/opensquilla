@@ -440,6 +440,8 @@
             <div v-if="presentedLive.liveAnswerPart" class="live-answer">
               <StreamingTextPart
                 :raw-text="presentedLive.liveAnswerPart.rawText"
+                :visualize-receipts="liveVisualizeReceipts"
+                :session-key="sessionKey"
                 :render-markdown="renderMarkdown"
               />
             </div>
@@ -827,7 +829,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, inject, onMounted, onUnmounted, onScopeDispose, nextTick, watch } from 'vue'
+import { ref, computed, provide, inject, onMounted, onUnmounted, onScopeDispose, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
@@ -877,6 +879,8 @@ import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import ConversationMinimap from '@/components/chat/ConversationMinimap.vue'
 import EmptyStateChips from '@/components/chat/EmptyStateChips.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
+import { VISUALIZE_CONVERSATION_KEY } from '@/visualize/types'
+import { visualizeReceipts } from '@/visualize/receipts'
 import StreamingTextPart from '@/components/chat/parts/StreamingTextPart.vue'
 import ReasoningTimeline from '@/components/chat/ReasoningTimeline.vue'
 import GoalRibbon from '@/components/chat/GoalRibbon.vue'
@@ -5168,6 +5172,20 @@ function applyLandingSuggestion(text: string) {
   if (landingSuggestionsDisabled.value) return
   sendComposerText(text)
 }
+
+const liveVisualizeReceipts = computed(() => visualizeReceipts(foldedTurn.value.toolCalls))
+function visualizeConversationEnabled(key: string) {
+  return Boolean(key && key === sessionKey.value && gatewayAccess.isAvailable && !shareMode.value
+    && !forkTransition.value && !goalDraftArmed.value && !replanActive.value && !dockedPlanQuestionnaire.value)
+}
+provide(VISUALIZE_CONVERSATION_KEY, {
+  enabled: visualizeConversationEnabled,
+  draft(key, receipt, text) {
+    if (!visualizeConversationEnabled(key)) return false
+    appendComposerText(`[Visualize: ${receipt.name} · ${receipt.revisionId}]\n${text.slice(0, 4000)}`)
+    return true
+  },
+})
 
 function appendComposerText(text: string, paths?: readonly string[]) {
   const presentation = localPathPresentation(String(text || '').trim(), paths)

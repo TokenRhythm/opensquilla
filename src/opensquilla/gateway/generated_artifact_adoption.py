@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.artifact_session import ArtifactSessionService
-from opensquilla.artifact_session.models import Actor, ActorKind, ArtifactBlobRef
+from opensquilla.artifact_session.models import Actor, ActorKind, ArtifactBlobRef, ArtifactKind
 from opensquilla.artifacts import (
     ArtifactRef,
     ArtifactSource,
@@ -63,6 +63,7 @@ class GeneratedArtifactAdopter:
     async def open_workspace_preview(
         self, context: ToolContext, *, path: str, bundle: str | None = None,
         bundle_root: str | None = None,
+        presentation: str = "workbench",
     ) -> dict[str, Any]:
         """Register an HTML source as an internal Document without publishing it."""
         if self.workspace is None:
@@ -108,6 +109,54 @@ class GeneratedArtifactAdopter:
         if entry.suffix.casefold() not in {".html", ".htm", ".xhtml"}:
             raise ValueError("workspace preview entrypoint must be HTML")
         source_path = entry.relative_to(root).as_posix()
+        if presentation not in {"workbench", "inline"}:
+            raise ValueError("invalid workspace preview presentation")
+        if presentation == "inline":
+            if bundle not in {None, "none"} or bundle_root is not None:
+                raise ValueError(
+                    "inline preview requires a self-contained HTML file; use bundle=none"
+                )
+            if entry.suffix.casefold() == ".xhtml":
+                raise ValueError("inline preview requires .html or .htm")
+            # Read one bounded, no-follow snapshot. Never return a live working
+            # head: an old chat must keep showing the exact bytes delivered then.
+            payload = await asyncio.to_thread(
+                _read_regular_bundle_file, entry, max_bytes=1024 * 1024
+            )
+            if not payload or len(entry.name) > 250:
+                raise ValueError(
+                    "inline preview requires nonempty HTML and a name <=250 characters"
+                )
+            payload.decode("utf-8")
+            ref = await asyncio.to_thread(
+                self.store.publish_bytes, payload,
+                session_id=self.session_id, session_key=self.session_key,
+                name=entry.name, mime="text/html",
+                source="workspace-preview", visibility="internal",
+            )
+            commit = await self.service.create_document(
+                session_key=self.session_key, session_id=self.session_id,
+                name=entry.name, kind=ArtifactKind.HTML,
+                initial_artifact=ArtifactBlobRef(
+                    artifact_id=ref.id, sha256=ref.sha256, filename=ref.name,
+                    media_type=ref.mime, byte_size=ref.size,
+                ),
+                actor=Actor(kind=ActorKind.SYSTEM, actor_id="visualize"),
+                validate_session=self.validate_session,
+            )
+            scope = {"workspace": str(root), "source_path": source_path,
+                     "bundle_mode": "none", "bundle_root": ""}
+            if scope not in context.workspace_preview_scopes:
+                context.workspace_preview_scopes.append(scope)
+            document_id = commit.document.document_id
+            revision_id = commit.revision.revision_id
+            return {
+                "previewStatus": "inline-ready", "presentation": "inline",
+                "documentId": document_id, "revisionId": revision_id,
+                "artifactId": ref.id, "name": ref.name, "mime": ref.mime,
+                "sha256": ref.sha256, "size": ref.size,
+                "marker": f"visualize:{document_id}:{revision_id}",
+            }
         async with self.service.repository._read_transaction("workspace.preview.lookup") as conn:
             if self.validate_session is not None:
                 await self.validate_session(conn)

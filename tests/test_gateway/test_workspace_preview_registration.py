@@ -121,6 +121,66 @@ async def test_none_mode_is_html_and_notification_failure_does_not_undo_commit(p
     assert adopter.event_emitter.await_count == 1
 
 
+async def test_inline_is_a_private_immutable_snapshot_and_does_not_end_turn(preview):
+    context, adopter, workspace = preview
+    source = workspace / "site/pages/index.html"
+    source.write_text("<h1>First</h1>", encoding="utf-8")
+    first = await _open(context, presentation="inline")
+    source.write_text("<h1>Second</h1>", encoding="utf-8")
+    second = await _open(context, presentation="inline", bundle="none")
+    assert first["previewStatus"] == "inline-ready"
+    assert first["documentId"] != second["documentId"]
+    assert first["sha256"] != second["sha256"]
+    assert first["marker"] == f"visualize:{first['documentId']}:{first['revisionId']}"
+    assert len(json.dumps(first)) < 1000
+    assert not {"entrypoint", "workspace", "open", "htmlLaunchUrl"} & first.keys()
+    head = await adopter.service.get_document_head(first["documentId"])
+    assert head.revision.revision_id == first["revisionId"]
+    assert head.revision.artifact_sha256 == first["sha256"]
+    assert await get_working_files(adopter.service, first["documentId"]) is None
+    assert context.published_artifacts == []
+    adopter.preview_service.register_working_files.assert_not_called()
+    async with adopter.service.repository._read_transaction("test.inline.internal") as conn:
+        cursor = await conn.execute("SELECT COUNT(*) FROM document_publications")
+        assert (await cursor.fetchone())[0] == 0
+
+
+async def test_inline_rejects_stale_session_inside_document_transaction(preview):
+    context, adopter, _ = preview
+    adopter.validate_session = AsyncMock(side_effect=ValueError("session generation changed"))
+    with pytest.raises(ToolError, match="session generation changed"):
+        await _open(context, presentation="inline")
+    adopter.validate_session.assert_awaited_once()
+    assert not await adopter.service.list_documents(
+        session_key=context.session_key, session_id=context.session_id,
+    )
+    assert context.workspace_preview_scopes == []
+
+
+@pytest.mark.parametrize("options", [
+    {"bundle": "directory", "bundle_root": "site"}, {"bundle": "auto"},
+    {"bundle_root": "site"},
+])
+async def test_inline_rejects_bundle_options(preview, options):
+    context, _, _ = preview
+    with pytest.raises(ToolError, match="self-contained"):
+        await _open(context, presentation="inline", **options)
+
+
+async def test_inline_rejects_oversize_and_non_utf8(preview):
+    context, _, workspace = preview
+    source = workspace / "site/pages/index.html"
+    source.write_bytes(b"x" * (1024 * 1024 + 1))
+    with pytest.raises(ToolError):
+        await _open(context, presentation="inline")
+    source.write_bytes(b"\xff\xfe")
+    with pytest.raises(ToolError):
+        await _open(context, presentation="inline")
+    source.write_bytes(b"")
+    with pytest.raises(ToolError, match="nonempty"):
+        await _open(context, presentation="inline")
+
+
 @pytest.mark.parametrize("suffix,mime", [
     (".html", "text/html"),
     (".htm", "text/html"),

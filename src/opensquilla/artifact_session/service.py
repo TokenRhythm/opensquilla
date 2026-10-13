@@ -172,6 +172,7 @@ class ArtifactSessionService:
         session_id: str | None = None,
         document_id: str | None = None,
         revision_id: str | None = None,
+        validate_session: Callable[[Any], Awaitable[None]] | None = None,
     ) -> CommitResult:
         return await self.repository.create_document(
             session_key=_required(session_key, "session_key"),
@@ -182,6 +183,7 @@ class ArtifactSessionService:
             actor=_actor(actor),
             document_id=(None if document_id is None else _required(document_id, "document_id")),
             revision_id=(None if revision_id is None else _required(revision_id, "revision_id")),
+            validate_session=validate_session,
         )
 
     async def retire_legacy_html_state(self) -> None:

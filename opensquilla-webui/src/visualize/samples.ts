@@ -1,0 +1,11 @@
+export const visualizeSamples = [{
+  id: 'capacity',
+  title: 'Capacity simulator / 容量模拟器',
+  html: `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+  *{box-sizing:border-box}body{margin:0;padding:24px;font:15px system-ui,sans-serif;color:var(--color-text-primary,#20242a);background:var(--color-background,#fff)}h2{margin:0 0 8px;font-size:22px}p{line-height:1.6;opacity:.8}label{display:block;margin:20px 0 8px}input{width:100%;accent-color:#e26936}svg{display:block;width:100%;height:120px;margin:24px 0}button{border:0;border-radius:10px;padding:12px 18px;background:#db632f;color:white;font:inherit;cursor:pointer}.metrics{display:flex;gap:24px;flex-wrap:wrap}.metrics strong{font-size:30px;display:block}small{opacity:.7}@media(max-width:480px){body{padding:16px}h2{font-size:20px}}
+  </style></head><body><h2>Capacity simulator · 容量模拟器</h2><p>Adjust the workers to compare throughput and cost. 调整并发数，观察吞吐量与成本。</p>
+  <label for="workers">Workers / 并发数 <output id="value">4</output></label><input id="workers" aria-label="Workers" type="range" min="1" max="16" value="4">
+  <svg viewBox="0 0 600 120" role="img" aria-label="Throughput"><rect x="0" y="30" width="600" height="55" rx="12" fill="#8b8b8b" opacity=".15"/><rect id="bar" x="0" y="30" width="150" height="55" rx="12" fill="#e26936"/></svg>
+  <div class="metrics"><div><strong id="throughput">320</strong><small>requests / second</small></div><div><strong id="cost">$40</strong><small>estimated cost / hour</small></div></div><p><button id="follow">Discuss this setup / 讨论当前方案</button></p>
+  <script>const api=window.opensquillaVisualize;api.ready.then(()=>{const input=document.getElementById('workers');const saved=api.getState();if(saved&&Number.isFinite(saved.workers))input.value=String(saved.workers);function update(){const workers=Number(input.value);document.getElementById('value').textContent=workers;document.getElementById('throughput').textContent=workers*80;document.getElementById('cost').textContent='$'+workers*10;document.getElementById('bar').setAttribute('width',String(workers/16*600));api.setState({workers})}input.addEventListener('input',update);document.getElementById('follow').onclick=()=>api.sendPrompt('请评估 '+input.value+' 个并发 worker、每秒 '+Number(input.value)*80+' 次请求的方案，并说明成本与瓶颈。');update()});</script></body></html>`,
+}]

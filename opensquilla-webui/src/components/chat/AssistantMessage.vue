@@ -158,6 +158,7 @@
             :part="activityProjection.answerPart"
             :sources="message.sources ?? []"
             :workspace-previews="workspacePreviews"
+        :visualize-receipts="visualizePreviews"
             :session-key="sessionKey"
             :prefer-workspace-workbench="workbenchEnabled"
             @open-resource="emit('openArtifact', $event)"
@@ -221,6 +222,7 @@
         :part="activityProjection.answerPart"
         :sources="message.sources ?? []"
         :workspace-previews="workspacePreviews"
+        :visualize-receipts="visualizePreviews"
         :session-key="sessionKey"
         :prefer-workspace-workbench="workbenchEnabled"
         @open-resource="emit('openArtifact', $event)"
@@ -229,9 +231,10 @@
       />
 
       <TextPart
-        v-if="workspacePreviews.length && (!activityProjection.canSeparateActivity || !activityProjection.answerPart)"
+        v-if="(workspacePreviews.length || visualizePreviews.length) && (!activityProjection.canSeparateActivity || !activityProjection.answerPart)"
         :part="{ type: 'text', key: 'workspace-preview-fallback', rawText: '', html: '' }"
         :workspace-previews="workspacePreviews"
+        :visualize-receipts="visualizePreviews"
         :session-key="sessionKey"
         :prefer-workspace-workbench="workbenchEnabled"
         @open-resource="emit('openArtifact', $event)"
@@ -488,6 +491,7 @@
 </template>
 
 <script setup lang="ts">
+import { visualizeReceiptsFromMessage } from '@/visualize/receipts'
 import { computed, nextTick, onBeforeUnmount, provide, ref, watch } from 'vue'
 import { HISTORY_DETAILS_READY } from '@/modules/historyDetails'
 import { useI18n } from 'vue-i18n'
@@ -875,6 +879,7 @@ const legacyTimelineItems = computed<ChatStreamTimelineItem[]>(() => {
 })
 
 const semanticCreatedSessions = computed(() => createdSessionsFromMessage(props.message))
+const visualizePreviews = computed(() => props.shareMode ? [] : visualizeReceiptsFromMessage(props.message))
 const registeredWorkspacePreviews = computed(() => workspacePreviewsFromMessage(props.message))
 const previewResources = ref<Record<string, WorkbenchResource>>({})
 const workspacePreviews = computed(() => registeredWorkspacePreviews.value.flatMap(

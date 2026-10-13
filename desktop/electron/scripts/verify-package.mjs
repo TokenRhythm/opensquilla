@@ -453,12 +453,12 @@ async function verifyInstallerDataPolicy() {
   if (
     !Array.isArray(protocols)
     || protocols.length !== 1
-    || protocols[0]?.name !== 'OpenSquilla'
+    || protocols[0]?.name !== 'OpenSquilla Visualize A'
     || !Array.isArray(protocols[0]?.schemes)
     || protocols[0].schemes.length !== 1
-    || protocols[0].schemes[0] !== 'opensquilla'
+    || protocols[0].schemes[0] !== 'opensquilla-visualize-a'
   ) {
-    fail('electron-builder must register only the opensquilla URL protocol')
+    fail('electron-builder must register only the opensquilla-visualize-a trial URL protocol')
   }
 
   const extraResources = packageJson.build?.extraResources

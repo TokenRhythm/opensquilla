@@ -17,6 +17,7 @@ export function defaultRootRedirect(): string {
 }
 
 export const sharedRoutes: RouteRecordRaw[] = [
+  { path: '/visualize-trial', name: 'visualize-trial', component: () => import('@/views/VisualizeTrialView.vue'), meta: { title: 'Visualize trial', group: 'Work', icon: 'chat', nav: 'primary', navOrder: 65, navLabelKey: 'visualize.trial', platforms: ['web', 'desktop'] } },
   {
     path: '/',
     redirect: () => {

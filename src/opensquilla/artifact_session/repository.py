@@ -606,6 +606,7 @@ class ArtifactSessionRepository:
         actor: Actor,
         document_id: str | None = None,
         revision_id: str | None = None,
+        validate_session: Callable[[Any], Awaitable[None]] | None = None,
     ) -> CommitResult:
         """Create a document and its generation-one immutable snapshot atomically."""
 
@@ -613,6 +614,8 @@ class ArtifactSessionRepository:
         revision_id = revision_id or self._id_factory("rev")
         created_at = self._clock()
         async with self._transaction("create_document") as conn:
+            if validate_session is not None:
+                await validate_session(conn)
             return await self._create_document_on_conn(
                 conn,
                 session_key=session_key,

@@ -206,6 +206,7 @@ export class HtmlBundleExportError extends Error {
 }
 
 export interface ArtifactContentAccess {
+  fetchVisualize?(request: { sessionKey: string; documentId: string; revisionId: string; signal?: AbortSignal; maxBytes: number }): Promise<Blob>
   exportHtmlBundle?(request: HtmlBundleExportRequest): Promise<{ blob: Blob; filename: string }>
   workingFileMetadata?(request: WorkingFileRequest): Promise<WorkingFileMetadata | null>
   fetchWorkingFile?(request: WorkingFileRequest): Promise<Blob>

@@ -1,4 +1,4 @@
-export const DESKTOP_DEEP_LINK_SCHEME = 'opensquilla'
+export const DESKTOP_DEEP_LINK_SCHEME = 'opensquilla-visualize-a'
 
 export type DesktopDeepLinkAction = 'open'
 
