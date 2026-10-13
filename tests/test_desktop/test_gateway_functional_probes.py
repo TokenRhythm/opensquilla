@@ -323,6 +323,63 @@ def test_pty_probe_drains_tail_after_process_exit(
     assert not (tmp_path / "pty-probe-failures.jsonl").exists()
 
 
+@pytest.mark.parametrize(("output", "returncode", "available"), [
+    (b"opensquilla-pty-ok\n", 0, True),
+    (b"opensquilla-pty-ok\n", 7, False),
+    (b"opensquilla-pty-miss\n", 0, False),
+])
+def test_pty_probe_accepts_eof_during_post_exit_drain(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    output: bytes, returncode: int, available: bool,
+) -> None:
+    from opensquilla.tools import pty_backend
+
+    handle = object()
+    draining = asyncio.Event()
+    terminated = []
+    reads = 0
+    wait_for = asyncio.wait_for
+
+    async def read(current):
+        nonlocal reads
+        assert current is handle
+        reads += 1
+        if reads == 1:
+            return output
+        # Hold EOF until the probe takes the process-exited/reader-pending
+        # branch, rather than depending on executor or event-loop scheduling.
+        await draining.wait()
+        raise EOFError
+
+    async def wait(current):
+        assert current is handle
+        return returncode
+
+    async def drain(awaitable, timeout):
+        draining.set()
+        return await wait_for(awaitable, timeout)
+
+    async def terminate(current):
+        terminated.append(current)
+
+    monkeypatch.setattr(pty_backend, "spawn_pty", lambda *args, **kwargs: handle)
+    monkeypatch.setattr(pty_backend, "read_pty", read)
+    monkeypatch.setattr(pty_backend, "wait_pty", wait)
+    monkeypatch.setattr(pty_backend, "terminate_pty", terminate)
+    monkeypatch.setattr(asyncio, "wait_for", drain)
+    namespace = runpy.run_path(str(ENTRY))
+
+    assert namespace["_run_desktop_pty_probe"]() == (0 if available else 1)
+    assert draining.is_set()
+    assert terminated == [handle]
+    assert json.loads(capsys.readouterr().out) == {
+        "probe": "opensquilla-desktop-pty",
+        "available": available,
+        "ioMode": "pty" if b"opensquilla-pty-ok" in output else "pipe",
+        "returncode": returncode,
+    }
+
+
 def test_pty_probe_waits_for_process_when_reader_eof_arrives_first(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:

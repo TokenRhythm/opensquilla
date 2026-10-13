@@ -190,6 +190,8 @@ def _run_desktop_pty_probe() -> int:
                             with suppress(asyncio.CancelledError):
                                 await reading
                             break
+                        except EOFError:
+                            break
                     else:
                         try:
                             chunk = reading.result()
