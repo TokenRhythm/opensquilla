@@ -37,6 +37,13 @@ from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any
 
+from opensquilla._windows_owned_launch import (
+    _WINDOWS_HELPER_STRIP_ENV,
+    _pop_windows_env,
+)
+from opensquilla._windows_owned_launch import (
+    _windows_target_env_from_helper as _windows_target_env_from_helper,
+)
 from opensquilla.asyncio_utils import reset_contextvar_token
 from opensquilla.private_paths import (
     _WindowsPrivateDaclVerificationError,
@@ -77,7 +84,6 @@ _POSIX_TARGET_RELEASE = b"X"
 _WINDOWS_LAUNCH_GATE_PREFIX = "Local\\OpenSquillaTaskLaunch-"
 _WINDOWS_JOB_PREFIX = "Local\\OpenSquillaTaskJob-"
 _WINDOWS_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-_WINDOWS_HELPER_STRIP_ENV = "OPENSQUILLA_INTERNAL_PROCESS_TREE_STRIP_ENV"
 _WINDOWS_HELPER_RUNTIME_ENV_KEYS = ("SystemRoot", "WINDIR", "ComSpec")
 _OWNER_SCHEMA_VERSION = 1
 _OWNER_DATABASE_FILENAME = "task-process-owners.sqlite3"
@@ -120,6 +126,82 @@ def _windows_launch_diagnostics_enabled() -> bool:
     }
 
 
+def _log_windows_launch_failure(
+    *,
+    phase: str,
+    phase_started: float,
+    launch_started: float,
+    process: Any | None,
+    launcher: str,
+    error: BaseException,
+) -> None:
+    """Record bounded failure facts before cleanup, never command or exception text."""
+
+    # Diagnostics must not replace the original failure or prevent cleanup.
+    with contextlib.suppress(Exception):
+        now = time.perf_counter()
+        exceptions: list[dict[str, Any]] = []
+        current: BaseException | None = error
+        seen: set[int] = set()
+        while current is not None and len(exceptions) < 4 and id(current) not in seen:
+            seen.add(id(current))
+            item: dict[str, Any] = {"exception_type": type(current).__name__[:80]}
+            for key in ("errno", "winerror"):
+                value = getattr(current, key, None)
+                if type(value) is int:
+                    item[key] = value
+            exceptions.append(item)
+            following = current.__cause__
+            if following is None and not current.__suppress_context__:
+                following = current.__context__
+            current = following
+
+        pid = getattr(process, "pid", None)
+        returncode = None
+        returncode_observed = False
+        observation_error = None
+        try:
+            if process is not None:
+                if launcher == "async":
+                    returncode = process.returncode
+                    returncode_observed = True
+                elif launcher == "popen":
+                    returncode = process.poll()
+                    returncode_observed = True
+                # A PTY/custom factory's poll can change native reader state.
+                # Do not call it or infer liveness from its PID.
+        except Exception as exc:
+            observation_error = type(exc).__name__[:80]
+        metadata: dict[str, Any] = {
+            "event": "windows_process_tree_launch_failed",
+            "phase": phase,
+            "phase_elapsed_ms": round((now - phase_started) * 1000),
+            "launch_elapsed_ms": round((now - launch_started) * 1000),
+            "source": "frozen" if getattr(sys, "frozen", False) else "source",
+            "mode": launcher,
+            "wrapper_pid": pid if type(pid) is int else None,
+            "wrapper_returncode": returncode if type(returncode) is int else None,
+            "wrapper_returncode_observed": returncode_observed,
+            "entry": exceptions,
+        }
+        if observation_error is not None:
+            metadata["fields"] = {
+                "kind": "wrapper_observation",
+                "exception_type": observation_error,
+            }
+        log.warning(
+            "windows_process_tree_launch_failed",
+            extra={"_opensquilla_log_metadata": metadata},
+        )
+
+
+def _windows_launch_failure_message(phase: str, error: BaseException) -> str:
+    message = "Windows controlled process launch failed closed"
+    if phase == "helper_ready" and isinstance(error, TimeoutError):
+        message += " (phase=helper_ready, cause=TimeoutError)"
+    return message
+
+
 def _windows_launch_semaphore() -> tuple[asyncio.Semaphore, int]:
     """Get one admission gate per event loop, without cross-loop sharing."""
 
@@ -136,12 +218,20 @@ def _windows_launch_semaphore() -> tuple[asyncio.Semaphore, int]:
 def _process_tree_child_argv(*args: str) -> tuple[str, ...]:
     """Build the source or frozen argv for one process-tree helper."""
 
-    prefix = (
-        (sys.executable, "--internal-child", "process-tree")
-        if getattr(sys, "frozen", False)
-        else (sys.executable, "-m", "opensquilla.process_tree")
-    )
-    return (*prefix, *args)
+    if getattr(sys, "frozen", False):
+        return (sys.executable, "--internal-child", "process-tree", *args)
+    module = "opensquilla.process_tree"
+    if args and args[0] == "--windows-owned-launch":
+        module = "opensquilla._windows_owned_launch"
+        helper_path = Path(__file__).with_name("_windows_owned_launch.py").absolute()
+        # The stdlib-only helper does not need site hooks or package discovery.
+        # Keep the current interpreter and leave the target's argv/env intact.
+        # -B is explicit because -I ignores PYTHONDONTWRITEBYTECODE.
+        with contextlib.suppress(OSError):
+            if helper_path.is_file():
+                return (sys.executable, "-I", "-S", "-B", str(helper_path), *args)
+        # Zip imports and sourceless installations can still use module dispatch.
+    return (sys.executable, "-m", module, *args)
 
 
 def _wait_for_windows_helper_ready(gate: Any) -> None:
@@ -2289,25 +2379,6 @@ def _windows_helper_env(target_env: Mapping[str, str] | None) -> dict[str, str]:
     return helper_env
 
 
-def _pop_windows_env(env: dict[str, str], key: str) -> str | None:
-    folded = key.casefold()
-    for candidate in tuple(env):
-        if candidate.casefold() == folded:
-            return env.pop(candidate)
-    return None
-
-
-def _windows_target_env_from_helper(helper_env: Mapping[str, str]) -> dict[str, str]:
-    """Recover the caller-requested env after the helper has booted."""
-
-    target_env = {str(key): str(value) for key, value in dict(helper_env).items()}
-    injected = _pop_windows_env(target_env, _WINDOWS_HELPER_STRIP_ENV) or ""
-    for key in injected.split(";"):
-        if key:
-            _pop_windows_env(target_env, key)
-    return target_env
-
-
 async def _finish_launch_cleanup_step[Result](
     operation: Callable[[], Awaitable[Result]],
     cancellations: list[asyncio.CancelledError],
@@ -2545,6 +2616,7 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
                 *argv,
             )
             try:
+                phase = "helper_spawn"
                 phase_started = time.perf_counter()
                 windows_process = await asyncio.create_subprocess_exec(
                     *helper_argv,
@@ -2553,11 +2625,13 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
                 timings["helper_spawn_ms"] = round(
                     (time.perf_counter() - phase_started) * 1000
                 )
+                phase = "job_assign"
                 phase_started = time.perf_counter()
                 job.assign_pid(int(windows_process.pid))
                 timings["job_assign_ms"] = round(
                     (time.perf_counter() - phase_started) * 1000
                 )
+                phase = "helper_ready"
                 phase_started = time.perf_counter()
                 await asyncio.to_thread(
                     _wait_for_windows_helper_ready,
@@ -2567,6 +2641,7 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
                     (time.perf_counter() - phase_started) * 1000
                 )
                 if task_scope is not None:
+                    phase = "owner_register"
                     phase_started = time.perf_counter()
                     registration = asyncio.get_running_loop().run_in_executor(
                         None, partial(
@@ -2582,6 +2657,8 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
                     timings["owner_register_ms"] = round(
                         (time.perf_counter() - phase_started) * 1000
                     )
+                phase = "owner_attach"
+                phase_started = time.perf_counter()
                 if gate is None or job is None:
                     raise ProcessTreeOwnershipError(
                         "Windows controlled process launch lost ownership state"
@@ -2593,15 +2670,27 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
                     persisted_owner=persisted_owner,
                 )
                 _attach_owner(windows_process, owner)
+                phase = "gate_release"
                 phase_started = time.perf_counter()
                 gate.release()
                 timings["gate_release_ms"] = round(
                     (time.perf_counter() - phase_started) * 1000
                 )
+                phase = "completion_monitor"
+                phase_started = time.perf_counter()
                 owner.start_completion_monitor()
                 launch_succeeded = True
                 return windows_process
             except BaseException as exc:
+                if diagnostics:
+                    _log_windows_launch_failure(
+                        phase=phase,
+                        phase_started=phase_started,
+                        launch_started=launch_started,
+                        process=windows_process,
+                        launcher="async",
+                        error=exc,
+                    )
                 if job is None:
                     raise ProcessTreeOwnershipError(
                         "Windows controlled process launch lost Job ownership"
@@ -2616,7 +2705,7 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
                 if cancellation is not None:
                     raise cancellation
                 raise ProcessTreeOwnershipError(
-                    "Windows controlled process launch failed closed"
+                    _windows_launch_failure_message(phase, exc)
                 ) from exc
         finally:
             if gate is not None:
@@ -2626,10 +2715,14 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
                 timings["total_ms"] = round((time.perf_counter() - launch_started) * 1000)
                 timings["concurrency_limit"] = launch_limit
                 timings["succeeded"] = int(launch_succeeded)
-                log.info(
-                    "windows_process_tree_launch_timing",
-                    extra={"_opensquilla_log_metadata": {"timings": timings}},
-                )
+                with contextlib.suppress(Exception):
+                    log.info(
+                        "windows_process_tree_launch_timing",
+                        extra={"_opensquilla_log_metadata": {
+                            "event": "windows_process_tree_launch_timing",
+                            "timings": timings,
+                        }},
+                    )
 
     raise ProcessTreeOwnershipError(f"unsupported process-tree platform: {os.name}")
 
@@ -2659,6 +2752,8 @@ def create_owned_popen(
 
     if os.name != "nt":
         raise ProcessTreeOwnershipError("synchronous owned launcher is Windows-only")
+    diagnostics = _windows_launch_diagnostics_enabled()
+    launch_started = time.perf_counter()
     owner_id = uuid.uuid4().hex
     task_scope = _current_task_process_scope()
     gate = _WindowsLaunchGate.create()
@@ -2683,23 +2778,33 @@ def create_owned_popen(
     )
     process: Any | None = None
     persisted_owner: _PersistedOwnerRef | None = None
+    phase = "helper_spawn" if process_factory is None else "factory_spawn"
+    phase_started = time.perf_counter()
     try:
         if process_factory is None:
             process = subprocess.Popen(helper_argv, **child_kwargs)
+            phase = "job_assign"
+            phase_started = time.perf_counter()
             job.assign_pid(int(process.pid))
         else:
             # Native PTY wrappers can fail while constructing their reader,
             # after the process starts but before returning a Python handle.
             # The factory assigns the still-gated helper before that boundary.
             process = process_factory(helper_argv, owner_job=job, **child_kwargs)
+        phase = "helper_ready"
+        phase_started = time.perf_counter()
         _wait_for_windows_helper_ready(gate)
         if task_scope is not None:
+            phase = "owner_register"
+            phase_started = time.perf_counter()
             persisted_owner = _insert_owner_record(
                 task_scope,
                 owner_id=owner_id,
                 platform="windows",
                 controller_pid=int(process.pid),
             )
+        phase = "owner_attach"
+        phase_started = time.perf_counter()
         if cancel_event is not None and cancel_event.is_set():
             raise ProcessTreeOwnershipError("Windows process launch cancelled before release")
         owner = ProcessTreeOwner(
@@ -2709,10 +2814,23 @@ def create_owned_popen(
             persisted_owner=persisted_owner,
         )
         _attach_owner(process, owner)
+        phase = "gate_release"
+        phase_started = time.perf_counter()
         gate.release()
+        phase = "completion_monitor"
+        phase_started = time.perf_counter()
         owner.start_completion_monitor()
         return process
     except BaseException as exc:
+        if diagnostics:
+            _log_windows_launch_failure(
+                phase=phase,
+                phase_started=phase_started,
+                launch_started=launch_started,
+                process=process,
+                launcher="popen" if process_factory is None else "factory",
+                error=exc,
+            )
         try:
             if process is not None and process.poll() is None:
                 with contextlib.suppress(OSError):
@@ -2729,7 +2847,7 @@ def create_owned_popen(
             if persisted_owner is not None:
                 _delete_owner_record(persisted_owner)
         raise ProcessTreeOwnershipError(
-            "Windows controlled process launch failed closed"
+            _windows_launch_failure_message(phase, exc)
         ) from exc
     finally:
         gate.close()
@@ -3258,45 +3376,9 @@ def _run_windows_owned_launch(
     ready_name: str,
     argv: list[str],
 ) -> int:
-    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
-    kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
-    kernel32.OpenEventW.restype = wintypes.HANDLE
-    kernel32.SetEvent.argtypes = [wintypes.HANDLE]
-    kernel32.SetEvent.restype = wintypes.BOOL
-    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    kernel32.WaitForSingleObject.restype = wintypes.DWORD
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    synchronize = 0x00100000
-    event_modify_state = 0x0002
-    infinite = 0xFFFFFFFF
-    wait_failed = 0xFFFFFFFF
-    gate = kernel32.OpenEventW(synchronize, False, gate_name)
-    if not gate:
-        raise _windows_error()
-    ready = kernel32.OpenEventW(event_modify_state, False, ready_name)
-    if not ready:
-        kernel32.CloseHandle(gate)
-        raise _windows_error()
-    try:
-        if not kernel32.SetEvent(ready):
-            raise _windows_error()
-        if kernel32.WaitForSingleObject(gate, infinite) == wait_failed:
-            raise _windows_error()
-    finally:
-        kernel32.CloseHandle(ready)
-        kernel32.CloseHandle(gate)
-    if not argv:
-        return 127
-    try:
-        process = subprocess.Popen(
-            argv,
-            env=_windows_target_env_from_helper(os.environ),
-        )
-    except OSError:
-        print("OpenSquilla controlled launch failed", file=sys.stderr)
-        return 127
-    return int(process.wait())
+    from opensquilla._windows_owned_launch import _run_windows_owned_launch as run
+
+    return run(gate_name, ready_name, argv)
 
 
 def _posix_anchor_command_matches(record: _PersistedOwnerRecord) -> bool:

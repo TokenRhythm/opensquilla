@@ -1,5 +1,4 @@
 import os
-import ssl
 import sys
 
 _DESKTOP_CA_PROBE_ARG = "--_desktop-ca-probe"
@@ -39,6 +38,8 @@ def _is_recovery_invocation(argv: list[str]) -> bool:
 
 
 def _run_desktop_ca_probe() -> int:
+    import ssl
+
     try:
         context = ssl.create_default_context()
         ca_certificate_count = len(context.get_ca_certs(binary_form=True))
@@ -365,6 +366,13 @@ if __name__ == "__main__":
         raise SystemExit(dispatch_internal_child(["filesystem-worker", "-"]))
 
     if len(sys.argv) >= 3 and sys.argv[1] == _INTERNAL_CHILD_ARG:
+        if sys.argv[2:4] == ["process-tree", "--windows-owned-launch"]:
+            # The Windows ready handshake must not import the sandbox or the
+            # parent's asyncio/ownership registry before signalling readiness.
+            from opensquilla._windows_owned_launch import main as windows_owned_main
+
+            raise SystemExit(windows_owned_main(sys.argv[3:]))
+
         from opensquilla.sandbox.runtime_launcher import dispatch_internal_child
 
         raise SystemExit(dispatch_internal_child(sys.argv[2:]))
