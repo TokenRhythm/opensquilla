@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
+from opensquilla import token_estimation
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.request_proof import (
     project_final_request_payload,
@@ -25,6 +26,12 @@ from opensquilla.session.compaction_deployment import (
     CompactionExecutionPlan,
     CompactionExecutionTarget,
 )
+
+
+class _CharacterBudgetEncoding:
+    def encode(self, text: str, *, disallowed_special: tuple[Any, ...]) -> range:
+        del disallowed_special
+        return range((len(text) + 7) // 8)
 
 
 @pytest.mark.parametrize("identifier_instruction", ["", "Keep exact identifiers."])
@@ -62,6 +69,11 @@ async def test_reduced_summary_allowance_preserves_native_request_contract(
     reasoning: str,
     finish_reason: str,
 ) -> None:
+    # Keep tokens cheap so this contract exercises character-budget reduction.
+    # An ambient sticky tokenizer fallback makes this synthetic input too large
+    # even with no output allowance; loader/cache behavior has its own tests.
+    encoding = _CharacterBudgetEncoding()
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: encoding)
     provider_kind = "dashscope" if reasoning == "mandatory" else "openai"
     model = "qwen3.8-max-preview" if reasoning == "mandatory" else "synthetic-model"
     provider = OpenAIProvider(api_key="synthetic", model=model, provider_kind=provider_kind)
