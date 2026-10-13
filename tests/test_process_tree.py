@@ -433,7 +433,9 @@ async def test_posix_incomplete_empty_keeps_unproven_owner_record(
     persisted = object()
     owner.persisted_owner = persisted
     deleted: list[object] = []
-    monkeypatch.setattr(process_tree, "_delete_owner_record", deleted.append)
+    monkeypatch.setattr(
+        process_tree, "_delete_owner_record", lambda row, **_kwargs: deleted.append(row),
+    )
 
     class Input:
         closed = False
@@ -1197,7 +1199,7 @@ def test_darwin_pre_eof_requires_identity_bound_direct_target(
         assert result == (0 if target_visible else 125)
         assert capture_flags == [True]
         assert set(captured_ids[0]) == ({101, 102, 103} if target_visible else {102, 103})
-        assert output_pipe.getvalue() == (b"YVE" if target_visible else b"YFU")
+        assert output_pipe.getvalue() == (b"YBVE" if target_visible else b"YBFU")
     finally:
         os.close(write_fd)
 
@@ -1325,6 +1327,7 @@ def test_posix_ps_snapshot_failures_never_report_group_empty(
     stdout: str,
 ) -> None:
     monkeypatch.setattr(process_tree.os.path, "isdir", lambda _path: False)
+    monkeypatch.setattr(process_tree.sys, "platform", "other-posix")
     monkeypatch.setattr(
         process_tree.subprocess,
         "run",
@@ -2865,7 +2868,9 @@ def test_owner_registry_retries_transient_insert_contention(
         def __exit__(self, *_args: object) -> None:
             return None
 
-        def execute(self, statement: str, parameters: tuple[object, ...]) -> None:
+        def execute(
+            self, statement: str, parameters: tuple[object, ...] = (),
+        ) -> None:
             executed.append((statement, parameters))
 
     def connect(_path, *, timeout_seconds: float):
@@ -2896,7 +2901,9 @@ def test_owner_registry_retries_transient_insert_contention(
 
     assert attempts == [process_tree._OWNER_DATABASE_INSERT_TIMEOUT_SECONDS] * 3
     assert delays == list(process_tree._OWNER_DATABASE_INSERT_RETRY_DELAYS_SECONDS[:2])
-    assert len(executed) == 1
+    assert len(executed) == 3
+    assert executed[0] == ("BEGIN IMMEDIATE", ())
+    assert executed[-1] == ("COMMIT", ())
     assert reference.record.owner_id == "c" * 32
 
 
@@ -3771,7 +3778,7 @@ async def test_windows_job_completion_monitor_reclaims_persisted_row(
     monkeypatch.setattr(
         process_tree,
         "_delete_owner_record",
-        lambda row: deleted.append(row.record.owner_id),
+        lambda row, **_kwargs: deleted.append(row.record.owner_id),
     )
     owner = process_tree.ProcessTreeOwner(
         process=SimpleNamespace(returncode=0),
@@ -3798,7 +3805,7 @@ def test_pid_identity_mismatch_reclaims_stale_row_without_signalling(
     monkeypatch.setattr(
         process_tree,
         "_delete_owner_record",
-        lambda row: deleted.append(row.record.owner_id),
+        lambda row, **_kwargs: deleted.append(row.record.owner_id),
     )
     monkeypatch.setattr(
         process_tree.socket,
@@ -3885,7 +3892,7 @@ def test_persisted_posix_stop_handles_anchor_cleanup_markers(
     monkeypatch.setattr(
         process_tree,
         "_delete_owner_record",
-        lambda row: deleted.append(row.record.owner_id),
+        lambda row, **_kwargs: deleted.append(row.record.owner_id),
     )
     monotonic_values = iter(float(value) for value in range(10))
     monkeypatch.setattr(process_tree.time, "monotonic", lambda: next(monotonic_values))
@@ -3905,7 +3912,7 @@ def test_live_posix_owner_with_unavailable_control_endpoint_retains_row(
     monkeypatch.setattr(
         process_tree,
         "_delete_owner_record",
-        lambda row: deleted.append(row.record.owner_id),
+        lambda row, **_kwargs: deleted.append(row.record.owner_id),
     )
 
     assert process_tree._terminate_persisted_posix_owner_sync(reference) is False
@@ -3925,7 +3932,7 @@ def test_windows_controller_identity_mismatch_reclaims_row_without_opening_job(
     monkeypatch.setattr(
         process_tree,
         "_delete_owner_record",
-        lambda row: deleted.append(row.record.owner_id),
+        lambda row, **_kwargs: deleted.append(row.record.owner_id),
     )
     monkeypatch.setattr(
         process_tree._WindowsJob,
@@ -3985,7 +3992,7 @@ def test_windows_recovered_job_cleanup_is_fail_safe(
     monkeypatch.setattr(
         process_tree,
         "_delete_owner_record",
-        lambda row: deleted.append(row.record.owner_id),
+        lambda row, **_kwargs: deleted.append(row.record.owner_id),
     )
 
     assert process_tree._terminate_persisted_windows_owner_sync(reference) is stopped
@@ -4045,7 +4052,7 @@ async def test_unsupported_platform_record_is_retained_fail_safe(
     monkeypatch.setattr(
         process_tree,
         "_delete_owner_record",
-        lambda row: deleted.append(row.record.owner_id),
+        lambda row, **_kwargs: deleted.append(row.record.owner_id),
     )
 
     assert await process_tree._terminate_persisted_owner(reference) is False

@@ -26,7 +26,16 @@ import {
   type DesktopProfilePaths,
 } from './desktop-profile-context.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
-import { DesktopQuitBudget, DesktopQuitConfirmation, quitGatewayWithinBudget } from './desktop-quit.js'
+import {
+  DESKTOP_QUIT_TERMINATION_MS,
+  DesktopQuitBudget,
+  DesktopQuitConfirmation,
+  quitGatewayWithinBudget,
+} from './desktop-quit.js'
+import {
+  cleanupDesktopProcessTrees,
+  type DesktopProcessCleanupLaunch,
+} from './desktop-process-cleanup.js'
 import {
   buildDesktopQuitDialogHtml,
   parseDesktopQuitDialogResponse,
@@ -685,6 +694,15 @@ const gatewayProcessOwnershipContexts = new WeakMap<ChildProcessWithoutNullStrea
   profileFingerprint: string
   port: number
 }>()
+// A root exiting does not release its independent task process groups. Retain
+// each launch authority until its scoped cleanup has been confirmed.
+const gatewayProcessCleanupContexts = new Map<ChildProcessWithoutNullStreams, DesktopProcessCleanupLaunch>()
+const gatewayProcessCleanupConfirmed = new WeakSet<ChildProcessWithoutNullStreams>()
+const gatewayProcessCleanupOperations = new WeakMap<ChildProcessWithoutNullStreams, {
+  budget: DesktopQuitBudget
+  promise: Promise<boolean>
+}>()
+const gatewayProcessCleanupRetirements = new Map<ChildProcessWithoutNullStreams, Promise<boolean>>()
 // Opt stopGateway into the Windows HTTP graceful-drain path even while isQuitting
 // is set, for the update/uninstall flows that keep the main process alive and
 // await the child's exit (so the fire-and-forget drain is not racing app teardown).
@@ -9475,6 +9493,11 @@ async function startGateway(): Promise<GatewayState> {
     publishGatewayConnection()
   }
 
+  if (!await joinGatewayProcessRetirements()) {
+    throw new Error('Previous Desktop gateway process cleanup could not be confirmed.')
+  }
+  if (!isCurrent()) throw new Error('Desktop startup was superseded by a newer open request.')
+
   const activeProfile = activeDesktopProfile()
   const overrideUrl = process.env.OPENSQUILLA_DESKTOP_GATEWAY_URL
   if (overrideUrl) {
@@ -9705,6 +9728,20 @@ async function startGateway(): Promise<GatewayState> {
     profileFingerprint: gatewayProfileFingerprint,
     port,
   })
+  if (process.platform !== 'win32') {
+    gatewayProcessCleanupContexts.set(child, {
+      ...runtime,
+      args: [...runtime.args],
+      ownershipDir: gatewayOwnershipDir,
+      instanceNonce: gatewayInstanceNonce,
+      env: desktopChildEnvironment(activeProfile, {
+        PATH: childPath,
+        PYTHONUNBUFFERED: '1',
+        PYTHONUTF8: '1',
+        PYTHONIOENCODING: 'utf-8:replace',
+      }),
+    })
+  }
   gatewayProfileKey = desktopProfileKey(activeProfile)
   desktopLog('gateway_spawned', {
     elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
@@ -9744,6 +9781,12 @@ async function startGateway(): Promise<GatewayState> {
   })
   child.stdout.pipe(logStream, { end: false })
   child.stderr.pipe(logStream, { end: false })
+  child.once('exit', (code, signal) => {
+    if (code === 0 && signal === null && !isQuitting && !updateApplying
+      && gatewayStoppingProcesses.has(child)) {
+      retireStoppedGatewayProcessCleanup(child)
+    }
+  })
   // Classify startup failures only after stdio has closed. Node may emit
   // 'exit' before the final stdout/stderr chunks, which can otherwise drop the
   // stable OPENSQUILLA_PROFILE_IN_USE marker printed immediately before exit.
@@ -9829,6 +9872,7 @@ async function startGateway(): Promise<GatewayState> {
       }
       return
     }
+    gatewayProcessCleanupContexts.delete(child)
     if (isCurrentGateway) gatewayProcess = null
     closeLogStream()
     if (!isCurrentGateway) return
@@ -12619,7 +12663,7 @@ async function stopAndJoinAllLifecycleOwnedGateways(
 ): Promise<boolean> {
   cancelGatewayUnexpectedExitRestart('Gateway stop/join requested')
   const startedAt = Date.now()
-  return await stopAndJoinLifecycleProcesses({
+  const exited = await stopAndJoinLifecycleProcesses({
     currentProcess: () => (
       gatewayProcess && gatewayState.owned && !hasGatewayProcessExited(gatewayProcess)
         ? gatewayProcess
@@ -12645,6 +12689,15 @@ async function stopAndJoinAllLifecycleOwnedGateways(
       operationElapsedMs: Math.max(0, Date.now() - startedAt),
     }),
   })
+  if (!exited) return false
+  // Include roots that exited before this call as well as failures retained
+  // from an earlier attempt. Protected profile writes cannot race retirement.
+  return await joinGatewayProcessRetirements()
+}
+
+async function joinGatewayProcessRetirements(): Promise<boolean> {
+  const retired = await Promise.all(gatewayProcessCleanupRetirements.values())
+  return retired.every(Boolean)
 }
 
 function restoreDownloadedUpdateRetryState(
@@ -14958,6 +15011,13 @@ ipcMain.handle('desktop:migration:run', async (
       throw new Error('A gateway is still serving this profile; stop it and retry.')
     }
 
+    if (!await confirmStoppedGatewayProcessScopes()) {
+      restartAllowed = false
+      const message = 'Gateway process cleanup could not be confirmed before the transfer.'
+      transitionGatewayConnection({ owned: false, status: 'error', error: message })
+      throw new Error(message)
+    }
+
     // The intent is outside the target tree, so it survives target replacement.
     // Startup can use it plus a new target-side receipt to finish credential
     // adoption even if Electron dies after the Python commit but before this IPC
@@ -15927,7 +15987,9 @@ function holdQuitForTaskConfirmation(
     if (!onIdleClose) quitConfirmationWantsExit = true
     return true
   }
-  const children = liveLifecycleOwnedGatewayProcesses()
+  const children = [...new Set([
+    ...liveLifecycleOwnedGatewayProcesses(), ...gatewayProcessCleanupContexts.keys(),
+  ])]
   if (children.length === 0) return false
   event.preventDefault()
   quitConfirmationWantsExit = !onIdleClose
@@ -15937,7 +15999,14 @@ function holdQuitForTaskConfirmation(
     const accepted = await desktopQuitConfirmation.request({
       check: async () => {
         const activity = await Promise.all(children.map(async child => {
-          if (hasGatewayProcessExited(child)) return { kind: 'ok' as const, activeCount: 0 }
+          if (hasGatewayProcessExited(child)) {
+            // A known successful restart already owns bounded verification.
+            // Join that proof instead of calling its retired scope active work.
+            await gatewayProcessCleanupOperations.get(child)?.promise
+            return gatewayProcessCleanupContexts.has(child)
+              ? { kind: 'unreachable' as const }
+              : { kind: 'ok' as const, activeCount: 0 }
+          }
           const record = ownedGatewayRecord(child)
           return record
             ? await readVerifiedDesktopGatewayActivity(record, { timeoutMs: 1_000 })
@@ -15989,11 +16058,69 @@ function holdQuitForTaskConfirmation(
   return true
 }
 
+async function confirmOwnedGatewayProcessCleanup(
+  child: ChildProcessWithoutNullStreams,
+  budget: DesktopQuitBudget,
+  reportFailure = true,
+): Promise<boolean> {
+  if (process.platform === 'win32') return true
+  if (gatewayProcessCleanupConfirmed.has(child)) return true
+  const launch = gatewayProcessCleanupContexts.get(child)
+  if (reportFailure) quitUnconfirmedProcessTrees.add(child)
+  if (!launch) return false
+  let operation = gatewayProcessCleanupOperations.get(child)
+  if (!operation) {
+    const promise = cleanupDesktopProcessTrees({ launch, budget }).then(complete => {
+      if (complete) {
+        gatewayProcessCleanupConfirmed.add(child)
+        gatewayProcessCleanupContexts.delete(child)
+        gatewayProcessCleanupRetirements.delete(child)
+        quitUnconfirmedProcessTrees.delete(child)
+      }
+      desktopLog('quit_gateway_process_cleanup', { pid: child.pid, complete })
+      return complete
+    }).finally(() => { gatewayProcessCleanupOperations.delete(child) })
+    operation = { budget, promise }
+    gatewayProcessCleanupOperations.set(child, operation)
+  }
+  const result = await budget.termination(operation.promise)
+  if (!result.completed && operation.budget !== budget) operation.budget.tighten(0, 0)
+  return result.completed && result.value
+}
+
+function retireStoppedGatewayProcessCleanup(child: ChildProcessWithoutNullStreams): void {
+  if (process.platform === 'win32' || !gatewayProcessCleanupContexts.has(child)
+    || gatewayProcessCleanupRetirements.has(child)) return
+  const budget = new DesktopQuitBudget(0, DESKTOP_QUIT_TERMINATION_MS)
+  const retirement = confirmOwnedGatewayProcessCleanup(child, budget, false).catch(() => {
+    desktopLog('stopped_gateway_process_cleanup_failed', { pid: child.pid })
+    return false
+  }).finally(() => budget.dispose())
+  gatewayProcessCleanupRetirements.set(child, retirement)
+}
+
+async function confirmStoppedGatewayProcessScopes(): Promise<boolean> {
+  const children = [...gatewayProcessCleanupContexts.keys()]
+  if (children.some(child => !hasGatewayProcessExited(child))) return false
+  // Import already owns writer admission and has explicitly stopped its root.
+  // Verify every retained launch before replacing the state backing its proof.
+  const budget = new DesktopQuitBudget(0, DESKTOP_QUIT_TERMINATION_MS)
+  try {
+    const results = await Promise.all(children.map(child =>
+      confirmOwnedGatewayProcessCleanup(child, budget, false)))
+    return results.every(Boolean) && await joinGatewayProcessRetirements()
+  } catch {
+    return false
+  } finally {
+    budget.dispose()
+  }
+}
+
 async function terminateOwnedGatewayForQuit(
   child: ChildProcessWithoutNullStreams,
   budget: DesktopQuitBudget,
 ): Promise<boolean> {
-  if (hasGatewayProcessExited(child)) return true
+  if (hasGatewayProcessExited(child)) return await confirmOwnedGatewayProcessCleanup(child, budget)
   if (budget.remainingTotalMs <= 0) return false
   gatewayHardTerminatedProcesses.add(child)
   let treeStopped = true
@@ -16020,7 +16147,11 @@ async function terminateOwnedGatewayForQuit(
     if (treeStopped) quitUnconfirmedProcessTrees.delete(child)
     else quitUnconfirmedProcessTrees.add(child)
   } else {
-    terminateGatewayProcess(child, 'SIGKILL')
+    // Fence new launches and stop the exact retained task owners before the
+    // root disappears; a blocked Gateway event loop cannot perform this step.
+    treeStopped = await confirmOwnedGatewayProcessCleanup(child, budget)
+    if (!treeStopped || budget.remainingTotalMs <= 0) return false
+    if (!hasGatewayProcessExited(child)) terminateGatewayProcess(child, 'SIGKILL')
   }
   const exited = await waitForGatewayProcessExit(child, budget.remainingTotalMs)
   desktopLog('quit_gateway_termination', { pid: child.pid, exited, treeStopped })
@@ -16031,6 +16162,7 @@ async function quitOwnedGateway(
   child: ChildProcessWithoutNullStreams,
   budget: DesktopQuitBudget,
 ): Promise<boolean> {
+  let legacyDrain = false
   const result = await quitGatewayWithinBudget({
     budget,
     hasExited: () => hasGatewayProcessExited(child),
@@ -16045,9 +16177,18 @@ async function quitOwnedGateway(
     legacyDrain: () => drainOwnedGatewayForLegacyQuit(child, '', true, true),
     waitForExit: timeoutMs => waitForGatewayProcessExit(child, timeoutMs),
     terminate: () => terminateOwnedGatewayForQuit(child, budget),
-    onLegacyDrain: () => setQuitStatus('quit.legacy'),
+    confirmExit: () => confirmOwnedGatewayProcessCleanup(child, budget),
+    onLegacyDrain: () => {
+      legacyDrain = true
+      setQuitStatus('quit.legacy')
+    },
     onTerminating: () => setAppExitPhase('terminating', 'quit cleanup deadline reached'),
   })
+  if (legacyDrain && result) {
+    // Older runtimes have neither the scoped helper nor its spawn fence. Keep
+    // their existing full drain instead of sending a new internal protocol.
+    gatewayProcessCleanupContexts.delete(child)
+  }
   desktopLog('quit_gateway_exit', {
     pid: child.pid,
     exited: result,
@@ -16120,9 +16261,10 @@ async function drainOwnedGatewayForLegacyQuit(
 }
 
 function showDesktopQuitFailure(): void {
-  // A live owned root can be retried. Once it exits, its PID cannot safely
-  // identify the unconfirmed descendants or be reused for another tree kill.
-  const needsManualRecovery = [...quitUnconfirmedProcessTrees].some(hasGatewayProcessExited)
+  // A retained launch scope is retryable after root exit. Without that scope,
+  // a dead root PID cannot safely identify descendants for another tree kill.
+  const needsManualRecovery = [...quitUnconfirmedProcessTrees].some(child =>
+    hasGatewayProcessExited(child) && !gatewayProcessCleanupContexts.has(child))
   const titleKey = needsManualRecovery ? 'quit.manualRecovery' : 'quit.failed'
   isQuitting = true
   setAppExitPhase('failed', needsManualRecovery
@@ -16216,7 +16358,10 @@ app.on('before-quit', (event) => {
     && !hasGatewayProcessExited(gatewayProcess)
     ? gatewayProcess
     : null
-  const children = liveLifecycleOwnedGatewayProcesses()
+  const children = [...new Set([
+    ...liveLifecycleOwnedGatewayProcesses(),
+    ...(!quitFromSignal ? gatewayProcessCleanupContexts.keys() : []),
+  ])]
   if (children.length > 0 || !quitFromSignal || quitUnconfirmedProcessTrees.size > 0) {
     event.preventDefault()
     setAppExitPhase('draining', 'stopping lifecycle-owned Gateway')
@@ -16238,6 +16383,7 @@ app.on('before-quit', (event) => {
     ])
       .then(([results]) => results.every(Boolean)
         && liveLifecycleOwnedGatewayProcesses().length === 0
+        && (quitFromSignal || gatewayProcessCleanupContexts.size === 0)
         && quitUnconfirmedProcessTrees.size === 0)
       .catch((error) => {
         desktopLog('quit_gateway_drain_failed', {

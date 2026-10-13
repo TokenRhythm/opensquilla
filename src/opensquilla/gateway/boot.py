@@ -4575,6 +4575,7 @@ async def start_gateway_server(
             _desktop_gateway_ownership = activate_desktop_gateway_ownership(
                 profile_home=desktop_profile_home,
                 port=config.port,
+                process_state_dir=getattr(config, "state_dir", None),
             )
             log.info(
                 "gateway.desktop_ownership_activated",

@@ -110,6 +110,7 @@ export interface DesktopQuitGatewayOptions {
   legacyDrain(): Promise<boolean>
   waitForExit(timeoutMs: number): Promise<boolean>
   terminate(timeoutMs: number): Promise<boolean>
+  confirmExit?(timeoutMs: number): Promise<boolean>
   onLegacyDrain(): void
   onTerminating(): void
 }
@@ -117,7 +118,12 @@ export interface DesktopQuitGatewayOptions {
 /** Stop an exact owned child; unsupported peers retain their existing drain policy. */
 export async function quitGatewayWithinBudget(options: DesktopQuitGatewayOptions): Promise<boolean> {
   const { budget } = options
-  if (options.hasExited()) return true
+  const confirmExit = async (): Promise<boolean> => {
+    if (!options.confirmExit) return true
+    const result = await budget.termination(options.confirmExit(budget.remainingTotalMs))
+    return result.completed && result.value && options.hasExited()
+  }
+  if (options.hasExited()) return await confirmExit()
   const requestedAt = budget.elapsedMs
   const request = await budget.cleanup(options.requestQuit(budget.remainingCleanupMs))
   if (request.completed && request.value.kind === 'rejected') return false
@@ -136,11 +142,11 @@ export async function quitGatewayWithinBudget(options: DesktopQuitGatewayOptions
         ? undefined : request.value.totalRemainingMs - roundTripMs,
     )
   }
-  if (options.hasExited()) return true
+  if (options.hasExited()) return await confirmExit()
   const graceful = await budget.cleanup(options.waitForExit(budget.remainingCleanupMs))
-  if (graceful.completed && graceful.value) return true
-  if (options.hasExited()) return true
+  if (graceful.completed && graceful.value) return await confirmExit()
+  if (options.hasExited()) return await confirmExit()
   options.onTerminating()
   const terminated = await budget.termination(options.terminate(budget.remainingTotalMs))
-  return terminated.completed && terminated.value && options.hasExited()
+  return terminated.completed && terminated.value && options.hasExited() && await confirmExit()
 }

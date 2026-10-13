@@ -1055,6 +1055,8 @@ jobs:
           node scripts/test-desktop-close-confirmation.mjs
           node scripts/test-desktop-quit-failure.mjs
           node scripts/test-desktop-quit-dialog.mjs
+          node scripts/test-desktop-process-cleanup.mjs
+          node scripts/test-desktop-process-cleanup-lifecycle.mjs
           node scripts/test-bundled-runtimes.mjs
           node scripts/test-desktop-cleanup-contract.mjs
           node scripts/test-desktop-renderer-log.mjs
@@ -1771,6 +1773,9 @@ jobs:
             tests/test_recovery
             tests/test_migration/test_opensquilla_home_migration.py
             tests/test_desktop/test_electron_startup_contract.py
+            tests/test_desktop/test_process_cleanup.py
+            tests/test_desktop/test_posix_quit_process_cleanup.py
+            tests/test_mcp/test_stdio_client.py
             tests/test_engine/test_request_execution_identity.py
             tests/test_gateway/test_session_model_routing_rpc.py
             tests/test_tools/test_execution_status.py

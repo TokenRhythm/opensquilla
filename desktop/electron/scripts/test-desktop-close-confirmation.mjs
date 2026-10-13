@@ -112,6 +112,8 @@ function createScenario({ platform = 'darwin', behavior = 'background', activity
     app: { quit: () => { quit += 1; events.push('quit') } },
     desktopLog: (event) => events.push(event),
     liveLifecycleOwnedGatewayProcesses: () => [child],
+    gatewayProcessCleanupContexts: new Map(),
+    gatewayProcessCleanupOperations: new WeakMap(),
     hasGatewayProcessExited: () => false,
     ownedGatewayRecord: () => ({ instance_nonce: 'synthetic' }),
     readVerifiedDesktopGatewayActivity: async () => {
@@ -191,6 +193,41 @@ for (const activity of ['active', 'unknown']) {
   await settleConfirmation(scenario, true)
   assert.equal(scenario.quit, 1, `${activity}: accepted prompt should quit once`)
   assert.equal(scenario.hidden, 0)
+}
+
+// A retired root cannot prove its independent tools are idle.
+{
+  const scenario = createScenario({ activity: 'idle' })
+  const retired = {}
+  scenario.env.liveLifecycleOwnedGatewayProcesses = () => []
+  scenario.env.hasGatewayProcessExited = () => true
+  scenario.env.gatewayProcessCleanupContexts.set(retired, { instanceNonce: 'synthetic-retired-scope' })
+  scenario.handlers.holdQuitForTaskConfirmation(scenario.closeEvent())
+  await until(() => scenario.shownQuitDialog === 1)
+  assert.equal(scenario.activityChecks, 0, 'a dead root cannot prove its independent tools are idle')
+  assert.equal(scenario.hidden, 0)
+  assert.equal(scenario.quit, 0)
+  await settleConfirmation(scenario, false)
+  assert.equal(scenario.quit, 0, 'uncertain retained work requires interruption confirmation')
+}
+
+// An idle runtime preserves the configured close behavior.
+{
+  const scenario = createScenario({ behavior: 'background', activity: 'idle' })
+  const retired = {}
+  const proof = deferred()
+  scenario.env.hasGatewayProcessExited = value => value === retired
+  scenario.env.gatewayProcessCleanupContexts.set(retired, { instanceNonce: 'synthetic-clean-restart' })
+  scenario.env.gatewayProcessCleanupOperations.set(retired, {
+    promise: proof.promise.then(() => { scenario.env.gatewayProcessCleanupContexts.delete(retired); return true }),
+  })
+  scenario.handlers.handleMainWindowClose(scenario.window, scenario.closeEvent())
+  await flush()
+  assert.equal(scenario.shownQuitDialog, 0, 'a clean restart joins its pending verification')
+  proof.resolve()
+  await until(() => scenario.hidden === 1)
+  assert.equal(scenario.shownQuitDialog, 0)
+  assert.equal(scenario.quit, 0, 'an idle post-restart close keeps the background preference')
 }
 
 // An idle runtime preserves the configured close behavior.

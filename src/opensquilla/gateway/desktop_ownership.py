@@ -554,6 +554,7 @@ def activate_desktop_gateway_ownership(
     *,
     profile_home: str | Path,
     port: int,
+    process_state_dir: str | Path | None = None,
 ) -> DesktopGatewayOwnership | None:
     """Create the process-owned record when the Desktop handshake is enabled."""
 
@@ -567,7 +568,19 @@ def activate_desktop_gateway_ownership(
     active = _ACTIVE_DESKTOP_GATEWAY_OWNERSHIP
     if active is not None and active is not owner:
         raise RuntimeError("Desktop gateway ownership is already active")
-    owner.acquire()
+    from opensquilla.desktop_process_cleanup import configure_desktop_process_cleanup
+
+    configure_desktop_process_cleanup(
+        ownership_dir=owner.state_dir, instance_nonce=owner.instance_nonce,
+        state_dir=process_state_dir,
+    )
+    try:
+        owner.acquire()
+    except BaseException:
+        from opensquilla.desktop_process_cleanup import release_desktop_process_cleanup
+
+        release_desktop_process_cleanup(owner.instance_nonce)
+        raise
     _ACTIVE_DESKTOP_GATEWAY_OWNERSHIP = owner
     return owner
 
@@ -579,7 +592,12 @@ def release_active_desktop_gateway_ownership() -> None:
     owner = _ACTIVE_DESKTOP_GATEWAY_OWNERSHIP
     _ACTIVE_DESKTOP_GATEWAY_OWNERSHIP = None
     if owner is not None:
-        owner.release()
+        from opensquilla.desktop_process_cleanup import release_desktop_process_cleanup
+
+        try:
+            owner.release()
+        finally:
+            release_desktop_process_cleanup(owner.instance_nonce)
 
 
 __all__ = [

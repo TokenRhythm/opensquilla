@@ -224,6 +224,7 @@ function mainExitHarness() {
     cancelGatewayUnexpectedExitRestart() {}, desktopT: key => key,
     gatewayProcess: child,
     gatewayProcessOwnershipContexts: new Map([[child, { nonce: 'synthetic-owner' }]]),
+    gatewayProcessCleanupContexts: new Map(),
     desktopGatewayAuthToken: nonce => `auth-${nonce}`,
     activeDesktopProfile: () => ({ home: 'synthetic-profile' }),
     desktopProfileFingerprint: () => 'synthetic-fingerprint',

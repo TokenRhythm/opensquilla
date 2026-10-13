@@ -162,6 +162,7 @@ function lifecycleFixture(options = {}) {
     mainWindowCloseAction, DesktopQuitBudget,
     quitConfirmationPromise: null, quitConfirmed: false, quitFromSignal: false,
     quitUnconfirmedProcessTrees: new Set(),
+    gatewayProcessCleanupContexts: new Map(),
     holdQuitForTaskConfirmation: () => false,
     cancelGatewayUnexpectedExitRestart: () => {},
     showDesktopQuitFailure: () => { assert.fail('synthetic normal quit cleanup must succeed') },

@@ -72,6 +72,26 @@ await withBudget(async (budget, clock) => {
 })
 
 await withBudget(async (budget, clock) => {
+  const confirmation = deferred()
+  let finished = false
+  const quit = quitGatewayWithinBudget(gatewayOptions(budget, {
+    hasExited: () => true,
+    confirmExit: async remainingMs => {
+      assert.equal(remainingMs, 15_000)
+      return await confirmation.promise
+    },
+  })).then(result => { finished = true; return result })
+  await flush()
+  assert.equal(finished, false, 'an exited root still waits for its independent tool cleanup')
+  await clock.advance(100)
+  budget.tighten(0, 50)
+  await clock.advance(50)
+  assert.equal(await quit, false, 'exit verification uses the same shortened overall deadline')
+  confirmation.resolve(true)
+  await flush()
+})
+
+await withBudget(async (budget, clock) => {
   let exited = false
   const quit = quitGatewayWithinBudget(gatewayOptions(budget, {
     hasExited: () => exited,
@@ -184,6 +204,7 @@ await withBudget(async (budget, clock) => {
     requestQuit: async () => ({ kind: 'unsupported' }),
     onLegacyDrain: () => phases.push('legacy'),
     legacyDrain: async () => await legacy.promise,
+    confirmExit: unexpected('new cleanup protocol for a legacy peer'),
   })).then(result => {
     settled = true
     return result

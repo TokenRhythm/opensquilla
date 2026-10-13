@@ -59,6 +59,7 @@ const env = {
   liveLifecycleOwnedGatewayProcesses: () => rootExited ? [] : [child],
   quitFromSignal: false,
   quitUnconfirmedProcessTrees: new Set([child]),
+  gatewayProcessCleanupContexts: new Map(),
   setAppExitPhase: phase => { statuses.push(phase) },
   setQuitStatus: key => { statuses.push(key) },
   artifactPreviewLeaseBroker: { shutdown: async () => {} },

@@ -60,6 +60,7 @@ _WINDOWS_PROCESS_LAUNCH_CONCURRENCY_ENV = (
 _WINDOWS_LAUNCH_DIAGNOSTICS_ENV = "OPENSQUILLA_STALL_DIAGNOSTICS"
 _POSIX_ANCHOR_READY = b"Y"
 _POSIX_ANCHOR_ARM = b"A"
+_POSIX_ANCHOR_ARMED = b"B"
 _POSIX_ANCHOR_EMPTY = b"E"
 _POSIX_ANCHOR_EMPTY_INCOMPLETE = b"U"
 _POSIX_ANCHOR_CAPTURED = b"C"
@@ -178,6 +179,7 @@ class _TaskProcessScope:
     task_digest: str
     parent_session_digest: str | None = None
     parent_task_digest: str | None = None
+    desktop_launch_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -289,7 +291,9 @@ def task_process_scope(
 
 
 def _current_task_process_scope() -> _TaskProcessScope | None:
-    return _CURRENT_TASK_PROCESS_SCOPE.get()
+    from opensquilla.desktop_process_cleanup import desktop_process_scope
+
+    return desktop_process_scope(_CURRENT_TASK_PROCESS_SCOPE.get())
 
 
 @dataclass(frozen=True)
@@ -671,6 +675,9 @@ def _connect_owner_database(
             "CREATE INDEX IF NOT EXISTS idx_task_process_owners_parent "
             "ON task_process_owners(parent_task_digest)"
         )
+        from opensquilla.desktop_process_cleanup import prepare_launch_registry
+
+        prepare_launch_registry(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS task_process_owner_claims (
@@ -1269,6 +1276,10 @@ def _insert_owner_record(
                 path,
                 timeout_seconds=_OWNER_DATABASE_INSERT_TIMEOUT_SECONDS,
             ) as connection:
+                from opensquilla.desktop_process_cleanup import register_launch_owner
+
+                connection.execute("BEGIN IMMEDIATE")
+                register_launch_owner(connection, scope, record)
                 connection.execute(
                     """
                     INSERT INTO task_process_owners (
@@ -1289,6 +1300,7 @@ def _insert_owner_record(
                         record.controller_start_identity,
                     ),
                 )
+                connection.execute("COMMIT")
             return _PersistedOwnerRef(database_path=path, record=record)
         except (OSError, sqlite3.Error, _OwnerRegistryFileChangedError) as exc:
             if delay is None or not _is_transient_owner_registry_write_error(exc):
@@ -1300,11 +1312,16 @@ def _insert_owner_record(
     raise AssertionError("owner database insert retry loop did not terminate")
 
 
-def _delete_owner_record(reference: _PersistedOwnerRef) -> None:
+def _delete_owner_record(
+    reference: _PersistedOwnerRef, *, cleanup_complete: bool = False,
+) -> None:
     record = reference.record
     try:
         with _connect_owner_database(reference.database_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            from opensquilla.desktop_process_cleanup import settle_launch_owner
+
+            settle_launch_owner(connection, reference.record.owner_id, cleanup_complete)
             connection.execute(
                 "DELETE FROM task_process_owners "
                 "WHERE owner_id = ? AND controller_pid = ? "
@@ -1776,6 +1793,7 @@ class _WindowsLaunchGate:
 class _PosixLaunchGate:
     read_fd: int
     write_fd: int
+    release_attempted: bool = False
 
     @classmethod
     def create(cls) -> _PosixLaunchGate:
@@ -1794,6 +1812,7 @@ class _PosixLaunchGate:
     def release(self) -> None:
         if self.write_fd < 0:
             raise ProcessTreeOwnershipError("POSIX controlled launch gate is closed")
+        self.release_attempted = True
         os.write(self.write_fd, _POSIX_TARGET_RELEASE)
         os.close(self.write_fd)
         self.write_fd = -1
@@ -1848,6 +1867,16 @@ class _PosixGroupAnchor:
             raise ProcessTreeOwnershipError("POSIX ownership anchor has incomplete control pipes")
         stdin.write(_POSIX_ANCHOR_ARM)
         await stdin.drain()
+        try:
+            marker = await asyncio.wait_for(
+                stdout.readexactly(1), timeout=_CONTROL_READY_TIMEOUT_SECONDS,
+            )
+        except (TimeoutError, asyncio.IncompleteReadError) as exc:
+            raise ProcessTreeOwnershipError(
+                "POSIX ownership anchor did not authorize launch"
+            ) from exc
+        if marker != _POSIX_ANCHOR_ARMED:
+            raise ProcessTreeOwnershipError("POSIX ownership anchor refused target launch")
         self._monitor_task = asyncio.create_task(self._watch_empty(stdout))
 
     def bind(self, owner: ProcessTreeOwner) -> None:
@@ -2051,12 +2080,15 @@ class ProcessTreeOwner:
         self.persisted_owner = None
         return persisted_owner
 
-    async def _mark_closed(self) -> None:
+    async def _mark_closed(self, *, cleanup_complete: bool = True) -> None:
         persisted_owner = self._take_persisted_owner()
         if persisted_owner is not None:
             self._owner_deletion = asyncio.get_running_loop().run_in_executor(
                 None,
-                partial(contextvars.copy_context().run, _delete_owner_record, persisted_owner),
+                partial(
+                    contextvars.copy_context().run, _delete_owner_record,
+                    persisted_owner, cleanup_complete=cleanup_complete,
+                ),
             )
         if self._owner_deletion is not None:
             cancellations: list[asyncio.CancelledError] = []
@@ -2120,35 +2152,39 @@ class ProcessTreeOwner:
 
         async with self._terminate_lock:
             if not self.is_active():
-                await self._mark_closed()
+                complete = True
                 if self.posix_anchor is not None:
                     await self.posix_anchor.settle(kill_timeout)
-                    return not self.posix_anchor.cleanup_incomplete
-                return True
+                    complete = not self.posix_anchor.cleanup_incomplete
+                await self._mark_closed(cleanup_complete=complete)
+                return complete
             if self.pgid is not None:
                 assert self.posix_anchor is not None
                 if not await self.posix_anchor.request_signal(_POSIX_ANCHOR_TERMINATE):
                     if not self.is_active():
-                        await self._mark_closed()
                         await self.posix_anchor.settle(kill_timeout)
-                        return not self.posix_anchor.cleanup_incomplete
+                        complete = not self.posix_anchor.cleanup_incomplete
+                        await self._mark_closed(cleanup_complete=complete)
+                        return complete
                     return False
                 if await self._wait_inactive(graceful_timeout):
-                    await self._mark_closed()
-                    if self.posix_anchor is not None:
-                        await self.posix_anchor.settle(kill_timeout)
-                    return not self.posix_anchor.cleanup_incomplete
+                    await self.posix_anchor.settle(kill_timeout)
+                    complete = not self.posix_anchor.cleanup_incomplete
+                    await self._mark_closed(cleanup_complete=complete)
+                    return complete
                 if not await self.posix_anchor.request_signal(_POSIX_ANCHOR_KILL):
                     if not self.is_active():
-                        await self._mark_closed()
                         await self.posix_anchor.settle(kill_timeout)
-                        return not self.posix_anchor.cleanup_incomplete
+                        complete = not self.posix_anchor.cleanup_incomplete
+                        await self._mark_closed(cleanup_complete=complete)
+                        return complete
                     return False
                 stopped = await self._wait_inactive(kill_timeout)
                 if stopped:
-                    await self._mark_closed()
-                    if self.posix_anchor is not None:
-                        await self.posix_anchor.settle(kill_timeout)
+                    await self.posix_anchor.settle(kill_timeout)
+                    await self._mark_closed(
+                        cleanup_complete=not self.posix_anchor.cleanup_incomplete,
+                    )
                 return stopped and not self.posix_anchor.cleanup_incomplete
             if self.windows_job is not None:
                 try:
@@ -2360,10 +2396,21 @@ async def _cleanup_failed_posix_launch(
             partial(_stop_unarmed_posix_anchor, anchor), cancellations,
         )
     if persisted_owner is not None:
+        # A cancelled pre-release launch never ran user code. Both controlled
+        # children must still be observed stopped before recording success.
+        complete = (
+            not getattr(gate, "release_attempted", True)
+            and (process is None or getattr(process, "returncode", None) is not None)
+            and getattr(anchor.process, "returncode", None) is not None
+        )
+        delete = (
+            partial(_delete_owner_record, cleanup_complete=True)
+            if complete else _delete_owner_record
+        )
         with contextlib.suppress(BaseException):
             deletion = asyncio.get_running_loop().run_in_executor(
                 None,
-                partial(contextvars.copy_context().run, _delete_owner_record, persisted_owner),
+                partial(contextvars.copy_context().run, delete, persisted_owner),
             )
             await _finish_launch_cleanup_step(partial(asyncio.shield, deletion), cancellations)
     return cancellations[0] if cancellations else None
@@ -2812,6 +2859,27 @@ class _PtyAnchorProcess:
             self.stdout.close()
 
 
+def _stop_failed_posix_pty_control(control: _PtyAnchorProcess) -> None:
+    """Keep a lost launch ACK from orphaning an unpersisted PTY target."""
+    deadline = time.monotonic() + _CONTROL_READY_TIMEOUT_SECONDS
+    with contextlib.suppress(BrokenPipeError, OSError):
+        control.stdin.write(_POSIX_ANCHOR_TERMINATE + _POSIX_ANCHOR_KILL)
+    descriptor = control.stdout.file.fileno()
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        readable, _, _ = select.select([descriptor], [], [], remaining)
+        if not readable:
+            break
+        marker = os.read(descriptor, 1)
+        if not marker:
+            break
+        if marker in {_POSIX_ANCHOR_EMPTY, _POSIX_ANCHOR_EMPTY_INCOMPLETE}:
+            with contextlib.suppress(BrokenPipeError, OSError):
+                control.stdin.write(_POSIX_ANCHOR_RELEASE)
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        control.process.wait(timeout=max(0.0, deadline - time.monotonic()))
+
+
 def create_owned_posix_pty(
     argv: list[str], process_factory: Callable[..., Any], *,
     cancel_event: threading.Event | None = None, **kwargs: Any,
@@ -2830,6 +2898,7 @@ def create_owned_posix_pty(
     status_read, status_write = os.pipe()
     process = None
     persisted_owner = None
+    control: _PtyAnchorProcess | None = None
     try:
         # ptyprocess preserves pass_fds when closing descriptors, but unlike
         # subprocess.Popen it does not clear their close-on-exec flag.
@@ -2867,16 +2936,30 @@ def create_owned_posix_pty(
         )
         anchor.bind(owner)
         _attach_owner(process, owner)
-        # Async callers may prepare this launch in a worker, then attach the
-        # status reader to their event loop before using or cleaning the tree.
-        owner.start_completion_monitor()
+        # Consume the launch acknowledgement before giving the asynchronous
+        # monitor ownership of this pipe. Cancellation must never release a PTY.
         control.stdin.write(_POSIX_ANCHOR_ARM)
+        status_fd = control.stdout.file.fileno()
+        readable, _, _ = select.select([status_fd], [], [], _CONTROL_READY_TIMEOUT_SECONDS)
+        if not readable or os.read(status_fd, 1) != _POSIX_ANCHOR_ARMED:
+            raise ProcessTreeOwnershipError("PTY group anchor refused target launch")
+        owner.start_completion_monitor()
         return process
     except BaseException:
-        if process is not None:
-            process.terminate()
         if persisted_owner is not None:
-            _delete_owner_record(persisted_owner)
+            # An ACK can be lost after the target starts. Use the durable
+            # controller before retiring its identity or closing control pipes.
+            with contextlib.suppress(Exception):
+                if _terminate_persisted_posix_owner_sync(persisted_owner) and process is not None:
+                    process.wait()
+        elif control is not None:
+            with contextlib.suppress(Exception):
+                _stop_failed_posix_pty_control(control)
+        elif process is not None:
+            process.terminate()
+        if control is not None:
+            control.stdin.close()
+            control.stdout.close()
         raise
     finally:
         for fd in (control_read, control_write, status_read, status_write):
@@ -2993,6 +3076,8 @@ def _run_posix_group_anchor(
     captured: tuple[_CapturedPosixProcess, ...] = ()
     capture_attempted = False
     cleanup_complete = True
+    readers: list[Any]
+    connection: socket.socket | None
 
     def prepare_capture(*, refresh: bool = False) -> bytes:
         nonlocal captured, capture_attempted, cleanup_complete
@@ -3034,7 +3119,7 @@ def _run_posix_group_anchor(
 
     def signal_owned(command: bytes) -> bytes:
         nonlocal cleanup_complete
-        prepare_capture()
+        prepare_capture(refresh=command == _POSIX_ANCHOR_KILL)
         if command == _POSIX_ANCHOR_TERMINATE:
             try:
                 os.killpg(pgid, signal.SIGTERM)
@@ -3068,9 +3153,37 @@ def _run_posix_group_anchor(
             server.listen(2)
         output_pipe.write(_POSIX_ANCHOR_READY)
         output_pipe.flush()
-        if input_pipe.read(1) != _POSIX_ANCHOR_ARM:
-            return 125
-        if target_argv is not None:
+        # The Gateway can stall before ARM or after EMPTY. Keep the independent
+        # cleanup socket available at both boundaries without releasing a target.
+        startup_cancelled = False
+        while True:
+            readers = [input_pipe.fileno(), *([server] if server is not None else [])]
+            ready, _, _ = select.select(readers, [], [], _POLL_INTERVAL_SECONDS)
+            if server is not None and server in ready:
+                connection, _address = server.accept()
+                with connection:
+                    connection.settimeout(0.2)
+                    try:
+                        command = connection.recv(1)
+                    except OSError:
+                        command = b""
+                    if command in {_POSIX_ANCHOR_TERMINATE, _POSIX_ANCHOR_KILL}:
+                        marker = signal_owned(command)
+                        with contextlib.suppress(OSError):
+                            connection.sendall(marker)
+                        # Neither the PTY target nor the pipe target's release gate
+                        # may become runnable after an independent quit request.
+                        if command == _POSIX_ANCHOR_KILL:
+                            os.killpg(pgid, signal.SIGKILL)
+                        startup_cancelled = True
+                        break
+            if input_pipe.fileno() in ready:
+                if input_pipe.read(1) != _POSIX_ANCHOR_ARM:
+                    return 125
+                output_pipe.write(_POSIX_ANCHOR_ARMED)
+                output_pipe.flush()
+                break
+        if target_argv is not None and not startup_cancelled:
             def restore_signals() -> None:
                 for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                     signal.signal(sig, signal.SIG_DFL)
@@ -3130,14 +3243,33 @@ def _run_posix_group_anchor(
                     return 0 if cleanup_complete else 125
                 if not stdin_open:
                     return 0 if cleanup_complete else 125
-                os.set_blocking(stdin_fd, True)
-                if os.read(stdin_fd, 1) != _POSIX_ANCHOR_RELEASE:
-                    return 125
-                if not cleanup_complete:
-                    return 125
-                return int(target.returncode or 0) if target is not None else 0
+                while True:
+                    readers = [stdin_fd, *([server] if server is not None else [])]
+                    ready, _, _ = select.select(readers, [], [], _POLL_INTERVAL_SECONDS)
+                    if server is not None and server in ready:
+                        connection, _address = server.accept()
+                        with connection:
+                            connection.settimeout(0.2)
+                            try:
+                                command = connection.recv(1)
+                            except OSError:
+                                command = b""
+                            if command in {_POSIX_ANCHOR_TERMINATE, _POSIX_ANCHOR_KILL}:
+                                marker = (
+                                    _POSIX_ANCHOR_CAPTURED
+                                    if cleanup_complete else _POSIX_ANCHOR_INCOMPLETE
+                                )
+                                with contextlib.suppress(OSError):
+                                    connection.sendall(marker)
+                                return 0 if cleanup_complete else 125
+                    if stdin_fd in ready:
+                        if os.read(stdin_fd, 1) != _POSIX_ANCHOR_RELEASE:
+                            return 125
+                        if not cleanup_complete:
+                            return 125
+                        return int(target.returncode or 0) if target is not None else 0
             pipe_command = b""
-            readers: list[Any] = [stdin_fd] if stdin_open else []
+            readers = [stdin_fd] if stdin_open else []
             if server is not None:
                 readers.append(server)
             try:
@@ -3195,7 +3327,7 @@ def _run_posix_group_anchor(
                     poll_delay = _POLL_INTERVAL_SECONDS
                 else:
                     return 0
-            connection: socket.socket | None = None
+            connection = None
             if server is not None and server in readable:
                 connection, _address = server.accept()
             if connection is not None:
@@ -3311,6 +3443,16 @@ def _run_windows_owned_launch(
     return int(process.wait())
 
 
+def _posix_anchor_argv_matches(argv: list[str], owner_id: str) -> bool:
+    for prefix in (("-m", "opensquilla.process_tree"), ("--internal-child", "process-tree")):
+        for index in range(len(argv) - 3):
+            if tuple(argv[index:index + 2]) == prefix and argv[index + 2:index + 4] == [
+                "--posix-group-anchor", owner_id,
+            ]:
+                return True
+    return False
+
+
 def _posix_anchor_command_matches(record: _PersistedOwnerRecord) -> bool:
     pid = record.controller_pid
     if sys.platform.startswith("linux"):
@@ -3319,11 +3461,7 @@ def _posix_anchor_command_matches(record: _PersistedOwnerRecord) -> bool:
         except OSError:
             return False
         decoded = [value.decode("utf-8", errors="replace") for value in argv if value]
-        return (
-            "opensquilla.process_tree" in decoded
-            and "--posix-group-anchor" in decoded
-            and record.owner_id in decoded
-        )
+        return _posix_anchor_argv_matches(decoded, record.owner_id)
     try:
         command = "/bin/ps" if Path("/bin/ps").is_file() else "ps"
         result = subprocess.run(
@@ -3337,13 +3475,15 @@ def _posix_anchor_command_matches(record: _PersistedOwnerRecord) -> bool:
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    command_line = result.stdout.strip()
-    return (
-        result.returncode == 0
-        and "opensquilla.process_tree" in command_line
-        and "--posix-group-anchor" in command_line
-        and record.owner_id in command_line.split()
+    if result.returncode != 0:
+        return False
+    # ps renders argv without shell quoting. Executable/target paths may contain
+    # unmatched quotes, so only match the fixed helper marker and exact owner ID.
+    marker = (
+        r"(?<!\S)(?:-m\s+opensquilla\.process_tree|--internal-child\s+process-tree)"
+        r"\s+--posix-group-anchor\s+" + re.escape(record.owner_id) + r"(?=\s|$)"
     )
+    return re.search(marker, result.stdout) is not None
 
 
 def _controller_identity_matches(record: _PersistedOwnerRecord) -> bool:
@@ -3422,11 +3562,12 @@ def _terminate_persisted_posix_owner_sync(reference: _PersistedOwnerRef) -> bool
     if _posix_controller_matches(record):
         log.warning("process_tree_persisted_posix_stop_timeout")
         return False
-    _delete_owner_record(reference)
-    return capture_marker in {
+    complete = capture_marker in {
         _POSIX_ANCHOR_CAPTURED,
         _POSIX_ANCHOR_LEGACY_TERMINATED,
     }
+    _delete_owner_record(reference, cleanup_complete=complete)
+    return complete
 
 
 def _terminate_persisted_windows_owner_sync(reference: _PersistedOwnerRef) -> bool:
@@ -3461,7 +3602,7 @@ def _terminate_persisted_windows_owner_sync(reference: _PersistedOwnerRef) -> bo
     finally:
         job.close()
     if stopped:
-        _delete_owner_record(reference)
+        _delete_owner_record(reference, cleanup_complete=True)
     else:
         log.warning("process_tree_persisted_windows_stop_timeout")
     return stopped
@@ -3607,6 +3748,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run one fixed process-tree helper mode."""
 
     args = list(sys.argv[1:] if argv is None else argv)
+    if args == ["--desktop-quit-cleanup"]:
+        from opensquilla.desktop_process_cleanup import cleanup_main
+
+        return cleanup_main()
     if (
         len(args) >= 3
         and args[0] == "--posix-group-anchor"
