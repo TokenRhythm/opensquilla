@@ -120,9 +120,27 @@ class ResolvedSearchRuntime:
     def provider_kwargs(self, provider_id: str) -> dict[str, object]:
         return self.provider_config(provider_id).provider_kwargs()
 
+    def require_available(self, provider_id: str) -> None:
+        """Reject unavailable providers before constructing or calling them."""
+
+        provider = self.provider_config(provider_id)
+        if provider.available:
+            return
+        raise SearchProviderError(
+            provider=provider_id,
+            kind="auth" if provider.requires_api_key else "unknown",
+            message=(
+                "Search API key is not configured."
+                if provider.requires_api_key and not provider.credential_configured
+                else "Search provider is not supported by this runtime."
+            ),
+            retryable=False,
+        )
+
     def build_provider(self, provider_id: str) -> SearchProvider:
         from opensquilla.search.registry import get_provider
 
+        self.require_available(provider_id)
         _ensure_builtin_search_providers()
         return get_provider(provider_id, **self.provider_kwargs(provider_id))
 

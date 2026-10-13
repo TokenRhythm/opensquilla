@@ -16723,9 +16723,14 @@ class Agent:
         requested = set(ctx.disclosed_tool_names) & set(authorized) - existing
         if not requested:
             return
+        authorized_definitions = [
+            definition
+            for definition in registry.to_tool_definitions(ctx)
+            if definition.name in authorized
+        ]
         definitions = {
             definition.name: definition
-            for definition in registry.to_tool_definitions(ctx)
+            for definition in registry.to_model_tool_definitions(authorized_definitions, ctx)
             if definition.name in requested
         }
         for name in sorted(requested):

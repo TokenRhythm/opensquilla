@@ -87,6 +87,17 @@ candidate, but it still sends at most one provider network request and never
 switches after a network failure. `search_diagnostics = true` includes
 provider-attempt details in tool results.
 
+The agent's provider choices include only currently available providers. Providers
+that require an API key are hidden from the model until credentials are configured;
+explicit calls from an older tool definition are also rejected before constructing
+or calling the provider. Missing credentials are reported separately from rejected
+credentials.
+
+If DuckDuckGo returns an anti-bot challenge, it is not called again during that
+agent turn, even with a different query or through link discovery. The agent can
+still use another configured provider or fetch a known URL. A new turn may try
+DuckDuckGo again.
+
 Configuration matrix:
 
 - **no-key**: choose DuckDuckGo, or leave search unconfigured and the runtime

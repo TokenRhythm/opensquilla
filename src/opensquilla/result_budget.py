@@ -20,6 +20,7 @@ from enum import StrEnum
 from typing import Any, TypeGuard
 
 from opensquilla.search.normalize import canonicalize_query_key
+from opensquilla.search.turn_state import SearchTurnState
 from opensquilla.search_tool_outcome import (
     WebRetrievalSemanticKey,
     parse_web_tool_outcome,
@@ -237,6 +238,7 @@ class ToolRunBudgetTracker:
 
     def __init__(self, policy: ToolRunBudgetPolicy | None = None) -> None:
         self.policy = policy or DEFAULT_TOOL_RUN_BUDGET_POLICY
+        self.search_turn_state = SearchTurnState()
         self._lock = asyncio.Lock()
         self._web_search_calls_used = 0
         self._web_fetch_calls_used = 0
@@ -317,7 +319,13 @@ class ToolRunBudgetTracker:
             if semantic_key is not None:
                 self._inflight_retrieval_keys.discard(semantic_key)
                 if web_outcome is not None and web_outcome.retry_allowed is False:
-                    self._terminal_retrieval_keys[semantic_key] = web_outcome.error_kind
+                    provider_guarded = (
+                        web_outcome.error_kind == "blocked"
+                        and web_outcome.failed_provider == "duckduckgo"
+                        and self.search_turn_state.duckduckgo_blocked
+                    )
+                    if not provider_guarded:
+                        self._terminal_retrieval_keys[semantic_key] = web_outcome.error_kind
 
     async def abort_tool_result(self, reservation: ToolRunBudgetReservation) -> None:
         if (
