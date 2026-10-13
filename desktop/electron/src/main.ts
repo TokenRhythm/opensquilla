@@ -1,5 +1,6 @@
 import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, powerMonitor, protocol, safeStorage, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
+import { parse as parseToml } from 'smol-toml'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { createWriteStream, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs'
@@ -25,6 +26,7 @@ import {
   primaryProfilePaths,
   type DesktopProfilePaths,
 } from './desktop-profile-context.js'
+import { configuredDesktopDataDirectory, inspectDesktopStartupMetadata } from './desktop-startup-preflight.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
 import {
   acknowledgeDesktopActivation, clearDesktopActivationAcknowledgements,
@@ -2370,25 +2372,9 @@ function configuredDesktopStateDirectory(
   configRaw: string | null,
 ): string {
   if (configRaw !== null) {
-    for (const rawLine of configRaw.split(/\r?\n/)) {
-      if (/^\s*\[/.test(rawLine)) break
-      const match = rawLine.match(/^\s*state_dir\s*=\s*(["'])(.*?)\1\s*(?:#.*)?$/)
-      if (!match) continue
-      let configured = match[2] ?? ''
-      if (match[1] === '"') {
-        try {
-          const parsed: unknown = JSON.parse(`${match[1]}${configured}${match[1]}`)
-          if (typeof parsed === 'string') configured = parsed
-        } catch {
-          return join(profile.home, 'state')
-        }
-      }
-      if (configured === '~') configured = homedir()
-      else if (configured.startsWith('~/') || configured.startsWith('~\\')) {
-        configured = join(homedir(), configured.slice(2))
-      }
-      return resolve(profile.home, configured)
-    }
+    const configured = configuredDesktopDataDirectory(profile.home, parseToml(configRaw).state_dir, 'state')
+    if (!configured) throw new Error('The configured Desktop state directory is not a supported path.')
+    return configured
   }
   return join(profile.home, 'state')
 }
@@ -10397,8 +10383,11 @@ async function stopOwnedGatewayAndWait(): Promise<void> {
 }
 
 async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
-  const consolidationFailure = await consolidateLegacyRecoveryProfilesBeforeStartup()
   const active = activeDesktopProfile()
+  const metadata = inspectDesktopStartupMetadata(app.getPath('userData'), active.home)
+  let consolidationFailure = metadata.canSkipMaintenance
+    ? null
+    : await consolidateLegacyRecoveryProfilesBeforeStartup()
   // On a hard Electron crash, the Python Gateway can remain healthy and keep
   // the profile writer lease. Prove and stop that exact prior Desktop instance
   // before profile inspection; otherwise the inspector reports profile_lock_busy
@@ -10409,6 +10398,26 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     await recoverVerifiedOrphanGatewayBeforeSpawn(active)
   }
   recoveryOperationError = null
+  if (metadata.canSkipMaintenance) {
+    // Orphan drain can await another process. Re-check metadata afterwards so a
+    // transaction or config edit during that wait takes the original path.
+    const current = inspectDesktopStartupMetadata(app.getPath('userData'), active.home)
+    if (current.canSkipMaintenance) {
+      recoveryInspection = null
+      primaryRecoveryInspection = null
+      desktopGrowthTelemetry.observeProfileInspection({
+        profileKey: active.home,
+        stableCode: resolvedPathsEqual(current.workspaceDirectory, join(active.home, 'workspace'))
+          ? 'canonical_workspace' : 'configured_workspace',
+        importedOrMigrated: false,
+      })
+      desktopLog('desktop_profile_startup_fastpath', { maintenanceHelpersSkipped: true })
+      publishRecoveryState()
+      createApplicationMenu()
+      return true
+    }
+    consolidationFailure = await consolidateLegacyRecoveryProfilesBeforeStartup()
+  }
   let inspection = await inspectDesktopProfile(active)
   const growthInspection = {
     profileKey: active.home,
