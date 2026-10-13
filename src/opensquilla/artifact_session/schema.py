@@ -512,10 +512,25 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         SELECT RAISE(ABORT, 'document publications are immutable');
     END
     """,
+    """
+    CREATE TABLE IF NOT EXISTS artifact_office_materializations (
+        document_id TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL UNIQUE,
+        session_key TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        workspace TEXT NOT NULL,
+        expected_revision_id TEXT NOT NULL,
+        plan_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('prepared', 'applied')),
+        result_revision_id TEXT,
+        FOREIGN KEY (document_id) REFERENCES artifact_documents(document_id) ON DELETE CASCADE
+    )
+    """,
 )
 
 
 SCHEMA_OBJECTS: tuple[str, ...] = (
+    "artifact_office_materializations",
     "document_publications_immutable",
     "document_source_bindings_immutable",
     "idx_document_publish_attempts_status",

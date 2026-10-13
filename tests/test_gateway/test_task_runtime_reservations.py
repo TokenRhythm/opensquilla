@@ -2026,3 +2026,45 @@ async def test_concurrent_execution_fences_cannot_erase_driver_change_signal(
                 task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+
+
+@pytest.mark.parametrize(
+    ("incoming_office", "queued_office"), [(True, False), (False, True), (True, True)],
+)
+async def test_collect_keeps_office_candidates_in_independent_turns(incoming_office, queued_office):
+    storage = _TrackingStorage()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    async def handler(run):
+        if run.message == "running":
+            started.set()
+            await release.wait()
+    runtime = TaskRuntime(storage=storage, turn_handler=handler, max_concurrency=1)
+    running_envelope = _envelope("agent-1::office-collect")
+    running = await runtime.enqueue(running_envelope, "running")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    queued_envelope = _envelope("agent-1::office-collect")
+    incoming = _envelope("agent-1::office-collect")
+    if queued_office:
+        queued_envelope.metadata["office_candidate"] = {"candidateId":"first"}
+    if incoming_office:
+        incoming.metadata["office_candidate"] = {"candidateId":"second"}
+    queued = await runtime.enqueue(queued_envelope, "first", mode="collect")
+    persisted = False
+    async def persist(*args):
+        nonlocal persisted
+        persisted = True
+        return _PersistenceResult()
+    try:
+        result = await runtime.try_collect_atomically(
+            envelope=incoming, message="second", attachments=None, run_kind="default",
+            no_memory_capture=False, semantic_message=None, persisted_user_message_id="second",
+            message_count=1, persist=persist,
+        )
+        assert result is None and not persisted
+        assert runtime._tasks[queued.task_id].message == "first"
+        assert runtime._tasks[queued.task_id].envelope.metadata == queued_envelope.metadata
+    finally:
+        release.set()
+        await runtime.wait(running.task_id, timeout=2.0)
+        await runtime.wait(queued.task_id, timeout=2.0)

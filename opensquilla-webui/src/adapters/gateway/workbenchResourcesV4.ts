@@ -1,4 +1,5 @@
 import { normalizePageContext } from '@/types/pageContext'
+import { artifactWorkbenchPreviewKind, isOfficePreviewFormat } from '@/utils/workbench/artifactPreview'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import type { WorkbenchResourceProvider } from '@/modules/artifactWorkbench'
 
@@ -311,6 +312,14 @@ export function createRpcWorkbenchResourceProvider(
       const resolved = normalizeWorkbenchResource(response.resource)
       const preview = record(response.preview)
       const previewResource = normalizeRef(preview?.resource)
+      const format = resolved ? artifactWorkbenchPreviewKind({ name: resolved.name, mime: resolved.mime }) : 'unsupported'
+      const localAdapter = record(preview?.adapter)
+      const localRenderer = stringAt(preview || {}, 'mode') === 'local-renderer'
+        && stringAt(preview || {}, 'sandboxProfile', 'sandbox_profile') === 'none'
+        && isOfficePreviewFormat(format) && localAdapter?.id === 'silurus-office'
+        && localAdapter.version === '0.88.0' && localAdapter.format === format
+      const isolatedRenderer = stringAt(preview || {}, 'mode') === 'isolated'
+        && stringAt(preview || {}, 'sandboxProfile', 'sandbox_profile') === 'opaque-offline'
       if (
         !resolved
         || !resolved.capabilities.preview
@@ -319,8 +328,7 @@ export function createRpcWorkbenchResourceProvider(
         || previewResource.type !== resolved.resource.type
         || workbenchResourceRefId(previewResource)
           !== workbenchResourceRefId(resolved.resource)
-        || stringAt(preview, 'mode') !== 'isolated'
-        || stringAt(preview, 'sandboxProfile', 'sandbox_profile') !== 'opaque-offline'
+        || !(localRenderer || isolatedRenderer)
         || valueAt(preview, 'network') !== false
       ) {
         throw new Error('The workbench preview descriptor is invalid.')
@@ -329,10 +337,10 @@ export function createRpcWorkbenchResourceProvider(
         resource: resolved,
         preview: {
           protocolVersion: numberAt(preview, 'protocolVersion', 'protocol_version') ?? 1,
-          mode: 'isolated',
+          mode: localRenderer ? 'local-renderer' : 'isolated',
           resource: previewResource,
           launchUrl: stringAt(preview, 'launchUrl', 'launch_url') || undefined,
-          sandboxProfile: 'opaque-offline',
+          sandboxProfile: localRenderer ? 'none' : 'opaque-offline',
           network: false,
           adapter: record(preview.adapter),
         },

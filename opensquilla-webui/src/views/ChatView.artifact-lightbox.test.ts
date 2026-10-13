@@ -46,8 +46,8 @@ describe('ChatView artifact preview routing', () => {
 
     expect(typedStart).toBeGreaterThan(-1)
     expect(source).toContain("createWorkbenchResourceRef('deliverable', artifactId)")
-    expect(source).toContain('workbenchResourcesStore.resolve(sessionKey.value, ref)')
-    expect(source).toContain('workbenchResourcesStore.openCurrent(sessionKey.value, resource)')
+    expect(source).toContain('workbenchResourcesStore.resolve(key, ref)')
+    expect(source).toContain('workbenchResourcesStore.openCurrent(key, resource)')
     expect(source).toContain("current?.disposition === 'document'")
     expect(source).toContain('artifactPayloadFromRevision(current.revision)')
     expect(source).toContain("initialSection: 'preview'")

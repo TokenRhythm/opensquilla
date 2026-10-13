@@ -3,6 +3,20 @@ import { describe, expect, it } from 'vitest'
 import chatViewSource from './ChatView.vue?raw'
 
 describe('ChatView prompt annotation focus and reuse', () => {
+  it('filters shared drafts at display, preparation and snapshot boundaries without opening native reuse', () => {
+    expect(chatViewSource).toContain('activeDraftsForSession(sessionKey.value, annotationAllowed)')
+    expect(chatViewSource).toContain('sendableDraftsForSession(sessionKey.value, annotationAllowed)')
+    expect(chatViewSource).toContain('sendBlockedReason(sessionKey.value, annotationAllowed)')
+    expect(chatViewSource).toContain('if (!ids.every(id => annotationAllowed(artifactPromptAnnotationsStore.annotations[id]))) return false')
+    expect(chatViewSource).toContain('ids.filter(id => annotationAllowed(artifactPromptAnnotationsStore.annotations[id]))')
+    const desktop = chatViewSource.slice(chatViewSource.indexOf('const promptAnnotationDesktopAvailable'), chatViewSource.indexOf('const { inputText'))
+    expect(desktop).toContain('&& promptAnnotationsEnabled.value')
+    expect(desktop).not.toContain('officePromptAnnotationsEnabled')
+    const browser = chatViewSource.slice(chatViewSource.indexOf('const browserUseSupported'), chatViewSource.indexOf('let browserUseSelectionSequence'))
+    expect(browser).toContain('platform.capabilities.hasNativeWorkbenchSurfaces === true')
+    expect(browser).not.toContain('officePromptAnnotationsEnabled')
+  })
+
   it('keeps Workbench resources independently gated and hides actions on old gateways', () => {
     const start = chatViewSource.indexOf('const workbenchResourcesEnabled = computed(')
     const end = chatViewSource.indexOf('\nconst activePromptAnnotations', start)

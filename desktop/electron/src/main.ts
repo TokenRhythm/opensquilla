@@ -1586,6 +1586,7 @@ async function proxyDesktopRendererRequest(
     method,
     headers,
     body,
+    signal: request.signal,
     redirect: 'manual',
     bypassCustomProtocolHandlers: true,
   })
@@ -1614,7 +1615,7 @@ function secureDesktopRendererDocument(response: Response): Response {
       "base-uri opensquilla-app://desktop",
       "object-src 'none'",
       "frame-ancestors 'none'",
-      "script-src 'self' opensquilla-app://desktop 'unsafe-inline'",
+      "script-src 'self' opensquilla-app://desktop 'unsafe-inline' 'wasm-unsafe-eval'",
       "style-src 'self' opensquilla-app://desktop 'unsafe-inline'",
       "img-src 'self' opensquilla-app://desktop blob: data: http: https:",
       "font-src 'self' opensquilla-app://desktop data:",

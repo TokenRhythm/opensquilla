@@ -438,6 +438,21 @@ describe('workbench resource provider', () => {
     )
   })
 
+  it.each(['docx', 'pptx', 'xlsx'])('accepts a pinned local %s renderer without claiming HTML origin isolation', async format => {
+    const response = { resource: { resource: { type: 'attachment', id: 'att-office' },
+      name: `sample.${format}`, mime: 'application/octet-stream', sha256: 'a'.repeat(64),
+      downloadUrl: '/api/v1/attachments/office', capabilities: { preview: true, download: true, edit: false, publish: false }, relations: {} },
+      preview: { protocolVersion: 1, mode: 'local-renderer', resource: { type: 'attachment', id: 'att-office' },
+        sandboxProfile: 'none', network: false, adapter: { id: 'silurus-office', version: '0.88.0', format } } }
+    const call = vi.fn(async () => response)
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
+    const result = await provider.createPreview?.('session-a', { type: 'attachment', id: 'att-office' })
+    expect(result?.preview).toMatchObject({ mode: 'local-renderer', sandboxProfile: 'none', network: false,
+      adapter: { id: 'silurus-office', version: '0.88.0', format } })
+    response.preview.adapter.version = 'unknown'
+    await expect(provider.createPreview?.('session-a', { type: 'attachment', id: 'att-office' })).rejects.toThrow()
+  })
+
   it('publishes one immutable revision', async () => {
     const call = vi.fn(async () => ({
       deliverable: {

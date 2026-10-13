@@ -122,12 +122,12 @@ async def test_office_format_capabilities_are_independently_fail_closed(
     for artifact_format in ("docx", "xlsx", "pptx"):
         capabilities = described.payload["formats"][artifact_format]
         assert capabilities["download"] is True
-        assert capabilities["preview"] is False
-        assert capabilities["selectionContext"] is False
+        assert capabilities["preview"] is True
+        assert capabilities["selectionContext"] is True
         assert capabilities["manualEdit"] is False
-        assert capabilities["agentEdit"] is False
-        assert capabilities["publish"] is False
-        assert capabilities["unavailableReason"] == "office_adapter_not_available"
+        assert capabilities["agentEdit"] is True
+        assert capabilities["publish"] is True
+        assert "unavailableReason" not in capabilities
 
 
 

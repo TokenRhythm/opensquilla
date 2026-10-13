@@ -62,6 +62,7 @@ _PINNED_CONTENT_TYPES = {
     ".woff": "font/woff",
     ".woff2": "font/woff2",
     ".ttf": "font/ttf",
+    ".otf": "font/otf",
     ".html": "text/html",
     ".htm": "text/html",
     ".png": "image/png",

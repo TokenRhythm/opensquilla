@@ -458,6 +458,11 @@ jobs:
         working-directory: opensquilla-webui
         run: npm ci
 
+      - name: Prepare pinned offline Office preview assets
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        working-directory: opensquilla-webui
+        run: npm run prepare:office-assets
+
       - name: Stage verified frontend artifact for Python consumers
         working-directory: opensquilla-webui
         run: node scripts/stage-dist.mjs

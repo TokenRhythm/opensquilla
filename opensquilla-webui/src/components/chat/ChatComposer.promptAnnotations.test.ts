@@ -72,6 +72,25 @@ afterEach(() => {
 })
 
 describe('ChatComposer prompt annotation drafts', () => {
+  it('keeps Office draft editing without offering the native DOM focus action', async () => {
+    const jump = vi.fn()
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = createApp(ChatComposer, composerProps({
+      promptAnnotations: [annotation({ selection: { format: 'pptx', kind: 'element', shapeId: 'title', truncated: false } })],
+      onJumpPromptAnnotation: jump,
+    }))
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+    const main = host.querySelector<HTMLButtonElement>('.chat-prompt-annotation-chip__main')!
+    expect(main.disabled).toBe(true)
+    main.click()
+    expect(jump).not.toHaveBeenCalled()
+    expect(host.querySelector<HTMLButtonElement>('.chat-prompt-annotation-chip .attachment-action')?.disabled).toBe(false)
+    app.unmount()
+  })
+
   it('keeps the draft card visible when the floating composer was retracted', async () => {
     const host = document.createElement('div')
     document.body.append(host)

@@ -1639,7 +1639,7 @@ async def test_office_resource_exposes_stable_edit_unavailable_reason(
     assert capabilities["agentEdit"] is False
     assert capabilities["edit"] is False
     assert capabilities["publish"] is False
-    assert capabilities["editReasonCode"] == "office_adapter_not_available"
+    assert capabilities["editReasonCode"] == "office_not_zip"
 
     forged_import = await _dispatch(
         env,
@@ -1654,7 +1654,7 @@ async def test_office_resource_exposes_stable_edit_unavailable_reason(
     )
     assert forged_import.error is not None
     assert forged_import.error.code == "RESOURCE_UNSUPPORTED"
-    assert forged_import.error.details == {"reasonCode": "office_adapter_not_available"}
+    assert forged_import.error.details == {"reasonCode": "office_not_zip"}
     service = await ArtifactSessionService.from_session_storage(env.storage)
     assert (
         await service.list_documents(
@@ -1721,7 +1721,7 @@ async def test_office_resource_exposes_stable_edit_unavailable_reason(
     )
     assert rejected_publish.error is not None
     assert rejected_publish.error.code == "RESOURCE_UNSUPPORTED"
-    assert rejected_publish.error.details == {"reasonCode": "office_adapter_not_available"}
+    assert rejected_publish.error.details == {"reasonCode": "office_not_zip"}
     assert (
         await service.list_document_publications(
             session_id=env.session.session_id,

@@ -100,10 +100,11 @@ export interface WorkbenchResourcesListResponse {
 
 export interface WorkbenchPreviewDescriptor {
   protocolVersion: number
-  mode: 'isolated'
+  mode: 'isolated' | 'local-renderer'
   resource: WorkbenchResourceRef
   launchUrl?: string
-  sandboxProfile: 'opaque-offline'
+  sandboxProfile: 'opaque-offline' | 'none'
+  /** Document external resources are disabled; local-renderer is not an origin sandbox. */
   network: false
   adapter?: Readonly<Record<string, unknown>> | null
 }

@@ -108,6 +108,7 @@
                 type="button"
                 class="chat-prompt-annotation-chip__main"
                 :title="annotation.body"
+                :disabled="Boolean(annotation.selection)"
                 @click="emit('jumpPromptAnnotation', annotation.annotationId)"
               >
                 <span class="chat-prompt-annotation-chip__target">

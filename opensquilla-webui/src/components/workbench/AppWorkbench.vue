@@ -52,7 +52,7 @@
         :artifact="resourceActionArtifact(item)!" :session-key="sessionKeyFromWorkbenchItem(item)"
         :previewable="false" trigger />
       <select
-        v-if="artifactNavigationItems(item).length > 1"
+        v-if="showArtifactNavigation(item)"
         class="app-workbench__switcher"
         :value="item?.id"
         :aria-label="t('chat.sessionDeliverables')"
@@ -135,7 +135,10 @@
           v-else
           type="button"
           class="app-workbench__action"
-          :class="{ 'is-active': toolbarItem.pressed }"
+          :class="{
+            'is-active': toolbarItem.pressed,
+            'app-workbench__action--annotation': toolbarItem.id === 'toggle-annotation-mode',
+          }"
           :aria-label="toolbarItem.label"
           :aria-describedby="isActiveAnnotationToolbarItem(toolbarItem)
             ? 'workbench-annotation-mode-status'
@@ -148,10 +151,10 @@
           <Icon :name="toolbarItem.icon" :size="15" aria-hidden="true" />
           <span
             v-if="toolbarItem.id === 'toggle-annotation-mode'"
-            class="app-workbench__action-beta"
+            class="app-workbench__action-label"
             aria-hidden="true"
           >
-            β
+            {{ toolbarItem.label }}
           </span>
         </button>
       </template>
@@ -223,7 +226,7 @@ import type {
   WorkbenchPreviewDescriptor,
   WorkbenchResource,
 } from '@/types/workbenchResources'
-import { workbenchResourceRefId } from '@/types/workbenchResources'
+import { createWorkbenchResourceRef, workbenchResourceRefId } from '@/types/workbenchResources'
 import { workbenchPanelRegistry } from '@/workbench/registry'
 import {
   artifactWorkbenchItemId,
@@ -242,12 +245,12 @@ import {
   type BrowserWorkbenchOpenEventDetail,
 } from '@/workbench/browserItems'
 import { artifactFileTitle } from '@/utils/chat/artifacts'
-import { artifactProductClientError } from '@/utils/artifactProductErrors'
+import { artifactProductClientError, classifyArtifactProductError } from '@/utils/artifactProductErrors'
 import {
   readPreviewPreferences,
   savePreviewPreferences,
 } from '@/utils/workbench/previewPreferences'
-import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
+import { artifactWorkbenchPreviewKind, isOfficePreviewFormat } from '@/utils/workbench/artifactPreview'
 import {
   attachWorkbenchRuntime,
   WorkbenchRuntimeManager,
@@ -285,7 +288,7 @@ import type {
   WorkbenchToolbarSelectOption,
   WorkbenchToolbarItem,
 } from '@/workbench/types'
-import { createArtifactWorkbenchDefinitions } from './artifactWorkbenchProvider'
+import { createArtifactWorkbenchDefinitions, type ArtifactWorkbenchProviderOptions } from './artifactWorkbenchProvider'
 import { createBrowserWorkbenchDefinition } from './browserWorkbenchProvider'
 import { createWorkbenchResourceCollectionDefinition } from './workbenchResourceCollectionProvider'
 import { WORKSPACE_REFERENCES_KEY } from '@/modules/workspaceReferences'
@@ -301,6 +304,7 @@ const props = withDefaults(defineProps<{
   modalBlocked?: boolean
   workbenchResourcesEnabled?: boolean
   promptAnnotationsEnabled?: boolean
+  officePromptAnnotationsEnabled?: boolean
   routeActive?: boolean
   sessionId?: string
 }>(), {
@@ -308,6 +312,7 @@ const props = withDefaults(defineProps<{
   modalBlocked: false,
   workbenchResourcesEnabled: false,
   promptAnnotationsEnabled: false,
+  officePromptAnnotationsEnabled: false,
   routeActive: false,
   sessionId: '',
 })
@@ -359,6 +364,7 @@ let stopSurfaceEvents: (() => void) | null = null
 let stopArtifactEvents: (() => void) | null = null
 let detachRuntime: (() => Promise<void>) | null = null
 let scopeChangeGeneration = 0
+let artifactNavigationGeneration = 0
 function artifactPreviewItemForExplicitOpen(
   options: Parameters<typeof createArtifactPreviewWorkbenchItem>[0],
 ): WorkbenchItem {
@@ -457,11 +463,7 @@ function onBrowserWorkbenchOpen(event: Event) {
   }
 }
 
-for (const definition of createArtifactWorkbenchDefinitions({
-  artifactContent: artifactWorkbench.content,
-  artifactPreviews: artifactWorkbench.previews,
-  artifactDocuments,
-  promptAnnotations: props.promptAnnotationsEnabled ? {
+const promptAnnotationActions: NonNullable<ArtifactWorkbenchProviderOptions['promptAnnotations']> = {
     create: request => artifactPromptAnnotations.create(request),
     update: (annotationId, body) => artifactPromptAnnotations.update(annotationId, body),
     discard: annotationId => artifactPromptAnnotations.discard(annotationId),
@@ -477,7 +479,14 @@ for (const definition of createArtifactWorkbenchDefinitions({
     setActiveDocument: (sessionKey, documentId) => {
       artifactPromptAnnotations.setActiveDocument(sessionKey, documentId)
     },
-  } : undefined,
+}
+
+for (const definition of createArtifactWorkbenchDefinitions({
+  artifactContent: artifactWorkbench.content,
+  artifactPreviews: artifactWorkbench.previews,
+  artifactDocuments,
+  promptAnnotations: props.promptAnnotationsEnabled ? promptAnnotationActions : undefined,
+  officePromptAnnotations: props.officePromptAnnotationsEnabled ? promptAnnotationActions : undefined,
   baseOrigin,
   confirmPermission: confirmWorkbenchPermission,
   confirmRemoteResources: () => confirm({
@@ -573,10 +582,15 @@ function openResourceArtifact(
   }))
 }
 
-async function openWorkbenchResource(resource: WorkbenchResource, item: WorkbenchItem) {
+async function openWorkbenchResource(
+  resource: WorkbenchResource,
+  item: WorkbenchItem,
+  isCurrent: () => boolean = () => true,
+) {
   const sessionKey = resourceSessionKey(item)
-  if (!sessionKey) return
+  if (!sessionKey || !isCurrent()) return
   const current = await workbenchResources.openCurrent(sessionKey, resource)
+  if (!isCurrent()) return
   if (current?.disposition === 'document') {
     refreshResourceCollectionItem(sessionKey)
     const artifact = artifactPayloadFromRevision(current.revision)
@@ -599,7 +613,7 @@ async function openWorkbenchResource(resource: WorkbenchResource, item: Workbenc
     && resource.capabilities.edit
     && resource.sha256
   ) {
-    await importWorkbenchResourceForSession(resource, sessionKey)
+    await importWorkbenchResourceForSession(resource, sessionKey, isCurrent)
     return
   }
   const readonlyResource = current?.resource || resource
@@ -632,6 +646,7 @@ async function openWorkbenchResource(resource: WorkbenchResource, item: Workbenc
     return
   }
   const preview = await workbenchResources.preview(sessionKey, readonlyResource.resource)
+  if (!isCurrent()) return
   const resolved = preview ? resourceFromPreparedPreview(preview) : readonlyResource
   openResourceArtifact(
     resolved,
@@ -644,8 +659,11 @@ async function openWorkbenchResource(resource: WorkbenchResource, item: Workbenc
 async function importWorkbenchResourceForSession(
   resource: WorkbenchResource,
   sessionKey: string,
+  isCurrent: () => boolean = () => true,
 ) {
+  if (!isCurrent()) return
   const imported = await workbenchResources.importDocument(sessionKey, resource)
+  if (!isCurrent()) return
   refreshResourceCollectionItem(sessionKey)
   const artifact = artifactPayloadFromRevision(imported.revision)
   artifact.documentId = imported.document.documentId
@@ -834,7 +852,13 @@ function artifactNavigationId(
   return artifactWorkbenchItemId(sessionKeyFromWorkbenchItem(item), artifact)
 }
 
-function selectNavigationArtifact(
+function showArtifactNavigation(item: WorkbenchItem | null): boolean {
+  const artifacts = artifactNavigationItems(item)
+  return Boolean(item && artifacts.length > 1
+    && artifacts.some(artifact => artifactNavigationId(item, artifact) === item.id))
+}
+
+async function selectNavigationArtifact(
   item: WorkbenchItem | null,
   event: Event,
 ) {
@@ -844,8 +868,46 @@ function selectNavigationArtifact(
     candidate => artifactNavigationId(item, candidate) === select.value,
   )
   if (!artifact || select.value === item.id) return
+  // The active item changes only after a successful open, including canonical
+  // document resolution. Keep failed requests from looking like a selection.
+  select.value = item.id
   const navigationArtifacts = navigationArtifactsFromWorkbenchItem(item)
   const sessionKey = sessionKeyFromWorkbenchItem(item)
+  const navigationGeneration = ++artifactNavigationGeneration
+  const scopeGeneration = scopeChangeGeneration
+  const isCurrent = () => navigationGeneration === artifactNavigationGeneration
+    && scopeGeneration === scopeChangeGeneration
+    && props.routeActive && props.sessionId === sessionKey
+    && store.activeSessionId === sessionKey && store.activeItemId === item.id
+    && store.items.some(candidate => candidate.id === item.id)
+  if (!isCurrent()) return
+  const kind = artifactWorkbenchPreviewKind(artifact)
+  const artifactId = typeof artifact.id === 'string' ? artifact.id.trim() : ''
+  const documentId = typeof artifact.documentId === 'string'
+    ? artifact.documentId.trim()
+    : typeof artifact.document_id === 'string' ? artifact.document_id.trim() : ''
+  if (props.workbenchResourcesEnabled && sessionKey && (artifactId || documentId)
+    && (kind === 'html' || isOfficePreviewFormat(kind))) {
+    try {
+      const resource = await workbenchResources.resolve(sessionKey, createWorkbenchResourceRef(
+        documentId ? 'document' : 'deliverable', documentId || artifactId,
+      ))
+      if (!isCurrent()) return
+      if (resource) {
+        await openWorkbenchResource(resource, item, isCurrent)
+        return
+      }
+      // A Gateway without the resource API retains the established legacy path.
+    } catch (error) {
+      if (!isCurrent()) return
+      const classified = classifyArtifactProductError(error)
+      const translated = t(classified.messageKey)
+      pushToast(translated === classified.messageKey ? classified.fallbackMessage : translated,
+        { tone: 'danger', duration: 9000 })
+      return
+    }
+  }
+  if (!isCurrent()) return
   store.openItem(artifactPreviewItemForExplicitOpen({
     artifact,
     navigationArtifacts,
@@ -1046,7 +1108,7 @@ async function activatePromptAnnotationItem(
 
 async function onPromptAnnotationFocus(event: Event) {
   const detail = (event as CustomEvent<ArtifactPromptAnnotationFocusDetail>).detail
-  if (!detail?.annotationId || !detail.documentId || !detail.sessionKey) {
+  if (!props.promptAnnotationsEnabled || !detail?.annotationId || !detail.documentId || !detail.sessionKey) {
     detail?.complete?.(false)
     return
   }
@@ -1074,7 +1136,8 @@ async function onPromptAnnotationFocus(event: Event) {
 async function onPromptAnnotationReuse(event: Event) {
   const detail = (event as CustomEvent<ArtifactPromptAnnotationReuseDetail>).detail
   if (
-    !detail?.documentId
+    !props.promptAnnotationsEnabled
+    || !detail?.documentId
     || !detail.sessionKey
     || !detail.body.trim()
     || detail.body.length > 16 * 1024
@@ -1273,6 +1336,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  artifactNavigationGeneration += 1
   stopPromptAnnotationLifecycle()
   pageAnnotationSendQueue.clear()
   if (pageAnnotationSendRetryTimer) clearTimeout(pageAnnotationSendRetryTimer)
@@ -1348,18 +1412,6 @@ onBeforeUnmount(() => {
   cursor: pointer;
 }
 
-.app-workbench__action-beta {
-  position: absolute;
-  top: 3px;
-  right: 3px;
-  color: currentColor;
-  font-size: 7px;
-  font-weight: 600;
-  line-height: 1;
-  opacity: 0.58;
-  pointer-events: none;
-}
-
 .app-workbench__switcher {
   width: min(150px, 24vw);
   min-width: 84px;
@@ -1402,6 +1454,27 @@ onBeforeUnmount(() => {
 
 .app-workbench__action.is-active {
   background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+}
+
+.app-workbench__action--annotation {
+  width: auto;
+  flex: 0 0 auto;
+  gap: var(--sp-1);
+  padding: 0 var(--sp-2);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--accent);
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.app-workbench__action--annotation:hover,
+.app-workbench__action--annotation.is-active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
   color: var(--accent);
 }
 

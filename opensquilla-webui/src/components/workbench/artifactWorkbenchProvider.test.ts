@@ -3368,7 +3368,7 @@ describe('artifact Workbench provider', () => {
       annotationId: string
       sessionKey: string
       documentId: string
-      selection: { targetRef: string; resourceId?: string; locatorHint?: string }
+      selection: { targetRef?: string; resourceId?: string; locatorHint?: string }
     }) => {
       if (rejectNextCreate) {
         const error = rejectNextCreate

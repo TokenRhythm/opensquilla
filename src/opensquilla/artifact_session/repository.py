@@ -1263,6 +1263,17 @@ class ArtifactSessionRepository:
             )
             return tuple(_document_source_binding_from_row(row) for row in rows)
 
+    async def get_document_source_binding_for_document(
+        self, *, session_id: str, document_id: str,
+    ) -> DocumentSourceBinding | None:
+        async with self._read_transaction("get_document_source_binding_for_document") as conn:
+            row = await _fetchone(
+                conn,
+                "SELECT * FROM document_source_bindings WHERE session_id = ? AND document_id = ?",
+                (session_id, document_id),
+            )
+            return None if row is None else _document_source_binding_from_row(row)
+
     async def apply_document_import_attempt(
         self,
         *,
@@ -1768,6 +1779,18 @@ class ArtifactSessionRepository:
     ) -> DocumentPublication:
         async with self._read_transaction("get_document_publication") as conn:
             return await self._get_document_publication_on_conn(conn, publication_id)
+
+    async def get_document_publication_for_artifact(
+        self, *, session_id: str, artifact_id: str,
+    ) -> DocumentPublication | None:
+        async with self._read_transaction("get_document_publication_for_artifact") as conn:
+            row = await _fetchone(
+                conn,
+                "SELECT * FROM document_publications "
+                "WHERE session_id = ? AND deliverable_artifact_id = ?",
+                (session_id, artifact_id),
+            )
+            return None if row is None else _document_publication_from_row(row)
 
     async def list_document_publications(
         self,

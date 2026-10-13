@@ -61,7 +61,7 @@ describe('artifactWorkbenchPreviewKind', () => {
     expect(artifactUsesWorkbenchPreview(artifact({
       name: 'slides.pptx',
       mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-    }))).toBe(false)
+    }))).toBe(true)
   })
 
   it('rejects a response MIME that does not match the selected renderer', () => {

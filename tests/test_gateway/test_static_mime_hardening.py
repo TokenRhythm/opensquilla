@@ -47,6 +47,7 @@ _ASSETS: dict[str, tuple[bytes, str]] = {
     "font.woff2": (b"wOF2", "font/woff2"),
     "font.woff": (b"wOFF", "font/woff"),
     "font.ttf": (b"\x00\x01\x00\x00", "font/ttf"),
+    "font.otf": (b"OTTO", "font/otf"),
     "page.html": (b"<!doctype html>\n", "text/html"),
     "page.htm": (b"<!doctype html>\n", "text/html"),
     "icon.png": (b"\x89PNG\r\n\x1a\n", "image/png"),
