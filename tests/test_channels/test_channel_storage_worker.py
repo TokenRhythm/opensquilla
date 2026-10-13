@@ -8,6 +8,7 @@ import sys
 import textwrap
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -345,23 +346,115 @@ async def test_pairing_transaction_rolls_back_on_failure(channel_store, tmp_path
 
 
 @pytest.mark.parametrize("operation", ["acquire", "renew"])
-async def test_cancelled_lease_commit_is_released_before_close(gated, operation):
-    worker, _, gate, entered = await gated(f"after_{operation}")
-    if operation == "acquire":
-        task = asyncio.create_task(worker.acquire_transport_lease("channel", "account", "owner"))
-    else:
-        lease = await worker.acquire_transport_lease("channel", "account", "owner")
-        task = asyncio.create_task(worker.renew_transport_lease(lease))
-    await until(entered.is_set)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    closing = asyncio.create_task(worker.close())
-    await asyncio.sleep(0)
-    gate.set()
-    await closing
-    with sqlite3.connect(worker.path) as conn:
-        assert conn.execute("SELECT expires_at FROM channel_transport_leases").fetchone() == (0,)
+async def test_cancelled_lease_commit_is_released_before_close(tmp_path, monkeypatch, operation):
+    loop = asyncio.get_running_loop()
+    events, gate, entered = [], threading.Event(), threading.Event()
+    committed = asyncio.Event()
+    close_waiting = asyncio.Event()
+
+    class LeaseCommitStore(GateStore):
+        def _pause(self, name):
+            self.events.append((name, threading.get_ident()))
+            if self.pause == name:
+                self.entered.set()
+                loop.call_soon_threadsafe(committed.set)
+                # The case's finally releases this gate, including on timeout.
+                # SQL preparation and loop scheduling have no separate SLA.
+                self.gate.wait()
+
+        def release_transport_lease(self, lease):
+            result = super().release_transport_lease(lease)
+            self.events.append(("released", threading.get_ident()))
+            return result
+
+    worker = AsyncChannelDeliveryStore(
+        tmp_path / "cancelled-lease.sqlite",
+        store_factory=lambda path: LeaseCommitStore(
+            path, events, gate, entered, f"after_{operation}",
+        ),
+    )
+    wait_for_condition = worker._condition.wait_for
+
+    async def observe_close_wait(predicate):
+        if asyncio.current_task() is worker._close_task and not predicate():
+            close_waiting.set()
+        return await wait_for_condition(predicate)
+
+    monkeypatch.setattr(worker._condition, "wait_for", observe_close_wait)
+    tasks = []
+    failure = None
+    try:
+        # This bounds deadlocks across setup, cancellation, and cleanup; the
+        # contract concerns their ordering, not real SQLite commit latency.
+        async with asyncio.timeout(60.0):
+            await worker.open()
+            if operation == "acquire":
+                task = asyncio.create_task(
+                    worker.acquire_transport_lease("channel", "account", "owner"),
+                )
+            else:
+                lease = await worker.acquire_transport_lease("channel", "account", "owner")
+                task = asyncio.create_task(worker.renew_transport_lease(lease))
+            tasks.append(task)
+            commit_waiter = asyncio.create_task(committed.wait())
+            tasks.append(commit_waiter)
+            finished, _ = await asyncio.wait(
+                {commit_waiter, task}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if task in finished:
+                await task
+                pytest.fail("lease operation returned before the commit barrier")
+            assert entered.is_set()
+            with closing(sqlite3.connect(worker.path)) as conn:
+                assert conn.execute(
+                    "SELECT expires_at FROM channel_transport_leases",
+                ).fetchone()[0] > 0
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            close_task = asyncio.create_task(worker.close())
+            close_waiter = asyncio.create_task(close_waiting.wait())
+            tasks.extend((close_task, close_waiter))
+            finished, _ = await asyncio.wait(
+                {close_waiter, close_task}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if close_task in finished:
+                await close_task
+                pytest.fail("close returned while the committed lease was held")
+            assert not close_task.done()
+            assert "close" not in [name for name, _ in events]
+            gate.set()
+            await close_task
+            names = [name for name, _ in events]
+            assert names.count("released") == 1
+            assert names.index("released") < names.index("close")
+            with closing(sqlite3.connect(worker.path)) as conn:
+                assert conn.execute(
+                    "SELECT expires_at FROM channel_transport_leases",
+                ).fetchone() == (0,)
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        gate.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        try:
+            async with asyncio.timeout(5.0):
+                await worker.close()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException as cleanup_error:
+            # Keep a failed contract as the primary error, and do not hang in
+            # fixture teardown if the close path itself is what regressed.
+            for task in (*worker._owned, worker._open_task, worker._consumer, worker._close_task):
+                if task is not None:
+                    task.cancel()
+            worker._executor.shutdown(wait=False)
+            if failure is None:
+                raise
+            failure.add_note(f"Worker cleanup failed: {type(cleanup_error).__name__}")
 
 
 async def test_close_wakes_waiters_without_waiting_for_queue_capacity(gated):
