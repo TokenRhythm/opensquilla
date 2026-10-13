@@ -92,7 +92,9 @@ async def test_scan_keeps_status_responsive_and_cancel_waits_for_cleanup(
         await asyncio.wait({entry_waiter, task}, timeout=3, return_when=asyncio.FIRST_COMPLETED)
         if not entered.is_set():
             install_finished = task.done()
-            reason = "install finished before scanning" if install_finished else "scan entry exceeded 3s"
+            reason = (
+                "install finished before scanning" if install_finished else "scan entry exceeded 3s"
+            )
             details: dict[str, object] = {
                 "install": task_state(task),
                 "last_progress_requested": last_progress_requested,

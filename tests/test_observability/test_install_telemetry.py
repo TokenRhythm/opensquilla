@@ -70,6 +70,11 @@ def test_default_endpoint_uploads_install_once_and_dedupes(tmp_path, monkeypatch
     monkeypatch.setattr(telemetry, "_post_payload", fake_post)
 
     first = telemetry.collect_install_telemetry(state_path=state_path, version="1.0.0")
+
+    def unexpected_platform_probe():
+        raise AssertionError("an already-uploaded version must not probe the platform")
+
+    monkeypatch.setattr(telemetry, "_platform_details", unexpected_platform_probe)
     second = telemetry.collect_install_telemetry(state_path=state_path, version="1.0.0")
 
     assert first.sent is True
@@ -396,6 +401,8 @@ def test_successful_upload_uses_longer_timeout_for_result_merge(tmp_path, monkey
     _set_stable_sources(monkeypatch, macs=["02:00:00:00:00:06"])
     state_path = tmp_path / "install_telemetry.json"
     lock_timeouts: list[float] = []
+    lock_depth = 0
+    platform_calls = 0
 
     from opensquilla import profile_operation_lock
 
@@ -404,18 +411,32 @@ def test_successful_upload_uses_longer_timeout_for_result_merge(tmp_path, monkey
             lock_timeouts.append(timeout)
 
         def __enter__(self):
+            nonlocal lock_depth
+            lock_depth += 1
             return self
 
         def __exit__(self, _exc_type, _exc, _traceback):
+            nonlocal lock_depth
+            lock_depth -= 1
             return None
 
+    def probe_platform():
+        nonlocal platform_calls
+        platform_calls += 1
+        assert lock_depth == 0, "platform probing must not hold the state lock"
+        return "synthetic-os", "synthetic-release", "synthetic-machine"
+
     monkeypatch.setattr(profile_operation_lock, "ProfileOperationLock", RecordingLock)
+    monkeypatch.setattr(telemetry, "_platform_details", probe_platform)
     monkeypatch.setattr(telemetry, "_post_payload", lambda *_args, **_kwargs: (True, None))
 
     result = telemetry.collect_install_telemetry(state_path=state_path, version="1.0.0")
 
     assert result.uploaded is True
+    assert platform_calls == 1
+    assert lock_depth == 0
     assert lock_timeouts == [
+        telemetry._STATE_TRANSACTION_TIMEOUT_SECONDS,
         telemetry._STATE_TRANSACTION_TIMEOUT_SECONDS,
         telemetry._RESULT_STATE_TRANSACTION_TIMEOUT_SECONDS,
     ]
@@ -725,9 +746,11 @@ def test_background_collection_honors_privacy_without_thread_or_state(
     assert results[0].skipped_reason == "disabled"
 
 
+@pytest.mark.parametrize("uploaded_during_probe", [False, True])
 def test_concurrent_process_results_merge_without_holding_lock_across_network(
     tmp_path,
     monkeypatch,
+    uploaded_during_probe,
 ):
     _enable_telemetry_for_test(monkeypatch)
     state_path = tmp_path / "state" / "install_telemetry.json"
@@ -838,10 +861,12 @@ print(json.dumps({
     ]
     outputs: list[tuple[str, str]] = []
 
-    def wait_for_worker_barrier(paths: list[Path], phase: str) -> None:
+    def wait_for_worker_barrier(
+        paths: list[Path], phase: str, phase_workers: list[subprocess.Popen[str]],
+    ) -> None:
         deadline = time.monotonic() + 10
         while not all(path.exists() for path in paths):
-            for worker in workers:
+            for worker in phase_workers:
                 if worker.poll() is not None:
                     stdout, stderr = worker.communicate()
                     raise AssertionError(
@@ -856,9 +881,20 @@ print(json.dumps({
         # Both metadata probes must start even while the other one is blocked.
         # This catches cold platform work accidentally consuming the writer's
         # one-second acquisition budget without relying on host probe speed.
-        wait_for_worker_barrier([path.with_suffix(".platform") for path in ready_paths], "platform")
+        wait_for_worker_barrier(
+            [path.with_suffix(".platform") for path in ready_paths], "platform", workers,
+        )
+        if uploaded_during_probe:
+            # A separate writer can complete this version while metadata is
+            # blocked. The collector must re-read it, not upload its old choice.
+            with telemetry._state_transaction(state_path):
+                state = _load(state_path)
+                state["uploaded_versions"].append("1.0.0")
+                state["peer_field"] = {"preserve": True}
+                telemetry._write_state(state_path, state)
         go_path.with_suffix(".platform").write_text("go", encoding="utf-8")
-        wait_for_worker_barrier(ready_paths, "network")
+        active_start = 1 if uploaded_during_probe else 0
+        wait_for_worker_barrier(ready_paths[active_start:], "network", workers[active_start:])
         # Both workers reaching this barrier proves the process lock is not held
         # across the simulated network operation.
         go_path.write_text("go", encoding="utf-8")
@@ -869,15 +905,21 @@ print(json.dumps({
                 worker.terminate()
                 worker.wait(timeout=5)
 
-    for worker, (stdout, stderr) in zip(workers, outputs, strict=True):
+    for index, (worker, (stdout, stderr)) in enumerate(zip(workers, outputs, strict=True)):
         assert worker.returncode == 0, stderr
         result = json.loads(stdout)
-        assert result["sent"] is True, (
+        expected_upload = not (uploaded_during_probe and index == 0)
+        assert result["sent"] is expected_upload, (
             f"telemetry worker result={result!r}, stderr={stderr!r}"
         )
-        assert result["uploaded"] is True, (
+        assert result["uploaded"] is expected_upload, (
             f"telemetry worker result={result!r}, stderr={stderr!r}"
         )
+        assert result["skipped_reason"] == (None if expected_upload else "already_uploaded")
+        assert ready_paths[index].exists() is expected_upload
     state = _load(state_path)
+    assert state["install_id"] == "synthetic-install-id"
     assert set(state["uploaded_versions"]) == {"0.9.0", "1.0.0", "2.0.0"}
     assert state["future_field"] == {"preserve": True}
+    if uploaded_during_probe:
+        assert state["peer_field"] == {"preserve": True}

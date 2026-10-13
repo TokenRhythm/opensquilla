@@ -117,11 +117,6 @@ def collect_install_telemetry(
         # lock across network I/O. Daily usage telemetry shares this state file
         # for the anonymous install id and must remain free to read it.
         with _COLLECT_LOCK:
-            # Cold Windows platform queries can enter WMI. They do not depend on
-            # the selected state, so do not spend another writer's lock budget
-            # waiting for them. Keep payload assembly and privacy checks below
-            # with the selected state snapshot, before persisting any changes.
-            platform_details = _platform_details() if endpoint else None
             with _state_transaction(path):
                 state = _load_or_create_state(path)
                 event = _next_event(state, current_version)
@@ -140,6 +135,21 @@ def collect_install_telemetry(
                         endpoint_configured=False,
                         event=event,
                         skipped_reason="endpoint_empty",
+                    )
+
+            # Probe only when an event is needed. Cold Windows queries can enter
+            # WMI, so keep them outside the cross-process state transaction.
+            platform_details = _platform_details()
+            with _state_transaction(path):
+                # Another collector may have uploaded while the probe ran.
+                # Select the event and identity again from its latest state.
+                state = _load_or_create_state(path)
+                event = _next_event(state, current_version)
+                if event is None:
+                    return InstallTelemetryResult(
+                        state_path=path,
+                        endpoint_configured=True,
+                        skipped_reason="already_uploaded",
                     )
 
                 now = _utc_now()
