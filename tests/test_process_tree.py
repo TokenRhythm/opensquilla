@@ -7,6 +7,8 @@ import ctypes
 import ctypes.wintypes as wintypes
 import errno
 import io
+import json
+import logging
 import multiprocessing
 import os
 import shutil
@@ -53,15 +55,25 @@ def _synthetic_owner_reference(
 
 
 @pytest.mark.parametrize(
-    ("frozen", "expected_prefix"),
+    ("frozen", "mode", "expected_prefix"),
     [
-        (False, ("/synthetic/python", "-m", "opensquilla.process_tree")),
-        (True, ("/synthetic/gateway", "--internal-child", "process-tree")),
+        (False, "--windows-owned-launch",
+         ("/synthetic/python", "-I", "-S", "-B",
+          str(process_tree.Path(process_tree.__file__).with_name(
+              "_windows_owned_launch.py",
+          ).absolute()))),
+        (False, "--posix-owned-launch",
+         ("/synthetic/python", "-m", "opensquilla.process_tree")),
+        (True, "--windows-owned-launch",
+         ("/synthetic/gateway", "--internal-child", "process-tree")),
+        (True, "--posix-owned-launch",
+         ("/synthetic/gateway", "--internal-child", "process-tree")),
     ],
 )
 def test_process_tree_child_argv_is_fixed_for_source_and_frozen_modes(
     monkeypatch: pytest.MonkeyPatch,
     frozen: bool,
+    mode: str,
     expected_prefix: tuple[str, ...],
 ) -> None:
     executable = "/synthetic/gateway" if frozen else "/synthetic/python"
@@ -69,7 +81,7 @@ def test_process_tree_child_argv_is_fixed_for_source_and_frozen_modes(
     monkeypatch.setattr(process_tree.sys, "frozen", frozen, raising=False)
 
     argv = process_tree._process_tree_child_argv(
-        "--windows-owned-launch",
+        mode,
         "gate",
         "ready",
         "--",
@@ -78,11 +90,38 @@ def test_process_tree_child_argv_is_fixed_for_source_and_frozen_modes(
 
     assert argv == (
         *expected_prefix,
-        "--windows-owned-launch",
+        mode,
         "gate",
         "ready",
         "--",
         "cmd",
+    )
+
+
+@pytest.mark.parametrize("origin", ["package.zip/opensquilla/process_tree.py", "process_tree.pyc"])
+def test_windows_source_helper_falls_back_when_adjacent_source_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, origin: str,
+) -> None:
+    monkeypatch.setattr(process_tree, "__file__", str(tmp_path / origin))
+    monkeypatch.setattr(process_tree.sys, "executable", "/synthetic/current-python")
+    monkeypatch.setattr(process_tree.sys, "frozen", False, raising=False)
+    args = ("--windows-owned-launch", "gate", "ready", "--", "target", "中文 a;b")
+    assert process_tree._process_tree_child_argv(*args) == (
+        "/synthetic/current-python", "-m", "opensquilla._windows_owned_launch", *args,
+    )
+
+
+def test_windows_source_helper_path_probe_error_preserves_module_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def inaccessible(_path):
+        raise PermissionError("synthetic inaccessible helper path")
+
+    monkeypatch.setattr(process_tree.Path, "is_file", inaccessible)
+    monkeypatch.setattr(process_tree.sys, "frozen", False, raising=False)
+    args = ("--windows-owned-launch", "gate", "ready", "--", "target")
+    assert process_tree._process_tree_child_argv(*args) == (
+        sys.executable, "-m", "opensquilla._windows_owned_launch", *args,
     )
 
 
@@ -2467,6 +2506,283 @@ def test_windows_sync_helper_ready_timeout_fails_closed(
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("launcher", ["async", "popen"])
+@pytest.mark.parametrize("failure_phase", ["helper_ready", "owner_register"])
+@pytest.mark.parametrize("diagnostics", ["on", "off", "logger-fails"])
+async def test_windows_launch_failure_diagnostics_preserve_cleanup_and_privacy(
+    monkeypatch: pytest.MonkeyPatch,
+    launcher: str,
+    failure_phase: str,
+    diagnostics: str,
+) -> None:
+    events: list[str] = []
+    records: list[dict[str, object]] = []
+    timing_records: list[dict[str, object]] = []
+    secret = "private-command-env-and-exception-text"
+    cause = OSError(errno.EACCES, secret)
+    cause.winerror = 5
+    failure = TimeoutError(secret) if failure_phase == "helper_ready" else ValueError(secret)
+    failure.__cause__ = cause
+
+    class Gate:
+        gate_name = "test-gate"
+        ready_name = "test-ready"
+
+        def wait_ready(self, timeout: float) -> None:
+            assert timeout == 2.0
+            events.append("ready")
+            if failure_phase == "helper_ready":
+                raise failure
+
+        def release(self) -> None:
+            events.append("released")
+
+        def close(self) -> None:
+            events.append("gate-closed")
+
+    class Job:
+        def assign_pid(self, _pid: int) -> None:
+            events.append("assigned")
+
+        def close(self) -> None:
+            events.append("job-closed")
+
+    class Process:
+        pid = 7878
+        returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            events.append("terminated")
+            self.returncode = -15
+
+        def wait(self, timeout: float) -> int:
+            return int(self.returncode or 0)
+
+    class AsyncProcess(Process):
+        async def wait(self) -> int:
+            return int(self.returncode or 0)
+
+    process = AsyncProcess() if launcher == "async" else Process()
+
+    async def spawn(*_args: object, **_kwargs: object):
+        return process
+
+    def persist(*_args: object, **_kwargs: object):
+        events.append("register")
+        raise failure
+
+    def warning(message: str, *, extra: dict[str, object]) -> None:
+        assert message == "windows_process_tree_launch_failed"
+        # Observation occurs before cleanup changes the process return code.
+        assert process.returncode is None
+        events.append("diagnostic")
+        records.append(extra)
+        if diagnostics == "logger-fails":
+            raise RuntimeError(secret)
+
+    def info(message: str, *, extra: dict[str, object]) -> None:
+        assert message == "windows_process_tree_launch_timing"
+        timing_records.append(extra)
+        if diagnostics == "logger-fails":
+            raise RuntimeError(secret)
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree.sys, "frozen", False, raising=False)
+    monkeypatch.setenv("OPENSQUILLA_STALL_DIAGNOSTICS", "0" if diagnostics == "off" else "1")
+    monkeypatch.setattr(process_tree, "_current_task_process_scope", lambda: object())
+    monkeypatch.setattr(
+        process_tree._WindowsLaunchGate, "create", classmethod(lambda _cls: Gate()),
+    )
+    monkeypatch.setattr(
+        process_tree._WindowsJob, "create", classmethod(lambda _cls, _name=None: Job()),
+    )
+    monkeypatch.setattr(process_tree.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(process_tree.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(process_tree, "_insert_owner_record", persist)
+    monkeypatch.setattr(process_tree.log, "warning", warning)
+    monkeypatch.setattr(process_tree.log, "info", info)
+
+    with pytest.raises(process_tree.ProcessTreeOwnershipError) as caught:
+        if launcher == "async":
+            await process_tree.create_owned_subprocess_exec(secret, env={"PRIVATE": secret})
+        else:
+            process_tree.create_owned_popen((secret,), env={"PRIVATE": secret})
+
+    captured = caught.value.__cause__
+    if launcher == "async" and failure_phase == "helper_ready":
+        # Python 3.12 converts an exact TimeoutError across the executor
+        # Future, copying args but not necessarily preserving its cause.
+        assert type(captured) is TimeoutError
+        assert captured.args == failure.args
+    else:
+        assert captured is failure
+        assert captured.__cause__ is cause
+    assert str(caught.value).startswith("Windows controlled process launch failed closed")
+    assert ("phase=helper_ready, cause=TimeoutError" in str(caught.value)) is (
+        failure_phase == "helper_ready"
+    )
+    assert secret not in str(caught.value)
+    assert "released" not in events
+    assert events[-3:] == ["terminated", "job-closed", "gate-closed"]
+    assert ("register" in events) is (failure_phase == "owner_register")
+    assert len(timing_records) == int(launcher == "async" and diagnostics != "off")
+    if diagnostics == "off":
+        assert records == []
+    else:
+        assert len(records) == 1
+        metadata = records[0]["_opensquilla_log_metadata"]
+        assert metadata["event"] == "windows_process_tree_launch_failed"
+        assert metadata["phase"] == failure_phase
+        assert metadata["source"] == "source"
+        assert metadata["mode"] == launcher
+        assert metadata["wrapper_pid"] == 7878
+        assert metadata["wrapper_returncode"] is None
+        assert metadata["wrapper_returncode_observed"] is True
+        expected_entry = [
+            {"exception_type": "TimeoutError" if failure_phase == "helper_ready" else "ValueError"},
+        ]
+        if captured.__cause__ is not None:
+            assert captured.__cause__ is cause
+            expected_entry.append({
+                "exception_type": "PermissionError", "errno": errno.EACCES, "winerror": 5,
+            })
+        assert metadata["entry"] == expected_entry
+        assert secret not in repr(records)
+        assert events.index("diagnostic") < events.index("terminated")
+
+
+@pytest.mark.parametrize("cyclic", [False, True])
+def test_windows_launch_diagnostics_bound_causes_and_do_not_poll_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    cyclic: bool,
+) -> None:
+    records: list[dict[str, object]] = []
+    errors = [RuntimeError("private message") for _ in range(6)]
+    for outer, inner in zip(errors, errors[1:], strict=False):
+        outer.__cause__ = inner
+    if cyclic:
+        errors[1].__cause__ = errors[0]
+
+    class FactoryProcess:
+        pid = 7979
+
+        @property
+        def returncode(self):
+            pytest.fail("PTY returncode can change reader state")
+
+        def poll(self):
+            pytest.fail("a factory process must not be polled for diagnostics")
+
+    monkeypatch.setattr(process_tree.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        process_tree.log, "warning", lambda _message, *, extra: records.append(extra),
+    )
+    now = time.perf_counter()
+    process_tree._log_windows_launch_failure(
+        phase="helper_ready", phase_started=now, launch_started=now,
+        process=FactoryProcess(), launcher="factory", error=errors[0],
+    )
+
+    metadata = records[0]["_opensquilla_log_metadata"]
+    assert metadata["source"] == "frozen"
+    assert metadata["wrapper_pid"] == 7979
+    assert metadata["wrapper_returncode_observed"] is False
+    assert len(metadata["entry"]) == (2 if cyclic else 4)
+    assert "private message" not in repr(records)
+    assert process_tree._windows_launch_failure_message(
+        "owner_register", TimeoutError("private message"),
+    ) == "Windows controlled process launch failed closed"
+
+
+def test_windows_launch_diagnostics_record_failed_observation_without_exception_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records: list[dict[str, object]] = []
+
+    def poll():
+        raise OSError("private observation failure")
+
+    monkeypatch.setattr(
+        process_tree.log, "warning", lambda _message, *, extra: records.append(extra),
+    )
+    now = time.perf_counter()
+    process_tree._log_windows_launch_failure(
+        phase="helper_ready", phase_started=now, launch_started=now,
+        process=SimpleNamespace(pid=8080, poll=poll), launcher="popen",
+        error=TimeoutError("private launch failure"),
+    )
+
+    metadata = records[0]["_opensquilla_log_metadata"]
+    assert metadata["fields"] == {
+        "kind": "wrapper_observation", "exception_type": "OSError",
+    }
+    assert metadata["wrapper_returncode_observed"] is False
+    assert metadata["entry"] == [{"exception_type": "TimeoutError"}]
+    assert "private" not in repr(records)
+
+
+@pytest.mark.parametrize("observation_fails", [False, True])
+def test_windows_launch_diagnostics_survive_private_log_formatter(
+    monkeypatch: pytest.MonkeyPatch,
+    observation_fails: bool,
+) -> None:
+    from opensquilla.observability.log_privacy import PrivateLogFormatter
+
+    secret = "private-command-env-and-exception-text"
+    cause = OSError(errno.EACCES, secret)
+    cause.winerror = 5
+    failure = TimeoutError(secret)
+    failure.__cause__ = cause
+
+    def poll():
+        if observation_fails:
+            raise OSError(secret)
+        return 17
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(PrivateLogFormatter())
+    logger = logging.Logger("opensquilla.process_tree", level=logging.DEBUG)
+    logger.addHandler(handler)
+    monkeypatch.setattr(process_tree, "log", logger)
+    monkeypatch.setattr(process_tree.sys, "frozen", True, raising=False)
+    now = time.perf_counter()
+    try:
+        process_tree._log_windows_launch_failure(
+            phase="helper_ready", phase_started=now, launch_started=now,
+            process=SimpleNamespace(pid=8081, poll=poll), launcher="popen", error=failure,
+        )
+    finally:
+        handler.close()
+
+    rendered = stream.getvalue()
+    payload = json.loads(rendered[rendered.index("{"):])
+    assert payload["event"] == "windows_process_tree_launch_failed"
+    assert payload["phase"] == "helper_ready"
+    assert payload["source"] == "frozen"
+    assert payload["mode"] == "popen"
+    assert payload["wrapper_pid"] == 8081
+    assert payload["wrapper_returncode"] == (None if observation_fails else 17)
+    assert payload["wrapper_returncode_observed"] is not observation_fails
+    assert payload["phase_elapsed_ms"] >= 0
+    assert payload["launch_elapsed_ms"] >= payload["phase_elapsed_ms"]
+    assert payload["entry"] == [
+        {"exception_type": "TimeoutError"},
+        {"exception_type": "PermissionError", "errno": errno.EACCES, "winerror": 5},
+    ]
+    if observation_fails:
+        assert payload["fields"] == {
+            "kind": "wrapper_observation", "exception_type": "OSError",
+        }
+    else:
+        assert "fields" not in payload
+    assert secret not in rendered
+
+
 def test_windows_helper_runtime_env_is_removed_before_target_spawn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2526,6 +2842,52 @@ async def test_windows_owned_launch_boots_helper_with_restricted_target_env() ->
 
     assert process.returncode == 0, stderr.decode(errors="replace")
     assert stdout.decode().splitlines() == ["yes", "missing", "missing"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows events and Job Objects")
+@pytest.mark.ci_serial
+@pytest.mark.asyncio
+async def test_windows_isolated_helper_preserves_target_python_flags_env_and_stdio(
+    tmp_path,
+) -> None:
+    python_path = tmp_path / "target imports"
+    python_path.mkdir()
+    (python_path / "owned_target_probe.py").write_text("VALUE = 'target-import-ok'\n")
+    environment = dict(os.environ)
+    environment.pop("PYTHONDONTWRITEBYTECODE", None)
+    environment.update(
+        PYTHONPATH=str(python_path), PYTHONIOENCODING="utf-8",
+        PYTHONPYCACHEPREFIX=str(tmp_path / "target-pycache"),
+    )
+    script = (
+        "import json, os, sys, owned_target_probe; "
+        "print(json.dumps({'flags': [sys.flags.isolated, sys.flags.no_site, "
+        "sys.flags.dont_write_bytecode], 'path': os.environ.get('PYTHONPATH'), "
+        "'encoding': os.environ.get('PYTHONIOENCODING'), 'cache': sys.pycache_prefix, "
+        "'module': owned_target_probe.VALUE, 'args': sys.argv[1:]}, ensure_ascii=False)); "
+        "print(sys.stdin.read(), end=''); sys.exit(17)"
+    )
+    process = await process_tree.create_owned_subprocess_exec(
+        sys.executable, "-c", script, "中文 a;b",
+        cwd=str(tmp_path), env=environment,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    owner = process_tree.capture_process_tree_owner(process, isolated=True)
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate("输入 stdin\n".encode()), timeout=15.0,
+        )
+    finally:
+        await owner.terminate(graceful_timeout=0.0, kill_timeout=1.0)
+    assert process.returncode == 17, stderr.decode(errors="replace")
+    lines = stdout.decode("utf-8").splitlines()
+    assert json.loads(lines[0]) == {
+        "flags": [0, 0, 0], "path": str(python_path), "encoding": "utf-8",
+        "cache": str(tmp_path / "target-pycache"), "module": "target-import-ok",
+        "args": ["中文 a;b"],
+    }
+    assert lines[1:] == ["输入 stdin"]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires a native packaged Windows Gateway")
