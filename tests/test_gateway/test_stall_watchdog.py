@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import linecache
-import time
+import threading
 
 from opensquilla.gateway import stall_watchdog
 from opensquilla.gateway.stall_watchdog import GatewayStallWatchdog
@@ -14,7 +14,7 @@ def test_stall_watchdog_is_opt_in(monkeypatch) -> None:
     assert GatewayStallWatchdog.from_environment() is None
 
 
-def test_stall_watchdog_samples_main_thread_without_locals(tmp_path) -> None:
+def test_stall_watchdog_samples_main_thread_without_locals(tmp_path, monkeypatch) -> None:
     output = tmp_path / "stalls.jsonl"
     watchdog = GatewayStallWatchdog(
         output_path=output,
@@ -22,11 +22,21 @@ def test_stall_watchdog_samples_main_thread_without_locals(tmp_path) -> None:
         sample_interval_s=0.05,
         stack_interval_s=0.1,
     )
-    watchdog.start()
+    stack_written = threading.Event()
+    original_write = watchdog._write
+
+    def notify_stack_written(payload, **kwargs):
+        written = original_write(payload, **kwargs)
+        if written and payload["type"] == "stack_sample":
+            stack_written.set()
+        return written
+
+    monkeypatch.setattr(watchdog, "_write", notify_stack_written)
+    assert watchdog.start()
     try:
         # The event-loop heartbeat is intentionally not called.  A separate
         # watchdog thread must still capture the blocked main Python stack.
-        time.sleep(0.55)
+        assert stack_written.wait(timeout=10), "watchdog did not persist a stack sample"
     finally:
         watchdog.stop()
 
@@ -43,34 +53,6 @@ def test_stall_watchdog_samples_main_thread_without_locals(tmp_path) -> None:
     assert (samples[0]["capture_monotonic_s"]
             <= samples[0]["capture_finished_monotonic_s"])
     assert any(event["type"] == "stall_started" for event in events)
-
-
-def test_stall_watchdog_records_heartbeat_age_and_observation_span(tmp_path) -> None:
-    output = tmp_path / "stalls.jsonl"
-    watchdog = GatewayStallWatchdog(
-        output_path=output,
-        threshold_s=0.2,
-        sample_interval_s=0.05,
-        stack_interval_s=0.5,
-    )
-    watchdog.start()
-    try:
-        watchdog.beat()
-        time.sleep(0.35)
-        watchdog.beat()
-        time.sleep(0.12)
-    finally:
-        watchdog.stop()
-
-    events = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
-    started = next(event for event in events if event["type"] == "stall_started")
-    ended = next(event for event in events if event["type"] == "stall_ended")
-    assert started["heartbeat_age_ms"] == started["lag_ms"]
-    assert isinstance(started["heartbeat_seq"], int)
-    assert ended["observed_duration_ms"] == ended["duration_ms"]
-    assert ended["heartbeat_to_observation_span_ms"] >= ended["observed_duration_ms"]
-    assert "stale_heartbeat_window_lower_bound_ms" not in ended
-    assert ended["heartbeat_seq"] > started["heartbeat_seq"]
 
 
 def test_stack_capture_precedes_log_writes_and_keeps_capture_time(tmp_path, monkeypatch) -> None:
@@ -178,27 +160,36 @@ def test_stack_capture_is_bounded_and_never_loads_source(tmp_path, monkeypatch) 
 def test_recovery_observation_span_can_include_time_after_actual_recovery(
     tmp_path, monkeypatch
 ) -> None:
+    now = [100.0]
+    monkeypatch.setattr(stall_watchdog.time, "monotonic", lambda: now[0])
     watchdog = GatewayStallWatchdog(
         output_path=tmp_path / "stalls.jsonl", threshold_s=0.2,
     )
-    watchdog._heartbeat_at = 100.0
-    now = [100.25]
-    monkeypatch.setattr(stall_watchdog.time, "monotonic", lambda: now[0])
+    watchdog.beat()
     events = []
     monkeypatch.setattr(watchdog, "_write", lambda payload: events.append(payload))
+    now[0] = 100.25
     watchdog._sample_once()
     now[0] = 100.4
     watchdog.beat()
     now[0] = 100.45
     watchdog._sample_once()
+    started = next(event for event in events if event["type"] == "stall_started")
     ended = next(event for event in events if event["type"] == "stall_ended")
-    assert ended["observed_duration_ms"] == 200
+    assert started["heartbeat_age_ms"] == started["lag_ms"] == 250
+    assert started["heartbeat_seq"] == 1
+    assert ended["heartbeat_seq"] == 2
+    assert ended["observed_duration_ms"] == ended["duration_ms"] == 200
     # Recovery happened at 400 ms; the 450 ms span ends at the observing poll.
     assert ended["heartbeat_to_observation_span_ms"] == 450
     assert "stale_heartbeat_window_lower_bound_ms" not in ended
 
 
-def test_stall_watchdog_does_not_emit_stalls_after_heartbeat_failure(tmp_path) -> None:
+def test_stall_watchdog_does_not_emit_stalls_after_heartbeat_failure(
+    tmp_path, monkeypatch
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr(stall_watchdog.time, "monotonic", lambda: now[0])
     output = tmp_path / "stalls.jsonl"
     watchdog = GatewayStallWatchdog(
         output_path=output,
@@ -206,12 +197,11 @@ def test_stall_watchdog_does_not_emit_stalls_after_heartbeat_failure(tmp_path) -
         sample_interval_s=0.02,
         stack_interval_s=0.02,
     )
-    assert watchdog.start()
-    try:
-        watchdog.heartbeat_failed(RuntimeError("test heartbeat failure"))
-        time.sleep(0.08)
-    finally:
-        watchdog.stop()
+    watchdog.heartbeat_failed(RuntimeError("test heartbeat failure"))
+    assert watchdog._stop.is_set()
+    now[0] += 1.0
+    watchdog._sample_once()
+    watchdog.stop()
 
     events = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert any(event["type"] == "heartbeat_failed" for event in events)

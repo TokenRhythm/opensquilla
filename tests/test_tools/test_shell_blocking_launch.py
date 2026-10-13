@@ -4,32 +4,46 @@ import asyncio
 import contextlib
 import os
 import shlex
+import socket
 import sys
 import threading
+import time
+import traceback
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from opensquilla import process_tree
+from opensquilla.tools import pty_backend
 from opensquilla.tools.builtin import shell
 from opensquilla.tools.pty_backend import PtyBackendError, PtyHandle
 from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
 
 
 @pytest.fixture(params=["pty", "stdin"])
-def native_launch(request, tmp_path):
+def native_launch(request, tmp_path, monkeypatch):
     kind = request.param
     if kind == "stdin" and os.name != "nt":
         pytest.skip("explicit blocking stdin is Windows-only")
     if kind == "pty":
         pytest.importorskip("winpty" if os.name == "nt" else "ptyprocess")
+    readers = []
+    if kind == "pty" and os.name == "nt":
+        original_init = pty_backend._OwnedPtyProcess.__init__
+
+        def capture_reader(wrapper, raw):
+            original_init(wrapper, raw)
+            readers.append(raw)
+
+        monkeypatch.setattr(pty_backend._OwnedPtyProcess, "__init__", capture_reader)
     marker = tmp_path / "executed.txt"
     script = tmp_path / "command.py"
     script.write_text(
         "from pathlib import Path\n"
         f"Path({str(marker)!r}).write_text('executed')\n"
-        "print('launch-ok', flush=True)\n",
+        + ("print('launch-ok héllo 世界', flush=True)\n" if kind == "pty"
+           else "print('launch-ok', flush=True)\n"),
         encoding="utf-8",
     )
     command = (
@@ -68,6 +82,7 @@ def native_launch(request, tmp_path):
             try:
                 await asyncio.wait_for(session.collector_task, timeout=10)
                 assert "launch-ok" in shell._bg_rendered_output(session)
+                assert "héllo 世界" in shell._bg_rendered_output(session)
             finally:
                 await shell._stop_bg_session(session)
                 shell._bg_sessions.pop(execution)
@@ -75,13 +90,27 @@ def native_launch(request, tmp_path):
             assert "exit_code=0" in result, result
             assert "launch-ok" in result
 
-    return SimpleNamespace(kind=kind, launch=launch, finish=finish, state=state, marker=marker)
+    async def assert_readers_closed():
+        if kind == "pty" and os.name == "nt":
+            assert len(readers) == 1, "must observe the actual native PTY process"
+        for raw in readers:
+            if hasattr(raw, "fileobj"):
+                assert raw.fileobj.fileno() == -1, "PTY output socket survived launch cleanup"
+                assert raw._server.fileno() == -1, "PTY writer survived launch cleanup"
+            if hasattr(raw, "_thread"):
+                await asyncio.to_thread(raw._thread.join, 1)
+                assert not raw._thread.is_alive(), "PTY reader survived launch cleanup"
+
+    return SimpleNamespace(
+        kind=kind, launch=launch, finish=finish, state=state, marker=marker,
+        script=script, assert_readers_closed=assert_readers_closed,
+    )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["finish", "cancel", "fail"])
 async def test_slow_native_launch_preserves_loop_and_ownership(
-    native_launch, monkeypatch, outcome,
+    native_launch, monkeypatch, outcome, request,
 ):
     case = native_launch
     loop = asyncio.get_running_loop()
@@ -89,20 +118,49 @@ async def test_slow_native_launch_preserves_loop_and_ownership(
     release = threading.Event()
     original_insert = process_tree._insert_owner_record
     references = []
+    launch_started = time.monotonic()
+    phases = []
+    worker_id = None
+
+    def phase(name):
+        phases.append((name, round(time.monotonic() - launch_started, 3)))
+
+    def diagnose_pending_launch():
+        # Capture before wait_for's cancellation drains the worker, when its
+        # blocked frame still identifies registration, native I/O or cleanup.
+        elapsed = time.monotonic() - launch_started
+        lines = [f"native launch {case.kind}/{outcome}: elapsed={elapsed:.3f}s phases={phases!r}\n"]
+        frames = sys._current_frames()
+        for thread in threading.enumerate():
+            if (
+                thread.ident == worker_id or thread.name.startswith("asyncio_")
+                or thread.name == "opensquilla-pty-reader"
+            ):
+                frame = frames.get(thread.ident)
+                if frame is not None:
+                    lines.append(f"thread={thread.name}\n")
+                    lines.extend(traceback.format_stack(frame))
+        request.node.add_report_section("call", "native launch before timeout", "".join(lines))
 
     def persist(*args, **kwargs):
+        nonlocal worker_id
+        worker_id = threading.get_ident()
+        phase("registration-entered")
         assert process_tree._current_task_process_scope() is not None
         assert current_tool_context.get().task_id == "slow-launch-task"
         loop.call_soon_threadsafe(started.set)
         assert release.wait(5), "event loop did not release slow registration"
+        phase("registration-released")
         if outcome == "fail":
             raise process_tree.ProcessTreeOwnershipError("synthetic registration failure")
         reference = original_insert(*args, **kwargs)
+        phase("registration-committed")
         references.append(reference)
         return reference
 
     monkeypatch.setattr(process_tree, "_insert_owner_record", persist)
     task = asyncio.create_task(case.launch())
+    diagnostic = loop.call_later(9, diagnose_pending_launch)
     try:
         await asyncio.wait_for(started.wait(), timeout=10)
         # This event-loop round trip happens while registration is blocked in
@@ -116,18 +174,23 @@ async def test_slow_native_launch_preserves_loop_and_ownership(
             task.cancel("repeat cancellation")
             await asyncio.sleep(0)
             assert not task.done()
+        phase("release-requested")
         release.set()
+        diagnostic.cancel()
+        diagnostic = loop.call_later(9, diagnose_pending_launch)
         if outcome == "cancel":
             with pytest.raises(asyncio.CancelledError, match="cancel slow launch"):
                 await asyncio.wait_for(task, timeout=10)
         else:
             result = await asyncio.wait_for(task, timeout=10)
+            diagnostic.cancel()
             if outcome == "finish":
                 await case.finish(result)
                 assert case.marker.exists()
             else:
                 assert "capability_error" in result if case.kind == "pty" else "[error]" in result
     finally:
+        diagnostic.cancel()
         release.set()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -136,6 +199,116 @@ async def test_slow_native_launch_preserves_loop_and_ownership(
     if outcome != "finish":
         assert not case.marker.exists()
     assert bool(references) is (outcome != "fail")
+    await case.assert_readers_closed()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native PTY reader lifecycle")
+@pytest.mark.parametrize("native_launch", ["pty"], indirect=True)
+@pytest.mark.parametrize("outcome", ["fail", "cancel"])
+@pytest.mark.asyncio
+async def test_quiet_native_reader_is_reclaimed_after_initialization(
+    native_launch, monkeypatch, outcome,
+):
+    case = native_launch
+    case.script.write_text(
+        "import time\nfrom pathlib import Path\n"
+        f"Path({str(case.marker)!r}).write_text('quiet-ready')\n"
+        "time.sleep(60)\n", encoding="utf-8",
+    )
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+    original_start = pty_backend._start_windows_pty_reader
+    readers = []
+
+    def start(raw):
+        original_start(raw)
+        readers.append(raw._thread)
+        # Prove the real child reached its quiet wait, not just that the
+        # helper's ownership gate opened. The outer watchdog releases this
+        # wait on failure, so the launch still drains its native resources.
+        while not case.marker.exists():
+            assert not release.wait(0.01), "quiet child did not start"
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(5), "event loop did not release reader initialization"
+        if outcome == "fail":
+            raise OSError("synthetic failure after native reader initialization")
+
+    monkeypatch.setattr(pty_backend, "_start_windows_pty_reader", start)
+    task = asyncio.create_task(case.launch())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=10)
+        assert process_tree._load_owner_records(case.state)
+        if outcome == "cancel":
+            task.cancel("cancel during reader initialization")
+            await asyncio.sleep(0)
+        release.set()
+        if outcome == "cancel":
+            with pytest.raises(asyncio.CancelledError, match="cancel during reader"):
+                await asyncio.wait_for(task, timeout=10)
+        else:
+            result = await asyncio.wait_for(task, timeout=10)
+            assert "capability_error" in result
+    finally:
+        release.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    assert readers
+    assert process_tree._load_owner_records(case.state) == ()
+    await case.assert_readers_closed()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native PTY reader lifecycle")
+def test_windows_reader_keeps_empty_reads_and_utf8_tail():
+    winpty = pytest.importorskip("winpty")
+    chunks = iter(["", "héllo 世界\n", winpty.WinptyError("Standard out reached EOF")])
+
+    def read(_size, *, blocking):
+        assert not blocking
+        value = next(chunks)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    raw = SimpleNamespace(pty=SimpleNamespace(read=read))
+    pty_backend._start_windows_pty_reader(raw)
+    try:
+        raw.fileobj.settimeout(2)
+        received = bytearray()
+        while chunk := raw.fileobj.recv(4096):
+            received.extend(chunk)
+        assert received.decode("utf-8") == "héllo 世界\n"
+    finally:
+        PtyHandle(raw, "windows").close_reader()
+    assert not raw._thread.is_alive()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native PTY reader lifecycle")
+def test_windows_reader_closes_when_output_socket_is_full(monkeypatch):
+    pytest.importorskip("winpty")
+    reader, writer = socket.socketpair()
+    reader.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    writer.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    monkeypatch.setattr(pty_backend.socket, "socketpair", lambda: (reader, writer))
+    entered = threading.Event()
+
+    def read(_size, *, blocking):
+        assert not blocking
+        entered.set()
+        return "x" * (2 * 1024 * 1024)
+
+    raw = SimpleNamespace(pty=SimpleNamespace(read=read))
+    pty_backend._start_windows_pty_reader(raw)
+    try:
+        assert entered.wait(2)
+        reader.settimeout(2)
+        assert reader.recv(1) == b"x"
+        # Receiving one byte proves sendall started. Leave the rest undrained:
+        # close must wake a writer whose output exceeds the small buffers.
+    finally:
+        PtyHandle(raw, "windows").close_reader()
+    assert not raw._thread.is_alive()
+    assert reader.fileno() == writer.fileno() == -1
 
 
 def test_runner_shutdown_waits_for_native_launch_cleanup(native_launch, monkeypatch):

@@ -844,13 +844,16 @@ def test_cleanup_removes_backup_when_quarantine_pushes_child_past_max_path(
     monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "lock-state"))
     backup = user_data / "backups"
     nested = backup / "profile-consolidation" / "synthetic-transaction"
-    nested.mkdir(parents=True)
-    # The original file fits MAX_PATH; the transaction's quarantine prefix
-    # pushes it past that boundary before recursive removal.
-    filename = "x" * (245 - len(str(nested)) - len("/.txt")) + ".txt"
-    marker = nested / filename
+    # Both the original directory and file fit MAX_PATH. Quarantine lengthens
+    # the directory itself, so post-move inventory must also use native paths,
+    # before recursive removal can begin.
+    nested = nested / ("x" * (239 - len(str(nested)) - 1))
+    native_io_path(nested).mkdir(parents=True)
+    marker = nested / "x.txt"
     assert len(str(marker)) == 245
     native_io_path(marker).write_text("synthetic backup\n", encoding="utf-8")
+    with os.scandir(nested) as entries:
+        assert [entry.name for entry in entries] == ["x.txt"]
     outside = tmp_path / "unrelated.txt"
     outside.write_text("keep\n", encoding="utf-8")
 

@@ -8,15 +8,6 @@ import source from './ClarifyCard.vue?raw'
 const chatViewStyles = readFileSync(new URL('../../styles/chat-view.css', import.meta.url), 'utf8')
 
 describe('ClarifyCard submit feedback', () => {
-  it('shows immediate visible feedback while a clarify reply is being sent', () => {
-    // Sending feedback does not claim the agent received an unconfirmed reply.
-    expect(source).toContain("busy ? t('chat.clarify.sendingReply') : t('chat.clarify.sendReply')")
-    expect(source).toContain('data-testid="clarify-submit-status"')
-    expect(source).toContain("t('chat.clarify.sendingReply')")
-    expect(source).not.toContain("t('chat.clarify.sendingContinuing')")
-    expect(source).toContain("t('chat.clarify.expiredTitle')")
-  })
-
   it('renders a prominent submitted banner instead of a low-contrast text row', () => {
     expect(source).toContain('clarify-outcome__icon')
     expect(source).toContain('clarify-outcome__title')

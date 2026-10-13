@@ -6,6 +6,7 @@ import { createServer } from 'node:http'
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { runInNewContext } from 'node:vm'
 
@@ -340,6 +341,107 @@ try {
     if (primaryError) assert.ok(cleanupReports.length > 0, 'secondary cleanup failure must remain observable')
   }
 
+  // Exercise the actual helper with a Windows child lifecycle, without sending
+  // OS signals to synthetic PIDs. Exit and stdio close are independent events.
+  const shutdownSource = await readFile(join(scriptDir, 'e2e-shutdown-helpers.mjs'), 'utf8')
+  const shutdownBody = shutdownSource.slice(shutdownSource.indexOf('const FORCED_PROCESS_EXIT_TIMEOUT_MS'))
+    .replace(/^export /gm, '')
+  for (const scenario of ['success', 'exit-during-diagnostics', 'taskkill-128-race']) {
+    const child = Object.assign(new EventEmitter(), {
+      pid: 1234, exitCode: null, signalCode: null, killed: false,
+      ...Object.fromEntries(['stdin', 'stdout', 'stderr'].map(name => [name,
+        Object.assign(new EventEmitter(), {
+          destroyed: false, readableEnded: false, writableFinished: false,
+        }),
+      ])),
+    })
+    const exitChild = () => { child.exitCode = 0; child.emit('exit', 0, null) }
+    let processCalls = 0
+    let closeStarted = false
+    let treeKillCalls = 0
+    const logs = []
+    const fixture = runInNewContext(`${shutdownBody}\n({ closeElectronWithDeadline, canAcceptWindowsElectronShutdownFallback })`, {
+      AbortController, performance, delay,
+      process: {
+        platform: 'win32',
+        kill: pid => {
+          assert.equal(pid, child.pid)
+          if (child.exitCode !== null) throw Object.assign(new Error('missing'), { code: 'ESRCH' })
+        },
+      },
+      terminateWindowsProcessTree: async ({ pid, onFailure }) => {
+        treeKillCalls += 1
+        assert.equal(scenario, 'taskkill-128-race')
+        assert.equal(pid, child.pid)
+        exitChild()
+        onFailure({ pid, timedOut: false, exitCode: 128, signal: null, error: null })
+        return false
+      },
+    })
+    const result = await fixture.closeElectronWithDeadline({
+      app: {
+        process: () => {
+          processCalls += 1
+          assert.equal(closeStarted, false, 'capture the owned child before closing the dispatcher')
+          return child
+        },
+        close: () => {
+          closeStarted = true
+          assert.equal(child.listenerCount('exit'), 1)
+          assert.equal(child.listenerCount('close'), 1)
+          if (scenario !== 'success') return new Promise(() => {})
+          exitChild()
+          child.stdout.emit('end')
+          child.stdout.emit('close')
+          child.emit('close', 0, null)
+        },
+      },
+      phase: scenario, timeoutMs: 10,
+      diagnostics: async () => {
+        if (scenario === 'exit-during-diagnostics') exitChild()
+        return { marker: 'bounded-diagnostic' }
+      },
+      emit: line => logs.push(JSON.parse(line)),
+    })
+    assert.equal(processCalls, 1)
+    for (const emitter of [child, child.stdin, child.stdout, child.stderr]) {
+      assert.equal(emitter.eventNames().length, 0, 'diagnostic listeners must always be removed')
+    }
+    if (scenario === 'success') {
+      assert.equal(result.closed, true)
+      assert.equal(logs.length, 0, 'successful shutdown must remain silent')
+      assert.equal(treeKillCalls, 0)
+      continue
+    }
+    assert.equal(result.closed, false)
+    assert.equal(result.closeErrorCode, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
+    assert.equal(result.forcedExitSucceeded, false)
+    assert.equal(result.processTreeReaped, false)
+    assert.equal(fixture.canAcceptWindowsElectronShutdownFallback({
+      shutdown: result, gatewayExitLogged: true, committedExitLogged: true,
+    }), false, 'neither PID absence nor taskkill 128 proves tree cleanup')
+    const observation = result.shutdownObservation
+    const events = observation.events.map(event => event.event)
+    assert.equal(observation.process.pidPresent, false)
+    assert.equal(observation.process.exitCode, 0)
+    assert.equal(observation.process.stdio.stdout.destroyed, false)
+    assert.equal(observation.process.stdio.stdout.readableEnded, false)
+    assert.ok(events.indexOf('close-start') < events.indexOf('close-failed'))
+    assert.ok(events.indexOf('close-failed') < events.indexOf('child-exit'))
+    assert.equal(events.includes('child-close'), false)
+    assert.equal(events.includes('stdout-end'), false)
+    assert.equal(logs.at(-1).event, 'desktop_e2e_electron_shutdown_cleanup')
+    if (scenario === 'exit-during-diagnostics') {
+      assert.equal(treeKillCalls, 0)
+      assert.ok(events.indexOf('child-exit') < events.indexOf('diagnostics-complete'))
+    } else {
+      assert.equal(treeKillCalls, 1)
+      assert.ok(events.indexOf('force-start') < events.indexOf('child-exit'))
+      assert.ok(events.indexOf('child-exit') < events.indexOf('tree-termination-failed'))
+      assert.equal(logs[1].exitCode, 128)
+    }
+  }
+
   const shutdownLogs = []
   // The production helper invokes real taskkill on Windows, so this fixture
   // must own its PID rather than supplying a synthetic EventEmitter PID.
@@ -373,10 +475,11 @@ try {
     assert.equal(hangingShutdown.processTreeReaped, true)
     assert.match(hangingShutdown.error.message, /DESKTOP_E2E_ELECTRON_SHUTDOWN_FAILED/)
     assert.ok(hangingProcess.exitCode !== null || hangingProcess.signalCode !== null)
-    assert.equal(shutdownLogs.length, 1)
+    assert.equal(shutdownLogs.length, 2)
     const shutdownLog = JSON.parse(shutdownLogs[0])
+    const { shutdownObservation, ...originalDetail } = shutdownLog
     assert.deepEqual({
-      ...shutdownLog,
+      ...originalDetail,
       error: String(shutdownLog.error).split('\n')[0],
     }, {
       event: 'desktop_e2e_electron_shutdown_failed',
@@ -391,6 +494,13 @@ try {
       },
       diagnostics: { marker: 'bounded-diagnostic' },
     })
+    assert.equal(shutdownObservation.events[0].event, 'close-start')
+    const cleanupLog = JSON.parse(shutdownLogs[1])
+    assert.equal(cleanupLog.event, 'desktop_e2e_electron_shutdown_cleanup')
+    assert.equal(cleanupLog.processTreeReaped, true)
+    assert.equal(cleanupLog.forcedExitSucceeded, true)
+    assert.ok(cleanupLog.shutdownObservation.events.some(event => event.event === 'child-exit'))
+    assert.equal(hangingProcess.listenerCount('exit'), 0)
   } finally {
     if (hangingProcess.exitCode === null && hangingProcess.signalCode === null) {
       hangingProcess.kill('SIGKILL')
@@ -542,6 +652,49 @@ try {
     'cli-pass',
     'cli-fail',
   ])
+  // This portable contract belongs in the existing Node owner, without a
+  // second interpreter launch from the Python upgrade suite.
+  {
+    const source = await readFile(join(scriptDir, 'test-packaged-session-recovery.mjs'), 'utf8')
+    const start = source.indexOf('  gatewayReadinessStartedAt = performance.now()')
+    const end = source.indexOf('  // The preceding release-upgrade launch', start)
+    assert.ok(start > 0 && end > start)
+    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+    const run = new AsyncFunction('waitFor', 'page', 'assert', 'performance', 'console',
+      'DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS',
+      'let gatewayReadinessStartedAt, lastGatewayConnection;\n' + source.slice(start, end))
+    for (const terminal of ['ready', 'error', 'stopped', 'starting']) {
+      let calls = 0
+      const logs = []
+      const page = { evaluate: async () => ({
+        status: ++calls === 1 ? 'starting' : terminal,
+        error: terminal === 'error' ? 'synthetic startup failure' : null,
+        authToken: 'must-never-appear-in-evidence',
+      }) }
+      const wait = async (check, label, budget) => {
+        assert.equal(budget, 120_000)
+        assert.equal(label, 'candidate Desktop Gateway readiness')
+        for (let i = 0; i < 3; i++) if (await check()) return
+        throw new Error('synthetic startup timeout')
+      }
+      const attempt = run(wait, page, assert, performance,
+        { error: value => logs.push(value) }, 120_000)
+      if (terminal === 'ready') {
+        await attempt
+        assert.equal(calls, 2)
+        assert.equal(JSON.parse(logs[0]).budgetMs, 120_000)
+      } else {
+        await assert.rejects(attempt, error => {
+          assert.ok(!error.message.includes('must-never-appear-in-evidence'))
+          assert.match(error.message, terminal === 'starting'
+            ? /synthetic startup timeout/ : /Candidate Gateway failed/)
+          return true
+        })
+        assert.equal(calls, terminal === 'starting' ? 3 : 2)
+        assert.deepEqual(logs, [])
+      }
+    }
+  }
   await import('./test-packaged-first-send-cleanup.mjs')
   await import('./test-session-recovery-transport-contract.mjs')
   await import('./test-session-recovery-rpc-evidence.mjs')

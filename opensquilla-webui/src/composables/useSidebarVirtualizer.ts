@@ -1,4 +1,4 @@
-import { computed, nextTick, type ComputedRef, type Ref } from 'vue'
+import { computed, nextTick, onScopeDispose, type ComputedRef, type Ref } from 'vue'
 import { defaultRangeExtractor, observeElementRect, useVirtualizer, type VirtualizerOptions } from '@tanstack/vue-virtual'
 import type { SidebarDisplayRow } from '@/utils/sidebarDisplayProjection'
 import { readDistanceFromEnd } from '@/utils/virtualizerLayout'
@@ -102,8 +102,31 @@ export function useSidebarVirtualizer<T extends SidebarVirtualBlock>(
     })
   })
 
+  const pendingMeasurements = new Set<HTMLElement>()
+  let measurementQueued = false
+  let disposed = false
+  onScopeDispose(() => {
+    disposed = true
+    pendingMeasurements.clear()
+  })
   function measureElement(element: Element | null) {
-    if (virtualized.value) virtualizer.value.measureElement(element as HTMLElement | null)
+    if (!virtualized.value) return
+    if (element) pendingMeasurements.add(element as HTMLElement)
+    if (measurementQueued) return
+    measurementQueued = true
+    // Vue calls function refs during its patch. A layout read after an old
+    // keyed spacer is removed can clamp scrollTop before its replacement is
+    // inserted. Measure the complete window after the DOM commit instead.
+    void nextTick(() => {
+      measurementQueued = false
+      const elements = [...pendingMeasurements]
+      pendingMeasurements.clear()
+      if (disposed || !virtualized.value) return
+      virtualizer.value.measureElement(null)
+      for (const item of elements) {
+        if (item.isConnected) virtualizer.value.measureElement(item)
+      }
+    })
   }
 
   async function revealRow(key: string) {

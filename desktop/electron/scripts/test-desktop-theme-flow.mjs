@@ -134,6 +134,9 @@ async function selectTheme(page, theme) {
 const isolationRoot = await mkdtemp(join(tmpdir(), 'opensquilla-electron-theme-test-'))
 const userDataDir = join(isolationRoot, 'chromium-user-data')
 const isolatedHome = join(isolationRoot, 'home')
+const isolatedRoaming = join(isolatedHome, 'AppData', 'Roaming')
+const isolatedLocal = join(isolatedHome, 'AppData', 'Local')
+const isolatedTemp = join(isolatedLocal, 'Temp')
 let desktopApp
 let page
 let flowSucceeded = false
@@ -141,6 +144,8 @@ let flowSucceeded = false
 try {
   await mkdir(userDataDir, { recursive: true })
   await mkdir(isolatedHome, { recursive: true })
+  await mkdir(isolatedRoaming, { recursive: true })
+  await mkdir(isolatedTemp, { recursive: true })
 
   // Use a synthetic keyless profile so the theme flow reaches the real Control
   // UI without reading developer credentials or requiring an external model.
@@ -171,9 +176,18 @@ try {
       packageRoot,
     ],
     env: {
-      ...process.env,
+      ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !(
+        /(^OPENSQUILLA_|TOKEN|SECRET|API_KEY|ACCESS_KEY|PRIVATE_KEY|PASSWORD|^ELECTRON_RUN_AS_NODE$)/i.test(key)
+      ))),
       HOME: isolatedHome,
       USERPROFILE: isolatedHome,
+      APPDATA: isolatedRoaming,
+      LOCALAPPDATA: isolatedLocal,
+      TEMP: isolatedTemp,
+      TMP: isolatedTemp,
+      TMPDIR: isolatedTemp,
+      OPENSQUILLA_USER_STATE_DIR: join(isolatedHome, 'user-state'),
+      OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1',
       OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
       OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
       OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',

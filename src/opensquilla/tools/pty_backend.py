@@ -33,6 +33,44 @@ class PtyBackendError(RuntimeError):
         self.handle = handle
 
 
+def _copy_windows_pty_output(native: Any, output: socket.socket, stop: threading.Event) -> None:
+    """Bridge native output without an uninterruptible read on a quiet child."""
+
+    from winpty import WinptyError  # type: ignore[import-not-found,import-untyped]
+
+    try:
+        while not stop.is_set():
+            data = native.read(4096, blocking=False)
+            if data:
+                output.sendall(data.encode("utf-8") if isinstance(data, str) else bytes(data))
+            else:
+                # An empty nonblocking read is not EOF. The event also wakes
+                # this wait when cancellation closes an otherwise quiet PTY.
+                # Native read reports EOF with WinptyError after its buffered
+                # output is drained; probing the pipe separately can block
+                # behind the backend's own synchronous reading thread.
+                stop.wait(0.01)
+    except (EOFError, OSError, ValueError, WinptyError):
+        pass
+    finally:
+        output.close()
+
+
+def _start_windows_pty_reader(raw: Any) -> None:
+    raw.flag_eof = False
+    raw.delayafterclose = 0.1
+    raw._reader_stop = threading.Event()
+    # Preserve PtyProcess's socket attributes for its inherited read/close API.
+    raw.fileobj, raw._server = socket.socketpair()
+    raw.fd = raw.fileobj.fileno()
+    raw._thread = threading.Thread(
+        target=_copy_windows_pty_output,
+        args=(raw.pty, raw._server, raw._reader_stop),
+        name="opensquilla-pty-reader", daemon=True,
+    )
+    raw._thread.start()
+
+
 @dataclass
 class PtyHandle:
     """Small async-friendly wrapper around ptyprocess or pywinpty."""
@@ -116,6 +154,9 @@ class PtyHandle:
 
     def close_reader(self) -> None:
         if self.platform == "windows":
+            stop = getattr(self.raw, "_reader_stop", None)
+            if stop is not None:
+                stop.set()
             # pywinpty's isalive() sets closed before close() can release its
             # sockets. Wake blocked recv threads even after the Job has exited.
             stream = getattr(self.raw, "fileobj", None)
@@ -127,7 +168,16 @@ class PtyHandle:
                 stream.close()
             server = getattr(self.raw, "_server", None)
             if server is not None:
+                try:
+                    server.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 server.close()
+            reader = getattr(self.raw, "_thread", None)
+            if stop is not None and reader is not None and reader.ident is not None:
+                reader.join(timeout=1)
+                if reader.is_alive():
+                    raise PtyBackendError("PTY reader did not stop", started=True, handle=self)
         elif hasattr(self.raw, "close"):
             self.raw.close(force=False)
 
@@ -215,8 +265,20 @@ def spawn_pty(
 
                 class _JobPtyProcess(PtyProcess):  # type: ignore[misc]
                     def __init__(self, native: Any) -> None:
+                        # Registration can fail or be cancelled while the
+                        # helper is still behind its ownership gate. Starting
+                        # pywinpty's blocking reader there leaves a thread
+                        # holding the native PTY after the helper is killed.
+                        # Keep only the process operations needed by the
+                        # controlled launcher until it commits ownership.
+                        self.pty = native
+                        self.pid = native.pid
+                        self.closed = False
+                        self.delayafterterminate = 0.1
                         job.assign_pid(int(native.pid))
-                        super().__init__(native)
+
+                    def start_reader(self) -> None:
+                        _start_windows_pty_reader(self)
 
                 return _OwnedPtyProcess(_JobPtyProcess.spawn(
                     list(argv), dimensions=(rows, cols), backend="0", **kwargs,
@@ -228,6 +290,7 @@ def spawn_pty(
             )
             handle = PtyHandle(raw, "windows")
             try:
+                raw.start_reader()
                 if hasattr(raw, "setwinsize"):
                     raw.setwinsize(rows, cols)
             except Exception as exc:

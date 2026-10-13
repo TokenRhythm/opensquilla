@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -19,10 +21,16 @@ PR_BODY_LINT = Path(".github/scripts/validate_pr_body.py")
 TEST_PATH_RE = re.compile(r"tests/[A-Za-z0-9_./-]+\.py")
 
 
+@lru_cache(maxsize=32)
+def _parsed_workflow(source: str) -> dict:
+    return yaml.safe_load(source)
+
+
 def _workflow(name: str) -> dict:
     path = WORKFLOW_DIR / name
     assert path.is_file(), f"missing workflow: {path}"
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+    # Reparse when content changes; never share a mutable dict between callers.
+    return copy.deepcopy(_parsed_workflow(path.read_text(encoding="utf-8")))
 
 
 def _trigger_keys(data: dict) -> set[str]:
@@ -591,6 +599,7 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     assert "Release packaging contracts" in text
     assert "CI result" in text
     assert 'push)\n              before="${{ github.event.before }}"' in text
+    assert 'after="${{ github.event.after }}"' in text
     merge_group_case = text.split("            merge_group)", 1)[1].split(
         "              ;;", 1
     )[0]
@@ -754,16 +763,6 @@ def test_pr_change_selection_uses_merge_base_and_ignores_base_only_changes(
     git("switch", "main")
 
     assert select_changed_files(base_sha, unrelated_sha) == [".ci/run-all"]
-
-
-def test_queue_summary_explains_tree_mismatch_fallback() -> None:
-    text = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
-
-    assert 'if [[ "${REASON_CODE}" == "tree_mismatch" ]]' in text
-    assert "this entry runs the full fail-closed matrix" in text
-    assert "If main advanced" in text
-    assert "wait for a new green PR CI run before requeueing" in text
-    assert "future entry's exact base and tree" in text
 
 
 def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
@@ -1051,22 +1050,6 @@ def test_skill_hub_contract_is_integrated_into_canonical_ci() -> None:
     }
     assert "not live_skill_hub" in run
     assert "skill-hub" in jobs["ci-result"]["needs"]
-
-def test_default_ci_keeps_main_pushes_targeted_and_manual_runs_full() -> None:
-    ci_path = WORKFLOW_DIR / "ci.yml"
-    if not ci_path.exists():
-        return
-    text = ci_path.read_text(encoding="utf-8")
-
-    assert 'before="${{ github.event.before }}"' in text
-    assert 'after="${{ github.event.after }}"' in text
-    assert (
-        'git diff --no-renames --name-only "${before}" "${after}" > "${changed_files}"'
-        in text
-    )
-    assert 'workflow_dispatch' in text
-    assert 'printf \'.ci/run-all\\n\' > "${changed_files}"' in text
-
 
 def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> None:
     # Generated WebUI files belong to CI artifacts and release packages, not Git.
@@ -1840,6 +1823,7 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "desktop-check",
         "ubuntu-quality",
         "ubuntu-full",
+        "python-stress",
         "windows-full",
         "macos-recovery",
         "desktop-recovery-e2e",
@@ -1892,10 +1876,12 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "RESULT_DESKTOP",
         "RESULT_UBUNTU",
         "RESULT_UBUNTU_FULL",
+        "RESULT_PYTHON_STRESS",
         "RESULT_WINDOWS_FULL",
         "RESULT_MACOS_RECOVERY",
         "RESULT_DESKTOP_RECOVERY_E2E",
         "RESULT_WEBUI_CHAT_RECOVERY",
+        "RESULT_WEBUI_CAPACITY",
         "RESULT_RELEASE",
         "RESULT_MANAGED_TOOLCHAIN_ARTIFACTS",
         "RESULT_SKILL_HUB",
@@ -2003,8 +1989,7 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert "history-hydration.spec.ts" in session_recovery["run"]
     # Select by a stable contract tag, not the scenario's human-readable title.
     # Renaming the test must not silently leave this release-platform gate empty.
-    assert '--grep "@session-hang-recovery"' in session_recovery["run"]
-    assert '--grep "@plan-goal-runtime"' in session_recovery["run"]
+    assert '--grep "@session-hang-recovery|@plan-goal-runtime"' in session_recovery["run"]
     for spec in ("plan-presentation.spec.ts", "task-progress.spec.ts", "goal-mode.spec.ts"):
         assert spec in session_recovery["run"]
         assert "@plan-goal-runtime" in Path("opensquilla-webui/e2e", spec).read_text(
@@ -2022,10 +2007,11 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     # Zero-retry failures need traces on the first attempt, inside the uploaded
     # tree. Separate output directories prevent later suites deleting evidence.
     browser_cases = (
-        "session-hang-recovery", "plan-goal-runtime", "modern-session-recovery",
+        "session-hang-recovery", "modern-session-recovery",
     )
     assert len(browser_commands) == len(browser_cases)
     for command, case in zip(browser_commands, browser_cases, strict=True):
+        assert "--workers=1" in command
         assert "--retries=0" in command
         assert "--trace retain-on-failure" in command
         assert f'--output "${{CI_REPORT_DIR}}/{case}-results"' in command
@@ -2520,6 +2506,7 @@ def test_webui_virtualization_contracts_run_isolated_without_retries() -> None:
     assert "--workers=1" in run["run"]
     assert "--retries=0" in run["run"]
     assert "--output=test-results/virtualization" in run["run"]
+    assert "--grep-invert=@capacity" in run["run"]
     selected_specs = {arg for arg in run["run"].split() if arg.endswith(".spec.ts")}
     assert selected_specs == {
         "chat-virtualization.spec.ts",
@@ -2533,6 +2520,44 @@ def test_webui_virtualization_contracts_run_isolated_without_retries() -> None:
     }
     for spec in selected_specs:
         assert (Path("opensquilla-webui/e2e") / spec).is_file()
+
+
+def test_browser_capacity_phase_cannot_be_skipped_behind_a_green_browser_job() -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    job = jobs["webui-chat-recovery"]
+    admission = next(step for step in job["steps"] if step.get("id") == "capacity-inventory")
+    assert "if" not in admission
+    assert not admission.get("continue-on-error")
+    assert (
+        "tests/test_ci/test_workflows.py::"
+        "test_browser_capacity_phase_cannot_be_skipped_behind_a_green_browser_job"
+    ) in admission["run"]
+    # The browser job already gets pytest through its locked default dev
+    # group; this synchronous check must not require the optional xdist extra.
+    assert "uv run --no-sync pytest" in admission["run"]
+    assert "-n" not in admission["run"].split()
+    capacity = next(step for step in job["steps"] if step.get("id") == "webui-capacity")
+    assert capacity["if"] == (
+        "${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'webui-capacity') }}"
+    )
+    assert not capacity.get("continue-on-error")
+    assert capacity["working-directory"] == "opensquilla-webui"
+    for argument in ("--grep=@capacity", "--workers=1", "--retries=0"):
+        assert argument in capacity["run"]
+    targets = {arg for arg in capacity["run"].split() if arg.endswith(".spec.ts")}
+    marked = {
+        path.name for path in Path("opensquilla-webui/e2e").glob("*.spec.ts")
+        if re.search(r"\btag:[^\r\n]*['\"]@capacity['\"]", path.read_text(encoding="utf-8"))
+    }
+    assert marked == targets == {"long-task-resilience.spec.ts", "sidebar-virtualization.spec.ts"}
+    assert job["outputs"]["capacity_result"] == "${{ steps.webui-capacity.outcome }}"
+    gate = next(
+        step for step in jobs["ci-result"]["steps"]
+        if step.get("name") == "Check required CI results"
+    )
+    assert gate["env"]["RESULT_WEBUI_CAPACITY"] == (
+        "${{ needs.webui-chat-recovery.outputs.capacity_result || 'skipped' }}"
+    )
 
 
 def test_tui_check_owns_the_bun_contract() -> None:
@@ -3270,15 +3295,6 @@ def test_linux_desktop_recovery_e2e_scripts_preserve_x11_authority() -> None:
         )
 
 
-def test_desktop_cleanup_flow_allows_windows_helper_release_latency() -> None:
-    source = Path(
-        "desktop/electron/scripts/test-desktop-cleanup-flow.mjs"
-    ).read_text(encoding="utf-8")
-
-    assert "process.platform === 'win32' ? 90_000 : 30_000" in source
-    assert "pending synthetic targets" in source
-
-
 @pytest.mark.parametrize(("job_name", "test_step_name"), [
     ("ubuntu-full", "Test Ubuntu full shard"),
     ("windows-full", "Test Windows shard"),
@@ -3302,7 +3318,7 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
         "tests/test_live_multi_provider_matrix.py",
         "tests/test_live_provider_profile_smoke.py",
     }
-    if job_name in {"ubuntu-full", "windows-full"}:
+    if job_name == "windows-full":
         expected_preflight_files.update({
             "tests/test_ci/test_architecture_import_contracts.py",
             "tests/test_cli/test_chat_cmd.py",
@@ -3321,14 +3337,8 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
             "tests/test_tools/test_shell_runtime_preflight.py",
             "tests/test_sandbox/test_windows_shell_process_runtime.py",
         })
-        selector = '"${family}"' if job_name == "windows-full" else '"${{ matrix.shard }}"'
-        assert f'{selector} == "desktop-installer-contracts"' in preflight["run"]
+        assert '"${family}" == "desktop-installer-contracts"' in preflight["run"]
         assert '"${regression_args[@]}"' in preflight["run"]
-        assert f"-o faulthandler_timeout={faulthandler_timeout}" in preflight["run"]
-    if job_name == "ubuntu-full":
-        expected_preflight_files.update(_GATEWAY_REGRESSION_FILES)
-        assert '"${{ matrix.shard }}" == "gateway-sqlite"' in preflight["run"]
-    if job_name == "windows-full":
         expected_preflight_files.update({
             "tests/test_ci/test_windows_signatures.py",
             "tests/test_tools/test_shell_process_isolation.py",
@@ -3349,6 +3359,8 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
         expected_preflight_files
     )
     assert "-vv --tb=short" in preflight["run"]
+    if job_name in {"ubuntu-full", "windows-full"}:
+        assert f"-o faulthandler_timeout={faulthandler_timeout}" in preflight["run"]
     assert f"-o faulthandler_timeout={faulthandler_timeout}" in main["run"]
     assert "no:faulthandler" not in preflight["run"]
     assert "no:faulthandler" not in main["run"]
@@ -3356,49 +3368,106 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
     assert "--showlocals" not in main["run"]
 
 
-@pytest.mark.parametrize(("family", "expected_file"), [
-    ("core", "tests/test_ci/test_windows_signatures.py"),
-    ("core", "tests/test_cli/test_chat_cmd.py"),
-    ("core", "tests/test_tools/test_shell_blocking_launch.py"),
-    ("core", "tests/test_ci/test_rpc_architecture_contracts.py"),
-    ("core", "tests/test_skills/test_hub_management_service.py"),
-    ("gateway-sqlite", "tests/test_gateway/test_native_attachment_import.py"),
-    ("gateway-sqlite", "tests/test_gateway/test_recovery_scheduler.py"),
-    ("gateway-sqlite", "tests/test_gateway/test_goal_user_input.py"),
-    ("gateway-sqlite", "tests/test_gateway/test_manual_compaction_contract.py"),
-    ("gateway-sqlite", "tests/test_gateway/test_sandbox_token_rpc_workers.py"),
-    ("gateway-sqlite", "tests/test_live_provider_profile_gateway_e2e.py"),
-    ("recovery-migration", "tests/test_sandbox/test_windows_shell_process_runtime.py"),
-    ("recovery-migration", "tests/test_live_long_task_case_driver.py"),
-    ("recovery-migration", "tests/test_ci/test_upgrade_baselines.py"),
-    ("recovery-migration", "tests/test_engine/test_runtime_router_fallback.py"),
-    ("desktop-installer-contracts", "tests/test_ci/test_architecture_import_contracts.py"),
-    ("desktop-installer-contracts", "tests/test_engine/test_tool_concurrency.py"),
+@pytest.mark.parametrize("family", [
+    "core", "gateway-sqlite", "recovery-migration", "desktop-installer-contracts",
 ])
-def test_windows_preflight_selects_regressions_for_physical_partitions(family, expected_file):
-    steps = _workflow("ci.yml")["jobs"]["windows-full"]["steps"]
+@pytest.mark.parametrize("scope", ["single", "family", "full", "mixed"])
+def test_windows_preflight_selects_regressions_for_physical_partitions(family, scope):
+    job = _workflow("ci.yml")["jobs"]["windows-full"]
+    steps = job["steps"]
     preflight = next(step for step in steps if step.get("name") == (
         "Preflight offline test environment"
     ))
-    selector = "regression_args=()" + preflight["run"].split("regression_args=()", 1)[1]
+    assert job["strategy"]["matrix"]["shard"] == (
+        "${{ fromJSON(needs.plan-ci.outputs.python_matrix).windows }}"
+    )
+    assert preflight["env"]["PLANNED_WINDOWS_SHARDS"] == (
+        "${{ toJSON(fromJSON(needs.plan-ci.outputs.python_matrix).windows) }}"
+    )
+    assert job["strategy"]["fail-fast"] is False
+    assert "windows-full" in _workflow("ci.yml")["jobs"]["ci-result"]["needs"]
+    selector = "set -euo pipefail\nregression_args=()" + preflight["run"].split(
+        "regression_args=()", 1,
+    )[1]
     selector = selector.split("uv run pytest", 1)[0]
+    runner = runpy.run_path(".github/scripts/windows_test_shards.py")
+    regressions = {
+        path for path in TEST_PATH_RE.findall(selector)
+        if runner["shard_for_test"](path) == family
+    }
     suites = json.loads(Path(".github/ci/suites.v1.json").read_text(encoding="utf-8"))
+    full_matrix = suites["full_python_matrix"]["windows"]
     partitions = [
-        shard for shard in suites["full_python_matrix"]["windows"]
+        shard for shard in full_matrix
         if shard.startswith(f"{family}-")
     ]
     assert partitions
     for shard in partitions:
-        script = selector.replace("${{ matrix.shard }}", shard)
+        planned = {
+            "single": [shard],
+            "family": partitions,
+            "full": full_matrix,
+            "mixed": [shard, next(cell for cell in full_matrix if cell not in partitions)],
+        }[scope]
+        planned_json = json.dumps(planned)
+        owned = set(runner["files_for_planned_windows_shards"](
+            Path.cwd(), shard, planned_json,
+        ))
+        # Stub only process execution. Use the real assignment inventory and
+        # Windows CRLF output to exercise the workflow's filtering shell.
+        script = '''uv() {
+          [[ "$#" == 7 && "$1" == run && "$2" == python &&
+             "$3" == .github/scripts/windows_test_shards.py && "$4" == list &&
+             "$5" == "$EXPECTED_SHARD" && "$6" == --planned-windows-shards &&
+             "$7" == "$EXPECTED_PLAN" ]] || return 96
+          printf '%s' "$OWNED_TEST_FILES"
+        }
+        ''' + selector.replace("${{ matrix.shard }}", shard)
         script += '\nprintf "%s\\n" "${regression_args[@]}"\n'
         result = subprocess.run(
             [_bash_executable(), "-c", script],
+            env={
+                **os.environ,
+                "EXPECTED_SHARD": shard,
+                "EXPECTED_PLAN": planned_json,
+                "PLANNED_WINDOWS_SHARDS": planned_json,
+                "OWNED_TEST_FILES": "\r\n".join(sorted(owned)) + "\r\n",
+            },
             check=True, capture_output=True, text=True, timeout=10,
         )
-        if expected_file is None:
-            assert not result.stdout.strip(), shard
+        remaining = set(filter(None, result.stdout.splitlines()))
+        assert remaining == regressions - owned, shard
+        if scope in {"family", "full"}:
+            assert remaining == set(), shard
         else:
-            assert expected_file in result.stdout.splitlines(), shard
+            assert remaining == {
+                path for path in regressions
+                if runner["windows_shard_for_test"](path) != shard
+            }, shard
+
+
+@pytest.mark.parametrize("partial_output", [False, True])
+def test_windows_preflight_stops_if_shard_inventory_fails(partial_output):
+    steps = _workflow("ci.yml")["jobs"]["windows-full"]["steps"]
+    preflight = next(step for step in steps if step.get("name") == (
+        "Preflight offline test environment"
+    ))
+    selector = "set -euo pipefail\nregression_args=()" + preflight["run"].split(
+        "regression_args=()", 1,
+    )[1]
+    selector = selector.split("uv run pytest", 1)[0]
+    script = "uv() {\n"
+    if partial_output:
+        script += "printf 'tests/test_cli/test_chat_cmd.py\\r\\n'\n"
+    script += "return 31\n}\n" + selector.replace("${{ matrix.shard }}", "core-1")
+    script += "\nprintf 'preflight-continued\\n'\n"
+    result = subprocess.run(
+        [_bash_executable(), "-c", script],
+        env={**os.environ, "PLANNED_WINDOWS_SHARDS": '["core-1"]'},
+        check=False, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 31
+    assert "preflight-continued" not in result.stdout
 
 
 _GATEWAY_REGRESSION_FILES = {

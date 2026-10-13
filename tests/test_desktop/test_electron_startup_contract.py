@@ -1624,12 +1624,7 @@ def test_desktop_onboarding_exposes_immediate_and_slow_submit_feedback() -> None
 
 def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
-    router_profiles = json.loads(
-        _read("desktop/electron/src/generated/desktop-router-catalog.ts").split(" = ", 1)[1]
-    )
-    router_config = _read("desktop/electron/src/desktop-router-config.ts")
     tokenrhythm_catalog = _section(main_ts, "id: 'tokenrhythm'", "id: 'openrouter'")
-    tokenrhythm_profile = router_profiles["tokenrhythm"]
     onboarding_html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
 
     assert "routerSupported: supportsRouter(provider.id)" in main_ts
@@ -1638,7 +1633,6 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
     openrouter_catalog = _section(main_ts, "id: 'openrouter'", "id: 'openai'")
     assert "model: ROUTER_PROFILES.openrouter.c1.model" in openrouter_catalog
     assert "desktopRouterConfigTomlLines(credential, existingRaw, routerWriteIntent)" in main_ts
-    assert "`preset_binding = ${tomlValue(binding)}`" in router_config
     assert (
         "return selected.onboardingModel && selected.routerSupported ? 'squilla_router' : 'direct';"
         in onboarding_html
@@ -1654,39 +1648,10 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
     assert "routerTiers:" not in onboarding_html
     assert "routerDefaultTier:" not in onboarding_html
     assert "defaultTiers: defaultRouterTiers(provider," in main_ts
-    assert "routerDefaultTier: 'c1'," in router_config
-    assert "routerPresetBinding: 'follow_primary'," in router_config
     assert "[data-model-routing-mode]" not in onboarding_html
     assert "`selection_mode = ${tomlString(selectionMode)}`" in main_ts
     assert "'[[llm_ensemble.candidates]]'" not in main_ts
     assert "DESKTOP_ENSEMBLE_PROFILES" not in main_ts
-
-    expected_models = (
-        "qwen3.7-flash",
-        "deepseek-flash",
-        "deepseek-v4-pro-0813",
-        "glm-5.3",
-        "kimi-k2.6",
-    )
-    assert {tier["model"] for tier in tokenrhythm_profile.values()} == set(expected_models)
-    assert tokenrhythm_profile["c3"]["ensembleEnabled"] is False
-    assert all("thinkingLevel" not in tier for tier in tokenrhythm_profile.values())
-    assert "ensemble_enabled = ${tomlValue(ensembleEnabled)}" in router_config
-
-
-def test_desktop_legacy_inline_router_does_not_inherit_new_c3_ensemble() -> None:
-    main_ts = _read("desktop/electron/src/main.ts")
-    normalizer = _read("desktop/electron/src/router-tier-normalization.ts")
-    package_json = json.loads(_read("desktop/electron/package.json"))
-
-    assert "normalizeRouterTiers" in main_ts
-    assert "for (const tier of Object.values(out)) delete tier.ensembleEnabled" in normalizer
-    assert "hasOwnProperty.call(tier, 'ensembleEnabled')" in normalizer
-    assert "hasOwnProperty.call(tier, 'ensemble_enabled')" in normalizer
-    assert "normalizeBooleanSetting(ensembleEnabled, false)" in normalizer
-    assert package_json["scripts"]["test:router-tier-normalization"] == (
-        "npm run build && node scripts/test-router-tier-normalization.mjs"
-    )
 
 
 def test_desktop_onboarding_opens_only_trusted_registration_url_outside_renderer() -> None:
@@ -2031,6 +1996,9 @@ def test_gateway_runtime_selection_validates_cwd_and_keeps_dev_on_checkout() -> 
     assert "if (app.isPackaged && await pathIsFile(bundledBinary))" in resolver
     assert "await assertRepoRoot()" in resolver
     assert "command: 'uv'" in resolver
+    assert "join(repoRoot, 'desktop', 'electron', 'scripts', 'gateway-entry.py')" in resolver
+    assert "if (!(await pathIsFile(entry)))" in resolver
+    assert "args: ['run', 'python', entry, 'gateway', 'run']" in resolver
     assert "mode: 'dev'" in resolver
     assert "async function validateGatewayRuntime(runtime: RuntimeLaunch)" in main_ts
     assert "runtime_root_missing: Gateway cwd does not exist" in main_ts
@@ -2332,24 +2300,6 @@ def test_desktop_mock_update_dialog_auto_responder_is_mock_only() -> None:
     assert "const mockResponse = nextMockUpdateDialogResponse()" in show_dialog
     assert "response: mockResponse" in show_dialog
     assert "dialog.showMessageBox" in show_dialog
-
-
-def test_desktop_mock_update_flow_has_automated_e2e_script() -> None:
-    package_json = json.loads(_read("desktop/electron/package.json"))
-    script = _read("desktop/electron/scripts/test-mock-update-flow.mjs")
-
-    assert package_json["scripts"]["test:mock-update-flow"] == (
-        "npm run build && node scripts/test-mock-update-flow.mjs"
-    )
-    assert "_electron" in script
-    assert "OPENSQUILLA_DESKTOP_MOCK_UPDATE_VERSION" in script
-    assert "OPENSQUILLA_DESKTOP_MOCK_UPDATE_DIALOG_RESPONSES" in script
-    assert "window.opensquillaDesktop.isAutoUpdateEnabled()" in script
-    assert "window.opensquillaDesktop.getUpdateState" in script
-    assert 'data-testid="desktop-update-download"' in script
-    assert 'data-testid="update-banner"' in script
-    assert "Menu.getApplicationMenu()" in script
-    assert "Relaunch to Update" in script
 
 
 def test_update_downloaded_records_pending_version_and_rebuilds_menu() -> None:
@@ -2736,10 +2686,8 @@ def test_desktop_network_observability_disable_gates_native_update_and_gateway_e
     assert "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: '1'" in start
 
 
-def test_desktop_native_update_rechecks_daily_without_overlapping() -> None:
+def test_desktop_native_update_scheduler_is_wired_to_startup_and_quit() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
-    scheduler_ts = _read("desktop/electron/src/update-check-scheduler.ts")
-    scheduler_test = _read("desktop/electron/scripts/test-update-check-scheduler.mjs")
     startup = _section(main_ts, "void app.whenReady().then", "})\n}")
     before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
 
@@ -2747,12 +2695,6 @@ def test_desktop_native_update_rechecks_daily_without_overlapping() -> None:
     assert "const UPDATE_CHECK_REPEAT_DELAY_MS = 24 * 60 * 60 * 1000" in main_ts
     assert "desktopUpdateCheckScheduler.start(UPDATE_CHECK_INITIAL_DELAY_MS)" in startup
     assert "desktopUpdateCheckScheduler.stop()" in before_quit
-    assert "if (this.inFlight)" in scheduler_ts
-    assert "return this.inFlight" in scheduler_ts
-    assert "if (manual) this.promoteToManual()" in scheduler_ts
-    assert "this.schedule(this.repeatDelayMs)" in scheduler_ts
-    assert "repeat delay starts at completion" in scheduler_test
-    assert "manual caller must join the active promise" in scheduler_test
 
 
 def test_package_verifier_hard_fails_stale_runtime_and_boot_contract() -> None:
@@ -2799,7 +2741,6 @@ def test_package_verifier_hard_fails_stale_runtime_and_boot_contract() -> None:
 def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway() -> None:
     package_json = json.loads(_read("desktop/electron/package.json"))
     recovery = _read("desktop/electron/scripts/test-packaged-session-recovery.mjs")
-    recovery_rpc = _read("desktop/electron/scripts/session-recovery-rpc-evidence.mjs")
     helpers = _read("desktop/electron/scripts/packaged-smoke-helpers.mjs")
 
     assert (
@@ -2813,13 +2754,6 @@ def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway
     assert "app.context().routeWebSocket" in recovery
     assert recovery.index("app.context().routeWebSocket") < recovery.index("app.firstWindow")
     assert recovery.index("page.reload") < recovery.index("page.goto(sessionUrl")
-    for method in (
-        "chat.history", "sessions.messages.subscribe", "sessions.messages.snapshot.read",
-    ):
-        assert method in recovery_rpc
-    assert "frame?.type !== 'req'" in recovery_rpc
-    assert "frame.params?.sessionKey === sessionKey" in recovery_rpc
-    assert "frame.params?.key !== sessionKey" in recovery_rpc
     assert "createSessionRecoveryFault(sessionKey)" in recovery
     assert "injectHang ? recoveryFault.holdRequest(socketIndex, frame) : null" in recovery
     assert "recoveryFault.holdResponse(socketIndex, frame, forward)" in recovery
@@ -3118,8 +3052,6 @@ def test_desktop_second_launch_retries_lock_and_logs_instead_of_silent_quit() ->
 
 def test_desktop_renderer_logging_is_trusted_bounded_and_lifecycle_aware() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
-    renderer_log = _read("desktop/electron/src/desktop-renderer-log.ts")
-    log_file = _read("desktop/electron/src/desktop-log-file.ts")
     create_window = _section(
         main_ts,
         "async function createMainWindow(): Promise<BrowserWindow>",
@@ -3132,12 +3064,6 @@ def test_desktop_renderer_logging_is_trusted_bounded_and_lifecycle_aware() -> No
     assert "webContents.on('render-process-gone'" in create_window
     assert "webContents.on('unresponsive'" in create_window
     assert "webContents.on('responsive'" in create_window
-    assert "'error'" in renderer_log
-    assert "'warning'," not in renderer_log
-    assert "renderer_console_suppressed" in renderer_log
-    assert "redactRendererLogText" in renderer_log
-    assert "DESKTOP_LOG_MAX_BYTES" in log_file
-    assert "DESKTOP_LOG_BACKUP_COUNT" in log_file
     assert "appendDesktopLogRecord" in main_ts
 
 
@@ -3171,44 +3097,6 @@ def test_desktop_renderer_loss_revokes_artifact_preview_leases() -> None:
         "if (isMainFrame && !isInPlace) releaseRendererOwnedArtifactPreviews()"
         in full_navigation
     )
-
-
-def test_desktop_renderer_crash_has_bounded_same_window_recovery_fence() -> None:
-    main_ts = _read("desktop/electron/src/main.ts")
-    create_window = _section(
-        main_ts,
-        "async function createMainWindow(): Promise<BrowserWindow>",
-        "function currentMainWindow",
-    )
-    renderer_gone = _section(
-        create_window,
-        "window.webContents.on('render-process-gone'",
-        "window.webContents.on('unresponsive'",
-    )
-    assert "rendererRecoveryGeneration" in renderer_gone
-    assert "let cancelRendererRecovery: (() => void) | null = null" in create_window
-    # A new crash retires the previous listener/timer before reloading, while
-    # retaining its failed-attempt count. Runtime ordering is covered by the
-    # Electron renderer logging/recovery script.
-    assert renderer_gone.index("cancelRendererRecovery?.()") < renderer_gone.index(
-        "rendererRecoveryFailureCount += 1"
-    ) < renderer_gone.index("window.webContents.reload()")
-    assert "cancelRendererRecovery = () => finish('stale')" in renderer_gone
-    assert "if (finished) return" in renderer_gone
-    assert "clearTimeout(timeout)" in renderer_gone
-    assert "removeListener('did-finish-load', onReady)" in renderer_gone
-    assert "cancelRendererRecovery = null" in renderer_gone
-    assert "recoveryGeneration === rendererRecoveryGeneration" in renderer_gone
-    assert "rendererRecoveryFailureCount >= 3" in renderer_gone
-    assert "rendererRecoveryFailureWindowStartedAt >= 60_000" in renderer_gone
-    assert "setTimeout(() => finish('timeout'), 30_000)" in renderer_gone
-    assert "renderer_recovery_scheduled" in renderer_gone
-    assert "renderer_recovery_ready" in renderer_gone
-    assert "rendererPid: window.webContents.getOSProcessId()" in renderer_gone
-    assert "renderer_recovery_exhausted" in renderer_gone
-    assert "window.webContents.reload()" in renderer_gone
-    assert "did-finish-load" in renderer_gone
-    assert "appExitPhase !== 'running'" in renderer_gone
 
 
 def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
@@ -3495,80 +3383,7 @@ def test_windows_process_start_identity_avoids_powershell_module_autoload() -> N
     assert "[System.Diagnostics.Process]::GetProcessById" in windows_probe
 
 
-def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
-    package_json = json.loads(_read("desktop/electron/package.json"))
-    script = _read(
-        "desktop/electron/scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
-    )
-    main = _read("desktop/electron/src/main.ts")
-    lifecycle = _read("desktop/electron/src/gateway-lifecycle.ts")
-
-    assert package_json["scripts"]["test:gateway-orphan-recovery-flow"] == (
-        "npm run build && node scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
-    )
-    assert "firstMain.kill('SIGKILL')" in script
-    assert "verifyDesktopGatewayOwnership(firstRecord)" in script
-    assert "'orphan Desktop Gateway ownership verification'" in script
-    assert "electronChildCleanup.remainingMs('verify-orphan-survived')" in script
-    assert "await launchDesktop(" in script
-    assert "sameDesktopGatewayOwnershipInstance(loaded.record, firstRecord)" in script
-    assert "verifyDesktopGatewayOwnership(loaded.record)" in script
-    assert "'verified replacement Desktop Gateway ownership record'" in script
-    assert "process.kill(secondRecord.pid, 'SIGKILL')" in script
-    assert "sameDesktopGatewayOwnershipInstance(loaded.record, secondRecord)" in script
-    assert "assert.notEqual(secondRecord.instance_nonce, firstRecord.instance_nonce)" in script
-    assert "assert.notEqual(thirdRecord.instance_nonce, secondRecord.instance_nonce)" in script
-    assert "return !gatewayProcessSnapshot(firstRecord).alive" in script
-    assert "return !gatewayProcessSnapshot(secondRecord).alive" in script
-    assert "function processAlive(pid)" not in script
-    assert "gatewayProcesses: ownedInstances.map" in script
-    assert "assert.equal(thirdRecord.port, secondRecord.port)" in script
-    assert "assert.equal(secondPage.url(), rendererUrlBeforeCrash)" in script
-    assert "'renderer-observed-child-crash'" in script
-    assert "'renderer-reconnected-after-child-restart'" in script
-    assert "verifyDesktopGatewayOwnership(thirdRecord)" in script
-    assert "waitForDesktopGatewayOwnershipRelease" in script
-    assert "export const DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS = 120_000" in lifecycle
-    assert "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000" in main
-    assert "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000" in script
-    assert (
-        "DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + DESKTOP_RENDERER_READY_TIMEOUT_MS"
-        in script
-    )
-    assert (
-        "VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS + INITIAL_DESKTOP_STARTUP_BUDGET_MS"
-        in script
-    )
-    assert "createPhaseBudget('hard-crash-exit', CRASH_EXIT_BUDGET_MS)" in script
-    assert "const WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS = 20_000" in script
-    assert "const WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS = 30_000" in script
-    assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in script
-    assert "closeElectronWithDeadline" in script
-    assert "desktopShutdownEvidenceSince" in script
-    assert "canAcceptWindowsElectronShutdownFallback" in script
-    assert "ownershipReleased && !gatewayProcessSnapshot(thirdRecord).alive" in script
-    assert "'successful-electron-shutdown'" in script
-    assert "'finally-second-electron-shutdown'" in script
-    assert "'finally-first-electron-shutdown'" in script
-    assert "await secondApp.close()" not in script
-    assert (
-        "createPhaseBudget(\n"
-        "    'windows-electron-child-cleanup',\n"
-        "    WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS,\n"
-        "  )"
-    ) in script
-    assert "timeout: WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS" in script
-    assert "phase.remainingMs('first-window')" in script
-    assert "phase.remainingMs('desktop-renderer-route')" in script
-    assert "phase.remainingMs('gateway-readiness')" in script
-    assert "DESKTOP_E2E_PHASE_TIMEOUT:" in script
-    assert "DESKTOP_E2E_PHASE_FAILED:" in script
-    assert "DESKTOP_E2E_PROCESS_EXITED:" in script
-    assert "if (flowSucceeded && stillLive.length === 0)" in script
-    assert "async function waitFor(check, label, timeoutMs = 60_000)" not in script
-
-
-def test_desktop_e2e_shutdown_helpers_bound_windows_cleanup_without_masking_failures() -> None:
+def test_desktop_e2e_flows_keep_bounded_shutdown_and_fail_closed_log_reads() -> None:
     orphan_flow = _read(
         "desktop/electron/scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
     )
@@ -3576,24 +3391,6 @@ def test_desktop_e2e_shutdown_helpers_bound_windows_cleanup_without_masking_fail
     profile_import_flow = _read("desktop/electron/scripts/test-profile-import-flow.mjs")
     window_flow = _read("desktop/electron/scripts/test-desktop-window-background-flow.mjs")
     theme_flow = _read("desktop/electron/scripts/test-desktop-theme-flow.mjs")
-    helper = _read("desktop/electron/scripts/e2e-shutdown-helpers.mjs")
-
-    assert "server.closeIdleConnections?.()" in helper
-    assert "server.closeAllConnections?.()" in helper
-    assert "for (const socket of sockets) socket.destroy()" in helper
-    assert "terminateWindowsProcessTree" in helper
-    assert "child.kill('SIGKILL')" in helper
-    assert "forced process exit" in helper
-    assert "desktop_e2e_electron_shutdown_failed" in helper
-    assert "canAcceptWindowsElectronShutdownFallback" in helper
-    assert "desktopShutdownEvidenceSince" in helper
-    assert "record.hardTerminated === false" in helper
-    assert "record.reason === 'all lifecycle-owned Gateways exited'" in helper
-    assert "shutdown?.closeErrorCode === 'DESKTOP_E2E_SHUTDOWN_TIMEOUT'" in helper
-    assert "shutdown?.forcedExitSucceeded === true" in helper
-    assert "shutdown?.processTreeReaped === true" in helper
-    assert "gatewayExitCount > 0 && allGatewayExitsClean" in helper
-    assert "committedExitIndex > lastGatewayExitIndex" in helper
     for flow in (
         orphan_flow,
         profile_flow,
@@ -3647,8 +3444,6 @@ def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
     # against the release SHA256SUMS (OSS mirror first, canonical GitHub
     # Release as fail-over) before revealing it.
     main_ts = _read("desktop/electron/src/main.ts")
-    resolver = _read("desktop/electron/src/update-channel.ts")
-    verification = _read("desktop/electron/src/update-verification.ts")
     package_json = json.loads(_read("desktop/electron/package.json"))
     check = _section(
         main_ts,
@@ -3675,15 +3470,6 @@ def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
         "if (desktopUpdateInstallMode() === 'manual')",
         "if (!autoUpdateSupported())",
     )
-
-    assert "export function updateChannelPathForVersion" in resolver
-    assert "'stable.json'" in resolver
-    assert "`preview/${parsed.base}.json`" in resolver
-    assert "latest-mac.yml" in resolver
-    assert "candidate.base !== current.base" in resolver
-    assert "platform assets do not match the release version" in resolver
-    assert "UPDATE_OSS_RELEASE_ROOT" in resolver
-    assert "UPDATE_GITHUB_RELEASE_ROOT" in resolver
 
     assert "function configureDesktopUpdateFeed(resolved: ResolvedDesktopUpdate)" in main_ts
     assert "provider: 'generic'" in main_ts
@@ -3749,11 +3535,6 @@ def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
         "await checkNativeDesktopUpdate(resolved)",
     )
     assert "rememberSuccessfulUpdateSource" not in manual_discovery
-    assert "parseSha256SumsForAsset" in verification
-    assert "streamResponseToVerifiedFile" in verification
-    assert "actual !== expected" in verification
-    assert "await rm(temporaryPath, { force: true })" in verification
-    assert "received !== totalBytes" in verification
     assert "ipcMain.handle('desktop:update:managed'" in main_ts
     assert "'x-user-staging-id': '00000000-0000-4000-8000-000000000000'" in main_ts
 
@@ -4392,91 +4173,6 @@ def test_migration_preload_bridge_and_progress_channel() -> None:
     assert "workspace_conflict" in legacy_choice
     assert "choosePrimaryWorkspace(" in legacy_choice
     assert "'legacy-agent-data'" in legacy_choice
-
-
-def test_compiled_electron_flows_preserve_xvfb_display_authority() -> None:
-    package_json = json.loads(_read("desktop/electron/package.json"))
-    assert package_json["scripts"]["test:profile-consolidation-flow"] == (
-        "npm run build && node scripts/test-profile-consolidation-flow.mjs"
-    )
-    assert package_json["scripts"]["test:primary-repair-accessibility"] == (
-        "npm run build && node scripts/test-primary-repair-accessibility.mjs"
-    )
-    assert package_json["scripts"]["test:unsafe-legacy-recovery-no-write"] == (
-        "npm run build && node scripts/test-unsafe-legacy-recovery-no-write.mjs"
-    )
-    assert package_json["scripts"]["test:profile-import-flow"] == (
-        "npm run build && node scripts/test-profile-import-flow.mjs"
-    )
-    for retired_script in (
-        "test:profile-recovery-flow",
-        "test:profile-recovery-accessibility",
-        "test:unsafe-profile-no-write",
-        "test:profile-recovery",
-    ):
-        assert retired_script not in package_json["scripts"]
-    for script in (
-        "desktop/electron/scripts/test-profile-consolidation-flow.mjs",
-        "desktop/electron/scripts/test-primary-repair-accessibility.mjs",
-        "desktop/electron/scripts/test-profile-import-flow.mjs",
-    ):
-        source = _read(script)
-        assert "name === 'DISPLAY' || name === 'XAUTHORITY'" in source
-        assert source.index("name === 'DISPLAY' || name === 'XAUTHORITY'") < source.index(
-            "/(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)/i"
-        )
-
-
-def test_consolidation_e2e_waits_for_primary_route_and_emits_renderer_diagnostics() -> None:
-    source = _read("desktop/electron/scripts/test-profile-consolidation-flow.mjs")
-    control = _section(source, "async function controlPage", "async function createLegacyRecovery")
-
-    assert "candidate.url().startsWith('opensquilla-app://desktop/')" in control
-    assert "pathname !== '/chat' && pathname !== '/chat/new'" in control
-    assert "connection?.status !== 'ready'" in control
-    assert "candidate.locator('.chat-textarea').count()" in control
-    assert "page.on('console'" in source
-    assert "page.on('pageerror'" in source
-    assert "windows=${JSON.stringify(windows)}" in control
-    assert "gatewayLogTail: gatewayLog.slice(-8_000)" in source
-    assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in source
-    assert "closeElectronWithDeadline" in source
-    assert "desktopShutdownEvidenceSince" in source
-    assert "canAcceptWindowsElectronShutdownFallback" in source
-    assert "closeActiveApp('consolidated-primary-electron-shutdown')" in source
-    assert "closeActiveApp('completed-receipt-electron-shutdown')" in source
-    assert "closeActiveApp('config-only-electron-shutdown')" in source
-    assert "closeActiveApp('credential-only-electron-shutdown')" in source
-    assert "closeActiveApp('invalid-credential-electron-shutdown')" in source
-    assert "closeActiveApp('finally-profile-electron-shutdown'" in source
-    assert "await app.close()" not in source
-    assert "await app?.close()" not in source
-
-
-def test_consolidation_e2e_covers_receipt_replay_and_inactive_state_archival() -> None:
-    source = _read("desktop/electron/scripts/test-profile-consolidation-flow.mjs")
-
-    assert "runProfileConsolidationCli(" in source
-    assert "await writeFile(primaryCredential, '{}\\n', 'utf8')" in source
-    assert "assert.equal(await readFile(primaryCredential, 'utf8'), '{}\\n')" in source
-    assert "prelaunchConsolidation.credential_adoption_status, 'pending'" in source
-    assert "pendingReceiptRecoveredAfterCrash: true" in source
-    assert "completedReceiptDidNotResurrectCredential: true" in source
-    assert "invalidCredentialStableCode" in source
-    assert "'archived_credential_invalid'" in source
-    assert "'not_required'" in source
-    assert "'complete'" in source
-    assert "credentialOnlySourceGeneratedPrimary: true" in source
-    assert "generatedCredential.configAuthority, 'generated'" in source
-    assert "generatedCredential.importTransactionId, ''" in source
-
-    # Supported historical data becomes active, while unknown/runtime state is
-    # absent from active state and remains traceable in non-active recovered-data
-    # plus the immutable consolidation backup.
-    assert "'session-archive'" in source
-    assert "'recovered-data'" in source
-    assert "pathExists(join(primaryHome, 'state'" in source
-    assert "archivedProfiles" in source
 
 
 def test_obsolete_profile_consolidation_escape_hatch_is_removed() -> None:

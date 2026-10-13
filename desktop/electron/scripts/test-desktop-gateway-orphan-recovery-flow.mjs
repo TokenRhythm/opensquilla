@@ -293,6 +293,9 @@ async function removeSyntheticProfile(root) {
 const isolationRoot = await mkdtemp(join(tmpdir(), 'opensquilla-orphan-recovery-e2e-'))
 const userDataDir = join(isolationRoot, 'chromium-user-data')
 const isolatedHome = join(isolationRoot, 'home')
+const appData = join(isolatedHome, 'AppData', 'Roaming')
+const localAppData = join(isolatedHome, 'AppData', 'Local')
+const localTemp = join(localAppData, 'Temp')
 const port = await freeLoopbackPort()
 let firstApp
 let secondApp
@@ -305,6 +308,12 @@ const launchEnvironment = {
   ...process.env,
   HOME: isolatedHome,
   USERPROFILE: isolatedHome,
+  APPDATA: appData,
+  LOCALAPPDATA: localAppData,
+  TEMP: localTemp,
+  TMP: localTemp,
+  OPENSQUILLA_USER_STATE_DIR: localAppData,
+  OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1',
   OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
   OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
   OPENSQUILLA_DESKTOP_GATEWAY_PORT: String(port),
@@ -331,7 +340,11 @@ async function launchDesktop(phase, step) {
 
 try {
   await mkdir(userDataDir, { recursive: true })
-  await mkdir(isolatedHome, { recursive: true })
+  await Promise.all([
+    mkdir(appData, { recursive: true }),
+    mkdir(localAppData, { recursive: true }),
+    mkdir(localTemp, { recursive: true }),
+  ])
   const now = new Date().toISOString()
   await writeFile(join(userDataDir, 'desktop-credential.json'), JSON.stringify({
     provider: 'ollama',

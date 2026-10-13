@@ -14,6 +14,7 @@ import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
+import { withDeadline } from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -61,6 +62,10 @@ function launchEnvironment(isolatedHome) {
     ...inherited,
     HOME: isolatedHome,
     USERPROFILE: isolatedHome,
+    APPDATA: join(isolatedHome, 'AppData', 'Roaming'),
+    LOCALAPPDATA: join(isolatedHome, 'AppData', 'Local'),
+    TEMP: join(isolatedHome, 'AppData', 'Local', 'Temp'),
+    TMP: join(isolatedHome, 'AppData', 'Local', 'Temp'),
     OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
     OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
     OPENSQUILLA_USER_STATE_DIR: join(isolatedHome, 'user-state'),
@@ -140,7 +145,10 @@ try {
   await mkdir(workspace, { recursive: true })
   await mkdir(state, { recursive: true })
   await mkdir(dirname(consolidationBackupMarker), { recursive: true })
-  await mkdir(isolatedHome, { recursive: true })
+  await Promise.all([
+    mkdir(join(isolatedHome, 'AppData', 'Roaming'), { recursive: true }),
+    mkdir(join(isolatedHome, 'AppData', 'Local', 'Temp'), { recursive: true }),
+  ])
   await writeFile(join(workspace, 'IDENTITY.md'), 'synthetic cleanup identity\n', 'utf8')
   await writeFile(join(state, 'sessions.db.keep'), 'synthetic chat state\n', 'utf8')
   await writeFile(consolidationBackupMarker, 'recorded backup must remain\n', 'utf8')
@@ -212,12 +220,7 @@ try {
       confirmation: '',
     })
   ), preview.previewId).catch(() => {})
-  await Promise.race([
-    exited,
-    delay(30_000).then(() => {
-      throw new Error('Desktop did not exit after deleting the current profile.')
-    }),
-  ])
+  await withDeadline(() => exited, 'Desktop exit after deleting the current profile', 30_000)
 
   assert.equal(await exists(primaryHome), false)
   assert.equal(await exists(join(userData, 'desktop-credential.json')), false)
@@ -270,12 +273,7 @@ try {
       confirmation: 'DELETE ALL OPENSQUILLA DATA',
     })
   ), deleteAllPreview.previewId).catch(() => {})
-  await Promise.race([
-    deleteAllExited,
-    delay(30_000).then(() => {
-      throw new Error('Desktop did not exit before the delete-all helper handoff.')
-    }),
-  ])
+  await withDeadline(() => deleteAllExited, 'Desktop exit before the delete-all helper handoff', 30_000)
   try {
     await waitFor(async () => (
       !await exists(primaryHome)

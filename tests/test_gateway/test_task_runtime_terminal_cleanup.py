@@ -27,7 +27,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from opensquilla.engine.runtime import TurnRunner
-from opensquilla.gateway import task_runtime
+from opensquilla.gateway import session_streams, task_runtime
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.routing import (
@@ -2811,14 +2811,47 @@ async def test_exception_path_clears_dicts() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.ci_serial
+@pytest.mark.stress
 async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
-    """10 000 tasks, each <=50 ms; dict sizes after GC must be within ±2 of baseline."""
+    """Keep the 10 000-task reclamation/memory soak outside the default suite.
+
+    The short success, exception, and queued-handoff tests above own the
+    per-turn cleanup contracts; this test owns cumulative growth under load.
+    """
     num_tasks = 10_000
     session_count = 50  # rotate sessions to mimic real load
     monkeypatch.setattr(task_runtime, "_emit_metric", lambda *_args, **_kwargs: None)
+    # Replay-history sizing has its own tests. Retain this synthetic turn's
+    # phase and done event without rescanning an ever-growing history per task.
+    streams = session_streams.SessionStreamRegistry(max_events_per_session=2)
+    monkeypatch.setattr(session_streams, "_session_streams", streams)
 
-    async def _instant_handler(_run: Any) -> None:
-        pass  # returns immediately — well under 50 ms
+    async def _expire_no_approvals(_session_key: str) -> int:
+        return 0
+
+    # This workload creates no approvals. The short approval-expiry tests above
+    # own that interaction; avoid 10 000 unrelated SQLite worker calls here.
+    approval_port = SimpleNamespace(expire_pending_for_session_async=_expire_no_approvals)
+    monkeypatch.setattr(
+        "opensquilla.application.approval_queue.get_approval_queue",
+        lambda: approval_port,
+    )
+
+    async def _instant_handler(run: Any) -> None:
+        # Model a minimal completed turn through the real snapshot owner. A bare
+        # no-op handler omits the stream contract and emits thousands of unrelated
+        # snapshot-missing warnings instead of exercising normal settlement.
+        common = {"task_id": run.task_id, "turn_id": run.task_id}
+        streams.record(
+            run.envelope.session_key,
+            "session.event.provider_activity",
+            {**common, "phase": "requesting"},
+        )
+        streams.record(
+            run.envelope.session_key,
+            "session.event.done",
+            common,
+        )
 
     rt = _make_runtime(
         turn_handler=_instant_handler,
@@ -2847,9 +2880,11 @@ async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
         # single gather of 10 000 ``runtime.wait`` calls creates another 10 000
         # waiter tasks and timer bookkeeping on top of the runtime workload; that
         # amplification is what made this quantitative check consume a minute on
-        # loaded Windows runners. The shared deadline still catches a stuck task.
+        # loaded Windows runners. This is a growth contract, not a throughput
+        # benchmark; the shared five-minute watchdog still catches a stuck task.
         batch_size = 500
-        deadline = asyncio.get_running_loop().time() + 60.0
+        deadline = asyncio.get_running_loop().time() + 300.0
+        completed_tasks = 0
         for batch_start in range(0, num_tasks, batch_size):
             handles = []
             for i in range(batch_start, min(batch_start + batch_size, num_tasks)):
@@ -2857,50 +2892,65 @@ async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
                 env = _make_envelope(sk)
                 handles.append(await rt.enqueue(env, f"msg-{i}"))
             remaining = deadline - asyncio.get_running_loop().time()
+            timeout_message = (
+                "task runtime leak workload exceeded its shared deadline "
+                f"after {completed_tasks}/{num_tasks} tasks drained"
+            )
             if remaining <= 0:
-                raise TimeoutError("task runtime leak workload exceeded its shared deadline")
-            async with asyncio.timeout(remaining):
-                await asyncio.gather(*(rt.wait(h.task_id) for h in handles))
+                raise TimeoutError(timeout_message)
+            try:
+                async with asyncio.timeout(remaining):
+                    records = await asyncio.gather(*(rt.wait(h.task_id) for h in handles))
+            except TimeoutError as exc:
+                raise TimeoutError(timeout_message) from exc
+            assert all(record.status is AgentTaskStatus.SUCCEEDED for record in records)
+            assert all(
+                record.details["activity_snapshot"]["complete"] is True
+                for record in records
+            )
+            completed_tasks += len(records)
+        assert completed_tasks == num_tasks
 
         # --- post-GC snapshot ---
         gc.collect()
         snap_after = tracemalloc.take_snapshot()
+
+        # Check before shutdown: teardown must not hide a terminal cleanup leak.
+        after_tasks = len(rt._tasks)
+        after_locks = len(rt._session_locks)
+        after_pending = len(rt._pending_by_session)
+        after_running = len(rt._running_by_session)
+        after_envelope = len(rt._last_envelope_by_session)
+
+        tolerance = 2
+        assert abs(after_tasks - baseline_tasks) <= tolerance, (
+            f"_tasks leaked: baseline={baseline_tasks}, after={after_tasks}"
+        )
+        # _session_locks is intentionally NOT cleaned at terminal to prevent
+        # split-brain on rapid re-enqueue. The dict grows by unique session_keys,
+        # not by tasks, and must stay bounded by the 50 sessions in this soak.
+        assert after_locks <= session_count + tolerance, (
+            f"_session_locks grew beyond unique session count: {after_locks} > {session_count}"
+        )
+        assert abs(after_pending - baseline_pending) <= tolerance, (
+            f"_pending_by_session leaked: baseline={baseline_pending}, after={after_pending}"
+        )
+        assert abs(after_running - baseline_running) <= tolerance, (
+            f"_running_by_session leaked: baseline={baseline_running}, after={after_running}"
+        )
+        assert abs(after_envelope - baseline_envelope) <= tolerance, (
+            "_last_envelope_by_session leaked: "
+            f"baseline={baseline_envelope}, after={after_envelope}"
+        )
+
+        # This coarse memory guard complements the precise dict-size checks.
+        # The fake storage intentionally retains all durable task records, so
+        # allow up to 200 MB of growth rather than claiming zero retained memory.
+        top_stats = snap_after.compare_to(snap_before, "lineno")
+        total_added = sum(s.size_diff for s in top_stats if s.size_diff > 0)
+        assert total_added < 200 * 1024 * 1024, (
+            f"Unexpected memory growth: {total_added / 1024:.1f} KB"
+        )
     finally:
         tracemalloc.stop()
-
-    after_tasks = len(rt._tasks)
-    after_locks = len(rt._session_locks)
-    after_pending = len(rt._pending_by_session)
-    after_running = len(rt._running_by_session)
-    after_envelope = len(rt._last_envelope_by_session)
-
-    tolerance = 2
-    assert abs(after_tasks - baseline_tasks) <= tolerance, (
-        f"_tasks leaked: baseline={baseline_tasks}, after={after_tasks}"
-    )
-    # _session_locks is intentionally NOT cleaned at terminal to prevent
-    # split-brain on rapid re-enqueue.  The dict grows by # unique session_keys
-    # (capped at session_count=50 here), not by # tasks.  We verify it is bounded
-    # by session_count rather than by num_tasks.
-    assert after_locks <= session_count + tolerance, (
-        f"_session_locks grew beyond unique session count: {after_locks} > {session_count}"
-    )
-    assert abs(after_pending - baseline_pending) <= tolerance, (
-        f"_pending_by_session leaked: baseline={baseline_pending}, after={after_pending}"
-    )
-    assert abs(after_running - baseline_running) <= tolerance, (
-        f"_running_by_session leaked: baseline={baseline_running}, after={after_running}"
-    )
-    assert abs(after_envelope - baseline_envelope) <= tolerance, (
-        f"_last_envelope_by_session leaked: baseline={baseline_envelope}, after={after_envelope}"
-    )
-
-    # Confirm memory allocation delta is reasonable (no catastrophic growth).
-    # Informational only — the dict-size assertions above are authoritative.
-    # 10 000 asyncio tasks create significant transient allocation for
-    # Task/Future/Event objects; allow up to 200 MB of incidental growth.
-    top_stats = snap_after.compare_to(snap_before, "lineno")
-    total_added = sum(s.size_diff for s in top_stats if s.size_diff > 0)
-    assert total_added < 200 * 1024 * 1024, (
-        f"Unexpected memory growth: {total_added / 1024:.1f} KB"
-    )
+        await rt.shutdown()

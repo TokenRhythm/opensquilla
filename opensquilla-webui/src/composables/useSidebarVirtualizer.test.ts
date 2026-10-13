@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { computed, createApp, h, nextTick, ref, type App } from 'vue'
+import { computed, createApp, Fragment, h, nextTick, ref, type App } from 'vue'
 import type { SidebarDisplayRow } from '@/utils/sidebarDisplayProjection'
 import { useSidebarVirtualizer } from './useSidebarVirtualizer'
 
@@ -43,10 +43,14 @@ async function mount(count = 200) {
     api = useSidebarVirtualizer(ref(element), computed(() => blocks.value), computed(() => retained.value), focused)
     return () => api.renderedBlocks.value.map(section => h('section', { key: section.block.key }, [
       h('div', { 'data-index': section.headingIndex, ref: (el: unknown) => api.measureElement(el as Element | null) }),
-      ...section.rows.map(entry => h('div', {
-        key: entry.row.key, 'data-index': entry.index, 'data-key': entry.row.key,
-        ref: (el: unknown) => api.measureElement(el as Element | null),
-      })),
+      ...section.rows.map(entry => h(Fragment, { key: entry.row.key }, [
+        entry.gapBefore ? h('div', { 'data-gap': '', style: { height: `${entry.gapBefore}px` } }) : null,
+        h('div', {
+          'data-index': entry.index, 'data-key': entry.row.key,
+          ref: (el: unknown) => api.measureElement(el as Element | null),
+        }),
+      ])),
+      section.gapAfter ? h('div', { 'data-gap': '', style: { height: `${section.gapAfter}px` } }) : null,
     ]))
   } })
   app.mount(host)
@@ -64,6 +68,7 @@ beforeEach(() => {
 afterEach(() => {
   apps.splice(0).forEach(app => app.unmount())
   document.body.innerHTML = ''
+  vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
 })
@@ -97,6 +102,39 @@ describe('sidebar TanStack window', () => {
     await flush()
     expect(state.keys()).not.toContain('task-150')
     expect(state.keys()).not.toContain('task-100')
+  })
+
+  it('does not clamp the scroll position while replacing a window at scroll end', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const state = await mount(3000)
+    state.element.scrollTop = 2800 * 44
+    state.element.dispatchEvent(new Event('scroll'))
+    await flush()
+
+    let layoutReads = 0
+    vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockImplementation(function (this: HTMLElement) {
+      if (this.hasAttribute('data-index') && state.element.contains(this)) {
+        layoutReads++
+        // A layout read clamps native scrolling to the DOM's current extent.
+        // Happy DOM has no layout, so model that browser effect over the actual
+        // Vue-rendered headings, rows and normal-flow spacers.
+        const extent = [...state.element.querySelectorAll<HTMLElement>('[data-index], [data-gap]')]
+          .reduce((height, node) => height + (node.hasAttribute('data-index') ? 44 : Number.parseFloat(node.style.height)), 0)
+        state.element.scrollTop = Math.min(state.element.scrollTop, Math.max(0, extent - state.element.clientHeight))
+      }
+      return 44
+    })
+
+    const bottom = state.element.scrollHeight - state.element.clientHeight
+    state.element.scrollTop = bottom
+    // The existing scroll-end callback can see this new position before its
+    // native scroll event, so the virtualizer replaces rows while not scrolling.
+    await vi.runOnlyPendingTimersAsync()
+    await flush()
+
+    expect(layoutReads).toBeGreaterThan(0)
+    expect(state.element.scrollTop).toBe(bottom)
+    expect(state.keys()).toContain('task-2999')
   })
 
   it('keeps group headers and accounts for disjoint window gaps exactly once', async () => {

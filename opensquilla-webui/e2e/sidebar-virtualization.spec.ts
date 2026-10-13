@@ -41,7 +41,9 @@ async function openSidebar(page: Page, count: number, current = 3) {
 }
 
 for (const count of [200, 1000, 3000]) {
-  test(`${count} paginated tasks keep a bounded DOM and responsive rename`, async ({ page }, info) => {
+  test(`${count} paginated tasks keep a bounded DOM and responsive rename`, {
+    tag: count === 3000 ? '@capacity' : [],
+  }, async ({ page }, info) => {
     const errors: string[] = []
     page.on('pageerror', error => errors.push(error.message))
     await page.addInitScript(() => {

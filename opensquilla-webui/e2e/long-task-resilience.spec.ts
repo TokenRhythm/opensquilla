@@ -881,7 +881,9 @@ test.describe('0.5.0 long-task resilience', () => {
     ).toBeVisible()
   })
 
-  test('keeps 200-message history windowed and the composer responsive under a deterministic delta flood', async ({
+  test('keeps 200-message history windowed and the composer responsive under a deterministic delta flood', {
+    tag: '@capacity',
+  }, async ({
     page, nativeGateway,
   }, testInfo) => {
     test.setTimeout(180_000)
