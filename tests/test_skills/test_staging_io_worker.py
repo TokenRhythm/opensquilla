@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from opensquilla.skills.hub import management
 from opensquilla.skills.hub.management import SkillManagementService
 from opensquilla.skills.hub.router import SourceRouter
 from opensquilla.skills.hub.scanner import ScanResult
@@ -15,9 +16,8 @@ from opensquilla.skills.io_worker import check_staging_cancelled, run_staging_wo
 from tests.test_skills.test_hub_management_service import FakeImmutableSource
 
 
-# This contract combines a real worker thread with a bounded responsiveness
-# assertion. Isolate it from the xdist pool so host scheduling cannot consume
-# the three-second entry budget before the worker starts.
+# Keep this real-worker integration contract outside the xdist pool. Its entry
+# guard also includes install preparation; serial scheduling cannot bound that I/O.
 @pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_scan_keeps_status_responsive_and_cancel_waits_for_cleanup(
@@ -27,6 +27,15 @@ async def test_scan_keeps_status_responsive_and_cancel_waits_for_cleanup(
     entered = asyncio.Event()
     exited = threading.Event()
     main_thread = threading.get_ident()
+    last_progress_requested = "admission"
+    report_progress = management.report_install_progress_async
+
+    async def observed_progress(phase: str, **counts) -> None:
+        nonlocal last_progress_requested
+        last_progress_requested = phase
+        await report_progress(phase, **counts)
+
+    monkeypatch.setattr(management, "report_install_progress_async", observed_progress)
 
     def scanning(directory: Path) -> ScanResult:
         assert threading.get_ident() != main_thread
@@ -55,17 +64,47 @@ async def test_scan_keeps_status_responsive_and_cancel_waits_for_cleanup(
         return (await service.install("demo", "fake")).to_dict()
 
     task = asyncio.create_task(operations.run("owner", operation_id, {}, install))
-    await asyncio.wait_for(entered.wait(), timeout=3)
-    status = operations.store.read("owner", operation_id)
-    assert status["state"] == "running"
-    assert status["phase"] == "scanning"
-    assert not exited.is_set()
-    result = await operations.cancel("owner", operation_id)
-    assert result["cancelled"]
-    assert (await task)["cancelled"]
-    assert exited.is_set()
-    assert not (managed / "demo").exists()
-    assert not list((managed / ".opensquilla-staging").glob("*"))
+    failure: BaseException | None = None
+    try:
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=3)
+        except TimeoutError as exc:
+            exc.add_note(
+                f"last_progress_requested={last_progress_requested}; "
+                f"install_waiter_done={task.done()}; scanner_exited={exited.is_set()}"
+            )
+            raise
+        status = operations.store.read("owner", operation_id)
+        assert status["state"] == "running"
+        assert status["phase"] == "scanning"
+        assert not exited.is_set()
+        result = await operations.cancel("owner", operation_id)
+        assert result["cancelled"]
+        assert (await task)["cancelled"]
+        assert exited.is_set()
+        assert not (managed / "demo").exists()
+        assert not list((managed / ".opensquilla-staging").glob("*"))
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        cleanup_errors: list[BaseException] = []
+        try:
+            assert await service.close(timeout=5), "install owners did not settle during cleanup"
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        try:
+            if not task.done():
+                task.cancel()
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            primary = failure if failure is not None else cleanup_errors.pop(0)
+            for cleanup_error in cleanup_errors:
+                primary.add_note(f"install cleanup failed: {cleanup_error!r}")
+            if failure is None:
+                raise primary
 
 
 @pytest.mark.asyncio

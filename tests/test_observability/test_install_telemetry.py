@@ -764,6 +764,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from opensquilla.observability import install_telemetry as telemetry
 
@@ -771,6 +772,23 @@ state_path = Path(sys.argv[1])
 ready_path = Path(sys.argv[2])
 go_path = Path(sys.argv[3])
 version = sys.argv[4]
+
+original_platform = telemetry.platform
+
+def blocked_system():
+    ready_path.with_suffix(".platform").write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 10
+    while not go_path.with_suffix(".platform").exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("platform barrier timed out")
+        time.sleep(0.01)
+    return original_platform.system()
+
+telemetry.platform = SimpleNamespace(
+    system=blocked_system,
+    release=original_platform.release,
+    machine=original_platform.machine,
+)
 
 def blocked_post(endpoint, payload, *, timeout):
     ready_path.write_text("ready", encoding="utf-8")
@@ -819,19 +837,28 @@ print(json.dumps({
         )
     ]
     outputs: list[tuple[str, str]] = []
-    try:
+
+    def wait_for_worker_barrier(paths: list[Path], phase: str) -> None:
         deadline = time.monotonic() + 10
-        while not all(path.exists() for path in ready_paths):
+        while not all(path.exists() for path in paths):
             for worker in workers:
                 if worker.poll() is not None:
                     stdout, stderr = worker.communicate()
                     raise AssertionError(
-                        "telemetry worker exited before the network barrier: "
+                        f"telemetry worker exited before the {phase} barrier: "
                         f"rc={worker.returncode}, stdout={stdout!r}, stderr={stderr!r}"
                     )
             if time.monotonic() >= deadline:
-                raise AssertionError("both workers must reach the network barrier")
+                raise AssertionError(f"both workers must reach the {phase} barrier")
             time.sleep(0.01)
+
+    try:
+        # Both metadata probes must start even while the other one is blocked.
+        # This catches cold platform work accidentally consuming the writer's
+        # one-second acquisition budget without relying on host probe speed.
+        wait_for_worker_barrier([path.with_suffix(".platform") for path in ready_paths], "platform")
+        go_path.with_suffix(".platform").write_text("go", encoding="utf-8")
+        wait_for_worker_barrier(ready_paths, "network")
         # Both workers reaching this barrier proves the process lock is not held
         # across the simulated network operation.
         go_path.write_text("go", encoding="utf-8")

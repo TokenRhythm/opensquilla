@@ -117,6 +117,11 @@ def collect_install_telemetry(
         # lock across network I/O. Daily usage telemetry shares this state file
         # for the anonymous install id and must remain free to read it.
         with _COLLECT_LOCK:
+            # Cold Windows platform queries can enter WMI. They do not depend on
+            # the selected state, so do not spend another writer's lock budget
+            # waiting for them. Keep payload assembly and privacy checks below
+            # with the selected state snapshot, before persisting any changes.
+            platform_details = _platform_details() if endpoint else None
             with _state_transaction(path):
                 state = _load_or_create_state(path)
                 event = _next_event(state, current_version)
@@ -143,6 +148,7 @@ def collect_install_telemetry(
                     event=event,
                     current_version=current_version,
                     sent_at=now,
+                    platform_details=platform_details,
                 )
                 skip_reason = _telemetry_skip_reason(config=config)
                 if skip_reason:
@@ -558,22 +564,32 @@ def _add_uploaded_version(state: dict[str, Any], current_version: str) -> None:
     state["uploaded_versions"] = versions
 
 
+def _platform_details() -> tuple[str, str, str]:
+    return (
+        _safe_str(platform.system()),
+        _safe_str(platform.release()),
+        _safe_str(platform.machine()),
+    )
+
+
 def _build_payload(
     state: dict[str, Any],
     *,
     event: str,
     current_version: str,
     sent_at: str,
+    platform_details: tuple[str, str, str] | None = None,
 ) -> dict[str, Any]:
+    system, release, machine = platform_details or _platform_details()
     return {
         "schema_version": TELEMETRY_SCHEMA_VERSION,
         "event": event,
         "install_id": state["install_id"],
         "opensquilla_version": current_version,
         "install_method": _detect_install_method(),
-        "os": _safe_str(platform.system()),
-        "os_version": _safe_str(platform.release()),
-        "architecture": _safe_str(platform.machine()),
+        "os": system,
+        "os_version": release,
+        "architecture": machine,
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
         "first_seen_at": state["first_seen_at"],
         "sent_at": sent_at,
