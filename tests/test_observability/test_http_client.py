@@ -418,6 +418,7 @@ def tls_context(tmp_path: Path):
     return cert_path, context
 
 
+@pytest.mark.ci_serial
 def test_custom_ca_and_hostname_validation_are_preserved(monkeypatch, servers, tls_context):
     cert_path, context = tls_context
     server = servers(context=context)
@@ -434,6 +435,7 @@ def test_custom_ca_and_hostname_validation_are_preserved(monkeypatch, servers, t
     assert len(server.hits) == 1
 
 
+@pytest.mark.ci_serial
 def test_idle_tls_connection_does_not_block_certificate_validation(
     monkeypatch, servers, tls_context, capsys
 ):
