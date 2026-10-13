@@ -46,6 +46,8 @@ _CHANNEL_DEFAULT_ALLOW: frozenset[str] = frozenset(
         "grep_search",
         "image",
         "image_generate",
+        "video_generate",
+        "video_status",
         "audio_provider_capabilities",
         "dubbing_download",
         "dubbing_generate",

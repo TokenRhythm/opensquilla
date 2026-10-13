@@ -2,8 +2,10 @@ import { rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import proxyTlsPatch from './prepare-global-agent-tls.cjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
+await proxyTlsPatch.prepareInstalledProxyTls()
 // TypeScript leaves removed source modules in its output directory on incremental builds.
 rmSync(join(root, 'dist'), { recursive: true, force: true })
 const result = spawnSync(process.execPath, [

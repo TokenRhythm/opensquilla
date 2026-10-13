@@ -159,8 +159,9 @@ PRODUCTION_HANDLER_NAMES = {
 def test_production_registry_uses_contract_wrappers_without_surface_drift() -> None:
     registry = get_dispatcher()
 
-    # The v2 connection recovery contracts add six methods to the 269-method surface.
-    assert len(registry.list_methods()) == 275
+    # The v2 recovery contracts and video discovery add seven methods to the 269-method surface.
+    assert len(registry.list_methods()) == 276
+    assert registry.get_entry("onboarding.videoGeneration.models.discover") is not None
     for method in (
         "transport.sessionFlow.update.v2",
         "sessions.read.open.v2",

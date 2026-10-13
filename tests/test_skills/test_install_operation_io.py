@@ -899,15 +899,18 @@ async def test_close_drains_direct_mutation_without_waiting_for_rpc_task(
 async def test_close_waits_for_cancel_method_not_its_rpc_task(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    operations = _service(tmp_path).install_operations
+    service = _service(tmp_path)
+    await service.prepare_install_operations()
+    operations = service.install_operations
     operation_id = str(uuid.uuid4())
-    entered, release = threading.Event(), threading.Event()
+    entered, release = asyncio.Event(), threading.Event()
     returned, rpc_release = asyncio.Event(), asyncio.Event()
     finish = operations.store.finish
+    loop = asyncio.get_running_loop()
 
     def blocked_finish(*args, **kwargs):
-        entered.set()
-        assert release.wait(5)
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(30)
         return finish(*args, **kwargs)
 
     monkeypatch.setattr(operations.store, "finish", blocked_finish)
@@ -920,15 +923,16 @@ async def test_close_waits_for_cancel_method_not_its_rpc_task(
 
     owner = asyncio.create_task(rpc())
     try:
-        async with asyncio.timeout(5):
-            while not entered.is_set():
-                await asyncio.sleep(.001)
-        closing = asyncio.create_task(operations.close(timeout=2))
-        await asyncio.sleep(.01)
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        # Exercise owner tracking independently of the receipt's disk latency.
+        # The bounded-close rejection is covered by the blocked claim test.
+        closing = asyncio.create_task(operations.close())
+        await asyncio.sleep(0)
+        assert operations._closing
         assert not closing.done()
     finally:
         release.set()
-    assert await closing
+    assert await asyncio.wait_for(closing, timeout=10)
     assert returned.is_set() and not owner.done()
     rpc_release.set()
     await owner
@@ -938,10 +942,14 @@ async def test_close_waits_for_cancel_method_not_its_rpc_task(
 async def test_close_tracks_waiter_fallback_after_task_cancelled_before_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    operations = _service(tmp_path).install_operations
+    service = _service(tmp_path)
+    await service.prepare_install_operations()
+    operations = service.install_operations
     operation_id = str(uuid.uuid4())
-    entered, second_finished, release = threading.Event(), threading.Event(), threading.Event()
+    entered, second_finished = asyncio.Event(), asyncio.Event()
+    release = threading.Event()
     finish = operations.store.finish
+    loop = asyncio.get_running_loop()
     create_task = asyncio.create_task
     count = 0
     count_lock = threading.Lock()
@@ -958,11 +966,11 @@ async def test_close_tracks_waiter_fallback_after_task_cancelled_before_start(
             count += 1
             first = count == 1
         if first:
-            entered.set()
-            assert release.wait(5)
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(30)
         result = finish(*args, **kwargs)
         if not first:
-            second_finished.set()
+            loop.call_soon_threadsafe(second_finished.set)
         return result
 
     monkeypatch.setattr(asyncio, "create_task", cancel_new_install)
@@ -973,16 +981,23 @@ async def test_close_tracks_waiter_fallback_after_task_cancelled_before_start(
 
     waiter = asyncio.create_task(operations.run("owner", operation_id, {}, forbidden))
     try:
-        async with asyncio.timeout(5):
-            while not entered.is_set():
-                await asyncio.sleep(.001)
-        closer = asyncio.create_task(operations.close(timeout=2))
-        async with asyncio.timeout(5):
-            while not second_finished.is_set():
-                await asyncio.sleep(.001)
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        closer = asyncio.create_task(operations.close())
+        await asyncio.wait_for(second_finished.wait(), timeout=10)
+        # The worker notification precedes its owning Task's completion. Drain
+        # close's replacement receipt before checking that the first fallback
+        # still keeps close pending through run's admission.
+        key = ("owner", operation_id)
+        settlement = operations.tasks.get(key)
+        if settlement is not None:
+            assert (await asyncio.wait_for(asyncio.shield(settlement), timeout=10))["cancelled"]
+        await asyncio.sleep(0)
+        assert key not in operations.tasks
+        assert operations._closing
+        assert not waiter.done()
         assert not closer.done()
     finally:
         release.set()
-    assert (await waiter)["cancelled"]
-    assert await closer
+    assert (await asyncio.wait_for(waiter, timeout=10))["cancelled"]
+    assert await asyncio.wait_for(closer, timeout=10)
     assert operations.store.read_existing("owner", operation_id)["state"] == "cancelled"

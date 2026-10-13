@@ -44,6 +44,7 @@ STATUS_TOP_LEVEL_KEYS = frozenset(
         # Additive binding/effective-state contract. Legacy flat fields above
         # remain frozen for older clients.
         "imageGenerationState",
+        "videoGenerationState",
         "audioConfigured",
         "audioEnabled",
         "audioSource",
@@ -200,6 +201,27 @@ IMAGE_GENERATION_RECOMMENDATION_KEYS = frozenset(
 IMAGE_GENERATION_CREDENTIAL_OPTION_KEYS = frozenset(
     {"providerId", "available", "source", "owner", "kind", "envKey", "reason"}
 )
+VIDEO_GENERATION_STATE_KEYS = frozenset(
+    {"enabled", "providerId", "primary", "credentialOptions"}
+)
+VIDEO_GENERATION_CREDENTIAL_OPTION_KEYS = frozenset(
+    {
+        "providerId",
+        "available",
+        "source",
+        "owner",
+        "envKey",
+        "clearable",
+        # Additive, secret-free connection provenance for shared credentials.
+        # Older gateways omit these fields; clients retain compatibility defaults.
+        "baseUrl",
+        "baseUrlSource",
+        "baseUrlAuthored",
+        "apiKeyEnvAuthored",
+        "sharedBaseUrl",
+        "sharedCredentialAvailable",
+    }
+)
 
 
 def _synthetic_config(tmp_path, **overrides) -> GatewayConfig:
@@ -226,6 +248,41 @@ async def test_onboarding_status_top_level_keys_are_frozen(tmp_path) -> None:
         set(option) == IMAGE_GENERATION_CREDENTIAL_OPTION_KEYS
         for option in image_state["credentialOptions"]
     )
+    video_state = payload["videoGenerationState"]
+    assert set(video_state) == VIDEO_GENERATION_STATE_KEYS
+    assert video_state["credentialOptions"]
+    assert all(
+        set(option) == VIDEO_GENERATION_CREDENTIAL_OPTION_KEYS
+        for option in video_state["credentialOptions"]
+    )
+
+
+async def test_video_status_reports_reusable_image_key_without_revealing_it(tmp_path) -> None:
+    secret = "synthetic-status-image-key"
+    cfg = _synthetic_config(
+        tmp_path,
+        image_generation={
+            "enabled": True,
+            "primary": "tokenrhythm/qwen-image-2.0",
+            "providers": {"tokenrhythm": {"api_key": secret}},
+        },
+        video_generation={
+            "enabled": True,
+            "provider": "tokenrhythm",
+            "primary": "wan3.0-video",
+        },
+    )
+
+    payload = _status_payload(RpcContext(conn_id="contract", config=cfg))
+    options = payload["videoGenerationState"]["credentialOptions"]
+    tokenrhythm = next(
+        option for option in options if option["providerId"] == "tokenrhythm"
+    )
+
+    assert tokenrhythm["available"] is True
+    assert tokenrhythm["source"] == "image_direct"
+    assert tokenrhythm["owner"] == "image"
+    assert secret not in repr(payload)
 
 
 async def test_llm_profile_status_reflects_exhausted_global_credential_pool(

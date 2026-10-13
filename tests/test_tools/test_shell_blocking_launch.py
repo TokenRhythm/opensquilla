@@ -459,7 +459,9 @@ def test_cancelled_windows_sync_launch_closes_job_before_failing_row_delete(monk
         events.append("delete-failed")
         raise OSError("synthetic database failure")
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(
+        process_tree, "os", SimpleNamespace(**{**vars(process_tree.os), "name": "nt"}),
+    )
     monkeypatch.setattr(process_tree._WindowsLaunchGate, "create", lambda: gate)
     monkeypatch.setattr(process_tree._WindowsJob, "create", lambda *_args: job)
     monkeypatch.setattr(process_tree, "_current_task_process_scope", lambda: object())
