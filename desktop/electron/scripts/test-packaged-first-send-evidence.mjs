@@ -200,7 +200,6 @@ if (process.argv.includes('--fixture-json')) {
     const privateContent = { get textContent() { assert.fail('message content was read') },
       get value() { assert.fail('input value was read') } }
     const elements = {
-      '.conn-pill.connected': {},
       '.chat-send-btn.btn--primary': { disabled: true, getAttribute: () => 'true' },
       '.chat-textarea': Object.assign(Object.create(privateContent), { disabled: true }),
       '.chat-session-recovery-status': { getAttribute: () => state,
@@ -215,7 +214,7 @@ if (process.argv.includes('--fixture-json')) {
         href: 'https://example.invalid/chat?session=synthetic-private-session' }, URL },
     )))
     assert.deepEqual(capture(), {
-      pathname: '/chat', sessionMaterialized: true, connected: true,
+      pathname: '/chat', sessionMaterialized: true, connected: null,
       sendButtonDisabled: true, sendButtonAriaBusy: true, textareaDisabled: true,
       recoveryNoticePresent: true, recoveryState: 'live-connecting',
       assistantMessages: 1, assistantAnswers: 0, errorBoundaries: 0, sessionErrors: [],
@@ -227,6 +226,7 @@ if (process.argv.includes('--fixture-json')) {
     assert.doesNotMatch(JSON.stringify(capture()), /synthetic-private/)
     for (const key of Object.keys(elements)) delete elements[key]
     const missing = capture()
+    assert.equal(missing.connected, null)
     assert.equal(missing.recoveryNoticePresent, false)
     assert.equal(missing.sendButtonAriaBusy, null)
     assert.equal(missing.textareaDisabled, null)

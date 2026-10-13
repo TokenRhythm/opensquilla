@@ -402,12 +402,24 @@ try {
   // visible can interrupt that promise and strand startup before inspection.
   // Prove the initial document and Gateway are settled before installing the
   // page-level WebSocket probe.
-  reportPhase('gateway-connection-start')
-  await page.locator('.conn-pill.connected').waitFor({
-    state: 'visible',
-    timeout: INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS,
-  })
-  reportPhase('gateway-connected')
+  reportPhase('gateway-readiness-start')
+  await waitFor(
+    () => page.evaluate(async () => {
+      const desktop = window.opensquillaDesktop
+      if (!desktop) return false
+      const [gateway, connection] = await Promise.all([
+        desktop.getGatewayStatus(),
+        desktop.getGatewayConnection(),
+      ])
+      return gateway.owned === true && gateway.status === 'ready' && connection.status === 'ready'
+    }),
+    'owned packaged Gateway and connection descriptor readiness',
+    INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS,
+  )
+  await page.locator('.chat-textarea').waitFor({ state: 'visible', timeout: SEND_TIMEOUT_MS })
+  // IPC readiness does not prove a WebSocket handshake. The send-enabled,
+  // actual chat.send and provider/answer assertions below prove that path.
+  reportPhase('gateway-ready')
   // Observe the renderer's own WebSocket without proxying it. Playwright's
   // routeWebSocket transparent proxy changes the ASGI accept sequence in a
   // packaged Electron app. Register the probe for later full-document route
@@ -436,12 +448,6 @@ try {
 
     const composer = page.locator('.chat-textarea')
     const header = page.locator('#app-route-header [data-testid="chat-header-actions"]')
-    await page.locator('.conn-pill.connected').waitFor({
-      state: 'visible',
-      // Initial cold start completed before probe installation. Keep the strict
-      // interaction budget used by the rest of this gate.
-      timeout: SEND_TIMEOUT_MS,
-    })
     await composer.waitFor({ state: 'visible', timeout: SEND_TIMEOUT_MS })
     // The packaged app can expose its initial draft URL before Vue has mounted
     // the permanent route header. Establish the landing-route baseline before
