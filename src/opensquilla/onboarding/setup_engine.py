@@ -35,9 +35,15 @@ from opensquilla.onboarding.provider_specs import provider_catalog_payload
 from opensquilla.onboarding.router_specs import router_catalog_payload
 from opensquilla.onboarding.search_specs import search_provider_catalog_payload
 from opensquilla.onboarding.status import OnboardingStatus, get_onboarding_status
+from opensquilla.provider.video_generation_catalog import (
+    video_generation_provider_catalog_payload,
+)
 
 IMAGE_GENERATION_SECTION_ALIASES = frozenset(
     {"image", "image-generation", "image_generation"}
+)
+VIDEO_GENERATION_SECTION_ALIASES = frozenset(
+    {"video", "video-generation", "video_generation"}
 )
 MEMORY_EMBEDDING_SECTION_ALIASES = frozenset(
     {"memory", "memory-embedding", "memory_embedding"}
@@ -53,6 +59,7 @@ _CATALOG_SECTION_ALIASES = {
     "channels": "channels",
     "channel": "channels",
     **{alias: "imageGenerationProviders" for alias in IMAGE_GENERATION_SECTION_ALIASES},
+    **{alias: "videoGenerationProviders" for alias in VIDEO_GENERATION_SECTION_ALIASES},
     **{alias: "audioProviders" for alias in AUDIO_SECTION_ALIASES},
     **{alias: "memoryEmbeddingProviders" for alias in MEMORY_EMBEDDING_SECTION_ALIASES},
 }
@@ -65,6 +72,7 @@ def setup_catalog_payload(section: str | None = None) -> dict[str, Any]:
         "searchProviders": search_provider_catalog_payload(),
         "channels": channel_catalog_payload(),
         "imageGenerationProviders": image_generation_provider_catalog_payload(),
+        "videoGenerationProviders": video_generation_provider_catalog_payload(),
         "audioProviders": audio_provider_catalog_payload(),
         "memoryEmbeddingProviders": memory_embedding_provider_catalog_payload(),
     }

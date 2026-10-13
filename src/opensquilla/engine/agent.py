@@ -11876,6 +11876,11 @@ class Agent:
                                     if not settled else
                                     " The local call ended; this does not confirm remote effects."
                                 )
+                                if tc.tool_name == "video_generate":
+                                    settlement_note += (
+                                        " The video submission may have been accepted. "
+                                        "Do not submit the same generation again automatically."
+                                    )
                                 if (
                                     cancellation_policy == "must_settle"
                                     and self._tool_effect_observation()
@@ -11943,7 +11948,15 @@ class Agent:
                             res = ToolResult(
                                 tool_use_id=tc.tool_use_id,
                                 tool_name=tc.tool_name,
-                                content=f"Tool '{tc.tool_name}' timed out after {tool_timeout}s",
+                                content=(
+                                    f"Tool '{tc.tool_name}' timed out after {tool_timeout}s"
+                                    + (
+                                        ". The video submission may have been accepted. "
+                                        "Do not submit the same generation again automatically."
+                                        if tc.tool_name == "video_generate"
+                                        else ""
+                                    )
+                                ),
                                 is_error=True,
                                 execution_status=runtime_execution_status(
                                     "timeout",

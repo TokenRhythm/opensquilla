@@ -2276,6 +2276,7 @@ dependencies = [
     { name = "lark-oapi" },
     { name = "lxml-html-clean" },
     { name = "mcp" },
+    { name = "multidict" },
     { name = "openpyxl" },
     { name = "pdfplumber" },
     { name = "pillow" },
@@ -2344,6 +2345,7 @@ pty = [
     { name = "pywinpty", marker = "sys_platform == 'win32' or (extra == 'group-11-opensquilla-dev' and extra == 'group-11-opensquilla-legacy-contract-codegen')" },
 ]
 recommended = [
+    { name = "fsspec" },
     { name = "jieba" },
     { name = "joblib" },
     { name = "lightgbm" },
@@ -2390,6 +2392,7 @@ requires-dist = [
     { name = "discord-py", specifier = ">=2.7.1,<3" },
     { name = "duckduckgo-search", specifier = ">=8.1.1" },
     { name = "extract-msg", marker = "extra == 'msg'", specifier = ">=0.56.1" },
+    { name = "fsspec", marker = "extra == 'recommended'", specifier = ">=2026.6.0" },
     { name = "h2", marker = "extra == 'matrix'", specifier = ">=4.4.1" },
     { name = "h2", marker = "extra == 'matrix-e2e'", specifier = ">=4.4.1" },
     { name = "html2text", specifier = ">=2024.2" },
@@ -2407,6 +2410,7 @@ requires-dist = [
     { name = "matrix-nio", marker = "extra == 'matrix'", specifier = ">=0.25,<0.26" },
     { name = "matrix-nio", extras = ["e2e"], marker = "extra == 'matrix-e2e'", specifier = ">=0.25,<0.26" },
     { name = "mcp", specifier = ">=2.2.0,<3" },
+    { name = "multidict", specifier = ">=6.9.1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=2.3.1" },
     { name = "numpy", marker = "extra == 'recommended'", specifier = ">=2.5.3" },
     { name = "onnxruntime", marker = "extra == 'recommended'", specifier = ">=1.30.0" },
