@@ -616,6 +616,53 @@ describe('SidebarConversations project workspaces', () => {
     expect(host.querySelector('[data-session-key="agent:main:webchat:task-a"]')).toBeNull()
   })
 
+  it('toggles compatibility projects when header and task identities are mixed during catalog hydration', async () => {
+    const workspace = 'D:\\repos\\project-a'
+    const { host, events } = await mountSidebar([
+      projectRow({ workspaceId: undefined, key: `workspace:${workspace}`, workspace }),
+      // During catalog hydration the compatibility header can lack an id even
+      // while session rows from the gateway already carry one.
+      taskRow({ workspaceId: 'project-a', workspace }),
+    ])
+    const disclosure = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-disclosure"]')
+    const task = () => host.querySelector('[data-session-key="agent:main:webchat:task-a"]')
+
+    expect(disclosure?.getAttribute('aria-expanded')).toBe('true')
+    expect(task()).not.toBeNull()
+
+    disclosure?.click()
+    await nextTick()
+    expect(disclosure?.getAttribute('aria-expanded')).toBe('false')
+    expect(task()).toBeNull()
+
+    disclosure?.click()
+    await nextTick()
+    expect(disclosure?.getAttribute('aria-expanded')).toBe('true')
+    expect(task()).not.toBeNull()
+    expect(events.select).not.toHaveBeenCalled()
+  })
+
+  it('toggles a fully path-only compatibility project', async () => {
+    const workspace = 'D:\\repos\\project-a'
+    const { host, events } = await mountSidebar([
+      projectRow({ workspaceId: undefined, key: `workspace:${workspace}`, workspace }),
+      taskRow({ workspaceId: undefined, workspace }),
+    ])
+    const disclosure = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-disclosure"]')
+    const task = () => host.querySelector('[data-session-key="agent:main:webchat:task-a"]')
+
+    disclosure?.click()
+    await nextTick()
+    expect(disclosure?.getAttribute('aria-expanded')).toBe('false')
+    expect(task()).toBeNull()
+
+    disclosure?.click()
+    await nextTick()
+    expect(disclosure?.getAttribute('aria-expanded')).toBe('true')
+    expect(task()).not.toBeNull()
+    expect(events.select).not.toHaveBeenCalled()
+  })
+
   it('creates a project task and expands its project from the persistent plus action', async () => {
     const { host, events } = await mountSidebar([projectRow(), taskRow()])
     const plus = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')

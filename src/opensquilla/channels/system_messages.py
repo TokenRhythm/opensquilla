@@ -58,10 +58,6 @@ ChannelSystemMessageKey = Literal[
     "command_compact_failed",
     "command_compact_completed",
     "command_compact_skipped",
-    "command_meta_denied",
-    "command_meta_failed",
-    "command_meta_empty",
-    "command_meta_heading",
     "command_missing_scope",
     "command_new_denied",
     "command_new_unavailable",
@@ -157,10 +153,6 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "command_compact_failed": "Compact failed: {reason}",
         "command_compact_completed": "Context compacted.",
         "command_compact_skipped": "Already within context budget; no compact was applied.",
-        "command_meta_denied": "/meta denied: {reason}",
-        "command_meta_failed": "/meta failed: {reason}",
-        "command_meta_empty": "No meta-skills available.",
-        "command_meta_heading": "Available meta-skills:",
         "command_missing_scope": ": missing {missing}",
         "command_new_denied": "/new denied: Insufficient scope for method: {method}{detail}",
         "command_new_unavailable": "/new failed: command unavailable",
@@ -245,10 +237,6 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "command_compact_failed": "压缩失败：{reason}",
         "command_compact_completed": "上下文已压缩。",
         "command_compact_skipped": "上下文仍在预算范围内，未执行压缩。",
-        "command_meta_denied": "/meta 被拒绝：{reason}",
-        "command_meta_failed": "/meta 失败：{reason}",
-        "command_meta_empty": "没有可用的元技能。",
-        "command_meta_heading": "可用的元技能：",
         "command_missing_scope": "：缺少 {missing}",
         "command_new_denied": "/new 被拒绝：方法权限不足：{method}{detail}",
         "command_new_unavailable": "/new 失败：命令不可用",
@@ -342,10 +330,6 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "command_compact_failed": "コンテキスト圧縮に失敗しました: {reason}",
         "command_compact_completed": "コンテキストを圧縮しました。",
         "command_compact_skipped": "コンテキストは予算内のため、圧縮しませんでした。",
-        "command_meta_denied": "/meta は拒否されました: {reason}",
-        "command_meta_failed": "/meta は失敗しました: {reason}",
-        "command_meta_empty": "利用可能なメタスキルはありません。",
-        "command_meta_heading": "利用可能なメタスキル:",
         "command_missing_scope": ": 不足している権限 {missing}",
         "command_new_denied": (
             "/new は拒否されました: メソッドの権限が不足しています: {method}{detail}"
@@ -445,10 +429,6 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "command_compact_skipped": (
             "Le contexte est déjà dans le budget ; aucun compactage appliqué."
         ),
-        "command_meta_denied": "/meta refusé : {reason}",
-        "command_meta_failed": "/meta a échoué : {reason}",
-        "command_meta_empty": "Aucune méta-compétence disponible.",
-        "command_meta_heading": "Méta-compétences disponibles :",
         "command_missing_scope": " : autorisation manquante {missing}",
         "command_new_denied": (
             "/new refusé : autorisation insuffisante pour la méthode : {method}{detail}"
@@ -552,10 +532,6 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "command_compact_skipped": (
             "Der Kontext liegt bereits im Budget; keine Komprimierung wurde angewendet."
         ),
-        "command_meta_denied": "/meta abgelehnt: {reason}",
-        "command_meta_failed": "/meta fehlgeschlagen: {reason}",
-        "command_meta_empty": "Keine Meta-Skills verfügbar.",
-        "command_meta_heading": "Verfügbare Meta-Skills:",
         "command_missing_scope": ": fehlende Berechtigung {missing}",
         "command_new_denied": "/new abgelehnt: Unzureichender Umfang für Methode: {method}{detail}",
         "command_new_unavailable": "/new fehlgeschlagen: Befehl nicht verfügbar",
@@ -652,10 +628,6 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "command_compact_skipped": (
             "El contexto ya está dentro del presupuesto; no se aplicó compactación."
         ),
-        "command_meta_denied": "/meta denegado: {reason}",
-        "command_meta_failed": "/meta falló: {reason}",
-        "command_meta_empty": "No hay meta-habilidades disponibles.",
-        "command_meta_heading": "Meta-habilidades disponibles:",
         "command_missing_scope": ": falta el permiso {missing}",
         "command_new_denied": (
             "/new denegado: alcance insuficiente para el método: {method}{detail}"

@@ -9,6 +9,22 @@ workflow downloads release assets from GitHub, verifies `SHA256SUMS`, then
 uploads version-scoped assets, moving installer aliases, and strict JSON
 channel manifests used by update clients.
 
+## Repository transfer boundary
+
+New releases are sourced from the canonical GitHub repository
+`TokenRhythm/opensquilla`. The organization transfer does not rename the OSS
+bucket, object prefix, versioned release paths, or moving aliases: the mirror
+continues to use `ALIYUN_OSS_BUCKET`, the `releases` prefix, and the existing
+`latest/` and `channels/` objects. The workflow fails closed when it runs from
+another GitHub repository, so a release from the pre-transfer repository cannot
+silently populate the mirror.
+
+The channel manifest intentionally keeps the legacy v1 `releaseUrl` spelling
+(`github.com/opensquilla/opensquilla`) for already-shipped clients while new
+GitHub API and download operations use `TokenRhythm/opensquilla`. Do not rewrite
+existing OSS object keys or moving aliases solely because the GitHub owner
+changed.
+
 ## Repository configuration
 
 Configure these GitHub repository secrets:
@@ -36,14 +52,23 @@ the bucket state, lists aliases, copies existing aliases to a short-lived
 backup, uploads versioned assets, aliases, and channel manifests, and removes
 backups and legacy `latest.html`. Do not use a full-access account key.
 
-Keep OSS bucket versioning disabled for this mirror. Before uploading, the
-workflow queries the versioning state through the standard regional OSS
-endpoint and fails closed unless the bucket is unversioned. Version-scoped
-uploads then use the OSS `x-oss-forbid-overwrite` condition so a concurrent
-writer cannot replace an object between the workflow's existence check and
-upload; OSS ignores that condition when bucket versioning is enabled or
-suspended. Moving `latest/` and `channels/` objects retain their explicit
-backup-and-rollback behavior.
+The workflow records the bucket's versioning state without changing it. It
+checks existing version-scoped objects byte-for-byte and refuses changed
+contents. The OSS `x-oss-forbid-overwrite` condition also protects writes on
+unversioned buckets; OSS ignores that condition when versioning is enabled or
+suspended. Release jobs share a concurrency group, and other writers must not
+modify version-scoped release objects. Moving `latest/` and `channels/` objects
+retain their explicit backup-and-rollback behavior.
+
+Large assets use parallel multipart uploads to an attempt-specific temporary
+prefix. The workflow downloads and verifies the staged bytes, rechecks whether
+the final object already exists, and uses a conditional server-side copy to
+commit the versioned object. It verifies that object again before advancing
+channels. Small parts avoid restarting an entire installer transfer on an
+unreliable upload link. Completed staging versions and incomplete multipart
+uploads are cleaned only within the current attempt's temporary prefix. Moving
+installer aliases are copied from the verified versioned objects inside OSS,
+without a second upload of the installer bytes.
 
 ## Destination layout
 

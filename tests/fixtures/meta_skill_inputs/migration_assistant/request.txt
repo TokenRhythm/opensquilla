@@ -1,7 +1,0 @@
-Use meta-migration-assistant to produce a CommonJS to native ESM migration
-checklist for this fixture package:
-tests/fixtures/meta_skill_inputs/migration_assistant/cjs-to-esm-package
-
-Focus on package.json type/exports, extension changes, require/module.exports
-replacement, test-runner impact, and consumer compatibility. Return Markdown
-only.

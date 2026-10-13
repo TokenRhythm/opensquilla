@@ -141,7 +141,7 @@ def _publish_note(ctx: ToolContext, *, already_published: bool = False) -> str:
             "Do not call publish_artifact again for this unchanged file. Follow the "
             "Active Goal instructions: re-evaluate the entire objective and continue "
             "any remaining work with the ordinary tools available for this turn. "
-            "update_goal_progress remains optional; use it only when a concise current-state "
+            "update_plan remains optional; use it only when a concise current-state "
             "view helps, and replace that view when reality changes rather than treating it "
             "as fixed phases or turn boundaries. Call "
             "update_goal only when the entire objective is complete or genuinely blocked. "

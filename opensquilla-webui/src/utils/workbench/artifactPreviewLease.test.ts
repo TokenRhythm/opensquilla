@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { ArtifactPreviewLeaseError } from '@/modules/artifactWorkbench'
 import {
+  createPrivateHttpTransport,
   HttpTransportError,
 } from '@/adapters/gateway/privateHttpTransport'
 import {
@@ -44,6 +45,68 @@ const lease = {
 }
 
 describe('artifact preview lease client', () => {
+  it.each(['stream', 'json'] as const)('distinguishes a Web response %s failure after HTTP 200', async kind => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response(kind === 'stream'
+      ? new ReadableStream({ start(controller) { controller.error(new TypeError('Connection lost')) } })
+      : 'invalid JSON', { status: 200, headers: { 'content-type': 'application/json' } }))
+    const http = createPrivateHttpTransport({ baseUrl: 'https://control.example', fetch })
+    await expect(renewArtifactPreviewLease(http, 'lease-1', {
+      baseOrigin: 'https://control.example', sessionKey: 'session-a',
+    })).rejects.toMatchObject({ name: 'ArtifactPreviewLeaseError', retryable: kind === 'stream' })
+  })
+
+  it('turns a stalled Web renewal into a retryable timeout', async () => {
+    vi.useFakeTimers()
+    const fetch = vi.fn<typeof globalThis.fetch>((_url, request) => new Promise((_resolve, reject) => {
+      request!.signal!.addEventListener('abort', () => {
+        reject(new DOMException('Aborted', 'AbortError'))
+      }, { once: true })
+    }))
+    const http = createPrivateHttpTransport({ baseUrl: 'https://control.example', fetch })
+    try {
+      const failure = expect(renewArtifactPreviewLease(http, 'lease-1', {
+        baseOrigin: 'https://control.example', sessionKey: 'session-a',
+      })).rejects.toMatchObject({ name: 'ArtifactPreviewLeaseError', retryable: true })
+      await vi.advanceTimersByTimeAsync(15_000)
+      await failure
+      expect(fetch).toHaveBeenCalledOnce()
+      expect(vi.getTimerCount()).toBe(0)
+    } finally { vi.useRealTimers() }
+  })
+
+  it.each([
+    { kind: 'network' as const, status: undefined, retryable: true },
+    { kind: 'timeout' as const, status: undefined, retryable: true },
+    { kind: 'http-status' as const, status: 429, retryable: true },
+    { kind: 'http-status' as const, status: 503, retryable: true },
+    { kind: 'http-status' as const, status: 401, retryable: false },
+    { kind: 'invalid-endpoint' as const, status: undefined, retryable: false },
+    { kind: 'aborted' as const, status: undefined, retryable: false },
+    { kind: 'decode' as const, status: 502, retryable: false },
+  ])('preserves retry eligibility for Web $kind/$status', async ({ kind, status, retryable }) => {
+    const http = httpTransport({ requestJson: vi.fn(async () => {
+      throw new HttpTransportError(kind, 'Synthetic failure', status)
+    }) })
+    await expect(renewArtifactPreviewLease(http, 'lease-1', {
+      baseOrigin: 'https://control.example', sessionKey: 'session-a',
+    })).rejects.toMatchObject({ name: 'ArtifactPreviewLeaseError', retryable })
+  })
+
+  it.each([
+    { status: 429, code: 'RATE_LIMITED', retryable: true },
+    { status: 503, code: 'PREVIEW_BROKER_UNAVAILABLE', retryable: true },
+    { status: 502, code: 'INVALID_RESPONSE', retryable: false },
+    { status: 403, code: 'FORBIDDEN', retryable: false },
+    { status: 0, code: 'DESKTOP_PREVIEW_BROKER_UNAVAILABLE', retryable: false },
+  ])('preserves retry eligibility for Desktop $code', async ({ status, code, retryable }) => {
+    await expect(renewArtifactPreviewLease(httpTransport(), 'lease-1', {
+      baseOrigin: 'http://127.0.0.1:18791', sessionKey: 'session-a',
+      nativeBroker: { renewArtifactPreviewLease: vi.fn(async () => ({
+        ok: false as const, status, code, message: 'Synthetic failure',
+      })) },
+    })).rejects.toMatchObject({ name: 'ArtifactPreviewLeaseError', retryable })
+  })
+
   it.each(['desktop', 'web'] as const)('requests the selected page through %s transport', async client => {
     const selected = { ...lease, page_path: 'pages/北京 页面.html',
       launch_url: 'http://p-token.localhost:43123/pages/%E5%8C%97%E4%BA%AC%20%E9%A1%B5%E9%9D%A2.html' }
@@ -192,7 +255,7 @@ describe('artifact preview lease client', () => {
     expect(requestJson).toHaveBeenCalledWith(expect.any(String), {
       method: 'POST',
       sessionKey: 'session-a',
-      timeoutMs: 0,
+      timeoutMs: 15_000,
     })
     expect(requestBlob).toHaveBeenCalledWith(expect.any(String), {
       keepalive: true,

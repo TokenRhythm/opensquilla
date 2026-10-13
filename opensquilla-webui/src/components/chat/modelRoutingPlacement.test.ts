@@ -27,7 +27,7 @@ function expectContained(result: ModelRoutingPlacement, view: ModelRoutingViewpo
   expect(result.submenuLeft + submenuWidth).toBeLessThanOrEqual(right)
   expect(result.submenuTop).toBeGreaterThanOrEqual(top)
   expect(result.submenuHeight).toBeGreaterThanOrEqual(0)
-  expect(result.submenuHeight).toBeLessThanOrEqual(360)
+  expect(result.submenuHeight).toBeLessThanOrEqual(520)
   expect(result.submenuTop + result.submenuHeight).toBeLessThanOrEqual(result.primaryBottom)
   if (result.compact) {
     expect(result.submenuLeft).toBe(result.primaryLeft)
@@ -49,8 +49,8 @@ describe('native model routing placement', () => {
       width: 224,
       compact: false,
       submenuLeft: 648,
-      submenuTop: 412,
-      submenuHeight: 360,
+      submenuTop: 252,
+      submenuHeight: 520,
       submenuSide: 'right',
     })
   })

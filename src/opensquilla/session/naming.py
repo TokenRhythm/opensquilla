@@ -11,15 +11,15 @@ A tier model is only eligible when the tier targets the active provider —
 matched on the configured provider id, with the wire kind accepted as an alias
 — or names no provider at all: tier model ids are spelled per provider catalog
 and are not portable across connections. Connection credentials (api_key /
-base_url) come from the same provider the compaction path resolves, so an
-OpenRouter-backed gateway stays self-consistent.
+base_url) come from the selected provider clone, so an OpenRouter-backed gateway
+stays self-consistent. Naming overrides are independent of summary deployment.
 
 The title is written to ``derived_title`` (not ``display_name``) so it sits below
 a user's manual rename in the precedence (see ``session_view._title``) and can
 never override a name the user set by hand. On any failure the call is a no-op and
 the existing truncation fallback (``derive_transcript_title``) remains in effect.
 
-Transport follows the compaction summarizer's two-path structure:
+Transport retains the production provider adapter and its legacy helper:
 
 - :func:`call_naming_provider` (production) streams one turn through the active
   provider adapter (``provider.chat``), so naming inherits the adapter's wire
@@ -814,11 +814,11 @@ async def generate_session_title(
             return
 
         # Local imports keep the optional background path out of startup imports.
-        from opensquilla.gateway.compaction_target import (
-            effective_session_model,
-            resolve_selected_compaction_provider,
-        )
         from opensquilla.gateway.model_routing import model_routing_snapshot
+        from opensquilla.gateway.selected_provider import (
+            effective_session_model,
+            resolve_selected_provider,
+        )
         from opensquilla.gateway.session_event_publisher import emit_session_event
         from opensquilla.gateway.session_events import build_sessions_changed_payload
         from opensquilla.gateway.session_services import get_session_storage
@@ -830,7 +830,7 @@ async def generate_session_title(
         if session is None or not title_slot_is_empty(session):
             return
 
-        provider = resolve_selected_compaction_provider(ctx, session)
+        provider = resolve_selected_provider(ctx, session)
         if provider is None:
             return
         target = resolve_naming_target(
@@ -847,7 +847,7 @@ async def generate_session_title(
         if provider_connection_config(provider).model != target.model:
             # Rebuild only a clone so explicit naming targets reach the physical
             # adapter without changing the session's chat deployment.
-            provider = resolve_selected_compaction_provider(
+            provider = resolve_selected_provider(
                 ctx, session, model_override=target.model,
             )
             if provider is None or provider_connection_config(provider).model != target.model:

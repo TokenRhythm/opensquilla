@@ -611,7 +611,9 @@ def _post_payload(
     try:
         import httpx
 
-        with httpx.Client(timeout=timeout) as client:
+        from opensquilla.observability.http_client import observability_httpx_kwargs
+
+        with httpx.Client(timeout=timeout, **observability_httpx_kwargs()) as client:
             response = client.post(endpoint, json=payload)
         if response.status_code in _SUCCESS_STATUS_CODES:
             return True, None

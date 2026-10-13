@@ -212,6 +212,36 @@ class GatewayArtifactContentPort(ArtifactContentPort):
         session_id = await self._session_id(query.session_key)
         if session_id is None:
             raise ContentNotFoundError("attachment not found")
+        if query.message_id is not None:
+            from opensquilla.content_reader import (
+                ContentMetadataPendingError,
+                ContentRangeError,
+            )
+            from opensquilla.content_reader import (
+                ContentNotFoundError as StorageContentNotFoundError,
+            )
+
+            storage = get_session_storage(self._session_manager)
+            if storage is None:
+                raise ContentNotFoundError("attachment source unavailable")
+            try:
+                ref = await storage.get_legacy_content_ref(
+                    session_id, query.message_id, source=query.source, actual_byte_length=True
+                )
+                if ref.revision != query.revision:
+                    raise ContentNotFoundError("attachment source changed")
+                attachment = await storage.read_inline_attachment(ref, query.attachment_index)
+            except (StorageContentNotFoundError, ContentMetadataPendingError) as exc:
+                raise ContentNotFoundError("attachment source unavailable") from exc
+            except ContentRangeError as exc:
+                raise ContentIntegrityError("attachment data is invalid") from exc
+            if attachment["sha256_ref"] != query.sha256:
+                raise ContentIntegrityError("attachment integrity check failed")
+            # Recheck the owning session after the asynchronous read, so a
+            # concurrent reset cannot publish bytes under its replacement.
+            if await self._session_id(query.session_key) != session_id:
+                raise ContentNotFoundError("attachment session changed")
+            return ContentMaterial(None, attachment["mime"], attachment["name"], attachment["data"])
         try:
             path = transcript_material_path(
                 media_root_from_config(self._config), session_id, query.sha256

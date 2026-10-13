@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import runpy
 import subprocess
 from pathlib import Path
@@ -56,8 +57,12 @@ def test_native_acceptance_tracks_dependency_and_probe_changes_without_running_f
     assert "windows-nsis-regression" not in docs["required_suites"]
 
 
-def test_native_acceptance_evidence_covers_the_actual_complete_reusable_matrix(
-    tmp_path: Path, suite_config: dict[str, Any],
+@pytest.mark.parametrize(("profile", "paths", "count"), [
+    ("smoke", ("uv.lock", "opensquilla-webui/package-lock.json"), 4),
+    ("full", ("desktop/electron/package-lock.json", ".ci/run-all"), 14),
+])
+def test_native_acceptance_evidence_covers_the_actual_reusable_matrix(
+    tmp_path: Path, suite_config: dict[str, Any], profile: str, paths: tuple[str, ...], count: int,
 ) -> None:
     import itertools
 
@@ -67,23 +72,80 @@ def test_native_acceptance_evidence_covers_the_actual_complete_reusable_matrix(
         encoding="utf-8",
     ))["jobs"]
     matrix = jobs["upgrade-and-start"]["strategy"]["matrix"]
+
+    def axis(name: str) -> list[str]:
+        expression = re.fullmatch(
+            r"\$\{\{ fromJSON\(inputs.acceptance_profile == 'smoke' && '(.*)' \|\| '(.*)'\) \}\}",
+            matrix[name],
+        )
+        assert expression is not None
+        return json.loads(expression[1 if profile == "smoke" else 2])
+
     cases = {
         f"{baseline}-{install_path}-{scenario}"
         for baseline, install_path, scenario in itertools.product(
-            matrix["baseline"], matrix["install-path"], matrix["scenario"],
+            axis("baseline"), matrix["install-path"], axis("scenario"),
         )
     } | {f"{item['baseline']}-{item['install-path']}-{item['scenario']}"
          for item in matrix["include"]}
-    assert len(cases) == 14
+    assert len(cases) == count
     assert {"fresh-default-fresh", "fresh-custom-fresh"} <= cases
     expected = {(jobs["build"]["runs-on"], "build")}
     expected.update((jobs["wheelhouse-security"]["runs-on"], f"wheelhouse-{profile}")
                     for profile in jobs["wheelhouse-security"]["strategy"]["matrix"]["profile"])
     expected.update((jobs["upgrade-and-start"]["runs-on"], case) for case in cases)
-    assert len(expected) == 17
-    for path in ("uv.lock", ".ci/run-all"):
+    probes = yaml.safe_load(Path(".github/workflows/windows-candidate-probes.yml").read_text(
+        encoding="utf-8",
+    ))["jobs"]["candidate-probe"]
+    expected.update((probes["runs-on"], f"candidate-{probe}")
+                    for probe in probes["strategy"]["matrix"]["probe"])
+    assert len(expected) == count + 7
+    for path in paths:
         plan = _plan(tmp_path, suite_config, path)
+        assert plan["windows_nsis_profile"] == profile
         assert _platform_cells(plan, "windows-nsis-regression") == expected
+
+
+@pytest.mark.parametrize("path", [
+    "desktop/electron/scripts/nsis/legacy-uninstaller-temp.nsh",
+    "desktop/electron/scripts/test-nsis-upgrade.mjs",
+    "desktop/electron/scripts/prepare-installer-tooling.mjs",
+    "desktop/electron/src/windows-update-handoff.ts",
+    ".github/scripts/verify-release-windows-upgrade.ps1",
+    "src/opensquilla/migration/sandbox.py",
+    "src/opensquilla/persistence/schema.py",
+    "src/opensquilla/recovery/profile.py",
+    "src/opensquilla/uninstall/profile.py",
+    "src/opensquilla/profile.py",
+    "migrations/9999-fixture.sql",
+    "tests/fixtures/upgrade-v054/sessions.sql",
+])
+def test_installer_and_historical_data_changes_keep_all_upgrade_cases(
+    tmp_path: Path, suite_config: dict[str, Any], path: str,
+) -> None:
+    plan = _plan(tmp_path, suite_config, "opensquilla-webui/package-lock.json", path)
+    assert plan["windows_nsis_profile"] == "full"
+    assert len(_platform_cells(plan, "windows-nsis-regression")) == 21
+
+
+@pytest.mark.parametrize("paths", [(), (".ci/run-all",), ("unclassified.file",), ("../unsafe",)])
+def test_uncertain_and_explicit_full_plans_never_downgrade_native_acceptance(
+    tmp_path: Path, suite_config: dict[str, Any], paths: tuple[str, ...],
+) -> None:
+    plan = _plan(tmp_path, suite_config, *paths)
+    assert plan["full_fallback"] is True
+    assert plan["windows_nsis_profile"] == "full"
+    assert len(_platform_cells(plan, "windows-nsis-regression")) == 21
+
+
+def test_nsis_smoke_keeps_exactly_the_two_upgrade_and_two_fresh_cases() -> None:
+    assert MODULE["windows_nsis_upgrade_cells"]("smoke") == [
+        {"baseline": baseline, "install-path": path, "scenario": scenario}
+        for baseline, scenario in (("0.5.4", "baseline"), ("fresh", "fresh"))
+        for path in ("default", "custom")
+    ]
+    with pytest.raises(ValueError, match="unknown Windows NSIS acceptance profile"):
+        MODULE["windows_nsis_upgrade_cells"]("smkoe")
 
 
 @pytest.fixture
@@ -287,10 +349,14 @@ def test_deleted_governed_test_uses_existing_parent_and_keeps_windows_shard(
     assert "deleted_test_targeted" in plan["reason_codes"]
 
 
+@pytest.mark.parametrize("path", [
+    "tests/functional/test_gateway_attachment_history_e2e.py",
+    "tests/test_gateway/test_rpc_approvals.py",
+    "tests/test_gateway/test_rpc_chat_branch_edit.py",
+])
 def test_test_only_change_selects_one_physical_windows_partition(
-    tmp_path: Path, suite_config: dict[str, Any]
+    tmp_path: Path, suite_config: dict[str, Any], path: str,
 ) -> None:
-    path = "tests/functional/test_gateway_attachment_history_e2e.py"
     _write_test_module(tmp_path, path)
 
     plan = plan_changes([path], repo=tmp_path, config=suite_config)
@@ -305,20 +371,42 @@ def test_test_only_change_selects_one_physical_windows_partition(
     }
 
 
-def test_windows_family_request_expands_only_its_two_physical_cells(
-    suite_config: dict[str, Any]
+@pytest.mark.parametrize(("family", "partitions"), [
+    ("gateway-sqlite", 4), ("core", 2), ("recovery-migration", 2),
+    ("desktop-installer-contracts", 2),
+])
+def test_windows_family_request_expands_only_its_physical_cells(
+    suite_config: dict[str, Any], family: str, partitions: int,
 ) -> None:
     python, platforms = MODULE["_execution_matrices"](
-        ["windows-high-risk"], set(), {"gateway-sqlite"}, False, suite_config
+        ["windows-high-risk"], set(), {family}, False, suite_config
     )
 
-    assert python == {
-        "ubuntu": [], "windows": ["gateway-sqlite-1", "gateway-sqlite-2"]
-    }
+    expected = [f"{family}-{partition}" for partition in range(1, partitions + 1)]
+    assert python == {"ubuntu": [], "windows": expected}
     assert platforms == [
         {"suite": "windows-high-risk", "os": "windows-latest", "shard": shard}
-        for shard in ("gateway-sqlite-1", "gateway-sqlite-2")
+        for shard in expected
     ]
+
+
+def test_windows_partition_fallback_matches_execution_selector(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    selector = runpy.run_path(".github/scripts/windows_test_shards.py")
+    paths = [f"tests/test_gateway/test_new_partition_fallback_{index}.py"
+             for index in range(32)]
+    snapshot = tmp_path / "partitions.json"
+    snapshot.write_text(json.dumps({
+        "schema_version": 1,
+        "partitions": {shard: [] for shard in suite_config["full_python_matrix"]["windows"]},
+    }))
+    actual = MODULE["_load_windows_test_partitions"](
+        snapshot, assignments={path: "gateway-sqlite" for path in paths},
+        allowed_shards=set(suite_config["full_python_matrix"]["windows"]),
+    )
+    assert actual == {path: selector["windows_shard_for_test"](path) for path in paths}
+    assert set(actual.values()) == {f"gateway-sqlite-{partition}" for partition in range(1, 5)}
 
 
 @pytest.mark.parametrize("invalid", ["missing-cell", "duplicate-file", "wrong-family"])
@@ -467,11 +555,11 @@ def test_test_helper_dependency_closure_is_recursive_and_cycle_safe(
 ) -> None:
     core = "tests/test_skills/test_hub_management_service.py"
     recovery = "tests/test_skills_hash_consumers.py"
-    desktop = "tests/test_engine/test_runtime_meta_invoke_surfacing.py"
+    desktop = "tests/test_engine/test_runtime_router_fallback.py"
     _write_test_module(
         tmp_path,
         core,
-        "from tests.test_engine.test_runtime_meta_invoke_surfacing import DesktopHelper\n",
+        "from tests.test_engine.test_runtime_router_fallback import DesktopHelper\n",
     )
     _write_test_module(
         tmp_path,
@@ -1225,66 +1313,10 @@ def test_toolchain_and_packaging_changes_select_dedicated_suites(
 
 
 @pytest.mark.parametrize(
-    ("path", "domain_targets"),
-    [
-        (
-            "src/opensquilla/skills/bundled/meta-paper-write/SKILL.md",
-            {
-                "tests/test_skills/test_meta_paper*.py",
-                "tests/test_skills/test_paper_*.py",
-            },
-        ),
-        (
-            "src/opensquilla/skills/bundled/paper-quality-gate/scripts/audit.py",
-            {
-                "tests/test_skills/test_meta_paper*.py",
-                "tests/test_skills/test_paper_*.py",
-            },
-        ),
-        (
-            "src/opensquilla/skills/bundled/meta-short-drama/SKILL.md",
-            {"tests/test_skills/test_meta_short_drama*.py"},
-        ),
-        (
-            "src/opensquilla/skills/bundled/subtitle-burner/scripts/burn.py",
-            {"tests/test_skills/test_subtitle_burner.py"},
-        ),
-        (
-            "src/opensquilla/skills/bundled/video-still-animator/scripts/animate.py",
-            set(),
-        ),
-    ],
-)
-def test_bundled_managed_toolchain_domains_select_artifact_and_targeted_tests(
-    tmp_path: Path,
-    suite_config: dict[str, Any],
-    path: str,
-    domain_targets: set[str],
-) -> None:
-    plan = _plan(tmp_path, suite_config, path)
-
-    assert plan["full_fallback"] is False
-    assert {"managed-toolchain", "python-targeted", "windows-high-risk"} <= set(
-        plan["required_suites"]
-    )
-    assert {
-        "tests/test_skills/test_managed_toolchains.py",
-        "tests/test_skills/test_toolchain_runtime_integration.py",
-        "tests/test_skills/test_toolchain_state_scope.py",
-        *domain_targets,
-    } <= set(plan["python_targets"])
-    assert "toolchain_changed" in plan["reason_codes"]
-
-
-@pytest.mark.parametrize(
     "path",
     [
         "tests/test_skills/test_managed_toolchains.py",
         "tests/test_skills/test_toolchain_runtime_integration.py",
-        "tests/test_skills/test_meta_paper_write_e2e.py",
-        "tests/test_skills/test_paper_quality_gate.py",
-        "tests/test_skills/test_meta_short_drama_delivery_audit.py",
-        "tests/test_skills/test_subtitle_burner.py",
     ],
 )
 def test_managed_toolchain_domain_tests_retain_the_artifact_e2e_suite(
@@ -1564,7 +1596,6 @@ def test_unregistered_dependency_manifest_fails_closed_inside_known_domains(
         "src/opensquilla/gateway/scopes.py",
         "src/opensquilla/cli/main.py",
         "src/opensquilla/cli/skills_cmd.py",
-        "src/opensquilla/cli/skills_meta_cmd.py",
         "src/opensquilla/tools/builtin/skill_tools.py",
         "src/opensquilla/tools/registry.py",
     ],
@@ -1592,11 +1623,9 @@ def test_skill_hub_inputs_select_all_three_contract_platforms(
         "tests/test_skills/test_loader_turn_snapshot.py",
         "tests/test_cli/test_skills_reload_cmd.py",
         "tests/test_skill_catalog_projection.py",
-        "tests/test_gateway/test_meta_catalog_compatibility.py",
         "tests/test_gateway/test_rpc_commands.py",
         "tests/test_migration/test_legacy_config_fixtures.py",
         "tests/test_skills/test_catalog_upgrade_retirement.py",
-        "tests/test_skills/test_sop_compiler.py",
         "tests/unit/cli/tui/test_opentui_completion_catalog.py",
     ],
 )
@@ -1616,6 +1645,33 @@ def test_skill_hub_related_test_change_keeps_three_platform_suite(
         ("macos-latest", "default"),
         ("windows-latest", "default"),
     }
+
+
+@pytest.mark.parametrize("path", [
+    "tests/test_skills/test_install_operation_io.py",
+    "tests/test_skills/test_hub_rollback_serialization.py",
+])
+def test_unregistered_skill_hub_test_keeps_full_fallback_and_execution_digest(
+    tmp_path: Path, suite_config: dict[str, Any], path: str,
+) -> None:
+    first = _plan(tmp_path, suite_config, path)
+
+    assert first["full_fallback"] is True
+    assert first["reason_codes"] == ["unknown_path"]
+    assert first["python_targets"] == ["tests"]
+    assert _platform_cells(first, "skill-hub") == {
+        ("ubuntu-latest", "default"),
+        ("macos-latest", "default"),
+        ("windows-latest", "default"),
+    }
+
+    (tmp_path / path).write_text("# Changed regression boundary\n", encoding="utf-8")
+    second = _plan(tmp_path, suite_config, path)
+
+    assert (
+        first["suite_execution_digests"]["skill-hub"]
+        != second["suite_execution_digests"]["skill-hub"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -2047,21 +2103,17 @@ def test_release_packaging_inputs_cover_root_readmes(
     assert "README*.md" in inputs
 
 
-def test_managed_toolchain_inputs_cover_bundled_consumers_and_tests(
+def test_managed_toolchain_inputs_cover_runtime_and_tests(
     suite_config: dict[str, Any],
 ) -> None:
     inputs = set(suite_config["suites"]["managed-toolchain"]["execution_inputs"])
 
     assert {
-        "src/opensquilla/skills/bundled/meta-paper-write/**",
-        "src/opensquilla/skills/bundled/meta-short-drama/**",
-        "src/opensquilla/skills/bundled/paper-*/**",
-        "src/opensquilla/skills/bundled/subtitle-burner/**",
-        "src/opensquilla/skills/bundled/video-still-animator/**",
-        "tests/test_skills/test_meta_paper*.py",
-        "tests/test_skills/test_meta_short_drama*.py",
-        "tests/test_skills/test_paper_*.py",
-        "tests/test_skills/test_subtitle_burner.py",
+        "scripts/validate_managed_toolchain_artifacts*.py",
+        "src/opensquilla/skills/runtime_env.py",
+        "src/opensquilla/skills/toolchains/**",
+        "tests/test_skills/test_managed_toolchains.py",
+        "tests/test_skills/test_toolchain_*.py",
     } <= inputs
 
 

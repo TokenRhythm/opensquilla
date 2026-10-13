@@ -11,7 +11,8 @@ import pytest
 from opensquilla.engine.agent import Agent
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import AgentConfig
-from opensquilla.provider import DoneEvent, TextDeltaEvent
+from opensquilla.provider import DoneEvent, OpenAIProvider, TextDeltaEvent
+from opensquilla.provider.selector import ProviderConfig
 
 
 @pytest.mark.asyncio
@@ -34,8 +35,7 @@ async def test_run_accepts_legacy_tool_and_iteration_timeouts_without_enforcing_
 
     monkeypatch.setattr("opensquilla.engine.types.AgentConfig", recording_agent_config)
 
-    provider = MagicMock()
-    provider.provider_name = "stub"
+    provider = OpenAIProvider(api_key="synthetic-unused", model="stub-model")
 
     async def _chat(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         yield TextDeltaEvent(text="done")
@@ -46,7 +46,9 @@ async def test_run_accepts_legacy_tool_and_iteration_timeouts_without_enforcing_
     selector = MagicMock()
     selector.resolve.return_value = provider
     selector.clone.return_value = selector
-    selector.current_config = MagicMock(model="stub-model")
+    selector.current_config = ProviderConfig(
+        provider="openai", model="stub-model", api_key="synthetic-unused",
+    )
 
     session_manager = MagicMock()
     session_manager.get = AsyncMock(return_value=None)

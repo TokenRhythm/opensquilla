@@ -2682,6 +2682,7 @@ try {
       await manager.destroySurface('browser:terminal-reentry')
 
       const capacityResults = []
+      let firstCapacityContents
       for (let index = 0; index < 9; index += 1) {
         capacityResults.push(await manager.createSurface({
           version: 2,
@@ -2692,8 +2693,32 @@ try {
             scopeId: `synthetic:capacity-${index}`,
           },
         }))
+        if (index === 0) {
+          firstCapacityContents = view('browser:capacity-0').webContents
+          await firstCapacityContents.executeJavaScript(`
+            window.__capacityState = 'retained'
+            const input = document.createElement('input')
+            input.id = 'capacity-draft'
+            input.value = 'unsaved draft'
+            document.body.append(input)
+            localStorage.setItem('capacity-isolation-probe', 'first-page')
+          `)
+        }
       }
-      const liveSurfaceCountAtLimit = manager.surfaces.size
+      const liveSurfaceCountAfterOpen = manager.surfaces.size
+      const capacitySessions = new Set(
+        [...manager.surfaces.values()].map(record => record.previewSession),
+      ).size
+      const capacityFirstPageState = await firstCapacityContents.executeJavaScript(`({
+        state: window.__capacityState,
+        draft: document.getElementById('capacity-draft')?.value,
+      })`)
+      const lastCapacityContents = manager.surfaces.get('browser:capacity-8')?.view.webContents
+      const capacityLastPageStorage = lastCapacityContents
+        ? await lastCapacityContents.executeJavaScript(
+            "localStorage.getItem('capacity-isolation-probe')",
+          )
+        : 'missing-page'
       const failedCapacityRecord = manager.surfaces.get('browser:capacity-0')
       if (!failedCapacityRecord) throw new Error('Capacity surface was not retained.')
       const failedCapacityView = failedCapacityRecord.view
@@ -2707,7 +2732,7 @@ try {
       await waitFor(
         () => failedCapacityContents.isDestroyed()
           && !manager.surfaces.has('browser:capacity-0'),
-        'unresponsive capacity slot teardown',
+        'unresponsive preview teardown',
       )
       emitUnresponsive(failedCapacityContents)
       emitRendererGone(failedCapacityContents)
@@ -2734,7 +2759,9 @@ try {
         },
       })
       const liveSurfaceCountAfterReuse = manager.surfaces.size
+      const capacityContents = [...manager.surfaces.values()].map(record => record.view.webContents)
       await manager.destroyAll()
+      const capacityContentsDestroyed = capacityContents.every(contents => contents.isDestroyed())
       const storageProbe = new BrowserWindow({
         show: false,
         webPreferences: {
@@ -2894,11 +2921,15 @@ try {
         reentrantTerminalEventCount,
         capacityResults,
         capacityReuse,
+        capacitySessions,
+        capacityFirstPageState,
+        capacityLastPageStorage,
+        capacityContentsDestroyed,
         capacityTerminalEventCount,
         failedCapacityDetached,
         failedSessionStorageCleared,
         liveSurfaceCountAfterReuse,
-        liveSurfaceCountAtLimit,
+        liveSurfaceCountAfterOpen,
       }
     },
     {
@@ -3466,12 +3497,16 @@ try {
     'a terminal event callback may replace the item without the old teardown destroying it',
   )
   assert.equal(
-    result.liveSurfaceCountAtLimit,
-    8,
-    'the manager must retain at most eight live surfaces',
+    result.liveSurfaceCountAfterOpen,
+    result.capacityResults.length,
+    'opening previews beyond eight must retain every existing surface',
   )
-  assert.equal(result.capacityResults.slice(0, 8).every(entry => entry.ok), true)
-  assert.equal(result.capacityResults[8].ok, false, 'the ninth live surface must be rejected')
+  assert.equal(result.capacityResults.every(entry => entry.ok), true, 'the ninth preview must open')
+  assert.equal(result.capacitySessions, result.capacityResults.length, 'each preview must remain isolated')
+  assert.deepEqual(result.capacityFirstPageState, { state: 'retained', draft: 'unsaved draft' },
+    'opening more previews must preserve existing page state and unsaved input')
+  assert.equal(result.capacityLastPageStorage, null, 'new previews must not inherit another page storage')
+  assert.equal(result.capacityContentsDestroyed, true, 'closing all previews must destroy every renderer')
   assert.equal(
     result.capacityTerminalEventCount,
     1,
@@ -3485,12 +3520,12 @@ try {
   assert.equal(
     result.capacityReuse.ok,
     true,
-    'an unresponsive v2 item must release its capacity slot immediately',
+    'opening a preview after another becomes unresponsive must succeed',
   )
   assert.equal(
     result.liveSurfaceCountAfterReuse,
-    8,
-    'a replacement may reuse the failed item slot without hidden eviction',
+    result.capacityResults.length,
+    'replacing a failed preview must leave all healthy previews intact',
   )
   assert.equal(
     result.failedSessionStorageCleared,

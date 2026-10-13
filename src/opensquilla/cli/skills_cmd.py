@@ -431,57 +431,6 @@ def _recover_offline_management_service(service: Any) -> None:
         recover()
 
 
-def inspect_compiled_dag(*, name: str, bundled_dir: Path | None = None) -> str:
-    """Return the compiled composition for a meta-skill as YAML text.
-
-    Helper used by both the CLI command and tests; isolating the logic
-    keeps the Typer command body minimal and verifiable.
-    """
-
-    import yaml as _yaml
-
-    from opensquilla.skills.loader import SkillLoader
-
-    if bundled_dir is not None:
-        # Explicit bundled_dir keeps the test-friendly single-layer path.
-        loader = SkillLoader(bundled_dir=bundled_dir)
-    else:
-        # Resolve every skill layer so managed/workspace meta-skills (e.g.
-        # user-installed ones under ~/.opensquilla/skills) are inspectable,
-        # matching `skills list`.
-        import os as _os
-
-        from opensquilla.gateway.config import GatewayConfig
-        from opensquilla.skills.paths import resolve_skill_layer_dirs
-
-        config = GatewayConfig.load(_os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
-        workspace_root = Path(config.workspace_dir) if config.workspace_dir else None
-        workspace_override = (
-            Path(config.skills.workspace_dir) if config.skills.workspace_dir else None
-        )
-        layer_dirs = resolve_skill_layer_dirs(
-            allow_bundled=config.skills.allow_bundled,
-            workspace_root=workspace_root,
-            workspace_override=workspace_override,
-            managed_override=config.skills.managed_dir,
-            extra_dirs=[Path(d) for d in config.skills.extra_dirs],
-        )
-        loader = SkillLoader(
-            bundled_dir=layer_dirs.bundled_dir,
-            workspace_dir=layer_dirs.workspace_dir,
-            managed_dir=layer_dirs.managed_dir,
-            personal_agents_dir=layer_dirs.personal_agents_dir,
-            project_agents_dir=layer_dirs.project_agents_dir,
-            extra_dirs=layer_dirs.extra_dirs,
-        )
-    loader.invalidate_cache()
-    loader.load_all()
-    spec = loader.get_by_name(name)
-    if spec is None:
-        return f"skill {name!r} not loaded"
-    if spec.composition_raw is None:
-        return f"skill {name!r} has no composition (not a meta skill)"
-    return str(_yaml.safe_dump(spec.composition_raw, sort_keys=False))
 
 
 @skills_app.command("list")
@@ -889,8 +838,9 @@ def skills_install(
         "--source",
         "-s",
         help=(
-            "Source (clawhub, github). GitHub accepts owner/repo, "
-            "owner/repo@ref:path, or GitHub URLs."
+            "Source (clawhub, skillhub, github). SkillHub accepts a registry slug "
+            "or slug@version; GitHub accepts owner/repo, owner/repo@ref:path, "
+            "or GitHub URLs."
         ),
     ),
     force: bool = typer.Option(
@@ -1220,11 +1170,6 @@ def skills_doctor(
         raise typer.Exit(1)
 
 
-# ── Meta-skill sub-commands ───────────────────────────────────────────────
-
-from opensquilla.cli.skills_meta_cmd import meta_app  # noqa: E402
-
-skills_app.add_typer(meta_app, name="meta")
 
 
 # ── Tap sub-commands ──────────────────────────────────────────────────────
@@ -1293,12 +1238,3 @@ def skills_publish(
             console.print(f"[red]Failed:[/] {result.message}")
 
     asyncio.run(_publish())
-
-
-@skills_app.command("inspect")
-def cli_inspect(
-    name: str = typer.Argument(..., help="Meta-skill name to inspect"),
-) -> None:
-    """Print the compiled composition.steps for a meta-skill."""
-
-    typer.echo(inspect_compiled_dag(name=name))

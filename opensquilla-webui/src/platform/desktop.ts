@@ -111,6 +111,7 @@ const NATIVE_SURFACE_EVENT_TYPES = new Set<NativeWorkbenchSurfaceEventType>([
   'crashed',
   'escape',
   'browser-opened',
+  'browser-closed',
   'annotation-selected',
   'annotation-draft-change',
   'annotation-submit',
@@ -161,6 +162,17 @@ function normalizeArtifactAnnotationSelection(
   }
 }
 
+function normalizeNavigationError(value: unknown): NonNullable<NativeWorkbenchSurfaceEvent['detail']>['navigationError'] {
+  if (value === null) return null
+  if (!value || typeof value !== 'object') return undefined
+  const raw = value as Record<string, unknown>
+  if (typeof raw.url !== 'string' || raw.url.length > 8192
+    || typeof raw.code !== 'string' || raw.code.length > 128
+    || typeof raw.message !== 'string' || raw.message.length > 2048) return undefined
+  return { url: raw.url, code: raw.code, message: raw.message,
+    ...(typeof raw.errorCode === 'number' && Number.isSafeInteger(raw.errorCode) ? { errorCode: raw.errorCode } : {}) }
+}
+
 function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEvent | null {
   if (!payload || typeof payload !== 'object') return null
   const raw = payload as Record<string, unknown>
@@ -175,6 +187,7 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
     ? raw.detail as Record<string, unknown>
     : null
   const selection = normalizeArtifactAnnotationSelection(rawDetail?.selection)
+  const navigationError = normalizeNavigationError(rawDetail?.navigationError)
   const annotationId = typeof rawDetail?.annotationId === 'string'
     && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(rawDetail.annotationId)
     ? rawDetail.annotationId
@@ -211,6 +224,8 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
         ...(typeof rawDetail.targetRef === 'string' ? { targetRef: rawDetail.targetRef } : {}),
         ...(typeof rawDetail.title === 'string' ? { title: rawDetail.title } : {}),
         ...(typeof rawDetail.loading === 'boolean' ? { loading: rawDetail.loading } : {}),
+        ...(navigationError !== undefined ? { navigationError } : {}),
+        ...(typeof rawDetail.pageState === 'string' ? { pageState: rawDetail.pageState } : {}),
         ...(typeof rawDetail.canGoBack === 'boolean'
           ? { canGoBack: rawDetail.canGoBack }
           : {}),
@@ -263,7 +278,7 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
 
   async function getCapabilities(): Promise<NativeWorkbenchCapabilities> {
     if (typeof api.getWorkbenchCapabilities !== 'function') {
-      return { protocolVersions: [1], modes: ['offline'], maxSurfaces: 8 }
+      return { protocolVersions: [1], modes: ['offline'] }
     }
     try {
       const payload = await api.getWorkbenchCapabilities()
@@ -284,12 +299,12 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
       return {
         protocolVersions: versions.length > 0 ? versions : [1],
         modes: modes.length > 0 ? modes : ['offline'],
-        maxSurfaces: typeof raw.maxSurfaces === 'number' && Number.isFinite(raw.maxSurfaces)
-          ? Math.max(1, Math.floor(raw.maxSurfaces))
-          : 8,
+        ...(typeof raw.maxSurfaces === 'number' && Number.isFinite(raw.maxSurfaces)
+          ? { maxSurfaces: Math.max(1, Math.floor(raw.maxSurfaces)) }
+          : {}),
       }
     } catch {
-      return { protocolVersions: [1], modes: ['offline'], maxSurfaces: 8 }
+      return { protocolVersions: [1], modes: ['offline'] }
     }
   }
 
@@ -327,6 +342,8 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
       : {}),
     ...(typeof api.getWorkbenchBrowserTarget === 'function'
       ? { getWorkbenchBrowserTarget: payload => api.getWorkbenchBrowserTarget!(payload) } : {}),
+    ...(typeof api.setBrowserAutomationState === 'function'
+      ? { setBrowserAutomationState: payload => api.setBrowserAutomationState!(payload) } : {}),
     ...(typeof api.focusWorkbenchAnnotation === 'function'
       ? { focusWorkbenchAnnotation: payload => api.focusWorkbenchAnnotation!(payload) } : {}),
     ...(typeof api.captureWorkbenchScreenshot === 'function'
@@ -643,6 +660,10 @@ export function createDesktopPlatform(): Platform {
         : {}),
     },
     files: {
+      ...(typeof window.opensquillaDesktop?.chooseLocalFilePaths === 'function'
+        ? { chooseLocalFilePaths: request => requireDesktopApi().chooseLocalFilePaths!(request) } : {}),
+      ...(typeof window.opensquillaDesktop?.resolveNativeFilePath === 'function'
+        ? { resolveNativeFilePath: file => requireDesktopApi().resolveNativeFilePath!(file) } : {}),
       ...(typeof window.opensquillaDesktop?.chooseAttachments === 'function'
         ? { chooseAttachments: request => requireDesktopApi().chooseAttachments!(request) } : {}),
       ...(typeof window.opensquillaDesktop?.selectAttachmentFile === 'function'
@@ -655,6 +676,8 @@ export function createDesktopPlatform(): Platform {
         ? { saveArtifact: payload => requireDesktopApi().saveArtifact!(payload) } : {}),
       ...(typeof window.opensquillaDesktop?.sourceFileAction === 'function'
         ? { sourceFileAction: payload => requireDesktopApi().sourceFileAction!(payload) } : {}),
+      ...(typeof window.opensquillaDesktop?.workspaceFileAction === 'function'
+        ? { workspaceFileAction: payload => requireDesktopApi().workspaceFileAction!(payload) } : {}),
       openArtifact: (payload) => requireDesktopApi().openArtifact(payload),
       async chooseProjectDirectory(request) {
         const api = requireDesktopApi()

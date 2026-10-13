@@ -53,6 +53,7 @@ export interface GoalStatusResult {
 export interface GoalSetInput {
   readonly sessionKey: string
   readonly objective: string
+  readonly localPathReferences?: readonly string[]
   readonly clientRequestId: string
   readonly clientMessageId: string
   readonly sourceKind?: 'web' | 'cli'

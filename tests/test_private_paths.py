@@ -96,6 +96,176 @@ def test_windows_private_acl_is_verified_through_the_same_bound_handle() -> None
     ]
 
 
+def test_windows_private_directory_acl_skips_set_on_strict_private_shape() -> None:
+    events: list[tuple[object, ...]] = []
+
+    class FakeNative:
+        def current_user_sid(self) -> str:
+            return "S-1-5-21-123"
+
+        @contextlib.contextmanager
+        def open_bound(self, *_args: object, **_kwargs: object) -> Iterator[object]:
+            events.append(("open",))
+            yield "synthetic-directory-handle"
+            events.append(("close",))
+
+        def set_protected_dacl(self, handle: object, _sddl: str) -> None:
+            events.append(("set", handle))
+
+        def read_dacl_sddl(self, handle: object) -> str:
+            events.append(("read", handle))
+            return "O:S-1-5-21-123D:P(A;OICI;FA;;;S-1-5-21-123)(A;CIOI;FA;;;SY)"
+
+    private_paths.apply_windows_private_dacl(
+        Path("synthetic-private-directory"),
+        directory=True,
+        expected_device=7,
+        expected_inode=42,
+        native=FakeNative(),
+        skip_if_private_directory=True,
+    )
+
+    assert events == [
+        ("open",),
+        ("read", "synthetic-directory-handle"),
+        ("close",),
+    ]
+
+
+def test_windows_private_directory_acl_repairs_non_private_shape() -> None:
+    events: list[tuple[object, ...]] = []
+    reads = iter(
+        [
+            "O:S-1-5-21-123D:P(A;OICI;FA;;;S-1-5-21-123)(A;OICI;FA;;;SY)(A;OICI;FR;;;WD)",
+            "O:S-1-5-21-123D:P(A;OICI;FA;;;S-1-5-21-123)(A;OICI;FA;;;SY)",
+        ]
+    )
+
+    class FakeNative:
+        def current_user_sid(self) -> str:
+            return "S-1-5-21-123"
+
+        @contextlib.contextmanager
+        def open_bound(self, *_args: object, **_kwargs: object) -> Iterator[object]:
+            events.append(("open",))
+            yield "synthetic-directory-handle"
+            events.append(("close",))
+
+        def set_protected_dacl(self, handle: object, sddl: str) -> None:
+            events.append(("set", handle, sddl))
+
+        def read_dacl_sddl(self, handle: object) -> str:
+            events.append(("read", handle))
+            return next(reads)
+
+    private_paths.apply_windows_private_dacl(
+        Path("synthetic-private-directory"),
+        directory=True,
+        expected_device=7,
+        expected_inode=42,
+        native=FakeNative(),
+        skip_if_private_directory=True,
+    )
+
+    assert [event[0] for event in events] == ["open", "read", "set", "read", "close"]
+
+
+def test_windows_private_directory_acl_precheck_read_failure_repairs_and_verifies() -> None:
+    events: list[str] = []
+    reads = 0
+
+    class FakeNative:
+        def current_user_sid(self) -> str:
+            return "S-1-5-21-123"
+
+        @contextlib.contextmanager
+        def open_bound(self, *_args: object, **_kwargs: object) -> Iterator[object]:
+            events.append("open")
+            yield "synthetic-directory-handle"
+            events.append("close")
+
+        def set_protected_dacl(self, _handle: object, _sddl: str) -> None:
+            events.append("set")
+
+        def read_dacl_sddl(self, _handle: object) -> str:
+            nonlocal reads
+            reads += 1
+            events.append("read")
+            if reads == 1:
+                raise OSError("synthetic DACL read failure")
+            return "O:S-1-5-21-123D:P(A;OICI;FA;;;S-1-5-21-123)(A;OICI;FA;;;SY)"
+
+    private_paths.apply_windows_private_dacl(
+        Path("synthetic-private-directory"),
+        directory=True,
+        expected_device=7,
+        expected_inode=42,
+        native=FakeNative(),
+        skip_if_private_directory=True,
+    )
+
+    assert events == ["open", "read", "set", "read", "close"]
+
+
+def test_windows_private_acl_skip_option_does_not_bypass_regular_files() -> None:
+    events: list[str] = []
+
+    class FakeNative:
+        def current_user_sid(self) -> str:
+            return "S-1-5-21-123"
+
+        @contextlib.contextmanager
+        def open_bound(self, *_args: object, **_kwargs: object) -> Iterator[object]:
+            events.append("open")
+            yield "synthetic-file-handle"
+            events.append("close")
+
+        def set_protected_dacl(self, _handle: object, _sddl: str) -> None:
+            events.append("set")
+
+        def read_dacl_sddl(self, _handle: object) -> str:
+            events.append("read")
+            return "O:S-1-5-21-123D:P(A;;FA;;;S-1-5-21-123)(A;;FA;;;SY)"
+
+    private_paths.apply_windows_private_dacl(
+        Path("synthetic-private-file"),
+        directory=False,
+        expected_device=7,
+        expected_inode=42,
+        native=FakeNative(),
+        skip_if_private_directory=True,
+    )
+
+    assert events == ["open", "set", "read", "close"]
+
+
+@pytest.mark.parametrize(
+    ("flags", "has_guid", "expected"),
+    [
+        ("OICI", False, True),
+        ("CIOI", False, True),
+        ("OICIIO", False, False),
+        ("OICINP", False, False),
+        ("OICIID", False, False),
+        ("OICI", True, False),
+    ],
+)
+def test_windows_private_directory_reuse_requires_exact_inheritance_shape(
+    flags: str,
+    has_guid: bool,
+    expected: bool,
+) -> None:
+    guid = "00000000-0000-0000-0000-000000000001" if has_guid else ""
+    sddl = f"O:S-1-5-21-123D:P(A;{flags};FA;{guid};;S-1-5-21-123)(A;{flags};FA;;;SY)"
+    assert (
+        private_paths._windows_sddl_is_private_directory_for_reuse(
+            sddl,
+            user_sid="S-1-5-21-123",
+        )
+        is expected
+    )
+
+
 def test_windows_private_acl_rejects_unverified_extra_principal() -> None:
     class FakeNative:
         def current_user_sid(self) -> str:

@@ -926,6 +926,10 @@ async def test_agent_waits_for_approval_resolution_before_retry_result_reaches_m
         reset_approval_queue()
 
 
+# This contract uses a real two-second prompt-observation budget. Keep it out
+# of the xdist pool so host scheduling cannot consume the budget before the
+# approval event loop reaches the first tool result.
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_pending_approval_ignores_legacy_timeout_and_waits_for_decision(
     tmp_path: Any,

@@ -23,6 +23,7 @@ export interface ProviderListError {
 export interface ModelCatalogResult {
   readonly models: readonly ModelDescriptor[]
   readonly errors: readonly ProviderListError[]
+  readonly catalog?: { readonly cacheHit: boolean; readonly stale: boolean; readonly lastSyncedAt: string | null }
 }
 
 export interface ProviderDescriptor {
@@ -130,7 +131,7 @@ export interface ProviderCatalog {
 }
 
 export interface ModelCatalog {
-  list(options?: { scope?: 'active' | 'configured'; signal?: AbortSignal }): Promise<ModelCatalogResult>
+  list(options?: { scope?: 'active' | 'configured'; cacheOnly?: boolean; signal?: AbortSignal }): Promise<ModelCatalogResult>
   readonly capacitySupported?: boolean
   resolveCapacity?(models: readonly ModelCapacityTarget[]): Promise<{ models: ModelCapacity[] }>
 }

@@ -16,11 +16,12 @@ function deferred() {
 const scopes: ReturnType<typeof effectScope>[] = []
 afterEach(() => { for (const scope of scopes.splice(0)) scope.stop() })
 
-function harness(options: { draft?: boolean; available?: boolean; key?: string } = {}) {
+function harness(options: { draft?: boolean; available?: boolean; allowed?: boolean; key?: string } = {}) {
   const sessionKey = ref(options.key ?? 'agent:main:webchat:one')
   const draft = ref(options.draft ?? false)
   const available = ref(options.available ?? true)
   const connectionEpoch = ref(1)
+  const allowed = ref(options.allowed ?? true)
   const requests: Array<ReturnType<typeof deferred> & { key: string; signal?: AbortSignal }> = []
   const resolve = vi.fn((request: { key: string; signal?: AbortSignal }) => {
     const pending = deferred()
@@ -30,9 +31,9 @@ function harness(options: { draft?: boolean; available?: boolean; key?: string }
   const scope = effectScope()
   scopes.push(scope)
   const api = scope.run(() => useChatSessionModel({
-    directory: { resolve }, sessionKey, isDraft: () => draft.value, available, connectionEpoch,
+    directory: { resolve }, sessionKey, isDraft: () => draft.value, available, connectionEpoch, allowed,
   }))!
-  return { api, sessionKey, draft, available, connectionEpoch, resolve, requests, scope }
+  return { api, sessionKey, draft, available, connectionEpoch, allowed, resolve, requests, scope }
 }
 
 function stored(model: string | null = 'Exact-Model-ID', key = 'agent:main:webchat:one'): ResolvedSession {
@@ -52,6 +53,7 @@ describe('stored chat session model display', () => {
   it('loads the exact stored model when a draft becomes durable with the same session key', async () => {
     const h = harness({ draft: true })
     h.draft.value = false
+    await nextTick()
     expect(h.resolve).toHaveBeenCalledExactlyOnceWith({
       key: h.sessionKey.value, signal: expect.any(AbortSignal),
     })
@@ -70,6 +72,7 @@ describe('stored chat session model display', () => {
   it('rejects stale replies even after switching away and back to the same session', async () => {
     const h = harness()
     h.sessionKey.value = 'agent:main:webchat:two'
+    await nextTick()
     h.requests[1]!.resolve(stored('Second-Model', h.sessionKey.value))
     await nextTick()
     expect(h.api.modelName.value).toBe('Second-Model')
@@ -101,6 +104,7 @@ describe('stored chat session model display', () => {
     expect(h.api.modelName.value).toBe('Gateway-A-Model')
     h.connectionEpoch.value += 1
     expect(h.api.modelName.value).toBeNull()
+    await nextTick()
     h.connectionEpoch.value += 1
     expect(h.requests[1]!.signal?.aborted).toBe(true)
     h.requests[1]!.resolve(stored('Stale-Gateway-B-Model'))
@@ -119,6 +123,7 @@ describe('stored chat session model display', () => {
     await nextTick()
     expect(h.api.modelName.value).toBeNull()
     h.available.value = true
+    await nextTick()
     h.requests[1]!.resolve(stored('Reconnected-Model'))
     await nextTick()
     expect(h.api.modelName.value).toBe('Reconnected-Model')
@@ -178,5 +183,53 @@ describe('stored chat session model display', () => {
     await h.api.refresh()
     expect(h.api.modelName.value).toBeNull()
     expect(h.resolve).toHaveBeenCalledTimes(1)
+  })
+
+  it('waits for bootstrap admission and then resolves only the current session', async () => {
+    const h = harness({ allowed: false })
+    await h.api.refresh()
+    h.sessionKey.value = 'agent:main:webchat:two'
+    await nextTick()
+    expect(h.resolve).not.toHaveBeenCalled()
+
+    h.allowed.value = true
+    await nextTick()
+    expect(h.resolve).toHaveBeenCalledExactlyOnceWith({
+      key: h.sessionKey.value, signal: expect.any(AbortSignal),
+    })
+    h.requests[0]!.resolve(stored('Current-Model', h.sessionKey.value))
+    await nextTick()
+    expect(h.api.modelName.value).toBe('Current-Model')
+  })
+
+  it('retires the old identity before the bootstrap closes admission for a session switch', async () => {
+    const h = harness()
+    h.requests[0]!.resolve(stored())
+    await nextTick()
+    const pending = h.api.refresh()
+    h.sessionKey.value = 'agent:main:webchat:two'
+    expect(h.api.modelName.value).toBeNull()
+    expect(h.requests[1]!.signal?.aborted).toBe(true)
+    // The session coordinator queues critical frames and closes its gate in
+    // the same turn, after sync watchers have retired the previous identity.
+    h.allowed.value = false
+    h.requests[1]!.resolve(stored('Stale-Model'))
+    await pending
+    await nextTick()
+    expect(h.api.modelName.value).toBeNull()
+    expect(h.resolve).toHaveBeenCalledTimes(2)
+
+    h.allowed.value = true
+    await nextTick()
+    expect(h.requests[2]!.key).toBe(h.sessionKey.value)
+    expect(h.resolve).toHaveBeenCalledTimes(3)
+  })
+
+  it('does not start a deferred read when its scope is disposed before admission', async () => {
+    const h = harness({ allowed: false })
+    h.allowed.value = true
+    h.scope.stop()
+    await nextTick()
+    expect(h.resolve).not.toHaveBeenCalled()
   })
 })

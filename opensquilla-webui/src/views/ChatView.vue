@@ -4,7 +4,6 @@
     class="chat"
     :class="{
       'chat--new-landing': isNewChatLanding,
-      'chat--meta-setup': Boolean(setupState),
       'chat--drag-over': threadDragOver,
       'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire),
       'chat--composer-floating': composerFxEnabled && !isNewChatLanding,
@@ -150,6 +149,12 @@
           @dismiss="chatSessionBootstrap.dismissRecoveryNotice()"
           @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
         />
+        <ChatDeliveryRecoveryStatus
+          v-if="!forkTransition"
+          :entries="chatSend.deliveryRecoveryEntries.value"
+          :checking-ids="chatSend.checkingDeliveryIds.value"
+          @check="chatSend.checkDelivery"
+        />
         <div
           v-if="!forkTransition && showConfirmedEmptySession"
           class="chat-empty"
@@ -237,6 +242,9 @@
           @open-artifact="openArtifact"
           @toggle-tool-group="toggleToolGroup"
           @toggle-tool-item="toggleToolItem"
+          @details-disclosure="(message, open) => historyDetails.setExpanded(message.contentRef, open)"
+          @content-hydrated="chatHistory.reconcileHydratedContent"
+          :load-history-details="message => historyDetails.setExpanded(message.contentRef, true)"
           @show-tool-result="showToolResultModal"
           @open-session="switchToSession"
           @resolve-interrupt="resolveInterrupt"
@@ -306,24 +314,6 @@
           @replan="beginPlanRevision"
           @presentation-change="chatPlans.setPresentation"
         />
-
-        <!-- MetaSkill run cards: preflight checkpoint + progress ribbon,
-             grouped per run_id above the live activity area. -->
-        <template v-for="runId in metaRuns.ribbonOrder.value" :key="`meta-${runId}`">
-          <MetaPreflightCard
-            v-if="metaRuns.preflights.value.has(runId)"
-            :state="metaRuns.preflights.value.get(runId)!.state"
-            :phase="metaRuns.preflights.value.get(runId)!.phase"
-            :error-text="metaRuns.preflights.value.get(runId)!.errorText"
-            @action="metaRuns.onPreflightAction"
-          />
-          <MetaRibbon
-            v-if="metaRuns.ribbons.value.has(runId)"
-            :run="metaRuns.ribbons.value.get(runId)!"
-            @action="metaRuns.onRibbonAction"
-            @chip-select="metaRuns.onChipSelect"
-          />
-        </template>
 
         <SkillLoadStatus v-if="isStreaming" standalone :receipts="liveSkillLoads[activeStreamTaskId] || []" />
 
@@ -514,15 +504,6 @@
       </div>
     </div>
 
-    <MetaSkillSetupCard
-      v-if="setupState"
-      :state="setupState"
-      :provider-navigation-pending="metaSetupProviderNavigationPending"
-      @confirm="confirmSetup"
-      @retry="retrySetup"
-      @cancel="cancelSetup"
-      @configure="openMetaSetupProviderSettings"
-    />
     <!-- Composer dock: positioning context so the slash menu anchors directly
          above the composer in any layout. The new-chat landing centers the
          composer instead of pinning it to the bottom, so the menu must not
@@ -597,8 +578,6 @@
       <ChatSlashPalette :items="filteredSlashCmds" :active-index="slashIdx"
         :loading="skillsLoading" :error="skillsError" @choose="completeSlashCmd" />
     </div>
-    <SkillWorkflowRequestDialog v-if="metaDraft" v-model="metaDraft.text" :name="metaDraft.label || metaDraft.name"
-      @cancel="metaDraft = null" @launch="void launchMetaDraft()" />
 
     <PendingQueue
       :items="pendingQueue"
@@ -611,6 +590,10 @@
       :steer-unavailable-message="sameTurnSteerUnavailableMessage"
       :delivery-identity="gatewayAccess.deliveryIdentity"
       :offline="!gatewayAccess.isAvailable"
+      :auto-send-paused="pendingAutoSendPaused"
+      :followup-available="canSendPendingFollowup"
+      :has-active-turn="isStreaming || !!taskOwnership.runningTaskId.value"
+      :stopping="isStopPending"
       @clear="clearPendingQueue"
       @edit="editPendingMessage"
       @remove="removePendingChip"
@@ -618,6 +601,8 @@
       @reorder-end="endPendingReorder"
       @reorder-start="beginPendingReorder"
       @steer="steerPendingMessage"
+      @send="sendPendingMessage"
+      @resume="resumePendingAutoSend"
     />
 
     <div
@@ -642,11 +627,13 @@
     <ChatModelSetupNotice v-if="!shareMode" />
     <ChatComposer
       ref="composerRef"
-      v-model="inputText"
+      v-model="composerText"
       :attachments="pendingAttachments"
+      :local-paths="localPaths"
       :busy-send-mode="busySendMode"
       :has-send-content="composerHasSendContent"
       :send-pending="chatSend.sendPending.value"
+      :send-disabled="chatSend.sendHydrationBlocked.value"
       :is-streaming="isStreaming"
       :can-stop="canStop"
       :stop-targets-plan-run="composerStopsPlanRun"
@@ -679,13 +666,12 @@
       :models-error="newTaskModelsError"
       :model-provider-errors="newTaskModelsProviderErrors"
       :model-selection-disabled-reason="composerModelDisabledReason"
-      :coding-mode-enabled="codingModeEnabled"
-      :coding-mode-settings-busy="codingModeSettingsBusy"
       :goal-draft-armed="goalDraftArmed"
       :goal-mode-available="goalUiAvailable"
       :goal-mode-busy="goalBusy || planModeBusy || replanActive"
       :goal-mode-existing="goalComposerExisting"
       :add-menu-avoid-element="goalRunDockRef"
+      :browser-use-available="browserUseAvailable"
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
@@ -712,22 +698,28 @@
       @composition-change="composing = $event; !$event && handleSlashInput()"
       @beforeinput="onTextareaBeforeInput"
       :choose-attachments="chooseAttachments"
+      :choose-local-file-paths="localPathPicker.choose"
+      :local-paths-available="localPathPicker.available.value"
+      :local-paths-busy="localPathPicker.busy.value"
       @file-change="onFileInputChange"
       @input="onTextareaInput"
       @keydown="onTextareaKeydown"
       @remove-attachment="removeAttachment"
+      @remove-local-path="removeLocalPath"
       @remove-skill="selectedSkills = selectedSkills.filter(skill => skill.instanceId !== $event)"
       @retry-attachment="retryAttachment"
       @preview-image="previewPendingImage"
       @set-busy-send-mode="busySendMode = $event"
       @set-run-mode="setComposerRunMode"
+      @refresh-run-mode-availability="sandboxReadinessRefresh.refreshOnOpen"
       @set-session-routing-mode="setComposerSessionRoutingMode"
       @select-model="setComposerModel"
       @refresh-models="refreshComposerModels"
       @open-model-settings="openComposerModelSettings"
-      @set-coding-mode-enabled="setComposerCodingModeEnabled"
       @set-collaboration-mode="setCollaborationMode"
       @arm-goal="void activateGoalComposerMode()"
+      @select-browser-use="void selectBrowserUse()"
+      @open-add-menu="prepareAddMenu"
       @disarm-goal="disarmGoalMode"
       @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
@@ -747,6 +739,7 @@
       :open="composerSandboxSetupOpen"
       :pending="sandboxSetupPending"
       :outcome="sandboxSetupOutcome"
+      :repair-identity="sandboxIdentityRepairRequired"
       @cancel="cancelComposerSandboxSetup"
       @background="runComposerSandboxSetupInBackground"
       @confirm="void confirmComposerSandboxSetup()"
@@ -810,7 +803,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, inject, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, onScopeDispose, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
@@ -836,6 +829,7 @@ import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnota
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
+import { useBrowserAutomationState } from '@/composables/chat/useBrowserAutomationState'
 import {
   focusArtifactPromptAnnotation,
   notifyPageAnnotationsSent,
@@ -860,9 +854,6 @@ import EmptyStateChips from '@/components/chat/EmptyStateChips.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
 import StreamingTextPart from '@/components/chat/parts/StreamingTextPart.vue'
 import ReasoningTimeline from '@/components/chat/ReasoningTimeline.vue'
-import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
-import MetaRibbon from '@/components/chat/MetaRibbon.vue'
-import MetaSkillSetupCard from '@/components/chat/MetaSkillSetupCard.vue'
 import GoalRibbon from '@/components/chat/GoalRibbon.vue'
 import TaskProgressRibbon from '@/components/chat/TaskProgressRibbon.vue'
 import { useChatTaskProgress } from '@/composables/chat/useChatTaskProgress'
@@ -879,6 +870,7 @@ import HistoryLoadSentinel from '@/components/HistoryLoadSentinel.vue'
 import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 import { useChatApprovals } from '@/composables/chat/useChatApprovals'
 import { useChatAttachments } from '@/composables/chat/useChatAttachments'
+import { useLocalPathPicker } from '@/composables/chat/useLocalPathPicker'
 import { useChatCompaction } from '@/composables/chat/useChatCompaction'
 import { useChatComposerShortcuts } from '@/composables/chat/useChatComposerShortcuts'
 import { useDeliverableUpdateIndicator } from '@/composables/chat/useDeliverableUpdateIndicator'
@@ -891,6 +883,7 @@ import {
   useChatGoals,
 } from '@/composables/chat/useChatGoals'
 import { useChatDraftPersistence } from '@/composables/chat/useChatDraftPersistence'
+import { useLocalPathDraft } from '@/composables/chat/useLocalPathDraft'
 import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
@@ -900,9 +893,9 @@ import { USAGE_REPORTING_KEY, type UsageReporting } from '@/modules/usageReporti
 import SkillLoadStatus from '@/components/chat/SkillLoadStatus.vue'
 import { mergeSkillLoad, type SkillLoadReceipt } from '@/types/skillLoads'
 import ChatSlashPalette from '@/components/chat/ChatSlashPalette.vue'
-import SkillWorkflowRequestDialog from '@/components/chat/SkillWorkflowRequestDialog.vue'
 import { SKILL_CATALOG_KEY } from '@/modules/skillCatalog'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
+import { localPathPresentation } from '@/types/localPathReferences'
 import { readSkillTaskPrefill } from '@/composables/skills/skillTaskPrefill'
 import { COMMAND_CATALOG_KEY, type CommandCatalog } from '@/modules/commandCatalog'
 import { PROMPT_CACHE_LEASE_KEY, type PromptCacheLease } from '@/modules/promptCacheLease'
@@ -912,21 +905,21 @@ import {
 } from '@/modules/clarificationSubmission'
 import { SESSION_MAINTENANCE_KEY, type SessionMaintenance } from '@/modules/sessionMaintenance'
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
+import { DURABLE_DELIVERY_KEY } from '@/modules/delivery'
 import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCenter'
 import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
 import { GOAL_CONTINUITY_KEY, type GoalContinuity } from '@/modules/goalContinuity'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
+import ChatDeliveryRecoveryStatus from '@/components/chat/ChatDeliveryRecoveryStatus.vue'
+import { useChatHistoryDetails } from '@/composables/chat/useChatHistoryDetails'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
+import { useChatMessageContent } from '@/composables/chat/useChatMessageContent'
 import {
   resolveChatHeaderTitle,
   useChatSessionTitles,
 } from '@/composables/chat/useChatSessionTitles'
-import {
-  createChatMetaDraftRecovery,
-  listServerMetaDrafts,
-  queryServerMetaDrafts,
-} from '@/composables/chat/useChatMetaDraftRecovery'
+
 import {
   useChatPendingQueue,
   type PendingQueueOwnerContext,
@@ -947,17 +940,16 @@ import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSen
 import { useChatSteerDelivery } from '@/composables/chat/useChatSteerDelivery'
 import { chatTaskId, useChatTaskOwnership } from '@/composables/chat/useChatTaskOwnership'
 import {
+  allowedComposerRunModes,
   composerRunModeSelectionAction,
   effectiveComposerRunMode,
 } from '@/composables/chat/composerRunMode'
+import { useSandboxReadinessRefresh } from '@/composables/chat/useSandboxReadinessRefresh'
 import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
 import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
-import { useMetaRuns } from '@/composables/chat/useMetaRuns'
-import { useMetaSkillSetup } from '@/composables/chat/useMetaSkillSetup'
 import { useChatPlans } from '@/composables/chat/useChatPlans'
 import { PLAN_CENTER_KEY, type PlanCenter } from '@/modules/planCenter'
-import { META_RUN_CENTER_KEY, type MetaRunCenter } from '@/modules/metaRunCenter'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
 import {
   shouldCanonicalizeInitialDraftRoute,
@@ -973,10 +965,12 @@ import {
  } from '@/composables/chat/useChatSessionBootstrap'
  import {
    autoSendDraftIsUnchanged,
+   sessionRecoverySucceeded,
  } from '@/composables/chat/sessionBootstrapContract'
 import {
   acquireSessionBootstrapAdmission,
   claimSessionBootstrapAdmission,
+  registerSessionBootstrapAdmissionOwner,
   optionalSessionRpcAllowed,
   optionalSessionReadOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
@@ -1001,7 +995,6 @@ import {
 } from '@/modules/conversationEvents'
 import {
   useChatSlashCommands,
-  type DurableMetaDraft,
 } from '@/composables/chat/useChatSlashCommands'
 import { useChatStream } from '@/composables/chat/useChatStream'
 import { useComposerFloatingPreference } from '@/composables/useComposerFloatingPreference'
@@ -1011,7 +1004,6 @@ import { useChatSessionModel } from '@/composables/chat/useChatSessionModel'
 import { useSessionArtifacts } from '@/composables/chat/useSessionArtifacts'
 import { useVoiceInput } from '@/composables/chat/useVoiceInput'
 import { AUDIO_TRANSCRIPTION_KEY } from '@/modules/audioTranscription'
-import { navigateMetaSetupProviderSettings } from '@/composables/chat/metaSetupProviderNavigation'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
@@ -1039,7 +1031,6 @@ import type {
   ChatStreamTimelineItem,
   ChatToolCall,
   DisplayAttachment,
-  HiddenControlDispatchResult,
   ToolResultContext,
 } from '@/types/chat'
 import {
@@ -1108,11 +1099,7 @@ import { findArtifactCard, focusArtifactInTranscript } from '@/utils/chat/artifa
 import {
   classifyArtifactProductError,
 } from '@/utils/artifactProductErrors'
-import {
-  persistDeferredMetaDraft,
-  takeDeferredMetaDrafts,
-} from '@/utils/chat/metaDraftOutbox'
-import { listPendingMetaDiscards } from '@/utils/chat/metaDiscardOutbox'
+
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
 import {
   clearProgrammaticScroll,
@@ -1148,8 +1135,11 @@ import {
 } from '@/utils/chat/toolDisplay'
 import {
   collectClipboardFiles,
+  collectClipboardText,
   hasModelInputImageAttachment,
+  isLongPlainTextPaste,
   normalizeDisplayAttachment,
+  pastedTextAttachmentName,
   isSendableAttachment,
   shouldCaptureFilePaste,
 } from '@/utils/chat/attachments'
@@ -1176,6 +1166,7 @@ import {
   resolveChatWheelOwnership,
 } from '@/utils/chat/chatScrollOwnership'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
+import { stripBackgroundProcessNoticeTimeline } from '@/utils/chat/backgroundProcessNotice'
 import {
   resolveChatHistoryRecoveryState,
   shouldShowConfirmedEmptySession,
@@ -1194,7 +1185,7 @@ import {
 interface ChatComposerHandle {
   composerElement: () => HTMLElement | null
   canCollapse: () => boolean
-  focusTextarea: () => void
+  focusTextarea: (options?: { preserveFocus?: boolean }) => void
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
 }
@@ -1246,6 +1237,9 @@ const sessionLifecycle = injectedSessionLifecycle
 const injectedTurnCommands = inject(TURN_COMMANDS_KEY)
 if (!injectedTurnCommands) throw new Error('TurnCommands was not provided')
 const turnCommands: TurnCommands = injectedTurnCommands
+const injectedDurableDelivery = inject(DURABLE_DELIVERY_KEY)
+if (!injectedDurableDelivery) throw new Error('DurableDelivery was not provided')
+const durableDelivery = injectedDurableDelivery
 const injectedApprovalCenter = inject(APPROVAL_CENTER_KEY)
 if (!injectedApprovalCenter) throw new Error('ApprovalCenter was not provided')
 const approvalCenter: ApprovalCenter = injectedApprovalCenter
@@ -1258,9 +1252,6 @@ const planCenter: PlanCenter = injectedPlanCenter
 const injectedGoalContinuity = inject(GOAL_CONTINUITY_KEY)
 if (!injectedGoalContinuity) throw new Error('GoalContinuity was not provided')
 const goalContinuity: GoalContinuity = injectedGoalContinuity
-const injectedMetaRunCenter = inject(META_RUN_CENTER_KEY)
-if (!injectedMetaRunCenter) throw new Error('MetaRunCenter was not provided')
-const metaRunCenter: MetaRunCenter = injectedMetaRunCenter
 const injectedAppSettings = inject(APP_SETTINGS_KEY)
 if (!injectedAppSettings) throw new Error('AppSettings was not provided')
 const injectedUsageReporting = inject(USAGE_REPORTING_KEY)
@@ -1318,6 +1309,12 @@ const {
 // entering the serialized Gateway queue ahead of session recovery.
 let releaseOptionalRpcAdmission: (() => void) | null =
   claimSessionBootstrapAdmission()
+const unregisterSessionBootstrapOwner = registerSessionBootstrapAdmissionOwner()
+onScopeDispose(() => {
+  unregisterSessionBootstrapOwner()
+  releaseOptionalRpcAdmission?.()
+  releaseOptionalRpcAdmission = null
+})
 let optionalRpcAdmissionGeneration = 0
 const appStore = useAppStore()
 const workbenchStore = useWorkbenchStore()
@@ -1411,6 +1408,8 @@ const { enabled: composerFxEnabled } = useComposerFloatingPreference()
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+const optimisticSessionTitle = ref<{ key: string; title: string } | null>(null)
+const draftHandoffSourceKey = ref<string | null>(null)
 function clearPendingComposerScrollIntent() {
   pendingComposerScrollIntent = null
   if (composerScrollIntentTimer !== null) {
@@ -1534,13 +1533,22 @@ const promptCacheKeepaliveAvailable = computed(() => (
   promptCacheLease.isAvailable()
 ))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
+const browserUseSupported = computed(() => workbenchEnabled.value && !shareMode.value
+  && platform.capabilities.hasNativeWorkbenchSurfaces === true
+  && Boolean(platform.workbench.native)
+  && gatewayConnectionState.value === 'connected'
+  && Boolean(skillCatalog?.supportsCandidates()))
+let browserUseSelectionSequence = 0
+const browserUseSelection = ref<{ sessionKey: string; requestId: number } | null>(null)
+const browserUseSelectionPending = computed(() => browserUseSelection.value?.sessionKey === sessionKey.value)
+
 const promptAnnotationDesktopAvailable = computed(() => (
   workbenchEnabled.value
   && promptAnnotationsEnabled.value
   && platform.id === 'desktop'
   && platform.capabilities.hasNativeWorkbenchSurfaces === true
 ))
-const inputText = ref('')
+const { inputText, composerText, localPaths, appendLocalPaths, removeLocalPath, restoreInput } = useLocalPathDraft()
 const selectedSkills = ref<SelectedSkillRef[]>([])
 const composerRevision = ref(0)
 const aborted = ref(false)
@@ -1658,7 +1666,7 @@ const chatElevatedMode = useChatElevatedMode({
 })
 // Persist the composer draft per session so a refresh / session switch / crash
 // before the backend accepts a send cannot silently lose typed text (issue 248).
-const draftPersistence = useChatDraftPersistence({ sessionKey, inputText, selectedSkills })
+const draftPersistence = useChatDraftPersistence({ sessionKey, inputText: composerText, localPaths, selectedSkills })
 const {
   elevatedMode,
   loadElevatedMode,
@@ -1697,6 +1705,11 @@ const sandboxSetupRecovery = useSandboxSetupRecovery({
   runMode: requestedRunMode,
   autoRefresh: false,
 })
+const sandboxReadinessRefresh = useSandboxReadinessRefresh({
+  connectionState: gatewayConnectionState,
+  allowed: optionalSessionRpcAllowed,
+  recovery: sandboxSetupRecovery,
+})
 const {
   status: sandboxSetupStatus,
 } = sandboxSetupRecovery
@@ -1706,27 +1719,24 @@ const runMode = computed<SandboxRunMode>(() => effectiveComposerRunMode(
   activeRunModeLock.value,
   sandboxSetupRecovery.resolved.value,
 ))
-const composerAllowedRunModes = computed<SandboxRunMode[]>(() => {
-  if (!sandboxSetupRecovery.resolved.value) {
-    return allowedRunModes.value.filter((mode) => mode !== 'safe')
-  }
-  const status = sandboxSetupStatus.value
-  if (
-    status === null
-    || status.state !== 'ready'
-  ) {
-    return allowedRunModes.value.filter((mode) => mode !== 'safe')
-  }
-  return allowedRunModes.value
-})
+const composerAllowedRunModes = computed<SandboxRunMode[]>(() => allowedComposerRunModes(
+  allowedRunModes.value,
+  sandboxSetupStatus.value,
+  sandboxSetupRecovery.resolved.value,
+  sandboxSetupRecovery.available.value,
+))
 const composerSafeSetupAvailable = computed(() =>
   !sandboxSetupPending.value && sandboxSetupRecovery.canSetup.value)
 const composerSandboxSetupOpen = ref(false)
+const sandboxIdentityRepairRequired = computed(() => (
+  sandboxSetupStatus.value?.detail?.includes('offline_identity_repair_required') === true
+  || sandboxSetupStore.status?.detail?.includes('offline_identity_repair_required') === true
+))
 
 async function refreshPostBootstrapMetadata() {
   await refreshRunModePreference()
   if (!chatViewDisposed && gatewayAccess.isAvailable) {
-    await sandboxSetupRecovery.refresh()
+    await sandboxReadinessRefresh.refreshAfterBootstrap()
   }
 }
 
@@ -1767,6 +1777,8 @@ const activeStreamTaskId = ref<string>('')
 const activeStreamSessionKey = ref<string>('')
 const acceptanceStopPending = ref(false)
 const acceptanceRecoveryPending = ref(false)
+const acceptanceStopAvailable = ref(false)
+const durableStopPending = ref(false)
 const taskOwnership = useChatTaskOwnership()
 const taskProgress = useChatTaskProgress({
   sessionKey, currentEpoch, activeTaskId: taskOwnership.stopTargetTaskId,
@@ -1775,7 +1787,7 @@ const ordinaryTaskProgress = taskProgress.progress
 const isStopPending = computed(() => (
   Boolean(taskOwnership.stopRequestedTaskId.value)
   || acceptanceStopPending.value
-  || acceptanceRecoveryPending.value
+  || (durableStopPending.value && !acceptanceStopAvailable.value && !taskOwnership.stopTargetTaskId.value)
 ))
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
 let restoreLiveTurnSnapshot = (_snapshot: SessionReadSnapshot) => {}
@@ -1911,6 +1923,16 @@ const {
   ensureInterruptBubble,
   completeReasoningPresentation,
 } = chatStream
+useBrowserAutomationState({
+  native: platform.workbench.native,
+  sessionKey,
+  connected: computed(() => gatewayAccess.isAvailable
+    && gatewayAccess.isAuthenticated && gatewayAccess.isLocalOwner),
+  isStreaming,
+  runStatus,
+  activeStreamTaskId,
+  activeStreamSessionKey,
+})
 watch(
   () => gatewayAccess.isAvailable,
   available => setStreamConnectionAvailable(available),
@@ -1976,7 +1998,7 @@ const {
   prepareAttachmentsForSend,
 } = chatAttachments
 watch(
-  [inputText, pendingAttachments, selectedSkills],
+  [inputText, composerText, localPaths, pendingAttachments, selectedSkills],
   () => {
     composerRevision.value += 1
   },
@@ -1987,48 +2009,24 @@ let sendCurrentInput: () => void = () => {}
 let sendAutomaticInput: () => void = () => {}
 let sendUsageBarrierReplay: (payload: {
   text: string
+  localPathReferences?: string[]
   forkBeforeMessageId: string
 }) => Promise<boolean> = async () => false
-// Late-bound: dispatchHiddenSend is created below (useChatSend) but the /meta
-// slash handler (useChatSlashCommands, created earlier) needs it at call time.
-let dispatchHiddenForMeta: (
-  providerText: string,
-  displayText: string,
-  clientRequestId?: string,
-  targetSessionKey?: string,
-) => Promise<HiddenControlDispatchResult> = (
-  _providerText,
-  _displayText,
-  clientRequestId = '',
-  targetSessionKey = '',
-) => (
-  Promise.resolve({
-    status: 'rejected',
-    reason: 'invalid_request',
-    clientRequestId,
-    sessionKey: targetSessionKey || sessionKey.value,
-  })
-)
 let dispatchPlanComposerPrompt: (prompt: string, composerText: string) => void = () => {}
 let isCompactInFlightForCurrentSession: () => boolean = () => false
 let isQueuedDeliveryBlocked: () => boolean = () => false
 let isLiveDeliveryBlocked: () => boolean = () => true
-let dispatchQueuedHiddenControl: (
-  item: ChatPendingItem,
-  ownerSessionKey: string,
-) => Promise<ChatSendOutcome> = async () => 'not_sent'
 let dispatchQueuedItem: (
   item: ChatPendingItem,
   ownerSessionKey?: string,
+  preDispatchGuard?: () => boolean,
 ) => Promise<ChatSendOutcome> = async () => 'not_sent'
 const pendingQueueOwnerContext = ref<PendingQueueOwnerContext | null>(null)
-let handleHiddenControlDispatchResult: (result: HiddenControlDispatchResult) => void = () => {}
-let discardHiddenControlOutbox: (sessionKey: string, clientRequestId: string) => boolean = () => false
-let forgetHiddenControlOutbox: (sessionKey: string, clientRequestId: string) => void = () => {}
-let disarmGoalDraftForMetaRestore: () => void = () => {}
 const pendingInputWal = createPendingInputWal()
 const chatPendingQueue = useChatPendingQueue({
   selectedSkills,
+  localPathReferences: localPaths,
+  restoreInput,
   sessionKey,
   ownerContext: pendingQueueOwnerContext,
   inputText,
@@ -2059,7 +2057,9 @@ const chatPendingQueue = useChatPendingQueue({
   composerRevision,
   prepareAttachmentsForSend,
   onPendingPersistenceError: reason => {
-    const message = reason === 'order_conflict'
+    const message = reason === 'pause_failed'
+      ? t('chat.pending.pauseSaveFailed')
+      : reason === 'order_conflict'
       ? 'Queue order changed in another tab. The server order was restored.'
       : reason === 'attachments_unsupported'
       ? 'Queued attachments are not supported yet. Your draft was kept.'
@@ -2070,27 +2070,17 @@ const chatPendingQueue = useChatPendingQueue({
       tone: ['server_rejected', 'order_conflict'].includes(reason) ? 'warn' : 'danger',
     })
   },
-  dispatchHiddenControl: (item, ownerSessionKey) =>
-    dispatchQueuedHiddenControl(item, ownerSessionKey),
-  onHiddenControlDispatchResult: (result) => {
-    if (result.reason === 'discarded') {
-      const discardPersisted = discardHiddenControlOutbox(
-        result.sessionKey,
-        result.clientRequestId,
-      )
-      if (!discardPersisted) {
-        pushToast(t('chat.metaRuns.cancelNotSaved'), { tone: 'danger' })
-        return false
-      }
-    }
-    handleHiddenControlDispatchResult(result)
-    return true
-  },
-  dispatchPendingItem: (item, ownerSessionKey) =>
-    dispatchQueuedItem(item, ownerSessionKey),
+  dispatchPendingItem: (item, ownerSessionKey, preDispatchGuard) =>
+    dispatchQueuedItem(item, ownerSessionKey, preDispatchGuard),
 })
 const {
   pendingQueue,
+  autoSendPaused: pendingAutoSendPaused,
+  canSendFollowup: canSendPendingFollowup,
+  pausePendingAutoSend,
+  resumePendingAutoSend,
+  capturePendingAutoSendResume,
+  captureFollowupGuard,
   canQueueMore,
   canReorder: canReorderPendingQueue,
   isReordering: pendingQueueReorderPending,
@@ -2098,8 +2088,6 @@ const {
   maxPending,
   enqueuePendingPayload,
   enqueuePendingInput,
-  enqueueRecoveredInput,
-  enqueueHiddenControl,
   enqueuePendingSteerAttempt,
   removePendingChip,
   beginPendingDelivery,
@@ -2123,48 +2111,6 @@ const {
 watch(attachmentWorkBusy, (busy) => {
   if (!busy) flushDeferredPendingDrain()
 })
-
-function restoreMetaLaunchDraft(launchText: string, targetSessionKey: string): void {
-  const restored = String(launchText || '').trim()
-  const target = String(targetSessionKey || '').trim()
-  if (!restored || !target) return
-  if (target !== sessionKey.value) {
-    if (!persistDeferredMetaDraft({ sessionKey: target, launchText: restored })) {
-      pushToast(t('chat.metaRuns.couldNotRunSkill', { skill: restored.split(/\s+/, 3)[1] || 'MetaSkill' }), {
-        tone: 'danger',
-      })
-    }
-    return
-  }
-
-  // A restored /meta launch is an ordinary slash draft, never a Goal
-  // objective. Resolve that precedence before inspecting or queueing text.
-  disarmGoalDraftForMetaRestore()
-  const currentDraft = inputText.value.trim()
-  if (!currentDraft) {
-    inputText.value = restored
-    autoResizeTextarea()
-    nextTick(() => composerRef.value?.focusTextarea())
-    return
-  }
-  if (currentDraft === restored) return
-  if (!enqueueRecoveredInput(restored)) {
-    // Preserve the newer composer verbatim. A durable deferred copy is safer
-    // than concatenating two independently sendable requests into one turn.
-    persistDeferredMetaDraft({ sessionKey: target, launchText: restored })
-  }
-}
-
-function restoreDeferredMetaDrafts(
-  targetSessionKey: string,
-  skipLaunchTexts: ReadonlySet<string> = new Set(),
-): void {
-  if (sessionKey.value !== targetSessionKey) return
-  for (const launchText of takeDeferredMetaDrafts(targetSessionKey)) {
-    if (skipLaunchTexts.has(launchText)) continue
-    restoreMetaLaunchDraft(launchText, targetSessionKey)
-  }
-}
 
 const chatCompaction = useChatCompaction({
   sessionKey,
@@ -2277,12 +2223,9 @@ const {
   modelRoutingCapabilitiesByMode,
   routerVisualEffectsEnabled,
   routerVisualMode,
-  codingModeEnabled,
-  codingModeSettingsBusy,
   routerTierConfigs,
   defaultModelForAgent,
   loadFeatureToggles,
-  setCodingModeEnabled,
   bindFeatureRefresh,
 } = chatFeatureToggles
 
@@ -2296,6 +2239,7 @@ const chatSessionModel = useChatSessionModel({
   isDraft: isDraftSurface,
   available: computed(() => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated),
   connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
+  allowed: optionalSessionRpcAllowed,
 })
 const { modelName: storedSessionModelName } = chatSessionModel
 
@@ -2338,6 +2282,10 @@ const newTaskModel = useNewTaskModelSelection({
   capable: computed(() => gatewayAccess.chatSendInitialModel
     && gatewayAccess.isAvailable && gatewayAccess.isAuthenticated),
   connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
+  // Provider discovery is an optional network action. The composer starts it
+  // when the model picker is explicitly opened, so an unreachable provider
+  // cannot delay the first chat/sidebar control requests.
+  autoRefresh: false,
   routingMode: modelRoutingMode,
   busy: computed(() => isStreaming.value || modelRoutingSettingsBusy.value
     || acceptanceStopPending.value || acceptanceRecoveryPending.value),
@@ -2597,6 +2545,7 @@ const chatHistory = useChatHistory({
     }
   },
 })
+const historyDetails = useChatHistoryDetails({ sessionKey, messages })
 const {
   historySessionKey,
   historyState,
@@ -2704,7 +2653,7 @@ const steerDelivery = useChatSteerDelivery({
     chatStream.acknowledgeSteerBoundary?.(boundaryKey, modelCallId, iteration),
   scheduleHistorySync,
   removePendingItem: item => settlePendingDelivery(item, 'accepted'),
-  restoreSteerIntoComposer: text => appendComposerText(text),
+  restoreSteerIntoComposer: (text, paths) => appendComposerText(text, paths),
   onProjected: () => {
     autoScroll.value = true
     scrollToBottom()
@@ -2746,8 +2695,14 @@ const voiceCapability = useSetupStatus<{ audioConfigured?: boolean }>(injectedSe
 })
 const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured === true)
 
+const { readMessageText } = useChatMessageContent(sessionKey)
+const messageActionSessionIdentity = () => JSON.stringify([sessionKey.value, currentEpoch.value])
 const chatMessageActions = useChatMessageActions({
+  sessionIdentity: messageActionSessionIdentity,
+  readMessageText,
   selectedSkills,
+  localPathReferences: localPaths,
+  restoreInput,
   messages,
   inputText,
   isStreaming,
@@ -2887,6 +2842,7 @@ applySessionRunState = chatSessionSubscription.applySessionRunState
 
 const chatSessionBootstrap = useChatSessionBootstrap({
   sessionKey,
+  isProvisionalDraft: isProvisionalDraftSession,
   sessionReadLifecycle,
   loadHistory: async (context, retry) => (
     retry
@@ -3076,7 +3032,6 @@ function bindFreshGuestDraft() {
     // Hello owns the namespace. Cancel the captured pre-Hello lease before
     // ready() continuations can subscribe with its provisional owner key.
     cancelSessionBootstrap()
-    metaDraftRecovery.invalidate()
     draftPersistence.rebindCurrentDraft(key)
     // A change of authority preserves the editor but requires explicit Send.
     pendingAutoSend.value = ''
@@ -3170,27 +3125,28 @@ const sessionHasActiveWork = computed(() => (
   || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
 ))
 const canStop = computed(() => (
-  !isSessionHydrating.value
-  && taskOwnership.hydrationResolved.value
-  && !taskOwnership.stopRequestedTaskId.value
+  !taskOwnership.stopRequestedTaskId.value
   && !acceptanceStopPending.value
-  && !acceptanceRecoveryPending.value
-  && (
-    Boolean(taskOwnership.stopTargetTaskId.value)
-    || activeStreamTaskId.value === PENDING_STREAM_TASK_ID
-    || Boolean(
-      activeStreamTaskId.value
-      && ![
-        FINISHED_STREAM_TASK_ID,
-        STOPPED_STREAM_TASK_ID,
-      ].includes(activeStreamTaskId.value),
+  && (acceptanceStopAvailable.value || (
+    !isSessionHydrating.value
+    && taskOwnership.hydrationResolved.value
+    && (
+      Boolean(taskOwnership.stopTargetTaskId.value)
+      || activeStreamTaskId.value === PENDING_STREAM_TASK_ID
+      || Boolean(
+        activeStreamTaskId.value
+        && ![
+          FINISHED_STREAM_TASK_ID,
+          STOPPED_STREAM_TASK_ID,
+        ].includes(activeStreamTaskId.value),
+      )
+      || isCompactInFlightForCurrentSession()
+      || activeTaskGroups.value.size > 0
+      || activePlanRun.value?.status === 'queued'
+      || activePlanRun.value?.status === 'running'
+      || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
     )
-    || isCompactInFlightForCurrentSession()
-    || activeTaskGroups.value.size > 0
-    || activePlanRun.value?.status === 'queued'
-    || activePlanRun.value?.status === 'running'
-    || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
-  )
+  ))
 ))
 const runModeLocked = computed(
   () => isSessionHydrating.value
@@ -3264,7 +3220,6 @@ const {
   startDraftSession,
   switchToSession: switchRuntimeToSession,
   adoptResponseSession,
-  rebindDraftSession,
 } = chatSessionRuntime
 switchToPlanSession = switchToSession
 
@@ -3276,54 +3231,9 @@ async function switchToSession(nextSessionKey: string) {
   return outcome
 }
 
-const metaSkillSetup = useMetaSkillSetup({
-  metaRunCenter,
-  currentSessionKey: sessionKey,
-  dispatchHidden: (providerText: string, displayText: string, clientRequestId?: string) => (
-    dispatchHiddenForMeta(providerText, displayText, clientRequestId)
-  ),
-  autoRestore: false,
-  restoreDraft: restoreMetaLaunchDraft,
-  discardDraft: async (draftSessionKey: string, clientRequestId: string) => {
-    const result = await metaRunCenter.discardDraft({
-      sessionKey: draftSessionKey,
-      clientRequestId,
-    })
-    if (result.accepted === true) {
-      forgetHiddenControlOutbox(draftSessionKey, clientRequestId)
-      return 'accepted'
-    }
-    if (result.discarded !== true) return 'unconfirmed'
-    // Only after the server confirms atomic discard may the setup flow restore
-    // plain composer text. Remove the matching browser hidden-control copy too,
-    // otherwise a later session restore could replay the old stable id beside
-    // the newly restored composer request.
-    forgetHiddenControlOutbox(draftSessionKey, clientRequestId)
-    return 'discarded'
-  },
-  onDraftAlreadyAccepted: () => {
-    pushToast(t('chat.metaRuns.cancelAlreadyAccepted'), { tone: 'info', duration: 7000 })
-  },
-  forgetHiddenControl: (draftSessionKey: string, clientRequestId: string) => {
-    forgetHiddenControlOutbox(draftSessionKey, clientRequestId)
-  },
-})
-const {
-  setupState,
-  requestSetup: requestMetaSetup,
-  confirmSetup,
-  beginProviderHandoff,
-  cancelProviderHandoff,
-  retrySetup,
-  cancelSetup,
-  restoreSetupJob: restoreMetaSetupJob,
-  handleHiddenDispatchResult,
-} = metaSkillSetup
-handleHiddenControlDispatchResult = handleHiddenDispatchResult
-const metaSetupProviderNavigationPending = ref(false)
-
 function projectAcceptedGoalMessage({
   objective,
+  localPathReferences,
   clientMessageId,
   response,
 }: GoalSetAcceptedPayload): void {
@@ -3357,6 +3267,7 @@ function projectAcceptedGoalMessage({
       ...current,
       role: 'user',
       text: current.text || objective,
+      ...(localPathReferences?.length ? { localPathReferences: [...localPathReferences] } : {}),
       ts: current.ts ?? timestamp,
       clientId: current.clientId || clientMessageId,
       messageId,
@@ -3366,6 +3277,7 @@ function projectAcceptedGoalMessage({
     messages.value.push({
       role: 'user',
       text: objective,
+      ...(localPathReferences?.length ? { localPathReferences: [...localPathReferences] } : {}),
       ts: timestamp,
       clientId: clientMessageId,
       messageId,
@@ -3379,6 +3291,7 @@ function projectAcceptedGoalMessage({
 }
 
 const chatGoals = useChatGoals({
+  localPathReferences: localPaths,
   connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
   connectionAvailable: () => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated,
   goalCenter,
@@ -3464,7 +3377,6 @@ const {
   clear: clearGoalMutation,
   status: goalStatus,
 } = chatGoals
-disarmGoalDraftForMetaRestore = disarmGoalMode
 
 async function editGoalFromRibbon(
   objective: string,
@@ -3531,19 +3443,18 @@ const goalOutcomeHasMessageAnchor = computed(() => (
 const chatSlashCommands = useChatSlashCommands({
   skillCatalog,
   selectedSkills,
-  getCaret: () => composerRef.value?.composerElement()?.querySelector('textarea')?.selectionStart ?? inputText.value.length,
+  getCaret: () => composerRef.value?.composerElement()?.querySelector('textarea')?.selectionStart ?? composerText.value.length,
   setCaret: (position) => { void nextTick(() => {
     composerRef.value?.focusTextarea()
     composerRef.value?.composerElement()?.querySelector('textarea')?.setSelectionRange(position, position)
   }) },
   manageSkill: (name) => { void router.push({ path: '/skills', query: { skill: name } }) },
-  hasNonTextInput: () => pendingAttachments.value.length > 0 || activePromptAnnotations.value.length > 0,
   commandCatalog,
   usageReporting,
   sessionMaintenance,
-  metaRunCenter,
   catalogCallOptions: optionalSessionReadOptions,
-  inputText,
+  inputText: composerText,
+  submissionText: inputText,
   sessionKey,
   autoResizeTextarea,
   newSession: () => {
@@ -3560,26 +3471,11 @@ const chatSlashCommands = useChatSlashCommands({
   showCompactStatus,
   showCompactionToast,
   notify: (message: string) => pushToast(message, { duration: 6000 }),
-  dispatchHidden: (
-    providerText: string,
-    displayText: string,
-    clientRequestId?: string,
-    targetSessionKey?: string,
-  ) => dispatchHiddenForMeta(
-    providerText,
-    displayText,
-    clientRequestId,
-    targetSessionKey,
-  ),
-  restoreDraft: restoreMetaLaunchDraft,
-  requestMetaSetup,
   dispatchPlanPrompt: (prompt: string, composerText: string) => {
     dispatchPlanComposerPrompt(prompt, composerText)
   },
   activatePlanMode: activatePlanComposerMode,
   planModeAvailable: () => planUiAvailable.value,
-  codingModeEnabled,
-  setCodingModeEnabled,
   armGoal: activateGoalComposerMode,
   startGoal,
   goalStatus,
@@ -3591,22 +3487,49 @@ const chatSlashCommands = useChatSlashCommands({
 const {
   slashOpen,
   slashIdx,
+  skillCandidates,
   skillsLoading,
   skillsError,
-  metaDraft,
-  launchMetaDraft,
   invalidateSkillCandidates,
   filteredSlashCmds,
   loadSlashCommands,
+  loadSkillCandidates,
   handleSlashInput,
   closeSlashMenu,
   completeSlashCmd,
   activateSlashCmd,
   classifySlashCommand,
   executeSlashCommand,
-  restoreDurableMetaDrafts: restoreServerMetaDrafts,
 } = chatSlashCommands
-watch([sessionKey, codingModeEnabled, gatewayConnectionState, () => activeWorkspace.value?.id], invalidateSkillCandidates)
+
+const browserUseAvailable = computed(() => browserUseSupported.value
+  && skillCandidates.value.some(candidate => candidate.name === 'browser-use' && candidate.ready))
+
+function prepareAddMenu() {
+  if (!browserUseSupported.value) return
+  invalidateSkillCandidates()
+  void loadSkillCandidates()
+}
+
+async function selectBrowserUse() {
+  if (!browserUseAvailable.value || browserUseSelectionPending.value) return
+  const requestId = ++browserUseSelectionSequence
+  const originSessionKey = sessionKey.value
+  browserUseSelection.value = { sessionKey: originSessionKey, requestId }
+  try {
+    if (await chatSlashCommands.selectSkillByName('browser-use')
+      && sessionKey.value === originSessionKey) {
+      await nextTick()
+      composerRef.value?.focusTextarea()
+    }
+  } finally {
+    if (browserUseSelection.value?.requestId === requestId) browserUseSelection.value = null
+  }
+}
+watch(sessionKey, current => {
+  if (browserUseSelection.value?.sessionKey !== current) browserUseSelection.value = null
+})
+watch([sessionKey, gatewayConnectionState, () => activeWorkspace.value?.id], invalidateSkillCandidates)
 
 watch([slashIdx, filteredSlashCmds], () => {
   slashMenuRef.value
@@ -3626,6 +3549,9 @@ useDocumentEvent('pointerdown', event => {
 
 const chatComposerShortcuts = useChatComposerShortcuts({
   inputText,
+  localPathReferences: localPaths,
+  restoreInput,
+  textareaText: composerText,
   composing,
   messages,
   pendingQueue,
@@ -3640,8 +3566,14 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   completeSlashCmd,
   activateSlashCmd,
   popPendingTail,
-  enqueuePendingInput,
+  enqueuePendingInput: async text => {
+    const resume = !isStopPending.value ? capturePendingAutoSendResume() : undefined
+    const queued = await enqueuePendingInput(text)
+    if (queued) resume?.()
+    return queued
+  },
   sendCurrentInput: () => sendCurrentInput(),
+  handleLongPaste: handleLongPastedInput,
   cancelMessageEdit: () => cancelEdit(),
 })
 const {
@@ -3652,14 +3584,16 @@ const {
 resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
 const chatSend = useChatSend({
+  durableDelivery,
   selectedSkills,
+  localPathReferences: localPaths,
+  restoreInput,
   consumeAcceptedDraft: draftPersistence.consumeAcceptedDraft,
   captureAttachmentDraftConsumption: chatAttachments.captureDraftConsumption,
-  metaRunCenter,
   turnCommands: {
     send(request, options) {
-      // Retire freshness at the delivery boundary, including hidden sends and
-      // unknown acceptance receipts. A reconnect must retain that attempt's key.
+      // Retire freshness at the delivery boundary, including unknown acceptance
+      // receipts. A reconnect must retain that attempt's key.
       forgetFreshDraftSession(
         request.kind === 'new-turn' ? request.params.sessionKey : request.params.key,
       )
@@ -3667,6 +3601,9 @@ const chatSend = useChatSend({
     },
     cancel: (request, options) => turnCommands.cancel(request, options),
     steer: (request, options) => turnCommands.steer(request, options),
+    lookupReceipt: (request, options) => turnCommands.lookupReceipt?.(request, options)
+      || Promise.resolve({ status: 'unsupported' as const }),
+    supportsReceiptLookup: () => turnCommands.supportsReceiptLookup?.() ?? false,
     supports: capability => turnCommands.supports(capability),
   },
   activeSteerCapability,
@@ -3675,6 +3612,8 @@ const chatSend = useChatSend({
   sessionKey,
   pendingQueueOwnerContext,
   hasPendingQueueWork: () => pendingQueue.value.length > 0,
+  pausePendingAutoSend,
+  capturePendingAutoSendResume,
   pendingInputWal,
   busySendMode,
   modelRoutingMode,
@@ -3683,7 +3622,6 @@ const chatSend = useChatSend({
   initialRoutingMode,
   initialModel: newTaskModel.initialModel,
   initialProvider: newTaskModel.initialProvider,
-  restoreInitialModel: newTaskModel.restore,
   elevatedMode,
   runMode,
   pendingAttachments,
@@ -3725,6 +3663,9 @@ const chatSend = useChatSend({
       freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
     }
     persistSession(key, { source: 'chatView.draftAccepted' })
+    // Acceptance created the durable session. The replacement read lease must
+    // no longer inherit the provisional intent still held by useChatSend.
+    pendingSessionIntent.value = null
     // The provisional draft bootstrap can finish before the Gateway creates
     // the first durable session. Re-register immediately after acceptance so
     // buffered text, tool, and reasoning frames replay into the first turn.
@@ -3745,19 +3686,30 @@ const chatSend = useChatSend({
   taskOwnership,
   acceptanceStopPending,
   acceptanceRecoveryPending,
+  acceptanceStopAvailable,
+  durableStopPending,
   autoScroll,
   stream: chatStream,
   canStop: () => canStop.value,
+  canStopKnownTask: () => !isSessionHydrating.value && taskOwnership.hydrationResolved.value,
   normalizeElevatedMode,
   adoptResponseSession: async (key, ownerRequestId) => {
     const sourceKey = sessionKey.value
+    const optimisticTitle = draftHandoffSourceKey.value === sourceKey
+      ? firstUserTitleForResponseHandoff(sourceKey)
+      : ''
     const workspaceId = freshTaskDraft.materializedWorkspaceBySession.value[sourceKey]
       || boundWorkspaceId.value
     if (workspaceId && key !== sourceKey) {
       freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
       freshTaskDraft.forgetMaterializedProjectTask(sourceKey)
     }
-    return adoptResponseSession(key, ownerRequestId)
+    const adoption = await adoptResponseSession(key, ownerRequestId)
+    if (optimisticTitle && key) {
+      optimisticSessionTitle.value = { key, title: optimisticTitle }
+    }
+    if (draftHandoffSourceKey.value === sourceKey) draftHandoffSourceKey.value = null
+    return adoption
   },
   recoverPendingQueueHandoff,
   failPendingQueueHandoff,
@@ -3771,7 +3723,6 @@ const chatSend = useChatSend({
   enqueuePendingInput,
   enqueuePendingPayload,
   cancelDurablePendingItem: cancelDurableItem,
-  enqueueHiddenControl,
   enqueuePendingSteerAttempt,
   steerDelivery,
   restoreSteerIntoComposer: text => appendComposerText(text),
@@ -3790,13 +3741,6 @@ const {
   sendQueuedFollowup,
   sendUsageBarrierReplay: dispatchUsageBarrierReplay,
   dispatchComposerPrompt,
-  dispatchHiddenSend,
-  dispatchQueuedHiddenSend,
-  discardHiddenControl,
-  forgetHiddenControl,
-  flushPendingMetaDiscards,
-  restoreHiddenControls,
-  sendHiddenMetaPreflightConfirmation,
   recoverResponseHandoffs,
 } = chatSend
 sendUsageBarrierReplay = dispatchUsageBarrierReplay
@@ -3810,7 +3754,10 @@ watch(
 async function onSend(
   sendOptions?: Parameters<typeof dispatchCurrentInput>[0],
 ): Promise<void> {
-  markProvisionalDraftUsed()
+  if (browserUseSelectionPending.value) return
+  if (pendingSessionIntent.value === 'new_chat') {
+    draftHandoffSourceKey.value = sessionKey.value
+  }
   if (pendingAutoSendSessionKey.value === sessionKey.value) {
     pendingAutoSend.value = ''
     pendingAutoSendSessionKey.value = ''
@@ -3818,66 +3765,6 @@ async function onSend(
   await dispatchCurrentInput(sendOptions)
 }
 sendCurrentInput = onSend
-dispatchHiddenForMeta = dispatchHiddenSend
-discardHiddenControlOutbox = discardHiddenControl
-forgetHiddenControlOutbox = forgetHiddenControl
-
-async function restoreDurableMetaControls(
-  targetSessionKey: string,
-  prefetchedServerDrafts?: DurableMetaDraft[],
-  isCurrent: () => boolean = () => true,
-): Promise<void> {
-  // Setup owns a matching cancellation tombstone so it can clear its recovery
-  // checkpoint without ever re-entering launch. Queue-only tombstones are then
-  // retried here before any server draft is considered.
-  const pendingDiscardIds = new Set(
-    listPendingMetaDiscards(targetSessionKey).map(item => item.clientRequestId),
-  )
-  await restoreMetaSetupJob(targetSessionKey)
-  if (!isCurrent()) return
-  const setupDiscardRequestId = setupState.value?.retryMode === 'discard'
-    ? setupState.value.resumeRequestId || ''
-    : ''
-  const flushedDiscardIds = await flushPendingMetaDiscards(
-    targetSessionKey,
-    setupDiscardRequestId ? [setupDiscardRequestId] : [],
-  )
-  if (!isCurrent()) return
-  for (const requestId of flushedDiscardIds) {
-    pendingDiscardIds.add(requestId)
-  }
-  const serverDrafts = (prefetchedServerDrafts
-    ?? await listServerMetaDrafts(metaRunCenter, { sessionKey: targetSessionKey }))
-    .filter(draft => !pendingDiscardIds.has(draft.clientRequestId))
-  if (!isCurrent()) return
-  restoreDeferredMetaDrafts(
-    targetSessionKey,
-    new Set(serverDrafts.map(draft => draft.launchText)),
-  )
-  const activeSetupRequestId = setupState.value?.sessionKey === targetSessionKey
-    ? setupState.value.resumeRequestId || setupState.value.providerHandoff?.clientRequestId || ''
-    : ''
-  const matchingServerDrafts = serverDrafts.filter(
-    draft => draft.sessionKey === targetSessionKey,
-  )
-  const setupHandledRequestIds = activeSetupRequestId
-    ? matchingServerDrafts
-        .filter(draft => draft.clientRequestId === activeSetupRequestId)
-        .map(draft => draft.clientRequestId)
-    : []
-  const attemptedServerRequestIds = await restoreServerMetaDrafts(
-    matchingServerDrafts.filter(
-      draft => draft.clientRequestId !== activeSetupRequestId,
-    ),
-    isCurrent,
-  )
-  if (!isCurrent()) return
-  await restoreHiddenControls(
-    targetSessionKey,
-    [...setupHandledRequestIds, ...attemptedServerRequestIds],
-    isCurrent,
-  )
-}
 
 function flushPendingAutoSend(targetSessionKey: string): boolean {
   if (
@@ -3897,58 +3784,10 @@ function flushPendingAutoSend(targetSessionKey: string): boolean {
   return true
 }
 
-async function handleAuthoritativeSessionSubscription(
-  targetSessionKey: string,
-  prefetchedServerDrafts?: DurableMetaDraft[],
-): Promise<void> {
-  const attempt = ++durableRecoveryGeneration
-  const isCurrent = () => (
-    chatViewActive
-    && attempt === durableRecoveryGeneration
-    && sessionKey.value === targetSessionKey
-  )
-  if (!isCurrent()) return
-  // Ordinary Sessions Hub handoffs must never wait behind optional Meta
-  // recovery. Durable controls remain persisted for the next reconnect.
-  if (flushPendingAutoSend(targetSessionKey)) return
-  await Promise.all([
-    metaRuns.hydrateRecovery(),
-    restoreDurableMetaControls(targetSessionKey, prefetchedServerDrafts, isCurrent),
-  ])
+async function handleAuthoritativeSessionSubscription(targetSessionKey: string): Promise<void> {
+  if (chatViewActive && sessionKey.value === targetSessionKey) flushPendingAutoSend(targetSessionKey)
 }
 
-function isPristineDraftForRecovery(expectedSessionKey: string, agentId: string): boolean {
-  return !provisionalDraftUsed
-    && sessionKey.value === expectedSessionKey
-    && isDraftRoute()
-    && draftAgentId() === agentId
-    && agentIdFromSessionKey(expectedSessionKey) === agentId
-    && pendingSessionIntent.value === 'new_chat'
-    && messages.value.length === 0
-    && inputText.value.length === 0
-    && pendingAttachments.value.length === 0
-    && pendingQueue.value.length === 0
-    && pendingAutoSend.value.length === 0
-    && !isStreaming.value
-    && setupState.value?.sessionKey !== expectedSessionKey
-}
-
-const metaDraftRecovery = createChatMetaDraftRecovery({
-  currentSessionKey: () => sessionKey.value,
-  listDrafts: query => queryServerMetaDrafts(metaRunCenter, query),
-  isPristineDraft: isPristineDraftForRecovery,
-  rebindDraftSession,
-  onAuthoritativeSubscription: handleAuthoritativeSessionSubscription,
-})
-
-let provisionalDraftUsed = false
-let durableRecoveryGeneration = 0
-
-function markProvisionalDraftUsed(): void {
-  if (provisionalDraftUsed) return
-  provisionalDraftUsed = true
-  metaDraftRecovery.invalidate()
-}
 const sameTurnSteerAvailable = computed(() => (
   isStreaming.value
   && chatSend.supportsSameTurnSteer()
@@ -4016,16 +3855,17 @@ async function onComposerSend() {
   if (goalDraftArmed.value) {
     const goalText = inputText.value.trim()
     if (!goalText) return
+    const submittedRevision = composerRevision.value
     const started = await startGoal(goalText)
     if (!started) return
     disarmGoalMode()
-    inputText.value = ''
+    if (composerRevision.value === submittedRevision) inputText.value = ''
     autoResizeTextarea()
     return
   }
   const target = replanTarget.value
   if (!target) {
-    onSend()
+    onSend({ resumeQueueOnSuccess: !isStopPending.value })
     return
   }
   const prompt = inputText.value.trim()
@@ -4043,11 +3883,9 @@ sendCurrentInput = onComposerSend
 sendAutomaticInput = () => {
   void onSend({ cancelIfComposerChanged: true })
 }
-dispatchHiddenForMeta = dispatchHiddenSend
 dispatchPlanComposerPrompt = (prompt, composerText) => {
   void dispatchComposerPrompt(prompt, composerText)
 }
-dispatchQueuedHiddenControl = dispatchQueuedHiddenSend
 dispatchQueuedItem = sendQueuedFollowup
 
 function editPendingMessage(pendingUiId: string) {
@@ -4057,7 +3895,24 @@ function editPendingMessage(pendingUiId: string) {
 
 const pendingSteerClicks = new WeakSet<ChatPendingItem>()
 
+async function sendPendingMessage(pendingUiId: string) {
+  if (isStopPending.value || !canSendPendingFollowup.value) return
+  const ownerSessionKey = sessionKey.value
+  const preDispatchGuard = captureFollowupGuard(ownerSessionKey, true)
+  const candidate = pendingQueue.value.find(item => item.pendingUiId === pendingUiId)
+  if (!candidate || candidate.steerAttempt) return
+  const item = beginPendingDelivery(pendingUiId)
+  if (!item) return
+  let outcome: ChatSendOutcome = 'retryable_failure'
+  try {
+    outcome = await sendQueuedFollowup(item, ownerSessionKey, preDispatchGuard)
+  } finally {
+    settlePendingDelivery(item, outcome)
+  }
+}
+
 async function steerPendingMessage(pendingUiId: string) {
+  if (isStopPending.value) return
   const candidate = pendingQueue.value.find(item => item.pendingUiId === pendingUiId)
   if (
     candidate?.steerAttempt
@@ -4068,15 +3923,13 @@ async function steerPendingMessage(pendingUiId: string) {
   ) return
   const item = candidate?.steerAttempt
     ? candidate
-    : beginPendingDelivery(pendingUiId, candidate?.hiddenControl === true)
+    : beginPendingDelivery(pendingUiId)
   if (!item) return
   if (candidate?.steerAttempt) pendingSteerClicks.add(candidate)
 
   let outcome: ChatSendOutcome = 'retryable_failure'
   try {
-    outcome = item.hiddenControl
-      ? await dispatchQueuedHiddenSend(item, item.ownerSessionKey || sessionKey.value)
-      : await sendQueuedSteer(item)
+    outcome = await sendQueuedSteer(item)
   } finally {
     settlePendingDelivery(item, outcome)
     pendingSteerClicks.delete(item)
@@ -4204,7 +4057,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
     liveSkillLoads.value[turnId] = mergeSkillLoad(liveSkillLoads.value[turnId] || [], receipt)
     if (receipt.status === 'failed') invalidateSkillCandidates()
   },
-  onRecoveryRequired: () => { void recoverCurrentSession() },
+  onRecoveryRequired: () => { void recoverCurrentSession().catch(() => {}) },
   onTaskProgress: taskProgress.applyEvent,
   onTaskSettled: (taskId, epoch) => {
     chatPlans.noteTaskSettled(taskId, epoch)
@@ -4249,7 +4102,6 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   restoreSteerIntoComposer: text => appendComposerText(text),
   saveWidgetState,
   onSessionSubscribed: () => {
-    if (isDraftRoute()) metaDraftRecovery.retry(draftAgentId())
     return handleAuthoritativeSessionSubscription(sessionKey.value)
   },
   handleSessionConnectionState: state =>
@@ -4263,7 +4115,11 @@ const { attachTurnReasoning } = rpcEventHandlers
 
 // The append-only turn log is the single live content projection. The activity
 // head (phase/elapsed) remains presentation state outside the transcript fold.
-const liveTimelineItems = computed(() => foldedTurn.value.timelineItems)
+const liveTimelineItems = computed(() => stripBackgroundProcessNoticeTimeline(
+  foldedTurn.value.timelineItems,
+  foldedTurn.value.toolCalls,
+  renderMarkdown,
+))
 const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value, {
   keepToolTurnTextInActivity: true,
 }))
@@ -4522,8 +4378,10 @@ function recoverCurrentSession(scope?: { readonly keys: readonly string[], reado
   if (!lease) return Promise.resolve(false)
   const prior = sessionRecoveries.get(lease)
   if (prior) return prior
-  const pending = retryLive(false).then(result => key === sessionKey.value
-    && sessionReadLifecycle.current() === lease && result.authoritative).catch(() => false)
+  const pending = retryLive(false).then(result => {
+    if (key !== sessionKey.value || sessionReadLifecycle.current() !== lease) return false
+    return sessionRecoverySucceeded(result)
+  })
   const observed = pending.finally(() => {
     if (sessionRecoveries.get(lease) === observed) sessionRecoveries.delete(lease)
   })
@@ -4541,34 +4399,6 @@ watch(sessionKey, () => {
 // only its handle; the shared WebSocket and diagnostic listeners stay alive.
 watch(sessionKey, key => chatRpcSubscriptions.setSessionKey(key))
 
-// MetaSkill run UI: preflight checkpoint + run-progress ribbon, driven by the
-// four session.event.meta_* frames (delivered via the '*' wildcard, so this
-// controller must not re-consume stream_seq).
-const metaRuns = useMetaRuns({
-  metaRunCenter,
-  sessionKey,
-  currentEpoch,
-  lastStreamSeq,
-  observeStreamGeneration,
-  sendHiddenConfirmation: sendHiddenMetaPreflightConfirmation,
-  sendHiddenReplay: (providerText: string, displayText: string) => (
-    dispatchHiddenForMeta(providerText, displayText)
-  ),
-  scrollToStepCard,
-  sendComposerText,
-  lastUserMessageText,
-  // The composer placeholder is a computed prop, so a true placeholder setter
-  // is not exposed; surface the switch-skill hint via the toast path (keeping
-  // focus) so the vanilla guidance is not silently dropped.
-  setComposerPlaceholder: (hint: string) => pushToast(hint, { duration: 6000 }),
-  focusComposer: () => composerRef.value?.focusTextarea(),
-  pushToast,
-})
-
-// Meta retries/replays and landing suggestions must never overwrite an
-// operator-owned draft. Occupied composers keep the generated prompt as an
-// immutable queue item; an empty but blocked composer stages it for explicit
-// retry without pretending it was sent.
 function sendComposerText(text: string) {
   const next = String(text || '')
   if (!next) return
@@ -4599,35 +4429,6 @@ function sendComposerText(text: string) {
     return
   }
   void sendCurrentInput()
-}
-
-// The most recent user message text (mirrors vanilla `_latestUserMessageText`).
-function lastUserMessageText(): string {
-  for (let i = messages.value.length - 1; i >= 0; i--) {
-    if (messages.value[i]?.role === 'user') return messages.value[i].text || ''
-  }
-  return ''
-}
-
-// Resolve a step's in-thread tool card and scroll it into view (chip click /
-// show-detail). The card carries data-tool-use-id="meta_step_<id>".
-function scrollToStepCard(toolUseId: string) {
-  const root = threadRef.value
-  if (!root) return
-  const card = root.querySelector(`[data-tool-use-id="${cssEscapeAttr(toolUseId)}"]`)
-  if (card && typeof (card as HTMLElement).scrollIntoView === 'function') {
-    const reduceMotion = typeof window !== 'undefined'
-      && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
-    beginActiveThreadNavigation(!reduceMotion)
-    ;(card as HTMLElement).scrollIntoView({ block: 'center', behavior: reduceMotion ? 'auto' : 'smooth' })
-  }
-}
-
-function cssEscapeAttr(value: string): string {
-  if (typeof window !== 'undefined' && window.CSS && typeof window.CSS.escape === 'function') {
-    return window.CSS.escape(value)
-  }
-  return String(value ?? '').replace(/[^a-zA-Z0-9_-]/g, '\\$&')
 }
 
 // History syncs replace the messages array; rows carry reasoning text but
@@ -4856,7 +4657,8 @@ const activeProjectComposerBlockMessage = computed(() => {
 })
 
 const composerSendBlockedMessage = computed(() =>
-  (forkTransition.value
+  (browserUseSelectionPending.value ? t('chat.skillPalette.loading') : '')
+  || (forkTransition.value
     ? t(
         forkTransition.value.phase === 'error'
           ? 'chat.forkOpenFailed'
@@ -4954,20 +4756,40 @@ function setCollaborationMode(mode: CollaborationMode) {
 }
 
 const sessionTitles = useChatSessionTitles()
-const currentChatTitle = computed(() => {
-  return resolveChatHeaderTitle(
-    sessionKey.value,
-    sessionTitles.value,
+function chatHeaderTitleLabels() {
+  return {
+    newChat: t('chat.newChat'),
+    chatWithSuffix: (suffix: string) => t('chat.chatWithSuffix', { suffix }),
+  }
+}
+
+function firstUserTitleForResponseHandoff(sourceKey: string): string {
+  const title = resolveChatHeaderTitle(
+    sourceKey,
+    {},
     messages.value,
     stripTimePrefix,
-    {
-      newChat: t('chat.newChat'),
-      chatWithSuffix: suffix => t('chat.chatWithSuffix', { suffix }),
-    },
+    chatHeaderTitleLabels(),
   )
-})
+  const suffix = sourceKey.split(':').pop() || ''
+  const genericTitles = new Set([
+    t('chat.newChat'),
+    t('chat.chatWithSuffix', { suffix }),
+  ])
+  return genericTitles.has(title) ? '' : title
+}
+
+const currentChatTitle = computed(() => resolveChatHeaderTitle(
+  sessionKey.value,
+  sessionTitles.value,
+  messages.value,
+  stripTimePrefix,
+  chatHeaderTitleLabels(),
+))
 
 const chatMarkdownExport = useChatMarkdownExport({
+  sessionIdentity: messageActionSessionIdentity,
+  readMessageText,
   messages: renderedMessages,
   currentTitle: currentChatTitle,
   aiGeneratedLabel,
@@ -4998,6 +4820,7 @@ async function setComposerRunMode(mode: SandboxRunMode): Promise<void> {
     sandboxSetupStatus.value,
     composerSafeSetupAvailable.value,
     sandboxSetupRecovery.resolved.value,
+    sandboxSetupRecovery.available.value,
   )
   if (action === 'ignore') return
   if (action === 'setup') {
@@ -5019,10 +4842,10 @@ function cancelComposerSandboxSetup(): void {
 
 async function confirmComposerSandboxSetup(): Promise<void> {
   if (sandboxSetupPending.value) return
-  const ready = await sandboxSetupStore.startSafeSetup()
+  const ready = await sandboxSetupStore.startSafeSetup({ repairIdentity: sandboxIdentityRepairRequired.value })
+  if (sandboxSetupOutcome.value !== 'in_progress') composerSandboxSetupOpen.value = false
   await sandboxSetupRecovery.refresh()
   if (ready) {
-    composerSandboxSetupOpen.value = false
     await refreshRunModePreference()
   }
 }
@@ -5056,15 +4879,6 @@ function openComposerModelSettings() {
   void router.push('/settings/modelStrategy').catch(() => {})
 }
 
-async function setComposerCodingModeEnabled(enabled: boolean) {
-  const updated = await setCodingModeEnabled(enabled)
-  pushToast(t(
-    updated
-      ? (enabled ? 'chat.codingMode.enabled' : 'chat.codingMode.disabled')
-      : 'chat.codingMode.updateFailed',
-  ))
-}
-
 // A suggestion chip is an explicit task choice. Route it through the same
 // composer-backed send path as every other message so routing, attachments,
 // optimistic state, and recovery behavior stay identical.
@@ -5073,15 +4887,49 @@ function applyLandingSuggestion(text: string) {
   sendComposerText(text)
 }
 
-function appendComposerText(text: string) {
-  const next = String(text || '').trim()
-  if (!next) return
-  inputText.value = inputText.value.trim()
-    ? `${inputText.value.trimEnd()}\n${next}`
-    : next
+function appendComposerText(text: string, paths?: readonly string[]) {
+  const presentation = localPathPresentation(String(text || '').trim(), paths)
+  const next = presentation.text.trim()
+  if (!next && !presentation.paths.length) return
+  if (next) composerText.value = composerText.value.trim()
+    ? `${composerText.value.trimEnd()}\n${next}` : next
+  if (presentation.paths.length) appendLocalPaths(presentation.paths.join('\n'))
   autoResizeTextarea()
   composerRef.value?.focusTextarea()
 }
+
+const localPathPicker = useLocalPathPicker({
+  available: () => platform.id === 'desktop' && gatewayAccess.isLocalOwner && gatewayAccess.isAvailable
+    // This existing profile identity is obtained from main's owned-child binding, not owner role/localhost.
+    && Boolean(attachmentDraftIdentity.value) && typeof platform.files.chooseLocalFilePaths === 'function',
+  scope: () => [sessionKey.value, pendingSessionIntent.value, pendingForkBeforeMessageId.value,
+    deliveryIdentity.value, gatewayConnectionState.value, gatewayAccess.subscriptionEpoch,
+    attachmentDraftIdentity.value, pendingWorkspaceId.value, boundWorkspaceId.value,
+    activeWorkspace.value?.id, landingAgentId.value, draftAgentId(), runMode.value, composerRevision.value,
+    chatSend.sendPending.value, replanActive.value, Boolean(dockedPlanQuestionnaire.value),
+    Boolean(forkTransition.value), historyState.value.sessionMissing, router.currentRoute.value.fullPath],
+  getBinding: () => platform.gateway.getAttachmentBinding?.() ?? Promise.resolve(null),
+  choosePaths: request => platform.files.chooseLocalFilePaths!(request),
+  nativeDropAvailable: () => platform.id === 'desktop' && gatewayAccess.isLocalOwner && gatewayAccess.isAvailable
+    && typeof platform.files.resolveNativeFilePath === 'function',
+  resolveNativeFilePath: async file => {
+    // A Desktop bridge alone does not identify the Gateway that will execute
+    // the path. Require the non-secret owned-child binding, without requiring
+    // a durable session/workspace binding for the first message.
+    const binding = await platform.gateway.getAttachmentBinding?.()
+    if (!binding || typeof platform.files.resolveNativeFilePath !== 'function') return null
+    return platform.files.resolveNativeFilePath(file)
+  },
+  text: () => inputText.value,
+  append: text => {
+    appendLocalPaths(text)
+    composerRef.value?.focusTextarea()
+  },
+  onError: kind => pushToast(t(kind === 'too-long'
+    ? 'chat.localPathTextTooLong'
+    : kind === 'too-many' ? 'chat.localPathTooMany' : 'chat.localPathSelectionFailed'),
+    { tone: 'warn' }),
+})
 
 function onVoiceInput() {
   void toggleVoiceInput(appendComposerText)
@@ -5092,32 +4940,6 @@ function onVoiceInput() {
 function onVoiceSetup() {
   pushToast(t('chat.toast.voiceSetupNeeded'), { tone: 'info' })
   router.push('/settings/capabilities').catch(() => {})
-}
-
-async function openMetaSetupProviderSettings(providerId: string) {
-  if (metaSetupProviderNavigationPending.value) return
-  metaSetupProviderNavigationPending.value = true
-  try {
-    const opened = await navigateMetaSetupProviderSettings({
-      providerId,
-      sessionKey: setupState.value?.sessionKey || '',
-      currentRouteSession: route.query.session,
-      router,
-      beginHandoff: beginProviderHandoff,
-      cancelHandoff: cancelProviderHandoff,
-      materializeSession: (handoffSessionKey) => {
-        persistSession(handoffSessionKey, {
-          updateRoute: false,
-          source: 'chatView.metaSetupProviderHandoff',
-        })
-      },
-    })
-    if (!opened) {
-      pushToast(t('chat.metaSetup.providerNavigationFailed'), { tone: 'danger' })
-    }
-  } finally {
-    metaSetupProviderNavigationPending.value = false
-  }
 }
 
 function normalizeRunStatus(status: string): ChatRunStatusState {
@@ -5251,7 +5073,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       const artifact = artifactPayloadFromRevision(current.revision)
       artifact.documentId = current.document.documentId
       artifact.revisionId = current.revision.revisionId
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact,
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -5262,13 +5084,10 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
         resourceIdentity: workbenchResourceKey(current.resource.resource),
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     if (!current && resource.resource.type === 'document') {
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact: artifactPayloadFromWorkbenchResource(resource),
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -5279,9 +5098,6 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
         resourceIdentity: workbenchResourceKey(resource.resource),
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     if (
@@ -5297,7 +5113,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       const artifact = artifactPayloadFromRevision(imported.revision)
       artifact.documentId = imported.document.documentId
       artifact.revisionId = imported.revision.revisionId
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact,
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -5308,9 +5124,6 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
         resourceIdentity: `document:${imported.document.documentId}`,
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     const readonlyResource = current?.resource || resource
@@ -5329,7 +5142,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
     )
     if (!preview) return
     const preparedResource = resourceFromPreparedPreview(preview)
-    const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
       artifact: artifactPayloadFromWorkbenchResource(preparedResource),
       initialSection: 'preview',
       nativeHtml: false,
@@ -5338,9 +5151,6 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       resourceIdentity: workbenchResourceKey(readonlyResource.resource),
       sessionKey: sessionKey.value,
     }))
-    if (!opened) {
-      pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-    }
   } catch (error) {
     const classified = classifyArtifactProductError(error)
     const translated = t(classified.messageKey)
@@ -5423,14 +5233,11 @@ async function openDeliverables() {
       const snapshot = await workbenchResourcesStore.load(sessionKey.value)
       const resources = workbenchResourcesStore.navigationResources(sessionKey.value)
       if (snapshot.available && resources.length > 0) {
-        const opened = workbenchStore.openItem(createResourceCollectionWorkbenchItem({
+        workbenchStore.openItem(createResourceCollectionWorkbenchItem({
           resources,
           sessionKey: sessionKey.value,
           title: t('workbench.resources.title'),
         }))
-        if (!opened) {
-          pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-        }
         return
       }
     } catch {
@@ -5525,7 +5332,7 @@ function openLegacyArtifactWorkbench(
   artifact: ArtifactPayload,
   initialSection: 'preview' | 'source' = 'preview',
 ): boolean {
-  const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+  return workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
     artifact,
     initialSection,
     navigationArtifacts: sessionArtifacts.value,
@@ -5535,10 +5342,6 @@ function openLegacyArtifactWorkbench(
     ),
     sessionKey: sessionKey.value,
   }))
-  if (!opened) {
-    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-  }
-  return opened
 }
 
 async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
@@ -5564,7 +5367,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       const currentArtifact = artifactPayloadFromRevision(current.revision)
       currentArtifact.documentId = current.document.documentId
       currentArtifact.revisionId = current.revision.revisionId
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact: currentArtifact,
         initialSection: 'preview',
         navigationArtifacts: sessionArtifacts.value,
@@ -5576,9 +5379,6 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
         resourceIdentity: workbenchResourceKey(current.resource.resource),
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     if (!current && resource.resource.type === 'document') {
@@ -5601,7 +5401,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       const importedArtifact = artifactPayloadFromRevision(imported.revision)
       importedArtifact.documentId = imported.document.documentId
       importedArtifact.revisionId = imported.revision.revisionId
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact: importedArtifact,
         initialSection: 'preview',
         navigationArtifacts: sessionArtifacts.value,
@@ -5613,9 +5413,6 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
         resourceIdentity: `document:${imported.document.documentId}`,
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     const readonlyResource = current?.resource || resource
@@ -5637,7 +5434,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       return
     }
     const preparedResource = resourceFromPreparedPreview(preview)
-    const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
       artifact: artifactPayloadFromWorkbenchResource(preparedResource),
       navigationArtifacts: sessionArtifacts.value,
       nativeHtml: false,
@@ -5646,9 +5443,6 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       resourceIdentity: workbenchResourceKey(readonlyResource.resource),
       sessionKey: sessionKey.value,
     }))
-    if (!opened) {
-      pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-    }
   } catch (error) {
     // METHOD_NOT_FOUND is normalized to a null open result by the provider and
     // follows the compatibility path above. Any other failure must remain
@@ -5680,7 +5474,7 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
     artifact.documentId = current.document.documentId
     artifact.revisionId = current.revision.revisionId
     if (previewPagePath) artifact.previewPagePath = previewPagePath
-    const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
       artifact,
       initialSection: 'preview',
       navigationArtifacts: sessionArtifacts.value,
@@ -5689,7 +5483,6 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
       resourceIdentity: workbenchResourceKey(current.resource.resource),
       sessionKey: key,
     }))
-    if (!opened) pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
   },
   onError: error => {
     const classified = classifyArtifactProductError(error)
@@ -5890,6 +5683,15 @@ async function forkConversation(throughTurnId?: string) {
       clearForkTransition(generation)
       return
     }
+    // The fork result carries only the child key; the sidebar row synthesized
+    // before the next sessions.list snapshot would otherwise have no project
+    // binding and float to the section's top level. Mirror adoptResponseSession:
+    // carry the parent's project onto the child until the durable row confirms it.
+    const forkWorkspaceId = freshTaskDraft.materializedWorkspaceBySession.value[parentKey]
+      || boundWorkspaceId.value
+    if (forkWorkspaceId) {
+      freshTaskDraft.bindMaterializedProjectTask(childKey, forkWorkspaceId)
+    }
     forkTransition.value = {
       ...forkTransition.value,
       childKey,
@@ -6025,8 +5827,14 @@ async function copyGatewayLink() {
 // the header subtree. The owner token makes delayed teardown harmless.
 const chatRouteHeader = useChatRouteHeaderBridge()
 const chatRouteHeaderRegistration = chatRouteHeader.register({
+  sessionKey,
   visible: computed(() => !isNewChatLanding.value),
   title: currentChatTitle,
+  optimisticTitle: computed(() => (
+    optimisticSessionTitle.value?.key === sessionKey.value
+      ? optimisticSessionTitle.value.title
+      : ''
+  )),
   copyState: sessionCopyState,
   copyIcon: sessionCopyIcon,
   copyLiveText: sessionCopyLiveText,
@@ -6687,7 +6495,12 @@ function onChatDragLeave(e: DragEvent) {
   }
 }
 
-function onChatDrop(e: DragEvent) {
+function isImageDropFile(file: File): boolean {
+  const mime = typeof file.type === 'string' ? file.type.toLowerCase() : ''
+  return mime.startsWith('image/') || /\.(?:png|jpe?g|gif|webp)$/i.test(file.name || '')
+}
+
+async function onChatDrop(e: DragEvent) {
   e.preventDefault()
   threadDragDepth.value = 0
   threadDragOver.value = false
@@ -6698,8 +6511,43 @@ function onChatDrop(e: DragEvent) {
   }
   const files = Array.from(e.dataTransfer?.files || [])
   if (files.length === 0) return
-  void addAttachments(files)
+  const fallbackFiles = await localPathPicker.appendNativeDrop(files, isImageDropFile)
+  if (fallbackFiles === null) return
+  if (fallbackFiles.length > 0) await addAttachments(fallbackFiles)
   composerRef.value?.focusTextarea()
+}
+
+/**
+ * Some browser hosts expose a paste as the post-insertion input event but do
+ * not provide a usable ClipboardEvent for the document-level listener.
+ */
+function handleLongPastedInput(text: string, event?: InputEvent): boolean {
+  if (!composerRef.value?.isTextareaFocused()) return false
+  if (replanActive.value) return false
+
+  // The input event fires after the browser has inserted the paste. Prefer its
+  // data payload so a paste appended to an existing instruction becomes an
+  // attachment while the instruction remains in the composer. Hosts that do
+  // not expose `data` fall back to the full field value, which preserves the
+  // previous behavior for a paste-only composer.
+  const pastedText = typeof event?.data === 'string' && event.data.length > 0
+    ? event.data
+    : text
+  if (!isLongPlainTextPaste(pastedText)) return false
+
+  if (event?.target instanceof HTMLTextAreaElement
+    && typeof event.data === 'string'
+    && event.data.length > 0) {
+    const caret = event.target.selectionStart
+    const start = Math.max(0, caret - event.data.length)
+    composerText.value = `${text.slice(0, start)}${text.slice(caret)}`
+  } else {
+    composerText.value = ''
+  }
+  autoResizeTextarea()
+  const file = new File([pastedText], pastedTextAttachmentName(pastedText), { type: 'text/plain' })
+  void addAttachments([file], { origin: 'paste' })
+  return true
 }
 
 /* ── Textarea ──────────────────────────────────────────────────────── */
@@ -6719,7 +6567,20 @@ function onDocumentPaste(e: ClipboardEvent) {
     dialogLayerOpen: hasOpenDialogLayer(),
   })) return
   const files = collectClipboardFiles(e.clipboardData)
-  if (files.length === 0) return
+  if (files.length === 0) {
+    if (!composerRef.value?.isTextareaFocused()) return
+    const text = collectClipboardText(e.clipboardData)
+    if (!isLongPlainTextPaste(text)) return
+    if (replanActive.value) {
+      e.preventDefault()
+      pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })
+      return
+    }
+    e.preventDefault()
+    const file = new File([text], pastedTextAttachmentName(text), { type: 'text/plain' })
+    void addAttachments([file], { origin: 'paste' })
+    return
+  }
   if (replanActive.value) {
     e.preventDefault()
     pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })
@@ -6783,7 +6644,6 @@ function consumeDraftPrefill() {
   inputText.value = prefill
   if (skills.length) {
     selectedSkills.value = skills
-    markProvisionalDraftUsed()
     persistDraftHistoryState()
   }
   landingPrefilled.value = true
@@ -6875,9 +6735,7 @@ function beginDraftProjectChoice(): DraftProjectChoice | null {
   }
   draftProjectChoice = choice
   projectBindingBusy.value = true
-  // Choosing a directory is an explicit draft edit, not a fresh task or an
-  // invitation to recover another provisional Meta draft.
-  markProvisionalDraftUsed()
+  // Choosing a directory is an explicit draft edit.
   cancelActiveProjectValidation()
   return choice
 }
@@ -7065,7 +6923,6 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
 // provisional key stays out of the URL and storage until the first send.
 function enterDraft() {
   landingPrefilled.value = false
-  provisionalDraftUsed = false
   const agentId = draftAgentId()
   const isFreshDraft = pendingSessionIntent.value === 'new_chat'
     && messages.value.length === 0
@@ -7073,7 +6930,9 @@ function enterDraft() {
     && agentIdFromSessionKey(sessionKey.value) === agentId
   if (!isFreshDraft) startDraftSession(agentId)
   consumeDraftPrefill()
-  if (isDesktopViewport.value) composerRef.value?.focusTextarea()
+  if (isDesktopViewport.value) {
+    composerRef.value?.focusTextarea({ preserveFocus: !landingPrefilled.value })
+  }
 }
 
 let chatViewActive = false
@@ -7191,7 +7050,6 @@ onMounted(async () => {
   // serialized dispatch queue.
   unsubs.push(chatRpcSubscriptions.subscribe())
   unsubs.push(chatApprovals.subscribe())
-  unsubs.push(metaRuns.subscribe())
   unsubs.push(chatSessionRouting.subscribe())
   unsubs.push(chatPlans.subscribe())
   const sessionBootstrap = startSessionBootstrap({
@@ -7203,28 +7061,6 @@ onMounted(async () => {
         syncDraftProjectFromRoute(initialDraftProjectGeneration!),
       )
 
-  // Provisional Meta draft discovery is detached from the critical bootstrap.
-  // It may rebind only an untouched draft and never delays ordinary chat.
-  if (initialSession.draft) metaDraftRecovery.start(draftAgentId())
-  const initialMetaSessionKey = sessionKey.value
-  void sessionBootstrap.live.then((outcome) => {
-    if (
-      outcome.authoritative
-      && chatViewActive
-      && sessionKey.value === initialMetaSessionKey
-    ) {
-      if (initialSession.draft) metaDraftRecovery.retry(draftAgentId())
-      return Promise.all([
-        metaRuns.hydrateRecovery(),
-        restoreDurableMetaControls(initialMetaSessionKey),
-      ])
-    }
-  }).catch((error: unknown) => {
-    console.warn(
-      'Initial Meta recovery failed:',
-      error instanceof Error ? error.message : error,
-    )
-  })
   // The entire dock can grow through attachments, pending work, and textarea
   // autoresize. Publish its real height locally so the thread always reserves
   // exactly enough clearance for the floating surface.
@@ -7259,9 +7095,9 @@ onMounted(async () => {
     publishComposerDockHeight()
   }
 
-  // Focus textarea on desktop
+  // Automatic entry preserves focus in overlays and their invoking controls.
   if (isDesktopViewport.value) {
-    composerRef.value?.focusTextarea()
+    composerRef.value?.focusTextarea({ preserveFocus: !explicitFreshTask })
   }
 
   if (initialDraftProjectGeneration !== null) {
@@ -7319,8 +7155,8 @@ watch(
   { flush: 'post' },
 )
 
-
 onUnmounted(() => {
+  chatSend.dispose()
   cancelDraftProjectChoice()
   window.removeEventListener('pointerup', onThreadPointerEnd)
   window.removeEventListener('pointercancel', onThreadPointerEnd)
@@ -7330,15 +7166,11 @@ onUnmounted(() => {
   chatViewDisposed = true
   forkTransitionLifetime.dispose()
   forkTransition.value = null
-  durableRecoveryGeneration += 1
-  metaDraftRecovery.invalidate()
   draftProjectHydration.invalidate()
   cancelSessionBootstrap()
   conversationSessionRuntime.dispose()
   pendingSessionOptionalReads = null
   pendingFeatureToggleRefresh = false
-  releaseOptionalRpcAdmission?.()
-  releaseOptionalRpcAdmission = null
   cancelActiveProjectValidation()
   clearExecutionDockHideTimer()
   unsubs.forEach(fn => fn())
@@ -7350,7 +7182,6 @@ onUnmounted(() => {
   cleanupCompaction()
   cleanupVoiceInput()
   chatApprovals.cleanup()
-  metaRuns.cleanup()
   if (composerDockResizeObserver) {
     composerDockResizeObserver.disconnect()
     composerDockResizeObserver = null
@@ -7378,8 +7209,6 @@ useDocumentEvent('keydown', onDocumentKeydown)
 
 // Watch for route changes
 watch(() => route.query.session, async (newSession) => {
-  durableRecoveryGeneration += 1
-  metaDraftRecovery.invalidate()
   const transition = forkTransition.value
   if (transition) {
     const handoffAction = forkRouteHandoffAction(newSession, transition)
@@ -7460,8 +7289,6 @@ watch(() => [route.path, route.query.agent, route.query.project], async () => {
     && draftProjectChoiceIsCurrent(draftProjectChoice)
     && readProjectFromUrl() === (draftProjectChoice.target?.id || '')
   ) return
-  durableRecoveryGeneration += 1
-  metaDraftRecovery.invalidate()
   draftProjectHydration.invalidate()
   if (!isDraftRoute()) return
   artifactImageLightbox.close()
@@ -7472,24 +7299,18 @@ watch(() => [route.path, route.query.agent, route.query.project], async () => {
   const generation = draftProjectHydration.begin()
   if (!await syncDraftProjectFromRoute(generation)) return
   if (!draftProjectHydration.isCurrent(generation) || !isDraftRoute()) return
-  metaDraftRecovery.start(draftAgentId())
 })
 
 watch(inputText, (value) => {
   if (value.length > 0) {
-    markProvisionalDraftUsed()
     persistDraftHistoryState()
   }
 }, { flush: 'sync' })
 
-watch(() => pendingAttachments.value.length, (count) => {
-  if (count > 0) markProvisionalDraftUsed()
+watch(() => pendingAttachments.value.length, () => {
   persistDraftHistoryState()
 }, { flush: 'sync' })
 
-watch(() => pendingQueue.value.length, (count) => {
-  if (count > 0) markProvisionalDraftUsed()
-}, { flush: 'sync' })
 
 // Explicit new-task actions must reset even when navigation targets the exact
 // draft URL already on screen (for example, clicking the same project pencil).

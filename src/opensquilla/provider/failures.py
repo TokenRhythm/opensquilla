@@ -405,6 +405,12 @@ _SHARED_TAIL_MATCHERS: tuple[FailureMatcher, ...] = (
         ProviderFailureKind.PROVIDER_OVERLOADED,
         status_codes=_GATEWAY_TRANSIENT_STATUS_CODES,
     ),
+    FailureMatcher(
+        ProviderFailureKind.PROVIDER_OVERLOADED,
+        raw_codes=frozenset({
+            "provider_overload_retry_after_deadline", "provider_overload_retry_wait_exhausted",
+        }),
+    ),
     FailureMatcher(ProviderFailureKind.PROVIDER_OVERLOADED, predicate=_is_gateway_transient),
     FailureMatcher(
         ProviderFailureKind.MALFORMED_RESPONSE,

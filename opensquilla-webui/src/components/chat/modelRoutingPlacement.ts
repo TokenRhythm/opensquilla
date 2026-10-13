@@ -36,7 +36,7 @@ export interface ModelRoutingPlacement {
 const MARGIN = 12
 const GAP = 8
 const SUBMENU_WIDTH = 316
-const SUBMENU_MAX_HEIGHT = 360
+const SUBMENU_MAX_HEIGHT = 520
 const COMPACT_MAX_WIDTH = 352
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(value, max))

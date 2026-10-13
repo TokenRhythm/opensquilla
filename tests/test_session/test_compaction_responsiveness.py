@@ -125,11 +125,11 @@ async def test_cancellation_during_preparation_does_not_start_provider(monkeypat
     request = _request()
     source = deepcopy(request.entries)
 
-    def slow_measure(entries):
+    def slow_measure(entries, **kwargs):
         loop.call_soon_threadsafe(entered.set)
         try:
             assert released.wait(5)
-            return original(entries)
+            return original(entries, **kwargs)
         finally:
             loop.call_soon_threadsafe(finished.set)
 

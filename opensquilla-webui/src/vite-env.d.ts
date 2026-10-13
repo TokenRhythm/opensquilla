@@ -97,12 +97,15 @@ declare global {
     abandonCleanupTransaction?: () => Promise<unknown>
     setNativeTheme?: (payload: { source: 'light' | 'dark' | 'system' }) => Promise<unknown>
     openArtifact: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
+    chooseLocalFilePaths?: PlatformFilesApi['chooseLocalFilePaths']
+    resolveNativeFilePath?: PlatformFilesApi['resolveNativeFilePath']
     chooseAttachments?: PlatformFilesApi['chooseAttachments']
     selectAttachmentFile?: PlatformFilesApi['selectAttachmentFile']
     importAttachmentSelection?: PlatformFilesApi['importAttachmentSelection']
     cancelAttachmentSelections?: PlatformFilesApi['cancelAttachmentSelections']
     saveArtifact?: PlatformFilesApi['saveArtifact']
     sourceFileAction?: PlatformFilesApi['sourceFileAction']
+    workspaceFileAction?: PlatformFilesApi['workspaceFileAction']
     chooseProjectDirectory: (
       request?: ProjectDirectoryPickerRequest,
     ) => Promise<{ path: string } | null>
@@ -132,6 +135,9 @@ declare global {
     getWorkbenchBrowserTarget?: (
       payload: { surfaceId: string },
     ) => Promise<import('./platform/types').NativeWorkbenchBrowserTarget>
+    setBrowserAutomationState?: (
+      payload: import('./platform/types').NativeBrowserAutomationState,
+    ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
     focusWorkbenchAnnotation?: (
       payload: { surfaceId: string; targetRef: string; locatorHint: string },
     ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>

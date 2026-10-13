@@ -7,7 +7,7 @@ export const WORKBENCH_MAX_VIEWPORT_RATIO = 0.7
 export const WORKBENCH_SPLIT_MIN_WIDTH = 960
 export const WORKBENCH_MOBILE_MAX_WIDTH = 720
 
-export type WorkbenchLayoutMode = 'split' | 'overlay' | 'mobile-dialog'
+export type WorkbenchLayoutMode = 'split' | 'overlay' | 'maximized' | 'mobile-dialog'
 export type WorkbenchWidthSource = 'default' | 'user'
 
 export interface WorkbenchWidthPreference {
@@ -19,6 +19,7 @@ export interface WorkbenchWidthPreference {
 export interface WorkbenchLayoutInput {
   availableWidth: number
   coarseOnly?: boolean
+  maximized?: boolean
 }
 
 function finiteDimension(value: number): number {
@@ -86,6 +87,7 @@ export function parseWorkbenchWidthPreference(
 export function workbenchLayoutMode(input: WorkbenchLayoutInput): WorkbenchLayoutMode {
   const width = finiteDimension(input.availableWidth)
   if (input.coarseOnly || width <= WORKBENCH_MOBILE_MAX_WIDTH) return 'mobile-dialog'
+  if (input.maximized) return 'maximized'
   if (width < WORKBENCH_SPLIT_MIN_WIDTH) return 'overlay'
   return 'split'
 }
@@ -113,7 +115,7 @@ export function workbenchEffectiveWidth(
 ): number {
   const normalized = normalizeWorkbenchWidthPreference(preference)
   const width = finiteDimension(availableWidth)
-  if (mode === 'mobile-dialog') return width
+  if (mode === 'mobile-dialog' || mode === 'maximized') return width
   if (mode === 'overlay') {
     return Math.min(normalized.width, Math.max(0, width - 24))
   }

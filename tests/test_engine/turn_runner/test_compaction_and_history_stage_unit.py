@@ -20,11 +20,13 @@ from opensquilla.engine.turn_runner.outcome import StageOutcome
 class _RecordingPreflight:
     raises: type[BaseException] | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
+    return_value: Any = None
 
-    async def maybe_compact(self, **kwargs: Any) -> None:
+    async def maybe_compact(self, **kwargs: Any) -> Any:
         self.calls.append(dict(kwargs))
         if self.raises is not None:
             raise self.raises("recording preflight boom")
+        return self.return_value
 
 
 @dataclass
@@ -263,3 +265,15 @@ async def test_history_loader_trim_and_bound_message_are_forwarded() -> None:
 
     assert history.calls[0]["trim_last_user"] is False
     assert history.calls[0]["bound_user_message_id"] == "bound-user"
+
+
+async def test_prepared_window_flows_directly_from_preflight_to_history_loader() -> None:
+    prepared = object()
+    preflight = _RecordingPreflight(return_value=prepared)
+    history = _RecordingHistoryLoader()
+    stage, _, _, _ = _make_stage(preflight=preflight, history=history)
+    await stage.run(_make_input())
+    assert history.calls[0]["prepared_window"] is prepared
+    # A following turn that skips compaction cannot inherit the previous view.
+    await stage.run(_make_input(skip_compaction=True))
+    assert "prepared_window" not in history.calls[1]

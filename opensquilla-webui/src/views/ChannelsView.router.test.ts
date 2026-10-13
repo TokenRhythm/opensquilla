@@ -158,7 +158,7 @@ async function mountWithRealRouter(options: { webHistory?: boolean } = {}) {
     routes: [
       { path: '/', redirect: '/channels' },
       { path: '/channels', component: Component, meta: { keepAlive: true } },
-      { path: '/overview', component: emptyStub('overview-view') },
+      { path: '/usage', component: emptyStub('usage-view') },
       { path: '/skills', component: emptyStub('skills-view') },
     ],
   })
@@ -291,11 +291,11 @@ describe('ChannelsView with a real router', () => {
 
       // A clean draft: the leave guard answers true and nothing may cancel
       // the in-flight navigation (the old watcher replace did exactly that).
-      const failure = await router.push('/overview')
+      const failure = await router.push('/usage')
       expect(failure).toBeUndefined()
-      expect(router.currentRoute.value.path).toBe('/overview')
+      expect(router.currentRoute.value.path).toBe('/usage')
       await flush()
-      expect(el.querySelector('[data-testid="overview-view"]')).toBeTruthy()
+      expect(el.querySelector('[data-testid="usage-view"]')).toBeTruthy()
     } finally {
       app.unmount()
     }
@@ -439,14 +439,14 @@ describe('ChannelsView with a real router', () => {
       // …then the user clicks through to another page. The route-leave guard
       // supersedes the pending confirm, and the superseded handler must NOT
       // fire its URL-restoring replace (that used to cancel this navigation).
-      const nav = router.push('/overview')
+      const nav = router.push('/usage')
       await flush()
       buttonWithText(el, 'Discard').click()
       await flush(6)
       const failure = await nav
       expect(failure).toBeUndefined()
-      expect(router.currentRoute.value.path).toBe('/overview')
-      expect(el.querySelector('[data-testid="overview-view"]')).toBeTruthy()
+      expect(router.currentRoute.value.path).toBe('/usage')
+      expect(el.querySelector('[data-testid="usage-view"]')).toBeTruthy()
     } finally {
       app.unmount()
     }

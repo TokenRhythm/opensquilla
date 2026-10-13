@@ -520,19 +520,16 @@ class FeishuWebhookTransport:
         event_id = header.get("event_id")
         event_type = header.get("event_type", "")
 
-        if event_id and not self._dedupe.check_and_add(event_id):
-            return Response(status_code=200)
-
         if self._handler is not None:
-            await self._handler(
-                InboundEventEnvelope(
-                    source="feishu:webhook",
-                    event_id=event_id,
-                    event_type=event_type,
-                    raw=data,
-                    received_at=datetime.now(UTC),
-                )
+            handler = self._handler
+            envelope = InboundEventEnvelope(
+                source="feishu:webhook",
+                event_id=event_id,
+                event_type=event_type,
+                raw=data,
+                received_at=datetime.now(UTC),
             )
+            await self._dedupe.run_once(event_id, lambda: handler(envelope))
 
         return Response(status_code=200)
 
@@ -1237,10 +1234,10 @@ class FeishuChannel:
     # Inbound
     # ------------------------------------------------------------------
 
-    def enqueue(self, message: IncomingMessage) -> None:
+    async def enqueue(self, message: IncomingMessage) -> None:
         from opensquilla.channels.delivery_store import durable_enqueue
 
-        durable_enqueue(self, message, self._queue)
+        await durable_enqueue(self, message, self._queue)
 
     async def receive(self) -> IncomingMessage:
         msg = await self._queue.get()
@@ -1258,15 +1255,14 @@ class FeishuChannel:
         return self._transport.create_route(path)
 
     async def _handle_inbound_event(self, envelope: InboundEventEnvelope) -> None:
-        if (
-            envelope.source == "feishu:websocket"
-            and envelope.event_id
-            and not self._dedupe.check_and_add(envelope.event_id)
-        ):
-            return
+        key = envelope.event_id if envelope.source == "feishu:websocket" else None
+        await self._dedupe.run_once(key, lambda: self._handle_inbound_once(envelope))
 
+    async def _handle_inbound_once(self, envelope: InboundEventEnvelope) -> None:
         if envelope.event_type == "im.message.receive_v1":
-            self.enqueue(self._with_event_provenance(self.parse_event(envelope.raw), envelope))
+            await self.enqueue(
+                self._with_event_provenance(self.parse_event(envelope.raw), envelope)
+            )
         elif envelope.event_type == "im.chat.member.bot.added_v1":
             chat_id = envelope.raw.get("event", {}).get("chat_id", "unknown")
             log.info(
@@ -1298,10 +1294,10 @@ class FeishuChannel:
             )
         elif envelope.event_type == "card.action.trigger":
             if msg := self._parse_approval_card_action(envelope.raw):
-                self.enqueue(self._with_event_provenance(msg, envelope))
+                await self.enqueue(self._with_event_provenance(msg, envelope))
                 return
             if msg := self._parse_clarify_card_action(envelope.raw):
-                self.enqueue(self._with_event_provenance(msg, envelope))
+                await self.enqueue(self._with_event_provenance(msg, envelope))
                 return
             log.info("feishu.card_action_ignored", event_id=envelope.event_id)
         else:

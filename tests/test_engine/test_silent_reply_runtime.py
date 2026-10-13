@@ -292,6 +292,40 @@ async def test_human_sentinel_runtime_emits_error_and_retains_usage(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("payload", ["[NO_REPLY]", "[HEARTBEAT_OK]"])
+async def test_goal_continuation_bracket_alias_is_suppressed_without_history(
+    tmp_path, payload: str,
+) -> None:
+    storage, manager, _provider, runner, context, session_key = await _runtime_stack(
+        tmp_path,
+        [[payload]],
+    )
+    try:
+        events = [
+            event
+            async for event in runner.run(
+                "continue the Goal",
+                session_key,
+                tool_context=context,
+                history_has_persisted_user=False,
+                input_mode="goal_continuation",
+                run_kind="goal",
+                no_memory_capture=True,
+            )
+        ]
+
+        assert not any(isinstance(event, TextDeltaEvent) for event in events)
+        done = next(event for event in events if isinstance(event, DoneEvent))
+        assert done.text == ""
+        assert done.delivery == "suppressed"
+        assert done.suppression_reason in {"no_reply", "heartbeat_ack"}
+        transcript = await manager.get_transcript(session_key)
+        assert [entry for entry in transcript if entry.role == "assistant"] == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_human_mixed_sentinel_runtime_remains_visible(tmp_path) -> None:
     body = "A normal human-facing reply."
     source = f"NO_REPLY\n{body}"

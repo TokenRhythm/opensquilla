@@ -68,6 +68,31 @@ function createHarness() {
 }
 
 describe('useChatSteerDelivery', () => {
+  it('snapshots explicit local references and preserves them in admission and recovery', () => {
+    const harness = createHarness()
+    try {
+      const paths = ['C:\\项目\\steer.pdf']
+      const text = `Check this report\n${paths[0]}`
+      const item: ChatPendingItem = {
+        pendingUiId: 'steer-paths', text, attachments: [], intent: null,
+        ownerSessionKey: REQUEST.key, localPathReferences: [...paths],
+      }
+      harness.pendingQueue.value.push(item)
+      harness.api.begin(item, { ...REQUEST, message: text, localPathReferences: paths })
+      paths[0] = 'C:\\wrong.pdf'
+      expect(item.steerAttempt?.request.localPathReferences).toEqual(['C:\\项目\\steer.pdf'])
+
+      const projection = harness.api.accept({
+        clientRequestId: REQUEST.client_request_id,
+        clientMessageId: REQUEST.client_message_id,
+        disposition: 'cancelled',
+      }, item)
+
+      expect(projection.message).toMatchObject({ text, localPathReferences: ['C:\\项目\\steer.pdf'] })
+      expect(harness.restoreSteerIntoComposer).toHaveBeenCalledExactlyOnceWith(text, ['C:\\项目\\steer.pdf'])
+    } finally { harness.stop() }
+  })
+
   it.each([
     ['retryable_rejected', 'KNOWN_REJECTION'],
     ['acceptance_unknown', 'RESPONSE_LOST'],

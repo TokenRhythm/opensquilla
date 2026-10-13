@@ -7,6 +7,7 @@ import type {
   SandboxSetupResult,
 } from '@/modules/sandboxRuntime'
 import type { SandboxSetupStatusPayload } from '@/types/sandbox'
+import { useSandboxReadinessRefresh } from './useSandboxReadinessRefresh'
 import { useSandboxSetupRecovery } from './useSandboxSetupRecovery'
 
 afterEach(() => {
@@ -39,6 +40,29 @@ function runtime(options: {
 }
 
 describe('useSandboxSetupRecovery', () => {
+  it('keeps existing Safe capability during a check and clears it after invalidity', async () => {
+    vi.useFakeTimers()
+    const readiness = vi.fn()
+      .mockResolvedValueOnce({ status: status('setting_up'), capability: { available: true } })
+      .mockResolvedValueOnce({ status: status('setting_up'), capability: { available: false } })
+      .mockResolvedValueOnce({ status: status('failed'), capability: null })
+    const scope = effectScope()
+    const recovery = scope.run(() => useSandboxSetupRecovery({
+      sandbox: runtime({ readiness }), connectionState: ref('connected'), runMode: ref('safe'),
+    }))!
+    await Promise.resolve()
+    expect(recovery.available.value).toBe(true)
+    expect(recovery.visible.value).toBe(false)
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(recovery.available.value).toBe(false)
+    expect(recovery.visible.value).toBe(true)
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(recovery.status.value?.state).toBe('failed')
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(readiness).toHaveBeenCalledTimes(3)
+    scope.stop()
+  })
+
   it('can defer the first read until session bootstrap admits it', async () => {
     const sandbox = runtime()
     const scope = effectScope()
@@ -194,7 +218,59 @@ describe('useSandboxSetupRecovery', () => {
     scope.stop()
   })
 
-  it.each(['failed', 'unavailable', 'setting_up'] as const)(
+  it('releases a superseded readiness read when setup finishes before its old response', async () => {
+    let resolveOldRead!: (value: SandboxReadinessState) => void
+    const oldRead = new Promise<SandboxReadinessState>(resolve => { resolveOldRead = resolve })
+    const readiness = vi.fn()
+      .mockResolvedValueOnce({ status: status('not_setup'), capability: null })
+      .mockReturnValueOnce(oldRead)
+      .mockResolvedValueOnce({ status: status('ready'), capability: null })
+    const sandbox = runtime({
+      readiness,
+      ensureReady: async () => ({
+        ready: false,
+        status: status('failed'),
+        capability: null,
+        outcome: 'failed',
+      }),
+    })
+    const scope = effectScope()
+    const { recovery, refresh } = scope.run(() => {
+      const connectionState = ref('connected')
+      const recovery = useSandboxSetupRecovery({
+        sandbox, connectionState, runMode: ref('full'), autoRefresh: false,
+      })
+      const refresh = useSandboxReadinessRefresh({
+        connectionState, allowed: ref(true), recovery,
+      })
+      return { recovery, refresh }
+    })!
+
+    try {
+      await refresh.refreshAfterBootstrap()
+      const pendingRead = recovery.refresh()
+      expect(recovery.loading.value).toBe(true)
+      await expect(recovery.ensureSetup()).resolves.toBe(false)
+      expect(recovery.loading.value).toBe(false)
+      expect(recovery.ensuring.value).toBe(false)
+      expect(recovery.status.value?.state).toBe('failed')
+
+      resolveOldRead({ status: status('ready'), capability: null })
+      await pendingRead
+      expect(recovery.status.value?.state).toBe('failed')
+      expect(recovery.loading.value).toBe(false)
+
+      await refresh.refreshOnOpen()
+      expect(readiness).toHaveBeenCalledTimes(3)
+      expect(recovery.status.value?.state).toBe('ready')
+      expect(recovery.loading.value).toBe(false)
+      expect(sandbox.ensureReady).toHaveBeenCalledOnce()
+    } finally {
+      scope.stop()
+    }
+  })
+
+  it.each(['unavailable', 'setting_up'] as const)(
     'does not offer setup for %s',
     async state => {
       const sandbox = runtime({
@@ -211,6 +287,33 @@ describe('useSandboxSetupRecovery', () => {
       expect(recovery.canSetup.value).toBe(false)
       await expect(recovery.ensureSetup()).resolves.toBe(false)
       expect(sandbox.ensureReady).not.toHaveBeenCalled()
+      scope.stop()
+    },
+  )
+
+  it.each(['failed', 'ready'] as const)(
+    'allows Windows setup retry/repair while status is %s',
+    async state => {
+      const sandbox = runtime({
+        readiness: async () => ({ status: status(state), capability: null }),
+        ensureReady: async () => ({
+          ready: true,
+          status: status('ready'),
+          capability: null,
+          outcome: 'ready',
+        }),
+      })
+      const scope = effectScope()
+      const recovery = scope.run(() => useSandboxSetupRecovery({
+        sandbox,
+        connectionState: ref('connected'),
+        runMode: ref('safe'),
+      }))!
+
+      await vi.waitFor(() => expect(recovery.resolved.value).toBe(true))
+      expect(recovery.canSetup.value).toBe(true)
+      await expect(recovery.ensureSetup()).resolves.toBe(true)
+      expect(sandbox.ensureReady).toHaveBeenCalledOnce()
       scope.stop()
     },
   )

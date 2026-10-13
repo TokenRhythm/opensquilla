@@ -103,8 +103,11 @@ def test_shell_tools_preserve_legacy_approval_id_positions() -> None:
             assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
 
 
-def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
+def test_tool_context_appends_new_runtime_fields_after_ordinary_fields() -> None:
     field_names = [item.name for item in fields(ToolContext)]
+    # Coding Mode was removed without retaining its positional compatibility slot.
+    assert "coding_mode" not in field_names
+    assert "coding_mode" not in inspect.signature(ToolContext).parameters
 
     legacy_runtime_tail = [
         "sandbox_file_system_profile",
@@ -120,7 +123,7 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "scratch_verify_mirror_active",
     ]
     legacy_tail_start = field_names.index(legacy_runtime_tail[0])
-    assert legacy_tail_start == 64
+    assert legacy_tail_start == 63
     assert (
         field_names[legacy_tail_start : legacy_tail_start + len(legacy_runtime_tail)]
         == legacy_runtime_tail
@@ -191,7 +194,7 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
 
 def test_tool_context_preserves_workspace_authoring_positional_constructor() -> None:
     defaults = ToolContext()
-    published_fields = fields(ToolContext)[:123]
+    published_fields = fields(ToolContext)[:122]
     assert published_fields[-1].name == "sandboxed_workspace_authoring"
     published_values = [getattr(defaults, item.name) for item in published_fields]
     authoring_facts = object()
@@ -203,10 +206,10 @@ def test_tool_context_preserves_workspace_authoring_positional_constructor() -> 
     assert context.process_event_emitter is None
 
 
-def test_tool_context_preserves_complete_legacy_positional_constructor() -> None:
+def test_tool_context_preserves_pre_spool_positional_constructor() -> None:
     defaults = ToolContext()
-    # Preserve the complete constructor published before output-spool fields.
-    legacy_fields = fields(ToolContext)[:105]
+    # Preserve the remaining pre-spool fields after the Coding Mode slot was retired.
+    legacy_fields = fields(ToolContext)[:104]
     assert legacy_fields[-1].name == "workspace_preview_scopes"
     legacy_values = [getattr(defaults, item.name) for item in legacy_fields]
     source_paths = {}
@@ -225,7 +228,7 @@ def test_tool_context_preserves_complete_legacy_positional_constructor() -> None
 
 def test_tool_context_preserves_output_spool_positional_constructor() -> None:
     defaults = ToolContext()
-    published_fields = fields(ToolContext)[:108]
+    published_fields = fields(ToolContext)[:107]
     assert published_fields[-1].name == "tool_result_store_retention_seconds"
     published_values = [getattr(defaults, item.name) for item in published_fields]
     published_values[-3:] = [1024, 4096, 3600]
@@ -244,7 +247,7 @@ def test_tool_context_preserves_snapshot_writer_positional_constructor() -> None
         return None
 
     defaults = ToolContext()
-    published_fields = fields(ToolContext)[:109]
+    published_fields = fields(ToolContext)[:108]
     assert published_fields[-1].name == "tool_result_snapshot_writer"
     published_values = [getattr(defaults, item.name) for item in published_fields]
     published_values[-1] = write_snapshot
@@ -258,7 +261,7 @@ def test_tool_context_preserves_snapshot_writer_positional_constructor() -> None
 
 def test_tool_context_appends_install_receipts_after_published_routing_fields() -> None:
     defaults = ToolContext()
-    published_fields = fields(ToolContext)[:111]
+    published_fields = fields(ToolContext)[:110]
     assert published_fields[-1].name == "router_control_routing_revision"
     published_values = [getattr(defaults, item.name) for item in published_fields]
     published_values[-1] = 7
@@ -271,7 +274,7 @@ def test_tool_context_appends_install_receipts_after_published_routing_fields() 
 
 def test_tool_context_preserves_install_receipt_positional_constructor() -> None:
     defaults = ToolContext()
-    published_fields = fields(ToolContext)[:112]
+    published_fields = fields(ToolContext)[:111]
     assert published_fields[-1].name == "skill_install_turn"
     published_values = [getattr(defaults, item.name) for item in published_fields]
     install_receipts = object()
@@ -289,7 +292,7 @@ def test_tool_context_preserves_install_receipt_positional_constructor() -> None
 
 def test_attachment_fields_follow_published_shared_runtime_positions() -> None:
     defaults = ToolContext()
-    published_fields = fields(ToolContext)[:118]
+    published_fields = fields(ToolContext)[:117]
     assert [item.name for item in published_fields[-6:]] == [
         "suspend_compute_slot", "update_progress", "usage_root_turn_id",
         "selected_skills", "verified_skill_ids", "skill_load_emitter",

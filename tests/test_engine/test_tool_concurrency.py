@@ -33,7 +33,6 @@ from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
 # ---------------------------------------------------------------------------
 
 _TOOL_SLEEP_S = 0.2
-_SCHEDULER_TOLERANCE_S = 0.05
 
 
 def _tool_def(name: str) -> ToolDefinition:
@@ -152,19 +151,31 @@ def test_sessions_spawn_policy_keys_by_parent_session() -> None:
     assert policy.key == ("sessions_spawn", "agent:main:parent-a")
 
 
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_image_analysis_calls_have_dedicated_inflight_cap() -> None:
     """Vision requests should not fan out at the generic safe-tool limit."""
     tool_calls = [("image", {"path": f"slide-{i}.png"}) for i in range(6)]
     in_flight = 0
     max_in_flight = 0
+    started: list[str] = []
+    completed: list[str] = []
+    batch_started = [asyncio.Event() for _ in range(3)]
+    release_batch = [asyncio.Event() for _ in range(3)]
 
     async def _handler(tc: ToolCall) -> ToolResult:
         nonlocal in_flight, max_in_flight
         in_flight += 1
         max_in_flight = max(max_in_flight, in_flight)
-        await asyncio.sleep(_TOOL_SLEEP_S)
-        in_flight -= 1
+        batch = len(started) // 2
+        started.append(tc.tool_use_id)
+        try:
+            if len(started) % 2 == 0:
+                batch_started[batch].set()
+            await release_batch[batch].wait()
+            completed.append(tc.tool_use_id)
+        finally:
+            in_flight -= 1
         return ToolResult(
             tool_use_id=tc.tool_use_id,
             tool_name=tc.tool_name,
@@ -179,12 +190,33 @@ async def test_image_analysis_calls_have_dedicated_inflight_cap() -> None:
         tool_handler=_handler,
     )
 
-    t0 = time.monotonic()
-    await _collect(agent)
-    elapsed = time.monotonic() - t0
+    turn = asyncio.create_task(_collect(agent))
+    try:
+        # Bound a broken dispatcher without making scheduler speed part of
+        # the concurrency contract. Each pair must start before it is released.
+        async with asyncio.timeout(5):
+            for batch in range(3):
+                await batch_started[batch].wait()
+                # Give other runnable calls a chance to expose a missing cap.
+                await asyncio.sleep(0)
+                assert len(started) == (batch + 1) * 2
+                assert len(completed) == batch * 2
+                assert in_flight == 2
+                release_batch[batch].set()
+            await turn
+    finally:
+        for release in release_batch:
+            release.set()
+        if not turn.done():
+            turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
 
     assert max_in_flight == 2
-    assert 3 * _TOOL_SLEEP_S - _SCHEDULER_TOLERANCE_S <= elapsed < 4 * _TOOL_SLEEP_S
+    assert in_flight == 0
+    expected_ids = [f"tool-{i}" for i in range(len(tool_calls))]
+    assert sorted(started) == expected_ids
+    assert sorted(completed) == expected_ids
+    assert len(provider.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -228,17 +260,26 @@ async def test_sessions_send_different_targets_run_concurrent() -> None:
         ("sessions_send", {"session_key": "agent:main:child-a", "message": "one"}),
         ("sessions_send", {"session_key": "agent:main:child-b", "message": "two"}),
     ]
-    intervals: list[tuple[str, str, float, float]] = []
+    started: list[tuple[str, str]] = []
+    completed: list[tuple[str, str]] = []
+    both_started = asyncio.Event()
+    handlers_completed = asyncio.Event()
+    release_tools = asyncio.Event()
 
     async def _handler(tc: ToolCall) -> ToolResult:
         target = str(tc.arguments["session_key"])
-        start = time.monotonic()
-        await asyncio.sleep(_TOOL_SLEEP_S)
-        intervals.append((tc.tool_name, target, start, time.monotonic()))
+        identity = (tc.tool_use_id, target)
+        started.append(identity)
+        if len(started) == len(tool_calls):
+            both_started.set()
+        await release_tools.wait()
+        completed.append(identity)
+        if len(completed) == len(tool_calls):
+            handlers_completed.set()
         return ToolResult(
             tool_use_id=tc.tool_use_id,
             tool_name=tc.tool_name,
-            content="ok",
+            content=f"ok:{target}",
         )
 
     provider = _FixedToolCallArgsProvider(tool_calls)
@@ -249,14 +290,38 @@ async def test_sessions_send_different_targets_run_concurrent() -> None:
         tool_handler=_handler,
     )
 
-    t0 = time.monotonic()
-    await _collect(agent)
-    elapsed = time.monotonic() - t0
+    expected = [(f"tool-{i}", args["session_key"]) for i, (_, args) in enumerate(tool_calls)]
+    turn = asyncio.create_task(_collect(agent))
+    try:
+        # Both real Agent dispatches must enter before either handler may finish.
+        # The timeout only bounds a broken dispatcher, not acceptable tool latency.
+        async with asyncio.timeout(5):
+            await both_started.wait()
+        assert sorted(started) == expected
+        assert completed == []
+        assert not turn.done()
+        assert len(provider.calls) == 1
+        release_tools.set()
+        # Result projection and a second provider round are separate Agent-loop
+        # contracts. This test owns only keyed dispatch: both handlers must
+        # finish once their shared barrier opens.
+        async with asyncio.timeout(5):
+            await handlers_completed.wait()
+    finally:
+        release_tools.set()
+        cancelled_by_cleanup = False
+        if not turn.done():
+            turn.cancel()
+            cancelled_by_cleanup = True
+        done, pending = await asyncio.wait({turn}, timeout=5)
+        assert not pending, "Tool concurrency test task did not settle during cleanup"
+        await asyncio.gather(*done, return_exceptions=True)
+        if not cancelled_by_cleanup and not turn.cancelled():
+            exception = turn.exception()
+            if exception is not None:
+                raise exception
 
-    assert elapsed < 0.35, (
-        f"Expected sends to different sessions to overlap, got {elapsed:.3f} s."
-    )
-    assert len(intervals) == len(tool_calls)
+    assert sorted(completed) == expected
 
 
 @pytest.mark.asyncio

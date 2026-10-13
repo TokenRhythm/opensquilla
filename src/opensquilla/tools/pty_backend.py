@@ -11,6 +11,7 @@ import asyncio
 import os
 import socket
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -192,6 +193,7 @@ def spawn_pty(
     env: dict[str, str] | None,
     cols: int = 120,
     rows: int = 30,
+    cancel_event: threading.Event | None = None,
 ) -> PtyHandle:
     """Spawn one PTY process using a lazy platform-specific import."""
 
@@ -222,6 +224,7 @@ def spawn_pty(
 
             raw = create_owned_popen(
                 _shell_argv(command), process_factory=spawn, cwd=cwd, env=env,
+                cancel_event=cancel_event,
             )
             handle = PtyHandle(raw, "windows")
             try:
@@ -253,6 +256,7 @@ def spawn_pty(
 
         raw = create_owned_posix_pty(
             _shell_argv(command), spawn, cwd=cwd, env=env, dimensions=(rows, cols),
+            cancel_event=cancel_event,
         )
         return PtyHandle(raw, "posix")
     except Exception as exc:
@@ -286,6 +290,14 @@ async def resize_pty(handle: PtyHandle, cols: int, rows: int) -> None:
 
 
 async def eof_pty(handle: PtyHandle) -> None:
+    if handle.platform == "posix" and sys.platform == "darwin" and isinstance(
+        handle.raw, _OwnedPtyProcess
+    ):
+        owner = getattr(handle.raw, "_opensquilla_process_tree_owner", None)
+        if owner is None or not await owner.capture_before_eof():
+            raise PtyBackendError(
+                "PTY descendants could not be captured before EOF", started=True, handle=handle,
+            )
     await asyncio.to_thread(handle.eof)
 
 

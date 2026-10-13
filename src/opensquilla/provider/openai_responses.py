@@ -75,11 +75,7 @@ def _responses_tool(tool: ToolDefinition) -> dict[str, Any]:
         "type": "function",
         "name": tool.name,
         "description": tool.description,
-        "parameters": {
-            "type": tool.input_schema.type,
-            "properties": tool.input_schema.properties,
-            "required": tool.input_schema.required,
-        },
+        "parameters": tool.input_schema.model_dump(exclude_none=True, by_alias=True),
     }
 
 

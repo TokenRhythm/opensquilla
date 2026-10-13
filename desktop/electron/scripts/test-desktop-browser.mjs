@@ -1,15 +1,24 @@
 import assert from 'node:assert/strict'
 import { request as httpRequest } from 'node:http'
 import { mock } from 'node:test'
-import { DesktopBrowserServer, parseDesktopBrowserRequest, DESKTOP_BROWSER_URL_ENV, DESKTOP_BROWSER_TOKEN_ENV } from '../dist/desktop-browser.js'
+import { DesktopBrowserError, DesktopBrowserServer, parseDesktopBrowserRequest, DESKTOP_BROWSER_URL_ENV, DESKTOP_BROWSER_TOKEN_ENV } from '../dist/desktop-browser.js'
 
 const audit = []
 let calls = 0
 let interrupted = false
 let started
 const slowStarted = new Promise(resolve => { started = resolve })
+const diagnosticUrl = 'https://diagnostic-fixture.test/private?token=synthetic-navigation-secret'
+const diagnosticDetails = {
+  targetRef: 'partially-opened-page', operation: 'open', pageState: 'navigation_failed',
+  navigation: { url: diagnosticUrl, code: 'ERR_NAME_NOT_RESOLVED', errorCode: -105 },
+  outcome: 'completed', retryable: false, recovery: 'change_url_or_network',
+}
 const server = new DesktopBrowserServer(async (request, signal) => {
   calls++
+  if (request.sessionKey === 'synthetic-diagnostic-session') {
+    throw new DesktopBrowserError('NAVIGATION_FAILED', 'Synthetic navigation failure.', 409, diagnosticDetails)
+  }
   if (request.sessionKey === 'slow') return await new Promise(resolve => {
     signal.addEventListener('abort', () => { interrupted = true; resolve({ cancelled: true }) }, { once: true })
     started()
@@ -75,6 +84,16 @@ try {
   assert.throws(() => parseDesktopBrowserRequest({ operation: 'act', sessionKey: 's', targetRef: 'p', action: 'click' }))
   assert.throws(() => parseDesktopBrowserRequest({ operation: 'act', sessionKey: 's', targetRef: 'p', action: 'scroll', direction: 'down', amount: '20' }))
   assert.equal(parseDesktopBrowserRequest({ operation: 'act', sessionKey: 's', targetRef: 'p', action: 'fill', ref: 'e', text: '' }).text, '')
+  const diagnosticResponse = await invoke({ sessionKey: 'synthetic-diagnostic-session', operation: 'open', url: diagnosticUrl })
+  assert.equal(diagnosticResponse.status, 409)
+  const diagnostic = await diagnosticResponse.json()
+  assert.equal(diagnostic.code, 'NAVIGATION_FAILED')
+  for (const [key, value] of Object.entries(diagnosticDetails)) assert.deepEqual(diagnostic[key], value)
+  assert.equal(audit.at(-1).outcome, 'rejected')
+  assert.equal(audit.at(-1).code, 'NAVIGATION_FAILED')
+  for (const forbidden of [token, 'synthetic-diagnostic-session', diagnosticUrl, 'synthetic-navigation-secret']) {
+    assert.equal(JSON.stringify(audit).includes(forbidden), false, 'diagnostic details must not leak into audit events')
+  }
   // A client that disconnects while uploading must not leave an operation running.
   await new Promise(resolve => {
     const client = httpRequest(endpoint, { method: 'POST', headers: { ...headers, 'Content-Length': '100' } })

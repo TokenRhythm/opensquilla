@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, cast
@@ -23,6 +24,7 @@ from opensquilla.application.turn_steering import (
     SteeringSession,
     SteeringTranscript,
 )
+from opensquilla.contracts.local_path_references import normalize_local_path_references
 from opensquilla.gateway.admission_input import (
     is_web_source_hint,
     normalized_source_hint,
@@ -72,6 +74,9 @@ def decode_steering_command(
 ) -> SteerTurn:
     """Resolve v4 aliases and authenticated identity before the Application seam."""
     source = normalized_source_hint(params)
+    local_path_references = normalize_local_path_references(
+        params.get("localPathReferences"), message=params["message"],
+    )
     web_source = is_web_source_hint(source)
     target = _optional_text(params, "expected_turn_id", "expectedTurnId")
     request_id = _optional_text(params, "client_request_id", "clientRequestId")
@@ -99,6 +104,7 @@ def decode_steering_command(
             source_scope=f"{source_scope}:steer.v2"[:256],
             fingerprint_params={
                 "message": params["message"],
+                "localPathReferences": list(local_path_references),
                 "intent": "steer.v2",
                 "queueMode": {
                     "expected_turn_id": target,
@@ -115,6 +121,7 @@ def decode_steering_command(
     return SteerTurn(
         session_key=key,
         message=params["message"],
+        local_path_references=local_path_references,
         expected_turn_id=target,
         client_request_id=request_id,
         client_message_id=message_id,
@@ -308,16 +315,29 @@ class GatewaySteeringPrimitives:
             )
         if not isinstance(session, SessionNode):
             raise TypeError("Durable steering preparation requires a native session")
+        content = message
+        if context.local_path_references:
+            stamp = getattr(self._manager, "stamp_user_text", None)
+            content = json.dumps({
+                "text": stamp(message) if callable(stamp) else message,
+                "display_text": message,
+                "local_path_references": list(context.local_path_references),
+            })
         entry, epoch = await prepare(
             key,
             role="user",
-            content=message,
+            content=content,
             turn_context=_context_payload(context),
             session_node=session,
         )
         if not isinstance(entry, TranscriptEntry):
             raise TypeError("Durable steering preparation requires a native transcript entry")
-        return PreparedSteeringInput(entry, epoch)
+        canonical_message = None
+        if context.local_path_references:
+            if not isinstance(entry.content, str):
+                raise TypeError("Local-path steering requires a persisted text envelope")
+            canonical_message = json.loads(entry.content)["text"]
+        return PreparedSteeringInput(entry, epoch, canonical_message)
 
     async def persist(
         self,

@@ -560,7 +560,15 @@ test.describe('Completed assistant activity disclosure', () => {
         arrowOpacity: arrow ? Number.parseFloat(getComputedStyle(arrow).opacity) : 0,
       }
     })
-    expect(hoverSummaryStyles.backgroundColor).toBe('rgba(0, 0, 0, 0)')
+    const expectedHoverBackground = await page.evaluate(() => {
+      const probe = document.createElement('div')
+      probe.style.backgroundColor = 'color-mix(in srgb, var(--bg-hover) 58%, transparent)'
+      document.body.appendChild(probe)
+      const value = getComputedStyle(probe).backgroundColor
+      probe.remove()
+      return value
+    })
+    expect(hoverSummaryStyles.backgroundColor).toBe(expectedHoverBackground)
     expect(hoverSummaryStyles.boxShadow).toBe('none')
     expect(hoverSummaryStyles.color).not.toBe(idleSummaryStyles.color)
     expect(hoverSummaryStyles.arrowOpacity).toBeGreaterThan(0)
@@ -743,7 +751,7 @@ test.describe('Completed assistant activity disclosure', () => {
       }))
       await page.route('**/control/static/dist/opensquilla-mark.png', route => route.fulfill({
         contentType: 'image/png',
-        body: fs.readFileSync(new URL('../public/opensquilla-mark.png', import.meta.url)),
+        body: fs.readFileSync(new URL('../public-assets/opensquilla-mark.png', import.meta.url)),
       }))
       await mockActivityHistory(page, { recoveredEdit: true })
       await page.setViewportSize({ width, height: width === 390 ? 844 : 900 })

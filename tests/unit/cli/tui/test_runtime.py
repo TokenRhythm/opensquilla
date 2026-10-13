@@ -1496,8 +1496,10 @@ async def test_runtime_runs_command_inline_without_echo_or_queue(command: str) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("command", ["/strategy", "/router on", "/ensemble", "/meta foo"])
-async def test_standalone_gateway_only_commands_never_become_turns(command: str) -> None:
+@pytest.mark.parametrize(
+    "command", ["/strategy", "/router on", "/ensemble", "/meta foo", "/coding on"],
+)
+async def test_standalone_unsupported_commands_never_become_turns(command: str) -> None:
     inputs: asyncio.Queue[str | None] = asyncio.Queue()
     surface = _FakeSurface(inputs)
     state = TuiRuntimeState()

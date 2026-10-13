@@ -804,14 +804,23 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 }
 
 #app .chat .chat-input-footer {
-  padding: 2px 10px 10px;
+  padding: var(--sp-2) var(--sp-3) var(--sp-3);
 }
 
 #app .chat .chat-input-panel .btn--icon:not(.chat-stop-btn) {
-  height: 32px;
-  min-height: 32px;
-  min-width: 32px;
-  width: 32px;
+  height: 36px;
+  min-height: 36px;
+  min-width: 36px;
+  width: 36px;
+}
+
+@media (pointer: coarse) {
+  #app .chat .chat-input-panel .btn--icon:not(.chat-stop-btn) {
+    height: 44px;
+    min-height: 44px;
+    min-width: 44px;
+    width: 44px;
+  }
 }
 
 #app .chat .chat-input-panel .btn--ghost:not(:disabled):hover {

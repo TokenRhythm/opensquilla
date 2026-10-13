@@ -1,4 +1,5 @@
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import { readTransportFailure } from './transportTypes'
 import { CRON_LIST_METHOD, type Result as CronListResult } from '@/contracts/generated/v4/cronList'
 import { validateResult as validateCronListResult } from '@/contracts/generated/v4/cronListValidators.mjs'
 import { CRON_CREATE_METHOD, type Result as CronCreateResult } from '@/contracts/generated/v4/cronCreate'
@@ -21,10 +22,12 @@ import {
 } from '@/contracts/generated/v4/cronRunFinishedEvent'
 import { validatePayload as validateCronRunFinishedPayload } from '@/contracts/generated/v4/cronRunFinishedEventValidators.mjs'
 import type {
+  CronReadOptions,
   CronRunFinished,
   CronScheduler,
   CronSubscription,
 } from '@/modules/cronScheduler'
+import { CronReadUnavailableError } from '@/modules/cronScheduler'
 import type { CronJob, CronRun } from '@/types/cron'
 
 interface RpcTransport {
@@ -43,6 +46,7 @@ const LEASE_OPTIONS: RpcCallOptions = {
   timeoutAction: 'reject',
   abortAction: 'reject',
 }
+const READ_TIMEOUT_MS = 10_000
 
 function invalid(method: string): Error {
   return new Error(`${method} returned an invalid response`)
@@ -57,6 +61,32 @@ export function createV4CronScheduler(
   let stateSubscription: { close(): void } | null = null
   let boundGeneration: number | null = null
   let bindWork: Promise<void> | null = null
+
+  async function read<T>(method: string, params: Record<string, unknown> | undefined, options?: CronReadOptions): Promise<T> {
+    const callOptions: RpcCallOptions = {
+      signal: options?.signal,
+      timeoutMs: READ_TIMEOUT_MS,
+      timeoutAction: 'reject',
+      abortAction: 'reject',
+      recoveryClass: 'safe-read',
+    }
+    try {
+      await rpc.ready(callOptions)
+      if (options?.signal?.aborted) throw new DOMException('Cron read cancelled', 'AbortError')
+      const generation = rpc.generation
+      const result = await rpc.request<T>(method, params, { ...callOptions, expectedGeneration: generation })
+      if (options?.signal?.aborted) throw new DOMException('Cron read cancelled', 'AbortError')
+      if (generation !== rpc.generation) throw new Error('Cron read connection changed')
+      return result
+    } catch (error) {
+      const failure = readTransportFailure(error)
+      if (failure.retryable === true && (
+        failure.code === 'STORAGE_BUSY' || failure.code === 'QUEUE_FULL'
+        || (failure.code === 'UNAVAILABLE' && /queue.*full|too many|capacity/i.test(failure.message))
+      )) throw new CronReadUnavailableError(failure.message, failure.retryAfterMs)
+      throw error
+    }
+  }
 
   const bindLease = async (): Promise<void> => {
     if (listeners.size === 0 || boundGeneration === rpc.generation) return
@@ -128,9 +158,8 @@ export function createV4CronScheduler(
   }
 
   return {
-    async listJobs() {
-      await rpc.ready()
-      const result = await rpc.request<CronListResult>(CRON_LIST_METHOD)
+    async listJobs(options) {
+      const result = await read<CronListResult>(CRON_LIST_METHOD, undefined, options)
       if (!validateCronListResult(result)) throw invalid(CRON_LIST_METHOD)
       return result as CronJob[]
     },
@@ -160,10 +189,11 @@ export function createV4CronScheduler(
       const result = await rpc.request<CronRemoveResult>(CRON_REMOVE_METHOD, { id: jobId })
       if (!validateCronRemoveResult(result)) throw invalid(CRON_REMOVE_METHOD)
     },
-    async listRuns(jobId, limit = 10) {
-      const result = await rpc.request<CronRunsResult>(
+    async listRuns(jobId, limit = 10, options) {
+      const result = await read<CronRunsResult>(
         CRON_RUNS_METHOD,
         { id: jobId, limit },
+        options,
       )
       if (!validateCronRunsResult(result)) throw invalid(CRON_RUNS_METHOD)
       return result as CronRun[]

@@ -6,15 +6,13 @@
         <p>{{ t('settings.sandbox.subtitle') }}</p>
       </div>
       <span
-        v-if="capability || capabilityLoading || capabilityCheckFailed"
+        v-if="capability?.available || capabilityLoading"
         class="sandbox-settings__status"
         :class="{ 'is-ready': capability?.available }"
       >
         {{ capabilityLoading
           ? t('shared.loading')
-          : capability?.available
-            ? t('settings.sandbox.available')
-            : t('settings.sandbox.unavailable') }}
+          : t('settings.sandbox.available') }}
       </span>
     </header>
 
@@ -37,7 +35,7 @@
             <button
               type="button"
               :class="{ 'is-selected': defaultRunMode === 'safe' }"
-              :disabled="(!capability?.available && !canRequestSandboxSetup) || sandboxSetupPending"
+              :disabled="!capability?.available && (!canRequestSandboxSetup || sandboxSetupPending)"
               data-testid="sandbox-safe-mode"
               @click="selectSafeMode"
             >
@@ -53,14 +51,6 @@
             </button>
           </div>
         </section>
-        <p
-          v-if="sandboxSetupOutcomeMessage"
-          class="sandbox-setup-result"
-          data-testid="sandbox-setup-result"
-          role="status"
-        >
-          {{ sandboxSetupOutcomeMessage }}
-        </p>
 
         <nav class="sandbox-list" :aria-label="t('settings.sandbox.title')">
           <button type="button" class="sandbox-list__row" data-testid="sandbox-open-files" @click="activeView = 'files'">
@@ -383,6 +373,7 @@
       :open="sandboxSetupConfirmOpen"
       :pending="sandboxSetupPending"
       :outcome="sandboxSetupOutcome"
+      :repair-identity="sandboxIdentityRepairRequired"
       @cancel="cancelSandboxSetup"
       @background="runSandboxSetupInBackground"
       @confirm="void continueSandboxSetup()"
@@ -411,9 +402,9 @@ const { t } = useI18n()
 const {
   loading,
   capabilityLoading,
-  capabilityCheckFailed,
   loadError,
   capability,
+  sandboxSetupStatus,
   canRequestSandboxSetup,
   draft,
   builtinDenyWritePaths,
@@ -438,13 +429,21 @@ const {
   adoptSavedDefaultRunMode,
   scheduleSectionSave,
   flushSectionSave,
+  hasUnsettledChanges,
+  prepareToLeave,
 } = useSandboxSettings()
+defineExpose({ hasUnsettledChanges, prepareToLeave })
 const sandboxSetupStore = useSandboxSetupStore()
 const {
   ensuring: sandboxSetupPending,
   outcome: sandboxSetupOutcome,
   intendedMode: sandboxSetupIntendedMode,
 } = storeToRefs(sandboxSetupStore)
+
+const sandboxIdentityRepairRequired = computed(() => (
+  sandboxSetupStatus.value?.detail?.includes('offline_identity_repair_required') === true
+  || sandboxSetupStore.status?.detail?.includes('offline_identity_repair_required') === true
+))
 
 const newFilePath = ref('')
 const approvalPrefix = ref('')
@@ -673,15 +672,6 @@ function runtimeInstallLabel(status: SandboxRuntimeComponentStatus): string {
   return t('settings.sandbox.runtimes.actions.download')
 }
 
-const sandboxSetupOutcomeMessage = computed(() => {
-  if (sandboxSetupOutcome.value === 'cancelled') return t('settings.sandbox.setup.cancelled')
-  if (sandboxSetupOutcome.value === 'failed') return t('settings.sandbox.setup.failed')
-  if (sandboxSetupOutcome.value === 'verification_failed') {
-    return t('settings.sandbox.setup.verificationFailed')
-  }
-  return ''
-})
-
 function selectSafeMode(): void {
   sandboxSetupStore.resetOutcome()
   sandboxSetupStore.noteRunModeSelection('safe')
@@ -704,9 +694,9 @@ function cancelSandboxSetup(): void {
 
 async function continueSandboxSetup(): Promise<void> {
   if (sandboxSetupPending.value) return
-  const ready = await sandboxSetupStore.startSafeSetup()
+  const ready = await sandboxSetupStore.startSafeSetup({ repairIdentity: sandboxIdentityRepairRequired.value })
+  if (sandboxSetupOutcome.value !== 'in_progress') sandboxSetupConfirmOpen.value = false
   if (ready) {
-    sandboxSetupConfirmOpen.value = false
     if (sandboxSetupIntendedMode.value === 'safe') adoptSavedDefaultRunMode('safe')
   }
   await load()

@@ -12,19 +12,28 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import pytest
 
 ENTRY = Path(__file__).resolve().parents[2] / "desktop/electron/scripts/gateway-entry.py"
+MIGRATIONS_DIR = ENTRY.parents[3] / "migrations"
 
 
 def isolated_environment(tmp_path: Path) -> dict[str, str]:
     profile = tmp_path / "profile"
     profile.mkdir()
     config = profile / "config.toml"
-    config.write_text('[auth]\nmode = "none"\n', encoding="utf-8")
+    # These probes exercise Desktop/MCP transport, not semantic memory search.
+    # Keep the fresh-profile startup budget focused on the transport under test
+    # instead of downloading/loading a local embedding backend on Windows CI.
+    config.write_text(
+        '[auth]\nmode = "none"\n'
+        '[memory]\nretrieval_mode = "fts_only"\n'
+        '[memory.embedding]\nprovider = "none"\n',
+        encoding="utf-8",
+    )
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith("OPENSQUILLA_")}
     environment.update({
@@ -67,6 +76,54 @@ def _gateway_startup_diagnostics(tmp_path: Path) -> str:
                   "error_code": getattr(exc, "sqlite_errorname", None)}
     diagnostics.append(f"migration ledger: {json.dumps(ledger)}")
     return "\n\n".join(diagnostics)
+
+
+def _prepare_migrated_profile(environment: dict[str, str]) -> None:
+    """Seed the isolated Gateway profile before timing the MCP bridge startup."""
+
+    from opensquilla.persistence.migrator import apply_pending
+
+    database = Path(environment["OPENSQUILLA_STATE_DIR"]) / "state" / "sessions.db"
+    database.parent.mkdir(parents=True, exist_ok=True)
+    assert apply_pending(str(database), MIGRATIONS_DIR)
+
+
+@contextmanager
+def _running_gateway(tmp_path: Path, environment: dict[str, str]):
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    log_path = tmp_path / "gateway.log"
+    with log_path.open("w", encoding="utf-8") as log:
+        gateway = subprocess.Popen(
+            [sys.executable, str(ENTRY), "gateway", "run", "--bind", "127.0.0.1",
+             "--port", str(port), "--config", environment["OPENSQUILLA_GATEWAY_CONFIG_PATH"]],
+            env=environment, stdout=log, stderr=subprocess.STDOUT,
+        )
+        try:
+            yield gateway, port
+        finally:
+            gateway.terminate()
+            try:
+                gateway.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                gateway.kill()
+                gateway.wait(timeout=10)
+
+
+def _wait_for_gateway_healthz(gateway: subprocess.Popen, port: int, tmp_path: Path) -> None:
+    deadline = time.monotonic() + 40
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    while time.monotonic() < deadline:
+        assert gateway.poll() is None, _gateway_startup_diagnostics(tmp_path)
+        try:
+            with opener.open(f"http://127.0.0.1:{port}/healthz", timeout=1) as response:
+                if json.load(response).get("ok"):
+                    return
+        except (OSError, urllib.error.URLError):
+            pass
+        time.sleep(0.1)
+    pytest.fail(_gateway_startup_diagnostics(tmp_path))
 
 
 def test_document_probe_extracts_text_and_renders_a_decodable_image(tmp_path: Path) -> None:
@@ -121,13 +178,15 @@ def test_pty_probe_reports_real_tty_when_backend_is_installed(tmp_path: Path) ->
 
 @pytest.mark.parametrize("failure", ["read", "timeout", "initialization"])
 def test_pty_probe_cleans_child_after_failure(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], failure: str
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], failure: str,
+    tmp_path: Path,
 ) -> None:
     from opensquilla.tools import pty_backend
 
     handle = object()
     terminated = []
     waited = []
+    monkeypatch.setenv("CI_REPORT_DIR", str(tmp_path))
 
     def spawn(*args, **kwargs):
         if failure == "initialization":
@@ -155,7 +214,10 @@ def test_pty_probe_cleans_child_after_failure(
     monkeypatch.setattr(pty_backend, "wait_pty", wait)
     namespace = runpy.run_path(str(ENTRY))
     probe = namespace["_run_desktop_pty_probe"]
-    monkeypatch.setitem(probe.__globals__, "_DESKTOP_PTY_PROBE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setitem(
+        probe.__globals__, "_DESKTOP_PTY_PROBE_TIMEOUT_SECONDS",
+        1.0 if failure == "read" else 0.01,
+    )
 
     assert probe() == 1
     result = json.loads(capsys.readouterr().out)
@@ -167,59 +229,160 @@ def test_pty_probe_cleans_child_after_failure(
     }[failure]
     assert terminated == [handle]
     assert waited == [handle]
+    diagnostic = json.loads((tmp_path / "pty-probe-failures.jsonl").read_text())
+    assert diagnostic["phase"] in {
+        "read": {"read"}, "timeout": {"read", "post-exit-drain"},
+        "initialization": {"spawn"},
+    }[failure]
+    assert diagnostic["cleanupAttempted"] is True
+    assert diagnostic["cleanupCompleted"] is True
+    assert diagnostic["outputBytes"] == 0
+    assert diagnostic["sawTtyMarker"] is False
+    assert diagnostic["errorTypes"][0] == {
+        "read": "RuntimeError", "timeout": "TimeoutError", "initialization": "PtyBackendError",
+    }[failure]
 
 
-# Fresh-profile migrations and a real stdio server share the runner's process
-# and disk budget. Keep the startup deadline independent of parallel test load.
+def test_pty_probe_diagnostic_keeps_only_safe_state_and_preserves_attempts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path,
+) -> None:
+    from opensquilla.tools import pty_backend
+
+    monkeypatch.setenv("CI_REPORT_DIR", str(tmp_path))
+    monkeypatch.setenv("SYNTHETIC_SECRET", "do-not-record-this-value")
+    handle = object()
+    monkeypatch.setattr(pty_backend, "spawn_pty", lambda *args, **kwargs: handle)
+
+    async def terminate(current):
+        stopped.set()
+
+    async def wait(current):
+        await stopped.wait()
+        return 0
+
+    monkeypatch.setattr(pty_backend, "wait_pty", wait)
+    monkeypatch.setattr(pty_backend, "terminate_pty", terminate)
+    namespace = runpy.run_path(str(ENTRY))
+    for _ in range(2):
+        stopped = asyncio.Event()
+        chunks = iter([b"opensquilla-pty-o", b"k\n", b"private terminal text"])
+
+        async def read(current):
+            chunk = next(chunks, None)
+            if chunk is None:
+                raise RuntimeError("synthetic failure")
+            return chunk
+
+        monkeypatch.setattr(pty_backend, "read_pty", read)
+        assert namespace["_run_desktop_pty_probe"]() == 1
+    assert len(capsys.readouterr().out.splitlines()) == 2
+    payload = (tmp_path / "pty-probe-failures.jsonl").read_text()
+    attempts = [json.loads(line) for line in payload.splitlines()]
+    assert len(attempts) == 2
+    assert all(row["sawTtyMarker"] for row in attempts)
+    assert all(row["outputBytes"] == len(b"opensquilla-pty-ok\nprivate terminal text")
+               for row in attempts)
+    assert all(row["phase"] == "read" for row in attempts)
+    assert all(row["waitCompletedBeforeCleanup"] is False for row in attempts)
+    assert "private terminal text" not in payload
+    assert "do-not-record-this-value" not in payload
+
+
+def test_pty_probe_drains_tail_after_process_exit(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path,
+) -> None:
+    from opensquilla.tools import pty_backend
+
+    handle = object()
+    chunks = iter([b"opensquilla-pty-ok\n", b"late-tail\n", b""])
+    monkeypatch.setenv("CI_REPORT_DIR", str(tmp_path))
+
+    monkeypatch.setattr(pty_backend, "spawn_pty", lambda *args, **kwargs: handle)
+
+    async def read(current):
+        assert current is handle
+        return next(chunks)
+
+    async def wait(current):
+        assert current is handle
+        return 0
+
+    monkeypatch.setattr(pty_backend, "read_pty", read)
+    monkeypatch.setattr(pty_backend, "wait_pty", wait)
+    monkeypatch.setattr(pty_backend, "terminate_pty", lambda current: asyncio.sleep(0))
+    namespace = runpy.run_path(str(ENTRY))
+    probe = namespace["_run_desktop_pty_probe"]
+
+    assert probe() == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "probe": "opensquilla-desktop-pty",
+        "available": True,
+        "ioMode": "pty",
+        "returncode": 0,
+    }
+    assert not (tmp_path / "pty-probe-failures.jsonl").exists()
+
+
+def test_pty_probe_waits_for_process_when_reader_eof_arrives_first(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from opensquilla.tools import pty_backend
+
+    handle = object()
+    chunks = iter([b"opensquilla-pty-ok\n", b""])
+
+    monkeypatch.setattr(pty_backend, "spawn_pty", lambda *args, **kwargs: handle)
+
+    async def read(current):
+        assert current is handle
+        return next(chunks)
+
+    async def wait(current):
+        assert current is handle
+        await asyncio.sleep(0.01)
+        return 0
+
+    monkeypatch.setattr(pty_backend, "read_pty", read)
+    monkeypatch.setattr(pty_backend, "wait_pty", wait)
+    monkeypatch.setattr(pty_backend, "terminate_pty", lambda current: asyncio.sleep(0))
+    namespace = runpy.run_path(str(ENTRY))
+    probe = namespace["_run_desktop_pty_probe"]
+
+    assert probe() == 0
+    assert json.loads(capsys.readouterr().out)["returncode"] == 0
+
+
+@pytest.mark.ci_serial
+def test_gateway_fresh_profile_reaches_healthz(tmp_path: Path) -> None:
+    """Keep cold CLI startup/migration coverage separate from MCP assertions."""
+
+    environment = isolated_environment(tmp_path)
+    with _running_gateway(tmp_path, environment) as (gateway, port):
+        _wait_for_gateway_healthz(gateway, port, tmp_path)
+
+
 @pytest.mark.ci_serial
 def test_mcp_probe_uses_real_stdio_server_and_gateway(tmp_path: Path) -> None:
     from mcp_types import LATEST_PROTOCOL_VERSION
 
     environment = isolated_environment(tmp_path)
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
-    log_path = tmp_path / "gateway.log"
-    with log_path.open("w", encoding="utf-8") as log:
-        gateway = subprocess.Popen(
-            [sys.executable, str(ENTRY), "gateway", "run", "--bind", "127.0.0.1",
-             "--port", str(port), "--config", environment["OPENSQUILLA_GATEWAY_CONFIG_PATH"]],
-            env=environment, stdout=log, stderr=subprocess.STDOUT,
-        )
-        try:
-            deadline = time.monotonic() + 40
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            while time.monotonic() < deadline:
-                assert gateway.poll() is None, _gateway_startup_diagnostics(tmp_path)
-                try:
-                    with opener.open(f"http://127.0.0.1:{port}/healthz", timeout=1) as response:
-                        if json.load(response).get("ok"):
-                            break
-                except (OSError, urllib.error.URLError):
-                    pass
-                time.sleep(0.1)
-            else:
-                pytest.fail(_gateway_startup_diagnostics(tmp_path))
+    # Cold migration is covered by the dedicated smoke above; bridge timing
+    # starts from the same latest-schema profile for source and frozen probes.
+    _prepare_migrated_profile(environment)
+    with _running_gateway(tmp_path, environment) as (gateway, port):
+        _wait_for_gateway_healthz(gateway, port, tmp_path)
 
-            frozen_probe = os.environ.get("OPENSQUILLA_TEST_FROZEN_MCP_PROBE")
-            probe_command = [frozen_probe] if frozen_probe else [sys.executable, str(ENTRY)]
-            result = subprocess.run(
-                [*probe_command, "--_desktop-mcp-probe",
-                 f"ws://127.0.0.1:{port}/ws"],
-                env=environment, text=True, capture_output=True, timeout=60,
-            )
-            assert result.returncode == 0, result.stderr
-            assert json.loads(result.stdout) == {
-                "probe": "opensquilla-desktop-mcp", "sessions": 0,
-                "protocolVersion": LATEST_PROTOCOL_VERSION,
-                "tools": ["conversations_list", "events_wait", "messages_read",
-                          "messages_send", "session_resolve", "transcript_export"],
-                "resources": ["opensquilla://sessions"],
-            }
-        finally:
-            gateway.terminate()
-            try:
-                gateway.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                gateway.kill()
-                gateway.wait(timeout=10)
+        frozen_probe = os.environ.get("OPENSQUILLA_TEST_FROZEN_MCP_PROBE")
+        probe_command = [frozen_probe] if frozen_probe else [sys.executable, str(ENTRY)]
+        result = subprocess.run(
+            [*probe_command, "--_desktop-mcp-probe", f"ws://127.0.0.1:{port}/ws"],
+            env=environment, text=True, capture_output=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "probe": "opensquilla-desktop-mcp", "sessions": 0,
+            "protocolVersion": LATEST_PROTOCOL_VERSION,
+            "tools": ["conversations_list", "events_wait", "messages_read",
+                      "messages_send", "session_resolve", "transcript_export"],
+            "resources": ["opensquilla://sessions"],
+        }

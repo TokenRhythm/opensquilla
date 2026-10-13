@@ -12,6 +12,23 @@ afterEach(() => {
 })
 
 describe('native Workbench platform bridge', () => {
+  it('forwards optional automation state while preserving older native clients', async () => {
+    const base = {
+      createWorkbenchSurface: vi.fn(),
+      setWorkbenchSurfaceRect: vi.fn(),
+      activateWorkbenchSurface: vi.fn(),
+      destroyWorkbenchSurface: vi.fn(),
+      onWorkbenchSurfaceEvent: vi.fn(),
+    }
+    setDesktopApi(base)
+    expect(createDesktopPlatform().workbench.native?.setBrowserAutomationState).toBeUndefined()
+    const update = vi.fn(async () => ({ ok: true }))
+    setDesktopApi({ ...base, setBrowserAutomationState: update })
+    const request = { sessionKey: 'session-fixture', taskId: 'task-fixture', active: true }
+    await createDesktopPlatform().workbench.native!.setBrowserAutomationState!(request)
+    expect(update).toHaveBeenCalledExactlyOnceWith(request)
+  })
+
   it('is absent on web and older desktop shells', () => {
     expect(createWebPlatform().workbench.native).toBeUndefined()
     expect(createWebPlatform().capabilities.hasNativeWorkbenchSurfaces).toBe(false)
@@ -130,6 +147,16 @@ describe('native Workbench platform bridge', () => {
       type: 'missing-resource',
       detail: { path: '/assets/app.css' },
     })
+    const navigationError = { url: 'https://example.test/unavailable', code: 'ERR_CONNECTION_REFUSED',
+      errorCode: -102, message: 'Connection refused.' }
+    emit?.({ version: 4, surfaceId: 'browser:fixture', type: 'navigation-state',
+      detail: { pageState: 'navigation_failed', navigationError: { ...navigationError, ignored: 'value' } } })
+    expect(listener).toHaveBeenLastCalledWith({ version: 4, surfaceId: 'browser:fixture', type: 'navigation-state',
+      detail: { pageState: 'navigation_failed', navigationError } })
+    emit?.({ version: 4, surfaceId: 'browser:fixture', type: 'navigation-state', detail: { navigationError: null } })
+    expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({ detail: { navigationError: null } }))
+    emit?.({ version: 4, surfaceId: 'browser:fixture', type: 'navigation-state', detail: { navigationError: { code: 42 } } })
+    expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({ detail: {} }))
   })
 
   it('fails closed when only part of the shell bridge exists', () => {
@@ -142,6 +169,41 @@ describe('native Workbench platform bridge', () => {
     const platform = createDesktopPlatform()
     expect(platform.workbench.native).toBeUndefined()
     expect(platform.capabilities.hasNativeWorkbenchSurfaces).toBe(false)
+  })
+
+  it.each([
+    {
+      name: 'current host',
+      getCapabilities: async () => ({ protocolVersions: [1, 2, 3, 4], modes: ['full'] }),
+      expected: { protocolVersions: [1, 2, 3, 4], modes: ['full'] },
+    },
+    {
+      name: 'legacy host with an explicit limit',
+      getCapabilities: async () => ({ protocolVersions: [1, 2], modes: ['offline'], maxSurfaces: 8 }),
+      expected: { protocolVersions: [1, 2], modes: ['offline'], maxSurfaces: 8 },
+    },
+    {
+      name: 'host without a capability bridge',
+      getCapabilities: undefined,
+      expected: { protocolVersions: [1], modes: ['offline'] },
+    },
+    {
+      name: 'unavailable capability bridge',
+      getCapabilities: async () => { throw new Error('unavailable') },
+      expected: { protocolVersions: [1], modes: ['offline'] },
+    },
+  ])('does not invent a surface limit for $name', async ({ getCapabilities, expected }) => {
+    setDesktopApi({
+      createWorkbenchSurface: async () => ({ ok: true }),
+      setWorkbenchSurfaceRect: async () => ({ ok: true }),
+      activateWorkbenchSurface: async () => ({ ok: true }),
+      destroyWorkbenchSurface: async () => ({ ok: true }),
+      onWorkbenchSurfaceEvent: () => () => undefined,
+      getWorkbenchCapabilities: getCapabilities,
+    })
+
+    const native = createDesktopPlatform().workbench.native!
+    await expect(native.getCapabilities?.()).resolves.toEqual(expected)
   })
 
   it('normalizes the v3 annotation bridge and rejects untrusted event fields', async () => {

@@ -16,6 +16,8 @@ if (process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND
   process.exit(child.status ?? 1)
 }
 let revision = 1
+let holdWorkingHead = false
+const heldWorkingHeads = []
 const requests = { working: 0, immutable: 0 }
 const server = createServer((request, response) => {
   // Commit a real replacement document, but keep its load pending until stop.
@@ -42,6 +44,10 @@ const server = createServer((request, response) => {
   response.setHeader('cache-control', 'no-store')
   response.setHeader('etag', `"${working ? revision : 1}"`)
   if (working) response.setHeader('x-opensquilla-working-preview', '1')
+  if (working && request.method === 'HEAD' && holdWorkingHead) {
+    heldWorkingHeads.push(() => response.end())
+    return
+  }
   response.end(`<!doctype html><title>Browser fixture</title><style>body{min-height:1500px;padding:24px;background:${request.url === '/hidden-open' ? '#2040d0' : 'white'}}</style>
     <h1>Revision ${working ? revision : 1}</h1><button id="increment" onclick="window.count=(window.count||0)+1">Increment</button>
     <input id="value" aria-label="Value"><select aria-label="Choice"><option value="a">A</option><option value="b">B</option></select>
@@ -62,7 +68,9 @@ try {
     resolve({ code, signal })
   }))
   const setup = await app.evaluate(async ({ BrowserWindow, ipcMain }, { origin, preload }) => {
-    const owner = new BrowserWindow({ show: true, width: 1000, height: 800,
+    // Initialize retained views before presenting the owner. Electron can have
+    // finished the document while isLoading() still awaits did-stop-loading.
+    const owner = new BrowserWindow({ show: false, width: 1000, height: 800,
       webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, preload } })
     await owner.loadURL('data:text/html,<title>Browser test host</title>')
     const manager = new globalThis.__opensquillaNativeWorkbenchSurfaceManager({ getWindow: () => owner, emit() {} })
@@ -86,6 +94,7 @@ try {
       return await manager.navigateSurface(request)
     })
     const targets = []
+    const initialClassifications = []
     for (const [surfaceId, sessionKey, path] of [
       ['first', 'session-a', '/'], ['same-url', 'session-a', '/'], ['other-session', 'session-b', '/'],
       ['working', 'session-a', '/working'],
@@ -93,14 +102,30 @@ try {
       const result = await manager.createSurface({ version: 4, surfaceId, kind: 'artifact-preview',
         payload: { launchUrl: origin + path, expectedOrigin: origin, scopeId: sessionKey, mode: 'full' } })
       if (!result.ok) throw new Error(result.message)
+      initialClassifications.push(manager.surfaces.get(surfaceId).revisionKind)
       manager.setSurfaceRect({ surfaceId, x: 100, y: 80, width: 700, height: 600, visible: true })
       targets.push(manager.getBrowserTarget(surfaceId))
     }
+    owner.show()
     manager.activateSurface('first')
     const browser = new globalThis.__opensquillaDesktopBrowserServer((request, signal) => manager.executeBrowser(request, signal))
     globalThis.browserFixture.server = browser
-    return { targets, environment: await browser.start() }
+    return { targets, initialClassifications, environment: await browser.start() }
   }, { origin, preload: fileURLToPath(new URL('../dist/preload.cjs', import.meta.url)) })
+  assert.deepEqual(setup.initialClassifications, ['immutable', 'immutable', 'immutable', 'working'],
+    'hidden previews must classify at creation, without relying on later visibility or Agent access')
+  // Optional real idle measurement, also usable against an unchanged baseline.
+  const idleSampleMs = Number(process.env.OPENSQUILLA_PREVIEW_IDLE_SAMPLE_MS || 0)
+  if (idleSampleMs > 0) {
+    await new Promise(resolve => setTimeout(resolve, 2200))
+    const before = requests.working
+    const started = Date.now()
+    await new Promise(resolve => setTimeout(resolve, idleSampleMs))
+    console.log('Working preview idle sample:', JSON.stringify({
+      platform: process.platform, elapsedMs: Date.now() - started,
+      hiddenWorkingHeads: requests.working - before,
+    }))
+  }
   const controlPage = (await Promise.all(app.windows().map(async page => ({ page, title: await page.title() }))))
     .find(({ title }) => title === 'Browser test host')?.page
   assert.ok(controlPage, 'the fixture owner renderer must expose the shipped preload')
@@ -158,17 +183,27 @@ try {
   assert.equal(await app.evaluate(async () => await globalThis.browserFixture.manager.surfaces.get('first').view.webContents.executeJavaScript('window.count')),1)
   const beforeWorking = await app.evaluate(() => globalThis.browserFixture.manager.surfaces.get('working').view.webContents.id)
   const beforeWorkingSnapshot = await invoke({operation:'snapshot',targetRef:working.targetRef})
+  const idleHeads = requests.working
+  await new Promise(resolve => setTimeout(resolve, 2200))
+  assert.equal(requests.working, idleHeads, 'a hidden idle working preview must not poll')
+  assert.equal(await app.evaluate(() => globalThis.browserFixture.manager.surfaces.get('working').revisionTimer), null)
   revision = 2
-  await app.evaluate(async () => {
+  const hiddenFreshSnapshot = await invoke({operation:'snapshot',targetRef:working.targetRef})
+  assert.equal(hiddenFreshSnapshot.status, 200)
+  assert.match(hiddenFreshSnapshot.text, /Revision 2/)
+  assert.equal(await app.evaluate(() => globalThis.browserFixture.manager.surfaces.get('working').view.getVisible()), false)
+  const waitWorkingRevision = async expected => await app.evaluate(async ({}, expected) => {
     const record = globalThis.browserFixture.manager.surfaces.get('working')
     const end = Date.now()+7000
     while(Date.now()<end) {
-      if (record.browserDocumentReady && await record.view.webContents.executeJavaScript('document.querySelector("h1")?.innerText') === 'Revision 2') return
+      if (record.browserDocumentReady && await record.view.webContents.executeJavaScript('document.querySelector("h1")?.innerText') === `Revision ${expected}`) return
       await new Promise(resolve=>setTimeout(resolve,100))
     }
-    const probe = await record.previewSession.fetch(record.documentUrl,{method:'HEAD',cache:'no-store',redirect:'error'}).then(r=>({status:r.status,headers:Object.fromEntries(r.headers)}),e=>({error:String(e)}))
-    throw new Error('Working file preview did not refresh: '+JSON.stringify({probe,loading:record.view.webContents.isLoading(),ready:record.browserDocumentReady,timer:Boolean(record.revisionTimer)}))
-  })
+    throw new Error('Working file preview did not refresh: '+JSON.stringify({expected,loading:record.view.webContents.isLoading(),ready:record.browserDocumentReady,timer:Boolean(record.revisionTimer)}))
+  }, expected)
+  await app.evaluate(() => globalThis.browserFixture.manager.activateSurface('working'))
+  revision = 3
+  await waitWorkingRevision(3)
   assert.equal(await app.evaluate(() => globalThis.browserFixture.manager.surfaces.get('working').view.webContents.id),beforeWorking)
   assert.equal((await invoke({operation:'act',targetRef:working.targetRef,action:'click',ref:beforeWorkingSnapshot.refs.find(item=>item.name==='Increment').ref})).code,'STALE_ELEMENT')
   const refreshedSnapshot = await invoke({operation:'snapshot',targetRef:working.targetRef})
@@ -208,7 +243,98 @@ try {
   const afterReloadSnapshot = await invoke({operation:'snapshot',targetRef:working.targetRef})
   assert.equal((await invoke({operation:'act',targetRef:working.targetRef,action:'click',ref:afterReloadSnapshot.refs.find(item=>item.name==='Increment').ref})).status,200)
   assert.equal(await app.evaluate(async () => globalThis.browserFixture.manager.surfaces.get('working').view.webContents.executeJavaScript('window.count')),1)
+  // Interaction protects application state as well as form values. Reads cannot
+  // silently discard it when the working file changes underneath the renderer.
+  const draftInput = afterReloadSnapshot.refs.find(item => item.name === 'Value')
+  assert.equal((await invoke({operation:'act',targetRef:working.targetRef,action:'fill',ref:draftInput.ref,text:'synthetic unsaved draft'})).status, 200)
+  revision = 4
+  const protectedHeads = requests.working
+  await new Promise(resolve => setTimeout(resolve, 2200))
+  assert.equal(requests.working, protectedHeads)
+  for (const operation of ['snapshot', 'screenshot']) {
+    assert.equal((await invoke({operation,targetRef:working.targetRef})).code, 'REFRESH_DEFERRED')
+  }
+  const retainedDraft = await app.evaluate(async () => {
+    const record = globalThis.browserFixture.manager.surfaces.get('working')
+    return await record.view.webContents.executeJavaScript('({title:document.querySelector("h1").innerText,value:document.querySelector("input").value,count:window.count})')
+  })
+  assert.deepEqual(retainedDraft, {title:'Revision 3',value:'synthetic unsaved draft',count:1})
+  assert.equal((await invoke({operation:'reload',targetRef:working.targetRef})).status, 200)
+  await waitWorkingRevision(4)
+  const annotationMode = await app.evaluate(async () => await globalThis.browserFixture.manager.setArtifactAnnotationMode({version:4,surfaceId:'working',enabled:true}))
+  assert.equal(annotationMode.ok, true)
+  revision = 5
+  assert.equal((await invoke({operation:'snapshot',targetRef:working.targetRef})).code, 'REFRESH_DEFERRED')
+  assert.equal(await app.evaluate(() => globalThis.browserFixture.manager.surfaces.get('working').annotationPickerActive), true)
+  await app.evaluate(async () => {
+    const manager = globalThis.browserFixture.manager
+    manager.activateSurface('first')
+    manager.activateSurface('working')
+    await manager.setArtifactAnnotationMode({version:4,surfaceId:'working',enabled:false})
+  })
+  assert.equal((await invoke({operation:'snapshot',targetRef:working.targetRef})).code, 'REFRESH_DEFERRED',
+    'the hide/annotation-flush handoff must preserve pending state')
+  assert.equal((await invoke({operation:'reload',targetRef:working.targetRef})).status, 200)
+  await waitWorkingRevision(5)
+
+  // A hidden view drops an outstanding background request, even if a late
+  // transport response arrives. Reopening and Agent access retain its identity.
+  holdWorkingHead = true
+  revision = 6
+  const waitHeldHead = async () => {
+    const end = Date.now() + 4000
+    while (!heldWorkingHeads.length && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.ok(heldWorkingHeads.length, 'expected a pending background HEAD')
+  }
+  await waitHeldHead()
+  await app.evaluate(() => globalThis.browserFixture.manager.activateSurface('first'))
+  holdWorkingHead = false
+  heldWorkingHeads.splice(0).forEach(release => release())
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(await app.evaluate(async () => await globalThis.browserFixture.manager.surfaces.get('working').view.webContents.executeJavaScript('document.querySelector("h1").innerText')), 'Revision 5')
+  assert.match((await invoke({operation:'snapshot',targetRef:working.targetRef})).text, /Revision 6/)
+
+  // Keep a real capture in flight: no background revision check may interleave
+  // between capture start and completion, even if the view becomes visible.
+  await app.evaluate(() => {
+    const fixture = globalThis.browserFixture
+    const contents = fixture.manager.surfaces.get('working').view.webContents
+    const capture = contents.capturePage.bind(contents)
+    contents.capturePage = async (...args) => {
+      contents.capturePage = capture
+      fixture.captureStarted = true
+      await new Promise(resolve => { fixture.releaseCapture = resolve })
+      return await capture(...args)
+    }
+  })
+  const pendingCapture = invoke({operation:'screenshot',targetRef:working.targetRef})
+  await app.evaluate(async () => {
+    const end = Date.now() + 3000
+    while (!globalThis.browserFixture.captureStarted && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 10))
+    if (!globalThis.browserFixture.captureStarted) throw new Error('Capture did not start')
+    globalThis.browserFixture.manager.activateSurface('working')
+  })
+  const duringCaptureHeads = requests.working
+  revision = 7
+  await new Promise(resolve => setTimeout(resolve, 1200))
+  assert.equal(requests.working, duringCaptureHeads)
+  await app.evaluate(() => globalThis.browserFixture.releaseCapture())
+  assert.equal((await pendingCapture).status, 200)
+  await waitWorkingRevision(7)
+  await app.evaluate(() => {
+    const manager = globalThis.browserFixture.manager
+    for (let i = 0; i < 30; i++) {
+      manager.activateSurface('first')
+      manager.activateSurface('working')
+    }
+    manager.activateSurface('first')
+  })
+  const cycledHeads = requests.working
+  await new Promise(resolve => setTimeout(resolve, 1200))
+  assert.equal(requests.working, cycledHeads, 'repeated view switches cannot leave a polling loop behind')
+  assert.equal(await app.evaluate(() => globalThis.browserFixture.manager.surfaces.get('working').view.webContents.id), beforeWorking)
   assert.equal(requests.immutable,3,'immutable previews should probe once and stop')
+  await app.evaluate(() => globalThis.browserFixture.manager.activateSurface('working'))
   const replacement = await app.evaluate(async ({}, origin) => {
     const manager = globalThis.browserFixture.manager
     await manager.destroySurface('first')

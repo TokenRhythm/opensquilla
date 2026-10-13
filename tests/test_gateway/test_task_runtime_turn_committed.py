@@ -81,6 +81,9 @@ class _Storage:
         record = self.records.get(task_id)
         if record is None:
             return
+        details_patch = updates.pop("details_patch", None)
+        if details_patch is not None:
+            record.details = {**(record.details or {}), **details_patch}
         for field_name, value in updates.items():
             if hasattr(record, field_name):
                 object.__setattr__(record, field_name, value)

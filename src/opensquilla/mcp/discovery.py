@@ -3,18 +3,40 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
+import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
+import structlog
 from anyascii import anyascii
 
+from opensquilla.contracts.attachments import (
+    IMAGE_ATTACHMENT_BYTES,
+    IMAGE_ATTACHMENT_MIMES,
+    MAX_ATTACHMENTS,
+    normalize_attachment_mime,
+)
+from opensquilla.contracts.image_validation import validate_image_bytes
 from opensquilla.mcp.client import MCPClient
-from opensquilla.mcp.types import MCPServerConfig, MCPToolDef
+from opensquilla.mcp.types import (
+    MCPCallContext,
+    MCPServerConfig,
+    MCPToolDef,
+    MCPToolResult,
+    current_mcp_call_context,
+)
+from opensquilla.safety.secret_redaction import redact_secret_text, redact_secret_value
 from opensquilla.tools.registry import ToolRegistry
-from opensquilla.tools.types import SafeToolError, ToolSpec
+from opensquilla.tools.types import SafeToolError, ToolSpec, current_tool_context
+
+MCPToolSpecTransform = Callable[[MCPToolDef, ToolSpec], ToolSpec]
+log = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -47,6 +69,9 @@ _active_clients: list[ActiveMCPClient] = []
 
 _PROVIDER_TOOL_NAME_MAX_LENGTH = 64
 _MCP_NAMESPACE_MAX_LENGTH = 32
+# Leave room beneath the standard curated tool-error envelope's 2,000-character cap.
+_MCP_ERROR_SUMMARY_MAX_CHARS = 1800
+_JSON_STRING_TOKEN = re.compile(r'"(?:\\.|[^"\\])*"')
 
 
 def _bounded_name(value: str, *, max_length: int, separator: str) -> str:
@@ -134,6 +159,161 @@ def create_client(config: MCPServerConfig) -> MCPClient:
         raise ValueError(f"Unknown MCP transport: {config.transport!r}")
 
 
+def _result_text_parts(result: MCPToolResult) -> list[str]:
+    if result.structured_content is None:
+        return [result.content] if result.content else []
+    structured = json.dumps(result.structured_content, ensure_ascii=False)
+    try:
+        legacy = json.loads(result.content)
+    except (ValueError, TypeError):
+        legacy = None
+    if legacy == result.structured_content:
+        return [result.content]
+    # Some servers extend structuredContent after producing a legacy JSON text
+    # block. The extension should not cause the earlier object to appear twice.
+    repeated = isinstance(legacy, dict) and all(
+        key in result.structured_content and result.structured_content[key] == value
+        for key, value in legacy.items()
+    )
+    return [structured] if not result.content or repeated else [result.content, structured]
+
+
+def _project_tool_result(result: MCPToolResult, tool_use_id: str) -> str:
+    """Project text and validated images without leaking binary data into text."""
+    parts = _result_text_parts(result)
+
+    context = current_tool_context.get()
+    images: list[dict[str, Any]] = []
+    total_bytes = 0
+    image_count = 0
+    for block in result.content_blocks:
+        if block.get("type") != "image":
+            continue
+        image_count += 1
+        if image_count > MAX_ATTACHMENTS:
+            parts.append("[Additional MCP images omitted: attachment count limit reached.]")
+            break
+        encoded = block.get("data")
+        mime = normalize_attachment_mime(block.get("mimeType"))
+        try:
+            if mime not in IMAGE_ATTACHMENT_MIMES:
+                raise ValueError("unsupported image MIME")
+            if not isinstance(encoded, str) or not (
+                1 <= len(encoded) <= ((IMAGE_ATTACHMENT_BYTES + 2) // 3) * 4
+            ):
+                raise ValueError("invalid image size")
+            payload = base64.b64decode(encoded, validate=True)
+            total_bytes += len(payload)
+            if total_bytes > IMAGE_ATTACHMENT_BYTES:
+                raise ValueError("image result byte limit exceeded")
+            assert mime is not None
+            validate_image_bytes(payload, mime)
+        except (ValueError, binascii.Error):
+            parts.append(
+                f"[MCP image {image_count} was not loaded: invalid, unsupported, "
+                "or oversized image data. This image was not analyzed.]"
+            )
+            continue
+        if context is None or not tool_use_id:
+            parts.append(
+                f"[MCP image {image_count} was not loaded: no active model tool call.]"
+            )
+            continue
+        image = {"mime": mime, "data": encoded}
+        images.append(image)
+    if images and context is not None:
+        context.tool_result_media[tool_use_id] = images
+        parts.append(
+            f"[{len(images)} MCP image(s) loaded for this tool call. "
+            "Image delivery depends on the current model's vision capability.]"
+        )
+    return "\n".join(parts)
+
+
+def _error_json(value: Any) -> str:
+    # Redact values before serialization. Escape assignment separators inside
+    # JSON strings so subsequent generic text redaction cannot swallow closing
+    # quotes/braces (for example an Authorization header used as a page label).
+    encoded = json.dumps(redact_secret_value(value), ensure_ascii=False, separators=(",", ":"))
+    return _JSON_STRING_TOKEN.sub(
+        lambda match: match.group().replace(":", "\\u003a").replace("=", "\\u003d"), encoded,
+    )
+
+
+async def _recoverable_error_content(
+    client: MCPClient,
+    result: MCPToolResult,
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
+) -> str:
+    """Use the existing result store instead of silently clipping MCP error recovery data."""
+    if len(content) <= _MCP_ERROR_SUMMARY_MAX_CHARS:
+        return content
+    if result.structured_content is not None:
+        original_prefix = "\n".join(_result_text_parts(result))
+        safe_prefix = _error_json(result.structured_content)
+        if len(_result_text_parts(result)) > 1:
+            safe_prefix = redact_secret_text(result.content) + "\n" + safe_prefix
+        content = safe_prefix + redact_secret_text(content[len(original_prefix):])
+    else:
+        content = redact_secret_text(content)
+    recovery: dict[str, Any] = {"available": False}
+    context = current_tool_context.get()
+    writer = context.tool_result_snapshot_writer if context is not None else None
+    if (
+        writer is not None and context is not None and context.tool_result_retrieval_available
+        and tool_use_id.strip()
+    ):
+        try:
+            reference = await writer(content, tool_name, tool_use_id)
+        except Exception:  # Best-effort persistence must not obscure the original tool failure.
+            reference = None
+        if (
+            isinstance(reference, dict)
+            and isinstance(reference.get("handle"), str)
+            and re.fullmatch(r"tr-[0-9a-f]{32}", reference["handle"])
+            and reference.get("sha256") == hashlib.sha256(content.encode("utf-8")).hexdigest()
+        ):
+            recovery = {
+                "available": True, "handle": reference["handle"],
+                "next_call": {"name": "retrieve_tool_result", "arguments": {
+                    "handle": reference["handle"], "mode": "raw_slice", "offset": 0,
+                    "limit": 12000,
+                }},
+            }
+    summary: dict[str, Any] = {
+        "isError": True, "truncated": True, "originalChars": len(content),
+        "content_recovery": recovery,
+    }
+    generic_summary = deepcopy(summary)
+    projected = False
+    if result.structured_content is not None:
+        try:
+            projected = client.project_error_summary(
+                summary,
+                result.structured_content,
+                serialize=_error_json,
+                max_chars=_MCP_ERROR_SUMMARY_MAX_CHARS,
+            )
+        except Exception:
+            log.warning("mcp.error_projection_failed", tool=tool_name)
+    if projected and len(_error_json(summary)) > _MCP_ERROR_SUMMARY_MAX_CHARS:
+        projected = False
+    if not projected:
+        summary = generic_summary
+        summary["preview"] = content[:600]
+        summary["guidance"] = (
+            "Retrieve the complete error before using omitted result data."
+            if recovery["available"] else
+            "Full error recovery is unavailable. Request a smaller read-only inspection; "
+            "do not blindly repeat a state-changing action."
+        )
+        while len(_error_json(summary)) > _MCP_ERROR_SUMMARY_MAX_CHARS:
+            summary["preview"] = summary["preview"][:len(summary["preview"]) // 2]
+    return _error_json(summary)
+
+
 def _make_tool_handler(
     client: MCPClient,
     namespace: str,
@@ -141,28 +321,56 @@ def _make_tool_handler(
     tool_def: MCPToolDef,
     registry: ToolRegistry,
     timeout_seconds: float,
+    spec_transform: MCPToolSpecTransform | None = None,
 ) -> None:
     """Register a single MCP tool in its server-scoped namespace."""
-    # Extract properties and required from input_schema
-    schema = tool_def.input_schema
-    raw_properties = schema.get("properties", {}) if isinstance(schema, Mapping) else {}
-    properties: dict[str, Any] = dict(raw_properties) if isinstance(raw_properties, Mapping) else {}
-    raw_required = schema.get("required", []) if isinstance(schema, Mapping) else []
+    # Retain the object schema for provider projection. The legacy pair remains
+    # available to integrations that inspect ToolSpec.parameters/required.
+    if not isinstance(tool_def.input_schema, Mapping):
+        raise ValueError(f"MCP tool '{tool_name}' inputSchema must be an object")
+    schema = deepcopy(dict(tool_def.input_schema))
+    if schema.get("type", "object") != "object":
+        raise ValueError(f"MCP tool '{tool_name}' inputSchema type must be object")
+    schema.setdefault("type", "object")
+    raw_properties = schema.get("properties", {})
+    if not isinstance(raw_properties, Mapping):
+        log.warning("mcp.invalid_optional_schema_properties", tool=tool_name)
+        raw_properties = {}
+    properties: dict[str, Any] = dict(raw_properties)
+    schema["properties"] = properties
+    raw_required = schema.get("required", [])
+    if not isinstance(raw_required, list | tuple) or any(
+        not isinstance(item, str) for item in raw_required
+    ):
+        log.warning("mcp.invalid_optional_schema_required", tool=tool_name)
+        raw_required = []
     required = (
         [item for item in raw_required if isinstance(item, str)]
         if isinstance(raw_required, list | tuple)
         else []
     )
+    schema["required"] = required
+    if "_tool_use_id" in properties:
+        raise ValueError("MCP input schema uses reserved runtime argument: _tool_use_id")
 
     spec = ToolSpec(
         name=mcp_tool_name(namespace, tool_name),
         description=tool_def.description,
         parameters=properties,
         required=required,
+        input_schema=schema,
         execution_timeout_seconds=timeout_seconds + 5.0,
+        runtime_only_arguments=frozenset({"_tool_use_id"}),
     )
+    if spec_transform is not None:
+        spec = spec_transform(tool_def, spec)
+        if spec.name != mcp_tool_name(namespace, tool_name):
+            raise ValueError("MCP tool policy must preserve the registered tool name")
+        if spec.runtime_only_arguments != frozenset({"_tool_use_id"}):
+            raise ValueError("MCP tool policy must preserve runtime call identity")
 
-    async def handler(**kwargs: Any) -> str:
+    async def handler(_tool_use_id: str = "", **kwargs: Any) -> str:
+        call_token = current_mcp_call_context.set(MCPCallContext(tool_use_id=_tool_use_id))
         try:
             result = await asyncio.wait_for(
                 client.call_tool(tool_name, kwargs),
@@ -172,14 +380,17 @@ def _make_tool_handler(
             raise SafeToolError(
                 f"MCP tool '{tool_name}' timed out after {timeout_seconds}s"
             ) from None
-        # An MCP error (result-level isError, or a JSON-RPC error the client
-        # flags) must reach the tool boundary AS an error, not be laundered into
-        # a successful result. Raising SafeToolError makes dispatch record
-        # is_error=True with an error execution status while preserving the
-        # server's message for the model.
+        finally:
+            current_mcp_call_context.reset(call_token)
+        # Keep MCP failures on the standard error path. Large structured results
+        # need a bounded recovery summary before the generic exception envelope.
+        content = _project_tool_result(result, _tool_use_id)
         if result.is_error:
-            raise SafeToolError(result.content or f"MCP tool '{tool_name}' failed")
-        return result.content
+            content = await _recoverable_error_content(
+                client, result, content, spec.name, _tool_use_id,
+            )
+            raise SafeToolError(content or f"MCP tool '{tool_name}' failed")
+        return content
 
     registry.register(spec, handler)
 
@@ -196,6 +407,22 @@ async def discover_and_register(
     The client is kept alive in module-level _active_clients so tool handlers can use it.
     """
     client = create_client(config)
+    return await register_client_tools(client, registry, owner=owner)
+
+
+async def register_client_tools(
+    client: MCPClient,
+    registry: ToolRegistry,
+    *,
+    owner: str | None = None,
+    spec_transform: MCPToolSpecTransform | None = None,
+) -> list[str]:
+    """Connect and register a runtime-provided MCP client with managed cleanup.
+
+    The optional trusted transform supplies tool policy without placing service
+    specific branches in MCP discovery or exposing runtime context as arguments.
+    """
+    config = client.config
     registered: list[str] = []
     namespace = mcp_namespace(config.name)
     namespace_registered = False
@@ -221,6 +448,7 @@ async def discover_and_register(
                 t,
                 registry,
                 timeout_seconds=config.tool_timeout_seconds,
+                spec_transform=spec_transform,
             )
         _active_clients.append(
             ActiveMCPClient(

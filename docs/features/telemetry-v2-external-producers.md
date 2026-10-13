@@ -74,26 +74,14 @@ is accepted.
 | Website backend | `download_click` | a consented, valid download action is accepted by the backend |
 | CDN/download service | `download_served` | the complete installer object is successfully delivered, not merely requested |
 | Account service | `registration_result` | the registration transaction reaches success, fail, or cancel |
-| Runtime | `metaskill_usage` | the first executable MetaSkill step starts; one event counts one run |
-| Runtime | `coding_mode_usage` | a Coding Mode task starts its coding Agent process; one event counts one run |
 | Gateway / CLI runtime | `product_active` | a Desktop or Web owner UI is visibly active, a TUI is ready or receives user input, or a CLI Agent run is submitted; device counts deduplicate across profiles and surfaces per UTC day |
-
-`metaskill_usage` and `coding_mode_usage` intentionally carry no MetaSkill name,
-prompt, plan, step, command, repository, tool argument, or run identifier. The
-runtime-only events are emitted at their first demonstrated execution boundary,
-are gated by the client's unified network-reporting policy, and are counted by
-the dashboard as usage totals, unique devices, and UTC daily trends. They carry
-the device token without requiring a fresh-install cohort; first-use
-funnel milestones still require that cohort. Enabling Coding Mode or
-injecting its turn directive without starting the coding Agent is not counted.
 
 `product_active` is a v1 Growth event with `source=gateway`, `outcome=null`,
 and `surface` (`desktop`, `web`, `tui`, or `cli`). Its `device_id` is stable
 across profiles on the same OS device; the legacy random `analytics_user_id`
 remains only for cohort and queue compatibility. It does not create a fresh-user
 cohort and contains no prompt, response, route, input, or account ID.
-Background Gateway uptime and internal Coding Mode child processes
-do not count. Its daily observations support cross-surface DAU and rolling
+Background Gateway uptime does not count. Its daily observations support cross-surface DAU and rolling
 30-day MAU, both deduplicated by device token across profiles and surfaces.
 Records without a device token are excluded from these device metrics.
 For Gateway-observed Web/TUI activity the device is the Gateway execution host;
@@ -128,8 +116,7 @@ are recorded only in the dedicated store. Counts lost by older in-memory clients
 cannot be reconstructed.
 
 Daily usage uploads include only completed UTC days. The current day's counters
-are durable locally and become eligible after midnight UTC. Internal Coding Mode
-child processes do not start V1 reporting or count a second user conversation.
+are durable locally and become eligible after midnight UTC.
 The existing reporting preference and environment vetoes apply at collection
 and upload boundaries for both versions.
 

@@ -82,8 +82,6 @@ async def record_completed_turn(
     """Add an eligible completed turn to today's local aggregate."""
     if install_telemetry._telemetry_skip_reason(config=config) is not None:
         return False
-    if os.environ.get("OPENSQUILLA_CODETASK_CHILD") == "1":
-        return False
     if run_kind not in INTERACTIVE_RUN_KINDS or done_event is None:
         return False
     current = (now or datetime.now(UTC)).astimezone(UTC)
@@ -220,7 +218,6 @@ class StandaloneUsageTelemetry:
     def start(self) -> None:
         if (
             self._closed or self._upload_task is not None
-            or os.environ.get("OPENSQUILLA_CODETASK_CHILD") == "1"
         ):
             return
         self._install_thread = install_telemetry.start_background_install_telemetry(
@@ -237,7 +234,6 @@ class StandaloneUsageTelemetry:
         if (
             self._closed
             or install_telemetry._telemetry_skip_reason(config=self._config) is not None
-            or os.environ.get("OPENSQUILLA_CODETASK_CHILD") == "1"
             or run_kind not in INTERACTIVE_RUN_KINDS
             or done_event is None
         ):
@@ -266,8 +262,7 @@ class StandaloneUsageTelemetry:
                 pass
 
         async def finish_usage() -> None:
-            if os.environ.get("OPENSQUILLA_CODETASK_CHILD") != "1":
-                await _upload_pending_sources(self._legacy_storage, config=self._config)
+            await _upload_pending_sources(self._legacy_storage, config=self._config)
 
         async def finish_install() -> None:
             thread, self._install_thread = self._install_thread, None
@@ -338,9 +333,12 @@ def _utc_now() -> str:
 
 async def _post_payload(endpoint: str, payload: dict[str, Any]) -> tuple[bool, str | None]:
     try:
-        import httpx
+        from opensquilla.observability.http_client import create_observability_async_client
 
-        async with httpx.AsyncClient(timeout=install_telemetry.DEFAULT_TIMEOUT_SECONDS) as client:
+        client = await create_observability_async_client(
+            timeout=install_telemetry.DEFAULT_TIMEOUT_SECONDS
+        )
+        async with client:
             response = await client.post(
                 endpoint,
                 json=payload,

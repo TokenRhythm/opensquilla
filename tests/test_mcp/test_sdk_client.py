@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import anyio
 import pytest
+from mcp.types import AudioContent, CallToolResult, ImageContent, TextContent
 from structlog.testing import capture_logs
 
 from opensquilla.mcp.sdk_client import SDKMCPClient
@@ -26,9 +27,9 @@ class Adapter(SDKMCPClient):
 
 def sdk_result(
     text: str | None = "done", *, structured: Any = None, is_error: bool = False,
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        content=[] if text is None else [SimpleNamespace(type="text", text=text)],
+) -> CallToolResult:
+    return CallToolResult(
+        content=[] if text is None else [TextContent(type="text", text=text)],
         structured_content=structured,
         is_error=is_error,
     )
@@ -270,6 +271,54 @@ async def test_lists_every_page_without_losing_schema() -> None:
     assert sdk.list_tools.await_args_list[1].kwargs == {"cursor": "second-page"}
 
 
+async def test_discovered_root_constraint_violation_surfaces_server_error() -> None:
+    from opensquilla.mcp.discovery import close_active_clients, register_client_tools
+    from opensquilla.tool_boundary import ToolCall
+    from opensquilla.tools.dispatch import build_tool_handler, preflight_tool_call
+    from opensquilla.tools.registry import ToolRegistry
+
+    schema = {
+        "type": "object",
+        "properties": {"left": {"type": "string"}, "right": {"type": "string"}},
+        "oneOf": [{"required": ["left"]}, {"required": ["right"]}],
+    }
+    sdk = sdk_client(sdk_result("exactly one of left or right is required", is_error=True))
+    sdk.list_tools.return_value = SimpleNamespace(
+        tools=[SimpleNamespace(name="choose", description="Choose one", input_schema=schema)],
+        next_cursor=None,
+    )
+    client = Adapter(lambda: connected(sdk))
+    registry = ToolRegistry()
+    call = ToolCall(
+        tool_use_id="call-1",
+        tool_name="mcp__synthetic__choose",
+        arguments={"left": "a", "right": "b"},
+    )
+    try:
+        await register_client_tools(client, registry)
+        definition = next(
+            tool for tool in registry.to_tool_definitions()
+            if tool.name == call.tool_name
+        )
+        assert definition.input_schema.model_dump(exclude_none=True, by_alias=True)[
+            "oneOf"
+        ] == schema["oneOf"]
+
+        # The local preflight intentionally checks a small subset. The MCP
+        # server remains authoritative for other root constraints.
+        assert await preflight_tool_call(registry=registry, ctx=None, tool_call=call) is None
+        result = await build_tool_handler(registry)(call)
+
+        sdk.session.call_tool.assert_awaited_once()
+        assert sdk.session.call_tool.await_args.args[:2] == (
+            "choose", {"left": "a", "right": "b"},
+        )
+        assert result.is_error is True
+        assert "exactly one of left or right" in result.content
+    finally:
+        await close_active_clients(owner="synthetic")
+
+
 async def test_repeated_pagination_cursor_fails_instead_of_looping() -> None:
     sdk = sdk_client()
     sdk.list_tools.return_value = SimpleNamespace(tools=[], next_cursor="same")
@@ -304,13 +353,14 @@ async def test_tool_result_projection(result: Any, expected: str, error: bool) -
         await client.close()
     assert actual.content == expected
     assert actual.is_error is error
+    assert actual.structured_content == result.structured_content
     if result.structured_content is not None and result.content == []:
         assert json.loads(actual.content) == result.structured_content
 
 
-async def test_nontext_only_result_is_not_an_empty_success() -> None:
+async def test_unsupported_nontext_only_result_is_not_an_empty_success() -> None:
     result = sdk_result(None)
-    result.content = [SimpleNamespace(type="image")]
+    result.content = [AudioContent(type="audio", data="AA==", mime_type="audio/wav")]
     client = Adapter(lambda: connected(sdk_client(result)))
     await client.connect()
     try:
@@ -318,15 +368,29 @@ async def test_nontext_only_result_is_not_an_empty_success() -> None:
     finally:
         await client.close()
     assert actual.is_error
-    assert "unsupported content types: image" in actual.content
+    assert "unsupported content types: audio" in actual.content
+
+
+async def test_image_only_result_preserves_media_without_binary_text_fallback() -> None:
+    result = sdk_result(None)
+    result.content = [ImageContent(type="image", data="AA==", mime_type="image/png")]
+    client = Adapter(lambda: connected(sdk_client(result)))
+    await client.connect()
+    try:
+        actual = await client.call_tool("screenshot", {})
+    finally:
+        await client.close()
+    assert not actual.is_error
+    assert actual.content == ""
+    assert actual.content_blocks == [{"type": "image", "data": "AA==", "mimeType": "image/png"}]
 
 
 async def test_multiple_text_blocks_preserve_order_and_empty_blocks() -> None:
     result = sdk_result(None, structured={"ignored": True})
     result.content = [
-        SimpleNamespace(type="text", text="first"),
-        SimpleNamespace(type="text", text=""),
-        SimpleNamespace(type="text", text="last"),
+        TextContent(type="text", text="first"),
+        TextContent(type="text", text=""),
+        TextContent(type="text", text="last"),
     ]
     client = Adapter(lambda: connected(sdk_client(result)))
     await client.connect()

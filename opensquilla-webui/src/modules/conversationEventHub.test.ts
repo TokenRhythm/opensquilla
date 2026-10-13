@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { SessionReadFailure } from './sessionReadLifecycle'
 import {
   createConversationEventHub,
   type ConversationEventSourceHandlers,
@@ -40,6 +41,46 @@ function sourceHarness() {
 }
 
 describe('conversation event hub', () => {
+  it('keeps terminal A local while global recovery retries B, and reopens A for a new admission', async () => {
+    const source = sourceHarness()
+    const hub = createConversationEventHub(source)
+    const terminal = new SessionReadFailure('too-large', 'terminal', false)
+    const alpha = vi.fn(async (): Promise<boolean> => { throw terminal })
+    const beta = vi.fn(async () => true).mockResolvedValueOnce(false)
+    hub.prepareReadRetirement('alpha')
+    hub.prepareReadRetirement('beta')
+    hub.observeRecoveryRequired(scope => scope.keys[0] === 'alpha' ? alpha() : beta())
+    const global = { keys: [], global: true }
+    await expect(source.recover(global)).resolves.toBe(false)
+    await expect(source.recover(global)).resolves.toEqual({ retryable: false })
+    expect(alpha).toHaveBeenCalledOnce()
+    expect(beta).toHaveBeenCalledTimes(2)
+    hub.prepareReadRetirement('alpha')
+    alpha.mockImplementation(async () => true)
+    await expect(source.recover({ keys: ['alpha'], global: false })).resolves.toBe(true)
+    expect(alpha).toHaveBeenCalledTimes(2)
+    hub.dispose()
+  })
+
+  it.each(['admission', 'connection'] as const)('ignores terminal recovery from an obsolete %s', async replacement => {
+    const source = sourceHarness()
+    const hub = createConversationEventHub(source)
+    hub.prepareReadRetirement('alpha')
+    let fail!: (reason: unknown) => void
+    const pending = new Promise<boolean>((_, reject) => { fail = reject })
+    const recover = vi.fn(async () => true).mockImplementationOnce(() => pending)
+    hub.observeRecoveryRequired(recover)
+    const old = source.recover({ keys: ['alpha'], global: false })
+    await Promise.resolve()
+    if (replacement === 'admission') hub.prepareReadRetirement('alpha')
+    else source.state('disconnected')
+    fail(new SessionReadFailure('budget-exhausted', 'old owner', false))
+    await expect(old).resolves.toBe(false)
+    await expect(source.recover({ keys: ['alpha'], global: false })).resolves.toBe(true)
+    expect(recover).toHaveBeenCalledTimes(2)
+    hub.dispose()
+  })
+
   it('requires explicit consumer ownership and awaits its applied-or-dirty result', async () => {
     const source = sourceHarness()
     const hub = createConversationEventHub(source)

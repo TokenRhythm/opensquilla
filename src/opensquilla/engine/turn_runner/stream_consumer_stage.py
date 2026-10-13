@@ -312,7 +312,6 @@ class _StreamState:
     turn_artifacts: list[dict[str, Any]] = field(default_factory=list)
     artifact_delivery_failures: list[str] = field(default_factory=list)
     artifact_delivery_failures_by_target: dict[str, str] = field(default_factory=dict)
-    completed_meta_skill_without_text: str | None = None
     reasoning: list[str] = field(default_factory=list)
     terminal_generation_reset: bool = False
     control_terminal_event: ControlTerminalEvent | None = None
@@ -385,9 +384,9 @@ class StreamConsumerStageInput:
     compaction_source_boundary_entry_id: int | None = None
     expected_session_id: str | None = None
     expected_session_epoch: int | None = None
-    # Original ingress mode.  Internal Goal continuations and heartbeats use
-    # ``system_event``; their text is held until the terminal snapshot can be
-    # canonicalized so silent-reply protocol markers never flash on a client.
+    # Original ingress mode. Internal Goal continuations and heartbeats hold
+    # their text until the terminal snapshot can be canonicalized so
+    # silent-reply protocol markers never flash on a client.
     input_mode: str = "user"
     execution_context: TurnExecutionContext | None = None
 
@@ -654,8 +653,6 @@ class _ToolResultHandler:
         elif not event.is_error:
             for target_key in target_keys:
                 _clear_artifact_delivery_failure(state, target_key)
-        if _is_completed_meta_invoke(event):
-            state.completed_meta_skill_without_text = _meta_invoke_skill_name(event)
         _update_tool_use_segment(event, state)
         result_segment = _persisted_tool_result_segment(event)
         for index in range(len(state.turn_segments) - 1, -1, -1):
@@ -911,7 +908,7 @@ class _DoneHandler:
         snapshot_present, terminal_text = done_text_snapshot(event)
         accumulated_text = "".join(state.final_text_parts)
         buffer_system_event_text = (
-            inp.input_mode == "system_event"
+            inp.input_mode in {"system_event", "goal_continuation"}
             and inp.run_kind in {"goal", "heartbeat"}
         )
         # Buffered internal turns may be produced by legacy adapters that leave
@@ -1098,18 +1095,6 @@ class _DoneHandler:
         extra_yields: list[AgentEvent] = []
         if done_suffix_event is not None:
             extra_yields.append(done_suffix_event)
-        if not accumulated_text.strip() and state.completed_meta_skill_without_text:
-            event, fallback_event = _append_done_notice_delta(
-                event,
-                state,
-                _meta_completed_without_text_notice(
-                    state.completed_meta_skill_without_text
-                ),
-                accumulated_text=accumulated_text,
-            )
-            extra_yields.append(fallback_event)
-            accumulated_text = "".join(state.final_text_parts)
-
         return _DonePrePublish(
             event=event,
             extra_yields=extra_yields,
@@ -1430,26 +1415,10 @@ def _append_done_notice_delta(
     return event, _TextDeltaEvent(text=notice_delta, presentation="answer")
 
 
-def _is_completed_meta_invoke(event: ToolResultEvent) -> bool:
-    if event.tool_name != "meta_invoke" or event.is_error:
-        return False
-    result = event.result.strip().lower()
-    return "meta-skill" in result and "completed" in result
 
 
-def _meta_invoke_skill_name(event: ToolResultEvent) -> str:
-    arguments = event.arguments if isinstance(event.arguments, dict) else {}
-    candidate = arguments.get("name")
-    if isinstance(candidate, str) and candidate.strip():
-        return candidate.strip()
-    return "meta skill"
 
 
-def _meta_completed_without_text_notice(skill_name: str) -> str:
-    return (
-        f"Meta skill `{skill_name}` 已完成，但这次流程没有生成可展示的最终回答。"
-        "请查看上方步骤结果和产物；如果需要，可以补充更明确的输出要求后重新运行。"
-    )
 
 
 def _subagent_partial_failure_disclosure(
@@ -1894,10 +1863,12 @@ class StreamConsumerStage:
 
         state = inp.state
         buffer_system_event_text = (
-            inp.input_mode == "system_event"
+            inp.input_mode in {"system_event", "goal_continuation"}
             and inp.run_kind in {"goal", "heartbeat"}
         )
-        gate_human_silent_reply_prefix = inp.input_mode != "system_event"
+        gate_human_silent_reply_prefix = inp.input_mode not in {
+            "system_event", "goal_continuation"
+        }
         human_silent_reply_prefix_open = gate_human_silent_reply_prefix
         held_human_silent_reply_text = ""
         human_prefix_crossed_public_boundary = False
@@ -2004,8 +1975,8 @@ class StreamConsumerStage:
                 if buffer_system_event_text:
                     if event.text and not buffered_text_observed:
                         log.info(
-                            "system_event_text_buffered_total",
-                            metric="system_event_text_buffered_total",
+                            "internal_turn_text_buffered_total",
+                            metric="internal_turn_text_buffered_total",
                             value=1,
                             run_kind=inp.run_kind,
                         )
@@ -2310,7 +2281,7 @@ class StreamConsumerStage:
                     human_prefix_crossed_public_boundary = False
 
                 human_silent_reply_disallowed = (
-                    inp.input_mode != "system_event"
+                    inp.input_mode not in {"system_event", "goal_continuation"}
                     and transformed.delivery == "suppressed"
                     and transformed.suppression_reason
                     in {"no_reply", "heartbeat_ack"}

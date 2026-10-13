@@ -13,6 +13,7 @@
     :tool-elapsed-text="toolElapsedText"
     @toggle-group="$emit('toggleGroup', $event)"
     @toggle-item="$emit('toggleItem', $event)"
+    @open-change="$emit('openChange', $event)"
     @show-result="(content, title, context) => $emit('showResult', content, title, context)"
   >
     <template #interrupt="{ part }">
@@ -45,6 +46,7 @@ defineProps<{
 
 defineEmits<{
   toggleGroup: [groupId: string]
+  openChange: [open: boolean]
   toggleItem: [renderKey: string]
   showResult: [content: string, title: string, context?: ToolResultContext]
 }>()

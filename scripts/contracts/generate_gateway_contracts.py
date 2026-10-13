@@ -951,6 +951,22 @@ def _normalise_optional_non_nullable_defaults(spec: ContractSpec, text: str) -> 
                 and isinstance(ast.parse(annotation, mode="eval").body, ast.Subscript)
             )
             ignore_codes = "assignment, arg-type" if generic_field_default else "assignment"
+            if (
+                generic_field_default
+                and isinstance(field.value, ast.Call)
+                and field.value.args
+                and field.value.args[0].lineno != value_end_lineno
+            ):
+                # For multiline Field calls, mypy reports an incompatible
+                # default on the argument line, not the closing parenthesis.
+                default_line = field.value.args[0].lineno
+                default_start = _source_offset(lines, default_line, 0)
+                default_end = default_start + len(lines[default_line - 1].rstrip("\r\n"))
+                if "# type: ignore[" not in text[default_start:default_end]:
+                    replacements.append(
+                        (default_end, default_end, "  # type: ignore[arg-type]")
+                    )
+                ignore_codes = "assignment"
             if "# type: ignore[" not in line:
                 replacements.append((line_end, line_end, f"  # type: ignore[{ignore_codes}]"))
 

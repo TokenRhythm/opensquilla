@@ -54,7 +54,7 @@ def test_legacy_snapshot_cannot_republish_retired_bundled_skills(
     assert restarted.load_snapshot() is None
     snapshot = restarted.snapshot_for_turn("upgrade")
     public = catalog_policy.project_public_catalog(
-        snapshot.skills, coding_mode=False, include_stable_meta=False
+        snapshot.skills
     )
     assert [skill.name for skill in public] == ["github"]
     memory = next((skill for skill in snapshot.skills if skill.name == "memory"), None)
@@ -66,7 +66,7 @@ def test_legacy_snapshot_cannot_republish_retired_bundled_skills(
     else:
         assert memory is None
     restarted.save_snapshot()
-    assert json.loads(cache.read_text(encoding="utf-8"))["version"] == 16
+    assert json.loads(cache.read_text(encoding="utf-8"))["version"] == 17
 
 
 @pytest.mark.parametrize("name", ["cron", "memory", "git-diff", "http-fetch"])
@@ -96,9 +96,7 @@ def test_retirement_preserves_independently_installed_same_name_skills(
         **directories,
     )
     public = catalog_policy.project_public_catalog(
-        loader.snapshot_for_turn("upgrade").skills,
-        coding_mode=False,
-        include_stable_meta=False,
+        loader.snapshot_for_turn("upgrade").skills
     )
     matching = [skill for skill in public if skill.name == name]
     assert len(matching) == 1

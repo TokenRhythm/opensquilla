@@ -221,6 +221,10 @@ export interface NativeAttachmentReceipt {
 }
 
 export interface PlatformFilesApi {
+  /** Trusted Desktop picker; inserts plain paths without uploading or granting tool access. */
+  chooseLocalFilePaths?: (request: { gatewayInstanceId: string }) => Promise<string[]>
+  /** Resolve an OS-dragged File to its local path without reading its contents. */
+  resolveNativeFilePath?: (file: File) => Promise<string | null>
   chooseAttachments?: (request: NativeAttachmentContext) => Promise<NativeAttachmentSelection[]>
   selectAttachmentFile?: (request: NativeAttachmentContext, file: File) => Promise<NativeAttachmentSelection | null>
   importAttachmentSelection?: (request: NativeAttachmentContext, token: string) => Promise<NativeAttachmentReceipt>
@@ -233,6 +237,14 @@ export interface PlatformFilesApi {
     pagePath?: string
     action: 'open' | 'reveal'
   }) => Promise<void>
+  /** Open or reveal a validated file in the current local workspace. */
+  workspaceFileAction?: (payload: {
+    gatewayInstanceId: string
+    sessionKey: string
+    path: string
+    workspaceBinding: string
+    action: 'open' | 'reveal'
+  }) => Promise<{ ok: boolean; message?: string }>
   /** Write the bytes to a temp file and open it with the OS default app. */
   openArtifact?: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
   /** Open the trusted host's native folder picker. Undefined on the web. */
@@ -286,7 +298,8 @@ export type NativeWorkbenchCreateSurfaceRequest =
 export interface NativeWorkbenchCapabilities {
   protocolVersions: Array<NativeWorkbenchProtocolVersion>
   modes: WorkbenchPreviewMode[]
-  maxSurfaces: number
+  /** Reported only by older desktop hosts that impose a surface count limit. */
+  maxSurfaces?: number
 }
 
 export interface NativeArtifactAnnotationCapabilities {
@@ -374,6 +387,7 @@ export interface NativeWorkbenchSurfaceResult {
   retryable?: boolean
   message?: string
   surfaceInstanceId?: string
+  navigationError?: { url: string; code: string; errorCode?: number; message: string }
 }
 
 export type NativeWorkbenchSurfaceEventType =
@@ -390,6 +404,7 @@ export type NativeWorkbenchSurfaceEventType =
   | 'crashed'
   | 'escape'
   | 'browser-opened'
+  | 'browser-closed'
   | 'annotation-selected'
   | 'annotation-draft-change'
   | 'annotation-submit'
@@ -407,6 +422,8 @@ export interface NativeWorkbenchSurfaceEvent {
     url?: string
     title?: string
     loading?: boolean
+    pageState?: string
+    navigationError?: { url: string; code: string; errorCode?: number; message: string } | null
     canGoBack?: boolean
     canGoForward?: boolean
     action?: string
@@ -464,6 +481,12 @@ export type NativeArtifactPreviewLeaseBrokerResult = {
   message: string
 }
 
+export interface NativeBrowserAutomationState {
+  sessionKey: string
+  taskId: string
+  active: boolean
+}
+
 export interface NativeWorkbenchApi {
   getCapabilities?(): Promise<NativeWorkbenchCapabilities>
   getArtifactAnnotationCapabilities?(): Promise<NativeArtifactAnnotationCapabilities>
@@ -477,6 +500,7 @@ export interface NativeWorkbenchApi {
     request: NativeArtifactAnnotationOverlayCloseRequest,
   ): Promise<NativeWorkbenchSurfaceResult>
   getWorkbenchBrowserTarget?(request: { surfaceId: string }): Promise<NativeWorkbenchBrowserTarget>
+  setBrowserAutomationState?(request: NativeBrowserAutomationState): Promise<NativeWorkbenchSurfaceResult>
   focusWorkbenchAnnotation?(request: {
     surfaceId: string; targetRef: string; locatorHint: string; pagePath?: string
   }): Promise<NativeWorkbenchSurfaceResult>

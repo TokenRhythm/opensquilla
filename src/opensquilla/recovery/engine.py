@@ -50,6 +50,7 @@ from opensquilla.recovery.locking import (
     resolve_home_link,
 )
 from opensquilla.recovery.models import RecoveryOutcome, RecoveryReport, WorkspaceCandidate
+from opensquilla.startup_timing import startup_phase_end, startup_phase_start
 
 SUPPORTED_CONFIG_VERSION = LATEST_CONFIG_VERSION
 _IMPORT_LAYOUT_RECEIPT_FIELDS = frozenset(
@@ -752,7 +753,12 @@ def _database_safety_code(path: Path) -> str | None:
 
     snapshots: list[_DatabaseSourceSnapshot] = []
     try:
-        with tempfile.TemporaryDirectory(prefix="opensquilla-db-inspect-") as temporary:
+        # A scanner or a late-created file can prevent Windows from removing
+        # the disposable snapshot. Cleanup must not replace the inspection
+        # result or abort Gateway startup; validation errors keep their codes.
+        with tempfile.TemporaryDirectory(
+            prefix="opensquilla-db-inspect-", ignore_cleanup_errors=True
+        ) as temporary:
             snapshot_root = Path(temporary)
             with contextlib.suppress(OSError):
                 snapshot_root.chmod(0o700)
@@ -2503,7 +2509,9 @@ def guarded_desktop_profile(
     """
 
     home_path = _resolved_home_path(home)
+    profile_lock_started = startup_phase_start("profile_lock")
     with ProfileOperationLock(home_path, timeout=lock_timeout):
+        startup_phase_end("profile_lock", profile_lock_started)
         kind = _profile_kind(None, home=home_path)
         report: RecoveryReport | None = None
         if kind in _DESKTOP_PROFILE_KINDS:
@@ -2511,10 +2519,14 @@ def guarded_desktop_profile(
             # before inspection.  LegacyGatewayLock may create
             # state/gateway.pid.lock, so a hard-gated Desktop profile must be
             # rejected before that compatibility write can happen.
+            inspect_started = startup_phase_start("profile_inspect")
             report = inspect_profile(home_path, profile_kind=kind)
+            startup_phase_end("profile_inspect", inspect_started)
             if report.outcome == "recovery_required":
                 raise RecoveryRequiredError(report)
+        legacy_lock_started = startup_phase_start("legacy_lock")
         with LegacyGatewayLock(home_path, timeout=lock_timeout):
+            startup_phase_end("legacy_lock", legacy_lock_started)
             yield report
 
 

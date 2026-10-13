@@ -31,7 +31,7 @@ _IDENTIFIERS = frozenset("""
     tool_profile tool_choice tool_name tool model provider model_id
     provider_id resolved_model routed_model baseline_model provider_after_rewrite
     target_provider target_model target_source target_fingerprint route tier
-    routed_tier routing_source skill meta_skill skill_name skills_invoked
+    routed_tier routing_source skill skill_name skills_invoked
     skill_catalog_ids alias_resolution_chain activation_mode input_mode run_kind
     channel channel_id transport protocol backend platform architecture version
     format summary_format summary_source coverage_status
@@ -50,7 +50,13 @@ _CONTAINERS = frozenset({
 })
 # Retain only producer-owned enum values for fields that could otherwise be
 # mistaken for free-form reason text. These codes are consumed by diagnostics.
-_CLASSIFICATIONS = {"image_route_reason": frozenset({"current_turn", "history_context"})}
+_CLASSIFICATIONS = {
+    "image_route_reason": frozenset({"current_turn", "history_context"}),
+    "browser_requested_mode": frozenset({"auto", "dom", "invalid"}),
+    "journal_mode": frozenset({
+        "delete", "memory", "off", "persist", "truncate", "wal", "unknown",
+    }),
+}
 _FIELD = re.compile(r"[a-z][a-z0-9_]{0,95}\Z")
 _CONTENT_FIELDS = frozenset({
     "content", "text", "prompt", "query", "message", "messages", "input", "output",

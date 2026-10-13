@@ -12,10 +12,8 @@ from opensquilla.application.conversation_ancillary import (
     CommandCatalogQuery,
     PromptCacheLease,
     PromptCachePolicy,
-    RouteFeedback,
     SetPromptCacheLease,
     SubmitClarification,
-    SubmitRouteFeedback,
     UsageQuery,
     UsageReporting,
 )
@@ -94,24 +92,17 @@ async def test_prompt_cache_module_rejects_invalid_policy_without_mutation() -> 
     port.set_policy.assert_not_awaited()
 
 
-async def test_feedback_and_clarification_validate_before_ports() -> None:
-    feedback_port = SimpleNamespace(submit=AsyncMock(return_value={"accepted": True}))
+async def test_clarification_validates_before_port() -> None:
     clarification_port = SimpleNamespace(submit=AsyncMock(return_value={"accepted": True}))
 
-    await RouteFeedback(cast(Any, feedback_port)).submit(
-        SubmitRouteFeedback(decision_id=" decision ", rating="up")
-    )
     await ClarificationSubmission(cast(Any, clarification_port)).submit(
         SubmitClarification(
             session_key=" agent:main:webchat:test ",
             fields={"choice": "continue"},
             request_id=" request-1 ",
-            run_id=" run-1 ",
         )
     )
 
-    assert feedback_port.submit.await_args.args[0].decision_id == "decision"
     clarification = clarification_port.submit.await_args.args[0]
     assert clarification.session_key == "agent:main:webchat:test"
     assert clarification.request_id == "request-1"
-    assert clarification.run_id == "run-1"

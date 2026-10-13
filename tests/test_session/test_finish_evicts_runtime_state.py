@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
-
 import pytest
 
 from opensquilla.engine import cache_break_monitor
@@ -97,9 +95,6 @@ async def test_finish_evicts_cache_break_monitor_state() -> None:
 def test_explicit_runtime_eviction_drops_all_session_identity_caches() -> None:
     from opensquilla.tools.builtin import sessions as sessions_tool
 
-    meta_resolution = importlib.import_module(
-        "opensquilla.engine.steps.meta_resolution"
-    )
     session_key = "agent:main:webchat:history-eviction"
     session_id = "history-eviction-generation"
     manager = SessionManager(_MemoryStorage())  # type: ignore[arg-type]
@@ -107,7 +102,6 @@ def test_explicit_runtime_eviction_drops_all_session_identity_caches() -> None:
     _tracker.mark_closed(session_key, "child-task")
     _history_store.set(session_key, [{"turn_index": 3}])
     sessions_tool._get_spawn_lock(session_key)
-    meta_resolution._sticky_put(session_id, "meta-skill", "follow up")
 
     manager.evict_session_runtime_state(
         session_key,
@@ -118,7 +112,6 @@ def test_explicit_runtime_eviction_drops_all_session_identity_caches() -> None:
     assert not _tracker.is_closed(session_key, "child-task")
     assert _history_store.get(session_key) is None
     assert session_key not in sessions_tool._spawn_locks
-    assert session_id not in meta_resolution._meta_sticky_cache
 
 
 def test_runtime_eviction_drops_session_key_cache_without_generation_id() -> None:

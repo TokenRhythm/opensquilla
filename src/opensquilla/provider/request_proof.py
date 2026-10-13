@@ -19,7 +19,7 @@ from PIL import Image
 
 from opensquilla.context_budget import ContextBudgetGovernor
 
-from .types import ChatConfig, ProviderFinalRequestProjection
+from .types import ChatConfig, ContentBlockText, ProviderFinalRequestProjection
 
 _COMPACTED_STRING_MAX_CHARS = 1200
 _COMPACTED_TAIL_STRING_MAX_CHARS = 640
@@ -1085,7 +1085,7 @@ def _tool_result_content_is_error(content: Any) -> bool:
 
 def _tool_result_content_is_unresolved(content: Any) -> bool:
     if isinstance(content, str):
-        with contextlib.suppress(json.JSONDecodeError):
+        with contextlib.suppress(json.JSONDecodeError, RecursionError):
             parsed = json.loads(content)
             if isinstance(parsed, dict):
                 if _execution_status_is_unresolved(parsed.get("execution_status")):
@@ -1104,10 +1104,17 @@ def _tool_result_content_is_unresolved(content: Any) -> bool:
     if not isinstance(content, list):
         return False
     for block in content:
+        if isinstance(block, ContentBlockText):
+            if _tool_result_content_is_unresolved(block.text):
+                return True
+            continue
         if not isinstance(block, dict):
             continue
         if _execution_status_is_unresolved(block.get("execution_status")):
             return True
+        if block.get("type") == "text" and isinstance(block.get("text"), str):
+            if _tool_result_content_is_unresolved(block["text"]):
+                return True
         if _tool_result_content_is_unresolved(block.get("content")):
             return True
     return False
@@ -1190,12 +1197,20 @@ def protected_tool_result_indexes(messages: Any) -> frozenset[int]:
                 if isinstance(block, dict)
                 else getattr(block, "is_error", False) is True
             )
+            result_content = (
+                block.get("content")
+                if isinstance(block, dict)
+                else getattr(block, "content", None)
+            )
             if (
                 _protect_error_results_enabled()
                 and (is_error or _execution_status_is_failure(status))
             ) or (
                 _protect_unresolved_results_enabled()
-                and _execution_status_is_unresolved(status)
+                and (
+                    _execution_status_is_unresolved(status)
+                    or _tool_result_content_is_unresolved(result_content)
+                )
             ):
                 protected.add(ordinal)
             ordinal += 1

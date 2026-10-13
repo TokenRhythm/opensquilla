@@ -5,6 +5,7 @@ import type {
   GatewayConnectionHealth,
   GatewayConnectionPhase,
   GatewayRunModePolicy,
+  SupportBundleUnavailableReason,
 } from '@/modules/gatewayAccess'
 import { SESSIONS_MESSAGES_HYDRATE_METHOD } from '@/contracts/generated/v4/sessionsMessagesHydrate'
 import {
@@ -23,6 +24,7 @@ interface GatewayAccessSource {
   readonly runtimeStarting?: boolean
   readonly error: string | null
   readonly isLocalOwner: boolean
+  getConnectionEndpoint(): string | null
   readonly canManageProjectWorkspaces: boolean
   readonly canChooseProject: boolean
   readonly auth: Record<string, unknown> | null
@@ -52,6 +54,50 @@ function connectionEndpoint(): string {
     return localStorage.getItem(WS_URL_KEY) || defaultGatewayEndpoint()
   } catch {
     return defaultGatewayEndpoint()
+  }
+}
+
+function connectedGatewayHost(source: GatewayAccessSource): string | null {
+  if (
+    source.state !== 'connected' || source.health !== 'healthy' || source.isResuming
+    || (source.phase !== undefined && source.phase !== 'healthy')
+  ) return null
+  try {
+    const endpoint = source.getConnectionEndpoint()
+    if (!endpoint) return null
+    const target = new URL(endpoint)
+    return ['ws:', 'wss:'].includes(target.protocol) ? target.host : null
+  } catch {
+    return null
+  }
+}
+
+function supportBundleUnavailableReason(source: GatewayAccessSource): SupportBundleUnavailableReason {
+  if (
+    source.state !== 'connected' || source.health !== 'healthy' || source.isResuming
+    || (source.phase !== undefined && source.phase !== 'healthy')
+  ) return 'disconnected'
+  if (!source.isLocalOwner) return 'permission'
+  try {
+    const endpoint = source.getConnectionEndpoint()
+    if (!endpoint) return 'differentGateway'
+    const target = new URL(endpoint)
+    if (
+      !['ws:', 'wss:'].includes(target.protocol)
+      || target.username || target.password || target.hash
+    ) return 'differentGateway'
+    const page = new URL(globalThis.location.href)
+    // The private Desktop scheme is proxied by the main process to its current
+    // authoritative Gateway. It must never be compared to the remote WS origin.
+    if (
+      page.protocol === 'opensquilla-app:' && page.hostname === 'desktop'
+      && !(page.port || page.username || page.password)
+    ) return null
+    target.protocol = target.protocol === 'wss:' ? 'https:' : 'http:'
+    return ['http:', 'https:'].includes(page.protocol) && target.origin === page.origin
+      ? null : 'differentGateway'
+  } catch {
+    return 'differentGateway'
   }
 }
 
@@ -168,6 +214,9 @@ export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAcces
     get connectionError() {
       return source.error
     },
+    get connectedGatewayHost() {
+      return connectedGatewayHost(source)
+    },
     get requiresCredential() {
       return source.error === 'authentication_failed' || source.error === 'authentication_mismatch'
     },
@@ -176,6 +225,9 @@ export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAcces
     },
     get isLocalOwner() {
       return source.isLocalOwner
+    },
+    get supportBundleUnavailableReason() {
+      return supportBundleUnavailableReason(source)
     },
     get isAuthenticated() {
       return authenticated(source.auth)

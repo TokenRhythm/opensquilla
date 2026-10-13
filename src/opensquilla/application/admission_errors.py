@@ -36,6 +36,15 @@ class AdmissionQueueFullError(RuntimeError):
         super().__init__("The pending task queue is full")
 
 
+class AdmissionResourceBusyError(RuntimeError):
+    """Resident process capacity is full before durable turn acceptance."""
+
+    def __init__(self, session_key: str, max_resident: int) -> None:
+        self.session_key = session_key
+        self.max_resident = max_resident
+        super().__init__("The Gateway resident task capacity is full")
+
+
 class AdmissionShuttingDownError(RuntimeError):
     def __init__(self, session_key: str) -> None:
         self.session_key = session_key

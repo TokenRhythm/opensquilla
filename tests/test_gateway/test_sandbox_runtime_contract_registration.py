@@ -159,7 +159,19 @@ PRODUCTION_HANDLER_NAMES = {
 def test_production_registry_uses_contract_wrappers_without_surface_drift() -> None:
     registry = get_dispatcher()
 
-    assert len(registry.list_methods()) == 301
+    # The v2 connection recovery contracts add six methods to the 269-method surface.
+    assert len(registry.list_methods()) == 275
+    for method in (
+        "transport.sessionFlow.update.v2",
+        "sessions.read.open.v2",
+        "sessions.read.state.v2",
+        "sessions.read.install.v2",
+        "sessions.read.close.v2",
+        "sessions.history.page.v2",
+    ):
+        assert registry.get_entry(method) is not None
+    assert registry.get_entry("router.feedback.submit") is None
+    assert registry.get_entry("router.selflearning.status") is None
     assert registry.get_entry("workspaces.references.read") is not None
     assert registry.get_entry("skills.candidates") is not None
     assert registry.get_entry("skills.setEnabled") is not None
@@ -168,6 +180,11 @@ def test_production_registry_uses_contract_wrappers_without_surface_drift() -> N
     assert registry.get_entry("skills.install.status") is not None
     assert registry.get_entry("telemetry.product_active.record") is not None
     assert registry.get_entry("sessions.executionLog.read") is not None
+    receipt_entry = registry.get_entry("turns.receipt.get")
+    assert receipt_entry is not None
+    assert receipt_entry.required_scope == "operator.read"
+    assert receipt_entry.generated_contract_name == "turns.receipt.get"
+    assert receipt_entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
     assert tuple(PRODUCTION_HANDLER_NAMES) == SANDBOX_RUNTIME_CONTRACT_METHODS
     for method, implementation_name in PRODUCTION_HANDLER_NAMES.items():
         entry = registry.get_entry(method)

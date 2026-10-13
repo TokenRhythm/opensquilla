@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { ActivitySnapshotV2, ChatMessage, ChatStreamTimelineItem } from '@/types/chat'
+import type { ChatPart } from '@/types/parts'
 import {
   activityReasoningBlocks,
   activitySnapshotMatchesMessage,
@@ -39,6 +40,42 @@ const snapshot: ActivitySnapshotV2 = {
 }
 
 describe('activitySnapshot v2', () => {
+  it('keeps original chronology for explicitly shortened reasoning and text previews', () => {
+    const message: ChatMessage = {
+      role: 'assistant', text: 'fi', ts: 1,
+      reasoning: { text: 'A', seconds: 0 },
+      tool_calls: [
+        { type: 'text', text: 'fi', presentation: 'intermediate' },
+        { type: 'tool_use', tool_use_id: 'tool-1', name: 'skill_view', input: { text: 'preview' } },
+      ],
+      historyPayloadPreview: { detailsTruncated: true, reasoningUtf16Length: 3, textUtf16Lengths: [5] },
+    }
+    expect(activitySnapshotMatchesMessage(snapshot, message)).toBe(true)
+    expect(activityReasoningBlocks(snapshot, 'A', 3)).toMatchObject([
+      { text: 'A', activityOrder: 6, id: 'reasoning-1' },
+    ])
+    const timeline: ChatStreamTimelineItem[] = [{ type: 'text', key: 'first', rawText: 'fi', html: 'fi' }]
+    expect(applyActivityOrdersToTimeline(timeline, snapshot)[0]?.activityOrder).toBe(31)
+    expect(activitySnapshotMatchesMessage(snapshot, { ...message, historyPayloadPreview: undefined })).toBe(false)
+    expect(activitySnapshotMatchesMessage(snapshot, {
+      ...message, historyPayloadPreview: { ...message.historyPayloadPreview, textUtf16Lengths: [6] },
+    })).toBe(false)
+    expect(activityReasoningBlocks(snapshot, 'A', 2)).toBeUndefined()
+  })
+
+  it('does not shift a later reasoning block into a clipped prefix', () => {
+    const physical: ActivitySnapshotV2 = {
+      ...snapshot, reasoningUtf16Length: 10,
+      entries: [
+        { ...snapshot.entries[2]!, text_start_utf16: 0, text_end_utf16: 3 },
+        { ...snapshot.entries[2]!, id: 'reasoning-2', order: 42, block_index: 1, text_start_utf16: 4, text_end_utf16: 10 },
+      ],
+    }
+    expect(activityReasoningBlocks(physical, 'A', 10)).toMatchObject([
+      { text: 'A', activityOrder: 6 }, { text: '', activityOrder: 42 },
+    ])
+    expect(activityReasoningBlocks(physical, 'A😀 wrong', 10)).toBeUndefined()
+  })
   it('restores temporary maintenance without promoting it to a saved summary', () => {
     const normalized = normalizeActivitySnapshot({
       version: 2, task_id: 'turn-1', turn_id: 'turn-1',
@@ -296,5 +333,63 @@ describe('activitySnapshot v2', () => {
     expect(JSON.stringify(restored)).not.toContain('C:/')
     expect(restored.parts[0]?.type === 'interrupt'
       && restored.parts[0].approval?.displayTarget).toBeUndefined()
+  })
+
+  it('inserts a resolved clarify interrupt at its activity order', () => {
+    const clarifyPart: ChatPart = {
+      type: 'interrupt',
+      interruptKind: 'clarify',
+      key: 'message-1:interrupt:request-1',
+      clarify: {
+        intro: 'Choose a target.',
+        fields: [],
+        requestId: 'request-1',
+        runId: 'run-1',
+        step: 'choose_target',
+      },
+      resolution: 'replied',
+      busy: false,
+      error: '',
+    }
+    const toolItem: ChatStreamTimelineItem = {
+      type: 'tool-group',
+      key: 'tool-group-1',
+      activityOrder: 100,
+      group: {
+        groupId: 'tool-group-1',
+        operationKey: 'skill_view',
+        label: 'Inspect',
+        iconName: 'gear',
+        calls: [],
+        secondary: '',
+        isRunning: false,
+        isError: false,
+        status: 'success',
+      },
+    }
+    const restored = restoreActivityInterruptTimeline(
+      [toolItem],
+      [clarifyPart],
+      {
+        version: 2,
+        taskId: 'run-1',
+        turnId: 'run-1',
+        complete: true,
+        reasoningUtf16Length: 0,
+        entries: [{
+          type: 'interrupt',
+          id: 'clarify:request-1',
+          order: 50,
+          interrupt_type: 'clarify',
+          reference_id: 'request-1',
+          started_at: 40,
+          ended_at: 50,
+        }],
+      },
+      'message-1',
+    )
+
+    expect(restored.items.map(item => item.type)).toEqual(['interrupt', 'tool-group'])
+    expect(restored.items.map(item => item.activityOrder)).toEqual([50, 100])
   })
 })

@@ -13,6 +13,14 @@ import { normalizeRouterTiers } from '../dist/router-tier-normalization.js'
 import { prepareDesktopPrimaryProviderChange } from '../dist/desktop-primary-provider-change.js'
 import { parse, stringify } from 'smol-toml'
 
+function toPlain(value) {
+  if (Array.isArray(value)) return value.map(toPlain)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, toPlain(nested)]))
+  }
+  return value
+}
+
 const defaults = {
   c0: { provider: 'tokenrhythm', model: 'qwen3.7-flash' },
   c1: { provider: 'tokenrhythm', model: 'deepseek-flash' },
@@ -216,12 +224,12 @@ for (const enabled of [true, false]) {
     assert.equal(router.default_tier, 'c2')
     assert.equal(router.preset_binding, 'follow_primary')
     assert.equal(router.tier_profile, undefined)
-    assert.deepEqual(router.budget_gate, saved.squilla_router.budget_gate)
+    assert.deepEqual(toPlain(router.budget_gate), saved.squilla_router.budget_gate)
     assert.equal(router.confidence_threshold, 0.8)
     assert.ok(Object.values(router.tiers).every(tier => tier.provider === 'tokenrhythm'))
     assert.equal(result.router.routerTiers.c1.model, defaults.c1.model)
     assert.equal(result.router.routerTiers.c3.ensembleEnabled, false)
-    assert.deepEqual(parse(result.ensembleLines.join('\n')).llm_ensemble, saved.llm_ensemble)
+    assert.deepEqual(toPlain(parse(result.ensembleLines.join('\n')).llm_ensemble), saved.llm_ensemble)
     assert.deepEqual(saved, original)
     assert.equal(result.modelRoutingMode, ensembleEnabled ? 'llm_ensemble' : enabled ? 'squilla_router' : 'direct')
   }
@@ -252,7 +260,7 @@ assert.equal(replacedDirect.router.routerTiers.c1.provider, 'tokenrhythm')
 const retainedDirect = switchPrimary(directCustomWithoutTiers, { requestedMode: 'direct' })
 assert.equal(retainedDirect.router.routerMode, 'disabled')
 assert.deepEqual(retainedDirect.router.routerTiers, {})
-assert.deepEqual(parse(retainedDirect.routerLines.join('\n')).squilla_router,
+assert.deepEqual(toPlain(parse(retainedDirect.routerLines.join('\n')).squilla_router),
   directCustomWithoutTiers.squilla_router)
 
 assert.equal(switchPrimary(savedPrimary, { provider: 'openrouter' }), null)
@@ -261,7 +269,7 @@ custom.squilla_router.preset_binding = 'custom'
 assert.throws(() => switchPrimary(custom), /Saved Router tiers use another provider/)
 custom.squilla_router.enabled = false
 const customChanged = switchPrimary(custom)
-assert.deepEqual(parse(customChanged.routerLines.join('\n')).squilla_router, custom.squilla_router)
+assert.deepEqual(toPlain(parse(customChanged.routerLines.join('\n')).squilla_router), custom.squilla_router)
 assert.equal(customChanged.router.routerPresetBinding, 'custom', 'actual file overrides stale credential ownership')
 delete custom.squilla_router.preset_binding
 assert.equal(switchPrimary(custom).router.routerPresetBinding, undefined)
@@ -270,7 +278,7 @@ const explicitReset = switchPrimary(custom, {
 })
 assert.equal(explicitReset.router.routerPresetBinding, 'follow_primary')
 assert.equal(parse(explicitReset.routerLines.join('\n')).squilla_router.enabled, false)
-assert.deepEqual(parse(explicitReset.ensembleLines.join('\n')).llm_ensemble, custom.llm_ensemble)
+assert.deepEqual(toPlain(parse(explicitReset.ensembleLines.join('\n')).llm_ensemble), custom.llm_ensemble)
 const crossProvider = structuredClone(savedPrimary)
 crossProvider.squilla_router.preset_binding = 'custom'
 crossProvider.squilla_router.cross_provider_tiers = true

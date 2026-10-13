@@ -478,7 +478,9 @@ async def test_gateway_early_failure_timeout_closes_owned_upload_without_retry(
                 started_at=gateway_cmd.time.monotonic(),
                 failure=OSError("synthetic-private-path"),
             ),
-            timeout=10,
+            # Cold SQLite schema creation can be delayed by Windows shard
+            # load; keep the guard bounded without making the assertion flaky.
+            timeout=30 if sys.platform == "win32" else 10,
         )
 
     assert len(requests) == 1
@@ -1647,12 +1649,21 @@ class _ShutdownProbeServer:
     or "http" through ``app.state.request_shutdown`` (the HTTP endpoint path).
     """
 
-    def __init__(self, *, fire: str | None = None, via: str = "signal") -> None:
+    def __init__(
+        self,
+        *,
+        fire: str | None = None,
+        via: str = "signal",
+        startup_ready: bool = False,
+    ) -> None:
         self.closed: list[str] = []
         self._fire = fire
         self._via = via
         self._on_signal = None
-        self.app = SimpleNamespace(state=SimpleNamespace())
+        state = SimpleNamespace()
+        if startup_ready:
+            state.gateway_start_ready_event = asyncio.Event()
+        self.app = SimpleNamespace(state=state)
         self._task: asyncio.Task | None = None
 
     def spawn(self) -> None:
@@ -1660,6 +1671,10 @@ class _ShutdownProbeServer:
         self._task = asyncio.ensure_future(self._serve())
 
     async def _serve(self) -> None:
+        startup_ready_event = getattr(self.app.state, "gateway_start_ready_event", None)
+        if isinstance(startup_ready_event, asyncio.Event):
+            startup_ready_event.set()
+            await asyncio.sleep(0)
         if self._fire is not None:
             await asyncio.sleep(0.01)
             if self._via == "http":
@@ -1717,10 +1732,13 @@ def test_gateway_run_records_launch_for_owning_surface(
     calls: list[dict[str, object]] = []
 
     async def record_launch(**kwargs: object) -> bool:
+        assert server.app.state.gateway_start_ready_event.is_set()
         calls.append(kwargs)
         return True
 
-    server = _ShutdownProbeServer(fire="api_shutdown", via="http")
+    server = _ShutdownProbeServer(
+        fire="api_shutdown", via="http", startup_ready=True
+    )
     server._services = SimpleNamespace(
         growth_event_sink=SimpleNamespace(record_client_launch=record_launch)
     )
@@ -1858,11 +1876,21 @@ def test_gateway_run_drains_via_http_shutdown_trigger(tmp_path, monkeypatch) -> 
     _install_fake_start(server, holder, monkeypatch)
     monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
 
-    gateway_cmd.run_gateway(
-        port=None, bind=None, listen="", debug=False, config_path=str(config)
-    )
+    import structlog
+
+    with structlog.testing.capture_logs() as logs:
+        gateway_cmd.run_gateway(
+            port=None, bind=None, listen="", debug=False, config_path=str(config)
+        )
 
     assert holder["server"].closed == ["api_shutdown"]
+    assert {
+        "event": "gateway.shutdown_requested",
+        "reason": "api_shutdown",
+    } in [
+        {key: event[key] for key in ("event", "reason") if key in event}
+        for event in logs
+    ]
 
 
 def test_gateway_run_force_exits_after_incomplete_shutdown(tmp_path, monkeypatch) -> None:

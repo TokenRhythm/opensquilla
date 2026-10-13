@@ -3,6 +3,7 @@ import { createClientRequestId } from './messageIdentity'
 
 const DATABASE = 'opensquilla-attachment-drafts'
 const STORE = 'drafts'
+const MAX_ATTACHMENT_DRAFT_ITEMS = 16
 export const ATTACHMENT_DRAFT_TTL_MS = 24 * 60 * 60 * 1000
 export const ATTACHMENT_DRAFT_MAX_BYTES = 60 * 1024 * 1024
 export const ATTACHMENT_DRAFT_TOTAL_BYTES = 120 * 1024 * 1024
@@ -15,11 +16,45 @@ interface StoredAttachment {
   workspaceFile?: WorkspaceFileReference
   fileUuid?: string; expiresAt?: number; ttlSeconds?: number
   error?: string
+  origin?: 'paste'
 }
 interface DraftRecord {
   key: string; version: 1; updatedAt: number; expiresAt: number; bytes: number
   revision?: string
   attachments: StoredAttachment[]
+}
+
+function validWorkspaceFileReference(value: WorkspaceFileReference | undefined): value is WorkspaceFileReference {
+  if (!value || Object.keys(value).some(key => !['workspaceId', 'relativePath', 'name', 'mime', 'size'].includes(key))
+    || typeof value.workspaceId !== 'string' || !value.workspaceId || value.workspaceId.length > 256
+    || typeof value.relativePath !== 'string' || !value.relativePath || value.relativePath.length > 4096
+    || value.relativePath.startsWith('/') || value.relativePath.includes('\\') || value.relativePath.includes(':')
+    || [...value.relativePath].some(char => char.charCodeAt(0) < 32)
+    || value.relativePath.split('/').some(part => !part || part === '..' || part === '.')
+    || typeof value.name !== 'string' || !value.name || value.name.length > 1024
+    || typeof value.mime !== 'string' || !value.mime || value.mime.length > 256
+    || [...value.name, ...value.mime].some(char => char.charCodeAt(0) < 32)) return false
+  return value.size === undefined || (Number.isSafeInteger(value.size) && value.size >= 0)
+}
+
+/** Payload retained by a draft; live workspace references retain metadata only. */
+export function attachmentDraftPayloadBytes(attachments: readonly StoredAttachment[]): number {
+  let bytes = 0
+  for (const item of attachments) {
+    if (!item || typeof item.name !== 'string' || typeof item.mime !== 'string'
+      || !Number.isSafeInteger(item.size) || item.size < 0) throw new Error('Saved attachment draft is invalid')
+    if (item.workspaceFile !== undefined && !validWorkspaceFileReference(item.workspaceFile)) {
+      throw new Error('Saved project file reference is invalid')
+    }
+    // A Blob is always real retained payload, even if a legacy record also
+    // carries otherwise-valid workspaceFile metadata.
+    const itemBytes = item.blob instanceof Blob
+      ? item.blob.size
+      : item.workspaceFile ? 0 : item.size
+    bytes += itemBytes
+    if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('Saved attachment draft is invalid')
+  }
+  return bytes
 }
 export interface AttachmentDraftStore {
   load(scope: AttachmentDraftScope): Promise<Attachment[]>
@@ -49,8 +84,12 @@ function inlineBlob(attachment: Attachment): Blob | undefined {
   return new Blob([bytes], { type: attachment.mime })
 }
 function storedAttachment(attachment: Attachment): StoredAttachment {
-  const base = { name: attachment.name, mime: attachment.mime, size: attachment.size ?? 0 }
+  const base = { name: attachment.name, mime: attachment.mime, size: attachment.size ?? 0,
+    ...(attachment.origin ? { origin: attachment.origin } : {}) }
   if (attachment.kind === 'workspace' && attachment.workspaceFile) {
+    if (!validWorkspaceFileReference(attachment.workspaceFile)) {
+      throw new Error('Project file reference is invalid; select the file again')
+    }
     // Persist identity, never a native token or a reusable filesystem authority.
     return { ...base, workspaceFile: { ...attachment.workspaceFile } }
   }
@@ -64,35 +103,31 @@ function storedAttachment(attachment: Attachment): StoredAttachment {
   }
 }
 function restore(record: DraftRecord, now: number): Attachment[] {
-  if (record.version !== 1 || !Array.isArray(record.attachments) || record.attachments.length > 10) {
+  if (record.version !== 1 || !Array.isArray(record.attachments) || record.attachments.length > MAX_ATTACHMENT_DRAFT_ITEMS) {
     throw new Error('Saved attachment draft is invalid; select the files again')
   }
-  let bytes = 0
+  const bytes = attachmentDraftPayloadBytes(record.attachments)
+  if (bytes > ATTACHMENT_DRAFT_MAX_BYTES) throw new Error('Saved attachment draft exceeds its size limit')
   return record.attachments.map((item, index) => {
-    if (!item || typeof item.name !== 'string' || typeof item.mime !== 'string'
-      || !Number.isSafeInteger(item.size) || item.size < 0) throw new Error('Saved attachment draft is invalid')
-    bytes += item.blob instanceof Blob ? item.blob.size : item.size
-    if (bytes > ATTACHMENT_DRAFT_MAX_BYTES) throw new Error('Saved attachment draft exceeds its size limit')
     const base = { local_id: index + 1, name: item.name, mime: item.mime, size: item.size }
+    const origin = item.origin === 'paste' ? { origin: 'paste' as const } : {}
     if (item.workspaceFile) {
       const ref = item.workspaceFile
-      if (typeof ref.workspaceId !== 'string' || typeof ref.relativePath !== 'string'
-        || !ref.workspaceId || !ref.relativePath || ref.relativePath.startsWith('/')
-        || ref.relativePath.includes('\\') || ref.relativePath.split('/').some(part => !part || part === '..' || part === '.')) {
+      if (!validWorkspaceFileReference(ref)) {
         throw new Error('Saved project file reference is invalid; select the file again')
       }
-      return { ...base, kind: 'workspace', workspaceFile: { ...ref } }
+      return { ...base, ...origin, kind: 'workspace', workspaceFile: { ...ref } }
     }
     if (item.blob instanceof Blob && item.blob.size !== item.size) throw new Error('Saved attachment size changed')
     const file = item.blob instanceof Blob ? new File([item.blob], item.name, { type: item.mime }) : undefined
     if (item.fileUuid && typeof item.fileUuid === 'string'
       && (file || (typeof item.expiresAt === 'number' && item.expiresAt * 1000 > now))) {
-      return { ...base, kind: 'staged', file_uuid: item.fileUuid,
+      return { ...base, ...origin, kind: 'staged', file_uuid: item.fileUuid,
         expires_at: item.expiresAt ?? 0, ttl_seconds: item.ttlSeconds, file }
     }
     // Restored bytes go through the ordinary bounded upload path before send.
     // No native path/selection survives a reload, including browser File objects.
-    return { ...base, kind: 'failed', file,
+    return { ...base, ...origin, kind: 'failed', file,
       error: item.error || (file ? 'Draft restored; retry to prepare the file' : 'Select the file again to restore this attachment') }
   })
 }
@@ -149,9 +184,9 @@ export class IndexedDbAttachmentDraftStore implements AttachmentDraftStore {
   }
   async save(scope: AttachmentDraftScope, attachments: readonly Attachment[], revision?: string): Promise<void> {
     const key = attachmentDraftKey(scope)
-    if (attachments.length > 10) throw new Error('Too many attachments to save as a draft')
+    if (attachments.length > MAX_ATTACHMENT_DRAFT_ITEMS) throw new Error('Too many attachments to save as a draft')
     const stored = attachments.map(storedAttachment)
-    const bytes = stored.reduce((sum, item) => sum + item.size, 0)
+    const bytes = attachmentDraftPayloadBytes(stored)
     if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > ATTACHMENT_DRAFT_MAX_BYTES) {
       throw new Error('Attachment draft exceeds its storage limit')
     }
@@ -168,15 +203,27 @@ export class IndexedDbAttachmentDraftStore implements AttachmentDraftStore {
     // One read/write transaction makes the aggregate limit hold across tabs.
     const request = store.getAll()
     let quotaError = false
+    let invalidRecord = false
     request.onsuccess = () => {
       let total = bytes
       let count = 1
       for (const record of request.result as DraftRecord[]) {
         if (record.key === key) continue
         if (!Number.isFinite(record.expiresAt) || record.expiresAt <= now) { store.delete(record.key); continue }
-        if (!Number.isSafeInteger(record.bytes) || record.bytes < 0) { store.delete(record.key); continue }
-        total += record.bytes
+        let recordBytes: number
+        try {
+          if (record.version !== 1 || !Array.isArray(record.attachments) || record.attachments.length > MAX_ATTACHMENT_DRAFT_ITEMS) {
+            throw new Error('Saved attachment draft is invalid')
+          }
+          recordBytes = attachmentDraftPayloadBytes(record.attachments)
+        } catch {
+          invalidRecord = true
+          transaction.abort()
+          return
+        }
+        total += recordBytes
         count += 1
+        if (record.bytes !== recordBytes) store.put({ ...record, bytes: recordBytes })
       }
       if (total > ATTACHMENT_DRAFT_TOTAL_BYTES || count > MAX_DRAFTS) {
         quotaError = true
@@ -189,6 +236,7 @@ export class IndexedDbAttachmentDraftStore implements AttachmentDraftStore {
     }
     try { await done } catch (error) {
       if (quotaError) throw new Error('Attachment draft storage is full; clear older drafts to enable recovery')
+      if (invalidRecord) throw new Error('Saved attachment draft storage is invalid; restore or clear the affected draft first')
       throw error
     }
   }
@@ -209,7 +257,7 @@ export class IndexedDbAttachmentDraftStore implements AttachmentDraftStore {
       const attachments = record.attachments.filter((_item, index) => !accepted.has(index))
       if (!attachments.length) store.delete(key)
       else store.put({ ...record, revision: undefined, attachments,
-        bytes: attachments.reduce((sum, item) => sum + item.size, 0) })
+        bytes: attachmentDraftPayloadBytes(attachments) })
     }
     await done
     return consumed

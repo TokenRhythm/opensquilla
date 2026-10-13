@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
+import hashlib
 import json
 import logging
+import os
 import random
 import re
 import secrets
@@ -25,10 +29,23 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from enum import StrEnum
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, cast
+from uuid import uuid4
 
 from opensquilla.compat import aiosqlite
+from opensquilla.content_reader import (
+    MAX_CONTENT_RANGE_BYTES,
+    MAX_DISPLAY_CONTENT_BYTES,
+    ContentMetadataPendingError,
+    ContentNotFoundError,
+    ContentRange,
+    ContentRangeError,
+    ContentSource,
+    LegacyContentRef,
+    validate_content_range,
+)
 from opensquilla.history_cursor import HistoryCursorInvalidatedError
 from opensquilla.persistence.memory_flush_retirement import (
     RETIRED_MEMORY_COLUMNS,
@@ -38,6 +55,11 @@ from opensquilla.persistence.plan_presentation import (
     PLAN_PRESENTATION_SCHEMA,
     PlanPresentationConflictError,
     PlanPresentationRequestConflictError,
+)
+from opensquilla.session.attachment_history import (
+    USER_DISPLAY_TEXT_SQL,
+    inline_attachment_digest,
+    user_display_envelope_sql,
 )
 from opensquilla.session.attachment_manifest import preserve_attachment_occurrence_ids
 from opensquilla.session.cost_rollup import rollup_cost_source
@@ -67,7 +89,7 @@ from opensquilla.session.goals import (
     normalize_goal_progress,
     normalize_goal_reason,
 )
-from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
+from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id
 from opensquilla.session.models import (
     AgentTaskRecord,
     AgentTaskStatus,
@@ -75,8 +97,6 @@ from opensquilla.session.models import (
     GoalCommandReceiptRecord,
     GoalRecord,
     MemoryDurableReceipt,
-    MetaControlIntent,
-    MetaLaunchDraft,
     PlanRevisionRecord,
     PlanRunRecord,
     PlanRunStatus,
@@ -100,6 +120,7 @@ from opensquilla.session.recovery_reads import (
     ReadCapacityError,
     RecoveryReadPool,
     current_read_budget,
+    recovery_read_scope,
 )
 from opensquilla.session.usage_ledger import (
     UsageBackfillBatch,
@@ -132,7 +153,6 @@ from opensquilla.turn_outcome_projection import (
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
 if TYPE_CHECKING:
-    from opensquilla.persistence.meta_run_writer import MetaRunWriter
     from opensquilla.project_workspaces import ProjectWorkspaceGuard
 
 log = logging.getLogger(__name__)
@@ -207,24 +227,14 @@ class PendingChatInputAlreadyDispatchedError(RuntimeError):
     """Raised when a delayed enqueue targets an already accepted staged input."""
 
 
-class MetaControlIntentConflictError(ValueError):
-    """Raised when a durable MetaSkill control identity is reused incompatibly."""
 
 
-class MetaLaunchDraftConflictError(ValueError):
-    """Raised when a durable MetaSkill draft identity is reused incompatibly."""
 
 
-class MetaLaunchDraftCapacityError(RuntimeError):
-    """Raised when the bounded durable MetaSkill draft outbox is full."""
 
 
-class MetaLaunchDraftUnavailableError(RuntimeError):
-    """Raised when a draft expired before control promotion."""
 
 
-class MetaLaunchDraftDiscardedError(RuntimeError):
-    """Raised when a cancelled draft identity is reused before its tombstone expires."""
 
 
 class TaskCollectionUnavailableError(RuntimeError):
@@ -312,6 +322,51 @@ class PendingChatInputDispatchReceipt:
     schema_version: int = 1
 
 
+@dataclass(frozen=True, slots=True)
+class ActivationPermit:
+    """Durable authorization fence between acceptance and provider dispatch.
+
+    The permit is intentionally a separate row in ``sessions.db``.  A task
+    may be accepted while queued, but provider work is allowed only after a
+    short writer transaction proves the exact task, session owner generation,
+    and authorization revision still match.  ``released`` is terminal and
+    permits are never reused for another task.
+    """
+
+    permit_id: str
+    task_id: str
+    session_key: str
+    session_id: str
+    session_epoch: int
+    authorization_revision: int
+    permission_fingerprint: str
+    state: str
+    created_at: int
+    expires_at: int | None = None
+    activated_at: int | None = None
+    released_at: int | None = None
+    schema_version: int = 1
+
+
+class ActivationPermitConflictReason(StrEnum):
+    """Stable causes that are safe for the runtime to classify."""
+
+    SESSION_RESET_INVALIDATED = "session_reset_invalidated"
+
+
+class ActivationPermitConflictError(RuntimeError):
+    """The queued task or its authority snapshot no longer matches."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: ActivationPermitConflictReason | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 async def _verify_project_workspace_guard(
     conn: aiosqlite.Connection,
     *,
@@ -386,12 +441,6 @@ async def _next_project_workspace_order_value(
     return max(now_ms, int(previous) + 1) if previous is not None else now_ms
 
 
-@dataclass(frozen=True)
-class RecoverableMetaControlTask:
-    """A never-started accepted control task claimed for restart recovery."""
-
-    task: AgentTaskRecord
-    entry: TranscriptEntry
 
 
 class AgentTaskTerminalConflictError(ValueError):
@@ -402,64 +451,23 @@ class AgentTaskTerminalConflictError(ValueError):
         self.record = record
 
 
+@dataclass(frozen=True, slots=True)
+class AgentTaskSettlementReceipt:
+    """Proof that terminal state and the absence of an active permit committed."""
+
+    task_id: str
+    session_key: str
+
+
 _SQLITE_BUSY_TIMEOUT_MS = 100
 _SQLITE_STARTUP_BUSY_TIMEOUT_SECONDS = 5.0
 _INTERACTIVE_BUSY_BUDGET_SECONDS = 2.0
 _BUSY_RETRY_INITIAL_SECONDS = 0.025
 _BUSY_RETRY_MAX_SECONDS = 0.250
-_META_CONTROL_STAGED_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
-_META_CONTROL_STAGED_GC_BATCH = 128
-_META_CONTROL_RECOVERY_INVALID_REASON = "meta_control_recovery_invalid"
-_META_LAUNCH_DRAFT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
-_META_LAUNCH_DRAFT_PER_SESSION_LIMIT = 20
-_META_LAUNCH_DRAFT_GLOBAL_LIMIT = 512
-_META_LAUNCH_DRAFT_GC_BATCH = 512
-_META_LAUNCH_DRAFT_GC_INTERVAL_SECONDS = 60.0
-_META_LAUNCH_DISCARD_PER_SESSION_LIMIT = 64
-_META_LAUNCH_DISCARD_GLOBAL_LIMIT = 2048
-_META_LAUNCH_ACCEPTED_PER_SESSION_LIMIT = 20
-_META_LAUNCH_SESSION_KEY_MAX_LENGTH = 512
-_META_LAUNCH_REQUEST_ID_MAX_LENGTH = 256
 
 
-def normalize_meta_launch_coordinates(
-    session_key: object,
-    client_request_id: object,
-) -> tuple[str, str]:
-    """Validate bounded, content-free coordinates for draft and tombstone rows."""
-
-    if not isinstance(session_key, str) or not isinstance(client_request_id, str):
-        raise ValueError("meta launch draft coordinates must be strings")
-    if len(session_key.strip()) > _META_LAUNCH_SESSION_KEY_MAX_LENGTH:
-        raise ValueError("meta launch draft session is invalid")
-    normalized_session = canonicalize_session_key(session_key)
-    normalized_request_id = client_request_id.strip()
-    if not normalized_session or len(normalized_session) > _META_LAUNCH_SESSION_KEY_MAX_LENGTH:
-        raise ValueError("meta launch draft session is invalid")
-    if (
-        not normalized_request_id
-        or len(normalized_request_id) > _META_LAUNCH_REQUEST_ID_MAX_LENGTH
-        or any(character.isspace() for character in normalized_request_id)
-    ):
-        raise ValueError("meta launch draft request identity is invalid")
-    return normalized_session, normalized_request_id
 
 
-def _clear_pending_meta_launch_boundary(
-    session_key: str,
-    *,
-    preserve_client_request_id: str | None = None,
-    preserve_message: object = None,
-) -> int:
-    """Clear the process compatibility cache after a committed session boundary."""
-
-    from opensquilla.engine.steps.meta_command import pending_meta_launch_clear_session
-
-    return pending_meta_launch_clear_session(
-        session_key,
-        preserve_client_request_id=preserve_client_request_id,
-        preserve_message=preserve_message,
-    )
 _BOUNDED_INTERACTIVE_READS: ContextVar[bool] = ContextVar(
     "opensquilla_bounded_interactive_storage_reads",
     default=False,
@@ -467,6 +475,58 @@ _BOUNDED_INTERACTIVE_READS: ContextVar[bool] = ContextVar(
 _READ_CONNECTION: ContextVar[tuple[Any, Any] | None] = ContextVar(
     "opensquilla_session_read_connection", default=None,
 )
+
+
+def _read_path_diagnostics_enabled() -> bool:
+    """Enable narrowly scoped read-path timing only for local investigations.
+
+    This is deliberately separate from ``OPENSQUILLA_STORAGE_DIAGNOSTICS``:
+    the latter is already used by packaged probes for write diagnostics, while
+    this switch may emit one line per history query.  It is never enabled by a
+    normal product configuration.
+    """
+
+    return os.environ.get("OPENSQUILLA_READ_PATH_DIAGNOSTICS") == "1"
+
+
+def _read_path_sql_tag(sql: str) -> str:
+    """Return a stable, payload-free identifier for a diagnostic query."""
+
+    return hashlib.sha256(sql.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _log_read_path_timing(
+    *,
+    operation: str,
+    wait_ms: int | None = None,
+    query_ms: int | None = None,
+    hold_ms: int | None = None,
+    rows: int | None = None,
+    sql_tag: str | None = None,
+) -> None:
+    """Emit bounded read timing without recording SQL or user content."""
+
+    if not _read_path_diagnostics_enabled():
+        return
+    log.warning(
+        "session_storage.read_path_timing operation=%s wait_ms=%s "
+        "query_ms=%s hold_ms=%s rows=%s sql_tag=%s",
+        operation,
+        wait_ms,
+        query_ms,
+        hold_ms,
+        rows,
+        sql_tag,
+        extra={"_opensquilla_log_metadata": {
+            "event": "session_storage.read_path_timing",
+            "operation": operation,
+            "wait_ms": wait_ms,
+            "query_ms": query_ms,
+            "hold_ms": hold_ms,
+            "rows": rows,
+            "sql_tag": sql_tag,
+        }},
+    )
 
 
 def _is_sqlite_busy(exc: BaseException) -> bool:
@@ -572,10 +632,43 @@ def _serialized_read[**P, R](
 # prompt-annotation drafts atomically consumed by chat turns. Version 24 added
 # durable idempotency receipts for artifact mutation attempts. Version 25 added
 # the persistent per-session model-routing mode and its compare-and-set revision.
+# Version 26 retired workflow execution controls and archived their audit history.
 # Nullable execution workspace bindings are additive and are migrated without
 # changing the semantic session schema version used by upgrade compatibility.
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 MAX_PENDING_CHAT_INPUTS = 5
+# Title/search enrichment only needs a bounded prefix.  Keep this separate
+# from the history wire preview because these helpers return plain strings and
+# otherwise can pull a full legacy body across the SQLite/Python boundary.
+SESSION_TITLE_PREVIEW_CHARS = 4 * 1024
+SESSION_TITLE_MAX_BODY_BYTES = 64 * 1024
+# 仅在 metadata 已筛出 <=64KiB 的候选后投影正文。先截 JSON 会丢掉图片
+# base64 后的 display_text，必须在 SQLite 内提取可见正文再限制返回长度。
+_SESSION_TITLE_CONTENT_SQL = f"""CASE WHEN json_valid(content) THEN CASE
+    WHEN json_type(content, '$.display_text') = 'text'
+      OR (json_type(content, '$.text') = 'text'
+          AND json_type(content, '$.attachments') = 'array')
+    THEN json_object('display_text',
+         substr({USER_DISPLAY_TEXT_SQL}, 1, {SESSION_TITLE_PREVIEW_CHARS}))
+    ELSE substr(content, 1, {SESSION_TITLE_PREVIEW_CHARS}) END
+    ELSE substr(content, 1, {SESSION_TITLE_PREVIEW_CHARS}) END"""
+# Read ordinary envelopes completely before applying display semantics. This
+# is a storage parse budget, separate from both title and wire preview limits.
+# Larger/unindexed rows retain a prefix and an explicit *actual* truncation bit;
+# byte length metadata being pending does not mean a short row was truncated.
+HISTORY_INLINE_CONTENT_BYTES = 64 * 1024
+_BOUNDED_TRANSCRIPT_CHARS_SQL = (
+    f"CASE WHEN content_byte_length BETWEEN 0 AND {HISTORY_INLINE_CONTENT_BYTES} "
+    f"THEN {HISTORY_INLINE_CONTENT_BYTES} ELSE {SESSION_TITLE_PREVIEW_CHARS} END"
+)
+_BOUNDED_TRANSCRIPT_CONTENT_SQL = f"substr(content, 1, {_BOUNDED_TRANSCRIPT_CHARS_SQL})"
+_BOUNDED_USER_ENVELOPE_SQL = user_display_envelope_sql()
+_BOUNDED_TRANSCRIPT_TRUNCATED_SQL = (
+    f"length(substr(content, ({_BOUNDED_TRANSCRIPT_CHARS_SQL}) + 1, 1)) > 0"
+)
+# Session-directory titles are a convenience field.  Never make startup
+# inspect a large transcript body just to derive one.  New rows carry exact
+# metadata; legacy rows remain pending until the maintenance backfill.
 
 # These fields have their own atomic resolver/CAS API.  Whole-session writes
 # may seed them when inserting a new row, but must never replace the value of
@@ -887,6 +980,10 @@ CREATE TABLE IF NOT EXISTS transcript_entries (
     message_id TEXT NOT NULL,
     role TEXT NOT NULL,
     content TEXT,
+    -- Nullable for legacy rows until the post-ready metadata backfill runs.
+    content_byte_length INTEGER,
+    -- Incremented by the content update trigger to fence same-length changes.
+    content_revision INTEGER NOT NULL DEFAULT 0,
     tool_calls TEXT,
     tool_call_id TEXT,
     reasoning_content TEXT,
@@ -914,6 +1011,10 @@ _CREATE_IDX_TRANSCRIPT_CURSOR = """
 CREATE INDEX IF NOT EXISTS idx_transcript_session_cursor
 ON transcript_entries(session_id, created_at, id)
 """
+_CREATE_IDX_TRANSCRIPT_TITLE_CANDIDATES = """
+CREATE INDEX IF NOT EXISTS idx_transcript_title_candidates
+ON transcript_entries(session_id, role, content_byte_length, created_at, id)
+"""
 
 _CREATE_COMPACTED_TRANSCRIPT = """
 CREATE TABLE IF NOT EXISTS compacted_transcript_entries (
@@ -926,6 +1027,9 @@ CREATE TABLE IF NOT EXISTS compacted_transcript_entries (
     message_id TEXT NOT NULL,
     role TEXT NOT NULL,
     content TEXT,
+    -- Nullable for legacy rows until the post-ready metadata backfill runs.
+    content_byte_length INTEGER,
+    content_revision INTEGER NOT NULL DEFAULT 0,
     tool_calls TEXT,
     tool_call_id TEXT,
     reasoning_content TEXT,
@@ -957,6 +1061,12 @@ _CREATE_IDX_COMPACTED_TRANSCRIPT_CURSOR = """
 CREATE INDEX IF NOT EXISTS idx_compacted_transcript_session_cursor
 ON compacted_transcript_entries(session_id, created_at, original_entry_id, id)
 """
+_CREATE_IDX_COMPACTED_TRANSCRIPT_TITLE_CANDIDATES = """
+CREATE INDEX IF NOT EXISTS idx_compacted_transcript_title_candidates
+ON compacted_transcript_entries(
+    session_id, role, content_byte_length, created_at, original_entry_id, id
+)
+"""
 
 _CREATE_IDX_COMPACTED_TRANSCRIPT_COMPACTION = """
 CREATE INDEX IF NOT EXISTS idx_compacted_transcript_session_compaction
@@ -983,7 +1093,10 @@ END
 """
 
 _CREATE_FTS_TRIGGER_UPDATE = """
-CREATE TRIGGER IF NOT EXISTS transcript_fts_au AFTER UPDATE ON transcript_entries BEGIN
+CREATE TRIGGER IF NOT EXISTS transcript_fts_au
+AFTER UPDATE OF content, id ON transcript_entries
+WHEN OLD.id IS NOT NEW.id OR OLD.content IS NOT NEW.content
+BEGIN
     INSERT INTO transcript_fts(transcript_fts, rowid, content)
     VALUES ('delete', old.id, old.content);
     INSERT INTO transcript_fts(rowid, content) VALUES (new.id, new.content);
@@ -1079,6 +1192,60 @@ ON agent_tasks(session_key, status)
 _CREATE_IDX_AGENT_TASKS_STATUS_UPDATED = """
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_status_updated
 ON agent_tasks(status, updated_at)
+"""
+
+_CREATE_ACTIVATION_PERMITS = """
+CREATE TABLE IF NOT EXISTS activation_permits (
+    permit_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL UNIQUE,
+    session_key TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    session_epoch INTEGER NOT NULL,
+    authorization_revision INTEGER NOT NULL,
+    permission_fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('active', 'released', 'expired')),
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    activated_at INTEGER,
+    released_at INTEGER,
+    schema_version INTEGER NOT NULL DEFAULT 1
+)
+"""
+
+_CREATE_IDX_ACTIVATION_PERMITS_STATE = """
+CREATE INDEX IF NOT EXISTS idx_activation_permits_state
+ON activation_permits(state, created_at)
+"""
+
+# A recovery lease is connection-owned while it is active, but its final
+# proof must survive a Gateway restart.  Keep this receipt deliberately
+# metadata-only: the event payloads remain in the bounded stream registry (or
+# are re-read from the durable transcript), while this table records the
+# identity/generation CAS that made the installation authoritative.
+_CREATE_SESSION_READ_RECOVERY_RECEIPTS = """
+CREATE TABLE IF NOT EXISTS session_read_recovery_receipts (
+    recovery_id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    session_epoch INTEGER NOT NULL,
+    connection_epoch TEXT NOT NULL,
+    subscription_epoch TEXT NOT NULL,
+    stream_generation TEXT NOT NULL,
+    base_seq INTEGER NOT NULL,
+    target_seq INTEGER NOT NULL,
+    consumed_through_seq INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    proof_id TEXT,
+    proof_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1
+)
+"""
+
+_CREATE_IDX_SESSION_READ_RECOVERY_RECEIPTS_SESSION = """
+CREATE INDEX IF NOT EXISTS idx_session_read_recovery_receipts_session
+ON session_read_recovery_receipts(session_key, session_epoch, updated_at)
 """
 
 _CREATE_TURN_INGRESS_RECEIPTS = """
@@ -1181,79 +1348,13 @@ CREATE INDEX IF NOT EXISTS idx_pending_chat_input_dispatch_session
 ON pending_chat_input_dispatch_receipts(session_key, accepted_at, pending_input_id)
 """
 
-_CREATE_META_CONTROL_INTENTS = """
-CREATE TABLE IF NOT EXISTS meta_control_intents (
-    intent_id TEXT PRIMARY KEY,
-    session_key TEXT NOT NULL,
-    control_kind TEXT NOT NULL,
-    correlation_id TEXT NOT NULL,
-    meta_skill_name TEXT NOT NULL,
-    replay_run_id TEXT,
-    replay_mode TEXT,
-    status TEXT NOT NULL DEFAULT 'staged',
-    accepted_source_scope TEXT,
-    accepted_request_session_key TEXT,
-    accepted_client_request_id TEXT,
-    accepted_request_fingerprint TEXT,
-    accepted_message_id TEXT,
-    accepted_task_id TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    schema_version INTEGER NOT NULL DEFAULT 1,
-    CHECK (control_kind IN ('manual', 'replay')),
-    CHECK (status IN ('staged', 'accepted'))
-)
-"""
 
-_CREATE_IDX_META_CONTROL_CORRELATION = """
-CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_control_intents_correlation
-ON meta_control_intents(session_key, control_kind, correlation_id)
-"""
 
-_CREATE_IDX_META_CONTROL_SESSION_STATUS = """
-CREATE INDEX IF NOT EXISTS idx_meta_control_intents_session_status
-ON meta_control_intents(session_key, status, created_at)
-"""
 
-_CREATE_META_LAUNCH_DRAFTS = """
-CREATE TABLE IF NOT EXISTS meta_launch_drafts (
-    draft_id TEXT PRIMARY KEY,
-    session_key TEXT NOT NULL,
-    client_request_id TEXT NOT NULL,
-    meta_skill_name TEXT NOT NULL,
-    launch_text TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
-    schema_version INTEGER NOT NULL DEFAULT 1
-)
-"""
 
-_CREATE_IDX_META_LAUNCH_DRAFT_REQUEST = """
-CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_launch_drafts_request
-ON meta_launch_drafts(session_key, client_request_id)
-"""
 
-_CREATE_IDX_META_LAUNCH_DRAFT_SESSION_EXPIRY = """
-CREATE INDEX IF NOT EXISTS idx_meta_launch_drafts_session_expiry
-ON meta_launch_drafts(session_key, expires_at, created_at)
-"""
 
-_CREATE_META_LAUNCH_DISCARD_TOMBSTONES = """
-CREATE TABLE IF NOT EXISTS meta_launch_discard_tombstones (
-    session_key TEXT NOT NULL,
-    client_request_id TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
-    schema_version INTEGER NOT NULL DEFAULT 1,
-    PRIMARY KEY (session_key, client_request_id)
-)
-"""
 
-_CREATE_IDX_META_LAUNCH_DISCARD_TOMBSTONES_EXPIRY = """
-CREATE INDEX IF NOT EXISTS idx_meta_launch_discard_tombstones_expiry
-ON meta_launch_discard_tombstones(expires_at, created_at)
-"""
 
 _CREATE_MEMORY_DURABLE_RECEIPTS = """
 CREATE TABLE IF NOT EXISTS memory_durable_receipts (
@@ -1532,6 +1633,24 @@ def _serialize(value: Any) -> Any:
     return value
 
 
+def _content_byte_length(value: Any) -> int:
+    """Return the persisted SQLite TEXT/BLOB byte length without a DB read.
+
+    Transcript writes already hold the complete value in memory.  Recording
+    the UTF-8 byte count at that boundary lets bounded history and content
+    metadata reads avoid rescanning a legacy BLOB while the shared reader
+    lock is held.  ``None`` is the durable empty-body representation.
+    """
+
+    if value is None:
+        return 0
+    if isinstance(value, bytes):
+        return len(value)
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    return len(str(value).encode("utf-8"))
+
+
 def _transcript_preimage(
     entries: Sequence[TranscriptEntry],
 ) -> tuple[tuple[Any, ...], ...]:
@@ -1762,6 +1881,19 @@ def _decode_transcript_rows(rows: Sequence[Any]) -> list[TranscriptEntry]:
     return [TranscriptEntry(**_deserialize_row(dict(row))) for row in rows]
 
 
+def _decode_legacy_display_row(row: Any, raw_bytes: bytes) -> TranscriptEntry:
+    from opensquilla.content_reader import ContentEncodingError
+
+    try:
+        decoded = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ContentEncodingError("legacy transcript content is not valid UTF-8") from exc
+    payload = dict(row)
+    payload["content"] = decoded
+    payload.pop("content_byte_length", None)
+    return TranscriptEntry(**_deserialize_row(payload))
+
+
 def _py_lower(value: Any) -> Any:
     """Unicode-aware lowercase for the ``py_lower`` SQL function.
 
@@ -1912,14 +2044,26 @@ class SessionListPage:
     has_more: bool
 
 
+@dataclass(slots=True)
+class _TransactionTiming:
+    clock: Callable[[], float]
+    phase_started: float
+    phase: str
+    timings: dict[str, float]
+
+    def advance(self, phase: str) -> None:
+        now = self.clock()
+        self.timings[self.phase] = max(0.0, (now - self.phase_started) * 1000)
+        self.phase_started = now
+        self.phase = phase
+
+
 class SessionStorage:
     """Low-level async SQLite operations for session persistence."""
 
     def __init__(
         self,
         db_path: str = ":memory:",
-        *,
-        meta_run_writer: MetaRunWriter | None = None,
     ) -> None:
         self._db_path = db_path
         self._conn: Any | None = None
@@ -1927,9 +2071,10 @@ class SessionStorage:
         self._transcript_reader: Any | None = None
         self._recovery_read_pool: RecoveryReadPool | None = None
         self._pending_reader_operations: set[asyncio.Task[Any]] = set()
-        self._meta_run_writer = meta_run_writer
         self._operation_lock = asyncio.Lock()
         self._operation_holder: tuple[str, float] | None = None
+        self._diagnostics_enabled = os.environ.get("OPENSQUILLA_STORAGE_DIAGNOSTICS") == "1"
+        self._diagnostic_count = 0
         self._transcript_reader_lock = asyncio.Lock()
         self._transcript_reader_fallback_warned = False
         self._usage_backfill_index_lock = asyncio.Lock()
@@ -1942,7 +2087,6 @@ class SessionStorage:
         self._sleep = asyncio.sleep
         self._monotonic = time.monotonic
         self._random = random.random
-        self._meta_launch_draft_gc_task: asyncio.Task[None] | None = None
         self._restart_abandoned_session_keys: tuple[str, ...] = ()
 
     @property
@@ -1992,7 +2136,6 @@ class SessionStorage:
         if (
             self._conn is not None
             or self._transcript_reader is not None
-            or self._meta_launch_draft_gc_task is not None
         ):
             await self.close()
         self._poisoned = False
@@ -2020,10 +2163,6 @@ class SessionStorage:
             await self._initialize_schema(goal_pause_reason=goal_pause_reason)
             await self._conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
             await self._open_transcript_reader(journal_mode)
-            self._meta_launch_draft_gc_task = asyncio.create_task(
-                self._run_meta_launch_draft_gc(),
-                name="session-storage-meta-launch-draft-gc",
-            )
         except BaseException:
             await self.close()
             raise
@@ -2035,11 +2174,6 @@ class SessionStorage:
         return storage
 
     async def close(self) -> None:
-        gc_task, self._meta_launch_draft_gc_task = self._meta_launch_draft_gc_task, None
-        if gc_task is not None:
-            gc_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await gc_task
         # Drain before acquiring the writer gate: a serial fallback may still
         # be waiting for that gate. Pool close prevents new recovery admission.
         if self._recovery_read_pool is not None:
@@ -2081,17 +2215,18 @@ class SessionStorage:
             "session_storage.transcript_reader_fallback reason=%s journal_mode=%s",
             safe_reason,
             safe_journal_mode,
-            extra={
+            extra={"_opensquilla_log_metadata": {
                 "event": "session_storage.transcript_reader_fallback",
-                "reason": safe_reason,
+                "reason_code": safe_reason,
                 "journal_mode": safe_journal_mode,
-            },
+            }},
         )
 
     @staticmethod
     async def _register_sql_functions(conn: Any) -> None:
         # Read-only and writer connections must share search/usage semantics.
         for name, arity, function in (
+            ("history_inline_digest", 3, inline_attachment_digest),
             ("py_lower", 1, _py_lower),
             ("usage_nonnegative_int", 1, _sqlite_usage_nonnegative_int),
             ("usage_invalid_int", 1, _sqlite_usage_invalid_int),
@@ -2226,28 +2361,57 @@ class SessionStorage:
                 resource="session_storage_recovery_read_pool",
             ) from exc
 
-    async def _run_meta_launch_draft_gc(self) -> None:
-        """Physically enforce raw-draft retention while the Gateway stays up."""
-
-        while True:
-            await asyncio.sleep(_META_LAUNCH_DRAFT_GC_INTERVAL_SECONDS)
-            try:
-                async with self._write_transaction("meta_launch_draft_periodic_gc") as conn:
-                    await self._purge_expired_meta_launch_drafts(
-                        conn,
-                        now_ms=_now_ms(),
-                        limit=_META_LAUNCH_DRAFT_GC_BATCH,
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.warning("Periodic MetaSkill draft retention cleanup failed", exc_info=True)
 
     def _raise_if_poisoned(self) -> None:
         if self._poisoned:
             raise StorageConnectionPoisonedError(
                 "Session storage connection is unavailable after rollback failure"
             )
+
+    @contextlib.contextmanager
+    def _transaction_diagnostics(
+        self, operation: str, role: str,
+    ) -> Iterator[_TransactionTiming | None]:
+        # Local opt-in only. Bound volume even if the switch is left enabled.
+        if not self._diagnostics_enabled or self._diagnostic_count >= 256:
+            yield None
+            return
+        self._diagnostic_count += 1
+        sequence = self._diagnostic_count
+        generation = self._connection_generation
+        # Python 3.12 on Windows can quantize monotonic() to ~15 ms. Use a
+        # separate high-resolution clock for observation, never for deadlines.
+        started = time.perf_counter()
+        timing = _TransactionTiming(time.perf_counter, started, "queue_ms", {})
+        status = "ok"
+        failure: BaseException | None = None
+        try:
+            yield timing
+        except BaseException as exc:
+            failure = exc
+            status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
+            raise
+        finally:
+            phase = timing.phase
+            timing.advance("finished")
+            # The caller has released its gate; no SQL, handlers or awaits are
+            # added inside the transaction. These are await spans, not SQL CPU.
+            log.info("session_storage.transaction_timing", extra={
+                "_opensquilla_log_metadata": {
+                    "event": "session_storage.transaction_timing",
+                    "operation": operation, "role": role, "status": status,
+                    "phase": phase, "operation_id": sequence,
+                    "connection_generation": generation,
+                    "duration_ms": max(0.0, (timing.phase_started - started) * 1000),
+                    "timings": timing.timings,
+                    "exception_type": type(failure).__name__ if failure else None,
+                    "connection_in_transaction": (
+                        bool(self._conn.in_transaction) if self._conn is not None else None
+                    ),
+                    "poisoned": self._poisoned,
+                    "capture_limit_reached": sequence == 256,
+                },
+            })
 
     @contextlib.contextmanager
     def _observe_operation(self, operation: str) -> Iterator[None]:
@@ -2344,6 +2508,12 @@ class SessionStorage:
                 "session_storage.rollback_failed operation=%s error=%s",
                 operation,
                 type(exc).__name__,
+                extra={"_opensquilla_log_metadata": {
+                    "event": "session_storage.rollback_failed",
+                    "operation": operation,
+                    "exception_type": type(exc).__name__,
+                    "phase": "rollback",
+                }},
             )
             await self._retire_poisoned_connection()
             raise StorageConnectionPoisonedError(
@@ -2354,6 +2524,12 @@ class SessionStorage:
                 "session_storage.rollback_failed operation=%s error=%s",
                 operation,
                 type(exc).__name__,
+                extra={"_opensquilla_log_metadata": {
+                    "event": "session_storage.rollback_failed",
+                    "operation": operation,
+                    "exception_type": type(exc).__name__,
+                    "phase": "rollback",
+                }},
             )
             await self._retire_poisoned_connection()
             raise StorageConnectionPoisonedError(
@@ -2442,30 +2618,39 @@ class SessionStorage:
         budget = self._busy_budget_seconds if budget_seconds is None else budget_seconds
         deadline = started + max(0.0, budget)
         acquired = False
-        try:
-            remaining = max(0.0, deadline - self._monotonic())
+        with self._transaction_diagnostics(operation, "write") as timing:
             try:
-                # asyncio.timeout(0) still permits an uncontended Lock.acquire
-                # to complete synchronously, while refusing to queue behind an
-                # existing holder or waiter once the budget is exhausted.
-                async with asyncio.timeout(remaining):
-                    await self._operation_lock.acquire()
-            except TimeoutError as exc:
-                raise self._operation_busy_error(operation, started) from exc
-            acquired = True
-            self._raise_if_poisoned()
-            conn = self.conn
-            with self._observe_operation(operation):
-                await self._begin_immediate(conn, operation, deadline, started)
+                remaining = max(0.0, deadline - self._monotonic())
                 try:
-                    yield conn
-                    await self._commit_transaction(conn, operation, deadline, started)
-                except BaseException:
-                    await self._rollback_transaction(conn, operation)
-                    raise
-        finally:
-            if acquired:
-                self._operation_lock.release()
+                    # asyncio.timeout(0) still permits an uncontended Lock.acquire
+                    # to complete synchronously, while refusing to queue behind an
+                    # existing holder or waiter once the budget is exhausted.
+                    async with asyncio.timeout(remaining):
+                        await self._operation_lock.acquire()
+                except TimeoutError as exc:
+                    raise self._operation_busy_error(operation, started) from exc
+                acquired = True
+                if timing is not None:
+                    timing.advance("begin_await_ms")
+                self._raise_if_poisoned()
+                conn = self.conn
+                with self._observe_operation(operation):
+                    await self._begin_immediate(conn, operation, deadline, started)
+                    try:
+                        if timing is not None:
+                            timing.advance("body_ms")
+                        yield conn
+                        if timing is not None:
+                            timing.advance("commit_await_ms")
+                        await self._commit_transaction(conn, operation, deadline, started)
+                    except BaseException:
+                        if timing is not None:
+                            timing.advance("rollback_await_ms")
+                        await self._rollback_transaction(conn, operation)
+                        raise
+            finally:
+                if acquired:
+                    self._operation_lock.release()
 
     @property
     def connection_generation(self) -> int:
@@ -2486,15 +2671,23 @@ class SessionStorage:
         """
 
         qualified_operation = f"read.{operation}"
-        async with self._operation_lock:
-            self._raise_if_poisoned()
-            conn = self.conn
-            try:
-                await self._finish_sqlite_call(conn.execute("BEGIN"))
-                yield conn
-            finally:
-                if bool(getattr(conn, "in_transaction", False)):
-                    await self._rollback_transaction(conn, qualified_operation)
+        with self._transaction_diagnostics(qualified_operation, "read") as timing:
+            async with self._operation_lock:
+                if timing is not None:
+                    timing.advance("begin_await_ms")
+                self._raise_if_poisoned()
+                conn = self.conn
+                with self._observe_operation(qualified_operation):
+                    try:
+                        await self._finish_sqlite_call(conn.execute("BEGIN"))
+                        if timing is not None:
+                            timing.advance("body_ms")
+                        yield conn
+                    finally:
+                        if bool(getattr(conn, "in_transaction", False)):
+                            if timing is not None:
+                                timing.advance("rollback_await_ms")
+                            await self._rollback_transaction(conn, qualified_operation)
 
     async def _initialize_schema(
         self,
@@ -2541,6 +2734,10 @@ class SessionStorage:
         await self._conn.execute(_CREATE_AGENT_TASKS)
         await self._conn.execute(_CREATE_IDX_AGENT_TASKS_SESSION_STATUS)
         await self._conn.execute(_CREATE_IDX_AGENT_TASKS_STATUS_UPDATED)
+        await self._conn.execute(_CREATE_ACTIVATION_PERMITS)
+        await self._conn.execute(_CREATE_IDX_ACTIVATION_PERMITS_STATE)
+        await self._conn.execute(_CREATE_SESSION_READ_RECOVERY_RECEIPTS)
+        await self._conn.execute(_CREATE_IDX_SESSION_READ_RECOVERY_RECEIPTS_SESSION)
         await self._conn.execute(_CREATE_TURN_INGRESS_RECEIPTS)
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_REQUEST)
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_ACCEPTED_SESSION)
@@ -2556,14 +2753,6 @@ class SessionStorage:
         await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_REQUEST)
         await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_MESSAGE)
         await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_SESSION)
-        await self._conn.execute(_CREATE_META_CONTROL_INTENTS)
-        await self._conn.execute(_CREATE_IDX_META_CONTROL_CORRELATION)
-        await self._conn.execute(_CREATE_IDX_META_CONTROL_SESSION_STATUS)
-        await self._conn.execute(_CREATE_META_LAUNCH_DRAFTS)
-        await self._conn.execute(_CREATE_IDX_META_LAUNCH_DRAFT_REQUEST)
-        await self._conn.execute(_CREATE_IDX_META_LAUNCH_DRAFT_SESSION_EXPIRY)
-        await self._conn.execute(_CREATE_META_LAUNCH_DISCARD_TOMBSTONES)
-        await self._conn.execute(_CREATE_IDX_META_LAUNCH_DISCARD_TOMBSTONES_EXPIRY)
         await self._conn.execute(_CREATE_MEMORY_DURABLE_RECEIPTS)
         await self._conn.execute(_CREATE_IDX_MEMORY_DURABLE_RECEIPTS_SESSION)
         await self._conn.execute(_CREATE_TELEMETRY_DAILY_USAGE)
@@ -2594,7 +2783,7 @@ class SessionStorage:
         await self._conn.execute(_CREATE_TRANSCRIPT_FTS)
         await self._conn.execute(_CREATE_FTS_TRIGGER_INSERT)
         await self._conn.execute(_CREATE_FTS_TRIGGER_DELETE)
-        await self._conn.execute(_CREATE_FTS_TRIGGER_UPDATE)
+        await self._migrate_transcript_fts_update_trigger()
         # Hard DB-level guarantee: epoch can never decrease via UPDATE.
         await self._conn.execute(_CREATE_EPOCH_ROLLBACK_TRIGGER)
         await self._conn.commit()
@@ -2607,11 +2796,16 @@ class SessionStorage:
         await self._migrate_derived_title_column()
         await self._migrate_transcript_reasoning_content_column()
         await self._migrate_assistant_replay_column()
+        await self._migrate_transcript_content_byte_length_column()
+        await self._migrate_transcript_content_revision_column()
+        await self._conn.execute(_CREATE_IDX_TRANSCRIPT_TITLE_CANDIDATES)
+        await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_TITLE_CANDIDATES)
         await self._migrate_transcript_turn_usage_column()
         await self._migrate_transcript_turn_context_column()
         await self._migrate_summary_metadata_columns()
         await self._migrate_memory_durable_receipt_coverage_columns()
         await self._retire_legacy_memory_flush_metadata()
+        await self._retire_product_features()
         await self._conn.execute(_CREATE_IDX_MEMORY_DURABLE_RECEIPTS_COVERAGE)
         # Recency index for list_sessions / title search. Guarded on the column
         # because a very old (pre-updated_at) sessions table can survive here
@@ -2620,14 +2814,6 @@ class SessionStorage:
             session_columns = {row[1] for row in await cur.fetchall()}
         if "updated_at" in session_columns:
             await self._conn.execute(_CREATE_IDX_SESSIONS_UPDATED)
-        # Launch drafts contain raw user prompts. Enforce their seven-day
-        # retention at every process start even when nobody stages or lists a
-        # new draft after the old rows expire.
-        await self._purge_expired_meta_launch_drafts(
-            self._conn,
-            now_ms=_now_ms(),
-            limit=_META_LAUNCH_DRAFT_GC_BATCH,
-        )
         if "workspace_id" in session_columns:
             await self._conn.execute(_CREATE_IDX_SESSIONS_WORKSPACE)
         await self._conn.commit()
@@ -2658,9 +2844,11 @@ class SessionStorage:
             if self._usage_backfill_indexes_ready:
                 return
             statements = (
+                # Live provider reservations also use this identity lookup.
+                # Keep it usable if a later historical index is interrupted.
+                _CREATE_IDX_SESSIONS_ID_KEY,
                 _CREATE_IDX_TRANSCRIPT_USAGE_BACKFILL,
                 _CREATE_IDX_COMPACTED_USAGE_BACKFILL,
-                _CREATE_IDX_SESSIONS_ID_KEY,
             )
             if self._db_path == ":memory:":
                 async with self._operation_lock:
@@ -2682,6 +2870,74 @@ class SessionStorage:
                 finally:
                     await connection.close()
             self._usage_backfill_indexes_ready = True
+
+    async def backfill_transcript_content_lengths(
+        self,
+        *,
+        batch_size: int = 4,
+        max_batches: int | None = None,
+    ) -> int:
+        """Index legacy transcript byte lengths after core readiness.
+
+        The scan uses a short-lived independent SQLite connection and tiny
+        keyset batches.  It therefore never acquires the shared interactive
+        transcript reader lock, and cancellation/restart is safe: rows remain
+        NULL until their own atomic update commits and are picked up again.
+        """
+
+        if self._db_path == ":memory:":
+            return 0
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        batch_size = min(batch_size, 32)
+        if max_batches is not None and (
+            isinstance(max_batches, bool) or not isinstance(max_batches, int) or max_batches < 0
+        ):
+            raise ValueError("max_batches must be non-negative or None")
+
+        connection = await aiosqlite.connect(
+            self._db_path,
+            isolation_level=None,
+            timeout=_SQLITE_STARTUP_BUSY_TIMEOUT_SECONDS,
+        )
+        connection.row_factory = aiosqlite.Row
+        total = 0
+        batches = 0
+        try:
+            for table in ("transcript_entries", "compacted_transcript_entries"):
+                last_id = 0
+                while max_batches is None or batches < max_batches:
+                    async with connection.execute(
+                        f"SELECT id, length(CAST(content AS BLOB)) AS byte_length "
+                        f"FROM {table} "
+                        "WHERE content_byte_length IS NULL AND id > ? "
+                        "ORDER BY id ASC LIMIT ?",
+                        (last_id, batch_size),
+                    ) as cursor:
+                        rows = await cursor.fetchall()
+                    if not rows:
+                        break
+                    await connection.execute("BEGIN")
+                    try:
+                        for row in rows:
+                            await connection.execute(
+                                f"UPDATE {table} SET content_byte_length = ? "
+                                "WHERE id = ? AND content_byte_length IS NULL",
+                                (max(0, int(row["byte_length"] or 0)), int(row["id"])),
+                            )
+                        await connection.commit()
+                    except BaseException:
+                        await connection.rollback()
+                        raise
+                    last_id = int(rows[-1]["id"])
+                    total += len(rows)
+                    batches += 1
+                    await asyncio.sleep(0)
+                if max_batches is not None and batches >= max_batches:
+                    break
+        finally:
+            await connection.close()
+        return total
 
     async def ensure_daily_usage_store_id(self) -> str:
         """Keep upload deduplication scoped to this database, including after moves.
@@ -2941,6 +3197,101 @@ class SessionStorage:
         if changed:
             await self._conn.commit()
 
+    async def _migrate_transcript_content_byte_length_column(self) -> None:
+        """Add nullable persisted byte-length metadata without scanning bodies.
+
+        Existing rows intentionally remain NULL.  A post-ready backfill fills
+        them in small, restartable batches; startup must never walk legacy
+        transcript BLOBs while the Gateway is becoming ready.
+        """
+
+        assert self._conn is not None
+        changed = False
+        for table in ("transcript_entries", "compacted_transcript_entries"):
+            async with self._conn.execute(f"PRAGMA table_info({table})") as cur:
+                columns = {row[1] for row in await cur.fetchall()}
+            if "content_byte_length" not in columns:
+                await self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN content_byte_length INTEGER"
+                )
+                changed = True
+        if changed:
+            await self._conn.commit()
+
+    async def _migrate_transcript_fts_update_trigger(self) -> None:
+        """Upgrade only the trigger definition, without rebuilding the FTS index.
+
+        Revision maintenance writes metadata on the same row. A broad AFTER
+        UPDATE trigger can then delete the replacement's terms twice. Restrict
+        FTS work to actual indexed-content/row-identity changes instead.
+        """
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'transcript_fts_au'"
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        def normalized(sql: str) -> str:
+            return " ".join(sql.upper().replace("IF NOT EXISTS ", "").split())
+
+        if row is not None and normalized(str(row[0])) == normalized(_CREATE_FTS_TRIGGER_UPDATE):
+            return
+        await self._conn.execute("SAVEPOINT transcript_fts_update_upgrade")
+        try:
+            await self._conn.execute("DROP TRIGGER IF EXISTS transcript_fts_au")
+            await self._conn.execute(_CREATE_FTS_TRIGGER_UPDATE)
+            await self._conn.execute("RELEASE SAVEPOINT transcript_fts_update_upgrade")
+        except BaseException:
+            with contextlib.suppress(BaseException):
+                await self._conn.execute("ROLLBACK TO SAVEPOINT transcript_fts_update_upgrade")
+                await self._conn.execute("RELEASE SAVEPOINT transcript_fts_update_upgrade")
+            raise
+
+    async def _migrate_transcript_content_revision_column(self) -> None:
+        """Add a cheap row revision and fence same-length body replacements.
+
+        The range reader must not hash a multi-megabyte SQLite body on every
+        request.  A trigger increments this metadata whenever the body changes;
+        the content reference then carries the row id/revision/length tuple.
+        """
+
+        assert self._conn is not None
+        for table in ("transcript_entries", "compacted_transcript_entries"):
+            async with self._conn.execute(f"PRAGMA table_info({table})") as cur:
+                columns = {row[1] for row in await cur.fetchall()}
+            if "content_revision" not in columns:
+                await self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN content_revision INTEGER NOT NULL DEFAULT 0"
+                )
+            trigger = f"trg_{table}_content_revision"
+            await self._conn.execute(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS {trigger}
+                AFTER UPDATE OF content ON {table}
+                WHEN NOT (NEW.content IS OLD.content)
+                BEGIN
+                    UPDATE {table}
+                    SET content_revision = OLD.content_revision + 1
+                    WHERE id = NEW.id;
+                END
+                """
+            )
+            await self._conn.execute(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS trg_{table}_details_revision
+                AFTER UPDATE OF reasoning_content, tool_calls, turn_context ON {table}
+                WHEN NOT (NEW.reasoning_content IS OLD.reasoning_content)
+                  OR NOT (NEW.tool_calls IS OLD.tool_calls)
+                  OR NOT (NEW.turn_context IS OLD.turn_context)
+                BEGIN
+                    UPDATE {table}
+                    SET content_revision = OLD.content_revision + 1
+                    WHERE id = NEW.id;
+                END
+                """
+            )
+        await self._conn.commit()
+
     async def _migrate_transcript_turn_usage_column(self) -> None:
         """Idempotently add per-turn usage metadata storage to transcripts."""
         assert self._conn is not None
@@ -3035,6 +3386,29 @@ class SessionStorage:
                 changed = True
         if changed:
             await self._conn.commit()
+
+    async def _retire_product_features(self) -> None:
+        """Run the same bounded retirement used by the versioned upgrade."""
+        from opensquilla.persistence.product_retirement import (
+            LEGACY_TABLES_SQL,
+            RETIREMENT_COLUMN_TABLES,
+            product_retirement_statements,
+        )
+
+        async with self.conn.execute(LEGACY_TABLES_SQL) as cur:
+            tables = {row[0]: row[1] for row in await cur.fetchall()}
+        if not tables:
+            return
+        async with self._write_transaction("retire_product_features") as conn:
+            async with conn.execute(LEGACY_TABLES_SQL) as cur:
+                tables = {row[0]: row[1] for row in await cur.fetchall()}
+            columns: dict[str, set[str]] = {}
+            for table in RETIREMENT_COLUMN_TABLES:
+                if table in tables:
+                    async with conn.execute(f'PRAGMA table_info("{table}")') as cur:
+                        columns[table] = {row[1] for row in await cur.fetchall()}
+            for statement in product_retirement_statements(tables, columns=columns):
+                await conn.execute(statement)
 
     async def _retire_legacy_memory_flush_metadata(self) -> None:
         """Converge direct legacy opens using the versioned upgrade's SQL plan."""
@@ -5617,9 +5991,15 @@ class SessionStorage:
                 material_cleanups.append(await self._prepare_deleted_session_cleanup(conn, session))
                 await self._delete_session_rows(conn, session)
 
+        cancellation: asyncio.CancelledError | None = None
         for session, cleanup in zip(deleted, material_cleanups, strict=True):
             try:
                 await self._cleanup_deleted_session(session, cleanup)
+            except asyncio.CancelledError as exc:
+                # Shutdown can cancel this child directly, bypassing the public
+                # shield. Its current worker has drained; finish the committed
+                # batch before propagating cancellation.
+                cancellation = cancellation or exc
             except Exception:  # noqa: BLE001 - the database commit is authoritative.
                 log.warning(
                     "project_workspace.session_cleanup_failed "
@@ -5628,6 +6008,8 @@ class SessionStorage:
                     session.session_key,
                     exc_info=True,
                 )
+        if cancellation is not None:
+            raise cancellation
         return [session.session_key for session in deleted]
 
     async def delete_project_workspace_sessions(
@@ -5895,8 +6277,15 @@ class SessionStorage:
             limit,
             offset,
         ]
+        query_started = self._monotonic()
         async with self.conn.execute(sql, query_params) as cur:
             rows = await cur.fetchall()
+        _log_read_path_timing(
+            operation="sessions_list_legacy",
+            query_ms=max(0, int((self._monotonic() - query_started) * 1000)),
+            rows=len(rows),
+            sql_tag=_read_path_sql_tag(sql),
+        )
         return [SessionNode(**_deserialize_row(dict(r))) for r in rows]
 
     @_serialized_read
@@ -5983,8 +6372,15 @@ class SessionStorage:
             *cursor_params,
             page_limit + 1,
         ]
+        query_started = self._monotonic()
         async with self.conn.execute(sql, query_params) as cur:
             rows = await cur.fetchall()
+        _log_read_path_timing(
+            operation="sessions_list_page",
+            query_ms=max(0, int((self._monotonic() - query_started) * 1000)),
+            rows=len(rows),
+            sql_tag=_read_path_sql_tag(sql),
+        )
 
         has_more = len(rows) > page_limit
         page_rows = rows[:page_limit]
@@ -6039,7 +6435,7 @@ class SessionStorage:
             "DELETE FROM session_context_states WHERE session_key = ?",
             (session.session_key,),
         )
-        for table in ("router_decisions", "turn_errors"):
+        for table in ("router_decisions", "turn_errors", "retired_meta_skill_runs"):
             async with conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
                 (table,),
@@ -6115,38 +6511,12 @@ class SessionStorage:
 
         await run_session_material_cleanup(session.session_id, session.session_key, cleanup)
 
-        # G4 cleanup: cascade meta-skill audit rows for this session. The
-        # sessions table is created lazily at runtime (not via yoyo), so
-        # there is no SQL FK to rely on — explicit purge is required.
-        if self._meta_run_writer is not None:
-            try:
-                # The writer commits synchronously (busy_timeout=5000); keep the
-                # delete off the event loop like every other writer call site.
-                await asyncio.to_thread(
-                    self._meta_run_writer.purge_for_session,
-                    session.session_key,
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warning("session_delete.purge_meta_runs_failed: %s", exc)
 
     async def delete_session(self, session_key: str) -> None:
         session_key = canonicalize_session_key(session_key)
         session: SessionNode | None = None
         cleanup = None
         async with self._write_transaction("delete_session") as conn:
-            # Controls and drafts can exist on a provisional key before the
-            # first accepted turn creates a sessions row. Fence those request
-            # identities even when there is no session left to delete.
-            await self._tombstone_meta_launches_for_boundary(
-                conn,
-                session_key=session_key,
-                now_ms=_now_ms(),
-                intent_statuses=("staged", "accepted"),
-            )
-            await conn.execute(
-                "DELETE FROM meta_launch_drafts WHERE session_key = ?",
-                (session_key,),
-            )
             await conn.execute(
                 "DELETE FROM pending_chat_inputs WHERE session_key = ?",
                 (session_key,),
@@ -6159,10 +6529,6 @@ class SessionStorage:
                 "DELETE FROM pending_chat_input_dispatch_receipts WHERE session_key = ?",
                 (session_key,),
             )
-            await conn.execute(
-                "DELETE FROM meta_control_intents WHERE session_key = ?",
-                (session_key,),
-            )
             async with conn.execute(
                 "SELECT * FROM sessions WHERE session_key = ?", (session_key,)
             ) as cursor:
@@ -6172,7 +6538,6 @@ class SessionStorage:
                 cleanup = await self._prepare_deleted_session_cleanup(conn, session)
                 await self._delete_session_rows(conn, session)
 
-        _clear_pending_meta_launch_boundary(session_key)
         if session is None:
             return
         await self._cleanup_deleted_session(session, cleanup)
@@ -6193,8 +6558,17 @@ class SessionStorage:
                 material_cleanups.append(await self._prepare_deleted_session_cleanup(conn, session))
                 await self._delete_session_rows(conn, session)
                 deleted.append(session)
+        cancellation: asyncio.CancelledError | None = None
         for session, cleanup in zip(deleted, material_cleanups, strict=True):
-            await self._cleanup_deleted_session(session, cleanup)
+            try:
+                await self._cleanup_deleted_session(session, cleanup)
+            except asyncio.CancelledError as exc:
+                # The material hook drains its current worker before raising.
+                # Every row in this batch is already deleted; finish the other
+                # cleanup attempts before propagating the first cancellation.
+                cancellation = cancellation or exc
+        if cancellation is not None:
+            raise cancellation
         return deleted
 
     async def prune_stale_sessions(self, before_ms: int) -> int:
@@ -6250,14 +6624,7 @@ class SessionStorage:
             return int(row[0])
 
     async def advance_reset_epoch(self, session_key: str) -> int:
-        """Fence a same-key reset and invalidate its unaccepted MetaSkill controls.
-
-        The epoch transition and staged-control deletion share one transaction,
-        so another client retaining an old hidden control can never observe the
-        new epoch while its pre-reset authorization is still consumable. Recent
-        accepted browser coordinates are also fenced against stale outbox
-        retries; their intent rows remain immutable history.
-        """
+        """Advance the durable epoch to fence work accepted before a reset."""
 
         session_key = canonicalize_session_key(session_key)
         async with self._write_transaction("advance_reset_epoch") as conn:
@@ -6275,22 +6642,7 @@ class SessionStorage:
                 conn,
                 session_key=session_key,
             )
-            await self._tombstone_meta_launches_for_boundary(
-                conn,
-                session_key=session_key,
-                now_ms=_now_ms(),
-                intent_statuses=("staged", "accepted"),
-            )
-            await conn.execute(
-                "DELETE FROM meta_control_intents WHERE session_key = ? AND status = 'staged'",
-                (session_key,),
-            )
-            await conn.execute(
-                "DELETE FROM meta_launch_drafts WHERE session_key = ?",
-                (session_key,),
-            )
             new_epoch = int(row[0])
-        _clear_pending_meta_launch_boundary(session_key)
         return new_epoch
 
     @_serialized_read
@@ -8641,7 +8993,7 @@ class SessionStorage:
         expected: ExpectedGoal,
         expected_continuation_seq: int,
         task_record: AgentTaskRecord,
-        max_turns: int = 50,
+        max_turns: int = 256,
         runtime_budget_seconds: int = 3_600,
         workspace_guard: ProjectWorkspaceGuard | None = None,
         now_ms: int | None = None,
@@ -9095,34 +9447,6 @@ class SessionStorage:
             assert updated is not None
             return updated
 
-    async def update_goal_progress(
-        self,
-        context: GoalTurnContext,
-        *,
-        explanation: object | None,
-        steps: object,
-        now_ms: int | None = None,
-    ) -> GoalRecord:
-        """Compatibility adapter to the single ordinary task progress authority."""
-        goal = await self.get_goal_by_id(context.goal_id)
-        if goal is None:
-            raise GoalConflictError("GOAL_NOT_FOUND", "The Goal no longer exists")
-        progress = normalize_goal_progress(explanation=explanation, steps=steps)
-        await self.update_task_progress(
-            context.task_id,
-            session_key=goal.session_key,
-            session_id=context.session_id,
-            session_epoch=context.epoch,
-            steps=progress["steps"],
-            explanation=progress["explanation"],
-            goal_context=context,
-            now_ms=now_ms,
-        )
-        updated = await self.get_goal_by_id(context.goal_id)
-        if updated is None:
-            raise GoalConflictError("GOAL_NOT_FOUND", "The Goal no longer exists")
-        return updated
-
     @staticmethod
     async def _turn_usage_totals_on_conn(
         conn: Any,
@@ -9426,7 +9750,7 @@ class SessionStorage:
                     int(task.finished_at if task.finished_at is not None else timestamp)
                     - task.started_at,
                 )
-            await conn.execute(
+            async with conn.execute(
                 """
                 UPDATE agent_tasks
                 SET status = ?, terminal_reason = ?, updated_at = ?,
@@ -9442,7 +9766,34 @@ class SessionStorage:
                     AgentTaskStatus.QUEUED.value,
                     AgentTaskStatus.RUNNING.value,
                 ),
-            )
+            ) as task_update:
+                task_changed = (task_update.rowcount or 0) == 1
+            if task_changed:
+                # Activation can fail after admission has created the
+                # resident lease but before the runtime crosses the
+                # provider-owned boundary.  Settle that durable ownership
+                # projection in the same writer transaction as the task
+                # transition.  This also applies when the Goal CAS below
+                # loses a race to pause/replace the Goal: task ownership is
+                # independent of Goal accounting and must not remain held.
+                details = dict(task_details)
+                owner = dict(details.get("admission_owner") or {})
+                if owner:
+                    owner.update(
+                        {
+                            "resident_lease": "released",
+                            "compute_lease": (
+                                "released" if task.started_at is not None else "not_acquired"
+                            ),
+                            "settlement": "settled",
+                        }
+                    )
+                    details["admission_owner"] = owner
+                    details.pop("cancellation_requested", None)
+                    await conn.execute(
+                        "UPDATE agent_tasks SET details = ?, updated_at = ? WHERE task_id = ?",
+                        (_serialize(details), timestamp, context.task_id),
+                    )
             goal = await self._select_goal_on_conn(conn, goal_id=context.goal_id)
             if (
                 goal is None
@@ -9659,6 +10010,383 @@ class SessionStorage:
             await self._insert_agent_task(conn, task)
         return task
 
+    @staticmethod
+    def _activation_permit_from_row(row: Any) -> ActivationPermit:
+        return ActivationPermit(
+            permit_id=str(row["permit_id"]),
+            task_id=str(row["task_id"]),
+            session_key=str(row["session_key"]),
+            session_id=str(row["session_id"]),
+            session_epoch=int(row["session_epoch"]),
+            authorization_revision=int(row["authorization_revision"]),
+            permission_fingerprint=str(row["permission_fingerprint"]),
+            state=str(row["state"]),
+            created_at=int(row["created_at"]),
+            expires_at=(int(row["expires_at"]) if row["expires_at"] is not None else None),
+            activated_at=(int(row["activated_at"]) if row["activated_at"] is not None else None),
+            released_at=(int(row["released_at"]) if row["released_at"] is not None else None),
+            schema_version=int(row["schema_version"]),
+        )
+
+    async def claim_activation_permit(
+        self,
+        task_id: str,
+        *,
+        session_key: str,
+        session_id: str,
+        session_epoch: int,
+        authorization_revision: int,
+        permission_fingerprint: str,
+        expires_at: int | None = None,
+    ) -> ActivationPermit:
+        """Claim the provider-dispatch boundary in the same SQLite writer txn.
+
+        This is deliberately stricter than ``get_agent_task`` followed by an
+        update: the task must still be QUEUED and its durable ``sessions`` row
+        must have the exact admitted ``session_id``/``epoch``.  The unique task
+        key makes retries idempotent only when every authority coordinate is
+        identical.  A missing/changed coordinate is a conflict and therefore
+        cannot silently turn into a provider call.
+        """
+        session_key = canonicalize_session_key(session_key)
+        if not task_id or not isinstance(session_id, str) or not session_id:
+            raise ValueError("activation permit requires task and session identity")
+        if (
+            isinstance(session_epoch, bool)
+            or not isinstance(session_epoch, int)
+            or session_epoch < 0
+        ):
+            raise ValueError("activation permit session_epoch must be non-negative")
+        if (
+            isinstance(authorization_revision, bool)
+            or not isinstance(authorization_revision, int)
+            or authorization_revision < 0
+        ):
+            raise ValueError("activation permit authorization_revision must be non-negative")
+        if not isinstance(permission_fingerprint, str) or not permission_fingerprint:
+            raise ValueError("activation permit permission_fingerprint must be non-empty")
+        if expires_at is not None and (
+            isinstance(expires_at, bool) or not isinstance(expires_at, int) or expires_at <= 0
+        ):
+            raise ValueError("activation permit expires_at must be a positive timestamp")
+        now = _now_ms()
+        expired_conflict = False
+        async with self._write_transaction("claim_activation_permit") as conn:
+            async with conn.execute(
+                "SELECT * FROM agent_tasks WHERE task_id = ? AND session_key = ?",
+                (task_id, session_key),
+            ) as cur:
+                task_row = await cur.fetchone()
+            if task_row is None or str(task_row["status"]) != AgentTaskStatus.QUEUED.value:
+                raise ActivationPermitConflictError(
+                    "activation requires the exact queued task"
+                )
+            task_details = _deserialize_row({"details": task_row["details"]}).get("details")
+            authority = (
+                task_details.get("activation_authority") if isinstance(task_details, dict) else None
+            )
+            if not isinstance(authority, Mapping):
+                raise ActivationPermitConflictError(
+                    "activation authority snapshot is unavailable"
+                )
+            if (
+                authority.get("session_id") != session_id
+                or authority.get("session_epoch") != session_epoch
+                or authority.get("authorization_revision") != authorization_revision
+                or authority.get("permission_fingerprint") != permission_fingerprint
+            ):
+                raise ActivationPermitConflictError(
+                    "activation authority snapshot changed"
+                )
+            # Named-token authority is re-read from the same sessions.db
+            # writer transaction as the permit CAS.  A revoke (or a future
+            # permission update) racing the queue must therefore prevent the
+            # provider boundary even when the ingress snapshot was valid when
+            # it was captured.
+            if authority.get("authority_kind") == "named_token":
+                public_id = authority.get("token_public_id")
+                if not isinstance(public_id, str) or not public_id:
+                    raise ActivationPermitConflictError(
+                        "named-token activation authority is incomplete"
+                    )
+                async with conn.execute(
+                    "SELECT roles_json, scopes_json, capabilities_json, "
+                    "authorization_revision FROM sandbox_tokens "
+                    "WHERE public_id = ? AND revoked_at IS NULL",
+                    (public_id,),
+                ) as cur:
+                    token_row = await cur.fetchone()
+                if token_row is None:
+                    raise ActivationPermitConflictError(
+                        "named-token authorization is no longer active"
+                    )
+                try:
+                    token_sets = {
+                        name: sorted(
+                            str(value)
+                            for value in json.loads(str(token_row[f"{name}_json"] or "[]"))
+                        )
+                        for name in ("roles", "scopes", "capabilities")
+                    }
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ActivationPermitConflictError(
+                        "named-token authorization is malformed"
+                    ) from exc
+                token_fingerprint = hashlib.sha256(
+                    json.dumps(
+                        token_sets,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+                if (
+                    int(token_row["authorization_revision"]) != authorization_revision
+                    or token_fingerprint != permission_fingerprint
+                ):
+                    raise ActivationPermitConflictError(
+                        "named-token authorization changed before activation"
+                    )
+            invalidation = (
+                task_details.get("activation_invalidation")
+                if isinstance(task_details, Mapping)
+                else None
+            )
+            if isinstance(invalidation, Mapping):
+                replaced_epoch = invalidation.get("replaced_session_epoch")
+                replacement_session_id = invalidation.get("replacement_session_id")
+                replacement_epoch = invalidation.get("replacement_session_epoch")
+                if (
+                    invalidation.get("kind") == "session_reset"
+                    and invalidation.get("replaced_session_id") == session_id
+                    and not isinstance(replaced_epoch, bool)
+                    and replaced_epoch == session_epoch
+                    and isinstance(replacement_session_id, str)
+                    and replacement_session_id
+                    and replacement_session_id != session_id
+                    and not isinstance(replacement_epoch, bool)
+                    and isinstance(replacement_epoch, int)
+                    and replacement_epoch > session_epoch
+                ):
+                    raise ActivationPermitConflictError(
+                        "activation was invalidated by a session reset",
+                        reason=ActivationPermitConflictReason.SESSION_RESET_INVALIDATED,
+                    )
+            if not await _matches_session_owner_on_conn(
+                conn,
+                session_key=session_key,
+                session_id=session_id,
+                session_epoch=session_epoch,
+            ):
+                raise ActivationPermitConflictError(
+                    "activation session owner generation changed"
+                )
+            async with conn.execute(
+                "SELECT * FROM activation_permits WHERE task_id = ?",
+                (task_id,),
+            ) as cur:
+                existing = await cur.fetchone()
+            if existing is not None:
+                permit = self._activation_permit_from_row(existing)
+                if (
+                    permit.state == "active"
+                    and permit.expires_at is not None
+                    and permit.expires_at <= now
+                ):
+                    await conn.execute(
+                        "UPDATE activation_permits SET state = 'expired', released_at = ? "
+                        "WHERE permit_id = ? AND state = 'active'",
+                        (now, permit.permit_id),
+                    )
+                    expired_conflict = True
+                elif (
+                    permit.state == "active"
+                    and permit.session_key == session_key
+                    and permit.session_id == session_id
+                    and permit.session_epoch == session_epoch
+                    and permit.authorization_revision == authorization_revision
+                    and permit.permission_fingerprint == permission_fingerprint
+                ):
+                    return permit
+                else:
+                    raise ActivationPermitConflictError(
+                        "activation permit already exists with a different authority snapshot"
+                    )
+            if expired_conflict:
+                # Commit the state transition before reporting the conflict;
+                # raising inside _write_transaction would roll it back.
+                pass
+            else:
+                permit_id = secrets.token_hex(16)
+                await conn.execute(
+                    """
+                    INSERT INTO activation_permits (
+                        permit_id, task_id, session_key, session_id, session_epoch,
+                        authorization_revision, permission_fingerprint, state,
+                        created_at, expires_at, activated_at, released_at, schema_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, NULL, 1)
+                    """,
+                    (
+                        permit_id,
+                        task_id,
+                        session_key,
+                        session_id,
+                        session_epoch,
+                        authorization_revision,
+                        permission_fingerprint,
+                        now,
+                        expires_at,
+                        now,
+                    ),
+                )
+                async with conn.execute(
+                    "SELECT * FROM activation_permits WHERE permit_id = ?",
+                    (permit_id,),
+                ) as cur:
+                    row = await cur.fetchone()
+                assert row is not None
+                result = self._activation_permit_from_row(row)
+        if expired_conflict:
+            raise ActivationPermitConflictError("activation permit has expired")
+        return result
+
+    async def get_activation_permit(self, task_id: str) -> ActivationPermit | None:
+        async with self.conn.execute(
+            "SELECT * FROM activation_permits WHERE task_id = ?", (task_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return self._activation_permit_from_row(row) if row is not None else None
+
+    async def release_activation_permit(
+        self,
+        task_id: str,
+        *,
+        session_key: str,
+        state: str = "released",
+    ) -> ActivationPermit | None:
+        """Release an active permit exactly once after terminal settlement."""
+        if state not in {"released", "expired"}:
+            raise ValueError("activation permit release state is invalid")
+        session_key = canonicalize_session_key(session_key)
+        now = _now_ms()
+        async with self._write_transaction("release_activation_permit") as conn:
+            await conn.execute(
+                """
+                UPDATE activation_permits
+                SET state = ?, released_at = ?
+                WHERE task_id = ? AND session_key = ? AND state = 'active'
+                """,
+                (state, now, task_id, session_key),
+            )
+            async with conn.execute(
+                "SELECT * FROM activation_permits WHERE task_id = ? AND session_key = ?",
+                (task_id, session_key),
+            ) as cur:
+                row = await cur.fetchone()
+        return self._activation_permit_from_row(row) if row is not None else None
+
+    async def upsert_session_read_recovery_receipt(
+        self, receipt: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Persist the authoritative result of one v2 read installation.
+
+        The recovery wire protocol is connection-scoped, but an installed
+        state must remain auditable after the socket or Gateway disappears.
+        This method stores only bounded coordinates and a canonical proof
+        document; it never writes replay payloads or a client-provided state.
+        """
+        required = (
+            "recovery_id", "session_key", "session_id", "session_epoch",
+            "connection_epoch", "subscription_epoch", "stream_generation",
+            "base_seq", "target_seq", "consumed_through_seq", "status",
+        )
+        missing = [name for name in required if name not in receipt]
+        if missing:
+            raise ValueError(
+                "session read recovery receipt missing " + ", ".join(missing)
+            )
+        recovery_id = str(receipt["recovery_id"])
+        if not recovery_id:
+            raise ValueError("session read recovery receipt id must not be empty")
+        proof = receipt.get("proof")
+        if not isinstance(proof, Mapping):
+            raise ValueError("session read recovery receipt proof must be an object")
+        proof_json = json.dumps(
+            dict(proof), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        now = _now_ms()
+        async with self._write_transaction("upsert_session_read_recovery_receipt") as conn:
+            await conn.execute(
+                """
+                INSERT INTO session_read_recovery_receipts (
+                    recovery_id, session_key, session_id, session_epoch,
+                    connection_epoch, subscription_epoch, stream_generation,
+                    base_seq, target_seq, consumed_through_seq, status,
+                    proof_id, proof_json, created_at, updated_at, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(recovery_id) DO UPDATE SET
+                    session_key = excluded.session_key,
+                    session_id = excluded.session_id,
+                    session_epoch = excluded.session_epoch,
+                    connection_epoch = excluded.connection_epoch,
+                    subscription_epoch = excluded.subscription_epoch,
+                    stream_generation = excluded.stream_generation,
+                    base_seq = excluded.base_seq,
+                    target_seq = excluded.target_seq,
+                    consumed_through_seq = excluded.consumed_through_seq,
+                    status = excluded.status,
+                    proof_id = excluded.proof_id,
+                    proof_json = excluded.proof_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    recovery_id,
+                    str(receipt["session_key"]),
+                    str(receipt["session_id"]),
+                    int(receipt["session_epoch"]),
+                    str(receipt["connection_epoch"]),
+                    str(receipt["subscription_epoch"]),
+                    str(receipt["stream_generation"]),
+                    int(receipt["base_seq"]),
+                    int(receipt["target_seq"]),
+                    int(receipt["consumed_through_seq"]),
+                    str(receipt["status"]),
+                    (str(receipt["proof_id"]) if receipt.get("proof_id") is not None else None),
+                    proof_json,
+                    int(receipt.get("created_at") or now),
+                    now,
+                ),
+            )
+            async with conn.execute(
+                "SELECT * FROM session_read_recovery_receipts WHERE recovery_id = ?",
+                (recovery_id,),
+            ) as cur:
+                row = await cur.fetchone()
+        if row is None:  # pragma: no cover - SQLite write failure is raised above
+            raise RuntimeError("session read recovery receipt was not persisted")
+        result = dict(row)
+        result["proof"] = json.loads(str(result.pop("proof_json") or "{}"))
+        return result
+
+    @_serialized_read
+    async def get_session_read_recovery_receipt(
+        self, recovery_id: str,
+    ) -> dict[str, Any] | None:
+        if not isinstance(recovery_id, str) or not recovery_id:
+            return None
+        async with self.conn.execute(
+            "SELECT * FROM session_read_recovery_receipts WHERE recovery_id = ?",
+            (recovery_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["proof"] = json.loads(str(result.pop("proof_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result["proof"] = {}
+        return result
+
     @_serialized_read
     async def get_agent_task(self, task_id: str) -> AgentTaskRecord | None:
         async with self.conn.execute(
@@ -9711,7 +10439,7 @@ class SessionStorage:
         session_key = canonicalize_session_key(session_key)
         timestamp = _now_ms()
         async with self._write_transaction("fail_queued_agent_task_activation") as conn:
-            await conn.execute(
+            async with conn.execute(
                 """
                 UPDATE agent_tasks
                 SET status = ?, finished_at = ?, updated_at = ?,
@@ -9728,7 +10456,36 @@ class SessionStorage:
                     session_key,
                     AgentTaskStatus.QUEUED.value,
                 ),
-            )
+            ) as task_update:
+                task_changed = (task_update.rowcount or 0) == 1
+            if task_changed:
+                async with conn.execute(
+                    "SELECT details FROM agent_tasks WHERE task_id = ? AND session_key = ?",
+                    (task_id, session_key),
+                ) as details_cur:
+                    details_row = await details_cur.fetchone()
+                raw_details = (
+                    _deserialize_row({"details": details_row["details"]}).get("details")
+                    if details_row is not None
+                    else None
+                )
+                details = dict(raw_details) if isinstance(raw_details, dict) else {}
+                owner = dict(details.get("admission_owner") or {})
+                if owner:
+                    owner.update(
+                        {
+                            "resident_lease": "released",
+                            "compute_lease": "not_acquired",
+                            "settlement": "settled",
+                        }
+                    )
+                    details["admission_owner"] = owner
+                    details.pop("cancellation_requested", None)
+                    await conn.execute(
+                        "UPDATE agent_tasks SET details = ?, updated_at = ? "
+                        "WHERE task_id = ? AND session_key = ?",
+                        (_serialize(details), timestamp, task_id, session_key),
+                    )
             async with conn.execute(
                 "SELECT * FROM agent_tasks WHERE task_id = ? AND session_key = ?",
                 (task_id, session_key),
@@ -9746,7 +10503,6 @@ class SessionStorage:
         session_epoch: int,
         steps: list[dict[str, Any]],
         explanation: str | None = None,
-        goal_context: GoalTurnContext | None = None,
         now_ms: int | None = None,
     ) -> dict[str, Any]:
         """Replace descriptive progress on the live owning task, never its lifecycle."""
@@ -9754,7 +10510,7 @@ class SessionStorage:
             return await self._update_task_progress_on_conn(
                 conn, task_id, session_key=session_key, session_id=session_id,
                 session_epoch=session_epoch, steps=steps, explanation=explanation,
-                goal_context=goal_context, now_ms=now_ms,
+                now_ms=now_ms,
             )
 
     async def _update_task_progress_on_conn(
@@ -9767,32 +10523,11 @@ class SessionStorage:
         session_epoch: int,
         steps: list[dict[str, Any]],
         explanation: str | None = None,
-        goal_context: GoalTurnContext | None = None,
         now_ms: int | None = None,
     ) -> dict[str, Any]:
-        """Shared transaction body for current and compatibility progress controls."""
+        """Persist task progress and its Goal and PlanRun projections atomically."""
         progress = normalize_goal_progress(steps=steps, explanation=explanation)
         timestamp = _now_ms() if now_ms is None else now_ms
-        if goal_context is not None:
-            goal = await self._select_goal_on_conn(conn, goal_id=goal_context.goal_id)
-            if goal is None:
-                raise GoalConflictError("GOAL_NOT_FOUND", "The Goal no longer exists")
-            if (
-                goal.session_id != goal_context.session_id
-                or goal.session_epoch != goal_context.epoch
-                or goal.objective_revision != goal_context.objective_revision
-                or goal.active_task_id != task_id
-                or goal.status not in {GoalStatus.ACTIVE.value, GoalStatus.PAUSED.value}
-            ):
-                raise GoalConflictError(
-                    "STALE_GOAL", "The task no longer owns this Goal objective", current=goal
-                )
-            await self._require_persisted_goal_context_on_conn(
-                conn,
-                context=goal_context,
-                expected_session_key=session_key,
-                current=goal,
-            )
         if not await _matches_session_owner_on_conn(
             conn,
             session_key=session_key,
@@ -9865,8 +10600,20 @@ class SessionStorage:
             )
         return progress
 
-    async def update_agent_task(self, task_id: str, **fields: Any) -> AgentTaskRecord:
-        if not fields:
+    async def update_agent_task(
+        self,
+        task_id: str,
+        *,
+        details_patch: Mapping[str, Any] | None = None,
+        **fields: Any,
+    ) -> AgentTaskRecord:
+        """Publish task fields and an owned details patch in one writer transaction."""
+        if details_patch is not None:
+            if not isinstance(details_patch, Mapping):
+                raise TypeError("details_patch must be a mapping")
+            if "details" in fields:
+                raise ValueError("details and details_patch cannot be supplied together")
+        if not fields and details_patch is None:
             existing = await self.get_agent_task(task_id)
             if existing is None:
                 raise KeyError(f"Agent task not found: {task_id}")
@@ -9877,10 +10624,19 @@ class SessionStorage:
         if unknown:
             raise ValueError(f"Unknown agent task fields: {', '.join(unknown)}")
         fields.setdefault("updated_at", _now_ms())
-        assignments = ", ".join(f"{name} = ?" for name in fields)
-        values = [_serialize(value) for value in fields.values()]
-        values.append(task_id)
         async with self._write_transaction("update_agent_task") as conn:
+            if details_patch is not None:
+                async with conn.execute(
+                    "SELECT details FROM agent_tasks WHERE task_id = ?", (task_id,),
+                ) as cur:
+                    current = await cur.fetchone()
+                if current is None:
+                    raise KeyError(f"Agent task not found: {task_id}")
+                details = _deserialize_row({"details": current["details"]}).get("details")
+                fields["details"] = {**(details or {}), **details_patch}
+            assignments = ", ".join(f"{name} = ?" for name in fields)
+            values = [_serialize(value) for value in fields.values()]
+            values.append(task_id)
             await conn.execute(
                 f"UPDATE agent_tasks SET {assignments} WHERE task_id = ?",
                 values,
@@ -9893,6 +10649,44 @@ class SessionStorage:
                 raise KeyError(f"Agent task not found: {task_id}")
             updated = AgentTaskRecord(**_deserialize_row(dict(row)))
         return updated
+
+    async def patch_agent_task_details(
+        self,
+        task_id: str,
+        *,
+        details_patch: Mapping[str, Any],
+        remove_detail_keys: Sequence[str] = (),
+    ) -> AgentTaskRecord:
+        """Merge a small owned details patch under the storage writer gate.
+
+        Admission lifecycle metadata is written after the task row has been
+        created and while other producers may still append their own details.
+        Replacing the complete JSON document through ``update_agent_task``
+        would lose those concurrent fields.  This method keeps the merge
+        linearizable and is intentionally narrow so callers cannot mutate
+        identity/status columns through the patch path.
+        """
+
+        if not isinstance(details_patch, Mapping):
+            raise TypeError("details_patch must be a mapping")
+        async with self._write_transaction("patch_agent_task_details") as conn:
+            async with conn.execute(
+                "SELECT * FROM agent_tasks WHERE task_id = ?", (task_id,)
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Agent task not found: {task_id}")
+            record = AgentTaskRecord(**_deserialize_row(dict(row)))
+            details = dict(record.details or {})
+            for key in remove_detail_keys:
+                details.pop(str(key), None)
+            details.update(dict(details_patch))
+            updated_at = _now_ms()
+            await conn.execute(
+                "UPDATE agent_tasks SET details = ?, updated_at = ? WHERE task_id = ?",
+                (_serialize(details), updated_at, task_id),
+            )
+        return record.model_copy(update={"details": details, "updated_at": updated_at})
 
     async def settle_agent_task(
         self,
@@ -9946,7 +10740,51 @@ class SessionStorage:
                 (*(_serialize(value) for value in update.values()), task_id),
             ):
                 pass
+            # Keep the terminal task row and its provider admission permit in
+            # one writer transaction. This prevents a SQLite lock between
+            # settlement and a compatibility release from leaving a terminal
+            # task with a durable active permit.
+            await conn.execute(
+                """
+                UPDATE activation_permits
+                SET state = 'released', released_at = COALESCE(released_at, ?)
+                WHERE task_id = ? AND session_key = ? AND state = 'active'
+                """,
+                (fields["finished_at"], task_id, canonicalize_session_key(session_key)),
+            )
         return record.model_copy(update=update)
+
+    # Capture the known atomic implementation independently of later public
+    # method overrides, including a class-level compatibility monkeypatch.
+    _atomic_terminal_settle_implementation = settle_agent_task
+
+    async def settle_agent_task_with_receipt(
+        self,
+        task_id: str,
+        **fields: Any,
+    ) -> AgentTaskSettlementReceipt | None:
+        """Settle a task, proving atomic permit release only for this implementation.
+
+        Keep ``settle_agent_task``'s record return contract for existing callers.
+        Overrides may implement a different transaction boundary, so their
+        successful return does not prove permit release. They still execute,
+        and the runtime retains its compatibility release in that case.
+        """
+
+        settle = self.settle_agent_task
+        proves_atomic_release = (
+            getattr(settle, "__func__", None)
+            is SessionStorage._atomic_terminal_settle_implementation
+        )
+        record = await settle(task_id, **fields)
+        if not proves_atomic_release:
+            return None
+        # The transaction context in settle_agent_task has exited successfully;
+        # cancellation or a failed commit cannot reach this receipt boundary.
+        return AgentTaskSettlementReceipt(
+            task_id=record.task_id,
+            session_key=canonicalize_session_key(record.session_key),
+        )
 
     @_serialized_read
     async def list_agent_tasks(
@@ -10213,28 +11051,38 @@ class SessionStorage:
         if not keys or limit_per_session <= 0:
             return grouped
 
-        for index in range(0, len(keys), _SQLITE_VARIABLE_CHUNK_SIZE):
-            chunk = keys[index : index + _SQLITE_VARIABLE_CHUNK_SIZE]
-            placeholders = ", ".join("?" for _ in chunk)
+        # Reserve one binding for the per-session limit.
+        chunk_size = _SQLITE_VARIABLE_CHUNK_SIZE - 1
+        for index in range(0, len(keys), chunk_size):
+            chunk = keys[index : index + chunk_size]
+            values = ", ".join("(?)" for _ in chunk)
             # Session-list/subagent summaries never inspect task details. Keep
             # durable channel outbox content out of this high-fanout batch read;
             # exact replay still uses get_agent_task(), which selects all fields.
             summary_columns = ", ".join(
-                name for name in AgentTaskRecord.model_fields if name != "details"
+                f"task.{name}" for name in AgentTaskRecord.model_fields if name != "details"
             )
-            sql = (
-                f"SELECT {summary_columns} FROM agent_tasks "
-                f"WHERE session_key IN ({placeholders}) "
-                "ORDER BY session_key ASC, created_at DESC, rowid DESC"
-            )
-            async with self.conn.execute(sql, chunk) as cur:
+            # Bound returned rows before Python deserialization. The existing
+            # session/status index locates each session's candidates; rowid
+            # preserves the existing insertion-order tie-break for equal dates.
+            sql = f"""
+                WITH requested(session_key) AS (VALUES {values})
+                SELECT {summary_columns}
+                FROM requested
+                JOIN agent_tasks AS task ON task.rowid IN (
+                    SELECT rowid FROM agent_tasks
+                    WHERE session_key = requested.session_key
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                )
+                ORDER BY task.session_key ASC, task.created_at DESC, task.rowid DESC
+            """
+            async with self.conn.execute(sql, [*chunk, limit_per_session]) as cur:
                 rows = await cur.fetchall()
 
             for row in rows:
                 task = AgentTaskRecord(**_deserialize_row(dict(row)))
-                bucket = grouped.setdefault(task.session_key, [])
-                if len(bucket) < limit_per_session:
-                    bucket.append(task)
+                grouped[task.session_key].append(task)
         return grouped
 
     async def mark_abandoned_agent_tasks(
@@ -10255,7 +11103,7 @@ class SessionStorage:
             raise ValueError(
                 "goal_pause_reason must be process_restart or feature_disabled"
             )
-        ts = now_ms or _now_ms()
+        ts = now_ms if now_ms is not None else _now_ms()
         plan_run_reconciliation = {
             "cancelled": 0,
             "completed": 0,
@@ -10271,7 +11119,7 @@ class SessionStorage:
         async with self._write_transaction("mark_abandoned_agent_tasks") as conn:
             async with conn.execute(
                 """
-                SELECT task_id, details
+                SELECT task_id, status, details
                 FROM agent_tasks
                 WHERE status IN (?, ?)
                    OR (status = ? AND terminal_reason = ?)
@@ -10356,26 +11204,13 @@ class SessionStorage:
                 SET status = ?,
                     updated_at = ?,
                     finished_at = COALESCE(finished_at, ?),
-                    terminal_reason = CASE
-                        WHEN status = ? AND EXISTS (
-                            SELECT 1 FROM meta_control_intents AS intent
-                            WHERE intent.accepted_task_id = agent_tasks.task_id
-                              AND intent.status = 'accepted'
-                        ) AND EXISTS (
-                            SELECT 1 FROM sessions AS owner
-                            WHERE owner.session_key = agent_tasks.session_key
-                              AND owner.status NOT IN (?, ?, ?, ?)
-                        ) THEN 'meta_control_restart_before_start'
-                        ELSE COALESCE(terminal_reason, ?)
-                    END
+                    terminal_reason = ?
                 WHERE status IN (?, ?)
                 """,
                 (
                     AgentTaskStatus.ABANDONED,
                     ts,
                     ts,
-                    AgentTaskStatus.QUEUED,
-                    *terminal_session_statuses,
                     "process_restart",
                     AgentTaskStatus.QUEUED,
                     AgentTaskStatus.RUNNING,
@@ -10387,6 +11222,29 @@ class SessionStorage:
                     "details"
                 )
                 details = dict(details_raw) if isinstance(details_raw, dict) else {}
+                # Startup recovery is the durable settlement path for a
+                # process that died before TaskRuntime could run its normal
+                # terminal cleanup.  Keep the owner ledger and the separate
+                # activation permit in the same transaction as the
+                # QUEUED/RUNNING -> ABANDONED transition; otherwise a restart
+                # leaves a task that is terminal in ``agent_tasks`` while its
+                # resident/compute lease still appears held and its permit
+                # remains active forever.
+                owner = details.get("admission_owner")
+                if isinstance(owner, dict):
+                    owner = dict(owner)
+                    owner["resident_lease"] = "released"
+                    compute_lease = owner.get("compute_lease")
+                    owner["compute_lease"] = (
+                        "released"
+                        if (
+                            compute_lease in {"held", "released"}
+                            or str(task_row["status"]) == AgentTaskStatus.RUNNING.value
+                        )
+                        else "not_acquired"
+                    )
+                    owner["settlement"] = "settled"
+                    details["admission_owner"] = owner
                 details["turn_outcome"] = {
                     "kind": "interrupted",
                     "reason": "process_restart",
@@ -10408,6 +11266,41 @@ class SessionStorage:
                         "process_restart",
                     ),
                 )
+                await conn.execute(
+                    """
+                    UPDATE activation_permits
+                    SET state = 'released', released_at = COALESCE(released_at, ?)
+                    WHERE task_id = ? AND state = 'active'
+                    """,
+                    (ts, task_row["task_id"]),
+                )
+            # Normal terminal settlement releases the permit in TaskRuntime,
+            # but that final best-effort write can race a SQLite lock.  Sweep
+            # every terminal task in this same startup/recovery transaction so
+            # a durable terminal row can never retain an active permit after
+            # the process that owned the cleanup has gone away.
+            await conn.execute(
+                """
+                UPDATE activation_permits
+                SET state = 'released', released_at = COALESCE(released_at, ?)
+                WHERE state = 'active'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM agent_tasks AS terminal_task
+                      WHERE terminal_task.task_id = activation_permits.task_id
+                        AND terminal_task.session_key = activation_permits.session_key
+                        AND terminal_task.status IN (?, ?, ?, ?, ?)
+                  )
+                """,
+                (
+                    ts,
+                    AgentTaskStatus.SUCCEEDED,
+                    AgentTaskStatus.FAILED,
+                    AgentTaskStatus.CANCELLED,
+                    AgentTaskStatus.TIMEOUT,
+                    AgentTaskStatus.ABANDONED,
+                ),
+            )
             for owner_row in goal_owner_rows:
                 details_raw = _deserialize_row(
                     {"details": owner_row["task_details"]}
@@ -10704,12 +11597,6 @@ class SessionStorage:
                     END
                 WHERE session_key IN ({placeholders})
                   AND status NOT IN (?, ?, ?, ?)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM agent_tasks AS recoverable
-                      WHERE recoverable.session_key = sessions.session_key
-                        AND recoverable.status = ?
-                        AND recoverable.terminal_reason = 'meta_control_restart_before_start'
-                  )
                 """,
                 (
                     SessionStatus.FAILED,
@@ -10719,7 +11606,6 @@ class SessionStorage:
                     ts,
                     *chunk,
                     *terminal_session_statuses,
-                    AgentTaskStatus.ABANDONED,
                 ),
             )
         if any(plan_run_reconciliation.values()):
@@ -10729,212 +11615,6 @@ class SessionStorage:
             )
         return count
 
-    async def claim_recoverable_meta_control_tasks(
-        self,
-        *,
-        limit: int = 64,
-    ) -> list[RecoverableMetaControlTask]:
-        """Claim accepted control tasks proven not to have started before restart.
-
-        Running tasks are deliberately excluded: provider side effects may have
-        occurred before the crash, so replaying them automatically would be
-        unsafe. A claimed queued task is returned with its original transcript
-        row and task identity; another crash marks it recoverable again.
-        """
-
-        bounded_limit = max(1, min(int(limit), 256))
-        recovered: list[RecoverableMetaControlTask] = []
-        now_ms = _now_ms()
-        terminal_session_statuses = (
-            SessionStatus.DONE,
-            SessionStatus.FAILED,
-            SessionStatus.KILLED,
-            SessionStatus.TIMEOUT,
-        )
-        recovered_owners: set[tuple[str, str, int]] = set()
-        async with self._write_transaction("claim_meta_control_recovery") as conn:
-            async def quarantine_invalid(task_id: str) -> None:
-                await conn.execute(
-                    """
-                    UPDATE agent_tasks
-                    SET terminal_reason = ?, updated_at = ?,
-                        error_class = 'MetaControlRecoveryInvalid',
-                        error_message = 'Durable MetaSkill control recovery data is invalid.'
-                    WHERE task_id = ? AND status = ?
-                      AND terminal_reason = 'meta_control_restart_before_start'
-                    """,
-                    (
-                        _META_CONTROL_RECOVERY_INVALID_REASON,
-                        now_ms,
-                        task_id,
-                        AgentTaskStatus.ABANDONED,
-                    ),
-                )
-
-            # Invalid rows must not permanently head-of-line block later valid
-            # controls when callers use a small limit. Every selected row is
-            # either claimed or quarantined before the next bounded read.
-            while len(recovered) < bounded_limit:
-                remaining = bounded_limit - len(recovered)
-                async with conn.execute(
-                    """
-                    SELECT task.*,
-                           owner.session_id AS recovery_owner_session_id,
-                           owner.epoch AS recovery_owner_epoch
-                    FROM agent_tasks AS task
-                    JOIN meta_control_intents AS intent
-                      ON intent.accepted_task_id = task.task_id
-                    JOIN sessions AS owner
-                      ON owner.session_key = task.session_key
-                    WHERE task.status = ?
-                      AND task.terminal_reason = 'meta_control_restart_before_start'
-                      AND intent.status = 'accepted'
-                      AND owner.status NOT IN (?, ?, ?, ?)
-                    ORDER BY task.created_at ASC, task.task_id ASC
-                    LIMIT ?
-                    """,
-                    (
-                        AgentTaskStatus.ABANDONED,
-                        *terminal_session_statuses,
-                        remaining,
-                    ),
-                ) as cur:
-                    task_rows = await cur.fetchall()
-                if not task_rows:
-                    break
-
-                for raw_task in task_rows:
-                    task_data = dict(raw_task)
-                    owner_session_id = str(
-                        task_data.pop("recovery_owner_session_id")
-                    )
-                    owner_epoch = int(task_data.pop("recovery_owner_epoch"))
-                    task = AgentTaskRecord(**_deserialize_row(task_data))
-                    details = task.details if isinstance(task.details, dict) else {}
-                    detail_session_id = (
-                        details["session_id"] if "session_id" in details else None
-                    )
-                    detail_session_epoch = (
-                        details["session_epoch"]
-                        if "session_epoch" in details
-                        else None
-                    )
-                    try:
-                        if "session_id" in details and (
-                            not isinstance(detail_session_id, str)
-                            or not detail_session_id
-                        ):
-                            raise ValueError(
-                                "Task session owner session_id must be a non-empty string"
-                            )
-                        if "session_epoch" in details and (
-                            isinstance(detail_session_epoch, bool)
-                            or not isinstance(detail_session_epoch, int)
-                            or detail_session_epoch < 0
-                        ):
-                            raise ValueError(
-                                "Task session owner session_epoch must be a non-negative integer"
-                            )
-                        _validate_optional_session_owner(
-                            session_id=detail_session_id,
-                            session_epoch=detail_session_epoch,
-                        )
-                    except ValueError:
-                        await quarantine_invalid(task.task_id)
-                        continue
-                    if (
-                        detail_session_id is not None
-                        and detail_session_id != owner_session_id
-                    ) or (
-                        detail_session_epoch is not None
-                        and detail_session_epoch != owner_epoch
-                    ):
-                        await quarantine_invalid(task.task_id)
-                        continue
-                    metadata = details.get("metadata")
-                    message_id = details.get("persisted_user_message_id")
-                    if not isinstance(metadata, dict) or not isinstance(message_id, str):
-                        await quarantine_invalid(task.task_id)
-                        continue
-                    control = metadata.get("meta_control")
-                    if not isinstance(control, dict):
-                        await quarantine_invalid(task.task_id)
-                        continue
-                    async with conn.execute(
-                        """
-                        SELECT * FROM transcript_entries
-                        WHERE session_key = ? AND session_id = ?
-                          AND message_id = ? AND role = 'user'
-                        """,
-                        (task.session_key, owner_session_id, message_id),
-                    ) as entry_cur:
-                        entry_row = await entry_cur.fetchone()
-                    if entry_row is None:
-                        await quarantine_invalid(task.task_id)
-                        continue
-                    entry = TranscriptEntry(**_deserialize_row(dict(entry_row)))
-                    if (
-                        entry.session_id != owner_session_id
-                        or not isinstance(entry.turn_context, dict)
-                        or entry.turn_context.get("meta_control") != control
-                    ):
-                        await quarantine_invalid(task.task_id)
-                        continue
-                    async with conn.execute(
-                        """
-                        UPDATE agent_tasks
-                        SET status = ?, updated_at = ?, finished_at = NULL,
-                            terminal_reason = NULL, error_class = NULL, error_message = NULL
-                        WHERE task_id = ? AND status = ?
-                          AND terminal_reason = 'meta_control_restart_before_start'
-                          AND EXISTS (
-                              SELECT 1 FROM sessions AS owner
-                              WHERE owner.session_key = agent_tasks.session_key
-                                AND owner.session_id = ? AND owner.epoch = ?
-                          )
-                        """,
-                        (
-                            AgentTaskStatus.QUEUED,
-                            now_ms,
-                            task.task_id,
-                            AgentTaskStatus.ABANDONED,
-                            owner_session_id,
-                            owner_epoch,
-                        ),
-                    ) as update_cur:
-                        if int(update_cur.rowcount or 0) != 1:
-                            continue
-                    task.status = AgentTaskStatus.QUEUED
-                    task.updated_at = now_ms
-                    task.finished_at = None
-                    task.terminal_reason = None
-                    task.error_class = None
-                    task.error_message = None
-                    recovered.append(RecoverableMetaControlTask(task=task, entry=entry))
-                    recovered_owners.add(
-                        (task.session_key, owner_session_id, owner_epoch)
-                    )
-
-            for session_key, owner_session_id, owner_epoch in sorted(
-                recovered_owners
-            ):
-                await conn.execute(
-                    """
-                    UPDATE sessions
-                    SET status = ?, updated_at = ?, ended_at = NULL, runtime_ms = NULL
-                    WHERE session_key = ? AND session_id = ? AND epoch = ?
-                      AND status NOT IN (?, ?, ?, ?)
-                    """,
-                    (
-                        SessionStatus.RUNNING,
-                        now_ms,
-                        session_key,
-                        owner_session_id,
-                        owner_epoch,
-                        *terminal_session_statuses,
-                    ),
-                )
-        return recovered
 
     # ── Transcript CRUD ──────────────────────────────────────────────────────
 
@@ -10977,6 +11657,7 @@ class SessionStorage:
         expected_epoch: int | None,
     ) -> None:
         data = entry.model_dump(exclude={"id"})
+        data["content_byte_length"] = _content_byte_length(data.get("content"))
         cols = list(data.keys())
         placeholders = ", ".join("?" for _ in cols)
         values = [_serialize(data[c]) for c in cols]
@@ -11080,6 +11761,7 @@ class SessionStorage:
         # envelope when the caller supplies None could revive an abandoned
         # generation; accepted-message callers supply their complete envelope.
         data = entry.model_dump(exclude={"id", "created_at"})
+        data["content_byte_length"] = _content_byte_length(data.get("content"))
         assignments = [f"{column} = ?" for column in data]
         values = [_serialize(data[column]) for column in data]
         values.append(entry.id)
@@ -11203,6 +11885,7 @@ class SessionStorage:
                 message_id,
                 role,
                 content,
+                content_byte_length,
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
@@ -11227,6 +11910,7 @@ class SessionStorage:
                 message_id,
                 role,
                 content,
+                content_byte_length,
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
@@ -11361,6 +12045,26 @@ class SessionStorage:
             ),
         )
 
+    @_serialized_read
+    async def get_turn_receipt_context(
+        self, session_id: str, message_id: str,
+    ) -> dict[str, Any] | None:
+        """Read receipt disposition without decoding message bodies or replaying admission."""
+        async with self.conn.execute(
+            "SELECT turn_context FROM compacted_transcript_entries "
+            "WHERE session_id = ? AND message_id = ? "
+            "UNION ALL SELECT turn_context FROM transcript_entries "
+            "WHERE session_id = ? AND message_id = ? LIMIT 1",
+            (session_id, message_id, session_id, message_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        raw = row["turn_context"]
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        return raw if isinstance(raw, dict) else {}
+
     async def replay_turn_ingress_receipt(
         self,
         *,
@@ -11368,13 +12072,7 @@ class SessionStorage:
         request_session_key: str,
         client_request_id: str,
     ) -> TurnAcceptanceResult | None:
-        """Replay accepted ingress and consume an obsolete Meta launch draft.
-
-        Older builds could commit the ingress receipt before removing the
-        browser-recovery draft. Keep the fast replay lookup transactional with
-        that repair so the RPC shortcut preserves the same cleanup contract as
-        :meth:`accept_turn`.
-        """
+        """Replay an accepted ingress receipt without accepting another turn."""
 
         canonical_session_key = canonicalize_session_key(request_session_key)
         # Keep the common miss path read-only. Besides avoiding unnecessary
@@ -11398,13 +12096,6 @@ class SessionStorage:
             if selected is None:
                 return None
             receipt, task_status, fresh_user_session, task_details = selected
-            await conn.execute(
-                """
-                DELETE FROM meta_launch_drafts
-                WHERE session_key = ? AND client_request_id = ?
-                """,
-                (canonical_session_key, client_request_id),
-            )
             return TurnAcceptanceResult(
                 receipt=receipt,
                 replayed=True,
@@ -12127,823 +12818,19 @@ class SessionStorage:
             )
             return True
 
-    @staticmethod
-    async def _select_meta_control_intent(
-        conn: Any,
-        *,
-        session_key: str,
-        control_kind: str,
-        correlation_id: str,
-    ) -> MetaControlIntent | None:
-        async with conn.execute(
-            """
-            SELECT * FROM meta_control_intents
-            WHERE session_key = ? AND control_kind = ? AND correlation_id = ?
-            """,
-            (session_key, control_kind, correlation_id),
-        ) as cur:
-            row = await cur.fetchone()
-        return MetaControlIntent(**_deserialize_row(dict(row))) if row is not None else None
 
-    async def stage_meta_control_intent(
-        self,
-        *,
-        session_key: str,
-        control_kind: str,
-        correlation_id: str,
-        meta_skill_name: str,
-        replay_run_id: str | None = None,
-        replay_mode: str | None = None,
-    ) -> tuple[MetaControlIntent, str]:
-        """Durably stage one manual launch or committed replay authorization.
 
-        Repeating the same coordinates is idempotent even after acceptance.
-        Reusing their correlation identity for a different skill/run/mode is a
-        hard conflict. Staged rows have a 30-day recovery window, far longer
-        than the browser outbox, so long turns and restarts remain safe without
-        allowing abandoned pre-send authorizations to grow forever.
-        """
 
-        session_key = canonicalize_session_key(session_key)
-        control_kind = control_kind.strip()
-        correlation_id = correlation_id.strip()
-        meta_skill_name = meta_skill_name.strip()
-        replay_run_id = replay_run_id.strip() if isinstance(replay_run_id, str) else None
-        replay_mode = replay_mode.strip() if isinstance(replay_mode, str) else None
-        if not session_key or not correlation_id or not meta_skill_name:
-            raise ValueError("meta control session, correlation, and skill are required")
-        if control_kind not in {"manual", "replay"}:
-            raise ValueError("meta control kind must be manual or replay")
-        if len(correlation_id) > 272:
-            raise ValueError("meta control correlation exceeds 272 characters")
-        if control_kind == "manual":
-            if not correlation_id.startswith("request:"):
-                raise ValueError("manual meta control requires a request correlation")
-            if replay_run_id is not None or replay_mode is not None:
-                raise ValueError("manual meta control cannot carry replay coordinates")
-            session_key, request_id = normalize_meta_launch_coordinates(
-                session_key,
-                correlation_id.removeprefix("request:"),
-            )
-            correlation_id = f"request:{request_id}"
-        elif (
-            not correlation_id.startswith("nonce:")
-            or replay_run_id is None
-            or replay_mode not in {"failed-step", "partial-context"}
-        ):
-            raise ValueError("replay meta control requires nonce, run, and live mode")
 
-        async with self._write_transaction("stage_meta_control_intent") as conn:
-            return await self._stage_meta_control_intent_in_transaction(
-                conn,
-                session_key=session_key,
-                control_kind=control_kind,
-                correlation_id=correlation_id,
-                meta_skill_name=meta_skill_name,
-                replay_run_id=replay_run_id,
-                replay_mode=replay_mode,
-            )
 
-    async def _stage_meta_control_intent_in_transaction(
-        self,
-        conn: Any,
-        *,
-        session_key: str,
-        control_kind: str,
-        correlation_id: str,
-        meta_skill_name: str,
-        replay_run_id: str | None,
-        replay_mode: str | None,
-    ) -> tuple[MetaControlIntent, str]:
-        """Insert or replay a validated control on an existing write transaction."""
 
-        now_ms = _now_ms()
-        cutoff_ms = now_ms - _META_CONTROL_STAGED_RETENTION_MS
-        await conn.execute(
-            """
-            DELETE FROM meta_control_intents
-            WHERE intent_id IN (
-                SELECT intent_id FROM meta_control_intents
-                WHERE status = 'staged' AND created_at < ?
-                ORDER BY created_at ASC, intent_id ASC
-                LIMIT ?
-            )
-            """,
-            (cutoff_ms, _META_CONTROL_STAGED_GC_BATCH),
-        )
-        if control_kind == "manual":
-            request_id = correlation_id.removeprefix("request:")
-            await conn.execute(
-                """
-                DELETE FROM meta_launch_discard_tombstones
-                WHERE session_key = ? AND client_request_id = ? AND expires_at <= ?
-                """,
-                (session_key, request_id, now_ms),
-            )
-            async with conn.execute(
-                """
-                SELECT 1 FROM meta_launch_discard_tombstones
-                WHERE session_key = ? AND client_request_id = ? AND expires_at > ?
-                """,
-                (session_key, request_id, now_ms),
-            ) as cur:
-                discarded = await cur.fetchone()
-            if discarded is not None:
-                raise MetaLaunchDraftDiscardedError(
-                    "meta launch draft identity was explicitly discarded"
-                )
-        existing = await self._select_meta_control_intent(
-            conn,
-            session_key=session_key,
-            control_kind=control_kind,
-            correlation_id=correlation_id,
-        )
-        if existing is not None:
-            if (
-                existing.meta_skill_name != meta_skill_name
-                or existing.replay_run_id != replay_run_id
-                or existing.replay_mode != replay_mode
-            ):
-                raise MetaControlIntentConflictError(
-                    "meta control identity was already used for another launch"
-                )
-            return existing, "replayed"
 
-        if control_kind == "manual":
-            await self._ensure_meta_launch_coordinate_capacity(
-                conn,
-                now_ms=now_ms,
-                session_key=session_key,
-                client_request_id=correlation_id.removeprefix("request:"),
-            )
 
-        intent = MetaControlIntent(
-            session_key=session_key,
-            control_kind=control_kind,
-            correlation_id=correlation_id,
-            meta_skill_name=meta_skill_name,
-            replay_run_id=replay_run_id,
-            replay_mode=replay_mode,
-        )
-        data = intent.model_dump()
-        columns = list(data)
-        await conn.execute(
-            f"INSERT INTO meta_control_intents ({', '.join(columns)}) "
-            f"VALUES ({', '.join('?' for _ in columns)})",
-            [_serialize(data[column]) for column in columns],
-        )
-        return intent, "stamped"
 
-    @_serialized_read
-    async def get_meta_control_intent(
-        self,
-        *,
-        session_key: str,
-        control_kind: str,
-        correlation_id: str,
-    ) -> MetaControlIntent | None:
-        """Return the exact durable control authorization, if one exists."""
 
-        return await self._select_meta_control_intent(
-            self.conn,
-            session_key=canonicalize_session_key(session_key),
-            control_kind=control_kind,
-            correlation_id=correlation_id,
-        )
 
-    @staticmethod
-    async def _select_meta_launch_draft(
-        conn: Any,
-        *,
-        session_key: str,
-        client_request_id: str,
-    ) -> MetaLaunchDraft | None:
-        async with conn.execute(
-            """
-            SELECT * FROM meta_launch_drafts
-            WHERE session_key = ? AND client_request_id = ?
-            """,
-            (session_key, client_request_id),
-        ) as cur:
-            row = await cur.fetchone()
-        return MetaLaunchDraft(**_deserialize_row(dict(row))) if row is not None else None
 
-    async def _select_live_meta_launch_coordinates(
-        self,
-        conn: Any,
-        *,
-        now_ms: int,
-        session_key: str | None = None,
-        include_drafts: bool = True,
-        include_tombstones: bool = True,
-        include_staged: bool = True,
-        include_accepted: bool = True,
-        exclude_intent_id: str | None = None,
-    ) -> set[tuple[str, str]]:
-        """Return the bounded live launch identities represented across ledgers.
 
-        One browser request may briefly exist as both a raw draft and a staged
-        control. Capacity is therefore defined over exact coordinates, not row
-        counts. Accepted controls contribute only the newest browser-outbox
-        window per session; older accepted history is not a live resend source.
-        """
-
-        canonical_session = canonicalize_session_key(session_key) if session_key else ""
-        coordinates: set[tuple[str, str]] = set()
-
-        def append_coordinate(raw_session: object, raw_request: object) -> None:
-            try:
-                coordinate = normalize_meta_launch_coordinates(
-                    raw_session,
-                    raw_request,
-                )
-            except ValueError:
-                # Older ledgers may contain identifiers that current ingress no
-                # longer accepts. They cannot be replayed through the bounded RPC.
-                return
-            if canonical_session and coordinate[0] != canonical_session:
-                return
-            coordinates.add(coordinate)
-
-        async def append_rows(sql: str, params: tuple[Any, ...]) -> None:
-            async with conn.execute(sql, params) as cur:
-                for row in await cur.fetchall():
-                    append_coordinate(row[0], row[1])
-
-        session_clause = " AND session_key = ?" if canonical_session else ""
-        session_params: tuple[Any, ...] = (canonical_session,) if canonical_session else ()
-        if include_drafts:
-            await append_rows(
-                "SELECT session_key, client_request_id FROM meta_launch_drafts "
-                f"WHERE expires_at > ?{session_clause}",
-                (now_ms, *session_params),
-            )
-        if include_tombstones:
-            await append_rows(
-                "SELECT session_key, client_request_id "
-                "FROM meta_launch_discard_tombstones "
-                f"WHERE expires_at > ?{session_clause}",
-                (now_ms, *session_params),
-            )
-        if include_staged:
-            exclude_clause = " AND intent_id <> ?" if exclude_intent_id else ""
-            exclude_params: tuple[Any, ...] = (
-                (exclude_intent_id,) if exclude_intent_id else ()
-            )
-            await append_rows(
-                "SELECT session_key, substr(correlation_id, 9) "
-                "FROM meta_control_intents "
-                "WHERE control_kind = 'manual' AND status = 'staged' "
-                "AND correlation_id LIKE 'request:%' AND created_at > ?"
-                f"{session_clause}{exclude_clause}",
-                (
-                    now_ms - _META_CONTROL_STAGED_RETENTION_MS,
-                    *session_params,
-                    *exclude_params,
-                ),
-            )
-        if include_accepted:
-            exclude_clause = " AND intent_id <> ?" if exclude_intent_id else ""
-            exclude_params = (exclude_intent_id,) if exclude_intent_id else ()
-            if canonical_session:
-                accepted_sql = (
-                    "SELECT session_key, substr(correlation_id, 9) "
-                    "FROM meta_control_intents "
-                    "WHERE control_kind = 'manual' AND status = 'accepted' "
-                    "AND correlation_id LIKE 'request:%' AND updated_at > ?"
-                    f"{session_clause}{exclude_clause} "
-                    "ORDER BY updated_at DESC, intent_id DESC LIMIT ?"
-                )
-                accepted_params = (
-                    now_ms - _META_LAUNCH_DRAFT_RETENTION_MS,
-                    *session_params,
-                    *exclude_params,
-                    _META_LAUNCH_ACCEPTED_PER_SESSION_LIMIT,
-                )
-            else:
-                # Rank in SQLite so the selector never materializes the full
-                # seven-day acceptance history in Python. The outer allowance
-                # covers every coordinate already selected plus one decisive
-                # row beyond the global capacity bound, even when ledgers
-                # temporarily overlap during an atomic hand-off.
-                accepted_sql = (
-                    "SELECT session_key, client_request_id FROM ("
-                    "SELECT session_key, substr(correlation_id, 9) AS client_request_id, "
-                    "updated_at, intent_id, "
-                    "ROW_NUMBER() OVER (PARTITION BY session_key "
-                    "ORDER BY updated_at DESC, intent_id DESC) AS accepted_rank "
-                    "FROM meta_control_intents "
-                    "WHERE control_kind = 'manual' AND status = 'accepted' "
-                    "AND correlation_id LIKE 'request:%' AND updated_at > ?"
-                    f"{exclude_clause}"
-                    ") WHERE accepted_rank <= ? "
-                    "ORDER BY session_key ASC, updated_at DESC, intent_id DESC LIMIT ?"
-                )
-                accepted_params = (
-                    now_ms - _META_LAUNCH_DRAFT_RETENTION_MS,
-                    *exclude_params,
-                    _META_LAUNCH_ACCEPTED_PER_SESSION_LIMIT,
-                    _META_LAUNCH_DISCARD_GLOBAL_LIMIT + len(coordinates) + 1,
-                )
-            async with conn.execute(accepted_sql, accepted_params) as cur:
-                accepted_counts: dict[str, int] = {}
-                for row in await cur.fetchall():
-                    row_session = canonicalize_session_key(str(row[0]))
-                    seen = accepted_counts.get(row_session, 0)
-                    if seen >= _META_LAUNCH_ACCEPTED_PER_SESSION_LIMIT:
-                        continue
-                    accepted_counts[row_session] = seen + 1
-                    append_coordinate(row[0], row[1])
-
-        return coordinates
-
-    async def _ensure_meta_launch_coordinate_capacity(
-        self,
-        conn: Any,
-        *,
-        now_ms: int,
-        session_key: str,
-        client_request_id: str,
-    ) -> None:
-        """Reserve one exact live coordinate without exceeding either bound."""
-
-        coordinate = normalize_meta_launch_coordinates(session_key, client_request_id)
-        live = await self._select_live_meta_launch_coordinates(conn, now_ms=now_ms)
-        if coordinate in live:
-            return
-        if sum(1 for item in live if item[0] == coordinate[0]) >= (
-            _META_LAUNCH_DISCARD_PER_SESSION_LIMIT
-        ):
-            raise MetaLaunchDraftCapacityError(
-                "MetaSkill cancellation retention is full for this session"
-            )
-        if len(live) >= _META_LAUNCH_DISCARD_GLOBAL_LIMIT:
-            raise MetaLaunchDraftCapacityError("MetaSkill cancellation retention is full")
-
-    @_serialized_read
-    async def is_meta_launch_discarded(
-        self,
-        *,
-        session_key: str,
-        client_request_id: str,
-    ) -> bool:
-        """Return whether a live terminal marker fences this request identity."""
-
-        session_key, client_request_id = normalize_meta_launch_coordinates(
-            session_key,
-            client_request_id,
-        )
-        async with self.conn.execute(
-            """
-            SELECT 1 FROM meta_launch_discard_tombstones
-            WHERE session_key = ? AND client_request_id = ? AND expires_at > ?
-            """,
-            (session_key, client_request_id, _now_ms()),
-        ) as cur:
-            return await cur.fetchone() is not None
-
-    @staticmethod
-    async def _purge_expired_meta_launch_drafts(
-        conn: Any,
-        *,
-        now_ms: int,
-        limit: int,
-    ) -> int:
-        """Delete bounded pages of expired raw prompts and cancellation markers."""
-
-        bounded_limit = max(1, min(int(limit), _META_LAUNCH_DRAFT_GLOBAL_LIMIT))
-        await conn.execute(
-            """
-            DELETE FROM meta_launch_discard_tombstones
-            WHERE rowid IN (
-                SELECT rowid
-                FROM meta_launch_discard_tombstones
-                WHERE expires_at <= ?
-                ORDER BY expires_at ASC, created_at ASC
-                LIMIT ?
-            )
-            """,
-            (now_ms, bounded_limit),
-        )
-        async with conn.execute(
-            """
-            SELECT draft_id, session_key, client_request_id
-            FROM meta_launch_drafts
-            WHERE expires_at <= ?
-            ORDER BY expires_at ASC, draft_id ASC
-            LIMIT ?
-            """,
-            (now_ms, bounded_limit),
-        ) as cur:
-            expired = await cur.fetchall()
-        if not expired:
-            return 0
-
-        # Revoke the one-shot authorization before deleting the only row that
-        # correlates it to the expiring raw request.
-        for row in expired:
-            await conn.execute(
-                """
-                DELETE FROM meta_control_intents
-                WHERE session_key = ? AND control_kind = 'manual'
-                  AND correlation_id = ? AND status = 'staged'
-                """,
-                (str(row["session_key"]), f"request:{row['client_request_id']}"),
-            )
-        placeholders = ", ".join("?" for _ in expired)
-        await conn.execute(
-            f"DELETE FROM meta_launch_drafts WHERE draft_id IN ({placeholders})",
-            [str(row["draft_id"]) for row in expired],
-        )
-        return len(expired)
-
-    async def _tombstone_meta_launches_for_boundary(
-        self,
-        conn: Any,
-        *,
-        session_key: str,
-        now_ms: int,
-        intent_statuses: tuple[str, ...],
-        exclude_intent_id: str | None = None,
-        exclude_client_request_id: str | None = None,
-    ) -> int:
-        """Fence stale MetaSkill identities while erasing their raw content."""
-
-        statuses = tuple(
-            status for status in intent_statuses if status in {"staged", "accepted"}
-        )
-        if not statuses:
-            return 0
-        await self._purge_expired_meta_launch_drafts(
-            conn,
-            now_ms=now_ms,
-            limit=_META_LAUNCH_DRAFT_GC_BATCH,
-        )
-        coordinates = await self._select_live_meta_launch_coordinates(
-            conn,
-            now_ms=now_ms,
-            session_key=session_key,
-            include_tombstones=False,
-            include_staged="staged" in statuses,
-            include_accepted="accepted" in statuses,
-            exclude_intent_id=exclude_intent_id,
-        )
-        request_ids = {
-            request_id
-            for _coordinate_session, request_id in coordinates
-            if request_id != exclude_client_request_id
-        }
-
-        for request_id in sorted(request_ids):
-            await conn.execute(
-                """
-                INSERT INTO meta_launch_discard_tombstones (
-                    session_key, client_request_id, created_at, expires_at
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(session_key, client_request_id) DO UPDATE SET
-                    created_at = excluded.created_at,
-                    expires_at = excluded.expires_at
-                WHERE meta_launch_discard_tombstones.expires_at <= excluded.created_at
-                """,
-                (
-                    session_key,
-                    request_id,
-                    now_ms,
-                    now_ms + _META_LAUNCH_DRAFT_RETENTION_MS,
-                ),
-            )
-        return len(request_ids)
-
-    async def stage_meta_launch_draft(
-        self,
-        *,
-        session_key: str,
-        client_request_id: str,
-        meta_skill_name: str,
-        launch_text: str,
-    ) -> tuple[MetaLaunchDraft, str]:
-        """Retain one exact manual request until its hidden turn is accepted.
-
-        The outbox is deliberately small and short-lived because ``launch_text``
-        is user content.  Stable request identities are immutable, making
-        retries safe after an RPC response loss or application restart.
-        """
-
-        session_key, client_request_id = normalize_meta_launch_coordinates(
-            session_key,
-            client_request_id,
-        )
-        meta_skill_name = meta_skill_name.strip()
-        if (
-            not meta_skill_name
-            or len(meta_skill_name) > 256
-            or any(character.isspace() for character in meta_skill_name)
-        ):
-            raise ValueError("meta launch draft skill is invalid")
-        if not isinstance(launch_text, str) or not launch_text or len(launch_text) > 128_000:
-            raise ValueError("meta launch draft content is invalid")
-        prefix = f"/meta {meta_skill_name}"
-        suffix = launch_text[len(prefix) :] if launch_text.startswith(prefix) else ""
-        if launch_text != prefix:
-            if not suffix.startswith(" --") or (len(suffix) > 3 and not suffix[3].isspace()):
-                raise ValueError("meta launch draft does not match its skill")
-
-        now_ms = _now_ms()
-        async with self._write_transaction("stage_meta_launch_draft") as conn:
-            await self._purge_expired_meta_launch_drafts(
-                conn,
-                now_ms=now_ms,
-                limit=_META_LAUNCH_DRAFT_GC_BATCH,
-            )
-            # The bounded global GC page may not include this coordinate when
-            # many markers expire together. Remove its own expired marker so a
-            # legitimate reuse after the retention window is deterministic.
-            await conn.execute(
-                """
-                DELETE FROM meta_launch_discard_tombstones
-                WHERE session_key = ? AND client_request_id = ? AND expires_at <= ?
-                """,
-                (session_key, client_request_id, now_ms),
-            )
-            async with conn.execute(
-                """
-                SELECT 1
-                FROM meta_launch_discard_tombstones
-                WHERE session_key = ? AND client_request_id = ? AND expires_at > ?
-                """,
-                (session_key, client_request_id, now_ms),
-            ) as cur:
-                discarded = await cur.fetchone()
-            if discarded is not None:
-                raise MetaLaunchDraftDiscardedError(
-                    "meta launch draft identity was explicitly discarded"
-                )
-            existing = await self._select_meta_launch_draft(
-                conn,
-                session_key=session_key,
-                client_request_id=client_request_id,
-            )
-            if existing is not None:
-                if (
-                    existing.meta_skill_name != meta_skill_name
-                    or existing.launch_text != launch_text
-                ):
-                    raise MetaLaunchDraftConflictError(
-                        "meta launch draft identity was already used for another request"
-                    )
-                return existing, "replayed"
-
-            async with conn.execute(
-                "SELECT COUNT(*) FROM meta_launch_drafts WHERE session_key = ?",
-                (session_key,),
-            ) as cur:
-                per_session_row = await cur.fetchone()
-            per_session_count = int(per_session_row[0] if per_session_row else 0)
-            if per_session_count >= _META_LAUNCH_DRAFT_PER_SESSION_LIMIT:
-                raise MetaLaunchDraftCapacityError("MetaSkill draft outbox is full")
-            async with conn.execute("SELECT COUNT(*) FROM meta_launch_drafts") as cur:
-                global_row = await cur.fetchone()
-            global_drafts = int(global_row[0] if global_row else 0)
-            if global_drafts >= _META_LAUNCH_DRAFT_GLOBAL_LIMIT:
-                raise MetaLaunchDraftCapacityError("MetaSkill draft outbox is full")
-            await self._ensure_meta_launch_coordinate_capacity(
-                conn,
-                now_ms=now_ms,
-                session_key=session_key,
-                client_request_id=client_request_id,
-            )
-
-            draft = MetaLaunchDraft(
-                session_key=session_key,
-                client_request_id=client_request_id,
-                meta_skill_name=meta_skill_name,
-                launch_text=launch_text,
-                created_at=now_ms,
-                updated_at=now_ms,
-                expires_at=now_ms + _META_LAUNCH_DRAFT_RETENTION_MS,
-            )
-            data = draft.model_dump()
-            columns = list(data)
-            await conn.execute(
-                f"INSERT INTO meta_launch_drafts ({', '.join(columns)}) "
-                f"VALUES ({', '.join('?' for _ in columns)})",
-                [_serialize(data[column]) for column in columns],
-            )
-            return draft, "stamped"
-
-    async def promote_meta_launch_draft(
-        self,
-        *,
-        session_key: str,
-        client_request_id: str,
-        meta_skill_name: str,
-        launch_text: str,
-    ) -> tuple[MetaControlIntent, str]:
-        """Atomically verify a live draft and stage its manual authorization.
-
-        Readiness checks intentionally run outside SQLite. This compare-and-set
-        closes the later boundary: if another tab discarded or expiry removed
-        the raw request while readiness was running, no consumable control is
-        created and the caller receives a retry-safe failure.
-        """
-
-        session_key, client_request_id = normalize_meta_launch_coordinates(
-            session_key,
-            client_request_id,
-        )
-        meta_skill_name = meta_skill_name.strip()
-        if not meta_skill_name or not launch_text:
-            raise ValueError("meta launch draft promotion coordinates are required")
-
-        now_ms = _now_ms()
-        async with self._write_transaction("promote_meta_launch_draft") as conn:
-            await self._purge_expired_meta_launch_drafts(
-                conn,
-                now_ms=now_ms,
-                limit=_META_LAUNCH_DRAFT_GC_BATCH,
-            )
-            async with conn.execute(
-                """
-                SELECT 1 FROM meta_launch_discard_tombstones
-                WHERE session_key = ? AND client_request_id = ? AND expires_at > ?
-                """,
-                (session_key, client_request_id, now_ms),
-            ) as cur:
-                discarded = await cur.fetchone()
-            if discarded is not None:
-                raise MetaLaunchDraftDiscardedError(
-                    "meta launch draft identity was explicitly discarded"
-                )
-            draft = await self._select_meta_launch_draft(
-                conn,
-                session_key=session_key,
-                client_request_id=client_request_id,
-            )
-            if draft is None:
-                raise MetaLaunchDraftUnavailableError(
-                    "meta launch draft was discarded or expired"
-                )
-            if (
-                draft.meta_skill_name != meta_skill_name
-                or draft.launch_text != launch_text
-            ):
-                raise MetaLaunchDraftConflictError(
-                    "meta launch draft identity was already used for another request"
-                )
-            return await self._stage_meta_control_intent_in_transaction(
-                conn,
-                session_key=session_key,
-                control_kind="manual",
-                correlation_id=f"request:{client_request_id}",
-                meta_skill_name=meta_skill_name,
-                replay_run_id=None,
-                replay_mode=None,
-            )
-
-    async def list_meta_launch_drafts(
-        self,
-        *,
-        session_key: str | None = None,
-        agent_id: str | None = None,
-        provisional_only: bool = False,
-        limit: int = _META_LAUNCH_DRAFT_PER_SESSION_LIMIT,
-    ) -> list[MetaLaunchDraft]:
-        """List live drafts for one session or one agent without consuming them."""
-
-        canonical_session = canonicalize_session_key(session_key) if session_key else ""
-        normalized_agent = normalize_agent_id(agent_id) if agent_id else ""
-        if not canonical_session and not normalized_agent:
-            raise ValueError("meta launch draft session or agent is required")
-        bounded_limit = max(1, min(int(limit), _META_LAUNCH_DRAFT_PER_SESSION_LIMIT))
-        now_ms = _now_ms()
-        async with self._write_transaction("list_meta_launch_drafts") as conn:
-            await self._purge_expired_meta_launch_drafts(
-                conn,
-                now_ms=now_ms,
-                limit=_META_LAUNCH_DRAFT_GC_BATCH,
-            )
-            if canonical_session:
-                sql = (
-                    "SELECT * FROM meta_launch_drafts "
-                    "WHERE session_key = ? AND expires_at > ? "
-                    "ORDER BY created_at ASC, draft_id ASC LIMIT ?"
-                )
-                params: tuple[Any, ...] = (canonical_session, now_ms, bounded_limit)
-            else:
-                session_prefix = f"agent:{normalized_agent}:"
-                provisional_clause = (
-                    "AND NOT EXISTS ("
-                    "SELECT 1 FROM sessions "
-                    "WHERE sessions.session_key = meta_launch_drafts.session_key"
-                    ") "
-                    if provisional_only
-                    else ""
-                )
-                sql = (
-                    "SELECT * FROM meta_launch_drafts "
-                    "WHERE substr(session_key, 1, length(?)) = ? AND expires_at > ? "
-                    f"{provisional_clause}"
-                    "ORDER BY created_at ASC, draft_id ASC LIMIT ?"
-                )
-                params = (session_prefix, session_prefix, now_ms, bounded_limit)
-            async with conn.execute(sql, params) as cur:
-                rows = await cur.fetchall()
-        drafts = [MetaLaunchDraft(**_deserialize_row(dict(row))) for row in rows]
-        if normalized_agent:
-            # Keep the parser authoritative if session-key formats expand; the
-            # SQL prefix is only the bounded query accelerator.
-            drafts = [
-                draft
-                for draft in drafts
-                if parse_agent_id(draft.session_key) == normalized_agent
-            ]
-        return drafts
-
-    async def discard_meta_launch_draft(
-        self,
-        *,
-        session_key: str,
-        client_request_id: str,
-    ) -> bool:
-        """Make an explicit user discard terminal for a bounded retention window."""
-
-        try:
-            session_key, client_request_id = normalize_meta_launch_coordinates(
-                session_key,
-                client_request_id,
-            )
-        except ValueError:
-            return False
-        now_ms = _now_ms()
-        async with self._write_transaction("discard_meta_launch_draft") as conn:
-            intent = await self._select_meta_control_intent(
-                conn,
-                session_key=session_key,
-                control_kind="manual",
-                correlation_id=f"request:{client_request_id}",
-            )
-            # Acceptance is the irreversible boundary: the task may already be
-            # invoking a paid provider even if the browser lost the send
-            # response. Never report that request as cancelled or let the UI
-            # restore it as a newly sendable composer draft.
-            if intent is not None and intent.status == "accepted":
-                return False
-            await self._purge_expired_meta_launch_drafts(
-                conn,
-                now_ms=now_ms,
-                limit=_META_LAUNCH_DRAFT_GC_BATCH,
-            )
-            async with conn.execute(
-                """
-                SELECT 1 FROM meta_launch_discard_tombstones
-                WHERE session_key = ? AND client_request_id = ? AND expires_at > ?
-                """,
-                (session_key, client_request_id, now_ms),
-            ) as cur:
-                existing_tombstone = await cur.fetchone()
-            if existing_tombstone is None:
-                await self._ensure_meta_launch_coordinate_capacity(
-                    conn,
-                    now_ms=now_ms,
-                    session_key=session_key,
-                    client_request_id=client_request_id,
-                )
-            # Keep only the request coordinates, never the raw launch text or
-            # skill name. Repeated response-loss retries do not extend the
-            # finite retention window established by the first discard.
-            await conn.execute(
-                """
-                INSERT INTO meta_launch_discard_tombstones (
-                    session_key, client_request_id, created_at, expires_at
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(session_key, client_request_id) DO UPDATE SET
-                    created_at = excluded.created_at,
-                    expires_at = excluded.expires_at
-                WHERE meta_launch_discard_tombstones.expires_at <= excluded.created_at
-                """,
-                (
-                    session_key,
-                    client_request_id,
-                    now_ms,
-                    now_ms + _META_LAUNCH_DRAFT_RETENTION_MS,
-                ),
-            )
-            await conn.execute(
-                "DELETE FROM meta_launch_drafts WHERE session_key = ? AND client_request_id = ?",
-                (session_key, client_request_id),
-            )
-            await conn.execute(
-                """
-                DELETE FROM meta_control_intents
-                WHERE session_key = ? AND control_kind = 'manual'
-                  AND correlation_id = ? AND status = 'staged'
-                """,
-                (session_key, f"request:{client_request_id}"),
-            )
-            # Idempotent cancellation: a retry after a committed discard
-            # response loss must confirm the same terminal intent instead of
-            # resurrecting a launch in the browser.
-            return True
 
     @staticmethod
     async def _delete_reset_history(conn: Any, session_id: str) -> None:
@@ -12957,6 +12844,82 @@ class SessionStorage:
             await conn.execute(
                 f"DELETE FROM {table} WHERE session_id = ?",  # noqa: S608
                 (session_id,),
+            )
+
+    @staticmethod
+    async def _invalidate_reset_generation_activation_on_conn(
+        conn: Any,
+        *,
+        session_key: str,
+        replaced_session_id: str,
+        replaced_session_epoch: int,
+        replacement_session_id: str,
+        replacement_session_epoch: int,
+        timestamp: int,
+    ) -> None:
+        """Persist a reset-only activation fence for work in the old generation.
+
+        The runtime remains the sole terminal writer.  This marker instead
+        makes the commit-to-activation gap unambiguous: an old queued task
+        that has not yet claimed its provider permit must settle as
+        reset-cancelled, while an unrelated stale owner/authority conflict
+        remains a failure.
+        """
+
+        async with conn.execute(
+            """
+            SELECT task.task_id, task.details
+            FROM agent_tasks AS task
+            WHERE task.session_key = ? AND task.status = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM activation_permits AS permit
+                  WHERE permit.task_id = task.task_id
+                    AND permit.session_key = task.session_key
+                    AND permit.state = 'active'
+              )
+            """,
+            (
+                session_key,
+                AgentTaskStatus.QUEUED.value,
+            ),
+        ) as cur:
+            task_rows = await cur.fetchall()
+        invalidation = {
+            "kind": "session_reset",
+            "replaced_session_id": replaced_session_id,
+            "replaced_session_epoch": replaced_session_epoch,
+            "replacement_session_id": replacement_session_id,
+            "replacement_session_epoch": replacement_session_epoch,
+        }
+        for task_row in task_rows:
+            details_raw = _deserialize_row({"details": task_row["details"]}).get("details")
+            details = dict(details_raw) if isinstance(details_raw, dict) else {}
+            owner_epoch = details.get("session_epoch")
+            if (
+                details.get("session_id") != replaced_session_id
+                or isinstance(owner_epoch, bool)
+                or not isinstance(owner_epoch, int)
+                or owner_epoch != replaced_session_epoch
+                or not isinstance(details.get("activation_authority"), Mapping)
+            ):
+                continue
+            if details.get("activation_invalidation") == invalidation:
+                continue
+            details["activation_invalidation"] = invalidation
+            await conn.execute(
+                """
+                UPDATE agent_tasks
+                SET details = ?, updated_at = ?
+                WHERE task_id = ? AND session_key = ? AND status = ?
+                """,
+                (
+                    _serialize(details),
+                    timestamp,
+                    task_row["task_id"],
+                    session_key,
+                    AgentTaskStatus.QUEUED.value,
+                ),
             )
 
     async def reset_session(
@@ -13053,6 +13016,16 @@ class SessionStorage:
                     session_key=node.session_key,
                     expected_epoch=expected_epoch,
                 )
+            timestamp = _now_ms()
+            await self._invalidate_reset_generation_activation_on_conn(
+                conn,
+                session_key=node.session_key,
+                replaced_session_id=expected_session_id,
+                replaced_session_epoch=expected_epoch,
+                replacement_session_id=node.session_id,
+                replacement_session_epoch=int(node.epoch or 0),
+                timestamp=timestamp,
+            )
             await self._ensure_usage_baseline_for_session_on_conn(
                 conn,
                 session_key=node.session_key,
@@ -13073,22 +13046,6 @@ class SessionStorage:
                 """,
                 (node.session_key,),
             )
-            await self._tombstone_meta_launches_for_boundary(
-                conn,
-                session_key=node.session_key,
-                now_ms=_now_ms(),
-                intent_statuses=("staged", "accepted"),
-            )
-            await conn.execute(
-                "DELETE FROM meta_control_intents "
-                "WHERE session_key = ? AND status = 'staged'",
-                (node.session_key,),
-            )
-            await conn.execute(
-                "DELETE FROM meta_launch_drafts WHERE session_key = ?",
-                (node.session_key,),
-            )
-            timestamp = _now_ms()
             active_placeholders = ", ".join(
                 "?" for _ in PLAN_RUN_ACTIVE_STATUSES
             )
@@ -13111,7 +13068,6 @@ class SessionStorage:
                 ],
             )
 
-        _clear_pending_meta_launch_boundary(node.session_key)
         from opensquilla.session.material_cleanup import run_session_artifact_cleanup
 
         await run_session_artifact_cleanup(expected_session_id, node.session_key)
@@ -13136,7 +13092,6 @@ class SessionStorage:
         plan_revision: PlanRevisionRecord | None = None,
         plan_run: PlanRunRecord | None = None,
         merge_into_task: bool = False,
-        meta_control_intent_id: str | None = None,
         workspace_guard: ProjectWorkspaceGuard | None = None,
         expected_collaboration_revision: int | None = None,
         expected_active_plan_revision_id: str | None = None,
@@ -13185,8 +13140,6 @@ class SessionStorage:
             )
         if goal_mutation is not None and plan_run is not None:
             raise ValueError("Goal turns cannot start or claim a Plan run")
-        if goal_mutation is not None and meta_control_intent_id is not None:
-            raise ValueError("Goal turns cannot consume a MetaSkill control intent")
         pending_guard_values = (
             pending_input_id,
             pending_input_fingerprint,
@@ -13285,8 +13238,6 @@ class SessionStorage:
             raise ValueError("reset_archive_writer requires reset_from_session_id")
         if merge_into_task and session_node is not None:
             raise ValueError("task collection cannot create, reset, or fork a session")
-        if merge_into_task and meta_control_intent_id is not None:
-            raise ValueError("a MetaSkill control turn cannot merge into another task")
         if plan_run is not None:
             if merge_into_task:
                 raise ValueError("a plan implementation turn cannot merge into a task")
@@ -13384,13 +13335,6 @@ class SessionStorage:
                 goal_command_result: GoalCommandResult | None = None
                 # Repair an outbox left by an older build that committed the
                 # receipt before learning to consume drafts atomically.
-                await conn.execute(
-                    """
-                    DELETE FROM meta_launch_drafts
-                    WHERE session_key = ? AND client_request_id = ?
-                    """,
-                    (request_session_key, client_request_id),
-                )
                 if pending_input_id is not None:
                     dispatch_receipt = (
                         await self._select_pending_chat_input_dispatch_receipt(
@@ -13494,58 +13438,6 @@ class SessionStorage:
                     )
                 pending_dispatch_client_message_id = pending.client_message_id
 
-            if meta_control_intent_id is not None:
-                if task_record is None:
-                    raise ValueError(
-                        "a MetaSkill control turn requires a runtime task"
-                    )
-                async with conn.execute(
-                    "SELECT * FROM meta_control_intents WHERE intent_id = ?",
-                    (meta_control_intent_id,),
-                ) as cur:
-                    control_row = await cur.fetchone()
-                if control_row is None:
-                    raise MetaControlIntentConflictError(
-                        "MetaSkill control authorization is missing"
-                    )
-                control = MetaControlIntent(**_deserialize_row(dict(control_row)))
-                if control.session_key != request_session_key:
-                    raise MetaControlIntentConflictError(
-                        "MetaSkill control authorization belongs to another session"
-                    )
-                if control.status != "staged":
-                    raise MetaControlIntentConflictError(
-                        "MetaSkill control authorization was already accepted"
-                    )
-                embedded = (
-                    entry.turn_context.get("meta_control")
-                    if isinstance(entry.turn_context, dict)
-                    else None
-                )
-                expected_embedded: dict[str, Any] = {
-                    "version": 1,
-                    "intent_id": control.intent_id,
-                    "kind": control.control_kind,
-                    "name": control.meta_skill_name,
-                    "correlation_id": control.correlation_id,
-                }
-                if control.control_kind == "replay":
-                    expected_embedded.update({
-                        "run_id": control.replay_run_id,
-                        "mode": control.replay_mode,
-                    })
-                if embedded != expected_embedded:
-                    raise MetaControlIntentConflictError(
-                        "MetaSkill control payload does not match its authorization"
-                    )
-                task_metadata = (task_record.details or {}).get("metadata")
-                if (
-                    not isinstance(task_metadata, dict)
-                    or task_metadata.get("meta_control") != expected_embedded
-                ):
-                    raise MetaControlIntentConflictError(
-                        "MetaSkill control task lost its authorized payload"
-                    )
 
             if isinstance(goal_mutation, StartGoalMutation):
                 command_replay = await self._replay_goal_command_on_conn(
@@ -13739,6 +13631,16 @@ class SessionStorage:
                             session_key=session_node.session_key,
                             expected_epoch=previous_epoch,
                         )
+                    timestamp = _now_ms()
+                    await self._invalidate_reset_generation_activation_on_conn(
+                        conn,
+                        session_key=session_node.session_key,
+                        replaced_session_id=reset_from_session_id,
+                        replaced_session_epoch=previous_epoch,
+                        replacement_session_id=session_node.session_id,
+                        replacement_session_epoch=int(session_node.epoch or 0),
+                        timestamp=timestamp,
+                    )
                     await self._ensure_usage_baseline_for_session_on_conn(
                         conn,
                         session_key=session_node.session_key,
@@ -13756,49 +13658,7 @@ class SessionStorage:
                         """,
                         (session_node.session_key,),
                     )
-                    await self._tombstone_meta_launches_for_boundary(
-                        conn,
-                        session_key=session_node.session_key,
-                        now_ms=_now_ms(),
-                        intent_statuses=("staged", "accepted"),
-                        exclude_intent_id=meta_control_intent_id,
-                        exclude_client_request_id=(
-                            client_request_id
-                            if meta_control_intent_id is not None
-                            and request_session_key == session_node.session_key
-                            else None
-                        ),
-                    )
-                    if meta_control_intent_id is None:
-                        await conn.execute(
-                            """
-                            DELETE FROM meta_control_intents
-                            WHERE session_key = ? AND status = 'staged'
-                            """,
-                            (session_node.session_key,),
-                        )
-                    else:
-                        # The currently accepted hidden control belongs to this
-                        # atomic reset turn. Preserve only that validated row;
-                        # every other staged authorization belongs to the old
-                        # session identity and must be invalidated.
-                        await conn.execute(
-                            """
-                            DELETE FROM meta_control_intents
-                            WHERE session_key = ? AND status = 'staged'
-                              AND intent_id <> ?
-                            """,
-                            (session_node.session_key, meta_control_intent_id),
-                        )
-                    # A reset discards every unaccepted request owned by the old
-                    # session identity. If this transaction is itself accepting
-                    # one of them, rollback restores it on any later failure.
-                    await conn.execute(
-                        "DELETE FROM meta_launch_drafts WHERE session_key = ?",
-                        (session_node.session_key,),
-                    )
 
-                    timestamp = _now_ms()
                     active_placeholders = ", ".join(
                         "?" for _ in PLAN_RUN_ACTIVE_STATUSES
                     )
@@ -14377,42 +14237,6 @@ class SessionStorage:
                     raise PendingChatInputConflictError(
                         "pending input changed before atomic dispatch"
                     )
-            await conn.execute(
-                """
-                DELETE FROM meta_launch_drafts
-                WHERE session_key = ? AND client_request_id = ?
-                """,
-                (request_session_key, client_request_id),
-            )
-            if meta_control_intent_id is not None:
-                if task_record is None:
-                    raise AssertionError(
-                        "validated MetaSkill control turn lost its runtime task"
-                    )
-                async with conn.execute(
-                    """
-                    UPDATE meta_control_intents
-                    SET status = 'accepted', accepted_source_scope = ?,
-                        accepted_request_session_key = ?, accepted_client_request_id = ?,
-                        accepted_request_fingerprint = ?, accepted_message_id = ?,
-                        accepted_task_id = ?, updated_at = ?
-                    WHERE intent_id = ? AND status = 'staged'
-                    """,
-                    (
-                        source_scope,
-                        request_session_key,
-                        client_request_id,
-                        request_fingerprint,
-                        entry.message_id,
-                        task_record.task_id,
-                        updated_at,
-                        meta_control_intent_id,
-                    ),
-                ) as cur:
-                    if int(cur.rowcount or 0) != 1:
-                        raise MetaControlIntentConflictError(
-                            "MetaSkill control authorization changed during acceptance"
-                        )
             acceptance_result = TurnAcceptanceResult(
                 receipt=receipt,
                 replayed=False,
@@ -14436,11 +14260,6 @@ class SessionStorage:
                 goal_command_response=accepted_goal_command_response,
             )
         if reset_from_session_id is not None:
-            _clear_pending_meta_launch_boundary(
-                entry.session_key,
-                preserve_client_request_id=client_request_id,
-                preserve_message=entry.content,
-            )
             from opensquilla.session.material_cleanup import run_session_artifact_cleanup
 
             await run_session_artifact_cleanup(reset_from_session_id, entry.session_key)
@@ -14458,11 +14277,31 @@ class SessionStorage:
         session_id: str,
         limit: int | None,
         offset: int,
+        content_mode: str = "full",
     ) -> list[Any]:
         # SQLite requires LIMIT before OFFSET; use -1 for unlimited
         limit_val = limit if limit is not None else -1
+        if content_mode == "full":
+            select_sql = "SELECT *"
+        elif content_mode == "bounded":
+            select_sql = f"""
+                SELECT id, session_id, session_key, message_id, role,
+                       {_BOUNDED_TRANSCRIPT_CONTENT_SQL} AS content,
+                       {_BOUNDED_TRANSCRIPT_TRUNCATED_SQL} AS content_truncated,
+                       {_BOUNDED_USER_ENVELOPE_SQL} AS user_display_envelope,
+                       content_byte_length,
+                       content_revision,
+                       'active' AS content_source,
+                       tool_calls, tool_call_id, reasoning_content, NULL AS assistant_replay,
+                       turn_usage, turn_context, created_at, token_count,
+                       provenance_kind, provenance_origin_session_id,
+                       provenance_source_session_key, provenance_source_channel,
+                       provenance_source_tool, schema_version
+            """
+        else:
+            raise ValueError("content_mode must be 'full' or 'bounded'")
         sql = (
-            "SELECT * FROM transcript_entries WHERE session_id = ? "
+            f"{select_sql} FROM transcript_entries WHERE session_id = ? "
             "ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?"
         )
         async with conn.execute(sql, (session_id, limit_val, offset)) as cur:
@@ -14473,6 +14312,7 @@ class SessionStorage:
         session_id: str,
         limit: int | None,
         offset: int,
+        content_mode: str = "full",
     ) -> list[Any]:
         if not _BOUNDED_INTERACTIVE_READS.get():
             async with self._operation_lock:
@@ -14485,6 +14325,7 @@ class SessionStorage:
                             session_id,
                             limit,
                             offset,
+                            content_mode,
                         )
                     )
                 )
@@ -14513,6 +14354,7 @@ class SessionStorage:
                         session_id,
                         limit,
                         offset,
+                        content_mode,
                     )
                 )
             )
@@ -14521,12 +14363,16 @@ class SessionStorage:
                 self._operation_lock.release()
 
     @asynccontextmanager
-    async def _transcript_reader_access(self) -> AsyncIterator[Any | None]:
+    async def _transcript_reader_access(
+        self,
+        operation: str = "transcript_reader",
+    ) -> AsyncIterator[Any | None]:
         selected = _READ_CONNECTION.get()
         if current_read_budget() is not None and selected is not None and selected[0] is self:
             yield selected[1]
             return
         acquired = False
+        wait_started = self._monotonic()
         if not _BOUNDED_INTERACTIVE_READS.get():
             await self._transcript_reader_lock.acquire()
             acquired = True
@@ -14544,22 +14390,36 @@ class SessionStorage:
                     resource="session_storage_transcript_reader_lock",
                 ) from exc
             acquired = True
+        wait_ms = max(0, int((self._monotonic() - wait_started) * 1000))
+        hold_started = self._monotonic()
         try:
             self._raise_if_poisoned()
             yield self._transcript_reader
         finally:
             if acquired:
+                hold_ms = max(0, int((self._monotonic() - hold_started) * 1000))
                 self._transcript_reader_lock.release()
+                _log_read_path_timing(
+                    operation=operation,
+                    wait_ms=wait_ms,
+                    hold_ms=hold_ms,
+                )
 
     async def _read_transcript_rows(
-        self, session_id: str, limit: int | None = None, offset: int = 0
+        self,
+        session_id: str,
+        limit: int | None = None,
+        offset: int = 0,
+        content_mode: str = "full",
     ) -> list[Any]:
         if current_read_budget() is not None:
             return await self._run_recovery_read(
                 "get_transcript",
-                lambda reader: self._fetch_transcript_rows(reader, session_id, limit, offset),
+                lambda reader: self._fetch_transcript_rows(
+                    reader, session_id, limit, offset, content_mode,
+                ),
             )
-        async with self._transcript_reader_access() as reader:
+        async with self._transcript_reader_access("transcript_rows") as reader:
             if reader is not None:
                 rows = await self._finish_sqlite_call(
                     self._fetch_transcript_rows(
@@ -14567,6 +14427,7 @@ class SessionStorage:
                         session_id,
                         limit,
                         offset,
+                        content_mode,
                     )
                 )
             else:
@@ -14576,6 +14437,7 @@ class SessionStorage:
                 session_id,
                 limit,
                 offset,
+                content_mode,
             )
         return cast(list[Any], rows)
 
@@ -14589,34 +14451,482 @@ class SessionStorage:
             self._fetch_history_query(self.conn, sql, params),
         ))
 
-    async def _read_history_query(self, sql: str, params: Sequence[Any]) -> list[Any]:
+    async def _read_history_query(
+        self,
+        sql: str,
+        params: Sequence[Any],
+        *,
+        operation: str = "history_query",
+    ) -> list[Any]:
         """Keep single-statement history projections off the shared writer gate."""
         if current_read_budget() is not None:
-            return await self._run_recovery_read(
-                "get_history", lambda reader: self._fetch_history_query(reader, sql, params),
+            query_started = self._monotonic()
+            rows = await self._run_recovery_read(
+                "get_history",
+                lambda reader: self._fetch_history_query(reader, sql, params),
             )
-        async with self._transcript_reader_access() as reader:
+            _log_read_path_timing(
+                operation=f"{operation}:recovery",
+                query_ms=max(0, int((self._monotonic() - query_started) * 1000)),
+                rows=len(rows),
+                sql_tag=_read_path_sql_tag(sql),
+            )
+            return rows
+        query_started = self._monotonic()
+        async with self._transcript_reader_access(operation) as reader:
             if reader is not None:
-                return cast(list[Any], await self._finish_sqlite_call(
+                rows = cast(list[Any], await self._finish_sqlite_call(
                     self._fetch_history_query(reader, sql, params),
                 ))
-        return await self._fetch_history_query_on_writer(sql, params)
+                _log_read_path_timing(
+                    operation=operation,
+                    query_ms=max(0, int((self._monotonic() - query_started) * 1000)),
+                    rows=len(rows),
+                    sql_tag=_read_path_sql_tag(sql),
+                )
+                return rows
+        rows = await self._fetch_history_query_on_writer(sql, params)
+        _log_read_path_timing(
+            operation=operation,
+            query_ms=max(0, int((self._monotonic() - query_started) * 1000)),
+            rows=len(rows),
+            sql_tag=_read_path_sql_tag(sql),
+        )
+        return rows
+
+    async def _read_title_query_pair(
+        self,
+        candidate_sql: str,
+        candidate_params: Sequence[Any],
+        content_query: Callable[[list[Any]], tuple[str, Sequence[Any]]],
+        *,
+        operation: str,
+    ) -> tuple[list[Any], list[Any]]:
+        """Run title candidate and bounded content reads on one short lease."""
+
+        async def execute_pair(reader: Any) -> tuple[list[Any], list[Any]]:
+            await reader.execute("BEGIN")
+            try:
+                started = self._monotonic()
+                candidates = cast(list[Any], await self._fetch_history_query(
+                    reader, candidate_sql, candidate_params,
+                ))
+                _log_read_path_timing(
+                    operation=f"{operation}:candidates",
+                    query_ms=max(0, int((self._monotonic() - started) * 1000)),
+                    rows=len(candidates),
+                )
+                if not candidates:
+                    await reader.execute("COMMIT")
+                    return candidates, []
+                content_sql, content_params = content_query(candidates)
+                started = self._monotonic()
+                content_rows = cast(list[Any], await self._fetch_history_query(
+                    reader, content_sql, content_params,
+                ))
+                _log_read_path_timing(
+                    operation=f"{operation}:content",
+                    query_ms=max(0, int((self._monotonic() - started) * 1000)),
+                    rows=len(content_rows),
+                )
+                await reader.execute("COMMIT")
+                return candidates, content_rows
+            except BaseException:
+                with contextlib.suppress(BaseException):
+                    await reader.execute("ROLLBACK")
+                raise
+
+        selected = _READ_CONNECTION.get()
+        if selected is not None and selected[0] is self:
+            return await execute_pair(selected[1])
+        # Clock resolution is not request identity: concurrent Windows calls
+        # can share a monotonic_ns tick and otherwise collide in the read pool.
+        # Pool admission/deadline failures must propagate without bypassing its
+        # physical connection limit through the legacy reader or writer.
+        with recovery_read_scope(
+            f"session-title:{uuid4().hex}",
+            deadline=self._monotonic() + 2.0,
+            workload="identity",
+        ):
+            return await self._run_recovery_read(operation, execute_pair)
 
     async def get_transcript(
-        self, session_id: str, limit: int | None = None, offset: int = 0
+        self, session_id: str, limit: int | None = None, offset: int = 0,
+        *, content_mode: str = "full",
     ) -> list[TranscriptEntry]:
-        rows = await self._read_transcript_rows(session_id, limit, offset)
+        rows = await self._read_transcript_rows(session_id, limit, offset, content_mode)
         return await self._decode_read_rows(rows)
+
+    async def get_transcript_token_metadata(self, session_id: str) -> dict[str, int | bool]:
+        """Return a bounded token summary without reading transcript bodies.
+
+        ``usage.status`` is a control-plane request and must not fall back to
+        ``get_transcript()`` when a legacy session has no persisted context
+        token value.  This aggregate only touches scalar metadata columns;
+        in particular it never evaluates ``content``/``length(content)``.
+        Rows with a missing token count are reported explicitly so callers can
+        expose an incomplete estimate instead of presenting a false zero.
+        """
+
+        sql = """
+            SELECT
+                COUNT(*) AS entry_count,
+                COALESCE(SUM(
+                    CASE WHEN token_count IS NOT NULL AND token_count >= 0
+                         THEN token_count ELSE 0 END
+                ), 0) AS known_tokens,
+                COALESCE(SUM(
+                    CASE WHEN token_count IS NULL OR token_count < 0
+                         THEN 1 ELSE 0 END
+                ), 0) AS unknown_entries
+            FROM transcript_entries
+            WHERE session_id = ?
+        """
+        rows = await self._read_history_query(
+            sql,
+            (session_id,),
+            operation="transcript_token_metadata",
+        )
+        row = rows[0] if rows else None
+        if row is None:
+            return {
+                "entry_count": 0,
+                "known_tokens": 0,
+                "unknown_entries": 0,
+                "complete": True,
+            }
+        get = row.__getitem__ if hasattr(row, "__getitem__") else lambda key: None
+        entry_count = max(0, int(get("entry_count") or 0))
+        known_tokens = max(0, int(get("known_tokens") or 0))
+        unknown_entries = max(0, int(get("unknown_entries") or 0))
+        return {
+            "entry_count": entry_count,
+            "known_tokens": known_tokens,
+            "unknown_entries": unknown_entries,
+            "complete": unknown_entries == 0,
+        }
 
     async def _decode_read_rows(self, rows: Sequence[Any]) -> list[TranscriptEntry]:
         budget = current_read_budget()
         if budget is None:
-            return await asyncio.to_thread(_decode_transcript_rows, rows)
-        budget.check()
-        task = asyncio.create_task(asyncio.to_thread(_decode_transcript_rows, rows))
-        self._pending_reader_operations.add(task)
-        task.add_done_callback(self._pending_reader_operations.discard)
-        return await budget.wait_for(task)
+            decoded = await asyncio.to_thread(_decode_transcript_rows, rows)
+        else:
+            budget.check()
+            task = asyncio.create_task(asyncio.to_thread(_decode_transcript_rows, rows))
+            self._pending_reader_operations.add(task)
+            task.add_done_callback(self._pending_reader_operations.discard)
+            decoded = await budget.wait_for(task)
+        # ``content_byte_length`` is storage metadata rather than a
+        # SQLModel field, so model_dump() and the normal transcript contract
+        # remain unchanged.  Legacy rows may be NULL until the post-ready
+        # backfill completes.
+        for entry, row in zip(decoded, rows, strict=True):
+            keys = row.keys() if hasattr(row, "keys") else ()
+            if "user_display_envelope" in keys and row["user_display_envelope"] is not None:
+                object.__setattr__(
+                    entry, "user_display_envelope", json.loads(row["user_display_envelope"])
+                )
+            if "content_truncated" in keys:
+                object.__setattr__(entry, "content_truncated", bool(row["content_truncated"]))
+            length = row["content_byte_length"] if "content_byte_length" in keys else None
+            if length is not None:
+                object.__setattr__(entry, "content_byte_length", max(0, int(length or 0)))
+            elif "content_byte_length" in keys:
+                # Legacy rows are safe to preview but cannot expose a range
+                # reference until the post-ready metadata backfill indexes
+                # their exact UTF-8 size.
+                object.__setattr__(entry, "content_metadata_pending", True)
+            source = row["content_source"] if "content_source" in keys else None
+            if source in {"active", "compacted"}:
+                object.__setattr__(entry, "content_source", source)
+                row_id = row["id"] if "id" in keys else None
+                created_at = row["created_at"] if "created_at" in keys else None
+                if row_id is not None and created_at is not None:
+                    # The row identity is immutable for ordinary transcript
+                    # publication.  Carry it as a cache/re-read fence so a
+                    # replaced row cannot reuse a previous range cache entry
+                    # merely because its byte length happens to match.
+                    object.__setattr__(
+                        entry,
+                        "content_revision",
+                        f"legacy-v1:{source}:{int(row_id)}:{int(created_at)}:"
+                        f"{int(row['content_revision'] or 0) if 'content_revision' in keys else 0}:"
+                        f"{int(length) if length is not None else 'pending'}",
+                    )
+        await self._project_user_attachment_metadata(decoded)
+        return decoded
+
+    async def _project_user_attachment_metadata(self, entries: Sequence[TranscriptEntry]) -> None:
+        """Enrich only this page's display descriptors; never load raw page bodies."""
+        from opensquilla.contracts.attachments import MAX_TOTAL_ATTACHMENT_BYTES
+        from opensquilla.session.attachment_history import MAX_INLINE_ENVELOPE_BYTES
+        from opensquilla.session.attachment_manifest import legacy_attachment_id, valid_sha256
+
+        selected = [
+            entry
+            for entry in entries
+            if isinstance(getattr(entry, "user_display_envelope", None), dict)
+        ]
+        if not selected:
+            return
+        manifests: dict[tuple[str, str, int], dict[str, Any]] = {}
+        for session_id in dict.fromkeys(entry.session_id for entry in selected):
+            message_ids = [entry.message_id for entry in selected if entry.session_id == session_id]
+            placeholders = ",".join("?" for _ in message_ids)
+            rows = await self._read_history_query(
+                f"""WITH latest AS (
+                    SELECT payload FROM session_context_states
+                    WHERE session_id = ? AND provider = 'portable'
+                      AND state_kind = 'attachment_manifest_v1' AND valid = 1
+                      AND length(CAST(payload AS BLOB)) <= {MAX_INLINE_ENVELOPE_BYTES}
+                      AND json_valid(payload)
+                    ORDER BY created_at DESC, id DESC LIMIT 1
+                ) SELECT substr(json_extract(item.value, '$.source_message_id'), 1, 256),
+                         json_extract(item.value, '$.ordinal'),
+                         substr(json_extract(item.value, '$.attachment_id'), 1, 256),
+                         substr(json_extract(item.value, '$.sha256_ref'), 1, 64),
+                         json_extract(item.value, '$.size')
+                  FROM latest, json_each(latest.payload, '$.occurrences') AS item
+                  WHERE item.type = 'object'
+                    AND json_extract(item.value, '$.source_message_id') IN ({placeholders})
+                  LIMIT ?""",
+                [session_id, *message_ids, len(message_ids) * 16],
+                operation="history_attachment_metadata",
+            )
+            for message_id, ordinal, attachment_id, sha, size in rows:
+                if isinstance(ordinal, int):
+                    manifests[(session_id, message_id, ordinal)] = {
+                        "attachment_id": attachment_id,
+                        "sha256_ref": sha,
+                        "size": size,
+                    }
+
+        # The 60MiB admission limit belongs to each canonical message. Page
+        # work uses the existing reader lease/deadline; exhausting that lease
+        # must raise retryable busy, never mark a valid later image missing.
+        for entry in selected:
+            remaining = MAX_TOTAL_ATTACHMENT_BYTES
+            projection = getattr(entry, "user_display_envelope")
+            envelope = projection.get("envelope")
+            if not isinstance(envelope, dict):
+                continue
+            attachments = envelope.get("attachments", [])
+            fallback: dict[int, dict[str, Any]] | None = None
+            for ordinal in projection.get("inline_ordinals", []):
+                attachment = attachments[ordinal]
+                if not isinstance(attachment, dict) or attachment.get("missing_reason"):
+                    continue
+                indexed = manifests.get((entry.session_id, entry.message_id, ordinal))
+                try:
+                    ref = await self.get_legacy_content_ref(
+                        entry.session_id,
+                        entry.message_id,
+                        source=getattr(entry, "content_source", None),
+                        actual_byte_length=True,
+                    )
+                    page_revision = getattr(entry, "content_revision", "")
+                    if (
+                        not ref.revision
+                        or ref.revision.rsplit(":", 1)[0] != page_revision.rsplit(":", 1)[0]
+                    ):
+                        raise ContentNotFoundError("attachment source changed")
+                    # This resolved identity belongs to the attachment read.
+                    # Keep the page's pending body reference until storage
+                    # actually indexes its length; HTTP sees the same metadata.
+                    if not (
+                        indexed
+                        and indexed.get("attachment_id") == attachment.get("attachment_id")
+                        and valid_sha256(indexed.get("sha256_ref"))
+                        and isinstance(indexed.get("size"), int)
+                        and indexed["size"] >= 0
+                    ):
+                        if fallback is None:
+                            fallback = await self._read_inline_attachment_digests(
+                                ref, max_bytes=remaining
+                            )
+                            remaining -= sum(item.get("size", 0) for item in fallback.values())
+                        indexed = fallback.get(ordinal)
+                        if not indexed or indexed.get("error"):
+                            raise ContentRangeError("attachment preview unavailable")
+                    attachment["sha256_ref"] = indexed["sha256_ref"]
+                    attachment["size"] = indexed["size"]
+                    if not attachment.get("attachment_id"):
+                        attachment["attachment_id"] = legacy_attachment_id(
+                            session_id=entry.session_id, message_id=entry.message_id,
+                            index=ordinal, sha256=indexed["sha256_ref"],
+                        )
+                    # These are opaque URL locators, not canonical metadata.
+                    attachment["_history_source"] = {
+                        "message_id": entry.message_id,
+                        "ordinal": ordinal,
+                        "revision": ref.revision,
+                        "source": ref.source,
+                    }
+                except (
+                    ContentNotFoundError,
+                    ContentMetadataPendingError,
+                    ContentRangeError,
+                    ValueError,
+                ):
+                    attachment["missing_reason"] = "attachment preview unavailable"
+
+    async def _read_inline_attachment_digests(
+        self, ref: LegacyContentRef, *, max_bytes: int
+    ) -> dict[int, dict[str, Any]]:
+        """Native json_each parses one exact row; Python sees one attachment at a time."""
+        from opensquilla.session.attachment_history import MAX_INLINE_ENVELOPE_BYTES
+
+        table = {"active": "transcript_entries", "compacted": "compacted_transcript_entries"}[
+            ref.source
+        ]
+        identity = "id" if ref.source == "active" else "original_entry_id"
+        rows = await self._read_history_query(
+            f"""WITH source AS MATERIALIZED (
+                SELECT content FROM {table} WHERE session_id = ? AND message_id = ? """
+            f"""AND role = 'user'
+                  AND 'legacy-v1:{ref.source}:' || {identity} || ':' || created_at || """
+            f"""':' || content_revision || ':' || length(CAST(content AS BLOB)) = ?
+                  AND length(CAST(content AS BLOB)) <= {MAX_INLINE_ENVELOPE_BYTES}
+                LIMIT 1
+            ), items AS MATERIALIZED (
+                SELECT item.key AS ordinal, json_extract(item.value, '$.data') AS data,
+                       coalesce(json_extract(item.value, '$.type'), """
+            f"""json_extract(item.value, '$.mime')) AS mime
+                FROM source, json_each(source.content, '$.attachments') AS item
+                WHERE item.type = 'object' AND item.key < 16
+                  AND json_type(item.value, '$.data') = 'text'
+                  AND json_extract(item.value, '$.missing_reason') IS NULL
+            ), sized AS (
+                SELECT *, length(data) / 4 * 3 - (substr(data, -1) = '=') - """
+            f"""(substr(data, -2, 1) = '=') AS raw_size
+                FROM items
+            ) SELECT ordinal, history_inline_digest(data, mime,
+                max(0, ? - coalesce(sum(raw_size) OVER (ORDER BY ordinal ROWS BETWEEN """
+            f"""UNBOUNDED PRECEDING AND 1 PRECEDING), 0)))
+                FROM sized""",
+            (ref.session_id, ref.message_id, ref.revision, max_bytes),
+            operation="inline_attachment_digests",
+        )
+        if not rows:
+            raise ContentNotFoundError("attachment source changed")
+        return {int(ordinal): json.loads(payload) for ordinal, payload in rows}
+
+    async def read_inline_attachment(
+        self,
+        ref: LegacyContentRef,
+        ordinal: int,
+        *,
+        max_bytes: int | None = None,
+        include_data: bool = True,
+    ) -> dict[str, Any]:
+        """Read one legacy inline occurrence in bounded, revision-fenced chunks."""
+        from opensquilla.contracts.attachments import (
+            MAX_ATTACHMENTS,
+            MAX_TOTAL_ATTACHMENT_BYTES,
+            attachment_size_limit_for_mime,
+        )
+        from opensquilla.session.attachment_history import (
+            INLINE_CHUNK_CHARS,
+            MAX_INLINE_ENVELOPE_BYTES,
+        )
+
+        if (
+            not isinstance(ordinal, int)
+            or isinstance(ordinal, bool)
+            or not 0 <= ordinal < MAX_ATTACHMENTS
+        ):
+            raise ContentRangeError("attachment ordinal is invalid")
+        table = {"active": "transcript_entries", "compacted": "compacted_transcript_entries"}.get(
+            ref.source
+        )
+        if table is None or not ref.revision:
+            raise ContentNotFoundError("attachment source is invalid")
+        identity = "id" if ref.source == "active" else "original_entry_id"
+        path = f"$.attachments[{ordinal}]"
+        limit = min(
+            MAX_TOTAL_ATTACHMENT_BYTES,
+            max_bytes if max_bytes is not None else MAX_TOTAL_ATTACHMENT_BYTES,
+        )
+        if limit < 0:
+            raise ContentRangeError("attachment read budget exhausted")
+        metadata_sql = (
+            f"""SELECT {identity}, created_at, content_revision,
+                   length(CAST(content AS BLOB)),
+                   substr(json_extract(content, '{path}.type'), 1, 120), """
+            f"""substr(json_extract(content, '{path}.mime'), 1, 120),
+                   substr(json_extract(content, '{path}.name'), 1, 160),
+                   length(json_extract(content, '{path}.data')),
+                   json_type(content, '{path}.data'), substr(json_extract(content, """
+            f"""'{path}.missing_reason'), 1, 256)
+             FROM {table} WHERE session_id = ? AND message_id = ? AND role = 'user'
+               AND CASE WHEN length(CAST(content AS BLOB)) <= {MAX_INLINE_ENVELOPE_BYTES}
+                   THEN CASE WHEN json_valid(content) THEN
+                     json_type(content, '$.text') = 'text' AND json_type(content, """
+            f"""'$.attachments') = 'array'
+                     ELSE 0 END ELSE 0 END
+             LIMIT 1"""
+        )
+        rows = await self._read_history_query(
+            metadata_sql, (ref.session_id, ref.message_id), operation="inline_attachment_metadata"
+        )
+        if not rows:
+            raise ContentNotFoundError("attachment source was not found")
+        row = rows[0]
+        revision = (
+            f"legacy-v1:{ref.source}:{int(row[0])}:{int(row[1])}:{int(row[2] or 0)}:{int(row[3])}"
+        )
+        if revision != ref.revision or row[8] != "text" or row[9]:
+            raise ContentNotFoundError("attachment source changed or is unavailable")
+        mime = row[4] or row[5]
+        if not isinstance(mime, str):
+            raise ContentRangeError("attachment MIME is missing")
+        limit = min(limit, attachment_size_limit_for_mime(mime))
+        encoded_size = int(row[7] or 0)
+        if encoded_size <= 0 or encoded_size > ((limit + 2) // 3) * 4 or encoded_size % 4:
+            raise ContentRangeError("attachment exceeds the read limit")
+        # Fetch one admitted attachment, never a whole envelope/page. Parsing
+        # the same maximum-size JSON once per small range is prohibitively
+        # expensive; the single result is capped by the MIME/remaining budget
+        # already proved above, then decoded and hashed in worker chunks.
+        rows = await self._read_history_query(
+            f"""SELECT substr(json_extract(content, '{path}.data'), 1, ?)
+                 FROM {table} WHERE session_id = ? AND message_id = ? AND role = 'user'
+                   AND {identity} = ? AND created_at = ? AND content_revision = ?
+                   AND length(CAST(content AS BLOB)) = ? LIMIT 1""",
+            (encoded_size + 1, ref.session_id, ref.message_id, row[0], row[1], row[2], row[3]),
+            operation="inline_attachment_data",
+        )
+        if not rows or not isinstance(rows[0][0], str) or len(rows[0][0]) != encoded_size:
+            raise ContentNotFoundError("attachment source changed")
+        encoded = rows[0][0]
+
+        def decode() -> dict[str, Any]:
+            digest = hashlib.sha256()
+            data = bytearray()
+            size = 0
+            for offset in range(0, encoded_size, INLINE_CHUNK_CHARS):
+                part = encoded[offset:offset + INLINE_CHUNK_CHARS]
+                if offset + len(part) < encoded_size and "=" in part:
+                    raise ContentRangeError("attachment data has premature padding")
+                try:
+                    chunk = base64.b64decode(part, validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise ContentRangeError("attachment data is invalid") from exc
+                size += len(chunk)
+                if size > limit:
+                    raise ContentRangeError("attachment exceeds the read limit")
+                digest.update(chunk)
+                if include_data:
+                    data.extend(chunk)
+            return {
+                "sha256_ref": digest.hexdigest(),
+                "size": size,
+                "mime": mime,
+                "name": row[6],
+                "data": bytes(data) if include_data else None,
+            }
+
+        return await asyncio.to_thread(decode)
 
     async def get_canonical_transcript(
         self, session_id: str, limit: int | None = None, offset: int = 0
@@ -14635,7 +14945,7 @@ class SessionStorage:
                 ),
             )
             return await self._decode_read_rows(recovery_rows)
-        async with self._transcript_reader_access() as reader:
+        async with self._transcript_reader_access("canonical_transcript") as reader:
             rows = (
                 await self._finish_sqlite_call(
                     self._fetch_canonical_transcript_rows(
@@ -14674,6 +14984,7 @@ class SessionStorage:
                 message_id,
                 role,
                 content,
+                content_byte_length,
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
@@ -14698,6 +15009,7 @@ class SessionStorage:
                 message_id,
                 role,
                 content,
+                content_byte_length,
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
@@ -14766,6 +15078,7 @@ class SessionStorage:
                 message_id,
                 role,
                 content,
+                content_byte_length,
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
@@ -14790,6 +15103,7 @@ class SessionStorage:
                 message_id,
                 role,
                 content,
+                content_byte_length,
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
@@ -15246,6 +15560,7 @@ class SessionStorage:
         limit: int,
         before: tuple[int, int] | None = None,
         after: tuple[int, int] | None = None,
+        content_mode: str = "full",
     ) -> tuple[list[TranscriptEntry], bool]:
         """Return one keyset page across archived and active transcript rows.
 
@@ -15255,8 +15570,17 @@ class SessionStorage:
         an anchor in this session; missing, foreign, or deleted anchors fail
         instead of becoming an unpositioned latest read.
         """
+        if content_mode not in {"full", "bounded"}:
+            raise ValueError("content_mode must be 'full' or 'bounded'")
         page_size = max(1, int(limit))
         fetch_size = page_size + 1
+        # SQLite performs the substring before the row crosses the Python
+        # boundary. Small envelopes stay parseable; larger bodies have a
+        # bounded prefix with an explicit truncation bit.
+        content_sql = "content" if content_mode == "full" else _BOUNDED_TRANSCRIPT_CONTENT_SQL
+        truncated_sql = "0" if content_mode == "full" else _BOUNDED_TRANSCRIPT_TRUNCATED_SQL
+        replay_sql = "assistant_replay" if content_mode == "full" else "NULL"
+        envelope_sql = "NULL" if content_mode == "full" else _BOUNDED_USER_ENVELOPE_SQL
 
         cursor = before
         ascending = False
@@ -15315,11 +15639,16 @@ class SessionStorage:
                     session_key,
                     message_id,
                     role,
-                    content,
+                    {content_sql} AS content,
+                    {truncated_sql} AS content_truncated,
+                    {envelope_sql} AS user_display_envelope,
+                    content_byte_length,
+                    content_revision,
+                    'active' AS content_source,
                     tool_calls,
                     tool_call_id,
                     reasoning_content,
-                    assistant_replay,
+                    {replay_sql} AS assistant_replay,
                     turn_usage,
                     turn_context,
                     created_at,
@@ -15344,11 +15673,16 @@ class SessionStorage:
                     session_key,
                     message_id,
                     role,
-                    content,
+                    {content_sql} AS content,
+                    {truncated_sql} AS content_truncated,
+                    {envelope_sql} AS user_display_envelope,
+                    content_byte_length,
+                    content_revision,
+                    'compacted' AS content_source,
                     tool_calls,
                     tool_call_id,
                     reasoning_content,
-                    assistant_replay,
+                    {replay_sql} AS assistant_replay,
                     turn_usage,
                     turn_context,
                     created_at,
@@ -15393,7 +15727,11 @@ class SessionStorage:
         # statement, so a concurrent reset, delete, or compaction lands wholly
         # before or after this snapshot.
         params = [*anchor_params, *active_params, *archived_params, fetch_size]
-        rows = await self._read_history_query(sql, params)
+        rows = await self._read_history_query(
+            sql,
+            params,
+            operation="canonical_page",
+        )
 
         if not rows or not bool(rows[0]["_cursor_valid"]):
             raise HistoryCursorInvalidatedError(
@@ -15455,7 +15793,11 @@ class SessionStorage:
             WHERE session.session_id = ?
             LIMIT 1
         """
-        rows = await self._read_history_query(sql, (session_id,))
+        rows = await self._read_history_query(
+            sql,
+            (session_id,),
+            operation="canonical_coverage",
+        )
         row = rows[0] if rows else None
         if row is None:
             return CanonicalTranscriptCoverage(
@@ -15521,6 +15863,7 @@ class SessionStorage:
                 message_id,
                 role,
                 content,
+                content_byte_length,
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
@@ -15546,6 +15889,7 @@ class SessionStorage:
                 message_id,
                 role,
                 content,
+                content_byte_length,
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
@@ -15599,9 +15943,10 @@ class SessionStorage:
                     continue
                 await conn.execute(
                     "UPDATE compacted_transcript_entries "
-                    "SET content = ?, turn_context = ? WHERE id = ?",
+                    "SET content = ?, content_byte_length = ?, turn_context = ? WHERE id = ?",
                     (
                         rebound_content,
+                        _content_byte_length(rebound_content),
                         _serialize(rebound_context) if rebound_context != context
                         else row["turn_context"],
                         row["id"],
@@ -15664,32 +16009,65 @@ class SessionStorage:
         session_ids = list(dict.fromkeys(session_ids))
         if not session_ids:
             return {}
-        chunk = 300
         result: dict[str, list[str]] = {sid: [] for sid in session_ids}
         bounded_limit = max(0, int(limit_per_session))
         if not bounded_limit:
             return result
+        # The second phase binds one id per eligible row.  Keep both the
+        # candidate and content statements below SQLite's variable limit even
+        # when a caller asks for more than the normal three title inputs.
+        chunk = max(1, min(300, 900 // max(1, bounded_limit)))
         for i in range(0, len(session_ids), chunk):
             batch = session_ids[i : i + chunk]
             values = ",".join("(?)" for _ in batch)
-            sql = f"""
+            # Keep candidate discovery metadata-only.  A correlated query
+            # that selects ``entry.content`` in the same statement can still
+            # make SQLite touch a legacy NULL/oversized body before it proves
+            # that no title candidate exists.  First obtain at most N ids via
+            # the metadata index, then read only a bounded prefix for those
+            # rows in a separate query.
+            candidate_sql = f"""
                 WITH requested(session_id) AS (VALUES {values})
-                SELECT entry.session_id, entry.content
+                SELECT entry.session_id, entry.id
                 FROM requested
                 JOIN transcript_entries AS entry ON entry.id IN (
-                    SELECT id FROM transcript_entries
+                    SELECT id
+                    FROM transcript_entries
                     WHERE session_id = requested.session_id
-                        AND role = 'user'
-                        AND COALESCE(content, '') != ''
+                      AND role = 'user'
+                      AND content_byte_length IS NOT NULL
+                      AND content_byte_length > 0
+                      AND content_byte_length <= {SESSION_TITLE_MAX_BODY_BYTES}
                     ORDER BY created_at ASC, id ASC
                     LIMIT ?
                 )
                 ORDER BY entry.session_id ASC, entry.created_at ASC, entry.id ASC
             """
-            rows = await self._read_history_query(sql, [*batch, bounded_limit])
-            for sid, content in rows:
-                if isinstance(content, str):
-                    result.setdefault(sid, []).append(content)
+            def content_query(candidates: list[Any]) -> tuple[str, Sequence[Any]]:
+                candidate_ids = [int(row[1]) for row in candidates]
+                placeholders = ",".join("?" for _ in candidate_ids)
+                return (
+                    f"""
+                    SELECT id, session_id, {_SESSION_TITLE_CONTENT_SQL}
+                    FROM transcript_entries
+                    WHERE id IN ({placeholders})
+                    """,
+                    candidate_ids,
+                )
+
+            candidates, content_rows = await self._read_title_query_pair(
+                candidate_sql,
+                [*batch, bounded_limit],
+                content_query,
+                operation="session_titles",
+            )
+            if not candidates:
+                continue
+            by_id = {int(row[0]): row for row in content_rows}
+            for _, entry_id in candidates:
+                row = by_id.get(int(entry_id))
+                if row is not None and isinstance(row[2], str):
+                    result.setdefault(row[1], []).append(row[2])
         return result
 
     async def list_canonical_user_transcript_content_batch(
@@ -15701,10 +16079,12 @@ class SessionStorage:
         """Return early user text across active and archived transcript rows.
 
         Each source uses its existing session cursor index to select at most
-        ``limit_per_session`` candidates per session. Merging those candidates
-        in one statement preserves a single snapshot while compaction moves
-        rows between tables. Archived rows keep their original transcript ID,
-        matching canonical history ordering instead of archive insertion order.
+        ``limit_per_session`` metadata-only candidates per session. A second,
+        bounded lookup reads prefixes for those ids. The two short reads may
+        observe a concurrent compaction boundary; missing ids are ignored and
+        never substituted across sessions. Archived rows keep their original
+        transcript ID, matching canonical history ordering instead of archive
+        insertion order.
         """
         unique_ids = list(dict.fromkeys(session_ids))
         result: dict[str, list[str]] = {sid: [] for sid in unique_ids}
@@ -15714,55 +16094,92 @@ class SessionStorage:
 
         # One parameter per session plus three limits stays below SQLite's
         # historical 999-variable limit, including large directory requests.
-        chunk = 300
+        # Canonical reads can return ids from both active and compacted tables.
+        # Size chunks from the requested per-session limit so the second phase
+        # never binds more than roughly 900 ids.
+        chunk = max(1, min(300, 900 // max(1, 2 * bounded_limit)))
         for index in range(0, len(unique_ids), chunk):
             batch = unique_ids[index : index + chunk]
             values = ",".join("(?)" for _ in batch)
-            sql = f"""
+            candidate_sql = f"""
                 WITH requested(session_id) AS (VALUES {values}),
                 candidates AS (
-                    SELECT active.session_id, active.content,
-                           active.created_at, active.id AS original_entry_id
+                    SELECT 'active' AS source, entry.session_id, entry.id,
+                           entry.created_at, entry.id AS original_entry_id
                     FROM requested
-                    JOIN transcript_entries AS active ON active.id IN (
-                        SELECT id FROM transcript_entries
+                    JOIN transcript_entries AS entry ON entry.id IN (
+                        SELECT id
+                        FROM transcript_entries
                         WHERE session_id = requested.session_id
                           AND role = 'user'
-                          AND COALESCE(content, '') != ''
+                          AND content_byte_length IS NOT NULL
+                          AND content_byte_length > 0
+                          AND content_byte_length <= {SESSION_TITLE_MAX_BODY_BYTES}
                         ORDER BY created_at ASC, id ASC
                         LIMIT ?
                     )
                     UNION ALL
-                    SELECT archived.session_id, archived.content,
-                           archived.created_at, archived.original_entry_id
+                    SELECT 'archived' AS source, entry.session_id, entry.id,
+                           entry.created_at, entry.original_entry_id
                     FROM requested
-                    JOIN compacted_transcript_entries AS archived ON archived.id IN (
-                        SELECT id FROM compacted_transcript_entries
+                    JOIN compacted_transcript_entries AS entry ON entry.id IN (
+                        SELECT id
+                        FROM compacted_transcript_entries
                         WHERE session_id = requested.session_id
                           AND role = 'user'
-                          AND COALESCE(content, '') != ''
+                          AND content_byte_length IS NOT NULL
+                          AND content_byte_length > 0
+                          AND content_byte_length <= {SESSION_TITLE_MAX_BODY_BYTES}
                         ORDER BY created_at ASC, original_entry_id ASC, id ASC
                         LIMIT ?
                     )
                 ),
                 ranked AS (
-                    SELECT session_id, content,
+                    SELECT source, session_id, id, created_at, original_entry_id,
                            ROW_NUMBER() OVER (
                                PARTITION BY session_id
-                               ORDER BY created_at ASC, original_entry_id ASC
+                               ORDER BY created_at ASC, original_entry_id ASC, id ASC
                            ) AS rn
                     FROM candidates
                 )
-                SELECT session_id, content
+                SELECT source, session_id, id
                 FROM ranked
                 WHERE rn <= ?
                 ORDER BY session_id ASC, rn ASC
             """
-            params = [*batch, bounded_limit, bounded_limit, bounded_limit]
-            rows = await self._read_history_query(sql, params)
-            for sid, content in rows:
-                if isinstance(content, str):
-                    result[sid].append(content)
+            def content_query(candidates: list[Any]) -> tuple[str, Sequence[Any]]:
+                active_ids = [int(row[2]) for row in candidates if row[0] == "active"]
+                archived_ids = [int(row[2]) for row in candidates if row[0] == "archived"]
+                active_placeholders = ",".join("?" for _ in active_ids) or "NULL"
+                archived_placeholders = ",".join("?" for _ in archived_ids) or "NULL"
+                return (
+                    f"""
+                    SELECT 'active' AS source, id, session_id,
+                           {_SESSION_TITLE_CONTENT_SQL}
+                    FROM transcript_entries
+                    WHERE id IN ({active_placeholders})
+                    UNION ALL
+                    SELECT 'archived' AS source, id, session_id,
+                           {_SESSION_TITLE_CONTENT_SQL}
+                    FROM compacted_transcript_entries
+                    WHERE id IN ({archived_placeholders})
+                    """,
+                    [*active_ids, *archived_ids],
+                )
+
+            candidates, content_rows = await self._read_title_query_pair(
+                candidate_sql,
+                [*batch, bounded_limit, bounded_limit, bounded_limit],
+                content_query,
+                operation="canonical_titles",
+            )
+            if not candidates:
+                continue
+            by_key = {(row[0], int(row[1])): row for row in content_rows}
+            for source, _, entry_id in candidates:
+                row = by_key.get((source, int(entry_id)))
+                if row is not None and isinstance(row[3], str):
+                    result[row[2]].append(row[3])
         return result
 
     async def list_last_transcript_content_batch(
@@ -15802,16 +16219,483 @@ class SessionStorage:
                     SELECT id FROM transcript_entries
                     WHERE session_id = requested.session_id
                         AND role IN ('user', 'assistant')
-                        AND COALESCE(content, '') != ''
+                        AND length(substr(content, 1, 1)) > 0
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                 )
             """
-            rows = await self._read_history_query(sql, [*batch, bounded_chars])
+            rows = await self._read_history_query(
+                sql,
+                [*batch, bounded_chars],
+                operation="session_previews",
+            )
             for session_id, content in rows:
                 if isinstance(content, str):
                     result[session_id] = content
         return result
+
+    async def get_legacy_content_ref(
+        self,
+        session_id: str,
+        message_id: str,
+        *,
+        source: ContentSource | None = None,
+        actual_byte_length: bool = False,
+        allow_pending: bool = False,
+    ) -> LegacyContentRef:
+        """Return metadata for one legacy body without materializing it.
+
+        Active rows are preferred when the same message identity is present in
+        both tables.  ``source`` can pin a previously issued reference while
+        a caller streams ranges.  The body itself is never selected here.
+        """
+
+        if not isinstance(session_id, str) or not session_id:
+            raise ContentNotFoundError("legacy content session identity is missing")
+        if not isinstance(message_id, str) or not message_id:
+            raise ContentNotFoundError("legacy content message identity is missing")
+        if source not in (None, "active", "compacted"):
+            raise ContentNotFoundError("legacy content source is invalid")
+
+        if source == "active":
+            sql = """
+                SELECT 'active' AS source,
+                       id,
+                       created_at,
+                       content_revision,
+                       content_byte_length AS byte_length
+                FROM transcript_entries
+                WHERE session_id = ? AND message_id = ?
+                LIMIT 1
+            """
+        elif source == "compacted":
+            sql = """
+                SELECT 'compacted' AS source,
+                       original_entry_id AS id,
+                       created_at,
+                       content_revision,
+                       content_byte_length AS byte_length
+                FROM compacted_transcript_entries
+                WHERE session_id = ? AND message_id = ?
+                LIMIT 1
+            """
+        else:
+            sql = """
+                SELECT source, id, created_at, content_revision, byte_length
+                FROM (
+                    SELECT 'active' AS source,
+                           id,
+                           created_at,
+                           content_revision,
+                           content_byte_length AS byte_length,
+                           0 AS source_rank
+                    FROM transcript_entries
+                    WHERE session_id = ? AND message_id = ?
+                    UNION ALL
+                    SELECT 'compacted' AS source,
+                           original_entry_id AS id,
+                           created_at,
+                           content_revision,
+                           content_byte_length AS byte_length,
+                           1 AS source_rank
+                    FROM compacted_transcript_entries
+                    WHERE session_id = ? AND message_id = ?
+                )
+                ORDER BY source_rank
+                LIMIT 1
+            """
+
+        if actual_byte_length:
+            # Inline attachment compatibility must also work before metadata
+            # backfill. SQLite returns only this scalar, never the raw body.
+            sql = sql.replace(
+                "content_byte_length AS byte_length", "length(CAST(content AS BLOB)) AS byte_length"
+            )
+        params: tuple[str, ...] = (session_id, message_id)
+        if source is None:
+            params = (session_id, message_id, session_id, message_id)
+        rows = await self._read_history_query(
+            sql,
+            params,
+            operation="content_ref",
+        )
+        if not rows:
+            raise ContentNotFoundError("legacy transcript content was not found")
+        row = rows[0]
+        row_source = str(row[0])
+        if row_source not in ("active", "compacted"):
+            raise ContentNotFoundError("legacy transcript content source is invalid")
+        if row[4] is None and not allow_pending:
+            raise ContentMetadataPendingError(
+                "legacy transcript content metadata is still being indexed"
+            )
+        revision = None
+        if row[1] is not None and row[2] is not None:
+            revision = (
+                f"legacy-v1:{row_source}:{int(row[1])}:{int(row[2])}:"
+                f"{int(row[3] or 0)}:{int(row[4]) if row[4] is not None else 'pending'}"
+            )
+        return LegacyContentRef(
+            session_id=session_id,
+            message_id=message_id,
+            source=cast(ContentSource, row_source),
+            byte_length=max(0, int(row[4])) if row[4] is not None else None,
+            revision=revision,
+        )
+
+    async def read_legacy_content_range(
+        self,
+        ref: LegacyContentRef,
+        *,
+        offset: int = 0,
+        limit: int = MAX_CONTENT_RANGE_BYTES,
+    ) -> ContentRange:
+        """Read at most one bounded byte range from a legacy body.
+
+        SQLite slices the BLOB before it crosses the Python boundary.  This
+        preserves the old TEXT storage format while preventing a large JSON
+        body from being copied into a Gateway object merely to serve a range.
+        ``offset == byte_length`` is a valid empty EOF read; larger offsets are
+        rejected as caller errors.
+        """
+
+        offset, limit = validate_content_range(offset, limit)
+        if ref.byte_length is None:
+            raise ContentMetadataPendingError("raw ranges require indexed content length")
+        if offset > ref.byte_length:
+            raise ContentRangeError("content range offset exceeds content length")
+        table = {
+            "active": "transcript_entries",
+            "compacted": "compacted_transcript_entries",
+        }.get(ref.source)
+        if table is None:
+            raise ContentNotFoundError("legacy content source is invalid")
+        identity_column = "id" if table == "transcript_entries" else "original_entry_id"
+        sql = f"""
+            SELECT {identity_column} AS revision_id,
+                   created_at,
+                   content_revision,
+                   content_byte_length,
+                   substr(CAST(content AS BLOB), ?, ?)
+            FROM {table}
+            WHERE session_id = ? AND message_id = ?
+            LIMIT 1
+        """
+        rows = await self._read_history_query(
+            sql,
+            (offset + 1, limit, ref.session_id, ref.message_id),
+            operation="content_range",
+        )
+        if not rows:
+            raise ContentNotFoundError("legacy transcript content was not found")
+        if rows[0][3] is None:
+            raise ContentMetadataPendingError(
+                "legacy transcript content metadata is still being indexed"
+            )
+        total_bytes = max(0, int(rows[0][3]))
+        current_revision = None
+        if rows[0][0] is not None and rows[0][1] is not None:
+            current_revision = (
+                f"legacy-v1:{ref.source}:{int(rows[0][0])}:"
+                f"{int(rows[0][1])}:{int(rows[0][2] or 0)}:{total_bytes}"
+            )
+        if total_bytes != ref.byte_length or (
+            ref.revision is not None and current_revision != ref.revision
+        ):
+            raise ContentNotFoundError("legacy transcript content changed")
+        raw = rows[0][4]
+        data = bytes(raw or b"") if not isinstance(raw, bytes) else raw
+        # SQLite's substr returns no more than the requested limit.  Keep the
+        # invariant explicit because callers use it to size their buffers.
+        if len(data) > limit:
+            raise ContentRangeError("storage returned an oversized content range")
+        return ContentRange(ref=ref, offset=offset, limit=limit, data=data)
+
+    @_serialized_read
+    async def _read_unindexed_display_entry(
+        self, ref: LegacyContentRef, *, max_bytes: int,
+    ) -> TranscriptEntry:
+        """Read one unknown-length body on the owned SQLite worker and snapshot."""
+        from opensquilla.content_reader import ContentExportLimitError, content_revision_matches
+        from opensquilla.session.attachment_history import (
+            MAX_INLINE_ENVELOPE_BYTES,
+            USER_DISPLAY_TEXT_SQL,
+        )
+
+        table = {
+            "active": "transcript_entries", "compacted": "compacted_transcript_entries",
+        }[ref.source]
+        identity = "id" if ref.source == "active" else "original_entry_id"
+        reader = self.conn
+
+        def read() -> TranscriptEntry:
+            connection = reader._conn
+            owns_transaction = not connection.in_transaction
+            if owns_transaction:
+                connection.execute("BEGIN").close()
+            try:
+                cursor = connection.execute(
+                    f"""SELECT id AS blob_rowid, {identity} AS id, session_id, session_key,
+                        message_id, role, tool_calls, tool_call_id, reasoning_content,
+                        turn_usage, turn_context, created_at, token_count,
+                        provenance_kind, provenance_origin_session_id,
+                        provenance_source_session_key,
+                        provenance_source_channel, provenance_source_tool, schema_version,
+                        content_revision, content_byte_length, typeof(content) AS content_type
+                        FROM {table} WHERE session_id = ? AND message_id = ? LIMIT 1""",
+                    (ref.session_id, ref.message_id),
+                )
+                try:
+                    row = cursor.fetchone()
+                finally:
+                    cursor.close()
+                if row is None:
+                    raise ContentNotFoundError("legacy transcript content was not found")
+                length = row["content_byte_length"]
+                revision = (
+                    f"legacy-v1:{ref.source}:{row['id']}:{row['created_at']}:"
+                    f"{row['content_revision']}:{length if length is not None else 'pending'}"
+                )
+                if not ref.revision or not content_revision_matches(ref.revision, revision):
+                    raise ContentNotFoundError("legacy transcript content changed")
+                if row["content_type"] == "null":
+                    raw_bytes = b""
+                else:
+                    with connection.blobopen(
+                        table, "content", row["blob_rowid"], readonly=True,
+                    ) as blob:
+                        byte_length = len(blob)
+                        if byte_length <= max_bytes:
+                            raw_bytes = blob.read(byte_length)
+                        elif row["role"] == "user" and byte_length <= MAX_INLINE_ENVELOPE_BYTES:
+                            # The snapshot and version check above also fence
+                            # this caption read. Inspect only legal envelopes;
+                            # a huge ordinary body is rejected before any SQL
+                            # expression reads its content.
+                            caption_cursor = connection.execute(
+                                f"""SELECT {USER_DISPLAY_TEXT_SQL} FROM {table}
+                                    WHERE id = ? AND CASE WHEN json_valid(content)
+                                    THEN json_type(content, '$.text') = 'text'
+                                      AND json_type(content, '$.attachments') = 'array'
+                                      AND length(CAST({USER_DISPLAY_TEXT_SQL} AS BLOB)) <= ?
+                                    ELSE 0 END""",
+                                (row["blob_rowid"], max_bytes),
+                            )
+                            try:
+                                caption_row = caption_cursor.fetchone()
+                            finally:
+                                caption_cursor.close()
+                            if caption_row is None:
+                                raise ContentExportLimitError(
+                                    f"display content exceeds {max_bytes} bytes"
+                                )
+                            raw_bytes = json.dumps({"text": caption_row[0]}).encode("utf-8")
+                        else:
+                            raise ContentExportLimitError(
+                                f"display content exceeds {max_bytes} bytes"
+                            )
+            finally:
+                if owns_transaction:
+                    connection.rollback()
+            return _decode_legacy_display_row(row, raw_bytes)
+
+        async def run() -> TranscriptEntry:
+            if isinstance(reader, aiosqlite._AsyncConnection):
+                async with reader._locked:
+                    return cast(TranscriptEntry, await aiosqlite._run_sqlite_call(read))
+            return cast(TranscriptEntry, await reader._execute(read))
+
+        return cast(TranscriptEntry, await self._finish_sqlite_call(run()))
+
+    async def read_legacy_display_entry(
+        self,
+        ref: LegacyContentRef,
+        *,
+        max_bytes: int = MAX_DISPLAY_CONTENT_BYTES,
+    ) -> TranscriptEntry:
+        """Return one bounded, version-fenced entry for display projection.
+
+        ``read_legacy_content_range`` is deliberately a raw byte seam for
+        callers that need an exact export.  The chat renderer cannot use that
+        seam for rows whose persisted body contains protocol JSON, flattened
+        tool markers, or legacy control prompts: hydrating those bytes would
+        put internal text back in the UI. The Gateway content-reader adapter
+        applies that projection after this storage-owned read. The bounded
+        cap is checked before the SQL result crosses into Python, so a display
+        read cannot turn into a hidden unbounded body load.
+        """
+
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+            raise ValueError("display content max_bytes must be a positive integer")
+        table = {
+            "active": "transcript_entries",
+            "compacted": "compacted_transcript_entries",
+        }.get(ref.source)
+        if table is None:
+            raise ContentNotFoundError("legacy content source is invalid")
+
+        if ref.byte_length is None:
+            return await self._read_unindexed_display_entry(ref, max_bytes=max_bytes)
+
+        from opensquilla.session.attachment_history import (
+            MAX_INLINE_ENVELOPE_BYTES,
+            USER_DISPLAY_TEXT_SQL,
+        )
+
+        current = await self.get_legacy_content_ref(
+            ref.session_id, ref.message_id, source=ref.source, actual_byte_length=True
+        )
+        if current.byte_length != ref.byte_length or (
+            ref.revision is not None and current.revision != ref.revision
+        ):
+            raise ContentNotFoundError("legacy transcript content changed")
+
+        identity = "id" if ref.source == "active" else "original_entry_id"
+        # A legal image can dwarf its caption. Bound the caption itself,
+        # rather than rejecting it because the canonical envelope has pixels.
+        caption_rows = await self._read_history_query(
+            f"""SELECT length(CAST({USER_DISPLAY_TEXT_SQL} AS BLOB)) AS display_bytes,
+                       CASE WHEN length(CAST({USER_DISPLAY_TEXT_SQL} AS BLOB)) <= ?
+                            THEN {USER_DISPLAY_TEXT_SQL} END AS display_text,
+                       turn_context, session_key
+                FROM {table} WHERE session_id = ? AND message_id = ? AND role = 'user'
+                  AND 'legacy-v1:{ref.source}:' || {identity} || ':' || created_at || """
+            f"""':' || content_revision || ':' || length(CAST(content AS BLOB)) = ?
+                  AND CASE WHEN length(CAST(content AS BLOB)) <= {MAX_INLINE_ENVELOPE_BYTES}
+                    THEN CASE WHEN json_valid(content) THEN
+                      json_type(content, '$.text') = 'text' AND json_type(content, """
+            f"""'$.attachments') = 'array'
+                    ELSE 0 END ELSE 0 END LIMIT 1""",
+            (max_bytes, ref.session_id, ref.message_id, ref.revision),
+            operation="user_caption_display",
+        )
+        if caption_rows:
+            from opensquilla.content_reader import ContentExportLimitError
+
+            caption = caption_rows[0]
+            if caption[0] > max_bytes:
+                raise ContentExportLimitError(f"display content exceeds {max_bytes} bytes")
+            def decode_caption() -> TranscriptEntry:
+                context = json.loads(caption[2]) if isinstance(caption[2], str) else caption[2]
+                return TranscriptEntry(session_id=ref.session_id, session_key=caption[3],
+                    message_id=ref.message_id,
+                    role="user", content=json.dumps({"text": caption[1]}), turn_context=context)
+
+            return await asyncio.to_thread(decode_caption)
+        if ref.byte_length > max_bytes:
+            from opensquilla.content_reader import ContentExportLimitError
+
+            raise ContentExportLimitError(f"display content exceeds {max_bytes} bytes")
+
+        # Keep the column list explicit.  ``SELECT *`` would copy archive-only
+        # columns and make this semantic endpoint dependent on SQLite row
+        # ordering.  The selected fields are exactly those consumed by the
+        # canonical history projector.  Check the revision in this same read:
+        # an equal-length update may occur after the earlier reference check.
+        sql = (
+            f"""
+            SELECT id, session_id, session_key, message_id, role,
+                   substr(CAST(content AS BLOB), 1, ?) AS content,
+                   tool_calls, tool_call_id, reasoning_content, NULL AS assistant_replay,
+                   turn_usage, turn_context, created_at, token_count,
+                   provenance_kind, provenance_origin_session_id,
+                   provenance_source_session_key, provenance_source_channel,
+                   provenance_source_tool, schema_version,
+                   content_byte_length
+            FROM {table}
+            WHERE session_id = ? AND message_id = ?
+              AND (? IS NULL OR 'legacy-v1:{ref.source}:' || {identity} || ':' || """
+            f"""created_at || ':' || content_revision || ':' || length(CAST(content AS BLOB)) = ?)
+            LIMIT 1
+        """
+        )
+        rows = await self._read_history_query(
+            sql,
+            (max_bytes + 1, ref.session_id, ref.message_id, ref.revision, ref.revision),
+            operation="content_display",
+        )
+        if not rows:
+            raise ContentNotFoundError("legacy transcript content was not found")
+        row = rows[0]
+        if row["content_byte_length"] is None:
+            raise ContentMetadataPendingError(
+                "legacy transcript content metadata is still being indexed"
+            )
+        total_bytes = max(0, int(row["content_byte_length"]))
+        if total_bytes != ref.byte_length:
+            raise ContentNotFoundError("legacy transcript content changed")
+        raw = row["content"]
+        if isinstance(raw, bytes):
+            raw_bytes = raw
+        else:
+            raw_bytes = bytes(raw or b"")
+        if len(raw_bytes) > max_bytes:
+            from opensquilla.content_reader import ContentExportLimitError
+
+            raise ContentExportLimitError(
+                f"display content exceeds {max_bytes} bytes"
+            )
+        # Row decoding remains off the Gateway loop. Semantic chat projection
+        # belongs to the adapter above storage and keeps its own output cap.
+        return await asyncio.to_thread(_decode_legacy_display_row, row, raw_bytes)
+
+    async def read_legacy_detail_entry(
+        self,
+        ref: LegacyContentRef,
+        *,
+        max_bytes: int = MAX_DISPLAY_CONTENT_BYTES,
+    ) -> TranscriptEntry:
+        """Read complete display details on demand, without loading the message body."""
+        from opensquilla.content_reader import ContentExportLimitError
+
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+            raise ValueError("display details max_bytes must be a positive integer")
+        table = {
+            "active": "transcript_entries", "compacted": "compacted_transcript_entries",
+        }.get(ref.source)
+        if table is None or not ref.revision:
+            raise ContentNotFoundError("legacy details require a versioned content reference")
+        identity = "id" if ref.source == "active" else "original_entry_id"
+        version = re.fullmatch(
+            rf"(legacy-v1:{ref.source}:\d+:\d+:\d+):(?:\d+|pending)", ref.revision,
+        )
+        if version is None:
+            raise ContentNotFoundError("legacy details require a versioned content reference")
+        # Check the same revision and the combined payload size in the SQL read.
+        # A large tool result must not cross into Python before the display cap
+        # is enforced; reasoning/details updates invalidate this revision too.
+        rows = await self._read_history_query(
+            f"""WITH selected AS (
+                SELECT message_id, role, reasoning_content, tool_calls, turn_context,
+                       coalesce(length(CAST(reasoning_content AS BLOB)), 0)
+                       + coalesce(length(CAST(tool_calls AS BLOB)), 0)
+                       + coalesce(length(CAST(turn_context AS BLOB)), 0) AS detail_bytes
+                FROM {table} WHERE session_id = ? AND message_id = ?
+                  AND 'legacy-v1:{ref.source}:' || {identity} || ':' || created_at || ':'
+                    || content_revision = ?
+                LIMIT 1
+            ) SELECT message_id, role, detail_bytes,
+                     CASE WHEN detail_bytes <= ? THEN reasoning_content END AS reasoning_content,
+                     CASE WHEN detail_bytes <= ? THEN tool_calls END AS tool_calls,
+                     CASE WHEN detail_bytes <= ? THEN turn_context END AS turn_context
+              FROM selected""",
+            (ref.session_id, ref.message_id, version[1], max_bytes, max_bytes, max_bytes),
+            operation="content_details",
+        )
+        if not rows:
+            raise ContentNotFoundError("legacy transcript details changed or were not found")
+        row = rows[0]
+        if row["detail_bytes"] > max_bytes:
+            raise ContentExportLimitError(f"display details exceed {max_bytes} bytes")
+
+        def decode_details() -> TranscriptEntry:
+            payload = dict(row)
+            payload.pop("detail_bytes")
+            return TranscriptEntry(
+                session_id=ref.session_id, content="", **_deserialize_row(payload)
+            )
+
+        return await asyncio.to_thread(decode_details)
 
     async def delete_transcript(self, session_id: str) -> None:
         async with self._write_transaction("delete_transcript") as conn:
@@ -15919,7 +16803,8 @@ class SessionStorage:
         archived_at = _now_ms()
         cols = [key for key in TranscriptEntry.model_fields if key != "id"]
         archive_cols = [
-            *cols, "original_entry_id", "compaction_id", "compaction_index", "archived_at",
+            *cols, "content_byte_length", "original_entry_id", "compaction_id",
+            "compaction_index", "archived_at",
         ]
         if source_rows_validated:
             # The CAS below has verified these exact source rows. Copy their
@@ -15932,7 +16817,8 @@ class SessionStorage:
                 placeholders = ", ".join("?" for _ in chunk)
                 async with self.conn.execute(
                     f"INSERT INTO compacted_transcript_entries ({', '.join(archive_cols)}) "
-                    f"SELECT {', '.join(cols)}, id, ?, ?, ? FROM transcript_entries "
+                    f"SELECT {', '.join(cols)}, content_byte_length, id, ?, ?, ? "
+                    f"FROM transcript_entries "
                     f"WHERE session_id = ? AND id IN ({placeholders})",
                     (compaction_id, compaction_index, archived_at, node.session_id, *chunk),
                 ) as cur:
@@ -15945,6 +16831,9 @@ class SessionStorage:
             (
                 *(node.session_id if col == "session_id" else
                   node.session_key if col == "session_key" else row[col] for col in cols),
+                row.get("content_byte_length")
+                if row.get("content_byte_length") is not None
+                else _content_byte_length(row.get("content")),
                 entry.id, compaction_id, compaction_index, archived_at,
             )
             for entry, row in zip(entries, prepared_rows, strict=True)
@@ -16014,6 +16903,8 @@ class SessionStorage:
             await asyncio.to_thread(_serialized_model_rows, entries)
             if not preserve_surviving_rows else []
         )
+        for row in prepared_tail:
+            row["content_byte_length"] = _content_byte_length(row.get("content"))
         prepared_node = (
             (await asyncio.to_thread(_serialized_model_rows, [node]))[0]
             if not preserve_surviving_rows else None
@@ -16444,30 +17335,51 @@ class SessionStorage:
         if safe_q == '""':
             return []
 
+        first_term = safe_q.split('"')[1]
+        # FTS snippet scores candidate windows around token occurrences. On
+        # multi-megabyte rows with frequent hits this can dominate the search.
+        # Keep its exact short-row output; large rows use a linear literal
+        # excerpt without changing the full-text match, rank, or result limit.
+        large = "COALESCE(t.content_byte_length, length(CAST(t.content AS BLOB))) > 1048576"
+        excerpt = self._search_excerpt_sql("t.content", "lower(t.content)")
+        sql = (
+            "SELECT t.id, t.session_key, t.role, t.created_at, "
+            f"{large} AS linear_excerpt, "
+            f"CASE WHEN {large} THEN {excerpt} ELSE "
+            "snippet(transcript_fts, 0, '>>>', '<<<', '...', 48) END AS snippet "
+            "FROM transcript_fts f "
+            "JOIN transcript_entries t ON f.rowid = t.id "
+            "WHERE f.content MATCH ? "
+        )
+        params: list[Any] = [first_term.lower(), first_term.lower(), len(first_term) + 81, safe_q]
         if session_id:
-            sql = (
-                "SELECT t.id, t.session_key, t.role, t.created_at, "
-                "snippet(transcript_fts, 0, '>>>', '<<<', '...', 48) AS snippet "
-                "FROM transcript_fts f "
-                "JOIN transcript_entries t ON f.rowid = t.id "
-                "WHERE f.content MATCH ? AND t.session_id = ? "
-                "ORDER BY f.rank LIMIT ?"
-            )
-            params: list[Any] = [safe_q, session_id, limit]
-        else:
-            sql = (
-                "SELECT t.id, t.session_key, t.role, t.created_at, "
-                "snippet(transcript_fts, 0, '>>>', '<<<', '...', 48) AS snippet "
-                "FROM transcript_fts f "
-                "JOIN transcript_entries t ON f.rowid = t.id "
-                "WHERE f.content MATCH ? "
-                "ORDER BY f.rank LIMIT ?"
-            )
-            params = [safe_q, limit]
+            sql += "AND t.session_id = ? "
+            params.append(session_id)
+        sql += "ORDER BY f.rank LIMIT ?"
+        params.append(limit)
 
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+        results = [dict(r) for r in rows]
+        for result in results:
+            if result.pop("linear_excerpt"):
+                result["snippet"] = self._make_snippet(result["snippet"] or "", first_term)
+        return results
+
+    @staticmethod
+    def _search_excerpt_sql(content: str, folded: str) -> str:
+        """Return only a small first-hit window from the SQLite worker.
+
+        Parameters are the folded first term twice, then its length plus 81.
+        One extra character preserves the trailing ellipsis. The leading
+        marker survives _make_snippet's own 40-character context trimming.
+        FTS normalization can match without a literal occurrence (e.g. accents);
+        in that case the bounded start of the body is still a useful preview.
+        """
+        return (
+            f"CASE WHEN instr({folded}, ?) > 41 THEN '...' ELSE '' END || "
+            f"substr({content}, max(1, instr({folded}, ?) - 40), ?)"
+        )
 
     @staticmethod
     def _like_escape(raw: str) -> str:
@@ -16568,21 +17480,30 @@ class SessionStorage:
             return []
         col = "py_lower(content)" if self._needs_unicode_fold(query) else "content"
         clauses = [f"{col} LIKE ? ESCAPE '\\'" for _ in tokens]
-        params: list[Any] = list(tokens)
+        first_term = query.split()[0]
+        folded = "py_lower(content)" if self._needs_unicode_fold(first_term) else "lower(content)"
+        excerpt = self._search_excerpt_sql("content", folded)
+        params: list[Any] = [*tokens]
         where = " AND ".join(clauses)
         if session_id:
             where += " AND session_id = ?"
             params.append(session_id)
         params.append(limit)
+        params.extend([first_term.lower(), first_term.lower(), len(first_term) + 81])
+        # Materialize only the selected IDs before reading excerpts. Otherwise
+        # SQLite may evaluate lower/substr on every candidate that enters the
+        # sort's top K, including large bodies later discarded by LIMIT.
         sql = (
-            "SELECT id, session_key, role, content, created_at "
-            f"FROM transcript_entries WHERE {where} "
-            "ORDER BY created_at DESC LIMIT ?"
+            "WITH matched AS MATERIALIZED ("
+            f"SELECT id FROM transcript_entries WHERE {where} "
+            "ORDER BY created_at DESC LIMIT ?) "
+            f"SELECT id, session_key, role, {excerpt} AS content, created_at "
+            "FROM transcript_entries WHERE id IN (SELECT id FROM matched) "
+            "ORDER BY created_at DESC"
         )
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
         # Snippet highlights the first term; the others are guaranteed present too.
-        first_term = query.split()[0]
         out: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)

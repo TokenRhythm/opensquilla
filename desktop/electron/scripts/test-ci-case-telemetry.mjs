@@ -7,6 +7,7 @@ import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { runInNewContext } from 'node:vm'
 
 import {
   runCommandWithTelemetry,
@@ -253,6 +254,91 @@ try {
   assert.throws(() => assertNativeShutdownProcessOwnership(
     nativeFixtureSource.replace(/const\s+ownedChild\s*=\s*desktopApp\s*\.\s*process\s*\(\s*\)/, ''),
   ), /capture the owned ChildProcess before closing Electron/)
+
+  // Execute the profile fixture's actual close/finally blocks without launching
+  // Electron. A failed close must retain its owner and survive a later EBUSY.
+  const importFixture = (await readFile(join(scriptDir, 'test-profile-import-flow.mjs'), 'utf8')).replace(/\r\n/g, '\n')
+  const closeStart = importFixture.indexOf('async function closeActiveApp(')
+  const closeEnd = importFixture.indexOf('\n\ntry {', closeStart)
+  const closeSource = importFixture.slice(closeStart, closeEnd)
+  const primaryCloseError = new Error('original Electron shutdown timeout')
+  const timeoutShutdown = {
+    closed: false, error: primaryCloseError, closeErrorCode: 'DESKTOP_E2E_SHUTDOWN_TIMEOUT',
+    forcedExitSucceeded: false, processTreeReaped: false,
+  }
+  const cleanExitLog = [
+    { event: 'quit_gateway_exit', exited: true, hardTerminated: false },
+    { event: 'desktop_exit_phase', to: 'committed', reason: 'all lifecycle-owned Gateways exited' },
+  ].map(record => JSON.stringify(record)).join('\n') + '\n'
+  const secretProbe = 'synthetic-secret-must-not-appear'
+  for (const [shutdown, electronPidExists, cleanExit, retainOwner, accepted] of [
+    [timeoutShutdown, true, false, true, false],
+    [{ ...timeoutShutdown, forcedExitSucceeded: true, processTreeReaped: true }, false, false, false, false],
+    [{ ...timeoutShutdown, forcedExitSucceeded: true, processTreeReaped: true }, false, true, false, true],
+    [{ ...timeoutShutdown, forcedExitSucceeded: true, processTreeReaped: true }, true, true, true, false],
+    [{ ...timeoutShutdown, forcedExitSucceeded: true, processTreeReaped: true }, null, true, true, false],
+    [{ closed: true, error: null }, false, true, false, true],
+  ]) {
+    const ownedApp = {}
+    let closeCalls = 0
+    let currentLog = ''
+    const scope = {
+      app: ownedApp, activeAppUserData: 'synthetic-user-data', activeAppIdentity: {},
+      ELECTRON_SHUTDOWN_TIMEOUT_MS: 15_000, join,
+      readFile: async () => currentLog,
+      closeElectronWithDeadline: async options => {
+        closeCalls++
+        assert.equal(options.app, ownedApp)
+        assert.equal(options.timeoutMs, 15_000, 'preserve the native shutdown deadline')
+        currentLog += [
+          { event: 'before_quit', at: '2026-10-10T21:57:37.570Z', message: secretProbe },
+          { event: 'desktop_exit_phase', to: 'draining', reason: secretProbe },
+          { event: 'quit_deferred_for_profile_writer', at: secretProbe, error: secretProbe },
+          { event: secretProbe, token: secretProbe },
+        ].map(record => JSON.stringify(record)).join('\n') + '\n'
+        if (cleanExit) currentLog += cleanExitLog
+        const diagnostics = await options.diagnostics()
+        assert.equal(diagnostics.processes.electronPid, 54321)
+        assert.equal(diagnostics.processes.electronPidExists, electronPidExists)
+        assert.ok(diagnostics.exitEvents.some(record => record.event === 'before_quit'))
+        assert.ok(diagnostics.exitEvents.some(record => record.phase === 'draining'))
+        assert.ok(!JSON.stringify(diagnostics).includes(secretProbe), 'diagnostics must omit raw log and probe errors')
+        return shutdown
+      },
+      electronProcessSnapshot: () => ({ electronPid: 54321, electronPidExists,
+        diagnosticError: secretProbe, electronProbeError: secretProbe }),
+      desktopShutdownEvidenceSince,
+      canAcceptWindowsElectronShutdownFallback: options => canAcceptWindowsElectronShutdownFallback({ ...options, platform: 'win32' }),
+      console: { warn() {}, error() {} },
+    }
+    const close = runInNewContext(`${closeSource}\ncloseActiveApp`, scope)
+    if (accepted) await close('existing-profile-electron-shutdown')
+    else await assert.rejects(close('existing-profile-electron-shutdown'), error => error === primaryCloseError)
+    assert.equal(scope.app, retainOwner ? ownedApp : null, 'clear only a proven exited owner')
+    assert.equal(scope.activeAppUserData, retainOwner ? 'synthetic-user-data' : null)
+    const finalCloseError = await close('profile-import-final-shutdown', { failOnError: false })
+    assert.equal(finalCloseError, retainOwner ? primaryCloseError : undefined)
+    assert.equal(closeCalls, retainOwner ? 2 : 1, 'an exited process must not incur another close deadline')
+  }
+  const finalizer = importFixture.slice(importFixture.lastIndexOf('\n} finally {') + 2)
+  for (const [primaryError, failureStage] of [
+    [primaryCloseError, 'remove'], [null, 'remove'],
+    [primaryCloseError, 'close'], [null, 'close'],
+  ]) {
+    const cleanupError = Object.assign(new Error('synthetic file still locked'), { code: 'EBUSY' })
+    const cleanupReports = []
+    const scope = {
+      runError: primaryError, primaryError, app: null, fakeProvider: null, root: 'synthetic-root',
+      closeActiveApp: async () => failureStage === 'close' ? cleanupError : undefined,
+      rm: async () => { if (failureStage === 'remove') throw cleanupError },
+      console: { error: line => cleanupReports.push(line) },
+    }
+    const work = runInNewContext(
+      `(async () => { try { if (primaryError) throw primaryError } ${finalizer} })()`, scope,
+    )
+    await assert.rejects(work, error => error === (primaryError ?? cleanupError))
+    if (primaryError) assert.ok(cleanupReports.length > 0, 'secondary cleanup failure must remain observable')
+  }
 
   const shutdownLogs = []
   // The production helper invokes real taskkill on Windows, so this fixture

@@ -255,6 +255,7 @@ const pauseReasonText = computed(() => {
     case 'user':
     case 'user_paused': return t('chat.goal.pausedByUser')
     case 'empty_continuations': return t('chat.goal.emptyContinuations')
+    case 'no_progress': return t('chat.goal.noProgress')
     case 'turn_limit': return t('chat.goal.turnLimitReached')
     case 'runtime_limit': return t('chat.goal.runtimeLimitReached')
     case 'process_restart': return t('chat.goal.pausedAfterRestart')

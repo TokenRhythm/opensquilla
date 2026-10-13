@@ -340,6 +340,7 @@ async def _models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
         base_url=str(p.get("baseUrl", "") or ""),
         proxy=str(p.get("proxy", "") or ""),
         force_refresh=_bool_param(params, "forceRefresh"),
+        cache_only=_bool_param(params, "cacheOnly"),
     )
     return cast(
         dict[str, Any],
@@ -1104,6 +1105,7 @@ async def _discover_saved_profile_models(
             proxy=deployment.proxy,
             allow_default_api_key_env=False,
             force_refresh=_bool_param(command.values, "forceRefresh"),
+            cache_only=_bool_param(command.values, "cacheOnly"),
             persist_catalog=True,
             catalog_config=cfg,
         )
@@ -1144,6 +1146,7 @@ async def _discover_draft_profile_models(
             proxy=deployment.proxy,
             allow_default_api_key_env=False,
             force_refresh=_bool_param(command.values, "forceRefresh"),
+            cache_only=_bool_param(command.values, "cacheOnly"),
             persist_catalog=False,
             catalog_config=draft,
         )
@@ -1349,6 +1352,7 @@ async def _discover_primary_models(
                 not same_provider or reuse_stored_credentials
             ),
             force_refresh=force_refresh,
+            cache_only=command.cache_only,
             persist_catalog=(
                 same_provider and reuse_stored_credentials and not request_overrides
             ),

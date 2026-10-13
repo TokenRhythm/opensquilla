@@ -69,6 +69,133 @@ def test_array_of_tables_headers_still_track_context() -> None:
     assert patched == '[[server]]\nhost = "a"\n\n[[server]]\nhost = "c"\n'
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("final_newline", [True, False])
+def test_retired_product_tables_are_removed_without_rewriting_ordinary_settings(
+    newline: str, final_newline: bool,
+) -> None:
+    from opensquilla.gateway.config_migration import (
+        LATEST_CONFIG_VERSION,
+        migrate_config_payload,
+    )
+
+    prefix = f"config_version = {LATEST_CONFIG_VERSION}\n# profile settings\n"
+    raw = prefix + (
+        '["meta_skill"] # retired root\n'
+        "enabled = true # retired flag\n"
+        'description = """\n[not.a.table]\n# string content\n""" # explanation\n'
+        "[meta_skill.auto_propose] # retired subsection\n"
+        "enabled = true\n"
+        "[meta_skill.empty]\n"
+        "[skills]\n"
+        "enabled = true  # ordinary skills\n"
+        "[skills.coding_mode] # retired mode\n"
+        "enabled = true\n"
+        "[other]\n"
+        'value = "unchanged"\n'
+    )
+    expected = prefix + (
+        "# retired root\n"
+        "# retired flag\n"
+        "# explanation\n"
+        "# retired subsection\n"
+        "[skills]\n"
+        "enabled = true  # ordinary skills\n"
+        "# retired mode\n"
+        "[other]\n"
+        'value = "unchanged"\n'
+    )
+    if not final_newline:
+        raw, expected = raw[:-1], expected[:-1]
+    source = raw.replace("\n", newline).encode()
+    original = tomllib.loads(source.decode())
+    transformed = migrate_config_payload(original, emit_diagnostics=False).payload
+
+    patched = patch_import_config(source, original, transformed)
+
+    assert patched == expected.replace("\n", newline).encode()
+    assert tomllib.loads(patched.decode()) == transformed
+
+
+@pytest.mark.parametrize("value", ["{}", "{enabled=true, nested={enabled=true}}"])
+def test_complete_inline_table_removal_preserves_ordinary_values(value: str) -> None:
+    raw = f'meta_skill = {value} # retired settings\nport = 18795\n'.encode()
+
+    assert _patched(raw, lambda payload: payload.pop("meta_skill")) == (
+        "# retired settings\nport = 18795\n"
+    )
+
+
+def test_removing_child_table_keeps_implicit_empty_parent() -> None:
+    raw = b'[skills.coding_mode] # retired mode\nenabled=true\n'
+
+    assert _patched(raw, lambda payload: payload["skills"].pop("coding_mode")) == (
+        "[skills]\n# retired mode\n"
+    )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("final_newline", [True, False])
+@pytest.mark.parametrize("header", ["providers", '"provider.list"'])
+def test_retirement_preserves_array_table_children_verbatim(
+    newline: str, final_newline: bool, header: str,
+) -> None:
+    retained = (
+        '[[providers]]\nname="one"\n'
+        '[providers.extra]\nx="kept one"\n'
+        '[[providers.models]]\nname="model one"\n'
+        '[providers.models.options]\ntemperature=0.5\n'
+        '[[providers.models]]\nname="model two"\n'
+        '[providers.models.options]\ntemperature=0.7\n'
+        '[[providers]]\nname="two"\n'
+        '[providers.extra]\nx="kept two"\n'
+        '[[providers.models]]\nname="model three"\n'
+        '[providers.models.options]\ntemperature=0.8\n'
+    ).replace("providers", header)
+    retired = '[meta_skill]\nenabled=true\n'
+    suffix = '[ordinary]\nvalue="unchanged"\n'
+    if not final_newline:
+        suffix = suffix[:-1]
+    raw = (retained + retired + suffix).replace("\n", newline).encode()
+
+    assert _patched(raw, lambda payload: payload.pop("meta_skill")) == (
+        (retained + suffix).replace("\n", newline)
+    )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_retirement_removes_nested_array_table_children(newline: str) -> None:
+    raw = (
+        '[[meta_skill.items]] # first retired item\nname="one"\n'
+        '[meta_skill.items.inputs] # retired inputs\nx="retired one"\n'
+        '[[meta_skill.items.steps]]\nname="step one"\n'
+        '[meta_skill.items.steps.inputs]\nx="retired step"\n'
+        '[[meta_skill.items]] # second retired item\nname="two"\n'
+        '[meta_skill.items.inputs]\nx="retired two"\n'
+        '[[meta_skill.items.steps]]\nname="step two"\n'
+        '[meta_skill.items.steps.inputs]\nx="retired other step"\n'
+        '[ordinary]\nx="kept"\n'
+    ).replace("\n", newline).encode()
+
+    assert _patched(raw, lambda payload: payload.pop("meta_skill")) == (
+        '# first retired item\n# retired inputs\n# second retired item\n'
+        '[ordinary]\nx="kept"\n'
+    ).replace("\n", newline)
+
+
+def test_removed_array_child_keeps_implicit_empty_parent_in_current_element() -> None:
+    raw = (
+        b'[[providers]]\nname="one"\n[providers.extra]\nx="kept"\n'
+        b'[[providers]]\nname="two"\n'
+        b'[providers.extra.retired] # obsolete child\nx="removed"\n'
+    )
+
+    assert _patched(raw, lambda payload: payload["providers"][1]["extra"].pop("retired")) == (
+        '[[providers]]\nname="one"\n[providers.extra]\nx="kept"\n'
+        '[[providers]]\nname="two"\n[providers.extra]\n# obsolete child\n'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Values that span physical lines (issue #1106 and neighbours)
 # ---------------------------------------------------------------------------
@@ -520,3 +647,38 @@ def test_retired_memory_fields_in_inline_table_keep_surviving_source_bytes(
     patched = patch_import_config(raw, original, transformed)
     assert patched == expected
     assert tomllib.loads(patched.decode()) == transformed
+
+
+def test_startup_migration_write_keeps_surviving_source_bytes(tmp_path) -> None:
+    """The write funnel used by startup load patches instead of reserializing."""
+    from opensquilla.gateway.config_migration import (
+        LATEST_CONFIG_VERSION,
+        migrate_config_payload,
+        rewrite_migrated_config_best_effort,
+    )
+
+    raw = (
+        "# keep the file header\n"
+        f"config_version = {LATEST_CONFIG_VERSION}\n"
+        "[gateway]\n"
+        "port = 18795  # inner-net only\n"
+        "\n"
+        "# keep the section note\n"
+        "[sandbox]\n"
+        "auto_setup = true\n"
+    ).encode()
+    path = tmp_path / "config.toml"
+    path.write_bytes(raw)
+    original = tomllib.loads(raw.decode())
+    result = migrate_config_payload(original, emit_diagnostics=False)
+    assert result.changed
+
+    rewrite_migrated_config_best_effort(path, result)
+
+    written = path.read_bytes()
+    assert b"# keep the file header" in written
+    assert b"# inner-net only" in written
+    assert b"# keep the section note" in written
+    assert tomllib.loads(written.decode()) == result.payload
+    assert written == patch_import_config(raw, original, result.payload)
+    assert list(tmp_path.glob("config.toml.backup.*"))

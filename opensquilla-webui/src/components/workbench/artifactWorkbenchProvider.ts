@@ -334,7 +334,9 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   private leaseArtifactId = ''
   private requestedPreviewPage: unknown
   private sectionRequestId: number
-  private leaseRenewTimer: ReturnType<typeof setInterval> | null = null
+  private leaseRenewTimer: ReturnType<typeof setTimeout> | null = null
+  private leaseRenewGeneration = 0
+  private leaseRenewFailures = 0
   private readonly nativeRecoveryAttemptedKeys = new Set<string>()
   private nativeRecoveryInFlight: Promise<void> | null = null
   private nativeSurfaceInstanceId = ''
@@ -1882,6 +1884,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   }
 
   async dispose() {
+    this.stopLeaseRenewal()
     this.component = null
     await this.releaseNativeSurface(true)
     await this.releaseLease()
@@ -2326,21 +2329,34 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   }
 
   private startLeaseRenewal() {
-    if (this.leaseRenewTimer) clearInterval(this.leaseRenewTimer)
-    this.leaseRenewTimer = setInterval(() => {
-      void this.renewLease()
-    }, 15 * 60 * 1000)
+    this.stopLeaseRenewal()
+    this.scheduleLeaseRenewal(15 * 60 * 1000)
   }
 
-  private async renewLease() {
+  private stopLeaseRenewal() {
+    this.leaseRenewGeneration += 1
+    this.leaseRenewFailures = 0
+    if (this.leaseRenewTimer !== null) clearTimeout(this.leaseRenewTimer)
+    this.leaseRenewTimer = null
+  }
+
+  private scheduleLeaseRenewal(delay: number) {
+    const generation = this.leaseRenewGeneration
+    this.leaseRenewTimer = setTimeout(() => {
+      this.leaseRenewTimer = null
+      void this.renewLease(generation)
+    }, delay)
+  }
+
+  private async renewLease(generation: number) {
     const lease = this.lease
-    if (!lease || !this.context.isItemOpen()) return
+    if (!lease || generation !== this.leaseRenewGeneration || !this.context.isItemOpen()) return
     try {
       const renewal = await this.options.artifactPreviews.renewLease(lease.lease_id, {
         nativeBroker: this.context.nativeWorkbenchApi,
         sessionKey: artifactSessionKey(this.item, this.options),
       })
-      if (this.lease !== lease) return
+      if (this.lease !== lease || generation !== this.leaseRenewGeneration) return
       if (renewal.lease_id !== lease.lease_id) {
         throw new ArtifactPreviewLeaseError('Preview lease identity changed.', 502)
       }
@@ -2348,8 +2364,19 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         ...lease,
         expires_at: renewal.expires_at,
       }
+      this.leaseRenewFailures = 0
+      // Schedule only after the request settles, so slow requests never overlap.
+      this.scheduleLeaseRenewal(15 * 60 * 1000)
     } catch (error) {
-      if (this.lease !== lease) return
+      if (this.lease !== lease || generation !== this.leaseRenewGeneration) return
+      const remaining = Date.parse(lease.expires_at) - Date.now()
+      if (error instanceof ArtifactPreviewLeaseError && error.retryable && remaining > 0) {
+        // A failed maintenance request does not invalidate the live page. Keep
+        // its input/JS state while retrying within the last confirmed lease.
+        const delay = Math.min(60_000, 2_000 * 2 ** Math.min(this.leaseRenewFailures++, 5))
+        this.scheduleLeaseRenewal(Math.min(remaining, delay * (0.5 + Math.random() * 0.5)))
+        return
+      }
       if (
         error instanceof ArtifactPreviewLeaseError
         && (error.status === 404 || error.status === 410)
@@ -2369,10 +2396,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   }
 
   private async releaseLease() {
-    if (this.leaseRenewTimer) {
-      clearInterval(this.leaseRenewTimer)
-      this.leaseRenewTimer = null
-    }
+    this.stopLeaseRenewal()
     const lease = this.lease
     this.lease = null
     this.leaseArtifactId = ''
@@ -2419,10 +2443,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   }
 
   private async handleLeaseFailure(error: unknown) {
-    if (this.leaseRenewTimer) {
-      clearInterval(this.leaseRenewTimer)
-      this.leaseRenewTimer = null
-    }
+    this.stopLeaseRenewal()
     await this.releaseNativeSurface(false)
     const message = productErrorMessage(error, this.options)
     this.context.updateRenderState({

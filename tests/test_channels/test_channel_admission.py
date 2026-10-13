@@ -52,10 +52,10 @@ def test_ingress_provenance_parses_authenticated_principal() -> None:
     )
 
 
-def test_legacy_direct_message_is_admitted_without_mention_hook() -> None:
+async def test_legacy_direct_message_is_admitted_without_mention_hook() -> None:
     message = IncomingMessage(sender_id="u1", channel_id="dm1", content="hello")
 
-    decision = decide_channel_admission(
+    decision = await decide_channel_admission(
         SimpleNamespace(),
         message,
         "agent:main:legacy:direct:u1",
@@ -66,7 +66,7 @@ def test_legacy_direct_message_is_admitted_without_mention_hook() -> None:
     assert decision.is_group is False
 
 
-def test_authenticated_sender_mismatch_is_denied() -> None:
+async def test_authenticated_sender_mismatch_is_denied() -> None:
     message = IncomingMessage(
         sender_id="payload-user",
         channel_id="dm1",
@@ -79,7 +79,7 @@ def test_authenticated_sender_mismatch_is_denied() -> None:
         ),
     )
 
-    decision = decide_channel_admission(
+    decision = await decide_channel_admission(
         SimpleNamespace(),
         message,
         "agent:main:discord:direct:payload-user",
@@ -108,7 +108,7 @@ def test_authenticated_sender_mismatch_is_denied() -> None:
         },
     ],
 )
-def test_provider_interactions_are_addressed_but_still_apply_allowlist(
+async def test_provider_interactions_are_addressed_but_still_apply_allowlist(
     metadata: dict[str, object],
 ) -> None:
     policy = ChannelAccessPolicy(
@@ -128,12 +128,12 @@ def test_provider_interactions_are_addressed_but_still_apply_allowlist(
     )
     denied = admitted.model_copy(update={"sender_id": "outsider"})
 
-    admitted_decision = decide_channel_admission(
+    admitted_decision = await decide_channel_admission(
         channel,
         admitted,
         "agent:main:provider:group:group-1",
     )
-    denied_decision = decide_channel_admission(
+    denied_decision = await decide_channel_admission(
         channel,
         denied,
         "agent:main:provider:group:group-1",

@@ -183,60 +183,70 @@ async def test_startup_failure_does_not_install_repair_or_retry(monkeypatch):
     assert calls == ["initialize"]
 
 
-async def test_startup_runs_backend_probe_once_and_keeps_status_passive(monkeypatch):
-    """Startup validates the selected backend; capability status remains a read."""
+@pytest.mark.parametrize("backend_name", ["seatbelt", "windows_default", "bubblewrap"])
+@pytest.mark.parametrize("explicit_setup", [False, True])
+async def test_initialization_and_status_never_execute_backend_probes(
+    monkeypatch, backend_name, explicit_setup
+):
 
     setup_runtime.mark_sandbox_startup_pending()
-    calls: list[dict[str, object]] = []
+    calls: list[str] = []
 
     class Backend:
-        name = "windows_default"
+        name = backend_name
 
         async def probe_runtime(self, **kwargs):
-            calls.append(kwargs)
+            pytest.fail("initialization must not execute a probe")
+
+        async def run(self, *_args, **_kwargs):
+            pytest.fail("initialization must not execute a command")
+
+        async def run_operation(self, *_args, **_kwargs):
+            pytest.fail("initialization must not execute a filesystem canary")
 
     backend = Backend()
 
     async def initialize():
+        calls.append("initialize")
         return backend
 
     monkeypatch.setattr(integration, "initialize_runtime_backend", initialize)
     monkeypatch.setattr(integration, "get_runtime", lambda: SimpleNamespace(backend=backend))
-    result = await setup_runtime.initialize_sandbox_runtime(SimpleNamespace())
+    async def setup(_config):
+        return SetupResult(SandboxSetupState.READY, "test", "Setup complete.")
+
+    monkeypatch.setattr(setup_runtime, "ensure_sandbox_setup", setup)
+    initialize_entry = (
+        setup_runtime.ensure_sandbox_setup_auto
+        if explicit_setup else setup_runtime.initialize_sandbox_runtime
+    )
+    result = await initialize_entry(SimpleNamespace())
 
     assert result.state is SandboxSetupState.READY
-    assert len(calls) == 1
+    assert calls == ["initialize"]
 
-    # The cached startup result prevents a second helper launch. The capability
-    # report itself remains a passive status path and does not probe again.
-    report = await setup_runtime.current_sandbox_capability_report(SimpleNamespace())
+    assert await initialize_entry(SimpleNamespace()) is result
+    report = await setup_runtime.current_sandbox_capability_report(
+        SimpleNamespace(), force_refresh=True
+    )
     assert report.available is True
-    assert len(calls) == 1
+    assert calls == ["initialize"]
 
 
-async def test_startup_probe_failure_marks_safe_unavailable_without_full_fallback(monkeypatch):
+async def test_backend_selection_failure_keeps_safe_unavailable(monkeypatch):
     setup_runtime.mark_sandbox_startup_pending()
 
-    class Backend:
-        name = "windows_default"
-
-        async def probe_runtime(self, **_kwargs):
-            from opensquilla.sandbox.types import SandboxBackendError
-
-            raise SandboxBackendError("helper_probe_timeout: startup helper did not exit")
-
-    backend = Backend()
-
     async def initialize():
-        return backend
+        from opensquilla.sandbox.types import SandboxBackendError
+
+        raise SandboxBackendError("required backend is missing")
 
     monkeypatch.setattr(integration, "initialize_runtime_backend", initialize)
-    monkeypatch.setattr(integration, "get_runtime", lambda: SimpleNamespace(backend=backend))
 
     result = await setup_runtime.initialize_sandbox_runtime(SimpleNamespace())
 
     assert result.state is SandboxSetupState.FAILED
-    assert "helper_probe_timeout" in (result.detail or "")
+    assert "required backend is missing" in (result.detail or "")
     report = await setup_runtime.current_sandbox_capability_report(SimpleNamespace())
     assert report.available is False
 

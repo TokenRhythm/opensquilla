@@ -7,7 +7,11 @@
  * transport used by another handle (or by a reconnecting composition root).
  */
 
+import { SessionReadFailure } from './sessionReadLifecycle'
+
 export type ConversationConsumption = 'applied' | 'dirty'
+/** A terminal read remains unrecovered; it must never count as consumption. */
+export type ConversationRecoveryResult = boolean | { readonly retryable: false }
 export interface ConversationRecoveryScope {
   readonly keys: readonly string[]
   readonly global: boolean
@@ -24,7 +28,7 @@ export type ConversationEventListener<TEvent> = (event: TEvent, context?: Conver
 
 export interface ConversationEventSourceHandlers<TEvent> {
   onEvent?: ConversationEventListener<TEvent>
-  onRecoveryRequired?: (scope: ConversationRecoveryScope) => Promise<boolean>
+  onRecoveryRequired?: (scope: ConversationRecoveryScope) => Promise<ConversationRecoveryResult>
   onConnectionState?: (state: string) => void
   onDecodeError?: (error: unknown) => void
 }
@@ -82,7 +86,7 @@ export function createConversationEventHub<TEvent>(
   const stateListeners = new Set<(state: string) => void>()
   const decodeErrorListeners = new Set<(error: unknown) => void>()
   const recoveryListeners = new Set<(scope: ConversationRecoveryScope) => Promise<boolean>>()
-  const readAdmissions = new Map<string, symbol>()
+  const readAdmissions = new Map<string, { blocked: boolean }>()
   const retiredKeys = new Set<string>()
   let connectionRevision = 0
   let detachSource: (() => void) | null = null
@@ -98,7 +102,7 @@ export function createConversationEventHub<TEvent>(
 
   function prepareReadRetirement(key: string): (released?: boolean) => void {
     invalidateConsumption(key)
-    const admission = Symbol(key)
+    const admission = { blocked: false }
     const connection = connectionRevision
     readAdmissions.set(key, admission)
     retiredKeys.delete(key)
@@ -165,16 +169,31 @@ export function createConversationEventHub<TEvent>(
         // visible handle. Each key independently needs an explicit owner.
         const results = await Promise.all(keys.map(async key => {
           if (retiredKeys.has(key)) return true
-          if (!readAdmissions.has(key)) return false
+          const admission = readAdmissions.get(key)
+          if (!admission) return false
+          if (admission.blocked) return { retryable: false } as const
+          const connection = connectionRevision
           const owners = await Promise.all([...recoveryListeners].map(listener =>
-            Promise.resolve().then(() => listener({ keys: [key], global: false })).catch(() => false)))
-          return owners.some(Boolean)
+            Promise.resolve().then(() => listener({ keys: [key], global: false })).catch(error =>
+              error instanceof SessionReadFailure && !error.retryable && error.kind !== 'aborted'
+                ? { retryable: false } as const : false)))
+          if (disposed || connection !== connectionRevision || readAdmissions.get(key) !== admission) return false
+          if (owners.some(result => result === true)) return true
+          if (owners.some(result => typeof result === 'object' && result.retryable === false)) {
+            admission.blocked = true
+            return { retryable: false } as const
+          }
+          return false
         }))
-        return results.every(Boolean)
+        // Retry remaining transient failures without re-entering terminal A;
+        // successful B is independent, and no terminal result proves an ACK.
+        if (results.some(result => result === false)) return false
+        return results.every(result => result === true) ? true : { retryable: false }
       },
       onConnectionState: (state) => {
         if (state !== 'connected') {
           connectionRevision++
+          for (const admission of readAdmissions.values()) admission.blocked = false
           retiredKeys.clear()
           invalidateConsumption()
         }

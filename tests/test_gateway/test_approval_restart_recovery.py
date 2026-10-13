@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -11,7 +11,8 @@ from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
 from opensquilla.session.storage import SessionStorage
 
 
-def test_restart_recovery_expires_every_pending_approval_once() -> None:
+@pytest.mark.asyncio
+async def test_restart_recovery_expires_every_pending_approval_once() -> None:
     storage = SimpleNamespace(
         restart_abandoned_session_keys=(
             "agent:main:webchat:first",
@@ -25,28 +26,29 @@ def test_restart_recovery_expires_every_pending_approval_once() -> None:
         ),
     )
     queue = Mock()
-    queue.expire_all_pending.return_value = 3
+    queue.expire_all_pending_async = AsyncMock(return_value=3)
 
-    expired = boot._expire_restart_orphaned_approvals(storage, queue)
+    expired = await boot._expire_restart_orphaned_approvals(storage, queue)
 
     assert expired == 3
     storage.take_restart_abandoned_session_keys.assert_called_once_with()
-    queue.expire_all_pending.assert_called_once_with()
+    queue.expire_all_pending_async.assert_awaited_once_with()
 
 
-def test_restart_recovery_reports_global_cleanup_failure(
+@pytest.mark.asyncio
+async def test_restart_recovery_reports_global_cleanup_failure(
     monkeypatch,
 ) -> None:
     storage = SimpleNamespace(restart_abandoned_session_keys=())
     queue = Mock()
-    queue.expire_all_pending.side_effect = RuntimeError("locked")
+    queue.expire_all_pending_async = AsyncMock(side_effect=RuntimeError("locked"))
     logger = Mock()
     monkeypatch.setattr(boot, "log", logger)
 
-    expired = boot._expire_restart_orphaned_approvals(storage, queue)
+    expired = await boot._expire_restart_orphaned_approvals(storage, queue)
 
     assert expired == 0
-    queue.expire_all_pending.assert_called_once_with()
+    queue.expire_all_pending_async.assert_awaited_once_with()
     logger.exception.assert_called_once_with("approval.restart_recovery_failed")
 
 
@@ -96,7 +98,7 @@ async def test_process_restart_terminalizes_task_and_its_orphaned_approval(
         assert len(restarted_queue.list_pending()) == 3
 
         assert (
-            boot._expire_restart_orphaned_approvals(
+                await boot._expire_restart_orphaned_approvals(
                 restarted_storage,
                 restarted_queue,
             )

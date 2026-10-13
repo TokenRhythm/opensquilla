@@ -76,6 +76,7 @@ try {
   await page.reload()
   const result = await page.evaluate(async () => {
     const { IndexedDbAttachmentDraftStore, ATTACHMENT_DRAFT_TTL_MS, ATTACHMENT_DRAFT_MAX_BYTES } = await import('/drafts.js')
+    const MiB = 1024 * 1024
     let now = Date.now()
     const store = new IndexedDbAttachmentDraftStore(indexedDB, () => now)
     const scope = { identity: 'gateway-user-A', sessionKey: 'session-A' }
@@ -95,20 +96,23 @@ try {
     wal.close()
     const blobText = await loaded[0].file.text()
     const isolated = (await store.load({ ...scope, identity: 'gateway-user-B' })).length === 0
-    const workspaceFile = { workspaceId: 'project-A', relativePath: 'src/code.ts', name: 'code.ts', mime: 'text/plain', size: 3 }
-    await store.save(scope, [{ kind: 'workspace', local_id: 2, name: 'code.ts', mime: 'text/plain', size: 3,
+    const workspaceFile = { workspaceId: 'project-A', relativePath: 'src/code.ts', name: 'code.ts', mime: 'text/plain', size: 80 * MiB }
+    await store.save(scope, [{ kind: 'workspace', local_id: 2, name: 'code.ts', mime: 'text/plain', size: 80 * MiB,
       workspaceFile, nativeSelectionToken: 'must-never-persist' }])
     const workspace = await store.load(scope)
-    const savedRaw = await new Promise((resolve, reject) => {
+    const savedRawRecords = await new Promise((resolve, reject) => {
       const opening = indexedDB.open('opensquilla-attachment-drafts', 1)
       opening.onsuccess = () => {
         const db = opening.result
         const request = db.transaction('drafts').objectStore('drafts').getAll()
-        request.onsuccess = () => { resolve(JSON.stringify(request.result)); db.close() }
+        request.onsuccess = () => { resolve(request.result); db.close() }
         request.onerror = () => reject(request.error)
       }
       opening.onerror = () => reject(opening.error)
     })
+    const savedRaw = JSON.stringify(savedRawRecords)
+    const workspacePayloadIsZero = savedRawRecords.some(record => record.key === JSON.stringify([scope.identity, scope.sessionKey])
+      && record.bytes === 0 && record.attachments[0]?.size === 80 * MiB)
     now += ATTACHMENT_DRAFT_TTL_MS + 1
     const expired = (await store.load(scope)).length === 0
     const staged = [{ kind: 'staged', local_id: 1, name: 'large-a.bin', mime: 'application/octet-stream', size: ATTACHMENT_DRAFT_MAX_BYTES / 2, file_uuid: 'file-a' },
@@ -120,6 +124,156 @@ try {
     const existingPreserved = (await store.load(scope)).length === 2
     let perDraftRejected = false
     try { await store.save(scope, [{ ...staged[0], size: ATTACHMENT_DRAFT_MAX_BYTES + 1 }]) } catch { perDraftRejected = true }
+
+    // Expire the preceding quota fixtures, then install v1 records with stale
+    // `bytes` values. Aggregate admission must recompute actual payload from
+    // attachment types in the same read/write transaction.
+    now += ATTACHMENT_DRAFT_TTL_MS + 1
+    const legacyLiveScope = { identity: scope.identity, sessionKey: 'legacy-live' }
+    const legacyUploadScope = { identity: scope.identity, sessionKey: 'legacy-upload' }
+    const legacyMixedScope = { identity: scope.identity, sessionKey: 'legacy-mixed' }
+    await new Promise((resolve, reject) => {
+      const opening = indexedDB.open('opensquilla-attachment-drafts', 1)
+      opening.onsuccess = () => {
+        const db = opening.result
+        const transaction = db.transaction('drafts', 'readwrite')
+        const drafts = transaction.objectStore('drafts')
+        const base = { version: 1, updatedAt: now, expiresAt: now + ATTACHMENT_DRAFT_TTL_MS }
+        drafts.put({ ...base, key: JSON.stringify([legacyLiveScope.identity, legacyLiveScope.sessionKey]), bytes: 80 * MiB,
+          attachments: [{ name: 'live.bin', mime: 'application/octet-stream', size: 80 * MiB,
+            workspaceFile: { ...workspaceFile, relativePath: 'live.bin', name: 'live.bin', mime: 'application/octet-stream' } }] })
+        drafts.put({ ...base, key: JSON.stringify([legacyUploadScope.identity, legacyUploadScope.sessionKey]), bytes: 0,
+          attachments: [{ name: 'copy.bin', mime: 'application/octet-stream', size: 59 * MiB, fileUuid: 'legacy-copy' }] })
+        drafts.put({ ...base, key: JSON.stringify([legacyMixedScope.identity, legacyMixedScope.sessionKey]), bytes: 0,
+          attachments: [{ name: 'mixed.bin', mime: 'application/octet-stream', size: 80 * MiB,
+            workspaceFile: { ...workspaceFile, relativePath: 'mixed.bin', name: 'mixed.bin', mime: 'application/octet-stream' },
+            blob: new Blob([new Uint8Array(MiB)]) }] })
+        transaction.oncomplete = () => { db.close(); resolve() }
+        transaction.onerror = () => reject(transaction.error)
+      }
+      opening.onerror = () => reject(opening.error)
+    })
+    const aggregateBoundaryScope = { identity: scope.identity, sessionKey: 'legacy-boundary' }
+    let legacyAggregateAccepted = true
+    try {
+      await store.save(aggregateBoundaryScope, [{ kind: 'staged', local_id: 1, name: 'boundary.bin',
+        mime: 'application/octet-stream', size: 60 * MiB, file_uuid: 'boundary-copy' }])
+    } catch { legacyAggregateAccepted = false }
+    let legacyOverflowRejected = false
+    try {
+      await store.save({ ...scope, sessionKey: 'legacy-overflow' }, [{ kind: 'staged', local_id: 1,
+        name: 'overflow.bin', mime: 'application/octet-stream', size: 1, file_uuid: 'overflow-copy' }])
+    } catch { legacyOverflowRejected = true }
+    const repairedBytes = await new Promise((resolve, reject) => {
+      const opening = indexedDB.open('opensquilla-attachment-drafts', 1)
+      opening.onsuccess = () => {
+        const db = opening.result
+        const request = db.transaction('drafts').objectStore('drafts').getAll()
+        request.onsuccess = () => {
+          resolve(Object.fromEntries(request.result.map(record => [record.key, record.bytes])))
+          db.close()
+        }
+        request.onerror = () => reject(request.error)
+      }
+      opening.onerror = () => reject(opening.error)
+    })
+    const legacyBytesRepaired = repairedBytes[JSON.stringify([legacyLiveScope.identity, legacyLiveScope.sessionKey])] === 0
+      && repairedBytes[JSON.stringify([legacyUploadScope.identity, legacyUploadScope.sessionKey])] === 59 * MiB
+      && repairedBytes[JSON.stringify([legacyMixedScope.identity, legacyMixedScope.sessionKey])] === MiB
+
+    // Invalid workspace metadata must never be persisted by a new save. A
+    // malformed legacy record must also block aggregate writes without being
+    // silently deleted, including the size=0/extra-Blob zero-accounting case.
+    now += ATTACHMENT_DRAFT_TTL_MS + 1
+    const invalidNewScope = { identity: scope.identity, sessionKey: 'invalid-new-workspace' }
+    const invalidWorkspaceScope = { identity: scope.identity, sessionKey: 'invalid-workspace' }
+    const invalidWorkspaceFile = { ...workspaceFile, size: 0, unexpected: new Blob([new Uint8Array(MiB)]) }
+    let invalidNewSaveRejected = false
+    try {
+      await store.save(invalidNewScope, [{ kind: 'workspace', local_id: 1, name: 'invalid-new.bin',
+        mime: 'application/octet-stream', size: 0, workspaceFile: invalidWorkspaceFile }])
+    } catch { invalidNewSaveRejected = true }
+    await new Promise((resolve, reject) => {
+      const opening = indexedDB.open('opensquilla-attachment-drafts', 1)
+      opening.onsuccess = () => {
+        const db = opening.result
+        const transaction = db.transaction('drafts', 'readwrite')
+        const drafts = transaction.objectStore('drafts')
+        const base = { version: 1, updatedAt: now, expiresAt: now + ATTACHMENT_DRAFT_TTL_MS, bytes: 0 }
+        drafts.put({ ...base, key: JSON.stringify([invalidWorkspaceScope.identity, invalidWorkspaceScope.sessionKey]),
+          attachments: [{ name: 'invalid-live.bin', mime: 'application/octet-stream', size: 0,
+            workspaceFile: invalidWorkspaceFile }] })
+        transaction.oncomplete = () => { db.close(); resolve() }
+        transaction.onerror = () => reject(transaction.error)
+      }
+      opening.onerror = () => reject(opening.error)
+    })
+    let invalidWorkspaceRejected = false
+    try { await store.load(invalidWorkspaceScope) } catch { invalidWorkspaceRejected = true }
+    let invalidAggregateSaveRejected = false
+    try {
+      await store.save({ ...scope, sessionKey: 'blocked-by-invalid-workspace' }, [{ kind: 'staged', local_id: 1,
+        name: 'new.bin', mime: 'application/octet-stream', size: 1, file_uuid: 'new-copy' }])
+    } catch { invalidAggregateSaveRejected = true }
+    const invalidWorkspaceRecordRetained = await new Promise((resolve, reject) => {
+      const opening = indexedDB.open('opensquilla-attachment-drafts', 1)
+      opening.onsuccess = () => {
+        const db = opening.result
+        const request = db.transaction('drafts').objectStore('drafts')
+          .get(JSON.stringify([invalidWorkspaceScope.identity, invalidWorkspaceScope.sessionKey]))
+        request.onsuccess = () => { resolve(Boolean(request.result)); db.close() }
+        request.onerror = () => reject(request.error)
+      }
+      opening.onerror = () => reject(opening.error)
+    })
+    // The assertion above proves production save did not delete the invalid
+    // reference. Remove only this fixture, then independently retain a legacy
+    // record whose attachment structure is malformed for another reason.
+    await new Promise((resolve, reject) => {
+      const opening = indexedDB.open('opensquilla-attachment-drafts', 1)
+      opening.onsuccess = () => {
+        const db = opening.result
+        const transaction = db.transaction('drafts', 'readwrite')
+        const drafts = transaction.objectStore('drafts')
+        drafts.delete(JSON.stringify([invalidWorkspaceScope.identity, invalidWorkspaceScope.sessionKey]))
+        transaction.oncomplete = () => { db.close(); resolve() }
+        transaction.onerror = () => reject(transaction.error)
+      }
+      opening.onerror = () => reject(opening.error)
+    })
+    const corruptScope = { identity: scope.identity, sessionKey: 'corrupt-record' }
+    await new Promise((resolve, reject) => {
+      const opening = indexedDB.open('opensquilla-attachment-drafts', 1)
+      opening.onsuccess = () => {
+        const db = opening.result
+        const transaction = db.transaction('drafts', 'readwrite')
+        transaction.objectStore('drafts').put({ version: 1, updatedAt: now,
+          expiresAt: now + ATTACHMENT_DRAFT_TTL_MS, bytes: 0,
+          key: JSON.stringify([corruptScope.identity, corruptScope.sessionKey]),
+          attachments: [{ name: 'corrupt.bin', mime: 'application/octet-stream', size: -1 }] })
+        transaction.oncomplete = () => { db.close(); resolve() }
+        transaction.onerror = () => reject(transaction.error)
+      }
+      opening.onerror = () => reject(opening.error)
+    })
+    let corruptSaveRejected = false
+    try {
+      await store.save({ ...scope, sessionKey: 'blocked-by-corrupt-record' }, [{ kind: 'staged', local_id: 1,
+        name: 'new.bin', mime: 'application/octet-stream', size: 1, file_uuid: 'new-copy' }])
+    } catch { corruptSaveRejected = true }
+    const corruptRecordRetained = await new Promise((resolve, reject) => {
+      const opening = indexedDB.open('opensquilla-attachment-drafts', 1)
+      opening.onsuccess = () => {
+        const db = opening.result
+        const transaction = db.transaction('drafts', 'readwrite')
+        const drafts = transaction.objectStore('drafts')
+        const request = drafts.get(JSON.stringify([corruptScope.identity, corruptScope.sessionKey]))
+        request.onsuccess = () => drafts.delete(JSON.stringify([corruptScope.identity, corruptScope.sessionKey]))
+        transaction.oncomplete = () => { resolve(Boolean(request.result)); db.close() }
+        transaction.onerror = () => reject(transaction.error)
+      }
+      opening.onerror = () => reject(opening.error)
+    })
     await new Promise((resolve, reject) => {
       const request = indexedDB.open('accepted-queue-sentinel', 1)
       request.onupgradeneeded = () => request.result.createObjectStore('accepted')
@@ -143,12 +297,19 @@ try {
       }
     })
     return { blobText, isolated, workspace, walRestored, legacyRevisionRestored, capabilityAbsent: !savedRaw.includes('must-never-persist'),
-      expired, aggregateRejected, existingPreserved, perDraftRejected, removed, acceptedRetained }
+      workspacePayloadIsZero, expired, aggregateRejected, existingPreserved, perDraftRejected,
+      legacyAggregateAccepted, legacyOverflowRejected, legacyBytesRepaired, invalidNewSaveRejected,
+      invalidWorkspaceRejected, invalidAggregateSaveRejected, invalidWorkspaceRecordRetained,
+      corruptSaveRejected, corruptRecordRetained, removed, acceptedRetained }
   })
   assert.equal(result.blobText, 'draft contents')
   assert.equal(result.workspace[0].kind, 'workspace')
   assert.equal(result.workspace[0].workspaceFile.relativePath, 'src/code.ts')
-  for (const key of ['walRestored', 'legacyRevisionRestored', 'isolated', 'capabilityAbsent', 'expired', 'aggregateRejected', 'existingPreserved', 'perDraftRejected', 'removed', 'acceptedRetained']) assert.equal(result[key], true, key)
+  for (const key of ['walRestored', 'legacyRevisionRestored', 'isolated', 'capabilityAbsent', 'workspacePayloadIsZero',
+    'expired', 'aggregateRejected', 'existingPreserved', 'perDraftRejected', 'legacyAggregateAccepted',
+    'legacyOverflowRejected', 'legacyBytesRepaired', 'invalidNewSaveRejected', 'invalidWorkspaceRejected',
+    'invalidAggregateSaveRejected', 'invalidWorkspaceRecordRetained', 'corruptSaveRejected',
+    'corruptRecordRetained', 'removed', 'acceptedRetained']) assert.equal(result[key], true, key)
   const nextWindow = app.waitForEvent('window')
   await app.evaluate(async ({ BrowserWindow }, url) => {
     const window = new BrowserWindow({ show: false, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } })
@@ -180,15 +341,26 @@ try {
     const rejectedDuplicate = !await store.consume(scope, restored.revision, [0])
     const remainingSnapshot = await store.loadSnapshot(scope)
     const remainder = remainingSnapshot.attachments
+    const remainingBytes = await new Promise((resolve, reject) => {
+      const opening = indexedDB.open('opensquilla-attachment-drafts', 1)
+      opening.onsuccess = () => {
+        const db = opening.result
+        const request = db.transaction('drafts').objectStore('drafts').get(JSON.stringify([scope.identity, scope.sessionKey]))
+        request.onsuccess = () => { resolve(request.result?.bytes); db.close() }
+        request.onerror = () => reject(request.error)
+      }
+      opening.onerror = () => reject(opening.error)
+    })
     const consumedRemainder = await store.consume(scope, remainingSnapshot.revision, [0])
       && (await store.load(scope)).length === 0
     return { newerRetained, rejectedOldVersion, consumedCurrentVersion, rejectedDuplicate, consumedRemainder,
-      revision: restored.revision, remainder: remainder.map(item => item.name) }
+      revision: restored.revision, remainder: remainder.map(item => item.name), remainingBytes }
   }, scope)
   assert.equal(consumption.revision, 'new-tab-version')
   for (const key of ['newerRetained', 'rejectedOldVersion', 'consumedCurrentVersion', 'rejectedDuplicate', 'consumedRemainder']) assert.equal(consumption[key], true, key)
   assert.deepEqual(consumption.remainder, ['second.txt'])
-  console.log('Electron IndexedDB attachment drafts: reload/Blob, isolation, workspace and handoff WAL, expiry, budgets and queue ownership passed')
+  assert.equal(consumption.remainingBytes, 0)
+  console.log('Electron IndexedDB attachment drafts: reload/Blob, live payload accounting, legacy byte repair, isolation, expiry and budgets passed')
   console.log('Two-renderer IndexedDB acceptance: newer identical draft survives, partial consumption and duplicate ACK passed')
 } finally {
   await app?.close()

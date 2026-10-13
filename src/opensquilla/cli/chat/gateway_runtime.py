@@ -242,7 +242,7 @@ def _event_input_mode(event: dict[str, Any]) -> str:
         and surface_id.startswith("goal:")
         and _event_user_message_id(event) is None
     ):
-        return "system_event"
+        return "goal_continuation"
     return "user"
 
 
@@ -446,7 +446,7 @@ async def _external_prompt(
     *,
     input_mode: str,
 ) -> str | None:
-    if input_mode == "system_event":
+    if input_mode in {"system_event", "goal_continuation"}:
         return None
     if user_message_id:
         with suppress(Exception):

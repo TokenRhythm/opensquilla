@@ -7,13 +7,13 @@ from typing import Any
 
 from opensquilla.application.approval_queue import get_approval_queue
 from opensquilla.application.approval_rpc import (
-    approval_extend_rpc_payload,
-    approval_lookup_status_rpc_payload,
-    approval_request_rpc_payload,
-    approval_resolve_rpc_payload,
+    approval_extend_rpc_payload_async,
+    approval_lookup_status_rpc_payload_async,
+    approval_request_rpc_payload_async,
+    approval_resolve_rpc_payload_async,
     approval_settings_rpc_payload,
     approval_snapshot_rpc_payload,
-    approval_status_rpc_payload,
+    approval_status_rpc_payload_async,
     approval_wait_decision_rpc_payload,
 )
 from opensquilla.gateway.adapters.approval_contract import register_approval_contract
@@ -22,7 +22,7 @@ from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.sandbox.escalation import (
     apply_sandbox_approval_choice,
-    deny_matching_pending_sandbox_approvals,
+    deny_matching_pending_sandbox_approvals_async,
     discard_approval_run_context_authority,
     is_sandbox_approval_kind,
     remember_sandbox_approval_denial,
@@ -68,18 +68,22 @@ def _require_owner_for_sandbox_approval_resolution(
     _require_owner_for_approval_resolution(ctx)
 
 
-def _complete_sandbox_resolution_claim(
+async def _complete_sandbox_resolution_claim(
     queue: Any,
     approval_id: str,
     claim_token: str,
 ) -> None:
     try:
-        queue.complete_claimed_resolution(
+        await queue.complete_claimed_resolution_async(
             approval_id,
             claim_token,
         )
     except Exception:
-        queue.complete_claimed_resolution(
+        # Grant application already succeeded. A transient SQLite completion
+        # error must be retried while the claim is still owned; otherwise the
+        # durable approval remains half-finalized and the user sees a false
+        # failure on an otherwise applied grant.
+        await queue.complete_claimed_resolution_async(
             approval_id,
             claim_token,
         )
@@ -97,10 +101,10 @@ async def _join_active_resolution(queue: Any, approval_id: str) -> Any:
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _APPROVAL_CLAIM_JOIN_TIMEOUT_SECONDS
-    pending = queue.get(approval_id)
+    pending = await queue.get_async(approval_id)
     while pending.claim_token is not None and loop.time() < deadline:
         await asyncio.sleep(_APPROVAL_CLAIM_POLL_SECONDS)
-        pending = queue.get(approval_id)
+        pending = await queue.get_async(approval_id)
     return pending
 
 
@@ -159,7 +163,7 @@ async def _handle_exec_approval_request(params: dict | None, ctx: RpcContext) ->
     for field in ("toolName", "args", "sessionKey"):
         if field not in params:
             raise ValueError(f"params.{field} is required")
-    return approval_request_rpc_payload(
+    return await approval_request_rpc_payload_async(
         get_approval_queue(),
         namespace="exec",
         params=params,
@@ -184,7 +188,7 @@ async def _handle_exec_approval_wait_decision(
 async def _handle_exec_approval_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or not str(params.get("id") or "").strip():
         raise ValueError("params.id is required")
-    return approval_lookup_status_rpc_payload(
+    return await approval_lookup_status_rpc_payload_async(
         get_approval_queue(),
         str(params["id"]).strip(),
         namespace="exec",
@@ -217,11 +221,11 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
     choice = params.get("choice")
     queue = get_approval_queue()
     approved = bool(params["approved"])
-    pending = queue.get(params["id"])
+    pending = await queue.get_async(params["id"])
     if pending.claim_token is not None:
         pending = await _join_active_resolution(queue, params["id"])
         if pending.claim_token is not None:
-            payload = approval_status_rpc_payload(
+            payload = await approval_status_rpc_payload_async(
                 queue,
                 params["id"],
                 queue.get_settings().mode,
@@ -233,7 +237,7 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
     # queue.  Return the canonical result instead of presenting the losing
     # surface with a false red failure (and never replay sandbox side effects).
     if pending.resolved:
-        return approval_status_rpc_payload(
+        return await approval_status_rpc_payload_async(
             queue,
             params["id"],
             queue.get_settings().mode,
@@ -250,20 +254,20 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
     )
 
     if sandbox_approval and approved:
-        claim_token = queue.claim_resolution(
+        claim_token = await queue.claim_resolution_async(
             params["id"],
             resolution_metadata={"resolutionSource": "user_web"},
         )
-        pending = queue.get(params["id"])
+        pending = await queue.get_async(params["id"])
         try:
-            queue.finalize_claimed_resolution(
+            await queue.finalize_claimed_resolution_async(
                 params["id"],
                 claim_token,
                 approved,
                 elevated_mode=None,
             )
         except Exception:
-            queue.release_resolution_claim(params["id"], claim_token)
+            await queue.release_resolution_claim_async(params["id"], claim_token)
             raise
         try:
             await apply_sandbox_approval_choice(
@@ -278,23 +282,21 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
             # This exact execution/session/workspace authority is gone.
             # Reopening can never make the card actionable again.
             discard_approval_run_context_authority(params["id"])
-            queue.expire_claimed_resolution(params["id"], claim_token)
-            return approval_status_rpc_payload(
+            await queue.expire_claimed_resolution_async(params["id"], claim_token)
+            return await approval_status_rpc_payload_async(
                 queue,
                 params["id"],
                 queue.get_settings().mode,
             )
         except Exception:
-            queue.reopen_resolved_approval(params["id"], expected_approved=True)
+            await queue.reopen_resolved_approval_async(params["id"], expected_approved=True)
             raise
-        _complete_sandbox_resolution_claim(
-            queue,
-            params["id"],
-            claim_token,
+        await _complete_sandbox_resolution_claim(queue, params["id"], claim_token)
+        return await approval_status_rpc_payload_async(
+            queue, params["id"], queue.get_settings().mode
         )
-        return approval_status_rpc_payload(queue, params["id"], queue.get_settings().mode)
 
-    queue.resolve(
+    await queue.resolve_async(
         params["id"],
         approved,
         elevated_mode=None,
@@ -303,13 +305,13 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
     )
     if sandbox_approval and not approved:
         remember_sandbox_approval_denial(pending.params, params["id"])
-        deny_matching_pending_sandbox_approvals(
+        await deny_matching_pending_sandbox_approvals_async(
             queue,
             pending.params,
             exclude_approval_id=params["id"],
         )
 
-    return approval_status_rpc_payload(queue, params["id"], queue.get_settings().mode)
+    return await approval_status_rpc_payload_async(queue, params["id"], queue.get_settings().mode)
 
 
 _EXTEND_DEFAULT_SECONDS = 300.0
@@ -333,7 +335,7 @@ async def _handle_exec_approval_extend(params: dict | None, ctx: RpcContext) -> 
         raise ValueError("params.id is required")
     seconds = _coerce_extend_seconds(params.get("seconds"))
     queue = get_approval_queue()
-    return approval_extend_rpc_payload(queue, params["id"], seconds)
+    return await approval_extend_rpc_payload_async(queue, params["id"], seconds)
 
 
 async def _handle_plugin_approval_extend(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
@@ -341,7 +343,7 @@ async def _handle_plugin_approval_extend(params: dict | None, ctx: RpcContext) -
         raise ValueError("params.id is required")
     seconds = _coerce_extend_seconds(params.get("seconds"))
     queue = get_approval_queue()
-    return approval_extend_rpc_payload(queue, params["id"], seconds)
+    return await approval_extend_rpc_payload_async(queue, params["id"], seconds)
 
 
 @_d.method("plugin.approval.request", scope="operator.approvals")
@@ -351,7 +353,7 @@ async def _handle_plugin_approval_request(params: dict | None, ctx: RpcContext) 
     for field in ("pluginId", "version", "permissions"):
         if field not in params:
             raise ValueError(f"params.{field} is required")
-    return approval_request_rpc_payload(
+    return await approval_request_rpc_payload_async(
         get_approval_queue(),
         namespace="plugin",
         params=params,
@@ -375,7 +377,7 @@ async def _handle_plugin_approval_wait_decision(
 async def _handle_plugin_approval_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or not str(params.get("id") or "").strip():
         raise ValueError("params.id is required")
-    return approval_lookup_status_rpc_payload(
+    return await approval_lookup_status_rpc_payload_async(
         get_approval_queue(),
         str(params["id"]).strip(),
         namespace="plugin",
@@ -392,14 +394,20 @@ async def _handle_plugin_approval_resolve(params: dict | None, ctx: RpcContext) 
     # Match exec approvals' cross-surface contract: the first valid decision is
     # canonical, and a later surface receives that outcome even if its stale
     # click requested the opposite result.
-    if queue.get(approval_id).resolved:
-        return approval_status_rpc_payload(queue, approval_id, queue.get_settings().mode)
+    if (await queue.get_async(approval_id)).resolved:
+        return await approval_status_rpc_payload_async(
+            queue, approval_id, queue.get_settings().mode
+        )
     try:
-        return approval_resolve_rpc_payload(queue, approval_id, bool(params["approved"]))
+        return await approval_resolve_rpc_payload_async(
+            queue, approval_id, bool(params["approved"])
+        )
     except ValueError:
         # Close the get/resolve race without hiding an unrelated queue error.
-        if queue.get(approval_id).resolved:
-            return approval_status_rpc_payload(queue, approval_id, queue.get_settings().mode)
+        if (await queue.get_async(approval_id)).resolved:
+            return await approval_status_rpc_payload_async(
+                queue, approval_id, queue.get_settings().mode
+            )
         raise
 
 

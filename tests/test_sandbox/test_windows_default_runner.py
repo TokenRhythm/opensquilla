@@ -2531,7 +2531,7 @@ def test_capability_probe_uses_restricted_token_without_shared_offline_acl(
     assert events == ["refresh", "restricted"]
 
 
-def test_startup_probe_uses_offline_identity_reexec_path(
+def test_safe_noop_uses_offline_identity_reexec_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2543,7 +2543,6 @@ def test_startup_probe_uses_offline_identity_reexec_path(
         env={},
         policy={
             "network": "none",
-            "helperProbe": True,
             "windowsAclPlan": {
                 "autoGrants": [],
                 "capabilitySids": [],
@@ -2586,7 +2585,7 @@ def test_startup_probe_uses_offline_identity_reexec_path(
     monkeypatch.setattr(
         mod,
         "_run_restricted_process_native",
-        lambda *_args: pytest.fail("startup probe must exercise offline identity"),
+        lambda *_args: pytest.fail("Safe execution must use the offline identity"),
     )
 
     assert mod._run_windows_default(payload) == 0

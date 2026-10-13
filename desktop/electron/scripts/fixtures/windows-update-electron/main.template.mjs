@@ -29,6 +29,7 @@ let gatewayProcess = null
 const gatewayState = { owned: true, url: '' }
 let isQuitting = false
 let appExitPhase = 'running'
+const gatewayLateReadyObservation = null
 let updateApplying = false
 let updateInstallHandoffReady = false
 let updateDownloadInProgress = false

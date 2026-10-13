@@ -10,6 +10,48 @@ const SEND = 'chat.send'
 const METHODS = new Set([SUBSCRIBE, HYDRATE, READ, RESUME, RELEASE, UNSUBSCRIBE, 'chat.history', SEND])
 const LIVE_EVENTS = new Set(['session.event.text_delta', 'session.event.done', 'session.event.turn_committed'])
 
+export function sessionRecoveryFaultDomain(frame, sessionKey) {
+  if (frame?.type !== 'req') return null
+  if (frame.method === 'chat.history' && frame.params?.sessionKey === sessionKey) return 'history'
+  if (frame.params?.key !== sessionKey) return null
+  if (frame.method === READ) return 'history'
+  if (frame.method === SUBSCRIBE) return 'live'
+  return null
+}
+
+export function createSessionRecoveryFault(sessionKey) {
+  const pendingReads = new Map()
+  let heldResponses = []
+  return {
+    holdRequest(socket, frame) {
+      const domain = sessionRecoveryFaultDomain(frame, sessionKey)
+      if (domain === 'history' && frame.method === READ) {
+        // The real Gateway must create the original proof before the live
+        // subscription recovers. Holding the request would skip stale recovery.
+        pendingReads.set(`${socket}:${frame.id}`, socket)
+        return null
+      }
+      return domain
+    },
+    holdResponse(socket, frame, forward) {
+      if (frame?.type !== 'res' || !pendingReads.delete(`${socket}:${frame.id}`)
+        || frame.ok !== true) return false
+      heldResponses.push({ socket, forward })
+      return true
+    },
+    release() {
+      pendingReads.clear()
+      const responses = heldResponses
+      heldResponses = []
+      for (const { forward } of responses) forward()
+    },
+    close(socket) {
+      for (const [key, owner] of pendingReads) if (owner === socket) pendingReads.delete(key)
+      heldResponses = heldResponses.filter(item => item.socket !== socket)
+    },
+  }
+}
+
 // Keep diagnostic evidence limited to the synthetic target's RPC control flow.
 // Never retain connection credentials, lease tokens, messages or snapshot data.
 export function createSessionRecoveryEvidence(sessionKey, now = Date.now) {
@@ -41,7 +83,7 @@ export function createSessionRecoveryEvidence(sessionKey, now = Date.now) {
     item.requestSequence = append({ direction: 'request', ...item, held })
     if (!held) pending.set(`${socket}:${frame.id}`, item)
   }
-  function response(socket, frame) {
+  function response(socket, frame, held = false) {
     if (frame?.type === 'event' && LIVE_EVENTS.has(frame.event)
       && (frame.payload?.key ?? frame.payload?.session_key) === sessionKey) {
       append({ direction: 'event', socket, event: frame.event,
@@ -56,6 +98,7 @@ export function createSessionRecoveryEvidence(sessionKey, now = Date.now) {
     pending.delete(key)
     append({
       direction: 'response', ...item, ok: frame.ok === true,
+      ...(held ? { held: true } : {}),
       revision: identifier(frame.payload?.sync_revision) ?? item.revision,
       snapshot: identifier(frame.payload?.snapshot_id) ?? item.snapshot,
       ...(typeof frame.payload?.hydration_complete === 'boolean'

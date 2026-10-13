@@ -172,7 +172,7 @@ def _is_explicit_interaction(msg: IncomingMessage) -> bool:
     return isinstance(metadata.get("approval_action"), dict)
 
 
-def decide_channel_admission(
+async def decide_channel_admission(
     channel: Any,
     msg: IncomingMessage,
     session_key: str,
@@ -249,7 +249,7 @@ def decide_channel_admission(
             channel_name = str(getattr(channel, "_delivery_channel_name", "") or "")
             request_pairing = getattr(store, "request_pairing", None)
             if channel_name and callable(request_pairing):
-                record = request_pairing(
+                record = await request_pairing(
                     channel_name=channel_name,
                     provider=provenance.provider or channel_name,
                     account_id=provenance.account_id or channel_name,

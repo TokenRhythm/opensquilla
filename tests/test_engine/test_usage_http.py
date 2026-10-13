@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
+import httpx
 import pytest
 
 from opensquilla.engine.usage_accounting import (
@@ -315,9 +316,29 @@ async def test_missing_receipt_is_unknown_but_keeps_successful_output(monkeypatc
 @pytest.mark.asyncio
 async def test_each_compaction_chunk_gets_one_distinct_event(monkeypatch) -> None:
     calls: list[dict] = []
+    client_type = httpx.AsyncClient
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        receipt = _response_payload("compact summary")
+        frames = [
+            {"model": receipt["model"], "choices": [{
+                "index": 0, "delta": {"content": "compact summary"},
+                "finish_reason": None,
+            }]},
+            {"model": receipt["model"], "choices": [{
+                "index": 0, "delta": {}, "finish_reason": "stop",
+            }], "usage": receipt["usage"]},
+        ]
+        body = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+        return httpx.Response(
+            200, content=body + "data: [DONE]\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
     monkeypatch.setattr(
-        "opensquilla.session.compaction.httpx.AsyncClient",
-        lambda **kwargs: _client(_response_payload("compact summary"), calls),
+        "opensquilla.provider.openai.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=httpx.MockTransport(respond)),
     )
     sink = _Sink()
 

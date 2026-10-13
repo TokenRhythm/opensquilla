@@ -22,6 +22,7 @@ from opensquilla.engine import (
     ToolResult,
     WarningEvent,
 )
+from opensquilla.engine.agent import _LiveTurnCheckpointMessage, _LiveTurnContinuationMessage
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.session_sanitize import session_payload_chars
 from opensquilla.engine.types import CompactionEvent
@@ -2054,8 +2055,10 @@ async def test_context_overflow_effective_compaction_allows_single_retry(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("success_after", [None, 1])
 async def test_narrow_routed_window_never_durably_compacts_base_session(
     monkeypatch: pytest.MonkeyPatch,
+    success_after: int | None,
 ) -> None:
     async def _unexpected_compaction(_request: Any) -> CompactionResult:
         raise AssertionError(
@@ -2066,7 +2069,7 @@ async def test_narrow_routed_window_never_durably_compacts_base_session(
         "opensquilla.engine.agent.compact_context",
         _unexpected_compaction,
     )
-    provider = _ContextOverflowProvider()
+    provider = _ContextOverflowProvider(success_after=success_after)
     agent = Agent(
         provider=provider,
         config=AgentConfig(
@@ -2089,14 +2092,16 @@ async def test_narrow_routed_window_never_durably_compacts_base_session(
 
     events = [event async for event in agent.run_turn("current request")]
 
-    assert len(provider.calls) == 1
+    assert len(provider.calls) == 2
+    assert _provider_payload_is_smaller(provider.calls[0], provider.calls[1])
     assert not any(isinstance(event, CompactionEvent) for event in events)
-    assert agent.history_snapshot() == history
-    assert any(
-        isinstance(event, ErrorEvent)
-        and event.code == "provider_request_too_large"
-        for event in events
-    )
+    assert agent.history_snapshot()[:len(history)] == history
+    if success_after is None:
+        assert any(isinstance(event, ErrorEvent) for event in events)
+        assert agent.history_snapshot() == history
+    else:
+        assert not any(isinstance(event, ErrorEvent) for event in events)
+        assert any(event.kind == "done" for event in events)
 
 
 @pytest.mark.asyncio
@@ -2579,7 +2584,7 @@ async def test_inline_overflow_projects_completed_live_rounds_without_mutating_p
         current_user,
         *rounds,
     ]
-    canonical_snapshot = list(messages)
+    canonical_snapshot = [message.model_copy(deep=True) for message in messages]
     agent = Agent(
         provider=_ContextOverflowProvider(),
         config=AgentConfig(
@@ -2596,8 +2601,29 @@ async def test_inline_overflow_projects_completed_live_rounds_without_mutating_p
 
     assert outcome is not None
     assert outcome.ephemeral_only is True
-    assert outcome.messages[2] is current_user
-    assert outcome.messages[-4:] == rounds[-4:]
+    assert outcome.messages[0] is current_user
+    assert sum(message is current_user for message in outcome.messages) == 1
+    assert outcome.protected_turn_start_index == 0
+    assert len(outcome.messages) == 3
+    checkpoint = outcome.messages[1]
+    assert isinstance(checkpoint, _LiveTurnCheckpointMessage)
+    assert checkpoint.role == "assistant"
+    assert "completed work summary" in str(checkpoint.content)
+    assert isinstance(outcome.messages[2], _LiveTurnContinuationMessage)
+    assert outcome.messages[2].role == "user"
+    assert outcome.messages[2].content != current_user.content
+    receipts = checkpoint._compaction_tool_receipts
+    assert [receipt["tool_call_id"] for receipt in receipts] == [
+        f"live-{index}" for index in range(3)
+    ]
+    assert [receipt["name"] for receipt in receipts] == ["read_file"] * 3
+    assert [receipt["arguments"] for receipt in receipts] == [
+        {"path": f"part-{index}.txt"} for index in range(3)
+    ]
+    assert all(receipt["result_received"] for receipt in receipts)
+    assert all(receipt["execution_status"]["status"] == "unknown" for receipt in receipts)
+    assert compact_requests[0].forced_prefix_cut == len(rounds) + 2
+    assert all(message not in outcome.messages for message in rounds)
     assert messages == canonical_snapshot
     assert compact_requests
     assert compact_requests[0].config.protect_semantic_tail is False
@@ -3036,11 +3062,11 @@ async def test_live_turn_recovery_uses_stable_consumer_input_budget(
     )
     assert not any(isinstance(event, ErrorEvent) for event in events)
     assert len(provider.calls) == 5
-    assert len(compact_requests) == 2
+    assert len(compact_requests) == 1
     assert all(request.config.budget is not None for request in compact_requests)
-    # Completed-prefix capacity also reserves the active prompt and raw tool
-    # tail. A protected tail already above the physical cap has no room for a
-    # checkpoint; the existing local request window remains the recovery path.
+    # All completed rounds are eligible at once. Only the active prompt and
+    # actual fixed envelope consume raw capacity; no implicit recent-pair
+    # retry is needed before admitting the compacted request.
     assert all(request.context_window_tokens < 2_750 for request in compact_requests)
     assert all(request.context_window_chars < 11_000 for request in compact_requests)
     assert all(request.forced_prefix_cut is not None for request in compact_requests)

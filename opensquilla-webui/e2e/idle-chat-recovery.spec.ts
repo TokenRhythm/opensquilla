@@ -95,7 +95,9 @@ for (const halfOpen of [false, true]) {
     // Product probe/retry deadlines remain unchanged.
     for (let elapsed = 0; elapsed < 65_000; elapsed += 1_000) {
       await page.clock.runFor(1_000)
-      if (halfOpen && connectionCount > 1 && await send.isEnabled()) break
+      // Opening the replacement socket precedes Hello and message subscription.
+      // Keep advancing the existing budget until the recovered stream is ready.
+      if (halfOpen && connectionCount > 1 && subscriptions.includes(connectionCount) && await send.isEnabled()) break
       if (!halfOpen && elapsed >= 6_000) break
     }
 

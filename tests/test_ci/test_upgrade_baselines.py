@@ -29,6 +29,94 @@ def nsis_regression():
     return module
 
 
+@pytest.mark.parametrize("relative,method,field", [
+    (".", "is_dir", None),
+    ("old-install", "is_dir", "oldInstallObserved"),
+    ("old-uninstaller.exe", "is_file", "oldUninstallerObserved"),
+])
+def test_nsis_directory_sampling_recovers_from_windows_access_race(
+    nsis_regression, tmp_path, monkeypatch, relative, method, field,
+):
+    directory = tmp_path / "nsSynthetic.tmp"
+    (directory / "old-install").mkdir(parents=True)
+    (directory / "old-uninstaller.exe").write_bytes(b"synthetic")
+    target = directory / relative
+    original = getattr(Path, method)
+    attempts = 0
+
+    def sample(path):
+        nonlocal attempts
+        if path == target:
+            attempts += 1
+            if attempts <= 2:
+                error = PermissionError(13, "synthetic access denied", str(path))
+                error.winerror = 5
+                raise error
+        return original(path)
+
+    monkeypatch.setattr(Path, method, sample)
+    observed, errors = {}, []
+    for seconds in (1.0, 2.0):
+        nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, seconds)
+        if field is None:
+            assert observed == {}
+        else:
+            assert observed[str(directory)][field] is False
+    assert len(errors) == 1
+    assert errors[0] == {
+        "path": str(target), "sample": method, "errno": 13, "winerror": 5,
+        "firstObservedSeconds": 1.0, "lastObservedSeconds": 2.0, "observations": 2,
+    }
+    nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, 3.0)
+    assert observed[str(directory)]["oldInstallObserved"] is True
+    assert observed[str(directory)]["oldUninstallerObserved"] is True
+
+
+def test_nsis_directory_sampling_preserves_real_evidence_after_access_race(
+    nsis_regression, tmp_path, monkeypatch,
+):
+    directory = tmp_path / "nsSynthetic.tmp"
+    (directory / "old-install").mkdir(parents=True)
+    observed, errors = {}, []
+    nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, 1.0)
+    original = Path.is_dir
+
+    def denied(path):
+        if path == directory / "old-install":
+            error = PermissionError(13, "synthetic access denied", str(path))
+            error.winerror = 5
+            raise error
+        return original(path)
+
+    monkeypatch.setattr(Path, "is_dir", denied)
+    nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, 2.0)
+    assert observed[str(directory)]["oldInstallObserved"] is True
+    assert observed[str(directory)]["oldUninstallerObserved"] is False
+    assert errors[0]["winerror"] == 5
+
+
+@pytest.mark.parametrize("error_type,winerror", [
+    (PermissionError, None), (PermissionError, 32), (OSError, 5),
+])
+def test_nsis_directory_sampling_does_not_suppress_other_errors(
+    nsis_regression, tmp_path, monkeypatch, error_type, winerror,
+):
+    directory = tmp_path / "nsSynthetic.tmp"
+    error = error_type("synthetic unexpected filesystem error")
+    if winerror is not None:
+        error.winerror = winerror
+
+    def failed(_path):
+        raise error
+
+    monkeypatch.setattr(Path, "is_dir", failed)
+    observed, errors = {}, []
+    with pytest.raises(error_type) as raised:
+        nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, 1.0)
+    assert raised.value is error
+    assert observed == {} and errors == []
+
+
 @pytest.fixture
 def fresh_nsis_arguments(tmp_path):
     node = tmp_path / "synthetic-node.exe"
@@ -295,9 +383,15 @@ def test_nsis_matrix_adds_only_two_fresh_cells_with_shared_candidate_binding():
     workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
     job = workflow["jobs"]["upgrade-and-start"]
     matrix = job["strategy"]["matrix"]
-    assert matrix["baseline"] == ["0.5.3", "0.5.4"]
+    assert matrix["baseline"] == (
+        "${{ fromJSON(inputs.acceptance_profile == 'smoke' && '[\"0.5.4\"]' || "
+        "'[\"0.5.3\",\"0.5.4\"]') }}"
+    )
     assert matrix["install-path"] == ["default", "custom"]
-    assert matrix["scenario"] == ["baseline", "readlock", "longpath"]
+    assert matrix["scenario"] == (
+        "${{ fromJSON(inputs.acceptance_profile == 'smoke' && '[\"baseline\"]' || "
+        "'[\"baseline\",\"readlock\",\"longpath\"]') }}"
+    )
     assert matrix["include"] == [
         {"baseline": "fresh", "install-path": path, "scenario": "fresh"}
         for path in ("default", "custom")
@@ -305,6 +399,11 @@ def test_nsis_matrix_adds_only_two_fresh_cells_with_shared_candidate_binding():
     download = next(step for step in job["steps"]
                     if step.get("name") == "Download pinned official baseline")
     assert download["if"] == "matrix.scenario != 'fresh'"
+    download_script = download["run"]
+    assert "for ($attempt = 1; $attempt -le 3; $attempt++)" in download_script
+    assert "Remove-Item -LiteralPath $asset" in download_script
+    assert "HTTP (429|5\\d\\d)" in download_script
+    assert "if (-not $retryable -or $attempt -eq 3)" in download_script
     verify = next(step["run"] for step in job["steps"]
                   if "--candidate-source-sha" in step.get("run", ""))
     baseline_branch = "if ('${{ matrix.scenario }}' -ne 'fresh')"
@@ -505,6 +604,84 @@ def test_packaged_recovery_transport_contract_runs_in_desktop_node_ci() -> None:
         assert native_test.relative_to(ROOT).as_posix() in inputs
 
 
+@pytest.mark.ci_serial
+def test_packaged_gateway_readiness_budget_and_terminal_errors(tmp_path: Path) -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required for the packaged readiness contract")
+    script = r"""
+import assert from 'node:assert/strict';
+import { readFileSync, writeSync } from 'node:fs';
+const phase = (name, terminal) => writeSync(2, JSON.stringify({
+  event: 'packaged_readiness_contract', phase: name, terminal, at: Date.now(),
+}) + '\n');
+phase('entry');
+const source = readFileSync('desktop/electron/scripts/test-packaged-session-recovery.mjs', 'utf8');
+phase('source-loaded');
+const start = source.indexOf('  gatewayReadinessStartedAt = performance.now()');
+const end = source.indexOf('  // The preceding release-upgrade launch', start);
+assert.ok(start > 0 && end > start);
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const run = new AsyncFunction('waitFor', 'page', 'assert', 'performance', 'console',
+  'DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS',
+  'let gatewayReadinessStartedAt, lastGatewayConnection;\n' + source.slice(start, end));
+phase('compiled');
+for (const terminal of ['ready', 'error', 'stopped', 'starting']) {
+  phase('case-start', terminal);
+  let calls = 0;
+  const logs = [];
+  const page = { evaluate: async () => ({
+    status: ++calls === 1 ? 'starting' : terminal,
+    error: terminal === 'error' ? 'synthetic startup failure' : null,
+    authToken: 'must-never-appear-in-evidence',
+  }) };
+  const wait = async (check, label, budget) => {
+    assert.equal(budget, 120_000);
+    assert.equal(label, 'candidate Desktop Gateway readiness');
+    for (let i = 0; i < 3; i++) if (await check()) return;
+    throw new Error('synthetic startup timeout');
+  };
+  const attempt = run(wait, page, assert, performance,
+    { error: value => logs.push(value) }, 120_000);
+  if (terminal === 'ready') {
+    await attempt;
+    assert.equal(calls, 2);
+    assert.equal(JSON.parse(logs[0]).budgetMs, 120_000);
+  } else {
+    await assert.rejects(attempt, error => {
+      assert.ok(!error.message.includes('must-never-appear-in-evidence'));
+      assert.match(error.message, terminal === 'starting'
+        ? /synthetic startup timeout/ : /Candidate Gateway failed/);
+      return true;
+    });
+    assert.equal(calls, terminal === 'starting' ? 3 : 2);
+    assert.deepEqual(logs, []);
+  }
+  phase('case-end', terminal);
+}
+phase('complete');
+"""
+    # Keep the original process deadline independent of Windows pipe-reader
+    # threads, and retain the last completed phase if the child times out.
+    stdout_path = tmp_path / "node-stdout.log"
+    stderr_path = tmp_path / "node-stderr.log"
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        try:
+            result = subprocess.run(
+                [node, "--input-type=module", "-e", script],
+                cwd=ROOT, stdout=stdout_file, stderr=stderr_file, timeout=15, check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            error.add_note(
+                f"Captured stdout: {stdout_path.read_text(encoding='utf-8', errors='replace')!r}\n"
+                f"Captured stderr: {stderr_path.read_text(encoding='utf-8', errors='replace')!r}"
+            )
+            raise
+    stdout = stdout_path.read_text(encoding="utf-8")
+    stderr = stderr_path.read_text(encoding="utf-8")
+    assert result.returncode == 0, stdout + stderr
+
+
 @pytest.mark.parametrize(
     ("launch_fails", "cleanup_fails"), [(False, False), (False, True), (True, False)]
 )
@@ -523,6 +700,7 @@ def test_packaged_recovery_preserves_original_failure_after_cleanup(
     ):
         shutil.copyfile(scripts / name, tmp_path / name)
     (tmp_path / "packaged-smoke-helpers.mjs").write_text(
+        "export const DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS = 120_000;\n"
         "export function requiredOption(name) {\n"
         "return process.argv[process.argv.indexOf(name) + 1] }\n"
         "export async function waitFor() { throw new Error('Unexpected fixture wait') }\n"
@@ -1385,6 +1563,10 @@ def _assert_windows_signature_arguments(
     assert Path(captured["InstalledRoot"]) == installed
 
 
+# These subprocess contracts cold-start PowerShell and compile native PE version
+# resources. Keep them out of the parallel migration workers so the existing
+# 45-second process watchdog measures the helper, not competing cold starts.
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("install_mode", ["default", "custom"])
 @pytest.mark.parametrize(
     ("candidate", "installed"),
@@ -1422,6 +1604,7 @@ def test_windows_replacement_rejects_successful_installer_with_stale_app(
     )
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("install_mode", ["default", "custom"])
 @pytest.mark.parametrize("candidate", ["0.5.5", "0.5.5-rc1"])
 def test_windows_replacement_accepts_exact_installed_candidate_version(
@@ -1443,6 +1626,7 @@ def test_windows_replacement_accepts_exact_installed_candidate_version(
     )
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("install_mode", ["default", "custom"])
 def test_windows_upgrade_accepts_zero_revision_for_stable_pe_versions(
     windows_upgrade_harness: tuple[str, Path], install_mode: str
@@ -1463,6 +1647,7 @@ def test_windows_upgrade_accepts_zero_revision_for_stable_pe_versions(
     )
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("baseline_product_version", ["0.5.4.1", "0.5.40"])
 def test_windows_upgrade_rejects_other_baseline_pe_versions(
     windows_upgrade_harness: tuple[str, Path], baseline_product_version: str
@@ -1482,6 +1667,7 @@ def test_windows_upgrade_rejects_other_baseline_pe_versions(
     assert "POST_INSTALL_LAUNCH_REACHED" not in result.stderr
 
 
+@pytest.mark.ci_serial
 def test_windows_default_install_rejects_unrelated_executable_outside_known_folder(
     windows_upgrade_harness: tuple[str, Path],
 ) -> None:
@@ -1501,6 +1687,7 @@ def test_windows_default_install_rejects_unrelated_executable_outside_known_fold
     assert not (windows_upgrade_harness[1].parent / "signature-arguments.json").exists()
 
 
+@pytest.mark.ci_serial
 def test_windows_default_install_refuses_existing_installation_before_download(
     windows_upgrade_harness: tuple[str, Path],
 ) -> None:
@@ -1560,6 +1747,7 @@ $after = Get-NSISUserProgramsDirectory
     assert not Path(paths["after"]).is_relative_to(wrapper.parent)
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("install_mode", ["default", "custom"])
 @pytest.mark.parametrize("signature_failure", ["exit", "throw"])
 def test_windows_upgrade_propagates_signature_failure_before_launch(
@@ -1587,6 +1775,7 @@ def test_windows_upgrade_propagates_signature_failure_before_launch(
     )
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize(
     "candidate_name",
     [
@@ -1606,6 +1795,7 @@ def test_windows_upgrade_rejects_noncanonical_asset_before_side_effects(
     assert not (windows_upgrade_harness[1].parent / "runner").exists()
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("manifest_version", ["0.5.6", "0.5.5-rc1"])
 def test_windows_upgrade_rejects_manifest_candidate_mismatch_before_side_effects(
     windows_upgrade_harness: tuple[str, Path], manifest_version: str

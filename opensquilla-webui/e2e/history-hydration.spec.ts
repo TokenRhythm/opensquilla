@@ -54,6 +54,7 @@ function basePayload(method: string, sessionKey = SESSION_KEY): unknown {
     },
     'models.routing.get': { mode: 'direct' },
     'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
+    'sessions.resolve': { session_key: sessionKey, session_id: sessionKey },
     'sessions.messages.snapshot': sessionMessagesSnapshotPayload(sessionKey),
     'sessions.messages.subscribe': sessionMessagesSubscribePayload(sessionKey),
     'sessions.messages.hydrate': sessionMessagesHydratePayload(sessionKey),

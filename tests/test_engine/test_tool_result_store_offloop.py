@@ -11,13 +11,14 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine import tool_result_store as trs_module
+from opensquilla.managed_artifacts import ManagedArtifactError
 from opensquilla.provider import ContentBlockToolResult, ContentBlockToolUse, Message
 from opensquilla.tools import ToolRegistry, tool
 from opensquilla.tools.dispatch import build_tool_handler
@@ -306,23 +307,54 @@ async def test_sync_projection_keeps_content_when_output_writer_owns_store(tmp_p
 
 
 async def test_async_projection_waits_for_store_then_publishes_readable_handle(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
     agent = _agent_with_store(tmp_path)
     store = trs_module.ToolResultStore(tmp_path / "store")
     messages = _bulky_messages()
-    async with _hold_store_budget(store):
-        projection = asyncio.create_task(agent._provider_request_messages_async(
-            messages,
-            request_context_message=None,
-            request_context_insert_index=0,
-            runtime_context_message=Message(role="user", content="[Runtime context]"),
-            runtime_context_insert_index=len(messages),
-        ))
-        await asyncio.sleep(0.05)
-        assert not projection.done()
+    loop = asyncio.get_running_loop()
+    lock_attempted = asyncio.Event()
+    lock_acquired = asyncio.Event()
+    original_budget_lock = trs_module.ToolResultStore._budget_lock
 
-    projected = await asyncio.wait_for(projection, timeout=2)
+    @contextmanager
+    def observe_budget_lock(self, *, timeout=5.0):
+        # The holder owns a separate store instance for the same directory.
+        # Observe success only after both the thread and file locks are acquired.
+        if self is not store:
+            with pytest.raises(ManagedArtifactError, match="Timed out waiting for another"):
+                with original_budget_lock(self, timeout=0):
+                    pass
+            loop.call_soon_threadsafe(lock_attempted.set)
+        with original_budget_lock(self, timeout=timeout):
+            if self is not store:
+                loop.call_soon_threadsafe(lock_acquired.set)
+            yield
+
+    monkeypatch.setattr(trs_module.ToolResultStore, "_budget_lock", observe_budget_lock)
+    projection = None
+    try:
+        async with _hold_store_budget(store):
+            projection = asyncio.create_task(agent._provider_request_messages_async(
+                messages,
+                request_context_message=None,
+                request_context_insert_index=0,
+                runtime_context_message=Message(role="user", content="[Runtime context]"),
+                runtime_context_insert_index=len(messages),
+            ))
+            await asyncio.wait_for(lock_attempted.wait(), timeout=2)
+            assert not lock_acquired.is_set()
+            assert not projection.done()
+
+        # Keep the two-second lock-handoff watchdog. Real snapshot scanning,
+        # encoding and atomic writes begin after this acquisition boundary.
+        await asyncio.wait_for(lock_acquired.wait(), timeout=2)
+        projected = await asyncio.shield(projection)
+    finally:
+        # The holder releases in its own finally; drain the actual worker before
+        # monkeypatch or tmp_path teardown, including failed handshake assertions.
+        if projection is not None:
+            await asyncio.gather(projection, return_exceptions=True)
     text = _tool_content(projected)
     assert len(text) < len(_tool_content(messages))
     handle = text.split("tool_result_handle: ", 1)[1].splitlines()[0]

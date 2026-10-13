@@ -103,7 +103,7 @@ def _agent(
         ),
         tool_definitions=[
             ToolDefinition(name=name, description="Synthetic tool", input_schema=ToolInputSchema())
-            for name in ("probe", "repair", "meta_invoke", "read_file", "exec_command", "process")
+            for name in ("probe", "repair", "read_file", "exec_command", "process")
         ],
         tool_handler=handler,
         tool_context=context,
@@ -270,49 +270,8 @@ async def test_total_timeout_during_final_response_preserves_timeout_outcome() -
     assert errors[0].code == "agent_runtime_timeout"
 
 
-async def test_meta_dispatch_waiting_behind_failed_batch_does_not_start(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    batch = [("probe", {"target": "sample"})] * 3
-    batch.append(("meta_invoke", {"name": "synthetic", "inputs": {}}))
-    provider = _EdgeProvider([batch])
-    meta_calls: list[ToolCall] = []
-
-    async def handler(call: ToolCall) -> ToolResult:
-        return _failed(call)
-
-    async def meta_handler(call: ToolCall, context: ToolContext) -> AsyncIterator[ToolResult]:
-        meta_calls.append(call)
-        yield _succeeded(call)
-
-    agent = _agent(provider, handler)
-    monkeypatch.setattr(agent, "_run_one_streaming", meta_handler)
-    events = [event async for event in agent.run_turn("Inspect the sample.")]
-    assert not meta_calls
-    assert provider.requests[-1]["tools"] is None
-    assert any(isinstance(event, DoneEvent) and event.text for event in events)
 
 
-async def test_repeated_streaming_meta_failures_share_the_recovery_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _EdgeProvider([[('meta_invoke', {"name": "synthetic", "inputs": {}})]] * 8)
-    meta_calls: list[ToolCall] = []
-
-    async def handler(call: ToolCall) -> ToolResult:
-        raise AssertionError("Streaming meta calls should not use the ordinary handler")
-
-    async def meta_handler(call: ToolCall, context: ToolContext) -> AsyncIterator[ToolResult]:
-        meta_calls.append(call)
-        yield _failed(call)
-
-    agent = _agent(provider, handler)
-    monkeypatch.setattr(agent, "_run_one_streaming", meta_handler)
-    events = [event async for event in agent.run_turn("Inspect the sample.")]
-    assert len(meta_calls) == 3
-    assert len(provider.requests) == 4
-    assert provider.requests[-1]["tools"] is None
-    assert any(isinstance(event, DoneEvent) and event.text for event in events)
 
 
 async def test_final_text_survives_spurious_tool_calls_without_dispatch() -> None:
@@ -335,30 +294,6 @@ async def test_final_text_survives_spurious_tool_calls_without_dispatch() -> Non
     )
 
 
-async def test_meta_repair_receipt_reopens_permanent_failed_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _EdgeProvider([
-        [("probe", {"target": "sample"})],
-        [("meta_invoke", {"name": "synthetic", "inputs": {}})],
-        [("probe", {"target": "sample"})],
-    ])
-    calls: list[ToolCall] = []
-
-    async def handler(call: ToolCall) -> ToolResult:
-        calls.append(call)
-        return _failed(call, permanent=True) if len(calls) == 1 else _succeeded(call)
-
-    async def meta_handler(call: ToolCall, context: ToolContext) -> AsyncIterator[ToolResult]:
-        context.workspace_mutation_receipts.append({"path": "sample.conf", "operation": "write"})
-        yield _succeeded(call)
-
-    agent = _agent(provider, handler, context=ToolContext())
-    monkeypatch.setattr(agent, "_run_one_streaming", meta_handler)
-    events = [event async for event in agent.run_turn("Repair and inspect the sample.")]
-    assert len(calls) == 2
-    assert all(request["tools"] for request in provider.requests)
-    assert not any(isinstance(event, ErrorEvent) for event in events)
 
 
 async def test_shared_turn_runner_factory_and_run_adapter_enforce_recovery() -> None:

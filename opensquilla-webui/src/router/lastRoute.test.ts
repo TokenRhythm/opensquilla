@@ -5,10 +5,10 @@ import { isRestorableRoute, saveLastRoute, readLastRoute, LAST_ROUTE_KEY } from 
 beforeEach(() => localStorage.clear())
 
 describe('isRestorableRoute', () => {
-  it('accepts the known top-level views, including both route hubs', () => {
+  it('accepts the surviving top-level views', () => {
     for (const p of [
       '/chat', '/channels',
-      '/cron', '/skills', '/overview', '/usage', '/logs',
+      '/cron', '/skills', '/usage',
     ]) {
       expect(isRestorableRoute(p)).toBe(true)
     }
@@ -20,7 +20,7 @@ describe('isRestorableRoute', () => {
       // /approvals redirects to /chat and is not saved.
 
       '/approvals',
-      '/health', '/nope', '/settingsx', '',
+      '/overview', '/logs', '/health', '/nope', '/settingsx', '',
     ]) {
       expect(isRestorableRoute(p)).toBe(false)
     }
@@ -31,8 +31,8 @@ describe('saveLastRoute / readLastRoute', () => {
   it('round-trips a restorable view', () => {
     saveLastRoute('/cron')
     expect(readLastRoute()).toBe('/cron')
-    saveLastRoute('/overview')
-    expect(readLastRoute()).toBe('/overview')
+    saveLastRoute('/usage')
+    expect(readLastRoute()).toBe('/usage')
   })
 
   it('never persists the settings overlay, and re-validates an already-saved one to null', () => {
@@ -58,6 +58,18 @@ describe('saveLastRoute / readLastRoute', () => {
 
   it('drops an Agent page saved by an older build so cold start uses the default', () => {
     localStorage.setItem(LAST_ROUTE_KEY, '/agents')
+    expect(readLastRoute()).toBeNull()
+  })
+
+  it.each(['/overview', '/health'])('migrates a saved %s to Usage', (path) => {
+    localStorage.setItem(LAST_ROUTE_KEY, path)
+    expect(readLastRoute()).toBe('/usage')
+  })
+
+  it('drops a saved Logs page instead of restoring the Settings overlay', () => {
+    localStorage.setItem(LAST_ROUTE_KEY, '/logs')
+    expect(readLastRoute()).toBeNull()
+    saveLastRoute('/logs')
     expect(readLastRoute()).toBeNull()
   })
 })

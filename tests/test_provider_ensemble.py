@@ -6574,7 +6574,10 @@ async def test_aggregator_no_output_timeout_uses_fixed_aggregator_and_preserves_
     )
 
     async def stalled_aggregator() -> AsyncIterator[StreamEvent]:
-        await asyncio.sleep(0.05)
+        # Never produce a terminal event: the test exercises the idle-timeout
+        # takeover, so a delayed DoneEvent would make cancellation scheduling
+        # decide whether the fallback path is entered.
+        await asyncio.Event().wait()
         yield DoneEvent(model="agg")
 
     async def successful_fallback() -> AsyncIterator[StreamEvent]:

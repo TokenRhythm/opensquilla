@@ -664,7 +664,7 @@ async def test_sync_manager_warm_called(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_agent_factory_forwards_registry_and_tool_context() -> None:
-    """meta_invoke dispatch needs the Agent to retain registry/context wiring."""
+    """Tool dispatch needs the Agent to retain registry/context wiring."""
 
     registry = ToolRegistry()
     tool_context = ToolContext(is_owner=True, workspace_dir="/tmp")

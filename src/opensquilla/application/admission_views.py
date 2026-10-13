@@ -146,21 +146,6 @@ class AdmissionPlanRun(Protocol):
     def plan_revision_id(self) -> str: ...
 
 
-class AdmissionMetaControl(Protocol):
-    @property
-    def status(self) -> str: ...
-    @property
-    def intent_id(self) -> str: ...
-    @property
-    def control_kind(self) -> str: ...
-    @property
-    def meta_skill_name(self) -> str: ...
-    @property
-    def correlation_id(self) -> str: ...
-    @property
-    def replay_run_id(self) -> str | None: ...
-    @property
-    def replay_mode(self) -> str | None: ...
 
 
 
@@ -205,11 +190,6 @@ class AdmissionProjectOrigin:
     run_mode_source: str
 
 
-@dataclass(frozen=True, slots=True)
-class MetaAdmissionControl:
-    kind: Literal["manual", "replay"]
-    correlation_id: str
-    name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,7 +209,6 @@ class AdmissionSessionCapabilities:
 @dataclass(frozen=True, slots=True)
 class AdmissionStorageCapabilities:
     receipts: bool
-    meta_controls: bool
     atomic_acceptance: bool
 
 
@@ -256,7 +235,6 @@ class AdmissionCommit:
     plan_revision: AdmissionPlanRevision | None = None
     plan_run: AdmissionPlanRun | None = None
     merge_into_task: bool = False
-    meta_control_intent_id: str | None = None
     workspace_guard: ProjectWorkspaceGuard | None = None
     expected_collaboration_revision: int | None = None
     expected_active_plan_revision_id: str | None = None

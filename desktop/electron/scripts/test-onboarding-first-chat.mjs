@@ -126,20 +126,29 @@ try {
     for (const page of app.windows()) {
       if (!page.isClosed() && page.url().startsWith('opensquilla-app://desktop/')) {
         const connection = await page.evaluate(() => window.opensquillaDesktop?.getGatewayConnection?.())
+        if (connection?.status !== 'ready') return page
+      }
+    }
+    return null
+  }, 'local Desktop renderer before setup is dismissed')
+  assert.equal(await onboarding.locator('#apiKey').inputValue(), '')
+  assert.equal(requests.filter(request => request.method === 'POST').length, 0)
+  await screenshot('01-client-before-setup')
+  complete('empty first run shows onboarding before Gateway readiness')
+
+  await onboarding.locator('#skip').click()
+  await waitFor(() => onboarding.isClosed(), 'skip dismisses onboarding')
+  desktop = await waitFor(async () => {
+    for (const page of app.windows()) {
+      if (!page.isClosed() && page.url().startsWith('opensquilla-app://desktop/')) {
+        const connection = await page.evaluate(() => window.opensquillaDesktop?.getGatewayConnection?.())
         if (connection?.status === 'ready') return page
       }
     }
     return null
-  }, 'Gateway readiness before any setup input')
+  }, 'Gateway readiness after setup is dismissed')
   const notice = desktop.locator('.chat-model-setup-notice')
   await notice.waitFor({ state: 'visible', timeout: 30_000 })
-  assert.equal(await onboarding.locator('#apiKey').inputValue(), '')
-  assert.equal(requests.filter(request => request.method === 'POST').length, 0)
-  await screenshot('01-client-ready-before-setup')
-  complete('empty first run reaches Gateway ready and shows the model setup notice')
-
-  await onboarding.locator('#skip').click()
-  await waitFor(() => onboarding.isClosed(), 'skip dismisses onboarding')
   await desktop.bringToFront()
   const composer = desktop.locator('.chat-textarea')
   await composer.fill(draft)

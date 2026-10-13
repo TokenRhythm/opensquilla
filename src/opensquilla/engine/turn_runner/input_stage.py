@@ -154,6 +154,22 @@ class InputStage:
                     " message. Treat it as system-originated context."
                 )
             }
+        elif inp.input_mode == "goal_continuation":
+            # Goal rounds are hidden from the user transcript, but must retain
+            # user-like/actionable semantics.  Treating them as system events
+            # activates the heartbeat/silent-reply guidance and encourages the
+            # model to answer with NO_REPLY instead of doing Goal work.
+            runtime_message = f"[GOAL CONTINUATION]\n{inp.message}"
+            semantic_input = inp.message
+            extra_prompt_context = {
+                "Goal Continuation Mode": (
+                    "The next input is an internal Goal continuation. It is an"
+                    " actionable work round, not a heartbeat or status poll."
+                    " Inspect the durable Goal, make concrete progress, and use"
+                    " update_goal when the Goal is complete or blocked. Do not"
+                    " emit NO_REPLY or HEARTBEAT_OK for this input."
+                )
+            }
 
         extra_prompt_context = self._extra_ctx.merge(
             extra_prompt_context,

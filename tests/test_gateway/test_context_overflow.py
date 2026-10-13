@@ -18,6 +18,8 @@ from opensquilla.gateway.context_overflow import (
     apply_context_overflow_policy,
 )
 from opensquilla.gateway.rpc_chat import _handle_chat_send
+from opensquilla.provider.protocol import provider_connection_config
+from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction import CompactionConfig, build_compaction_config_from_provider
 from opensquilla.session.compaction_state import (
@@ -1046,7 +1048,11 @@ async def test_rpc_chat_auto_summarize_builds_provider_compaction_config() -> No
             return_value=SimpleNamespace(model="session/model", model_override="routed/model")
         )
     )
-    selector = _FakeProviderSelector()
+    selected = ProviderConfig(
+        provider="openrouter", model="provider/model", api_key="overflow-provider-key",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    selector = ModelSelector(SelectorConfig(primary=selected))
     ctx = SimpleNamespace(config=cfg, session_manager=sm, provider_selector=selector)
 
     session = await sm._storage.get_session("s-auto")
@@ -1069,11 +1075,17 @@ async def test_rpc_chat_auto_summarize_builds_provider_compaction_config() -> No
     assert outcome.summarized is True
     config = sm.compact_calls[0][2]
     assert isinstance(config, CompactionConfig)
-    assert config.api_key == "overflow-provider-key"
-    assert config.model == "routed/model"
-    assert config.base_url == "https://openrouter.ai/api/v1"
-    assert selector.override_calls == []
-    assert selector.clone_instance.override_calls == ["routed/model"]
+    assert config.llm_plan is not None
+    deployment = config.llm_plan.deployment
+    connection = provider_connection_config(deployment.provider)
+    assert deployment.provider_id == "openrouter"
+    assert deployment.model == "session/model"
+    assert connection.api_key == "overflow-provider-key"
+    assert connection.base_url == "https://openrouter.ai/api/v1"
+    assert config.llm_plan.candidates == (deployment,)
+    assert selector.current_config == selected
+    assert selector.current_config.model == "provider/model"
+    assert session.model_override == "routed/model"
 
 
 @pytest.mark.asyncio

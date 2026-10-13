@@ -215,7 +215,6 @@ async function createAnnotationDraftHarness(
     getCapabilities: vi.fn(async () => ({
       protocolVersions: [3] as Array<3>,
       modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-      maxSurfaces: 8,
     })),
     getArtifactAnnotationCapabilities: vi.fn(async () => ({
       version: 3 as const,
@@ -405,7 +404,7 @@ describe('artifact Workbench provider', () => {
       const renderState: Record<string, unknown> = {}
       const nativeApi: NativeWorkbenchApi = {
         getCapabilities: vi.fn<NonNullable<NativeWorkbenchApi['getCapabilities']>>(
-          async () => ({ protocolVersions: [3], modes: ['offline'], maxSurfaces: 8 }),
+          async () => ({ protocolVersions: [3], modes: ['offline'] }),
         ),
         createArtifactPreviewLease: vi.fn(), renewArtifactPreviewLease: vi.fn(), revokeArtifactPreviewLease: vi.fn(),
         createSurface: vi.fn(async () => ({ ok: true })),
@@ -571,7 +570,7 @@ describe('artifact Workbench provider', () => {
     const harness = await createAnnotationDraftHarness()
     if (compatibility === 'old-protocol') {
       vi.mocked(harness.nativeApi.getCapabilities!).mockResolvedValue({
-        protocolVersions: [1], modes: ['offline'], maxSurfaces: 8,
+        protocolVersions: [1], modes: ['offline'],
       })
     } else {
       harness.nativeApi.createArtifactPreviewLease = undefined
@@ -1727,7 +1726,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [2] as Array<2>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       createArtifactPreviewLease: createLease,
       renewArtifactPreviewLease: vi.fn(async () => ({
@@ -2009,7 +2007,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [1, 2, 3] as Array<1 | 2 | 3>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       createArtifactPreviewLease: createLease,
       renewArtifactPreviewLease: vi.fn(async () => ({
@@ -2499,7 +2496,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [1, 2] as Array<1 | 2>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       createArtifactPreviewLease: createLease,
       renewArtifactPreviewLease: vi.fn(async () => ({
@@ -2589,6 +2585,112 @@ describe('artifact Workbench provider', () => {
     await runtime.dispose?.('closed')
   })
 
+  it.each([429, 503])('keeps the live page and annotations through a transient renewal %s', async status => {
+    vi.useFakeTimers()
+    const h = await createAnnotationDraftHarness()
+    const renew = vi.mocked(h.nativeApi.renewArtifactPreviewLease!)
+    renew.mockResolvedValueOnce({ ok: false, status, code: 'RATE_LIMITED', message: 'Try later' })
+    const initialState = { ...h.renderState }
+    try {
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000)
+      expect(renew).toHaveBeenCalledOnce()
+      expect(h.renderState).toEqual(initialState)
+      expect(h.destroySurface).not.toHaveBeenCalled()
+      expect(h.pushToast).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(2_000)
+      expect(renew).toHaveBeenCalledTimes(2)
+      expect(h.createSurface).toHaveBeenCalledOnce()
+      expect(h.closeOverlay).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000)
+      expect(renew).toHaveBeenCalledTimes(3)
+      expect(h.destroySurface).not.toHaveBeenCalled()
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+
+  it('cancels a queued renewal retry when the preview closes', async () => {
+    vi.useFakeTimers()
+    const h = await createAnnotationDraftHarness()
+    const renew = vi.mocked(h.nativeApi.renewArtifactPreviewLease!)
+    renew.mockResolvedValueOnce({ ok: false, status: 429, code: 'RATE_LIMITED', message: 'Try later' })
+    await vi.advanceTimersByTimeAsync(15 * 60 * 1000)
+    await h.runtime.dispose?.('closed')
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000)
+    expect(renew).toHaveBeenCalledOnce()
+    expect(h.destroySurface).toHaveBeenCalledOnce()
+  })
+
+  it.each([true, false])('does not overlap slow renewals or resume them after close (success=%s)', async success => {
+    vi.useFakeTimers()
+    const h = await createAnnotationDraftHarness()
+    const renew = vi.mocked(h.nativeApi.renewArtifactPreviewLease!)
+    let finish!: (value: Awaited<ReturnType<typeof renew>>) => void
+    const pending = new Promise<Awaited<ReturnType<typeof renew>>>(resolve => { finish = resolve })
+    renew.mockReturnValueOnce(pending)
+    await vi.advanceTimersByTimeAsync(45 * 60 * 1000)
+    expect(renew).toHaveBeenCalledOnce()
+    await h.runtime.dispose?.('closed')
+    finish(success ? {
+      ok: true, status: 200,
+      payload: { version: 1, lease_id: 'apl-annotation-focused', expires_at: '2099-01-01T00:00:00Z' },
+    } : { ok: false, status: 503, code: 'PREVIEW_BROKER_UNAVAILABLE', message: 'Unavailable' })
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000)
+    expect(renew).toHaveBeenCalledOnce()
+    expect(h.destroySurface).toHaveBeenCalledOnce()
+    expect(h.pushToast).not.toHaveBeenCalled()
+  })
+
+  it('cancels the old retry when a preview lease is replaced', async () => {
+    vi.useFakeTimers()
+    const h = await createAnnotationDraftHarness()
+    const renew = vi.mocked(h.nativeApi.renewArtifactPreviewLease!)
+    renew.mockResolvedValueOnce({ ok: false, status: 429, code: 'RATE_LIMITED', message: 'Try later' })
+    try {
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000)
+      await h.runtime.performAction?.('refresh', h.item)
+      await vi.advanceTimersByTimeAsync(2_000)
+      expect(renew).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000)
+      expect(renew).toHaveBeenCalledTimes(2)
+      expect(h.createSurface).toHaveBeenCalledTimes(2)
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+
+  it.each([
+    { status: 401, code: 'UNAUTHORIZED' },
+    { status: 403, code: 'FORBIDDEN' },
+    { status: 502, code: 'INVALID_RESPONSE' },
+    { status: 0, code: 'DESKTOP_PREVIEW_BROKER_UNAVAILABLE' },
+  ])('does not silently retry a terminal renewal $code', async failure => {
+    vi.useFakeTimers()
+    const h = await createAnnotationDraftHarness()
+    const renew = vi.mocked(h.nativeApi.renewArtifactPreviewLease!)
+    renew.mockResolvedValueOnce({ ok: false, ...failure, message: 'Unavailable' })
+    try {
+      await vi.advanceTimersByTimeAsync(16 * 60 * 1000)
+      expect(renew).toHaveBeenCalledOnce()
+      expect(h.destroySurface).toHaveBeenCalledOnce()
+      expect(h.renderState.previewBlocked).toBe(true)
+      expect(h.pushToast).toHaveBeenCalledOnce()
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+
+  it('bounds transient retries by the last confirmed lease expiry', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(Date.parse('2099-01-01T00:00:00Z') - 15 * 60 * 1000 - 500))
+    const h = await createAnnotationDraftHarness()
+    const renew = vi.mocked(h.nativeApi.renewArtifactPreviewLease!)
+    renew.mockResolvedValue({ ok: false, status: 503, code: 'PREVIEW_BROKER_UNAVAILABLE', message: 'Unavailable' })
+    try {
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000)
+      expect(h.destroySurface).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(500)
+      expect(renew).toHaveBeenCalledTimes(2)
+      expect(h.destroySurface).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000)
+      expect(renew).toHaveBeenCalledTimes(2)
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+
   it('settles a revoked-lease replacement failure without an unhandled renewal rejection', async () => {
     vi.useFakeTimers()
     const privateDiagnostic = 'revoked lease at /private/operator/profile'
@@ -2616,7 +2718,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [2] as Array<2>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       createArtifactPreviewLease: vi.fn(async () => ({
         ok: true as const,
@@ -2695,7 +2796,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [1, 2] as Array<1 | 2>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       createSurface: vi.fn(async () => ({ ok: true })),
       setSurfaceRect: vi.fn(async () => ({ ok: true })),
@@ -2806,7 +2906,7 @@ describe('artifact Workbench provider', () => {
         keepalive: true,
         method: 'DELETE',
         sessionKey: 'session-a',
-        timeoutMs: 0,
+        timeoutMs: 15_000,
       })
       expect(clearPreviewOrigin.mock.invocationCallOrder[0]).toBeLessThan(
         requestBlob.mock.invocationCallOrder[0]!,
@@ -2854,7 +2954,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [4] as Array<4>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       getArtifactAnnotationCapabilities: vi.fn(async () => ({
         version: 4 as const,
@@ -3033,7 +3132,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [3] as Array<3>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       getArtifactAnnotationCapabilities,
       setArtifactAnnotationMode,
@@ -3436,7 +3534,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [3] as Array<3>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       getArtifactAnnotationCapabilities: vi.fn(async () => ({
         version: 3 as const,
@@ -4226,7 +4323,7 @@ async function createWorkingHeadRuntime(workingDocumentId?: string) {
   const revokeLease = vi.fn(async () => ({ ok: true as const, status: 204, payload: undefined }))
   const nativeApi: NativeWorkbenchApi = {
     getCapabilities: vi.fn(async () => ({ protocolVersions: [4] as Array<4>,
-      modes: ['full', 'offline'] as Array<'full' | 'offline'>, maxSurfaces: 8 })),
+      modes: ['full', 'offline'] as Array<'full' | 'offline'> })),
     createArtifactPreviewLease: createLease,
     renewArtifactPreviewLease: vi.fn(async () => ({ ok: true as const, status: 200,
       payload: { version: 1 as const, lease_id: `apl-working-${sequence}`, expires_at: '2099-01-01T00:00:00Z' } })),

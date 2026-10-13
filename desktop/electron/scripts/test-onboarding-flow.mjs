@@ -19,6 +19,15 @@ const selectedCases = new Set(String(process.env.OPENSQUILLA_DESKTOP_ONBOARDING_
   .split(',').map(value => value.trim()).filter(Boolean))
 const onboardingDiagnosticContexts = new WeakMap()
 const reportedOnboardingFailures = new WeakSet()
+
+function toPlain(value) {
+  if (Array.isArray(value)) return value.map(toPlain)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, toPlain(nested)]))
+  }
+  return value
+}
+
 // Match the existing orphan-recovery native harness's cold-start budget:
 // Gateway readiness owns 120s, with 45s for the surrounding Desktop startup.
 // Each launch consumes one absolute deadline; it is not renewed by assertions.
@@ -314,20 +323,29 @@ async function reportOnboardingFailure(app, phase, error) {
 }
 
 async function setupWindow(app) {
-  let phase = 'gateway-startup'
+  let phase = 'setup-window'
   try {
-    // The optional invitation is published only after the client and Gateway
-    // are ready. Profile preparation must not consume its separate UI deadline.
-    await readyDesktopWindow(app)
-    phase = 'setup-window'
-    return await waitFor(async () => {
+    const context = onboardingDiagnosticContexts.get(app)
+    const timeoutMs = context ? context.startupDeadline - Date.now() : 60_000
+    if (timeoutMs <= 0) {
+      throw new Error(`Desktop startup exceeded its ${INITIAL_DESKTOP_STARTUP_BUDGET_MS}ms launch budget.`)
+    }
+    // Fresh onboarding opens before its first Gateway spawn. The client
+    // renderer is already mounted, while Gateway readiness waits for save,
+    // skip, or close. Profile inspection consumes the same absolute launch
+    // budget as readyDesktopWindow; do not start a separate 60s cutoff here.
+    const page = await waitFor(async () => {
       for (const page of app.windows()) {
         if (page.isClosed()) continue
         await page.waitForLoadState('domcontentloaded', { timeout: 5_000 }).catch(() => {})
         if (await page.locator('#setup-form').count().catch(() => 0)) return page
       }
       return null
-    }, 'desktop onboarding window')
+    }, 'desktop onboarding window', timeoutMs)
+    if (context && Date.now() >= context.startupDeadline) {
+      throw new Error(`Desktop startup exceeded its ${INITIAL_DESKTOP_STARTUP_BUDGET_MS}ms launch budget.`)
+    }
+    return page
   } catch (error) {
     await reportOnboardingFailure(app, phase, error)
     throw error
@@ -473,9 +491,8 @@ async function verifyBootPhaseTimer(app) {
       (await phase.innerText()).trim() === status.label
     ), `boot status ${status.label} to render`)
   }
-  // The non-blocking onboarding invitation now opens after real boot has
-  // reached ready. A boot error arms the documented retry reset; a profile
-  // status alone must not make completed progress go backwards.
+  // A boot error arms the documented retry reset; a profile status alone must
+  // not make completed progress go backwards.
   await sendBootEvent(app, 'desktop:boot:error', { message: 'Synthetic retry boundary.' })
   await waitFor(async () => page.locator('body').evaluate(body => body.classList.contains('errored')),
     'boot error to arm the retry progress reset')
@@ -956,7 +973,6 @@ async function verifyOptionalProbeDoesNotBlockPersistence() {
   const syntheticKey = 'synthetic-probe-retry-key'
   try {
     const page = await setupWindow(app)
-    await readyDesktopWindow(app)
     const initialConfig = await readFile(configPath, 'utf8')
     assert.equal(await fileExists(credentialPath), false)
     await page.locator('#providerSelectToggle').click()
@@ -1040,8 +1056,6 @@ async function verifyEmptySetupCanBeDismissedAndStaysDismissed(action = 'skip') 
   let phase = 'setup-window'
   try {
     const page = await setupWindow(app)
-    phase = 'initial-gateway-ready'
-    const desktop = await readyDesktopWindow(app)
     phase = `dismiss-${action}`
     const initialWindows = await app.evaluate(({ BrowserWindow }) => (
       BrowserWindow.getAllWindows().map(window => ({
@@ -1068,6 +1082,8 @@ async function verifyEmptySetupCanBeDismissedAndStaysDismissed(action = 'skip') 
       await page.locator('#skip').click()
     }
     await waitFor(() => page.isClosed(), 'empty configuration panel to close')
+    phase = 'initial-gateway-ready'
+    const desktop = await readyDesktopWindow(app)
     assert.equal(desktop.isClosed(), false, 'skipping must not quit the client')
     assert.equal(await fileExists(join(initial.userDataDir, 'desktop-credential.json')), false,
       'skipping must not invent provider credentials')
@@ -1106,8 +1122,6 @@ async function verifySlowProbeDoesNotOwnSetupActions() {
   let phase = 'setup-window'
   try {
     const page = await setupWindow(app)
-    phase = 'initial-gateway-ready'
-    const desktop = await readyDesktopWindow(app)
     phase = 'probe-edit-races'
     await installPendingProbeStub(app)
     await page.locator('#apiKey').fill('synthetic-original-key')
@@ -1157,6 +1171,7 @@ async function verifySlowProbeDoesNotOwnSetupActions() {
     await page.locator('#skip').click()
     await waitFor(() => page.isClosed(), 'skip to close setup without waiting for the probe')
     await settlePendingProbe(app, 3, { ok: true, latencyMs: 9000 })
+    const desktop = await readyDesktopWindow(app)
     assert.equal(desktop.isClosed(), false)
     assert.equal((await desktop.evaluate(() => window.opensquillaDesktop.getGatewayConnection())).status, 'ready')
     assert.equal(await fileExists(join(userDataDir, 'desktop-credential.json')), false,
@@ -1204,15 +1219,13 @@ try {
   assert.equal(
     desktopPage.url(),
     'opensquilla-app://desktop/chat/new',
-    'the local Desktop renderer must exist before onboarding and Gateway readiness',
+    'the local Desktop renderer must exist before onboarding completes',
   )
   assert.equal(await desktopPage.locator('#app').count(), 1)
-  await readyDesktopWindow(app)
-  const startingConnection = await desktopPage.evaluate(
+  const preSetupConnection = await desktopPage.evaluate(
     () => window.opensquillaDesktop?.getGatewayConnection?.(),
   )
-  assert.equal(startingConnection?.status, 'ready', 'the client must start before the user completes model setup')
-  assert.match(startingConnection?.wsUrl || '', /^ws:\/\/127\.0\.0\.1:\d+\/ws$/)
+  assert.notEqual(preSetupConnection?.status, 'ready', 'fresh onboarding must precede Gateway readiness')
   const pageErrors = []
   page.on('pageerror', (error) => pageErrors.push(error.message || String(error)))
   const providerScreen = page.locator('[data-screen="1"]')
@@ -1762,9 +1775,9 @@ try {
   assert.equal(afterSwitch.squilla_router.preset_binding, 'follow_primary')
   assert.equal(afterSwitch.squilla_router.enabled, true)
   assert.equal(afterSwitch.squilla_router.rollout_phase, 'observe')
-  assert.deepEqual(afterSwitch.squilla_router.budget_gate, beforeSwitch.squilla_router.budget_gate)
+  assert.deepEqual(toPlain(afterSwitch.squilla_router.budget_gate), beforeSwitch.squilla_router.budget_gate)
   assert.ok(Object.values(afterSwitch.squilla_router.tiers).every(tier => tier.provider === 'openrouter'))
-  assert.deepEqual(afterSwitch.llm_ensemble, beforeSwitch.llm_ensemble)
+  assert.deepEqual(toPlain(afterSwitch.llm_ensemble), beforeSwitch.llm_ensemble)
 
   afterSwitch.squilla_router.preset_binding = 'custom'
   await writeFile(routerConfigPath, stringify(afterSwitch))
@@ -1784,6 +1797,9 @@ try {
     model: credential.model,
     screenshotPath: screenshotPath || null,
   }, null, 2))
+} catch (error) {
+  await reportOnboardingFailure(app, 'provider-client', error)
+  throw error
 } finally {
   await app.close().catch(() => {})
   await successfulProbeServer.close().catch(() => {})

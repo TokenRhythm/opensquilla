@@ -67,6 +67,31 @@ const GENERIC_IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
   webp: 'image/webp',
 }
 
+function isDesktopRendererOrigin(origin: string): boolean {
+  try {
+    const parsed = new URL(origin)
+    return parsed.protocol === 'opensquilla-app:' && parsed.hostname === 'desktop'
+  } catch {
+    return false
+  }
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  // Avoid spreading a large PDF into a function call (which can overflow the
+  // stack) while still keeping the conversion local to the preview boundary.
+  let binary = ''
+  const chunkSize = 0x8000
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length))
+    binary += String.fromCharCode(...chunk)
+  }
+  return globalThis.btoa(binary)
+}
+
+function desktopPdfDataUrl(bytes: Uint8Array, mime: string): string {
+  return `data:${mime};base64,${bytesToBase64(bytes)}`
+}
+
 function defaultBaseOrigin(): string {
   return runtimeArtifactHttpBaseOrigin()
 }
@@ -442,14 +467,24 @@ export function createArtifactPreviewResource(
         text.value = new TextDecoder().decode(bytes)
         state.value = 'ready'
       } else {
-        const blob = new Blob([bytesToArrayBuffer(bytes)], { type: mime })
-        const nextObjectUrl = createObjectUrl(blob)
+        // Chromium's native PDF viewer cannot reliably consume blob URLs
+        // whose origin is Electron's custom `opensquilla-app:` protocol. It
+        // may render the viewer chrome while leaving the page area blank.
+        // A data URL keeps the same authenticated byte path and avoids that
+        // custom-origin handoff. HTTP/Web UI previews keep their normal Blob
+        // URL so ordinary browser memory and navigation behavior is unchanged.
+        const useDesktopPdfDataUrl = nextKind === 'pdf' && isDesktopRendererOrigin(baseOrigin)
+        const nextObjectUrl = useDesktopPdfDataUrl
+          ? desktopPdfDataUrl(bytes, mime)
+          : createObjectUrl(new Blob([bytesToArrayBuffer(bytes)], { type: mime }))
         if (disposed || suspended || run !== generation) {
-          try { revokeObjectUrl(nextObjectUrl) } catch {}
+          if (!useDesktopPdfDataUrl) {
+            try { revokeObjectUrl(nextObjectUrl) } catch {}
+          }
           return
         }
         objectUrl.value = nextObjectUrl
-        objectUrlOwned = true
+        objectUrlOwned = !useDesktopPdfDataUrl
         state.value = 'ready'
       }
       progress.value = 100

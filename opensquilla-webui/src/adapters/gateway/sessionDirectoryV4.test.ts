@@ -33,6 +33,7 @@ const callPolicy = {
   timeoutMs: 10_000,
   timeoutAction: 'reject',
   abortAction: 'reject',
+  recoveryClass: 'safe-read',
 }
 
 function sessionsListResult(

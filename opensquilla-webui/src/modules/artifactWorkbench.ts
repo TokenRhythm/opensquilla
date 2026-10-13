@@ -344,6 +344,7 @@ export class ArtifactPreviewLeaseError extends Error {
     message: string,
     readonly status: number,
     readonly code = '',
+    readonly retryable = false,
   ) {
     super(message)
     this.name = 'ArtifactPreviewLeaseError'

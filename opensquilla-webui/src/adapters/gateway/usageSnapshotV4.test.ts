@@ -15,7 +15,7 @@ function rpcWith(call: RpcCall, supports = true): TestObservability {
   }, {
     requestJson: vi.fn(),
     requestBinary: vi.fn(),
-  }), { rememberUnsupportedMethod })
+  }, () => null), { rememberUnsupportedMethod })
 }
 
 async function projected(response: Record<string, unknown>) {

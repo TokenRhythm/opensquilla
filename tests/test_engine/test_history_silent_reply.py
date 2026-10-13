@@ -10,7 +10,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from opensquilla import token_estimation
-from opensquilla.engine import runtime as runtime_module
 from opensquilla.engine.history import reconstruct_messages_from_entry
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.turn_runner.transcript_snapshot import TurnTranscriptSnapshot
@@ -286,7 +285,7 @@ async def test_exact_history_discards_retired_owner_emergency_override_after_res
         )
     admitted_entries = list(await manager.get_transcript(key))
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
-    recorded = await runner._record_emergency_ephemeral_compaction(
+    recorded = await runner._prepare_request_window(
         key,
         admitted_entries,
         200,
@@ -296,8 +295,8 @@ async def test_exact_history_discards_retired_owner_emergency_override_after_res
         expected_session_id=admitted.session_id,
         expected_session_epoch=int(admitted.epoch or 0),
     )
-    assert recorded is True
-    retired_override = runner._emergency_compaction_overrides[key]
+    assert recorded is not None
+    retired_override = recorded
     assert len(retired_override.kept_entries) < len(admitted_entries)
     assert any("retired owner secret" in entry.content for entry in retired_override.kept_entries)
     assert retired_override.expected_session_id == admitted.session_id
@@ -325,6 +324,7 @@ async def test_exact_history_discards_retired_owner_emergency_override_after_res
             agent,
             key,
             trim_last_user=False,
+            prepared_window=retired_override,
             expected_session_id=replacement.session_id,
             expected_session_epoch=int(replacement.epoch or 0),
         )
@@ -335,32 +335,22 @@ async def test_exact_history_discards_retired_owner_emergency_override_after_res
     assert [message.content for message in history] == ["replacement owner content"]
     assert summary_context is None
     assert "retired owner" not in repr(history)
-    assert key not in runner._emergency_compaction_overrides
+    assert not hasattr(runner, "_emergency_compaction_overrides")
 
 
-def test_clear_compaction_turn_state_discards_emergency_override() -> None:
+def test_clear_compaction_turn_state_has_no_hidden_request_window() -> None:
     key = "agent:main:history-emergency-cleanup"
     runner = TurnRunner(provider_selector=MagicMock())
     runner.mark_compaction_attempted_this_turn(key)
     runner.mark_compacted_this_turn(key)
     runner._turn_compaction_failed_sessions.add(key)
-    runner._emergency_compaction_overrides[key] = (
-        runtime_module._EmergencyCompactionOverride(
-            summary="request-scoped summary",
-            kept_entries=[],
-            reason="compact_failed",
-            compaction_id="cmp-cleanup",
-            expected_session_id="session-owner",
-            expected_session_epoch=3,
-        )
-    )
 
     runner.clear_compaction_turn_state(key)
 
     assert not runner.has_attempted_compaction_this_turn(key)
     assert not runner.has_compacted_this_turn(key)
     assert key not in runner._turn_compaction_failed_sessions
-    assert key not in runner._emergency_compaction_overrides
+    assert not hasattr(runner, "_emergency_compaction_overrides")
 
 
 @pytest.mark.parametrize("reader", ["context", "summary"])

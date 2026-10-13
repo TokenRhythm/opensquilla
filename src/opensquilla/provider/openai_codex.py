@@ -115,11 +115,7 @@ def _codex_tool(tool: ToolDefinition) -> dict[str, Any]:
         "name": tool.name,
         "description": tool.description,
         "strict": False,
-        "parameters": {
-            "type": tool.input_schema.type,
-            "properties": tool.input_schema.properties,
-            "required": tool.input_schema.required,
-        },
+        "parameters": tool.input_schema.model_dump(exclude_none=True, by_alias=True),
     }
 
 

@@ -27,7 +27,7 @@ class _NormalizedInput:
 
 class _ReplayStorage:
     capabilities = AdmissionStorageCapabilities(
-        receipts=True, meta_controls=False, atomic_acceptance=False
+        receipts=True, atomic_acceptance=False
     )
 
     def __init__(self, events: list[str], acceptance: TurnAcceptanceResult) -> None:

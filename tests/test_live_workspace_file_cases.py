@@ -200,18 +200,23 @@ def test_pending_input_requires_paused_result_for_current_turn(tmp_path):
 
 
 def test_next_request_waits_for_previous_response_cleanup(tmp_path):
-    log = FunctionalRequestLog(tmp_path / "requests.db", enabled=True)
-    log.select_phase(variant="new", case_id="race")
-    first_stream_open = threading.Event()
-    finish_first_stream = threading.Event()
-    second_started = threading.Event()
+    first_lock_acquired = threading.Event()
+    second_lock_attempted = threading.Event()
+    first_cleanup_finished = threading.Event()
     failures = []
+
+    class RequestLog(FunctionalRequestLog):
+        def finish_request(self, *args, **kwargs):
+            super().finish_request(*args, **kwargs)
+            first_cleanup_finished.set()
+
+    log = RequestLog(tmp_path / "requests.db", enabled=True)
+    log.select_phase(variant="new", case_id="race")
 
     class Stream(httpx.SyncByteStream):
         def __iter__(self):
             yield b"data: [DONE]\n\n"
-            first_stream_open.set()
-            assert finish_first_stream.wait(3)
+            assert second_lock_attempted.wait(3)
 
     calls = []
 
@@ -232,9 +237,29 @@ def test_next_request_waits_for_previous_response_cleanup(tmp_path):
     )
     body = json.dumps({"model": "test-model", "max_tokens": 1}).encode()
 
-    def request(second=False):
-        if second:
-            second_started.set()
+    class ObservedLock:
+        def __init__(self, lock):
+            self.lock = lock
+
+        def __enter__(self):
+            is_first = threading.current_thread() is first
+            if not is_first:
+                second_lock_attempted.set()
+            self.lock.acquire()
+            if is_first:
+                first_lock_acquired.set()
+            return self
+
+        def __exit__(self, *args):
+            try:
+                if threading.current_thread() is first:
+                    assert first_cleanup_finished.is_set()
+            finally:
+                self.lock.release()
+
+    relay._serial = ObservedLock(relay._serial)
+
+    def request():
         try:
             with relay.forward(body) as response:
                 list(response.chunks)
@@ -242,23 +267,27 @@ def test_next_request_waits_for_previous_response_cleanup(tmp_path):
             failures.append(exc)
 
     first = threading.Thread(target=request)
-    second = threading.Thread(target=request, args=(True,))
     try:
         first.start()
-        assert first_stream_open.wait(3)
-        second.start()
-        assert second_started.wait(3)
-        finish_first_stream.set()
+        # Observe acquisition before the first request's SQLite transactions.
+        # The second request runs here so its blocking acquire and disk I/O do
+        # not consume the three-second thread-scheduling checks.
+        assert first_lock_acquired.wait(3)
+        with relay.forward(body) as response:
+            assert first_cleanup_finished.is_set()
+            list(response.chunks)
         first.join(3)
-        second.join(3)
+        assert not first.is_alive()
         assert not failures
         assert len(calls) == 2
+        snapshot = log.snapshot()
+        assert snapshot["pendingRequests"] == 0
+        assert [row["status"] for row in snapshot["requests"]] == ["completed", "completed"]
     finally:
-        finish_first_stream.set()
+        second_lock_attempted.set()
         first.join(3)
-        if second.ident:
-            second.join(3)
         relay.close()
+        assert not first.is_alive()
 
 
 def test_manifest_download_does_not_deliver_extension_dependencies():

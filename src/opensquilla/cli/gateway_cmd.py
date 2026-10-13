@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -31,14 +32,23 @@ from opensquilla.cli.port_validation import (
     validate_gateway_port,
 )
 from opensquilla.cli.ui import ACCENT_MARKUP, console
-from opensquilla.gateway.boot import (
+from opensquilla.startup_timing import startup_phase_end, startup_phase_start
+
+_boot_import_started = startup_phase_start("gateway_boot_import")
+from opensquilla.gateway.boot import (  # noqa: E402
     gateway_shutdown_deadline,
     start_gateway_server,
 )
-from opensquilla.gateway.config import GatewayConfig, is_public_bind, resolve_listen_address
-from opensquilla.gateway.config_migration import ConfigParseError
-from opensquilla.gateway.shutdown import ShutdownRequest
-from opensquilla.paths import default_opensquilla_home
+
+startup_phase_end("gateway_boot_import", _boot_import_started)
+from opensquilla.gateway.config import (  # noqa: E402
+    GatewayConfig,
+    is_public_bind,
+    resolve_listen_address,
+)
+from opensquilla.gateway.config_migration import ConfigParseError  # noqa: E402
+from opensquilla.gateway.shutdown import ShutdownRequest  # noqa: E402
+from opensquilla.paths import default_opensquilla_home  # noqa: E402
 
 log = structlog.get_logger(__name__)
 
@@ -310,6 +320,7 @@ def run_gateway(
     matching what the field name promises.
     """
     gateway_startup_started_at = time.monotonic()
+    startup_phase_start("gateway_run_enter")
     _check_gateway_port(port, action="run", json_output=False)
     requested_config = config_path or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH")
     if not desktop_config_path_is_profile_local(requested_config):
@@ -394,9 +405,62 @@ def run_gateway(
         )
 
     watchdog: _GatewayShutdownWatchdog | None = None
+    stall_watchdog = None
+    stall_heartbeat_task: asyncio.Task[None] | None = None
 
-    async def _run() -> bool:
-        nonlocal watchdog
+    async def _run_inner() -> bool:
+        nonlocal watchdog, stall_watchdog, stall_heartbeat_task
+        from opensquilla.gateway.stall_watchdog import GatewayStallWatchdog
+
+        # This is deliberately opt-in.  The diagnostic thread is the only
+        # component that can sample the Gateway while its event loop is
+        # synchronously blocked; normal clients pay no thread or file cost.
+        stall_watchdog = GatewayStallWatchdog.from_environment()
+        active_watchdog = stall_watchdog
+        if active_watchdog is not None and active_watchdog.start():
+
+            async def _stall_heartbeat() -> None:
+                loop = asyncio.get_running_loop()
+                interval_s = 0.1
+                expected_wake = loop.time() + interval_s
+                while True:
+                    # Set the deadline before sleeping.  If the event loop is
+                    # blocked, the wake callback runs late and this delta is
+                    # the actual scheduling delay; resetting the deadline
+                    # before measuring would erase the very stall we need to
+                    # observe.
+                    await asyncio.sleep(interval_s)
+                    now = loop.time()
+                    active_watchdog.record_loop_lag(
+                        max(0.0, now - expected_wake) * 1000.0,
+                        expected_wake_s=expected_wake,
+                        wake_s=now,
+                        wake_perf_ns=time.perf_counter_ns(),
+                        wake_ts=time.time(),
+                    )
+                    active_watchdog.beat()
+                    expected_wake = now + interval_s
+
+            stall_heartbeat_task = asyncio.create_task(
+                _stall_heartbeat(), name="gateway-stall-heartbeat"
+            )
+
+            def _stall_heartbeat_done(task: asyncio.Task[None]) -> None:
+                if task.cancelled():
+                    return
+                try:
+                    error = task.exception()
+                except asyncio.CancelledError:
+                    return
+                if error is not None:
+                    active_watchdog.heartbeat_failed(error)
+                    log.error(
+                        "gateway.stall_heartbeat_failed",
+                        error_type=type(error).__name__,
+                    )
+
+            stall_heartbeat_task.add_done_callback(_stall_heartbeat_done)
+
         # Subscription manager is gateway-specific (WS event routing)
         from opensquilla.gateway.websocket import SubscriptionManager
 
@@ -421,6 +485,10 @@ def run_gateway(
             raise
         assert server._task is not None
 
+        app = getattr(server, "app", None)
+        app_state = getattr(app, "state", None)
+        startup_ready_event = getattr(app_state, "gateway_start_ready_event", None)
+
         from opensquilla.telemetry.contracts.common import (
             ClientEntrypoint,
             ClientSurface,
@@ -429,16 +497,32 @@ def run_gateway(
 
         growth_sink = getattr(getattr(server, "_services", None), "growth_event_sink", None)
         record_launch = getattr(growth_sink, "record_client_launch", None)
+        record_launch_task: asyncio.Task[object] | None = None
         if callable(record_launch):
-            await record_launch(
-                surface=(
-                    ClientSurface.DESKTOP
-                    if desktop_profile_lifecycle_active()
-                    else ClientSurface.CLI
-                ),
-                entrypoint=ClientEntrypoint.GATEWAY_RUN,
-                execution_mode=ExecutionMode.GATEWAY,
-            )
+            async def _record_client_launch_after_ready() -> None:
+                if isinstance(startup_ready_event, asyncio.Event):
+                    await startup_ready_event.wait()
+                await record_launch(
+                    surface=(
+                        ClientSurface.DESKTOP
+                        if desktop_profile_lifecycle_active()
+                        else ClientSurface.CLI
+                    ),
+                    entrypoint=ClientEntrypoint.GATEWAY_RUN,
+                    execution_mode=ExecutionMode.GATEWAY,
+                )
+
+            if isinstance(startup_ready_event, asyncio.Event):
+                # Identity and marker writes include synchronous locking and
+                # fsync. Keep them out of the listener-startup critical path.
+                record_launch_task = asyncio.create_task(
+                    _record_client_launch_after_ready(),
+                    name="opensquilla-gateway-client-launch",
+                )
+            else:
+                # Embedded/fake servers from older integrations have no
+                # readiness event; preserve their existing behavior.
+                await _record_client_launch_after_ready()
 
         # Trigger OpenSquilla's graceful drain on SIGINT/SIGTERM. uvicorn's own
         # handlers are suppressed in start_gateway_server, so server.close() —
@@ -458,6 +542,7 @@ def run_gateway(
             if reason == "desktop_quit":
                 shutdown_reason = reason
             if not shutdown.is_set():
+                log.info("gateway.shutdown_requested", reason=reason)
                 shutdown_reason = reason
                 shutdown.set()
 
@@ -465,7 +550,6 @@ def run_gateway(
         # Expose the same trigger to the owner-only HTTP shutdown endpoint so a
         # graceful stop also works where POSIX signals can't drain — notably
         # Windows, where SIGTERM maps to an immediate TerminateProcess.
-        app = getattr(server, "app", None)
         if app is not None and hasattr(app, "state"):
             install_shutdown_handler = getattr(app.state, "install_shutdown_handler", None)
             if callable(install_shutdown_handler):
@@ -488,6 +572,12 @@ def run_gateway(
         finally:
             waiter.cancel()
             _remove_shutdown_handlers(loop, installed_signals)
+            if record_launch_task is not None:
+                record_launch_task.cancel()
+                try:
+                    await record_launch_task
+                except asyncio.CancelledError:
+                    pass
 
         # The serve task binds the listener after start_gateway_server returns.
         # Startup can still fail here (including uvicorn's SystemExit on a bind
@@ -541,6 +631,13 @@ def run_gateway(
                     None,
                 ),
             )
+            # ``_force_process_exit`` uses an immediate process exit and does
+            # not unwind the outer ``finally`` below.  Flush opt-in stall
+            # diagnostics before taking that path so a forced shutdown keeps
+            # its loop-lag evidence instead of silently truncating the JSONL.
+            if stall_watchdog is not None:
+                stall_watchdog.stop()
+                stall_watchdog = None
             request = getattr(getattr(getattr(server, "app", None), "state", None),
                               "shutdown_request", None)
             if isinstance(request, ShutdownRequest) and request.mode == "quit":
@@ -555,6 +652,20 @@ def run_gateway(
         if explicit_shutdown:
             console.print("\n[yellow]Gateway stopped.[/yellow]")
         return explicit_shutdown
+
+    async def _run() -> bool:
+        """Run the Gateway and always retire the diagnostic heartbeat task."""
+
+        nonlocal stall_heartbeat_task
+        try:
+            return await _run_inner()
+        finally:
+            task = stall_heartbeat_task
+            stall_heartbeat_task = None
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     try:
         try:
@@ -608,6 +719,9 @@ def run_gateway(
         raise typer.Exit(code=1) from exc
     except KeyboardInterrupt:
         console.print("\n[yellow]Gateway stopped.[/yellow]")
+    finally:
+        if stall_watchdog is not None:
+            stall_watchdog.stop()
 
 
 def _resolve_lifecycle_host(*, bind: str, listen: str) -> str:

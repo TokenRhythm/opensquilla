@@ -1,6 +1,12 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { ref } from 'vue'
+import { downloadText } from '@/utils/browser'
+import type { ReadMessageText } from '@/utils/chat/historyMessageContent'
 
-import { buildChatMarkdown } from './useChatMarkdownExport'
+import { buildChatMarkdown, useChatMarkdownExport } from './useChatMarkdownExport'
+
+vi.mock('@/utils/browser', () => ({ downloadText: vi.fn() }))
+beforeEach(() => vi.mocked(downloadText).mockClear())
 import type { ChatRenderedMessage } from '@/types/chat'
 
 describe('buildChatMarkdown', () => {
@@ -82,6 +88,43 @@ describe('buildChatMarkdown', () => {
     expect(markdown).not.toContain('HEARTBEAT_OK')
   })
 
+  it('exports only explicit answer text from a failed terminal turn', () => {
+    const markdown = buildChatMarkdown({
+      title: 'Failed tool projection',
+      exportedAt: '2026-08-11T10:00:00.000Z',
+      aiGeneratedLabel: 'AI generated',
+      messages: [{
+        displayRole: 'assistant',
+        roleLabel: 'Assistant',
+        text: 'Checking the repository.\n\nThe final answer.',
+        terminalFailure: true,
+        turnOutcome: {
+          turnId: 'turn-failed-projection',
+          status: 'failed',
+        },
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Checking the repository.',
+            rawText: 'Checking the repository.',
+            presentation: 'intermediate',
+          },
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'The final answer.',
+            rawText: 'The final answer.',
+            presentation: 'answer',
+          },
+        ],
+      } as ChatRenderedMessage],
+    })
+
+    expect(markdown).toContain('The final answer.')
+    expect(markdown).not.toContain('Checking the repository.')
+  })
+
   it('retains mixed sentinel-looking text exported from an ordinary user turn', () => {
     const markdown = buildChatMarkdown({
       title: 'Literal marker documentation',
@@ -125,5 +168,103 @@ describe('buildChatMarkdown', () => {
 
     expect(markdown).toContain('> Router selected historical/authoritative-model')
     expect(markdown).not.toContain('current/stale-model')
+  })
+})
+
+
+describe('complete Markdown export', () => {
+  const body = '0123456789'.repeat(2048) + 'EXPECTED_FINAL_TAIL'
+  function fixture() {
+    const messages = ref<ChatRenderedMessage[]>([{
+      role: 'user', displayRole: 'user', roleLabel: 'User', text: body.slice(0, 16384),
+      timeStr: '', showHeader: false, messageId: 'long-user', previewComplete: false,
+      contentRef: { version: 1, sessionKey: 'session-a', sessionId: 'physical-a', messageId: 'long-user',
+        source: 'active', view: 'display', revision: 'revision-a' },
+    }])
+    const session = ref('session-a:0')
+    const read = vi.fn<ReadMessageText>(async () => body)
+    const options = { messages, currentTitle: ref('Long history'), aiGeneratedLabel: ref('AI generated'),
+      sessionIdentity: () => session.value, readMessageText: read }
+    return { ...useChatMarkdownExport(options), messages, options, session, read }
+  }
+
+  it('downloads the complete body without changing the bounded transcript projection', async () => {
+    const { exportMarkdown, messages } = fixture()
+    expect(await exportMarkdown()).toBe(true)
+    expect(downloadText).toHaveBeenCalledOnce()
+    expect(vi.mocked(downloadText).mock.calls[0]?.[2]).toContain(body)
+    expect(messages.value[0]?.text).toBe(body.slice(0, 16384))
+  })
+
+  it('restores explicit assistant answer boundaries before formatting', async () => {
+    const { exportMarkdown, messages, read } = fixture()
+    const note = 'Investigating. '
+    const answer = 'Final answer 😀'.repeat(2000) + 'ANSWER_TAIL'
+    messages.value = [{ ...messages.value[0]!, role: 'assistant', displayRole: 'assistant',
+      text: note + answer.slice(0, 50),
+      historyPayloadPreview: { textUtf16Lengths: [note.length, answer.length] },
+      timelineItems: [
+        { type: 'text', key: 'note', rawText: note, html: '', presentation: 'intermediate', activityOrder: 1 },
+        { type: 'text', key: 'answer', rawText: answer.slice(0, 50), html: '', presentation: 'answer', activityOrder: 3 },
+      ],
+    }]
+    read.mockResolvedValue(note + answer)
+    expect(await exportMarkdown()).toBe(true)
+    const markdown = vi.mocked(downloadText).mock.calls[0]?.[2]
+    expect(markdown).toContain(answer)
+    expect(markdown).not.toContain(note)
+  })
+
+  it('refuses to export a partial conversation when one body read fails', async () => {
+    const { exportMarkdown, messages, read } = fixture()
+    messages.value.push({ ...messages.value[0]!, messageId: 'second' })
+    read.mockResolvedValueOnce(body).mockRejectedValueOnce(new Error('incomplete range'))
+    expect(await exportMarkdown()).toBe(false)
+    expect(downloadText).not.toHaveBeenCalled()
+  })
+
+  it('refuses a truncated explicit timeline that cannot be reconstructed', async () => {
+    const { exportMarkdown, messages } = fixture()
+    messages.value[0] = { ...messages.value[0]!, role: 'assistant', displayRole: 'assistant',
+      historyPayloadPreview: { textUtf16Lengths: [body.length + 1] },
+      timelineItems: [{ type: 'text', key: 'answer', rawText: 'preview', html: '', presentation: 'answer' }],
+    }
+    expect(await exportMarkdown()).toBe(false)
+    expect(downloadText).not.toHaveBeenCalled()
+  })
+
+  it.each(['session', 'epoch', 'revision', 'transcript'] as const)('discards an export after %s changes', async change => {
+    const { exportMarkdown, messages, session, read } = fixture()
+    let resolve!: (text: string) => void
+    read.mockImplementation(() => new Promise(done => { resolve = done }))
+    const request = exportMarkdown()
+    if (change === 'session') { session.value = 'session-b:0'; session.value = 'session-a:0' }
+    if (change === 'epoch') session.value = 'session-a:1'
+    if (change === 'revision') messages.value[0]!.contentRef!.revision = 'new-revision'
+    if (change === 'transcript') messages.value = []
+    resolve(body)
+    expect(await request).toBe(false)
+    expect(downloadText).not.toHaveBeenCalled()
+  })
+
+  it('supersedes a pending export without downloading its late result', async () => {
+    const { exportMarkdown, read } = fixture()
+    let resolve!: (text: string) => void
+    read.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+    const first = exportMarkdown()
+    expect(await exportMarkdown()).toBe(true)
+    resolve('STALE')
+    expect(await first).toBe(false)
+    expect(downloadText).toHaveBeenCalledOnce()
+    expect(vi.mocked(downloadText).mock.calls[0]?.[2]).toContain(body)
+  })
+
+  it('exports complete bodies directly even if a details-only contentRef exists', async () => {
+    const { exportMarkdown, messages, read } = fixture()
+    messages.value[0]!.previewComplete = true
+    messages.value[0]!.text = body
+    expect(await exportMarkdown()).toBe(true)
+    expect(read).not.toHaveBeenCalled()
+    expect(vi.mocked(downloadText).mock.calls[0]?.[2]).toContain(body)
   })
 })

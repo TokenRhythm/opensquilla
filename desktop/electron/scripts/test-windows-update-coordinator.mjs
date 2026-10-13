@@ -10,6 +10,7 @@ function deferred() {
 
 function fixture(overrides = {}) {
   const events = []
+  const stages = []
   const writers = new DesktopWriterAdmission()
   let token = null
   let running = true
@@ -28,9 +29,10 @@ function fixture(overrides = {}) {
       if (stopped) running = true
       events.push(['failed', error, stopped])
     },
+    stage: event => stages.push(event),
     ...overrides,
   }
-  return { events, writers, hooks, isRunning: () => running }
+  return { events, stages, writers, hooks, isRunning: () => running }
 }
 
 // Verification is first; a failure leaves both pending writes and Gateway alone.
@@ -58,6 +60,10 @@ function fixture(overrides = {}) {
   finish()
   assert.equal(await run, 'handed-off')
   assert.deepEqual(f.events, ['started', 'verified', 'closed', 'drained', 'gateway-stopped', 'spawned', 'committed'])
+  assert.deepEqual(f.stages, [
+    'update_started', 'writers_admission_closed', 'writers_drained',
+    'gateway_stop_requested', 'gateway_child_exited', 'installer_handoff',
+  ])
   assert.equal(await coordinator.run(f.hooks), 'busy')
 }
 
@@ -72,6 +78,7 @@ function fixture(overrides = {}) {
   const error = f.events.at(-1)[1]
   assert.ok(error instanceof WindowsUpdatePreparationError)
   assert.equal(error.reason, 'writers_busy')
+  assert.deepEqual(f.stages, ['update_started', 'writers_admission_closed', 'update_recovered'])
   finish()
   await f.writers.waitForAtMost(0)
   f.writers.begin('retry save')()
@@ -85,6 +92,10 @@ function fixture(overrides = {}) {
   assert.equal(f.events.some((event) => event === 'spawned'), false)
   assert.equal(f.writers.closed, false)
   assert.equal(f.events.at(-1)[1].reason, 'gateway_busy')
+  assert.deepEqual(f.stages, [
+    'update_started', 'writers_admission_closed', 'writers_drained',
+    'gateway_stop_requested', 'gateway_child_exit_wait', 'update_recovered',
+  ])
 }
 
 // Asynchronous launch failure restores admission and the previously running service.

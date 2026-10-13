@@ -130,7 +130,7 @@ def test_onboarding_save_preserves_recovery_and_writer_ordering() -> None:
     assert "throw error" in save
 
 
-def test_onboarding_does_not_wait_for_configuration_before_starting_gateway() -> None:
+def test_fresh_onboarding_runs_before_gateway_without_changing_existing_prompt_path() -> None:
     source = _main_source()
     startup = _section(
         source,
@@ -140,10 +140,30 @@ def test_onboarding_does_not_wait_for_configuration_before_starting_gateway() ->
     run = _section(source, "async function runOnboarding", "async function pathExists")
 
     assert "await prepareDesktopStartupConnection()" in startup
-    assert "await runOnboarding()" not in startup
+    assert "const shouldRunFreshOnboarding" in startup
+    assert "await runOnboarding()" in startup
+    assert "await onboardingFlows.waitForAbandonedSave()" in startup
+    assert startup.index("await runOnboarding()") < startup.index("sendBootStatus('gateway-start')")
     assert "void runOnboarding()" in source
     assert "Promise<DesktopConnection | null>" in run
     assert "modal: true" not in run
+
+
+def test_onboarding_harness_uses_one_launch_deadline_before_and_after_setup() -> None:
+    source = (ROOT / "desktop/electron/scripts/test-onboarding-flow.mjs").read_text(
+        encoding="utf-8",
+    )
+    setup = _section(source, "async function setupWindow", "async function bootWindow")
+    ready = _section(
+        source, "async function readyDesktopWindow", "async function installPendingSaveStub",
+    )
+    assert "context.startupDeadline - Date.now()" in setup
+    assert "context.startupDeadline - Date.now()" in ready
+    assert "'desktop onboarding window', timeoutMs" in setup
+    assert "if (timeoutMs <= 0)" in setup
+    assert "Date.now() >= context.startupDeadline" in setup
+    assert "startupDeadline:" not in setup
+    assert "startupReady = true" not in setup
 
 
 def test_onboarding_skip_is_trusted_and_does_not_quit_the_client() -> None:

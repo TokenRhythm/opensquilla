@@ -311,7 +311,6 @@ _COLLABORATION_TOOLS: Final = frozenset(
         "send_message",
         "send_message_to_agent",
         "wait_agent",
-        "meta_invoke",
     }
 )
 

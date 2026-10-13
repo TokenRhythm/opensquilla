@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -77,6 +79,76 @@ def _item(event_id: str = "event-1") -> UsageEventItem:
     )
 
 
+@pytest.mark.asyncio
+async def test_cancelling_queued_usage_reservation_does_not_reach_caller_boundary(tmp_path):
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    queued = asyncio.Event()
+    caller_reached = []
+    await storage._operation_lock.acquire()
+
+    async def reserve_then_continue():
+        queued.set()
+        await storage.start_usage_event(_start())
+        caller_reached.append("reserved")
+
+    pending = asyncio.create_task(reserve_then_continue())
+    try:
+        await asyncio.wait_for(queued.wait(), timeout=2)
+        pending.cancel()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not caller_reached
+        async with storage.conn.execute("SELECT count(*) FROM usage_events") as cursor:
+            assert (await cursor.fetchone())[0] == 0
+        storage._operation_lock.release()
+        await reserve_then_continue()
+        assert caller_reached == ["reserved"]
+    finally:
+        if storage._operation_lock.locked():
+            storage._operation_lock.release()
+        await asyncio.gather(pending, return_exceptions=True)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_usage_reservations_are_committed_before_returning(tmp_path):
+    path = tmp_path / "sessions.db"
+    storage = await SessionStorage.open(str(path))
+    queued = [asyncio.Event() for _ in range(12)]
+    returned = []
+    await storage._operation_lock.acquire()
+
+    async def reserve_then_check(index):
+        queued[index].set()
+        event = _start(f"event-{index}", execution_id=f"execution-{index}")
+        await storage.start_usage_event(event)
+        # This verifies storage's return contract, not a real provider dispatch.
+        reader = sqlite3.connect(path)
+        try:
+            row = reader.execute(
+                "SELECT status FROM usage_events WHERE event_id = ?", (event.event_id,),
+            ).fetchone()
+            assert row == ("started",)
+        finally:
+            reader.close()
+        returned.append(event.event_id)
+
+    pending = [asyncio.create_task(reserve_then_check(i)) for i in range(len(queued))]
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in queued)), timeout=2)
+        assert not returned
+        storage._operation_lock.release()
+        await asyncio.gather(*pending)
+        assert len(set(returned)) == len(queued)
+        assert not storage.conn.in_transaction
+    finally:
+        if storage._operation_lock.locked():
+            storage._operation_lock.release()
+        await asyncio.gather(*pending, return_exceptions=True)
+        await storage.close()
+
+
 def test_nano_usd_conversion_is_decimal_and_bounded() -> None:
     assert usd_to_nanos(0.0092) == 9_200_000
     assert usd_to_nanos(Decimal("0.0000000005")) == 1
@@ -90,7 +162,7 @@ def test_nano_usd_conversion_is_decimal_and_bounded() -> None:
 
 
 def test_session_schema_version_includes_artifact_mutations_and_routing_state() -> None:
-    assert SCHEMA_VERSION == 25
+    assert SCHEMA_VERSION == 26
 
 
 async def test_initialize_cutover_snapshots_legacy_totals_once(tmp_path: Path) -> None:
@@ -473,7 +545,7 @@ async def test_unknown_never_downgrades_finalized_and_survives_session_delete(
         await storage.close()
 
 
-async def test_session_boundaries_clean_meta_state_but_preserve_billing_audit(
+async def test_session_boundaries_preserve_billing_audit(
     tmp_path: Path,
 ) -> None:
     storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
@@ -501,56 +573,14 @@ async def test_session_boundaries_clean_meta_state_but_preserve_billing_audit(
             receipts=(receipt,),
         )
 
-        async def stage(client_request_id: str) -> None:
-            launch_text = f"/meta meta-paper-write -- {client_request_id}"
-            await storage.stage_meta_launch_draft(
-                session_key=session.session_key,
-                client_request_id=client_request_id,
-                meta_skill_name="meta-paper-write",
-                launch_text=launch_text,
-            )
-            await storage.promote_meta_launch_draft(
-                session_key=session.session_key,
-                client_request_id=client_request_id,
-                meta_skill_name="meta-paper-write",
-                launch_text=launch_text,
-            )
-
         async def assert_billing_audit_survives() -> None:
             assert await storage.query_usage_events(None, None) == [finalized]
             assert await storage.query_usage_event_items(["event-1"]) == [item]
             assert await storage.query_usage_item_billing_receipts(["event-1"]) == [receipt]
 
-        await stage("before-reset")
         assert await storage.advance_reset_epoch(session.session_key) == 1
-        assert await storage.list_meta_launch_drafts(session_key=session.session_key) == []
-        assert await storage.get_meta_control_intent(
-            session_key=session.session_key,
-            control_kind="manual",
-            correlation_id="request:before-reset",
-        ) is None
         await assert_billing_audit_survives()
-
-        await stage("before-delete")
         await storage.delete_session(session.session_key)
-        assert await storage.list_meta_launch_drafts(session_key=session.session_key) == []
-        assert await storage.get_meta_control_intent(
-            session_key=session.session_key,
-            control_kind="manual",
-            correlation_id="request:before-delete",
-        ) is None
-        async with storage.conn.execute(
-            """
-            SELECT client_request_id
-            FROM meta_launch_discard_tombstones
-            WHERE session_key = ?
-            """,
-            (session.session_key,),
-        ) as cur:
-            assert {str(row[0]) for row in await cur.fetchall()} == {
-                "before-reset",
-                "before-delete",
-            }
         await assert_billing_audit_survives()
     finally:
         await storage.close()

@@ -35,9 +35,92 @@ runs.
 
 Desktop TypeScript uses Node 24 definitions to match Electron's embedded Node
 runtime. The Node.js version used to run build scripts is a separate requirement.
-Playwright stays on the 1.60 line while Electron 42 is supported: the hidden
-browser reload viewport check fails with Playwright 1.63 on Electron 42. Upgrade
-that pair only after the existing native viewport and rendering checks pass.
+The built-in browser driver uses the pinned `playwright-core` 1.63 dependency
+and its public CDP transport API. It attaches to an existing `WebContentsView`
+through an isolated debugger session; it does not download or launch a separate
+Chromium browser or enable a production remote-debugging port. When upgrading
+Electron or Playwright, run both the attachment and native viewport checks.
+
+## Built-in browser MCP
+
+The owned Gateway discovers the Desktop's authenticated local MCP endpoint at
+startup. No user-managed MCP configuration is needed. Owner conversations in
+the Desktop receive `mcp__desktop-browser__browser_*` tools for listing, opening,
+navigating, reloading, inspecting, interacting with, and capturing URL pages.
+Existing workspace artifact previews continue to use the native `browser` tool.
+Older Desktop shells without the MCP endpoint retain that native tool as a
+fallback. CLI, channel, guest and subagent contexts do not receive this capability.
+
+The workspace button is available throughout Desktop chat, including a new task
+with no open pages. Its empty panel accepts a web address, and the header's new-tab
+button opens another page. Closing the final browser tab leaves the address panel
+available. Manually opened pages belong to the current task, including its draft
+before the first message, so that task's browser tools can discover and operate
+them. Switching tasks hides their pages while retaining their in-memory state.
+
+Mouse movement uses Playwright's browser input, with a visible pointer following
+accepted movement and click events. Element clicks retain Playwright's visibility,
+stability, enabled-state and hit-target checks. The pointer does not move the
+operating-system cursor, intercept page input, or appear in tool screenshots.
+
+Session identity and operation IDs come from trusted Gateway context. Page refs
+identify actual conversation-owned views; element refs expire on navigation or
+replacement. Mutating calls retain receipts for the server lifetime so replaying
+the same call ID cannot repeat a click. A timeout can leave the action outcome
+unknown: inspect the page before deciding whether to submit again. Receipt
+capacity is bounded to 4,096 mutations per Desktop server lifetime.
+
+The browser advertises supported parameters in its MCP catalog. Existing tool
+names and required arguments remain compatible with older clients. In clients
+with the extended catalog:
+
+- `browser_act` supports `button` for clicks, bounded `hold` with `durationMs`,
+  and `drag` between element refs. Coordinate gestures use `browser_batch` with
+  the current screenshot identities; a drag additionally supplies `toX`/`toY`.
+  A gesture owns its complete press/move/release sequence and releases held
+  input when it is cancelled.
+- `browser_inspect` with a readable `ref` returns visible text and form values
+  without flattening whitespace. `maxChars` bounds the result and truncation
+  is explicit. The ordinary compact snapshot remains available for navigation.
+- `browser_open` with `contextTargetRef` creates a related tab in an owned
+  page's storage context. Omitting it preserves the independent-page behavior.
+  Context inheritance never permits access to another task's pages.
+- The `upload` action selects a current task attachment by `fileId`, using an
+  input `ref` or the reported `chooserId`. `cancelUpload` dismisses that chooser.
+  The Gateway resolves persisted user attachments and supplies their bytes;
+  model-provided local paths are not accepted. Available attachments are listed
+  in browser results when this capability is negotiated.
+- The `download` action clicks a ref with a managed capture already armed.
+  Its page-owned `downloadId` can be read through `browser_inspect`; UTF-8 text
+  is returned with explicit truncation, while binary artifacts return metadata.
+  Uploads and managed downloads are limited to 8 MiB. Download artifacts are
+  temporary, bounded, and cleaned up when the owning page closes. Ordinary
+  downloads outside this explicit action retain the native save dialog.
+
+File chooser interception is scoped to an automated action, preserving native
+pickers for manual clicks while idle. A chooser opened asynchronously after the
+action returns may still use the native picker. A managed download blocked by
+a JavaScript dialog returns the blocker immediately and disarms its capture;
+accepting that dialog can use the native save dialog and does not produce a
+managed `downloadId`.
+
+These extensions do not expose arbitrary JavaScript, browser-global commands,
+or cookie export. Explicit Gateway network restrictions are rejected in Safe
+mode because the attached renderer does not yet use the Gateway's network proxy.
+Screenshots use the existing model image-result channel.
+
+```bash
+npm run test:browser-mcp
+```
+
+These offline fixtures use temporary profiles and synthetic local pages. The
+suite includes real Electron tests for existing storage, same-URL page identity,
+hidden views and windows, debugger coexistence, cancellation, reconnect and
+concurrent calls. It also uses the production dependency collector to build and
+run a temporary ASAR, without an installer or signing. Linux without a display
+requires `xvfb-run`.
+
+## Desktop startup
 
 On first run, the shell starts the client and Gateway with an explicitly
 unconfigured model profile, then offers a non-modal setup window. **Set up later**

@@ -96,7 +96,10 @@
         <span class="artifact-preview__status-detail">{{ failureDetail }}</span>
         <span class="artifact-preview__status-actions">
           <button
-            v-if="preview.state.value !== 'unsupported' || preview.errorCode.value !== 'unsupported'"
+            v-if="
+              !pdfViewerUnavailable
+                && (preview.state.value !== 'unsupported' || preview.errorCode.value !== 'unsupported')
+            "
             type="button"
             class="btn btn--ghost"
             @click="reloadPreview"
@@ -151,7 +154,7 @@
           class="artifact-preview__markdown chat-markdown"
         >
           <!-- eslint-disable-next-line vue/no-v-html -- output is DOMPurify-sanitized in the resource controller -->
-          <div v-html="preview.markdownHtml.value" />
+          <div ref="markdownPreviewEl" v-html="preview.markdownHtml.value" />
         </div>
         <pre
           v-else-if="preview.kind.value === 'text'"
@@ -203,6 +206,7 @@ import {
   artifactIconName,
 } from '@/utils/chat/artifacts'
 import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
+import { useMarkdownEnhancements } from '@/composables/chat/useMarkdownEnhancements'
 
 const props = withDefaults(defineProps<{
   artifact: ArtifactPayload
@@ -248,6 +252,7 @@ const artifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
 if (!artifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 const previewFrameRef = ref<HTMLIFrameElement | null>(null)
 const htmlFrameGeneration = ref(0)
+const markdownPreviewEl = ref<HTMLDivElement | null>(null)
 let loadedFrame: HTMLIFrameElement | null = null
 
 function onHtmlFrameLoad(event: Event) {
@@ -272,6 +277,8 @@ const preview = artifactWorkbench.previews.createResource({
   },
   sessionKey: () => props.sessionKey,
 })
+
+useMarkdownEnhancements(markdownPreviewEl, { version: () => preview.markdownHtml.value })
 
 const resourceSignature = computed(() => [
   props.artifact.id || '',
@@ -368,10 +375,21 @@ function emitArtifactEvent(
   emit('workbench-event', { type, payload: props.artifact })
 }
 
+// `pdfViewerEnabled` only describes the browser's inline PDF capability. It
+// is still useful as an early guard for WebViews/Electron builds that have the
+// PDF plugin disabled, where an iframe otherwise renders as an unexplained
+// empty dark surface.
+const pdfViewerUnavailable = computed(() => {
+  if (preview.kind.value !== 'pdf') return false
+  if (typeof navigator === 'undefined' || !('pdfViewerEnabled' in navigator)) return false
+  return (navigator as Navigator & { pdfViewerEnabled?: boolean }).pdfViewerEnabled === false
+})
+
 const isRenderable = computed(() =>
-  preview.state.value === 'ready'
+  !pdfViewerUnavailable.value
+  && (preview.state.value === 'ready'
   || preview.state.value === 'ready-with-warnings'
-  || preview.state.value === 'missing-resource')
+  || preview.state.value === 'missing-resource'))
 
 const opaqueOfflinePreview = computed(() =>
   props.previewSandboxProfile === 'opaque-offline'
@@ -429,12 +447,14 @@ onBeforeUnmount(() => {
 })
 
 const isFailureState = computed(() =>
-  preview.state.value === 'crashed'
+  pdfViewerUnavailable.value
+  || preview.state.value === 'crashed'
   || preview.state.value === 'error'
   || preview.state.value === 'offline'
   || preview.state.value === 'unsupported')
 
 const failureTitle = computed(() => {
+  if (pdfViewerUnavailable.value) return t('workbench.artifactPreview.unsupported')
   if (preview.state.value === 'offline') return t('workbench.artifactPreview.offline')
   if (preview.state.value === 'crashed') return t('workbench.artifactPreview.crashed')
   if (preview.errorCode.value === 'too-large') return t('workbench.artifactPreview.tooLarge')
@@ -446,6 +466,7 @@ const failureTitle = computed(() => {
 })
 
 const failureDetail = computed(() => {
+  if (pdfViewerUnavailable.value) return t('workbench.artifactPreview.pdfViewerUnavailable')
   if (preview.errorCode.value === 'preview-blocked' && props.previewErrorMessage) {
     return props.previewErrorMessage
   }

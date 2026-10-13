@@ -49,6 +49,7 @@
           :default-open="activityDefaultOpen"
           :state-key="activityStateKey"
           :continuity-key="activityContinuityKey"
+          @open-change="activityDetailsOpen = $event"
         >
           <UnifiedAssistantActivityTimeline
             v-if="hasUnifiedActivityOrder"
@@ -158,6 +159,7 @@
             :sources="message.sources ?? []"
             :workspace-previews="workspacePreviews"
             :session-key="sessionKey"
+            :prefer-workspace-workbench="workbenchEnabled"
             @open-resource="emit('openArtifact', $event)"
             @citation="onCitation"
             @workspace-preview="openWorkspacePreview"
@@ -174,8 +176,9 @@
           :blocks="reasoningBlocks"
           :pace-bursts="reasoningRevealPending"
           @reveal-complete="completeTerminalReasoningReveal"
+          @open-change="legacyReasoningOpen = $event"
         />
-        <ReasoningPart v-else-if="reasoningPart" :part="reasoningPart" />
+        <ReasoningPart v-else-if="reasoningPart" :part="reasoningPart" @open-change="legacyReasoningOpen = $event" />
         <ToolCallTimeline
           :items="visibleLegacyTimelineItems"
           :state-scope="toolStateScope"
@@ -186,6 +189,7 @@
           :tool-secondary-text="toolSecondaryText"
           @toggle-group="$emit('toggleToolGroup', $event)"
           @toggle-item="$emit('toggleToolItem', $event)"
+          @open-change="legacyToolsOpen = $event"
           @show-result="(content, title, context) => $emit('showToolResult', content, title, context)"
         >
           <template #interrupt="{ part }">
@@ -217,6 +221,7 @@
         :sources="message.sources ?? []"
         :workspace-previews="workspacePreviews"
         :session-key="sessionKey"
+        :prefer-workspace-workbench="workbenchEnabled"
         @open-resource="emit('openArtifact', $event)"
         @citation="onCitation"
         @workspace-preview="openWorkspacePreview"
@@ -227,6 +232,7 @@
         :part="{ type: 'text', key: 'workspace-preview-fallback', rawText: '', html: '' }"
         :workspace-previews="workspacePreviews"
         :session-key="sessionKey"
+        :prefer-workspace-workbench="workbenchEnabled"
         @open-resource="emit('openArtifact', $event)"
         @workspace-preview="openWorkspacePreview"
       />
@@ -421,16 +427,15 @@
           <button v-if="regenerateAvailable !== false" type="button" class="msg-action" :title="t('chat.regenerate')" :aria-label="t('chat.regenerate')" @click="$emit('regenerate', message)">
             <Icon name="refresh" :size="12" />
           </button>
-          <template v-if="feedbackDecisionId">
+          <template v-if="feedbackAvailable && !message.isStreaming">
             <button
               type="button"
               class="msg-action msg-action--vote"
               :class="{ 'msg-action--ok': feedbackRating === 'up' }"
-              :disabled="feedbackBusy"
               :aria-pressed="feedbackRating === 'up'"
-              :title="feedbackUpTitle"
-              :aria-label="feedbackUpTitle"
-              @click="onFeedbackClick('up')"
+              :title="t('chat.messageFeedback.up')"
+              :aria-label="t('chat.messageFeedback.up')"
+              @click="toggleFeedback('up')"
             >
               <Icon name="thumbs-up" :size="12" />
             </button>
@@ -438,11 +443,10 @@
               type="button"
               class="msg-action msg-action--vote"
               :class="{ 'msg-action--err': feedbackRating === 'down' }"
-              :disabled="feedbackBusy"
               :aria-pressed="feedbackRating === 'down'"
-              :title="feedbackDownTitle"
-              :aria-label="feedbackDownTitle"
-              @click="onFeedbackClick('down')"
+              :title="t('chat.messageFeedback.down')"
+              :aria-label="t('chat.messageFeedback.down')"
+              @click="toggleFeedback('down')"
             >
               <Icon name="thumbs-down" :size="12" />
             </button>
@@ -483,7 +487,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, provide, ref, watch } from 'vue'
+import { HISTORY_DETAILS_READY } from '@/modules/historyDetails'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
@@ -505,8 +510,8 @@ import { workspaceReferencesFromMessage } from '@/utils/chat/workspaceReferences
 import StatusHistoryPart from '@/components/chat/parts/StatusHistoryPart.vue'
 import TextPart from '@/components/chat/parts/TextPart.vue'
 import TurnOutcomeStatus from '@/components/chat/TurnOutcomeStatus.vue'
-import { useChatRouteFeedback } from '@/composables/chat/useChatRouteFeedback'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
+import { useChatMessageFeedback } from '@/composables/chat/useChatMessageFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
 import { createdSessionsFromMessage } from '@/utils/chat/createdSessions'
 import { sessionReferencesFromMessage } from '@/utils/chat/sessionReferences'
@@ -558,6 +563,7 @@ import {
 
 const props = defineProps<{
   message: ChatRenderedMessage
+  loadHistoryDetails?: (message: ChatRenderedMessage) => Promise<void>
   index: number
   shareMode: boolean
   shareSelected: boolean
@@ -595,6 +601,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   regenerate: [message: ChatRenderedMessage]
+  detailsDisclosure: [message: ChatRenderedMessage, open: boolean]
   toggleShare: [messageId: string]
   downloadArtifact: [artifact: ArtifactPayload]
   openArtifact: [artifact: ArtifactPayload]
@@ -618,24 +625,11 @@ const emit = defineEmits<{
 // clock, so a tick re-evaluates one cheap computed per visible bubble.
 const { t } = useI18n()
 
-// Routing feedback: buttons only exist when the turn carries a V017 decision
-// id (router actually decided this turn). The copy differs by execution kind —
-// a single-model rating judges the tier choice, an ensemble rating judges the
-// aggregated answer (backend excludes it from tier training accordingly).
-const routeFeedback = useChatRouteFeedback()
-const feedbackDecisionId = computed(() => props.message.meta?.decisionId)
-const feedbackRating = computed(() => routeFeedback.ratingFor(feedbackDecisionId.value))
-const feedbackBusy = computed(() => routeFeedback.busy(feedbackDecisionId.value))
-const feedbackUpTitle = computed(() =>
-  props.message.meta?.ensemble ? t('chat.routeFeedback.upEnsemble') : t('chat.routeFeedback.up'),
-)
-const feedbackDownTitle = computed(() =>
-  props.message.meta?.ensemble ? t('chat.routeFeedback.downEnsemble') : t('chat.routeFeedback.down'),
-)
-function onFeedbackClick(rating: 'up' | 'down') {
-  const id = feedbackDecisionId.value
-  if (id) void routeFeedback.submit(id, rating)
-}
+const {
+  available: feedbackAvailable,
+  rating: feedbackRating,
+  toggle: toggleFeedback,
+} = useChatMessageFeedback(() => props.sessionKey, () => props.message.messageId)
 
 const now = useRelativeNow()
 const timeIso = computed(() => isoTime(props.message.ts))
@@ -1019,6 +1013,30 @@ const showActivityDisclosure = computed(() =>
   (activityProjection.value.canSeparateActivity && hasActivity.value)
   || props.message.activitySnapshotIncomplete === true,
 )
+const activityDetailsOpen = ref(false)
+const legacyReasoningOpen = ref(false)
+const legacyToolsOpen = ref(false)
+let detailsDisposed = false
+provide(HISTORY_DETAILS_READY, () => {
+  if (!props.message.historyPayloadPreview?.detailsTruncated) return true
+  if (!props.loadHistoryDetails) return false
+  const ref = props.message.contentRef
+  const identity = JSON.stringify(ref)
+  return props.loadHistoryDetails(props.message).then(async () => {
+    await nextTick()
+    return !detailsDisposed && identity === JSON.stringify(props.message.contentRef)
+      && props.message.historyPayloadPreview?.detailsTruncated === false
+      && (activityProjection.value.canSeparateActivity
+        ? activityDetailsOpen.value : legacyReasoningOpen.value || legacyToolsOpen.value)
+  })
+})
+watch(() => [
+  props.message.contentRef,
+  props.message.historyPayloadPreview?.detailsTruncated,
+  activityProjection.value.canSeparateActivity
+    ? activityDetailsOpen.value : legacyReasoningOpen.value || legacyToolsOpen.value,
+] as const, ([, truncated, open]) => emit('detailsDisclosure', props.message, Boolean(truncated && open)), { flush: 'post' })
+onBeforeUnmount(() => { detailsDisposed = true; emit('detailsDisclosure', props.message, false) })
 
 const toolFailureCount = computed(() =>
   visibleActivityItems.value.reduce((count, item) => {
@@ -1520,13 +1538,7 @@ function fmtUsd(value: number): string {
   color: var(--danger);
 }
 
-.msg-action--vote:disabled {
-  cursor: progress;
-  opacity: 0.55;
-}
-
-/* A cast vote stays visible without hover — the row otherwise fades out and
-   the user would lose the only cue that their rating registered. */
+/* Keep the selected rating visible when the action row is not hovered. */
 .msg-ai-actions:has(.msg-action--vote[aria-pressed='true']) {
   opacity: 1;
 }

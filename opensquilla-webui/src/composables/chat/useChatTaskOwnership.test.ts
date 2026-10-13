@@ -165,4 +165,114 @@ describe('useChatTaskOwnership', () => {
     expect(ownership.runningTaskId.value).toBe('')
     expect(ownership.hasAuthoritativeWork.value).toBe(false)
   })
+
+  it.each(['idle', 'failed', 'timeout', 'cancelled', 'interrupted'])(
+    'releases a stopped task missing from a complete %s snapshot so its successor can be stopped',
+    runStatus => {
+      const ownership = useChatTaskOwnership()
+      ownership.noteRunning('task-A')
+      ownership.beginStop()
+      ownership.noteRunning('task-B')
+
+      const revision = ownership.captureSnapshotRevision()
+      expect(ownership.applySnapshot({
+        run_status: runStatus, active_task: null, last_task: null,
+      }, true, revision)).toBe(true)
+
+      expect(ownership.stopRequestedTaskId.value).toBe('')
+      expect(ownership.isSettled('task-A')).toBe(true)
+      expect(ownership.noteRunning('task-C')).toBe(true)
+      expect(ownership.stopTargetTaskId.value).toBe('task-C')
+      expect(ownership.beginStop()).toBe('task-C')
+    },
+  )
+
+  it.each([
+    { run_status: 'idle' },
+    { active_task: null, last_task: null },
+    { run_status: 'idle', active_task: null },
+    { run_status: 'failed', last_task: null },
+    { run_status: 'cancelled', active_task: null },
+    { run_status: 'unexpected', active_task: null, last_task: null },
+    { run_status: 'running', active_task: null, last_task: null },
+  ])('does not release Stop from incomplete, unknown, or live metadata: %j', (snapshot) => {
+    const ownership = useChatTaskOwnership()
+    ownership.noteRunning('task-A')
+    ownership.beginStop()
+
+    ownership.applySnapshot(snapshot, true)
+
+    expect(ownership.stopRequestedTaskId.value).toBe('task-A')
+    expect(ownership.isSettled('task-A')).toBe(false)
+  })
+
+  it.each(['idle', 'failed', 'timeout', 'cancelled', 'interrupted'])(
+    'keeps the old Stop target when %s metadata still contains running or queued work', runStatus => {
+      const ownership = useChatTaskOwnership()
+      ownership.noteRunning('task-A')
+      ownership.beginStop()
+      ownership.applySnapshot({
+        run_status: 'running',
+        active_task: { task_id: 'task-B', status: 'running' },
+        last_task: null,
+      }, true)
+      expect(ownership.stopRequestedTaskId.value).toBe('task-A')
+      expect(ownership.runningTaskId.value).toBe('task-B')
+
+      ownership.applySnapshot({
+        run_status: runStatus, active_task: null, last_task: null,
+        queued_task_ids: ['task-C'],
+      } as never, true)
+      expect(ownership.stopRequestedTaskId.value).toBe('task-A')
+
+      ownership.applySnapshot({
+        run_status: runStatus, active_task: null, last_task: null,
+        tasks: [{ task_id: 'task-B', status: 'running' }],
+      } as never, true)
+      expect(ownership.stopRequestedTaskId.value).toBe('task-A')
+      expect(ownership.runningTaskId.value).toBe('task-B')
+    },
+  )
+
+  it('keeps Stop through deferred failed hydration until a complete current read arrives', () => {
+    const ownership = useChatTaskOwnership()
+    ownership.noteRunning('task-A')
+    ownership.beginStop()
+    const snapshot = { run_status: 'failed', active_task: null, last_task: null }
+    expect(ownership.applySnapshot(snapshot, false, ownership.captureSnapshotRevision())).toBe(false)
+    expect(ownership.stopRequestedTaskId.value).toBe('task-A')
+    expect(ownership.runningTaskId.value).toBe('task-A')
+    expect(ownership.hydrationResolved.value).toBe(false)
+    expect(ownership.applySnapshot(snapshot, true, ownership.captureSnapshotRevision())).toBe(true)
+    expect(ownership.stopRequestedTaskId.value).toBe('')
+  })
+
+  it.each(['idle', 'failed', 'timeout', 'cancelled', 'interrupted'])(
+    'rejects a previously started %s read after a successor or newer Stop has been observed', runStatus => {
+      const ownership = useChatTaskOwnership()
+      ownership.noteRunning('task-A')
+      ownership.beginStop()
+      const revision = ownership.captureSnapshotRevision()
+      ownership.noteTerminal('task-A')
+      ownership.noteRunning('task-C')
+      ownership.beginStop()
+
+      expect(ownership.applySnapshot({
+        run_status: runStatus, active_task: null, last_task: null,
+      }, true, revision)).toBe(false)
+      expect(ownership.runningTaskId.value).toBe('task-C')
+      expect(ownership.stopRequestedTaskId.value).toBe('task-C')
+      expect(ownership.isSettled('task-C')).toBe(false)
+    },
+  )
+
+  it('does not demote the current task on a malformed statusless snapshot', () => {
+    const ownership = useChatTaskOwnership()
+    ownership.noteRunning('task-A')
+    ownership.beginStop()
+
+    expect(ownership.applySnapshot({ active_task: null, last_task: null }, true)).toBe(false)
+    expect(ownership.runningTaskId.value).toBe('task-A')
+    expect(ownership.stopRequestedTaskId.value).toBe('task-A')
+  })
 })

@@ -57,6 +57,12 @@ def pending_input_payload(turn: AdmitTurn, confirmed_plain_text: bool) -> dict[s
         "clientMessageId": turn.client_message_id,
         "_source": source,
     }
+    if turn.required_services:
+        # Preserve the producer dependency fence through the durable pending
+        # queue.  Re-dispatch decodes this payload before acceptance; dropping
+        # the field here would allow a queued browser-use turn to bypass the
+        # delayed-service gate after reconnect.
+        payload["requiredServices"] = list(turn.required_services)
     if turn.workspace_files:
         payload["workspaceFiles"] = list(turn.workspace_files)
     if turn.intent_was_provided:
@@ -77,6 +83,8 @@ def pending_input_payload(turn: AdmitTurn, confirmed_plain_text: bool) -> dict[s
         payload["pageContext"] = turn.page_context
     if turn.selected_skills:
         payload["selectedSkills"] = list(turn.selected_skills)
+    if turn.local_path_references:
+        payload["localPathReferences"] = list(turn.local_path_references)
     return payload
 
 
@@ -96,6 +104,7 @@ def pending_input_projection(
                 "mime": attachment.get("mime") or attachment.get("type"),
                 "type": attachment.get("type") or attachment.get("mime"),
                 "size": attachment.get("size"),
+                **({"origin": "paste"} if attachment.get("origin") == "paste" else {}),
             }
         )
     result: dict[str, Any] = {
@@ -130,6 +139,8 @@ def pending_input_projection(
         result["pageContext"] = payload["pageContext"]
     if payload.get("selectedSkills"):
         result["selectedSkills"] = payload["selectedSkills"]
+    if payload.get("localPathReferences"):
+        result["localPathReferences"] = payload["localPathReferences"]
     routing = payload.get("initialRoutingMode")
     if isinstance(routing, str):
         result["initialRoutingMode"] = routing

@@ -11,7 +11,7 @@ async function openMobileChat(page: Page) {
 }
 
 test.describe('Mobile bottom tab bar', () => {
-  test('tabs are visible and navigate between Chat, Overview, and More', async ({ page }) => {
+  test('tabs are visible and navigate between Chat, Usage, and More', async ({ page }) => {
     await openMobileChat(page)
 
     const tabbar = page.locator('.mobile-tabbar')
@@ -25,10 +25,11 @@ test.describe('Mobile bottom tab bar', () => {
 
     // Session history is managed in the More drawer sidebar.
 
-    // Overview fronts Status/Usage and remains active for diagnostic Logs.
-    await tabbar.getByRole('link', { name: 'Overview' }).click()
-    await expect(page).toHaveURL(/\/overview$/)
-    await expect(tabbar.getByRole('link', { name: 'Overview' })).toHaveClass(/is-active/)
+    await expect(tabbar.getByRole('link', { name: /Overview|Logs/ })).toHaveCount(0)
+    await tabbar.getByRole('link', { name: 'Usage', exact: true }).click()
+    await expect(page).toHaveURL(/\/usage$/)
+    await expect(tabbar.getByRole('link', { name: 'Usage', exact: true })).toHaveClass(/is-active/)
+    await expect(page.locator('.route-hub__tabs')).toHaveCount(0)
 
     await chatTab.click()
     await expect(page).toHaveURL(/\/chat/)
@@ -54,7 +55,7 @@ test.describe('Mobile bottom tab bar', () => {
     await expect(page.locator('.sidebar.docked')).toBeVisible()
     await expect(page.locator('.sidebar-scrim')).toBeVisible()
     await expect(page.locator('.sidebar-core .sidebar-fn-label')).toHaveText([
-      'Overview', 'Skills & Channels', 'Cron',
+      'Skills & Channels', 'Cron', 'View usage',
     ])
 
     // Skills & Channels and Cron live in this same flat drawer instead of a
@@ -74,12 +75,12 @@ test.describe('Mobile bottom tab bar', () => {
   test('More stays active on Skills, Channels, and Cron routes', async ({ page }) => {
     await openMobileChat(page)
     const more = page.locator('.mobile-tabbar').getByRole('button', { name: 'More' })
-    const overview = page.locator('.mobile-tabbar').getByRole('link', { name: 'Overview' })
+    const usage = page.locator('.mobile-tabbar').getByRole('link', { name: 'Usage', exact: true })
 
     for (const path of ['skills', 'channels', 'cron']) {
       await page.goto(CONTROL_URL + path)
       await expect(more).toHaveClass(/is-active/)
-      await expect(overview).not.toHaveClass(/is-active/)
+      await expect(usage).not.toHaveClass(/is-active/)
     }
   })
 

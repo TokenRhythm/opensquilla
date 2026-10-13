@@ -1161,17 +1161,17 @@ async def test_exec_approval_resolve_recovers_complete_failure_after_grant_apply
     assert params is not None
     queue = get_approval_queue()
     approval_id = _request_generated_sandbox_approval(manager, params)
-    original_complete = queue.complete_claimed_resolution
+    original_complete = queue.complete_claimed_resolution_async
     attempts = 0
 
-    def fail_once_then_complete(*args, **kwargs) -> None:
+    async def fail_once_then_complete(*args, **kwargs) -> None:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise RuntimeError("transient complete failed")
-        original_complete(*args, **kwargs)
+        await original_complete(*args, **kwargs)
 
-    monkeypatch.setattr(queue, "complete_claimed_resolution", fail_once_then_complete)
+    monkeypatch.setattr(queue, "complete_claimed_resolution_async", fail_once_then_complete)
 
     result = await get_dispatcher().dispatch(
         "approve",

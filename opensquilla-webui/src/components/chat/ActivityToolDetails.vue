@@ -101,7 +101,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, inject, nextTick, onBeforeUnmount, ref } from 'vue'
+import { HISTORY_DETAILS_READY } from '@/modules/historyDetails'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { ChatToolCallRenderItem, ToolResultContext } from '@/types/chat'
@@ -136,6 +137,9 @@ const emit = defineEmits<{
 }>()
 
 const { locale, t } = useI18n()
+const historyDetailsReady = inject(HISTORY_DETAILS_READY, undefined)
+let disposed = false
+onBeforeUnmount(() => { disposed = true })
 const projection = computed(() =>
   projectActivityToolDetail(props.call, props.operationKey),
 )
@@ -371,7 +375,15 @@ const detailActionLabel = computed(() => {
   return summary ? `${action}: ${summary}` : action
 })
 
-function showRawDetails() {
+async function showRawDetails() {
+  const toolId = props.call.toolId
+  const ready = historyDetailsReady?.()
+  if (ready === false) return
+  if (ready && typeof ready !== 'boolean') {
+    if (!(await ready)) return
+    await nextTick()
+    if (disposed || toolId !== props.call.toolId) return
+  }
   const detail = projection.value
   const executionIoValue = executionIo.value
   emit(

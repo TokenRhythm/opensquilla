@@ -332,6 +332,182 @@ def test_gateway_restart_keeps_the_first_launch_port(
     assert launch_ports[1] == launch_ports[0]
 
 
+def test_initial_github_windows_healthless_ownership_timeout_restarts_once(
+    startup_gateway, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = startup_gateway
+    now = [0.0]
+    launched_ports: list[int] = []
+    processes = []
+
+    class Process:
+        def __init__(self) -> None:
+            self.pid = 1200 + len(processes)
+            self.running = True
+            self.killed = False
+
+        def poll(self):
+            return None if self.running else -9
+
+        def kill(self) -> None:
+            self.killed = True
+            self.running = False
+
+        def wait(self, *, timeout):
+            self.running = False
+            return -9
+
+    class HealthyResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def launch(command, **_kwargs):
+        launched_ports.append(int(command[command.index("--port") + 1]))
+        process = Process()
+        processes.append(process)
+        if len(processes) == 1:
+            log = gateway.root / "gateway.stdout.log"
+            with log.open("a", encoding="utf-8") as stream:
+                for phase in ("config", "ownership"):
+                    stream.write(json.dumps({
+                        "event": "gateway.startup_phase",
+                        "phase": phase,
+                        "status": "ready",
+                        "duration_ms": 1,
+                        "startup_elapsed_ms": 2,
+                    }) + "\n")
+        return process
+
+    def health(*_args, **_kwargs):
+        if len(processes) == 1:
+            raise driver.urllib.error.URLError("synthetic initial cold-start stall")
+        return HealthyResponse()
+
+    monkeypatch.setattr(driver, "_GITHUB_WINDOWS_CI", True)
+    monkeypatch.setattr(driver, "_free_port", lambda: 41001)
+    monkeypatch.setattr(driver.subprocess, "Popen", launch)
+    monkeypatch.setattr(
+        driver.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0),
+    )
+    monkeypatch.setattr(driver.urllib.request, "urlopen", health)
+    monkeypatch.setattr(
+        driver, "time",
+        SimpleNamespace(monotonic=lambda: now[0], sleep=lambda seconds: now.__setitem__(
+            0, now[0] + seconds,
+        )),
+    )
+
+    gateway.start()
+
+    assert launched_ports == [41001, 41001]
+    assert processes[0].killed is True
+    assert gateway.proc is processes[1]
+    assert gateway.port == 41001
+    assert gateway._has_reached_health is True
+    assert gateway._startup_recovery_used is True
+
+
+def test_initial_github_windows_healthless_ownership_restart_is_bounded_to_once(
+    startup_gateway, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = startup_gateway
+    now = [0.0]
+    launched_ports: list[int] = []
+
+    class Process:
+        def __init__(self) -> None:
+            self.pid = 1300 + len(launched_ports)
+            self.running = True
+
+        def poll(self):
+            return None if self.running else -9
+
+        def kill(self) -> None:
+            self.running = False
+
+        def wait(self, *, timeout):
+            self.running = False
+            return -9
+
+    def launch(command, **_kwargs):
+        launched_ports.append(int(command[command.index("--port") + 1]))
+        log = gateway.root / "gateway.stdout.log"
+        with log.open("a", encoding="utf-8") as stream:
+            for phase in ("config", "ownership"):
+                stream.write(json.dumps({
+                    "event": "gateway.startup_phase",
+                    "phase": phase,
+                    "status": "ready",
+                    "duration_ms": 1,
+                    "startup_elapsed_ms": 2,
+                }) + "\n")
+        return Process()
+
+    monkeypatch.setattr(driver, "_GITHUB_WINDOWS_CI", True)
+    monkeypatch.setattr(driver, "_free_port", lambda: 42001)
+    monkeypatch.setattr(driver.subprocess, "Popen", launch)
+    monkeypatch.setattr(
+        driver.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0),
+    )
+    monkeypatch.setattr(
+        driver.urllib.request, "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            driver.urllib.error.URLError("synthetic repeated cold-start stall"),
+        ),
+    )
+    monkeypatch.setattr(
+        driver, "time",
+        SimpleNamespace(monotonic=lambda: now[0], sleep=lambda seconds: now.__setitem__(
+            0, now[0] + seconds,
+        )),
+    )
+
+    with pytest.raises(driver.DriverConfigurationError):
+        gateway.start()
+
+    assert launched_ports == [42001, 42001]
+    assert gateway._startup_recovery_used is True
+
+
+@pytest.mark.parametrize(
+    ("github_windows_ci", "has_reached_health", "exit_code", "health_status", "phases"),
+    [
+        (False, False, None, None, {"config", "ownership"}),
+        (True, True, None, None, {"config", "ownership"}),
+        (True, False, 1, None, {"config", "ownership"}),
+        (True, False, None, 503, {"config", "ownership"}),
+        (True, False, None, None, {"config", "ownership", "services"}),
+    ],
+)
+def test_initial_github_windows_startup_recovery_fails_closed_outside_exact_signature(
+    startup_gateway,
+    monkeypatch: pytest.MonkeyPatch,
+    github_windows_ci: bool,
+    has_reached_health: bool,
+    exit_code: int | None,
+    health_status: int | None,
+    phases: set[str],
+) -> None:
+    gateway = startup_gateway
+    gateway._has_reached_health = has_reached_health
+    monkeypatch.setattr(driver, "_GITHUB_WINDOWS_CI", github_windows_ci)
+    monkeypatch.setattr(
+        gateway,
+        "_startup_phases",
+        lambda: {phase: {} for phase in phases},
+    )
+
+    assert gateway._can_recover_initial_windows_startup(
+        exit_code=exit_code,
+        last_health_status=health_status,
+    ) is False
+
+
 @pytest.mark.parametrize("exit_code", [17, None])
 @pytest.mark.parametrize("prefix", [
     "", "2026-09-18T13:00:00+00:00 [INFO] opensquilla.gateway.boot: ",

@@ -32,7 +32,7 @@ from opensquilla.gateway.origin_guard import (
     request_origin_allowed as _request_origin_allowed,
 )
 from opensquilla.gateway.origin_guard import (
-    request_principal_is_owner as _request_principal_is_owner,
+    request_principal_is_owner_async as _request_principal_is_owner,
 )
 
 log = structlog.get_logger(__name__)
@@ -56,7 +56,7 @@ def register_bundle_routes(app: Starlette, *, config: GatewayConfig) -> None:
     async def bundle_handler(request: Request) -> FileResponse | JSONResponse:
         if not _request_origin_allowed(request, config):
             return forbidden_origin_response()
-        if not _request_principal_is_owner(config, request):
+        if not await _request_principal_is_owner(config, request):
             return JSONResponse(
                 {"error": "Owner privileges required", "code": "OWNER_REQUIRED"},
                 status_code=403,

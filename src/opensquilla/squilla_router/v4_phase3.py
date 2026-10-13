@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import sys
 from collections.abc import Iterator
@@ -39,6 +38,20 @@ def default_bundle_dir() -> Path:
 def runtime_src_import_path(bundle_dir: Path) -> Iterator[None]:
     """Temporarily expose the copied bundle's ``runtime_src`` import root."""
     old_path = list(sys.path)
+    # A frozen Gateway may already contain a top-level ``src`` namespace in
+    # PyInstaller's module archive.  If that namespace wins before this
+    # bundle path is inserted, imports such as ``src.router.inference`` are
+    # resolved against the archive and can miss files that are intentionally
+    # shipped in the bundle's runtime_src tree.  The router runtime owns this
+    # namespace while it is active, so discard any preloaded copy and let the
+    # validated bundle provide the modules consistently in source and frozen
+    # executions.
+    stale_runtime_modules = [
+        name for name in sys.modules
+        if name == "src" or name.startswith("src.")
+    ]
+    for name in stale_runtime_modules:
+        sys.modules.pop(name, None)
     sys.path.insert(0, str(bundle_dir / "runtime_src"))
     try:
         yield
@@ -71,19 +84,14 @@ class V4Phase3Strategy:
         confidence_threshold: float = 0.5,
         require_router_runtime: bool = False,
         use_aux_head: bool | None = None,
-        emit_train_features: bool = False,
-        emit_raw_bge: bool = False,
     ) -> None:
         self.bundle_dir = Path(bundle_dir) if bundle_dir else default_bundle_dir()
         self._threshold = confidence_threshold
         self._require_router_runtime = require_router_runtime
-        self._emit_train_features = emit_train_features
-        self._emit_raw_bge = emit_raw_bge
         self._core: Any | None = None
         self._request_type: Any | None = None
         self._config: dict[str, Any] = {}
         self._model_version = "unknown"
-        self._feature_schema_version = "unknown"
         self._available = False
         self._degraded_warned = False
 
@@ -108,14 +116,21 @@ class V4Phase3Strategy:
             or {}
         )
         self._model_version = self._read_model_version()
-        self._feature_schema_version = self._compute_feature_schema_version()
-        # Hand the capture toggles to the inference core via its config dict.
-        self._config["emit_train_features"] = self._emit_train_features
-        self._config["emit_raw_bge"] = self._emit_train_features and self._emit_raw_bge
 
         with runtime_src_import_path(self.bundle_dir):
-            from src.router.inference.core import InferenceCore
-            from src.router.inference.types import InferenceRequest
+            try:
+                from src.router.inference.core import InferenceCore
+                from src.router.inference.types import InferenceRequest
+            except Exception as exc:
+                # Keep frozen-runtime failures actionable: a missing module
+                # here is otherwise indistinguishable from a bad model file.
+                runtime_root = self.bundle_dir / "runtime_src"
+                raise RuntimeError(
+                    f"router runtime import failed: {exc}; "
+                    f"bundle={self.bundle_dir}; runtime_src={runtime_root.exists()}; "
+                    f"runtime_path={runtime_root in [Path(p) for p in sys.path]}; "
+                    f"sys_path_head={sys.path[:4]}"
+                ) from exc
 
             resolved_aux_head = (
                 bool(self._config.get("v4", {}).get("aux_head_inference", False))
@@ -186,30 +201,6 @@ class V4Phase3Strategy:
                 if value:
                     return str(value)
         return "unknown"
-
-    def _compute_feature_schema_version(self) -> str:
-        """Hash the fitted feature projections so captured ``features_390`` are
-        only ever mixed with samples produced under the same basis.
-
-        Re-fitting TF-IDF/SVD/PCA changes these bytes, which invalidates older
-        captured vectors (different coordinate system); the offline trainer keys
-        on this to start a fresh dataset generation. Hashing artifact bytes is
-        more robust than trusting a hand-bumped version string.
-        """
-
-        digest = hashlib.sha256()
-        for rel in (
-            "inference_manifest.json",
-            "features/meta.json",
-            "features/config.pkl",
-            "features/tfidf.pkl",
-            "features/svd.pkl",
-            "features/bge_pca.joblib",
-        ):
-            path = self.bundle_dir / rel
-            if path.exists():
-                digest.update(path.read_bytes())
-        return digest.hexdigest()[:16] if digest.digest() else "unknown"
 
     async def classify(
         self,
@@ -378,16 +369,6 @@ class V4Phase3Strategy:
         )
         if prompt_hint:
             extra["prompt_hint"] = str(prompt_hint)
-        # Self-learning: carry the captured feature vectors under a private key.
-        # The router step pops this out of routing_extra before logging/history
-        # so the large arrays never reach decision logs or routing history.
-        features_390 = intermediates.get("features_390")
-        if features_390 is not None:
-            extra["_train_features"] = {
-                "features_390": features_390,
-                "raw_bge_1536": intermediates.get("raw_bge_1536"),
-                "feature_schema_version": self._feature_schema_version,
-            }
         return tier, confidence, self.source, extra
 
     def _prompt_hint(self, prompt_policy: str, message: str | None = None) -> str | None:

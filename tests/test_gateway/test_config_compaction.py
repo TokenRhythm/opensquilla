@@ -22,13 +22,13 @@ def test_compaction_model_only_remains_backwards_compatible() -> None:
     assert config.model == "session-provider-model"
 
 
-def test_compaction_provider_only_falls_back_without_blocking_boot(caplog) -> None:
+def test_deprecated_compaction_provider_only_is_preserved_without_blocking_boot(caplog) -> None:
     with caplog.at_level(logging.WARNING):
         config = CompactionLlmConfig(provider="openai")
 
-    assert config.provider is None
+    assert config.provider == "openai"
     assert config.model is None
-    assert "compaction.model is not set" in caplog.text
+    assert "compaction.model is not set" not in caplog.text
 
 
 def test_legacy_context_budget_default_is_quiet_and_schema_is_deprecated(

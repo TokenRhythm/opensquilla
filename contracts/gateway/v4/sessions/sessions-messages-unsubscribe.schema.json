@@ -66,7 +66,30 @@
         }
       }
     },
-    "SessionsMessagesUnsubscribeResult": { "type": "null" },
+    "SessionsMessagesUnsubscribeLaneRetire": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connection_epoch", "subscription_epoch", "retire_token", "final_published_id"],
+      "properties": {
+        "connection_epoch": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "subscription_epoch": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "retire_token": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "final_published_id": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "SessionsMessagesUnsubscribeResult": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["lane_retire"],
+          "properties": {
+            "lane_retire": { "$ref": "#/$defs/SessionsMessagesUnsubscribeLaneRetire" }
+          }
+        }
+      ]
+    },
     "RpcError": {
       "type": "object",
       "additionalProperties": true,

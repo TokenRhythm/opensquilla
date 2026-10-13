@@ -22,6 +22,73 @@ It covers:
   reference material; the MIT notice is reproduced below for conservative
   attribution.
 
+## OpenAI-compatible empty tool-call tails
+
+The handling of absent, null, and empty tool-call deltas in compatible terminal
+frames follows the no-op semantics reviewed in
+[Pi's OpenAI Completions adapter](https://github.com/earendil-works/pi/blob/4c8eb393c73220c742e75745df210335aedc020e/packages/ai/src/api/openai-completions.ts).
+This behavior is adapted using OpenSquilla's existing tool-payload validator;
+no upstream source or fixtures are bundled, and OpenSquilla retains its stricter
+post-terminal state checks. Pi is distributed under the MIT license:
+
+```text
+MIT License
+
+Copyright (c) 2025 Mario Zechner
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## Markdown diagrams and rich rendering
+
+The Web UI dynamically bundles [Mermaid](https://github.com/mermaid-js/mermaid)
+11.17.2 (npm package `mermaid`). Diagram interaction and sequence-diagram
+compatibility helpers were adapted from [browsa](https://github.com/xiaohuzai/browsa),
+including its preview height estimates and semicolon retry behavior. OpenSquilla owns the Vue
+lifecycle, resource policy, and shared rendering integration. Both upstreams
+are MIT licensed; their notices are retained here.
+
+```text
+The MIT License (MIT)
+
+Mermaid: Copyright (c) 2014 - 2022 Knut Sveidqvist
+browsa: Copyright (c) 2026 browsa contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## Python runtime dependencies
 
 SQLAlchemy defines the Gateway's persisted model types, and websockets supports
@@ -139,6 +206,7 @@ resolved versions are recorded by `opensquilla-webui/package.json` and
 | Vue Devtools API (`@vue/devtools-api`; [vuejs/devtools](https://github.com/vuejs/devtools)) | Explicit Pinia devtools peer; integration code where retained in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2023 webfansplz. |
 | Vue Router (`vue-router`) | Client-side routing runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2019-present Eduardo San Martin Morote. |
 | Vue I18n (`vue-i18n`, `@intlify/core-base`, `@intlify/message-compiler`, `@intlify/shared`) | Localization runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2020 kazuya kawaguchi. |
+| noble-hashes (`@noble/hashes`; [paulmillr/noble-hashes](https://github.com/paulmillr/noble-hashes)) | SHA-256 fallback for Web UI delivery identity generation when the browser does not expose SubtleCrypto; generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2022 Paul Miller (paulmillr.com). |
 | html-to-image (`html-to-image`) | Image-export runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2017-2025 W.Y. |
 | KaTeX (`katex`) | npm dependency used by `opensquilla-webui/src/composables/chat/useChatTextRendering.ts`; generated JavaScript, CSS, and `KaTeX_*` fonts under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2013-2020 Khan Academy and other contributors. |
 | marked (`marked`) | npm dependency used by `opensquilla-webui/src/composables/chat/useChatTextRendering.ts`; generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2018+, MarkedJS and Copyright (c) 2011-2018, Christopher Jeffrey. The bundled Markdown-derived portion carries the John Gruber notice reproduced below. |
@@ -146,8 +214,6 @@ resolved versions are recorded by `opensquilla-webui/package.json` and
 | highlight.js (`highlight.js`) | npm dependency used by `opensquilla-webui/src/composables/chat/useChatTextRendering.ts`; generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | BSD-3-Clause. Copyright (c) 2006, Ivan Sagalaev. |
 | IBM Plex Sans and IBM Plex Mono | `opensquilla-webui/src/assets/fonts/ibm-plex-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2017 IBM Corp. with Reserved Font Name "Plex". |
 | Space Grotesk | `opensquilla-webui/src/assets/fonts/space-grotesk-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2020 The Space Grotesk Project Authors. |
-| Fraunces | `opensquilla-webui/src/themes/out-of-register/fonts/fraunces-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2020 The Fraunces Project Authors (https://github.com/undercasetype/Fraunces). |
-| Newsreader | `opensquilla-webui/src/themes/out-of-register/fonts/newsreader-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2020 The Newsreader Project Authors. |
 
 The Web UI lockfile is the version authority for these dependencies. The build
 pipeline regenerates the browser bundle from that lockfile; no separate
@@ -500,40 +566,14 @@ SOFTWARE.
 These bundled skill descriptors are authored and maintained by OpenSquilla and
 are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 
-- `code-task`
-- `AwesomeWebpageMetaSkill`
-- `awesome-webpage-image-download`
-- `awesome-webpage-research`
+- `browser-use`
 - `deep-research`
 - `docx`
 - `github`
-- `history-explorer`
-- `meta-kid-project-planner`
-- `meta-paper-write`
-- `meta-short-drama`
-- `meta-skill-creator`
-- `multi-search-engine`
-- `openrouter-video-generator`
-- `paper-artifact-runtime`
-- `paper-citation-integrity-gate`
-- `paper-delivery-summary`
-- `paper-latex-sanitizer`
-- `paper-length-gate`
-- `paper-quality-gate`
-- `paper-refbib-stub`
-- `paper-section-author`
-- `paper-source-readiness-gate`
 - `pdf-toolkit`
 - `pptx`
 - `skill-creator`
-- `short-drama-delivery-audit`
-- `short-drama-review-normalizer`
 - `sub-agent`
-- `srt-from-script`
-- `subtitle-burner`
-- `text-file-read`
-- `title-card-image`
-- `video-still-animator`
 - `xlsx`
 
 ## tokenjuice adapted reduction rules
@@ -613,19 +653,11 @@ SOFTWARE.
 ## ClawHub-derived bundled skill descriptors
 
 - Component: SKILL.md frontmatter and instruction text for these bundled skills:
-  - `ai-video-script`
-  - `audio-cog`
   - `deep-research`
   - `docx`
   - `html-coder`
-  - `multi-search-engine`
-  - `nano-banana-pro`
-  - `nano-banana-pro-openrouter`
   - `pdf-toolkit`
   - `pptx`
-  - `seedance-2-prompt`
-  - `video-merger`
-  - `web-search`
   - `xlsx`
 - Upstream registry: https://clawhub.ai
 - License: MIT-0 (Public-domain-equivalent; no attribution required, but
@@ -648,45 +680,6 @@ in the Software without restriction, including without limitation the rights
 to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 copies of the Software, and to permit persons to whom the Software is
 furnished to do so.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
-## ClawHub MIT bundled skill descriptors
-
-- Component: SKILL.md frontmatter and instruction text for these bundled skills:
-  - `filesystem`
-- Upstream registry: https://clawhub.ai
-- Upstream package: https://clawhub.ai/gtrusler/clawdbot-filesystem
-- License: MIT
-- Copyright notice: Copyright (c) 2026 Clawdbot Community
-
-The `filesystem` bundled skill metadata, package manifest, and skill card
-identify this upstream artifact as MIT licensed. OpenSquilla excludes
-skill-local `LICENSE.md` files from wheels as non-runtime skill resources, so
-the required MIT notice for this copied descriptor is reproduced here in the
-top-level notices distributed with release artifacts.
-
-```
-MIT License
-
-Copyright (c) 2026 Clawdbot Community
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,

@@ -12,7 +12,6 @@ from opensquilla.gateway.admission_failures import admission_failure, translate_
 from opensquilla.gateway.rpc import RpcHandlerError
 from opensquilla.session.plans import PlanConflictError, PlanRunConflictError
 from opensquilla.session.storage import (
-    MetaControlIntentConflictError,
     PendingChatInputConflictError,
     PlanImplementationSessionBusyError,
     StaleEpochError,
@@ -28,7 +27,6 @@ from opensquilla.session.storage import (
         (StaleEpochError("epoch"), domain.AdmissionStaleEpochError),
         (TurnIngressConflictError("identity"), domain.AdmissionIngressConflictError),
         (PendingChatInputConflictError("revision"), domain.AdmissionPendingInputConflictError),
-        (MetaControlIntentConflictError("control"), domain.AdmissionMetaControlConflictError),
         (TaskCollectionUnavailableError("started"), domain.AdmissionTaskCollectionUnavailableError),
         (PlanConflictError("plan"), domain.AdmissionPlanConflictError),
         (PlanRunConflictError("run"), domain.AdmissionPlanConflictError),

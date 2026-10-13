@@ -55,6 +55,10 @@ import {
 } from '@/utils/chat/silentSentinels'
 import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
 import {
+  stripBackgroundProcessNotice,
+  stripBackgroundProcessNoticeTimeline,
+} from '@/utils/chat/backgroundProcessNotice'
+import {
   applyActivityOrdersToTimeline,
   restoreActivityInterruptTimeline,
 } from '@/utils/chat/activitySnapshot'
@@ -121,13 +125,10 @@ const ROUTER_LEGACY_DECOY_MODELS = [
 
 function clarifyInterruptFromValue(value: unknown): ToPartsInterrupt | null {
   const data = clarifyRequestFromValue(value)
-  if (!data) return null
-  const composite = `${data.runId}|${data.step}`
-  const approvalId = data.requestId
-    || (composite === '|' ? 'clarify:history' : composite)
+  if (!data?.requestId) return null
   return {
     kind: 'clarify',
-    approvalId,
+    approvalId: data.requestId,
     data,
   }
 }
@@ -437,6 +438,10 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         && !msg.text.trim()
         && !msg.attachments?.length
         && !msg.promptAnnotations?.length
+        && msg.previewComplete !== false
+        && msg.contentAvailability !== 'preparing'
+        && msg.contentAvailability !== 'unavailable'
+        && !msg.contentUnavailableReason
       ) {
         prevRole = ''
         continue
@@ -598,13 +603,17 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         runKind: msg.turnRunKind,
       }
       const assistantDisplayText = msg.role === 'assistant'
-        ? sanitizeAssistantPresentationText(assistantRawText, assistantProvenance)
+        ? stripBackgroundProcessNotice(
+            sanitizeAssistantPresentationText(assistantRawText, assistantProvenance),
+            msg.tool_calls ?? [],
+          )
         : assistantRawText
       const legacySilentOnly = msg.role === 'assistant'
         && isLegacySilentSentinelOnly(assistantRawText)
       const rendered: ChatRenderedMessage = {
         skillLoads: skillLoadsFromSegments(msg.tool_calls),
         selectedSkills: msg.selectedSkills,
+        localPathReferences: msg.localPathReferences,
         id: `${msg.role}-${i}`,
         ...(msg.clientId ? { clientId: msg.clientId } : {}),
         sourceIndex: i,
@@ -618,6 +627,13 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         ts: msg.ts ?? null,
         showHeader: !sameGroup,
         messageId: msg.messageId,
+        contentRef: msg.contentRef,
+        contentSlice: msg.contentSlice,
+        previewComplete: msg.previewComplete,
+        historyPayloadPreview: msg.historyPayloadPreview,
+        contentRevision: msg.contentRevision,
+        contentAvailability: msg.contentAvailability,
+        contentUnavailableReason: msg.contentUnavailableReason,
         restoredFromHistory: msg.restoredFromHistory,
         turnKey: `turn:${turnIdentity === 'turn-0' ? ownerKey : turnIdentity}`,
         turnId: messageTurnId || undefined,
@@ -636,14 +652,18 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         // plan part exists, the plan card is the authoritative visible item;
         // keep real process tools in the Activity timeline.
         toolCalls: normalizedToolCalls.filter(call => !isPlanMessage || call.name !== 'submit_plan'),
-        timelineItems: applyActivityOrdersToTimeline(
-          stripPlanControlToolItems(projectInterruptTimeline(
-            normalizeMessageTimeline(msg, ownerKey),
-            historicalInterrupts,
-            terminalOwner,
-            options.interruptState?.value,
-          ), isPlanMessage),
-          msg.activitySnapshot,
+        timelineItems: stripBackgroundProcessNoticeTimeline(
+          applyActivityOrdersToTimeline(
+            stripPlanControlToolItems(projectInterruptTimeline(
+              normalizeMessageTimeline(msg, ownerKey),
+              historicalInterrupts,
+              terminalOwner,
+              options.interruptState?.value,
+            ), isPlanMessage),
+            msg.activitySnapshot,
+          ),
+          msg.tool_calls ?? [],
+          options.renderMarkdown,
         ),
         planRevisions,
         artifacts: msg.artifacts,

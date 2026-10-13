@@ -102,6 +102,7 @@ function harness(
   continuityStorage?: GoalContinuityStorage,
   streamGeneration?: Ref<string | null>,
   connectionEpoch = ref(0),
+  localPathReferences = ref<string[]>([]),
 ) {
   const handlers = new Map<string, (...args: unknown[]) => void>()
   const toGoalEvent = (value: unknown): GoalEvent => {
@@ -167,6 +168,7 @@ function harness(
   const api = useChatGoals({
     goalCenter,
     goalContinuity,
+    localPathReferences,
     sessionKey,
     currentEpoch,
     streamGeneration,
@@ -199,6 +201,35 @@ async function flushAsyncWork() {
 }
 
 describe('useChatGoals', () => {
+  it('freezes local references before subscription and retains them in the accepted message', async () => {
+    const path = 'C:\\Users\\tester\\Downloads\\report.pdf'
+    const references = ref([path])
+    const { api, rpc, ensureSubscribed, onSetAccepted } = harness(undefined, undefined, ref(0), references)
+    let subscribed!: (value: boolean) => void
+    ensureSubscribed.mockImplementationOnce(() => new Promise(resolve => { subscribed = resolve }))
+    const objective = `Review the report\n${path}`
+    const pending = api.startGoal(objective)
+    await flushAsyncWork()
+    references.value = ['C:\\Users\\tester\\Downloads\\new-draft.pdf']
+    subscribed(true)
+
+    expect(await pending).toBe(true)
+    expect(rpc.call).toHaveBeenCalledWith('goals.set', expect.objectContaining({
+      objective,
+      localPathReferences: [path],
+    }))
+    expect(onSetAccepted).toHaveBeenCalledWith(expect.objectContaining({
+      objective,
+      localPathReferences: [path],
+    }))
+  })
+
+  it('does not label unrelated objective text with stale composer references', async () => {
+    const { api, rpc } = harness(undefined, undefined, ref(0), ref(['C:\\report.pdf']))
+    expect(await api.startGoal('A separate objective')).toBe(true)
+    expect(rpc.call.mock.calls[0]![1]).not.toHaveProperty('localPathReferences')
+  })
+
   it('reuses an unknown Goal set receipt and message identity on retry', async () => {
     const { api, rpc, currentEpoch } = harness()
     currentEpoch.value = 1

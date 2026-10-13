@@ -6,6 +6,11 @@ on:
   # CI owns change selection, cancellation, and the required aggregate result.
   # Reusing this workflow keeps manual diagnostics on the same acceptance path.
   workflow_call:
+    inputs:
+      acceptance_profile:
+        description: 'smoke: current legacy baseline and fresh installs; full: all historical fault cases'
+        type: string
+        default: full
   workflow_dispatch:
 
 permissions:
@@ -25,6 +30,13 @@ jobs:
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
     steps:
+      - name: Validate acceptance profile
+        env:
+          ACCEPTANCE_PROFILE: ${{ inputs.acceptance_profile || 'full' }}
+        run: |
+          if ($env:ACCEPTANCE_PROFILE -cnotin @('smoke', 'full')) {
+            throw "Unknown Windows NSIS acceptance profile: $env:ACCEPTANCE_PROFILE"
+          }
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
@@ -86,13 +98,20 @@ jobs:
       - name: Audit frozen dependencies and verify packaged first interaction
         env:
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: '1'
+          OPENSQUILLA_SMOKE_PROVISION_SANDBOX: '1'
+          OPENSQUILLA_FIRST_SEND_TRACE_PATH: ${{ runner.temp }}/security-first-send-trace.zip
         run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
+            throw 'Windows Safe provisioning requires a disposable GitHub-hosted runner.'
+          }
+          # Select the disposable runner's real user profile; the child validates its SID.
+          $env:OPENSQUILLA_SMOKE_SANDBOX_PROFILE_ROOT = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.opensquilla'
           $inventory = 'dist/desktop-electron/win-unpacked/resources/runtime/gateway/dependency-inventory.json'
           python .github/scripts/audit_dependencies.py --repo . --python-only --python-inventory $inventory --output-dir "$env:RUNNER_TEMP/frozen-dependency-audit"
           if ($LASTEXITCODE -ne 0) { throw 'Frozen dependency audit failed' }
           Push-Location desktop/electron
           try {
-            npm run verify:gateway-smoke
+            npm run verify:gateway-smoke -- --provision-windows-sandbox
             if ($LASTEXITCODE -ne 0) { throw 'Frozen Gateway smoke failed' }
             node scripts/test-packaged-first-send-renderer.mjs --executable "$env:GITHUB_WORKSPACE/dist/desktop-electron/win-unpacked/OpenSquilla.exe" --user-data-dir "$env:RUNNER_TEMP/security-first-send" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/security-first-send-report.log"
             $probeExitCode = $LASTEXITCODE
@@ -151,6 +170,7 @@ jobs:
           name: packaged-first-send-evidence
           path: |
             ${{ runner.temp }}/security-first-send-report.log
+            ${{ runner.temp }}/security-first-send-trace.zip
             ${{ runner.temp }}/security-first-send/logs/desktop.log*
             ${{ runner.temp }}/security-first-send/first-send-main-console.jsonl
           if-no-files-found: warn
@@ -210,9 +230,11 @@ jobs:
       # Each acceptance case owns a hosted VM and only reads the built installer.
       # Let all cases start once that immutable candidate is available.
       matrix:
-        baseline: ['0.5.3', '0.5.4']
+        # PR smoke: four cases. Installer/migration changes, fail-closed plans,
+        # nightly and standalone manual runs retain all fourteen cases.
+        baseline: ${{ fromJSON(inputs.acceptance_profile == 'smoke' && '["0.5.4"]' || '["0.5.3","0.5.4"]') }}
         install-path: [default, custom]
-        scenario: [baseline, readlock, longpath]
+        scenario: ${{ fromJSON(inputs.acceptance_profile == 'smoke' && '["baseline"]' || '["baseline","readlock","longpath"]') }}
         include:
           - baseline: fresh
             install-path: default
@@ -249,8 +271,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           New-Item -ItemType Directory -Path old,candidate | Out-Null
-          gh release download 'v${{ matrix.baseline }}' --repo TokenRhythm/opensquilla --pattern 'OpenSquilla-${{ matrix.baseline }}-win-x64.exe' --dir old
-          if ($LASTEXITCODE -ne 0) { throw 'Baseline download failed' }
+          $asset = 'old/OpenSquilla-${{ matrix.baseline }}-win-x64.exe'
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Remove-Item -LiteralPath $asset -Force -ErrorAction SilentlyContinue
+            $downloadOutput = gh release download 'v${{ matrix.baseline }}' --repo TokenRhythm/opensquilla --pattern 'OpenSquilla-${{ matrix.baseline }}-win-x64.exe' --dir old 2>&1
+            $downloadExitCode = $LASTEXITCODE
+            $downloadOutput | Write-Output
+            if ($downloadExitCode -eq 0) { break }
+            $retryable = (($downloadOutput | Out-String) -match '\bHTTP (429|5\d\d)\b')
+            if (-not $retryable -or $attempt -eq 3) {
+              throw "Baseline download failed after $attempt attempt(s)"
+            }
+            Write-Warning "Transient GitHub release download failure; retrying attempt $($attempt + 1) of 3"
+            Start-Sleep -Seconds (5 * $attempt)
+          }
       - uses: ./.github/actions/download-required-artifact
         with:
           name: nsis-regression-installer

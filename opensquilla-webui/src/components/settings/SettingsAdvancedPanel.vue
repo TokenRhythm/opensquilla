@@ -4,7 +4,7 @@ import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import Icon from '@/components/Icon.vue'
-import MemoryLearningGroup from '@/components/settings/MemoryLearningGroup.vue'
+import MemoryDreamSettings from '@/components/settings/MemoryDreamSettings.vue'
 
 defineProps<{
   autoCapture: boolean
@@ -15,7 +15,6 @@ defineProps<{
 const { t } = useI18n()
 const emit = defineEmits<{
   'update-auto-capture': [enabled: boolean]
-  'open-agent-configuration': []
   'open-data-maintenance': []
   'copy-config-path': []
 }>()
@@ -28,7 +27,6 @@ const emit = defineEmits<{
 
 // --- boolean '1'/'0' flags (absent => off) ---
 const APPROVAL_KEY = 'opensquilla.chat.approvalPoll'
-const RUNTRACE_KEY = 'opensquilla.logs.runTrace'
 
 function readBool(key: string): boolean {
   try { return localStorage.getItem(key) === '1' } catch { return false }
@@ -38,9 +36,7 @@ function writeBool(key: string, on: boolean) {
 }
 
 const approvalPoll = ref(readBool(APPROVAL_KEY))
-const runTrace = ref(readBool(RUNTRACE_KEY))
 function setApprovalPoll(on: boolean) { approvalPoll.value = on; writeBool(APPROVAL_KEY, on) }
-function setRunTrace(on: boolean) { runTrace.value = on; writeBool(RUNTRACE_KEY, on) }
 
 // --- answerReveal: "min,max" milliseconds, min >= 0 and max >= min ---
 const REVEAL_KEY = 'opensquilla.chat.answerReveal'
@@ -73,9 +69,6 @@ function localStorageGet(key: string): string | null {
   try { return localStorage.getItem(key) } catch { return null }
 }
 
-const agentConfigAriaLabel = computed(() =>
-  `${t('setup.advanced.agentConfigAction')}: ${t('setup.advanced.agentConfigLabel')}`,
-)
 </script>
 
 <template>
@@ -107,7 +100,7 @@ const agentConfigAriaLabel = computed(() =>
         <span>{{ t('shared.loading') }}</span>
       </div>
 
-      <MemoryLearningGroup />
+      <MemoryDreamSettings />
     </div>
 
     <h4 class="advanced-group advanced-group--section">{{ t('setup.advanced.experimentsGroup') }}</h4>
@@ -153,17 +146,6 @@ const agentConfigAriaLabel = computed(() =>
       </div>
     </label>
 
-    <label class="control-row">
-      <div class="control-row__label-block">
-        <span class="control-row__label">{{ t('setup.advanced.runTraceLabel') }}</span>
-        <span class="control-row__desc">{{ t('setup.advanced.runTraceDesc') }}</span>
-      </div>
-      <div class="control-row__control">
-        <span class="labs-hint">{{ t('setup.advanced.reload') }}</span>
-        <ControlSwitch name="labs_run_trace" :checked="runTrace" :aria-label="t('setup.advanced.runTraceAria')" @change="setRunTrace" />
-      </div>
-    </label>
-
     <h4 class="advanced-group advanced-group--management">{{ t('setup.advanced.managementGroup') }}</h4>
 
     <div v-if="configPath" class="control-row control-row--stack" data-testid="advanced-config-file">
@@ -177,23 +159,6 @@ const agentConfigAriaLabel = computed(() =>
           :aria-label="t('settings.dialog.copyConfigPath')" :title="t('settings.dialog.copyConfigPath')"
           @click="emit('copy-config-path')"
         ><Icon name="copy" :size="14" /></button>
-      </div>
-    </div>
-
-    <div class="control-row">
-      <div class="control-row__label-block">
-        <span class="control-row__label">{{ t('setup.advanced.agentConfigLabel') }}</span>
-        <span class="control-row__desc">{{ t('setup.advanced.agentConfigDesc') }}</span>
-      </div>
-      <div class="control-row__control">
-        <button
-          type="button"
-          class="btn btn--ghost"
-          :aria-label="agentConfigAriaLabel"
-          @click="emit('open-agent-configuration')"
-        >
-          {{ t('setup.advanced.agentConfigAction') }}
-        </button>
       </div>
     </div>
 
@@ -238,17 +203,6 @@ const agentConfigAriaLabel = computed(() =>
   font-size: var(--fs-sm);
   gap: var(--sp-2);
   padding: var(--sp-4) 0;
-}
-
-.labs-hint {
-  border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border));
-  border-radius: var(--radius-full);
-  color: var(--warn);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.03em;
-  padding: 1px 7px;
-  text-transform: uppercase;
 }
 
 .labs-range {

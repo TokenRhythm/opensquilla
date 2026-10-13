@@ -8,6 +8,10 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "src" / "opensquilla"
 
 APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
+    # Settings owners record opt-in, payload-free timings through a leaf with
+    # no OpenSquilla implementation imports; it never changes save semantics.
+    ("application", "observability"),
+    ("onboarding", "observability"),
     # Source adapters consume the transport-neutral install command's pure
     # identifier parser; application never imports the Skill implementation.
     ("skills", "application"),
@@ -43,8 +47,6 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("channels", "tools"),
     ("cli", "agents"),
     ("cli", "contracts"),
-    # The code-task CLI drives its contrib host workflow through lazy imports.
-    ("cli", "contrib"),
     ("cli", "dist"),
     ("cli", "engine"),
     ("cli", "eval"),
@@ -71,22 +73,6 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("cli", "telemetry"),
     ("cli", "tools"),
     ("cli", "uninstall"),
-    # code-task assembles the subagent's per-run config from the operator's
-    # own provider sections and validates it against the gateway config
-    # schema before spawning (lazy import; gateway never imports contrib, so
-    # no cycle).
-    ("contrib", "gateway"),
-    # code-task's credential preflight reuses the onboarding provider probe and
-    # the provider failure taxonomy / registry to classify results; neither
-    # onboarding nor provider imports contrib, so no cycle.
-    ("contrib", "onboarding"),
-    ("contrib", "provider"),
-    # CodeTask resolves an explicitly selected Runtime Pack against the active
-    # sandbox/run-mode policy at execution time.  These imports remain lazy so
-    # ordinary CLI and Gateway startup do not initialize optional runtimes.
-    ("contrib", "runtime_packs"),
-    ("contrib", "sandbox"),
-    ("contrib", "tools"),
     # The diagnostics-bundle shim composes gateway redaction, the offline
     # doctor, and onboarding config resolution lazily for the bundle
     # generator; a top-level module (permissions.py precedent) so the
@@ -152,9 +138,6 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("gateway", "search"),
     ("gateway", "session"),
     ("gateway", "skills"),
-    # Gateway's post-dream hook drives the opt-in router self-learning
-    # orchestrator (offline retrain; default-off, fail-open).
-    ("gateway", "squilla_router"),
     # Gateway composition owns scoped telemetry lifecycle and its authenticated
     # consent RPC boundary; telemetry does not import Gateway implementation.
     ("gateway", "telemetry"),
@@ -169,6 +152,11 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("git_runtime.py", "sandbox"),
     ("identity", "safety"),
     ("identity", "session"),
+    # MCP image results share the canonical attachment limits and byte validator.
+    # Contracts is a leaf; tool visibility and sandbox policy remain in tools.
+    ("mcp", "contracts"),
+    # MCP redacts long tool errors before storing them for later retrieval.
+    ("mcp", "safety"),
     ("mcp", "tools"),
     ("memory", "agents"),
     ("memory", "compat"),
@@ -256,9 +244,6 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("scheduler", "session"),
     ("scheduler", "skills"),
     ("scheduler", "tools"),
-    # Self-learning's opt-in audit sidecar reuses the decision-log redactor;
-    # observability is a leaf package, so this closes no cycle.
-    ("squilla_router", "observability"),
     ("session", "artifact_session"),
     ("session", "compat"),
     ("session", "engine"),
@@ -460,3 +445,19 @@ def test_contracts_package_stays_implementation_free() -> None:
         "contracts must not import implementation packages: "
         + ", ".join(sorted(implementation_edges))
     )
+
+
+def test_settings_save_timing_stays_an_implementation_independent_leaf() -> None:
+    path = PACKAGE_ROOT / "observability" / "settings_save.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assert not [
+        name for name in _module_imports(tree, path) if name.startswith("opensquilla.")
+    ]
+
+
+def test_recovery_read_budget_stays_independent_of_implementation_packages() -> None:
+    path = PACKAGE_ROOT / "recovery_read_budget.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assert [name for name in _module_imports(tree, path) if name.startswith("opensquilla.")] == [
+        "opensquilla.session_key",
+    ]

@@ -885,6 +885,35 @@ def deny_matching_pending_sandbox_approvals(
     return count
 
 
+async def deny_matching_pending_sandbox_approvals_async(
+    queue: Any,
+    params: dict[str, Any] | None,
+    *,
+    exclude_approval_id: str | None = None,
+) -> int:
+    """Deny matching approvals through the queue's async SQLite owner.
+
+    Gateway RPC handlers run on the event loop.  Keeping this fan-out on the
+    queue's async port avoids a detached thread using the shared SQLite
+    connection concurrently with other async approval transactions.
+    """
+    key = _sandbox_approval_key(params)
+    if key is None:
+        return 0
+    count = 0
+    for pending in await queue.list_pending_async("exec"):
+        approval_id = str(pending.get("id") or "")
+        if not approval_id or approval_id == exclude_approval_id:
+            continue
+        pending_params = pending.get("params")
+        if _sandbox_approval_key(pending_params) != key:
+            continue
+        await queue.resolve_async(approval_id, False, allow_idempotent=True)
+        remember_sandbox_approval_denial(pending_params, approval_id)
+        count += 1
+    return count
+
+
 def validate_sandbox_approval_choice(
     params: dict[str, Any] | None,
     *,

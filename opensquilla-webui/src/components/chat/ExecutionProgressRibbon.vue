@@ -500,11 +500,13 @@ const liveStatusLabel = computed(() =>
 )
 
 const staticTodoStatus = computed<PlanRunStepStatus>(() => {
+  // A successful owning turn ends the run; it does not certify every step.
+  // Keep the overall marker neutral while preserving the reported step count.
   const statuses: Record<Exclude<PlanRunStatus, 'running'>, PlanRunStepStatus> = {
     queued: 'pending',
     paused: 'pending',
     blocked: 'blocked',
-    completed: 'completed',
+    completed: 'pending',
     cancelled: 'skipped',
     superseded: 'skipped',
   }

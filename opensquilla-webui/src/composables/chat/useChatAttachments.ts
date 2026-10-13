@@ -10,15 +10,15 @@ import type { NativeAttachmentContext, NativeAttachmentSelection, PlatformFilesA
 const INLINE_THRESHOLD_BYTES = 2_000_000
 const ATTACHMENT_TEXT_HARD_CAP_BYTES = INLINE_THRESHOLD_BYTES
 const ATTACHMENT_IMAGE_HARD_CAP_BYTES = 5 * 1024 * 1024
-const ATTACHMENT_PDF_HARD_CAP_BYTES = 30 * 1024 * 1024
-const ATTACHMENT_OFFICE_HARD_CAP_BYTES = 30 * 1024 * 1024
+const ATTACHMENT_PDF_HARD_CAP_BYTES = 50 * 1024 * 1024
+const ATTACHMENT_OFFICE_HARD_CAP_BYTES = 50 * 1024 * 1024
 // Text above the inline threshold routes through the staged upload path (the
 // gateway proves the whole payload is UTF-8 before honoring this ceiling).
-const ATTACHMENT_STAGED_TEXT_HARD_CAP_BYTES = 30 * 1024 * 1024
+const ATTACHMENT_STAGED_TEXT_HARD_CAP_BYTES = 50 * 1024 * 1024
 // Opaque types (archives, binaries, audio/video, unknown formats) stage up to
 // this ceiling; their bytes land in the agent workspace, never in the prompt.
-const ATTACHMENT_OPAQUE_HARD_CAP_BYTES = 30 * 1024 * 1024
-const MAX_ATTACHMENTS = 10
+const ATTACHMENT_OPAQUE_HARD_CAP_BYTES = 50 * 1024 * 1024
+const MAX_ATTACHMENTS = 16
 const MAX_TOTAL_ATTACHMENT_BYTES = 60 * 1024 * 1024
 const STAGED_UPLOAD_REFRESH_GRACE_MS = 30_000
 // Email is held to the text cap (bounded text is extracted; large emails are
@@ -39,6 +39,10 @@ type AttachmentPreparationOptions = {
    * draft that the operator is still editing.
    */
   attachments?: Attachment[]
+}
+
+type AttachmentAddOptions = {
+  origin?: 'paste'
 }
 
 // Per-addAttachments-call state so batch-wide rejections (the aggregate size
@@ -150,7 +154,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
     }
   }
 
-  async function addAttachments(files: File[]) {
+  async function addAttachments(files: File[], addOptions: AttachmentAddOptions = {}) {
     const batch: AttachmentBatch = {
       generation: attachmentGeneration,
       totalSizeToastShown: false,
@@ -163,7 +167,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
           pushToast(i18n.global.t('chat.toast.tooManyAttachments', { max: MAX_ATTACHMENTS }), { tone: 'danger' })
           return
         }
-        await addAttachmentFile(file, batch)
+        await addAttachmentFile(file, batch, addOptions.origin)
         if (!isAttachmentGenerationCurrent(batch.generation)) return
       }
     } finally {
@@ -275,11 +279,11 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
     return true
   }
 
-  async function addAttachment(file: File) {
-    await addAttachments([file])
+  async function addAttachment(file: File, addOptions: AttachmentAddOptions = {}) {
+    await addAttachments([file], addOptions)
   }
 
-  async function addAttachmentFile(file: File, batch: AttachmentBatch) {
+  async function addAttachmentFile(file: File, batch: AttachmentBatch, origin?: 'paste') {
     if (!isAttachmentGenerationCurrent(batch.generation)) return
     const fileName = file.name || 'Untitled file'
     if (file.size === 0) {
@@ -287,7 +291,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
       return
     }
 
-    if (options.native?.selectAttachmentFile && options.native.importAttachmentSelection
+    if (!origin && options.native?.selectAttachmentFile && options.native.importAttachmentSelection
       && options.nativeContext && await tryNativeFile(file, batch)) return
     if (!isAttachmentGenerationCurrent(batch.generation)) return
 
@@ -314,7 +318,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
     const localId = nextAttachmentId.value++
 
     if (file.size <= INLINE_THRESHOLD_BYTES) {
-      pendingAttachments.value.push({ kind: 'inline_pending', local_id: localId, name: fileName, mime, size: file.size, file })
+      pendingAttachments.value.push({ kind: 'inline_pending', local_id: localId, name: fileName, mime, size: file.size, file, ...(origin ? { origin } : {}) })
       const reader = new FileReader()
       reader.onload = (e) => {
         if (!isAttachmentGenerationCurrent(batch.generation)) return
@@ -322,13 +326,13 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
         const b64 = dataUrl?.split(',')[1] || ''
         const idx = pendingAttachments.value.findIndex(a => a.local_id === localId)
         if (idx >= 0) {
-          pendingAttachments.value[idx] = { kind: 'inline', local_id: localId, name: fileName, mime, size: file.size, data: b64, dataUrl, file }
+          pendingAttachments.value[idx] = { kind: 'inline', local_id: localId, name: fileName, mime, size: file.size, data: b64, dataUrl, file, ...(origin ? { origin } : {}) }
         }
       }
       reader.onerror = () => {
         if (!isAttachmentGenerationCurrent(batch.generation)) return
         const message = i18n.global.t('chat.toast.couldNotReadFile', { name: fileName })
-        markAttachmentFailed(localId, file, mime, message)
+        markAttachmentFailed(localId, file, mime, message, pendingAttachments.value, origin)
         pushToast(message, { tone: 'danger' })
       }
       reader.readAsDataURL(file)
@@ -340,11 +344,11 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
       return
     }
 
-    pendingAttachments.value.push({ kind: 'uploading', local_id: localId, name: fileName, mime, size: file.size, file })
-    uploadAttachmentStaged(file, mime, localId, batch.generation).catch((err) => {
+    pendingAttachments.value.push({ kind: 'uploading', local_id: localId, name: fileName, mime, size: file.size, file, ...(origin ? { origin } : {}) })
+    uploadAttachmentStaged(file, mime, localId, batch.generation, origin).catch((err) => {
       if (!isAttachmentGenerationCurrent(batch.generation)) return
       const message = uploadFailureMessage(err)
-      markAttachmentFailed(localId, file, mime, message)
+      markAttachmentFailed(localId, file, mime, message, pendingAttachments.value, origin)
       pushToast(`${i18n.global.t('chat.toast.uploadFailed', { name: fileName })}: ${message}`, { tone: 'danger' })
     })
   }
@@ -354,6 +358,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
     mime: string,
     localId: number,
     generation: number,
+    origin?: 'paste',
   ) {
     const meta = await uploadAttachmentFile(file, mime)
     if (!isAttachmentGenerationCurrent(generation)) return
@@ -369,6 +374,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
         expires_at: meta.expiresAt,
         ttl_seconds: meta.ttlSeconds,
         file,
+        ...(origin ? { origin } : {}),
       }
     }
   }
@@ -404,7 +410,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
       return
     }
     pendingAttachments.value.splice(index, 1)
-    await addAttachment(attachment.file)
+    await addAttachment(attachment.file, attachment.origin ? { origin: attachment.origin } : undefined)
   }
 
   function markAttachmentFailed(
@@ -413,6 +419,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
     mime: string,
     error: string,
     attachments: Attachment[] = pendingAttachments.value,
+    origin?: 'paste',
   ) {
     const idx = attachments.findIndex(a => a.local_id === localId)
     if (idx >= 0) {
@@ -424,6 +431,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
         size: file.size,
         error,
         file,
+        ...(origin ? { origin } : {}),
       }
     }
   }
@@ -453,6 +461,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
           mime: attachment.mime,
           size: attachment.size,
           error: 'Upload expired; select the file again',
+          ...(attachment.origin ? { origin: attachment.origin } : {}),
         }
         pushToast(`Upload expired for ${attachment.name}: select the file again`, { tone: 'danger' })
         return false
@@ -474,6 +483,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
           expires_at: meta.expiresAt,
           ttl_seconds: meta.ttlSeconds,
           file: attachment.file,
+          ...(attachment.origin ? { origin: attachment.origin } : {}),
         }
       } catch (err: unknown) {
         if (!preparationIsCurrent()) return false
@@ -484,6 +494,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
           attachment.mime,
           message,
           attachments,
+          attachment.origin,
         )
         pushToast(`${i18n.global.t('chat.toast.uploadFailed', { name: attachment.name })}: ${message}`, { tone: 'danger' })
         return false
@@ -508,7 +519,12 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
       pushToast(i18n.global.t('chat.toast.tooManyAttachments', { max: MAX_ATTACHMENTS }), { tone: 'danger' })
       return false
     }
-    const totalBytes = activeAttachments.reduce((sum, attachment) => sum + (attachment.size || 0), 0) + size
+    // A classified workspace attachment is a live reference, not payload that
+    // will be uploaded or retained in the attachment draft. Unclassified
+    // native selections still pass their full size into this function.
+    const totalBytes = activeAttachments.reduce((sum, attachment) => sum + (
+      attachment.kind === 'workspace' && attachment.workspaceFile ? 0 : (attachment.size || 0)
+    ), 0) + size
     if (totalBytes > MAX_TOTAL_ATTACHMENT_BYTES) {
       // Every file is still evaluated (a smaller later file may fit under the
       // total), but the rejection toasts once per batch.

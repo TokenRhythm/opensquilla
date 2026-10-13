@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { EffectScope } from 'vue'
 import type {
   SandboxRuntimeActionReceipt,
+  SandboxRequestOptions,
   SandboxSettingsRuntime,
 } from '@/modules/sandboxRuntime'
 import type {
@@ -86,13 +87,13 @@ async function createSandboxSettings(options: {
   policyConflict?: SandboxPolicy
   policyConflictGate?: Promise<unknown>
   runModeSetError?: Error
-  runtimeStatus?: SandboxRuntimePackStatus | null | (() => SandboxRuntimePackStatus | null | Promise<SandboxRuntimePackStatus | null>)
+  runtimeStatus?: SandboxRuntimePackStatus | null | ((options?: SandboxRequestOptions) => SandboxRuntimePackStatus | null | Promise<SandboxRuntimePackStatus | null>)
   runtimeStatusError?: Error
   runtimeAction?: (
     action: 'install' | 'cancel' | 'discard' | 'remove',
     componentId: string,
     operationId?: string,
-  ) => SandboxRuntimeActionReceipt
+  ) => SandboxRuntimeActionReceipt | Promise<SandboxRuntimeActionReceipt>
 } = {}) {
   vi.resetModules()
   const pushToast = vi.fn()
@@ -160,9 +161,9 @@ async function createSandboxSettings(options: {
     if (options.runModeSetError) throw options.runModeSetError
     return { runMode: mode, source: 'preference' }
   })
-  const runtimeStatus = vi.fn(async () => {
+  const runtimeStatus = vi.fn(async (request?: SandboxRequestOptions) => {
     if (options.runtimeStatusError) throw options.runtimeStatusError
-    if (typeof options.runtimeStatus === 'function') return await options.runtimeStatus()
+    if (typeof options.runtimeStatus === 'function') return await options.runtimeStatus(request)
     return options.runtimeStatus ?? null
   })
   const runtimeAction = (
@@ -242,8 +243,117 @@ afterEach(() => {
 })
 
 describe('useSandboxSettings auto-save', () => {
-  it.each(['failed', 'unavailable', 'setting_up'] as const)(
-    'does not offer first-time setup for %s', async setupState => {
+  it('flushes debounce before leaving without waiting for runtime status', async () => {
+    vi.useFakeTimers()
+    const { operations, scope, settings } = await createSandboxSettings({
+      runtimeStatus: () => new Promise(() => {}),
+    })
+    await settings.load()
+    settings.draft.value!.network.blockAllNetwork = true
+    settings.scheduleSectionSave('network')
+    expect(settings.hasUnsettledChanges.value).toBe(true)
+
+    await expect(settings.prepareToLeave()).resolves.toBe(true)
+    expect(operations.updatePolicy).toHaveBeenCalledOnce()
+    expect(settings.hasUnsettledChanges.value).toBe(false)
+    await vi.advanceTimersByTimeAsync(500)
+    expect(operations.updatePolicy).toHaveBeenCalledOnce()
+    scope.stop()
+  })
+
+  it('drains a save appended by an edit during an existing save', async () => {
+    const saves: Array<{ candidate: SandboxPolicy, resolve: (value: SandboxPolicy) => void }> = []
+    const { scope, settings } = await createSandboxSettings({
+      policyUpdate: params => new Promise<SandboxPolicy>(resolve => {
+        const candidate = structuredClone(params.policy as SandboxPolicy)
+        candidate.policyVersion = Number(params.basePolicyVersion) + 1
+        saves.push({ candidate, resolve })
+      }),
+    })
+    await settings.load()
+    settings.draft.value!.network.blockAllNetwork = true
+    const initialSave = settings.flushSectionSave('network')
+    await settle()
+    let left = false
+    const preparation = settings.prepareToLeave()
+    expect(settings.prepareToLeave()).toBe(preparation)
+    const leaving = preparation.then(result => { left = true; return result })
+    settings.draft.value!.network.denyDomains.push('new.example.com')
+    settings.scheduleSectionSave('network')
+    saves[0]!.resolve(saves[0]!.candidate)
+    await initialSave
+    await settle()
+    expect(saves).toHaveLength(2)
+    expect(left).toBe(false)
+    expect(saves[1]!.candidate.network.denyDomains).toEqual(['new.example.com'])
+    saves[1]!.resolve(saves[1]!.candidate)
+    await expect(leaving).resolves.toBe(true)
+    expect(settings.hasUnsettledChanges.value).toBe(false)
+    scope.stop()
+  })
+
+  it('keeps the draft and rejects leaving when the flushed save fails', async () => {
+    const { operations, scope, settings } = await createSandboxSettings({
+      policyUpdate: async () => { throw new Error('write rejected') },
+    })
+    await settings.load()
+    settings.draft.value!.network.blockAllNetwork = true
+    settings.scheduleSectionSave('network')
+    await expect(settings.prepareToLeave()).resolves.toBe(false)
+    expect(settings.draft.value!.network.blockAllNetwork).toBe(true)
+    expect(settings.sectionError.network).toBe('write rejected')
+    expect(settings.hasUnsettledChanges.value).toBe(true)
+    expect(operations.updatePolicy).toHaveBeenCalledOnce()
+    scope.stop()
+  })
+
+  it('rejects a conflicting leave save even when the new baseline matches the draft', async () => {
+    const currentPolicy = structuredClone(policy)
+    currentPolicy.policyVersion = 1
+    currentPolicy.network.blockAllNetwork = true
+    const { operations, scope, settings } = await createSandboxSettings({ policyConflict: currentPolicy })
+    await settings.load()
+    settings.draft.value!.network.blockAllNetwork = true
+    await expect(settings.prepareToLeave()).resolves.toBe(false)
+    expect(settings.sectionDirty('network')).toBe(false)
+    expect(settings.draft.value!.network.blockAllNetwork).toBe(true)
+    expect(settings.baseline.value!.policyVersion).toBe(1)
+    expect(operations.updatePolicy).toHaveBeenCalledOnce()
+    scope.stop()
+  })
+
+  it('waits for an already queued mode write before leaving', async () => {
+    let resolveMode!: (value: { runMode: 'safe', source: 'preference' }) => void
+    const { operations, scope, settings } = await createSandboxSettings()
+    operations.selectMode.mockImplementationOnce(() => new Promise(resolve => { resolveMode = resolve }))
+    await settings.load()
+    const saving = settings.setDefaultRunMode('safe')
+    let left = false
+    const leaving = settings.prepareToLeave().then(result => { left = true; return result })
+    await settle()
+    expect(left).toBe(false)
+    expect(settings.hasUnsettledChanges.value).toBe(true)
+    resolveMode({ runMode: 'safe', source: 'preference' })
+    await saving
+    await expect(leaving).resolves.toBe(true)
+    expect(operations.selectMode).toHaveBeenCalledOnce()
+    scope.stop()
+  })
+
+  it('retains a failed mode draft when its write is awaited by leaving', async () => {
+    const { scope, settings } = await createSandboxSettings({ runModeSetError: new Error('mode rejected') })
+    await settings.load()
+    const saving = settings.setDefaultRunMode('safe')
+    const leaving = settings.prepareToLeave()
+    await expect(saving).resolves.toBe(false)
+    await expect(leaving).resolves.toBe(false)
+    expect(settings.defaultRunMode.value).toBe('safe')
+    expect(settings.defaultRunModeBaseline.value).toBe('full')
+    scope.stop()
+  })
+
+  it.each(['unavailable', 'setting_up'] as const)(
+    'does not offer setup for %s', async setupState => {
       const { operations, scope, settings } = await createSandboxSettings({ desktop: true, setupState })
       await settings.load()
       await settle()
@@ -266,6 +376,19 @@ describe('useSandboxSettings auto-save', () => {
     expect(settings.defaultRunModeBaseline.value).toBe('safe')
     scope.stop()
   })
+
+  it.each(['failed', 'ready'] as const)(
+    'offers explicit setup retry/repair for Windows %s', async setupState => {
+      const { operations, scope, settings } = await createSandboxSettings({ desktop: true, setupState })
+      await settings.load()
+      await settle()
+      expect(settings.sandboxSetupStatus.value?.state).toBe(setupState)
+      expect(settings.canRequestSandboxSetup.value).toBe(true)
+      await expect(settings.ensureSandboxSetupForSafeMode()).resolves.toBe(false)
+      expect(operations.ensureReady).toHaveBeenCalledOnce()
+      scope.stop()
+    },
+  )
 
   it('adopts a mode already persisted by the shared setup task without writing it twice', async () => {
     const { operations, scope, settings } = await createSandboxSettings()
@@ -732,12 +855,14 @@ describe('useSandboxSettings runtime packs', () => {
     })
     await settings.load()
     await settle()
+    settings.setRuntimeViewActive(true)
+    await settle()
 
     await expect(settings.discardRuntimeDownload('python')).resolves.toBe(false)
     await settle()
 
-    expect(operations.runtimeStatus).toHaveBeenCalledTimes(2)
-    expect(statusCalls).toBe(2)
+    expect(operations.runtimeStatus).toHaveBeenCalledTimes(3)
+    expect(statusCalls).toBe(3)
     expect(settings.runtimeStatus.value?.components[0]?.resumeBytes).toBe(0)
     expect(settings.runtimeActionError.python).toBe('cache is busy')
     expect(settings.runtimeActionPending.python).toBe(false)
@@ -768,7 +893,11 @@ describe('useSandboxSettings runtime packs', () => {
     const { scope, settings } = await createSandboxSettings({
       runtimeStatus: () => {
         statusCalls += 1
-        return statusCalls === 1 ? readyRuntimeStatus : staleStatus
+        if (statusCalls === 1) return readyRuntimeStatus
+        if (statusCalls === 2) return staleStatus
+        const refreshed = structuredClone(readyRuntimeStatus)
+        refreshed.components[0]!.operation = queuedOperation
+        return refreshed
       },
       runtimeAction: () => ({ kind: 'operation', operation: queuedOperation }),
     })
@@ -788,6 +917,73 @@ describe('useSandboxSettings runtime packs', () => {
     expect(settings.runtimeStatus.value?.components[0]?.operation?.operationId)
       .toBe('operation-1')
     expect(settings.runtimeStatusLoading.value).toBe(false)
+    expect(statusCalls).toBe(3)
+    scope.stop()
+  })
+
+  it('coalesces status reads and waits for an aborted observation before re-entry', async () => {
+    vi.useFakeTimers()
+    let resolveStatus!: (status: SandboxRuntimePackStatus) => void
+    const pending = new Promise<SandboxRuntimePackStatus>(resolve => { resolveStatus = resolve })
+    let calls = 0
+    const { operations, scope, settings } = await createSandboxSettings({
+      runtimeStatus: () => ++calls === 1 ? pending : readyRuntimeStatus,
+    })
+    settings.setRuntimeViewActive(true)
+    const joined = settings.loadRuntimeStatus()
+    for (let i = 0; i < 12; i++) {
+      settings.setRuntimeViewActive(false)
+      settings.setRuntimeViewActive(true)
+    }
+    expect(calls).toBe(1)
+    expect(operations.runtimeStatus.mock.calls[0]?.[0]?.signal?.aborted).toBe(true)
+    resolveStatus(readyRuntimeStatus)
+    await joined
+    await settle()
+    expect(calls).toBe(2)
+    expect(settings.runtimeStatus.value).toEqual(readyRuntimeStatus)
+    expect(settings.runtimeStatusError.value).toBe('')
+    scope.stop()
+  })
+
+  it('lets an accepted action finish after leaving without starting a fallback read', async () => {
+    let complete!: (receipt: SandboxRuntimeActionReceipt) => void
+    const action = new Promise<SandboxRuntimeActionReceipt>(resolve => { complete = resolve })
+    const noRows = { ...readyRuntimeStatus, components: [] }
+    const { operations, scope, settings } = await createSandboxSettings({
+      runtimeStatus: noRows, runtimeAction: () => action,
+    })
+    settings.setRuntimeViewActive(true)
+    await settle()
+    const accepted = settings.cancelRuntime('python', 'operation-1')
+    settings.setRuntimeViewActive(false)
+    complete({ kind: 'operation', operation: {
+      operationId: 'operation-1', componentId: 'python', kind: 'install', state: 'cancelled',
+      downloadedBytes: 0, totalBytes: 100, progressPercent: 0, source: null,
+      startedAtMs: 1, updatedAtMs: 2, error: null,
+    } })
+    await expect(accepted).resolves.toBe(true)
+    expect(operations.cancelRuntime).toHaveBeenCalledTimes(1)
+    expect(operations.runtimeStatus).toHaveBeenCalledTimes(1)
+    scope.stop()
+  })
+
+  it.each(['leave', 'dispose'] as const)('does not publish or start a tail read after %s', async ending => {
+    vi.useFakeTimers()
+    let resolveStatus!: (status: SandboxRuntimePackStatus) => void
+    const pending = new Promise<SandboxRuntimePackStatus>(resolve => { resolveStatus = resolve })
+    const { operations, scope, settings } = await createSandboxSettings({ runtimeStatus: () => pending })
+    settings.setRuntimeViewActive(true)
+    settings.setRuntimeViewActive(false)
+    settings.setRuntimeViewActive(true)
+    if (ending === 'dispose') scope.stop()
+    else settings.setRuntimeViewActive(false)
+    resolveStatus(readyRuntimeStatus)
+    await settle()
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(operations.runtimeStatus).toHaveBeenCalledTimes(1)
+    expect(settings.runtimeStatus.value).toBeNull()
+    expect(settings.runtimeStatusError.value).toBe('')
     scope.stop()
   })
 

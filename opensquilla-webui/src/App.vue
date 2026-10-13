@@ -233,7 +233,7 @@
           :can-manage-connection="webConfigEnabled"
           @open-connection="openConnectionSettings"
           @open-approval="openBlockedApprovalSession"
-          @open-update="openDesktopRuntimeSettings"
+          @open-update="openDesktopUpdateSettings"
         />
         <template v-else>
           <button
@@ -256,12 +256,6 @@
           <span v-else class="conn-pill" :class="connectionState">{{ connectionStateLabel }}</span>
           <DesktopUpdateIndicator />
         </template>
-        <!-- Opt-in (Settings → Appearance or the command palette); off by
-             default so the topbar stays music-free until asked for. -->
-        <BgmControl
-          v-if="bgmEnabled"
-          :presentation="isChatRoute && systemHeaderLayout !== 'wide' ? 'pause-only' : 'full'"
-        />
         <LanguageSwitcher />
         <div class="theme-menu-wrap">
           <button
@@ -308,14 +302,22 @@
             </button>
           </div>
         </div>
+        <WorkbenchToggle
+          v-if="platform.capabilities.hasNativeWorkbenchSurfaces"
+          :enabled="appStore.features.artifactWorkbench === true && isChatRoute"
+          allow-empty
+          :session-id="workbenchSessionKey"
+          :blocked="workbenchModalBlocked"
+        />
       </div>
     </header>
     <div class="app-workspace">
       <main
+        v-show="!workbenchMaximized"
+        :inert="workbenchMaximized || undefined"
+        :aria-hidden="workbenchMaximized ? 'true' : undefined"
         class="content"
         :class="{ 'content--chat': isChatRoute }"
-        :data-skin="skinId || undefined"
-        :data-skin-variant="variants || undefined"
         id="content"
       >
         <ErrorBoundary @error-captured="clearChatRouteHeaderAfterError">
@@ -350,7 +352,7 @@
         )"
         :prompt-annotations-enabled="appStore.features.artifactPromptAnnotations === true"
         :route-active="isChatRoute"
-        :session-id="currentSessionKey"
+        :session-id="workbenchSessionKey"
         :modal-blocked="workbenchModalBlocked"
       />
       <ArtifactImageLightbox />
@@ -358,7 +360,7 @@
   </div>
 
   <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up):
-       Chat, Overview, then More for the sidebar drawer with session history,
+       Chat, Usage, then More for the sidebar drawer with session history,
        navigation, and Settings. -->
   <nav
     class="mobile-tabbar"
@@ -376,13 +378,13 @@
       <span class="mobile-tab__label">{{ t('nav.chat') }}</span>
     </router-link>
     <router-link
-      to="/overview"
+      to="/usage"
       class="mobile-tab"
-      :class="{ 'is-active': isOverviewNavActive }"
+      :class="{ 'is-active': isNavActive('/usage') }"
       @click="handleNavClick"
     >
-      <Icon name="home" :size="20" />
-      <span class="mobile-tab__label">{{ t('nav.overview') }}</span>
+      <Icon name="usage" :size="20" />
+      <span class="mobile-tab__label">{{ t('nav.usage') }}</span>
     </router-link>
     <button
       type="button"
@@ -461,6 +463,7 @@ import {
   arrangeSidebarSections,
   useSessions,
   type SessionItem,
+  type SessionListLoadResult,
   type SidebarSection,
   type SidebarSectionRow,
 } from './composables/useSessions'
@@ -479,10 +482,10 @@ import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import LanguageSwitcher from './components/LanguageSwitcher.vue'
-import BgmControl from './components/BgmControl.vue'
 import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
-import { useBgm } from './composables/useBgm'
+import WorkbenchToggle from './components/workbench/WorkbenchToggle.vue'
+import { useWorkbenchStore } from './workbench/store'
 import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
@@ -505,7 +508,6 @@ import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
 import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
 import { bindDesktopSessionDeepLinks } from './app/desktopSessionDeepLinks'
-import { useSurfaceSkin } from './themes/useSurfaceSkin'
 import { themePickerOptions, getManifest } from './themes/registry'
 import { normalizeAgentId } from './utils/chat/sessionKeys'
 import { effectiveChatConnectionState } from './utils/chat/chatConnectionState'
@@ -538,9 +540,11 @@ import {
   buildChatSessionTitles,
   isSensibleChatTitle,
   provideChatSessionTitles,
+  resolveOptimisticChatTitle,
 } from './composables/chat/useChatSessionTitles'
 
 const appStore = useAppStore()
+const workbenchStore = useWorkbenchStore()
 const platform = getPlatform()
 const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
 if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
@@ -576,14 +580,19 @@ const { backgroundRoute: settingsBackgroundRoute, contentRoute: settingsContentR
 // controls render on chat and non-chat routes, so route-scoped coordination
 // would allow sibling menus such as Language and Theme to overlap.
 const isChatRoute = computed(() => settingsContentRoute.value.path === '/chat' || settingsContentRoute.value.path === '/chat/new')
+const workbenchMaximized = computed(() => isChatRoute.value
+  && appStore.features.artifactWorkbench === true
+  && workbenchStore.expanded && workbenchStore.maximized)
 const topbarPopoverCoordinationEnabled = ref(true)
 const topbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(
   topbarPopoverCoordinationEnabled,
 )
 const chatRouteHeader = provideChatRouteHeaderBridge()
 const {
+  sessionKey: chatRouteHeaderSessionKey,
   visible: chatRouteHeaderVisible,
   title: chatRouteHeaderTitle,
+  optimisticTitle: chatRouteHeaderOptimisticTitle,
   copyState: chatRouteHeaderCopyState,
   copyIcon: chatRouteHeaderCopyIcon,
   copyLiveText: chatRouteHeaderCopyLiveText,
@@ -670,10 +679,9 @@ const {
   loadSessions,
   loadMoreSessions,
   cancelPendingRequests,
+  applyConfirmedTitle,
 } = useSessions(sessionDirectory)
 const { bottomRoutes, workNav } = useNavigation()
-// Axis-B: the active expressive skin for the routed content area (meta.skin).
-const { skinId, variants } = useSurfaceSkin()
 const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
@@ -708,9 +716,6 @@ watch(
     editingProjectId.value = ''
   },
 )
-// Feature-gated topbar music control; the singleton `enabled` ref is written by
-// Settings → Appearance and the command palette.
-const { enabled: bgmEnabled } = useBgm()
 const desktopUpdate = useDesktopUpdate()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
@@ -760,8 +765,8 @@ const { agents, loadAgents } = useAgentOptions(agentCatalog, optionalSessionRead
 const mobileKeyboardOpen = ref(false)
 const commandPaletteOpen = ref(false)
 const localChatSessions = ref<Record<string, { effectiveAgentId: string; title: string; updatedAt: number }>>({})
-// Pending optimistic renames, keyed by session key; cleared after the next list
-// reload returns the backend's canonical title.
+// Pending optimistic renames, keyed by session key; confirmed names enter the
+// existing list before the temporary override is removed.
 const renameOverrides = ref<Record<string, string>>({})
 
 const chatSessionTitles = computed(() => (
@@ -848,6 +853,11 @@ useDocumentEvent('click', (e) => {
 const currentSessionKey = computed(() => {
   return ($route.query.session as string) || ''
 })
+// The draft already has the key that its first turn will use. Keep manually
+// opened browser pages on that identity before the URL gains a session query.
+const workbenchSessionKey = computed(() =>
+  currentSessionKey.value || chatRouteHeader.model.sessionKey.value,
+)
 const sessionTaskAttention = useSessionTaskAttention()
 
 function currentSessionIsVisible(): boolean {
@@ -875,7 +885,6 @@ const systemHeaderPressureCount = computed(() => (
   Number(effectiveConnectionState.value !== 'connected')
   + Number(appStore.approvalCount > 0)
   + Number(desktopUpdate.visible.value)
-  + Number(bgmEnabled.value)
 ))
 const systemHeaderLayout = useSystemHeaderLayout({
   target: topbarRef,
@@ -929,19 +938,14 @@ function isNavActive(path: string): boolean {
   return $route.path === path
 }
 
-// Overview owns the Status/Usage hub plus its diagnostic Logs route, while
-// Skills fronts the Skills/Channels hub. Keep those active families disjoint so
-// diagnostic routes never light an unrelated primary destination.
-const OVERVIEW_NAV_PATHS = new Set(['/overview', '/usage', '/logs'])
+// Skills fronts the Skills/Channels hub; Usage is a standalone destination.
 const SKILLS_CHANNELS_HUB_PATHS = new Set(['/skills', '/channels'])
 const MOBILE_MORE_PATHS = new Set(['/skills', '/channels', '/cron'])
-const isOverviewNavActive = computed(() => OVERVIEW_NAV_PATHS.has($route.path))
 const isSkillsChannelsHubActive = computed(() => SKILLS_CHANNELS_HUB_PATHS.has($route.path))
 const isMobileMoreActive = computed(() =>
   appStore.sidebarOpen || MOBILE_MORE_PATHS.has($route.path))
 
 function isPrimaryNavActive(path: string): boolean {
-  if (path === '/usage') return isOverviewNavActive.value
   if (path === '/skills') return isSkillsChannelsHubActive.value
   return isNavActive(path)
 }
@@ -1077,7 +1081,64 @@ const sidebarSessionItems = computed((): SessionItem[] => {
   return items
 })
 
+// A just-materialized chat can reach the route before the next sessions.list
+// snapshot. Keep an optimistic ledger entry for it so switching to another
+// conversation does not make the new task disappear from the sidebar. When
+// ChatView has the first user message, reuse its resolved header title so the
+// sidebar shows the same text immediately. The key guard prevents a title from
+// the previous ChatView instance leaking into the new session during navigation.
+function optimisticCurrentSessionTitle(key: string, allowHeaderTitle = true): string {
+  return resolveOptimisticChatTitle(
+    key,
+    chatRouteHeaderSessionKey.value,
+    chatRouteHeaderOptimisticTitle.value,
+    chatRouteHeaderTitle.value,
+    allowHeaderTitle,
+    {
+      currentTask: t('shared.sidebar.currentTask'),
+      newChat: t('chat.newChat'),
+      chatWithSuffix: suffix => t('chat.chatWithSuffix', { suffix }),
+    },
+  )
+}
+
+watch(
+  [
+    currentSessionKey,
+    chatRouteHeaderSessionKey,
+    chatRouteHeaderTitle,
+    chatRouteHeaderOptimisticTitle,
+  ],
+  ([key], oldValues) => {
+    if (!key || allSessions.value.some(item => item.key === key)) return
+    const existing = localChatSessions.value[key]
+    const previousKey = oldValues?.[0] || ''
+    const previousHeaderKey = oldValues?.[1] || ''
+    const sessionChanged = Boolean(
+      (previousKey && key && previousKey !== key)
+      || (previousHeaderKey
+        && chatRouteHeaderSessionKey.value
+        && previousHeaderKey !== chatRouteHeaderSessionKey.value),
+    )
+    const title = optimisticCurrentSessionTitle(key, !sessionChanged)
+    if (existing && existing.title === title) return
+    const effectiveAgentId = normalizeAgentId(key.split(':')[1] || 'main')
+    localChatSessions.value = {
+      ...localChatSessions.value,
+      [key]: {
+        effectiveAgentId: existing?.effectiveAgentId || effectiveAgentId,
+        title,
+        updatedAt: existing?.updatedAt || Date.now(),
+      },
+    }
+  },
+  { flush: 'sync', immediate: true },
+)
+
 watch(allSessions, sessions => {
+  // Only positive directory confirmation retires a provisional row; an
+  // absent key may simply be outside the loaded page.
+  removeLocalSessions(new Set(sessions.map(item => item.key)))
   for (const item of sessions) {
     if (!item.key || !item.workspaceId) continue
     freshTaskDraft.confirmMaterializedProjectTask(item.key, item.workspaceId)
@@ -1288,8 +1349,6 @@ watch(sidebarDynamicMaximum, () => {
 })
 
 // Primary new-chat path: ordinary tasks always start against the default Agent.
-// Explicit custom-Agent launches still receive their Agent-scoped session key
-// from advanced Agent administration.
 function openDefaultDraft() {
   freshTaskDraft.requestFreshTask('main')
   return router.push({ path: '/chat/new', query: { agent: 'main' } })
@@ -1472,7 +1531,11 @@ async function onProjectDeleteHistory(workspaceId: string) {
       sessions: allSessions.value,
       deletedSessionKeys: result.deletedSessionKeys,
     })
-    sessionTaskAttention.removeMany(result.deletedSessionKeys)
+    const deleted = new Set(result.deletedSessionKeys)
+    removeLocalSessions(deleted)
+    sessionTaskAttention.removeMany(deleted)
+    appStore.removePendingApprovalsForSessions(deleted)
+    dispatchLocalSessionsDeleted(deleted, APP_SESSION_SYNC_SOURCE)
     await loadSessions()
     if (leaveDeletedTask) void openDefaultDraft()
     pushToast(t('workspaces.historyDeleted'), { tone: 'ok' })
@@ -1558,25 +1621,34 @@ async function switchToSession(key: string, source = 'app.switchToSession') {
   if ($route.path === '/chat' && $route.query.session === key) closeSidebarDrawer()
 }
 
-// Optimistic rename: show the new title immediately, then persist through the
-// SessionLifecycle seam and reload so the backend's canonical title wins. The
-// override clears once the reload lands.
+// Only the current rename may update local display state. Later authoritative
+// list snapshots can still rename or remove the row normally.
+let sessionRenameSequence = 0
+const pendingSessionRenames = new Map<string, number>()
 async function onRenameSession({ key, title }: { key: string; title: string }) {
   const next = title.trim()
   if (!key || !next) return
+  const sequence = ++sessionRenameSequence
+  pendingSessionRenames.set(key, sequence)
   renameOverrides.value = { ...renameOverrides.value, [key]: next }
-  const local = localChatSessions.value[key]
-  if (local) localChatSessions.value[key] = { ...local, title: next }
   try {
     await sessionLifecycle.rename({ key, title: next })
+    if (pendingSessionRenames.get(key) !== sequence) return
+    applyConfirmedTitle(key, next)
+    const local = localChatSessions.value[key]
+    if (local) localChatSessions.value[key] = { ...local, title: next }
     pushToast('Session renamed', { tone: 'ok' })
   } catch (err: unknown) {
+    if (pendingSessionRenames.get(key) !== sequence) return
     console.warn('[App] session rename error:', errorMessage(err))
     pushToast('Failed to rename session', { tone: 'danger' })
   } finally {
-    await loadSessions()
-    const { [key]: _dropped, ...rest } = renameOverrides.value
-    renameOverrides.value = rest
+    if (pendingSessionRenames.get(key) === sequence) {
+      pendingSessionRenames.delete(key)
+      const { [key]: _dropped, ...rest } = renameOverrides.value
+      renameOverrides.value = rest
+      await loadSidebarData()
+    }
   }
 }
 
@@ -1697,16 +1769,17 @@ function openConnectionSettings() {
 
 // Compact chat headers hand off to the complete Desktop update workflow rather
 // than recreating update actions inside the status summary.
-function openDesktopRuntimeSettings() {
-  router.push('/settings/gateway#runtime')
+function openDesktopUpdateSettings() {
+  router.push('/settings/gateway#updates')
 }
 
 function scheduleSessionRefresh() {
   automaticAppRpc.schedule()
 }
 
-async function performSidebarLoad(): Promise<void> {
-  const requests: Promise<unknown>[] = [loadSessions()]
+async function performSidebarLoad(): Promise<SessionListLoadResult> {
+  const sessionRead = loadSessions()
+  const requests: Promise<unknown>[] = [sessionRead]
   if (
     gatewayAccess.canManageProjectWorkspaces
     && optionalSessionRpcAllowed.value
@@ -1716,6 +1789,7 @@ async function performSidebarLoad(): Promise<void> {
     )
   }
   await Promise.allSettled(requests)
+  return sessionRead
 }
 
 const automaticAppRpc = createAppAutomaticRpc({
@@ -1732,7 +1806,13 @@ function loadSidebarData(): Promise<void> {
   return automaticAppRpc.load()
 }
 
+function handleAppForeground() {
+  markCurrentSessionReadIfVisible()
+  if (document.visibilityState === 'visible') automaticAppRpc.foreground()
+}
+
 const sessionDirectoryChangesSubscription = sessionDirectoryChanges.subscribe(change => {
+  if (change.reason === 'deleted') removeLocalSessions(new Set([change.key]))
   scheduleSessionRefresh()
   sessionTaskAttention.handleSessionDirectoryChange(change, {
     currentSessionKey: currentSessionKey.value,
@@ -1761,6 +1841,16 @@ watch(
   () => gatewayAccess.availability,
   () => {
     void automaticAppRpc.availabilityChanged()
+  },
+  { flush: 'sync' },
+)
+
+watch(
+  () => gatewayAccess.connectionHealth,
+  (health, previous) => {
+    if (health === 'healthy' && previous === 'suspect') {
+      automaticAppRpc.connectionHealthChanged(health)
+    }
   },
   { flush: 'sync' },
 )
@@ -1963,8 +2053,8 @@ onMounted(() => {
   })
   window.visualViewport?.addEventListener('resize', syncMobileKeyboard)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
-  window.addEventListener('focus', markCurrentSessionReadIfVisible)
-  document.addEventListener('visibilitychange', markCurrentSessionReadIfVisible)
+  window.addEventListener('focus', handleAppForeground)
+  document.addEventListener('visibilitychange', handleAppForeground)
   void automaticAppRpc.mount()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
@@ -1977,8 +2067,8 @@ onUnmounted(() => {
   appAutomaticRpcMounted = false
   automaticAppRpc.dispose()
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
-  window.removeEventListener('focus', markCurrentSessionReadIfVisible)
-  document.removeEventListener('visibilitychange', markCurrentSessionReadIfVisible)
+  window.removeEventListener('focus', handleAppForeground)
+  document.removeEventListener('visibilitychange', handleAppForeground)
   sessionDirectoryChangesSubscription.close()
   sessionDirectoryChanges.dispose()
   unsubscribeApprovals()

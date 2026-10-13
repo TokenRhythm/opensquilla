@@ -13,6 +13,10 @@ import {
   type SessionsChangedEventPayload,
 } from '@/contracts/generated/v4/sessionsChanged'
 import { validateSessionsChangedEventPayload } from '@/contracts/generated/v4/sessionsChangedValidators.mjs'
+import {
+  conversationSemanticEventKind,
+  decodeConversationEvent,
+} from './conversationEventsV4'
 import type {
   SessionDirectoryChange,
   SessionDirectoryChangeReason,
@@ -30,6 +34,10 @@ const SESSION_DIRECTORY_CHANGE_CALL_OPTIONS: RpcCallOptions = {
   abortAction: 'reject',
 }
 const PRIVATE_STATE_EVENT = '_state'
+const TERMINAL_INVALIDATION_KINDS = new Set([
+  'task-succeeded', 'task-failed', 'task-cancelled', 'task-abandoned', 'task-timed-out',
+  'turn-completed', 'turn-failed', 'turn-committed',
+])
 
 interface SessionDirectoryChangesRpcTransport {
   request<T = unknown>(
@@ -99,6 +107,7 @@ function normalizeReason(reason: string): SessionDirectoryChangeReason {
     case 'cron_static_message':
       return 'cronStaticMessage'
     case 'turn_complete':
+    case 'cancellation_completed':
     case 'cron_result':
     case 'cron_system_event':
     case 'updated':
@@ -213,8 +222,8 @@ function isExpectedUnavailable(error: unknown): boolean {
 }
 
 /**
- * Own the session-directory subscription as a logical lease. There is one raw
- * event listener and at most one server subscribe per physical connection
+ * Own the session-directory subscription as a logical lease. There is at most
+ * one server subscribe per physical connection
  * generation, regardless of how many UI consumers subscribe locally.
  */
 export function createV4SessionDirectoryChanges(
@@ -235,6 +244,19 @@ export function createV4SessionDirectoryChanges(
   let releaseWork: Promise<void> | null = null
   let releaseRequested = false
 
+  function publish(change: SessionDirectoryChange) {
+    if (disposed) return
+    for (const listener of [...listeners]) {
+      try {
+        listener(change)
+      } catch (error) {
+        // One view must not prevent the rest of the application from
+        // observing an invalidation.
+        warn('Session directory listener failed', error)
+      }
+    }
+  }
+
   const eventSubscription = events.subscribe(
     SESSIONS_CHANGED_EVENT,
     payload => {
@@ -243,17 +265,23 @@ export function createV4SessionDirectoryChanges(
         warn('Dropped malformed sessions.changed event')
         return
       }
-      for (const listener of [...listeners]) {
-        try {
-          listener(change)
-        } catch (error) {
-          // One view must not prevent the rest of the application from
-          // observing an invalidation.
-          warn('Session directory listener failed', error)
-        }
-      }
+      publish(change)
     },
   )
+  const terminalSubscription = events.subscribe('*', (name, payload) => {
+    if (disposed || typeof name !== 'string' || !name.trim() || !listeners.size) return
+    if (!TERMINAL_INVALIDATION_KINDS.has(conversationSemanticEventKind(name))) return
+    try {
+      const event = decodeConversationEvent(name, payload)
+      if (!event.sessionKey) return
+      // The conversation lane may arrive even when sessions.changed is lost.
+      // A finished predecessor says nothing about a queued successor: only
+      // invalidate the directory and let its authoritative snapshot decide.
+      publish({ key: event.sessionKey, reason: 'updated' })
+    } catch (error) {
+      warn('Dropped malformed terminal directory invalidation', error)
+    }
+  })
   const stateSubscription = events.subscribe(
     PRIVATE_STATE_EVENT,
     state => {
@@ -261,7 +289,7 @@ export function createV4SessionDirectoryChanges(
         // Rebind automatically when a live consumer still owns the logical
         // lease. The composition root may also call resume() here to trigger
         // its snapshot refresh; bindLease() coalesces both requests.
-        if (resumeRequested && listeners.size > 0) void bindLease()
+        if (resumeRequested && listeners.size > 0) void bindLease().catch(() => {})
         return
       }
       // A server-side subscription belongs to the old physical connection;
@@ -310,6 +338,7 @@ export function createV4SessionDirectoryChanges(
     if (boundGeneration !== null && boundGeneration === rpc.generation) return
     if (bindWork) return bindWork
 
+    let generation = rpc.generation
     let work!: Promise<void>
     work = (async () => {
       try {
@@ -327,7 +356,7 @@ export function createV4SessionDirectoryChanges(
           abortAction: 'reject',
         })
         if (disposed || !resumeRequested || listeners.size === 0) return
-        const generation = rpc.generation
+        generation = rpc.generation
         if (boundGeneration === generation) return
         if (unavailableGeneration === generation) return
 
@@ -344,15 +373,17 @@ export function createV4SessionDirectoryChanges(
           releaseRequested = true
         }
       } catch (error) {
-        const generation = rpc.generation
-        if (isExpectedUnavailable(error)) {
+        if (isExpectedUnavailable(error) && rpc.generation === generation) {
           unavailableGeneration = generation
           if (errorCode(error) === 'METHOD_NOT_FOUND' || errorCode(error) === 'UNSUPPORTED') {
             rpc.markUnsupported?.(SESSIONS_SUBSCRIBE_METHOD)
           }
           return
         }
-        if (!disposed && resumeRequested) warn('Session directory subscription failed', error)
+        if (!disposed && resumeRequested) {
+          warn('Session directory subscription failed', error)
+          throw error
+        }
       } finally {
         if (bindWork === work) bindWork = null
         if (releaseRequested && !bindWork) void releaseLease()
@@ -367,7 +398,7 @@ export function createV4SessionDirectoryChanges(
   ): SessionDirectoryChangeSubscription {
     if (disposed) return { close() {} }
     listeners.add(listener)
-    if (resumeRequested) void bindLease()
+    if (resumeRequested) void bindLease().catch(() => {})
     let closed = false
     return {
       close() {
@@ -395,6 +426,7 @@ export function createV4SessionDirectoryChanges(
     resumeRequested = false
     releaseRequested = true
     eventSubscription.close()
+    terminalSubscription.close()
     stateSubscription.close()
     listeners.clear()
     if (!bindWork) void releaseLease()

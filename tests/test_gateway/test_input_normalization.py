@@ -4,6 +4,7 @@ import base64
 
 import pytest
 
+from opensquilla.attachment_refs import make_attachment_ref, write_transcript_material
 from opensquilla.gateway.input_normalization import (
     INLINE_TEXT_ATTACHMENT_MAX_BYTES,
     LARGE_PASTE_CHARS,
@@ -12,6 +13,8 @@ from opensquilla.gateway.input_normalization import (
     PAGE_DUMP_PLACEHOLDER,
     estimate_text_tokens,
     infer_normalized_input_from_attachments,
+    infer_pasted_text_input_from_attachments,
+    materialize_generated_text_attachments,
     normalize_incoming_text,
     page_dump_marker_score,
 )
@@ -182,3 +185,77 @@ def test_regular_text_attachment_does_not_infer_normalization() -> None:
         infer_normalized_input_from_attachments(LARGE_PASTE_PLACEHOLDER, [attachment])
         is None
     )
+
+
+def test_pasted_text_attachment_preserves_user_message() -> None:
+    raw = "界" * 20_001
+    attachment = {
+        "type": "text/plain",
+        "mime": "text/plain",
+        "name": "pasted-text-1.txt",
+        "origin": "paste",
+        "data": base64.b64encode(raw.encode("utf-8")).decode("ascii"),
+    }
+
+    normalized = infer_pasted_text_input_from_attachments("请总结", [attachment])
+
+    assert normalized is not None
+    assert normalized.message_text == "请总结"
+    assert normalized.semantic_message == "请总结"
+    assert normalized.metadata["origin"] == "paste"
+    assert normalized.metadata["guard_action"] == "generated_text_attachment"
+
+
+def test_staged_pasted_text_uses_server_material_metadata(tmp_path) -> None:
+    raw = "界" * 20_001
+    sha, path, _ = write_transcript_material(
+        media_root=tmp_path,
+        session_id="session-1",
+        payload=raw.encode("utf-8"),
+    )
+    attachment = make_attachment_ref(
+        sha256=sha,
+        name="pasted-text-1.txt",
+        mime="text/plain",
+        size=len(raw.encode("utf-8")),
+        session_id="session-1",
+        source="upload",
+    )
+    attachment.update(
+        {
+            "origin": "paste",
+            "_material_chars": len(raw),
+            "_material_estimated_tokens": estimate_text_tokens(raw),
+            "_material_path": str(path),
+        }
+    )
+
+    normalized = infer_pasted_text_input_from_attachments("请总结", [attachment])
+
+    assert normalized is not None
+    assert normalized.material_chars == len(raw)
+    assert normalized.material_estimated_tokens == estimate_text_tokens(raw)
+    assert normalized.metadata["original_chars"] == len(raw)
+
+
+def test_pasted_text_materializes_as_preview_only_attachment(tmp_path) -> None:
+    raw = "line 1\n" + ("x" * 20_000)
+    attachment = {
+        "type": "text/plain",
+        "mime": "text/plain",
+        "name": "pasted-text-1.txt",
+        "origin": "paste",
+        "data": base64.b64encode(raw.encode("utf-8")).decode("ascii"),
+    }
+
+    refs = materialize_generated_text_attachments(
+        [attachment],
+        media_root=tmp_path,
+        session_id="session-1",
+        normalization_metadata={"guard_action": "generated_text_attachment"},
+    )
+
+    assert refs[0]["kind"] == "attachment_ref"
+    assert refs[0]["origin"] == "paste"
+    assert refs[0]["source"] == "input_normalization"
+    assert refs[0]["_provider_inline_policy"] == "preview_only"

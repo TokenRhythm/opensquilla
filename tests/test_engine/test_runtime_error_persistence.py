@@ -111,6 +111,33 @@ class _ProviderSelector:
         return _SelectorClone(self.provider)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["session_lookup", "attachments"])
+async def test_prestream_cancel_preserves_original_cancellation(monkeypatch, boundary) -> None:
+    from opensquilla.gateway.config import GatewayConfig
+
+    config = GatewayConfig()
+    config.squilla_router.enabled = False
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(_SingleReplyProvider()),
+        session_manager=_RecordingSessionManager(), config=config,
+    )
+    monkeypatch.setattr("opensquilla.token_estimation._get_encoding", lambda: None)
+    monkeypatch.setattr(runner, "_build_tools", lambda *args, **kwargs: ([], None))
+    cancellation = AsyncMock(side_effect=asyncio.CancelledError("synthetic prestream cancel"))
+    if boundary == "session_lookup":
+        monkeypatch.setattr(runner, "_resolve_session_id_for_log", cancellation)
+    else:
+        monkeypatch.setattr(runner._attachment_stage, "run", cancellation)
+    with pytest.raises(asyncio.CancelledError, match="synthetic prestream cancel"):
+        async for _event in runner.run(
+            "probe", "synthetic:cancel", ToolContext(is_owner=True, caller_kind=CallerKind.WEB),
+            no_memory_capture=True, input_mode="text",
+        ):
+            pass
+    cancellation.assert_awaited_once()
+
+
 @pytest.mark.parametrize(
     "outcome", ["loaded", "missing", "cancelled", "delayed", "cancelled_inflight"],
 )

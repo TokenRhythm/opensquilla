@@ -57,6 +57,17 @@ export function shouldRetrySessionPhase(error: unknown): boolean {
   )
 }
 
+/** Preserve a projected terminal read failure across the recovery callback. */
+export function sessionRecoverySucceeded(result: {
+  authoritative: boolean; cancelled?: boolean; error?: unknown
+}): boolean {
+  if (result.cancelled) return false
+  if (result.authoritative) return true
+  if (result.error instanceof SessionReadFailure && !result.error.retryable
+    && result.error.kind !== 'aborted') throw result.error
+  return false
+}
+
 export function autoSendDraftIsUnchanged(
   expectedText: string,
   currentText: string,

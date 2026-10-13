@@ -36,6 +36,69 @@ async function reserveLoopbackPort(): Promise<number> {
  * provider. The browser uses its default same-origin `/ws`; no WebSocket route,
  * constructor shim, storage override, user profile, or external LLM is used.
  */
+export async function withIsolatedRealGateway(
+  options: {
+    outputDir: string
+    scenario?: RealGoalGatewayScenario
+    authMode?: 'none' | 'token'
+    initialSessionKeys?: readonly string[]
+  },
+  use: (gateway: IsolatedRealGateway) => Promise<void>,
+): Promise<void> {
+  const webuiPort = await reserveLoopbackPort()
+  const webuiOrigin = `http://127.0.0.1:${webuiPort}`
+  const gateway = await startRealGoalGateway({
+    outputDir: options.outputDir,
+    webuiOrigin,
+    // This deterministic provider also supports an ordinary chat turn; the
+    // release gate lets the test prove the UI is connected before it replies.
+    scenario: options.scenario,
+    authMode: options.authMode,
+    initialSessionKeys: options.initialSessionKeys,
+  })
+  const gatewayHttpUrl = gateway.wsUrl.replace(/^ws:/, 'http:').replace(/\/ws$/, '')
+  const webuiRoot = fileURLToPath(new URL('..', import.meta.url))
+  let vite: ViteDevServer | null = null
+
+  try {
+    vite = await createViteServer({
+      root: webuiRoot,
+      logLevel: 'error',
+      server: {
+        host: '127.0.0.1',
+        port: webuiPort,
+        strictPort: true,
+        proxy: {
+          '/api': {
+            target: gatewayHttpUrl,
+            changeOrigin: true,
+            configure(proxy) {
+              proxy.on('proxyReq', proxyReq => proxyReq.removeHeader('origin'))
+            },
+          },
+          '/ws': {
+            target: gatewayHttpUrl,
+            changeOrigin: true,
+            ws: true,
+          },
+          '/control/static': {
+            target: gatewayHttpUrl,
+            changeOrigin: true,
+          },
+        },
+      },
+    })
+    await vite.listen()
+    await use(Object.assign(gateway, {
+      webuiOrigin,
+      controlUrl: `${webuiOrigin}/control/`,
+    }))
+  } finally {
+    await vite?.close()
+    await gateway.stop()
+  }
+}
+
 export const test = base.extend<{
   isolatedRealGateway: IsolatedRealGateway
   isolatedRealGatewayScenario: RealGoalGatewayScenario
@@ -43,59 +106,12 @@ export const test = base.extend<{
 }>({
   isolatedRealGatewayScenario: ['lifecycle', { option: true }],
   isolatedRealGatewayAuthMode: ['none', { option: true }],
-  isolatedRealGateway: async ({ isolatedRealGatewayScenario, isolatedRealGatewayAuthMode }, use, testInfo) => {
-    const webuiPort = await reserveLoopbackPort()
-    const webuiOrigin = `http://127.0.0.1:${webuiPort}`
-    const gateway = await startRealGoalGateway({
+  isolatedRealGateway: async ({ isolatedRealGatewayScenario, isolatedRealGatewayAuthMode }, use, testInfo) =>
+    withIsolatedRealGateway({
       outputDir: testInfo.outputPath('isolated-real-gateway'),
-      webuiOrigin,
-      // This deterministic provider also supports an ordinary chat turn; the
-      // release gate lets the test prove the UI is connected before it replies.
       scenario: isolatedRealGatewayScenario,
       authMode: isolatedRealGatewayAuthMode,
-    })
-    const gatewayHttpUrl = gateway.wsUrl.replace(/^ws:/, 'http:').replace(/\/ws$/, '')
-    const webuiRoot = fileURLToPath(new URL('..', import.meta.url))
-    let vite: ViteDevServer | null = null
-
-    try {
-      vite = await createViteServer({
-        root: webuiRoot,
-        logLevel: 'error',
-        server: {
-          host: '127.0.0.1',
-          port: webuiPort,
-          strictPort: true,
-          proxy: {
-            '/api': {
-              target: gatewayHttpUrl,
-              changeOrigin: true,
-              configure(proxy) {
-                proxy.on('proxyReq', proxyReq => proxyReq.removeHeader('origin'))
-              },
-            },
-            '/ws': {
-              target: gatewayHttpUrl,
-              changeOrigin: true,
-              ws: true,
-            },
-            '/control/static': {
-              target: gatewayHttpUrl,
-              changeOrigin: true,
-            },
-          },
-        },
-      })
-      await vite.listen()
-      await use(Object.assign(gateway, {
-        webuiOrigin,
-        controlUrl: `${webuiOrigin}/control/`,
-      }))
-    } finally {
-      await vite?.close()
-      await gateway.stop()
-    }
-  },
+    }, use),
 })
 
 export { expect }

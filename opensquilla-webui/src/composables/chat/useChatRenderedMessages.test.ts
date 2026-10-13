@@ -58,6 +58,21 @@ function renderedMessagesFor(
 }
 
 describe('useChatRenderedMessages scheduled provenance', () => {
+  it('keeps semantic content identity while answer text segments are not tool calls', () => {
+    const contentRef = {
+      version: 1 as const, sessionKey: 'agent:main:webchat:test', sessionId: 'sid', messageId: 'mid',
+      view: 'display' as const, byteLength: 32 * 1024, revision: 'r1',
+    }
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: 'bounded answer', ts: 1, contentRef,
+      tool_calls: [{ type: 'text', presentation: 'answer', text: 'bounded answer' }],
+    }])
+    const row = api.renderedMessages.value[0]
+    expect(row?.contentRef).toEqual(contentRef)
+    expect(row?.toolCalls).toEqual([])
+    expect(row?.contentSlice).toBeUndefined()
+  })
+
   it('keeps persisted sources and labels live cron completions before history arrives', () => {
     const api = renderedMessagesFor([
       { role: 'user', text: 'Run the inventory check.', ts: 1, provenanceKind: 'cron' },
@@ -369,6 +384,17 @@ describe('useChatRenderedMessages internal control turns', () => {
 
     expect(api.renderedMessages.value).toHaveLength(1)
     expect(api.renderedMessages.value[0]?.hasAttachments).toBe(true)
+  })
+
+  it.each(['preparing', 'unavailable'] as const)('keeps empty user %s content visible for existing local feedback', availability => {
+    const api = renderedMessagesFor([{
+      role: 'user', text: '', ts: 1, messageId: 'pending-user', attachments: [],
+      contentAvailability: availability, previewComplete: false,
+    }])
+    expect(api.renderedMessages.value).toHaveLength(1)
+    expect(api.renderedMessages.value[0]).toMatchObject({
+      displayRole: 'user', contentAvailability: availability, previewComplete: false,
+    })
   })
 
   it('keeps subagent completion control rows out while retaining the parent creation route', () => {
@@ -2941,7 +2967,7 @@ describe('useChatRenderedMessages per-turn usage', () => {
 })
 
 describe('useChatRenderedMessages clarify history recovery', () => {
-  it('restores a clarify interrupt from persisted meta-step tool input', () => {
+  it('keeps retired workflow history as ordinary transcript without an actionable form', () => {
     const api = renderedMessagesFor([
       {
         role: 'assistant',
@@ -2995,14 +3021,8 @@ describe('useChatRenderedMessages clarify history recovery', () => {
       interruptKind: 'clarify'
     } => part.type === 'interrupt' && part.interruptKind === 'clarify')
 
-    expect(clarify).toBeTruthy()
-    expect(clarify?.key).toBe('m-clarify:interrupt:run-1|project_clarify')
-    expect(clarify?.clarify?.intro).toBe('A few details.')
-    expect(clarify?.clarify?.fields.map(field => field.name)).toEqual([
-      'topic',
-      'age_band',
-    ])
-    expect(clarify?.clarify?.fields[1].choices).toEqual(['PRE_K', 'EARLY_GRADE'])
+    expect(clarify).toBeUndefined()
+    expect(message.text).toContain('Please reply with these fields.')
   })
 
   it('restores request_user_input from persisted tool_result JSON without arguments', () => {
@@ -3020,6 +3040,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
             result: JSON.stringify({
               kind: 'user_input',
               paused: true,
+              request_id: 'request-history-2',
               run_id: 'plan-run-2',
               step: 'choose_target',
               clarify_schema: {
@@ -3043,7 +3064,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
       interruptKind: 'clarify'
     } => part.type === 'interrupt' && part.interruptKind === 'clarify')
 
-    expect(clarify?.key).toBe('m-request-user-input:interrupt:plan-run-2|choose_target')
+    expect(clarify?.key).toBe('m-request-user-input:interrupt:request-history-2')
     expect(clarify?.clarify).toEqual({
       intro: 'Choose where to implement.',
       fields: [{
@@ -3054,6 +3075,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
         defaultValue: '',
         choices: ['current', 'new'],
       }],
+      requestId: 'request-history-2',
       runId: 'plan-run-2',
       step: 'choose_target',
     })
@@ -3118,6 +3140,93 @@ describe('useChatRenderedMessages clarify history recovery', () => {
     expect(clarify?.clarify?.presentation).toBe('plan_questionnaire_v1')
   })
 
+  it('keeps a resolved question in activity order after history restoration', () => {
+    const pending = {
+      status: 'input_required',
+      kind: 'user_input',
+      paused: true,
+      request_id: 'request-ordered',
+      run_id: 'run-ordered',
+      step: 'choose_target',
+      clarify_schema: {
+        fields: [{ name: 'target', type: 'enum', choices: ['current', 'new'] }],
+      },
+    }
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'done',
+      ts: 0,
+      messageId: 'm-ordered-question',
+      turnOutcome: { turnId: 'run-ordered', taskId: 'run-ordered', status: 'succeeded' },
+      tool_calls: [
+        {
+          type: 'tool_use',
+          tool_use_id: 'request-ordered-tool',
+          name: 'request_user_input',
+          input: { questions: [{ id: 'target', question: 'Where?', options: [{ label: 'Current' }, { label: 'New' }] }] },
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 'request-ordered-tool',
+          name: 'request_user_input',
+          user_input_request: pending,
+          result: JSON.stringify({
+            status: 'answered',
+            kind: 'user_input',
+            paused: false,
+            request_id: 'request-ordered',
+            answers: { target: 'current' },
+          }),
+        },
+        {
+          type: 'tool_use',
+          tool_use_id: 'inspect-ordered-tool',
+          name: 'skill_view',
+          input: {},
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 'inspect-ordered-tool',
+          name: 'skill_view',
+          result: 'ok',
+        },
+        { type: 'text', text: 'done' },
+      ],
+      activitySnapshot: {
+        version: 2,
+        taskId: 'run-ordered',
+        turnId: 'run-ordered',
+        complete: true,
+        reasoningUtf16Length: 0,
+        entries: [
+          {
+            type: 'segment', id: 'tool:request-ordered-tool', order: 10,
+            segment_type: 'tool', tool_use_id: 'request-ordered-tool', name: 'request_user_input',
+          },
+          {
+            type: 'interrupt', id: 'clarify:request-ordered', order: 11,
+            interrupt_type: 'clarify', reference_id: 'request-ordered',
+            started_at: 10, ended_at: 11,
+          },
+          {
+            type: 'segment', id: 'tool:inspect-ordered-tool', order: 12,
+            segment_type: 'tool', tool_use_id: 'inspect-ordered-tool', name: 'skill_view',
+          },
+          {
+            type: 'segment', id: 'text:0', order: 13,
+            segment_type: 'text', text_index: 0, text_utf16_length: 4,
+          },
+        ],
+      },
+    }])
+
+    const rendered = api.renderedMessages.value[0]
+    expect(rendered.timelineItems?.map(item => item.type)).toEqual([
+      'tool-group', 'interrupt', 'tool-group', 'text',
+    ])
+    expect(rendered.timelineItems?.map(item => item.activityOrder)).toEqual([10, 11, 12, 13])
+  })
+
   it.each(['succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted'])(
     'expires only unresolved structured input owned by the %s historical turn',
     (status) => {
@@ -3156,7 +3265,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
             part.type === 'interrupt' && part.interruptKind === 'clarify',
         ) ?? []
         expect(clarifies.map(part => part.resolution)).toEqual([
-          'expired', 'replied', null, null,
+          'expired', 'replied', null,
         ])
       }
     },
@@ -3287,7 +3396,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
 
   it('applies clarify submit state to recovered historical interrupt cards', () => {
     const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map([
-      ['run-1|project_clarify', {
+      ['request-history-1', {
         resolution: 'replied',
         busy: true,
         error: '',
@@ -3302,10 +3411,11 @@ describe('useChatRenderedMessages clarify history recovery', () => {
         tool_calls: [
           {
             type: 'tool_use',
-            tool_use_id: 'meta_step_project_clarify',
-            name: 'meta-step:project_clarify',
+            tool_use_id: 'request-input-history-1',
+            name: 'request_user_input',
             input: {
               kind: 'user_input',
+              request_id: 'request-history-1',
               paused: true,
               step: 'project_clarify',
               run_id: 'run-1',

@@ -464,17 +464,15 @@ async def run_agent_once(
 
         growth_sink = getattr(svc, "growth_event_sink", None)
         record_launch = getattr(growth_sink, "record_client_launch", None)
-        # Internal coding Agents retain turn/tool diagnostics, but their
-        # disposable profiles must not inflate CLI users or launch counts.
-        # Stateless is independent: a user's stateless CLI run still counts.
-        if callable(record_launch) and os.environ.get("OPENSQUILLA_CODETASK_CHILD") != "1":
+        # Stateless CLI runs still count as client launches.
+        if callable(record_launch):
             await record_launch(
                 surface=ClientSurface.CLI,
                 entrypoint=ClientEntrypoint.AGENT,
                 execution_mode=ExecutionMode.ONE_SHOT,
             )
         record_active = getattr(growth_sink, "record_product_active", None)
-        if callable(record_active) and os.environ.get("OPENSQUILLA_CODETASK_CHILD") != "1":
+        if callable(record_active):
             with contextlib.suppress(Exception):
                 await record_active(surface=ClientSurface.CLI)
 

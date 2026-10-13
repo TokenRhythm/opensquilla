@@ -636,14 +636,17 @@ def test_usage_endpoint_is_independent_from_install_endpoint(monkeypatch):
 async def test_post_uses_event_id_as_idempotency_key(monkeypatch):
     import httpx
 
+    monkeypatch.delenv("OPENSQUILLA_TRUST_ENV", raising=False)
+
     calls: list[dict[str, Any]] = []
 
     class FakeResponse:
         status_code = 200
 
     class FakeClient:
-        def __init__(self, *, timeout: float) -> None:
+        def __init__(self, *, timeout: float, trust_env: bool) -> None:
             assert timeout == install_telemetry.DEFAULT_TIMEOUT_SECONDS
+            assert trust_env is False
 
         async def __aenter__(self):
             return self
@@ -671,12 +674,9 @@ async def test_post_uses_event_id_as_idempotency_key(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize("disabled,child", [(True, False), (False, True)])
-async def test_standalone_veto_does_not_create_usage_store(tmp_path, monkeypatch, disabled, child):
+async def test_standalone_veto_does_not_create_usage_store(tmp_path, monkeypatch):
     _enable_telemetry_for_test(monkeypatch)
-    if child:
-        monkeypatch.setenv("OPENSQUILLA_CODETASK_CHILD", "1")
-    config = _config(tmp_path, disabled=disabled)
+    config = _config(tmp_path, disabled=True)
     runtime = usage_telemetry.StandaloneUsageTelemetry(config=config, legacy_storage=None)
     runtime.start()
     await runtime.record_turn(run_kind="default", done_event=_done())

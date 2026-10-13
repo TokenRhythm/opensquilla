@@ -42,10 +42,11 @@ from opensquilla.gateway.config import (
 from opensquilla.gateway.config_migration import (
     ConfigParseError,
     atomic_write_config,
-    backup_and_write_migrated_config,
     make_config_backup,
     migrate_config_payload,
+    rewrite_migrated_config_best_effort,
 )
+from opensquilla.observability.settings_save import settings_save_stage
 from opensquilla.paths import default_opensquilla_home, native_io_path
 
 log = structlog.get_logger(__name__)
@@ -221,7 +222,7 @@ def load_config(
     migration = migrate_config_payload(data)
     cfg = GatewayConfig.model_validate(migration.payload)
     if migration.changed and persist_migrations:
-        backup_and_write_migrated_config(target, migration.payload, migration)
+        rewrite_migrated_config_best_effort(target, migration)
     _mark_env_absorbed_runtime_secrets(cfg, data)
     cfg.config_path = str(target)
     _remember_load_baseline(cfg, migration.payload)
@@ -588,19 +589,21 @@ def _remember_load_baseline(
     cfg.set_persist_snapshot(baseline, raw_payload if raw_payload else None)
 
 
-def _lock_config_file(fh: BinaryIO) -> None:
+def _lock_config_file(fh: BinaryIO, *, blocking: bool = True) -> None:
     if os.name == "nt":
         import msvcrt
 
         msvcrt_mod = cast(Any, msvcrt)
         fh.seek(0)
-        msvcrt_mod.locking(fh.fileno(), msvcrt_mod.LK_LOCK, 1)
+        mode = msvcrt_mod.LK_LOCK if blocking else msvcrt_mod.LK_NBLCK
+        msvcrt_mod.locking(fh.fileno(), mode, 1)
         return
 
     import fcntl
 
     fcntl_mod = cast(Any, fcntl)
-    fcntl_mod.flock(fh.fileno(), fcntl_mod.LOCK_EX)
+    flags = fcntl_mod.LOCK_EX | (0 if blocking else fcntl_mod.LOCK_NB)
+    fcntl_mod.flock(fh.fileno(), flags)
 
 
 def _unlock_config_file(fh: BinaryIO) -> None:
@@ -619,14 +622,16 @@ def _unlock_config_file(fh: BinaryIO) -> None:
 
 
 @contextmanager
-def _config_write_lock(target: Path) -> Iterator[None]:
+def _config_write_lock(target: Path, *, blocking: bool = True) -> Iterator[None]:
     """Serialize read/merge/replace against every shared persister process."""
     lock_path = target.with_name(f".{target.name}.lock")
     fd = os.open(native_io_path(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
     if os.fstat(fd).st_size == 0:
         os.write(fd, b"\0")
     with os.fdopen(fd, "r+b", buffering=0) as fh:
-        _lock_config_file(fh)
+        settings_save_stage("file_lock_wait")
+        _lock_config_file(fh, blocking=blocking)
+        settings_save_stage("file_lock_acquired")
         try:
             yield
         finally:
@@ -930,6 +935,7 @@ def persist_config(
 
         # Re-validate to catch any invariant breakage that survived model_dump.
         GatewayConfig.model_validate(copy.deepcopy(merged))
+        settings_save_stage("persist_validated")
         next_baseline = copy.deepcopy(current_dump) if same_path else None
         next_raw_base = copy.deepcopy(merged) if same_path else None
 
@@ -972,7 +978,10 @@ def persist_config(
         else:
             if backup and target_io.exists():
                 backup_path = make_config_backup(target)
+            settings_save_stage("backup_finished")
             atomic_write_config(target, merged)
+
+        settings_save_stage("disk_committed")
 
         config.consume_force_persist_path_segments(force_paths)
 

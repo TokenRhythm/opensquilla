@@ -7,6 +7,7 @@ import { join, relative, resolve } from 'node:path'
 import vm from 'node:vm'
 import ts from '@typescript/typescript6'
 import { DesktopWriterAdmission } from '../dist/desktop-writer-admission.js'
+import { DesktopQuitBudget } from '../dist/desktop-quit.js'
 import { mainWindowCloseAction } from '../dist/desktop-window-lifecycle.js'
 import { WindowsUpdateCoordinator, WindowsUpdatePreparationError } from '../dist/windows-update-coordinator.js'
 import { WindowsUpdateSecurityError } from '../dist/windows-update-security.js'
@@ -100,7 +101,7 @@ function fixture(options = {}) {
     windowsUpdateCacheRestoreAttempted: true,
     windowsUpdateCoordinator: new WindowsUpdateCoordinator(1000),
     windowsUpdateRecoveryGeneration: 0,
-    updateApplying: false, isQuitting: false, appExitPhase: 'running',
+    updateApplying: false, isQuitting: false, appExitPhase: 'running', gatewayLateReadyObservation: null,
     updateInstallHandoffReady: false, updateDownloadInProgress: false,
     manualInstallerActionInProgress: false, updateGatewayShutdownProcess: null,
     downloadedUpdateVersion: null, quitRequestedDuringUpdateDrain: false,
@@ -156,9 +157,14 @@ function electronEvent() {
 function lifecycleFixture(options = {}) {
   const f = fixture(options)
   const calls = { quitEvents: [], exits: [], hidden: 0, normalDrains: 0, schedulerStops: 0 }
-  const window = { hide: () => { calls.hidden += 1 } }
+  const window = { isDestroyed: () => false, hide: () => { calls.hidden += 1 } }
   Object.assign(f.context, {
-    mainWindowCloseAction,
+    mainWindowCloseAction, DesktopQuitBudget,
+    quitConfirmationPromise: null, quitConfirmed: false, quitFromSignal: false,
+    quitUnconfirmedProcessTrees: new Set(),
+    holdQuitForTaskConfirmation: () => false,
+    cancelGatewayUnexpectedExitRestart: () => {},
+    showDesktopQuitFailure: () => { assert.fail('synthetic normal quit cleanup must succeed') },
     systemSessionEnding: false,
     windowsTray: {},
     currentOnboardingWindow: () => null,
@@ -167,7 +173,7 @@ function lifecycleFixture(options = {}) {
     focusOnboardingWindow: () => { assert.fail('no onboarding exists in this lifecycle fixture') },
     promptForMainWindowClose: () => { assert.fail('close during a deferred/draining exit must not reopen a prompt') },
     desktopUpdateCheckScheduler: { stop: () => { calls.schedulerStops += 1 } },
-    artifactPreviewLeaseBroker: { clear: () => {}, revokeAll: async () => {} },
+    artifactPreviewLeaseBroker: { clear: () => {}, shutdown: async () => {} },
     nativeWorkbenchSurfaces: { destroyAll: async () => {} },
     desktopBrowser: { close: async () => {} },
     destroyWindowsTray: () => { f.context.windowsTray = null },
@@ -177,7 +183,13 @@ function lifecycleFixture(options = {}) {
     quitWriterAdmission: null,
     gatewayProcess: null,
     gatewayState: { owned: false },
-    drainOwnedGatewayForQuit: async () => { calls.normalDrains += 1; return true },
+    quitOwnedGateway: async (child) => {
+      calls.normalDrains += 1
+      const index = f.live.indexOf(child)
+      assert.ok(index >= 0, 'normal quit must own the child it stops')
+      f.live.splice(index, 1)
+      return true
+    },
     dialog: { showErrorBox: () => { assert.fail('synthetic normal quit drain must succeed') } },
     app: { ...f.context.app,
       quit: () => {
@@ -445,7 +457,7 @@ for (const code of ['signature_invalid', 'signature_unavailable']) {
   assert.equal(f.context.quitRequestedDuringUpdateDrain, true)
   assert.equal(f.context.appExitPhase, 'deferred')
   assert.equal(f.closeWindow().defaultPrevented, true)
-  assert.equal(f.lifecycleCalls.hidden, 1)
+  assert.equal(f.lifecycleCalls.hidden, 0, 'close must keep the protected update visible')
   assert.equal(f.calls.stops, 0)
   assert.equal(f.lifecycleCalls.normalDrains, 0)
   assert.deepEqual(f.lifecycleCalls.exits, [])
@@ -474,7 +486,8 @@ for (const code of ['signature_invalid', 'signature_unavailable']) {
   drain.resolve()
   await update
   assert.equal(f.context.quitRequestedDuringUpdateDrain, false)
-  await until(() => f.lifecycleCalls.quitEvents.some((event) => !event.defaultPrevented), 'remembered Quit after asynchronous spawn failure')
+  await until(() => f.lifecycleCalls.exits.length === 1, 'remembered Quit after asynchronous spawn failure')
+  assert.deepEqual(f.lifecycleCalls.exits, [0])
   assert.equal(f.calls.launches, 1)
   assert.equal(f.context.updateInstallHandoffReady, false, 'failed spawn cannot commit installer handoff')
   assert.equal(f.calls.resumes, 0, 'user Quit after a drain suppresses Gateway recovery')
@@ -496,7 +509,7 @@ for (const code of ['signature_invalid', 'signature_unavailable']) {
   await f.subject.applyWindowsInstaller()
   assert.equal(f.calls.stops, 1)
   assert.equal(f.calls.launches, 0)
-  assert.equal(f.lifecycleCalls.hidden, 2)
+  assert.equal(f.lifecycleCalls.hidden, 0, 'repeated close must keep the protected update visible')
   drain.resolve()
   await until(() => f.child !== null, 'spawn event after deferred Quit')
   assert.equal(f.context.updateInstallHandoffReady, false)

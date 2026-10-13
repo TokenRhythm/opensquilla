@@ -217,7 +217,7 @@ _OPENAI_STREAM_USAGE_ONLY_KEYS = frozenset(
 _OPENAI_STREAM_NOOP_CHOICE_KEYS = frozenset(
     {"index", "delta", "finish_reason", "native_finish_reason"}
 )
-_OPENAI_STREAM_NOOP_DELTA_KEYS = frozenset({"content", "role"})
+_OPENAI_STREAM_NOOP_DELTA_KEYS = frozenset({"content", "role", "tool_calls"})
 _EPHEMERAL_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
 _DASHSCOPE_MAX_CACHE_MARKERS = 4
 _DASHSCOPE_CACHE_MARKER_ROLES = {"system", "user", "assistant", "tool"}
@@ -289,6 +289,8 @@ def _is_inert_post_terminal_stream_frame(
     if delta.get("content") not in (None, ""):
         return False
     if delta.get("role") not in (None, "assistant"):
+        return False
+    if _has_native_tool_payload(delta.get("tool_calls")):
         return False
 
     repeated_finish = choice.get("finish_reason")
@@ -3208,6 +3210,30 @@ class OpenAIProvider:
     final_request_admission_guaranteed = True
     provider_name = "openai"
 
+    async def _build_http_client(
+        self,
+        *,
+        timeout: Any,
+    ) -> httpx.AsyncClient:
+        """Construct HTTPX away from the Gateway event loop.
+
+        HTTPX builds proxy/TLS state synchronously in ``AsyncClient.__init__``.
+        On Windows, certificate-store or proxy initialization can therefore
+        stop the Gateway loop before the first await (a shape consistent with
+        the 103-second field stall; the live incident's exact stack is still
+        being captured).  Constructing the whole client in the worker keeps
+        that synchronous work off the event-loop thread and also preserves the
+        normal HTTPX ownership/close lifecycle.
+        """
+
+        return await asyncio.to_thread(
+            httpx.AsyncClient,
+            timeout=timeout,
+            trust_env=_trust_env(),
+            proxy=self._proxy,
+            follow_redirects=False,
+        )
+
     def __init__(
         self,
         api_key: str,
@@ -3352,6 +3378,8 @@ class OpenAIProvider:
             model=self._model,
             api_key=self._api_key,
             base_url=self._base_url,
+            org_id=self._org_id or "",
+            retry_after_scope_known=True,
         )
 
     def _api_url(self, path: str) -> str:
@@ -4068,16 +4096,14 @@ class OpenAIProvider:
             return released
 
         try:
-            async with httpx.AsyncClient(
+            client = await self._build_http_client(
                 timeout=(
                     _stream_timeout(cfg.timeout)
                     if stream_timeout_fallback
                     else cfg.timeout
-                ),
-                trust_env=_trust_env(),
-                proxy=self._proxy,
-                follow_redirects=False,
-            ) as client:
+                )
+            )
+            async with client:
                 headers.pop(TOKENRHYTHM_INSTALL_ID_HEADER, None)
                 headers.update(
                     tokenrhythm_install_id_headers(
@@ -5750,12 +5776,8 @@ class OpenAIProvider:
         )
 
         try:
-            async with httpx.AsyncClient(
-                timeout=cfg.timeout,
-                trust_env=_trust_env(),
-                proxy=self._proxy,
-                follow_redirects=False,
-            ) as client:
+            client = await self._build_http_client(timeout=cfg.timeout)
+            async with client:
                 # ``AsyncClient.__aenter__`` is an await boundary. Refresh at
                 # the final send point so a privacy toggle that lands while
                 # the fallback client is opening cannot forward a stale id.
@@ -6548,12 +6570,8 @@ class OpenAIProvider:
         raw_message = ""
         raw_state = ""
         try:
-            async with httpx.AsyncClient(
-                timeout=10.0,
-                trust_env=_trust_env(),
-                proxy=self._proxy,
-                follow_redirects=False,
-            ) as client:
+            client = await self._build_http_client(timeout=10.0)
+            async with client:
                 headers.update(
                     tokenrhythm_install_id_headers(
                         self._provider_kind,

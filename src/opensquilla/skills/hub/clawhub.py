@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import tempfile
@@ -25,7 +26,7 @@ from opensquilla.skills.hub.contracts import (
     SkillDiagnostic,
 )
 from opensquilla.skills.hub.github import GitHubSource
-from opensquilla.skills.hub.operations import report_install_progress
+from opensquilla.skills.hub.operations import report_install_progress_async
 from opensquilla.skills.hub.source import (
     SkillBundle,
     SkillMeta,
@@ -78,6 +79,7 @@ _GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _MAX_ARTIFACT_REDIRECTS = 5
+_ARTIFACT_FETCH_TIMEOUT_SECONDS = 30.0
 _MAX_REGISTRY_DESCRIPTION_LENGTH = 1_024
 _SHA256_RE = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{64}$")
 
@@ -100,6 +102,24 @@ def _artifact_transport(url: str, vetted_ips: list[str], **kwargs: object) -> ob
     from opensquilla.tools.ssrf import pinned_transport
 
     return pinned_transport(url, vetted_ips, **kwargs)
+
+
+def _artifact_client_kwargs(url: str) -> dict[str, object]:
+    vetted = _validate_artifact_url(url)
+    transport_kwargs: dict[str, object] = {}
+    if _trust_env():
+        proxy_url = _artifact_proxy_url(url)
+        if proxy_url is not None:
+            transport_kwargs["proxy"] = proxy_url
+    transport = _artifact_transport(url, vetted, **transport_kwargs)
+    client_kwargs: dict[str, object] = {
+        "timeout": _ARTIFACT_FETCH_TIMEOUT_SECONDS,
+        "trust_env": _trust_env(),
+        "follow_redirects": False,
+    }
+    if transport is not None:
+        client_kwargs["transport"] = transport
+    return client_kwargs
 
 
 @dataclass(frozen=True)
@@ -273,6 +293,16 @@ class ClawHubSource(SkillSource):
     @property
     def trust_level(self) -> str:
         return "community"
+
+    @property
+    def requires_immutable_resolution(self) -> bool:
+        return True
+
+    @property
+    def source_name(self) -> str:
+        """Human-readable name used in shared archive-fetch diagnostics."""
+
+        return "ClawHub"
 
     def _headers(self) -> dict[str, str]:
         headers: dict[str, str] = {"Accept": "application/json"}
@@ -736,11 +766,16 @@ class ClawHubSource(SkillSource):
         if resolution.artifact_kind != "archive" or not resolution.artifact_url:
             raise SkillSourceFetchError.diagnostic(
                 "SOURCE_HANDOFF_UNSUPPORTED",
-                "ClawHub resolution does not contain a supported immutable artifact hand-off.",
+                (
+                    f"{self.source_name} resolution does not contain a supported "
+                    "immutable artifact hand-off."
+                ),
                 phase=DiagnosticPhase.FETCH,
             )
 
         import httpx
+
+        from opensquilla.tools.fetch_work import run_blocking_fetch_work
 
         try:
             current_url = resolution.artifact_url
@@ -750,25 +785,15 @@ class ClawHubSource(SkillSource):
                     raise SkillSourceFetchError.diagnostic(
                         "ARTIFACT_TRANSPORT_INSECURE",
                         (
-                            "ClawHub redirected to a plaintext artifact URL without a "
+                            f"{self.source_name} redirected to a plaintext artifact URL without a "
                             "verifiable SHA-256 digest."
                         ),
                         phase=DiagnosticPhase.SECURITY,
                     )
-                vetted = _validate_artifact_url(current_url)
-                transport_kwargs: dict[str, object] = {}
-                if _trust_env():
-                    proxy_url = _artifact_proxy_url(current_url)
-                    if proxy_url is not None:
-                        transport_kwargs["proxy"] = proxy_url
-                transport = _artifact_transport(current_url, vetted, **transport_kwargs)
-                client_kwargs: dict[str, object] = {
-                    "timeout": 30,
-                    "trust_env": _trust_env(),
-                    "follow_redirects": False,
-                }
-                if transport is not None:
-                    client_kwargs["transport"] = transport
+                async with asyncio.timeout(_ARTIFACT_FETCH_TIMEOUT_SECONDS):
+                    client_kwargs = await run_blocking_fetch_work(
+                        _artifact_client_kwargs, current_url,
+                    )
                 async with httpx.AsyncClient(**client_kwargs) as client:  # type: ignore[arg-type]
                     stream = getattr(client, "stream", None)
                     if callable(stream):
@@ -783,13 +808,15 @@ class ClawHubSource(SkillSource):
                                 raise_for_source_http_status(
                                     response,
                                     phase=DiagnosticPhase.FETCH,
-                                    source_name="ClawHub",
+                                    source_name=self.source_name,
                                 )
                                 size = 0
                                 with archive_path.open("wb") as output:
                                     async for chunk in response.aiter_bytes(CHUNK_SIZE):
                                         size += len(chunk)
-                                        report_install_progress("downloading", downloadedBytes=size)
+                                        await report_install_progress_async(
+                                            "downloading", downloadedBytes=size,
+                                        )
                                         if exceeds_limit(
                                             size, DEFAULT_ARCHIVE_LIMITS.max_archive_bytes
                                         ):
@@ -810,7 +837,7 @@ class ClawHubSource(SkillSource):
                             raise_for_source_http_status(
                                 response,
                                 phase=DiagnosticPhase.FETCH,
-                                source_name="ClawHub",
+                                source_name=self.source_name,
                             )
                             if exceeds_limit(
                                 len(response.content), DEFAULT_ARCHIVE_LIMITS.max_archive_bytes
@@ -829,7 +856,7 @@ class ClawHubSource(SkillSource):
             raise
         except Exception as exc:
             log.warning(
-                "clawhub.fetch_failed",
+                f"{self.source_id}.fetch_failed",
                 identifier=resolution.canonical_identifier,
                 error=str(exc),
             )
@@ -849,11 +876,11 @@ class ClawHubSource(SkillSource):
                 raise source_transport_error(
                     exc,
                     phase=DiagnosticPhase.FETCH,
-                    source_name="ClawHub",
+                    source_name=self.source_name,
                 ) from exc
             raise SkillSourceFetchError.diagnostic(
                 code,
-                str(exc) or "ClawHub artifact fetch failed.",
+                str(exc) or f"{self.source_name} artifact fetch failed.",
                 phase=phase,
                 hint="Check source availability and the immutable install reference.",
             ) from exc
@@ -863,7 +890,7 @@ class ClawHubSource(SkillSource):
             )
         except ArchiveNormalizationError as exc:
             log.warning(
-                "clawhub.fetch_invalid_archive",
+                f"{self.source_id}.fetch_invalid_archive",
                 identifier=resolution.canonical_identifier,
                 error=str(exc),
             )
@@ -874,10 +901,13 @@ class ClawHubSource(SkillSource):
             digest,
             f"sha256:{digest}",
         }:
-            log.warning("clawhub.fetch_digest_mismatch", identifier=resolution.canonical_identifier)
+            log.warning(
+                f"{self.source_id}.fetch_digest_mismatch",
+                identifier=resolution.canonical_identifier,
+            )
             raise SkillSourceFetchError.diagnostic(
                 "ARTIFACT_DIGEST_MISMATCH",
-                "The downloaded ClawHub archive digest does not match its resolution.",
+                f"The downloaded {self.source_name} archive digest does not match its resolution.",
                 phase=DiagnosticPhase.SECURITY,
             )
         diagnostics = resolution.diagnostics

@@ -4,7 +4,8 @@ import type { ConversationCronResult, ConversationEnsembleProgress, Conversation
 import type { ConversationAnswerReset, ConversationSubagentCompletion } from './conversationEventContent'
 import type { ConversationCompactionContent, ConversationTextContent, ConversationThinkingContent, ConversationToolContent } from './conversationEventContent'
 import type { ConversationArtifact, ConversationCommittedTurn, ConversationEventIdentity, ConversationInputDisposition, ConversationLifecycle, ConversationRoutingDecision, ConversationTurnCompletion, ConversationWarning } from './conversationEventContent'
-import type { SessionProcess } from './sessionProcesses'
+
+type SessionProcessStatus = 'running' | 'done' | 'killed' | 'timed_out'
 
 /** Protocol-neutral meanings emitted by the Conversation event Adapter. */
 export type ConversationSemanticEventKind =
@@ -22,10 +23,6 @@ export type ConversationSemanticEventKind =
   | 'goal-changed'
   | 'goal-run-changed'
   | 'input-disposition'
-  | 'meta-preflight'
-  | 'meta-run-announced'
-  | 'meta-run-completed'
-  | 'meta-step-state'
   | 'plan-revision'
   | 'plan-run'
   | 'process-completed'
@@ -87,7 +84,7 @@ export type ConversationEventProjection =
   | ProjectedEvent<'ensemble-progress', ConversationEnsembleProgress>
   | ProjectedEvent<'answer-generation-reset', ConversationAnswerReset>
   | ProjectedEvent<'subagent-completed', ConversationSubagentCompletion>
-  | ProjectedEvent<'process-completed', { executionId: string; status: SessionProcess['status']; returncode: number | null; sessionId: string; sessionEpoch: number }>
+  | ProjectedEvent<'process-completed', { executionId: string; status: SessionProcessStatus; returncode: number | null; sessionId: string; sessionEpoch: number }>
   | ProjectedEvent<'text-delta', ConversationTextContent>
   | ProjectedEvent<'tool-use-started' | 'tool-use-delta' | 'tool-use-ended' | 'tool-result', ConversationToolContent>
   | ProjectedEvent<'thinking-started' | 'thinking-delta' | 'thinking-ended', ConversationThinkingContent>
@@ -99,7 +96,7 @@ export type ConversationEventProjection =
   | ProjectedEvent<'warning', ConversationWarning>
   | ProjectedEvent<'artifact-created', ConversationArtifact>
   | ProjectedEvent<Extract<ConversationSemanticEventKind, `task-${string}`> | 'turn-failed' | 'state-changed' | 'run-heartbeat' | 'session-epoch-changed', ConversationLifecycle>
-  | ProjectedEvent<'approval-requested' | 'approval-resolved' | 'artifact-state-changed' | 'collaboration-mode-changed' | 'goal-changed' | 'goal-run-changed' | 'meta-preflight' | 'meta-run-announced' | 'meta-run-completed' | 'meta-step-state' | 'plan-revision' | 'plan-run' | 'router-control-replay' | 'steer-received', ConversationEventIdentity>
+  | ProjectedEvent<'approval-requested' | 'approval-resolved' | 'artifact-state-changed' | 'collaboration-mode-changed' | 'goal-changed' | 'goal-run-changed' | 'plan-revision' | 'plan-run' | 'router-control-replay' | 'steer-received', ConversationEventIdentity>
   | (ConversationEventPosition & {
   readonly kind: 'unknown'
   readonly semanticKind: 'unknown'

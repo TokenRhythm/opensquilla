@@ -497,8 +497,8 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
     assert manifest["protocol"] == runner.GATEWAY_PROTOCOL
     assert manifest["wireVersion"] == 4
     assert manifest["source"] == {
-        "schemaCount": 235,
-        "methodCount": 225,
+        "schemaCount": 218,
+        "methodCount": 208,
         "eventFamilyCount": 10,
         "schemaTreeSha256": runner._schema_tree_digest(specs),
         "generatorSha256": runner._generator_digest(),
@@ -531,7 +531,7 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
         {entry["name"] for entry in manifest["methods"]}
     )
     assert Counter(entry["lifecycle"] for entry in manifest["methods"]) == {
-        "stable": 222,
+        "stable": 205,
         "legacy": 3,
     }
     assert [
@@ -558,6 +558,11 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
     )
     assert capacity_resolve["lifecycle"] == "stable"
     assert capacity_resolve["schema"] == "platform/models-capacity-resolve.schema.json"
+    receipt_lookup = next(
+        entry for entry in manifest["methods"] if entry["name"] == "turns.receipt.get"
+    )
+    assert receipt_lookup["lifecycle"] == "stable"
+    assert receipt_lookup["schema"] == "conversation/turns-receipt-get.schema.json"
     assert {
         entry["name"]: entry["canonicalName"]
         for entry in manifest["methods"]
@@ -791,8 +796,9 @@ def test_python_renderer_keeps_field_alias_metadata_when_tightening_nullability(
     )
 
 
+@pytest.mark.parametrize("multiline", [False, True])
 def test_python_renderer_keeps_omittable_non_nullable_collection_constraints(
-    tmp_path: Path,
+    tmp_path: Path, multiline: bool,
 ) -> None:
     from pydantic import ValidationError
 
@@ -803,13 +809,24 @@ def test_python_renderer_keeps_omittable_non_nullable_collection_constraints(
     }
     schema = _write_schema(tmp_path, "sessions/sessions-resolve.schema.json", document)
     spec = runner.load_contract(schema, contract_root=tmp_path)
+    field = (
+        "Field(\n        None,\n        max_length=2,\n    )"
+        if multiline else "Field(None, max_length=2)"
+    )
     generated = (
         "from pydantic import BaseModel, Field\n\n"
         "class SessionsResolveResult(BaseModel):\n"
-        "    values: list[str] | None = Field(None, max_length=2)\n"
+        f"    values: list[str] | None = {field}\n"
     )
     rendered = runner._normalise_optional_non_nullable_defaults(spec, generated)
-    assert "list[str] = Field(None, max_length=2)  # type: ignore[assignment, arg-type]" in rendered
+    if multiline:
+        assert "list[str] = Field(\n        None,  # type: ignore[arg-type]\n" in rendered
+        assert "    )  # type: ignore[assignment]" in rendered
+    else:
+        assert (
+            "list[str] = Field(None, max_length=2)  # type: ignore[assignment, arg-type]"
+            in rendered
+        )
     namespace: dict[str, Any] = {}
     exec(rendered, namespace)
     model = namespace["SessionsResolveResult"]

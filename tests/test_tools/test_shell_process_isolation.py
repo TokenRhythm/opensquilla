@@ -134,41 +134,6 @@ def test_background_process_result_surfaces_local_http_server_url() -> None:
     assert "include the local URL" in result
 
 
-def test_bg_session_payload_surfaces_codetask_status_with_spaced_path(tmp_path) -> None:
-    run_dir = tmp_path / "Application Support" / "code-task" / "run-1"
-    run_dir.mkdir(parents=True)
-    status_path = run_dir / "status.json"
-    status_path.write_text(
-        json.dumps(
-            {
-                "run_id": "run-1",
-                "phase": "agent_running",
-                "updated": "2026-06-29T00:00:00Z",
-                "log_paths": {"stdout": str(run_dir / "agent_stdout.log")},
-            }
-        ),
-        encoding="utf-8",
-    )
-    session = _session(
-        "code",
-        "agent:main:one",
-        command="opensquilla-gateway code-task solve --task-file /tmp/x --yes",
-    )
-    session.output_lines.append(
-        "[code-task] run started: run_id=run-1 "
-        f"artifact_dir={run_dir} status={status_path} "
-        "(work happens in the run dir)\n"
-    )
-
-    payload = shell._bg_session_payload(session)
-
-    code_task = payload["code_task"]
-    assert isinstance(code_task, dict)
-    assert code_task["run_id"] == "run-1"
-    assert code_task["artifact_dir"] == str(run_dir)
-    assert code_task["status_path"] == str(status_path)
-    assert code_task["phase"] == "agent_running"
-    assert code_task["log_paths"] == {"stdout": str(run_dir / "agent_stdout.log")}
 
 
 def test_verified_channel_admin_can_manage_background_sessions_across_sessions() -> None:
@@ -1098,18 +1063,6 @@ def test_process_tool_declares_wait_timeout_metadata() -> None:
     assert spec.execution_timeout_argument == "timeout"
 
 
-def test_process_wait_uses_coding_mode_default_timeout() -> None:
-    ctx = ToolContext(coding_mode=True)
-
-    assert ctx.coding_mode is True
-    token = current_tool_context.set(ctx)
-    try:
-        assert (
-            shell._resolve_process_wait_timeout(None)
-            == shell._CODING_PROCESS_WAIT_TIMEOUT
-        )
-    finally:
-        current_tool_context.reset(token)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="uses POSIX sleep/true")

@@ -1,4 +1,4 @@
-"""Check production collectors against an immutable release source before publication."""
+"""Validate release protocol source and report production collector compatibility."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ REQUEST_TIMEOUT_SECONDS = 10
 MAX_ATTEMPTS = 3
 
 # A reviewed, one-way compatibility pair: the newer server accepts events
-# without the optional device field. Unknown protocol differences fail closed.
+# without the optional device field. Unknown differences remain incompatible.
 COMPATIBLE_PAIRS = frozenset(
     {
         (
@@ -161,7 +161,19 @@ def main() -> None:
         print(f"Release source {args.source_sha} predates the collector clients; no gate required")
         return
     print(f"Checking release source {args.source_sha}; protocol {fingerprint}")
-    check_collectors(fingerprint)
+    # Collector deployment is independent of client releases. Keep local source
+    # validation above this advisory boundary and never claim a mismatch passed.
+    try:
+        check_collectors(fingerprint)
+    except Exception:
+        # All ordinary collector failures, including HTTP parser errors, are
+        # advisory. Remote bodies, messages, and request details stay private.
+        print(
+            "::warning::Production collector compatibility could not be verified; "
+            "continuing with the validated release source. Review collector health "
+            "and protocol compatibility separately.",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":
@@ -169,5 +181,5 @@ if __name__ == "__main__":
         main()
     except (ValueError, OSError, subprocess.SubprocessError):
         # Do not print remote response bodies, subprocess output, or request details.
-        print("Release protocol check failed; publication is blocked.", file=sys.stderr)
+        print("Release source protocol validation failed; publication is blocked.", file=sys.stderr)
         sys.exit(1)

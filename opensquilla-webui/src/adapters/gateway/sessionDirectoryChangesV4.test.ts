@@ -10,7 +10,7 @@ import {
 } from '@/contracts/generated/v4/sessionsSubscribe'
 import { SESSIONS_UNSUBSCRIBE_METHOD } from '@/contracts/generated/v4/sessionsUnsubscribe'
 
-type Handler = (payload: unknown) => void
+type Handler = (...payload: unknown[]) => void
 
 function makeHarness(initialGeneration = 1) {
   let generation = initialGeneration
@@ -46,8 +46,8 @@ function makeHarness(initialGeneration = 1) {
     rpc,
     events,
     calls,
-    emit(event: string, payload: unknown) {
-      handlers.get(event)?.forEach(handler => handler(payload))
+    emit(event: string, ...payload: unknown[]) {
+      handlers.get(event)?.forEach(handler => handler(...payload))
     },
     setGeneration(value: number) { generation = value },
     listenerCount(event: string) { return handlers.get(event)?.size || 0 },
@@ -116,7 +116,7 @@ describe('v4 SessionDirectoryChanges Adapter', () => {
   })
 
   it('maps known generic invalidations to updated while preserving unknown reasons', () => {
-    for (const reason of ['turn_complete', 'cron_result', 'cron_system_event', 'updated']) {
+    for (const reason of ['turn_complete', 'cancellation_completed', 'cron_result', 'cron_system_event', 'updated']) {
       expect(decodeSessionDirectoryChange({ key: 'k', reason }))
         .toEqual({ key: 'k', reason: 'updated' })
     }
@@ -150,7 +150,7 @@ describe('v4 SessionDirectoryChanges Adapter', () => {
     expect(harness.calls[0].method).toBe(SESSIONS_SUBSCRIBE_METHOD)
     expect(harness.calls[0].params).toEqual({})
     expect(harness.calls[0].options).toMatchObject({ expectedGeneration: 1, abortAction: 'reject' })
-    expect(harness.events.subscribe).toHaveBeenCalledTimes(2)
+    expect(harness.events.subscribe).toHaveBeenCalledTimes(3)
     expect(Math.max(...harness.events.subscribe.mock.invocationCallOrder))
       .toBeLessThan(Math.min(...harness.rpc.request.mock.invocationCallOrder))
 
@@ -166,6 +166,54 @@ describe('v4 SessionDirectoryChanges Adapter', () => {
     secondSubscription.close()
     await flushAsyncWork()
     expect(harness.calls.filter(call => call.method === SESSIONS_UNSUBSCRIBE_METHOD)).toHaveLength(1)
+  })
+
+  it.each([
+    'task.succeeded', 'task.failed', 'task.cancelled', 'task.abandoned', 'task.timeout',
+    'session.event.done', 'session.event.error', 'chat.done',
+  ])('uses %s as an identity-only fallback when directory invalidation is missing', async name => {
+    const harness = makeHarness()
+    const changes = createV4SessionDirectoryChanges(harness.rpc, harness.events)
+    const listener = vi.fn()
+    changes.subscribe(listener)
+    await changes.resume()
+    harness.emit('*', name, {
+      schema_version: 1,
+      session_key: 'agent:main:task',
+      task_id: 'finished-predecessor',
+      status: 'cancelled',
+    })
+    expect(listener).toHaveBeenCalledExactlyOnceWith({ key: 'agent:main:task', reason: 'updated' })
+    expect(harness.calls).toHaveLength(1)
+    changes.dispose()
+    expect(harness.listenerCount('*')).toBe(0)
+  })
+
+  it('invalidates again when a durable commit follows an earlier turn completion', () => {
+    const harness = makeHarness()
+    const changes = createV4SessionDirectoryChanges(harness.rpc, harness.events)
+    const listener = vi.fn()
+    changes.subscribe(listener)
+    harness.emit('*', 'session.event.turn_committed', {
+      schema_version: 1, session_key: 'agent:main:task',
+      task_id: 'finished-task', turn_id: 'finished-task', stream_seq: 12,
+      status: 'succeeded', terminal_reason: 'completed', finished_at: 123,
+    })
+    expect(listener).toHaveBeenCalledExactlyOnceWith({ key: 'agent:main:task', reason: 'updated' })
+    changes.dispose()
+  })
+
+  it('ignores nonterminal, unscoped, and invalid-version fallback events', () => {
+    const harness = makeHarness()
+    const warn = vi.fn()
+    const changes = createV4SessionDirectoryChanges(harness.rpc, harness.events, { warn })
+    const listener = vi.fn()
+    changes.subscribe(listener)
+    harness.emit('*', 'session.event.text_delta', { key: 'agent:main:task', text: 'hello' })
+    harness.emit('*', 'task.cancelled', { task_id: 'task-without-session' })
+    harness.emit('*', 'task.cancelled', { schema_version: 2, key: 'agent:main:task' })
+    expect(listener).not.toHaveBeenCalled()
+    changes.dispose()
   })
 
   it('rebinds once after a new generation and fences unsubscribe', async () => {
@@ -273,27 +321,92 @@ describe('v4 SessionDirectoryChanges Adapter', () => {
     second.close()
   })
 
-  it('does not retry forbidden subscription endlessly and releases transport listeners', async () => {
+  it('rejects an unaccepted transient bind and permits an idempotent same-generation retry', async () => {
     const harness = makeHarness()
-    const error = Object.assign(new Error('guest denied'), { code: 'UNAUTHORIZED' })
-    harness.rpc.request.mockImplementation(async (
-      method: string,
-      params?: Record<string, unknown>,
-      options?: RpcCallOptions,
-    ): Promise<never> => {
-      harness.calls.push({ method, params, options })
-      throw error
+    const error = Object.assign(new Error('Connection request queue is full'), {
+      code: 'UNAVAILABLE', retryable: true, accepted: false,
     })
-    const warn = vi.fn()
-    const changes = createV4SessionDirectoryChanges(harness.rpc, harness.events, { warn })
-    const subscription = changes.subscribe(vi.fn())
+    harness.rpc.request.mockRejectedValueOnce(error)
+    const changes = createV4SessionDirectoryChanges(harness.rpc, harness.events, { warn: vi.fn() })
+    changes.subscribe(vi.fn())
+
+    await expect(changes.resume()).rejects.toBe(error)
+    expect(harness.rpc.markUnsupported).not.toHaveBeenCalled()
     await changes.resume()
     await changes.resume()
-    expect(harness.calls.filter(call => call.method === SESSIONS_SUBSCRIBE_METHOD)).toHaveLength(1)
-    expect(warn).not.toHaveBeenCalled()
-    subscription.close()
+    expect(harness.rpc.request).toHaveBeenCalledTimes(2)
     changes.dispose()
-    expect(harness.listenerCount('sessions.changed')).toBe(0)
-    expect(harness.listenerCount('_state')).toBe(0)
   })
+
+  it('does not mark a replacement connection unsupported after an old bind rejects', async () => {
+    const harness = makeHarness()
+    let rejectOld!: (error: unknown) => void
+    harness.rpc.request.mockImplementationOnce(() => new Promise((_, reject) => { rejectOld = reject }))
+    const error = Object.assign(new Error('Old connection unsupported'), { code: 'UNSUPPORTED' })
+    const changes = createV4SessionDirectoryChanges(harness.rpc, harness.events, { warn: vi.fn() })
+    changes.subscribe(vi.fn())
+    const rejected = expect(changes.resume()).rejects.toBe(error)
+    await flushAsyncWork()
+    harness.setGeneration(2)
+    harness.emit('_state', 'disconnected')
+    harness.emit('_state', 'connected')
+    rejectOld(error)
+    await rejected
+    await changes.resume()
+
+    expect(harness.rpc.markUnsupported).not.toHaveBeenCalled()
+    expect(harness.rpc.request).toHaveBeenCalledTimes(2)
+    expect(harness.rpc.request).toHaveBeenLastCalledWith(
+      SESSIONS_SUBSCRIBE_METHOD, {}, expect.objectContaining({ expectedGeneration: 2 }),
+    )
+    changes.dispose()
+  })
+
+  it.each(['release', 'dispose'])(
+    'does not revive a rejected pending lease after %s', async cleanup => {
+      const harness = makeHarness()
+      let rejectBind!: (error: unknown) => void
+      harness.rpc.request.mockImplementationOnce(() => new Promise((_, reject) => { rejectBind = reject }))
+      const warn = vi.fn()
+      const changes = createV4SessionDirectoryChanges(harness.rpc, harness.events, { warn })
+      const subscription = changes.subscribe(vi.fn())
+      const binding = changes.resume()
+      await flushAsyncWork()
+      if (cleanup === 'dispose') changes.dispose()
+      else subscription.close()
+      rejectBind(new Error('Late transient rejection'))
+      await binding
+      await flushAsyncWork()
+
+      expect(harness.rpc.request).toHaveBeenCalledOnce()
+      expect(warn).not.toHaveBeenCalled()
+      changes.dispose()
+    },
+  )
+
+  it.each(['UNAUTHORIZED', 'FORBIDDEN', 'METHOD_NOT_FOUND', 'UNSUPPORTED'])(
+    'does not retry permanent %s subscription failure and releases transport listeners', async code => {
+      const harness = makeHarness()
+      const error = Object.assign(new Error('directory unavailable'), { code })
+      harness.rpc.request.mockImplementation(async (
+        method: string,
+        params?: Record<string, unknown>,
+        options?: RpcCallOptions,
+      ): Promise<never> => {
+        harness.calls.push({ method, params, options })
+        throw error
+      })
+      const warn = vi.fn()
+      const changes = createV4SessionDirectoryChanges(harness.rpc, harness.events, { warn })
+      const subscription = changes.subscribe(vi.fn())
+      await changes.resume()
+      await changes.resume()
+      expect(harness.calls.filter(call => call.method === SESSIONS_SUBSCRIBE_METHOD)).toHaveLength(1)
+      expect(warn).not.toHaveBeenCalled()
+      subscription.close()
+      changes.dispose()
+      expect(harness.listenerCount('sessions.changed')).toBe(0)
+      expect(harness.listenerCount('_state')).toBe(0)
+    },
+  )
 })

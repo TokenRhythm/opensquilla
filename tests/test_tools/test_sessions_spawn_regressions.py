@@ -538,7 +538,8 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
         memory={},
         naming={"enabled": False},
         agent_stream_heartbeat_interval_seconds=0.0,
-        agent_stream_idle_timeout_seconds=1.0,
+        # Keep the production idle wrapper/default: this tests durable authority,
+        # not stream timing. The dispatch below has its own test-only guard.
     )
     storage = await SessionStorage.open(str(database))
     manager = SessionManager(storage, inject_time_prefix=False)
@@ -696,13 +697,14 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
         return None
 
     try:
-        await dispatch_task_runtime_turn(
-            queued_run,
-            config=config,
-            session_manager=restarted_manager,
-            turn_runner=Runner(),
-            event_emitter=emit,
-        )
+        async with asyncio.timeout(60.0):
+            await dispatch_task_runtime_turn(
+                queued_run,
+                config=config,
+                session_manager=restarted_manager,
+                turn_runner=Runner(),
+                event_emitter=emit,
+            )
 
         assert observations["mode"] is RunMode.SAFE
         assert observations["source"] == "route_metadata"
@@ -919,9 +921,11 @@ async def test_task_workspace_spawn_rejects_invalid_root_before_creating_child(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("write_delay_seconds", [0.0, 1.1])
 async def test_project_spawned_child_persists_binding_and_revalidates_queued_execution(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    write_delay_seconds: float,
 ) -> None:
     from opensquilla.project_workspaces import (
         ProjectWorkspaceStateError,
@@ -949,7 +953,8 @@ async def test_project_spawned_child_persists_binding_and_revalidates_queued_exe
         memory={},
         naming={"enabled": False},
         agent_stream_heartbeat_interval_seconds=0.0,
-        agent_stream_idle_timeout_seconds=1.0,
+        # Real filesystem and stream-finalization I/O are not a one-second idle
+        # contract. Retain the production wrapper/default and bound dispatch.
     )
     storage = await SessionStorage.open(str(database))
     manager = SessionManager(storage, inject_time_prefix=False)
@@ -1037,6 +1042,9 @@ async def test_project_spawned_child_persists_binding_and_revalidates_queued_exe
             backend_operations.append(operation)
             request = operation.request
             assert request.path is not None
+            # Deliberately exceed the former one-second stream-idle override.
+            # This simulates slow I/O; it is not a synchronization mechanism.
+            await asyncio.sleep(write_delay_seconds)
             request.path.write_text(request.content, encoding="utf-8")
             return SandboxOperationResult(
                 message=f"sandboxed write: {request.path}",
@@ -1088,13 +1096,14 @@ async def test_project_spawned_child_persists_binding_and_revalidates_queued_exe
         emitted.append(args)
 
     try:
-        await dispatch_task_runtime_turn(
-            queued_run,
-            config=config,
-            session_manager=restarted_manager,
-            turn_runner=Runner(),
-            event_emitter=emit,
-        )
+        async with asyncio.timeout(60.0):
+            await dispatch_task_runtime_turn(
+                queued_run,
+                config=config,
+                session_manager=restarted_manager,
+                turn_runner=Runner(),
+                event_emitter=emit,
+            )
         child = await restarted_storage.get_session(child_key)
         assert child is not None
         assert child.workspace_id == project.workspace_id
@@ -1116,18 +1125,19 @@ async def test_project_spawned_child_persists_binding_and_revalidates_queued_exe
 
         await restarted_storage.remove_project_workspace(project.workspace_id)
         with pytest.raises(ProjectWorkspaceStateError, match="removed"):
-            await dispatch_task_runtime_turn(
-                TaskRun(
-                    task_id="project-child-retry",
-                    envelope=queued_run.envelope,
-                    message="queued after project removal",
-                    run_kind="subagent",
-                ),
-                config=config,
-                session_manager=restarted_manager,
-                turn_runner=Runner(),
-                event_emitter=emit,
-            )
+            async with asyncio.timeout(60.0):
+                await dispatch_task_runtime_turn(
+                    TaskRun(
+                        task_id="project-child-retry",
+                        envelope=queued_run.envelope,
+                        message="queued after project removal",
+                        run_kind="subagent",
+                    ),
+                    config=config,
+                    session_manager=restarted_manager,
+                    turn_runner=Runner(),
+                    event_emitter=emit,
+                )
         assert len(observations) == 1
         assert emitted
     finally:

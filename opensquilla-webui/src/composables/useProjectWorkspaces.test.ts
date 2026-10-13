@@ -67,6 +67,7 @@ function accessFromRpc(rpc: ReturnType<typeof useRpcStore>): GatewayAccess {
     detachedSessionHydration: false,
     turnCommittedEvents: false,
     subscriptionEpoch: 0,
+    supportBundleUnavailableReason: null,
     loadConnectionEndpoint: () => 'ws://example.invalid/ws',
     connect: async () => undefined,
     disconnect: () => undefined,
@@ -77,6 +78,10 @@ function accessFromRpc(rpc: ReturnType<typeof useRpcStore>): GatewayAccess {
 describe('useProjectWorkspaces', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
+  })
+
+  it('creates the RPC store without browser globals', () => {
+    expect(useRpcStore().state).toBe('disconnected')
   })
 
   it('distinguishes an unavailable project list from a successfully empty list', async () => {

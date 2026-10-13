@@ -20,6 +20,7 @@ from opensquilla.gateway.attachment_ingest import (
     ingest_attachments,
     stage_pending_chat_input_attachments,
 )
+from opensquilla.gateway.input_normalization import estimate_text_tokens
 from opensquilla.gateway.uploads import UploadStore
 from tests.helpers.image_bytes import image_bytes
 
@@ -611,6 +612,30 @@ async def test_uuid_ingress_respects_persistence_without_consuming_upload(
             "data": base64.b64encode(payload).decode("ascii"), "_was_staged": True,
         }]
         assert not (media_root / "transcripts").exists()
+
+
+@pytest.mark.asyncio
+async def test_staged_pasted_text_ref_keeps_server_material_metadata(tmp_path: Path) -> None:
+    raw = "界" * 20_001
+    payload = raw.encode("utf-8")
+    store = UploadStore(marker_dir=tmp_path / "upload-markers")
+    file_uuid = await store.put("pasted.txt", "text/plain", payload)
+    media_root = tmp_path / "media"
+
+    result = await ingest_attachments(
+        "请总结",
+        [{"file_uuid": file_uuid, "type": "text/plain", "name": "pasted.txt", "origin": "paste"}],
+        store=store,
+        material_root=media_root,
+        session_id="accepted-session",
+    )
+
+    assert result.failures == []
+    ref = result.attachments[0]
+    assert ref["origin"] == "paste"
+    assert ref["_material_chars"] == len(raw)
+    assert ref["_material_estimated_tokens"] == estimate_text_tokens(raw)
+    assert ref["_material_path"]
 
 
 @pytest.mark.asyncio

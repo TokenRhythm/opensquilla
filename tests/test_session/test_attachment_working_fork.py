@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -9,6 +10,7 @@ import pytest_asyncio
 
 from opensquilla.attachment_refs import make_attachment_ref, write_transcript_material
 from opensquilla.attachment_workspace import AttachmentWorkspaceMaterializer
+from opensquilla.paths import native_io_path
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import TranscriptEntry
 from opensquilla.session.storage import SessionStorage
@@ -24,18 +26,30 @@ async def storage():
     await value.close()
 
 
-async def _parent(storage: SessionStorage, tmp_path: Path, count: int = 1):
+async def _parent(
+    storage: SessionStorage,
+    tmp_path: Path,
+    count: int = 1,
+    *,
+    size_bytes: int = 0,
+):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     media_root = tmp_path / "media"
+
     async def full_context(session):
         return ToolContext(
-            workspace_dir=str(workspace), artifact_session_id=session.session_id,
-            session_key=session.session_key, run_mode="full", workspace_strict=True,
+            workspace_dir=str(workspace),
+            artifact_session_id=session.session_id,
+            session_key=session.session_key,
+            run_mode="full",
+            workspace_strict=True,
         )
 
     manager = SessionManager(
-        storage, inject_time_prefix=False, media_root=media_root,
+        storage,
+        inject_time_prefix=False,
+        media_root=media_root,
         attachment_fork_context_resolver=full_context,
     )
     parent = await manager.create(
@@ -64,6 +78,8 @@ async def _parent(storage: SessionStorage, tmp_path: Path, count: int = 1):
     try:
         for index in range(count):
             payload = f"original {index}\n".encode()
+            if size_bytes:
+                payload += b"a" * (size_bytes - len(payload))
             sha, _, _ = write_transcript_material(
                 media_root=media_root,
                 session_id=parent.session_id,
@@ -125,6 +141,74 @@ async def test_manager_branch_persists_independent_current_working_bytes(storage
     parent_record = next(iter(records.values()))
     assert (workspace / parent_record["path"]).read_text() == "parent edit 0\n"
     assert (workspace / next(iter(records))).read_text() == "original 0\n"
+
+
+@pytest.mark.asyncio
+async def test_fifty_mib_working_copy_fork_survives_manager_reopen(storage, tmp_path):
+    manager, parent, workspace, records, _ = await _parent(
+        storage,
+        tmp_path,
+        size_bytes=50 * 1024 * 1024,
+    )
+    parent_record = next(iter(records.values()))
+    original_path = native_io_path(workspace / next(iter(records)))
+    parent_path = native_io_path(workspace / parent_record["path"])
+
+    def digest(path: Path) -> str:
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+
+    original_hash = digest(original_path)
+    parent_hash = digest(parent_path)
+    assert original_path.stat().st_size == 50 * 1024 * 1024
+    with parent_path.open("rb") as stream:
+        parent_header = stream.readline()
+    assert parent_header.rstrip(b"\r\n") == b"parent edit 0"
+    # The existing Windows text writer translates LF to CRLF. Assert the
+    # complete large payload size without imposing a different newline policy.
+    assert parent_path.stat().st_size == (
+        50 * 1024 * 1024 - len(b"original 0\n") + len(parent_header)
+    )
+    assert parent_hash != original_hash
+
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:direct:large-child",
+        fork_transcript=True,
+    )
+    # Load the persisted mapping through a new manager, not the branch return
+    # object. The child's working bytes must snapshot the edited parent bytes.
+    restored = await SessionManager(storage).get_session(child.session_key)
+    assert restored is not None
+    child_records = restored.origin["attachment_working_files"]
+    key, child_record = next(iter(child_records.items()))
+    child_path = native_io_path(workspace / child_record["path"])
+    assert child_record["session_id"] == child.session_id
+    assert child_path != parent_path
+    assert not child_path.samefile(parent_path)
+    assert digest(child_path) == parent_hash
+
+    token = current_tool_context.set(
+        ToolContext(
+            workspace_dir=str(workspace),
+            artifact_session_id=child.session_id,
+            run_mode="full",
+            attachment_working_files=child_records,
+        )
+    )
+    try:
+        await filesystem.edit_file(key, "parent edit", "child edit")
+    finally:
+        current_tool_context.reset(token)
+    with child_path.open("rb") as stream:
+        assert stream.readline().rstrip(b"\r\n") == b"child edit 0"
+    assert child_path.stat().st_size == parent_path.stat().st_size - 1
+    assert digest(child_path) != parent_hash
+    assert digest(parent_path) == parent_hash
+    assert digest(original_path) == original_hash
+    reopened_parent = await SessionManager(storage).get_session(parent.session_key)
+    assert reopened_parent is not None
+    assert reopened_parent.origin["attachment_working_files"] == records
 
 
 @pytest.mark.asyncio

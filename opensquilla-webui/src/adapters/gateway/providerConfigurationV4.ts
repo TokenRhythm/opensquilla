@@ -135,7 +135,11 @@ function modelCatalog(value: unknown): ModelCatalogResult {
         }
       })
     : []
-  return { models, errors }
+  const catalog = record(raw.catalog)
+  return { models, errors, ...(typeof catalog.cacheHit === 'boolean' ? { catalog: {
+    cacheHit: catalog.cacheHit, stale: catalog.stale !== false,
+    lastSyncedAt: typeof catalog.lastSyncedAt === 'string' ? catalog.lastSyncedAt : null,
+  } } : {}) }
 }
 
 function status(value: unknown): ProviderStatusResult {
@@ -245,7 +249,10 @@ export function createV4ProviderConfiguration(
       return providerCatalog(result)
     },
     async list(request) {
-      const params = request?.scope ? { scope: request.scope } : undefined
+      const params = request?.scope || request?.cacheOnly ? {
+        ...(request?.scope ? { scope: request.scope } : {}),
+        ...(request?.cacheOnly ? { cacheOnly: true } : {}),
+      } : undefined
       if (!validateModelsListParams(params ?? {})) throw new Error(`${MODELS_LIST_METHOD} params are invalid`)
       const result = await requestProvider(rpc, MODELS_LIST_METHOD, params, options(request?.signal))
       if (!validateModelsListResult(result)) throw new Error(`${MODELS_LIST_METHOD} returned an invalid response`)

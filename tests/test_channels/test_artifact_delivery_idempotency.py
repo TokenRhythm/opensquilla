@@ -65,9 +65,11 @@ class _Channel:
         )
 
 
-async def test_successful_artifact_replay_survives_store_restart(tmp_path: Path) -> None:
+async def test_successful_artifact_replay_survives_store_restart(
+    channel_store, tmp_path: Path
+) -> None:
     path = tmp_path / "delivery.sqlite"
-    store = ChannelDeliveryStore(path)
+    store = await channel_store(path)
     channel = _Channel(store)
     install_outbox(channel)
     request = _request()
@@ -75,9 +77,9 @@ async def test_successful_artifact_replay_survives_store_restart(tmp_path: Path)
     assert len(channel.requests) == 1
     delivery_id = channel.requests[0].delivery_id
     assert delivery_id
-    store.close()
+    (await store.close())
 
-    reopened = ChannelDeliveryStore(path)
+    reopened = await channel_store(path)
     channel = _Channel(reopened)
     install_outbox(channel)
     # Temporary staging paths change between attempts and must not change the
@@ -92,11 +94,13 @@ async def test_successful_artifact_replay_survives_store_restart(tmp_path: Path)
     assert "/private/local" not in rows[0][1]
     assert "private synthetic request" not in rows[0][1]
     assert "private detail" not in rows[0][1]
-    reopened.close()
+    (await reopened.close())
 
 
-async def test_unknown_artifact_outcome_cannot_be_blindly_retried(tmp_path: Path) -> None:
-    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+async def test_unknown_artifact_outcome_cannot_be_blindly_retried(
+    channel_store, tmp_path: Path
+) -> None:
+    store = await channel_store(tmp_path / "delivery.sqlite")
 
     class UncertainChannel(_Channel):
         async def deliver_artifact(self, request: ChannelArtifactDeliveryRequest) -> None:
@@ -113,12 +117,14 @@ async def test_unknown_artifact_outcome_cannot_be_blindly_retried(tmp_path: Path
     assert replay.retryable is False
     assert "unknown" in replay.reason
     assert len(channel.requests) == 1
-    assert store.diagnostics("test-main")["outbox"]["unknown"]["count"] == 1
-    store.close()
+    assert (await store.diagnostics("test-main"))["outbox"]["unknown"]["count"] == 1
+    (await store.close())
 
 
-async def test_concurrent_artifact_attempt_does_not_start_second_upload(tmp_path: Path) -> None:
-    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+async def test_concurrent_artifact_attempt_does_not_start_second_upload(
+    channel_store, tmp_path: Path
+) -> None:
+    store = await channel_store(tmp_path / "delivery.sqlite")
     started = asyncio.Event()
     finish = asyncio.Event()
 
@@ -143,14 +149,14 @@ async def test_concurrent_artifact_attempt_does_not_start_second_upload(tmp_path
     finally:
         finish.set()
         await first
-        store.close()
+        (await store.close())
 
 
 @pytest.mark.parametrize("field", ["account", "channel", "thread", "sender", "session", "artifact"])
 async def test_reused_delivery_id_cannot_cross_artifact_or_reply_binding(
-    tmp_path: Path, field: str
+    channel_store, tmp_path: Path, field: str
 ) -> None:
-    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+    store = await channel_store(tmp_path / "delivery.sqlite")
     channel = _Channel(store)
     install_outbox(channel)
     request = replace(_request(), delivery_id="same-delivery")
@@ -174,12 +180,14 @@ async def test_reused_delivery_id_cannot_cross_artifact_or_reply_binding(
     assert not result.is_delivered()
     assert "does not match" in result.reason
     assert len(channel.requests) == 1
-    assert store.diagnostics("test-main")["outbox"]["sent"]["count"] == 1
-    store.close()
+    assert (await store.diagnostics("test-main"))["outbox"]["sent"]["count"] == 1
+    (await store.close())
 
 
-async def test_explicit_retryable_rejection_keeps_provider_delivery_id(tmp_path: Path) -> None:
-    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+async def test_explicit_retryable_rejection_keeps_provider_delivery_id(
+    channel_store, tmp_path: Path
+) -> None:
+    store = await channel_store(tmp_path / "delivery.sqlite")
 
     class RejectedChannel(_Channel):
         async def deliver_artifact(
@@ -196,17 +204,17 @@ async def test_explicit_retryable_rejection_keeps_provider_delivery_id(tmp_path:
     assert (await channel.deliver_artifact(_request())).is_delivered()
     assert len(channel.requests) == 2
     assert channel.requests[0].delivery_id == channel.requests[1].delivery_id
-    assert store.diagnostics("test-main")["outbox"]["sent"]["count"] == 1
-    store.close()
+    assert (await store.diagnostics("test-main"))["outbox"]["sent"]["count"] == 1
+    (await store.close())
 
 
-async def test_shared_pipeline_dedupes_legacy_file_delivery(tmp_path: Path) -> None:
+async def test_shared_pipeline_dedupes_legacy_file_delivery(channel_store, tmp_path: Path) -> None:
     artifact_store = ArtifactStore(tmp_path / "media")
     ref = artifact_store.publish_bytes(
         b"report", session_id="session-1", session_key="test-session", name="report.txt",
         mime="text/plain", source="test",
     )
-    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+    store = await channel_store(tmp_path / "delivery.sqlite")
 
     class LegacyChannel:
         capability_profile = ChannelCapabilityProfile(
@@ -232,19 +240,19 @@ async def test_shared_pipeline_dedupes_legacy_file_delivery(tmp_path: Path) -> N
             channel, _request().inbound, [ref.to_dict()], config, expected_session_id="session-1"
         ) == []
     assert channel.calls == 1
-    assert store.diagnostics("test-main")["outbox"]["sent"]["count"] == 1
-    store.close()
+    assert (await store.diagnostics("test-main"))["outbox"]["sent"]["count"] == 1
+    (await store.close())
 
 
 @pytest.mark.parametrize("spoof_session", [False, True])
 async def test_shared_pipeline_rejects_other_sessions_artifact_before_any_send(
-    tmp_path: Path, spoof_session: bool
+    channel_store, tmp_path: Path, spoof_session: bool
 ) -> None:
     ref = ArtifactStore(tmp_path / "media").publish_bytes(
         b"private material", session_id="session-a", session_key="test-a",
         name="private.txt", mime="text/plain", source="test",
     )
-    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+    store = await channel_store(tmp_path / "delivery.sqlite")
     channel = _Channel(store)
     install_outbox(channel)
     artifact = ref.to_dict()
@@ -258,5 +266,5 @@ async def test_shared_pipeline_rejects_other_sessions_artifact_before_any_send(
     )
     assert result == []  # No foreign name or signed URL is returned as a text fallback.
     assert channel.requests == []
-    assert store.diagnostics("test-main")["outbox"] == {}
-    store.close()
+    assert (await store.diagnostics("test-main"))["outbox"] == {}
+    (await store.close())

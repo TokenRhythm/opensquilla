@@ -41,7 +41,6 @@ from opensquilla.telemetry.contracts.growth import (
 )
 from opensquilla.telemetry.contracts.growth import (
     ClientLaunch,
-    CodingModeUsage,
     DownloadClick,
     DownloadServed,
     FirstAppReady,
@@ -51,7 +50,6 @@ from opensquilla.telemetry.contracts.growth import (
     InstallResult,
     InstallStarted,
     LandingView,
-    MetaSkillUsage,
     OnboardingCompleted,
     ProductActive,
     RegistrationResult,
@@ -119,8 +117,6 @@ TelemetryEvent = (
     | FirstTurnSucceeded
     | ClientLaunch
     | ProductActive
-    | MetaSkillUsage
-    | CodingModeUsage
 )
 
 TELEMETRY_EVENT_ADAPTER: TypeAdapter[TelemetryEvent] = TypeAdapter(TelemetryEvent)
@@ -152,8 +148,6 @@ EVENT_MODELS = MappingProxyType(
         ("first_turn_result", 1): FirstTurnSucceeded,
         ("client_launch", 1): ClientLaunch,
         ("product_active", 1): ProductActive,
-        ("metaskill_usage", 1): MetaSkillUsage,
-        ("coding_mode_usage", 1): CodingModeUsage,
     }
 )
 
@@ -170,7 +164,6 @@ __all__ = [
     "AppCrashDetected",
     "AppStartResult",
     "ClientLaunch",
-    "CodingModeUsage",
     "ClientEntrypoint",
     "ClientSurface",
     "ConsentScope",
@@ -189,7 +182,6 @@ __all__ = [
     "InstallResult",
     "InstallStarted",
     "LandingView",
-    "MetaSkillUsage",
     "OnboardingCompleted",
     "PerformanceSummary",
     "Platform",

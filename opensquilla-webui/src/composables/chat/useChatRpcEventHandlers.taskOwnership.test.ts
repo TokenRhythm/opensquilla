@@ -271,6 +271,53 @@ describe('task ownership event races', () => {
     scope.stop()
   })
 
+  describe.each(['running', 'queued'])('with %s successor ownership', successorStatus => {
+    it.each([
+      { reason: 'cancellation_completed' },
+      { reason: 'task_terminal', run_status: 'cancelled', last_task: { status: 'cancelled' } },
+      { reason: 'task_terminal', run_status: 'cancelled' },
+    ])('reconciles an unscoped cancellation without ending successor B: $reason', (summary) => {
+      const { api, options, stream, activeStreamTaskId, taskOwnership, scope } = makeHarness()
+      const recover = vi.fn()
+      options.onRecoveryRequired = recover
+      taskOwnership.noteTerminal('task-A')
+      taskOwnership.noteAccepted('task-B', successorStatus)
+      activeStreamTaskId.value = 'task-B'
+      options.activeTaskGroups.value = new Set(['group-owned-by-B'])
+
+      api.handlers.onWireEventFixture('sessions.changed', { key: SESSION, ...summary })
+      api.handlers.onWireEventFixture('sessions.changed', { key: SESSION, ...summary })
+
+      expect(recover).toHaveBeenCalledOnce()
+      expect(stream.endStreaming).not.toHaveBeenCalled()
+      expect(stream.isStreaming.value).toBe(true)
+      expect(activeStreamTaskId.value).toBe('task-B')
+      expect(taskOwnership.stopTargetTaskId.value).toBe('task-B')
+      expect(taskOwnership.isQueued('task-B')).toBe(successorStatus === 'queued')
+      expect([...options.activeTaskGroups.value]).toEqual(['group-owned-by-B'])
+      expect(options.applySessionRunState).not.toHaveBeenCalled()
+      expect(options.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+      scope.stop()
+    })
+  })
+
+  it('reconciles a group-only cancellation without inventing a task terminal', () => {
+    const { api, options, stream, activeStreamTaskId, taskOwnership, scope } = makeHarness()
+    options.onRecoveryRequired = vi.fn()
+    taskOwnership.noteTerminal('task-A')
+    activeStreamTaskId.value = ''
+    options.activeTaskGroups.value = new Set(['cancelled-group'])
+
+    api.handlers.onWireEventFixture('sessions.changed', {
+      key: SESSION, reason: 'cancellation_completed',
+    })
+
+    expect(options.onRecoveryRequired).toHaveBeenCalledOnce()
+    expect(stream.endStreaming).not.toHaveBeenCalled()
+    expect(options.applySessionRunState).not.toHaveBeenCalled()
+    scope.stop()
+  })
+
   it('clears A task groups and hands off to B when last_task A is cancelled', () => {
     const { api, options, stream, activeStreamTaskId, taskOwnership, scope } = makeHarness()
     options.activeTaskGroups.value = new Set(['group-owned-by-A'])

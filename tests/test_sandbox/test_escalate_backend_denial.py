@@ -12,6 +12,7 @@ from opensquilla.sandbox.elevation import ElevationGateResult
 from opensquilla.sandbox.integration import (
     configure_runtime,
     consume_backend_denial_retry,
+    consume_backend_denial_retry_async,
     escalate_backend_denial,
     get_runtime,
     reset_runtime,
@@ -70,6 +71,9 @@ class _ApproveQueue:
         self._approve = approve
         self.last_params: dict | None = None
         self._entry: SimpleNamespace | None = None
+
+    async def run_operation_async(self, operation, *args, **kwargs):
+        return operation(*args, **kwargs)
 
     def request(self, namespace: str = "exec", params: dict | None = None) -> str:
         self.last_params = params
@@ -310,8 +314,11 @@ async def test_escalate_no_runtime_returns_seatbelt_denied(tmp_path: Path) -> No
     assert decision.retryable is False
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.asyncio
-async def test_approved_backend_retry_consumes_same_request_once(tmp_path: Path) -> None:
+async def test_approved_backend_retry_consumes_same_request_once(
+    tmp_path: Path, asynchronous,
+) -> None:
     queue = ApprovalQueue(db_path=str(tmp_path / "approvals.sqlite"))
     try:
         runtime = configure_runtime(
@@ -335,13 +342,18 @@ async def test_approved_backend_retry_consumes_same_request_once(tmp_path: Path)
         assert isinstance(pending, ElevationGateResult)
         queue.resolve(pending.approval_id or "", True)
 
-        approved = consume_backend_denial_retry(
+        consumer = (
+            consume_backend_denial_retry_async if asynchronous else consume_backend_denial_retry
+        )
+        approved = consumer(
             pending.approval_id,
             request,
             policy,
             runtime=runtime,
         )
 
+        if asynchronous:
+            approved = await approved
         assert approved is not None and approved.allowed is True
         assert queue.get(pending.approval_id or "").consumed is True
     finally:

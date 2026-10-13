@@ -64,6 +64,8 @@ class ProviderConnectionConfig:
     model: str = ""
     api_key: str = field(default="", repr=False)
     base_url: str = ""
+    org_id: str = ""
+    retry_after_scope_known: bool = False
 
 
 @runtime_checkable

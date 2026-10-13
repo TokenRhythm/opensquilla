@@ -71,33 +71,13 @@ def _write_manifest(webui: Path, dist: Path) -> None:
     )
 
 
-def _artifact(
-    tmp_path: Path,
-    *,
-    include_personal_audio: bool = False,
-    include_local_playlist: bool = False,
-    personal_audio_name: str = "local.mp3",
-    tracked_playlist: dict[str, object] | None = None,
-) -> tuple[Path, Path]:
+def _artifact(tmp_path: Path) -> tuple[Path, Path]:
     webui = tmp_path / "opensquilla-webui"
     dist = tmp_path / "dist"
     (webui / "src").mkdir(parents=True)
     (webui / ".node-version").write_text("22.12.0\n", encoding="utf-8")
     (webui / "package.json").write_text('{"scripts":{"build":"vite build"}}\n')
     (webui / "src/App.vue").write_text("<template>Hello</template>\n")
-    if include_personal_audio:
-        (webui / "public/music").mkdir(parents=True)
-        (webui / "public/music" / personal_audio_name).write_bytes(b"synthetic personal audio")
-    if include_local_playlist:
-        (webui / "public/music").mkdir(parents=True, exist_ok=True)
-        (webui / "public/music/playlist.local.json").write_text('{"tracks": []}\n')
-    if tracked_playlist is not None:
-        (webui / "public/music").mkdir(parents=True, exist_ok=True)
-        (webui / "public/music/playlist.json").write_text(
-            f"{json.dumps(tracked_playlist)}\n",
-            encoding="utf-8",
-        )
-
     (dist / "assets").mkdir(parents=True)
     synthetic_entrypoint = (
         '<script type="module" src="assets/app.js"></script>'
@@ -107,18 +87,6 @@ def _artifact(
         (dist / entrypoint_name).write_text(synthetic_entrypoint, encoding="utf-8")
     (dist / "assets/app.js").write_text("console.log('hello')\n", encoding="utf-8")
     (dist / "assets/app.css").write_text("body { color: black; }\n", encoding="utf-8")
-    if include_personal_audio:
-        (dist / "music").mkdir()
-        (dist / "music" / personal_audio_name).write_bytes(b"synthetic personal audio")
-    if include_local_playlist:
-        (dist / "music").mkdir(exist_ok=True)
-        (dist / "music/playlist.local.json").write_text('{"tracks": []}\n')
-    if tracked_playlist is not None:
-        (dist / "music").mkdir(exist_ok=True)
-        (dist / "music/playlist.json").write_text(
-            f"{json.dumps(tracked_playlist)}\n",
-            encoding="utf-8",
-        )
     _write_manifest(webui, dist)
     return webui, dist
 
@@ -145,15 +113,15 @@ def test_verify_dist_rejects_artifact_after_source_changes(tmp_path: Path) -> No
         verify_dist(dist, webui_root=webui)
 
 
-def test_source_fingerprint_ignores_ds_store_but_tracks_personal_bgm(
+def test_source_fingerprint_ignores_metadata_and_retired_media(
     tmp_path: Path,
 ) -> None:
     webui, _ = _artifact(tmp_path)
     baseline = source_fingerprint(webui)
 
     (webui / "src/.DS_Store").write_bytes(b"Finder metadata")
-    (webui / "public").mkdir()
-    (webui / "public/.DS_Store").write_bytes(b"more Finder metadata")
+    (webui / "public-assets").mkdir()
+    (webui / "public-assets/.DS_Store").write_bytes(b"more Finder metadata")
     assert source_fingerprint(webui) == baseline
 
     env_file = webui / ".env.production"
@@ -165,8 +133,12 @@ def test_source_fingerprint_ignores_ds_store_but_tracks_personal_bgm(
     env_file.unlink()
 
     music = webui / "public/music"
-    music.mkdir()
-    (music / "private.mp3").write_bytes(b"private audio")
+    music.mkdir(parents=True)
+    (music / "private.mp3").write_bytes(b"synthetic private audio")
+    (music / "playlist.local.json").write_bytes(b"invalid legacy JSON")
+    assert source_fingerprint(webui) == baseline
+
+    (webui / "public-assets/brand.png").write_bytes(b"synthetic public image")
     assert source_fingerprint(webui) != baseline
 
 
@@ -203,57 +175,32 @@ def test_verify_dist_rejects_metadata_and_sensitive_files(
         verify_dist(dist, webui_root=webui)
 
 
-def test_personal_audio_is_local_only_not_globally_forbidden(tmp_path: Path) -> None:
-    webui, dist = _artifact(tmp_path, include_personal_audio=True)
-
-    files = verify_dist(dist, webui_root=webui)
-    assert files["music/local.mp3"] == b"synthetic personal audio"
-
-    with pytest.raises(ArtifactError, match="forbidden in official WebUI artifacts"):
-        verify_dist(dist, webui_root=webui, forbid_personal_bgm=True)
-
-
-def test_official_guard_rejects_audio_extensions_outside_the_documented_list(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "music/local.mp3",
+        "music/album/voice.aac",
+        "music/playlist.local.json",
+        "music/playlist.json",
+        "music/README.md",
+        "music",
+        "Music/track.wav",
+        "music.",
+        "music ",
+        r"music\private.aac",
+    ),
+)
+def test_verify_dist_rejects_retired_media_without_an_opt_in(
+    tmp_path: Path, relative: str,
 ) -> None:
-    webui, dist = _artifact(
-        tmp_path,
-        include_personal_audio=True,
-        personal_audio_name="voice.aac",
-    )
+    webui, dist = _artifact(tmp_path)
+    target = dist / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("synthetic private content\n", encoding="utf-8")
+    _write_manifest(webui, dist)
 
-    assert "music/voice.aac" in verify_dist(dist, webui_root=webui)
-    with pytest.raises(ArtifactError, match="music/voice.aac"):
-        verify_dist(dist, webui_root=webui, forbid_personal_bgm=True)
-
-
-def test_local_playlist_override_is_forbidden_only_in_official_artifacts(
-    tmp_path: Path,
-) -> None:
-    webui, dist = _artifact(tmp_path, include_local_playlist=True)
-
-    assert "music/playlist.local.json" in verify_dist(dist, webui_root=webui)
-    with pytest.raises(ArtifactError, match="playlist.local.json"):
-        verify_dist(dist, webui_root=webui, forbid_personal_bgm=True)
-
-
-def test_official_guard_rejects_tracks_in_the_tracked_playlist(tmp_path: Path) -> None:
-    webui, dist = _artifact(
-        tmp_path,
-        tracked_playlist={
-            "tracks": [
-                {
-                    "id": "private-stream",
-                    "title": "Private stream",
-                    "src": "https://example.com/private.mp3",
-                }
-            ]
-        },
-    )
-
-    assert "music/playlist.json" in verify_dist(dist, webui_root=webui)
-    with pytest.raises(ArtifactError, match="must keep its tracks list empty"):
-        verify_dist(dist, webui_root=webui, forbid_personal_bgm=True)
+    with pytest.raises(ArtifactError, match="forbidden metadata or sensitive files"):
+        verify_dist(dist, webui_root=webui)
 
 
 def test_invalid_manifest_and_entrypoint_return_actionable_artifact_errors(
@@ -273,7 +220,14 @@ def test_invalid_manifest_and_entrypoint_return_actionable_artifact_errors(
         verify_dist(dist, webui_root=webui)
 
 
-def test_verify_wheel_requires_byte_identical_artifact(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "unexpected",
+    [
+        "unexpected.txt", "music/private.mp3", "music/", "music./private.aac",
+        "music /", "./music/", r"music\private.aac",
+    ],
+)
+def test_verify_wheel_requires_byte_identical_artifact(tmp_path: Path, unexpected: str) -> None:
     webui, dist = _artifact(tmp_path)
     wheel = tmp_path / "opensquilla-0-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
@@ -284,8 +238,11 @@ def test_verify_wheel_requires_byte_identical_artifact(tmp_path: Path) -> None:
     verify_wheel(dist, wheel, webui_root=webui)
 
     with zipfile.ZipFile(wheel, "a") as archive:
-        archive.writestr(f"{WHEEL_PREFIX}unexpected.txt", "not allowed")
-    with pytest.raises(ArtifactError, match="file set differs"):
+        archive.writestr(f"{WHEEL_PREFIX}{unexpected}", "not allowed")
+    expected_error = (
+        "file set differs" if unexpected == "unexpected.txt" else "forbidden retired media paths"
+    )
+    with pytest.raises(ArtifactError, match=expected_error):
         verify_wheel(dist, wheel, webui_root=webui)
 
 
@@ -297,7 +254,7 @@ def test_node_and_python_source_fingerprints_share_order_and_line_endings(
     """Run the cross-runtime Node probe alone on process-constrained runners."""
     webui = tmp_path / "opensquilla-webui"
     source = webui / "src"
-    public = webui / "public"
+    public = webui / "public-assets"
     source.mkdir(parents=True)
     public.mkdir()
     (webui / ".node-version").write_text("22.12.0\n", encoding="utf-8")
@@ -310,6 +267,10 @@ def test_node_and_python_source_fingerprints_share_order_and_line_endings(
     (source / "😀.vue").write_bytes(b"<template>emoji</template>\r\n")
     (public / "site.webmanifest").write_bytes(b'{"name":"OpenSquilla"}\r\n')
     (source / ".DS_Store").write_bytes(b"ignored metadata")
+    retired = webui / "public/music"
+    retired.mkdir(parents=True)
+    (retired / "private.aac").write_bytes(b"synthetic private audio")
+    (retired / "playlist.local.json").write_bytes(b"invalid legacy JSON")
 
     script = (
         f"import {{ sourceFingerprint }} from {json.dumps(NODE_VERIFIER.as_uri())};"
@@ -457,39 +418,29 @@ def test_python_accepts_node_manifest_with_unicode_artifact_names(
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
-def test_node_official_guard_rejects_tracks_in_the_tracked_playlist(
-    tmp_path: Path, isolated_node_verifier: Path
+@pytest.mark.parametrize(
+    "relative",
+    ["music/playlist.json", "music/private.aac", "music", "music.", r"music\private.aac"],
+)
+def test_node_verifier_rejects_retired_media_without_an_opt_in(
+    tmp_path: Path, isolated_node_verifier: Path, relative: str,
 ) -> None:
     dist = tmp_path / "dist"
     (dist / "assets").mkdir(parents=True)
-    (dist / "music").mkdir()
     (dist / "assets/app.js").write_text("console.log('hello')\n", encoding="utf-8")
     (dist / "assets/app.css").write_text("body{}\n", encoding="utf-8")
-    (dist / "index.html").write_text(
+    entrypoint = (
         '<script type="module" src="assets/app.js"></script>'
-        '<link rel="stylesheet" href="assets/app.css">',
-        encoding="utf-8",
+        '<link rel="stylesheet" href="assets/app.css">'
     )
-    (dist / "desktop.html").write_text(
-        '<script type="module" src="assets/app.js"></script>'
-        '<link rel="stylesheet" href="assets/app.css">',
-        encoding="utf-8",
-    )
-    (dist / "music/playlist.json").write_text(
-        '{"tracks":[{"id":"private","src":"https://example.com/private.mp3"}]}\n',
-        encoding="utf-8",
-    )
-    subprocess.run(
-        ["node", str(isolated_node_verifier), "--write", str(dist)],
-        cwd=isolated_node_verifier.parent.parent,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    for name in ("index.html", "desktop.html"):
+        (dist / name).write_text(entrypoint, encoding="utf-8")
+    target = dist / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("synthetic private content\n", encoding="utf-8")
 
     result = subprocess.run(
-        ["node", str(isolated_node_verifier), "--forbid-personal-bgm", str(dist)],
+        ["node", str(isolated_node_verifier), "--write", str(dist)],
         cwd=isolated_node_verifier.parent.parent,
         check=False,
         capture_output=True,
@@ -497,4 +448,51 @@ def test_node_official_guard_rejects_tracks_in_the_tracked_playlist(
         timeout=30,
     )
     assert result.returncode != 0
-    assert "must keep its tracks list empty" in result.stderr
+    assert "forbidden metadata or sensitive files" in result.stderr
+    assert "music" in result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_fingerprints_do_not_follow_retired_media_symlinks(tmp_path: Path) -> None:
+    webui, _ = _artifact(tmp_path)
+    baseline = source_fingerprint(webui)
+    retired = webui / "public/music"
+    retired.parent.mkdir(parents=True)
+    try:
+        retired.symlink_to(tmp_path / "missing-personal-library", target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    script = (
+        f"import {{ sourceFingerprint }} from {json.dumps(NODE_VERIFIER.as_uri())};"
+        "console.log(sourceFingerprint(process.argv[1]));"
+    )
+    result = subprocess.run(
+        ["node", "--input-type=module", "--eval", script, str(webui)],
+        check=True, capture_output=True, text=True, timeout=30,
+    )
+    assert source_fingerprint(webui) == baseline
+    assert result.stdout.strip() == baseline
+
+
+@pytest.mark.parametrize(
+    "relative", ["music", "music/empty/nested", "Music", "music.", "music "],
+)
+def test_verifiers_reject_empty_retired_media_directories(tmp_path: Path, relative: str) -> None:
+    webui, dist = _artifact(tmp_path)
+    (dist / relative).mkdir(parents=True)
+    with pytest.raises(ArtifactError, match="forbidden metadata or sensitive files"):
+        verify_dist(dist, webui_root=webui)
+
+    if shutil.which("node") is None:
+        return
+    script = (
+        f"import {{ verifyDist }} from {json.dumps(NODE_VERIFIER.as_uri())};"
+        "verifyDist(process.argv[1], { sourceRoot: process.argv[2] });"
+    )
+    result = subprocess.run(
+        ["node", "--input-type=module", "--eval", script, str(dist), str(webui)],
+        check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0
+    assert "forbidden metadata or sensitive files" in result.stderr

@@ -52,7 +52,7 @@ def _ctx(config: GatewayConfig, current: ProviderConfig) -> SimpleNamespace:
     )
 
 
-def test_explicit_compaction_pair_uses_its_complete_profile() -> None:
+def test_deprecated_compaction_pair_does_not_override_current_session() -> None:
     config = GatewayConfig()
     config.compaction.provider = "openai"
     config.compaction.model = "gpt-explicit"
@@ -74,19 +74,19 @@ def test_explicit_compaction_pair_uses_its_complete_profile() -> None:
 
     target = resolve_gateway_compaction_target(ctx, session)
 
-    assert target.provider_id == "openai"
-    assert target.model == "gpt-explicit"
-    assert target.source == "explicit_compaction"
+    assert target.provider_id == "ollama"
+    assert target.model == "qwen-session"
+    assert target.source == "session_override"
     assert target.plan is not None
-    assert target.plan.primary.provider_id == "openai"
+    assert target.plan.primary.provider_id == "ollama"
     assert target.plan.primary.context_window_tokens > 0
     assert target.plan.primary.provider_request_max_chars > 0
     connection = provider_connection_config(target.provider)
-    assert connection.api_key == "explicit-profile-secret"
-    assert connection.base_url == "https://api.openai.com/v1"
+    assert not connection.api_key
+    assert connection.base_url == "http://127.0.0.1:11434"
     assert "explicit-profile-secret" not in repr(target)
     assert "explicit-profile-secret" not in repr(target.plan)
-    assert ctx.provider_selector.clone_calls == 0
+    assert ctx.provider_selector.clone_calls == 1
     assert current.model == "qwen-current"
     assert current.replay_provider_state is True
 
@@ -106,11 +106,11 @@ def test_model_only_compaction_stays_on_current_provider() -> None:
     target = resolve_gateway_compaction_target(ctx, session)
 
     assert target.provider_id == "openai"
-    assert target.model == "gpt-summary"
-    assert target.source == "selector_current"
+    assert target.model == "gpt-turn"
+    assert target.source == "selector_base"
     assert target.plan is not None
     assert provider_connection_config(target.provider).api_key == "current-provider-secret"
-    assert ctx.provider_selector.clone_calls == 0
+    assert ctx.provider_selector.clone_calls == 1
     assert current.model == "gpt-turn"
     assert current.replay_provider_state is True
 
@@ -129,18 +129,18 @@ def test_model_only_compaction_ignores_stale_session_provider_provenance() -> No
         session_key="agent:main:webchat:model-only-stale",
         provider_override=None,
         model_provider="anthropic",
-        model_override=None,
-        model="claude-stale",
+        model_override="claude-stale",
+        model="gpt-turn",
     )
 
     target = resolve_gateway_compaction_target(ctx, session)
 
     assert target.provider_id == "openai"
-    assert target.model == "gpt-summary"
-    assert target.source == "selector_current"
+    assert target.model == "gpt-turn"
+    assert target.source == "session_model"
     assert target.plan is not None
     assert provider_connection_config(target.provider).api_key == "current-provider-secret"
-    assert ctx.provider_selector.clone_calls == 0
+    assert ctx.provider_selector.clone_calls == 1
 
 
 def test_manual_consumer_budget_uses_stable_base_not_last_routed_model() -> None:
@@ -320,7 +320,7 @@ def test_manual_compaction_uses_exact_credential_limits(
     assert target.plan is not None
     assert target.plan.primary.context_window_tokens == (configured_window or 64_000)
     assert target.plan.primary.max_generation_tokens == 8192
-    assert target.plan.primary.max_output_tokens == 1024
+    assert target.plan.primary.max_output_tokens == budget.max_output_tokens
 
 
 @pytest.mark.parametrize("writer_provider,configured_output,known_window,expected_output", [
@@ -331,12 +331,12 @@ def test_manual_compaction_uses_exact_credential_limits(
     ("openrouter", 8192, True, 3072),
     ("openrouter", 8192, False, 3072),
 ])
-def test_manual_writer_generation_budget_is_separate_from_body_and_consumer(
+def test_manual_writer_uses_current_consumer_generation_budget(
     monkeypatch: pytest.MonkeyPatch, writer_provider: str, configured_output: int,
     known_window: bool, expected_output: int,
 ) -> None:
     from opensquilla.provider.model_catalog import ModelCatalog
-    from opensquilla.session.compaction import _build_prefix_compaction_call
+    from opensquilla.session.compaction import _build_suffix_compaction_call
 
     catalog = ModelCatalog()
     writer_limits = {"max_output_tokens": 3072}
@@ -349,8 +349,8 @@ def test_manual_writer_generation_budget_is_separate_from_body_and_consumer(
     ):
         monkeypatch.setattr(f"{module}.shared_catalog", lambda: catalog)
     config = GatewayConfig(llm={
-        "provider": "openai", "model": "synthetic-base", "api_key": "synthetic-key",
-        "context_window_tokens": 64_000, "max_tokens": configured_output,
+        "provider": writer_provider, "model": "synthetic-writer", "api_key": "synthetic-key",
+        "context_window_tokens": 32_000 if known_window else 0, "max_tokens": configured_output,
     })
     config.compaction.provider = writer_provider
     config.compaction.model = "synthetic-writer"
@@ -359,7 +359,7 @@ def test_manual_writer_generation_budget_is_separate_from_body_and_consumer(
     )
     target = resolve_gateway_compaction_target(
         _ctx(config, ProviderConfig(
-            provider="openai", model="synthetic-base", api_key="synthetic-key",
+            provider=writer_provider, model="synthetic-writer", api_key="synthetic-key",
         )),
         SimpleNamespace(session_key="agent:main:webchat:writer-generation"),
     )
@@ -367,14 +367,17 @@ def test_manual_writer_generation_budget_is_separate_from_body_and_consumer(
     assert target.plan is not None
     writer = target.plan.primary
     assert writer.provider_id == writer_provider
-    assert writer.max_output_tokens == 1024
+    assert writer.max_output_tokens == expected_output
     assert writer.max_generation_tokens == expected_output
-    _, sent = _build_prefix_compaction_call(
-        writer, "synthetic history", "", None, timeout=30,
-        request_context=None, provider_request_correlation=None,
+    messages, _, sent = _build_suffix_compaction_call(
+        None, [{"role": "user", "content": "synthetic history"}], "", "", None,
+        provider=writer.provider, deployment=writer,
+        context_window_tokens=(writer.context_window_tokens if known_window else 0),
+        summary_output_tokens=writer.max_output_tokens, timeout=30,
+        provider_request_correlation=None,
     )
     assert sent.max_tokens == expected_output
-    assert "within 1024 tokens" in sent.system
+    assert "1024" not in str(messages[-1].content)
     if not known_window:
         assert writer.context_window_source == "bounded_fallback"
         assert sent.provider_context_window_tokens == 0
@@ -476,7 +479,8 @@ def test_manual_consumer_uses_adapter_generation_cap_once_for_thinking() -> None
     assert isinstance(budget.provider, AnthropicProvider)
     # This adapter raises max_tokens to thinking + 4096. The resulting cap
     # already includes reasoning and must not reserve another 10000 tokens.
-    assert budget.max_output_tokens == 14_096
+    assert budget.max_output_tokens == 1024
+    assert budget.generation_reserve_tokens == 14_096
     assert budget.provider_request_max_chars == (64_000 - 20_000 - 14_096) * 4
     assert budget.provider_request_max_chars_explicit_cap == 0
     admission, _ = build_gateway_consumer_admission(budget)
@@ -680,12 +684,12 @@ def test_unavailable_explicit_target_falls_through_to_current_deployment() -> No
 
     assert target.provider_id == "ollama"
     assert target.model == "qwen-current"
-    assert target.source == "selector_current"
+    assert target.source == "selector_base"
     assert target.plan is not None
-    assert ctx.provider_selector.clone_calls == 0
+    assert ctx.provider_selector.clone_calls == 1
 
 
-def test_manual_target_freezes_authorized_fallback_chain() -> None:
+def test_manual_target_does_not_inherit_selector_fallback_chain() -> None:
     config = GatewayConfig()
     current = ProviderConfig(
         provider="openai",
@@ -717,16 +721,15 @@ def test_manual_target_freezes_authorized_fallback_chain() -> None:
         (candidate.provider_id, candidate.model, candidate.source)
         for candidate in target.plan.candidates
     ] == [
-        ("openai", "qwen-current", "selector_current"),
-        ("openai", "qwen-fallback", "selector_fallback"),
+        ("openai", "qwen-current", "selector_base"),
     ]
     assert [
         provider_connection_config(candidate.provider).api_key
         for candidate in target.plan.candidates
-    ] == ["primary-secret", "fallback-secret"]
+    ] == ["primary-secret"]
 
 
-def test_manual_target_preserves_credential_distinct_same_model_fallback() -> None:
+def test_manual_target_does_not_switch_to_another_credential() -> None:
     config = GatewayConfig()
     current = ProviderConfig(
         provider="openai",
@@ -757,17 +760,14 @@ def test_manual_target_preserves_credential_distinct_same_model_fallback() -> No
     assert [
         provider_connection_config(candidate.provider).api_key
         for candidate in target.plan.candidates
-    ] == ["primary-secret", "fallback-secret"]
-    assert (
-        target.plan.candidates[0].deployment_fingerprint
-        != target.plan.candidates[1].deployment_fingerprint
-    )
+    ] == ["primary-secret"]
+    assert len(target.plan.candidates) == 1
     rendered = repr(target.plan)
     assert "primary-secret" not in rendered
     assert "fallback-secret" not in rendered
 
 
-def test_unavailable_session_target_falls_through_to_current_deployment() -> None:
+def test_unavailable_pinned_session_target_fails_closed() -> None:
     config = GatewayConfig()
     current = ProviderConfig(
         provider="ollama",
@@ -785,14 +785,15 @@ def test_unavailable_session_target_falls_through_to_current_deployment() -> Non
 
     target = resolve_gateway_compaction_target(ctx, session)
 
-    assert target.provider_id == "ollama"
-    assert target.model == "qwen-current"
-    assert target.source == "selector_current"
-    assert target.plan is not None
-    assert ctx.provider_selector.clone_calls == 0
+    assert target.provider_id == "provider-that-does-not-exist"
+    assert target.model == "stale-model"
+    assert target.source == "session_override"
+    assert target.plan is None
+    assert target.blocked_reason == "unknown_provider"
+    assert ctx.provider_selector.clone_calls == 1
 
 
-def test_unavailable_current_target_uses_authorized_selector_fallback() -> None:
+def test_unavailable_current_target_does_not_activate_selector_fallback() -> None:
     config = GatewayConfig()
     current = ProviderConfig(
         provider="provider-that-does-not-exist",
@@ -823,11 +824,12 @@ def test_unavailable_current_target_uses_authorized_selector_fallback() -> None:
         SimpleNamespace(session_key="agent:main:webchat:selector-fallback"),
     )
 
-    assert target.provider is fallback
-    assert target.provider_id == "ollama"
-    assert target.model == "qwen-fallback"
-    assert target.source == "selected_provider_compat"
-    assert target.plan is not None
+    assert target.provider is None
+    assert target.provider_id == "provider-that-does-not-exist"
+    assert target.model == "unavailable-current"
+    assert target.source == "selector_base"
+    assert target.plan is None
+    assert target.blocked_reason == "unknown_provider"
     assert selector.clone_calls == 1
 
 
@@ -862,7 +864,7 @@ def test_named_session_auth_profile_fails_closed_when_exact_profile_is_missing()
     assert target.plan is None
     assert session.provider_override == "openai"
     assert session.auth_profile_override == "profile-a"
-    assert ctx.provider_selector.clone_calls == 0
+    assert ctx.provider_selector.clone_calls == 1
 
     consumer = resolve_gateway_consumer_budget(ctx, session)
     admission, _fingerprint = build_gateway_consumer_admission(consumer)
@@ -985,9 +987,10 @@ def test_named_session_auth_profile_binds_complete_manual_deployment() -> None:
     assert consumer.deployment_fingerprint
 
 
-def test_named_profile_consumer_prefers_recorded_physical_pair_over_base() -> None:
+def test_named_profile_consumer_uses_stable_profile_not_recorded_model() -> None:
     config = GatewayConfig()
     config.llm_profiles["openai:work"] = LlmProviderProfile(
+        model="gpt-stable",
         api_key="named-profile-secret",
         base_url="https://api.openai.com/v1",
     )
@@ -1011,7 +1014,7 @@ def test_named_profile_consumer_prefers_recorded_physical_pair_over_base() -> No
 
     assert target.blocked_reason == ""
     assert target.provider_id == "openai"
-    assert target.model == "gpt-session"
+    assert target.model == "gpt-stable"
     assert consumer.blocked_reason == ""
     assert consumer.source == "session_auth_profile"
     assert consumer.provider_id == target.provider_id
@@ -1196,18 +1199,18 @@ def test_explicit_compaction_deployment_uses_matching_named_auth_profile() -> No
 
     target = resolve_gateway_compaction_target(ctx, session)
 
-    assert target.source == "explicit_compaction_auth_profile"
+    assert target.source == "session_auth_profile"
     assert target.blocked_reason == ""
     assert target.plan is not None
     assert target.provider_id == "openai"
-    assert target.model == "gpt-summary"
+    assert target.model == "gpt-session"
     assert (
         provider_connection_config(target.provider).api_key
         == "compaction-profile-secret"
     )
 
 
-def test_explicit_compaction_provider_rejects_named_profile_provider_mismatch() -> None:
+def test_deprecated_compaction_provider_does_not_change_named_profile_boundary() -> None:
     config = GatewayConfig()
     config.compaction.provider = "openai"
     config.compaction.model = "gpt-summary"
@@ -1233,12 +1236,12 @@ def test_explicit_compaction_provider_rejects_named_profile_provider_mismatch() 
 
     target = resolve_gateway_compaction_target(_ctx(config, current), session)
 
-    assert target.provider is None
-    assert target.plan is None
-    assert target.provider_id == "openai"
-    assert target.model == "gpt-summary"
-    assert target.source == "auth_profile_unresolved"
-    assert target.blocked_reason == "named_auth_profile_provider_mismatch"
+    assert isinstance(target.provider, AnthropicProvider)
+    assert target.plan is not None
+    assert target.provider_id == "anthropic"
+    assert target.model == "claude-session"
+    assert target.source == "session_auth_profile"
+    assert target.blocked_reason == ""
 
 
 def test_bare_named_profile_uses_explicit_provider_boundary() -> None:
@@ -1262,8 +1265,8 @@ def test_bare_named_profile_uses_explicit_provider_boundary() -> None:
     target = resolve_gateway_compaction_target(_ctx(config, current), session)
 
     assert target.blocked_reason == ""
-    assert target.provider_id == "openai"
-    assert target.model == "gpt-summary"
+    assert target.provider_id == "ollama"
+    assert target.model == "qwen-current"
     assert (
         provider_connection_config(target.provider).api_key
         == "bare-profile-secret"
@@ -1298,7 +1301,7 @@ def test_named_profile_never_falls_back_to_inherited_or_registry_credential(
     assert target.blocked_reason == "missing_credential"
 
 
-def test_recorded_physical_pair_prevents_provider_model_misbinding() -> None:
+def test_idle_manual_uses_selected_session_pair_not_recorded_previous_pair() -> None:
     config = GatewayConfig()
     config.llm_profiles["openai"] = LlmProviderProfile(
         api_key="explicit-provider-secret",
@@ -1325,16 +1328,16 @@ def test_recorded_physical_pair_prevents_provider_model_misbinding() -> None:
 
     target = resolve_gateway_compaction_target(ctx, session)
 
-    assert target.provider_id == "anthropic"
-    assert target.model == "claude-recorded"
-    assert target.source == "session_model_provider"
+    assert target.provider_id == "openai"
+    assert target.model == "gpt-explicit"
+    assert target.source == "session_override"
     assert (
         provider_connection_config(target.provider).api_key
-        == "recorded-provider-secret"
+        == "explicit-provider-secret"
     )
 
 
-def test_recorded_model_provider_binds_session_model() -> None:
+def test_idle_manual_without_session_choice_uses_stable_base() -> None:
     config = GatewayConfig()
     config.llm_profiles["openai"] = LlmProviderProfile(
         api_key="routed-provider-secret",
@@ -1350,16 +1353,16 @@ def test_recorded_model_provider_binds_session_model() -> None:
         session_key="agent:main:webchat:routed",
         provider_override=None,
         model_provider="openai",
-        model_override=None,
-        model="gpt-routed",
+        model_override="gpt-routed",
+        model=None,
     )
 
     target = resolve_gateway_compaction_target(ctx, session)
 
-    assert target.provider_id == "openai"
-    assert target.model == "gpt-routed"
-    assert target.source == "session_model_provider"
-    assert provider_connection_config(target.provider).api_key == "routed-provider-secret"
+    assert target.provider_id == "ollama"
+    assert target.model == "qwen-current"
+    assert target.source == "selector_base"
+    assert not provider_connection_config(target.provider).api_key
 
 
 def test_compaction_config_uses_resolved_execution_plan() -> None:

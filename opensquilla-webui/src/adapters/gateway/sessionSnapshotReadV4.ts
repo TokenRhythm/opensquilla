@@ -35,6 +35,7 @@ interface SnapshotReader {
   acknowledgeDelivery?(receipt: SnapshotDeliveryReceipt): Promise<void> | void
   resumeFlow?(receipt: SnapshotInstalledReceipt): Promise<void> | void
   recoveryVersion?(key: string): string
+  snapshotInstalled?(key: string, version: string): void
   waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void>
   failProtocol?(generation: number): void
 }
@@ -303,6 +304,9 @@ export function createV4SessionSnapshotTransfer(
           installed = true
           clearTimeout(timer)
           staging = null
+          // Installation already has server and consumer proof. An optional
+          // local credit callback must not turn that success into another read.
+          try { if (version !== undefined) rpc.snapshotInstalled?.(key, version) } catch { /* Keep unacknowledged credit conservative. */ }
         }
       },
     }

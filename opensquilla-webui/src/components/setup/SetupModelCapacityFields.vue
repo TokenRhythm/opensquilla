@@ -6,7 +6,7 @@ import { parseCapacity, type CapacityField, type CapacityValues } from '@/compos
 
 const { t } = useI18n()
 const id = useId()
-const props = defineProps<{ row: ModelCapacity; modelValue: CapacityValues; disabled?: boolean }>()
+const props = defineProps<{ row: ModelCapacity; modelValue: CapacityValues; disabled?: boolean; hideIdentity?: boolean }>()
 const emit = defineEmits<{ 'update:modelValue': [value: CapacityValues] }>()
 const fields: CapacityField[] = ['contextWindow', 'maxOutputTokens']
 const canReset = computed(() => fields.some(field => props.row[field].editable && props.modelValue[field] !== ''))
@@ -40,7 +40,7 @@ function reset() {
 
 <template>
   <div class="model-capacity-fields">
-    <p class="model-capacity-fields__identity">{{ row.provider }} · {{ row.model }}</p>
+    <p v-if="!hideIdentity" class="model-capacity-fields__identity">{{ row.provider }} · {{ row.model }}</p>
     <p class="control-section__desc">{{ t('setup.capacity.scope') }}</p>
     <label v-for="field in fields" :key="field" class="model-capacity-fields__row">
       <span class="control-row__label-block">

@@ -4,6 +4,7 @@ import type {
   SandboxSetupOutcome,
 } from '@/modules/sandboxRuntime'
 import type {
+  SandboxCapabilityReport,
   SandboxRunMode,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
@@ -19,6 +20,8 @@ export interface UseSandboxSetupRecoveryOptions {
 
 export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions) {
   const status = ref<SandboxSetupStatusPayload | null>(null)
+  const capability = ref<SandboxCapabilityReport | null>(null)
+  const available = computed(() => capability.value?.available === true)
   const resolved = ref(false)
   const loading = ref(false)
   const ensuring = ref(false)
@@ -33,12 +36,14 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
   const visible = computed(() =>
     active.value
     && options.runMode.value !== 'full'
+    && !available.value
     && !dismissed.value
     && status.value !== null
     && status.value.state !== 'ready')
   const isWindows = computed(() => status.value?.platform.toLowerCase().startsWith('win') === true)
   const canSetup = computed(() =>
-    isWindows.value && status.value?.state === 'not_setup')
+    isWindows.value
+    && ['not_setup', 'failed', 'ready'].includes(status.value?.state ?? ''))
 
   function clearPoll() {
     if (pollTimer) clearTimeout(pollTimer)
@@ -62,11 +67,13 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
   async function refresh() {
     if (!active.value) return
     const generation = ++requestGeneration
-    loading.value = status.value === null
+    loading.value = true
     clearPoll()
     try {
-      const payload = (await options.sandbox.readiness()).status
+      const readiness = await options.sandbox.readiness()
+      const payload = readiness.status
       if (generation !== requestGeneration) return
+      capability.value = readiness.capability
       if (!payload) {
         // Keep following an already-authoritative setting_up state when a
         // transient/malformed response cannot advance it. schedulePoll remains
@@ -96,12 +103,15 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
   async function ensureSetup(): Promise<boolean> {
     if (!canSetup.value || ensuring.value) return false
     const generation = ++requestGeneration
+    // Setup owns this generation; an older read can no longer clear its flag.
+    loading.value = false
     ensuring.value = true
     error.value = ''
     clearPoll()
     try {
       const result = await options.sandbox.ensureReady()
       if (generation !== requestGeneration) return false
+      capability.value = result.capability
       if (result.status) applyStatus(result.status)
       outcome.value = result.outcome
       return result.ready
@@ -124,6 +134,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
       }
       else {
         status.value = null
+        capability.value = null
         resolved.value = false
         lastState = ''
         loading.value = false
@@ -147,6 +158,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
 
   return {
     status,
+    available,
     resolved,
     loading,
     ensuring,

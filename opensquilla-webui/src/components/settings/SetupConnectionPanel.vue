@@ -6,11 +6,7 @@ import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 const props = withDefaults(defineProps<{ managed?: boolean }>(), { managed: false })
 const { t } = useI18n()
 
-// Gateway connection editor. This is the one Settings section that must work
-// while the gateway is NOT connected — it is exactly how you point the UI at a
-// reachable gateway. It therefore owns its own form state and talks only to the
-// Gateway Access seam; it never depends on catalog/readiness RPCs, so
-// it renders outside SettingsDialog's `!loaded` gate.
+// Connection recovery must work without catalog/readiness RPCs.
 const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
 if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
 const gatewayAccess = injectedGatewayAccess
@@ -18,6 +14,8 @@ const gatewayAccess = injectedGatewayAccess
 const wsUrl = ref('')
 const wsToken = ref('')
 const tokenInput = ref<HTMLInputElement | null>(null)
+const connectionEditorOpen = ref(false)
+const connectionEditorInteracted = ref(false)
 const requiresCredential = computed(() => !props.managed && gatewayAccess.requiresCredential)
 
 watch(requiresCredential, required => {
@@ -47,6 +45,22 @@ const transportPhase = computed(() => {
   return gatewayAccess.availability === 'preparing' ? 'checking' : 'disconnected'
 })
 
+// Show recovery controls immediately; preserve an editor the user has touched.
+const needsRecovery = computed(() => transportPhase.value !== 'healthy'
+  || requiresCredential.value || !!gatewayAccess.connectionError)
+
+watch([transportPhase, requiresCredential, () => gatewayAccess.connectionError], () => {
+  if (needsRecovery.value) {
+    connectionEditorOpen.value = true
+  } else if (!connectionEditorInteracted.value) {
+    connectionEditorOpen.value = false
+  }
+}, { immediate: true })
+
+function syncConnectionEditor(event: Event) {
+  connectionEditorOpen.value = (event.currentTarget as HTMLDetailsElement).open
+}
+
 const statusPillClass = computed(() => {
   if (statusState.value === 'connected') return 'ok'
   if (statusState.value === 'connecting') return 'warn'
@@ -68,9 +82,12 @@ const statusReason = computed(() => {
   if (gatewayAccess.connectionError) {
     return t('setup.connection.reasonFailed', { error: gatewayAccess.connectionError })
   }
-  if (statusState.value === 'connected') return t('setup.connection.reasonConnected')
+  if (statusState.value === 'connected') {
+    return (!props.managed && gatewayAccess.connectedGatewayHost)
+      || t('setup.connection.reasonConnected')
+  }
   if (statusState.value === 'connecting') return t('setup.connection.reasonConnecting')
-  return t('setup.connection.reasonDisconnected')
+  return t(props.managed ? 'setup.connection.reasonManagedDisconnected' : 'setup.connection.reasonDisconnected')
 })
 
 function connect() {
@@ -88,7 +105,7 @@ function disconnect() {
   <section class="control-section">
     <div class="control-section__head">
       <h3 class="control-section__title">{{ t('setup.connection.title') }}</h3>
-      <p class="control-section__desc">{{ t(managed ? 'setup.runtime.desc' : 'setup.connection.desc') }}</p>
+      <p v-if="!managed" class="control-section__desc">{{ t('setup.connection.desc') }}</p>
     </div>
 
     <div class="conn-status" :class="statusPillClass" role="status" aria-live="polite">
@@ -96,54 +113,78 @@ function disconnect() {
       <span class="conn-status__reason">{{ statusReason }}</span>
     </div>
 
-    <div v-if="!managed" class="control-row control-row--stack">
-      <div class="control-row__label-block">
-        <label class="control-row__label" for="conn-ws-url">{{ t('setup.connection.wsUrlLabel') }}</label>
-        <span class="control-row__desc">{{ t('setup.connection.wsUrlDesc') }} <code>ws://host:port/ws</code></span>
-      </div>
-      <div class="control-row__control">
-        <input
-          id="conn-ws-url"
-          v-model="wsUrl"
-          class="control-input conn-input--mono"
-          type="text"
-          placeholder="ws://..."
-          autocomplete="off"
-          spellcheck="false"
-        >
-      </div>
-    </div>
+    <details
+      id="settings-connection-details"
+      :open="connectionEditorOpen"
+      class="conn-editor"
+      @toggle="syncConnectionEditor"
+      @input="connectionEditorInteracted = true"
+      @focusin="connectionEditorInteracted = true"
+    >
+      <summary @click="connectionEditorInteracted = true">{{ t(managed ? 'setup.connection.actions' : 'setup.connection.editConnection') }}</summary>
 
-    <div v-if="!managed" class="control-row control-row--stack">
-      <div class="control-row__label-block">
-        <label class="control-row__label" for="conn-ws-token">{{ t('setup.connection.tokenLabel') }} <span v-if="!requiresCredential" class="conn-optional">{{ t('setup.connection.optional') }}</span></label>
-        <span class="control-row__desc">{{ t('setup.connection.tokenDesc') }}</span>
+      <div v-if="!managed" class="control-row control-row--stack">
+        <div class="control-row__label-block">
+          <label class="control-row__label" for="conn-ws-url">{{ t('setup.connection.wsUrlLabel') }}</label>
+          <span class="control-row__desc">{{ t('setup.connection.wsUrlDesc') }} <code>ws://host:port/ws</code></span>
+        </div>
+        <div class="control-row__control">
+          <input
+            id="conn-ws-url"
+            v-model="wsUrl"
+            class="control-input conn-input--mono"
+            type="text"
+            placeholder="ws://..."
+            autocomplete="off"
+            spellcheck="false"
+          >
+        </div>
       </div>
-      <div class="control-row__control">
-        <input
-          id="conn-ws-token"
-          ref="tokenInput"
-          v-model="wsToken"
-          :data-settings-initial-focus="requiresCredential ? '' : undefined"
-          class="control-input"
-          type="password"
-          placeholder="&mdash;"
-          autocomplete="off"
-          @keydown.enter.prevent="connect"
-        >
-      </div>
-    </div>
 
-    <div class="conn-actions">
-      <button type="button" class="btn btn--primary" @click="connect">
-        {{ statusState === 'connected' ? t('setup.connection.reconnect') : t('setup.connection.connect') }}
-      </button>
-      <button type="button" class="btn" @click="disconnect">{{ t('setup.connection.disconnect') }}</button>
-    </div>
+      <div v-if="!managed" class="control-row control-row--stack">
+        <div class="control-row__label-block">
+          <label class="control-row__label" for="conn-ws-token">{{ t('setup.connection.tokenLabel') }} <span v-if="!requiresCredential" class="conn-optional">{{ t('setup.connection.optional') }}</span></label>
+          <span class="control-row__desc">{{ t('setup.connection.tokenDesc') }}</span>
+        </div>
+        <div class="control-row__control">
+          <input
+            id="conn-ws-token"
+            ref="tokenInput"
+            v-model="wsToken"
+            :data-settings-initial-focus="requiresCredential ? '' : undefined"
+            class="control-input"
+            type="password"
+            placeholder="&mdash;"
+            autocomplete="off"
+            @keydown.enter.prevent="connect"
+          >
+        </div>
+      </div>
+
+      <div class="conn-actions">
+        <button type="button" class="btn" :class="{ 'btn--primary': needsRecovery }" @click="connect">
+          {{ statusState === 'connected' ? t('setup.connection.reconnect') : t('setup.connection.connect') }}
+        </button>
+        <button type="button" class="btn" @click="disconnect">{{ t('setup.connection.disconnect') }}</button>
+      </div>
+    </details>
   </section>
 </template>
 
 <style scoped>
+.conn-editor > summary {
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  min-height: 44px;
+  padding: var(--sp-3) 0;
+}
+
+.conn-editor > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .conn-status {
   align-items: baseline;
   border: 1px solid var(--border);
@@ -158,7 +199,10 @@ function disconnect() {
 .conn-status.ok {
   background: color-mix(in srgb, var(--ok) 8%, var(--bg-surface));
   border-color: color-mix(in srgb, var(--ok) 35%, var(--border));
+  padding: var(--sp-2) var(--sp-3);
 }
+
+.conn-status.ok .conn-status__reason { min-height: 0; }
 
 .conn-status.warn {
   background: color-mix(in srgb, var(--warn) 8%, var(--bg-surface));
@@ -186,18 +230,13 @@ function disconnect() {
 
 .conn-status__reason {
   color: var(--text-muted);
+  flex: 1 1 220px;
   font-size: var(--fs-sm);
-  /* The reason text differs per socket state (disconnected / failed-with-error /
-     connecting / connected) and used to change the block's height as it resolved
-     on open — reflowing the whole form below it (a visible "jitter"). Reserve a
-     stable two-line height (em-based for locale tolerance) and clamp longer error
-     strings so the layout never shifts as the state settles. */
+  /* Reserve recovery space without clipping longer errors. */
   line-height: 1.3;
   min-height: 2.6em;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .conn-input--mono {

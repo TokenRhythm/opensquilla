@@ -29,6 +29,40 @@ from opensquilla.sandbox.types import (
 from opensquilla.tools.types import ToolContext, current_tool_context
 
 
+class _ProcessStream:
+    def __init__(self, process, index):
+        self.process = process
+        self.index = index
+        self.offset = 0
+
+    async def read(self, size):
+        output = (await self.process._communicated())[self.index]
+        chunk = output[self.offset:self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+
+class _PipeProcess:
+    """Expose stream reads for existing in-memory process fixtures."""
+
+    @property
+    def stdout(self):
+        return _ProcessStream(self, 0)
+
+    @property
+    def stderr(self):
+        return _ProcessStream(self, 1)
+
+    async def _communicated(self):
+        if not hasattr(self, "_output_task"):
+            self._output_task = asyncio.create_task(self.communicate())
+        return await self._output_task
+
+    async def wait(self):
+        await self._communicated()
+        return self.returncode
+
+
 def _directory_link(link: Path, target: Path) -> None:
     try:
         link.symlink_to(target, target_is_directory=True)
@@ -79,82 +113,6 @@ def _request(tmp_path: Path) -> SandboxRequest:
         run_mode=RunMode.SAFE.value,
     )
 
-
-@pytest.mark.asyncio
-async def test_windows_startup_probe_uses_validated_helper_root_and_no_cache_side_effects(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from opensquilla.sandbox.backend import windows_default as mod
-    from opensquilla.sandbox.backend import windows_default_runner as runner
-
-    helper_root = tmp_path / "runtime" / "_internal"
-    (helper_root / "opensquilla").mkdir(parents=True)
-    captured: dict[str, object] = {}
-
-    monkeypatch.setattr(mod, "_support_ready", lambda: True)
-    monkeypatch.setattr(runner, "_helper_import_root", lambda: helper_root)
-    monkeypatch.setattr(mod, "_python_executable", lambda: Path("python.exe"))
-
-    async def fake_run(_self, request, **kwargs):
-        captured["request"] = request
-        captured["kwargs"] = kwargs
-        return SimpleNamespace(returncode=0, stderr="", timed_out=False)
-
-    monkeypatch.setattr(mod.WindowsDefaultBackend, "_run", fake_run)
-    await mod.WindowsDefaultBackend().probe_runtime(cwd=tmp_path / "deleted-worktree")
-
-    request = captured["request"]
-    assert request.cwd == helper_root
-    assert request.action_kind == "helper.startup_probe"
-    assert request.policy.network is NetworkMode.NONE
-    assert request.policy.workspace_rw is False
-    assert request.policy.tmp_writable is False
-    assert captured["kwargs"] == {
-        "prepare_cache": False,
-        "rehome_user_state": False,
-        "private_mounts_are_required": False,
-    }
-
-
-@pytest.mark.asyncio
-async def test_windows_startup_probe_preserves_helper_root_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from opensquilla.sandbox.backend import windows_default as mod
-    from opensquilla.sandbox.backend import windows_default_runner as runner
-
-    monkeypatch.setattr(mod, "_support_ready", lambda: True)
-    monkeypatch.setattr(
-        runner,
-        "_helper_import_root",
-        lambda: (_ for _ in ()).throw(RuntimeError("helper_root_unavailable: deleted")),
-    )
-
-    with pytest.raises(mod.SandboxBackendError, match=r"^helper_root_unavailable:"):
-        await mod.WindowsDefaultBackend().probe_runtime()
-
-
-@pytest.mark.asyncio
-async def test_windows_startup_probe_normalizes_nested_helper_root_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from opensquilla.sandbox.backend import windows_default as mod
-    from opensquilla.sandbox.backend import windows_default_runner as runner
-
-    helper_root = tmp_path / "runtime"
-    (helper_root / "opensquilla").mkdir(parents=True)
-    monkeypatch.setattr(mod, "_support_ready", lambda: True)
-    monkeypatch.setattr(runner, "_helper_import_root", lambda: helper_root)
-
-    async def fake_run(_self, _request, **_kwargs):
-        raise mod.SandboxBackendError(
-            "helper_launch_failed: RuntimeError: helper_root_unavailable: deleted"
-        )
-
-    monkeypatch.setattr(mod.WindowsDefaultBackend, "_run", fake_run)
-
-    with pytest.raises(mod.SandboxBackendError, match=r"^helper_root_unavailable:"):
-        await mod.WindowsDefaultBackend().probe_runtime()
 
 
 @pytest.mark.asyncio
@@ -1393,7 +1351,7 @@ async def test_backend_readonly_cwd_does_not_prepare_or_rehome_cache(
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         returncode = 0
 
         async def communicate(self):
@@ -1441,7 +1399,7 @@ async def test_backend_returns_helper_result(
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         def __init__(self):
             self.returncode = returncode
 
@@ -1525,7 +1483,7 @@ async def test_backend_authenticates_timeout_before_stderr_truncation(
         b'\nOPENSQUILLA_WINDOWS_DEFAULT_HELPER_TIMEOUT {"nonce":"timeout-test","timed_out":true}\n'
     )
 
-    class Proc:
+    class Proc(_PipeProcess):
         returncode = 124
 
         async def communicate(self):
@@ -1560,7 +1518,7 @@ async def test_backend_cancellation_kills_and_reaps_helper(
     communicating = asyncio.Event()
     never_finishes = asyncio.Event()
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         returncode = None
         killed = False
         waited = False
@@ -1606,7 +1564,7 @@ async def test_frozen_backend_uses_internal_child_role(
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         returncode = 0
 
         async def communicate(self):
@@ -1641,7 +1599,7 @@ async def test_backend_raises_terminal_error_for_authenticated_helper_failure(
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         returncode = 1
 
         async def communicate(self):
@@ -1671,7 +1629,7 @@ async def test_invalid_helper_cwd_is_classified_as_launch_failure_without_host_f
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         returncode = 1
 
         async def communicate(self):
@@ -1706,7 +1664,7 @@ async def test_helper_root_error_keeps_its_stable_code(
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         returncode = 1
 
         async def communicate(self):
@@ -1736,7 +1694,7 @@ async def test_backend_waits_for_helper_grace_beyond_command_timeout(
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         returncode = 0
 
         async def communicate(self):

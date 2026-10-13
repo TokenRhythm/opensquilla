@@ -192,7 +192,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_channel_dispatch_chunking.py",
     "tests/test_gateway/test_channel_reply_delivery_guard.py",
     "tests/test_gateway/test_channel_session_and_busy_policy.py",
-    "tests/test_gateway/test_capability_runtime.py",
     "tests/test_gateway/test_contract_method_adapter.py",
     "tests/test_gateway/test_session_read_adapter.py",
     "tests/test_gateway/test_session_read_contract_registration.py",
@@ -203,8 +202,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_conversation_runtime_adapter.py",
     "tests/test_gateway/test_goal_plan_contract_adapters.py",
     "tests/test_scripts/test_stage_webui_artifact.py",
-    "tests/test_gateway/test_meta_setup_launch_e2e.py",
-    "tests/test_gateway/test_rpc_meta_setup.py",
     "tests/test_artifact_validation.py",
     "tests/test_ci/test_dockerignore_context.py",
     "tests/test_ci/test_migration_v022.py",
@@ -253,9 +250,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_observability/test_usage_telemetry.py",
     "tests/test_migrations/test_v023_router_deployment_telemetry.py",
     "tests/test_migrations/test_v024_usage_native_billing_receipts.py",
-    "tests/test_migrations/test_v030_meta_control_intents.py",
-    "tests/test_migrations/test_v031_meta_launch_drafts.py",
-    "tests/test_migrations/test_v032_meta_launch_discard_tombstones.py",
     "tests/test_live_mixed_provider_gateway.py",
     "tests/test_live_long_task_case_driver.py",
     "tests/test_live_long_task_release_gate.py",
@@ -287,24 +281,11 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_scheduler/test_job_lifecycle.py",
     "tests/test_session/test_storage_session_list_pagination.py",
     "tests/test_session/test_storage_transactions.py",
-    "tests/test_session/test_meta_launch_drafts.py",
     "tests/test_session/test_pending_chat_inputs.py",
     "tests/test_session/test_turn_acceptance_storage.py",
     "tests/test_session/test_assistant_message_identity.py",
     "tests/test_skills/test_hub_deps_subprocess.py",
     "tests/test_skills/test_managed_toolchains.py",
-    "tests/test_skills/test_meta_readiness.py",
-    "tests/test_skills/test_meta_short_drama_delivery_audit.py",
-    "tests/test_skills/test_paper_citation_integrity_gate.py",
-    "tests/test_skills/test_paper_delivery_summary.py",
-    "tests/test_skills/test_paper_latex_sanitizer.py",
-    "tests/test_skills/test_paper_length_gate.py",
-    "tests/test_skills/test_paper_quality_gate.py",
-    "tests/test_skills/test_paper_refbib_metadata.py",
-    "tests/test_skills/test_paper_source_readiness_gate.py",
-    "tests/test_skills/test_short_drama_review_normalizer.py",
-    "tests/test_skills/test_subtitle_burner.py",
-    "tests/test_skills/test_title_card_image.py",
     "tests/test_skills/test_toolchain_runtime_integration.py",
     "tests/test_skills/test_toolchain_state_scope.py",
     "tests/test_tools/test_shell_managed_toolchains.py",
@@ -371,7 +352,7 @@ def test_every_pytest_file_belongs_to_exactly_one_windows_shard() -> None:
     assert set().union(*by_shard.values()) == discovered
     assert sum(len(paths) for paths in by_shard.values()) == len(discovered)
     assert all(len(matching_specialized_shards(path)) <= 1 for path in discovered)
-    assert "tests/fixtures/meta_skill_inputs/code_review_dirty_repo/tests/test_app.py" not in (
+    assert "tests/fixtures/synthetic_project/tests/test_app.py" not in (
         discovered
     )
     assert set(validated_files_for_shard(Path.cwd(), "core")) == by_shard["core"]
@@ -510,10 +491,28 @@ def test_task_runtime_leak_smoke_is_marked_ci_serial() -> None:
     )
 
 
+@pytest.mark.parametrize("function_name", [
+    "test_real_node_metadata_imports_unchanged_image_on_python",
+    "test_electron_embedded_node_metadata_imports_unchanged_image",
+])
+def test_native_attachment_runtime_parity_is_marked_ci_serial(function_name: str) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_gateway/test_native_attachment_import.py"), function_name,
+    )
+
+
 def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_ci/test_upgrade_baselines.py"),
+        "test_packaged_gateway_readiness_budget_and_terminal_errors",
+    )
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_desktop/test_gateway_functional_probes.py"),
         "test_mcp_probe_uses_real_stdio_server_and_gateway",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_live_provider_profile_gateway_e2e.py"),
+        "test_attachment_capacity_runner_reaches_provider_through_real_gateway",
     )
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_live_provider_profile_gateway_e2e.py"),
@@ -548,6 +547,10 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
         "test_transaction_recovery_locks_parked_backup_before_restoring_target",
     )
     assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/functional/test_gateway_session_routing_e2e.py"),
+        "test_real_gateway_websocket_session_routing_contract",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/functional/test_gateway_silent_reply_process_e2e.py"),
         "test_real_gateway_suppresses_goal_sentinel_everywhere",
     )
@@ -563,6 +566,108 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
         Path("tests/test_skills/test_hub_transaction_process_gates.py"),
         "test_unleased_build_services_does_not_sweep_another_process_reservation",
     )
+
+
+@pytest.mark.parametrize(
+    ("test_file", "function_name"),
+    [
+        (
+            "tests/test_gateway/test_plan_rpc.py",
+            "test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn",
+        ),
+        (
+            "tests/test_engine/test_tool_concurrency.py",
+            "test_image_analysis_calls_have_dedicated_inflight_cap",
+        ),
+        (
+            "tests/test_gateway/test_manual_compaction_contract.py",
+            "test_absolute_deadline_closes_provider_and_emits_one_skipped_terminal",
+        ),
+        (
+            "tests/test_engine/test_compaction_parent_turn_deadline.py",
+            "test_parent_deadline_cancels_inflight_preflight_without_auxiliary_failure",
+        ),
+        (
+            "tests/test_engine/test_compaction_parent_turn_deadline.py",
+            "test_parent_deadline_after_sqlite_commit_does_not_rollback_checkpoint",
+        ),
+        (
+            "tests/test_engine/test_compaction_runtime_boundaries.py",
+            "test_parent_expiry_cancels_inflight_summary_without_failure_or_window",
+        ),
+        (
+            "tests/test_engine/test_compaction_runtime_boundaries.py",
+            "test_real_turn_reports_parent_timeout_without_auxiliary_failure",
+        ),
+        (
+            "tests/test_gateway/test_rpc_sessions.py",
+            "test_direct_send_rejects_dropping_durable_runner",
+        ),
+        (
+            "tests/test_engine/test_interactive_approval_retry.py",
+            "test_pending_approval_ignores_legacy_timeout_and_waits_for_decision",
+        ),
+        (
+            "tests/test_skills/test_staging_io_worker.py",
+            "test_scan_keeps_status_responsive_and_cancel_waits_for_cleanup",
+        ),
+    ],
+)
+def test_bounded_latency_contracts_are_marked_ci_serial(
+    test_file: str, function_name: str,
+) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(Path(test_file), function_name)
+
+
+@pytest.mark.parametrize("function_name", [
+    "test_close_releases_stalled_send_lock_before_draining_accepted_record",
+    "test_prepare_shutdown_releases_send_lock_and_keeps_producer_records_open",
+    "test_shutdown_probe_rejects_broken_contracts",
+    "test_shutdown_probe_bounds_noncooperative_cleanup",
+])
+def test_telemetry_process_probes_are_explicitly_serial(function_name: str) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_telemetry/test_client_runtime.py"), function_name,
+    )
+
+
+@pytest.mark.parametrize("function_name", [
+    "test_close_drains_native_before_reconnect",
+    "test_close_probe_rejects_broken_resource_contracts",
+    "test_close_probe_watchdog_terminates_noncooperative_close",
+])
+def test_recovery_close_probes_are_explicitly_serial(function_name: str) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_session/test_recovery_reads.py"), function_name,
+    )
+
+
+@pytest.mark.ci_serial
+@pytest.mark.parametrize(("target", "serial_count"), [
+    ("tests/test_telemetry/test_client_runtime.py", 5),
+    ("tests/test_session/test_recovery_reads.py", 9),
+    ("tests/test_gateway/test_native_attachment_import.py", 3),
+])
+def test_process_probe_collection_is_complete_and_disjoint(target: str, serial_count: int) -> None:
+    """Exercise actual pytest collection, not fixture-setup-time marker changes."""
+    def collect(marker: str | None) -> set[str]:
+        command = [sys.executable, "-m", "pytest", target, "--collect-only", "-q"]
+        if marker is not None:
+            command += ["-m", marker]
+        result = subprocess.run(
+            command, capture_output=True, text=True, check=False, timeout=90,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        nodes = [line for line in result.stdout.splitlines() if line.startswith(f"{target}::")]
+        assert nodes and len(nodes) == len(set(nodes)), result.stdout
+        return set(nodes)
+
+    all_nodes = collect(None)
+    parallel = collect("not ci_serial")
+    serial = collect("ci_serial")
+    assert not parallel & serial
+    assert parallel | serial == all_nodes
+    assert len(serial) == serial_count
 
 
 def test_real_skill_install_cancellation_is_marked_ci_serial() -> None:
@@ -843,14 +948,17 @@ def test_windows_execution_partitions_cover_every_file_once_within_its_family() 
     physical_files = {
         shard: set(validated_files_for_shard(root, shard)) for shard in WINDOWS_SHARD_NAMES
     }
-    assert len(physical_files) == 8
+    assert len(physical_files) == 10
+    catalog = json.loads(Path(".github/ci/suites.v1.json").read_text(encoding="utf-8"))
+    assert tuple(catalog["full_python_matrix"]["windows"]) == WINDOWS_SHARD_NAMES
     assert all(physical_files.values())
     assert set().union(*physical_files.values()) == discovered
     assert sum(map(len, physical_files.values())) == len(discovered)
     for family in SHARD_NAMES:
-        assert physical_files[f"{family}-1"] | physical_files[f"{family}-2"] == set(
-            files_for_shard(root, family)
-        )
+        family_files = [paths for shard, paths in physical_files.items()
+                        if shard_family(shard) == family]
+        assert len(family_files) == (4 if family == "gateway-sqlite" else 2)
+        assert set().union(*family_files) == set(files_for_shard(root, family))
     for path, physical in assignments.items():
         assert shard_family(physical) == shard_for_test(path)
         assert windows_shard_for_test(path) == physical
@@ -885,6 +993,15 @@ def test_windows_new_file_fallback_is_stable_and_keeps_environment_family() -> N
     for path, shard in first.items():
         assert shard in WINDOWS_SHARD_NAMES
         assert shard_family(shard) == shard_for_test(path)
+
+
+def test_gateway_new_file_fallback_uses_all_four_partitions() -> None:
+    paths = [f"tests/test_gateway/test_new_partition_fallback_{index}.py"
+             for index in range(32)]
+    assert not set(paths).intersection(partition_assignments())
+    assert {windows_shard_for_test(path) for path in paths} == {
+        f"gateway-sqlite-{partition}" for partition in range(1, 5)
+    }
 
 
 @pytest.mark.parametrize(
@@ -939,15 +1056,16 @@ def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
     report = assignment_governance_summary(Path.cwd())
 
     expected_moved_paths = {
+        "tests/test_gateway/test_rpc_sessions.py",
+        "tests/test_recovery/test_session_merge.py",
+        "tests/test_engine/test_placeholder_escalation_and_wrapup.py",
         "tests/test_gateway/test_goal_rpc.py",
-        "tests/test_gateway/test_rpc_meta_runs.py",
         "tests/test_gateway/test_rpc_router_decisions.py",
         "tests/test_live_long_task_case_driver.py",
         "tests/test_live_multi_provider_matrix.py",
         "tests/test_observability/test_bundle.py",
         "tests/test_persistence/test_router_decision_writer.py",
         "tests/test_sandbox/test_windows_default_capability.py",
-        "tests/test_skills/test_meta_resume.py",
     }
     moved_paths = {
         path for path, shard in assignments.items() if baseline[path] != shard
@@ -956,7 +1074,7 @@ def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
     assert moved_paths == expected_moved_paths
     assert set(assignments) == set(historical_test_weights())
     assert {str(override["path"]) for override in overrides} == expected_moved_paths
-    assert sum(override.get("affinity_exception") is True for override in overrides) == 5
+    assert sum(override.get("affinity_exception") is True for override in overrides) == 6
     assert guardrails == {
         "max_moved_files": 10,
         "max_moved_fraction": 0.02,
@@ -1136,17 +1254,15 @@ def test_affinity_overflow_moves_only_environment_independent_tests() -> None:
     # These reviewed files need no shard-specific setup. Releasing them keeps
     # environment-dependent tests pinned while restoring an even critical path.
     assert moved == {
+        "tests/test_gateway/test_rpc_sessions.py": "core",
+        "tests/test_recovery/test_session_merge.py": "core",
         "tests/contracts/test_gateway_contract_parallel.py": "core",
         "tests/test_ci/test_migrations_packaged.py": "core",
         "tests/test_gateway/test_goal_rpc.py": "desktop-installer-contracts",
-        "tests/test_gateway/test_rpc_meta_runs.py": "desktop-installer-contracts",
         "tests/test_gateway/test_rpc_router_decisions.py": (
             "desktop-installer-contracts"
         ),
         "tests/test_observability/test_bundle.py": "desktop-installer-contracts",
-        "tests/test_persistence/test_meta_run_writer.py": (
-            "desktop-installer-contracts"
-        ),
         "tests/test_persistence/test_router_decision_writer.py": "core",
     }
     assert shard_for_test("tests/test_recovery/test_atomic_and_locking.py") == (
@@ -1527,17 +1643,22 @@ def test_windows_shard_runner_splits_parallel_and_serial_tests(tmp_path: Path) -
     assert metadata_payload["execution"]["parallel"]["workers"] == 2
 
 
+@pytest.mark.parametrize("selected_shard", ["core-1", "gateway-sqlite-3", "gateway-sqlite-4"])
 def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
-    tmp_path: Path,
+    tmp_path: Path, selected_shard: str,
 ) -> None:
     (tmp_path / "pyproject.toml").write_text(
         '[tool.pytest.ini_options]\nmarkers = ["ci_serial: serial CI contract"]\n',
         encoding="utf-8",
     )
-    test_dir = tmp_path / "tests"
-    test_dir.mkdir()
-    selected_path = "tests/test_partition_probe.py"
-    selected_shard = windows_shard_for_test(selected_path)
+    family = shard_family(selected_shard)
+    prefix = "tests/test_gateway" if family == "gateway-sqlite" else "tests"
+    (tmp_path / prefix).mkdir(parents=True)
+    selected_path = next(
+        f"{prefix}/test_partition_probe_{index}.py"
+        for index in range(100)
+        if windows_shard_for_test(f"{prefix}/test_partition_probe_{index}.py") == selected_shard
+    )
     (tmp_path / selected_path).write_text(
         "import os\nimport pytest\n\n"
         "def test_parallel():\n"
@@ -1548,9 +1669,9 @@ def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
         encoding="utf-8-sig",
     )
     unselected_path = next(
-        f"tests/test_partition_other_{index}.py"
+        f"{prefix}/test_partition_other_{index}.py"
         for index in range(100)
-        if windows_shard_for_test(f"tests/test_partition_other_{index}.py") != selected_shard
+        if windows_shard_for_test(f"{prefix}/test_partition_other_{index}.py") != selected_shard
     )
     (tmp_path / unselected_path).write_text(
         "def test_must_not_execute():\n    assert False, 'another physical partition'\n",
@@ -1593,7 +1714,7 @@ def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
     metadata = json.loads((reports / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["test_files"] == [selected_path]
     assert metadata["partition_sha256"] == partition_snapshot_fingerprint()
-    assert metadata["family"] == "core"
+    assert metadata["family"] == family
     junit = ET.parse(reports / "junit.xml").getroot()
     assert {test.get("name") for test in junit.iter("testcase")} == {
         "test_parallel",

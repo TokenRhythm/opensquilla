@@ -17,6 +17,12 @@ const caRuntimeHookPath = join(scriptDir, 'pyinstaller_runtime_hooks', 'ensure_c
 const controlUiDistDir = join(repoRoot, 'opensquilla-webui', 'dist')
 const controlUiVerifier = join(repoRoot, 'opensquilla-webui', 'scripts', 'verify-dist.mjs')
 const routerBundleDir = join(repoRoot, 'src', 'opensquilla', 'squilla_router', 'models', 'v4.2_phase3_inference')
+// The V4 router ships its implementation as a copied runtime_src tree and
+// imports it only after validating the bundle.  PyInstaller cannot resolve
+// that delayed `src.router.*` import from the normal repository search path;
+// make the runtime root an explicit analysis path so the packaged Gateway
+// contains the same router implementation as the source Gateway.
+const routerRuntimeSrcDir = join(routerBundleDir, 'runtime_src')
 const addDataSeparator = process.platform === 'win32' ? ';' : ':'
 const gitLfsPointerHeader = 'version https://git-lfs.github.com/spec/v1'
 const gatewayUvArgs = [
@@ -355,6 +361,13 @@ const args = [
   'reportlab',
   '--collect-data',
   'certifi',
+  '--paths',
+  routerRuntimeSrcDir,
+  // `src.router` is a data-backed runtime tree, not an application module.
+  // Excluding the top-level namespace prevents PyInstaller's meta-path
+  // importer from shadowing the bundle path at runtime.
+  '--exclude-module',
+  'src',
   '--hidden-import',
   'certifi',
   '--collect-binaries',

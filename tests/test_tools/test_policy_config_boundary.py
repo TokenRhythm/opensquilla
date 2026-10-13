@@ -4,6 +4,8 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.tools import policy_helpers
 from opensquilla.tools.policy import apply_tool_policy_from_config
@@ -168,6 +170,33 @@ def test_policy_config_parses_gateway_and_sender_policy_shapes() -> None:
     assert sender_policy(policy, "bob") == ToolPolicy(
         also_allow=frozenset({"sessions_send"})
     )
+
+
+@pytest.mark.parametrize("profile", [
+    "repo_coding_source_edit",
+    "repo_coding_source_edit_strict",
+    "repo_coding_source_edit_v2",
+    "repo_coding_source_edit_balanced",
+    "repo_coding_source_edit_patch_fallback",
+    "repo_coding_scaffold_edit",
+    "repo_coding_scaffold_patch",
+])
+@pytest.mark.parametrize("shape", ["mapping", "string"])
+def test_retired_per_agent_profiles_use_ordinary_coding_policy(profile, shape) -> None:
+    tools = {"profile": profile} if shape == "mapping" else profile
+    config = GatewayConfig(agents=[{"id": "main", "tools": tools}])
+    coding_tools = {"read_file", "write_file", "edit_file", "exec_command", "process"}
+
+    ctx = apply_tool_policy_from_config(
+        ToolContext(agent_id="main", is_owner=True),
+        available_tools=sorted(coding_tools | {"web_search"}),
+        config=config,
+    )
+
+    assert ctx.allowed_tools == coding_tools
+    assert ctx.file_edit_requires_fresh_read is True
+    assert policy_from_config(tools) == ToolPolicy(profile="coding")
+    assert ToolPolicy(profile=profile).profile == "coding"
 
 
 def test_policy_helpers_apply_workspace_write_deny_globs_from_config() -> None:

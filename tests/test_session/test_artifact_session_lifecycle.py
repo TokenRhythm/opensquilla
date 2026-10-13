@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import sqlite3
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -160,6 +163,85 @@ async def test_reset_atomically_purges_old_state_and_only_internal_bytes(tmp_pat
 
 async def _noop() -> None:
     return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_reset_cleanup_keeps_loop_responsive_and_finishes_exact_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel: bool,
+) -> None:
+    media_root = tmp_path / "media"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    set_session_artifact_cleanup(build_session_artifact_cleanup(_config(media_root, workspace)))
+    store = ArtifactStore(media_root)
+    old = SessionNode(session_key="agent:main:webchat:cleanup", session_id="sid-old")
+    sibling = SessionNode(session_key="agent:main:webchat:sibling", session_id="sid-sibling")
+    listed = _publish(store, node=old, payload=b"listed", visibility="listed")
+    internal = _publish(store, node=old, payload=b"internal", visibility="internal")
+    sibling_internal = _publish(store, node=sibling, payload=b"sibling", visibility="internal")
+    new = old.model_copy(update={"session_id": "sid-new", "epoch": 1})
+    started, release, completed = asyncio.Event(), threading.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    context = contextvars.ContextVar("artifact_cleanup_test_context", default="missing")
+    original_delete = ArtifactStore.delete_session_internal_artifacts
+    observed = []
+
+    def slow_delete(instance, session_id):
+        assert threading.get_ident() != loop_thread
+        observed.append((session_id, context.get()))
+        loop.call_soon_threadsafe(started.set)
+        try:
+            assert release.wait(5), "event loop did not release artifact cleanup"
+            return original_delete(instance, session_id)
+        finally:
+            completed.set()
+
+    monkeypatch.setattr(ArtifactStore, "delete_session_internal_artifacts", slow_delete)
+    async with SessionStorage(tmp_path / "sessions.db") as storage:
+        await storage.upsert_session(old)
+        token = context.set("captured")
+        try:
+            task = asyncio.create_task(storage.reset_session(
+                new, expected_session_id=old.session_id, expected_epoch=0,
+                archive_writer=lambda _snapshot: _noop(),
+            ))
+        finally:
+            context.reset(token)
+        try:
+            await asyncio.wait_for(started.wait(), 3)
+            # The durable reset is committed, and the shared connection remains
+            # available while only the old generation's disk cleanup waits.
+            current = await asyncio.wait_for(storage.get_session(old.session_key), 1)
+            assert current is not None and current.session_id == new.session_id
+            new_internal = _publish(store, node=new, payload=b"new", visibility="internal")
+            if cancel:
+                for _ in range(2):
+                    task.cancel("cancel cleanup")
+                    await asyncio.sleep(0)
+                    assert not task.done()
+                    assert not completed.is_set()
+            release.set()
+            if cancel:
+                with pytest.raises(asyncio.CancelledError, match="cancel cleanup"):
+                    await task
+            else:
+                await task
+            assert completed.is_set()
+            assert observed == [(old.session_id, "captured")]
+            with pytest.raises(ArtifactFileNotFoundError):
+                store.get_ref(session_id=old.session_id, artifact_id=internal.id)
+            assert store.get_ref(session_id=old.session_id, artifact_id=listed.id).id == listed.id
+            assert store.get_ref(
+                session_id=sibling.session_id, artifact_id=sibling_internal.id,
+            ).id == sibling_internal.id
+            assert store.get_ref(session_id=new.session_id, artifact_id=new_internal.id).id == (
+                new_internal.id
+            )
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

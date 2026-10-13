@@ -7,9 +7,11 @@ import { access, constants, open, readFile, readdir, rename, rm, stat, unlink, w
 import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
+import { performance } from 'node:perf_hooks'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { NativeAttachmentSelections } from './native-attachments.js'
-import { saveArtifactFile, performSourceFileAction, type SaveArtifactRequest, type SourceFileActionRequest } from './resource-file-actions.js'
+import { chooseLocalFilePaths } from './native-path-picker.js'
+import { saveArtifactFile, performSourceFileAction, performWorkspaceFileAction, type SaveArtifactRequest, type SourceFileActionRequest, type WorkspaceFileActionRequest } from './resource-file-actions.js'
 import {
   DESKTOP_LOCALES,
   normalizeGatewayLocale,
@@ -29,6 +31,11 @@ import {
   buildDesktopQuitDialogHtml,
   parseDesktopQuitDialogResponse,
 } from './desktop-quit-dialog.js'
+import {
+  acknowledgeDesktopActivation, clearDesktopActivationAcknowledgements,
+  createDesktopActivationRequest, disposeDesktopActivationRequest,
+  hasDesktopActivationAcknowledgement,
+} from './desktop-single-instance.js'
 import { terminateWindowsProcessTree } from './windows-process-tree.js'
 import {
   createDesktopGatewayInstanceNonce,
@@ -39,7 +46,8 @@ import {
   readVerifiedDesktopGatewayActivity,
   requestVerifiedDesktopGatewayQuit,
   requestVerifiedDesktopGatewayShutdown,
-  verifyDesktopGatewayLaunchOwnership,
+  verifyDesktopGatewayOwnership,
+  verifyDesktopGatewayLaunchOwnershipDetailed,
   waitForDesktopGatewayOwnershipRelease,
   type DesktopGatewayOwnershipRecord,
 } from './desktop-gateway-ownership.js'
@@ -48,6 +56,7 @@ import {
 } from './desktop-gateway-ownership-verification.js'
 import {
   DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
+  GatewayReadinessTimeoutError,
   lifecycleAllowsProcessSpawn,
   stopAndJoinLifecycleProcesses,
   waitForGatewayReadiness,
@@ -182,6 +191,7 @@ import {
 } from './native-workbench-annotation-contract.js'
 import { DesktopBrowserServer, DESKTOP_BROWSER_URL_ENV, DESKTOP_BROWSER_TOKEN_ENV } from './desktop-browser.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
+import { installDesktopReloadShortcuts } from './desktop-reload-shortcuts.js'
 import {
   buildRendererConsoleLogEntry,
   isLiveMainFrameConsoleMessage,
@@ -487,6 +497,77 @@ interface DesktopRecoveryViewState {
 
 type BootPhaseId = 'profile' | 'gateway-start' | 'gateway-health' | 'control' | 'ready'
 
+// Keep the startup timeline more precise than the five user-facing boot
+// milestones.  These stages are diagnostic boundaries only: they must never
+// grant readiness or change the lifecycle ordering.  In particular,
+// websocket-connected and tool-ready are hand-off observations owned by the
+// renderer/Gateway; the main process records the boundary it can actually see
+// rather than pretending that publishing a descriptor proves a live socket.
+type DesktopStartupStage =
+  | 'profile-inspect'
+  | 'profile-reconcile'
+  | 'orphan-owner'
+  | 'gateway-spawn'
+  | 'core-ready'
+  | 'ownership'
+  | 'legacy-ready'
+  | 'websocket-connected'
+  | 'tool-ready'
+
+interface DesktopStartupStageAttempt {
+  id: number
+  startedAt: number
+  lastStage: DesktopStartupStage | null
+  finished: boolean
+}
+
+let desktopStartupStageAttemptSequence = 0
+let desktopStartupStageAttempt: DesktopStartupStageAttempt | null = null
+
+function beginDesktopStartupStageAttempt(): DesktopStartupStageAttempt {
+  const attempt: DesktopStartupStageAttempt = {
+    id: ++desktopStartupStageAttemptSequence,
+    startedAt: Date.now(),
+    lastStage: null,
+    finished: false,
+  }
+  desktopStartupStageAttempt = attempt
+  desktopStartupLog('startup_stage_attempt_started', { attemptId: attempt.id })
+  return attempt
+}
+
+function observeDesktopStartupStage(
+  stage: DesktopStartupStage,
+  detail: Record<string, unknown> = {},
+): void {
+  const attempt = desktopStartupStageAttempt
+  if (!attempt || attempt.finished || attempt.lastStage === stage) return
+  attempt.lastStage = stage
+  desktopStartupLog('startup_stage', {
+    attemptId: attempt.id,
+    stage,
+    stageElapsedMs: Math.max(0, Date.now() - attempt.startedAt),
+    ...detail,
+  })
+}
+
+function finishDesktopStartupStageAttempt(
+  attempt: DesktopStartupStageAttempt,
+  outcome: 'success' | 'fail' | 'cancel',
+  detail: Record<string, unknown> = {},
+): void {
+  if (attempt.finished) return
+  attempt.finished = true
+  desktopStartupLog('startup_stage_attempt_finished', {
+    attemptId: attempt.id,
+    outcome,
+    durationMs: Math.max(0, Date.now() - attempt.startedAt),
+    lastStage: attempt.lastStage,
+    ...detail,
+  })
+  if (desktopStartupStageAttempt === attempt) desktopStartupStageAttempt = null
+}
+
 interface BootStatus {
   phaseId: BootPhaseId
   label: string
@@ -593,6 +674,7 @@ let quitConfirmationWantsExit = false
 const desktopQuitConfirmation = new DesktopQuitConfirmation()
 let quitFromSignal = false
 let appExitStatusKey = 'tray.running'
+let gatewayShutdownRequestInterceptorInstalled = false
 // A child remains lifecycle-owned until its exit event, even after stopGateway
 // clears the current slot so a replacement cannot accidentally reuse it. Quit,
 // update, cleanup, and recovery all join this set before Electron may exit.
@@ -826,6 +908,10 @@ let bootStatus: BootStatus = {
 let bootError: BootError | null = null
 let forceOnboardingOnNextStartup = false
 let onboardingPromptProfileKey: string | null = null
+// A fresh profile is offered onboarding before its first Gateway spawn. Keep
+// this separate from onboardingPromptProfileKey, which also covers migration
+// and reset flows that must retain the existing ready-before-invitation path.
+let freshOnboardingProfileKey: string | null = null
 let recoveryInspection: RecoveryProtocolResult | null = null
 let primaryRecoveryInspection: RecoveryProtocolResult | null = null
 let recoveryOperationBusy = false
@@ -845,12 +931,14 @@ const gatewayProcessTreeTerminations = new WeakMap<
 const gatewayHardTerminatedProcesses = new WeakSet<ChildProcessWithoutNullStreams>()
 const desktopWriters = new DesktopWriterAdmission()
 let desktopOpenFlowRevision = 0
+let gatewayLateReadyObservation: { isCurrent: () => boolean; resumeIfCurrent: () => void } | null = null
 let desktopOpenFlowPromise: Promise<void> | null = null
 let bootResumePromise: Promise<{ ok: boolean; error?: string }> | null = null
 let gatewayConnectionRevision = 0
 let gatewayConnectionInstanceId: string | null = null
 
 function invalidateDesktopOpenFlow(): number {
+  gatewayLateReadyObservation = null
   cancelGatewayUnexpectedExitRestart('desktop open flow invalidated')
   desktopOpenFlowRevision += 1
   return desktopOpenFlowRevision
@@ -1016,7 +1104,9 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
 const desktopBrowser = new DesktopBrowserServer(
   (request, signal) => nativeWorkbenchSurfaces.executeBrowser(request, signal),
   entry => desktopLog(entry.event, { operation: entry.operation, outcome: entry.outcome,
-    code: entry.code, durationMs: entry.durationMs }),
+    code: entry.code, durationMs: entry.durationMs, operationId: entry.operationId,
+    targetRef: entry.targetRef, navigationCode: entry.navigationCode }),
+  (request, signal) => nativeWorkbenchSurfaces.executeBrowserMcp(request, signal),
 )
 
 function activeDesktopProfile(): DesktopProfilePaths {
@@ -1499,6 +1589,13 @@ async function proxyDesktopRendererRequest(
   const body = method === 'GET' || method === 'HEAD'
     ? undefined
     : new Uint8Array(await request.arrayBuffer())
+  if (isCurrentGatewayShutdownRequest(`${gatewayState.url}${pathAndQuery}`, method)) {
+    const child = gatewayProcess
+    if (child && gatewayState.owned) {
+      trackStoppingGatewayProcess(child)
+      cancelGatewayUnexpectedExitRestart('Gateway shutdown endpoint requested')
+    }
+  }
   const response = await electronNet.fetch(`${gatewayState.url}${pathAndQuery}`, {
     method,
     headers,
@@ -1537,7 +1634,7 @@ function secureDesktopRendererDocument(response: Response): Response {
       "font-src 'self' opensquilla-app://desktop data:",
       "media-src 'self' opensquilla-app://desktop blob: data: http: https:",
       "connect-src 'self' opensquilla-app://desktop http: https: ws: wss:",
-      "frame-src blob: http: https:",
+      "frame-src blob: data: http: https:",
       "worker-src 'self' opensquilla-app://desktop blob:",
     ].join('; '),
   )
@@ -5028,6 +5125,7 @@ function focusMainWindow(): boolean {
 }
 
 function setAppExitPhase(next: DesktopExitPhase, reason: string): void {
+  if (next !== 'running') gatewayLateReadyObservation = null
   const connectionWasSuspended = desktopGatewayConnectionSuspendedForExit()
   desktopLog('desktop_exit_phase', { from: appExitPhase, to: next, reason })
   appExitPhase = next
@@ -7235,7 +7333,8 @@ async function prepareDesktopStartupConnection(): Promise<DesktopConnection | nu
   // An explicit empty primary prevents provider defaults or inherited API keys
   // from silently configuring a fresh profile. The config also records that the
   // first-run invitation has been offered; later launches use Settings instead.
-  if (!(await pathExists(desktopConfigPath()))) {
+  const configExists = await pathExists(desktopConfigPath())
+  if (!configExists) {
     const finishWriter = beginDesktopWriterOperation('initialize unconfigured desktop profile')
     const profile = activeDesktopProfile()
     try {
@@ -7251,6 +7350,9 @@ async function prepareDesktopStartupConnection(): Promise<DesktopConnection | nu
       }
       if (initialized.stable_code === 'unconfigured_profile_initialized') {
         onboardingPromptProfileKey = desktopProfileKey(profile)
+        if (!pendingProviderSetup && !forceOnboardingOnNextStartup && existing === null) {
+          freshOnboardingProfileKey = desktopProfileKey(profile)
+        }
       }
     } finally {
       finishWriter()
@@ -8152,6 +8254,11 @@ async function runRecoveryCli(
   writerReserved = false,
 ): Promise<RecoveryProtocolResult> {
   const mutating = commandArgs[0] !== 'inspect'
+  if (commandArgs[0] === 'inspect') {
+    observeDesktopStartupStage('profile-inspect', { command: commandArgs[0] })
+  } else if (mutating) {
+    observeDesktopStartupStage('profile-reconcile', { command: commandArgs[0] })
+  }
   const kindAwareCommands = new Set(['inspect', 'reconcile', 'choose-workspace'])
   const effectiveArgs = kindAwareCommands.has(commandArgs[0] || '')
     && !commandArgs.includes('--profile-kind')
@@ -8603,6 +8710,10 @@ async function consolidateLegacyRecoveryProfilesBeforeStartup(
       for (const profile of [...recoveryProfiles, primary]) {
         await recoverVerifiedOrphanGatewayBeforeSpawn(profile)
       }
+      observeDesktopStartupStage('profile-reconcile', {
+        command: 'consolidate-profile',
+        recoveryProfileCount: recoveryProfiles.length,
+      })
       const result = await runDesktopProfileConsolidationCli(primary)
       validateDesktopProfileConsolidationPaths(result, primary)
       desktopLog('desktop_profile_consolidation_completed', {
@@ -8792,12 +8903,22 @@ async function healthCheck(url: string, timeoutMs = 1000): Promise<boolean> {
 async function readinessCheck(url: string, timeoutMs = 1000): Promise<boolean> {
   try {
     const boundedTimeoutMs = Math.max(1, Math.min(1000, Math.floor(timeoutMs)))
-    const response = await fetch(`${url}/readyz`, {
+    // The durable core probe is the Desktop startup boundary.  Optional MCP,
+    // channel and browser services may still be starting after this returns;
+    // waiting for the legacy aggregate probe would reintroduce that coupling.
+    let response = await fetch(`${url}/readyz/core`, {
       signal: AbortSignal.timeout(boundedTimeoutMs),
     })
+    // Keep compatibility with an older externally managed Gateway that does
+    // not expose the additive core probe yet.
+    if (response.status === 404) {
+      response = await fetch(`${url}/readyz`, {
+        signal: AbortSignal.timeout(boundedTimeoutMs),
+      })
+    }
     if (!response.ok) return false
     const payload = await response.json().catch(() => null)
-    return Boolean(payload && payload.ready === true)
+    return Boolean(payload && (payload.core_ready === true || payload.ready === true))
   } catch {
     return false
   }
@@ -8866,10 +8987,19 @@ function classifyGatewayExitMessage(message: string, outputTail: string): string
 async function waitForGateway(
   url: string,
   earlyExitMessage?: () => string | null,
+  preflight?: (remainingMs: number) => Promise<boolean>,
 ): Promise<void> {
   const startedAt = Date.now()
   const result = await waitForGatewayReadiness({
-    probe: (remainingMs) => readinessCheck(url, remainingMs),
+    probe: async (remainingMs) => {
+      // A healthy loopback endpoint is not sufficient during a fresh spawn:
+      // another Gateway can win the port probe→bind race while our child is
+      // still loading/migrating.  Run the caller's exact-instance challenge
+      // before any readiness request so a foreign listener cannot satisfy the
+      // startup boundary.
+      if (preflight && !await preflight(remainingMs)) return false
+      return await readinessCheck(url, remainingMs)
+    },
     exitMessage: earlyExitMessage,
     primaryTimeoutMs: 45_000,
     lateGraceMs: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS - 45_000,
@@ -8887,7 +9017,7 @@ async function waitForGateway(
     return
   }
   if (result.status === 'exited') throw new Error(result.message)
-  throw new Error(`Gateway did not become ready at ${url}`)
+  throw new GatewayReadinessTimeoutError(url)
 }
 
 function hasGatewayProcessExited(process: ChildProcessWithoutNullStreams | null): boolean {
@@ -8895,12 +9025,46 @@ function hasGatewayProcessExited(process: ChildProcessWithoutNullStreams | null)
 }
 
 function trackStoppingGatewayProcess(child: ChildProcessWithoutNullStreams): void {
+  if (child === gatewayProcess) gatewayLateReadyObservation = null
   if (hasGatewayProcessExited(child) || gatewayStoppingProcesses.has(child)) return
   gatewayStoppingProcesses.add(child)
-  child.once('exit', () => {
+  // The close handler classifies the child's final status. Keep the explicit
+  // stop marker until close because Node emits exit before close; clearing it
+  // on exit would make an intentional clean stop look like an unexpected
+  // ready-child disconnect and schedule a replacement.
+  child.once('close', () => {
     gatewayStoppingProcesses.delete(child)
     if (updateGatewayShutdownProcess === child) updateGatewayShutdownProcess = null
   })
+}
+
+function isCurrentGatewayShutdownRequest(url: string, method: string): boolean {
+  if (method !== 'POST' || !gatewayState.url) return false
+  try {
+    const request = new URL(url)
+    const gateway = new URL(gatewayState.url)
+    return request.origin === gateway.origin && request.pathname === '/api/system/shutdown'
+  } catch {
+    return false
+  }
+}
+
+function installGatewayShutdownRequestInterceptor(window: BrowserWindow): void {
+  if (gatewayShutdownRequestInterceptorInstalled) return
+  gatewayShutdownRequestInterceptorInstalled = true
+  window.webContents.session.webRequest.onBeforeRequest(
+    { urls: ['<all_urls>'] },
+    (details, callback) => {
+      if (isCurrentGatewayShutdownRequest(details.url, details.method)) {
+        const child = gatewayProcess
+        if (child && gatewayState.owned) {
+          trackStoppingGatewayProcess(child)
+          cancelGatewayUnexpectedExitRestart('Gateway shutdown endpoint requested')
+        }
+      }
+      callback({})
+    },
+  )
 }
 
 function liveLifecycleOwnedGatewayProcesses(): ChildProcessWithoutNullStreams[] {
@@ -8926,6 +9090,14 @@ async function reuseHealthyGatewayState(
   if (ready) {
     gatewayState.status = 'ready'
     gatewayState.error = undefined
+    desktopStartupLog('gateway_ready', { operation: 'reused' })
+    observeDesktopStartupStage('core-ready', { operation: 'reused' })
+    observeDesktopStartupStage('ownership', {
+      operation: 'reused',
+      verified: gatewayState.owned,
+      boundary: gatewayState.owned ? 'existing-child' : 'external-gateway',
+    })
+    observeDesktopStartupStage('legacy-ready', { operation: 'reused', source: 'descriptor' })
     sendBootStatus('control')
     publishGatewayConnection()
     return gatewayState
@@ -8941,14 +9113,39 @@ async function reuseHealthyGatewayState(
 
 async function verifyOwnedGatewayLaunch(
   child: ChildProcessWithoutNullStreams,
+  options: { emitDiagnostic?: boolean; timeoutMs?: number } = {},
 ): Promise<boolean> {
   const context = gatewayProcessOwnershipContexts.get(child)
-  if (!context) return false
-  return await verifyDesktopGatewayLaunchOwnership(context.ownershipDir, {
+  if (!context) {
+    if (options.emitDiagnostic !== false) {
+      desktopLog('gateway_ownership_not_verified', {
+        phase: 'launch', pid: child.pid, stage: 'launch', reason: 'launch_context_missing', elapsedMs: 0,
+      })
+    }
+    return false
+  }
+  const authority = {
     instanceNonce: context.nonce,
     profileFingerprint: context.profileFingerprint,
     port: context.port,
-  })
+  }
+  const result = await verifyDesktopGatewayLaunchOwnershipDetailed(
+    context.ownershipDir,
+    authority,
+    options.timeoutMs === undefined
+      ? {}
+      : {
+          // Keep the identity challenge inside the shared readiness deadline;
+          // otherwise a 1.5s fetch could outlive the final readiness probe.
+          verify: async record => await verifyDesktopGatewayOwnership(record, {
+            timeoutMs: Math.max(1, Math.min(1500, Math.floor(options.timeoutMs ?? 1))),
+          }),
+        },
+  )
+  if (!result.ok && options.emitDiagnostic !== false) {
+    desktopLog('gateway_ownership_not_verified', { phase: 'launch', pid: child.pid, port: context.port, ...result })
+  }
+  return result.ok
 }
 
 async function discardUnverifiedOwnedGatewayChild(
@@ -8994,9 +9191,15 @@ async function resumeOwnedGatewayStartup(
   }
   gatewayState.status = 'starting'
   gatewayState.error = undefined
+  desktopStartupLog('gateway_starting', { operation: 'resume' })
   sendBootStatus('gateway-health')
   advanceGatewayStartTelemetry('health')
-  await waitForGateway(url, childExitMessage)
+  await waitForGateway(
+    url,
+    childExitMessage,
+    remainingMs => verifyOwnedGatewayLaunch(child, { emitDiagnostic: false, timeoutMs: remainingMs }),
+  )
+  observeDesktopStartupStage('core-ready', { operation: 'resume', pid: child.pid })
   if (!isCurrent()) throw new Error('Desktop startup was superseded during health verification.')
 
   // Health alone never grants ownership. The same exact child and profile that
@@ -9017,6 +9220,7 @@ async function resumeOwnedGatewayStartup(
     }
     return null
   }
+  observeDesktopStartupStage('ownership', { operation: 'resume', pid: child.pid, verified: true })
   if (
     gatewayProcess !== child
     || hasGatewayProcessExited(child)
@@ -9026,18 +9230,105 @@ async function resumeOwnedGatewayStartup(
     throw new Error(childExitMessage() || 'Desktop gateway changed during ownership verification.')
   }
 
+  return publishResumedOwnedGateway(child)
+}
+
+function publishResumedOwnedGateway(child: ChildProcessWithoutNullStreams): GatewayState {
   gatewayState.status = 'ready'
   gatewayState.error = undefined
+  desktopStartupLog('gateway_ready', { operation: 'resume', pid: child.pid })
   markGatewayProcessReady(child)
+  observeDesktopStartupStage('legacy-ready', { operation: 'resume', source: 'descriptor' })
   sendBootStatus('control')
   publishGatewayConnection()
   return gatewayState
+}
+
+// Foreground startup still ends at 120 seconds. A live owned child can finish
+// necessary profile work later; observe it without restarting or killing it.
+const GATEWAY_LATE_READY_OBSERVATION_MS = 10 * 60_000
+
+function observeLateOwnedGatewayReadiness(
+  deadline = performance.now() + GATEWAY_LATE_READY_OBSERVATION_MS,
+): void {
+  if (gatewayLateReadyObservation?.isCurrent()) return
+  const remainingMs = deadline - performance.now()
+  if (remainingMs <= 0) return
+  const authority = currentBootResumeAuthority()
+  if (!authority) return
+  const launch = gatewayProcessOwnershipContexts.get(authority.child)
+  if (!launch || !gatewayState.url || gatewayState.status === 'ready') return
+  const url = gatewayState.url
+  const port = gatewayState.port
+  const instanceId = gatewayConnectionInstanceId
+  const authorityIsCurrent = (): boolean => (
+    bootResumeAuthorityIsCurrent(authority)
+    && gatewayState.status !== 'ready'
+    && gatewayState.url === url
+    && gatewayState.port === port
+    && gatewayConnectionInstanceId === instanceId
+    && gatewayProcessOwnershipContexts.get(authority.child) === launch
+  )
+  const observation = {
+    isCurrent: (): boolean => (
+      gatewayLateReadyObservation === observation
+      && authorityIsCurrent()
+    ),
+    // A failed update preparation may resume this exact launch. Create a new
+    // observation so canceled callbacks stay invalid, retaining the old budget.
+    resumeIfCurrent: (): void => {
+      if (gatewayLateReadyObservation && gatewayLateReadyObservation !== observation) return
+      if (gatewayLateReadyObservation === observation) gatewayLateReadyObservation = null
+      if (authorityIsCurrent()) observeLateOwnedGatewayReadiness(deadline)
+    },
+  }
+  gatewayLateReadyObservation = observation
+  const isCurrent = observation.isCurrent
+  if (!isCurrent()) {
+    // The foreground deadline can expire while update verification is still
+    // running. Retain only this timeout's intent and budget; do not probe yet.
+    if (updateApplying && appExitPhase === 'deferred' && !isQuitting) return
+    gatewayLateReadyObservation = null
+    return
+  }
+  void waitForGatewayReadiness({
+    probe: async remainingMs => {
+      if (!isCurrent() || !await readinessCheck(url, remainingMs)) return false
+      if (!isCurrent() || !await verifyOwnedGatewayLaunch(authority.child)) return false
+      return isCurrent()
+    },
+    exitMessage: () => isCurrent() ? null : 'Late Gateway readiness was superseded.',
+    primaryTimeoutMs: remainingMs,
+    lateGraceMs: 0,
+    pollIntervalMs: 2_000,
+  }).then(async result => {
+    if (result.status !== 'ready' || !isCurrent()) return
+    // Explicit Resume may have restored boot.html before timing out again.
+    // The existing helper is a no-op when the local renderer is already open.
+    await loadDesktopRendererIntoCurrentWindow()
+    if (!isCurrent()) return
+    bootError = null
+    publishResumedOwnedGateway(authority.child)
+    sendBootStatus('ready')
+    finishAppStartSuccess()
+  }).catch(error => {
+    if (isCurrent()) desktopLog('gateway_late_readiness_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }).finally(() => {
+    if (gatewayLateReadyObservation === observation) gatewayLateReadyObservation = null
+  })
 }
 
 const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000
 const desktopGatewayOwnershipVerification = new DesktopGatewayOwnershipVerificationCoordinator({
   onPidRecycled: (record) => {
     desktopLog('gateway_ownership_pid_recycled', { pid: record.pid, port: record.port })
+  },
+  onVerificationFailed: (record, diagnostic, exitReason) => {
+    desktopLog('gateway_ownership_not_verified', {
+      phase: 'orphan', pid: record.pid, port: record.port, exitReason, ...diagnostic,
+    })
   },
 })
 
@@ -9065,6 +9356,9 @@ async function verifyDesktopGatewayOwnershipWhenReady(
 async function recoverVerifiedOrphanGatewayBeforeSpawn(
   profile = activeDesktopProfile(),
 ): Promise<void> {
+  observeDesktopStartupStage('orphan-owner', {
+    profileKind: profile.kind,
+  })
   const ownershipDir = desktopGatewayOwnershipDir(profile)
   const loaded = loadDesktopGatewayOwnershipRecord(ownershipDir)
   if (loaded.status !== 'valid') {
@@ -9087,7 +9381,6 @@ async function recoverVerifiedOrphanGatewayBeforeSpawn(
       // A stale record after SIGKILL is harmless: the OS has already released the
       // profile lock and the next admitted Gateway will replace the record. Do
       // not unlink it or infer authority over whatever now owns the PID/port.
-      desktopLog('gateway_ownership_not_verified', { pid: current.pid, port: current.port })
       return
     }
 
@@ -9186,6 +9479,7 @@ async function startGateway(): Promise<GatewayState> {
   const overrideUrl = process.env.OPENSQUILLA_DESKTOP_GATEWAY_URL
   if (overrideUrl) {
     beginGatewayStartTelemetry('external', 'health')
+    observeDesktopStartupStage('gateway-spawn', { operation: 'external', spawned: false })
     if (!isCurrent()) throw new Error('Desktop startup was superseded before Gateway override validation.')
     sendBootStatus('gateway-health')
     gatewayState.url = overrideUrl.replace(/\/$/, '')
@@ -9195,6 +9489,7 @@ async function startGateway(): Promise<GatewayState> {
     gatewayConnectionInstanceId = randomUUID()
     gatewayState.status = 'starting'
     gatewayState.error = undefined
+    desktopStartupLog('gateway_starting', { operation: 'external', port: gatewayState.port })
     publishGatewayConnection()
     const overrideReady = await readinessCheck(gatewayState.url)
     if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway override validation.')
@@ -9205,6 +9500,10 @@ async function startGateway(): Promise<GatewayState> {
       publishGatewayConnection()
       throw new Error(`Configured gateway is not healthy: ${gatewayState.url}`)
     }
+    observeDesktopStartupStage('core-ready', { operation: 'external' })
+    observeDesktopStartupStage('ownership', { operation: 'external', verified: false })
+    observeDesktopStartupStage('legacy-ready', { operation: 'external', source: 'descriptor' })
+    desktopStartupLog('gateway_ready', { operation: 'external', port: gatewayState.port })
     publishGatewayConnection()
     return gatewayState
   }
@@ -9216,15 +9515,51 @@ async function startGateway(): Promise<GatewayState> {
   sendBootStatus('profile')
   const connection = await prepareDesktopStartupConnection()
   if (!isCurrent()) throw new Error('Desktop startup was superseded during profile setup.')
+  let startupConnection = connection
+  const shouldRunFreshOnboarding = (
+    startupConnection === null
+    && freshOnboardingProfileKey === startupProfileKey
+    && !forceOnboardingOnNextStartup
+  )
+  if (shouldRunFreshOnboarding) {
+    // Consume the fresh marker before opening the window. A successful save or
+    // an explicit skip/close must never cause the ready path to invite twice.
+    freshOnboardingProfileKey = null
+    onboardingPromptProfileKey = null
+    try {
+      startupConnection = await runOnboarding()
+      // Closing the window while a save is already admitted resolves the flow
+      // immediately, while the atomic write continues in the coordinator.
+      // Never spawn a Gateway against a profile that is still being written.
+      await onboardingFlows.waitForAbandonedSave()
+      if (startupConnection === null) startupConnection = await loadDesktopCredential()
+    } catch (error) {
+      // The invitation is optional. A renderer/load failure must not turn a
+      // usable unconfigured Gateway into a boot failure; leave the prompt key
+      // for the ready path so the user can retry after the client is up.
+      desktopLog('onboarding_preboot_unavailable', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      startupConnection = await loadDesktopCredential()
+      if (startupConnection === null) onboardingPromptProfileKey = startupProfileKey
+    }
+    if (!isCurrent()) {
+      if (startupConnection === null && !forceOnboardingOnNextStartup) {
+        freshOnboardingProfileKey = startupProfileKey
+        onboardingPromptProfileKey = startupProfileKey
+      }
+      throw new Error('Desktop startup was superseded during fresh onboarding.')
+    }
+  }
   forceOnboardingOnNextStartup = false
-  const apiKey = connection ? decryptApiKey(connection) : ''
+  const apiKey = startupConnection ? decryptApiKey(startupConnection) : ''
   // Keyless providers (e.g. Ollama) ship requiresApiKey=false and are accepted
   // by onboarding without a key, so only treat a missing key as fatal when the
   // provider actually needs one — otherwise every keyless credential wedges boot.
-  if (connection && providerDefaults(connection.provider).requiresApiKey && !apiKey) {
+  if (startupConnection && providerDefaults(startupConnection.provider).requiresApiKey && !apiKey) {
     throw new Error('Saved desktop API key could not be read.')
   }
-  const searchApiKey = connection ? decryptSearchApiKey(connection) : ''
+  const searchApiKey = startupConnection ? decryptSearchApiKey(startupConnection) : ''
   // Config is seeded (when missing) inside runOnboarding / the onboarding save,
   // and is otherwise the RPC-owned source of truth — so it is intentionally NOT
   // regenerated here on every boot.
@@ -9303,8 +9638,14 @@ async function startGateway(): Promise<GatewayState> {
   gatewayState.logPath = logPath
   gatewayState.error = undefined
   gatewayConnectionInstanceId = randomUUID()
+  desktopStartupLog('gateway_starting', { operation: 'spawn', port })
   publishGatewayConnection()
 
+  observeDesktopStartupStage('gateway-spawn', {
+    operation: 'spawn',
+    port,
+    runtimeMode: runtime.mode,
+  })
   const childPath = desktopChildPath()
   const gatewayInstanceNonce = createDesktopGatewayInstanceNonce()
   const gatewayOwnershipDir = desktopGatewayOwnershipDir(activeProfile)
@@ -9312,8 +9653,8 @@ async function startGateway(): Promise<GatewayState> {
   const childEnv = desktopChildEnvironment(activeProfile, {
     PATH: childPath,
     ...(process.platform === 'win32' ? { Path: childPath } : {}),
-    ...(connection?.apiKeyEnv && apiKey ? { [connection.apiKeyEnv]: apiKey } : {}),
-    ...(connection?.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
+    ...(startupConnection?.apiKeyEnv && apiKey ? { [startupConnection.apiKeyEnv]: apiKey } : {}),
+    ...(startupConnection?.searchApiKeyEnv && searchApiKey ? { [startupConnection.searchApiKeyEnv]: searchApiKey } : {}),
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_ID: gatewayConnectionInstanceId,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
@@ -9322,12 +9663,13 @@ async function startGateway(): Promise<GatewayState> {
     // desktopChildEnvironment pins OPENSQUILLA_STATE_DIR to H. RC4's Python
     // recovery engine has already validated/reconciled the historical nested
     // layout before this writer is admitted.
-    ...(connection?.disableNetworkObservability ? { OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: '1' } : {}),
+    ...(startupConnection?.disableNetworkObservability ? { OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: '1' } : {}),
     PYTHONUNBUFFERED: '1',
     PYTHONUTF8: '1',
     PYTHONIOENCODING: 'utf-8:replace',
   })
 
+  const gatewaySpawnRequestedAt = Date.now()
   const child = spawn(
     runtime.command,
     [...runtime.args, '--port', String(port), '--listen', '127.0.0.1', '--config', desktopConfigPath()],
@@ -9340,9 +9682,21 @@ async function startGateway(): Promise<GatewayState> {
       windowsHide: true,
     }
   )
+  // Keep the Windows packaged startup tail observable at the process boundary.
+  // `ChildProcess.spawn` only proves that CreateProcess returned; the bundled
+  // PyInstaller executable and Python imports may still take seconds before
+  // the first Gateway log line.  Do not log payload bytes: the timing record
+  // separates this pre-log interval from the instrumented Gateway phases.
+  let gatewayFirstOutputAt: number | null = null
+  let gatewayFirstOutputStream: 'stdout' | 'stderr' | null = null
   let childSpawnSucceeded = false
   child.once('spawn', () => {
     childSpawnSucceeded = true
+    desktopStartupLog('gateway_child_spawned', {
+      pid: child.pid,
+      port,
+      spawnToChildMs: Math.max(0, Date.now() - gatewaySpawnRequestedAt),
+    })
   })
   gatewayProcess = child
   gatewayProcessOwnershipContexts.set(child, {
@@ -9365,11 +9719,29 @@ async function startGateway(): Promise<GatewayState> {
 
   let gatewayOutputTail = ''
   let childExitMessage: string | null = null
+  const markGatewayFirstOutput = (stream: 'stdout' | 'stderr', chunk: Buffer | string): void => {
+    if (gatewayFirstOutputAt !== null) return
+    gatewayFirstOutputAt = Date.now()
+    gatewayFirstOutputStream = stream
+    desktopStartupLog('gateway_process_output_first', {
+      pid: child.pid,
+      port,
+      stream,
+      bytes: Buffer.byteLength(String(chunk), 'utf8'),
+      spawnToOutputMs: Math.max(0, gatewayFirstOutputAt - gatewaySpawnRequestedAt),
+    })
+  }
   const rememberGatewayOutput = (chunk: Buffer | string) => {
     gatewayOutputTail = appendGatewayOutputTail(gatewayOutputTail, chunk)
   }
-  child.stdout.on('data', rememberGatewayOutput)
-  child.stderr.on('data', rememberGatewayOutput)
+  child.stdout.on('data', (chunk) => {
+    markGatewayFirstOutput('stdout', chunk)
+    rememberGatewayOutput(chunk)
+  })
+  child.stderr.on('data', (chunk) => {
+    markGatewayFirstOutput('stderr', chunk)
+    rememberGatewayOutput(chunk)
+  })
   child.stdout.pipe(logStream, { end: false })
   child.stderr.pipe(logStream, { end: false })
   // Classify startup failures only after stdio has closed. Node may emit
@@ -9386,11 +9758,20 @@ async function startGateway(): Promise<GatewayState> {
     const childWasReady = childReadyAuthority !== null
     const unexpectedReadyExit = isCurrentGateway
       && childWasReady
-      && abnormalExit
       && !isQuitting
       && !gatewayStoppingProcesses.has(child)
+    desktopLog('gateway_exited', {
+      pid: child.pid,
+      code,
+      signal,
+      abnormalExit,
+      current: isCurrentGateway,
+      ready: childWasReady,
+      quitting: isQuitting,
+      gatewayStopping: gatewayStoppingProcesses.has(child),
+    })
     gatewayReadyProcesses.delete(child)
-    if (unexpectedReadyExit) {
+    if (unexpectedReadyExit && abnormalExit) {
       desktopReliabilityTelemetry.recordCrash({
         component: 'gateway',
         errorCode: 'gateway_unexpected_exit',
@@ -9416,7 +9797,12 @@ async function startGateway(): Promise<GatewayState> {
       publishGatewayConnection()
       return
     }
-    if (abnormalExit) {
+    // A ready Gateway can receive SIGTERM and exit cleanly (code=0). That is
+    // still an unexpected disconnect while the Desktop app is alive. Treat it
+    // like an abnormal ready exit so the bounded recovery series can restore
+    // the child. The stopping set and lifecycle authority checks above/below
+    // keep explicit quit, update, and profile recovery drains excluded.
+    if (abnormalExit || unexpectedReadyExit) {
       if (scheduleGatewayUnexpectedExitRestart(
         classifiedMessage,
         childWasReady,
@@ -9459,7 +9845,12 @@ async function startGateway(): Promise<GatewayState> {
 
   sendBootStatus('gateway-health')
   advanceGatewayStartTelemetry('health')
-  await waitForGateway(url, () => childExitMessage)
+  await waitForGateway(
+    url,
+    () => childExitMessage,
+    remainingMs => verifyOwnedGatewayLaunch(child, { emitDiagnostic: false, timeoutMs: remainingMs }),
+  )
+  observeDesktopStartupStage('core-ready', { operation: 'spawn', pid: child.pid })
   // Guard against adopting a foreign gateway that won the probe→bind race: if our
   // spawned child has already exited, it lost the exclusive bind and the healthy
   // endpoint belongs to someone else (e.g. a CLI `opensquilla gateway run` on the
@@ -9479,6 +9870,7 @@ async function startGateway(): Promise<GatewayState> {
       'OPENSQUILLA_GATEWAY_PORT_IN_USE: Gateway port is already in use by an unverified listener.',
     )
   }
+  observeDesktopStartupStage('ownership', { operation: 'spawn', pid: child.pid, verified: true })
   if (hasGatewayProcessExited(child) || gatewayProcess !== child || !isCurrent()) {
     throw new Error(childExitMessage
       || 'OPENSQUILLA_GATEWAY_PORT_IN_USE: desktop gateway changed during ownership verification.')
@@ -9486,7 +9878,17 @@ async function startGateway(): Promise<GatewayState> {
   sendBootStatus('control')
   gatewayState.status = 'ready'
   gatewayState.error = undefined
+  desktopStartupLog('gateway_ready', {
+    operation: 'spawn',
+    pid: child.pid,
+    spawnToReadyMs: Math.max(0, Date.now() - gatewaySpawnRequestedAt),
+    spawnToOutputMs: gatewayFirstOutputAt === null
+      ? null
+      : Math.max(0, gatewayFirstOutputAt - gatewaySpawnRequestedAt),
+    firstOutputStream: gatewayFirstOutputStream,
+  })
   markGatewayProcessReady(child)
+  observeDesktopStartupStage('legacy-ready', { operation: 'spawn', source: 'descriptor' })
   publishGatewayConnection()
   return gatewayState
 }
@@ -9555,15 +9957,27 @@ async function createMainWindow(): Promise<BrowserWindow> {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Electron disables Chromium's built-in PDF plugin by default. The
+      // Workbench intentionally uses the native PDF viewer for PDF artifacts;
+      // keep the renderer sandboxed while enabling that viewer.
+      plugins: true,
     },
   })
   mainWindow = window
+  installGatewayShutdownRequestInterceptor(window)
   trackDesktopReliabilityWindow(window)
   installDesktopZoomShortcuts(
     window.webContents,
     window.webContents,
     () => nativeWorkbenchSurfaces.refreshBounds(window),
   )
+  if (process.platform !== 'darwin') {
+    installDesktopReloadShortcuts(
+      window.webContents,
+      window.webContents,
+      () => currentOnboardingWindow() === null,
+    )
+  }
   installEditingContextMenu(window)
 
   const rendererConsoleLogLimiter = new RendererConsoleLogLimiter()
@@ -9577,6 +9991,11 @@ async function createMainWindow(): Promise<BrowserWindow> {
     void nativeWorkbenchSurfaces.destroyAll()
     void artifactPreviewLeaseBroker.revokeAll()
   }
+
+  let rendererRecoveryGeneration = 0
+  let cancelRendererRecovery: (() => void) | null = null
+  let rendererRecoveryFailureWindowStartedAt = 0
+  let rendererRecoveryFailureCount = 0
 
   // Forward renderer console errors to desktop.log. The Control UI runs
   // in the renderer, so a purely front-end failure (a thrown error, an unhandled
@@ -9603,6 +10022,8 @@ async function createMainWindow(): Promise<BrowserWindow> {
   // failure of all — the whole UI freezes with nothing in any log — so stamping
   // the reason and exit code gives a first, always-present breadcrumb.
   window.webContents.on('render-process-gone', (_event, details) => {
+    rendererRecoveryGeneration += 1
+    const recoveryGeneration = rendererRecoveryGeneration
     flushRendererConsoleSuppression()
     releaseRendererOwnedArtifactPreviews()
     if (rendererUnresponsiveAt !== null) {
@@ -9615,6 +10036,72 @@ async function createMainWindow(): Promise<BrowserWindow> {
       exitCode: details.exitCode,
     })
     desktopLog(entry.event, entry.detail)
+
+    // A crashed renderer leaves the native window and its Gateway owner alive,
+    // so recover the document in place. This is deliberately bounded: one
+    // reload per crash generation and at most three failed recoveries per
+    // minute. A later generation cannot let an older did-finish-load callback
+    // publish readiness or reset the failure budget.
+    // A new crash invalidates the old load. Retire its listener and timer
+    // before starting the latest generation with the same failure budget.
+    cancelRendererRecovery?.()
+    if (isQuitting || appExitPhase !== 'running' || window.isDestroyed()) {
+      desktopLog('renderer_recovery_suppressed', {
+        generation: recoveryGeneration,
+        reason: 'lifecycle_not_running',
+      })
+      return
+    }
+    const now = Date.now()
+    if (now - rendererRecoveryFailureWindowStartedAt >= 60_000) {
+      rendererRecoveryFailureWindowStartedAt = now
+      rendererRecoveryFailureCount = 0
+    }
+    if (rendererRecoveryFailureCount >= 3) {
+      desktopLog('renderer_recovery_exhausted', {
+        generation: recoveryGeneration,
+        failures: rendererRecoveryFailureCount,
+      })
+      return
+    }
+    rendererRecoveryFailureCount += 1
+    desktopLog('renderer_recovery_scheduled', {
+      generation: recoveryGeneration,
+      attempt: rendererRecoveryFailureCount,
+    })
+    let finished = false
+    let onReady: () => void = () => undefined
+    const timeout = setTimeout(() => finish('timeout'), 30_000)
+    const finish = (outcome: 'ready' | 'timeout' | 'stale' | 'reload-failed'): void => {
+      if (finished) return
+      finished = true
+      clearTimeout(timeout)
+      window.webContents.removeListener('did-finish-load', onReady)
+      cancelRendererRecovery = null
+      if (outcome === 'ready' && recoveryGeneration === rendererRecoveryGeneration) {
+        rendererRecoveryFailureCount = 0
+        desktopLog('renderer_recovery_ready', {
+          generation: recoveryGeneration,
+          rendererPid: window.webContents.getOSProcessId(),
+        })
+      } else if (outcome !== 'stale') {
+        desktopLog('renderer_recovery_failed', { generation: recoveryGeneration, outcome })
+      }
+    }
+    onReady = (): void => {
+      if (recoveryGeneration !== rendererRecoveryGeneration) {
+        finish('stale')
+        return
+      }
+      finish('ready')
+    }
+    cancelRendererRecovery = () => finish('stale')
+    window.webContents.once('did-finish-load', onReady)
+    try {
+      window.webContents.reload()
+    } catch {
+      finish('reload-failed')
+    }
   })
 
   window.webContents.on('unresponsive', () => {
@@ -10101,10 +10588,15 @@ async function openOrResumeDesktopApp(): Promise<void> {
       let operationIsCurrent = () => (
         desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)
       )
-      await createMainWindow()
-      focusMainWindow()
+      const startupStageAttempt = beginDesktopStartupStageAttempt()
 
       try {
+        // Anchor the diagnostic timeline before creating/focusing the window;
+        // window construction is part of user-visible startup and must not be
+        // hidden by moving the first timestamp later in the flow.
+        await createMainWindow()
+        focusMainWindow()
+        observeDesktopStartupStage('profile-inspect', { operation: 'startup' })
         const profileReady = await inspectActiveProfileBeforeStartup()
         // Only trust config.state_dir after profile inspection/recovery has
         // bounded the active profile. Sync before publishing that inspection's
@@ -10123,6 +10615,9 @@ async function openOrResumeDesktopApp(): Promise<void> {
         if (!profileReady && operationIsCurrent()) {
           finishAppStartFailure(new Error('profile recovery required'), {
             stage: 'profile',
+            errorCode: 'profile_recovery_required',
+          })
+          finishDesktopStartupStageAttempt(startupStageAttempt, 'fail', {
             errorCode: 'profile_recovery_required',
           })
         }
@@ -10158,8 +10653,17 @@ async function openOrResumeDesktopApp(): Promise<void> {
               )
             )
             if (operationIsCurrent()) {
+              observeDesktopStartupStage('websocket-connected', {
+                boundary: 'main-publication',
+                observed: false,
+              })
+              observeDesktopStartupStage('tool-ready', {
+                boundary: 'desktop-ready',
+                observed: false,
+              })
               sendBootStatus('ready')
               finishAppStartSuccess()
+              finishDesktopStartupStageAttempt(startupStageAttempt, 'success')
               if (onboardingPromptProfileKey === desktopProfileKey() && !onboardingFlows.active) {
                 onboardingPromptProfileKey = null
                 // The client and Gateway are already ready. This optional,
@@ -10191,10 +10695,26 @@ async function openOrResumeDesktopApp(): Promise<void> {
           if (operationIsCurrent()) {
             if (currentMainWindow()) sendBootError(error)
             finishAppStartFailure(error)
+            finishDesktopStartupStageAttempt(startupStageAttempt, 'fail', {
+              error: error instanceof Error ? error.message : String(error),
+            })
+            if (error instanceof GatewayReadinessTimeoutError) observeLateOwnedGatewayReadiness()
           }
         }
       }
-      if (desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)) return
+      if (desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)) {
+        if (!startupStageAttempt.finished) {
+          finishDesktopStartupStageAttempt(startupStageAttempt, 'cancel', {
+            reason: 'startup_authority_changed',
+          })
+        }
+        return
+      }
+      if (!startupStageAttempt.finished) {
+        finishDesktopStartupStageAttempt(startupStageAttempt, 'cancel', {
+          reason: 'startup_authority_changed',
+        })
+      }
       if (gatewayProfileKey && gatewayProfileKey !== desktopProfileKey()) {
         if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
         else clearReusableGatewayState()
@@ -12098,6 +12618,7 @@ async function stopAndJoinAllLifecycleOwnedGateways(
   stopCurrentProcess: (child: ChildProcessWithoutNullStreams) => void = () => stopGateway(),
 ): Promise<boolean> {
   cancelGatewayUnexpectedExitRestart('Gateway stop/join requested')
+  const startedAt = Date.now()
   return await stopAndJoinLifecycleProcesses({
     currentProcess: () => (
       gatewayProcess && gatewayState.owned && !hasGatewayProcessExited(gatewayProcess)
@@ -12107,6 +12628,22 @@ async function stopAndJoinAllLifecycleOwnedGateways(
     stopCurrentProcess,
     liveProcesses: liveLifecycleOwnedGatewayProcesses,
     waitForExit: (child) => waitForGatewayProcessExit(child),
+    onStopRequested: (child) => desktopStartupLog('gateway_stop_requested', {
+      pid: child.pid,
+      operationElapsedMs: Math.max(0, Date.now() - startedAt),
+    }),
+    onChildExited: (child, exited) => desktopStartupLog(
+      exited ? 'gateway_child_exited' : 'gateway_child_exit_wait',
+      {
+        pid: child.pid,
+        exited,
+        operationElapsedMs: Math.max(0, Date.now() - startedAt),
+      },
+    ),
+    onComplete: (exited) => desktopStartupLog('gateway_stop_join_complete', {
+      exited,
+      operationElapsedMs: Math.max(0, Date.now() - startedAt),
+    }),
   })
 }
 
@@ -12155,6 +12692,7 @@ async function applyWindowsInstaller(): Promise<void> {
   const profileKey = desktopProfileKey()
   let recoveryGeneration = 0
   let telemetryStartedAt = 0
+  let resumeLateReadinessAfterFailure: (() => void) | null = null
   const assertCanHandoff = () => {
     if (liveLifecycleOwnedGatewayProcesses().length > 0 || !writerAdmissionToken
       || desktopWriters.hasOtherOwner(writerAdmissionToken) || desktopWriters.activeCount !== 0) {
@@ -12165,12 +12703,30 @@ async function applyWindowsInstaller(): Promise<void> {
     canStart: () => windowsInstallerActionsSupported() && !isQuitting && appExitPhase === 'running'
       && !updateApplying && !updateDownloadInProgress && !manualInstallerActionInProgress && !desktopWriters.closed,
     started: () => {
+      if (gatewayLateReadyObservation?.isCurrent()) {
+        resumeLateReadinessAfterFailure = gatewayLateReadyObservation.resumeIfCurrent
+      }
       recoveryGeneration = ++windowsUpdateRecoveryGeneration
       telemetryStartedAt = Date.now()
       updateApplying = true
       setAppExitPhase('deferred', 'verifying Windows update before installation')
       setDesktopUpdateState({ status: 'applying', error: null, errorCode: null })
       createApplicationMenu()
+    },
+    stage: (event, detail) => {
+      // The shared stop/join helper emits per-child gateway_stop_requested and
+      // gateway child-exit breadcrumbs. Keep the update coordinator's
+      // update-level stages separate so one child does not produce duplicates.
+      if (
+        event === 'gateway_stop_requested'
+        || event === 'gateway_child_exited'
+        || event === 'gateway_child_exit_wait'
+      ) return
+      desktopStartupLog(event, {
+        operation: 'windows-update',
+        operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
+        ...detail,
+      })
     },
     verify: async () => {
       installerPath = await revalidateReadyWindowsInstaller()
@@ -12252,7 +12808,14 @@ async function applyWindowsInstaller(): Promise<void> {
             : desktopUpdateErrorMessage(errorCode),
       })
       desktopLog('update_windows_installer_failed', { version: candidate.version, errorCode, error: String(error) })
-      if (quitResumed || !gatewayStopStarted || !previouslyOwned) return
+      if (quitResumed) return
+      if (!gatewayStopStarted) {
+        const resumeLateReadiness = gatewayLateReadyObservation?.resumeIfCurrent
+          ?? resumeLateReadinessAfterFailure
+        resumeLateReadiness?.()
+        return
+      }
+      if (!previouslyOwned) return
       // If termination timed out, wait for these exact children. Never start a
       // second Gateway or resurrect a profile after another lifecycle action.
       const resume = () => {
@@ -12317,13 +12880,22 @@ async function applyDownloadedUpdate(): Promise<void> {
   const pendingVersion = downloadedUpdateVersion
   if (pendingVersion === null) return
   const telemetryStartedAt = Date.now()
+  desktopStartupLog('update_started', { operation: 'auto-updater' })
   updateApplying = true
   setAppExitPhase('deferred', 'preparing downloaded update')
   // Never interrupt a reconcile/workspace/settings transaction after it has
   // been admitted. Close new writers and wait for existing operations to
   // finish naturally before the installer handoff.
   const updateWriterAdmission = desktopWriters.close('apply downloaded update')
+  desktopStartupLog('writers_admission_closed', {
+    operation: 'auto-updater',
+    operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
+  })
   await waitForDesktopWriterOperations()
+  desktopStartupLog('writers_drained', {
+    operation: 'auto-updater',
+    operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
+  })
   downloadedUpdateVersion = null
   createApplicationMenu()
   setDesktopUpdateState({
@@ -12371,6 +12943,10 @@ async function applyDownloadedUpdate(): Promise<void> {
     updateInstallHandoffReady = true
     setAppExitPhase('committed', 'handing off to desktop updater')
     autoUpdater.quitAndInstall(false, true)
+    desktopStartupLog('installer_handoff', {
+      operation: 'auto-updater',
+      operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
+    })
   } catch (err) {
     desktopReliabilityTelemetry.clearUpdateHandoff()
     desktopReliabilityTelemetry.recordUpdateResult({
@@ -12434,12 +13010,33 @@ ipcMain.handle('desktop:deep-link-session:get', (event) => {
 ipcMain.handle('desktop:theme:set', (_event, payload: unknown) => (
   applyDesktopNativeTheme(normalizeDesktopNativeThemeSource(payload))
 ))
-ipcMain.handle('gateway:status', () => ({ ...gatewayState }))
+ipcMain.handle('gateway:status', () => {
+  if (gatewayState.status === 'ready') {
+    // This is the main-process boundary at which the renderer has requested
+    // the Gateway capability state. It is intentionally labelled as a
+    // boundary observation; actual tool registration remains Gateway-owned.
+    observeDesktopStartupStage('tool-ready', {
+      boundary: 'gateway-status-ipc',
+      observed: false,
+    })
+  }
+  return { ...gatewayState }
+})
 ipcMain.handle('gateway:connection', (event) => {
   if (!trustedMainWindowControlIpc(event)) {
     throw new Error('Untrusted Gateway connection request.')
   }
   const snapshot = desktopGatewayConnectionSnapshot()
+  if (snapshot.status === 'ready') {
+    // The Desktop can observe the trusted renderer asking for the connection
+    // descriptor, but the WebSocket handshake itself is owned by WebUI. Keep
+    // that distinction explicit in diagnostics instead of claiming a socket
+    // was established merely because IPC returned successfully.
+    observeDesktopStartupStage('websocket-connected', {
+      boundary: 'gateway-connection-ipc',
+      observed: false,
+    })
+  }
   if (snapshot.status === 'ready' && gatewayState.sandboxUpgrade === null) {
     void refreshSandboxUpgradeReport()
   }
@@ -12508,6 +13105,58 @@ ipcMain.handle('desktop:source-file:action', async (event, payload: SourceFileAc
     },
     openPath: path => shell.openPath(path), reveal: path => shell.showItemInFolder(path),
   })
+})
+ipcMain.handle('desktop:workspace-file:action', async (event, payload: WorkspaceFileActionRequest) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted workspace file request.')
+  return performWorkspaceFileAction(payload, {
+    connection: () => {
+      if (!trustedControlUiIpc(event) || !gatewayState.owned || gatewayState.status !== 'ready') return null
+      const snapshot = desktopGatewayConnectionSnapshot()
+      const nonce = gatewayProcess ? gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce : null
+      if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken || !nonce) return null
+      return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+        url: snapshot.httpUrl, authToken: snapshot.authToken, nonce }
+    },
+    openPath: path => shell.openPath(path), reveal: path => shell.showItemInFolder(path),
+  }).catch(() => {
+    // Native filesystem errors can embed host paths. Only the main process
+    // receives controlled metadata; renderer errors remain path-free.
+    throw new Error('Workspace file action failed')
+  })
+})
+ipcMain.handle('desktop:files:choose-paths', async (event, request: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted local path request')
+  const connectionRevision = gatewayConnectionRevision
+  let invalidated = false
+  const invalidate = () => { invalidated = true }
+  const onNavigation = (_event: Electron.Event, _url: string, _inPlace: boolean, mainFrame: boolean) => {
+    if (mainFrame) invalidate()
+  }
+  event.sender.on('did-start-navigation', onNavigation)
+  event.sender.once('destroyed', invalidate)
+  try {
+    return await chooseLocalFilePaths(request, {
+      connection: () => {
+        if (invalidated || connectionRevision !== gatewayConnectionRevision
+          || event.sender.isDestroyed() || !trustedControlUiIpc(event)
+          || !gatewayState.owned || gatewayState.status !== 'ready' || !gatewayProcess) return null
+        const snapshot = desktopGatewayConnectionSnapshot()
+        const nonce = gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce
+        if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken || !nonce) return null
+        return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+          url: snapshot.httpUrl, authToken: snapshot.authToken, nonce }
+      },
+      pick: async () => {
+        const window = BrowserWindow.fromWebContents(event.sender)
+        if (!window) throw new Error('Main window unavailable')
+        const choice = await dialog.showOpenDialog(window, { properties: ['openFile', 'multiSelections'] })
+        return choice.canceled ? [] : choice.filePaths
+      },
+    })
+  } finally {
+    event.sender.removeListener('did-start-navigation', onNavigation)
+    event.sender.removeListener('destroyed', invalidate)
+  }
 })
 // File paths enter this broker only from the native picker or isolated preload's
 // webUtils.getPathForFile(File); renderer-facing calls never accept a path string.
@@ -12612,6 +13261,10 @@ ipcMain.handle('desktop:workbench:browser:target', (event, payload: unknown) => 
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted browser request.')
   const request = payload as { surfaceId?: unknown } | null
   return nativeWorkbenchSurfaces.getBrowserTarget(parseNativeWorkbenchSurfaceId(request?.surfaceId))
+})
+ipcMain.handle('desktop:workbench:browser:automation-state', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted browser request.')
+  return await nativeWorkbenchSurfaces.setBrowserAutomationState(payload)
 })
 ipcMain.handle('desktop:workbench:annotation:focus', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted annotation request.')
@@ -14940,6 +15593,10 @@ function currentBootResumeAuthority(): BootResumeAuthority | null {
 
 function bootResumeAuthorityIsCurrent(authority: BootResumeAuthority): boolean {
   return !isQuitting
+    && !updateApplying
+    && !desktopWriters.closed
+    && appExitPhase === 'running'
+    && !gatewayStoppingProcesses.has(authority.child)
     && gatewayProcess === authority.child
     && !hasGatewayProcessExited(authority.child)
     && gatewayState.owned
@@ -14949,6 +15606,9 @@ function bootResumeAuthorityIsCurrent(authority: BootResumeAuthority): boolean {
 }
 
 async function resumeBootStartup(): Promise<{ ok: boolean; error?: string; code?: BootErrorCode }> {
+  // The explicit Resume flow owns readiness publication from this point; an
+  // in-flight background probe may finish, but can no longer adopt its result.
+  gatewayLateReadyObservation = null
   invalidateSecretStorageBackendCache()
   const pendingStart = gatewayStartPromise
   const initialAuthority = pendingStart ? null : currentBootResumeAuthority()
@@ -15017,6 +15677,7 @@ async function resumeBootStartup(): Promise<{ ok: boolean; error?: string; code?
       error: message,
     })
     sendBootError(message)
+    if (error instanceof GatewayReadinessTimeoutError) observeLateOwnedGatewayReadiness()
     return { ok: false, error: message }
   }
 }
@@ -15042,6 +15703,8 @@ ipcMain.handle('desktop:boot:retry', async () => {
     return { ok: true }
   }
 
+  const restartStartedAt = Date.now()
+  desktopStartupLog('runtime_restart_started')
   // Otherwise force a real runtime restart. "Restart runtime" must relaunch the
   // child even when the current gateway is healthy, so join every lifecycle-
   // owned child before openOrResumeDesktopApp may respawn. This includes a
@@ -15049,6 +15712,10 @@ ipcMain.handle('desktop:boot:retry', async () => {
   // closed: spawning while any previous writer is live would race the profile
   // lock and recreate the startup failure this recovery action is meant to fix.
   const exited = await stopAndJoinAllLifecycleOwnedGateways()
+  desktopStartupLog('runtime_restart_child_exited', {
+    exited,
+    operationElapsedMs: Math.max(0, Date.now() - restartStartedAt),
+  })
   if (!exited) {
     const message = desktopGatewayStillRunningMessage()
     gatewayState.status = 'error'
@@ -15063,6 +15730,9 @@ ipcMain.handle('desktop:boot:retry', async () => {
   clearReusableGatewayState()
   bootError = null
 
+  desktopStartupLog('runtime_restart_starting', {
+    operationElapsedMs: Math.max(0, Date.now() - restartStartedAt),
+  })
   void openOrResumeDesktopApp()
   return { ok: true }
 })
@@ -15642,37 +16312,54 @@ const initialDesktopDeepLinkArguments = process.platform === 'win32' || process.
 // held. Without a retry the new process silently quits and no window appears
 // (issue #446). Retry synchronously for a short window, then — if still
 // unavailable — surface an explicit error instead of exiting silently.
+let existingDesktopActivationAccepted = false
 function acquireSingleInstanceLockWithRetry(): boolean {
   const deadline = Date.now() + 5_000
   // Atomics.wait blocks this thread without an event loop (app.whenReady has not
-  // fired) and, unlike a Date.now() spin, does not peg a CPU core. Larger sleep
-  // slices also cut the retry count — each failed requestSingleInstanceLock
-  // notifies the running instance (firing its second-instance handler).
+  // fired) without pegging a CPU core. Lock retries remain 400 ms apart because
+  // every failed request notifies the primary; receipt polls do not notify it.
   const sleepSignal = new Int32Array(new SharedArrayBuffer(4))
+  const activationRequest = initialDesktopDeepLinkArguments.length === 0
+    ? createDesktopActivationRequest() : null
+  const userData = app.getPath('userData')
   let attempt = 0
-  for (;;) {
-    attempt += 1
-    if (app.requestSingleInstanceLock()) {
-      desktopLog('single_instance_lock_acquired', {
-        elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
-        attempt,
-      })
-      return true
+  const acceptActivation = (): boolean => {
+    if (!activationRequest || !hasDesktopActivationAcknowledgement(userData, activationRequest)) return false
+    existingDesktopActivationAccepted = true
+    desktopLog('single_instance_activation_accepted', { attempt })
+    return true
+  }
+  try {
+    for (;;) {
+      if (attempt > 0 && acceptActivation()) return false
+      attempt += 1
+      if (app.requestSingleInstanceLock(activationRequest ? { desktopActivation: activationRequest } : undefined)) {
+        desktopLog('single_instance_lock_acquired', {
+          elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
+          attempt,
+        })
+        return true
+      }
+      // Protocol launches already hand their target to the existing instance.
+      // Keep their one-delivery behavior, including compatibility with old apps.
+      if (initialDesktopDeepLinkArguments.length > 0) {
+        desktopLog('single_instance_deep_link_forwarded', { attempt })
+        return false
+      }
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) {
+        desktopLog('single_instance_lock_unavailable', { attempt })
+        return false
+      }
+      const nextAttemptAt = Date.now() + Math.min(400, remaining)
+      do {
+        if (acceptActivation()) return false
+        // A healthy primary normally acknowledges before a second activation.
+        Atomics.wait(sleepSignal, 0, 0, Math.min(50, Math.max(0, nextAttemptAt - Date.now())))
+      } while (Date.now() < nextAttemptAt)
     }
-    // A Windows/Linux protocol launch targets the current instance and does not need
-    // the normal close/relaunch race retry. The failed lock request has already
-    // delivered its command line through second-instance; exit the forwarding
-    // process immediately instead of sending the same deep link for five seconds.
-    if (initialDesktopDeepLinkArguments.length > 0) {
-      desktopLog('single_instance_deep_link_forwarded', { attempt })
-      return false
-    }
-    const remaining = deadline - Date.now()
-    if (remaining <= 0) {
-      desktopLog('single_instance_lock_unavailable', { attempt })
-      return false
-    }
-    Atomics.wait(sleepSignal, 0, 0, Math.min(400, remaining))
+  } finally {
+    if (activationRequest) disposeDesktopActivationRequest(userData, activationRequest)
   }
 }
 
@@ -15693,10 +16380,10 @@ if (!gotSingleInstanceLock) {
   // to surface its window (the second-instance handler calls
   // openOrResumeDesktopApp), show an explicit dialog so the launch is never a
   // silent no-op, then quit.
-  desktopLog('launch_aborted_lock_held', {
+  desktopLog(existingDesktopActivationAccepted ? 'launch_forwarded_to_existing_instance' : 'launch_aborted_lock_held', {
     deepLinkHandoff: initialDesktopDeepLinkArguments.length > 0,
   })
-  if (initialDesktopDeepLinkArguments.length === 0) {
+  if (initialDesktopDeepLinkArguments.length === 0 && !existingDesktopActivationAccepted) {
     try {
       // This runs before app.whenReady, so app.getLocale() is unreliable; fall back
       // to the persisted onboarding locale (a plain file read) for this dialog.
@@ -15735,11 +16422,18 @@ if (!gotSingleInstanceLock) {
   })
   handleDeepLinksFromCommandLine(initialDesktopDeepLinkArguments, 'initial-argv')
 
-  app.on('second-instance', (_event, commandLine) => {
+  app.once('will-quit', clearDesktopActivationAcknowledgements)
+  app.on('second-instance', (_event, commandLine, _workingDirectory, additionalData) => {
     const hadDeepLink = handleDeepLinksFromCommandLine(commandLine, 'second-instance')
     desktopLog('second_instance', { hadDeepLink })
     if (hadDeepLink) return
     revealDesktopApp()
+    if (!canRevealDesktopApp(appExitPhase) || isQuitting) return
+    const revealed = currentOnboardingWindow() ?? currentMainWindow()
+    if (revealed && !revealed.isDestroyed() && revealed.isVisible()
+      && !revealed.isMinimized() && revealed.isFocused()) {
+      acknowledgeDesktopActivation(app.getPath('userData'), additionalData)
+    }
   })
 
   void app.whenReady().then(async () => {

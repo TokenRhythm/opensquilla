@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from email.message import Message
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -55,32 +56,37 @@ def _health(scope: str, fingerprint: str) -> dict[str, object]:
     }
 
 
-def test_protocol_approved_predecessor_diff_is_only_optional_device_field(
+def test_protocol_retirement_does_not_expand_approved_legacy_compatibility(
     protocol_preflight: ModuleType,
 ) -> None:
     raw = (ROOT / protocol_preflight.MANIFEST_PATH).read_bytes()
     current = protocol_preflight.manifest_fingerprint(raw)
-    manifest = json.loads(raw)
-    assert manifest.pop("device_identity") == {
-        "field": "device_id",
-        "format": "sha256-lowercase-hex",
-        "optional": True,
-        "scope": "application-events",
-        "deduplication_unit": "device",
-    }
-    assert manifest["manifest_version"] == 2
-    manifest["manifest_version"] = 1
-    previous = protocol_preflight.manifest_fingerprint(json.dumps(manifest).encode())
-    assert protocol_preflight.COMPATIBLE_PAIRS == {(current, previous)}
+    # This released pair approved only the optional device-field addition.
+    # Removing event types creates a distinct protocol; reporting compatibility
+    # still requires an exact match rather than inheriting historical approval.
+    legacy_server = "c05f4afd7bea0c9a3f110698aa2209994348479b45f105f9f80af2b4a2175d18"
+    legacy_client = "9e5d0501e6614fdcd4cf78f8a177db94b739fad156a0409f330809e5b2a5719f"
+    assert protocol_preflight.COMPATIBLE_PAIRS == {(legacy_server, legacy_client)}
+    assert current not in {legacy_server, legacy_client}
     for scope in ("growth", "reliability"):
         protocol_preflight.validate_health(_health(scope, current), scope, current)
-        protocol_preflight.validate_health(_health(scope, current), scope, previous)
+        protocol_preflight.validate_health(
+            _health(scope, legacy_server),
+            scope,
+            legacy_client,
+        )
         with pytest.raises(ValueError, match="does not support"):
-            protocol_preflight.validate_health(_health(scope, previous), scope, current)
+            protocol_preflight.validate_health(_health(scope, legacy_client), scope, legacy_server)
+        for legacy in (legacy_server, legacy_client):
+            with pytest.raises(ValueError, match="does not support"):
+                protocol_preflight.validate_health(_health(scope, legacy), scope, current)
+            with pytest.raises(ValueError, match="does not support"):
+                protocol_preflight.validate_health(_health(scope, current), scope, legacy)
 
 
 def test_protocol_source_reads_fixed_commit_not_mutated_checkout_or_tag(
-    protocol_preflight: ModuleType, local_source: Path,
+    protocol_preflight: ModuleType,
+    local_source: Path,
 ) -> None:
     raw = (ROOT / protocol_preflight.MANIFEST_PATH).read_bytes()
     path = local_source / protocol_preflight.MANIFEST_PATH
@@ -101,17 +107,24 @@ def test_protocol_source_reads_fixed_commit_not_mutated_checkout_or_tag(
 
 
 def test_protocol_legacy_tag_without_clients_does_not_need_collector(
-    protocol_preflight: ModuleType, local_source: Path,
+    protocol_preflight: ModuleType,
+    local_source: Path,
 ) -> None:
     sha = _git(local_source, "rev-parse", "HEAD")
     assert protocol_preflight.source_fingerprint(local_source, sha) is None
 
 
-@pytest.mark.parametrize("client_path", [
-    "src/opensquilla/telemetry", "desktop/electron/src/telemetry",
-])
+@pytest.mark.parametrize(
+    "client_path",
+    [
+        "src/opensquilla/telemetry",
+        "desktop/electron/src/telemetry",
+    ],
+)
 def test_protocol_existing_client_cannot_bypass_gate_with_missing_manifest(
-    protocol_preflight: ModuleType, local_source: Path, client_path: str,
+    protocol_preflight: ModuleType,
+    local_source: Path,
+    client_path: str,
 ) -> None:
     path = local_source / client_path / "client.txt"
     path.parent.mkdir(parents=True)
@@ -121,43 +134,68 @@ def test_protocol_existing_client_cannot_bypass_gate_with_missing_manifest(
         protocol_preflight.source_fingerprint(local_source, sha)
 
 
-@pytest.mark.parametrize("replacement", [
-    {"ok": False}, {"ok": 1}, {"scope": "reliability"},
-    {"schema_version": True}, {"schema_version": 2},
-    {"protocol_fingerprint": "A" * 64}, {"protocol_fingerprint": "b" * 64},
-    {"extra": "unexpected"},
-])
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        {"ok": False},
+        {"ok": 1},
+        {"scope": "reliability"},
+        {"schema_version": True},
+        {"schema_version": 2},
+        {"protocol_fingerprint": "A" * 64},
+        {"protocol_fingerprint": "b" * 64},
+        {"extra": "unexpected"},
+    ],
+)
 def test_protocol_health_rejects_wrong_service_version_or_identity(
-    protocol_preflight: ModuleType, replacement: dict[str, object],
+    protocol_preflight: ModuleType,
+    replacement: dict[str, object],
 ) -> None:
     with pytest.raises(ValueError):
-        protocol_preflight.validate_health({**_health("growth", "a" * 64), **replacement},
-                                          "growth", "a" * 64)
+        protocol_preflight.validate_health(
+            {**_health("growth", "a" * 64), **replacement}, "growth", "a" * 64
+        )
 
 
-@pytest.mark.parametrize("raw", [
-    b"[]", b"null", b"{broken", b'{"manifest_version":1,"manifest_version":2}',
-    b'{"manifest_version":true,"batch_version":1,"events":[{}]}',
-    b'{"manifest_version":2,"batch_version":1,"events":[NaN]}', b"\xff",
-])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"[]",
+        b"null",
+        b"{broken",
+        b'{"manifest_version":1,"manifest_version":2}',
+        b'{"manifest_version":true,"batch_version":1,"events":[{}]}',
+        b'{"manifest_version":2,"batch_version":1,"events":[NaN]}',
+        b"\xff",
+    ],
+)
 def test_protocol_manifest_rejects_malformed_input(
-    protocol_preflight: ModuleType, raw: bytes,
+    protocol_preflight: ModuleType,
+    raw: bytes,
 ) -> None:
     with pytest.raises(ValueError):
         protocol_preflight.manifest_fingerprint(raw)
 
 
-@pytest.mark.parametrize(("status", "content_type", "final_url", "raw", "valid"), [
-    (200, "application/json; charset=utf-8", None, b'{"ok":true}', True),
-    (202, "application/json", None, b'{"ok":true}', False),
-    (200, "text/html", None, b'{"ok":true}', False),
-    (200, "application/json", "https://other.example.invalid/", b'{"ok":true}', False),
-    (200, "application/json", None, b'{"ok":false,"ok":true}', False),
-    (200, "application/json", None, b"x" * 4097, False),
-])
+@pytest.mark.parametrize(
+    ("status", "content_type", "final_url", "raw", "valid"),
+    [
+        (200, "application/json; charset=utf-8", None, b'{"ok":true}', True),
+        (202, "application/json", None, b'{"ok":true}', False),
+        (200, "text/html", None, b'{"ok":true}', False),
+        (200, "application/json", "https://other.example.invalid/", b'{"ok":true}', False),
+        (200, "application/json", None, b'{"ok":false,"ok":true}', False),
+        (200, "application/json", None, b"x" * 4097, False),
+    ],
+)
 def test_protocol_https_response_is_bounded_and_not_redirected(
-    protocol_preflight: ModuleType, monkeypatch: pytest.MonkeyPatch,
-    status: int, content_type: str, final_url: str | None, raw: bytes, valid: bool,
+    protocol_preflight: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    content_type: str,
+    final_url: str | None,
+    raw: bytes,
+    valid: bool,
 ) -> None:
     url = protocol_preflight.HEALTH_URLS["growth"]
     response = io.BytesIO(raw)
@@ -188,13 +226,19 @@ def test_protocol_https_response_is_bounded_and_not_redirected(
     assert response.closed
 
 
-@pytest.mark.parametrize("error", [
-    URLError("synthetic network failure"), TimeoutError(),
-    HTTPError("https://example.invalid", 503, "unavailable", {}, None),
-    HTTPError("https://example.invalid", 429, "rate limited", {}, None),
-])
+@pytest.mark.parametrize(
+    "error",
+    [
+        URLError("synthetic network failure"),
+        TimeoutError(),
+        HTTPError("https://example.invalid", 503, "unavailable", {}, None),
+        HTTPError("https://example.invalid", 429, "rate limited", {}, None),
+    ],
+)
 def test_protocol_transient_failure_retries_then_checks_both_scopes(
-    protocol_preflight: ModuleType, monkeypatch: pytest.MonkeyPatch, error: Exception,
+    protocol_preflight: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
 ) -> None:
     calls: list[str] = []
     delays: list[int] = []
@@ -216,8 +260,11 @@ def test_protocol_transient_failure_retries_then_checks_both_scopes(
 
 
 @pytest.mark.parametrize(("status", "attempts"), [(301, 1), (401, 1), (404, 1), (503, 3)])
-def test_protocol_http_failure_never_allows_publication(
-    protocol_preflight: ModuleType, monkeypatch: pytest.MonkeyPatch, status: int, attempts: int,
+def test_protocol_http_failure_is_not_reported_as_compatible(
+    protocol_preflight: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    attempts: int,
 ) -> None:
     calls: list[str] = []
     monkeypatch.setattr(protocol_preflight.time, "sleep", lambda _delay: None)
@@ -232,8 +279,9 @@ def test_protocol_http_failure_never_allows_publication(
     assert len(calls) == attempts
 
 
-def test_protocol_second_scope_mismatch_blocks_after_first_scope_succeeds(
-    protocol_preflight: ModuleType, monkeypatch: pytest.MonkeyPatch,
+def test_protocol_second_scope_mismatch_is_detected_after_first_scope_succeeds(
+    protocol_preflight: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def read(url: str) -> object:
         if url == protocol_preflight.HEALTH_URLS["reliability"]:
@@ -245,27 +293,162 @@ def test_protocol_second_scope_mismatch_blocks_after_first_scope_succeeds(
         protocol_preflight.check_collectors("a" * 64)
 
 
+def _run_protocol_cli(
+    repo: Path,
+    sha: str,
+    scenario: str,
+    fingerprint: str = "a" * 64,
+) -> subprocess.CompletedProcess[str]:
+    # Exercise the actual entry point and exit status with an offline HTTP
+    # boundary. Even an accidentally reached collector never uses the network.
+    driver = r"""
+import io, json, runpy, sys, time, urllib.request
+from email.message import Message
+from http.client import HTTPResponse
+from urllib.error import URLError
+
+script, repo, sha, scenario, fingerprint = sys.argv[1:]
+class Opener:
+    def open(self, request, timeout):
+        if scenario == "no-network":
+            raise AssertionError("Collector contacted before source validation")
+        if scenario == "unavailable":
+            raise URLError("private-remote-details")
+        if scenario in {"bad-status", "incomplete-chunk"}:
+            raw = (b"private-remote-details\r\n\r\n" if scenario == "bad-status" else
+                   b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                   b"Transfer-Encoding: chunked\r\n\r\n8\r\n{}\r\n")
+            class Socket:
+                def makefile(self, *_args):
+                    return io.BytesIO(raw)
+            response = HTTPResponse(Socket())
+            response.begin()
+            response.geturl = lambda: request.full_url
+            return response
+        scope = request.full_url.split("/")[-2]
+        payload = {"ok": True, "scope": scope, "schema_version": 1,
+                   "protocol_fingerprint": fingerprint if scenario == "match" else "b" * 64}
+        raw = json.dumps(payload).encode() if scenario != "malformed" else b"private-remote-details"
+        response = io.BytesIO(raw)
+        response.status = 200
+        response.headers = Message()
+        response.headers["Content-Type"] = "application/json"
+        response.geturl = lambda: request.full_url
+        return response
+urllib.request.build_opener = lambda *_args: Opener()
+time.sleep = lambda _delay: None
+sys.argv = [script, "--source-repo", repo, "--source-sha", sha]
+runpy.run_path(script, run_name="__main__")
+"""
+    return subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            driver,
+            str(ROOT / ".github/scripts/release_protocol_preflight.py"),
+            str(repo),
+            sha,
+            scenario,
+            fingerprint,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=20,
+    )
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "match",
+        "mismatch",
+        "unavailable",
+        "malformed",
+        "bad-status",
+        "incomplete-chunk",
+    ],
+)
+def test_protocol_cli_remote_check_is_advisory_after_validating_source(
+    protocol_preflight: ModuleType,
+    local_source: Path,
+    scenario: str,
+) -> None:
+    raw = (ROOT / protocol_preflight.MANIFEST_PATH).read_bytes()
+    path = local_source / protocol_preflight.MANIFEST_PATH
+    path.parent.mkdir(parents=True)
+    path.write_bytes(raw)
+    sha = _commit(local_source)
+    result = _run_protocol_cli(
+        local_source,
+        sha,
+        scenario,
+        protocol_preflight.manifest_fingerprint(raw),
+    )
+    assert result.returncode == 0, result.stderr
+    assert f"Checking release source {sha}; protocol " in result.stdout
+    assert "private-remote-details" not in result.stdout + result.stderr
+    if scenario == "match":
+        assert result.stderr == ""
+        assert "reliability: release protocol accepted" in result.stdout
+        assert "growth: release protocol accepted" in result.stdout
+    else:
+        warning = "::warning::Production collector compatibility could not be verified"
+        assert warning in result.stderr
+        assert "continuing with the validated release source" in result.stderr
+        assert "release protocol accepted" not in result.stdout
+
+
+@pytest.mark.parametrize("raw", [b"{broken", b"{}", b'{"manifest_version":1,"manifest_version":2}'])
+def test_protocol_cli_malformed_source_manifest_remains_fatal(
+    protocol_preflight: ModuleType,
+    local_source: Path,
+    raw: bytes,
+) -> None:
+    path = local_source / protocol_preflight.MANIFEST_PATH
+    path.parent.mkdir(parents=True)
+    path.write_bytes(raw)
+    result = _run_protocol_cli(local_source, _commit(local_source), "no-network")
+    assert result.returncode == 1
+    assert "Release source protocol validation failed; publication is blocked." in result.stderr
+    assert "::warning::" not in result.stderr
+    assert "Collector contacted" not in result.stderr
+
+
+@pytest.mark.parametrize("sha", ["main", "a" * 8, "f" * 40])
+def test_protocol_cli_invalid_source_sha_remains_fatal(local_source: Path, sha: str) -> None:
+    result = _run_protocol_cli(local_source, sha, "no-network")
+    assert result.returncode == 1
+    assert "Release source protocol validation failed; publication is blocked." in result.stderr
+    assert "::warning::" not in result.stderr
+    assert "Collector contacted" not in result.stderr
+
+
 def test_protocol_release_workflow_gates_fixed_source_before_build_and_publication() -> None:
     jobs = yaml.safe_load((ROOT / ".github/workflows/wheelhouse-release.yml").read_text())["jobs"]
     condition = "${{ github.event_name == 'push' || github.event.inputs.tag != '' }}"
     preflight = jobs["release-preflight"]["steps"]
-    gate = next(step for step in preflight if step.get("name") ==
-                "Check production collector compatibility")
+    gate = next(
+        step for step in preflight if step.get("name") == "Check production collector compatibility"
+    )
     assert gate["env"]["RELEASE_SOURCE_SHA"] == "${{ steps.source.outputs.source_sha }}"
     assert gate["run"] == (
         'python .github/scripts/release_protocol_preflight.py --source-sha "$RELEASE_SOURCE_SHA"'
     )
-    assert preflight.index(gate) > next(i for i, step in enumerate(preflight)
-                                        if step.get("id") == "source")
+    assert preflight.index(gate) > next(
+        i for i, step in enumerate(preflight) if step.get("id") == "source"
+    )
     publication = jobs["publish-release"]["steps"]
-    index = next(i for i, step in enumerate(publication)
-                 if step.get("name") == "Upload to GitHub Release")
+    index = next(
+        i for i, step in enumerate(publication) if step.get("name") == "Upload to GitHub Release"
+    )
     final_gate = publication[index - 1]
     assert final_gate["env"]["RELEASE_SOURCE_SHA"] == (
         "${{ needs.build-release-assets.outputs.source_sha }}"
     )
     assert final_gate["run"] == (
-        'python .release-validation/.github/scripts/release_protocol_preflight.py '
+        "python .release-validation/.github/scripts/release_protocol_preflight.py "
         '--source-sha "$RELEASE_SOURCE_SHA"'
     )
     tooling = publication[index - 2]
@@ -629,8 +812,17 @@ def test_workflow_checkouts_use_preflight_sha_through_declared_job_outputs() -> 
     def assert_provenance(job_name: str, visited: set[str]) -> None:
         assert job_name not in visited, "Source SHA output chain contains a cycle"
         job = jobs[job_name]
-        if job_name == "release-preflight":
+        if job_name in {"release-preflight", "audit-existing-source"}:
             assert job["outputs"]["source_sha"] == "${{ steps.source.outputs.source_sha }}"
+            return
+        if job_name == "prestage-draft-updater-assets":
+            assert job["outputs"]["source_sha"] == (
+                "${{ needs.publish-release.outputs.source_sha || "
+                "needs.audit-existing-source.outputs.source_sha }}"
+            )
+            assert job["needs"] == ["publish-release", "audit-existing-source"]
+            for upstream in job["needs"]:
+                assert_provenance(upstream, visited | {job_name})
             return
         match = expression.fullmatch(job["outputs"]["source_sha"])
         assert match, f"{job_name} does not forward its validated source SHA"
@@ -660,7 +852,24 @@ def test_workflow_checkouts_use_preflight_sha_through_declared_job_outputs() -> 
                 continue
             ref = step["with"]["ref"]
             assert step["with"]["persist-credentials"] is False
-            if job_name == "release-preflight" or (
+            if job_name in {"audit-downloaded-macos-release", "audit-downloaded-windows-release"}:
+                assert ref == "${{ github.workflow_sha }}"
+                assert job["needs"] == "prestage-draft-updater-assets"
+                assert_provenance(job["needs"], {job_name})
+                evidence = next(
+                    s for s in job["steps"]
+                    if s.get("name") == "Record verifier and candidate provenance"
+                )
+                assert evidence["env"]["CANDIDATE_SHA"] == (
+                    "${{ needs.prestage-draft-updater-assets.outputs.source_sha }}"
+                )
+                checkouts += 1
+                continue
+            if job_name in {
+                "release-preflight",
+                "audit-existing-source",
+                "prestage-draft-updater-assets",
+            } or (
                 job_name == "publish-release"
                 and step.get("name") == "Checkout publication validation tooling"
             ):
@@ -674,7 +883,7 @@ def test_workflow_checkouts_use_preflight_sha_through_declared_job_outputs() -> 
             assert match[1] in ([needs] if isinstance(needs, str) else needs)
             assert_provenance(match[1], {job_name})
             checkouts += 1
-    assert checkouts >= 8
+    assert checkouts >= 7
     assert "environment" not in jobs["release-preflight"]
 
 
@@ -713,8 +922,7 @@ def test_empty_tag_runs_independent_windows_artifact_audit_matrix() -> None:
     jobs = yaml.safe_load((ROOT / ".github/workflows/wheelhouse-release.yml").read_text())["jobs"]
     audit = jobs["audit-internal-windows-artifact"]
     assert (
-        audit["if"]
-        == "${{ always() && github.event_name == 'workflow_dispatch' "
+        audit["if"] == "${{ always() && github.event_name == 'workflow_dispatch' "
         "&& github.event.inputs.tag == '' "
         "&& needs.build-desktop-windows.outputs.candidate_artifact_id != '' }}"
     )
@@ -750,9 +958,9 @@ def test_empty_tag_runs_independent_windows_artifact_audit_matrix() -> None:
     assert (
         "--manifest release-audit/audit-candidate.json --source-sha $env:CANDIDATE_SOURCE_SHA"
     ) in verify["run"]
-    assert (
-        "if ($LASTEXITCODE -ne 0) { throw 'Signed candidate provenance mismatch.' }"
-    ) in verify["run"]
+    assert ("if ($LASTEXITCODE -ne 0) { throw 'Signed candidate provenance mismatch.' }") in verify[
+        "run"
+    ]
     assert verify["run"].index("windows_candidate_identity.py") < verify["run"].index(
         "verify-windows-signatures.ps1"
     )
@@ -764,8 +972,11 @@ def test_empty_tag_runs_independent_windows_artifact_audit_matrix() -> None:
 
 def test_macos_release_backports_keychain_fix_before_loading_builder_and_requires_signing() -> None:
     workflow = yaml.safe_load((ROOT / ".github/workflows/wheelhouse-release.yml").read_text())
-    step = next(step for step in workflow["jobs"]["build-desktop-macos"]["steps"]
-                if step.get("name") == "Build signed macOS installer")
+    step = next(
+        step
+        for step in workflow["jobs"]["build-desktop-macos"]["steps"]
+        if step.get("name") == "Build signed macOS installer"
+    )
     preparation = "node scripts/prepare-macos-keychain.cjs"
     build = (
         "npx electron-builder --mac --publish never "
@@ -780,8 +991,11 @@ def test_macos_release_backports_keychain_fix_before_loading_builder_and_require
     )
     assert step["env"]["APPLE_TEAM_ID"] == "${{ secrets.APPLE_TEAM_ID }}"
     assert "continue-on-error" not in step
-    verify = next(step for step in workflow["jobs"]["build-desktop-macos"]["steps"]
-                  if step.get("name") == "Verify macOS signatures and notarization")
+    verify = next(
+        step
+        for step in workflow["jobs"]["build-desktop-macos"]["steps"]
+        if step.get("name") == "Verify macOS signatures and notarization"
+    )
     assert 'codesign --verify --deep --strict --verbose=2 "${apps[0]}"' in verify["run"]
     assert 'spctl --assess --type execute --verbose=2 "${apps[0]}"' in verify["run"]
     assert 'xcrun stapler validate "${apps[0]}"' in verify["run"]
@@ -790,8 +1004,11 @@ def test_macos_release_backports_keychain_fix_before_loading_builder_and_require
     assert "continue-on-error" not in verify
     assert "if" not in verify
     ci = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
-    unit = next(step for step in ci["jobs"]["desktop-check"]["steps"]
-                if step.get("name") == "Run desktop unit tests")
+    unit = next(
+        step
+        for step in ci["jobs"]["desktop-check"]["steps"]
+        if step.get("name") == "Run desktop unit tests"
+    )
     assert "node scripts/test-macos-keychain-patch.cjs" in unit["run"]
     assert "continue-on-error" not in unit
 
@@ -817,7 +1034,8 @@ def test_windows_only_input_skips_unrelated_jobs_and_keeps_signed_windows_audits
     assert {
         name for name, job in jobs.items() if "internal_windows_only" in job.get("if", "")
     } == skipped
-    for name in ("release-preflight", "build-control-ui", "build-desktop-windows"):
+    assert jobs["release-preflight"]["if"] == "${{ inputs.audit_existing_assets != true }}"
+    for name in ("build-control-ui", "build-desktop-windows"):
         assert "if" not in jobs[name]
     assert jobs["build-control-ui"]["needs"] == "release-preflight"
     windows = jobs["build-desktop-windows"]
@@ -839,9 +1057,57 @@ def test_windows_only_input_skips_unrelated_jobs_and_keeps_signed_windows_audits
         "audit-downloaded-macos-release",
         "audit-downloaded-windows-release",
     ):
-        assert jobs[name]["if"] == (
-            "${{ github.event_name == 'push' || github.event.inputs.tag != '' }}"
-        )
+        assert "github.event_name == 'push' || github.event.inputs.tag != ''" in jobs[name]["if"]
+        assert "always() && !cancelled()" in jobs[name]["if"]
+        assert jobs[name]["permissions"] == {"contents": "write"}
+
+
+def test_audit_only_mode_cannot_build_sign_or_upload_a_release() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/wheelhouse-release.yml").read_text())
+    jobs = workflow["jobs"]
+    guard = jobs["audit-existing-source"]
+    assert "inputs.audit_existing_assets == true" in guard["if"]
+    assert "github.event_name == 'workflow_dispatch'" in guard["if"]
+    assert "environment" not in guard
+    source = next(step for step in guard["steps"] if step.get("id") == "source")
+    for contract in (
+        '"${source_sha}" == "${EXPECTED_SOURCE_SHA}"',
+        "release['isDraft'] is True",
+        "release['tagName'] == os.environ['RELEASE_TAG']",
+        '"${GH_REPO}" == "TokenRhythm/opensquilla"',
+        '"${INTERNAL_WINDOWS_ONLY}" != "true"',
+    ):
+        assert contract in source["run"]
+    prestage = jobs["prestage-draft-updater-assets"]
+    assert (
+        "inputs.audit_existing_assets == true && needs.audit-existing-source.result == 'success'"
+        in prestage["if"]
+    )
+    assert (
+        "inputs.audit_existing_assets != true && needs.publish-release.result == 'success'"
+        in prestage["if"]
+    )
+    for name in ("audit-downloaded-macos-release", "audit-downloaded-windows-release"):
+        assert "needs.prestage-draft-updater-assets.result == 'success'" in jobs[name]["if"]
+
+    # Every build and publisher descends from the preflight disabled in audit mode.
+    def depends_on_preflight(name: str) -> bool:
+        if name == "release-preflight":
+            return jobs[name]["if"] == "${{ inputs.audit_existing_assets != true }}"
+        upstream = jobs[name].get("needs", [])
+        upstream = [upstream] if isinstance(upstream, str) else upstream
+        assert upstream
+        assert "always()" not in jobs[name].get("if", "")
+        return all(depends_on_preflight(parent) for parent in upstream)
+
+    for name in (
+        "build-control-ui",
+        "build-release-assets",
+        "build-desktop-macos",
+        "build-desktop-windows",
+        "publish-release",
+    ):
+        assert depends_on_preflight(name)
 
 
 def test_internal_diagnostics_preserve_signed_bytes_without_feeding_publication() -> None:
@@ -1016,7 +1282,10 @@ def _run_signing_material_step(
     ],
 )
 def test_signing_material_timeout_is_offline_and_diagnoses_phase(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stderr: bytes, phase: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: bytes,
+    phase: str,
 ) -> None:
     monkeypatch.setattr(shutil, "which", lambda _name: "synthetic-pwsh")
     monkeypatch.setenv("SM_API_KEY", "synthetic-parent-secret")

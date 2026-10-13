@@ -101,6 +101,7 @@ def build_transcript_attachment_envelope(
     page_context: dict[str, Any] | None = None,
     workspace_files: list[dict[str, Any]] | None = None,
     selected_skills: list[dict[str, str]] | None = None,
+    local_path_references: list[str] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Build the JSON envelope written to ``transcript_entries.content``.
 
@@ -150,6 +151,7 @@ def build_transcript_attachment_envelope(
                     "name": name,
                     "mime": media_type,
                     "size": attachment.get("size"),
+                    **({"origin": "paste"} if attachment.get("origin") == "paste" else {}),
                 }
             )
             continue
@@ -196,6 +198,7 @@ def build_transcript_attachment_envelope(
                     "name": name,
                     "mime": media_type,
                     "size": len(payload),
+                    **({"origin": "paste"} if attachment.get("origin") == "paste" else {}),
                 }
             )
         else:
@@ -205,6 +208,7 @@ def build_transcript_attachment_envelope(
                     "type": media_type,
                     "name": name,
                     "data": data,
+                    **({"origin": "paste"} if attachment.get("origin") == "paste" else {}),
                 }
             )
 
@@ -219,6 +223,12 @@ def build_transcript_attachment_envelope(
         envelope_payload["workspace_files"] = normalize_workspace_files(workspace_files)
     if selected_skills:
         envelope_payload["selected_skills"] = selected_skills
+    if local_path_references:
+        from opensquilla.contracts.local_path_references import normalize_local_path_references
+
+        envelope_payload["local_path_references"] = list(normalize_local_path_references(
+            local_path_references, message=display_text if display_text is not None else text,
+        ))
     envelope = json.dumps(envelope_payload)
     return envelope, disk_writes
 
@@ -285,6 +295,8 @@ def rebuild_attachments_for_replay(
                 session_id=session_id,
                 source="transcript",
             )
+            if entry.get("origin") == "paste":
+                rebuilt_ref["origin"] = "paste"
             missing_markers.append(attachment_ref_marker(rebuilt_ref))
         else:
             missing_reason = entry.get("missing_reason")
@@ -304,6 +316,7 @@ def rebuild_attachments_for_replay(
                         "type": mime,
                         "data": data,
                         "name": raw_name if isinstance(raw_name, str) else "attachment",
+                        **({"origin": "paste"} if entry.get("origin") == "paste" else {}),
                     }
                 )
 

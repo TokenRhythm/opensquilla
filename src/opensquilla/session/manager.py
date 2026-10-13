@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import structlog
 
+from opensquilla.compaction_timing import resolve_compaction_total_timeout
 from opensquilla.contracts.turn_execution import AssistantMessageReservation
 from opensquilla.engine.steps.inject_time_prefix import stamp as _stamp_time_prefix
 from opensquilla.paths import default_opensquilla_home, native_io_path
@@ -602,7 +603,7 @@ def _compaction_target_fingerprint(config: CompactionConfig) -> str:
 
     plan = config.llm_plan
     if plan is not None:
-        target_payload = {
+        target_payload: dict[str, Any] = {
             "max_calls": plan.max_calls,
             "candidates": [
                 {
@@ -1609,15 +1610,6 @@ class SessionManager:
             evict_cache_break_state(session_key)
         except Exception:
             pass
-        if session_id:
-            try:
-                from opensquilla.engine.steps.meta_resolution import (
-                    evict_meta_sticky,
-                )
-
-                evict_meta_sticky(session_id)
-            except Exception:
-                pass
 
     async def _task_owner_is_verified_fork_ancestor(
         self,
@@ -2806,6 +2798,7 @@ class SessionManager:
         *,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
+        content_mode: str = "full",
     ) -> list[TranscriptEntry]:
         session_key = canonicalize_session_key(session_key)
         node = await self._storage.get_session(session_key)
@@ -2817,7 +2810,11 @@ class SessionManager:
             expected_session_epoch=expected_session_epoch,
             operation="transcript read",
         )
-        transcript = await self._storage.get_transcript(node.session_id, limit=limit)
+        transcript = await self._storage.get_transcript(
+            node.session_id,
+            limit=limit,
+            content_mode=content_mode,
+        )
         if expected_session_id is not None or expected_session_epoch is not None:
             current = await self._storage.get_session(session_key)
             if current is None:
@@ -2829,6 +2826,15 @@ class SessionManager:
                 operation="transcript read",
             )
         return transcript
+
+    async def get_transcript_token_metadata(self, session_key: str) -> dict[str, int | bool]:
+        """Return transcript token metadata without materializing message bodies."""
+
+        session_key = canonicalize_session_key(session_key)
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        return await self._storage.get_transcript_token_metadata(node.session_id)
 
     async def capture_compaction_source(
         self,
@@ -3124,6 +3130,7 @@ class SessionManager:
         limit: int,
         before: tuple[int, int] | None = None,
         after: tuple[int, int] | None = None,
+        content_mode: str = "full",
     ) -> CanonicalTranscriptPage:
         """Return a bounded canonical page without changing provider replay."""
         session_key = canonicalize_session_key(session_key)
@@ -3135,6 +3142,7 @@ class SessionManager:
             limit=limit,
             before=before,
             after=after,
+            content_mode=content_mode,
         )
         canonical_complete = await self._storage.is_canonical_transcript_complete(node.session_id)
         return CanonicalTranscriptPage(
@@ -3834,12 +3842,10 @@ class SessionManager:
         if compaction_deadline_at_monotonic is not None:
             try:
                 deadline = float(compaction_deadline_at_monotonic)
-                total_timeout = float(compaction_timeout_seconds or 120.0)
             except (TypeError, ValueError):
                 deadline = 0.0
-                total_timeout = 120.0
             deadline_config = CompactionConfig(
-                total_timeout_seconds=total_timeout if total_timeout > 0 else 120.0,
+                total_timeout_seconds=resolve_compaction_total_timeout(compaction_timeout_seconds),
                 deadline_at_monotonic=deadline,
                 operation_id=persisted_compaction_id,
             )

@@ -77,6 +77,11 @@ class RouteEnvelope:
     metadata: dict[str, Any] = field(default_factory=dict)
     interaction_mode: InteractionMode = InteractionMode.INTERACTIVE
     sandbox_run_context_fresh: bool = False
+    # Trusted producer declaration of optional services that must be ready
+    # before the runtime may reserve this turn.  This is deliberately a
+    # separate field from ``metadata``: channel/web payloads are untrusted and
+    # must never be able to manufacture a readiness or lifecycle claim.
+    required_services: tuple[str, ...] = field(default=(), kw_only=True)
     # Process-local services attached only after durable acceptance. Keeping
     # them out of ``metadata`` prevents serialization of live handles.
     runtime_services: dict[str, Any] = field(
@@ -131,6 +136,7 @@ def build_channel_route_envelope(
     channel_type: str | None = None,
     session_id: str | None = None,
     session_epoch: int | None = None,
+    required_services: tuple[str, ...] = (),
 ) -> RouteEnvelope:
     """Build a route for a normalized inbound channel message."""
     metadata = dict(msg.metadata or {})
@@ -181,6 +187,7 @@ def build_channel_route_envelope(
         metadata=metadata,
         interaction_mode=InteractionMode.UNATTENDED,
         session_epoch=session_epoch,
+        required_services=tuple(required_services),
     )
 
 
@@ -198,6 +205,7 @@ def build_cli_route_envelope(
     interaction_mode: InteractionMode | str = InteractionMode.INTERACTIVE,
     elevated: str | None = None,
     run_mode: str | None = None,
+    required_services: tuple[str, ...] = (),
 ) -> RouteEnvelope:
     """Build a route for local CLI input."""
     resolved_interaction_mode = _interaction_mode(interaction_mode)
@@ -228,6 +236,7 @@ def build_cli_route_envelope(
         metadata=metadata,
         interaction_mode=resolved_interaction_mode,
         session_epoch=session_epoch,
+        required_services=tuple(required_services),
     )
 
 
@@ -244,6 +253,7 @@ def build_web_route_envelope(
     tool_source_kind: str | None = None,
     principal_is_owner: bool | None = None,
     principal_host_execute: bool | None = None,
+    required_services: tuple[str, ...] = (),
 ) -> RouteEnvelope:
     """Build a route for Web/RPC-originated input."""
     resolved_channel_id = channel_id or (f"web:{conn_id}" if conn_id else "web")
@@ -276,6 +286,7 @@ def build_web_route_envelope(
         metadata=metadata,
         interaction_mode=InteractionMode.INTERACTIVE,
         session_epoch=session_epoch,
+        required_services=tuple(required_services),
     )
 
 
@@ -287,6 +298,7 @@ def build_cron_route_envelope(
     delivery: Any | None = None,
     session_id: str | None = None,
     session_epoch: int | None = None,
+    required_services: tuple[str, ...] = ("cron",),
 ) -> RouteEnvelope:
     """Build a route for scheduler-originated agent work or delivery."""
     resolved_delivery = delivery if delivery is not None else getattr(job, "delivery", None)
@@ -363,6 +375,7 @@ def build_cron_route_envelope(
         metadata=metadata,
         interaction_mode=InteractionMode.UNATTENDED,
         session_epoch=session_epoch,
+        required_services=tuple(required_services),
     )
 
 

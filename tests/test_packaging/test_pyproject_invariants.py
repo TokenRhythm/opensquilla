@@ -203,6 +203,7 @@ def test_standard_distributions_require_verified_generated_webui() -> None:
     assert "opensquilla-webui/public/music/**" not in hatch["targets"]["sdist"][
         "artifacts"
     ]
+    assert "opensquilla-webui/public/music/**" in hatch["targets"]["sdist"]["exclude"]
     assert (PYPROJECT.parent / "hatch_build.py").is_file()
     assert (PYPROJECT.parent / "scripts" / "verify_webui_artifact.py").is_file()
     assert (PYPROJECT.parent / "opensquilla-webui" / "scripts" / "stage-dist.mjs").is_file()
@@ -218,6 +219,7 @@ def test_webui_build_owns_dist_and_stages_the_package_copy() -> None:
         )
     )
     assert "outDir: resolve(__dirname, 'dist')" in vite
+    assert "publicDir: resolve(__dirname, 'public-assets')" in vite
     assert "scripts/stage-dist.mjs" in package["scripts"]["build:artifact"]
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -14,8 +15,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-CURRENT_VERSION = "0.5.4"
-CURRENT_DESKTOP_VERSION = "0.5.4"
+CURRENT_VERSION = "0.5.6"
+CURRENT_DESKTOP_VERSION = "0.5.6"
 CURRENT_TAG = f"v{CURRENT_VERSION}"
 HISTORICAL_PREVIEW_VERSION = "0.2.0rc1"
 HISTORICAL_PREVIEW_TAG = f"v{HISTORICAL_PREVIEW_VERSION}"
@@ -99,7 +100,7 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert "latest.yml" in workflow
     assert 'NOTES_FILE="docs/releases/${TAG#v}.md"' in workflow
     assert '--notes-file "${NOTES_FILE}"' in workflow
-    assert 'gh release upload "${TAG}" dist/* --clobber' in workflow
+    assert 'gh release upload "${TAG}" dist/public/* --clobber' in workflow
     assert "& node scripts/test-packaged-first-send-renderer.mjs `" in workflow
     assert "--executable $candidate.Path `" in workflow
     assert "npm run test:packaged-first-send-renderer -- `" not in workflow
@@ -141,6 +142,62 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert "timeout: SEND_TIMEOUT_MS" in first_send_gate[current_probe_install:]
     assert "PLAYWRIGHT_ELECTRON_SANDBOX_ERRORS" in first_send_evidence
     assert "unexpectedRendererErrorCount" in first_send_evidence
+
+
+@pytest.mark.parametrize(
+    ("tag", "version", "desktop_version"),
+    [
+        ("v0.5.5", "0.5.5", "0.5.5"),
+        ("v0.5.5rc1", "0.5.5rc1", "0.5.5-rc1"),
+        ("", "0.5.5", "0.5.5"),
+    ],
+)
+def test_release_artifact_staging_excludes_internal_files(
+    tmp_path: Path, tag: str, version: str, desktop_version: str
+) -> None:
+    workflow = yaml.safe_load(
+        Path(".github/workflows/wheelhouse-release.yml").read_text(encoding="utf-8")
+    )
+    steps = {step["name"]: step for step in workflow["jobs"]["publish-release"]["steps"]}
+    verify = steps["Verify release asset set"]["run"]
+    script = verify.split("python - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    names = [
+        f"OpenSquilla-{desktop_version}-mac-arm64.dmg",
+        f"OpenSquilla-{desktop_version}-mac-arm64.zip",
+        f"OpenSquilla-{desktop_version}-mac-arm64.dmg.blockmap",
+        f"OpenSquilla-{desktop_version}-mac-arm64.zip.blockmap",
+        "latest-mac.yml",
+        f"OpenSquilla-{desktop_version}-win-x64.exe",
+        f"OpenSquilla-{desktop_version}-win-x64.exe.blockmap",
+        "latest.yml",
+        f"opensquilla-{version}-py3-none-any.whl",
+    ]
+    checksums = []
+    for name in names:
+        content = f"synthetic release asset: {name}\n".encode()
+        (dist / name).write_bytes(content)
+        checksums.append(f"{hashlib.sha256(content).hexdigest()}  {name}")
+    (dist / "SHA256SUMS").write_text("\n".join(checksums) + "\n", encoding="utf-8")
+    (dist / "audit-candidate.json").write_text('{"version": "synthetic"}', encoding="utf-8")
+    (dist / "build.log").write_text("synthetic internal build log", encoding="utf-8")
+
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env={**os.environ, "RELEASE_TAG": tag},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    pattern = steps["Upload aggregate workflow artifact"]["with"]["path"]
+    staged = {path.name: path for path in tmp_path.glob(pattern)}
+    assert set(staged) == {*names, "SHA256SUMS"}
+    for name, path in staged.items():
+        assert path.read_bytes() == (dist / name).read_bytes()
+    assert (dist / "audit-candidate.json").is_file()
 
 
 def test_release_workflow_runs_v053_windows_upgrade_checks_on_server_2022() -> None:
@@ -299,6 +356,93 @@ def test_release_profile_config_diagnostics_omit_values(
         assert parsed[key] == value
     assert "secret" not in summary
     assert parsed["actual_text_sha256"] != parsed["expected_text_sha256"]
+
+
+@pytest.mark.parametrize("version", ["0.5.3", "0.5.4"])
+@pytest.mark.parametrize("started", [False, True])
+def test_upgrade_config_snapshot_preserves_known_old_startup_only(
+    tmp_path: Path, version: str, started: bool,
+) -> None:
+    probe = runpy.run_path(".github/scripts/verify-release-profile-preservation.py")
+    home = tmp_path / "profile"
+    label = "upgrade-baseline"
+    probe["seed_profile"](home, label)
+    config = probe["_config_text"](home, label)
+    if started:
+        config = probe["_runtime_config_text"](home)
+        if version == "0.5.4":
+            config += '\n[sandbox]\nrun_mode = "full"\n'
+    (home / "config.toml").write_text(config, encoding="utf-8")
+    snapshot = tmp_path / "baseline.json"
+    snapshot.write_text(json.dumps({
+        "baselineVersion": version, "config": config.replace("\n", "\r\n"),
+    }))
+    options = {"config_baseline": snapshot, "baseline_version": version}
+    probe["verify_profile"](home, label, **options)
+    # The candidate's native locale synchronization can persist schema v2.
+    candidate = config.replace("config_version = 1", "config_version = 2")
+    if not started:
+        candidate += '\nconfig_version_unused = 2\n'
+        with pytest.raises(AssertionError):
+            probe["_verify_runtime_config"](config, candidate)
+    else:
+        (home / "config.toml").write_text(candidate, encoding="utf-8")
+        with pytest.raises(AssertionError, match="config.toml changed"):
+            probe["verify_profile"](home, label, **options)
+        probe["verify_profile"](home, label, allow_runtime_config=True, **options)
+    # No config exemption may bypass the existing identity/data checks.
+    (home / "workspace/IDENTITY.md").write_text("corrupted", encoding="utf-8")
+    with pytest.raises(AssertionError, match="IDENTITY.md"):
+        probe["verify_profile"](home, label, allow_runtime_config=True, **options)
+
+
+@pytest.mark.parametrize("mutation", [
+    ('model = "opensquilla-release-session-recovery-smoke"', 'model = "wrong"'),
+    ('run_mode = "full"', 'run_mode = "safe"'),
+    ('default_locale = "en"', 'default_locale = "zh-Hans"'),
+    ("config_version = 1", "config_version = true"),
+    ("config_version = 1", "config_version = 999"),
+    ("config_version = 1\n", ""),
+    ('search_provider = "duckduckgo"', 'search_provider = "changed"'),
+])
+def test_upgrade_baseline_rejects_protected_mutations(
+    tmp_path: Path, mutation: tuple[str, str],
+) -> None:
+    probe = runpy.run_path(".github/scripts/verify-release-profile-preservation.py")
+    home = tmp_path / "profile"
+    label = "upgrade-baseline"
+    original = probe["_runtime_config_text"](home) + '\n[sandbox]\nrun_mode = "full"\n'
+    changed = original.replace(*mutation)
+    with pytest.raises(AssertionError):
+        probe["_verify_runtime_config"](original, changed)
+    if mutation[1] == "":
+        return  # An old client is allowed not to have written its schema stamp yet.
+    snapshot = tmp_path / "baseline.json"
+    snapshot.write_text(json.dumps({"baselineVersion": "0.5.4", "config": changed}))
+    with pytest.raises(AssertionError, match="protected config"):
+        probe["_upgrade_config_baseline"](home, label, snapshot, "0.5.4")
+
+
+def test_downloaded_upgrade_audits_upload_failure_diagnostics_only() -> None:
+    workflow = yaml.safe_load(Path(".github/workflows/wheelhouse-release.yml").read_text())
+    for platform in ("macos", "windows"):
+        steps = workflow["jobs"][f"audit-downloaded-{platform}-release"]["steps"]
+        upload = next(s for s in steps if s.get("uses") == "actions/upload-artifact@v4")
+        assert upload["if"] == "failure()"
+        assert "logs/**" in upload["with"]["path"]
+        assert "config.toml" not in upload["with"]["path"]
+        assert "sessions.db" not in upload["with"]["path"]
+    smoke = Path("desktop/electron/scripts/test-packaged-session-recovery.mjs").read_text()
+    assert (
+        "'candidate Desktop Gateway readiness',\n    DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,"
+        in smoke
+    )
+    assert "status: connection.status, error: connection.error ?? null" in smoke
+    assert "assert.equal(lastGatewayConnection?.status, 'ready'" in smoke
+    windows = Path(".github/scripts/verify-release-windows-upgrade.ps1").read_text()
+    macos = Path(".github/scripts/verify-release-macos-real-update.sh").read_text()
+    assert "-ne $configBeforeUninstall" in windows
+    assert 'cmp "${profile}/config.toml" "${sandbox}/before-uninstall-config.toml"' in macos
 
 
 @pytest.mark.parametrize("signed_seed", [False, True])
@@ -662,6 +806,9 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     session_recovery_smoke = Path(
         "desktop/electron/scripts/test-packaged-session-recovery.mjs"
     ).read_text(encoding="utf-8")
+    session_recovery_rpc = Path(
+        "desktop/electron/scripts/session-recovery-rpc-evidence.mjs"
+    ).read_text(encoding="utf-8")
     packaged_smoke_helpers = Path(
         "desktop/electron/scripts/packaged-smoke-helpers.mjs"
     ).read_text(encoding="utf-8")
@@ -737,8 +884,11 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     assert "desktop-credential.json" in packaged_smoke_helpers
     assert "_electron as electron" in packaged_smoke_helpers
 
-    for method in ("chat.history", "sessions.messages.subscribe"):
-        assert method in session_recovery_smoke
+    for method in (
+        "chat.history", "sessions.messages.subscribe", "sessions.messages.snapshot.read",
+    ):
+        assert method in session_recovery_rpc
+    assert "createSessionRecoveryFault(sessionKey)" in session_recovery_smoke
     for contract in (
         "connectToServer()",
         "chat-session-load-state",
@@ -793,7 +943,7 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     windows_audit = workflow[workflow.index("  audit-downloaded-windows-release:") :]
     for audit in (mac_audit, windows_audit):
         assert "needs: prestage-draft-updater-assets" in audit
-        assert "contents: read" in audit
+        assert "contents: write" in audit  # Required to read unpublished Drafts.
         assert "gh release download" in audit
         assert "SHA256SUMS" in audit
         assert "isDraft" in audit
@@ -827,16 +977,27 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     )
     workflow = yaml.safe_load(workflow_text)
     prestage = workflow["jobs"]["prestage-draft-updater-assets"]
-    assert prestage["needs"] == "publish-release"
+    assert prestage["needs"] == ["publish-release", "audit-existing-source"]
     assert prestage["environment"] == "desktop-release-oss-prestage"
     assert (
         prestage["env"]["OSS_ACCESS_KEY_ID"]
-        == "${{ secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_ID }}"
+        == "${{ secrets.ALIYUN_OSS_ACCESS_KEY_ID }}"
     )
     assert (
         prestage["env"]["OSS_ACCESS_KEY_SECRET"]
-        == "${{ secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_SECRET }}"
+        == "${{ secrets.ALIYUN_OSS_ACCESS_KEY_SECRET }}"
     )
+    mirror = yaml.safe_load(
+        Path(".github/workflows/mirror-release-to-oss.yml").read_text(encoding="utf-8")
+    )["jobs"]["mirror-release-assets"]
+    for key in ("OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET"):
+        assert prestage["env"][key] == mirror["env"][key]
+    mirror_workflow = yaml.safe_load(
+        Path(".github/workflows/mirror-release-to-oss.yml").read_text(encoding="utf-8")
+    )
+    assert prestage["concurrency"] == mirror_workflow["concurrency"]
+    assert prestage["concurrency"]["cancel-in-progress"] is False
+    assert "ALIYUN_OSS_PRESTAGE_ACCESS_KEY" not in workflow_text
     assert 'release["isDraft"] is True' in workflow_text
     assert 'ALIYUN_OSS_BUCKET}" == "opensquilla-releases"' in workflow_text
     assert 'OSS_REGION}" == "cn-beijing"' in workflow_text
@@ -847,7 +1008,8 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     assert "--addressing-style virtual" in workflow_text
     assert "decoder.raw_decode" in workflow_text
     assert '{"enabled", "suspended"}' in workflow_text
-    assert "OSS bucket versioning must be unconfigured" in workflow_text
+    assert "existing-object SHA256" in workflow_text
+    assert "post-upload byte verification" in workflow_text
     assert prestage["steps"][-1]["name"] == "Upload loopback-only updater rehearsal manifest"
 
     script = Path(".github/scripts/prestage-release-to-oss.sh").read_text(encoding="utf-8")
@@ -1016,7 +1178,7 @@ def test_release_docs_describe_signed_windows_policy() -> None:
 
     assert "Code signing policy:" in readme
     assert "v0.5.4 Windows installer remains unsigned" in readme
-    assert "Authenticode signs new Windows installers" in readme
+    assert f"{CURRENT_VERSION} Windows installer is Authenticode signed" in readme
     assert "must Authenticode sign each new installer" in releases
     assert "Release Assets workflow signs new Windows builds" in signing_policy
     assert "windows-code-signing" in signing_policy
@@ -1028,7 +1190,7 @@ def test_release_docs_describe_signed_windows_policy() -> None:
     for text in [readme, releases, release_notes]:
         assert "code-signing-policy.md" in text
 
-    assert "Windows desktop installer is currently unsigned" in release_notes
+    assert "Windows desktop installer is Authenticode signed" in release_notes
 
     assert "PRIVACY.md" in readme
     assert "THIRD_PARTY_NOTICES.md" in readme
@@ -1336,7 +1498,7 @@ def test_container_workflow_gates_latest_promotion() -> None:
     assert "type=ref,event=tag" in workflow
     assert "type=raw,value=latest" not in workflow
     assert "provenance: false" in workflow
-    assert "OPENSQUILLA_FORBID_PERSONAL_BGM=1" in workflow
+    assert "OPENSQUILLA_FORBID_PERSONAL_BGM" not in workflow
     assert "most recently pushed release tag" in workflow
     assert '["docker", "buildx", "imagetools", "inspect", image_ref, "--raw"]' in workflow
     assert 'expected = {"linux/amd64", "linux/arm64"}' in workflow
@@ -1359,63 +1521,48 @@ def test_historical_040_release_notes_remain_available() -> None:
     assert "OpenSquilla-0.4.0-mac-arm64.dmg" in notes
 
 
-def test_current_release_notes_cover_documents_runtimes_upgrade_and_containers() -> None:
+def test_current_release_notes_cover_upgrade_and_containers() -> None:
     notes = Path(f"docs/releases/{CURRENT_VERSION}.md").read_text(encoding="utf-8")
+    normalized = " ".join(notes.split())
 
     assert "## Downloads" in notes
-    assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.dmg" in notes
-    assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.zip" in notes
-    assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe" in notes
-    assert f"opensquilla-{CURRENT_VERSION}-py3-none-any.whl" in notes
-    assert notes.index("### HTML document editing beta") < notes.index(
-        "### Runtime Packs and slimmer Desktop installers"
-    )
-    assert notes.index("### Model routing, Ensemble, and providers") < notes.index(
-        "### Chats, tasks, and attachments"
-    )
+    for name in (
+        f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.dmg",
+        f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.zip",
+        f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe",
+        f"opensquilla-{CURRENT_VERSION}-py3-none-any.whl",
+        "SHA256SUMS",
+        "latest-mac.yml",
+        "latest.yml",
+    ):
+        assert name in notes
     assert notes.index("## ✨ What's Improved") < notes.index("## Downloads")
-    assert "no\nmanual data transfer is required" in notes
-    assert "Additive database\nmigrations run automatically" in notes
-    assert "early beta" in notes
-    assert "limited to single-file UTF-8 HTML" in notes
-    assert "The 0.5.3 bundled\n  runtimes are intentionally not migrated" in notes
-    assert "No Windows Portable assets are published for 0.5.4" in notes
-    assert "0.5.4 Portable zip" in notes
-    assert "## Upgrading from 0.5.3" in notes
+    assert "no manual data transfer is required" in normalized
+    assert "Supported database migrations run automatically" in normalized
+    assert f"No Windows Portable assets are published for {CURRENT_VERSION}" in notes
+    assert f"{CURRENT_VERSION} Portable zip" in notes
+    assert "## Upgrading from 0.5.5" in notes
+    assert "Upgrading from 0.5.4 or earlier" in notes
     assert "must not\n> uninstall that build first" in notes
     assert r"%APPDATA%\OpenSquilla" in notes
-    assert "ghcr.io/opensquilla/opensquilla:v0.5.4" in notes
+    assert f"ghcr.io/tokenrhythm/opensquilla:{CURRENT_TAG}" in notes
     assert "`latest` tag follows the most recently verified release tag" in notes
     assert (
-        "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/"
-        "OpenSquilla-mac-arm64.dmg" in notes
+        "Goal Token budgets and foreground/background execution settings are retired" in normalized
     )
-    assert (
-        "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/"
-        "OpenSquilla-win-x64.exe" in notes
-    )
+    assert "Ordinary channel authoring is unavailable on Windows" in normalized
+    assert "Node.js 22.12+" in notes
+    for asset in ("OpenSquilla-mac-arm64.dmg", "OpenSquilla-win-x64.exe"):
+        assert (
+            "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/"
+            + asset
+        ) in notes
+    for doc in ("PRIVACY.md", "THIRD_PARTY_NOTICES.md", "CONTRIBUTORS.md"):
+        assert f"https://github.com/TokenRhythm/opensquilla/blob/{CURRENT_TAG}/{doc}" in notes
     assert "releases/latest.html" not in notes
     assert "Synthetic fixtures" not in notes
     assert "release gate" not in notes
     assert "## Acknowledgements" in notes
-    for login in [
-        "@AmirF194",
-        "@Kiuyor",
-        "@Liu-RK",
-        "@LiuXinchen1997",
-        "@Sanjays2402",
-        "@ab2ence",
-        "@freeaccount-create",
-        "@jiaoqingrui",
-        "@kriptoburak",
-        "@lifelmy",
-        "@lihongguang-0014",
-        "@openvictory",
-        "@shixi-li",
-        "@xfjsssq",
-    ]:
-        assert login in notes
-    assert "CONTRIBUTORS.md" in notes
 
 
 def test_docs_index_links_current_release_notes() -> None:
@@ -1425,29 +1572,61 @@ def test_docs_index_links_current_release_notes() -> None:
     assert "releases/0.4.0.md" in index
 
 
-def test_current_contributor_ledger_records_054_attribution() -> None:
+def test_historical_contributor_ledger_retains_055_attribution() -> None:
     ledger = Path("CONTRIBUTORS.md").read_text(encoding="utf-8")
-    section = ledger.split("## OpenSquilla 0.5.4", 1)[1].split("## OpenSquilla 0.5.3", 1)[0]
+    notes = Path("docs/releases/0.5.5.md").read_text(encoding="utf-8")
+    section = ledger.split("## OpenSquilla 0.5.5", 1)[1].split("## OpenSquilla 0.5.4", 1)[0]
 
     expected = {
-        "@AmirF194": "#1193",
-        "@Kiuyor": "#1185",
-        "@Liu-RK": "#1267",
-        "@LiuXinchen1997": "#1199",
-        "@Sanjays2402": "#1214",
-        "@ab2ence": "#1300",
-        "@freeaccount-create": "#1264",
-        "@jiaoqingrui": "#1350",
-        "@kriptoburak": "#1367",
-        "@lifelmy": "#1215",
-        "@lihongguang-0014": "#1355",
-        "@openvictory": "#1351",
-        "@shixi-li": "#1184",
-        "@xfjsssq": "#1176",
+        "@Elioooon": "#1540",
+        "@GuddXzy": "#1562",
+        "@Kiuyor": "#1022",
+        "@Kuang-xianxin": "#1752",
+        "@LHMQ878": "#1056",
+        "@Liu-RK": "#1671",
+        "@LiuXinchen1997": "#1709",
+        "@QinLuza": "#1137",
+        "@Ramnath0521": "#1600",
+        "@RickyYii": "#1422",
+        "@ShaunMX": "#1532",
+        "@YIKUAIBANZI": "#1715",
+        "@freeaccount-create": "#1411",
+        "@kingxiao630": "#1682",
+        "@lifelmy": "#1684",
+        "@lihongguang-0014": "#1754",
+        "@lihongguang0014": "#1506",
+        "@mengchao99": "#953",
+        "@mikemikimike": "#1598",
+        "@openvictory": "#1459",
+        "@ptterjgf": "#1692",
+        "@qiaoye2024": "#793",
+        "@superbigcup325": "#1720",
+        "@wanglei1346": "#1585",
+        "@xiaohuzai": "#1570",
     }
     for login, evidence in expected.items():
         assert login in section
+        assert login in notes
         assert evidence in section
-    assert "#1179" in section
     assert "Codex" not in section
     assert "Claude Code" not in section
+
+
+def test_current_release_records_browser_beta_and_contributors() -> None:
+    notes = Path(f"docs/releases/{CURRENT_VERSION}.md").read_text(encoding="utf-8")
+    ledger = Path("CONTRIBUTORS.md").read_text(encoding="utf-8")
+    section = ledger.split(f"## OpenSquilla {CURRENT_VERSION}", 1)[1].split(
+        "## OpenSquilla 0.5.5",
+        1,
+    )[0]
+    assert "Browser Use (Beta)" in notes
+    assert "Desktop" in notes
+    assert "not a replacement for your system browser" in " ".join(notes.split())
+    for login, evidence in {
+        "@angri450": "#1830",
+        "@lihongguang-0014": "#1823",
+        "@openvictory": "#1855",
+    }.items():
+        assert login in section
+        assert login in notes
+        assert evidence in section

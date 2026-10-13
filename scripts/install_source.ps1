@@ -424,7 +424,7 @@ if ($uvCommand) {
 } else {
     # No uv, and the ambient python is missing or older than 3.12. Do NOT
     # silently pip-install onto an unsupported interpreter: a broken
-    # opensquilla makes coding mode fall back to manual edits. Fail loud.
+    # opensquilla cannot run. Report the prerequisite before installing.
     $pyver = if ($pythonCmd) { (& python -V 2>&1) } else { 'none' }
     Write-Error "install_source.ps1: cannot install - uv not found and python ($pyver) is older than 3.12. OpenSquilla requires Python >= 3.12. Install uv (it brings its own 3.12): 'irm https://astral.sh/uv/install.ps1 | iex', then re-run scripts/install_source.ps1."
     exit 1

@@ -7,7 +7,8 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import type { DiscoveredModel } from '@/composables/setup/useSetupProviderForm'
+import type { DiscoveredModel, DiscoveredModelCatalog } from '@/composables/setup/useSetupProviderForm'
+import { modelCatalogFeedbackKey } from '@/utils/modelCatalogFeedback'
 
 const { t } = useI18n()
 
@@ -32,6 +33,9 @@ const props = defineProps<{
   value: string
   models: DiscoveredModel[]
   modelSource: string
+  // Compact strategy pickers own their feedback; provider editors render it
+  // next to their refresh action and leave this unset to avoid duplicate copy.
+  catalogState?: DiscoveredModelCatalog
   // Cell mode drops the outer control-row + label chrome so the combobox can
   // live inside a table cell (tier table); the field label becomes the input's
   // aria-label. Default (false) renders the full settings-row layout unchanged.
@@ -72,6 +76,7 @@ const DROPDOWN_MARGIN = 8
 const open = ref(false)
 const activeIndex = ref(-1)
 const inputEl = ref<HTMLInputElement | null>(null)
+const listEl = ref<HTMLElement | null>(null)
 const listStyle = ref<Record<string, string>>({})
 // A saved model id must not hide the rest of the discovered list: opening the
 // dropdown (focus / arrow keys) always shows every model, and the query filter
@@ -83,6 +88,9 @@ const fieldId = computed(() => `setup-provider-${String(props.field.name || 'mod
 const fieldName = computed(() => `setup_provider_${String(props.field.name || 'model')}`)
 const fieldDescriptionId = computed(() => `${fieldId.value}-description`)
 const fieldTooltipId = computed(() => `${fieldId.value}-info-tooltip`)
+const catalogFeedback = computed(() => props.catalogState
+  ? modelCatalogFeedbackKey(props.catalogState, typedSinceOpen.value || leadingSelected.value ? '' : props.value)
+  : '')
 
 const leadingSelected = computed(() => Boolean(
   props.leadingOption && props.value === props.leadingOption.value,
@@ -115,6 +123,7 @@ const describedBy = computed(() => {
   const ids: string[] = []
   if (!props.cell && props.field.description) ids.push(fieldDescriptionId.value)
   if (props.externalDescriptionId) ids.push(props.externalDescriptionId)
+  if (catalogFeedback.value) ids.push(`${fieldId.value}-sync`)
   if (catalogAvailable.value) ids.push(`${fieldId.value}-catalog-count`)
   return ids.join(' ') || undefined
 })
@@ -145,6 +154,33 @@ const matches = computed(() => {
 
 const visibleModels = computed(() => matches.value.slice(0, MAX_ROWS))
 const truncatedCount = computed(() => Math.max(0, matches.value.length - visibleModels.value.length))
+
+watch(visibleModels, (models, previous) => {
+  if (!open.value) return
+  const modelIndex = activeIndex.value - leadingOptionCount.value
+  const activeModel = previous[modelIndex]
+  if (activeModel) {
+    const nextIndex = models.findIndex(model => model.id === activeModel.id)
+    activeIndex.value = nextIndex < 0 ? -1 : nextIndex + leadingOptionCount.value
+  } else if (activeIndex.value >= leadingOptionCount.value && modelIndex >= previous.length) {
+    activeIndex.value = showFreeTextRow.value ? leadingOptionCount.value + models.length : -1
+  }
+  // Keep the first visible row anchored while rows above it arrive or disappear.
+  const list = listEl.value
+  if (!list) return
+  const top = list.getBoundingClientRect().top
+  const anchor = Array.from(list.querySelectorAll<HTMLElement>('[data-model-id]'))
+    .find(row => row.getBoundingClientRect().bottom > top)
+  if (!anchor) return
+  const anchorId = anchor.dataset.modelId
+  const anchorTop = anchor.getBoundingClientRect().top
+  void nextTick(() => {
+    if (!open.value || listEl.value !== list) return
+    const replacement = Array.from(list.querySelectorAll<HTMLElement>('[data-model-id]'))
+      .find(row => row.dataset.modelId === anchorId)
+    if (replacement) list.scrollTop += replacement.getBoundingClientRect().top - anchorTop
+  })
+})
 
 // The escape hatch: whatever was typed is always usable as-is. Shown whenever
 // there is typed text that is not an exact discovered id.
@@ -248,6 +284,7 @@ function rowStatus(model: DiscoveredModel): string {
   if (!normalized || NORMAL_MODEL_STATUSES.has(normalized)) return ''
   if (normalized === 'testing') return t('setup.provider.modelStatusTesting')
   if (normalized === 'offline') return t('setup.provider.modelStatusOffline')
+  if (normalized === 'special_offer') return t('setup.provider.modelStatusSpecialOffer')
   return status
 }
 
@@ -532,12 +569,15 @@ function onKeydown(event: KeyboardEvent) {
         >
           <div v-if="models.length" :id="`${fieldId}-catalog-readout`" class="setup-model-combobox__readout">
             <span>{{ t('setup.provider.modelListReadout', { count: models.length }) }}</span>
-            <span v-if="modelSource === 'live'" class="setup-model-combobox__live-source">
-              <span class="setup-model-combobox__live-dot" aria-hidden="true"></span>
-              {{ t('setup.provider.modelLiveSource') }}
-            </span>
+            <span
+              v-if="catalogFeedback"
+              :id="`${fieldId}-sync`"
+              class="setup-model-combobox__popup-sync"
+              role="status"
+            >{{ t(`setup.provider.${catalogFeedback}`) }}</span>
           </div>
           <div
+            ref="listEl"
             :id="`${fieldId}-listbox`"
             class="setup-model-combobox__list"
             role="listbox"
@@ -571,6 +611,7 @@ function onKeydown(event: KeyboardEvent) {
             <button
               v-for="(model, index) in visibleModels"
               :key="model.id"
+              :data-model-id="model.id"
               :id="modelOptionId(index)"
               type="button"
               class="setup-model-combobox__row"
@@ -666,6 +707,12 @@ function onKeydown(event: KeyboardEvent) {
     </div>
     <span v-if="$slots.actions" class="setup-model-combobox__actions"><slot name="actions" /></span>
     </div>
+    <p
+      v-if="catalogFeedback && (!open || !models.length)"
+      :id="`${fieldId}-sync`"
+      class="setup-model-combobox__sync"
+      role="status"
+    >{{ t(`setup.provider.${catalogFeedback}`) }}</p>
   </div>
 </template>
 
@@ -675,6 +722,9 @@ function onKeydown(event: KeyboardEvent) {
 .setup-model-combobox__control-group > .setup-model-combobox { flex: 1; min-width: 0; }
 .setup-model-combobox__control-group input { width: 100%; box-sizing: border-box; }
 .setup-model-combobox__actions { display: flex; align-items: center; gap: var(--sp-1); flex-shrink: 0; }
+.setup-model-combobox__sync { margin: 0; color: var(--text-muted); font-size: var(--fs-xs); overflow-wrap: anywhere; }
+.setup-model-combobox__popup-sync { margin-left: auto; text-align: right; overflow-wrap: anywhere; }
+.setup-model-combobox__readout > span:first-child { flex-shrink: 0; }
 @media (max-width: 760px) { .setup-model-combobox__actions { flex-direction: column; align-items: flex-end; } }
 
 /* Cell mode: the wrapper is a grid/table cell — the input fills it. No label
@@ -842,21 +892,6 @@ function onKeydown(event: KeyboardEvent) {
   justify-content: space-between;
   padding: var(--sp-2) var(--sp-3);
   flex-shrink: 0;
-}
-
-.setup-model-combobox__live-dot {
-  background: var(--info);
-  border-radius: var(--radius-pill);
-  height: 6px;
-  width: 6px;
-}
-
-.setup-model-combobox__live-source {
-  align-items: center;
-  color: var(--text-dim);
-  display: inline-flex;
-  gap: var(--sp-1);
-  white-space: nowrap;
 }
 
 .setup-model-combobox__row {

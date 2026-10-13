@@ -9,7 +9,6 @@ import pytest
 
 from opensquilla.application.session_maintenance import (
     CompactSession,
-    SessionCompactionDeadlineError,
     SessionCompactionEvent,
     SessionCompactionExecutionResult,
     SessionCompactionMilestone,
@@ -193,15 +192,18 @@ async def test_compaction_orders_safety_before_destructive_execution() -> None:
     assert ports.events[-1].terminal is True
 
 
-async def test_timeout_claims_one_terminal_result() -> None:
+async def test_recoverable_timeout_claims_one_skipped_terminal_result() -> None:
     ports = _Ports()
-    ports.execution_error = SessionCompactionPhaseTimeoutError("summarizing")
+    ports.execution_error = SessionCompactionPhaseTimeoutError(
+        "summarizing", definitively_uncommitted=True,
+    )
 
-    with pytest.raises(SessionCompactionDeadlineError) as raised:
-        await _application(ports).compact(CompactSession("agent:main:webchat:one"))
+    result = await _application(ports).compact(CompactSession("agent:main:webchat:one"))
 
-    assert raised.value.phase == "summarizing"
-    assert [event.status for event in ports.events if event.terminal] == ["failed"]
+    assert result.status == "skipped"
+    assert result.applied is False
+    assert ports.events[-1].stage == "summarizing"
+    assert [event.status for event in ports.events if event.terminal] == ["skipped"]
     assert ports.events[-1].reason == "compaction_deadline_exceeded"
     assert {event.compaction_id for event in ports.events} == {"compact-1"}
 
@@ -277,13 +279,16 @@ async def test_invalid_compaction_budget_never_loads_session() -> None:
         ("stale_preimage", "skipped"),
         ("stale_context_state", "skipped"),
         ("consumer_admission_stale", "skipped"),
-        ("consumer_admission_failed", "failed"),
-        ("summary_target_unavailable", "failed"),
-        ("coverage_blocked", "failed"),
-        ("quality_gate_failed", "failed"),
-        ("summary_replay_incomplete", "failed"),
+        ("consumer_admission_failed", "skipped"),
+        ("summary_target_unavailable", "skipped"),
+        ("coverage_blocked", "skipped"),
+        ("quality_gate_failed", "skipped"),
+        ("summary_replay_incomplete", "skipped"),
+        ("summary_failed", "skipped"),
+        ("suffix_summary_failed", "skipped"),
+        ("summary_does_not_fit", "skipped"),
         ("invalid_source_boundary", "failed"),
-        (None, "failed"),
+        (None, "skipped"),
     ],
 )
 async def test_manual_compaction_classifies_unapplied_candidates(reason, status) -> None:
@@ -330,5 +335,5 @@ async def test_cancel_before_commit_closes_same_manual_operation(background: boo
     assert {event.compaction_id for event in ports.events} == {"compact-1"}
     terminals = [event for event in ports.events if event.terminal]
     assert len(terminals) == 1
-    assert terminals[0].status == "failed"
+    assert terminals[0].status == "cancelled"
     assert terminals[0].reason == "cancelled"

@@ -97,6 +97,7 @@ export interface ChatRpcStreamApi {
     presentation?: 'intermediate' | 'answer',
     identity?: ChatStreamModelCallIdentity,
   ) => void
+  markTextPreviewIncomplete?: () => void
   scheduleRender: () => void
   appendToolCall: (payload: ConversationToolContent) => void
   appendToolDelta: (payload: ConversationToolContent) => void
@@ -180,7 +181,7 @@ export interface UseChatRpcEventHandlersOptions {
   getCompactionPlacement?: (compactionId: string) => ChatCompactionPlacement | undefined
   showWarningToast: (message: string) => void
   supportsTurnCommitted?: () => boolean
-  scheduleHistorySync: (preserveLocalTail?: boolean) => void
+  scheduleHistorySync: (preserveLocalTail?: boolean, expectedUserMessageId?: string) => void
   schedulePendingDrainAfterTerminal: () => void
   popAllPendingIntoComposer: () => boolean
   restoreSteerIntoComposer?: (text: string) => void
@@ -881,7 +882,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       } else if (event === 'router-control-replay') {
         handleRpcRouterControlReplay(payload)
       } else if (event === 'input-disposition') {
-        handleRpcInputDisposition(payload)
+        handleRpcInputDisposition(payload, entry.replayed)
       } else if (event === 'compaction-progress') {
         // A live snapshot is the authoritative base for the active stream, not
         // historical replay. Compaction deliberately ignores replayed
@@ -1584,6 +1585,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       // Compatibility with older gateways that predate semantic text roles.
       stream.appendDelta(payload.text || '')
     }
+    if (payload.text_truncated === true) stream.markTextPreviewIncomplete?.()
   }
 
   function handleSkillLoad(payload: ConversationEventData) {
@@ -1838,15 +1840,31 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     options.showWarningToast(String(payload.message || ''))
   }
 
-  function handleRpcInputDisposition(payload: ConversationInputDisposition) {
+  function syncMissingUserMessage(payload: Pick<ConversationEventData, 'user_message_id' | 'client_message_id'>) {
+    const messageId = String(payload.user_message_id || '').trim()
+    if (!messageId) return
+    const clientId = String(payload.client_message_id || '').trim()
+    if (messages.value.some(message => message.role === 'user' && (
+      message.messageId === messageId || Boolean(clientId && message.clientId === clientId)
+    ))) return
+    // A peer has no optimistic send row. Read the durable message (including
+    // attachments) without replacing its live answer or Router projection.
+    options.scheduleHistorySync(true, messageId)
+  }
+
+  function handleRpcInputDisposition(payload: ConversationInputDisposition, replayed = false) {
     if (isStaleEpoch(payload)) return
     if (!isCurrentSessionPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     // Primary sends also publish durable queued/applied disposition events.
-    // Those events describe ingress ownership, not same-turn Steer UX. Older
-    // gateways omitted intent for steer events, so only an explicit non-steer
-    // intent is ignored for compatibility.
-    if (payload.intent && payload.intent !== 'steer') return
+    // Peers must hydrate the durable input while keeping its disposition out
+    // of same-turn Steer UX. Older gateways omitted intent for steer events.
+    if (payload.intent && payload.intent !== 'steer') {
+      // Bootstrap/reconciliation owns history for replay. Its original input
+      // can be outside the latest page during a long-running turn.
+      if (!replayed) syncMissingUserMessage(payload)
+      return
+    }
     const disposition = payload.disposition
     if (!disposition) return
     const clientRequestId = String(payload.client_request_id || '')
@@ -1958,6 +1976,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function handleRpcSessionsChanged(payload: ConversationEventData) {
     if (isStaleEpoch(payload)) return
     if (!isCurrentSessionPayload(payload)) return
+    if (payload.reason === 'cancellation_completed') {
+      // A completed cancellation operation is not a terminal task identity.
+      // Reconciliation also clears cancelled background-only task groups.
+      markRecoveryDirty()
+      return
+    }
     const changedTask = payload.changed_task
     const changedTaskStatus = String(changedTask?.status || '').toLowerCase()
     if (changedTaskStatus === 'queued') options.taskOwnership?.noteQueued(changedTask || '')
@@ -1996,6 +2020,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       && !isCurrentTaskPayload(payload)
     ) return
     if (sessionChangeIsTerminal(payload)) {
+      if (!payloadTerminalTaskId && options.taskOwnership?.stopTargetTaskId.value) {
+        // Older Gateways' unscoped cancellation summaries cannot settle a
+        // queued or running successor. Read fresh task and group ownership.
+        markRecoveryDirty()
+        return
+      }
       const terminalStatus = String(payloadTerminalTask?.status || '').toLowerCase()
       const interrupted = ['cancelled', 'abandoned', 'interrupted'].includes(terminalStatus)
       if (activeTaskGroups.value.size > 0 && !interrupted) {
@@ -2032,6 +2062,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentSessionPayload(payload)) return
     const taskId = payloadTaskId(payload)
     if (!taskId) return
+    syncMissingUserMessage(payload)
     const queued = options.taskOwnership?.noteQueued({ ...(payload || {}), status: 'queued' })
     // queued can describe another same-session task. Keep the fresh send on
     // PENDING until its chat.send response supplies the accepted task id.
@@ -2052,6 +2083,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // task belongs to this optimistic stream.
     const taskId = payloadTaskId(payload)
     if (!taskId) return
+    syncMissingUserMessage(payload)
     options.taskOwnership?.noteRunning({ ...(payload || {}), status: 'running' })
     aborted.value = false
     const currentRenderTaskId = activeStreamTaskId.value
@@ -2559,7 +2591,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (event.kind === 'known') {
       switch (event.semanticKind) {
         case 'process-completed':
-          // A retained process may finish after its turn. The process panel owns it.
+          // Retained process completion is handled outside the chat transcript.
           return
         case 'answer-generation-reset':
           handleRpcAnswerGenerationReset(event.payload)
@@ -2601,7 +2633,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
           handleRpcWarning(event.payload)
           break
         case 'input-disposition':
-          handleRpcInputDisposition(event.payload)
+          handleRpcInputDisposition(event.payload, event.meta.replayed === true)
           break
         case 'cron-result':
           handleRpcCronResult(event.payload)

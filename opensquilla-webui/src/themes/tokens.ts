@@ -3,9 +3,6 @@
 // CSS in lockstep: dropping a `src/themes/<id>/tokens.css` makes the theme both
 // selectable AND functional, with no per-theme import to maintain.
 //
-// Expressive skins (skin.css) are intentionally NOT matched here — they load
-// lazily per route via the manifest, so they stay out of the entry bundle.
-//
 // Import order is deliberately NOT load-bearing: dark's tokens.css declares the
 // default ground on `:where(:root)` (specificity 0), so every theme's
 // `[data-theme="<id>"]` block beats it no matter where the glob emits it.

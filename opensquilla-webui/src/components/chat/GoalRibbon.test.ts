@@ -108,6 +108,13 @@ describe('GoalRibbon', () => {
     expect(host.querySelector('[data-action="resume"]')).not.toBeNull()
   })
 
+  it('shows a distinct reason when repeated turns make no measurable progress', () => {
+    const host = mountRibbon({ goal: goal({ status: 'paused', pauseReason: 'no_progress' }) })
+    expect(host.querySelector('.goal-ribbon__meta')?.textContent)
+      .toContain('Paused after repeated turns without measurable progress')
+    expect(host.querySelector('[data-action="resume"]')).not.toBeNull()
+  })
+
   it('shows Goal progress, accounting, and Plan deferral', () => {
     const host = mountRibbon({ planModeActive: true })
 

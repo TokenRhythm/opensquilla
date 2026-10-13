@@ -34,8 +34,14 @@ function mountDrawer(options: {
   const queue = ref(options.queue || [])
   const queueSource: SkillInstallSource = queue.value[0]?.source === 'clawhub'
     ? 'clawhub'
-    : 'github'
+    : queue.value[0]?.source === 'skillhub'
+      ? 'skillhub'
+      : 'github'
   const activities = ref<SkillInstallActivities>(options.activities || {
+    skillhub: {
+      items: queueSource === 'skillhub' ? queue.value : [],
+      refreshWarning: '',
+    },
     clawhub: {
       items: queueSource === 'clawhub' ? queue.value : [],
       refreshWarning: '',
@@ -48,9 +54,11 @@ function mountDrawer(options: {
   const runningSource = ref<SkillInstallSource | null>(options.runningSource ?? null)
   const cancellingSource = ref<SkillInstallSource | null>(options.cancellingSource ?? null)
   const installed: Array<[string, string, string]> = []
+  const viewed: Array<[string, string, string]> = []
   const retried: Array<[string, boolean | undefined]> = []
   const cleared: SkillInstallSource[] = []
   const cancelled: SkillInstallSource[] = []
+  const sourceChanges: SkillInstallSource[] = []
 
   const Root = defineComponent({
     setup() {
@@ -75,8 +83,12 @@ function mountDrawer(options: {
           'onUpdate:registryQuery': (value: string) => { registryQuery.value = value },
           'onUpdate:githubUrl': (value: string) => { githubUrl.value = value },
           onClose: () => { open.value = false },
+          onSourceChange: (source: SkillInstallSource) => { sourceChanges.push(source) },
           onInstall: (identifier: string, source: string, name: string) => {
             installed.push([identifier, source, name])
+          },
+          onViewDetails: (identifier: string, source: string, name: string) => {
+            viewed.push([identifier, source, name])
           },
           onRetry: (id: string, acknowledgeRisk?: boolean) => {
             retried.push([id, acknowledgeRisk])
@@ -109,9 +121,11 @@ function mountDrawer(options: {
     runningSource,
     cancellingSource,
     installed,
+    viewed,
     retried,
     cleared,
     cancelled,
+    sourceChanges,
   }
 }
 
@@ -132,13 +146,21 @@ describe('SkillsAddDrawer', () => {
     const sourceGroup = document.querySelector<HTMLElement>('.sk-add-source-tabs')
     const githubButton = document.querySelector<HTMLElement>('#skills-add-tab-github')
     const clawhubButton = document.querySelector<HTMLElement>('#skills-add-tab-clawhub')
+    const skillhubButton = document.querySelector<HTMLElement>('#skills-add-tab-skillhub')
     expect(sourceGroup?.getAttribute('role')).toBe('group')
     expect(githubButton?.getAttribute('aria-pressed')).toBe('true')
     expect(clawhubButton?.getAttribute('aria-pressed')).toBe('false')
+    expect(skillhubButton?.getAttribute('aria-pressed')).toBe('false')
     expect(githubButton?.hasAttribute('aria-selected')).toBe(false)
     expect(githubButton?.hasAttribute('aria-controls')).toBe(false)
     expect(document.querySelector('#skills-add-panel-github')?.hasAttribute('role')).toBe(false)
     expect(document.activeElement).toBe(drawer?.querySelector('.sk-add-drawer__close'))
+
+    skillhubButton?.click()
+    await nextTick()
+    expect(skillhubButton?.getAttribute('aria-pressed')).toBe('true')
+    expect(document.querySelector('#skills-add-panel-skillhub')).not.toBeNull()
+    expect(document.querySelector<HTMLInputElement>('#skills-add-skillhub-query')).not.toBeNull()
 
     document.querySelector<HTMLElement>('[data-testid="skills-add-scrim"]')?.click()
     await nextTick()
@@ -180,6 +202,131 @@ describe('SkillsAddDrawer', () => {
     expect(callout.textContent).toContain('Retry after: <b>30</b> seconds')
     expect(callout.innerHTML).not.toContain('<b>30</b>')
     expect(callout.textContent).not.toContain('secret')
+  })
+
+  it('does not show results from another registry after switching sources', async () => {
+    const { sourceChanges } = mountDrawer({
+      results: [{
+        name: 'ClawHub demo',
+        installReference: '@acme/demo@1.0.0',
+        source: 'clawhub',
+      }],
+    })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-clawhub')?.click()
+    await nextTick()
+    expect(document.querySelector('.sk-add-result')?.textContent).toContain('ClawHub demo')
+
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-skillhub')?.click()
+    await nextTick()
+    expect(document.querySelector('.sk-add-results')).toBeNull()
+    expect(document.querySelector('.sk-add-empty')?.textContent).toContain('SkillHub')
+    expect(sourceChanges).toEqual(['clawhub', 'skillhub'])
+  })
+
+  it.each(['Enter', ' '])('preserves button activation while selecting cards with %j', async (key) => {
+    mountDrawer({
+      results: [
+        { name: 'First', identifier: 'first', source: 'clawhub' },
+        { name: 'Second', identifier: 'second', source: 'clawhub', installed: true },
+      ],
+    })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')!.click()
+    await nextTick()
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-clawhub')!.click()
+    await nextTick()
+
+    const rows = document.querySelectorAll<HTMLElement>('.sk-add-result')
+    for (const row of rows) {
+      const button = row.querySelector<HTMLButtonElement>('button')!
+      const buttonKey = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+      button.dispatchEvent(buttonKey)
+      // A browser's native button click depends on the key event remaining uncancelled.
+      expect(buttonKey.defaultPrevented).toBe(false)
+    }
+    await nextTick()
+    expect(rows[0].classList.contains('is-selected')).toBe(true)
+    expect(rows[1].classList.contains('is-selected')).toBe(false)
+
+    const cardKey = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+    rows[1].dispatchEvent(cardKey)
+    await nextTick()
+    expect(cardKey.defaultPrevented).toBe(true)
+    expect(rows[1].classList.contains('is-selected')).toBe(true)
+  })
+
+  it('selects a result for preview and retries cancelled installs', async () => {
+    const { retried } = mountDrawer({
+      queue: [{
+        id: '["clawhub","@acme/cancelled"]',
+        identifier: '@acme/cancelled',
+        source: 'clawhub',
+        displayName: 'Cancelled demo',
+        status: 'cancelled',
+      }],
+      results: [
+        {
+          name: 'Cancelled demo',
+          installReference: '@acme/cancelled',
+          source: 'clawhub',
+        },
+        {
+          name: 'Second demo',
+          installReference: '@acme/second',
+          source: 'clawhub',
+          description: 'A second searchable result.',
+        },
+      ],
+    })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-clawhub')?.click()
+    await nextTick()
+
+    const results = Array.from(document.querySelectorAll<HTMLElement>('.sk-add-result'))
+    expect(results[0].classList.contains('is-selected')).toBe(true)
+    results[1].click()
+    await nextTick()
+    expect(results[1].classList.contains('is-selected')).toBe(true)
+    await new Promise(resolve => setTimeout(resolve, 250))
+    expect(document.querySelector('.sk-add-preview h3')?.textContent).toBe('Second demo')
+
+    results[0].querySelector<HTMLButtonElement>('button')?.click()
+    expect(retried).toEqual([['["clawhub","@acme/cancelled"]', false]])
+  })
+
+  it('allows SkillHub installation when the registry omits license metadata', async () => {
+    const { installed } = mountDrawer({
+      results: [{
+        name: 'ByteRover',
+        identifier: 'byterover',
+        source: 'skillhub',
+      }],
+    })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-skillhub')?.click()
+    await nextTick()
+
+    const result = document.querySelector<HTMLElement>('.sk-add-result')
+    const action = result?.querySelector<HTMLButtonElement>('button')
+    expect(result?.textContent).not.toContain('License required')
+    expect(action?.disabled).toBe(false)
+    action?.click()
+    expect(installed).toEqual([['byterover', 'skillhub', 'ByteRover']])
+
+    const preview = document.querySelector<HTMLElement>('.sk-add-preview')!
+    expect(preview.textContent).not.toContain('License required')
+    expect(preview.textContent).not.toContain('MIT')
+    const previewAction = preview.querySelector<HTMLButtonElement>('button')!
+    expect(previewAction.disabled).toBe(false)
+    previewAction.click()
+    expect(installed).toEqual([
+      ['byterover', 'skillhub', 'ByteRover'],
+      ['byterover', 'skillhub', 'ByteRover'],
+    ])
   })
 
   it('explains newline batching and reports only exact duplicate references', async () => {
@@ -411,6 +558,26 @@ describe('SkillsAddDrawer', () => {
     expect(installed).toEqual([['@verified/demo@1.2.3', 'clawhub', 'Demo']])
   })
 
+  it('keeps registry cards readable when the source summary contains markers', async () => {
+    mountDrawer({
+      results: [{
+        name: '<!-- TYPEUI_SH_MANAGED_START --> # Paper Design Design System Skill (Universal)',
+        description: '<!-- TYPEUI_SH_MANAGED_START -->\n---\ntitle: Paper\n---\n## Build polished UI',
+        source: 'clawhub',
+      }],
+    })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-clawhub')?.click()
+    await nextTick()
+
+    const result = document.querySelector<HTMLElement>('.sk-add-result')!
+    expect(result.querySelector('strong')?.textContent)
+      .toBe('Paper Design Design System Skill (Universal)')
+    expect(result.querySelector('p')?.textContent).toBe('Build polished UI')
+    expect(result.textContent).not.toContain('TYPEUI_SH_MANAGED_START')
+  })
+
   it('shows install activity before long ClawHub search results', async () => {
     const queue: SkillInstallQueueItem[] = [{
       id: '["clawhub","@verified/demo"]',
@@ -481,7 +648,7 @@ describe('SkillsAddDrawer', () => {
     await nextTick()
 
     expect(result.dataset.status).toBe('failed')
-    expect(action.textContent).toContain('View details')
+    expect(action.textContent).toContain('View installation details')
     expect(result.textContent).toContain('Failed')
     expect(result.textContent).not.toContain('Manifest rejected')
     expect(result.textContent).not.toContain('Not installed')
@@ -497,10 +664,35 @@ describe('SkillsAddDrawer', () => {
     expect(activity.querySelector<HTMLElement>('.sk-add-activity-body')?.style.display)
       .not.toBe('none')
     expect(mounted.retried).toEqual([])
+    expect(action.getAttribute('aria-controls')).toMatch(/^skills-install-item-/)
+    expect(document.querySelector<HTMLElement>('.sk-add-queue-item')?.classList.contains('is-focused'))
+      .toBe(true)
+  })
+
+  it('opens details for an already installed registry result', async () => {
+    const { viewed } = mountDrawer({
+      results: [{
+        name: 'Installed demo',
+        installReference: '@verified/demo@1.2.3',
+        source: 'clawhub',
+        installed: true,
+      }],
+    })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-clawhub')?.click()
+    await nextTick()
+
+    const action = document.querySelector<HTMLButtonElement>('.sk-add-result .btn')!
+    expect(action.textContent).toContain('View details')
+    expect(action.disabled).toBe(false)
+    action.click()
+    expect(viewed).toEqual([['@verified/demo@1.2.3', 'clawhub', 'Installed demo']])
   })
 
   it('keeps source activity isolated and exposes inactive failures on the source tab only', async () => {
     const activities: SkillInstallActivities = {
+      skillhub: { items: [], refreshWarning: '' },
       clawhub: {
         items: [{
           id: '["clawhub","@acme/failed"]',
@@ -548,6 +740,7 @@ describe('SkillsAddDrawer', () => {
 
   it('shows background progress on its source tab and keeps read-only search available', async () => {
     const activities: SkillInstallActivities = {
+      skillhub: { items: [], refreshWarning: '' },
       clawhub: { items: [], refreshWarning: '' },
       github: {
         items: [{
@@ -584,6 +777,7 @@ describe('SkillsAddDrawer', () => {
 
   it('shows one canonical spinner and truthful copy while refreshing the active source', async () => {
     const activities: SkillInstallActivities = {
+      skillhub: { items: [], refreshWarning: '' },
       clawhub: { items: [], refreshWarning: '', phase: 'terminal' },
       github: {
         items: [{
@@ -617,6 +811,7 @@ describe('SkillsAddDrawer', () => {
   it('renders rate-limited remainder items as not attempted instead of failed', async () => {
     const deferredNote = 'Not attempted because GitHub rate limited an earlier reference.'
     const activities: SkillInstallActivities = {
+      skillhub: { items: [], refreshWarning: '' },
       clawhub: { items: [], refreshWarning: '', phase: 'terminal' },
       github: {
         items: [{
@@ -661,6 +856,7 @@ describe('SkillsAddDrawer', () => {
 
   it('summarizes terminal outcomes, allows manual disclosure, and clears only terminal activity', async () => {
     const activities: SkillInstallActivities = {
+      skillhub: { items: [], refreshWarning: '' },
       clawhub: { items: [], refreshWarning: '' },
       github: {
         items: [{
@@ -713,6 +909,7 @@ describe('SkillsAddDrawer', () => {
       readiness_state: 'unknown' as const,
     }
     const activities: SkillInstallActivities = {
+      skillhub: { items: [], refreshWarning: '' },
       clawhub: {
         items: [{
           id: '["clawhub","@acme/new"]',
@@ -775,6 +972,7 @@ describe('SkillsAddDrawer', () => {
 
   it('reports a preserved installation when a reinstall fails', async () => {
     const activities: SkillInstallActivities = {
+      skillhub: { items: [], refreshWarning: '' },
       clawhub: {
         items: [{
           id: '["clawhub","@acme/existing"]',
@@ -812,6 +1010,7 @@ describe('SkillsAddDrawer', () => {
 
   it('presents an interrupted response as unknown and marks its source for attention', async () => {
     const activities: SkillInstallActivities = {
+      skillhub: { items: [], refreshWarning: '' },
       clawhub: {
         items: [{
           id: '["clawhub","@acme/uncertain"]',
@@ -850,7 +1049,7 @@ describe('SkillsAddDrawer', () => {
     expect(activity.querySelector('.sk-add-retry')).toBeNull()
     expect(activity.querySelector('.sk-spinner')).toBeNull()
     expect(result.textContent).toContain('Installation result unknown')
-    expect(result.textContent).toContain('View details')
+    expect(result.textContent).toContain('View installation details')
     expect(result.textContent).not.toContain('connection closed')
   })
 })

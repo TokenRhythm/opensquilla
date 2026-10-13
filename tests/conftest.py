@@ -377,3 +377,19 @@ def isolated_core_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     temp_root = tmp_path_factory.mktemp("isolated-core-wheel")
     return build_isolated_core_wheel(_REPO_ROOT, temp_root)
+
+
+@pytest.fixture(autouse=True)
+def isolated_provider_retry_after_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests reuse synthetic credentials; retain real cooling within each test.
+
+    A server hint from one independent test must not delay another test that
+    happens to construct the same dummy endpoint/key/model. This resets state,
+    not dispatch enforcement; integration tests exercise shared new adapters.
+    """
+    from opensquilla.provider import retry_after
+
+    monkeypatch.setattr(
+        retry_after, "_provider_retry_after_cooldowns",
+        retry_after.ProviderRetryAfterCooldowns(),
+    )

@@ -43,6 +43,7 @@ const SESSION_DIRECTORY_CALL_OPTIONS: RpcCallOptions = {
   timeoutMs: SESSION_DIRECTORY_TIMEOUT_MS,
   timeoutAction: 'reject',
   abortAction: 'reject',
+  recoveryClass: 'safe-read',
 }
 
 // Keep the Adapter's public factory signature independent of the private
@@ -52,6 +53,7 @@ const SESSION_DIRECTORY_CALL_OPTIONS: RpcCallOptions = {
 // Gate.  This narrow port is intentionally limited to the operations this
 // domain Adapter owns.
 interface SessionDirectoryTransport {
+  readonly generation?: number
   request<T = unknown>(
     method: string,
     params?: Record<string, unknown>,
@@ -275,9 +277,17 @@ export function createV4SessionDirectory(
     abortMessage: string,
   ): Promise<T> {
     const options = signal ? { ...SESSION_DIRECTORY_CALL_OPTIONS, signal } : SESSION_DIRECTORY_CALL_OPTIONS
-    await transport.ready?.({ ...options, timeoutAction: 'reject', abortAction: 'reject' })
+    await transport.ready?.({
+      timeoutMs: SESSION_DIRECTORY_TIMEOUT_MS,
+      ...(signal ? { signal } : {}),
+      timeoutAction: 'reject',
+      abortAction: 'reject',
+    })
     if (signal?.aborted) throw signal.reason || new Error(abortMessage)
-    return transport.request<T>(method, params, options)
+    return transport.request<T>(method, params, {
+      ...options,
+      ...(transport.generation !== undefined ? { expectedGeneration: transport.generation } : {}),
+    })
   }
 
   async function call(params: SessionsListParams, signal?: AbortSignal) {

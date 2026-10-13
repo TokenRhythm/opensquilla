@@ -79,6 +79,7 @@ from opensquilla.provider.image_generation_policy import (
 from opensquilla.provider.protocol import provider_metadata
 from opensquilla.provider.types import ChatConfig, derive_provider_request_correlation
 from opensquilla.sandbox.operation_runtime import SandboxOperation, SandboxToolDescriptor
+from opensquilla.tools.fetch_work import run_blocking_fetch_work
 from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import full_host_access_active
@@ -93,6 +94,7 @@ from opensquilla.tools.types import (
 )
 
 _SUPPORTED_IMAGE_FORMATS = {"png", "jpg", "jpeg", "gif", "webp"}
+_IMAGE_FETCH_TIMEOUT_SECONDS = 30.0
 _SUPPORTED_AUDIO_FORMATS = {"aac", "flac", "m4a", "mp3", "mp4", "mpeg", "ogg", "wav", "webm"}
 _IMAGE_SIZE_LIMIT = 20 * 1024 * 1024  # 20 MB
 _AUDIO_SIZE_LIMIT = 100 * 1024 * 1024  # 100 MB
@@ -406,40 +408,40 @@ async def _fetch_image_url(url: str) -> tuple[bytes, str]:
 
     from opensquilla.tools.ssrf import environment_proxy_url, pinned_transport
 
-    vetted: dict[str, list[str]] = {"ips": []}
-
-    def _check_image_url(candidate_url: str) -> None:
+    def _prepare_image_client(candidate_url: str) -> dict[str, object]:
         marker = _sensitive_media_url_block("image", candidate_url)
         if marker is not None:
             raise ToolError("Blocked: URL contains sensitive data")
         try:
-            vetted["ips"] = validate_http_url_for_fetch(candidate_url)
+            vetted_ips = validate_http_url_for_fetch(candidate_url)
         except UnsupportedURLSchemeError as exc:
             raise ToolError("Only HTTP/HTTPS URLs are supported for image fetch") from exc
         except SSRFBlockedError as exc:
             raise ToolError(str(exc)) from exc
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
+        transport_kwargs: dict[str, object] = {}
+        if _trust_env():
+            proxy_url = environment_proxy_url(candidate_url)
+            if proxy_url is not None:
+                transport_kwargs["proxy"] = proxy_url
+        transport = pinned_transport(candidate_url, vetted_ips, **transport_kwargs)
+        client_kwargs: dict[str, object] = {
+            "timeout": _IMAGE_FETCH_TIMEOUT_SECONDS,
+            "follow_redirects": False,
+            "trust_env": _trust_env(),
+        }
+        if transport is not None:
+            client_kwargs["transport"] = transport
+        return client_kwargs
 
     try:
         current_url = url
         for _redirect_count in range(_MAX_REDIRECTS + 1):
-            _check_image_url(current_url)
+            async with asyncio.timeout(_IMAGE_FETCH_TIMEOUT_SECONDS):
+                client_kwargs = await run_blocking_fetch_work(_prepare_image_client, current_url)
             # Pin the connection to the address that just passed the guard so a
             # second (rebinding) DNS resolution cannot land on a private IP.
-            transport_kwargs: dict[str, object] = {}
-            if _trust_env():
-                proxy_url = environment_proxy_url(current_url)
-                if proxy_url is not None:
-                    transport_kwargs["proxy"] = proxy_url
-            transport = pinned_transport(current_url, vetted["ips"], **transport_kwargs)
-            client_kwargs: dict[str, object] = {
-                "timeout": 30.0,
-                "follow_redirects": False,
-                "trust_env": _trust_env(),
-            }
-            if transport is not None:
-                client_kwargs["transport"] = transport
             async with httpx.AsyncClient(**client_kwargs) as client:  # type: ignore[arg-type]
                 resp = await client.get(current_url)
             if resp.status_code not in {301, 302, 303, 307, 308}:

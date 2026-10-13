@@ -10,14 +10,20 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
+import json
 import threading
 from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from PIL import Image
 
+from opensquilla.attachment_refs import write_transcript_material
 from opensquilla.engine import runtime as runtime_module
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway.config import GatewayConfig
@@ -25,7 +31,7 @@ from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import Message, ModelInfo
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider.model_catalog import ModelCatalog
-from opensquilla.session.compaction import CompactionConfig
+from opensquilla.session.compaction import CompactionConfig, estimate_entry_model_replay_tokens
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import TranscriptEntry
 from opensquilla.session.storage import SessionStorage
@@ -209,7 +215,12 @@ class _FailingResultCompactionSessionManager(_ResultCompactionSessionManager):
     ) -> SimpleNamespace:
         self.compact_with_result_calls.append((session_key, context_window_tokens, config))
         self.compact_with_result_kwargs.append(dict(kwargs))
-        raise RuntimeError("preimage write failed")
+        if config.on_summary_call_started is not None:
+            config.on_summary_call_started()
+        return SimpleNamespace(
+            summary="", kept_entries=list(self._transcript), removed_count=0,
+            chunks_processed=1, summary_source="skipped", skip_reason="summary_failed",
+        )
 
 
 class _StaleResultCompactionSessionManager(_ResultCompactionSessionManager):
@@ -336,7 +347,7 @@ async def test_preflight_measures_history_once_without_blocking_event_loop(monke
     loop = asyncio.get_running_loop()
     measured = []
 
-    def estimate(entry):
+    def estimate(entry, **_kwargs):
         loop.call_soon_threadsafe(entered.set)
         assert release.wait(5)
         measured.append(entry)
@@ -646,7 +657,7 @@ async def test_preflight_legacy_compactor_uses_id_safe_ephemeral_override(
     manager.compact = AsyncMock(side_effect=legacy_compact)
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
 
-    await runner._maybe_preflight_compact(
+    prepared_window = await runner._maybe_preflight_compact(
         session_key,
         1000,
         history_has_persisted_user=True,
@@ -654,7 +665,8 @@ async def test_preflight_legacy_compactor_uses_id_safe_ephemeral_override(
     )
 
     assert durable_calls == []
-    override = runner._emergency_compaction_overrides[session_key]
+    override = prepared_window
+    assert override is not None
     assert override.protected_recent_messages == 2
     assert [entry.message_id for entry in override.kept_entries] == [
         active_user.message_id, queued_user.message_id,
@@ -677,6 +689,7 @@ async def test_preflight_legacy_compactor_uses_id_safe_ephemeral_override(
         agent,
         session_key,
         trim_last_user=True,
+        prepared_window=prepared_window,
         bound_user_message_id=active_user.message_id,
     )
 
@@ -701,6 +714,91 @@ async def test_preflight_under_threshold_does_not_compact() -> None:
     await runner._maybe_preflight_compact("user:session", 200_000)
 
     mock_sm.compact.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_base64", [False, True])
+async def test_preflight_opaque_attachment_uses_projected_size(
+    invalid_base64: bool,
+) -> None:
+    payload = (
+        "invalid***" + "A" * 200_000
+        if invalid_base64
+        else base64.b64encode(b"opaque zip payload" * 12_000).decode("ascii")
+    )
+    envelope = json.dumps(
+        {
+            "text": "inspect this archive",
+            "attachments": [{"type": "application/zip", "name": "bundle.zip", "data": payload}],
+        },
+        separators=(",", ":"),
+    )
+    entries = [_make_entry(envelope)]
+    mock_sm = MagicMock()
+    mock_sm.compact = AsyncMock()
+    mock_sm.get_transcript = AsyncMock(return_value=entries)
+
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
+    await runner._maybe_preflight_compact("user:session", 1_000)
+
+    mock_sm.compact.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preflight_text_route_omits_historical_image_reserve() -> None:
+    stream = io.BytesIO()
+    with Image.new("RGB", (1, 1), "#2468ac") as image:
+        image.save(stream, format="PNG")
+    data = base64.b64encode(stream.getvalue()).decode("ascii")
+    envelope = json.dumps({
+        "text": "Earlier image request.",
+        "attachments": [{"type": "image/png", "data": data} for _ in range(10)],
+    })
+    entries = [_make_entry(envelope) for _ in range(10)]
+    omitted = sum(
+        estimate_entry_model_replay_tokens(entry, preserve_images=False)
+        for entry in entries
+    )
+    retained = sum(estimate_entry_model_replay_tokens(entry) for entry in entries)
+    assert omitted < 17_000 < retained
+
+    mock_sm = MagicMock()
+    mock_sm.compact = AsyncMock()
+    mock_sm.get_transcript = AsyncMock(return_value=entries)
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
+    await runner._maybe_preflight_compact(
+        "user:session", 20_000, preserve_historical_images=False,
+    )
+    mock_sm.compact.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preflight_retained_ref_uses_verified_pixel_reserve(tmp_path: Path) -> None:
+    stream = io.BytesIO()
+    with Image.new("1", (2048, 2048), 1) as image:
+        image.save(stream, format="PNG")
+    media_root = tmp_path / "media"
+    raw = stream.getvalue()
+    sha, _path, _written = write_transcript_material(
+        media_root=media_root, session_id="test-session-id", payload=raw,
+    )
+    entry = _make_entry(json.dumps({"text": "Inspect.", "attachments": [{
+        "type": "image/png", "sha256_ref": sha, "size": len(raw),
+    }]}))
+    assert estimate_entry_model_replay_tokens(
+        entry, media_root=media_root, session_id="test-session-id",
+    ) >= 4_096
+
+    mock_sm = MagicMock()
+    mock_sm.compact = AsyncMock(return_value="summary")
+    mock_sm.get_transcript = AsyncMock(return_value=[entry])
+    config = GatewayConfig()
+    config.attachments.media_root = str(media_root)
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm, config=config)
+    await runner._maybe_preflight_compact(
+        "user:session", 3_500, preserve_historical_images=True,
+    )
+    mock_sm.compact.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -936,7 +1034,7 @@ async def test_preflight_compact_failure_uses_emergency_ephemeral_history_trim()
         ),
     )
 
-    await runner._maybe_preflight_compact(session_key, context_window)
+    prepared_window = await runner._maybe_preflight_compact(session_key, context_window)
 
     class _HistoryCapture:
         provider = SimpleNamespace(provider_name="test")
@@ -951,7 +1049,9 @@ async def test_preflight_compact_failure_uses_emergency_ephemeral_history_trim()
             assert messages == []
 
     agent = _HistoryCapture()
-    summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
+    summary_context = await runner._load_history(
+        agent, session_key, trim_last_user=False, prepared_window=prepared_window,
+    )
 
     _assert_armed_compaction_call(sm.compact_with_result_calls, session_key, context_window)
     assert len(await sm.get_transcript(session_key)) == len(entries)
@@ -994,7 +1094,7 @@ async def test_preflight_compact_failure_reports_emergency_without_failed_event(
     assert emergency["applied"] is True
     assert emergency["durability"] == "request_scoped"
     assert emergency["user_visible"] is True
-    assert emergency["reason"] == "compact_failed"
+    assert emergency["reason"] == "summary_failed"
     assert runner._compaction_failures[session_key].count == 2
 
 
@@ -1041,7 +1141,7 @@ async def test_preflight_open_circuit_still_uses_request_scoped_emergency_trim(
 
     monkeypatch.setattr(request_window, "iter_window_prefix_cuts", observe_cuts)
 
-    await runner._maybe_preflight_compact(
+    prepared_window = await runner._maybe_preflight_compact(
         session_key,
         context_window,
         history_capacity_tokens=history_capacity,
@@ -1055,8 +1155,10 @@ async def test_preflight_open_circuit_still_uses_request_scoped_emergency_trim(
     assert emergency["applied"] is True
     assert emergency["durability"] == "request_scoped"
     assert runner._compaction_failures[session_key].count == 3
-    assert selected_windows == [len(entries) - 2]
-    override = runner._emergency_compaction_overrides[session_key]
+    # Completed history has no implicit two-message hard protection.
+    assert selected_windows == [len(entries)]
+    override = prepared_window
+    assert override is not None
     assert override.history_window_tokens == history_capacity
     assert override.history_capacity_chars == history_capacity_chars
 
@@ -1100,7 +1202,7 @@ async def test_preflight_empty_summary_uses_emergency_ephemeral_history_trim() -
     sm = _EmptySummarySessionManager(entries)
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
 
-    await runner._maybe_preflight_compact(session_key, context_window)
+    prepared_window = await runner._maybe_preflight_compact(session_key, context_window)
 
     class _HistoryCapture:
         provider = SimpleNamespace(provider_name="test")
@@ -1115,7 +1217,9 @@ async def test_preflight_empty_summary_uses_emergency_ephemeral_history_trim() -
             assert messages == []
 
     agent = _HistoryCapture()
-    summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
+    summary_context = await runner._load_history(
+        agent, session_key, trim_last_user=False, prepared_window=prepared_window,
+    )
 
     _assert_armed_compaction_call(sm.compact_with_result_calls, session_key, context_window)
     assert len(await sm.get_transcript(session_key)) == len(entries)
@@ -1150,7 +1254,7 @@ async def test_preflight_stale_preimage_skip_does_not_use_emergency_trim(
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
     runner._compaction_failures[session_key] = runtime_module._CompactionFailureState(count=1)
 
-    await runner._maybe_preflight_compact(session_key, context_window)
+    prepared_window = await runner._maybe_preflight_compact(session_key, context_window)
 
     _assert_armed_compaction_call(sm.compact_with_result_calls, session_key, context_window)
     assert runner.has_compacted_this_turn(session_key) is False
@@ -1174,7 +1278,9 @@ async def test_preflight_stale_preimage_skip_does_not_use_emergency_trim(
             assert messages == []
 
     agent = _HistoryCapture()
-    summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
+    summary_context = await runner._load_history(
+        agent, session_key, trim_last_user=False, prepared_window=prepared_window,
+    )
     assert summary_context is None
     assert len(agent.history) == len(entries)
 
@@ -1216,13 +1322,13 @@ async def test_preflight_passes_provider_backed_compaction_config() -> None:
     config = captured_configs[0]
     assert isinstance(config, CompactionConfig)
     assert config.api_key == "preflight-provider-key"
-    assert config.model == "routed/model"
+    assert config.model == "provider/model"
     assert config.base_url == "https://openrouter.ai/api/v1"
     assert config.timeout_seconds == 17.5
 
 
 @pytest.mark.asyncio
-async def test_preflight_passes_profile_config_without_provider_or_model() -> None:
+async def test_disabled_preflight_never_invokes_the_summary_manager() -> None:
     context_window = 1000
     entries = [_make_entry("early durable fact " + ("a" * 4000))]
     sm = _ResultCompactionSessionManager(entries)
@@ -1242,14 +1348,7 @@ async def test_preflight_passes_profile_config_without_provider_or_model() -> No
     with patch("opensquilla.session.tokenizer.estimate_tokens", return_value=1000):
         await runner._maybe_preflight_compact("agent:ops:long-session", context_window)
 
-    assert len(sm.compact_with_result_calls) == 1
-    config = sm.compact_with_result_calls[0][2]
-    assert isinstance(config, CompactionConfig)
-    assert config.model is None
-    assert config.api_key == ""
-    assert config.compaction_profile == "coding"
-    assert config.protected_recent_messages == 7
-    assert config.timeout_seconds == 17.5
+    assert not sm.compact_with_result_calls
 
 
 @pytest.mark.asyncio
@@ -1431,7 +1530,12 @@ async def test_preflight_compaction_circuit_breaker_retries_after_cooldown() -> 
     entries = [_make_entry("a" * 4000)]
 
     mock_sm = MagicMock()
-    mock_sm.compact = AsyncMock(side_effect=RuntimeError("compact failed"))
+    async def failed_summary(session_key, window, config=None):
+        if config.on_summary_call_started is not None:
+            config.on_summary_call_started()
+        return ""
+
+    mock_sm.compact = AsyncMock(side_effect=failed_summary)
     mock_sm.get_transcript = AsyncMock(return_value=entries)
 
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)

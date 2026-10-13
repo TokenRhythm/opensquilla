@@ -564,7 +564,7 @@ async def run_channel_dispatch(
         )
         ingress_claim = None
         if delivery_store is not None:
-            ingress_claim = delivery_store.claim_inbound(delivery_channel_name, msg)
+            ingress_claim = await delivery_store.claim_inbound(delivery_channel_name, msg)
             if ingress_claim is None:
                 log.info(
                     "channel.ingress_duplicate_skipped",
@@ -572,7 +572,7 @@ async def run_channel_dispatch(
                 )
                 continue
         session_key = session_key_builder(msg)
-        admission = decide_channel_admission(
+        admission = await decide_channel_admission(
             channel,
             msg,
             session_key,
@@ -618,7 +618,7 @@ async def run_channel_dispatch(
                         error_type=type(exc).__name__,
                     )
             if delivery_store is not None:
-                delivery_store.complete_inbound(
+                await delivery_store.complete_inbound(
                     ingress_claim,
                     "admission_denied",
                     reason=admission.reason,
@@ -632,6 +632,7 @@ async def run_channel_dispatch(
             msg,
             session_key=session_key,
             session_prefix=session_prefix,
+            required_services=(f"channel:{session_prefix.strip().lower()}",),
         )
         principal_is_owner = _stamp_channel_admin_principal(config, route_envelope, msg)
         approval_reply = await _maybe_resolve_channel_approval(
@@ -654,7 +655,7 @@ async def run_channel_dispatch(
                     error_type=type(exc).__name__,
                 )
             if delivery_store is not None:
-                delivery_store.complete_inbound(
+                await delivery_store.complete_inbound(
                     ingress_claim, "approval_resolved", reason=admission.reason
                 )
             continue
@@ -681,7 +682,7 @@ async def run_channel_dispatch(
                     session_key=session_key,
                 )
                 if delivery_store is not None:
-                    delivery_store.complete_inbound(
+                    await delivery_store.complete_inbound(
                         ingress_claim, "command_dispatched", reason=admission.reason
                     )
                 continue
@@ -786,6 +787,7 @@ async def run_channel_dispatch(
 
         if task_runtime is not None:
             from opensquilla.gateway.task_runtime import (
+                TaskDependencyError,
                 TaskQueueFullError,
                 TaskRuntimeShuttingDownError,
             )
@@ -822,7 +824,7 @@ async def run_channel_dispatch(
                     )
                 await status_reactor.completed(msg)
                 if delivery_store is not None:
-                    delivery_store.complete_inbound(
+                    await delivery_store.complete_inbound(
                         ingress_claim, "capacity_rejected", reason=admission.reason
                     )
                 continue
@@ -911,7 +913,7 @@ async def run_channel_dispatch(
                         )
                     )
                     if delivery_store is not None:
-                        delivery_store.fail_inbound(ingress_claim, exc)
+                        await delivery_store.fail_inbound(ingress_claim, exc)
                     continue
                 if isinstance(exc, StaleEpochError):
                     await status_reactor.failed(msg)
@@ -922,7 +924,7 @@ async def run_channel_dispatch(
                         )
                     )
                     if delivery_store is not None:
-                        delivery_store.fail_inbound(ingress_claim, exc)
+                        await delivery_store.fail_inbound(ingress_claim, exc)
                     continue
                 if isinstance(exc, TurnIngressConflictError):
                     await status_reactor.failed(msg)
@@ -937,7 +939,7 @@ async def run_channel_dispatch(
                         )
                     )
                     if delivery_store is not None:
-                        delivery_store.complete_inbound(
+                        await delivery_store.complete_inbound(
                             ingress_claim, "ingress_conflict", reason=admission.reason
                         )
                     continue
@@ -955,7 +957,20 @@ async def run_channel_dispatch(
                         )
                     )
                     if delivery_store is not None:
-                        delivery_store.fail_inbound(ingress_claim, exc)
+                        await delivery_store.fail_inbound(ingress_claim, exc)
+                    continue
+                if isinstance(exc, TaskDependencyError):
+                    await status_reactor.failed(msg)
+                    retry_hint = (
+                        "A required service is still starting. Please retry shortly."
+                        if exc.kind == "DEPENDENCY_STARTING"
+                        else "A required service is unavailable. Please retry later."
+                    )
+                    await channel.send(
+                        _route_envelope_reply_message(retry_hint, route_envelope)
+                    )
+                    if delivery_store is not None:
+                        await delivery_store.fail_inbound(ingress_claim, exc)
                     continue
                 if isinstance(exc, TaskRuntimeShuttingDownError):
                     await status_reactor.failed(msg)
@@ -966,11 +981,11 @@ async def run_channel_dispatch(
                         )
                     )
                     if delivery_store is not None:
-                        delivery_store.fail_inbound(ingress_claim, exc)
+                        await delivery_store.fail_inbound(ingress_claim, exc)
                     continue
                 if not isinstance(exc, TaskQueueFullError):
                     if delivery_store is not None:
-                        delivery_store.fail_inbound(ingress_claim, exc)
+                        await delivery_store.fail_inbound(ingress_claim, exc)
                     raise
                 await status_reactor.failed(msg)
                 await channel.send(
@@ -983,14 +998,14 @@ async def run_channel_dispatch(
                     )
                 )
                 if delivery_store is not None:
-                    delivery_store.complete_inbound(
+                    await delivery_store.complete_inbound(
                         ingress_claim, "queue_rejected", reason=admission.reason
                     )
             else:
                 if replayed and handle is None:
                     await status_reactor.completed(msg)
                     if delivery_store is not None:
-                        delivery_store.complete_inbound(
+                        await delivery_store.complete_inbound(
                             ingress_claim, "turn_replayed", reason=admission.reason
                         )
                     continue
@@ -1067,7 +1082,7 @@ async def run_channel_dispatch(
 
                 reply_task.add_done_callback(_reply_done)
                 if delivery_store is not None:
-                    delivery_store.complete_inbound(
+                    await delivery_store.complete_inbound(
                         ingress_claim, "turn_dispatched", reason=admission.reason
                     )
             continue
@@ -1091,7 +1106,7 @@ async def run_channel_dispatch(
             )
         except BaseException as exc:
             if delivery_store is not None:
-                delivery_store.fail_inbound(ingress_claim, exc)
+                await delivery_store.fail_inbound(ingress_claim, exc)
             raise
         finally:
             if typing_task is not None:
@@ -1105,7 +1120,7 @@ async def run_channel_dispatch(
                 "turn_complete",
             )
         if delivery_store is not None:
-            delivery_store.complete_inbound(
+            await delivery_store.complete_inbound(
                 ingress_claim, "turn_completed", reason=admission.reason
             )
 
@@ -1200,7 +1215,7 @@ async def _maybe_resolve_channel_approval(
         DECISION_ALWAYS,
         DECISION_DENY,
         parse_approval_action,
-        resolve_short_code,
+        resolve_short_code_async,
     )
 
     parsed = parse_approval_action(msg)
@@ -1230,7 +1245,7 @@ async def _maybe_resolve_channel_approval(
             content=render_channel_message("approval_probe_throttled", config=config)
         )
 
-    binding = resolve_short_code(code)
+    binding = await resolve_short_code_async(code)
     if binding is None:
         log.info("channel.approval_unknown_code", code=code, session_key=session_key)
         _record_approval_probe_failure(probe_key)
@@ -1394,13 +1409,13 @@ async def _resolve_channel_approval_decision(
     from opensquilla.channels.approval_prompt import DECISION_ALWAYS
     from opensquilla.sandbox.escalation import (
         apply_sandbox_approval_choice,
-        deny_matching_pending_sandbox_approvals,
+        deny_matching_pending_sandbox_approvals_async,
         is_sandbox_approval_kind,
         remember_sandbox_approval_denial,
         validate_sandbox_approval_choice,
     )
 
-    pending = queue.get(approval_id)
+    pending = await queue.get_async(approval_id)
     sandbox_approval = is_sandbox_approval_kind(pending.params.get("approvalKind"))
     choice: str | None = None
     if sandbox_approval and approved:
@@ -1414,20 +1429,20 @@ async def _resolve_channel_approval_decision(
             # Nothing has been claimed yet — surface this as a validation
             # failure, NOT as the caller's already-resolved ValueError race.
             raise _SandboxChoiceError(str(exc)) from exc
-        claim_token = queue.claim_resolution(
+        claim_token = await queue.claim_resolution_async(
             approval_id,
             resolution_metadata={"resolutionSource": "user_channel"},
         )
-        pending = queue.get(approval_id)
+        pending = await queue.get_async(approval_id)
         try:
-            queue.finalize_claimed_resolution(
+            await queue.finalize_claimed_resolution_async(
                 approval_id,
                 claim_token,
                 True,
                 elevated_mode=None,
             )
         except Exception:
-            queue.release_resolution_claim(approval_id, claim_token)
+            await queue.release_resolution_claim_async(approval_id, claim_token)
             raise
         try:
             await apply_sandbox_approval_choice(
@@ -1439,13 +1454,13 @@ async def _resolve_channel_approval_decision(
                 config=config,
             )
         except Exception:
-            queue.reopen_resolved_approval(approval_id, expected_approved=True)
+            await queue.reopen_resolved_approval_async(approval_id, expected_approved=True)
             raise
-        queue.complete_claimed_resolution(approval_id, claim_token)
+        await queue.complete_claimed_resolution_async(approval_id, claim_token)
     else:
         # Force elevated_mode=None: a channel approval permits exactly the one
         # gated command, never a session-wide bypass regardless of payload.
-        queue.resolve(
+        await queue.resolve_async(
             approval_id,
             approved,
             elevated_mode=None,
@@ -1454,7 +1469,7 @@ async def _resolve_channel_approval_decision(
         )
         if sandbox_approval and not approved:
             remember_sandbox_approval_denial(pending.params, approval_id)
-            deny_matching_pending_sandbox_approvals(
+            await deny_matching_pending_sandbox_approvals_async(
                 queue,
                 pending.params,
                 exclude_approval_id=approval_id,
@@ -1597,7 +1612,7 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
     from opensquilla.gateway.routing import build_channel_route_envelope
 
     msg = combined.message
-    admission = admission_decision or decide_channel_admission(
+    admission = admission_decision or await decide_channel_admission(
         channel,
         msg,
         session_key,
@@ -1607,7 +1622,12 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
     if not admission.admit:
         log.info("channel.admission_denied", channel=session_prefix, reason=admission.reason, is_group=admission.is_group)  # noqa: E501
         return
-    route_envelope = build_channel_route_envelope(msg, session_key=session_key, session_prefix=session_prefix)  # noqa: E501
+    route_envelope = build_channel_route_envelope(  # noqa: E501
+        msg,
+        session_key=session_key,
+        session_prefix=session_prefix,
+        required_services=(f"channel:{session_prefix.strip().lower()}",),
+    )
     principal_is_owner = _stamp_channel_admin_principal(config, route_envelope, msg)
     approval_reply = await _maybe_resolve_channel_approval(
         msg=msg,
@@ -1657,6 +1677,7 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
     await status_reactor.received(msg)
     raw_content = getattr(combined, "raw_content", None) or msg.content
     from opensquilla.gateway.task_runtime import (
+        TaskDependencyError,
         TaskQueueFullError,
         TaskRuntimeShuttingDownError,
     )
@@ -1784,6 +1805,15 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
                     route_envelope,
                 )
             )
+            return
+        if isinstance(exc, TaskDependencyError):
+            await status_reactor.failed(msg)
+            retry_hint = (
+                "A required service is still starting. Please retry shortly."
+                if exc.kind == "DEPENDENCY_STARTING"
+                else "A required service is unavailable. Please retry later."
+            )
+            await channel.send(_route_envelope_reply_message(retry_hint, route_envelope))
             return
         if isinstance(exc, TaskRuntimeShuttingDownError):
             await status_reactor.failed(msg)

@@ -37,6 +37,8 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/gateway/adapters/session_read_contract.py",
         # Additive connection-local snapshot and consumption control Contracts.
         "src/opensquilla/gateway/adapters/connection_recovery_contract.py",
+        # Read-only acceptance recovery validates frozen material without copying bodies.
+        "src/opensquilla/gateway/adapters/turn_receipt_contract.py",
         # SandboxRuntime handlers stay legacy-compatible while generated
         # descriptors own registration metadata and success validation.
         "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
@@ -127,9 +129,12 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Add metadata-only Skill candidates and the allow-use setting.
 # Add the owner-authorized workspace source reference reader.
 # Add session-owned managed process list, output preview and stop.
-RUNTIME_RPC_METHOD_BASELINE = 301
-RUNTIME_RPC_METHOD_DIGEST = "7979e15e8945643942f2ae907c5d8526e9412202607771d87f5ad7d4286a3ca5"
-STATIC_RPC_DECORATOR_BASELINE = 72
+# Retire 19 generated MetaSkill methods and nine legacy workflow methods.
+# Retire router learning status and training feedback (two generated methods).
+# Retire the three advanced agent administration methods.
+RUNTIME_RPC_METHOD_BASELINE = 275
+RUNTIME_RPC_METHOD_DIGEST = "bb550c7d3d3f70eefea7e9d233ee892abf4e2c28b77a9460c2da60b1228f77f1"
+STATIC_RPC_DECORATOR_BASELINE = 63
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -140,7 +145,6 @@ STATIC_RPC_DECORATOR_BASELINE = 72
 # production LOC reduction after each complete domain migration.
 AUTHORED_RUNTIME_FILES = (
     "opensquilla-webui/src/App.vue",
-    "opensquilla-webui/src/components/sessions/SessionInspectDrawer.vue",
     "opensquilla-webui/src/composables/usage/useUsageData.ts",
     "opensquilla-webui/src/composables/useSessions.ts",
     "opensquilla-webui/src/main.ts",
@@ -192,8 +196,10 @@ F2_GATEWAY_COMPOSITION_ROOT = "opensquilla-webui/src/adapters/gateway/gatewayAda
 # on the reviewed #1525 baseline.
 # Connection stability adds 69 reviewed lines at this private seam: one flow
 # owner, consumed/gap hooks, staging/install control and validated orphan-read
-# credit cleanup. Domain recovery stays outside the generic transport seam.
-F2_TRANSPORT_FOUNDATION_LOC_CEILING = 1_125 + 69
+# credit cleanup. The snapshot-install/recovery result contract adds three
+# further reviewed lines. Domain recovery stays outside the generic transport
+# seam.
+F2_TRANSPORT_FOUNDATION_LOC_CEILING = 1_125 + 72
 
 WEBUI_SOURCE_ROOT = ROOT / "opensquilla-webui" / "src"
 WEBUI_LEGACY_TRANSPORT_IDENTIFIERS = (
@@ -215,7 +221,6 @@ R3_APPLICATION_MODULE_FILES = (
     "src/opensquilla/application/observability.py",
     "src/opensquilla/application/skill_catalog.py",
     "src/opensquilla/application/skill_management.py",
-    "src/opensquilla/application/skill_proposal_review.py",
     "src/opensquilla/application/artifact_workbench.py",
 )
 
@@ -588,13 +593,19 @@ def test_schema_derived_method_metadata_consumers_are_exact() -> None:
             PLANS_METADATA_IMPORT_ALLOWLIST,
         ),
     }
+    # Index all metadata consumers in one source-tree scan instead of parsing
+    # the entire package again for every method's allowlist.
+    consumers_by_module: dict[str, set[str]] = {
+        module_name: set() for module_name, _ in allowlists.values()
+    }
+    for path in _python_files(PACKAGE_ROOT):
+        for node in ast.walk(_tree(path)):
+            for module_name in _imported_modules(path, node):
+                if module_name in consumers_by_module:
+                    consumers_by_module[module_name].add(_relative(path))
+
     for method, (module_name, allowlist) in allowlists.items():
-        consumers = {
-            _relative(path)
-            for path in _python_files(PACKAGE_ROOT)
-            for node in ast.walk(_tree(path))
-            if module_name in _imported_modules(path, node)
-        }
+        consumers = consumers_by_module[module_name]
         unexpected = consumers - allowlist
         stale = allowlist - consumers
         assert unexpected == set(), f"unexpected {method} metadata imports: {unexpected}"
@@ -1028,7 +1039,6 @@ def test_r5_gateway_adapters_depend_on_typed_ports_not_rpc_callbacks() -> None:
         "GatewayLogReaderPort",
         "GatewayReadinessDataPort",
         "GatewayReadinessEvaluationPort",
-        "GatewayRouterLearningStatusPort",
         "GatewaySkillCatalogReadPort",
         "GatewaySkillManagementPort",
     }
@@ -1099,7 +1109,6 @@ def test_r5_rpc_factories_bind_concrete_typed_runtime_ports() -> None:
         ),
         "rpc_doctor.py": ("_GatewayReadinessRuntime(ctx)",),
         "rpc_logs.py": ("_GatewayLogReaderRuntime(ctx)",),
-        "rpc_router.py": ("_GatewayRouterLearningStatusRuntime(ctx)",),
         "rpc_skills.py": (
             "_SkillCatalogRuntime(ctx)",
             "_SkillManagementRuntime(ctx)",
@@ -1110,9 +1119,6 @@ def test_r5_rpc_factories_bind_concrete_typed_runtime_ports() -> None:
         source = (PACKAGE_ROOT / "gateway" / filename).read_text(encoding="utf-8")
         for binding in bindings:
             assert binding in source, f"{filename} must bind {binding}"
-
-    proposal_source = (PACKAGE_ROOT / "gateway" / "rpc_proposals.py").read_text(encoding="utf-8")
-    assert "opensquilla.gateway.rpc_cron" not in proposal_source
 
 
 def test_rpc_context_does_not_grow_past_pinned_main() -> None:
@@ -1260,14 +1266,10 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "usage.query",
             "usage.cost",
             "commands.list_for_surface",
-            "router.feedback.submit",
             "sessions.promptCacheKeepalive.status",
             "sessions.promptCacheKeepalive.set",
             "chat.clarify_submit",
             "agents.list",
-            "agents.create",
-            "agents.update",
-            "agents.delete",
             "channels.status",
             "channels.get",
             "channels.probe",
@@ -1287,7 +1289,6 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "cron.subscribe",
             "cron.unsubscribe",
             "status",
-            "router.selflearning.status",
             "doctor.status",
             "logs.status",
             "logs.tail",
@@ -1319,17 +1320,6 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "workspaces.pin",
             "workspaces.remove",
             "workspaces.history.delete",
-            "meta.list",
-            "meta.inspect",
-            "meta.drafts.list",
-            "meta.drafts.discard",
-            "meta.run",
-            "meta.runs.confirm_preflight",
-            "meta.runs.recovery",
-            "meta.runs.replay",
-            "meta.setup.plan",
-            "meta.setup.install",
-            "meta.setup.status",
             "migration.sources.list",
             "migration.sources.preview",
         }
@@ -1430,6 +1420,7 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         ("sessions.processes.list", "operator.read"),
         ("sessions.processes.log", "operator.read"),
         ("sessions.processes.stop", "operator.write"),
+        ("turns.receipt.get", "operator.read"),
     ):
         process_entry = registry.get_entry(method)
         assert process_entry is not None
@@ -1506,10 +1497,14 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     for method in (
         "sessions.messages.snapshot.read", "transport.flow.update", "sessions.executionLog.read",
         "sessions.messages.resume", "sessions.messages.snapshot.release",
+        "sessions.history.page.v2", "sessions.read.close.v2", "sessions.read.install.v2",
+        "sessions.read.open.v2", "sessions.read.state.v2", "transport.sessionFlow.update.v2",
     ):
         entry = registry.get_entry(method)
         assert entry is not None
+        assert entry.name == method
         assert entry.required_scope == "operator.read"
+        assert entry.generated_contract_name == method
         assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
         assert entry.handler.__name__ == "handle_contract_method"
 
@@ -1641,9 +1636,6 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     from opensquilla.gateway.adapters.skill_management_contract import (
         SKILL_MANAGEMENT_CONTRACT_METHODS,
     )
-    from opensquilla.gateway.adapters.skill_proposal_review_contract import (
-        SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS,
-    )
     from opensquilla.gateway.adapters.turn_admission_contract import (
         TURN_ADMISSION_CONTRACT_METHODS,
     )
@@ -1660,7 +1652,6 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         *OBSERVABILITY_CONTRACT_METHODS,
         *SKILL_CATALOG_CONTRACT_METHODS,
         *SKILL_MANAGEMENT_CONTRACT_METHODS,
-        *SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS,
         *ARTIFACT_WORKBENCH_CONTRACT_METHODS,
     ):
         entry = registry.get_entry(method)

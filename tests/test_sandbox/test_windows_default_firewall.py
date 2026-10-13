@@ -135,6 +135,15 @@ def test_loopback_remote_addresses_use_firewall_accepted_ipv6_range() -> None:
     assert LOOPBACK_REMOTE_ADDRESSES == "127.0.0.0/8,::/127"
 
 
+def test_firewall_trusted_powershell_path_delegates_to_setup_resolver(monkeypatch) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as setup_mod
+
+    expected = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    monkeypatch.setattr(setup_mod, "_trusted_windows_powershell_path", lambda: expected)
+
+    assert firewall_mod._trusted_windows_powershell_path() == expected
+
+
 def test_install_firewall_rules_batches_all_rules_into_one_powershell_call(
     monkeypatch,
 ) -> None:
@@ -145,6 +154,12 @@ def test_install_firewall_rules_batches_all_rules_into_one_powershell_call(
     )
     calls = []
 
+    monkeypatch.setattr(
+        firewall_mod,
+        "_trusted_windows_powershell_path",
+        lambda: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+    )
+
     def fake_run(*args, **kwargs):
         calls.append((args, kwargs))
         return SimpleNamespace(returncode=0, stderr="", stdout="")
@@ -154,6 +169,9 @@ def test_install_firewall_rules_batches_all_rules_into_one_powershell_call(
     firewall_mod.install_firewall_rules(specs)
 
     assert len(calls) == 1
+    assert calls[0][0][0][0] == (
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    )
     script = calls[0][0][0][5]
     assert script.startswith("$ErrorActionPreference = 'Stop'; ")
     assert all(spec.name in script for spec in specs)

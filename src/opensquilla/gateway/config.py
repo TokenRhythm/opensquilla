@@ -41,13 +41,14 @@ from opensquilla.application.config_secrets import (
 from opensquilla.application.config_secrets import (
     redact_public_config as redact_public_config,
 )
+from opensquilla.compaction_timing import DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS
 from opensquilla.gateway.config_migration import (
     DEPRECATED_MEMORY_LEAVES,
     LATEST_CONFIG_VERSION,
     ConfigParseError,
-    backup_and_write_migrated_config,
     handle_deprecated_skill_filter_env,
     migrate_config_payload,
+    rewrite_migrated_config_best_effort,
     strip_deprecated_skill_filter_settings,
 )
 from opensquilla.paths import default_opensquilla_home, native_io_path
@@ -223,7 +224,7 @@ class AttachmentsConfig(BaseSettings):
     # into a provider prompt — they are staged into the agent workspace for
     # tool access only. False restores the rendered-types-only admission gate.
     accept_opaque: bool = True
-    opaque_max_bytes: int = 30 * 1024 * 1024
+    opaque_max_bytes: int = 50 * 1024 * 1024
     # Aggregate byte ceiling for the temporary staged-upload store. When
     # reached, new uploads are rejected (HTTP 507 UPLOAD_STORE_FULL) instead
     # of evicting staged entries, preserving the file_uuid TTL promise.
@@ -241,6 +242,15 @@ class RateLimitConfig(BaseSettings):
     enabled: bool = True
     max_requests: int = 100
     window_seconds: int = 60
+    # Content reads are a separate, bounded capability.  A transcript is
+    # deliberately read in 1 MiB ranges, so charging those requests to the
+    # small control/API bucket makes a normal history or export compete with
+    # startup traffic.  Keep an independent request budget instead of
+    # disabling abuse protection altogether.  The content endpoint enforces
+    # the per-range byte limit; this budget therefore caps the aggregate
+    # amount a client can read in one window as well.
+    content_max_requests: int = 1200
+    content_window_seconds: int = 60
 
 
 class ControlUiConfig(BaseSettings):
@@ -391,11 +401,6 @@ class SkillsConfig(BaseSettings):
     # Names of skills the operator has turned off (e.g. via the control-UI
     # plugin toggle). A disabled skill is gated out of the agent's view.
     disabled: list[str] = Field(default_factory=list)
-    # Coding mode (control-UI toggle). When ON, the agent operates in a
-    # locked coding mode: the code-task plugin is available and a directive
-    # steers every turn through it. When OFF, code-task is unreachable through
-    # every skill API. Default OFF — coding mode is opt-in.
-    coding_mode: bool = False
     max_skills_prompt_chars: int = 8000
     # "system" = full system prompt (default)
     # "user_context" = ephemeral user-role context, after history and before current user
@@ -406,7 +411,9 @@ class SkillsConfig(BaseSettings):
     @classmethod
     def _ignore_retired_filter_settings(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            return strip_deprecated_skill_filter_settings(data)
+            return strip_deprecated_skill_filter_settings(
+                {key: value for key, value in data.items() if key != "coding_mode"}
+            )
         return data
 
 
@@ -420,13 +427,6 @@ class ToolsConfig(BaseModel):
             "memory_only",
             "coding",
             "messaging",
-            "repo_coding_source_edit",
-            "repo_coding_source_edit_strict",
-            "repo_coding_source_edit_v2",
-            "repo_coding_source_edit_balanced",
-            "repo_coding_source_edit_patch_fallback",
-            "repo_coding_scaffold_edit",
-            "repo_coding_scaffold_patch",
         ]
         | None
     ) = None
@@ -439,6 +439,21 @@ class ToolsConfig(BaseModel):
     file_edit_requires_fresh_read: bool | None = None
     file_edit_flexible_recovery: bool | None = None
     trusted_fake_ip_cidrs: list[str] = Field(default_factory=list)
+
+    @field_validator("profile", mode="before")
+    @classmethod
+    def _retire_repo_coding_profiles(cls, value: object) -> object:
+        if value in (
+            "repo_coding_source_edit",
+            "repo_coding_source_edit_strict",
+            "repo_coding_source_edit_v2",
+            "repo_coding_source_edit_balanced",
+            "repo_coding_source_edit_patch_fallback",
+            "repo_coding_scaffold_edit",
+            "repo_coding_scaffold_patch",
+        ):
+            return "coding"
+        return value
 
     @field_validator("trusted_fake_ip_cidrs")
     @classmethod
@@ -460,6 +475,10 @@ class TaskRuntimeConfig(BaseModel):
     """Server-side task-runtime queue settings."""
 
     max_concurrency: int = Field(default=8, ge=1)
+    # Resident admission spans reservations, queued/running turns and terminal
+    # settlement. It is separate from per-session pending limits so many
+    # sessions cannot exhaust the process with inert durable work.
+    max_resident_tasks: int = Field(default=256, ge=1)
     max_pending_per_session: int = Field(default=64, ge=1)
     # Per-channel-adapter in-flight semaphore (separate from
     # task_runtime._global_sem). Configured here so OPENSQUILLA_CHANNEL_INFLIGHT_CAP
@@ -1080,8 +1099,6 @@ class PromptConfig(BaseModel):
         "full",
         "minimal",
         "none",
-        "headless_source_edit",
-        "headless_repo_coding_scaffold",
     ] = "auto"
     platform_hint_enabled: bool = True
     # Deprecated, unused compatibility slot; preserve construction and saved configs.
@@ -1090,6 +1107,13 @@ class PromptConfig(BaseModel):
     finalize_evidence_gate: bool = False
     # Deprecated, unused. Accepted so existing configuration still loads.
     legacy_prompt_style: bool = False
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def retire_headless_modes(cls, value: object) -> object:
+        if value in ("headless_source_edit", "headless_repo_coding_scaffold"):
+            return "auto"
+        return value
 
 
 MemoryEmbeddingProvider = Literal[
@@ -1314,54 +1338,6 @@ class RouterBudgetConfig(BaseModel):
     include_next_turn_estimate: bool = False
 
 
-class RouterSelfLearningConfig(BaseModel):
-    """Squilla Router self-learning loop (capture + offline retrain).
-
-    Opt-in. ``enabled`` is the master switch; capture and training each have
-    their own sub-toggle so an operator can collect data without yet training.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False  # master switch; off => zero overhead on the hot path
-    capture_enabled: bool = True  # gates inference-time feature emission
-    enable_mlp: bool = False  # also store raw_bge_1536 for MLP fine-tune (phase 2)
-    store_audit_summary: bool = False  # opt-in redacted summary, audit only
-    # Trigger gating (evaluated cheaply on each post-dream hook).
-    train_min_samples: int = Field(default=200, ge=1)
-    idle_hours: float = Field(default=2.0, ge=0.0)
-    cooldown_hours: float = Field(default=72.0, ge=0.0)
-    retention_days: int = Field(default=30, ge=1)
-    # Training (LightGBM incremental) — consumed by the offline trainer/worker.
-    num_boost_round: int = Field(default=60, ge=1)
-    train_timeout_seconds: float = Field(default=900.0, gt=0.0)
-    # Promotion / rollback.
-    auto_rollback: bool = True
-    golden_eval_path: str | None = None
-    cost_tolerance_pct: float = Field(default=5.0, ge=0.0)
-    max_critical_under_routing: float = Field(default=0.30, ge=0.0, le=1.0)
-    min_golden_agreement: float = Field(default=0.5, ge=0.0, le=1.0)
-    # Online rollback monitor (M4).
-    min_monitor_samples: int = Field(default=30, ge=1)
-    complaint_regression_delta: float = Field(default=0.05, ge=0.0, le=1.0)
-    # Second rollback trigger: explicit down-vote-rate regression (F7).
-    # Feedback is far sparser than samples, hence its own minimum and a
-    # wider delta than the complaint monitor.
-    min_feedback_monitor_samples: int = Field(default=5, ge=1)
-    downvote_regression_delta: float = Field(default=0.15, ge=0.0, le=1.0)
-    # Rolling holdout (per-agent progress metric).
-    holdout_pct: float = Field(default=0.10, ge=0.0, le=0.5)
-    holdout_repeats: int = Field(default=5, ge=1)
-    holdout_min_size: int = Field(default=30, ge=1)
-    holdout_granularity: Literal["session", "alignment_group"] = "session"
-
-
-# Resolve this model's own forward refs (Literal) before it is nested below, so
-# rebuilding the parent does not leave it "not fully defined" under the
-# unregistered-module exec path used by tests. See the rebuild note below.
-RouterSelfLearningConfig.model_rebuild()
-
-
 class SquillaRouterConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_SQUILLA_ROUTER_",
@@ -1436,7 +1412,6 @@ class SquillaRouterConfig(BaseSettings):
     # rollback-tolerant).
     budget: RouterBudgetConfig = Field(default_factory=RouterBudgetConfig)
     estimated_output_savings_pct: float = 0.03
-    self_learning: RouterSelfLearningConfig = Field(default_factory=RouterSelfLearningConfig)
     # Deprecated compatibility fields: active history is retained until compaction;
     # image routing no longer imposes a separate turn window.
     vision_history_lookback_turns: int = Field(default=8, ge=0)
@@ -1517,11 +1492,7 @@ class SquillaRouterConfig(BaseSettings):
         return self
 
 
-# Eagerly resolve the ``self_learning: RouterSelfLearningConfig`` forward ref
-# (``from __future__ import annotations`` makes it a string). Without this the
-# model stays "not fully defined" when this file is exec'd as an unregistered
-# module (e.g. tests load it via spec_from_file_location), since pydantic falls
-# back to ``sys.modules[__module__]`` which is absent in that scenario.
+# Resolve nested routing models for callers loading this module by file path.
 SquillaRouterConfig.model_rebuild()
 
 
@@ -1545,16 +1516,17 @@ class AgentTokenSavingConfig(BaseSettings):
 class CompactionLlmConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_COMPACTION_")
 
-    # A provider is meaningful only together with ``model``.  Model-only
-    # remains the backwards-compatible "override the selected provider's
-    # model" form; a complete pair selects an explicit physical deployment.
-    provider: str | None = None
-    model: str | None = None  # None = use session model
-    timeout_seconds: float = 90.0
-    # Absolute budget shared by all summarization chunks and fallbacks.  The
+    # Deprecated load/save compatibility. Summary generation always uses the
+    # current physical deployment; keep old values without rewriting profiles.
+    provider: str | None = Field(default=None, json_schema_extra={"deprecated": True})
+    model: str | None = Field(default=None, json_schema_extra={"deprecated": True})
+    # Legacy explicit values remain semantic idle limits. None inherits the
+    # normal request timeout; it never replaces the provider's I/O policy.
+    timeout_seconds: float | None = None
+    # Absolute budget shared by all summarization chunks and revisions. The
     # durable commit has separate bounded SQLite semantics and is reconciled if
     # cancellation races with commit completion.
-    total_timeout_seconds: float = Field(default=120.0, gt=0.0)
+    total_timeout_seconds: float = Field(default=DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS, gt=0.0)
     heartbeat_interval_seconds: float = Field(default=15.0, gt=0.0)
     enabled: bool = True
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
@@ -1564,32 +1536,11 @@ class CompactionLlmConfig(BaseSettings):
     def _normalize_explicit_deployment(self) -> CompactionLlmConfig:
         self.provider = str(self.provider or "").strip() or None
         self.model = str(self.model or "").strip() or None
-        if self.provider and not self.model:
-            logger.warning(
-                "Ignoring compaction.provider=%s because compaction.model is not set",
-                self.provider,
-            )
-            self.provider = None
         return self
 
 
 def validate_compaction_deployment_write(payload: dict[str, Any]) -> None:
-    """Reject newly saved provider-only compaction deployments.
-
-    Load-time validation remains deliberately tolerant so an older hand-written
-    config cannot brick gateway startup. Config writers call this stricter
-    validator on their post-mutation payload before persistence.
-    """
-
-    compaction = payload.get("compaction")
-    if not isinstance(compaction, dict):
-        return
-    provider = str(compaction.get("provider") or "").strip()
-    model = str(compaction.get("model") or "").strip()
-    if provider and not model:
-        raise ValueError(
-            "compaction.provider requires compaction.model when saving config"
-        )
+    """Compatibility hook: deprecated target fields have no routing effect."""
 
 
 class SessionNamingConfig(BaseSettings):
@@ -2168,95 +2119,6 @@ class SubagentsGatewayConfig(BaseModel):
     """When enabled, subagent bootstrap prompts keep only AGENTS.md."""
 
 
-class MetaSkillPersistenceConfig(BaseSettings):
-    """Persistence/audit ledger for meta-skill executions (G4)."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="OPENSQUILLA_META_SKILL_PERSISTENCE_",
-        extra="forbid",
-    )
-    enabled: bool = True
-    orphan_cleanup_age_seconds: int = 3600
-    # Per-DAG memory persist: when False the orchestrator skips any step
-    # whose ``skill`` is "memory" (the conventional last-step pattern that
-    # archives DAG output to memory/*.md). Defaults to True to preserve
-    # existing behaviour. Toggle off for exploratory runs where polluting
-    # the long-term memory store is undesirable.
-    memory_persist_enabled: bool = True
-
-
-class MetaSkillAutoProposeConfig(BaseSettings):
-    """Unattended synthesis: drive meta-skill-creator from co-occurrence
-    patterns observed in ``~/.opensquilla/logs/decisions-*.jsonl``.
-
-    Two independent triggers feed the same library function
-    (``skills.creator.auto_propose``):
-      * ``enabled`` schedules a recurring cron job
-      * ``on_dream_complete`` piggybacks on memory-consolidation dreams
-
-    Both default off. Operators flip them on after reviewing
-    meta-skill-creator's gated output once.
-    """
-
-    model_config = SettingsConfigDict(
-        env_prefix="OPENSQUILLA_META_SKILL_AUTO_PROPOSE_",
-        extra="forbid",
-    )
-
-    enabled: bool = False
-    """Path 1: schedule the auto-propose cron job. When false no
-    handler is registered at all (zero-impact code path)."""
-
-    cron: str = "0 5 * * *"
-    """Cron expression (5-field, local time) for the scheduled job."""
-
-    window_days: int = Field(default=30, ge=1, le=365)
-    """How many days of decision-log history to aggregate."""
-
-    min_freq: int = Field(default=3, ge=1)
-    """Drop co-occurrence chains observed fewer than this many times."""
-
-    top_k: int = Field(default=5, ge=1, le=50)
-    """At most this many distinct patterns considered per fire."""
-
-    on_dream_complete: bool = False
-    """Path 2: also run after a successful memory-consolidation dream.
-    Independent of ``enabled`` — either, both, or neither may be on."""
-
-    auto_enable: bool = False
-    """When true, eligible low-risk proposals are promoted to MANAGED
-    automatically after the creator gates pass. Defaults off."""
-
-    auto_enable_max_risk: Literal["low", "medium", "high"] = "low"
-    """Highest deterministic risk class that unattended promotion may accept."""
-
-    agent_ids: list[str] = Field(default_factory=list)
-    """Restrict to these agent IDs; empty = all configured agents."""
-
-
-class MetaSkillConfig(BaseSettings):
-    """Top-level meta-skill subsystem configuration."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="OPENSQUILLA_META_SKILL_",
-        env_nested_delimiter="__",
-        extra="forbid",
-    )
-    enabled: bool = True
-    auto_trigger: bool = False
-    """When False (default), meta-skills are manual-only: no prompt guidance, no
-    keyword/semantic auto-trigger, ``meta_invoke`` is not exposed for automatic
-    invocation, and meta-skills are hidden from ``<available_skills>``. They run
-    only via the explicit ``/meta`` command. Set True to restore automatic
-    activation."""
-    persistence: MetaSkillPersistenceConfig = Field(
-        default_factory=MetaSkillPersistenceConfig,
-    )
-    auto_propose: MetaSkillAutoProposeConfig = Field(
-        default_factory=MetaSkillAutoProposeConfig,
-    )
-
-
 class TlsConfig(BaseSettings):
     """Optional TLS termination at the gateway itself.
 
@@ -2462,7 +2324,9 @@ class GoalConfig(BaseSettings):
     )
 
     execution_enabled: bool = True
-    max_turns: int = Field(default=50, ge=1, le=500)
+    # Match the reference Goal drivers' long-lived round cap. Semantic
+    # no-progress and explicit terminal decisions remain the normal exits.
+    max_turns: int = Field(default=256, ge=1, le=500)
     # Accumulated running time only. Queued, paused, and process downtime are
     # deliberately excluded from this limit.
     runtime_budget_seconds: int = Field(default=3_600, ge=60, le=86_400)
@@ -2541,13 +2405,19 @@ class GatewayConfig(BaseSettings):
     agents: list[AgentEntryConfig] = Field(default_factory=list)
     agents_defaults: AgentDefaults = Field(default_factory=AgentDefaults)
     subagents: SubagentsGatewayConfig = Field(default_factory=SubagentsGatewayConfig)
-    meta_skill: MetaSkillConfig = Field(default_factory=MetaSkillConfig)
 
     # Component enable flags
     control_ui: ControlUiConfig = Field(default_factory=ControlUiConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     diagnostics_enabled: bool = False
     channel_admin_senders: dict[str, list[str]] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_retired_product_features(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return {key: value for key, value in data.items() if key != "meta_skill"}
+        return data
 
     @property
     def effective_run_mode(self) -> str:
@@ -2926,8 +2796,7 @@ class GatewayConfig(BaseSettings):
     # Agent runtime timeout (whole turn lifecycle). ``None`` means use the
     # long built-in runtime default; ``0`` disables the runtime budget.
     agent_runtime_timeout_seconds: float | None = None
-    # Optional safety cap for ordinary interactive Web chat turns. Coding and
-    # meta turns retain the regular agent runtime budget. Disabled by default;
+    # Optional safety cap for interactive Web chat turns. Disabled by default;
     # an explicit TurnRunner timeout still has priority when the cap is enabled.
     web_chat_runtime_timeout_seconds: float = Field(default=0.0, ge=0.0)
     # Deprecated, unused: provider inactivity and tool deadlines are separate.
@@ -3558,7 +3427,7 @@ class GatewayConfig(BaseSettings):
         cfg._mark_env_absorbed_secrets(data)
         cls._apply_profile_path_overrides(cfg, target)
         if migration.changed:
-            _rewrite_migrated_config_best_effort(target, migration)
+            rewrite_migrated_config_best_effort(target, migration)
         return cfg
 
     @classmethod
@@ -3599,7 +3468,7 @@ class GatewayConfig(BaseSettings):
                 cfg = cls(**migration.payload)
                 cls._apply_profile_path_overrides(cfg, path)
                 if migration.changed and not read_only:
-                    _rewrite_migrated_config_best_effort(path, migration)
+                    rewrite_migrated_config_best_effort(path, migration)
                 cfg.config_path = str(path)
                 cfg._mark_env_absorbed_secrets(data)
                 cfg.set_persist_snapshot(cfg.to_toml_dict(), migration.payload)
@@ -3640,26 +3509,6 @@ class GatewayConfig(BaseSettings):
 
 # --- bind-address resolution ----------------------------------------------
 
-
-def _rewrite_migrated_config_best_effort(path: Path, migration: Any) -> None:
-    """Persist a migrated config, degrading to a warning when not writable.
-
-    The migrated payload already validated and the gateway can run from it;
-    a read-only config location (mounted backup, locked-down home) must not
-    turn that into a boot failure. The rewrite is retried on the next load.
-    """
-    try:
-        backup_and_write_migrated_config(path, migration.payload, migration)
-    except OSError as error:
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "OpenSquilla config migration could not rewrite %s (%s); running "
-            "from the migrated payload in memory. Make the file writable to "
-            "persist the migration and silence this warning.",
-            path,
-            error,
-        )
 
 # Wildcard addresses that expose the gateway on every interface. Used by the
 # boot banner and the install-script post-install message.

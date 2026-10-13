@@ -51,7 +51,6 @@ from opensquilla.paths import media_root_from_config, native_io_path
 log = structlog.get_logger(__name__)
 
 PREVIEW_LEASE_IDLE_SECONDS = 8 * 60 * 60
-PREVIEW_LEASE_LIMIT_PER_SESSION = 8
 _PREVIEW_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 _PREVIEW_AUTHORITY_RE = re.compile(r"^p-([0-9a-f]{32})\.localhost:([0-9]{1,5})$")
 _HTML_MIMES = frozenset({"text/html", "application/xhtml+xml"})
@@ -70,10 +69,6 @@ class PreviewLeaseNotFoundError(PreviewLeaseError):
 
 class PreviewLeaseExpiredError(PreviewLeaseError):
     """Raised when a known lease has expired or has been revoked."""
-
-
-class PreviewLeaseLimitError(PreviewLeaseError):
-    """Raised when a session already owns the maximum number of leases."""
 
 
 @dataclass(slots=True)
@@ -110,12 +105,10 @@ class ArtifactPreviewLeaseService:
         *,
         config: GatewayConfig,
         idle_seconds: int = PREVIEW_LEASE_IDLE_SECONDS,
-        max_per_session: int = PREVIEW_LEASE_LIMIT_PER_SESSION,
         clock: Any = time.time,
     ) -> None:
         self._config = config
         self._idle_seconds = idle_seconds
-        self._max_per_session = max_per_session
         self._clock = clock
         self._lock = threading.RLock()
         self._leases_by_id: dict[str, ArtifactPreviewLease] = {}
@@ -210,11 +203,6 @@ class ArtifactPreviewLeaseService:
 
         with self._lock:
             self._purge_expired_locked(now)
-            active_for_session = sum(
-                lease.session_id == session_id for lease in self._leases_by_id.values()
-            )
-            if active_for_session >= self._max_per_session:
-                raise PreviewLeaseLimitError("preview lease limit reached")
             token = secrets.token_hex(16)
             token_hash = _token_hash(token)
             lease = ArtifactPreviewLease(
@@ -619,8 +607,6 @@ def register_artifact_preview_routes(
                     client=client,
                 )
             )
-        except PreviewLeaseLimitError:
-            return _api_error("Preview lease limit reached", "PREVIEW_LEASE_LIMIT", 429)
         except ArtifactBundleUnsupportedError:
             return _api_error(
                 "Artifact bundle version is unsupported",

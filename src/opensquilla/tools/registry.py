@@ -16,6 +16,7 @@ from opensquilla.provider.types import ToolDefinition, ToolInputSchema
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.tools import visibility as visibility_policy
 from opensquilla.tools.policy_runtime import ToolSurfaceCapabilities
+from opensquilla.tools.schema_validation import tool_spec_schema_parts
 from opensquilla.tools.types import (
     CallerKind,
     InteractionMode,
@@ -64,7 +65,6 @@ DEFAULT_MODEL_TOOL_NAMES: frozenset[str] = frozenset(
     }
 )
 
-CODING_MODE_MODEL_TOOL_NAMES: frozenset[str] = frozenset()
 
 # Kept registered for old RPC/in-process callers, but never projected into a
 # model tool catalog (including progressive disclosure through tool_search).
@@ -160,10 +160,26 @@ class ToolRegistry:
 
     @staticmethod
     def _required_for(rt: RegisteredTool) -> list[str]:
-        return [name for name in rt.spec.required if name not in rt.spec.runtime_only_arguments]
+        _, required, _ = tool_spec_schema_parts(rt.spec)
+        return [name for name in required if name not in rt.spec.runtime_only_arguments]
+
+    def _input_schema_for(self, rt: RegisteredTool, ctx: ToolContext) -> ToolInputSchema:
+        canonical = rt.spec.input_schema
+        if isinstance(canonical, Mapping):
+            schema = copy.deepcopy(dict(canonical))
+        elif rt.spec.parameters.get("type") == "object" and isinstance(
+            rt.spec.parameters.get("properties"), Mapping
+        ):
+            schema = copy.deepcopy(rt.spec.parameters)
+        else:
+            schema = {}
+        schema["type"] = "object"
+        schema["properties"] = self._parameters_for(rt, ctx)
+        schema["required"] = self._required_for(rt)
+        return ToolInputSchema.model_validate(schema)
 
     def _parameters_for(self, rt: RegisteredTool, ctx: ToolContext) -> dict[str, Any]:
-        raw_parameters = rt.spec.parameters
+        raw_parameters = rt.spec.input_schema or rt.spec.parameters
         if raw_parameters.get("type") == "object" and isinstance(
             raw_parameters.get("properties"), Mapping
         ):
@@ -324,11 +340,7 @@ class ToolRegistry:
                     active_ctx,
                     visible_tool_names,
                 ),
-                input_schema=ToolInputSchema(
-                    type="object",
-                    properties=self._parameters_for(rt, active_ctx),
-                    required=self._required_for(rt),
-                ),
+                input_schema=self._input_schema_for(rt, active_ctx),
                 execution_timeout_seconds=rt.spec.execution_timeout_seconds,
                 execution_timeout_argument=rt.spec.execution_timeout_argument,
                 execution_timeout_padding=rt.spec.execution_timeout_padding,
@@ -386,8 +398,6 @@ class ToolRegistry:
         selected = set(DEFAULT_MODEL_TOOL_NAMES)
         selected.difference_update(_MODEL_HIDDEN_TOOL_NAMES)
         if ctx is not None:
-            if ctx.coding_mode:
-                selected.update(CODING_MODE_MODEL_TOOL_NAMES)
             selected.update(ctx.disclosed_tool_names)
             selected.update(ctx.surfaced_tools or set())
             ctx.authorized_tool_names = frozenset(authorized_by_name)

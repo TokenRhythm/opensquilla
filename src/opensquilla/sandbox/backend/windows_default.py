@@ -14,12 +14,14 @@ import sys
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
+from functools import partial
 from pathlib import Path, PurePath
 from typing import Any
 
 from opensquilla.process_tree import (
     create_owned_subprocess_exec,
 )
+from opensquilla.runtime_preparation import prepare_runtime
 from opensquilla.sandbox.backend.base import Backend
 from opensquilla.sandbox.backend.filesystem_worker_policy import (
     build_filesystem_worker_policy,
@@ -35,6 +37,11 @@ from opensquilla.sandbox.backend.windows_default_cache import (
     ensure_cache_dirs,
 )
 from opensquilla.sandbox.backend.windows_default_capability import capability_sids_for_command
+from opensquilla.sandbox.backend.windows_default_output import (
+    PIPE_READ_SIZE,
+    BoundedOutput,
+    HelperStderr,
+)
 from opensquilla.sandbox.backend.windows_default_roots import (
     process_executable_rx_roots,
     runtime_rx_roots,
@@ -65,13 +72,9 @@ from opensquilla.sandbox.permissions import (
 from opensquilla.sandbox.run_mode import normalize_run_mode
 from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.types import (
-    NetworkMode,
-    ResourceLimits,
     SandboxBackendError,
-    SandboxPolicy,
     SandboxRequest,
     SandboxResult,
-    SecurityLevel,
 )
 from opensquilla.subprocess_encoding import decode_subprocess_output
 
@@ -116,87 +119,6 @@ class WindowsDefaultBackend(Backend):
     def available(self) -> bool:
         return _support_ready()
 
-    async def probe_runtime(self, *, cwd: Path | None = None) -> None:
-        """Launch the real Windows helper with a harmless no-op command.
-
-        This deliberately uses the same payload, authenticated helper process,
-        ACL planning, and ``CreateProcessWithLogonW`` path as normal Safe work.
-        It does not prepare caches, rehome user state, access the network, or
-        write a user file. ``cwd`` is only a diagnostic hint: the runner's
-        validated package root is authoritative for the helper launch.
-        """
-
-        _ = cwd
-        if not _support_ready():
-            raise SandboxBackendError(
-                "sandbox_setup_required: Windows Safe helper setup is not ready"
-            )
-        from opensquilla.sandbox.backend.windows_default_runner import _helper_import_root
-
-        try:
-            helper_root = _helper_import_root()
-        except RuntimeError as exc:
-            raise SandboxBackendError(str(exc)) from exc
-        log.info(
-            "sandbox.windows_default_probe_start: backend=%s helper_root=%s runtime_provenance=%s",
-            self.name,
-            helper_root,
-            "validated_package_root",
-        )
-        request = SandboxRequest(
-            argv=(str(_python_executable()), "-c", "pass"),
-            cwd=helper_root,
-            action_kind="helper.startup_probe",
-            policy=SandboxPolicy(
-                level=SecurityLevel.STANDARD,
-                network=NetworkMode.NONE,
-                mounts=(),
-                workspace_rw=False,
-                tmp_writable=False,
-                limits=ResourceLimits(wall_timeout_s=5.0),
-                env_allowlist=("PATH", "PYTHONPATH", "SystemRoot", "WINDIR", "ComSpec"),
-                require_approval=False,
-                description="Windows Safe helper startup probe",
-                file_system=FileSystemPermissionProfile(
-                    entries=(),
-                    default_access=FileSystemAccess.READ,
-                ),
-            ),
-            env=dict(os.environ),
-            reason="Windows Safe helper startup probe",
-            run_mode="safe",
-        )
-        try:
-            result = await asyncio.wait_for(
-                self._run(
-                    request,
-                    prepare_cache=False,
-                    rehome_user_state=False,
-                    private_mounts_are_required=False,
-                ),
-                timeout=10.0,
-            )
-        except TimeoutError as exc:
-            raise SandboxBackendError(
-                "helper_probe_timeout: Windows Safe helper exceeded startup deadline"
-            ) from exc
-        except SandboxBackendError as exc:
-            detail = str(exc)
-            root_marker = detail.find("helper_root_unavailable:")
-            if root_marker >= 0:
-                raise SandboxBackendError(detail[root_marker:]) from exc
-            if detail.split(":", 1)[0] in {
-                "helper_launch_failed",
-                "helper_probe_timeout",
-                "sandbox_setup_required",
-            }:
-                raise
-            raise SandboxBackendError(f"helper_launch_failed: {detail}") from exc
-        if result.timed_out:
-            raise SandboxBackendError("helper_probe_timeout: Windows Safe helper timed out")
-        if result.returncode != 0:
-            detail = result.stderr.strip() or f"exit={result.returncode}"
-            raise SandboxBackendError(f"helper_launch_failed: {detail}")
 
     def operation_domains_supported(self) -> frozenset[SandboxOperationDomain]:
         return frozenset({"filesystem"})
@@ -210,17 +132,8 @@ class WindowsDefaultBackend(Backend):
                 f"windows_default backend does not implement {operation.domain} operations"
             )
         _filesystem_request(operation)
-        if not _support_ready():
-            raise SandboxBackendError(
-                "sandbox_setup_required: Windows Safe helper setup is not ready; "
-                "administrator setup or Windows "
-                "support checks are not ready"
-            )
-        if operation.workspace is None:
-            raise SandboxBackendError("filesystem operation is missing workspace")
-        request = _filesystem_operation_request(operation)
         result = await self._run(
-            request,
+            operation,
             prepare_cache=False,
             rehome_user_state=False,
             private_mounts_are_required=True,
@@ -230,49 +143,35 @@ class WindowsDefaultBackend(Backend):
         return SandboxOperationResult.from_worker_stdout(result.stdout)
 
     async def run(self, request: SandboxRequest) -> SandboxResult:
-        cache_writable = _request_allows_cache_write(request)
         return await self._run(
             request,
-            prepare_cache=cache_writable,
-            rehome_user_state=cache_writable,
+            prepare_cache=None,
+            rehome_user_state=None,
             private_mounts_are_required=False,
         )
 
     async def _run(
         self,
-        request: SandboxRequest,
+        request: SandboxRequest | SandboxOperation,
         *,
-        prepare_cache: bool,
-        rehome_user_state: bool,
+        prepare_cache: bool | None,
+        rehome_user_state: bool | None,
         private_mounts_are_required: bool,
     ) -> SandboxResult:
-        if not _support_ready():
-            raise SandboxBackendError(
-                "sandbox_setup_required: Windows Safe helper setup is not ready; "
-                "administrator setup or Windows "
-                "support checks are not ready"
+        structured_output = isinstance(request, SandboxOperation)
+        prepared_request, payload, helper_env, helper_argv = await prepare_runtime(
+            partial(
+                _prepare_helper_launch,
+                request,
+                prepare_cache=prepare_cache,
+                rehome_user_state=rehome_user_state,
+                private_mounts_are_required=private_mounts_are_required,
             )
-
-        payload = _payload_for_request(
-            request,
-            rehome_user_state=rehome_user_state,
-            private_mounts_are_required=private_mounts_are_required,
         )
-        if prepare_cache:
-            ensure_cache_dirs(request.cwd)
-        helper_env = dict(os.environ)
-        helper_env[_HELPER_PAYLOAD_ENV] = json.dumps(
-            payload,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        helper_argv = internal_child_argv(
-            ChildRole.WINDOWS_DEFAULT_RUNNER,
-            args=("--payload-env",),
-        )
-        wall = request.policy.limits.wall_timeout_s
+        wall = prepared_request.policy.limits.wall_timeout_s
         helper_wall = _helper_supervision_timeout(wall)
         started = time.monotonic()
+        collection: asyncio.Task[tuple[BoundedOutput, HelperStderr]] | None = None
         try:
             proc = await create_owned_subprocess_exec(
                 *helper_argv,
@@ -284,12 +183,30 @@ class WindowsDefaultBackend(Backend):
             raise SandboxBackendError(f"helper_launch_failed: {exc}") from exc
 
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=helper_wall,
-            )
+            if structured_output:
+                # Filesystem worker JSON has its own receipt contract; do not
+                # impose the ordinary process collector on structured results.
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=helper_wall,
+                )
+                stderr_bytes, helper_timed_out = _extract_authenticated_helper_timeout(
+                    stderr_bytes, expected_nonce=str(payload["helperNonce"]),
+                )
+                trunc_out = trunc_err = False
+                helper_error = None
+            else:
+                collection = asyncio.create_task(
+                    _collect_process_output(proc, expected_nonce=str(payload["helperNonce"])),
+                )
+                captured, errors = await asyncio.wait_for(
+                    asyncio.shield(collection),
+                    timeout=helper_wall,
+                )
+                stdout_bytes, stderr_bytes = bytes(captured.data), bytes(errors.data)
+                trunc_out, trunc_err = captured.truncated, errors.truncated
+                helper_timed_out, helper_error = errors.timed_out, errors.helper_error
         except asyncio.CancelledError:
-            await asyncio.shield(_terminate_owned_helper(proc))
+            await _terminate_owned_helper(proc)
             raise
         except TimeoutError:
             await _terminate_owned_helper(proc)
@@ -300,24 +217,41 @@ class WindowsDefaultBackend(Backend):
                 stderr="windows_default helper timed out",
                 wall_time_s=elapsed,
                 backend_used=self.name,
-                policy_used=request.policy.summary(),
+                policy_used=prepared_request.policy.summary(),
                 timed_out=True,
             )
+        except Exception:
+            await _terminate_owned_helper(proc)
+            raise
+        finally:
+            if collection is not None:
+                # Keep pipes draining through termination: Process.wait() can
+                # otherwise wait forever on a full, paused pipe after exit.
+                if not collection.done():
+                    collection.cancel()
+                settled = asyncio.gather(collection, return_exceptions=True)
+                cancellation: asyncio.CancelledError | None = None
+                while not settled.done():
+                    try:
+                        await asyncio.shield(settled)
+                    except asyncio.CancelledError as exc:
+                        cancellation = exc
+                settled.result()
+                if cancellation is not None:
+                    raise cancellation
 
         owner = getattr(proc, "_opensquilla_process_tree_owner", None)
         if owner is not None:
-            await owner.terminate(graceful_timeout=0.0, kill_timeout=1.0)
+            await _terminate_owned_helper(proc)
         elapsed = time.monotonic() - started
-        stderr_bytes, helper_timed_out = _extract_authenticated_helper_timeout(
-            stderr_bytes,
-            expected_nonce=str(payload["helperNonce"]),
-        )
-        stdout, trunc_out = _decode_capped(stdout_bytes)
-        stderr, trunc_err = _decode_capped(stderr_bytes)
-        helper_error = _authenticated_helper_error(
-            stderr,
-            expected_nonce=str(payload["helperNonce"]),
-        )
+        stdout, decode_trunc_out = _decode_capped(stdout_bytes)
+        stderr, decode_trunc_err = _decode_capped(stderr_bytes)
+        trunc_out |= decode_trunc_out
+        trunc_err |= decode_trunc_err
+        if structured_output:
+            helper_error = _authenticated_helper_error(
+                stderr, expected_nonce=str(payload["helperNonce"]),
+            )
         if proc.returncode not in {None, 0} and helper_error is not None:
             if "helper_root_unavailable:" in helper_error:
                 detail = helper_error.split("helper_root_unavailable:", 1)[1].strip()
@@ -331,11 +265,76 @@ class WindowsDefaultBackend(Backend):
             stderr=stderr,
             wall_time_s=elapsed,
             backend_used=self.name,
-            policy_used=request.policy.summary(),
+            policy_used=prepared_request.policy.summary(),
             truncated_stdout=trunc_out,
             truncated_stderr=trunc_err,
             timed_out=proc.returncode == 124 and helper_timed_out,
         )
+
+
+async def _collect_process_output(
+    proc: Any, *, expected_nonce: str,
+) -> tuple[BoundedOutput, HelperStderr]:
+    output = BoundedOutput(_OUTPUT_BYTE_CAP)
+    errors = HelperStderr(_OUTPUT_BYTE_CAP, expected_nonce)
+
+    async def drain(stream: asyncio.StreamReader, capture: BoundedOutput) -> None:
+        while chunk := await stream.read(PIPE_READ_SIZE):
+            capture.feed(chunk)
+
+    tasks = [
+        asyncio.create_task(drain(proc.stdout, output)),
+        asyncio.create_task(drain(proc.stderr, errors)),
+        asyncio.create_task(proc.wait()),
+    ]
+    try:
+        await asyncio.gather(*tasks)
+        errors.finish()
+        return output, errors
+    except Exception:
+        # A failed reader must not stop the other pipe before process teardown.
+        await _terminate_owned_helper(proc)
+        raise
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _prepare_helper_launch(
+    request: SandboxRequest | SandboxOperation,
+    *,
+    prepare_cache: bool | None,
+    rehome_user_state: bool | None,
+    private_mounts_are_required: bool,
+) -> tuple[SandboxRequest, dict[str, Any], dict[str, str], tuple[str, ...]]:
+    if not _support_ready():
+        raise SandboxBackendError(
+            "sandbox_setup_required: Windows Safe helper setup is not ready; "
+            "administrator setup or Windows support checks are not ready"
+        )
+    if isinstance(request, SandboxOperation):
+        request = _filesystem_operation_request(request)
+    if prepare_cache is None:
+        prepare_cache = _request_allows_cache_write(request)
+    if rehome_user_state is None:
+        rehome_user_state = prepare_cache
+    payload = _payload_for_request(
+        request,
+        rehome_user_state=rehome_user_state,
+        private_mounts_are_required=private_mounts_are_required,
+    )
+    if prepare_cache:
+        ensure_cache_dirs(request.cwd)
+    helper_env = dict(os.environ)
+    helper_env[_HELPER_PAYLOAD_ENV] = json.dumps(
+        payload, separators=(",", ":"), sort_keys=True,
+    )
+    helper_argv = internal_child_argv(
+        ChildRole.WINDOWS_DEFAULT_RUNNER, args=("--payload-env",),
+    )
+    return request, payload, helper_env, helper_argv
 
 
 def _support_ready() -> bool:
@@ -343,15 +342,29 @@ def _support_ready() -> bool:
 
 
 async def _terminate_owned_helper(proc: Any) -> None:
+    cleanup = asyncio.create_task(_terminate_helper_process(proc))
+    cancellation: asyncio.CancelledError | None = None
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+    cleanup.result()
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _terminate_helper_process(proc: Any) -> None:
     owner = getattr(proc, "_opensquilla_process_tree_owner", None)
     if owner is not None:
         await owner.terminate(graceful_timeout=0.0, kill_timeout=1.0)
         return
     # Compatibility for injected subprocess-like embedders. Production owned
     # launchers always attach a Job-backed owner before returning.
-    proc.kill()
     with contextlib.suppress(ProcessLookupError):
-        await proc.wait()
+        if proc.returncode is None:
+            proc.kill()
+        await asyncio.wait_for(proc.wait(), timeout=1.0)
 
 
 def _helper_supervision_timeout(command_timeout_s: float) -> float:
@@ -386,8 +399,6 @@ def _payload_for_request(
         # the user's real Safe profile, which can trigger expensive inherited
         # ACL churn on a large home directory.
         policy["capabilityProbe"] = True
-    if _is_helper_startup_probe_request(request):
-        policy["helperProbe"] = True
     network_boundary = _windows_network_boundary_payload(request)
     if network_boundary is not None:
         policy["windowsNetworkBoundary"] = network_boundary
@@ -415,10 +426,6 @@ def _is_capability_probe_request(request: SandboxRequest) -> bool:
     return request.action_kind == "capability.probe" or request.action_kind.startswith(
         "capability.probe.fs.worker."
     )
-
-
-def _is_helper_startup_probe_request(request: SandboxRequest) -> bool:
-    return request.action_kind == "helper.startup_probe"
 
 
 def _extract_authenticated_helper_timeout(
@@ -1336,7 +1343,7 @@ def _request_needs_host_tool_paths(request: SandboxRequest) -> bool:
     return (
         request.env.get("OPENSQUILLA_GUEST_SAFE") != "1"
         and not _is_filesystem_worker_request(request)
-        and request.action_kind not in {"capability.probe", "helper.startup_probe"}
+        and request.action_kind != "capability.probe"
     )
 
 

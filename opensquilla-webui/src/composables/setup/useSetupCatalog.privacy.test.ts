@@ -5,6 +5,7 @@ import { localizeImageActionableDetail, useSetupCatalog } from './useSetupCatalo
 import { LEGACY_OPENROUTER_MODEL_OPTIONS } from './useSetupEnsembleForm'
 import { PROVIDER_CREDENTIAL_REVEAL_TIMEOUT_MS } from './useSetupProviderForm'
 import { SetupWorkflowError } from '@/modules/setupWorkflow'
+import { AppSettingsError } from '@/modules/appSettings'
 import type { GatewayAvailability } from '@/modules/gatewayAccess'
 
 const rpcCall = vi.hoisted(() => vi.fn())
@@ -104,6 +105,7 @@ async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('avai
     detachedSessionHydration: false,
     turnCommittedEvents: false,
     subscriptionEpoch: 0,
+    supportBundleUnavailableReason: null,
     loadConnectionEndpoint: () => 'ws://example.invalid/ws',
     connect: async () => undefined,
     disconnect: () => undefined,
@@ -1362,13 +1364,16 @@ describe('useSetupCatalog effective model limits', () => {
     })
     const { api, app } = await mountCatalog()
 
-    await vi.waitFor(() => expect(discoverCalls).toBe(1))
+    // Initial settings hydration must not probe an arbitrary provider
+    // endpoint. Discovery starts only after the user leaves and re-enters
+    // the Provider section (or uses the explicit refresh action).
+    expect(discoverCalls).toBe(0)
 
     api.setSection('behavior')
     await nextTick()
     api.setSection('provider')
     await nextTick()
-    expect(discoverCalls).toBe(1)
+    await vi.waitFor(() => expect(discoverCalls).toBe(1))
 
     releaseFirstDiscovery()
     await vi.waitFor(() => expect(api.providerPanel.value.connection.modelSource).toBe('live'))
@@ -1387,6 +1392,7 @@ describe('useSetupCatalog effective model limits', () => {
     expect(rpcCall).toHaveBeenLastCalledWith('onboarding.models.discover', {
       providerId: 'tokenrhythm',
       model: 'qwen3.8-max',
+      cacheOnly: true,
     })
     app.unmount()
   })
@@ -1527,6 +1533,7 @@ describe('useSetupCatalog model strategy IA', () => {
     expect(rpcCall).toHaveBeenCalledWith('onboarding.models.discover', {
       providerId: 'tokenrhythm',
       model: 'deepseek-v4-pro',
+      cacheOnly: true,
     })
     expect(api.routerPanel.value.discoveredModelsByProvider.tokenrhythm?.models).toHaveLength(1)
     expect(api.routerPanel.value.discoveredModelsByProvider.tokenrhythm?.models[0]?.id).toBe('deepseek-v4-flash')
@@ -1686,30 +1693,28 @@ describe('useSetupCatalog model strategy IA', () => {
     })
     const { api, app } = await mountCatalog()
 
+    expect(requests).toEqual([])
     api.updateProviderField('api_key', 'unsaved-selected-provider-key')
     api.setSection('modelStrategy')
-    await vi.waitFor(() => expect(requests).toHaveLength(4))
+    await vi.waitFor(() => expect(requests).toHaveLength(3))
 
-    expect(requests).toContainEqual({
-      providerId: 'tokenrhythm',
-      model: 'deepseek-v4-pro',
-    })
     expect(requests).toContainEqual({
       providerId: 'tokenrhythm',
       apiKey: 'unsaved-selected-provider-key',
       model: 'deepseek-v4-pro',
+      cacheOnly: true,
     })
-    expect(requests).toContainEqual({ providerId: 'openrouter' })
-    expect(requests).toContainEqual({ providerId: 'anthropic' })
+    expect(requests).toContainEqual({ providerId: 'openrouter', cacheOnly: true })
+    expect(requests).toContainEqual({ providerId: 'anthropic', cacheOnly: true })
     expect(requests.filter(request => request.apiKey !== undefined)).toHaveLength(1)
-    expect(discoveryMethods.filter(method => method === 'onboarding.models.discover')).toHaveLength(2)
+    expect(discoveryMethods.filter(method => method === 'onboarding.models.discover')).toHaveLength(1)
     expect(discoveryMethods.filter(method => method === 'onboarding.llmProfile.models.discover')).toHaveLength(2)
 
     const byProvider = api.routerPanel.value.discoveredModelsByProvider
     expect(Object.keys(byProvider).sort()).toEqual(['anthropic', 'openrouter', 'tokenrhythm'])
     expect(byProvider.tokenrhythm?.models[0]?.id).toBe('deepseek-v4-flash')
     expect(byProvider.openrouter?.models[0]?.id).toBe('deepseek/deepseek-v4-pro')
-    expect(byProvider.anthropic).toEqual({ models: [], source: 'none' })
+    expect(byProvider.anthropic).toMatchObject({ models: [], source: 'none', discovering: false })
     app.unmount()
   })
 
@@ -1762,8 +1767,8 @@ describe('useSetupCatalog model strategy IA', () => {
     expect(requests.sort()).toEqual(['openrouter', 'tokenrhythm'])
     releaseDiscoveries()
     await vi.waitFor(() => expect(
-      Object.keys(api.routerPanel.value.discoveredModelsByProvider),
-    ).toHaveLength(2))
+      api.routerPanel.value.discoveredModelsByProvider.openrouter?.discovering,
+    ).toBe(false))
 
     api.setSection('provider')
     await nextTick()
@@ -2293,6 +2298,124 @@ describe('useSetupCatalog model strategy IA', () => {
     app.unmount()
   })
 
+  it.each([true, false])('confirms behavior-only saving as %s without rereading unrelated settings', async enabled => {
+    mockConfigSequence([{
+      naming: { enabled: !enabled, timeout_seconds: 18 },
+      privacy: { disable_network_observability: true },
+    }])
+    const { api, app } = await mountCatalog()
+    rpcCall.mockClear()
+    pushToast.mockClear()
+    try {
+      api.setAutoSessionTitles(enabled)
+      await api.saveDirtySections()
+
+      expect(rpcCall.mock.calls).toEqual([['config.patch.safe', {
+        patches: { 'naming.enabled': enabled },
+      }]])
+      expect(api.config.value.naming).toEqual({ enabled, timeout_seconds: 18 })
+      expect(api.config.value.privacy).toEqual({ disable_network_observability: true })
+      expect(api.behaviorPanel.value.autoSessionTitles).toBe(enabled)
+      expect(api.sectionDirty('general')).toBe(false)
+      expect(api.saveAllPending.value).toBe(false)
+      expect(pushToast).toHaveBeenCalledOnce()
+
+      api.setAutoSessionTitles(!enabled)
+      expect(api.sectionDirty('general')).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it('acknowledges only the submitted behavior value and retains a newer draft', async () => {
+    mockConfigSequence([{ naming: { enabled: false } }])
+    const { api, app } = await mountCatalog()
+    let releaseSave!: (result: { restartRequired: boolean }) => void
+    rpcCall.mockClear()
+    rpcCall.mockImplementationOnce(() => new Promise(resolve => { releaseSave = resolve }))
+    try {
+      api.setAutoSessionTitles(true)
+      const saving = api.saveDirtySections()
+      expect(api.saveAllPending.value).toBe(true)
+      api.setAutoSessionTitles(false)
+
+      releaseSave({ restartRequired: false })
+      await saving
+
+      expect(api.config.value.naming?.enabled).toBe(true)
+      expect(api.behaviorPanel.value.autoSessionTitles).toBe(false)
+      expect(api.sectionDirty('general')).toBe(true)
+      expect(api.saveAllPending.value).toBe(false)
+
+      await api.saveDirtySections()
+      expect(rpcCall.mock.calls).toEqual([
+        ['config.patch.safe', { patches: { 'naming.enabled': true } }],
+        ['config.patch.safe', { patches: { 'naming.enabled': false } }],
+      ])
+      expect(api.config.value.naming?.enabled).toBe(false)
+      expect(api.sectionDirty('general')).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it.each([
+    ['rejection', new AppSettingsError('invalid', 'Synthetic rejected preference')],
+    ['timeout', new AppSettingsError('unavailable', 'Synthetic RPC request timed out')],
+  ] as const)('retains the behavior draft after %s without success or an automatic retry', async (_kind, error) => {
+    mockConfigSequence([{ naming: { enabled: false } }])
+    const { api, app } = await mountCatalog()
+    rpcCall.mockClear()
+    pushToast.mockClear()
+    rpcCall.mockRejectedValueOnce(error)
+    try {
+      api.setAutoSessionTitles(true)
+      await api.saveDirtySections()
+
+      expect(rpcCall.mock.calls).toEqual([['config.patch.safe', {
+        patches: { 'naming.enabled': true },
+      }]])
+      expect(api.config.value.naming?.enabled).toBe(false)
+      expect(api.behaviorPanel.value.autoSessionTitles).toBe(true)
+      expect(api.sectionDirty('general')).toBe(true)
+      expect(api.saveAllPending.value).toBe(false)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(expect.any(String), { tone: 'danger' })
+    } finally { app.unmount() }
+  })
+
+  it('waits for another dirty section while retaining an acknowledged behavior save if that section fails', async () => {
+    let rejectModelSave!: (error: Error) => void
+    const modelSave = new Promise((_resolve, reject) => { rejectModelSave = reject })
+    mockConfigSequence([{
+      llm: { provider: 'openrouter', model: 'openrouter/auto' },
+      naming: { enabled: false },
+      squilla_router: { enabled: false },
+      llm_ensemble: { enabled: false },
+    }])
+    const { api, app } = await mountCatalog()
+    rpcCall.mockClear()
+    rpcCall.mockImplementation(async method => {
+      if (method === 'config.patch.safe') return { restartRequired: false }
+      if (method === 'config.patch') return modelSave
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    try {
+      api.setAutoSessionTitles(true)
+      api.setFixedModel('deepseek/deepseek-v4-pro')
+      const saving = api.saveDirtySections()
+      await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith('config.patch', {
+        patches: { 'llm.model': 'deepseek/deepseek-v4-pro' },
+      }))
+      expect(api.saveAllPending.value).toBe(true)
+      expect(api.config.value.naming?.enabled).toBe(true)
+      expect(api.sectionDirty('general')).toBe(false)
+
+      rejectModelSave(new Error('Synthetic model save failure'))
+      await saving
+
+      expect(api.saveAllPending.value).toBe(false)
+      expect(api.sectionDirty('general')).toBe(false)
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(rpcCall.mock.calls.map(([method]) => method)).toEqual(['config.patch.safe', 'config.patch'])
+    } finally { app.unmount() }
+  })
+
   it('snapshots save-all work and reloads once after every dirty section is persisted', async () => {
     let configReads = 0
     rpcCall.mockImplementation(async (method: string) => {
@@ -2384,8 +2507,9 @@ describe('useSetupCatalog model strategy IA', () => {
 
     expect(rpcCall.mock.calls.filter(call => call[0] === 'config.patch.safe'))
       .toHaveLength(1)
-    expect(configReads).toBe(2)
+    expect(configReads).toBe(1)
     expect(api.saveAllPending.value).toBe(false)
+    expect(api.sectionDirty('general')).toBe(false)
     app.unmount()
   })
 
@@ -3605,7 +3729,7 @@ describe('useSetupCatalog configured provider management', () => {
     api.selectConfiguredProvider('deepseek')
     await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith(
       'onboarding.llmProfile.models.discover',
-      { providerId: 'deepseek' },
+      { providerId: 'deepseek', cacheOnly: true },
     ))
     expect(api.providerDraftDirty.value).toBe(false)
     rpcCall.mockClear()
@@ -3727,14 +3851,14 @@ describe('useSetupCatalog configured provider management', () => {
     app.unmount()
   })
 
-  it('loads the saved active provider catalog without probing or dirtying the editor', async () => {
+  it('loads the saved active provider catalog on Provider re-entry without probing or dirtying the editor', async () => {
     rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
       if (method === 'onboarding.catalog') return { providers }
       if (method === 'onboarding.status') return statusWithDeepSeek()
       if (method === 'channels.status') return { channels: [] }
       if (method === 'config.get') return configWithProfiles('deepseek')
       if (method === 'onboarding.models.discover') {
-        expect(params).toEqual({ providerId: 'openai', model: 'gpt-4.1-mini' })
+        expect(params).toEqual({ providerId: 'openai', model: 'gpt-4.1-mini', cacheOnly: true })
         return {
           ok: true,
           source: 'live',
@@ -3745,6 +3869,10 @@ describe('useSetupCatalog configured provider management', () => {
     })
     const { api, app } = await mountCatalog()
 
+    expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.models.discover')).toBe(false)
+    api.setSection('behavior')
+    await nextTick()
+    api.setSection('provider')
     await vi.waitFor(() => expect(api.providerPanel.value.connection.models).toHaveLength(1))
     expect(api.providerPanel.value.connection).toMatchObject({
       phase: 'unverified',
@@ -3765,7 +3893,7 @@ describe('useSetupCatalog configured provider management', () => {
         return { ok: true, source: 'live', models: [{ id: 'gpt-4.1-mini', name: 'GPT-4.1 mini' }] }
       }
       if (method === 'onboarding.llmProfile.models.discover') {
-        expect(params).toEqual({ providerId: 'deepseek' })
+        expect(params).toEqual({ providerId: 'deepseek', cacheOnly: true })
         return { ok: true, source: 'live', models: [{ id: 'deepseek-chat', name: 'DeepSeek Chat' }] }
       }
       throw new Error(`Unexpected RPC method: ${method}`)
@@ -3798,6 +3926,8 @@ describe('useSetupCatalog configured provider management', () => {
     })
     const { api, app } = await mountCatalog()
 
+    expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.models.discover')).toBe(false)
+    await api.refreshProviderModels()
     await vi.waitFor(() => expect(
       rpcCall.mock.calls.some(call => call[0] === 'onboarding.models.discover'),
     ).toBe(true))
@@ -5212,11 +5342,11 @@ describe('useSetupCatalog configured provider management', () => {
 
     await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith(
       'onboarding.llmProfile.models.discover',
-      { providerId: 'deepseek' },
+      { providerId: 'deepseek', cacheOnly: true },
     ))
     expect(rpcCall).toHaveBeenCalledWith('onboarding.models.discover', {
       providerId: 'openai',
-      model: 'gpt-4.1-mini',
+      cacheOnly: true,
     })
     await vi.waitFor(() => expect(
       api.routerPanel.value.discoveredModelsByProvider.deepseek?.models[0]?.id,
@@ -5251,11 +5381,12 @@ describe('useSetupCatalog configured provider management', () => {
     api.setSection('modelStrategy')
     await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith(
       'onboarding.llmProfile.models.discover',
-      { providerId: 'deepseek' },
+      { providerId: 'deepseek', cacheOnly: true },
     ))
     await vi.waitFor(() => expect(
       api.routerPanel.value.discoveredModelsByProvider.deepseek,
-    ).toEqual({ models: [], source: 'none' }))
+    ).toMatchObject({ models: [], source: 'none', discovering: false,
+      discoverError: '401 unauthorized profile deployment' }))
     expect(rpcCall.mock.calls.some(([method, params]) => (
       method === 'onboarding.models.discover'
       && (params as Record<string, unknown> | undefined)?.providerId === 'deepseek'
@@ -5297,6 +5428,7 @@ describe('useSetupCatalog configured provider management', () => {
     ).toBe('legacy-model'))
     expect(rpcCall).toHaveBeenCalledWith('onboarding.models.discover', {
       providerId: 'deepseek',
+      cacheOnly: true,
     })
     app.unmount()
   })
@@ -7598,6 +7730,294 @@ describe('capacity save integration', () => {
       rpcCall.mockClear()
       expect(await api.saveModelStrategy({ reload: false })).toBe(false)
       expect(rpcCall).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+})
+
+describe('primary thinking save integration', () => {
+  it.each([['', 'high'], ['high', '']])('persists thinking-only edits from %s to %s and reloads the baseline', async (initial, next) => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    try {
+      Object.assign(saved.llm, { thinking: initial || null })
+      await api.loadData()
+      const originalRpc = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'config.patch') {
+          const patches = params?.patches as Record<string, unknown> | undefined
+          if (patches && 'llm.thinking' in patches) Object.assign(saved.llm, { thinking: patches['llm.thinking'] })
+        }
+        return originalRpc(method, params)
+      })
+      expect(api.providerDraftDirty.value).toBe(false)
+      api.updateLlmThinking(next)
+      expect(api.providerDraftDirty.value).toBe(true)
+      rpcCall.mockClear()
+      expect(await api.saveProvider()).toBe(true)
+      expect(rpcCall.mock.calls.some(([method]) => /configure|activate|probe/.test(method))).toBe(false)
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patches: { 'llm.thinking': next || null } })
+      expect(api.providerPanel.value.llmThinking).toBe(next)
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('saves thinking and capacity in the same provider save action', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      const target = { provider: 'openrouter', model: 'openai/gpt-4.1-mini' }
+      api.modelCapacity.ensure(target)
+      await Promise.resolve(); await Promise.resolve(); await nextTick()
+      api.modelCapacity.update(target, { contextWindow: '262144', maxOutputTokens: '65536' }, 'provider:openrouter')
+      api.updateLlmThinking('high')
+      rpcCall.mockClear()
+      expect(await api.saveProvider({ reload: false })).toBe(true)
+      expect(rpcCall.mock.calls.some(([method]) => /configure|activate|probe/.test(method))).toBe(false)
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patches: { 'llm.thinking': 'high' } })
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patch: { models: { openrouter: { [target.model]: { context_window: 262144, max_output_tokens: 65536 } } } } })
+    } finally { app.unmount() }
+  })
+
+  it('discards thinking on cancel or provider switch without leaking into profile edits', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.updateLlmThinking('high')
+      api.cancelProviderEdit()
+      expect(api.providerPanel.value.llmThinking).toBe('')
+      expect(api.providerDraftDirty.value).toBe(false)
+      api.updateLlmThinking('low')
+      await api.requestSelectConfiguredProvider('tokenrhythm')
+      api.updateLlmThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      expect(api.providerPanel.value.llmThinking).toBe('')
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+})
+
+
+describe('global thinking across settings surfaces', () => {
+  it.each(['high', ''])('saves a fixed-model thinking edit through model strategy: %s', async next => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    try {
+      Object.assign(saved.llm, { thinking: 'medium' })
+      await api.loadData()
+      const original = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+        const patches = params?.patches as Record<string, unknown> | undefined
+        if (method === 'config.patch' && patches && 'llm.thinking' in patches) Object.assign(saved.llm, { thinking: patches['llm.thinking'] })
+        return original(method, params)
+      })
+      api.updateModelStrategyThinking(next)
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(api.providerDraftDirty.value).toBe(false)
+      expect(api.providerPanel.value.llmThinking).toBe(next)
+      rpcCall.mockClear()
+      expect(await api.saveModelStrategy()).toBe(true)
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patches: { 'llm.thinking': next || null } })
+      expect(rpcCall.mock.calls.some(([method]) => /configure|activate|probe/.test(method))).toBe(false)
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+      expect(api.modelStrategyPanel.value.llmThinking).toBe(next)
+      expect(api.providerPanel.value.llmThinking).toBe(next)
+    } finally { app.unmount() }
+  })
+  it('retains a routing thinking draft when switching provider editors and discards it explicitly', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('tokenrhythm')
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('high')
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      await api.discardChanges()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('')
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+})
+
+
+describe('provider thinking draft rollback', () => {
+  it.each(['high', ''])('restores the routing draft %s when a provider edit is cancelled', async draft => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    try {
+      Object.assign(saved.llm, { thinking: 'medium' })
+      await api.loadData()
+      api.updateModelStrategyThinking(draft)
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe(draft)
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('restores the routing draft when switching away from the edited primary', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      await api.requestSelectConfiguredProvider('tokenrhythm')
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('high')
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it('does not resurrect the routing draft after the provider edit is saved', async () => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    try {
+      const original = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+        const patches = params?.patches as Record<string, unknown> | undefined
+        if (method === 'config.patch' && patches && 'llm.thinking' in patches) Object.assign(saved.llm, { thinking: patches['llm.thinking'] })
+        return original(method, params)
+      })
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      expect(await api.saveProvider()).toBe(true)
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('minimal')
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('low')
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('does not resurrect a routing draft after discarding all settings', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      await api.discardChanges()
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('')
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+})
+
+
+describe('partial thinking save acknowledgement', () => {
+  it('keeps the acknowledged thinking baseline if the subsequent capacity save fails', async () => {
+    const { api, app } = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'config.patch' && params?.patch) throw new Error('synthetic capacity failure')
+      return { changed: true }
+    })
+    try {
+      const target = { provider: 'openrouter', model: 'openai/gpt-4.1-mini' }
+      api.modelCapacity.ensure(target)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBeGreaterThan(0))
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'provider:openrouter')
+      expect(await api.saveProvider()).toBe(false)
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('low')
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+})
+
+
+describe('unacknowledged provider thinking patches', () => {
+  async function rejectedPatchScenario(committed = false, readbackFails = false) {
+    const result = await primaryTransitionScenario()
+    Object.assign(result.saved.llm, { thinking: 'medium' })
+    Object.assign(result.saved, { llm_request_timeout_seconds: 300 })
+    await result.api.loadData()
+    const original = rpcCall.getMockImplementation()!
+    let rejectNextPatch = true
+    rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      if (readbackFails && !rejectNextPatch && method === 'config.get') {
+        throw new Error('synthetic read-back failure')
+      }
+      const patches = params?.patches as Record<string, unknown> | undefined
+      if (method === 'config.patch' && patches && 'llm.thinking' in patches) {
+        const reject = rejectNextPatch
+        rejectNextPatch = false
+        if (!reject || committed) {
+          Object.assign(result.saved.llm, { thinking: patches['llm.thinking'] })
+          if ('llm_request_timeout_seconds' in patches) {
+            Object.assign(result.saved, { llm_request_timeout_seconds: patches.llm_request_timeout_seconds })
+          }
+        }
+        if (reject) throw new Error('synthetic thinking patch failure')
+      }
+      return original(method, params)
+    })
+    const target = { provider: 'openrouter', model: 'openai/gpt-4.1-mini' }
+    result.api.modelCapacity.ensure(target)
+    await vi.waitFor(() => expect(result.api.modelCapacity.rows.size).toBeGreaterThan(0))
+    result.api.updateLlmTimeout(600)
+    result.api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'provider:openrouter')
+    rpcCall.mockClear()
+    return { ...result, target }
+  }
+
+  it.each(['high', ''])('retains and retries rejected thinking %s after partial save refresh', async thinking => {
+    const { api, app, saved, target } = await rejectedPatchScenario()
+    try {
+      api.updateLlmThinking(thinking)
+      expect(await api.saveProvider()).toBe(false)
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.configure', expect.anything())
+      expect(api.providerPanel.value.llmThinking).toBe(thinking)
+      expect(api.providerPanel.value.llmTimeoutSeconds).toBe(600)
+      expect(api.providerDraftDirty.value).toBe(true)
+      expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
+      rpcCall.mockClear()
+      expect(await api.saveProvider()).toBe(true)
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patches: {
+        llm_request_timeout_seconds: 600,
+        'llm.thinking': thinking || null,
+      } })
+      expect(saved.llm).toEqual(expect.objectContaining({ thinking: thinking || null }))
+      expect(api.providerPanel.value.llmThinking).toBe(thinking)
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('restores the prior routing draft when a rejected provider edit is cancelled', async () => {
+    const { api, app } = await rejectedPatchScenario()
+    try {
+      api.updateModelStrategyThinking('high')
+      api.updateLlmThinking('low')
+      expect(await api.saveProvider()).toBe(false)
+      expect(api.providerPanel.value.llmThinking).toBe('low')
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('high')
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      // Timeout is edited outside the provider dialog and remains a global draft.
+      expect(api.providerPanel.value.llmTimeoutSeconds).toBe(600)
+      expect(api.providerDraftDirty.value).toBe(true)
+      api.updateLlmTimeout(300)
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('accepts a thinking write confirmed by read-back without resurrecting the prior routing draft', async () => {
+    const { api, app } = await rejectedPatchScenario(true)
+    try {
+      api.updateModelStrategyThinking('high')
+      api.updateLlmThinking('low')
+      expect(await api.saveProvider()).toBe(false)
+      expect(api.providerPanel.value.llmThinking).toBe('low')
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('low')
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('retains rejected thinking and timeout drafts when read-back also fails', async () => {
+    const { api, app } = await rejectedPatchScenario(false, true)
+    try {
+      api.updateLlmThinking('high')
+      expect(await api.saveProvider()).toBe(false)
+      expect(api.providerPanel.value.llmThinking).toBe('high')
+      expect(api.providerPanel.value.llmTimeoutSeconds).toBe(600)
+      expect(api.providerDraftDirty.value).toBe(true)
     } finally { app.unmount() }
   })
 })

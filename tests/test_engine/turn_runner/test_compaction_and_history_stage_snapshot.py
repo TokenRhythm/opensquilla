@@ -498,11 +498,14 @@ async def test_runtime_compaction_keeps_file_paths_with_image_retention_disabled
     }
     seen: dict[str, Any] = {}
 
-    async def summarize(**kwargs: Any) -> str:
-        seen["summary_input"] = kwargs["chunk_text"]
-        return "Continue reviewing the original document."
+    async def summarize(self, messages, tools=None, config=None):
+        from opensquilla.provider.types import DoneEvent, TextDeltaEvent
 
-    monkeypatch.setattr("opensquilla.session.compaction.call_compaction_llm", summarize)
+        seen["summary_input"] = json.dumps([message.model_dump() for message in messages])
+        yield TextDeltaEvent(text="Continue reviewing the original document.")
+        yield DoneEvent(stop_reason="stop", output_tokens=10)
+
+    monkeypatch.setattr("opensquilla.provider.openai.OpenAIProvider.chat", summarize)
 
     async def preflight(
         self: TurnRunner, *args: Any, attachment_path_resolver=None, **kwargs: Any,
@@ -523,6 +526,7 @@ async def test_runtime_compaction_keeps_file_paths_with_image_retention_disabled
             config=CompactionConfig(
                 model="synthetic-model", api_key="synthetic-key", safety_margin=1.0,
                 protected_recent_messages=2, attachment_path_resolver=attachment_path_resolver,
+                preserve_historical_images=False,
             ), forced_prefix_cut=2, trigger="message_count",
         ))
         seen["result"] = result

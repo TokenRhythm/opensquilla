@@ -12,6 +12,8 @@ export function requiredOption(name) {
   return process.argv[index + 1]
 }
 
+export { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
+
 export async function waitFor(check, label, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs
   let lastError

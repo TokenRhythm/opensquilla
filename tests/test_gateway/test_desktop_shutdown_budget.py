@@ -26,6 +26,10 @@ class _Storage:
         return self.records.get(task_id)
 
     async def update_agent_task(self, task_id, **fields):
+        details_patch = fields.pop("details_patch", None)
+        if details_patch is not None:
+            record = self.records[task_id]
+            record.details = {**(record.details or {}), **details_patch}
         for key, value in fields.items():
             setattr(self.records[task_id], key, value)
 
@@ -81,7 +85,7 @@ async def test_desktop_quit_cancels_and_preserves_system_reason(start_with_drain
 
     runtime = TaskRuntime(storage=storage, turn_handler=handler)
     handle = await runtime.enqueue(_envelope(), "synthetic work")
-    await started.wait()
+    await asyncio.wait_for(started.wait(), 1)
     request = ShutdownRequest(
         "drain" if start_with_drain else "quit", time.monotonic() + 10,
     )
@@ -132,7 +136,7 @@ async def test_quit_fences_fair_slot_waiter_before_handler():
 
     runtime = TaskRuntime(storage=_Storage(), turn_handler=handler, max_concurrency=1)
     first = await runtime.enqueue(_envelope("agent:main:first"), "first")
-    await started.wait()
+    await asyncio.wait_for(started.wait(), 1)
     await runtime.enqueue(_envelope("agent:main:second"), "waiting")
     request = ShutdownRequest("quit", time.monotonic() + 1)
     runtime.close_admission(request)
@@ -158,7 +162,7 @@ async def test_desktop_cancellation_stops_driver_before_blocked_intent_write():
 
     runtime = TaskRuntime(storage=storage, turn_handler=handler)
     handle = await runtime.enqueue(_envelope(), "synthetic work")
-    await started.wait()
+    await asyncio.wait_for(started.wait(), 1)
     task = runtime._tasks[handle.task_id]
     update = storage.update_agent_task
 
@@ -201,9 +205,9 @@ async def test_quit_cancels_other_tasks_while_one_intent_write_is_blocked():
 
     runtime = TaskRuntime(storage=storage, turn_handler=handler)
     first = await runtime.enqueue(_envelope("agent:main:first"), "first")
-    await started.get()
+    await asyncio.wait_for(started.get(), 1)
     await runtime.enqueue(_envelope("agent:main:second"), "second")
-    await started.get()
+    await asyncio.wait_for(started.get(), 1)
     update = storage.update_agent_task
 
     async def slow_update(task_id, **fields):
@@ -241,7 +245,7 @@ async def test_blocked_goal_pause_does_not_delay_quit_cancellation(monkeypatch):
 
     runtime = TaskRuntime(storage=_Storage(), turn_handler=handler)
     await runtime.enqueue(_envelope(), "synthetic work")
-    await started.wait()
+    await asyncio.wait_for(started.wait(), 1)
     request = ShutdownRequest("quit", time.monotonic() + 0.05)
     runtime.close_admission(request)
     services = SimpleNamespace(
@@ -282,7 +286,7 @@ async def test_completion_quit_fences_new_work_and_bounds_resistant_watcher():
 
     task = asyncio.create_task(watcher())
     manager._watch_tasks.add(task)
-    await started.wait()
+    await asyncio.wait_for(started.wait(), 1)
     assert manager.shutdown_activity_count() == 1
     assert not await asyncio.wait_for(manager.close(cancel=True, timeout=0.02), 0.5)
     assert not await manager._begin_group_admission("parent", "group")
@@ -303,6 +307,9 @@ async def test_quit_stops_only_exact_runtime_and_background_process_owners(monke
     ))
     monkeypatch.setattr(shell, "cancel_background_processes_for_task", background)
     monkeypatch.setattr(process_tree, "cancel_persisted_processes_for_task", persisted)
+    monkeypatch.setattr(
+        process_tree, "has_persisted_processes_for_task", AsyncMock(return_value=False),
+    )
     runtime = TaskRuntime(storage=_Storage(), turn_handler=AsyncMock())
     assert runtime.shutdown_activity()["auxiliary"] == 1
     server = GatewayServer(
@@ -318,3 +325,30 @@ async def test_quit_stops_only_exact_runtime_and_background_process_owners(monke
     assert {call.args[1:] for call in persisted.await_args_list} == {
         ("background-session", "completed-task"), ("active-session", "active-task"),
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("residual", [False, True, OSError("synthetic registry unavailable")])
+async def test_quit_requires_verified_persisted_process_cleanup(monkeypatch, tmp_path, residual):
+    from opensquilla import process_tree
+    from opensquilla.tools.builtin import shell
+
+    monkeypatch.setattr(shell, "active_background_process_task_owners", lambda: ())
+    monkeypatch.setattr(shell, "cancel_background_processes_for_task", AsyncMock(return_value=0))
+    # Zero can mean either no owned tree or failed exact-owner termination.
+    monkeypatch.setattr(
+        process_tree, "cancel_persisted_processes_for_task", AsyncMock(return_value=0),
+    )
+    remaining = AsyncMock(
+        **({"side_effect": residual} if isinstance(residual, Exception)
+           else {"return_value": residual}),
+    )
+    monkeypatch.setattr(process_tree, "has_persisted_processes_for_task", remaining)
+    server = GatewayServer(
+        app=SimpleNamespace(), config=GatewayConfig(state_dir=str(tmp_path)),
+        _services=SimpleNamespace(task_runtime=SimpleNamespace(
+            shutdown_task_owners=lambda: {("synthetic-session", "synthetic-task")},
+        )),
+    )
+    assert await server._stop_owned_processes() is (residual is False)
+    remaining.assert_awaited_once_with(str(tmp_path), "synthetic-session", "synthetic-task")

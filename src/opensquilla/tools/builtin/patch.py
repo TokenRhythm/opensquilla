@@ -18,7 +18,7 @@ from opensquilla.sandbox.destructive_backup import DestructiveBackupGate
 from opensquilla.sandbox.elevation import (
     ApprovalDisplay,
     ElevationAction,
-    gate_elevated_action,
+    gate_elevated_action_async,
 )
 from opensquilla.sandbox.integration import active_file_system_profile
 from opensquilla.sandbox.operation_runtime import (
@@ -635,7 +635,7 @@ async def _gate_patch_ops(
         if not destructive.allowed:
             return destructive.envelope, False, ()
         return None, True, summarize_backup_receipts(destructive.receipts)
-    gate = gate_elevated_action(
+    gate = await gate_elevated_action_async(
         action,
         approval_id=approval_id,
         session_key=ctx.session_key if ctx is not None else None,

@@ -20,7 +20,7 @@ from opensquilla.channels.contract import (
     channel_capability_evidence,
     channel_platform_manifest,
 )
-from opensquilla.channels.delivery_store import ChannelDeliveryStore, install_outbox
+from opensquilla.channels.delivery_store import install_outbox
 from opensquilla.channels.types import (
     ChannelArtifactDeliveryRequest,
     IncomingMessage,
@@ -159,8 +159,10 @@ def test_contextual_method_backs_manifest_and_capability_evidence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_contextual_artifact_outbox_persists_only_safe_summary(tmp_path: Path) -> None:
-    delivery_store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+async def test_contextual_artifact_outbox_persists_only_safe_summary(
+    channel_store, tmp_path: Path
+) -> None:
+    delivery_store = await channel_store(tmp_path / "channel_delivery.sqlite")
 
     class ContextualChannel:
         _delivery_store = delivery_store
@@ -219,12 +221,14 @@ async def test_contextual_artifact_outbox_persists_only_safe_summary(tmp_path: P
     assert "generate a report" not in message_json
     assert provider_message_id == "provider-message-1"
     assert provider_file_id == "provider-file-1"
-    delivery_store.close()
+    (await delivery_store.close())
 
 
 @pytest.mark.asyncio
-async def test_contextual_artifact_outbox_redacts_exception_request(tmp_path: Path) -> None:
-    delivery_store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+async def test_contextual_artifact_outbox_redacts_exception_request(
+    channel_store, tmp_path: Path
+) -> None:
+    delivery_store = await channel_store(tmp_path / "channel_delivery.sqlite")
 
     class FailingChannel:
         _delivery_store = delivery_store
@@ -262,16 +266,17 @@ async def test_contextual_artifact_outbox_redacts_exception_request(tmp_path: Pa
     assert error_message == "RuntimeError: contextual artifact delivery failed"
     assert request.file_path not in error_message
     assert "do-not-persist" not in error_message
-    delivery_store.close()
+    (await delivery_store.close())
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_keyword", [False, True])
 async def test_malformed_contextual_artifact_call_never_persists_raw_arguments(
+    channel_store,
     tmp_path: Path,
     use_keyword: bool,
 ) -> None:
-    delivery_store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+    delivery_store = await channel_store(tmp_path / "channel_delivery.sqlite")
     malformed = {
         "file_path": "/private/local/generated/secret-report.txt",
         "access_token": "secret-provider-token",
@@ -316,17 +321,16 @@ async def test_malformed_contextual_artifact_call_never_persists_raw_arguments(
     assert "private-user-prompt" not in persisted
     assert "sensitive-target" not in persisted
     expected_error_type = "TypeError" if use_keyword else "RuntimeError"
-    assert error_message == (
-        f"{expected_error_type}: contextual artifact delivery failed"
-    )
-    delivery_store.close()
+    assert error_message == (f"{expected_error_type}: contextual artifact delivery failed")
+    (await delivery_store.close())
 
 
 @pytest.mark.asyncio
 async def test_malformed_contextual_artifact_result_reason_is_not_persisted(
+    channel_store,
     tmp_path: Path,
 ) -> None:
-    delivery_store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+    delivery_store = await channel_store(tmp_path / "channel_delivery.sqlite")
     secret_path = "/private/local/generated/secret-report.txt"
 
     class FailingChannel:
@@ -359,4 +363,4 @@ async def test_malformed_contextual_artifact_result_reason_is_not_persisted(
     assert target_id == ""
     assert secret_path not in message_json
     assert error_message == ""
-    delivery_store.close()
+    (await delivery_store.close())

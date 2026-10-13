@@ -826,6 +826,35 @@ async def test_set_is_atomic_emits_one_goal_event_and_creates_no_plan_state(
         assert await _plan_row_count(stack.storage, "plan_runs") == 0
 
 
+async def test_goal_set_keeps_local_path_display_metadata_in_history_and_identity(tmp_path):
+    from opensquilla.chat.history import transcript_entries_to_chat_messages
+
+    paths = [r"C:\fixtures\report.pdf"]
+    objective = "Summarize this report\n" + paths[0]
+    runs = []
+
+    async def handler(run):
+        runs.append(run)
+
+    async with _open_goal_rpc_stack(tmp_path / "goal-paths.db", handler=handler) as stack:
+        params = {**_set_params(), "objective": objective, "localPathReferences": paths}
+        response = await _handle_goals_set(params, stack.context)
+        await stack.runtime.wait(response["taskId"], timeout=2.0)
+        replay = await _handle_goals_set(params, stack.context)
+        assert replay["taskId"] == response["taskId"]
+        transcript = await stack.manager.get_transcript(SOURCE_KEY)
+        assert len(transcript) == 1
+        payload = json.loads(transcript[0].content)
+        assert payload["text"] == objective
+        assert payload["local_path_references"] == paths
+        projected = transcript_entries_to_chat_messages(transcript)[0]
+        assert projected["text"] == objective
+        assert projected["localPathReferences"] == paths
+        assert len(runs) == 1 and runs[0].message == objective
+        with pytest.raises(RpcHandlerError):
+            await _handle_goals_set({**params, "localPathReferences": []}, stack.context)
+
+
 @pytest.mark.asyncio
 async def test_set_post_accept_notification_failure_still_activates_durable_task(
     tmp_path: Path,
@@ -1326,10 +1355,9 @@ async def test_edit_reactivates_complete_goal_and_returns_new_continuity(
 ) -> None:
     async def handler(run: TaskRun) -> None:
         assert run.goal_context is not None
-        await stack.service.update_progress(
-            run.goal_context,
-            explanation="The original objective was delivered.",
-            steps=[{"step": "Deliver it", "status": "completed"}],
+        await run.envelope.runtime_services["update_progress"](
+            [{"step": "Deliver it", "status": "completed"}],
+            "The original objective was delivered.",
         )
 
     async with _open_goal_rpc_stack(
@@ -2326,7 +2354,7 @@ async def test_post_driver_idle_starts_exactly_one_system_event_continuation(
         )
         assert automatic.task_id == expected_task_id
         assert automatic.run_kind == "goal"
-        assert automatic.input_mode == "system_event"
+        assert automatic.input_mode == "goal_continuation"
         assert automatic.persist_input is False
         assert automatic.history_has_persisted_user is False
         assert automatic.no_memory_capture is True
@@ -2527,7 +2555,7 @@ async def test_multi_turn_goal_completes_without_creating_plan_state(
                 sequence,
             )
             assert run.run_kind == "goal"
-            assert run.input_mode == "system_event"
+            assert run.input_mode == "goal_continuation"
             assert run.persist_input is False
             assert run.history_has_persisted_user is False
             assert run.no_memory_capture is True
@@ -2993,7 +3021,7 @@ async def test_plan_mode_defers_active_goal_then_default_starts_exactly_one(
         )
         assert complete.continuation_seq == 1
         assert len(runs) == 2
-        assert runs[1].input_mode == "system_event"
+        assert runs[1].input_mode == "goal_continuation"
         await asyncio.sleep(0.05)
         assert len(runs) == 2
 
@@ -3617,6 +3645,12 @@ async def test_continuation_authority_loss_after_accept_compensates_before_activ
         assert task.status == AgentTaskStatus.ABANDONED
         assert task.terminal_reason == reason
         assert task.started_at is None
+        owner = task.details.get("admission_owner")
+        assert isinstance(owner, dict)
+        assert owner["resident_lease"] == "released"
+        assert owner["compute_lease"] == "not_acquired"
+        assert owner["settlement"] == "settled"
+        assert "cancellation_requested" not in task.details
         assert goal.status == ("active" if detached else "paused")
         assert goal.pause_reason == (None if detached else reason)
         assert goal.active_task_id is None
@@ -3726,6 +3760,12 @@ async def test_continuation_post_accept_read_failure_compensates_before_provider
         assert task is not None
         assert task.status == AgentTaskStatus.ABANDONED
         assert task.terminal_reason == "activation_failed"
+        owner = task.details.get("admission_owner")
+        assert isinstance(owner, dict)
+        assert owner["resident_lease"] == "released"
+        assert owner["compute_lease"] == "not_acquired"
+        assert owner["settlement"] == "settled"
+        assert "cancellation_requested" not in task.details
         assert goal is not None
         assert goal.status == "paused"
         assert goal.pause_reason == "activation_failed"
@@ -4278,12 +4318,11 @@ async def test_goal_event_observer_failure_never_changes_durable_tool_result(
     async def handler(run: TaskRun) -> None:
         assert service is not None
         assert run.goal_context is not None
-        progress = await service.update_progress(
-            run.goal_context,
-            explanation="synthetic progress",
-            steps=[{"step": "Finish", "status": "completed"}],
+        progress = await run.envelope.runtime_services["update_progress"](
+            [{"step": "Finish", "status": "completed"}],
+            "synthetic progress",
         )
-        assert progress["progressRevision"] == 1
+        assert progress["revision"] == 1
         terminal = await service.commit_model_status(
             run.goal_context,
             status="complete",
@@ -4541,7 +4580,7 @@ def _durable_goal_artifact_registry(
         publish_artifact,
     )
     builtins = get_default_registry()
-    for name in ("update_goal", "update_goal_progress"):
+    for name in ("update_goal", "update_plan"):
         registered = builtins.get(name)
         assert registered is not None
         registry.register(registered.spec, registered.handler)
@@ -4642,7 +4681,7 @@ async def test_goal_artifact_loop_commits_and_settles_durable_terminal_state(
         assert task.status == expected_task_status
         assert provider.calls == 3
         assert all(
-            {"publish_artifact", "update_goal", "update_goal_progress"}
+            {"publish_artifact", "update_goal", "update_plan"}
             <= set(tool_names)
             for tool_names in provider.tool_names_seen
         )
@@ -4729,7 +4768,7 @@ class _DurableGoalContinuationProvider:
         self.request_contexts_seen.append(request_context)
         self.messages_seen.append(message_text)
 
-        goal_tools = {"update_goal", "update_goal_progress"}
+        goal_tools = {"update_goal", "update_plan"}
         if call == 1:
             assert goal_tools <= set(tool_names)
             assert self.objective in request_context
@@ -4809,7 +4848,7 @@ class _DurableGoalContinuationSelector:
 def _durable_goal_control_registry() -> ToolRegistry:
     registry = ToolRegistry()
     builtins = get_default_registry()
-    for name in ("update_goal", "update_goal_progress"):
+    for name in ("update_goal", "update_plan"):
         registered = builtins.get(name)
         assert registered is not None
         registry.register(registered.spec, registered.handler)
@@ -4931,7 +4970,7 @@ async def test_real_turn_runner_continuation_reuses_durable_goal_context_and_com
 
         assert [run.task_id for run in runs] == [first_task_id, second_task_id]
         assert runs[1].run_kind == "goal"
-        assert runs[1].input_mode == "system_event"
+        assert runs[1].input_mode == "goal_continuation"
         assert runs[1].persist_input is False
         assert runs[1].history_has_persisted_user is False
         assert runs[1].no_memory_capture is True
@@ -4984,7 +5023,7 @@ async def test_real_turn_runner_continuation_reuses_durable_goal_context_and_com
         if retry_automatic:
             assert provider.request_contexts_seen[1] == provider.request_contexts_seen[2]
         assert all(
-            {"update_goal", "update_goal_progress"} <= set(tool_names)
+            {"update_goal", "update_plan"} <= set(tool_names)
             for tool_names in provider.tool_names_seen
         )
         assert goal.status == "complete"
@@ -5069,7 +5108,7 @@ class _RunningGoalEditProvider:
         self.request_texts.append(request_text)
         self.tool_names_seen.append(tool_names)
 
-        goal_tools = {"update_goal", "update_goal_progress"}
+        goal_tools = {"update_goal", "update_plan"}
         if call == 1:
             assert goal_tools <= set(tool_names)
             assert self.initial_objective in request_text
@@ -5110,11 +5149,11 @@ class _RunningGoalEditProvider:
         if call == 2:
             yield ProviderToolUseStart(
                 tool_use_id="goal-progress-rev2",
-                tool_name="update_goal_progress",
+                tool_name="update_plan",
             )
             yield ProviderToolUseEnd(
                 tool_use_id="goal-progress-rev2",
-                tool_name="update_goal_progress",
+                tool_name="update_plan",
                 arguments={
                     "steps": [
                         {
@@ -5286,7 +5325,7 @@ async def test_running_goal_edit_adopts_revision_in_same_task_without_transcript
         assert [run.task_id for run in runs] == [created["taskId"]]
         assert provider.calls == 4
         assert provider.partial_text in provider.request_texts[1]
-        assert {"update_goal", "update_goal_progress"} <= set(provider.tool_names_seen[3])
+        assert {"update_goal", "update_plan"} <= set(provider.tool_names_seen[3])
         assert goal.objective_revision == 2
         assert goal.objective == provider.edited_objective
         assert goal.terminal_task_id == created["taskId"]
@@ -5846,6 +5885,97 @@ async def test_three_empty_automatic_turns_pause_without_counting_user_turn(tmp_
         assert goal.turns_started == goal.turns_settled == 4
         assert len(runs) == 4
         assert [run.goal_context["automatic"] for run in runs] == [False, True, True, True]
+
+
+async def test_three_identical_visible_goal_turns_pause_for_no_progress(tmp_path: Path) -> None:
+    runs: list[TaskRun] = []
+
+    async def handler(run: TaskRun) -> None:
+        runs.append(run)
+        task = await stack.storage.get_agent_task(run.task_id)
+        assert task is not None
+        details = dict(task.details)
+        details["terminal_assistant_message_content"] = json.dumps(
+            {"text": "Still working on the same step."}, ensure_ascii=False
+        )
+        details["activity_snapshot"] = {
+            "version": 2,
+            "task_id": run.task_id,
+            "turn_id": run.task_id,
+            "complete": True,
+            "entries": [
+                {
+                    "type": "phase",
+                    "id": "writing",
+                    "order": 1,
+                    "kind": "write",
+                    "phase": "writing",
+                    "at": 1,
+                },
+                {
+                    "type": "segment",
+                    "id": "text:0",
+                    "order": 2,
+                    "segment_type": "text",
+                    "text_utf16_length": 30,
+                },
+            ],
+        }
+        await stack.storage.update_agent_task(run.task_id, details=details)
+
+    async with _open_goal_rpc_stack(
+        tmp_path / "no-progress-continuations.sqlite",
+        handler=handler,
+        wire_lifecycle=True,
+    ) as stack:
+        await _handle_goals_set(_set_params(), stack.context)
+        for expected_turns in range(1, 5):
+            await _wait_for_goal(
+                stack.storage,
+                lambda value, expected=expected_turns: value.turns_settled >= expected,
+            )
+        goal = await _wait_for_goal(
+            stack.storage,
+            lambda value: value.status == "paused" and value.active_task_id is None,
+        )
+        assert goal.pause_reason == "no_progress"
+        assert goal.turns_started == goal.turns_settled == 4
+        assert [run.goal_context["automatic"] for run in runs] == [False, True, True, True]
+        last_task = await stack.storage.get_agent_task(runs[-1].task_id)
+        assert last_task is not None
+        assert "Still working on the same step." in str(
+            last_task.details.get("terminal_assistant_message_content")
+        )
+
+
+def test_malformed_goal_sentinel_is_empty_for_the_empty_guard() -> None:
+    context = GoalTurnContext(
+        session_id="synthetic-session",
+        epoch=0,
+        goal_id="synthetic-goal",
+        objective_revision=1,
+        objective_snapshot="Do synthetic work.",
+        task_id="synthetic-task",
+        continuation_seq=1,
+        automatic=True,
+    )
+    task = SimpleNamespace(
+        status=AgentTaskStatus.SUCCEEDED,
+        details={
+            "terminal_assistant_message_content": json.dumps(
+                {"text": "[NO_REPLY]", "artifacts": []}
+            ),
+            "activity_snapshot": {
+                "version": 2,
+                "complete": True,
+                "entries": [
+                    {"type": "phase", "phase": "writing"},
+                    {"type": "segment", "segment_type": "text", "text_utf16_length": 10},
+                ],
+            },
+        },
+    )
+    assert GoalService._empty_automatic_turn(task, context) is True
 
 
 @pytest.mark.parametrize(

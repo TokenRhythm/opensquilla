@@ -1,6 +1,6 @@
 {
   "name": "@opensquilla/desktop-electron",
-  "version": "0.5.4",
+  "version": "0.5.6",
   "private": true,
   "description": "Electron desktop shell for the OpenSquilla Control UI.",
   "repository": {
@@ -26,6 +26,9 @@
     "test:bundled-runtimes": "node scripts/test-bundled-runtimes.mjs",
     "test:packaged-session-recovery": "node scripts/test-packaged-session-recovery.mjs",
     "test:packaged-first-send-renderer": "node scripts/test-packaged-first-send-renderer.mjs",
+    "test:packaged-gateway-reliability": "node scripts/test-packaged-gateway-reliability.mjs",
+    "test:packaged-gateway-reliability-contract": "node --test scripts/test-packaged-gateway-reliability-contract.mjs",
+    "test:packaged-single-instance-contract": "node scripts/test-packaged-single-instance-contract.mjs",
     "test:cli-invocation": "npm run build && node scripts/test-cli-invocation.mjs",
     "test:secret-storage": "npm run build && node scripts/test-secret-storage-policy.mjs && node scripts/test-secret-decryption-cache.mjs",
     "test:sandbox-default": "npm run build && node scripts/test-desktop-sandbox-default.mjs",
@@ -36,10 +39,12 @@
     "test:desktop-locale": "npm run build && node scripts/test-desktop-locale.mjs",
     "test:desktop-renderer-protocol": "npm run build && node scripts/test-desktop-renderer-protocol.mjs",
     "test:desktop-zoom": "npm run build && node scripts/test-desktop-zoom-shortcuts.mjs",
+    "test:desktop-reload": "npm run build && node scripts/test-desktop-reload-shortcuts.mjs",
     "test:image-clipboard": "node scripts/test-image-clipboard-electron.mjs",
     "test:attachment-drafts": "npm run build && node scripts/test-attachment-drafts-electron.mjs",
     "test:native-attachments": "npm run build && node --test scripts/test-native-attachments.mjs && node scripts/test-native-attachments-electron.mjs",
     "test:project-workspace-picker": "npm run build && node scripts/test-project-workspace-picker.mjs",
+    "test:local-path-picker": "npm run build && node --test scripts/test-native-path-picker.mjs",
     "test:gateway-ownership": "npm run build && node scripts/test-desktop-gateway-ownership.mjs",
     "test:gateway-lifecycle": "npm run build && node scripts/test-desktop-gateway-lifecycle.mjs",
     "test:window-lifecycle": "npm run build && node scripts/test-desktop-window-lifecycle.mjs",
@@ -47,7 +52,7 @@
     "test:desktop-quit-dialog": "npm run build && node scripts/test-desktop-quit-dialog.mjs",
     "test:window-background-flow": "npm run build && node scripts/test-desktop-window-background-flow.mjs",
     "test:theme-flow": "npm run build && node scripts/test-desktop-theme-flow.mjs",
-    "test:deep-link": "npm run build && node scripts/test-desktop-deep-link.mjs && node scripts/test-desktop-deep-link-startup.mjs",
+    "test:deep-link": "npm run build && node scripts/test-desktop-single-instance.mjs && node scripts/test-desktop-deep-link.mjs && node scripts/test-desktop-deep-link-startup.mjs",
     "test:gateway-orphan-recovery-flow": "npm run build && node scripts/test-desktop-gateway-orphan-recovery-flow.mjs",
     "test:profile-substrate": "npm run build && node scripts/test-desktop-profile-substrate.mjs && node scripts/test-desktop-profile-consolidation.mjs",
     "test:profile-consolidation-flow": "npm run build && node scripts/test-profile-consolidation-flow.mjs",
@@ -60,7 +65,7 @@
     "test:renderer-log": "npm run build && node scripts/test-desktop-renderer-log.mjs",
     "test:renderer-log-lifecycle": "npm run build && node scripts/test-desktop-renderer-log-lifecycle.mjs",
     "test:preview-lease-broker": "npm run build && node scripts/test-artifact-preview-lease-broker.mjs",
-    "test:desktop-workbench": "npm run build && node scripts/test-artifact-preview-lease-broker.mjs && node scripts/test-native-workbench-surface.mjs && node scripts/test-desktop-browser.mjs && node scripts/test-native-workbench-surface-electron.mjs && node scripts/test-desktop-browser-electron.mjs && node scripts/test-native-workbench-v2-electron.mjs",
+    "test:desktop-workbench": "npm run build && node scripts/test-artifact-preview-lease-broker.mjs && node scripts/test-native-workbench-surface.mjs && node scripts/test-working-preview-refresh.mjs && node scripts/test-desktop-browser.mjs && node scripts/test-native-workbench-surface-electron.mjs && node scripts/test-desktop-browser-electron.mjs && node scripts/test-native-workbench-v2-electron.mjs",
     "test:mock-update-flow": "npm run build && node scripts/test-mock-update-flow.mjs",
     "test:onboarding-coordinator": "npm run build && node scripts/test-onboarding-flow-coordinator.mjs && node scripts/test-desktop-unconfigured-profile.mjs",
     "test:onboarding-telemetry": "npm run build && node scripts/test-onboarding-save-telemetry.mjs",
@@ -81,23 +86,30 @@
     "pack:prepared": "npm run build && npm run verify:prepared && electron-builder --dir && npm run verify:package",
     "dist:prepared": "npm run build && npm run verify:prepared && electron-builder && npm run verify:package",
     "test:desktop-browser": "npm run build && node scripts/test-desktop-browser.mjs && node scripts/test-desktop-browser-electron.mjs",
+    "test:browser-mcp": "npm run build && node scripts/test-browser-capability-contract.mjs && node scripts/test-browser-managed-downloads.mjs && node scripts/test-browser-ref-semantics.mjs && node scripts/test-browser-mouse-trajectory.mjs && node scripts/test-desktop-browser.mjs && node scripts/test-desktop-browser-mcp.mjs && node scripts/test-browser-visual-freshness.mjs && node scripts/test-browser-visual-recovery.mjs && node scripts/test-browser-playwright-attach.mjs && node scripts/test-browser-capabilities-electron.mjs && node scripts/test-browser-context-files-electron.mjs && node scripts/test-browser-pointer-electron.mjs && node scripts/test-desktop-browser-mcp-electron.mjs && node scripts/test-browser-native-dialog-electron.mjs && node scripts/test-browser-mcp-faults-electron.mjs && node scripts/test-browser-playwright-package.mjs",
     "test:live-html-harness": "node --test scripts/test-live-html-foreground.mjs scripts/test-live-html-diagnostics.mjs scripts/test-live-html-supplemental-scenarios.mjs",
     "test:live-html-browser": "node --test scripts/test-live-html-business.mjs"
   },
   "dependencies": {
     "electron-updater": "^6.6.2",
-    "smol-toml": "1.8.0"
+    "playwright-core": "1.64.0",
+    "smol-toml": "1.9.0"
   },
   "devDependencies": {
-    "@types/node": "^26.6.1",
+    "@types/node": "^26.6.4",
     "@typescript/typescript6": "6.0.2",
-    "electron": "^42.11.4",
+    "electron": "^42.11.12",
     "electron-builder": "^26.15.3",
     "gsap": "^3.15.0",
     "lottie-web": "^5.13.0",
-    "playwright": "~1.63.0",
+    "playwright": "~1.64.0",
     "typescript": "7.0.2",
-    "ws": "^8.21.3"
+    "ws": "^8.22.0"
+  },
+  "overrides": {
+    "@electron/get@^3.0.0": {
+      "global-agent": "^4.1.3"
+    }
   },
   "build": {
     "appId": "ai.opensquilla.desktop",

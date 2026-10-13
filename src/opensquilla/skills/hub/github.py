@@ -28,7 +28,7 @@ from opensquilla.skills.hub.contracts import (
     DiagnosticSeverity,
     SkillDiagnostic,
 )
-from opensquilla.skills.hub.operations import report_install_progress
+from opensquilla.skills.hub.operations import report_install_progress_async
 from opensquilla.skills.hub.source import (
     SkillBundle,
     SkillMeta,
@@ -562,6 +562,10 @@ class GitHubSource(SkillSource):
     def trust_level(self) -> str:
         return "community"
 
+    @property
+    def requires_immutable_resolution(self) -> bool:
+        return True
+
     def _headers(self) -> dict[str, str]:
         h: dict[str, str] = {"Accept": "application/vnd.github.v3+json"}
         if self._token:
@@ -1011,7 +1015,9 @@ class GitHubSource(SkillSource):
                 actual_total = 0
                 budget = _DownloadBudget(DEFAULT_ARCHIVE_LIMITS.max_expanded_bytes)
                 completed_files = 0
-                report_install_progress("downloading", totalFiles=len(selected), completedFiles=0)
+                await report_install_progress_async(
+                    "downloading", totalFiles=len(selected), completedFiles=0,
+                )
 
                 async def worker() -> None:
                     nonlocal actual_total, completed_files
@@ -1026,7 +1032,7 @@ class GitHubSource(SkillSource):
                         )
                         actual_total += target.stat().st_size
                         completed_files += 1
-                        report_install_progress(
+                        await report_install_progress_async(
                             "downloading", completedFiles=completed_files,
                             totalFiles=len(selected), downloadedBytes=actual_total,
                         )

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -267,3 +269,26 @@ async def test_unsupported_input_is_rejected_before_any_persistence(message, non
     assert result["failure_code"] == "STEER_UNSUPPORTED_INPUT"
     assert result["fallback_safe"] is True
     assert ports.calls == []
+
+
+async def test_display_metadata_envelope_is_not_sent_to_steering_runtime(monkeypatch) -> None:
+    paths = (r"C:\fixtures\report.pdf",)
+    message = "Read this\n" + paths[0]
+    ports = _Ports()
+    prepare = ports.prepare
+
+    async def prepare_envelope(key, text, context, session):
+        assert context.local_path_references == paths
+        prepared = await prepare(key, text, context, session)
+        prepared.entry.content = json.dumps({"text": text, "local_path_references": paths})
+        return replace(prepared, message=text)
+
+    runtime = AsyncMock(wraps=ports.admit_runtime)
+    monkeypatch.setattr(ports, "prepare", prepare_envelope)
+    monkeypatch.setattr(ports, "admit_runtime", runtime)
+    result = await TurnSteering(ports).steer(_command(
+        message=message, local_path_references=paths,
+    ))
+    assert result["accepted"] is True
+    assert runtime.await_args.args[2] == message
+    assert runtime.await_args.kwargs["semantic_message"] == message

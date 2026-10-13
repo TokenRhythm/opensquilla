@@ -398,6 +398,45 @@ def _config_change_summary(expected: str, actual: str) -> str:
     )
 
 
+def _upgrade_config_baseline(home: Path, label: str, path: Path, version: str) -> str:
+    """Validate the old client's snapshot before trusting it as an upgrade baseline."""
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    assert version in {"0.5.3", "0.5.4"}, "unsupported upgrade baseline"
+    assert snapshot["baselineVersion"] == version, "upgrade baseline version differs"
+    # Match Path.read_text's universal-newline handling on Windows; the Node
+    # snapshot preserves the original CRLF bytes inside its JSON string.
+    text = snapshot["config"].replace("\r\n", "\n").replace("\r", "\n")
+    actual = tomllib.loads(text)
+    expected = tomllib.loads(_config_text(home, label))
+    # These are the only independently reproduced old-client startup writes.
+    # Missing fields may stay absent, but existing values may never be ignored.
+    if "config_version" in actual:
+        expected["config_version"] = 1
+    if "control_ui" in actual:
+        expected["control_ui"] = {"default_locale": "en"}
+    if version == "0.5.4" and "sandbox" in actual:
+        expected["sandbox"] = {"run_mode": "full"}
+    assert json.dumps(actual, sort_keys=True) == json.dumps(expected, sort_keys=True), (
+        "old-client startup changed protected config values"
+    )
+    return text
+
+
+def _verify_runtime_config(expected: str, actual: str) -> None:
+    """Permit only the candidate's known schema stamp and native locale sync."""
+    before, after = tomllib.loads(expected), tomllib.loads(actual)
+    # Candidate startup can persist the current stamp when syncing native locale.
+    # Do not accept removed fields, other locales, or ANY sandbox-mode change.
+    if "config_version" in after and after["config_version"] == 2:
+        before["config_version"] = 2
+    if "control_ui" not in before and "control_ui" in after:
+        before["control_ui"] = {"default_locale": "en"}
+    assert json.dumps(before, sort_keys=True) == json.dumps(after, sort_keys=True), (
+        "config.toml changed protected values after runtime startup: "
+        + _config_change_summary(expected, actual)
+    )
+
+
 def verify_profile(
     home: Path,
     label: str,
@@ -405,6 +444,9 @@ def verify_profile(
     runtime_migrated: bool = False,
     signed_retained: bool = False,
     external_root: Path | None = None,
+    config_baseline: Path | None = None,
+    baseline_version: str | None = None,
+    allow_runtime_config: bool = False,
 ) -> None:
     """Verify exact fixture bytes and a read-only SQLite integrity probe."""
 
@@ -422,7 +464,14 @@ def verify_profile(
         if runtime_migrated
         else _config_text(home, label, signed_retained=signed_retained)
     )
-    if actual_config != expected_config:
+    if config_baseline is not None:
+        expected_config = _upgrade_config_baseline(
+            home, label, config_baseline, baseline_version or ""
+        )
+    if allow_runtime_config:
+        assert config_baseline is not None, "runtime comparison requires an upgrade baseline"
+        _verify_runtime_config(expected_config, actual_config)
+    elif actual_config != expected_config:
         phase = "after expected runtime migration" if runtime_migrated else "during installation"
         raise AssertionError(
             f"config.toml changed unexpectedly {phase}: "
@@ -535,6 +584,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--label", type=_validated_label, required=True)
     parser.add_argument("--external-root", type=Path)
     parser.add_argument("--baseline-version", choices=("0.5.3", "0.5.4"))
+    parser.add_argument("--config-baseline", type=Path)
+    parser.add_argument("--allow-runtime-config", action="store_true")
     return parser
 
 
@@ -573,6 +624,9 @@ def main() -> int:
                 runtime_migrated=runtime_migrated,
                 signed_retained=signed_retained,
                 external_root=args.external_root,
+                config_baseline=args.config_baseline,
+                baseline_version=args.baseline_version,
+                allow_runtime_config=args.allow_runtime_config,
             )
             if args.baseline_version == "0.5.4":
                 from upgrade_baseline import verify_ledger

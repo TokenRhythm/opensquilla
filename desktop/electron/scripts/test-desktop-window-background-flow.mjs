@@ -93,6 +93,7 @@ const routedServers = new WeakMap()
 const blackholedClients = new Set()
 let wakeBlackholeEvidence = null
 let wakeBlackholeFailure = null
+let backgroundPrecondition = null
 
 async function startSyntheticProvider() {
   let chatRequests = 0
@@ -459,14 +460,21 @@ try {
     for (const client of routedClients) blackholedClients.add(client)
     const wakeStarted = Date.now()
     await page.evaluate(() => localStorage.removeItem('opensquilla.chat.sessionNavigationDiag'))
-    await desktopApp.evaluate(({ powerMonitor }) => { powerMonitor.emit('resume') })
+    await desktopApp.evaluate(({ powerMonitor }) => {
+      powerMonitor.emit('resume')
+      // A healthy replacement can recover before the periodic signal below.
+      // Inject the duplicate while the first incident is still being probed.
+      powerMonitor.emit('resume')
+    })
     const duplicateWake = setInterval(() => {
       void desktopApp.evaluate(({ powerMonitor }) => { powerMonitor.emit('resume') }).catch(() => {})
     }, 3_000)
     try {
+      // Diagnostics are stored newest-first; correlate the first incident in
+      // chronological order even if another native wake arrives after recovery.
       const readDiagnostics = () => page.evaluate(() => JSON.parse(
         localStorage.getItem('opensquilla.chat.sessionNavigationDiag') || '[]',
-      ).filter(entry => entry.source === 'rpc.transport'))
+      ).filter(entry => entry.source === 'rpc.transport').reverse())
       await waitFor(async () => (await readDiagnostics()).some(entry => entry.phase === 'probe_timeout'),
         'wake suspect diagnostic', 20_000)
       await waitFor(async () => await page.locator('[data-testid="connection-status"].connecting, [data-testid="chat-system-status-trigger"].connecting').count() > 0,
@@ -581,6 +589,22 @@ try {
       window.__opensquillaWindowLifecycleMarker = value
     }, marker)
 
+    // This section measures close -> background -> activate, not whether the
+    // first launch automatically revealed its window. Establish a visible
+    // starting state once through the real activation handler, after the
+    // preceding resume/connection-fault assertions have already completed.
+    // Preserve the original state so an earlier unexpected hide remains
+    // visible in the evidence; activation must not recreate the renderer.
+    const activationStart = await mainWindowSnapshot(desktopApp)
+    assert.ok(activationStart && !activationStart.destroyed, 'background setup requires the existing main window')
+    backgroundPrecondition = {
+      activationRequests: 1,
+      visibleBeforeActivation: activationStart.visible,
+      minimizedBeforeActivation: activationStart.minimized,
+      focusedBeforeActivation: activationStart.focused,
+      boundary: 'Explicit activation establishes background-test setup; automatic launch visibility is not verified.',
+    }
+    await desktopApp.evaluate(({ app }) => { app.emit('activate') })
     const before = await waitFor(
       async () => {
         const snapshot = await mainWindowSnapshot(desktopApp)
@@ -588,6 +612,10 @@ try {
       },
       'visible main window',
     )
+    assert.equal(before.browserWindowId, activationStart.browserWindowId)
+    assert.equal(before.webContentsId, activationStart.webContentsId)
+    assert.equal(await page.evaluate(() => window.__opensquillaWindowLifecycleMarker), marker,
+      'background setup activation must preserve the existing renderer')
 
     await desktopApp.evaluate(({ BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows().find((candidate) => (
@@ -811,6 +839,7 @@ try {
       platform: runtimeIsolation.platform,
       behavior: preferences.mainWindowCloseBehavior,
       backgroundSupported,
+      backgroundPrecondition,
       browserWindowId: revealed.browserWindowId,
       webContentsId: revealed.webContentsId,
       rendererPreserved: true,
@@ -861,6 +890,7 @@ try {
     syntheticProviderRequests: syntheticProvider?.chatRequests() ?? null,
     continuityDiagnostics,
     wakeBlackholeFailure,
+    backgroundPrecondition,
     rpcTransport: await readRpcTransportObservation(continuityPage),
     windows,
     desktopLog,

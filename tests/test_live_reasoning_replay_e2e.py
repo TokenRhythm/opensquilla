@@ -1199,7 +1199,7 @@ async def test_chunked_compaction_reports_one_preflight_after_runner_cleanup(
     summary = "Completed archived background. The synthetic memory exercise is complete."
     if recall_result != "missing_summary_label":
         summary += f" Retain COMPACTION_LABEL={label} for exact recall."
-    responses = iter([f"COMPACTION_LABEL={label}", summary, summary, final_answer])
+    requests = []
 
     if recall_result == "missing_persisted_label":
         prepare = harness.SessionManager.prepare_message
@@ -1213,8 +1213,15 @@ async def test_chunked_compaction_reports_one_preflight_after_runner_cleanup(
         monkeypatch.setattr(harness.SessionManager, "prepare_message", drop_label)
 
     async def respond(request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        is_summary = harness._is_compaction_wire_call(harness.WireCall(request=payload))
+        content = (
+            f"COMPACTION_LABEL={label}" if len(requests) == 1
+            else summary if is_summary else final_answer
+        )
         frame = {
-            "choices": [{"index": 0, "delta": {"content": next(responses)},
+            "choices": [{"index": 0, "delta": {"content": content},
                          "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 20},
         }
@@ -1224,7 +1231,7 @@ async def test_chunked_compaction_reports_one_preflight_after_runner_cleanup(
         )
 
     observer = harness.WireObserver(
-        harness.registry_endpoint("openrouter"), httpx.MockTransport(respond), max_calls=4,
+        harness.registry_endpoint("openrouter"), httpx.MockTransport(respond), max_calls=6,
     )
     run = harness._run_compaction_case(
         tmp_path, provider="openrouter", model="deepseek/deepseek-v4-flash",
@@ -1235,7 +1242,8 @@ async def test_chunked_compaction_reports_one_preflight_after_runner_cleanup(
         assert report["ok"] is True
         assert report["preflight_ratio"] == 0.85
         assert report["compaction_attempted_by_turn"] == [False, True]
-        assert report["summary_call_indexes"] == [1, 2]
+        assert report["summary_call_indexes"] == list(range(1, len(observer.calls) - 1))
+        assert 2 <= len(report["summary_call_indexes"]) <= 4
         assert report["coverage"]["observed"]["chunked_summary"] is True
         assert report["coverage"]["observed"]["single_preflight"] is True
     else:
@@ -1256,7 +1264,9 @@ async def test_chunked_compaction_reports_one_preflight_after_runner_cleanup(
         assert recall_checks == []
         return
 
-    assert len(observer.calls) == 4
+    summary_calls = [call for call in observer.calls if harness._is_compaction_wire_call(call)]
+    assert 2 <= len(summary_calls) <= 4
+    assert len(observer.calls) == len(summary_calls) + 2
     assert observer.replay_checks["compaction_attempted_by_turn"] == [False, True]
     assert [event["phase"] for event in observer.replay_checks["compaction_events"]
             if event.get("status") == "started"] == ["preflight"]

@@ -700,7 +700,7 @@ def test_declared_capabilities_array_is_positive_evidence_only() -> None:
     assert declared.capabilities.vision is None
 
 
-def test_merge_uses_auth_as_entitlement_and_filters_known_non_chat_or_offline() -> None:
+def test_merge_uses_auth_as_entitlement_and_filters_only_known_non_chat() -> None:
     published = parse_tokenrhythm_published(
         {
             "data": [
@@ -731,11 +731,51 @@ def test_merge_uses_auth_as_entitlement_and_filters_known_non_chat_or_offline() 
     merged = merge_tokenrhythm_catalog(published, declared)
     runtime_entries = tokenrhythm_published_catalog_entries(published)
 
-    assert set(merged) == {"qwen3.8-max", "auth-only"}
+    assert set(merged) == {
+        "qwen3.8-max", "auth-only", "offline-model", "paused-model", "auth-only-offline",
+    }
     assert "image-model" not in runtime_entries
-    assert "offline-model" not in runtime_entries
+    assert "offline-model" in runtime_entries
+    assert "paused-model" in runtime_entries
     assert merged["qwen3.8-max"].metadata.published is not None
     assert merged["auth-only"].metadata.published is None
+
+
+@pytest.mark.parametrize(
+    ("published_status", "declared_status"),
+    [
+        ("special_offer", None),
+        (None, "special_offer"),
+        ("future-status", "future-status"),
+        ("offline", "maintenance"),
+    ],
+)
+def test_status_metadata_preserves_authenticated_models_and_catalog_fields(
+    published_status: str | None, declared_status: str | None,
+) -> None:
+    model_id = "synthetic-chat-model"
+    published = parse_tokenrhythm_published({"data": [
+        _published_row(id=model_id, status=published_status),
+        _published_row(id="public-only", status=published_status),
+    ]})
+    declared = parse_tokenrhythm_declared({"data": [
+        {"id": model_id, "status": declared_status},
+        {"id": "auth-only", "status": declared_status},
+    ]})
+
+    merged = merge_tokenrhythm_catalog(published, declared)
+    assert set(merged) == {model_id, "auth-only"}
+    metadata = merged[model_id].metadata.to_wire()
+    assert metadata["published"]["status"] == published_status
+    assert metadata["declared"]["status"] == declared_status
+
+    fields = tokenrhythm_published_catalog_entries(published)[model_id]
+    assert fields["context_window"] == 1_000_000
+    assert fields["max_output_tokens"] == 131_072
+    assert fields["supports_tools"] is True
+    assert fields["supports_vision"] is True
+    assert fields["input_cost_per_mtok"] > 0
+    assert fields["output_cost_per_mtok"] > 0
 
 
 def test_v4_flash_0731_public_metadata_does_not_grant_entitlement() -> None:

@@ -78,34 +78,6 @@ class AgentRegistry:
         await self._persist()
         return self._entry_summary(entry)
 
-    async def update_agent(self, agent_id: str, **fields: Any) -> dict[str, Any]:
-        normalized = self._normalize_user_agent_id(agent_id)
-        index = self._require_index(normalized)
-        entry = self.config.agents[index]
-        updates: dict[str, Any] = {}
-        for field in (
-            "name",
-            "description",
-            "model",
-            "workspace",
-            "agent_dir",
-            "tools",
-            "enabled",
-            "system_prompt",
-        ):
-            if field in fields:
-                updates[field] = fields[field]
-        if "systemPrompt" in fields:
-            updates["system_prompt"] = fields["systemPrompt"]
-        if "agentDir" in fields:
-            updates["agent_dir"] = fields["agentDir"]
-        if not updates:
-            raise ValueError("No fields to update")
-        next_entry = entry.model_copy(update=updates)
-        self.config.agents[index] = next_entry
-        await self._persist()
-        return self._entry_summary(next_entry)
-
     async def delete_agent(self, agent_id: str) -> None:
         normalized = self._normalize_user_agent_id(agent_id)
         index = self._require_index(normalized)

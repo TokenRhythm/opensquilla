@@ -361,7 +361,7 @@ export function renewArtifactPreviewLeaseHttp<T>(
   return http.requestJson<T>(artifactPreviewLeaseControlUrl(leaseId, context, '/renew'), {
     method: 'POST',
     sessionKey: context.sessionKey,
-    timeoutMs: 0,
+    timeoutMs: 15_000,
   })
 }
 

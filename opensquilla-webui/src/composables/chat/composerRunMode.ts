@@ -1,5 +1,16 @@
 import type { SandboxRunMode, SandboxSetupStatusPayload } from '@/types/sandbox'
 
+export function allowedComposerRunModes(
+  allowed: SandboxRunMode[],
+  setupStatus: SandboxSetupStatusPayload | null,
+  setupResolved: boolean,
+  capabilityAvailable = false,
+): SandboxRunMode[] {
+  return setupResolved && (capabilityAvailable || setupStatus?.state === 'ready')
+    ? allowed
+    : allowed.filter(mode => mode !== 'safe')
+}
+
 export function effectiveComposerRunMode(
   preference: SandboxRunMode,
   _setupStatus: SandboxSetupStatusPayload | null,
@@ -17,11 +28,17 @@ export function composerRunModeSelectionAction(
   setupStatus: SandboxSetupStatusPayload | null,
   canSetup: boolean,
   setupResolved = true,
+  capabilityAvailable = false,
 ): ComposerRunModeSelectionAction {
   if (mode === 'full') return 'persist'
   if (!setupResolved || setupStatus === null) return 'ignore'
-  if (setupStatus.state === 'ready') return 'persist'
-  return setupStatus.state === 'not_setup' && canSetup ? 'setup' : 'ignore'
+  // A ready readiness result is authoritative for mode selection. Setup is
+  // reserved for first-time configuration and an explicit retryable failure;
+  // selecting Safe again must not reopen administrator setup on Windows.
+  if (capabilityAvailable || setupStatus.state === 'ready') return 'persist'
+  return ['not_setup', 'failed'].includes(setupStatus.state) && canSetup
+    ? 'setup'
+    : 'ignore'
 }
 
 export async function completeComposerSafeSetup(

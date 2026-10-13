@@ -40,10 +40,30 @@
         :data-chat-message-forced="forcedIndexes.has(entry.index) ? 'true' : 'false'"
         data-testid="chat-message-row"
       >
+        <div
+          v-if="showContentHydrationStatus(messages[entry.index], entry.index)"
+          class="chat-history-content-hydration"
+          data-testid="chat-history-content-hydration"
+          role="status"
+        >
+          <button
+            v-if="contentHydrationError(messages[entry.index], entry.index)"
+            type="button"
+            class="chat-history-content-hydration__button"
+            :disabled="contentHydrationPending(messages[entry.index], entry.index)"
+            @click.stop="hydrateContent(messages[entry.index], entry.index)"
+          >
+            {{ t('chat.retry') }}
+          </button>
+          <span v-else>{{ contentHydrationPending(messages[entry.index], entry.index) ? t('shared.loading') : contentAvailabilityLabel(messages[entry.index]) }}</span>
+          <span v-if="contentHydrationError(messages[entry.index], entry.index)" class="chat-history-content-hydration__error">
+            {{ contentHydrationError(messages[entry.index], entry.index) }}
+          </span>
+        </div>
         <slot
           v-if="messages[entry.index].isRouterStrip"
           name="router-strip"
-          :message="messages[entry.index]"
+          :message="hydratedMessage(messages[entry.index], entry.index)"
           :index="entry.index"
         />
         <UserMessage
@@ -51,7 +71,7 @@
           :id="`chat-turn-${entry.index}`"
           :data-chat-turn-key="chatMessageKey(messages[entry.index], entry.index)"
           tabindex="-1"
-          :message="messages[entry.index]"
+          :message="hydratedMessage(messages[entry.index], entry.index)"
           :share-mode="shareMode"
           :share-selected="selectedMessageIds.has(chatMessageKey(messages[entry.index], entry.index))"
           :share-message-id="chatMessageKey(messages[entry.index], entry.index)"
@@ -79,8 +99,9 @@
         />
         <AssistantMessage
           v-else-if="messages[entry.index].displayRole === 'assistant'"
-          :message="messages[entry.index]"
+          :message="hydratedMessage(messages[entry.index], entry.index)"
           :index="entry.index"
+          :load-history-details="loadHistoryDetails"
           :share-mode="shareMode"
           :share-selected="selectedMessageIds.has(chatMessageKey(messages[entry.index], entry.index))"
           :share-message-id="chatMessageKey(messages[entry.index], entry.index)"
@@ -119,6 +140,7 @@
           @open-artifact="$emit('openArtifact', $event)"
           @toggle-tool-group="$emit('toggleToolGroup', $event)"
           @toggle-tool-item="$emit('toggleToolItem', $event)"
+          @details-disclosure="(message, open) => $emit('detailsDisclosure', message, open)"
           @show-tool-result="(content, title, context) => $emit('showToolResult', content, title, context)"
           @open-session="$emit('openSession', $event)"
           @resolve-interrupt="(id, decision) => $emit('resolveInterrupt', id, decision)"
@@ -133,7 +155,7 @@
         />
         <SystemMessage
           v-else
-          :message="messages[entry.index]"
+          :message="hydratedMessage(messages[entry.index], entry.index)"
           :subagent-summary="subagentSummary"
           :subagent-body="subagentBody"
           :retry-available="usageBarrierRetryAvailable(entry.index)"
@@ -163,15 +185,18 @@
 import SkillLoadStatus from './SkillLoadStatus.vue'
 import {
   computed,
+  inject,
   nextTick,
   onBeforeUnmount,
   onMounted,
   onUpdated,
+  reactive,
   ref,
   useSlots,
   watch,
   type ComponentPublicInstance,
 } from 'vue'
+import { useI18n } from 'vue-i18n'
 import AssistantMessage from '@/components/chat/AssistantMessage.vue'
 import CompactionEvent from '@/components/chat/CompactionEvent.vue'
 import SystemMessage from '@/components/chat/SystemMessage.vue'
@@ -197,6 +222,10 @@ import { captureVisibleTextScrollAnchor, restoreTextScrollAnchor, type TextScrol
 import { readDistanceFromEnd, remeasureVirtualizer, type VirtualizerAnchor } from '@/utils/virtualizerLayout'
 import { sandboxResumeMessageTurnId } from '@/utils/chat/sandboxResumeGuard'
 import { isProcessRestartOutcome, turnOutcomePresentation } from '@/utils/chat/turnOutcome'
+import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
+import { ContentRangeCache, type ContentRangeRef } from '@/utils/chat/contentRangeCache'
+import { HISTORY_CONTENT_READER_KEY } from '@/modules/historyContent'
+import { restoreHistoryTimelineText } from '@/utils/chat/historyMessageContent'
 import {
   isUsageAccountingBarrierMessage,
   strictUsageBarrierRetryUserMessageIndex,
@@ -206,6 +235,7 @@ import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 
 const props = defineProps<{
   messages: ChatRenderedMessage[]
+  loadHistoryDetails?: (message: ChatRenderedMessage) => Promise<void>
   shareMode: boolean
   selectedMessageIds: Set<string>
   stripTimePrefix: (text: string) => string
@@ -275,6 +305,8 @@ const emit = defineEmits<{
   openArtifact: [artifact: ArtifactPayload]
   toggleToolGroup: [groupId: string]
   toggleToolItem: [renderKey: string]
+  detailsDisclosure: [message: ChatRenderedMessage, open: boolean]
+  contentHydrated: [message: ChatRenderedMessage, text: string]
   showToolResult: [content: string, title: string, context?: ToolResultContext]
   openSession: [sessionKey: string]
   forkConversation: [throughTurnId?: string]
@@ -292,6 +324,7 @@ const emit = defineEmits<{
 
 const VIRTUALIZATION_STORAGE_KEY = 'opensquilla.chat.virtualizeHistory'
 const MESSAGE_GAP_PX = 4
+const { t } = useI18n()
 
 function forwardSystemRetry(
   message: ChatRenderedMessage,
@@ -312,7 +345,22 @@ function forwardSandboxResume(message: ChatRenderedMessage) {
 }
 
 const visibleAnswerTurns = computed(() => new Set(props.messages
-  .filter(message => message.displayRole === 'assistant' && message.text.trim() && message.turnId)
+  .filter(message => {
+    if (message.displayRole !== 'assistant' || !message.turnId) return false
+    const outcome = turnOutcomePresentation(message.turnOutcome)
+    const lifecycle = outcome === 'stopped' || outcome === 'interrupted' || message.interrupted
+      ? 'interrupted' as const
+      : outcome === 'timeout' || outcome === 'failed' || message.terminalFailure
+        ? 'failed' as const
+        : message.isStreaming
+          ? 'working' as const
+          : 'settled' as const
+    return Boolean(resolveAssistantAnswer(
+      message,
+      message.timelineItems ?? [],
+      lifecycle,
+    ).text.trim())
+  })
   .map(message => message.turnId!)))
 
 function outcomeTurnIdentity(message: ChatRenderedMessage): string {
@@ -382,6 +430,231 @@ let readingPosition = -1
 const activeNavigation = ref<{ key: string; options: ScrollToOptions } | null>(null)
 const scrollHandoff = ref<symbol | null>(null)
 let synchronizeScrollOffset: (() => void) | null = null
+
+// Hydrate mounted history previews into the existing message renderer.
+// Reads are serialized. Mounted content remains visible; only offscreen cached
+// bodies are evicted when the retained-content cache exceeds its budget.
+const contentRangeCache = inject(HISTORY_CONTENT_READER_KEY, () => new ContentRangeCache())()
+const hydratedContent = reactive(new Map<string, string>())
+const hydratedContentBytes = new Map<string, number>()
+let hydratedContentTotalBytes = 0
+const hydrationLoading = reactive(new Set<string>())
+const hydrationErrors = reactive(new Map<string, string>())
+const hydrationControllers = new Map<string, AbortController>()
+let contentHydrationGeneration = 0
+const hydrationAttempted = new Set<string>()
+const hydrationUnavailable = reactive(new Set<string>())
+let automaticHydrationOwner: { generation: number; key?: string } | undefined
+let contentHydrationDisposed = false
+const MAX_HYDRATED_CONTENT_BYTES = 16 * 1024 * 1024
+
+function contentHydrationKey(message: ChatRenderedMessage, _index: number): string {
+  const ref = message.contentRef
+  if (ref?.version === 1 && ref.sessionKey && ref.sessionId && ref.messageId) {
+    // Message ids are only unique inside a session. Include the complete
+    // content identity so a reused ChatMessageList cannot install a late
+    // response from the previous session or revision.
+    return [
+      'content', ref.sessionKey, ref.sessionId, ref.messageId,
+      ref.source ?? '', ref.view ?? 'raw', String(ref.byteLength ?? ''),
+      ref.revision ?? '', ref.sha256 ?? '', message.contentRevision ?? '',
+    ].join('|')
+  }
+  return chatMessageKey(message, _index)
+}
+
+function contentRefFor(message: ChatRenderedMessage): ContentRangeRef | undefined {
+  const ref = message.contentRef
+  if (!ref || ref.version !== 1 || !ref.sessionKey || !ref.sessionId || !ref.messageId) return undefined
+  return ref
+}
+
+function canHydrateContent(message: ChatRenderedMessage): boolean {
+  if (message.previewComplete === true) return false
+  // Raw ranges are safe for plain user rows. Rows with persisted
+  // protocol JSON, tool results, or legacy control prompts carry
+  // `contentRef.view=display`; that endpoint reapplies the server history
+  // projection before any bytes reach the renderer, so assistant/tool rows
+  // can be inspected without reintroducing internal wire text.
+  if (
+    message.turnRunKind === 'plan_implementation'
+    || message.provenanceKind === 'plan_implementation'
+  ) return false
+  // Split rows share a content identity and the serialized read/cache. A mounted
+  // slice can restore an evicted body even when its canonical row is offscreen.
+  if (message.contentRef?.view === 'display') {
+    return ['user', 'assistant', 'tool'].includes(message.displayRole)
+  }
+  return message.displayRole === 'user' && !message.toolCalls?.length
+}
+
+function showContentHydrationStatus(message: ChatRenderedMessage, index: number): boolean {
+  if (props.shareMode || message.previewComplete === true) return false
+  if (message.turnRunKind === 'plan_implementation' || message.provenanceKind === 'plan_implementation') return false
+  const key = contentHydrationKey(message, index)
+  if (hydratedContent.has(key)) return false
+  return Boolean(contentRefFor(message) && canHydrateContent(message))
+    || message.previewComplete === false || Boolean(message.contentUnavailableReason)
+}
+
+function contentAvailabilityLabel(message: ChatRenderedMessage): string {
+  if (hydrationUnavailable.has(contentHydrationKey(message, 0))) return t('historyContent.unavailable')
+  return message.contentAvailability === 'preparing' || message.contentUnavailableReason === 'content_metadata_pending'
+    ? t('shared.loading')
+    : t('historyContent.unavailable')
+}
+
+function hydratedMessage(message: ChatRenderedMessage, index: number): ChatRenderedMessage {
+  // A new complete server projection owns the body even if a previous preview
+  // for this content identity was hydrated locally.
+  if (message.previewComplete === true) return message
+  const key = contentHydrationKey(message, index)
+  const text = hydratedContent.get(key)
+  if (text === undefined) return message
+  const slice = message.contentSlice
+  if (!slice) return {
+    ...message, text,
+    timelineItems: hydrateTimelineText(message, text) ?? message.timelineItems,
+  }
+  if (
+    !Number.isSafeInteger(slice.startCodepoint)
+    || !Number.isSafeInteger(slice.endCodepoint)
+    || slice.startCodepoint < 0
+    || slice.endCodepoint < slice.startCodepoint
+  ) return message
+  const codepoints = Array.from(text)
+  if (slice.endCodepoint > codepoints.length) return message
+  return {
+    ...message,
+    text: codepoints.slice(slice.startCodepoint, slice.endCodepoint).join(''),
+  }
+}
+
+function hydrateTimelineText(message: ChatRenderedMessage, text: string): ChatRenderedMessage['timelineItems'] {
+  return restoreHistoryTimelineText(message, text)?.map(item => item.type === 'text'
+    ? { ...item, html: props.renderMarkdown(item.rawText ?? '') } : item)
+}
+
+function rememberHydratedContent(key: string, text: string): void {
+  const previous = hydratedContentBytes.get(key)
+  if (previous !== undefined) hydratedContentTotalBytes -= previous
+  hydratedContent.delete(key)
+  hydratedContentBytes.delete(key)
+
+  const size = new TextEncoder().encode(text).byteLength
+  hydratedContent.set(key, text)
+  hydratedContentBytes.set(key, size)
+  hydratedContentTotalBytes += size
+
+  trimHydratedContent()
+}
+
+function mountedContentKeys(): Set<string> {
+  return new Set(renderEntries.value.flatMap(({ index }) => {
+    const message = props.messages[index]
+    return message ? [contentHydrationKey(message, index)] : []
+  }))
+}
+
+function trimHydratedContent(): void {
+  const mounted = mountedContentKeys()
+  for (const key of hydratedContent.keys()) {
+    if (hydratedContentTotalBytes <= MAX_HYDRATED_CONTENT_BYTES) break
+    // A cache budget must not replace already displayed full text with a
+    // preview. Mounted rows own their bodies until they leave the list.
+    if (mounted.has(key)) continue
+    const evicted = hydratedContentBytes.get(key) ?? 0
+    hydratedContent.delete(key)
+    hydratedContentBytes.delete(key)
+    hydrationAttempted.delete(key)
+    hydratedContentTotalBytes -= evicted
+  }
+}
+
+function contentHydrationError(message: ChatRenderedMessage, index: number): string | undefined {
+  return hydrationErrors.get(contentHydrationKey(message, index))
+}
+
+function contentHydrationPending(message: ChatRenderedMessage, index: number): boolean {
+  return hydrationLoading.has(contentHydrationKey(message, index))
+}
+
+async function hydrateContent(message: ChatRenderedMessage, index: number): Promise<void> {
+  const ref = contentRefFor(message)
+  if (!ref || props.shareMode || !canHydrateContent(message)) return
+  const key = contentHydrationKey(message, index)
+  if (hydratedContent.has(key) || hydrationLoading.has(key)) return
+  hydrationAttempted.add(key)
+  if (ref.view !== 'display' && !contentRangeCache.canReadText(ref)) {
+    hydrationUnavailable.add(key)
+    return
+  }
+  const controller = new AbortController()
+  const generation = contentHydrationGeneration
+  hydrationControllers.set(key, controller)
+  hydrationLoading.add(key)
+  hydrationErrors.delete(key)
+  try {
+    const text = ref.view === 'display'
+      ? await contentRangeCache.readDisplay(ref, { signal: controller.signal })
+      : await contentRangeCache.readText(ref, { signal: controller.signal })
+    if (generation === contentHydrationGeneration && !controller.signal.aborted) {
+      rememberHydratedContent(key, text)
+      emit('contentHydrated', message, text)
+    }
+  } catch (error) {
+    if (!controller.signal.aborted && generation === contentHydrationGeneration) {
+      hydrationErrors.set(key, error instanceof Error ? error.message : t('historyContent.unavailable'))
+    }
+  } finally {
+    if (hydrationControllers.get(key) === controller) {
+      hydrationLoading.delete(key)
+      hydrationControllers.delete(key)
+    }
+  }
+}
+
+async function hydrateMountedContent(): Promise<void> {
+  if (contentHydrationDisposed || props.shareMode
+    || automaticHydrationOwner?.generation === contentHydrationGeneration) return
+  const generation = contentHydrationGeneration
+  const owner = { generation, key: undefined as string | undefined }
+  automaticHydrationOwner = owner
+  try {
+    while (!contentHydrationDisposed && automaticHydrationOwner === owner
+      && generation === contentHydrationGeneration && !props.shareMode) {
+      const entry = renderEntries.value.find(({ index }) => {
+        const message = props.messages[index]
+        if (!message || !contentRefFor(message) || !canHydrateContent(message)) return false
+        const key = contentHydrationKey(message, index)
+        return !hydratedContent.has(key) && !hydrationAttempted.has(key)
+          && !hydrationLoading.has(key)
+          && !hydrationErrors.has(key) && !hydrationUnavailable.has(key)
+      })
+      if (!entry) break
+      owner.key = contentHydrationKey(props.messages[entry.index], entry.index)
+      await hydrateContent(props.messages[entry.index], entry.index)
+    }
+  } finally {
+    // A superseded shared range may finish after a new session/revision read.
+    // It cannot release the new pump's lease.
+    if (automaticHydrationOwner === owner) automaticHydrationOwner = undefined
+  }
+}
+
+function resetContentHydrationState(): void {
+  contentHydrationGeneration += 1
+  for (const controller of hydrationControllers.values()) controller.abort()
+  hydrationControllers.clear()
+  hydrationLoading.clear()
+  hydrationErrors.clear()
+  hydratedContent.clear()
+  hydrationAttempted.clear()
+  hydrationUnavailable.clear()
+  hydratedContentBytes.clear()
+  hydratedContentTotalBytes = 0
+  contentRangeCache.clear()
+}
 
 function readVirtualizationPreference(): boolean {
   try {
@@ -539,13 +812,24 @@ watch([activeNavigation, layoutPending, scrollHandoff], () => {
 const variableLayout = computed(() => {
   // Populate the same geometry even when an export renders every row.
   const totalSize = virtualizer.value.getTotalSize()
-  if (!virtualizationEnabled.value) return {
-    entries: [
-      ...messageKeys.value.map((key, index) => ({ key, index, gapBefore: 0 })),
-      ...(hasTrailing.value ? [{ key: 'trailing:' + (props.trailingKey ?? props.sessionKey ?? ''), index: props.messages.length, gapBefore: 0 }] : []),
-    ],
-    topSpacer: 0,
-    bottomSpacer: props.bottomPadding ?? 0,
+  if (!virtualizationEnabled.value) {
+    // Without virtualization every loaded row must remain reachable by
+    // ordinary scrolling and message navigation.
+    const entries = messageKeys.value.map((key, index) => ({
+      key,
+      index,
+      gapBefore: 0,
+    }))
+    if (hasTrailing.value) entries.push({
+      key: 'trailing:' + (props.trailingKey ?? props.sessionKey ?? ''),
+      index: props.messages.length,
+      gapBefore: 0,
+    })
+    return {
+      entries,
+      topSpacer: 0,
+      bottomSpacer: props.bottomPadding ?? 0,
+    }
   }
   const items = virtualizer.value.getVirtualItems()
   const margin = scrollMargin.value
@@ -561,6 +845,36 @@ const variableLayout = computed(() => {
   }
 })
 const renderEntries = computed(() => variableLayout.value.entries)
+
+watch(() => [props.shareMode, props.sessionKey, props.scrollEpoch, ...renderEntries.value.map(({ index }) => {
+  const message = props.messages[index]
+  return message ? [contentHydrationKey(message, index), message.previewComplete, canHydrateContent(message)] : null
+})], () => {
+  const mounted = mountedContentKeys()
+  const previousOwner = automaticHydrationOwner
+  if (previousOwner?.key && !mounted.has(previousOwner.key)) {
+    automaticHydrationOwner = undefined
+    hydrationControllers.get(previousOwner.key)?.abort()
+    // Releasing the waiter must be synchronous: a shared raw transport can
+    // remain pending after abort, while the same row is already mounted again.
+    // The old finally block checks controller identity before touching a new read.
+    hydrationControllers.delete(previousOwner.key)
+    hydrationLoading.delete(previousOwner.key)
+  }
+  // An evicted successful body can be restored when its row is mounted again.
+  // Failed reads retain their explicit retry state instead of polling.
+  for (const key of hydrationAttempted) if (!mounted.has(key)) hydrationAttempted.delete(key)
+  trimHydratedContent()
+  // Pagination or a history refresh can supply Steer anchors after the body was
+  // cached. Reconcile against that body without retaining it in parent state.
+  for (const { index } of renderEntries.value) {
+    const message = props.messages[index]
+    if (!message || message.contentSlice || message.displayRole !== 'assistant' || !canHydrateContent(message)) continue
+    const text = hydratedContent.get(contentHydrationKey(message, index))
+    if (text !== undefined) emit('contentHydrated', message, text)
+  }
+  void hydrateMountedContent()
+}, { immediate: true, flush: 'post' })
 
 function spacerStyle(height: number): Record<string, string> {
   return { height: height + 'px' }
@@ -853,7 +1167,8 @@ defineExpose<ChatMessageListVirtualizer>({
   isVirtualized: () => virtualizationEnabled.value,
 })
 
-watch([() => props.sessionKey, () => props.scrollEpoch], () => {
+watch([() => props.sessionKey, () => props.scrollEpoch], (current, previous) => {
+  if (current[0] !== previous[0] || current[1] !== previous[1]) resetContentHydrationState()
   cancelScroll()
   ensuredMessageKeys.value = new Set()
   focusedMessageKey.value = null
@@ -895,8 +1210,10 @@ onMounted(() => {
 })
 onUpdated(updateLayout)
 onBeforeUnmount(() => {
+  contentHydrationDisposed = true
   layoutGeneration += 1
   scrollHandoff.value = null
+  resetContentHydrationState()
   window.removeEventListener('storage', syncPreference)
   document.fonts?.removeEventListener('loadingdone', remeasure)
   listRootRef.value?.removeEventListener('focusin', onFocusIn)
@@ -1006,6 +1323,33 @@ function goalOutcomeFor(message: ChatRenderedMessage, index: number): GoalSnapsh
 
 .chat-message-list__row--last {
   padding-bottom: 0;
+}
+
+.chat-history-content-hydration {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.chat-history-content-hydration__button {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.2rem 0.45rem;
+  color: inherit;
+  background: var(--bg-surface);
+  cursor: pointer;
+}
+
+.chat-history-content-hydration__button:disabled {
+  cursor: progress;
+  opacity: 0.7;
+}
+
+.chat-history-content-hydration__error {
+  color: var(--status-warning, var(--text-muted));
 }
 
 .chat-message-list__spacer {

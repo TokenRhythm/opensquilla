@@ -515,6 +515,7 @@ class BackgroundCompletionManager:
         deadline: float | None = None,
     ) -> bool:
         now = asyncio.get_running_loop().time()
+        remaining: float | None
         if deadline is None and timeout is not None:
             deadline = now + timeout + (0.0 if cancel else 5.0)
         self.begin_shutdown(cancel=cancel)

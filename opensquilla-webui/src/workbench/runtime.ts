@@ -103,6 +103,13 @@ export class WorkbenchRuntimeManager {
       if (event.type === 'open') {
         await this.ensureRuntime(event.item, eventEpoch)
       } else if (event.type === 'update') {
+        // Metadata changes must not recreate a suspended document's resources.
+        // Its descriptor is already recorded above for the next activation.
+        // Check inside the queue so an earlier suspend has finished disposing.
+        if (
+          event.item.retention === 'dispose-on-suspend'
+          && !this.runtimes.has(id)
+        ) return
         const runtime = await this.ensureRuntime(event.item, eventEpoch)
         await runtime?.update?.(event.item)
       } else if (event.type === 'activate') {
@@ -208,6 +215,8 @@ export class WorkbenchRuntimeManager {
     options?: WorkbenchBeforeCloseOptions,
   ): Promise<boolean> {
     if (!this.isCurrentDescriptor(item)) return true
+    // Browsers have no source edits to persist; navigation must not block closing a tab.
+    if (item.kind === 'browser') return true
     await this.flush(item.id)
     const runtime = await this.ensureRuntime(item)
     try {

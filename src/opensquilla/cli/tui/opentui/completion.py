@@ -398,7 +398,7 @@ def _skill_candidates(
     candidates: list[CompletionCandidate] = []
     for skill in sorted(skills, key=lambda item: getattr(item, "name", "")):
         if not is_public_ordinary(
-            skill, coding_mode="code-task" not in eligibility.disabled_set
+            skill
         ):
             continue
         name = str(getattr(skill, "name", "")).strip()

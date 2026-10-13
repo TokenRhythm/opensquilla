@@ -7,9 +7,12 @@ const COPY_FEEDBACK_RESET_MS = 1200
 export function useCopyFeedback(copy: () => Promise<boolean>) {
   const copyState = ref<'ok' | 'err' | null>(null)
   let resetTimer: ReturnType<typeof setTimeout> | null = null
+  let copyGeneration = 0
 
   async function onCopyClick() {
+    const generation = ++copyGeneration
     const ok = await copy()
+    if (generation !== copyGeneration) return
     copyState.value = ok ? 'ok' : 'err'
     if (resetTimer) clearTimeout(resetTimer)
     resetTimer = setTimeout(() => {
@@ -18,6 +21,7 @@ export function useCopyFeedback(copy: () => Promise<boolean>) {
   }
 
   onBeforeUnmount(() => {
+    copyGeneration += 1
     if (resetTimer) clearTimeout(resetTimer)
   })
 
