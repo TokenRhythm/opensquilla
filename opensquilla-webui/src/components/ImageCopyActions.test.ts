@@ -4,11 +4,19 @@ import { createApp, h, nextTick, ref, type App } from 'vue'
 import i18n from '@/i18n'
 import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
 import { useNativeSurfaceOcclusionState } from '@/composables/useDialogA11y'
+import * as imageClipboard from '@/utils/imageClipboard'
+import { getIconSvg } from '@/utils/icons'
 import ImageCopyActions from './ImageCopyActions.vue'
 
 const apps: App[] = []
 const artifact = { id: 'vector', name: 'vector.svg', mime: 'image/svg+xml' }
 const xml = '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="8"/>'
+
+function iconMarkup(name: 'copy' | 'check') {
+  const element = document.createElement('span')
+  element.innerHTML = getIconSvg(name, 16)
+  return element.innerHTML
+}
 
 async function mount() {
   const unrelated = ref(0)
@@ -32,9 +40,37 @@ afterEach(() => {
   document.body.innerHTML = ''
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  vi.useRealTimers()
 })
 
 describe('ImageCopyActions', () => {
+  it('shows the check only after clipboard success and restores copy after 1.2 seconds', async () => {
+    vi.useFakeTimers()
+    let finishWrite!: () => void
+    vi.spyOn(imageClipboard, 'writePreparedClipboard').mockImplementation(() => new Promise<void>(resolve => {
+      finishWrite = resolve
+    }))
+    const { host } = await mount()
+    const button = host.querySelector<HTMLButtonElement>('[data-testid="copy-image"]')!
+    expect(button.querySelector('.icon')?.innerHTML).toBe(iconMarkup('copy'))
+    button.click()
+    await nextTick()
+    expect(button.disabled).toBe(true)
+    expect(button.querySelector('.spinner')).not.toBeNull()
+    expect(button.querySelector('.image-copy-actions__success')).toBeNull()
+
+    finishWrite()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(button.disabled).toBe(false)
+    expect(button.querySelector('.icon')?.innerHTML).toBe(iconMarkup('check'))
+    expect(host.querySelector('[role="status"]')?.textContent).toBe(i18n.global.t('imageClipboard.copiedImage'))
+    await vi.advanceTimersByTimeAsync(1199)
+    expect(button.querySelector('.icon')?.innerHTML).toBe(iconMarkup('check'))
+    await vi.advanceTimersByTimeAsync(1)
+    expect(button.querySelector('.icon')?.innerHTML).toBe(iconMarkup('copy'))
+    expect(button.querySelector('.image-copy-actions__success')).toBeNull()
+  })
+
   it('supports the SVG menu keyboard lifecycle across unrelated parent renders', async () => {
     const { host, unrelated } = await mount()
     const more = host.querySelector<HTMLButtonElement>('[data-testid="image-copy-more"]')!
@@ -61,5 +97,6 @@ describe('ImageCopyActions', () => {
     await vi.waitFor(() => expect(host.querySelector('.image-copy-actions')?.getAttribute('data-state')).toBe('error'))
     expect(host.querySelector('[role="status"]')?.textContent).toBe(i18n.global.t('imageClipboard.failed'))
     expect(content.fetchArtifact).not.toHaveBeenCalled()
+    expect(host.querySelector('[data-testid="copy-image"] .icon')?.innerHTML).toBe(iconMarkup('copy'))
   })
 })
