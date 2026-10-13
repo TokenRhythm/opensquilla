@@ -27,6 +27,23 @@ from opensquilla import private_paths, process_tree
 from tests.helpers.owner_registry_probe import write_owner
 
 
+def _simulate_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Keep pathlib, pytest, and other modules on the real host platform.
+    monkeypatch.setattr(
+        process_tree, "os", SimpleNamespace(**{**vars(process_tree.os), "name": "nt"}),
+    )
+
+
+def test_windows_simulation_preserves_host_path_operations(monkeypatch: pytest.MonkeyPatch):
+    host_name = os.name
+    _simulate_windows(monkeypatch)
+
+    assert process_tree.os.name == "nt"
+    assert os.name == host_name
+    helper_path = process_tree.Path(process_tree.__file__).with_name("_windows_owned_launch.py")
+    assert helper_path.is_file()
+
+
 def _synthetic_owner_reference(
     database_path,
     *,
@@ -1565,7 +1582,7 @@ def test_windows_unowned_process_never_attempts_racy_post_spawn_job_assignment(
         pid = 6262
         returncode = None
     proc = Process()
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
 
     owner = process_tree.capture_process_tree_owner(proc, isolated=True)
 
@@ -1616,7 +1633,7 @@ async def test_windows_controlled_launcher_assignment_failure_stops_unreleased_h
         events.append("spawned-helper")
         return process
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(
         process_tree._WindowsLaunchGate,
         "create",
@@ -1678,7 +1695,7 @@ async def test_windows_controlled_launcher_waits_for_helper_ready_before_release
         spawn_kwargs.update(kwargs)
         return Process()
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(
         process_tree._WindowsLaunchGate,
         "create",
@@ -1792,7 +1809,7 @@ def controlled_async_launch(request, tmp_path, monkeypatch):
     monkeypatch.setattr(process_tree.asyncio, "create_subprocess_exec", spawn)
     monkeypatch.setattr(process_tree.ProcessTreeOwner, "start_completion_monitor", lambda _s: None)
     if request.param == "windows":
-        monkeypatch.setattr(process_tree.os, "name", "nt")
+        _simulate_windows(monkeypatch)
 
     async def launch():
         with process_tree.task_process_scope(
@@ -2190,7 +2207,7 @@ async def test_windows_named_job_is_persisted_before_target_release(
         events.append("owner-persisted")
         return reference
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(
         process_tree._WindowsLaunchGate,
         "create",
@@ -2258,7 +2275,7 @@ async def test_windows_async_helper_ready_timeout_fails_closed(
     async def fake_spawn(*_argv: str, **_kwargs: object) -> Process:
         return Process()
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(
         process_tree._WindowsLaunchGate,
         "create",
@@ -2330,7 +2347,7 @@ async def test_windows_launch_cancellation_cleans_before_reraising_same_exceptio
     async def spawn(*_argv: str, **_kwargs: object) -> Process:
         return Process()
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(
         process_tree._WindowsLaunchGate,
         "create",
@@ -2403,7 +2420,7 @@ def test_windows_sync_launcher_waits_for_helper_ready_before_release(
         spawn_kwargs.update(kwargs)
         return Process()
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(
         process_tree._WindowsLaunchGate,
         "create",
@@ -2476,7 +2493,7 @@ def test_windows_sync_helper_ready_timeout_fails_closed(
             events.append("waited")
             return -15
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(
         process_tree._WindowsLaunchGate,
         "create",
@@ -2590,7 +2607,7 @@ async def test_windows_launch_failure_diagnostics_preserve_cleanup_and_privacy(
         if diagnostics == "logger-fails":
             raise RuntimeError(secret)
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(process_tree.sys, "frozen", False, raising=False)
     monkeypatch.setenv("OPENSQUILLA_STALL_DIAGNOSTICS", "0" if diagnostics == "off" else "1")
     monkeypatch.setattr(process_tree, "_current_task_process_scope", lambda: object())
@@ -3357,7 +3374,7 @@ def test_windows_owner_registry_classifies_only_known_sharing_failures(
         0,
         "synthetic DACL verification race",
     )
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
 
     assert process_tree._is_transient_owner_registry_write_error(transient) is True
     assert process_tree._is_transient_owner_registry_write_error(dacl_verification) is True
@@ -3384,7 +3401,7 @@ def test_windows_registry_retries_only_transient_file_sharing_failures(
             error.winerror = 32
             raise error
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(process_tree, "_prepare_private_file_once", prepare)
     monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
 
@@ -3407,7 +3424,7 @@ def test_windows_registry_retries_main_file_identity_change(
                 "task process owner registry changed during privacy hardening"
             )
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(process_tree, "_prepare_private_file_once", prepare)
     monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
 
@@ -3428,7 +3445,7 @@ def test_windows_registry_retries_disappearing_main_file(
         if attempts < 3:
             raise FileNotFoundError("synthetic first-writer cleanup race")
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(process_tree, "_prepare_private_file_once", prepare)
     monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
 
@@ -3474,7 +3491,7 @@ def test_windows_registry_retries_main_file_identity_change_before_acl(
         assert (current.st_dev, current.st_ino) != (expected_device, expected_inode)
         raise OSError("synthetic bound path changed")
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_before_bind)
     monkeypatch.setattr(process_tree.time, "sleep", delays.append)
 
@@ -3515,7 +3532,7 @@ def test_windows_registry_rejects_nonregular_replacement_before_acl(
         path.mkdir()
         raise OSError("synthetic unsafe replacement")
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_before_bind)
     monkeypatch.setattr(process_tree.time, "sleep", delays.append)
 
@@ -3541,7 +3558,7 @@ def test_windows_registry_main_file_identity_churn_remains_fail_closed(
             "task process owner registry changed during privacy hardening"
         )
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(process_tree, "_prepare_private_file_once", prepare)
     monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
 
@@ -3578,7 +3595,7 @@ def test_windows_registry_retries_transient_directory_acl_sharing_failures(
             error.winerror = 32
             raise error
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(process_tree, "apply_windows_private_dacl", apply_acl)
     monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
 
@@ -3612,7 +3629,7 @@ def test_windows_registry_retries_sidecar_identity_change(
             replacement.write_bytes(b"replacement")
             os.replace(replacement, sidecar)
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_once)
     monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
 
@@ -3639,7 +3656,7 @@ def test_windows_registry_retries_sidecar_dacl_verification_race(
                 "synthetic DACL verification race",
             )
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(process_tree, "apply_windows_private_dacl", verify_dacl)
     monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
 
@@ -3671,7 +3688,7 @@ def test_windows_registry_retries_sidecar_identity_change_before_acl(
             os.replace(replacement, sidecar)
             raise OSError("synthetic bound path changed")
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_then_fail)
     monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
 
@@ -3702,7 +3719,7 @@ def test_windows_registry_sidecar_identity_change_remains_fail_closed(
         replacement.write_bytes(str(attempts).encode())
         os.replace(replacement, sidecar)
 
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_always)
     monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
 
@@ -3765,7 +3782,7 @@ def test_windows_owner_registry_file_acl_failure_is_fail_closed(
         database_path.write_bytes(b"synthetic-existing-registry")
     attempts = 0
     delays: list[float] = []
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
 
     def fail_file_acl(
         *_args: object,
@@ -3800,7 +3817,7 @@ def test_windows_new_private_directory_acl_failure_removes_empty_directory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state_dir = tmp_path / "synthetic-runtime-state"
-    monkeypatch.setattr(process_tree.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(
         process_tree,
         "create_windows_private_directory",
