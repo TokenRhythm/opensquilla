@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 
@@ -66,16 +67,36 @@ def test_frozen_renderer_requires_its_separate_python_environment(
         legacy.render()
 
 
-def test_frozen_renderer_rejects_current_python_even_in_the_legacy_location(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("installed", ["0.75.1", "0.82.0"])
+def test_frozen_renderer_rejects_unverified_python_in_the_legacy_location(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installed: str,
 ) -> None:
     executable = tmp_path / "python"
     executable.touch()
     monkeypatch.setattr(legacy, "LEGACY_PYTHON", executable)
-    monkeypatch.setattr(legacy, "_capture", lambda *args, **kwargs: "0.81.0\n")
+    monkeypatch.setattr(legacy, "_capture", lambda *args, **kwargs: installed + "\n")
     monkeypatch.setattr(legacy, "_run", lambda *args, **kwargs: pytest.fail("must not generate"))
-    with pytest.raises(RuntimeError, match="Frozen Python generator must be 0.75.1"):
+    with pytest.raises(RuntimeError, match="Frozen Python generator must be 0.81.0"):
         legacy.render()
+
+
+def test_frozen_codegen_group_contains_only_the_verified_patched_python_generator() -> None:
+    assert runner.LEGACY_TYPE_CODEGEN["python"]["version"] == (
+        legacy.PYTHON_GENERATOR_VERSION
+    ) == "0.81.0"
+    project = tomllib.loads((runner.ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert project["dependency-groups"]["legacy-contract-codegen"] == [
+        "datamodel-code-generator==0.81.0"
+    ]
+    lock = tomllib.loads((runner.ROOT / "uv.lock").read_text(encoding="utf-8"))
+    assert {
+        package["version"]
+        for package in lock["package"]
+        if package["name"] == "datamodel-code-generator"
+    } == {"0.81.0"}
+    assert project["tool"]["uv"]["conflicts"] == [
+        [{"group": "dev"}, {"group": "legacy-contract-codegen"}]
+    ]
 
 
 def test_frozen_renderer_rejects_missing_or_substituted_npm_alias(
@@ -86,7 +107,7 @@ def test_frozen_renderer_rejects_missing_or_substituted_npm_alias(
     alias = tmp_path / "json-schema-to-typescript-legacy"
     monkeypatch.setattr(legacy, "LEGACY_PYTHON", executable)
     monkeypatch.setattr(legacy, "LEGACY_TYPESCRIPT_PACKAGE", alias)
-    monkeypatch.setattr(legacy, "_capture", lambda *args, **kwargs: "0.75.1\n")
+    monkeypatch.setattr(legacy, "_capture", lambda *args, **kwargs: "0.81.0\n")
     monkeypatch.setattr(legacy, "_run", lambda *args, **kwargs: pytest.fail("must not generate"))
     with pytest.raises(FileNotFoundError):
         legacy.render()

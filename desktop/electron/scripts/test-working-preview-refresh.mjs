@@ -35,10 +35,10 @@ function fixture({ immutable = false } = {}) {
     annotationPickerActive: false, annotationCandidate: null, annotationFallbackActive: false,
     annotationFocusTimer: null, annotationDocumentGeneration: 1, pendingPermissions: new Map(),
     pendingAuthentication: null, browserDocumentReady: true, browserNavigationStopped: false,
-    view: { webContents: {
+    contents: {
       isDestroyed: () => false, isLoading: () => false,
       reload() { reloads++; record.annotationDocumentGeneration++; record.browserDocumentReady = true },
-    } },
+    },
     previewSession: { async fetch(_url, options) {
       heads++
       if (fetchOverride) return await fetchOverride(options)
@@ -98,7 +98,7 @@ function fixture({ immutable = false } = {}) {
 for (const immutable of [false, true]) {
   const f = fixture({ immutable })
   // loadURL resolves at did-finish-load, before isLoading necessarily clears.
-  f.record.view.webContents.isLoading = () => true
+  f.record.contents.isLoading = () => true
   await f.manager.watchWorkingPreview(f.record)
   assert.equal(f.heads, 1, 'a ready hidden document must receive its initial classification')
   assert.equal(f.record.revisionKind, immutable ? 'immutable' : 'working')
@@ -116,7 +116,7 @@ for (const immutable of [false, true]) {
 {
   const f = fixture()
   f.record.browserDocumentReady = false
-  f.record.view.webContents.isLoading = () => true
+  f.record.contents.isLoading = () => true
   await f.manager.watchWorkingPreview(f.record)
   assert.equal(f.heads, 0, 'a document that is not ready must not classify while loading')
   assert.equal(f.record.revisionKind, 'unknown')
@@ -126,7 +126,7 @@ for (const immutable of [false, true]) {
 
 for (const interrupt of ['navigate', 'dispose', 'stop']) {
   const f = fixture({ immutable: true })
-  f.record.view.webContents.isLoading = () => true
+  f.record.contents.isLoading = () => true
   let release
   f.fetch = () => new Promise(resolve => { release = resolve })
   const watching = f.manager.watchWorkingPreview(f.record)

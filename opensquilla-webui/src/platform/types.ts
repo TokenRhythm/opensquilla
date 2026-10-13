@@ -287,6 +287,7 @@ export interface NativeWorkbenchCreateUrlSurfaceRequestV2 {
   payload: {
     url: string
     scopeId: string
+    contextTargetRef?: string
   }
 }
 
@@ -298,6 +299,7 @@ export type NativeWorkbenchCreateSurfaceRequest =
 export interface NativeWorkbenchCapabilities {
   protocolVersions: Array<NativeWorkbenchProtocolVersion>
   modes: WorkbenchPreviewMode[]
+  navigationActions?: NativeWorkbenchNavigateRequest['action'][]
   /** Reported only by older desktop hosts that impose a surface count limit. */
   maxSurfaces?: number
 }
@@ -395,6 +397,9 @@ export type NativeWorkbenchSurfaceEventType =
   | 'ready'
   | 'missing-resource'
   | 'navigation-state'
+  | 'find-requested'
+  | 'find-state'
+  | 'download-state'
   | 'permission-request'
   | 'blocked-action'
   | 'capability-expired'
@@ -426,6 +431,16 @@ export interface NativeWorkbenchSurfaceEvent {
     navigationError?: { url: string; code: string; errorCode?: number; message: string } | null
     canGoBack?: boolean
     canGoForward?: boolean
+    findQuery?: string
+    findMatches?: number
+    findActiveMatch?: number
+    findFinal?: boolean
+    zoomFactor?: number
+    downloadId?: string
+    downloadName?: string
+    downloadState?: 'progressing' | 'completed' | 'cancelled' | 'interrupted'
+    receivedBytes?: number
+    totalBytes?: number
     action?: string
     code?: string
     surfaceInstanceId?: string
@@ -443,8 +458,13 @@ export interface NativeWorkbenchSurfaceEvent {
 export interface NativeWorkbenchNavigateRequest {
   version: NativeWorkbenchInteractiveProtocolVersion
   surfaceId: string
-  action: 'back' | 'forward' | 'reload' | 'stop' | 'navigate'
+  action: 'back' | 'forward' | 'reload' | 'stop' | 'navigate' | 'open-external' | 'close'
+    | 'find' | 'find-next' | 'find-stop' | 'zoom' | 'download-open'
   url?: string
+  query?: string
+  forward?: boolean
+  zoomFactor?: number
+  downloadId?: string
 }
 
 export interface NativeWorkbenchPermissionResponse {

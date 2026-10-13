@@ -469,7 +469,7 @@ await withBudget(async budget => {
     setAppExitPhase() {}, setQuitStatus() {}, desktopT: key => key,
     publishGatewayConnection() {},
     artifactPreviewLeaseBroker: { shutdown: async () => {} },
-    nativeWorkbenchSurfaces: { destroyAll: async () => {} },
+    nativeWorkbenchSurfaces: { hasBrowserTabs: () => false, destroyAll: async () => {} },
     quitOwnedGateway: async value => { assert.equal(value, child); calls.push('cleanup'); return false },
     dialog: { showErrorBox: title => calls.push(title) },
     app: { exit: () => assert.fail('an unconfirmed scope must retain the desktop') },

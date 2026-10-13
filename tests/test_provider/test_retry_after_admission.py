@@ -331,20 +331,33 @@ async def test_internal_timeout_is_not_parent_expiration(cooling):
 
 
 async def test_actual_parent_deadline_expires_during_wait():
-    registry = ProviderRetryAfterCooldowns()
+    cooling_now = time.monotonic()
+    # Keep the admission hint active while the real parent deadline expires.
+    registry = ProviderRetryAfterCooldowns(clock=lambda: cooling_now)
     provider = []
     registry.record(provider, 0.005)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
 
     async def blocked(_seconds):
-        await asyncio.Event().wait()
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
 
-    with pytest.raises(RetryAfterWaitTimeoutError):
+    deadline = time.monotonic() + 0.025
+    with pytest.raises(RetryAfterWaitTimeoutError) as caught:
         async for _ in registry.wait(
             provider,
-            deadline_at_monotonic=time.monotonic() + 0.025,
+            deadline_at_monotonic=deadline,
             sleep=blocked,
         ):
             pass
+    assert entered.is_set()
+    assert cancelled.is_set()
+    assert caught.value.deadline_at_monotonic == deadline
 
 
 @pytest.mark.parametrize("status", ["429", "503"])

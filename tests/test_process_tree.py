@@ -1382,18 +1382,18 @@ def test_posix_ps_snapshot_failures_never_report_group_empty(
     returncode: int,
     stdout: str,
 ) -> None:
+    monkeypatch.setattr(process_tree.sys, "platform", "freebsd")
     monkeypatch.setattr(process_tree.os.path, "isdir", lambda _path: False)
-    monkeypatch.setattr(process_tree.sys, "platform", "other-posix")
-    monkeypatch.setattr(
-        process_tree.subprocess,
-        "run",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            returncode=returncode,
-            stdout=stdout,
-        ),
-    )
+    calls: list[tuple[object, ...]] = []
+
+    def run_ps(*args: object, **_kwargs: object) -> SimpleNamespace:
+        calls.append(args)
+        return SimpleNamespace(returncode=returncode, stdout=stdout)
+
+    monkeypatch.setattr(process_tree.subprocess, "run", run_ps)
 
     assert process_tree._posix_group_members(123) is None
+    assert len(calls) == 1
 
 
 def test_posix_proc_skipped_read_never_reports_group_empty(

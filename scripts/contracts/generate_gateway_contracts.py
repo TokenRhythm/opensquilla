@@ -70,6 +70,17 @@ LEGACY_SCHEMA_CODEGEN = {
     "runtimeValidation": {"tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only"},
 }
 
+# Active tools may receive security patches only while the frozen type bodies
+# and historical schema metadata remain unchanged.
+LEGACY_TYPE_CODEGEN = {
+    "python": {
+        "tool": "datamodel-code-generator",
+        "version": "0.81.0",
+        "target": "pydantic_v2.BaseModel",
+    },
+    "typescript": {"tool": "json-schema-to-typescript", "version": "15.0.4"},
+}
+
 # Exact-output compatibility seam.  Remove an entry only in the PR that
 # intentionally regenerates and reviews that Contract's complete wire surface.
 LEGACY_GENERATORS = {
@@ -1566,7 +1577,7 @@ def render_legacy(spec: ContractSpec) -> dict[Path, str]:
     def portable_run(command: list[str], *, env: dict[str, str]) -> None:
         legacy_run(_resolved_command(command), env=env)
 
-    # Keep the historical generator byte-for-byte stable while making its
+    # Preserve the frozen type bodies while making the compatibility generator's
     # npm invocation work on Windows, where the executable is npm.cmd.
     legacy._run = portable_run
     rendered = legacy.render()
@@ -1689,7 +1700,7 @@ def render_compatibility_manifest(specs: tuple[ContractSpec, ...]) -> str:
             "toolchains": {
                 "ordinaryTypes": {key: PINNED_CODEGEN[key] for key in ("python", "typescript")},
                 "legacyTypes": {
-                    key: LEGACY_SCHEMA_CODEGEN[key] for key in ("python", "typescript")
+                    key: LEGACY_TYPE_CODEGEN[key] for key in ("python", "typescript")
                 },
                 "runtimeValidation": PINNED_CODEGEN["runtimeValidation"],
             },

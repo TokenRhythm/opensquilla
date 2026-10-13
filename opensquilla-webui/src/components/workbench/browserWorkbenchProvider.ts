@@ -19,7 +19,13 @@ import BrowserPreviewPanel from './BrowserPreviewPanel.vue'
 
 interface BrowserAction {
   action: 'back' | 'forward' | 'reload' | 'stop' | 'navigate' | 'open-external'
+    | 'find-open' | 'find-close' | 'find' | 'find-next' | 'find-stop' | 'zoom' | 'download-open'
   url?: string
+  query?: string
+  forward?: boolean
+  zoomFactor?: number
+  downloadId?: string
+  addressRequestId?: string
 }
 
 export interface BrowserWorkbenchProviderOptions {
@@ -38,20 +44,36 @@ function browserAction(event: WorkbenchComponentEvent): BrowserAction | null {
   }
   const raw = event.payload as Record<string, unknown>
   const action = raw.action
-  if (!['back', 'forward', 'reload', 'stop', 'navigate', 'open-external'].includes(
+  if (!['back', 'forward', 'reload', 'stop', 'navigate', 'open-external',
+    'find-open', 'find-close', 'find', 'find-next', 'find-stop', 'zoom', 'download-open'].includes(
     String(action),
   )) return null
   return {
     action: action as BrowserAction['action'],
     ...(typeof raw.url === 'string' ? { url: raw.url } : {}),
+    ...(typeof raw.query === 'string' && raw.query.length <= 512 ? { query: raw.query } : {}),
+    ...(typeof raw.forward === 'boolean' ? { forward: raw.forward } : {}),
+    ...(typeof raw.zoomFactor === 'number' && Number.isFinite(raw.zoomFactor)
+      && raw.zoomFactor >= 0.5 && raw.zoomFactor <= 3 ? { zoomFactor: raw.zoomFactor } : {}),
+    ...(typeof raw.downloadId === 'string' && /^download-[0-9a-f-]{36}$/.test(raw.downloadId)
+      ? { downloadId: raw.downloadId } : {}),
+    ...(typeof raw.addressRequestId === 'string'
+      && /^browser-address-[a-z0-9-]{1,64}$/i.test(raw.addressRequestId)
+      ? { addressRequestId: raw.addressRequestId } : {}),
   }
+}
+
+function isReadingAction(action: BrowserAction['action']): boolean {
+  return ['find', 'find-next', 'find-stop', 'zoom', 'download-open'].includes(action)
 }
 
 class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
   private created = false
   private adoptOnInitialize: boolean
   private item: WorkbenchItem
+  private rejectedContextTargetRef = ''
   private rect: NativeSurfaceRect | null = null
+  private addressNavigationGeneration = 0
 
   constructor(
     item: WorkbenchItem,
@@ -66,6 +88,20 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
       currentUrl: browserUrlFromWorkbenchItem(item),
       errorMessage: '',
       loading: true,
+      findOpen: false,
+      findFocusSequence: 0,
+      findQuery: '',
+      findMatches: null,
+      findActiveMatch: 0,
+      zoomFactor: 1,
+      downloadId: '',
+      downloadName: '',
+      downloadState: '',
+      downloadReceivedBytes: 0,
+      downloadTotalBytes: 0,
+      controlError: '',
+      navigationAddressSequence: 0,
+      navigationAddressRequestId: '',
     })
   }
 
@@ -84,15 +120,26 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
       }
       const url = browserUrlFromWorkbenchItem(this.item)
       if (!adopt) {
-        const result = await native.createSurface({
+        const contextTargetRef = typeof this.item.payload.contextTargetRef === 'string'
+          ? this.item.payload.contextTargetRef : ''
+        const scopeId = this.item.scope.type === 'session' ? this.item.scope.id : 'app'
+        let result = await native.createSurface({
           version: 2,
           surfaceId: this.item.id,
           kind: 'url-preview',
           payload: {
             url,
-            scopeId: this.item.scope.type === 'session' ? this.item.scope.id : 'app',
+            scopeId,
+            ...(contextTargetRef ? { contextTargetRef } : {}),
           },
         })
+        if (!result.ok && result.code === 'TARGET_NOT_FOUND' && contextTargetRef) {
+          this.rejectedContextTargetRef = contextTargetRef
+          const { contextTargetRef: _stale, ...payload } = this.item.payload
+          this.item = { ...this.item, payload }
+          result = await native.createSurface({ version: 2, surfaceId: this.item.id,
+            kind: 'url-preview', payload: { url, scopeId } })
+        }
         if (!result.ok) {
           throw new Error(result.message || 'Could not open the side browser.')
         }
@@ -114,6 +161,12 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
   }
 
   update(item: WorkbenchItem) {
+    if (this.rejectedContextTargetRef
+      && item.payload.contextTargetRef === this.rejectedContextTargetRef) {
+      const { contextTargetRef: _stale, ...payload } = item.payload
+      this.item = { ...item, payload }
+      return
+    }
     this.item = item
   }
 
@@ -121,8 +174,28 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
     const request = browserAction(event)
     if (!request) return
     const native = this.context.nativeWorkbenchApi
+    if (request.action === 'find-open') {
+      this.requestFindFocus()
+      return
+    }
+    if (request.action === 'find-close') {
+      this.context.updateRenderState({ findOpen: false, findQuery: '', findMatches: null,
+        findActiveMatch: 0, controlError: '' })
+    }
+    const action = request.action === 'find-close' ? 'find-stop' : request.action
+    if (action === 'find' && request.query === undefined) return
+    if (action === 'find-next' && !String(this.context.getRenderState().findQuery || '')) return
+    if (action === 'zoom' && request.zoomFactor === undefined) return
+    if (action === 'download-open' && request.downloadId === undefined) return
+    if (action === 'find') {
+      this.context.updateRenderState({ findQuery: request.query, findMatches: null,
+        findActiveMatch: 0, controlError: '' })
+    } else if (action === 'find-stop') {
+      this.context.updateRenderState({ findQuery: '', findMatches: null,
+        findActiveMatch: 0, controlError: '' })
+    }
     if (
-      request.action === 'reload'
+      action === 'reload'
       && Boolean(this.context.getRenderState().errorMessage)
       && !this.created
     ) {
@@ -132,22 +205,43 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
       await this.initialize()
       return
     }
-    if (!native?.navigateSurface) return
-    if (request.action === 'open-external') {
+    if (action === 'open-external') {
       const current = String(this.context.getRenderState().currentUrl || '')
       if (normalizeBrowserUrl(current)) this.options.openExternal(current)
       return
     }
-    const url = request.action === 'navigate' ? normalizeBrowserUrl(request.url || '') : ''
-    if (request.action === 'navigate' && !url) return
+    if (!native?.navigateSurface) {
+      if (isReadingAction(action)) this.context.updateRenderState({
+        controlError: this.options.t('workbench.browser.controlUnavailable'),
+      })
+      return
+    }
+    const url = action === 'navigate' ? normalizeBrowserUrl(request.url || '') : ''
+    if (action === 'navigate' && !url) return
+    const addressGeneration = action === 'navigate'
+      ? ++this.addressNavigationGeneration : this.addressNavigationGeneration
     try {
       const result = await native.navigateSurface({
         version: 2,
         surfaceId: this.item.id,
-        action: request.action,
+        action,
         ...(url ? { url } : {}),
+        ...(action === 'find' ? { query: request.query } : {}),
+        ...(action === 'find-next' ? { forward: request.forward !== false } : {}),
+        ...(action === 'zoom' ? { zoomFactor: request.zoomFactor } : {}),
+        ...(action === 'download-open' ? { downloadId: request.downloadId } : {}),
       })
       if (!result.ok) {
+        if (result.code === 'NAVIGATION_CANCELLED') {
+          this.context.updateRenderState({ loading: false, errorMessage: '', controlError: '' })
+          if (action === 'navigate') this.finishAddressNavigation(request, addressGeneration)
+          return
+        }
+        if (isReadingAction(action)) {
+          this.context.updateRenderState({ controlError: result.message
+            || this.options.t('workbench.browser.controlUnavailable') })
+          return
+        }
         if (result.navigationError) {
           this.showNavigationFailure(result.navigationError.message, result.navigationError.url)
           return
@@ -159,8 +253,19 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
         }
         throw error
       }
-      this.context.updateRenderState({ errorMessage: '' })
+      if (isReadingAction(action)) {
+        this.context.updateRenderState({ controlError: '',
+          ...(action === 'zoom' ? { zoomFactor: request.zoomFactor } : {}) })
+      } else {
+        this.context.updateRenderState({ errorMessage: '', controlError: '' })
+        if (action === 'navigate') this.finishAddressNavigation(request, addressGeneration)
+      }
     } catch (error) {
+      if (isReadingAction(action)) {
+        this.context.updateRenderState({ controlError: error instanceof Error ? error.message
+          : this.options.t('workbench.browser.controlUnavailable') })
+        return
+      }
       this.showNavigationFailure(error instanceof Error ? error.message : this.options.t('workbench.browser.failedDetail'))
       if (this.rect) await this.setRect({ ...this.rect, visible: false })
     }
@@ -169,7 +274,43 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
   async handleNativeSurfaceEvent(event: NativeWorkbenchSurfaceEvent) {
     if (!this.created) return
     if (event.type === 'escape') {
+      if (this.context.getRenderState().findOpen === true) {
+        await this.handleComponentEvent({ type: 'browser-action', payload: { action: 'find-close' } })
+        return
+      }
       this.context.setExpanded(false)
+      return
+    }
+    if (event.type === 'find-requested') {
+      if (this.context.isItemActive?.() === false) return
+      this.requestFindFocus()
+      return
+    }
+    if (event.type === 'find-state') {
+      const detail = event.detail
+      const currentQuery = String(this.context.getRenderState().findQuery || '')
+      if (detail?.zoomFactor !== undefined) {
+        this.context.updateRenderState({ zoomFactor: detail.zoomFactor })
+      }
+      if (detail?.findQuery !== undefined && detail.findQuery !== currentQuery) return
+      if (detail?.findMatches !== undefined || detail?.findActiveMatch !== undefined) {
+        this.context.updateRenderState({
+          ...(detail.findMatches !== undefined ? { findMatches: detail.findMatches } : {}),
+          ...(detail.findActiveMatch !== undefined ? { findActiveMatch: detail.findActiveMatch } : {}),
+        })
+      }
+      return
+    }
+    if (event.type === 'download-state') {
+      const detail = event.detail
+      if (!detail?.downloadId || !detail.downloadState) return
+      const currentId = String(this.context.getRenderState().downloadId || '')
+      if (detail.downloadState === 'progressing' || detail.downloadId === currentId) {
+        this.context.updateRenderState({ downloadId: detail.downloadId,
+          downloadName: detail.downloadName || '', downloadState: detail.downloadState,
+          downloadReceivedBytes: detail.receivedBytes || 0,
+          downloadTotalBytes: detail.totalBytes || 0 })
+      }
       return
     }
     if (event.type === 'loading') {
@@ -181,12 +322,15 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
       return
     }
     if (event.type === 'navigation-state') {
+      const changedPage = Boolean(event.detail?.url
+        && event.detail.url !== this.context.getRenderState().currentUrl)
       this.context.updateRenderState({
         canGoBack: event.detail?.canGoBack === true,
         canGoForward: event.detail?.canGoForward === true,
         currentUrl: event.detail?.url || '',
         loading: event.detail?.loading === true,
         pageTitle: event.detail?.title || '',
+        ...(changedPage ? { findMatches: null, findActiveMatch: 0 } : {}),
         ...(event.detail?.navigationError !== undefined
           ? { errorMessage: event.detail.navigationError?.message || '' } : {}),
       })
@@ -196,7 +340,7 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
       const requestId = event.detail?.requestId || ''
       const native = this.context.nativeWorkbenchApi
       if (!requestId || !native?.respondToPermission) return
-      const allow = await this.options.confirmPermission({
+      const allow = this.context.isItemActive?.() === false ? false : await this.options.confirmPermission({
         permission: event.detail?.permission || 'unknown',
         requestingOrigin: event.detail?.requestingOrigin || '',
       })
@@ -204,7 +348,7 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
         version: 2,
         surfaceId: this.item.id,
         requestId,
-        allow,
+        allow: allow && this.context.isItemActive?.() !== false,
       })
       return
     }
@@ -224,6 +368,22 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
   async handleSurfaceRect(rect: NativeSurfaceRect) {
     this.rect = rect
     await this.syncRect()
+  }
+
+  private requestFindFocus() {
+    this.context.updateRenderState({
+      findOpen: true,
+      findFocusSequence: Number(this.context.getRenderState().findFocusSequence || 0) + 1,
+      controlError: '',
+    })
+  }
+
+  private finishAddressNavigation(request: BrowserAction, generation: number) {
+    if (generation !== this.addressNavigationGeneration) return
+    this.context.updateRenderState({
+      navigationAddressSequence: Number(this.context.getRenderState().navigationAddressSequence || 0) + 1,
+      navigationAddressRequestId: request.addressRequestId || '',
+    })
   }
 
   async suspend() {
@@ -329,6 +489,21 @@ export function createBrowserWorkbenchDefinition(
       currentUrl: String(state.runtimeState.currentUrl || ''),
       errorMessage: String(state.runtimeState.errorMessage || ''),
       loading: state.runtimeState.loading === true,
+      findOpen: state.runtimeState.findOpen === true,
+      findFocusSequence: Number(state.runtimeState.findFocusSequence || 0),
+      findQuery: String(state.runtimeState.findQuery || ''),
+      findMatches: typeof state.runtimeState.findMatches === 'number'
+        ? state.runtimeState.findMatches : null,
+      findActiveMatch: Number(state.runtimeState.findActiveMatch || 0),
+      zoomFactor: Number(state.runtimeState.zoomFactor || 1),
+      downloadId: String(state.runtimeState.downloadId || ''),
+      downloadName: String(state.runtimeState.downloadName || ''),
+      downloadState: String(state.runtimeState.downloadState || ''),
+      downloadReceivedBytes: Number(state.runtimeState.downloadReceivedBytes || 0),
+      downloadTotalBytes: Number(state.runtimeState.downloadTotalBytes || 0),
+      controlError: String(state.runtimeState.controlError || ''),
+      navigationAddressSequence: Number(state.runtimeState.navigationAddressSequence || 0),
+      navigationAddressRequestId: String(state.runtimeState.navigationAddressRequestId || ''),
     }),
     async createRuntime(item, context) {
       const runtime = new BrowserWorkbenchRuntime(item, context, options)

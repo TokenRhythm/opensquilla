@@ -63,7 +63,7 @@ const env = {
   setAppExitPhase: phase => { statuses.push(phase) },
   setQuitStatus: key => { statuses.push(key) },
   artifactPreviewLeaseBroker: { shutdown: async () => {} },
-  nativeWorkbenchSurfaces: { destroyAll: async () => {} },
+  nativeWorkbenchSurfaces: { hasBrowserTabs: () => false, destroyAll: async () => {} },
   quitOwnedGateway: async value => {
     assert.equal(value, child)
     assert.equal(rootExited, false, 'Never retry an exited root PID.')

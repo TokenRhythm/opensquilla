@@ -1002,6 +1002,9 @@ async def test_new_task_copies_independent_plan_lineages(
         } == {first.revision_id, second.revision_id}
 
 
+# This exercises real SQLite activation before its bounded handler-entry wait.
+# Run it without other CI workers competing for disk and executor time.
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_explicit_implement_mode_is_pinned_at_queued_execution_boundary(
     tmp_path: Path,

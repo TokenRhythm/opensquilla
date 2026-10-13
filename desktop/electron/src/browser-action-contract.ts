@@ -1,5 +1,20 @@
 import type { DesktopBrowserAction, DesktopBrowserRequest } from './desktop-browser.js'
 
+export const BROWSER_PROMPT_MAX_LENGTH = 16_384
+
+/** JSON Schema maxLength counts Unicode code points, including astral characters. */
+export function isBrowserPromptTextWithinLimit(value: string): boolean {
+  if (value.length > BROWSER_PROMPT_MAX_LENGTH * 2) return false
+  let count = 0
+  for (const _character of value) if (++count > BROWSER_PROMPT_MAX_LENGTH) return false
+  return true
+}
+
+export function truncateBrowserPromptText(value: string): string {
+  return Array.from(value.slice(0, BROWSER_PROMPT_MAX_LENGTH * 2))
+    .slice(0, BROWSER_PROMPT_MAX_LENGTH).join('')
+}
+
 type JsonObject = Record<string, unknown>
 type FieldDefinition = {
   type: 'string' | 'number' | 'integer' | 'boolean' | 'array'
@@ -48,7 +63,8 @@ const fields = {
   ref: identity(), downloadId: identity(), maxChars: { type: 'integer', minimum: 1, maximum: 65536 },
   observationMode: { type: 'string', enum: ['auto', 'dom'], description: 'auto includes a viewport image when capture is available; dom returns text only.' },
   actions: { type: 'array', minItems: 1, maxItems: 3 },
-  dialogId: identity(), accept: { type: 'boolean' }, promptText: text(),
+  dialogId: identity(), accept: { type: 'boolean' }, promptText: { ...text(),
+    maxLength: BROWSER_PROMPT_MAX_LENGTH, description: 'Prompt response, at most 16384 Unicode code points.' },
   tabAction: { type: 'string', enum: ['switch', 'close'] },
   action: { type: 'string', enum: actionNames }, text: text(), key: identity(40),
   direction: { type: 'string', enum: ['up', 'down', 'left', 'right'] },
@@ -115,7 +131,8 @@ function read(body: JsonObject, field: Field, prefix = ''): unknown {
     if (typeof value !== 'boolean') fail(location, 'type', 'boolean')
   } else {
     if (typeof value !== 'string') fail(location, 'type', 'string')
-    if (value.length < (spec.minLength ?? 0) || value.length > (spec.maxLength ?? Infinity)) fail(location, 'range', 'within_bounds')
+    if (value.length < (spec.minLength ?? 0) || (field === 'promptText'
+      ? !isBrowserPromptTextWithinLimit(value) : value.length > (spec.maxLength ?? Infinity))) fail(location, 'range', 'within_bounds')
     if (spec.characters === 'identity' && /[\u0000-\u001f\u007f]/.test(value)
       || spec.characters === 'text' && value.includes('\0')) fail(location, 'range', 'within_bounds')
     if (spec.enum && !spec.enum.includes(value)) fail(location, 'enum', 'supported_value')

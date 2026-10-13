@@ -10,6 +10,7 @@ import type {
   DesktopUpdateStatus,
   NativeWorkbenchApi,
   NativeWorkbenchCapabilities,
+  NativeWorkbenchNavigateRequest,
   NativeWorkbenchSurfaceEvent,
   NativeWorkbenchSurfaceEventType,
   Platform,
@@ -102,6 +103,9 @@ const NATIVE_SURFACE_EVENT_TYPES = new Set<NativeWorkbenchSurfaceEventType>([
   'ready',
   'missing-resource',
   'navigation-state',
+  'find-requested',
+  'find-state',
+  'download-state',
   'permission-request',
   'blocked-action',
   'capability-expired',
@@ -207,7 +211,8 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
   const detail = rawDetail
     ? {
         ...(typeof rawDetail.message === 'string' ? { message: rawDetail.message } : {}),
-        ...(typeof rawDetail.path === 'string' ? { path: rawDetail.path } : {}),
+        ...(raw.type !== 'download-state' && typeof rawDetail.path === 'string'
+          ? { path: rawDetail.path } : {}),
         ...(typeof rawDetail.reason === 'string' ? { reason: rawDetail.reason } : {}),
         ...(annotationId ? { annotationId } : {}),
         ...(body !== undefined ? { body } : {}),
@@ -232,6 +237,31 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
         ...(typeof rawDetail.canGoForward === 'boolean'
           ? { canGoForward: rawDetail.canGoForward }
           : {}),
+        ...(typeof rawDetail.findQuery === 'string' && rawDetail.findQuery.length <= 512
+          ? { findQuery: rawDetail.findQuery } : {}),
+        ...(typeof rawDetail.findMatches === 'number' && Number.isSafeInteger(rawDetail.findMatches)
+          && rawDetail.findMatches >= 0
+          ? { findMatches: rawDetail.findMatches } : {}),
+        ...(typeof rawDetail.findActiveMatch === 'number' && Number.isSafeInteger(rawDetail.findActiveMatch)
+          && rawDetail.findActiveMatch >= 0
+          ? { findActiveMatch: rawDetail.findActiveMatch } : {}),
+        ...(typeof rawDetail.findFinal === 'boolean' ? { findFinal: rawDetail.findFinal } : {}),
+        ...(typeof rawDetail.zoomFactor === 'number' && Number.isFinite(rawDetail.zoomFactor)
+          && rawDetail.zoomFactor >= 0.5 && rawDetail.zoomFactor <= 3
+          ? { zoomFactor: rawDetail.zoomFactor } : {}),
+        ...(typeof rawDetail.downloadId === 'string'
+          && /^download-[0-9a-f-]{36}$/.test(rawDetail.downloadId)
+          ? { downloadId: rawDetail.downloadId } : {}),
+        ...(typeof rawDetail.downloadName === 'string' && rawDetail.downloadName.length <= 255
+          ? { downloadName: rawDetail.downloadName } : {}),
+        ...(typeof rawDetail.downloadState === 'string'
+          && ['progressing', 'completed', 'cancelled', 'interrupted'].includes(rawDetail.downloadState)
+          ? { downloadState: rawDetail.downloadState as 'progressing' | 'completed' | 'cancelled' | 'interrupted' }
+          : {}),
+        ...(typeof rawDetail.receivedBytes === 'number' && Number.isSafeInteger(rawDetail.receivedBytes)
+          && rawDetail.receivedBytes >= 0 ? { receivedBytes: rawDetail.receivedBytes } : {}),
+        ...(typeof rawDetail.totalBytes === 'number' && Number.isSafeInteger(rawDetail.totalBytes)
+          && rawDetail.totalBytes >= 0 ? { totalBytes: rawDetail.totalBytes } : {}),
         ...(typeof rawDetail.action === 'string' ? { action: rawDetail.action } : {}),
         ...(typeof rawDetail.code === 'string' ? { code: rawDetail.code } : {}),
         ...(typeof rawDetail.surfaceInstanceId === 'string'
@@ -296,9 +326,18 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
         ? raw.modes.filter((value): value is 'full' | 'offline' =>
             value === 'full' || value === 'offline')
         : []
+      const knownNavigationActions = new Set<NativeWorkbenchNavigateRequest['action']>([
+        'back', 'forward', 'reload', 'stop', 'navigate', 'open-external', 'close',
+        'find', 'find-next', 'find-stop', 'zoom', 'download-open',
+      ])
+      const navigationActions = Array.isArray(raw.navigationActions)
+        ? raw.navigationActions.filter((value): value is NativeWorkbenchNavigateRequest['action'] =>
+            knownNavigationActions.has(value as NativeWorkbenchNavigateRequest['action']))
+        : undefined
       return {
         protocolVersions: versions.length > 0 ? versions : [1],
         modes: modes.length > 0 ? modes : ['offline'],
+        ...(navigationActions ? { navigationActions } : {}),
         ...(typeof raw.maxSurfaces === 'number' && Number.isFinite(raw.maxSurfaces)
           ? { maxSurfaces: Math.max(1, Math.floor(raw.maxSurfaces)) }
           : {}),

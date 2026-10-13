@@ -576,6 +576,10 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
             "test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn",
         ),
         (
+            "tests/test_gateway/test_plan_rpc.py",
+            "test_explicit_implement_mode_is_pinned_at_queued_execution_boundary",
+        ),
+        (
             "tests/test_engine/test_tool_concurrency.py",
             "test_image_analysis_calls_have_dedicated_inflight_cap",
         ),
@@ -610,6 +614,22 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
         (
             "tests/test_skills/test_staging_io_worker.py",
             "test_scan_keeps_status_responsive_and_cancel_waits_for_cleanup",
+        ),
+        (
+            "tests/test_observability/test_http_client.py",
+            "test_custom_ca_and_hostname_validation_are_preserved",
+        ),
+        (
+            "tests/test_observability/test_http_client.py",
+            "test_idle_tls_connection_does_not_block_certificate_validation",
+        ),
+        (
+            "tests/test_recovery/test_runtime_writer_guard.py",
+            "test_runtime_writer_lock_keeps_read_only_cli_available_and_rejects_agent",
+        ),
+        (
+            "tests/test_recovery/test_runtime_writer_guard.py",
+            "test_distinct_profile_and_gateway_state_dirs_run_concurrently_across_processes",
         ),
     ],
 )
@@ -647,6 +667,8 @@ def test_recovery_close_probes_are_explicitly_serial(function_name: str) -> None
     ("tests/test_telemetry/test_client_runtime.py", 5),
     ("tests/test_session/test_recovery_reads.py", 9),
     ("tests/test_gateway/test_native_attachment_import.py", 3),
+    ("tests/test_observability/test_http_client.py", 2),
+    ("tests/test_recovery/test_runtime_writer_guard.py", 3),
 ])
 def test_process_probe_collection_is_complete_and_disjoint(target: str, serial_count: int) -> None:
     """Exercise actual pytest collection, not fixture-setup-time marker changes."""

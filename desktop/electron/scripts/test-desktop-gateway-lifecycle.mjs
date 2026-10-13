@@ -254,7 +254,7 @@ function mainExitHarness() {
       clear() {},
       shutdown: () => { calls.order.push('preview-cleanup'); return previewCleanup.promise },
     },
-    nativeWorkbenchSurfaces: { destroyAll: async () => {} },
+    nativeWorkbenchSurfaces: { hasBrowserTabs: () => false, destroyAll: async () => {} },
     desktopBrowser: { close: async () => {} },
     destroyWindowsTray() {}, stopGateway() {},
     hasGatewayProcessExited: () => childExited,
@@ -1179,5 +1179,7 @@ for (const [label, invalidate] of [
   ['update during renderer restoration', harness => { harness.context.updateApplying = true }],
   ['new open during renderer restoration', harness => runInContext('invalidateDesktopOpenFlow()', harness.context)],
 ]) await runLateReadinessNavigationAuthorityCase(label, invalidate)
+
+await import('./test-desktop-browser-quit-lifecycle.mjs')
 
 console.log('desktop gateway lifecycle tests passed')

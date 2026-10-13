@@ -6,7 +6,7 @@ import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { runInNewContext } from 'node:vm'
-import { AUDIT_MARKER, AUDIT_PURPOSE, assertNoExistingDesktop, assertPreservedInputs, assertStopEvidence, auditMessages, parseAuditManifest, parseSyntheticCredential, sha256, verifyAuditInputs } from './fixtures/packaged-retained-interaction/contract.mjs'
+import { AUDIT_MARKER, AUDIT_PURPOSE, assertNoExistingDesktop, assertPreservedInputs, assertStopEvidence, auditMessages, collectSqliteProcessCensus, parseAuditManifest, parseSyntheticCredential, sha256, verifyAuditInputs } from './fixtures/packaged-retained-interaction/contract.mjs'
 import { installRetainedRpcProbe } from './fixtures/packaged-retained-interaction/browser-probe.mjs'
 import { startRetainedProvider } from './fixtures/packaged-retained-interaction/provider.mjs'
 import { collectRetainedGatewayDiagnostics, sameLogFileIdentity } from './fixtures/packaged-retained-interaction/diagnostics.mjs'
@@ -88,6 +88,30 @@ test('failure diagnostics retain database holder and exception evidence while re
     assert.equal(row.truncated, false)
   }
   await assertPreservedInputs(plan)
+})
+
+test('failure diagnostics retain safe SQLite codes and bounded connection states', async t => {
+  const { plan, gatewayLog } = await diagnosticFixture(t)
+  const evidence = {
+    event: 'session_storage.transaction_timing', operation: 'synthetic_contender',
+    sqlite_error_code: 517, sqlite_primary_code: 5, sqlite_error_name: 'SQLITE_BUSY_SNAPSHOT',
+    sqlite_version: '3.51.3', backend: 'sqlite3_fallback', connection_in_transaction: false,
+    connections: [
+      { connection_id: 1, role: 'session_writer', backend: 'sqlite3_fallback', status: 'open', connection_in_transaction: false },
+      { connection_id: 2, role: 'content_length_writer', backend: 'aiosqlite', status: 'open', connection_in_transaction: true },
+    ],
+    connections_observed: 2, connections_omitted: 0, connections_truncated: false,
+    current_unregistered: false,
+    process_registry_omitted: 0, process_registry_capacity: 64, registry_truncated: false,
+    process_id: 123,
+  }
+  await writeFile(gatewayLog, JSON.stringify({ ...evidence, token: 'private-diagnostic-token',
+    path: join(plan.userDataDir, 'private-synthetic-database.sqlite') }) + '\n')
+  const [row] = await collectRetainedGatewayDiagnostics(plan)
+  const observed = JSON.parse(row.tail)
+  for (const [key, value] of Object.entries(evidence)) assert.deepEqual(observed[key], value)
+  assert.doesNotMatch(row.tail, /private-diagnostic-token/)
+  assert.equal(row.tail.includes(plan.userDataDir), false)
 })
 
 test('log reads and redacted output are bounded; partial and oversized lines are omitted', async t => {
@@ -177,15 +201,18 @@ test('diagnostic timeout preserves the original failure and probe captures befor
     provider: { snapshot: () => ({}), close: async () => { phases.push('provider-close') } },
     persist: async () => {}, join,
     collectRetainedGatewayDiagnostics: () => { phases.push('logs'); return new Promise(() => {}) },
+    collectSqliteProcessCensus: () => { phases.push('processes'); return new Promise(() => {}) },
+    runFile: async () => {},
     captureFirstSendDiagnostic: operation => captureFirstSendDiagnostic(operation, 10),
     copyFile: async () => { throw Object.assign(new Error('unreadable-log'), { code: 'EACCES' }) },
     console: { error() {} }, process: processState,
   })
-  assert.deepEqual(phases, ['logs', 'provider-close'])
+  assert.deepEqual(phases, ['logs', 'processes', 'provider-close'])
   assert.equal(report.error, 'original first-send timeout')
   assert.equal(report.errorCode, 'FIRST_SEND_TIMEOUT')
   assert.equal(report.ok, false)
   assert.match(report.gatewayDiagnostics.diagnosticError, /timed out/)
+  assert.match(report.sqliteProcesses.diagnosticError, /timed out/)
   assert.equal(report.desktopLogDiagnosticError, 'EACCES')
   assert.equal(processState.exitCode, 1)
 })
@@ -386,6 +413,40 @@ test('Desktop process guard rejects any existing Desktop and every incomplete ce
     assert.equal(calls, 1, 'Process census failures must not retry or pass')
   }
   await assert.rejects(assertNoExistingDesktop(async () => assert.fail('Invalid SystemRoot must not spawn a process'), 'relative-directory'), /absolute SystemRoot/)
+})
+
+test('failure process census keeps fixed images and PID evidence without arbitrary metadata', async () => {
+  const windowsDirectory = join(tmpdir(), 'Windows')
+  const signal = new AbortController().signal
+  const rows = [
+    '"OpenSquilla.exe","42","Private Session","1","26,228 K"',
+    '"opensquilla-gateway.exe","50","Private Session","1","26,228 K"',
+    '"opensquilla-gateway.exe","51","Private Session","1","26,228 K"',
+    '"python.exe","99","Private Session","1","26,228 K"',
+    '"private-document-name.exe","100","Private Session","1","26,228 K"',
+  ]
+  const census = await collectSqliteProcessCensus(async (_command, _args, options) => {
+    assert.equal(options.signal, signal)
+    return { stdout: rows.join('\r\n'), stderr: '' }
+  }, windowsDirectory, signal)
+  assert.deepEqual(census, { scope: 'image_and_pid_only', processes: [
+    { name: 'opensquilla.exe', pid: 42 },
+    { name: 'opensquilla-gateway.exe', pid: 50 },
+    { name: 'opensquilla-gateway.exe', pid: 51 },
+    { name: 'python.exe', pid: 99 },
+  ], truncated: false })
+  assert.doesNotMatch(JSON.stringify(census), /Private Session|private-document/)
+  const many = await collectSqliteProcessCensus(async () => ({ stdout: Array.from({ length: 40 }, (_, index) =>
+    `"python.exe","${index + 1}","Console","1","8 K"`).join('\r\n') }), windowsDirectory)
+  assert.equal(many.processes.length, 32)
+  assert.equal(many.truncated, true)
+  for (const stdout of ['', 'malformed', '"python.exe","9999999999999999","Console","1","8 K"']) {
+    assert.deepEqual(await collectSqliteProcessCensus(async () => ({ stdout }), windowsDirectory),
+      { unavailable: true, code: 'PROCESS_CENSUS_UNAVAILABLE' })
+  }
+  const failed = await collectSqliteProcessCensus(async () => { throw Object.assign(
+    new Error('private process command line'), { code: 'ABORT_ERR' }) }, windowsDirectory)
+  assert.deepEqual(failed, { unavailable: true, code: 'ABORT_ERR' })
 })
 
 const stopSnapshot = () => ({ requests: [{ method: 'chat.abort', params: { sessionKey: 'session-a', taskId: 'task-a', source: 'webui_stop', scope: 'task' } }], events: [{ taskId: 'task-a', reason: 'aborted' }] })
