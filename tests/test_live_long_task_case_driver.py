@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +18,30 @@ from scripts.long_task_fault_proxy import (
     FaultRequestRecord,
     FaultScenario,
 )
+
+
+@pytest.fixture
+def prepared_gateway_database(
+    monkeypatch: pytest.MonkeyPatch,
+    _migrated_db_template: Path,
+) -> None:
+    original_init = driver.GatewayProcess.__init__
+
+    def initialize(self, *args, **kwargs) -> None:
+        original_init(self, *args, **kwargs)
+        # Retry and fallback cases need a current schema, not fresh migration
+        # work on every isolated subprocess. The shared source is closed; only
+        # this Gateway's private copy receives runtime writes.
+        try:
+            # OPENSQUILLA_STATE_DIR sets the home; GatewayConfig appends state.
+            runtime_state = self.state_dir / "state"
+            runtime_state.mkdir(mode=0o700)
+            shutil.copy2(_migrated_db_template, runtime_state / "sessions.db")
+        except BaseException:
+            self.cleanup()
+            raise
+
+    monkeypatch.setattr(driver.GatewayProcess, "__init__", initialize)
 
 
 def _case_directory(tmp_path: Path) -> Path:
@@ -1352,6 +1377,7 @@ def test_runtime_failure_preserves_physical_usage_and_cost_budget_evidence(
 @pytest.mark.ci_serial
 def test_fault_case_executes_through_isolated_gateway_without_real_provider(
     monkeypatch: pytest.MonkeyPatch,
+    prepared_gateway_database: None,
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-not-a-real-key")
     case = driver.LiveCase(
@@ -1384,6 +1410,7 @@ def test_fault_case_executes_through_isolated_gateway_without_real_provider(
 @pytest.mark.ci_serial
 def test_fault_429_case_proves_retry_after_was_not_violated(
     monkeypatch: pytest.MonkeyPatch,
+    prepared_gateway_database: None,
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-not-a-real-key")
     request_records: list[FaultRequestRecord] = []
@@ -1454,6 +1481,7 @@ def test_fault_429_case_proves_retry_after_was_not_violated(
 @pytest.mark.ci_serial
 def test_fallback_case_proves_activity_precedes_backup_request_without_real_provider(
     monkeypatch: pytest.MonkeyPatch,
+    prepared_gateway_database: None,
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-not-a-real-key")
     monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-not-a-real-key")
