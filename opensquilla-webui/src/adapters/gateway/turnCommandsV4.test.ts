@@ -199,6 +199,7 @@ describe('v4 TurnCommands Adapter', () => {
       message: 'edit the notes', sessionKey: 'agent:main:test',
       intent: 'new_chat', initialModel: 'model-a', initialProvider: 'provider-a', initialRoutingMode: 'direct' as const,
       selectedSkills: [{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }],
+      requiredServices: ['desktop_browser'],
       workspaceFiles: [{ workspaceId: 'project-1', relativePath: 'docs/notes.md', name: 'notes.md', mime: 'text/markdown' }],
       attachments: [{ type: 'application/pdf', mime: 'application/pdf', name: 'original.pdf', file_uuid: 'fixture-file' }],
     }

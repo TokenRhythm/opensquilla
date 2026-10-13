@@ -8,7 +8,8 @@ import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from functools import lru_cache
+from typing import Any, cast
 
 import snowballstemmer  # type: ignore[import-untyped]
 from anyascii import anyascii
@@ -48,7 +49,18 @@ _ENGLISH_STOP_WORDS = frozenset(
     }
 )
 _WORD_RE = re.compile(r"\d+(?:\.\d+)*|[a-z]+(?:'[a-z]+)?")
-_STEMMER = snowballstemmer.stemmer("english")
+_MAX_CACHED_WORD_LENGTH = 128
+
+
+def _stem_word(word: str) -> str:
+    # Snowball stemmers mutate internal cursors. Keep cache misses independent
+    # even when separate threads build indexes concurrently.
+    return cast(str, snowballstemmer.stemmer("english").stemWord(word))
+
+
+@lru_cache(maxsize=4096)
+def _cached_stem_word(word: str) -> str:
+    return _stem_word(word)
 
 
 def normalize_search_text(value: str) -> str:
@@ -62,7 +74,12 @@ def tokenize_for_bm25(value: str) -> tuple[str, ...]:
 
     words = [word for word in _WORD_RE.findall(normalize_search_text(value))]
     words = [word for word in words if word not in _ENGLISH_STOP_WORDS]
-    return tuple(_STEMMER.stemWords(words))
+    # Bound retained vocabulary, not input or matching semantics. Long words
+    # still receive the complete stemming operation without entering the cache.
+    return tuple(
+        _cached_stem_word(word) if len(word) <= _MAX_CACHED_WORD_LENGTH else _stem_word(word)
+        for word in words
+    )
 
 
 def tool_namespace(tool_name: str) -> str:

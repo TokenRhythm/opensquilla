@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import { HISTORY_ANSWER_BYTES, HISTORY_TURNS, ORDINARY_RUNS_ROOT, appendOnlyLogSuffix,
-  gatewayFlowFailureEvidence, gatewayShutdownCountFromLog, hasCleanGatewayFlowEvidence, hasNaturalGatewayExits, historyTurn, inside, isSettledDraft, isolatedEnvironment,
+  gatewayFlowFailureEvidence, gatewayShutdownCountFromLog, hasCleanGatewayFlowEvidence, hasNaturalGatewayExits, historyRereadReady, historyTurn, inside, isSettledDraft, isolatedEnvironment,
   observeFrame, onboardingSaveEvidence, ordinaryMigrationEvidence, ordinaryPerformanceMetrics, parseArguments, runtimeRestartControl,
   safeFailureReason, syntheticConfig, validateOrdinaryProfileMarker } from './test-packaged-gateway-reliability.mjs'
 
@@ -262,6 +262,26 @@ test('passive frame evidence never serializes credentials, bodies, URL, unknown 
   assert.equal(JSON.stringify(summary).includes(state), false)
 })
 
+test('packaged flow evidence requires the v2 capability and update method together', () => {
+  const summary = { methods: {}, requestedCaps: [] }
+  const state = join(tmpdir(), 'synthetic-v2-state')
+  observeFrame(summary, 'sent', JSON.stringify({ type: 'req', method: 'connect', params: {
+    caps: ['transport.flow.v1', 'transport.recovery.v1', 'transport.session-flow.v2'] } }), state)
+  observeFrame(summary, 'received', JSON.stringify({ type: 'hello-ok', protocol: 3,
+    snapshot: { state_dir: state }, features: {
+      methods: ['sessions.messages.resume', 'sessions.messages.snapshot.release', 'transport.sessionFlow.update.v2'],
+    }, policy: { transport_flow: { delivery_epoch: 'epoch', window_frames: 128, window_bytes: 4194304 } } }), state)
+  assert.deepEqual(summary.requestedCaps, ['transport.flow.v1', 'transport.recovery.v1', 'transport.session-flow.v2'])
+  assert.equal(summary.hello.v2Method, true)
+  const stale = { methods: {}, requestedCaps: [] }
+  observeFrame(stale, 'sent', JSON.stringify({ type: 'req', method: 'connect', params: {
+    caps: ['transport.flow.v1', 'transport.recovery.v1'] } }), state)
+  observeFrame(stale, 'received', JSON.stringify({ type: 'hello-ok', protocol: 3,
+    snapshot: { state_dir: state }, features: { methods: [] },
+    policy: { transport_flow: { delivery_epoch: 'epoch', window_frames: 128, window_bytes: 4194304 } } }), state)
+  assert.equal(stale.hello.v2Method, false)
+})
+
 test('configuration success requires a response to the actual observed configure request', () => {
   const summary = { methods: {}, requestedCaps: [] }
   observeFrame(summary, 'received', '{"type":"res","id":"other","ok":true}', tmpdir())
@@ -272,6 +292,25 @@ test('configuration success requires a response to the actual observed configure
   assert.equal(summary.configurationFailed, 1)
   assert.equal(summary.configurationSucceeded, undefined)
   assert.equal(JSON.stringify(summary).includes('not persisted'), false)
+})
+
+test('read-v2 observer counts actual requests, responses and bounded error classes without private payloads', () => {
+  const summary = { methods: {}, requestedCaps: [] }
+  const methods = ['sessions.read.open.v2', 'sessions.read.state.v2',
+    'sessions.read.install.v2', 'sessions.read.close.v2', 'sessions.history.page.v2']
+  observeFrame(summary, 'received', JSON.stringify({ type: 'hello-ok', features: { methods } }), tmpdir())
+  assert.equal(summary.hello.sessionReadV2Methods, true)
+  for (const [index, method] of [...methods, 'sessions.messages.subscribe', 'sessions.messages.unsubscribe'].entries()) {
+    observeFrame(summary, 'sent', JSON.stringify({ type: 'req', id: String(index), method,
+      params: { key: 'PRIVATE', token: 'PRIVATE' } }), tmpdir())
+    observeFrame(summary, 'received', JSON.stringify({ type: 'res', id: String(index), ok: index > 1,
+      error: { code: index === 0 ? 'NOT_FOUND' : 'PRIVATE', message: 'PRIVATE' }, payload: { text: 'PRIVATE' } }), tmpdir())
+    assert.equal(summary.methods[method], 1)
+    assert.deepEqual(summary.responses[method], index > 1 ? { ok: 1, failed: 0 } : { ok: 0, failed: 1 })
+  }
+  assert.deepEqual(summary.responseErrors['sessions.read.open.v2'], { NOT_FOUND: 1 })
+  assert.deepEqual(summary.responseErrors['sessions.read.state.v2'], { OTHER: 1 })
+  assert.equal(JSON.stringify(summary).includes('PRIVATE'), false)
 })
 
 test('failure reasons accept only fixed script text, never arbitrary Playwright error strings', () => {
@@ -337,7 +376,29 @@ test('unrelated or failed large snapshots cannot prove multi-segment target reco
   assert.equal(summary.targetReadCompleted, undefined)
 })
 
-test('long-history acceptance checks complete retained content and stable message IDs, not response size', () => {
+for (const method of ['chat.history', 'sessions.history.page.v2']) {
+test(`history reread waits for ${method} and both rendered roles`, () => {
+  const summary = { methods: {}, requestedCaps: [] }
+  const probe = { key: 'target', armed: true, revision: 1, readsBefore: 0, historyReadsBefore: 0 }
+  const users = ['Synthetic gateway reliability request.']
+  const assistants = ['Synthetic gateway reliability response.']
+  const send = (id, method) => observeFrame(summary, 'sent',
+    JSON.stringify({ type: 'req', id, method, params: { key: probe.key } }), tmpdir(), probe)
+  const receive = (id, payload) => observeFrame(summary, 'received',
+    JSON.stringify({ type: 'res', id, ok: true, payload }), tmpdir(), probe)
+  send('snapshot', 'sessions.messages.snapshot.read')
+  receive('snapshot', { segment_index: 0, segment_count: 1 })
+  assert.equal(historyRereadReady([summary], probe, probe.key, users, assistants), false,
+    'An installed snapshot cannot prove that durable user history has returned')
+  send('history', method)
+  receive('history', method === 'chat.history' ? { messages: [] } : { items: [] })
+  assert.equal(historyRereadReady([summary], probe, probe.key, [], assistants), false)
+  assert.equal(historyRereadReady([summary], probe, probe.key, users, []), false)
+  assert.equal(historyRereadReady([summary], probe, 'other', users, assistants), false)
+  assert.equal(historyRereadReady([summary], probe, probe.key, users, assistants), true)
+})
+
+test(`long-history ${method} acceptance checks complete retained content and stable IDs, not size`, () => {
   const retained = Array.from({ length: HISTORY_TURNS }, (_, index) => [
     { message_id: `PRIVATE-user-${index}`, role: 'user', text: `Synthetic retained history request ${index + 1}.` },
     { message_id: `PRIVATE-assistant-${index}`, role: 'assistant', text: historyTurn(index).answer },
@@ -351,11 +412,13 @@ test('long-history acceptance checks complete retained content and stable messag
   let sequence = 0
   const request = (key = probe.key) => {
     const id = String(++sequence)
-    observeFrame(summary, 'sent', JSON.stringify({ type: 'req', id, method: 'chat.history', params: { sessionKey: key } }), tmpdir(), probe)
+    observeFrame(summary, 'sent', JSON.stringify({ type: 'req', id, method, params: { key } }), tmpdir(), probe)
     return id
   }
+  const payloadFor = messages => method === 'chat.history' ? { messages }
+    : { items: messages.map(message => ({ message_id: message.message_id, message })) }
   const response = (id, messages, ok = true) => observeFrame(summary, 'received',
-    JSON.stringify({ type: 'res', id, ok, payload: { messages } }), tmpdir(), probe)
+    JSON.stringify({ type: 'res', id, ok, payload: payloadFor(messages) }), tmpdir(), probe)
   response(request(), retained)
   assert.equal(summary.targetSyntheticHistoryCaptured, 1)
   const earlier = request()
@@ -387,10 +450,11 @@ test('long-history acceptance checks complete retained content and stable messag
 
   const uncaptured = { key: probe.key, armed: true, revision: 1, historyPhase: 'verify' }
   const noBaseline = { methods: {}, requestedCaps: [] }
-  observeFrame(noBaseline, 'sent', JSON.stringify({ type: 'req', id: 'no-baseline', method: 'chat.history', params: { sessionKey: probe.key } }), tmpdir(), uncaptured)
-  observeFrame(noBaseline, 'received', JSON.stringify({ type: 'res', id: 'no-baseline', ok: true, payload: { messages: complete } }), tmpdir(), uncaptured)
+  observeFrame(noBaseline, 'sent', JSON.stringify({ type: 'req', id: 'no-baseline', method, params: { key: probe.key } }), tmpdir(), uncaptured)
+  observeFrame(noBaseline, 'received', JSON.stringify({ type: 'res', id: 'no-baseline', ok: true, payload: payloadFor(complete) }), tmpdir(), uncaptured)
   assert.equal(noBaseline.targetSyntheticHistoryVerified, undefined)
 })
+}
 
 test('no-argument CLI fails without creating evidence or importing a packaged runtime', () => {
   const result = spawnSync(process.execPath, [script], { encoding: 'utf8', timeout: 5_000 })

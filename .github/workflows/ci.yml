@@ -871,7 +871,10 @@ jobs:
           chat-send-lifecycle.real.spec.ts
           cross-window-sync.real.spec.ts
           composer-paste.spec.ts
+          durable-delivery.spec.ts
+          history-content-reading.spec.ts
           history-hydration.spec.ts
+          http-delivery.spec.ts
           idle-chat-recovery.spec.ts
           modern-session-recovery.spec.ts
           provider-error-experience.spec.ts
@@ -1024,6 +1027,8 @@ jobs:
         run: |
           node scripts/test-macos-keychain-patch.cjs
           node scripts/test-installer-progress-contract.mjs
+          node --test scripts/test-electron-download-proxy.mjs
+          node --test scripts/test-electron-download-tls.mjs
           node --test scripts/test-gateway-integrity.mjs
           node scripts/test-secret-storage-policy.mjs
           node scripts/test-update-resolver.mjs
@@ -1403,6 +1408,13 @@ jobs:
           printf 'OPENSQUILLA_STATE_DIR=%s/opensquilla-state\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           printf 'OPENSQUILLA_LOG_DIR=%s/opensquilla-logs\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Native metadata parity needs Windows volume IDs; the older WebUI
+          # build runtime reports zero. Pin the validated native-test runtime.
+          node-version: '22.23.3'
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -1486,6 +1498,8 @@ jobs:
             python --version
             uv --version
             uv run pytest --version
+            node --version
+            node -p 'process.execPath'
           } >> "${CI_REPORT_DIR}/environment.txt" 2>&1
 
       - name: Provision distinct Windows test volumes
@@ -1554,21 +1568,12 @@ jobs:
               tests/test_tools/test_dispatch_legacy_coverage.py
               tests/unit/cli/repl/test_slash_bridge.py
             )
-          elif [[ "${family}" == "gateway-sqlite" ]]; then
-            regression_args+=(
-              tests/test_gateway/test_channel_turn_ingress.py
-              tests/test_gateway/test_plan_rpc.py
-              tests/test_gateway/test_goal_registry_cleanup.py
-              tests/test_gateway/test_task_runtime_terminal_cleanup.py
-              tests/test_gateway/test_task_runtime_wait_slots.py
-              tests/test_gateway/test_goal_turn_authority.py
-              tests/test_gateway/test_task_progress_projection.py
-              tests/functional/test_gateway_silent_reply_process_e2e.py
-            )
           elif [[ "${family}" == "recovery-migration" ]]; then
             regression_args+=(
               tests/test_sandbox/test_windows_shell_process_runtime.py
               tests/test_live_long_task_case_driver.py
+              tests/test_ci/test_upgrade_baselines.py
+              tests/test_engine/test_runtime_router_fallback.py
             )
           elif [[ "${family}" == "core" ]]; then
             regression_args+=(
@@ -1579,6 +1584,18 @@ jobs:
               tests/test_tools/test_shell_workdir.py
               tests/test_sandbox/test_shell_code_network_hints.py
               tests/test_tools/test_shell_runtime_preflight.py
+              tests/test_tools/test_shell_blocking_launch.py
+              tests/test_ci/test_rpc_architecture_contracts.py
+              tests/test_skills/test_hub_management_service.py
+            )
+          elif [[ "${family}" == "gateway-sqlite" ]]; then
+            regression_args+=(
+              tests/test_gateway/test_native_attachment_import.py
+              tests/test_gateway/test_recovery_scheduler.py
+              tests/test_gateway/test_goal_user_input.py
+              tests/test_gateway/test_manual_compaction_contract.py
+              tests/test_gateway/test_sandbox_token_rpc_workers.py
+              tests/test_live_provider_profile_gateway_e2e.py
             )
           fi
           # Windows workers hit access violations during timed stack dumps.
@@ -1779,6 +1796,18 @@ jobs:
             tests/test_persistence/test_migration_compatibility.py
             tests/test_migrations/test_v045_goal_runtime_accounting.py
             tests/test_tools/test_plan_access.py
+            tests/test_sandbox/test_run_context.py
+            tests/test_sandbox/test_run_context_grants.py
+            tests/test_sandbox/test_user_grants_workers.py
+            tests/test_sandbox/test_user_grants_service_workers.py
+            tests/test_sandbox/test_user_grants_mutation_order.py
+            tests/test_sandbox/test_startup_without_canaries.py
+            tests/test_gateway/test_rpc_run_mode_preference.py
+            tests/test_gateway/test_rpc_sandbox_setup.py
+            tests/test_gateway/test_admission_preparation.py
+            tests/test_gateway/test_project_workspace_execution.py
+            tests/test_gateway/test_full_policy_preparation_workers.py
+            tests/test_gateway/test_sandbox_policy_workers.py
             tests/test_scripts/test_verify_webui_artifact.py
             tests/test_scripts/test_stage_webui_artifact.py
             tests/test_packaging/test_webui_build_contract.py
@@ -1960,6 +1989,7 @@ jobs:
           set -euo pipefail
           uv run --no-sync pytest \
             tests/test_mcp tests/test_mcp_server \
+            tests/test_desktop/test_gateway_functional_probes.py::test_gateway_fresh_profile_reaches_healthz \
             tests/test_desktop/test_gateway_functional_probes.py::test_mcp_probe_uses_real_stdio_server_and_gateway \
             -vv --tb=short \
             2>&1 | tee "${CI_REPORT_DIR}/mcp-transports.log"
@@ -1991,7 +2021,9 @@ jobs:
           import asyncio
           import json
           import sys
-          from importlib.metadata import version
+          from importlib.metadata import requires, version
+
+          from packaging.requirements import Requirement
 
           from mcp import Client
           from mcp_types import LATEST_PROTOCOL_VERSION
@@ -2000,9 +2032,18 @@ jobs:
           from opensquilla.mcp.types import MCPServerConfig
           from opensquilla.mcp_server import create_mcp_server
 
-          async def check():
+          def check_sdk_version():
               sdk_version = version("mcp")
-              assert sdk_version == "2.2.0", sdk_version
+              sdk_requirement = next(
+                  dependency
+                  for dependency in map(Requirement, requires("opensquilla") or ())
+                  if dependency.name == "mcp"
+              )
+              assert sdk_version in sdk_requirement.specifier, sdk_version
+              return sdk_version
+
+          async def check():
+              sdk_version = check_sdk_version()
               async with Client(create_mcp_server(), mode="auto") as server:
                   assert server.protocol_version == LATEST_PROTOCOL_VERSION
                   tools = sorted(tool.name for tool in (await server.list_tools()).tools)
@@ -2096,11 +2137,15 @@ jobs:
             --workers=1 \
             --grep "@session-hang-recovery" \
             --retries=0 \
+            --trace retain-on-failure \
+            --output "${CI_REPORT_DIR}/session-hang-recovery-results" \
             2>&1 | tee "${CI_REPORT_DIR}/session-hang-recovery.log"
           npm run test:e2e -- \
             plan-presentation.spec.ts task-progress.spec.ts goal-mode.spec.ts \
             --project=chromium --workers=1 --retries=0 \
             --grep "@plan-goal-runtime" \
+            --trace retain-on-failure \
+            --output "${CI_REPORT_DIR}/plan-goal-runtime-results" \
             2>&1 | tee "${CI_REPORT_DIR}/plan-goal-runtime.log"
 
       - name: Run cross-platform modern session recovery contracts
@@ -2115,6 +2160,8 @@ jobs:
           npm run test:e2e -- \
             modern-session-recovery.spec.ts \
             --project=chromium --workers=1 --retries=0 \
+            --trace retain-on-failure \
+            --output "${CI_REPORT_DIR}/modern-session-recovery-results" \
             2>&1 | tee "${CI_REPORT_DIR}/modern-session-recovery.log"
 
       - name: Install Desktop workbench browser
@@ -2169,6 +2216,9 @@ jobs:
             local name="$1"
             local script="$2"
             local attempt="$3"
+            if [[ "${RUNNER_OS}" == "Linux" && "${name}" == "profile-import-flow" ]]; then
+              local -x DEBUG="${DEBUG:+${DEBUG},}pw:browser"
+            fi
             local log_path="${CI_REPORT_DIR}/${name}-attempt-${attempt}.log"
             local telemetry_path="${CI_REPORT_DIR}/desktop-e2e-cases.jsonl"
             local telemetry=(
@@ -2647,10 +2697,12 @@ jobs:
             tests/test_engine/test_skill_install_settlement.py \
             tests/test_gateway/test_skill_install_status.py \
             tests/test_skills/test_hub_install_operations.py \
+            tests/test_skills/test_install_operation_io.py \
             tests/test_skills/test_staging_io_worker.py \
             tests/test_skills_hub_streaming.py \
             tests/test_skills_hub_streaming_faults.py \
             tests/test_skills/test_hub_management_service.py \
+            tests/test_skills/test_hub_rollback_serialization.py \
             tests/test_skills/test_hub_scanner.py \
             tests/test_skills/test_hub_transaction_recovery.py \
             tests/test_skills/test_hub_transaction_process_gates.py \

@@ -10,6 +10,23 @@ from opensquilla.provider.failures import (
     decide_recovery_action,
 )
 from opensquilla.provider.registry import list_provider_specs
+from opensquilla.provider.retry_after import RetryAfterDeferredError
+
+
+@pytest.mark.parametrize(
+    "provider",
+    [spec.provider_id for spec in list_provider_specs()] + ["kimi-code", "unknown-provider"],
+)
+@pytest.mark.parametrize(
+    "reason", ["provider_retry_after_deadline", "provider_retry_after_wait_ceiling"],
+)
+def test_overload_cooldown_failure_is_shared_across_providers(provider: str, reason: str) -> None:
+    error = RetryAfterDeferredError(901, reason, failure_reason="provider_overloaded")
+
+    kind = classify_provider_error(provider, None, raw_code=error.code, message=error.message)
+
+    assert kind is ProviderFailureKind.PROVIDER_OVERLOADED
+    assert decide_recovery_action(kind) is ProviderRecoveryAction.RETRY_THEN_FALLBACK
 
 
 @pytest.mark.parametrize(

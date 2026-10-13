@@ -30,7 +30,7 @@ from opensquilla.sandbox.directory_listing import format_directory_entry
 from opensquilla.sandbox.elevation import (
     ApprovalDisplay,
     ElevationAction,
-    gate_elevated_action,
+    gate_elevated_action_async,
 )
 from opensquilla.sandbox.escalation import (
     build_path_approval_params,
@@ -1644,7 +1644,7 @@ async def _gate_out_of_workspace_write(
                 if not destructive.allowed:
                     return destructive.envelope, False, ()
                 return None, True, summarize_backup_receipts(destructive.receipts)
-            gate = gate_elevated_action(
+            gate = await gate_elevated_action_async(
                 action,
                 approval_id=approval_id,
                 session_key=ctx.session_key if ctx is not None else None,
@@ -1779,7 +1779,7 @@ async def _gate_safe_policy_file_mutation(
             )
             return envelope, False, ()
         return None, True, summarize_backup_receipts(destructive.receipts)
-    gate = gate_elevated_action(
+    gate = await gate_elevated_action_async(
         action,
         approval_id=approval_id,
         session_key=ctx.session_key if ctx is not None else None,

@@ -98,6 +98,10 @@ function sessionReadMessage(
     model: value.model ?? null,
     inputTokens: value.inputTokens ?? null,
     outputTokens: value.outputTokens ?? null,
+    historyPayloadPreview: value.historyPayloadPreview,
+    contentRef: value.contentRef,
+    contentRevision: value.contentRevision,
+    previewComplete: value.previewComplete,
     additional: value.additional ?? {},
   }
 }
@@ -1511,6 +1515,55 @@ describe('useChatHistory canonical pagination', () => {
       steerAppliedIteration: 2,
     })
     expect(messages.value[3]?.messageId).toBe('assistant-1')
+  })
+
+  it.each([[1, 'r1'], [2, 'r1'], [2, 'r2']] as const)('rebuilds hydrated Steer slices once after a partial history refresh at row %i (%s)', async (start, revision) => {
+    const body = '前😀中🙂后🚀'
+    const contentRef = { version: 1 as const, sessionKey: 'agent:main:webchat:test', sessionId: 'session',
+      messageId: 'answer', view: 'display' as const, revision: 'r1', byteLength: 32768 }
+    const rows: SessionReadMessageFixture[] = [
+      { id: 'steer-1', messageId: 'steer-1', role: 'user', text: '调整一', turnContext: {
+        turnId: 'turn', disposition: 'applied', modelCallId: '2.0', appliedIteration: 2 } },
+      { id: 'steer-2', messageId: 'steer-2', role: 'user', text: '调整二', turnContext: {
+        turnId: 'turn', disposition: 'applied', modelCallId: '3.0', appliedIteration: 3 } },
+      { id: 'answer', messageId: 'answer', role: 'assistant', text: '前', turnContext: { turnId: 'turn' },
+        previewComplete: false, contentRef, contentRevision: 'r1', usage: { model_call_segments: [
+          { model_call_id: '2.0', iteration: 2, start_codepoint: 2, end_codepoint: 4 },
+          { model_call_id: '3.0', iteration: 3, start_codepoint: 4, end_codepoint: 6 },
+        ] } },
+    ]
+    const { api, historyFixture, messages } = makeHistory(false)
+    historyFixture.mockResolvedValueOnce({ messages: rows }).mockResolvedValueOnce({ messages: rows.slice(start).map(row =>
+      row.role === 'assistant' ? { ...row, contentRef: { ...contentRef, revision }, contentRevision: revision } : row) })
+    await api.loadHistory()
+    api.reconcileHydratedContent(messages.value[messages.value.length - 1]!, body)
+    const initial = messages.value.map(row => [row.messageId || row.clientId, row.text, row.contentSlice])
+    expect(initial).toHaveLength(5)
+    await api.loadHistory()
+    api.reconcileHydratedContent(messages.value[messages.value.length - 1]!, body)
+    expect(messages.value.map(row => [row.messageId || row.clientId, row.text, row.contentSlice])).toEqual(initial)
+    const reconciled = messages.value
+    api.reconcileHydratedContent(messages.value[messages.value.length - 1]!, body)
+    expect(messages.value).toBe(reconciled)
+  })
+
+  it('invalidates old slices immediately when a new aggregate revision has no Steer ranges', async () => {
+    const contentRef = { version: 1 as const, sessionKey: 'agent:main:webchat:test', sessionId: 'session',
+      messageId: 'answer', view: 'display' as const, revision: 'r1' }
+    const source: ChatMessage = { role: 'assistant', text: '前', ts: 3, messageId: 'answer', turnId: 'turn',
+      contentRef, contentRevision: 'r1', previewComplete: false, restoredFromHistory: true,
+      usage: { model_call_segments: [{ model_call_id: '2.0', iteration: 2, start_codepoint: 2, end_codepoint: 4 }] } }
+    const { api, messages } = makeHistory(false, { messages: [
+      { role: 'user', text: '调整', ts: 2, messageId: 'steer', turnId: 'turn', inputDisposition: 'applied',
+        steerModelCallId: '2.0', steerAppliedIteration: 2, restoredFromHistory: true }, source,
+    ], response: { messages: [{ id: 'answer', messageId: 'answer', role: 'assistant', text: '新正文',
+      turnContext: { turnId: 'turn' }, contentRef: { ...contentRef, revision: 'r2' }, contentRevision: 'r2', previewComplete: false }] } })
+    api.reconcileHydratedContent(source, '前😀后续')
+    expect(messages.value).toHaveLength(3)
+    await api.loadHistory()
+    expect(messages.value.map(row => row.text)).toEqual(['调整', '新正文'])
+    api.reconcileHydratedContent(source, '前😀后续')
+    expect(messages.value.map(row => row.text)).toEqual(['调整', '新正文'])
   })
 
   it('restores a promoted steer under its new turn instead of the completed target turn', async () => {
@@ -3381,6 +3434,25 @@ describe('useChatHistory optimistic local rows', () => {
       activitySnapshotIncomplete: false,
       statusHistory: [{ action: 'provider:requesting', activityOrder: 4 }],
       reasoningBlocks: [{ id: 'reasoning-1', text: ' A😀 ', activityOrder: 6 }],
+    })
+
+    const preview = makeHistory(false, {
+      response: {
+        messages: [{
+          ...assistantMessage, reasoningContent: ' A',
+          historyPayloadPreview: { detailsTruncated: true, reasoningUtf16Length: 5, textUtf16Lengths: [8, 13] },
+          toolCalls: assistantMessage.toolCalls.map(segment => segment.type === 'text'
+            ? { ...segment, text: segment.text?.slice(0, 3) } : segment),
+        }],
+        turnOutcomes: [outcome], hasMore: false,
+      },
+    })
+    await preview.api.loadHistory()
+    expect(preview.messages.value[0]).toMatchObject({
+      historyPayloadPreview: { reasoningUtf16Length: 5, textUtf16Lengths: [8, 13] },
+      activitySnapshot: complete.messages.value[0]?.activitySnapshot,
+      activitySnapshotIncomplete: false,
+      reasoningBlocks: [{ id: 'reasoning-1', text: ' A', activityOrder: 6 }],
     })
 
     const corrupted = makeHistory(false, {

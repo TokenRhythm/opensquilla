@@ -22,16 +22,17 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     specs = runner.discover_contracts()
     targets = runner.load_production_targets(specs)
 
-    assert len(targets) == 178
+    assert len(targets) == 185
     assert targets[("method", "skills.candidates")] == ("result",)
     assert targets[("method", "skills.setEnabled")] == ("result",)
     assert Counter(role for roles in targets.values() for role in roles) == {
-        "result": 168,
-        "params": 26,
+        "result": 175,
+        "params": 32,
         "payload": 9,
         "frame": 1,
     }
-    assert sum(len(spec.targets) for spec in specs) == 818
+    assert sum(len(spec.targets) for spec in specs) == 846
+    assert targets[("method", "onboarding.videoGeneration.models.discover")] == ("result",)
     assert targets[("method", "agents.list")] == ("result",)
     assert targets[("method", "turns.receipt.get")] == ("params", "result")
     assert targets[("method", "models.list")] == ("params", "result")
@@ -45,6 +46,12 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     assert targets[("method", "sessions.messages.resume")] == ("params", "result")
     assert targets[("method", "sessions.messages.snapshot.release")] == ("params", "result")
     assert targets[("method", "transport.flow.update")] == ("params", "result")
+    assert targets[("method", "sessions.read.open.v2")] == ("params", "result")
+    assert targets[("method", "sessions.read.state.v2")] == ("params", "result")
+    assert targets[("method", "sessions.read.install.v2")] == ("params", "result")
+    assert targets[("method", "sessions.read.close.v2")] == ("params", "result")
+    assert targets[("method", "sessions.history.page.v2")] == ("params", "result")
+    assert targets[("method", "transport.sessionFlow.update.v2")] == ("params", "result")
     assert targets[("method", "onboarding.llmProfile.upsertAndActivate")] == (
         "params", "result",
     )

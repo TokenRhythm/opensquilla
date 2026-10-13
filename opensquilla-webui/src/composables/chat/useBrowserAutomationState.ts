@@ -1,6 +1,7 @@
 import { onScopeDispose, watch, type Ref } from 'vue'
 import type { NativeBrowserAutomationState, NativeWorkbenchApi } from '@/platform/types'
 import type { ChatRunStatus } from '@/types/chat'
+import { createClientRequestId } from '@/utils/chat/messageIdentity'
 import { chatTaskId } from './useChatTaskOwnership'
 
 const BUSY_STATUSES = new Set(['queued', 'running', 'approval_pending'])
@@ -65,7 +66,7 @@ export function useBrowserAutomationState(options: BrowserAutomationStateOptions
     if (identity && next.taskId && !identity.backendTaskId) identity.backendTaskId = next.taskId
     if (!identity || (next.taskId && next.taskId !== identity.backendTaskId)) {
       identity = { sessionKey: next.sessionKey, backendTaskId: next.taskId,
-        visualTaskId: next.taskId || `browser-visual-${crypto.randomUUID()}` }
+        visualTaskId: next.taskId || `browser-visual-${createClientRequestId()}` }
     }
     if (current?.sessionKey === next.sessionKey && current.taskId === identity.visualTaskId) return
     release()

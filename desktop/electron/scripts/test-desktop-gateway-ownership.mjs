@@ -28,7 +28,9 @@ import {
   requestVerifiedDesktopGatewayShutdown,
   sameDesktopGatewayOwnershipInstance,
   verifyDesktopGatewayOwnership,
+  verifyDesktopGatewayOwnershipDetailed,
   verifyDesktopGatewayLaunchOwnership,
+  verifyDesktopGatewayLaunchOwnershipDetailed,
   waitForDesktopGatewayOwnershipRelease,
 } from '../dist/desktop-gateway-ownership.js'
 import {
@@ -152,6 +154,55 @@ assert.equal(
     false,
     'a matching record without a successful identity challenge fails closed',
   )
+}
+
+// Failure diagnostics distinguish actionable boundaries without serializing
+// credentials or response values. Existing callers retain a boolean result.
+{
+  const goodIdentity = { ...unsignedIdentity, proof: desktopGatewayIdentityProof(nonce, unsignedIdentity) }
+  const cases = [
+    ['verified', 'verified', async () => new Response(JSON.stringify(goodIdentity))],
+    ['http', 'http_status', async () => new Response('private-response-body', { status: 503 })],
+    ['payload', 'invalid_json', async () => new Response('{private-response-body')],
+    ['payload', 'invalid_payload', async () => new Response(JSON.stringify({ ...goodIdentity, unexpected: 'private-response-body' }))],
+    ['fields', 'identity_mismatch', async () => new Response(JSON.stringify({ ...goodIdentity, pid: 9999 }))],
+    ['proof', 'proof_mismatch', async () => new Response(JSON.stringify({ ...goodIdentity, proof: '0'.repeat(64) }))],
+    ['request', 'request_failed', async () => { throw new DOMException('private-request-error', 'TimeoutError') }],
+    ['request', 'request_failed', async () => { throw new TypeError('private-request-error') }],
+  ]
+  for (const [stage, reason, fetchImpl] of cases) {
+    const result = await verifyDesktopGatewayOwnershipDetailed(record, { challenge, fetchImpl })
+    assert.equal(result.stage, stage)
+    assert.equal(result.reason, reason)
+    assert.equal(result.ok, stage === 'verified')
+    assert.equal(await verifyDesktopGatewayOwnership(record, { challenge, fetchImpl }), result.ok)
+    assert.ok(Number.isFinite(result.elapsedMs) && result.elapsedMs >= 0)
+    const encoded = JSON.stringify(result)
+    for (const secret of [nonce, challenge, record.profile_fingerprint, record.start_identity, goodIdentity.proof, 'private-response-body', 'private-request-error']) {
+      assert.equal(encoded.includes(secret), false, `diagnostic must not disclose ${secret.slice(0, 8)}`)
+    }
+    if (stage === 'http') assert.equal(result.statusCode, 503)
+    if (stage === 'fields') assert.deepEqual(result.mismatchFields, ['pid'])
+    if (reason === 'request_failed') assert.ok(['timeout', 'network_error'].includes(result.errorType))
+  }
+
+  const authority = { instanceNonce: nonce, profileFingerprint: record.profile_fingerprint, port: record.port }
+  for (const status of ['missing', 'invalid']) {
+    const result = await verifyDesktopGatewayLaunchOwnershipDetailed('/private-profile-path', authority, {
+      load: () => ({ status, record: null }),
+      verify: async () => assert.fail('untrusted records must never be challenged'),
+    })
+    assert.equal(result.stage, 'record')
+    assert.equal(result.reason, `record_${status}`)
+    assert.equal(JSON.stringify(result).includes('/private-profile-path'), false)
+  }
+  const mismatch = await verifyDesktopGatewayLaunchOwnershipDetailed('/private-profile-path', authority, {
+    load: () => ({ status: 'valid', record: { ...record, instance_nonce: 'x'.repeat(43) } }),
+    verify: async () => assert.fail('a foreign launch must never be challenged'),
+  })
+  assert.equal(mismatch.reason, 'launch_mismatch')
+  assert.deepEqual(mismatch.mismatchFields, ['instance_nonce'])
+  assert.equal(JSON.stringify(mismatch).includes('x'.repeat(43)), false)
 }
 
 const root = mkdtempSync(join(tmpdir(), 'opensquilla-desktop-gateway-owner-'))
@@ -394,11 +445,42 @@ assert.equal(desktopProcessStartIdentity(1.5), null)
 
 // --- readiness verification budget: one deadline per exact record instance ---
 
+// A child may have written its record while migrations still hold the profile
+// lock.  The identity challenge must retry within one bounded budget and
+// converge once the listener is actually serving; a transient foreign health
+// response is never used as a substitute for that proof.
+{
+  let now = 0
+  let verifyCalls = 0
+  const coordinator = new DesktopGatewayOwnershipVerificationCoordinator({
+    identityReadyTimeoutMs: 100,
+    pollIntervalMs: 10,
+    now: () => now,
+    wait: async timeoutMs => { now += timeoutMs },
+    verify: async () => {
+      verifyCalls += 1
+      return verifyCalls >= 3
+    },
+    load: () => ({ status: 'valid', record }),
+    processMayStillBeAlive: () => true,
+    processStartIdentity: () => null,
+    startIdentityConflicts: () => false,
+  })
+  assert.equal(
+    await coordinator.verifyWhenReady('/profile/migrating', record),
+    true,
+    'identity challenge retries through child migration delay and converges',
+  )
+  assert.equal(verifyCalls, 3)
+  assert.equal(now, 20)
+}
+
 {
   let now = 0
   let verifyCalls = 0
   let livenessCalls = 0
   let startIdentityCalls = 0
+  const diagnostics = []
   const coordinator = new DesktopGatewayOwnershipVerificationCoordinator({
     identityReadyTimeoutMs: 100,
     pollIntervalMs: 25,
@@ -420,6 +502,7 @@ assert.equal(desktopProcessStartIdentity(1.5), null)
       return null
     },
     startIdentityConflicts: () => false,
+    onVerificationFailed: (_record, diagnostic, exitReason) => diagnostics.push({ diagnostic, exitReason }),
   })
 
   assert.equal(await coordinator.verifyWhenReady('/profile/owner', record), false)
@@ -429,6 +512,8 @@ assert.equal(desktopProcessStartIdentity(1.5), null)
   assert.equal(verifyCalls, 7, 'later phases still perform one fresh identity challenge')
   assert.equal(livenessCalls, 7, 'every failed challenge gets a fresh process liveness probe')
   assert.equal(startIdentityCalls, 3, 'later phases still perform a fresh liveness check')
+  assert.equal(diagnostics.length, 3, 'one diagnostic per terminal verification, not per poll')
+  assert.ok(diagnostics.every(item => item.exitReason === 'deadline' && item.diagnostic.ok === false))
 }
 
 {

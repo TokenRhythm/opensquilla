@@ -54,7 +54,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy minimal build context — everything else is in .dockerignore.
-COPY pyproject.toml README.md README.release.md ./
+COPY pyproject.toml uv.lock README.md README.release.md ./
 COPY hatch_build.py ./
 COPY scripts/verify_webui_artifact.py ./scripts/verify_webui_artifact.py
 COPY scripts/freeze_migration_registry.py ./scripts/freeze_migration_registry.py
@@ -94,8 +94,12 @@ if missing or pointers:
     )
 PY
 
-RUN pip install ".[recommended]" \
-    && rm -rf hatch_build.py scripts opensquilla-webui
+RUN --mount=from=ghcr.io/astral-sh/uv:0.12.15,source=/uv,target=/usr/local/bin/uv \
+    uv export --frozen --no-dev --extra recommended --no-emit-project \
+        --output-file /tmp/opensquilla-requirements.txt \
+    && pip install --require-hashes --requirement /tmp/opensquilla-requirements.txt \
+    && pip install --no-deps ".[recommended]" \
+    && rm -rf hatch_build.py scripts opensquilla-webui uv.lock /tmp/opensquilla-requirements.txt
 
 # Persisted state root. The gateway writes config, state, logs, and the
 # workspace under OPENSQUILLA_STATE_DIR — mounting a volume here (see

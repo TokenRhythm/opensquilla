@@ -407,6 +407,9 @@ class AdmissionSessions(Protocol):
 
 
 class AdmissionPrimitives(Protocol):
+    # Optional-service descriptors are metadata owned by Gateway boot.
+    startup_services: dict[str, dict[str, Any]] | None
+
     @property
     def sessions(self) -> AdmissionSessions | None: ...
 

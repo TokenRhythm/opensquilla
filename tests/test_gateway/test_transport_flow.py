@@ -14,13 +14,82 @@ from starlette.websockets import WebSocketState
 from opensquilla.gateway import websocket as websocket_module
 from opensquilla.gateway.protocol import ResFrame
 from opensquilla.gateway.transport_flow import (
+    FLOW_CAPABILITY,
+    FLOW_CAPABILITY_V2,
+    FLOW_LANE_WINDOW_FRAMES,
     FLOW_WINDOW_FRAMES,
     MAX_WIRE_BYTES,
+    SESSION_FLOW_V2_CAPABILITY,
     FlowWindow,
     TransportBudget,
     get_transport_budget,
 )
 from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, _OutboundFrame
+
+
+@pytest.mark.asyncio
+async def test_cancelled_pending_subscription_does_not_reuse_its_token_or_epoch() -> None:
+    """A failed recovery subscribe must not become an already-ready lease.
+
+    ``sessions.messages.subscribe`` allocates an intent before the recovery
+    read reaches ``activate_message_subscription``.  If that read is
+    cancelled, the intent has no active ``_message_subs`` row, so cleanup must
+    still discard its token coordinate.  Otherwise the next subscribe can
+    inherit a stale token and skip its readiness barrier.
+    """
+    manager = SubscriptionManager()
+    # Model a stale coordinate left by an earlier cancelled attempt.  The
+    # next intent would otherwise inherit it as an already-ready lease.
+    manager._message_subscription_tokens[("conn", "session")] = ("stale", 0)
+    manager._message_subscription_epochs[("conn", "session")] = 7
+    first, created = manager.admit_message_subscription("conn", "session")
+    assert created is False
+    assert first.token == "stale"
+
+    assert manager.unsubscribe_messages(
+        "conn", "session", expected_token=first.token,
+    ) is None
+    assert manager.get_message_subscription_token("conn", "session") is None
+
+    second, second_created = manager.admit_message_subscription("conn", "session")
+    assert second_created is True
+    assert second.token != first.token
+
+
+@pytest.mark.asyncio
+async def test_cancelled_pending_subscription_cleans_its_coordinate_with_an_active_peer() -> None:
+    """A pending lane must not survive beside another subscriber of the key."""
+    manager = SubscriptionManager()
+    manager.subscribe_messages("active", "session")
+    manager._message_subscription_tokens[("pending", "session")] = ("stale", 0)
+    manager._message_subscription_epochs[("pending", "session")] = 7
+
+    intent, created = manager.admit_message_subscription("pending", "session")
+    assert created is False
+    assert intent.token == "stale"
+    assert manager.get_message_subscribers("session") == {"active"}
+
+    assert manager.unsubscribe_messages(
+        "pending", "session", expected_token=intent.token,
+    ) is None
+    assert manager.get_message_subscription_token("pending", "session") is None
+    assert manager.get_message_subscription_epoch("pending", "session") is None
+    assert manager.get_message_subscribers("session") == {"active"}
+    assert manager.get_message_subscription_token("active", "session") is not None
+
+
+def test_disconnect_cleans_pending_subscription_coordinate_without_touching_peer() -> None:
+    manager = SubscriptionManager()
+    manager.subscribe_messages("active", "session")
+    manager._message_subscription_tokens[("pending", "session")] = ("stale", 0)
+    manager._message_subscription_epochs[("pending", "session")] = 7
+
+    manager.remove_connection("pending")
+
+    assert manager.get_message_subscription_token("pending", "session") is None
+    assert manager.get_message_subscription_epoch("pending", "session") is None
+    assert manager.get_message_subscribers("session") == {"active"}
+    assert manager.get_message_subscription_token("active", "session") is not None
 
 
 def test_only_sent_current_epoch_ack_releases_credit() -> None:
@@ -39,6 +108,187 @@ def test_only_sent_current_epoch_ack_releases_credit() -> None:
     flow.acknowledge(flow.epoch, 1)
     flow.acknowledge(flow.epoch, 1)
     assert budget.used == 0
+
+
+def test_lane_ack_releases_active_lane_without_crossing_stalled_lane() -> None:
+    """The additive v2 ledger does not let B's ACK retire A's hole."""
+    budget = TransportBudget()
+    flow = FlowWindow(budget.reserve, budget.release)
+    stalled_a = flow.admit(100, lane="session:a")
+    active_b = flow.admit(200, lane="session:b")
+    assert (stalled_a, active_b) == (1, 2)
+    a_sequence = flow.deliveries[stalled_a].lane_sequence
+    b_sequence = flow.deliveries[active_b].lane_sequence
+    assert (a_sequence, b_sequence) == (1, 1)
+    flow.mark_sent(stalled_a)
+    flow.mark_sent(active_b)
+
+    # B can release its own bytes while A remains unacknowledged.  The v1
+    # connection watermark intentionally remains at zero because ID 1 is a
+    # hole; this is the invariant the future wire capability must expose.
+    flow.acknowledge_lane(flow.epoch, "session:b", b_sequence)
+    assert budget.used == 100
+    assert stalled_a in flow.deliveries
+    assert active_b not in flow.deliveries
+    assert flow.ack_id == 0
+    assert flow.lane_ack_ids == {"session:b": b_sequence}
+
+    flow.acknowledge_lane(flow.epoch, "session:a", a_sequence)
+    assert budget.used == 0
+    assert flow.lane_ack_ids == {"session:a": a_sequence, "session:b": b_sequence}
+
+
+def test_lane_ack_rejects_unsent_or_foreign_watermark() -> None:
+    budget = TransportBudget()
+    flow = FlowWindow(budget.reserve, budget.release)
+    a = flow.admit(100, lane="a")
+    b = flow.admit(100, lane="b")
+    flow.mark_sent(b)
+    a_sequence = flow.deliveries[a].lane_sequence
+    b_sequence = flow.deliveries[b].lane_sequence
+    with pytest.raises(ValueError, match="unsent"):
+        flow.acknowledge_lane(flow.epoch, "a", a_sequence)
+    flow.mark_sent(a)
+    with pytest.raises(ValueError, match="(ahead|belong)"):
+        flow.acknowledge_lane(flow.epoch, "c", b_sequence)
+    flow.close()
+
+
+def test_retired_lane_can_be_reused_only_by_a_new_subscription_epoch() -> None:
+    budget = TransportBudget()
+    flow = FlowWindow(budget.reserve, budget.release, lane_mode=True)
+    first = flow.admit(100, lane="session:a", lane_epoch="sub-old")
+    assert first is not None
+    flow.mark_sent(first)
+    token = flow.retire_lane(flow.epoch, "session:a", lane_epoch="sub-old")
+    flow.confirm_lane_retire(
+        flow.epoch, "session:a", token, first, lane_epoch="sub-old",
+    )
+    assert flow.admit(100, lane="session:a", lane_epoch="sub-old") is None
+    replacement = flow.admit(100, lane="session:a", lane_epoch="sub-new")
+    assert replacement is not None
+    flow.close()
+
+
+@pytest.mark.parametrize("confirm_before_reopen", [False, True])
+@pytest.mark.parametrize("old_has_delivery", [False, True])
+def test_subscription_registration_reopens_retired_or_closed_lane(
+    confirm_before_reopen: bool, old_has_delivery: bool,
+) -> None:
+    """Reopening history works on either side of the old discard receipt."""
+    budget = TransportBudget()
+    flow = FlowWindow(budget.reserve, budget.release, lane_mode=True)
+    flow.register_lane_epoch("session", "old")
+    old_delivery = 0
+    if old_has_delivery:
+        old_delivery = flow.admit(100, lane="session", lane_epoch="old")
+        assert old_delivery is not None
+        flow.mark_sent(old_delivery)
+    token = flow.retire_lane(flow.epoch, "session", lane_epoch="old")
+    if confirm_before_reopen:
+        flow.confirm_lane_retire(
+            flow.epoch, "session", token, old_delivery, lane_epoch="old",
+        )
+
+    # Production subscribe establishes this fence before its first event.
+    # Unlike delivery-time admit(), registration must also accept CLOSED.
+    flow.register_lane_epoch("session", "new")
+    if confirm_before_reopen:
+        assert ("session", "old") not in flow._lane_epoch_states
+    else:
+        assert flow._lane_epoch_states[("session", "old")] == "RETIRED"
+    with pytest.raises(ValueError, match="epoch"):
+        flow.acknowledge_lane_delivery(
+            flow.epoch, "session", old_delivery, lane_epoch="old",
+        )
+    with pytest.raises(ValueError, match="not retired"):
+        flow.register_lane_epoch("session", "unretired-replacement")
+
+    replacement = flow.admit(200, lane="session", lane_epoch="new")
+    assert replacement is not None
+    flow.mark_sent(replacement)
+    if not confirm_before_reopen:
+        flow.confirm_lane_retire(
+            flow.epoch, "session", token, old_delivery, lane_epoch="old",
+        )
+    assert replacement in flow.deliveries
+    assert budget.used == 200
+    flow.acknowledge_lane_delivery(
+        flow.epoch, "session", replacement, lane_epoch="new",
+    )
+    assert budget.used == 0
+
+
+def test_physical_lane_ack_does_not_change_lane_sequence_watermark() -> None:
+    budget = TransportBudget()
+    flow = FlowWindow(budget.reserve, budget.release, lane_mode=True)
+    delivery = flow.admit(100, lane="session:a", lane_epoch="sub-a")
+    assert delivery is not None
+    flow.mark_sent(delivery)
+    flow.acknowledge_lane_delivery(
+        flow.epoch, "session:a", delivery, lane_epoch="sub-a",
+    )
+    assert flow.lane_delivery_ack_ids == {"session:a": delivery}
+    assert flow.lane_ack_ids == {}
+
+
+def test_physical_lane_ack_interleaving_releases_only_the_selected_lane() -> None:
+    budget = TransportBudget()
+    flow = FlowWindow(budget.reserve, budget.release, lane_mode=True)
+    a1 = flow.admit(100, lane="a", lane_epoch="a-1")
+    b1 = flow.admit(200, lane="b", lane_epoch="b-1")
+    a2 = flow.admit(300, lane="a", lane_epoch="a-1")
+    assert (a1, b1, a2) == (1, 2, 3)
+    for delivery_id in (a1, b1, a2):
+        flow.mark_sent(delivery_id)
+
+    flow.acknowledge_lane_delivery(flow.epoch, "b", b1, lane_epoch="b-1")
+    assert budget.used == 400
+    assert set(flow.deliveries) == {a1, a2}
+    flow.acknowledge_lane_delivery(flow.epoch, "a", a2, lane_epoch="a-1")
+    assert budget.used == 0
+    assert not flow.deliveries
+
+
+def test_old_lane_ack_is_rejected_after_replacement_epoch() -> None:
+    budget = TransportBudget()
+    flow = FlowWindow(budget.reserve, budget.release, lane_mode=True)
+    old = flow.admit(100, lane="session", lane_epoch="old")
+    assert old is not None
+    flow.mark_sent(old)
+    token = flow.retire_lane(flow.epoch, "session", lane_epoch="old")
+    replacement = flow.admit(200, lane="session", lane_epoch="new")
+    assert replacement is not None
+    flow.mark_sent(replacement)
+    with pytest.raises(ValueError, match="epoch"):
+        flow.acknowledge_lane_delivery(
+            flow.epoch, "session", old, lane_epoch="old",
+        )
+    assert budget.used == 300
+    flow.confirm_lane_retire(
+        flow.epoch, "session", token, old, lane_epoch="old",
+    )
+    assert budget.used == 200
+
+
+def test_ack_from_a_reset_connection_epoch_cannot_release_new_flow() -> None:
+    budget = TransportBudget()
+    old_flow = FlowWindow(budget.reserve, budget.release, lane_mode=True)
+    old = old_flow.admit(100, lane="session", lane_epoch="old")
+    assert old is not None
+    old_flow.mark_sent(old)
+    old_epoch = old_flow.epoch
+    old_flow.close()
+    new_flow = FlowWindow(budget.reserve, budget.release, lane_mode=True)
+    fresh = new_flow.admit(200, lane="session", lane_epoch="new")
+    assert fresh is not None
+    new_flow.mark_sent(fresh)
+    with pytest.raises(ValueError, match="epoch"):
+        new_flow.acknowledge_lane_delivery(
+            old_epoch, "session", old, lane_epoch="old",
+        )
+    assert budget.used == 200
+    new_flow.close()
 
 
 def test_large_frame_is_admitted_when_ordinary_window_is_empty() -> None:
@@ -188,6 +438,90 @@ class _FastSocket:
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
         self.closed.append(code)
+
+
+def test_retired_queued_delivery_keeps_credit_until_dequeue_after_confirmation() -> None:
+    budget = TransportBudget()
+    flow = FlowWindow(budget.reserve, budget.release, lane_mode=True)
+    old = flow.admit(100, lane="a", lane_epoch="old")
+    assert old is not None
+    token = flow.retire_lane(flow.epoch, "a", lane_epoch="old")
+    flow.confirm_lane_retire(flow.epoch, "a", token, old, lane_epoch="old")
+    assert budget.used == 100
+    replacement = flow.admit(200, lane="a", lane_epoch="new")
+    assert replacement is not None
+    assert flow.discard_retired_queued(old)
+    assert budget.used == 200
+    with pytest.raises(KeyError):
+        flow.discard_retired_queued(old)
+    assert not flow.discard_retired_queued(replacement)
+    flow.mark_sent(replacement)
+    with pytest.raises(ValueError, match="epoch"):
+        flow.acknowledge_lane_delivery(flow.epoch, "a", old, lane_epoch="old")
+    flow.acknowledge_lane_delivery(flow.epoch, "a", replacement, lane_epoch="new")
+    assert budget.used == 0
+
+
+def test_retire_confirmation_during_send_keeps_credit_until_send_finishes() -> None:
+    budget = TransportBudget()
+    flow = FlowWindow(budget.reserve, budget.release, lane_mode=True)
+    delivery = flow.admit(100, lane="a", lane_epoch="old")
+    assert delivery is not None
+    flow.mark_sending(delivery)
+    token = flow.retire_lane(flow.epoch, "a", lane_epoch="old")
+    flow.confirm_lane_retire(flow.epoch, "a", token, delivery, lane_epoch="old")
+    assert not flow.discard_retired_queued(delivery)
+    assert budget.used == 100
+    flow.mark_sent(delivery)
+    flow.mark_send_finished(delivery)
+    assert budget.used == 0
+
+
+@pytest.mark.parametrize("confirm_before_dequeue", [False, True])
+async def test_task_switch_discards_queued_old_epoch_without_closing_peer_lane(
+    monkeypatch, confirm_before_dequeue: bool,
+) -> None:
+    initial_budget = get_transport_budget().used
+    registry = websocket_module.ConnectionRegistry()
+    monkeypatch.setattr(websocket_module, "_registry", registry)
+    ws = _FastSocket()
+    conn = WsConnection(
+        "retire-queued", ws, client_caps=frozenset({SESSION_FLOW_V2_CAPABILITY}),
+    )  # type: ignore[arg-type]
+    conn._subscriptions = SubscriptionManager()
+    registry.register(conn)
+    conn._enable_flow()
+    conn._start_writer(maxsize=16, enabled=True)
+    assert conn._flow is not None
+    try:
+        for key in ("a", "b"):
+            conn._subscriptions.subscribe_messages(conn.conn_id, key)
+            await conn.send_event("session.event.text_delta", {"session_key": key, "text": key})
+        assert conn._outbox.qsize() == 2
+        queued_bytes = conn._transport_bytes
+        retire = conn._subscriptions.unsubscribe_messages(conn.conn_id, "a")
+        assert retire is not None
+        assert conn._transport_bytes == queued_bytes
+        if confirm_before_dequeue:
+            conn.apply_session_flow_update_v2({
+                "connection_epoch": conn._flow.epoch,
+                "consumed": [], "staged_recovery": [], "discarded_lanes": [retire],
+            })
+            assert conn._transport_bytes == queued_bytes
+        conn._subscriptions.subscribe_messages(conn.conn_id, "a")
+        await conn.send_event("session.event.text_delta", {"session_key": "a", "text": "new"})
+        for _ in range(8):
+            await asyncio.sleep(0)
+        assert not conn._closing
+        assert ws.closed == []
+        assert [frame["payload"]["text"] for frame in ws.frames] == ["b", "new"]
+        assert [frame["seq"] for frame in ws.frames] == [1, 2]
+        assert all(not delivery.retired_unsent for delivery in conn._flow.deliveries.values())
+    finally:
+        await conn._stop_writer()
+        conn._cleanup_transport()
+        registry.unregister(conn.conn_id)
+    assert get_transport_budget().used == initial_budget
 
 
 @pytest.mark.parametrize("reason_code", [
@@ -451,6 +785,65 @@ async def test_fast_socket_does_not_bypass_renderer_credit_and_other_peer_remain
         for conn in (slow, fast):
             await conn._stop_writer()
             conn._cleanup_transport()
+    assert get_transport_budget().used == before
+
+
+async def test_v2_lane_admission_keeps_active_session_live_behind_stalled_session() -> None:
+    """A stalled session lane must not consume the whole v2 connection window.
+
+    This is intentionally server-side admission coverage.  The current v1
+    client still uses the cumulative ACK wire shape; lane ACK negotiation and
+    client ledger integration remain a later contract slice.  Negotiating the
+    additive capability is therefore explicit in this test and does not alter
+    legacy peers.
+    """
+    before = get_transport_budget().used
+    socket = _FastSocket()
+    conn = WsConnection(
+        "same-connection-lanes",
+        socket,
+        client_caps=frozenset({FLOW_CAPABILITY, FLOW_CAPABILITY_V2}),
+    )
+    subscriptions = SubscriptionManager()
+    conn._subscriptions = subscriptions
+    subscriptions.subscribe_messages(conn.conn_id, "A")
+    subscriptions.subscribe_messages(conn.conn_id, "B")
+    conn._enable_flow()
+    conn._start_writer(maxsize=512, enabled=True)
+    try:
+        for sequence in range(1, FLOW_LANE_WINDOW_FRAMES + 1):
+            await conn.send_event(
+                "session.event.text_delta",
+                {
+                    "session_key": "A",
+                    "stream_generation": "g",
+                    "stream_seq": sequence,
+                    "text": "a",
+                },
+            )
+            await asyncio.sleep(0)
+
+        # A has no ACK, but B still receives a frame on the same socket.
+        await conn.send_event(
+            "session.event.text_delta",
+            {"session_key": "B", "stream_generation": "g", "stream_seq": 1, "text": "b"},
+        )
+        await asyncio.sleep(0)
+        events = [
+            frame for frame in socket.frames
+            if frame.get("event") == "session.event.text_delta"
+        ]
+        assert sum(
+            frame.get("payload", {}).get("session_key") == "A" for frame in events
+        ) == FLOW_LANE_WINDOW_FRAMES
+        assert sum(
+            frame.get("payload", {}).get("session_key") == "B" for frame in events
+        ) == 1
+        assert "B" not in conn._flow.dirty
+        assert conn._flow.deliveries[FLOW_LANE_WINDOW_FRAMES + 1].lane == "B"
+    finally:
+        await conn._stop_writer()
+        conn._cleanup_transport()
     assert get_transport_budget().used == before
 
 
@@ -784,3 +1177,140 @@ async def test_unsubscribe_can_finish_global_barrier_but_not_another_unrecovered
     finally:
         conn._cleanup_transport()
         registry.unregister(conn.conn_id)
+
+
+def test_session_lane_ack_uses_physical_watermark_without_touching_legacy_sequence() -> None:
+    budget = TransportBudget()
+    flow = FlowWindow(budget.reserve, budget.release, lane_mode=True)
+    first = flow.admit(100, lane="a", lane_epoch="0")
+    second = flow.admit(100, lane="b", lane_epoch="0")
+    assert (first, second) == (1, 2)
+    flow.mark_sent(first)
+    flow.mark_sent(second)
+    flow.acknowledge_lane(flow.epoch, "a", 1)
+    assert flow.lane_ack_ids == {"a": 1}
+    assert flow.lane_delivery_ack_ids == {}
+    flow.acknowledge_lane_delivery(flow.epoch, "b", second)
+    assert flow.lane_ack_ids == {"a": 1}
+    assert flow.lane_delivery_ack_ids == {"b": second}
+    assert budget.used == 0
+
+
+def test_retired_lane_keeps_old_fence_while_same_key_resubscribes() -> None:
+    budget = TransportBudget()
+    flow = FlowWindow(budget.reserve, budget.release, lane_mode=True)
+    old = flow.admit(100, lane="session", lane_epoch="0")
+    assert old == 1
+    flow.mark_sent(old)
+    token = flow.retire_lane(flow.epoch, "session", lane_epoch="0", final_published_id=old)
+    replacement = flow.admit(100, lane="session", lane_epoch="1")
+    assert replacement == 2
+    flow.mark_sent(replacement)
+    flow.acknowledge_lane_delivery(
+        flow.epoch, "session", replacement, lane_epoch="1",
+    )
+    assert old in flow.deliveries
+    # The new lane ACK released only its replacement reservation; the old
+    # unsubscribe confirmation remains independently valid.
+    flow.confirm_lane_retire(flow.epoch, "session", token, old, lane_epoch="0")
+    assert old not in flow.deliveries
+    assert replacement not in flow.deliveries
+    with pytest.raises(ValueError, match="retired"):
+        flow.confirm_lane_retire(flow.epoch, "session", token, old, lane_epoch="0")
+    assert budget.used == 0
+
+
+def test_session_flow_v2_connection_dispatches_lane_ack_and_retire_confirmation() -> None:
+    registry = websocket_module.ConnectionRegistry()
+    old_registry = websocket_module._registry
+    websocket_module._registry = registry
+    conn = WsConnection(
+        "v2-wire", _FastSocket(),
+        client_caps=frozenset({SESSION_FLOW_V2_CAPABILITY}),
+    )  # type: ignore[arg-type]
+    conn._subscriptions = SubscriptionManager()
+    registry.register(conn)
+    conn._enable_flow()
+    conn._subscriptions.subscribe_messages(conn.conn_id, "session")
+    subscription_epoch = conn._subscriptions.get_message_subscription_epoch(conn.conn_id, "session")
+    assert subscription_epoch is not None
+    delivery = conn._flow.admit(100, lane="session", lane_epoch=subscription_epoch)  # type: ignore[union-attr]
+    assert delivery == 1
+    conn._flow_lane_epochs[subscription_epoch] = "session"
+    conn._flow.mark_sent(delivery)  # type: ignore[union-attr]
+    try:
+        result = conn.apply_session_flow_update_v2(
+            {
+                "connection_epoch": conn._flow.epoch,  # type: ignore[union-attr]
+                "consumed": [
+                    {"subscription_epoch": subscription_epoch, "through_delivery_id": delivery}
+                ],
+                "staged_recovery": [],
+                "discarded_lanes": [],
+            }
+        )
+        assert result["consumed"][0]["through_delivery_id"] == delivery
+        assert delivery not in conn._flow.deliveries  # type: ignore[union-attr]
+        retire = conn._subscriptions.unsubscribe_messages(conn.conn_id, "session")
+        assert retire is not None
+        retired = conn.apply_session_flow_update_v2({
+            "connection_epoch": conn._flow.epoch,  # type: ignore[union-attr]
+            "consumed": [], "staged_recovery": [],
+            "discarded_lanes": [{
+                "subscription_epoch": retire["subscription_epoch"],
+                "retire_token": retire["retire_token"],
+                "final_published_id": retire["final_published_id"],
+            }],
+        })
+        assert retired["discarded_lanes"]
+    finally:
+        conn._cleanup_transport()
+        registry.unregister(conn.conn_id)
+        websocket_module._registry = old_registry
+
+
+def test_session_flow_v2_rejects_unretired_epoch_churn_until_receipt() -> None:
+    registry = websocket_module.ConnectionRegistry()
+    old_registry = websocket_module._registry
+    websocket_module._registry = registry
+    conn = WsConnection(
+        "v2-churn", _FastSocket(),
+        client_caps=frozenset({SESSION_FLOW_V2_CAPABILITY}),
+    )  # type: ignore[arg-type]
+    conn._subscriptions = SubscriptionManager()
+    registry.register(conn)
+    conn._enable_flow()
+    first_retire: dict[str, object] | None = None
+    try:
+        for index in range(16):
+            conn._subscriptions.subscribe_messages(conn.conn_id, "session")
+            epoch = conn._subscriptions.get_message_subscription_epoch(conn.conn_id, "session")
+            assert epoch is not None
+            delivery = conn._flow.admit(100, lane="session", lane_epoch=epoch)  # type: ignore[union-attr]
+            assert delivery is not None
+            conn._flow.mark_sent(delivery)  # type: ignore[union-attr]
+            conn._flow_lane_epochs[epoch] = "session"
+            retire = conn._subscriptions.unsubscribe_messages(conn.conn_id, "session")
+            assert retire is not None
+            if first_retire is None:
+                first_retire = retire
+        assert first_retire is not None
+        # The connection refuses new epoch churn while old retire fences are
+        # outstanding; it never forgets the oldest epoch to make room.
+        assert len(conn._flow_lane_epochs) <= 16
+        assert len(conn._flow._lane_epoch_states) == 16  # type: ignore[union-attr]
+        conn._subscriptions.subscribe_messages(conn.conn_id, "session")
+        blocked_epoch = conn._subscriptions.get_message_subscription_epoch(conn.conn_id, "session")
+        assert blocked_epoch is not None
+        assert conn._flow.admit(100, lane="session", lane_epoch=blocked_epoch) is None  # type: ignore[union-attr]
+        result = conn.apply_session_flow_update_v2({
+            "connection_epoch": conn._flow.epoch,  # type: ignore[union-attr]
+            "consumed": [], "staged_recovery": [],
+            "discarded_lanes": [first_retire],
+        })
+        assert result["discarded_lanes"] == [first_retire]
+        assert len(conn._flow._lane_epoch_states) == 15  # type: ignore[union-attr]
+    finally:
+        conn._cleanup_transport()
+        registry.unregister(conn.conn_id)
+        websocket_module._registry = old_registry

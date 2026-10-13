@@ -215,6 +215,8 @@ export class WorkbenchRuntimeManager {
     options?: WorkbenchBeforeCloseOptions,
   ): Promise<boolean> {
     if (!this.isCurrentDescriptor(item)) return true
+    // Browsers have no source edits to persist; navigation must not block closing a tab.
+    if (item.kind === 'browser') return true
     await this.flush(item.id)
     const runtime = await this.ensureRuntime(item)
     try {

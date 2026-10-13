@@ -33,10 +33,12 @@ from opensquilla.provider.model_catalog import (
     shared_catalog,
 )
 from opensquilla.session.cost_rollup import rollup_cost_source
+from opensquilla.session.storage import StorageBusyError
 from opensquilla.session.tokenizer import estimate_tokens
 
 _d = get_dispatcher()
 _CONTEXT_WARNING_RATIO = 0.85
+_CONTEXT_ESTIMATE_MAX_ENTRIES = 128
 
 
 def _now_ms() -> int:
@@ -132,21 +134,99 @@ async def _context_status(
     compaction_count = _positive_int(_field(source, "compaction_count")) or 0
     context_tokens = persisted_context_tokens
     token_source = "session_context_tokens" if context_tokens is not None else "unavailable"
+    estimate_complete: bool | None = None
+    estimate_entry_count: int | None = None
+    estimate_unknown_entries: int | None = None
     should_estimate_transcript = (
         allow_transcript_estimate
         and ctx.session_manager is not None
         and (context_tokens is None or compaction_count > 0)
     )
     if should_estimate_transcript:
-        get_transcript = getattr(ctx.session_manager, "get_transcript", None)
-        if callable(get_transcript):
+        # Prefer a scalar metadata aggregate.  Calling get_transcript() here
+        # used to materialize every body (including multi-MiB/legacy rows) on
+        # the usage RPC's control path, and compaction made that path run more
+        # often.  A busy/failed metadata read is explicitly unavailable; it
+        # must never trigger a second full-body retry.
+        get_token_metadata = getattr(
+            ctx.session_manager, "get_transcript_token_metadata", None
+        )
+        metadata_attempted = callable(get_token_metadata)
+        if callable(get_token_metadata):
             try:
-                transcript = await get_transcript(session_key)
-            except (KeyError, AttributeError, NotImplementedError):
-                transcript = None
-            if transcript is not None:
-                context_tokens = sum(_transcript_entry_tokens(entry) for entry in transcript)
-                token_source = "transcript_estimate"
+                metadata = await get_token_metadata(session_key)
+            except (
+                KeyError,
+                AttributeError,
+                NotImplementedError,
+                StorageBusyError,
+                TimeoutError,
+            ):
+                metadata = None
+            if isinstance(metadata, Mapping):
+                estimate_entry_count = _positive_int(metadata.get("entry_count")) or 0
+                estimate_unknown_entries = (
+                    _positive_int(metadata.get("unknown_entries")) or 0
+                )
+                known_tokens = _positive_int(metadata.get("known_tokens")) or 0
+                if known_tokens or estimate_unknown_entries == 0:
+                    context_tokens = known_tokens
+                    estimate_complete = estimate_unknown_entries == 0
+                    token_source = (
+                        "transcript_metadata"
+                        if estimate_complete
+                        else "transcript_metadata_partial"
+                    )
+                else:
+                    # A compacted row may still carry an old persisted
+                    # context_tokens value.  If the active transcript has no
+                    # usable token metadata, retaining that value would
+                    # present stale context pressure as current.  Fail closed
+                    # to the existing null/unavailable wire state.
+                    context_tokens = None
+                    token_source = "unavailable"
+            else:
+                # Storage busy/timeout or an unavailable metadata adapter is
+                # an explicit control-plane unknown; never reuse a stale
+                # persisted estimate and never retry with full transcript
+                # materialization.
+                context_tokens = None
+                token_source = "unavailable"
+        if not metadata_attempted:
+            # Compatibility seam for old test doubles/adapters.  The shipped
+            # SessionManager implements the metadata method above, so the
+            # production path never enters this fallback.  Keep the legacy
+            # call only when an adapter does not expose the new method yet.
+            get_transcript = getattr(ctx.session_manager, "get_transcript", None)
+            if callable(get_transcript):
+                try:
+                    transcript = await get_transcript(
+                        session_key,
+                        limit=_CONTEXT_ESTIMATE_MAX_ENTRIES,
+                        content_mode="bounded",
+                    )
+                except TypeError:
+                    # Older adapters do not accept bounded-read keywords.  We
+                    # retain their historical behavior for compatibility;
+                    # this branch is intentionally unreachable for the
+                    # bundled SessionManager.
+                    transcript = await get_transcript(session_key)
+                except (
+                    KeyError,
+                    AttributeError,
+                    NotImplementedError,
+                    StorageBusyError,
+                    TimeoutError,
+                ):
+                    transcript = None
+                if transcript is not None:
+                    context_tokens = sum(
+                        _transcript_entry_tokens(entry) for entry in transcript
+                    )
+                    token_source = "transcript_estimate"
+                    estimate_entry_count = len(transcript)
+                    estimate_complete = len(transcript) < _CONTEXT_ESTIMATE_MAX_ENTRIES
+                    estimate_unknown_entries = 0
     if context_tokens is None:
         return None
 
@@ -172,6 +252,12 @@ async def _context_status(
         "compaction_count": compaction_count,
         "token_source": token_source,
         "window_source": window_source,
+        "contextEstimateComplete": estimate_complete,
+        "contextEstimateEntryCount": estimate_entry_count,
+        "contextEstimateUnknownEntries": estimate_unknown_entries,
+        "context_estimate_complete": estimate_complete,
+        "context_estimate_entry_count": estimate_entry_count,
+        "context_estimate_unknown_entries": estimate_unknown_entries,
     }
 
 

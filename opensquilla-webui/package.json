@@ -28,31 +28,37 @@
     "node": ">=22.12.0"
   },
   "dependencies": {
+    "@noble/hashes": "2.4.0",
     "@tanstack/vue-virtual": "3.13.39",
     "@vue/devtools-api": "^8.2.1",
     "dompurify": "^3.4.16",
     "highlight.js": "^11.12.0",
     "html-to-image": "^1.11.13",
-    "katex": "^0.18.9",
-    "marked": "^18.0.14",
+    "katex": "^0.19.0",
+    "marked": "^18.1.0",
+    "mermaid": "^11.17.2",
     "pinia": "^4.0.3",
     "vue": "^3.5.43",
-    "vue-i18n": "^11.4.12",
-    "vue-router": "^5.3.1"
+    "vue-i18n": "^11.4.13",
+    "vue-router": "^5.4.0"
+  },
+  "overrides": {
+    "katex": "$katex"
   },
   "devDependencies": {
-    "@playwright/test": "^1.63.0",
-    "@types/ws": "^8.18.1",
+    "@playwright/test": "^1.64.0",
+    "@types/ws": "^8.18.2",
     "@typescript/typescript6": "6.0.2",
     "@vitejs/plugin-vue": "^6.0.9",
     "ajv": "8.20.0",
+    "fake-indexeddb": "6.2.5",
     "happy-dom": "^20.14.5",
     "json-schema-to-typescript": "16.0.0",
     "json-schema-to-typescript-legacy": "npm:json-schema-to-typescript@15.0.4",
     "typescript": "7.0.2",
-    "vite": "^8.3.1",
-    "vitest": "^5.0.1",
-    "vue-tsc": "^3.3.11",
-    "ws": "^8.21.3"
+    "vite": "^8.3.4",
+    "vitest": "^5.0.3",
+    "vue-tsc": "^3.3.12",
+    "ws": "^8.22.0"
   }
 }

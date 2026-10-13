@@ -14,6 +14,8 @@ import { createV4PendingInputQueue } from './pendingInputQueueV4'
 import { createApprovalCenterV4 } from './approvalCenterV4'
 import type { ApprovalCenter } from '@/modules/approvalCenter'
 import type { HttpTransport } from './privateHttpTransport'
+import type { HistoryContentReaderFactory } from '@/modules/historyContent'
+import { createHistoryContentReader } from './historyContentV4'
 import type { GoalCenter } from '@/modules/goalCenter'
 import { createV4GoalCenter } from './goalCenterV4'
 import { createV4GoalContinuity } from './goalContinuityV4'
@@ -80,6 +82,7 @@ type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>
   & Parameters<typeof createV4GatewayAccess>[0]
 
 export interface GatewayAdapters {
+  readonly historyContentReader: HistoryContentReaderFactory
   readonly gatewayAccess: GatewayAccess
   readonly conversationEvents: ConversationEvents
   readonly sessionReadLifecycleFactory: SessionReadLifecycleFactory
@@ -154,6 +157,7 @@ export function createGatewayAdapters(
   )
   const conversationEvents = createConversationEventTransport(transports.events)
   const adapters: GatewayAdapters = {
+    historyContentReader: createHistoryContentReader(http),
     gatewayAccess,
     conversationEvents,
     sessionReadLifecycleFactory,

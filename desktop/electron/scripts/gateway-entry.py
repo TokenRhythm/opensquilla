@@ -1,5 +1,4 @@
 import os
-import ssl
 import sys
 
 _DESKTOP_CA_PROBE_ARG = "--_desktop-ca-probe"
@@ -39,6 +38,8 @@ def _is_recovery_invocation(argv: list[str]) -> bool:
 
 
 def _run_desktop_ca_probe() -> int:
+    import ssl
+
     try:
         context = ssl.create_default_context()
         ca_certificate_count = len(context.get_ca_certs(binary_form=True))
@@ -113,6 +114,7 @@ def _run_desktop_pty_probe() -> int:
     """Verify that the frozen gateway contains a working platform PTY backend."""
     import asyncio
     import json
+    import time
     from contextlib import suppress
 
     from opensquilla.tools.pty_backend import (
@@ -122,6 +124,26 @@ def _run_desktop_pty_probe() -> int:
         terminate_pty,
         wait_pty,
     )
+
+    started_at = time.monotonic()
+    diagnostic = {"phase": "spawn", "outputBytes": 0, "sawTtyMarker": False}
+
+    def write_failure_diagnostic(exc: Exception) -> None:
+        report_dir = os.environ.get("CI_REPORT_DIR")
+        if not report_dir:
+            return
+        causes = []
+        cause: BaseException | None = exc
+        while cause is not None and len(causes) < 5:
+            causes.append(type(cause).__name__)
+            cause = cause.__cause__
+        diagnostic["errorTypes"] = causes
+        # Keep the one-line stdout contract intact, including the CI retry's
+        # exact-match check. Never record environment, command, or PTY content.
+        with suppress(OSError):
+            filename = os.path.join(report_dir, "pty-probe-failures.jsonl")
+            with open(filename, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(diagnostic) + "\n")
 
     if os.name == "nt":
         command = (
@@ -142,15 +164,19 @@ def _run_desktop_pty_probe() -> int:
         reading = None
         try:
             handle = spawn_pty(command, cwd=os.getcwd(), env=dict(os.environ))
+            diagnostic["spawnElapsedMs"] = round((time.monotonic() - started_at) * 1000)
             async with asyncio.timeout(_DESKTOP_PTY_PROBE_TIMEOUT_SECONDS):
                 chunks: list[bytes] = []
+                marker_tail = b""
                 exited = asyncio.create_task(wait_pty(handle))
                 while True:
+                    diagnostic["phase"] = "read"
                     reading = asyncio.create_task(read_pty(handle))
                     done, _ = await asyncio.wait(
                         {reading, exited}, return_when=asyncio.FIRST_COMPLETED,
                     )
                     if exited in done and reading not in done:
+                        diagnostic["phase"] = "post-exit-drain"
                         # ConPTY can keep its socket open after the child has
                         # exited.  Give the reader a bounded grace period to
                         # receive buffered tail bytes, then treat quietness as
@@ -171,12 +197,30 @@ def _run_desktop_pty_probe() -> int:
                             break
                     if not chunk:
                         break
+                    diagnostic["outputBytes"] += len(chunk)
+                    marker_window = marker_tail + chunk
+                    diagnostic["sawTtyMarker"] |= b"opensquilla-pty-ok" in marker_window
+                    marker_tail = marker_window[-17:]
                     chunks.append(chunk)
+                diagnostic["phase"] = "wait-exit"
                 return b"".join(chunks).decode("utf-8", errors="replace"), await exited
         except PtyBackendError as exc:
             handle = exc.handle or handle
             raise
         finally:
+            diagnostic["pid"] = getattr(handle, "pid", None)
+            diagnostic["elapsedBeforeCleanupMs"] = round(
+                (time.monotonic() - started_at) * 1000,
+            )
+            diagnostic["waitCompletedBeforeCleanup"] = exited is not None and exited.done()
+            diagnostic["waitCancelledBeforeCleanup"] = (
+                exited is not None and exited.cancelled()
+            )
+            if exited is not None and exited.done() and not exited.cancelled():
+                with suppress(Exception):
+                    diagnostic["returncodeBeforeCleanup"] = exited.result()
+            diagnostic["cleanupAttempted"] = handle is not None
+            diagnostic["cleanupCompleted"] = False
             if reading is not None and not reading.done():
                 reading.cancel()
                 with suppress(asyncio.CancelledError):
@@ -190,6 +234,7 @@ def _run_desktop_pty_probe() -> int:
                 # reader thread, including a failed spawn that returned a handle.
                 with suppress(Exception):
                     await terminate_pty(handle)
+                    diagnostic["cleanupCompleted"] = True
                 if exited is None or exited.cancelled() or not exited.done():
                     with suppress(Exception):
                         await asyncio.wait_for(wait_pty(handle), timeout=5.0)
@@ -206,6 +251,7 @@ def _run_desktop_pty_probe() -> int:
         print(json.dumps(result))
         return 0 if result["available"] else 1
     except PtyBackendError as exc:
+        write_failure_diagnostic(exc)
         print(json.dumps({
             "probe": "opensquilla-desktop-pty",
             "available": False,
@@ -214,6 +260,7 @@ def _run_desktop_pty_probe() -> int:
         }))
         return 1
     except Exception as exc:
+        write_failure_diagnostic(exc)
         print(json.dumps({
             "probe": "opensquilla-desktop-pty",
             "available": False,
@@ -319,6 +366,13 @@ if __name__ == "__main__":
         raise SystemExit(dispatch_internal_child(["filesystem-worker", "-"]))
 
     if len(sys.argv) >= 3 and sys.argv[1] == _INTERNAL_CHILD_ARG:
+        if sys.argv[2:4] == ["process-tree", "--windows-owned-launch"]:
+            # The Windows ready handshake must not import the sandbox or the
+            # parent's asyncio/ownership registry before signalling readiness.
+            from opensquilla._windows_owned_launch import main as windows_owned_main
+
+            raise SystemExit(windows_owned_main(sys.argv[3:]))
+
         from opensquilla.sandbox.runtime_launcher import dispatch_internal_child
 
         raise SystemExit(dispatch_internal_child(sys.argv[2:]))
@@ -329,6 +383,11 @@ if __name__ == "__main__":
         )
 
         raise SystemExit(elevated_setup_helper_main(sys.argv[1:]))
+
+    if len(sys.argv) == 3 and sys.argv[1] == "--windows-setup-launcher":
+        from opensquilla.sandbox.backend.windows_setup_process import setup_launcher_main
+
+        raise SystemExit(setup_launcher_main(sys.argv[1:]))
 
     from opensquilla.startup_timing import startup_phase_end, startup_phase_start
 

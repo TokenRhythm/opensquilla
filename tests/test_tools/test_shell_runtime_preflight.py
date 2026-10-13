@@ -38,6 +38,7 @@ async def test_missing_declared_runtime_returns_actionable_result_before_executi
 
     monkeypatch.setattr(shell, "get_runtime", lambda: None)
     monkeypatch.setattr(shell, "full_host_access_active", lambda: full_access)
+    monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.setattr(shell, "_base_shell_environment", lambda: {"PATH": str(tmp_path)})
     monkeypatch.setattr(shell, "_runtime_shell_environment", lambda env, **_kw: env)
     monkeypatch.setattr(shell, "_managed_skill_environment", lambda env: env)
@@ -347,7 +348,7 @@ async def test_full_host_exec_preserves_exported_runtime_function(
         pytest.skip("Bash is unavailable")
     monkeypatch.setattr(shell, "get_runtime", lambda: None)
     monkeypatch.setattr(shell, "full_host_access_active", lambda: True)
-    monkeypatch.setattr(shell, "_base_shell_environment", lambda: {"PATH": str(tmp_path)})
+    monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.setattr(shell, "_runtime_shell_environment", lambda env, **_kw: env)
     monkeypatch.setattr(shell, "_managed_skill_environment", lambda env: env)
 
@@ -377,7 +378,7 @@ async def test_full_host_exec_preserves_parameter_assignment_resolution(
     executable.chmod(0o755)
     monkeypatch.setattr(shell, "get_runtime", lambda: None)
     monkeypatch.setattr(shell, "full_host_access_active", lambda: True)
-    monkeypatch.setattr(shell, "_base_shell_environment", lambda: {"PATH": ""})
+    monkeypatch.setenv("PATH", "")
     monkeypatch.setattr(shell, "_runtime_shell_environment", lambda env, **_kw: env)
     monkeypatch.setattr(shell, "_managed_skill_environment", lambda env: env)
 
@@ -403,7 +404,7 @@ async def test_explicit_environment_repair_permits_execution(
         return "exit_code=0\nvalidated\n"
 
     monkeypatch.setattr(shell, "full_host_access_active", lambda: True)
-    monkeypatch.setattr(shell, "_base_shell_environment", lambda: {"PATH": str(tmp_path)})
+    monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.setattr(shell, "_runtime_shell_environment", lambda env, **_kw: env)
     monkeypatch.setattr(shell, "_managed_skill_environment", lambda env: env)
     monkeypatch.setattr(shell, "_run_host_shell_command", run)

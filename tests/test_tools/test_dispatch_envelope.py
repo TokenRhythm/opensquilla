@@ -3448,3 +3448,67 @@ async def test_repeated_reads_return_real_results_without_runtime_notices(monkey
     assert calls == ["data.json"] * 3
     assert [result.content for result in results] == contents
     assert all(not result.is_error for result in results)
+
+
+async def test_unattended_finalizer_keeps_loop_responsive_during_stale_claim_cleanup(
+    tmp_path, monkeypatch,
+):
+    import sqlite3
+    import threading
+    from contextlib import closing
+
+    from opensquilla.application.approval_queue import ApprovalQueue
+    from opensquilla.tools.policy.finalize import finalize
+
+    path = tmp_path / "finalizer.sqlite"
+    queue = ApprovalQueue(db_path=str(path))
+    approval_id = queue.request("exec", {"reviewer": "user", "humanActionable": True})
+    queue._conn.execute(
+        "UPDATE approval_queue SET claim_token = 'expired', claim_started_at = 0"
+    )
+    locked, release, started = threading.Event(), threading.Event(), threading.Event()
+    forced_release = threading.Event()
+    loop_thread = threading.get_ident()
+    sql_threads = []
+
+    def trace(sql):
+        sql_threads.append(threading.get_ident())
+        if sql.startswith("BEGIN IMMEDIATE"):
+            started.set()
+
+    def hold_writer():
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            locked.set()
+            if not release.wait(3):
+                forced_release.set()
+            connection.rollback()
+
+    queue._conn.set_trace_callback(trace)
+    monkeypatch.setattr("opensquilla.gateway.approval_queue.get_approval_queue", lambda: queue)
+    holder = threading.Thread(target=hold_writer)
+    holder.start()
+    task = None
+    try:
+        assert await asyncio.to_thread(locked.wait, 3)
+        task = asyncio.create_task(finalize(
+            call=ToolCall(tool_use_id="probe", tool_name="exec_command", arguments={}),
+            ctx=ToolContext(
+                caller_kind=CallerKind.CRON, interaction_mode=InteractionMode.UNATTENDED,
+            ),
+            raw_result={"status": "approval_required", "approval_id": approval_id},
+            exception=None, artifact_start=0, budget_tracker=None, registered=None,
+        ))
+        assert await asyncio.to_thread(started.wait, 3)
+        assert not forced_release.is_set()
+        assert not task.done()
+        release.set()
+        result = await task
+        assert result.execution_status["reason"] == "approval_pending"
+        assert sql_threads and loop_thread not in sql_threads
+    finally:
+        release.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        await asyncio.to_thread(holder.join, 3)
+        queue.close()

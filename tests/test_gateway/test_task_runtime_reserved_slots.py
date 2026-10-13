@@ -36,6 +36,9 @@ class _StubStorage:
         rec = self.records.get(task_id)
         if rec is None:
             return
+        details_patch = fields.pop("details_patch", None)
+        if details_patch is not None:
+            rec.details = {**(rec.details or {}), **details_patch}
         for k, v in fields.items():
             setattr(rec, k, v)
 

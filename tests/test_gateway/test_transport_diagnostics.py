@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from opensquilla.gateway import websocket
-from opensquilla.gateway.protocol import ResFrame
+from opensquilla.gateway.protocol import MAX_PAYLOAD_BYTES, ReqFrame, ResFrame, make_error_res
 from opensquilla.gateway.transport_flow import get_transport_budget
 from opensquilla.gateway.websocket import WsConnection
 
@@ -146,6 +146,169 @@ async def test_failed_admission_diagnostics_cannot_skip_cleanup_or_original_reco
     finally:
         conn._cleanup_transport()
     assert get_transport_budget().used == before
+
+
+async def test_oversized_response_returns_rpc_error_without_closing_socket(monkeypatch):
+    """C30 regression: a response wire overflow is request-scoped."""
+
+    before = get_transport_budget().used
+    monkeypatch.setattr(websocket, "MAX_PAYLOAD_BYTES", 512)
+    conn = WsConnection("oversized-response", AsyncMock())
+    conn._enable_flow()
+    conn._outbox = asyncio.Queue()
+    try:
+        conn._enqueue_frame(websocket._OutboundFrame(
+            kind="res",
+            classification="control",
+            payload=None,
+            event_name=None,
+            res_frame=ResFrame(id="large", ok=True, payload={"content": "x" * 4096}),
+        ))
+        assert not conn._closing
+        reply = conn._outbox.get_nowait()
+        assert reply.res_frame is not None
+        assert reply.res_frame.id == "large"
+        assert reply.res_frame.error is not None
+        assert reply.res_frame.error.code == "RESPONSE_TOO_LARGE"
+        assert reply.res_frame.error.accepted is None
+        assert reply.res_frame.error.retryable is False
+        assert reply.res_frame.error.details == {"max_payload_bytes": 512}
+
+        # The same socket can still carry a subsequent control response.
+        conn._enqueue_frame(websocket._OutboundFrame(
+            kind="res",
+            classification="control",
+            payload=None,
+            event_name=None,
+            res_frame=ResFrame(id="follow-up", ok=True, payload={"ok": True}),
+        ))
+        follow_up = conn._outbox.get_nowait()
+        assert follow_up.res_frame is not None
+        assert follow_up.res_frame.id == "follow-up"
+        conn._release_outbound_budget(reply)
+        conn._release_outbound_budget(follow_up)
+    finally:
+        conn._cleanup_transport()
+    assert get_transport_budget().used == before
+
+
+@pytest.mark.parametrize("failure", ["wire", "post-reservation"])
+async def test_response_fallback_failure_closes_once_and_releases_its_budget(monkeypatch, failure):
+    before = get_transport_budget().used
+    monkeypatch.setattr(websocket, "MAX_PAYLOAD_BYTES", 1 if failure == "wire" else 512)
+    conn = WsConnection("failed-response-fallback", AsyncMock())
+    conn._enable_flow()
+    conn._outbox = asyncio.Queue()
+    frame = websocket._OutboundFrame(
+        kind="res", classification="control", payload=None, event_name=None,
+        res_frame=ResFrame(id="request", ok=True, payload={"content": "x" * 4096}),
+    )
+    prepare, attempted = conn._prepare_flow_frame, []
+
+    def prepare_then_fail(candidate):
+        attempted.append(candidate)
+        result = prepare(candidate)
+        if failure == "post-reservation" and candidate is not frame:
+            assert candidate.budget_bytes > 0
+            raise websocket._FlowAdmissionError(
+                "late admission rejection", reason_code="transport_reservation_rejected",
+            )
+        return result
+
+    close, logger = AsyncMock(), Mock()
+    monkeypatch.setattr(conn, "_prepare_flow_frame", prepare_then_fail)
+    monkeypatch.setattr(conn, "_force_close", close)
+    monkeypatch.setattr(websocket, "log", logger)
+    try:
+        conn._enqueue_frame(frame)
+        await asyncio.sleep(0)
+        assert len(attempted) == 2
+        assert attempted[1].res_frame.error.code == "RESPONSE_TOO_LARGE"
+        assert attempted[1].res_frame.error.accepted is None
+        assert all(candidate.budget_bytes == 0 for candidate in attempted)
+        close.assert_awaited_once_with(reason="transport_resource_limit", code=1013)
+        assert logger.warning.call_count == 1
+        assert conn._closing and conn._outbox.empty()
+        assert conn._transport_bytes == conn._flow_control_bytes == conn._flow_control_frames == 0
+        assert get_transport_budget().used == before
+    finally:
+        conn._cleanup_transport()
+
+
+async def test_near_wire_limit_request_id_cannot_recurse_through_error_responses(monkeypatch):
+    # The real inbound limit allows this id, but both error envelopes exceed it.
+    # Keep the id intact: truncating it would break request correlation.
+    request = ReqFrame(id="i" * (MAX_PAYLOAD_BYTES - 80), method="x")
+    assert len(request.model_dump_json().encode()) <= MAX_PAYLOAD_BYTES
+    response = make_error_res(request.id, "METHOD_NOT_FOUND", "Unknown method")
+    assert len(response.model_dump_json().encode()) > MAX_PAYLOAD_BYTES
+    before = get_transport_budget().used
+    conn = WsConnection("near-limit-id", AsyncMock())
+    conn._enable_flow()
+    conn._outbox = asyncio.Queue()
+    prepare, close = Mock(wraps=conn._prepare_flow_frame), AsyncMock()
+    monkeypatch.setattr(conn, "_prepare_flow_frame", prepare)
+    monkeypatch.setattr(conn, "_force_close", close)
+    try:
+        conn._enqueue_frame(websocket._OutboundFrame(
+            kind="res", classification="control", payload=None, event_name=None,
+            res_frame=response,
+        ))
+        await asyncio.sleep(0)
+        assert prepare.call_count == 2
+        fallback = prepare.call_args.args[0]
+        assert fallback.res_frame.id == request.id
+        assert fallback.res_frame.error.accepted is None
+        close.assert_awaited_once_with(reason="transport_resource_limit", code=1013)
+        assert conn._closing and conn._outbox.empty()
+        assert conn._transport_bytes == 0
+        assert get_transport_budget().used == before
+    finally:
+        conn._cleanup_transport()
+
+
+def test_wire_preflight_rejects_oversized_payload_before_recursive_protocol_copy(monkeypatch):
+    """A clearly oversized response/event never enters the full encoder."""
+
+    monkeypatch.setattr(websocket, "MAX_PAYLOAD_BYTES", 512)
+    original = websocket.encode_payload_for_protocol
+    original_model_copy = ResFrame.model_copy
+    large_calls: list[object] = []
+
+    def guarded(payload, *, protocol):
+        if isinstance(payload, dict) and len(str(payload.get("content", ""))) > 1024:
+            large_calls.append(payload)
+            raise AssertionError("oversized payload reached recursive protocol encoder")
+        return original(payload, protocol=protocol)
+
+    monkeypatch.setattr(websocket, "encode_payload_for_protocol", guarded)
+
+    def guarded_model_copy(self, *args, **kwargs):
+        payload = self.payload
+        if isinstance(payload, dict) and len(str(payload.get("content", ""))) > 1024:
+            raise AssertionError("oversized payload reached Pydantic frame serializer")
+        return original_model_copy(self, *args, **kwargs)
+
+    monkeypatch.setattr(ResFrame, "model_copy", guarded_model_copy)
+    conn = WsConnection("preflight", AsyncMock())
+    conn._enable_flow()
+    conn._outbox = asyncio.Queue()
+    try:
+        conn._enqueue_frame(websocket._OutboundFrame(
+            kind="res", classification="control", payload=None, event_name=None,
+            res_frame=ResFrame(id="large", ok=True, payload={"content": "x" * 4096}),
+        ))
+        response = conn._outbox.get_nowait()
+        assert response.res_frame is not None
+        assert response.res_frame.error is not None
+        assert response.res_frame.error.code == "RESPONSE_TOO_LARGE"
+        conn._enqueue_frame(websocket._OutboundFrame(
+            kind="event", classification="lossy", payload={"content": "x" * 4096},
+            event_name="session.event.text_delta", res_frame=None,
+        ))
+        assert large_calls == []
+    finally:
+        conn._cleanup_transport()
 
 
 def test_admission_failure_counters_include_acknowledged_inflight_reservations():

@@ -97,6 +97,7 @@ export interface ChatRpcStreamApi {
     presentation?: 'intermediate' | 'answer',
     identity?: ChatStreamModelCallIdentity,
   ) => void
+  markTextPreviewIncomplete?: () => void
   scheduleRender: () => void
   appendToolCall: (payload: ConversationToolContent) => void
   appendToolDelta: (payload: ConversationToolContent) => void
@@ -1584,6 +1585,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       // Compatibility with older gateways that predate semantic text roles.
       stream.appendDelta(payload.text || '')
     }
+    if (payload.text_truncated === true) stream.markTextPreviewIncomplete?.()
   }
 
   function handleSkillLoad(payload: ConversationEventData) {

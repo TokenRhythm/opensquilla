@@ -176,6 +176,7 @@ const resumeCode = ts.transpileModule(resume.getText(ast), {
 }).outputText
 for (const superseded of [false, true]) {
   const events = []
+  const startupOutcomes = []
   let profile = 'original'
   let attempts = 0
   const startup = vm.createContext({
@@ -186,6 +187,13 @@ for (const superseded of [false, true]) {
     forceOnboardingOnNextStartup: false, onboardingPromptProfileKey: null,
     gatewayProfileKey: 'original', gatewayProcess: null,
     gatewayState: { status: 'starting', owned: false, url: null },
+    beginDesktopStartupStageAttempt: () => ({ finished: false }),
+    observeDesktopStartupStage() {},
+    finishDesktopStartupStageAttempt: (attempt, outcome) => {
+      assert.equal(attempt.finished, false)
+      attempt.finished = true
+      startupOutcomes.push(outcome)
+    },
     invalidateDesktopOpenFlow: () => { startup.desktopOpenFlowRevision += 1 },
     desktopProfileKey: () => profile,
     desktopOpenAuthorityIsCurrent: (revision, key) => (
@@ -215,6 +223,7 @@ for (const superseded of [false, true]) {
     ? ['renderer', 'boot', 'cleanup', 'renderer', 'ready']
     : ['renderer', 'boot', 'error', 'failure'])
   assert.equal(startup.desktopOpenFlowPromise, null)
+  assert.deepEqual(startupOutcomes, superseded ? ['cancel', 'success'] : ['fail'])
 }
 
 console.log(JSON.stringify({ ok: true, providers: catalog.length, freshSave: true, invalidRoutingRejected: true }))

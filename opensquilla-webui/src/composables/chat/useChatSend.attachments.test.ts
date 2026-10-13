@@ -2958,6 +2958,19 @@ describe('useChatSend attachment payloads', () => {
     expect(pendingSessionIntent.value).toBeNull()
   })
 
+  it('sends a draft once when its acceptance callback promotes the read lease immediately', async () => {
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const materializeDraftSession = vi.fn(() => {
+      expect(pendingSessionIntent.value).toBe('new_chat')
+      pendingSessionIntent.value = null
+    })
+    const { api, options } = makeOptions({ pendingSessionIntent, materializeDraftSession })
+    await api.onSend()
+    expect(options.rpc.call).toHaveBeenCalledTimes(1)
+    expect(materializeDraftSession).toHaveBeenCalledExactlyOnceWith(options.sessionKey.value)
+    expect(pendingSessionIntent.value).toBeNull()
+  })
+
   it('queues a second draft while the first send has not announced steer capability', async () => {
     const pendingSessionIntent = ref<string | null>('new_chat')
     const pendingWorkspaceId = ref<string | null>('project-a')

@@ -806,6 +806,9 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     session_recovery_smoke = Path(
         "desktop/electron/scripts/test-packaged-session-recovery.mjs"
     ).read_text(encoding="utf-8")
+    session_recovery_rpc = Path(
+        "desktop/electron/scripts/session-recovery-rpc-evidence.mjs"
+    ).read_text(encoding="utf-8")
     packaged_smoke_helpers = Path(
         "desktop/electron/scripts/packaged-smoke-helpers.mjs"
     ).read_text(encoding="utf-8")
@@ -881,8 +884,11 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     assert "desktop-credential.json" in packaged_smoke_helpers
     assert "_electron as electron" in packaged_smoke_helpers
 
-    for method in ("chat.history", "sessions.messages.subscribe"):
-        assert method in session_recovery_smoke
+    for method in (
+        "chat.history", "sessions.messages.subscribe", "sessions.messages.snapshot.read",
+    ):
+        assert method in session_recovery_rpc
+    assert "createSessionRecoveryFault(sessionKey)" in session_recovery_smoke
     for contract in (
         "connectToServer()",
         "chat-session-load-state",

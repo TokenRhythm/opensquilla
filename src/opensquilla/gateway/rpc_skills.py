@@ -1898,7 +1898,9 @@ async def _handle_skills_install_status(
         return {"operationId": operation_id, "state": "unknown", "phase": "unknown",
                 "terminal": True, "scope": ""}
     owner = _install_owner(ctx)
-    receipt = installer.install_operations.store.read(owner, operation_id)
+    receipt = await installer.install_operations.store.read_status_async(
+        owner, operation_id, installer.journal_path,
+    )
     import hashlib
     scope = hashlib.sha256(
         f"{installer.journal_path}:{owner}".encode(),

@@ -41,7 +41,7 @@ from opensquilla.gateway.origin_guard import (
     request_origin_allowed,
 )
 from opensquilla.gateway.origin_guard import (
-    request_principal_is_owner as _request_principal_is_owner,
+    request_principal_is_owner_async as _request_principal_is_owner,
 )
 
 # Keep the test-facing module handles stable while the implementation lives in
@@ -77,7 +77,7 @@ def register_artifact_routes(
         if not request_origin_allowed(request, config):
             return forbidden_origin_response()
         # Source paths are host material, unlike an immutable shared delivery.
-        if not _request_principal_is_owner(config, request):
+        if not await _request_principal_is_owner(config, request):
             return JSONResponse({"code": "OWNER_REQUIRED"}, status_code=403, headers=headers)
         format_ = request.query_params.get("format", "content")
         if format_ not in {"content", "metadata"}:
@@ -130,6 +130,8 @@ def register_artifact_routes(
                     request.query_params.get("revisionId"),
                 )
             )
+            if material.path is None:
+                raise ContentNotFoundError("artifact document has no file path")
         except ContentIntegrityError as exc:
             return JSONResponse(
                 {"error": str(exc), "code": "INTEGRITY_ERROR"},
@@ -163,6 +165,8 @@ def register_artifact_routes(
                     thumbnail=want_thumbnail,
                 )
             )
+            if material.path is None:
+                raise ContentNotFoundError("artifact has no file path")
         except ContentIntegrityError as exc:
             return JSONResponse({"error": str(exc), "code": "INTEGRITY_ERROR"}, status_code=409)
         except (ContentNotFoundError, ValueError):
@@ -179,7 +183,7 @@ def register_artifact_routes(
     async def open_handler(request: Request) -> JSONResponse:
         if not request_origin_allowed(request, config):
             return forbidden_origin_response()
-        if not _request_principal_is_owner(config, request):
+        if not await _request_principal_is_owner(config, request):
             return JSONResponse(
                 {"error": "Owner privileges required", "code": "OWNER_REQUIRED"},
                 status_code=403,

@@ -912,7 +912,7 @@ async function loadData(options: {
         )
         providerImageGenerationOptIn.value = true
         providerSelectionKind.value = 'primary'
-        if (providerForm.selectedProvider.value) void providerForm.discoverModels()
+        // Provider discovery starts when its section is opened or refreshed.
         promotedForm.initProviderFromConfig(config.value, preserve?.thinking)
       }
       if (!preserve?.fixedModel) {
@@ -2430,6 +2430,7 @@ async function saveDirtySections() {
       image: capabilitiesForm.imageDirty.value,
       audio: promotedForm.audioDirty.value,
     }
+    const behaviorPatches = behaviorForm.patches()
     if (!Object.values(work).some(Boolean)) return
 
     // A configured primary provider and Model Routing share llm.model. Validate
@@ -2450,7 +2451,7 @@ async function saveDirtySections() {
     const restoreProfileSelection = providerSelectionKind.value !== 'primary'
     if (work.privacy && !(await savePrivacy(disableNetworkObservability.value, { reload: false }))) return
     if (work.memoryCapture && !(await saveMemoryAutoCapture({ reload: false }))) return
-    if (work.behavior && !(await saveBehavior({ reload: false }))) return
+    if (work.behavior && !(await saveBehavior(behaviorPatches))) return
     if (work.modelStrategy && !(await saveModelStrategy({
       reload: false,
       allowUnsavedProvider: false,
@@ -2459,6 +2460,10 @@ async function saveDirtySections() {
     if (work.memory && !(await saveMemory({ reload: false }))) return
     if (work.image && !(await saveImage({ reload: false }))) return
     if (work.audio && !(await saveAudio({ reload: false }))) return
+
+    // This preference is confirmed by its mutation response. Unrelated setup
+    // reads must not prolong saving or overwrite a newer behavior draft.
+    if (work.behavior && Object.values(work).filter(Boolean).length === 1) return
 
     await loadData()
     if (
@@ -4172,11 +4177,17 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
   }
 }
 
-async function saveBehavior(options: SaveOptions = {}): Promise<boolean> {
+async function saveBehavior(patches = behaviorForm.patches()): Promise<boolean> {
+  const submitted = patches['naming.enabled']
+  if (typeof submitted !== 'boolean') return true
   try {
-    const restart = await safePatchConfig(behaviorForm.patches())
+    const restart = await safePatchConfig({ 'naming.enabled': submitted })
+    config.value = {
+      ...config.value,
+      naming: { ...config.value.naming, enabled: submitted },
+    }
+    behaviorForm.acceptSaved(submitted)
     pushToast(restart ? t('setup.toast.behaviorSavedRestart') : t('setup.toast.behaviorSaved'))
-    if (options.reload !== false) await loadData()
     return true
   } catch (err) {
     pushToast(saveFailedMessage(err), { tone: 'danger' })

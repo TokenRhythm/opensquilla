@@ -58,6 +58,21 @@ function renderedMessagesFor(
 }
 
 describe('useChatRenderedMessages scheduled provenance', () => {
+  it('keeps semantic content identity while answer text segments are not tool calls', () => {
+    const contentRef = {
+      version: 1 as const, sessionKey: 'agent:main:webchat:test', sessionId: 'sid', messageId: 'mid',
+      view: 'display' as const, byteLength: 32 * 1024, revision: 'r1',
+    }
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: 'bounded answer', ts: 1, contentRef,
+      tool_calls: [{ type: 'text', presentation: 'answer', text: 'bounded answer' }],
+    }])
+    const row = api.renderedMessages.value[0]
+    expect(row?.contentRef).toEqual(contentRef)
+    expect(row?.toolCalls).toEqual([])
+    expect(row?.contentSlice).toBeUndefined()
+  })
+
   it('keeps persisted sources and labels live cron completions before history arrives', () => {
     const api = renderedMessagesFor([
       { role: 'user', text: 'Run the inventory check.', ts: 1, provenanceKind: 'cron' },
@@ -369,6 +384,17 @@ describe('useChatRenderedMessages internal control turns', () => {
 
     expect(api.renderedMessages.value).toHaveLength(1)
     expect(api.renderedMessages.value[0]?.hasAttachments).toBe(true)
+  })
+
+  it.each(['preparing', 'unavailable'] as const)('keeps empty user %s content visible for existing local feedback', availability => {
+    const api = renderedMessagesFor([{
+      role: 'user', text: '', ts: 1, messageId: 'pending-user', attachments: [],
+      contentAvailability: availability, previewComplete: false,
+    }])
+    expect(api.renderedMessages.value).toHaveLength(1)
+    expect(api.renderedMessages.value[0]).toMatchObject({
+      displayRole: 'user', contentAvailability: availability, previewComplete: false,
+    })
   })
 
   it('keeps subagent completion control rows out while retaining the parent creation route', () => {

@@ -46,6 +46,7 @@ from opensquilla.gateway.config_migration import (
     migrate_config_payload,
     rewrite_migrated_config_best_effort,
 )
+from opensquilla.observability.settings_save import settings_save_stage
 from opensquilla.paths import default_opensquilla_home, native_io_path
 
 log = structlog.get_logger(__name__)
@@ -149,6 +150,7 @@ def _raw_key_present(raw: Any, path: str) -> bool:
 _ENV_ABSORBED_NESTED_SECRET_SECTIONS = (
     ("audio.providers", "api_key"),
     ("image_generation.providers", "api_key"),
+    ("video_generation.providers", "api_key"),
 )
 
 
@@ -588,19 +590,21 @@ def _remember_load_baseline(
     cfg.set_persist_snapshot(baseline, raw_payload if raw_payload else None)
 
 
-def _lock_config_file(fh: BinaryIO) -> None:
+def _lock_config_file(fh: BinaryIO, *, blocking: bool = True) -> None:
     if os.name == "nt":
         import msvcrt
 
         msvcrt_mod = cast(Any, msvcrt)
         fh.seek(0)
-        msvcrt_mod.locking(fh.fileno(), msvcrt_mod.LK_LOCK, 1)
+        mode = msvcrt_mod.LK_LOCK if blocking else msvcrt_mod.LK_NBLCK
+        msvcrt_mod.locking(fh.fileno(), mode, 1)
         return
 
     import fcntl
 
     fcntl_mod = cast(Any, fcntl)
-    fcntl_mod.flock(fh.fileno(), fcntl_mod.LOCK_EX)
+    flags = fcntl_mod.LOCK_EX | (0 if blocking else fcntl_mod.LOCK_NB)
+    fcntl_mod.flock(fh.fileno(), flags)
 
 
 def _unlock_config_file(fh: BinaryIO) -> None:
@@ -619,14 +623,16 @@ def _unlock_config_file(fh: BinaryIO) -> None:
 
 
 @contextmanager
-def _config_write_lock(target: Path) -> Iterator[None]:
+def _config_write_lock(target: Path, *, blocking: bool = True) -> Iterator[None]:
     """Serialize read/merge/replace against every shared persister process."""
     lock_path = target.with_name(f".{target.name}.lock")
     fd = os.open(native_io_path(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
     if os.fstat(fd).st_size == 0:
         os.write(fd, b"\0")
     with os.fdopen(fd, "r+b", buffering=0) as fh:
-        _lock_config_file(fh)
+        settings_save_stage("file_lock_wait")
+        _lock_config_file(fh, blocking=blocking)
+        settings_save_stage("file_lock_acquired")
         try:
             yield
         finally:
@@ -871,6 +877,33 @@ def _persist_plan(
     return _model_toml_payload(GatewayConfig()), merge_base
 
 
+def _retain_video_key_origin_bindings(
+    merged: dict[str, Any], current_dump: dict[str, Any]
+) -> None:
+    """Persist an existing key's origin even when sparse diffs see it as a default.
+
+    An env-supplied key is omitted from TOML, and an older manually authored
+    key may predate the binding field. If the URL changes in the same save,
+    dropping this metadata would bind that old key to the new URL on reload.
+    """
+
+    current_video = current_dump.get("video_generation")
+    current_providers = (
+        current_video.get("providers") if isinstance(current_video, dict) else None
+    )
+    if not isinstance(current_providers, dict):
+        return
+    for provider_id, provider in current_providers.items():
+        if not isinstance(provider, dict):
+            continue
+        origin = provider.get("api_key_base_url")
+        if not isinstance(origin, str) or not origin:
+            continue
+        path = ("video_generation", "providers", provider_id, "api_key_base_url")
+        if _get_path(merged, path) is None:
+            _set_path(merged, path, origin)
+
+
 def persist_config(
     config: GatewayConfig,
     *,
@@ -906,6 +939,7 @@ def persist_config(
         for provenance_key in _NON_PERSISTED_TOP_LEVEL_FIELDS:
             diff.pop(provenance_key, None)
         _merge_diff(merged, diff)
+        _retain_video_key_origin_bindings(merged, current_dump)
         exact_remove_paths = tuple(
             tuple(part for part in dotted.split(".") if part)
             for dotted in remove_paths
@@ -930,6 +964,7 @@ def persist_config(
 
         # Re-validate to catch any invariant breakage that survived model_dump.
         GatewayConfig.model_validate(copy.deepcopy(merged))
+        settings_save_stage("persist_validated")
         next_baseline = copy.deepcopy(current_dump) if same_path else None
         next_raw_base = copy.deepcopy(merged) if same_path else None
 
@@ -972,7 +1007,10 @@ def persist_config(
         else:
             if backup and target_io.exists():
                 backup_path = make_config_backup(target)
+            settings_save_stage("backup_finished")
             atomic_write_config(target, merged)
+
+        settings_save_stage("disk_committed")
 
         config.consume_force_persist_path_segments(force_paths)
 

@@ -30,6 +30,19 @@ function call(
 }
 
 describe('activity tool detail projection', () => {
+  it('keeps long ordinary hyphenated output and redacts only the actual trailing assignment', () => {
+    const ordinary = 'full-result-'.repeat(3_000)
+    expect(redactActivityDetail(ordinary)).toBe(ordinary)
+    expect(redactActivityDetail(`${ordinary}token=private-value`)).toBe(`${ordinary}token=[redacted]`)
+  })
+
+  it('preserves credential redaction across nested assignments and irregular key prefixes', () => {
+    expect(redactActivityDetail('outer="token=private" --scope__password=private other=keep'))
+      .toBe('outer="token=[redacted]" --scope__password=[redacted] other=keep')
+    expect(redactActivityDetail('123https://user:pass@example.test 123://user:pass@example.test'))
+      .toBe('123https://[redacted]@example.test 123://user:pass@example.test')
+  })
+
   it('projects URLs and file paths as resource targets rather than details', () => {
     expect(projectActivityToolTargets(call({
       name: 'web_search',

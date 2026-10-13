@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import importlib
 import json
@@ -48,6 +49,7 @@ from opensquilla.session.models import (
     TurnIngressReceipt,
 )
 from opensquilla.session.storage import SessionStorage, TurnAcceptanceResult
+from tests.helpers.image_bytes import image_bytes
 
 SESSION_KEY = "agent:main:webchat:atomic-ingress"
 CLIENT_REQUEST_ID = "client-request-atomic-1"
@@ -538,10 +540,13 @@ async def test_pending_input_confirmed_plain_slash_survives_staging_and_dispatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("display_text", [None, "//different"])
+@pytest.mark.parametrize(
+    ("display_text", "with_attachment"), [(None, False), ("//different", False), ("", True)],
+)
 async def test_pending_input_rejects_unmarked_control_commands(
     tmp_path: Path,
     display_text: str | None,
+    with_attachment: bool,
 ) -> None:
     suffix = "missing" if display_text is None else "mismatched"
     async with _open_real_stack(tmp_path / f"pending-control-{suffix}.db") as stack:
@@ -554,6 +559,8 @@ async def test_pending_input_rejects_unmarked_control_commands(
         }
         if display_text is not None:
             params["displayText"] = display_text
+        if with_attachment:
+            params["attachments"] = [{"type": "image/png", "data": "QQ=="}]
         rejected = await get_dispatcher().dispatch(
             "pending-control-enqueue",
             "sessions.pending_inputs.enqueue",
@@ -596,10 +603,12 @@ async def test_pending_input_plain_marker_rejects_registered_web_controls(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("message", "display_text", "confirmed_plain_text"),
+    ("message", "display_text", "confirmed_plain_text", "with_attachment"),
     [
-        ("ordinary provider text", "/reset", False),
-        ("/gamemode creative", "/reset", True),
+        ("ordinary provider text", "/reset", False, False),
+        ("ordinary provider text", "", False, False),
+        ("/gamemode creative", "/reset", True, False),
+        ("ordinary provider text", "unrelated display text", False, True),
     ],
 )
 async def test_pending_input_rejects_unpaired_display_text(
@@ -607,6 +616,7 @@ async def test_pending_input_rejects_unpaired_display_text(
     message: str,
     display_text: str,
     confirmed_plain_text: bool,
+    with_attachment: bool,
 ) -> None:
     async with _open_real_stack(tmp_path / "pending-display-mismatch.db") as stack:
         rejected = await get_dispatcher().dispatch(
@@ -620,6 +630,8 @@ async def test_pending_input_rejects_unpaired_display_text(
                 "message": message,
                 "displayText": display_text,
                 "confirmedPlainText": confirmed_plain_text,
+                "attachments": [{"type": "image/png", "data": "QQ=="}]
+                if with_attachment else [],
             },
             stack.context,
         )
@@ -778,6 +790,100 @@ async def test_chat_send_first_ordinary_turn_schedules_auto_title_once(
 
         stack.release_handler.set()
         await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize(
+    ("display_text", "manual_title"),
+    [
+        ("", None),
+        (None, None),
+        ("Describe these attachments", None),
+        ("Inspect the chart axes", None),
+        ("", "My image notes"),
+    ],
+)
+async def test_image_title_uses_user_text_and_preserves_default_or_manual_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    queued: bool,
+    display_text: str | None,
+    manual_title: str | None,
+) -> None:
+    async with _open_real_stack(tmp_path / "image-title.db") as stack:
+        stack.context.config.naming.enabled = True
+        await stack.manager.update(SESSION_KEY, display_name=manual_title or "WebChat")
+        scheduled_titles: list[str] = []
+
+        def record_title(_ctx, _key, first_message: str, **_kwargs) -> None:
+            scheduled_titles.append(first_message)
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.rpc_sessions._schedule_auto_title", record_title,
+        )
+        dispatcher = get_dispatcher()
+        initial = await dispatcher.dispatch("before", "sessions.list", None, stack.context)
+        assert initial.ok, initial.error
+        default_title = next(
+            row["title"] for row in initial.payload["sessions"] if row["key"] == SESSION_KEY
+        )
+        provider_message = display_text or "Describe these attachments"
+        params = {
+            "key": SESSION_KEY,
+            "sessionKey": SESSION_KEY,
+            "clientRequestId": "image-title-request",
+            "clientMessageId": "image-title-message",
+            "message": provider_message,
+            "attachments": [{
+                "type": "image/png", "name": "image.png",
+                "data": base64.b64encode(image_bytes()).decode("ascii"),
+            }],
+        }
+        if display_text is not None:
+            params["displayText"] = display_text
+        method = "chat.send"
+        if queued:
+            params["pendingInputId"] = "image-title-pending"
+            staged = await dispatcher.dispatch(
+                "stage", "sessions.pending_inputs.enqueue", params, stack.context,
+            )
+            assert staged.ok, staged.error
+            pending = await stack.storage.get_pending_chat_input("image-title-pending")
+            assert pending is not None
+            assert ("displayText" in pending.payload) is (display_text is not None)
+            if display_text is not None:
+                assert pending.payload["displayText"] == display_text
+            params = {
+                "key": SESSION_KEY,
+                "pendingInputId": "image-title-pending",
+                "clientRequestId": "image-title-request",
+                "requestFingerprint": staged.payload["requestFingerprint"],
+            }
+            method = "sessions.pending_inputs.dispatch"
+        accepted = await dispatcher.dispatch("accept", method, params, stack.context)
+        assert accepted.ok, accepted.error
+        await stack.wait_until_running()
+        transcript = await stack.storage.get_canonical_transcript(stack.session_id)
+        stored_input = json.loads(
+            next(entry.content for entry in transcript if entry.role == "user")
+        )
+        assert ("display_text" in stored_input) is (display_text is not None)
+        if display_text is not None:
+            assert stored_input["display_text"] == display_text
+
+        expected_text = "Describe these attachments" if display_text is None else display_text
+        assert scheduled_titles == ([expected_text] if expected_text and not manual_title else [])
+        # The provider still receives its useful image prompt; only title input changes.
+        assert stack.received_runs[0].message == provider_message
+        listed = await dispatcher.dispatch("after", "sessions.list", None, stack.context)
+        assert listed.ok, listed.error
+        title = next(
+            row["title"] for row in listed.payload["sessions"] if row["key"] == SESSION_KEY
+        )
+        assert title == (manual_title or expected_text or default_title)
+        stored = await stack.storage.get_session(SESSION_KEY)
+        assert stored is not None
+        assert stored.derived_title is None
 
 
 @pytest.mark.asyncio

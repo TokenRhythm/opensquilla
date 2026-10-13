@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -11,6 +13,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
 
 WORKFLOW_DIR = Path(".github/workflows")
 PR_TARGET_VALIDATOR = Path(".github/scripts/validate-pr-target-branch.sh")
@@ -1025,11 +1028,13 @@ def test_skill_hub_contract_is_integrated_into_canonical_ci() -> None:
         "tests/test_engine/test_skill_install_settlement.py",
         "tests/test_gateway/test_skill_install_status.py",
         "tests/test_skills/test_hub_install_operations.py",
+        "tests/test_skills/test_install_operation_io.py",
         "tests/test_skills/test_staging_io_worker.py",
         "tests/test_skill_install_source.py",
         "tests/test_skills_hub_streaming.py",
         "tests/test_skills_hub_streaming_faults.py",
         "tests/test_skills/test_hub_management_service.py",
+        "tests/test_skills/test_hub_rollback_serialization.py",
         "tests/test_skills/test_hub_scanner.py",
         "tests/test_skills/test_hub_transaction_recovery.py",
         "tests/test_skills/test_hub_transaction_process_gates.py",
@@ -2008,6 +2013,24 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
             encoding="utf-8"
         )
     assert "--retries=0" in session_recovery["run"]
+    modern_recovery = next(
+        step for step in steps
+        if step.get("name") == "Run cross-platform modern session recovery contracts"
+    )
+    browser_commands = [
+        *session_recovery["run"].split("npm run test:e2e --")[1:],
+        *modern_recovery["run"].split("npm run test:e2e --")[1:],
+    ]
+    # Zero-retry failures need traces on the first attempt, inside the uploaded
+    # tree. Separate output directories prevent later suites deleting evidence.
+    browser_cases = (
+        "session-hang-recovery", "plan-goal-runtime", "modern-session-recovery",
+    )
+    assert len(browser_commands) == len(browser_cases)
+    for command, case in zip(browser_commands, browser_cases, strict=True):
+        assert "--retries=0" in command
+        assert "--trace retain-on-failure" in command
+        assert f'--output "${{CI_REPORT_DIR}}/{case}-results"' in command
     recovery_spec = Path("opensquilla-webui/e2e/history-hydration.spec.ts").read_text(
         encoding="utf-8"
     )
@@ -2454,9 +2477,12 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "chat-send-lifecycle.real.spec.ts",
         "cross-window-sync.real.spec.ts",
         "composer-paste.spec.ts",
+        "durable-delivery.spec.ts",
         "ensemble-new-task-legacy-turn.spec.ts",
         "goal-mode.spec.ts",
+        "history-content-reading.spec.ts",
         "history-hydration.spec.ts",
+        "http-delivery.spec.ts",
         "idle-chat-recovery.spec.ts",
         "modern-session-recovery.spec.ts",
         "new-task-ensemble-race.spec.ts",
@@ -2548,6 +2574,15 @@ def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
     }
     checkout = next(step for step in steps if step.get("name") == "Check out repository")
     assert checkout["with"]["lfs"] is True
+    setup_node = next(step for step in steps if step.get("name") == "Set up Node.js")
+    assert setup_node["uses"] == "actions/setup-node@v4"
+    assert setup_node["with"] == {"node-version": "22.23.3"}
+    assert "if" not in setup_node
+    versions = next(step for step in steps if step.get("name") == "Record tool versions")
+    assert steps.index(checkout) < steps.index(setup_node) < steps.index(versions)
+    assert steps.index(versions) < steps.index(test_step)
+    assert "node --version" in versions["run"]
+    assert "node -p 'process.execPath'" in versions["run"]
     bun_step = next(step for step in steps if step.get("name") == "Set up Bun")
     assert bun_step["if"] == "${{ startsWith(matrix.shard, 'core-') }}"
     assert steps[0]["name"] == "Prepare diagnostic report"
@@ -2737,7 +2772,8 @@ def test_native_desktop_cells_run_source_and_frozen_mcp_probes() -> None:
     assert "docker run --rm -i --entrypoint python" in container["run"]
     assert "readonly" in container["run"]
     assert "docker image inspect --format '{{json .Size}}'" in container["run"]
-    assert 'sdk_version == "2.2.0"' in container["run"]
+    assert 'requires("opensquilla")' in container["run"]
+    assert "sdk_version in sdk_requirement.specifier" in container["run"]
     assert "create_mcp_server()" in container["run"]
     assert "MCPStdioClient(MCPServerConfig(" in container["run"]
     assert "set -euo pipefail" in container["run"]
@@ -2746,6 +2782,33 @@ def test_native_desktop_cells_run_source_and_frozen_mcp_probes() -> None:
     compile(container["run"].split("<<'PY'", 1)[1].split("\n", 1)[1].rsplit(
         "\nPY", 1
     )[0], "docker-mcp-smoke", "exec")
+
+
+@pytest.mark.parametrize("sdk_version,allowed", [
+    ("2.2.0", True), ("2.3.0", True), ("2.1.0", False), ("3.0.0", False),
+])
+def test_container_mcp_sdk_version_obeys_installed_package_contract(
+    sdk_version: str, allowed: bool,
+) -> None:
+    steps = _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+    container = next(step for step in steps if step.get("name") == (
+        "Build production Docker image and verify MCP"
+    ))
+    script = container["run"].split("<<'PY'", 1)[1].split("\n", 1)[1].rsplit("\nPY", 1)[0]
+    check = next(node for node in ast.parse(script).body
+                 if isinstance(node, ast.FunctionDef) and node.name == "check_sdk_version")
+    namespace = {
+        "version": lambda name: sdk_version,
+        "requires": lambda name: ["anyio>=4", "mcp>=2.2.0,<3"],
+        "Requirement": Requirement,
+    }
+    exec(compile(ast.Module(body=[check], type_ignores=[]), "docker-mcp-version", "exec"),
+         namespace)
+    if allowed:
+        assert namespace["check_sdk_version"]() == sdk_version
+    else:
+        with pytest.raises(AssertionError, match=re.escape(sdk_version)):
+            namespace["check_sdk_version"]()
 
 
 def test_native_desktop_cells_require_recommended_pty_before_managed_smoke() -> None:
@@ -3282,14 +3345,6 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
             "tests/test_gateway/test_goal_rpc.py",
             "tests/test_tools/test_dispatch_legacy_coverage.py",
             "tests/unit/cli/repl/test_slash_bridge.py",
-            "tests/test_gateway/test_channel_turn_ingress.py",
-            "tests/test_gateway/test_plan_rpc.py",
-            "tests/test_gateway/test_goal_registry_cleanup.py",
-            "tests/test_gateway/test_task_runtime_terminal_cleanup.py",
-            "tests/test_gateway/test_task_runtime_wait_slots.py",
-            "tests/test_gateway/test_goal_turn_authority.py",
-            "tests/test_gateway/test_task_progress_projection.py",
-            "tests/functional/test_gateway_silent_reply_process_e2e.py",
             "tests/test_engine/test_cancelled_turn_segments.py",
             "tests/test_tools/test_shell_workdir.py",
             "tests/test_sandbox/test_shell_code_network_hints.py",
@@ -3298,13 +3353,26 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
         })
         selector = '"${family}"' if job_name == "windows-full" else '"${{ matrix.shard }}"'
         assert f'{selector} == "desktop-installer-contracts"' in preflight["run"]
-        assert f'{selector} == "gateway-sqlite"' in preflight["run"]
         assert '"${regression_args[@]}"' in preflight["run"]
         assert f"-o faulthandler_timeout={faulthandler_timeout}" in preflight["run"]
+    if job_name == "ubuntu-full":
+        expected_preflight_files.update(_GATEWAY_REGRESSION_FILES)
+        assert '"${{ matrix.shard }}" == "gateway-sqlite"' in preflight["run"]
     if job_name == "windows-full":
         expected_preflight_files.update({
             "tests/test_ci/test_windows_signatures.py",
             "tests/test_tools/test_shell_process_isolation.py",
+            "tests/test_tools/test_shell_blocking_launch.py",
+            "tests/test_ci/test_rpc_architecture_contracts.py",
+            "tests/test_skills/test_hub_management_service.py",
+            "tests/test_gateway/test_native_attachment_import.py",
+            "tests/test_gateway/test_recovery_scheduler.py",
+            "tests/test_gateway/test_goal_user_input.py",
+            "tests/test_gateway/test_manual_compaction_contract.py",
+            "tests/test_gateway/test_sandbox_token_rpc_workers.py",
+            "tests/test_live_provider_profile_gateway_e2e.py",
+            "tests/test_ci/test_upgrade_baselines.py",
+            "tests/test_engine/test_runtime_router_fallback.py",
         })
         assert '"${family}" == "core"' in preflight["run"]
     assert set(re.findall(r"tests/[a-zA-Z0-9_/.]+\.py", preflight["run"])) == (
@@ -3321,11 +3389,19 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
 @pytest.mark.parametrize(("family", "expected_file"), [
     ("core", "tests/test_ci/test_windows_signatures.py"),
     ("core", "tests/test_cli/test_chat_cmd.py"),
-    ("gateway-sqlite", "tests/test_gateway/test_goal_registry_cleanup.py"),
-    ("gateway-sqlite", "tests/test_gateway/test_task_runtime_wait_slots.py"),
-    ("gateway-sqlite", "tests/test_gateway/test_plan_rpc.py"),
+    ("core", "tests/test_tools/test_shell_blocking_launch.py"),
+    ("core", "tests/test_ci/test_rpc_architecture_contracts.py"),
+    ("core", "tests/test_skills/test_hub_management_service.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_native_attachment_import.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_recovery_scheduler.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_goal_user_input.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_manual_compaction_contract.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_sandbox_token_rpc_workers.py"),
+    ("gateway-sqlite", "tests/test_live_provider_profile_gateway_e2e.py"),
     ("recovery-migration", "tests/test_sandbox/test_windows_shell_process_runtime.py"),
     ("recovery-migration", "tests/test_live_long_task_case_driver.py"),
+    ("recovery-migration", "tests/test_ci/test_upgrade_baselines.py"),
+    ("recovery-migration", "tests/test_engine/test_runtime_router_fallback.py"),
     ("desktop-installer-contracts", "tests/test_ci/test_architecture_import_contracts.py"),
     ("desktop-installer-contracts", "tests/test_engine/test_tool_concurrency.py"),
 ])
@@ -3349,4 +3425,30 @@ def test_windows_preflight_selects_regressions_for_physical_partitions(family, e
             [_bash_executable(), "-c", script],
             check=True, capture_output=True, text=True, timeout=10,
         )
-        assert expected_file in result.stdout.splitlines(), shard
+        if expected_file is None:
+            assert not result.stdout.strip(), shard
+        else:
+            assert expected_file in result.stdout.splitlines(), shard
+
+
+_GATEWAY_REGRESSION_FILES = {
+    "tests/test_gateway/test_channel_turn_ingress.py",
+    "tests/test_gateway/test_plan_rpc.py",
+    "tests/test_gateway/test_goal_registry_cleanup.py",
+    "tests/test_gateway/test_task_runtime_terminal_cleanup.py",
+    "tests/test_gateway/test_task_runtime_wait_slots.py",
+    "tests/test_gateway/test_goal_turn_authority.py",
+    "tests/test_gateway/test_task_progress_projection.py",
+    "tests/functional/test_gateway_silent_reply_process_e2e.py",
+}
+
+
+def test_gateway_preflight_regressions_keep_one_main_windows_partition():
+    runner = runpy.run_path(".github/scripts/windows_test_shards.py")
+    partitions = [
+        runner["files_for_shard"](Path.cwd(), shard)
+        for shard in runner["WINDOWS_SHARD_NAMES"]
+        if shard.startswith("gateway-sqlite-")
+    ]
+    for path in _GATEWAY_REGRESSION_FILES:
+        assert sum(path in files for files in partitions) == 1, path

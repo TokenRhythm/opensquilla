@@ -855,6 +855,72 @@ describe('useSkillRegistry install state', () => {
     expect(registry.registryLoading.value).toBe(false)
   })
 
+  it('joins repeated submissions of the same source and trimmed query', async () => {
+    let finish!: (value: unknown) => void
+    const pending = new Promise(resolve => { finish = resolve })
+    const call = vi.fn().mockReturnValue(pending)
+    const registry = useSkillRegistry({ call }, vi.fn(async () => true))
+    registry.registryQuery.value = ' paper '
+    const first = registry.searchRegistry('clawhub')
+    registry.registryQuery.value = 'paper'
+    const repeated = registry.searchRegistry('clawhub')
+    expect(repeated).toBe(first)
+    expect(call).toHaveBeenCalledTimes(1)
+    expect(call).toHaveBeenCalledWith('skills.search', {
+      query: 'paper', source: 'clawhub', limit: 20,
+    })
+    expect(registry.registryLoading.value).toBe(true)
+    finish({ results: [{ name: 'Current result' }] })
+    await Promise.all([first, repeated])
+    expect(registry.registryResults.value).toEqual([{ name: 'Current result' }])
+    expect(registry.registryLoading.value).toBe(false)
+    await registry.searchRegistry('clawhub')
+    expect(call).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['query', 'source', 'reset'] as const)(
+    'keeps the new in-flight request joinable after an old %s request settles', async change => {
+      let finishFirst!: (value: unknown) => void
+      let finishSecond!: (value: unknown) => void
+      const first = new Promise(resolve => { finishFirst = resolve })
+      const second = new Promise(resolve => { finishSecond = resolve })
+      const call = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second)
+      const registry = useSkillRegistry({ call }, vi.fn(async () => true))
+      registry.registryQuery.value = 'paper'
+      const oldSearch = registry.searchRegistry('clawhub')
+      if (change === 'query') registry.registryQuery.value = 'writing'
+      if (change === 'reset') registry.resetRegistrySearch()
+      const source = change === 'source' ? 'skillhub' : 'clawhub'
+      const newSearch = registry.searchRegistry(source)
+      expect(call).toHaveBeenCalledTimes(2)
+      finishFirst({ results: [{ name: 'Obsolete result' }] })
+      await oldSearch
+      const joined = registry.searchRegistry(source)
+      expect(joined).toBe(newSearch)
+      expect(call).toHaveBeenCalledTimes(2)
+      expect(registry.registryLoading.value).toBe(true)
+      expect(registry.registryResults.value).toEqual([])
+      finishSecond({ results: [{ name: 'Current result' }] })
+      await joined
+      expect(registry.registryResults.value).toEqual([{ name: 'Current result' }])
+    },
+  )
+
+  it('allows the same search to retry after failure', async () => {
+    const call = vi.fn()
+      .mockRejectedValueOnce(new Error('temporary failure'))
+      .mockResolvedValueOnce({ results: [{ name: 'Retry result' }] })
+    const registry = useSkillRegistry({ call }, vi.fn(async () => true))
+    registry.registryQuery.value = 'paper'
+    await registry.searchRegistry('clawhub')
+    expect(registry.registrySearchError.value).toBe('temporary failure')
+    expect(registry.registryLoading.value).toBe(false)
+    await registry.searchRegistry('clawhub')
+    expect(call).toHaveBeenCalledTimes(2)
+    expect(registry.registrySearchError.value).toBe('')
+    expect(registry.registryResults.value).toEqual([{ name: 'Retry result' }])
+  })
+
   it('clears the previous source results and diagnostics while preserving the search query', async () => {
     const call = vi.fn(async () => ({
       results: [{ name: 'ClawHub result', source: 'clawhub' }],

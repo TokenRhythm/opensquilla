@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -160,7 +161,9 @@ async def test_apply_patch_approved_absolute_escape_uses_shared_gate(
         actions.append(action)
         return SimpleNamespace(allowed=True)
 
-    monkeypatch.setattr(destructive_backup, "gate_elevated_action", allow)
+    monkeypatch.setattr(
+        destructive_backup, "gate_elevated_action_async", AsyncMock(side_effect=allow),
+    )
     token = current_tool_context.set(
         ToolContext(
             is_owner=True,

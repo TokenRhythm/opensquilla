@@ -14,6 +14,7 @@ import json
 import tempfile
 import zipfile
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from starlette.testclient import TestClient
@@ -193,7 +194,7 @@ def test_bundle_route_rejects_non_owner(monkeypatch, tmp_path) -> None:
     import opensquilla.gateway.bundle_routes as bundle_routes
 
     monkeypatch.setattr(
-        bundle_routes, "_request_principal_is_owner", lambda config, request: False
+        bundle_routes, "_request_principal_is_owner", AsyncMock(return_value=False)
     )
     with _client(monkeypatch, tmp_path) as client:
         response = client.post("/api/v1/diagnostics/bundle", json={})

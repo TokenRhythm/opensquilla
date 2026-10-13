@@ -35,7 +35,7 @@ function request(id = 'synthetic-request'): Extract<TurnSendRequest, { kind: 'ne
 }
 
 function harness(overrides: Partial<TurnCommands> = {}, storage = memoryWal()) {
-  let identity = 'synthetic-identity'
+  let identity: string | null = 'synthetic-identity'
   let available = true
   let generation = 1
   const commands: TurnCommands = {
@@ -48,7 +48,7 @@ function harness(overrides: Partial<TurnCommands> = {}, storage = memoryWal()) {
   const owner = createDurableDelivery({ commands, wal: storage.wal, ownerId: crypto.randomUUID(),
     access: { identity: () => identity, available: () => available, generation: () => generation } })
   return { owner, commands, ...storage,
-    identity: (value: string) => { identity = value; generation += 1 },
+    identity: (value: string | null) => { identity = value; generation += 1 },
     available: (value: boolean) => { available = value },
   }
 }
@@ -70,6 +70,120 @@ function sharedQueuePermission() {
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers() })
 
 describe('application-owned durable delivery', () => {
+  it.each(['available', 'denied', 'unavailable'] as const)(
+    'starts and cancels an exact task without randomUUID when storage is %s', async mode => {
+      const storage = memoryWal()
+      if (mode === 'denied') storage.wal.prepareDelivery = async () => { throw new Error('quota') }
+      const commands: TurnCommands = {
+        send: vi.fn(async () => ({ taskId: 'unused' })), steer: vi.fn(async () => ({ accepted: true })),
+        cancel: vi.fn(async () => ({ aborted: true })), supports: () => true,
+      }
+      const getRandomValues = globalThis.crypto.getRandomValues.bind(globalThis.crypto)
+      vi.stubGlobal('crypto', { getRandomValues })
+      let owner: ReturnType<typeof createDurableDelivery> | undefined
+      try {
+        owner = createDurableDelivery({ commands, wal: mode === 'unavailable' ? null : storage.wal,
+          access: { identity: () => 'synthetic-identity', available: () => true, generation: () => 1 } })
+        await expect(owner.commands.cancel({ sessionKey: 'synthetic-session', taskId: 'known-task', scope: 'task' }))
+          .resolves.toEqual({ aborted: true })
+        expect(commands.cancel).toHaveBeenCalledTimes(1)
+        expect(commands.cancel).toHaveBeenCalledWith(
+          { sessionKey: 'synthetic-session', taskId: 'known-task', scope: 'task' },
+          expect.objectContaining({ expectedGeneration: 1 }),
+        )
+        expect(owner.snapshots()[0]?.id).toMatch(/^stop:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+        expect(commands.send).not.toHaveBeenCalled()
+      } finally { owner?.dispose(); vi.unstubAllGlobals() }
+    },
+  )
+
+  it('projects current identity without discarding a foreign unresolved Stop', async () => {
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request',
+      deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session', phase: 'unknown',
+      request: { kind: 'send', request: request() }, stop: { requested: true },
+      revision: 1, createdAt: 1, updatedAt: 1 })
+    const test = harness({}, storage)
+    test.available(false)
+    try {
+      await test.owner.wake()
+      expect(test.owner.snapshots()[0]).toMatchObject({ isCurrentIdentity: true, phase: 'unknown', stopPending: true,
+        preview: 'synthetic message' })
+      for (const identity of ['another-identity', null]) {
+        test.identity(identity)
+        expect(test.owner.snapshots()[0]).toMatchObject({ isCurrentIdentity: false, phase: 'unknown',
+          stopPending: true, stopAvailable: false, waitReason: 'identity', preview: undefined })
+      }
+      test.identity('synthetic-identity')
+      expect(test.owner.snapshots()[0]).toMatchObject({ isCurrentIdentity: true, stopPending: true,
+        preview: 'synthetic message' })
+      expect(storage.records.get('synthetic-request')?.stop).toEqual({ requested: true })
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it.each([false, true])('rechecks only the original identity and preserves its existing Stop=%s', async withStop => {
+    vi.useFakeTimers()
+    const storage = memoryWal()
+    const original: DeliveryWalRecord = { schemaVersion: 2, ownerRequestId: 'synthetic-request',
+      deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session', phase: 'unknown', paused: 'authority',
+      request: { kind: 'send', request: request() }, ...(withStop ? { stop: { requested: true as const } } : {}),
+      revision: 1, createdAt: 1, updatedAt: 1 }
+    storage.records.set(original.ownerRequestId, structuredClone(original))
+    const test = harness({ lookupReceipt: vi.fn(async () => ({ status: 'found' as const,
+      response: { taskId: 'recovered-task', sessionKey: 'synthetic-session' } })) }, storage)
+    try {
+      test.identity('another-identity')
+      // Cover an unobserved row as well as a stale UI action after wake.
+      await test.owner.retry(original.ownerRequestId)
+      await test.owner.wake()
+      await test.owner.retry(original.ownerRequestId)
+      test.identity(null)
+      await test.owner.retry(original.ownerRequestId)
+      expect(storage.records.get(original.ownerRequestId)).toEqual(original)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+      test.identity('synthetic-identity')
+      const first = test.owner.retry(original.ownerRequestId)
+      const duplicate = test.owner.retry(original.ownerRequestId)
+      await vi.advanceTimersByTimeAsync(6_000)
+      await Promise.all([first, duplicate])
+      expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(1)
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.cancel).toHaveBeenCalledTimes(withStop ? 1 : 0)
+      expect(storage.records.get(original.ownerRequestId)?.stop).toEqual(withStop
+        ? expect.objectContaining({ requested: true, completed: true }) : undefined)
+      const read = vi.spyOn(storage.wal, 'getDelivery')
+      test.owner.dispose()
+      await test.owner.retry(original.ownerRequestId)
+      expect(read).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it.each(['identity', 'dispose'] as const)('fences a manual recheck after its first storage read changes %s', async interrupt => {
+    const storage = memoryWal()
+    const original: DeliveryWalRecord = { schemaVersion: 2, ownerRequestId: 'synthetic-request',
+      deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session', phase: 'unknown', paused: 'authority',
+      request: { kind: 'send', request: request() }, stop: { requested: true }, revision: 1, createdAt: 1, updatedAt: 1 }
+    storage.records.set(original.ownerRequestId, structuredClone(original))
+    const test = harness({}, storage)
+    const get = storage.wal.getDelivery!
+    storage.wal.getDelivery = async id => {
+      const record = await get(id)
+      if (interrupt === 'identity') test.identity('another-identity')
+      else test.owner.dispose()
+      return record
+    }
+    try {
+      await test.owner.retry(original.ownerRequestId)
+      expect(storage.records.get(original.ownerRequestId)).toEqual(original)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+      expect(test.commands.send).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
   it.each(['prepare', 'claim', 'arm'] as const)('honors a peer queue Stop during WAL %s and keeps the unsent request retryable', async stage => {
     const storage = memoryWal()
     const permission = sharedQueuePermission()

@@ -1,15 +1,18 @@
-import type { Ref } from 'vue'
+import { getCurrentScope, onScopeDispose, watch, type Ref } from 'vue'
 import type { ChatRenderedMessage } from '@/types/chat'
 import { downloadText } from '@/utils/browser'
 import { artifactMeta, artifactName } from '@/utils/chat/artifacts'
 import { sanitizeAssistantPresentationText } from '@/utils/chat/silentSentinels'
 import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
 import { turnOutcomePresentation } from '@/utils/chat/turnOutcome'
+import { messageContentIdentity, needsCompleteMessageText, restoreHistoryTimelineText, type ReadMessageText } from '@/utils/chat/historyMessageContent'
 
 export interface UseChatMarkdownExportOptions {
   messages: Readonly<Ref<ChatRenderedMessage[]>>
   currentTitle: Readonly<Ref<string>>
   aiGeneratedLabel: Readonly<Ref<string>>
+  sessionIdentity?: () => string
+  readMessageText?: ReadMessageText
 }
 
 export interface BuildChatMarkdownOptions {
@@ -105,14 +108,61 @@ export function buildChatMarkdown(options: BuildChatMarkdownOptions): string {
 }
 
 export function useChatMarkdownExport(options: UseChatMarkdownExportOptions) {
-  function exportMarkdown() {
-    const markdown = buildChatMarkdown({
-      title: options.currentTitle.value,
-      exportedAt: new Date().toISOString(),
-      messages: options.messages.value,
-      aiGeneratedLabel: options.aiGeneratedLabel.value,
-    })
-    downloadText(markdownFilename(options.currentTitle.value), 'text/markdown;charset=utf-8', markdown)
+  let pending: AbortController | null = null
+  function cancelExport() {
+    pending?.abort()
+    pending = null
+  }
+  if (options.sessionIdentity) watch(options.sessionIdentity, cancelExport, { flush: 'sync' })
+  if (getCurrentScope()) onScopeDispose(cancelExport)
+
+  async function exportMarkdown(): Promise<boolean> {
+    cancelExport()
+    const controller = new AbortController()
+    pending = controller
+    const transcript = options.messages.value
+    const identities = transcript.map(messageContentIdentity)
+    const session = options.sessionIdentity?.()
+    const title = options.currentTitle.value
+    const label = options.aiGeneratedLabel.value
+    const current = () => !controller.signal.aborted && pending === controller
+      && session === options.sessionIdentity?.() && transcript === options.messages.value
+      && transcript.length === identities.length
+      && transcript.every((message, index) => messageContentIdentity(message) === identities[index])
+    try {
+      const complete: ChatRenderedMessage[] = []
+      for (const message of transcript) {
+        if (!message.isRouterStrip
+          && ['user', 'assistant', 'system', 'subagent', 'error'].includes(message.displayRole || message.role)
+          && needsCompleteMessageText(message)) {
+          if (!options.readMessageText) throw new Error('Complete history content is unavailable')
+          const text = await options.readMessageText({ ...message, contentRef: message.contentRef && { ...message.contentRef } }, controller.signal)
+          if (!current()) return false
+          // Assistant answer selection uses timeline presentation boundaries.
+          // Replacing only message.text would still export their old previews.
+          const timelineItems = message.contentSlice ? undefined : restoreHistoryTimelineText(message, text)
+          if (!message.contentSlice && message.historyPayloadPreview?.textUtf16Lengths
+            && message.timelineItems?.some(item => item.type === 'text') && !timelineItems) {
+            throw new Error('Complete history timeline is unavailable')
+          }
+          complete.push({ ...message, text, timelineItems: timelineItems ?? message.timelineItems })
+        } else complete.push(message)
+      }
+      if (!current()) return false
+      const markdown = buildChatMarkdown({
+        title,
+        exportedAt: new Date().toISOString(),
+        messages: complete,
+        aiGeneratedLabel: label,
+      })
+      downloadText(markdownFilename(title), 'text/markdown;charset=utf-8', markdown)
+      return true
+    } catch (error) {
+      if (!controller.signal.aborted) console.warn('Markdown export failed:', error instanceof Error ? error.message : String(error))
+      return false
+    } finally {
+      if (pending === controller) pending = null
+    }
   }
 
   return {

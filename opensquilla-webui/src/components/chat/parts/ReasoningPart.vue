@@ -25,6 +25,7 @@
       'thinking-fold--timeline-phase': timelinePhase,
     }"
     :open="controlled ? open : undefined"
+    @toggle="emit('openChange', ($event.target as HTMLDetailsElement).open)"
   >
     <summary class="thinking-fold__summary" @click="onSummaryClick">
       <Icon class="thinking-fold__chevron" name="chevronRight" :size="12" />
@@ -75,6 +76,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   toggle: []
+  openChange: [open: boolean]
   tailFollowChange: [following: boolean]
 }>()
 

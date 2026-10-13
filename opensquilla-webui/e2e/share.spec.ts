@@ -1,12 +1,23 @@
-import { test, expect, type Page } from '@playwright/test'
+import { test as base, expect, type Page } from '@playwright/test'
+import { join } from 'node:path'
 
-import { chatHistoryPayload } from './support/session-read-fixtures'
+import { withIsolatedRealGateway, type IsolatedRealGateway } from './real-gateway.fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2eshare'
 const SYSTEM_ONLY_SESSION_KEY = 'agent:main:webchat:e2esharesysonly'
 const SEEDED_MODEL = 'deepseek-v4-flash-20260423'
 const SEEDED_COST = '$0.000646'
+
+// These fixtures only read session identities. Reuse the isolated Gateway and
+// Vite server within a worker; every assertion still gets a fresh browser page.
+const test = base.extend<{}, { shareGateway: IsolatedRealGateway }>({
+  shareGateway: [async ({}, use, workerInfo) => withIsolatedRealGateway({
+    outputDir: join(workerInfo.project.outputDir, `share-gateway-${workerInfo.workerIndex}`),
+    initialSessionKeys: [SESSION_KEY, SYSTEM_ONLY_SESSION_KEY, `${SESSION_KEY}-trailing-user`],
+  }, use), { scope: 'worker' }],
+  baseURL: async ({ shareGateway }, use) => use(shareGateway.webuiOrigin),
+})
 
 type SeededMessage = {
   role: 'user' | 'assistant' | 'system'
@@ -54,11 +65,13 @@ interface SeedHistoryOptions {
 }
 
 // Seed a settled turn through the real WS pipeline: the page talks to the
-// real gateway, but chat.history responses are rewritten in flight so a
+// isolated Gateway with durable session identities. Only V2 history page
+// contents are rewritten in flight; lease/subscribe/install remain real, so a
 // user + assistant exchange renders without a live agent run. With
 // withMessages=false the thread holds a single system message: the header
 // renders but no bubble is shareable.
 async function seedHistory(page: Page, withMessages: boolean, options: SeedHistoryOptions = {}) {
+  const completedHistoryReads: string[] = []
   await page.addInitScript(() => {
     window.localStorage.setItem('opensquilla-locale', 'en')
   })
@@ -68,7 +81,7 @@ async function seedHistory(page: Page, withMessages: boolean, options: SeedHisto
     ws.onMessage(message => {
       try {
         const frame = JSON.parse(String(message))
-        if (frame?.type === 'req' && frame.method === 'chat.history') {
+        if (frame?.type === 'req' && frame.method === 'sessions.history.page.v2') {
           historyIds.add(String(frame.id))
         }
       } catch {}
@@ -79,8 +92,11 @@ async function seedHistory(page: Page, withMessages: boolean, options: SeedHisto
         const frame = JSON.parse(String(message))
         if (frame?.type === 'res' && frame.id !== undefined && historyIds.has(String(frame.id))) {
           historyIds.delete(String(frame.id))
-          frame.ok = true
-          delete frame.error
+          if (frame.ok !== true) {
+            ws.send(message)
+            return
+          }
+          completedHistoryReads.push(String(frame.id))
           const now = Math.floor(Date.now() / 1000)
           const messages: SeededMessage[] = withMessages
             ? [
@@ -130,10 +146,14 @@ async function seedHistory(page: Page, withMessages: boolean, options: SeedHisto
           const upstreamPayload = frame.payload && typeof frame.payload === 'object'
             ? frame.payload as Record<string, unknown>
             : {}
-          frame.payload = chatHistoryPayload(messages, {
+          frame.payload = {
             ...upstreamPayload,
-            messages,
-            loaded_count: messages.length,
+            items: messages.map((message, index) => ({
+              message_id: message.id, item_id: message.id, order: String(index + 1),
+              role: message.role, preview: message.text, preview_complete: true,
+              source_revision: `share-seed-${index}`, content_availability: 'ready',
+              contents: [], message,
+            })),
             ...(options.includeTurnOutcome
               ? {
                   turn_outcomes: [{
@@ -145,7 +165,7 @@ async function seedHistory(page: Page, withMessages: boolean, options: SeedHisto
                   }],
                 }
               : {}),
-          })
+          }
           ws.send(JSON.stringify(frame))
           return
         }
@@ -153,6 +173,7 @@ async function seedHistory(page: Page, withMessages: boolean, options: SeedHisto
       ws.send(message)
     })
   })
+  return completedHistoryReads
 }
 
 async function openSeededSession(
@@ -161,10 +182,11 @@ async function openSeededSession(
   withMessages: boolean,
   options: SeedHistoryOptions = {},
 ) {
-  await seedHistory(page, withMessages, options)
+  const historyReads = await seedHistory(page, withMessages, options)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(key))
   await page.waitForSelector('.conn-pill', { timeout: 10000 })
   await page.waitForSelector('.chat-header', { timeout: 10000 })
+  await expect.poll(() => historyReads.length).toBeGreaterThan(0)
 }
 
 async function installShareStageProbe(page: Page) {

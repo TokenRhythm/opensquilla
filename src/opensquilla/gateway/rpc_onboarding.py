@@ -360,6 +360,13 @@ async def _image_generation_models_discover(
     )
 
 
+async def _video_generation_models_discover(
+    params: Any, ctx: RpcContext
+) -> dict[str, Any]:
+    del ctx
+    return await _discover_video_models(str(_require(params, "providerId")))
+
+
 def _profile_probe_command(params: Any) -> Any:
     from opensquilla.application.profile_lifecycle import ProfileProbeCommand
 
@@ -1377,6 +1384,16 @@ async def _discover_image_models(provider_id: str) -> dict[str, Any]:
         return await discover_image_generation_models(str(provider_id))
 
 
+async def _discover_video_models(provider_id: str) -> dict[str, Any]:
+    """List video-output models using provider-scoped catalog metadata."""
+    from opensquilla.onboarding.video_generation_model_discovery import (
+        discover_video_generation_models,
+    )
+
+    with _validation_error("onboarding.videoGeneration.invalid"):
+        return await discover_video_generation_models(str(provider_id))
+
+
 @_d.method("onboarding.router.catalog", scope="operator.read")
 async def _router_catalog(params: Any, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.onboarding.router_specs import router_catalog_payload
@@ -1683,6 +1700,7 @@ _PLATFORM_SETUP_IMPLEMENTATIONS = {
     "onboarding.provider.probe": _provider_probe,
     "onboarding.models.discover": _models_discover,
     "onboarding.imageGeneration.models.discover": _image_generation_models_discover,
+    "onboarding.videoGeneration.models.discover": _video_generation_models_discover,
     "onboarding.provider.credential.reveal": _provider_credential_reveal,
     "onboarding.provider.credential.clear": _provider_credential_clear,
     "onboarding.llmProfile.upsert": _llm_profile_upsert,

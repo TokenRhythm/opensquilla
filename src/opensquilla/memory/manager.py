@@ -20,6 +20,7 @@ extra patches at this module's path.
 
 from __future__ import annotations
 
+import asyncio
 import ntpath
 import os
 import re
@@ -626,8 +627,9 @@ async def build_memory_managers(
             )
 
         return managers
-    except Exception:
-        # Tear down in reverse order of acquisition.
+    except (Exception, asyncio.CancelledError):
+        # The factory owns these resources until it returns, including when
+        # deferred startup is cancelled. Tear down before propagating the error.
         if in_flight_sync is not None:
             try:
                 await in_flight_sync.stop()

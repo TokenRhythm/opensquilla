@@ -82,19 +82,23 @@ def _connect() -> sqlite3.Connection:
     path = native_io_path(_state_path())
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(os.fspath(path), timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS sandbox_user_grants ("
-        "kind TEXT NOT NULL, "
-        "grant_key TEXT NOT NULL, "
-        "payload TEXT NOT NULL, "
-        "updated_at REAL NOT NULL, "
-        "PRIMARY KEY(kind, grant_key)"
-        ")"
-    )
-    _migrate_legacy_json(conn)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS sandbox_user_grants ("
+            "kind TEXT NOT NULL, "
+            "grant_key TEXT NOT NULL, "
+            "payload TEXT NOT NULL, "
+            "updated_at REAL NOT NULL, "
+            "PRIMARY KEY(kind, grant_key)"
+            ")"
+        )
+        _migrate_legacy_json(conn)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 

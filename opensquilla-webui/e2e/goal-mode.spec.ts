@@ -1435,11 +1435,10 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
     const assertCanonicalHistoryPayload = (payload: unknown) => {
       const serialized = JSON.stringify(payload)
       expect(serialized).not.toMatch(/NO_REPLY|HEARTBEAT_OK/)
-      const historyMessages = (
-        payload
-        && typeof payload === 'object'
-        && Array.isArray((payload as { messages?: unknown }).messages)
-      ) ? (payload as { messages: Array<Record<string, unknown>> }).messages : []
+      expect(payload).toMatchObject({ canonical_available: true, canonical_complete: true })
+      const items = (payload as { items: Array<{ message: Record<string, unknown> }> }).items
+      expect(Array.isArray(items)).toBe(true)
+      const historyMessages = items.map(item => item.message)
       expect(historyMessages.filter(message => message.text === initialReply)).toHaveLength(1)
       expect(historyMessages.filter(message => message.text === mixedBody)).toHaveLength(1)
       expect(historyMessages.filter(message => message.text === formattedBody)).toHaveLength(1)
@@ -1580,7 +1579,7 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
     // gated. Canonical bodies render once and neither suppressed turn grows a
     // ghost assistant row.
     const hydrateCountBeforeReload = sentRequests('sessions.messages.hydrate').length
-    const historyCountBeforeReload = sentRequests('chat.history').length
+    const historyCountBeforeReload = sentRequests('sessions.history.page.v2').length
     const socketCountBeforeReload = socketUrls.length
     await page.reload()
     await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
@@ -1591,7 +1590,7 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
       { timeout: 15_000 },
     ).toBeGreaterThan(hydrateCountBeforeReload)
     await expect.poll(
-      () => sentRequests('chat.history').length,
+      () => sentRequests('sessions.history.page.v2').length,
       { timeout: 15_000 },
     ).toBeGreaterThan(historyCountBeforeReload)
     const hydrateRequest = sentRequests('sessions.messages.hydrate').at(-1)!
@@ -1602,7 +1601,7 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
     })
     expect(JSON.stringify(responseAfter(hydrateRequest)?.payload))
       .not.toMatch(/NO_REPLY|HEARTBEAT_OK/)
-    const historyRequest = sentRequests('chat.history').at(-1)!
+    const historyRequest = sentRequests('sessions.history.page.v2').at(-1)!
     await expect.poll(() => Boolean(responseAfter(historyRequest)), { timeout: 15_000 })
       .toBe(true)
     assertCanonicalHistoryPayload(responseAfter(historyRequest)?.payload)
@@ -1685,7 +1684,7 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
     // Terminal refresh exercises the persisted fallback Goal outcome as well
     // as the sanitized transcript one final time.
     const finalHydrateCount = sentRequests('sessions.messages.hydrate').length
-    const finalHistoryCount = sentRequests('chat.history').length
+    const finalHistoryCount = sentRequests('sessions.history.page.v2').length
     const finalSocketCount = socketUrls.length
     await page.reload()
     await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
@@ -1694,10 +1693,10 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
     await expect.poll(() => sentRequests('sessions.messages.hydrate').length, {
       timeout: 15_000,
     }).toBeGreaterThan(finalHydrateCount)
-    await expect.poll(() => sentRequests('chat.history').length, { timeout: 15_000 })
+    await expect.poll(() => sentRequests('sessions.history.page.v2').length, { timeout: 15_000 })
       .toBeGreaterThan(finalHistoryCount)
     const terminalHydrateRequest = sentRequests('sessions.messages.hydrate').at(-1)!
-    const terminalHistoryRequest = sentRequests('chat.history').at(-1)!
+    const terminalHistoryRequest = sentRequests('sessions.history.page.v2').at(-1)!
     await expect.poll(
       () => Boolean(responseAfter(terminalHydrateRequest)),
       { timeout: 15_000 },

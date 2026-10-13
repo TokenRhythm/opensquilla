@@ -42,7 +42,7 @@ from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig, LlmProvi
 from opensquilla.gateway.guest_rpc_policy import guest_owned_session_key
 from opensquilla.gateway.input_normalization import LARGE_PASTE_CHARS, estimate_text_tokens
 from opensquilla.gateway.routing import tool_context_from_envelope
-from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.gateway.session_lifecycle import SessionTaskSnapshot
@@ -707,6 +707,10 @@ class _ReplayConn:
         self.conn_id = conn_id
         self.client_caps = client_caps
         self.events: list[tuple[str, dict, dict | None]] = []
+
+    def _register_flow_subscription_epoch(self, key: str) -> bool:
+        assert "transport.flow.v1" not in self.client_caps
+        return True
 
     def _retire_flow_subscription(self, key: str) -> None:
         """This replay-only fake has no negotiated consumption-flow state."""
@@ -3079,6 +3083,16 @@ class TestSessionsSend:
             config=config,
         )
 
+        if auth_state == "invalid":
+            with pytest.raises(RpcHandlerError) as rejected:
+                await rpc_sessions._handle_sessions_send_contract(
+                    {"key": session.session_key, "message": "hello"}, ctx,
+                )
+            assert rejected.value.code == "UNAUTHORIZED"
+            assert rejected.value.accepted is False
+            assert runtime.enqueue_calls == []
+            return
+
         await rpc_sessions._handle_sessions_send_contract(
             {"key": session.session_key, "message": "hello"},
             ctx,
@@ -3395,6 +3409,15 @@ class TestSessionsSend:
                 self.records: dict[str, AgentTaskRecord] = {}
                 self.turn_context_updates: list[tuple[str, str, dict[str, Any]]] = []
                 self.owner_cas_calls: list[tuple[str | None, int | None]] = []
+                self.activation_claims: list[str] = []
+
+            async def claim_activation_permit(self, task_id: str, **kwargs: Any) -> None:
+                assert kwargs["session_key"] == session.session_key
+                assert kwargs["session_id"] == session.session_id
+                assert kwargs["session_epoch"] == session.epoch
+                assert kwargs["authorization_revision"] == 1
+                assert kwargs["permission_fingerprint"]
+                self.activation_claims.append(task_id)
 
             async def create_agent_task(
                 self,
@@ -3505,10 +3528,13 @@ class TestSessionsSend:
         release_blocker.set()
         await runtime.wait(blocker.task_id, timeout=2.0)
         await runtime.wait(first.payload["task_id"], timeout=2.0)
+        completed = runtime_storage.records[first.payload["task_id"]]
+        assert completed.status == AgentTaskStatus.SUCCEEDED, completed
         assert runs == [
             (blocker.task_id, "blocker"),
             (first.payload["task_id"], "first\nsecond"),
         ]
+        assert runtime_storage.activation_claims == [first.payload["task_id"]]
 
     @pytest.mark.asyncio
     async def test_send_marks_empty_transcript_as_fresh_user_session(self, dispatcher, session):

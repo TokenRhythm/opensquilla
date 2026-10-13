@@ -17,7 +17,7 @@ from opensquilla.sandbox.elevation import (
     ApprovalDisplay,
     ElevationAction,
     ElevationGateResult,
-    gate_elevated_action,
+    gate_elevated_action_async,
 )
 from opensquilla.sandbox.permissions import FileSystemPermissionProfile
 from opensquilla.sandbox.policy_models import SandboxPolicy
@@ -122,14 +122,14 @@ class DestructiveBackupGate:
         )
         return payload
 
-    def _gate(
+    async def _gate(
         self,
         action: ElevationAction,
         *,
         approval_id: str | None,
         session_key: str | None,
     ) -> ElevationGateResult:
-        return gate_elevated_action(
+        return await gate_elevated_action_async(
             action,
             approval_id=approval_id,
             session_key=session_key,
@@ -169,7 +169,7 @@ class DestructiveBackupGate:
         selected_without_backup = False
         if approval_id:
             try:
-                entry = self._approval_queue().get(approval_id)
+                entry = await self._approval_queue().get_async(approval_id)
             except KeyError:
                 entry = None
             if (
@@ -180,7 +180,7 @@ class DestructiveBackupGate:
                 selected_action = without_backup_action
                 selected_without_backup = True
 
-        reviewed = self._gate(
+        reviewed = await self._gate(
             selected_action,
             approval_id=approval_id,
             session_key=session_key,
@@ -219,7 +219,7 @@ class DestructiveBackupGate:
                 quota_bytes=policy.files.backup_quota_bytes,
             )
         except (BackupUnavailable, OSError):
-            second = self._gate(
+            second = await self._gate(
                 without_backup_action,
                 approval_id=None,
                 session_key=session_key,

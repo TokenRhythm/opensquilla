@@ -37,7 +37,9 @@ SHARD_NAMES: Final[tuple[str, ...]] = (
     "desktop-installer-contracts",
 )
 WINDOWS_SHARD_NAMES: Final[tuple[str, ...]] = tuple(
-    f"{family}-{partition}" for family in SHARD_NAMES for partition in (1, 2)
+    f"{family}-{partition}"
+    for family in SHARD_NAMES
+    for partition in range(1, 5 if family == "gateway-sqlite" else 3)
 )
 DEFAULT_PARALLEL_WORKERS: Final[int] = 4
 _CORE_WHEEL_FIXTURE: Final[str] = "isolated_core_wheel"
@@ -492,8 +494,9 @@ def windows_shard_for_test(path: str) -> str:
     if assignment is not None:
         return assignment
     family = shard_for_test(normalized)
-    partition = int(hashlib.sha256(normalized.encode("utf-8")).hexdigest(), 16) % 2 + 1
-    return f"{family}-{partition}"
+    partitions = tuple(shard for shard in WINDOWS_SHARD_NAMES if shard_family(shard) == family)
+    index = int(hashlib.sha256(normalized.encode("utf-8")).hexdigest(), 16) % len(partitions)
+    return partitions[index]
 
 
 def files_for_shard(root: Path, shard: str) -> tuple[str, ...]:

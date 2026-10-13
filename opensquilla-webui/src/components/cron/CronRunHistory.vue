@@ -10,10 +10,12 @@
       </button>
     </div>
     <div class="cron-detail__runs">
-      <p v-if="loading" class="cron-muted">{{ t('cronSkills.runHistory.loading') }}</p>
+      <p v-if="waiting" class="cron-muted" role="status">{{ t('cronSkills.jobs.waitingForCapacity') }}</p>
+      <p v-else-if="error" class="cron-muted" role="alert">{{ error }}</p>
+      <p v-else-if="loading" class="cron-muted">{{ t('cronSkills.runHistory.loading') }}</p>
       <p v-else-if="runs.length === 0" class="cron-muted">{{ t('cronSkills.runHistory.empty') }}</p>
       <DataTable
-        v-else
+        v-if="runs.length > 0"
         class="cron-runs-table"
         :columns="runColumns"
         :rows="runRows"
@@ -64,6 +66,8 @@ const props = defineProps<{
   job: CronRunHistoryJob
   runs: CronRunHistoryRun[]
   loading: boolean
+  waiting?: boolean
+  error?: string | null
 }>()
 
 const emit = defineEmits<{

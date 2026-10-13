@@ -9,6 +9,7 @@ import sys
 import threading
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1218,6 +1219,170 @@ def _attachment_capacity_evidence_records(
         ],
     }
     return [request, response], [decision]
+
+
+@pytest.mark.parametrize(
+    ("decision_case", "startup_elapsed", "reply_elapsed"),
+    [
+        ("delayed", 0.0, 1.0),
+        ("delayed_utf8", 0.0, 1.0),
+        ("complete_with_partial_utf8", 0.0, 1.0),
+        ("partial_utf8", 0.0, 74.75),
+        ("missing", 0.0, 74.75),
+        ("unrelated", 0.0, 74.75),
+        ("missing", 40.0, 60.75),
+        ("missing", 0.0, 76.0),
+        ("missing_router_step", 0.0, 1.0),
+        ("invalid_tier", 0.0, 1.0),
+        ("provider_error", 0.0, 1.0),
+        ("marker_missing", 0.0, 1.0),
+    ],
+)
+def test_attachment_capacity_waits_for_decision_before_stopping_within_reply_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decision_case: str,
+    startup_elapsed: float,
+    reply_elapsed: float,
+) -> None:
+    fixture = e2e._attachment_capacity_fixture()  # noqa: SLF001
+    clock = 0.0
+    sleeps: list[float] = []
+    records: list[dict[str, object]] = []
+    decisions: list[dict[str, object]] = []
+    stopped_decisions: list[dict[str, object]] = []
+    pending_tail = b""
+    decision_path = tmp_path / "logs" / "decisions-20260101.jsonl"
+
+    def sleep(seconds: float) -> None:
+        nonlocal clock, pending_tail
+        assert seconds > 0
+        sleeps.append(seconds)
+        clock += seconds
+        if pending_tail:
+            with decision_path.open("ab") as handle:
+                handle.write(pending_tail)
+            pending_tail = b""
+
+    def ready(*_args, **_kwargs):
+        nonlocal clock
+        clock += startup_elapsed
+        return {"ready": True}, None
+
+    def submit(_url, payload, **_kwargs):
+        request_records, decision_records = _attachment_capacity_evidence_records(
+            fixture, payload["sessionKey"],
+        )
+        records.extend(request_records)
+        decisions.extend(decision_records)
+
+    def reply(**kwargs):
+        nonlocal clock, pending_tail
+        assert kwargs["timeout_seconds"] == min(75.0, 105.0 - startup_elapsed - 4.0)
+        clock += reply_elapsed
+        if decision_case in {"delayed", "delayed_utf8"}:
+            # A different session and a partial append are not our evidence.
+            if decision_case == "delayed_utf8":
+                decisions[0]["synthetic_label"] = "中"
+            encoded = (json.dumps(decisions[0], ensure_ascii=False) + "\n").encode()
+            split = (
+                encoded.index("中".encode()) + 1
+                if decision_case == "delayed_utf8" else len(encoded) // 2
+            )
+            decision_path.write_bytes(b'{"session_key":"unrelated"}\n' + encoded[:split])
+            pending_tail = encoded[split:]
+        elif decision_case in {"complete_with_partial_utf8", "partial_utf8"}:
+            complete = (
+                (json.dumps(decisions[0]) + "\n").encode()
+                if decision_case == "complete_with_partial_utf8" else b""
+            )
+            partial = b'{"session_key":"unrelated","synthetic_label":"' + "中".encode()[:1]
+            decision_path.write_bytes(complete + partial)
+        elif decision_case == "unrelated":
+            decision_path.write_text('{"session_key":"unrelated"}\n', encoding="utf-8")
+        elif decision_case in {"missing_router_step", "invalid_tier"}:
+            if decision_case == "missing_router_step":
+                decisions[0]["pipeline_steps"] = []
+            else:
+                decisions[0]["pipeline_steps"][0]["routed_tier"] = "must-not-report"
+            decisions[0]["raw_prompt"] = "must-not-report"
+            decision_path.write_text(json.dumps(decisions[0]) + "\n", encoding="utf-8")
+        if decision_case == "provider_error":
+            return None, None, "HTTP 401 unauthorized"
+        text = "without completion marker" if decision_case == "marker_missing" else (
+            "ATTACHMENT_CAPACITY_LIVE_OK"
+        )
+        return {"text": text}, None, None
+
+    def stop(_proc):
+        stopped_decisions.extend(e2e._read_decision_records(tmp_path))  # noqa: SLF001
+        return "", ""
+
+    monkeypatch.setattr(
+        e2e, "time", SimpleNamespace(monotonic=lambda: clock, sleep=sleep, time=lambda: 1000),
+    )
+    monkeypatch.setattr(e2e, "_attachment_capacity_fixture", lambda: fixture)
+    monkeypatch.setattr(e2e, "_seed_attachment_capacity_history", lambda *_args: None)
+    monkeypatch.setattr(e2e, "_free_port", lambda: 49152)
+    monkeypatch.setattr(
+        e2e.subprocess, "Popen", lambda *_args, **_kwargs: SimpleNamespace(poll=lambda: None),
+    )
+    monkeypatch.setattr(e2e, "_wait_for_attachment_gateway_ready", ready)
+    monkeypatch.setattr(e2e, "_upload_inline_attachment", lambda **_kwargs: "synthetic-upload")
+    monkeypatch.setattr(e2e, "_post_json", submit)
+    monkeypatch.setattr(e2e, "_wait_for_assistant_reply", reply)
+    monkeypatch.setattr(e2e, "_stop_gateway", stop)
+    monkeypatch.setattr(e2e, "_read_turn_call_records", lambda _path: records)
+    monkeypatch.setattr(
+        e2e, "_provider_proof_from_logs", lambda _paths: {"fits": True, "media_blocks": 5},
+    )
+    monkeypatch.setattr(
+        e2e, "_attachment_capacity_session_metrics",
+        lambda *_args: {
+            "physical_request_count": 1, "physical_response_count": 1, "compaction_count": 0,
+        },
+    )
+
+    result = e2e._run_tokenrhythm_attachment_capacity_in_temp(  # noqa: SLF001
+        api_key="synthetic-decision-key", base_url="http://127.0.0.1:49152/v1", tmp_path=tmp_path,
+    )
+
+    diagnostics = result["cases"][0]["decision_diagnostics"]
+    assert set(diagnostics) == {"record_present", "router_step_present", "routed_tier"}
+    assert "must-not-report" not in json.dumps(result)
+    succeeded = decision_case in {"delayed", "delayed_utf8", "complete_with_partial_utf8"}
+    assert result["ok"] is succeeded
+    if succeeded:
+        assert sleeps == ([] if decision_case == "complete_with_partial_utf8" else [0.1])
+        assert decisions[0] in stopped_decisions
+        assert diagnostics == {
+            "record_present": True, "router_step_present": True, "routed_tier": "c2",
+        }
+    elif decision_case in {"missing", "unrelated", "partial_utf8"}:
+        deadline = startup_elapsed + min(75.0, 105.0 - startup_elapsed - 4.0)
+        assert clock == pytest.approx(max(startup_elapsed + reply_elapsed, deadline))
+        assert sum(sleeps) == pytest.approx(max(0.0, deadline - startup_elapsed - reply_elapsed))
+        assert result["error"] == "decision record did not arrive before assistant reply deadline"
+        assert diagnostics == {
+            "record_present": False, "router_step_present": False, "routed_tier": None,
+        }
+    else:
+        assert sleeps == []
+        assert clock == startup_elapsed + reply_elapsed
+        if decision_case in {"missing_router_step", "invalid_tier"}:
+            assert result["error"] is None
+            assert result["failure_kinds"] == ["implementation"]
+            assert diagnostics == {
+                "record_present": True,
+                "router_step_present": decision_case == "invalid_tier",
+                "routed_tier": None,
+            }
+        elif decision_case == "provider_error":
+            assert result["failure_kinds"] == ["auth"]
+        else:
+            assert result["error"] == (
+                "assistant reply did not contain the bounded completion marker"
+            )
 
 
 @pytest.mark.parametrize("physical_request_count", [0, 1, 2])

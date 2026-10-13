@@ -166,11 +166,38 @@ export async function markMainConsoleCleanup(app) {
   })
 }
 
+// Serialized into the page by Playwright; keep this function self-contained.
+export function firstSendRendererSnapshot({ document = globalThis.document,
+  location = globalThis.location } = {}) {
+  const sendButton = document.querySelector('.chat-send-btn.btn--primary')
+  const recoveryNotice = document.querySelector('.chat-session-recovery-status')
+  const recoveryState = recoveryNotice?.getAttribute('data-recovery-state')
+  return {
+    pathname: location.pathname,
+    sessionMaterialized: new URL(location.href).searchParams.has('session'),
+    connected: Boolean(document.querySelector('.conn-pill.connected')),
+    sendButtonDisabled: sendButton?.disabled ?? null,
+    sendButtonAriaBusy: sendButton ? sendButton.getAttribute('aria-busy') === 'true' : null,
+    textareaDisabled: document.querySelector('.chat-textarea')?.disabled ?? null,
+    recoveryNoticePresent: Boolean(recoveryNotice),
+    recoveryState: ['history-loading', 'history-retrying', 'history-error',
+      'live-connecting', 'live-degraded', 'session-missing'].includes(recoveryState) ? recoveryState : null,
+    assistantMessages: document.querySelectorAll('.msg-ai').length,
+    assistantAnswers: document.querySelectorAll('.msg-ai-text').length,
+    errorBoundaries: document.querySelectorAll('.error-boundary').length,
+    // Preserve the existing synthetic error-card evidence; never read messages,
+    // textarea values, session identifiers or URL queries into this snapshot.
+    sessionErrors: [...document.querySelectorAll('.msg-error-card__text')]
+      .slice(0, 5).map(element => (element.textContent || '').slice(0, 500)),
+  }
+}
+
 export function observeRendererPages(context, getPhase) {
   const pages = new Map()
   const subframePageIds = new Set()
   const pageErrorDetails = []
   const consoleErrorDetails = []
+  const sessionStreamWarnings = []
   const attach = page => {
     if (pages.has(page)) return
     const pageId = pages.size + 1
@@ -189,6 +216,19 @@ export function observeRendererPages(context, getPhase) {
       message: String(error?.message || error),
     }))
     page.on('console', message => {
+      if (message.type() === 'warning') {
+        const prefix = 'Session stream subscription failed:'
+        const text = message.text()
+        if (text.startsWith(prefix)) {
+          // The product emits err.message, which may omit its RPC code. Keep
+          // unknown codes null and never retain arbitrary warning text.
+          const code = /\b(RPC_TIMEOUT|RPC_ABORTED|RPC_TRANSPORT_ERROR|STORAGE_BUSY|SNAPSHOT_BUSY|SNAPSHOT_EXPIRED|SNAPSHOT_STALE|SNAPSHOT_TOO_LARGE|REBASE_REQUIRED|SESSION_NOT_FOUND|NOT_FOUND|UNAUTHORIZED|INVALID_REQUEST|INTERNAL_ERROR)\b/
+            .exec(text.slice(prefix.length))?.[1] ?? null
+          sessionStreamWarnings.push({ pageId, phase: getPhase(),
+            observedAt: new Date().toISOString(), code })
+        }
+        return
+      }
       if (message.type() !== 'error') return
       const location = message.location()
       consoleErrorDetails.push({ index: consoleErrorDetails.length, pageId,
@@ -202,7 +242,7 @@ export function observeRendererPages(context, getPhase) {
   }
   context.on('page', attach)
   for (const page of context.pages()) attach(page)
-  return { pages, subframePageIds, pageErrorDetails, consoleErrorDetails, attach }
+  return { pages, subframePageIds, pageErrorDetails, consoleErrorDetails, sessionStreamWarnings, attach }
 }
 
 function positions(records, event) {

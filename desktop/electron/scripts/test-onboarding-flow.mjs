@@ -1797,6 +1797,9 @@ try {
     model: credential.model,
     screenshotPath: screenshotPath || null,
   }, null, 2))
+} catch (error) {
+  await reportOnboardingFailure(app, 'provider-client', error)
+  throw error
 } finally {
   await app.close().catch(() => {})
   await successfulProbeServer.close().catch(() => {})

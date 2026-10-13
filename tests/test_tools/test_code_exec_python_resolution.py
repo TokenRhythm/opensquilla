@@ -6,6 +6,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -903,7 +904,10 @@ async def test_code_exec_bubblewrap_denied_system_pythons_fail_before_backend(
     )
     runtime.backend = SimpleNamespace(name="bubblewrap")  # type: ignore[assignment]
     monkeypatch.setattr(code_exec, "gate_action", fake_gate_action)
-    monkeypatch.setattr(code_exec, "consume_backend_denial_retry", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        code_exec, "consume_backend_denial_retry_async",
+        AsyncMock(side_effect=lambda *_args, **_kwargs: None),
+    )
     monkeypatch.setattr(
         code_exec,
         "_run_backend_with_managed_network_if_needed",

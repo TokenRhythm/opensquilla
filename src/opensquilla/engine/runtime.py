@@ -9123,9 +9123,11 @@ class TurnRunner:
                 caller_ctx.denied_tools.clear()
                 caller_ctx.denied_tools.update(ctx.denied_tools)
                 caller_ctx.workspace_write_deny_globs[:] = ctx.workspace_write_deny_globs
+        tool_defs = self._tool_registry.to_tool_definitions(ctx)
+        if ctx is not None:
             log.debug(
                 "tool_policy.policy_pre",
-                allowed_tool_count=len(self._tool_registry.to_tool_definitions(ctx)),
+                allowed_tool_count=len(tool_defs),
                 denied_count=len(ctx.denied_tools),
                 profile=resolve_profile(ctx).value,
             )
@@ -9134,7 +9136,6 @@ class TurnRunner:
             caller_kind=ctx.caller_kind if ctx else "none",
             denied_count=len(ctx.denied_tools) if ctx else 0,
         )
-        tool_defs = self._tool_registry.to_tool_definitions(ctx)
         if ctx is not None:
             from opensquilla.tools.filter import filter_tools
 
@@ -9212,6 +9213,8 @@ class TurnRunner:
             gateway_config=getattr(self, "_config", None) is not None,
             channel_backing=detected.channel_backing,
             image_generation=detected.image_generation,
+            video_generation=detected.video_generation,
+            video_status=detected.video_status,
             git_available=detected.git_available,
         )
         return resolve_runtime_tool_surface(ctx, capabilities=capabilities)

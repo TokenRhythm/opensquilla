@@ -2,6 +2,7 @@
 
 import { createPinia, setActivePinia } from 'pinia'
 import { computed } from 'vue'
+import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRpcStore } from './rpc'
 import { createV4GatewayAccess } from '@/adapters/gateway/gatewayAccessV4'
@@ -77,6 +78,7 @@ describe('rpc link-token bootstrap', () => {
     vi.unstubAllGlobals()
   })
   beforeEach(() => {
+    vi.stubGlobal('indexedDB', new IDBFactory())
     vi.stubGlobal('navigator', {
       locks: { request: vi.fn(async (_name: string, action: () => unknown) => action()) },
     })
@@ -244,6 +246,7 @@ describe('rpc link-token bootstrap', () => {
     expect(createV4GatewayAccess(first).deliveryIdentity).toBeNull()
     expect(createV4GatewayAccess(second).deliveryIdentity).toBeNull()
     waiting[0]!()
+    await vi.waitFor(() => expect(localStorage.getItem('opensquilla.deliverySalt.v1')).not.toBeNull())
     const salt = localStorage.getItem('opensquilla.deliverySalt.v1')
     waiting[1]!()
     expect(localStorage.getItem('opensquilla.deliverySalt.v1')).toBe(salt)
@@ -254,22 +257,25 @@ describe('rpc link-token bootstrap', () => {
     second.$dispose()
   })
 
-  it('without Web Locks only reuses an existing shared salt and keeps first-use transport working', async () => {
+  it('creates a stable HTTP identity without Web Locks or SubtleCrypto', async () => {
     vi.stubGlobal('navigator', {})
+    vi.stubGlobal('crypto', { getRandomValues: crypto.getRandomValues.bind(crypto) })
     const first = useRpcStore()
     first.init()
     clients[0].emit('_hello', deliveryHello())
     await Promise.resolve()
     expect(connectCalls).toHaveLength(1)
-    expect(createV4GatewayAccess(first).deliveryIdentity).toBeNull()
-    expect(localStorage.getItem('opensquilla.deliverySalt.v1')).toBeNull()
+    await vi.waitFor(() => expect(createV4GatewayAccess(first).deliveryIdentity).not.toBeNull())
+    const identity = createV4GatewayAccess(first).deliveryIdentity
+    const salt = localStorage.getItem('opensquilla.deliverySalt.v1')
+    expect(salt).toMatch(/^[0-9a-f]{32}$/)
     first.$dispose()
-    localStorage.setItem('opensquilla.deliverySalt.v1', '1'.repeat(32))
     setActivePinia(createPinia())
     const next = useRpcStore()
     next.init()
     clients[1].emit('_hello', deliveryHello())
-    await vi.waitFor(() => expect(createV4GatewayAccess(next).deliveryIdentity).not.toBeNull())
+    await vi.waitFor(() => expect(createV4GatewayAccess(next).deliveryIdentity).toBe(identity))
+    expect(localStorage.getItem('opensquilla.deliverySalt.v1')).toBe(salt)
     next.$dispose()
   })
 
@@ -363,6 +369,39 @@ describe('rpc link-token bootstrap', () => {
     store.$dispose()
   })
 
+  it('revokes proven delivery authority when another tab changes the shared salt', async () => {
+    const store = useRpcStore()
+    const access = createV4GatewayAccess(store)
+    store.init()
+    clients[0].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+    const oldSalt = localStorage.getItem('opensquilla.deliverySalt.v1')
+    const newSalt = 'e'.repeat(32)
+    localStorage.setItem('opensquilla.deliverySalt.v1', newSalt)
+    window.dispatchEvent(new StorageEvent('storage', { key: 'opensquilla.deliverySalt.v1', oldValue: oldSalt, newValue: newSalt }))
+    expect(access.deliveryIdentity).toBeNull()
+    expect(store.isConnected).toBe(true)
+    clients[0].emit('_hello', deliveryHello())
+    expect(access.deliveryIdentity).toBeNull()
+    store.$dispose()
+  })
+
+  it('does not publish delayed hashing after its salt changes, even before a storage event', async () => {
+    let finish!: (value: ArrayBuffer) => void
+    vi.spyOn(crypto.subtle, 'digest').mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const store = useRpcStore()
+    const access = createV4GatewayAccess(store)
+    store.init()
+    clients[0].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
+    localStorage.setItem('opensquilla.deliverySalt.v1', 'e'.repeat(32))
+    finish(new ArrayBuffer(32))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(access.deliveryIdentity).toBeNull()
+    store.$dispose()
+  })
+
   it('keeps transport startup working without offline authority when hashing is unavailable', async () => {
     const digest = vi.spyOn(crypto.subtle, 'digest').mockRejectedValue(new Error('Synthetic crypto restriction'))
     const store = useRpcStore()
@@ -385,7 +424,7 @@ describe('rpc link-token bootstrap', () => {
     await Promise.resolve()
     expect(connectCalls).toHaveLength(1)
     expect(store.isConnected).toBe(true)
-    expect(write).toHaveBeenCalled()
+    await vi.waitFor(() => expect(write).toHaveBeenCalled())
     expect(createV4GatewayAccess(store).deliveryIdentity).toBeNull()
     store.$dispose()
   })

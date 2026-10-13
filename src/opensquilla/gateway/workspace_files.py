@@ -26,7 +26,7 @@ from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.origin_guard import (
     forbidden_origin_response,
     request_origin_allowed,
-    request_principal_is_owner,
+    request_principal_is_owner_async,
 )
 from opensquilla.gateway.project_workspace_runtime import authoritative_project_run_context
 from opensquilla.gateway.rpc import RpcHandlerError
@@ -502,10 +502,10 @@ def register_workspace_file_routes(
 ) -> None:
     service = WorkspaceFiles(config, session_manager)
 
-    def guard(request: Request) -> Response | None:
+    async def guard(request: Request) -> Response | None:
         if not request_origin_allowed(request, config):
             return forbidden_origin_response()
-        if not request_principal_is_owner(config, request):
+        if not await request_principal_is_owner_async(config, request):
             return JSONResponse({"code": "OWNER_REQUIRED"}, status_code=403, headers=_HEADERS)
         return None
 
@@ -529,7 +529,7 @@ def register_workspace_file_routes(
         return instance_id, nonce
 
     async def resolve(request: Request) -> Response:
-        denied = guard(request)
+        denied = await guard(request)
         if denied is not None:
             return denied
         body = bytearray()
@@ -559,7 +559,7 @@ def register_workspace_file_routes(
         return JSONResponse(result, headers=_HEADERS)
 
     async def content(request: Request) -> Response:
-        denied = guard(request)
+        denied = await guard(request)
         if denied is not None:
             return denied
         try:
@@ -583,7 +583,7 @@ def register_workspace_file_routes(
         )
 
     async def page(request: Request) -> Response:
-        denied = guard(request)
+        denied = await guard(request)
         if denied is not None:
             return denied
         try:
@@ -610,7 +610,7 @@ def register_workspace_file_routes(
         return JSONResponse(result, headers=_HEADERS)
 
     async def search(request: Request) -> Response:
-        denied = guard(request)
+        denied = await guard(request)
         if denied is not None:
             return denied
         query = request.query_params.get("query", "").strip()
@@ -628,7 +628,7 @@ def register_workspace_file_routes(
         return JSONResponse(result, headers=_HEADERS)
 
     async def metadata(request: Request) -> Response:
-        denied = guard(request)
+        denied = await guard(request)
         if denied is not None:
             return denied
         owner = native_owner(request)

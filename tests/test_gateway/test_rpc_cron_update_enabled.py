@@ -198,8 +198,8 @@ async def test_update_invalid_patch_does_not_change_enabled_or_persist(
         job.backoff_until = now + timedelta(minutes=1)
         await store.save(job)
         before = await store.get(job.id)
-        save = AsyncMock(wraps=store.save)
-        monkeypatch.setattr(store, "save", save)
+        update_configuration = AsyncMock(wraps=store.update_configuration)
+        monkeypatch.setattr(store, "update_configuration", update_configuration)
 
         with pytest.raises(ValueError, match=error):
             await _handle_cron_update(
@@ -208,7 +208,7 @@ async def test_update_invalid_patch_does_not_change_enabled_or_persist(
             )
 
         assert await store.get(job.id) == before
-        save.assert_not_awaited()
+        update_configuration.assert_not_awaited()
     finally:
         await store.close()
 
@@ -229,8 +229,8 @@ async def test_update_enabled_and_schedule_persist_together_once(
             schedule_value=(now + timedelta(hours=1)).isoformat(),
             payload=make_agent_turn_payload("original reminder"),
         )
-        save = AsyncMock(wraps=store.save)
-        monkeypatch.setattr(store, "save", save)
+        update_configuration = AsyncMock(wraps=store.update_configuration)
+        monkeypatch.setattr(store, "update_configuration", update_configuration)
         new_at = (now + timedelta(hours=2)).isoformat()
 
         await _handle_cron_update(
@@ -249,6 +249,6 @@ async def test_update_enabled_and_schedule_persist_together_once(
         assert after.enabled is enabled
         assert after.next_run_at == now + timedelta(hours=2)
         assert payload_text(after.payload, after.session_target) == "updated reminder"
-        save.assert_awaited_once()
+        update_configuration.assert_awaited_once()
     finally:
         await store.close()

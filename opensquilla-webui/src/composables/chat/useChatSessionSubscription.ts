@@ -347,8 +347,11 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     activity: SessionReadActivity,
     signal: AbortSignal,
     ownershipRevision: number | undefined,
+    reconciliation: boolean,
   ): void {
-    void lease.metadata.then((metadata) => {
+    // A recovery must sample current control state, not reinstall the initial
+    // plan/task snapshot captured before the missed events.
+    void (reconciliation ? lease.retryMetadata() : lease.metadata).then((metadata) => {
       if (
         !isCurrentSubscription(lease, key, sequence, signal)
         || metadataHydration !== metadataHydrationSequence
@@ -468,6 +471,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         live.activity,
         signal,
         ownershipRevision,
+        reconciliation,
       )
       // Fast ACK is authoritative for delivery registration. Deferred storage
       // metadata may refine task/workspace state later but cannot make history

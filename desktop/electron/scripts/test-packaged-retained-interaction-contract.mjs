@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { link, mkdtemp, mkdir, readFile, realpath, rm, rmdir, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { test } from 'node:test'
@@ -9,6 +9,8 @@ import { runInNewContext } from 'node:vm'
 import { AUDIT_MARKER, AUDIT_PURPOSE, assertNoExistingDesktop, assertPreservedInputs, assertStopEvidence, auditMessages, parseAuditManifest, parseSyntheticCredential, sha256, verifyAuditInputs } from './fixtures/packaged-retained-interaction/contract.mjs'
 import { installRetainedRpcProbe } from './fixtures/packaged-retained-interaction/browser-probe.mjs'
 import { startRetainedProvider } from './fixtures/packaged-retained-interaction/provider.mjs'
+import { collectRetainedGatewayDiagnostics, sameLogFileIdentity } from './fixtures/packaged-retained-interaction/diagnostics.mjs'
+import { captureFirstSendDiagnostic } from './packaged-first-send-cleanup.mjs'
 
 // Pure fixture/loopback tests: never execute the dummy .exe, Electron, Gateway,
 // an installer, or a real profile. These results are not native acceptance.
@@ -47,6 +49,145 @@ test('pinned synthetic inputs validate without rewriting credentials/config', as
   assert.equal(plan.provider.model, credential().model)
   await assertPreservedInputs(plan)
   assert.equal(await readFile(plan.credentialPath, 'utf8'), JSON.stringify(credential()))
+})
+
+async function diagnosticFixture(t) {
+  const f = await fixture(t)
+  const plan = await verifyAuditInputs(f.manifestPath, f.outputDir)
+  for (const path of [join(plan.userDataDir, 'logs'), join(plan.profile, 'logs')]) await mkdir(path)
+  return { ...f, plan, gatewayLog: join(plan.userDataDir, 'logs/gateway.log'), debugLog: join(plan.profile, 'logs/debug.log') }
+}
+
+test('log identity permits only Windows unknown path device without weakening inode checks', () => {
+  for (const platform of ['win32', 'linux', 'darwin']) {
+    assert.equal(sameLogFileIdentity({ dev: 123, ino: 456 }, { dev: 123, ino: 456 }, platform), true)
+    assert.equal(sameLogFileIdentity({ dev: 123, ino: 456 }, { dev: 789, ino: 456 }, platform), false)
+    assert.equal(sameLogFileIdentity({ dev: 0, ino: 456 }, { dev: 123, ino: 456 }, platform), platform === 'win32')
+    assert.equal(sameLogFileIdentity({ dev: 0, ino: 456 }, { dev: 123, ino: 789 }, platform), false)
+    assert.equal(sameLogFileIdentity({ dev: 123, ino: 456 }, { dev: 0, ino: 456 }, platform), false)
+  }
+})
+
+test('failure diagnostics retain database holder and exception evidence while redacting credentials', async t => {
+  const { plan, gatewayLog, debugLog } = await diagnosticFixture(t)
+  const record = JSON.stringify({ event: 'session_storage.operation_busy', operation: 'save_session',
+    attrs: { operation: 'read.archive' }, hold_ms: 2200, exception_type: 'OperationalError',
+    token: 'private-token-value', authorization: 'Bearer private-bearer-value',
+    path: join(plan.userDataDir, 'synthetic.log') }) + '\n'
+  await writeFile(gatewayLog, record)
+  await writeFile(debugLog, record)
+  await writeFile(debugLog + '.1', record)
+  const rows = await collectRetainedGatewayDiagnostics(plan)
+  assert.deepEqual(rows.map(row => row.name), ['gateway.log', 'debug.log', 'debug.log.1'])
+  for (const row of rows) {
+    assert.match(row.tail, /session_storage.operation_busy/)
+    assert.match(row.tail, /read.archive/)
+    assert.match(row.tail, /OperationalError/)
+    assert.match(row.tail, /2200/)
+    assert.doesNotMatch(row.tail, /private-token-value|private-bearer-value/)
+    assert.equal(row.truncated, false)
+  }
+  await assertPreservedInputs(plan)
+})
+
+test('log reads and redacted output are bounded; partial and oversized lines are omitted', async t => {
+  const { plan, gatewayLog, debugLog } = await diagnosticFixture(t)
+  const content = 'token=' + 'x'.repeat(70_000) + '\n' + 'z'.repeat(9000) + '\n'
+    + 'token=x\n'.repeat(6000) + 'session_storage.operation_busy hold_ms=2000\n' + 'unfinished-secret'
+  for (const path of [gatewayLog, debugLog, debugLog + '.1']) await writeFile(path, content)
+  const rows = await collectRetainedGatewayDiagnostics(plan)
+  for (const row of rows) {
+    assert.ok(row.capturedBytes <= 64 * 1024)
+    assert.ok(Buffer.byteLength(row.tail) <= 64 * 1024)
+    assert.equal(row.truncated, true)
+    assert.equal(row.leadingPartialLine, true)
+    assert.equal(row.trailingPartialLine, true)
+    assert.equal(row.oversizedLines, 1)
+    assert.match(row.tail, /session_storage.operation_busy hold_ms=2000/)
+    assert.doesNotMatch(row.tail, /unfinished-secret|token=x|z{20}|x{20}/)
+  }
+  assert.ok(rows.reduce((bytes, row) => bytes + Buffer.byteLength(row.tail), 0) <= 192 * 1024)
+})
+
+test('missing logs and non-file diagnostics do not prevent other log capture', async t => {
+  const { plan, gatewayLog, debugLog } = await diagnosticFixture(t)
+  await mkdir(gatewayLog)
+  await writeFile(debugLog, 'session_storage.operation_busy\n')
+  const rows = await collectRetainedGatewayDiagnostics(plan)
+  assert.deepEqual(rows[0], { name: 'gateway.log', unavailable: true, code: 'UNSAFE_PATH' })
+  assert.match(rows[1].tail, /operation_busy/)
+  assert.deepEqual(rows[2], { name: 'debug.log.1', unavailable: true, code: 'ENOENT' })
+})
+
+test('diagnostics reject a profile outside the verified synthetic root and hard-linked logs', async t => {
+  const { root, plan, gatewayLog } = await diagnosticFixture(t)
+  const external = join(root, 'external-private.log')
+  await writeFile(external, 'external-private-content\n')
+  await link(external, gatewayLog)
+  const linked = await collectRetainedGatewayDiagnostics(plan)
+  assert.equal(linked[0].code, 'UNSAFE_PATH')
+  const outside = await collectRetainedGatewayDiagnostics({ ...plan, profile: root })
+  assert.ok(outside.every(row => row.code === 'UNSAFE_PATH'))
+  assert.doesNotMatch(JSON.stringify([linked, outside]), /external-private-content/)
+})
+
+test('diagnostics reject redirected log directories without reading outside the synthetic profile', async t => {
+  const { root, plan, gatewayLog } = await diagnosticFixture(t)
+  const external = join(root, 'external-logs')
+  await mkdir(external)
+  await writeFile(join(external, 'gateway.log'), 'external-private-content\n')
+  await rmdir(dirname(gatewayLog))
+  try { await symlink(external, dirname(gatewayLog), process.platform === 'win32' ? 'junction' : 'dir') }
+  catch (error) {
+    if (['EPERM', 'EACCES'].includes(error.code)) { t.skip('Creating a test directory link requires host privileges'); return }
+    throw error
+  }
+  const rows = await collectRetainedGatewayDiagnostics(plan)
+  assert.equal(rows[0].code, 'UNSAFE_PATH')
+  assert.doesNotMatch(JSON.stringify(rows), /external-private-content/)
+})
+
+test('diagnostics reject a symbolic log file when the host permits creating one', async t => {
+  const { root, plan, gatewayLog } = await diagnosticFixture(t)
+  const external = join(root, 'external-private.log')
+  await writeFile(external, 'external-private-content\n')
+  try { await symlink(external, gatewayLog, 'file') }
+  catch (error) {
+    if (['EPERM', 'EACCES'].includes(error.code)) { t.skip('Creating a test file symlink requires host privileges'); return }
+    throw error
+  }
+  const rows = await collectRetainedGatewayDiagnostics(plan)
+  assert.equal(rows[0].code, 'UNSAFE_PATH')
+  assert.doesNotMatch(JSON.stringify(rows), /external-private-content/)
+})
+
+test('diagnostic timeout preserves the original failure and probe captures before cleanup', async () => {
+  const source = (await readFile(new URL('./test-packaged-retained-interaction.mjs', import.meta.url), 'utf8')).replace(/\r\n/g, '\n')
+  const start = source.indexOf('} catch (error) {\n  Object.assign(report')
+  const end = source.indexOf('\n} finally {', start)
+  assert.ok(start >= 0 && end > start)
+  const phases = []
+  const report = {}
+  const processState = { exitCode: 0 }
+  // Execute the real failure body without importing/starting Electron. A hung
+  // diagnostic and unreadable Desktop log must leave the initial error intact.
+  await runInNewContext(`(async () => {${source.slice(start + '} catch (error) {'.length, end)}\n})()`, {
+    error: Object.assign(new Error('original first-send timeout'), { code: 'FIRST_SEND_TIMEOUT' }),
+    report, outputCreated: true, active: undefined, plan: { outputDir: 'synthetic-evidence', logPath: 'synthetic-log' },
+    provider: { snapshot: () => ({}), close: async () => { phases.push('provider-close') } },
+    persist: async () => {}, join,
+    collectRetainedGatewayDiagnostics: () => { phases.push('logs'); return new Promise(() => {}) },
+    captureFirstSendDiagnostic: operation => captureFirstSendDiagnostic(operation, 10),
+    copyFile: async () => { throw Object.assign(new Error('unreadable-log'), { code: 'EACCES' }) },
+    console: { error() {} }, process: processState,
+  })
+  assert.deepEqual(phases, ['logs', 'provider-close'])
+  assert.equal(report.error, 'original first-send timeout')
+  assert.equal(report.errorCode, 'FIRST_SEND_TIMEOUT')
+  assert.equal(report.ok, false)
+  assert.match(report.gatewayDiagnostics.diagnosticError, /timed out/)
+  assert.equal(report.desktopLogDiagnosticError, 'EACCES')
+  assert.equal(processState.exitCode, 1)
 })
 test('redirected temporary parents yield canonical fixtures while audit aliases remain rejected', async t => {
   const parent = await fixture(t)
@@ -173,6 +314,19 @@ test('browser observation forwards every original frame and records terminal eve
   socket.incoming({ type: 'event', event: 'session.event.done', payload: { session_key: 'session-a', turn_id: 'task-a', reason: 'aborted', content: 'do not persist arbitrary transcript' } })
   assert.equal(assertStopEvidence(context.__retainedAuditRpc, 'session-a').taskId, 'task-a')
   assert.equal(JSON.stringify(context.__retainedAuditRpc).includes('do not persist'), false)
+  const request = JSON.stringify({ type: 'req', id: 'snapshot-1', method: 'sessions.snapshot', params: { token: 'private-token' } })
+  assert.equal(socket.send(request), 'original-return')
+  socket.incoming({ type: 'res', id: 'snapshot-1', ok: false, error: { code: 'SNAPSHOT_STALE', message: 'private-details' }, payload: { content: 'private-transcript' } })
+  const transport = JSON.parse(JSON.stringify(context.__retainedAuditRpc.transport))
+  assert.deepEqual(transport.slice(-2).map(({ at, ...entry }) => {
+    assert.equal(typeof at, 'number')
+    return entry
+  }), [
+    { type: 'req', id: 'snapshot-1', method: 'sessions.snapshot' },
+    { type: 'res', id: 'snapshot-1', ok: false, code: 'SNAPSHOT_STALE' },
+  ])
+  assert.equal(JSON.stringify(context.__retainedAuditRpc).includes('private-'), false)
+  assert.equal(socket.sent.at(-1), request, 'Diagnostics must forward the unmodified request')
 })
 
 async function providerFixture(t) {

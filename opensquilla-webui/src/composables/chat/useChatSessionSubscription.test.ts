@@ -790,6 +790,50 @@ describe('useChatSessionSubscription domain lease', () => {
     expect(taskOwnership.hydrationResolved.value).toBe(true)
   })
 
+  it('refreshes a newly published plan during reconciliation without blocking live readiness', async () => {
+    const fresh = deferred<SessionReadMetadata>()
+    const fixture = leaseFixture({
+      live: live({ initialMetadata: metadata({ hydrationComplete: false }) }),
+      metadata: metadata({ currentPlan: null }),
+      retryMetadata: () => fresh.promise,
+    })
+    const onSnapshot = vi.fn()
+    const subject = harness(fixture.lease, { onSnapshot })
+    await subject.api.subscribeSession()
+    await vi.waitFor(() => expect(onSnapshot).toHaveBeenCalledWith(expect.objectContaining({ currentPlan: null })))
+    onSnapshot.mockClear()
+    await expect(subject.api.reconcileSession()).resolves.toMatchObject({ authoritative: true })
+    expect(fixture.retryMetadata).toHaveBeenCalledOnce()
+    expect(onSnapshot).not.toHaveBeenCalled()
+    const currentPlan = { revisionId: 'new-plan', planId: 'plan', title: 'Implementation plan', current: true }
+    fresh.resolve(metadata({ currentPlan }))
+    await vi.waitFor(() => expect(onSnapshot).toHaveBeenCalledWith(expect.objectContaining({ currentPlan })))
+    subject.api.cancelActiveSubscription()
+  })
+
+  it('rejects late initial and replaced-scope metadata after a fresh reconciliation', async () => {
+    const old = deferred<SessionReadMetadata>()
+    const fresh = deferred<SessionReadMetadata>()
+    const fixture = leaseFixture({
+      live: live({ initialMetadata: metadata({ hydrationComplete: false }) }),
+      metadata: old.promise, retryMetadata: () => fresh.promise,
+    })
+    const onSnapshot = vi.fn()
+    const subject = harness(fixture.lease, { onSnapshot })
+    await subject.api.subscribeSession()
+    await subject.api.reconcileSession()
+    old.resolve(metadata({ currentPlan: { revisionId: 'obsolete' } }))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(onSnapshot).not.toHaveBeenCalled()
+    subject.setLease(leaseFixture().lease)
+    fresh.resolve(metadata({ currentPlan: { revisionId: 'wrong-scope' } }))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(onSnapshot).not.toHaveBeenCalled()
+    subject.api.cancelActiveSubscription()
+  })
+
   it('honors background activity even before task-group metadata is complete', async () => {
     const subject = harness(leaseFixture({
       live: live({

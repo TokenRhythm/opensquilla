@@ -20,9 +20,10 @@ import {
   type ConversationBootstrapRunToken,
   waitForConversationBootstrapRetry,
 } from '@/modules/conversationBootstrapCoordinator'
-import type {
-  SessionReadLease,
-  SessionReadLifecycle,
+import {
+  SessionReadFailure,
+  type SessionReadLease,
+  type SessionReadLifecycle,
 } from '@/modules/sessionReadLifecycle'
 
 type PhaseRuntime<T> = ConversationBootstrapPhase<T>
@@ -46,6 +47,7 @@ export interface SessionBootstrapRun {
 
 export interface UseChatSessionBootstrapOptions {
   sessionKey: Ref<string>
+  isProvisionalDraft?: () => boolean
   sessionReadLifecycle: SessionReadLifecycle
   loadHistory: (
     context: SessionBootstrapPhaseContext,
@@ -86,7 +88,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   const liveAttemptCompletion = ref(0)
   const retryBusy = ref(false)
   const noticeDismissed = ref(false)
-  const incidents = new Map<string, { started: number; degraded: boolean; dismissed: boolean }>()
+  const incidents = new Map<string, { started: number; degraded: boolean; dismissed: boolean; readDeadlineAt?: number }>()
   let foregroundTimer: ReturnType<typeof setTimeout> | null = null
   function incidentKey(key: string) { return `${options.incidentScope?.() ?? ''}\0${key}` }
   function clearForegroundTimer() {
@@ -308,16 +310,17 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     return phase.promise
   }
 
-  function createRun(key: string, includeHistory: boolean): ActiveBootstrap {
+  function createRun(key: string, includeHistory: boolean, liveDeadlineAt = Date.now() + 120_000): ActiveBootstrap {
     options.cancelHistory()
     options.cancelSubscription()
     const run = ownership.start(key, includeHistory, token => ({
       lease: options.sessionReadLifecycle.open({
         sessionKey: key,
+        ...(options.isProvisionalDraft?.() ? { provisionalDraft: true } : {}),
         includeInitialHistory: includeHistory,
       }),
       history: historyRuntime(token.deadlineAt),
-      live: liveRuntime(Date.now() + 120_000),
+      live: liveRuntime(liveDeadlineAt),
     }))
     active = run
     return run
@@ -335,6 +338,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   function startSessionBootstrap(optionsForStart: {
     includeHistory?: boolean
     force?: boolean
+    liveDeadlineAt?: number
   } = {}): SessionBootstrapRun {
     const key = options.sessionKey.value
     const includeHistory = optionsForStart.includeHistory !== false
@@ -364,7 +368,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       return publicRun(active)
     }
 
-    const run = createRun(key, includeHistory)
+    const run = createRun(key, includeHistory, optionsForStart.liveDeadlineAt)
     // Opening the lease starts subscribe/snapshot and, when requested, the
     // eager latest-history frame. Both projections consume that same lease.
     run.live.promise = runLivePhase(run)
@@ -400,9 +404,36 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     const run = active
     if (explicit && run && isCurrent(run)) {
       if (run.live.running) return run.live.promise
+      delete incidentFor(run.key).readDeadlineAt
       if (run.live.result?.error && !shouldRetrySessionPhase(run.live.result.error)) {
-        return startSessionBootstrap({ includeHistory: false, force: true }).live
+        const previousHistoryPhase = historyPhase.value
+        const includeHistory = previousHistoryPhase !== 'ready'
+        const replacement = startSessionBootstrap({ includeHistory, force: true })
+        if (!includeHistory) historyPhase.value = previousHistoryPhase
+        return replacement.live
       }
+    }
+    if (run && isCurrent(run) && leaseIsCurrent(run) && !run.live.running
+      && run.live.result?.error instanceof SessionReadFailure
+      && run.live.result.error.kind === 'rebase-required') {
+      const incident = incidentFor(run.key)
+      const deadlineAt = explicit ? Date.now() + 120_000 : incident.readDeadlineAt ?? run.live.deadlineAt
+      incident.readDeadlineAt = deadlineAt
+      if (Date.now() >= deadlineAt) {
+        const result = { ...run.live.result, error: new SessionReadFailure(
+          'budget-exhausted', 'Session read recovery budget exhausted.', false, 0, run.live.result.error,
+        ) }
+        run.live.result = result
+        liveAttemptCompletion.value++
+        return Promise.resolve(result)
+      }
+      // The existing owner retires the exact old lease before opening the new
+      // base. Keep history and the incident deadline across read-only rebases.
+      const previousHistoryPhase = historyPhase.value
+      const includeHistory = previousHistoryPhase !== 'ready'
+      const replacement = startSessionBootstrap({ includeHistory, force: true, liveDeadlineAt: deadlineAt })
+      if (!includeHistory) historyPhase.value = previousHistoryPhase
+      return replacement.live
     }
     if (run && isCurrent(run) && leaseIsCurrent(run) && options.reconcileSession) {
       if (run.live.running) {

@@ -127,13 +127,13 @@ assertPresent(
 // not bypass DOMPurify, and must never let assistant text render arbitrary form
 // controls. The only <input> markdown produces is a disabled task-list checkbox.
 assertAbsent(
-  'src/composables/chat/useChatTextRendering.ts',
+  'src/utils/markdown/renderCore.ts',
   /forceKeepAttr/,
   'markdown sanitization must not bypass DOMPurify via forceKeepAttr.',
 )
 
 assertPresent(
-  'src/composables/chat/useChatTextRendering.ts',
+  'src/utils/markdown/renderCore.ts',
   /addHook\(\s*['"]uponSanitizeElement['"][\s\S]*?removeChild/,
   'markdown sanitizer must drop non-task-list <input> elements (uponSanitizeElement + removeChild).',
 )

@@ -22,6 +22,7 @@ from opensquilla.sandbox.run_mode import (
     project_default_run_mode,
 )
 from opensquilla.sandbox.user_grants import load_user_grants_payload
+from opensquilla.sandbox.user_grants_worker import user_grants_operation
 
 RUN_CONTEXT_ORIGIN_KEY = "sandbox_run_context"
 RUN_MODE_PREFERENCE_KEY = "sandbox.run_mode"
@@ -555,6 +556,28 @@ async def get_run_context(
     include_user_grants: bool = True,
     session_node: Any | None = None,
 ) -> RunContext:
+    # Read session-manager state inside the mutation scope to avoid retaining
+    # transient updates that are later rolled back. An explicitly supplied node
+    # retains the caller's existing snapshot semantics.
+    async with user_grants_operation() as operation:
+        context = await _get_session_run_context(
+            session_manager, session_key, config=config, workspace=workspace,
+            session_node=session_node,
+        )
+        if include_user_grants:
+            return await operation.run(lambda: _with_user_grants(context))
+        return context
+
+
+async def _get_session_run_context(
+    session_manager: Any,
+    session_key: str,
+    *,
+    config: Any,
+    workspace: str | None,
+    session_node: Any | None = None,
+) -> RunContext:
+    """Read session state while the caller owns ``user_grants_operation``."""
     binding_kind = None
     node = (
         session_node
@@ -599,7 +622,7 @@ async def get_run_context(
                 )
             else:
                 saved = replace(saved, workspace_binding_kind=binding_kind)
-            return _with_user_grants(saved) if include_user_grants else saved
+            return saved
     configured_mode, _source = await resolve_default_run_mode(session_manager, config)
     context = RunContext(
         run_mode=configured_mode,
@@ -607,7 +630,7 @@ async def get_run_context(
         source="default",
         workspace_binding_kind=binding_kind,
     )
-    return _with_user_grants(context) if include_user_grants else context
+    return context
 
 
 async def resolve_default_run_mode(
@@ -642,6 +665,16 @@ async def persist_run_context(
     session_key: str,
     context: RunContext,
 ) -> RunContext:
+    async with user_grants_operation():
+        return await _persist_run_context(session_manager, session_key, context)
+
+
+async def _persist_run_context(
+    session_manager: Any,
+    session_key: str,
+    context: RunContext,
+) -> RunContext:
+    """Persist session state while the caller owns ``user_grants_operation``."""
     node = await _get_session_node(session_manager, session_key)
     if node is None:
         raise KeyError(f"Session not found: {session_key}")

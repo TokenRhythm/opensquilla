@@ -984,9 +984,15 @@ class _CronSchedulerRuntime(CronSchedulerPort):
         await _require_scheduler(self._ctx).remove_job(target.job_id)
 
     async def run_job(self, target: CronJobTarget) -> CronRunProjection:
+        scheduler = _require_scheduler(self._ctx)
+        admitted = self._ctx.cron_run_admitted
+        result = (
+            await scheduler.run_job_now(target.job_id, on_admitted=admitted)
+            if admitted is not None else await scheduler.run_job_now(target.job_id)
+        )
         return cast(
             CronRunProjection,
-            _manual_run_to_wire(await _require_scheduler(self._ctx).run_job_now(target.job_id)),
+            _manual_run_to_wire(result),
         )
 
     async def list_runs(self, query: CronRunQuery) -> list[CronRunProjection]:

@@ -647,12 +647,29 @@ export function useChatSend(options: UseChatSendOptions) {
   let handoffRecoveryPromise: Promise<void> | null = null
   const stoppedAcceptanceAttempts = new Map<string, SendAttempt>()
   const acceptanceRecoveryVersion = ref(0)
+  watch(() => options.deliveryIdentity?.value, () => {
+    // This is a visible pre-ACK latch, not the durable Stop intent. A different
+    // account must not inherit it; the WAL and scoped attempt registry retain
+    // the original request and restore its recovery status on return.
+    acceptanceStopPending.value = false
+  }, { flush: 'sync' })
   const pendingDeliveryStops = new Set<string>()
-  const composerSubmissions = new Map<symbol, { sessionKey: string; snapshot: ComposerSnapshot }>()
+  const composerSubmissions = new Map<symbol, { sessionKey: string; identity: string | null; snapshot: ComposerSnapshot }>()
   const composerSubmissionVersion = ref(0)
   const sendPending = computed(() => {
     composerSubmissionVersion.value
-    return [...composerSubmissions.values()].some(entry => entry.sessionKey === options.sessionKey.value)
+    const identity = options.deliveryIdentity?.value
+    return Boolean(identity && [...composerSubmissions.values()].some(entry => (
+      entry.sessionKey === options.sessionKey.value && entry.identity === identity
+    )))
+  })
+  const sendHydrationBlocked = computed(() => {
+    composerSubmissionVersion.value
+    acceptanceRecoveryVersion.value
+    // Receipt recovery and proven offline queues precede the ordinary task
+    // hydration guard. Keep those existing actions available in the UI.
+    return Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value
+      && !currentExactReplayAttempt() && !options.offlineQueueIdentity?.value)
   })
 
   function noteAcceptanceRecoveryChanged() {
@@ -660,25 +677,53 @@ export function useChatSend(options: UseChatSendOptions) {
     acceptanceRecoveryVersion.value += 1
   }
 
-  const stoppableDeliveryForCurrentSession = computed(() => {
+  const currentSessionDeliveries = computed(() => {
     acceptanceRecoveryVersion.value
-    options.deliveryIdentity?.value
+    const identity = options.deliveryIdentity?.value
     const key = options.sessionKey.value
-    if (!key) return null
+    if (!identity || !key) return []
+    return options.durableDelivery.snapshots().filter(item => item.isCurrentIdentity && item.sessionKey === key)
+  })
+  const deliveryRecoveryEntries = computed(() => currentSessionDeliveries.value.filter(item => (
+    item.phase === 'unknown' || item.stopPending
+  )))
+  const deliveryChecks = ref(new Set<string>())
+  const checkingDeliveryIds = computed(() => deliveryRecoveryEntries.value
+    .filter(item => deliveryChecks.value.has(item.id)).map(item => item.id))
+
+  async function checkDelivery(id: string): Promise<void> {
+    if (disposed || deliveryChecks.value.has(id)
+      || !deliveryRecoveryEntries.value.some(item => item.id === id)) return
+    const identity = options.deliveryIdentity?.value
+    const key = options.sessionKey.value
+    deliveryChecks.value = new Set(deliveryChecks.value).add(id)
+    try {
+      // The application owner rechecks the original receipt under its identity
+      // and lease. This action never submits a new message or a Stop intent.
+      await options.durableDelivery.retry(id)
+    } catch {
+      if (!disposed && options.deliveryIdentity?.value === identity && options.sessionKey.value === key) {
+        pushToast(i18n.global.t('deliveryRecovery.reason.storage-check'), { tone: 'warn' })
+      }
+    } finally {
+      const remaining = new Set(deliveryChecks.value)
+      remaining.delete(id)
+      deliveryChecks.value = remaining
+    }
+  }
+
+  const stoppableDeliveryForCurrentSession = computed(() => {
     // The app owner decides identity/phase eligibility. The composer can only
-    // target an unambiguous request; multiple unknowns have individual actions
-    // in the application notice.
-    const candidates = options.durableDelivery.snapshots().filter(item => (
-      item.sessionKey === key && item.stopAvailable && !pendingDeliveryStops.has(item.id)
+    // target an unambiguous request; each unknown can be checked separately in
+    // the current conversation's recovery status.
+    const candidates = currentSessionDeliveries.value.filter(item => (
+      item.stopAvailable && !pendingDeliveryStops.has(item.id)
     ))
     return candidates.length === 1 ? candidates[0]! : null
   })
   const acceptanceStopAvailableForCurrentSession = computed(() => Boolean(stoppableDeliveryForCurrentSession.value))
   const durableStopPendingForCurrentSession = computed(() => {
-    acceptanceRecoveryVersion.value
-    options.deliveryIdentity?.value
-    return Boolean(options.durableDelivery.snapshots().some(item => item.sessionKey === options.sessionKey.value
-      && (item.stopPending || pendingDeliveryStops.has(item.id))))
+    return currentSessionDeliveries.value.some(item => item.stopPending || pendingDeliveryStops.has(item.id))
   })
   watch(acceptanceStopAvailableForCurrentSession, available => {
     if (options.acceptanceStopAvailable) options.acceptanceStopAvailable.value = available
@@ -691,12 +736,14 @@ export function useChatSend(options: UseChatSendOptions) {
     // Depend on an explicit version because the attempt registry is purposely
     // non-reactive and must remain request-owned across route switches.
     acceptanceRecoveryVersion.value
+    const identity = options.deliveryIdentity?.value
     const key = options.sessionKey.value
-    if (!key) return false
-    if (options.durableDelivery.snapshots().some(item => item.sessionKey === key
-      && (item.phase === 'unknown' || item.phase === 'submitting' || item.stopPending))) return true
+    if (!identity || !key) return false
+    if (currentSessionDeliveries.value.some(item => (
+      item.phase === 'unknown' || item.phase === 'submitting' || item.stopPending
+    ))) return true
     for (const attempt of stoppedAcceptanceAttempts.values()) {
-      if (attempt.requestSessionKey === key && attempt.stopRequested) return true
+      if (attempt.deliveryIdentity === identity && attempt.requestSessionKey === key && attempt.stopRequested) return true
     }
     return false
   })
@@ -1208,6 +1255,14 @@ export function useChatSend(options: UseChatSendOptions) {
 
   function initialProviderForIntent(intent: string | null): string | null {
     return intent === 'new_chat' ? options.initialProvider?.value ?? null : null
+  }
+
+  // Only known browser skills require the optional desktop browser service.
+  function requiredServicesForSkills(skills: readonly SelectedSkillRef[]): string[] {
+    return skills.some(skill => {
+      const name = String(skill.name || '').trim().toLowerCase()
+      return name === 'browser-use' || name === 'browser_use' || name === 'browseruse'
+    }) ? ['desktop_browser'] : []
   }
 
   function consumeAcceptedComposer(attempt: SendAttempt): void {
@@ -2220,14 +2275,24 @@ export function useChatSend(options: UseChatSendOptions) {
     resumeQueueOnSuccess?: boolean
   }
 
+  function currentExactReplayAttempt(): SendAttempt | null {
+    const identity = options.deliveryIdentity?.value
+    return identity && !responseHandoffBlocksCurrentSession()
+      && recoveredAttempt?.requiresIdempotentReplay
+      && recoveredAttempt.deliveryIdentity === identity
+      && recoveredAttempt.requestSessionKey === options.sessionKey.value
+      ? recoveredAttempt : null
+  }
+
   async function onSend(invocation: SendInvocation = {}) {
     if (disposed) return
     const key = options.sessionKey.value
+    const identity = options.deliveryIdentity?.value || null
     if ([...composerSubmissions.values()].some(entry => (
-      entry.sessionKey === key && composerMatchesSnapshot(entry.snapshot)
+      entry.identity === identity && entry.sessionKey === key && composerMatchesSnapshot(entry.snapshot)
     ))) return
     const token = Symbol('composer-send')
-    composerSubmissions.set(token, { sessionKey: key, snapshot: captureComposerSnapshot() })
+    composerSubmissions.set(token, { sessionKey: key, identity, snapshot: captureComposerSnapshot() })
     composerSubmissionVersion.value += 1
     try {
       const onAccepted = invocation.resumeQueueOnSuccess
@@ -2277,13 +2342,7 @@ export function useChatSend(options: UseChatSendOptions) {
     // In particular, do this before consulting the current annotation drafts:
     // the first request may already have consumed them and advanced the head.
     // Only live transport/admission state is allowed to block this exact replay.
-    const exactReplayAttempt = (
-      !handoffInFlight
-      && recoveredAttempt?.requiresIdempotentReplay
-      && recoveredAttempt.requestSessionKey === options.sessionKey.value
-    )
-      ? recoveredAttempt
-      : null
+    const exactReplayAttempt = currentExactReplayAttempt()
     if (exactReplayAttempt) {
       if (exactReplayAttempt.deliveryIdentity !== undefined
         && exactReplayAttempt.deliveryIdentity !== requestDeliveryIdentity) return
@@ -2307,12 +2366,28 @@ export function useChatSend(options: UseChatSendOptions) {
       return
     }
 
+    const matchesRecoveredComposer = () => Boolean(recoveredAttempt && matchesRecoveredDraft(recoveredAttempt, {
+      requestSessionKey,
+      draftIds: composerSnapshot.draftIds,
+      pageContext: composerSnapshot.pageContext,
+      selectedSkills: composerSnapshot.selectedSkills,
+      localPathReferences: composerSnapshot.localPathReferences,
+      text,
+      attachments: sendableAttachments,
+      intent: composerSnapshot.intent,
+      initialCollaborationMode: composerSnapshot.initialCollaborationMode,
+      initialRoutingMode: composerSnapshot.initialRoutingMode,
+      initialModel: composerSnapshot.initialModel,
+      initialProvider: composerSnapshot.initialProvider,
+      forkBeforeMessageId: composerSnapshot.forkBeforeMessageId,
+      workspaceId: composerSnapshot.workspaceId,
+    }))
     const offlineIdentity = options.offlineQueueIdentity?.value
     if (offlineIdentity && hasPayload) {
       // This branch has never called the command port. Already-submitted
       // requests retain the exact receipt-recovery path above.
       if (
-        recoveredAttempt
+        (recoveredAttempt && (recoveredAttempt.deliveryIdentity === requestDeliveryIdentity || matchesRecoveredComposer()))
         || handoffInFlight
         || !requestSessionKey
         || offlineIdentity !== options.deliveryIdentity?.value
@@ -2361,22 +2436,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (
       !handoffInFlight &&
       recoveredAttempt &&
-      matchesRecoveredDraft(recoveredAttempt, {
-        requestSessionKey: options.sessionKey.value,
-        draftIds: composerSnapshot.draftIds,
-        pageContext: composerSnapshot.pageContext,
-        selectedSkills: composerSnapshot.selectedSkills,
-        localPathReferences: composerSnapshot.localPathReferences,
-        text,
-        attachments: sendableAttachments,
-        intent: composerSnapshot.intent,
-        initialCollaborationMode: composerSnapshot.initialCollaborationMode,
-        initialRoutingMode: composerSnapshot.initialRoutingMode,
-        initialModel: composerSnapshot.initialModel,
-        initialProvider: composerSnapshot.initialProvider,
-        forkBeforeMessageId: composerSnapshot.forkBeforeMessageId,
-        workspaceId: composerSnapshot.workspaceId,
-      })
+      matchesRecoveredComposer()
     ) {
       await dispatchSend(text, {
         composerText,
@@ -2861,6 +2921,7 @@ export function useChatSend(options: UseChatSendOptions) {
           .slice(0, 16)
     const requiresRecoveryReplay = Boolean(
       retryCandidate?.requiresIdempotentReplay
+      && retryCandidate.deliveryIdentity === requestDeliveryIdentity
       && retryCandidate.requestSessionKey === requestSessionKey
       && retryCandidate.queueMode === sendOpts.queueMode,
     )
@@ -3039,6 +3100,8 @@ export function useChatSend(options: UseChatSendOptions) {
         sessionKey: requestSessionKey,
       }
       if (attemptSelectedSkills.length) params.selectedSkills = copySelectedSkills(attemptSelectedSkills)
+      const requiredServices = requiredServicesForSkills(attemptSelectedSkills)
+      if (requiredServices.length) params.requiredServices = requiredServices
       if (attemptLocalPathReferences.length) params.localPathReferences = [...attemptLocalPathReferences]
       if (attemptPageContext) params.pageContext = attemptPageContext
       if (attemptPageContext?.annotations?.length && !userText) params.displayText = ''
@@ -4029,6 +4092,10 @@ export function useChatSend(options: UseChatSendOptions) {
     },
     onSend,
     sendPending,
+    sendHydrationBlocked,
+    deliveryRecoveryEntries,
+    checkingDeliveryIds,
+    checkDelivery,
     onStop,
     sendQueuedSteer,
     sendQueuedFollowup,

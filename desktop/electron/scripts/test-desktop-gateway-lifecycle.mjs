@@ -68,7 +68,10 @@ function deferred() {
 function mainStartupHarness() {
   const inspection = deferred()
   const inspectionStarted = deferred()
-  const calls = { rendered: [], published: [], readiness: [], starts: 0, successes: 0, failures: [], invitations: 0 }
+  const calls = {
+    rendered: [], published: [], readiness: [], startupLogs: [],
+    starts: 0, successes: 0, failures: [], invitations: 0,
+  }
   const snapshot = () => runInContext('desktopGatewayConnectionSnapshot()', context)
   const context = createContext({
     Error,
@@ -98,7 +101,13 @@ function mainStartupHarness() {
     syncDesktopConsentMirror: async () => {},
     desktopTelemetryRuntimeGate: { close() {} },
     desktopLog() {},
-    desktopStartupLog() {},
+    desktopStartupLog: (event, detail) => {
+      if (event === 'startup_stage_attempt_started'
+        || event === 'startup_stage'
+        || event === 'startup_stage_attempt_finished') {
+        calls.startupLogs.push({ event, detail })
+      }
+    },
     loadDesktopRendererIntoCurrentWindow: async () => { calls.rendered.push(snapshot()) },
     beginGatewayStartTelemetry() {},
     readinessCheck: async (url) => {
@@ -116,6 +125,7 @@ function mainStartupHarness() {
     currentMainWindow: () => null,
   })
   runInContext([
+    mainSection('let desktopStartupStageAttemptSequence =', 'const __dirname ='),
     mainSection('let desktopOpenFlowRevision =', 'function beginDesktopWriterOperation('),
     mainSection('const gatewayState =', 'let sandboxUpgradeRefreshInFlight ='),
     mainSection('function transitionGatewayConnection(', 'const artifactPreviewLeaseBroker ='),
@@ -143,6 +153,13 @@ async function runColdStartDescriptorCase() {
   assert.equal(harness.snapshot().status, 'error', 'real startup failures remain actionable')
   assert.equal(harness.calls.published.at(-1).error, 'Synthetic profile inspection failure')
   assert.deepEqual(harness.calls.failures, ['Synthetic profile inspection failure'])
+  assert.deepEqual(
+    harness.calls.startupLogs.map(entry => entry.event),
+    ['startup_stage_attempt_started', 'startup_stage', 'startup_stage_attempt_finished'],
+    'failed startup must still close its stage attempt',
+  )
+  assert.equal(harness.calls.startupLogs[1].detail.stage, 'profile-inspect')
+  assert.equal(harness.calls.startupLogs[2].detail.outcome, 'fail')
 }
 
 async function runWarmExternalGatewayReuseCase() {
@@ -159,6 +176,14 @@ async function runWarmExternalGatewayReuseCase() {
   assert.equal(harness.calls.starts, 0)
   assert.equal(harness.calls.successes, 1)
   assert.deepEqual(harness.calls.failures, [])
+  assert.deepEqual(
+    harness.calls.startupLogs
+      .filter(entry => entry.event === 'startup_stage')
+      .map(entry => entry.detail.stage),
+    ['profile-inspect', 'core-ready', 'ownership', 'legacy-ready', 'websocket-connected', 'tool-ready'],
+    'warm startup must expose ordered process boundaries',
+  )
+  assert.equal(harness.calls.startupLogs.at(-1).detail.outcome, 'success')
   for (const descriptor of [...harness.calls.rendered, ...harness.calls.published]) {
     assert.equal(descriptor.status, 'ready', 'warm launch must not publish a spurious startup transition')
   }
@@ -414,6 +439,7 @@ function lateReadyHarness() {
     },
   })
   runInContext([
+    mainSection('let desktopStartupStageAttemptSequence =', 'const __dirname ='),
     mainSection('let desktopOpenFlowRevision =', 'function beginDesktopWriterOperation('),
     mainSection('const gatewayState =', 'let sandboxUpgradeRefreshInFlight ='),
     mainSection('async function waitForGateway(', 'function trackStoppingGatewayProcess('),
@@ -585,7 +611,11 @@ async function runLateReadinessManualResumeCase() {
   assert.equal((await repeated).ok, true)
   backgroundVerification.resolve(true)
   await harness.flush()
-  assert.equal(harness.calls.ownership, 2, 'repeated Resume shares one foreground attempt')
+  assert.equal(
+    harness.calls.ownership,
+    3,
+    'repeated Resume shares one foreground attempt (identity preflight plus final proof)',
+  )
   assert.equal(harness.calls.ready, 1, 'manual Resume supersedes the in-flight background callback')
   assert.equal(harness.calls.published.filter(state => state.status === 'ready').length, 1)
   assert.equal(harness.state().bootError, null)
@@ -789,6 +819,48 @@ async function runReadinessBeforePrimaryDeadlineCase() {
 
   assert.deepEqual(result, { status: 'ready', late: false })
   assert.equal(probes, 2)
+}
+
+async function runGatewayIdentityPreflightCase() {
+  const events = []
+  let identityAttempts = 0
+  const context = createContext({
+    Date,
+    GatewayReadinessTimeoutError,
+    DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
+    gatewayState: { port: 18792 },
+    desktopStartupLog() {},
+    desktopLog() {},
+    events,
+    identityAttempts,
+    readinessCheck: async () => {
+      events.push('health')
+      return true
+    },
+    waitForGatewayReadiness: async ({ probe }) => {
+      // Simulate a child that has written no usable identity yet while its
+      // migrations are running.  A foreign /readyz must not be consulted in
+      // those rounds; only the exact HMAC identity unlocks the health probe.
+      assert.equal(await probe(1_000), false)
+      assert.equal(await probe(1_000), false)
+      assert.equal(await probe(1_000), true)
+      return { status: 'ready', late: false }
+    },
+  })
+  runInContext(
+    mainSection('async function waitForGateway(', 'function hasGatewayProcessExited('),
+    context,
+  )
+  const result = await runInContext(
+    `waitForGateway('http://127.0.0.1:18792', undefined, async () => {
+      events.push('identity')
+      identityAttempts += 1
+      return identityAttempts >= 3
+    })`,
+    context,
+  )
+  assert.equal(result, undefined)
+  assert.deepEqual(events, ['identity', 'identity', 'identity', 'health'])
 }
 
 async function runLateReadinessCase() {
@@ -1026,6 +1098,7 @@ await runLatePublishedChildCase()
 await runFailClosedCase()
 await runPendingSpawnAdmissionCase()
 await runReadinessBeforePrimaryDeadlineCase()
+await runGatewayIdentityPreflightCase()
 await runLateReadinessCase()
 await runReadinessTimeoutCase()
 await runReadinessExitCase()

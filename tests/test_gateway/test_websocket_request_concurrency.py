@@ -55,6 +55,139 @@ def test_only_explicit_valid_probe_modes_are_detached(method: str) -> None:
     assert _should_detach_rpc_request(method, {"mode": ""}) is False
 
 
+@pytest.mark.parametrize("fallback", [False, True], ids=["aiosqlite", "sqlite3-fallback"])
+async def test_search_cancel_interrupts_sqlite_and_reuses_reader(
+    tmp_path: Any, monkeypatch: Any, fallback: bool,
+) -> None:
+    from opensquilla.compat import aiosqlite
+    from opensquilla.session.models import SessionNode, TranscriptEntry
+    from opensquilla.session.recovery_reads import current_read_budget
+    from opensquilla.session.storage import SessionStorage
+
+    monkeypatch.setattr(aiosqlite, "_FORCE_SQLITE3_FALLBACK", fallback)
+    storage = await SessionStorage.open(tmp_path / "cancel-search.db")
+    key = "agent:main:webchat:search-cancel"
+    await storage.upsert_session(SessionNode(session_key=key, session_id="sid", agent_id="main"))
+    await storage.append_transcript_entry(TranscriptEntry(
+        session_key=key, session_id="sid", message_id="mid", role="user",
+        content="searchable history", created_at=100,
+    ), expected_epoch=0)
+    native_started = asyncio.Event()
+    cancelled = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    original_open = storage._open_recovery_reader
+    expensive_once = True
+    budget = None
+
+    async def open_reader() -> Any:
+        nonlocal expensive_once
+        reader = await original_open()
+        execute = reader.execute
+
+        def traced(sql: str) -> None:
+            if sql.startswith("WITH RECURSIVE search_cancel"):
+                loop.call_soon_threadsafe(native_started.set)
+
+        await reader.set_trace_callback(traced)
+
+        def execute_search(sql: str, params: Any = ()) -> Any:
+            nonlocal expensive_once
+            if "FROM transcript_fts f" in sql and expensive_once:
+                expensive_once = False
+                # Actual native VM work, with no Python sleep/UDF to release.
+                sql = (
+                    "WITH RECURSIVE search_cancel(x) AS (VALUES(0) UNION ALL "
+                    "SELECT x+1 FROM search_cancel WHERE x<1000000000) "
+                    "SELECT sum(x) FROM search_cancel"
+                )
+                params = ()
+            return execute(sql, params)
+
+        monkeypatch.setattr(reader, "execute", execute_search)
+        return reader
+
+    monkeypatch.setattr(storage, "_open_recovery_reader", open_reader)
+
+    class Dispatcher:
+        def list_methods(self) -> list[str]:
+            return ["sessions.search", "chat.history", "noop"]
+
+        async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
+            nonlocal budget
+            if method == "sessions.search":
+                if req_id == "slow":
+                    budget = current_read_budget()
+                try:
+                    rows = await storage.search_transcript("searchable")
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+                return make_ok_res(req_id, {"count": len(rows)})
+            if method == "chat.history":
+                return make_ok_res(req_id, {"count": len(await storage.get_transcript("sid"))})
+            return make_ok_res(req_id, {"method": method})
+
+    async def before_frame(frame: str) -> None:
+        message = json.loads(frame)
+        if message.get("id") == "quick":
+            await asyncio.wait_for(native_started.wait(), 2)
+        if message.get("type") == "cancel":
+            # Ordinary work completes while the expensive SQLite VM is active.
+            await ws.wait_for_response("quick")
+            assert not cancelled.is_set()
+            assert not websocket_module._ACTIVE_PROVIDER_PROBE_LEASES
+        if message.get("id") == "again":
+            await asyncio.wait_for(cancelled.wait(), 2)
+            assert budget is not None
+            await asyncio.wait_for(budget.drain(), 2)
+            pool = storage._recovery_read_pool
+            assert pool is not None and pool.active_count == pool.retiring_count == 0
+
+    async def finish(socket: _HistoryWebSocket) -> None:
+        await socket.wait_for_response("again")
+        await socket.wait_for_response("history")
+
+    frames = [_CONNECT_FRAME]
+    frames += [json.dumps({"type": "req", "id": ident, "method": method, "params": {}})
+               for ident, method in [("slow", "sessions.search"), ("quick", "noop")]]
+    frames += [json.dumps({"type": "cancel", "id": "slow"})]
+    frames += [json.dumps({"type": "req", "id": ident, "method": method, "params": {}})
+               for ident, method in [("again", "sessions.search"), ("history", "chat.history")]]
+    ws = _HistoryWebSocket(frames, Dispatcher(), before_frame=before_frame, after_frames=finish)
+    try:
+        await asyncio.wait_for(handle_ws_connection(
+            ws, GatewayConfig(), dispatcher=Dispatcher(),
+        ), 10)
+        responses = {frame["id"]: frame for frame in ws.responses()}
+        assert "slow" not in responses
+        assert responses["again"]["payload"] == {"count": 1}
+        assert responses["history"]["payload"] == {"count": 1}
+        assert "sessions.search" in ws.hello()["policy"]["cancellable_request_methods"]
+        assert "sessions.search" in ws.hello()["policy"]["concurrent_optional_read_methods"]
+        assert storage._recovery_read_pool.physical_count == 1
+    finally:
+        await asyncio.wait_for(storage.close(), 2)
+
+
+async def test_search_deadline_is_error_and_does_not_hold_ordinary_queue(monkeypatch: Any) -> None:
+    monkeypatch.setattr(websocket_module, "READ_BUDGET_SECONDS", 0.05)
+    dispatcher = _ConcurrentOptionalReadDispatcher({"search"})
+
+    async def finish(socket: _HistoryWebSocket) -> None:
+        await socket.wait_for_response("quick")
+        await socket.wait_for_response("search")
+
+    frames = [_CONNECT_FRAME]
+    frames += [json.dumps({"type": "req", "id": ident, "method": method, "params": {}})
+               for ident, method in [("search", "sessions.search"), ("quick", "noop")]]
+    ws = _HistoryWebSocket(frames, dispatcher, after_frames=finish)
+    await asyncio.wait_for(handle_ws_connection(ws, GatewayConfig(), dispatcher=dispatcher), 10)
+    responses = {frame["id"]: frame for frame in ws.responses()}
+    assert responses["search"]["ok"] is False
+    assert responses["search"]["error"]["code"] == "STORAGE_BUSY"
+    assert responses["quick"]["ok"] is True
+
+
 class _HistoryDispatcher:
     def __init__(self) -> None:
         self.history_started = asyncio.Event()
@@ -197,6 +330,24 @@ class _SessionHandoffDispatcher:
             self.mutation_order.append(("unsubscribe", key))
             subscriptions.unsubscribe_messages(ctx.conn_id, key)
         return make_ok_res(req_id, {"key": key, "method": method})
+
+
+class _BlockingFlowControlDispatcher:
+    def __init__(self) -> None:
+        self.control_started = asyncio.Event()
+        self.release_control = asyncio.Event()
+        self.quick_dispatched = asyncio.Event()
+
+    def list_methods(self) -> list[str]:
+        return ["transport.sessionFlow.update.v2", "noop"]
+
+    async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
+        if method == "transport.sessionFlow.update.v2":
+            self.control_started.set()
+            await self.release_control.wait()
+        elif method == "noop":
+            self.quick_dispatched.set()
+        return make_ok_res(req_id, {"method": method})
 
 
 class _HistoryWebSocket:
@@ -384,6 +535,7 @@ async def test_explicit_provider_probe_cancel_closes_stream_and_does_not_block_s
         "onboarding.llmProfile.draft.probe",
         "onboarding.llmProfile.probe",
         "onboarding.provider.probe",
+        "sessions.search",
     ]
     assert ws.close_codes == []
 
@@ -1038,6 +1190,7 @@ async def test_webui_bootstrap_optional_reads_do_not_reject_catalog_or_block_int
         ("workspaces", "workspaces.list"),
         ("onboarding", "onboarding.status"),
         ("run-mode", "sandbox.run_mode.preference.get"),
+        ("runtime-status", "sandbox.runtime.status"),
         ("config", "config.get"),
         ("models", "models.routing.get"),
         ("commands", "commands.list_for_surface"),
@@ -1095,11 +1248,16 @@ async def test_webui_bootstrap_optional_reads_do_not_reject_catalog_or_block_int
         "artifacts.list",
         "commands.list_for_surface",
         "config.get",
+        "cron.list",
+        "cron.runs",
+        "cron.status",
         "models.routing.get",
         "onboarding.status",
         "sandbox.run_mode.preference.get",
+        "sandbox.runtime.status",
         "sessions.list",
         "sessions.messages.hydrate",
+        "sessions.search",
         "turns.receipt.get",
         "usage.status",
         "workspaces.list",
@@ -1461,15 +1619,60 @@ async def test_detached_hydrate_does_not_block_session_subscription_handoff(
         "artifacts.list",
         "commands.list_for_surface",
         "config.get",
+        "cron.list",
+        "cron.runs",
+        "cron.status",
         "models.routing.get",
         "onboarding.status",
         "sandbox.run_mode.preference.get",
+        "sandbox.runtime.status",
         "sessions.list",
         "sessions.messages.hydrate",
+        "sessions.search",
         "turns.receipt.get",
         "usage.status",
         "workspaces.list",
     ]
+    assert ws.close_codes == []
+
+
+async def test_v2_flow_control_does_not_block_following_rpc_ingress() -> None:
+    dispatcher = _BlockingFlowControlDispatcher()
+    observed: dict[str, bool] = {}
+
+    async def finish_after_frames(socket: _HistoryWebSocket) -> None:
+        await asyncio.wait_for(dispatcher.quick_dispatched.wait(), timeout=1)
+        observed["quick_before_control"] = not socket.has_response("control")
+        dispatcher.release_control.set()
+        await socket.wait_for_response("control")
+        await socket.wait_for_response("quick")
+
+    ws = _HistoryWebSocket(
+        [
+            _CONNECT_FRAME,
+            json.dumps({
+                "type": "req",
+                "id": "control",
+                "method": "transport.sessionFlow.update.v2",
+                "params": {},
+            }),
+            json.dumps({"type": "req", "id": "quick", "method": "noop", "params": {}}),
+        ],
+        dispatcher,
+        after_frames=finish_after_frames,
+    )
+
+    await asyncio.wait_for(
+        handle_ws_connection(
+            ws,
+            GatewayConfig(ws_writer_queue_enabled=True),
+            dispatcher=dispatcher,
+        ),
+        timeout=2,
+    )
+
+    assert observed["quick_before_control"] is True
+    assert {frame["id"] for frame in ws.responses()} == {"control", "quick"}
     assert ws.close_codes == []
 
 

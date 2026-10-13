@@ -425,6 +425,26 @@ async def _wait_for_goal(
     return result
 
 
+def _observe_goal_pause(stack: _GoalRpcStack) -> asyncio.Event:
+    paused = asyncio.Event()
+    emit = stack.service._event_emitter
+
+    async def observe(session_key: str, name: str, payload: dict[str, Any]) -> None:
+        await emit(session_key, name, payload)
+        goal = payload.get("goal")
+        if (
+            session_key == SOURCE_KEY
+            and name == "session.event.goal"
+            and isinstance(goal, dict)
+            and goal.get("status") == "paused"
+            and goal.get("activeTaskId") is None
+        ):
+            paused.set()
+
+    stack.service._event_emitter = observe
+    return paused
+
+
 async def _authority_is_detached(service: GoalService) -> bool:
     return SOURCE_KEY not in service._leases
 
@@ -3645,6 +3665,12 @@ async def test_continuation_authority_loss_after_accept_compensates_before_activ
         assert task.status == AgentTaskStatus.ABANDONED
         assert task.terminal_reason == reason
         assert task.started_at is None
+        owner = task.details.get("admission_owner")
+        assert isinstance(owner, dict)
+        assert owner["resident_lease"] == "released"
+        assert owner["compute_lease"] == "not_acquired"
+        assert owner["settlement"] == "settled"
+        assert "cancellation_requested" not in task.details
         assert goal.status == ("active" if detached else "paused")
         assert goal.pause_reason == (None if detached else reason)
         assert goal.active_task_id is None
@@ -3754,6 +3780,12 @@ async def test_continuation_post_accept_read_failure_compensates_before_provider
         assert task is not None
         assert task.status == AgentTaskStatus.ABANDONED
         assert task.terminal_reason == "activation_failed"
+        owner = task.details.get("admission_owner")
+        assert isinstance(owner, dict)
+        assert owner["resident_lease"] == "released"
+        assert owner["compute_lease"] == "not_acquired"
+        assert owner["settlement"] == "settled"
+        assert "cancellation_requested" not in task.details
         assert goal is not None
         assert goal.status == "paused"
         assert goal.pause_reason == "activation_failed"
@@ -5857,18 +5889,14 @@ async def test_three_empty_automatic_turns_pause_without_counting_user_turn(tmp_
         handler=handler,
         wire_lifecycle=True,
     ) as stack:
+        paused = _observe_goal_pause(stack)
         await _handle_goals_set(_set_params(), stack.context)
-        # Each turn makes durable SQLite writes. Bound each settlement instead
-        # of requiring all four turns to share one two-second CI deadline.
-        for expected_turns in range(1, 5):
-            await _wait_for_goal(
-                stack.storage,
-                lambda value, expected=expected_turns: value.turns_settled >= expected,
-            )
-        goal = await _wait_for_goal(
-            stack.storage,
-            lambda value: value.status == "paused" and value.active_task_id is None,
-        )
+        # A settled turn can still own post-driver cleanup before the next idle
+        # notification. Observe the committed pause across all four lifecycles.
+        await asyncio.wait_for(paused.wait(), timeout=10.0)
+        goal = await stack.storage.get_goal(SOURCE_KEY)
+        assert goal is not None
+        assert goal.status == "paused" and goal.active_task_id is None
         assert goal.pause_reason == "empty_continuations"
         assert goal.turns_started == goal.turns_settled == 4
         assert len(runs) == 4
@@ -5916,16 +5944,12 @@ async def test_three_identical_visible_goal_turns_pause_for_no_progress(tmp_path
         handler=handler,
         wire_lifecycle=True,
     ) as stack:
+        paused = _observe_goal_pause(stack)
         await _handle_goals_set(_set_params(), stack.context)
-        for expected_turns in range(1, 5):
-            await _wait_for_goal(
-                stack.storage,
-                lambda value, expected=expected_turns: value.turns_settled >= expected,
-            )
-        goal = await _wait_for_goal(
-            stack.storage,
-            lambda value: value.status == "paused" and value.active_task_id is None,
-        )
+        await asyncio.wait_for(paused.wait(), timeout=10.0)
+        goal = await stack.storage.get_goal(SOURCE_KEY)
+        assert goal is not None
+        assert goal.status == "paused" and goal.active_task_id is None
         assert goal.pause_reason == "no_progress"
         assert goal.turns_started == goal.turns_settled == 4
         assert [run.goal_context["automatic"] for run in runs] == [False, True, True, True]

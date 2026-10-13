@@ -18,7 +18,7 @@ function memoryStorage() {
     removeItem: (key: string) => { values.delete(key) },
   }
 }
-function harness(input: { catalogAvailable?: boolean; capable?: boolean; storage?: ReturnType<typeof memoryStorage>; list?: () => Promise<ModelCatalogResult> } = {}) {
+function harness(input: { catalogAvailable?: boolean; capable?: boolean; autoRefresh?: boolean; storage?: ReturnType<typeof memoryStorage>; list?: () => Promise<ModelCatalogResult> } = {}) {
   const sessionKey = ref('agent:main:webchat:one')
   const draft = ref(true)
   const capable = ref(input.capable ?? true)
@@ -32,11 +32,31 @@ function harness(input: { catalogAvailable?: boolean; capable?: boolean; storage
   const api = scope.run(() => useNewTaskModelSelection({
     catalog: { list }, sessionKey, isDraft: () => draft.value,
     capable, catalogAvailable, routingMode, busy, connectionEpoch, storage,
+    autoRefresh: input.autoRefresh,
   }))!
   return { api, list, sessionKey, draft, capable, catalogAvailable, routingMode, busy, connectionEpoch, storage, scope }
 }
 
 describe('new-task model selection', () => {
+  it('does not discover provider models until the explicit picker refresh', async () => {
+    const h = harness({ catalogAvailable: true, autoRefresh: false })
+    await nextTick()
+    expect(h.list).not.toHaveBeenCalled()
+    await h.api.refresh()
+    expect(h.list).toHaveBeenCalledTimes(1)
+    h.scope.stop()
+  })
+
+  it('revalidates an explicitly opened picker after reconnect', async () => {
+    const h = harness({ catalogAvailable: true, autoRefresh: false })
+    await h.api.refresh()
+    expect(h.list).toHaveBeenCalledTimes(1)
+    h.connectionEpoch.value = 2
+    await vi.waitFor(() => expect(h.list).toHaveBeenCalledTimes(2))
+    expect(h.list.mock.calls[1]).toEqual([expect.objectContaining({ cacheOnly: true })])
+    h.scope.stop()
+  })
+
   it('uses an older gateway response once without requiring snapshot metadata', async () => {
     const h = harness()
     await h.api.refresh()

@@ -22,6 +22,24 @@ function fixture(native?: NativeWorkbenchApi) {
 }
 
 describe('browser automation visual lifecycle', () => {
+  it('creates and retires a provisional visual identity without randomUUID', async () => {
+    const getRandomValues = globalThis.crypto.getRandomValues.bind(globalThis.crypto)
+    vi.stubGlobal('crypto', { getRandomValues })
+    const f = fixture()
+    try {
+      f.isStreaming.value = true
+      await nextTick()
+      const state = f.update.mock.calls[0]![0]
+      expect(state).toMatchObject({ sessionKey: 'session-a', active: true })
+      expect(state.taskId).toMatch(/^browser-visual-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+      f.activeStreamTaskId.value = 'assigned-task'
+      await nextTick()
+      expect(f.update).toHaveBeenCalledTimes(1)
+      f.scope.stop()
+      expect(f.update).toHaveBeenLastCalledWith({ ...state, active: false })
+    } finally { f.scope.stop(); vi.unstubAllGlobals() }
+  })
+
   it('keeps the same task active across streaming and approval gaps, then ends it', async () => {
     const f = fixture()
     expect(f.update).not.toHaveBeenCalled()

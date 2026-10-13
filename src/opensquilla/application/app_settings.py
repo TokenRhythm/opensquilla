@@ -28,6 +28,9 @@ from opensquilla.application.config_secrets import (
 from opensquilla.application.config_secrets import (
     restore_redacted_values as _restore_redacted_values,
 )
+from opensquilla.environment import environment_value
+from opensquilla.observability.settings_save import settings_save_stage
+from opensquilla.video_generation_defaults import VIDEO_GENERATION_OFFICIAL_BASE_URLS
 
 type SettingsValue = (
     None | bool | int | float | str | list["SettingsValue"] | dict[str, "SettingsValue"]
@@ -86,8 +89,14 @@ _SCOPED_TELEMETRY_CONSENT_PATHS = frozenset(
         "privacy.product_analytics_consented_at_utc",
     }
 )
+_VIDEO_KEY_BINDING_PATHS = frozenset(
+    f"video_generation.providers.{provider}.api_key_base_url"
+    for provider in VIDEO_GENERATION_OFFICIAL_BASE_URLS
+)
 _READONLY_PATHS = (
-    frozenset({"auth.token", "auth.password", "config_version"}) | _SCOPED_TELEMETRY_CONSENT_PATHS
+    frozenset({"auth.token", "auth.password", "config_version"})
+    | _SCOPED_TELEMETRY_CONSENT_PATHS
+    | _VIDEO_KEY_BINDING_PATHS
 )
 
 # Configuration that belongs exclusively to the local TOML file.  Unlike
@@ -249,6 +258,7 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
         if memory_paths is None or _memory_restart_required_for_paths(memory_paths):
             self._runtime.validate_embedding(candidate)
         inherit_then_clear_explicit(before.config, candidate, explicit - redacted)
+        _reconcile_video_direct_credentials(before.config, candidate, explicit, redacted)
         candidate._mark_env_absorbed_secrets(payload)
         if before.config is not None:
             candidate.inherit_persist_provenance(before.config)
@@ -278,18 +288,24 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
     ) -> SettingsMutation:
         runtime = self._runtime
         self._last_write_persisted = False
+        settings_save_stage("candidate_built")
         provider = runtime.resolve_provider(candidate)
         # Persistence is the commit point. Later runtime failures do not undo it.
         async with runtime.mutation_scope(candidate):
+            settings_save_stage("persist_begin")
             runtime.persist(candidate)
             self._last_write_persisted = True
+            settings_save_stage("persist_finished")
             if before.config is not None:
                 runtime.replace(before.config, candidate)
         if before.config is not None:
             await runtime.notify_goal(before.previous)
         runtime.sync_provider(provider)
+        settings_save_stage("provider_synced")
         await runtime.sync_runtime(before.previous, candidate)
+        settings_save_stage("runtime_synced")
         await runtime.refresh_catalog(before.catalog, candidate)
+        settings_save_stage("catalog_refreshed")
         result = _change_meta(before.payload, _config_dump(candidate))
         if patched is not None:
             result["patched"] = patched
@@ -305,6 +321,7 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
                     section for section in result.get("liveApplied", []) if section != "memory"
                 ]
         await self._publish_routing(before, candidate, result)
+        settings_save_stage("applied")
         return result
 
     async def set(self, path: str, value: SettingsValue) -> SettingsMutation:
@@ -386,7 +403,9 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
         return await self._mutate(dict(patch), dict(changes))
 
     async def _mutate(self, patch: SettingsObject, changes: SettingsObject) -> SettingsMutation:
+        settings_save_stage("settings_lock_wait")
         async with _settings_lock(self._runtime.config):
+            settings_save_stage("settings_lock_acquired")
             return await self._mutate_unlocked(patch, changes)
 
     async def _mutate_unlocked(
@@ -667,6 +686,76 @@ def _memory_restart_required_for_paths(paths: set[str]) -> bool:
         if path.startswith("memory.embedding"):
             return True
     return False
+
+
+def _reconcile_video_direct_credentials(
+    previous: Any, candidate: Any, explicit: set[str], redacted: set[str]
+) -> None:
+    """Bind newly entered video keys and let an authored env switch replace them."""
+
+    next_providers = getattr(getattr(candidate, "video_generation", None), "providers", None)
+    previous_providers = getattr(getattr(previous, "video_generation", None), "providers", None)
+    if next_providers is None:
+        return
+    for provider_id in VIDEO_GENERATION_OFFICIAL_BASE_URLS:
+        next_provider = getattr(next_providers, provider_id, None)
+        if next_provider is None:
+            continue
+        previous_provider = getattr(previous_providers, provider_id, None)
+        prefix = f"video_generation.providers.{provider_id}"
+        key_path = f"{prefix}.api_key"
+        env_path = f"{prefix}.api_key_env"
+        key_from_environment = key_path in getattr(previous, "_runtime_secret_paths", ())
+        nested_env_key = f"OPENSQUILLA_VIDEO_GENERATION_PROVIDERS__{provider_id.upper()}__API_KEY"
+        nested_env_value = environment_value(nested_env_key).strip()
+
+        def retain_environment_key() -> bool:
+            env_value = (
+                str(getattr(previous_provider, "api_key", "") or "")
+                if key_from_environment
+                else nested_env_value
+            )
+            if not env_value:
+                return False
+            next_provider.api_key = env_value
+            # A nested env key masked by a file key has no trustworthy
+            # endpoint provenance. Bind it conservatively to the provider's
+            # official origin when the file key is removed.
+            next_provider.api_key_base_url = (
+                str(getattr(previous_provider, "api_key_base_url", "") or "")
+                if key_from_environment
+                else VIDEO_GENERATION_OFFICIAL_BASE_URLS[provider_id]
+            )
+            candidate.mark_runtime_secret(key_path)
+            return True
+
+        if key_path in explicit - redacted:
+            if not getattr(next_provider, "api_key", "") and retain_environment_key():
+                # The environment still owns this direct key. A config patch
+                # cannot remove it permanently, so keep the live route and
+                # its conservative origin binding consistent with the next load.
+                continue
+            next_provider.api_key_base_url = (
+                str(getattr(next_provider, "base_url", "") or "")
+                if getattr(next_provider, "api_key", "")
+                else ""
+            )
+            continue
+        if env_path not in explicit:
+            continue
+        previous_env = str(getattr(previous_provider, "api_key_env", "") or "")
+        next_env = str(getattr(next_provider, "api_key_env", "") or "")
+        if key_path in redacted and next_env == previous_env:
+            # A full public-config round trip echoes the env field and a
+            # redacted key. Neither is a credential-source change.
+            continue
+        if retain_environment_key():
+            continue
+        next_provider.api_key = ""
+        next_provider.api_key_base_url = ""
+        forget = getattr(candidate, "forget_secret_provenance", None)
+        if callable(forget):
+            forget(key_path)
 
 
 def _config_dump(config: Any) -> dict[str, Any]:
