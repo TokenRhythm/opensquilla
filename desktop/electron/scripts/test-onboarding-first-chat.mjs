@@ -6,6 +6,23 @@ import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
+import {
+  loadDesktopGatewayOwnershipRecord,
+  readVerifiedDesktopGatewayActivity,
+} from '../dist/desktop-gateway-ownership.js'
+import {
+  canAcceptWindowsElectronShutdownFallback,
+  closeElectronWithDeadline,
+  closeHttpServerWithDeadline,
+  desktopShutdownEvidenceSince,
+  gatewayProcessSnapshot,
+  trackHttpServerConnections,
+} from './e2e-shutdown-helpers.mjs'
+import {
+  captureElectronProcessIdentity,
+  captureFirstSendDiagnostic,
+  electronProcessSnapshot,
+} from './packaged-first-send-cleanup.mjs'
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const repoRoot = resolve(packageRoot, '../..')
@@ -31,6 +48,10 @@ const stages = []
 let app
 let desktop
 let passed = false
+let runError = null
+let lastActivity = null
+let appIdentity = null
+let gatewayRecord = null
 
 const server = createServer((request, response) => {
   const chunks = []
@@ -69,6 +90,7 @@ const server = createServer((request, response) => {
     response.end(frames.map(frame => `data: ${JSON.stringify(frame)}\n\n`).join('') + 'data: [DONE]\n\n')
   })
 })
+const serverSockets = trackHttpServerConnections(server)
 await new Promise((resolveListen, rejectListen) => {
   server.once('error', rejectListen)
   server.listen(0, '127.0.0.1', resolveListen)
@@ -93,6 +115,85 @@ function complete(stage) {
   console.log(`PASS ${stage}`)
 }
 
+async function waitForFirstChatIdle(deadline) {
+  const connection = await captureFirstSendDiagnostic(
+    () => desktop.evaluate(() => window.opensquillaDesktop.getGatewayConnection()),
+    Math.max(1, deadline - Date.now()),
+  )
+  if (connection?.diagnosticError) throw new Error(connection.diagnosticError)
+  assert.equal(connection.status, 'ready')
+  assert.match(connection.profileFingerprint, /^[0-9a-f]{64}$/)
+  const loaded = loadDesktopGatewayOwnershipRecord(
+    join(userDataDir, 'gateway-ownership', connection.profileFingerprint),
+  )
+  assert.equal(loaded.status, 'valid', 'the current Gateway must publish its ownership record')
+  assert.equal(loaded.record.profile_fingerprint, connection.profileFingerprint)
+  assert.equal(loaded.record.port, Number(new URL(connection.httpUrl).port))
+  gatewayRecord = loaded.record
+  while (Date.now() < deadline) {
+    lastActivity = await readVerifiedDesktopGatewayActivity(loaded.record, {
+      timeoutMs: Math.max(1, Math.min(1_000, deadline - Date.now())),
+    })
+    if (Date.now() < deadline && lastActivity.kind === 'ok' && lastActivity.activeCount === 0) return
+    await delay(Math.max(0, Math.min(200, deadline - Date.now())))
+  }
+  throw new Error(`The first chat did not become idle within its completion budget: ${JSON.stringify(lastActivity)}`)
+}
+
+async function finishFirstChat() {
+  const recordError = error => { runError ??= error }
+  if (app) {
+    try {
+      const logPath = join(userDataDir, 'logs', 'desktop.log')
+      const checkpoint = await readFile(logPath, 'utf8').catch(() => null)
+      const shutdown = await closeElectronWithDeadline({
+        app,
+        phase: 'onboarding-first-chat',
+        timeoutMs: 15_000,
+        diagnostics: async () => ({ lastActivity, completedStages: [...stages] }),
+      })
+      if (!shutdown.closed) {
+        const log = await readFile(logPath, 'utf8').catch(() => null)
+        const fallbackAccepted = canAcceptWindowsElectronShutdownFallback({
+          shutdown, ...desktopShutdownEvidenceSince(checkpoint, log),
+        }) && electronProcessSnapshot(appIdentity).electronPidExists === false
+          && gatewayRecord && !gatewayProcessSnapshot(gatewayRecord).alive
+        if (!fallbackAccepted) throw shutdown.error
+        console.warn(JSON.stringify({
+          event: 'desktop_e2e_windows_shell_wrapper_reaped_after_commit',
+          phase: 'onboarding-first-chat',
+        }))
+      }
+      app = null
+    } catch (error) { recordError(error) }
+  }
+  server.closeAllConnections()
+  try {
+    await closeHttpServerWithDeadline(server, serverSockets, {
+      label: 'first-chat provider shutdown', timeoutMs: 15_000,
+    })
+  } catch (error) { recordError(error) }
+  if (passed && !runError) {
+    try { await rm(userDataRoot, { recursive: true, force: true }) } catch (error) { recordError(error) }
+  }
+  if (outputDir) {
+    const log = runError
+      ? await readFile(join(userDataDir, 'logs', 'desktop.log'), 'utf8').catch(() => '') : ''
+    const report = {
+      ok: passed && !runError, stages, requests, diagnostics, lastActivity,
+      ...(runError ? {
+        error: runError.message,
+        retainedFixtureProfile: userDataRoot,
+        desktopLogTail: log.split('\n').slice(-50).join('\n').replaceAll(syntheticKey, '[fixture-key]'),
+      } : {}),
+    }
+    try {
+      await writeFile(join(outputDir, 'report.json'), JSON.stringify(report, null, 2) + '\n')
+    } catch (error) { recordError(error) }
+  }
+  if (runError) throw runError
+}
+
 // Do not let real model credentials, provider overrides, or proxy configuration
 // from the caller leak into this isolated first-run acceptance test.
 const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !(
@@ -115,6 +216,7 @@ Object.assign(env, {
 
 try {
   app = await electron.launch({ ...(executablePath ? { executablePath } : {}), args: ['--use-mock-keychain', `--user-data-dir=${userDataDir}`, packageRoot], env })
+  appIdentity = await captureElectronProcessIdentity(app)
   app.context().on('page', page => page.on('pageerror', error => diagnostics.push(error.message)))
   const onboarding = await waitFor(async () => {
     for (const page of app.windows()) {
@@ -175,24 +277,20 @@ try {
   await screenshot('03-configured-draft-preserved')
   complete('settings UI saves the local provider without a connection test and preserves the draft')
 
+  const firstChatDeadline = Date.now() + 60_000
   await composer.press('Enter')
-  await waitFor(async () => (await desktop.locator('.chat-thread').innerText()).includes(fixtureAnswer), 'the real Gateway/provider reply in the transcript', 60_000)
+  await waitFor(async () => (await desktop.locator('.chat-thread').innerText()).includes(fixtureAnswer), 'the real Gateway/provider reply in the transcript', Math.max(1, firstChatDeadline - Date.now()))
   assert.ok(requests.some(request => request.method === 'POST' && request.url === '/v1/chat/completions' && request.model === fixtureModel))
   await screenshot('04-first-chat-reply')
   complete('the first chat reaches the local OpenAI fixture and renders its response')
+  // A streamed reply precedes task finalization. This acceptance case must let
+  // the real task finish, so an interruption prompt remains a shutdown failure.
+  await waitForFirstChatIdle(firstChatDeadline)
+  complete('the first chat and Gateway background work finish before quitting')
   passed = true
-  if (outputDir) await writeFile(join(outputDir, 'report.json'), JSON.stringify({ ok: true, stages, requests, diagnostics }, null, 2) + '\n')
 } catch (error) {
+  runError = error
   await screenshot('failure').catch(() => {})
-  if (outputDir) {
-    // Logs contain only synthetic credentials, but avoid copying them into reports.
-    const log = await readFile(join(userDataDir, 'logs', 'desktop.log'), 'utf8').catch(() => '')
-    await writeFile(join(outputDir, 'report.json'), JSON.stringify({ ok: false, error: error.message, retainedFixtureProfile: userDataRoot, stages, requests, diagnostics, desktopLogTail: log.split('\n').slice(-50).join('\n').replaceAll(syntheticKey, '[fixture-key]') }, null, 2) + '\n')
-  }
-  throw error
 } finally {
-  await app?.close().catch(() => {})
-  server.closeAllConnections()
-  await new Promise(resolveClose => server.close(resolveClose))
-  if (passed || !outputDir) await rm(userDataRoot, { recursive: true, force: true })
+  await finishFirstChat()
 }

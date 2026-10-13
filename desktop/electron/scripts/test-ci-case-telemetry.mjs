@@ -24,6 +24,7 @@ import {
 } from './e2e-shutdown-helpers.mjs'
 import { buildDesktopQuitDialogHtml } from '../dist/desktop-quit-dialog.js'
 import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
+import { captureFirstSendDiagnostic } from './packaged-first-send-cleanup.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const helperPath = join(scriptDir, 'ci-case-telemetry.mjs')
@@ -46,7 +47,9 @@ try {
       title: 'Synthetic quit', message: 'Synthetic unknown activity', detail: 'Synthetic cleanup',
       keepRunning: 'Keep running', confirm: 'Stop tasks and quit',
     })
-    runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], {
+    const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi)]
+    assert.equal(scripts.length, 1, 'the generated quit document must have one script')
+    runInNewContext(scripts[0][1], {
       document: {
         getElementById: id => ({
           addEventListener: (event, callback) => listeners.set(`${id}:${event}`, callback),
@@ -348,6 +351,136 @@ try {
     signal: null,
     error: 'taskkill exceeded 25ms',
   })
+
+  // Execute the first-chat fixture's own completion/cleanup helpers. A visible
+  // response is insufficient: signed activity must become idle without consent.
+  const firstChatFixture = await readFile(join(scriptDir, 'test-onboarding-first-chat.mjs'), 'utf8')
+  const firstChatHelpers = firstChatFixture.slice(
+    firstChatFixture.indexOf('async function waitForFirstChatIdle('),
+    firstChatFixture.indexOf('// Do not let real model credentials'),
+  )
+  const idleActivity = { kind: 'ok', activeCount: 0,
+    activity: { running: 0, queued: 0, waiting: 0, reservations: 0, auxiliary: 0 } }
+  const fingerprint = 'a'.repeat(64)
+  const firstChatRecord = { profile_fingerprint: fingerprint, port: 18791 }
+  for (const mode of ['settles', 'never-idle', 'unreachable', 'late-idle', 'wrong-profile', 'wrong-port']) {
+    let now = 0
+    let reads = 0
+    const timeouts = []
+    const activity = [
+      { kind: 'ok', activeCount: 1, activity: { ...idleActivity.activity, running: 1 } },
+      { kind: 'ok', activeCount: 1, activity: { ...idleActivity.activity, auxiliary: 1 } },
+      { kind: 'unreachable' },
+      idleActivity,
+    ]
+    const scope = {
+      assert, join, URL, userDataDir: 'synthetic-user-data', lastActivity: null, gatewayRecord: null,
+      Date: { now: () => now }, delay: async milliseconds => { now += milliseconds },
+      captureFirstSendDiagnostic: async (operation, timeoutMs) => {
+        assert.equal(timeoutMs, 1_000 - now)
+        return await operation()
+      },
+      desktop: { evaluate: async () => ({ status: 'ready', profileFingerprint: fingerprint,
+        httpUrl: 'http://127.0.0.1:18791' }) },
+      loadDesktopGatewayOwnershipRecord: path => {
+        assert.equal(path, join('synthetic-user-data', 'gateway-ownership', fingerprint))
+        return { status: 'valid', record: mode === 'wrong-profile'
+          ? { ...firstChatRecord, profile_fingerprint: 'b'.repeat(64) }
+          : mode === 'wrong-port' ? { ...firstChatRecord, port: 18792 } : firstChatRecord }
+      },
+      readVerifiedDesktopGatewayActivity: async (record, options) => {
+        assert.equal(record, firstChatRecord)
+        assert.ok(options.timeoutMs > 0 && options.timeoutMs <= 1_000 - now)
+        timeouts.push(options.timeoutMs)
+        reads++
+        if (mode === 'late-idle') { now = 1_000; return idleActivity }
+        if (mode === 'unreachable') return { kind: 'unreachable' }
+        if (mode === 'never-idle') return activity[0]
+        return activity.shift()
+      },
+    }
+    const waitIdle = runInNewContext(`${firstChatHelpers}\nwaitForFirstChatIdle`, scope)
+    if (mode === 'settles') {
+      await waitIdle(1_000)
+      assert.equal(reads, 4, 'wait through task settlement, auxiliary work and unknown activity')
+      assert.equal(scope.lastActivity, idleActivity)
+      assert.deepEqual(timeouts, [1_000, 800, 600, 400], 'all polls share the completion deadline')
+    } else if (mode.startsWith('wrong-')) {
+      await assert.rejects(waitIdle(1_000), /Expected values to be strictly equal/)
+      assert.equal(reads, 0, 'do not inspect an unrelated Gateway')
+    } else {
+      await assert.rejects(waitIdle(1_000), /did not become idle within its completion budget/)
+      assert.equal(now, 1_000)
+    }
+  }
+  {
+    const waitIdle = runInNewContext(`${firstChatHelpers}\nwaitForFirstChatIdle`, {
+      captureFirstSendDiagnostic, desktop: { evaluate: () => new Promise(() => {}) },
+    })
+    await assert.rejects(waitIdle(Date.now() + 25), /First-send diagnostics timed out after/,
+      'a hung renderer connection lookup must share the completion deadline')
+  }
+  for (const mode of ['success', 'close-failed', 'close-threw', 'server-failed', 'remove-failed',
+    'primary-error', 'windows-wrapper', 'windows-no-commit', 'windows-live-electron',
+    'windows-live-gateway', 'posix-wrapper']) {
+    const primary = new Error('synthetic chat assertion failed')
+    const cleanupFailure = new Error('synthetic shutdown failed')
+    const calls = []
+    const reports = []
+    const ownedApp = {}
+    const successful = ['success', 'windows-wrapper'].includes(mode)
+    const wrapperTimeout = mode.startsWith('windows-') || mode === 'posix-wrapper'
+    const committedLog = [
+      { event: 'quit_gateway_exit', exited: true, hardTerminated: false },
+      { event: 'desktop_exit_phase', to: 'committed', reason: 'all lifecycle-owned Gateways exited' },
+    ].map(record => JSON.stringify(record)).join('\n') + '\n'
+    const scope = {
+      app: ownedApp, passed: true, runError: mode === 'primary-error' ? primary : null,
+      appIdentity: {}, gatewayRecord: firstChatRecord,
+      lastActivity: idleActivity, stages: ['reply rendered', 'Gateway idle'], requests: [], diagnostics: [],
+      userDataRoot: 'synthetic-root', userDataDir: 'synthetic-user-data', outputDir: 'synthetic-output',
+      syntheticKey: 'synthetic-key', serverSockets: new Set(), join,
+      server: { closeAllConnections: () => calls.push('connections') },
+      closeElectronWithDeadline: async options => {
+        calls.push('electron')
+        assert.equal(options.app, ownedApp)
+        assert.equal(options.timeoutMs, 15_000)
+        assert.equal(options.requestClose, undefined, 'first chat must never accept a quit dialog')
+        assert.equal((await options.diagnostics()).lastActivity, idleActivity)
+        if (mode === 'close-threw') throw cleanupFailure
+        if (wrapperTimeout) return { closed: false, error: cleanupFailure,
+          closeErrorCode: 'DESKTOP_E2E_SHUTDOWN_TIMEOUT', forcedExitSucceeded: true, processTreeReaped: true }
+        return ['close-failed', 'primary-error'].includes(mode)
+          ? { closed: false, error: cleanupFailure } : { closed: true }
+      },
+      canAcceptWindowsElectronShutdownFallback: options => canAcceptWindowsElectronShutdownFallback({
+        ...options, platform: mode.startsWith('windows-') ? 'win32' : 'darwin',
+      }),
+      desktopShutdownEvidenceSince,
+      electronProcessSnapshot: () => ({ electronPidExists: mode === 'windows-live-electron' }),
+      gatewayProcessSnapshot: () => ({ alive: mode === 'windows-live-gateway' }),
+      console: { warn() {} },
+      closeHttpServerWithDeadline: async (_server, _sockets, options) => {
+        calls.push('server')
+        assert.equal(options.timeoutMs, 15_000)
+        if (mode === 'server-failed') throw cleanupFailure
+      },
+      rm: async () => { calls.push('remove'); if (mode === 'remove-failed') throw cleanupFailure },
+      readFile: async () => 'synthetic-key fixture log\n'
+        + (calls.includes('electron') && mode !== 'windows-no-commit' ? committedLog : ''),
+      writeFile: async (_path, body) => { calls.push('report'); reports.push(JSON.parse(body)) },
+    }
+    const finish = runInNewContext(`${firstChatHelpers}\nfinishFirstChat`, scope)
+    if (successful) await finish()
+    else await assert.rejects(finish(), error => error === (mode === 'primary-error' ? primary : cleanupFailure))
+    assert.deepEqual(calls.slice(0, 3), ['electron', 'connections', 'server'])
+    assert.equal(reports.length, 1)
+    assert.equal(reports[0].ok, successful, 'report success only after bounded cleanup')
+    assert.equal(calls.includes('remove'), successful || mode === 'remove-failed',
+      'retain the fixture profile after an assertion or shutdown failure')
+    assert.ok(!JSON.stringify(reports).includes('synthetic-key'), 'redact the synthetic credential')
+    assert.equal(calls.at(-1), 'report')
+  }
 
   // ElectronApplication.process() depends on a live Playwright dispatcher.
   // Successful close disposes it, so even diagnostics must retain the owned
