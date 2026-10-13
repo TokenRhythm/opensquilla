@@ -15999,18 +15999,28 @@ function holdQuitForTaskConfirmation(
     const accepted = await desktopQuitConfirmation.request({
       check: async () => {
         const activity = await Promise.all(children.map(async child => {
-          if (hasGatewayProcessExited(child)) {
+          const exited = hasGatewayProcessExited(child)
+          if (exited) {
             // A known successful restart already owns bounded verification.
             // Join that proof instead of calling its retired scope active work.
             await gatewayProcessCleanupOperations.get(child)?.promise
-            return gatewayProcessCleanupContexts.has(child)
-              ? { kind: 'unreachable' as const }
-              : { kind: 'ok' as const, activeCount: 0 }
           }
-          const record = ownedGatewayRecord(child)
-          return record
-            ? await readVerifiedDesktopGatewayActivity(record, { timeoutMs: 1_000 })
-            : { kind: 'unreachable' as const }
+          const retainedScope = gatewayProcessCleanupContexts.has(child)
+          const record = exited ? null : ownedGatewayRecord(child)
+          const result = exited
+            ? retainedScope ? { kind: 'unreachable' as const } : { kind: 'ok' as const, activeCount: 0 }
+            : record ? await readVerifiedDesktopGatewayActivity(record, { timeoutMs: 1_000 })
+              : { kind: 'unreachable' as const }
+          desktopLog('quit_gateway_activity_checked', {
+            pid: Number.isSafeInteger(child.pid) ? child.pid : null,
+            kind: result.kind,
+            activeCount: result.kind === 'ok' ? result.activeCount : null,
+            ownershipMatched: exited ? null : record !== null,
+            retainedScope,
+            exited,
+            gatewayStatus: gatewayState.status,
+          })
+          return result
         }))
         if (activity.some(result => result.kind === 'ok' && result.activeCount > 0)) return 'active'
         idle = activity.every(result => result.kind === 'ok')
@@ -16018,6 +16028,7 @@ function holdQuitForTaskConfirmation(
       },
       confirm: async state => {
         if (systemSessionEnding || updateApplying) return false
+        desktopLog('quit_confirmation_required', { activity: state })
         const window = currentMainWindow() ?? currentOnboardingWindow()
         if (window) {
           if (window.isMinimized()) window.restore()

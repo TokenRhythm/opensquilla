@@ -54,6 +54,7 @@ async function until(predicate, message = 'condition did not settle') {
 
 function createScenario({ platform = 'darwin', behavior = 'background', activity = 'idle' } = {}) {
   const events = []
+  const logs = []
   const activityResult = deferred()
   const dialogResult = deferred()
   const quitDialogResult = deferred()
@@ -75,7 +76,7 @@ function createScenario({ platform = 'darwin', behavior = 'background', activity
     focus: () => events.push('focus'),
   }
   const closeEvent = () => ({ preventDefault: () => { preventions += 1 } })
-  const child = {}
+  const child = { pid: 54321 }
   const env = {
     appExitPhase: 'running',
     systemSessionEnding: false,
@@ -89,6 +90,7 @@ function createScenario({ platform = 'darwin', behavior = 'background', activity
     mainWindow: window,
     onboardingWindow: null,
     process: { platform },
+    gatewayState: { status: 'ready' },
     window,
     currentMainWindow: () => window,
     currentOnboardingWindow: () => null,
@@ -110,7 +112,7 @@ function createScenario({ platform = 'darwin', behavior = 'background', activity
       return {}
     },
     app: { quit: () => { quit += 1; events.push('quit') } },
-    desktopLog: (event) => events.push(event),
+    desktopLog: (event, detail) => { events.push(event); logs.push({ event, ...detail }) },
     liveLifecycleOwnedGatewayProcesses: () => [child],
     gatewayProcessCleanupContexts: new Map(),
     gatewayProcessCleanupOperations: new WeakMap(),
@@ -148,6 +150,7 @@ function createScenario({ platform = 'darwin', behavior = 'background', activity
     get preventions() { return preventions },
     get savePending() { return savePending },
     events,
+    logs,
   }
 }
 
@@ -155,6 +158,27 @@ async function settleConfirmation(scenario, answer) {
   scenario.quitDialogResult.resolve(answer)
   await until(() => scenario.env.quitConfirmationPromise === null)
   await flush()
+}
+
+// Activity diagnostics distinguish an unmatched launch from a verified busy or
+// unreachable Gateway without retaining process-control authority or paths.
+for (const mode of ['active', 'unknown', 'unmatched']) {
+  const scenario = createScenario({ activity: mode })
+  const secret = 'synthetic-private-value'
+  scenario.env.ownedGatewayRecord = () => mode === 'unmatched' ? null : {
+    instance_nonce: secret, profile_fingerprint: secret, path: secret,
+  }
+  scenario.handlers.holdQuitForTaskConfirmation(scenario.closeEvent())
+  await until(() => scenario.shownQuitDialog === 1)
+  assert.deepEqual(scenario.logs, [{
+    event: 'quit_gateway_activity_checked', pid: 54321,
+    kind: mode === 'active' ? 'ok' : 'unreachable',
+    activeCount: mode === 'active' ? 1 : null,
+    ownershipMatched: mode !== 'unmatched', retainedScope: false, exited: false,
+    gatewayStatus: 'ready',
+  }, { event: 'quit_confirmation_required', activity: mode === 'active' ? 'active' : 'unknown' }])
+  assert.ok(!JSON.stringify(scenario.logs).includes(secret))
+  await settleConfirmation(scenario, false)
 }
 
 // Active work keeps the parent visible until the interruption prompt resolves.
@@ -311,11 +335,15 @@ for (const activity of ['active', 'unknown']) {
 // launch has no remaining tools. Its retained scope still requires consent.
 {
   const scenario = createScenario({ platform: 'darwin', activity: 'idle' })
-  const crashedChild = {}
+  const crashedChild = { pid: 54322 }
   scenario.env.gatewayProcessCleanupContexts.set(crashedChild, { synthetic: true })
   scenario.env.hasGatewayProcessExited = child => child === crashedChild
   scenario.handlers.holdQuitForTaskConfirmation(scenario.closeEvent())
   await until(() => scenario.shownQuitDialog === 1)
+  assert.deepEqual(scenario.logs.find(record => record.pid === crashedChild.pid), {
+    event: 'quit_gateway_activity_checked', pid: 54322, kind: 'unreachable', activeCount: null,
+    ownershipMatched: null, retainedScope: true, exited: true, gatewayStatus: 'ready',
+  })
   assert.equal(scenario.quit, 0)
   assert.equal(scenario.hidden, 0)
   await settleConfirmation(scenario, true)

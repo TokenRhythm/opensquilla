@@ -537,7 +537,10 @@ try {
   ]) {
     const ownedApp = {}
     let closeCalls = 0
-    let currentLog = ''
+    let currentLog = [...Array.from({ length: 30 }, () => ({
+      event: 'gateway_starting', path: secretProbe,
+    })), { event: 'quit_gateway_process_cleanup', pid: 1234, complete: false,
+      error: secretProbe }].map(record => JSON.stringify(record)).join('\n') + '\n'
     const scope = {
       app: ownedApp, activeAppUserData: 'synthetic-user-data', activeAppIdentity: {},
       ELECTRON_SHUTDOWN_TIMEOUT_MS: 15_000, join,
@@ -550,6 +553,14 @@ try {
           { event: 'before_quit', at: '2026-10-10T21:57:37.570Z', message: secretProbe },
           { event: 'desktop_exit_phase', to: 'draining', reason: secretProbe },
           { event: 'quit_deferred_for_profile_writer', at: secretProbe, error: secretProbe },
+          { event: 'quit_gateway_activity_checked', pid: 1234, kind: 'unreachable',
+            activeCount: null, ownershipMatched: null, retainedScope: true, exited: true,
+            gatewayStatus: 'ready', instance_nonce: secretProbe, record: { proof: secretProbe } },
+          { event: 'quit_confirmation_required', activity: 'unknown', message: secretProbe },
+          { event: 'quit_gateway_activity_checked', at: secretProbe, pid: secretProbe,
+            kind: secretProbe, activeCount: secretProbe, ownershipMatched: secretProbe,
+            retainedScope: secretProbe, exited: secretProbe, gatewayStatus: secretProbe,
+            activity: secretProbe, complete: secretProbe, code: secretProbe, signal: secretProbe },
           { event: secretProbe, token: secretProbe },
         ].map(record => JSON.stringify(record)).join('\n') + '\n'
         if (cleanExit) currentLog += cleanExitLog
@@ -558,6 +569,13 @@ try {
         assert.equal(diagnostics.processes.electronPidExists, electronPidExists)
         assert.ok(diagnostics.exitEvents.some(record => record.event === 'before_quit'))
         assert.ok(diagnostics.exitEvents.some(record => record.phase === 'draining'))
+        assert.ok(diagnostics.exitEvents.some(record => record.event === 'quit_gateway_activity_checked'
+          && record.pid === 1234 && record.retainedScope === true && record.exited === true))
+        assert.ok(diagnostics.exitEvents.some(record => record.event === 'quit_confirmation_required'
+          && record.activity === 'unknown'))
+        assert.ok(diagnostics.recentLifecycleEvents.length <= 24)
+        assert.ok(diagnostics.recentLifecycleEvents.some(record => record.pid === 1234
+          && record.event === 'quit_gateway_process_cleanup' && record.complete === false))
         assert.ok(!JSON.stringify(diagnostics).includes(secretProbe), 'diagnostics must omit raw log and probe errors')
         return shutdown
       },

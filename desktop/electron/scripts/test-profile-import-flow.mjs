@@ -386,13 +386,18 @@ async function closeActiveApp(phase, { failOnError = true } = {}) {
       const appended = typeof desktopLogCheckpoint === 'string'
         && currentLog?.startsWith(desktopLogCheckpoint)
         ? currentLog.slice(desktopLogCheckpoint.length) : ''
-      const exitEvents = appended.split(/\r?\n/).flatMap(line => {
+      const filterEvents = log => (log ?? '').split(/\r?\n/).flatMap(line => {
         let record
         try { record = JSON.parse(line) } catch { return [] }
         if (!['before_quit', 'desktop_exit_phase', 'quit_gateway_shutdown_requested',
           'quit_gateway_exit', 'gateway_exited', 'quit_gateway_drain_failed',
           'quit_gateway_still_running', 'quit_deferred_for_profile_writer',
-          'quit_deferred_for_update_drain'].includes(record?.event)) return []
+          'quit_deferred_for_update_drain', 'quit_gateway_activity_checked',
+          'quit_confirmation_required', 'quit_confirmed', 'quit_cancelled_by_user',
+          'quit_confirmation_failed', 'quit_confirmation_window_failed',
+          'gateway_starting', 'gateway_child_spawned', 'gateway_ready',
+          'gateway_stop_requested', 'gateway_child_exited', 'gateway_stop_join_complete',
+          'quit_gateway_process_cleanup', 'stopped_gateway_process_cleanup_failed'].includes(record?.event)) return []
         return [{
           event: record.event,
           at: typeof record.at === 'string' && /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(record.at) ? record.at : null,
@@ -401,14 +406,26 @@ async function closeActiveApp(phase, { failOnError = true } = {}) {
           exited: typeof record.exited === 'boolean' ? record.exited : null,
           hardTerminated: typeof record.hardTerminated === 'boolean' ? record.hardTerminated : null,
           activeWriters: Number.isSafeInteger(record.activeWriters) ? record.activeWriters : null,
+          pid: Number.isSafeInteger(record.pid) && record.pid > 0 ? record.pid : null,
+          kind: ['ok', 'unreachable', 'unsupported', 'rejected'].includes(record.kind) ? record.kind : null,
+          activeCount: Number.isSafeInteger(record.activeCount) && record.activeCount >= 0 ? record.activeCount : null,
+          ownershipMatched: typeof record.ownershipMatched === 'boolean' ? record.ownershipMatched : null,
+          retainedScope: typeof record.retainedScope === 'boolean' ? record.retainedScope : null,
+          gatewayStatus: ['starting', 'ready', 'stopped', 'error'].includes(record.gatewayStatus) ? record.gatewayStatus : null,
+          activity: ['active', 'unknown'].includes(record.activity) ? record.activity : null,
+          complete: typeof record.complete === 'boolean' ? record.complete : null,
+          code: Number.isSafeInteger(record.code) ? record.code : null,
+          signal: ['SIGTERM', 'SIGKILL', 'SIGINT'].includes(record.signal) ? record.signal : null,
         }]
       })
+      const exitEvents = filterEvents(appended).slice(-50)
+      const recentLifecycleEvents = filterEvents(desktopLogCheckpoint).slice(-24)
       const snapshot = electronProcessSnapshot(identity)
       const processes = Object.fromEntries(['wrapper', 'electron'].flatMap(role => [
         [`${role}Pid`, Number.isSafeInteger(snapshot[`${role}Pid`]) ? snapshot[`${role}Pid`] : null],
         [`${role}PidExists`, typeof snapshot[`${role}PidExists`] === 'boolean' ? snapshot[`${role}PidExists`] : null],
       ]))
-      return { processes, exitEvents,
+      return { processes, exitEvents, recentLifecycleEvents,
         ...desktopShutdownEvidenceSince(desktopLogCheckpoint, currentLog) }
     },
   })
