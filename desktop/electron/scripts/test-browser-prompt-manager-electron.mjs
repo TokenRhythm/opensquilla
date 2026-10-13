@@ -47,6 +47,7 @@ if (!process.versions.electron) {
 } else {
   const { app, BrowserWindow } = await import('electron')
   const { NativeWorkbenchSurfaceManager } = await import('../dist/native-workbench-surface.js')
+  const { BrowserPlaywrightDriver } = await import('../dist/browser-playwright.js')
   app.commandLine.appendSwitch('disable-gpu')
   app.on('window-all-closed', () => {})
   void (async () => {
@@ -106,6 +107,102 @@ if (!process.versions.electron) {
       assert.equal(await record.view.webContents.executeJavaScript(
         "document.querySelector('#result').textContent"), 'agent response')
       assert.equal(record.prompt.state(), null)
+
+      for (const promptText of ['a'.repeat(4096), 'a'.repeat(4097), 'a'.repeat(16384),
+        '文'.repeat(16384), '😀'.repeat(16384)]) {
+        const boundaryClick = record.view.webContents.executeJavaScript(
+          "document.querySelector('#ask').click()")
+        await until(() => record.prompt.state(), 'boundary MCP prompt')
+        const dialogId = record.prompt.state().id
+        const respond = value => call({ operation: 'dialog', targetRef: opened.targetRef,
+          dialogId, accept: true, promptText: value })
+        for (const invalid of ['a'.repeat(16385), '😀'.repeat(16384) + 'a',
+          '😀'.repeat(16385), 42, null, '\0']) {
+          await assert.rejects(() => respond(invalid), error => error.code === 'INVALID_REQUEST')
+          assert.equal(record.prompt.state().id, dialogId)
+        }
+        await assert.rejects(() => call({ operation: 'dialog', targetRef: opened.targetRef,
+          dialogId: 'expired-dialog', accept: true }), error => error.code === 'STALE_DIALOG')
+        assert.equal(record.prompt.state().id, dialogId)
+        assert.equal((await respond(promptText)).performed, true)
+        await boundaryClick
+        assert.equal(await record.view.webContents.executeJavaScript(
+          "document.querySelector('#result').textContent"), promptText)
+      }
+
+      // Exercise driver classification independently of the modal's resource policy.
+      let hostState = { id: 'host-fixture', message: 'Synthetic driver prompt',
+        defaultValue: '😀'.repeat(16384), openedAt: Date.now() }
+      let hostValue
+      let refuse = false
+      let expire = false
+      const host = { state: () => hostState, respond(id, value) {
+        if (expire) { hostState = null; return false }
+        if (refuse || hostState?.id !== id) return false
+        hostValue = value
+        hostState = null
+        return true
+      } }
+      const driver = new BrowserPlaywrightDriver(record.view.webContents, () => true, undefined, host)
+      const guard = () => {}
+      const signal = new AbortController().signal
+      const handle = fields => driver.handleDialog({ dialogId: 'host-fixture', accept: true,
+        ...fields }, guard, signal)
+      assert.equal(driver.pendingDialog.defaultValue, '😀'.repeat(16384))
+      await handle({})
+      assert.equal(hostValue, '😀'.repeat(16384), 'Omitted text accepts the complete default')
+      const resetHost = () => { hostState = { id: 'host-fixture', message: 'Synthetic driver prompt',
+        defaultValue: 'seed', openedAt: Date.now() }; hostValue = undefined }
+      resetHost()
+      await handle({ promptText: '' })
+      assert.equal(hostValue, '', 'An explicit empty value does not fall back to the default')
+      resetHost()
+      await handle({ accept: false })
+      assert.equal(hostValue, null)
+      resetHost()
+      await assert.rejects(() => handle({ accept: false, promptText: '' }),
+        error => error.code === 'INVALID_REQUEST')
+      assert.equal(hostState.id, 'host-fixture')
+      refuse = true
+      await assert.rejects(() => handle({}), error => error.code === 'DIALOG_CONTROL_UNAVAILABLE')
+      assert.equal(hostState.id, 'host-fixture', 'A host refusal does not make a live prompt stale')
+      refuse = false
+      expire = true
+      await assert.rejects(() => handle({}), error => error.code === 'STALE_DIALOG')
+
+      // The same validation precedes the native transport call, without consuming a dialog.
+      const nativeDriver = new BrowserPlaywrightDriver(record.view.webContents)
+      const nativeCalls = []
+      nativeDriver.transport = { async respondToDialog(accept, promptText, guard, signal, sessionId) {
+        guard()
+        assert.equal(signal.aborted, false)
+        nativeCalls.push({ accept, promptText, sessionId })
+      } }
+      const resetNative = () => {
+        nativeDriver.onDialog({ type: 'prompt', message: 'Synthetic native transport prompt',
+          defaultPrompt: '😀'.repeat(16384) })
+        nativeDriver.dialogSessionId = 'synthetic-native-session'
+        return nativeDriver.pendingDialog.id
+      }
+      let nativeId = resetNative()
+      assert.equal(nativeDriver.pendingDialog.defaultValue, '😀'.repeat(16384))
+      for (const promptText of ['a'.repeat(16385), '😀'.repeat(16384) + 'a', 42]) {
+        await assert.rejects(() => nativeDriver.handleDialog({ dialogId: nativeId,
+          accept: true, promptText }, guard, signal), error => error.code === 'INVALID_REQUEST')
+        assert.equal(nativeDriver.pendingDialog.id, nativeId)
+        assert.equal(nativeCalls.length, 0)
+      }
+      await nativeDriver.handleDialog({ dialogId: nativeId, accept: true,
+        promptText: '😀'.repeat(16384) }, guard, signal)
+      assert.deepEqual(nativeCalls.at(-1), { accept: true, promptText: '😀'.repeat(16384),
+        sessionId: 'synthetic-native-session' })
+      for (const fields of [{ accept: true }, { accept: true, promptText: '' }, { accept: false }]) {
+        nativeId = resetNative()
+        await nativeDriver.handleDialog({ dialogId: nativeId, ...fields }, guard, signal)
+        assert.equal(nativeCalls.at(-1).accept, fields.accept)
+        assert.equal(nativeCalls.at(-1).promptText, fields.promptText)
+        assert.equal(nativeDriver.pendingDialog, undefined)
+      }
 
       const manualClick = record.view.webContents.executeJavaScript(
         "document.querySelector('#ask').click()")

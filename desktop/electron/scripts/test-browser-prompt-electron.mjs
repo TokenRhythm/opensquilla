@@ -56,7 +56,7 @@ if (!process.versions.electron) {
       response.end(`<!doctype html><title>Prompt fixture</title>
         <button id="ask">Ask</button><output id="result"></output>
         <script>document.querySelector('#ask').onclick = () => {
-          const value = window.prompt('Synthetic question?', 'seed');
+          const value = window.prompt('Synthetic question?', window.promptDefault ?? 'seed');
           document.querySelector('#result').textContent = value === null ? '[cancelled]' : value;
         }</script>`)
     })
@@ -100,6 +100,55 @@ if (!process.versions.electron) {
       assert.equal(controller.respond(controller.state().id, 'agent answer'), true)
       await agentClick
       assert.equal(await answer(), 'agent answer')
+
+      for (const value of ['a'.repeat(4096), 'a'.repeat(4097), 'a'.repeat(16384),
+        '文'.repeat(16384), '😀'.repeat(16384), '😀'.repeat(16383) + 'a']) {
+        const boundaryClick = click()
+        await until(() => controller.state(), 'boundary prompt state')
+        const id = controller.state().id
+        assert.equal(controller.respond(id, value), true, `Accept ${Array.from(value).length} code points`)
+        await boundaryClick
+        assert.equal(await answer(), value)
+      }
+
+      // Reset only the synthetic controller's rate window for subsequent cases.
+      controller.dispose()
+      controller = new BrowserPromptController({ owner, contents: view.webContents,
+        isAllowed: () => true })
+      await view.webContents.executeJavaScript(`window.promptDefault = ${JSON.stringify('😀'.repeat(16384) + 'end')}`)
+      const defaultClick = click()
+      await until(() => controller.state(), 'long default prompt state')
+      assert.equal(controller.state().defaultValue, '😀'.repeat(16384))
+      await until(() => BrowserWindow.getAllWindows().some(window =>
+        window !== owner && window.getTitle() === 'Page prompt' && window.isVisible()),
+      'long default input modal')
+      const defaultModal = BrowserWindow.getAllWindows().find(window =>
+        window !== owner && window.getTitle() === 'Page prompt')
+      const ui = await defaultModal.webContents.executeJavaScript(`(() => {
+        const input = document.getElementById('value')
+        const defaultValue = input.value
+        input.value = 'synthetic'
+        input.setSelectionRange(2, 2)
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        const caret = input.selectionStart
+        input.value = ${JSON.stringify('😀'.repeat(16384) + 'extra')}
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        return { defaultValue, maxLength: input.maxLength, caret, clippedValue: input.value }
+      })()`)
+      assert.equal(ui.maxLength, 32768)
+      assert.equal(ui.caret, 2)
+      assert.equal(ui.defaultValue, '😀'.repeat(16384))
+      assert.equal(ui.clippedValue, '😀'.repeat(16384))
+      const id = controller.state().id
+      for (const invalid of ['a'.repeat(16385), '😀'.repeat(16384) + 'a', 42]) {
+        assert.equal(controller.respond(id, invalid), false)
+        assert.equal(controller.state().id, id, 'Invalid responses keep the same prompt pending')
+      }
+      assert.equal(controller.respond('different-prompt', ''), false)
+      assert.equal(controller.state().id, id)
+      await defaultModal.webContents.executeJavaScript("document.querySelector('#answer button[type=submit]').click()")
+      await defaultClick
+      assert.equal(await answer(), '😀'.repeat(16384))
 
       const closeClick = click()
       await until(() => controller.state(), 'lifecycle prompt state')

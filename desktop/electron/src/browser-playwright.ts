@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { BrowserWindow, WebContentsView, nativeImage, type WebContents } from 'electron'
 import { chromium, type Browser, type ConnectOverCDPTransport, type ElementHandle, type FileChooser, type Page } from 'playwright-core'
 import { DesktopBrowserError, type DesktopBrowserObservationReason, type DesktopBrowserRequest } from './desktop-browser.js'
+import { isBrowserPromptTextWithinLimit, truncateBrowserPromptText } from './browser-action-contract.js'
 import { BrowserPointerController } from './browser-pointer-controller.js'
 import { planMouseTrajectory } from './browser-mouse-trajectory.js'
 
@@ -383,7 +384,7 @@ export class BrowserPlaywrightDriver {
   get pendingDialog(): BrowserDialogState | undefined {
     const host = this.hostPrompt?.state()
     if (host) return { id: host.id, type: 'prompt', message: host.message.slice(0, 16_384),
-      defaultValue: host.defaultValue.slice(0, 16_384), openedAt: new Date(host.openedAt).toISOString(), documentEpoch: this.documentEpoch }
+      defaultValue: truncateBrowserPromptText(host.defaultValue), openedAt: new Date(host.openedAt).toISOString(), documentEpoch: this.documentEpoch }
     return this.dialogState ? { ...this.dialogState } : undefined
   }
   get pendingFileChooser(): BrowserFileChooserState | undefined { return this.fileChooser ? { ...this.fileChooser.state } : undefined }
@@ -436,7 +437,7 @@ export class BrowserPlaywrightDriver {
   private onDialog(dialog: Record<string, unknown>): void {
     this.latestVisual = undefined
     this.dialogState = { id: `dialog-${randomUUID()}`, type: String(dialog.type), message: String(dialog.message ?? '').slice(0, 16_384),
-      ...(dialog.type === 'prompt' ? { defaultValue: String(dialog.defaultPrompt ?? '').slice(0, 16_384) } : {}),
+      ...(dialog.type === 'prompt' ? { defaultValue: truncateBrowserPromptText(String(dialog.defaultPrompt ?? '')) } : {}),
       openedAt: new Date().toISOString(), documentEpoch: this.documentEpoch }
     const pending = this.pendingDialog
     if (pending) for (const notify of this.dialogWaiters) notify(pending)
@@ -454,6 +455,10 @@ export class BrowserPlaywrightDriver {
     if (request.promptText !== undefined && (pending.type !== 'prompt' || !request.accept)) {
       throw new DesktopBrowserError('INVALID_REQUEST', 'Prompt text requires accepting a prompt dialog.')
     }
+    if (request.promptText !== undefined && (typeof request.promptText !== 'string'
+      || !isBrowserPromptTextWithinLimit(request.promptText) || request.promptText.includes('\0'))) {
+      throw new DesktopBrowserError('INVALID_REQUEST', 'Prompt text must contain at most 16384 Unicode code points and no null character.', 400)
+    }
     this.resolvingDialog = true
     try {
       const host = this.hostPrompt?.state()
@@ -464,6 +469,11 @@ export class BrowserPlaywrightDriver {
         }
         const value = request.accept ? request.promptText ?? pending.defaultValue ?? '' : null
         if (!this.hostPrompt?.respond(pending.id, value)) {
+          if (this.hostPrompt?.state()?.id === pending.id) {
+            throw new DesktopBrowserError('DIALOG_CONTROL_UNAVAILABLE',
+              'The browser host could not respond to this prompt. Respond in the browser window.',
+              409, { outcome: 'not_started', retryable: false, recovery: 'manual_dialog_response' })
+          }
           throw new DesktopBrowserError('STALE_DIALOG', 'The pending dialog changed before its response.')
         }
         this.latestVisual = undefined

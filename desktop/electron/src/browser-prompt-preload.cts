@@ -2,14 +2,14 @@ import { contextBridge, ipcRenderer } from 'electron'
 
 const CHANNEL = 'opensquilla-browser-prompt'
 const MAX_MESSAGE = 2048
-const MAX_VALUE = 4096
+const MAX_VALUE = 16_384
 
 contextBridge.exposeInMainWorld('__opensquillaBrowserPrompt', {
   request(message: string, defaultValue: string): string | null {
     if (typeof message !== 'string' || typeof defaultValue !== 'string') return null
     const result: unknown = ipcRenderer.sendSync(CHANNEL, {
       message: message.slice(0, MAX_MESSAGE),
-      defaultValue: defaultValue.slice(0, MAX_VALUE),
+      defaultValue: Array.from(defaultValue.slice(0, MAX_VALUE * 2)).slice(0, MAX_VALUE).join(''),
     })
     return result === null || typeof result === 'string' ? result : null
   },

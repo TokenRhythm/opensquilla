@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { BrowserWindow, session, type Session, type WebContents } from 'electron'
+import { BROWSER_PROMPT_MAX_LENGTH, isBrowserPromptTextWithinLimit } from './browser-action-contract.js'
 
 export const BROWSER_PROMPT_PRELOAD = fileURLToPath(
   new URL('./browser-prompt-preload.cjs', import.meta.url),
@@ -8,7 +9,6 @@ export const BROWSER_PROMPT_PRELOAD = fileURLToPath(
 
 const CHANNEL = 'opensquilla-browser-prompt'
 const MAX_MESSAGE = 2048
-const MAX_VALUE = 4096
 const MAX_PROMPTS_PER_MINUTE = 8
 
 const HTML = `<!doctype html><meta charset="utf-8"><title>Page prompt</title>
@@ -22,7 +22,7 @@ const HTML = `<!doctype html><meta charset="utf-8"><title>Page prompt</title>
   button { font: inherit; min-width: 80px; padding: 6px 12px; }
 </style>
 <div id="origin"></div><p id="message"></p>
-<form id="answer"><input id="value" type="text" autocomplete="off" maxlength="4096">
+<form id="answer"><input id="value" type="text" autocomplete="off" maxlength="${BROWSER_PROMPT_MAX_LENGTH * 2}">
 <footer><button id="cancel" type="button">Cancel</button><button type="submit">OK</button></footer>
 </form>`
 
@@ -51,7 +51,7 @@ function promptRequest(value: unknown): { message: string; defaultValue: string 
   if (!value || typeof value !== 'object') return null
   const request = value as Record<string, unknown>
   return typeof request.message === 'string' && request.message.length <= MAX_MESSAGE
-    && typeof request.defaultValue === 'string' && request.defaultValue.length <= MAX_VALUE
+    && typeof request.defaultValue === 'string' && isBrowserPromptTextWithinLimit(request.defaultValue)
     ? { message: request.message, defaultValue: request.defaultValue }
     : null
 }
@@ -111,7 +111,7 @@ export class BrowserPromptController {
   respond(id: string, value: string | null): boolean {
     const pending = this.pending
     if (!pending || pending.state.id !== id || (value !== null
-      && (typeof value !== 'string' || value.length > MAX_VALUE))) return false
+      && (typeof value !== 'string' || !isBrowserPromptTextWithinLimit(value)))) return false
     this.pending = null
     try { this.options.onStateChange?.(null) } catch { /* Keep IPC reply live. */ }
     try { pending.event.returnValue = value } catch { /* Renderer may already be gone. */ }
@@ -164,6 +164,11 @@ export class BrowserPromptController {
       document.getElementById('message').textContent = ${JSON.stringify(pending.state.message)}
       const input = document.getElementById('value')
       input.value = ${JSON.stringify(pending.state.defaultValue)}
+      input.addEventListener('input', () => {
+        const value = Array.from(input.value.slice(0, ${BROWSER_PROMPT_MAX_LENGTH * 2}))
+          .slice(0, ${BROWSER_PROMPT_MAX_LENGTH}).join('')
+        if (input.value !== value) input.value = value
+      })
       input.focus()
       input.select()
       return new Promise(resolve => {
