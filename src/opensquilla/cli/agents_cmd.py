@@ -14,6 +14,7 @@ from rich.console import Console
 from rich.table import Table
 
 from opensquilla.agents.registry import AgentRegistry
+from opensquilla.cli.output import emit_error
 from opensquilla.onboarding.config_store import default_config_path, load_config, persist_config
 from opensquilla.session.keys import normalize_agent_id
 
@@ -37,8 +38,12 @@ def _load_registry(config_path: Path | None) -> tuple[Path, Any, AgentRegistry]:
     return target, cfg, AgentRegistry(cfg, config_path=target, persist_changes=False)
 
 
-def _fail(exc: Exception) -> None:
-    typer.secho(f"Error: {exc}", fg=typer.colors.RED, err=True)
+def _fail(exc: Exception, *, json_output: bool = False) -> None:
+    # The registry distinguishes the two failure kinds by exception type:
+    # _require_index raises KeyError for a missing agent, while a builtin-agent
+    # rejection or a duplicate id raises ValueError.
+    code = "NOT_FOUND" if isinstance(exc, KeyError) else "INVALID_ARGUMENT"
+    emit_error(str(exc), json_output=json_output, code=code)
     raise typer.Exit(code=2) from exc
 
 
@@ -105,7 +110,7 @@ def agents_add(
             )
         )
     except (ValueError, KeyError) as exc:
-        _fail(exc)
+        _fail(exc, json_output=json_output)
 
     persist = _persist_agents_config(cfg, target, quiet=json_output)
     if json_output:
@@ -134,7 +139,7 @@ def agents_delete(
     try:
         asyncio.run(registry.delete_agent(agent_id))
     except (ValueError, KeyError) as exc:
-        _fail(exc)
+        _fail(exc, json_output=json_output)
 
     persist = _persist_agents_config(cfg, target, quiet=json_output)
     payload = {

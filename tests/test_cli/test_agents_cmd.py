@@ -84,3 +84,44 @@ def test_agents_delete_force_json_removes_config_entry(tmp_path, monkeypatch):
         "stateDeleted": False,
     }
     assert load_config(target).agents == []
+
+
+def test_agents_delete_json_emits_structured_error_for_missing_agent(tmp_path, monkeypatch):
+    """--json must emit one JSON document on the failure path.
+
+    `sessions show --json` already does this; agents/channels bypassed it and
+    printed the human renderer's "Error: ..." line instead.
+    """
+    _setenv(monkeypatch, tmp_path)
+
+    result = runner.invoke(app, ["agents", "delete", "qa-does-not-exist", "--force", "--json"])
+
+    assert result.exit_code == 2
+    payload = json.loads(result.stderr)
+    assert payload["error"]["code"] == "NOT_FOUND"
+    assert "qa-does-not-exist" in payload["error"]["message"]
+
+
+def test_agents_add_json_emits_structured_error_for_duplicate(tmp_path, monkeypatch):
+    """The same failure path in `agents add`, which also advertises --json."""
+    _setenv(monkeypatch, tmp_path)
+    first = runner.invoke(app, ["agents", "add", "ops", "--json"])
+    assert first.exit_code == 0, first.stdout
+
+    result = runner.invoke(app, ["agents", "add", "ops", "--json"])
+
+    assert result.exit_code == 2
+    payload = json.loads(result.stderr)
+    assert "already exists" in payload["error"]["message"]
+
+
+def test_agents_delete_without_json_keeps_plain_text_error(tmp_path, monkeypatch):
+    """Control: the human path must be byte-for-byte what it always was."""
+    _setenv(monkeypatch, tmp_path)
+
+    result = runner.invoke(app, ["agents", "delete", "qa-does-not-exist", "--force"])
+
+    assert result.exit_code == 2
+    combined = result.stdout + (result.stderr or "")
+    assert "Error: " in combined
+    assert "{" not in combined
