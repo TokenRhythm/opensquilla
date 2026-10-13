@@ -6,6 +6,7 @@ export const NATIVE_WORKBENCH_MAX_HTML_BYTES = 5 * 1024 * 1024
 export const NATIVE_WORKBENCH_ARTIFACT_SCHEME = 'opensquilla-artifact'
 
 const SURFACE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const DOWNLOAD_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const PREVIEW_HOST_PATTERN = /^p-[a-f0-9]{32}\.localhost$/
 
 export interface NativeWorkbenchCreateRequestV1 {
@@ -42,6 +43,7 @@ export interface NativeWorkbenchUrlPreviewCreateRequestV2 {
   payload: {
     url: string
     scopeId: string
+    contextTargetRef?: string
   }
 }
 
@@ -95,7 +97,17 @@ export const NATIVE_WORKBENCH_NAVIGATION_ACTIONS = [
   'reload',
   'stop',
   'open-external',
+  'find',
+  'find-next',
+  'find-stop',
+  'zoom',
+  'close',
+  'download-open',
 ] as const
+
+export const NATIVE_WORKBENCH_FIND_QUERY_MAX_LENGTH = 512
+export const NATIVE_WORKBENCH_ZOOM_MIN_FACTOR = 0.5
+export const NATIVE_WORKBENCH_ZOOM_MAX_FACTOR = 3
 
 export type NativeWorkbenchNavigationAction =
   typeof NATIVE_WORKBENCH_NAVIGATION_ACTIONS[number]
@@ -105,6 +117,10 @@ export interface NativeWorkbenchNavigationRequest {
   surfaceId: string
   action: NativeWorkbenchNavigationAction
   url?: string
+  query?: string
+  forward?: boolean
+  zoomFactor?: number
+  downloadId?: string
 }
 
 export interface NativeWorkbenchPermissionResponse {
@@ -180,6 +196,9 @@ export type NativeWorkbenchSurfaceEventType =
   | 'crashed'
   | 'escape'
   | 'navigation-state'
+  | 'find-requested'
+  | 'find-state'
+  | 'download-state'
   | 'permission-request'
   | 'blocked-action'
   | 'capability-expired'
@@ -213,6 +232,16 @@ export interface NativeWorkbenchSurfaceEvent {
     navigationError?: { url: string; code: string; errorCode?: number; message: string } | null
     canGoBack?: boolean
     canGoForward?: boolean
+    findQuery?: string
+    findMatches?: number
+    findActiveMatch?: number
+    findFinal?: boolean
+    zoomFactor?: number
+    downloadId?: string
+    downloadName?: string
+    downloadState?: 'progressing' | 'completed' | 'cancelled' | 'interrupted'
+    receivedBytes?: number
+    totalBytes?: number
     requestId?: string
     permission?: string
     requestingOrigin?: string
@@ -278,6 +307,14 @@ function parseScopeId(value: unknown): string {
     throw new Error('The Workbench scope is invalid.')
   }
   return scopeId
+}
+
+function parseContextTargetRef(value: unknown): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 128
+    || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error('The browser context is invalid.')
+  }
+  return value
 }
 
 function parseHttpUrl(value: unknown, label: string): URL {
@@ -366,6 +403,8 @@ export function parseNativeWorkbenchCreateRequest(
         payload: {
           url: parseNativeWorkbenchNavigationUrl(payload.url),
           scopeId: parseScopeId(payload.scopeId),
+          ...(payload.contextTargetRef === undefined ? {}
+            : { contextTargetRef: parseContextTargetRef(payload.contextTargetRef) }),
         },
       }
     }
@@ -416,11 +455,49 @@ export function parseNativeWorkbenchNavigationRequest(
   if (action !== 'navigate' && action !== 'open-external' && request.url !== undefined) {
     throw new Error('This native Workbench navigation action does not accept an address.')
   }
+  if (action === 'find') {
+    if (typeof request.query !== 'string'
+      || request.query.length > NATIVE_WORKBENCH_FIND_QUERY_MAX_LENGTH) {
+      throw new Error('Choose a valid Workbench find query.')
+    }
+  } else if (request.query !== undefined) {
+    throw new Error('This native Workbench action does not accept a find query.')
+  }
+  if (action === 'find-next') {
+    if (request.forward !== undefined && typeof request.forward !== 'boolean') {
+      throw new Error('Choose a valid Workbench find direction.')
+    }
+  } else if (request.forward !== undefined) {
+    throw new Error('This native Workbench action does not accept a find direction.')
+  }
+  if (action === 'zoom') {
+    if (typeof request.zoomFactor !== 'number'
+      || !Number.isFinite(request.zoomFactor)
+      || request.zoomFactor < NATIVE_WORKBENCH_ZOOM_MIN_FACTOR
+      || request.zoomFactor > NATIVE_WORKBENCH_ZOOM_MAX_FACTOR) {
+      throw new Error('Choose a valid Workbench zoom factor.')
+    }
+  } else if (request.zoomFactor !== undefined) {
+    throw new Error('This native Workbench action does not accept a zoom factor.')
+  }
+  if (action === 'download-open') {
+    if (typeof request.downloadId !== 'string'
+      || !DOWNLOAD_ID_PATTERN.test(request.downloadId)) {
+      throw new Error('Choose a valid Workbench download.')
+    }
+  } else if (request.downloadId !== undefined) {
+    throw new Error('This native Workbench action does not accept a download.')
+  }
   return {
     version: request.version,
     surfaceId: parseNativeWorkbenchSurfaceId(request.surfaceId),
     action,
     ...(url ? { url } : {}),
+    ...(action === 'find' ? { query: request.query as string } : {}),
+    ...(action === 'find-next' && request.forward !== undefined
+      ? { forward: request.forward as boolean } : {}),
+    ...(action === 'zoom' ? { zoomFactor: request.zoomFactor as number } : {}),
+    ...(action === 'download-open' ? { downloadId: request.downloadId as string } : {}),
   }
 }
 

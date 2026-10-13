@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import linecache
 import threading
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
 
 from opensquilla.gateway import stall_watchdog
 from opensquilla.gateway.stall_watchdog import GatewayStallWatchdog
@@ -185,11 +188,10 @@ def test_recovery_observation_span_can_include_time_after_actual_recovery(
     assert "stale_heartbeat_window_lower_bound_ms" not in ended
 
 
+@pytest.mark.parametrize("prior_stall", [False, True])
 def test_stall_watchdog_does_not_emit_stalls_after_heartbeat_failure(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, prior_stall,
 ) -> None:
-    now = [100.0]
-    monkeypatch.setattr(stall_watchdog.time, "monotonic", lambda: now[0])
     output = tmp_path / "stalls.jsonl"
     watchdog = GatewayStallWatchdog(
         output_path=output,
@@ -197,15 +199,140 @@ def test_stall_watchdog_does_not_emit_stalls_after_heartbeat_failure(
         sample_interval_s=0.02,
         stack_interval_s=0.02,
     )
+    now = [100.0]
+    monkeypatch.setattr(stall_watchdog.time, "monotonic", lambda: now[0])
+    watchdog.beat()
+    if prior_stall:
+        now[0] = 101.0
+        watchdog._sample_once()
     watchdog.heartbeat_failed(RuntimeError("test heartbeat failure"))
     assert watchdog._stop.is_set()
-    now[0] += 1.0
+    now[0] = 102.0
+    watchdog._sample_once()
+    watchdog.beat()
+    now[0] = 103.0
     watchdog._sample_once()
     watchdog.stop()
 
     events = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
-    assert any(event["type"] == "heartbeat_failed" for event in events)
-    assert not any(event["type"] == "stall_started" for event in events)
+    failure_index = next(
+        index for index, event in enumerate(events) if event["type"] == "heartbeat_failed"
+    )
+    assert any(event["type"] == "stall_started" for event in events[:failure_index]) == prior_stall
+    assert not any(
+        event["type"] in {"stall_started", "stack_sample", "stall_ended"}
+        for event in events[failure_index + 1:]
+    )
+    assert watchdog._stop.is_set()
+    assert events[-1]["heartbeat_alive"] is False
+
+
+def test_stall_watchdog_discards_capture_in_flight_when_heartbeat_fails(
+    tmp_path, monkeypatch,
+) -> None:
+    watchdog = GatewayStallWatchdog(output_path=tmp_path / "stalls.jsonl")
+    watchdog._heartbeat_at = 100.0
+    monkeypatch.setattr(stall_watchdog.time, "monotonic", lambda: 103.0)
+    capture_started = threading.Event()
+    release_capture = threading.Event()
+
+    def capture():
+        capture_started.set()
+        assert release_capture.wait(5), "The test must release the paused stack capture"
+        return []
+
+    monkeypatch.setattr(watchdog, "_main_stack", capture)
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        sampling = worker.submit(watchdog._sample_once)
+        try:
+            assert capture_started.wait(5), "Sampling must reach stack capture"
+            watchdog.heartbeat_failed(RuntimeError("test heartbeat failure"))
+        finally:
+            release_capture.set()
+        sampling.result(timeout=5)
+
+    events = [json.loads(line) for line in watchdog.output_path.read_text().splitlines()]
+    assert [event["type"] for event in events] == ["heartbeat_failed"]
+
+
+def test_stall_watchdog_discards_recovery_waiting_to_write_after_heartbeat_failure(
+    tmp_path, monkeypatch,
+) -> None:
+    watchdog = GatewayStallWatchdog(output_path=tmp_path / "stalls.jsonl")
+    now = [103.0]
+    watchdog._heartbeat_at = 100.0
+    monkeypatch.setattr(stall_watchdog.time, "monotonic", lambda: now[0])
+    watchdog._sample_once()
+    watchdog.beat()
+    now[0] = 103.1
+    original_write = watchdog._write
+
+    def fail_before_recovery_write(payload, **kwargs):
+        if payload["type"] == "stall_ended":
+            watchdog.heartbeat_failed(RuntimeError("test heartbeat failure"))
+        return original_write(payload, **kwargs)
+
+    monkeypatch.setattr(watchdog, "_write", fail_before_recovery_write)
+    watchdog._sample_once()
+    events = [json.loads(line) for line in watchdog.output_path.read_text().splitlines()]
+    assert [event["type"] for event in events] == [
+        "stall_started", "stack_sample", "heartbeat_failed",
+    ]
+
+
+def test_stall_watchdog_orders_failure_after_admitted_write_without_blocking_beats(
+    tmp_path, monkeypatch,
+) -> None:
+    output = tmp_path / "stalls.jsonl"
+    watchdog = GatewayStallWatchdog(output_path=output)
+    watchdog._heartbeat_at = 100.0
+    monkeypatch.setattr(stall_watchdog.time, "monotonic", lambda: 103.0)
+    write_started = threading.Event()
+    release_write = threading.Event()
+    original_open = type(output).open
+
+    class PausedWriter:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def write(self, data):
+            if b'"type": "stall_started"' in data:
+                write_started.set()
+                assert release_write.wait(5), "The test must release the admitted write"
+            return self.stream.write(data)
+
+    def paused_open(path, mode="r", *args, **kwargs):
+        stream = original_open(path, mode, *args, **kwargs)
+        return PausedWriter(stream) if path == output and mode == "ab" else stream
+
+    monkeypatch.setattr(type(output), "open", paused_open)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        sampling = workers.submit(watchdog._sample_once)
+        try:
+            assert write_started.wait(5), "Sampling must enter its admitted write"
+            assert watchdog._heartbeat_lock.acquire(blocking=False), (
+                "A filesystem write must not hold the heartbeat lock"
+            )
+            watchdog._heartbeat_lock.release()
+            watchdog.beat()
+            failure = workers.submit(
+                watchdog.heartbeat_failed, RuntimeError("test heartbeat failure"),
+            )
+            assert watchdog._stop.wait(5), "Failure must retire sampling before waiting to write"
+        finally:
+            release_write.set()
+        sampling.result(timeout=5)
+        failure.result(timeout=5)
+
+    events = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [event["type"] for event in events] == ["stall_started", "heartbeat_failed"]
 
 
 def test_stall_watchdog_emits_event_loop_lag_summary_when_enabled(tmp_path) -> None:

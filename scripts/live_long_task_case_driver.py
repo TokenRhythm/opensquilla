@@ -613,6 +613,12 @@ class GatewayProcess:
         )
         return env
 
+    def _open_health(self) -> Any:
+        # Readiness belongs to the loopback process we launched. A user proxy
+        # or globally installed urllib opener must not answer on its behalf.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return opener.open(f"{self.http_url}/health", timeout=1)
+
     def start(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
             raise RuntimeError("Gateway is already running")
@@ -659,9 +665,7 @@ class GatewayProcess:
                         last_health_status,
                     )
                 try:
-                    with urllib.request.urlopen(
-                        f"{self.http_url}/health", timeout=1,
-                    ) as response:
+                    with self._open_health() as response:
                         last_health_status = response.status
                         if response.status == 200:
                             self._has_reached_health = True

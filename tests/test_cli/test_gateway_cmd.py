@@ -357,6 +357,8 @@ def test_gateway_start_failure_reaches_collector_without_exception_content(
 async def test_gateway_start_failure_does_not_wait_on_another_runtime_send_lock(
     tmp_path, monkeypatch, reuse_existing_sink
 ) -> None:
+    import sqlite3
+
     from opensquilla.gateway.config import GatewayConfig
     from opensquilla.telemetry import runtime as telemetry_runtime
     from opensquilla.telemetry.consent import TelemetryScope, resolve_scope_consent
@@ -394,6 +396,8 @@ async def test_gateway_start_failure_does_not_wait_on_another_runtime_send_lock(
         )
         await original.start()
         await asyncio.wait_for(entered.wait(), timeout=1)
+        upload_task = original._upload_task
+        assert upload_task is not None
         created = []
 
         def new_runtime(**kwargs):
@@ -415,8 +419,28 @@ async def test_gateway_start_failure_does_not_wait_on_another_runtime_send_lock(
                 timeout=0.5,
             )
             assert not cancelled.is_set()
+            assert not upload_task.done()
         finally:
-            await asyncio.wait_for(original.close(), timeout=1)
+            scoped_runtimes = tuple(original._scopes.values())
+            outboxes = tuple(scoped.outbox for scoped in scoped_runtimes)
+            connections = tuple(outbox._connection for outbox in outboxes)
+            # Drain owned SQLite work after checking the startup-failure deadline.
+            await original.close()
+            assert original._closed and not original.opened_scopes
+            assert upload_task.cancelled() and not original._record_tasks
+            assert all(scoped.uploader._closed for scoped in scoped_runtimes)
+            assert outboxes
+            assert all(outbox._closed for outbox in outboxes)
+            for connection in connections:
+                worker = getattr(connection, "_thread", None)
+                if worker is not None:
+                    assert connection._connection is None and not connection._running
+                    await asyncio.to_thread(worker.join)
+                    assert not worker.is_alive()
+                else:
+                    with pytest.raises((sqlite3.ProgrammingError, ValueError)):
+                        await connection.execute("SELECT 1")
+        assert not client.is_closed
 
     assert cancelled.is_set()
     assert len(created) == (0 if reuse_existing_sink else 1)
@@ -424,6 +448,12 @@ async def test_gateway_start_failure_does_not_wait_on_another_runtime_send_lock(
     outbox = await TelemetryOutbox.open(config.state_dir, TelemetryScope.RELIABILITY)
     try:
         assert (await outbox.stats()).pending_events == (2 if reuse_existing_sink else 1)
+        rows = await outbox._fetchall("SELECT payload FROM telemetry_outbox")
+        outcomes = sorted(json.loads(row["payload"])["outcome"] for row in rows)
+        expected = [ResultOutcome.SUCCESS.value]
+        if reuse_existing_sink:
+            expected.append(ResultOutcome.FAIL.value)
+        assert outcomes == sorted(expected)
     finally:
         await outbox.close()
 

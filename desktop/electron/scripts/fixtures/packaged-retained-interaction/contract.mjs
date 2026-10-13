@@ -102,22 +102,41 @@ export async function assertPreservedInputs(plan) {
   }
 }
 
-export async function assertNoExistingDesktop(runFile, windowsDirectory = process.env.SystemRoot) {
+async function windowsProcessCensus(runFile, windowsDirectory, signal) {
   // Only the image name is needed here. Avoid loading PowerShell and CIM for
   // this conservative guard against joining an existing single-instance owner.
   assert.ok(typeof windowsDirectory === 'string' && isAbsolute(windowsDirectory), 'Windows process census requires an absolute SystemRoot')
-  const { stdout, stderr } = await runFile(join(windowsDirectory, 'System32', 'tasklist.exe'), ['/FO', 'CSV', '/NH'], { windowsHide: true, timeout: 15_000 })
+  const { stdout, stderr } = await runFile(join(windowsDirectory, 'System32', 'tasklist.exe'), ['/FO', 'CSV', '/NH'], { windowsHide: true, timeout: 15_000, ...(signal ? { signal } : {}) })
   assert.equal((stderr || '').trim(), '', 'Windows process census returned unexpected stderr')
   assert.ok(typeof stdout === 'string' && stdout.trim(), 'Windows process census returned no CSV rows')
-  const names = stdout.trim().split(/\r?\n/).map(row => {
+  return stdout.trim().split(/\r?\n/).map(row => {
     // Parse complete quoted CSV rows, including commas and escaped quotes.
     // Unfiltered tasklist must list at least one process; INFO/error text or a
     // partially malformed response must never stand in for an empty census.
     const fields = row.match(/^"((?:[^"\r\n]|"")*)","([0-9]+)","((?:[^"\r\n]|"")*)","((?:[^"\r\n]|"")*)","((?:[^"\r\n]|"")*)"$/)
     assert.ok(fields && fields[1], 'Windows process census returned malformed CSV')
-    return fields[1].replaceAll('""', '"').toLowerCase()
+    const pid = Number(fields[2])
+    assert.ok(Number.isSafeInteger(pid) && pid >= 0 && pid <= 0xffffffff, 'Windows process census returned an invalid PID')
+    return { name: fields[1].replaceAll('""', '"').toLowerCase(), pid }
   })
-  assert.equal(names.includes('opensquilla.exe'), false, 'Close existing Desktop instances before this isolated probe')
+}
+
+export async function assertNoExistingDesktop(runFile, windowsDirectory = process.env.SystemRoot) {
+  const processes = await windowsProcessCensus(runFile, windowsDirectory)
+  assert.equal(processes.some(row => row.name === 'opensquilla.exe'), false, 'Close existing Desktop instances before this isolated probe')
+}
+
+export async function collectSqliteProcessCensus(runFile, windowsDirectory = process.env.SystemRoot, signal = AbortSignal.timeout(2_500)) {
+  try {
+    const names = new Set(['opensquilla.exe', 'opensquilla-gateway.exe', 'python.exe', 'python3.exe', 'pythonw.exe'])
+    const processes = (await windowsProcessCensus(runFile, windowsDirectory, signal)).filter(row => names.has(row.name))
+    // This is presence evidence only, not proof that a PID has this database
+    // open. Never collect executable paths, arguments, environments or titles.
+    return { scope: 'image_and_pid_only', processes: processes.slice(0, 32), truncated: processes.length > 32 }
+  } catch (error) {
+    const codes = new Set(['ENOENT', 'EACCES', 'EPERM', 'ABORT_ERR', 'ETIMEDOUT'])
+    return { unavailable: true, code: codes.has(error?.code) ? error.code : 'PROCESS_CENSUS_UNAVAILABLE' }
+  }
 }
 
 export function auditMessages(auditId) {

@@ -70,9 +70,9 @@ def _make_envelope(session_key: str = "agent-1::sess-1") -> RouteEnvelope:
     )
 
 
-def _make_storage() -> Any:
+def _make_storage(*, mock_optional_methods: bool = True) -> Any:
     """Minimal storage mock."""
-    storage = MagicMock()
+    storage = MagicMock() if mock_optional_methods else SimpleNamespace()
     task_db: dict[str, AgentTaskRecord] = {}
 
     async def create(record: AgentTaskRecord) -> None:
@@ -150,8 +150,14 @@ async def test_terminal_clears_all_dicts() -> None:
     """
     rt = _make_runtime()
     env = _make_envelope("agent-1::sess-a")
-    handle = await rt.enqueue(env, "hello")
-    await rt.wait(handle.task_id, timeout=2.0)
+    # A no-op turn has no snapshot. Keep the warning contract in this short
+    # cleanup case instead of generating 10 000 warnings in the growth soak.
+    with capture_logs() as logs:
+        handle = await rt.enqueue(env, "hello")
+        record = await rt.wait(handle.task_id, timeout=2.0)
+    assert record.status is AgentTaskStatus.SUCCEEDED
+    assert "activity_snapshot" not in record.details
+    assert sum(entry["event"] == "task_runtime.activity_snapshot_missing" for entry in logs) == 1
 
     sk = env.session_key
     assert handle.task_id not in rt._tasks
@@ -2821,23 +2827,36 @@ async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
     num_tasks = 10_000
     session_count = 50  # rotate sessions to mimic real load
     monkeypatch.setattr(task_runtime, "_emit_metric", lambda *_args, **_kwargs: None)
+    from opensquilla.application import approval_queue
+
     # Replay-history sizing has its own tests. Retain this synthetic turn's
     # phase and done event without rescanning an ever-growing history per task.
     streams = session_streams.SessionStreamRegistry(max_events_per_session=2)
     monkeypatch.setattr(session_streams, "_session_streams", streams)
 
-    async def _expire_no_approvals(_session_key: str) -> int:
+    # This workload has no approvals or activation permits. Keep the async
+    # cleanup boundary without a global SQLite worker or dynamic optional
+    # storage methods and their retained mock-call history.
+    approval_cleanups: dict[str, int] = {}
+
+    async def expire_pending_for_session_async(session_key: str) -> int:
+        approval_cleanups[session_key] = approval_cleanups.get(session_key, 0) + 1
         return 0
 
-    # This workload creates no approvals. The short approval-expiry tests above
-    # own that interaction; avoid 10 000 unrelated SQLite worker calls here.
-    approval_port = SimpleNamespace(expire_pending_for_session_async=_expire_no_approvals)
-    monkeypatch.setattr(
-        "opensquilla.application.approval_queue.get_approval_queue",
-        lambda: approval_port,
+    empty_approval_queue = SimpleNamespace(
+        expire_pending_for_session_async=expire_pending_for_session_async,
     )
+    monkeypatch.setattr(
+        approval_queue,
+        "get_approval_queue",
+        lambda: empty_approval_queue,
+    )
+    storage = _make_storage(mock_optional_methods=False)
+    executed = 0
 
     async def _instant_handler(run: Any) -> None:
+        nonlocal executed
+        executed += 1
         # Model a minimal completed turn through the real snapshot owner. A bare
         # no-op handler omits the stream contract and emits thousands of unrelated
         # snapshot-missing warnings instead of exercising normal settlement.
@@ -2853,7 +2872,8 @@ async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
             common,
         )
 
-    rt = _make_runtime(
+    rt = TaskRuntime(
+        storage=storage,
         turn_handler=_instant_handler,
         max_concurrency=32,
         max_pending_per_session=None,
@@ -2880,10 +2900,9 @@ async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
         # single gather of 10 000 ``runtime.wait`` calls creates another 10 000
         # waiter tasks and timer bookkeeping on top of the runtime workload; that
         # amplification is what made this quantitative check consume a minute on
-        # loaded Windows runners. This is a growth contract, not a throughput
-        # benchmark; the shared five-minute watchdog still catches a stuck task.
+        # loaded Windows runners. The shared deadline still catches a stuck task.
         batch_size = 500
-        deadline = asyncio.get_running_loop().time() + 300.0
+        deadline = asyncio.get_running_loop().time() + 60.0
         completed_tasks = 0
         for batch_start in range(0, num_tasks, batch_size):
             handles = []
@@ -2910,6 +2929,13 @@ async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
             )
             completed_tasks += len(records)
         assert completed_tasks == num_tasks
+        records = await storage.list_agent_tasks()
+        assert len(records) == executed == num_tasks
+        assert all(record.status is AgentTaskStatus.SUCCEEDED for record in records)
+        assert approval_cleanups == {
+            f"agent-1::sess-load-{i}": num_tasks // session_count
+            for i in range(session_count)
+        }
 
         # --- post-GC snapshot ---
         gc.collect()

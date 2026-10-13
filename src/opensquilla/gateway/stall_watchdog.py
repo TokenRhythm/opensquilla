@@ -209,12 +209,12 @@ class GatewayStallWatchdog:
         with self._heartbeat_lock:
             self._heartbeat_alive = False
             heartbeat_seq = self._heartbeat_seq
+        self._stop.set()
         self._write({
             "type": "heartbeat_failed",
             "heartbeat_seq": heartbeat_seq,
             "error_type": type(error).__name__,
         })
-        self._stop.set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -409,6 +409,14 @@ class GatewayStallWatchdog:
             return False
         encoded = (json.dumps({"ts": time.time(), **payload}, ensure_ascii=False) + "\n").encode()
         with self._write_lock:
+            # A capture can outlive heartbeat failure or wait behind another
+            # writer. Admit observations under the same lock that orders the
+            # failure marker, so none can follow it. Release the heartbeat
+            # lock before filesystem work so ordinary beats can still run.
+            if payload["type"] in {"stall_started", "stack_sample", "stall_ended"}:
+                with self._heartbeat_lock:
+                    if not self._heartbeat_alive:
+                        return False
             reserved = reserve_bytes if force else (
                 _RESERVED_SUMMARY_BYTES
                 + (_RESERVED_TIMELINE_BYTES if self.loop_lag_enabled else 0)
