@@ -1,4 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises'
+import { terminateOwnedPosixProcessGroup } from './e2e-posix-process-group.mjs'
 import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
 import {
   desktopGatewayStartIdentityConflict,
@@ -221,6 +222,11 @@ function observeElectronShutdown(app) {
 
 async function forceElectronProcessExit(child, phase, emit, observation) {
   observation.record('force-start', { process: observation.state() })
+  if (process.platform !== 'win32') {
+    return terminateOwnedPosixProcessGroup(child, {
+      timeoutMs: FORCED_PROCESS_EXIT_TIMEOUT_MS,
+    })
+  }
   if (childHasExited(child)) {
     const processTreeReaped = process.platform !== 'win32'
     return {
@@ -288,6 +294,16 @@ export async function closeElectronWithDeadline({
   const observation = observeElectronShutdown(app)
   try {
     await withDeadline(() => app.close(), `${phase} Electron shutdown`, timeoutMs)
+    const child = observation.child
+    if (!child || !Number.isSafeInteger(child.pid) || child.pid <= 0
+      || child.exitCode !== 0 || child.signalCode !== null) {
+      const error = new Error(`${phase} Electron close resolved without a clean process exit: `
+        + `exitCode=${child?.exitCode ?? 'unknown'} signal=${child?.signalCode ?? 'none'}`)
+      error.code = child && Number.isSafeInteger(child.pid) && child.pid > 0
+        && ((Number.isInteger(child.exitCode) && child.exitCode !== 0) || typeof child.signalCode === 'string')
+        ? 'DESKTOP_E2E_ABNORMAL_EXIT' : 'DESKTOP_E2E_UNVERIFIED_EXIT'
+      throw error
+    }
     return {
       closed: true,
       error: null,
@@ -311,17 +327,20 @@ export async function closeElectronWithDeadline({
       shutdownObservation: observation.snapshot(),
     }
     emit(JSON.stringify(detail))
-    const forcedExit = child
+    const forceNeeded = child && Number.isSafeInteger(child.pid) && child.pid > 0 && !childHasExited(child)
+    const forcedExit = forceNeeded
       ? await forceElectronProcessExit(child, phase, emit, observation)
       : {
-          error: new Error('Electron child process was unavailable for forced shutdown.'),
+          error: null,
           processTreeReaped: false,
         }
+    const forcedExitSucceeded = Boolean(forceNeeded && forcedExit.error === null)
     observation.record('cleanup-complete', { process: observation.state() })
     emit(JSON.stringify({
       event: 'desktop_e2e_electron_shutdown_cleanup',
       phase,
-      forcedExitSucceeded: child !== null && forcedExit.error === null,
+      forcedExitSucceeded,
+      cleanupSkipped: forceNeeded ? null : child && childHasExited(child) ? 'already-exited' : 'unverified-child',
       processTreeReaped: forcedExit.processTreeReaped,
       error: forcedExit.error?.message || null,
       shutdownObservation: observation.snapshot(),
@@ -329,7 +348,7 @@ export async function closeElectronWithDeadline({
     const error = new Error(
       `DESKTOP_E2E_ELECTRON_SHUTDOWN_FAILED: phase=${phase} `
       + `cause=${cause?.message || String(cause)} `
-      + `forcedExit=${forcedExit.error?.message || 'ok'} `
+      + `forcedExit=${forceNeeded ? forcedExit.error?.message || 'ok' : 'not-attempted'} `
       + `diagnostics=${JSON.stringify(snapshot)}`,
       { cause },
     )
@@ -337,7 +356,7 @@ export async function closeElectronWithDeadline({
       closed: false,
       error,
       closeErrorCode: typeof cause?.code === 'string' ? cause.code : null,
-      forcedExitSucceeded: child !== null && forcedExit.error === null,
+      forcedExitSucceeded,
       processTreeReaped: forcedExit.processTreeReaped,
       shutdownObservation: observation.snapshot(),
     }

@@ -7331,7 +7331,9 @@ function dismissOnboardingFlow(flow: OnboardingFlow): void {
   const window = flow.window
   if (window && !window.isDestroyed()) window.close()
   resolve?.(null)
-  focusMainWindow()
+  // During app.quit(), the parent may have destroyed its webContents while
+  // still closing this child. Revealing that half-closed native window is unsafe.
+  if (!isQuitting && appExitPhase !== 'committed') focusMainWindow()
 }
 
 async function runOnboarding(): Promise<DesktopConnection | null> {

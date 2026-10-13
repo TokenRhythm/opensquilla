@@ -23,6 +23,7 @@ import {
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
 import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
+import { readLinuxProcessStat } from './e2e-posix-process-group.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const helperPath = join(scriptDir, 'ci-case-telemetry.mjs')
@@ -446,21 +447,35 @@ try {
   // The production helper invokes real taskkill on Windows, so this fixture
   // must own its PID rather than supplying a synthetic EventEmitter PID.
   const hangingProcess = spawn(process.execPath, ['-e', `
+    process.title = 'ci( ) worker)';
     process.on('disconnect', () => process.exit(0));
     process.send({ type: 'ready', pid: process.pid });
     setInterval(() => {}, 1000);
   `], {
     stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    detached: process.platform !== 'win32',
     windowsHide: true,
   })
   const hangingProcessClosed = new Promise(resolveClose => hangingProcess.once('close', resolveClose))
   try {
     const [ready] = await once(hangingProcess, 'message', { signal: AbortSignal.timeout(5_000) })
     assert.deepEqual(ready, { type: 'ready', pid: hangingProcess.pid })
+    if (process.platform === 'linux') {
+      // Exercise actual kernel records, including ')' inside the process name.
+      assert.equal(readLinuxProcessStat(process.pid).ppid, process.ppid)
+      const rawStat = await readFile('/proc/' + hangingProcess.pid + '/stat', 'utf8')
+      assert.ok(rawStat.startsWith(hangingProcess.pid + ' (ci( ) worker)) '))
+      const childStat = readLinuxProcessStat(hangingProcess.pid)
+      assert.equal(childStat.pid, hangingProcess.pid)
+      assert.equal(childStat.ppid, process.pid)
+      assert.equal(childStat.pgid, hangingProcess.pid)
+      assert.match(childStat.startTicks, /^[1-9][0-9]*$/)
+    }
     const hangingElectron = {
       close: () => new Promise(() => {}),
       process: () => hangingProcess,
     }
+    const supportsOwnedTreeReaping = ['win32', 'linux'].includes(process.platform)
     const hangingShutdown = await closeElectronWithDeadline({
       app: hangingElectron,
       phase: 'unit-hanging-electron',
@@ -471,10 +486,10 @@ try {
     })
     assert.equal(hangingShutdown.closed, false)
     assert.equal(hangingShutdown.closeErrorCode, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
-    assert.equal(hangingShutdown.forcedExitSucceeded, true)
-    assert.equal(hangingShutdown.processTreeReaped, true)
+    assert.equal(hangingShutdown.forcedExitSucceeded, supportsOwnedTreeReaping)
+    assert.equal(hangingShutdown.processTreeReaped, supportsOwnedTreeReaping)
     assert.match(hangingShutdown.error.message, /DESKTOP_E2E_ELECTRON_SHUTDOWN_FAILED/)
-    assert.ok(hangingProcess.exitCode !== null || hangingProcess.signalCode !== null)
+    assert.equal(hangingProcess.exitCode !== null || hangingProcess.signalCode !== null, supportsOwnedTreeReaping)
     assert.equal(shutdownLogs.length, 2)
     const shutdownLog = JSON.parse(shutdownLogs[0])
     const { shutdownObservation, ...originalDetail } = shutdownLog
@@ -497,9 +512,9 @@ try {
     assert.equal(shutdownObservation.events[0].event, 'close-start')
     const cleanupLog = JSON.parse(shutdownLogs[1])
     assert.equal(cleanupLog.event, 'desktop_e2e_electron_shutdown_cleanup')
-    assert.equal(cleanupLog.processTreeReaped, true)
-    assert.equal(cleanupLog.forcedExitSucceeded, true)
-    assert.ok(cleanupLog.shutdownObservation.events.some(event => event.event === 'child-exit'))
+    assert.equal(cleanupLog.processTreeReaped, supportsOwnedTreeReaping)
+    assert.equal(cleanupLog.forcedExitSucceeded, supportsOwnedTreeReaping)
+    assert.equal(cleanupLog.shutdownObservation.events.some(event => event.event === 'child-exit'), supportsOwnedTreeReaping)
     assert.equal(hangingProcess.listenerCount('exit'), 0)
   } finally {
     if (hangingProcess.exitCode === null && hangingProcess.signalCode === null) {

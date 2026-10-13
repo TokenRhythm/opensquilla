@@ -1100,6 +1100,7 @@ jobs:
           node scripts/test-router-tier-normalization.mjs
           node scripts/test-desktop-router-config.mjs
           node scripts/test-onboarding-routing.mjs
+          node --test scripts/test-e2e-posix-process-group.mjs
           node scripts/test-ci-case-telemetry.mjs
           node scripts/test-telemetry-consent.mjs
           node scripts/test-telemetry-early-spool.mjs

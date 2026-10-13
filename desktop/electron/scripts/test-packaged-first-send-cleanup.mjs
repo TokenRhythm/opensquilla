@@ -83,6 +83,7 @@ console.log(`First-send shutdown log classification checks passed: ${quitLogCase
 
 const fixtureProcesses = []
 const fixtureServers = []
+let refusedCleanupChild = null
 
 async function startChild(withDescendant = false) {
   const source = `
@@ -95,6 +96,7 @@ async function startChild(withDescendant = false) {
   `
   const child = spawn(process.execPath, ['-e', source], {
     stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    detached: process.platform !== 'win32',
     windowsHide: true,
   })
   fixtureProcesses.push(child)
@@ -214,6 +216,8 @@ try {
   /did not produce a natural zero exit code/)
 
   const hanging = await startChild(process.platform === 'win32')
+  const supportsOwnedTreeReaping = ['win32', 'linux'].includes(process.platform)
+  if (!supportsOwnedTreeReaping) refusedCleanupChild = hanging.child
   const unaffected = await startChild()
   const identity = await captureElectronProcessIdentity({
     process: () => hanging.child,
@@ -255,12 +259,20 @@ try {
   })
   const forced = hangingPhases.find(event => event.phase === 'electron-cleanup-complete')
   assert.equal(forced.closed, false)
-  assert.equal(forced.forcedExitSucceeded, true, 'even successful containment must fail this gate')
+  assert.equal(forced.forcedExitSucceeded, supportsOwnedTreeReaping,
+    'successful containment or refusal must preserve the shutdown failure')
   assert.equal(hangingProvider.server.listening, false, 'provider cleanup must run after Electron failure')
   assert.equal(shutdownLogs[0].process.pid, hanging.child.pid)
   assert.equal(shutdownLogs[0].diagnostics.ownedFixture, true)
-  await assertProcessExited(hanging.child.pid)
-  assert.equal(electronProcessSnapshot(identity).wrapperPidExists, false)
+  if (supportsOwnedTreeReaping) {
+    await assertProcessExited(hanging.child.pid)
+    assert.equal(electronProcessSnapshot(identity).wrapperPidExists, false)
+  } else {
+    assert.equal(hanging.child.exitCode, null, 'unverified containment must leave the child alive')
+    assert.equal(hanging.child.signalCode, null)
+    assert.equal(hanging.child.killed, false)
+    assert.equal(electronProcessSnapshot(identity).wrapperPidExists, true)
+  }
   assert.equal(electronProcessSnapshot(identity).electronPidExists, true)
   if (hanging.descendantPid) await assertProcessExited(hanging.descendantPid)
   assert.equal(unaffected.child.exitCode, null, 'cleanup must not kill another Node process')
@@ -308,10 +320,23 @@ try {
   for (const child of fixtureProcesses) {
     try {
       if (child.exitCode === undefined || (child.exitCode === null && child.signalCode === null)) {
-        process.kill(child.pid, 'SIGKILL')
+        const refusedChildClosed = child === refusedCleanupChild
+          ? once(child, 'close', { signal: AbortSignal.timeout(5_000) }) : null
+        // Retained direct children include the refused macOS fixture. The
+        // existing PID-only entry is the Windows descendant checked above.
+        if (typeof child.kill === 'function') child.kill('SIGKILL')
+        else process.kill(child.pid, 'SIGKILL')
+        if (refusedChildClosed) await refusedChildClosed
       }
     } catch (error) {
       if (error.code !== 'ESRCH') throw error
     }
   }
+}
+
+if (refusedCleanupChild) {
+  // Refusal is not tree-reaping proof. Verify this child only after our own
+  // fixture finally, which holds its ChildProcess and creates no descendants.
+  await assertProcessExited(refusedCleanupChild.pid)
+  assert.equal(refusedCleanupChild.signalCode, 'SIGKILL')
 }
