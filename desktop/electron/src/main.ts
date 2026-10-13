@@ -16000,9 +16000,8 @@ app.on('before-quit', (event) => {
 })
 
 function shutdownFromSignal(): void {
-  isQuitting = true
-  // before-quit owns the child handle until its single-flight drain finishes.
-  // Clearing it here would recreate the orphaned-gateway race on SIGINT/SIGTERM.
+  // before-quit owns the exit state and child handle. Its browser close decision
+  // can still be canceled, so a signal requests quit without committing shutdown.
   app.quit()
 }
 

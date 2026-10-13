@@ -1165,4 +1165,6 @@ for (const [label, invalidate] of [
   ['new open during renderer restoration', harness => runInContext('invalidateDesktopOpenFlow()', harness.context)],
 ]) await runLateReadinessNavigationAuthorityCase(label, invalidate)
 
+await import('./test-desktop-browser-quit-lifecycle.mjs')
+
 console.log('desktop gateway lifecycle tests passed')
