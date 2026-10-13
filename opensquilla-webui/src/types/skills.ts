@@ -212,6 +212,12 @@ export interface RegistryResult {
   lifecycle?: SkillLifecycle
   instruction_usable?: boolean
   diagnostics?: SkillDiagnostic[]
+  // Marketplace browse metadata (all sources may leave these empty).
+  category?: string
+  tags?: string[]
+  downloads?: number
+  installs?: number
+  icon_url?: string
 }
 
 export interface SkillLayerGroup {

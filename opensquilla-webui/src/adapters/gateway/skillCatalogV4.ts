@@ -173,7 +173,7 @@ export function createV4SkillCatalog(rpc: RpcTransport): SkillCatalog {
       const params: SkillsSearchParams = {
         query,
         limit: options?.limit ?? 20,
-        source: options?.source || 'clawhub',
+        source: options?.source === null ? null : (options?.source || 'clawhub'),
       }
       const result = await rpc.request<SkillsSearchResult>(
         SKILLS_SEARCH_METHOD,

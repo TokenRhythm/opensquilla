@@ -192,6 +192,12 @@ class SkillMeta:
     origin_source: str = ""
     signature_status: str = ""
     content_hash: str = ""
+    # Marketplace listing fields.  Purely additive browse metadata surfaced by
+    # the aggregate market view; install/resolve paths never read them.
+    category: str = ""
+    downloads: int = 0
+    installs: int = 0
+    icon_url: str = ""
 
     @property
     def canonical_identity(self) -> str:

@@ -52,6 +52,23 @@ def _text(*values: object) -> str:
     return ""
 
 
+def _int(*values: object) -> int:
+    """Return the first usable non-negative count from alternate row fields."""
+    for value in values:
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value >= 0:
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = int(value.strip().replace(",", ""))
+            except ValueError:
+                continue
+            if parsed >= 0:
+                return parsed
+    return 0
+
+
 def _version(*values: object) -> str:
     """Return the first usable version from alternate registry fields."""
 
@@ -164,12 +181,17 @@ class SkillHubSource(ClawHubSource):
             license=_text(row.get("license"), row.get("licenseName"), row.get("spdx")),
             tags=[str(item) for item in row.get("tags", []) if isinstance(item, (str, int))]
             if isinstance(row.get("tags"), list)
-            else [],
+            else ([str(item) for item in row.get("labels", []) if isinstance(item, (str, int))]
+                  if isinstance(row.get("labels"), list) else []),
             canonical_identifier=slug,
             upstream_url=upstream,
             origin_source=origin,
             signature_status=signature,
             content_hash=content_hash,
+            category=_text(row.get("category"), row.get("categoryName")),
+            downloads=_int(row.get("downloads"), row.get("downloadCount")),
+            installs=_int(row.get("installs"), row.get("installCount")),
+            icon_url=_text(row.get("iconUrl"), row.get("icon"), row.get("avatarUrl")),
         )
 
     @staticmethod
