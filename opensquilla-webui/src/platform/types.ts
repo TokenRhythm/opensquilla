@@ -40,6 +40,8 @@ export interface DesktopGatewayConnection {
   profileFingerprint: string
   httpUrl: string | null
   wsUrl: string | null
+  /** Owned Gateway's actual Control UI mount; empty means root. Older shells omit it. */
+  controlUiBasePath?: string
   authToken?: string | null
   error: string | null
   sandboxUpgrade?: SandboxUpgradeReport | null

@@ -52,6 +52,7 @@ function normalizeDesktopGatewayConnection(payload: unknown): DesktopGatewayConn
       : '',
     httpUrl: typeof raw.httpUrl === 'string' ? raw.httpUrl : null,
     wsUrl: typeof raw.wsUrl === 'string' ? raw.wsUrl : null,
+    ...(typeof raw.controlUiBasePath === 'string' ? { controlUiBasePath: raw.controlUiBasePath } : {}),
     authToken: typeof raw.authToken === 'string' ? raw.authToken : null,
     error: typeof raw.error === 'string' ? raw.error : null,
     ...(sandboxUpgrade ? { sandboxUpgrade } : {}),

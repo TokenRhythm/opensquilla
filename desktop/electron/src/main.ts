@@ -270,6 +270,7 @@ interface DesktopGatewayConnection {
   instanceId: string | null
   profileFingerprint: string
   httpUrl: string | null
+  controlUiBasePath?: string
   wsUrl: string | null
   authToken: string | null
   error: string | null
@@ -976,6 +977,10 @@ function desktopGatewayConnectionSnapshot(): DesktopGatewayConnection {
     instanceId: gatewayConnectionInstanceId,
     profileFingerprint: desktopProfileFingerprint(activeDesktopProfile().home),
     httpUrl: gatewayState.url || null,
+    // Only an owned launch supplies an authoritative Control UI mount. An
+    // external Gateway may use a different profile; leave legacy fallback to
+    // the renderer instead of publishing this profile's stale mount prefix.
+    ...(gatewayState.owned ? { controlUiBasePath: ownedGatewayControlUiBasePath } : {}),
     wsUrl: ready ? gatewayState.url.replace(/^http/i, 'ws') + '/ws' : null,
     authToken: authToken ? desktopGatewayAuthToken(authToken) : null,
     error: gatewayState.error || null,

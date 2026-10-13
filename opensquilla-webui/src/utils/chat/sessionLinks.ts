@@ -17,7 +17,9 @@ export async function currentSessionLink(
   if (!['http:', 'https:', 'ws:', 'wss:'].includes(url.protocol)) {
     throw new Error('Gateway URL is unavailable')
   }
-  // Desktop configures its Gateway Control UI at /control. Its local
-  // opensquilla-app://desktop renderer instead uses / as the router base.
-  return sessionGatewayUrl(sessionKey, endpoint, '/control')
+  // The private renderer's router base is independent of the Gateway mount.
+  // Keep /control for older shells; an explicitly empty mount means root,
+  // which the URL helper accepts as '/' without consulting the renderer DOM.
+  const basePath = connection.controlUiBasePath ?? '/control'
+  return sessionGatewayUrl(sessionKey, endpoint, basePath === '' ? '/' : basePath)
 }

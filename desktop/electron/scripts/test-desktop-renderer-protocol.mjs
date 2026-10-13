@@ -162,6 +162,38 @@ const images = new Map(await Promise.all(['QRcode.png', 'opensquilla-mark.png'].
 ])))
 const mainSource = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8')
 const parsed = ts.createSourceFile('main.ts', mainSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+const snapshot = parsed.statements.find(node => ts.isFunctionDeclaration(node)
+  && node.name?.text === 'desktopGatewayConnectionSnapshot')
+assert.ok(snapshot, 'test the production IPC descriptor consumed by session link copying')
+const compiledSnapshot = ts.transpileModule(`${snapshot.getText(parsed)}\nglobalThis.snapshot = desktopGatewayConnectionSnapshot`, {
+  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+}).outputText
+for (const [config, expectedBasePath] of [
+  [null, '/control'],
+  ['[control_ui]\nbase_path = "/"', ''],
+  ['[control_ui]\nbase_path = "/custom/ui/"', '/custom/ui'],
+]) {
+  const gatewayState = { owned: true, status: 'ready', url: 'http://127.0.0.1:8765' }
+  const context = vm.createContext({
+    gatewayState,
+    ownedGatewayControlUiBasePath: desktopControlUiBasePath(config),
+    gatewayConnectionRevision: 1,
+    gatewayConnectionInstanceId: 'instance-a',
+    gatewayProcess: null,
+    desktopGatewayConnectionSuspendedForExit: () => false,
+    activeDesktopProfile: () => ({ home: 'synthetic-profile' }),
+    desktopProfileFingerprint: () => 'synthetic-fingerprint',
+  })
+  vm.runInContext(compiledSnapshot, context)
+  const descriptor = context.snapshot()
+  assert.equal(descriptor.controlUiBasePath, expectedBasePath)
+  assert.equal(descriptor.httpUrl, gatewayState.url, 'Control UI prefix must not alter API origin')
+  assert.equal(descriptor.wsUrl, `${gatewayState.url.replace(/^http/, 'ws')}/ws`)
+  assert.equal(descriptor.schemaVersion, 1, 'the optional field remains compatible with older renderers')
+  gatewayState.owned = false
+  assert.equal(Object.hasOwn(context.snapshot(), 'controlUiBasePath'), false,
+    'an external Gateway must not inherit a previous owned profile mount prefix')
+}
 const handler = parsed.statements.find(node => ts.isFunctionDeclaration(node)
   && node.name?.text === 'handleDesktopRendererRequest')
 assert.ok(handler, 'test the production protocol handler, including its selected mount prefix')
