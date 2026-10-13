@@ -650,6 +650,8 @@ export interface UseChatHistoryOptions {
   /** The bootstrap owner supplies the one lease shared with live subscription. */
   sessionReadLeaseReader: SessionReadLeaseReader
   sessionKey: Ref<string>
+  /** Delivery authority, not the transient socket connection state. */
+  deliveryIdentity?: Readonly<Ref<string | null>>
   messages: Ref<ChatMessage[]>
   threadRef?: Ref<HTMLElement | null>
   lastHeaderRole: Ref<string>
@@ -663,6 +665,10 @@ export interface UseChatHistoryOptions {
   stripTimePrefix: (text: string) => string
   scrollToBottom: () => void
   onTerminalTask?: (outcome: ChatTurnOutcome) => void
+  /** A current canonical page has been installed; display-only previews may retire. */
+  onHistoryInstalled?: (key: string) => void
+  /** Display-only window size; does not restore pagination or replay cursors. */
+  initialWindowSize?: () => number
 }
 
 export interface ChatHistoryState {
@@ -1098,6 +1104,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     if (!options.sessionKey.value) return
     const key = options.sessionKey.value
     const lease = options.sessionReadLeaseReader.current()
+    const requestIdentity = options.deliveryIdentity?.value
     const requestScrollEpoch = options.scrollEpoch?.value ?? 0
     const crossedSession = resetForSession(key)
     const historyStateBeforeLoad = historyState.value
@@ -1127,6 +1134,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     }
     const isCurrentRequest = () => (
       key === options.sessionKey.value
+      // Initial durable identity hashing runs alongside the authorized
+      // transport. Its null -> ready completion does not retire this lease.
+      // Once a proven identity was captured, require that exact authority.
+      && (requestIdentity == null || options.deliveryIdentity?.value === requestIdentity)
       && options.sessionReadLeaseReader.current() === lease
       && requestSeq === historyRequestSeq
       && requestScrollEpoch === (options.scrollEpoch?.value ?? 0)
@@ -1149,9 +1160,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         }
         return { ok: false, cancelled: true }
       }
-      const limit = !params.prepend && options.messages.value.length > 50
-        ? Math.min(200, options.messages.value.length)
-        : 50
+      const windowSize = Math.max(options.messages.value.length, options.initialWindowSize?.() ?? 0)
+      const limit = !params.prepend && Number.isFinite(windowSize) && windowSize > 50
+        ? Math.min(200, Math.floor(windowSize)) : 50
       const data = await callHistory(
         lease,
         params.before != null
@@ -1394,6 +1405,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           options.lastHeaderRole.value = ''
           options.lastHeaderDay.value = ''
         }
+        if (canonicalAvailable !== false || confirmedEmptyDraft) options.onHistoryInstalled?.(key)
         acknowledgePreservedLocalTail()
         flushPendingHistorySync()
         return { ok: true }
@@ -1442,6 +1454,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
       options.lastHeaderRole.value = ''
       options.lastHeaderDay.value = ''
+      if (!params.prepend && canonicalAvailable !== false) options.onHistoryInstalled?.(key)
 
       // The list virtualizer owns prepend/reflow geometry. History only
       // preserves the user's live-edge intent across its async data commit.

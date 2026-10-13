@@ -38,11 +38,13 @@ function rawUser(bytes = 32 * 1024): ChatRenderedMessage {
   return { ...value, contentRef: { ...value.contentRef!, view: 'raw', byteLength: bytes } }
 }
 
-async function mountList(messages: ChatRenderedMessage[] = [assistant()], renderMarkdown = (value: string) => value) {
+async function mountList(messages: ChatRenderedMessage[] = [assistant()], renderMarkdown = (value: string) => value,
+  contentCacheScope?: string | null, trailing?: () => ReturnType<typeof h>) {
   const host = document.createElement('div')
   document.body.appendChild(host)
   const props = reactive({
-    messages, sessionKey, scrollEpoch: 0, shareMode: false,
+    messages, sessionKey, scrollEpoch: 0, shareMode: false, contentCacheScope, contentCacheGeneration: 0,
+    previewReadOnly: false,
     selectedMessageIds: new Set<string>(), stripTimePrefix: (value: string) => value,
     renderMarkdown, fmtTok: (value: number) => String(value),
     subagentSummary: (value: string) => value, subagentBody: (value: string) => value,
@@ -50,7 +52,7 @@ async function mountList(messages: ChatRenderedMessage[] = [assistant()], render
     toolGroupStatusText: () => '', toolStatusText: () => '', toolSecondaryText: () => '',
     copyMessage: async () => true, downloadAttachment: async () => true,
   })
-  const app = createApp({ setup: () => () => h(ChatMessageList, props) })
+  const app = createApp({ setup: () => () => h(ChatMessageList, props, trailing ? { trailing } : undefined) })
   app.use(i18n)
   app.mount(host)
   apps.push(app)
@@ -81,6 +83,129 @@ afterEach(() => {
 })
 
 describe('ChatMessageList inline history content', () => {
+  it('makes cached historical rows inert without disabling fresh live controls in the trailing slot', async () => {
+    const approve = vi.fn()
+    const { host, props } = await mountList([assistant({ previewComplete: true })], value => value,
+      'gateway-one', () => h('button', { 'data-testid': 'live-approval', onClick: approve }, 'Approve'))
+    props.previewReadOnly = true
+    await nextTick()
+    expect(host.querySelector('[data-testid="chat-message-row"]')?.hasAttribute('inert')).toBe(true)
+    const approval = host.querySelector<HTMLButtonElement>('[data-testid="live-approval"]')!
+    expect(approval).not.toBeNull()
+    expect(approval.closest('[inert]')).toBeNull()
+    approval.click()
+    expect(approve).toHaveBeenCalledOnce()
+    props.previewReadOnly = false
+    await nextTick()
+    expect(host.querySelector('[data-testid="chat-message-row"]')?.hasAttribute('inert')).toBe(false)
+  })
+
+  it('restores a completed revision immediately on A/B/A without another content read', async () => {
+    const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay')
+      .mockImplementation(async ref => `Full body ${ref.sessionKey}`)
+    const rowA = assistant({ previewComplete: false })
+    const rowB = assistant({ previewComplete: false,
+      contentRef: { ...rowA.contentRef!, sessionKey: 'session-b' } })
+    const { host, props } = await mountList([rowA], value => value, 'gateway-one')
+    await settleHydration()
+    props.messages = [rowB]
+    props.sessionKey = 'session-b'
+    props.scrollEpoch++
+    await settleHydration()
+    props.messages = [rowA]
+    props.sessionKey = sessionKey
+    props.scrollEpoch++
+    await nextTick()
+    expect(host.querySelector('[data-testid="assistant-body"]')?.textContent).toBe(`Full body ${sessionKey}`)
+    expect(host.querySelector('[data-testid="chat-history-content-hydration"]')).toBeNull()
+    await settleHydration()
+    expect(read).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['scope', 'scope-removed', 'generation', 'same-session-reset'] as const)(
+    'invalidates completed bodies on %s and clears the old body before the new read', async change => {
+      const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay')
+        .mockResolvedValueOnce('Old completed body').mockImplementation(() => new Promise(() => {}))
+      const { host, props } = await mountList([assistant()], value => value, 'gateway-one')
+      await settleHydration()
+      if (change === 'scope') props.contentCacheScope = 'gateway-two'
+      if (change === 'scope-removed') props.contentCacheScope = null
+      if (change === 'generation') props.contentCacheGeneration++
+      if (change === 'same-session-reset') props.scrollEpoch++
+      await settleHydration()
+      expect(host.textContent).not.toContain('Old completed body')
+      expect(host.querySelector('[data-testid="assistant-body"]')?.textContent).toBe('Preview')
+      expect(read).toHaveBeenCalledTimes(2)
+    },
+  )
+
+  it('fences an old in-flight body when delivery scope changes with identical session ids', async () => {
+    let resolveOld!: (body: string) => void
+    const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay')
+      .mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve }))
+      .mockResolvedValueOnce('New authorized body')
+    const { host, props } = await mountList([assistant()], value => value, 'gateway-one')
+    await settleHydration()
+    const previousSignal = read.mock.calls[0]![1]!.signal!
+    props.contentCacheScope = 'gateway-two'
+    await settleHydration()
+    resolveOld('Body from old credentials')
+    await settleHydration()
+    expect(previousSignal.aborted).toBe(true)
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(host.querySelector('[data-testid="assistant-body"]')?.textContent).toBe('New authorized body')
+    expect(host.textContent).not.toContain('Body from old credentials')
+  })
+
+  it('does not retain a body with no stable revision across session switches', async () => {
+    const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay').mockResolvedValue('Full body')
+    const row = assistant({ contentRef: { ...assistant().contentRef!, revision: undefined } })
+    const { props } = await mountList([row], value => value, 'gateway-one')
+    await settleHydration()
+    props.sessionKey = 'session-b'
+    props.messages = []
+    await settleHydration()
+    props.sessionKey = sessionKey
+    props.messages = [row]
+    await settleHydration()
+    expect(read).toHaveBeenCalledTimes(2)
+  })
+
+  it('bounds retained content to the six most recently visited sessions', async () => {
+    const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay').mockResolvedValue('Full body')
+    const { props } = await mountList([assistant()], value => value, 'gateway-one')
+    await settleHydration()
+    for (let index = 1; index <= 6; index++) {
+      props.sessionKey = `session-${index}`
+      props.messages = [assistant({ contentRef: { ...assistant().contentRef!, sessionKey: props.sessionKey } })]
+      props.scrollEpoch++
+      await settleHydration()
+    }
+    expect(read).toHaveBeenCalledTimes(7)
+    props.sessionKey = sessionKey
+    props.messages = [assistant()]
+    props.scrollEpoch++
+    await settleHydration()
+    expect(read).toHaveBeenCalledTimes(8)
+  })
+
+  it('applies one byte budget across inactive sessions while keeping the mounted body intact', async () => {
+    const body = 'x'.repeat(9 * 1024 * 1024)
+    const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay').mockResolvedValue(body)
+    const rowA = assistant()
+    const { host, props } = await mountList([rowA], value => value, 'gateway-one')
+    await settleHydration()
+    props.sessionKey = 'session-b'
+    props.messages = [assistant({ contentRef: { ...rowA.contentRef!, sessionKey: 'session-b' } })]
+    await settleHydration()
+    expect(host.querySelector('[data-testid="assistant-body"]')?.textContent?.length).toBe(body.length)
+    expect(host.querySelector('[data-testid="chat-history-content-hydration"]')).toBeNull()
+    props.sessionKey = sessionKey
+    props.messages = [rowA]
+    await settleHydration()
+    expect(read).toHaveBeenCalledTimes(3)
+  })
+
   it('reads the complete 8 MiB single-line answer through the real Markdown renderer', async () => {
     const body = '0123456789abcdef'.repeat(512 * 1024)
     const preview = body.slice(0, 4096)

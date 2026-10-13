@@ -38,6 +38,7 @@
         :data-chat-message-key="entry.key"
         :data-chat-message-index="entry.index"
         :data-chat-message-forced="forcedIndexes.has(entry.index) ? 'true' : 'false'"
+        :inert="previewReadOnly || undefined"
         data-testid="chat-message-row"
       >
         <div
@@ -235,6 +236,8 @@ import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 
 const props = defineProps<{
   messages: ChatRenderedMessage[]
+  /** Cached history cannot authorize actions; fresh live controls stay outside these rows. */
+  previewReadOnly?: boolean
   loadHistoryDetails?: (message: ChatRenderedMessage) => Promise<void>
   shareMode: boolean
   selectedMessageIds: Set<string>
@@ -278,6 +281,10 @@ const props = defineProps<{
   layoutHeader?: HTMLElement | null
   /** Session/render epoch used to invalidate deferred scroll corrections. */
   scrollEpoch?: number
+  /** Authorized delivery identity; only this scope may reuse completed bodies. */
+  contentCacheScope?: string | null
+  /** Explicit invalidation for reset, deletion, or changed history generation. */
+  contentCacheGeneration?: number
   /** Preview/export paths can force a complete, canonical DOM. */
   virtualizationDisabled?: boolean
   /** Current search match or another externally owned focus target. */
@@ -437,6 +444,8 @@ let synchronizeScrollOffset: (() => void) | null = null
 const contentRangeCache = inject(HISTORY_CONTENT_READER_KEY, () => new ContentRangeCache())()
 const hydratedContent = reactive(new Map<string, string>())
 const hydratedContentBytes = new Map<string, number>()
+const hydratedContentOwners = new Map<string, { sessionKey: string; reusable: boolean }>()
+const retainedContentSessions = new Map<string, true>()
 let hydratedContentTotalBytes = 0
 const hydrationLoading = reactive(new Set<string>())
 const hydrationErrors = reactive(new Map<string, string>())
@@ -447,6 +456,8 @@ const hydrationUnavailable = reactive(new Set<string>())
 let automaticHydrationOwner: { generation: number; key?: string } | undefined
 let contentHydrationDisposed = false
 const MAX_HYDRATED_CONTENT_BYTES = 16 * 1024 * 1024
+const MAX_HYDRATED_CONTENT_ENTRIES = 256
+const MAX_RETAINED_CONTENT_SESSIONS = 6
 
 function contentHydrationKey(message: ChatRenderedMessage, _index: number): string {
   const ref = message.contentRef
@@ -454,11 +465,11 @@ function contentHydrationKey(message: ChatRenderedMessage, _index: number): stri
     // Message ids are only unique inside a session. Include the complete
     // content identity so a reused ChatMessageList cannot install a late
     // response from the previous session or revision.
-    return [
+    return JSON.stringify([
       'content', ref.sessionKey, ref.sessionId, ref.messageId,
       ref.source ?? '', ref.view ?? 'raw', String(ref.byteLength ?? ''),
       ref.revision ?? '', ref.sha256 ?? '', message.contentRevision ?? '',
-    ].join('|')
+    ])
   }
   return chatMessageKey(message, _index)
 }
@@ -535,7 +546,7 @@ function hydrateTimelineText(message: ChatRenderedMessage, text: string): ChatRe
     ? { ...item, html: props.renderMarkdown(item.rawText ?? '') } : item)
 }
 
-function rememberHydratedContent(key: string, text: string): void {
+function rememberHydratedContent(key: string, text: string, message: ChatRenderedMessage): void {
   const previous = hydratedContentBytes.get(key)
   if (previous !== undefined) hydratedContentTotalBytes -= previous
   hydratedContent.delete(key)
@@ -545,8 +556,38 @@ function rememberHydratedContent(key: string, text: string): void {
   hydratedContent.set(key, text)
   hydratedContentBytes.set(key, size)
   hydratedContentTotalBytes += size
+  hydratedContentOwners.set(key, {
+    sessionKey: message.contentRef?.sessionKey ?? props.sessionKey ?? '',
+    // An id/length alone does not prove that the body is still the same after
+    // a return to this session. Old servers without revisions keep local-only
+    // hydration, rather than presenting a potentially changed body as cached.
+    reusable: Boolean(message.contentRef?.revision || message.contentRef?.sha256 || message.contentRevision),
+  })
+  touchRetainedContentSession(message.contentRef?.sessionKey ?? props.sessionKey ?? '')
 
   trimHydratedContent()
+}
+
+function forgetHydratedContent(key: string): void {
+  hydratedContentTotalBytes -= hydratedContentBytes.get(key) ?? 0
+  hydratedContent.delete(key)
+  hydratedContentBytes.delete(key)
+  hydratedContentOwners.delete(key)
+  hydrationAttempted.delete(key)
+}
+
+function touchRetainedContentSession(session: string): void {
+  if (!session) return
+  retainedContentSessions.delete(session)
+  retainedContentSessions.set(session, true)
+  for (const candidate of retainedContentSessions.keys()) {
+    if (retainedContentSessions.size <= MAX_RETAINED_CONTENT_SESSIONS) break
+    if (candidate === props.sessionKey) continue
+    retainedContentSessions.delete(candidate)
+    for (const [key, owner] of hydratedContentOwners) {
+      if (owner.sessionKey === candidate) forgetHydratedContent(key)
+    }
+  }
 }
 
 function mountedContentKeys(): Set<string> {
@@ -559,15 +600,12 @@ function mountedContentKeys(): Set<string> {
 function trimHydratedContent(): void {
   const mounted = mountedContentKeys()
   for (const key of hydratedContent.keys()) {
-    if (hydratedContentTotalBytes <= MAX_HYDRATED_CONTENT_BYTES) break
+    if (hydratedContentTotalBytes <= MAX_HYDRATED_CONTENT_BYTES
+      && hydratedContent.size <= MAX_HYDRATED_CONTENT_ENTRIES) break
     // A cache budget must not replace already displayed full text with a
     // preview. Mounted rows own their bodies until they leave the list.
     if (mounted.has(key)) continue
-    const evicted = hydratedContentBytes.get(key) ?? 0
-    hydratedContent.delete(key)
-    hydratedContentBytes.delete(key)
-    hydrationAttempted.delete(key)
-    hydratedContentTotalBytes -= evicted
+    forgetHydratedContent(key)
   }
 }
 
@@ -599,7 +637,7 @@ async function hydrateContent(message: ChatRenderedMessage, index: number): Prom
       ? await contentRangeCache.readDisplay(ref, { signal: controller.signal })
       : await contentRangeCache.readText(ref, { signal: controller.signal })
     if (generation === contentHydrationGeneration && !controller.signal.aborted) {
-      rememberHydratedContent(key, text)
+      rememberHydratedContent(key, text, message)
       emit('contentHydrated', message, text)
     }
   } catch (error) {
@@ -642,17 +680,27 @@ async function hydrateMountedContent(): Promise<void> {
   }
 }
 
-function resetContentHydrationState(): void {
+function resetContentHydrationState(preserveCompletedBodies = false, invalidatedSession?: string): void {
   contentHydrationGeneration += 1
   for (const controller of hydrationControllers.values()) controller.abort()
   hydrationControllers.clear()
   hydrationLoading.clear()
   hydrationErrors.clear()
-  hydratedContent.clear()
   hydrationAttempted.clear()
   hydrationUnavailable.clear()
-  hydratedContentBytes.clear()
-  hydratedContentTotalBytes = 0
+  if (preserveCompletedBodies) {
+    for (const [key, owner] of hydratedContentOwners) {
+      if (!owner.reusable || owner.sessionKey === invalidatedSession) forgetHydratedContent(key)
+    }
+    touchRetainedContentSession(props.sessionKey ?? '')
+    trimHydratedContent()
+  } else {
+    hydratedContent.clear()
+    hydratedContentBytes.clear()
+    hydratedContentOwners.clear()
+    retainedContentSessions.clear()
+    hydratedContentTotalBytes = 0
+  }
   contentRangeCache.clear()
 }
 
@@ -846,7 +894,8 @@ const variableLayout = computed(() => {
 })
 const renderEntries = computed(() => variableLayout.value.entries)
 
-watch(() => [props.shareMode, props.sessionKey, props.scrollEpoch, ...renderEntries.value.map(({ index }) => {
+watch(() => [props.shareMode, props.sessionKey, props.scrollEpoch, props.contentCacheScope,
+  props.contentCacheGeneration, ...renderEntries.value.map(({ index }) => {
   const message = props.messages[index]
   return message ? [contentHydrationKey(message, index), message.previewComplete, canHydrateContent(message)] : null
 })], () => {
@@ -1167,13 +1216,21 @@ defineExpose<ChatMessageListVirtualizer>({
   isVirtualized: () => virtualizationEnabled.value,
 })
 
-watch([() => props.sessionKey, () => props.scrollEpoch], (current, previous) => {
-  if (current[0] !== previous[0] || current[1] !== previous[1]) resetContentHydrationState()
+watch([
+  () => props.sessionKey, () => props.scrollEpoch,
+  () => props.contentCacheScope, () => props.contentCacheGeneration,
+], (current, previous) => {
+  const reusableScope = Boolean(current[2]) && current[2] === previous[2] && current[3] === previous[3]
+  const sameSessionReset = current[0] === previous[0] && current[1] !== previous[1]
+  resetContentHydrationState(reusableScope, sameSessionReset ? current[0] : undefined)
   cancelScroll()
   ensuredMessageKeys.value = new Set()
   focusedMessageKey.value = null
   virtualizer.value.measure()
-}, { flush: 'sync' })
+// Batch the session and scroll-epoch prop changes from one parent render. A
+// synchronous per-prop watcher can otherwise mistake the second assignment
+// for a reset of the newly restored session and discard its cached bodies.
+}, { flush: 'pre' })
 watch(messageKeys, keys => {
   const retained = new Set(keys)
   ensuredMessageKeys.value = new Set([...ensuredMessageKeys.value].filter(key => retained.has(key)))

@@ -7,6 +7,50 @@ interface ExpansionState {
 const expandedByKey = new Map<string, ExpansionState>()
 const durationByKey = new Map<string, number>()
 let expansionVersion = 0
+const manualChoicesBySession = new Map<string, Map<string, ExpansionState>>()
+const MAX_RETAINED_SESSIONS = 6
+const MAX_MANUAL_CHOICES_PER_SESSION = 256
+let activeSessionKey = ''
+let activeScope: string | null = null
+
+function keyBelongsToSession(key: string, sessionKey: string): boolean {
+  try {
+    const identity: unknown = JSON.parse(key)
+    return Array.isArray(identity) && identity[0] === sessionKey
+  } catch {
+    return false
+  }
+}
+
+/** Preserve explicit reader choices, never elapsed time or automatic live state. */
+export function activateAssistantActivitySession(sessionKey: string, scope: string | null | undefined): void {
+  const nextScope = scope || null
+  if (nextScope === activeScope && sessionKey === activeSessionKey) return
+  if (nextScope !== activeScope || !nextScope) {
+    clearAssistantActivityExpansionState()
+  } else if (activeSessionKey) {
+    const choices = [...expandedByKey].filter(([key, state]) => state.manual
+      && keyBelongsToSession(key, activeSessionKey))
+      .sort((a, b) => a[1].version - b[1].version)
+      .slice(-MAX_MANUAL_CHOICES_PER_SESSION)
+    manualChoicesBySession.delete(activeSessionKey)
+    if (choices.length) manualChoicesBySession.set(activeSessionKey, new Map(choices))
+  }
+  expandedByKey.clear()
+  durationByKey.clear()
+  activeScope = nextScope
+  activeSessionKey = sessionKey
+  const choices = nextScope ? manualChoicesBySession.get(sessionKey) : undefined
+  // The active session is kept in the ordinary live map; the bounded cache
+  // contains only inactive sessions. Reading a session refreshes its LRU age.
+  manualChoicesBySession.delete(sessionKey)
+  if (choices) for (const [key, state] of choices) expandedByKey.set(key, state)
+  while (manualChoicesBySession.size >= MAX_RETAINED_SESSIONS) {
+    const oldest = manualChoicesBySession.keys().next().value
+    if (oldest === undefined) break
+    manualChoicesBySession.delete(oldest)
+  }
+}
 
 export function assistantActivityContinuityKey(sessionKey: string, turnKey: string): string {
   return turnKey ? JSON.stringify([sessionKey, 'assistant-activity-turn', turnKey]) : ''
@@ -78,8 +122,19 @@ export function writeAssistantActivityDuration(
   if (continuityKey) durationByKey.set(continuityKey, Math.floor(seconds))
 }
 
-export function clearAssistantActivityExpansionState(): void {
+export function clearAssistantActivityExpansionState(sessionKey?: string): void {
+  if (sessionKey !== undefined) {
+    manualChoicesBySession.delete(sessionKey)
+    for (const key of expandedByKey.keys()) {
+      if (keyBelongsToSession(key, sessionKey)) expandedByKey.delete(key)
+    }
+    for (const key of durationByKey.keys()) {
+      if (keyBelongsToSession(key, sessionKey)) durationByKey.delete(key)
+    }
+    return
+  }
   expandedByKey.clear()
   durationByKey.clear()
+  manualChoicesBySession.clear()
   expansionVersion = 0
 }

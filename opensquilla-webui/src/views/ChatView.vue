@@ -191,6 +191,9 @@
           :layout-header="threadHeaderRef"
           :messages="forkTransition?.previewMessages || visibleRenderedMessages"
           :session-key="forkTransition?.parentKey || sessionKey"
+          :content-cache-scope="deliveryIdentity"
+          :content-cache-generation="sessionViewCache.generation.value"
+          :preview-read-only="sessionViewCache.showingPreview.value"
           :scroll-container="threadRef"
           :virtualization-disabled="Boolean(forkTransition)"
           :artifact-navigation-items="sessionArtifacts"
@@ -987,6 +990,7 @@ import {
   optionalSessionReadOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
+import { useChatSessionViewCache } from '@/composables/chat/useChatSessionViewCache'
 import {
   useChatSessionSubscription,
 } from '@/composables/chat/useChatSessionSubscription'
@@ -1178,7 +1182,8 @@ import {
   getChatWheelDirection,
   resolveChatWheelOwnership,
 } from '@/utils/chat/chatScrollOwnership'
-import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
+import { activateAssistantActivitySession, clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
+import { LOCAL_SESSIONS_DELETED_EVENT, localSessionsDeletedDetail } from '@/utils/sessionSync'
 import { stripBackgroundProcessNoticeTimeline } from '@/utils/chat/backgroundProcessNotice'
 import {
   resolveChatHistoryRecoveryState,
@@ -2483,7 +2488,14 @@ const {
   replanActive,
 } = chatPlans
 
-const renderSourceMessages = computed(() => messages.value)
+const sessionViewCache = useChatSessionViewCache({ sessionKey, deliveryIdentity, messages })
+watch(sessionViewCache.generation, () => clearAssistantActivityExpansionState(), { flush: 'sync' })
+function invalidateDeletedSessionViews(event: Event) {
+  for (const key of localSessionsDeletedDetail(event)?.keys ?? []) sessionViewCache.invalidate(key)
+}
+window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, invalidateDeletedSessionViews)
+onScopeDispose(() => window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, invalidateDeletedSessionViews))
+const renderSourceMessages = sessionViewCache.messages
 const chatRenderedMessages = useChatRenderedMessages({
   messages: renderSourceMessages,
   interruptState,
@@ -2536,6 +2548,7 @@ const preserveHistoryLiveTail = computed(() =>
 const chatHistory = useChatHistory({
   sessionReadLeaseReader: sessionReadLifecycle,
   sessionKey,
+  deliveryIdentity,
   messages,
   threadRef,
   lastHeaderRole,
@@ -2546,6 +2559,8 @@ const chatHistory = useChatHistory({
   canApplyViewportCorrection: () => !historyNavigationScrollLock.locked,
   stripTimePrefix,
   scrollToBottom,
+  onHistoryInstalled: sessionViewCache.historyInstalled,
+  initialWindowSize: () => sessionViewCache.showingPreview.value ? sessionViewCache.messages.value.length : 0,
   onTerminalTask: outcome => {
     const taskId = outcome.taskId || ''
     if (!taskId) return
@@ -2581,6 +2596,9 @@ const {
   markSessionMissing,
   cleanup: cleanupHistory,
 } = chatHistory
+watch(() => historyState.value.sessionMissing, missing => {
+  if (missing) sessionViewCache.invalidate(sessionKey.value)
+}, { flush: 'sync' })
 
 function cancelInitialSessionPin() {
   if (initialSessionPinFrame !== null) {
@@ -2787,7 +2805,10 @@ const chatSessionSubscription = useChatSessionSubscription({
   loadHistory,
   resetStreamIdleTimer,
   resetStreamLiveTurnState,
-  onStreamGenerationReset: chatCompaction.handleGatewayRestart,
+  onStreamGenerationReset: () => {
+    sessionViewCache.invalidate()
+    chatCompaction.handleGatewayRestart()
+  },
   onLiveSnapshot: snapshot => restoreLiveTurnSnapshot(snapshot),
   onReadStarted: () => {
     conversationSessionRuntime.events.invalidateConsumption(sessionKey.value)
@@ -2840,6 +2861,7 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   onSessionMissing: markSessionMissing,
   onSnapshot: snapshot => {
+    sessionViewCache.observeEpoch(snapshot.sessionKey, snapshot.epoch)
     if (snapshot.sessionKey === sessionKey.value) {
       nativeAttachmentSession.value = typeof snapshot.epoch === 'number' && Number.isSafeInteger(snapshot.epoch)
         && snapshot.epoch >= 0 ? { key: snapshot.sessionKey, epoch: snapshot.epoch } : null
@@ -3486,6 +3508,7 @@ const chatSlashCommands = useChatSlashCommands({
     goToDraft({ agentId: 'main' })
   },
   resetCurrentSession: () => {
+    sessionViewCache.invalidate(sessionKey.value)
     resetCurrentSessionAfterSlash()
     resetSessionArtifacts()
     chatPlans.reset()
@@ -4391,7 +4414,10 @@ const chatRpcSubscriptions = useChatRpcSubscriptions({
         message.payload,
       )
     }
-    return rpcEventHandlers.consumeConversationEvent(message)
+    const previousEpoch = currentEpoch.value
+    const result = rpcEventHandlers.consumeConversationEvent(message)
+    if (currentEpoch.value !== previousEpoch) sessionViewCache.observeEpoch(sessionKey.value, currentEpoch.value)
+    return result
   },
   onRecoveryRequired: recoverCurrentSession,
   onConnectionState: rpcEventHandlers.handlers.onConnectionState,
@@ -4424,8 +4450,10 @@ function recoverCurrentSession(scope?: { readonly keys: readonly string[], reado
 // Session switches drop the previous session's stall tracking entirely.
 watch(sessionKey, () => {
   stallWatchdog.reset()
-  clearAssistantActivityExpansionState()
 })
+watch([sessionKey, deliveryIdentity], ([key, scope]) => {
+  activateAssistantActivitySession(key, scope)
+}, { flush: 'sync', immediate: true })
 
 // Keep event delivery fenced to the visible logical session. The hub swaps
 // only its handle; the shared WebSocket and diagnostic listeners stay alive.

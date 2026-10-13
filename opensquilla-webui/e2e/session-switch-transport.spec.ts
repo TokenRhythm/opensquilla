@@ -171,6 +171,93 @@ async function preparePage(page: Page) {
   }))
 }
 
+test('returning to a visited session keeps history visible while its real bootstrap is pending', async ({ page }) => {
+  await preparePage(page)
+  const sockets: WebSocketRoute[] = []
+  let holdA = false
+  let aText = 'Known A history'
+  const heldHistory: HeldRequest[] = []
+  await page.routeWebSocket(/\/ws$/, socket => {
+    sockets.push(socket)
+    socket.send(eventFrame('connect.challenge', {}))
+    socket.onMessage(raw => {
+      const frame = JSON.parse(String(raw)) as RpcRequest
+      if (frame.type === 'ping') { socket.send(JSON.stringify({ type: 'pong' })); return }
+      if (frame.type !== 'req') return
+      const method = String(frame.method || '')
+      const key = String(frame.params?.key || frame.params?.sessionKey || '')
+      if (method === 'connect') {
+        socket.send(helloOkResponse({
+          server: { version: 'e2e', conn_id: 'warm-switch-conn' },
+          features: { methods: ['sessions.messages.subscribe', 'sessions.messages.unsubscribe',
+            'sessions.messages.snapshot', 'sessions.messages.hydrate', 'workspaces.list', 'artifacts.list'], events: [] },
+          auth: { principal: { isOwner: true, authState: 'authenticated' },
+            runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' } },
+        }))
+        return
+      }
+      if (method === 'sessions.list') {
+        socket.send(response(frame.id, { sessions: [
+          session(SESSION_A, 'Warm A', WORKSPACE_A, '/fixtures/workspace-a', 100),
+          session(SESSION_B, 'Warm B', WORKSPACE_B, '/fixtures/workspace-b', 200),
+        ], count: 2, ts: 1_800_000_000, has_more: false }))
+        return
+      }
+      if (method === 'chat.history') {
+        if (holdA && key === SESSION_A) { heldHistory.push({ frame, socket }); return }
+        socket.send(response(frame.id, chatHistoryPayload([{ role: 'assistant',
+          text: key === SESSION_A ? aText : 'Known B history',
+          message_id: key === SESSION_A ? 'known-a' : 'known-b', timestamp: '2026-10-13T00:00:00Z',
+        }])))
+        return
+      }
+      if (method === 'sessions.messages.subscribe') { socket.send(response(frame.id, subscriptionPayload(key))); return }
+      if (method === 'sessions.messages.snapshot') { socket.send(response(frame.id, snapshotPayload(key))); return }
+      if (method === 'sessions.messages.hydrate') {
+        socket.send(response(frame.id, sessionMessagesHydratePayload(key, subscriptionPayload(key)))); return
+      }
+      if (method === 'workspaces.list') {
+        socket.send(response(frame.id, { workspaces: [
+          workspace(WORKSPACE_A, 'Workspace A', '/fixtures/workspace-a'),
+          workspace(WORKSPACE_B, 'Workspace B', '/fixtures/workspace-b'),
+        ] })); return
+      }
+      if (method === 'artifacts.list') { socket.send(response(frame.id, { artifacts: [], has_more: false })); return }
+      socket.send(response(frame.id, basePayload(method)))
+    })
+  })
+  await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
+  await expect(page.getByText('Known A history', { exact: true })).toBeVisible()
+  const navigate = async (key: string) => {
+    await page.locator(`[data-session-key="${key}"] .sidebar-history-item`).click()
+    await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(key)
+  }
+  await navigate(SESSION_B)
+  await expect(page.getByText('Known B history', { exact: true })).toBeVisible()
+  holdA = true
+  await navigate(SESSION_A)
+  await expect.poll(() => heldHistory.length).toBeGreaterThan(0)
+  // Authoritative history has not replied. The known target, never B's rows,
+  // stays visible while the one ordinary subscription is re-established.
+  await expect(page.getByText('Known A history', { exact: true })).toBeVisible()
+  await expect(page.getByText('Known B history', { exact: true })).toHaveCount(0)
+  await expect(page.locator('[data-testid="chat-message-row"]').first()).toHaveAttribute('inert', '')
+  expect(sockets).toHaveLength(1)
+  aText = 'A completed while away'
+  holdA = false
+  // Commit the server's new history and release all pending reads. Bootstrap
+  // may retire an earlier read while its snapshot is being reconciled.
+  for (const request of heldHistory.splice(0)) {
+    request.socket.send(response(request.frame.id, chatHistoryPayload([
+      { role: 'assistant', text: aText, message_id: 'known-a', timestamp: '2026-10-13T00:00:00Z' },
+    ])))
+  }
+  await expect(page.getByText('A completed while away', { exact: true })).toBeVisible()
+  await expect(page.getByText('Known A history', { exact: true })).toHaveCount(0)
+  await expect(page.locator('[data-testid="chat-message-row"]').first()).not.toHaveAttribute('inert', '')
+  expect(sockets).toHaveLength(1)
+})
+
 test('workspace navigation keeps one transport while the target subscription recovers', async ({
   page,
 }) => {
@@ -336,6 +423,9 @@ test('workspace navigation keeps one transport while the target subscription rec
   ))).toBe(true)
   await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
 
+  // The live-recovery notice intentionally stays quiet for five seconds.
+  // Control that interval instead of racing the default five-second expect.
+  await page.clock.install()
   const workspaceBRow = page.locator(`[data-session-key="${SESSION_B}"]`)
   await expect(workspaceBRow).toBeVisible()
   await workspaceBRow.locator('.sidebar-history-item').click()
@@ -391,6 +481,8 @@ test('workspace navigation keeps one transport while the target subscription rec
   const liveRecovery = page.locator(
     '[data-testid="chat-session-recovery-status"][data-recovery-state="live-connecting"]',
   )
+  await expect(liveRecovery).toHaveCount(0)
+  await page.clock.fastForward(5_001)
   await expect(liveRecovery).toContainText(
     'Gateway connected. Restoring live updates for this session…',
   )
