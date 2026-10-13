@@ -19,7 +19,24 @@ const idleUpdateState: DesktopUpdateState = {
   fallbackUsed: false,
 }
 
-const TOPBAR_STATUSES = new Set(['available', 'downloading', 'downloaded', 'error'])
+/** Keep background preparation quiet; downloaded is the shell's verified-byte state. */
+export function desktopUpdateReady(value: DesktopUpdateState): boolean {
+  return value.status === 'downloaded'
+    && Boolean(value.latestVersion?.trim())
+    && !value.error && !value.errorCode
+    && value.installMode !== 'unsupported'
+    && (value.canInstall ?? value.installMode === 'native')
+}
+
+export function desktopUpdateEntryAvailable(value: DesktopUpdateState): boolean {
+  if (desktopUpdateReady(value)) return true
+  // Older/manual-only shells still need a route to initiate download or reveal
+  // their installer. Never infer this capability from temporary update status.
+  return value.canAutoDownload !== true
+    && Boolean(value.latestVersion?.trim())
+    && !value.error && !value.errorCode
+    && (value.status === 'available' || value.status === 'downloaded')
+}
 
 const state = ref<DesktopUpdateState>({ ...idleUpdateState })
 const ready = ref(false)
@@ -27,9 +44,25 @@ const loading = ref(false)
 const actionBusy = ref(false)
 
 let initialized = false
+const visibilityNow = ref(Date.now())
+let snoozeTimer: ReturnType<typeof setTimeout> | undefined
+
+function refreshSnoozeDeadline() {
+  if (snoozeTimer !== undefined) clearTimeout(snoozeTimer)
+  snoozeTimer = undefined
+  visibilityNow.value = Date.now()
+  const expiresAt = Date.parse(state.value.snoozedUntil || '')
+  if (Number.isFinite(expiresAt) && expiresAt > visibilityNow.value) {
+    // A downloaded native update emits no further checks. Wake the existing
+    // reminder at its deadline rather than waiting for an unrelated state event.
+    snoozeTimer = setTimeout(refreshSnoozeDeadline,
+      Math.min(expiresAt - visibilityNow.value, 2_147_483_647))
+  }
+}
 
 function updateState(next: DesktopUpdateState) {
   state.value = { ...idleUpdateState, ...next }
+  refreshSnoozeDeadline()
   ready.value = true
 }
 
@@ -40,7 +73,7 @@ function errorMessage(err: unknown): string {
 function snoozeActive(value: DesktopUpdateState): boolean {
   if (!value.snoozedUntil) return false
   const expiresAt = Date.parse(value.snoozedUntil)
-  return Number.isFinite(expiresAt) && expiresAt > Date.now()
+  return Number.isFinite(expiresAt) && expiresAt > visibilityNow.value
 }
 
 function updateErrorTranslationKey(code: DesktopUpdateErrorCode): string {
@@ -113,11 +146,11 @@ export function useDesktopUpdate() {
     platform.capabilities.isDesktop
     && state.value.canCheck
   ))
+  const snoozed = computed(() => snoozeActive(state.value))
   const visible = computed(() =>
     isManagedDesktopUpdate.value &&
-    (TOPBAR_STATUSES.has(state.value.status)
-      || (state.value.status === 'applying' && state.value.installMode === 'manual')) &&
-    !snoozeActive(state.value),
+    desktopUpdateEntryAvailable(state.value) &&
+    !snoozed.value,
   )
   const latestVersion = computed(() => state.value.latestVersion || state.value.currentVersion || '')
   const localizedError = computed(() => {
@@ -134,6 +167,7 @@ export function useDesktopUpdate() {
     loading,
     actionBusy,
     visible,
+    snoozed,
     latestVersion,
     localizedError,
     isNativeDesktopUpdate,

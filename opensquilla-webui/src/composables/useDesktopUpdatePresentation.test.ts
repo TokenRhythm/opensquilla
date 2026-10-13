@@ -104,13 +104,13 @@ describe('useDesktopUpdatePresentation', () => {
     state.value = { ...state.value, canInstall: true }
     await nextTick()
     expect(presentation.canInstall.value).toBe(true)
-    expect(presentation.description.value).toContain('Quit and install')
+    expect(presentation.description.value).toContain('may interrupt running tasks')
 
     state.value = { ...state.value, status: 'applying', canInstall: false }
     await nextTick()
     expect(presentation.busy.value).toBe(true)
-    expect(presentation.summary.value).toBe('Closing background services')
-    expect(presentation.description.value).toContain('installer will open when they have stopped')
+    expect(presentation.summary.value).toBe('Preparing installation')
+    expect(presentation.description.value).toContain('When preparation is complete, OpenSquilla will quit')
 
     state.value = {
       ...state.value,

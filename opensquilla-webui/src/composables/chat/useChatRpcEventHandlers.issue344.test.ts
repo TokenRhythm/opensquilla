@@ -636,7 +636,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     expect(stream.endStreaming).toHaveBeenCalledTimes(1)
     expect(messages.value[messages.value.length - 1]).toMatchObject({
       role: 'error',
-      text: 'The task did not finish. Please try again later.',
+      text: 'This request did not finish.',
     })
     expect(options.scheduleHistorySync).toHaveBeenCalledTimes(1)
     expect(activeTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
@@ -838,7 +838,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     })
     expect(newest.api.finishRecovery()).toBe(true)
     expect(newest.stream.endStreaming).toHaveBeenCalledTimes(1)
-    expect(newest.messages.value[newest.messages.value.length - 1]?.text).toBe('The task did not finish. Please try again later.')
+    expect(newest.messages.value[newest.messages.value.length - 1]?.text).toBe('This request did not finish.')
     expect(newest.options.lastStreamSeq.value).toBe(9)
     oldest.scope.stop()
     newest.scope.stop()

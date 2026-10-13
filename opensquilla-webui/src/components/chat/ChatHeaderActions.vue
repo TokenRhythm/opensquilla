@@ -139,28 +139,8 @@
           type="button"
           class="chat-header__menu-item"
           role="menuitem"
-          data-testid="chat-session-action-copy-app-link"
-          @click="invoke('copy-session-link', true)"
-        >
-          <Icon name="externalLink" :size="16" />
-          <span>{{ t('chat.copySessionAppLink') }}</span>
-        </button>
-        <button
-          type="button"
-          class="chat-header__menu-item"
-          role="menuitem"
-          data-testid="chat-session-action-copy-gateway-link"
-          @click="invoke('copy-gateway-link', true)"
-        >
-          <Icon name="externalLink" :size="16" />
-          <span>{{ t('chat.copySessionGatewayLink') }}</span>
-        </button>
-        <button
-          type="button"
-          class="chat-header__menu-item"
-          role="menuitem"
           data-testid="chat-session-action-copy"
-          @click="invoke('copy-session-key', true)"
+          @click="invoke('copy-session-link', true)"
         >
           <Icon :name="copyIcon" :size="16" />
           <span>{{ copyLabel }}</span>
@@ -183,7 +163,7 @@ import {
 } from '@/utils/headerLayout'
 import type { IconName } from '@/utils/icons'
 
-type Action = 'deliverables' | 'share' | 'copy-session-key' | 'copy-session-link' | 'copy-gateway-link'
+type Action = 'deliverables' | 'share' | 'copy-session-link'
 
 const COARSE_POINTER_QUERY = '(pointer: coarse)'
 
@@ -201,9 +181,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   'open-deliverables': []
   'start-share': []
-  'copy-session-key': []
   'copy-session-link': []
-  'copy-gateway-link': []
 }>()
 
 const { t } = useI18n()
@@ -222,7 +200,7 @@ let coarsePointerMedia: MediaQueryList | null = null
 let layoutFrame: number | null = null
 let hasMeasuredLayout = false
 
-const copyLabel = computed(() => props.copyState === 'ok' ? t('chat.copied') : t('chat.copySessionKey'))
+const copyLabel = computed(() => props.copyState === 'ok' ? t('chat.copied') : t('chat.copySessionLink'))
 const deliverablesLabel = computed(() => {
   const label = t('chat.deliverablesCount', { count: props.deliverableCount })
   return props.hasNewDeliverable ? `${label}, New` : label
@@ -253,15 +231,13 @@ function isVisible(element: HTMLElement | null): element is HTMLElement {
 
 function actionForElement(element: Element | null): Action | null {
   if (element === wideDeliverablesRef.value) return 'deliverables'
-  if (element === menuTriggerRef.value) return 'copy-session-key'
+  if (element === menuTriggerRef.value) return 'copy-session-link'
   if (element === primaryActionRef.value) return primaryAction.value
   if (!(element instanceof HTMLElement)) return null
   const testId = element.dataset.testid
   if (testId === 'chat-session-action-deliverables') return 'deliverables'
   if (testId === 'chat-session-action-share') return 'share'
-  if (testId === 'chat-session-action-copy') return 'copy-session-key'
-  if (testId === 'chat-session-action-copy-app-link') return 'copy-session-link'
-  if (testId === 'chat-session-action-copy-gateway-link') return 'copy-gateway-link'
+  if (testId === 'chat-session-action-copy') return 'copy-session-link'
   return null
 }
 
@@ -341,9 +317,7 @@ function invoke(action: Action, fromMenu = false) {
   if (fromMenu) closeMenu(true)
   if (action === 'deliverables') emit('open-deliverables')
   if (action === 'share') emit('start-share')
-  if (action === 'copy-session-key') emit('copy-session-key')
   if (action === 'copy-session-link') emit('copy-session-link')
-  if (action === 'copy-gateway-link') emit('copy-gateway-link')
 }
 
 function onMenuKeydown(event: KeyboardEvent) {

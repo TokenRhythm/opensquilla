@@ -173,6 +173,7 @@ export interface SessionReadCompactionSummary {
 }
 
 export interface SessionReadTurnOutcome {
+  httpStatus?: number | null
   readonly turnId: string
   readonly taskId: string | null
   readonly status: string

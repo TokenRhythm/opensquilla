@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
-import { createApp, h, nextTick, ref } from 'vue'
+import { createApp, h, nextTick, reactive, ref } from 'vue'
 import { createI18n } from 'vue-i18n'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import ReasoningPart from './ReasoningPart.vue'
 import reasoningPartSource from './ReasoningPart.vue?raw'
@@ -18,10 +18,7 @@ const i18n = createI18n({
   messages: {
     en: {
       chat: {
-        // No bare `thinking` key on purpose: the live label must come from the
-        // fully localized `thinkingForSeconds` template, not concatenation —
-        // regressing to `t('chat.thinking') + '· Ns'` would render the raw
-        // missing-key path and fail the live-wording assertion below.
+        thinking: 'Thinking',
         thinkingForSeconds: 'Thinking · {seconds}s',
         thoughtProcess: 'Thinking',
         thoughtForSeconds: 'Thought for {seconds}s',
@@ -60,11 +57,13 @@ function mount(props: {
 
 beforeEach(() => {
   document.body.innerHTML = ''
+  vi.useRealTimers()
 })
 
 afterEach(() => {
   while (mountedApps.length) mountedApps.pop()?.unmount()
   document.body.innerHTML = ''
+  vi.useRealTimers()
 })
 
 describe('ReasoningPart embedded body height cap', () => {
@@ -83,6 +82,17 @@ describe('ReasoningPart embedded body height cap', () => {
 })
 
 describe('ReasoningPart summary wording', () => {
+  it('keeps the nested live label fixed and restores phase duration on completion', async () => {
+    const props = reactive({ part: part('trace', 4), live: true, nested: true, timelinePhase: true })
+    const host = mount(props)
+    expect(host.querySelector('.thinking-fold__label')?.textContent).toBe('Thinking')
+    props.part.seconds = 35
+    await nextTick()
+    expect(host.querySelector('.thinking-fold__label')?.textContent).toBe('Thinking')
+    props.live = false
+    await nextTick()
+    expect(host.querySelector('.thinking-fold__label')?.textContent).toBe('Thinking · 35s')
+  })
   it('renders the settled wording for sub-second, seconds, and minutes', () => {
     expect(mount({ part: part('t', 0), embedded: true }).textContent)
       .toContain('Thinking')
@@ -99,6 +109,70 @@ describe('ReasoningPart summary wording', () => {
     expect(summary?.textContent).not.toContain('Thought for')
     // A concatenation fallback would surface the missing-key name instead.
     expect(summary?.textContent).not.toContain('chat.thinking')
+  })
+})
+
+describe('ReasoningPart compact preview stability', () => {
+  it('grows the same line immediately and replaces fast new lines with only the latest after 500ms', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(10_000)
+    const props = reactive({ part: part('first', 1), live: true, controlled: true, open: false })
+    const host = mount(props)
+    const preview = () => host.querySelector('.thinking-fold__preview')?.textContent
+    const body = () => host.querySelector('.thinking-fold__body')?.textContent
+    props.part.text = 'first growing'
+    await nextTick()
+    expect(preview()).toBe('first growing')
+    await vi.advanceTimersByTimeAsync(100)
+    props.part.text += '\nsecond'
+    await nextTick()
+    expect(preview()).toBe('first growing')
+    expect(body()).toBe('first growing\nsecond')
+    await vi.advanceTimersByTimeAsync(100)
+    props.part.text += '\nthird growing'
+    await nextTick()
+    expect(body()).toBe(props.part.text)
+    await vi.advanceTimersByTimeAsync(299)
+    expect(preview()).toBe('first growing')
+    await vi.advanceTimersByTimeAsync(1)
+    expect(preview()).toBe('third growing')
+    expect(vi.getTimerCount()).toBe(0)
+    props.part.text += ' in place'
+    await nextTick()
+    expect(preview()).toBe('third growing in place')
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('opens the full canonical text immediately and clears a pending preview update', async () => {
+    vi.useFakeTimers()
+    const props = reactive({ part: part('first', 1), live: true, controlled: true, open: false })
+    const host = mount(props)
+    props.part.text += '\nlatest'
+    await nextTick()
+    expect(vi.getTimerCount()).toBe(1)
+    props.open = true
+    await nextTick()
+    expect(host.querySelector('.thinking-fold__body')?.textContent).toBe('first\nlatest')
+    expect(host.querySelector('.thinking-fold__preview')?.textContent).toBe('latest')
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it.each(['complete', 'stop-motion', 'replace-block', 'unmount'] as const)('clears pending line updates on %s', async action => {
+    vi.useFakeTimers()
+    const props = reactive({ part: part('first', 1), live: true, motionActive: true, controlled: true, open: false })
+    const host = mount(props)
+    props.part.text += '\nold pending'
+    await nextTick()
+    expect(vi.getTimerCount()).toBe(1)
+    if (action === 'complete') props.live = false
+    else if (action === 'stop-motion') props.motionActive = false
+    else if (action === 'replace-block') props.part = { ...part('new block', 1), key: 'reasoning:new' }
+    else mountedApps.pop()?.unmount()
+    await nextTick()
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(1_000)
+    if (action === 'replace-block') expect(host.querySelector('.thinking-fold__preview')?.textContent).toBe('new block')
+    if (action === 'complete') expect(host.querySelector('.thinking-fold__preview')).toBeNull()
   })
 })
 

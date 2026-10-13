@@ -7032,6 +7032,13 @@ async def test_aggregator_error_finish_fallback_retains_reported_usage_without_r
     assert aggregator_attempts == 1
     assert len(aggregator.calls) == 1
     assert fallback is not None and len(fallback.calls) == 1
+    fallback_activity = [
+        event for event in events
+        if isinstance(event, ProviderActivityEvent) and event.phase == "fallback"
+    ]
+    assert [(event.from_model, event.model) for event in fallback_activity] == [
+        ("agg", "fallback"),
+    ]
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert (done.input_tokens, done.output_tokens) == (31, 9)
     assert done.terminal_request_input_tokens == 11
@@ -8266,6 +8273,13 @@ async def test_default_quorum_with_zero_successful_proposers_uses_all_failed_pol
     called_models = [call["model"] for call in registry.calls]
     assert called_models.count("fallback") == 1
     assert "agg" not in called_models
+    fallback_activity = [
+        event for event in events
+        if isinstance(event, ProviderActivityEvent) and event.phase == "fallback"
+    ]
+    assert [(event.from_model, event.model) for event in fallback_activity] == [
+        ("", "fallback"),
+    ]
     assert isinstance(next(event for event in events if isinstance(event, DoneEvent)), DoneEvent)
 
 

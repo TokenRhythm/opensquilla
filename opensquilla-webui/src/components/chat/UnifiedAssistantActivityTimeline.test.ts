@@ -5,6 +5,7 @@ import { createApp, h, nextTick, ref, type App } from 'vue'
 import i18n from '@/i18n'
 import type { ChatStreamTimelineItem, ChatToolCallRenderItem } from '@/types/chat'
 import type { ReasoningBlock } from '@/types/turnlog'
+import type { LiveToolInputPreview } from '@/types/toolInputPreview'
 import { projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
 import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
 import UnifiedAssistantActivityTimeline from './UnifiedAssistantActivityTimeline.vue'
@@ -56,6 +57,39 @@ describe('UnifiedAssistantActivityTimeline', () => {
   })
   afterEach(() => {
     while (mounted.length) mounted.pop()?.unmount()
+  })
+
+  it('keeps a manually expanded draft open when the real write tool replaces it', async () => {
+    const previews = ref<LiveToolInputPreview[]>([{
+      previewId: 'p1', attemptId: 'a1', toolUseId: 'write-1', generationEpoch: 0, activityOrder: 2,
+      revision: 1, state: 'generating', toolName: 'write_file', path: 'page.html', content: '<html>draft', truncated: false,
+    }])
+    const items = ref<ChatStreamTimelineItem[]>([])
+    const choices = ref<Record<string, boolean>>({})
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp({ render: () => h(UnifiedAssistantActivityTimeline, {
+      projection: projectAssistantActivityTimeline(items.value, { lifecycle: 'working', statusHistory: [], endedAt: 2000 }),
+      timelineItems: items.value, toolInputPreviews: previews.value, executing: true, stateScope: 'turn-1',
+      isToolGroupOpen: () => undefined, isToolItemOpen: key => choices.value[key],
+      onToggleItem: (key, open) => { choices.value = { ...choices.value, [key]: open } },
+      toolGroupStatusText: () => '', toolStatusText: () => '', toolSecondaryText: () => '',
+    }) })
+    mounted.push(app); app.use(i18n); app.mount(host)
+    expect(host.querySelectorAll('[data-testid="tool-input-preview"]')).toHaveLength(1)
+    host.querySelector<HTMLButtonElement>('.tool-input-preview__summary')!.click()
+    await nextTick()
+    expect(host.querySelector('code')?.textContent).toBe('<html>draft')
+    expect(choices.value['turn-1:write-1']).toBe(true)
+    const call = { ...tool('write-1', 'write_file', 4), isRunning: true, status: '' as const,
+      inputRaw: JSON.stringify({ path: 'page.html', content: '<html>final' }) }
+    items.value = [group(call)]
+    previews.value = []
+    await nextTick()
+    expect(host.querySelector('[data-testid="tool-input-preview"]')).toBeNull()
+    expect(host.querySelectorAll('[data-activity-type="segment"]')).toHaveLength(1)
+    expect(host.querySelector('.tool-row')?.getAttribute('aria-expanded')).toBe('true')
+    expect(host.querySelector('code')?.textContent).toContain('<html>final')
   })
 
   it.each(['tool', 'reasoning'] as const)(
@@ -183,7 +217,7 @@ describe('UnifiedAssistantActivityTimeline', () => {
       '第一段',
       'Read skill',
       '思考二',
-      'Switching to backup model',
+      'Tried a backup model',
       '第二段',
       'Written',
       '思考三',

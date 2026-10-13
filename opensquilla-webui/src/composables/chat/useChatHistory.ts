@@ -365,6 +365,7 @@ function turnOutcomeRecord(outcome: SessionReadTurnOutcome): Record<string, unkn
     finishedAt: outcome.finishedAt ?? undefined,
     outcome: outcome.outcome,
     errorClass: outcome.errorClass ?? undefined,
+    ...(Object.prototype.hasOwnProperty.call(outcome, 'httpStatus') ? { httpStatus: outcome.httpStatus } : {}),
     retryable: outcome.retryable ?? undefined,
     activitySnapshot: outcome.activitySnapshot ?? undefined,
     usage: outcome.usage ?? undefined,

@@ -170,11 +170,12 @@
                 :aria-label="activityStatusHint(resolvedGroupStatusText(item.group))"
                 :title="activityStatusHint(resolvedGroupStatusText(item.group))"
               />
-              <span v-if="showGroupStatus(item.group)" class="tool-row__status" :class="{ 'tool-row__status--error': item.group.isError }">{{ resolvedGroupStatusText(item.group) }}</span>
+              <span v-if="presentation !== 'activity' && showGroupStatus(item.group)" class="tool-row__status" :class="{ 'tool-row__status--error': item.group.isError }">{{ resolvedGroupStatusText(item.group) }}</span>
               <Icon v-if="presentation !== 'activity' && groupHasDetails(item.group)" class="step-chevron" name="chevronRight" :size="14" />
             </span>
             </ActivityMotion>
           </component>
+          <p v-if="presentation === 'activity' && groupOpen(item.group) && showGroupStatus(item.group)" class="tool-row__error-detail">{{ resolvedGroupStatusText(item.group) }}</p>
           <TransitionGroup
             v-if="groupOpen(item.group)"
             name="tool-member"
@@ -235,7 +236,6 @@
                     :aria-label="activityStatusHint(activityTerminalStatusText(call))"
                     :title="activityStatusHint(activityTerminalStatusText(call))"
                   />
-                  <span v-if="activityTerminalStatusText(call)" class="tool-row__status tool-row__status--error">{{ activityTerminalStatusText(call) }}</span>
                   <span v-if="resultCountText(call)" class="tool-row__status">{{ resultCountText(call) }}</span>
                   <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
                   <Icon v-if="presentation !== 'activity' && iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
@@ -244,7 +244,6 @@
                 </span>
                 </ActivityMotion>
               </component>
-              <p v-if="activityErrorSummary(call)" class="tool-row__error-summary">{{ activityErrorSummary(call) }}</p>
               <div
                 v-if="activityTargetsVisible(call)"
                 class="tool-row-targets"
@@ -264,6 +263,7 @@
               </div>
               <Transition name="activity-tool-detail" :css="activityVisible && presentation === 'activity'">
                 <div v-if="activityVisible && callOpen(call) && callHasDetailBody(call)" class="tool-row-body">
+                  <p v-if="activityTerminalStatusText(call) && !hasActivityToolDetail(call, operationKey(call))" class="tool-row__error-detail">{{ activityTerminalStatusText(call) }}</p>
                   <ActivityToolDetails
                     v-if="presentation === 'activity' || isDocumentCall(call)"
                     :call="call"
@@ -337,7 +337,6 @@
                   :aria-label="activityStatusHint(activityTerminalStatusText(call))"
                   :title="activityStatusHint(activityTerminalStatusText(call))"
                 />
-                <span v-if="activityTerminalStatusText(call)" class="tool-row__status tool-row__status--error">{{ activityTerminalStatusText(call) }}</span>
                 <span v-if="resultCountText(call)" class="tool-row__status">{{ resultCountText(call) }}</span>
                 <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
                 <Icon v-if="presentation !== 'activity' && iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
@@ -346,7 +345,6 @@
               </span>
               </ActivityMotion>
             </component>
-            <p v-if="activityErrorSummary(call)" class="tool-row__error-summary">{{ activityErrorSummary(call) }}</p>
             <div
               v-if="activityTargetsVisible(call)"
               class="tool-row-targets"
@@ -366,6 +364,7 @@
             </div>
             <Transition name="activity-tool-detail" :css="activityVisible && presentation === 'activity'">
               <div v-if="activityVisible && callOpen(call) && callHasDetailBody(call)" class="tool-row-body">
+                <p v-if="activityTerminalStatusText(call) && !hasActivityToolDetail(call, operationKey(call))" class="tool-row__error-detail">{{ activityTerminalStatusText(call) }}</p>
                 <ActivityToolDetails
                   v-if="presentation === 'activity' || isDocumentCall(call)"
                   :call="call"
@@ -746,7 +745,6 @@ import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
 import {
   activityToolCodeKind,
   hasActivityToolDetail,
-  projectActivityToolErrorSummary,
   projectActivityToolSummary,
   projectActivityToolTargets,
   type ActivityToolTarget,
@@ -1153,20 +1151,18 @@ function groupBulletClass(group: ChatToolCallGroup) {
 function activityIconClass(call: ChatToolCallRenderItem) {
   return {
     'tool-row__activity-icon--running': call.isRunning,
-    'tool-row__activity-icon--error': call.status === 'error' || call.isError,
   }
 }
 
 function activityGroupIconClass(group: ChatToolCallGroup) {
   return {
     'tool-row__activity-icon--running': group.isRunning,
-    'tool-row__activity-icon--error': group.isError,
   }
 }
 
 function callHasDetailBody(call: ChatToolCallRenderItem): boolean {
   if (props.presentation === 'activity' || isDocumentCall(call)) {
-    return hasActivityToolDetail(call, operationKey(call))
+    return Boolean(activityTerminalStatusText(call)) || hasActivityToolDetail(call, operationKey(call))
   }
   return Boolean(
     call.inputRaw
@@ -1321,12 +1317,6 @@ function activityTerminalStatusText(call: ChatToolCallRenderItem): string {
 
 function activityStatusHint(status: string): string {
   return `${status} · ${t('shared.runTrace.activityViewDetails')}`
-}
-
-function activityErrorSummary(call: ChatToolCallRenderItem): string {
-  return !callOpen(call)
-    ? projectActivityToolErrorSummary(call)
-    : ''
 }
 
 function executionIoTextKey(summary: ExecutionIoSummary): string {
@@ -1701,11 +1691,11 @@ button.tool-row:hover {
 }
 
 .tool-row__status--error,
-.tool-row__error-summary {
+.tool-row__error-detail {
   color: var(--warn);
 }
 
-.tool-row__error-summary {
+.tool-row__error-detail {
   margin: 0.125rem 0 0.375rem;
   font-size: 0.8125rem;
   overflow-wrap: anywhere;
@@ -1966,10 +1956,6 @@ button.tool-row:hover {
 .tool-timeline--activity .tool-row .activity-motion--active .tool-row__elapsed,
 .tool-timeline--activity .tool-row .activity-motion--active .tool-row__status {
   color: var(--text);
-}
-
-.tool-timeline--activity .tool-row__activity-icon--error {
-  color: var(--warn);
 }
 
 .tool-timeline--activity .tool-row__activity-arrow {

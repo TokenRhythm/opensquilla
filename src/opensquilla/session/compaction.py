@@ -37,7 +37,11 @@ from opensquilla.compaction_timing import (
     resolve_compaction_total_timeout,
 )
 from opensquilla.contracts.image_validation import validate_image_bytes
-from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
+from opensquilla.provider.failures import (
+    ProviderFailureKind,
+    classify_provider_error,
+    safe_http_status,
+)
 from opensquilla.provider.image_projection import (
     ImageMarkerState,
     image_marker,
@@ -47,13 +51,14 @@ from opensquilla.provider.protocol import (
     project_provider_final_request,
     provider_connection_config,
 )
+from opensquilla.provider.recovery import (
+    retry_provider_stream,
+    sleep_before_retry,
+    transient_failure_kind,
+)
 from opensquilla.provider.replay_budget import project_message_replay_budget
 from opensquilla.provider.request_proof import projected_generation_budget
 from opensquilla.provider.retry_after import (
-    RetryAfterDeferredError,
-    RetryAfterWaitTimeoutError,
-    provider_retry_after_cooldowns,
-    provider_retry_after_scope,
     record_provider_retry_after,
 )
 from opensquilla.provider.types import (
@@ -64,6 +69,7 @@ from opensquilla.provider.types import (
     DoneEvent,
     ErrorEvent,
     Message,
+    ProviderActivityEvent,
     ReasoningDeltaEvent,
     TextDeltaEvent,
     ToolDefinition,
@@ -187,6 +193,10 @@ class CompactionConfig:
     )
     llm_calls_started: int = field(default=0, init=False, repr=False)
     last_failure_kind: str = field(default="", init=False, repr=False)
+    last_failure_detail: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    on_summary_recovery: Callable[[ProviderActivityEvent], None] | None = field(
+        default=None, repr=False, compare=False,
+    )
     on_summary_call_started: Callable[[], None] | None = field(
         default=None,
         repr=False,
@@ -309,6 +319,7 @@ class CompactionResult:
     # removing additional raw transcript rows.
     replaced_previous_summary: bool = False
     failure_kind: str = ""
+    failure_detail: dict[str, Any] = field(default_factory=dict)
 
 
 def compaction_replay_summary(result: CompactionResult) -> str:
@@ -478,6 +489,7 @@ def arm_compaction_deadline(
             config.last_attempted_target = None
             config.successful_target = None
             config.last_failure_kind = ""
+            config.last_failure_detail = {}
         config.operation_id = operation_id
     if config.operation_started_at_monotonic is None:
         config.operation_started_at_monotonic = time.monotonic()
@@ -2822,6 +2834,20 @@ def _compaction_failure_metadata(exc: Exception, *, provider: str = "") -> dict[
     return fields
 
 
+def summary_recovery_payload(event: ProviderActivityEvent) -> dict[str, Any]:
+    """Existing compaction progress carries a bounded recovery sub-state."""
+    payload = {
+        "phase": event.phase, "reason": event.reason,
+        "retry_attempt": event.retry_attempt, "retry_limit": event.retry_limit,
+        "retry_after_ms": event.retry_after_ms, "started_at": event.started_at,
+    }
+    status = getattr(event, "http_status", None)
+    if event.phase == "retry_wait" and isinstance(status, int) and not isinstance(status, bool):
+        if 400 <= status <= 599:
+            payload["http_status"] = status
+    return payload
+
+
 def _report_compaction_credential_failure(
     deployment: CompactionExecutionTarget,
     event: ErrorEvent,
@@ -2837,8 +2863,8 @@ def _report_compaction_credential_failure(
         code = str(event.code or "")
         kind = classify_provider_error(
             provider_name=deployment.provider_id,
-            status_code=int(code) if code.isdigit() else None,
-            raw_code=code,
+            status_code=event.http_status or (int(code) if code.isdigit() else None),
+            raw_code=event.provider_code or code,
             message=str(event.message or ""),
         )
         args = (deployment.credential_pool_provider, deployment.credential_pool_session_key, kind)
@@ -2880,6 +2906,8 @@ async def call_compaction_provider(
     summary_output_tokens: int | None = None,
     on_summary_call_started: Callable[[], None] | None = None,
     on_summary_failure: Callable[[str], None] | None = None,
+    on_summary_failure_detail: Callable[[dict[str, Any]], None] | None = None,
+    on_summary_recovery: Callable[[ProviderActivityEvent], None] | None = None,
 ) -> str | None:
     """Summarize a selected source range through the provider protocol."""
 
@@ -2906,6 +2934,7 @@ async def call_compaction_provider(
 
     provider_stream: Any | None = None
     accounted_stream: Any | None = None
+    recovery_stream: Any | None = None
     log.info(
         "compaction.llm_call_started",
         compaction_id=compaction_id,
@@ -2948,57 +2977,62 @@ async def call_compaction_provider(
         if chat_config.turn_deadline_at_monotonic is not None:
             if chat_config.turn_deadline_at_monotonic <= time.monotonic():
                 raise CompactionOperationTimeoutError("summary deadline expired before dispatch")
-        try:
-            async for _delay in provider_retry_after_cooldowns().wait(
-                deployment.provider,
-                scope=provider_retry_after_scope(deployment.provider),
-                deadline_at_monotonic=chat_config.turn_deadline_at_monotonic,
-            ):
-                pass  # Deliberate cooling is outside provider inactivity timing.
-        except RetryAfterDeferredError as exc:
-            raise _CompactionProviderError(
-                exc.reason, failure_kind=(
-                    ProviderFailureKind.PROVIDER_OVERLOADED
-                    if provider_retry_after_cooldowns().reason(
-                        deployment.provider, scope=provider_retry_after_scope(deployment.provider),
-                    ) == "provider_overloaded" else ProviderFailureKind.RATE_LIMITED
-                ),
-            ) from None
-        except RetryAfterWaitTimeoutError:
-            raise CompactionOperationTimeoutError(
-                "summary deadline expired during cooldown",
-            ) from None
-        if provider_accounts_physical_usage(deployment.provider):
-            if on_summary_call_started is not None:
-                on_summary_call_started()
-            provider_stream = deployment.provider.chat(
-                messages,
-                tools=tools,
-                config=chat_config,
-            )
-            accounted_stream = provider_stream
-        else:
+        chunks: list[str] = []
+        saw_done = False
+        received_bytes = 0
+        attempt_number = 0
 
-            def _start_provider_stream() -> Any:
+        def reset_attempt() -> None:
+            nonlocal saw_done, received_bytes, attempt_number
+            attempt_number += 1
+            # Provisional summary text is never delivered or committed. An
+            # admitted retry starts a fresh candidate, not a concatenation.
+            chunks.clear()
+            saw_done = False
+            received_bytes = 0
+
+        async def attempt_stream() -> Any:
+            nonlocal provider_stream, accounted_stream
+            correlation = chat_config.provider_request_correlation
+            if attempt_number > 1:
+                correlation = derive_provider_request_correlation(
+                    correlation, execution_id=uuid.uuid4().hex,
+                )
+            attempt_config = chat_config.model_copy(update={
+                "provider_request_correlation": correlation,
+            })
+
+            def start_stream() -> Any:
                 nonlocal provider_stream
                 if on_summary_call_started is not None:
                     on_summary_call_started()
                 provider_stream = deployment.provider.chat(
-                    messages,
-                    tools=tools,
-                    config=chat_config,
+                    messages, tools=tools, config=attempt_config,
                 )
                 return provider_stream
 
-            accounted_stream = account_provider_stream(
-                _start_provider_stream,
-                provider=deployment.provider_id,
-                model=deployment.model,
+            accounted_stream = (
+                start_stream() if provider_accounts_physical_usage(deployment.provider)
+                else account_provider_stream(
+                    start_stream, provider=deployment.provider_id, model=deployment.model,
+                )
             )
-
-        chunks: list[str] = []
-        saw_done = False
-        received_bytes = 0
+            try:
+                async with compaction_progress_timeout(
+                    idle_timeout_seconds=timeout,
+                    deadline_at_monotonic=chat_config.turn_deadline_at_monotonic,
+                ) as progress:
+                    async for event in accounted_stream:
+                        record_provider_retry_after(deployment.provider, event)
+                        progress.observe(event)
+                        if isinstance(event, ErrorEvent):
+                            _report_compaction_credential_failure(deployment, event)
+                        yield event
+            finally:
+                if provider_stream is not accounted_stream:
+                    await _close_compaction_provider_stream(provider_stream)
+                await _close_compaction_provider_stream(accounted_stream)
+                provider_stream = accounted_stream = None
 
         def enforce_stream_memory(text: str) -> None:
             nonlocal received_bytes
@@ -3006,67 +3040,55 @@ async def call_compaction_provider(
             if received_bytes > _MAX_COMPACTION_STREAM_BYTES:
                 raise _CompactionProviderError("summary_stream_resource_limit")
 
-        async with compaction_progress_timeout(
-            idle_timeout_seconds=timeout,
-            deadline_at_monotonic=chat_config.turn_deadline_at_monotonic,
-        ) as progress:
-            async for event in accounted_stream:
-                # Retain a real upstream hint even if the same frame also
-                # crosses the operation deadline in progress.observe().
-                record_provider_retry_after(deployment.provider, event)
-                progress.observe(event)
-                if isinstance(event, ErrorEvent) or getattr(event, "kind", "") == "error":
-                    message = str(getattr(event, "message", "") or "provider error")
-                    code = str(getattr(event, "code", "") or "")
-                    status_code = (
-                        int(code) if len(code) == 3 and code.isascii() and code.isdigit() else None
-                    )
-                    if status_code is not None and not 100 <= status_code <= 599:
-                        status_code = None
-                    failure_kind = classify_provider_error(
-                        provider_name=deployment.provider_id,
-                        status_code=status_code,
-                        raw_code=code,
-                        message=message,
-                    )
-                    if isinstance(event, ErrorEvent):
-                        _report_compaction_credential_failure(deployment, event)
-                    raise _CompactionProviderError(
-                        "provider_error",
-                        failure_kind=failure_kind,
-                        status_code=status_code,
-                    )
-                if str(getattr(event, "kind", "")).startswith("tool_use"):
-                    raise _CompactionProviderError("unexpected_tool_call")
-                if isinstance(event, TextDeltaEvent) or getattr(event, "kind", "") == "text_delta":
-                    text = str(getattr(event, "text", "") or "")
-                    if text:
-                        chunks.append(text)
-                        enforce_stream_memory(text)
-                elif (
-                    isinstance(event, ReasoningDeltaEvent)
-                    or getattr(event, "kind", "") == "reasoning_delta"
-                ):
-                    reasoning_text = str(getattr(event, "text", "") or "")
-                    if reasoning_text:
-                        enforce_stream_memory(reasoning_text)
-                elif isinstance(event, DoneEvent) or getattr(event, "kind", "") == "done":
-                    # Usage accounting finalizes on the same terminal event.
-                    saw_done = True
-                    if getattr(event, "refusal", False):
-                        raise _CompactionProviderError("provider refused the summary")
-                    if str(getattr(event, "stop_reason", "") or "").lower() not in {
-                        "end_turn",
-                        "stop",
-                        "stop_sequence",
-                        "completed",
-                    }:
-                        raise _CompactionProviderError("incomplete_summary")
-                    # Provider usage is accounted by its adapter. Local token
-                    # estimates cannot validate a different model's billed
-                    # generation, and reasoning is not checkpoint body text.
-                    enforce_stream_memory(str(getattr(event, "reasoning_content", "") or ""))
-                    continue
+        recovery_stream = retry_provider_stream(
+            attempt_stream, provider=deployment.provider, model=deployment.model,
+            config=chat_config, reset_attempt=reset_attempt,
+            sleep=sleep_before_retry,
+        )
+        async for event in recovery_stream:
+            if isinstance(event, ProviderActivityEvent):
+                if on_summary_recovery is not None:
+                    on_summary_recovery(event)
+                continue
+            if isinstance(event, ErrorEvent) or getattr(event, "kind", "") == "error":
+                status_code = safe_http_status(getattr(event, "http_status", None))
+                failure_kind = transient_failure_kind(deployment.provider, event)
+                raise _CompactionProviderError(
+                    "provider_error",
+                    failure_kind=failure_kind,
+                    status_code=status_code,
+                )
+            if str(getattr(event, "kind", "")).startswith("tool_use"):
+                raise _CompactionProviderError("unexpected_tool_call")
+            if isinstance(event, TextDeltaEvent) or getattr(event, "kind", "") == "text_delta":
+                text = str(getattr(event, "text", "") or "")
+                if text:
+                    chunks.append(text)
+                    enforce_stream_memory(text)
+            elif (
+                isinstance(event, ReasoningDeltaEvent)
+                or getattr(event, "kind", "") == "reasoning_delta"
+            ):
+                reasoning_text = str(getattr(event, "text", "") or "")
+                if reasoning_text:
+                    enforce_stream_memory(reasoning_text)
+            elif isinstance(event, DoneEvent) or getattr(event, "kind", "") == "done":
+                # Usage accounting finalizes on the same terminal event.
+                saw_done = True
+                if getattr(event, "refusal", False):
+                    raise _CompactionProviderError("provider refused the summary")
+                if str(getattr(event, "stop_reason", "") or "").lower() not in {
+                    "end_turn",
+                    "stop",
+                    "stop_sequence",
+                    "completed",
+                }:
+                    raise _CompactionProviderError("incomplete_summary")
+                # Provider usage is accounted by its adapter. Local token
+                # estimates cannot validate a different model's billed
+                # generation, and reasoning is not checkpoint body text.
+                enforce_stream_memory(str(getattr(event, "reasoning_content", "") or ""))
+                continue
 
         if not saw_done:
             raise _CompactionProviderError("missing_completion_event")
@@ -3100,8 +3122,15 @@ async def call_compaction_provider(
             raise
         if isinstance(exc, CompactionOperationTimeoutError):
             raise
+        detail = _compaction_failure_metadata(exc, provider=deployment.provider_id)
+        if "status_code" in detail:
+            detail["http_status"] = detail.pop("status_code")
+        detail = {key: value for key, value in detail.items()
+                  if key in {"reason_code", "failure_kind", "http_status"}}
+        if on_summary_failure_detail is not None:
+            on_summary_failure_detail(detail)
         if on_summary_failure is not None:
-            on_summary_failure(str(_compaction_failure_metadata(exc)["reason_code"]))
+            on_summary_failure(str(detail.get("failure_kind") or detail["reason_code"]))
         return None
     finally:
         # The raw provider iterator owns the transport. Close it first so a
@@ -3109,6 +3138,7 @@ async def call_compaction_provider(
         if provider_stream is not accounted_stream:
             await _close_compaction_provider_stream(provider_stream)
         await _close_compaction_provider_stream(accounted_stream)
+        await _close_compaction_provider_stream(recovery_stream)
 
 
 async def call_compaction_llm(
@@ -3614,6 +3644,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             cfg.timeout_seconds,
         )
         cfg.last_failure_kind = ""
+        cfg.last_failure_detail = {}
         result = await call_compaction_provider(
             chunk_text="",
             identifier_instruction=id_instruction,
@@ -3631,6 +3662,8 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             summary_output_tokens=(goal if goal is not None else summary_goal),
             on_summary_call_started=cfg.on_summary_call_started,
             on_summary_failure=lambda kind: setattr(cfg, "last_failure_kind", kind),
+            on_summary_failure_detail=lambda detail: setattr(cfg, "last_failure_detail", detail),
+            on_summary_recovery=cfg.on_summary_recovery,
         )
         require_compaction_time(cfg, phase="summarizing")
         if result:
@@ -4163,6 +4196,8 @@ async def compact_context(request: CompactionRequest) -> CompactionResult:
         phase="summarizing",
     )
     cfg = request.config
+    if result.skip_reason and cfg.last_failure_detail:
+        result.failure_detail = dict(cfg.last_failure_detail)
     if not result.failure_kind and result.skip_reason:
         result.failure_kind = (
             cfg.last_failure_kind if result.skip_reason == "summary_failed" else result.skip_reason

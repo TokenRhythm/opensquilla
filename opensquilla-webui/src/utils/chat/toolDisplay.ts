@@ -50,6 +50,24 @@ export function isInternalToolName(name: string): boolean {
   return name === 'router_control'
 }
 
+export function activityToolName(name: string): string {
+  const normalized = String(name || '')
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .replace(/-/g, '_')
+  const namespaced = normalized.split(/__|[.:/]/).filter(Boolean)
+  return namespaced[namespaced.length - 1] || ''
+}
+
+// Successful progress calls may follow an answer without moving it back into
+// Activity. Retain the retired checkpoint name for historical PlanRun turns.
+const ANSWER_TRANSPARENT_CONTROL_TOOLS = new Set(['plan_run_checkpoint', 'update_plan'])
+
+export function isAnswerTransparentControlTool(name: string): boolean {
+  return ANSWER_TRANSPARENT_CONTROL_TOOLS.has(activityToolName(name))
+}
+
 export function normalizeToolInputText(raw: unknown): string {
   const record = asRecord(raw)
   const value = record?.input ?? record?.arguments ?? ''

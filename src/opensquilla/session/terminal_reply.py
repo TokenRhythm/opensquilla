@@ -79,6 +79,7 @@ _SAFE_PROVIDER_FAILURE_MESSAGES = {
     "context_overflow": "The request exceeds the model provider's context window.",
     "unsupported_feature": "The model provider does not support this request.",
     "insufficient_credits": "The model provider account has insufficient credits.",
+    "usage_limit": "The model provider account has reached its usage limit.",
     "model_not_found": "The configured model is unavailable from the provider.",
     "transport_transient": (
         "The connection to the model provider was interrupted. Try again."

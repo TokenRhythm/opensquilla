@@ -348,6 +348,35 @@ describe('useChatSessionSubscription domain lease', () => {
     })
   })
 
+  it.each(['rpc-abort', 'local-cancel', 'session-replaced'])('does not warn for an intentionally cancelled subscription (%s)', async reason => {
+    const pendingLive = deferred<SessionReadLive>()
+    const sessionKey = ref(KEY)
+    const subject = harness(leaseFixture({ live: pendingLive.promise }).lease, { sessionKey })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const pending = subject.api.subscribeSession()
+      if (reason === 'local-cancel') subject.api.cancelActiveSubscription()
+      if (reason === 'session-replaced') sessionKey.value = 'agent:main:webchat:successor'
+      pendingLive.reject(reason === 'rpc-abort'
+        ? new SessionReadFailure('aborted', 'ready was aborted', false)
+        : new Error('Previous read ended'))
+      await expect(pending).resolves.toMatchObject({ authoritative: false, cancelled: true })
+      expect(warn).not.toHaveBeenCalled()
+    } finally { warn.mockRestore() }
+  })
+
+  it('still warns when the current subscription genuinely fails', async () => {
+    const pendingLive = deferred<SessionReadLive>()
+    const subject = harness(leaseFixture({ live: pendingLive.promise }).lease)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const pending = subject.api.subscribeSession()
+      pendingLive.reject(new Error('Gateway unavailable'))
+      await expect(pending).resolves.toMatchObject({ authoritative: false, cancelled: false })
+      expect(warn).toHaveBeenCalledExactlyOnceWith('Session stream subscription failed:', 'Gateway unavailable')
+    } finally { warn.mockRestore() }
+  })
+
   it('projects only a current domain missing failure as terminal session absence', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     try {

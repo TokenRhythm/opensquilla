@@ -205,6 +205,7 @@ from opensquilla.provider.protocol import (
     provider_metadata,
     validate_provider_chat_admission,
 )
+from opensquilla.provider.recovery import recovery_delay_seconds
 from opensquilla.provider.request_proof import (
     ProviderRequestBudgetExceededError,
     effective_proof_token_budget,
@@ -224,6 +225,11 @@ from opensquilla.provider.retry_after import (
     record_provider_retry_after,
     resolve_retry_delay_seconds,
 )
+from opensquilla.provider.tool_input_preview import (
+    PREVIEW_CONTENT_LIMIT,
+    PREVIEW_PATH_LIMIT,
+    preview_file_inputs,
+)
 from opensquilla.provider.types import (
     ContentBlockImage,
     ExecutionIdentity,
@@ -234,6 +240,7 @@ from opensquilla.provider.types import (
     ProviderMessageLimitProof,
     ProviderReplayState,
     ProviderRequestCorrelation,
+    ToolInputPreviewEvent,
     derive_provider_request_correlation,
 )
 from opensquilla.provider.types import (
@@ -816,6 +823,46 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
     return summarized
 
 
+class _ToolArgumentProgress:
+    """Throttle progress from validated deltas without publishing tool payloads."""
+
+    def __init__(self, *, clock: Callable[[], float] | None = None) -> None:
+        self._characters: dict[str, int] = {}
+        self._last_character_pulse: dict[str, int] = {}
+        self._last_pulse_at: float | None = None
+        self._clock = clock or time.monotonic
+
+    def clear(self) -> None:
+        self._characters.clear()
+        self._last_character_pulse.clear()
+        self._last_pulse_at = None
+
+    def finish(self, tool_use_id: str) -> None:
+        self._characters.pop(tool_use_id, None)
+        self._last_character_pulse.pop(tool_use_id, None)
+
+    def record(self, tool_use_id: str, fragment: str) -> bool:
+        if not fragment:
+            return False
+        characters = self._characters.get(tool_use_id, 0) + len(fragment)
+        self._characters[tool_use_id] = characters
+        character_pulse = (
+            characters - self._last_character_pulse.get(tool_use_id, 0)
+            >= _TOOL_ARGUMENT_HEARTBEAT_CHARS
+        )
+        now = self._clock()
+        if (
+            self._last_pulse_at is not None
+            and not character_pulse
+            and now - self._last_pulse_at < _TOOL_ARGUMENT_HEARTBEAT_SECONDS
+        ):
+            return False
+        if character_pulse:
+            self._last_character_pulse[tool_use_id] = characters
+        self._last_pulse_at = now
+        return True
+
+
 def _camel_usage_key(field: str) -> str:
     parts = field.split("_")
     return parts[0] + "".join(part.capitalize() for part in parts[1:])
@@ -834,6 +881,7 @@ _INVALID_PROVIDER_CONTEXT_PROJECTION_PREFIX = "[invalid_provider_context_project
 _INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY = "_invalid_provider_context_arguments"
 _AGGREGATE_TOOL_RESULT_MAX_SHARE = 0.25
 _TOOL_ARGUMENT_HEARTBEAT_CHARS = 4096
+_TOOL_ARGUMENT_HEARTBEAT_SECONDS = 2.0
 _PROVIDER_CONTEXT_PROJECTION_REUSED_REASON = "provider_context_projection_reused"
 _SEMANTIC_TOOL_RESULT_PROJECTION_SKIP_TOOLS = frozenset({"read_file", "git_diff"})
 _TOOL_RESULT_RETRIEVE_HINT = (
@@ -1843,6 +1891,9 @@ def _safe_provider_terminal_message(
         ),
         ProviderFailureKind.UNSUPPORTED_FEATURE: (
             "The model provider does not support this request."
+        ),
+        ProviderFailureKind.USAGE_LIMIT: (
+            "The model provider account has reached its usage limit."
         ),
         ProviderFailureKind.INSUFFICIENT_CREDITS: (
             "The model provider account has insufficient credits."
@@ -6287,6 +6338,16 @@ class Agent:
             return reported_count
 
         terminal_error: ErrorEvent | None = None
+        active_tool_previews: dict[str, ToolInputPreviewEvent] = {}
+
+        def discard_tool_previews() -> list[ToolInputPreviewEvent]:
+            previews = [
+                replace(event, state="discarded", revision=event.revision + 1, content="")
+                for event in active_tool_previews.values()
+            ]
+            active_tool_previews.clear()
+            return previews
+
         terminal_generation_reset_event: AnswerGenerationResetEvent | None = None
         final_text_parts: list[str] = []
         applied_model_call_boundaries: list[dict[str, Any]] = []
@@ -6903,7 +6964,7 @@ class Agent:
                 pending_tool_events: list[
                     ToolUseStartEvent | ToolUseDeltaEvent | EngineToolUseEndEvent
                 ] = []
-                tool_argument_heartbeat_chars: dict[str, int] = {}
+                tool_argument_progress = _ToolArgumentProgress()
                 iter_input_tokens = 0
                 iter_output_tokens = 0
                 iter_reasoning_tokens = 0
@@ -6937,6 +6998,8 @@ class Agent:
                 provider_activity_id = uuid.uuid4().hex
                 next_provider_activity_reason: _ProviderActivityReason = "initial"
                 while _retry_attempt <= _fallback.max_retries:
+                    for preview in discard_tool_previews():
+                        yield preview
                     provider_error = None
                     assistant_text_parts = []
                     attempt_reasoning_parts: list[str] = []
@@ -6951,7 +7014,7 @@ class Agent:
                     # appears this call, after which later text is tagged as
                     # intermediate narration between tools rather than the answer.
                     text_presentation_decided = False
-                    tool_argument_heartbeat_chars = {}
+                    tool_argument_progress.clear()
                     iter_input_tokens = 0
                     iter_output_tokens = 0
                     iter_reasoning_tokens = 0
@@ -7770,6 +7833,7 @@ class Agent:
                         raw_stream = observe_retry_after_dispatch(
                             guard_provider_text_stream(raw_stream), dispatch_evidence,
                         )
+                        raw_stream = preview_file_inputs(raw_stream)
                         pending_install_deadline: float | None = (
                             self._pending_durable_compaction_event.compaction_deadline_at_monotonic
                             if self._pending_durable_compaction_event is not None
@@ -7792,9 +7856,79 @@ class Agent:
                             total_deadline=provider_stream_deadline,
                             deadline_provider=_active_stream_deadline,
                         ):
+                            if isinstance(raw_ev, ToolInputPreviewEvent):
+                                # Display drafts cannot enter content-commit,
+                                # tool execution, retry-safety or history paths.
+                                if self._execution_context is not None and (
+                                    self._execution_context.closed
+                                    or self._execution_context.terminal
+                                    or self._execution_context.generation_epoch != generation_epoch
+                                ):
+                                    continue
+                                if (
+                                    not tools_supported_for_call
+                                    or raw_ev.tool_name != "write_file"
+                                    or not isinstance(raw_ev.state, str)
+                                    or raw_ev.state not in {"generating", "discarded"}
+                                    or not isinstance(raw_ev.path, str)
+                                    or not isinstance(raw_ev.content, str)
+                                    or not isinstance(raw_ev.revision, int)
+                                    or isinstance(raw_ev.revision, bool)
+                                    or raw_ev.revision <= 0
+                                    or len(raw_ev.path) > PREVIEW_PATH_LIMIT
+                                    or not all(
+                                        isinstance(value, str) and 0 < len(value) <= 256
+                                        for value in (
+                                            raw_ev.preview_id, raw_ev.attempt_id,
+                                            raw_ev.tool_use_id,
+                                        )
+                                    )
+                                    or (
+                                        raw_ev.generation_epoch is not None
+                                        and (
+                                            not isinstance(raw_ev.generation_epoch, int)
+                                            or isinstance(raw_ev.generation_epoch, bool)
+                                            or raw_ev.generation_epoch != generation_epoch
+                                        )
+                                    )
+                                ):
+                                    continue
+                                previous_preview = active_tool_previews.get(raw_ev.preview_id)
+                                if (
+                                    previous_preview is not None
+                                    and raw_ev.revision <= previous_preview.revision
+                                ):
+                                    continue
+                                if (
+                                    raw_ev.state == "generating"
+                                    and raw_ev.preview_id not in active_tool_previews
+                                    and len(active_tool_previews) >= 8
+                                ):
+                                    continue
+                                preview = replace(
+                                    raw_ev,
+                                    generation_epoch=generation_epoch,
+                                    path=raw_ev.path[:PREVIEW_PATH_LIMIT],
+                                    content=raw_ev.content[-PREVIEW_CONTENT_LIMIT:],
+                                    truncated=bool(raw_ev.truncated)
+                                    or len(raw_ev.content) > PREVIEW_CONTENT_LIMIT,
+                                )
+                                try:
+                                    preview.path.encode("utf-8")
+                                    preview.content.encode("utf-8")
+                                except UnicodeEncodeError:
+                                    continue
+                                if preview.state == "discarded":
+                                    active_tool_previews.pop(preview.preview_id, None)
+                                else:
+                                    active_tool_previews[preview.preview_id] = preview
+                                yield preview
+                                continue
                             if not getattr(self.provider, "owns_retry_after_admission", False):
                                 record_provider_retry_after(self.provider, raw_ev)
                             if isinstance(raw_ev, ProviderGenerationResetEvent):
+                                for preview in discard_tool_previews():
+                                    yield preview
                                 if (
                                     self._execution_context is not None
                                     and self._execution_context.terminal
@@ -7844,6 +7978,7 @@ class Agent:
                                         terminal=raw_ev.terminal,
                                         terminal_text_snapshot=(raw_ev.terminal_text_snapshot),
                                         terminal_error_message=terminal_error_message,
+                                        terminal_http_status=raw_ev.terminal_http_status,
                                         terminal_error_code=terminal_error_code,
                                         terminal_failure_kind=terminal_failure_kind,
                                     )
@@ -7860,6 +7995,7 @@ class Agent:
                                         terminal_error_message=terminal_error_message,
                                         terminal_error_code=terminal_error_code,
                                         terminal_failure_kind=terminal_failure_kind,
+                                        terminal_http_status=raw_ev.terminal_http_status,
                                     )
                                 generation_epoch = reset_event.new_generation_epoch
                                 last_provider_sequence = reset_event.sequence
@@ -7870,7 +8006,7 @@ class Agent:
                                 pending_tools.clear()
                                 pending_tool_events.clear()
                                 seen_tool_use_ids.clear()
-                                tool_argument_heartbeat_chars.clear()
+                                tool_argument_progress.clear()
                                 final_reasoning_parts.clear()
                                 iter_reasoning_content = None
                                 iter_reasoning_tokens = 0
@@ -7956,6 +8092,7 @@ class Agent:
                                             or "fixed provider final failure"
                                         ),
                                         code=(raw_ev.terminal_error_code or "ensemble_fixed_error"),
+                                        http_status=raw_ev.terminal_http_status,
                                         model_usage_breakdown=terminal_rows,
                                         usage_missing_count=(raw_ev.usage_missing_count),
                                     )
@@ -8062,6 +8199,12 @@ class Agent:
                                 first_event_at = time.monotonic()
                             if isinstance(raw_ev, ProviderDomainActivityEvent):
                                 activity_phase = _normalize_provider_activity_phase(raw_ev.phase)
+                                if activity_phase in {"fallback", "retry_wait", "retrying"}:
+                                    # Selector may reject a provisional stream
+                                    # locally, outside the physical observer.
+                                    # Revoke its draft before showing recovery.
+                                    for preview in discard_tool_previews():
+                                        yield preview
                                 if activity_phase == "reasoning":
                                     if reasoning_activity_started_at_ms == 0:
                                         reasoning_activity_started_at_ms = (
@@ -8075,7 +8218,9 @@ class Agent:
                                         getattr(raw_ev, "model", "")
                                     ),
                                     phase=activity_phase,
+                                    from_model=getattr(raw_ev, "from_model", ""),
                                     reason=_normalize_provider_activity_reason(raw_ev.reason),
+                                    http_status=raw_ev.http_status,
                                     retry_attempt=max(0, raw_ev.retry_attempt),
                                     retry_limit=max(0, raw_ev.retry_limit),
                                     retry_after_ms=max(0, raw_ev.retry_after_ms),
@@ -8217,7 +8362,7 @@ class Agent:
                                     pending_tools.clear()
                                     tool_calls.clear()
                                     pending_tool_events.clear()
-                                    tool_argument_heartbeat_chars.clear()
+                                    tool_argument_progress.clear()
                                     break
                                 seen_tool_use_ids.add(raw_ev.tool_use_id)
                                 # A tool follows, so any further text this call is
@@ -8228,7 +8373,6 @@ class Agent:
                                     tool_name=raw_ev.tool_name,
                                     synthetic_from_text=raw_ev.synthetic_from_text,
                                 )
-                                tool_argument_heartbeat_chars[raw_ev.tool_use_id] = 0
                                 pending_tool_events.append(
                                     ToolUseStartEvent(
                                         tool_use_id=raw_ev.tool_use_id,
@@ -8269,7 +8413,7 @@ class Agent:
                                     pending_tools.clear()
                                     tool_calls.clear()
                                     pending_tool_events.clear()
-                                    tool_argument_heartbeat_chars.clear()
+                                    tool_argument_progress.clear()
                                     break
                                 json_fragment = raw_ev.json_fragment
                                 acc.json_buf.append(json_fragment)
@@ -8286,16 +8430,9 @@ class Agent:
                                         self._execution_context.open_tool_buffer(
                                             raw_ev.tool_use_id
                                         ).append(pending_tool_events[-1])
-                                last_heartbeat_chars = tool_argument_heartbeat_chars.get(
-                                    raw_ev.tool_use_id, 0
-                                )
-                                if (
-                                    acc.json_chars - last_heartbeat_chars
-                                    >= _TOOL_ARGUMENT_HEARTBEAT_CHARS
+                                if tool_argument_progress.record(
+                                    raw_ev.tool_use_id, json_fragment,
                                 ):
-                                    tool_argument_heartbeat_chars[raw_ev.tool_use_id] = (
-                                        acc.json_chars
-                                    )
                                     yield RunHeartbeatEvent(
                                         phase="llm_tool_arguments",
                                         elapsed_ms=int((time.monotonic() - call_started_at) * 1000),
@@ -8322,7 +8459,7 @@ class Agent:
                                 end_tool_use_id = raw_ev.tool_use_id
                                 if isinstance(end_tool_use_id, str) and end_tool_use_id.strip():
                                     acc = pending_tools.pop(end_tool_use_id, None)
-                                    tool_argument_heartbeat_chars.pop(end_tool_use_id, None)
+                                    tool_argument_progress.finish(end_tool_use_id)
                                 else:
                                     acc = None
                                 if acc is None:
@@ -8338,7 +8475,7 @@ class Agent:
                                     pending_tools.clear()
                                     tool_calls.clear()
                                     pending_tool_events.clear()
-                                    tool_argument_heartbeat_chars.clear()
+                                    tool_argument_progress.clear()
                                     break
                                 invalid_arguments = not isinstance(raw_ev.arguments, dict)
                                 if not invalid_arguments:
@@ -8364,7 +8501,7 @@ class Agent:
                                     pending_tools.clear()
                                     tool_calls.clear()
                                     pending_tool_events.clear()
-                                    tool_argument_heartbeat_chars.clear()
+                                    tool_argument_progress.clear()
                                     break
                                 # ToolUseEndEvent is the provider boundary's
                                 # canonical, validated argument object.  Do not
@@ -8997,6 +9134,9 @@ class Agent:
                         ):
                             reasoning_only_act_now_message = None
 
+                    if _got_error:
+                        for preview in discard_tool_previews():
+                            yield preview
                     call_duration_ms = int((time.monotonic() - call_started_at) * 1000)
                     _notify_call_outcome(
                         ok=provider_error_for_log is None,
@@ -9414,6 +9554,7 @@ class Agent:
                             continue
 
                         if large_context_invalid:
+                            fallback_from_model = self._provider_activity_model()
                             if (
                                 not _invalid_response_fallback_done
                                 and self._switch_to_invalid_response_fallback(
@@ -9434,6 +9575,7 @@ class Agent:
                                     activity_id=provider_activity_id,
                                     model=self._provider_activity_model(),
                                     phase="fallback",
+                                    from_model=fallback_from_model,
                                     reason=fallback_reason,
                                     retry_attempt=_call_attempt + 1,
                                     retry_limit=_fallback.max_retries,
@@ -9817,6 +9959,7 @@ class Agent:
                             _call_attempt += 1
                             continue
 
+                        fallback_from_model = self._provider_activity_model()
                         if (
                             attempt_classification.kind
                             in {
@@ -9840,6 +9983,7 @@ class Agent:
                                 activity_id=provider_activity_id,
                                 model=self._provider_activity_model(),
                                 phase="fallback",
+                                from_model=fallback_from_model,
                                 reason=fallback_reason,
                                 retry_attempt=_call_attempt + 1,
                                 retry_limit=_fallback.max_retries,
@@ -10039,12 +10183,15 @@ class Agent:
                             _call_attempt += 1
                             continue
                         provider_error_status_code = (
-                            int(provider_error.code) if str(provider_error.code).isdigit() else None
+                            provider_error.http_status or (
+                                int(provider_error.code)
+                                if str(provider_error.code).isdigit() else None
+                            )
                         )
                         failure_kind = classify_provider_error(
                             provider_name=getattr(self.provider, "provider_name", ""),
                             status_code=provider_error_status_code,
-                            raw_code=provider_error.code,
+                            raw_code=provider_error.provider_code or provider_error.code,
                             message=provider_error.message,
                         )
                         image_failure = classify_image_failure(
@@ -10215,6 +10362,7 @@ class Agent:
                                 ),
                                 code=safe_provider_error_code,
                                 failure_kind=failure_kind.value,
+                                http_status=provider_error.http_status,
                             )
                             yield terminal_error
                             break
@@ -10240,6 +10388,7 @@ class Agent:
                                 ),
                                 code=safe_provider_error_code,
                                 failure_kind=failure_kind.value,
+                                http_status=provider_error.http_status,
                             )
                             yield terminal_error
                             break
@@ -10281,6 +10430,7 @@ class Agent:
                                         "again after one safe recovery attempt."
                                     ),
                                     code="provider_request_message_limit_exhausted",
+                                    http_status=provider_error.http_status,
                                 )
                                 yield terminal_error
                                 break
@@ -10319,6 +10469,7 @@ class Agent:
                                         "without changing protected turn or tool state."
                                     ),
                                     code="provider_request_message_limit_exhausted",
+                                    http_status=provider_error.http_status,
                                 )
                                 yield terminal_error
                                 break
@@ -11294,8 +11445,27 @@ class Agent:
                             getattr(self.provider, "retry_failed_call_safe", True) is not False
                         )
                         connection_failed = provider_error.code == CONNECTION_FAILED_CODE
-                        if connection_failed and retry_failed_call_safe:
-                            delay = min(60.0, 5.0 * 2 ** min(_connection_wait_attempt, 4))
+                        if (
+                            connection_failed and retry_failed_call_safe
+                            and not getattr(provider_error, "recovery_exhausted", False)
+                        ):
+                            delay = recovery_delay_seconds(
+                                kind=ProviderFailureKind.TRANSPORT_TRANSIENT,
+                                attempt=_connection_wait_attempt,
+                                provider_retry_after_s=provider_error.retry_after_s,
+                                connection_failed=True, deadline_at_monotonic=_total_deadline,
+                            )
+                            if delay is None:
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = ErrorEvent(
+                                    message=_safe_provider_terminal_message(
+                                        failure_kind, provider_error.code,
+                                    ), code=provider_error.code,
+                                    failure_kind=failure_kind.value,
+                                    http_status=provider_error.http_status,
+                                )
+                                yield terminal_error
+                                break
                             _connection_wait_attempt += 1
                             yield ProviderActivityEvent(
                                 activity_id=provider_activity_id,
@@ -11308,7 +11478,7 @@ class Agent:
                                 started_at=time.time_ns() // 1_000_000,
                             )
                             async with asyncio.timeout_at(_total_deadline):
-                                await asyncio.sleep(delay)
+                                await sleep_before_retry(delay)
                             next_provider_activity_reason = "transport_transient"
                             yield ProviderActivityEvent(
                                 activity_id=provider_activity_id,
@@ -11323,6 +11493,7 @@ class Agent:
                             continue
                         _connection_wait_attempt = 0
 
+                        fallback_from_model = self._provider_activity_model()
                         if (
                             provider_error.code == "provider_retry_after_deadline"
                             and retry_failed_call_safe
@@ -11337,6 +11508,7 @@ class Agent:
                                 activity_id=provider_activity_id,
                                 model=self._provider_activity_model(),
                                 phase="fallback",
+                                from_model=fallback_from_model,
                                 reason="rate_limited",
                                 retry_attempt=_call_attempt + 1,
                                 retry_limit=_fallback.max_retries,
@@ -11348,7 +11520,8 @@ class Agent:
                         # A wait that cannot fit may only move to a different
                         # authority above. Never replay the rate-limited leg.
                         should_retry = (
-                            provider_error.code not in {
+                            not getattr(provider_error, "recovery_exhausted", False)
+                            and provider_error.code not in {
                                 "provider_retry_after_deadline", "rate_limit_retry_exhausted",
                                 "provider_overload_retry_after_deadline",
                                 "provider_overload_retry_wait_exhausted"
@@ -11379,18 +11552,16 @@ class Agent:
                                     failure_kind.value,
                                 ),
                                 failure_kind=failure_kind.value,
+                                http_status=provider_error.http_status,
                             )
                             yield terminal_error
                             break
-                        local_delay = backoff_sleep(
-                            _retry_attempt,
-                            _fallback.base_backoff_ms,
-                            _fallback.max_backoff_ms,
-                            _fake=True,
-                        )
-                        resolved_retry_delay = _provider_retry_delay_seconds(
-                            local_delay_s=local_delay,
+                        resolved_retry_delay = recovery_delay_seconds(
+                            kind=failure_kind, attempt=_retry_attempt,
                             provider_retry_after_s=provider_error.retry_after_s,
+                            base_ms=_fallback.base_backoff_ms,
+                            max_ms=_fallback.max_backoff_ms,
+                            deadline_at_monotonic=_total_deadline,
                         )
                         reason = _provider_activity_reason_for_failure(failure_kind)
                         retry_exceeds_deadline = bool(
@@ -11399,6 +11570,7 @@ class Agent:
                             and _loop.time() + resolved_retry_delay >= _total_deadline
                         )
                         if resolved_retry_delay is None or retry_exceeds_deadline:
+                            fallback_from_model = self._provider_activity_model()
                             fallback_selected = self._switch_to_invalid_response_fallback(
                                 failure_kind.value,
                                 requires_tools=bool(provider_tools_for_call),
@@ -11409,6 +11581,7 @@ class Agent:
                                     activity_id=provider_activity_id,
                                     model=self._provider_activity_model(),
                                     phase="fallback",
+                                    from_model=fallback_from_model,
                                     reason=reason,
                                     retry_attempt=_retry_attempt + 1,
                                     retry_limit=_fallback.max_retries,
@@ -11428,6 +11601,7 @@ class Agent:
                                     failure_kind.value,
                                 ),
                                 failure_kind=failure_kind.value,
+                                http_status=provider_error.http_status,
                             )
                             yield terminal_error
                             break
@@ -11445,6 +11619,7 @@ class Agent:
                             retry_attempt=_retry_attempt + 1,
                             retry_limit=_fallback.max_retries,
                             retry_after_ms=math.ceil(resolved_retry_delay * 1000),
+                            http_status=provider_error.http_status,
                             started_at=time.time_ns() // 1_000_000,
                         )
                         async with asyncio.timeout_at(_total_deadline):
@@ -11542,6 +11717,13 @@ class Agent:
                             provider_done_for_log,
                         )
                 for pending_tool_event in pending_tool_events:
+                    if isinstance(pending_tool_event, ToolUseStartEvent):
+                        for preview_id, preview in list(active_tool_previews.items()):
+                            if preview.tool_use_id == pending_tool_event.tool_use_id:
+                                yield replace(
+                                    preview, state="committed", revision=preview.revision + 1,
+                                )
+                                del active_tool_previews[preview_id]
                     turn_image_retry_barrier_crossed = True
                     yield pending_tool_event
                 pending_tool_events.clear()
@@ -13023,6 +13205,8 @@ class Agent:
         # Do not add an await or another yield between this drain and the
         # terminal DoneEvent. A completed child is marked consumed only inside
         # the same event-loop slice that delivers the aggregate report.
+        for preview in discard_tool_previews():
+            yield preview
         rolled_subagent_usage = False
         for child_usage in self.subagent_manager.drain_completed_usage():
             rolled_subagent_usage = True
@@ -15616,6 +15800,23 @@ class Agent:
 
         summary_started = False
         previous_started = config.on_summary_call_started
+        previous_recovery = config.on_summary_recovery
+
+        def on_summary_recovery(event: ProviderDomainActivityEvent) -> None:
+            from opensquilla.session.compaction import summary_recovery_payload
+            if previous_recovery is not None:
+                previous_recovery(event)
+            if self._session_key:
+                notify_compaction(
+                    self._session_key, source="automatic", phase="summarizing", status="observed",
+                    recovery=summary_recovery_payload(event),
+                    **compaction_effect_payload(status="observed"),
+                    **compaction_lifecycle_payload(
+                        config.operation_id or "", COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+
+        config.on_summary_recovery = on_summary_recovery
 
         def on_summary_started() -> None:
             nonlocal summary_started
@@ -15641,6 +15842,7 @@ class Agent:
             raise
         finally:
             config.on_summary_call_started = previous_started
+            config.on_summary_recovery = previous_recovery
         self._require_compaction_parent_time(parent_config)
         if not summary_started:
             return result
@@ -16283,6 +16485,7 @@ class Agent:
                     notify_compaction(
                         self._session_key, source="automatic", phase="agent_inline_overflow",
                         status="failed", reason=self._last_compaction_refusal_reason,
+                        failure_detail=result.failure_detail,
                         **compaction_effect_payload(
                             status="failed", reason=self._last_compaction_refusal_reason,
                         ),

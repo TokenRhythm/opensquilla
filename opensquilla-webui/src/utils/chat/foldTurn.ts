@@ -17,6 +17,7 @@ import type {
 import type { ArtifactPayload } from '@/types/artifacts'
 import type { Frame, ReasoningBlock } from '@/types/turnlog'
 import {
+  isAnswerTransparentControlTool,
   isEmptyToolPreview,
   toolDisplayName,
   toolOperationKey,
@@ -49,6 +50,25 @@ export interface FoldedTurn {
 // 'stream' base key, so the fold must use the identical key to match groupIds
 // and tool renderKeys exactly (see grouping/ordering identity).
 const LIVE_OWNER_KEY = 'stream'
+
+/** Confirm pre-tool narration only on the published projection. The original
+ * provisional markers must remain available to authoritative text replacement.
+ */
+function markPreToolNarration(segments: ChatStreamSegment[], calls: ChatToolCall[]): void {
+  const ordinaryGroups = new Set(calls
+    .filter(call => !isAnswerTransparentControlTool(call.name))
+    .map(call => call.groupId))
+  for (let index = 1; index < segments.length; index += 1) {
+    const segment = segments[index]
+    const previous = segments[index - 1]
+    if (segment.type === 'tool-group'
+      && ordinaryGroups.has(segment.groupId)
+      && previous.type === 'text'
+      && previous.presentation === 'answer') {
+      previous.presentation = 'intermediate'
+    }
+  }
+}
 
 /** One ordered interrupt accumulated by the fold, keyed by approvalId. */
 type FoldedInterrupt = ToPartsInterrupt
@@ -503,6 +523,9 @@ export class TurnAccumulator {
           label: frame.label,
           at: frame.at,
           activityOrder: frame.activityOrder,
+          providerRecovery: frame.providerRecovery,
+          httpStatus: frame.httpStatus,
+          failureKind: frame.failureKind,
           ...(frame.id ? { id: frame.id } : {}),
           ...(frame.category ? { category: frame.category } : {}),
           ...(frame.state ? { state: frame.state } : {}),
@@ -579,6 +602,7 @@ export class TurnAccumulator {
     // private state between frames; already-published snapshots must stay
     // immutable until the scheduler explicitly publishes the next one.
     const segments = this.segments.map(segment => ({ ...segment }))
+    markPreToolNarration(segments, this.toolCalls)
     const toolCalls = this.toolCalls.map(call => ({
       ...call,
       ...(materializeRunningToolInputs
@@ -945,6 +969,9 @@ export function foldTurn(
           label: frame.label,
           at: frame.at,
           activityOrder: frame.activityOrder,
+          providerRecovery: frame.providerRecovery,
+          httpStatus: frame.httpStatus,
+          failureKind: frame.failureKind,
           ...(frame.id ? { id: frame.id } : {}),
           ...(frame.category ? { category: frame.category } : {}),
           ...(frame.state ? { state: frame.state } : {}),
@@ -983,6 +1010,7 @@ export function foldTurn(
     rawText = reconciled.rawText
     if (reconciled.segments !== segments) segments.splice(0, segments.length, ...reconciled.segments)
   }
+  markPreToolNarration(segments, toolCalls)
 
   // Render text segment html with the same renderer the legacy flush uses, so
   // compared html matches after a flush (synchronous here; ).

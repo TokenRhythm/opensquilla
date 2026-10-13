@@ -1,8 +1,11 @@
+import { compactionSkippedProviderFailure } from '@/utils/chat/compactionStatus'
+import type { ProviderRecovery } from '@/types/parts'
+import { providerRecoveryIdentity } from '@/utils/chat/providerRecovery'
 import type {
   ConversationCompactionContent,
   ConversationToolContent,
 } from '@/modules/conversationEventContent'
-import { computed, ref, type Ref } from 'vue'
+import { computed, ref, watch, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type {
   ChatMessage,
@@ -43,6 +46,8 @@ import type { ReasoningBlock } from '@/types/turnlog'
 import { isLegacySilentSentinelOnly } from '@/utils/chat/silentSentinels'
 import { createClientMessageId } from '@/utils/chat/messageIdentity'
 import { normalizeToolFileSnapshot } from '@/utils/chat/toolFileSnapshot'
+import { useToolInputPreviews } from './useToolInputPreviews'
+import type { ToolInputPreview } from '@/types/toolInputPreview'
 
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 630_000
 const THINKING_DELAY_MS = 400
@@ -146,6 +151,8 @@ export function resolvedStreamIdleTimeoutMs(value: number | null | undefined): n
 
 export function useChatStream(options: UseChatStreamOptions) {
   const isStreaming = ref(false)
+  const toolInputDrafts = useToolInputPreviews()
+  const stopDraftAbortWatch = watch(options.aborted, aborted => { if (aborted) toolInputDrafts.clear() }, { flush: 'sync' })
   const streamPreviewComplete = ref(true)
   // A replay summary may omit persisted text. Keep that fact until history
   // takes over, without stopping later live deltas from reaching the renderer.
@@ -198,7 +205,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     )
   })
 
-  const streamActivity = ref({ label: 'Sending', key: 'Sending', startedAt: 0 })
+  const streamActivity = ref<{ label: string; key: string; startedAt: number; providerRecovery?: ProviderRecovery }>({ label: 'Sending', key: 'Sending', startedAt: 0 })
   // Turn ownership is intentionally separate from the mutable phase clock.
   // Provider/router transitions may restart the small phase timer, but the
   // disclosure header must measure one uninterrupted user-visible run.
@@ -346,6 +353,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   let renderDirty = false
 
   function resetStreamState() {
+    toolInputDrafts.clear()
     acceptedActivityStartedAt = 0
     activeModelCallId = ''
     activeModelCallIteration = 0
@@ -381,19 +389,19 @@ export function useChatStream(options: UseChatStreamOptions) {
     )
   }
 
-  function setStreamActivity(label: string, key = label, recordActivity = true) {
+  function setStreamActivity(label: string, key = label, recordActivity = true, providerRecovery?: ProviderRecovery) {
     noteStreamSignal()
     const current = streamActivity.value
     let isNewPhase = false
-    if (current.key === key) {
+    if (current.key === key && providerRecoveryIdentity(current.providerRecovery) === providerRecoveryIdentity(providerRecovery)) {
       if (!current.startedAt) {
-        streamActivity.value = { label, key, startedAt: acceptedActivityStartedAt || Date.now() }
+        streamActivity.value = { label, key, startedAt: acceptedActivityStartedAt || Date.now(), providerRecovery }
         isNewPhase = true
       } else if (current.label !== label) {
-        streamActivity.value = { label, key, startedAt: current.startedAt }
+        streamActivity.value = { label, key, startedAt: current.startedAt, providerRecovery }
       }
     } else {
-      streamActivity.value = { label, key, startedAt: acceptedActivityStartedAt || Date.now() }
+      streamActivity.value = { label, key, startedAt: acceptedActivityStartedAt || Date.now(), providerRecovery }
       isNewPhase = true
     }
     // Record each accepted phase transition into the append-only log so the
@@ -401,7 +409,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     // Label-only refinements (same key) emit nothing — only a real phase change.
     if (isNewPhase && recordActivity) {
       const committed = streamActivity.value
-      appendFrame({ kind: 'status', action: committed.key, label: committed.label, at: committed.startedAt })
+      appendFrame({ kind: 'status', action: committed.key, label: committed.label, at: committed.startedAt, providerRecovery: committed.providerRecovery, httpStatus: committed.providerRecovery?.httpStatus })
       // TurnAccumulator is intentionally non-reactive. A provider phase can be
       // the only semantic progress for minutes, so publish the status through
       // the same frame clock even when no text/tool delta follows it.
@@ -414,14 +422,23 @@ export function useChatStream(options: UseChatStreamOptions) {
     }
   }
 
-  function recordActivityPhase(label: string, key = label) {
-    setStreamActivity(label, key, true)
+  function recordActivityPhase(label: string, key = label, providerRecovery?: ProviderRecovery) {
+    // Reasoning text and provider activity describe the same running phase.
+    // Different pulse metadata must not add rows or restart its phase clock;
+    // an intervening waiting/tool/answer phase still starts a fresh occurrence.
+    if (key === 'provider:reasoning' && streamActivity.value.key === key) {
+      noteStreamSignal()
+      return
+    }
+    setStreamActivity(label, key, true, providerRecovery)
   }
 
   function recordCompactionActivity(payload: ConversationCompactionContent) {
     noteStreamSignal()
     const rawStatus = String(payload.status || '').toLowerCase()
-    const state = rawStatus === 'skipped'
+    const state = compactionSkippedProviderFailure(rawStatus, payload.reason || payload.skip_reason, payload.compactionFailure?.failureKind)
+      ? 'failed'
+      : rawStatus === 'skipped'
       ? 'skipped'
       : rawStatus === 'stale'
         ? 'stale'
@@ -433,6 +450,8 @@ export function useChatStream(options: UseChatStreamOptions) {
               ? 'failed'
               : 'running'
     const id = String(payload.compaction_id || 'current')
+    const previous = foldedTurn.value.statusHistory.find(entry => entry.category === 'maintenance' && entry.id === id)
+    const recovery = state === 'running' ? payload.compactionRecovery ?? (previous?.state === 'running' ? previous.providerRecovery : undefined) : undefined
     appendFrame({
       kind: 'status',
       action: 'context_compaction',
@@ -447,6 +466,9 @@ export function useChatStream(options: UseChatStreamOptions) {
         : String(payload.durability || ''),
       detail: String(payload.detail || payload.phase || ''),
       reason: String(payload.reason || payload.skip_reason || ''),
+      providerRecovery: recovery,
+      httpStatus: state === 'failed' ? payload.compactionFailure?.httpStatus : state === 'running' ? recovery?.httpStatus : undefined,
+      failureKind: state === 'failed' ? payload.compactionFailure?.failureKind : undefined,
     })
     scheduleRender()
   }
@@ -927,6 +949,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     textSnapshot?: string
     preserveCompletedTools?: boolean
   } = {}) {
+    toolInputDrafts.clear()
     const preserveCompletedTools = optionsArg.preserveCompletedTools !== false
     const currentToolCalls = foldedTurn.value.toolCalls
     const completedToolIds = new Set(
@@ -1058,6 +1081,9 @@ export function useChatStream(options: UseChatStreamOptions) {
     if (!renderDirty) return
 
     publishTurnLog()
+    // Retain the draft until the real tool is published on the same frame.
+    // Clearing on tool-start receipt would briefly leave neither row visible.
+    for (const call of foldedTurn.value.toolCalls) toolInputDrafts.handoff(call.toolId)
     renderDirty = false
     if (options.autoScroll.value) options.scrollToBottom()
   }
@@ -1380,6 +1406,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       tool_name: tc.name,
       input: tc.inputRaw || tc.inputPreview,
       groupId: tc.groupId,
+      activityOrder: tc.activityOrder,
       result: tc.result,
       execution_log_handle: tc.executionLogHandle,
       ...(tc.fileSnapshot && !tc.isError ? { file_snapshot: tc.fileSnapshot } : {}),
@@ -1557,6 +1584,8 @@ export function useChatStream(options: UseChatStreamOptions) {
   }
 
   function cleanup() {
+    stopDraftAbortWatch()
+    toolInputDrafts.clear()
     clearRenderTimer()
     clearStreamIdleTimer()
     hideThinkingIndicator()
@@ -1567,6 +1596,8 @@ export function useChatStream(options: UseChatStreamOptions) {
   }
 
   return {
+    toolInputPreviews: toolInputDrafts.previews,
+    applyToolInputPreview: (preview: ToolInputPreview, activityOrder: number, existingOnly = false) => toolInputDrafts.accept(preview, activityOrder, existingOnly),
     isStreaming,
     streamArtifacts,
     streamBubble,

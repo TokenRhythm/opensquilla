@@ -29,7 +29,7 @@
       "delivery": "live-only-best-effort",
       "family": "conversation.events",
       "schema": "conversation/conversation-events.schema.json",
-      "schemaSha256": "952ace8aac4aeba3655438191a3d7c9baed037e24455117b369e0591ec600643",
+      "schemaSha256": "2132533c804cbe36e2dddde7ee2101a37a782642a0635b792c71fed918afca63",
       "schemaVersion": 1,
       "wireNames": [
         "chat.done",
@@ -69,6 +69,7 @@
         "session.event.thinking_end",
         "session.event.thinking_start",
         "session.event.tool_result",
+        "session.event.tool_input_preview",
         "session.event.tool_use_delta",
         "session.event.tool_use_end",
         "session.event.tool_use_start",
@@ -1430,7 +1431,7 @@
     "generatorSha256": "1fbd19302f070afa0dad372640c6814abf36a9ae7699e2c6020d72f932e9c12f",
     "methodCount": 209,
     "schemaCount": 219,
-    "schemaTreeSha256": "60177cf57cc690dbf09080c8d9071da638316c0ab37306fc317d60e4365553d0",
+    "schemaTreeSha256": "ba5a003a88857216f3566c729d82a1372a2bdf810558c4ce21b39e541e5b9006",
     "toolchains": {
       "legacyTypes": {
         "python": {

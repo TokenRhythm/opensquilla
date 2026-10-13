@@ -97,6 +97,9 @@ type FrameBody =
       // moves to a new phase so the finished turn can show what the agent was
       // doing; the fold accumulates these into a per-turn activity history.
       kind: 'status'
+      providerRecovery?: import('./parts').ProviderRecovery
+      httpStatus?: number
+      failureKind?: string
       seq: number
       action: string   // stable phase key (streamActivity.key)
       label: string    // human label (streamActivity.label)

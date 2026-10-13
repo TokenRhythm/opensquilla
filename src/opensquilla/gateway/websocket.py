@@ -244,8 +244,11 @@ _SESSION_MUTATION_METHODS = frozenset({
     "sessions.pending_inputs.dispatch", "sessions.pending_inputs.steer",
 })
 _SESSION_IDENTITY_MUTATIONS = frozenset({
-    "sessions.reset", "sessions.delete", "sessions.truncate", "sessions.contextCompact",
+    "sessions.reset", "sessions.delete", "sessions.truncate",
 })
+# Compaction preserves the session owner and canonical conversation. Keep its
+# existing subscription live during summary recovery; the completed lifecycle
+# event triggers history refresh. It remains an ordered session mutation above.
 # Running mutations retain their existing completion semantics after a peer
 # leaves. Strong references keep their result supervised until completion.
 _DRAINING_ORDINARY_WORKERS: set[asyncio.Task[None]] = set()

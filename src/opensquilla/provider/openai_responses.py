@@ -28,7 +28,13 @@ from .error_redaction import (
     redact_upstream_error_text,
     redacted_httpx_error,
 )
-from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
+from .failures import (
+    CONNECTION_FAILED_CODE,
+    is_connection_failure,
+    retry_after_from_headers,
+    safe_http_status,
+    structured_provider_error_code,
+)
 from .openai import _http_error_body_text, _resolve_llm_proxy, _versioned_api_url
 from .protocol import (
     ProviderConnectionConfig,
@@ -493,6 +499,8 @@ class OpenAIResponsesProvider:
             yield ErrorEvent(
                 message=message,
                 code=str(response.status_code),
+                http_status=safe_http_status(response.status_code),
+                provider_code=structured_provider_error_code(response.text),
                 retry_after_s=retry_after_from_headers(
                     response.status_code,
                     getattr(response, "headers", None),

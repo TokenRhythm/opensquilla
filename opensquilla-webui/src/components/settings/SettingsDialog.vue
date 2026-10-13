@@ -87,8 +87,8 @@
         >
           <fieldset
             class="settings-panel__interactions"
-            :disabled="settingsInteractionLocked"
-            :aria-busy="settingsInteractionLocked ? 'true' : undefined"
+            :disabled="settingsFormLocked"
+            :aria-busy="settingsFormLocked ? 'true' : undefined"
           >
           <!-- Gateway remains available even when config readiness cannot load,
                because this is where users recover the connection/runtime. -->
@@ -229,13 +229,13 @@
           {{ settingsInteractionLocked ? t('settings.dialog.savingChanges') : dirtyBarText }}
         </span>
         <span class="settings-dirtybar__spacer"></span>
-        <button type="button" class="btn" :disabled="settingsInteractionLocked" @click="discardChanges">
+        <button type="button" class="btn" :disabled="settingsFormLocked" @click="discardChanges">
           {{ dirtyDiscardLabel }}
         </button>
         <button
           type="button"
           class="btn btn--primary"
-          :disabled="settingsInteractionLocked"
+          :disabled="settingsFormLocked"
           :aria-busy="settingsInteractionLocked ? 'true' : undefined"
           @click="saveDirtySections"
         >{{ settingsInteractionLocked ? t('settings.dialog.savingChanges') : dirtySaveLabel }}</button>
@@ -499,6 +499,8 @@ const hasPendingSettingsWrite = computed(() => (
 const settingsInteractionLocked = computed(() => (
   saveAllPending.value || closeSavePending.value || primaryMutationPending.value || sandboxLeavePending.value
 ))
+// A routing-mode write must not claim that unrelated manual drafts are saving.
+const settingsFormLocked = computed(() => settingsInteractionLocked.value || modelStrategyRoutingBusy.value)
 const shouldGuardBrowserUnload = computed(() => (
   hasSettingsExitDraft.value || hasPendingSettingsWrite.value
   || securityPrivacyPanel.value?.hasUnsettledChanges === true

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from opensquilla.contracts.turn_execution import StickyExecutionRole
 from opensquilla.execution_status import ExecutionStatus
+from opensquilla.provider.activity import safe_activity_model
 from opensquilla.redaction import redact_error_text
 
 if TYPE_CHECKING:
@@ -251,6 +252,12 @@ class ErrorEvent:
     # model to correct it without replaying the preceding visible response.
     tool_argument_rejection: ToolArgumentRejection | None = None
     cumulative_usage_id: str = ""
+    # Actual HTTP response status only; business error codes must not populate this.
+    http_status: int | None = None
+    # The request owner consumed its retry budget; outer layers must not replay it.
+    recovery_exhausted: bool = False
+    # Internal machine cause, independent of the HTTP transport status.
+    provider_code: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +283,24 @@ class ProviderGenerationResetEvent:
     usage_missing_count: int = 0
     ensemble_trace: dict[str, Any] | None = None
     cumulative_usage_id: str = ""
+    terminal_http_status: int | None = None
+
+
+@dataclass
+class ToolInputPreviewEvent:
+    """Revocable display draft; never evidence that a tool has executed."""
+
+    kind: Literal["tool_input_preview"] = field(default="tool_input_preview", init=False)
+    preview_id: str = ""
+    attempt_id: str = ""
+    generation_epoch: int | None = None
+    tool_use_id: str = ""
+    revision: int = 0
+    state: Literal["generating", "committed", "discarded"] = "generating"
+    tool_name: Literal["write_file"] = "write_file"
+    path: str = ""
+    content: str = ""
+    truncated: bool = False
 
 
 @dataclass
@@ -382,6 +407,15 @@ class ProviderActivityEvent:
     started_at: int = 0
     heartbeat: bool = False
     model: str = ""
+    http_status: int | None = None
+    # Actual failed leg; model names the next attempted leg during fallback.
+    from_model: str = ""
+
+    def __post_init__(self) -> None:
+        self.model = safe_activity_model(self.model) or ""
+        self.from_model = (
+            safe_activity_model(self.from_model) or "" if self.phase == "fallback" else ""
+        )
 
 
 @dataclass
@@ -444,6 +478,7 @@ StreamEvent = (
     | ErrorEvent
     | ProviderGenerationResetEvent
     | ProviderHeartbeatEvent
+    | ToolInputPreviewEvent
     | ProviderActivityEvent
     | EnsembleProgressEvent
 )
@@ -860,6 +895,7 @@ def synthetic_failure_event(kind: ProviderFailureKind) -> ErrorEvent:
         _Kind.CONTEXT_OVERFLOW: ("", "injected context window overflow"),
         _Kind.UNSUPPORTED_FEATURE: ("", "injected unsupported feature"),
         _Kind.INSUFFICIENT_CREDITS: ("402", "injected insufficient credits"),
+        _Kind.USAGE_LIMIT: ("usage_limit_reached", "injected usage limit reached"),
         _Kind.MODEL_NOT_FOUND: ("404", "injected model not found"),
         _Kind.TRANSPORT_TRANSIENT: ("", "injected connection timeout"),
         _Kind.POLICY_REFUSAL: ("", "injected policy violation"),

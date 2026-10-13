@@ -15,7 +15,8 @@
         class="assistant-activity-status__row"
         :class="{
           'assistant-activity-status__row--current': step.isCurrent,
-          'assistant-activity-status__row--animating': step.isCurrent && executing && activityVisible,
+          'assistant-activity-status__row--routine': isRoutineActivityPhaseStep(step),
+          'assistant-activity-status__row--animating': step.isCurrent && executing && activityVisible && step.providerRecovery?.phase !== 'retry_wait',
           'assistant-activity-status__row--maintenance': step.category === 'maintenance',
           'assistant-activity-status__row--failed': step.state === 'failed',
         }"
@@ -25,15 +26,19 @@
         :data-source="step.source"
         :data-durability="step.durability"
       >
-        <span class="assistant-activity-status__dot" aria-hidden="true" />
-        <span
+        <span v-if="!isRoutineActivityPhaseStep(step)" class="assistant-activity-status__dot" aria-hidden="true" />
+        <ActivityMotion
+          class="assistant-activity-status__content"
+          :active="isRoutineActivityPhaseStep(step) && step.isCurrent && executing && activityVisible"
           :role="step.category === 'maintenance' ? (step.state === 'failed' ? 'alert' : 'status') : undefined"
           :aria-live="step.category === 'maintenance' ? (step.state === 'failed' ? 'assertive' : 'polite') : undefined"
           :aria-atomic="step.category === 'maintenance' ? 'true' : undefined"
         >
-          <span>{{ t(step.label.code, step.label.params) }}</span>
+          <span :aria-hidden="step.providerRecovery?.phase === 'retry_wait' ? 'true' : undefined">{{ statusText(step) }}</span>
+          <span v-if="step.providerRecovery?.phase === 'retry_wait'" class="sr-only">{{ statusText(step, true) }}</span>
+          <span v-if="step.httpStatus && (step.providerRecovery?.phase === 'retry_wait' || step.state === 'failed')" class="assistant-activity-status__detail">{{ t('chat.httpStatus', { status: step.httpStatus }) }}</span>
           <span
-            v-if="step.durationSeconds !== undefined"
+            v-if="!isRoutineActivityPhaseStep(step) && step.durationSeconds !== undefined"
             class="assistant-activity-status__duration"
             aria-hidden="true"
           >
@@ -45,7 +50,7 @@
           >
             {{ t('chat.compact.requestScoped') }}
           </span>
-        </span>
+        </ActivityMotion>
       </li>
     </TransitionGroup>
     <template v-for="segment in renderSegments()" :key="segment.key">
@@ -82,6 +87,9 @@
 <script setup lang="ts">
 import { Comment, Fragment, Text, computed, isVNode, type VNode } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { chatErrorPresentation } from '@/utils/chat/chatErrorPresentation'
+import { useProviderRecoveryClock } from '@/composables/chat/useProviderRecoveryClock'
+import ActivityMotion from '@/components/chat/ActivityMotion.vue'
 import ActivityNarration from '@/components/chat/ActivityNarration.vue'
 import ToolCallTimeline from '@/components/chat/ToolCallTimeline.vue'
 import type {
@@ -92,7 +100,10 @@ import type {
 } from '@/types/chat'
 import {
   type AssistantActivityTimelineProjection,
+  type AssistantActivityStatusStep,
+  providerActivityLabel,
   isBeforeReasoningActivityStatusStep,
+  isRoutineActivityPhaseStep,
   isVisibleActivityStatusStep,
 } from '@/utils/chat/assistantActivity'
 import { toolIconName, toolOperationKey } from '@/utils/chat/toolDisplay'
@@ -150,6 +161,14 @@ const statusSteps = computed(() => {
   return positionedSteps.slice(-3)
 })
 
+const now = useProviderRecoveryClock(() => activityVisible.value && statusSteps.value.some(step => step.isCurrent && step.providerRecovery?.phase === 'retry_wait'))
+function statusText(step: AssistantActivityStatusStep, announce = false): string {
+  if (step.state === 'failed' && step.failureKind) return `${t(step.label.code, step.label.params)} · ${t(chatErrorPresentation({ failureKind: step.failureKind }).messageKey)}`
+  const descriptor = providerActivityLabel(step, now.value, announce)
+  const recovery = String(t(descriptor.code, descriptor.params))
+  return step.category === 'maintenance' && step.isCurrent && step.providerRecovery
+    ? `${t(step.label.code, step.label.params)} · ${recovery}` : recovery
+}
 function formatDuration(seconds: number): string {
   const whole = Math.max(0, Math.floor(seconds))
   if (whole < 60) return String(t('chat.activityDurationSeconds', { seconds: whole }))
@@ -191,7 +210,10 @@ const items = computed<ChatStreamTimelineItem[]>(() => {
   if (props.timelineItems?.length) {
     // The original items own call order, narration boundaries and aggregate
     // failure evidence. RunTrace flattens their calls for presentation.
-    return props.timelineItems
+    // Whitespace-only stream segments can have raw text but no rendered HTML.
+    // Keep them in the canonical stream, but do not let an empty narration
+    // claim both adjacent paragraph gaps in the activity presentation.
+    return props.timelineItems.filter(item => item.type !== 'text' || !!item.html.trim())
   }
 
   return props.projection.activityClusters.flatMap(cluster => clusterItem(cluster) ?? [])
@@ -267,9 +289,14 @@ function InterruptSlotContent({ nodes }: { nodes?: VNode[] }) {
 </script>
 
 <style scoped>
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 .assistant-activity-timeline {
   display: flow-root;
   min-width: 0;
+}
+
+.assistant-activity-timeline :deep(.tool-timeline--checklist) {
+  gap: 0;
 }
 
 /* Keep tool rows dense; only narrative boundaries receive reading space. */
@@ -285,7 +312,7 @@ function InterruptSlotContent({ nodes }: { nodes?: VNode[] }) {
 
 .assistant-activity-timeline > .tool-timeline + .activity-narration,
 .assistant-activity-timeline > .assistant-activity-status + .activity-narration {
-  margin-top: 1.25rem;
+  margin-top: 0.75rem;
 }
 
 .assistant-activity-status {
@@ -309,6 +336,27 @@ function InterruptSlotContent({ nodes }: { nodes?: VNode[] }) {
 
 .assistant-activity-status__row--current {
   color: color-mix(in srgb, var(--text) 82%, transparent);
+}
+
+/* Routine progress shares thinking's text motion and reading origin.
+   The disclosure header owns elapsed time; no second ticking label or dot. */
+.assistant-activity-status__row--routine {
+  padding-inline: 0;
+  color: var(--text-dim);
+}
+
+.assistant-activity-status__row--routine .assistant-activity-status__content {
+  flex: 0 1 auto;
+}
+
+.assistant-activity-status__row--routine.activity-step-enter-from {
+  opacity: 1;
+  transform: none;
+}
+
+.assistant-activity-status__content {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .activity-step-enter-from {

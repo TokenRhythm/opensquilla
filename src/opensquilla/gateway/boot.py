@@ -282,11 +282,13 @@ class TaskRuntimeStreamError(RuntimeError):
         no_prior_provider_dispatch: bool = False,
         replay_safe: bool = False,
         error_id: str | None = None,
+        http_status: int | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.terminal_reason = terminal_reason
         self.failure_kind = failure_kind
+        self.http_status = http_status
         self.retry_after_ms = retry_after_ms
         self.activity_snapshot = activity_snapshot
         self.usage_call_index = usage_call_index
@@ -1870,11 +1872,14 @@ async def _emit_task_runtime_stream_events(
     from dataclasses import is_dataclass
 
     from opensquilla.engine.stream_wrappers import wrap_stream
+    from opensquilla.provider.activity import safe_activity_model
+    from opensquilla.provider.failures import safe_http_status
 
     error_message: str | None = None
     error_code: str | None = None
     error_id: str | None = None
     failure_kind: str | None = None
+    http_status: int | None = None
     terminal_reason: str | None = None
     retry_after_ms: int | None = None
     activity_phases: list[dict[str, Any]] = []
@@ -1929,6 +1934,7 @@ async def _emit_task_runtime_stream_events(
                 if isinstance(raw_terminal_failure_kind, str) and raw_terminal_failure_kind
                 else None
             )
+            http_status = safe_http_status(event_dict.get("terminal_http_status"))
             terminal_reason = "error"
             event_dict.setdefault("terminal_reason", terminal_reason)
         if event_kind == "answer_generation_reset":
@@ -1940,6 +1946,7 @@ async def _emit_task_runtime_stream_events(
             event_dict.pop("terminal_error_message", None)
             event_dict.pop("terminal_error_code", None)
             event_dict.pop("terminal_failure_kind", None)
+            event_dict.pop("terminal_http_status", None)
         if event_kind == "thinking" and not event_dict.get("block_id"):
             # Preserve the exact legacy payload for producers that still
             # construct an unscoped ThinkingEvent.
@@ -1954,7 +1961,21 @@ async def _emit_task_runtime_stream_events(
             )
         if event_kind == "artifact":
             event_dict = enrich_artifact_event_dict(event_dict)
+        if event_kind == "provider_activity":
+            for model_field in ("model", "from_model"):
+                model_value = safe_activity_model(event_dict.pop(model_field, None))
+                if model_value is not None and (
+                    model_field == "model" or event_dict.get("phase") == "fallback"
+                ):
+                    event_dict[model_field] = model_value
+        if event_kind in {"error", "provider_activity"}:
+            observed_http_status = safe_http_status(event_dict.pop("http_status", None))
+            if observed_http_status is not None and (
+                event_kind == "error" or event_dict.get("phase") == "retry_wait"
+            ):
+                event_dict["http_status"] = observed_http_status
         if event_kind == "error":
+            http_status = observed_http_status
             raw_message = event_dict.get("message")
             error_message = (
                 raw_message if isinstance(raw_message, str) and raw_message else "Agent error"
@@ -2034,6 +2055,7 @@ async def _emit_task_runtime_stream_events(
                 message=build_terminal_reply(terminal_payload),
                 error_class=error_code,
                 failure_kind=failure_kind,
+                http_status=http_status,
             ).to_dict()
             if error_id is not None:
                 outcome["error_id"] = error_id
@@ -2122,6 +2144,7 @@ async def _emit_task_runtime_stream_events(
             code=error_code,
             terminal_reason=terminal_reason,
             failure_kind=failure_kind,
+            http_status=http_status,
             error_id=error_id,
             retry_after_ms=retry_after_ms,
             activity_snapshot=activity_snapshot,

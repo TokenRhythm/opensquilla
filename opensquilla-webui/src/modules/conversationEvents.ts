@@ -50,6 +50,7 @@ export type ConversationSemanticEventKind =
   | 'thinking-ended'
   | 'thinking-started'
   | 'tool-result'
+  | 'tool-input-preview'
   | 'tool-use-delta'
   | 'tool-use-ended'
   | 'tool-use-started'
@@ -79,6 +80,7 @@ type ProjectedEvent<K extends ConversationSemanticEventKind, P> = ConversationEv
 export type ConversationEventProjection =
   | ProjectedEvent<'skill-load', ConversationEventData>
   | ProjectedEvent<'execution-progress', ConversationEventData>
+  | ProjectedEvent<'tool-input-preview', ConversationEventData>
   | ProjectedEvent<'cron-result', ConversationCronResult>
   | ProjectedEvent<'provider-activity', ConversationProviderActivity>
   | ProjectedEvent<'ensemble-progress', ConversationEnsembleProgress>

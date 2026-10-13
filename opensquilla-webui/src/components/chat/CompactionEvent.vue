@@ -2,7 +2,7 @@
   <div
     class="chat-compaction-event"
     :class="{
-      'chat-compaction-event--running': maintenance?.state === 'running',
+      'chat-compaction-event--running': maintenance?.state === 'running' && maintenance.providerRecovery?.phase !== 'retry_wait',
       'chat-compaction-event--failed': maintenance?.state === 'failed',
     }"
     data-testid="compaction-event"
@@ -18,6 +18,9 @@
     <span class="chat-compaction-event__marker" aria-hidden="true" />
     <div class="chat-compaction-event__body">
       <span class="chat-compaction-event__title">{{ t(labelCode) }}</span>
+      <span v-if="recoveryLabel" :aria-hidden="maintenance?.providerRecovery?.phase === 'retry_wait' ? 'true' : undefined"> · {{ recoveryLabel }}</span>
+      <span v-if="recoveryAnnouncement" class="sr-only">{{ recoveryAnnouncement }}</span>
+      <span v-if="maintenance?.httpStatus && (maintenance.state === 'failed' || maintenance.providerRecovery?.phase === 'retry_wait')" class="chat-compaction-event__http">{{ t('chat.httpStatus', { status: maintenance.httpStatus }) }}</span>
       <span v-if="detailLabelCode" class="chat-compaction-event__detail">
         {{ t(detailLabelCode) }}
       </span>
@@ -43,6 +46,9 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { providerActivityLabel } from '@/utils/chat/assistantActivity'
+import { chatErrorPresentation } from '@/utils/chat/chatErrorPresentation'
+import { useProviderRecoveryClock } from '@/composables/chat/useProviderRecoveryClock'
 import { useI18n } from 'vue-i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
 import { copyTextWithFallback } from '@/utils/browser'
@@ -58,6 +64,15 @@ const props = defineProps<{
 
 const { t } = useI18n()
 const maintenance = computed(() => props.message.maintenance)
+const now = useProviderRecoveryClock(() => !props.message.restoredFromHistory && maintenance.value?.state === 'running' && maintenance.value.providerRecovery?.phase === 'retry_wait')
+function recoveryText(announce = false): string {
+  const value = maintenance.value
+  if (!value?.providerRecovery || value.state !== 'running') return ''
+  const label = providerActivityLabel({ key: value.compactionId, at: 0, isCurrent: !props.message.restoredFromHistory, providerRecovery: value.providerRecovery, label: { code: 'chat.compact.compacting', params: {} } }, now.value, announce)
+  return String(t(label.code, label.params))
+}
+const recoveryLabel = computed(() => recoveryText())
+const recoveryAnnouncement = computed(() => maintenance.value?.providerRecovery?.phase === 'retry_wait' ? recoveryText(true) : '')
 const copied = ref(false)
 const copyFailed = ref(false)
 const failure = computed(() => compactionFailurePresentation(maintenance.value?.reason))
@@ -83,6 +98,7 @@ const labelCode = computed(() => {
   return compactionCompletedLabelCode(maintenance.value?.durability)
 })
 const detailLabelCode = computed(() => {
+  if (maintenance.value?.state === 'failed' && maintenance.value.failureKind) return chatErrorPresentation({ failureKind: maintenance.value.failureKind }).messageKey
   if (maintenance.value?.state === 'failed' && maintenance.value.source === 'manual') {
     return failure.value.detail
   }
@@ -102,6 +118,8 @@ const liveMode = computed(() => {
 </script>
 
 <style scoped>
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+.chat-compaction-event__http { color: var(--text-dim); font-size: var(--fs-xs); white-space: nowrap; }
 /* This event is rendered below ChatMessageList, so it must own its styles.
    ChatView's scoped stylesheet cannot reach through that component boundary. */
 .chat-compaction-event {

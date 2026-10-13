@@ -283,6 +283,34 @@ describe('SettingsDialog save-all pending state', () => {
     expect(controls.saveDirtySections).toHaveBeenCalledOnce()
   })
 
+  it('preserves the existing draft bar while locking its actions during routing autosave', async () => {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    catalogApi.modelStrategyRoutingBusy = ref(false)
+    const el = await mountDialog()
+    const bar = el.querySelector('.settings-dirtybar')!
+    const draftText = bar.textContent
+    const buttons = Array.from(bar.querySelectorAll<HTMLButtonElement>('button'))
+
+    catalogApi.modelStrategyRoutingBusy.value = true
+    await nextTick()
+
+    expect(el.querySelector('.settings-dirtybar')).toBe(bar)
+    expect(bar.textContent).toBe(draftText)
+    expect(bar.textContent).not.toContain('Saving changes')
+    expect(el.querySelector<HTMLFieldSetElement>('.settings-panel__interactions')?.disabled).toBe(true)
+    expect(buttons.every(button => button.disabled)).toBe(true)
+    buttons.forEach(button => button.click())
+    expect(controls.saveDirtySections).not.toHaveBeenCalled()
+    expect(controls.discardChanges).not.toHaveBeenCalled()
+
+    catalogApi.modelStrategyRoutingBusy.value = false
+    await nextTick()
+    expect(el.querySelector('.settings-dirtybar')).toBe(bar)
+    expect(bar.textContent).toBe(draftText)
+    expect(buttons.every(button => !button.disabled)).toBe(true)
+  })
+
   it('localizes the dirty section name instead of exposing its internal English label', async () => {
     const controls = mockCatalog()
     controls.saveAllPending.value = false

@@ -21,7 +21,8 @@ test.beforeAll(() => {
   })).toBe(true)
 })
 
-async function openFixture(page: Page, theme: 'miami' | 'light' | 'dark' = 'miami') {
+async function openFixture(page: Page, theme: 'miami' | 'light' | 'dark' = 'miami', history = continuousHistory) {
+  const payloads: Record<string, unknown> = { ...continuousPayloads, 'chat.history': history }
   await page.addInitScript(selectedTheme => {
     localStorage.setItem('opensquilla-locale', 'zh-Hans')
     localStorage.setItem('opensquilla-theme', selectedTheme)
@@ -41,12 +42,12 @@ async function openFixture(page: Page, theme: 'miami' | 'light' | 'dark' = 'miam
       }
       if (frame.type !== 'req') return
       ws.send(frame.method === 'connect' ? helloOkResponse()
-        : JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: continuousPayloads[frame.method || ''] ?? {} }))
+        : JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: payloads[frame.method || ''] ?? {} }))
     })
   })
   await page.goto(`/control/chat?session=${encodeURIComponent(CONTINUOUS_SESSION)}`)
   const answer = page.locator(`[data-message-id="${CONTINUOUS_MESSAGE}"]`)
-  await expect(answer).toHaveCount(1)
+  await expect(answer).toHaveCount(1, { timeout: 15_000 })
   await expect(answer.locator('.assistant-answer')).toContainText('连续阅读验收完成')
   return answer
 }
@@ -56,10 +57,46 @@ async function expandProcess(answer: Locator) {
   await summary.click()
   await expect(summary).toHaveAttribute('aria-expanded', 'true')
   await expect(answer.locator('.activity-narration').first()).toBeVisible()
+  await expect(answer.locator('.assistant-activity__body')).toHaveCSS('opacity', '1')
 }
 
 async function assertNoPageOverflow(page: Page) {
   expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1)
+}
+
+async function assertActivityHeaderBoundary(answer: Locator, expanded: boolean) {
+  const header = answer.locator('.assistant-activity__header')
+  await expect(header).toBeVisible()
+  await expect(header).toHaveText(/^用时\s+\d/)
+  const geometry = await header.evaluate(node => {
+    const style = getComputedStyle(node)
+    const headerRect = node.getBoundingClientRect()
+    const activityRect = node.closest('.assistant-activity')!.getBoundingClientRect()
+    const button = node.querySelector('button')!.getBoundingClientRect()
+    const inner = node.parentElement!.querySelector('.assistant-activity__body-inner')!.getBoundingClientRect()
+    const answer = node.parentElement!.parentElement!.querySelector('.assistant-answer .msg-ai-text > :first-child')!.getBoundingClientRect()
+    return {
+      width: headerRect.width, activityWidth: activityRect.width,
+      left: headerRect.left, activityLeft: activityRect.left,
+      borderWidth: parseFloat(style.borderBottomWidth),
+      borderStyle: style.borderBottomStyle, borderColor: style.borderBottomColor,
+      buttonHeight: button.height, lineBelowLabel: headerRect.bottom - button.bottom,
+      bodyGap: inner.top - headerRect.bottom,
+      answerFromDivider: answer.top - headerRect.bottom,
+      answerFromActivity: answer.top - activityRect.bottom,
+    }
+  })
+  expect(geometry.width).toBeGreaterThan(0)
+  expect(Math.abs(geometry.width - geometry.activityWidth)).toBeLessThanOrEqual(1)
+  expect(Math.abs(geometry.left - geometry.activityLeft)).toBeLessThanOrEqual(1)
+  expect(geometry.borderWidth).toBe(1)
+  expect(geometry.borderStyle).toBe('solid')
+  expect(geometry.borderColor).not.toMatch(/^(?:transparent|rgba\(0, 0, 0, 0\))$/)
+  expect(geometry.buttonHeight).toBeCloseTo(28, 1)
+  expect(geometry.lineBelowLabel).toBeGreaterThan(1)
+  expect(Math.abs(geometry.answerFromActivity - 18)).toBeLessThanOrEqual(1)
+  if (!expanded) expect(Math.abs(geometry.answerFromDivider - 18)).toBeLessThanOrEqual(1)
+  if (expanded) expect(Math.abs(geometry.bodyGap - 12)).toBeLessThanOrEqual(1)
 }
 
 test('collapsed defaults and manual disclosure preserve mixed-tool chronology', async ({ page }) => {
@@ -68,8 +105,10 @@ test('collapsed defaults and manual disclosure preserve mixed-tool chronology', 
   await expect(summary).toHaveAttribute('aria-expanded', 'false')
   await expect(answer.locator('.assistant-activity__body')).toHaveAttribute('aria-hidden', 'true')
   await expect(answer.locator('.tool-row-body')).toHaveCount(0)
+  await assertActivityHeaderBoundary(answer, false)
 
   await expandProcess(answer)
+  await assertActivityHeaderBoundary(answer, true)
   const calls = answer.locator('.tool-row[aria-expanded]')
   await expect(calls).toHaveCount(2)
   for (const call of await calls.all()) await expect(call).toHaveAttribute('aria-expanded', 'false')
@@ -112,9 +151,11 @@ for (const width of [1440, 1280, 390]) {
     if (width === 1440) expect(textBounds!.width).toBeGreaterThanOrEqual(799)
 
     await expandProcess(answer)
+    await assertActivityHeaderBoundary(answer, true)
     await answer.locator('.tool-row[aria-expanded]').nth(1).click()
     const detail = answer.locator('.tool-row-body')
     await expect(detail).toBeVisible()
+    await assertActivityHeaderBoundary(answer, true)
     const detailBounds = await detail.boundingBox()
     expect(Math.abs(detailBounds!.x - textBounds!.x)).toBeLessThanOrEqual(2)
     expect(detailBounds!.width).toBeLessThanOrEqual(textBounds!.width + 1)
@@ -136,26 +177,38 @@ test('prose retains readable spacing while metadata stays secondary and output s
   await expandProcess(answer)
   const sizes = await answer.evaluate(root => ({
     prose: parseFloat(getComputedStyle(root.querySelector('.activity-narration')!).fontSize),
-    tool: parseFloat(getComputedStyle(root.querySelector('.tool-row')!).fontSize),
+    tool: parseFloat(getComputedStyle(root.querySelector('.tool-row__label')!).fontSize),
     metadata: parseFloat(getComputedStyle(root.querySelector('.assistant-activity__label')!).fontSize),
+    reasoning: parseFloat(getComputedStyle(root.querySelector('.thinking-fold__summary')!).fontSize),
   }))
   expect(sizes.prose).toBe(16)
-  expect(sizes.tool).toBeLessThan(sizes.prose)
+  expect(sizes.tool).toBe(13)
+  expect(sizes.reasoning).toBe(sizes.tool)
   expect(sizes.metadata).toBeLessThan(sizes.prose)
   const rhythm = await answer.evaluate(root => {
     const narration = [...root.querySelectorAll('.activity-narration')].map(node => node.getBoundingClientRect())
     const tools = [...root.querySelectorAll('.tool-row[aria-expanded]')].map(node => node.getBoundingClientRect())
     const conclusion = root.querySelector('.assistant-answer')!.getBoundingClientRect()
     const firstParagraph = root.querySelector('.assistant-answer .msg-ai-text > p')!.getBoundingClientRect()
+    const reasoning = root.querySelector('.thinking-fold__summary')!.getBoundingClientRect()
     return { narrationToWrite: tools[0]!.top - narration[0]!.bottom,
       writeToNarration: narration[1]!.top - tools[0]!.bottom,
       narrationToShell: tools[1]!.top - narration[1]!.bottom,
+      reasoningToNarration: narration[0]!.top - reasoning.bottom,
+      reasoningHeight: reasoning.height, toolHeights: tools.map(row => row.height),
       conclusionInset: firstParagraph.top - conclusion.top }
   })
+  await test.info().attach('activity-geometry', {
+    body: JSON.stringify({ sizes, rhythm }, null, 2), contentType: 'application/json',
+  })
+  expect(rhythm.reasoningHeight).toBeCloseTo(28, 1)
+  expect(rhythm.toolHeights).toHaveLength(2)
+  for (const height of rhythm.toolHeights) expect(height).toBeCloseTo(28, 1)
+  expect(Math.abs(rhythm.reasoningToNarration - 12)).toBeLessThanOrEqual(1)
   expect(Math.abs(rhythm.narrationToWrite - 12)).toBeLessThanOrEqual(1)
   expect(Math.abs(rhythm.narrationToShell - 12)).toBeLessThanOrEqual(1)
-  expect(Math.abs(rhythm.writeToNarration - 20)).toBeLessThanOrEqual(1)
-  expect(Math.abs(rhythm.conclusionInset - 24)).toBeLessThanOrEqual(1)
+  expect(Math.abs(rhythm.writeToNarration - 12)).toBeLessThanOrEqual(1)
+  expect(Math.abs(rhythm.conclusionInset - 8)).toBeLessThanOrEqual(1)
   await answer.locator('.tool-row[aria-expanded]').nth(1).click()
   const outputViewport = answer.locator('.activity-code-details__viewport')
   await expect(outputViewport).toHaveCount(1)
@@ -170,6 +223,34 @@ test('prose retains readable spacing while metadata stays secondary and output s
   expect(outputDimensions.scrollWidth).toBeGreaterThan(outputDimensions.width)
   expect(outputDimensions.verticalOverflow).toMatch(/auto|scroll/)
   expect(outputDimensions.horizontalOverflow).toMatch(/auto|scroll/)
+  await assertNoPageOverflow(page)
+})
+
+test('legacy reasoning uses the same compact row dimensions without a structured timeline', async ({ page }) => {
+  const history = structuredClone(continuousHistory)
+  for (const outcome of history.turn_outcomes as Array<Record<string, unknown>>) delete outcome.activity_snapshot
+  expect(validateChatHistoryResult(history), JSON.stringify(validateChatHistoryResult.errors)).toBe(true)
+  const answer = await openFixture(page, 'miami', history)
+  await expandProcess(answer)
+  await expect(answer.locator('.reasoning-timeline')).toHaveCount(0)
+  await expect(answer.locator('.assistant-unified-activity-timeline')).toHaveCount(0)
+  const reasoning = answer.locator('.thinking-fold--in-activity > .thinking-fold__summary')
+  await expect(reasoning).toBeVisible()
+  const geometry = await answer.evaluate(root => {
+    const reasoning = root.querySelector('.thinking-fold__summary')!
+    const tool = root.querySelector('.tool-row[aria-expanded]')!
+    return {
+      reasoningSize: parseFloat(getComputedStyle(reasoning).fontSize),
+      toolSize: parseFloat(getComputedStyle(tool.querySelector('.tool-row__label')!).fontSize),
+      reasoningHeight: reasoning.getBoundingClientRect().height,
+      toolHeight: tool.getBoundingClientRect().height,
+    }
+  })
+  expect(geometry.reasoningSize).toBe(13)
+  expect(geometry.toolSize).toBe(geometry.reasoningSize)
+  expect(geometry.reasoningHeight).toBeCloseTo(28, 1)
+  expect(geometry.toolHeight).toBeCloseTo(28, 1)
+  await assertActivityHeaderBoundary(answer, true)
   await assertNoPageOverflow(page)
 })
 
@@ -212,9 +293,13 @@ for (const theme of ['miami', 'light', 'dark'] as const) {
         '--text': '#2A1830', '--text-muted': '#6B4A5E', '--accent': '#D71776', '--accent-secondary': '#077B92' })
     }
     await expect(answer.locator('.assistant-activity__summary')).toHaveAttribute('aria-expanded', 'false')
+    await assertActivityHeaderBoundary(answer, false)
+    await answer.locator('.assistant-activity').screenshot({ path: test.info().outputPath(`activity-${theme}-collapsed.png`) })
     await page.screenshot({ path: test.info().outputPath(`continuous-reading-${theme}-collapsed.png`) })
     await expandProcess(answer)
+    await assertActivityHeaderBoundary(answer, true)
     await answer.locator('.tool-row[aria-expanded]').first().click()
+    await answer.locator('.assistant-activity').screenshot({ path: test.info().outputPath(`activity-${theme}-expanded.png`) })
     await page.screenshot({ path: test.info().outputPath(`continuous-reading-${theme}-expanded.png`) })
     await assertNoPageOverflow(page)
   })

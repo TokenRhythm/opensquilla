@@ -90,8 +90,12 @@ export interface DesktopUpdateState {
   canNativeInstall: boolean
   /** Explicit shell permission to launch installation; older manual shells omit it. */
   canInstall?: boolean
+  /** The shell can prepare and verify updates without a download click. Older shells omit it. */
+  canAutoDownload?: boolean
   installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
+  /** Validated official release page for latestVersion; never an installer asset URL. */
+  releaseNotesUrl?: string | null
   source: DesktopUpdateSource | null
   fallbackUsed: boolean
 }

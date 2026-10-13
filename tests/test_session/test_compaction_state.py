@@ -75,12 +75,15 @@ def test_extract_compaction_obligations_keeps_high_signal_facts_bounded() -> Non
         {
             "role": "assistant",
             "content": "Next I will run uv run pytest tests/test_session/test_manager.py.",
-            "tool_calls": [{"id": "call_exec_1", "type": "function"}],
+            "tool_calls": [{"id": "call_exec_1", "name": "exec_command", "arguments": {
+                "command": "uv run pytest tests/test_session/test_manager.py",
+            }}],
         },
         {
             "role": "tool",
             "tool_call_id": "call_exec_1",
             "content": (
+                "exit_code=1\n"
                 "Command failed: uv run pytest tests/test_session/test_manager.py\n"
                 "Exit code 1\n"
                 "File src/opensquilla/session/models.py\n"
@@ -163,14 +166,16 @@ def test_structured_summary_exposes_command_and_pending_tool_workset() -> None:
             "role": "assistant",
             "content": "Next I will run uv run pytest tests/test_session/test_compaction.py.",
             "tool_calls": [
-                {"id": "call_done", "type": "function"},
+                {"id": "call_done", "name": "exec_command", "arguments": {
+                    "command": "uv run pytest tests/test_session/test_compaction.py",
+                }},
                 {"id": "call_waiting", "type": "function"},
             ],
         },
         {
             "role": "tool",
             "tool_call_id": "call_done",
-            "content": "uv run pytest tests/test_session/test_compaction.py passed",
+            "content": "exit_code=0\nuv run pytest tests/test_session/test_compaction.py passed",
         },
     ]
 
@@ -189,6 +194,105 @@ def test_structured_summary_exposes_command_and_pending_tool_workset() -> None:
     assert summary.open_steps == []
     assert summary.next_action is None
     assert "call_done" not in summary.pending_tool_and_approval_ids
+
+
+@pytest.mark.parametrize("role", ["user", "assistant", "tool"])
+def test_command_mentions_are_not_promoted_to_executed_history(role: str) -> None:
+    command = "pnpm test --filter connection-recovery"
+    entries = [{"role": role, "content": f"Please run `{command}` after approval."}]
+    if role == "tool":
+        entries = [
+            {"role": "assistant", "content": "Read the instructions.", "tool_calls": [
+                {"id": "read_guide", "name": "read_file", "arguments": {"path": "guide.md"}},
+            ]},
+            {**entries[0], "tool_call_id": "read_guide"},
+        ]
+    summary, _ = build_structured_summary_from_text(
+        "Awaiting approval; tests have not run.", extract_compaction_obligations(entries),
+        block_missing_critical=True,
+    )
+    assert summary.executed_commands_and_tests == []
+    assert command in render_structured_summary(summary)
+    assert "Executed Commands and Tests:" not in render_structured_summary(summary)
+
+
+@pytest.mark.parametrize("status", [
+    {"status": "unknown", "reason": "awaiting_approval", "preservation_class": "ephemeral"},
+    {"status": "error", "reason": "approval_denied"},
+    {"status": "error", "reason": "runtime_unavailable"},
+    {"status": "cancelled", "reason": "cancelled_before_dispatch"},
+    {"status": "timeout", "reason": "queue_timeout"},
+])
+def test_unexecuted_shell_requests_do_not_become_completed_commands(status: dict) -> None:
+    entries = [{"role": "assistant", "content": "Checking tests.", "tool_calls": [
+        {"type": "tool_use", "tool_use_id": "exec_1", "name": "exec_command",
+         "input": {"command": "pnpm test"}},
+        {"type": "tool_result", "tool_use_id": "exec_1", "result": "pnpm test not executed",
+         "execution_status": status},
+    ]}]
+    summary, _ = build_structured_summary_from_text(
+        "The shell operation did not execute.", extract_compaction_obligations(entries),
+    )
+    assert summary.executed_commands_and_tests == []
+
+
+@pytest.mark.parametrize("exit_code", [0, 2])
+def test_actual_shell_receipt_preserves_input_not_commands_mentioned_in_output(
+    exit_code: int,
+) -> None:
+    output = f"exit_code={exit_code}\nFor future checks try npm run lint"
+    if exit_code:
+        output += "\nError: validation failed"
+    entries = [
+        {"role": "assistant", "content": "Run validation.", "tool_calls": [
+            {"id": "exec_1", "function": {"name": "exec_command",
+             "arguments": '{"command": "pnpm test"}'}},
+        ]},
+        {"role": "tool", "tool_call_id": "exec_1",
+         "content": output},
+    ]
+    summary, _ = build_structured_summary_from_text(
+        "Validation returned an exit code.", extract_compaction_obligations(entries),
+    )
+    assert summary.executed_commands_and_tests == ["pnpm test"]
+    assert "npm run lint" in render_structured_summary(summary)
+    if exit_code:
+        assert any("validation failed" in str(item) for item in summary.known_failures)
+        # The command is recorded as executed, never labelled passed by the sidecar.
+        assert "passed" not in render_structured_summary(summary)
+
+
+def test_neutral_command_reference_stays_neutral_across_two_checkpoints() -> None:
+    first, _ = build_structured_summary_from_text(
+        "Approval is pending.", extract_compaction_obligations([
+            {"role": "user", "content": "After approval run pnpm test"},
+        ]),
+    )
+    second, _ = build_structured_summary_from_text(
+        "Approval is still pending; no command was run.", extract_compaction_obligations([
+            {"role": "assistant", "content": render_structured_summary(first)},
+        ]),
+        block_missing_critical=True,
+    )
+    assert first.executed_commands_and_tests == second.executed_commands_and_tests == []
+    assert "pnpm test" in render_structured_summary(second)
+
+
+@pytest.mark.parametrize("result", ["exit_code=0\nDone", "pnpm test passed (quoted README text)"])
+def test_legacy_shell_result_requires_actual_receipt_instead_of_completion_prose(
+    result: str,
+) -> None:
+    entries = [{"role": "assistant", "content": "", "tool_calls": [
+        {"type": "tool_use", "tool_use_id": "exec_1", "name": "exec_command",
+         "input": {"command": "pnpm test"}},
+        {"type": "tool_result", "tool_use_id": "exec_1", "result": result,
+         "execution_status": {"status": "unknown", "reason": "legacy_missing_status"}},
+    ]}]
+    summary, _ = build_structured_summary_from_text(
+        "Prior tool result.", extract_compaction_obligations(entries),
+    )
+    expected = ["pnpm test"] if result.startswith("exit_code=") else []
+    assert summary.executed_commands_and_tests == expected
 
 
 @pytest.mark.parametrize("structured", [False, True])

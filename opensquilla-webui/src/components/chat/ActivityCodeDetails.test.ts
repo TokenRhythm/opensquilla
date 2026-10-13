@@ -7,7 +7,7 @@ import type { ActivityToolCodeView } from '@/utils/chat/activityToolDetails'
 import en from '@/locales/en.json'
 
 const apps: ReturnType<typeof createApp>[] = []
-function mount(view: ActivityToolCodeView, options: { full?: boolean; canOpenCodeView?: boolean; onCopy?: () => void; onDownload?: () => void; onReachEnd?: () => void } = {}) {
+function mount(view: ActivityToolCodeView, options: { draft?: boolean; full?: boolean; canOpenCodeView?: boolean; onCopy?: () => void; onDownload?: () => void; onReachEnd?: () => void } = {}) {
   const props = reactive({ view, ...options })
   const host = document.createElement('div')
   document.body.append(host)
@@ -20,6 +20,35 @@ function mount(view: ActivityToolCodeView, options: { full?: boolean; canOpenCod
 afterEach(() => { apps.splice(0).forEach(app => app.unmount()); document.body.innerHTML = '' })
 
 describe('typed retained content', () => {
+  it('follows a live draft until the user scrolls up and resumes only after returning to its tail', async () => {
+    const { host, props } = mount({ kind: 'write', path: 'draft.html', content: '<html>one', language: 'html' }, { draft: true })
+    const viewport = host.querySelector<HTMLElement>('.activity-code-details__viewport')!
+    Object.defineProperty(viewport, 'scrollHeight', { configurable: true, value: 800 })
+    Object.defineProperty(viewport, 'clientHeight', { configurable: true, value: 200 })
+    await nextTick(); await nextTick()
+    expect(viewport.scrollTop).toBe(800)
+    viewport.scrollTop = 100
+    viewport.dispatchEvent(new Event('scroll'))
+    props.view.content = '<html>two'
+    await nextTick(); await nextTick()
+    expect(viewport.scrollTop).toBe(100)
+    expect(host.querySelector('code')?.textContent).toBe('<html>two')
+    expect(host.querySelector('.hljs-tag')).toBeNull()
+    viewport.scrollTop = 600
+    viewport.dispatchEvent(new Event('scroll'))
+    props.view.content = '<html>three'
+    await nextTick(); await nextTick()
+    expect(viewport.scrollTop).toBe(800)
+    expect(host.querySelectorAll('button')).toHaveLength(0)
+  })
+  it.each(['command', 'write'] as const)('marks only failed %s output for warning coloring', async kind => {
+    const { host, props } = mount({ kind, command: 'build', path: 'a.txt', error: true, output: 'Permission denied', exitCode: 1 })
+    expect(host.querySelector('.activity-code-details--error .activity-code-details__output')?.textContent).toBe('Permission denied')
+    props.view.error = false
+    await nextTick()
+    expect(host.querySelector('.activity-code-details--error')).toBeNull()
+    expect(host.querySelector('.activity-code-details__command')?.textContent ?? '').not.toContain('Permission denied')
+  })
   it('labels copying a retained producer fragment as copying a preview', () => {
     const { host } = mount({ kind: 'command', command: 'build', output: 'saved fragment', partial: true })
     expect(host.querySelector('[data-testid="activity-tool-detail-copy"]')?.getAttribute('aria-label')).toBe(en.shared.runTrace.copyPreview)

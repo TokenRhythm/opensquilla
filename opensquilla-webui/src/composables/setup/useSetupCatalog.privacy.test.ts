@@ -2048,6 +2048,10 @@ describe('useSetupCatalog model strategy IA', () => {
     expect(api.modelStrategyPanel.value.ensemble.scheme).toBe('custom')
     expect(api.modelStrategyPanel.value.ensemble.candidates).toEqual([])
     expect(api.sectionDirty('modelStrategy')).toBe(true)
+    expect(api.hasUnsavedChanges.value).toBe(true)
+    expect(api.dirtySections.value.map(section => section.id)).toContain('modelStrategy')
+    expect(api.modelStrategyPanel.value.routingSummary?.hasUnsavedChanges).toBe(true)
+    expect(api.modelStrategyRoutingBusy.value).toBe(false)
     expect(rpcCall.mock.calls.some(([method]) => method === 'models.routing.set')).toBe(false)
     expect(pushToast).not.toHaveBeenCalledWith(expect.stringContaining('Ensemble mode must remain'), expect.anything())
 
@@ -7482,6 +7486,173 @@ describe('useSetupCatalog image-generation onboarding intent', () => {
 })
 
 
+describe('model strategy switch dirty indicators', () => {
+  type Strategy = 'single' | 'router' | 'ensemble'
+
+  async function pendingSwitch(strategy: Strategy) {
+    let resolveRouting!: (value: Record<string, unknown>) => void
+    let rejectRouting!: (error: Error) => void
+    const routingRequest = new Promise<Record<string, unknown>>((resolve, reject) => {
+      resolveRouting = resolve
+      rejectRouting = reject
+    })
+    const scenario = await primaryTransitionScenario(false, method => (
+      method === 'models.routing.set' ? routingRequest : { changed: true }
+    ))
+    scenario.saved.squilla_router.enabled = strategy === 'single'
+    Object.assign(scenario.saved.llm_ensemble, {
+      selection_mode: 'custom_b5',
+      selection_configured: true,
+      candidates: [
+        { provider: 'openrouter', model: 'openai/gpt-4.1-mini', role: 'proposer' },
+        { provider: 'openrouter', model: 'openai/gpt-4.1', role: 'proposer' },
+      ],
+    })
+    await scenario.api.loadData()
+    return {
+      ...scenario,
+      resolveRouting: () => {
+        scenario.saved.squilla_router.enabled = strategy === 'router'
+        scenario.saved.llm_ensemble.enabled = strategy === 'ensemble'
+        resolveRouting({ mode: strategy === 'single' ? 'direct' : strategy })
+      },
+      rejectRouting: () => rejectRouting(new SetupWorkflowError('invalid', 'Routing change rejected')),
+    }
+  }
+
+  function dirtyIndicators(api: ReturnType<typeof useSetupCatalog>) {
+    return {
+      section: api.sectionDirty('modelStrategy'),
+      any: api.hasUnsavedChanges.value,
+      sections: api.dirtySections.value.map(section => section.id),
+      routing: api.modelStrategyPanel.value.routingSummary?.hasUnsavedChanges,
+    }
+  }
+
+  it.each(['single', 'router', 'ensemble'] as const)(
+    'keeps a pristine %s switch clean while the write and refresh are pending',
+    async strategy => {
+      const { api, app, saved, resolveRouting } = await pendingSwitch(strategy)
+      try {
+        const clean = { section: false, any: false, sections: [], routing: false }
+        expect(dirtyIndicators(api)).toEqual(clean)
+        let resolveRefresh!: (value: unknown) => void
+        const refreshRequest = new Promise(resolve => { resolveRefresh = resolve })
+        const refreshStarted = vi.fn()
+        const originalRpc = rpcCall.getMockImplementation()!
+        rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+          if (method === 'config.get') {
+            refreshStarted()
+            return refreshRequest
+          }
+          return originalRpc(method, params)
+        })
+
+        const mutation = api.setModelStrategy(strategy)
+        await nextTick()
+        expect(api.modelStrategyRoutingBusy.value).toBe(true)
+        expect(api.modelStrategyPanel.value.activeStrategy).toBe(strategy)
+        expect(dirtyIndicators(api)).toEqual(clean)
+        expect(rpcCall).toHaveBeenCalledWith('models.routing.set', {
+          mode: strategy === 'single' ? 'direct' : strategy,
+        })
+
+        resolveRouting()
+        await vi.waitFor(() => expect(refreshStarted).toHaveBeenCalledOnce())
+        await nextTick()
+        expect(api.modelStrategyRoutingBusy.value).toBe(true)
+        expect(dirtyIndicators(api)).toEqual(clean)
+        resolveRefresh(structuredClone(saved))
+        await mutation
+        await nextTick()
+        expect(api.modelStrategyRoutingBusy.value).toBe(false)
+        expect(api.modelStrategyPanel.value.activeStrategy).toBe(strategy)
+        expect(dirtyIndicators(api)).toEqual(clean)
+      } finally { app.unmount() }
+    },
+  )
+
+  it.each([false, true])('keeps an acknowledged switch after refresh fails (existing draft: %s)', async hasDraft => {
+    const { api, app, saved, resolveRouting } = await pendingSwitch('single')
+    try {
+      if (hasDraft) api.updateTierField('c0', 'model', 'retained-tier')
+      const before = dirtyIndicators(api)
+      expect(before).toEqual({
+        section: hasDraft,
+        any: hasDraft,
+        sections: hasDraft ? ['modelStrategy'] : [],
+        routing: hasDraft,
+      })
+      const originalRpc = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'config.get') throw new Error('refresh unavailable')
+        return originalRpc(method, params)
+      })
+      rpcCall.mockClear()
+      pushToast.mockClear()
+
+      const mutation = api.setModelStrategy('single')
+      await nextTick()
+      expect(api.modelStrategyRoutingBusy.value).toBe(true)
+      expect(dirtyIndicators(api)).toEqual(before)
+      resolveRouting()
+      await mutation
+      await nextTick()
+
+      expect(saved.squilla_router.enabled).toBe(false)
+      expect(api.modelStrategyPanel.value.activeStrategy).toBe('single')
+      expect(api.modelStrategyRoutingBusy.value).toBe(false)
+      expect(dirtyIndicators(api)).toEqual(before)
+      expect(api.routerPanel.value.tierRows[0]?.model).toBe(hasDraft ? 'retained-tier' : 'openai/gpt-4.1-mini')
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'models.routing.set')).toHaveLength(1)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(1)
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(
+        'Saved. Updated settings are temporarily unavailable; refresh later.',
+        { tone: 'warn' },
+      )
+    } finally { app.unmount() }
+  })
+
+  it.each([
+    ['router default', (api: ReturnType<typeof useSetupCatalog>) => api.setRouterDefaultTier('c0'), (api: ReturnType<typeof useSetupCatalog>) => api.routerPanel.value.routerDefaultTier],
+    ['tier', (api: ReturnType<typeof useSetupCatalog>) => api.updateTierField('c0', 'model', 'draft-tier'), (api: ReturnType<typeof useSetupCatalog>) => api.routerPanel.value.tierRows],
+    ['ensemble', (api: ReturnType<typeof useSetupCatalog>) => api.setEnsembleMinSuccessful(2), (api: ReturnType<typeof useSetupCatalog>) => api.ensemblePanel.value.minSuccessfulProposers],
+    ['fixed model', (api: ReturnType<typeof useSetupCatalog>) => { api.setFixedProvider('tokenrhythm'); api.setFixedModel('draft-fixed-model') }, (api: ReturnType<typeof useSetupCatalog>) => ({
+      providerId: api.modelStrategyPanel.value.single.providerId,
+      model: api.modelStrategyPanel.value.single.model,
+    })],
+    ['thinking', (api: ReturnType<typeof useSetupCatalog>) => api.updateModelStrategyThinking('high'), (api: ReturnType<typeof useSetupCatalog>) => api.modelStrategyPanel.value.llmThinking],
+  ] as const)('preserves the %s draft indicators and values across successful and failed switches', async (_name, edit, read) => {
+    for (const outcome of ['success', 'failure'] as const) {
+      const { api, app, resolveRouting, rejectRouting } = await pendingSwitch('single')
+      try {
+        edit(api)
+        await nextTick()
+        const before = dirtyIndicators(api)
+        const draft = JSON.parse(JSON.stringify(read(api)))
+        expect(before.section).toBe(true)
+        expect(before.any).toBe(true)
+        expect(before.sections).toContain('modelStrategy')
+        expect(before.routing).toBe(_name !== 'thinking')
+
+        const mutation = api.setModelStrategy('single')
+        await nextTick()
+        expect(api.modelStrategyRoutingBusy.value).toBe(true)
+        expect(dirtyIndicators(api)).toEqual(before)
+        expect(read(api)).toEqual(draft)
+        if (outcome === 'success') resolveRouting()
+        else rejectRouting()
+        await mutation
+        await nextTick()
+        expect(api.modelStrategyRoutingBusy.value).toBe(false)
+        expect(api.modelStrategyPanel.value.activeStrategy).toBe(outcome === 'success' ? 'single' : 'router')
+        expect(dirtyIndicators(api)).toEqual(before)
+        expect(read(api)).toEqual(draft)
+      } finally { app.unmount() }
+    }
+  })
+})
+
 describe('recommended Router reset and activation safety', () => {
   it.each(['openrouter', 'tokenrhythm'])('resets foreign tiers to the saved %s primary', async provider => {
     const { api, app, saved } = await primaryTransitionScenario()
@@ -7696,6 +7867,11 @@ describe('recommended Router reset and activation safety', () => {
     } else {
       expect(rpcCall).toHaveBeenCalledWith('models.routing.resetRecommended', { providerId: 'openrouter', activateRouter: true })
     }
+    expect(api.modelStrategyRoutingBusy.value).toBe(false)
+    expect(api.sectionDirty('modelStrategy')).toBe(choice === 'cancel')
+    expect(api.hasUnsavedChanges.value).toBe(choice === 'cancel')
+    expect(api.dirtySections.value.map(section => section.id)).toEqual(choice === 'cancel' ? ['modelStrategy'] : [])
+    expect(api.modelStrategyPanel.value.routingSummary?.hasUnsavedChanges).toBe(choice === 'cancel')
     app.unmount()
   })
 

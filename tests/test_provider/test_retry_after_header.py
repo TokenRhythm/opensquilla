@@ -55,6 +55,7 @@ async def test_openai_compat_429_carries_retry_after_seconds(
     errors = await _chat_errors(provider)
     assert errors
     assert errors[0].code == "429"
+    assert errors[0].http_status == 429
     assert errors[0].retry_after_s == 7.0
 
 
@@ -73,6 +74,7 @@ async def test_openai_compat_503_carries_retry_after_seconds(
     errors = await _chat_errors(provider)
     assert errors
     assert errors[0].code == "503"
+    assert errors[0].http_status == 503
     assert errors[0].retry_after_s == 12.0
 
 
@@ -91,6 +93,7 @@ async def test_openai_compat_400_never_carries_retry_after(
     errors = await _chat_errors(provider)
     assert errors
     assert errors[0].code == "400"
+    assert errors[0].http_status == 400
     assert errors[0].retry_after_s is None
 
 
@@ -109,6 +112,7 @@ async def test_anthropic_429_carries_retry_after_seconds(
     errors = await _chat_errors(provider)
     assert errors
     assert errors[0].code == "429"
+    assert errors[0].http_status == 429
     assert errors[0].retry_after_s == 9.0
 
 
@@ -126,6 +130,7 @@ async def test_missing_header_leaves_retry_after_none(
     errors = await _chat_errors(provider)
     assert errors
     assert errors[0].code == "429"
+    assert errors[0].http_status == 429
     assert errors[0].retry_after_s is None
 
 
@@ -153,4 +158,33 @@ async def test_other_adapters_preserve_retry_after_without_changing_status(
     errors = await _chat_errors(provider)
     assert len(errors) == 1
     assert errors[0].code == str(status)
+    assert errors[0].http_status == status
     assert errors[0].retry_after_s == expected
+
+
+@pytest.mark.parametrize("business_code,expected", [
+    ("usage_limit_reached", "usage_limit"),
+    ("insufficient_quota", "insufficient_credits"),
+    ("rate_limit_exceeded", "rate_limited"),
+])
+async def test_http_429_preserves_structured_cause(monkeypatch, business_code, expected):
+    from opensquilla.provider.failures import classify_provider_error
+
+    _patch_transport(monkeypatch, lambda: httpx.Response(429, json={
+        "error": {"code": business_code, "message": "Rate limited. Check billing."},
+    }))
+    provider = build_provider("openai", "test-chat-model", api_key=FAKE_API_KEY)
+    error, = await _chat_errors(provider)
+    assert error.http_status == 429
+    assert error.provider_code == business_code
+    assert classify_provider_error("openai", error.http_status,
+        raw_code=error.provider_code, message=error.message).value == expected
+
+
+async def test_sse_business_code_is_not_an_http_status(monkeypatch):
+    _patch_transport(monkeypatch, lambda: httpx.Response(200, text=
+        'data: {"error":{"code":"429","message":"Rate limited"}}\n\n'))
+    provider = build_provider("openai", "test-chat-model", api_key=FAKE_API_KEY)
+    error, = await _chat_errors(provider)
+    assert error.code == "429"
+    assert error.http_status is None

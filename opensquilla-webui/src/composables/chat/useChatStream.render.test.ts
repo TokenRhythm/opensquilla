@@ -23,10 +23,11 @@ function makeStream(
   const messages = ref<ChatMessage[]>([])
   const runStatus = ref<ChatRunStatus>({ status: 'idle', label: '', task: null })
   const applySessionRunState = vi.fn()
+  const aborted = ref(false)
   const api = useChatStream({
     messages,
     lastHeaderRole: ref(''),
-    aborted: ref(false),
+    aborted,
     autoScroll: ref(true),
     runStatus,
     applySessionRunState,
@@ -40,6 +41,7 @@ function makeStream(
   })
   return {
     api,
+    aborted,
     messages,
     runStatus,
     applySessionRunState,
@@ -63,6 +65,122 @@ describe('useChatStream render coalescing', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
     vi.useRealTimers()
+  })
+
+  it('keeps generated file drafts outside the turn log and hands disclosure to the real tool', () => {
+    const { api, messages } = makeStream(undefined, undefined, undefined, () => 'turn-scope')
+    api.startStreaming()
+    api.applyToolInputPreview({ previewId: 'draft-1', attemptId: 'attempt-1', toolUseId: 'write-1', generationEpoch: 0,
+      revision: 1, state: 'generating', toolName: 'write_file', path: 'page.html', content: '<html>draft', truncated: false }, 3)
+    api.toggleToolItem('turn-scope:write-1', true)
+    expect(api.toolInputPreviews.value).toHaveLength(1)
+    expect(api.foldedTurn.value.toolCalls).toEqual([])
+    expect(JSON.stringify(api.foldedTurn.value)).not.toContain('<html>draft')
+    expect(api.streamHasVisibleOutput.value).toBe(false)
+    api.appendToolCall({ id: 'write-1', name: 'write_file' })
+    // Keep the draft until the real row is published on the frame clock.
+    expect(api.toolInputPreviews.value).toHaveLength(1)
+    rafCbs[0](0)
+    expect(api.toolInputPreviews.value).toEqual([])
+    expect(api.foldedTurn.value.toolCalls).toHaveLength(1)
+    expect(api.isToolItemOpen('turn-scope:write-1')).toBe(true)
+    api.endStreaming({ reason: 'aborted' })
+    expect(JSON.stringify(messages.value)).not.toContain('<html>draft')
+    api.cleanup()
+  })
+
+  it.each(['abort', 'done'] as const)('discards live-only drafts on %s', action => {
+    const { api, aborted, messages } = makeStream()
+    api.startStreaming()
+    api.applyToolInputPreview({ previewId: 'draft-1', attemptId: 'attempt-1', toolUseId: 'write-1', generationEpoch: 0,
+      revision: 1, state: 'generating', toolName: 'write_file', path: 'page.html', content: 'never persisted', truncated: false }, 3)
+    if (action === 'abort') aborted.value = true
+    else api.endStreaming()
+    expect(api.toolInputPreviews.value).toEqual([])
+    expect(JSON.stringify(messages.value)).not.toContain('never persisted')
+    api.cleanup()
+  })
+
+  it('retains the last draft and manual disclosure across a brief connection loss', () => {
+    const { api } = makeStream()
+    api.startStreaming()
+    api.applyToolInputPreview({ previewId: 'draft-1', attemptId: 'attempt-1', toolUseId: 'write-1', generationEpoch: 0,
+      revision: 1, state: 'generating', toolName: 'write_file', path: 'page.html', content: 'retained draft', truncated: false }, 3)
+    api.toggleToolItem('write-1', true)
+    const draft = api.toolInputPreviews.value[0]
+    api.setStreamConnectionAvailable(false)
+    api.setStreamConnectionAvailable(true)
+    expect(api.toolInputPreviews.value[0]).toBe(draft)
+    expect(api.isToolItemOpen('write-1')).toBe(true)
+    expect(api.streamHasVisibleOutput.value).toBe(false)
+    api.cleanup()
+  })
+
+  it.each(['resetLiveTurnState', 'resetAnswerGeneration', 'cleanup'] as const)('clears ephemeral drafts on %s', action => {
+    const { api } = makeStream()
+    api.startStreaming()
+    api.applyToolInputPreview({ previewId: 'draft-1', attemptId: 'attempt-1', toolUseId: 'write-1', generationEpoch: 0,
+      revision: 1, state: 'generating', toolName: 'write_file', path: 'page.html', content: 'draft', truncated: false }, 3)
+    api[action]()
+    expect(api.toolInputPreviews.value).toEqual([])
+    api.cleanup()
+  })
+
+  it('projects a provider-refused skipped compaction as a failed attempt, leaving benign no-ops alone', () => {
+    const { api } = makeStream()
+    api.startStreaming()
+    const identity = { key: 's', source: 'automatic', status: 'skipped', compactionFailure: { failureKind: 'rate_limited', httpStatus: 429 } }
+    api.recordCompactionActivity({ ...identity, compaction_id: 'failed-summary', reason: 'summary_failed' })
+    api.recordCompactionActivity({ ...identity, compaction_id: 'no-op', reason: 'within_budget' })
+    expect(api.foldedTurn.value.statusHistory.find(s => s.id === 'failed-summary')).toMatchObject({ state: 'failed', httpStatus: 429, failureKind: 'rate_limited' })
+    expect(api.foldedTurn.value.statusHistory.find(s => s.id === 'no-op')).toMatchObject({ state: 'skipped' })
+    expect(api.foldedTurn.value.statusHistory.find(s => s.id === 'no-op')?.httpStatus).toBeUndefined()
+    api.cleanup()
+  })
+
+  it.each(['summary_failed', 'suffix_summary_failed'])('retains unknown provider HTTP failure for %s without guessing its category', reason => {
+    const { api } = makeStream()
+    api.startStreaming()
+    api.recordCompactionActivity({ key: 's', compaction_id: 'unknown-summary', source: 'automatic', status: 'skipped', reason, compactionFailure: { httpStatus: 418 } })
+    const entry = api.foldedTurn.value.statusHistory.find(s => s.id === 'unknown-summary')
+    expect(entry).toMatchObject({ state: 'failed', httpStatus: 418 })
+    expect(entry?.failureKind).toBeUndefined()
+    expect(entry?.providerRecovery).toBeUndefined()
+    api.cleanup()
+  })
+
+  it('keeps compaction wait through metadata-less heartbeat and clears it on retrying', () => {
+    const { api } = makeStream()
+    api.startStreaming()
+    const identity = { key: 's', compaction_id: 'c', source: 'automatic', status: 'observed', phase: 'summarizing' }
+    api.recordCompactionActivity({ ...identity, compactionRecovery: { phase: 'retry_wait', reason: 'rate_limited', startedAt: 10_000, retryAfterMs: 35_000, httpStatus: 429 } })
+    api.recordCompactionActivity({ ...identity, heartbeat: true })
+    let entry = api.foldedTurn.value.statusHistory.find(s => s.id === 'c')
+    expect(entry?.providerRecovery).toMatchObject({ startedAt: 10_000, httpStatus: 429 })
+    api.recordCompactionActivity({ ...identity, compactionRecovery: { phase: 'retrying', reason: 'rate_limited' } })
+    entry = api.foldedTurn.value.statusHistory.find(s => s.id === 'c')
+    expect(entry?.providerRecovery?.phase).toBe('retrying')
+    expect(entry?.httpStatus).toBeUndefined()
+    api.recordCompactionActivity({ ...identity, status: 'completed' })
+    expect(api.foldedTurn.value.statusHistory.find(s => s.id === 'c')?.providerRecovery).toBeUndefined()
+    api.cleanup()
+  })
+
+  it('preserves wait origin on heartbeat, records a new wait, and clears code on retry', () => {
+    const { api } = makeStream()
+    api.startStreaming()
+    const wait = { phase: 'retry_wait' as const, reason: 'rate_limited', startedAt: 10_000, retryAfterMs: 35_000, httpStatus: 429, attempt: 1 }
+    api.setAcceptedActivityStartedAt(10_000)
+    api.recordActivityPhase('Waiting', 'provider:rate_limited:35', wait)
+    api.setAcceptedActivityStartedAt(15_000)
+    api.recordActivityPhase('Waiting', 'provider:rate_limited:35', wait)
+    expect(api.foldedTurn.value.statusHistory.filter(s => s.providerRecovery?.phase === 'retry_wait')).toHaveLength(1)
+    expect(api.foldedTurn.value.statusHistory.find(s => s.providerRecovery?.phase === 'retry_wait')?.at).toBe(10_000)
+    api.recordActivityPhase('Waiting', 'provider:rate_limited:35', { ...wait, startedAt: 20_000, attempt: 2 })
+    expect(api.foldedTurn.value.statusHistory.filter(s => s.providerRecovery?.phase === 'retry_wait')).toHaveLength(2)
+    api.recordActivityPhase('Retrying', 'provider:retrying:2:3', { phase: 'retrying', reason: 'rate_limited', attempt: 2 })
+    expect(api.foldedTurn.value.statusHistory.slice(-1)[0]?.httpStatus).toBeUndefined()
+    api.cleanup()
   })
 
   it('uses valid negotiated idle grace and falls back to 630s for invalid policy', () => {
@@ -555,6 +673,29 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it.each(['activity-first', 'text-first'] as const)('keeps one reasoning phase and clock for %s progress', order => {
+    const { api } = makeStream()
+    const recovery = { phase: 'reasoning' as const, reason: 'initial', activityId: 'call-1', startedAt: Date.now() }
+    api.startStreaming()
+    api.recordActivityPhase('Preparing tool call')
+    api.recordActivityPhase('Thinking deeply', 'provider:reasoning', order === 'activity-first' ? recovery : undefined)
+    const first = api.foldedTurn.value.statusHistory.find(entry => entry.action === 'provider:reasoning')!
+    vi.advanceTimersByTime(21_000)
+    expect(api.streamActivityStale.value).toBe(true)
+    api.recordActivityPhase('Thinking deeply', 'provider:reasoning', order === 'text-first' ? recovery : undefined)
+    expect(api.streamActivityStale.value).toBe(false)
+    expect(api.streamPhaseElapsed.value).toBe('21s')
+    expect(api.foldedTurn.value.statusHistory.filter(entry => entry.action === 'provider:reasoning')).toEqual([first])
+
+    // A later block after tool preparation is a new phase, even within the
+    // same provider call; only consecutive duplicate signals are coalesced.
+    api.recordActivityPhase('Preparing tool call')
+    api.recordActivityPhase('Thinking deeply', 'provider:reasoning')
+    expect(api.foldedTurn.value.statusHistory.filter(entry => entry.action === 'provider:reasoning')).toHaveLength(2)
+    expect(api.streamPhaseElapsed.value).toBe('0s')
+    api.cleanup()
+  })
+
   it('does not parse the growing answer in the production reducer path', () => {
     const { api, renderMarkdown } = makeStream()
     for (let index = 0; index < 2_048; index += 1) api.appendDelta('x')
@@ -623,7 +764,7 @@ describe('useChatStream render coalescing', () => {
 
     expect(messages.value[0]?.text).toBe(prefix + suffix)
     expect(messages.value[0]?.timeline).toEqual([
-      { type: 'text', raw: prefix, presentation: 'answer' },
+      { type: 'text', raw: prefix, presentation: 'intermediate' },
       { type: 'tool-group', groupId: 'stream:tool-group:web.search:0', operationKey: 'web.search' },
       { type: 'text', raw: suffix, presentation: 'answer' },
     ])

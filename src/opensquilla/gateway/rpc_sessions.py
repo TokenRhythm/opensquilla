@@ -1991,8 +1991,14 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
     # classifies these codes (engine/outcome.py); this is the missing link that
     # carries it to clients.
     from opensquilla.engine.outcome import outcome_from_error
+    from opensquilla.provider.failures import safe_http_status
 
+    http_status = safe_http_status(payload.get("http_status", prior_outcome.get("http_status")))
+    payload.pop("http_status", None)
+    if http_status is not None:
+        payload["http_status"] = http_status
     outcome = outcome_from_error(
+        http_status=http_status,
         code=str(code) if code else None,
         message=safe_error_message,
         error_class=str(code) if code else None,

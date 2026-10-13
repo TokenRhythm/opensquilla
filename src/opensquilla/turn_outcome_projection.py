@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
+from opensquilla.provider.failures import safe_http_status
+
 FORK_TERMINAL_OUTCOME_CONTEXT_KEY = "_opensquilla_fork_terminal_outcome_v1"
 FORK_TERMINAL_OUTCOME_VERSION = 2
 _ACCEPTED_FORK_TERMINAL_OUTCOME_VERSIONS = frozenset({1, 2})
@@ -49,7 +51,11 @@ def terminal_turn_outcome(status: str, outcome: object) -> dict[str, Any] | None
     if status not in TERMINAL_AGENT_TASK_STATUSES:
         return None
     if isinstance(outcome, Mapping):
-        return deepcopy(dict(outcome))
+        result = deepcopy(dict(outcome))
+        http_status = safe_http_status(result.pop("http_status", None))
+        if status != "succeeded" and http_status is not None:
+            result["http_status"] = http_status
+        return result
     legacy_kind = {
         "succeeded": "completed",
         "failed": "failed",

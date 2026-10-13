@@ -2,6 +2,7 @@
   <!-- Keep the reason and its one safe action in the conversation flow. -->
   <div v-if="message.displayRole === 'error'" class="msg-error" :role="errorRole">
     <span v-if="errorText" class="msg-error__text">{{ errorText }}</span>
+    <span v-if="httpStatus !== undefined" class="msg-error__http">{{ t('chat.httpStatus', { status: httpStatus }) }}</span>
     <span v-if="hasPartialAnswer" class="msg-error__note">{{ t('chat.partialFailureNote') }}</span>
     <span v-if="settingsTarget || showResume || showRetry" class="msg-error__actions">
       <RouterLink v-if="settingsTarget" class="msg-error__action"
@@ -49,6 +50,7 @@ import { useI18n } from 'vue-i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
 import { absoluteTime, fullTime, isoTime } from '@/utils/messageTime'
 import { chatErrorPresentation } from '@/utils/chat/chatErrorPresentation'
+import { providerHttpStatus } from '@/utils/chat/providerRecovery'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
 import {
   hasStrictUsageBarrierReplayProof,
@@ -104,7 +106,11 @@ const errorText = computed(() => localizedChatErrorMessage(
     outcomeKind: props.message.turnOutcome?.kind,
   },
 ))
-const errorRole = computed(() => [
+const httpStatus = computed(() => {
+  if (['timeout', 'cancelled', 'abandoned', 'interrupted', 'succeeded', 'completed'].includes(props.message.turnOutcome?.status || '')) return undefined
+  return providerHttpStatus(props.message.turnOutcome?.httpStatus)
+})
+const errorRole = computed(() => props.message.restoredFromHistory ? undefined : [
   'chat.errorMessage.stopped', 'chat.errorMessage.interrupted',
   'chat.errorMessage.approvalRequired', 'chat.errorMessage.needsConfirmation',
   'chat.errorMessage.runLimit',
@@ -122,7 +128,7 @@ const settingsTarget = computed(() => {
 const actionLabel = computed(() => {
   const action = presentation.value.action
   if (action === 'open-provider-settings') return t('chat.errorAction.openProviderSettings')
-  if (action === 'choose-model') return t('chat.errorAction.chooseModel')
+  if (action === 'choose-model') return t('chat.errorAction.openModelSettings')
   return t('chat.errorAction.openModelSettings')
 })
 const showResume = computed(
@@ -225,6 +231,13 @@ const timeFull = computed(() => fullTime(props.message.ts))
 .msg-error__note,
 .msg-error__actions {
   margin-inline-start: 0.5rem;
+}
+
+.msg-error__http {
+  margin-inline-start: 0.25rem;
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  white-space: nowrap;
 }
 
 .msg-error__action {

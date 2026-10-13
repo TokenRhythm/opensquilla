@@ -42,7 +42,7 @@
           :step-count="activityStepCount"
           :failure-count="toolFailureCount"
           :duration-seconds="activityDurationSeconds"
-          :summary-label="displayActivitySummaryLabel"
+          :summary-label="activitySummaryLabel"
           :phase-label="hasPlan ? t('chat.plan.process') : ''"
           :completion-confirmed="activityCompletionConfirmed"
           :default-open="activityDefaultOpen"
@@ -1218,19 +1218,12 @@ const activitySummaryLabel = computed(() => {
     ].filter(Boolean).join(' · '))
   }
   if (activityCompletionConfirmed.value) {
-    return withMaintenanceSummary(activityCompactElapsedLabel.value
+    return activityCompactElapsedLabel.value
       ? String(t('chat.activityElapsed', { duration: activityCompactElapsedLabel.value }))
-      : String(t('chat.activity.lifecycle.settled')))
+      : String(t('chat.activity.lifecycle.settled'))
   }
   return withMaintenanceSummary(activityDetailLabel.value)
 })
-const planActivitySummaryLabel = computed(() => [
-  String(t('chat.plan.process')),
-  activityCompactElapsedLabel.value,
-].filter(Boolean).join(' · '))
-const displayActivitySummaryLabel = computed(() =>
-  hasPlan.value ? planActivitySummaryLabel.value : activitySummaryLabel.value,
-)
 function onMessageClick(event: MouseEvent) {
   if (!props.shareMode) return
   if (props.message.stopNotice) return
@@ -1345,7 +1338,7 @@ function fmtUsd(value: number): string {
 
 .assistant-answer--separated {
   margin-top: 0;
-  padding-top: 1.5rem;
+  padding-top: 0.5rem;
   border-top: 0;
 }
 

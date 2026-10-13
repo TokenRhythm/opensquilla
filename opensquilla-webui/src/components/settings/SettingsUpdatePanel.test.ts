@@ -1,7 +1,10 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { LocaleCode } from '@/i18n'
 
-const settle = () => new Promise((resolve) => setTimeout(resolve, 20))
+const settle = () => vi.isFakeTimers()
+  ? vi.advanceTimersByTimeAsync(20)
+  : new Promise((resolve) => setTimeout(resolve, 20))
 
 function setDesktopApi(api: unknown): void {
   ;(window as unknown as { opensquillaDesktop?: unknown }).opensquillaDesktop = api
@@ -37,13 +40,14 @@ function desktopUpdateApi(state: Record<string, unknown>, overrides: Record<stri
   }
 }
 
-async function mountPanel(api: ReturnType<typeof desktopUpdateApi>) {
+async function mountPanel(api: ReturnType<typeof desktopUpdateApi>, locale: LocaleCode = 'en') {
   vi.resetModules()
   document.body.innerHTML = ''
   setDesktopApi(api)
   const { createApp, nextTick } = await import('vue')
-  const i18n = (await import('@/i18n')).default
-  i18n.global.locale.value = 'en'
+  const { default: i18n, loadLocaleMessages } = await import('@/i18n')
+  await loadLocaleMessages(locale)
+  i18n.global.locale.value = locale
   const Component = (await import('./SettingsUpdatePanel.vue')).default
   const el = document.createElement('div')
   document.body.appendChild(el)
@@ -60,6 +64,19 @@ beforeEach(() => {
 })
 
 describe('SettingsUpdatePanel', () => {
+  it.each([
+    ['en', 'may interrupt running tasks'], ['zh-Hans', '进行中的任务可能中断'],
+    ['de', 'laufende Aufgaben unterbrechen'], ['fr', 'peut interrompre les tâches en cours'],
+    ['es', 'puede interrumpir las tareas en curso'], ['ja', '実行中のタスクが中断される場合があります'],
+  ] as const)('explains the Windows installation consequence in %s', async (locale, expected) => {
+    const { app, el } = await mountPanel(desktopUpdateApi({
+      status: 'downloaded', canInstall: true, canNativeInstall: false, installMode: 'manual',
+    }), locale)
+    expect(el.querySelector('.control-row__desc')?.textContent).toContain(expected)
+    expect(el.querySelectorAll('[role="dialog"]')).toHaveLength(0)
+    app.unmount()
+  })
+
   it.each([0, 37.8, 120, null])('shows real bounded download progress without inventing an unknown percentage (%s)', async (progress) => {
     const { app, el } = await mountPanel(desktopUpdateApi({ status: 'downloading', progress }))
     const track = el.querySelector('[role="progressbar"]')!
@@ -181,9 +198,13 @@ describe('SettingsUpdatePanel', () => {
     install.click()
     await settle()
     expect(api.relaunchToUpdate).toHaveBeenCalledTimes(1)
-    expect(el.textContent).toContain('Closing background services')
-    expect(el.textContent).toContain('installer will open when they have stopped')
-    expect(el.querySelector('[data-testid="settings-update-relaunch"]')).toBeNull()
+    expect(el.textContent).toContain('Preparing installation')
+    expect(el.textContent).toContain('When preparation is complete, OpenSquilla will quit')
+    expect(el.querySelector('[data-testid="settings-update-relaunch"]')).toBe(install)
+    expect(install.disabled).toBe(true)
+    expect(install.getAttribute('aria-busy')).toBe('true')
+    install.click()
+    expect(api.relaunchToUpdate).toHaveBeenCalledTimes(1)
     expect(el.querySelector('[data-testid="settings-update-download"]')).toBeNull()
     expect((el.querySelector('button') as HTMLButtonElement).disabled).toBe(true)
     app.unmount()
@@ -210,6 +231,116 @@ describe('SettingsUpdatePanel', () => {
     expect(el.textContent).toContain(expected)
     expect(el.querySelector('[data-testid="settings-update-relaunch"]')).not.toBeNull()
     expect(el.querySelector('[data-testid="settings-update-download"]')).not.toBeNull()
+    ;(el.querySelector('[data-testid="settings-update-relaunch"]') as HTMLButtonElement).click()
+    await settle()
+    expect(api.relaunchToUpdate).toHaveBeenCalledTimes(1)
+    expect(api.checkForUpdates).not.toHaveBeenCalled()
+    expect(api.downloadUpdate).not.toHaveBeenCalled()
     app.unmount()
   })
+
+  it('retries a failed update through check exactly once and keeps the action first', async () => {
+    let resolveCheck!: (state: Record<string, unknown>) => void
+    const api = desktopUpdateApi({ status: 'error', errorCode: 'download_failed' }, {
+      checkForUpdates: vi.fn(() => new Promise(resolve => { resolveCheck = resolve })),
+    })
+    const { app, el } = await mountPanel(api)
+    const retry = el.querySelector('[data-testid="settings-update-check"]') as HTMLButtonElement
+    expect(retry.textContent).toContain('Retry')
+    expect(retry.classList.contains('btn--primary')).toBe(true)
+    expect(el.querySelector('.settings-update__actions button')).toBe(retry)
+    expect(el.querySelectorAll('[data-testid="settings-update-check"]')).toHaveLength(1)
+    retry.click()
+    await settle()
+    expect(retry.disabled).toBe(true)
+    retry.click()
+    expect(api.checkForUpdates).toHaveBeenCalledTimes(1)
+    expect(api.downloadUpdate).not.toHaveBeenCalled()
+    expect(api.relaunchToUpdate).not.toHaveBeenCalled()
+    resolveCheck(await api.getUpdateState())
+    await settle()
+    expect(retry.disabled).toBe(false)
+    app.unmount()
+  })
+
+  it('acknowledges a reminder only after success and restores Later at its existing deadline', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-10-13T00:00:00Z'))
+    let resolveDismiss!: (state: Record<string, unknown>) => void
+    const expiresAt = Date.now() + 24 * 60 * 60 * 1000
+    const api = desktopUpdateApi({ status: 'downloaded', canInstall: true }, {
+      dismissUpdate: vi.fn(() => new Promise(resolve => { resolveDismiss = resolve })),
+    })
+    const { app, el } = await mountPanel(api)
+    try {
+      const later = el.querySelector('[data-testid="settings-update-later"]') as HTMLButtonElement
+      later.click()
+      await settle()
+      expect(later.disabled).toBe(true)
+      expect(later.textContent).toContain('Later')
+      expect(el.textContent).not.toContain('Reminder snoozed')
+      resolveDismiss({ ...await api.getUpdateState(), snoozedUntil: new Date(expiresAt).toISOString() })
+      await settle()
+      expect(el.querySelector('[data-testid="settings-update-later"]')).toBe(later)
+      expect(later.textContent).toContain('Reminder snoozed')
+      expect(later.disabled).toBe(true)
+      expect((el.querySelector('[data-testid="settings-update-relaunch"]') as HTMLButtonElement).disabled).toBe(false)
+      later.click()
+      expect(api.dismissUpdate).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(expiresAt - Date.now() - 1)
+      expect(later.textContent).toContain('Reminder snoozed')
+      await vi.advanceTimersByTimeAsync(1)
+      expect(later.textContent).toContain('Later')
+      expect(later.disabled).toBe(false)
+    } finally {
+      app.unmount()
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not acknowledge a reminder when the dismiss IPC rejects', async () => {
+    let rejectDismiss!: (reason: Error) => void
+    const api = desktopUpdateApi({ status: 'downloaded', canInstall: true }, {
+      dismissUpdate: vi.fn(() => new Promise((_resolve, reject) => { rejectDismiss = reject })),
+    })
+    const { app, el } = await mountPanel(api)
+    const later = el.querySelector('[data-testid="settings-update-later"]') as HTMLButtonElement
+    later.click()
+    await settle()
+    expect(later.textContent).toContain('Later')
+    rejectDismiss(new Error('Could not defer reminder'))
+    await settle()
+    expect(el.textContent).toContain('Could not defer reminder')
+    expect(el.textContent).not.toContain('Reminder snoozed')
+    expect(later.disabled).toBe(false)
+    app.unmount()
+  })
+  it('links to the version-specific release page in an external browser without installing', async () => {
+    const api = desktopUpdateApi({
+      status: 'downloaded', canInstall: true,
+      releaseUrl: 'https://example.invalid/installer.exe',
+      releaseNotesUrl: 'https://github.com/TokenRhythm/opensquilla/releases/tag/v99.0.0',
+    })
+    const { app, el } = await mountPanel(api)
+    const link = el.querySelector<HTMLAnchorElement>('[data-testid="settings-update-release-notes"]')!
+    expect(link.textContent).toContain('View what’s new')
+    expect(link.href).toBe('https://github.com/TokenRhythm/opensquilla/releases/tag/v99.0.0')
+    expect(link.target).toBe('_blank')
+    expect(link.rel).toBe('noopener noreferrer')
+    expect(api.relaunchToUpdate).not.toHaveBeenCalled()
+    expect(api.downloadUpdate).not.toHaveBeenCalled()
+    app.unmount()
+  })
+  it.each([null, 'javascript:alert(1)', 'file:///C:/installer.exe', 'https://user:pass@example.com/v2'])(
+    'omits absent or unsafe release notes without guessing from installer URL (%s)', async releaseNotesUrl => {
+      const { app, el } = await mountPanel(desktopUpdateApi({
+        status: 'downloaded', releaseUrl: 'https://example.invalid/installer.exe', releaseNotesUrl,
+      }))
+      expect(el.querySelector('[data-testid="settings-update-release-notes"]')).toBeNull()
+      expect(el.querySelector('[data-testid="settings-update-relaunch"]')).not.toBeNull()
+      app.unmount()
+    },
+  )
+
 })

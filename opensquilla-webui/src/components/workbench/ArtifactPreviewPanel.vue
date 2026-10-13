@@ -140,13 +140,6 @@
             {{ t('workbench.collapse') }}
           </button>
         </div>
-        <div
-          v-else-if="preview.kind.value === 'markdown'"
-          class="artifact-preview__markdown chat-markdown"
-        >
-          <!-- eslint-disable-next-line vue/no-v-html -- output is DOMPurify-sanitized in the resource controller -->
-          <div ref="markdownPreviewEl" v-html="preview.markdownHtml.value" />
-        </div>
         <pre
           v-else-if="preview.kind.value === 'text'"
           class="artifact-preview__text"
@@ -175,6 +168,16 @@
           </span>
         </div>
       </template>
+      <!-- Source visits suspend requests, not the readable Markdown document.
+           Keep loaded images, enhanced diagrams and the scroll container alive. -->
+      <div
+        v-if="preview.kind.value === 'markdown' && preview.markdownHtml.value"
+        v-show="isRenderable"
+        class="artifact-preview__markdown chat-markdown"
+      >
+        <!-- eslint-disable-next-line vue/no-v-html -- output is DOMPurify-sanitized in the resource controller -->
+        <div ref="markdownPreviewEl" v-html="preview.markdownHtml.value" />
+      </div>
     </div>
   </section>
 </template>
@@ -311,6 +314,10 @@ async function syncPreviewResource(
     return
   }
 
+  // A panel first opened on Source starts loading only on its first resume.
+  // Track that revision before awaiting its optional image requests as well.
+  const initiallyResuming = returningFromSuspend && loadedResourceSignature === null
+  if (initiallyResuming) loadedResourceSignature = signature
   if (returningFromSuspend) await preview.resume()
   if (
     generation !== resourceSyncGeneration
@@ -318,18 +325,18 @@ async function syncPreviewResource(
     || resourceSignature.value !== signature
   ) return
 
-  // A panel opened directly on Source has never loaded preview bytes. Its
-  // first resume performs that initial load, so recording the signature here
-  // avoids fetching the same revision twice.
-  if (returningFromSuspend && loadedResourceSignature === null) {
-    loadedResourceSignature = signature
-    return
-  }
+  // The first resume already loaded its recorded revision; do not fetch it twice.
+  if (initiallyResuming) return
 
   // Vue's watch tuple remembers signatures even while the panel is hidden.
   // Keep a separate identity for the bytes actually loaded by the preview so
   // resuming after a Source save cannot revive an older native lease or Blob.
-  if (loadedResourceSignature !== signature) await preview.reload()
+  if (loadedResourceSignature !== signature) {
+    // Optional Markdown images can outlive the main document load. Record the
+    // revision when it starts so a Source edit during that work still reloads.
+    loadedResourceSignature = signature
+    await preview.reload()
+  }
   else if (!returningFromSuspend) await preview.resume()
   if (
     generation === resourceSyncGeneration

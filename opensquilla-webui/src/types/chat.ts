@@ -418,6 +418,8 @@ export interface ChatTurnOutcome {
   documentMutationOutcome?: DocumentMutationOutcome
   errorClass?: string
   failureKind?: string
+  /** null prevents conflicting/invalid HTTP evidence from being restored by merges. */
+  httpStatus?: number | null
   /** null retains invalid/conflicting evidence across notice merges. */
   errorId?: string | null
   terminalMessage?: string
@@ -681,6 +683,9 @@ export interface ActivitySnapshotV2 {
 
 /** A non-conversational maintenance event rendered inside transcript chronology. */
 export interface ChatMaintenanceEvent {
+  providerRecovery?: import('./parts').ProviderRecovery
+  httpStatus?: number
+  failureKind?: string
   kind: 'context_compaction'
   compactionId: string
   source: string

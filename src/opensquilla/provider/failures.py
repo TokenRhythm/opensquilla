@@ -8,6 +8,7 @@ is a data change (a new matcher row), not a new branch.
 
 from __future__ import annotations
 
+import json
 import re
 import ssl
 from collections.abc import Callable, Mapping
@@ -24,6 +25,28 @@ from .registry import UnknownProviderError, get_provider_spec
 log = structlog.get_logger(__name__)
 
 CONNECTION_FAILED_CODE = "connection_failed"
+
+
+def safe_http_status(value: object) -> int | None:
+    """Accept only a genuine, explicitly supplied HTTP error status."""
+    return value if type(value) is int and 400 <= value <= 599 else None
+
+
+def structured_provider_error_code(body: bytes | str) -> str:
+    """Read only a bounded machine code; never expose response prose as a code."""
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    error = data.get("error")
+    source = error if isinstance(error, dict) else data
+    for key in ("code", "type"):
+        value = source.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", value):
+            return value.lower()
+    return ""
 
 
 def is_connection_failure(error: BaseException) -> bool:
@@ -53,6 +76,7 @@ class ProviderFailureKind(StrEnum):
     CONTEXT_OVERFLOW = "context_overflow"
     UNSUPPORTED_FEATURE = "unsupported_feature"
     INSUFFICIENT_CREDITS = "insufficient_credits"
+    USAGE_LIMIT = "usage_limit"
     MODEL_NOT_FOUND = "model_not_found"
     TRANSPORT_TRANSIENT = "transport_transient"
     POLICY_REFUSAL = "policy_refusal"
@@ -220,6 +244,15 @@ _MODEL_UNAVAILABLE_SUBSTRINGS = (
 
 # Family-independent kinds checked before any family table.
 _SHARED_PRE_MATCHERS: tuple[FailureMatcher, ...] = (
+    # A subscription/period usage cap is not RPM throttling or an empty balance.
+    FailureMatcher(
+        ProviderFailureKind.USAGE_LIMIT,
+        raw_codes=frozenset({"usage_limit", "usage_limit_reached", "usage_limited"}),
+    ),
+    FailureMatcher(
+        ProviderFailureKind.USAGE_LIMIT,
+        message_substrings=("usage_limit_reached", "usage_limited", "usage limit reached"),
+    ),
     # Provider-specific adapters use several raw spellings for exhausted
     # credits.  Normalize them once here so every runtime consumer (including
     # Goal settlement) observes the same failure taxonomy.
@@ -234,9 +267,6 @@ _SHARED_PRE_MATCHERS: tuple[FailureMatcher, ...] = (
                 "billing_hard_limit",
                 "insufficient_quota",
                 "provider_quota_exceeded",
-                "usage_limit",
-                "usage_limit_reached",
-                "usage_limited",
             }
         ),
     ),
@@ -456,6 +486,21 @@ def classify_provider_error(
 ) -> ProviderFailureKind:
     """Classify a provider error into a stable runtime failure kind."""
 
+    # Explicit business codes win over contradictory HTTP envelopes/prose.
+    structured_kind = {
+        "usage_limit": ProviderFailureKind.USAGE_LIMIT,
+        "usage_limit_reached": ProviderFailureKind.USAGE_LIMIT,
+        "usage_limited": ProviderFailureKind.USAGE_LIMIT,
+        "insufficient_quota": ProviderFailureKind.INSUFFICIENT_CREDITS,
+        "billing_hard_limit": ProviderFailureKind.INSUFFICIENT_CREDITS,
+        "provider_quota_exceeded": ProviderFailureKind.INSUFFICIENT_CREDITS,
+        "rate_limit_exceeded": ProviderFailureKind.RATE_LIMITED,
+        "rate_limit_error": ProviderFailureKind.RATE_LIMITED,
+        "invalid_api_key": ProviderFailureKind.AUTH_INVALID,
+        "authentication_error": ProviderFailureKind.AUTH_INVALID,
+    }.get((raw_code or "").strip().lower())
+    if structured_kind is not None:
+        return structured_kind
     provider = (provider_name or "").lower()
     family = _failure_family(provider)
     signal = FailureSignal(
@@ -520,6 +565,7 @@ def decide_recovery_action(kind: ProviderFailureKind) -> ProviderRecoveryAction:
     if kind in {
         ProviderFailureKind.RATE_LIMITED,
         ProviderFailureKind.INSUFFICIENT_CREDITS,
+        ProviderFailureKind.USAGE_LIMIT,
         ProviderFailureKind.MODEL_NOT_FOUND,
         ProviderFailureKind.UNSUPPORTED_FEATURE,
     }:

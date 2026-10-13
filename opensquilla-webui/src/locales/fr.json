@@ -140,13 +140,15 @@
     "desktop": {
       "installErrorTitle": "Impossible de démarrer l’installation",
       "quitAndInstall": "Quitter et installer",
-      "signedDownloadedDesc": "OpenSquilla {version} est vérifié et prêt. « Quitter et installer » arrête les services en arrière-plan et ouvre le programme d’installation.",
-      "manualApplyingStatus": "Arrêt des services en arrière-plan",
-      "manualApplyingDesc": "OpenSquilla arrête ses services en arrière-plan. Le programme d’installation s’ouvrira ensuite.",
+      "signedDownloadedDesc": "OpenSquilla {version} est prêt. La mise à jour fermera l’application et peut interrompre les tâches en cours ; suivez l’assistant d’installation pour la terminer.",
+      "manualApplyingStatus": "Préparation de l’installation",
+      "manualApplyingDesc": "Une fois la préparation terminée, OpenSquilla se fermera et ouvrira l’assistant d’installation.",
       "errorSignatureInvalid": "La signature du programme d’installation est invalide ou son éditeur ne correspond pas à OpenSquilla. L’installation a été bloquée. Téléchargez à nouveau la mise à jour.",
       "errorSignatureUnavailable": "OpenSquilla n’a pas pu vérifier la signature du programme d’installation. L’installation a été bloquée. Réessayez plus tard.",
       "indicatorAvailable": "Mise à jour {version}",
       "indicatorDownloaded": "Mise à jour prête",
+      "updateAvailableEntry": "Mise à jour disponible",
+      "viewReleaseNotes": "Voir les nouveautés",
       "indicatorInstallerReady": "Installateur vérifié",
       "indicatorDownloading": "Téléchargement",
       "indicatorDownloadingProgress": "Téléchargement {progress}%",
@@ -185,7 +187,7 @@
       "checkingStatus": "Vérification",
       "upToDateStatus": "À jour",
       "errorStatus": "Attention requise",
-      "applyingStatus": "Relance",
+      "applyingStatus": "Préparation de l’installation",
       "idleStatus": "Inactif",
       "unavailableStatus": "Indisponible",
       "unsupported": "Les mises à jour desktop natives ne sont pas disponibles sur cette plateforme. Utilisez le lien de version lorsqu'une nouvelle version est annoncée.",
@@ -198,7 +200,9 @@
       "downloadInstaller": "Télécharger l’installateur",
       "showInstaller": "Afficher l’installateur",
       "relaunch": "Relancer",
-      "later": "Plus tard"
+      "later": "Plus tard",
+      "reminderSnoozed": "Rappel reporté",
+      "retry": "Réessayer"
     }
   },
   "common": {
@@ -3674,9 +3678,7 @@
     "chatWithSuffix": "Chat {suffix}",
     "copied": "Copié",
     "copy": "Copier",
-    "copySessionKey": "Copier l’ID de session",
-    "copySessionAppLink": "Copier le lien de l’application",
-    "copySessionGatewayLink": "Copier le lien web du Gateway",
+    "copySessionLink": "Copier le lien de la session",
     "sessionActions": "Actions de la session",
     "share": "Partager",
     "shareSendFirst": "Envoyez d'abord un message pour partager",
@@ -3769,16 +3771,16 @@
     "copiedDiagnosticId": "Identifiant de diagnostic copié",
     "copyDiagnosticFailed": "Échec de la copie. Sélectionnez l’identifiant ci-dessus et copiez-le manuellement.",
     "errorMessage": {
-      "unknown": "La tâche n’a pas abouti. Veuillez réessayer plus tard.",
+      "unknown": "Cette requête n’a pas abouti.",
       "noProvider": "Aucun modèle n’est disponible.",
-      "credentials": "Les identifiants du modèle sont invalides.",
-      "credits": "Le compte du modèle n’a pas assez de crédits.",
+      "credentials": "L’authentification auprès du service de modèle a échoué.",
+      "credits": "Le solde du compte du service de modèle est insuffisant.",
       "modelUnavailable": "Le modèle sélectionné est indisponible.",
       "contextLimit": "Le contenu dépasse la limite du modèle.",
       "unsupported": "Ce modèle ne prend pas en charge cette demande.",
       "imageUnsupported": "Ce modèle ne prend pas en charge les images.",
       "ensembleImageUnsupported": "Ce mode ne prend pas en charge les images.",
-      "busy": "Le service du modèle est occupé. Réessayez plus tard.",
+      "busy": "Le service de modèle est occupé ; cette requête n’a pas abouti.",
       "unavailable": "Le service du modèle est indisponible. Réessayez plus tard.",
       "refused": "Le modèle ne peut pas traiter cette demande.",
       "responseIncomplete": "La réponse du modèle est incomplète. Réessayez plus tard.",
@@ -3791,7 +3793,11 @@
       "timeout": "La tâche n’a pas pu se terminer dans le délai imparti.",
       "stopped": "La tâche a été arrêtée.",
       "interrupted": "La tâche a été interrompue.",
-      "approvalRequired": "En attente de votre autorisation."
+      "approvalRequired": "En attente de votre autorisation.",
+      "rateLimited": "Le modèle est temporairement limité ; cette requête n’a pas abouti.",
+      "usageLimit": "La limite d’utilisation du service de modèle est atteinte.",
+      "rateLimitWaitEnded": "Le modèle est temporairement limité ; cette requête ne peut plus attendre.",
+      "busyWaitEnded": "Le service de modèle est occupé ; cette requête ne peut plus attendre."
     },
     "errorAction": {
       "openModelSettings": "Ouvrir les réglages du modèle",
@@ -3909,6 +3915,12 @@
     "activityElapsed": "Temps passé {duration}",
     "activityDurationMinutes": "{minutes} min {seconds} s",
     "activity": {
+      "fileDraft": {
+        "generating": "Génération du fichier",
+        "ready": "Préparation de l’écriture",
+        "note": "Brouillon en cours · Le fichier n’a pas encore été écrit",
+        "truncated": "Dernier extrait du brouillon · Le fichier n’a pas encore été écrit"
+      },
       "lifecycle": {
         "working": "En cours",
         "answering": "Rédaction de la réponse",
@@ -3922,11 +3934,25 @@
         "waiting": "En attente du modèle",
         "responded": "Réponse du modèle",
         "reasoning": "Réflexion",
-        "rateLimited": "Limite atteinte · nouvel essai dans {seconds}s",
-        "retryWait": "Nouvel essai dans {seconds}s",
+        "rateLimited": "Modèle temporairement limité, nouvelle tentative dans environ {seconds} s",
+        "retryWait": "Nouvelle tentative dans environ {seconds} s",
         "retrying": "Nouvel essai {attempt}/{limit}",
         "retryingWithoutLimit": "Nouvel essai · tentative {attempt}",
-        "fallback": "Passage au modèle de secours"
+        "fallback": "Essai d’un modèle de secours",
+        "rateLimitedWaiting": "Modèle temporairement limité, en attente d’une nouvelle tentative",
+        "overloaded": "Service de modèle occupé, nouvelle tentative dans environ {seconds} s",
+        "overloadedWaiting": "Service de modèle occupé, en attente d’une nouvelle tentative",
+        "retryWaiting": "En attente d’une nouvelle tentative",
+        "rateLimitedPast": "Attente liée à la limite du modèle terminée",
+        "overloadedPast": "Attente du service de modèle terminée",
+        "retryWaitPast": "Attente avant nouvelle tentative terminée",
+        "retryingPast": "Requête au modèle retentée",
+        "fallbackPast": "Modèle de secours essayé",
+        "fallbackModels": "Essai d’un modèle de secours · {from} → {to}",
+        "fallbackModelsPast": "Modèle de secours essayé · {from} → {to}",
+        "fallbackModel": "Essai d’un modèle de secours · {model}",
+        "fallbackModelPast": "Modèle de secours essayé · {model}",
+        "retryingGeneric": "Nouvelle tentative"
       },
       "purpose": {
         "discover": "Liens découverts",
@@ -4511,7 +4537,8 @@
       "sessionModelBusy": "Vous pourrez changer de modèle une fois la réponse en cours terminée.",
       "router": "Routage intelligent des modèles",
       "ensemble": "Ensemble de modèles"
-    }
+    },
+    "httpStatus": "(HTTP {status})"
   },
   "shared": {
     "loading": "Chargement",

@@ -27,14 +27,14 @@
       'thinking-fold--timeline-phase': timelinePhase,
     }"
     :open="controlled ? open : undefined"
-    @toggle="emit('openChange', ($event.target as HTMLDetailsElement).open)"
+    @toggle="onDisclosureToggle"
   >
     <summary class="thinking-fold__summary" @click="onSummaryClick">
       <ActivityMotion class="thinking-fold__motion" :active="live === true && motionActive !== false && activityVisible">
         <span class="thinking-fold__label">{{ summary }}</span>
         <Icon class="thinking-fold__chevron" name="chevronRight" :size="12" aria-hidden="true" />
       </ActivityMotion>
-      <span v-if="live && previewLine" class="thinking-fold__preview" aria-hidden="true">{{ previewLine }}</span>
+      <span v-if="live && previewLine" class="thinking-fold__preview" aria-hidden="true"><span class="thinking-fold__preview-line">{{ previewLine }}</span></span>
     </summary>
     <div
       ref="bodyElement"
@@ -48,7 +48,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onScopeDispose, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ActivityMotion from '@/components/chat/ActivityMotion.vue'
@@ -63,8 +63,7 @@ const props = withDefaults(defineProps<{
   embedded?: boolean
   /** Nested inside the outer activity disclosure. */
   nested?: boolean
-  /** Streaming turn: label the fold "Thinking · Ns" (matching the live
-   * elapsed ticker) instead of the settled "Thought for …" wording. */
+  /** Streaming turn. Nested summaries leave elapsed time to the turn header. */
   live?: boolean
   /** Stop feedback when the parent has moved beyond reasoning, without changing
    * the existing label or disclosure ownership. */
@@ -95,11 +94,64 @@ const emit = defineEmits<{
 
 const bodyElement = ref<HTMLElement | null>(null)
 const TAIL_THRESHOLD_PX = 4
-// Preview only text already supplied by the reasoning stream; no generated summary.
-const previewLine = computed(() => {
-  const lines = (props.previewText ?? props.part.text).trim().split(/\r?\n/).filter(line => line.trim())
-  return lines[lines.length - 1] || ''
-})
+const PREVIEW_LINE_DWELL_MS = 500
+const previewLine = ref('')
+const nativeOpen = ref(false)
+let previewIndex = -1
+let previewIdentity = ''
+let previewShownAt = 0
+let previewTimer: ReturnType<typeof setTimeout> | undefined
+let pendingPreview: { index: number; text: string } | undefined
+
+function clearPreviewTimer() {
+  if (previewTimer !== undefined) clearTimeout(previewTimer)
+  previewTimer = undefined
+  pendingPreview = undefined
+}
+
+function showPreview(line: { index: number; text: string }) {
+  clearPreviewTimer()
+  previewLine.value = line.text
+  previewIndex = line.index
+  previewShownAt = Date.now()
+}
+
+// Pace only changes of the compact preview's line. The canonical body stays
+// immediate, same-line text grows in place, and pending lines never form a queue.
+watch(() => [props.previewText ?? props.part.text, props.part.key, props.live,
+  props.motionActive, props.controlled ? props.open : nativeOpen.value, activityVisible.value] as const,
+([text, identity, live, motionActive, expanded, visible]) => {
+  const lines = text.split(/\r?\n/)
+  let index = lines.length - 1
+  while (index >= 0 && !lines[index]!.trim()) index--
+  const latest = { index, text: index < 0 ? '' : lines[index]!.trim() }
+  if (identity !== previewIdentity || !live || motionActive === false || expanded || !visible
+    || previewIndex < 0 || latest.index < previewIndex) {
+    previewIdentity = identity
+    showPreview(latest)
+    return
+  }
+  if (latest.index === previewIndex) {
+    clearPreviewTimer()
+    previewLine.value = latest.text
+    return
+  }
+  const remaining = PREVIEW_LINE_DWELL_MS - (Date.now() - previewShownAt)
+  if (remaining <= 0) {
+    showPreview(latest)
+    return
+  }
+  pendingPreview = latest
+  if (previewTimer === undefined) previewTimer = setTimeout(() => {
+    if (pendingPreview) showPreview(pendingPreview)
+  }, remaining)
+}, { immediate: true })
+onScopeDispose(clearPreviewTimer)
+
+function onDisclosureToggle(event: Event) {
+  nativeOpen.value = (event.target as HTMLDetailsElement).open
+  emit('openChange', nativeOpen.value)
+}
 
 function pinToTail() {
   if (!props.live || !props.followTail || props.open === false) return
@@ -131,7 +183,8 @@ function onSummaryClick(event: MouseEvent) {
 
 const summary = computed(() => {
   const seconds = props.part.seconds || 0
-  if (props.live) return t('chat.thinkingForSeconds', { seconds })
+  if (props.live) return props.nested || props.timelinePhase
+    ? t('chat.thinking') : t('chat.thinkingForSeconds', { seconds })
   if (props.timelinePhase) {
     if (seconds < 1) return t('chat.thoughtProcess')
     const duration = seconds < 60
@@ -193,7 +246,8 @@ const summary = computed(() => {
 .thinking-fold[open] > .thinking-fold__summary .thinking-fold__chevron { transform: rotate(90deg); }
 .thinking-fold__label { flex: 0 0 auto; white-space: nowrap; }
 .thinking-fold__motion { flex: 0 0 auto; }
-.thinking-fold__preview { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text-dim); font-size: 0.8125rem; }
+.thinking-fold__preview { display: flex; justify-content: flex-end; flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--text-dim); font-size: 0.8125rem; }
+.thinking-fold__preview-line { flex: 0 0 auto; min-width: 100%; white-space: nowrap; }
 .thinking-fold[open] .thinking-fold__preview { display: none; }
 .thinking-fold__body {
   margin: 0.25rem 0 0.375rem; padding: 0.125rem 0;
@@ -212,8 +266,18 @@ const summary = computed(() => {
   border-radius: 0;
   line-height: 1.45;
 }
+/* Structured timelines and legacy history share the same nested row dimensions. */
+.thinking-fold--in-activity {
+  margin-bottom: 0;
+  font-size: 0.8125rem;
+}
+.thinking-fold--in-activity > .thinking-fold__summary {
+  min-height: 1.75rem;
+  line-height: 1.45;
+}
 @media (pointer: coarse) {
   .thinking-fold__summary,
+  .thinking-fold--in-activity > .thinking-fold__summary,
   .thinking-fold--timeline-phase > .thinking-fold__summary { min-height: 2.75rem; }
 }
 @media (prefers-reduced-motion: reduce) {

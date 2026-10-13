@@ -4261,13 +4261,16 @@ async def test_continuation_guardrail_is_checked_before_provider_activation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [
+    ProviderFailureKind.INSUFFICIENT_CREDITS, ProviderFailureKind.USAGE_LIMIT,
+])
 async def test_normalized_provider_credit_failure_maps_goal_to_usage_limited(
-    tmp_path: Path,
+    tmp_path: Path, kind: ProviderFailureKind,
 ) -> None:
     class _ProviderCreditsExhaustedError(RuntimeError):
         code = "402"
         terminal_reason = "error"
-        failure_kind = ProviderFailureKind.INSUFFICIENT_CREDITS.value
+        failure_kind = kind.value
 
     async def handler(_run: TaskRun) -> None:
         raise _ProviderCreditsExhaustedError("synthetic credit balance exhausted")
@@ -4286,7 +4289,7 @@ async def test_normalized_provider_credit_failure_maps_goal_to_usage_limited(
         )
         turn_outcome = (task.details or {}).get("turn_outcome")
         assert isinstance(turn_outcome, dict)
-        assert turn_outcome["failure_kind"] == "insufficient_credits"
+        assert turn_outcome["failure_kind"] == kind.value
         assert limited.pause_reason == "usage_limited"
 
 

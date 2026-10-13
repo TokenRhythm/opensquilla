@@ -4,7 +4,7 @@
       v-for="block in visibleBlocks"
       :key="block.id"
       :part="asPart(block)"
-      :live="block.status === 'streaming'"
+      :live="block.status === 'streaming' && !collapseActive"
       :motion-active="executing === true && !collapseActive"
       :preview-text="block.text"
       :nested="nested"
@@ -66,7 +66,8 @@ function disclosureIdentity(block: ReasoningBlock): string {
 }
 
 watch(
-  () => [props.sessionKey, props.blocks.map(block => `${block.id}:${block.startedAt}:${block.status}`).join('|')],
+  () => [props.sessionKey, props.nested, props.timelinePhase, props.collapseActive,
+    props.blocks.map(block => `${block.id}:${block.startedAt}:${block.status}`).join('|')],
   () => {
     const currentIds = new Set(props.blocks.map(block => block.id))
     for (const id of openById.keys()) {
@@ -94,10 +95,12 @@ watch(
       }
     }
 
-    const hasStreaming = props.blocks.some(block => block.status === 'streaming')
-    if (hasStreaming && !timer) {
+    // Nested live summaries use a fixed label; the turn header owns its clock.
+    const needsLiveClock = !props.nested && !props.timelinePhase && !props.collapseActive
+      && props.blocks.some(block => block.status === 'streaming')
+    if (needsLiveClock && !timer) {
       timer = setInterval(() => { clock.value = Date.now() }, 1000)
-    } else if (!hasStreaming && timer) {
+    } else if (!needsLiveClock && timer) {
       clearInterval(timer)
       timer = null
     }
@@ -142,7 +145,7 @@ function asPart(block: ReasoningBlock): Extract<ChatPart, { type: 'reasoning' }>
   const end = block.endedAt ?? presentationEndedAtById.get(block.id) ?? Date.now()
   return {
     type: 'reasoning',
-    key: `live-reasoning:${block.id}`,
+    key: `live-reasoning:${props.sessionKey || ''}:${block.id}:${block.startedAt}`,
     text: block.text,
     seconds: Math.max(0, Math.floor((end - block.startedAt) / 1000)),
   }

@@ -140,13 +140,15 @@
     "desktop": {
       "installErrorTitle": "インストールを開始できませんでした",
       "quitAndInstall": "終了してインストール",
-      "signedDownloadedDesc": "OpenSquilla {version} のインストーラーは検証済みです。「終了してインストール」でバックグラウンドサービスを停止し、インストーラーを開きます。",
-      "manualApplyingStatus": "バックグラウンドサービスを停止中",
-      "manualApplyingDesc": "OpenSquilla のバックグラウンドサービスを停止しています。停止後にインストーラーが開きます。",
+      "signedDownloadedDesc": "OpenSquilla {version} の準備ができました。更新するとアプリが終了し、実行中のタスクが中断される場合があります。その後に開くインストールウィザードで更新を完了してください。",
+      "manualApplyingStatus": "インストールを準備中",
+      "manualApplyingDesc": "準備が完了すると、OpenSquilla が終了し、インストールウィザードが開きます。",
       "errorSignatureInvalid": "インストーラーの署名が無効か、発行元が OpenSquilla と一致しないため、インストールをブロックしました。更新を再ダウンロードしてください。",
       "errorSignatureUnavailable": "インストーラーの署名を検証できないため、インストールをブロックしました。後でもう一度お試しください。",
       "indicatorAvailable": "更新 {version}",
       "indicatorDownloaded": "更新準備完了",
+      "updateAvailableEntry": "更新があります",
+      "viewReleaseNotes": "更新内容を見る",
       "indicatorInstallerReady": "インストーラ検証済み",
       "indicatorDownloading": "ダウンロード中",
       "indicatorDownloadingProgress": "ダウンロード中 {progress}%",
@@ -185,7 +187,7 @@
       "checkingStatus": "確認中",
       "upToDateStatus": "最新",
       "errorStatus": "確認が必要",
-      "applyingStatus": "再起動中",
+      "applyingStatus": "インストールを準備中",
       "idleStatus": "待機中",
       "unavailableStatus": "利用不可",
       "unsupported": "このプラットフォームではネイティブのデスクトップ更新を利用できません。新しいバージョンが告知されたらリリースリンクを使用してください。",
@@ -198,7 +200,9 @@
       "downloadInstaller": "インストーラーをダウンロード",
       "showInstaller": "インストーラを表示",
       "relaunch": "再起動",
-      "later": "後で"
+      "later": "後で",
+      "reminderSnoozed": "通知を延期しました",
+      "retry": "再試行"
     }
   },
   "common": {
@@ -3674,9 +3678,7 @@
     "chatWithSuffix": "チャット {suffix}",
     "copied": "コピーしました",
     "copy": "コピー",
-    "copySessionKey": "セッション ID をコピー",
-    "copySessionAppLink": "アプリケーションリンクをコピー",
-    "copySessionGatewayLink": "Gateway ウェブリンクをコピー",
+    "copySessionLink": "セッションリンクをコピー",
     "sessionActions": "セッション操作",
     "share": "共有",
     "shareSendFirst": "共有するには、まずメッセージを送信してください",
@@ -3769,16 +3771,16 @@
     "copiedDiagnosticId": "診断番号をコピーしました",
     "copyDiagnosticFailed": "コピーできませんでした。上の番号を選択して手動でコピーしてください。",
     "errorMessage": {
-      "unknown": "タスクを完了できませんでした。後でもう一度お試しください。",
+      "unknown": "このリクエストは完了しませんでした。",
       "noProvider": "利用できるモデルがありません。",
-      "credentials": "モデルの認証情報が無効です。",
-      "credits": "モデルのアカウント残高が不足しています。",
+      "credentials": "モデルサービスの認証に失敗しました。",
+      "credits": "モデルサービスのアカウント残高が不足しています。",
       "modelUnavailable": "選択したモデルは利用できません。",
       "contextLimit": "入力がモデルの上限を超えています。",
       "unsupported": "このモデルはこのリクエストに対応していません。",
       "imageUnsupported": "このモデルは画像に対応していません。",
       "ensembleImageUnsupported": "このモードは画像に対応していません。",
-      "busy": "モデルサービスが混み合っています。後でもう一度お試しください。",
+      "busy": "モデルサービスが混雑し、このリクエストは完了しませんでした。",
       "unavailable": "モデルサービスを利用できません。後でもう一度お試しください。",
       "refused": "モデルはこのリクエストを処理できません。",
       "responseIncomplete": "モデルの応答が完了しませんでした。後でもう一度お試しください。",
@@ -3791,7 +3793,11 @@
       "timeout": "タスクが完了する前にタイムアウトしました。",
       "stopped": "タスクを停止しました。",
       "interrupted": "タスクが中断されました。",
-      "approvalRequired": "承認を待っています。"
+      "approvalRequired": "承認を待っています。",
+      "rateLimited": "モデルが一時的にレート制限され、このリクエストは完了しませんでした。",
+      "usageLimit": "モデルサービスの利用上限に達しました。",
+      "rateLimitWaitEnded": "モデルが一時的にレート制限され、これ以上待機できません。",
+      "busyWaitEnded": "モデルサービスが混雑しており、これ以上待機できません。"
     },
     "errorAction": {
       "openModelSettings": "モデル設定を開く",
@@ -3909,6 +3915,12 @@
     "activityElapsed": "所要時間 {duration}",
     "activityDurationMinutes": "{minutes} 分 {seconds} 秒",
     "activity": {
+      "fileDraft": {
+        "generating": "ファイルを生成中",
+        "ready": "書き込みを準備中",
+        "note": "生成中の下書き · まだファイルに書き込まれていません",
+        "truncated": "下書きの最新部分 · まだファイルに書き込まれていません"
+      },
       "lifecycle": {
         "working": "作業中",
         "answering": "回答を作成中",
@@ -3922,11 +3934,25 @@
         "waiting": "モデルを待機中",
         "responded": "モデル応答",
         "reasoning": "思考",
-        "rateLimited": "レート制限 · {seconds}秒後に再試行",
-        "retryWait": "{seconds}秒後に再試行",
+        "rateLimited": "モデルがレート制限中です。約 {seconds} 秒後に再試行します",
+        "retryWait": "約 {seconds} 秒後に再試行します",
         "retrying": "再試行中 {attempt}/{limit}",
         "retryingWithoutLimit": "再試行中 · {attempt}回目",
-        "fallback": "予備モデルに切り替え中"
+        "fallback": "代替モデルを試行中",
+        "rateLimitedWaiting": "モデルがレート制限中です。再試行を待っています",
+        "overloaded": "モデルサービスが混雑中です。約 {seconds} 秒後に再試行します",
+        "overloadedWaiting": "モデルサービスが混雑中です。再試行を待っています",
+        "retryWaiting": "再試行を待っています",
+        "rateLimitedPast": "モデルのレート制限解除を待機しました",
+        "overloadedPast": "モデルサービスを待機しました",
+        "retryWaitPast": "再試行を待機しました",
+        "retryingPast": "モデルリクエストを再試行しました",
+        "fallbackPast": "代替モデルを試行しました",
+        "fallbackModels": "代替モデルを試行中 · {from} → {to}",
+        "fallbackModelsPast": "代替モデルを試行しました · {from} → {to}",
+        "fallbackModel": "代替モデルを試行中 · {model}",
+        "fallbackModelPast": "代替モデルを試行しました · {model}",
+        "retryingGeneric": "再試行中"
       },
       "purpose": {
         "discover": "リンクを検出",
@@ -4511,7 +4537,8 @@
       "sessionModelBusy": "現在の応答が完了してからモデルを変更できます。",
       "router": "インテリジェントモデルルーティング",
       "ensemble": "モデルアンサンブル"
-    }
+    },
+    "httpStatus": "（HTTP {status}）"
   },
   "shared": {
     "loading": "読み込み中",

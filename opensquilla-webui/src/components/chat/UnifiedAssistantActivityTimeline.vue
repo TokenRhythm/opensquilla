@@ -22,6 +22,14 @@
         :tool-status-text="toolStatusText"
         :tool-secondary-text="toolSecondaryText"
       />
+      <ToolInputPreview
+        v-else-if="row.type === 'draft'"
+        :preview="row.preview"
+        :executing="executing"
+        :state-scope="stateScope"
+        :open="isToolItemOpen(stateScope ? `${stateScope}:${row.preview.toolUseId}` : row.preview.toolUseId) === true"
+        @toggle-item="(id, open) => $emit('toggleItem', id, open)"
+      />
       <ReasoningTimeline
         v-else-if="row.type === 'reasoning'"
         :session-key="sessionKey"
@@ -66,6 +74,8 @@ import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import ReasoningTimeline from '@/components/chat/ReasoningTimeline.vue'
+import ToolInputPreview from '@/components/chat/ToolInputPreview.vue'
+import type { LiveToolInputPreview } from '@/types/toolInputPreview'
 import type {
   ChatStreamTimelineItem,
   ChatToolCallGroup,
@@ -84,6 +94,7 @@ const props = withDefaults(defineProps<{
   projection: AssistantActivityTimelineProjection
   timelineItems?: ChatStreamTimelineItem[]
   reasoningBlocks?: ReasoningBlock[]
+  toolInputPreviews?: LiveToolInputPreview[]
   isToolGroupOpen: (groupId: string) => boolean | undefined
   isToolItemOpen: (renderKey: string) => boolean | undefined
   toolGroupStatusText: (group: ChatToolCallGroup) => string
@@ -100,6 +111,7 @@ const props = withDefaults(defineProps<{
 }>(), {
   timelineItems: () => [],
   reasoningBlocks: () => [],
+  toolInputPreviews: () => [],
   reasoningCollapseActive: false,
   reasoningNested: true,
   reasoningTimelinePhase: true,
@@ -121,6 +133,7 @@ defineSlots<{
 }>()
 
 type AtomicRow =
+  | { type: 'draft'; key: string; order: number; preview: LiveToolInputPreview }
   | {
       type: 'status'
       key: string
@@ -141,6 +154,7 @@ type AtomicRow =
     }
 
 type ActivityRow =
+  | Extract<AtomicRow, { type: 'draft' }>
   | Omit<Extract<AtomicRow, { type: 'status' }>, 'insertion'>
   | { type: 'reasoning'; key: string; order: number; blocks: ReasoningBlock[] }
   | { type: 'items'; key: string; order: number; items: ChatStreamTimelineItem[] }
@@ -160,7 +174,9 @@ function itemOrder(item: ChatStreamTimelineItem): number | undefined {
 }
 
 const rows = computed<ActivityRow[]>(() => {
-  if (!canMergeAssistantActivityOrder(
+  const hasNonDraftRows = props.projection.statusSteps.some(isVisibleActivityStatusStep)
+    || props.reasoningBlocks.some(block => block.text) || props.timelineItems.length > 0
+  if (hasNonDraftRows && !canMergeAssistantActivityOrder(
     props.projection.statusSteps, props.reasoningBlocks, props.timelineItems,
   )) return []
   const statusRows: AtomicRow[] = []
@@ -238,14 +254,18 @@ const rows = computed<ActivityRow[]>(() => {
     })
   }
 
-  const sources: AtomicRow[][] = [statusRows, reasoningRows, itemRows]
+  const draftRows: AtomicRow[] = props.toolInputPreviews.map(preview => ({
+    type: 'draft', key: `draft:${preview.previewId}`, order: preview.activityOrder, preview,
+  }))
+  if (draftRows.some(row => !validOrder(row.order))) return []
+  const sources: AtomicRow[][] = [statusRows, reasoningRows, itemRows, draftRows]
   if (sources.some(source => source.some(
     (row, index) => index > 0 && row.order < source[index - 1]!.order,
   ))) return []
 
   // Each source is already monotonic by the authoritative stream order.
-  // Merge the three sources in O(n), using source position as the stable
-  // same-seq tie break: phase -> reasoning -> segment.
+  // Merge sources in O(n), using source position as the stable
+  // same-seq tie break: phase -> reasoning -> segment -> live draft.
   const cursors = sources.map(() => 0)
   const atomic: AtomicRow[] = []
   while (true) {
@@ -270,6 +290,10 @@ const rows = computed<ActivityRow[]>(() => {
 
   const result: ActivityRow[] = []
   for (const row of atomic) {
+    if (row.type === 'draft') {
+      result.push(row)
+      continue
+    }
     if (row.type === 'status') {
       result.push({
         type: 'status',
@@ -328,7 +352,7 @@ function statusProjection(
 /* A reasoning/phase row can split item batches. Apply the same narrative
    boundary spacing across those batches without spacing every tool row. */
 .assistant-unified-activity-timeline > :deep([data-activity-type] + .assistant-activity-timeline:has(> .activity-narration:first-child)) {
-  margin-top: 1.25rem;
+  margin-top: 0.75rem;
 }
 
 .assistant-unified-activity-timeline > :deep(.assistant-activity-timeline:has(> .activity-narration:last-child) + [data-activity-type]) {

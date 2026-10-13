@@ -60,6 +60,7 @@ import {
 } from './onboarding-flow-coordinator.js'
 import { OnboardingSaveTelemetry } from './onboarding-save-telemetry.js'
 import { renderUnconfiguredDesktopConfig } from './desktop-unconfigured-profile.js'
+import { desktopControlUiBasePath } from './desktop-control-ui-config.js'
 import {
   applyDesktopTelemetryConsentPayload,
   desktopPrivacyTomlLines,
@@ -923,6 +924,7 @@ let desktopOpenFlowPromise: Promise<void> | null = null
 let bootResumePromise: Promise<{ ok: boolean; error?: string }> | null = null
 let gatewayConnectionRevision = 0
 let gatewayConnectionInstanceId: string | null = null
+let ownedGatewayControlUiBasePath = '/control'
 
 function invalidateDesktopOpenFlow(): number {
   gatewayLateReadyObservation = null
@@ -1633,7 +1635,11 @@ function secureDesktopRendererDocument(response: Response): Response {
 }
 
 async function handleDesktopRendererRequest(request: Request): Promise<Response> {
-  const route = routeDesktopRendererRequest(request.url, request.method)
+  const route = routeDesktopRendererRequest(
+    request.url,
+    request.method,
+    gatewayState.owned ? ownedGatewayControlUiBasePath : '',
+  )
   if (route.kind === 'reject') return new Response('Not found', { status: 404 })
   if (route.kind === 'gateway') return proxyDesktopRendererRequest(request, route.pathAndQuery)
 
@@ -9529,6 +9535,10 @@ async function startGateway(): Promise<GatewayState> {
     // capability disabled instead of weakening the transport boundary.
     desktopLog('desktop_browser_transport_unavailable')
   }
+  const controlUiBasePath = desktopControlUiBasePath(
+    await readOptionalDesktopText(join(activeProfile.home, 'config.toml')),
+    process.env,
+  )
   const port = await findGatewayPort()
   // This is the final await before spawn. Update, quit, cleanup, and recovery
   // close writer/lifecycle admission before draining current children; an
@@ -9568,6 +9578,7 @@ async function startGateway(): Promise<GatewayState> {
   gatewayState.url = url
   gatewayState.port = port
   gatewayState.owned = true
+  ownedGatewayControlUiBasePath = controlUiBasePath
   gatewayState.status = 'starting'
   gatewayState.logPath = logPath
   gatewayState.error = undefined
@@ -10893,6 +10904,8 @@ const { autoUpdater } = electronUpdater
 
 let autoUpdaterReady = false
 let updateDownloadInProgress = false
+let desktopUpdateDownloadTask: Promise<DesktopUpdateState> | null = null
+let desktopUpdateDownloadOrigin: 'automatic' | 'user' | null = null
 let manualInstallerActionInProgress = false
 let updateApplying = false
 // A user/system quit that arrives while an update is still draining writers or
@@ -10949,8 +10962,10 @@ interface DesktopUpdateState {
   canCheck: boolean
   canNativeInstall: boolean
   canInstall?: boolean
+  canAutoDownload: boolean
   installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
+  releaseNotesUrl: string | null
   source: DesktopUpdateSource | null
   fallbackUsed: boolean
 }
@@ -11113,6 +11128,10 @@ function windowsInstallerActionsSupported(): boolean {
   return process.platform === 'win32' && process.arch === 'x64'
     && desktopUpdateManaged() && desktopUpdateInstallMode() === 'manual'
     && process.env.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL !== '0'
+}
+
+function desktopUpdateAutomaticDownloadSupported(): boolean {
+  return nativeAutoUpdateEnabled() || windowsInstallerActionsSupported()
 }
 
 function windowsUpdateDownloadDirectory(): string {
@@ -11279,8 +11298,13 @@ function desktopUpdateSnapshot(): DesktopUpdateState {
     canCheck: desktopUpdateManaged() || mockUpdateVersion() !== null,
     canNativeInstall: installMode === 'native',
     canInstall: installMode === 'native' || windowsInstallerActionsSupported(),
+    canAutoDownload: desktopUpdateAutomaticDownloadSupported(),
     installMode,
     releaseUrl: desktopUpdateReleaseUrl,
+    // The release page belongs to this exact candidate, never to the transport
+    // URL (which is the .exe on Windows) or a previously selected version.
+    releaseNotesUrl: desktopUpdateCandidate?.version === latestVersion
+      ? desktopUpdateCandidate.releaseUrl : null,
     source: desktopUpdateSource,
     fallbackUsed: desktopUpdateFallbackUsed,
   }
@@ -11408,10 +11432,12 @@ function showUpdateError(
   err: unknown,
   silentFallback: DesktopUpdateFailureFallback | null = null,
 ): void {
-  const shouldNotify = desktopUpdateCheckScheduler.consumeManualRequest() || updateDownloadInProgress
+  const wasDownload = desktopUpdateDownloadOrigin !== null
+  const shouldNotify = desktopUpdateCheckScheduler.consumeManualRequest()
+    || desktopUpdateDownloadOrigin === 'user'
   const errorCode = classifyDesktopUpdateError(err)
   updateDownloadInProgress = false
-  if (!shouldNotify) {
+  if (!shouldNotify && !wasDownload) {
     if (silentFallback && !['checking', 'downloading', 'applying'].includes(silentFallback.state.status)) {
       desktopUpdateCandidate = silentFallback.candidate
       setDesktopUpdateState({
@@ -11450,6 +11476,15 @@ async function runMockUpdateFlow(version: string): Promise<void> {
   if (mockUpdatePromptActive) return
   mockUpdatePromptActive = true
   try {
+    const parsed = parseOpenSquillaReleaseTag(version)
+    if (parsed) {
+      const tag = `v${parsed.base}${parsed.rc === null ? '' : `rc${parsed.rc}`}`
+      desktopUpdateCandidate = {
+        tag, version, baseVersion: parsed.base, prerelease: parsed.rc !== null,
+        releaseUrl: `https://github.com/${GITHUB_UPDATE_OWNER}/${GITHUB_UPDATE_REPO}/releases/tag/${tag}`,
+        feed: '', installer: '',
+      }
+    }
     if (downloadedUpdateVersion === version) {
       setDesktopUpdateState({
         status: 'downloaded',
@@ -11473,7 +11508,29 @@ async function runMockUpdateFlow(version: string): Promise<void> {
   }
 }
 
-async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
+function downloadDesktopUpdate(origin: 'automatic' | 'user' = 'user'): Promise<DesktopUpdateState> {
+  if (desktopUpdateDownloadTask) {
+    if (origin === 'user') desktopUpdateDownloadOrigin = 'user'
+    return desktopUpdateDownloadTask
+  }
+  if (origin === 'automatic' && (!desktopUpdateAutomaticDownloadSupported()
+    || desktopUpdateStatus !== 'available' || !desktopUpdateCandidate)) {
+    return Promise.resolve(desktopUpdateSnapshot())
+  }
+  desktopUpdateDownloadOrigin = origin
+  // Reserve the flight before any cache/signature/network await. A renderer
+  // retry joins background preparation instead of starting another download.
+  const task = Promise.resolve().then(() => runDesktopUpdateDownload(origin))
+    .finally(() => {
+      if (desktopUpdateDownloadTask !== task) return
+      desktopUpdateDownloadTask = null
+      desktopUpdateDownloadOrigin = null
+    })
+  desktopUpdateDownloadTask = task
+  return task
+}
+
+async function runDesktopUpdateDownload(origin: 'automatic' | 'user'): Promise<DesktopUpdateState> {
   try {
     await restoreWindowsUpdateCache(true)
   } catch (error) {
@@ -11489,7 +11546,7 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
     manualInstallerActionInProgress = true
     try {
       await revalidateReadyWindowsInstaller()
-      shell.showItemInFolder(verifiedManualInstallerPath)
+      if (origin === 'user') shell.showItemInFolder(verifiedManualInstallerPath)
     } catch (err) {
       const errorCode = classifyDesktopUpdateError(err)
       if (errorCode === 'integrity_failed' || errorCode === 'signature_invalid') {
@@ -11528,7 +11585,7 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
       error: null,
     })
     await new Promise<void>((resolve) => {
-      setTimeout(resolve, 100)
+      setTimeout(resolve, 600)
     })
     updateDownloadInProgress = false
     downloadedUpdateVersion = version
@@ -11555,8 +11612,9 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
     manualInstallerActionInProgress = true
     let finishTelemetry: ((outcome: 'success' | 'fail', errorCode: UpdateErrorCode | null) => void) | undefined
     try {
-      if (desktopUpdateStatus === 'checking') await checkForUpdates(true)
-      if (!desktopUpdateCandidate) await checkForUpdates(true)
+      if (origin === 'user' && (desktopUpdateStatus === 'checking' || !desktopUpdateCandidate)) {
+        await checkForUpdates(true)
+      }
       const candidate = desktopUpdateCandidate
       if (!candidate || !['available', 'error'].includes(desktopUpdateStatus)) return desktopUpdateSnapshot()
       const telemetryStartedAt = Date.now()
@@ -11680,6 +11738,7 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
   initAutoUpdater()
   let candidate = desktopUpdateCandidate
   if (!candidate || !nativeUpdateReadyFor(candidate)) {
+    if (origin === 'automatic') return desktopUpdateSnapshot()
     await checkForUpdates(true)
     candidate = desktopUpdateCandidate
   }
@@ -11695,6 +11754,9 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
   })
   try {
     await downloadNativeDesktopUpdateWithFallback()
+    if (desktopUpdateSnapshot().status !== 'downloaded' || downloadedUpdateVersion !== candidate.version) {
+      throw new UpdateChannelError('manifest_invalid', 'The selected update has not reached verified readiness.')
+    }
     desktopReliabilityTelemetry.recordUpdateResult({
       outcome: 'success',
       durationMs: Math.max(0, Date.now() - telemetryStartedAt),
@@ -11724,9 +11786,9 @@ function initAutoUpdater(): void {
   if (autoUpdaterReady || !autoUpdateSupported()) return
   autoUpdaterReady = true
 
-  // Consent-based: the bundled gateway + ML runtime make updates large, so we
-  // never download without asking. We also keep installation on the explicit
-  // restart path so applyDownloadedUpdate() can drain the owned gateway first.
+  // OpenSquilla owns download scheduling after its exact candidate/feed checks,
+  // including source fallback. Installation remains an explicit user action so
+  // applyDownloadedUpdate() can drain the owned gateway first.
   autoUpdater.autoDownload = false
   autoUpdater.autoInstallOnAppQuit = false
   // electron-updater generates a persistent per-install staging UUID even
@@ -11761,8 +11823,13 @@ function initAutoUpdater(): void {
   })
 
   autoUpdater.on('update-downloaded', (info) => {
-    updateDownloadInProgress = false
     const version = String(info?.version ?? '')
+    if (!desktopUpdateCandidate || version !== desktopUpdateCandidate.version
+      || !nativeUpdateReadyFor(desktopUpdateCandidate)) {
+      showUpdateError(new UpdateChannelError('manifest_invalid', 'Downloaded update does not match the selected release.'))
+      return
+    }
+    updateDownloadInProgress = false
     downloadedUpdateVersion = version
     mockDownloadedUpdate = false
     createApplicationMenu()
@@ -12333,6 +12400,17 @@ function desktopUpdateCheckAllowed(): boolean {
 }
 
 async function runDesktopUpdateCheck(): Promise<void> {
+  await checkDesktopUpdateCandidate()
+  if (desktopUpdateStatus === 'available' && desktopUpdateAutomaticDownloadSupported()) {
+    // Do not await here: an explicit Download may already be awaiting this
+    // check. Both routes join the same flight once the verified candidate exists.
+    void downloadDesktopUpdate('automatic').catch((error) => {
+      console.error('[updater] background preparation failed', error)
+    })
+  }
+}
+
+async function checkDesktopUpdateCandidate(): Promise<void> {
   try {
     await restoreWindowsUpdateCache(desktopUpdateCheckScheduler.manualRequestPending)
   } catch (error) {

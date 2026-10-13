@@ -403,7 +403,7 @@
 /* Gateway-confirmed answer text streams in its final visual position. */
 .live-answer {
   margin-top: 0;
-  padding-top: 1.5rem;
+  padding-top: 0.5rem;
   border-top: 0;
 }
 

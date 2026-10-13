@@ -409,6 +409,28 @@ class GatewaySessionMaintenancePorts(
         # SessionManager copies config for its owned operation. A callback
         # survives that copy while its runtime counters deliberately reset.
         runtime.config.on_summary_call_started = on_summary_call_started
+
+        # Runtime listeners append synchronously, bypassing the RPC lifecycle
+        # publisher. Capture the operation's epoch while its session lock is
+        # held so recovery events use the same replay fence as started/terminal.
+        recovery_identity = await prepare_session_event_payload(
+            self._context, command.session_key, self._EVENT_NAME, {},
+        )
+
+        def on_summary_recovery(activity: object) -> None:
+            from dataclasses import asdict
+
+            from opensquilla.gateway.terminal_activity import safe_compaction_recovery
+
+            recovery = safe_compaction_recovery(asdict(activity))
+            if recovery is not None:
+                notify_compaction(
+                    command.session_key, status="observed", source="manual",
+                    phase="summarizing", compaction_id=runtime.config.operation_id,
+                    recovery=recovery, **recovery_identity,
+                )
+
+        runtime.config.on_summary_recovery = on_summary_recovery
         try:
             outcome = await self._compact(command, plan)
         except SessionCompactionPhaseTimeoutError as exc:
@@ -570,6 +592,7 @@ class GatewaySessionMaintenancePorts(
                 state_kind=str(getattr(result, "summary_format", "text") or "text"),
                 skip_reason=str(getattr(result, "skip_reason", "") or ""),
                 failure_kind=str(getattr(result, "failure_kind", "") or ""),
+                failure_detail=getattr(result, "failure_detail", None),
                 quality_report=dict(getattr(result, "quality_report", None) or {}),
             )
 
@@ -613,6 +636,11 @@ class GatewaySessionMaintenancePorts(
         }
         if result.skip_reason:
             payload["skip_reason"] = result.skip_reason
+        from opensquilla.gateway.terminal_activity import safe_compaction_failure_detail
+
+        detail = safe_compaction_failure_detail(result.failure_detail)
+        if not result.applied and detail is not None:
+            payload["failure_detail"] = detail
         return payload
 
     async def prepare(self, event: SessionCompactionEvent) -> object:

@@ -140,13 +140,15 @@
     "desktop": {
       "installErrorTitle": "未能开始安装",
       "quitAndInstall": "退出并安装",
-      "signedDownloadedDesc": "OpenSquilla {version} 安装包已通过校验。点击“退出并安装”以关闭后台服务并打开安装程序。",
-      "manualApplyingStatus": "正在关闭后台服务",
-      "manualApplyingDesc": "OpenSquilla 正在关闭后台服务，完成后将打开安装程序。",
+      "signedDownloadedDesc": "OpenSquilla {version} 已就绪。更新将退出客户端，进行中的任务可能中断；请按随后打开的安装向导完成更新。",
+      "manualApplyingStatus": "正在准备安装",
+      "manualApplyingDesc": "准备完成后将退出客户端并打开安装向导。",
       "errorSignatureInvalid": "安装包签名无效，或发布者与 OpenSquilla 不符，已阻止安装。请重新下载更新。",
       "errorSignatureUnavailable": "暂时无法验证安装包签名，已阻止安装。请稍后重试。",
       "indicatorAvailable": "更新 {version}",
       "indicatorDownloaded": "更新已就绪",
+      "updateAvailableEntry": "有可用更新",
+      "viewReleaseNotes": "查看更新内容",
       "indicatorInstallerReady": "安装包已验证",
       "indicatorDownloading": "正在下载",
       "indicatorDownloadingProgress": "正在下载 {progress}%",
@@ -185,7 +187,7 @@
       "checkingStatus": "检查中",
       "upToDateStatus": "已是最新",
       "errorStatus": "需要处理",
-      "applyingStatus": "重启中",
+      "applyingStatus": "正在准备安装",
       "idleStatus": "空闲",
       "unavailableStatus": "不可用",
       "unsupported": "此平台暂不支持原生桌面更新。新版本发布时请使用发布链接更新。",
@@ -198,7 +200,9 @@
       "downloadInstaller": "下载安装程序",
       "showInstaller": "显示安装程序",
       "relaunch": "重新启动",
-      "later": "稍后"
+      "later": "稍后",
+      "reminderSnoozed": "已延后提醒",
+      "retry": "重试"
     }
   },
   "common": {
@@ -3758,9 +3762,7 @@
     "chatWithSuffix": "聊天 {suffix}",
     "copied": "已复制",
     "copy": "复制",
-    "copySessionKey": "复制会话 ID",
-    "copySessionAppLink": "复制应用链接",
-    "copySessionGatewayLink": "复制 Gateway 网页链接",
+    "copySessionLink": "复制会话链接",
     "sessionActions": "会话操作",
     "share": "分享",
     "shareSendFirst": "先发送一条消息才能分享",
@@ -3853,16 +3855,16 @@
     "copiedDiagnosticId": "诊断编号已复制",
     "copyDiagnosticFailed": "复制失败，请选中上方编号手动复制。",
     "errorMessage": {
-      "unknown": "任务未完成，请稍后再试",
+      "unknown": "本次请求未完成",
       "noProvider": "当前没有可用模型",
-      "credentials": "模型凭据无效",
-      "credits": "模型账户额度不足",
+      "credentials": "模型服务身份验证未通过",
+      "credits": "模型服务账户余额不足",
       "modelUnavailable": "当前模型不可用",
       "contextLimit": "输入内容超出模型限制",
       "unsupported": "当前模型不支持此请求",
       "imageUnsupported": "当前模型不支持图片",
       "ensembleImageUnsupported": "当前模式不支持图片",
-      "busy": "模型服务暂时繁忙，请稍后再试",
+      "busy": "模型服务繁忙，本次未完成",
       "unavailable": "模型服务暂时不可用，请稍后再试",
       "refused": "模型无法处理此请求",
       "responseIncomplete": "模型响应未完成，请稍后再试",
@@ -3875,7 +3877,11 @@
       "timeout": "任务超时，未能完成",
       "stopped": "任务已停止",
       "interrupted": "任务已中断",
-      "approvalRequired": "等待你的授权"
+      "approvalRequired": "等待你的授权",
+      "rateLimited": "模型暂时限流，本次未完成",
+      "usageLimit": "已达到模型服务使用上限",
+      "rateLimitWaitEnded": "模型暂时限流，本次无法继续等待",
+      "busyWaitEnded": "模型服务繁忙，本次无法继续等待"
     },
     "errorAction": {
       "openModelSettings": "打开模型设置",
@@ -3993,6 +3999,12 @@
     "activityElapsed": "用时 {duration}",
     "activityDurationMinutes": "{minutes} 分 {seconds} 秒",
     "activity": {
+      "fileDraft": {
+        "generating": "正在生成文件",
+        "ready": "准备写入文件",
+        "note": "生成中草稿 · 尚未写入文件",
+        "truncated": "草稿最新片段 · 尚未写入文件"
+      },
       "lifecycle": {
         "working": "正在工作",
         "answering": "正在组织回答",
@@ -4006,11 +4018,25 @@
         "waiting": "等待模型",
         "responded": "模型响应",
         "reasoning": "思考",
-        "rateLimited": "受到限流 · {seconds} 秒后重试",
-        "retryWait": "{seconds} 秒后重试",
+        "rateLimited": "模型暂时限流，约 {seconds} 秒后重试",
+        "retryWait": "约 {seconds} 秒后重试",
         "retrying": "正在重试 {attempt}/{limit}",
         "retryingWithoutLimit": "正在重试 · 第 {attempt} 次",
-        "fallback": "正在切换备用模型"
+        "fallback": "正在尝试备用模型",
+        "rateLimitedWaiting": "模型暂时限流，等待重试",
+        "overloaded": "模型服务繁忙，约 {seconds} 秒后重试",
+        "overloadedWaiting": "模型服务繁忙，等待重试",
+        "retryWaiting": "等待重试",
+        "rateLimitedPast": "曾等待模型限流恢复",
+        "overloadedPast": "曾等待模型服务恢复",
+        "retryWaitPast": "曾等待重试",
+        "retryingPast": "已尝试重新请求模型",
+        "fallbackPast": "曾尝试备用模型",
+        "fallbackModels": "正在尝试备用模型 · {from} → {to}",
+        "fallbackModelsPast": "曾尝试备用模型 · {from} → {to}",
+        "fallbackModel": "正在尝试备用模型 · {model}",
+        "fallbackModelPast": "曾尝试备用模型 · {model}",
+        "retryingGeneric": "正在重试"
       },
       "purpose": {
         "discover": "发现链接",
@@ -4595,7 +4621,8 @@
       "sessionModelBusy": "当前回复完成后可切换模型。",
       "router": "智能模型路由",
       "ensemble": "多模型融合"
-    }
+    },
+    "httpStatus": "（HTTP {status}）"
   },
   "shared": {
     "loading": "加载中",

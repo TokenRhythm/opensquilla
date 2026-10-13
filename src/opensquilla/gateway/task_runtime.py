@@ -60,6 +60,7 @@ from opensquilla.gateway.terminal_activity import (
     terminal_activity_snapshot,
     usage_barrier_replay_proof,
 )
+from opensquilla.provider.failures import safe_http_status
 from opensquilla.safety.injection_guard import xml_escape
 from opensquilla.session.goals import (
     GOAL_OBJECTIVE_UPDATE_DETAIL_KEY,
@@ -5014,6 +5015,7 @@ class TaskRuntime:
                 return
             terminal_reason = str(getattr(exc, "terminal_reason", None) or "error")
             failure_kind = str(getattr(exc, "failure_kind", None) or "") or None
+            http_status = safe_http_status(getattr(exc, "http_status", None))
             status = (
                 AgentTaskStatus.TIMEOUT if terminal_reason == "timeout" else AgentTaskStatus.FAILED
             )
@@ -5025,6 +5027,7 @@ class TaskRuntime:
                 error_class=str(getattr(exc, "code", None) or type(exc).__name__),
                 error_message=str(exc),
                 failure_kind=failure_kind,
+                http_status=http_status,
                 error_id=safe_error_id(getattr(exc, "error_id", None)),
                 retry_after_ms=safe_retry_after_ms(getattr(exc, "retry_after_ms", None)),
                 activity_snapshot=getattr(exc, "activity_snapshot", None),
@@ -6930,6 +6933,7 @@ class TaskRuntime:
         error_class: str | None = None,
         error_message: str | None = None,
         failure_kind: str | None = None,
+        http_status: int | None = None,
         error_id: str | None = None,
         retry_after_ms: int | None = None,
         activity_snapshot: object = None,
@@ -6957,6 +6961,7 @@ class TaskRuntime:
                         error_class=error_class,
                         error_message=error_message,
                         failure_kind=failure_kind,
+                        http_status=http_status,
                         error_id=error_id,
                         retry_after_ms=retry_after_ms,
                         activity_snapshot=activity_snapshot,
@@ -7030,6 +7035,7 @@ class TaskRuntime:
         error_class: str | None = None,
         error_message: str | None = None,
         failure_kind: str | None = None,
+        http_status: int | None = None,
         error_id: str | None = None,
         retry_after_ms: int | None = None,
         activity_snapshot: object = None,
@@ -7160,6 +7166,7 @@ class TaskRuntime:
                     error_class=error_class,
                     error_message=error_message,
                     failure_kind=failure_kind,
+                    http_status=http_status,
                     error_id=error_id,
                     retry_after_ms=retry_after_ms,
                     activity_snapshot=activity_snapshot,
@@ -7246,9 +7253,12 @@ class TaskRuntime:
                         code=terminal_reason if terminal_reason != "error" else error_class,
                         error_class=error_class,
                         failure_kind=failure_kind,
+                        http_status=http_status,
                     ).to_dict()
                     if safe_error_id(error_id):
                         turn_outcome["error_id"] = error_id
+                if safe_http_status(http_status) is not None:
+                    payload["http_status"] = http_status
                 payload["code"] = error_class or terminal_reason
                 payload["turn_outcome"] = {
                     **turn_outcome,
@@ -7284,6 +7294,7 @@ class TaskRuntime:
                         message=error_message,
                         error_class=error_class,
                         failure_kind=failure_kind,
+                        http_status=http_status,
                     ).to_dict()
                     if retry_after_ms is not None:
                         turn_outcome["retry_after_ms"] = retry_after_ms
@@ -7328,6 +7339,7 @@ class TaskRuntime:
                         error_class=error_class,
                         error_message=error_message,
                         failure_kind=failure_kind,
+                        http_status=http_status,
                         error_id=error_id,
                         retry_after_ms=retry_after_ms,
                         activity_snapshot=activity_snapshot,
@@ -7791,6 +7803,7 @@ class TaskRuntime:
         error_class: str | None,
         error_message: str | None,
         failure_kind: str | None,
+        http_status: int | None = None,
         retry_after_ms: int | None,
         activity_snapshot: object,
         terminal_at: int,
@@ -7931,6 +7944,7 @@ class TaskRuntime:
                 message=error_message,
                 error_class=error_class,
                 failure_kind=failure_kind,
+                http_status=http_status,
             ).to_dict()
             if safe_error_id(error_id):
                 turn_outcome["error_id"] = error_id
@@ -8011,6 +8025,7 @@ class TaskRuntime:
         error_class: str | None,
         error_message: str | None,
         failure_kind: str | None,
+        http_status: int | None = None,
         retry_after_ms: int | None,
         activity_snapshot: object,
         usage_call_index: int | None,
@@ -8036,6 +8051,7 @@ class TaskRuntime:
                     error_class=error_class,
                     error_message=error_message,
                     failure_kind=failure_kind,
+                    http_status=http_status,
                     error_id=error_id,
                     retry_after_ms=retry_after_ms,
                     activity_snapshot=preserved_activity_snapshot,

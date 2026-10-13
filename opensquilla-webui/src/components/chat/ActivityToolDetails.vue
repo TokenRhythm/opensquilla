@@ -70,6 +70,7 @@
           v-for="section in visibleSections"
           :key="section.kind"
           class="activity-tool-details__section"
+          :class="{ 'activity-tool-details__section--error': section.kind === 'error' }"
         >
           <div class="activity-tool-details__section-label">{{ section.label }}</div>
           <pre class="activity-tool-details__preview">{{ section.content }}</pre>
@@ -525,6 +526,8 @@ const detailActionLabel = computed(() => {
 .activity-tool-details__section + .activity-tool-details__section { margin-top: 0.75rem; }
 .activity-tool-details__section-label { margin-bottom: 0.25rem; color: var(--text-dim); font-size: 0.6875rem; font-weight: 600; }
 .activity-tool-details__preview { margin: 0; padding: 0; border: 0; background: transparent; color: var(--text-muted); font: inherit; font-family: var(--font-mono); font-variant-ligatures: none; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; }
+.activity-tool-details__section--error .activity-tool-details__section-label,
+.activity-tool-details__section--error .activity-tool-details__preview { color: var(--warn); }
 .activity-tool-details__copy { position: absolute; top: 0.25rem; right: 0.375rem; z-index: 1; display: inline-flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-muted); cursor: pointer; }
 .activity-tool-details__copy:hover { background: var(--bg-hover); color: var(--text); }
 .activity-tool-details__copy:focus-visible { outline: none; box-shadow: var(--focus-ring); }
@@ -536,7 +539,7 @@ const detailActionLabel = computed(() => {
 .activity-tool-details__line--target,
 .activity-tool-details__line--code { flex: 1 1 auto; color: var(--text-muted); }
 .activity-tool-details__line--code { font-family: var(--font-mono); font-variant-ligatures: none; }
-.activity-tool-details__line--error { flex: 1 1 auto; overflow: visible; overflow-wrap: anywhere; white-space: normal; color: var(--text-muted); }
+.activity-tool-details__line--error { flex: 1 1 auto; overflow: visible; overflow-wrap: anywhere; white-space: normal; color: var(--warn); }
 .activity-tool-details__separator { flex: 0 0 auto; color: var(--text-dim); }
 @media (pointer: coarse) { .activity-tool-details__copy { width: 2.75rem; height: 2.75rem; } }
 </style>

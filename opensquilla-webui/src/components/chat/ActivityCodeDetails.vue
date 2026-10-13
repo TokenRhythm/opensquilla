@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import DOMPurify from 'dompurify'
 import hljs from 'highlight.js/lib/common'
 import Icon from '@/components/Icon.vue'
 import { boundedTextPreviews } from '@/utils/chat/toolContentPreview'
+import { boundedToolInputPreviewContent } from '@/utils/chat/toolInputPreview'
 import {
   hasActivityToolCodeContent,
   isOmittedActivityPayload,
@@ -18,11 +19,18 @@ const props = withDefaults(defineProps<{
   truncated?: boolean
   downloadError?: boolean
   full?: boolean
+  /** Live input preview, not a saved file or downloadable tool result. */
+  draft?: boolean
 }>(), { copyState: 'idle', canOpenCodeView: false, full: false })
 const emit = defineEmits<{ copy: []; download: []; openCodeView: []; reachEnd: [] }>()
 const viewport = ref<HTMLElement | null>(null)
+const followingDraft = ref(true)
 function checkScrollEnd() {
   const element = viewport.value
+  if (props.draft && element) {
+    followingDraft.value = element.scrollHeight - element.scrollTop - element.clientHeight <= 4
+    return
+  }
   if (!props.full && !isTruncated.value && element && element.clientHeight > 0
     && element.scrollTop + element.clientHeight >= element.scrollHeight - 96) emit('reachEnd')
 }
@@ -39,9 +47,15 @@ const boundedParts = computed(() => {
   const command = props.view.kind === 'command' && !isOmittedActivityPayload(props.view.command) ? props.view.command || '' : ''
   return boundedTextPreviews([command, isOmittedActivityPayload(value) ? '' : value || ''])
 })
-const source = computed(() => boundedParts.value.previews[1]?.content || '')
+const source = computed(() => props.draft ? boundedToolInputPreviewContent(props.view.content || '').content : boundedParts.value.previews[1]?.content || '')
 const command = computed(() => boundedParts.value.previews[0]?.content || '')
-const isTruncated = computed(() => props.truncated || props.view.truncated || boundedParts.value.truncated)
+const isTruncated = computed(() => props.truncated || props.view.truncated || (!props.draft && boundedParts.value.truncated))
+watch(source, () => {
+  if (!props.draft || !followingDraft.value) return
+  void nextTick(() => {
+    if (viewport.value && followingDraft.value) viewport.value.scrollTop = viewport.value.scrollHeight
+  })
+}, { immediate: true, flush: 'post' })
 const actionLabel = computed(() => isTruncated.value
   ? t(props.downloadError ? 'shared.runTrace.downloadContentFailed' : props.view.partial ? 'chat.download' : 'shared.runTrace.downloadFullContent') : copyLabel.value)
 const exitCode = computed(() => props.view.exitCode !== undefined && !/^\s*exit[_ ]code\s*[:=]/im.test(source.value)
@@ -56,7 +70,7 @@ const highlightedContent = computed(() => {
   const language = props.view.language
   const escaped = () => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   // Bound the source before highlighting or splitting it into DOM nodes.
-  if (isTruncated.value || text.length > 100_000 || !language || !hljs.getLanguage(language)) return escaped()
+  if (props.draft || isTruncated.value || text.length > 100_000 || !language || !hljs.getLanguage(language)) return escaped()
   try {
     return DOMPurify.sanitize(hljs.highlight(text, { language, ignoreIllegals: true }).value, {
       ALLOWED_TAGS: ['span'], ALLOWED_ATTR: ['class'],
@@ -72,11 +86,11 @@ const diffLines = computed(() => source.value.split('\n').map(text => ({
 </script>
 
 <template>
-  <section v-if="hasContent" class="activity-code-details" :class="{ 'activity-code-details--full': full }"
+  <section v-if="hasContent" class="activity-code-details" :class="{ 'activity-code-details--full': full, 'activity-code-details--error': view.error }"
     :data-kind="view.kind" data-testid="activity-code-details">
     <header v-if="!full" class="activity-code-details__header">
       <span class="activity-code-details__title" :title="view.path">{{ title }}</span>
-      <div class="activity-code-details__actions">
+      <div v-if="!draft" class="activity-code-details__actions">
         <button v-if="canOpenCodeView && view.kind !== 'command' && !view.error" type="button"
           class="activity-code-details__action activity-code-details__open" data-share-control data-testid="activity-code-open"
           :aria-label="openLabel" :title="openLabel" @click.stop="emit('openCodeView')">
@@ -105,7 +119,7 @@ const diffLines = computed(() => source.value.split('\n').map(text => ({
       <pre v-else-if="source" class="activity-code-details__source"><code v-html="highlightedContent"></code></pre>
       <p v-else-if="!view.error && (view.kind === 'read' || view.kind === 'write')" class="activity-code-details__note">{{ t('shared.runTrace.codeEmptyFile') }}</p>
     </div>
-    <p v-if="isTruncated || (view.partial && source)" class="activity-code-details__note activity-code-details__preview-note"
+    <p v-if="!draft && (isTruncated || (view.partial && source))" class="activity-code-details__note activity-code-details__preview-note"
       :data-testid="isTruncated ? 'tool-content-truncated' : undefined">{{ t(view.partial ? 'shared.runTrace.codePartial' : 'shared.runTrace.previewTruncated') }}</p>
   </section>
 </template>
@@ -142,6 +156,8 @@ const diffLines = computed(() => source.value.split('\n').map(text => ({
 .activity-code-details__command + .activity-code-details__output,
 .activity-code-details pre + .activity-code-details__exit { margin-top: 0.625rem; }
 .activity-code-details__prompt { color: var(--text-dim); user-select: none; }
+.activity-code-details--error .activity-code-details__output,
+.activity-code-details--error .activity-code-details__exit { color: var(--warn); }
 .activity-code-details__diff-line--added { background: color-mix(in srgb, var(--ok) 8%, transparent); color: var(--text); }
 .activity-code-details__diff-line--removed { background: color-mix(in srgb, var(--danger) 8%, transparent); color: var(--text); }
 .activity-code-details__diff-line--meta { color: var(--text-muted); }

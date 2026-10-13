@@ -140,13 +140,15 @@
     "desktop": {
       "installErrorTitle": "Installation konnte nicht gestartet werden",
       "quitAndInstall": "Beenden und installieren",
-      "signedDownloadedDesc": "OpenSquilla {version} wurde überprüft und ist bereit. „Beenden und installieren“ beendet die Hintergrunddienste und öffnet das Installationsprogramm.",
-      "manualApplyingStatus": "Hintergrunddienste werden beendet",
-      "manualApplyingDesc": "OpenSquilla beendet seine Hintergrunddienste. Danach wird das Installationsprogramm geöffnet.",
+      "signedDownloadedDesc": "OpenSquilla {version} ist bereit. Das Update beendet die App und kann laufende Aufgaben unterbrechen. Schließen Sie das Update im anschließend geöffneten Installationsassistenten ab.",
+      "manualApplyingStatus": "Installation wird vorbereitet",
+      "manualApplyingDesc": "Nach der Vorbereitung wird OpenSquilla beendet und der Installationsassistent geöffnet.",
       "errorSignatureInvalid": "Die Signatur des Installationsprogramms ist ungültig oder der Herausgeber stimmt nicht mit OpenSquilla überein. Die Installation wurde blockiert. Laden Sie das Update erneut herunter.",
       "errorSignatureUnavailable": "OpenSquilla konnte die Signatur des Installationsprogramms nicht überprüfen. Die Installation wurde blockiert. Versuchen Sie es später erneut.",
       "indicatorAvailable": "Update {version}",
       "indicatorDownloaded": "Update bereit",
+      "updateAvailableEntry": "Update verfügbar",
+      "viewReleaseNotes": "Neuerungen ansehen",
       "indicatorInstallerReady": "Installer geprüft",
       "indicatorDownloading": "Wird heruntergeladen",
       "indicatorDownloadingProgress": "Wird heruntergeladen {progress}%",
@@ -185,7 +187,7 @@
       "checkingStatus": "Prüfung",
       "upToDateStatus": "Aktuell",
       "errorStatus": "Benötigt Aufmerksamkeit",
-      "applyingStatus": "Neustart",
+      "applyingStatus": "Installation wird vorbereitet",
       "idleStatus": "Bereit",
       "unavailableStatus": "Nicht verfügbar",
       "unsupported": "Native Desktop-Updates sind auf dieser Plattform nicht verfügbar. Verwende den Release-Link, wenn eine neue Version angekündigt wird.",
@@ -198,7 +200,9 @@
       "downloadInstaller": "Installationsprogramm laden",
       "showInstaller": "Installationsprogramm anzeigen",
       "relaunch": "Neu starten",
-      "later": "Später"
+      "later": "Später",
+      "reminderSnoozed": "Erinnerung verschoben",
+      "retry": "Erneut versuchen"
     }
   },
   "common": {
@@ -3674,9 +3678,7 @@
     "chatWithSuffix": "Chat {suffix}",
     "copied": "Kopiert",
     "copy": "Kopieren",
-    "copySessionKey": "Sitzungs-ID kopieren",
-    "copySessionAppLink": "Anwendungslink kopieren",
-    "copySessionGatewayLink": "Gateway-Weblink kopieren",
+    "copySessionLink": "Sitzungslink kopieren",
     "sessionActions": "Sitzungsaktionen",
     "share": "Teilen",
     "shareSendFirst": "Senden Sie zuerst eine Nachricht, um zu teilen",
@@ -3769,16 +3771,16 @@
     "copiedDiagnosticId": "Diagnose-ID kopiert",
     "copyDiagnosticFailed": "Kopieren fehlgeschlagen. Markieren und kopieren Sie die ID oben manuell.",
     "errorMessage": {
-      "unknown": "Die Aufgabe wurde nicht abgeschlossen. Versuchen Sie es später erneut.",
+      "unknown": "Diese Anfrage wurde nicht abgeschlossen.",
       "noProvider": "Kein Modell ist verfügbar.",
-      "credentials": "Die Zugangsdaten für das Modell sind ungültig.",
-      "credits": "Das Modellkonto hat nicht genügend Guthaben.",
+      "credentials": "Authentifizierung beim Modelldienst fehlgeschlagen.",
+      "credits": "Das Guthaben des Modelldienstkontos reicht nicht aus.",
       "modelUnavailable": "Das gewählte Modell ist nicht verfügbar.",
       "contextLimit": "Die Eingabe überschreitet das Modelllimit.",
       "unsupported": "Dieses Modell unterstützt die Anfrage nicht.",
       "imageUnsupported": "Dieses Modell unterstützt keine Bilder.",
       "ensembleImageUnsupported": "Dieser Modus unterstützt keine Bilder.",
-      "busy": "Der Modelldienst ist ausgelastet. Versuchen Sie es später erneut.",
+      "busy": "Der Modelldienst ist ausgelastet; diese Anfrage wurde nicht abgeschlossen.",
       "unavailable": "Der Modelldienst ist nicht verfügbar. Versuchen Sie es später erneut.",
       "refused": "Das Modell kann diese Anfrage nicht bearbeiten.",
       "responseIncomplete": "Die Modellantwort wurde nicht abgeschlossen. Versuchen Sie es später erneut.",
@@ -3791,7 +3793,11 @@
       "timeout": "Die Aufgabe konnte nicht rechtzeitig abgeschlossen werden.",
       "stopped": "Die Aufgabe wurde gestoppt.",
       "interrupted": "Die Aufgabe wurde unterbrochen.",
-      "approvalRequired": "Warten auf Ihre Genehmigung."
+      "approvalRequired": "Warten auf Ihre Genehmigung.",
+      "rateLimited": "Das Modell ist vorübergehend begrenzt; diese Anfrage wurde nicht abgeschlossen.",
+      "usageLimit": "Das Nutzungslimit des Modelldienstes wurde erreicht.",
+      "rateLimitWaitEnded": "Das Modell ist vorübergehend begrenzt; diese Anfrage kann nicht weiter warten.",
+      "busyWaitEnded": "Der Modelldienst ist ausgelastet; diese Anfrage kann nicht weiter warten."
     },
     "errorAction": {
       "openModelSettings": "Modelleinstellungen öffnen",
@@ -3909,6 +3915,12 @@
     "activityElapsed": "Zeitaufwand {duration}",
     "activityDurationMinutes": "{minutes} Min. {seconds} Sek.",
     "activity": {
+      "fileDraft": {
+        "generating": "Datei wird erstellt",
+        "ready": "Schreiben wird vorbereitet",
+        "note": "Live-Entwurf · Datei noch nicht geschrieben",
+        "truncated": "Neuester Entwurfsausschnitt · Datei noch nicht geschrieben"
+      },
       "lifecycle": {
         "working": "In Arbeit",
         "answering": "Antwort wird verfasst",
@@ -3922,11 +3934,25 @@
         "waiting": "Warten auf das Modell",
         "responded": "Modellantwort",
         "reasoning": "Nachdenken",
-        "rateLimited": "Ratenlimit · neuer Versuch in {seconds}s",
-        "retryWait": "Neuer Versuch in {seconds}s",
+        "rateLimited": "Modell vorübergehend begrenzt, neuer Versuch in etwa {seconds} s",
+        "retryWait": "Neuer Versuch in etwa {seconds} s",
         "retrying": "Neuer Versuch {attempt}/{limit}",
         "retryingWithoutLimit": "Neuer Versuch · Versuch {attempt}",
-        "fallback": "Wechsel zum Ersatzmodell"
+        "fallback": "Ersatzmodell wird versucht",
+        "rateLimitedWaiting": "Modell vorübergehend begrenzt, warte auf neuen Versuch",
+        "overloaded": "Modelldienst ausgelastet, neuer Versuch in etwa {seconds} s",
+        "overloadedWaiting": "Modelldienst ausgelastet, warte auf neuen Versuch",
+        "retryWaiting": "Warte auf neuen Versuch",
+        "rateLimitedPast": "Auf das Ratenlimit des Modells gewartet",
+        "overloadedPast": "Auf den Modelldienst gewartet",
+        "retryWaitPast": "Auf neuen Versuch gewartet",
+        "retryingPast": "Modellanfrage erneut versucht",
+        "fallbackPast": "Ersatzmodell versucht",
+        "fallbackModels": "Ersatzmodell wird versucht · {from} → {to}",
+        "fallbackModelsPast": "Ersatzmodell versucht · {from} → {to}",
+        "fallbackModel": "Ersatzmodell wird versucht · {model}",
+        "fallbackModelPast": "Ersatzmodell versucht · {model}",
+        "retryingGeneric": "Erneuter Versuch"
       },
       "purpose": {
         "discover": "Links gefunden",
@@ -4511,7 +4537,8 @@
       "sessionModelBusy": "Das Modell kann nach Abschluss der aktuellen Antwort geändert werden.",
       "router": "Intelligentes Modellrouting",
       "ensemble": "Modell-Ensemble"
-    }
+    },
+    "httpStatus": "(HTTP {status})"
   },
   "shared": {
     "loading": "Wird geladen",

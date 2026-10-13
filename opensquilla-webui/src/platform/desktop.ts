@@ -395,6 +395,7 @@ function idleUpdateState(canNativeInstall: boolean, managed = canNativeInstall):
     canCheck: managed,
     canNativeInstall,
     canInstall: canNativeInstall,
+    canAutoDownload: false,
     installMode: canNativeInstall ? 'native' : managed ? 'manual' : 'unsupported',
     releaseUrl: null,
     source: null,
@@ -440,8 +441,10 @@ function normalizeUpdateState(
     canInstall: normalizedInstallMode !== 'unsupported' && (
       typeof raw.canInstall === 'boolean' ? raw.canInstall : normalizedInstallMode === 'native'
     ),
+    canAutoDownload: raw.canAutoDownload === true,
     installMode: normalizedInstallMode,
     releaseUrl: typeof raw.releaseUrl === 'string' && raw.releaseUrl ? raw.releaseUrl : null,
+    releaseNotesUrl: typeof raw.releaseNotesUrl === 'string' && raw.releaseNotesUrl ? raw.releaseNotesUrl : null,
     source: UPDATE_SOURCES.has(source as DesktopUpdateSource) ? source as DesktopUpdateSource : null,
     fallbackUsed: raw.fallbackUsed === true,
   }

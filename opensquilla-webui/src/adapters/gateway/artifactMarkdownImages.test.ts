@@ -151,6 +151,99 @@ describe('bounded Markdown image resources', () => {
     expect(state.controller.markdownImages!.value.size).toBe(0)
   })
 
+  it('resumes only interrupted images across repeated Source visits and ignores late cancelled responses', async () => {
+    const attempts: { signal?: AbortSignal; finish: (response: TestHttpBinaryResponse) => void }[] = []
+    const state = mount('<p>Keep this document</p>' + image('/api/v1/artifacts/first') + image('/api/v1/artifacts/slow'), async (url, signal) => {
+      if (url.endsWith('/first')) return httpBinaryResponse('first', { contentType: 'image/png' })
+      return new Promise(resolve => attempts.push({ signal, finish: resolve }))
+    })
+    try {
+      const initial = state.controller.load()
+      await vi.waitFor(() => expect(attempts).toHaveLength(1))
+      const html = state.controller.markdownHtml.value
+      const firstImage = state.controller.markdownImages!.value.get('/api/v1/artifacts/first')
+      for (let index = 0; index < 2; index += 1) {
+        state.controller.suspend()
+        expect(attempts[index]!.signal?.aborted).toBe(true)
+        await state.controller.resume()
+        await vi.waitFor(() => expect(attempts).toHaveLength(index + 2))
+        expect(state.controller.state.value).toBe('ready')
+        expect(state.controller.markdownHtml.value).toBe(html)
+        expect(state.controller.markdownImages!.value.get('/api/v1/artifacts/first')).toBe(firstImage)
+        attempts[index]!.finish(httpBinaryResponse('cancelled image', { contentType: 'image/png' }))
+      }
+      attempts[2]!.finish(httpBinaryResponse('current image', { contentType: 'image/png' }))
+      await initial
+      await vi.waitFor(() => expect(state.controller.markdownImages!.value.size).toBe(2))
+      expect(state.requestBinary.mock.calls.filter(([url]) => url.endsWith('/notes'))).toHaveLength(1)
+      expect(state.requestBinary.mock.calls.filter(([url]) => url.endsWith('/first'))).toHaveLength(1)
+      expect(state.createObjectUrl).toHaveBeenCalledTimes(2)
+      expect(state.revokeObjectUrl).not.toHaveBeenCalled()
+    } finally { state.controller.dispose() }
+    expect(state.revokeObjectUrl).toHaveBeenCalledTimes(2)
+  })
+
+  it('retains the shared byte budget when pending images resume', async () => {
+    let interrupted = false
+    const body = new Uint8Array(MARKDOWN_IMAGE_BYTE_LIMIT)
+    const state = mount(Array.from({ length: 6 }, (_, index) => image(`/api/v1/artifacts/image-${index}`)).join(''), async (url, signal) => {
+      if (url.endsWith('image-3') && !interrupted) {
+        interrupted = true
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+        })
+      }
+      return httpBinaryResponse(body, { contentType: 'image/png' })
+    })
+    try {
+      const initial = state.controller.load()
+      await vi.waitFor(() => expect(interrupted).toBe(true))
+      state.controller.suspend()
+      await initial
+      await state.controller.resume()
+      await vi.waitFor(() => expect(state.createObjectUrl).toHaveBeenCalledTimes(4))
+      expect(state.controller.markdownImages!.value.size).toBe(4)
+      expect(state.requestBinary.mock.calls.some(([url]) => /image-[45]$/.test(url))).toBe(false)
+    } finally { state.controller.dispose() }
+  })
+
+  it('does not advance the resumed cursor when a cancelled invalid-image cleanup finishes late', async () => {
+    let cleanupStarted = false
+    let finishCleanup!: () => void
+    let finishCurrent!: (response: TestHttpBinaryResponse) => void
+    let firstAttempts = 0
+    const state = mount(['one', 'two', 'three'].map(name => image(`/api/v1/artifacts/${name}`)).join(''), async url => {
+      if (url.endsWith('/one')) {
+        firstAttempts += 1
+        if (firstAttempts === 1) return {
+          metadata: { status: 200, contentType: 'text/html' },
+          blob: vi.fn(),
+          stream: () => new ReadableStream({ cancel() {
+            cleanupStarted = true
+            return new Promise<void>(resolve => { finishCleanup = resolve })
+          } }),
+        }
+        return new Promise(resolve => { finishCurrent = resolve })
+      }
+      return httpBinaryResponse('image', { contentType: 'image/png' })
+    })
+    try {
+      const initial = state.controller.load()
+      await vi.waitFor(() => expect(cleanupStarted).toBe(true))
+      state.controller.suspend()
+      await state.controller.resume()
+      await vi.waitFor(() => expect(firstAttempts).toBe(2))
+      finishCleanup()
+      await initial
+      finishCurrent(httpBinaryResponse('one', { contentType: 'image/png' }))
+      await vi.waitFor(() => expect(state.controller.markdownImages!.value.size).toBe(3))
+      expect(state.requestBinary.mock.calls.map(([url]) => url)).toEqual([
+        '/api/v1/artifacts/notes', '/api/v1/artifacts/one', '/api/v1/artifacts/one',
+        '/api/v1/artifacts/two', '/api/v1/artifacts/three',
+      ])
+    } finally { state.controller.dispose() }
+  })
+
   it('does not overwrite a newer document when a previous image resolves late', async () => {
     let finish!: (value: TestHttpBinaryResponse) => void
     let started!: () => void

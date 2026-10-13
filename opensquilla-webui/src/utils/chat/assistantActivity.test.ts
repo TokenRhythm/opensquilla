@@ -1442,10 +1442,12 @@ describe('projectAssistantActivityTimeline', () => {
     const rateLimited = statusStep({
       at: 10_000,
       label: { code: 'chat.activity.provider.rateLimited', params: { seconds: 8 } },
+      isCurrent: true, providerRecovery: { phase: 'retry_wait', reason: 'rate_limited', startedAt: 10_000, retryAfterMs: 8_000 },
     })
     const retryWait = statusStep({
       at: 10_000,
       label: { code: 'chat.activity.provider.retryWait', params: { seconds: 12 } },
+      isCurrent: true, providerRecovery: { phase: 'retry_wait', reason: 'transport_transient', startedAt: 10_000, retryAfterMs: 12_000 },
     })
     const reasoning = statusStep({
       at: 10_000,
@@ -1454,7 +1456,7 @@ describe('projectAssistantActivityTimeline', () => {
 
     expect(providerActivityRemainingSeconds(rateLimited, 10_999)).toBe(8)
     expect(providerActivityRemainingSeconds(rateLimited, 13_000)).toBe(5)
-    expect(providerActivityRemainingSeconds(rateLimited, 30_000)).toBe(0)
+    expect(providerActivityRemainingSeconds(rateLimited, 30_000)).toBeNull()
     expect(providerActivityRemainingSeconds(retryWait, 15_000)).toBe(7)
     expect(providerActivityRemainingSeconds(reasoning, 15_000)).toBeNull()
   })

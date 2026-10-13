@@ -489,12 +489,14 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         backgroundOnly: live.activity === 'background' && !taskOrInterruptLive,
       }
     } catch (err: unknown) {
-      console.warn('Session stream subscription failed:', err instanceof Error ? err.message : err)
       const cancelled = (
         !isCurrentSubscription(lease, key, sequence)
         || signal.aborted
         || isRpcAbort(err)
       )
+      // Replacing a socket/lease intentionally aborts its pending read. Keep
+      // genuine current failures observable without reporting cancellation as one.
+      if (!cancelled) console.warn('Session stream subscription failed:', err instanceof Error ? err.message : err)
       const sessionMissing = !cancelled
         && err instanceof SessionReadSessionMissingError
       if (sessionMissing) options.onSessionMissing?.(key)

@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { createApp, h, nextTick, ref, type Ref } from 'vue'
+import { createApp, h, nextTick, reactive, ref, type Ref } from 'vue'
 import { createI18n } from 'vue-i18n'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -15,10 +15,13 @@ const i18n = createI18n({
   messages: {
     en: {
       chat: {
+        thinking: 'Thinking',
         thinkingForSeconds: 'Thinking · {seconds}s',
         thoughtProcess: 'Thinking',
         thoughtForSeconds: 'Thought for {seconds}s',
         thoughtForMinutes: 'Thought for {minutes}m {seconds}s',
+        activityDurationSeconds: '{seconds}s',
+        activityDurationMinutes: '{minutes}m {seconds}s',
       },
     },
   },
@@ -44,6 +47,8 @@ function block(
 function mount(blocks: Ref<ReasoningBlock[]>, collapseActive: Ref<boolean> = ref(false), options: {
   sessionKey?: string
   executing?: boolean
+  nested?: boolean
+  timelinePhase?: boolean
 } = {}) {
   const host = document.createElement('div')
   document.body.appendChild(host)
@@ -70,6 +75,37 @@ afterEach(() => {
 })
 
 describe('ReasoningTimeline disclosure ownership', () => {
+  it('runs the seconds clock only for a live standalone summary and keeps completed duration accurate', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(10_000)
+    const startClock = vi.spyOn(globalThis, 'setInterval')
+    const stopClock = vi.spyOn(globalThis, 'clearInterval')
+    const blocks = ref([block('r1', 0, 'trace')])
+    const options = reactive({ nested: true, timelinePhase: true })
+    const host = mount(blocks, ref(false), options)
+    expect(startClock).not.toHaveBeenCalled()
+    expect(host.querySelector('.thinking-fold__label')?.textContent).toBe('Thinking')
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(startClock).not.toHaveBeenCalled()
+    options.nested = false
+    await nextTick()
+    expect(startClock).not.toHaveBeenCalled()
+    options.timelinePhase = false
+    await nextTick()
+    expect(startClock).toHaveBeenCalledExactlyOnceWith(expect.any(Function), 1_000)
+    const clockTimer = startClock.mock.results[0]!.value
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(host.querySelector('.thinking-fold__label')?.textContent).toBe('Thinking · 12s')
+    options.nested = true
+    await nextTick()
+    expect(stopClock).toHaveBeenCalledWith(clockTimer)
+    blocks.value = [{ ...block('r1', 0, 'trace', 'completed'), endedAt: 13_000 }]
+    await nextTick()
+    expect(host.querySelector('.thinking-fold__label')?.textContent).toBe('Thought for 12s')
+    expect(startClock).toHaveBeenCalledTimes(1)
+    startClock.mockRestore()
+    stopClock.mockRestore()
+  })
   it('starts compact and keeps manual open and close stable across deltas', async () => {
     const blocks = ref([block('r1', 0, 'plan')])
     const host = mount(blocks)
@@ -139,12 +175,12 @@ describe('ReasoningTimeline disclosure ownership', () => {
     await nextTick()
 
     expect(host.querySelector<HTMLDetailsElement>('details')?.open).toBe(true)
-    expect(host.textContent).toContain('Thinking · 5s')
+    expect(host.textContent).toContain('Thought for 5s')
     expect(host.querySelector('.activity-motion--active')).toBeNull()
 
     vi.advanceTimersByTime(4_000)
     await nextTick()
-    expect(host.textContent).toContain('Thinking · 5s')
+    expect(host.textContent).toContain('Thought for 5s')
     vi.useRealTimers()
   })
 
@@ -277,6 +313,25 @@ describe('ReasoningTimeline disclosure ownership', () => {
     await nextTick()
     expect(host.querySelector('.thinking-fold__body')?.textContent).toBe('other')
     expect(host.querySelector('.thinking-fold__preview')?.textContent).toBe('other')
+  })
+
+  it('does not replay a pending preview when a new turn reuses the same block id', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(10_000)
+    const blocks = ref([block('r1', 0, 'first')])
+    const host = mount(blocks, ref(false), { sessionKey: 'session-a' })
+    blocks.value = [block('r1', 0, 'first\nold pending')]
+    await nextTick()
+    expect(host.querySelector('.thinking-fold__preview')?.textContent).toBe('first')
+    blocks.value = [{ ...block('r1', 0, 'new turn'), startedAt: 11_000 }]
+    await nextTick()
+    expect(host.querySelector('.thinking-fold__preview')?.textContent).toBe('new turn')
+    await vi.advanceTimersByTimeAsync(500)
+    expect(host.querySelector('.thinking-fold__preview')?.textContent).toBe('new turn')
+    expect(host.querySelector('.thinking-fold__body')?.textContent).toBe('new turn')
+    blocks.value = [{ ...block('r1', 0, 'new turn', 'completed'), startedAt: 11_000 }]
+    await nextTick()
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it('preserves manual open and close through live-to-history remounts', async () => {

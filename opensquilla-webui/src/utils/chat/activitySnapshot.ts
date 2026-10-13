@@ -1,3 +1,6 @@
+import { compactionSkippedProviderFailure } from '@/utils/chat/compactionStatus'
+import { normalizeProviderRecovery, providerActivityModel, providerHttpStatus } from '@/utils/chat/providerRecovery'
+import { providerFailureKind } from '@/utils/chat/providerFailure'
 import type {
   ActivitySnapshotEntry,
   ActivitySnapshotV2,
@@ -20,7 +23,7 @@ const PHASES: Readonly<Record<string, ReadonlySet<string>>> = {
 const MAINTENANCE_STATES = new Set([
   'running', 'completed', 'skipped', 'stale', 'cancelled', 'failed',
 ])
-const MAINTENANCE_REASONS = new Set(['within_budget', 'within_compaction_budget'])
+const MAINTENANCE_REASONS = new Set(['within_budget', 'within_compaction_budget', 'summary_failed', 'suffix_summary_failed'])
 const RESOLUTIONS = new Set([
   'approved', 'denied', 'expired', 'unavailable', 'replied',
 ])
@@ -75,7 +78,8 @@ function parsePhase(
 ): ActivitySnapshotEntry | undefined {
   if (!onlyKeys(raw, [
     'type', 'id', 'order', 'kind', 'phase', 'at', 'ended_at', 'reason',
-    'retry_after_ms', 'retry_attempt', 'retry_limit', 'round',
+    'retry_after_ms', 'retry_attempt', 'retry_limit', 'round', 'http_status',
+    'model', 'from_model',
   ])) return undefined
   const kind = safeText(raw.kind, 32)
   const phase = safeText(raw.phase, 32)
@@ -94,9 +98,17 @@ function parsePhase(
     ended_at: endedAt,
   }
   if (kind === 'provider') {
+    for (const field of ['model', 'from_model'] as const) {
+      if (raw[field] === undefined) continue
+      const model = providerActivityModel(raw[field])
+      if (!model || field === 'from_model' && phase !== 'fallback') return undefined
+      entry[field] = model
+    }
+    if (phase === 'retry_wait' && providerHttpStatus(raw.http_status) !== undefined) entry.http_status = raw.http_status
     if (raw.reason !== undefined) {
-      if (raw.reason !== 'rate_limited') return undefined
-      entry.reason = 'rate_limited'
+      const reason = normalizeProviderRecovery({ phase, reason: raw.reason })?.reason
+      if (!reason || reason === 'unknown' && raw.reason !== 'unknown') return undefined
+      entry.reason = reason
     }
     for (const [field, maximum] of [
       ['retry_after_ms', 900_000],
@@ -116,11 +128,13 @@ function parsePhase(
     if (
       raw.reason !== undefined || raw.retry_after_ms !== undefined
       || raw.retry_attempt !== undefined || raw.retry_limit !== undefined
+      || raw.model !== undefined || raw.from_model !== undefined
     ) return undefined
   } else if (
     raw.reason !== undefined || raw.retry_after_ms !== undefined
     || raw.retry_attempt !== undefined || raw.retry_limit !== undefined
     || raw.round !== undefined
+    || raw.model !== undefined || raw.from_model !== undefined
   ) return undefined
   return entry
 }
@@ -222,9 +236,10 @@ function parseMaintenance(
   if (!onlyKeys(raw, [
     'type', 'id', 'order', 'maintenance_type', 'state', 'at',
     'ended_at', 'source', 'durability',
-    'reason',
+    'reason', 'recovery', 'failure_detail',
   ])) return undefined
-  const state = safeText(raw.state, 32)
+  const rawState = safeText(raw.state, 32)
+  const state = compactionSkippedProviderFailure(rawState, raw.reason, record(raw.failure_detail)?.failure_kind) ? 'failed' : rawState
   const at = safeInteger(raw.at, 1, MAX_TIMESTAMP)
   const endedAt = safeInteger(raw.ended_at, 1, MAX_TIMESTAMP)
   if (
@@ -239,6 +254,16 @@ function parseMaintenance(
     state,
     at,
     ended_at: endedAt,
+  }
+  if (state === 'running') {
+    const recovery = normalizeProviderRecovery(raw.recovery)
+    if (recovery) entry.recovery = recovery
+  }
+  if (state === 'failed') {
+    const failure = record(raw.failure_detail)
+    if (failure) entry.failure_detail = {
+      failure_kind: providerFailureKind(failure.failure_kind), http_status: providerHttpStatus(failure.http_status),
+    }
   }
   for (const field of ['source', 'durability'] as const) {
     if (raw[field] === undefined) continue
@@ -404,6 +429,8 @@ function phaseStatus(entry: ActivitySnapshotEntry): StatusPart | undefined {
     endedAt,
     activityOrder: entry.order,
     durability: 'durable',
+    providerRecovery: kind === 'provider' ? normalizeProviderRecovery({ ...entry, started_at: entry.at, activity_id: entry.id }) : undefined,
+    httpStatus: phase === 'retry_wait' ? providerHttpStatus(entry.http_status) : undefined,
   }
   if (kind === 'router') return { ...common, action: 'router:decided', label: 'Selecting model' }
   if (kind === 'state' && phase === 'thinking') {
@@ -482,6 +509,9 @@ export function activityStatusHistory(snapshot: ActivitySnapshotV2): StatusPart[
       source: safeText(entry.source, 64),
       durability: safeText(entry.durability, 64),
       reason: safeText(entry.reason, 64),
+      providerRecovery: state === 'running' ? normalizeProviderRecovery(entry.recovery) : undefined,
+      httpStatus: state === 'failed' ? providerHttpStatus(record(entry.failure_detail)?.http_status) : undefined,
+      failureKind: state === 'failed' ? providerFailureKind(record(entry.failure_detail)?.failure_kind) : undefined,
     }]
   })
 }

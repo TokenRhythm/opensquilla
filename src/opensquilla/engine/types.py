@@ -15,7 +15,9 @@ from opensquilla.contracts.turn_execution import (
     AnswerGenerationResetEvent,
 )
 from opensquilla.execution_status import ExecutionStatus
+from opensquilla.provider.activity import safe_activity_model
 from opensquilla.provider.types import ExecutionIdentity
+from opensquilla.provider.types import ToolInputPreviewEvent as ToolInputPreviewEvent
 from opensquilla.tool_boundary import ToolCall as ToolCall
 from opensquilla.tool_boundary import ToolEffectOutcome as ToolEffectOutcome
 from opensquilla.tool_boundary import ToolResult as ToolResult
@@ -172,6 +174,15 @@ class ProviderActivityEvent:
     started_at: int = 0
     heartbeat: bool = False
     model: str = ""
+    http_status: int | None = None
+    # Actual failed leg, captured before selecting the fallback target.
+    from_model: str = ""
+
+    def __post_init__(self) -> None:
+        self.model = safe_activity_model(self.model) or ""
+        self.from_model = (
+            safe_activity_model(self.from_model) or "" if self.phase == "fallback" else ""
+        )
 
 
 @dataclass
@@ -292,6 +303,7 @@ class ErrorEvent:
     no_prior_provider_dispatch: bool | None = None
     replay_safe: bool | None = None
     model_capacity: dict[str, Any] | None = None
+    http_status: int | None = None
 
 
 @dataclass
@@ -578,6 +590,7 @@ AgentEvent = (
     | ThinkingEndEvent
     | TextDeltaEvent
     | RunHeartbeatEvent
+    | ToolInputPreviewEvent
     | ProviderActivityEvent
     | SkillLoadEvent
     | ToolUseStartEvent

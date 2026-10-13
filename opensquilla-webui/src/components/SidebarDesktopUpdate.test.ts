@@ -1,10 +1,13 @@
 // @vitest-environment happy-dom
 import { createApp, nextTick, ref, type App } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import i18n from '@/i18n'
+import i18n, { loadLocaleMessages } from '@/i18n'
 import type { DesktopUpdateState } from '@/platform'
 const mocks = vi.hoisted(() => ({ controller: null as unknown }))
-vi.mock('@/composables/useDesktopUpdate', () => ({ useDesktopUpdate: () => mocks.controller }))
+vi.mock('@/composables/useDesktopUpdate', async importOriginal => ({
+  ...await importOriginal<typeof import('@/composables/useDesktopUpdate')>(),
+  useDesktopUpdate: () => mocks.controller,
+}))
 import SidebarDesktopUpdate from './SidebarDesktopUpdate.vue'
 
 let app: App | undefined
@@ -50,34 +53,32 @@ describe('sidebar desktop update entry', () => {
     visible.value = false; await nextTick()
     expect(host.querySelector('button')).toBeNull()
   })
-  it('uses real download percentage and distinguishes indeterminate progress', async () => {
-    state.value = { ...state.value, status: 'downloading', progress: 37 }
-    const { host } = await mountEntry()
-    expect(host.querySelector('button')?.title).toContain('37')
-    state.value = { ...state.value, progress: null }; await nextTick()
-    expect(host.querySelector('button')?.title).not.toContain('37')
-    expect(host.querySelector('button')?.title).not.toContain('null')
+  it.each(['native', 'manual'] as const)('shows one readable ready row for %s without installing', async installMode => {
+    state.value = { ...state.value, status: 'downloaded', installMode, canInstall: true }
+    const { host, open } = await mountEntry()
+    const button = host.querySelector('button')!
+    expect(button.textContent).toContain('Update ready')
+    expect(button.textContent).toContain('2.0.0')
+    expect(button.querySelectorAll('svg')).toHaveLength(2)
+    button.click()
+    expect(open).toHaveBeenCalledOnce()
+    expect(relaunch).not.toHaveBeenCalled()
   })
-  it.each(['native', 'manual'] as const)('uses shared presentation for %s downloaded state', async installMode => {
-    state.value = { ...state.value, status: 'downloaded', installMode }
+  it('keeps legacy manual updates actionable without claiming installation readiness', async () => {
+    state.value = { ...state.value, status: 'downloaded', installMode: 'manual', canInstall: false }
     const { host } = await mountEntry()
-    expect(host.querySelector('button')?.title).toBe(i18n.global.t(installMode === 'manual'
-      ? 'updates.desktop.indicatorInstallerReady' : 'updates.desktop.indicatorDownloaded'))
-    expect(host.querySelector('button')?.dataset.state).toBe('info')
+    expect(host.querySelector('button')?.textContent).toContain('Update available')
+    expect(host.querySelector('button')?.textContent).not.toContain('Update ready')
   })
-  it('keeps a manual installer retry error visible as an error', async () => {
-    state.value = { ...state.value, status: 'downloaded', installMode: 'manual', errorCode: 'install_failed' }
+  it.each([
+    ['en', 'Update ready'], ['zh-Hans', '更新已就绪'], ['de', 'Update bereit'],
+    ['es', 'Actualización lista'], ['fr', 'Mise à jour prête'], ['ja', '更新準備完了'],
+  ] as const)('renders %s readiness and retains a complete accessible version', async (locale, expected) => {
+    state.value = { ...state.value, status: 'downloaded', canInstall: true }
     const { host } = await mountEntry()
-    expect(host.querySelector('button')?.dataset.state).toBe('danger')
-    expect(host.querySelector('button')?.title).toBe(i18n.global.t('updates.desktop.indicatorError'))
-  })
-  it('uses localized presentation for applying and failures', async () => {
-    state.value = { ...state.value, status: 'applying', installMode: 'manual' }
-    const { host } = await mountEntry()
-    expect(host.querySelector('button')?.title).toBe(i18n.global.t('updates.desktop.manualApplyingStatus'))
-    state.value = { ...state.value, status: 'error' }; await nextTick()
-    expect(host.querySelector('button')?.dataset.state).toBe('danger')
-    i18n.global.locale.value = 'zh-Hans'; await nextTick()
-    expect(host.querySelector('button')?.title).toBe(i18n.global.t('updates.desktop.indicatorError'))
+    await loadLocaleMessages(locale)
+    i18n.global.locale.value = locale; await nextTick()
+    expect(host.querySelector('button')?.textContent).toContain(expected)
+    expect(host.querySelector('button')?.getAttribute('aria-label')).toContain('2.0.0')
   })
 })

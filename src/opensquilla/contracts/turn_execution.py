@@ -924,6 +924,7 @@ class TurnExecutionContext:
         terminal_error_message: str = "",
         terminal_error_code: str = "",
         terminal_failure_kind: str = "",
+        terminal_http_status: int | None = None,
     ) -> AnswerGenerationResetEvent:
         """Advance the generation epoch while retaining the same message id."""
 
@@ -973,6 +974,7 @@ class TurnExecutionContext:
             terminal_error_message=terminal_error_message,
             terminal_error_code=terminal_error_code,
             terminal_failure_kind=terminal_failure_kind,
+            terminal_http_status=terminal_http_status,
         )
 
     def begin_control_terminal(self, reason: str) -> int | None:
@@ -1171,3 +1173,4 @@ class AnswerGenerationResetEvent:
     terminal_error_message: str = ""
     terminal_error_code: str = ""
     terminal_failure_kind: str = ""
+    terminal_http_status: int | None = None

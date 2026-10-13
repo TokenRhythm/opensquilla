@@ -78,6 +78,7 @@
       "session.event.thinking_end",
       "session.event.thinking_start",
       "session.event.tool_result",
+      "session.event.tool_input_preview",
       "session.event.tool_use_delta",
       "session.event.tool_use_end",
       "session.event.tool_use_start",

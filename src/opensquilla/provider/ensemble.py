@@ -660,6 +660,7 @@ def _generation_reset(
     terminal_text_snapshot: str | None = None,
     terminal_error_message: str = "",
     terminal_error_code: str = "",
+    terminal_http_status: int | None = None,
     model_usage_breakdown: list[dict[str, Any]] | None = None,
     usage_missing_count: int = 0,
     ensemble_trace: dict[str, Any] | None = None,
@@ -674,6 +675,7 @@ def _generation_reset(
         terminal_text_snapshot=terminal_text_snapshot,
         terminal_error_message=terminal_error_message,
         terminal_error_code=terminal_error_code,
+        terminal_http_status=terminal_http_status,
         model_usage_breakdown=list(model_usage_breakdown or ()),
         usage_missing_count=max(0, int(usage_missing_count or 0)),
         ensemble_trace=(dict(ensemble_trace) if ensemble_trace is not None else None),
@@ -4627,6 +4629,7 @@ class EnsembleProvider:
         logical_call_index: int = 0,
         phase: str = "ensemble_fixed_wait",
         message: str | None = None,
+        from_model: str = "",
     ) -> AsyncIterator[StreamEvent]:
         """Run one fixed logical call with one transient retry at most."""
 
@@ -4769,6 +4772,7 @@ class EnsembleProvider:
                     request_activity=ProviderActivityEvent(
                         model=physical_model,
                         phase="fallback" if fixed_attempt == 1 else "retrying",
+                        from_model=from_model if fixed_attempt == 1 else "",
                         reason="unknown" if fixed_attempt == 1 else "transport_transient",
                         retry_attempt=fixed_attempt - 1,
                         retry_limit=1,
@@ -5102,6 +5106,7 @@ class EnsembleProvider:
                 terminal_text_snapshot=ENSEMBLE_FIXED_TERMINAL_MESSAGE,
                 terminal_error_message=terminal_report.message,
                 terminal_error_code=terminal_report.code,
+                terminal_http_status=terminal_report.http_status,
                 model_usage_breakdown=terminal_report.model_usage_breakdown,
                 usage_missing_count=terminal_report.usage_missing_count,
                 ensemble_trace=trace,
@@ -5415,6 +5420,9 @@ class EnsembleProvider:
         )
         async for event in self._stream_fixed_attempts(
             provider=self.fallback_provider,
+            # Aggregation has one observed physical source; a failed proposer
+            # fan-out has none. Sticky continuations do not inherit this hop.
+            from_model=self._active_model_id,
             fixed_messages=fixed_messages,
             tools=tools,
             config=fallback_config or ChatConfig(),

@@ -13,9 +13,7 @@ import type { IconName } from '@/utils/icons'
 export type ChatRouteHeaderAction =
   | 'deliverables'
   | 'share'
-  | 'copy-session-key'
   | 'copy-session-link'
-  | 'copy-gateway-link'
 
 export interface ChatRouteHeaderModel {
   sessionKey: Readonly<Ref<string>>
@@ -34,9 +32,7 @@ export interface ChatRouteHeaderModel {
 export interface ChatRouteHeaderCommands {
   openDeliverables: () => void
   startShare: () => void
-  copySessionKey: () => void
-  copySessionLink?: () => void
-  copyGatewayLink?: () => void
+  copySessionLink: () => void
   restoreComposerFocus: () => void
 }
 

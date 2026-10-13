@@ -515,6 +515,60 @@ async def test_batch_mutation_from_legacy_connection_fences_each_modern_owner(co
     assert scheduler.mutation_tail(runtime, "agent:main:b") is None
 
 
+@pytest.mark.parametrize("method", ["sessions.reset", "sessions.delete", "sessions.truncate"])
+async def test_identity_mutations_still_retire_snapshot_and_fence_live_delivery(connection, method):
+    runtime = object()
+    key = "agent:main:webchat:identity-fence"
+    connection._recovery_runtime = runtime
+    token = subscribe(connection, key)
+    transfer = connection.snapshot_registry().admit(key, "before", token)
+    _, completed = _admit_session_mutation(
+        method, {"key": key}, RpcContext(conn_id="mutation-owner", session_manager=runtime),
+    )
+    try:
+        assert transfer.closed
+        assert key in connection._flow.dirty
+        assert get_recovery_scheduler().mutation_tail(runtime, key) is not None
+    finally:
+        completed.set_result(None)
+        await asyncio.sleep(0)
+
+
+async def test_manual_compaction_keeps_live_retry_progress_while_ordered_mutation_is_pending(
+    connection,
+):
+    runtime = object()
+    key = "agent:main:webchat:manual-live-progress"
+    connection._recovery_runtime = runtime
+    token = subscribe(connection, key)
+    transfer = connection.snapshot_registry().admit(key, "before", token)
+    _, completed = _admit_session_mutation(
+        "sessions.contextCompact", {"key": key},
+        RpcContext(conn_id="mutation-owner", session_manager=runtime),
+    )
+    try:
+        assert not transfer.closed
+        assert key not in connection._flow.dirty
+        assert get_recovery_scheduler().mutation_tail(runtime, key) is not None
+        payload = get_session_streams().record(key, "session.event.compaction", {
+            "source": "manual", "status": "observed", "epoch": 0,
+            "compaction_id": "cmp-live-review", "phase": "summarizing",
+            "recovery": {"phase": "retry_wait", "reason": "rate_limited",
+                         "retry_after_ms": 35000, "http_status": 429},
+        })
+        await connection.send_event("session.event.compaction", payload)
+        await asyncio.sleep(0)
+        frames = [frame for frame in connection.ws.frames
+                  if frame.get("event") == "session.event.compaction"]
+        assert len(frames) == 1
+        assert frames[0]["payload"]["recovery"]["http_status"] == 429
+        assert frames[0]["payload"]["recovery"]["phase"] == "retry_wait"
+        assert not completed.done(), "Progress must arrive before the operation finishes"
+    finally:
+        completed.set_result(None)
+        await asyncio.sleep(0)
+
+
 async def test_dirty_notice_successor_survives_old_send_finally(connection, monkeypatch):
     started, release = asyncio.Event(), asyncio.Event()
     original_send = connection.ws.send_text

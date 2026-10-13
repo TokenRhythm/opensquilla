@@ -10,7 +10,7 @@ afterEach(() => {
 
 describe('Chat user error presentation', () => {
   const providerCases: [string, string, ChatErrorAction?][] = [
-    ['rate_limited', 'busy'],
+    ['rate_limited', 'rateLimited'],
     ['provider_overloaded', 'busy'],
     ['auth_invalid', 'credentials', 'open-provider-settings'],
     ['context_overflow', 'contextLimit', 'choose-model'],
@@ -95,7 +95,7 @@ describe('Chat user error presentation', () => {
     expect(chatErrorPresentation({ outcomeKind: 'budgetLimited', failureKind: 'unknown' }))
       .toEqual({ messageKey: 'chat.errorMessage.runLimit' })
     expect(chatErrorPresentation({ outcomeKind: 'partial', failureKind: 'rate_limited' }))
-      .toEqual({ messageKey: 'chat.errorMessage.busy' })
+      .toEqual({ messageKey: 'chat.errorMessage.rateLimited' })
   })
 
   it.each(['approval_pending', 'approval_required', 'human_decision_required'])(
@@ -114,6 +114,15 @@ describe('Chat user error presentation', () => {
     },
   )
 
+  it('distinguishes waiting budget from task timeout and usage limits from credits', () => {
+    expect(chatErrorPresentation({ code: 'provider_retry_after_deadline', failureKind: 'rate_limited' })).toEqual({ messageKey: 'chat.errorMessage.rateLimitWaitEnded' })
+    expect(chatErrorPresentation({ code: 'provider_overload_retry_after_deadline', failureKind: 'provider_overloaded' })).toEqual({ messageKey: 'chat.errorMessage.busyWaitEnded' })
+    expect(chatErrorPresentation({ terminalStatus: 'timeout', code: 'provider_retry_after_deadline' })).toEqual({ messageKey: 'chat.errorMessage.timeout' })
+    expect(chatErrorPresentation({ failureKind: 'insufficient_credits' })).toEqual({ messageKey: 'chat.errorMessage.credits', action: 'open-provider-settings' })
+    expect(chatErrorPresentation({ failureKind: 'usage_limit' })).toEqual({ messageKey: 'chat.errorMessage.usageLimit' })
+    for (const code of ['400', '401', '403', '404', '429', '503']) expect(chatErrorPresentation({ code })).toEqual({ messageKey: 'chat.errorMessage.unknown' })
+  })
+
   it('never uses a general retry hint to offer whole-turn replay', () => {
     for (const [failureKind] of providerCases) {
       expect(chatErrorPresentation({ failureKind, replaySafe: true }).action).not.toBe('retry-usage-replay')
@@ -122,9 +131,9 @@ describe('Chat user error presentation', () => {
   })
 
   it('keeps a provider usage limit separate from the local execution budget', () => {
-    for (const failureKind of [undefined, 'insufficient_credits']) {
+    for (const failureKind of [undefined, 'usage_limit']) {
       expect(chatErrorPresentation({ code: 'usage_limit_reached', failureKind })).toEqual({
-        messageKey: 'chat.errorMessage.credits', action: 'open-provider-settings',
+        messageKey: 'chat.errorMessage.usageLimit',
       })
     }
     expect(chatErrorPresentation({ code: 'turn_billed_cost_budget_exceeded' }))
@@ -136,7 +145,7 @@ describe('Chat user error presentation', () => {
     expect(localizedChatErrorMessage('DOCUMENT_CHANGED', 'raw upstream secret'))
       .toBe('The page changed. Refresh it before trying again.')
     expect(localizedChatErrorMessage('PERMISSION_DENIED', 'raw upstream secret'))
-      .toBe('The task did not finish. Please try again later.')
+      .toBe('This request did not finish.')
   })
 
   it.each(['429', '401', 'future_code', '__proto__', 'constructor', 'Rate limited (ref: abcdef01)', null, {}])(
@@ -163,7 +172,7 @@ describe('Chat user error presentation', () => {
     await loadLocaleMessages('zh-Hans')
     i18n.global.locale.value = 'zh-Hans'
     expect(localizedChatErrorMessage('unknown', 'secret upstream content (ref: abcdef01)'))
-      .toBe('任务未完成，请稍后再试')
+      .toBe('本次请求未完成')
     for (const fallback of ['No provider available', 'The task failed. (ref: abcdef01)', '']) {
       expect(localizedChatErrorMessage('no_provider', fallback)).toBe('当前没有可用模型')
     }

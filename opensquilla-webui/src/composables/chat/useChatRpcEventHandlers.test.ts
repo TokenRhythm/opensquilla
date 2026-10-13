@@ -25,6 +25,7 @@ import { useChatPlans } from './useChatPlans'
 import { useChatCompaction } from './useChatCompaction'
 import { useChatStream } from './useChatStream'
 import type { SkillLoadReceipt } from '@/types/skillLoads'
+import { isVisibleActivityStatusStep, projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
 
 function createHarness(options: {
   messages?: ChatMessage[]
@@ -57,6 +58,7 @@ function createHarness(options: {
   const sessionKey = ref('agent:main:test')
   const lastStreamSeq = ref(0)
   const currentEpoch = ref(0)
+  const aborted = ref(false)
   const onTaskSettled = vi.fn()
   const activeTaskGroups = ref(new Set<string>())
   const activeStreamTaskId = ref('')
@@ -65,7 +67,7 @@ function createHarness(options: {
   const streamRuntime = options.withCompactionRuntime ? useChatStream({
     messages,
     lastHeaderRole: ref(''),
-    aborted: ref(false),
+    aborted,
     autoScroll: ref(false),
     runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
     applySessionRunState,
@@ -85,6 +87,7 @@ function createHarness(options: {
     appendDelta: vi.fn(),
     scheduleRender: vi.fn(),
     appendToolCall: vi.fn(),
+    applyToolInputPreview: vi.fn(() => true),
     appendToolDelta: vi.fn(),
     appendToolEnd: vi.fn(),
     appendToolResult: vi.fn(),
@@ -144,7 +147,7 @@ function createHarness(options: {
     taskOwnership: options.taskOwnership,
     onTaskSettled,
     activeStreamTaskId,
-    aborted: ref(false),
+    aborted,
     messages,
     pendingQueue,
     usageAccum: ref({
@@ -218,6 +221,7 @@ function createHarness(options: {
     sessionKey,
     lastStreamSeq,
     currentEpoch,
+    aborted,
     onTaskSettled,
     stream,
     streamRuntime,
@@ -244,6 +248,95 @@ function createHarness(options: {
     stop: () => { detach(); scope.stop(); compaction?.cleanup(); streamRuntime?.cleanup() },
   }
 }
+
+describe('live tool input preview delivery', () => {
+  const draft = (patch: Record<string, unknown> = {}) => ({
+    key: 'agent:main:test', task_id: 'task-live', turn_id: 'task-live', epoch: 0, stream_seq: 1,
+    preview_id: 'p1', attempt_id: 'a1', tool_use_id: 'write-1', generation_epoch: 0,
+    revision: 1, state: 'generating', tool_name: 'write_file', path: 'page.html', content: '<html>', truncated: false,
+    ...patch,
+  })
+  it('buffers until task acceptance, then rejects stale identities, duplicate cursor, replay, and cancellation', () => {
+    const h = createHarness()
+    h.activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+    try {
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft())
+      expect(h.stream.applyToolInputPreview).not.toHaveBeenCalled()
+      h.api.bindActiveStreamTask('task-live')
+      expect(h.stream.applyToolInputPreview).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ content: '<html>', toolUseId: 'write-1' }), 1, false)
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft())
+      for (const invalid of [{ key: 'other' }, { task_id: 'other', turn_id: 'other' }, { epoch: -1 }, { generation_epoch: 1 },
+        { task_id: undefined, turn_id: undefined }, { stream_seq: undefined }]) {
+        h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 99, ...invalid }))
+      }
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 2, revision: 2 }), { replayed: true })
+      expect(h.stream.applyToolInputPreview).toHaveBeenCalledTimes(1)
+      h.aborted.value = true
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 3, revision: 3 }))
+      expect(h.stream.applyToolInputPreview).toHaveBeenCalledTimes(1)
+      expect(h.stream.streamHasVisibleOutput.value).toBe(false)
+    } finally { h.stop() }
+  })
+  it('clears generation drafts and never resurrects an ended task from a late preview', () => {
+    const h = createHarness({ withCompactionRuntime: true })
+    h.activeStreamTaskId.value = 'task-live'
+    try {
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft())
+      expect(h.streamRuntime?.toolInputPreviews.value).toHaveLength(1)
+      h.api.handlers.onAnswerGenerationReset({ key: h.sessionKey.value, task_id: 'task-live', turn_id: 'task-live', stream_seq: 2,
+        old_generation_epoch: 0, new_generation_epoch: 1, authoritative_text_snapshot: '', authoritative_reasoning_snapshot: '', preserve_completed_tools: true })
+      expect(h.streamRuntime?.toolInputPreviews.value).toEqual([])
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 99, revision: 2 }))
+      expect(h.streamRuntime?.toolInputPreviews.value).toEqual([])
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 3, preview_id: 'p2', generation_epoch: 1 }))
+      expect(h.streamRuntime?.toolInputPreviews.value).toHaveLength(1)
+      h.api.handlers.onWireEventFixture('session.event.done', { key: h.sessionKey.value, task_id: 'task-live', turn_id: 'task-live', stream_seq: 4, generation_epoch: 1 })
+      expect(h.streamRuntime?.toolInputPreviews.value).toEqual([])
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 5, preview_id: 'late', generation_epoch: 1 }))
+      expect(h.streamRuntime?.toolInputPreviews.value).toEqual([])
+    } finally { h.stop() }
+  })
+  it.each(['discarded', 'committed'] as const)('applies a replayed %s to the matching authoritative snapshot draft', async state => {
+    const h = createHarness({ withCompactionRuntime: true })
+    try {
+      h.api.restoreLiveTurnSnapshot({ sessionKey: h.sessionKey.value, taskId: 'task-live', events: [{
+        semanticKind: 'tool-input-preview', payload: {
+          key: h.sessionKey.value, task_id: 'task-live', turn_id: 'task-live', epoch: 0, stream_seq: 1, generation_epoch: 0,
+          toolInputPreview: { previewId: 'p1', attemptId: 'a1', toolUseId: 'write-1', generationEpoch: 0,
+            revision: 1, state: 'generating', toolName: 'write_file', path: 'page.html', content: '<html>', truncated: false },
+        },
+      }] })
+      h.streamRuntime!.toggleToolItem('write-1', true)
+      expect(h.streamRuntime!.toolInputPreviews.value).toHaveLength(1)
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 2, revision: 2, state, attempt_id: 'other' }), { replayed: true })
+      expect(h.streamRuntime!.toolInputPreviews.value[0]?.state).toBe('generating')
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 3, revision: 2, state }), { replayed: true })
+      if (state === 'discarded') {
+        expect(h.streamRuntime!.toolInputPreviews.value).toEqual([])
+      } else {
+        expect(h.streamRuntime!.toolInputPreviews.value[0]?.state).toBe('committed')
+        h.api.handlers.onWireEventFixture('session.event.tool_use_start', {
+          key: h.sessionKey.value, task_id: 'task-live', turn_id: 'task-live', epoch: 0, stream_seq: 4,
+          generation_epoch: 0, id: 'write-1', name: 'write_file', arguments: { path: 'page.html', content: '<html>final' },
+        }, { replayed: true })
+        await new Promise(resolve => setTimeout(resolve, 60))
+        expect(h.streamRuntime!.toolInputPreviews.value).toEqual([])
+        expect(h.streamRuntime!.foldedTurn.value.toolCalls).toHaveLength(1)
+        expect(h.streamRuntime!.isToolItemOpen('write-1')).toBe(true)
+      }
+    } finally { h.stop() }
+  })
+  it.each(['discarded', 'committed'] as const)('does not reopen a stream for a replayed %s without a live draft', state => {
+    const h = createHarness({ withCompactionRuntime: true })
+    h.activeStreamTaskId.value = 'task-live'
+    try {
+      expect(h.streamRuntime!.isStreaming.value).toBe(false)
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ state }), { replayed: true })
+      expect(h.streamRuntime!.isStreaming.value).toBe(false)
+      expect(h.streamRuntime!.toolInputPreviews.value).toEqual([])
+    } finally { h.stop() }
+  })
+})
 
 describe('cross-window primary input hydration', () => {
   const key = 'agent:main:test'
@@ -3679,6 +3772,54 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     } finally {
       stop()
     }
+  })
+
+  it.each(['requesting', 'preparing'] as const)('hands %s feedback to actual reasoning without a provider activity event', phase => {
+    const h = createHarness({ withCompactionRuntime: true })
+    try {
+      const payload = { key: h.sessionKey.value, task_id: 'thinking-task', turn_id: 'thinking-task' }
+      h.activeStreamTaskId.value = 'thinking-task'
+      if (phase === 'requesting') {
+        h.api.handlers.onWireEventFixture('session.event.provider_activity', {
+          ...payload, stream_seq: 1, phase: 'requesting', schema_version: 1,
+        })
+      } else {
+        h.api.handlers.onRunHeartbeat({ ...payload, stream_seq: 1, phase: 'llm_tool_arguments' })
+      }
+      h.api.handlers.onWireEventFixture('session.event.thinking', {
+        ...payload, stream_seq: 2, text: 'Reviewing the generated file.', block_id: 'reasoning-1',
+      })
+      const runtime = h.streamRuntime!
+      const history = runtime.foldedTurn.value.statusHistory
+      expect(history[history.length - 1]?.action).toBe('provider:reasoning')
+      const reasoning = runtime.foldedTurn.value.reasoningBlocks
+      expect(reasoning[reasoning.length - 1]?.text).toBe('Reviewing the generated file.')
+      expect(projectAssistantActivityTimeline([], { lifecycle: 'working', statusHistory: history })
+        .statusSteps.filter(isVisibleActivityStatusStep)).toEqual([])
+
+      h.api.handlers.onWireEventFixture('session.event.provider_activity', {
+        ...payload, stream_seq: 3, phase: 'reasoning', schema_version: 1,
+        activity_id: 'provider-call-1', started_at: Date.now(), reason: 'initial',
+      })
+      h.api.handlers.onWireEventFixture('session.event.thinking', {
+        ...payload, stream_seq: 4, text: ' Checking the content.', block_id: 'reasoning-1',
+      })
+      expect(runtime.foldedTurn.value.statusHistory.filter(entry => entry.action === 'provider:reasoning')).toHaveLength(1)
+    } finally { h.stop() }
+  })
+
+  it('does not restore reasoning feedback from a finished turn', () => {
+    const h = createHarness({ withCompactionRuntime: true })
+    try {
+      h.activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
+      h.api.handlers.onWireEventFixture('session.event.thinking', {
+        key: h.sessionKey.value, task_id: 'finished-task', turn_id: 'finished-task',
+        stream_seq: 1, text: 'Late reasoning', block_id: 'old-reasoning',
+      })
+      expect(h.streamRuntime!.isStreaming.value).toBe(false)
+      expect(h.streamRuntime!.foldedTurn.value.statusHistory).toEqual([])
+      expect(h.streamRuntime!.foldedTurn.value.reasoningBlocks).toEqual([])
+    } finally { h.stop() }
   })
 
   it('maps structured provider activity without rendering provider error text', () => {

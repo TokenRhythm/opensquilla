@@ -423,6 +423,13 @@ async def _chat_history_turn_outcomes(
         )
         if snapshot is not None:
             projected["activity_snapshot"] = snapshot
+        from opensquilla.provider.failures import safe_http_status
+
+        http_status = (
+            safe_http_status(outcome.get("http_status")) if isinstance(outcome, dict) else None
+        )
+        if status != "succeeded" and http_status is not None:
+            projected["http_status"] = http_status
         error_class = getattr(row, "error_class", None)
         if (
             status != "succeeded"

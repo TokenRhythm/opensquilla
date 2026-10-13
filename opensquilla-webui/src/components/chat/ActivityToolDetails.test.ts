@@ -23,7 +23,7 @@ describe('ActivityToolDetails text hierarchy', () => {
       'color: var(--text-muted);',
     )
     const error = ruleBody('.activity-tool-details__line--error')
-    expect(error).toContain('color: var(--text-muted);')
+    expect(error).toContain('color: var(--warn);')
     expect(error).not.toContain('var(--danger)')
   })
 })

@@ -47,6 +47,9 @@ export type TopbarUpdateState = {
   snoozedUntil: string | null
   canCheck: boolean
   canNativeInstall: boolean
+  canInstall?: boolean
+  canAutoDownload?: boolean
+  releaseNotesUrl?: string | null
   installMode: 'native' | 'manual' | 'unsupported'
   releaseUrl: string | null
   source: 'oss' | 'github' | null

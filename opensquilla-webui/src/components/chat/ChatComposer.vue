@@ -1858,16 +1858,12 @@ button.attachment-chip__primary:focus-visible {
   }
 }
 
-/* Reserve separate rows before either action cluster overlaps the other,
-   including ordinary new-chat composers without an active mode chip. */
+/* Let the actual controls determine whether another row is needed. A short
+   model name fits beside the left actions even in a split chat column. */
 @container chat-composer (min-width: 26rem) and (max-width: 36rem) {
   .chat-input-footer {
     flex-wrap: wrap;
     gap: 0.375rem;
-  }
-
-  .chat-input-footer > .chat-input-actions {
-    flex: 1 1 100%;
   }
 
   .chat-input-footer > .chat-input-actions--left {
@@ -1876,6 +1872,7 @@ button.attachment-chip__primary:focus-visible {
   }
 
   .chat-input-footer > .chat-input-actions--right {
+    flex-grow: 1;
     justify-content: space-between;
     margin-left: 0;
   }

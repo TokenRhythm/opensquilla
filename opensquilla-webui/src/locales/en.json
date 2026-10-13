@@ -141,13 +141,15 @@
     "desktop": {
       "installErrorTitle": "Could not start installation",
       "quitAndInstall": "Quit and install",
-      "signedDownloadedDesc": "OpenSquilla {version} is verified and ready. Quit and install to close background services and open the installer.",
-      "manualApplyingStatus": "Closing background services",
-      "manualApplyingDesc": "OpenSquilla is closing its background services. The installer will open when they have stopped.",
+      "signedDownloadedDesc": "OpenSquilla {version} is ready. Updating will quit the app and may interrupt running tasks; follow the installation wizard to finish the update.",
+      "manualApplyingStatus": "Preparing installation",
+      "manualApplyingDesc": "When preparation is complete, OpenSquilla will quit and open the installation wizard.",
       "errorSignatureInvalid": "The installer signature is invalid or its publisher does not match OpenSquilla. Installation was blocked. Download the update again.",
       "errorSignatureUnavailable": "OpenSquilla could not verify the installer signature. Installation was blocked. Try again later.",
       "indicatorAvailable": "Update {version}",
       "indicatorDownloaded": "Update ready",
+      "updateAvailableEntry": "Update available",
+      "viewReleaseNotes": "View what’s new",
       "indicatorInstallerReady": "Installer verified",
       "indicatorDownloading": "Downloading",
       "indicatorDownloadingProgress": "Downloading {progress}%",
@@ -186,7 +188,7 @@
       "checkingStatus": "Checking",
       "upToDateStatus": "Up to date",
       "errorStatus": "Needs attention",
-      "applyingStatus": "Relaunching",
+      "applyingStatus": "Preparing installation",
       "idleStatus": "Idle",
       "unavailableStatus": "Unavailable",
       "unsupported": "Native desktop updates are unavailable on this platform. Use the release link when a new version is announced.",
@@ -199,7 +201,9 @@
       "downloadInstaller": "Download installer",
       "showInstaller": "Show installer",
       "relaunch": "Relaunch",
-      "later": "Later"
+      "later": "Later",
+      "reminderSnoozed": "Reminder snoozed",
+      "retry": "Retry"
     }
   },
   "common": {
@@ -3759,9 +3763,7 @@
     "chatWithSuffix": "Chat {suffix}",
     "copied": "Copied",
     "copy": "Copy",
-    "copySessionKey": "Copy session ID",
-    "copySessionAppLink": "Copy application link",
-    "copySessionGatewayLink": "Copy Gateway web link",
+    "copySessionLink": "Copy session link",
     "sessionActions": "Session actions",
     "share": "Share",
     "shareSendFirst": "Send a message first to share",
@@ -3854,16 +3856,16 @@
     "copiedDiagnosticId": "Diagnostic ID copied",
     "copyDiagnosticFailed": "Copy failed. Select the ID above and copy it manually.",
     "errorMessage": {
-      "unknown": "The task did not finish. Please try again later.",
+      "unknown": "This request did not finish.",
       "noProvider": "No model is available.",
-      "credentials": "The model credentials are invalid.",
-      "credits": "The model account has insufficient credits.",
+      "credentials": "Model service authentication failed.",
+      "credits": "The model service account has insufficient credits.",
       "modelUnavailable": "The selected model is unavailable.",
       "contextLimit": "The input exceeds the model limit.",
       "unsupported": "This model does not support this request.",
       "imageUnsupported": "This model does not support images.",
       "ensembleImageUnsupported": "This mode does not support images.",
-      "busy": "The model service is busy. Please try again later.",
+      "busy": "The model service is busy; this request did not finish.",
       "unavailable": "The model service is unavailable. Please try again later.",
       "refused": "The model cannot process this request.",
       "responseIncomplete": "The model response did not finish. Please try again later.",
@@ -3876,7 +3878,11 @@
       "timeout": "The task timed out before it finished.",
       "stopped": "The task was stopped.",
       "interrupted": "The task was interrupted.",
-      "approvalRequired": "Waiting for your approval."
+      "approvalRequired": "Waiting for your approval.",
+      "rateLimited": "The model is temporarily rate limited; this request did not finish.",
+      "usageLimit": "The model service usage limit has been reached.",
+      "rateLimitWaitEnded": "The model is temporarily rate limited; this request cannot keep waiting.",
+      "busyWaitEnded": "The model service is busy; this request cannot keep waiting."
     },
     "errorAction": {
       "openModelSettings": "Open model settings",
@@ -3994,6 +4000,12 @@
     "activityElapsed": "Time spent {duration}",
     "activityDurationMinutes": "{minutes}m {seconds}s",
     "activity": {
+      "fileDraft": {
+        "generating": "Generating file",
+        "ready": "Preparing to write",
+        "note": "Live draft · File has not been written yet",
+        "truncated": "Latest draft content · File has not been written yet"
+      },
       "lifecycle": {
         "working": "Working",
         "answering": "Writing the answer",
@@ -4007,11 +4019,25 @@
         "waiting": "Waiting for model",
         "responded": "Model response",
         "reasoning": "Thinking",
-        "rateLimited": "Rate limited · retrying in {seconds}s",
-        "retryWait": "Retrying in {seconds}s",
+        "rateLimited": "Model temporarily rate limited, retrying in about {seconds}s",
+        "retryWait": "Waiting to retry in about {seconds}s",
         "retrying": "Retrying {attempt}/{limit}",
         "retryingWithoutLimit": "Retrying · attempt {attempt}",
-        "fallback": "Switching to backup model"
+        "fallback": "Trying a backup model",
+        "rateLimitedWaiting": "Model temporarily rate limited, waiting to retry",
+        "overloaded": "Model service busy, retrying in about {seconds}s",
+        "overloadedWaiting": "Model service busy, waiting to retry",
+        "retryWaiting": "Waiting to retry",
+        "rateLimitedPast": "Waited for the model rate limit",
+        "overloadedPast": "Waited for the model service",
+        "retryWaitPast": "Waited to retry",
+        "retryingPast": "Retried the model request",
+        "fallbackPast": "Tried a backup model",
+        "fallbackModels": "Trying a backup model · {from} → {to}",
+        "fallbackModelsPast": "Tried a backup model · {from} → {to}",
+        "fallbackModel": "Trying a backup model · {model}",
+        "fallbackModelPast": "Tried a backup model · {model}",
+        "retryingGeneric": "Retrying"
       },
       "purpose": {
         "discover": "Discovered links",
@@ -4596,7 +4622,8 @@
       "sessionModelBusy": "Finish the current response before changing its model.",
       "router": "Intelligent model routing",
       "ensemble": "Model ensemble"
-    }
+    },
+    "httpStatus": "(HTTP {status})"
   },
   "shared": {
     "loading": "Loading",

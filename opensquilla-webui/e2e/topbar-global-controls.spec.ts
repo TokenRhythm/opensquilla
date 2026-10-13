@@ -84,33 +84,31 @@ test.describe('Chat topbar global controls', () => {
     await expect(page.getByTestId('settings-update-download')).toBeVisible()
   })
 
-  test('desktop update lifecycle preserves header layout and the focused sidebar entry', async ({ page }) => {
+  test('background update preparation stays quiet and only readiness adds a sidebar row', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 1000 })
     const harness = await openTopbarSession(page, {
       sessionKey: `${TOPBAR_SESSION_KEY}-update-lifecycle`, locale: 'en',
-      update: { status: 'available', latestVersion: '2.0.0' },
+      update: { status: 'available', latestVersion: '2.0.0', canAutoDownload: true },
     })
     const header = page.locator('.chat-header')
     const update = page.getByTestId('sidebar-desktop-update')
+    const settings = page.locator('.sidebar-foot button[data-icon="settings"]')
+    const originalSettings = await settings.boundingBox()
     const initialSessionLayout = await header.getAttribute('data-layout')
-    await expect(page.getByTestId('chat-system-status')).toHaveCount(0)
-    await update.focus()
-    const states = [
-      { status: 'downloading' as const, progress: 37 },
-      { status: 'downloaded' as const, progress: 100 },
-      { status: 'error' as const, progress: null, errorCode: 'download_failed',
-        error: 'synthetic raw error that must not become the control label' },
-    ]
-    for (const state of states) {
-      await harness.pushUpdate(state)
-      await expect(update).toBeVisible()
-      await expect(update).toBeFocused()
-      await expect(update).not.toHaveAttribute('aria-label', /synthetic raw error/)
-      await expect(page.getByTestId('chat-system-status')).toHaveCount(0)
+    for (const status of ['available', 'downloading', 'error'] as const) {
+      await harness.pushUpdate({ status, progress: status === 'downloading' ? 37 : null })
+      await expect(update).toHaveCount(0)
+      await expect(page.getByTestId('sidebar-update-dot')).toHaveCount(0)
       await expect(header).toHaveAttribute('data-layout', initialSessionLayout || '')
-      await expectTopbarGeometry(page)
     }
-    await expect(update).toHaveAttribute('data-state', 'danger')
+    await harness.pushUpdate({ status: 'downloaded', canInstall: true, progress: 100 })
+    await expect(update).toHaveAccessibleName('Update ready 2.0.0')
+    const readySettings = await settings.boundingBox()
+    expect(readySettings?.y).toBeCloseTo(originalSettings!.y, 0)
+    expect((await update.boundingBox())!.y).toBeLessThan(readySettings!.y)
+    await expectTopbarGeometry(page)
+    await harness.pushUpdate({ errorCode: 'signature_invalid' })
+    await expect(update).toHaveCount(0)
   })
 
   test('disconnection stays direct while the sidebar update remains reachable', async ({ page }) => {
@@ -176,10 +174,15 @@ test.describe('Chat topbar global controls', () => {
       sessionKey: `${TOPBAR_SESSION_KEY}-forced-colors`, locale: 'en', approvalCount: 1,
       update: { status: 'error', errorCode: 'download_failed' },
     })
+    const approval = page.getByTestId('chat-system-approval')
+    await expect(approval).toHaveAttribute('data-state', 'warning')
+    await expectTopbarGeometry(page, { minimumTargetSize: 44 })
     await harness.disconnect()
     const connection = page.getByTestId('connection-status')
-    await expect(connection).toHaveAttribute('data-state', 'danger')
-    await expect(page.getByTestId('chat-system-approval')).toHaveAttribute('data-state', 'warning')
+    // Passive disconnect feedback intentionally stays quiet for five seconds.
+    await expect(connection).toHaveAttribute('data-state', 'danger', { timeout: 10_000 })
+    // Availability loss retires approval data until the next authoritative seed.
+    await expect(approval).toHaveCount(0)
     const stateStyle = await connection.evaluate(element => {
       const style = getComputedStyle(element)
       return { animationName: style.animationName, forcedColorAdjust: style.forcedColorAdjust,

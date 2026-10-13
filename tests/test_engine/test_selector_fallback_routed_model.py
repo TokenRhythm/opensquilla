@@ -2014,6 +2014,13 @@ async def test_agent_invalid_response_fallback_preserves_tools_and_skips_denial(
     assert len(providers[primary_config.model].calls) == 1
     assert providers[unsupported_config.model].calls == []
     assert providers[unknown_config.model].calls == [tools]
+    fallback_activity = [
+        event for event in events
+        if isinstance(event, EngineProviderActivityEvent) and event.phase == "fallback"
+    ]
+    assert [(event.from_model, event.model) for event in fallback_activity] == [
+        ("empty-primary", "tools-unknown"),
+    ]
     assert any(
         getattr(event, "kind", "") == "done"
         and getattr(event, "text", "") == "reply from tools-unknown"
@@ -3105,6 +3112,19 @@ async def test_provider_activity_tracks_three_link_physical_fallback_chain(
         ("fallback", ACTIVITY_TERTIARY_MODEL),
         ("requesting", ACTIVITY_TERTIARY_MODEL),
     ]
+    assert [
+        (event.from_model, event.model)
+        for event in events
+        if isinstance(event, EngineProviderActivityEvent) and event.phase == "fallback"
+    ] == [
+        (ACTIVITY_PRIMARY_MODEL, ACTIVITY_FALLBACK_MODEL),
+        (ACTIVITY_FALLBACK_MODEL, ACTIVITY_TERTIARY_MODEL),
+    ]
+    assert all(
+        not event.from_model
+        for event in events
+        if isinstance(event, EngineProviderActivityEvent) and event.phase != "fallback"
+    )
 
     done = next(event for event in events if isinstance(event, EngineDoneEvent))
     assert done.route_plan is not None

@@ -64,6 +64,7 @@ export function isDesktopRendererDocumentUrl(rawUrl: string): boolean {
 export function routeDesktopRendererRequest(
   rawUrl: string,
   method = 'GET',
+  gatewayControlUiBasePath = '',
 ): DesktopRendererRequestRoute {
   let url: URL
   try {
@@ -79,7 +80,14 @@ export function routeDesktopRendererRequest(
   }
   if (url.pathname.startsWith('/static/img/')) {
     if (upperMethod !== 'GET' && upperMethod !== 'HEAD') return { kind: 'reject' }
-    return { kind: 'gateway', pathAndQuery: `${url.pathname}${url.search}` }
+    // A profile may mount Control UI at root or a custom prefix. Treat that
+    // prefix strictly as a local path, never as a URL or query/fragment input.
+    if (gatewayControlUiBasePath !== '' && (
+      !gatewayControlUiBasePath.startsWith('/')
+      || /[\\?#%\u0000-\u0020]/.test(gatewayControlUiBasePath)
+      || gatewayControlUiBasePath.split('/').slice(1).some(part => !part || part === '.' || part === '..')
+    )) return { kind: 'reject' }
+    return { kind: 'gateway', pathAndQuery: `${gatewayControlUiBasePath}${url.pathname}${url.search}` }
   }
   if (upperMethod !== 'GET' && upperMethod !== 'HEAD') return { kind: 'reject' }
 

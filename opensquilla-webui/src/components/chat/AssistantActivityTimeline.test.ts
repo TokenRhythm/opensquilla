@@ -106,6 +106,64 @@ afterEach(() => {
 })
 
 describe('AssistantActivityTimeline', () => {
+  it.each([
+    ['provider:requesting', 'Waiting for model'],
+    ['Preparing tool call', 'Preparing tool call'],
+  ])('gives %s quiet text feedback without a dot or second timer', async (action, label) => {
+    const executing = shallowRef(true)
+    const visible = shallowRef(true)
+    const history: StatusPart[] = [{ action, label: action, at: 1_000 }]
+    const projection = shallowRef(projectAssistantActivityTimeline([], {
+      lifecycle: 'working', statusHistory: history, endedAt: 3_000,
+    }))
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp({ setup() {
+      provideActivityDisclosureVisibility(visible)
+      return () => h(AssistantActivityTimeline, {
+        projection: projection.value, executing: executing.value,
+        isToolGroupOpen: () => undefined, isToolItemOpen: () => undefined,
+        toolGroupStatusText: () => '', toolStatusText: () => '', toolSecondaryText: () => '',
+      })
+    } })
+    mountedApps.push(app)
+    app.use(i18n)
+    app.use(createPinia())
+    app.mount(root)
+    await nextTick()
+    expect(root.textContent).toContain(label)
+    expect(root.querySelectorAll('.activity-motion--active')).toHaveLength(1)
+    expect(root.querySelector('.assistant-activity-status__dot')).toBeNull()
+    expect(root.querySelector('.assistant-activity-status__duration')).toBeNull()
+
+    visible.value = false
+    await nextTick()
+    expect(root.querySelector('.activity-motion--active')).toBeNull()
+    visible.value = true
+    executing.value = false
+    await nextTick()
+    expect(root.querySelector('.activity-motion--active')).toBeNull()
+
+    // An authoritative tool start takes over the preparing/waiting row.
+    executing.value = true
+    const tool = toolCall('running-write', 'write_file')
+    tool.isRunning = true
+    tool.status = ''
+    projection.value = projectAssistantActivityTimeline([group(tool)], {
+      lifecycle: 'working', statusHistory: history, endedAt: 4_000,
+    })
+    await nextTick()
+    expect(root.querySelector('.assistant-activity-status__row--routine')).toBeNull()
+    expect(root.textContent).not.toContain(label)
+
+    projection.value = projectAssistantActivityTimeline([], {
+      lifecycle: 'interrupted', statusHistory: history, endedAt: 5_000,
+    })
+    await nextTick()
+    expect(root.querySelector('.assistant-activity-status__row')).toBeNull()
+    expect(root.querySelector('.activity-motion--active')).toBeNull()
+  })
+
   it.each(['absent', 'comment', 'fragment'] as const)(
     'omits consecutive %s interrupt slots without breaking visible reading boundaries',
     async kind => {
@@ -301,6 +359,27 @@ describe('AssistantActivityTimeline', () => {
     expect(ruleBody('.assistant-activity-status__dot {')).toContain('margin: 0 0.25rem;')
   })
 
+  it('omits empty rendered narration between tools without changing source items', async () => {
+    const items: ChatStreamTimelineItem[] = [
+      group(toolCall('before-blank', 'read_file')),
+      { type: 'text', key: 'blank', html: '', rawText: '\n\n', activityOrder: 2 },
+      group(toolCall('after-blank', 'execute_code')),
+    ]
+    const root = await mountTimeline(items)
+    expect(root.querySelector('.activity-narration')).toBeNull()
+    expect(root.querySelectorAll('.tool-timeline')).toHaveLength(1)
+    expect([...root.querySelectorAll('.tool-row__label')].map(row => row.textContent))
+      .toEqual(['Read', 'Ran'])
+    expect(items[1]).toMatchObject({ rawText: '\n\n', activityOrder: 2 })
+  })
+
+  it('does not leave an empty activity batch for whitespace-only rendered content', async () => {
+    const root = await mountTimeline([
+      { type: 'text', key: 'blank', html: ' \n ', rawText: '\n' },
+    ], [], 'settled')
+    expect(root.querySelector('.assistant-activity-timeline')).toBeNull()
+  })
+
   it('keeps narration as a semantic grouping boundary', async () => {
     const root = await mountTimeline([
       group(toolCall('write-before', 'write_file')),
@@ -348,7 +427,7 @@ describe('AssistantActivityTimeline', () => {
 
     expect(liveRoot.querySelectorAll('.assistant-activity-status__row')).toHaveLength(1)
     expect(liveRoot.textContent).toContain('Writing the answer')
-    expect(liveRoot.textContent).toContain('3s')
+    expect(liveRoot.querySelector('.assistant-activity-status__duration')).toBeNull()
     expect(liveRoot.textContent).not.toContain('/private/customer')
     expect(liveRoot.textContent).not.toContain('secret')
 
@@ -421,8 +500,8 @@ describe('AssistantActivityTimeline', () => {
     expect(root.textContent).not.toContain('Answer composition')
     expect(root.textContent).not.toContain('Writing the answer')
     expect(root.textContent).not.toContain('Thinking')
-    expect(root.textContent).toContain('Switching to backup model')
-    expect(rows[1]?.textContent).toContain('2/3')
+    expect(root.textContent).toContain('Tried a backup model')
+    expect(rows[1]?.textContent).toContain('Retried the model request')
   })
 
   it('shows prior semantic context but leaves the current action to the live header', async () => {

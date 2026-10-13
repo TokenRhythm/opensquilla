@@ -320,9 +320,8 @@
         <!-- Streaming AI message: activity stays open while the turn is live.
              Gateway-marked intermediate text remains in the transcript, while
              gateway-marked answer text streams below the activity boundary. -->
-        <!-- No blanket aria-live here: the phase label inside ActivityDisclosure
-             is the single live announcement point, so streaming DOM churn (tool
-             rows, answer tokens) is not read out mutation-by-mutation. -->
+        <!-- No blanket aria-live here: ActivityDisclosure announces phase
+             changes separately from its total timer and streaming content. -->
         <div v-if="isStreaming && streamBubble && answerRevealOpen" class="msg-ai" data-history-role="assistant">
           <div class="msg-ai-main">
             <ActivityDisclosure
@@ -333,8 +332,9 @@
               :step-count="executionDockRun?.status === 'running' ? 0 : liveActivityStepCount"
               :failure-count="liveActivityFailureCount"
               :phase-label="liveActivityPhaseLabel"
+              :phase-announcement="liveActivityPhaseAnnouncement"
+              :phase-waiting="liveActivityWaiting"
               :elapsed-label="streamTurnElapsed"
-              :phase-elapsed-label="liveActivityElapsedLabel"
               :stale="streamActivityStale"
             >
               <UnifiedAssistantActivityTimeline
@@ -342,7 +342,8 @@
                 :executing="liveActivityExecuting"
                 v-if="liveHasUnifiedActivityOrder"
                 variant="checklist"
-                :projection="liveActivityProjection"
+                :projection="liveActivityDisplayProjection"
+                :tool-input-previews="toolInputPreviews"
                 :timeline-items="liveActivityTimelineItems"
                 :reasoning-blocks="liveReasoningBlocks"
                 :reasoning-collapse-active="liveReasoningCollapseActive"
@@ -388,7 +389,7 @@
                   || liveActivityProjection.statusSteps.length
                 "
                 variant="checklist"
-                :projection="liveActivityProjection"
+                :projection="liveActivityDisplayProjection"
                 :timeline-items="liveActivityTimelineItems"
                 :state-scope="liveToolStateScope"
                 :is-tool-group-open="isToolGroupOpen"
@@ -413,6 +414,10 @@
                   />
                 </template>
               </AssistantActivityTimeline>
+              <ToolInputPreview v-for="preview in toolInputPreviews" :key="preview.previewId"
+                :preview="preview" :executing="liveActivityExecuting" :state-scope="liveToolStateScope"
+                :open="isToolItemOpen(liveToolStateScope ? `${liveToolStateScope}:${preview.toolUseId}` : preview.toolUseId) === true"
+                @toggle-item="toggleToolItem" />
               </template>
             </ActivityDisclosure>
 
@@ -843,6 +848,7 @@ import {
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import UnifiedAssistantActivityTimeline from '@/components/chat/UnifiedAssistantActivityTimeline.vue'
+import ToolInputPreview from '@/components/chat/ToolInputPreview.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
@@ -1132,8 +1138,7 @@ import {
 import { copyTextWithFallback, copyImageToClipboard, downloadBlob, shareCopyImageSupported } from '@/utils/browser'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
-import { sessionApplicationLink, sessionDesktopLink } from '@/types/references'
-import { currentSessionGatewayLink } from '@/utils/chat/sessionLinks'
+import { currentSessionLink } from '@/utils/chat/sessionLinks'
 import {
   toolCallGroups,
   toolGroupStatusText,
@@ -1183,7 +1188,7 @@ import {
   canMergeAssistantActivityOrder,
   isSemanticActivityStatusStep,
   projectAssistantActivityTimeline,
-  providerActivityRemainingSeconds,
+  providerActivityLabel,
   splitLiveAssistantTimeline,
 } from '@/utils/chat/assistantActivity'
 
@@ -1929,6 +1934,7 @@ const {
   migrateToolDisclosureScope,
   cleanup: cleanupStream,
   foldedTurn,
+  toolInputPreviews,
   appendInterruptFrame,
   ensureInterruptBubble,
 } = chatStream
@@ -2158,6 +2164,7 @@ watch(compactStatus, (status) => {
     compactionId,
     source: status.source || 'manual',
     state: transcriptCompactionState(status.status),
+    providerRecovery: status.providerRecovery, httpStatus: status.httpStatus, failureKind: status.failureKind,
     durability: status.durability || '',
     ...(status.detail ? { detail: status.detail } : {}),
     ...(status.reason ? { reason: status.reason } : {}),
@@ -4125,8 +4132,8 @@ bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask
 restoreLiveTurnSnapshot = rpcEventHandlers.restoreLiveTurnSnapshot
 const { attachTurnReasoning } = rpcEventHandlers
 
-// The append-only turn log is the single live content projection. The activity
-// head (phase/elapsed) remains presentation state outside the transcript fold.
+// The append-only turn log is the single live content projection. Only the
+// total clock and accessible phase announcement live outside the transcript.
 const liveTimelineItems = computed(() => stripBackgroundProcessNoticeTimeline(
   foldedTurn.value.timelineItems,
   foldedTurn.value.toolCalls,
@@ -4164,23 +4171,24 @@ const liveActivityProjection = computed(() =>
 const liveCurrentActivityTool = computed(() => liveActivityProjection.value.activityClusters.find(
   cluster => cluster.key === liveActivityProjection.value.currentClusterKey,
 ))
-const liveActivityPhaseLabel = computed(() => {
+const liveActivityDisplayProjection = computed(() => toolInputPreviews.value.length ? {
+  ...liveActivityProjection.value,
+  statusSteps: liveActivityProjection.value.statusSteps.filter(step =>
+    !(step.isCurrent && step.label.code === 'chat.activity.lifecycle.preparingToolCall')),
+} : liveActivityProjection.value)
+const liveCurrentActivityPhase = computed(() => [...liveActivityProjection.value.statusSteps].reverse().find(step => step.isCurrent))
+const liveActivityWaiting = computed(() => !['queued', 'approval_pending'].includes(runStatus.value.status) && !liveCurrentActivityTool.value && liveCurrentActivityPhase.value?.providerRecovery?.phase === 'retry_wait')
+function currentActivityLabel(announce = false): string {
   if (runStatus.value.status === 'queued') return String(t('chat.status.queued'))
   if (runStatus.value.status === 'approval_pending') return String(t('chat.status.approvalPending'))
-  const currentPhase = [...liveActivityProjection.value.statusSteps].reverse()
-    .find(step => step.isCurrent)
-  const label = liveCurrentActivityTool.value?.purpose || currentPhase?.label
-  if (!liveCurrentActivityTool.value && currentPhase) {
-    const seconds = providerActivityRemainingSeconds(currentPhase)
-    if (seconds !== null) return String(t(currentPhase.label.code, { ...currentPhase.label.params, seconds }))
-  }
-  return label ? String(t(label.code, label.params)) : String(t('chat.activity.lifecycle.working'))
-})
-const liveActivityElapsedLabel = computed(() => {
-  if (streamActivityStale.value || ['queued', 'approval_pending'].includes(runStatus.value.status)) return ''
-  const runningCall = liveCurrentActivityTool.value?.calls.find(call => call.isRunning)
-  return runningCall ? liveToolElapsedText(runningCall) : streamPhaseElapsed.value
-})
+  const phase = liveCurrentActivityPhase.value
+  const label = liveCurrentActivityTool.value?.purpose || (phase && providerActivityLabel(phase, Date.now(), announce))
+  const text = label ? String(t(label.code, label.params)) : String(t('chat.activity.lifecycle.working'))
+  return !liveCurrentActivityTool.value && phase?.category === 'maintenance' && phase.providerRecovery
+    ? `${t(phase.label.code, phase.label.params)} · ${text}` : text
+}
+const liveActivityPhaseLabel = computed(() => { void streamPhaseElapsed.value; return currentActivityLabel() })
+const liveActivityPhaseAnnouncement = computed(() => liveActivityWaiting.value ? currentActivityLabel(true) : '')
 const liveCurrentPhaseCode = computed(() => [...liveActivityProjection.value.statusSteps]
   .reverse()
   .find(step => step.isCurrent && step.category !== 'maintenance')
@@ -4217,10 +4225,7 @@ const liveHasUnifiedActivityOrder = computed(() => canMergeAssistantActivityOrde
   liveReasoningBlocks.value,
   liveActivityTimelineItems.value,
 ))
-// No clamp and no raw status count: the header chip must agree with the
-// visible body, which renders clusters plus only the semantic status steps.
-// A text-only turn therefore counts 0 and the disclosure's stepCount > 0
-// gate hides the chip instead of claiming "step 1" over an empty body.
+// Keep the fallback count semantic for records without an elapsed duration.
 const liveActivityStepCount = computed(() =>
   liveActivityProjection.value.activityClusters.length
     + liveActivityProjection.value.statusSteps.filter(isSemanticActivityStatusStep).length
@@ -5244,7 +5249,7 @@ const attachmentWorkbenchResources = computed<ReadonlyMap<string, WorkbenchResou
 const deliverablesOpen = ref(false)
 
 function focusHeaderAction(
-  action: 'deliverables' | 'share' | 'copy-session-key' | 'copy-session-link' | 'copy-gateway-link',
+  action: 'deliverables' | 'share' | 'copy-session-link',
 ) {
   void nextTick(() => chatRouteHeaderRegistration.focusAction(action))
 }
@@ -5813,42 +5818,24 @@ const {
   copyState: sessionCopyState,
   copyIconName: sessionCopyIcon,
   copyLiveText: sessionCopyLiveText,
-  onCopyClick: onSessionCopyClick,
+  onCopyClick: copySessionLink,
 } = useCopyFeedback(async () => {
-  if (!sessionKey.value) return false
+  const key = sessionKey.value
+  const epoch = gatewayAccess.subscriptionEpoch
+  const isCurrent = () => !chatViewDisposed
+    && sessionKey.value === key
+    && gatewayAccess.subscriptionEpoch === epoch
+  if (!key || !isCurrent()) return false
   try {
-    await copyTextWithFallback(sessionKey.value)
-    return true
+    const link = await currentSessionLink(key, platform)
+    if (!isCurrent()) return false
+    await copyTextWithFallback(link)
+    return isCurrent()
   } catch {
-    pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
+    if (isCurrent()) pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
     return false
   }
 })
-
-async function copySessionReference(value: string) {
-  if (!sessionKey.value) return
-  try {
-    await copyTextWithFallback(value)
-    pushToast(t('chat.copied'), { tone: 'ok' })
-  } catch {
-    pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
-  }
-}
-const copySessionLink = () => copySessionReference(
-  platform.capabilities.isDesktop
-    ? sessionDesktopLink(sessionKey.value)
-    : sessionApplicationLink(sessionKey.value),
-)
-async function copyGatewayLink() {
-  const key = sessionKey.value
-  if (!key) return
-  try {
-    const link = await currentSessionGatewayLink(key, platform)
-    if (sessionKey.value === key) await copySessionReference(link)
-  } catch {
-    pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
-  }
-}
 
 // App owns the header component. This view registers one stable set of refs and
 // commands; draft materialization only changes those refs and never rebuilds
@@ -5873,9 +5860,7 @@ const chatRouteHeaderRegistration = chatRouteHeader.register({
 }, {
   openDeliverables,
   startShare: startShareMode,
-  copySessionKey: onSessionCopyClick,
   copySessionLink,
-  copyGatewayLink,
   restoreComposerFocus: () => composerRef.value?.focusTextarea(),
 })
 

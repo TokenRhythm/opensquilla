@@ -313,8 +313,10 @@ describe('RunTrace tool detail defaults', () => {
     expect(el.querySelector('.tool-row--group')).toBeNull()
     expect(el.querySelectorAll('.tool-row')).toHaveLength(4)
     for (const row of el.querySelectorAll('.tool-row')) expect(row.getAttribute('aria-expanded')).toBe(expected)
-    expect(el.querySelector('.tool-row--error')?.textContent).toContain(i18n.global.t('shared.runTrace.activityNotCompleted'))
-    expect(el.textContent).toContain('Network unavailable')
+    expect(el.querySelector('.tool-row--error')?.textContent).not.toContain(i18n.global.t('shared.runTrace.activityNotCompleted'))
+    expect(el.querySelector('.tool-row--error .tool-row__status-dot')?.getAttribute('aria-label'))
+      .toContain(i18n.global.t('shared.runTrace.activityNotCompleted'))
+    expect(el.textContent?.includes('Network unavailable')).toBe(mode === 'expanded')
   })
 
   it.each([true, false])('retains manual %s through a complete mode round trip while untouched rows follow defaults', async choice => {
@@ -347,7 +349,9 @@ describe('RunTrace tool detail defaults', () => {
     await nextTick()
     expect(toolRow(el, 'command.run')?.getAttribute('aria-expanded')).toBe('false')
     expect(toolRow(el, 'file.inspect')?.getAttribute('aria-expanded')).toBe('true')
-    expect(el.querySelector('.tool-row__error-summary')?.textContent).toBe('Validation failed')
+    expect(el.querySelector('.tool-row__error-summary')).toBeNull()
+    expect(el.textContent).not.toContain('Validation failed')
+    expect(toolRow(el, 'command.run')?.querySelector('.tool-row__status-dot')).not.toBeNull()
   })
 
   it('retains choices through remounts with a different render key for the same tool', async () => {

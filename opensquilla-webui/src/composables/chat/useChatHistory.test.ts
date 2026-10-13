@@ -3592,7 +3592,7 @@ describe('useChatHistory optimistic local rows', () => {
 
     expect(messages.value).toHaveLength(1)
     expect(messages.value[0]).toMatchObject({
-      role: 'error', text: 'The task did not finish. Please try again later.',
+      role: 'error', text: 'This request did not finish.',
       turnId, errorCode: 'future_internal_failure', terminalNotice: true,
     })
   })
@@ -3660,7 +3660,7 @@ describe('useChatHistory optimistic local rows', () => {
 
     expect(messages.value).toHaveLength(5)
     expect(messages.value[0]).toMatchObject({
-      role: 'error', terminalNotice: true, text: 'The task did not finish. Please try again later.',
+      role: 'error', terminalNotice: true, text: 'This request did not finish.',
     })
     expect(messages.value.slice(1).map(message => [message.role, message.text])).toEqual([
       ['system', unrelatedText],
@@ -3976,7 +3976,7 @@ describe('useChatHistory optimistic local rows', () => {
         ['assistant', 'Initial summary.'],
         ['user', 'Include the risks'],
         ['assistant', 'Risk analysis in progress.'],
-        ['error', 'The model service is busy. Please try again later.'],
+        ['error', 'The model is temporarily rate limited; this request did not finish.'],
       ])
       const notice = messages.value.filter(message => message.role === 'error')
       expect(notice).toHaveLength(1)
@@ -4146,7 +4146,7 @@ describe('useChatHistory optimistic local rows', () => {
 
     expect(messages.value.map(message => [message.role, message.text])).toEqual([
       ['user', 'retry this turn'],
-      ['error', 'The task did not finish. Please try again later.'],
+      ['error', 'This request did not finish.'],
     ])
     expect(messages.value[1]).toMatchObject({
       errorCode: 'failed',

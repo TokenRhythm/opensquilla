@@ -71,7 +71,16 @@ const description = computed(() => {
 const showDownload = computed(() => state.value.canCheck && state.value.installMode !== 'unsupported' && (
   status.value === 'available' || (manualInstall.value && status.value === 'downloaded')
 ))
-const showRelaunch = computed(() => canInstall.value && status.value === 'downloaded')
+const releaseNotesUrl = computed(() => {
+  const value = state.value.releaseNotesUrl
+  if (!value || !state.value.latestVersion) return null
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' && !url.username && !url.password ? url.href : null
+  } catch { return null }
+})
+const showRelaunch = computed(() => (canInstall.value && status.value === 'downloaded')
+  || (state.value.installMode !== 'unsupported' && status.value === 'applying'))
 const showLater = computed(() => state.value.canCheck && (status.value === 'available' || status.value === 'downloaded' || status.value === 'error'))
 </script>
 
@@ -115,13 +124,39 @@ const showLater = computed(() => state.value.canCheck && (status.value === 'avai
 
     <div class="control-row__control settings-update__actions">
       <button
+        v-if="showRelaunch"
         type="button"
-        class="btn btn--ghost"
+        class="btn btn--primary"
+        data-testid="settings-update-relaunch"
+        :disabled="busy"
+        :aria-busy="status === 'applying' || undefined"
+        @click="update.relaunch"
+      >
+        <Icon name="refresh" :size="15" aria-hidden="true" />
+        <span>{{ t(status === 'applying'
+          ? manualInstall ? 'updates.desktop.manualApplyingStatus' : 'updates.desktop.applyingStatus'
+          : manualInstall ? 'updates.desktop.quitAndInstall' : 'updates.desktop.relaunch') }}</span>
+      </button>
+      <button
+        v-if="status === 'error'"
+        type="button"
+        class="btn btn--primary"
+        data-testid="settings-update-check"
         :disabled="busy || !state.canCheck"
         @click="update.check"
       >
         <Icon name="refresh" :size="15" aria-hidden="true" />
-        <span>{{ t('updates.desktop.check') }}</span>
+        <span>{{ t('updates.desktop.retry') }}</span>
+      </button>
+      <button
+        v-if="showLater"
+        data-testid="settings-update-later"
+        type="button"
+        class="btn btn--ghost"
+        :disabled="busy || update.snoozed.value"
+        @click="update.dismiss"
+      >
+        {{ t(update.snoozed.value ? 'updates.desktop.reminderSnoozed' : 'updates.desktop.later') }}
       </button>
       <button
         v-if="showDownload"
@@ -142,26 +177,28 @@ const showLater = computed(() => state.value.canCheck && (status.value === 'avai
         }}</span>
       </button>
       <button
-        v-if="showRelaunch"
-        type="button"
-        class="btn btn--primary"
-        data-testid="settings-update-relaunch"
-        :disabled="busy"
-        @click="update.relaunch"
-      >
-        <Icon name="refresh" :size="15" aria-hidden="true" />
-        <span>{{ t(manualInstall ? 'updates.desktop.quitAndInstall' : 'updates.desktop.relaunch') }}</span>
-      </button>
-      <button
-        v-if="showLater"
+        v-if="status !== 'error'"
         type="button"
         class="btn btn--ghost"
-        :disabled="busy"
-        @click="update.dismiss"
+        data-testid="settings-update-check"
+        :disabled="busy || !state.canCheck"
+        @click="update.check"
       >
-        {{ t('updates.desktop.later') }}
+        <Icon name="refresh" :size="15" aria-hidden="true" />
+        <span>{{ t('updates.desktop.check') }}</span>
       </button>
     </div>
+    <a
+      v-if="releaseNotesUrl"
+      :href="releaseNotesUrl"
+      target="_blank"
+      rel="noopener noreferrer"
+      class="settings-update__release-notes"
+      data-testid="settings-update-release-notes"
+    >
+      {{ t('updates.desktop.viewReleaseNotes') }}
+      <Icon name="externalLink" :size="14" aria-hidden="true" />
+    </a>
   </div>
 </template>
 
@@ -194,6 +231,13 @@ const showLater = computed(() => state.value.canCheck && (status.value === 'avai
   color: var(--text-dim);
   font-weight: 600;
   margin-right: 4px;
+}
+
+.settings-update__release-notes {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
 }
 
 .settings-update__actions {

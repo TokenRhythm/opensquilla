@@ -23,7 +23,12 @@ from .error_redaction import (
     redact_upstream_error_text,
     redacted_httpx_error,
 )
-from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
+from .failures import (
+    CONNECTION_FAILED_CODE,
+    is_connection_failure,
+    retry_after_from_headers,
+    safe_http_status,
+)
 from .protocol import ProviderModelListingResponseError
 from .request_proof import (
     ProviderRequestBudgetExceededError,
@@ -423,6 +428,7 @@ class OllamaProvider:
                         yield ErrorEvent(
                             message=message,
                             code=str(response.status_code),
+                            http_status=safe_http_status(response.status_code),
                             retry_after_s=retry_after_from_headers(
                                 response.status_code, getattr(response, "headers", None)
                             ),

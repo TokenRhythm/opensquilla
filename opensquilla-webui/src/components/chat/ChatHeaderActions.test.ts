@@ -6,7 +6,7 @@ import { createI18n } from 'vue-i18n'
 import ChatHeaderActions from './ChatHeaderActions.vue'
 
 type LayoutName = 'wide' | 'compact' | 'tight'
-type Action = 'deliverables' | 'share' | 'copy-session-key' | 'copy-session-link' | 'copy-gateway-link'
+type Action = 'deliverables' | 'share' | 'copy-session-link'
 
 type HeaderInstance = ComponentPublicInstance & {
   focusAction: (action: Action) => boolean
@@ -26,9 +26,7 @@ const BASE_PROPS = {
 const messages = {
   chat: {
     copied: 'Copied',
-    copySessionKey: 'Copy session ID',
-    copySessionAppLink: 'Copy application link',
-    copySessionGatewayLink: 'Copy Gateway web link',
+    copySessionLink: 'Copy session link',
     deliverables: 'Deliverables',
     deliverablesCount: 'Deliverables ({count})',
     sessionActions: 'Session actions',
@@ -127,9 +125,7 @@ async function mountHeader(
   const handlers = {
     deliverables: vi.fn(),
     share: vi.fn(),
-    copy: vi.fn(),
     copyLink: vi.fn(),
-    copyGatewayLink: vi.fn(),
   }
   const el = document.createElement('div')
   document.body.appendChild(el)
@@ -138,9 +134,7 @@ async function mountHeader(
     ...overrides,
     onOpenDeliverables: handlers.deliverables,
     onStartShare: handlers.share,
-    onCopySessionKey: handlers.copy,
     onCopySessionLink: handlers.copyLink,
-    onCopyGatewayLink: handlers.copyGatewayLink,
   })
   app.use(createI18n({
     legacy: false,
@@ -170,7 +164,7 @@ function renderedActions(el: HTMLElement): string[] {
   }
   for (const node of el.querySelectorAll<HTMLElement>('[data-testid^="chat-session-action-"]')) {
     const action = node.dataset.testid!.replace('chat-session-action-', '')
-    actions.push(action === 'copy' ? 'copy-session-key' : action === 'copy-app-link' ? 'copy-session-link' : action)
+    actions.push(action === 'copy' ? 'copy-session-link' : action)
   }
   return actions
 }
@@ -182,9 +176,7 @@ function expectedActions({
   const actions: Action[] = []
   if (deliverableCount > 0) actions.push('deliverables')
   if (!shareMode) actions.push('share')
-  actions.push('copy-session-key')
   actions.push('copy-session-link')
-  actions.push('copy-gateway-link')
   return actions
 }
 
@@ -279,7 +271,11 @@ describe('ChatHeaderActions', () => {
     expect(trigger(el).getAttribute('aria-haspopup')).toBe('menu')
     await openMenu(el)
     expect(Array.from(el.querySelectorAll('[role="menuitem"]')).map(item => item.textContent?.trim()))
-      .toEqual(['Share', 'Copy application link', 'Copy Gateway web link', 'Copy session ID'])
+      .toEqual(['Share', 'Copy session link'])
+    expect(el.querySelectorAll('[data-testid="chat-session-action-copy"]')).toHaveLength(1)
+    expect(el.querySelector('[data-testid="chat-session-action-copy-app-link"]')).toBeNull()
+    expect(el.querySelector('[data-testid="chat-session-action-copy-gateway-link"]')).toBeNull()
+    expect(el.textContent).not.toContain('Copy session ID')
     expect(identity.nextElementSibling).toBe(spacer)
     expect(spacer.nextElementSibling?.classList.contains('chat-header__actions')).toBe(true)
   })
@@ -576,7 +572,7 @@ describe('ChatHeaderActions', () => {
     await flush()
 
     const items = Array.from(el.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
-    expect(items).toHaveLength(layout === 'tight' ? 5 : 4)
+    expect(items).toHaveLength(layout === 'tight' ? 3 : 2)
     expect(el.querySelector('[data-chat-topbar-popover="session-actions"]')).toBeTruthy()
     expect(document.activeElement).toBe(items[0])
 
@@ -633,9 +629,7 @@ describe('ChatHeaderActions', () => {
 
     for (const [testId, handler] of [
       ['chat-session-action-share', handlers.share],
-      ['chat-session-action-copy', handlers.copy],
-      ['chat-session-action-copy-app-link', handlers.copyLink],
-      ['chat-session-action-copy-gateway-link', handlers.copyGatewayLink],
+      ['chat-session-action-copy', handlers.copyLink],
     ] as const) {
       await openMenu(el)
       el.querySelector<HTMLButtonElement>(`[data-testid="${testId}"]`)!.click()
@@ -647,14 +641,12 @@ describe('ChatHeaderActions', () => {
 
     expect(handlers.deliverables).toHaveBeenCalledTimes(1)
     expect(handlers.share).toHaveBeenCalledTimes(1)
-    expect(handlers.copy).toHaveBeenCalledTimes(1)
     expect(handlers.copyLink).toHaveBeenCalledTimes(1)
-    expect(handlers.copyGatewayLink).toHaveBeenCalledTimes(1)
   })
 
-  it.each(LAYOUT_CASES)('keeps share and all copy actions reachable from the stable $layout menu trigger', async ({ width }) => {
+  it.each(LAYOUT_CASES)('keeps share and the single copy link action reachable from the stable $layout menu trigger', async ({ width }) => {
     const { el, instance } = await mountHeader(width)
-    for (const action of ['share', 'copy-session-key', 'copy-session-link', 'copy-gateway-link'] as const) {
+    for (const action of ['share', 'copy-session-link'] as const) {
       expect(instance.focusAction(action)).toBe(true)
       expect(document.activeElement).toBe(trigger(el))
     }

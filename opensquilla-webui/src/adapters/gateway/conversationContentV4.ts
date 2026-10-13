@@ -9,8 +9,12 @@ import { usageAccountingErrorCode } from '@/utils/chat/usageAccountingFailure'
 import type { DecodedConversationEvent } from './conversationEventsV4'
 import { ConversationEventContractError, conversationSemanticEventKind, decodeConversationEvent } from './conversationEventsV4'
 
+import { normalizeProviderRecovery, providerHttpStatus } from '@/utils/chat/providerRecovery'
+import { providerFailureKind } from '@/utils/chat/providerFailure'
+import { boundedToolInputPreviewContent } from '@/utils/chat/toolInputPreview'
+
 const STRING_FIELDS = `reason status run_status terminal_message terminal_reason message code group_id
-  to_state error_class text reasoning_content model activity_id phase parent_session_key child_session_key
+  to_state error_class text reasoning_content model from_model activity_id phase parent_session_key child_session_key
   message_id session_id client_message_id user_message_id surface_id approval_id name input_delta model_call_id
   block_id content_kind target_turn_id client_request_id promoted_from_turn_id promoted_turn_id failure_code error_code
   recovery tier routed_tier routed_model baseline_model decision_id rollout_phase accepted_routing_mode
@@ -196,6 +200,17 @@ export function projectConversationRoutingSnapshot(value: unknown): Conversation
 export function projectConversationContent(payload: unknown, kind?: ConversationSemanticEventKind): ConversationEventData {
   const source = object(payload)
   const result: Record<string, unknown> = {}
+  const httpStatus = providerHttpStatus(source.http_status)
+  if (httpStatus !== undefined) result.httpStatus = httpStatus
+  if (kind === 'compaction-progress') {
+    const recovery = normalizeProviderRecovery(source.recovery)
+    if (recovery) result.compactionRecovery = recovery
+    const failure = object(source.failure_detail)
+    if (Object.keys(failure).length) result.compactionFailure = {
+      failureKind: providerFailureKind(failure.failure_kind),
+      httpStatus: providerHttpStatus(failure.http_status),
+    }
+  }
   if (kind === 'skill-load') {
     const receipt = skillLoadReceipt(source.content)
     if (receipt) result.skillLoad = receipt
@@ -450,6 +465,29 @@ function projectKnownConversationContent(
       ...(phase && phases.includes(phase) ? { phase } : {}),
       ...(reason && reasons.includes(reason) ? { reason } : {}),
     } }
+  }
+  if (semanticKind === 'tool-input-preview') {
+    const raw = object(rawPayload)
+    const payload = projectConversationContent(rawPayload, semanticKind)
+    const id = (value: unknown) => typeof value === 'string' && value.length > 0 && value.length <= 512
+    if (id(raw.preview_id) && id(raw.attempt_id) && id(raw.tool_use_id)
+      && raw.tool_name === 'write_file'
+      && ['generating', 'committed', 'discarded'].includes(String(raw.state))
+      && Number.isSafeInteger(raw.revision) && Number(raw.revision) > 0
+      && Number.isSafeInteger(raw.generation_epoch) && Number(raw.generation_epoch) >= 0
+      && typeof raw.path === 'string' && raw.path.length <= 4096
+      && typeof raw.content === 'string' && typeof raw.truncated === 'boolean') {
+      const bounded = boundedToolInputPreviewContent(raw.content)
+      payload.toolInputPreview = {
+        previewId: String(raw.preview_id), attemptId: String(raw.attempt_id), toolUseId: String(raw.tool_use_id),
+        generationEpoch: Number(raw.generation_epoch), revision: Number(raw.revision),
+        state: raw.state as 'generating' | 'committed' | 'discarded', toolName: 'write_file',
+        path: raw.path, content: bounded.content, truncated: raw.truncated || bounded.truncated,
+      }
+    }
+    // Draft text is accepted only in the bounded typed projection above.
+    delete payload.content
+    return { kind: 'known', semanticKind, payload }
   }
   if (semanticKind === 'ensemble-progress') {
     const { error, ...data } = projectConversationContent(rawPayload, semanticKind)

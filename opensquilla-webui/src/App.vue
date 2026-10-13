@@ -110,6 +110,7 @@
 
     <!-- Fixed footer: settings and the desktop update entry -->
     <div class="sidebar-foot">
+      <SidebarDesktopUpdate @open="openDesktopUpdateSettings" />
       <button
         type="button"
         class="sidebar-fn-item"
@@ -119,7 +120,6 @@
         <Icon name="settings-2" :size="17" />
         <span class="sidebar-fn-label">{{ t('chrome.settings') }}</span>
       </button>
-      <SidebarDesktopUpdate @open="openDesktopUpdateSettings" />
     </div>
   </nav>
 
@@ -223,9 +223,7 @@
           :shareable-message-count="chatRouteHeaderShareableMessageCount"
           @open-deliverables="chatRouteHeader.invoke('openDeliverables')"
           @start-share="chatRouteHeader.invoke('startShare')"
-          @copy-session-key="chatRouteHeader.invoke('copySessionKey')"
           @copy-session-link="chatRouteHeader.invoke('copySessionLink')"
-          @copy-gateway-link="chatRouteHeader.invoke('copyGatewayLink')"
         />
       </div>
       <div class="topbar-right">
@@ -1972,7 +1970,8 @@ onUnmounted(() => {
 
 .sidebar-foot {
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: stretch;
   gap: var(--sp-1);
 }
 

@@ -496,6 +496,12 @@ const saveAllPending = ref(false)
 const providerSavePending = ref(false)
 const primaryMutationPending = ref(false)
 const modelStrategyRoutingBusy = ref(false)
+// Immediate mode writes reuse the forms, but their optimistic changes are not
+// manual drafts. Keep the existing draft indicators stable until they settle.
+const routingModeDraftIndicators = ref<{
+  sectionDirty: boolean
+  formDirty: boolean
+} | null>(null)
 const routerResetPending = ref(false)
 // The reactive flag drives UI feedback; this synchronous guard closes the
 // same-microtask double-click window before the first save RPC can yield.
@@ -1877,7 +1883,7 @@ const routingSummary = computed(() => ({
   hasForeignTierProviders: Object.entries(config.value.squilla_router?.tiers || {}).some(([name, tier]) => (
     name !== 'image' && Boolean(tier.provider) && normalizeProviderId(tier.provider) !== normalizeProviderId(currentProvider.value)
   )),
-  hasUnsavedChanges: modelStrategyForm.isDirty.value,
+  hasUnsavedChanges: routingModeDraftIndicators.value?.formDirty ?? modelStrategyForm.isDirty.value,
   resetPending: routerResetPending.value,
   resetDisabledReason: !hasSavedProvider.value ? t('setup.router.chooseProviderFirst')
     : !resetRecommendedSupported.value ? t('setup.modelStrategy.resetUpgradeHint')
@@ -2380,7 +2386,7 @@ function sectionDirty(sectionId: string): boolean {
   if (sectionId === 'general') return behaviorDirty.value
   if (sectionId === 'securityPrivacy') return securityPrivacyDirty.value
   if (sectionId === 'advanced') return memorySettingsDirty.value
-  if (sectionId === 'modelStrategy') return modelStrategyDirty.value
+  if (sectionId === 'modelStrategy') return routingModeDraftIndicators.value?.sectionDirty ?? modelStrategyDirty.value
   if (sectionId === 'capabilities') return capabilitiesDirty.value
   return false
 }
@@ -3398,6 +3404,10 @@ async function setModelStrategy(strategy: ModelStrategy) {
     ensembleForm.restoreRoutingModeState(ensembleRoutingState)
     routerForm.restoreRoutingModeState(routerRoutingState)
   }
+  routingModeDraftIndicators.value = {
+    sectionDirty: modelStrategyDirty.value,
+    formDirty: modelStrategyForm.isDirty.value,
+  }
   modelStrategyRoutingBusy.value = true
   let acknowledged = false
   try {
@@ -3452,6 +3462,7 @@ async function setModelStrategy(strategy: ModelStrategy) {
       pushToast(t('setup.modelStrategy.resultUncertain'), { tone: 'danger' })
     } else pushToast(saveFailedMessage(err), { tone: 'danger' })
   } finally {
+    routingModeDraftIndicators.value = null
     modelStrategyRoutingBusy.value = false
   }
 }

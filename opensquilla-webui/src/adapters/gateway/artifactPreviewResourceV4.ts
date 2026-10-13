@@ -52,6 +52,13 @@ interface ArtifactPreviewResourceAdapterOptions extends ArtifactPreviewResourceO
   baseOrigin?: () => string
 }
 
+interface MarkdownImageWork {
+  sources: string[]
+  baseOrigin: string
+  nextIndex: number
+  received: number
+}
+
 const INLINE_WORKBENCH_ATTACHMENT_URL_PATTERN =
   /^data:([a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*(?:;charset=[^;,]+)?);base64,([a-z0-9+/=]*)$/i
 
@@ -322,6 +329,7 @@ export function createArtifactPreviewResource(
   let nativePayloadDelivered = false
   let objectUrlOwned = false
   const markdownImageUrls = new Set<string>()
+  let markdownImageWork: MarkdownImageWork | null = null
 
   function revokeCurrentObjectUrl() {
     if (!objectUrl.value) return
@@ -333,6 +341,7 @@ export function createArtifactPreviewResource(
   }
 
   function clearOutput() {
+    markdownImageWork = null
     revokeCurrentObjectUrl()
     for (const url of markdownImageUrls) {
       try { revokeObjectUrl(url) } catch {}
@@ -358,13 +367,16 @@ export function createArtifactPreviewResource(
     return { html: template.innerHTML, sources: [...sources].slice(0, MARKDOWN_IMAGE_COUNT_LIMIT) }
   }
 
-  async function prepareMarkdownImages(sources: string[], baseOrigin: string, signal: AbortSignal): Promise<void> {
-    let received = 0
-    for (const source of sources) {
+  async function prepareMarkdownImages(work: MarkdownImageWork, signal: AbortSignal): Promise<void> {
+    const { sources, baseOrigin } = work
+    // Advance only after a source settles. Suspending leaves the interrupted
+    // source pending, while completed images and the document budget survive.
+    for (; work.nextIndex < sources.length; work.nextIndex += 1) {
+      const source = sources[work.nextIndex]!
       if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
-      if (received < MARKDOWN_IMAGES_TOTAL_BYTE_LIMIT) {
+      if (work.received < MARKDOWN_IMAGES_TOTAL_BYTE_LIMIT) {
         try {
-          const remaining = Math.min(MARKDOWN_IMAGE_BYTE_LIMIT, MARKDOWN_IMAGES_TOTAL_BYTE_LIMIT - received)
+          const remaining = Math.min(MARKDOWN_IMAGE_BYTE_LIMIT, MARKDOWN_IMAGES_TOTAL_BYTE_LIMIT - work.received)
           let response: ArtifactPreviewResourceBinaryResponse | null = null
           let candidate: ArtifactPayload | null = null
           if (/^data:image\//i.test(source)) {
@@ -374,7 +386,8 @@ export function createArtifactPreviewResource(
             // The resolver rejects absolute/network paths and uses one bounded
             // current-session catalog page. Never walk the user's filesystem.
             candidate ??= await options.resolveMarkdownImage?.(source, signal) || null
-            if (!candidate || signal.aborted) continue
+            if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
+            if (!candidate) continue
             const request = bindArtifactBinaryRequest(http, candidate, { baseOrigin, policy: 'trusted-origin' })
             if (!request) continue
             response = await request.execute({ sessionKey: options.sessionKey?.() || '', signal, timeoutMs: 15_000 })
@@ -384,9 +397,16 @@ export function createArtifactPreviewResource(
           const mime = responseMime === 'application/octet-stream' || !responseMime
             ? GENERIC_IMAGE_MIME_BY_EXTENSION[artifactExtension(String(candidate?.name || ''))] || ''
             : responseMime
-          if (!IMAGE_MIMES.has(mime)) { await cancelResponseBody(response); continue }
-          const alreadyReceived = received
-          const bytes = await readResponseBytes(response, remaining, signal, () => undefined, count => { received = alreadyReceived + count })
+          if (!IMAGE_MIMES.has(mime)) {
+            await cancelResponseBody(response)
+            // Cleanup may settle after a resumed worker owns this same cursor.
+            if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
+            continue
+          }
+          const alreadyReceived = work.received
+          const bytes = await readResponseBytes(response, remaining, signal, () => undefined, count => {
+            if (!signal.aborted) work.received = alreadyReceived + count
+          })
           if (signal.aborted) break
           // Even SVG stays in the inert image context; never inline SVG markup.
           const url = createObjectUrl(new Blob([bytesToArrayBuffer(bytes)], { type: mime }))
@@ -400,6 +420,7 @@ export function createArtifactPreviewResource(
         }
       }
     }
+    if (!signal.aborted && markdownImageWork === work) markdownImageWork = null
   }
 
   function abortActive() {
@@ -566,7 +587,8 @@ export function createArtifactPreviewResource(
         markdownHtml.value = document.html
         state.value = 'ready'
         progress.value = 100
-        await prepareMarkdownImages(document.sources, baseOrigin, controller.signal)
+        markdownImageWork = { sources: document.sources, baseOrigin, nextIndex: 0, received: 0 }
+        await prepareMarkdownImages(markdownImageWork, controller.signal)
         if (disposed || suspended || run !== generation) return
       } else if (nextKind === 'text') {
         text.value = new TextDecoder().decode(bytes)
@@ -648,6 +670,17 @@ export function createArtifactPreviewResource(
         || stateBeforeSuspend === 'ready-with-warnings'
         ? stateBeforeSuspend
         : 'ready'
+      if (markdownImageWork) {
+        const controller = new AbortController()
+        activeController = controller
+        // Optional images must not delay the owner's revision check on return
+        // from Source. A changed document can immediately abort this work.
+        void prepareMarkdownImages(markdownImageWork, controller.signal).catch(() => {
+          // Cancellation preserves the cursor; per-image failures stay local.
+        }).finally(() => {
+          if (activeController === controller) activeController = null
+        })
+      }
       return
     }
     await load()

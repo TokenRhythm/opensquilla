@@ -197,9 +197,7 @@ describe('RunTrace activity presentation', () => {
     expect(
       ruleBody('.tool-timeline--activity .tool-row--error .tool-row__status'),
     ).toContain('color: var(--warn);')
-    expect(
-      ruleBody('.tool-timeline--activity .tool-row__activity-icon--error'),
-    ).toContain('color: var(--warn);')
+    expect(runTraceSource).not.toContain('tool-row__activity-icon--error')
 
     expect(ruleBody('.tool-timeline--activity .tool-row--running .tool-row__arg')).toContain(
       'color: var(--text-muted);',
@@ -406,16 +404,15 @@ describe('RunTrace activity presentation', () => {
     const failureDots = [...el.querySelectorAll('.tool-row__status-dot')]
     expect(failureDots).toHaveLength(2)
     for (const dot of failureDots) expectStatusDot(dot, "Didn't complete")
-    expect(el.textContent).toContain("Didn't complete")
+    expect(el.textContent).not.toContain("Didn't complete")
     expect([...el.querySelectorAll('.tool-row--error')]
       .every(row => row.getAttribute('aria-expanded') === 'false')).toBe(true)
     expect(el.querySelector('.tool-row__bullet--err')).toBeNull()
-    expect(el.querySelector('.tool-row__activity-icon--error')).not.toBeNull()
+    expect(el.querySelector('.tool-row__activity-icon--error')).toBeNull()
     expect(el.querySelector('.tool-row__state-icon--err')).toBeNull()
     expect(el.querySelectorAll('.activity-code-details__output')).toHaveLength(0)
     expect(el.querySelectorAll('.tool-row-body')).toHaveLength(0)
-    expect([...el.querySelectorAll('.tool-row__error-summary')].map(node => node.textContent))
-      .toEqual(['failed', 'failed'])
+    expect(el.querySelectorAll('.tool-row__error-summary')).toHaveLength(0)
     expect(el.querySelector('.tool-row-section--error')).toBeNull()
     expect(el.textContent).not.toContain('failed-group')
   })
@@ -433,7 +430,7 @@ describe('RunTrace activity presentation', () => {
     expect(el.querySelector('.tool-row__status-dot')).toBeNull()
   })
 
-  it('shows a collapsed failed activity call with visible status and an accessible dot', async () => {
+  it('shows a collapsed failed activity call with only an accessible status dot', async () => {
     const el = await mountTimeline([
       group('single-failure-group', [
         call('single-failure', {
@@ -447,28 +444,35 @@ describe('RunTrace activity presentation', () => {
 
     expect(el.querySelector('.tool-row--error')).not.toBeNull()
     expect(el.querySelector('.tool-row__label')?.textContent).toBe('Run command')
-    expect(el.querySelector('.tool-row__status')?.textContent).toBe("Didn't complete")
+    expect(el.querySelector('.tool-row__status')).toBeNull()
     expectStatusDot(el.querySelector('.tool-row__status-dot'), "Didn't complete")
-    expect(el.textContent).toContain("Didn't complete")
+    expect(el.textContent).not.toContain("Didn't complete")
     expect(el.querySelector('.tool-row')?.getAttribute('aria-expanded')).toBe('false')
     expect(el.querySelector('.activity-tool-details')).toBeNull()
-    expect(el.querySelector('.tool-row__error-summary')?.textContent).toBe('failed')
+    expect(el.querySelector('.tool-row__error-summary')).toBeNull()
+    expect(el.textContent).not.toContain('failed')
   })
 
-  it('keeps the collapsed error summary to one redacted line without opening the full output', async () => {
+  it('keeps error details out of a collapsed row and redacts them after manual expansion', async () => {
     const result = 'Permission denied; token=private-token-value\nFull diagnostic continuation'
     const el = await mountTimeline([
       group('custom.failure', [call('failed-custom', {
         name: 'custom_tool', status: 'error', isError: true,
         result, resultPreview: result,
       })]),
-    ], { presentation: 'activity' })
+    ], reactive({ presentation: 'activity' as const, itemOpen: false }))
 
-    expect(el.querySelector('.tool-row__error-summary')?.textContent)
-      .toBe('Permission denied; token=[redacted]')
+    expect(el.querySelector('.tool-row__error-summary')).toBeNull()
+    expect(el.textContent).not.toContain('Permission denied')
     expect(el.textContent).not.toContain('private-token-value')
     expect(el.textContent).not.toContain('Full diagnostic continuation')
     expect(el.querySelector('.activity-tool-details')).toBeNull()
+    el.querySelector<HTMLButtonElement>('.tool-row')?.click()
+    await nextTick()
+    expect(el.querySelector('.tool-row')?.getAttribute('aria-expanded')).toBe('true')
+    expect(el.querySelector('.activity-tool-details__section--error')?.textContent)
+      .toContain('Permission denied; token=[redacted]')
+    expect(el.textContent).not.toContain('private-token-value')
   })
 
   it('does not expose legacy document payloads through the collapsed error summary', async () => {
@@ -485,9 +489,57 @@ describe('RunTrace activity presentation', () => {
       })]),
     ], { presentation: 'activity' })
 
-    expect(el.querySelector('.tool-row__status')?.textContent).toBe("Didn't complete")
+    expect(el.querySelector('.tool-row__status')).toBeNull()
     expect(el.querySelector('.tool-row-body')).toBeNull()
     expect(el.textContent).not.toMatch(/private|binding|<html>/i)
+  })
+
+  it('discloses a failed webpage error only on the focusable native button and preserves manual collapse', async () => {
+    useToolDetailPreference().setMode('expanded')
+    const options = reactive({ presentation: 'activity' as const, itemOpen: undefined as boolean | undefined })
+    const failed = reactive(call('failed-page', {
+      name: 'web_fetch', inputRaw: '{"url":"https://dailysynapse.com/"}',
+      status: 'error', isError: true,
+      result: 'The tool received an invalid argument.',
+      resultPreview: 'The tool received an invalid argument.',
+    }))
+    const el = await mountTimeline([group('web.read', [failed])], options)
+    const row = el.querySelector<HTMLButtonElement>('.tool-row')!
+    expect(row.tagName).toBe('BUTTON')
+    expect(row.type).toBe('button')
+    row.focus()
+    expect(document.activeElement).toBe(row)
+    expect(row.getAttribute('aria-expanded')).toBe('true')
+    expect(row.textContent).not.toContain('invalid argument')
+    expect(el.querySelector('.activity-tool-details__line--error')?.textContent?.trim())
+      .toBe('The tool received an invalid argument.')
+    row.click()
+    await nextTick()
+    expect(row.getAttribute('aria-expanded')).toBe('false')
+    await vi.waitFor(() => expect(el.textContent).not.toContain('invalid argument'))
+    expectStatusDot(row.querySelector('.tool-row__status-dot'), "Didn't complete")
+    failed.result = 'Updated diagnostic detail'
+    await nextTick()
+    expect(row.getAttribute('aria-expanded')).toBe('false')
+    expect(el.textContent).not.toContain('Updated diagnostic')
+    row.click()
+    await nextTick()
+    expect(el.querySelector('.activity-tool-details__line--error')?.textContent?.trim())
+      .toBe('Updated diagnostic detail')
+  })
+
+  it('keeps a failed call with missing output expandable instead of offering an empty disclosure', async () => {
+    const options = reactive({ presentation: 'activity' as const, itemOpen: false })
+    const el = await mountTimeline([group('web.read', [call('missing-error', {
+      name: 'web_fetch', status: 'error', isError: true,
+      inputRaw: '', inputPreview: '', result: '', resultPreview: '',
+    })])], options)
+    const row = el.querySelector<HTMLButtonElement>('.tool-row')!
+    expect(row.getAttribute('aria-expanded')).toBe('false')
+    expect(el.textContent).not.toContain("Didn't complete")
+    row.click()
+    await nextTick()
+    expect(el.querySelector('.tool-row-body .tool-row__error-detail')?.textContent).toBe("Didn't complete")
   })
 
   it.each(['document_apply', 'document_patch'])(
@@ -522,16 +574,16 @@ describe('RunTrace activity presentation', () => {
     const el = await mountTimeline([restoredFailure], { presentation: 'activity' })
 
     expect(el.querySelector('.tool-row--error')).not.toBeNull()
-    expect(el.querySelector('.tool-row__status')?.textContent).toBe("Didn't complete")
+    expect(el.querySelector('.tool-row__status')).toBeNull()
     expectStatusDot(el.querySelector('.tool-row__status-dot'), "Didn't complete")
-    expect(el.textContent).toContain("Didn't complete")
+    expect(el.textContent).not.toContain("Didn't complete")
     expect(el.querySelector('.tool-row__label')?.textContent)
       .toBe(name === 'shell' ? 'Run command' : 'restored-failure')
     expect(restoredFailure.group.calls[0]?.status).toBe('success')
     expect(restoredFailure.group.calls[0]?.isError).toBe(false)
   })
 
-  it.each(['collapsed', 'expanded'] as const)('keeps cancelled status visible with %s details', async (mode) => {
+  it.each(['collapsed', 'expanded'] as const)('keeps cancelled status accessible with %s details', async (mode) => {
     useToolDetailPreference().setMode(mode)
     const el = await mountTimeline([
       group('single-cancelled-group', [
@@ -548,9 +600,9 @@ describe('RunTrace activity presentation', () => {
     })
 
     expect(el.querySelector('.tool-row--error')).not.toBeNull()
-    expect(el.querySelector('.tool-row__status')?.textContent).toBe('Cancelled')
+    expect(el.querySelector('.tool-row__status')).toBeNull()
     expectStatusDot(el.querySelector('.tool-row__status-dot'), 'Cancelled')
-    expect(el.textContent).toContain('Cancelled')
+    expect(el.querySelector('.tool-row')?.textContent).not.toContain('Cancelled')
     expect(el.querySelector('.tool-row__label')?.textContent).toBe('Run command')
     expect(el.querySelector('.tool-row')?.getAttribute('aria-expanded')).toBe(String(mode === 'expanded'))
     if (mode === 'expanded') {
@@ -558,7 +610,8 @@ describe('RunTrace activity presentation', () => {
       expect(el.querySelector('.tool-row__error-summary')).toBeNull()
     } else {
       expect(el.querySelector('.activity-tool-details')).toBeNull()
-      expect(el.querySelector('.tool-row__error-summary')?.textContent).toBe('cancelled')
+      expect(el.querySelector('.tool-row__error-summary')).toBeNull()
+      expect(el.textContent).not.toContain('cancelled')
     }
   })
 
