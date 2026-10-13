@@ -2076,11 +2076,11 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert 'if classify_retryable_infrastructure_failure "${name}" "${first_log}"' in (
         run["run"]
     )
-    assert '"windows-delete-helper-handoff-timeout-v1"' in run["run"]
+    assert '"windows-delete-helper-handoff-timeout-v1"' not in run["run"]
     assert '"windows-isolated-acl-worker-timeout-v1"' in run["run"]
     assert '"windows-loopback-no-buffer-space-v1"' in run["run"]
     assert '"macos-electron-foreground-prerequisite-v1"' in run["run"]
-    assert '"cases": {"desktop-cleanup-flow"}' in run["run"]
+    assert '"cases": {"desktop-cleanup-flow"}' not in run["run"]
     assert '"cases": {"native-workbench-v2"}' in run["run"]
     assert '"classification": matches[0] if retryable else "non_retryable"' in (
         run["run"]
@@ -2117,13 +2117,6 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
 @pytest.mark.parametrize(
     ("case_name", "runner_os", "message", "expected_signature"),
     (
-        (
-            "desktop-cleanup-flow",
-            "Windows",
-            "Error: Timed out waiting for post-exit delete-all helper completion: ; "
-            "pending synthetic targets: synthetic-home\n",
-            "windows-delete-helper-handoff-timeout-v1",
-        ),
         (
             "native-workbench-v2",
             "Windows",
@@ -2247,6 +2240,56 @@ def test_desktop_retry_classifier_rejects_similar_windows_loopback_failures(
             sys.executable,
             "-",
             "native-workbench-v2",
+            "Windows",
+            str(log),
+            str(output),
+            str(evidence),
+        ],
+        input=classifier,
+        text=True,
+        check=False,
+    )
+
+    assert rejected.returncode == 1
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["classification"] == "non_retryable"
+    assert record["retryable"] is False
+    assert list(evidence.iterdir()) == []
+
+
+@pytest.mark.parametrize("line_ending", ("\n", "\r\n"), ids=("lf", "crlf"))
+@pytest.mark.parametrize(
+    "pending_targets",
+    ("primary-home, consolidation-backup, desktop-logs", "primary-home"),
+    ids=("all-targets", "one-target"),
+)
+def test_desktop_retry_classifier_rejects_unexplained_delete_helper_timeout(
+    tmp_path: Path, line_ending: str, pending_targets: str,
+) -> None:
+    run = next(
+        step["run"]
+        for step in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+        if step.get("name") == "Run compiled Desktop recovery flows"
+    )
+    classifier = run.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    log = tmp_path / "attempt-1.log"
+    output = tmp_path / "classifications.jsonl"
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    # This was previously retried without proof that the helper failure came
+    # from runner infrastructure. Preserve the exact signature as a rejection.
+    log.write_bytes(
+        (
+            "Error: Timed out waiting for post-exit delete-all helper completion: ; "
+            f"pending synthetic targets: {pending_targets}{line_ending}"
+        ).encode()
+    )
+
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            "-",
+            "desktop-cleanup-flow",
             "Windows",
             str(log),
             str(output),

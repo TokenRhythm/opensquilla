@@ -2309,22 +2309,11 @@ jobs:
           )
 
           # Retry only a single case for narrowly identified hosted-runner
-          # handoff/input failures.  Generic timeouts, connection failures,
+          # environment/input failures.  Generic timeouts, connection failures,
           # crashes, assertion errors, and product output mismatches are not
           # retryable.  Case + OS binding prevents a coincidental message in
           # another functional assertion from matching.
           rules = (
-              {
-                  "id": "windows-delete-helper-handoff-timeout-v1",
-                  "os": "Windows",
-                  "cases": {"desktop-cleanup-flow"},
-                  "pattern": re.compile(
-                      r"^Error: Timed out waiting for post-exit delete-all helper completion:"
-                      r"\s*; pending synthetic targets: .+$",
-                      re.MULTILINE,
-                  ),
-                  "companion_patterns": (),
-              },
               {
                   "id": "windows-isolated-acl-worker-timeout-v1",
                   "os": "Windows",

@@ -475,8 +475,8 @@ channel exports remain available through lazy lookup. The crash-recovery test
 retains its 20-second deadline, abrupt exit, committed ingress, and ambiguous
 outbox assertions. Preserve the same asynchronous pipe reader on timeout so
 phase output already consumed before cancellation is not lost. On Windows,
-both parser and crash probes launch the base interpreter with the venv launcher
-environment and assert its PID and prefix, so the watchdog owns the process
+parser, crash, and cold-import probes launch the base interpreter with the venv
+launcher environment and assert its PID and prefix, so the watchdog owns the process
 doing the work rather than a redirector that can exit before it.
 
 The generic Windows managed-handle and pipe/EOF contracts use PowerShell
@@ -510,3 +510,11 @@ boundary before release. Their existing provider, retry, and terminal guards
 start after durable activation, with the expected task identity checked first.
 Review every custom handler and downstream wait in the module when fixing this
 pattern, including paths whose activation happened to finish within the guard.
+
+An unexplained post-exit Desktop cleanup timeout must fail its first attempt.
+The timeout signature alone does not identify a transient environment failure.
+Keep delete-all helper diagnostics outside the approved deletion targets so
+that its output survives Electron exit and target removal. Regular-file output
+avoids introducing an unread diagnostic pipe; retain the original stdin/EOF
+approval protocol and the existing exit and cleanup deadlines. A successful
+diagnostic run proves observability, not the cause of an earlier timeout.

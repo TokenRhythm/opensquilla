@@ -26,7 +26,11 @@ def test_storage_import_does_not_load_adapters_or_gateway(tmp_path: Path) -> Non
     root = Path(__file__).resolve().parents[2]
     script = """
 import importlib.abc
+import os
 import sys
+
+assert sys.prefix == sys.argv[1], 'storage import probe must retain the test venv'
+print(f'storage-import-pid={os.getpid()}', flush=True)
 
 class StorageImportBoundary(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
@@ -48,15 +52,42 @@ assert AsyncChannelDeliveryStore.__module__ == 'opensquilla.channels.storage_wor
 message = IncomingMessage(sender_id='user', channel_id='channel', content='payload')
 assert message.content == 'payload'
 """
-    result = subprocess.run(
-        [sys.executable, "-c", script],
+    environment = {**os.environ, "PYTHONPATH": str(root / "src")}
+    interpreter = sys.executable
+    if os.name == "nt":
+        # Own the importing interpreter so the timeout also closes its pipes.
+        interpreter = sys._base_executable
+        environment["__PYVENV_LAUNCHER__"] = sys.executable
+    process = subprocess.Popen(
+        [interpreter, "-c", script, sys.prefix],
         cwd=tmp_path,
-        env={**os.environ, "PYTHONPATH": str(root / "src")},
-        capture_output=True,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=20,
     )
-    assert result.returncode == 0, result.stderr
+    try:
+        stdout, stderr = process.communicate(timeout=20)
+    except BaseException as error:
+        try:
+            if process.poll() is None:
+                process.kill()
+        except OSError as cleanup_error:
+            error.add_note(f"storage import child kill failed: {cleanup_error!r}")
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except BaseException as cleanup_error:
+            error.add_note(f"storage import child cleanup failed: {cleanup_error!r}")
+        else:
+            error.add_note(
+                f"storage import child pid={process.pid}, returncode={process.returncode}; "
+                f"stdout={stdout!r}; stderr={stderr!r}"
+            )
+        raise
+    assert process.returncode == 0, stderr
+    assert f"storage-import-pid={process.pid}" in stdout.splitlines(), (
+        f"storage import watchdog must own the interpreter: {stdout!r}"
+    )
 
 
 def test_public_channel_exports_preserve_identity() -> None:
