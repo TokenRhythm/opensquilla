@@ -3301,9 +3301,9 @@ async def test_repeated_cancellation_drains_compatibility_rollback_reload(
         if operation == "install"
         else asyncio.create_task(service.update("compatibility-rollback"))
     )
-    assert await asyncio.to_thread(rollback_reload_started.wait, 2)
     propagated: asyncio.CancelledError | None = None
     try:
+        assert await asyncio.to_thread(rollback_reload_started.wait, 2)
         assert service._mutation_lock.locked()
         assert loader._publication_barrier_depth == 1
 

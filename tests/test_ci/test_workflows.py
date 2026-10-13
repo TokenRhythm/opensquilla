@@ -2572,6 +2572,15 @@ def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
     }
     checkout = next(step for step in steps if step.get("name") == "Check out repository")
     assert checkout["with"]["lfs"] is True
+    setup_node = next(step for step in steps if step.get("name") == "Set up Node.js")
+    assert setup_node["uses"] == "actions/setup-node@v4"
+    assert setup_node["with"] == {"node-version": "22.23.3"}
+    assert "if" not in setup_node
+    versions = next(step for step in steps if step.get("name") == "Record tool versions")
+    assert steps.index(checkout) < steps.index(setup_node) < steps.index(versions)
+    assert steps.index(versions) < steps.index(test_step)
+    assert "node --version" in versions["run"]
+    assert "node -p 'process.execPath'" in versions["run"]
     bun_step = next(step for step in steps if step.get("name") == "Set up Bun")
     assert bun_step["if"] == "${{ startsWith(matrix.shard, 'core-') }}"
     assert steps[0]["name"] == "Prepare diagnostic report"
@@ -3323,6 +3332,17 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
         expected_preflight_files.update({
             "tests/test_ci/test_windows_signatures.py",
             "tests/test_tools/test_shell_process_isolation.py",
+            "tests/test_tools/test_shell_blocking_launch.py",
+            "tests/test_ci/test_rpc_architecture_contracts.py",
+            "tests/test_skills/test_hub_management_service.py",
+            "tests/test_gateway/test_native_attachment_import.py",
+            "tests/test_gateway/test_recovery_scheduler.py",
+            "tests/test_gateway/test_goal_user_input.py",
+            "tests/test_gateway/test_manual_compaction_contract.py",
+            "tests/test_gateway/test_sandbox_token_rpc_workers.py",
+            "tests/test_live_provider_profile_gateway_e2e.py",
+            "tests/test_ci/test_upgrade_baselines.py",
+            "tests/test_engine/test_runtime_router_fallback.py",
         })
         assert '"${family}" == "core"' in preflight["run"]
     assert set(re.findall(r"tests/[a-zA-Z0-9_/.]+\.py", preflight["run"])) == (
@@ -3339,9 +3359,19 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
 @pytest.mark.parametrize(("family", "expected_file"), [
     ("core", "tests/test_ci/test_windows_signatures.py"),
     ("core", "tests/test_cli/test_chat_cmd.py"),
-    ("gateway-sqlite", None),
+    ("core", "tests/test_tools/test_shell_blocking_launch.py"),
+    ("core", "tests/test_ci/test_rpc_architecture_contracts.py"),
+    ("core", "tests/test_skills/test_hub_management_service.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_native_attachment_import.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_recovery_scheduler.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_goal_user_input.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_manual_compaction_contract.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_sandbox_token_rpc_workers.py"),
+    ("gateway-sqlite", "tests/test_live_provider_profile_gateway_e2e.py"),
     ("recovery-migration", "tests/test_sandbox/test_windows_shell_process_runtime.py"),
     ("recovery-migration", "tests/test_live_long_task_case_driver.py"),
+    ("recovery-migration", "tests/test_ci/test_upgrade_baselines.py"),
+    ("recovery-migration", "tests/test_engine/test_runtime_router_fallback.py"),
     ("desktop-installer-contracts", "tests/test_ci/test_architecture_import_contracts.py"),
     ("desktop-installer-contracts", "tests/test_engine/test_tool_concurrency.py"),
 ])
