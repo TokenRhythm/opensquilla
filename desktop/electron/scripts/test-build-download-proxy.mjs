@@ -42,6 +42,10 @@ test('builder artifact downloads retain proxy routing and checksum verification'
         const downloaded = await downloader.downloadArtifact({ ...options,
           checksums: { 'fixture.txt': process.env.OPENSQUILLA_SYNTHETIC_DOWNLOAD_DIGEST } });
         assert.equal(await readFile(downloaded, 'utf8'), 'Synthetic verified build artifact');
+        const cached = await downloader.downloadArtifact({ ...options, force: false,
+          checksums: { 'fixture.txt': process.env.OPENSQUILLA_SYNTHETIC_DOWNLOAD_DIGEST } });
+        assert.equal(cached, downloaded);
+        assert.equal(await readFile(cached, 'utf8'), 'Synthetic verified build artifact');
         await assert.rejects(downloader.downloadArtifact({ ...options,
           checksums: { 'fixture.txt': '0'.repeat(64) } }), /checksum|hash/i);
       })().catch(error => { console.error(error); process.exitCode = 1; });
