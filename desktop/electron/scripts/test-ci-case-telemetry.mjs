@@ -47,9 +47,13 @@ try {
       title: 'Synthetic quit', message: 'Synthetic unknown activity', detail: 'Synthetic cleanup',
       keepRunning: 'Keep running', confirm: 'Stop tasks and quit',
     })
-    const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi)]
-    assert.equal(scripts.length, 1, 'the generated quit document must have one script')
-    runInNewContext(scripts[0][1], {
+    // This repository-owned template has one fixed inline script. Reject a
+    // changed template shape instead of parsing or filtering arbitrary HTML.
+    const scriptStart = html.split('<script>')
+    assert.equal(scriptStart.length, 2, 'the generated quit document must have one script')
+    const scriptEnd = scriptStart[1].split('</script>')
+    assert.equal(scriptEnd.length, 2, 'the generated quit script must have a closing tag')
+    runInNewContext(scriptEnd[0], {
       document: {
         getElementById: id => ({
           addEventListener: (event, callback) => listeners.set(`${id}:${event}`, callback),
