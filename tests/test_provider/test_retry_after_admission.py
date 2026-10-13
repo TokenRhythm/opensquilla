@@ -72,6 +72,7 @@ def cooling(monkeypatch):
     monkeypatch.setattr(retry_after, "_provider_retry_after_cooldowns", registry)
     monkeypatch.setattr("opensquilla.engine.agent.sleep_before_retry", clock.sleep)
     monkeypatch.setattr("opensquilla.engine.runtime.sleep_before_retry", clock.sleep)
+    monkeypatch.setattr("opensquilla.session.compaction.sleep_before_retry", clock.sleep)
     return registry, clock
 
 
@@ -362,9 +363,16 @@ async def test_actual_parent_deadline_expires_during_wait():
 
 @pytest.mark.parametrize("status", ["429", "503"])
 async def test_summary_failure_then_new_direct_agent_waits_and_dispatches_once(cooling, status):
-    _registry, clock = cooling
+    registry, clock = cooling
     summary_provider = PhysicalProvider([[ErrorEvent(code=status, retry_after_s=3)]])
-    assert await call_compaction_provider("old history", "", plan(summary_provider)) is None
+    # This summary cannot afford the server wait, but a fresh owner can.
+    assert await call_compaction_provider(
+        "old history", "", plan(summary_provider), deadline_at_monotonic=clock.now + 1,
+    ) is None
+    assert not clock.sleeps
+    assert registry.remaining(
+        summary_provider, scope=provider_retry_after_scope(summary_provider),
+    ) == 3
     normal_provider = PhysicalProvider()
     sink = Sink()
     events = [e async for e in agent(normal_provider, sink).run_turn("Continue")]
@@ -373,6 +381,28 @@ async def test_summary_failure_then_new_direct_agent_waits_and_dispatches_once(c
     assert any(e.kind == "done" for e in events)
     reason = "rate_limited" if status == "429" else "provider_overloaded"
     assert any(e.kind == "provider_activity" and e.reason == reason for e in events)
+
+
+@pytest.mark.parametrize("status", ["429", "503"])
+async def test_summary_recovers_with_shared_wait_before_new_agent_dispatch(cooling, status):
+    _registry, clock = cooling
+    summary_provider = PhysicalProvider([
+        [ErrorEvent(code=status, retry_after_s=3)],
+        [TextDeltaEvent(text="summary"), DoneEvent(stop_reason="stop")],
+    ])
+    activities = []
+    assert await call_compaction_provider(
+        "old history", "", plan(summary_provider), on_summary_recovery=activities.append,
+    ) == "summary"
+    assert clock.sleeps == [3]
+    assert len(summary_provider.calls) == 2
+    assert [event.phase for event in activities] == ["retry_wait", "retrying"]
+    assert activities[0].retry_after_ms == 3000
+    normal_provider = PhysicalProvider()
+    events = [event async for event in agent(normal_provider).run_turn("Continue")]
+    assert len(normal_provider.calls) == 1
+    assert clock.sleeps == [3]
+    assert any(event.kind == "done" for event in events)
 
 
 @pytest.mark.parametrize("status", [429, 503])
@@ -416,7 +446,9 @@ async def test_native_header_summary_to_fresh_native_agent_and_org_isolation(
             org_id=org,
         )
 
-    assert await call_compaction_provider("old history", "", plan(native("org-a"))) is None
+    assert await call_compaction_provider(
+        "old history", "", plan(native("org-a")), deadline_at_monotonic=clock.now + 1,
+    ) is None
     assert not clock.sleeps
     other_events = [e async for e in agent(native("org-b")).run_turn("continue")]
     assert any(e.kind == "done" for e in other_events)
@@ -483,7 +515,9 @@ async def test_invalid_optional_metadata_does_not_break_normal_chat(cooling, bad
 async def test_selector_physical_gate_waits_before_usage(cooling, monkeypatch):
     _registry, clock = cooling
     summary = PhysicalProvider([[ErrorEvent(code="429", retry_after_s=3)]])
-    assert await call_compaction_provider("old", "", plan(summary)) is None
+    assert await call_compaction_provider(
+        "old", "", plan(summary), deadline_at_monotonic=clock.now + 1,
+    ) is None
     physical = PhysicalProvider()
     monkeypatch.setattr("opensquilla.provider.selector._build_provider", lambda _config: physical)
     selector = ModelSelector(
@@ -653,6 +687,7 @@ async def test_summary_expired_frame_preserves_real_hint(cooling, monkeypatch):
 
 @pytest.mark.parametrize("style", ["legacy", "hint", "raises_type_error"])
 async def test_credential_reporter_is_called_once_with_supported_signature(cooling, style):
+    _registry, clock = cooling
     calls = []
 
     def legacy(provider, session, kind):
@@ -672,6 +707,7 @@ async def test_credential_reporter_is_called_once_with_supported_signature(cooli
                 provider,
                 modern if style == "hint" else legacy,
             ),
+            deadline_at_monotonic=clock.now + 1,
         )
         is None
     )
@@ -712,7 +748,9 @@ async def test_summary_failed_aggregator_cooldown_survives_fresh_ensemble_adapte
 ):
     _registry, clock = cooling
     summary = PhysicalProvider([[ErrorEvent(code="429", retry_after_s=4)]])
-    assert await call_compaction_provider("old", "", plan(summary)) is None
+    assert await call_compaction_provider(
+        "old", "", plan(summary), deadline_at_monotonic=clock.now + 1,
+    ) is None
     proposer = PhysicalProvider(model="proposer")
     aggregator = PhysicalProvider()
     monkeypatch.setattr(
