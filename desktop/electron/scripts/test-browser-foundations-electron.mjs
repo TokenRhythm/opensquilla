@@ -388,12 +388,148 @@ if (!process.versions.electron) {
       Menu.buildFromTemplate = originalBuild
 
       const wasFullscreen = owner.isFullScreen()
+      const fullscreenRecord = record(parent)
+      const normalContentBounds = owner.getContentBounds()
+      let nativeFullscreenEntries = 0
+      let nativeFullscreenExits = 0
+      owner.on('enter-full-screen', () => { nativeFullscreenEntries += 1 })
+      owner.on('leave-full-screen', () => { nativeFullscreenExits += 1 })
+      const waitOwnerRestoration = async () => {
+        await until(() => owner.isFullScreen() === wasFullscreen, 'owner fullscreen restoration')
+        if (!wasFullscreen) {
+          await until(() => nativeFullscreenExits >= nativeFullscreenEntries,
+            'native fullscreen exit transition')
+          await until(() => {
+            const { width, height } = owner.getContentBounds()
+            return width === normalContentBounds.width && height === normalContentBounds.height
+          }, 'native fullscreen transition completion')
+        }
+      }
       await clickNamed(parent, 'Enter fullscreen')
       await until(() => evaluate(parent, 'Boolean(document.fullscreenElement)'), 'HTML fullscreen entry')
       await until(() => owner.isFullScreen(), 'owner fullscreen expansion')
+      await until(() => nativeFullscreenEntries > 0, 'native fullscreen entry transition')
       await clickNamed(parent, 'Exit fullscreen')
       await until(() => evaluate(parent, '!document.fullscreenElement'), 'HTML fullscreen exit')
-      await until(() => owner.isFullScreen() === wasFullscreen, 'owner fullscreen restoration')
+      await waitOwnerRestoration()
+      const enterFullscreen = async () => {
+        const ownerAlreadyFullscreen = owner.isFullScreen()
+        const previousEntries = nativeFullscreenEntries
+        await until(async () => {
+          const viewport = await evaluate(parent, '({ width: innerWidth, height: innerHeight })')
+          const bounds = fullscreenRecord.view.getBounds()
+          const zoom = fullscreenRecord.contents.getZoomFactor()
+          return Math.abs(viewport.width * zoom - bounds.width) <= zoom
+            && Math.abs(viewport.height * zoom - bounds.height) <= zoom
+        }, 'renderer viewport after native bounds update')
+        fullscreenRecord.contents.focus()
+        const previousGesture = fullscreenRecord.lastTrustedGestureAt
+        fullscreenRecord.contents.sendInputEvent({ type: 'keyDown', keyCode: 'Shift' })
+        await until(() => fullscreenRecord.lastTrustedGestureAt > previousGesture,
+          'native gesture for fullscreen geometry request')
+        fullscreenRecord.contents.sendInputEvent({ type: 'keyUp', keyCode: 'Shift' })
+        await fullscreenRecord.contents.executeJavaScript(
+          'void document.querySelector("#fullscreen-target").requestFullscreen().catch(error => { window.fullscreenRequestError = { name: error.name, message: error.message } })', true)
+        await until(() => evaluate(parent, 'Boolean(document.fullscreenElement)'), 'HTML fullscreen geometry entry')
+          .catch(async error => { throw new Error(`${error.message}: ${JSON.stringify(await evaluate(parent,
+            '({error: window.fullscreenRequestError, enabled: document.fullscreenEnabled, activation: navigator.userActivation.isActive, width: innerWidth, height: innerHeight})'))}`) })
+        await until(() => owner.isFullScreen(), 'owner fullscreen geometry expansion')
+        if (!ownerAlreadyFullscreen) await until(() => nativeFullscreenEntries > previousEntries,
+          'native fullscreen geometry transition')
+      }
+      const fullscreenBounds = () => {
+        const { width, height } = owner.getContentBounds()
+        return { x: 0, y: 0, width, height }
+      }
+      const panelRect = { x: 200, y: 150, width: 700, height: 450 }
+      await enterFullscreen()
+      await until(() => JSON.stringify(fullscreenRecord.view.getBounds()) === JSON.stringify(fullscreenBounds()),
+        'fullscreen page bounds')
+      assert.equal(manager.setSurfaceRect({ surfaceId: fullscreenRecord.id,
+        ...panelRect, visible: true }).ok, true)
+      assert.deepEqual(fullscreenRecord.view.getBounds(), fullscreenBounds(),
+        'A panel layout update must not shrink the fullscreen page')
+      assert.deepEqual(fullscreenRecord.requestedRect, panelRect,
+        'The latest panel layout must be retained for fullscreen exit')
+      assert.equal(manager.activateSurface(fullscreenRecord.id).ok, true)
+      assert.equal(manager.activateSurface(fullscreenRecord.id).ok, true)
+      assert.deepEqual(fullscreenRecord.view.getBounds(), fullscreenBounds(),
+        'Repeated activation must keep the fullscreen page expanded')
+      owner.emit('resize')
+      manager.refreshBounds(owner)
+      assert.deepEqual(fullscreenRecord.view.getBounds(), fullscreenBounds(),
+        'Host bounds refresh must use the same fullscreen rectangle')
+      await evaluate(parent, 'void document.exitFullscreen()')
+      await until(() => evaluate(parent, '!document.fullscreenElement'), 'HTML fullscreen exit')
+      await waitOwnerRestoration()
+      await until(() => JSON.stringify(fullscreenRecord.view.getBounds()) === JSON.stringify(panelRect),
+        'latest panel rectangle restoration')
+
+      const previousEntries = nativeFullscreenEntries
+      owner.setFullScreen(true)
+      await until(() => owner.isFullScreen() && nativeFullscreenEntries > previousEntries,
+        'host fullscreen before HTML fullscreen')
+      await enterFullscreen()
+      assert.equal(manager.setSurfaceRect({ surfaceId: fullscreenRecord.id,
+        ...panelRect, visible: true }).ok, true)
+      assert.equal(manager.activateSurface(fullscreenRecord.id).ok, true)
+      assert.deepEqual(fullscreenRecord.view.getBounds(), fullscreenBounds())
+      await evaluate(parent, 'void document.exitFullscreen()')
+      await until(() => evaluate(parent, '!document.fullscreenElement'), 'HTML exit in fullscreen host')
+      assert.equal(owner.isFullScreen(), true, 'HTML fullscreen exit must retain a preexisting fullscreen host')
+      await until(() => JSON.stringify(fullscreenRecord.view.getBounds()) === JSON.stringify(panelRect),
+        'panel restoration in fullscreen host')
+      owner.setFullScreen(wasFullscreen)
+      await waitOwnerRestoration()
+
+      const normalSize = owner.getContentSize()
+      owner.setContentSize(640, 480)
+      await until(() => {
+        const { width, height } = owner.getContentBounds()
+        const expected = { x: panelRect.x, y: panelRect.y,
+          width: Math.min(panelRect.width, width - panelRect.x),
+          height: Math.min(panelRect.height, height - panelRect.y) }
+        return width === 640 && height === 480
+          && JSON.stringify(fullscreenRecord.view.getBounds()) === JSON.stringify(expected)
+      }, 'native host resize clamps the panel bounds')
+      assert.deepEqual(fullscreenRecord.requestedRect, panelRect)
+      owner.setContentSize(...normalSize)
+      await until(() => JSON.stringify(fullscreenRecord.view.getBounds()) === JSON.stringify(panelRect),
+        'native host resize restores the requested panel bounds')
+
+      await enterFullscreen()
+      assert.equal(manager.setSurfaceRect({ surfaceId: fullscreenRecord.id,
+        ...panelRect, visible: false }).ok, true)
+      assert.equal(fullscreenRecord.view.getVisible(), false)
+      await waitOwnerRestoration()
+      manager.refreshBounds(owner)
+      assert.equal(fullscreenRecord.view.getVisible(), false, 'A bounds refresh must not reveal a hidden page')
+      assert.equal(manager.setSurfaceRect({ surfaceId: fullscreenRecord.id,
+        ...panelRect, visible: true }).ok, true)
+      await until(() => evaluate(parent, '!document.fullscreenElement'), 'resuming settles HTML fullscreen exit')
+      assert.equal(owner.isFullScreen(), wasFullscreen)
+      assert.deepEqual(fullscreenRecord.view.getBounds(), panelRect)
+
+      const otherScope = await manager.createSurface({ version: 2, surfaceId: 'synthetic-fullscreen-other-scope',
+        kind: 'url-preview', payload: { url: origin + '/login', scopeId: 'synthetic-other-task' } })
+      assert.equal(otherScope.ok, true, otherScope.message)
+      const otherRecord = manager.surfaces.get('synthetic-fullscreen-other-scope')
+      await enterFullscreen()
+      assert.equal(manager.setSurfaceRect({ surfaceId: otherRecord.id,
+        x: 24, y: 24, width: 500, height: 400, visible: true }).ok, true)
+      assert.equal(manager.activeSurfaceId, otherRecord.id)
+      assert.equal(fullscreenRecord.view.getVisible(), false)
+      await waitOwnerRestoration()
+      manager.refreshBounds(owner)
+      assert.equal(fullscreenRecord.view.getVisible(), false, 'The old task must remain hidden after fullscreen exit')
+      assert.deepEqual(otherRecord.view.getBounds(), { x: 24, y: 24, width: 500, height: 400 })
+      assert.equal(otherRecord.view.getVisible(), true)
+      await manager.destroySurface(otherRecord.id)
+      assert.equal(manager.setSurfaceRect({ surfaceId: fullscreenRecord.id,
+        x: 12, y: 12, width: 900, height: 720, visible: true }).ok, true)
+      await until(() => evaluate(parent, '!document.fullscreenElement'), 'task resume settles HTML fullscreen exit')
+      assert.equal(owner.isFullScreen(), wasFullscreen)
+      assert.equal(fullscreenRecord.view.getVisible(), true)
 
       assert.equal((await manager.navigateSurface({ version: 2, surfaceId: manual.surfaceId,
         action: 'navigate', url: origin + '/dashboard' })).ok, true)

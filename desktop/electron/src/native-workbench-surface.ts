@@ -5504,7 +5504,8 @@ export class NativeWorkbenchSurfaceManager {
       if (other !== record) this.hideRecord(other)
     }
     this.activeSurfaceId = record.id
-    record.view.setBounds(record.rect)
+    const bounds = this.resolveEffectiveSurfaceRect(record)
+    if (bounds) record.view.setBounds(bounds)
     this.emitBrowserFindState(record)
     this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(record.owner))
     const overlay = this.annotationOverlays.get(record.owner)
@@ -5578,12 +5579,6 @@ export class NativeWorkbenchSurfaceManager {
   }
 
   private reapplyActiveBounds(owner: BrowserWindow): void {
-    const fullscreen = this.htmlFullscreen?.record
-    if (fullscreen?.owner === owner && !fullscreen.disposed && !owner.isDestroyed()) {
-      const { width, height } = owner.getContentBounds()
-      fullscreen.view.setBounds({ x: 0, y: 0, width, height })
-      return
-    }
     if (!this.activeSurfaceId) return
     const record = this.surfaces.get(this.activeSurfaceId)
     if (record?.disposed || record?.crashed) {
@@ -5594,11 +5589,12 @@ export class NativeWorkbenchSurfaceManager {
       return
     }
     record.rect = this.resolveSurfaceRect(record)
-    if (!record.rect) {
+    const bounds = this.resolveEffectiveSurfaceRect(record)
+    if (!bounds) {
       this.setPhysicalVisibility(record, false)
       return
     }
-    record.view.setBounds(record.rect)
+    record.view.setBounds(bounds)
     this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(owner))
     const overlay = this.annotationOverlays.get(owner)
     if (
@@ -5725,5 +5721,14 @@ export class NativeWorkbenchSurfaceManager {
       record.owner.webContents.getZoomFactor(),
     )
     return clampNativeWorkbenchSurfaceRect(dipRect, record.owner.getContentBounds())
+  }
+
+  private resolveEffectiveSurfaceRect(record: NativeWorkbenchSurfaceRecord): NativeWorkbenchSurfaceRect | null {
+    if (!record.rect || record.owner.isDestroyed()) return null
+    if (this.htmlFullscreen?.record === record) {
+      const { width, height } = record.owner.getContentBounds()
+      return { x: 0, y: 0, width, height }
+    }
+    return record.rect
   }
 }
