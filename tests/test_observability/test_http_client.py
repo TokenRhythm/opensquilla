@@ -31,6 +31,9 @@ _MANIFEST = {
     "prerelease": False,
     "releaseUrl": "https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.7",
 }
+# Certificate-policy checks exercise real native TLS, including cold platform
+# initialization; their fixture budget is separate from deadline assertions.
+_TLS_CHECK_TIMEOUT_SECONDS = 10
 
 
 @pytest.fixture(autouse=True)
@@ -76,7 +79,7 @@ def isolated_network(monkeypatch):
 def servers():
     running: list[tuple[ThreadingHTTPServer, threading.Thread]] = []
 
-    def start(*, context: ssl.SSLContext | None = None):
+    def start(*, context: ssl.SSLContext | None = None, handshake_timeout: float = 2):
         state = SimpleNamespace(hits=[], redirect_to=None, post_status=202)
 
         class Handler(BaseHTTPRequestHandler):
@@ -109,7 +112,9 @@ def servers():
             def __init__(self):
                 self.ready = threading.Event()
                 self.accepted = threading.Event()
+                self.handshake_started = threading.Event()
                 self.connections: set[socket.socket] = set()
+                self.handshakes: set[socket.socket] = set()
                 self.workers: list[threading.Thread] = []
                 self.connection_lock = threading.Lock()
                 super().__init__(("127.0.0.1", 0), Handler)
@@ -141,12 +146,18 @@ def servers():
             def process_request_thread(self, request, client_address):
                 try:
                     if context is not None:
+                        with self.connection_lock:
+                            self.handshakes.add(request)
+                            self.handshake_started.set()
                         try:
-                            request.settimeout(2)
+                            request.settimeout(handshake_timeout)
                             request.do_handshake()
                         except OSError:
                             self.shutdown_request(request)
                             return
+                        finally:
+                            with self.connection_lock:
+                                self.handshakes.discard(request)
                     super().process_request_thread(request, client_address)
                 finally:
                     with self.connection_lock:
@@ -158,10 +169,31 @@ def servers():
         )
         thread.start()
         running.append((server, thread))
-        assert server.ready.wait(timeout=2), "Loopback server accept loop did not become ready"
+        assert server.ready.wait(timeout=handshake_timeout), (
+            "Loopback server accept loop did not become ready"
+        )
         scheme = "https" if context else "http"
         state.url = f"{scheme}://127.0.0.1:{server.server_port}"
         state.accepted = server.accepted
+        state.handshake_started = server.handshake_started
+
+        def active_handshakes():
+            with server.connection_lock:
+                return frozenset(server.handshakes)
+
+        def tls_progress():
+            with server.connection_lock:
+                return {
+                    "accepted": server.accepted.is_set(),
+                    "handshake_started": server.handshake_started.is_set(),
+                    "active_handshakes": len(server.handshakes),
+                    "connections": len(server.connections),
+                    "live_workers": sum(worker.is_alive() for worker in server.workers),
+                    "handler_hits": len(state.hits),
+                }
+
+        state.active_handshakes = active_handshakes
+        state.tls_progress = tls_progress
         return state
 
     yield start
@@ -421,16 +453,23 @@ def tls_context(tmp_path: Path):
 @pytest.mark.ci_serial
 def test_custom_ca_and_hostname_validation_are_preserved(monkeypatch, servers, tls_context):
     cert_path, context = tls_context
-    server = servers(context=context)
+    server = servers(context=context, handshake_timeout=_TLS_CHECK_TIMEOUT_SECONDS)
     monkeypatch.setenv("SSL_CERT_FILE", str(cert_path))
     monkeypatch.setenv("OPENSQUILLA_TRUST_ENV", "1")
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,[::1]")
-    assert update_check._fetch_latest_release(server.url, "0.5.6", timeout=2)[2] is None
+    valid_error = update_check._fetch_latest_release(
+        server.url, "0.5.6", timeout=_TLS_CHECK_TIMEOUT_SECONDS
+    )[2]
+    assert valid_error is None, (valid_error, server.tls_progress())
     wrong_host = server.url.replace("127.0.0.1", "localhost")
-    error = update_check._fetch_latest_release(wrong_host, "0.5.6", timeout=2)[2]
+    error = update_check._fetch_latest_release(
+        wrong_host, "0.5.6", timeout=_TLS_CHECK_TIMEOUT_SECONDS
+    )[2]
     assert error is not None and "CERTIFICATE_VERIFY_FAILED" in error
     monkeypatch.setenv("OPENSQUILLA_TRUST_ENV", "0")
-    error = update_check._fetch_latest_release(server.url, "0.5.6", timeout=2)[2]
+    error = update_check._fetch_latest_release(
+        server.url, "0.5.6", timeout=_TLS_CHECK_TIMEOUT_SECONDS
+    )[2]
     assert error is not None and "CERTIFICATE_VERIFY_FAILED" in error
     assert len(server.hits) == 1
 
@@ -440,19 +479,30 @@ def test_idle_tls_connection_does_not_block_certificate_validation(
     monkeypatch, servers, tls_context, capsys
 ):
     cert_path, context = tls_context
-    server = servers(context=context)
+    server = servers(context=context, handshake_timeout=_TLS_CHECK_TIMEOUT_SECONDS)
     port = int(server.url.rsplit(":", 1)[1])
-    with socket.create_connection(("127.0.0.1", port), timeout=2):
-        assert server.accepted.wait(timeout=2)
+    with socket.create_connection(("127.0.0.1", port), timeout=_TLS_CHECK_TIMEOUT_SECONDS):
+        assert server.accepted.wait(timeout=_TLS_CHECK_TIMEOUT_SECONDS)
+        assert server.handshake_started.wait(timeout=_TLS_CHECK_TIMEOUT_SECONDS)
+        idle_handshakes = server.active_handshakes()
+        assert len(idle_handshakes) == 1
         monkeypatch.setenv("SSL_CERT_FILE", str(cert_path))
         monkeypatch.setenv("OPENSQUILLA_TRUST_ENV", "1")
         monkeypatch.setenv("NO_PROXY", "127.0.0.1,[::1]")
-        assert update_check._fetch_latest_release(server.url, "0.5.6", timeout=2)[2] is None
+        valid_error = update_check._fetch_latest_release(
+            server.url, "0.5.6", timeout=_TLS_CHECK_TIMEOUT_SECONDS
+        )[2]
+        assert valid_error is None, (valid_error, server.tls_progress())
+        assert idle_handshakes <= server.active_handshakes(), server.tls_progress()
         wrong_host = server.url.replace("127.0.0.1", "localhost")
-        error = update_check._fetch_latest_release(wrong_host, "0.5.6", timeout=2)[2]
+        error = update_check._fetch_latest_release(
+            wrong_host, "0.5.6", timeout=_TLS_CHECK_TIMEOUT_SECONDS
+        )[2]
         assert error is not None and "CERTIFICATE_VERIFY_FAILED" in error
         monkeypatch.setenv("OPENSQUILLA_TRUST_ENV", "0")
-        error = update_check._fetch_latest_release(server.url, "0.5.6", timeout=2)[2]
+        error = update_check._fetch_latest_release(
+            server.url, "0.5.6", timeout=_TLS_CHECK_TIMEOUT_SECONDS
+        )[2]
         assert error is not None and "CERTIFICATE_VERIFY_FAILED" in error
         assert len(server.hits) == 1
     assert "Exception occurred during processing of request" not in capsys.readouterr().err

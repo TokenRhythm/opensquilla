@@ -623,6 +623,14 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
             "tests/test_observability/test_http_client.py",
             "test_idle_tls_connection_does_not_block_certificate_validation",
         ),
+        (
+            "tests/test_recovery/test_runtime_writer_guard.py",
+            "test_runtime_writer_lock_keeps_read_only_cli_available_and_rejects_agent",
+        ),
+        (
+            "tests/test_recovery/test_runtime_writer_guard.py",
+            "test_distinct_profile_and_gateway_state_dirs_run_concurrently_across_processes",
+        ),
     ],
 )
 def test_bounded_latency_contracts_are_marked_ci_serial(
@@ -660,6 +668,7 @@ def test_recovery_close_probes_are_explicitly_serial(function_name: str) -> None
     ("tests/test_session/test_recovery_reads.py", 9),
     ("tests/test_gateway/test_native_attachment_import.py", 3),
     ("tests/test_observability/test_http_client.py", 2),
+    ("tests/test_recovery/test_runtime_writer_guard.py", 3),
 ])
 def test_process_probe_collection_is_complete_and_disjoint(target: str, serial_count: int) -> None:
     """Exercise actual pytest collection, not fixture-setup-time marker changes."""

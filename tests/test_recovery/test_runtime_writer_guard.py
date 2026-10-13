@@ -110,12 +110,12 @@ def _hold_runtime_writer(
         os.environ.pop("OPENSQUILLA_PROFILE_KIND", None)
         os.environ.pop("OPENSQUILLA_DESKTOP", None)
 
-    from opensquilla.recovery import guarded_desktop_profile
-
     try:
+        from opensquilla.recovery import guarded_desktop_profile
+
         with guarded_desktop_profile(Path(home)):
             ready.put("locked")
-            if not release.wait(timeout=15):
+            if not release.wait(timeout=60):
                 raise TimeoutError("test did not release the runtime writer")
     except BaseException as exc:
         ready.put(f"error:{type(exc).__name__}:{exc}")
@@ -142,10 +142,10 @@ def _hold_isolated_runtime_writer(
     os.environ.pop("OPENSQUILLA_DESKTOP", None)
     os.chdir(cwd)
 
-    from opensquilla.gateway.config import GatewayConfig
-    from opensquilla.recovery import guarded_desktop_profile
-
     try:
+        from opensquilla.gateway.config import GatewayConfig
+        from opensquilla.recovery import guarded_desktop_profile
+
         config = GatewayConfig.load()
         with guarded_desktop_profile(Path(home)):
             ready.put(
@@ -155,7 +155,9 @@ def _hold_isolated_runtime_writer(
                     "state_dir": config.state_dir,
                 }
             )
-            if not release.wait(timeout=15):
+            # Cover both parent readiness waits and the assertions while both
+            # independent leases must remain held until explicitly released.
+            if not release.wait(timeout=60):
                 raise TimeoutError("test did not release the isolated runtime writer")
     except BaseException as exc:
         ready.put({"label": label, "error": f"{type(exc).__name__}:{exc}"})
@@ -246,6 +248,7 @@ def test_unknown_desktop_layout_warns_without_seeding_or_blocking(
     assert not (home / "workspace").exists()
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize(
     "profile_kind",
     ["desktop-primary", ""],
@@ -278,10 +281,10 @@ def test_runtime_writer_lock_keeps_read_only_cli_available_and_rejects_agent(
         target=_hold_runtime_writer,
         args=(str(home), str(user_state), profile_kind, ready, release),
     )
-    writer.start()
-    assert ready.get(timeout=10) == "locked"
-
     try:
+        writer.start()
+        assert ready.get(timeout=10) == "locked"
+
         from opensquilla.cli import gateway_cmd, models_cmd
         from opensquilla.cli import main as cli_main
 
@@ -360,14 +363,19 @@ def test_runtime_writer_lock_keeps_read_only_cli_available_and_rejects_agent(
         assert agent_calls == []
     finally:
         release.set()
-        writer.join(timeout=10)
-        if writer.is_alive():
-            writer.terminate()
-            writer.join(timeout=5)
+        if writer.pid is not None:
+            writer.join(timeout=10)
+            if writer.is_alive():
+                writer.terminate()
+                writer.join(timeout=5)
+        ready.close()
+        ready.join_thread()
+        assert not writer.is_alive()
 
     assert writer.exitcode == 0
 
 
+@pytest.mark.ci_serial
 def test_distinct_profile_and_gateway_state_dirs_run_concurrently_across_processes(
     tmp_path: Path,
 ) -> None:
@@ -403,10 +411,10 @@ def test_distinct_profile_and_gateway_state_dirs_run_concurrently_across_process
         for label, (home, gateway_state) in profiles.items()
     ]
 
-    for writer in writers:
-        writer.start()
-
     try:
+        for writer in writers:
+            writer.start()
+
         resolved = [ready.get(timeout=15), ready.get(timeout=15)]
         assert all("error" not in result for result in resolved), resolved
         assert {result["label"] for result in resolved} == set(profiles)
@@ -425,9 +433,13 @@ def test_distinct_profile_and_gateway_state_dirs_run_concurrently_across_process
     finally:
         release.set()
         for writer in writers:
-            writer.join(timeout=10)
-            if writer.is_alive():
-                writer.terminate()
-                writer.join(timeout=5)
+            if writer.pid is not None:
+                writer.join(timeout=10)
+                if writer.is_alive():
+                    writer.terminate()
+                    writer.join(timeout=5)
+        ready.close()
+        ready.join_thread()
+        assert not any(writer.is_alive() for writer in writers)
 
     assert [writer.exitcode for writer in writers] == [0, 0]
