@@ -180,6 +180,7 @@ const props = withDefaults(defineProps<{
   errorMessage?: string
   loading?: boolean
   findOpen?: boolean
+  findFocusSequence?: number
   findQuery?: string
   findMatches?: number | null
   findActiveMatch?: number
@@ -198,6 +199,7 @@ const props = withDefaults(defineProps<{
   errorMessage: '',
   loading: false,
   findOpen: false,
+  findFocusSequence: 0,
   findQuery: '',
   findMatches: null,
   findActiveMatch: 0,
@@ -249,8 +251,10 @@ watch(() => props.navigationCancelSequence, () => {
   invalidAddress.value = false
 })
 
-watch(() => props.findOpen, opened => {
-  if (opened) void nextTick(() => findInput.value?.focus({ preventScroll: true }))
+watch([() => props.findOpen, () => props.findFocusSequence], ([opened]) => {
+  if (opened) void nextTick(() => {
+    if (props.findOpen) findInput.value?.focus({ preventScroll: true })
+  })
 })
 
 watch(() => props.findQuery, value => {

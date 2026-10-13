@@ -84,6 +84,7 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
       errorMessage: '',
       loading: true,
       findOpen: false,
+      findFocusSequence: 0,
       findQuery: '',
       findMatches: null,
       findActiveMatch: 0,
@@ -168,7 +169,7 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
     if (!request) return
     const native = this.context.nativeWorkbenchApi
     if (request.action === 'find-open') {
-      this.context.updateRenderState({ findOpen: true, controlError: '' })
+      this.requestFindFocus()
       return
     }
     if (request.action === 'find-close') {
@@ -272,7 +273,8 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
       return
     }
     if (event.type === 'find-requested') {
-      this.context.updateRenderState({ findOpen: true, controlError: '' })
+      if (this.context.isItemActive?.() === false) return
+      this.requestFindFocus()
       return
     }
     if (event.type === 'find-state') {
@@ -357,6 +359,14 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
   async handleSurfaceRect(rect: NativeSurfaceRect) {
     this.rect = rect
     await this.syncRect()
+  }
+
+  private requestFindFocus() {
+    this.context.updateRenderState({
+      findOpen: true,
+      findFocusSequence: Number(this.context.getRenderState().findFocusSequence || 0) + 1,
+      controlError: '',
+    })
   }
 
   async suspend() {
@@ -463,6 +473,7 @@ export function createBrowserWorkbenchDefinition(
       errorMessage: String(state.runtimeState.errorMessage || ''),
       loading: state.runtimeState.loading === true,
       findOpen: state.runtimeState.findOpen === true,
+      findFocusSequence: Number(state.runtimeState.findFocusSequence || 0),
       findQuery: String(state.runtimeState.findQuery || ''),
       findMatches: typeof state.runtimeState.findMatches === 'number'
         ? state.runtimeState.findMatches : null,
