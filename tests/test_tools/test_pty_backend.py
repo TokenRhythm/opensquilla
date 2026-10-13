@@ -102,6 +102,24 @@ async def test_real_pty_cleans_descendant_tree(
     )
     argv = [sys.executable, str(parent)]
     command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    timeout_ready = asyncio.Event()
+    timed_waits = []
+    if action == "timeout":
+        original_wait = shell._wait_bg_process
+
+        async def wait_after_child_observed(owned_session, timeout):
+            if (
+                owned_session.session_key == "test:pty-tree"
+                and owned_session.task_id == "pty-timeout"
+                and timeout == 3
+            ):
+                timed_waits.append(owned_session)
+                # Start the real timeout after the fixture holds proof of the
+                # descendant, rather than racing its PID/TTY publication.
+                await timeout_ready.wait()
+            return await original_wait(owned_session, timeout)
+
+        monkeypatch.setattr(shell, "_wait_bg_process", wait_after_child_observed)
     token = current_tool_context.set(ToolContext(
         is_owner=True, caller_kind=CallerKind.CLI, session_key="test:pty-tree",
         task_id=f"pty-{action}",
@@ -146,9 +164,13 @@ async def test_real_pty_cleans_descendant_tree(
             kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
             child_handle = kernel32.OpenProcess(0x00100000, False, child_process)
             assert child_handle
+        timeout_ready.set()
         if action != "timeout":
             await shell.process(action, execution_id=execution_id)
         await asyncio.wait_for(asyncio.shield(session.collector_task), timeout=10)
+        if action == "timeout":
+            assert timed_waits == [session]
+            assert session.timed_out
         assert "TTY=True" in shell._bg_rendered_output(session)
         assert session.process_tree is not None and session.process_tree.durable
         assert not session.process_tree.is_active()
@@ -165,21 +187,53 @@ async def test_real_pty_cleans_descendant_tree(
         else:
             assert _strict_process_start_identity(child_process) != child_identity
     finally:
+        failure = sys.exception()
+        cleanup_failure = None
+
+        def retain_cleanup_failure(stage, exc):
+            nonlocal cleanup_failure
+            primary = failure if failure is not None else cleanup_failure
+            if primary is None:
+                cleanup_failure = exc
+            else:
+                primary.add_note(f"PTY fixture {stage} also failed: {type(exc).__name__}: {exc}")
+
+        # A failed readiness assertion must not leave the collector waiting
+        # on a fixture barrier while its owned process tree is cleaned up.
+        timeout_ready.set()
         if session is not None:
-            await shell._terminate_bg_session(session)
-            if session.collector_task is not None:
-                await asyncio.wait_for(asyncio.shield(session.collector_task), timeout=5)
-            shell._bg_sessions.pop(session.session_id, None)
-        if (
-            child_process is not None
-            and _strict_process_start_identity(child_process) == child_identity
-        ):
-            import signal
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(child_process, signal.SIGTERM)
-        if kernel32 is not None and child_handle is not None:
-            kernel32.CloseHandle(child_handle)
+            try:
+                await shell._terminate_bg_session(session)
+            except BaseException as exc:
+                retain_cleanup_failure("termination", exc)
+            try:
+                if session.collector_task is not None:
+                    await asyncio.wait_for(asyncio.shield(session.collector_task), timeout=5)
+                assert session.done, "PTY fixture collector did not finalize its session"
+                assert session.process_tree is None or not session.process_tree.is_active(), (
+                    "PTY fixture still owns a live process tree"
+                )
+                shell._bg_sessions.pop(session.session_id, None)
+            except BaseException as exc:
+                retain_cleanup_failure("collector drain", exc)
+        try:
+            if (
+                child_process is not None and child_identity is not None
+                and _strict_process_start_identity(child_process) == child_identity
+            ):
+                import signal
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(child_process, signal.SIGTERM)
+        except BaseException as exc:
+            retain_cleanup_failure("descendant cleanup", exc)
+        try:
+            if kernel32 is not None and child_handle is not None:
+                kernel32.CloseHandle(child_handle)
+        except BaseException as exc:
+            retain_cleanup_failure("handle close", exc)
         current_tool_context.reset(token)
+        if failure is None and cleanup_failure is not None:
+            raise cleanup_failure
 
 
 class _RawPty:
