@@ -34,6 +34,7 @@ class WebToolOutcome:
 
     error_kind: str
     retry_allowed: bool | None
+    failed_provider: str | None = None
 
 
 def parse_web_tool_outcome(tool_name: str, content: Any) -> WebToolOutcome | None:
@@ -55,7 +56,24 @@ def parse_web_tool_outcome(tool_name: str, content: Any) -> WebToolOutcome | Non
     return WebToolOutcome(
         error_kind=_normalize_error_kind(payload.get("error_kind")),
         retry_allowed=retry_allowed,
+        failed_provider=_failed_provider(payload),
     )
+
+
+def _failed_provider(payload: Mapping[str, Any]) -> str | None:
+    attempts = payload.get("provider_attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return None
+    last_attempt = attempts[-1]
+    if not isinstance(last_attempt, Mapping):
+        return None
+    status = last_attempt.get("status")
+    if not isinstance(status, str) or status not in {"error", "auth_missing", "auth_failed"}:
+        return None
+    provider = last_attempt.get("provider")
+    if not isinstance(provider, str):
+        return None
+    return provider.strip().lower() or None
 
 
 def web_retrieval_semantic_key(

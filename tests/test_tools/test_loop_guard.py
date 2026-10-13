@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from opensquilla.result_budget import (
@@ -10,6 +12,9 @@ from opensquilla.result_budget import (
     ToolRunBudgetTracker,
     clamp_tool_arguments,
 )
+from opensquilla.search.turn_state import SearchTurnState
+from opensquilla.search.types import SearchProviderError
+from opensquilla.search_tool_outcome import parse_web_tool_outcome
 
 
 @pytest.mark.asyncio
@@ -366,3 +371,112 @@ async def test_semantic_guard_isolated_between_trackers() -> None:
     )
 
     assert allowed.counted_as_search is True
+
+
+@pytest.mark.asyncio
+async def test_provider_guard_remembers_challenge_only_for_current_turn() -> None:
+    first_turn = ToolRunBudgetTracker()
+    state = first_turn.search_turn_state
+    with pytest.raises(SearchProviderError):
+        async with state.provider_attempt("duckduckgo"):
+            raise SearchProviderError("duckduckgo", "blocked", "Synthetic upstream challenge")
+
+    with pytest.raises(SearchProviderError) as blocked:
+        async with state.provider_attempt("duckduckgo"):
+            pytest.fail("A blocked provider must not be attempted again")
+
+    assert blocked.value.kind == "blocked"
+    assert blocked.value.retryable is False
+    assert "Do not retry" in str(blocked.value)
+    async with state.provider_attempt("brave"):
+        pass
+    async with ToolRunBudgetTracker().search_turn_state.provider_attempt("duckduckgo"):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_provider_guard_serializes_concurrent_duckduckgo_attempts() -> None:
+    state = SearchTurnState()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    waiting = asyncio.Event()
+    attempts = 0
+
+    async def first() -> None:
+        nonlocal attempts
+        async with state.provider_attempt("duckduckgo"):
+            attempts += 1
+            started.set()
+            await release.wait()
+            raise SearchProviderError("duckduckgo", "blocked", "Synthetic upstream challenge")
+
+    async def second() -> None:
+        nonlocal attempts
+        waiting.set()
+        async with state.provider_attempt("duckduckgo"):
+            attempts += 1
+
+    first_task = asyncio.create_task(first())
+    await started.wait()
+    second_task = asyncio.create_task(second())
+    await waiting.wait()
+    # Other providers can run while the DuckDuckGo request is pending.
+    async with state.provider_attempt("brave"):
+        pass
+    release.set()
+    outcomes = await asyncio.gather(first_task, second_task, return_exceptions=True)
+
+    assert attempts == 1
+    assert all(isinstance(outcome, SearchProviderError) for outcome in outcomes)
+    assert state.duckduckgo_blocked is True
+
+
+@pytest.mark.asyncio
+async def test_provider_guard_allows_retry_after_transient_failure_or_cancellation() -> None:
+    state = SearchTurnState()
+    with pytest.raises(SearchProviderError):
+        async with state.provider_attempt("duckduckgo"):
+            raise SearchProviderError("duckduckgo", "timeout", "Synthetic timeout", retryable=True)
+
+    started = asyncio.Event()
+
+    async def pending() -> None:
+        async with state.provider_attempt("duckduckgo"):
+            started.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(pending())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    async with state.provider_attempt("duckduckgo"):
+        pass
+    assert state.duckduckgo_blocked is False
+
+
+@pytest.mark.parametrize(
+    ("attempts", "failed_provider"),
+    [
+        (None, None),
+        ([], None),
+        ([{"provider": "duckduckgo", "status": "success"}], None),
+        ([{"provider": "duckduckgo", "status": []}], None),
+        ([{"provider": "duckduckgo", "status": {}}], None),
+        ([{"provider": "duckduckgo", "status": "error"}, {}], None),
+        ([{"provider": "duckduckgo", "status": "error"}], "duckduckgo"),
+    ],
+)
+def test_search_failure_provider_requires_final_failure_attempt(attempts, failed_provider) -> None:
+    outcome = parse_web_tool_outcome(
+        "web_search",
+        {
+            "ok": False,
+            "error_kind": "blocked",
+            "retry_allowed": False,
+            "provider_attempts": attempts,
+        },
+    )
+
+    assert outcome is not None
+    assert outcome.failed_provider == failed_provider
