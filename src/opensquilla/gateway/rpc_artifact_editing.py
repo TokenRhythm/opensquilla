@@ -48,6 +48,7 @@ from opensquilla.artifact_session.models import head_restore_receipt_state_revis
 from opensquilla.artifact_session.working_files import get_working_files, restore_working_revision
 from opensquilla.artifacts import (
     DEFAULT_ARTIFACT_MAX_BYTES,
+    ArtifactBudgetError,
     ArtifactIntegrityError,
     ArtifactNotFoundError,
     ArtifactRef,
@@ -79,6 +80,7 @@ from opensquilla.gateway.session_services import (
 )
 from opensquilla.gateway.websocket import get_registry
 from opensquilla.html_format import is_html
+from opensquilla.office_format import MAX_OFFICE_BYTES, validate_office_bytes
 from opensquilla.paths import media_root_from_config
 from opensquilla.session.keys import canonicalize_session_key
 
@@ -220,27 +222,24 @@ def _kind_for(ref: ArtifactRef) -> ArtifactKind:
 
 def _capabilities(artifact_format: str) -> dict[str, Any]:
     html = artifact_format == "html"
+    office = artifact_format in {"docx", "xlsx", "pptx"}
     capabilities: dict[str, Any] = {
         "download": True,
         "versionHistory": True,
-        "publish": html,
-        "preview": html,
+        "publish": html or office,
+        "preview": html or office,
         "source": html,
         "manualEdit": False,
-        "agentEdit": False,
+        "agentEdit": office,
         "sourceEdit": False,
         "browserUse": False,
-        "selectionContext": False,
-        "selection": False,
-        "promptAnnotations": False,
+        "selectionContext": office,
+        "selection": office,
+        "promptAnnotations": office,
         "engine": None,
     }
-    if not html:
-        capabilities["unavailableReason"] = (
-            "office_adapter_not_available"
-            if artifact_format in {"docx", "xlsx", "pptx"}
-            else "unsupported_format"
-        )
+    if not html and not office:
+        capabilities["unavailableReason"] = "unsupported_format"
     return capabilities
 
 
@@ -260,6 +259,21 @@ async def _revision_capabilities(
 ) -> dict[str, Any]:
     artifact_format = _format_for(revision.filename, revision.media_type, document.kind)
     capabilities = _capabilities(artifact_format)
+    if artifact_format in {"docx", "xlsx", "pptx"}:
+        try:
+            if document.session_id is None:
+                raise ValueError("Document has no material session")
+            store = ArtifactStore(media_root_from_config(ctx.config))
+            await asyncio.to_thread(
+                _validate_office_revision, store, document.session_id, revision, artifact_format,
+            )
+        except (
+            ArtifactNotFoundError, ArtifactIntegrityError, ArtifactBudgetError, OSError, ValueError,
+        ):
+            return {**capabilities, "preview": False, "publish": False, "agentEdit": False,
+                    "selectionContext": False, "selection": False, "promptAnnotations": False,
+                    "unavailableReason": "office_invalid_package"}
+        return capabilities
     if artifact_format != "html":
         return capabilities
     if document.session_id is None:
@@ -279,6 +293,18 @@ async def _revision_capabilities(
     except (ArtifactNotFoundError, ArtifactIntegrityError, OSError, ValueError):
         return _html_integrity_failure_capabilities()
     return capabilities
+
+
+def _validate_office_revision(
+    store: ArtifactStore, session_id: str, revision: Revision, artifact_format: str,
+) -> None:
+    ref, payload, _manifest = store.read_verified_material(
+        revision.artifact_id, session_id=session_id, max_bytes=MAX_OFFICE_BYTES,
+        validate_bundle=True,
+    )
+    if ref.sha256 != revision.artifact_sha256 or ref.size != revision.byte_size:
+        raise ArtifactIntegrityError("document revision material does not match its record")
+    validate_office_bytes(payload, artifact_format)
 
 
 def _revision_payload(revision: Revision) -> dict[str, Any]:

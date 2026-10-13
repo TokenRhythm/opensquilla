@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, inject, nextTick, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { ARTIFACT_WORKBENCH_KEY, type WorkingFileMetadata, type WorkingFileRequest } from '@/modules/artifactWorkbench'
+import { ARTIFACT_WORKBENCH_KEY, HtmlBundleExportError, type WorkingFileMetadata, type WorkingFileRequest } from '@/modules/artifactWorkbench'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { usePlatform } from '@/platform'
@@ -12,6 +12,7 @@ import { ImageClipboardError } from '@/utils/imageClipboard'
 import { copyTextWithFallback, downloadBlob, isMacPlatform } from '@/utils/browser'
 import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
 import { isPreviewPagePath } from '@/utils/workbench/previewPagePath'
+import { htmlBundleExportTarget } from '@/utils/workbench/htmlBundleExport'
 import Icon from '@/components/Icon.vue'
 
 const props = withDefaults(defineProps<{
@@ -19,6 +20,9 @@ const props = withDefaults(defineProps<{
   sessionKey?: string
   trigger?: boolean
   previewable?: boolean
+  requireSameOrigin?: boolean
+  /** New media-card shortcuts must not turn a spoofed MIME into a script opener. */
+  nativeOpenMediaOnly?: boolean
 }>(), { sessionKey: '', trigger: false, previewable: true })
 const emit = defineEmits<{ open: [artifact: ArtifactPayload] }>()
 const { t } = useI18n()
@@ -43,6 +47,10 @@ let epoch = 0
 const source = computed(() => selected.value?.source === 'workspace-preview'
   && typeof selected.value.documentId === 'string')
 const readable = computed(() => source.value ? !!metadata.value : !!selected.value)
+const bundleTarget = computed(() => selected.value ? htmlBundleExportTarget(selected.value) : null)
+const canOpenCopy = computed(() => !source.value && !!platform.files.openArtifact
+  && (!props.nativeOpenMediaOnly || /\.(?:png|jpe?g|gif|webp|svg|bmp|ico|tiff?|avif|heic|heif|jxl|apng|mp3|wav|m4a|aac|flac|ogg|oga|opus|mp4|m4v|mov|webm|ogv|mkv|avi|wmv)$/i
+    .test(String(selected.value?.name || '').trim())))
 const html = computed(() => !!selected.value && artifactWorkbenchPreviewKind({
   ...selected.value,
   ...(metadata.value ? { name: metadata.value.name, mime: metadata.value.mime } : {}),
@@ -72,7 +80,8 @@ const imageClipboard = useImageClipboard({
       if (blob.size > maxBytes) throw new ImageClipboardError('tooLarge')
       return blob
     }
-    const result = await workbench.content.fetchArtifact(artifact, { sessionKey: session, signal, maxBytes })
+    const result = await workbench.content.fetchArtifact(artifact, { sessionKey: session, signal, maxBytes,
+      ...(props.requireSameOrigin ? { requireSameOrigin: true } : {}) })
     if (!result.ok) throw new ImageClipboardError(result.errorCode === 'too_large' ? 'tooLarge' : 'failed')
     return result.blob
   },
@@ -85,7 +94,8 @@ const revealLabel = computed(() => t(isMacPlatform() ? 'resourceActions.revealFi
   : typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent)
     ? 'resourceActions.revealExplorer' : 'resourceActions.reveal'))
 const signature = computed(() => [props.sessionKey, props.artifact?.id, props.artifact?.documentId,
-  props.artifact?.previewPagePath, props.artifact?.download_url].join('\0'))
+  props.artifact?.document_id, props.artifact?.revisionId, props.artifact?.sha256,
+  props.artifact?.previewPagePath, props.artifact?.download_url, props.requireSameOrigin, props.nativeOpenMediaOnly].join('\0'))
 
 function close() {
   visible.value = false
@@ -167,7 +177,7 @@ async function show(event: MouseEvent | KeyboardEvent, artifact = props.artifact
   }
 }
 
-async function perform(action: 'preview' | 'save' | 'path' | 'contents' | 'open' | 'reveal' | 'copy-open') {
+async function perform(action: 'preview' | 'save' | 'export-zip' | 'path' | 'contents' | 'open' | 'reveal' | 'copy-open') {
   const artifact = selected.value
   if (!artifact || !workbench || !pending) return
   const isSource = source.value
@@ -182,6 +192,21 @@ async function perform(action: 'preview' | 'save' | 'path' | 'contents' | 'open'
   close()
   try {
     assertCurrent()
+    if (action === 'export-zip') {
+      const target = bundleTarget.value
+      if (!target || !workbench.content.exportHtmlBundle) return
+      const result = await workbench.content.exportHtmlBundle({ target, sessionKey: capturedSession, signal: pending.signal })
+      assertCurrent()
+      if (platform.files.saveArtifact) {
+        const data = await result.blob.arrayBuffer()
+        assertCurrent()
+        const saved = await platform.files.saveArtifact({ data, name: result.filename, mime: 'application/zip' })
+        assertCurrent()
+        if (saved.status === 'saved') pushToast(t('resourceActions.saved'), { tone: 'ok' })
+      } else downloadBlob(result.blob, result.filename)
+      return
+    }
+    if (action === 'copy-open' && !canOpenCopy.value) return
     if (action === 'preview') { emit('open', artifact); return }
     if (action === 'open' || action === 'reveal') {
       if (!request || !localInstance.value || !platform.files.sourceFileAction) return
@@ -203,7 +228,8 @@ async function perform(action: 'preview' | 'save' | 'path' | 'contents' | 'open'
       if (!workbench.content.fetchWorkingFile) throw new Error(t('resourceActions.unavailable'))
       blob = await workbench.content.fetchWorkingFile(request)
     } else {
-      const result = await workbench.content.fetchArtifact(artifact, { sessionKey: capturedSession, signal: pending.signal })
+      const result = await workbench.content.fetchArtifact(artifact, { sessionKey: capturedSession, signal: pending.signal,
+        ...(props.requireSameOrigin ? { requireSameOrigin: true } : {}) })
       if (!result.ok) throw new Error(result.message)
       blob = result.blob
     }
@@ -237,7 +263,12 @@ async function perform(action: 'preview' | 'save' | 'path' | 'contents' | 'open'
     } else { downloadBlob(blob, name) }
   } catch (error) {
     if (attempt === generation && !(error instanceof DOMException && error.name === 'AbortError')) {
-      pushToast(error instanceof Error ? error.message : t('resourceActions.failed'), { tone: 'danger' })
+      const exportKey = error instanceof HtmlBundleExportError ? {
+        unavailable: 'resourceActions.zipUnavailable', incomplete: 'resourceActions.zipIncomplete',
+        'too-large': 'resourceActions.zipTooLarge', 'source-forbidden': 'resourceActions.zipSourceForbidden',
+        'source-changed': 'resourceActions.zipSourceChanged', failed: 'resourceActions.zipFailed',
+      }[error.code] : null
+      pushToast(exportKey ? t(exportKey) : error instanceof Error ? error.message : t('resourceActions.failed'), { tone: 'danger' })
     }
   }
 }
@@ -272,7 +303,10 @@ defineExpose({ show })
           <button role="menuitem" type="button" @click="perform('open')">{{ t('resourceActions.openSource') }}</button>
           <button role="menuitem" type="button" @click="perform('reveal')">{{ revealLabel }}</button>
         </template>
-        <button v-if="!source && platform.files.openArtifact" role="menuitem" type="button" @click="perform('copy-open')">{{ t('resourceActions.openCopy') }}</button>
+        <button v-if="canOpenCopy" role="menuitem" type="button" @click="perform('copy-open')">{{ t('resourceActions.openCopy') }}</button>
+        <button v-if="bundleTarget && workbench?.content.exportHtmlBundle" role="menuitem" type="button"
+          :title="t(source ? 'resourceActions.zipWorking' : 'resourceActions.zipSnapshot')"
+          @click="perform('export-zip')">{{ t('resourceActions.downloadZip') }}</button>
         <template v-if="readable">
           <button role="menuitem" type="button" :title="source ? t('resourceActions.singleFile') : undefined" @click="perform('save')">
             {{ t(platform.files.saveArtifact ? 'resourceActions.saveAs' : 'chat.download') }}

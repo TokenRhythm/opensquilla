@@ -640,6 +640,9 @@ async def reconcile_pending_document_resources(
 ) -> DocumentResourceRecoverySummary:
     """Recover every pending import and publication without client retries."""
 
+    from opensquilla.artifact_session.working_files import reconcile_office_materializations
+
+    await reconcile_office_materializations(service, store)
     summary = DocumentResourceRecoverySummary()
     after: str | None = None
     while True:

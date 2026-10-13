@@ -87,6 +87,7 @@
           <span class="msg-media-card__meta">{{ artifactFileSubtitle(artifact) }}</span>
           <span class="msg-media-card__spacer" />
           <ImageCopyActions v-if="!shareMode" :source="{ kind: 'artifact', artifact }" :session-key="sessionKey" />
+          <ResourceActionsMenu v-if="!shareMode" :artifact="artifact" :session-key="sessionKey" :previewable="false" native-open-media-only trigger />
           <button
             type="button"
             class="msg-media-card__download"
@@ -107,6 +108,7 @@
         :data-artifact-key="artifactKey(artifact)"
         :artifact="artifact"
         :session-key="sessionKey"
+        :share-mode="shareMode"
         @download="$emit('download', $event)"
       />
     </TransitionGroup>
@@ -119,6 +121,7 @@
         :data-artifact-key="artifactKey(artifact)"
         :artifact="artifact"
         :session-key="sessionKey"
+        :share-mode="shareMode"
         @download="$emit('download', $event)"
       />
     </TransitionGroup>
@@ -152,6 +155,7 @@ import { computed, inject, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ImageCopyActions from '@/components/ImageCopyActions.vue'
+import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
 import ArtifactChip from '@/components/chat/ArtifactChip.vue'
 import AudioArtifactCard from '@/components/chat/AudioArtifactCard.vue'
 import VideoArtifactCard from '@/components/chat/VideoArtifactCard.vue'

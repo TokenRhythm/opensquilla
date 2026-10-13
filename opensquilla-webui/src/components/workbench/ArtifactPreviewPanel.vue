@@ -13,7 +13,8 @@
         <span class="artifact-preview__meta">{{ artifactFileSubtitle(artifact) }}</span>
       </span>
       <span class="artifact-preview__actions">
-        <ResourceActionsMenu :artifact="artifact" :session-key="sessionKey" :previewable="false" trigger />
+        <ResourceActionsMenu :artifact="actionArtifact" :session-key="sessionKey" :previewable="false"
+          :require-same-origin="!!artifact.revision_download_url" trigger />
         <button
           v-if="preview.kind.value !== 'unsupported'"
           type="button"
@@ -110,8 +111,21 @@
       </div>
 
       <template v-else-if="isRenderable">
+        <OfficePreviewPanel
+          v-if="officeFormat && preview.binary?.value"
+          :data="preview.binary.value"
+          :format="officeFormat"
+          :annotation-enabled="officeAnnotationEnabled"
+          :suspended="suspended"
+          @loading="officeRenderState = 'loading'"
+          @ready="officeRenderState = 'ready'"
+          @error="officeRenderState = 'error'"
+          @selection-request="selection => emit('workbench-event', { type: 'office-annotation-selected', payload: {
+            selection, revisionId: artifact.revisionId, sha256: artifact.sha256,
+          } })"
+        />
         <img
-          v-if="preview.kind.value === 'image'"
+          v-else-if="preview.kind.value === 'image'"
           class="artifact-preview__image"
           :src="preview.objectUrl.value"
           :alt="artifactFileTitle(artifact)"
@@ -187,6 +201,8 @@ import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
+import OfficePreviewPanel from './OfficePreviewPanel.vue'
+import { artifactPreviewActionTarget } from './artifactActionTarget'
 import {
   ARTIFACT_WORKBENCH_KEY,
   type ArtifactPreviewResourceState,
@@ -199,8 +215,8 @@ import {
   artifactFileTitle,
   artifactIconName,
 } from '@/utils/chat/artifacts'
-import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
 import { applyMarkdownImageResources, createMarkdownImageResolver } from '@/utils/workbench/markdownImageResources'
+import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE, isOfficePreviewFormat } from '@/utils/workbench/artifactPreview'
 import { useMarkdownEnhancements } from '@/composables/chat/useMarkdownEnhancements'
 
 const props = withDefaults(defineProps<{
@@ -214,10 +230,11 @@ const props = withDefaults(defineProps<{
   previewLaunchUrl?: string
   previewMode?: 'full' | 'offline'
   previewNetworkAllowed?: boolean
-  previewSandboxProfile?: 'default' | 'opaque-offline'
+  previewSandboxProfile?: 'default' | 'opaque-offline' | 'none'
   sessionKey?: string
   showHeader?: boolean
   suspended?: boolean
+  officeAnnotationEnabled?: boolean
 }>(), {
   baseOrigin: '',
   nativeHtml: false,
@@ -232,6 +249,7 @@ const props = withDefaults(defineProps<{
   sessionKey: '',
   showHeader: true,
   suspended: false,
+  officeAnnotationEnabled: false,
 })
 
 const emit = defineEmits<{
@@ -243,6 +261,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const actionArtifact = computed(() => artifactPreviewActionTarget(props.artifact))
 const artifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
 if (!artifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 const previewFrameRef = ref<HTMLIFrameElement | null>(null)
@@ -275,6 +294,11 @@ const preview = artifactWorkbench.previews.createResource({
   },
   sessionKey: () => props.sessionKey,
 })
+const officeFormat = computed(() => isOfficePreviewFormat(preview.kind.value) ? preview.kind.value : null)
+const officeRenderState = ref<ArtifactPreviewResourceState>('loading')
+watch(() => preview.binary?.value, () => { officeRenderState.value = 'loading' }, { flush: 'sync' })
+const reportedPreviewState = computed(() => officeFormat.value && preview.state.value === 'ready'
+  ? officeRenderState.value : preview.state.value)
 
 useMarkdownEnhancements(markdownPreviewEl, { version: () => preview.markdownHtml.value })
 
@@ -284,7 +308,10 @@ watch([markdownPreviewEl, () => preview.markdownImages?.value], ([root, resource
 
 const resourceSignature = computed(() => [
   props.artifact.id || '',
+  props.artifact.revisionId || '',
+  props.artifact.sha256 || '',
   props.artifact.download_url || '',
+  props.artifact.revision_download_url || '',
   props.artifact.name || '',
   props.artifact.mime || '',
   props.artifact.size || '',
@@ -364,7 +391,7 @@ watch(
 )
 
 watch(
-  preview.state,
+  reportedPreviewState,
   state => {
     emit('state-change', state)
     emit('workbench-event', { type: 'preview-state-change', payload: state })
@@ -376,9 +403,10 @@ function emitArtifactEvent(
   type: 'artifact-download' | 'artifact-external-open',
   legacyType: 'download' | 'external-open',
 ) {
-  if (legacyType === 'download') emit('download', props.artifact)
-  else emit('external-open', props.artifact)
-  emit('workbench-event', { type, payload: props.artifact })
+  const target = actionArtifact.value
+  if (legacyType === 'download') emit('download', target)
+  else emit('external-open', target)
+  emit('workbench-event', { type, payload: target })
 }
 
 // `pdfViewerEnabled` only describes the browser's inline PDF capability. It

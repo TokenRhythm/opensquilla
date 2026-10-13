@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 
 import { createApp, h, nextTick, reactive } from 'vue'
+import { readFileSync } from 'node:fs'
 import type { Component } from 'vue'
 import { createI18n } from 'vue-i18n'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -18,6 +19,13 @@ import {
 import type { ArtifactPayload } from '@/types/artifacts'
 import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
 import type { Window as TestWindow } from 'happy-dom'
+import { createOfficePreviewSession } from '@/workbench/officePreviewAdapter'
+import type { OfficePreviewSession } from '@/workbench/officePreviewAdapter'
+import { OFFICE_PREVIEW_MIMES } from '@/utils/workbench/artifactPreview'
+import { ARTIFACT_DOCUMENT_RPC_METHODS, createRpcArtifactDocumentProvider } from '@/adapters/gateway/artifactDocumentsV4'
+import officeRevisionWire from '@/testing/fixtures/officeRevisionPreview/wire.json'
+
+vi.mock('@/workbench/officePreviewAdapter', () => ({ createOfficePreviewSession: vi.fn() }))
 
 function artifact(overrides: Partial<ArtifactPayload> = {}): ArtifactPayload {
   return {
@@ -124,6 +132,80 @@ describe('ArtifactPreviewPanel', () => {
         expect(new TextDecoder().decode(payload.data)).toContain('Preview content')
       }
     }
+    mounted.unmount()
+  })
+
+  it('automatically previews pinned Office revisions while the mutable download head advances', async () => {
+    // Recorded from the synthetic live Gateway trial: only the first slide's
+    // title changed, but both the SHA-256 and byte length changed with it.
+    const updatedDocument = officeRevisionWire.documentResponse.document
+    const revisions = officeRevisionWire.revisionsResponse.revisions
+    const initialRevision = revisions.find(revision => revision.generation === 1)!
+    const updatedRevision = revisions.find(revision => revision.generation === 2)!
+    const initialBytes = new Uint8Array(readFileSync('src/testing/fixtures/officeRevisionPreview/initial.pptx')).buffer
+    const updatedBytes = new Uint8Array(readFileSync('src/testing/fixtures/officeRevisionPreview/updated.pptx')).buffer
+    let selectedRevision = initialRevision
+    const call = vi.fn(async (method: string) => {
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.capabilities) return { formats: { pptx: { preview: true } } }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.documentsGet) return { document: {
+        ...updatedDocument, headRevisionId: selectedRevision.id, generation: selectedRevision.generation, head: selectedRevision,
+      } }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.revisionsList) return officeRevisionWire.revisionsResponse
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.changesList) return { changeSets: [] }
+      throw new Error(`Unexpected RPC ${method}`)
+    })
+    const provider = createRpcArtifactDocumentProvider({ call: call as Parameters<typeof createRpcArtifactDocumentProvider>[0]['call'], hasRpcMethod: () => true })
+    const source = { documentId: updatedDocument.id, name: updatedDocument.name, mime: updatedRevision.mime }
+    const initialWorkspace = await provider.loadWorkspace(source, 'session-office-preview')
+    const requestBinary = vi.fn(async (url: string) => httpBinaryResponse(
+      url === initialRevision.downloadUrl ? initialBytes : updatedBytes,
+      { contentType: updatedRevision.mime },
+    ))
+    vi.mocked(createOfficePreviewSession).mockResolvedValue({
+      goTo: vi.fn(), getPageSize: vi.fn(() => null), getNotes: vi.fn(() => null), renderThumbnail: vi.fn(), fitPage: vi.fn(),
+      destroy: vi.fn(), previous: vi.fn(), next: vi.fn(), resize: vi.fn(), fitWidth: vi.fn(), zoomIn: vi.fn(), zoomOut: vi.fn(), setSelectionMode: vi.fn(), clearSelection: vi.fn(),
+    })
+    const onStateChange = vi.fn()
+    const mounted = mountPanel({ artifact: initialWorkspace.headArtifact, sessionKey: 'session-office-preview', onStateChange }, httpTransportTestDouble({ requestBinary }))
+    await vi.waitFor(() => expect(onStateChange).toHaveBeenLastCalledWith('ready'))
+    expect(requestBinary).toHaveBeenLastCalledWith(initialRevision.downloadUrl, expect.objectContaining({ sessionKey: 'session-office-preview' }))
+    expect(initialWorkspace.headArtifact.download_url).toBe(updatedDocument.latestDownloadUrl)
+
+    selectedRevision = updatedRevision
+    const updatedWorkspace = await provider.loadWorkspace(source, 'session-office-preview')
+    mounted.update({ artifact: updatedWorkspace.headArtifact })
+    await vi.waitFor(() => {
+      expect(requestBinary).toHaveBeenLastCalledWith(updatedRevision.downloadUrl, expect.objectContaining({ sessionKey: 'session-office-preview' }))
+      expect(onStateChange).toHaveBeenLastCalledWith('ready')
+    })
+    expect(updatedWorkspace.headArtifact.download_url).toBe(updatedDocument.latestDownloadUrl)
+    expect(requestBinary.mock.calls.map(([url]) => url)).toEqual([initialRevision.downloadUrl, updatedRevision.downloadUrl])
+    expect(mounted.element.querySelector('[role="alert"]')).toBeNull()
+    mounted.unmount()
+  })
+
+  it('reports Office rendering state after byte download and retains render failure with retry', async () => {
+    let resolve!: (session: OfficePreviewSession) => void
+    vi.mocked(createOfficePreviewSession).mockImplementationOnce(() => new Promise(next => { resolve = next }))
+    const onStateChange = vi.fn()
+    const mounted = mountPanel({ artifact: artifact({ name: 'sample.docx', mime: OFFICE_PREVIEW_MIMES.docx }), onStateChange },
+      httpTransportTestDouble({ requestBinary: vi.fn().mockResolvedValue(httpBinaryResponse('office-bytes', {
+        contentType: OFFICE_PREVIEW_MIMES.docx,
+      })) }))
+    await settlePreview()
+    expect(onStateChange).toHaveBeenLastCalledWith('loading')
+    expect(onStateChange).not.toHaveBeenCalledWith('ready')
+    const destroy = vi.fn()
+    resolve({ destroy, previous: vi.fn(), next: vi.fn(), resize: vi.fn(), fitWidth: vi.fn(), zoomIn: vi.fn(), zoomOut: vi.fn(), setSelectionMode: vi.fn(), clearSelection: vi.fn(),
+      goTo: vi.fn(), getPageSize: vi.fn(() => null), getNotes: vi.fn(() => null), renderThumbnail: vi.fn(), fitPage: vi.fn() })
+    await settlePreview()
+    expect(onStateChange).toHaveBeenLastCalledWith('ready')
+    vi.mocked(createOfficePreviewSession).mockRejectedValueOnce(new Error('invalid archive'))
+    mounted.update({ artifact: artifact({ name: 'sample.docx', mime: OFFICE_PREVIEW_MIMES.docx, revisionId: 'next' }) })
+    await settlePreview()
+    expect(onStateChange).toHaveBeenLastCalledWith('error')
+    expect(mounted.element.querySelector('[role="alert"]')).toBeTruthy()
+    expect(destroy).toHaveBeenCalledOnce()
     mounted.unmount()
   })
 
@@ -455,6 +537,26 @@ describe('ArtifactPreviewPanel', () => {
 
     expect(onExternalOpen).toHaveBeenCalledWith(item)
     expect(onDownload).toHaveBeenCalledWith(item)
+    mounted.unmount()
+  })
+
+  it('pins header actions to the shown revision while preserving its metadata', async () => {
+    const onExternalOpen = vi.fn()
+    const onDownload = vi.fn()
+    const onWorkbenchEvent = vi.fn()
+    const item = artifact({ id: 'artifact-2', revisionId: 'revision-2', name: 'archive-v2.zip',
+      mime: 'application/zip', sha256: '2'.repeat(64), size: 200,
+      download_url: '/api/v1/artifact-documents/document-1', revision_download_url: '/api/v1/artifacts/artifact-2' })
+    const mounted = mountPanel({ artifact: item, onDownload, onExternalOpen, onWorkbenchEvent })
+    await settlePreview()
+    const actions = [...mounted.element.querySelectorAll<HTMLButtonElement>('.artifact-preview__actions button:not(.resource-actions-trigger)')]
+    actions[0]?.click()
+    actions[1]?.click()
+    const pinned = { ...item, download_url: '/api/v1/artifacts/artifact-2' }
+    expect(onExternalOpen).toHaveBeenCalledWith(pinned)
+    expect(onDownload).toHaveBeenCalledWith(pinned)
+    expect(onWorkbenchEvent).toHaveBeenCalledWith({ type: 'artifact-download', payload: pinned })
+    expect(item.download_url).toBe('/api/v1/artifact-documents/document-1')
     mounted.unmount()
   })
 

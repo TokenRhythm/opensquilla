@@ -38,16 +38,19 @@
       <span>{{ primaryActionText }}</span>
     </button>
 
-    <button
-      type="button"
-      class="msg-audio-card__download"
-      :class="{ 'msg-audio-card__download--labelled': state === 'unsupported' }"
-      :aria-label="t('chat.downloadTitle', { title: artifactFileTitle(artifact) })"
-      @click="emit('download', artifact)"
-    >
-      <Icon name="download" :size="16" />
-      <span v-if="state === 'unsupported'">{{ t('chat.download') }}</span>
-    </button>
+    <span class="msg-audio-card__file-actions">
+      <ResourceActionsMenu v-if="!shareMode" :artifact="artifact" :session-key="sessionKey" :previewable="false" native-open-media-only trigger />
+      <button
+        type="button"
+        class="msg-audio-card__download"
+        :class="{ 'msg-audio-card__download--labelled': state === 'unsupported' }"
+        :aria-label="t('chat.downloadTitle', { title: artifactFileTitle(artifact) })"
+        @click="emit('download', artifact)"
+      >
+        <Icon name="download" :size="16" />
+        <span v-if="state === 'unsupported'">{{ t('chat.download') }}</span>
+      </button>
+    </span>
   </article>
 </template>
 
@@ -55,6 +58,7 @@
 import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
 import { useInlineMediaArtifact } from '@/composables/chat/useInlineMediaArtifact'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { artifactFileSubtitle, artifactFileTitle } from '@/utils/chat/artifacts'
@@ -62,6 +66,7 @@ import { artifactFileSubtitle, artifactFileTitle } from '@/utils/chat/artifacts'
 const props = defineProps<{
   artifact: ArtifactPayload
   sessionKey?: string
+  shareMode?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -164,6 +169,12 @@ const primaryActionLabel = computed(() =>
   padding: 0 var(--sp-3);
 }
 
+.msg-audio-card__file-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
 .msg-audio-card__download {
   width: var(--sp-8);
   padding: 0;
@@ -202,7 +213,7 @@ const primaryActionLabel = computed(() =>
     width: 100%;
   }
 
-  .msg-audio-card__download {
+  .msg-audio-card__file-actions {
     grid-column: 3;
     grid-row: 1;
   }

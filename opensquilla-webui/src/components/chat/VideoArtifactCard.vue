@@ -101,6 +101,7 @@
       <span class="msg-video-card__name">{{ title }}</span>
       <span class="msg-video-card__meta">{{ subtitle }}</span>
       <span class="msg-video-card__spacer" />
+      <ResourceActionsMenu v-if="!shareMode" :artifact="artifact" :session-key="sessionKey" :previewable="false" native-open-media-only trigger />
       <button
         v-if="previewState === 'loaded'"
         type="button"
@@ -150,6 +151,7 @@ function retainVideoPreview(entry: RetainedVideoPreview): void {
 import { computed, inject, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
 import {
   ARTIFACT_WORKBENCH_KEY,
   type ArtifactPreviewState,
@@ -163,6 +165,7 @@ import {
 const props = defineProps<{
   artifact: ArtifactPayload
   sessionKey?: string
+  shareMode?: boolean
 }>()
 
 const emit = defineEmits<{

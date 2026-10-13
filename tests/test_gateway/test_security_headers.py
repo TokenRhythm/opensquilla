@@ -89,7 +89,7 @@ def test_csp_allows_only_same_origin_blob_and_https_media() -> None:
     ] == ["media-src 'self' blob: https:"], csp
 
 
-def test_csp_allows_local_diagram_workers_and_wasm_without_javascript_eval() -> None:
+def test_csp_allows_office_and_local_diagram_workers_without_javascript_eval() -> None:
     csp = _client().get("/control/ping").headers.get("content-security-policy", "")
     directives = [directive.strip() for directive in csp.split(";") if directive.strip()]
 
@@ -98,7 +98,7 @@ def test_csp_allows_local_diagram_workers_and_wasm_without_javascript_eval() -> 
     ] == ["script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'"], csp
     assert [
         directive for directive in directives if directive.startswith("worker-src ")
-    ] == ["worker-src 'self'"], csp
+    ] == ["worker-src 'self' blob:"], csp
     assert "'unsafe-eval'" not in csp, csp
 
 

@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, h, nextTick, reactive, type App } from 'vue'
 import i18n from '@/i18n'
-import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
+import { ARTIFACT_WORKBENCH_KEY, HtmlBundleExportError } from '@/modules/artifactWorkbench'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { useNativeSurfaceOcclusionState } from '@/composables/useDialogA11y'
 import type { ArtifactPayload } from '@/types/artifacts'
@@ -27,13 +27,14 @@ const info = { documentId: 'doc_one', pagePath: 'editorial.html', sourcePath: '/
 const markdown = { source: 'publish_artifact', id: 'notes', name: 'notes.md', mime: 'text/markdown' }
 const apps: App[] = []
 async function settle() { for (let i = 0; i < 12; i++) await nextTick() }
-async function mount(artifact: ArtifactPayload = source, previewable = true) {
+async function mount(artifact: ArtifactPayload = source, previewable = true, requireSameOrigin = false) {
   const content = { workingFileMetadata: vi.fn().mockResolvedValue(info),
     fetchWorkingFile: vi.fn().mockResolvedValue(new Blob(['<h1>current</h1>'], { type: 'text/html' })),
     fetchArtifact: vi.fn().mockResolvedValue({ ok: true, blob: new Blob(['old version'], { type: 'text/plain' }) }),
+    exportHtmlBundle: vi.fn().mockResolvedValue({ blob: new Blob(['zip bytes'], { type: 'application/zip' }), filename: 'webpage.zip' }),
   }
   const access = reactive({ subscriptionEpoch: 1 })
-  const props = reactive({ artifact, sessionKey: 'agent:main:webchat:one', trigger: true, previewable })
+  const props = reactive({ artifact, sessionKey: 'agent:main:webchat:one', trigger: true, previewable, requireSameOrigin })
   const onOpen = vi.fn()
   const host = document.createElement('div')
   document.body.appendChild(host)
@@ -67,6 +68,103 @@ afterEach(() => {
 })
 
 describe('shared resource actions', () => {
+  it('exports the selected document revision to a local desktop ZIP without invoking an opener', async () => {
+    mocks.platform.id = 'desktop'
+    const saveArtifact = vi.fn().mockResolvedValue({ status: 'saved' })
+    const openArtifact = vi.fn()
+    mocks.platform.files = { saveArtifact, openArtifact }
+    const f = await mount({ id: 'art-old', documentId: 'doc_one', revisionId: 'rev_two', name: 'index.html', mime: 'text/html',
+      download_url: '/api/v1/artifact-documents/doc_one' })
+    await f.open()
+    item('resourceActions.downloadZip')!.click()
+    await vi.waitFor(() => expect(saveArtifact).toHaveBeenCalledOnce())
+    expect(f.content.exportHtmlBundle).toHaveBeenCalledWith({ target: { type: 'document', documentId: 'doc_one', revisionId: 'rev_two' },
+      sessionKey: f.props.sessionKey, signal: expect.any(AbortSignal) })
+    expect(saveArtifact).toHaveBeenCalledWith(expect.objectContaining({ name: 'webpage.zip', mime: 'application/zip' }))
+    expect(openArtifact).not.toHaveBeenCalled()
+    expect(f.content.fetchArtifact).not.toHaveBeenCalled()
+  })
+
+  it('downloads a published version on Web without touching current source files', async () => {
+    const f = await mount({ id: 'art-published', name: 'index.html', mime: 'text/html' })
+    await f.open()
+    expect(item('resourceActions.downloadZip')!.title).toBe(i18n.global.t('resourceActions.zipSnapshot'))
+    item('resourceActions.downloadZip')!.click()
+    await settle()
+    expect(f.content.exportHtmlBundle).toHaveBeenCalledWith(expect.objectContaining({ target: { type: 'artifact', artifactId: 'art-published' } }))
+    expect(mocks.download).toHaveBeenCalledWith(expect.any(Blob), 'webpage.zip')
+    expect(f.content.fetchWorkingFile).not.toHaveBeenCalled()
+  })
+
+  it('exports current workspace contents explicitly and explains remote permission denial without fallback', async () => {
+    const f = await mount()
+    f.content.exportHtmlBundle.mockRejectedValue(new HtmlBundleExportError('source-forbidden'))
+    await f.open()
+    expect(item('resourceActions.downloadZip')!.title).toBe(i18n.global.t('resourceActions.zipWorking'))
+    item('resourceActions.downloadZip')!.click()
+    await settle()
+    expect(f.content.exportHtmlBundle).toHaveBeenCalledWith(expect.objectContaining({ target: { type: 'working', documentId: 'doc_one', pagePath: 'editorial.html' } }))
+    expect(mocks.toast).toHaveBeenCalledWith(i18n.global.t('resourceActions.zipSourceForbidden'), { tone: 'danger' })
+    expect(mocks.download).not.toHaveBeenCalled()
+    expect(f.content.fetchArtifact).not.toHaveBeenCalled()
+  })
+
+  it.each(['unavailable', 'incomplete', 'too-large'] as const)('does not save a fallback HTML file after ZIP failure %s', async code => {
+    const f = await mount({ id: 'art-published', name: 'index.html', mime: 'text/html' })
+    f.content.exportHtmlBundle.mockRejectedValue(new HtmlBundleExportError(code))
+    await f.open()
+    item('resourceActions.downloadZip')!.click()
+    await settle()
+    expect(mocks.download).not.toHaveBeenCalled()
+    expect(f.content.fetchArtifact).not.toHaveBeenCalled()
+    expect(mocks.toast).toHaveBeenCalledOnce()
+  })
+
+  it.each(['session', 'epoch', 'revision', 'unmount'])('discards a completed ZIP when %s changes while downloading', async change => {
+    const f = await mount({ id: 'art-published', documentId: 'doc_one', revisionId: 'rev_one', name: 'index.html', mime: 'text/html' })
+    let finish!: (value: { blob: Blob; filename: string }) => void
+    f.content.exportHtmlBundle.mockImplementation(() => new Promise(resolve => { finish = resolve }))
+    await f.open()
+    item('resourceActions.downloadZip')!.click()
+    await nextTick()
+    const request = f.content.exportHtmlBundle.mock.calls[0]![0]
+    if (change === 'session') f.props.sessionKey = 'another-session'
+    if (change === 'epoch') f.access.subscriptionEpoch++
+    if (change === 'revision') f.props.artifact.revisionId = 'rev_two'
+    if (change === 'unmount') apps.pop()!.unmount()
+    await nextTick()
+    expect(request.signal.aborted).toBe(true)
+    finish({ blob: new Blob(['stale']), filename: 'stale.zip' })
+    await settle()
+    expect(mocks.download).not.toHaveBeenCalled()
+    expect(mocks.toast).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { name: 'page.html', download_url: 'https://external.invalid/page.html' },
+    { documentId: 'doc_one', name: 'page.html' },
+    { id: 'art-image', name: 'image.png', mime: 'image/png' },
+  ])('hides ZIP for resources without an eligible immutable/source HTML identity: %j', async artifact => {
+    const f = await mount(artifact)
+    await f.open()
+    expect(item('resourceActions.downloadZip')).toBeUndefined()
+    expect(f.content.exportHtmlBundle).not.toHaveBeenCalled()
+  })
+
+  it('carries the preview trust policy into Save As and keeps native open absent on Web', async () => {
+    const artifact = { ...markdown, revisionId: 'revision-2', sha256: '2'.repeat(64),
+      download_url: '/api/v1/artifacts/notes', revision_download_url: '/api/v1/artifacts/notes' }
+    const f = await mount(artifact, false, true)
+    await f.open()
+    expect(item('resourceActions.openCopy')).toBeUndefined()
+    item('chat.download')!.click()
+    await settle()
+    expect(f.content.fetchArtifact).toHaveBeenCalledWith(artifact, expect.objectContaining({
+      sessionKey: f.props.sessionKey, requireSameOrigin: true,
+    }))
+    expect(mocks.download).toHaveBeenCalledOnce()
+  })
+
   it('copies original SVG source through the shared async clipboard path', async () => {
     const text = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 8">\n<!-- unchanged -->\n</svg>'
     const copied: Blob[] = []
@@ -156,7 +254,7 @@ describe('shared resource actions', () => {
     ['Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)', 'resourceActions.revealFinder'],
     ['Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'resourceActions.revealExplorer'],
     ['Mozilla/5.0 (X11; Linux x86_64)', 'resourceActions.reveal'],
-  ])('shows exactly four local HTML actions with the native label for %s', async (userAgent, revealKey) => {
+  ])('shows local HTML actions with the native label for %s', async (userAgent, revealKey) => {
     vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue(userAgent)
     mocks.platform.id = 'desktop'
     const action = vi.fn().mockResolvedValue(undefined)
@@ -164,7 +262,7 @@ describe('shared resource actions', () => {
     const f = await mount()
     await f.open()
     expect([...document.querySelectorAll('[role="menuitem"]')].map(el => el.textContent?.trim())).toEqual([
-      'resourceActions.preview', 'resourceActions.openSource', revealKey, 'resourceActions.saveAs',
+      'resourceActions.preview', 'resourceActions.openSource', revealKey, 'resourceActions.downloadZip', 'resourceActions.saveAs',
     ].map(key => i18n.global.t(key)))
     item(revealKey)!.click()
     await settle()
@@ -257,7 +355,7 @@ describe('shared resource actions', () => {
     expect(useNativeSurfaceOcclusionState().value).toBe(false)
   })
 
-  it('omits in-app preview in the toolbar and focuses an action after metadata loads', async () => {
+  it('offers ZIP without waiting for metadata and preserves its focus as other actions load', async () => {
     const f = await mount(source, false)
     let resolve!: (metadata: typeof info) => void
     f.content.workingFileMetadata.mockImplementation(() => new Promise(done => { resolve = done }))
@@ -265,12 +363,12 @@ describe('shared resource actions', () => {
     f.trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'F10', shiftKey: true, bubbles: true }))
     await settle()
     const menu = document.querySelector('[role="menu"]')!
-    expect(document.activeElement).toBe(menu)
+    expect(document.activeElement).toBe(item('resourceActions.downloadZip'))
     expect(item('resourceActions.preview')).toBeUndefined()
     resolve(info)
     await settle()
-    expect(document.activeElement).toBe(item('chat.download'))
-    expect(document.querySelectorAll('[role="menuitem"]')).toHaveLength(1)
+    expect(document.activeElement).toBe(item('resourceActions.downloadZip'))
+    expect(document.querySelectorAll('[role="menuitem"]')).toHaveLength(2)
     menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     await nextTick()
     expect(document.activeElement).toBe(f.trigger)

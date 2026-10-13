@@ -39,7 +39,7 @@ describe('chat topbar semantic state contract', () => {
 
     expect(desktopUpdateSource).toContain('sidebar-desktop-update')
     expect(desktopUpdateSource).not.toContain('topbar-state--update')
-    expect(desktopUpdateSource).toContain(':data-state="severity"')
+    expect(desktopUpdateSource).toContain('data-state="info"')
   })
 
   it('limits world-theme emphasis to informational, warning, and danger states', () => {

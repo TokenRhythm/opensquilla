@@ -297,6 +297,12 @@ class GeneratedArtifactAdopter:
         if candidate is not None and candidate.artifact_id != ref.id:
             raise ValueError("generated publication belongs to another artifact")
         if self.workspace is not None and candidate is not None:
+            candidate_root = Path(self.workspace) / "artifacts" / ".office-candidates"
+            if Path(candidate.path).is_relative_to(candidate_root):
+                # Candidates are never adopted by publication, including queue recovery
+                # where no runtime adopter object survived. Only turn completion commits.
+                return
+        if self.workspace is not None and candidate is not None:
             from opensquilla.artifact_session.working_files import prepare_working_source
 
             try:
@@ -407,6 +413,11 @@ class GeneratedArtifactAdopter:
         if len(matches) != 1:
             return False
         binding = matches[0]
+        from opensquilla.office_format import office_format
+
+        if office_format(binding.entrypoint, binding.entry_mime):
+            # This download is not a committed Office version or publication receipt.
+            return True
         saved = await save_working_version(
             self.service,
             self.store,

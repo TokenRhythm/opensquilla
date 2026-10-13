@@ -18,6 +18,8 @@ import {
 } from '@/workbench/workbenchResourceItems'
 import { normalizeWorkbenchResource } from '@/workbench/workbenchResourceProvider'
 import ArtifactDocumentPanel from './ArtifactDocumentPanel.vue'
+import OfficePreviewPanel from './OfficePreviewPanel.vue'
+import * as officePreviewAdapter from '@/workbench/officePreviewAdapter'
 
 const officeArtifact: ArtifactPayload = {
   id: 'artifact-office',
@@ -528,6 +530,102 @@ describe('ArtifactDocumentPanel', () => {
     mounted.unmount()
   })
 
+  it('describes an ordinary Office selection without claiming the preview is hidden', async () => {
+    const mounted = mountPanel({
+      artifact: officeArtifact,
+      documentSnapshot: snapshot(),
+      annotationFallback: { annotationId: 'office-selection', body: '', reason: 'office-selection' },
+    })
+    await nextTick()
+    const dialog = mounted.element.querySelector('[role="dialog"]')
+    expect(dialog?.querySelector('strong')?.textContent).toBe('Request changes')
+    expect(dialog?.textContent).toContain(en.workbench.office.requestHint)
+    expect(dialog?.textContent).not.toContain(en.workbench.office.previewHint)
+    expect(dialog?.textContent).not.toContain('temporarily hidden')
+    expect(dialog?.textContent).not.toContain('Continue annotation')
+    mounted.unmount()
+  })
+
+  it.each(['escape', 'cancel button', 'focus moved elsewhere'] as const)(
+    'restores the Office mode keyboard scope after %s without stealing intentional focus',
+    async closeMethod => {
+      let viewerOptions: officePreviewAdapter.OfficePreviewOptions | undefined
+      const setSelectionMode = vi.fn()
+      vi.spyOn(officePreviewAdapter, 'createOfficePreviewSession').mockImplementation(async options => {
+        viewerOptions = options
+        options.onLocation(0, 1)
+        return {
+          destroy: vi.fn(), previous: vi.fn(async () => {}), next: vi.fn(async () => {}),
+          goTo: vi.fn(async () => {}), getPageSize: vi.fn(() => null), getNotes: vi.fn(() => null),
+          renderThumbnail: vi.fn(), fitPage: vi.fn(),
+          fitWidth: vi.fn(), zoomIn: vi.fn(), zoomOut: vi.fn(), resize: vi.fn(),
+          setSelectionMode, clearSelection: vi.fn(),
+        }
+      })
+      const fallback = ref<{ annotationId: string; body: string; reason: string } | null>(null)
+      const data = new ArrayBuffer(1)
+      const element = document.createElement('div')
+      document.body.append(element)
+      const app = createApp({ render: () => h('div', [
+        h(OfficePreviewPanel, {
+          data, format: 'pptx', annotationEnabled: true,
+          onSelectionRequest: () => { fallback.value = { annotationId: 'office-focus', body: '', reason: 'office-selection' } },
+        }),
+        h(ArtifactDocumentPanel, {
+          artifact: officeArtifact, documentSnapshot: snapshot(), suspended: true,
+          annotationFallback: fallback.value,
+          onWorkbenchEvent: (event: { type: string }) => {
+            if (event.type === 'artifact-annotation-fallback-cancel') fallback.value = null
+          },
+        }),
+        h('button', { class: 'intentional-focus-target' }, 'Elsewhere'),
+      ]) })
+      app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
+      app.use(createPinia())
+      provideArtifactWorkbench(app)
+      app.mount(element)
+      try {
+        await nextTick(); await nextTick()
+        const toggle = element.querySelector<HTMLButtonElement>('.office-preview__request')!
+        const preview = element.querySelector<HTMLElement>('.office-preview')!
+        toggle.click(); await nextTick()
+        expect(document.activeElement).toBe(preview)
+        viewerOptions!.onSelectionCommit!({ format: 'pptx', kind: 'element', slideIndex: 0, shapeId: '1', text: 'Title', truncated: false })
+        await nextTick(); await nextTick()
+        const dialog = element.querySelector<HTMLElement>('[role="dialog"]')!
+        const input = dialog.querySelector<HTMLTextAreaElement>('textarea')!
+        expect(document.activeElement).toBe(input)
+        const elsewhere = element.querySelector<HTMLButtonElement>('.intentional-focus-target')!
+        if (closeMethod === 'escape') {
+          const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+          input.dispatchEvent(escape)
+          expect(escape.defaultPrevented).toBe(true)
+        } else {
+          if (closeMethod === 'focus moved elsewhere') elsewhere.focus()
+          else dialog.querySelector<HTMLButtonElement>('button[type="button"]')!.focus()
+          dialog.querySelector<HTMLButtonElement>('button[type="button"]')!.click()
+        }
+        await nextTick(); await nextTick()
+        expect(element.querySelector('[role="dialog"]')).toBeNull()
+        expect(toggle.getAttribute('aria-pressed')).toBe('true')
+        if (closeMethod === 'focus moved elsewhere') {
+          expect(document.activeElement).toBe(elsewhere)
+        } else {
+          expect(document.activeElement).toBe(preview)
+          const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+          document.activeElement!.dispatchEvent(escape)
+          await nextTick()
+          expect(escape.defaultPrevented).toBe(true)
+          expect(toggle.getAttribute('aria-pressed')).toBe('false')
+          expect(setSelectionMode).toHaveBeenLastCalledWith(false)
+        }
+      } finally {
+        app.unmount()
+        element.remove()
+      }
+    },
+  )
+
   it('keeps annotation input available in the trusted Vue fallback', async () => {
     vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
@@ -548,6 +646,7 @@ describe('ArtifactDocumentPanel', () => {
     const dialog = mounted.element.querySelector('[role="dialog"]')
     const input = dialog?.querySelector<HTMLTextAreaElement>('textarea')
     expect(dialog?.textContent).toContain('Continue annotation')
+    expect(dialog?.textContent).toContain('The preview is temporarily hidden.')
     expect(dialog?.querySelector('img')).toBeNull()
     expect(input?.value).toBe('Initial draft')
     expect(dialog?.textContent).toContain('Shift + Enter for a new line')

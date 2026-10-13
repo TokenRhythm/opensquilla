@@ -286,6 +286,7 @@
           || appStore.features.artifactPromptAnnotations === true
         )"
         :prompt-annotations-enabled="appStore.features.artifactPromptAnnotations === true"
+        :office-prompt-annotations-enabled="appStore.features.officePromptAnnotations === true"
         :route-active="isChatRoute"
         :session-id="workbenchSessionKey"
         :modal-blocked="workbenchModalBlocked"

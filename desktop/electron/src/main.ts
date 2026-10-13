@@ -1588,6 +1588,7 @@ async function proxyDesktopRendererRequest(
     method,
     headers,
     body,
+    signal: request.signal,
     redirect: 'manual',
     bypassCustomProtocolHandlers: true,
   })

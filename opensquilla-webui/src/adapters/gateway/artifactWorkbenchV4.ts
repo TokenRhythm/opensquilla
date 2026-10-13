@@ -18,6 +18,7 @@ import { createV4ArtifactDocuments } from './artifactDocumentsV4'
 import { createV4WorkbenchResources } from './workbenchResourcesV4'
 import { createV4ArtifactContentAccess } from './artifactAccessV4'
 import { createWorkingFileAccess } from './privateWorkingFileAccess'
+import { createHtmlBundleExportAccess } from './privateHtmlBundleExport'
 import { createV4AttachmentContentAccess } from './attachmentAccessV4'
 import { createV4ArtifactPreviews } from './artifactPreviewsV4'
 import { documentChangeEventContract } from './artifactWorkbenchContracts'
@@ -25,6 +26,7 @@ import { documentChangeEventContract } from './artifactWorkbenchContracts'
 type ArtifactWorkbenchHttpTransport = Parameters<typeof createV4ArtifactContentAccess>[0]
   & Parameters<typeof createV4AttachmentContentAccess>[0]
   & Parameters<typeof createV4ArtifactPreviews>[0]
+  & Parameters<typeof createHtmlBundleExportAccess>[0]
 
 interface RpcTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
@@ -245,7 +247,7 @@ export function createV4ArtifactWorkbench(
     artifacts: createV4ArtifactCatalog(rpc),
     documents: createV4ArtifactDocuments(operationRpc),
     resources: createV4WorkbenchResources(operationRpc),
-    content: { ...artifactContent, ...attachmentContent, ...createWorkingFileAccess(http) },
+    content: { ...artifactContent, ...attachmentContent, ...createWorkingFileAccess(http), ...createHtmlBundleExportAccess(http) },
     previews: createV4ArtifactPreviews(http),
     subscribeDocumentChanges(listener): ArtifactWorkbenchSubscription {
       listeners.add(listener)

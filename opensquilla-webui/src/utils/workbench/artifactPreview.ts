@@ -16,7 +16,20 @@ export type ArtifactWorkbenchPreviewKind =
   | 'markdown'
   | 'pdf'
   | 'text'
+  | 'docx'
+  | 'pptx'
+  | 'xlsx'
   | 'unsupported'
+
+export type OfficePreviewFormat = 'docx' | 'pptx' | 'xlsx'
+export const OFFICE_PREVIEW_MIMES: Record<OfficePreviewFormat, string> = {
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+}
+export function isOfficePreviewFormat(kind: string): kind is OfficePreviewFormat {
+  return kind === 'docx' || kind === 'pptx' || kind === 'xlsx'
+}
 
 const HTML_EXTENSIONS = new Set(['htm', 'html', 'xhtml'])
 const MARKDOWN_EXTENSIONS = new Set(['markdown', 'md', 'mdown', 'mkd'])
@@ -35,6 +48,10 @@ export function artifactWorkbenchPreviewKind(
   const mime = artifactMime(artifact).split(';', 1)[0].trim()
   const extension = artifactExtension(artifactName(artifact))
 
+  for (const format of ['docx', 'pptx', 'xlsx'] as const) {
+    if (mime === OFFICE_PREVIEW_MIMES[format]) return format
+  }
+
   if (mime === 'text/html' || mime === 'application/xhtml+xml') return 'html'
   if (mime === 'application/pdf') return 'pdf'
   if (mime === 'text/markdown') return 'markdown'
@@ -42,6 +59,7 @@ export function artifactWorkbenchPreviewKind(
   if (mime.startsWith('image/')) return 'image'
 
   if (!mime || mime === 'application/octet-stream') {
+    if (isOfficePreviewFormat(extension)) return extension
     if (HTML_EXTENSIONS.has(extension)) return 'html'
     if (extension === 'pdf') return 'pdf'
     if (MARKDOWN_EXTENSIONS.has(extension)) return 'markdown'
@@ -75,6 +93,7 @@ export function responseMatchesArtifactPreviewKind(
   if (kind === 'markdown') return mime === 'text/markdown' || mime === 'text/plain'
   if (kind === 'text') return mime === 'text/plain' || mime === 'text/x-log'
   if (kind === 'image') return mime.startsWith('image/')
+  if (isOfficePreviewFormat(kind)) return mime === OFFICE_PREVIEW_MIMES[kind]
   return false
 }
 

@@ -191,6 +191,34 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ## Web UI dependencies and bundled fonts
 
+### Office preview renderer and offline Simplified Chinese fallback fonts
+
+The Web UI lazily loads `@silurus/ooxml` **0.88.0**, an MIT-licensed read-only
+DOCX/XLSX/PPTX renderer, copyright (c) 2026 Yuki Yokotani. Its precompiled
+WebAssembly parsers and JavaScript assets are distributed with the generated
+Control UI. The complete upstream MIT license and `THIRD_PARTY_NOTICES.md`
+(including Rust/WASM dependencies, Unicode data, and optional MathJax/STIX
+attribution) are preserved in
+`opensquilla-webui/public-assets/assets/office-preview-licenses/` and copied
+unchanged into release Web UI assets. No separate Silurus MCP binary is bundled.
+
+Chinese fallback faces are the unmodified **Noto Sans SC** and **Noto Serif SC**
+region subsets, Regular and Bold, from `notofonts/noto-cjk` commit
+`f8d157532fbfaeda587e826d4cd5b21a49186f7c`. Each is distributed under the SIL Open
+Font License 1.1; the original family-specific license/copyright notices are
+preserved alongside the Silurus notices. Fonts are prepared at build time with
+immutable source URLs and pinned hashes from
+`opensquilla-webui/scripts/office-preview-fonts.json`, then emitted as local
+assets. The browser does not download these fonts from Google Fonts, and the
+fonts are not installed into the host operating system.
+
+The generated assets retain the names and licenses of their unmodified font
+sources. These fallback faces do not claim metric identity with Microsoft
+fonts. Changes to the Silurus version, optional runtime assets, or font sources
+must update these notices and the build-time asset inventory together.
+
+### Other Web UI dependencies
+
 OpenSquilla builds the Vue Control UI from npm dependencies and locally bundled
 fonts. Release artifacts contain the generated browser assets from the
 source-owned `opensquilla-webui/dist/` tree (staged into

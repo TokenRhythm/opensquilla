@@ -19,6 +19,7 @@ import {
   type ArtifactWorkbenchPreviewKind,
   artifactPreviewLimit,
   artifactWorkbenchPreviewKind,
+  isOfficePreviewFormat,
   buildOfflineArtifactHtml,
   detectArtifactHtmlRelativeResources,
   renderArtifactMarkdown,
@@ -313,6 +314,7 @@ export function createArtifactPreviewResource(
   const errorCode = ref<ArtifactPreviewResourceErrorCode | null>(null)
   const progress = ref<number | null>(null)
   const objectUrl = shallowRef('')
+  const binary = shallowRef<ArrayBuffer | null>(null)
   const text = shallowRef('')
   const markdownHtml = shallowRef('')
   const markdownImages = shallowRef<ReadonlyMap<string, string>>(new Map())
@@ -348,6 +350,7 @@ export function createArtifactPreviewResource(
     }
     markdownImageUrls.clear()
     markdownImages.value = new Map()
+    binary.value = null
     text.value = ''
     markdownHtml.value = ''
     relativeResources.value = []
@@ -447,8 +450,14 @@ export function createArtifactPreviewResource(
     errorCode.value = null
     progress.value = null
 
-    const artifact = options.artifact()
-    const nextKind = artifactWorkbenchPreviewKind(artifact)
+    const selectedArtifact = options.artifact()
+    const nextKind = artifactWorkbenchPreviewKind(selectedArtifact)
+    // A document's download action follows its latest head. Verified Office
+    // previews must instead fetch the same immutable revision as their hash:
+    // the server head can advance while this selected snapshot is still visible.
+    const artifact = isOfficePreviewFormat(nextKind) && selectedArtifact.revision_download_url
+      ? { ...selectedArtifact, download_url: selectedArtifact.revision_download_url }
+      : selectedArtifact
     kind.value = nextKind
     if (nextKind === 'unsupported') {
       setFailure('unsupported', 'unsupported')
@@ -535,7 +544,7 @@ export function createArtifactPreviewResource(
         if (!disposed && run === generation) progress.value = value
       })
       if (disposed || suspended || run !== generation) return
-      if (inlineAttachment) {
+      if (inlineAttachment || isOfficePreviewFormat(nextKind)) {
         await verifyInlineWorkbenchAttachmentIntegrity(artifact, bytes)
         if (disposed || suspended || run !== generation) return
       }
@@ -580,6 +589,9 @@ export function createArtifactPreviewResource(
           objectUrlOwned = true
         }
         state.value = missing.length > 0 ? 'missing-resource' : 'ready'
+      } else if (isOfficePreviewFormat(nextKind)) {
+        binary.value = bytesToArrayBuffer(bytes)
+        state.value = 'ready'
       } else if (nextKind === 'markdown') {
         const document = prepareMarkdownDocument(renderArtifactMarkdown(new TextDecoder().decode(bytes)))
         // Text remains readable while optional authorized images arrive. A slow
@@ -661,6 +673,7 @@ export function createArtifactPreviewResource(
     suspended = false
     const hasReadyOutput = !!(
       objectUrl.value
+      || binary.value
       || text.value
       || markdownHtml.value
       || nativePayloadDelivered
@@ -718,6 +731,7 @@ export function createArtifactPreviewResource(
     markdownHtml,
     markdownImages,
     objectUrl,
+    binary,
     progress,
     relativeResources,
     state,

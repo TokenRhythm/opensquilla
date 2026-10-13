@@ -65,7 +65,7 @@ describe('artifact document provider', () => {
     expect(workspace.revisions).toHaveLength(101)
     expect(workspace.revisions.filter(item => item.revisionId === 'revision-1')).toHaveLength(1)
     expect(workspace.headArtifact).toMatchObject({
-      id: 'artifact-1', size: 1, documentId: 'document-html',
+      id: 'artifact-1', size: 1, documentId: 'document-html', revisionId: 'revision-1',
       download_url: '/api/v1/artifact-documents/document-html',
     })
   })

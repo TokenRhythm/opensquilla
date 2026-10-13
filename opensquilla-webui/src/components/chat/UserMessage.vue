@@ -70,7 +70,7 @@
             <span class="msg-prompt-annotation__text">{{ annotation.body }}</span>
           </span>
           <button
-            v-if="canReusePromptAnnotations && !shareMode"
+            v-if="canReusePromptAnnotations && !shareMode && !annotation.selection"
             type="button"
             class="msg-prompt-annotation__reuse"
             :title="t('chat.promptAnnotations.reuseDescription')"

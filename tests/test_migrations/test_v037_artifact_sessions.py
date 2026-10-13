@@ -20,6 +20,7 @@ ARTIFACT_MIGRATION_IDS = (
     "V039__artifact_mutation_attempts",
     "V040__document_resources",
     "V041__retire_html_editor",
+    "V048__office_materializations",
 )
 
 TABLES = {

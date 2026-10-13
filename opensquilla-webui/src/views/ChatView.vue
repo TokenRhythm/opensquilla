@@ -1069,7 +1069,7 @@ import type {
   PromptCacheKeepaliveStatus,
   PromptCacheKeepaliveStatusUpdate,
 } from '@/types/promptCacheKeepalive'
-import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
+import { promptAnnotationAllowed, type PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import {
   createWorkbenchResourceRef,
@@ -1107,6 +1107,7 @@ import {
 import {
   artifactUsesWorkbenchPreview,
   artifactWorkbenchPreviewKind,
+  isOfficePreviewFormat,
 } from '@/utils/workbench/artifactPreview'
 import { findArtifactCard, focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
 import {
@@ -1462,6 +1463,15 @@ watch(sessionKey, resetComposerRetraction, { flush: 'sync' })
 const promptAnnotationsEnabled = computed(() => (
   appStore.features.artifactPromptAnnotations === true
 ))
+const officePromptAnnotationsEnabled = computed(() => (
+  appStore.features.officePromptAnnotations === true
+))
+function annotationAllowed(annotation: Pick<PromptAnnotationSnapshot, 'selection'> | undefined) {
+  return promptAnnotationAllowed(annotation, {
+    native: promptAnnotationsEnabled.value,
+    office: officePromptAnnotationsEnabled.value,
+  })
+}
 const workbenchResourcesEnabled = computed(() => (
   appStore.features.documentWorkbenchResources === true
   || promptAnnotationsEnabled.value
@@ -1476,24 +1486,21 @@ const attachmentWorkbenchEditEnabled = computed(() => (
   && artifactWorkbench.resources.canImportDocuments()
 ))
 const activePromptAnnotations = computed(() =>
-  promptAnnotationsEnabled.value
-    ? artifactPromptAnnotationsStore.activeDraftsForSession(sessionKey.value)
-    : [])
+  artifactPromptAnnotationsStore.activeDraftsForSession(sessionKey.value, annotationAllowed))
 const sendableAnnotationDraftIds = computed(() =>
-  promptAnnotationsEnabled.value
-    ? artifactPromptAnnotationsStore.sendableDraftsForSession(sessionKey.value)
-      .map(annotation => annotation.annotationId)
-    : [])
+  artifactPromptAnnotationsStore.sendableDraftsForSession(sessionKey.value, annotationAllowed)
+    .map(annotation => annotation.annotationId))
 
 function promptAnnotationBlockedMessage(): string {
-  if (!promptAnnotationsEnabled.value) return ''
-  const reason = artifactPromptAnnotationsStore.sendBlockedReason(sessionKey.value)
+  if (!promptAnnotationsEnabled.value && !officePromptAnnotationsEnabled.value) return ''
+  const reason = artifactPromptAnnotationsStore.sendBlockedReason(sessionKey.value, annotationAllowed)
   if (reason === 'editing') return t('chat.promptAnnotations.editingBlocked')
   if (reason === 'too-long') return t('chat.promptAnnotations.tooLongBlocked')
   return ''
 }
 
 async function updatePromptAnnotation(annotationId: string, body: string) {
+  if (!annotationAllowed(artifactPromptAnnotationsStore.annotations[annotationId])) return
   try {
     await artifactPromptAnnotationsStore.update(annotationId, body)
   } catch {
@@ -1511,7 +1518,7 @@ async function discardPromptAnnotation(annotationId: string) {
 
 async function jumpPromptAnnotation(annotationId: string) {
   const annotation = artifactPromptAnnotationsStore.annotations[annotationId]
-  if (!annotation) return
+  if (!promptAnnotationsEnabled.value || !annotation || annotation.selection !== undefined) return
   const activated = await focusArtifactPromptAnnotation({
     annotationId,
     documentId: annotation.documentId,
@@ -1527,6 +1534,7 @@ async function jumpPromptAnnotation(annotationId: string) {
 async function reusePromptAnnotation(annotation: PromptAnnotationSnapshot) {
   if (
     !promptAnnotationsEnabled.value
+    || annotation.selection !== undefined
     || !annotation.body.trim()
     || !sessionKey.value
     || !workbenchEnabled.value
@@ -3654,10 +3662,13 @@ const chatSend = useChatSend({
   draftIds: sendableAnnotationDraftIds,
   idempotentReplayBlockedReason: liveSendBlockedReason,
   preparePromptAnnotationsForSend: async (ids, prepareOptions) => {
+    if (!ids.every(id => annotationAllowed(artifactPromptAnnotationsStore.annotations[id]))) return false
     const prepared = await artifactPromptAnnotationsStore.prepareForSend(ids)
     return prepared && (prepareOptions?.isCurrent?.() ?? true)
   },
-  promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(ids),
+  promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(
+    ids.filter(id => annotationAllowed(artifactPromptAnnotationsStore.annotations[id])),
+  ).filter(annotationAllowed),
   acknowledgePromptAnnotations: (snapshots, acceptedSessionKey, requestSessionKey) => {
     let removedIds: string[]
     try {
@@ -5378,11 +5389,14 @@ function openLegacyArtifactWorkbench(
 }
 
 async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
+  const key = sessionKey.value
+  const epoch = currentEpoch.value
+  const isCurrent = () => sessionKey.value === key && currentEpoch.value === epoch
   const artifactId = typeof artifact.id === 'string' ? artifact.id.trim() : ''
   const documentId = typeof artifact.documentId === 'string'
     ? artifact.documentId.trim()
     : typeof artifact.document_id === 'string' ? artifact.document_id.trim() : ''
-  if ((!artifactId && !documentId) || !sessionKey.value) {
+  if ((!artifactId && !documentId) || !key) {
     openLegacyArtifactWorkbench(artifact)
     return
   }
@@ -5390,12 +5404,14 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
     const ref = documentId
       ? createWorkbenchResourceRef('document', documentId)
       : createWorkbenchResourceRef('deliverable', artifactId)
-    const resource = await workbenchResourcesStore.resolve(sessionKey.value, ref)
+    const resource = await workbenchResourcesStore.resolve(key, ref)
+    if (!isCurrent()) return
     if (!resource) {
       openLegacyArtifactWorkbench(artifact)
       return
     }
-    const current = await workbenchResourcesStore.openCurrent(sessionKey.value, resource)
+    const current = await workbenchResourcesStore.openCurrent(key, resource)
+    if (!isCurrent()) return
     if (current?.disposition === 'document') {
       const currentArtifact = artifactPayloadFromRevision(current.revision)
       currentArtifact.documentId = current.document.documentId
@@ -5410,7 +5426,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
         ),
         previewLeaseEligible: true,
         resourceIdentity: workbenchResourceKey(current.resource.resource),
-        sessionKey: sessionKey.value,
+        sessionKey: key,
       }))
       return
     }
@@ -5428,9 +5444,10 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       && resource.sha256
     ) {
       const imported = await workbenchResourcesStore.importDocument(
-        sessionKey.value,
+        key,
         resource,
       )
+      if (!isCurrent()) return
       const importedArtifact = artifactPayloadFromRevision(imported.revision)
       importedArtifact.documentId = imported.document.documentId
       importedArtifact.revisionId = imported.revision.revisionId
@@ -5444,7 +5461,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
         ),
         previewLeaseEligible: true,
         resourceIdentity: `document:${imported.document.documentId}`,
-        sessionKey: sessionKey.value,
+        sessionKey: key,
       }))
       return
     }
@@ -5459,9 +5476,10 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       return
     }
     const preview = await workbenchResourcesStore.preview(
-      sessionKey.value,
+      key,
       readonlyResource.resource,
     )
+    if (!isCurrent()) return
     if (!preview) {
       openLegacyArtifactWorkbench(artifact)
       return
@@ -5474,9 +5492,10 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       preparedPreview: preview.preview,
       previewLeaseEligible: false,
       resourceIdentity: workbenchResourceKey(readonlyResource.resource),
-      sessionKey: sessionKey.value,
+      sessionKey: key,
     }))
   } catch (error) {
+    if (!isCurrent()) return
     // METHOD_NOT_FOUND is normalized to a null open result by the provider and
     // follows the compatibility path above. Any other failure must remain
     // visible: silently opening the immutable chat artifact would disguise a
@@ -5557,7 +5576,10 @@ function openArtifact(artifact: ArtifactPayload): boolean {
   if (!workbenchEnabled.value || !sessionKey.value) return false
   if (
     attachmentWorkbenchPreviewEnabled.value
-    && artifactWorkbenchPreviewKind(artifact) === 'html'
+    && (
+      artifactWorkbenchPreviewKind(artifact) === 'html'
+      || isOfficePreviewFormat(artifactWorkbenchPreviewKind(artifact))
+    )
     && (
       (typeof artifact.id === 'string' && artifact.id.trim())
       || (typeof artifact.documentId === 'string' && artifact.documentId.trim())
@@ -7434,7 +7456,7 @@ function flushSessionOptionalReads() {
       ? loadSessionArtifactsAfterReconnect()
       : loadSessionArtifacts())
   }
-  if (pending.key && promptAnnotationsEnabled.value) {
+  if (pending.key && (promptAnnotationsEnabled.value || officePromptAnnotationsEnabled.value)) {
     void artifactPromptAnnotationsStore.load(
       pending.key,
       pending.forceAnnotations ? { force: true } : undefined,

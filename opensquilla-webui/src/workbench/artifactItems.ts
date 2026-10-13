@@ -194,8 +194,12 @@ export function preparedPreviewFromWorkbenchItem(
   if (!resource || typeof resource !== 'object') return null
   const ref = resource as Record<string, unknown>
   if (
-    preview.mode !== 'isolated'
-    || preview.sandboxProfile !== 'opaque-offline'
+    !((preview.mode === 'isolated' && preview.sandboxProfile === 'opaque-offline')
+      || (preview.mode === 'local-renderer' && preview.sandboxProfile === 'none'
+        && preview.adapter && typeof preview.adapter === 'object'
+        && (preview.adapter as Record<string, unknown>).id === 'silurus-office'
+        && (preview.adapter as Record<string, unknown>).version === '0.88.0'
+        && ['docx', 'pptx', 'xlsx'].includes(String((preview.adapter as Record<string, unknown>).format))))
     || preview.network !== false
     || typeof preview.protocolVersion !== 'number'
     || typeof ref.type !== 'string'

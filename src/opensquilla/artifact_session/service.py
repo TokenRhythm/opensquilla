@@ -419,6 +419,14 @@ class ArtifactSessionService:
             ),
         )
 
+    async def get_document_source_binding_for_document(
+        self, *, session_id: str, document_id: str,
+    ) -> DocumentSourceBinding | None:
+        return await self.repository.get_document_source_binding_for_document(
+            session_id=_bounded_text(session_id, "session_id", max_bytes=512),
+            document_id=_bounded_text(document_id, "document_id", max_bytes=256),
+        )
+
     async def list_document_source_bindings(
         self,
         *,
@@ -588,6 +596,14 @@ class ArtifactSessionService:
     ) -> DocumentPublication:
         return await self.repository.get_document_publication(
             _bounded_text(publication_id, "publication_id", max_bytes=256)
+        )
+
+    async def get_document_publication_for_artifact(
+        self, *, session_id: str, artifact_id: str,
+    ) -> DocumentPublication | None:
+        return await self.repository.get_document_publication_for_artifact(
+            session_id=_bounded_text(session_id, "session_id", max_bytes=512),
+            artifact_id=_bounded_text(artifact_id, "artifact_id", max_bytes=256),
         )
 
     async def list_document_publications(

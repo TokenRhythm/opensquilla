@@ -186,7 +186,26 @@ export interface WorkingFileMetadata {
   size: number
 }
 
+export type HtmlBundleExportTarget =
+  | { readonly type: 'artifact'; readonly artifactId: string }
+  | { readonly type: 'document'; readonly documentId: string; readonly revisionId: string }
+  | { readonly type: 'working'; readonly documentId: string; readonly pagePath?: string }
+
+export interface HtmlBundleExportRequest {
+  readonly target: HtmlBundleExportTarget
+  readonly sessionKey: string
+  readonly signal?: AbortSignal
+}
+
+export class HtmlBundleExportError extends Error {
+  readonly name = 'HtmlBundleExportError'
+  constructor(readonly code: 'unavailable' | 'incomplete' | 'too-large' | 'source-forbidden' | 'source-changed' | 'failed') {
+    super(`HTML bundle export ${code}`)
+  }
+}
+
 export interface ArtifactContentAccess {
+  exportHtmlBundle?(request: HtmlBundleExportRequest): Promise<{ blob: Blob; filename: string }>
   workingFileMetadata?(request: WorkingFileRequest): Promise<WorkingFileMetadata | null>
   fetchWorkingFile?(request: WorkingFileRequest): Promise<Blob>
   fetchArtifact(
@@ -301,6 +320,7 @@ export interface ArtifactPreviewResourceController {
   /** Ready image resources are patched into stable Markdown placeholders. */
   markdownImages?: ShallowRef<ReadonlyMap<string, string>>
   objectUrl: ShallowRef<string>
+  binary?: ShallowRef<ArrayBuffer | null>
   progress: Ref<number | null>
   relativeResources: ShallowRef<string[]>
   state: Ref<ArtifactPreviewResourceState>
