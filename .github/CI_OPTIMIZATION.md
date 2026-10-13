@@ -505,3 +505,8 @@ waits, replay identity, transcript, and reopen assertions. Timeout diagnostics
 record the task identity, phase, task states, and owned drivers. Slow SQLite
 holds show where time was spent, but do not by themselves identify the cause of
 slow runner I/O or prove that a specific historical failure waited on that task.
+Custom provider, recovery, and budget-error handlers use the same readiness
+boundary before release. Their existing provider, retry, and terminal guards
+start after durable activation, with the expected task identity checked first.
+Review every custom handler and downstream wait in the module when fixing this
+pattern, including paths whose activation happened to finish within the guard.
