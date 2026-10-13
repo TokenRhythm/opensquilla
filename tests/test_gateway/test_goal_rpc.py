@@ -961,6 +961,7 @@ async def test_goal_settlement_survives_observer_timeout_after_notification_fail
         monkeypatch.setattr(stack.storage, "settle_goal_task", held_settlement)
         monkeypatch.setattr(stack.manager, "notify_message_appended", fail_notification)
         observer: asyncio.Task[Any] | None = None
+        wait_entry: asyncio.Task[bool] | None = None
         try:
             response = await _handle_goals_set(_set_params(), stack.context)
             await settlement_entered.wait()
@@ -981,14 +982,20 @@ async def test_goal_settlement_survives_observer_timeout_after_notification_fail
             assert not runtime_task.done.is_set()
             assert stack.runtime._tasks[task_id] is runtime_task
 
-            observer_started = asyncio.Event()
+            observer_waiting = asyncio.Event()
+            wait_for_completion = runtime_task.done.wait
 
-            async def observe_completion() -> Any:
-                observer_started.set()
-                return await stack.runtime.wait(task_id)
+            async def observe_completion_wait() -> bool:
+                observer_waiting.set()
+                return await wait_for_completion()
 
-            observer = asyncio.create_task(observe_completion())
-            await observer_started.wait()
+            monkeypatch.setattr(runtime_task.done, "wait", observe_completion_wait)
+            wait_entry = asyncio.create_task(observer_waiting.wait())
+            observer = asyncio.create_task(stack.runtime.wait(task_id))
+            completed, _ = await asyncio.wait(
+                {wait_entry, observer}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            assert wait_entry in completed, "observer returned without waiting for settlement"
             assert not observer.done()
 
             release_settlement.set()
@@ -1010,9 +1017,10 @@ async def test_goal_settlement_survives_observer_timeout_after_notification_fail
             assert await _table_count(stack.storage, "goal_command_receipts") == 1
         finally:
             release_settlement.set()
-            if observer is not None:
-                observer.cancel()
-                await asyncio.gather(observer, return_exceptions=True)
+            observers = [task for task in (wait_entry, observer) if task is not None]
+            for task in observers:
+                task.cancel()
+            await asyncio.gather(*observers, return_exceptions=True)
 
 
 @pytest.mark.asyncio
