@@ -182,6 +182,7 @@ def previous_final_entry(
     if not routing_history:
         return None
     cutoff = now - window
+    entry: dict
     for entry in reversed(routing_history):
         if entry.get("_ts", now) >= cutoff:
             return entry
