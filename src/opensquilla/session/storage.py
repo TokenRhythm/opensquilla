@@ -56,6 +56,12 @@ from opensquilla.persistence.plan_presentation import (
     PlanPresentationConflictError,
     PlanPresentationRequestConflictError,
 )
+from opensquilla.persistence.sqlite_diagnostics import (
+    connection_backend,
+    connection_snapshot,
+    register_connection,
+    sqlite_failure,
+)
 from opensquilla.session.attachment_history import (
     USER_DISPLAY_TEXT_SQL,
     inline_attachment_digest,
@@ -2154,6 +2160,7 @@ class SessionStorage:
             timeout=_SQLITE_STARTUP_BUSY_TIMEOUT_SECONDS,
         )
         self._connection_generation += 1
+        register_connection(self._db_path, "session_writer", self._conn)
         try:
             self._conn.row_factory = aiosqlite.Row
             await self._register_sql_functions(self._conn)
@@ -2259,6 +2266,7 @@ class SessionStorage:
         reader: Any | None = None
         try:
             reader = await aiosqlite.connect(self._db_path, isolation_level=None)
+            register_connection(self._db_path, "transcript_reader", reader)
             reader.row_factory = aiosqlite.Row
             await self._register_sql_functions(reader)
             async with reader.execute("PRAGMA query_only=ON"):
@@ -2301,7 +2309,9 @@ class SessionStorage:
     async def _open_recovery_reader(self) -> Any:
         """Return a raw reader to its lease before fallible configuration."""
 
-        return await aiosqlite.connect(self._db_path, isolation_level=None)
+        reader = await aiosqlite.connect(self._db_path, isolation_level=None)
+        register_connection(self._db_path, "recovery_reader", reader)
+        return reader
 
     async def _initialize_recovery_reader(self, reader: Any) -> None:
         """Configure an already-owned reader; the pool handles every failure."""
@@ -2413,6 +2423,10 @@ class SessionStorage:
                     "duration_ms": max(0.0, (timing.phase_started - started) * 1000),
                     "timings": timing.timings,
                     "exception_type": type(failure).__name__ if failure else None,
+                    "backend": connection_backend(self._conn),
+                    **sqlite_failure(failure),
+                    **(connection_snapshot(self._db_path, current_connection=self._conn)
+                       if failure else {}),
                     "connection_in_transaction": (
                         bool(self._conn.in_transaction) if self._conn is not None else None
                     ),
@@ -2871,6 +2885,7 @@ class SessionStorage:
                     self._db_path,
                     isolation_level=None,
                 )
+                register_connection(self._db_path, "usage_index_writer", connection)
                 try:
                     await connection.execute(
                         f"PRAGMA busy_timeout={int(_INTERACTIVE_BUSY_BUDGET_SECONDS * 1000)}"
@@ -2910,6 +2925,7 @@ class SessionStorage:
             isolation_level=None,
             timeout=_SQLITE_STARTUP_BUSY_TIMEOUT_SECONDS,
         )
+        register_connection(self._db_path, "content_length_writer", connection)
         connection.row_factory = aiosqlite.Row
         total = 0
         batches = 0

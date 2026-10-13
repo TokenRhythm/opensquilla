@@ -1,5 +1,5 @@
 import type { DownloadItem } from 'electron'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { chmod, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -36,6 +36,11 @@ interface DownloadRecord {
 export class BrowserManagedDownloads {
   private readonly records = new Map<string, DownloadRecord>()
   private readonly armed = new Map<number, DownloadRecord>()
+
+  isArmed(owner: BrowserDownloadOwner): boolean {
+    const record = this.armed.get(owner.webContentsId)
+    return Boolean(record && !record.settled && this.sameOwner(record, owner))
+  }
 
   async arm(owner: BrowserDownloadOwner, signal: AbortSignal) {
     if (signal.aborted) throw new DesktopBrowserError('TIMEOUT', 'The download request ended.', 504)
@@ -131,18 +136,10 @@ export class BrowserManagedDownloads {
   }
 
   async inspect(owner: BrowserDownloadOwner, downloadId: string, maxChars = DEFAULT_TEXT_CHARS) {
-    const record = this.records.get(downloadId)
-    if (!record || !this.sameOwner(record, owner) || !record.completed) {
-      throw new DesktopBrowserError('DOWNLOAD_NOT_FOUND', 'The completed download is not owned by this page.', 404)
-    }
+    const record = this.completedRecord(owner, downloadId)
     const metadata = this.metadata(record)
-    let bytes: Buffer
-    try { bytes = await readFile(record.path) } catch {
-      throw new DesktopBrowserError('DOWNLOAD_UNAVAILABLE', 'The download artifact is unavailable.')
-    }
-    if (bytes.length > BROWSER_DOWNLOAD_MAX_BYTES) {
-      throw new DesktopBrowserError('DOWNLOAD_TOO_LARGE', 'The download exceeds 8 MiB.')
-    }
+    const bytes = await this.readBounded(record)
+    this.completedRecord(owner, downloadId)
     let text: string
     try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes) } catch {
       return { ...metadata, textAvailable: false, reason: 'not_utf8' }
@@ -154,12 +151,48 @@ export class BrowserManagedDownloads {
       characterCount: text.length }
   }
 
+  /** Binary PDF handoff for the authenticated Gateway; never include this in model text. */
+  async exportPdf(owner: BrowserDownloadOwner, downloadId: string) {
+    const record = this.completedRecord(owner, downloadId)
+    const bytes = await this.readBounded(record)
+    this.completedRecord(owner, downloadId)
+    const mimeType = record.mimeType.split(';', 1)[0]?.trim().toLowerCase()
+    if (!['application/pdf', 'application/octet-stream', 'binary/octet-stream'].includes(mimeType)
+      || bytes.length < 8 || bytes.subarray(0, 5).toString('ascii') !== '%PDF-') {
+      throw new DesktopBrowserError('DOWNLOAD_NOT_PDF', 'The completed download is not a PDF document.', 409)
+    }
+    return { ...this.metadata(record), sha256: createHash('sha256').update(bytes).digest('hex'),
+      dataBase64: bytes.toString('base64') }
+  }
+
   async disposePage(owner: BrowserDownloadOwner): Promise<void> {
     const records = [...this.records.values()].filter(record => this.sameOwner(record, owner))
     for (const record of records) {
       if (!record.settled) this.fail(record, new DesktopBrowserError('TARGET_NOT_FOUND', 'The download page closed.', 404))
     }
     await Promise.all(records.map(record => this.remove(record)))
+  }
+
+  private completedRecord(owner: BrowserDownloadOwner, downloadId: string): DownloadRecord {
+    const record = this.records.get(downloadId)
+    if (!record || !this.sameOwner(record, owner) || !record.completed) {
+      throw new DesktopBrowserError('DOWNLOAD_NOT_FOUND', 'The completed download is not owned by this page.', 404)
+    }
+    return record
+  }
+
+  private async readBounded(record: DownloadRecord): Promise<Buffer> {
+    let bytes: Buffer
+    try { bytes = await readFile(record.path) } catch {
+      throw new DesktopBrowserError('DOWNLOAD_UNAVAILABLE', 'The download artifact is unavailable.')
+    }
+    if (bytes.length > BROWSER_DOWNLOAD_MAX_BYTES) {
+      throw new DesktopBrowserError('DOWNLOAD_TOO_LARGE', 'The download exceeds 8 MiB.')
+    }
+    if (bytes.length !== record.size) {
+      throw new DesktopBrowserError('DOWNLOAD_UNAVAILABLE', 'The completed download changed after capture.')
+    }
+    return bytes
   }
 
   private sameOwner(record: DownloadRecord, owner: BrowserDownloadOwner) {

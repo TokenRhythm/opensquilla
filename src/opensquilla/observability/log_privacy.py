@@ -24,6 +24,7 @@ from opensquilla.observability.redact import scrub_text
 _IDENTIFIERS = frozenset("""
     event kind event_type privacy level logger source step step_name phase status
     state code error_code error_type exception_type reason_code failure_kind
+    sqlite_error_name sqlite_version
     degraded_reason skip_reason method operation mode
     session_key session_id turn_id trace_id task_id run_id parent_run_id agent_id
     conn_id connection_id request_id response_id message_id user_message_id
@@ -46,7 +47,7 @@ _IDENTIFIERS = frozenset("""
 """.split())
 _CONTAINERS = frozenset({
     "attrs", "payload", "fields", "entry", "pipeline_steps", "savings",
-    "bootstrap_files", "memory_mode_fingerprint", "metadata", "stats", "timings",
+    "bootstrap_files", "memory_mode_fingerprint", "metadata", "stats", "timings", "connections",
 })
 # Retain only producer-owned enum values for fields that could otherwise be
 # mistaken for free-form reason text. These codes are consumed by diagnostics.

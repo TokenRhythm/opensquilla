@@ -70,7 +70,7 @@ if (process.platform !== 'darwin') {
 const mainSource = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8')
 assert.match(
   mainSource,
-  /installDesktopReloadShortcuts\(\s*window\.webContents,\s*window\.webContents,\s*\(\) => currentOnboardingWindow\(\) === null,?\s*\)/,
+  /installDesktopReloadShortcuts\(\s*window\.webContents,\s*window\.webContents,\s*\(\) => currentOnboardingWindow\(\) === null,\s*\(\) => reloadDesktopWindow\(false\),?\s*\)/,
 )
 
 if (!process.argv.includes('--contracts-only')) {

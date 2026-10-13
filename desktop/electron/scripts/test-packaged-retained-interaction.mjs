@@ -11,7 +11,7 @@ import { captureElectronProcessIdentity, captureFirstSendDiagnostic, closeElectr
 import { desktopShutdownEvidenceSince, gatewayProcessSnapshot } from './e2e-shutdown-helpers.mjs'
 import { desktopProfileFingerprint, loadDesktopGatewayOwnershipRecord, verifyDesktopGatewayOwnership } from '../dist/desktop-gateway-ownership.js'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
-import { assertNoExistingDesktop, assertPreservedInputs, assertStopEvidence, auditMessages, sha256, verifyAuditInputs } from './fixtures/packaged-retained-interaction/contract.mjs'
+import { assertNoExistingDesktop, assertPreservedInputs, assertStopEvidence, auditMessages, collectSqliteProcessCensus, sha256, verifyAuditInputs } from './fixtures/packaged-retained-interaction/contract.mjs'
 import { installRetainedRpcProbe } from './fixtures/packaged-retained-interaction/browser-probe.mjs'
 import { startRetainedProvider } from './fixtures/packaged-retained-interaction/provider.mjs'
 import { collectRetainedGatewayDiagnostics } from './fixtures/packaged-retained-interaction/diagnostics.mjs'
@@ -247,6 +247,7 @@ try {
   await persist()
   if (outputCreated) {
     report.gatewayDiagnostics = await captureFirstSendDiagnostic(() => collectRetainedGatewayDiagnostics(plan))
+    report.sqliteProcesses = await captureFirstSendDiagnostic(() => collectSqliteProcessCensus(runFile))
     await persist()
   }
   if (active?.page) {

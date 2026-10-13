@@ -1428,7 +1428,7 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "1fbd19302f070afa0dad372640c6814abf36a9ae7699e2c6020d72f932e9c12f",
+    "generatorSha256": "37fd3b6d8b66a0ca3a2a60372cf16cf9b4ad7fd9d3766f6720a4c7932fc35253",
     "methodCount": 209,
     "schemaCount": 219,
     "schemaTreeSha256": "bdac486e23d89b7d13a7911095165934fe9b6affb5bf5d970f45e4927ce91fe4",
@@ -1437,7 +1437,7 @@
         "python": {
           "target": "pydantic_v2.BaseModel",
           "tool": "datamodel-code-generator",
-          "version": "0.75.1"
+          "version": "0.81.0"
         },
         "typescript": {
           "tool": "json-schema-to-typescript",

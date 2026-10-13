@@ -2,7 +2,7 @@
   <WorkbenchHost
     :enabled="enabled"
     :allow-empty="Boolean(nativeApi)"
-    :route-active="routeActive"
+    :route-active="routeActive && store.activeSessionId === (sessionId || null)"
     :modal-blocked="surfaceBlocked"
     :aria-label="t('workbench.title')"
     :empty-label="t('workbench.empty')"
@@ -290,6 +290,7 @@ import type {
 } from '@/workbench/types'
 import { createArtifactWorkbenchDefinitions, type ArtifactWorkbenchProviderOptions } from './artifactWorkbenchProvider'
 import { createBrowserWorkbenchDefinition } from './browserWorkbenchProvider'
+import { requestNativeBrowserClose } from './browserCloseGuard'
 import { createWorkbenchResourceCollectionDefinition } from './workbenchResourceCollectionProvider'
 import { WORKSPACE_REFERENCES_KEY } from '@/modules/workspaceReferences'
 import { WORKSPACE_FILES_KEY } from '@/modules/workspaceFiles'
@@ -404,12 +405,16 @@ function openBrowserUrl(value: string, newTab = false) {
     openExternalUrl(value)
     return
   }
-  const item = createBrowserWorkbenchItem({
+  let item = createBrowserWorkbenchItem({
     scopeId: sessionId,
     url: value,
     instanceId: createClientRequestId(),
   })
   if (!item) return
+  const source = store.findMostRecentItem(candidate => candidate.kind === 'browser'
+    && candidate.scope.type === 'session' && candidate.scope.id === sessionId
+    && typeof candidate.payload.targetRef === 'string')
+  if (source) item = { ...item, payload: { ...item.payload, contextTargetRef: source.payload.targetRef } }
   const retained = store.findMostRecentItem(candidate =>
     candidate.kind === 'browser'
     && candidate.scope.type === 'session'
@@ -434,7 +439,14 @@ function openBrowserStart() {
 function reopenBrowser() {
   const closed = store.closedBrowserItems.find(item => item.scope.type === 'session'
     && item.scope.id === props.sessionId)
-  if (!closed || !store.openItem(closed)) {
+  if (!closed) return
+  const { contextTargetRef: _context, targetRef: _target, adoptedNativeSurface: _adopted, ...payload } = closed.payload
+  const source = store.findMostRecentItem(item => item.kind === 'browser'
+    && item.scope.type === 'session' && item.scope.id === props.sessionId
+    && typeof item.payload.targetRef === 'string')
+  const reopened = { ...closed, payload: { ...payload,
+    ...(source ? { contextTargetRef: source.payload.targetRef } : {}) } }
+  if (!store.openItem(reopened)) {
     pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
   }
 }
@@ -1026,14 +1038,24 @@ function onNativeSurfaceEvent(event: NativeWorkbenchSurfaceEvent) {
   if (event.type === 'browser-opened') {
     const detail = event.detail
     if (!detail?.url || !detail.sessionKey || !nativeApi) return
+    const existing = store.items.find(candidate => candidate.id === event.surfaceId)
+    if (existing && (existing.kind !== 'browser' || existing.scope.type !== 'session'
+      || existing.scope.id !== detail.sessionKey)) return
     const item = createBrowserWorkbenchItem({ scopeId: detail.sessionKey, url: detail.url })
     if (!item) return
     item.id = event.surfaceId
     item.title = detail.title || item.title
     item.payload = { ...item.payload, adoptedNativeSurface: true, targetRef: detail.targetRef,
       ...(detail.navigationError ? { navigationError: detail.navigationError } : {}) }
-    store.openItem(item, { activate: detail.sessionKey === props.sessionId })
+    store.openItem(item, { activate: props.enabled && props.routeActive
+      && detail.sessionKey === props.sessionId
+      && detail.sessionKey === store.activeSessionId })
     return
+  }
+  const browserItem = store.items.find(candidate => candidate.id === event.surfaceId)
+  if (browserItem?.kind === 'browser') {
+    if (event.detail?.sessionKey && (browserItem.scope.type !== 'session'
+      || browserItem.scope.id !== event.detail.sessionKey)) return
   }
   if (event.type === 'navigation-state' && event.detail?.url) {
     const item = store.items.find(candidate => candidate.id === event.surfaceId)
@@ -1043,6 +1065,7 @@ function onNativeSurfaceEvent(event: NativeWorkbenchSurfaceEvent) {
         ...item,
         title: event.detail.title || item.title,
         payload: { ...item.payload, initialUrl: url,
+          ...(event.detail.targetRef ? { targetRef: event.detail.targetRef } : {}),
           ...(event.detail.navigationError !== undefined ? { navigationError: event.detail.navigationError } : {}) },
       })
     }
@@ -1255,6 +1278,8 @@ async function beforeCloseItem(
   item: WorkbenchItem,
   options?: WorkbenchBeforeCloseOptions,
 ): Promise<boolean> {
+  const nativeClose = await requestNativeBrowserClose(item, nativeApi)
+  if (nativeClose !== null) return nativeClose
   const accepted = await runtimeManager.beforeClose(item, options)
   if (!accepted) {
     pushToast(t('workbench.artifactDocument.sourceUnavailable'), {
@@ -1270,7 +1295,7 @@ async function setSessionScopeSafely(sessionId: string | null) {
   const previousSessionId = store.activeSessionId
   if (previousSessionId === sessionId) return
   const staleItems = store.items.filter(item =>
-    item.scope.type === 'session' && item.scope.id !== sessionId)
+    item.scope.type === 'session' && item.scope.id !== sessionId && item.kind !== 'browser')
   for (const item of staleItems) {
     if (!await beforeCloseItem(item) || generation !== scopeChangeGeneration) return
   }

@@ -762,39 +762,8 @@ wheels = [
 
 [[package]]
 name = "datamodel-code-generator"
-version = "0.75.1"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.15'",
-    "python_full_version == '3.14.*'",
-    "python_full_version == '3.13.*'",
-    "python_full_version < '3.13'",
-]
-dependencies = [
-    { name = "argcomplete" },
-    { name = "black", marker = "sys_platform != 'emscripten'" },
-    { name = "genson" },
-    { name = "inflect" },
-    { name = "isort", marker = "sys_platform != 'emscripten'" },
-    { name = "jinja2" },
-    { name = "pydantic" },
-    { name = "pyyaml" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/59/d2/187e101ed143f5280079a57c7c7e3d702609826aadd85c095fd5a8267af9/datamodel_code_generator-0.75.1.tar.gz", hash = "sha256:d2053a889161af7e495a3eedb92b68c81848e6ea7988d467c602e5b2da30f018", size = 2116531, upload-time = "2026-08-24T19:16:37.119Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d6/be/a8d2b7450762a4ebb7b81a8e7b1756af725b3f3c14f3f76599d42493c602/datamodel_code_generator-0.75.1-py3-none-any.whl", hash = "sha256:58cb9330cdf0a356aee8547c0cce52d8fd2daa5253c7a6b8e245e9d3117c999e", size = 609533, upload-time = "2026-08-24T19:16:35.482Z" },
-]
-
-[[package]]
-name = "datamodel-code-generator"
 version = "0.81.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.15'",
-    "python_full_version == '3.14.*'",
-    "python_full_version == '3.13.*'",
-    "python_full_version < '3.13'",
-]
 dependencies = [
     { name = "argcomplete" },
     { name = "black", marker = "sys_platform != 'emscripten'" },
@@ -2363,12 +2332,12 @@ desktop-build = [
     { name = "pyinstaller", marker = "python_full_version < '3.16' or (extra == 'group-11-opensquilla-dev' and extra == 'group-11-opensquilla-legacy-contract-codegen')" },
 ]
 dev = [
-    { name = "datamodel-code-generator", version = "0.81.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "datamodel-code-generator" },
     { name = "laboratory" },
     { name = "syrupy" },
 ]
 legacy-contract-codegen = [
-    { name = "datamodel-code-generator", version = "0.75.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "datamodel-code-generator" },
 ]
 wheelhouse-build = [
     { name = "pip" },
@@ -2470,7 +2439,7 @@ dev = [
     { name = "laboratory", specifier = ">=1.0.2" },
     { name = "syrupy", specifier = ">=6.1.1" },
 ]
-legacy-contract-codegen = [{ name = "datamodel-code-generator", specifier = "==0.75.1" }]
+legacy-contract-codegen = [{ name = "datamodel-code-generator", specifier = "==0.81.0" }]
 wheelhouse-build = [{ name = "pip", specifier = "==26.2.1" }]
 
 [[package]]

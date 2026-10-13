@@ -105,6 +105,7 @@ export interface WorkbenchRuntimeContext {
   getRenderState(): Readonly<Record<string, unknown>>
   updateRenderState(patch: Readonly<Record<string, unknown>>): void
   isItemOpen(): boolean
+  isItemActive?(): boolean
   setExpanded(expanded: boolean): void
   reportError(error: unknown): void
 }

@@ -64,6 +64,8 @@ def browser_tool_spec(tool_name: str, spec: ToolSpec) -> ToolSpec:
     return replace(
         spec,
         owner_only=True,
+        # Download inspection can publish a PDF into the task workspace.
+        cancellation_policy="must_settle" if tool_name == "browser_inspect" else "bounded",
         plan_access=PlanAccess.READ_ONLY
         if tool_name
         in {
