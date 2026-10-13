@@ -570,6 +570,18 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
     ("test_file", "function_name"),
     [
         (
+            "tests/test_tools/test_shell_blocking_launch.py",
+            "test_slow_native_launch_preserves_loop_and_ownership",
+        ),
+        (
+            "tests/test_tools/test_shell_blocking_launch.py",
+            "test_quiet_native_reader_is_reclaimed_after_initialization",
+        ),
+        (
+            "tests/test_tools/test_shell_blocking_launch.py",
+            "test_runner_shutdown_waits_for_native_launch_cleanup",
+        ),
+        (
             "tests/test_gateway/test_plan_rpc.py",
             "test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn",
         ),

@@ -107,6 +107,9 @@ def native_launch(request, tmp_path, monkeypatch):
     )
 
 
+# Keep bounded native lifecycle contracts out of the bulk worker pool.
+# Their internal worker/event-loop concurrency remains real.
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["finish", "cancel", "fail"])
 async def test_slow_native_launch_preserves_loop_and_ownership(
@@ -202,12 +205,13 @@ async def test_slow_native_launch_preserves_loop_and_ownership(
     await case.assert_readers_closed()
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(os.name != "nt", reason="Windows native PTY reader lifecycle")
 @pytest.mark.parametrize("native_launch", ["pty"], indirect=True)
 @pytest.mark.parametrize("outcome", ["fail", "cancel"])
 @pytest.mark.asyncio
 async def test_quiet_native_reader_is_reclaimed_after_initialization(
-    native_launch, monkeypatch, outcome,
+    native_launch, monkeypatch, outcome, request,
 ):
     case = native_launch
     case.script.write_text(
@@ -220,24 +224,79 @@ async def test_quiet_native_reader_is_reclaimed_after_initialization(
     release = threading.Event()
     original_start = pty_backend._start_windows_pty_reader
     readers = []
+    launch_started = time.monotonic()
+    phases = []
+    worker_id = None
+    reader_pid = None
+
+    def phase(name):
+        phases.append((name, round(time.monotonic() - launch_started, 3)))
+
+    def diagnose_pending_launch():
+        if not task.done():
+            launch_state = "pending"
+        elif task.cancelled():
+            launch_state = "cancelled"
+        elif (error := task.exception()) is not None:
+            launch_state = f"exception={error!r}"
+        else:
+            launch_state = f"result={task.result()!r}"
+        lines = [
+            f"quiet native launch {outcome}: elapsed={time.monotonic() - launch_started:.3f}s "
+            f"phases={phases!r} marker_exists={case.marker.exists()} "
+            f"started={started.is_set()} reader_pid={reader_pid!r} launch={launch_state}\n",
+            f"readers={[(reader.name, reader.ident, reader.is_alive()) for reader in readers]!r}\n",
+        ]
+        frames = sys._current_frames()
+        for thread in threading.enumerate():
+            if (
+                thread.ident == worker_id or thread.name.startswith("asyncio_")
+                or thread.name == "opensquilla-pty-reader"
+            ):
+                frame = frames.get(thread.ident)
+                if frame is not None:
+                    lines.append(f"thread={thread.name}\n")
+                    lines.extend(traceback.format_stack(frame))
+        request.node.add_report_section("call", "quiet native launch preparation", "".join(lines))
 
     def start(raw):
+        nonlocal worker_id, reader_pid
+        worker_id = threading.get_ident()
+        reader_pid = raw.pid
+        phase("reader-init-entered")
         original_start(raw)
         readers.append(raw._thread)
+        phase("reader-thread-started")
         # Prove the real child reached its quiet wait, not just that the
         # helper's ownership gate opened. The outer watchdog releases this
         # wait on failure, so the launch still drains its native resources.
         while not case.marker.exists():
             assert not release.wait(0.01), "quiet child did not start"
+        phase("quiet-marker-observed")
         loop.call_soon_threadsafe(started.set)
         assert release.wait(5), "event loop did not release reader initialization"
+        phase("reader-init-released")
         if outcome == "fail":
             raise OSError("synthetic failure after native reader initialization")
 
     monkeypatch.setattr(pty_backend, "_start_windows_pty_reader", start)
     task = asyncio.create_task(case.launch())
+    started_task = asyncio.create_task(started.wait())
+    diagnostic = loop.call_later(9, diagnose_pending_launch)
     try:
-        await asyncio.wait_for(started.wait(), timeout=10)
+        done, _pending = await asyncio.wait(
+            {started_task, task}, timeout=10, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if task in done:
+            diagnose_pending_launch()
+            result = await task
+            pytest.fail(
+                f"native launch finished before reader initialization was released: {result}"
+            )
+        if started_task not in done:
+            diagnose_pending_launch()
+            raise TimeoutError("quiet native reader preparation did not complete within 10s")
+        diagnostic.cancel()
         assert process_tree._load_owner_records(case.state)
         if outcome == "cancel":
             task.cancel("cancel during reader initialization")
@@ -250,7 +309,11 @@ async def test_quiet_native_reader_is_reclaimed_after_initialization(
             result = await asyncio.wait_for(task, timeout=10)
             assert "capability_error" in result
     finally:
+        diagnostic.cancel()
         release.set()
+        started_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await started_task
         with contextlib.suppress(asyncio.CancelledError):
             await task
     assert readers
@@ -311,6 +374,7 @@ def test_windows_reader_closes_when_output_socket_is_full(monkeypatch):
     assert reader.fileno() == writer.fileno() == -1
 
 
+@pytest.mark.ci_serial
 def test_runner_shutdown_waits_for_native_launch_cleanup(native_launch, monkeypatch):
     case = native_launch
     release = threading.Event()
