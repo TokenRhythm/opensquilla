@@ -416,6 +416,8 @@ SUBAGENT_TOOL_DENY: frozenset[str] = frozenset(
         "session_search",
         "message",
         "publish_artifact",
+        "video_generate",
+        "video_status",
     }
 )
 

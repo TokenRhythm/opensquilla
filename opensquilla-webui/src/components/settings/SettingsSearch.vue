@@ -18,7 +18,7 @@ const labels: Partial<Record<SettingsRailSectionId, string[]>> = {
   gateway: ['monitorSupport.title', 'monitorSupport.downloadBundle', 'settings.search.supportBundle', 'gatewayLogs.viewLogs'],
   provider: ['setup.provider.defaultModelLabel', 'settings.search.defaultModel'],
   modelStrategy: ['setup.modelStrategy.singleModelLabel', 'setup.modelStrategy.routerTitle', 'setup.modelStrategy.ensembleTitle'],
-  capabilities: ['setup.search.title', 'setup.memory.title', 'setup.image.title', 'setup.audio.title'],
+  capabilities: ['setup.search.title', 'setup.memory.title', 'setup.image.title', 'setup.video.title', 'setup.audio.title'],
   general: ['settings.appearance.languageLabel', 'setup.behavior.autoTitlesLabel'],
   interface: ['settings.appearance.themeLabel', 'settings.appearance.sidebarWidthLabel', 'settings.appearance.toolDetailsLabel', 'settings.appearance.visualEffectsLabel', 'settings.appearance.composerFxLabel'],
   securityPrivacy: ['settings.sandbox.title', 'settings.sandbox.mode.title', 'settings.search.permissions', 'setup.privacy.networkReportingLabel'],
@@ -65,10 +65,11 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 function clearSearch(event: KeyboardEvent) {
-  if (!query.value) return
+  if (!query.value && !input.value?.value) return
   event.preventDefault()
   event.stopPropagation()
   query.value = ''
+  if (input.value) input.value.value = ''
   input.value?.focus()
 }
 function moveResult(event: KeyboardEvent, direction: 1 | -1) {

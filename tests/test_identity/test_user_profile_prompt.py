@@ -140,6 +140,17 @@ def test_system_prompt_only_documents_canonical_tool_names() -> None:
     assert "send_message" not in prompt
 
 
+def test_system_prompt_conditions_video_guidance_on_tool_availability() -> None:
+    profile = AgentProfile(agent_id="main", prompt_mode="full")
+    available = assemble_system_prompt(profile, tools=["video_generate", "video_status"])
+    unavailable = assemble_system_prompt(profile, tools=["image_generate"])
+
+    assert "call `video_generate`" in available
+    assert "use `video_status`" in available
+    assert "Video generation is unavailable" not in available
+    assert "Video generation is unavailable" in unavailable
+
+
 def test_system_prompt_requires_tool_preambles_and_conversation_language() -> None:
     prompt = assemble_system_prompt(
         AgentProfile(agent_id="main", prompt_mode="full"),

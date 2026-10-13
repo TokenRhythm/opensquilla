@@ -8,6 +8,8 @@ import { ONBOARDING_MODELS_DISCOVER_METHOD } from '@/contracts/generated/v4/onbo
 import { validateOnboardingModelsDiscoverResult as validateModelsDiscover } from '@/contracts/generated/v4/onboardingModelsDiscoverValidators.mjs'
 import { ONBOARDING_IMAGE_GENERATION_MODELS_DISCOVER_METHOD } from '@/contracts/generated/v4/onboardingImageGenerationModelsDiscover'
 import { validateOnboardingImageGenerationModelsDiscoverResult as validateImageModelsDiscover } from '@/contracts/generated/v4/onboardingImageGenerationModelsDiscoverValidators.mjs'
+import { ONBOARDING_VIDEO_GENERATION_MODELS_DISCOVER_METHOD } from '@/contracts/generated/v4/onboardingVideoGenerationModelsDiscover'
+import { validateOnboardingVideoGenerationModelsDiscoverResult as validateVideoModelsDiscover } from '@/contracts/generated/v4/onboardingVideoGenerationModelsDiscoverValidators.mjs'
 import { ONBOARDING_PROVIDER_CREDENTIAL_REVEAL_METHOD } from '@/contracts/generated/v4/onboardingProviderCredentialReveal'
 import { validateOnboardingProviderCredentialRevealResult as validateCredentialReveal } from '@/contracts/generated/v4/onboardingProviderCredentialRevealValidators.mjs'
 import { ONBOARDING_PROVIDER_CREDENTIAL_CLEAR_METHOD } from '@/contracts/generated/v4/onboardingProviderCredentialClear'
@@ -60,6 +62,7 @@ export const setupContracts = {
   providerProbe: descriptor(ONBOARDING_PROVIDER_PROBE_METHOD, validateProviderProbe),
   modelsDiscover: descriptor(ONBOARDING_MODELS_DISCOVER_METHOD, validateModelsDiscover),
   imageModelsDiscover: descriptor(ONBOARDING_IMAGE_GENERATION_MODELS_DISCOVER_METHOD, validateImageModelsDiscover),
+  videoModelsDiscover: descriptor(ONBOARDING_VIDEO_GENERATION_MODELS_DISCOVER_METHOD, validateVideoModelsDiscover),
   credentialReveal: descriptor(ONBOARDING_PROVIDER_CREDENTIAL_REVEAL_METHOD, validateCredentialReveal),
   credentialClear: descriptor(ONBOARDING_PROVIDER_CREDENTIAL_CLEAR_METHOD, validateCredentialClear),
   profileUpsert: descriptor(ONBOARDING_LLM_PROFILE_UPSERT_METHOD, validateProfileUpsert),

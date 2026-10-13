@@ -804,6 +804,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "onboarding.videoGeneration.models.discover",
+      "schema": "platform/onboarding-video-generation-models-discover.schema.json",
+      "schemaSha256": "34810820514146b1bee17dc7d9ca1e758f5e59ca52960276064df9c987a5686e"
+    },
+    {
+      "lifecycle": "stable",
       "name": "plans.cancelRun",
       "schema": "plans/plans-cancel-run.schema.json",
       "schemaSha256": "02ec2f3e25815de415595f1f13d6db9bd7fdbc0e2351ee4309e1cdfa261b76c2"
@@ -1421,10 +1427,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "a65290ff5b65a3d9a9246897d45fb50a0eb82fe15725ed71e9c028c9a1fd0934",
-    "methodCount": 208,
-    "schemaCount": 218,
-    "schemaTreeSha256": "1889f80a5f4b89b739978f89b723a90f905b06f5183251562143242cafeb6605",
+    "generatorSha256": "1fbd19302f070afa0dad372640c6814abf36a9ae7699e2c6020d72f932e9c12f",
+    "methodCount": 209,
+    "schemaCount": 219,
+    "schemaTreeSha256": "60177cf57cc690dbf09080c8d9071da638316c0ab37306fc317d60e4365553d0",
     "toolchains": {
       "legacyTypes": {
         "python": {

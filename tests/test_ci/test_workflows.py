@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
 
 WORKFLOW_DIR = Path(".github/workflows")
 PR_TARGET_VALIDATOR = Path(".github/scripts/validate-pr-target-branch.sh")
@@ -2572,6 +2574,15 @@ def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
     }
     checkout = next(step for step in steps if step.get("name") == "Check out repository")
     assert checkout["with"]["lfs"] is True
+    setup_node = next(step for step in steps if step.get("name") == "Set up Node.js")
+    assert setup_node["uses"] == "actions/setup-node@v4"
+    assert setup_node["with"] == {"node-version": "22.23.3"}
+    assert "if" not in setup_node
+    versions = next(step for step in steps if step.get("name") == "Record tool versions")
+    assert steps.index(checkout) < steps.index(setup_node) < steps.index(versions)
+    assert steps.index(versions) < steps.index(test_step)
+    assert "node --version" in versions["run"]
+    assert "node -p 'process.execPath'" in versions["run"]
     bun_step = next(step for step in steps if step.get("name") == "Set up Bun")
     assert bun_step["if"] == "${{ startsWith(matrix.shard, 'core-') }}"
     assert steps[0]["name"] == "Prepare diagnostic report"
@@ -2761,7 +2772,8 @@ def test_native_desktop_cells_run_source_and_frozen_mcp_probes() -> None:
     assert "docker run --rm -i --entrypoint python" in container["run"]
     assert "readonly" in container["run"]
     assert "docker image inspect --format '{{json .Size}}'" in container["run"]
-    assert 'sdk_version == "2.2.0"' in container["run"]
+    assert 'requires("opensquilla")' in container["run"]
+    assert "sdk_version in sdk_requirement.specifier" in container["run"]
     assert "create_mcp_server()" in container["run"]
     assert "MCPStdioClient(MCPServerConfig(" in container["run"]
     assert "set -euo pipefail" in container["run"]
@@ -2770,6 +2782,33 @@ def test_native_desktop_cells_run_source_and_frozen_mcp_probes() -> None:
     compile(container["run"].split("<<'PY'", 1)[1].split("\n", 1)[1].rsplit(
         "\nPY", 1
     )[0], "docker-mcp-smoke", "exec")
+
+
+@pytest.mark.parametrize("sdk_version,allowed", [
+    ("2.2.0", True), ("2.3.0", True), ("2.1.0", False), ("3.0.0", False),
+])
+def test_container_mcp_sdk_version_obeys_installed_package_contract(
+    sdk_version: str, allowed: bool,
+) -> None:
+    steps = _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+    container = next(step for step in steps if step.get("name") == (
+        "Build production Docker image and verify MCP"
+    ))
+    script = container["run"].split("<<'PY'", 1)[1].split("\n", 1)[1].rsplit("\nPY", 1)[0]
+    check = next(node for node in ast.parse(script).body
+                 if isinstance(node, ast.FunctionDef) and node.name == "check_sdk_version")
+    namespace = {
+        "version": lambda name: sdk_version,
+        "requires": lambda name: ["anyio>=4", "mcp>=2.2.0,<3"],
+        "Requirement": Requirement,
+    }
+    exec(compile(ast.Module(body=[check], type_ignores=[]), "docker-mcp-version", "exec"),
+         namespace)
+    if allowed:
+        assert namespace["check_sdk_version"]() == sdk_version
+    else:
+        with pytest.raises(AssertionError, match=re.escape(sdk_version)):
+            namespace["check_sdk_version"]()
 
 
 def test_native_desktop_cells_require_recommended_pty_before_managed_smoke() -> None:
@@ -3323,6 +3362,17 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
         expected_preflight_files.update({
             "tests/test_ci/test_windows_signatures.py",
             "tests/test_tools/test_shell_process_isolation.py",
+            "tests/test_tools/test_shell_blocking_launch.py",
+            "tests/test_ci/test_rpc_architecture_contracts.py",
+            "tests/test_skills/test_hub_management_service.py",
+            "tests/test_gateway/test_native_attachment_import.py",
+            "tests/test_gateway/test_recovery_scheduler.py",
+            "tests/test_gateway/test_goal_user_input.py",
+            "tests/test_gateway/test_manual_compaction_contract.py",
+            "tests/test_gateway/test_sandbox_token_rpc_workers.py",
+            "tests/test_live_provider_profile_gateway_e2e.py",
+            "tests/test_ci/test_upgrade_baselines.py",
+            "tests/test_engine/test_runtime_router_fallback.py",
         })
         assert '"${family}" == "core"' in preflight["run"]
     assert set(re.findall(r"tests/[a-zA-Z0-9_/.]+\.py", preflight["run"])) == (
@@ -3339,9 +3389,19 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
 @pytest.mark.parametrize(("family", "expected_file"), [
     ("core", "tests/test_ci/test_windows_signatures.py"),
     ("core", "tests/test_cli/test_chat_cmd.py"),
-    ("gateway-sqlite", None),
+    ("core", "tests/test_tools/test_shell_blocking_launch.py"),
+    ("core", "tests/test_ci/test_rpc_architecture_contracts.py"),
+    ("core", "tests/test_skills/test_hub_management_service.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_native_attachment_import.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_recovery_scheduler.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_goal_user_input.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_manual_compaction_contract.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_sandbox_token_rpc_workers.py"),
+    ("gateway-sqlite", "tests/test_live_provider_profile_gateway_e2e.py"),
     ("recovery-migration", "tests/test_sandbox/test_windows_shell_process_runtime.py"),
     ("recovery-migration", "tests/test_live_long_task_case_driver.py"),
+    ("recovery-migration", "tests/test_ci/test_upgrade_baselines.py"),
+    ("recovery-migration", "tests/test_engine/test_runtime_router_fallback.py"),
     ("desktop-installer-contracts", "tests/test_ci/test_architecture_import_contracts.py"),
     ("desktop-installer-contracts", "tests/test_engine/test_tool_concurrency.py"),
 ])

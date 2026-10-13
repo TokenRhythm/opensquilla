@@ -789,6 +789,7 @@ def _status_payload(status: OnboardingStatus, *, config: GatewayConfig) -> dict:
         "imageGenerationPrimary": status.image_generation_primary,
         "imageGenerationEnvKey": status.image_generation_env_key,
         "imageGenerationState": dict(status.image_generation_state),
+        "videoGenerationState": dict(status.video_generation_state),
         "audioConfigured": status.audio_configured,
         "audioEnabled": status.audio_enabled,
         "audioSource": status.audio_source,

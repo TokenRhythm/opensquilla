@@ -81,15 +81,23 @@ def persist_setup_candidate(
 
 
 def sync_media_runtime(config: Any) -> None:
-    """Apply image-generation and audio configuration to the live tool layer."""
+    """Apply media-generation configuration to the live tool layer."""
 
-    from opensquilla.tools.builtin.media import configure_audio, configure_image_generation
+    from opensquilla.tools.builtin.media import (
+        configure_audio,
+        configure_image_generation,
+        configure_video_generation,
+    )
 
     configure_image_generation(
         getattr(config, "image_generation", None),
         gateway_config=config,
         llm_config=getattr(config, "llm", None),
         squilla_router_config=getattr(config, "squilla_router", None),
+    )
+    configure_video_generation(
+        getattr(config, "video_generation", None),
+        gateway_config=config,
     )
     configure_audio(getattr(config, "audio", None))
 

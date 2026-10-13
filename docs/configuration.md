@@ -244,6 +244,93 @@ your install to see the current catalog.
 
 Read: [`providers-and-models.md`](providers-and-models.md)
 
+## Video Generation
+
+Video generation is disabled by default. Select TokenRhythm or OpenRouter and
+one of its text-to-video models in Settings, or configure them in TOML. If the
+same Provider is already configured, its credential is reused without entering
+another key:
+
+```toml
+[video_generation]
+enabled = true
+provider = "tokenrhythm"
+primary = "wan3.0-video"
+duration_seconds = 8
+max_duration_seconds = 8
+aspect_ratio = "16:9"
+allowed_aspect_ratios = ["16:9", "9:16"]
+resolution = "720p"
+allowed_resolutions = ["720p", "1080p"]
+timeout_seconds = 600
+max_output_bytes = 104857600 # 100 MiB
+```
+
+OpenRouter uses a raw model ID such as `google/veo-3.1-fast`; TokenRhythm uses
+its native model ID. The `wan3.0-video` example is documented by TokenRhythm;
+model access still depends on the account. Existing Gemini, xAI, Qwen, and
+Qwen Token Plan routes remain readable and usable for compatibility, but are
+not offered for new selections in Settings. Settings preserves an existing
+route until you explicitly select its replacement. Existing configurations
+with `primary` but no `provider` continue to use OpenRouter. A new installation
+does not select a provider automatically.
+
+Each `video_generation.providers.<provider>` section accepts `base_url`,
+`api_key_env`, and an optional direct `api_key`. A direct API key and an
+environment-variable reference are alternative credential sources; you do not
+need to configure both. Settings shows the resolved credential source and
+offers an optional dedicated credential editor. Environment-variable names
+refer to values available to the Gateway process, rather than containing a key.
+You can explicitly return to shared credentials by removing the video key and
+video environment-variable reference.
+
+Without a dedicated video credential, a matching configured primary Provider
+or profile supplies the key. A video API URL that has not been explicitly set
+also follows that Provider's endpoint. Explicit video endpoints and credentials
+retain their own bindings. A default environment key or same-origin image
+credential can be used when no matching Provider is configured. The default
+environment names for the two selectable providers are `OPENROUTER_API_KEY`
+and `TOKENRHYTHM_API_KEY`.
+
+For a dedicated compatible proxy, choose its URL and an explicit environment
+reference, or enter a dedicated key in Settings. For example:
+
+```toml
+[video_generation]
+enabled = true
+provider = "openrouter"
+primary = "google/veo-3.1-fast"
+
+[video_generation.providers.openrouter]
+base_url = "https://video.example.com/api/v1"
+api_key_env = "VIDEO_PROXY_API_KEY"
+```
+
+Custom endpoints must use HTTPS, except for an HTTP loopback service. A video
+provider cannot target another built-in provider's official origin. Default
+provider environment keys and model-service credentials do not follow a
+custom endpoint to a different origin unless the key reference was explicitly
+configured for that endpoint. A matching primary model-service or profile
+credential can be reused when its endpoint has the same origin. No video key
+is needed when the same provider's image generation key already covers that
+origin when no matching model-service Provider is configured. A direct video
+key entered in Settings is stored in the local Gateway configuration, tied to
+its endpoint, and redacted from settings reads. The tools appear only when video
+generation is enabled and the selected model and credential are available. An
+existing accepted job can still expose `video_status` for recovery
+after the generation setting is disabled. The official OpenRouter model catalog
+is checked before submission.
+
+The defaults allow agent-selected clips within an 8 second maximum. When neither
+the tool call nor the config specifies a duration, each adapter selects a
+provider-appropriate duration within the configured maximum and sends it explicitly.
+The schema permits an operator maximum up to 60
+seconds. The timeout can be 30–1800 seconds; the output cap can be 1–500 MiB.
+The video cap replaces the ordinary 30 MiB artifact per-file limit for these
+outputs. The separate aggregate artifact disk budget remains 512 MiB by
+default; configure `[attachments].artifact_disk_budget_bytes` if needed.
+See [video generation and recovery](artifacts-and-media.md#video-generation).
+
 ## Router Configuration
 
 Router modes:

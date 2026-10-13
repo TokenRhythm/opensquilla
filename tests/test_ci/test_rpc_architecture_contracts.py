@@ -132,8 +132,9 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Retire 19 generated MetaSkill methods and nine legacy workflow methods.
 # Retire router learning status and training feedback (two generated methods).
 # Retire the three advanced agent administration methods.
-RUNTIME_RPC_METHOD_BASELINE = 275
-RUNTIME_RPC_METHOD_DIGEST = "bb550c7d3d3f70eefea7e9d233ee892abf4e2c28b77a9460c2da60b1228f77f1"
+# Add video-generation model discovery without changing existing method names.
+RUNTIME_RPC_METHOD_BASELINE = 276
+RUNTIME_RPC_METHOD_DIGEST = "bbbdbc03db0735074506ce88b2406082116f560fbd560a04916d988a113df523"
 STATIC_RPC_DECORATOR_BASELINE = 63
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -593,13 +594,19 @@ def test_schema_derived_method_metadata_consumers_are_exact() -> None:
             PLANS_METADATA_IMPORT_ALLOWLIST,
         ),
     }
+    # Index all metadata consumers in one source-tree scan instead of parsing
+    # the entire package again for every method's allowlist.
+    consumers_by_module: dict[str, set[str]] = {
+        module_name: set() for module_name, _ in allowlists.values()
+    }
+    for path in _python_files(PACKAGE_ROOT):
+        for node in ast.walk(_tree(path)):
+            for module_name in _imported_modules(path, node):
+                if module_name in consumers_by_module:
+                    consumers_by_module[module_name].add(_relative(path))
+
     for method, (module_name, allowlist) in allowlists.items():
-        consumers = {
-            _relative(path)
-            for path in _python_files(PACKAGE_ROOT)
-            for node in ast.walk(_tree(path))
-            if module_name in _imported_modules(path, node)
-        }
+        consumers = consumers_by_module[module_name]
         unexpected = consumers - allowlist
         stale = allowlist - consumers
         assert unexpected == set(), f"unexpected {method} metadata imports: {unexpected}"
