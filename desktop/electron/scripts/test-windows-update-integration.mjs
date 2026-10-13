@@ -55,6 +55,7 @@ const compiled = ts.transpileModule(`${extracted}\nconst beforeQuit = ${beforeQu
     new URL('./test-windows-update-electron.mjs', import.meta.url), 'utf8',
   ), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
   let nativeNames
+  const protectedVisibilityChecks = []
   function findNames(node) {
     if (ts.isVariableDeclaration(node) && node.name.getText(runner) === 'names') {
       assert.ok(ts.isArrayLiteralExpression(node.initializer))
@@ -63,10 +64,42 @@ const compiled = ts.transpileModule(`${extracted}\nconst beforeQuit = ${beforeQu
         return value.text
       })
     }
+    if (ts.isCallExpression(node) && node.expression.getText(runner) === 'assert.equal'
+      && node.arguments[0]?.getText(runner) === 'deferred.visible') {
+      protectedVisibilityChecks.push(node.getText(runner))
+    }
     ts.forEachChild(node, findNames)
   }
   findNames(runner)
   assert.ok(nativeNames?.includes('holdQuitForTaskConfirmation'))
+  assert.equal(protectedVisibilityChecks.length, 2)
+  const failureCleanup = runner.statements.find(statement => ts.isFunctionDeclaration(statement)
+    && statement.name?.text === 'closeFixtureAfterFailure')
+  assert.ok(failureCleanup)
+  for (const gatesPresent of [false, true]) {
+    const order = []
+    const child = { pid: 54328 }
+    const close = new Function('closeElectronWithDeadline', `return ${failureCleanup.getText(runner)}`)(
+      async options => {
+        assert.equal(options.timeoutMs, 10_000, 'fixture gates share the existing cleanup deadline')
+        assert.equal(options.app.process(), child)
+        await options.app.close()
+        return { closed: true }
+      },
+    )
+    const result = await close({
+      process: () => child,
+      evaluate: async callback => vm.runInNewContext(`(${callback.toString()})()`, gatesPresent ? {
+        windowsUpdateFixture: {
+          releaseVerification: () => order.push('verification'),
+          releaseDrain: () => order.push('drain'),
+        },
+      } : {}),
+      close: async () => { order.push('close') },
+    })
+    assert.deepEqual(result, { closed: true })
+    assert.deepEqual(order, gatesPresent ? ['verification', 'drain', 'close'] : ['close'])
+  }
   const scheduler = parsed.statements.find(statement => ts.isVariableStatement(statement)
     && statement.declarationList.declarations.some(declaration => declaration.name.getText(parsed) === 'desktopUpdateCheckScheduler'))
   assert.ok(scheduler)
@@ -98,6 +131,7 @@ const compiled = ts.transpileModule(`${extracted}\nconst beforeQuit = ${beforeQu
         pendingQuit() { return quitRequestedDuringUpdateDrain },
         confirmationPending() { return quitConfirmationPromise },
         phase() { return appExitPhase },
+        closeWindow(window, event) { mainWindow = window; handleMainWindowClose(window, event) },
       };`,
     )(
       app, { registerSchemesAsPrivileged() {} },
@@ -114,8 +148,20 @@ const compiled = ts.transpileModule(`${extracted}\nconst beforeQuit = ${beforeQu
     )
     await fixture.startSyntheticGateway()
     if (deferredQuit) {
+      const window = {
+        visible: true, isDestroyed: () => false,
+        hide() { this.visible = false },
+      }
       fixture.setUpdating(true)
+      const closeEvent = electronEvent()
+      fixture.closeWindow(window, closeEvent)
       app.quit()
+      await fixture.confirmationPending()
+      assert.equal(closeEvent.defaultPrevented, true)
+      assert.equal(window.visible, true, 'protected update must retain its parent window')
+      for (const check of protectedVisibilityChecks) {
+        vm.runInNewContext(check, { assert, deferred: { visible: window.visible } })
+      }
       assert.equal(fixture.pendingQuit(), true)
       assert.equal(fixture.liveLifecycleOwnedGatewayProcesses().length, 1)
       assert.deepEqual(exits, [])
