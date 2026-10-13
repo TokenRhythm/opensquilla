@@ -461,3 +461,39 @@ timeout. After rollout, compare first-attempt failure and rerun rates by event,
 OS, and executed job over the same observation window. Record the deployed SHA
 and outstanding unknown signatures. A single green full matrix is acceptance
 evidence, not a measured long-term stability improvement.
+
+### Bounded subprocess contracts
+
+Keep a subprocess deadline attached to the behavior it owns. The adversarial
+source-symbol guard calls the same lightweight matcher used by the production
+tool, without importing the entire tool registry and Gateway. Its original
+30-second startup and 15-second parsing limits remain; tool-level Python and C
+receipt tests cover integration. A regression to the earlier catastrophic C
+regex must still fail the parsing guard.
+
+Channel storage imports must not initialize adapters or the Gateway. Public
+channel exports remain available through lazy lookup. The crash-recovery test
+retains its 20-second deadline, abrupt exit, committed ingress, and ambiguous
+outbox assertions. Preserve the same asynchronous pipe reader on timeout so
+phase output already consumed before cancellation is not lost. On Windows,
+both parser and crash probes launch the base interpreter with the venv launcher
+environment and assert its PID and prefix, so the watchdog owns the process
+doing the work rather than a redirector that can exit before it.
+
+The generic Windows managed-handle and pipe/EOF contracts use PowerShell
+commands directly within the original five-second budget. Native Python argv,
+quoting, exit-code, and stdin contracts remain in their dedicated tests. This
+removes an unrelated interpreter startup from those generic contracts; it does
+not establish which process stage caused historical failures without phase data.
+
+The fresh-wheel migration test installs all base dependencies into a clean
+environment from `uv.lock`, then installs the wheel with normal offline
+dependency resolution. The install phases share the original 300-second budget.
+Wheel contents in the cache do not imply that a second registry resolution has
+cached metadata; preparing locked dependencies avoids that extra requirement.
+The wheel's `Requires-Dist` must retain every declared base dependency, and the
+installed environment must pass `uv pip check`.
+Run the normal locked dependency sync first and preserve `UV_CACHE_DIR` when
+isolating a local test profile. An unavailable cached dependency is an error,
+never a reason to skip the test or retry online. The installed interpreter runs
+with `-I` and must resolve migrations beneath its own environment prefix.

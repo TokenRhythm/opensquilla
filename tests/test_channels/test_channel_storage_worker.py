@@ -588,21 +588,39 @@ async def test_process_crash_recovers_committed_ingress_once_without_resending_u
         "delivery_id": "crash-delivery",
     }
     script = textwrap.dedent("""\
+        import sys
+        import os
+        import time
+
+        started = time.monotonic()
+
+        def phase(name):
+            print(
+                f"phase: {name}; pid={os.getpid()}; "
+                f"elapsed={time.monotonic() - started:.6f}s",
+                file=sys.stderr, flush=True,
+            )
+
+        phase("python-ready")
         import asyncio
         import json
-        import os
-        import sys
         from types import SimpleNamespace
         from opensquilla.channels.delivery_store import deliver_operation_with_outbox
         from opensquilla.channels.storage_worker import AsyncChannelDeliveryStore
         from opensquilla.channels.types import ChannelArtifactDeliveryRequest, IncomingMessage
+        phase("imports-ready")
 
         async def main():
             payload = json.load(sys.stdin)
+            assert os.getpid() == payload["expected_pid"], "watchdog must own the interpreter"
+            assert sys.prefix == payload["expected_prefix"], "probe must retain the test venv"
             store = AsyncChannelDeliveryStore(payload["path"])
+            phase("store-open-start")
             await store.open()
+            phase("store-open-done")
             inbound = IncomingMessage.model_validate(payload["inbound"])
             assert await store.accept_inbound("channel", inbound)
+            phase("inbound-committed")
             channel = SimpleNamespace(_delivery_store=store, _delivery_channel_name="channel")
             request = ChannelArtifactDeliveryRequest(inbound=inbound, **payload["artifact"])
 
@@ -619,36 +637,62 @@ async def test_process_crash_recovers_committed_ingress_once_without_resending_u
                 raise AssertionError("provider must have an ambiguous outcome")
             record = await store.send_record(request.delivery_id)
             assert record["state"] == "unknown"
+            phase("unknown-committed")
             print("accept-and-unknown-committed", flush=True)
             # No worker.close, asyncio teardown, or Python exit handlers may run.
+            phase("before-exit")
             os._exit(31)
 
         asyncio.run(main())
         """)
     root = Path(__file__).resolve().parents[2]
+    environment = {**os.environ, "PYTHONPATH": str(root / "src")}
+    interpreter = sys.executable
+    if os.name == "nt":
+        # Own the interpreter holding SQLite threads, not the venv redirector.
+        # This is also the launch contract in tests.helpers.sqlite_process_probe.
+        interpreter = sys._base_executable
+        environment["__PYVENV_LAUNCHER__"] = sys.executable
     process = await asyncio.create_subprocess_exec(
-        sys.executable,
+        interpreter,
         "-c",
         script,
         cwd=root,
-        env={**os.environ, "PYTHONPATH": str(root / "src")},
+        env=environment,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    communication = asyncio.create_task(process.communicate(json.dumps({
+        "path": str(path),
+        "inbound": inbound.model_dump(mode="json"),
+        "artifact": artifact,
+        "expected_pid": process.pid,
+        "expected_prefix": sys.prefix,
+    }).encode()))
     try:
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(json.dumps({
-                "path": str(path),
-                "inbound": inbound.model_dump(mode="json"),
-                "artifact": artifact,
-            }).encode()),
-            timeout=20,
-        )
-    finally:
-        if process.returncode is None:
-            process.kill()
-            await process.communicate()
+        stdout, stderr = await asyncio.wait_for(asyncio.shield(communication), timeout=20)
+    except BaseException as error:
+        try:
+            if process.returncode is None:
+                process.kill()
+        except OSError as cleanup_error:
+            error.add_note(f"crash child kill failed: {cleanup_error!r}")
+        try:
+            # Preserve the same pipe reader: cancelling communicate discards
+            # already-consumed phase output when a cold import stalls.
+            stdout, stderr = await asyncio.wait_for(asyncio.shield(communication), timeout=5)
+        except BaseException as cleanup_error:
+            error.add_note(f"crash child output cleanup failed: {cleanup_error!r}")
+            communication.cancel()
+            await asyncio.gather(communication, return_exceptions=True)
+        else:
+            error.add_note(
+                f"crash child pid={process.pid}, returncode={process.returncode}; "
+                f"stdout={stdout.decode(errors='replace')!r}; "
+                f"stderr={stderr.decode(errors='replace')!r}"
+            )
+        raise
     assert process.returncode == 31, stderr.decode()
     assert b"accept-and-unknown-committed" in stdout.splitlines()
 
