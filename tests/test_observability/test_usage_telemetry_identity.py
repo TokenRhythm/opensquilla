@@ -105,9 +105,13 @@ class _IdempotentCollector:
 def collector(monkeypatch) -> _IdempotentCollector:
     collector = _IdempotentCollector()
     original_client = httpx.AsyncClient
+    monkeypatch.delenv("OPENSQUILLA_TRUST_ENV", raising=False)
 
-    def client(*, timeout: float) -> httpx.AsyncClient:
-        return original_client(transport=httpx.MockTransport(collector.handle), timeout=timeout)
+    def client(*, timeout: float, trust_env: bool) -> httpx.AsyncClient:
+        assert trust_env is False
+        return original_client(
+            transport=httpx.MockTransport(collector.handle), timeout=timeout, trust_env=trust_env
+        )
 
     monkeypatch.setattr(httpx, "AsyncClient", client)
     return collector

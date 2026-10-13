@@ -593,13 +593,19 @@ def test_schema_derived_method_metadata_consumers_are_exact() -> None:
             PLANS_METADATA_IMPORT_ALLOWLIST,
         ),
     }
+    # Index all metadata consumers in one source-tree scan instead of parsing
+    # the entire package again for every method's allowlist.
+    consumers_by_module: dict[str, set[str]] = {
+        module_name: set() for module_name, _ in allowlists.values()
+    }
+    for path in _python_files(PACKAGE_ROOT):
+        for node in ast.walk(_tree(path)):
+            for module_name in _imported_modules(path, node):
+                if module_name in consumers_by_module:
+                    consumers_by_module[module_name].add(_relative(path))
+
     for method, (module_name, allowlist) in allowlists.items():
-        consumers = {
-            _relative(path)
-            for path in _python_files(PACKAGE_ROOT)
-            for node in ast.walk(_tree(path))
-            if module_name in _imported_modules(path, node)
-        }
+        consumers = consumers_by_module[module_name]
         unexpected = consumers - allowlist
         stale = allowlist - consumers
         assert unexpected == set(), f"unexpected {method} metadata imports: {unexpected}"

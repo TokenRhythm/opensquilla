@@ -1406,6 +1406,13 @@ jobs:
           printf 'OPENSQUILLA_STATE_DIR=%s/opensquilla-state\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           printf 'OPENSQUILLA_LOG_DIR=%s/opensquilla-logs\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Native metadata parity needs Windows volume IDs; the older WebUI
+          # build runtime reports zero. Pin the validated native-test runtime.
+          node-version: '22.23.3'
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -1489,6 +1496,8 @@ jobs:
             python --version
             uv --version
             uv run pytest --version
+            node --version
+            node -p 'process.execPath'
           } >> "${CI_REPORT_DIR}/environment.txt" 2>&1
 
       - name: Provision distinct Windows test volumes
@@ -1561,6 +1570,8 @@ jobs:
             regression_args+=(
               tests/test_sandbox/test_windows_shell_process_runtime.py
               tests/test_live_long_task_case_driver.py
+              tests/test_ci/test_upgrade_baselines.py
+              tests/test_engine/test_runtime_router_fallback.py
             )
           elif [[ "${family}" == "core" ]]; then
             regression_args+=(
@@ -1571,6 +1582,18 @@ jobs:
               tests/test_tools/test_shell_workdir.py
               tests/test_sandbox/test_shell_code_network_hints.py
               tests/test_tools/test_shell_runtime_preflight.py
+              tests/test_tools/test_shell_blocking_launch.py
+              tests/test_ci/test_rpc_architecture_contracts.py
+              tests/test_skills/test_hub_management_service.py
+            )
+          elif [[ "${family}" == "gateway-sqlite" ]]; then
+            regression_args+=(
+              tests/test_gateway/test_native_attachment_import.py
+              tests/test_gateway/test_recovery_scheduler.py
+              tests/test_gateway/test_goal_user_input.py
+              tests/test_gateway/test_manual_compaction_contract.py
+              tests/test_gateway/test_sandbox_token_rpc_workers.py
+              tests/test_live_provider_profile_gateway_e2e.py
             )
           fi
           # Windows workers hit access violations during timed stack dumps.
@@ -1771,6 +1794,18 @@ jobs:
             tests/test_persistence/test_migration_compatibility.py
             tests/test_migrations/test_v045_goal_runtime_accounting.py
             tests/test_tools/test_plan_access.py
+            tests/test_sandbox/test_run_context.py
+            tests/test_sandbox/test_run_context_grants.py
+            tests/test_sandbox/test_user_grants_workers.py
+            tests/test_sandbox/test_user_grants_service_workers.py
+            tests/test_sandbox/test_user_grants_mutation_order.py
+            tests/test_sandbox/test_startup_without_canaries.py
+            tests/test_gateway/test_rpc_run_mode_preference.py
+            tests/test_gateway/test_rpc_sandbox_setup.py
+            tests/test_gateway/test_admission_preparation.py
+            tests/test_gateway/test_project_workspace_execution.py
+            tests/test_gateway/test_full_policy_preparation_workers.py
+            tests/test_gateway/test_sandbox_policy_workers.py
             tests/test_scripts/test_verify_webui_artifact.py
             tests/test_scripts/test_stage_webui_artifact.py
             tests/test_packaging/test_webui_build_contract.py

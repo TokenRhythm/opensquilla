@@ -154,7 +154,7 @@
           class="artifact-preview__markdown chat-markdown"
         >
           <!-- eslint-disable-next-line vue/no-v-html -- output is DOMPurify-sanitized in the resource controller -->
-          <div v-html="preview.markdownHtml.value" />
+          <div ref="markdownPreviewEl" v-html="preview.markdownHtml.value" />
         </div>
         <pre
           v-else-if="preview.kind.value === 'text'"
@@ -206,6 +206,7 @@ import {
   artifactIconName,
 } from '@/utils/chat/artifacts'
 import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
+import { useMarkdownEnhancements } from '@/composables/chat/useMarkdownEnhancements'
 
 const props = withDefaults(defineProps<{
   artifact: ArtifactPayload
@@ -251,6 +252,7 @@ const artifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
 if (!artifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 const previewFrameRef = ref<HTMLIFrameElement | null>(null)
 const htmlFrameGeneration = ref(0)
+const markdownPreviewEl = ref<HTMLDivElement | null>(null)
 let loadedFrame: HTMLIFrameElement | null = null
 
 function onHtmlFrameLoad(event: Event) {
@@ -275,6 +277,8 @@ const preview = artifactWorkbench.previews.createResource({
   },
   sessionKey: () => props.sessionKey,
 })
+
+useMarkdownEnhancements(markdownPreviewEl, { version: () => preview.markdownHtml.value })
 
 const resourceSignature = computed(() => [
   props.artifact.id || '',

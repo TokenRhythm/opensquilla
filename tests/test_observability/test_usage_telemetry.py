@@ -636,14 +636,17 @@ def test_usage_endpoint_is_independent_from_install_endpoint(monkeypatch):
 async def test_post_uses_event_id_as_idempotency_key(monkeypatch):
     import httpx
 
+    monkeypatch.delenv("OPENSQUILLA_TRUST_ENV", raising=False)
+
     calls: list[dict[str, Any]] = []
 
     class FakeResponse:
         status_code = 200
 
     class FakeClient:
-        def __init__(self, *, timeout: float) -> None:
+        def __init__(self, *, timeout: float, trust_env: bool) -> None:
             assert timeout == install_telemetry.DEFAULT_TIMEOUT_SECONDS
+            assert trust_env is False
 
         async def __aenter__(self):
             return self

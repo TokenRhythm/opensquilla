@@ -1158,6 +1158,11 @@ def _evaluate_attachment_capacity_evidence(
         "actual_response_model": response_model,
         "request_count": len(requests),
         "response_count": len(responses),
+        "decision_diagnostics": {
+            "record_present": bool(decision),
+            "router_step_present": bool(router_step),
+            "routed_tier": routed_tier if routed_tier in TEXT_PROFILE_SLOTS else None,
+        },
         "request_projection": projection,
         "router_step": router_step,
         "decision": {
@@ -1178,12 +1183,14 @@ def _first_record(records: list[dict[str, Any]], *, session_key: str, kind: str)
 def _read_decision_records(state_root: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for path in sorted((state_root / "logs").glob("decisions-*.jsonl")):
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in path.read_bytes().splitlines():
             if not line.strip():
                 continue
             try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
+                records.append(json.loads(line.decode("utf-8")))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                # Concurrent appends or process exit may leave an incomplete
+                # final line; retain all complete records preceding it.
                 continue
     return records
 
@@ -1599,6 +1606,27 @@ def _wait_for_attachment_gateway_ready(
     return None, "gateway did not become ready before timeout"
 
 
+def _wait_for_attachment_decision_record(
+    proc: subprocess.Popen[Any],
+    state_root: Path,
+    *,
+    session_key: str,
+    deadline: float,
+) -> str | None:
+    """Wait for complete evidence, without extending the assistant reply budget."""
+
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return f"gateway exited early with code {proc.returncode} before decision record"
+        decisions = _read_decision_records(state_root)
+        if _decision_for_session(decisions, session_key=session_key):
+            # Presence is sufficient here. The evidence evaluator must still
+            # reject a missing router step or incorrect routing fields.
+            return None
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    return "decision record did not arrive before assistant reply deadline"
+
+
 def _run_tokenrhythm_attachment_capacity_in_temp(
     *,
     api_key: str,
@@ -1747,6 +1775,7 @@ def _run_tokenrhythm_attachment_capacity_in_temp(
                             timeout=submit_timeout,
                         )
             if turn_error is None:
+                reply_started_at = time.monotonic()
                 reply_timeout = _attachment_capacity_remaining_timeout(
                     work_deadline,
                     ATTACHMENT_CAPACITY_AGENT_TIMEOUT_SECONDS,
@@ -1755,6 +1784,7 @@ def _run_tokenrhythm_attachment_capacity_in_temp(
                 if reply_timeout <= 0:
                     turn_error = "total deadline exhausted before assistant reply wait"
                 else:
+                    reply_deadline = min(work_deadline, reply_started_at + reply_timeout)
                     assistant, _history, turn_error = _wait_for_assistant_reply(
                         port=port,
                         session_key=session_key,
@@ -1763,6 +1793,12 @@ def _run_tokenrhythm_attachment_capacity_in_temp(
                     )
                 if turn_error is None and marker not in str((assistant or {}).get("text") or ""):
                     turn_error = "assistant reply did not contain the bounded completion marker"
+                if turn_error is None:
+                    # Transcript persistence precedes decision-log emission.
+                    # In particular, Windows terminate() cannot drain that work.
+                    turn_error = _wait_for_attachment_decision_record(
+                        proc, tmp_path, session_key=session_key, deadline=reply_deadline,
+                    )
         except Exception as exc:  # noqa: BLE001 - compact, sanitized live diagnostic
             turn_error = f"{type(exc).__name__}: {exc}"
         finally:
@@ -1818,6 +1854,7 @@ def _run_tokenrhythm_attachment_capacity_in_temp(
         "expected_model": str(evidence.get("expected_model") or ""),
         "actual_request_model": actual_request_model,
         "actual_response_model": actual_response_model,
+        "decision_diagnostics": evidence["decision_diagnostics"],
         "usage": usage,
         "cost": _estimate_cost(
             actual_request_model,
