@@ -392,7 +392,7 @@ describe('browser Workbench provider', () => {
       action: 'navigate', url: 'https://example.test/other',
     } }, harness.item)
     expect(harness.renderState).toMatchObject({ currentUrl, errorMessage: '', loading: false,
-      navigationCancelSequence: 1 })
+      navigationAddressSequence: 1, navigationAddressRequestId: '' })
     expect(harness.api.destroySurface).not.toHaveBeenCalled()
     expect(harness.api.setSurfaceRect).not.toHaveBeenLastCalledWith(
       expect.objectContaining({ visible: false }),

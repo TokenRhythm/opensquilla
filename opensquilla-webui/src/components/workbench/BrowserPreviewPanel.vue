@@ -36,7 +36,7 @@
         spellcheck="false"
         :aria-label="t('workbench.browser.address')"
         :aria-invalid="invalidAddress || undefined"
-        @input="invalidAddress = false"
+        @input="onAddressInput"
       >
       <button type="submit" class="btn btn--ghost">
         {{ t('workbench.browser.go') }}
@@ -170,6 +170,7 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { copyTextWithFallback } from '@/utils/browser'
+import { createMutationClientRequestId } from '@/utils/mutationRequestIdentity'
 import { normalizeBrowserAddress } from '@/workbench/browserItems'
 import type { WorkbenchComponentEvent } from '@/workbench/types'
 
@@ -191,7 +192,8 @@ const props = withDefaults(defineProps<{
   downloadReceivedBytes?: number
   downloadTotalBytes?: number
   controlError?: string
-  navigationCancelSequence?: number
+  navigationAddressSequence?: number
+  navigationAddressRequestId?: string
 }>(), {
   canGoBack: false,
   canGoForward: false,
@@ -210,7 +212,8 @@ const props = withDefaults(defineProps<{
   downloadReceivedBytes: 0,
   downloadTotalBytes: 0,
   controlError: '',
-  navigationCancelSequence: 0,
+  navigationAddressSequence: 0,
+  navigationAddressRequestId: '',
 })
 
 const emit = defineEmits<{
@@ -219,6 +222,9 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const address = ref(props.currentUrl)
 const invalidAddress = ref(false)
+let addressRevision = 0
+let addressIsDraft = false
+let submittedAddress: { requestId: string; revision: number } | null = null
 const findInput = ref<HTMLInputElement | null>(null)
 const findText = ref(props.findQuery)
 const lastFindQuery = ref(props.findQuery)
@@ -242,13 +248,20 @@ const findCount = computed(() => props.findMatches === null || findText.value !=
   }))
 
 watch(() => props.currentUrl, value => {
+  if (addressIsDraft && (!submittedAddress || submittedAddress.revision !== addressRevision)) return
   address.value = value
+  addressIsDraft = false
   invalidAddress.value = false
 })
 
-watch(() => props.navigationCancelSequence, () => {
-  address.value = props.currentUrl
-  invalidAddress.value = false
+watch(() => props.navigationAddressSequence, () => {
+  if (!submittedAddress || submittedAddress.requestId !== props.navigationAddressRequestId) return
+  if (submittedAddress.revision === addressRevision) {
+    address.value = props.currentUrl
+    addressIsDraft = false
+    invalidAddress.value = false
+  }
+  submittedAddress = null
 })
 
 watch([() => props.findOpen, () => props.findFocusSequence], ([opened]) => {
@@ -274,7 +287,17 @@ function emitAction(action: string, detail: Record<string, unknown> = {}) {
 function navigate() {
   const url = normalizeBrowserAddress(address.value)
   invalidAddress.value = !url
-  if (url) emitAction('navigate', { url })
+  if (url) {
+    const addressRequestId = createMutationClientRequestId('browser-address')
+    submittedAddress = { requestId: addressRequestId, revision: addressRevision }
+    emitAction('navigate', { url, addressRequestId })
+  }
+}
+
+function onAddressInput() {
+  addressRevision += 1
+  addressIsDraft = true
+  invalidAddress.value = false
 }
 
 function clearFindTimer() {

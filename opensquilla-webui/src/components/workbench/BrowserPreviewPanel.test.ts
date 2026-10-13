@@ -26,7 +26,8 @@ function mountPanel() {
     downloadState: '' as '' | 'progressing' | 'completed' | 'cancelled' | 'interrupted',
     downloadReceivedBytes: 0,
     downloadTotalBytes: 0,
-    navigationCancelSequence: 0,
+    navigationAddressSequence: 0,
+    navigationAddressRequestId: '',
   })
   const onEvent = vi.fn((event: WorkbenchComponentEvent) => {
     if (event.type !== 'browser-action') return
@@ -105,9 +106,12 @@ it('restores the retained page address after a cancelled navigation', async () =
     new Event('submit', { bubbles: true, cancelable: true }),
   )
   expect(onEvent).toHaveBeenLastCalledWith({ type: 'browser-action', payload: {
-    action: 'navigate', url: 'https://example.test/other',
+    action: 'navigate', url: 'https://example.test/other', addressRequestId: expect.any(String),
   } })
-  props.navigationCancelSequence++
+  props.navigationAddressRequestId = String(
+    (onEvent.mock.lastCall![0].payload as Record<string, unknown>).addressRequestId,
+  )
+  props.navigationAddressSequence++
   await nextTick()
   expect(address.value).toBe(props.currentUrl)
 })

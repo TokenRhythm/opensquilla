@@ -25,6 +25,7 @@ interface BrowserAction {
   forward?: boolean
   zoomFactor?: number
   downloadId?: string
+  addressRequestId?: string
 }
 
 export interface BrowserWorkbenchProviderOptions {
@@ -56,6 +57,9 @@ function browserAction(event: WorkbenchComponentEvent): BrowserAction | null {
       && raw.zoomFactor >= 0.5 && raw.zoomFactor <= 3 ? { zoomFactor: raw.zoomFactor } : {}),
     ...(typeof raw.downloadId === 'string' && /^download-[0-9a-f-]{36}$/.test(raw.downloadId)
       ? { downloadId: raw.downloadId } : {}),
+    ...(typeof raw.addressRequestId === 'string'
+      && /^browser-address-[a-z0-9-]{1,64}$/i.test(raw.addressRequestId)
+      ? { addressRequestId: raw.addressRequestId } : {}),
   }
 }
 
@@ -69,6 +73,7 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
   private item: WorkbenchItem
   private rejectedContextTargetRef = ''
   private rect: NativeSurfaceRect | null = null
+  private addressNavigationGeneration = 0
 
   constructor(
     item: WorkbenchItem,
@@ -95,7 +100,8 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
       downloadReceivedBytes: 0,
       downloadTotalBytes: 0,
       controlError: '',
-      navigationCancelSequence: 0,
+      navigationAddressSequence: 0,
+      navigationAddressRequestId: '',
     })
   }
 
@@ -212,6 +218,8 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
     }
     const url = action === 'navigate' ? normalizeBrowserUrl(request.url || '') : ''
     if (action === 'navigate' && !url) return
+    const addressGeneration = action === 'navigate'
+      ? ++this.addressNavigationGeneration : this.addressNavigationGeneration
     try {
       const result = await native.navigateSurface({
         version: 2,
@@ -225,8 +233,8 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
       })
       if (!result.ok) {
         if (result.code === 'NAVIGATION_CANCELLED') {
-          this.context.updateRenderState({ loading: false, errorMessage: '', controlError: '',
-            navigationCancelSequence: Number(this.context.getRenderState().navigationCancelSequence || 0) + 1 })
+          this.context.updateRenderState({ loading: false, errorMessage: '', controlError: '' })
+          if (action === 'navigate') this.finishAddressNavigation(request, addressGeneration)
           return
         }
         if (isReadingAction(action)) {
@@ -250,6 +258,7 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
           ...(action === 'zoom' ? { zoomFactor: request.zoomFactor } : {}) })
       } else {
         this.context.updateRenderState({ errorMessage: '', controlError: '' })
+        if (action === 'navigate') this.finishAddressNavigation(request, addressGeneration)
       }
     } catch (error) {
       if (isReadingAction(action)) {
@@ -369,6 +378,14 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
     })
   }
 
+  private finishAddressNavigation(request: BrowserAction, generation: number) {
+    if (generation !== this.addressNavigationGeneration) return
+    this.context.updateRenderState({
+      navigationAddressSequence: Number(this.context.getRenderState().navigationAddressSequence || 0) + 1,
+      navigationAddressRequestId: request.addressRequestId || '',
+    })
+  }
+
   async suspend() {
     if (this.rect) await this.setRect({ ...this.rect, visible: false })
   }
@@ -485,7 +502,8 @@ export function createBrowserWorkbenchDefinition(
       downloadReceivedBytes: Number(state.runtimeState.downloadReceivedBytes || 0),
       downloadTotalBytes: Number(state.runtimeState.downloadTotalBytes || 0),
       controlError: String(state.runtimeState.controlError || ''),
-      navigationCancelSequence: Number(state.runtimeState.navigationCancelSequence || 0),
+      navigationAddressSequence: Number(state.runtimeState.navigationAddressSequence || 0),
+      navigationAddressRequestId: String(state.runtimeState.navigationAddressRequestId || ''),
     }),
     async createRuntime(item, context) {
       const runtime = new BrowserWorkbenchRuntime(item, context, options)
