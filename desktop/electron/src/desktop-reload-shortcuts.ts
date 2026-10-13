@@ -28,11 +28,12 @@ export function installDesktopReloadShortcuts(
   inputContents: WebContents,
   reloadContents: WebContents = inputContents,
   canReload: () => boolean = () => true,
+  onReload: () => void = () => reloadContents.reload(),
 ): () => void {
   const listener = (event: Electron.Event, input: Input) => {
     if (desktopReloadCommandForInput(input) !== 'reload' || !canReload()) return
     event.preventDefault()
-    reloadContents.reload()
+    onReload()
   }
   inputContents.on('before-input-event', listener)
   return () => inputContents.removeListener('before-input-event', listener)

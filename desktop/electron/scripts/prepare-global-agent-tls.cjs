@@ -5,9 +5,9 @@ const { readFile, writeFile } = require('node:fs/promises')
 const { createRequire } = require('node:module')
 const { dirname, join } = require('node:path')
 
-const VERSION = '4.1.3'
-const ORIGINAL_SHA256 = 'a2a275ef0a6955109a0b5c1473c7194c183c0dc3bc7e8009a3b59c98be88d539'
-const PATCHED_SHA256 = '908267dad7f88db33e93443531416f6c1c5dfb28817fff418ccf787dfcc83e8f'
+const VERSION = '3.0.0'
+const ORIGINAL_SHA256 = '661807c170d5a796bd81e8632a6a6c85f2ab2a73d80211a882e4ba6a6bc5a69a'
+const PATCHED_SHA256 = '0c00d7a99dbb636ff2158f919c8e8960c618022f122204c735d698f09fcd8c8f'
 const sha256 = (value) => createHash('sha256').update(value).digest('hex')
 const TLS_OPTIONS = [
   'checkServerIdentity', 'minVersion', 'maxVersion', 'secureContext', 'session',
@@ -16,10 +16,13 @@ const TLS_OPTIONS = [
   'privateKeyIdentifier',
 ]
 const TLS_FORWARDING = `...Object.fromEntries(${JSON.stringify(TLS_OPTIONS)}
-                    .filter((key) => configuration[key] !== undefined)
-                    .map((key) => [key, configuration[key]])),
-                host: connectionConfiguration.host,
-                ca: (_g = configuration.ca)`
+          .filter((key) => configuration[key] !== undefined)
+          .map((key) => [key, configuration[key]])),
+        host: connectionConfiguration.host,
+        ca: configuration.ca`
+const TLS_SERVERNAME = `servername: configuration.servername === undefined
+          ? (require('node:net').isIP(connectionConfiguration.host) ? undefined : connectionConfiguration.host)
+          : configuration.servername`
 
 function patchedSource(original) {
   if (sha256(original) !== ORIGINAL_SHA256) {
@@ -27,9 +30,8 @@ function patchedSource(original) {
   }
   let source = original.toString('utf8')
   for (const [before, after] of [
-    ['if (configuration.secureEndpoint) {',
-      "if (configuration.secureEndpoint || this.protocol === 'https:') {"],
-    ['ca: (_g = configuration.ca)', TLS_FORWARDING],
+    ['ca: configuration.ca', TLS_FORWARDING],
+    ['servername: configuration.servername || connectionConfiguration.host', TLS_SERVERNAME],
   ]) {
     if (source.split(before).length !== 2) throw new Error('Unexpected HTTPS patch point.')
     source = source.replace(before, after)
@@ -69,5 +71,5 @@ if (require.main === module) {
 
 module.exports = {
   prepareProxyTls, prepareInstalledProxyTls, patchedSource,
-  ORIGINAL_SHA256, PATCHED_SHA256, TLS_FORWARDING,
+  ORIGINAL_SHA256, PATCHED_SHA256, TLS_FORWARDING, TLS_SERVERNAME,
 }

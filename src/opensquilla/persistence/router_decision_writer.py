@@ -35,6 +35,8 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from opensquilla.persistence.sqlite_diagnostics import register_connection
+
 log = logging.getLogger(__name__)
 
 _DEFAULT_RETENTION_DAYS = 30
@@ -539,4 +541,6 @@ def open_router_decision_writer(
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA busy_timeout = 5000")
-    return RouterDecisionWriter(conn, retention_days=retention_days)
+    writer = RouterDecisionWriter(conn, retention_days=retention_days)
+    register_connection(db_path, "router_writer", writer, attribute="_conn")
+    return writer

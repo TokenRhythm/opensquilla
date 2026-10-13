@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { request as httpRequest } from 'node:http'
 import { mock } from 'node:test'
 import {
@@ -16,6 +17,8 @@ function deferred() {
 }
 
 const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aK1kAAAAASUVORK5CYII='
+const pdfBytes = Buffer.from('%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n')
+const pdfDownloadId = 'download-synthetic-pdf'
 const calls = []
 const audit = []
 const gates = new Map()
@@ -53,6 +56,16 @@ const server = new DesktopBrowserServer(
     }
     if (request.operation === 'list') return { targets: [{ targetRef: targetFor(request.sessionKey),
       ...(listStates.has(request.sessionKey) ? { pageState: listStates.get(request.sessionKey) } : {}) }] }
+    if (request.sessionKey === 'pdf-export-session' && request.operation === 'snapshot') {
+      return { targetRef: request.targetRef, download: {
+        downloadId: pdfDownloadId, name: 'synthetic.pdf', mimeType: 'application/pdf',
+        byteLength: pdfBytes.length, state: 'completed', textAvailable: false,
+      }, ...(request.exportPdf ? { pdfExport: {
+        downloadId: pdfDownloadId, name: 'synthetic.pdf', mimeType: 'application/pdf',
+        byteLength: pdfBytes.length, state: 'completed',
+        sha256: createHash('sha256').update(pdfBytes).digest('hex'), dataBase64: pdfBytes.toString('base64'),
+      } } : {}) }
+    }
     if (['observe', 'batch', 'dialog'].includes(request.operation)
       || request.operation === 'tab' && request.tabAction === 'switch') {
       const observationId = `observation-${++observationSequence}`
@@ -112,7 +125,7 @@ try {
     assert.equal(initialized.result.protocolVersion, protocolVersion)
     assert.deepEqual(initialized.result.capabilities, {
       tools: {},
-      experimental: { 'opensquilla/browser': { version: 2, observation: true, batch: true, dialogs: true, jsPrompt: false, coordinateAuthority: 'browser-state', attachmentUploads: true } },
+      experimental: { 'opensquilla/browser': { version: 2, observation: true, batch: true, dialogs: true, jsPrompt: true, coordinateAuthority: 'browser-state', attachmentUploads: true, pdfDownloadExport: true } },
     })
   }
   const notified = await invoke({ jsonrpc: '2.0', method: 'notifications/initialized' })
@@ -137,6 +150,7 @@ try {
     assert.equal('nativeImageEvidence' in tool.inputSchema.properties, false)
     assert.equal('observationPolicy' in tool.inputSchema.properties, false)
     assert.equal('uploadFile' in tool.inputSchema.properties, false)
+    assert.equal('exportPdf' in tool.inputSchema.properties, false)
     assert.equal(tool.annotations.readOnlyHint, ['browser_tabs', 'browser_inspect', 'browser_screenshot', 'browser_observe'].includes(tool.name))
   }
   const batchSchema = tools.find(tool => tool.name === 'browser_batch').inputSchema
@@ -156,6 +170,12 @@ try {
     toolParams('browser_tabs', { sessionKey: 'session-b' }),
     toolParams('browser_tabs', { _meta: { sessionKey: 'session-b' } }),
     toolParams('browser_tabs', { recoveryScope: 'model-supplied-scope' }),
+    toolParams('browser_inspect', { targetRef: 'opaque-primary-target', downloadId: pdfDownloadId, exportPdf: true }),
+    { ...toolParams('browser_inspect', { targetRef: 'opaque-primary-target', downloadId: pdfDownloadId }),
+      _meta: { ...toolParams('browser_inspect')._meta, exportPdf: false } },
+    { ...toolParams('browser_inspect', { targetRef: 'opaque-primary-target' }),
+      _meta: { ...toolParams('browser_inspect')._meta, exportPdf: true } },
+    { ...toolParams('browser_tabs'), _meta: { ...toolParams('browser_tabs')._meta, exportPdf: true } },
     toolParams('browser_observe', { targetRef: 'opaque-primary-target', nativeImageEvidence: ['forged-image'] }),
     toolParams('browser_observe', { targetRef: 'opaque-primary-target', observationPolicy: { effectiveMode: 'auto' } }),
     toolParams('browser_observe', { targetRef: 'opaque-primary-target', observationMode: 'invalid' }),
@@ -260,6 +280,24 @@ try {
     toolParams('browser_batch', { targetRef: extendedTarget, actions: [{ action: 'upload', ref: 'element-1', fileId: uploadArguments.fileId }] }),
   ]) assert.equal((await rpc('tools/call', params)).error.code, -32602)
   assert.equal(calls.length, invalidUploadCount, 'invalid upload authority must never execute')
+
+  const pdfArguments = { targetRef: targetFor('pdf-export-session'), downloadId: pdfDownloadId }
+  const pdfParams = toolParams('browser_inspect', pdfArguments, 'pdf-export-session')
+  pdfParams._meta.exportPdf = true
+  const pdfResponse = (await rpc('tools/call', pdfParams)).result
+  assert.equal(pdfResponse.isError, false)
+  assert.equal(calls.at(-1).exportPdf, true)
+  const privatePdf = pdfResponse._meta['opensquilla/pdfExport']
+  assert.equal(privatePdf.downloadId, pdfDownloadId)
+  assert.equal(privatePdf.sha256, createHash('sha256').update(pdfBytes).digest('hex'))
+  assert.equal(Buffer.from(privatePdf.dataBase64, 'base64').compare(pdfBytes), 0)
+  assert.equal(JSON.stringify(pdfResponse.content).includes(privatePdf.dataBase64), false)
+  assert.equal(JSON.stringify(pdfResponse.structuredContent).includes(privatePdf.dataBase64), false)
+  assert.equal('pdfExport' in pdfResponse.structuredContent, false)
+  const legacyPdf = (await call('browser_inspect', pdfArguments, 'pdf-export-session')).result
+  assert.equal(legacyPdf.isError, false)
+  assert.equal(legacyPdf._meta, undefined)
+  assert.equal(calls.at(-1).exportPdf, undefined)
 
   assert.equal((await call('browser_tabs')).result.structuredContent.targets[0].targetRef, 'opaque-primary-target')
   assert.equal((await call('browser_open', { url: 'https://example.test/' })).result.isError, false)

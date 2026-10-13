@@ -24,6 +24,7 @@ from typing import Any
 import structlog
 
 from opensquilla.observability.redact import scrub_text
+from opensquilla.persistence.sqlite_diagnostics import register_connection
 
 log = structlog.get_logger(__name__)
 
@@ -256,4 +257,6 @@ def open_turn_error_writer(
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA busy_timeout = 5000")
-    return TurnErrorWriter(conn, retention_days=retention_days)
+    writer = TurnErrorWriter(conn, retention_days=retention_days)
+    register_connection(db_path, "error_writer", writer, attribute="_conn")
+    return writer

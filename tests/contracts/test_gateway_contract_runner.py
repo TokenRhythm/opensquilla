@@ -514,7 +514,7 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
             "legacyTypes": {
                 "python": {
                     "tool": "datamodel-code-generator",
-                    "version": "0.75.1",
+                    "version": "0.81.0",
                     "target": "pydantic_v2.BaseModel",
                 },
                 "typescript": {"tool": "json-schema-to-typescript", "version": "15.0.4"},
@@ -1068,6 +1068,11 @@ def test_sessions_list_legacy_artifacts_remain_byte_exact() -> None:
     specs = runner.discover_contracts()
     sessions_list = next(spec for spec in specs if spec.wire_name == "sessions.list")
     assert sessions_list.uses_legacy_generator is True
+    # Historical schema provenance is part of the published contract bytes.
+    assert hashlib.sha256(sessions_list.schema.read_bytes()).hexdigest() == (
+        "3bad083446fdbaa9c8a17ba701f98e7eafe60b1617532315e5ae49d5c50ac2f3"
+    )
+    assert sessions_list.document["x-opensquilla-codegen"]["python"]["version"] == "0.75.1"
 
     expected = {
         "sessions_list.py": "c8442279094b301bd1f903793bd58c091be96da896b9f6a031ee8defcbc042bf",

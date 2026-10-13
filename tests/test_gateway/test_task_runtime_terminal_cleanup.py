@@ -70,9 +70,9 @@ def _make_envelope(session_key: str = "agent-1::sess-1") -> RouteEnvelope:
     )
 
 
-def _make_storage() -> Any:
+def _make_storage(*, mock_optional_methods: bool = True) -> Any:
     """Minimal storage mock."""
-    storage = MagicMock()
+    storage = MagicMock() if mock_optional_methods else SimpleNamespace()
     task_db: dict[str, AgentTaskRecord] = {}
 
     async def create(record: AgentTaskRecord) -> None:
@@ -2816,11 +2816,34 @@ async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
     num_tasks = 10_000
     session_count = 50  # rotate sessions to mimic real load
     monkeypatch.setattr(task_runtime, "_emit_metric", lambda *_args, **_kwargs: None)
+    from opensquilla.application import approval_queue
+
+    # This workload has no approvals or activation permits. Keep the async
+    # cleanup boundary, without an unrelated global SQLite worker or dynamic
+    # optional storage methods and their retained mock-call history.
+    approval_cleanups: dict[str, int] = {}
+
+    async def expire_pending_for_session_async(session_key: str) -> int:
+        approval_cleanups[session_key] = approval_cleanups.get(session_key, 0) + 1
+        return 0
+
+    empty_approval_queue = SimpleNamespace(
+        expire_pending_for_session_async=expire_pending_for_session_async,
+    )
+    monkeypatch.setattr(
+        approval_queue,
+        "get_approval_queue",
+        lambda: empty_approval_queue,
+    )
+    storage = _make_storage(mock_optional_methods=False)
+    executed = 0
 
     async def _instant_handler(_run: Any) -> None:
-        pass  # returns immediately — well under 50 ms
+        nonlocal executed
+        executed += 1  # returns immediately — well under 50 ms
 
-    rt = _make_runtime(
+    rt = TaskRuntime(
+        storage=storage,
         turn_handler=_instant_handler,
         max_concurrency=32,
         max_pending_per_session=None,
@@ -2850,17 +2873,31 @@ async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
         # loaded Windows runners. The shared deadline still catches a stuck task.
         batch_size = 500
         deadline = asyncio.get_running_loop().time() + 60.0
-        for batch_start in range(0, num_tasks, batch_size):
-            handles = []
-            for i in range(batch_start, min(batch_start + batch_size, num_tasks)):
-                sk = f"agent-1::sess-load-{i % session_count}"
-                env = _make_envelope(sk)
-                handles.append(await rt.enqueue(env, f"msg-{i}"))
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise TimeoutError("task runtime leak workload exceeded its shared deadline")
-            async with asyncio.timeout(remaining):
-                await asyncio.gather(*(rt.wait(h.task_id) for h in handles))
+        # The empty handler deliberately emits no activity snapshot. Capture
+        # and verify those warnings rather than including console I/O in the
+        # runtime's shared deadline; no logging or terminal path is bypassed.
+        with capture_logs() as logs:
+            for batch_start in range(0, num_tasks, batch_size):
+                handles = []
+                for i in range(batch_start, min(batch_start + batch_size, num_tasks)):
+                    sk = f"agent-1::sess-load-{i % session_count}"
+                    env = _make_envelope(sk)
+                    handles.append(await rt.enqueue(env, f"msg-{i}"))
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError("task runtime leak workload exceeded its shared deadline")
+                async with asyncio.timeout(remaining):
+                    await asyncio.gather(*(rt.wait(h.task_id) for h in handles))
+
+        records = await storage.list_agent_tasks()
+        assert len(records) == executed == num_tasks
+        assert all(record.status is AgentTaskStatus.SUCCEEDED for record in records)
+        assert approval_cleanups == {
+            f"agent-1::sess-load-{i}": num_tasks // session_count
+            for i in range(session_count)
+        }
+        assert len(logs) == num_tasks
+        assert all(entry["event"] == "task_runtime.activity_snapshot_missing" for entry in logs)
 
         # --- post-GC snapshot ---
         gc.collect()

@@ -7,14 +7,17 @@ The preparation command uses `uv.lock` for two separate Python environments:
 | Output | Python generator | TypeScript generator |
 | --- | --- | --- |
 | Ordinary v4 types | datamodel-code-generator 0.81.0 in `.venv` | json-schema-to-typescript 16.0.0 |
-| Frozen `sessions.list` types | datamodel-code-generator 0.75.1 in `.venv-contract-legacy` | json-schema-to-typescript 15.0.4 through the `json-schema-to-typescript-legacy` npm alias |
+| Frozen `sessions.list` types | datamodel-code-generator 0.81.0 in `.venv-contract-legacy` | json-schema-to-typescript 15.0.4 through the `json-schema-to-typescript-legacy` npm alias |
 
 Both production and verification runtime validators use AJV 8.20.0. The original
-`sessions.list` schema metadata is historical and stays byte-identical; the
-compatibility manifest records the actual validator toolchain separately. The
-generator verifies installed versions before rendering. Do not substitute current
-generators for the frozen outputs or update the frozen body hashes to make a
-toolchain upgrade pass.
+`sessions.list` schema metadata records its original Python 0.75.1 toolchain and
+stays byte-identical. The active Python generator uses the patched 0.81.0 release;
+its output was verified against the existing frozen type-body hashes. The
+compatibility manifest records the active type and validator toolchains separately
+from that historical schema metadata. The generator verifies installed versions
+before rendering. Toolchain changes must preserve the frozen schema and type-body
+hashes; do not update those hashes to make an upgrade pass. Generator provenance
+headers may change to describe the actual generation code.
 
 Run `uv run --no-sync python scripts/contracts/generate_gateway_contracts.py
 --write-determinism --jobs 4` to regenerate, or replace `--write-determinism` with

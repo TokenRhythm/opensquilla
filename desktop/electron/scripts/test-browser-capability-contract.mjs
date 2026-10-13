@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { parseDesktopBrowserRequest } from '../dist/desktop-browser.js'
+import { browserToolDefinitions } from '../dist/browser-action-contract.js'
 
 const target = { sessionKey: 'synthetic-browser-owner', targetRef: 'synthetic-page' }
 const act = fields => parseDesktopBrowserRequest({ ...target, operation: 'act', ...fields })
@@ -106,3 +107,23 @@ assert.equal(parseDesktopBrowserRequest({ ...target, operation: 'open', url: 'ht
 assert.equal(act({ action: 'fill', ref: 'e1', text: '' }).text, '')
 assert.equal(act({ action: 'fill', ref: 'e1', text: 'first\n\nsecond' }).text, 'first\n\nsecond')
 console.log('Browser argument diagnostic safety and legacy normalization passed.')
+
+// Prompt maxLength follows JSON Schema's Unicode code-point semantics.
+const promptSchema = browserToolDefinitions.find(tool => tool.name === 'browser_handle_dialog')
+  .inputSchema.properties.promptText
+assert.equal(promptSchema.maxLength, 16384)
+const prompt = promptText => parseDesktopBrowserRequest({ ...target, operation: 'dialog',
+  dialogId: 'synthetic-prompt', accept: true, promptText })
+for (const promptText of ['', 'a'.repeat(4096), 'a'.repeat(4097), 'a'.repeat(16384),
+  '文'.repeat(16384), '😀'.repeat(16384), '😀'.repeat(16383) + 'a']) {
+  assert.equal(prompt(promptText).promptText, promptText)
+}
+for (const promptText of ['a'.repeat(16385), '文'.repeat(16385),
+  '😀'.repeat(16384) + 'a', '😀'.repeat(16385), '\0']) {
+  diagnostic({ operation: 'dialog', targetRef: target.targetRef, dialogId: 'synthetic-prompt',
+    accept: true, promptText }, 'promptText', 'range', 'within_bounds')
+}
+assert.equal(prompt('😀'.repeat(16384)).promptText.length, 32768)
+// Other text inputs keep their established UTF-16 bound.
+rejected(() => act({ action: 'fill', ref: 'e1', text: '😀'.repeat(8193) }))
+console.log('Prompt argument boundaries preserve the public Unicode maxLength contract.')

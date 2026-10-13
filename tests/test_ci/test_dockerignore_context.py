@@ -68,6 +68,7 @@ def test_dockerignore_filters_real_build_context(tmp_path: Path) -> None:
     _write(context / "scripts/verify_webui_artifact.py")
     _write(context / "scripts/freeze_migration_registry.py")
     _write(context / "scripts/private-build-notes.py")
+    _write(context / "uv.lock", "version = 1\n")
 
     result = subprocess.run(
         [
@@ -96,6 +97,7 @@ def test_dockerignore_filters_real_build_context(tmp_path: Path) -> None:
     assert (copied / "scripts/verify_webui_artifact.py").is_file()
     assert (copied / "scripts/freeze_migration_registry.py").is_file()
     assert not (copied / "scripts/private-build-notes.py").exists()
+    assert (copied / "uv.lock").is_file()
 
     assert not (copied / ".env").exists()
     assert not (copied / "opensquilla-webui/.env.local").exists()
