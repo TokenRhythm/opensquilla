@@ -9781,9 +9781,10 @@ async function startGateway(): Promise<GatewayState> {
   })
   child.stdout.pipe(logStream, { end: false })
   child.stderr.pipe(logStream, { end: false })
-  child.once('exit', (code, signal) => {
-    if (code === 0 && signal === null && !isQuitting && !updateApplying
-      && gatewayStoppingProcesses.has(child)) {
+  child.once('exit', () => {
+    // A stopped launcher can report a signal or nonzero exit after its Gateway
+    // drains. The retained scope still needs cleanup proof before replacement.
+    if (!isQuitting && !updateApplying && gatewayStoppingProcesses.has(child)) {
       retireStoppedGatewayProcessCleanup(child)
     }
   })

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import ts from '@typescript/typescript6'
 
 import {
-  DESKTOP_QUIT_TERMINATION_MS, DesktopQuitBudget, quitGatewayWithinBudget,
+  DESKTOP_QUIT_TERMINATION_MS, DesktopQuitBudget, DesktopQuitConfirmation, quitGatewayWithinBudget,
 } from '../dist/desktop-quit.js'
 import { stopAndJoinLifecycleProcesses } from '../dist/gateway-lifecycle.js'
 import {
@@ -21,11 +21,12 @@ const names = new Set([
   'retireStoppedGatewayProcessCleanup',
   'stopAndJoinAllLifecycleOwnedGateways',
   'joinGatewayProcessRetirements', 'confirmStoppedGatewayProcessScopes',
+  'holdQuitForTaskConfirmation',
 ])
 const functions = []
 let beforeQuitSource
 let failureSource
-let retirementGuard
+let retirementHandler
 let replacementGuard
 let importGuard
 function collect(node) {
@@ -37,9 +38,10 @@ function collect(node) {
     && ts.isStringLiteral(node.arguments[0]) && node.arguments[0].text === 'before-quit') {
     beforeQuitSource = node.arguments[1].getText(source)
   }
-  if (ts.isIfStatement(node) && node.expression.getText(source).includes('gatewayStoppingProcesses.has(child)')
-    && node.thenStatement.getText(source).includes('retireStoppedGatewayProcessCleanup(child)')) {
-    retirementGuard = node.getText(source)
+  if (ts.isCallExpression(node) && node.expression.getText(source) === 'child.once'
+    && ts.isStringLiteral(node.arguments[0]) && node.arguments[0].text === 'exit'
+    && node.arguments[1].getText(source).includes('retireStoppedGatewayProcessCleanup(child)')) {
+    retirementHandler = node.arguments[1].getText(source)
   }
   if (ts.isIfStatement(node) && node.expression.getText(source) === '!await joinGatewayProcessRetirements()') {
     replacementGuard = node.getText(source)
@@ -53,7 +55,7 @@ collect(source)
 assert.equal(functions.length, names.size)
 assert.ok(beforeQuitSource)
 assert.ok(failureSource)
-assert.ok(retirementGuard)
+assert.ok(retirementHandler)
 assert.ok(replacementGuard)
 assert.ok(importGuard)
 
@@ -67,6 +69,7 @@ function harness({ exited = false, platform = 'darwin', complete = true } = {}) 
   const child = { pid: 12345, exitCode: exited ? 0 : null, signalCode: null }
   const launch = { instanceNonce: 'retained-private-nonce', ownershipDir: '/synthetic/retained-profile' }
   const order = []
+  const logs = []
   const env = {
     process: { platform },
     DesktopQuitBudget, DESKTOP_QUIT_TERMINATION_MS,
@@ -75,7 +78,8 @@ function harness({ exited = false, platform = 'darwin', complete = true } = {}) 
     restartAllowed: true, transitionGatewayConnection: () => order.push('profile-error'),
     cancelGatewayUnexpectedExitRestart() {}, desktopStartupLog() {},
     stopGateway() { assert.fail('this synthetic join begins after root exit') },
-    liveLifecycleOwnedGatewayProcesses: () => env.hasGatewayProcessExited(child) ? [] : [child],
+    liveLifecycleOwnedGatewayProcesses: () => env.gatewayProcess
+      && !env.hasGatewayProcessExited(env.gatewayProcess) ? [env.gatewayProcess] : [],
     gatewayProcessCleanupContexts: new Map(platform === 'win32' ? [] : [[child, launch]]),
     gatewayProcessCleanupConfirmed: new WeakSet(),
     gatewayProcessCleanupOperations: new WeakMap(),
@@ -85,7 +89,15 @@ function harness({ exited = false, platform = 'darwin', complete = true } = {}) 
     gatewayProcessTreeTerminations: new WeakMap(),
     quitGatewayWithinBudget,
     hasGatewayProcessExited: value => value.exitCode !== null || value.signalCode !== null,
-    desktopLog() {}, setQuitStatus() {}, setAppExitPhase() {},
+    desktopLog: (event, detail) => logs.push({ event, ...detail }),
+    setQuitStatus() {}, setAppExitPhase() {},
+    quitConfirmed: false, quitFromSignal: false, quitConfirmationPromise: null,
+    quitConfirmationWantsExit: false, systemSessionEnding: false,
+    desktopQuitConfirmation: new DesktopQuitConfirmation(),
+    currentMainWindow: () => null, currentOnboardingWindow: () => null,
+    desktopT: key => key, app: { quit: () => order.push('quit-confirmed') },
+    showDesktopQuitConfirmation: async () => false,
+    readVerifiedDesktopGatewayActivity: async () => ({ kind: 'ok', activeCount: 0 }),
     cleanupDesktopProcessTrees: async options => {
       assert.equal(options.launch, launch, 'use retained launch authority, never the current profile')
       order.push('cleanup')
@@ -117,12 +129,13 @@ function harness({ exited = false, platform = 'darwin', complete = true } = {}) 
       terminateOwnedGatewayForQuit, quitOwnedGateway, retireStoppedGatewayProcessCleanup,
       stopAndJoinAllLifecycleOwnedGateways,
       joinGatewayProcessRetirements, confirmStoppedGatewayProcessScopes,
+      holdQuitForTaskConfirmation,
       replaceAfterRetirement: async () => { ${replacementGuard}; return true },
       importAfterConfirmation: async () => { ${importGuard}; return true },
-      closed: (child, code, signal) => { ${retirementGuard} },
+      closed: (child, code, signal) => (${retirementHandler})(code, signal),
     };
   }`)(env)
-  return { child, launch, order, env, handlers }
+  return { child, launch, order, logs, env, handlers }
 }
 
 async function withBudget(test) {
@@ -245,17 +258,78 @@ await withBudget(async budget => {
   assert.deepEqual(h.order, ['windows-tree'], 'Windows keeps its existing tree termination')
 })
 
-for (const scenario of ['clean-stop', 'crash', 'unexpected-clean-exit', 'signal', 'quitting', 'update']) {
+for (const scenario of ['clean-stop', 'crash', 'unexpected-clean-exit', 'unexpected-signal', 'quitting', 'update']) {
   const h = harness({ exited: true })
-  if (scenario === 'unexpected-clean-exit') h.env.gatewayStoppingProcesses.clear()
+  if (['crash', 'unexpected-clean-exit', 'unexpected-signal'].includes(scenario)) {
+    h.env.gatewayStoppingProcesses.clear()
+  }
   h.env.isQuitting = scenario === 'quitting'
   h.env.updateApplying = scenario === 'update'
-  h.handlers.closed(h.child, scenario === 'crash' ? 1 : 0, scenario === 'signal' ? 'SIGKILL' : null)
+  const signal = scenario === 'unexpected-signal' ? 'SIGKILL' : null
+  h.child.exitCode = signal ? null : scenario === 'crash' ? 1 : 0
+  h.child.signalCode = signal
+  h.handlers.closed(h.child, h.child.exitCode, h.child.signalCode)
   await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(h.order, scenario === 'clean-stop' ? ['cleanup'] : [],
     'only successful intentional stop verification may retire a scope in the background')
   assert.equal(h.env.gatewayProcessCleanupContexts.has(h.child), scenario !== 'clean-stop')
   assert.equal(h.env.quitUnconfirmedProcessTrees.size, 0, 'background failure is not a committed quit')
+}
+
+for (const { code, signal } of [
+  { code: null, signal: 'SIGTERM' },
+  { code: 143, signal: null },
+  { code: null, signal: 'SIGKILL' },
+]) {
+  for (const complete of [false, true]) {
+    const h = harness({ exited: true, platform: 'linux' })
+    h.child.exitCode = code
+    h.child.signalCode = signal
+    h.env.gatewayProcess = null
+    const cleanup = deferred()
+    h.env.cleanupDesktopProcessTrees = async ({ launch, budget }) => {
+      assert.equal(launch, h.launch, 'retirement verifies the stopped launch authority')
+      assert.equal(budget.remainingCleanupMs, 0)
+      assert.ok(budget.remainingTotalMs > 0 && budget.remainingTotalMs <= DESKTOP_QUIT_TERMINATION_MS,
+        'intentional signal exits keep the existing bounded verification budget')
+      h.order.push('cleanup')
+      return await cleanup.promise
+    }
+    h.handlers.closed(h.child, code, signal)
+    let joined = false
+    const join = h.handlers.stopAndJoinAllLifecycleOwnedGateways().then(result => {
+      joined = true
+      return result
+    })
+    let replacementSettled = false
+    const replacement = h.handlers.replaceAfterRetirement().then(
+      value => { replacementSettled = true; return value },
+      error => { replacementSettled = true; return error },
+    )
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(h.order, ['cleanup'], 'every intentional exit must verify its retained scope')
+    assert.equal(joined, false, 'profile writes must await verification after signal or nonzero exit')
+    assert.equal(replacementSettled, false, 'replacement startup must await the same proof')
+    cleanup.resolve(complete)
+    assert.equal(await join, complete)
+    const replacementResult = await replacement
+    assert.equal(h.env.gatewayProcessCleanupContexts.has(h.child), !complete)
+    if (complete) {
+      assert.equal(replacementResult, true)
+      h.env.gatewayProcess = { pid: 23456, exitCode: null, signalCode: null }
+      h.env.gatewayState = { owned: true, status: 'ready' }
+    } else {
+      assert.match(replacementResult.message, /cleanup could not be confirmed/)
+      assert.equal(await h.handlers.stopAndJoinAllLifecycleOwnedGateways(), false,
+        'failed verification cannot become an empty successful join on retry')
+    }
+    assert.equal(h.handlers.holdQuitForTaskConfirmation({ preventDefault() {} }), true)
+    await h.env.quitConfirmationPromise
+    assert.equal(h.env.quitConfirmed, complete,
+      'only verified retirement plus an idle replacement permits unprompted quit')
+    const confirmation = h.logs.find(log => log.event === 'quit_confirmation_required')
+    assert.equal(confirmation?.activity, complete ? undefined : 'unknown')
+  }
 }
 
 for (const complete of [false, true]) {
