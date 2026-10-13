@@ -3,13 +3,14 @@ import { execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { copyFile, lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { _electron as electron } from 'playwright'
 import { environmentWithoutProviderSecrets, requiredOption, waitFor } from './packaged-smoke-helpers.mjs'
 import { captureElectronProcessIdentity, captureFirstSendDiagnostic, closeElectronAndObserveExit } from './packaged-first-send-cleanup.mjs'
 import { desktopShutdownEvidenceSince, gatewayProcessSnapshot } from './e2e-shutdown-helpers.mjs'
-import { desktopProfileFingerprint, loadDesktopGatewayOwnershipRecord, verifyDesktopGatewayOwnership } from '../dist/desktop-gateway-ownership.js'
+import { desktopProfileFingerprint, loadDesktopGatewayOwnershipRecord, readVerifiedDesktopGatewayActivity, verifyDesktopGatewayOwnership } from '../dist/desktop-gateway-ownership.js'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 import { assertNoExistingDesktop, assertPreservedInputs, assertStopEvidence, auditMessages, sha256, verifyAuditInputs } from './fixtures/packaged-retained-interaction/contract.mjs'
 import { installRetainedRpcProbe } from './fixtures/packaged-retained-interaction/browser-probe.mjs'
@@ -131,14 +132,36 @@ async function oldSessionUi(page, name) {
   await page.getByText(expected, { exact: true }).first().waitFor({ state: 'visible', timeout: timeoutMs })
   await screenshot(page, `${name}-old-session`)
 }
+function remainingSendTime(deadline) {
+  const remaining = deadline - Date.now()
+  assert.ok(remaining > 0, 'Real Send did not finish within its completion budget')
+  return remaining
+}
+async function waitForRetainedGatewayIdle(ownership, deadline) {
+  assert.ok(ownership, 'The active launch must have a verified Gateway identity')
+  let activity
+  while (Date.now() < deadline) {
+    activity = await readVerifiedDesktopGatewayActivity(ownership, {
+      timeoutMs: Math.min(1_000, remainingSendTime(deadline)),
+    })
+    report.lastActivity = activity
+    if (Date.now() < deadline && activity.kind === 'ok' && activity.activeCount === 0) return
+    await delay(Math.max(0, Math.min(200, deadline - Date.now())))
+  }
+  throw new Error(`Real Send did not become idle within its completion budget: ${JSON.stringify(activity)}`)
+}
 async function send(page, message, answer) {
   await ready(page)
   await page.locator('.chat-textarea').fill(message)
   const button = page.locator('.chat-send-btn.btn--primary')
   await waitFor(async () => await button.count() === 1 && await button.isEnabled(), 'enabled real Send', timeoutMs)
-  await button.click()
-  await page.locator('.msg-ai-text').filter({ hasText: answer }).last().waitFor({ state: 'visible', timeout: timeoutMs })
-  await waitFor(async () => await button.count() === 1 && await button.isEnabled(), 'completed real Send', timeoutMs)
+  // Rendering the answer and restoring Send can precede Gateway finalization.
+  // Observe signed idle within the same completion budget before any quit.
+  const deadline = Date.now() + timeoutMs
+  await button.click({ timeout: remainingSendTime(deadline) })
+  await page.locator('.msg-ai-text').filter({ hasText: answer }).last().waitFor({ state: 'visible', timeout: remainingSendTime(deadline) })
+  await waitFor(async () => await button.count() === 1 && await button.isEnabled(), 'completed real Send', remainingSendTime(deadline))
+  await waitForRetainedGatewayIdle(active?.ownership, deadline)
   const rpc = await snapshot(page)
   assert.equal(rpc.requests.filter(request => request.method === 'chat.send' && request.params.message === message).length, 1, 'One user click must produce exactly one chat.send')
 }

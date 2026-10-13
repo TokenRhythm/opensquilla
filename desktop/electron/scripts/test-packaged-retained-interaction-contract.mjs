@@ -189,6 +189,118 @@ test('diagnostic timeout preserves the original failure and probe captures befor
   assert.equal(report.desktopLogDiagnosticError, 'EACCES')
   assert.equal(processState.exitCode, 1)
 })
+
+async function retainedSendHelpers(scope) {
+  const source = (await readFile(new URL('./test-packaged-retained-interaction.mjs', import.meta.url), 'utf8')).replace(/\r\n/g, '\n')
+  const start = source.indexOf('function remainingSendTime(')
+  const end = source.indexOf('async function quit()', start)
+  assert.ok(start >= 0 && end > start)
+  return runInNewContext(`${source.slice(start, end)}\n({ send, waitForRetainedGatewayIdle })`, { assert, ...scope })
+}
+
+test('real Send waits for signed Gateway idle after the answer and Send button are ready', async () => {
+  let now = 0
+  let releaseActivity
+  let completed = false
+  let snapshots = 0
+  const activityStarted = new Promise(resolve => { releaseActivity = resolve })
+  let resolveActivity
+  const firstActivity = new Promise(resolve => { resolveActivity = resolve })
+  const ownership = { pid: 123, instance_nonce: 'synthetic-instance' }
+  const requests = []
+  const deadlines = []
+  const report = {}
+  const { send } = await retainedSendHelpers({
+    Date: { now: () => now }, timeoutMs: 45_000, active: { ownership }, report,
+    ready: async () => {},
+    waitFor: async (check, label, timeout) => {
+      deadlines.push({ label, timeout })
+      assert.equal(await check(), true)
+    },
+    delay: async ms => { now += ms },
+    readVerifiedDesktopGatewayActivity: async (record, options) => {
+      assert.equal(record, ownership, 'The request must verify this launch, not a newly loaded owner')
+      requests.push(options.timeoutMs)
+      if (requests.length === 1) { releaseActivity(); return firstActivity }
+      return { kind: 'ok', activeCount: 0 }
+    },
+    snapshot: async () => {
+      snapshots += 1
+      return { requests: [{ method: 'chat.send', params: { message: 'synthetic turn' } }] }
+    },
+  })
+  const button = {
+    count: async () => 1, isEnabled: async () => true,
+    click: async ({ timeout }) => { assert.equal(timeout, 45_000); now += 100 },
+  }
+  const page = { locator: selector => {
+    if (selector === '.chat-textarea') return { fill: async () => {} }
+    if (selector === '.chat-send-btn.btn--primary') return button
+    assert.equal(selector, '.msg-ai-text')
+    return { filter: () => ({ last: () => ({ waitFor: async ({ timeout }) => {
+      assert.equal(timeout, 44_900)
+      now += 200
+    } }) }) }
+  } }
+  const sending = send(page, 'synthetic turn', 'synthetic answer').then(() => { completed = true })
+  await activityStarted
+  assert.equal(completed, false, 'Visible answer and enabled Send must not permit quit yet')
+  assert.equal(snapshots, 0)
+  resolveActivity({ kind: 'ok', activeCount: 1 })
+  await sending
+  assert.equal(completed, true)
+  assert.equal(snapshots, 1)
+  assert.deepEqual(requests, [1_000, 1_000])
+  assert.deepEqual(deadlines, [
+    { label: 'enabled real Send', timeout: 45_000 },
+    { label: 'completed real Send', timeout: 44_700 },
+  ])
+  assert.deepEqual(report.lastActivity, { kind: 'ok', activeCount: 0 })
+})
+
+test('retained completion rejects non-idle and unverified responses within the original deadline', async () => {
+  for (const activity of [
+    { kind: 'ok', activeCount: 1 }, { kind: 'unreachable' }, { kind: 'rejected' },
+  ]) {
+    let now = 44_800
+    const requests = []
+    const report = {}
+    const { waitForRetainedGatewayIdle } = await retainedSendHelpers({
+      Date: { now: () => now }, report,
+      delay: async ms => { now += ms },
+      readVerifiedDesktopGatewayActivity: async (_record, options) => {
+        requests.push(options.timeoutMs)
+        now += 100
+        return activity
+      },
+    })
+    await assert.rejects(waitForRetainedGatewayIdle({ pid: 123 }, 45_000), /did not become idle within its completion budget/)
+    assert.deepEqual(requests, [200], 'Activity requests consume only remaining time')
+    assert.equal(now, 45_000)
+    assert.equal(report.lastActivity, activity)
+  }
+})
+
+test('retained completion does not accept idle arriving after its deadline or without an owner', async () => {
+  let now = 44_990
+  let requests = 0
+  const { waitForRetainedGatewayIdle } = await retainedSendHelpers({
+    Date: { now: () => now }, report: {}, delay: async () => {},
+    readVerifiedDesktopGatewayActivity: async (_record, options) => {
+      requests += 1
+      assert.equal(options.timeoutMs, 10)
+      now = 45_001
+      return { kind: 'ok', activeCount: 0 }
+    },
+  })
+  await assert.rejects(waitForRetainedGatewayIdle(null, 45_000), /verified Gateway identity/)
+  assert.equal(requests, 0)
+  await assert.rejects(waitForRetainedGatewayIdle({ pid: 123 }, 45_000), /completion budget/)
+  assert.equal(requests, 1)
+  await assert.rejects(waitForRetainedGatewayIdle({ pid: 123 }, 45_000), /completion budget/)
+  assert.equal(requests, 1, 'An expired completion budget must not start another request')
+})
+
 test('redirected temporary parents yield canonical fixtures while audit aliases remain rejected', async t => {
   const parent = await fixture(t)
   const target = join(parent.root, 'temporary-target')
