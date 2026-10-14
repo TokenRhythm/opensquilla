@@ -333,6 +333,7 @@ onBeforeUnmount(() => {
 .visualize-toolbar { display: flex; align-items: center; justify-content: flex-end; min-height: 32px; gap: var(--sp-2); padding: 0 var(--sp-2); color: var(--text-muted); font-size: var(--fs-sm); }
 .visualize-title { margin-right: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .visualize-actions, .visualize-feedback-actions { display: flex; flex-shrink: 0; gap: var(--sp-2); flex-wrap: wrap; }
+.visualize-feedback-actions button { min-height: 44px; }
 button { border: 1px solid var(--border); border-radius: var(--radius-control); color: var(--text); background: var(--bg-hover); padding: var(--sp-1) var(--sp-2); cursor: pointer; }
 button:disabled { opacity: 0.5; cursor: default; }
 button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -350,8 +351,8 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .visualize-proposal, .visualize-feedback { margin: 0; padding: var(--sp-3); overflow-wrap: anywhere; }
 .visualize-feedback p { margin: 0 0 var(--sp-2); }
 .visualize-error-detail { max-height: 120px; overflow: auto; color: var(--text-muted); font-size: var(--fs-sm); }
-.visualize-proposal { border-top: 1px solid var(--border); }
-.visualize-proposal > p { margin: 0 0 var(--sp-2); }
+.visualize-proposal { border-top: 1px solid var(--border); padding-bottom: calc(var(--sp-3) + env(safe-area-inset-bottom, 0px)); }
+.visualize-proposal > p { margin: 0 0 var(--sp-2); max-height: min(28dvh, 220px); overflow-y: auto; overscroll-behavior: contain; }
 .visualize-export-feedback { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-size: var(--fs-sm); }
 .visualize-export-feedback--error { color: var(--danger, var(--text)); }
 .visualize-canvas--expanded { position: fixed; inset: var(--sp-3); width: calc(100% - var(--sp-3) * 2); max-width: 1440px; max-height: calc(100dvh - var(--sp-3) * 2); margin: auto; overflow: auto; overscroll-behavior: contain; border-color: var(--border); background: var(--bg-surface); }
@@ -361,4 +362,5 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .visualize-canvas:hover .visualize-actions, .visualize-canvas:focus-within .visualize-actions { opacity: 1; }
 }
 @media (pointer: coarse) { .visualize-icon { width: 44px; height: 44px; } }
+@media (max-width: 480px) { .visualize-proposal .visualize-feedback-actions button { flex: 1 1 0; min-width: 0; } }
 </style>
