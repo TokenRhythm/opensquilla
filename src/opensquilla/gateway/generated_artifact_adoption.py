@@ -158,7 +158,10 @@ class GeneratedArtifactAdopter:
             "documentId": document_id,
             "revisionId": revision_id,
             "artifactId": ref.id,
-            "name": ref.name,
+            # Keep the model-facing title as the chat label.  The content
+            # store's collision-safe filename remains available separately.
+            "name": normalized_title,
+            "artifactName": ref.name,
             "mime": ref.mime,
             "sha256": ref.sha256,
             "size": ref.size,

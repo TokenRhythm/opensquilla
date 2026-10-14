@@ -63,8 +63,9 @@ async def test_show_widget_publishes_immutable_artifact_receipt(widget_context):
     assert result["ok"] is True
     assert result["previewStatus"] == "inline-ready"
     assert result["presentation"] == "inline"
-    assert result["name"].startswith("capacity_simulator-")
-    assert result["name"].endswith(".html")
+    assert result["name"] == "capacity_simulator"
+    assert result["artifactName"].startswith("capacity_simulator-")
+    assert result["artifactName"].endswith(".html")
     assert result["marker"] == f"visualize:{result['documentId']}:{result['revisionId']}"
     assert result["loadingMessages"] == ["正在准备控件"]
     head = await adopter.service.get_document_head(result["documentId"])
