@@ -64,6 +64,7 @@ function i18n() {
     messages: {
       en: {
         chrome: { searchChats: 'Search tasks' },
+        chat: { copySessionLink: 'Copy session link' },
         sessions: { filter: { chats: 'Tasks' } },
         shared: {
           sidebar: {
@@ -159,6 +160,7 @@ afterEach(() => {
   document.body.innerHTML = ''
   localStorage.clear()
   confirm.mockClear()
+  vi.useRealTimers()
 })
 
 describe('SidebarConversations project workspaces', () => {
@@ -376,6 +378,7 @@ describe('SidebarConversations project workspaces', () => {
   })
 
   it('shows a project session hover card outside the sidebar with its project name', async () => {
+    vi.useFakeTimers()
     const { host } = await mountSidebar([projectRow(), taskRow()])
     const row = host.querySelector<HTMLElement>(
       '[data-session-key="agent:main:webchat:task-a"]',
@@ -385,6 +388,7 @@ describe('SidebarConversations project workspaces', () => {
     })
 
     row?.dispatchEvent(new MouseEvent('mouseenter'))
+    await vi.advanceTimersByTimeAsync(400)
     await nextTick()
 
     const preview = document.body.querySelector('.sidebar-session-preview')
@@ -397,6 +401,7 @@ describe('SidebarConversations project workspaces', () => {
   })
 
   it('does not mount the hover card when the sidebar fills a narrow viewport', async () => {
+    vi.useFakeTimers()
     const previousWidth = window.innerWidth
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 548 })
     try {
@@ -409,6 +414,7 @@ describe('SidebarConversations project workspaces', () => {
       })
 
       row?.dispatchEvent(new MouseEvent('mouseenter'))
+      await vi.advanceTimersByTimeAsync(400)
       await nextTick()
 
       expect(document.body.querySelector('.sidebar-session-preview')).toBeNull()
@@ -418,6 +424,7 @@ describe('SidebarConversations project workspaces', () => {
   })
 
   it('keeps a long mixed-language title and tooltip relationship intact', async () => {
+    vi.useFakeTimers()
     const title = '请执行一项 Deep Research 任务：分析 Fortinet 的长期经营表现与竞争格局'
     const { host } = await mountSidebar([projectRow(), taskRow({ title })])
     const row = host.querySelector<HTMLElement>(
@@ -428,6 +435,7 @@ describe('SidebarConversations project workspaces', () => {
     })
 
     row?.dispatchEvent(new MouseEvent('mouseenter'))
+    await vi.advanceTimersByTimeAsync(400)
     await nextTick()
 
     const trigger = row?.querySelector('.sidebar-history-item')
@@ -442,6 +450,7 @@ describe('SidebarConversations project workspaces', () => {
   })
 
   it('keeps the hover card but omits the project row for an unbound session', async () => {
+    vi.useFakeTimers()
     const { host } = await mountSidebar([
       taskRow({
         key: 'recent-task',
@@ -456,6 +465,7 @@ describe('SidebarConversations project workspaces', () => {
     })
 
     row?.dispatchEvent(new MouseEvent('mouseenter'))
+    await vi.advanceTimersByTimeAsync(400)
     await nextTick()
 
     const preview = document.body.querySelector('.sidebar-session-preview')
@@ -465,6 +475,7 @@ describe('SidebarConversations project workspaces', () => {
   })
 
   it('opens the session card on keyboard focus and closes it on focus loss', async () => {
+    vi.useFakeTimers()
     const { host } = await mountSidebar([projectRow(), taskRow()])
     const row = host.querySelector<HTMLElement>(
       '[data-session-key="agent:main:webchat:task-a"]',
@@ -474,6 +485,7 @@ describe('SidebarConversations project workspaces', () => {
     })
 
     row?.dispatchEvent(new FocusEvent('focusin', { bubbles: true }))
+    await vi.advanceTimersByTimeAsync(400)
     await nextTick()
     expect(document.body.querySelector('.sidebar-session-preview')).toBeTruthy()
 

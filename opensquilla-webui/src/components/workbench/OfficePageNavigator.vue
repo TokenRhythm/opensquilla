@@ -45,7 +45,7 @@ import Icon from '@/components/Icon.vue'
 import type { OfficePreviewSession } from '@/workbench/officePreviewAdapter'
 
 const props = defineProps<{ session: OfficePreviewSession | null; total: number; active: number; format: 'docx' | 'pptx'; collapsed: boolean }>()
-const emit = defineEmits<{ navigate: [index: number]; close: []; expand: [] }>()
+const emit = defineEmits<{ navigate: [index: number]; close: []; expand: []; thumbnail: [blob: Blob] }>()
 const { t } = useI18n()
 const root = ref<HTMLElement | null>(null), list = ref<HTMLElement | null>(null), rail = ref<HTMLElement | null>(null)
 const tooltipId = useId()
@@ -110,7 +110,10 @@ async function pumpThumbnails() {
       const current = () => !destroyed && !controller.signal.aborted && epoch === generation && props.session === session && wanted.value.includes(index)
       try {
         const thumbnail = await session.renderThumbnail(index, controller.signal)
-        if (current()) updateThumbnail(index, { status: 'ready', url: URL.createObjectURL(thumbnail.blob) })
+        if (current()) {
+          updateThumbnail(index, { status: 'ready', url: URL.createObjectURL(thumbnail.blob) })
+          if (index === activePage.value) emit('thumbnail', thumbnail.blob)
+        }
       } catch {
         if (current()) updateThumbnail(index, { status: 'error' })
       } finally {

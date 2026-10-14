@@ -1,9 +1,15 @@
 <template>
   <WorkbenchHost
+    ref="hostHandle"
+    :tab-info="tabInfo"
+    :show-toolbar="Boolean(store.activeItem && (showArtifactNavigation(store.activeItem) || visiblePanelToolbarItems(store.activeItem).length))"
+    @tab-menu="openTabMenu"
     :enabled="enabled"
     :allow-empty="Boolean(nativeApi)"
     :route-active="routeActive && store.activeSessionId === (sessionId || null)"
-    :modal-blocked="surfaceBlocked"
+    :modal-blocked="modalBlocked"
+    :native-blocked="surfaceBlocked"
+    :native-snapshot-url="nativeSnapshotUrl"
     :aria-label="t('workbench.title')"
     :empty-label="t('workbench.empty')"
     :open-items-label="t('workbench.openItems')"
@@ -38,7 +44,7 @@
 
     <template #actions="{ item }">
       <button
-        v-if="nativeApi"
+        v-if="nativeApi && (!item || item.kind === 'browser')"
         type="button"
         class="app-workbench__action"
         :aria-label="t('workbench.browser.newTab')"
@@ -48,9 +54,15 @@
       >
         <Icon name="plus" :size="16" aria-hidden="true" />
       </button>
-      <ResourceActionsMenu v-if="item && resourceActionArtifact(item)" :key="item.id"
-        :artifact="resourceActionArtifact(item)!" :session-key="sessionKeyFromWorkbenchItem(item)"
-        :previewable="false" trigger />
+      <button v-if="item" type="button" class="app-workbench__action"
+        :aria-label="t('resourceActions.more')" :title="t('resourceActions.more')" aria-haspopup="menu"
+        data-testid="workbench-tab-actions" @click="openTabMenu(item, $event)"
+        @keydown="onMenuTriggerKey(item, $event)">
+        <Icon name="moreHorizontal" :size="16" aria-hidden="true" />
+      </button>
+    </template>
+
+    <template #toolbar="{ item }">
       <select
         v-if="showArtifactNavigation(item)"
         class="app-workbench__switcher"
@@ -69,7 +81,7 @@
         </option>
       </select>
       <template
-        v-for="toolbarItem in panelToolbarItems(item)"
+        v-for="toolbarItem in visiblePanelToolbarItems(item)"
         :key="toolbarItem.id"
       >
         <span
@@ -194,6 +206,10 @@
       />
     </template>
   </WorkbenchHost>
+  <ResourceActionsMenu v-if="menuItem" ref="tabMenu" :artifact="resourceActionArtifact(menuItem)"
+    :session-key="sessionKeyFromWorkbenchItem(menuItem)" :previewable="false" compact
+    :download-action="menuDownloadAction"
+    :extra-actions="tabMenuActions" @action="performTabMenuAction" />
 </template>
 
 <script setup lang="ts">
@@ -299,7 +315,9 @@ import { createWorkspaceFileDefinition } from './workspaceFileProvider'
 import { createToolHistoryFileDefinition } from './toolHistoryFileProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
 import BrowserStartPanel from './BrowserStartPanel.vue'
-import { downloadBlob } from '@/utils/browser'
+import { copyTextWithFallback, downloadBlob } from '@/utils/browser'
+import { createTabThumbnailCache } from '@/workbench/tabThumbnailCache'
+import { createNativeTabSnapshots } from './nativeTabSnapshots'
 
 const props = withDefaults(defineProps<{
   enabled?: boolean
@@ -362,6 +380,100 @@ const runtimeManager = new WorkbenchRuntimeManager(workbenchPanelRegistry, {
     if (!expanded) restoreWorkbenchFocus()
   },
 })
+const hostHandle = ref<{ closeItem(id: string): Promise<void>; closeOtherItems(id: string): Promise<void>; hideHover(): void } | null>(null)
+const tabMenu = ref<{ show(event: MouseEvent | KeyboardEvent, artifact?: ArtifactPayload): Promise<void>; cancel(): void } | null>(null)
+const menuItemId = ref<string | null>(null)
+const menuItem = computed(() => store.visibleItems.find(item => item.id === menuItemId.value) ?? null)
+const menuDownloadAction = computed(() => panelToolbarItems(menuItem.value)
+  .some(action => action.kind === 'action' && action.id === 'download') ? 'panel:download' : undefined)
+const thumbnailCache = createTabThumbnailCache()
+const thumbnailVersion = ref(0)
+const nativeArtifactSnapshots = createNativeTabSnapshots(nativeApi, () => { thumbnailVersion.value++ })
+const nativeSnapshotUrl = computed(() => {
+  void thumbnailVersion.value
+  const item = store.activeItem
+  if (!item) return undefined
+  const state = runtimeManager.getRenderState(item.id)
+  if (state.errorMessage || ['error', 'crashed', 'offline', 'unsupported'].includes(String(state.nativeSurfaceState))) return undefined
+  if (typeof state.snapshotUrl === 'string') return state.snapshotUrl
+  return nativeArtifactSnapshots.snapshot(item.id, thumbnailFingerprint(item)) || tabInfo(item).thumbnailUrl
+})
+function thumbnailFingerprint(item: WorkbenchItem) {
+  const artifact = artifactFromWorkbenchItem(item)
+  return [artifact?.revisionId, artifact?.sha256, artifact?.download_url, artifact?.previewPagePath].join(':')
+}
+function tabInfo(item: WorkbenchItem) {
+  void thumbnailVersion.value
+  const state = runtimeManager.getRenderState(item.id)
+  return {
+    subtitle: panelHeader(item).subtitle,
+    loading: item.kind === 'browser' && state.loading === true,
+    thumbnailUrl: typeof state.thumbnailUrl === 'string' ? state.thumbnailUrl
+      : nativeArtifactSnapshots.get(item.id, thumbnailFingerprint(item))
+        || thumbnailCache.get(item.id, thumbnailFingerprint(item)),
+  }
+}
+const tabMenuActions = computed(() => {
+  const item = menuItem.value
+  if (!item) return []
+  const actions: { id: string; label: string; disabled?: boolean; separator?: boolean }[] = []
+  if (item.kind === 'browser') {
+    const state = runtimeManager.getRenderState(item.id)
+    const loading = state.loading === true
+    const url = normalizeBrowserUrl(String(state.currentUrl || item.payload.initialUrl || ''))
+    actions.push(
+      { id: loading ? 'stop' : 'reload', label: t(loading ? 'workbench.browser.stop' : 'workbench.refresh') },
+      { id: 'copy-link', label: t('workbench.tabs.copyLink'), disabled: !url },
+      { id: 'open-external', label: t('workbench.openExternal'), disabled: !url },
+    )
+  } else {
+    const refresh = panelToolbarItems(item).find(action => action.kind === 'action' && action.id === 'refresh')
+    if (refresh?.kind === 'action') actions.push({ id: 'panel:refresh', label: refresh.label, disabled: refresh.disabled })
+    const external = panelToolbarItems(item).find(action => action.kind === 'action' && action.id === 'open-external')
+    if (external?.kind === 'action') actions.push({ id: 'panel:open-external', label: external.label, disabled: external.disabled })
+    if (nativeApi) actions.push({ id: 'open-web', label: t('workbench.tabs.openWeb') })
+  }
+  actions.push({ id: 'close', label: t('workbench.closeItem'), separator: Boolean(actions.length || resourceActionArtifact(item)) })
+  if (store.visibleItems.length > 1) actions.push({ id: 'close-others', label: t('workbench.tabs.closeOthers') })
+  return actions
+})
+async function openTabMenu(item: WorkbenchItem, event: MouseEvent | KeyboardEvent) {
+  event.preventDefault()
+  event.stopPropagation()
+  hostHandle.value?.hideHover()
+  menuItemId.value = item.id
+  await nextTick()
+  if (menuItem.value?.id === item.id) await tabMenu.value?.show(event, resourceActionArtifact(item))
+}
+function onMenuTriggerKey(item: WorkbenchItem, event: KeyboardEvent) {
+  if (event.key === 'ContextMenu' || event.shiftKey && event.key === 'F10') void openTabMenu(item, event)
+}
+async function performTabMenuAction(action: string) {
+  const item = menuItem.value
+  if (!item) return
+  if (action === 'close') { await hostHandle.value?.closeItem(item.id); return }
+  if (action === 'close-others') { await hostHandle.value?.closeOtherItems(item.id); return }
+  if (action === 'open-web') { openBrowserStart(); return }
+  if (['panel:open-external', 'panel:download', 'panel:refresh'].includes(action)) {
+    runtimeManager.performAction(item, action.slice('panel:'.length)); return
+  }
+  if (item.kind !== 'browser') return
+  if (action === 'copy-link') {
+    const state = runtimeManager.getRenderState(item.id)
+    const url = normalizeBrowserUrl(String(state.currentUrl || item.payload.initialUrl || ''))
+    if (!url) return
+    try { await copyTextWithFallback(url); pushToast(t('chat.copied'), { tone: 'ok' }) }
+    catch { pushToast(t('resourceActions.failed'), { tone: 'danger' }) }
+    return
+  }
+  runtimeManager.performAction(item, action)
+}
+watch(() => store.items.map(item => item.id), ids => {
+  thumbnailCache.prune(new Set(ids))
+  nativeArtifactSnapshots.prune(new Set(ids))
+  thumbnailVersion.value++
+})
+watch(() => store.activeSessionId, () => { tabMenu.value?.cancel(); menuItemId.value = null })
 let stopSurfaceEvents: (() => void) | null = null
 let stopArtifactEvents: (() => void) | null = null
 let detachRuntime: (() => Promise<void>) | null = null
@@ -959,6 +1071,13 @@ function panelToolbarItems(
   ) || []
 }
 
+function visiblePanelToolbarItems(item: WorkbenchItem | null): readonly WorkbenchToolbarItem[] {
+  const toolbar = panelToolbarItems(item)
+  return item?.kind === 'artifact-preview'
+    ? toolbar.filter(action => !['open-external', 'download', 'refresh'].includes(action.id))
+    : toolbar
+}
+
 function resourceActionArtifact(item: WorkbenchItem): ArtifactPayload | undefined {
   return fileActionArtifactFromWorkbenchItem(item, runtimeManager.getRenderState(item.id))
 }
@@ -978,6 +1097,15 @@ function panelRefSetter(item: WorkbenchItem): (value: unknown) => void {
 }
 
 function handlePanelEvent(item: WorkbenchItem, event: WorkbenchComponentEvent) {
+  if (event.type === 'preview-thumbnail' && event.payload instanceof Blob) {
+    // The Office navigator already rendered this image for the visible document.
+    // Store a bounded independent URL so closing its renderer cannot break the tab card.
+    if (store.items.some(candidate => candidate.id === item.id)) {
+      thumbnailCache.save(item.id, thumbnailFingerprint(item), event.payload)
+      thumbnailVersion.value++
+    }
+    return
+  }
   if (event.type === 'request-collapse') {
     store.setExpanded(false)
     restoreWorkbenchFocus()
@@ -1071,6 +1199,13 @@ function onNativeSurfaceEvent(event: NativeWorkbenchSurfaceEvent) {
     }
   }
   runtimeManager.handleNativeSurfaceEvent(event)
+  if (browserItem?.kind === 'artifact-preview' && browserItem.hostKind === 'native-webcontents') {
+    if (event.type === 'loading' || event.type === 'error' || event.type === 'crashed') {
+      nativeArtifactSnapshots.invalidate(browserItem.id, event.type === 'loading')
+    } else if (event.type === 'ready' && store.activeItemId === browserItem.id && store.isVisible) {
+      void nativeArtifactSnapshots.ready(browserItem.id, thumbnailFingerprint(browserItem))
+    }
+  }
 }
 
 function onArtifactState(event: ArtifactDocumentChange) {
@@ -1363,6 +1498,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  thumbnailCache.clear()
+  nativeArtifactSnapshots.clear()
   artifactNavigationGeneration += 1
   stopPromptAnnotationLifecycle()
   pageAnnotationSendQueue.clear()

@@ -226,6 +226,11 @@
     "dismiss": "閉じる"
   },
   "workbench": {
+    "tabs": {
+      "copyLink": "リンクをコピー",
+      "openWeb": "ウェブページを開く",
+      "closeOthers": "他のタブを閉じる"
+    },
     "toolHistory": {
       "read": "今回の読み取り",
       "write": "今回の書き込み",

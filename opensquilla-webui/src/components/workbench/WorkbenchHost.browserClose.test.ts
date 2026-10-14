@@ -85,7 +85,8 @@ describe('browser tab close', () => {
         expect(setSurfaceRect).toHaveBeenCalledWith(expect.objectContaining({
           surfaceId: item.id, visible: false,
         }))
-        expect(destroySurface).not.toHaveBeenCalled()
+        if (operation === 'create') expect(destroySurface).not.toHaveBeenCalled()
+        else await vi.waitFor(() => expect(destroySurface).toHaveBeenCalledWith(item.id))
         expect(store.expanded).toBe(true)
         expect(host.querySelector('[data-testid="workbench-host"]')).not.toBeNull()
 

@@ -56,7 +56,7 @@
     <div class="office-preview__body">
       <OfficePageNavigator v-if="paged && session && total" :id="navigatorId"
         :session="session" :total="total" :active="page" :format="format as 'docx' | 'pptx'"
-        :collapsed="!navigatorExpanded" @navigate="goTo" @close="navigatorPreference = false" @expand="navigatorPreference = true" />
+        :collapsed="!navigatorExpanded" @thumbnail="emit('thumbnail', $event)" @navigate="goTo" @close="navigatorPreference = false" @expand="navigatorPreference = true" />
       <div ref="viewport" class="office-preview__viewport" :class="{ 'office-preview__viewport--paged': paged }">
         <div class="office-preview__reading" :class="{ 'office-preview__reading--slides': format === 'pptx' }">
           <div ref="container" class="office-preview__canvas" />
@@ -83,7 +83,7 @@ import { createOfficePreviewSession, type OfficePreviewSession } from '@/workben
 const props = withDefaults(defineProps<{ data: ArrayBuffer; format: OfficePreviewFormat; annotationEnabled?: boolean; suspended?: boolean }>(), {
   annotationEnabled: false, suspended: false,
 })
-const emit = defineEmits<{ 'selection-request': [selection: OfficeSelection]; loading: []; ready: []; error: [error: Error] }>()
+const emit = defineEmits<{ 'selection-request': [selection: OfficeSelection]; loading: []; ready: []; error: [error: Error]; thumbnail: [blob: Blob] }>()
 const { t } = useI18n()
 const panel = ref<HTMLElement | null>(null)
 const container = ref<HTMLElement | null>(null)

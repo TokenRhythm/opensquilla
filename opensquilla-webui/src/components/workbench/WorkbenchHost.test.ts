@@ -269,11 +269,11 @@ describe('WorkbenchHost', () => {
     expect(panel.style.getPropertyValue('--workbench-width')).toBe('614px')
   })
 
-  it('keeps a single item light and adds a tab strip only for multiple items', async () => {
+  it('retains one compact tab and expands the same strip for multiple items', async () => {
     const mounted = await mountHost(1200)
 
     expect(mounted.host.querySelector('[data-testid="workbench-host"]')).not.toBeNull()
-    expect(mounted.host.querySelector('[role="tablist"]')).toBeNull()
+    expect(mounted.host.querySelectorAll('[role="tab"]')).toHaveLength(1)
     expect(mounted.host.textContent).toContain('one.html')
     expect(mounted.host.querySelector('[data-testid="workbench-resizer"]')).not.toBeNull()
 
@@ -295,7 +295,7 @@ describe('WorkbenchHost', () => {
     expect(mounted.store.activeItemId).toBe('one')
   })
 
-  it('returns focus to the local collapse control when closing from two tabs to one', async () => {
+  it('returns focus to the remaining tab when closing from two tabs to one', async () => {
     const mounted = await mountHost(1200)
     mounted.store.openItem(item('two'))
     await nextTick()
@@ -308,8 +308,8 @@ describe('WorkbenchHost', () => {
     await nextTick()
 
     expect(mounted.store.items).toHaveLength(1)
-    expect(mounted.host.querySelector('[role="tablist"]')).toBeNull()
-    expect(document.activeElement).toBe(mounted.host.querySelector('[aria-label="Collapse workbench"]'))
+    expect(mounted.host.querySelectorAll('[role="tab"]')).toHaveLength(1)
+    expect(document.activeElement).toBe(mounted.host.querySelector('[role="tab"]'))
   })
 
   it('keeps a tab mounted when its pending source save rejects close', async () => {
@@ -473,7 +473,7 @@ describe('WorkbenchHost', () => {
     })
     document.dispatchEvent(tab)
     expect(tab.defaultPrevented).toBe(true)
-    expect(document.activeElement).toBe(collapse)
+    expect(document.activeElement).toBe(panel.querySelector('[role="tab"]'))
 
     document.dispatchEvent(new KeyboardEvent('keydown', {
       key: 'Escape',

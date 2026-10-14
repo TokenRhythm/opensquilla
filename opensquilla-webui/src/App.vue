@@ -94,6 +94,7 @@
       @refresh="loadSidebarData"
       @load-more="loadMoreSessions"
       @rename="onRenameSession"
+      @copy-session-link="onCopySidebarSessionLink"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
       @reorder="onReorderSidebarSession"
@@ -173,6 +174,13 @@
       'main--tabbar-hidden': mobileKeyboardOpen,
     }"
   >
+    <div class="app-workspace">
+      <div
+        v-show="!workbenchMaximized"
+        class="app-chat-pane"
+        :inert="workbenchMaximized || undefined"
+        :aria-hidden="workbenchMaximized ? 'true' : undefined"
+      >
     <header ref="topbarRef" class="topbar" :class="{ 'topbar--chat': isChatRoute }" :data-connection-state="effectiveConnectionState">
       <div class="topbar-left">
         <!-- Sidebar toggle — visible when sidebar is collapsed -->
@@ -252,7 +260,6 @@
         />
       </div>
     </header>
-    <div class="app-workspace">
       <main
         v-show="!workbenchMaximized"
         :inert="workbenchMaximized || undefined"
@@ -285,6 +292,7 @@
           <router-view v-if="settingsBackgroundRoute" />
         </ErrorBoundary>
       </main>
+      </div>
       <AppWorkbench
         :enabled="appStore.features.artifactWorkbench === true"
         :workbench-resources-enabled="(
@@ -392,6 +400,8 @@ import { SettingsBackgroundRoute, useSettingsRouteOverlay } from './router/setti
 import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
 import { getPlatform } from '@/platform'
+import { copyTextWithFallback } from '@/utils/browser'
+import { currentSessionLink } from '@/utils/chat/sessionLinks'
 import { useAppStore, type PendingApproval } from './stores/app'
 import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
 import { PRODUCT_ACTIVITY_KEY } from './modules/productActivity'
@@ -1508,6 +1518,30 @@ async function switchToSession(key: string, source = 'app.switchToSession') {
   if ($route.path === '/chat' && $route.query.session === key) closeSidebarDrawer()
 }
 
+let sidebarCopySequence = 0
+let sidebarClipboardWrite: Promise<void> = Promise.resolve()
+async function onCopySidebarSessionLink(key: string) {
+  if (!key) return
+  const sequence = ++sidebarCopySequence
+  const epoch = gatewayAccess.subscriptionEpoch
+  const isCurrent = () => sequence === sidebarCopySequence
+    && gatewayAccess.subscriptionEpoch === epoch
+  try {
+    const link = await currentSessionLink(key, platform)
+    if (!isCurrent()) return
+    // Clipboard fallbacks can settle after a newer click. Serialize the writes,
+    // then recheck ownership so an old fallback cannot overwrite the new link.
+    const write = sidebarClipboardWrite.then(async () => {
+      if (isCurrent()) await copyTextWithFallback(link)
+    })
+    sidebarClipboardWrite = write.catch(() => undefined)
+    await write
+    if (isCurrent()) pushToast(t('chat.copied'), { tone: 'ok' })
+  } catch {
+    if (isCurrent()) pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
+  }
+}
+
 // Only the current rename may update local display state. Later authoritative
 // list snapshots can still rename or remove the row normally.
 let sessionRenameSequence = 0
@@ -1948,6 +1982,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  sidebarCopySequence += 1
   appAutomaticRpcMounted = false
   automaticAppRpc.dispose()
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
@@ -1972,11 +2007,34 @@ onUnmounted(() => {
 
 <style scoped>
 .app-workspace {
+  --workspace-header-height: 49px;
   position: relative;
   display: flex;
   min-width: 0;
   min-height: 0;
   flex: 1;
+}
+
+.app-chat-pane {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.app-chat-pane > .content {
+  min-height: 0;
+}
+
+.topbar--chat {
+  border-bottom: 1px solid var(--border-subtle, var(--border));
+}
+
+.sidebar-core {
+  border-bottom: 1px solid var(--border-subtle, var(--border));
+  margin-bottom: var(--sp-2);
 }
 
 .sidebar-foot {

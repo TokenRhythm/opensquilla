@@ -118,6 +118,7 @@
           :annotation-enabled="officeAnnotationEnabled"
           :suspended="suspended"
           @loading="officeRenderState = 'loading'"
+          @thumbnail="emit('workbench-event', { type: 'preview-thumbnail', payload: $event })"
           @ready="officeRenderState = 'ready'"
           @error="officeRenderState = 'error'"
           @selection-request="selection => emit('workbench-event', { type: 'office-annotation-selected', payload: {

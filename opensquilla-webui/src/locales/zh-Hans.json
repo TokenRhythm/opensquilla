@@ -226,6 +226,11 @@
     "dismiss": "忽略"
   },
   "workbench": {
+    "tabs": {
+      "copyLink": "复制链接",
+      "openWeb": "打开网页",
+      "closeOthers": "关闭其他标签"
+    },
     "toolHistory": {
       "read": "本次读取",
       "write": "本次写入",

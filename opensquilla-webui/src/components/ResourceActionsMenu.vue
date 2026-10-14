@@ -17,6 +17,11 @@ import Icon from '@/components/Icon.vue'
 
 const props = withDefaults(defineProps<{
   artifact?: ArtifactPayload
+  /** Tab menus deliberately retain only download/reveal plus tab actions. */
+  compact?: boolean
+  /** Retain the panel's established download even without a local source file. */
+  downloadAction?: string
+  extraActions?: readonly { id: string; label: string; disabled?: boolean; separator?: boolean }[]
   sessionKey?: string
   trigger?: boolean
   previewable?: boolean
@@ -24,7 +29,7 @@ const props = withDefaults(defineProps<{
   /** New media-card shortcuts must not turn a spoofed MIME into a script opener. */
   nativeOpenMediaOnly?: boolean
 }>(), { sessionKey: '', trigger: false, previewable: true })
-const emit = defineEmits<{ open: [artifact: ArtifactPayload] }>()
+const emit = defineEmits<{ open: [artifact: ArtifactPayload]; action: [id: string] }>()
 const { t } = useI18n()
 const { pushToast } = useToasts()
 const platform = usePlatform()
@@ -119,7 +124,7 @@ function currentRequest(artifact: ArtifactPayload, signal: AbortSignal): Working
 }
 
 async function show(event: MouseEvent | KeyboardEvent, artifact = props.artifact) {
-  if (!artifact || !workbench) return
+  if ((!artifact || !workbench) && !props.extraActions?.length) return
   if (event instanceof KeyboardEvent && event.key !== 'ContextMenu'
     && !(event.shiftKey && event.key === 'F10')) return
   event.preventDefault()
@@ -128,9 +133,9 @@ async function show(event: MouseEvent | KeyboardEvent, artifact = props.artifact
   const attempt = ++generation
   pending = new AbortController()
   const signal = pending.signal
-  session = props.sessionKey || String(artifact.session_key || artifact.sessionKey || '')
+  session = props.sessionKey || String(artifact?.session_key || artifact?.sessionKey || '')
   epoch = gateway?.subscriptionEpoch ?? 0
-  selected.value = { ...artifact }
+  selected.value = artifact ? { ...artifact } : null
   metadata.value = null
   localInstance.value = null
   invoker = (event.target instanceof Element
@@ -150,7 +155,7 @@ async function show(event: MouseEvent | KeyboardEvent, artifact = props.artifact
   const initialFocus = menu.value?.querySelector<HTMLButtonElement>('button:not(:disabled)') ?? menu.value
   initialFocus?.focus()
   try {
-    if (source.value) {
+    if (source.value && artifact && workbench) {
       const info = await workbench.content.workingFileMetadata?.(currentRequest(artifact, signal))
       if (attempt !== generation) return
       metadata.value = info ?? null
@@ -163,7 +168,7 @@ async function show(event: MouseEvent | KeyboardEvent, artifact = props.artifact
       }
     }
   } catch {
-    if (attempt === generation) pushToast(t('resourceActions.unavailable'), { tone: 'danger' })
+    if (attempt === generation && !props.downloadAction) pushToast(t('resourceActions.unavailable'), { tone: 'danger' })
   } finally {
     if (attempt === generation) {
       loading.value = false
@@ -285,7 +290,12 @@ function onKeydown(event: KeyboardEvent) {
     : (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length
   buttons[next]?.focus()
 }
-defineExpose({ show })
+function performExtra(id: string) {
+  cancel()
+  emit('action', id)
+}
+
+defineExpose({ show, cancel })
 </script>
 
 <template>
@@ -298,25 +308,31 @@ defineExpose({ show })
     <div v-if="visible" class="resource-actions-backdrop" @pointerdown.self="cancel">
       <div ref="menu" class="resource-actions-menu" role="menu" tabindex="-1" :aria-label="t('resourceActions.more')"
         :style="{ left: `${point.left}px`, top: `${point.top}px` }" @keydown="onKeydown" @contextmenu.prevent>
-        <button v-if="previewable" role="menuitem" type="button" @click="perform('preview')">{{ t('resourceActions.preview') }}</button>
+        <button v-if="previewable && !compact" role="menuitem" type="button" @click="perform('preview')">{{ t('resourceActions.preview') }}</button>
         <template v-if="localInstance && metadata">
-          <button role="menuitem" type="button" @click="perform('open')">{{ t('resourceActions.openSource') }}</button>
+          <button v-if="!compact" role="menuitem" type="button" @click="perform('open')">{{ t('resourceActions.openSource') }}</button>
           <button role="menuitem" type="button" @click="perform('reveal')">{{ revealLabel }}</button>
         </template>
-        <button v-if="canOpenCopy" role="menuitem" type="button" @click="perform('copy-open')">{{ t('resourceActions.openCopy') }}</button>
-        <button v-if="bundleTarget && workbench?.content.exportHtmlBundle" role="menuitem" type="button"
+        <button v-if="canOpenCopy && !compact" role="menuitem" type="button" @click="perform('copy-open')">{{ t('resourceActions.openCopy') }}</button>
+        <button v-if="!compact && bundleTarget && workbench?.content.exportHtmlBundle" role="menuitem" type="button"
           :title="t(source ? 'resourceActions.zipWorking' : 'resourceActions.zipSnapshot')"
           @click="perform('export-zip')">{{ t('resourceActions.downloadZip') }}</button>
+        <button v-if="readable || downloadAction" role="menuitem" type="button"
+          :title="source && !downloadAction ? t('resourceActions.singleFile') : undefined"
+          @click="downloadAction ? performExtra(downloadAction) : perform('save')">
+            {{ t(compact ? 'chat.download' : platform.files.saveArtifact ? 'resourceActions.saveAs' : 'chat.download') }}
+        </button>
         <template v-if="readable">
-          <button role="menuitem" type="button" :title="source ? t('resourceActions.singleFile') : undefined" @click="perform('save')">
-            {{ t(platform.files.saveArtifact ? 'resourceActions.saveAs' : 'chat.download') }}
-          </button>
-          <button v-if="source && !html" role="menuitem" type="button" @click="perform('path')">{{ t(localInstance ? 'resourceActions.copyPath' : 'resourceActions.copyGatewayPath') }}</button>
-          <button v-if="svg" role="menuitem" type="button" :disabled="imageClipboard.busy.value"
+          <button v-if="!compact && source && !html" role="menuitem" type="button" @click="perform('path')">{{ t(localInstance ? 'resourceActions.copyPath' : 'resourceActions.copyGatewayPath') }}</button>
+          <button v-if="!compact && svg" role="menuitem" type="button" :disabled="imageClipboard.busy.value"
             @click="copySvgSource">{{ t('imageClipboard.copySource') }}</button>
-          <button v-else-if="!html" role="menuitem" type="button" @click="perform('contents')">{{ t('resourceActions.copyContents') }}</button>
+          <button v-else-if="!compact && !html" role="menuitem" type="button" @click="perform('contents')">{{ t('resourceActions.copyContents') }}</button>
         </template>
-        <small v-if="source && !readable" role="status">{{ t(loading ? 'common.loading' : 'resourceActions.unavailable') }}</small>
+        <template v-for="action in extraActions" :key="action.id">
+          <hr v-if="action.separator" class="resource-actions-separator" role="separator" />
+          <button role="menuitem" type="button" :disabled="action.disabled" @click="performExtra(action.id)">{{ action.label }}</button>
+        </template>
+        <small v-if="source && !readable && !downloadAction" role="status">{{ t(loading ? 'shared.loading' : 'resourceActions.unavailable') }}</small>
       </div>
     </div>
   </Teleport>
@@ -328,5 +344,7 @@ defineExpose({ show })
 .resource-actions-menu { position: fixed; display: flex; flex-direction: column; min-width: 220px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow-y: auto; padding: 5px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-surface); color: var(--text); box-shadow: var(--shadow-lg); }
 .resource-actions-menu button { border: 0; border-radius: var(--radius-sm); padding: 8px 12px; background: transparent; color: inherit; text-align: start; font: inherit; font-size: 0.8125rem; cursor: pointer; }
 .resource-actions-menu button:hover, .resource-actions-menu button:focus-visible { background: var(--bg-hover); outline: 1px solid var(--accent); }
+.resource-actions-separator { width: 100%; margin: 4px 0; border: 0; border-top: 1px solid var(--border); }
+.resource-actions-menu button:disabled { opacity: .5; cursor: default; }
 .resource-actions-menu small { padding: 8px 12px; color: var(--text-muted); max-width: 280px; }
 </style>

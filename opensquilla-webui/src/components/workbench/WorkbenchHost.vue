@@ -47,6 +47,11 @@
           class="workbench-host__tab-wrap"
           :class="{ 'is-active': item.id === activeItem?.id }"
           role="presentation"
+          @pointerenter="scheduleHover(item, $event)"
+          @pointerleave="scheduleHideHover"
+          @focusin="scheduleHover(item, $event)"
+          @focusout="onTabFocusOut"
+          @contextmenu="openTabMenu(item, $event)"
         >
           <button
             :id="tabId(item.id)"
@@ -55,10 +60,13 @@
             type="button"
             :aria-selected="item.id === activeItem?.id"
             :aria-controls="panelId(item.id)"
+            :aria-describedby="hoveredItem?.id === item.id ? hoverCardId : undefined"
+            :aria-busy="tabInfo?.(item).loading || undefined"
             :tabindex="item.id === activeItem?.id || (!activeItem && index === 0) ? 0 : -1"
-            @click="store.activateItem(item.id)"
+            @click="activateTab(item.id)"
             @keydown="onTabKeydown($event, index)"
           >
+            <Icon v-if="tabInfo?.(item).loading" name="refresh" :size="14" class="workbench-host__tab-spinner" aria-hidden="true" />
             <span class="workbench-host__tab-title">{{ item.title }}</span>
           </button>
           <button
@@ -108,6 +116,9 @@
         </button>
       </div>
     </header>
+    <div v-if="showToolbar" class="workbench-host__toolbar">
+      <slot name="toolbar" :item="activeItem" />
+    </div>
 
     <section
       ref="surfaceRef"
@@ -159,8 +170,21 @@
           </slot>
         </div>
       </template>
+      <img v-if="nativeSnapshotUrl && activeItem?.hostKind === 'native-webcontents'"
+        class="workbench-host__native-backdrop" :src="nativeSnapshotUrl" :style="nativeBackdropStyle"
+        alt="" aria-hidden="true" draggable="false" />
     </section>
   </aside>
+  <Teleport to="body">
+    <div v-if="hoveredItem && shouldRender && !modalBlocked" :id="hoverCardId" ref="hoverCardRef"
+      class="workbench-tab-preview" role="tooltip" :style="hoverStyle"
+      @pointerenter="cancelHideHover" @pointerleave="scheduleHideHover">
+      <strong>{{ hoveredItem.title }}</strong>
+      <span v-if="tabInfo?.(hoveredItem).subtitle">{{ tabInfo?.(hoveredItem).subtitle }}</span>
+      <img v-if="hoveredItem.id !== activeItem?.id && tabInfo?.(hoveredItem).thumbnailUrl"
+        :src="tabInfo?.(hoveredItem).thumbnailUrl" alt="" draggable="false" />
+    </div>
+  </Teleport>
 </template>
 
 <script setup lang="ts">
@@ -171,9 +195,10 @@ import {
   onMounted,
   ref,
   watch,
+  useId,
 } from 'vue'
 import Icon from '@/components/Icon.vue'
-import { useDialogA11y } from '@/composables/useDialogA11y'
+import { useDialogA11y, useDialogLayer } from '@/composables/useDialogA11y'
 import {
   WORKBENCH_MIN_WIDTH,
   defaultWorkbenchWidthPreference,
@@ -193,6 +218,10 @@ const props = withDefaults(defineProps<{
   allowEmpty?: boolean
   routeActive?: boolean
   modalBlocked?: boolean
+  nativeBlocked?: boolean
+  nativeSnapshotUrl?: string
+  showToolbar?: boolean
+  tabInfo?: (item: WorkbenchItem) => { subtitle?: string; thumbnailUrl?: string; loading?: boolean }
   availableWidth?: number
   coarseOnly?: boolean
   ariaLabel?: string
@@ -229,6 +258,7 @@ const emit = defineEmits<{
   'focus-return': []
   'layout-change': [mode: WorkbenchLayoutMode]
   'surface-rect': [rect: NativeSurfaceRect]
+  'tab-menu': [item: WorkbenchItem, event: MouseEvent | KeyboardEvent]
 }>()
 
 const store = useWorkbenchStore()
@@ -249,11 +279,68 @@ let surfaceMutationObserver: MutationObserver | null = null
 let rectFrame = 0
 let lastNativeItemId: string | null = null
 const nativeSurfaceSlotSelector = '[data-workbench-native-surface-slot]'
-const showTabStrip = computed(() => store.hasMultipleItems
-  || store.visibleItems.some(item => item.kind === 'browser'))
+const nativeBackdropStyle = ref<Record<string, string>>({ display: 'none' })
+const showTabStrip = computed(() => store.visibleItems.length > 0)
 const activeItem = computed(() => store.visibleItems.find(
   item => item.id === store.activeItemId,
 ) ?? null)
+const hoverCardId = useId()
+const hoveredId = ref<string | null>(null)
+const hoveredItem = computed(() => store.visibleItems.find(item => item.id === hoveredId.value) ?? null)
+const hoverCardRef = ref<HTMLElement | null>(null)
+const hoverPoint = ref({ left: 8, top: 8 })
+const hoverStyle = computed(() => ({ left: `${hoverPoint.value.left}px`, top: `${hoverPoint.value.top}px` }))
+const hoverOpen = computed(() => Boolean(hoveredItem.value) && shouldRender.value && !props.modalBlocked)
+let hoverTimer: ReturnType<typeof setTimeout> | undefined
+let hideHoverTimer: ReturnType<typeof setTimeout> | undefined
+function cancelHideHover() { clearTimeout(hideHoverTimer) }
+function hideHover() {
+  clearTimeout(hoverTimer)
+  clearTimeout(hideHoverTimer)
+  hoveredId.value = null
+}
+function scheduleHideHover() {
+  clearTimeout(hoverTimer)
+  cancelHideHover()
+  hideHoverTimer = setTimeout(hideHover, 130)
+}
+function onTabFocusOut(event: FocusEvent) {
+  if (event.currentTarget instanceof Element && event.relatedTarget instanceof Node
+    && event.currentTarget.contains(event.relatedTarget)) return
+  scheduleHideHover()
+}
+function scheduleHover(item: WorkbenchItem, event: Event) {
+  if (event instanceof PointerEvent && event.pointerType === 'touch') return
+  cancelHideHover()
+  clearTimeout(hoverTimer)
+  const element = event.currentTarget instanceof HTMLElement ? event.currentTarget : null
+  hoverTimer = setTimeout(async () => {
+    if (!element?.isConnected || props.modalBlocked) return
+    hoveredId.value = item.id
+    const rect = element.getBoundingClientRect()
+    hoverPoint.value = { left: Math.max(8, Math.min(rect.left, window.innerWidth - 320 - 8)), top: rect.bottom + 8 }
+    await nextTick()
+    const bounds = hoverCardRef.value?.getBoundingClientRect()
+    if (bounds) hoverPoint.value = {
+      left: Math.max(8, Math.min(rect.left, window.innerWidth - bounds.width - 8)),
+      top: Math.max(8, Math.min(rect.bottom + 8, window.innerHeight - bounds.height - 8)),
+    }
+  }, 400)
+}
+function activateTab(id: string) { hideHover(); store.activateItem(id) }
+function openTabMenu(item: WorkbenchItem, event: MouseEvent | KeyboardEvent) {
+  event.preventDefault()
+  event.stopPropagation()
+  hideHover()
+  emit('tab-menu', item, event)
+}
+function onHoverEscape(event: KeyboardEvent) {
+  if (event.key === 'Escape' && hoverOpen.value && hoverTopmost.value) {
+    event.preventDefault()
+    event.stopPropagation()
+    hideHover()
+  }
+}
 const mountedItems = computed(() => {
   const visibleIds = new Set(store.visibleItems.map(item => item.id))
   return store.items.filter(item => visibleIds.has(item.id)
@@ -303,6 +390,8 @@ const runtimeAvailable = computed(() =>
 const mobileDialogOpen = computed(() =>
   shouldRender.value && layoutMode.value === 'mobile-dialog')
 
+const hoverTopmost = useDialogLayer(hoverOpen)
+
 useDialogA11y(
   hostRef,
   mobileDialogOpen,
@@ -335,6 +424,7 @@ function toggleMaximized() {
 }
 
 async function closeWorkbenchItem(id: string) {
+  hideHover()
   const item = store.items.find(candidate => candidate.id === id)
   if (!item || props.beforeCloseItem && !await props.beforeCloseItem(item)) return
   if (!store.closeItem(id)) return
@@ -352,7 +442,21 @@ async function closeWorkbenchItem(id: string) {
   })
 }
 
+async function closeOtherItems(id: string) {
+  for (const item of [...store.visibleItems]) {
+    if (item.id !== id) await closeWorkbenchItem(item.id)
+  }
+}
+
+defineExpose({ closeItem: closeWorkbenchItem, closeOtherItems, hideHover })
+
 function onTabKeydown(event: KeyboardEvent, currentIndex: number) {
+  if (event.key === 'ContextMenu' || event.shiftKey && event.key === 'F10') {
+    const item = store.visibleItems[currentIndex]
+    if (item) openTabMenu(item, event)
+    return
+  }
+  if (event.key === 'Escape') { hideHover(); return }
   const count = store.visibleItems.length
   if (count < 2) return
   let nextIndex: number | null = null
@@ -473,17 +577,23 @@ function emitSurfaceRect() {
     '[data-workbench-native-surface-slot]',
   )
   if (!element || !runtimeAvailable.value) {
+    nativeBackdropStyle.value = { display: 'none' }
     emit('surface-rect', hiddenRect(activeNativeId))
     return
   }
   const rect = element.getBoundingClientRect()
+  const parentRect = surfaceRef.value?.getBoundingClientRect()
+  nativeBackdropStyle.value = parentRect ? {
+    left: `${rect.left - parentRect.left}px`, top: `${rect.top - parentRect.top}px`,
+    width: `${rect.width}px`, height: `${rect.height}px`,
+  } : { display: 'none' }
   emit('surface-rect', {
     itemId: activeNativeId,
     x: Math.round(rect.x),
     y: Math.round(rect.y),
     width: Math.max(0, Math.round(rect.width)),
     height: Math.max(0, Math.round(rect.height)),
-    visible: !props.modalBlocked && rect.width > 0 && rect.height > 0,
+    visible: !props.modalBlocked && !props.nativeBlocked && rect.width > 0 && rect.height > 0,
   })
 }
 
@@ -499,7 +609,10 @@ watch(runtimeAvailable, available => {
   void nextTick(scheduleSurfaceRect)
 }, { immediate: true })
 
-watch(() => props.modalBlocked, () => void nextTick(scheduleSurfaceRect))
+watch(() => props.modalBlocked, blocked => { if (blocked) hideHover(); void nextTick(scheduleSurfaceRect) })
+watch(() => props.nativeBlocked, () => void nextTick(scheduleSurfaceRect))
+watch(() => store.activeSessionId, hideHover)
+watch(shouldRender, visible => { if (!visible) hideHover() })
 watch(() => activeItem.value?.id, () => void nextTick(scheduleSurfaceRect))
 watch(() => activeItem.value?.hostKind, () => void nextTick(scheduleSurfaceRect))
 watch(effectiveWidth, scheduleSurfaceRect)
@@ -515,6 +628,7 @@ watch(shouldRender, (visible, previous) => {
 })
 
 onMounted(() => {
+  document.addEventListener('keydown', onHoverEscape, true)
   window.addEventListener('resize', updateViewportWidth)
   window.addEventListener('scroll', measureContainer, true)
   coarseQuery = window.matchMedia?.('(pointer: coarse) and (hover: none)') ?? null
@@ -537,6 +651,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  hideHover()
+  document.removeEventListener('keydown', onHoverEscape, true)
   window.removeEventListener('resize', updateViewportWidth)
   window.removeEventListener('scroll', measureContainer, true)
   coarseQuery?.removeEventListener?.('change', updateCoarseOnly)
@@ -602,12 +718,17 @@ onBeforeUnmount(() => {
 
 .workbench-host__chrome {
   display: flex;
-  min-height: 48px;
+  box-sizing: border-box;
+  min-height: var(--workspace-header-height, 49px);
   align-items: center;
   gap: var(--sp-2);
   padding: 0 var(--sp-3);
   border-block-end: 1px solid var(--border);
 }
+
+.workbench-host__toolbar { display: flex; flex: 0 0 auto; flex-wrap: wrap; align-items: center;
+  justify-content: flex-end; gap: var(--sp-1); min-height: 42px; padding: 4px var(--sp-3);
+  border-block-end: 1px solid var(--border); box-sizing: border-box; }
 
 .workbench-host__tabs {
   display: flex;
@@ -624,8 +745,10 @@ onBeforeUnmount(() => {
 
 .workbench-host__tab-wrap {
   display: flex;
-  min-width: 120px;
-  max-width: 220px;
+  min-width: 0;
+  flex: 0 0 auto;
+  width: max-content;
+  max-width: 200px;
   align-items: center;
   color: var(--text-dim);
 }
@@ -635,8 +758,11 @@ onBeforeUnmount(() => {
 }
 
 .workbench-host__tab {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   min-width: 0;
-  flex: 1;
+  flex: 1 1 auto;
   padding: var(--sp-2);
   border: 0;
   border-block-end: 2px solid transparent;
@@ -659,6 +785,7 @@ onBeforeUnmount(() => {
 }
 
 .workbench-host__tab-title {
+  min-width: 0;
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -711,23 +838,22 @@ onBeforeUnmount(() => {
   gap: var(--sp-1);
 }
 
-@container (max-width: 560px) {
-  .workbench-host__chrome:has(.workbench-host__tabs):not(.workbench-host__chrome--browser) {
-    flex-wrap: wrap;
-    gap: 0;
-  }
-
-  .workbench-host__chrome:not(.workbench-host__chrome--browser) .workbench-host__tabs {
-    flex-basis: 100%;
-    min-height: 44px;
-  }
-
-  .workbench-host__chrome:has(.workbench-host__tabs):not(.workbench-host__chrome--browser) .workbench-host__actions {
-    width: 100%;
-    min-height: 44px;
-    justify-content: flex-end;
-  }
-}
+/* Keep tabs and actions on one aligned row. Rare actions live in the menu. */
+.workbench-host__tab-close { opacity: 0; width: 24px; }
+.workbench-host__tab-wrap:hover .workbench-host__tab-close,
+.workbench-host__tab-wrap:focus-within .workbench-host__tab-close { opacity: 1; }
+.workbench-host__tab-spinner { flex: 0 0 auto; animation: workbench-tab-spin 1s linear infinite; }
+@keyframes workbench-tab-spin { to { transform: rotate(360deg); } }
+.workbench-tab-preview { position: fixed; z-index: 10001; display: flex; flex-direction: column; gap: 7px;
+  box-sizing: border-box; width: max-content; max-width: min(320px, calc(100vw - 16px)); padding: 12px;
+  border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--bg-surface);
+  color: var(--text); box-shadow: var(--shadow-lg); font-size: var(--fs-sm); overflow-wrap: anywhere; }
+.workbench-tab-preview strong { font-weight: 600; }
+.workbench-tab-preview span { color: var(--text-dim); font-size: var(--fs-xs); }
+.workbench-tab-preview img { display: block; width: 296px; max-width: 100%; max-height: 180px; object-fit: contain;
+  background: var(--bg); border-radius: var(--radius-sm); }
+@media (hover: none) { .workbench-host__tab-close { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .workbench-host__tab-spinner { animation: none; } }
 
 .workbench-host__surface {
   position: relative;
@@ -761,6 +887,9 @@ onBeforeUnmount(() => {
   font-size: var(--fs-sm);
   text-align: center;
 }
+
+.workbench-host__native-backdrop { position: absolute; z-index: 1; display: block; object-fit: fill;
+  pointer-events: none; background: var(--bg); }
 
 .workbench-host__native-placeholder {
   width: 100%;

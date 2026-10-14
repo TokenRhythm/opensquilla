@@ -226,6 +226,11 @@
     "dismiss": "Ignorer"
   },
   "workbench": {
+    "tabs": {
+      "copyLink": "Copier le lien",
+      "openWeb": "Ouvrir une page web",
+      "closeOthers": "Fermer les autres onglets"
+    },
     "toolHistory": {
       "read": "Lecture enregistrée",
       "write": "Écriture enregistrée",

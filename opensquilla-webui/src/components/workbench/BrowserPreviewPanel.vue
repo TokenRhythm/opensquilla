@@ -1,5 +1,5 @@
 <template>
-  <section class="browser-preview" @keydown.capture="onPanelKeydown">
+  <section class="browser-preview" :aria-busy="loading" @keydown.capture="onPanelKeydown">
     <form class="browser-preview__toolbar" @submit.prevent="navigate">
       <button
         type="button"
@@ -23,6 +23,7 @@
         type="button"
         class="btn btn--icon btn--ghost"
         :aria-label="loading ? t('workbench.browser.stop') : t('workbench.refresh')"
+        :title="loading ? t('workbench.browser.stop') : t('workbench.refresh')"
         @click="emitAction(loading ? 'stop' : 'reload')"
       >
         <Icon :name="loading ? 'x' : 'refresh'" :size="15" />

@@ -65,6 +65,7 @@ const props = defineProps<{
   title: string
   updatedAt: number
   projectName?: string
+  status?: string
   position: { left: string; top: string }
 }>()
 
@@ -83,8 +84,8 @@ async function fitMeasuredCard() {
   )
 }
 
-watch(() => props.position, (position) => {
-  resolvedPosition.value = position
+watch(() => [props.position, props.title, props.projectName, props.status], () => {
+  resolvedPosition.value = props.position
   void fitMeasuredCard()
 })
 onMounted(() => { void fitMeasuredCard() })
@@ -110,5 +111,19 @@ onMounted(() => { void fitMeasuredCard() })
       <Icon name="folder" :size="15" aria-hidden="true" />
       <span>{{ projectName }}</span>
     </div>
+    <div v-if="status" class="sidebar-session-preview__status">{{ status }}</div>
   </div>
 </template>
+
+<style scoped>
+.sidebar-session-preview {
+  pointer-events: auto;
+}
+
+.sidebar-session-preview__status {
+  margin-top: var(--sp-2);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+}
+</style>

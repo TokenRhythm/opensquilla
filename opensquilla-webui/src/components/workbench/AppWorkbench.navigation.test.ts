@@ -26,7 +26,7 @@ vi.mock('./WorkbenchHost.vue', async () => {
   const { useWorkbenchStore } = await import('@/workbench/store')
   return { default: defineComponent({ inheritAttrs: false, setup(_, { slots }) {
     const store = useWorkbenchStore()
-    return () => h('div', slots.actions?.({ item: store.items.find(item => item.id === store.activeItemId) || null }))
+    return () => h('div', slots.toolbar?.({ item: store.items.find(item => item.id === store.activeItemId) || null }))
   } }) }
 })
 vi.mock('@/components/ResourceActionsMenu.vue', () => ({ default: { render: () => null } }))

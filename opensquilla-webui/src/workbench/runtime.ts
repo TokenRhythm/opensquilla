@@ -56,15 +56,19 @@ export interface WorkbenchRuntimeManagerOptions {
 /**
  * Owns all non-serializable panel resources. Events for each item are queued so
  * rapid tab switching cannot resume a runtime after a later close disposed it.
+ * Browser navigations run independently so native progress and stop/close can
+ * be processed while a page response is pending.
  */
 export class WorkbenchRuntimeManager {
   private readonly runtimes = new Map<string, WorkbenchPanelRuntime>()
   private readonly items = new Map<string, WorkbenchItem>()
   private readonly itemEpochs = new Map<string, number>()
+  private nextItemEpoch = 0
   private readonly descriptorEpochs = new WeakMap<object, number>()
   private readonly openItemIds = new Set<string>()
   private readonly resumedItemIds = new Set<string>()
   private readonly queues = new Map<string, Promise<void>>()
+  private readonly browserNavigations = new Map<string, Set<Promise<void>>>()
   private readonly surfaceRects = new Map<string, NativeSurfaceRect>()
   private readonly renderStates = reactive(
     new Map<string, Readonly<Record<string, unknown>>>(),
@@ -79,7 +83,9 @@ export class WorkbenchRuntimeManager {
     const id = event.item.id
     let epoch = this.itemEpochs.get(id) ?? 0
     if (event.type === 'open' && !this.openItemIds.has(id)) {
-      epoch += 1
+      // Do not reuse an epoch after disposal deletes the item's bookkeeping:
+      // browser navigation/recovery can still settle after a same-id reopen.
+      epoch = ++this.nextItemEpoch
       this.itemEpochs.set(id, epoch)
       this.renderStates.delete(id)
       this.resumedItemIds.delete(id)
@@ -153,7 +159,12 @@ export class WorkbenchRuntimeManager {
     if (!this.isCurrentDescriptor(item)) return
     this.enqueue(item.id, async () => {
       const runtime = await this.ensureRuntime(item)
-      await runtime?.handleComponentEvent?.(event, item)
+      const result = runtime?.handleComponentEvent?.(event, item)
+      const action = event.type === 'browser-action' && event.payload && typeof event.payload === 'object'
+        ? String((event.payload as Record<string, unknown>).action) : ''
+      if (item.kind === 'browser' && ['navigate', 'reload', 'back', 'forward', 'stop'].includes(action)) {
+        this.trackBrowserNavigation(item, result)
+      } else await result
     }, item)
   }
 
@@ -193,7 +204,10 @@ export class WorkbenchRuntimeManager {
     if (!this.isCurrentDescriptor(item)) return
     this.enqueue(item.id, async () => {
       const runtime = await this.ensureRuntime(item)
-      await runtime?.performAction?.(actionId, item)
+      const result = runtime?.performAction?.(actionId, item)
+      if (item.kind === 'browser' && ['reload', 'stop'].includes(actionId)) {
+        this.trackBrowserNavigation(item, result)
+      } else await result
     }, item)
   }
 
@@ -202,11 +216,15 @@ export class WorkbenchRuntimeManager {
   }
 
   async flush(itemId?: string): Promise<void> {
-    if (itemId) {
-      await this.queues.get(itemId)
-      return
+    // Navigation may emit more lifecycle/state work while it settles. Include
+    // both queues without making stop/loading/close wait for a page response.
+    while (true) {
+      const pending = itemId
+        ? [this.queues.get(itemId), ...(this.browserNavigations.get(itemId) ?? [])].filter(Boolean)
+        : [...this.queues.values(), ...[...this.browserNavigations.values()].flatMap(tasks => [...tasks])]
+      if (!pending.length) return
+      await Promise.all(pending)
     }
-    await Promise.all([...this.queues.values()])
   }
 
   /** Ask the live panel to persist pending work before its store item is removed. */
@@ -231,9 +249,12 @@ export class WorkbenchRuntimeManager {
     for (const item of this.items.values()) this.hideNativeSurfaceImmediately(item)
     this.openItemIds.clear()
     this.resumedItemIds.clear()
-    await this.flush()
+    // Destroy pages before waiting for navigation: disposal cancels native
+    // loads, including requests that would otherwise hold shutdown open.
+    await Promise.all([...this.queues.values()])
     const ids = [...this.runtimes.keys()]
     for (const id of ids) await this.disposeRuntime(id, reason)
+    await this.flush()
     this.items.clear()
     this.itemEpochs.clear()
     this.surfaceRects.clear()
@@ -242,6 +263,19 @@ export class WorkbenchRuntimeManager {
 
   hasRuntime(itemId: string): boolean {
     return this.runtimes.has(itemId)
+  }
+
+  private trackBrowserNavigation(item: WorkbenchItem, result: void | Promise<void>) {
+    if (!result) return
+    const tasks = this.browserNavigations.get(item.id) ?? new Set<Promise<void>>()
+    this.browserNavigations.set(item.id, tasks)
+    const task = result.catch(error => this.reportError(error, item)).finally(() => {
+      tasks.delete(task)
+      if (!tasks.size && this.browserNavigations.get(item.id) === tasks) {
+        this.browserNavigations.delete(item.id)
+      }
+    })
+    tasks.add(task)
   }
 
   private enqueue(itemId: string, task: () => Promise<void>, item: WorkbenchItem) {
@@ -331,6 +365,10 @@ export class WorkbenchRuntimeManager {
     const isCurrent = () =>
       this.openItemIds.has(item.id)
       && this.itemEpochs.get(item.id) === runtimeEpoch
+    const mayDestroy = () => {
+      const currentEpoch = this.itemEpochs.get(item.id)
+      return currentEpoch === undefined || currentEpoch === runtimeEpoch
+    }
     const mayShow = () =>
       isCurrent()
       && this.resumedItemIds.has(item.id)
@@ -431,7 +469,9 @@ export class WorkbenchRuntimeManager {
         if (!isCurrent()) return ignored()
         const result = await nativeApi.createSurface(request)
         if (!isCurrent()) {
-          await nativeApi.destroySurface(request.surfaceId)
+          // Replacement creation owns this native id now. Its create path
+          // replaces the old surface; stale cleanup must not close the new one.
+          if (mayDestroy()) await nativeApi.destroySurface(request.surfaceId)
           return ignored()
         }
         if (!mayShow()) {
@@ -457,7 +497,9 @@ export class WorkbenchRuntimeManager {
         if (!mayShow()) return ignored()
         return nativeApi.activateSurface(surfaceId)
       },
-      destroySurface: surfaceId => nativeApi.destroySurface(surfaceId),
+      destroySurface: surfaceId => mayDestroy()
+        ? nativeApi.destroySurface(surfaceId)
+        : Promise.resolve(ignored()),
       ...(nativeApi.navigateSurface
         ? {
             async navigateSurface(request) {

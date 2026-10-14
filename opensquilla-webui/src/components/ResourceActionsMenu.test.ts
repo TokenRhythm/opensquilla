@@ -27,18 +27,18 @@ const info = { documentId: 'doc_one', pagePath: 'editorial.html', sourcePath: '/
 const markdown = { source: 'publish_artifact', id: 'notes', name: 'notes.md', mime: 'text/markdown' }
 const apps: App[] = []
 async function settle() { for (let i = 0; i < 12; i++) await nextTick() }
-async function mount(artifact: ArtifactPayload = source, previewable = true, requireSameOrigin = false) {
+async function mount(artifact: ArtifactPayload = source, previewable = true, requireSameOrigin = false, compact = false) {
   const content = { workingFileMetadata: vi.fn().mockResolvedValue(info),
     fetchWorkingFile: vi.fn().mockResolvedValue(new Blob(['<h1>current</h1>'], { type: 'text/html' })),
     fetchArtifact: vi.fn().mockResolvedValue({ ok: true, blob: new Blob(['old version'], { type: 'text/plain' }) }),
     exportHtmlBundle: vi.fn().mockResolvedValue({ blob: new Blob(['zip bytes'], { type: 'application/zip' }), filename: 'webpage.zip' }),
   }
   const access = reactive({ subscriptionEpoch: 1 })
-  const props = reactive({ artifact, sessionKey: 'agent:main:webchat:one', trigger: true, previewable, requireSameOrigin })
-  const onOpen = vi.fn()
+  const props = reactive({ artifact, sessionKey: 'agent:main:webchat:one', trigger: true, previewable, requireSameOrigin, compact, downloadAction: undefined as string | undefined, extraActions: compact ? [{ id: 'close', label: 'Close tab', separator: true }] : [] })
+  const onOpen = vi.fn(), onAction = vi.fn()
   const host = document.createElement('div')
   document.body.appendChild(host)
-  const app = createApp({ render: () => h(ResourceActionsMenu, { ...props, onOpen }) })
+  const app = createApp({ render: () => h(ResourceActionsMenu, { ...props, onOpen, onAction }) })
   app.use(i18n)
   app.provide(ARTIFACT_WORKBENCH_KEY, { content } as never)
   app.provide(GATEWAY_ACCESS_KEY, access as never)
@@ -47,7 +47,7 @@ async function mount(artifact: ArtifactPayload = source, previewable = true, req
   await nextTick()
   const trigger = host.querySelector('button')!
   const open = async () => { trigger.click(); await settle() }
-  return { content, access, props, onOpen, trigger, open }
+  return { content, access, props, onOpen, onAction, trigger, open }
 }
 function item(key: string) {
   const label = i18n.global.t(key)
@@ -68,6 +68,20 @@ afterEach(() => {
 })
 
 describe('shared resource actions', () => {
+  it('retains a compact panel download when its optional working source is unavailable', async () => {
+    const f = await mount(source, false, false, true)
+    f.props.downloadAction = 'panel:download'
+    f.content.workingFileMetadata.mockRejectedValue(new Error('source unavailable'))
+    await f.open()
+    expect(item('chat.download')).toBeDefined()
+    expect(document.querySelector('[role="menu"]')?.textContent).not.toContain(i18n.global.t('resourceActions.unavailable'))
+    item('chat.download')!.click()
+    await settle()
+    expect(f.onAction).toHaveBeenCalledExactlyOnceWith('panel:download')
+    expect(f.content.fetchWorkingFile).not.toHaveBeenCalled()
+    expect(f.content.fetchArtifact).not.toHaveBeenCalled()
+    expect(mocks.toast).not.toHaveBeenCalled()
+  })
   it('exports the selected document revision to a local desktop ZIP without invoking an opener', async () => {
     mocks.platform.id = 'desktop'
     const saveArtifact = vi.fn().mockResolvedValue({ status: 'saved' })
@@ -373,5 +387,44 @@ describe('shared resource actions', () => {
     await nextTick()
     expect(document.activeElement).toBe(f.trigger)
     expect(f.onOpen).not.toHaveBeenCalled()
+  })
+})
+
+
+describe('compact workbench tab actions', () => {
+  it('keeps only download and tab actions on Web, and downloads the exact targeted file', async () => {
+    const f = await mount(markdown, false, false, true)
+    await f.open()
+    expect([...document.querySelectorAll('[role="menuitem"]')].map(el => el.textContent?.trim())).toEqual([i18n.global.t('chat.download'), 'Close tab'])
+    item('chat.download')!.click(); await settle()
+    expect(f.content.fetchArtifact).toHaveBeenCalledWith(markdown, expect.objectContaining({ sessionKey: f.props.sessionKey }))
+    expect(mocks.download).toHaveBeenCalledWith(expect.any(Blob), 'notes.md')
+    expect(f.content.workingFileMetadata).not.toHaveBeenCalled()
+  })
+  it.each([true, false])('reveals original files only with an owned ready local Gateway (owned=%s)', async owned => {
+    mocks.platform.id = 'desktop'
+    const sourceFileAction = vi.fn().mockResolvedValue({ ok: true })
+    mocks.platform.files = { sourceFileAction }
+    mocks.platform.gateway.getStatus.mockResolvedValue({ owned, status: 'ready' })
+    const f = await mount(source, false, false, true); await f.open()
+    const reveal = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(el => /Finder|Explorer|file manager/i.test(el.textContent || ''))
+    expect(Boolean(reveal)).toBe(owned)
+    expect(item('resourceActions.openSource')).toBeUndefined()
+    expect(item('resourceActions.downloadZip')).toBeUndefined()
+    if (owned) {
+      reveal!.click(); await settle()
+      expect(sourceFileAction).toHaveBeenCalledWith(expect.objectContaining({ documentId: 'doc_one', pagePath: 'editorial.html', action: 'reveal', gatewayInstanceId: 'owned-one' }))
+    }
+  })
+  it('opens collection/browser actions without borrowing a file from another tab', async () => {
+    const f = await mount(markdown, false, false, true)
+    f.props.artifact = undefined as unknown as ArtifactPayload
+    await nextTick(); await f.open()
+    expect(document.querySelectorAll('[role="menuitem"]')).toHaveLength(1)
+    expect(document.querySelector('[role="menuitem"]')?.textContent).toBe('Close tab')
+    ;(document.querySelector('[role="menuitem"]') as HTMLButtonElement).click(); await settle()
+    expect(f.onAction).toHaveBeenCalledWith('close')
+    expect(f.content.fetchArtifact).not.toHaveBeenCalled(); expect(f.content.workingFileMetadata).not.toHaveBeenCalled()
+    expect(document.querySelector('[role="menu"]')).toBeNull()
   })
 })

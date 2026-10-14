@@ -58,7 +58,6 @@ import SidebarSessionHoverCard, {
 } from './SidebarSessionHoverCard.vue'
 import { useConfirm } from '@/composables/useConfirm'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
-import { usePlatform } from '@/platform'
 import { useSidebarVirtualizer } from '@/composables/useSidebarVirtualizer'
 import { shouldShowAgentFilterBadge } from '@/utils/sidebarConversations'
 import { buildSidebarTaskHierarchy } from '@/utils/sidebarTaskHierarchy'
@@ -92,14 +91,13 @@ const props = withDefaults(defineProps<{
   canCreateProjects: false,
 })
 
-const isDesktop = usePlatform().capabilities.isDesktop
-
 const emit = defineEmits<{
   (e: 'select', key: string): void
   (e: 'refresh'): void
   (e: 'load-more'): void
   (e: 'rename', payload: { key: string; title: string }): void
   (e: 'delete', key: string): void
+  (e: 'copy-session-link', key: string): void
   (e: 'bulk-delete', keys: string[]): void
   (e: 'reorder', payload: { draggedKey: string; targetKey: string; position: 'before' | 'after' }): void
   (e: 'session-pin', payload: { key: string; pinned: boolean }): void
@@ -783,8 +781,21 @@ function canOpenSessionMenu(row: SidebarDisplayRow): boolean {
 
 function focusOpenMenu() {
   nextTick(() => {
-    const items = openMenuEl.value?.querySelectorAll<HTMLElement>('.sidebar-row-menu__item')
+    const menu = openMenuEl.value
+    const items = menu?.querySelectorAll<HTMLElement>('.sidebar-row-menu__item')
     items?.[0]?.focus()
+    if (!menu) return
+    const rect = menu.getBoundingClientRect()
+    if (!rect.width || !rect.height) return
+    const edge = 8
+    // Localized labels and optional reorder actions change the measured size.
+    // Clamp the actual menu rather than relying on the opening estimate alone.
+    menuStyle.value = {
+      position: 'fixed',
+      left: `${Math.max(edge, Math.min(rect.left, window.innerWidth - rect.width - edge))}px`,
+      top: `${Math.max(edge, Math.min(rect.top, window.innerHeight - rect.height - edge))}px`,
+      transform: 'none',
+    }
   })
 }
 
@@ -819,9 +830,9 @@ function toggleMenu(key: string, event?: Event) {
 }
 
 function openSessionContextMenu(row: SidebarDisplayRow, event: MouseEvent) {
-  // Keep the browser's native context menu on the web build. The desktop shell
-  // owns right-click behavior and reuses the same actions as the row's ⋯ menu.
-  if (!isDesktop || !canOpenSessionMenu(row)) return
+  // Only session rows own this context menu; the rest of WebUI keeps the
+  // browser's native menu. Desktop and WebUI expose the same row actions.
+  if (!canOpenSessionMenu(row)) return
   event.preventDefault()
   event.stopPropagation()
   closeSessionPreview()
@@ -841,6 +852,22 @@ function openSessionContextMenu(row: SidebarDisplayRow, event: MouseEvent) {
   focusOpenMenu()
 }
 
+function onSessionKeydown(row: SidebarDisplayRow, event: KeyboardEvent) {
+  if (!canOpenSessionMenu(row)) return
+  if (event.key !== 'ContextMenu' && !(event.key === 'F10' && event.shiftKey)) return
+  event.preventDefault()
+  event.stopPropagation()
+  closeSessionPreview()
+  toggleMenu(row.key, event)
+}
+
+function copySessionLink(row: SidebarDisplayRow) {
+  closeMenu()
+  emit('copy-session-link', row.key)
+  restoreRowFocus(row.key)
+  void nextTick(closeSessionPreview)
+}
+
 function closeMenu() {
   openMenuKey.value = ''
   openMenuEl.value = null
@@ -851,34 +878,63 @@ const sessionPreview = ref<{
   row: SidebarDisplayRow
   position: { left: string; top: string }
 } | null>(null)
+let sessionPreviewTimer: ReturnType<typeof setTimeout> | undefined
+let sessionPreviewDismissTimer: ReturnType<typeof setTimeout> | undefined
+
+function canPreviewSession(row: SidebarDisplayRow): boolean {
+  return row.rowKind === 'session'
+    && !selectionMode.value
+    && !draggedRowKey.value
+    && !openMenuKey.value
+    && renamingKey.value !== row.key
+    && canShowSessionPreview(window.innerWidth)
+}
 
 function openSessionPreview(row: SidebarDisplayRow, event: Event) {
-  if (
-    row.rowKind !== 'session'
-    || selectionMode.value
-    || draggedRowKey.value
-    || openMenuKey.value
-    || renamingKey.value === row.key
-  ) return
-  // On narrow/mobile layouts the sidebar fills the viewport. A fixed preview
-  // would cover neighboring rows and make the list hard to operate.
-  if (!canShowSessionPreview(window.innerWidth)) {
-    closeSessionPreview()
-    return
-  }
+  keepSessionPreview()
+  if (sessionPreview.value?.row.key === row.key) return
+  closeSessionPreview()
+  if (!canPreviewSession(row)) return
   const anchor = event.currentTarget
   if (!(anchor instanceof HTMLElement)) return
-  sessionPreview.value = {
-    row,
-    position: sessionPreviewPosition(
-      anchor.getBoundingClientRect(),
-      { width: window.innerWidth, height: window.innerHeight },
-    ),
-  }
+  sessionPreviewTimer = setTimeout(() => {
+    sessionPreviewTimer = undefined
+    const current = findSessionRow(row.key)
+    if (!anchor.isConnected || !current || !canPreviewSession(current)) return
+    sessionPreview.value = {
+      row: current,
+      position: sessionPreviewPosition(
+        anchor.getBoundingClientRect(),
+        { width: window.innerWidth, height: window.innerHeight },
+      ),
+    }
+  }, 400)
+}
+
+function keepSessionPreview() {
+  if (sessionPreviewDismissTimer) clearTimeout(sessionPreviewDismissTimer)
+  sessionPreviewDismissTimer = undefined
+}
+
+function scheduleSessionPreviewClose() {
+  if (sessionPreviewTimer) clearTimeout(sessionPreviewTimer)
+  sessionPreviewTimer = undefined
+  keepSessionPreview()
+  sessionPreviewDismissTimer = setTimeout(closeSessionPreview, 130)
 }
 
 function closeSessionPreview() {
+  if (sessionPreviewTimer) clearTimeout(sessionPreviewTimer)
+  sessionPreviewTimer = undefined
+  keepSessionPreview()
   sessionPreview.value = null
+}
+
+function sessionPreviewStatus(row: SidebarDisplayRow): string {
+  // "Idle" is not evidence of successful completion. Only expose a status
+  // already supplied by the directory or the existing task-attention state.
+  return taskAttentionLabel(row.taskAttention)
+    || (row.runStatus && row.runStatus !== 'idle' ? row.runLabel : '')
 }
 
 function onSessionFocusOut(event: FocusEvent) {
@@ -889,12 +945,31 @@ function onSessionFocusOut(event: FocusEvent) {
 }
 
 watch([selectionMode, openMenuKey], closeSessionPreview)
-useDocumentEvent('scroll', closeSessionPreview, true)
+watch(displayProjection, () => {
+  if (!sessionPreview.value) return
+  const row = findSessionRow(sessionPreview.value.row.key)
+  if (row) sessionPreview.value = { ...sessionPreview.value, row }
+  else closeSessionPreview()
+})
+useDocumentEvent('scroll', (event) => {
+  if (event.target instanceof Element && event.target.closest('.sidebar-session-preview')) return
+  closeSessionPreview()
+}, true)
+useDocumentEvent('keydown', (event) => {
+  if (event.key !== 'Escape' || (!sessionPreview.value && !sessionPreviewTimer)) return
+  event.preventDefault()
+  closeSessionPreview()
+})
 onMounted(() => {
   window.addEventListener('resize', closeSessionPreview)
+  window.addEventListener('blur', closeSessionPreview)
   void nextTick(maybeLoadMore)
 })
-onUnmounted(() => window.removeEventListener('resize', closeSessionPreview))
+onUnmounted(() => {
+  window.removeEventListener('resize', closeSessionPreview)
+  window.removeEventListener('blur', closeSessionPreview)
+  closeSessionPreview()
+})
 watch(
   [displayBlocks, () => props.hasMore, () => props.loadingMore],
   () => nextTick(maybeLoadMore),
@@ -909,10 +984,13 @@ function onMenuKeydown(e: KeyboardEvent) {
     const trigger = menuTriggerEl.value
     focusedItemKey.value = `row:${openMenuKey.value}`
     closeMenu()
-    nextTick(() => trigger?.focus())
+    nextTick(() => {
+      trigger?.focus()
+      closeSessionPreview()
+    })
     return
   }
-  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
+  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return
   const items = Array.from(
     openMenuEl.value?.querySelectorAll<HTMLElement>('.sidebar-row-menu__item') ?? [],
   )
@@ -920,7 +998,8 @@ function onMenuKeydown(e: KeyboardEvent) {
   e.preventDefault()
   const current = items.indexOf(document.activeElement as HTMLElement)
   const delta = e.key === 'ArrowDown' ? 1 : -1
-  const next = (current + delta + items.length) % items.length
+  const next = e.key === 'Home' ? 0 : e.key === 'End' ? items.length - 1
+    : (current + delta + items.length) % items.length
   items[next]?.focus()
 }
 
@@ -1357,7 +1436,7 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
                 :style="{ '--row-depth': row.depth }"
                 @pointerdown="onRowPointerDown(row, $event)"
                 @mouseenter="openSessionPreview(row, $event)"
-                @mouseleave="closeSessionPreview"
+                @mouseleave="scheduleSessionPreviewClose"
                 @focusin="openSessionPreview(row, $event)"
                 @focusout="onSessionFocusOut"
               >
@@ -1478,6 +1557,7 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
                   :aria-describedby="sessionPreview?.row.key === row.key ? 'sidebar-session-preview' : undefined"
                   @click="onSelectRow(row, $event)"
                   @contextmenu="openSessionContextMenu(row, $event)"
+                  @keydown="onSessionKeydown(row, $event)"
                 >
                   <span
                     v-if="selectionMode && !row.provisional"
@@ -1667,6 +1747,16 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
                     </button>
                     <button
                       type="button"
+                      class="sidebar-row-menu__item"
+                      role="menuitem"
+                      data-session-action="copy-link"
+                      @click.stop="copySessionLink(row)"
+                    >
+                      <Icon name="copy" :size="14" />
+                      <span>{{ t('chat.copySessionLink') }}</span>
+                    </button>
+                    <button
+                      type="button"
                       class="sidebar-row-menu__item sidebar-row-menu__item--danger"
                       role="menuitem"
                       @click.stop="requestDelete(row)"
@@ -1728,13 +1818,22 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
         :title="sessionPreview.row.title"
         :updated-at="sessionPreview.row.updatedAt"
         :project-name="sessionPreview.row.displayProjectName"
+        :status="sessionPreviewStatus(sessionPreview.row)"
         :position="sessionPreview.position"
+        @mouseenter="keepSessionPreview"
+        @mouseleave="scheduleSessionPreviewClose"
       />
     </Teleport>
   </div>
 </template>
 
 <style scoped>
+.sidebar-row-menu {
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+}
+
 .sidebar-history-list {
   padding-top: 0;
 }
