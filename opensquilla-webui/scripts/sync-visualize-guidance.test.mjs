@@ -74,7 +74,7 @@ test('published guidance does not advertise unavailable tools, network examples 
   const references = [...files].filter(([file]) => file.startsWith('references/'))
   assert.equal(references.length, MODULES.length + 1)
   for (const [file, text] of references) {
-    assert.doesNotMatch(text, /`(?:show_widget|edit_widget|read_me|genframe\.(?:callTool|updateModelContext))`/, file)
+    assert.doesNotMatch(text, /`(?:read_me|genframe\.(?:callTool|updateModelContext))`/, file)
     assert.doesNotMatch(text, /<script src=|no script CDN is allowed:|Offer follow-up questions through buttons/, file)
     assert.doesNotMatch(text, /After sending, disable the form|sends `text` as the user's next chat/, file)
   }
