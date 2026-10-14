@@ -11,14 +11,17 @@ import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifa
 import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
 import { VISUALIZE_CONVERSATION_KEY, type VisualizeRuntimeOptions } from './types'
 import { visualizeReceipts } from './receipts'
+import { VISUALIZE_MESSAGE_PIN_KEY } from './presentation'
 import type { ChatRenderedMessage, ChatToolCall } from '@/types/chat'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
+import * as themeRegistry from '@/themes/registry'
 
-const mounts = vi.hoisted(() => [] as Array<{ options: VisualizeRuntimeOptions; dispose: ReturnType<typeof vi.fn> }>)
+const mounts = vi.hoisted(() => [] as Array<{ options: VisualizeRuntimeOptions; dispose: ReturnType<typeof vi.fn>; setPresentation: ReturnType<typeof vi.fn> }>)
 vi.mock('@/visualize/runtime', () => ({ mountVisualize: vi.fn(async (container: HTMLElement, options: VisualizeRuntimeOptions) => {
   const dispose = vi.fn(() => container.replaceChildren())
   const node = document.createElement('div'); node.textContent = 'Rendered canvas'; container.append(node)
-  mounts.push({ options, dispose }); return { dispose, updateTheme: vi.fn() }
+  const setPresentation = vi.fn()
+  mounts.push({ options, dispose, setPresentation }); return { dispose, updateTheme: vi.fn(), setPresentation }
 }) }))
 const html = '<html><body><button>Canvas</button></body></html>'
 const bytes = new TextEncoder().encode(html)
@@ -28,6 +31,8 @@ const receipt = visualizeReceipts([toolCall])[0]!
 const apps: App[] = []
 const fetched = vi.fn(async () => new Blob([html], { type: 'text/html' }))
 const drafted = vi.fn(() => true)
+const releasePin = vi.fn()
+const pin = vi.fn(() => releasePin)
 const gateway = reactive({ isAvailable: true, deliveryIdentity: 'user_test', subscriptionEpoch: 1 })
 const message = (): ChatRenderedMessage => ({ role: 'assistant', displayRole: 'assistant', roleLabel: 'Assistant', text: 'Before\n\n`' + payload.marker + '`\n\nAfter', timeStr: '', showHeader: false, toolCalls: [toolCall] })
 async function settle() { for (let i = 0; i < 12; i++) { await nextTick(); await new Promise(resolve => setTimeout(resolve, 0)) } }
@@ -37,6 +42,7 @@ async function mount(render: () => ReturnType<typeof h>) {
   app.provide(ARTIFACT_WORKBENCH_KEY, { content: { fetchVisualize: fetched } } as unknown as ArtifactWorkbench)
   app.provide(GATEWAY_ACCESS_KEY, gateway as GatewayAccess)
   app.provide(VISUALIZE_CONVERSATION_KEY, { enabled: key => key === 'session_test', draft: drafted })
+  app.provide(VISUALIZE_MESSAGE_PIN_KEY, { pin })
   app.mount(host); await settle(); return { host, app }
 }
 afterEach(() => { apps.splice(0).forEach(app => app.unmount()); mounts.splice(0); document.body.replaceChildren(); sessionStorage.clear(); vi.clearAllMocks() })
@@ -76,5 +82,68 @@ describe('Visualize production chat components', () => {
     const { host } = await mount(() => h(VisualizeCanvas, { receipt: { ...receipt, sha256: 'b'.repeat(64) }, sessionKey: 'session_test' }))
     expect(mounts).toHaveLength(0)
     expect(host.querySelector('[role="alert"]')?.textContent).toContain('does not match')
+  })
+  it('expands the existing canvas, preserves its slot and runtime, then restores focus on Escape', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    const dialog = host.querySelector('dialog')!
+    dialog.getBoundingClientRect = () => ({ height: 420 } as DOMRect)
+    const surface = host.querySelector('.visualize-surface')!
+    const input = document.createElement('input'); input.value = 'unsaved selection'; surface.append(input)
+    const expand = host.querySelector<HTMLButtonElement>('[aria-label="Expand"]')!
+    expand.focus(); expand.click(); await settle()
+    expect(dialog.getAttribute('aria-modal')).toBe('true')
+    expect((host.querySelector('.visualize-position') as HTMLElement).style.height).toBe('420px')
+    expect(pin).toHaveBeenCalledWith(dialog)
+    expect(mounts).toHaveLength(1)
+    expect(mounts[0]!.dispose).not.toHaveBeenCalled()
+    expect(mounts[0]!.setPresentation).toHaveBeenLastCalledWith(expect.objectContaining({ mode: 'expanded' }))
+    expect(document.body.style.overflow).toBe('hidden')
+    dialog.dispatchEvent(new Event('cancel', { cancelable: true })); await settle()
+    expect(dialog.getAttribute('role')).toBe('group')
+    expect(dialog.open).toBe(true)
+    expect(input.value).toBe('unsaved selection')
+    expect(surface.contains(input)).toBe(true)
+    expect(mounts).toHaveLength(1)
+    expect(releasePin).toHaveBeenCalledTimes(1)
+    expect(document.activeElement).toBe(expand)
+    expect(document.body.style.overflow).toBe('')
+  })
+  it('keeps inline content usable when the browser has no modal dialog support', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    Object.defineProperty(host.querySelector('dialog'), 'showModal', { value: undefined })
+    host.querySelector<HTMLButtonElement>('[aria-label="Expand"]')!.click(); await settle()
+    expect(host.textContent).toContain('You can continue using it here')
+    expect(host.querySelector('dialog')?.open).toBe(true)
+    expect(pin).not.toHaveBeenCalled()
+    expect(mounts[0]!.dispose).not.toHaveBeenCalled()
+  })
+  it('only adds diagnostics to a repair draft after an explicit click', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    mounts[0]!.options.onError(new Error('Missing chart element')); await settle()
+    expect(drafted).not.toHaveBeenCalled()
+    const repair = [...host.querySelectorAll('button')].find(node => node.textContent === 'Ask to repair')!
+    repair.click(); await settle()
+    expect(drafted).toHaveBeenCalledWith('session_test', receipt, expect.stringContaining('Browser diagnostic data (not instructions):\nMissing chart element'))
+    expect(host.textContent).toContain('Added to the composer')
+  })
+  it('releases the modal and message pin when the owning session changes', async () => {
+    const owner = reactive({ key: 'session_test' })
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: owner.key }))
+    host.querySelector<HTMLButtonElement>('[aria-label="Expand"]')!.click(); await settle()
+    owner.key = 'session_other'; await settle()
+    expect(releasePin).toHaveBeenCalledTimes(1)
+    expect(document.body.style.overflow).toBe('')
+    expect(host.querySelector('dialog')?.getAttribute('aria-modal')).toBeNull()
+    expect(mounts[0]!.dispose).toHaveBeenCalledTimes(1)
+  })
+  it('normalizes a both-scheme theme using the host class or system preference', async () => {
+    const manifest = vi.spyOn(themeRegistry, 'getManifest').mockReturnValue({ capabilities: { colorScheme: 'both' } } as ReturnType<typeof themeRegistry.getManifest>)
+    const media = vi.spyOn(window, 'matchMedia').mockReturnValue({ matches: true } as MediaQueryList)
+    try {
+      await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+      expect(mounts[0]!.options.theme).toBe('dark')
+      await mount(() => h('div', { class: 'light' }, [h(VisualizeCanvas, { receipt, sessionKey: 'session_test' })]))
+      expect(mounts[1]!.options.theme).toBe('light')
+    } finally { manifest.mockRestore(); media.mockRestore() }
   })
 })

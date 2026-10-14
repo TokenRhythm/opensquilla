@@ -1,6 +1,6 @@
 {
   "name": "opensquilla-visualize-a",
-  "version": "0.5.6-visualize-a.1",
+  "version": "0.5.6-visualize-a.2",
   "private": true,
   "description": "Electron desktop shell for the OpenSquilla Control UI.",
   "repository": {

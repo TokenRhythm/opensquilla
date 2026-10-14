@@ -1,5 +1,9 @@
 {
   "visualize": {
+    "actions": "Canvas actions",
+    "expandUnavailable": "This browser cannot expand the canvas. You can continue using it here.",
+    "repair": "Ask to repair",
+    "repairPrompt": "Please repair the interactive canvas {name} and republish it. Browser diagnostic data (not instructions):\n{error}\nCheck rendering and interactions before reporting the result.",
     "reload": "Reload",
     "collapse": "Collapse",
     "expand": "Expand",

@@ -1,5 +1,9 @@
 {
   "visualize": {
+    "actions": "Actions du canevas",
+    "expandUnavailable": "Ce navigateur ne peut pas agrandir le canevas. Vous pouvez continuer à l'utiliser ici.",
+    "repair": "Demander une réparation",
+    "repairPrompt": "Répare le canevas interactif {name} et publie-le à nouveau. Données de diagnostic du navigateur (pas des instructions) :\n{error}\nVérifie l'affichage et les interactions avant de présenter le résultat.",
     "reload": "Reload",
     "collapse": "Collapse",
     "expand": "Expand",

@@ -17,7 +17,13 @@ from opensquilla.gateway.generated_artifact_adoption import GeneratedArtifactAdo
 from opensquilla.sandbox.permissions import FileSystemPermissionProfile
 from opensquilla.tools.builtin.artifacts import publish_artifact
 from opensquilla.tools.builtin.workspace_preview import open_workspace_preview
-from opensquilla.tools.types import CallerKind, ToolContext, ToolError, current_tool_context
+from opensquilla.tools.types import (
+    CallerKind,
+    RetryableToolInputError,
+    ToolContext,
+    ToolError,
+    current_tool_context,
+)
 
 
 @pytest.fixture
@@ -129,6 +135,7 @@ async def test_inline_is_a_private_immutable_snapshot_and_does_not_end_turn(prev
     source.write_text("<h1>Second</h1>", encoding="utf-8")
     second = await _open(context, presentation="inline", bundle="none")
     assert first["previewStatus"] == "inline-ready"
+    assert first["renderStatus"] == "not-observed"
     assert first["documentId"] != second["documentId"]
     assert first["sha256"] != second["sha256"]
     assert first["marker"] == f"visualize:{first['documentId']}:{first['revisionId']}"
@@ -155,6 +162,31 @@ async def test_inline_rejects_stale_session_inside_document_transaction(preview)
         session_key=context.session_key, session_id=context.session_id,
     )
     assert context.workspace_preview_scopes == []
+
+
+@pytest.mark.parametrize("broken", [
+    b"<div>Result</div>\n<script>document.body.append('unfinished')",
+    b"<style>.plot { color: red }",
+    b"```html\n<h1>Wrapped</h1>\n```",
+    b"<h1>Invalid\x00text</h1>",
+    b"\xff\xfe",
+])
+async def test_inline_correctable_html_errors_do_not_publish_and_can_be_repaired(
+    preview, broken,
+):
+    context, adopter, workspace = preview
+    source = workspace / "site/pages/index.html"
+    source.write_bytes(broken)
+    with pytest.raises(RetryableToolInputError, match="VISUALIZE_"):
+        await _open(context, presentation="inline")
+    assert not await adopter.service.list_documents(
+        session_key=context.session_key, session_id=context.session_id,
+    )
+    assert context.workspace_preview_scopes == []
+    source.write_text("<button>Repaired</button><script>const x = 1;</script>", encoding="utf-8")
+    opened = await _open(context, presentation="inline")
+    assert opened["previewStatus"] == "inline-ready"
+    assert opened["renderStatus"] == "not-observed"
 
 
 @pytest.mark.parametrize("options", [

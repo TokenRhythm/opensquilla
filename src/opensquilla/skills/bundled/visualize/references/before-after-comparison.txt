@@ -1,0 +1,27 @@
+Before/after comparison — optional design example
+OpenSquilla original, Apache-2.0. Adapt the idea; this is not a fixed template.
+
+Question: What changes when the same request uses a revised execution flow?
+Show two aligned views driven by one shared step or progress control. Both must
+describe the same input and moment, so the user can see the actual difference.
+For example, at step 2 the old view may mix tool output with answer text while
+the proposed view keeps the answer and execution details distinct.
+
+Define a short event array and derive both views from the selected event index.
+A step button, slider, or play/pause control updates both views and a concise
+explanation of what changed. A detail toggle exposes real additional content.
+If the data is simulated, label it once; do not present it as measured runtime.
+
+State example: { eventIndex: 2, showDetails: false, view: "both" }.
+Persist the index and detail/view selections, not a running timer handle.
+Restore paused at the saved step. Honor prefers-reduced-motion and let users
+step manually. Clamp the restored index to the available event array.
+
+Use a shared heading/legend where possible instead of repeating large titles.
+At desktop width align corresponding rows; at 360 px stack the views or provide
+an accessible before/after switch that preserves the current event index.
+Keep controls outside the regions that change height to avoid accidental jumps.
+
+Check first/last steps, keyboard stepping, pause/reset, and restored selections.
+An optional follow-up action describes the exact step and displayed difference
+in a proposed conversation draft. It must not send the chat automatically.

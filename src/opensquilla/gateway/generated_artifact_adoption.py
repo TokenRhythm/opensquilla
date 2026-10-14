@@ -123,11 +123,13 @@ class GeneratedArtifactAdopter:
             payload = await asyncio.to_thread(
                 _read_regular_bundle_file, entry, max_bytes=1024 * 1024
             )
-            if not payload or len(entry.name) > 250:
+            if len(entry.name) > 250:
                 raise ValueError(
-                    "inline preview requires nonempty HTML and a name <=250 characters"
+                    "inline preview requires a name <=250 characters"
                 )
-            payload.decode("utf-8")
+            from opensquilla.gateway.visualize_html import validate_visualize_html
+
+            await asyncio.to_thread(validate_visualize_html, payload)
             ref = await asyncio.to_thread(
                 self.store.publish_bytes, payload,
                 session_id=self.session_id, session_key=self.session_key,
@@ -156,6 +158,7 @@ class GeneratedArtifactAdopter:
                 "artifactId": ref.id, "name": ref.name, "mime": ref.mime,
                 "sha256": ref.sha256, "size": ref.size,
                 "marker": f"visualize:{document_id}:{revision_id}",
+                "renderStatus": "not-observed",
             }
         async with self.service.repository._read_transaction("workspace.preview.lookup") as conn:
             if self.validate_session is not None:

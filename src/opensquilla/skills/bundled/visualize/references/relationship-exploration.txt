@@ -1,0 +1,33 @@
+Relationship exploration — optional design example
+OpenSquilla original, Apache-2.0. Adapt the idea; this is not a fixed template.
+
+Question: How does a request travel through this codebase?
+Use a small directed SVG graph: request -> routing -> agent -> provider, with
+tools branching from the agent. Label what each edge carries. Ground actual
+module names and relationships in source evidence; mark invented examples as
+illustrative. File counts alone do not explain the architecture.
+
+Put node details beside/below the graph. Clicking or keyboard-activating a node
+highlights its incoming/outgoing edges and updates the detail explanation.
+Clicking a relationship can explain the payload or responsibility it connects.
+A mode switch between dependencies and execution order must change edges and
+their meaning. Do not leave the same graph under different button labels.
+
+State example: { selectedNode: "agent", mode: "request", expanded: ["tools"] }.
+Accept only known node IDs and modes when restoring. Recompute highlight and
+detail content from state; persist selection and expansion after every change.
+Use DOM textContent for names/details rather than inserting arbitrary HTML.
+
+Use viewBox for a scalable SVG and native buttons for accessible node controls.
+On a narrow screen, stack detail under the graph; for a dense graph provide a
+focused subgraph or ordered relationship list instead of shrinking text until
+unreadable. If a list is an alternate view, keep selection synchronized.
+
+One restrained local title and a small selection legend are usually enough.
+Prefer host theme tokens, a transparent canvas, and selected-node contrast to
+many nested cards. Only add zoom/pan when the relationship density warrants it.
+
+An explicit "Explain this path" action should call sendPrompt with the selected
+node and named relationship, through the existing host confirmation/draft flow.
+Check keyboard selection, visible edge updates, reload restoration, and a 360 px
+view. A graph should reveal structure before the user operates any controls.

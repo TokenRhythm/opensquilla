@@ -55,6 +55,40 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## Inline Visualize frame runtime
+
+The Web UI bundles `generative-frame` 0.0.5 and its `safe-content-frame` 0.0.34
+dependency from [assistant-ui](https://github.com/assistant-ui/assistant-ui),
+maintained by AgentbaseAI Inc. Both packages are MIT licensed. Their identical
+license text, reproduced from the installed packages' LICENSE files, follows.
+OpenSquilla owns the Vue host, restricted bridge, Artifact integration and
+Visualize skill. The skill and its examples are original OpenSquilla content;
+they do not incorporate Codex skill text or claim to reproduce Codex internals.
+
+```text
+MIT License
+
+Copyright (c) 2026 AgentbaseAI Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## Markdown diagrams and rich rendering
 
 The Web UI dynamically bundles [Mermaid](https://github.com/mermaid-js/mermaid)
