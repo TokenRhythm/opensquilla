@@ -582,6 +582,22 @@ for _provider_spec in [
         failure_family="anthropic",
         auth_header_style="bearer",
     ),
+    # Self-hosted new-api gateway (github.com/QuantumNous/new-api) or any
+    # OpenAI-compatible aggregator reproducing its stream epilogue: a
+    # ``usage: null`` no-op choice frame after the terminal, and a choices-less
+    # usage trailer carrying billing/trace metadata. Own dialect kind so the
+    # generic `custom` provider keeps the strict OpenAI contract unchanged.
+    # Env NEW_API_KEY; the endpoint default is the gateway's stock Docker port.
+    _spec(
+        "newapi",
+        "openai_compat",
+        "newapi",
+        "NEW_API_KEY",
+        "http://127.0.0.1:3000/v1",
+        required_fields=frozenset({"model"}),
+        reasoning_shape="deepseek",
+        failure_family="openai_compat",
+    ),
     _spec("vllm", "openai_compat", "openai"),
     _spec("lm_studio", "openai_compat", "lm_studio", default_base_url="http://localhost:1234/v1"),
     _spec("ovms", "openai_compat", "ovms", default_base_url="http://localhost:8000/v3"),

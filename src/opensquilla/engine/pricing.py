@@ -582,7 +582,7 @@ _DEFAULT_PRICING = PriceEntry(3.0, 15.0)
 # pricing table misses the ``ollama/`` free entry and applies the cloud default.
 _LOCAL_FREE_PROVIDERS = frozenset({"ollama", "lm_studio", "ovms", "vllm", "local"})
 
-_CUSTOM_DEFAULT_ZERO_PROVIDERS = frozenset({"custom", "custom_anthropic"})
+_CUSTOM_DEFAULT_ZERO_PROVIDERS = frozenset({"custom", "custom_anthropic", "newapi"})
 
 
 def _lookup_static_price_ex(model_id: str) -> tuple[PriceEntry, bool]:

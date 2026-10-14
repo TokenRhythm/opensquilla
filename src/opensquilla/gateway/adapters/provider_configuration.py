@@ -338,7 +338,7 @@ class GatewayModelCatalogPort:
 
         catalog = shared_catalog()
         identities = {provider: custom_capacity_identity(self._config, provider)
-                      for provider in ("custom", "custom_anthropic")}
+                      for provider in ("custom", "custom_anthropic", "newapi")}
 
         def project(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for provider, identity in identities.items():

@@ -92,6 +92,7 @@ _PROVIDER_LABELS: dict[str, str] = {
     "vllm": "vLLM (self-hosted)",
     "custom": "Custom OpenAI-compatible endpoint",
     "custom_anthropic": "Custom Anthropic-compatible endpoint",
+    "newapi": "new-api gateway (self-hosted)",
     "litellm_proxy": "LiteLLM Proxy",
     "lm_studio": "LM Studio (local)",
     "ovms": "OpenVINO Model Server",

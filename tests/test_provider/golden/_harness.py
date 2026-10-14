@@ -112,6 +112,10 @@ COMPAT_THINKING_MODELS: dict[str, tuple[str, str]] = {
     "lm_studio": (_NEUTRAL_MODEL, "none"),
     "ovms": (_NEUTRAL_MODEL, "none"),
     "litellm_proxy": (_NEUTRAL_MODEL, "none"),
+    # No catalog prefix ladder for the newapi kind; the neutral model resolves
+    # "none" at the capability layer. The registry spec's reasoning_shape
+    # ("deepseek") governs replay handling, not the catalog dialect.
+    "newapi": (_NEUTRAL_MODEL, "none"),
 }
 
 # Synthetic OpenRouter catalog row fed through ModelCatalog's production
