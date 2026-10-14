@@ -8,6 +8,12 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "src" / "opensquilla"
 
 APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
+    # Snapshot retention names ToolContext only under TYPE_CHECKING; runtime
+    # snapshot imports remain independent of the tools package.
+    ("file_snapshot.py", "tools"),
+    # Bounded search shares the frontend-neutral canonical display projection
+    # and flattened-tool cleanup, keeping match offsets aligned with history.
+    ("session", "chat"),
     # Settings owners record opt-in, payload-free timings through a leaf with
     # no OpenSquilla implementation imports; it never changes save semantics.
     ("application", "observability"),

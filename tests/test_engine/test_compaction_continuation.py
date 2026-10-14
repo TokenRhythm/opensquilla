@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -63,8 +64,35 @@ def deterministic_estimation(monkeypatch):
     monkeypatch.setattr(token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE)
 
 
+@pytest.fixture
+async def compaction_retry_delays(monkeypatch):
+    from opensquilla.provider import retry_after
+
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    delays = []
+    real_sleep = asyncio.sleep
+
+    async def sleep(delay):
+        delays.append(delay)
+        now[0] += delay
+        await real_sleep(0)
+
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    monkeypatch.setattr("opensquilla.session.compaction.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("opensquilla.session.compaction.sleep_before_retry", sleep)
+    monkeypatch.setattr("opensquilla.provider.recovery.random.randint", lambda *_args: 0)
+    monkeypatch.setattr(
+        retry_after, "_provider_retry_after_cooldowns",
+        retry_after.ProviderRetryAfterCooldowns(clock=lambda: now[0]),
+    )
+    return delays
+
+
 @pytest.mark.parametrize("failure", ["503", "timeout", "empty", "length", "tool_calls"])
-async def test_twenty_turns_share_failure_circuit_and_recover_from_canonical_history(failure):
+async def test_twenty_turns_share_failure_circuit_and_recover_from_canonical_history(
+    failure, compaction_retry_delays,
+):
     provider = ContinuingProvider(failure)
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=None)
     key = "synthetic-continuation"
@@ -88,7 +116,13 @@ async def test_twenty_turns_share_failure_circuit_and_recover_from_canonical_his
         assert original == before
         assert agent.history_snapshot()[:len(original)] == before
     assert runner._compaction_failures[key].count == 3
-    assert sum(summary for summary, _, _ in provider.calls) == 3
+    # The circuit counts logical summary operations; transient failures
+    # consume four physical attempts inside each of those three operations.
+    attempts_per_operation = 4 if failure in {"503", "timeout"} else 1
+    assert sum(summary for summary, _, _ in provider.calls) == 3 * attempts_per_operation
+    assert compaction_retry_delays == (
+        [1.0, 2.0, 4.0] * 3 if attempts_per_operation == 4 else []
+    )
     main = [(messages, proof) for summary, messages, proof in provider.calls if not summary]
     assert len(main) == 20
     assert all(proof.fits and proof.proof.get("fits", True) for _, proof in main)

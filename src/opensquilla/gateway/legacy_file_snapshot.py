@@ -59,13 +59,13 @@ def _verified_write_payload(replay: dict[str, Any], snapshot: dict[str, Any]) ->
         raise ContentNotFoundError("historical file content unavailable")
     call = calls[0]
     arguments = call.get("input")
+    text = arguments.get("content") if isinstance(arguments, dict) else None
     if (
         call.get("name") != "write_file" or not isinstance(arguments, dict)
         or arguments.get("path") != snapshot["path"]
-        or not isinstance(arguments.get("content"), str)
+        or not isinstance(text, str)
     ):
         raise ContentNotFoundError("historical file content unavailable")
-    text = arguments["content"]
     if len(text) != reference["original_chars"]:
         raise ContentIntegrityError("historical file integrity check failed")
     payload = text.encode("utf-8")
@@ -141,6 +141,8 @@ class LegacyFileSnapshotRecovery:
     ) -> None:
         async with self._limit:
             storage = self._storage
+            if storage is None:
+                raise ContentNotFoundError("historical file content unavailable")
             session = await storage.get_session(session_key)
             if session is None:
                 raise ContentNotFoundError("historical file content unavailable")

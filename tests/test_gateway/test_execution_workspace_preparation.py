@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -376,7 +377,12 @@ def test_allocation_rollback_is_empty_and_identity_scoped(tmp_path: Path, mutati
     elif mutation in {"replacement", "symlink"}:
         root.rename(preserved)
         if mutation == "symlink":
-            root.symlink_to(preserved, target_is_directory=True)
+            try:
+                root.symlink_to(preserved, target_is_directory=True)
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    pytest.skip("Windows symbolic-link privilege is unavailable")
+                raise
         else:
             root.mkdir()
     elif mutation == "parent":

@@ -1825,6 +1825,7 @@ async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    from opensquilla.artifact_session import ArtifactSessionService
     from opensquilla.sandbox.escalation import (
         current_tool_run_context,
         reset_resolved_run_context_overlays,
@@ -1964,6 +1965,10 @@ async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
     object.__setattr__(envelope, "sandbox_run_context_fresh", True)
 
     try:
+        # build_services initializes ArtifactSession before accepting turns.
+        # Match that readiness step before the unchanged stream/wait deadlines.
+        artifact_service = await ArtifactSessionService.from_session_storage(storage)
+        await artifact_service.close()
         first = await runtime.enqueue(envelope, "first")
         await asyncio.wait_for(first_started.wait(), timeout=2.0)
         assert (await runtime.status(first.task_id)).status == "running"

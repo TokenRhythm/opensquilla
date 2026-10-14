@@ -172,7 +172,9 @@ class FileInputDrafts:
                 and tool_id not in self._delegated
                 and len(self._previews.keys() | self._inputs.keys()) < PREVIEW_ACTIVE_TOOL_LIMIT
             ):
-                self._inputs[tool_id] = PartialFileInput(event.tool_name)
+                self._inputs[tool_id] = PartialFileInput(
+                    "write_file" if event.tool_name == "write_file" else "execute_code",
+                )
                 self._epochs[tool_id] = getattr(event, "generation_epoch", None)
             return []
         if isinstance(event, ToolUseDeltaEvent):

@@ -10,8 +10,8 @@ afterEach(() => { while (apps.length) apps.pop()?.unmount(); document.body.inner
 it.each([
   ['C:\\Users\\example\\project\\workspace\\live-preview.html', 'live-preview.html'],
   ['C:\\Users\\example\\project\\live-preview.html', '…/live-preview.html'],
-  ['/home/example/project/workspace/src/page.html', 'src/page.html'],
-  ['/home/example/project/page.html', '…/page.html'],
+  ['/opt/project/workspace/src/page.html', 'src/page.html'],
+  ['/opt/project/page.html', '…/page.html'],
   ['src/pages/page.html', 'src/pages/page.html'],
 ])('shows the existing compact path for %s and retains its full tooltip', (path, label) => {
   const preview: LiveToolInputPreview = {

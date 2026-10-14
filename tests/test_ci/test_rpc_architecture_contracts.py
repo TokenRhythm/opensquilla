@@ -133,8 +133,8 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Retire router learning status and training feedback (two generated methods).
 # Retire the three advanced agent administration methods.
 # Add video-generation model discovery without changing existing method names.
-RUNTIME_RPC_METHOD_BASELINE = 276
-RUNTIME_RPC_METHOD_DIGEST = "bbbdbc03db0735074506ce88b2406082116f560fbd560a04916d988a113df523"
+RUNTIME_RPC_METHOD_BASELINE = 277
+RUNTIME_RPC_METHOD_DIGEST = "29b0b13c082534442371c559806c483c45d16be045f132a304fc328a6512f9ca"
 STATIC_RPC_DECORATOR_BASELINE = 63
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -1418,6 +1418,7 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     assert digest == RUNTIME_RPC_METHOD_DIGEST
 
     for method, scope in (
+        ("sessions.messages.search", "operator.read"),
         ("sessions.processes.list", "operator.read"),
         ("sessions.processes.log", "operator.read"),
         ("sessions.processes.stop", "operator.write"),

@@ -320,11 +320,14 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
     monkeypatch: pytest.MonkeyPatch, tmp_path, failure: str, hard_overflow: bool,
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "prefix")
-    compaction_clock = SimpleNamespace(now=100.0)
+    loop = asyncio.get_running_loop()
+    compaction_clock = SimpleNamespace(now=loop.time())
     active_timeouts: list[asyncio.Timeout] = []
     summary_cancelled = False
     if failure == "timeout":
         from opensquilla.provider import retry_after
+
+        monkeypatch.setattr(loop, "time", lambda: compaction_clock.now)
 
         monkeypatch.setattr(
             retry_after, "_provider_retry_after_cooldowns",
@@ -333,8 +336,8 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
         # Expire the shared deadline after the paid call starts. Preparation
         # speed must not turn this into a different, zero-provider-call case.
         monkeypatch.setattr(
-            "opensquilla.session.compaction.time",
-            SimpleNamespace(monotonic=lambda: compaction_clock.now),
+            "opensquilla.session.compaction.time.monotonic",
+            lambda: compaction_clock.now,
         )
 
         @asynccontextmanager

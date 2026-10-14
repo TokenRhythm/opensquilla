@@ -656,7 +656,12 @@ def test_symlink_guard_matches_lexical_spelling(effect_context, monkeypatch, tmp
     (workspace / "tests").mkdir(exist_ok=True)
     outside = tmp_path / "outside.py"
     outside.write_text("x\n", encoding="utf-8")
-    (workspace / "tests" / "link_test.py").symlink_to(outside)
+    try:
+        (workspace / "tests" / "link_test.py").symlink_to(outside)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
 
     def match():
         return write_policy.match_workspace_write_deny(

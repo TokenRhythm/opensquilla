@@ -14,9 +14,9 @@ import json
 import re
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import nullcontext
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, overload
 
 from opensquilla.chat.flattened_tool_markers import (
     has_flattened_used_tool_line,
@@ -60,6 +60,14 @@ class SearchStore(Protocol):
 
 def _position(row: Mapping[str, Any]) -> tuple[int, int]:
     return int(row["created_at"]), int(row["entry_id"])
+
+
+@overload
+def _decode_position(value: object, *, optional: Literal[False] = False) -> tuple[int, int]: ...
+
+
+@overload
+def _decode_position(value: object, *, optional: Literal[True]) -> tuple[int, int] | None: ...
 
 
 def _decode_position(value: object, *, optional: bool = False) -> tuple[int, int] | None:
@@ -165,7 +173,7 @@ def _entry_bytes(entry: TranscriptEntry) -> int:
     )
 
 
-async def _worker(function: Any, *args: Any) -> Any:
+async def _worker[Result](function: Callable[..., Result], *args: Any) -> Result:
     budget = current_read_budget()
     if budget is not None:
         budget.check()
@@ -295,7 +303,7 @@ async def _advance_coverage(
                         and unchanged
                     )
                     proof["phase"] = "done"
-                    return proof["valid"]
+                    return bool(proof["valid"])
     return False
 
 

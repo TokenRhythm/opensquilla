@@ -149,8 +149,13 @@ assert rpc_chat._turn_admission_adapter_factory is rpc_sessions.build_gateway_tu
 registry = get_dispatcher()
 # Includes durable receipts and execution logs after workflow and agent admin retirement.
 # The v2 recovery contracts and video discovery add seven production methods.
+# Bounded in-conversation search adds sessions.messages.search.
 # Keep the exact count so an unrelated RPC cannot slip into the registry.
-assert len(registry.list_methods()) == 276
+assert len(registry.list_methods()) == 277
+search_entry = registry.get_entry("sessions.messages.search")
+assert search_entry is not None
+assert search_entry.required_scope == "operator.read"
+assert search_entry.generated_contract_name == "sessions.messages.search"
 assert registry.get_entry("onboarding.videoGeneration.models.discover") is not None
 assert registry.get_entry("router.feedback.submit") is None
 assert registry.get_entry("router.selflearning.status") is None

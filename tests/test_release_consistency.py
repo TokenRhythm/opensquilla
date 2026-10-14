@@ -127,10 +127,18 @@ def test_release_workflow_builds_desktop_installers() -> None:
         "INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS = "
         "DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + SEND_TIMEOUT_MS"
     ) in first_send_gate
-    assert (
-        "timeout: INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS" in first_send_gate
-    )
-    initial_connection = first_send_gate.index("timeout: INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS")
+    initial_connection = first_send_gate.index("reportPhase('gateway-readiness-start')")
+    readiness_end = first_send_gate.index("reportPhase('gateway-ready')", initial_connection)
+    readiness = first_send_gate[initial_connection:readiness_end]
+    assert "await waitFor(" in readiness
+    assert "desktop.getGatewayStatus()" in readiness
+    assert "desktop.getGatewayConnection()" in readiness
+    assert "gateway.owned === true" in readiness
+    assert "gateway.status === 'ready'" in readiness
+    assert "connection.status === 'ready'" in readiness
+    assert "INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS," in readiness
+    assert "await page.locator('.chat-textarea').waitFor({ state: 'visible'" in readiness
+    assert ".conn-pill.connected" not in first_send_gate
     probe_install = first_send_gate.index(
         "await page.addInitScript(installBrowserRpcProbe)", initial_connection
     )

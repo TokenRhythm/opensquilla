@@ -77,6 +77,7 @@ from opensquilla.observability.network_policy import (
 from opensquilla.paths import media_root_from_config
 from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.provider.types import (
+    ProviderActivityEvent,
     ProviderRequestCorrelation,
 )
 from opensquilla.session.compaction import (
@@ -417,7 +418,7 @@ class GatewaySessionMaintenancePorts(
             self._context, command.session_key, self._EVENT_NAME, {},
         )
 
-        def on_summary_recovery(activity: object) -> None:
+        def on_summary_recovery(activity: ProviderActivityEvent) -> None:
             from dataclasses import asdict
 
             from opensquilla.gateway.terminal_activity import safe_compaction_recovery

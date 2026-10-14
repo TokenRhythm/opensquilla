@@ -1986,13 +1986,13 @@ class _SelectorPreTextBuffer:
 
     def append(self, event: Any) -> ProviderHeartbeatEvent | None:
         if self._overflowed or self._protocol_error:
-            return
+            return None
         if not self._accept_tool_frame(event):
-            return
+            return None
         if isinstance(event, ProviderReasoningDeltaEvent):
             text = str(event.text or "")
             if not text:
-                return
+                return None
             byte_count = len(text.encode("utf-8"))
             tail = self._entries[-1] if self._entries else None
             if not isinstance(tail, _BufferedReasoningDeltas):
@@ -2003,7 +2003,7 @@ class _SelectorPreTextBuffer:
             self._reasoning_bytes += byte_count
             self._buffered_bytes += byte_count
             self._trim_reasoning_prefix()
-            return
+            return None
         if isinstance(event, ProviderToolUseDeltaEvent):
             fragment = str(event.json_fragment or "")
             byte_count = len(event.tool_use_id.encode("utf-8")) + len(fragment.encode("utf-8"))
@@ -2028,12 +2028,13 @@ class _SelectorPreTextBuffer:
                     upstream_activity=True,
                     generation_epoch=getattr(event, "generation_epoch", None),
                 )
-            return
+            return None
         self._entries.append(event)
         self._buffered_bytes += self._event_buffer_bytes(event)
         self._trim_reasoning_prefix()
         if self._buffered_bytes > self._reasoning_limit_bytes:
             self._mark_overflowed()
+        return None
 
     @staticmethod
     def _trim_text_prefix_bytes(text: str, count: int) -> tuple[str, int]:
@@ -2366,11 +2367,14 @@ class _SelectorFallbackProvider:
         buffer: _SelectorPreTextBuffer,
     ) -> AsyncGenerator[Any, None]:
         """Use the common one-deployment retry owner before selector fallback."""
+        def reset_attempt() -> None:
+            buffer.drain(successful_leg=False)
+
         async for event in retry_provider_stream(
             lambda: preview_file_inputs(stream_factory()),
             provider=provider, model=model, config=config,
             content_started=content_started,
-            reset_attempt=lambda: buffer.drain(successful_leg=False),
+            reset_attempt=reset_attempt,
             max_retries=self._retry_policy.max_retries,
             base_ms=self._retry_policy.base_backoff_ms,
             max_ms=self._retry_policy.max_backoff_ms,

@@ -1541,8 +1541,10 @@ def build_tool_handler(
                         file_snapshot
                         and exception is None
                         and not final_result.is_error
-                        and (final_result.execution_status or {}).get("reason")
-                        != "approval_pending"
+                        and (
+                            final_result.execution_status is None
+                            or final_result.execution_status.get("reason") != "approval_pending"
+                        )
                     ):
                         final_result.file_snapshot = await retain_file_snapshot(
                             file_snapshot, context=effective_ctx,

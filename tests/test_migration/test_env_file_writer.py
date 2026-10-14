@@ -25,7 +25,12 @@ def test_write_secret_env_file_writes_through_symlink(tmp_path: Path) -> None:
     real.parent.mkdir()
     real.write_text("EXISTING_KEY=keep-me\n", encoding="utf-8")
     link = tmp_path / ".env"
-    link.symlink_to(real)
+    try:
+        link.symlink_to(real)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
 
     write_secret_env_file(link, ["EXISTING_KEY=keep-me", "NEW_KEY=synthetic"])
 
@@ -100,7 +105,12 @@ def test_openclaw_migration_preserves_symlinked_env(
 
     real = tmp_path / "dotfiles-env"
     real.write_text("EXISTING_KEY=keep-me\n", encoding="utf-8")
-    (home / ".env").symlink_to(real)
+    try:
+        (home / ".env").symlink_to(real)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
 
     OpenClawMigrator(
         MigrationOptions(

@@ -11449,13 +11449,13 @@ class Agent:
                             connection_failed and retry_failed_call_safe
                             and not getattr(provider_error, "recovery_exhausted", False)
                         ):
-                            delay = recovery_delay_seconds(
+                            connection_retry_delay = recovery_delay_seconds(
                                 kind=ProviderFailureKind.TRANSPORT_TRANSIENT,
                                 attempt=_connection_wait_attempt,
                                 provider_retry_after_s=provider_error.retry_after_s,
                                 connection_failed=True, deadline_at_monotonic=_total_deadline,
                             )
-                            if delay is None:
+                            if connection_retry_delay is None:
                                 yield self._transition(AgentState.ERROR)
                                 terminal_error = ErrorEvent(
                                     message=_safe_provider_terminal_message(
@@ -11474,11 +11474,11 @@ class Agent:
                                 reason="transport_transient",
                                 retry_attempt=_connection_wait_attempt,
                                 retry_limit=0,
-                                retry_after_ms=math.ceil(delay * 1000),
+                                retry_after_ms=math.ceil(connection_retry_delay * 1000),
                                 started_at=time.time_ns() // 1_000_000,
                             )
                             async with asyncio.timeout_at(_total_deadline):
-                                await sleep_before_retry(delay)
+                                await sleep_before_retry(connection_retry_delay)
                             next_provider_activity_reason = "transport_transient"
                             yield ProviderActivityEvent(
                                 activity_id=provider_activity_id,

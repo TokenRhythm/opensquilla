@@ -212,6 +212,7 @@ def test_anthropic_400_on_document_block_surfaces_actionable_error(
 
     class _StubResponse:
         status_code = 400
+        text = error_body
 
         async def aread(self) -> bytes:
             return error_body.encode()
@@ -265,6 +266,10 @@ def test_anthropic_400_on_document_block_surfaces_actionable_error(
     error_events = [e for e in events if isinstance(e, ErrorEvent)]
     assert error_events, f"expected ErrorEvent in {events!r}"
     err = error_events[0]
+    assert len(error_events) == 1
     assert err.code == "400"
+    assert err.http_status == 400
+    assert err.provider_code == "invalid_request_error"
+    assert err.retry_after_s is None
     assert "document block malformed" in err.message
-    assert "400" in captured["counter_calls"], captured["counter_calls"]
+    assert captured["counter_calls"] == ["400"]

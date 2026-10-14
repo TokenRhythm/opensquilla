@@ -3543,13 +3543,17 @@ async def test_compact_with_result_summarizes_completed_tool_round(manager):
         "agent:main:main",
         "assistant",
         "Next I will run uv run pytest tests/test_session/test_manager.py.",
-        tool_calls=[{"id": "call_exec_1", "type": "function"}],
+        tool_calls=[{
+            "id": "call_exec_1", "name": "exec_command",
+            "arguments": {"command": "uv run pytest tests/test_session/test_manager.py"},
+        }],
         token_count=250,
     )
     await manager.append_message(
         "agent:main:main",
         "tool",
         (
+            "exit_code=1\n"
             "Command failed: uv run pytest tests/test_session/test_manager.py\n"
             "Exit code 1\n"
             "Error: missing summary_payload column"

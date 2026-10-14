@@ -1704,7 +1704,12 @@ def test_remove_never_follows_component_package_symlink(tmp_path: Path) -> None:
     sentinel = external / "keep.txt"
     sentinel.write_text("keep\n", encoding="utf-8")
     component_root = service.root / "packages" / "python"
-    component_root.symlink_to(external, target_is_directory=True)
+    try:
+        component_root.symlink_to(external, target_is_directory=True)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
 
     removal = service.remove("python")
     assert service.wait_for_operation(removal.operation_id).state is (
@@ -1723,7 +1728,12 @@ def test_active_runtime_rejects_symlinked_package_ancestor(tmp_path: Path) -> No
     component_root = service.root / "packages" / "python"
     relocated = service.root / "trash" / "relocated-python"
     component_root.rename(relocated)
-    component_root.symlink_to(relocated, target_is_directory=True)
+    try:
+        component_root.symlink_to(relocated, target_is_directory=True)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
     service.invalidate_integrity_cache("python")
 
     assert service.active_runtime("python") is None
