@@ -15,13 +15,18 @@ import { VISUALIZE_MESSAGE_PIN_KEY } from './presentation'
 import type { ChatRenderedMessage, ChatToolCall } from '@/types/chat'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import * as themeRegistry from '@/themes/registry'
+import { downloadBlob } from '@/utils/browser'
 
-const mounts = vi.hoisted(() => [] as Array<{ options: VisualizeRuntimeOptions; dispose: ReturnType<typeof vi.fn>; setPresentation: ReturnType<typeof vi.fn> }>)
+const mounts = vi.hoisted(() => [] as Array<{ options: VisualizeRuntimeOptions; dispose: ReturnType<typeof vi.fn>; setPresentation: ReturnType<typeof vi.fn>; capture: ReturnType<typeof vi.fn> }>)
+const toasts = vi.hoisted(() => vi.fn())
+vi.mock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast: toasts }) }))
+vi.mock('@/utils/browser', async importOriginal => ({ ...await importOriginal<typeof import('@/utils/browser')>(), downloadBlob: vi.fn() }))
 vi.mock('@/visualize/runtime', () => ({ mountVisualize: vi.fn(async (container: HTMLElement, options: VisualizeRuntimeOptions) => {
   const dispose = vi.fn(() => container.replaceChildren())
   const node = document.createElement('div'); node.textContent = 'Rendered canvas'; container.append(node)
   const setPresentation = vi.fn()
-  mounts.push({ options, dispose, setPresentation }); return { dispose, updateTheme: vi.fn(), setPresentation }
+  const capture = vi.fn(async () => new Blob(['png pixels'], { type: 'image/png' }))
+  mounts.push({ options, dispose, setPresentation, capture }); return { dispose, updateTheme: vi.fn(), setPresentation, capture }
 }) }))
 const html = '<html><body><button>Canvas</button></body></html>'
 const bytes = new TextEncoder().encode(html)
@@ -45,7 +50,7 @@ async function mount(render: () => ReturnType<typeof h>) {
   app.provide(VISUALIZE_MESSAGE_PIN_KEY, { pin })
   app.mount(host); await settle(); return { host, app }
 }
-afterEach(() => { apps.splice(0).forEach(app => app.unmount()); mounts.splice(0); document.body.replaceChildren(); sessionStorage.clear(); vi.clearAllMocks() })
+afterEach(() => { apps.splice(0).forEach(app => app.unmount()); mounts.splice(0); document.body.replaceChildren(); sessionStorage.clear(); vi.clearAllMocks(); vi.unstubAllGlobals() })
 
 describe('Visualize production chat components', () => {
   it('renders live text/canvas/text and preserves the runtime while later text streams', async () => {
@@ -126,7 +131,7 @@ describe('Visualize production chat components', () => {
     const surface = host.querySelector('.visualize-surface')!
     const input = document.createElement('input'); input.value = 'keep selection'; surface.append(input)
     expand.click(); await settle()
-    first.options.onCollapse?.(); await settle()
+    first.options.onDismiss?.(); await settle()
     expect(dialog.getAttribute('aria-modal')).toBeNull()
     expect(dialog.open).toBe(true)
     expect(document.body.style.overflow).toBe('')
@@ -139,10 +144,10 @@ describe('Visualize production chat components', () => {
     expect(releasePin).toHaveBeenCalledTimes(1)
     owner.key = 'session_other'; await settle()
     expand.click(); await settle()
-    first.options.onCollapse?.(); await settle()
+    first.options.onDismiss?.(); await settle()
     expect(dialog.getAttribute('aria-modal')).toBe('true')
     expect(releasePin).toHaveBeenCalledTimes(1)
-    mounts[1]!.options.onCollapse?.(); await settle()
+    mounts[1]!.options.onDismiss?.(); await settle()
     expect(dialog.getAttribute('aria-modal')).toBeNull()
     expect(releasePin).toHaveBeenCalledTimes(2)
   })
@@ -174,5 +179,130 @@ describe('Visualize production chat components', () => {
       await mount(() => h('div', { class: 'light' }, [h(VisualizeCanvas, { receipt, sessionKey: 'session_test' })]))
       expect(mounts[1]!.options.theme).toBe('light')
     } finally { manifest.mockRestore(); media.mockRestore() }
+  })
+  it('anchors the menu outside the surface flow and closes it before the expanded canvas', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    const expand = host.querySelector<HTMLButtonElement>('[aria-label="Expand"]')!
+    const actions = host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!
+    expand.click(); actions.click(); await settle()
+    expect(host.querySelector('[role="menu"]')?.closest('.visualize-toolbar')).not.toBeNull()
+    expect(actions.getAttribute('aria-expanded')).toBe('true')
+    expect(mounts[0]!.options.onDismiss?.()).toBe('fullscreen'); await settle()
+    expect(host.querySelector('[role="menu"]')).toBeNull()
+    expect(host.querySelector('dialog')?.getAttribute('aria-modal')).toBe('true')
+    expect(document.activeElement).toBe(actions)
+    expect(mounts[0]!.options.onDismiss?.()).toBe('inline'); await settle()
+    expect(document.activeElement).toBe(expand)
+    expect(mounts).toHaveLength(1)
+    actions.click(); await settle()
+    const surface = host.querySelector('.visualize-surface')!
+    surface.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); await settle()
+    expect(host.querySelector('[role="menu"]')).toBeNull()
+    actions.click(); await settle()
+    mounts[0]!.options.onPointerDown?.(); await settle()
+    expect(host.querySelector('[role="menu"]')).toBeNull()
+  })
+  it('supports menu keyboard traversal and restores the trigger after Escape', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    const actions = host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!
+    actions.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })); await settle()
+    const items = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+    expect(document.activeElement).toBe(items[0])
+    items[0]!.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })); await settle()
+    expect(document.activeElement).toBe(items[1])
+    items[1]!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); await settle()
+    expect(host.querySelector('[role="menu"]')).toBeNull()
+    expect(document.activeElement).toBe(actions)
+    expect(host.querySelector('dialog')?.getAttribute('aria-modal')).toBeNull()
+  })
+  it('reloads the current expanded canvas with reported state and keeps its presentation', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    host.querySelector<HTMLButtonElement>('[aria-label="Expand"]')!.click(); await settle()
+    mounts[0]!.options.onState({ workers: 12, selected: 'b' })
+    host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!.click(); await settle()
+    host.querySelector<HTMLButtonElement>('[role="menuitem"]')!.click(); await settle()
+    expect(mounts).toHaveLength(2)
+    expect(mounts[0]!.dispose).toHaveBeenCalledOnce()
+    expect(mounts[1]!.options.initialState).toEqual({ workers: 12, selected: 'b' })
+    expect(host.querySelector('dialog')?.getAttribute('aria-modal')).toBe('true')
+    expect(mounts[1]!.setPresentation).toHaveBeenLastCalledWith(expect.objectContaining({ mode: 'expanded' }))
+  })
+  it('starts clipboard writing in the click before capturing and does not expand or remount', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    let resolveCapture!: (value: Blob) => void
+    mounts[0]!.capture.mockImplementation(() => new Promise<Blob>(resolve => { resolveCapture = resolve }))
+    let image!: Promise<Blob>
+    vi.stubGlobal('ClipboardItem', class { constructor(data: Record<string, Promise<Blob>>) { image = data['image/png']! } })
+    const write = vi.fn(async () => { await image })
+    vi.stubGlobal('navigator', { clipboard: { write } })
+    host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!.click(); await settle()
+    const copy = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === 'Copy as image')!
+    copy.click()
+    expect(write).toHaveBeenCalledOnce()
+    expect(mounts[0]!.capture).not.toHaveBeenCalled()
+    await settle()
+    expect(host.textContent).toContain('Preparing image')
+    expect(toasts).not.toHaveBeenCalled()
+    const png = new Blob(['captured pixels'], { type: 'image/png' }); resolveCapture(png); await settle()
+    expect(await image).toBe(png)
+    expect(toasts).toHaveBeenCalledWith('Image copied', { tone: 'ok' })
+    expect(host.querySelector('dialog')?.getAttribute('aria-modal')).toBeNull()
+    expect(mounts).toHaveLength(1)
+    expect(mounts[0]!.dispose).not.toHaveBeenCalled()
+    expect(drafted).not.toHaveBeenCalled()
+  })
+  it('downloads only a captured PNG and recovers from export errors without changing the canvas', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    const actions = host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!
+    const download = async () => {
+      actions.click(); await settle()
+      ;[...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === 'Download PNG')!.click()
+      await settle()
+    }
+    mounts[0]!.capture.mockRejectedValueOnce(new Error('screenshot failed'))
+    await download()
+    expect(downloadBlob).not.toHaveBeenCalled()
+    expect(toasts).toHaveBeenLastCalledWith('Could not export the canvas. Try again.', { tone: 'danger' })
+    expect(host.querySelector('[role="alert"]')).toBeNull()
+    await download()
+    expect(downloadBlob).toHaveBeenCalledWith(expect.objectContaining({ type: 'image/png' }), 'visual.png')
+    expect(toasts).toHaveBeenLastCalledWith('Download started', { tone: 'ok' })
+    expect(mounts).toHaveLength(1)
+    expect(mounts[0]!.dispose).not.toHaveBeenCalled()
+    expect(drafted).not.toHaveBeenCalled()
+  })
+  it('drops a pending export when its owning session changes', async () => {
+    const owner = reactive({ key: 'session_test' })
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: owner.key }))
+    let resolveCapture!: (value: Blob) => void
+    mounts[0]!.capture.mockImplementation(() => new Promise<Blob>(resolve => { resolveCapture = resolve }))
+    host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!.click(); await settle()
+    ;[...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === 'Download PNG')!.click(); await settle()
+    owner.key = 'session_other'; await settle()
+    resolveCapture(new Blob(['old pixels'], { type: 'image/png' })); await settle()
+    expect(downloadBlob).not.toHaveBeenCalled()
+    expect(toasts).not.toHaveBeenCalled()
+    expect(host.textContent).not.toContain('Preparing image')
+  })
+  it('offers download after unsupported clipboard copying and disables export on a broken canvas', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    vi.stubGlobal('navigator', { clipboard: undefined })
+    const actions = host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!
+    actions.click(); await settle()
+    ;[...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === 'Copy as image')!.click(); await settle()
+    expect(mounts[0]!.capture).not.toHaveBeenCalled()
+    expect(toasts).toHaveBeenLastCalledWith('Image copying is unavailable here. Use Download PNG instead.', { tone: 'danger' })
+    actions.click(); await settle()
+    const download = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === 'Download PNG')!
+    expect(download.disabled).toBe(false)
+    download.click(); await settle()
+    expect(downloadBlob).toHaveBeenCalledOnce()
+    mounts[0]!.options.onError(new Error('canvas execution failed')); await settle()
+    actions.click(); await settle()
+    const items = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+    expect(items.map(button => button.disabled)).toEqual([false, true, true])
+    items[0]!.click(); await settle()
+    expect(mounts).toHaveLength(2)
+    expect(host.querySelector('[role="alert"]')).toBeNull()
   })
 })

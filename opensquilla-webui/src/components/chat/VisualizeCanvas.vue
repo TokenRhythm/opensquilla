@@ -2,12 +2,21 @@
   <div class="visualize-position" :style="expanded ? { height: `${inlineHeight}px` } : undefined">
     <dialog ref="canvas" open class="visualize-canvas" :class="{ 'visualize-canvas--expanded': expanded }"
       :role="expanded ? 'dialog' : 'group'" :aria-modal="expanded || undefined" :aria-label="receipt.name"
-      data-visualize-canvas @cancel.prevent="collapse()" @keydown.esc.stop.prevent="onEscape">
+      data-visualize-canvas @cancel.prevent="onEscape" @keydown.esc.stop.prevent="onEscape">
       <header class="visualize-toolbar">
-        <span v-if="expanded" class="visualize-title">{{ receipt.name }}</span>
+        <span v-if="expanded" class="visualize-title" :title="receipt.name">{{ receipt.name }}</span>
+        <p v-if="exportBusy || exportFeedback" class="visualize-export-feedback" :class="{ 'visualize-export-feedback--error': exportFailed }" role="status" :title="exportBusy ? t('visualize.exporting') : exportFeedback">{{ exportBusy ? t('visualize.exporting') : exportFeedback }}</p>
         <div class="visualize-actions">
-          <button type="button" class="visualize-icon" :aria-label="t('visualize.actions')" :title="t('visualize.actions')"
-            :aria-expanded="menuOpen" @click="menuOpen = !menuOpen"><span aria-hidden="true">···</span></button>
+          <div ref="menuAnchor" class="visualize-menu-anchor" @focusout="onMenuFocusOut">
+            <button ref="menuButton" type="button" class="visualize-icon" :aria-label="t('visualize.actions')" :title="t('visualize.actions')"
+              aria-haspopup="menu" :aria-expanded="menuOpen" :aria-controls="menuId" @click="toggleMenu" @keydown.down.prevent="openMenu(true)" @keydown.up.prevent="openMenu(false)"><span aria-hidden="true">···</span></button>
+            <div v-if="menuOpen" :id="menuId" ref="menu" class="visualize-menu" role="menu" :aria-label="t('visualize.actions')" @keydown="onMenuKeydown">
+              <span class="visualize-menu-name" :title="receipt.name">{{ receipt.name }}</span>
+              <button type="button" role="menuitem" :disabled="loading || exportBusy" :title="t('visualize.reloadHint')" :aria-description="t('visualize.reloadHint')" @click="reloadFromMenu">{{ t('visualize.reload') }}</button>
+              <button type="button" role="menuitem" :disabled="!canExport" @click="exportCanvas('copy')">{{ t('visualize.copyImage') }}</button>
+              <button type="button" role="menuitem" :disabled="!canExport" @click="exportCanvas('download')">{{ t('visualize.downloadPng') }}</button>
+            </div>
+          </div>
           <button ref="expandButton" type="button" class="visualize-icon" :aria-expanded="expanded"
             :aria-label="t(expanded ? 'visualize.collapse' : 'visualize.expand')"
             :title="t(expanded ? 'visualize.collapse' : 'visualize.expand')" @click="toggleExpanded">
@@ -16,10 +25,6 @@
           </button>
         </div>
       </header>
-      <div v-if="menuOpen" class="visualize-menu">
-        <span>{{ receipt.name }}</span>
-        <button type="button" @click="reloadFromMenu">{{ t('visualize.reload') }}</button>
-      </div>
       <div v-if="error" class="visualize-feedback" role="alert">
         <p>{{ t('visualize.error') }}</p><p class="visualize-error-detail">{{ error }}</p>
         <div class="visualize-feedback-actions">
@@ -42,25 +47,33 @@
   </div>
 </template>
 <script setup lang="ts">
-import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { sha256 } from '@noble/hashes/sha2.js'
 import { bytesToHex } from '@noble/hashes/utils.js'
 import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { useDialogLayer } from '@/composables/useDialogA11y'
+import { useToasts } from '@/composables/useToasts'
+import { downloadBlob } from '@/utils/browser'
+import { abortableClipboardPreparation, assertClipboardPreparationActive, ImageClipboardError, IMAGE_CLIPBOARD_PREPARATION_TIMEOUT_MS, writePreparedClipboard } from '@/utils/imageClipboard'
 import { getManifest } from '@/themes/registry'
 import { VISUALIZE_CONVERSATION_KEY, type VisualizeReceipt, type VisualizeRuntime } from '@/visualize/types'
 import { VISUALIZE_MESSAGE_PIN_KEY } from '@/visualize/presentation'
 import { readVisualizeState, saveVisualizeState } from '@/visualize/state'
 const props = defineProps<{ receipt: VisualizeReceipt; sessionKey: string; sampleHtml?: string }>()
 const { t } = useI18n()
+const { pushToast } = useToasts()
 const content = inject(ARTIFACT_WORKBENCH_KEY, null)?.content
 const gateway = inject(GATEWAY_ACCESS_KEY, null)
 const conversation = inject(VISUALIZE_CONVERSATION_KEY, null)
 const messagePins = inject(VISUALIZE_MESSAGE_PIN_KEY, null)
 const canvas = ref<HTMLDialogElement | null>(null)
 const expandButton = ref<HTMLButtonElement | null>(null)
+const menuButton = ref<HTMLButtonElement | null>(null)
+const menuAnchor = ref<HTMLElement | null>(null)
+const menu = ref<HTMLElement | null>(null)
+const menuId = `visualize-actions-${useId()}`
 const container = ref<HTMLElement | null>(null)
 const loading = ref(true)
 const error = ref('')
@@ -68,17 +81,22 @@ const proposal = ref('')
 const drafted = ref(false)
 const expanded = ref(false)
 const menuOpen = ref(false)
+const exportBusy = ref(false)
+const exportFeedback = ref('')
+const exportFailed = ref(false)
 const expandUnavailable = ref(false)
 const inlineHeight = ref(120)
 const isTopmost = useDialogLayer(expanded)
 const scope = computed(() => JSON.stringify([gateway?.deliveryIdentity, props.sessionKey, props.receipt.documentId, props.receipt.revisionId, props.receipt.callId]))
 const canDraft = computed(() => conversation?.enabled(props.sessionKey) ?? false)
+const canExport = computed(() => !loading.value && !error.value && !exportBusy.value)
 let runtime: VisualizeRuntime | null = null
 let request: AbortController | null = null
 let observer: MutationObserver | null = null
 let releasePin: (() => void) | undefined
 let restoreScroll: (() => void) | undefined
 let alive = false
+let exportRequest: AbortController | null = null
 const theme = (): 'light' | 'dark' => {
   const themeId = container.value?.closest<HTMLElement>('[data-theme]')?.dataset.theme ?? document.documentElement.dataset.theme ?? ''
   const declared = getManifest(themeId)?.capabilities.colorScheme
@@ -136,6 +154,7 @@ async function toggleExpanded() {
 }
 
 function collapse(restoreFocus = true) {
+  closeMenu(false)
   if (!expanded.value) return
   canvas.value?.close()
   canvas.value?.setAttribute('open', '')
@@ -150,14 +169,100 @@ function collapse(restoreFocus = true) {
 }
 
 function onEscape() {
-  if (menuOpen.value) { menuOpen.value = false; return }
+  if (menuOpen.value) { closeMenu(true); return }
   if (isTopmost.value) collapse()
 }
+function closeMenu(restoreFocus = false) {
+  menuOpen.value = false
+  if (restoreFocus && menuButton.value?.isConnected) menuButton.value.focus({ preventScroll: true })
+}
+function toggleMenu() { if (menuOpen.value) closeMenu(true); else void openMenu() }
+async function openMenu(first?: boolean) {
+  menuOpen.value = true
+  if (first === undefined) return
+  await nextTick()
+  const items = menu.value?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)')
+  if (items?.length) items[first ? 0 : items.length - 1]?.focus({ preventScroll: true })
+}
+function onMenuKeydown(event: KeyboardEvent) {
+  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
+  const items = [...(menu.value?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? [])]
+  if (!items.length) return
+  event.preventDefault()
+  const current = items.indexOf(document.activeElement as HTMLButtonElement)
+  const index = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1
+    : (current + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length
+  items[index]?.focus({ preventScroll: true })
+}
+function onMenuFocusOut(event: FocusEvent) {
+  if (event.relatedTarget instanceof Node && !menuAnchor.value?.contains(event.relatedTarget)) closeMenu(false)
+}
 function closeMenuOutside(event: PointerEvent) {
-  if (menuOpen.value && event.target instanceof Node && !canvas.value?.contains(event.target)) menuOpen.value = false
+  if (menuOpen.value && event.target instanceof Node && !menuAnchor.value?.contains(event.target)) closeMenu(false)
+}
+function closeMenuOnFrameFocus() {
+  // Pointer/focus events do not bubble out of an opaque iframe. Also dismiss
+  // when focus leaves this browser window, without stealing the next focus.
+  closeMenu(false)
+}
+function cancelExport() {
+  exportRequest?.abort(); exportRequest = null; exportBusy.value = false
+  exportFeedback.value = ''; exportFailed.value = false
+}
+async function exportCanvas(mode: 'copy' | 'download') {
+  if (!canExport.value || !runtime) return
+  const mounted = runtime
+  const expectedScope = scope.value
+  const controller = new AbortController(); exportRequest = controller
+  const current = () => alive && !controller.signal.aborted && scope.value === expectedScope && runtime === mounted
+  const assertCurrent = () => {
+    assertClipboardPreparationActive(controller.signal)
+    if (!current()) throw new DOMException('Cancelled', 'AbortError')
+  }
+  const filename = `${(props.receipt.name.split(/[/\\]/).pop() ?? 'visualization').replace(/\.[^.]*$/, '').replace(/[<>:"|?*\u0000-\u001f]/g, '_') || 'visualization'}.png`
+  const timeout = setTimeout(() => controller.abort(new ImageClipboardError('timedOut')), IMAGE_CLIPBOARD_PREPARATION_TIMEOUT_MS)
+  exportBusy.value = true; exportFeedback.value = ''; exportFailed.value = false
+  closeMenu(true)
+  let preparationError: unknown
+  const prepare = async () => {
+    try {
+      assertCurrent()
+      const blob = await abortableClipboardPreparation(mounted.capture({ signal: controller.signal }), controller.signal)
+      assertCurrent()
+      // capture() validates PNG pixels and bounds; the HTML receipt is never
+      // used as a clipboard image descriptor or rasterized a second time.
+      return blob
+    } catch (cause) { preparationError = cause; throw cause }
+  }
+  try {
+    if (mode === 'copy') {
+      // Invoke while still inside the user's click. ClipboardItem owns the
+      // preparation promise, preserving activation in Safari and mobile Web.
+      await abortableClipboardPreparation(writePreparedClipboard('image', prepare), controller.signal)
+    } else {
+      const png = await prepare()
+      assertCurrent(); downloadBlob(png, filename)
+    }
+    assertCurrent()
+    exportFeedback.value = t(mode === 'copy' ? 'imageClipboard.copiedImage' : 'visualize.downloadStarted')
+    pushToast(exportFeedback.value, { tone: 'ok' })
+  } catch (cause) {
+    const failure = preparationError ?? cause
+    if (alive && scope.value === expectedScope && exportRequest === controller
+      && !(failure instanceof DOMException && failure.name === 'AbortError')) {
+      exportFailed.value = true
+      exportFeedback.value = t(failure instanceof ImageClipboardError && failure.kind === 'unsupported'
+        ? 'visualize.copyUnsupported' : mode === 'copy' ? 'visualize.copyFailed' : 'visualize.downloadFailed')
+      pushToast(exportFeedback.value, { tone: 'danger' })
+    }
+  } finally {
+    clearTimeout(timeout); controller.abort()
+    if (exportRequest === controller) { exportRequest = null; exportBusy.value = false }
+  }
 }
 
 async function reload() {
+  closeMenu(false); cancelExport()
   request?.abort(); runtime?.dispose(); runtime = null
   const controller = new AbortController(); request = controller
   const expectedScope = scope.value
@@ -180,7 +285,11 @@ async function reload() {
       onPrompt(text) { if (current() && typeof text === 'string') { proposal.value = text.trim().slice(0, 4000); drafted.value = false } },
       onState(state) { if (current()) saveVisualizeState(expectedScope, state) },
       onError(cause) { if (current()) error.value = diagnostic(cause) },
-      onCollapse() { if (current()) collapse() },
+      onDismiss() {
+        if (current()) onEscape()
+        return expanded.value ? 'fullscreen' : 'inline'
+      },
+      onPointerDown() { if (current()) closeMenu(false) },
     })
     if (!current()) { mounted.dispose(); return }
     runtime = mounted
@@ -189,7 +298,7 @@ async function reload() {
     if (current()) error.value = diagnostic(cause)
   } finally { if (current()) loading.value = false }
 }
-function reloadFromMenu() { menuOpen.value = false; void reload() }
+function reloadFromMenu() { closeMenu(true); void reload() }
 function acceptProposal() {
   if (!canDraft.value || !proposal.value) return
   if (conversation?.draft(props.sessionKey, props.receipt, proposal.value)) { proposal.value = ''; drafted.value = true }
@@ -204,23 +313,25 @@ onMounted(() => {
   observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'style'] })
   window.addEventListener('resize', updatePresentation)
   document.addEventListener('pointerdown', closeMenuOutside)
+  window.addEventListener('blur', closeMenuOnFrameFocus)
   window.visualViewport?.addEventListener('resize', updatePresentation)
 })
-watch([proposal, error, loading, menuOpen], () => { void nextTick(updatePresentation) })
+watch([proposal, error, loading], () => { void nextTick(updatePresentation) })
 watch(scope, () => { collapse(false); if (alive) void reload() })
 onBeforeUnmount(() => {
-  collapse(false); alive = false; request?.abort(); runtime?.dispose(); observer?.disconnect()
+  collapse(false); alive = false; cancelExport(); request?.abort(); runtime?.dispose(); observer?.disconnect()
   window.removeEventListener('resize', updatePresentation)
   document.removeEventListener('pointerdown', closeMenuOutside)
+  window.removeEventListener('blur', closeMenuOnFrameFocus)
   window.visualViewport?.removeEventListener('resize', updatePresentation)
 })
 </script>
 <style scoped>
 .visualize-position { margin: var(--sp-4) 0; min-width: 0; }
-.visualize-canvas { position: relative; display: block; width: 100%; max-width: none; max-height: none; min-width: 0; margin: 0; padding: 0; border: 1px solid transparent; border-radius: var(--radius-lg); overflow: hidden; color: var(--text); background: transparent; }
+.visualize-canvas { position: relative; display: block; width: 100%; max-width: none; max-height: none; min-width: 0; margin: 0; padding: 0; border: 1px solid transparent; border-radius: var(--radius-lg); overflow: visible; color: var(--text); background: transparent; }
 .visualize-canvas:hover, .visualize-canvas:focus-within { border-color: var(--border); }
 .visualize-toolbar { display: flex; align-items: center; justify-content: flex-end; min-height: 32px; gap: var(--sp-2); padding: 0 var(--sp-2); color: var(--text-muted); font-size: var(--fs-sm); }
-.visualize-title { margin-right: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.visualize-title { margin-right: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .visualize-actions, .visualize-feedback-actions { display: flex; flex-shrink: 0; gap: var(--sp-2); flex-wrap: wrap; }
 button { border: 1px solid var(--border); border-radius: var(--radius-control); color: var(--text); background: var(--bg-hover); padding: var(--sp-1) var(--sp-2); cursor: pointer; }
 button:disabled { opacity: 0.5; cursor: default; }
@@ -229,15 +340,20 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .visualize-icon:hover, .visualize-icon[aria-expanded="true"] { background: var(--bg-hover); color: var(--text); }
 .visualize-icon svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
 .visualize-icon span { font-size: var(--fs-xl); line-height: 1; }
-.visualize-menu { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--sp-2); padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--border); color: var(--text-muted); font-size: var(--fs-sm); }
-.visualize-menu span { overflow-wrap: anywhere; min-width: 0; }
-.visualize-surface { width: 100%; min-height: 120px; }
+.visualize-menu-anchor { position: relative; }
+.visualize-menu { position: absolute; z-index: var(--z-dropdown, 50); top: calc(100% + var(--sp-1)); right: 0; width: 260px; max-width: calc(100vw - var(--sp-6)); padding: var(--sp-1); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); color: var(--text); background: var(--bg-surface); font-size: var(--fs-sm); }
+.visualize-menu-name { display: block; min-width: 0; padding: var(--sp-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); }
+.visualize-menu button { display: block; width: 100%; min-height: 44px; padding: var(--sp-2); border-color: transparent; background: transparent; text-align: left; }
+.visualize-menu button:hover:not(:disabled), .visualize-menu button:focus-visible { background: var(--bg-hover); }
+.visualize-surface { width: 100%; min-height: 120px; overflow: hidden; border-radius: 0 0 var(--radius-lg) var(--radius-lg); }
 .visualize-surface :deep(iframe) { display: block; width: 100%; border: 0; }
 .visualize-proposal, .visualize-feedback { margin: 0; padding: var(--sp-3); overflow-wrap: anywhere; }
 .visualize-feedback p { margin: 0 0 var(--sp-2); }
 .visualize-error-detail { max-height: 120px; overflow: auto; color: var(--text-muted); font-size: var(--fs-sm); }
 .visualize-proposal { border-top: 1px solid var(--border); }
 .visualize-proposal > p { margin: 0 0 var(--sp-2); }
+.visualize-export-feedback { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-size: var(--fs-sm); }
+.visualize-export-feedback--error { color: var(--danger, var(--text)); }
 .visualize-canvas--expanded { position: fixed; inset: var(--sp-3); width: calc(100% - var(--sp-3) * 2); max-width: 1440px; max-height: calc(100dvh - var(--sp-3) * 2); margin: auto; overflow: auto; overscroll-behavior: contain; border-color: var(--border); background: var(--bg-surface); }
 .visualize-canvas--expanded::backdrop { background: color-mix(in srgb, var(--text) 35%, transparent); }
 @media (hover: hover) and (pointer: fine) {
