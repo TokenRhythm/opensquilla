@@ -1,5 +1,6 @@
-// State belongs to a pinned revision and calling session, never the widget title.
-// Bounded sessionStorage preserves refresh; sensitive state is not shared across accounts.
+// State belongs to a stable widget and calling session, not an immutable code
+// revision. This lets edit_widget refresh the guest while retaining controls;
+// bounded sessionStorage preserves refresh without sharing state across accounts.
 const memory = new Map<string, unknown>()
 const PREFIX = 'opensquilla.visualize.v1.'
 const LIMIT = 48
