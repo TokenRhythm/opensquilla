@@ -8,6 +8,7 @@ import {
 import { useChatTaskOwnership, type ChatTaskOwnershipApi } from './useChatTaskOwnership'
 import { useChatHistory } from './useChatHistory'
 import { useChatCompaction } from './useChatCompaction'
+import { useChatStream } from './useChatStream'
 import { createConversationRuntime } from '@/modules/conversationRuntime'
 import {
   createSessionReadLifecycle,
@@ -253,6 +254,28 @@ function harness(
 }
 
 describe('useChatSessionSubscription domain lease', () => {
+  it.each([false, true])('preserves reader follow=%s when metadata restores an active task without a live bubble', async follow => {
+    const autoScroll = ref(follow)
+    const stream = useChatStream({
+      messages: ref([]), lastHeaderRole: ref(''), aborted: ref(false), autoScroll,
+      applySessionRunState: vi.fn(), renderMarkdown: text => text,
+      stripDirectiveTags: text => text, stripGeneratedArtifactMarkers: text => text,
+      scrollToBottom: vi.fn(),
+    })
+    const initialMetadata = metadata({
+      runStatus: 'running', activeTask: { taskId: 'task-restored', status: 'running', startedAt: 90_000 },
+    })
+    const subject = harness(leaseFixture({
+      live: live({ activity: 'foreground', initialMetadata }), metadata: initialMetadata,
+    }).lease, { isStreaming: stream.isStreaming, startStreaming: stream.startStreaming })
+    try {
+      await expect(subject.api.subscribeSession()).resolves.toMatchObject({ authoritative: true, live: true })
+      expect(stream.isStreaming.value).toBe(true)
+      expect(subject.activeStreamTaskId.value).toBe('task-restored')
+      expect(autoScroll.value).toBe(follow)
+    } finally { subject.api.cancelActiveSubscription(); stream.cleanup() }
+  })
+
   it('waits for a rejected history cursor to recover before confirming reconciliation', async () => {
     const confirmInstalled = vi.fn(async () => {})
     const page: SessionReadHistoryPage = {

@@ -4,6 +4,7 @@ import {
   type Page,
   type WebSocketRoute,
 } from '@playwright/test'
+import { writeFile } from 'node:fs/promises'
 import { helloOkResponse } from './support/gateway-fixture'
 
 import {
@@ -109,6 +110,7 @@ function basePayload(method: string): unknown {
       skills: {},
     },
     'models.routing.get': { mode: 'direct' },
+    'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
     'onboarding.status': { audioConfigured: false },
     'sessions.subscribe': { subscribed: true },
     'usage.status': { sessions: [] },
@@ -117,6 +119,8 @@ function basePayload(method: string): unknown {
 }
 
 async function preparePage(page: Page) {
+  await page.route('**/api/system/update', route => route.fulfill({ json: {} }))
+  await page.route('**/api/elevated-mode', route => route.fulfill({ json: { enabled: false } }))
   await page.addInitScript(() => {
     window.localStorage.setItem('opensquilla-locale', 'en')
     const surfaceOk = async () => ({ ok: true })
@@ -170,6 +174,590 @@ async function preparePage(page: Page) {
     body: JSON.stringify({ pending: [], mode: 'prompt', allowPatterns: [], denyPatterns: [] }),
   }))
 }
+
+async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText = '', activeB = false,
+  historyAfterAdvance: 'canonical' | 'fallback' | 'read-error' = 'canonical') {
+  await preparePage(page)
+  const startedAt = Date.now() - 10_000
+  const sockets: WebSocketRoute[] = []
+  const held: HeldRequest[] = []
+  const requests: WireRequest[] = []
+  const failures: string[] = []
+  let holdHistory = false
+  let holdLive = false
+  let holdOwnership = false
+  let holdSnapshots = false
+  let rejectLive = false
+  let rejectedLiveReads = 0
+  let nextDelivery = 1
+  const deliveryEpoch = 'warm-race-delivery'
+  const readMethod = 'sessions.messages.snapshot.read'
+  const resumeMethod = 'sessions.messages.resume'
+  const releaseMethod = 'sessions.messages.snapshot.release'
+  const modernSnapshots = new Map<string, { bytes: Buffer; value: ReturnType<typeof sessionMessagesSnapshotPayload> }>()
+  let revision = 1
+  let epoch = 0
+  let terminal = false
+  let advancedHistoryReads = 0
+  const taskId = (key = SESSION_A) => `warm-live-task-${key === SESSION_B ? 'b-' : ''}${epoch}`
+  page.on('pageerror', error => failures.push(error.message))
+  const history = (key: string) => {
+    if (key !== SESSION_A) return chatHistoryPayload([{
+      role: 'assistant', text: `Warm live B history${activeB ? '\n\n' + Array.from({ length: 6 }, (_, index) =>
+        `Short session paragraph ${index + 1}. A second task is running, with a shorter transcript than the reading session.`).join('\n\n') : ''}`,
+      message_id: 'warm-b', timestamp: startedAt,
+    }])
+    return chatHistoryPayload([{
+      role: 'assistant', text: `Warm A history revision ${revision}${longHistoryText ? `\n\n${longHistoryText}` : ''}`,
+      message_id: `warm-a-${epoch}`, timestamp: startedAt - 1000,
+    }, {
+      role: 'user', text: `Prepare Python source ${epoch}`, message_id: `warm-user-${epoch}`, timestamp: startedAt,
+      turn_context: { turn_id: taskId() },
+    }], { ...(historyAfterAdvance === 'fallback' && revision > 1
+      ? { canonical_available: false, canonical_complete: false } : {}), turn_outcomes: terminal ? [{
+      turn_id: taskId(), task_id: taskId(), status: 'failed', started_at: startedAt, finished_at: startedAt + 8000,
+      outcome: { kind: 'failed', reason: '429', error_class: '429', failure_kind: 'rate_limited', retryable: true },
+    }] : [] })
+  }
+  const metadata = (key: string) => {
+    const active = (key === SESSION_A || activeB) && !terminal
+    return {
+      ...subscriptionPayload(key), epoch: key === SESSION_A ? epoch : 0,
+      current_stream_seq: active ? 7 : 0,
+      run_status: active ? 'running' : 'idle',
+      active_task: active ? { task_id: taskId(key), turn_id: taskId(key), status: 'running', started_at: startedAt } : null,
+      tasks: active ? [{ task_id: taskId(key), status: 'running', started_at: startedAt }] : [],
+    }
+  }
+  const snapshot = (key: string) => {
+    const active = (key === SESSION_A || activeB) && !terminal
+    const ev = (name: string, seq: number, payload: Record<string, unknown>) => ({
+      event: `session.event.${name}`, payload: {
+        key, session_key: key, task_id: taskId(key), turn_id: taskId(key), epoch, generation_epoch: 0,
+        stream_generation: 'workspace-switch-generation', stream_seq: seq, emitted_at: startedAt + seq * 100,
+        ...payload,
+      },
+    })
+    return sessionMessagesSnapshotPayload(key, {
+      epoch: key === SESSION_A ? epoch : 0, task_id: active ? taskId(key) : null,
+      current_stream_seq: active ? 7 : 0, stream_generation: 'workspace-switch-generation',
+      events: active ? [
+        ev('provider_activity', 1, { activity_id: `provider-${epoch}`, phase: 'reasoning', reason: 'initial', started_at: startedAt }),
+        ev('thinking_start', 2, { block_id: 'warm-thinking', block_index: 0, started_at: startedAt }),
+        ev('thinking', 3, { block_id: 'warm-thinking', block_index: 0, text: `Warm A reasoning revision ${revision}` }),
+        ev('thinking_end', 4, { block_id: 'warm-thinking', block_index: 0, status: 'completed', ended_at: startedAt + 400 }),
+        ev('text_delta', 5, { text: `Narration before draft revision ${revision}`, presentation: 'answer' }),
+        ev('provider_activity', 6, { activity_id: `provider-${epoch}`, phase: 'tool_calling', reason: 'initial', started_at: startedAt + 600 }),
+        ev('tool_input_preview', 7, { preview_id: `warm-draft-${epoch}`, attempt_id: `warm-attempt-${epoch}`,
+          tool_use_id: 'warm-code', revision, state: 'generating', tool_name: 'execute_code', path: '',
+          content: `print("draft revision ${revision}")`, truncated: false }),
+      ] : [],
+    })
+  }
+  const reply = ({ frame, socket }: HeldRequest) => {
+    const key = String(frame.params?.key || frame.params?.sessionKey || '')
+    const method = String(frame.method || '')
+    if (method === 'chat.history' && key === SESSION_A && revision > 1) {
+      advancedHistoryReads++
+      if (historyAfterAdvance === 'read-error' && advancedHistoryReads > 1) {
+        socket.send(JSON.stringify({ type: 'res', id: frame.id, ok: false, error: {
+          code: 'INTERNAL_ERROR', message: 'Synthetic history refresh remains unavailable.', retryable: true,
+        } }))
+        return
+      }
+    }
+    if (rejectLive && key === SESSION_A && method !== 'chat.history') {
+      rejectedLiveReads++
+      socket.send(JSON.stringify({ type: 'res', id: frame.id, ok: false, error: {
+        code: 'SNAPSHOT_BUSY', message: 'Synthetic live read remains unavailable.', retryable: true, accepted: false,
+      } }))
+      return
+    }
+    if (method === readMethod) {
+      const syncRevision = String(frame.params?.sync_revision)
+      let staged = modernSnapshots.get(syncRevision)
+      if (!staged) {
+        const value = snapshot(key)
+        staged = { value, bytes: Buffer.from(JSON.stringify(value)) }
+        modernSnapshots.set(syncRevision, staged)
+      }
+      socket.send(response(frame.id, {
+        key, sync_revision: syncRevision, snapshot_id: `warm-${syncRevision}`,
+        segment_index: 0, segment_count: 1, byte_length: staged.bytes.length,
+        encoding: 'base64-json-utf8', data: staged.bytes.toString('base64'),
+        stream_generation: 'workspace-switch-generation', current_stream_seq: staged.value.current_stream_seq,
+        task_id: staged.value.task_id, session_id: null, session_epoch: staged.value.epoch,
+        delivery: { delivery_epoch: deliveryEpoch, delivery_id: nextDelivery++ },
+      }))
+      return
+    }
+    const payload = method === 'chat.history' ? history(key)
+      : method === 'sessions.messages.snapshot' ? snapshot(key)
+        : method === 'sessions.messages.hydrate' ? sessionMessagesHydratePayload(key, metadata(key))
+          : key === SESSION_A && holdOwnership ? { ...metadata(key), hydration_complete: false,
+            active_task: null, tasks: [], run_status: 'idle', deferred_fields: ['active_task', 'tasks', 'run_status'] } : metadata(key)
+    socket.send(response(frame.id, payload))
+  }
+  await page.routeWebSocket(/\/ws$/, socket => {
+    const socketIndex = sockets.push(socket) - 1
+    socket.send(eventFrame('connect.challenge', {}))
+    socket.onMessage(raw => {
+      const frame = JSON.parse(String(raw)) as RpcRequest
+      if (frame.type === 'ping') { socket.send(JSON.stringify({ type: 'pong' })); return }
+      if (frame.type !== 'req') return
+      const method = String(frame.method || '')
+      const key = String(frame.params?.key || frame.params?.sessionKey || '')
+      requests.push({ method, key, socketIndex })
+      if (method === 'connect') {
+        socket.send(helloOkResponse({
+          server: { version: 'e2e', conn_id: 'warm-live-race' }, policy: { concurrent_history_reads: true,
+            ...(modern ? { transport_flow: { delivery_epoch: deliveryEpoch, window_frames: 128, window_bytes: 4 * 1024 * 1024 } } : {}) },
+          features: { methods: ['sessions.messages.subscribe', 'sessions.messages.unsubscribe',
+            'sessions.messages.snapshot', 'sessions.messages.hydrate', 'workspaces.list', 'artifacts.list',
+            ...(modern ? [readMethod, resumeMethod, releaseMethod, 'transport.flow.update'] : [])], events: [] },
+          auth: { principal: { isOwner: true, authState: 'authenticated' },
+            runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' } },
+        }))
+        return
+      }
+      if (method === 'sessions.list') {
+        socket.send(response(frame.id, { sessions: [
+          session(SESSION_A, 'Warm race A', WORKSPACE_A, '/fixtures/workspace-a', 100),
+          session(SESSION_B, 'Warm race B', WORKSPACE_B, '/fixtures/workspace-b', 200),
+        ], count: 2, ts: 1_800_000_000, has_more: false }))
+        return
+      }
+      if (method === 'transport.flow.update') {
+        socket.send(response(frame.id, { delivery_epoch: deliveryEpoch,
+          ack_delivery_id: Number(frame.params?.ack_delivery_id || 0), dirty_keys: [], global_dirty: false }))
+        return
+      }
+      if (method === resumeMethod || method === releaseMethod) {
+        socket.send(response(frame.id, { ...frame.params, ...(method === resumeMethod
+          ? { session_id: null, session_epoch: modernSnapshots.get(String(frame.params?.sync_revision))?.value.epoch,
+              replay_to_seq: frame.params?.stream_seq }
+          : { retired: true }) }))
+        return
+      }
+      if (['chat.history', 'sessions.messages.subscribe', 'sessions.messages.snapshot', 'sessions.messages.hydrate', readMethod].includes(method)) {
+        if (key === SESSION_A && (method === 'chat.history' ? holdHistory
+          : holdLive || (holdSnapshots && method === readMethod)
+            || (method === 'sessions.messages.hydrate' && holdOwnership))) held.push({ frame, socket })
+        else reply({ frame, socket })
+        return
+      }
+      if (method === 'workspaces.list') {
+        socket.send(response(frame.id, { workspaces: [
+          workspace(WORKSPACE_A, 'Workspace A', '/fixtures/workspace-a'),
+          workspace(WORKSPACE_B, 'Workspace B', '/fixtures/workspace-b'),
+        ] })); return
+      }
+      if (method === 'artifacts.list') { socket.send(response(frame.id, { artifacts: [], has_more: false })); return }
+      socket.send(response(frame.id, basePayload(method)))
+    })
+  })
+  return {
+    sockets, requests, failures,
+    pending: (side: 'history' | 'live') => held.filter(item => side === 'history'
+      ? item.frame.method === 'chat.history' : item.frame.method !== 'chat.history').length,
+    hold: () => { holdHistory = true; holdLive = true },
+    failLive: () => { rejectLive = true },
+    rejectedLiveReads: () => rejectedLiveReads,
+    deferSnapshots: () => { holdSnapshots = true },
+    snapshotPending: () => held.filter(item => item.frame.method === readMethod).length,
+    invalidateHeldSnapshot() {
+      const request = held.find(item => item.frame.method === readMethod)
+      if (!request) throw new Error('Expected a held modern snapshot read')
+      request.socket.send(eventFrame('transport.flow.dirty', {
+        delivery_epoch: deliveryEpoch, dirty_keys: [SESSION_A], global_dirty: false,
+      }))
+      held.splice(held.indexOf(request), 1)
+      reply(request)
+    },
+    releaseSnapshots() {
+      holdSnapshots = false
+      for (const request of held.filter(item => item.frame.method === readMethod)) {
+        held.splice(held.indexOf(request), 1)
+        reply(request)
+      }
+    },
+    deferOwnership: () => { holdOwnership = true },
+    confirmRunningOwner: () => sockets[0]!.send(eventFrame('task.running', {
+      key: SESSION_A, session_key: SESSION_A, task_id: taskId(), turn_id: taskId(),
+      epoch, status: 'running', started_at: startedAt,
+    })),
+    ownershipPending: () => held.some(item => item.frame.method === 'sessions.messages.hydrate'),
+    releaseOwnership() {
+      holdOwnership = false
+      for (const request of held.filter(item => item.frame.method === 'sessions.messages.hydrate')) {
+        held.splice(held.indexOf(request), 1)
+        reply(request)
+      }
+    },
+    advance: (changedEpoch = false, failed = false) => { revision = 2; epoch = changedEpoch ? 1 : 0; terminal = failed },
+    release(side: 'history' | 'live') {
+      if (side === 'history') holdHistory = false
+      else holdLive = false
+      const matching = held.filter(item => side === 'history'
+        ? item.frame.method === 'chat.history' : item.frame.method !== 'chat.history'
+          && !(holdSnapshots && item.frame.method === readMethod)
+          && !(holdOwnership && item.frame.method === 'sessions.messages.hydrate'))
+      for (const request of matching) { held.splice(held.indexOf(request), 1); reply(request) }
+    },
+  }
+}
+
+async function expectWarmLiveFrames(page: Page, expandedCode = false, stopVisible = true) {
+  // Sample actual rendered frames while the other RPC side remains blocked.
+  // An immediate assertion alone could pass before the released reply renders.
+  const frames = await page.evaluate(async expanded => {
+    const samples = []
+    for (let frame = 0; frame < 8; frame++) {
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+      const surface = document.querySelector<HTMLElement>('.chat-message-surface')
+      const preview = surface?.querySelector('[data-testid="tool-input-preview"]')
+      const narration = surface?.querySelector('.activity-narration')
+      const stop = document.querySelector<HTMLElement>('.chat-stop-btn')
+      samples.push({
+        inert: surface?.inert === true,
+        history: surface?.textContent?.includes('Warm A history revision 1') === true,
+        reasoning: surface?.querySelectorAll('[data-testid="reasoning-timeline"]').length === 1,
+        draft: Boolean(preview),
+        code: !expanded || preview?.querySelector('code')?.textContent === 'print("draft revision 1")',
+        narrationBeforeDraft: Boolean(narration && preview
+          && narration.textContent?.includes('Narration before draft revision 1')
+          && (narration.compareDocumentPosition(preview) & Node.DOCUMENT_POSITION_FOLLOWING)),
+        stopVisible: Boolean(stop?.getClientRects().length),
+      })
+    }
+    return samples
+  }, expandedCode)
+  expect(frames).toHaveLength(8)
+  for (const frame of frames) expect(frame).toEqual({
+    inert: true, history: true, reasoning: true, draft: true, code: true, narrationBeforeDraft: true, stopVisible,
+  })
+}
+
+test('a newer delivery gap keeps the complete warm view and Stop until automatic snapshot recovery', async ({ page }, testInfo) => {
+  const gateway = await prepareWarmLiveRace(page, true)
+  const warnings: string[] = []
+  page.on('console', message => {
+    if (message.type() === 'warning') warnings.push(message.text())
+  })
+  await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
+  const draft = page.getByTestId('tool-input-preview')
+  await expect(page.getByText('Narration before draft revision 1', { exact: true })).toBeVisible()
+  await draft.locator('button').click()
+  await expect(draft.locator('code')).toHaveText('print("draft revision 1")')
+  await expect(page.locator('.chat-stop-btn')).toBeEnabled()
+  await page.locator(`[data-session-key="${SESSION_B}"] .sidebar-history-item`).click()
+  await expect(page.getByText('Warm live B history', { exact: true })).toBeVisible()
+  gateway.hold()
+  gateway.deferSnapshots()
+  gateway.advance()
+  await page.locator(`[data-session-key="${SESSION_A}"] .sidebar-history-item`).click()
+  await expect.poll(gateway.snapshotPending).toBe(1)
+  gateway.release('history')
+  gateway.release('live')
+  await expectWarmLiveFrames(page, true)
+  await page.evaluate(() => {
+    const state = window as unknown as { warmRecoveryFrames: Record<string, boolean>[]; warmRecoveryRecording: boolean }
+    state.warmRecoveryFrames = []
+    state.warmRecoveryRecording = true
+    const sample = () => {
+      const surface = document.querySelector('.chat-message-surface')
+      const stop = document.querySelector<HTMLElement>('.chat-stop-btn')
+      state.warmRecoveryFrames.push({
+        stop: Boolean(stop?.getClientRects().length),
+        history: surface?.textContent?.includes('Warm A history revision') === true,
+        reasoning: Boolean(surface?.querySelector('[data-testid="reasoning-timeline"]')),
+        preview: Boolean(surface?.querySelector('[data-testid="tool-input-preview"]')),
+      })
+      if (state.warmRecoveryRecording) requestAnimationFrame(sample)
+    }
+    requestAnimationFrame(sample)
+  })
+  gateway.invalidateHeldSnapshot()
+  // Exercise the real flow invalidation and recovery scheduler: no click,
+  // reconnect, explicit retry, or mocked frontend lifecycle method.
+  await expect.poll(() => warnings.some(text => text.includes('Snapshot invalidated by a newer delivery gap.'))).toBe(true)
+  await expect.poll(gateway.snapshotPending, { timeout: 15_000 }).toBeGreaterThan(0)
+  await expectWarmLiveFrames(page, true)
+  gateway.releaseSnapshots()
+  await expect(page.getByText('Warm A history revision 2', { exact: true })).toBeVisible()
+  await expect(draft.locator('code')).toHaveText('print("draft revision 2")')
+  await expect(page.locator('.chat-message-surface')).not.toHaveAttribute('inert', '')
+  const frames = await page.evaluate(() => {
+    const state = window as unknown as { warmRecoveryFrames: Record<string, boolean>[]; warmRecoveryRecording: boolean }
+    state.warmRecoveryRecording = false
+    return state.warmRecoveryFrames
+  })
+  await testInfo.attach('warm-recovery-frames', { body: JSON.stringify(frames, null, 2), contentType: 'application/json' })
+  expect(frames.length).toBeGreaterThan(8)
+  for (const frame of frames) expect(frame).toEqual({ stop: true, history: true, reasoning: true, preview: true })
+  expect(gateway.requests.filter(item => item.key === SESSION_A && item.method === 'sessions.messages.snapshot.read').length).toBeGreaterThanOrEqual(3)
+  expect(gateway.requests.filter(item => item.method === 'chat.send' || item.method === 'chat.abort')).toEqual([])
+  expect(gateway.sockets).toHaveLength(1)
+  expect(gateway.failures).toEqual([])
+})
+
+for (const first of ['history', 'live'] as const) {
+  test(`warm history and prepared code hand off together when ${first} resolves first`, async ({ page }) => {
+    const gateway = await prepareWarmLiveRace(page)
+    await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
+    await expect(page.getByText('Warm A history revision 1', { exact: true })).toBeVisible()
+    const draft = page.getByTestId('tool-input-preview')
+    await expect(draft).toBeVisible()
+    await expect(page.getByText('Narration before draft revision 1', { exact: true })).toBeVisible()
+    await draft.locator('button').click()
+    await expect(draft.locator('code')).toHaveText('print("draft revision 1")')
+    const reasoning = page.getByTestId('reasoning-timeline')
+    await expect(reasoning).toHaveCount(1)
+    await expect(page.locator('.chat-stop-btn')).toBeEnabled()
+    await page.locator(`[data-session-key="${SESSION_B}"] .sidebar-history-item`).click()
+    await expect(page.getByText('Warm live B history', { exact: true })).toBeVisible()
+    gateway.hold()
+    gateway.advance()
+    await page.locator(`[data-session-key="${SESSION_A}"] .sidebar-history-item`).click()
+    await expect.poll(() => gateway.pending('history')).toBeGreaterThan(0)
+    await expect.poll(() => gateway.pending('live')).toBeGreaterThan(0)
+    await expect(page.getByText('Warm A history revision 1', { exact: true })).toBeVisible()
+    await expect(draft.locator('code')).toHaveText('print("draft revision 1")')
+    await expect(reasoning).toHaveCount(1)
+    await expect(draft.locator('.activity-motion--active')).toHaveCount(0)
+    await expect(page.locator('.chat-message-surface')).toHaveAttribute('inert', '')
+    gateway.release(first)
+    // One side resolving is insufficient to replace the complete, read-only view.
+    await expectWarmLiveFrames(page, true)
+    await expect(page.getByText('Warm A history revision 1', { exact: true })).toBeVisible()
+    await expect(draft.locator('code')).toHaveText('print("draft revision 1")')
+    await expect(page.locator('.chat-message-surface')).toHaveAttribute('inert', '')
+    gateway.release(first === 'history' ? 'live' : 'history')
+    await expect(page.getByText('Warm A history revision 2', { exact: true })).toBeVisible()
+    await expect(draft.locator('code')).toHaveText('print("draft revision 2")')
+    await expect(reasoning).toHaveCount(1)
+    await expect(page.locator('.chat-message-surface')).not.toHaveAttribute('inert', '')
+    expect(gateway.sockets).toHaveLength(1)
+    expect(gateway.requests.filter(item => item.method === 'chat.send' || item.method === 'chat.abort')).toEqual([])
+    expect(gateway.failures).toEqual([])
+  })
+}
+
+for (const ownerKnown of [false, true]) {
+  test(`warm presentation waits for deferred metadata with running ownership ${ownerKnown ? 'confirmed' : 'pending'}`, async ({ page }) => {
+    const gateway = await prepareWarmLiveRace(page)
+    await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
+    await expect(page.getByTestId('tool-input-preview')).toBeVisible()
+    await expect(page.getByText('Narration before draft revision 1', { exact: true })).toBeVisible()
+    await expect(page.locator('.chat-stop-btn')).toBeEnabled()
+    await page.locator(`[data-session-key="${SESSION_B}"] .sidebar-history-item`).click()
+    await expect(page.getByText('Warm live B history', { exact: true })).toBeVisible()
+    gateway.hold()
+    gateway.advance()
+    gateway.deferOwnership()
+    await page.locator(`[data-session-key="${SESSION_A}"] .sidebar-history-item`).click()
+    await expect.poll(() => gateway.pending('history')).toBeGreaterThan(0)
+    await expect.poll(() => gateway.pending('live')).toBeGreaterThan(0)
+    gateway.release('history')
+    gateway.release('live')
+    await expect.poll(gateway.ownershipPending).toBe(true)
+    await expectWarmLiveFrames(page)
+    // Cache may keep the Stop shape, but only current server ownership enables it.
+    const stop = page.locator('.chat-stop-btn')
+    await expect(stop).toBeVisible()
+    await expect(stop).toBeDisabled()
+    if (ownerKnown) {
+      // A real lifecycle event can authorize Stop before the complete metadata
+      // arrives. It must not be mistaken for completion of the hydration read.
+      gateway.confirmRunningOwner()
+      await expect(stop).toBeEnabled()
+      await expectWarmLiveFrames(page)
+      await expect(page.getByText('Warm A history revision 2', { exact: true })).toHaveCount(0)
+    }
+    gateway.releaseOwnership()
+    await expect(page.getByText('Warm A history revision 2', { exact: true })).toBeVisible()
+    await expect(page.locator('.chat-message-surface')).not.toHaveAttribute('inert', '')
+    await expect(stop).toBeEnabled()
+    expect(gateway.requests.filter(item => item.method === 'chat.abort')).toEqual([])
+    expect(gateway.failures).toEqual([])
+  })
+}
+
+for (const historyAfterAdvance of ['canonical', 'fallback', 'read-error'] as const) {
+  test(`changed epoch after history-first restoration handles ${historyAfterAdvance} history and releases the live view`, async ({ page }) => {
+    const gateway = await prepareWarmLiveRace(page, false, '', false, historyAfterAdvance)
+    await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
+    await expect(page.getByTestId('tool-input-preview')).toBeVisible()
+    await expect(page.getByText('Narration before draft revision 1', { exact: true })).toBeVisible()
+    await expect(page.locator('.chat-stop-btn')).toBeEnabled()
+    await page.locator(`[data-session-key="${SESSION_B}"] .sidebar-history-item`).click()
+    await expect(page.getByText('Warm live B history', { exact: true })).toBeVisible()
+    gateway.hold()
+    gateway.advance(true)
+    await page.locator(`[data-session-key="${SESSION_A}"] .sidebar-history-item`).click()
+    await expect.poll(() => gateway.pending('history')).toBeGreaterThan(0)
+    await expect.poll(() => gateway.pending('live')).toBeGreaterThan(0)
+    const before = gateway.requests.filter(item => item.key === SESSION_A && item.method === 'chat.history').length
+    gateway.release('history')
+    await expectWarmLiveFrames(page)
+    await expect(page.locator('.chat-message-surface')).toHaveAttribute('inert', '')
+    gateway.release('live')
+    await expect.poll(() => gateway.requests.filter(item => item.key === SESSION_A && item.method === 'chat.history').length).toBeGreaterThan(before)
+    await expect(page.getByText('Warm A history revision 2', { exact: true })).toBeVisible()
+    await expect(page.getByTestId('tool-input-preview')).toBeVisible()
+    await expect(page.locator('.chat-message-surface')).not.toHaveAttribute('inert', '')
+    await expect(page.getByText('Warm A history revision 1', { exact: true })).toHaveCount(0)
+    expect(gateway.failures).toEqual([])
+  })
+}
+
+for (const first of ['history', 'live'] as const) {
+  test(`terminal failure replaces cached activity when ${first} resolves first`, async ({ page }) => {
+    const gateway = await prepareWarmLiveRace(page)
+    await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
+    await expect(page.getByTestId('tool-input-preview')).toBeVisible()
+    await expect(page.getByText('Narration before draft revision 1', { exact: true })).toBeVisible()
+    await expect(page.locator('.chat-stop-btn')).toBeEnabled()
+    await page.locator(`[data-session-key="${SESSION_B}"] .sidebar-history-item`).click()
+    await expect(page.getByText('Warm live B history', { exact: true })).toBeVisible()
+    gateway.hold()
+    gateway.advance(false, true)
+    await page.locator(`[data-session-key="${SESSION_A}"] .sidebar-history-item`).click()
+    await expect.poll(() => gateway.pending('history')).toBeGreaterThan(0)
+    await expect.poll(() => gateway.pending('live')).toBeGreaterThan(0)
+    gateway.release(first)
+    if (first === 'history') {
+      // A durable terminal result supersedes this task's old live presentation
+      // without waiting for the live read to recover.
+      await expect(page.locator('.msg-error')).toHaveCount(1)
+      await expect(page.getByTestId('tool-input-preview')).toHaveCount(0)
+      await expect(page.locator('.chat-stop-btn')).toHaveCount(0)
+    } else {
+      // Let the authoritative idle metadata render before sampling frames.
+      // It retires Stop while history still owns the final outcome content.
+      await expect(page.locator('.chat-stop-btn')).toHaveCount(0)
+      await expectWarmLiveFrames(page, false, false)
+      await expect(page.locator('.chat-message-surface')).toHaveAttribute('inert', '')
+    }
+    gateway.release(first === 'history' ? 'live' : 'history')
+    await expect(page.locator('.msg-error')).toHaveCount(1)
+    await expect(page.locator('.msg-error')).toContainText('The model is temporarily rate limited; this request did not finish.')
+    await expect(page.getByTestId('tool-input-preview')).toHaveCount(0)
+    await expect(page.locator('.chat-message-surface')).not.toHaveAttribute('inert', '')
+    await expect(page.locator('.chat-stop-btn')).toHaveCount(0)
+    expect(gateway.sockets).toHaveLength(1)
+    expect(gateway.failures).toEqual([])
+  })
+}
+
+test('confirmed terminal history retires cached work while live reads keep failing', async ({ page }) => {
+  const gateway = await prepareWarmLiveRace(page)
+  await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
+  await expect(page.getByText('Narration before draft revision 1', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('tool-input-preview')).toBeVisible()
+  await expect(page.locator('.chat-stop-btn')).toBeEnabled()
+  await page.locator(`[data-session-key="${SESSION_B}"] .sidebar-history-item`).click()
+  await expect(page.getByText('Warm live B history', { exact: true })).toBeVisible()
+  gateway.hold()
+  gateway.advance(false, true)
+  gateway.failLive()
+  await page.locator(`[data-session-key="${SESSION_A}"] .sidebar-history-item`).click()
+  await expect.poll(() => gateway.pending('history')).toBeGreaterThan(0)
+  await expect.poll(() => gateway.pending('live')).toBeGreaterThan(0)
+  gateway.release('live')
+  await expect.poll(gateway.rejectedLiveReads).toBeGreaterThan(0)
+  await expectWarmLiveFrames(page)
+  gateway.release('history')
+  await expect(page.locator('.msg-error')).toHaveCount(1)
+  await expect(page.locator('.msg-error')).toContainText('The model is temporarily rate limited; this request did not finish.')
+  await expect(page.getByTestId('reasoning-timeline')).toHaveCount(0)
+  await expect(page.getByTestId('tool-input-preview')).toHaveCount(0)
+  await expect(page.locator('.chat-stop-btn')).toHaveCount(0)
+  const rejectedBefore = gateway.rejectedLiveReads()
+  await expect.poll(gateway.rejectedLiveReads, { timeout: 15_000 }).toBeGreaterThan(rejectedBefore)
+  await expect(page.locator('.msg-error')).toHaveCount(1)
+  await expect(page.getByTestId('reasoning-timeline')).toHaveCount(0)
+  await expect(page.getByTestId('tool-input-preview')).toHaveCount(0)
+  await expect(page.locator('.chat-stop-btn')).toHaveCount(0)
+  expect(gateway.requests.filter(item => item.method === 'chat.send' || item.method === 'chat.abort')).toEqual([])
+  expect(gateway.failures).toEqual([])
+})
+
+test('returning from a short active session restores the same paragraph with modern snapshots', async ({ page }, info) => {
+  const longText = Array.from({ length: 18 }, (_, index) => `### Reader section ${String(index + 1).padStart(2, '0')}
+
+This is a stable paragraph in the same assistant message. The reader is inspecting earlier work while a task continues.
+
+Its place in the viewport must remain tied to this session, even when another session has a much shorter transcript.`).join('\n\n')
+  const gateway = await prepareWarmLiveRace(page, true, longText, true)
+  const headingText = 'Reader section 09'
+  const measure = () => page.locator('.chat-thread').evaluate((thread, text) => {
+    const heading = [...thread.querySelectorAll<HTMLElement>('h3')].find(element => element.textContent === text)
+    const row = heading?.closest<HTMLElement>('[data-chat-message-key]')
+    return {
+      key: row?.dataset.chatMessageKey,
+      index: row?.dataset.chatMessageIndex,
+      heading: heading?.textContent,
+      y: heading ? heading.getBoundingClientRect().top - thread.getBoundingClientRect().top : null,
+      scrollTop: thread.scrollTop, scrollHeight: thread.scrollHeight, viewportHeight: thread.clientHeight,
+      reading: thread.classList.contains('chat-thread--reading-history'),
+    }
+  }, headingText)
+  const evidence: Record<string, unknown> = {}
+  try {
+    await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
+    await expect(page.getByRole('heading', { name: headingText, exact: true })).toHaveCount(1)
+    await expect(page.locator('.chat-stop-btn')).toBeEnabled()
+    await expect.poll(async () => (await measure()).scrollHeight).toBeGreaterThan(2000)
+    await expect.poll(async () => {
+      const position = await measure()
+      return position.scrollHeight - position.scrollTop - position.viewportHeight
+    }).toBeLessThan(4)
+    await page.locator('.chat-thread').hover({ position: { x: 120, y: 160 } })
+    const initial = await measure()
+    await page.mouse.wheel(0, Number(initial.y) - 120)
+    await expect(page.locator('.chat-thread')).toHaveClass(/chat-thread--reading-history/)
+    await expect.poll(async () => Math.abs(Number((await measure()).y) - 120)).toBeLessThan(4)
+    const saved = await measure()
+    evidence.savedA = saved
+    expect(saved.scrollTop).toBeGreaterThan(500)
+    await page.screenshot({ path: info.outputPath('reader-a-before.png') })
+    await page.locator(`[data-session-key="${SESSION_B}"] .sidebar-history-item`).click()
+    await expect(page.getByText('Warm live B history', { exact: true })).toBeVisible()
+    await expect(page.locator('.chat-stop-btn')).toBeEnabled()
+    await expect.poll(async () => (await measure()).scrollTop).toBeGreaterThan(50)
+    await expect.poll(async () => {
+      const position = await measure()
+      return position.scrollHeight - position.scrollTop - position.viewportHeight
+    }).toBeLessThan(4)
+    evidence.shortB = await measure()
+    gateway.hold()
+    await page.locator(`[data-session-key="${SESSION_A}"] .sidebar-history-item`).click()
+    await expect.poll(() => gateway.pending('history')).toBeGreaterThan(0)
+    gateway.release('live')
+    await expect(page.getByRole('heading', { name: headingText, exact: true })).toHaveCount(1)
+    await expect(page.locator('.chat-message-surface')).toHaveAttribute('inert', '')
+    evidence.pendingA = await measure()
+    await page.screenshot({ path: info.outputPath('reader-a-pending.png') })
+    // Assert the same interior content coordinate, not just message identity,
+    // reader mode, or the presence of cached DOM rows.
+    await expect.poll(async () => Math.abs(Number((await measure()).y) - Number(saved.y))).toBeLessThan(4)
+    const pending = await measure()
+    expect(pending).toMatchObject({ key: saved.key, index: saved.index, heading: saved.heading, reading: true })
+    gateway.release('history')
+    await expect(page.locator('.chat-message-surface')).not.toHaveAttribute('inert', '')
+    await expect.poll(async () => Math.abs(Number((await measure()).y) - Number(saved.y))).toBeLessThan(4)
+    evidence.installedA = await measure()
+    await page.screenshot({ path: info.outputPath('reader-a-installed.png') })
+    expect(gateway.sockets).toHaveLength(1)
+    expect(gateway.requests.filter(item => item.method === 'chat.send' || item.method === 'chat.abort')).toEqual([])
+    expect(gateway.failures).toEqual([])
+  } finally {
+    evidence.final = await measure().catch(error => ({ error: String(error) }))
+    await writeFile(info.outputPath('reader-position-evidence.json'), JSON.stringify(evidence, null, 2))
+    await info.attach('reader-position-evidence', { body: JSON.stringify(evidence, null, 2), contentType: 'application/json' })
+  }
+})
 
 test('returning to a visited session keeps history visible while its real bootstrap is pending', async ({ page }) => {
   await preparePage(page)

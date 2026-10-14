@@ -57,10 +57,13 @@ function mountTurn(initialTaskId = 'accepted-turn', seed?: (stream: ReturnType<t
     const LiveTurn = Vue.defineComponent({
       components: { ActivityDisclosure },
       setup: () => ({
-        liveActivityContinuityKey: disclosure.activityContinuityKey,
-        liveActivityExecuting: false, executionDockRun: null, liveActivityStepCount: 1,
-        liveActivityFailureCount: 0, liveActivityPhaseLabel: 'Working', streamTurnElapsed: '',
-        liveActivityPhaseAnnouncement: '', liveActivityWaiting: false, streamActivityStale: false,
+        presentedLive: Vue.computed(() => ({
+          liveActivityContinuityKey: disclosure.activityContinuityKey.value,
+          liveActivityExecuting: false, liveActivityStepCount: 1,
+          liveActivityFailureCount: 0, liveActivityPhaseLabel: 'Working', streamTurnElapsed: '',
+          liveActivityPhaseAnnouncement: '', liveActivityWaiting: false, streamActivityStale: false,
+          queued: false,
+        })),
       }),
       render: liveRender,
     })

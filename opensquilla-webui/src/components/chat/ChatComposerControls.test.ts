@@ -152,10 +152,17 @@ it('threads the independent model-routing control through ChatComposer and ChatV
     expect(composerSource).toContain('sessionRoutingMode: ModelRoutingMode')
     expect(composerSource).toContain('setSessionRoutingMode: [mode: ModelRoutingMode]')
 
-    expect(viewSource).toContain(':session-routing-mode="modelRoutingMode"')
-    expect(viewSource).toContain(':session-routing-busy="modelRoutingMutationBusy"')
-    expect(viewSource).toContain(':session-routing-control-blocked="goalBusy || modelRoutingSettingsBusy"')
-    expect(viewSource).toContain(':session-routing-available="sessionRoutingAvailable"')
+    const composerOpening = viewSource.match(/<ChatComposer\b[^>]*>/)?.[0] || ''
+    // The warm preview owns display values only. Keep current authorization
+    // and mutation state, and block changes until authoritative recovery.
+    expect(composerOpening).toContain(':session-routing-mode="sessionViewCache.presentation.value?.modelRoutingMode ?? modelRoutingMode"')
+    expect(composerOpening).toContain(':session-model-name="sessionViewCache.showingPreview.value ? sessionViewCache.presentation.value?.sessionModelName : sessionModelName"')
+    expect(composerOpening).toContain(':model-selection="sessionViewCache.showingPreview.value ? sessionViewCache.presentation.value?.modelSelection : composerModelSelection"')
+    expect(composerOpening).toContain(':model-selection-available="sessionViewCache.presentation.value?.modelSelectionAvailable ?? composerModelSelectionAvailable"')
+    expect(composerOpening).toContain(':session-routing-busy="modelRoutingMutationBusy"')
+    expect(composerOpening).toContain(':session-routing-control-blocked="goalBusy || modelRoutingSettingsBusy || sessionViewCache.showingPreview.value"')
+    expect(composerOpening).toContain(':model-selection-disabled-reason="sessionViewCache.showingPreview.value ? \'busy\' : composerModelDisabledReason"')
+    expect(composerOpening).toContain(':session-routing-available="sessionRoutingAvailable"')
     expect(viewSource).toContain('gatewayAccess.isAuthenticated')
     expect(viewSource).toContain('sessionRouting.available()')
     expect(composerSource).toContain('v-if="modelRoutingVisible"')

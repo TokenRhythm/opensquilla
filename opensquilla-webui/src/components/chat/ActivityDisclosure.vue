@@ -55,7 +55,6 @@
          to the chronological body, outside the total-duration header. -->
     <span v-if="isLive" class="assistant-activity__sr-only" role="status" aria-live="polite" aria-atomic="true">
       {{ phaseAnnouncement || liveStatusLabel }}
-      <template v-if="stale"> {{ t('chat.activity.stale') }}</template>
     </span>
     <div
       :id="bodyId"
@@ -65,9 +64,6 @@
       data-share-activity-body
     >
       <div class="assistant-activity__body-inner">
-        <span v-if="isLive && stale" class="assistant-activity__stale-note" aria-hidden="true">
-          {{ t('chat.activity.stale') }}
-        </span>
         <div v-if="detailLabel" class="assistant-activity__detail">
           {{ detailLabel }}
         </div>
@@ -104,6 +100,7 @@ const props = withDefaults(defineProps<{
   phaseAnnouncement?: string
   phaseWaiting?: boolean
   elapsedLabel?: string
+  queued?: boolean
   stale?: boolean
   executing?: boolean
   defaultOpen?: boolean
@@ -117,6 +114,7 @@ const props = withDefaults(defineProps<{
   detailLabel: '',
   phaseLabel: '',
   elapsedLabel: '',
+  queued: false,
   stale: false,
   executing: false,
   defaultOpen: false,
@@ -179,6 +177,8 @@ const headerMotionActive = computed(() =>
 
 const liveStatusLabel = computed(() => props.phaseLabel || t('chat.activityWorking'))
 const liveElapsedLabel = computed(() => {
+  // Queued tasks have no authoritative execution clock yet.
+  if (props.queued) return t('chat.status.queued')
   // The stream clock is a total in seconds; localize it with the same units
   // as persisted turns so completion does not switch from 107s to 1m 47s.
   const seconds = props.elapsedLabel.match(/^(\d+)s$/)?.[1]
@@ -251,12 +251,6 @@ const resolvedSummaryLabel = computed(() => {
 .assistant-activity__live-head:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
-}
-
-.assistant-activity__stale-note {
-  color: var(--warn);
-  font-size: 0.8125rem;
-  line-height: 1.5;
 }
 
 .assistant-activity__sr-only {

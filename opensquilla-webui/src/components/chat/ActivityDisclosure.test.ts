@@ -25,6 +25,7 @@ const i18n = createI18n({
         activityElapsed: 'Elapsed {duration}',
         activityDurationSeconds: '{seconds}s',
         activityDurationMinutes: '{minutes}m {seconds}s',
+        status: { queued: 'Queued' },
         workedForSeconds: 'Worked for {seconds}s',
         workedForMinutes: 'Worked for {minutes}m {seconds}s',
         activity: {
@@ -67,8 +68,8 @@ afterEach(() => {
 })
 
 describe('ActivityDisclosure lifecycle transitions', () => {
-  it('announces queued then running outside the elapsed-only button', async () => {
-    const state = reactive({ phase: 'Queued' })
+  it('shows queue admission without inventing an elapsed clock, then shows execution time', async () => {
+    const state = reactive({ phase: 'Queued', queued: true, elapsed: '' })
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp({
@@ -78,7 +79,8 @@ describe('ActivityDisclosure lifecycle transitions', () => {
         stepCount: 0,
         failureCount: 0,
         phaseLabel: state.phase,
-        elapsedLabel: '0s',
+        queued: state.queued,
+        elapsedLabel: state.elapsed,
       }),
     })
     mountedApps.push(app)
@@ -88,14 +90,17 @@ describe('ActivityDisclosure lifecycle transitions', () => {
 
     const button = host.querySelector('.assistant-activity__live-head')
     const announcement = host.querySelector('[role="status"]')
-    expect(button?.textContent?.trim()).toBe('Elapsed 0s')
+    expect(button?.textContent?.trim()).toBe('Queued')
+    expect(host.textContent).not.toContain('0s')
     expect(announcement?.textContent?.trim()).toBe('Queued')
     expect(announcement?.closest('button')).toBeNull()
     expect(host.textContent).not.toContain('Waiting for model')
 
     state.phase = 'Running'
+    state.queued = false
+    state.elapsed = '1s'
     await nextTick()
-    expect(button?.textContent?.trim()).toBe('Elapsed 0s')
+    expect(button?.textContent?.trim()).toBe('Elapsed 1s')
     expect(announcement?.textContent?.trim()).toBe('Running')
   })
 
@@ -746,7 +751,7 @@ describe('ActivityDisclosure live header', () => {
 })
 
 describe('ActivityDisclosure stale state', () => {
-  it('keeps the stale explanation in the process body and the header on total elapsed time', async () => {
+  it('keeps elapsed time and process content without a visible silence warning', async () => {
     const host = mountDisclosure({
       lifecycle: 'working',
       stepCount: 0,
@@ -759,10 +764,9 @@ describe('ActivityDisclosure stale state', () => {
     const button = host.querySelector('.assistant-activity__live-head')
     const note = host.querySelector('.assistant-activity__stale-note')
     expect(button?.textContent?.trim()).toBe('Elapsed 24s')
-    expect(note?.textContent?.trim())
-      .toBe('Still working — no recent signal')
-    expect(note?.closest('.assistant-activity__body')).not.toBeNull()
-    expect(note?.closest('.assistant-activity__header')).toBeNull()
+    expect(note).toBeNull()
+    expect(host.querySelector('.assistant-activity__body')?.textContent)
+      .not.toContain('Still working — no recent signal')
     expect(host.querySelector('.assistant-activity__live-dot')).toBeNull()
     expect(host.querySelector('.activity-motion--active')).toBeNull()
   })
@@ -782,12 +786,11 @@ describe('ActivityDisclosure stale state', () => {
     expect(host.querySelector('[role="status"]')?.textContent)
       .toContain('Running commands')
     expect(host.querySelector('[role="status"]')?.textContent)
-      .toContain('Still working — no recent signal')
-    expect(host.querySelector('.assistant-activity__stale-note')?.getAttribute('aria-hidden'))
-      .toBe('true')
+      .not.toContain('Still working — no recent signal')
+    expect(host.querySelector('.assistant-activity__stale-note')).toBeNull()
   })
 
-  it('removes the stale explanation without restarting the expanded header', async () => {
+  it('recovers from silence without replacing process content or the expanded header', async () => {
     const props = reactive({
       lifecycle: 'working' as const,
       stepCount: 1,
@@ -799,7 +802,7 @@ describe('ActivityDisclosure stale state', () => {
     })
     const host = mountDisclosure(props)
     await nextTick()
-    expect(host.querySelector('.assistant-activity__stale-note')).not.toBeNull()
+    expect(host.querySelector('.assistant-activity__stale-note')).toBeNull()
     host.querySelector<HTMLButtonElement>('.assistant-activity__live-head')?.click()
     await nextTick()
     expect(host.querySelector('.assistant-activity__live-head')?.getAttribute('aria-expanded')).toBe('true')

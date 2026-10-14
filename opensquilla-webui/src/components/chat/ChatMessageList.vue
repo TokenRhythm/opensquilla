@@ -283,6 +283,7 @@ const props = defineProps<{
   layoutHeader?: HTMLElement | null
   /** Session/render epoch used to invalidate deferred scroll corrections. */
   scrollEpoch?: number
+  restoredViewport?: ChatViewportSnapshot
   /** Authorized delivery identity; only this scope may reuse completed bodies. */
   contentCacheScope?: string | null
   /** Explicit invalidation for reset, deletion, or changed history generation. */
@@ -756,6 +757,7 @@ function updateSizeAdjustmentPolicy(
 }
 
 const messageKeys = computed(() => props.messages.map(chatMessageKey))
+const restoredSizes = computed(() => new Map(props.restoredViewport?.rows.map(row => [row.key, row.size])))
 const hasTrailing = computed(() => Boolean(slots.trailing))
 const virtualizationEnabled = computed(() => (
   virtualizationAllowed.value && !props.shareMode && !props.virtualizationDisabled
@@ -769,6 +771,7 @@ const forcedIndexes = computed(() => {
       ensuredMessageKeys.value.has(key) || focusedMessageKey.value === key
       || layoutAnchorKey.value === key
       || props.forceMountMessageKeys?.has(key)
+      || (props.previewReadOnly && props.restoredViewport?.anchor?.key === key)
       || message.isStreaming || message.maintenance?.state === 'running'
       || message.parts?.some(part => part.type === 'interrupt' && !part.resolution)
     ) forced.add(index)
@@ -791,8 +794,14 @@ const virtualizer = useVirtualizer<HTMLElement, HTMLElement>(computed(() => {
     getScrollElement: () => props.scrollContainer ?? null,
     getItemKey: (index: number) => index < keys.length
       ? keys[index] : 'trailing:' + (props.trailingKey ?? props.sessionKey ?? ''),
-    estimateSize: (index: number) => index < props.messages.length
-      ? estimatedMessageSize(props.messages[index]) : 0,
+    estimateSize: (index: number) => {
+      const key = index < keys.length ? keys[index] : 'trailing:' + (props.trailingKey ?? props.sessionKey ?? '')
+      const cached = props.restoredViewport
+      // Width changes reflow text; never reuse an old-width height estimate.
+      const size = cached && Math.abs(cached.width - (props.scrollContainer?.clientWidth || layoutWidth)) < 1
+        ? restoredSizes.value.get(key) : undefined
+      return size ?? (index < props.messages.length ? estimatedMessageSize(props.messages[index]) : 0)
+    },
     overscan: 5,
     scrollMargin: scrollMargin.value,
     paddingEnd: props.bottomPadding ?? 0,

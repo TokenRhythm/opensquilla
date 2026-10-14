@@ -5,7 +5,7 @@ import { createApp, h, nextTick, reactive, ref, type App } from 'vue'
 
 import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
-import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
+import type { ChatMessageListVirtualizer, ChatViewportSnapshot } from '@/types/chatVirtualizer'
 import { consumeProgrammaticScroll } from '@/utils/chat/scrollMutation'
 import ChatMessageList from './ChatMessageList.vue'
 
@@ -60,6 +60,8 @@ async function mountList(options: {
   withoutScrollContainer?: boolean
   virtualizationDisabled?: boolean
   fitsViewport?: boolean
+  restoredViewport?: ChatViewportSnapshot
+  previewReadOnly?: boolean
 } = {}) {
   const container = document.createElement('div')
   container.dataset.testScroll = 'true'
@@ -88,6 +90,8 @@ async function mountList(options: {
     sessionKey: options.sessionKey,
     scrollEpoch: options.scrollEpoch ?? 0,
     bottomPadding: options.bottomPadding ?? 0,
+    restoredViewport: options.restoredViewport,
+    previewReadOnly: options.previewReadOnly ?? false,
     selectedMessageIds: new Set<string>(),
     stripTimePrefix: (value: string) => value,
     renderMarkdown: (value: string) => value,
@@ -161,6 +165,35 @@ describe('ChatMessageList long-history virtualization', () => {
     await nextTick()
     expect(saved.scrollTop).toBe(940.25)
     expect(saved.anchor?.key).toBe('message-10')
+  })
+
+  it('restores the same keyed reading location after visiting another session and prepending history', async () => {
+    const original = Array.from({ length: 40 }, (_, index) => message(index))
+    const { api, container, props } = await mountList({
+      messages: original, followLiveEdge: false, sessionKey: 'session-a', scrollEpoch: 1,
+    })
+    container.scrollTop = 977 // 37 px inside message-10.
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    const saved = api.captureViewport!()
+    expect(saved.anchor).toEqual({ key: 'message-10', intraOffset: 37 })
+    props.sessionKey = 'session-b'
+    props.scrollEpoch++
+    props.messages = Array.from({ length: 40 }, (_, index) => message(index + 100))
+    container.scrollTop = 0
+    await nextTick()
+    await nextTick()
+    props.sessionKey = 'session-a'
+    props.scrollEpoch++
+    props.messages = [message(-1), ...original]
+    props.restoredViewport = saved
+    props.previewReadOnly = true
+    await nextTick()
+    await nextTick()
+    api.restoreViewport!(saved)
+    await nextTick()
+    expect(container.scrollTop).toBe(977 + 94)
+    expect(api.captureViewport!().anchor).toEqual(saved.anchor)
   })
 
   it('restores a followed live edge using the current height instead of its stale absolute offset', async () => {

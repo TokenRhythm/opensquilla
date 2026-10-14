@@ -464,40 +464,38 @@
               @pointerdown="focusSendHint"
               @keydown.esc="dismissSendHint"
             >
-              <Transition name="composer-ctl" mode="out-in">
-                <button
-                  v-if="canStop && !showSkillQueueSend"
-                  key="stop"
-                  class="btn btn--icon btn--danger chat-send-btn chat-stop-btn"
-                  :disabled="stopPending"
-                  :aria-busy="stopPending || undefined"
-                  :title="stopTargetsPlanRun
-                    ? t('chat.planRun.stopExecutionEsc')
-                    : t('chat.stopResponseEsc')"
-                  :aria-label="stopTargetsPlanRun
-                    ? t('chat.planRun.stopExecution')
-                    : t('chat.stopResponse')"
-                  @click="emit('stop')"
-                >
-                  <Icon name="stop" :size="16" />
-                </button>
-                <button
-                  v-else
-                  key="send"
-                  class="btn btn--icon btn--primary chat-send-btn"
-                  :class="{ 'is-ready': hasSendContent && !sendBlockedMessage && !sendDisabled && !inputDisabled }"
-                  :title="sendBlockedMessage || sendPending || sendDisabled || sessionRoutingBusy || inputDisabled ? undefined
-                    : showSkillQueueSend ? t('chat.sendQueues') : sendButtonTitle"
-                  :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
-                  :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
-                  :aria-busy="sendPending || sessionRoutingBusy ? 'true' : 'false'"
-                  :disabled="sendPending || sendDisabled || Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
-                  @click="emit('send')"
-                >
-                  <LoadingSpinner v-if="sendPending" />
-                  <Icon v-else name="arrowUp" :size="17" />
-                </button>
-              </Transition>
+              <button
+                v-if="(canStop || showStop) && !showSkillQueueSend"
+                key="stop"
+                class="btn btn--icon btn--danger chat-send-btn chat-stop-btn"
+                :disabled="stopPending || !canStop"
+                :aria-busy="stopPending || !canStop || undefined"
+                :title="stopTargetsPlanRun
+                  ? t('chat.planRun.stopExecutionEsc')
+                  : t('chat.stopResponseEsc')"
+                :aria-label="stopTargetsPlanRun
+                  ? t('chat.planRun.stopExecution')
+                  : t('chat.stopResponse')"
+                @click="canStop && !stopPending && emit('stop')"
+              >
+                <Icon name="stop" :size="16" />
+              </button>
+              <button
+                v-else
+                key="send"
+                class="btn btn--icon btn--primary chat-send-btn"
+                :class="{ 'is-ready': hasSendContent && !sendBlockedMessage && !sendDisabled && !inputDisabled }"
+                :title="sendBlockedMessage || sendPending || sendDisabled || sessionRoutingBusy || inputDisabled ? undefined
+                  : showSkillQueueSend ? t('chat.sendQueues') : sendButtonTitle"
+                :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
+                :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
+                :aria-busy="sendPending || sessionRoutingBusy ? 'true' : 'false'"
+                :disabled="sendPending || sendDisabled || Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
+                @click="emit('send')"
+              >
+                <LoadingSpinner v-if="sendPending" />
+                <Icon v-else name="arrowUp" :size="17" />
+              </button>
               <span
                 v-if="sendControlHint"
                 id="chat-composer-send-tooltip"
@@ -573,6 +571,8 @@ const props = withDefaults(defineProps<{
   sendDisabled?: boolean
   isStreaming: boolean
   canStop: boolean
+  /** Retain the current task's shape during recovery; never grants Stop permission. */
+  showStop?: boolean
   stopTargetsPlanRun?: boolean
   stopPending?: boolean
   isNewLanding: boolean
@@ -2299,19 +2299,6 @@ button.attachment-chip__primary:focus-visible {
   to { transform: rotate(360deg); }
 }
 
-/* Streaming-only controls (Stop, Queue/Steer) ease in/out at turn boundaries
-   instead of popping into the action cluster. */
-.composer-ctl-enter-active,
-.composer-ctl-leave-active {
-  transition: opacity var(--dur-fast) var(--ease-out),
-              transform var(--dur-fast) var(--ease-out);
-}
-.composer-ctl-enter-from,
-.composer-ctl-leave-to {
-  opacity: 0;
-  transform: scale(0.9);
-}
-
 @media (prefers-reduced-motion: reduce) {
   .chat-composer,
   .chat-collapse-region,
@@ -2321,11 +2308,6 @@ button.attachment-chip__primary:focus-visible {
   }
 
   .chat-run-mode-lock-tip {
-    transition: none;
-  }
-
-  .composer-ctl-enter-active,
-  .composer-ctl-leave-active {
     transition: none;
   }
 }

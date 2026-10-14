@@ -2,6 +2,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref, watch, type Ref } from 'vue'
 import { useChatSessionViewCache } from './useChatSessionViewCache'
+import chatViewSource from '@/views/ChatView.vue?raw'
 
 import { useChatHistory } from './useChatHistory'
 import { projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
@@ -316,6 +317,89 @@ function historyMessage(id: string): SessionReadMessage {
 }
 
 describe('history installation for warm session views', () => {
+  // Exercise the real composition-root readiness hook. Copying its watcher
+  // here would let the test and production wiring silently diverge.
+  const readinessWatch = chatViewSource.match(/watch\((?:\(\) => historyState\.value\.initialLoadStatus|\[\s*\(\) => historyState\.value\.initialLoadStatus)[\s\S]*?\}, \{ flush: 'sync' \}\)/)?.[0]
+  if (!readinessWatch) throw new Error('ChatView history readiness watcher is missing')
+  const installReadinessWatch = new Function(
+    'watch', 'historyState', 'historySessionKey', 'sessionKey', 'sessionViewCache', readinessWatch,
+  )
+
+  it.each([
+    ['fallback', 'fallback'], ['fallback', 'read-error'],
+    ['canonical', 'fallback'], ['canonical', 'read-error'],
+  ] as const)(
+    'releases repeated %s to %s history refreshes after epoch invalidation only when the current read finishes', async (initialKind, result) => {
+      const scope = effectScope()
+      const sessionKey = ref('A')
+      let installed: (key: string) => void = () => {}
+      const fallback: SessionReadHistoryPageFixture = {
+        canonicalAvailable: false, canonicalComplete: false,
+        messages: [{ role: 'assistant', messageId: 'fallback', text: 'Readable fallback history' }],
+      }
+      const h = makeHistory(false, { sessionKey,
+        response: { ...fallback, canonicalAvailable: initialKind === 'canonical', canonicalComplete: initialKind === 'canonical' },
+        onHistoryInstalled: key => installed(key),
+      })
+      const cache = scope.run(() => useChatSessionViewCache({
+        sessionKey, deliveryIdentity: ref('gateway'), messages: h.messages, waitForLive: true,
+      }))!
+      installed = cache.historyInstalled
+      scope.run(() => installReadinessWatch(watch, h.api.historyState, h.api.historySessionKey, sessionKey, cache))
+      try {
+        cache.observeEpoch('A', 0)
+        await h.api.loadHistory()
+        cache.liveInstalled('A')
+        expect(cache.ready.value).toBe(true)
+        for (const epoch of [1, 2]) {
+          cache.observeEpoch('A', epoch)
+          let resolve!: (page: SessionReadHistoryPageFixture) => void
+          let reject!: (error: Error) => void
+          h.historyFixture.mockImplementationOnce(() => new Promise((done, fail) => { resolve = done; reject = fail }))
+          const pending = h.api.loadHistory()
+          cache.liveInstalled('A')
+          expect(h.api.historyState.value).toMatchObject({ initialLoadStatus: 'ready', loading: true })
+          expect(cache.ready.value).toBe(false)
+          if (result === 'fallback') resolve(fallback)
+          else reject(new Error('history temporarily unavailable'))
+          await pending
+          expect(h.api.historyState.value).toMatchObject({ initialLoadStatus: 'ready', loading: false,
+            canonicalAvailable: initialKind === 'canonical' && result === 'read-error',
+            recoveryError: result === 'read-error',
+          })
+          expect(h.messages.value.map(message => message.text)).toEqual(['Readable fallback history'])
+          expect(cache.ready.value).toBe(true)
+        }
+        // Readable fallback/error display never becomes an authoritative cache.
+        sessionKey.value = 'B'
+        sessionKey.value = 'A'
+        expect(cache.showingPreview.value).toBe(false)
+      } finally { h.api.cleanup(); scope.stop() }
+    },
+  )
+
+  it('does not release a new session from the prior session history read completion', async () => {
+    const scope = effectScope()
+    const sessionKey = ref('A')
+    const h = makeHistory(false, { sessionKey, response: {
+      canonicalAvailable: false, messages: [{ role: 'assistant', messageId: 'a', text: 'A history' }],
+    } })
+    const cache = scope.run(() => useChatSessionViewCache({
+      sessionKey, deliveryIdentity: ref('gateway'), messages: h.messages, waitForLive: true,
+    }))!
+    scope.run(() => installReadinessWatch(watch, h.api.historyState, h.api.historySessionKey, sessionKey, cache))
+    try {
+      await h.api.loadHistory()
+      cache.liveInstalled('A')
+      expect(cache.ready.value).toBe(true)
+      sessionKey.value = 'B'
+      cache.liveInstalled('B')
+      h.api.historyState.value = { ...h.api.historyState.value, loading: true }
+      h.api.historyState.value = { ...h.api.historyState.value, loading: false }
+      expect(cache.ready.value).toBe(false)
+    } finally { h.api.cleanup(); scope.stop() }
+  })
+
   it.each([[100, 100], [500, 200], [Number.NaN, 50]])('refreshes the bounded cached window (%s -> %s) without restoring cursors', async (size, limit) => {
     const h = makeHistory(true, { initialWindowSize: () => size })
     await h.api.loadHistory()

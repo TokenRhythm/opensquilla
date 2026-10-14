@@ -145,7 +145,7 @@ describe('one owner for the current provider wait', () => {
   it('keeps provider waits in both ChatView display projections while tool previews replace only their preparation step', () => {
     for (const name of ['UnifiedAssistantActivityTimeline', 'AssistantActivityTimeline']) {
       const opening = chatViewSource.match(new RegExp(`<${name}\\b[^>]*>`))?.[0]
-      expect(opening).toContain(':projection="liveActivityDisplayProjection"')
+      expect(opening).toContain(':projection="presentedLive.liveActivityDisplayProjection"')
     }
     expect(chatViewSource).toContain("!(step.isCurrent && step.label.code === 'chat.activity.lifecycle.preparingToolCall')")
     expect(chatViewSource).not.toContain('withoutHeaderProviderWait')

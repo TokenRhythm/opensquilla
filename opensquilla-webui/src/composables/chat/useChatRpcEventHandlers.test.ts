@@ -1220,6 +1220,60 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
 })
 
 describe('useChatRpcEventHandlers live snapshot restoration', () => {
+  it.each(['state-changed', 'thinking-delta', 'run-heartbeat', 'text-delta'] as const)(
+    'preserves a detached reader when an early %s event opens the live reducer', semanticKind => {
+      const autoScroll = ref(false)
+      const scrollToBottom = vi.fn()
+      const stream = useChatStream({
+        messages: ref<ChatMessage[]>([]), lastHeaderRole: ref(''), aborted: ref(false), autoScroll,
+        applySessionRunState: vi.fn(), renderMarkdown: text => text,
+        stripDirectiveTags: text => text, stripGeneratedArtifactMarkers: text => text,
+        scrollToBottom,
+      })
+      const h = createHarness({ stream })
+      h.activeStreamTaskId.value = 'restored-task'
+      try {
+        const payload = {
+          key: h.sessionKey.value, task_id: 'restored-task', turn_id: 'restored-task',
+          stream_seq: 1, to_state: 'thinking', text: 'restored progress', phase: 'llm_tool_arguments',
+        }
+        // A queued event may arrive before snapshot/metadata restoration has
+        // started; no call-site option can distinguish every such entry point.
+        h.api.onConversationEvent({ kind: 'conversation', event: {
+          kind: 'known', semanticKind, payload, meta: {},
+          sessionKey: payload.key, taskId: payload.task_id, turnId: payload.turn_id,
+          streamGeneration: null, streamSeq: 1, connectionSeq: null, generationEpoch: null,
+        } })
+        expect(stream.isStreaming.value).toBe(true)
+        expect(autoScroll.value).toBe(false)
+        expect(scrollToBottom).not.toHaveBeenCalled()
+        if (semanticKind === 'text-delta') expect(stream.foldedTurn.value.rawText).toBe('restored progress')
+      } finally { h.stop(); stream.cleanup() }
+    },
+  )
+
+  it.each([false, true])('preserves reader follow=%s when restoring a live snapshot', follow => {
+    const autoScroll = ref(follow)
+    const stream = useChatStream({
+      messages: ref<ChatMessage[]>([]), lastHeaderRole: ref(''), aborted: ref(false), autoScroll,
+      applySessionRunState: vi.fn(), renderMarkdown: text => text,
+      stripDirectiveTags: text => text, stripGeneratedArtifactMarkers: text => text,
+      scrollToBottom: vi.fn(),
+    })
+    const h = createHarness({ stream })
+    try {
+      h.api.restoreLiveTurnSnapshot({
+        sessionKey: h.sessionKey.value, taskId: 'restored-task', currentStreamSeq: 1,
+        events: [{ semanticKind: 'text-delta', payload: {
+          key: h.sessionKey.value, task_id: 'restored-task', stream_seq: 1, text: 'restored answer',
+        } }],
+      })
+      expect(stream.isStreaming.value).toBe(true)
+      expect(stream.foldedTurn.value.rawText).toBe('restored answer')
+      expect(autoScroll.value).toBe(follow)
+    } finally { h.stop(); stream.cleanup() }
+  })
+
   it('starts restored activity at the earliest server event timestamp', () => {
     const harness = createHarness()
     harness.stream.isStreaming.value = false

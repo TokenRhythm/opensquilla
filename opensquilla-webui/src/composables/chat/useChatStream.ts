@@ -522,7 +522,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamBubble.value = true
     streamShowHeader.value = options.lastHeaderRole.value !== 'assistant'
     setStreamActivity('Sending', 'Sending', recordInitialActivity)
-    options.autoScroll.value = true
+    // Opening the live reducer also happens for replay and recovery. The send
+    // path owns following a new turn; incoming events preserve reader intent.
     resetStreamIdleTimer()
   }
 

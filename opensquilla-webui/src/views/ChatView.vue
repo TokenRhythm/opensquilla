@@ -181,7 +181,7 @@
           v-if="!historyState.sessionMissing"
           class="chat-message-surface"
           :class="{ 'chat-message-surface--preview': forkTransition }"
-          :inert="forkTransition ? true : undefined"
+          :inert="forkTransition || sessionViewCache.showingPreview.value ? true : undefined"
           :aria-hidden="forkTransition ? 'true' : undefined"
           :data-preview-session="forkTransition?.parentKey"
         >
@@ -235,6 +235,7 @@
           :is-streaming="!findContextMessages && isStreaming"
           :follow-live-edge="!chatFind.open.value && autoScroll"
           :scroll-epoch="scrollEpoch"
+          :restored-viewport="sessionViewCache.restoredViewport.value"
           :goal="currentGoalRun"
           :goal-elapsed="goalLastElapsed"
           :goal-removable="!shareMode && !forkTransition"
@@ -326,46 +327,47 @@
           @presentation-change="chatPlans.setPresentation"
         />
 
-        <SkillLoadStatus v-if="isStreaming" standalone :receipts="liveSkillLoads[activeStreamTaskId] || []" />
+        <SkillLoadStatus v-if="presentedLive.visible" standalone :receipts="presentedLive.skillLoads" />
 
         <!-- Streaming AI message: activity stays open while the turn is live.
              Gateway-marked intermediate text remains in the transcript, while
              gateway-marked answer text streams below the activity boundary. -->
         <!-- No blanket aria-live here: ActivityDisclosure announces phase
              changes separately from its total timer and streaming content. -->
-        <div v-if="isStreaming && streamBubble && answerRevealOpen" class="msg-ai" data-history-role="assistant">
+        <div v-if="presentedLive.visible" class="msg-ai" data-history-role="assistant">
           <div class="msg-ai-main">
             <ActivityDisclosure
               default-open
               lifecycle="working"
-              :continuity-key="liveActivityContinuityKey"
-              :executing="liveActivityExecuting"
-              :step-count="executionDockRun?.status === 'running' ? 0 : liveActivityStepCount"
-              :failure-count="liveActivityFailureCount"
-              :phase-label="liveActivityPhaseLabel"
-              :phase-announcement="liveActivityPhaseAnnouncement"
-              :phase-waiting="liveActivityWaiting"
-              :elapsed-label="streamTurnElapsed"
-              :stale="streamActivityStale"
+              :continuity-key="presentedLive.liveActivityContinuityKey"
+              :executing="presentedLive.liveActivityExecuting"
+              :step-count="presentedLive.liveActivityStepCount"
+              :failure-count="presentedLive.liveActivityFailureCount"
+              :phase-label="presentedLive.liveActivityPhaseLabel"
+              :phase-announcement="presentedLive.liveActivityPhaseAnnouncement"
+              :phase-waiting="presentedLive.liveActivityWaiting"
+              :elapsed-label="presentedLive.streamTurnElapsed"
+              :stale="presentedLive.streamActivityStale"
+              :queued="presentedLive.queued"
             >
               <UnifiedAssistantActivityTimeline
                 :session-key="sessionKey"
-                :executing="liveActivityExecuting"
-                v-if="liveHasUnifiedActivityOrder"
+                :executing="presentedLive.liveActivityExecuting"
+                v-if="presentedLive.liveHasUnifiedActivityOrder"
                 variant="checklist"
-                :projection="liveActivityDisplayProjection"
-                :tool-input-previews="toolInputPreviews"
-                :timeline-items="liveActivityTimelineItems"
-                :reasoning-blocks="liveReasoningBlocks"
-                :reasoning-collapse-active="liveReasoningCollapseActive"
+                :projection="presentedLive.liveActivityDisplayProjection"
+                :tool-input-previews="presentedLive.toolInputPreviews"
+                :timeline-items="presentedLive.liveActivityTimelineItems"
+                :reasoning-blocks="presentedLive.liveReasoningBlocks"
+                :reasoning-collapse-active="presentedLive.liveReasoningCollapseActive"
                 :reasoning-timeline-phase="false"
-                :state-scope="liveToolStateScope"
+                :state-scope="presentedLive.liveToolStateScope"
                 :is-tool-group-open="isToolGroupOpen"
                 :is-tool-item-open="isToolItemOpen"
                 :tool-group-status-text="toolGroupStatusText"
                 :tool-status-text="toolStatusText"
                 :tool-secondary-text="toolSecondaryText"
-                :tool-elapsed-text="liveToolElapsedText"
+                :tool-elapsed-text="presentedToolElapsedText"
                 @toggle-group="toggleToolGroup"
                 @toggle-item="toggleToolItem"
                 @show-result="showToolResultModal"
@@ -384,31 +386,31 @@
               </UnifiedAssistantActivityTimeline>
               <template v-else>
               <ReasoningTimeline
-                v-if="liveReasoningBlocks.length"
-                :executing="liveActivityExecuting"
+                v-if="presentedLive.liveReasoningBlocks.length"
+                :executing="presentedLive.liveActivityExecuting"
                 :session-key="sessionKey"
-                :blocks="liveReasoningBlocks"
-                :collapse-active="liveReasoningCollapseActive"
+                :blocks="presentedLive.liveReasoningBlocks"
+                :collapse-active="presentedLive.liveReasoningCollapseActive"
                 nested
               />
 
               <AssistantActivityTimeline
                 :session-key="sessionKey"
-                :executing="liveActivityExecuting"
+                :executing="presentedLive.liveActivityExecuting"
                 v-if="
-                  liveActivityTimelineItems.length
-                  || liveActivityProjection.statusSteps.length
+                  presentedLive.liveActivityTimelineItems.length
+                  || presentedLive.liveActivityDisplayProjection.statusSteps.length
                 "
                 variant="checklist"
-                :projection="liveActivityDisplayProjection"
-                :timeline-items="liveActivityTimelineItems"
-                :state-scope="liveToolStateScope"
+                :projection="presentedLive.liveActivityDisplayProjection"
+                :timeline-items="presentedLive.liveActivityTimelineItems"
+                :state-scope="presentedLive.liveToolStateScope"
                 :is-tool-group-open="isToolGroupOpen"
                 :is-tool-item-open="isToolItemOpen"
                 :tool-group-status-text="toolGroupStatusText"
                 :tool-status-text="toolStatusText"
                 :tool-secondary-text="toolSecondaryText"
-                :tool-elapsed-text="liveToolElapsedText"
+                :tool-elapsed-text="presentedToolElapsedText"
                 @toggle-group="toggleToolGroup"
                 @toggle-item="toggleToolItem"
                 @show-result="showToolResultModal"
@@ -425,9 +427,9 @@
                   />
                 </template>
               </AssistantActivityTimeline>
-              <ToolInputPreview v-for="preview in toolInputPreviews" :key="preview.previewId"
-                :preview="preview" :executing="liveActivityExecuting" :state-scope="liveToolStateScope"
-                :open="isToolItemOpen(liveToolStateScope ? `${liveToolStateScope}:${preview.toolUseId}` : preview.toolUseId) === true"
+              <ToolInputPreview v-for="preview in presentedLive.toolInputPreviews" :key="preview.previewId"
+                :preview="preview" :executing="presentedLive.liveActivityExecuting" :state-scope="presentedLive.liveToolStateScope"
+                :open="isToolItemOpen(presentedLive.liveToolStateScope ? `${presentedLive.liveToolStateScope}:${preview.toolUseId}` : preview.toolUseId) === true"
                 @toggle-item="toggleToolItem" />
               </template>
             </ActivityDisclosure>
@@ -435,20 +437,20 @@
             <!-- The gateway marks text as intermediate or answer. Only the
                  semantic answer span streams below the activity boundary; no
                  timeout or draft heuristic is involved. -->
-            <div v-if="liveAnswerPart" class="live-answer">
+            <div v-if="presentedLive.liveAnswerPart" class="live-answer">
               <StreamingTextPart
-                :raw-text="liveAnswerPart.rawText"
+                :raw-text="presentedLive.liveAnswerPart.rawText"
                 :render-markdown="renderMarkdown"
               />
             </div>
             <span
-              v-if="liveAnswerPart && !streamActivityStale && liveCurrentPhaseCode === 'chat.activity.lifecycle.answering'"
+              v-if="presentedLive.liveAnswerPart && presentedLive.liveActivityExecuting && !presentedLive.streamActivityStale && presentedLive.liveCurrentPhaseCode === 'chat.activity.lifecycle.answering'"
               class="stream-caret"
               aria-hidden="true"
             />
 
             <ChatArtifactList
-              :artifacts="liveArtifacts"
+              :artifacts="presentedLive.liveArtifacts"
               :navigation-artifacts="sessionArtifacts"
               :session-key="sessionKey"
               :prefer-workbench="workbenchEnabled"
@@ -463,7 +465,7 @@
              the live edge. A resolution removes this card and leaves its compact
              outcome in chronological history. -->
         <InterruptPart
-          v-for="part in livePendingInterruptParts"
+          v-for="part in presentedLive.livePendingInterruptParts"
           :key="part.key"
           :part="part"
           @resolve="resolveInterrupt"
@@ -495,7 +497,7 @@
         </div>
 
         <!-- Thinking indicator -->
-        <div v-else-if="thinkingVisible && answerRevealOpen" class="msg-ai thinking" role="status" aria-live="polite">
+        <div v-else-if="thinkingVisible && answerRevealOpen && sessionViewCache.ready.value && !sessionViewCache.showingPreview.value" class="msg-ai thinking" role="status" aria-live="polite">
           <div class="msg-ai-main">
             <div class="thinking-status">
               <span class="stream-activity-dot" aria-hidden="true" />
@@ -656,6 +658,7 @@
       :send-disabled="chatSend.sendHydrationBlocked.value"
       :is-streaming="isStreaming"
       :can-stop="canStop"
+      :show-stop="showStableStop || showCachedStop"
       :stop-targets-plan-run="composerStopsPlanRun"
       :stop-pending="planActionPending === 'cancel-run'"
       :is-new-landing="isNewChatLanding"
@@ -673,20 +676,20 @@
       :safe-setup-available="composerSafeSetupAvailable"
       :run-mode-locked="runModeLocked"
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
-      :session-routing-mode="modelRoutingMode"
+      :session-routing-mode="sessionViewCache.presentation.value?.modelRoutingMode ?? modelRoutingMode"
       :session-routing-busy="modelRoutingMutationBusy"
-      :session-routing-control-blocked="goalBusy || modelRoutingSettingsBusy"
+      :session-routing-control-blocked="goalBusy || modelRoutingSettingsBusy || sessionViewCache.showingPreview.value"
       :session-routing-available="sessionRoutingAvailable"
-      :session-model-name="sessionModelName"
+      :session-model-name="sessionViewCache.showingPreview.value ? sessionViewCache.presentation.value?.sessionModelName : sessionModelName"
       :is-new-task="isProvisionalDraftSession()"
-      :model-selection-available="composerModelSelectionAvailable"
+      :model-selection-available="sessionViewCache.presentation.value?.modelSelectionAvailable ?? composerModelSelectionAvailable"
       :available-models="newTaskModels"
-      :model-selection="composerModelSelection"
+      :model-selection="sessionViewCache.showingPreview.value ? sessionViewCache.presentation.value?.modelSelection : composerModelSelection"
       :default-model="composerDefaultModel"
       :models-loading="newTaskModelsLoading"
       :models-error="newTaskModelsError"
       :model-provider-errors="newTaskModelsProviderErrors"
-      :model-selection-disabled-reason="composerModelDisabledReason"
+      :model-selection-disabled-reason="sessionViewCache.showingPreview.value ? 'busy' : composerModelDisabledReason"
       :goal-draft-armed="goalDraftArmed"
       :goal-mode-available="goalUiAvailable"
       :goal-mode-busy="goalBusy || planModeBusy || replanActive"
@@ -913,6 +916,7 @@ import { useLocalPathDraft } from '@/composables/chat/useLocalPathDraft'
 import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
+import { useStableStopControl } from '@/composables/chat/useStableStopControl'
 import { useNewTaskModelSelection, type NewTaskModelSelection } from '@/composables/chat/useNewTaskModelSelection'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
 import { USAGE_REPORTING_KEY, type UsageReporting } from '@/modules/usageReporting'
@@ -1172,7 +1176,7 @@ import {
   isSendableAttachment,
   shouldCaptureFilePaste,
 } from '@/utils/chat/attachments'
-import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
+import { chatMessageKey, isShareableChatMessage } from '@/utils/chat/messageIdentity'
 import {
   projectSessionCreationRouterPresentation,
 } from '@/utils/chat/sessionCreationRouterPresentation'
@@ -1194,7 +1198,7 @@ import {
   getChatWheelDirection,
   resolveChatWheelOwnership,
 } from '@/utils/chat/chatScrollOwnership'
-import { activateAssistantActivitySession, clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
+import { activateAssistantActivitySession, assistantActivityContinuityKey, clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import { LOCAL_SESSIONS_DELETED_EVENT, localSessionsDeletedDetail } from '@/utils/sessionSync'
 import { stripBackgroundProcessNoticeTimeline } from '@/utils/chat/backgroundProcessNotice'
 import {
@@ -1964,6 +1968,17 @@ const {
   appendInterruptFrame,
   ensureInterruptBubble,
 } = chatStream
+// Register departure capture before session-scoped routing/live reset watchers.
+// Only display data is retained; subscription, ownership and approvals recover
+// through their existing authoritative readers.
+const sessionViewCache = useChatSessionViewCache({
+  sessionKey, deliveryIdentity, messages, waitForLive: true,
+  capturePresentation: captureSessionPresentation,
+  captureViewport: captureSessionViewport,
+})
+// Task events can confirm an owner before deferred session metadata arrives.
+// Keep that control fact separate from completion of the display snapshot.
+const presentationMetadataReady = ref(false)
 useBrowserAutomationState({
   native: platform.workbench.native,
   sessionKey,
@@ -2501,7 +2516,6 @@ const {
   replanActive,
 } = chatPlans
 
-const sessionViewCache = useChatSessionViewCache({ sessionKey, deliveryIdentity, messages })
 watch(sessionViewCache.generation, () => clearAssistantActivityExpansionState(), { flush: 'sync' })
 function invalidateDeletedSessionViews(event: Event) {
   for (const key of localSessionsDeletedDetail(event)?.keys ?? []) sessionViewCache.invalidate(key)
@@ -2587,9 +2601,15 @@ const chatHistory = useChatHistory({
   onTerminalTask: outcome => {
     const taskId = outcome.taskId || ''
     if (!taskId) return
-    taskOwnership.noteTerminal(taskId)
     const ownsLiveStream = activeStreamTaskId.value === taskId
     const ownsRunStatus = chatTaskId(runStatus.value.task) === taskId
+    if (sessionViewCache.presentation.value?.stoppableTaskId === taskId) {
+      // Durable completion supersedes the cached in-progress picture, even if
+      // transport recovery has not installed a new live snapshot yet.
+      sessionViewCache.retirePreview(sessionKey.value)
+    }
+    // An older finished turn does not resolve the current owner's hydration.
+    taskOwnership.noteTerminal(taskId, ownsLiveStream || ownsRunStatus)
     if (ownsLiveStream) {
       resetStreamLiveTurnState()
       activeStreamTaskId.value = outcome.status === 'cancelled'
@@ -2646,6 +2666,20 @@ watch(chatFind.open, value => { findOwnsViewport.value = value }, { flush: 'sync
 watch(() => historyState.value.sessionMissing, missing => {
   if (missing) sessionViewCache.invalidate(sessionKey.value)
 }, { flush: 'sync' })
+watch([
+  () => historyState.value.initialLoadStatus,
+  () => historyState.value.loading,
+  () => historyState.value.canonicalAvailable,
+  () => historyState.value.recoveryError,
+], ([status, loading, canonicalAvailable, recoveryError]) => {
+  if (historySessionKey.value === sessionKey.value && !loading && (status === 'error' || recoveryError
+    || (status === 'ready' && canonicalAvailable === false))) {
+    // Legacy or retained history remains readable after a failed refresh. It
+    // cannot populate a verified cache, but must not hide the ongoing live
+    // turn. An epoch refresh can finish without changing the ready status.
+    sessionViewCache.historyInstalled(sessionKey.value, false)
+  }
+}, { flush: 'sync' })
 
 function cancelInitialSessionPin() {
   if (initialSessionPinFrame !== null) {
@@ -2679,10 +2713,9 @@ function beginSessionScrollEpoch() {
   resetReaderScrollTracking()
   clearPendingComposerScrollIntent()
   if (threadRef.value) clearProgrammaticScroll(threadRef.value)
-  // The selected product policy is that every newly opened session starts at
-  // its live edge. A pre-pin reader gesture is recorded below and takes
-  // precedence over this one initial pin.
-  autoScroll.value = true
+  // A warm return restores the reader's position; first visits start at the
+  // live edge. Any new reader gesture still wins over pending restoration.
+  autoScroll.value = sessionViewCache.restoredViewport.value?.followLiveEdge ?? true
 }
 
 function scheduleInitialSessionPin(epoch: number) {
@@ -2701,14 +2734,16 @@ function scheduleInitialSessionPin(epoch: number) {
       if (
         epoch !== scrollEpoch.value
         || sessionScrollInputEpoch === epoch
-        || (!isNewChatLanding.value && sessionKey.value !== historySessionKey.value)
+        || (!isNewChatLanding.value && !sessionViewCache.showingPreview.value && sessionKey.value !== historySessionKey.value)
       ) {
         if (epoch === scrollEpoch.value) sessionScrollSwitching = false
         return
       }
       const thread = threadRef.value
       if (thread && bottomSentinelRef.value) {
-        messageListRef.value?.scrollToEnd({ behavior: 'auto' })
+        const saved = sessionViewCache.restoredViewport.value
+        if (saved) messageListRef.value?.restoreViewport?.(saved)
+        else messageListRef.value?.scrollToEnd({ behavior: 'auto' })
       }
       sessionScrollSwitching = false
     })
@@ -2717,13 +2752,12 @@ function scheduleInitialSessionPin(epoch: number) {
 
 watch(sessionKey, beginSessionScrollEpoch, { flush: 'sync' })
 watch(
-  () => [sessionKey.value, historySessionKey.value, historyState.value.initialLoadStatus] as const,
-  ([activeKey, loadedKey, status]) => {
+  () => [sessionKey.value, historySessionKey.value, sessionViewCache.ready.value, sessionViewCache.showingPreview.value] as const,
+  ([activeKey, loadedKey, ready, preview]) => {
     if (
       !sessionScrollSwitching
       || !activeKey
-      || activeKey !== loadedKey
-      || (status !== 'ready' && status !== 'error')
+      || (!preview && (activeKey !== loadedKey || !ready))
     ) return
     scheduleInitialSessionPin(scrollEpoch.value)
   },
@@ -2858,6 +2892,8 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   onLiveSnapshot: snapshot => restoreLiveTurnSnapshot(snapshot),
   onReadStarted: () => {
+    sessionViewCache.beginLiveRead(sessionKey.value)
+    presentationMetadataReady.value = false
     conversationSessionRuntime.events.invalidateConsumption(sessionKey.value)
     rpcEventHandlers.beginRecovery()
   },
@@ -2908,7 +2944,13 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   onSessionMissing: markSessionMissing,
   onSnapshot: snapshot => {
+    const viewGeneration = sessionViewCache.generation.value
     sessionViewCache.observeEpoch(snapshot.sessionKey, snapshot.epoch)
+    if (viewGeneration !== sessionViewCache.generation.value) {
+      // History can beat metadata on a warm return. A changed incarnation
+      // needs a new fenced history read before the presentation barrier opens.
+      scheduleHistorySync()
+    }
     if (snapshot.sessionKey === sessionKey.value) {
       nativeAttachmentSession.value = typeof snapshot.epoch === 'number' && Number.isSafeInteger(snapshot.epoch)
         && snapshot.epoch >= 0 ? { key: snapshot.sessionKey, epoch: snapshot.epoch } : null
@@ -2918,6 +2960,7 @@ const chatSessionSubscription = useChatSessionSubscription({
     taskProgress.applySnapshot(snapshot)
     applyGoalSnapshot(snapshot)
     applyPendingUserInputSnapshot(snapshot)
+    presentationMetadataReady.value = true
   },
 })
 const {
@@ -2961,6 +3004,12 @@ const {
   setSessionHandoffTarget,
   isSessionBootstrapCurrent,
 } = chatSessionBootstrap
+watch([livePhase, presentationMetadataReady, chatSessionSubscription.metadataRecoveryError], ([phase, metadataReady, error]) => {
+  // Degraded transport must not hide readable history indefinitely. It still
+  // grants no task authority; canStop/send retain their own admission checks.
+  if (phase === 'ready' && metadataReady) sessionViewCache.liveInstalled(sessionKey.value)
+  else if (phase === 'degraded' || (phase === 'ready' && error)) sessionViewCache.liveInstalled(sessionKey.value, false)
+}, { flush: 'sync' })
 
 function holdOptionalRpcAdmission() {
   if (!releaseOptionalRpcAdmission) {
@@ -3241,6 +3290,27 @@ const canStop = computed(() => (
     )
   ))
 ))
+const { showStop: showStableStop } = useStableStopControl({
+  identity: () => deliveryIdentity.value ? JSON.stringify([
+    deliveryIdentity.value, sessionKey.value, nativeAttachmentSession.value?.epoch ?? null,
+  ]) : '',
+  taskId: () => {
+    const id = taskOwnership.stopTargetTaskId.value || activeStreamTaskId.value
+    return [PENDING_STREAM_TASK_ID, FINISHED_STREAM_TASK_ID, STOPPED_STREAM_TASK_ID].includes(id) ? '' : id
+  },
+  canStop: () => canStop.value,
+  hydrating: () => isSessionHydrating.value || !taskOwnership.hydrationResolved.value || !presentationMetadataReady.value,
+  terminal: () => [FINISHED_STREAM_TASK_ID, STOPPED_STREAM_TASK_ID].includes(activeStreamTaskId.value),
+})
+const showCachedStop = computed(() => {
+  const id = sessionViewCache.presentation.value?.stoppableTaskId
+  const current = taskOwnership.stopTargetTaskId.value || activeStreamTaskId.value
+  return Boolean(id && sessionViewCache.showingPreview.value
+    && (isSessionHydrating.value || !taskOwnership.hydrationResolved.value || !presentationMetadataReady.value)
+    && !taskOwnership.isSettled(id)
+    && ![FINISHED_STREAM_TASK_ID, STOPPED_STREAM_TASK_ID].includes(current)
+    && (!current || current === PENDING_STREAM_TASK_ID || current === id))
+})
 const runModeLocked = computed(
   () => isSessionHydrating.value
     || sessionHasActiveWork.value
@@ -3560,6 +3630,11 @@ const chatSlashCommands = useChatSlashCommands({
     resetSessionArtifacts()
     chatPlans.reset()
     chatGoals.reset()
+    // Reset retires both presentation barriers under the same route key.
+    // Confirm the new incarnation instead of leaving live output gated by the
+    // completed bootstrap of the discarded conversation.
+    scheduleHistorySync()
+    void retryLive()
   },
   setCompactInFlight,
   showCompactStatus,
@@ -4288,7 +4363,6 @@ const liveReasoningCollapseActive = computed(() =>
 )
 const {
   stateScope: liveToolStateScope,
-  activityContinuityKey: liveActivityContinuityKey,
 } = useChatToolDisclosureScope({
   sessionKey,
   activeTaskId: activeStreamTaskId,
@@ -4340,6 +4414,78 @@ const liveActivityExecuting = computed(() =>
   && !isStopPending.value
   && livePendingInterruptParts.value.length === 0,
 )
+
+function captureLivePresentation(key = sessionKey.value) {
+  // Departure capture runs before scoped owners reset, but the route key has
+  // already changed. Retain the outgoing task's disclosure identity explicitly.
+  const turnKey = String(JSON.parse(liveToolStateScope.value)[1])
+  return {
+    visible: isStreaming.value && streamBubble.value && answerRevealOpen.value,
+    liveActivityContinuityKey: assistantActivityContinuityKey(key, turnKey),
+    liveToolStateScope: JSON.stringify([key, turnKey]),
+    liveActivityExecuting: liveActivityExecuting.value,
+    liveActivityStepCount: executionDockRun.value?.status === 'running' ? 0 : liveActivityStepCount.value,
+    liveActivityFailureCount: liveActivityFailureCount.value,
+    liveActivityPhaseLabel: liveActivityPhaseLabel.value,
+    liveActivityPhaseAnnouncement: liveActivityPhaseAnnouncement.value,
+    liveActivityWaiting: liveActivityWaiting.value,
+    queued: runStatus.value.status === 'queued',
+    streamTurnElapsed: streamTurnElapsed.value,
+    streamActivityStale: streamActivityStale.value,
+    liveHasUnifiedActivityOrder: liveHasUnifiedActivityOrder.value,
+    liveActivityDisplayProjection: liveActivityDisplayProjection.value,
+    liveActivityTimelineItems: liveActivityTimelineItems.value,
+    liveReasoningBlocks: liveReasoningBlocks.value,
+    liveReasoningCollapseActive: liveReasoningCollapseActive.value,
+    toolInputPreviews: toolInputPreviews.value,
+    liveAnswerPart: liveAnswerPart.value,
+    liveCurrentPhaseCode: liveCurrentPhaseCode.value,
+    liveArtifacts: liveArtifacts.value,
+    livePendingInterruptParts: livePendingInterruptParts.value,
+    skillLoads: liveSkillLoads.value[activeStreamTaskId.value] || [],
+    toolElapsed: Object.fromEntries(foldedTurn.value.toolCalls.map(call => [call.toolId, liveToolElapsedText(call)])),
+  }
+}
+
+function captureSessionPresentation(key: string) {
+  const taskId = taskOwnership.stopTargetTaskId.value || activeStreamTaskId.value
+  const stoppableTaskId = (canStop.value || showStableStop.value)
+    && ![PENDING_STREAM_TASK_ID, FINISHED_STREAM_TASK_ID, STOPPED_STREAM_TASK_ID].includes(taskId)
+    ? taskId : ''
+  return {
+    live: captureLivePresentation(key),
+    modelRoutingMode: modelRoutingMode.value,
+    modelSelection: composerModelSelection.value,
+    modelSelectionAvailable: composerModelSelectionAvailable.value,
+    sessionModelName: sessionModelName.value,
+    stoppableTaskId,
+  }
+}
+
+function captureSessionViewport(retainedMessages: readonly ChatMessage[]) {
+  const viewport = findOwnsViewport.value
+    ? findPresentation.capturedViewport() : messageListRef.value?.captureViewport?.()
+  if (!viewport?.anchor || viewport.followLiveEdge) return viewport
+  const anchor = visibleRenderedMessages.value.find((message, index) => chatMessageKey(message, index) === viewport.anchor?.key)
+  if (anchor?.sourceIndex !== undefined && anchor.sourceIndex < messages.value.length - retainedMessages.length) {
+    // The bounded cache does not contain this older page. Treat it as a cold
+    // return rather than applying its pixel offset to unrelated newer text.
+    return undefined
+  }
+  return viewport
+}
+
+const presentedLive = computed(() => {
+  const cached = sessionViewCache.presentation.value?.live
+  if (cached) return { ...cached, liveActivityExecuting: false, liveActivityPhaseAnnouncement: '' }
+  const current = captureLivePresentation()
+  // Replayed content must not precede its historical user/context rows. Drafts
+  // and already-installed sessions retain normal immediate streaming.
+  return { ...current, visible: current.visible && (sessionViewCache.ready.value || isDraftSurface()) }
+})
+function presentedToolElapsedText(call: Pick<ChatToolCall, 'toolId'>): string {
+  return presentedLive.value.toolElapsed[call.toolId] ?? ''
+}
 
 const visiblePendingInterruptKeys = computed(() => {
   const keys = new Set(livePendingInterruptParts.value.map(part => part.key))
@@ -4472,7 +4618,15 @@ const chatRpcSubscriptions = useChatRpcSubscriptions({
     }
     const previousEpoch = currentEpoch.value
     const result = rpcEventHandlers.consumeConversationEvent(message)
-    if (currentEpoch.value !== previousEpoch) sessionViewCache.observeEpoch(sessionKey.value, currentEpoch.value)
+    if (currentEpoch.value !== previousEpoch) {
+      const viewGeneration = sessionViewCache.generation.value
+      sessionViewCache.observeEpoch(sessionKey.value, currentEpoch.value)
+      if (viewGeneration !== sessionViewCache.generation.value) {
+        presentationMetadataReady.value = false
+        scheduleHistorySync()
+        void retryLive()
+      }
+    }
     return result
   },
   onRecoveryRequired: recoverCurrentSession,
