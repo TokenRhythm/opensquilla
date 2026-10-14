@@ -65,9 +65,14 @@ async def show_widget(
         if (
             not isinstance(loading_messages, list)
             or len(loading_messages) > 4
-            or any(not isinstance(message, str) or not message.strip() for message in loading_messages)
+            or any(
+                not isinstance(message, str) or not message.strip()
+                for message in loading_messages
+            )
         ):
-            raise ToolError("SHOW_WIDGET_INVALID_LOADING_MESSAGES: provide one to four nonempty strings")
+            raise ToolError(
+                "SHOW_WIDGET_INVALID_LOADING_MESSAGES: provide one to four nonempty strings"
+            )
     try:
         result: dict[str, Any] = await publish(
             context,
