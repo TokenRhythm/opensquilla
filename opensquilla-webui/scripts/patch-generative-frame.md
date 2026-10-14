@@ -23,13 +23,33 @@ Changes are confined to the screenshot clone:
    such as `svg { margin: 24px 0 }` otherwise also affects the outer screenshot
    SVG, introducing layout shifts. The browser trial confirmed a 24px shift
    disappeared when this rule stopped being reapplied.
-2. Lay out the clone at the source `devicePixelRatio` and compensate by scaling
-   the SVG viewBox, preserving the original output dimensions. SVG image
-   documents do not inherit browser zoom. At 80% browser zoom, freezing an
-   auto-sized button's used CSS width and laying out its text at 100% caused the
-   final character to wrap and be clipped. The original upstream code only used
-   DPR in the final canvas rasterization step. The browser comparison confirmed
-   that matching the layout scale restores the complete single-line label.
+2. Prefer `computedStyleMap()` for width/height, logical inline/block sizes,
+   their min/max constraints, flex-basis, margin/padding longhands and insets.
+   It preserves computed layout
+   inputs such as `auto` and percentages instead of freezing `getComputedStyle`
+   resolved pixel sizes. In a real narrow travel planner, three used widths plus
+   the declared gaps summed to 299.0316px inside a 299.023px flex row. Feeding
+   these rounded outputs back as explicit widths wrapped the last button; the
+   copied fixed parent height then caused overlapping text. The actual frame's
+   Typed OM values were `auto`, and keeping those inputs restored the complete
+   row and footer in the exported PNG. Both physical and logical sizes are
+   covered so a later logical declaration cannot undo the fix.
+   The same issue affects automatic margins: a budget input's `margin-left:auto`
+   became a fixed 143px margin and wrapped its header in the screenshot.
+   Only single-value layout longhands use Typed OM; applying `get()` to every
+   property could silently discard later values of a multi-layer background.
+
+This patch does not infer layout zoom from DPR: device density and browser zoom
+are different inputs. The upstream output scaling is unchanged. Earlier local
+patch candidates are reversed before the full original hash check, allowing a
+developer's existing dependency directory to migrate to this exact patch.
+
+`computedStyleMap()` is feature-detected. If it or a property's typed value is
+unavailable, the clone uses the original resolved-style value. That is a
+compatible rendering fallback, **not verified equivalent PNG fidelity** for
+flex layouts. The real narrow-width export was verified in Chromium; a desktop
+viewport resized to phone width does not establish Safari, an old WebView, or
+physical phone acceptance.
 
 The upstream sparse computed-style copy remains intact. Screenshots retain
 the upstream limits: URL-loaded fonts, cross-origin images and pseudo-elements
