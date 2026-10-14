@@ -50,12 +50,6 @@ assert.equal(isDesktopRendererUrl(DESKTOP_RENDERER_URL), true)
 assert.equal(isDesktopRendererUrl('opensquilla-app://desktop.evil/chat/new'), false)
 assert.equal(isDesktopRendererUrl('https://desktop/chat/new'), false)
 assert.equal(isDesktopRendererDocumentUrl(DESKTOP_RENDERER_URL), true)
-assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/visualize-trial'), true)
-assert.deepEqual(
-  routeDesktopRendererRequest('opensquilla-app://desktop/assets/visualize/mcp-sandbox-proxy.html'),
-  { kind: 'file', relativePath: 'assets/visualize/mcp-sandbox-proxy.html' },
-)
-assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/assets/visualize/mcp-sandbox-proxy.html'), false)
 assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/settings/runtime'), true)
 assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/agents'), false)
 assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/changelog'), false)

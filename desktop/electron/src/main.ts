@@ -599,10 +599,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 // Keep stable data in its established location. Prerelease binaries receive
 // independent Chromium, credential and Gateway state before any writer starts.
 // Changing the update feed never changes this process's active profile.
-// Isolated comparison build: never share the installed production profile.
-const channelUserData = app.commandLine.hasSwitch('user-data-dir')
-  ? resolve(app.commandLine.getSwitchValue('user-data-dir'))
-  : join(app.getPath('appData'), 'OpenSquilla Visualize A')
+const channelUserData = channelUserDataPath(app.getPath('userData'), app.getVersion())
 if (channelUserData !== resolve(app.getPath('userData'))) {
   mkdirSync(channelUserData, { recursive: true })
   app.setPath('userData', channelUserData)
@@ -9935,7 +9932,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     height: 900,
     minWidth: 960,
     minHeight: 640,
-    title: 'OpenSquilla Visualize A',
+    title: 'OpenSquilla',
     icon: appIconPath(),
     show: false,
     // Paint the window in the app's base color from the first frame so launch
@@ -11149,8 +11146,10 @@ function desktopUpdateMenuEnabled(): boolean {
 }
 
 function desktopUpdateManaged(): boolean {
-  // Comparison binaries never follow the production update feed.
-  return false
+  if (!app.isPackaged) return false
+  if (desktopNetworkObservabilityDisabled()) return false
+  if (process.env.OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE === '1') return false
+  return process.platform === 'darwin' || process.platform === 'win32'
 }
 
 function autoUpdateSupported(): boolean {

@@ -1,6 +1,6 @@
 {
-  "name": "opensquilla-visualize-a",
-  "version": "0.5.6-visualize-a.2",
+  "name": "@opensquilla/desktop-electron",
+  "version": "0.5.6",
   "private": true,
   "description": "Electron desktop shell for the OpenSquilla Control UI.",
   "repository": {
@@ -115,19 +115,25 @@
     }
   },
   "build": {
-    "appId": "ai.opensquilla.visualize.a",
-    "productName": "OpenSquilla Visualize A",
+    "appId": "ai.opensquilla.desktop",
+    "productName": "OpenSquilla",
     "beforePack": "scripts/nsis/prepare-upgrade-template.cjs",
-    "artifactName": "OpenSquilla-Visualize-A-${version}-${os}-${arch}.${ext}",
+    "artifactName": "OpenSquilla-${version}-${os}-${arch}.${ext}",
     "protocols": [
       {
-        "name": "OpenSquilla Visualize A",
+        "name": "OpenSquilla",
         "schemes": [
-          "opensquilla-visualize-a"
+          "opensquilla"
         ]
       }
     ],
-    "publish": [],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "TokenRhythm",
+        "repo": "opensquilla"
+      }
+    ],
     "directories": {
       "output": "../../dist/desktop-electron"
     },

@@ -17,7 +17,8 @@ export function defaultRootRedirect(): string {
 }
 
 export const sharedRoutes: RouteRecordRaw[] = [
-  { path: '/visualize-trial', name: 'visualize-trial', component: () => import('@/views/VisualizeTrialView.vue'), meta: { title: 'Visualize trial', group: 'Work', icon: 'chat', nav: 'primary', navOrder: 65, navLabelKey: 'visualize.trial', platforms: ['web', 'desktop'] } },
+  // A development fixture only; Visualize is embedded in conversation.
+  ...(import.meta.env.DEV ? [{ path: '/visualize-trial', name: 'visualize-trial', component: () => import('@/views/VisualizeTrialView.vue'), meta: { title: 'Visualize trial', platforms: ['web', 'desktop'] } } satisfies RouteRecordRaw] : []),
   {
     path: '/',
     redirect: () => {

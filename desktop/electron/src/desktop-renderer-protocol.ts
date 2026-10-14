@@ -22,7 +22,6 @@ const DESKTOP_RENDERER_DOCUMENT_PATHS = new Set([
   '/setup',
   '/skills',
   '/usage',
-  '/visualize-trial',
 ])
 
 export type DesktopRendererRequestRoute =
