@@ -19,8 +19,10 @@ export interface VisualizeRuntimeOptions {
   onPrompt(text: string): void
   onState(state: unknown): void
   onError(error: unknown): void
-  /** A guest may dismiss a host-expanded canvas, but cannot expand it. */
-  onCollapse?(): void
+  /** Dismiss host UI in order and return the actual remaining display mode. */
+  onDismiss?(): 'inline' | 'fullscreen'
+  /** A pointer entered the guest; only dismiss the owning host menu. */
+  onPointerDown?(): void
   /** Unclamped content size, before the host applies the presentation limit. */
   onResize?(size: VisualizeSize): void
 }
@@ -32,6 +34,8 @@ export interface VisualizePresentation {
 }
 export interface VisualizeRuntime {
   dispose(): void
+  /** Capture the current rendered state without rerunning generated code. */
+  capture(options?: { signal?: AbortSignal }): Promise<Blob>
   updateTheme(theme: 'light' | 'dark'): void
   setPresentation(presentation: VisualizePresentation): void
 }

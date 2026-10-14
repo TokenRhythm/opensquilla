@@ -3,18 +3,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { CreateWidgetOptions, EndResult, WidgetHandle } from 'generative-frame'
 import { mountVisualize } from './runtime'
 import type { VisualizeRuntimeOptions } from './types'
+import { VisualizeCaptureError } from './png'
 
-const driver = vi.hoisted(() => ({ create: vi.fn() }))
+const driver = vi.hoisted(() => ({ create: vi.fn(), decode: vi.fn() }))
 vi.mock('generative-frame', async importOriginal => ({
   ...await importOriginal<typeof import('generative-frame')>(),
   createWidget: driver.create,
 }))
+vi.mock('./png', async importOriginal => ({ ...await importOriginal<typeof import('./png')>(), validateCapturePng: driver.decode }))
 
 let host: HTMLDivElement
 let frame: HTMLIFrameElement
 let config: CreateWidgetOptions
 let options: VisualizeRuntimeOptions
-let widget: Pick<WidgetHandle, 'ready' | 'iframe' | 'write' | 'end' | 'inspect' | 'dispose' | 'setTheme' | 'setContext'>
+let widget: Pick<WidgetHandle, 'ready' | 'iframe' | 'write' | 'end' | 'inspect' | 'screenshot' | 'dispose' | 'setTheme' | 'setContext'>
 
 beforeEach(() => {
   vi.useFakeTimers()
@@ -23,11 +25,13 @@ beforeEach(() => {
   host = document.createElement('div')
   frame = document.createElement('iframe')
   document.body.append(host)
-  options = { html: '<button>Explore</button>', theme: 'light', initialState: { value: 3 }, onPrompt: vi.fn(), onState: vi.fn(), onError: vi.fn(), onResize: vi.fn(), onCollapse: vi.fn() }
+  options = { html: '<button>Explore</button>', theme: 'light', initialState: { value: 3 }, onPrompt: vi.fn(), onState: vi.fn(), onError: vi.fn(), onResize: vi.fn(), onDismiss: vi.fn(() => 'inline' as const), onPointerDown: vi.fn() }
+  driver.decode.mockResolvedValue(new Blob(['validated pixels'], { type: 'image/png' }))
   widget = {
     ready: Promise.resolve(), iframe: frame, write: vi.fn(),
     end: vi.fn(async (): Promise<EndResult> => ({ blank: false, errorCount: 0, size: { width: 640, height: 450 } })),
     inspect: vi.fn(async () => ({ kind: 'html' as const, ended: true, code: options.html, blank: false, errors: [], console: [], size: { width: 640, height: 450 } })),
+    screenshot: vi.fn(async () => ({ dataUrl: 'data:image/png;base64,cG5n', width: 640, height: 450 })),
     dispose: vi.fn(() => frame.remove()), setTheme: vi.fn(), setContext: vi.fn(),
   }
   driver.create.mockImplementation((value: CreateWidgetOptions) => { config = value; host.append(frame); return widget })
@@ -98,25 +102,44 @@ describe('generative-frame host adapter', () => {
     const runtime = await mountVisualize(host, options)
     expect(config.onRequestDisplayMode?.({ mode: 'fullscreen' })).toEqual({ mode: 'inline' })
     expect(config.onRequestDisplayMode?.({ mode: 'inline' })).toEqual({ mode: 'inline' })
-    expect(options.onCollapse).not.toHaveBeenCalled()
+    expect(options.onDismiss).not.toHaveBeenCalled()
     runtime.setPresentation({ mode: 'expanded', availableHeight: 500 })
     expect(config.onRequestDisplayMode?.({ mode: 'pip' })).toEqual({ mode: 'fullscreen' })
-    expect(options.onCollapse).not.toHaveBeenCalled()
+    expect(options.onDismiss).not.toHaveBeenCalled()
+    vi.mocked(options.onDismiss!).mockReturnValueOnce('fullscreen') // only the menu closed
+    expect(config.onRequestDisplayMode?.({ mode: 'inline' })).toEqual({ mode: 'fullscreen' })
     expect(config.onRequestDisplayMode?.({ mode: 'inline' })).toEqual({ mode: 'inline' })
-    expect(options.onCollapse).toHaveBeenCalledTimes(1)
+    expect(options.onDismiss).toHaveBeenCalledTimes(2)
     runtime.dispose()
     config.onRequestDisplayMode?.({ mode: 'inline' })
-    expect(options.onCollapse).toHaveBeenCalledTimes(1)
+    expect(options.onDismiss).toHaveBeenCalledTimes(2)
+  })
+
+  it('accepts only the reserved pointer signal over the private RPC without forwarding model context', async () => {
+    const runtime = await mountVisualize(host, options)
+    expect(() => config.onUpdateModelContext?.({ type: 'opensquilla:pointerdown:v1', text: 'send this' })).toThrow('unavailable')
+    expect(() => config.onUpdateModelContext?.({ structuredContent: { ignored: true } })).toThrow('unavailable')
+    expect(options.onPointerDown).not.toHaveBeenCalled()
+    config.onUpdateModelContext?.({ type: 'opensquilla:pointerdown:v1' })
+    expect(options.onPointerDown).toHaveBeenCalledTimes(1)
+    expect(options.onPrompt).not.toHaveBeenCalled()
+    expect(options.onState).not.toHaveBeenCalled()
+    runtime.dispose()
+    config.onUpdateModelContext?.({ type: 'opensquilla:pointerdown:v1' })
+    expect(options.onPointerDown).toHaveBeenCalledTimes(1)
   })
 
   it('bridges unhandled guest Escape after dispatch and respects generated controls', async () => {
     const runtime = await mountVisualize(host, options)
     const requestDisplayMode = vi.fn().mockResolvedValue({ mode: 'inline' })
-    const guest = Object.assign(new EventTarget(), { genframe: { context: { displayMode: 'inline' }, requestDisplayMode } })
+    const updateModelContext = vi.fn().mockResolvedValue({})
+    const guest = Object.assign(new EventTarget(), { genframe: { context: { displayMode: 'inline' }, requestDisplayMode, updateModelContext } })
     const source = vi.mocked(widget.write).mock.calls[0]![0]
     const script = new DOMParser().parseFromString(source, 'text/html').querySelector('script')!.textContent!
     // Execute the exact guest bridge that is sent to the isolated document.
     new Function('window', script)(guest)
+    guest.dispatchEvent(new Event('pointerdown'))
+    expect(updateModelContext).toHaveBeenCalledExactlyOnceWith({ type: 'opensquilla:pointerdown:v1' })
     guest.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }))
     await vi.advanceTimersByTimeAsync(0)
     expect(requestDisplayMode).not.toHaveBeenCalled()
@@ -200,6 +223,70 @@ describe('generative-frame host adapter', () => {
     await expect(mountVisualize(host, options)).rejects.toThrow('missing renderChart')
     expect(widget.dispose).toHaveBeenCalledTimes(2)
     expect(widget.inspect).not.toHaveBeenCalled()
+  })
+
+  it('captures the current pixels without rerendering or changing state', async () => {
+    const runtime = await mountVisualize(host, options)
+    const blob = await runtime.capture()
+    expect(blob.type).toBe('image/png')
+    expect(widget.screenshot).toHaveBeenCalledExactlyOnceWith({ scale: 1 })
+    expect(driver.decode).toHaveBeenCalledWith(expect.objectContaining({ dataUrl: 'data:image/png;base64,cG5n' }), expect.any(AbortSignal), document)
+    expect(driver.create).toHaveBeenCalledTimes(1)
+    expect(widget.write).toHaveBeenCalledTimes(1)
+    expect(widget.end).toHaveBeenCalledTimes(1)
+    expect(options.onState).not.toHaveBeenCalled()
+    expect(widget.dispose).not.toHaveBeenCalled()
+    runtime.dispose()
+  })
+
+  it('rejects unready and oversized captures before requesting rasterization', async () => {
+    const runtime = await mountVisualize(host, options)
+    vi.mocked(widget.inspect).mockResolvedValueOnce({ kind: 'html', ended: true, code: '', blank: true, errors: [], console: [], size: { width: 640, height: 450 } })
+    await expect(runtime.capture()).rejects.toMatchObject({ kind: 'unavailable' })
+    vi.mocked(widget.inspect).mockResolvedValueOnce({ kind: 'html', ended: true, code: '', blank: false, errors: [], console: [], size: { width: 640, height: 30_000 } })
+    await expect(runtime.capture()).rejects.toMatchObject({ kind: 'tooLarge' })
+    expect(widget.screenshot).not.toHaveBeenCalled()
+    runtime.dispose()
+  })
+
+  it.each(['cancel', 'dispose'])('discards a late screenshot after %s', async action => {
+    const runtime = await mountVisualize(host, options)
+    const controller = new AbortController()
+    let finish!: (value: Awaited<ReturnType<WidgetHandle['screenshot']>>) => void
+    vi.mocked(widget.screenshot).mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const pending = runtime.capture({ signal: controller.signal })
+    const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    await vi.advanceTimersByTimeAsync(0)
+    if (action === 'cancel') controller.abort(); else runtime.dispose()
+    await rejected
+    finish({ dataUrl: 'data:image/png;base64,bGF0ZQ==', width: 640, height: 450 })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(driver.decode).not.toHaveBeenCalled()
+    runtime.dispose()
+  })
+
+  it('bounds capture duration and rejects concurrent exports without disposing the usable canvas', async () => {
+    const runtime = await mountVisualize(host, options)
+    vi.mocked(widget.screenshot).mockImplementationOnce(() => new Promise(() => {}))
+    const pending = runtime.capture()
+    const rejected = expect(pending).rejects.toMatchObject({ kind: 'timedOut' })
+    await expect(runtime.capture()).rejects.toThrow('already in progress')
+    await vi.advanceTimersByTimeAsync(15_000)
+    await rejected
+    expect(widget.dispose).not.toHaveBeenCalled()
+    config.onPrompt?.('still usable')
+    expect(options.onPrompt).toHaveBeenCalledWith('still usable')
+    runtime.dispose()
+  })
+
+  it('propagates invalid PNG or opaque-canvas failures without claiming export success', async () => {
+    const runtime = await mountVisualize(host, options)
+    vi.mocked(widget.screenshot).mockRejectedValueOnce(new DOMException('The canvas is tainted', 'SecurityError'))
+    await expect(runtime.capture()).rejects.toMatchObject({ name: 'SecurityError' })
+    driver.decode.mockRejectedValueOnce(new VisualizeCaptureError('blank'))
+    await expect(runtime.capture()).rejects.toMatchObject({ kind: 'blank' })
+    runtime.dispose()
+    await expect(runtime.capture()).rejects.toMatchObject({ name: 'AbortError' })
   })
 
   function visibleHost() {

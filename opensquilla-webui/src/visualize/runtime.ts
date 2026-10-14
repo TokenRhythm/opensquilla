@@ -1,5 +1,7 @@
 import { createWidget, defaultThemeTokens, type ThemeTokens, type WidgetHandle } from 'generative-frame'
 import type { VisualizePresentation, VisualizeRuntime, VisualizeRuntimeOptions, VisualizeSize } from './types'
+import { abortableClipboardPreparation, assertClipboardPreparationActive } from '@/utils/imageClipboard'
+import { checkCaptureLayout, validateCapturePng, VisualizeCaptureError, VISUALIZE_CAPTURE_TIMEOUT_MS } from './png'
 
 export const VISUALIZE_RUNTIME_LABEL = 'A · generative-frame 0.0.5'
 const MIN_HEIGHT = 120
@@ -15,6 +17,9 @@ window.addEventListener('keydown',event=>{
       window.genframe.requestDisplayMode('inline').catch(()=>{});
     }
   },0);
+},true);
+window.addEventListener('pointerdown',()=>{
+  window.genframe.updateModelContext({type:'opensquilla:pointerdown:v1'}).catch(()=>{});
 },true);
 </script>`
 
@@ -91,6 +96,7 @@ export async function mountVisualize(container: HTMLElement, options: VisualizeR
   let contentSize: VisualizeSize = { width: 0, height: MIN_HEIGHT }
   let sizeFrame: number | undefined
   let cancelLayoutBarrier: (() => void) | undefined
+  let activeCapture: AbortController | undefined
   let lastLimit = MAX_HEIGHT
   let lastMode: VisualizePresentation['mode'] = 'inline'
   let lastOverflow = 'hidden'
@@ -125,6 +131,7 @@ export async function mountVisualize(container: HTMLElement, options: VisualizeR
   const dispose = () => {
     if (disposed) return
     disposed = true
+    activeCapture?.abort(new DOMException('Canvas disposed', 'AbortError'))
     options.signal?.removeEventListener('abort', dispose)
     if (sizeFrame !== undefined) view.cancelAnimationFrame(sizeFrame)
     cancelLayoutBarrier?.()
@@ -149,11 +156,22 @@ export async function mountVisualize(container: HTMLElement, options: VisualizeR
     onRequestDisplayMode({ mode }) {
       if (disposed) return { mode: 'inline' }
       // Only host controls may expand a canvas; guests can request dismissal.
-      if (mode === 'inline' && presentation.mode === 'expanded' && options.onCollapse) {
-        options.onCollapse()
-        return { mode: 'inline' }
+      if (mode === 'inline' && presentation.mode === 'expanded' && options.onDismiss) {
+        const actual = options.onDismiss()
+        return { mode: actual === 'inline' ? 'inline' : 'fullscreen' }
       }
       return { mode: presentation.mode === 'expanded' ? 'fullscreen' : 'inline' }
+    },
+    // Use the existing private RPC port for this one host-owned UI signal.
+    // No model context is accepted or forwarded by this adapter.
+    onUpdateModelContext(params) {
+      if (disposed) return {}
+      if (!params || typeof params !== 'object' || Array.isArray(params)
+        || Object.keys(params).length !== 1 || (params as { type?: unknown }).type !== 'opensquilla:pointerdown:v1') {
+        throw new Error('Model context updates are unavailable in this canvas')
+      }
+      options.onPointerDown?.()
+      return {}
     },
     onResize(size) {
       if (disposed || !validSize(size)) return
@@ -218,6 +236,32 @@ export async function mountVisualize(container: HTMLElement, options: VisualizeR
   } catch (error) { dispose(); throw error }
   return {
     dispose,
+    async capture(request = {}) {
+      if (disposed) throw new DOMException('Canvas disposed', 'AbortError')
+      if (activeCapture) throw new Error('A canvas capture is already in progress')
+      const controller = new AbortController()
+      activeCapture = controller
+      const abort = () => controller.abort(request.signal?.reason ?? new DOMException('Cancelled', 'AbortError'))
+      request.signal?.addEventListener('abort', abort, { once: true })
+      if (request.signal?.aborted) abort()
+      const timer = setTimeout(() => controller.abort(new VisualizeCaptureError('timedOut')), VISUALIZE_CAPTURE_TIMEOUT_MS)
+      try {
+        assertClipboardPreparationActive(controller.signal)
+        const inspection = await abortableClipboardPreparation(widget!.inspect(), controller.signal)
+        assertClipboardPreparationActive(controller.signal)
+        if (!inspection.ended || inspection.blank || inspection.errors.length) throw new VisualizeCaptureError('unavailable')
+        checkCaptureLayout(inspection.size.width, inspection.size.height)
+        const screenshot = await abortableClipboardPreparation(widget!.screenshot({ scale: 1 }), controller.signal)
+        assertClipboardPreparationActive(controller.signal)
+        const blob = await validateCapturePng(screenshot, controller.signal, container.ownerDocument)
+        assertClipboardPreparationActive(controller.signal)
+        return blob
+      } finally {
+        clearTimeout(timer)
+        request.signal?.removeEventListener('abort', abort)
+        if (activeCapture === controller) activeCapture = undefined
+      }
+    },
     updateTheme(theme) {
       if (disposed) return
       tokens = hostTheme(container, theme)
