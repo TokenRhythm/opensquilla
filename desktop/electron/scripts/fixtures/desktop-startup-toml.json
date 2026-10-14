@@ -1,0 +1,338 @@
+[
+  {
+    "name": "default",
+    "toml": "config_version = 2\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "comment syntax",
+    "toml": "# {} [中文] bare键 = x \\e \\x1b\nconfig_version = 2\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "basic string syntax",
+    "toml": "value = \"中文 {} # quoted \\\" [not a table]\"\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "literal string syntax",
+    "toml": "value = '中文 {} # \\e \\x1b'\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "escaped backslash",
+    "toml": "value = \"\\\\e \\\\x1b \\\\\\\\e\"\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "unicode escapes",
+    "toml": "\"\\u4e2d\\u6587\" = \"\\u007b\\U0001f642\\u007d\"\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "quoted keys",
+    "toml": "\"中文\" = '值'\n['带点.和括号{}']\n\"数据目录\" = '目录'\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "quoted dotted keys",
+    "toml": "\"中文\".'字段' = 1\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "empty inline",
+    "toml": "value = {}\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "nested inline",
+    "toml": "value = { outer = { enabled = true }, list = [1, 2,], empty = {} }\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "inline quoted keys",
+    "toml": "value = { '中文' = { \"路径\" = '目录' } }\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "inline punctuation values",
+    "toml": "value = { text = \"{},#[]\", literal = '{},#[]\\e\\x' }\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "multiline array",
+    "toml": "value = [\n{ key = 1 }, # {} \\e 中文\n{ key = [2, 3,] },\n]\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "multiline basic",
+    "toml": "value = \"\"\"\n中文 {} #\nquotes \" and \"\"\n\"\"\"\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "multiline literal",
+    "toml": "value = '''\n中文 {} # \\e \\x1b\nquotes ' and ''\n'''\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "basic four closing quotes",
+    "toml": "value = \"\"\"content\"\"\"\"\nnext = { a = 1 }\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "basic five closing quotes",
+    "toml": "value = \"\"\"content\"\"\"\"\"\nnext = { a = 1 }\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "literal four closing quotes",
+    "toml": "value = '''content''''\nnext = { a = 1 }\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "literal five closing quotes",
+    "toml": "value = '''content'''''\nnext = { a = 1 }\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "basic escaped quote before closing triple",
+    "toml": "value = \"\"\"content\\\"\"\"\"\nnext = { a = 1 }\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "basic continuation spaces",
+    "toml": "value = \"\"\"a\\ \t \n  b\"\"\"\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "basic continuation crlf",
+    "toml": "value = \"\"\"a\\\r\n \t b\"\"\"\r\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "basic continuation then escape",
+    "toml": "value = \"\"\"a\\\n  \\u007bb\"\"\"\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "basic continuation at close",
+    "toml": "value = \"\"\"a\\\n  \"\"\"\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "inline escaped newline",
+    "toml": "value = { text = \"a\\nb\" }\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "inline single line multiline value",
+    "toml": "value = { text = \"\"\"{}\"\"\" }\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "comments after inline",
+    "toml": "value = { a = 1 } # , } \\x1b 中文\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "top-level array trailing comma",
+    "toml": "value = [[1,], { a = [2,] },]\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "empty quoted keys",
+    "toml": "'' = ''\n\" \" = \" \"\n",
+    "defer": false,
+    "pythonAccepts": true
+  },
+  {
+    "name": "inline trailing comma",
+    "toml": "value = { a = 1, }\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "nested inline trailing comma",
+    "toml": "value = { inner = { a = 1, } }\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "inline newline",
+    "toml": "value = {\na = 1\n}\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "inline comment newline",
+    "toml": "value = { a = 1, # comment\nb = 2 }\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "inline array newline",
+    "toml": "value = { a = [\n1,\n] }\n",
+    "defer": true,
+    "pythonAccepts": true
+  },
+  {
+    "name": "inline multiline value",
+    "toml": "value = { text = \"\"\"a\nb\"\"\" }\n",
+    "defer": true,
+    "pythonAccepts": true
+  },
+  {
+    "name": "inline continued value",
+    "toml": "value = { text = \"\"\"a\\\nb\"\"\" }\n",
+    "defer": true,
+    "pythonAccepts": true
+  },
+  {
+    "name": "unicode bare key",
+    "toml": "中文 = 1\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "unicode bare header",
+    "toml": "[中文]\nvalue = 1\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "unicode bare inline key",
+    "toml": "value = { 中文 = 1 }\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "unicode bare dotted key",
+    "toml": "key.中文 = 1\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "escape e",
+    "toml": "value = \"\\e\"\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "escape x",
+    "toml": "value = \"\\x1b\"\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "quoted key escape x",
+    "toml": "\"\\x41\" = 1\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "multiline escape e",
+    "toml": "value = \"\"\"\\e\"\"\"\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "multiline escape x",
+    "toml": "value = \"\"\"\\x1b\"\"\"\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "odd backslash escape e",
+    "toml": "value = \"\\\\\\e\"\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "after escaped basic closing quote",
+    "toml": "value = \"quote \\\"\"\n中文 = 1\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "after basic four quote close",
+    "toml": "value = \"\"\"content\"\"\"\"\n中文 = 1\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "after basic five quote close",
+    "toml": "value = \"\"\"content\"\"\"\"\"\n中文 = 1\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "after literal five quote close",
+    "toml": "value = '''content'''''\n中文 = 1\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "after continuation escape e",
+    "toml": "value = \"\"\"a\\\n \\e\"\"\"\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "after continuation escape x",
+    "toml": "value = \"\"\"a\\\n \\x1b\"\"\"\n",
+    "defer": true,
+    "pythonAccepts": false
+  },
+  {
+    "name": "basic multiline CRLF content",
+    "toml": "value = \"\"\"{}\r\ntext\"\"\"\n",
+    "defer": true,
+    "pythonAccepts": true
+  },
+  {
+    "name": "literal multiline CRLF content",
+    "toml": "value = '''{}\r\ntext'''\n",
+    "defer": true,
+    "pythonAccepts": true
+  },
+  {
+    "name": "continuation four closing quotes",
+    "toml": "value = \"\"\"a\\ \t\n\"\"\"\"\n",
+    "defer": true,
+    "pythonAccepts": true
+  },
+  {
+    "name": "continuation five closing quotes",
+    "toml": "value = \"\"\"a\\\r\n\"\"\"\"\"\n",
+    "defer": true,
+    "pythonAccepts": true
+  }
+]

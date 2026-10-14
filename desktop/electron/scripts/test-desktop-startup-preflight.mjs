@@ -30,6 +30,26 @@ function check(item, expected, environment = {}) {
   return result
 }
 function tomlPath(path) { return JSON.stringify(path) }
+function archivedReceipt(item, status = 'not_required', index = 0, overrides = {}) {
+  const transactionId = `11234567-89ab-4cde-8fab-${String(index).padStart(12, '0')}`
+  const sourceId = '21234567-89ab-4cde-8fab-0123456789ab'
+  const backup = join(item.userData, 'backups', 'profile-consolidation', transactionId)
+  const path = join(backup, 'receipt.json')
+  const credential = status !== 'not_required'
+  const payload = {
+    schema_version: 1, outcome: 'consolidated', stable_code: 'profile_consolidation_complete',
+    transaction_id: transactionId, primary_home: item.home, backup_path: backup, receipt_path: path,
+    credential_adoption_status: status, consumed_recovery_ids: [sourceId], revision: 1, errors: [],
+    configuration_source_recovery_id: credential ? sourceId : null,
+    configuration_source_credential_path: credential ? join(backup, 'recovery-profiles', sourceId, 'desktop-credential.json') : null,
+    configuration_source_credential_sha256: credential ? 'a'.repeat(64) : null,
+    configuration_source_credential_size: credential ? 42 : null,
+    session_merges: [], ...overrides,
+  }
+  fs.mkdirSync(backup, { recursive: true })
+  fs.writeFileSync(path, JSON.stringify(payload))
+  return { path, backup, payload }
+}
 
 try {
   const healthy = fixture('healthy')
@@ -52,6 +72,58 @@ try {
   fs.writeFileSync(join(oversized.home, 'config.toml'), `#${'x'.repeat(1024 * 1024)}`)
   check(oversized, false)
 
+  for (const [name, maximumBytes] of [['.env', 128 * 1024], ['config.toml', 1024 * 1024]]) {
+    const item = fixture(`growing-${assertions}`)
+    const path = join(item.home, name)
+    fs.writeFileSync(path, '# initial\n')
+    const originalOpen = fs.openSync
+    const originalStat = fs.fstatSync
+    const originalRead = fs.readSync
+    let handle
+    let grew = false
+    let bytesRead = 0
+    fs.openSync = (pathToOpen, ...args) => {
+      const fd = originalOpen(pathToOpen, ...args)
+      if (pathToOpen === path && handle === undefined) handle = fd
+      return fd
+    }
+    fs.fstatSync = (fd, ...args) => {
+      const info = originalStat(fd, ...args)
+      if (fd === handle && !grew) {
+        // The initial descriptor check sees the original size; the actual read
+        // races with an in-place append that exceeds either metadata limit.
+        grew = true
+        fs.appendFileSync(path, Buffer.alloc(2 * 1024 * 1024, 0x20))
+      }
+      return info
+    }
+    fs.readSync = (fd, ...args) => {
+      const count = originalRead(fd, ...args)
+      if (fd === handle) bytesRead += count
+      return count
+    }
+    syncBuiltinESMExports()
+    try {
+      assert.equal(check(item, false).reason, 'metadata_unavailable')
+      assert.equal(grew, true)
+      assert.ok(bytesRead > 0 && bytesRead <= maximumBytes + 1, `unbounded metadata read: ${bytesRead}`)
+    } finally {
+      fs.openSync = originalOpen
+      fs.fstatSync = originalStat
+      fs.readSync = originalRead
+      syncBuiltinESMExports()
+    }
+    // Exact-limit files remain eligible, including when reads return short.
+    fs.writeFileSync(path, `#${'x'.repeat(maximumBytes - 1)}`)
+    fs.readSync = (fd, buffer, offset, length, position) =>
+      originalRead(fd, buffer, offset, Math.min(length, 4096), position)
+    syncBuiltinESMExports()
+    try { check(item, true) } finally {
+      fs.readSync = originalRead
+      syncBuiltinESMExports()
+    }
+  }
+
   const externalState = join(root, '外置 state')
   const externalWorkspace = join(root, '外置 workspace')
   fs.mkdirSync(externalState)
@@ -67,11 +139,18 @@ try {
     'extra = "\\e"\n', 'extra = "\\x1b"\n',
     '额外 = 1\n', '[额外]\nvalue = 1\n',
     'extra = 2020-02-30\n', 'extra = 2020-02-20\n',
-    'extra = 07:32\n', '# literal inline example { value = 1 }\n',
+    'extra = 07:32\n',
   ]) {
     const item = fixture(`toml-compatibility-${assertions}`, config)
     assert.match(check(item, false).reason, /^python_toml_/)
   }
+  for (const config of [
+    '# literal inline example { value = 1 }\n',
+    'extra = { value = 1, nested = { enabled = true }, list = [1, 2,] }\n',
+    'extra = "braces {}, # comments and 额外 are literal"\n',
+    '"额外" = { "中文" = "value" }\n',
+    'config_version = 0\n', 'config_version = 1\n', '',
+  ]) check(fixture(`compatible-${assertions}`, config), true)
   // Escaped Windows paths in ordinary strings are TOML 1.0, not \e/\x escapes.
   check(fixture('escaped-windows', `extra = ${tomlPath('C:\\example\\xfiles')}\n`), true)
   // A root mentioned inside a multiline string or nested table is not top-level.
@@ -159,23 +238,23 @@ try {
   const dotenvDuringRead = fixture('dotenv-changing-during-read')
   const changingDotenvPath = join(dotenvDuringRead.home, '.env')
   fs.writeFileSync(changingDotenvPath, 'EXAMPLE=test')
-  const originalRead = fs.readFileSync
+  const originalRead = fs.readSync
   let dotenvHandle
   const originalOpenDuringRead = fs.openSync
   fs.openSync = (path, ...args) => {
     const handle = originalOpenDuringRead(path, ...args)
-    if (path === changingDotenvPath) dotenvHandle = handle
+    if (path === changingDotenvPath && dotenvHandle === undefined) dotenvHandle = handle
     return handle
   }
-  fs.readFileSync = (path, ...args) => {
-    const value = originalRead(path, ...args)
-    if (path === dotenvHandle) fs.appendFileSync(changingDotenvPath, '\n# changed')
-    return value
+  fs.readSync = (handle, ...args) => {
+    const count = originalRead(handle, ...args)
+    if (handle === dotenvHandle) fs.appendFileSync(changingDotenvPath, '\n# changed')
+    return count
   }
   syncBuiltinESMExports()
   try { check(dotenvDuringRead, false) } finally {
     fs.openSync = originalOpenDuringRead
-    fs.readFileSync = originalRead
+    fs.readSync = originalRead
     syncBuiltinESMExports()
   }
   const missingLayout = fixture('missing-layout')
@@ -199,6 +278,84 @@ try {
     fs.mkdirSync(join(item.userData, container), { recursive: true })
     check(item, true)
     fs.mkdirSync(join(item.userData, container, '11234567-89ab-4cde-8fab-0123456789ab'))
+    check(item, false)
+  }
+  for (const status of ['not_required', 'complete', 'pending']) {
+    const item = fixture(`archived-${status}`)
+    const receipt = archivedReceipt(item, status)
+    // Completed credentials may already have been removed from the archive.
+    const opens = []
+    const originalOpen = fs.openSync
+    fs.openSync = (path, ...args) => { opens.push(String(path)); return originalOpen(path, ...args) }
+    syncBuiltinESMExports()
+    try { check(item, status !== 'pending') } finally {
+      fs.openSync = originalOpen
+      syncBuiltinESMExports()
+    }
+    assert.deepEqual(opens.filter(path => path.startsWith(receipt.backup)), [receipt.path])
+    assert.deepEqual(JSON.parse(fs.readFileSync(receipt.path, 'utf8')), receipt.payload)
+  }
+  const mixedReceipts = fixture('mixed-receipts')
+  archivedReceipt(mixedReceipts, 'pending')
+  archivedReceipt(mixedReceipts, 'complete', 1)
+  check(mixedReceipts, false)
+  for (const overrides of [
+    { schema_version: 2 }, { outcome: 'noop' }, { stable_code: 'unknown' },
+    { transaction_id: 'wrong' }, { primary_home: healthy.home },
+    { backup_path: root }, { receipt_path: root }, { revision: -1 },
+    { errors: ['unfinished'] }, { consumed_recovery_ids: ['../escape'] },
+    { configuration_source_recovery_id: '31234567-89ab-4cde-8fab-0123456789ab' },
+    { credential_adoption_status: 'unknown' }, { credential_adoption_status: 'not_required' },
+    { configuration_source_credential_path: join(root, 'credential.json') },
+    { configuration_source_credential_sha256: null }, { configuration_source_credential_size: -1 },
+  ]) {
+    const item = fixture(`invalid-receipt-${assertions}`)
+    archivedReceipt(item, 'complete', 0, overrides)
+    check(item, false)
+  }
+  const manyReceipts = fixture('many-receipts')
+  for (let index = 0; index < 32; index++) archivedReceipt(manyReceipts, 'complete', index)
+  check(manyReceipts, true)
+  archivedReceipt(manyReceipts, 'complete', 32)
+  check(manyReceipts, false)
+  const receiptBudget = fixture('receipt-byte-budget')
+  for (let index = 0; index < 7; index++) archivedReceipt(receiptBudget, 'complete', index, { padding: ' '.repeat(64 * 1024) })
+  check(receiptBudget, true)
+  archivedReceipt(receiptBudget, 'complete', 7, { padding: ' '.repeat(64 * 1024) })
+  check(receiptBudget, false)
+  const oversizedReceipt = fixture('oversized-receipt')
+  archivedReceipt(oversizedReceipt, 'complete', 0, { padding: ' '.repeat(128 * 1024) })
+  check(oversizedReceipt, false)
+  for (const change of ['receipt-pending', 'new-transaction', 'new-recovery', 'new-backups']) {
+    const item = fixture(`archive-race-${change}`)
+    const receipt = change === 'new-backups' ? null : archivedReceipt(item, 'complete')
+    fs.mkdirSync(join(item.userData, 'recovery-profiles'))
+    const originalOpen = fs.openSync
+    let changed = false
+    fs.openSync = (path, ...args) => {
+      if (!changed && path === join(item.home, 'config.toml')) {
+        changed = true
+        if (change === 'receipt-pending') fs.writeFileSync(receipt.path, JSON.stringify({ ...receipt.payload, credential_adoption_status: 'pending' }))
+        else if (change === 'new-recovery') fs.mkdirSync(join(item.userData, 'recovery-profiles', 'new-source'))
+        else archivedReceipt(item, 'pending', 1)
+      }
+      return originalOpen(path, ...args)
+    }
+    syncBuiltinESMExports()
+    try { assert.equal(check(item, false).reason, 'metadata_changed') } finally {
+      fs.openSync = originalOpen
+      syncBuiltinESMExports()
+    }
+    assert.equal(changed, true)
+  }
+  for (const linkAt of ['backups', 'transaction', 'receipt']) {
+    const item = fixture(`archive-link-${linkAt}`)
+    const receipt = archivedReceipt(item, 'complete')
+    const path = linkAt === 'backups' ? join(item.userData, 'backups') : linkAt === 'transaction' ? receipt.backup : receipt.path
+    const relocated = `${path}-original`
+    fs.renameSync(path, relocated)
+    if (linkAt === 'receipt') fs.linkSync(relocated, path)
+    else fs.symlinkSync(relocated, path, process.platform === 'win32' ? 'junction' : 'dir')
     check(item, false)
   }
   const linked = fixture('linked-config')

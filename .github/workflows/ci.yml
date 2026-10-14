@@ -1095,6 +1095,7 @@ jobs:
           node scripts/test-desktop-profile-substrate.mjs
           node scripts/test-desktop-profile-consolidation.mjs
           node scripts/test-desktop-startup-preflight.mjs
+          node scripts/test-desktop-startup-toml.mjs
           node scripts/test-desktop-gateway-ownership.mjs
           node scripts/test-desktop-gateway-lifecycle.mjs
           node scripts/test-desktop-window-lifecycle.mjs
