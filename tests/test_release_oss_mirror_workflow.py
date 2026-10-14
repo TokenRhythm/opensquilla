@@ -234,6 +234,7 @@ def _run_upload_step(
         [_bash_executable(), script_path.as_posix()],
         cwd=tmp_path,
         env=env,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         check=False,

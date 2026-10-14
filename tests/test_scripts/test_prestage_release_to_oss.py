@@ -187,6 +187,7 @@ def _run(tmp_path: Path, assets: Path) -> subprocess.CompletedProcess[str]:
         ],
         cwd=Path.cwd(),
         env=env,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         check=False,
