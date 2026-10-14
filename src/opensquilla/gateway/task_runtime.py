@@ -3771,6 +3771,37 @@ class TaskRuntime:
         source: str | None,
         reason: str | None,
     ) -> int:
+        """Finish an accepted cancellation even when its observer times out.
+
+        Freeze the task objects before handing ownership to the child. A Stop
+        response deadline must not interrupt persistence before the matching
+        coroutine is signalled, nor let delayed cleanup select a successor.
+        """
+
+        loop = asyncio.get_running_loop()
+        cancellation = self._cancel_runtime_tasks_impl(
+            tuple(candidates), source=source, reason=reason,
+        )
+        operation: asyncio.Task[int]
+        if loop.get_task_factory() is None:
+            # Preserve same-tick cancellation of an activated driver that has
+            # not entered _execute yet, as terminal settlement already does.
+            operation = asyncio.Task(cancellation, loop=loop, eager_start=True)
+        else:
+            operation = loop.create_task(cancellation)
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            await self._wait_for_task_settlement(operation)
+            raise
+
+    async def _cancel_runtime_tasks_impl(
+        self,
+        candidates: Sequence[_RuntimeTask],
+        *,
+        source: str | None,
+        reason: str | None,
+    ) -> int:
         """Atomically close cancellation and same-turn acceptance for a batch."""
 
         queued_tasks: list[_RuntimeTask] = []
