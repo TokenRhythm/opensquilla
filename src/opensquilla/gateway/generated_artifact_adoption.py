@@ -148,6 +148,11 @@ class GeneratedArtifactAdopter:
         result: dict[str, Any] = {
             "ok": True,
             "title": normalized_title,
+            "kind": (
+                "svg"
+                if widget_code.lstrip().casefold().startswith("<svg")
+                else "html"
+            ),
             "previewStatus": "inline-ready",
             "presentation": "inline",
             "documentId": document_id,
