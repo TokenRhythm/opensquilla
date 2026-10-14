@@ -69,6 +69,7 @@ async def show_widget(
                 not isinstance(message, str) or not message.strip()
                 for message in loading_messages
             )
+            or any(len(message) > 200 for message in loading_messages if isinstance(message, str))
         ):
             raise ToolError(
                 "SHOW_WIDGET_INVALID_LOADING_MESSAGES: provide one to four nonempty strings"
