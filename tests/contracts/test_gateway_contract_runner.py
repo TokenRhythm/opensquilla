@@ -484,6 +484,23 @@ def test_legacy_method_lifecycle_requires_one_legal_canonical_alias(
         runner.load_contract(schema, contract_root=tmp_path)
 
 
+def test_codegen_provenance_inputs_use_lf_line_endings() -> None:
+    # Provenance hashes use raw bytes. A clean Git status can still hide CRLF
+    # worktree inputs that generate different hashes from an LF CI checkout.
+    inputs = [
+        Path(runner.__file__),
+        runner.AJV_GENERATOR,
+        runner.PRODUCTION_TARGET_MANIFEST,
+        *(spec.schema for spec in runner.discover_contracts()),
+    ]
+    non_lf_inputs = [
+        path.relative_to(runner.ROOT).as_posix()
+        for path in inputs
+        if b"\r" in path.read_bytes()
+    ]
+    assert non_lf_inputs == [], "Normalize Contract provenance inputs to LF before codegen"
+
+
 def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
     specs = runner.discover_contracts()
 

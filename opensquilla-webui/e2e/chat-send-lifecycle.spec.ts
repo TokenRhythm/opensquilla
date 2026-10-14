@@ -306,7 +306,7 @@ test('pending admission is visible and a rejected send restores an editable retr
   await expect(page.locator('.msg-user')).toContainText('Synthetic request to retry.')
 
   gateway.rejectHeldSend()
-  await expect(page.locator('.chat-thread .msg-error__text')).toHaveText('The task did not finish. Please try again later.')
+  await expect(page.locator('.chat-thread .msg-error__text')).toHaveText('This request did not finish.')
   await expect(page.locator('body')).not.toContainText(REJECTION)
   await expect(page.locator('body')).not.toContainText('SYNTHETIC_ADMISSION_FAILURE')
   await expect(input).toHaveValue('Synthetic request to retry.')

@@ -1,3 +1,4 @@
+import { waitForRendererConnection } from './renderer-connection-probe.mjs'
 // Narrow native Windows probes. No installer, real profile, reload, WS proxy,
 // IPC replacement, or product timeout override. Run each scenario separately.
 import assert from 'node:assert/strict'
@@ -681,7 +682,7 @@ async function run(options) {
       return value?.status === 'ready' && (!replacement || (value.instanceId && value.instanceId !== replacement.instanceId
         && report.sockets.slice(replacement.socketCount).some(socket => !socket.closed && socket.hello?.stateDirMatches)))
     }, 'Gateway ready', 210_000)
-    await page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: 45_000 })
+    await waitForRendererConnection(page, 'connected', { timeout: 45_000 })
     if (connectedPhase) mark(connectedPhase)
     const composer = page.locator('.chat-textarea')
     await composer.waitFor({ state: 'visible', timeout: 45_000 })

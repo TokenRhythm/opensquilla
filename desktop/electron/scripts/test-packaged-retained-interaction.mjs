@@ -1,3 +1,4 @@
+import { waitForRendererConnection } from './renderer-connection-probe.mjs'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
@@ -67,7 +68,7 @@ async function screenshot(page, name) {
   report.screenshots.push({ path, sha256: sha256(await readFile(path)) })
 }
 async function ready(page) {
-  await page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: timeoutMs })
+  await waitForRendererConnection(page, 'connected', { timeout: timeoutMs })
   await page.locator('.chat-textarea').waitFor({ state: 'visible', timeout: timeoutMs })
 }
 async function launch(name) {
@@ -95,7 +96,7 @@ async function launch(name) {
   const page = await app.firstWindow()
   active.page = page
   await page.waitForURL(url => url.protocol === 'opensquilla-app:' && url.hostname === 'desktop', { timeout: timeoutMs })
-  await page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + timeoutMs })
+  await waitForRendererConnection(page, 'connected', { timeout: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + timeoutMs })
   const pageErrors = []
   page.on('pageerror', error => pageErrors.push(error.message))
   active.pageErrors = pageErrors

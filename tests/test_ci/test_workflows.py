@@ -2538,6 +2538,32 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         assert (Path("opensquilla-webui/e2e") / spec).is_file()
 
 
+def test_webui_chat_recovery_prepares_fonts_for_isolated_vite_fixtures() -> None:
+    steps = _workflow("ci.yml")["jobs"]["webui-chat-recovery"]["steps"]
+    install = next(
+        step for step in steps if step.get("name") == "Install frontend dependencies"
+    )
+    prepare = next(
+        step
+        for step in steps
+        if step.get("name") == "Prepare pinned offline Office preview assets"
+    )
+    browser = next(
+        step
+        for step in steps
+        if step.get("name") == "Run production-dist chat and Goal recovery browser contracts"
+    )
+
+    assert steps.index(install) < steps.index(prepare) < steps.index(browser)
+    assert prepare["working-directory"] == "opensquilla-webui"
+    assert prepare["run"].splitlines() == [
+        "npm run prepare:office-assets",
+        "npm run prepare:office-assets -- --offline",
+    ]
+    assert "if" not in prepare
+    assert not prepare.get("continue-on-error")
+
+
 def test_webui_virtualization_contracts_run_isolated_without_retries() -> None:
     job = _workflow("ci.yml")["jobs"]["webui-chat-recovery"]
     run = next(

@@ -19,6 +19,32 @@ export function sessionRecoveryFaultDomain(frame, sessionKey) {
   return null
 }
 
+// Hold the initial cold bootstrap without inventing a server response. Unlike
+// the later timeout fault, release forwards the real requests exactly once.
+export function createSessionBootstrapGate(sessionKey) {
+  let active = false
+  let requests = []
+  return {
+    begin() {
+      assert.equal(active, false, 'cold bootstrap gate is already active')
+      active = true
+    },
+    holdRequest(socket, frame, forward) {
+      if (!active || !sessionRecoveryFaultDomain(frame, sessionKey)) return false
+      requests.push({ socket, method: frame.method, forward })
+      return true
+    },
+    methods: () => requests.map(request => request.method),
+    release() {
+      active = false
+      const pending = requests
+      requests = []
+      for (const { forward } of pending) forward()
+    },
+    close(socket) { requests = requests.filter(request => request.socket !== socket) },
+  }
+}
+
 export function createSessionRecoveryFault(sessionKey) {
   const pendingReads = new Map()
   let heldResponses = []

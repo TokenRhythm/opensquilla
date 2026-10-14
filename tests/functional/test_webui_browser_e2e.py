@@ -166,7 +166,9 @@ def test_control_ui_loads_in_real_browser(tmp_path: Path) -> None:
                 waitUntil: "domcontentloaded",
                 timeout: 30000,
               });
-              await page.waitForSelector(".conn-pill.connected", { timeout: 15000 });
+              await page.waitForSelector('.topbar[data-connection-state="connected"]', {
+                timeout: 15000,
+              });
               const catalog = page.getByTestId("skills-catalog");
               const skillTile = catalog.locator("button.sk-tile").filter({
                 has: page.getByText("browser-smoke-skill", { exact: true }),
@@ -186,7 +188,9 @@ def test_control_ui_loads_in_real_browser(tmp_path: Path) -> None:
                 appCount: await page.locator("#app").count(),
                 basePath: await page.locator("#opensquilla-data").getAttribute("data-base-path"),
                 authMode: await page.locator("#opensquilla-data").getAttribute("data-auth-mode"),
-                connected: await page.locator(".conn-pill.connected").isVisible(),
+                connected: await page.locator(
+                  '.topbar[data-connection-state="connected"]'
+                ).isVisible(),
                 retiredControls: await page.locator(
                   ".sk-group--ap-settings, .sk-group--meta, .sk-proposal-row"
                 ).count(),

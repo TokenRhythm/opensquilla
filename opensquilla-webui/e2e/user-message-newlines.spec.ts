@@ -92,7 +92,7 @@ test('system text preserves authored line breaks while unknown errors use safe l
   await expect(systemText).toHaveCSS('white-space', 'pre-wrap')
 
   const errorText = page.locator('.msg-error__text').first()
-  await expect(errorText).toHaveText('The task did not finish. Please try again later.')
+  await expect(errorText).toHaveText('This request did not finish.')
   await expect(page.locator('.chat-thread')).not.toContainText('错误详情第一行')
   await expect(page.locator('.chat-thread')).not.toContainText('错误详情第二行')
 })

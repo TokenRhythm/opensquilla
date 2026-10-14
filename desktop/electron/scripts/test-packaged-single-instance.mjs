@@ -1,3 +1,4 @@
+import { waitForRendererConnection } from './renderer-connection-probe.mjs'
 // Native L1 acceptance. One scenario per fresh evidence root. Never uses a
 // real profile, replaces IPC, releases the lock, or kills a process by name.
 import assert from 'node:assert/strict'
@@ -185,7 +186,7 @@ export async function run(options) {
     const owner = currentOwner()
     assert.ok(owner && await ownership.verifyDesktopGatewayOwnership(owner), 'gateway-identity-unavailable')
     entry.owner = owner
-    await entry.page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: 45_000 })
+    await waitForRendererConnection(entry.page, 'connected', { timeout: 45_000 })
     await entry.page.locator('.chat-textarea').waitFor({ state: 'visible', timeout: 45_000 })
     report.processes.at(-1).launchToUiConnectedMs = Math.round(performance.now() - launchAt)
     return entry

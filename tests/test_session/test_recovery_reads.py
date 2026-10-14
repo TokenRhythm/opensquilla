@@ -314,8 +314,24 @@ async def test_title_deadline_does_not_fall_back_after_initialization_stalls(
 
 
 async def test_deadline_interrupts_sql_and_clears_handler_before_reuse(
-    storage: SessionStorage,
+    storage: SessionStorage, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    initialized_readers: list[Any] = []
+    statements: list[str] = []
+    original_initialize = storage._initialize_recovery_reader
+
+    async def initialize(reader: Any) -> None:
+        await original_initialize(reader)
+        await reader.set_trace_callback(statements.append)
+        initialized_readers.append(reader)
+
+    monkeypatch.setattr(storage, "_initialize_recovery_reader", initialize)
+    # This contract measures interruption of executing SQL. Cold connection
+    # setup has its own deadline tests and must finish before this 50ms budget.
+    with recovery_read_scope("agent:main:webchat:prepare", deadline=time.monotonic() + 1):
+        assert await storage.get_session("agent:main:webchat:healthy") is not None
+    assert len(initialized_readers) == 1
+
     with recovery_read_scope("agent:main:webchat:slow", deadline=time.monotonic() + 0.05) as budget:
         with pytest.raises(StorageBusyError) as caught:
             await storage._read_history_query(
@@ -324,11 +340,13 @@ async def test_deadline_interrupts_sql_and_clears_handler_before_reuse(
             )
     assert caught.value.stage == "deadline"
     await asyncio.wait_for(budget.drain(), 1)
+    assert any(statement.startswith("WITH RECURSIVE numbers") for statement in statements)
     pool = storage._recovery_read_pool
     assert pool is not None and pool.physical_count == 1 and pool.active_count == 0
     with recovery_read_scope("agent:main:webchat:healthy", deadline=time.monotonic() + 1):
         assert await storage.get_session("agent:main:webchat:healthy") is not None
     assert pool.physical_count == 1
+    assert len(initialized_readers) == 1
 
 
 async def test_all_recovery_read_paths_bypass_busy_legacy_reader(storage: SessionStorage) -> None:

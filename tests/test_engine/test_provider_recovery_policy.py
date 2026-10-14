@@ -124,18 +124,33 @@ async def test_expired_deadline_without_cooling_never_starts_factory(clock):
     assert calls == []
 
 
-async def test_cooldown_uses_exact_http_fact_independent_of_business_code(clock):
+@pytest.mark.parametrize("origin", [0.0, 29.1, 255.9])
+def test_cooldown_uses_exact_http_fact_independent_of_business_code(monkeypatch, origin):
+    from opensquilla.provider import retry_after
     from opensquilla.provider.retry_after import (
+        ProviderRetryAfterCooldowns,
         provider_retry_after_cooldowns,
         record_provider_retry_after,
     )
     from opensquilla.provider.types import ErrorEvent
 
+    now = [origin]
+    monkeypatch.setattr(
+        retry_after, "_provider_retry_after_cooldowns",
+        ProviderRetryAfterCooldowns(clock=lambda: now[0]),
+    )
     provider = object()
     record_provider_retry_after(provider, ErrorEvent(
         code="upstream_rate_limit", http_status=429, retry_after_s=35,
     ))
-    assert provider_retry_after_cooldowns().remaining(provider) == 35
+    # Adding/subtracting a monotonic origin may round the duration by an ULP.
+    assert provider_retry_after_cooldowns().remaining(provider) == pytest.approx(
+        35, rel=0, abs=1e-12,
+    )
+    now[0] = origin + 34
+    assert provider_retry_after_cooldowns().remaining(provider) > 0
+    now[0] = origin + 35
+    assert provider_retry_after_cooldowns().remaining(provider) == 0
 
 
 async def test_raised_http_error_main_owner_preserves_retry_after(monkeypatch, clock):

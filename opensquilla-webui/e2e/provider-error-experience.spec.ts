@@ -19,30 +19,30 @@ type Outcome = Record<string, unknown>
 // these are user-facing contracts for both supported test languages.
 const copy = {
   en: {
-    busy: 'The model service is busy. Please try again later.',
-    unknown: 'The task did not finish. Please try again later.',
+    busy: 'The model is temporarily rate limited; this request did not finish.',
+    unknown: 'This request did not finish.',
     timeout: 'The task timed out before it finished.',
     noProvider: 'No model is available.',
     modelSettings: 'Open model settings',
     partial: 'Partial results were preserved.',
     working: 'Working',
     waiting: 'Waiting for model',
-    retryWait: 'Rate limited · retrying in 30s',
+    retryWait: 'Model temporarily rate limited, retrying in about 30s',
     retrying: 'Retrying 2/3',
-    fallback: 'Switching to backup model',
+    fallback: 'Trying a backup model',
   },
   'zh-Hans': {
-    busy: '模型服务暂时繁忙，请稍后再试',
-    unknown: '任务未完成，请稍后再试',
+    busy: '模型暂时限流，本次未完成',
+    unknown: '本次请求未完成',
     timeout: '任务超时，未能完成',
     noProvider: '当前没有可用模型',
     modelSettings: '打开模型设置',
     partial: '已保留部分结果',
     working: '正在工作',
     waiting: '等待模型',
-    retryWait: '受到限流 · 30 秒后重试',
+    retryWait: '模型暂时限流，约 30 秒后重试',
     retrying: '正在重试 2/3',
-    fallback: '正在切换备用模型',
+    fallback: '正在尝试备用模型',
   },
 } satisfies Record<Locale, Record<string, string>>
 
@@ -316,9 +316,9 @@ for (const locale of ['en', 'zh-Hans'] as const) {
     test(`${locale} automatic recovery shows activity and ends with ${recovered ? 'success without failure' : 'one terminal failure'}`, async ({ page }) => {
       const gateway = await prepareGateway(page, { locale, partial: false })
       await gateway.start()
-      const label = page.locator('.assistant-activity--live .assistant-activity__live-label')
+      const label = page.locator('.assistant-activity--live').getByRole('status')
       gateway.activity('requesting', 'initial')
-      // Wait for the requesting event to reach the current phase header;
+      // Wait for the requesting event to reach the accessible phase announcement;
       // the generic working label is only the state before that event arrives.
       await expect(label).toHaveText(copy[locale].waiting)
       await expect(page.locator('.msg-error')).toHaveCount(0)

@@ -34,6 +34,49 @@ describe('Mermaid engine ownership', () => {
     expect(hasUnsupportedMermaidImageSources('flowchart TD\n A["<b>Public image</b><img src=https://example.com/a.png>"]')).toBe(false)
     expect(hasUnsupportedMermaidImageSources('flowchart TD\n A["<iframe src=https://example.com>"]')).toBe(true)
   })
+  it.each([
+    '<img src="file&#58;///secret">',
+    '<img src="https://example.com/a.png" srcset="https://example.com/b.png 2x">',
+    '<IMG SRC="https://example.com/a.png" oNeRrOr="alert(1)">',
+    '<svg><image xlink:href="file&#x3a;///secret"/></svg>',
+    '<svg><foreignObject><div onload="alert(1)">label</div></foreignObject></svg>',
+    '<template><img src="file:///secret"></template>',
+    '<b style="background: url(&quot;file:///secret&quot;)">label</b>',
+    '<style>@import "https://example.com/style.css";</style>',
+    '<script>fetch("https://example.com")</script>',
+    '<form action="https://example.com"><input></form>',
+  ])('rejects unsafe HTML before an engine can attach it: %s', async (markup) => {
+    const { renderMermaidBlocks } = await import('./mermaidRenderer')
+    const root = fixture(`flowchart TD\n A["${markup}"]`)
+    await renderMermaidBlocks(root, labels)
+    expect(root.querySelector('.mermaid-error')?.textContent).toContain('Blocked resource')
+    expect(root.querySelector('.mermaid-err-src')?.textContent).toContain(markup)
+    expect(api.render).not.toHaveBeenCalled()
+  })
+  it.each([
+    '<b>Public image</b><img src="https&#58;//example.com/a.png">',
+    '<svg><image xlink:href="https://example.com/a.png"/></svg>',
+    '<b style="fill:url(#local)">label</b>',
+    '<!-- <img src="file:///secret" onerror="alert(1)"> -->ordinary label',
+    '&lt;img src="file:///secret"&gt;',
+  ])('preserves safe HTML parsing and entity semantics: %s', async (markup) => {
+    const { hasUnsupportedMermaidImageSources } = await import('./mermaidRenderer')
+    expect(hasUnsupportedMermaidImageSources(`flowchart TD\n A["${markup}"]`)).toBe(false)
+  })
+  it('checks source without creating browser nodes or parsing it into a DOM', async () => {
+    const { hasUnsupportedMermaidImageSources } = await import('./mermaidRenderer')
+    const create = vi.spyOn(document, 'createElement')
+    const parse = vi.spyOn(DOMParser.prototype, 'parseFromString')
+    try {
+      expect(hasUnsupportedMermaidImageSources('<img src="file:///secret">')).toBe(true)
+      expect(hasUnsupportedMermaidImageSources('<b>Safe label</b>')).toBe(false)
+      expect(create).not.toHaveBeenCalled()
+      expect(parse).not.toHaveBeenCalled()
+    } finally {
+      create.mockRestore()
+      parse.mockRestore()
+    }
+  })
   it('serializes theme initialization with the entire preceding render', async () => {
     const { renderMermaidBlocks } = await import('./mermaidRenderer')
     let finish!: (value: { svg: string }) => void

@@ -336,10 +336,36 @@ def test_release_wheel_allows_only_canonical_distribution_license_notices() -> N
     assert module.forbidden_release_wheel_entries([notice, *forbidden]) == forbidden
 
 
-def test_release_wheel_notice_still_undergoes_sensitive_text_scanning(tmp_path: Path) -> None:
+def test_release_wheel_allows_only_canonical_office_preview_notice() -> None:
+    module = load_script()
+    notice = (
+        "opensquilla/gateway/static/dist/assets/office-preview-licenses/"
+        "Silurus-THIRD_PARTY_NOTICES.md"
+    )
+    forbidden = [
+        "opensquilla/gateway/static/dist/assets/office-preview-licenses/private-notes.md",
+        "opensquilla/gateway/static/dist/assets/office-preview-licenses/LICENSE.md",
+        "opensquilla/gateway/static/dist/assets/office-preview-licenses/nested/"
+        "Silurus-THIRD_PARTY_NOTICES.md",
+        "opensquilla/gateway/static/dist/assets/Silurus-THIRD_PARTY_NOTICES.md",
+        "docs/" + notice,
+    ]
+    assert module.forbidden_release_wheel_entries([notice, *forbidden]) == forbidden
+
+
+@pytest.mark.parametrize(
+    "notice",
+    [
+        "opensquilla-0.5.4.dist-info/licenses/THIRD_PARTY_NOTICES.md",
+        "opensquilla/gateway/static/dist/assets/office-preview-licenses/"
+        "Silurus-THIRD_PARTY_NOTICES.md",
+    ],
+)
+def test_release_wheel_notice_still_undergoes_sensitive_text_scanning(
+    tmp_path: Path, notice: str
+) -> None:
     module = load_script()
     wheel = tmp_path / "notice-probe.whl"
-    notice = "opensquilla-0.5.4.dist-info/licenses/THIRD_PARTY_NOTICES.md"
     marker = module.FORBIDDEN_RELEASE_TEXT_MARKERS[0]
     with ZipFile(wheel, "w") as archive:
         archive.writestr(notice, marker)

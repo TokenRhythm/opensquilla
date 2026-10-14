@@ -72,6 +72,20 @@ describe('artifactWorkbenchPreviewKind', () => {
 })
 
 describe('artifact HTML isolation', () => {
+  it.each([
+    '<p>ordinary document</p>',
+    '</script><script>parent.postMessage("untrusted", "*")</script>',
+    '<!-- "\\\n\u2028\u2029 --><p>untrusted delimiters</p>',
+  ])('keeps the Escape bridge fixed and ahead of artifact markup', (source) => {
+    const output = buildOfflineArtifactHtml(source)
+    const bridge = '<script>addEventListener("keydown",function(event){if(event.key==="Escape")'
+      + `parent.postMessage("${ARTIFACT_PREVIEW_ESCAPE_MESSAGE}","*")})</script>`
+    const bridgeStart = output.indexOf('<script>')
+    expect(output.slice(bridgeStart, bridgeStart + bridge.length)).toBe(bridge)
+    expect(output.slice(bridgeStart + bridge.length)).toBe(source)
+    expect(output.indexOf('Content-Security-Policy')).toBeLessThan(bridgeStart)
+  })
+
   it('detects local document, stylesheet, image and CSS references', () => {
     const source = `
       <link rel="stylesheet" href="./style.css">

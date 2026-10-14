@@ -1,4 +1,5 @@
 import { copyTextWithFallback } from '@/utils/browser'
+import { parseFragment, type DefaultTreeAdapterTypes } from 'parse5'
 import { getManifest } from '@/themes/registry'
 import { clampMermaidPreviewHeight, estimateMermaidPreviewHeight, formatMermaidParseError, renderMermaidWithRetry } from './mermaidUtils'
 import { isInternalSvgReference, isSafeMarkdownImageSource } from './markdownUris'
@@ -95,17 +96,49 @@ async function enqueueRender(run: () => Promise<string>, signal?: AbortSignal): 
 
 // Reject unsupported image requests before Mermaid attaches its measurement
 // DOM. Final SVG sanitization remains independent of this source preflight.
-export function hasUnsupportedMermaidImageSources(source: string): boolean {
-  const template = document.createElement('template')
-  template.innerHTML = source
-  if (template.content.querySelector('script, iframe, object, embed, link, base, meta, form, input, audio, video, source, picture')) return true
-  for (const element of template.content.querySelectorAll('*')) {
-    if ([...element.attributes].some(attribute => /^on/i.test(attribute.name))) return true
+const UNSUPPORTED_SOURCE_TAGS = new Set([
+  'script', 'iframe', 'object', 'embed', 'link', 'base', 'meta', 'form', 'input',
+  'audio', 'video', 'source', 'picture',
+])
+
+function sourceText(node: DefaultTreeAdapterTypes.ParentNode): string {
+  const pending: DefaultTreeAdapterTypes.Node[] = [...node.childNodes].reverse()
+  const text: string[] = []
+  while (pending.length) {
+    const child = pending.pop()!
+    if ('value' in child) text.push(child.value)
+    if ('childNodes' in child) pending.push(...[...child.childNodes].reverse())
   }
-  for (const image of template.content.querySelectorAll('img, image')) {
-    if (image.hasAttribute('srcset')) return true
-    const src = image.getAttribute('src') || image.getAttribute('href') || image.getAttribute('xlink:href') || ''
-    if (!isSafeMarkdownImageSource(src)) return true
+  return text.join('')
+}
+
+export function hasUnsupportedMermaidImageSources(source: string): boolean {
+  // Decode HTML entities and apply HTML parsing rules without constructing
+  // browser DOM or sanitizing away the attributes this preflight must reject.
+  const pending: DefaultTreeAdapterTypes.Node[] = [parseFragment(source)]
+  const css: string[] = []
+  while (pending.length) {
+    const node = pending.pop()!
+    if ('childNodes' in node) pending.push(...node.childNodes)
+    if (!('tagName' in node)) continue
+    const tag = node.tagName.toLowerCase()
+    if (UNSUPPORTED_SOURCE_TAGS.has(tag)) return true
+    const attributes = new Map(node.attrs.map(attribute => [
+      attribute.prefix ? `${attribute.prefix}:${attribute.name}` : attribute.name,
+      attribute.value,
+    ]))
+    if ([...attributes.keys()].some(name => /^on/i.test(name))) return true
+    if (tag === 'img' || tag === 'image') {
+      if (attributes.has('srcset')) return true
+      const src = attributes.get('src') || attributes.get('href') || attributes.get('xlink:href') || ''
+      if (!isSafeMarkdownImageSource(src)) return true
+    }
+    if (attributes.has('style') || tag === 'style') {
+      css.push(attributes.get('style') || sourceText(node))
+    }
+    if (tag === 'template' && node.namespaceURI === 'http://www.w3.org/1999/xhtml') {
+      pending.push((node as DefaultTreeAdapterTypes.Template).content)
+    }
   }
   // Only the explicit flowchart shape attributes describe image requests.
   // Plain labels/sequence messages can legitimately contain "img: ./file".
@@ -114,8 +147,6 @@ export function hasUnsupportedMermaidImageSources(source: string): boolean {
       if (!isSafeMarkdownImageSource(match[1] ?? match[2] ?? match[3] ?? '')) return true
     }
   }
-  const css = [...template.content.querySelectorAll('[style], style')]
-    .map(element => element.getAttribute('style') || element.textContent || '')
   css.push(...(source.match(/^(?:\s*(?:classDef|style|linkStyle)\b[^\n]*|\s*%%\{[^\n]*)/gm) || []))
   const header = source.match(/^---\s*\r?\n([\s\S]*?)\r?\n---(?:\s|$)/)
   if (header) css.push(header[1])

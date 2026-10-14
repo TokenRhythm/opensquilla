@@ -883,7 +883,7 @@ test.describe('Live assistant activity lifecycle', () => {
       retry_attempt: 7,
       retry_limit: 0,
     })
-    await expect(liveActivity.locator('.assistant-activity__live-label'))
+    await expect(liveActivity.getByRole('status'))
       .toHaveText('Retrying · attempt 7')
     await expect(liveActivity.getByTestId('assistant-unified-activity-timeline')
       .getByText('Retrying · attempt 7', { exact: true })).toBeVisible()
@@ -1001,9 +1001,9 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(page.locator('.work-card')).toHaveCount(0)
     const liveSummary = liveActivity.locator('.assistant-activity__live-head')
     await expect(liveSummary).toHaveAttribute('aria-expanded', 'true')
-    const liveStatus = liveActivity.locator('.assistant-activity__live-label')
+    const liveStatus = liveActivity.getByRole('status')
     await expect(liveStatus).toHaveText('Working')
-    const liveAnnouncement = liveActivity.locator('.assistant-activity__live-announcement')
+    const liveAnnouncement = liveActivity.getByRole('status')
     await expect(liveAnnouncement).toHaveAttribute('role', 'status')
     await expect(liveAnnouncement).toHaveAttribute('aria-live', 'polite')
     await expect(liveAnnouncement).toHaveAttribute('aria-atomic', 'true')
@@ -1012,23 +1012,14 @@ test.describe('Live assistant activity lifecycle', () => {
     // details must not add duplicate announcements.
     await expect(liveActivity.locator('[role="status"]')).toHaveCount(1)
     await expect(liveActivity.locator('.assistant-activity__live-elapsed'))
-      .toHaveAttribute('aria-hidden', 'true')
+      .toContainText('Time spent')
+    await expect(liveSummary.locator('[aria-live], [role="status"]')).toHaveCount(0)
     await expect(liveActivity.locator('.assistant-activity__live-failure')).toHaveCount(0)
     await expect(liveActivity.locator('.assistant-activity-status__row')).toHaveCount(0)
     await expect(liveSummary.locator('.activity-motion--active')).toHaveCount(0)
-    const liveMotion = await liveActivity.evaluate((element) => ({
-      row: getComputedStyle(element.querySelector<HTMLElement>('.assistant-activity__live-head .activity-motion')!).animationName,
-      dot: getComputedStyle(
-        element.querySelector<HTMLElement>('.assistant-activity__live-dot')!,
-      ).animationName,
-      label: getComputedStyle(
-        element.querySelector<HTMLElement>('.assistant-activity__live-label')!,
-      ).animationName,
-    }))
-    // Expanded activity animates its current tool, not a duplicate header.
-    expect(liveMotion.row).toBe('none')
-    expect(liveMotion.dot).toBe('none')
-    expect(liveMotion.label).toBe('none')
+    const headerMotion = liveSummary.locator('.activity-motion')
+    await expect(headerMotion).toHaveCSS('animation-name', 'none')
+    await expect(headerMotion).toHaveCSS('mask-image', 'none')
 
     lifecycle.emit('session.event.tool_use_start', {
       tool_use_id: 'activity-inspect',
@@ -1068,8 +1059,8 @@ test.describe('Live assistant activity lifecycle', () => {
     expect(await draftCandidate.evaluate(element =>
       element.closest('.assistant-activity') === null,
     )).toBe(true)
-    // The header and timeline both identify the active operation; the header
-    // additionally retains total and current-step elapsed times.
+    // The live region announces the phase; the visible header retains only
+    // total elapsed time, while the timeline shows the current operation.
     await expect(liveStatus).toHaveText('Writing the answer')
     await expect(
       liveTimeline.getByText('Writing the answer', { exact: true }),
@@ -1162,16 +1153,15 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(activeRow).toBeVisible()
     await expect(activeRow).toHaveCSS('animation-name', 'none')
     await expect(activeRow).toHaveCSS('mask-image', 'none')
-    const liveMotion = await liveActivity.evaluate((element) => ({
-      row: getComputedStyle(element.querySelector<HTMLElement>('.assistant-activity__live-head .activity-motion')!).animationName,
-      dot: getComputedStyle(
-        element.querySelector<HTMLElement>('.assistant-activity__live-dot')!,
-      ).animationName,
-      label: getComputedStyle(
-        element.querySelector<HTMLElement>('.assistant-activity__live-label')!,
-      ).animationName,
-    }))
-    expect(liveMotion).toEqual({ row: 'none', dot: 'none', label: 'none' })
+    // Collapsing transfers activity to the header, where reduced motion must
+    // still suppress both the animation and its mask.
+    const liveSummary = liveActivity.locator('.assistant-activity__live-head')
+    await liveSummary.click()
+    await expect(liveSummary).toHaveAttribute('aria-expanded', 'false')
+    const headerMotion = liveSummary.locator('.activity-motion--active')
+    await expect(headerMotion).toBeVisible()
+    await expect(headerMotion).toHaveCSS('animation-name', 'none')
+    await expect(headerMotion).toHaveCSS('mask-image', 'none')
   })
 })
 

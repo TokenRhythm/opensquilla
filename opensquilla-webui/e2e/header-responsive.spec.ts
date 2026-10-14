@@ -142,7 +142,8 @@ test.describe('Responsive chat header actions', () => {
       // the same session menu as narrower layouts.
       await menuTrigger.click()
       const menu = page.getByTestId('chat-session-actions-menu')
-      await expect(menu.getByRole('menuitem')).toHaveCount(2)
+      await expect(menu.getByRole('menuitem')).toHaveCount(3)
+      await expect(page.getByTestId('chat-session-action-find')).toHaveAccessibleName('在对话中查找 Ctrl+F')
       await expect(menu.getByRole('menuitem', { name: '分享', exact: true })).toBeVisible()
       await expect(page.getByTestId('chat-session-action-copy-app-link')).toHaveCount(0)
       await expect(page.getByTestId('chat-session-action-copy-gateway-link')).toHaveCount(0)

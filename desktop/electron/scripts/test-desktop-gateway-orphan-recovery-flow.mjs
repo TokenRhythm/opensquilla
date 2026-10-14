@@ -1,3 +1,4 @@
+import { waitForRendererConnection } from './renderer-connection-probe.mjs'
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import net from 'node:net'
@@ -462,7 +463,7 @@ try {
     'orphan-process-exit',
   ), () => phaseDiagnostics(secondApp, userDataDir, orphanRecoveryStartup))
   await withPhaseDeadline(
-    secondPage.locator('.conn-pill.connected').waitFor({ state: 'visible' }),
+    waitForRendererConnection(secondPage),
     orphanRecoveryStartup,
     'renderer-connected-before-child-crash',
     secondApp,
@@ -480,7 +481,7 @@ try {
   )
   process.kill(secondRecord.pid, 'SIGKILL')
   await withPhaseDeadline(
-    secondPage.locator('.conn-pill.connected').waitFor({ state: 'hidden' }),
+    waitForRendererConnection(secondPage, 'not-connected'),
     childCrashRecovery,
     'renderer-observed-child-crash',
     secondApp,
@@ -508,7 +509,7 @@ try {
     'replacement-ready',
   ), () => phaseDiagnostics(secondApp, userDataDir, childCrashRecovery))
   await withPhaseDeadline(
-    secondPage.locator('.conn-pill.connected').waitFor({ state: 'visible' }),
+    waitForRendererConnection(secondPage),
     childCrashRecovery,
     'renderer-reconnected-after-child-restart',
     secondApp,

@@ -848,6 +848,13 @@ jobs:
         working-directory: opensquilla-webui
         run: npm ci
 
+      - name: Prepare pinned offline Office preview assets
+        # Isolated real-Gateway fixtures start Vite directly and use source assets.
+        working-directory: opensquilla-webui
+        run: |
+          npm run prepare:office-assets
+          npm run prepare:office-assets -- --offline
+
       - name: Stage verified frontend artifact for Gateway
         working-directory: opensquilla-webui
         run: node scripts/stage-dist.mjs

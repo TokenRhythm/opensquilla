@@ -1,3 +1,4 @@
+import { waitForRendererConnection } from './renderer-connection-probe.mjs'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -130,7 +131,7 @@ async function runCase(plan, result) {
       page = await app.firstWindow({ timeout: startupTimeout })
       page.on('pageerror', failure => pageErrors.push(failure.message))
       await page.waitForURL(url => url.protocol === 'opensquilla-app:' && url.hostname === 'desktop', { timeout: startupTimeout })
-      await page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: startupTimeout })
+      await waitForRendererConnection(page, 'connected', { timeout: startupTimeout })
       await page.locator('.chat-textarea').waitFor({ state: 'visible', timeout: 30_000 })
       await waitFor(async () => (
         await page.evaluate(() => window.opensquillaDesktop?.getGatewayConnection?.())

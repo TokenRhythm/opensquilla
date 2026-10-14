@@ -11,7 +11,7 @@ import {
   DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
 } from './packaged-smoke-helpers.mjs'
 import { assertConcurrentRecoveryTransport } from './session-recovery-transport-contract.mjs'
-import { createSessionRecoveryEvidence, createSessionRecoveryFault } from './session-recovery-rpc-evidence.mjs'
+import { createSessionBootstrapGate, createSessionRecoveryEvidence, createSessionRecoveryFault } from './session-recovery-rpc-evidence.mjs'
 import {
   captureElectronProcessIdentity,
   captureFirstSendDiagnostic,
@@ -60,6 +60,7 @@ let heldSubscribeRequests = 0
 let serverTickCount = 0
 const rpcEvidence = createSessionRecoveryEvidence(sessionKey)
 const recoveryFault = createSessionRecoveryFault(sessionKey)
+const coldBootstrap = createSessionBootstrapGate(sessionKey)
 let faultReleased = 0
 let provider
 
@@ -198,6 +199,7 @@ async function captureRecoveryFailure() {
     gatewayReadinessElapsedMs: gatewayReadinessStartedAt === undefined
       ? null : Math.round(performance.now() - gatewayReadinessStartedAt),
     label, heldHistoryRequests, heldSubscribeRequests, socketCount, nextSocketIndex,
+    coldBootstrapMethods: coldBootstrap.methods(),
     physicalCloseCount, serverTickCount, faultReleased,
     ui, rpc: rpcEvidence.snapshot(),
     screenshot: screenshot?.diagnosticError ? screenshot : { captured: Boolean(screenshot) },
@@ -244,6 +246,7 @@ try {
     const server = client.connectToServer()
 
     client.onClose(() => {
+      coldBootstrap.close(socketIndex)
       recoveryFault.close(socketIndex)
       physicalCloseCount += 1
       if (!injectHang) healthyCloseCount += 1
@@ -256,31 +259,34 @@ try {
       } catch {
         // Non-JSON protocol frames must remain byte-transparent.
       }
-      if (frame) {
-        const faultDomain = injectHang ? recoveryFault.holdRequest(socketIndex, frame) : null
-        rpcEvidence.request(socketIndex, frame, faultDomain !== null)
-        if (
-          frame?.type === 'req'
-          && frame.method === 'sessions.messages.subscribe'
-          && !injectHang
-          && [sessionKey, switchSessionKey].includes(frame.params?.key)
-        ) {
-          healthyNavigationSocketIds.add(socketIndex)
-          healthySubscribeKeys.push(frame.params.key)
+      const forward = () => {
+        if (frame) {
+          const faultDomain = injectHang ? recoveryFault.holdRequest(socketIndex, frame) : null
+          rpcEvidence.request(socketIndex, frame, faultDomain !== null)
+          if (
+            frame?.type === 'req'
+            && frame.method === 'sessions.messages.subscribe'
+            && !injectHang
+            && [sessionKey, switchSessionKey].includes(frame.params?.key)
+          ) {
+            healthyNavigationSocketIds.add(socketIndex)
+            healthySubscribeKeys.push(frame.params.key)
+          }
+          if (faultDomain !== null) {
+            countTargetSocket()
+            if (faultDomain === 'history') heldHistoryRequests += 1
+            else heldSubscribeRequests += 1
+            return
+          }
         }
-        if (faultDomain !== null) {
-          countTargetSocket()
-          if (faultDomain === 'history') heldHistoryRequests += 1
-          else heldSubscribeRequests += 1
-          return
+        try {
+          server.send(message)
+        } catch {
+          // Setup navigation or application cleanup can close the peer between
+          // the message callback and this forwarding attempt.
         }
       }
-      try {
-        server.send(message)
-      } catch {
-        // Setup navigation or application cleanup can close the peer between
-        // the message callback and this forwarding attempt.
-      }
+      if (!coldBootstrap.holdRequest(socketIndex, frame, forward)) forward()
     })
 
     server.onMessage((message) => {
@@ -349,6 +355,7 @@ try {
   sessionUrl.pathname = '/chat'
   sessionUrl.search = new URLSearchParams({ session: sessionKey }).toString()
   sessionUrl.hash = ''
+  coldBootstrap.begin()
   await page.goto(sessionUrl.toString(), { waitUntil: 'domcontentloaded' })
 
   const thread = page.locator('.chat-thread')
@@ -356,6 +363,20 @@ try {
   const sendButton = page.locator('.chat-send-btn.btn--primary')
   const recoveredMessage = page.getByText(expectedLastMessage, { exact: true }).first()
   const sessionRow = key => page.locator(`[data-session-key="${key}"]`)
+
+  // A fresh document has no in-memory presentation cache. Keep this original
+  // cold-entry safety contract separate from the warm return tested below.
+  await waitFor(() => (
+    coldBootstrap.methods().includes('sessions.messages.subscribe')
+    && coldBootstrap.methods().includes('sessions.messages.snapshot.read')
+  ), 'cold session history and live bootstrap requests', SESSION_RECOVERY_TIMEOUT_MS)
+  await composer.waitFor({ state: 'visible', timeout: SESSION_RECOVERY_TIMEOUT_MS })
+  assert.equal(await page.getByText(expectedLastMessage, { exact: true }).count(), 0,
+    'cold history must remain unavailable while its bootstrap requests are held')
+  assert.equal(await composer.isEditable(), true, 'cold recovery must keep the composer editable')
+  assert.equal(await sendButton.isDisabled(), true, 'cold bootstrap must not grant send authority')
+  assert.equal(rpcEvidence.sendCount(), 0, 'cold bootstrap must not submit a user message')
+  coldBootstrap.release()
 
   await waitFor(
     async () => await recoveredMessage.isVisible() && !await sendButton.isDisabled(),
@@ -478,9 +499,14 @@ try {
     'the editable draft owns focus before recovery')
   assert.equal(
     await page.getByText(expectedLastMessage, { exact: true }).count(),
-    0,
-    'retained history must remain unavailable while its RPC is held',
+    1,
+    'a warm return must keep the retained history visible exactly once while its RPC is held',
   )
+  assert.equal(await recoveredMessage.isVisible(), true)
+  assert.equal(await recoveredMessage.evaluate(node => Boolean(node.closest('[inert]'))), true,
+    'cached history must remain read-only until its authoritative readers recover')
+  assert.equal(await sendButton.isDisabled(), true, 'cached presentation must not grant send authority')
+  assert.equal(rpcEvidence.sendCount(), 0, 'warm recovery must not submit or resend a user message')
 
   const historyFailure = page.locator(
     '[data-testid="chat-session-recovery-status"][data-recovery-state="history-error"]',
@@ -616,6 +642,8 @@ try {
     sessionKey,
     switchSessionKey,
     expectedLastMessage,
+    coldBootstrapVerified: true,
+    warmPresentationVerified: true,
     healthyNavigationSocketCount: healthyNavigationSample.socketCount,
     healthyNavigationNewSocketCount: healthyNavigationSample.newSocketCount,
     healthyNavigationCloseCount: healthyNavigationSample.closeCount,
