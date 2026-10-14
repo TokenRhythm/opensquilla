@@ -138,6 +138,10 @@
     ],
     "extraResources": [
       {
+        "from": "../../THIRD_PARTY_NOTICES.md",
+        "to": "THIRD_PARTY_NOTICES.md"
+      },
+      {
         "from": "src/boot.html",
         "to": "boot.html"
       },
