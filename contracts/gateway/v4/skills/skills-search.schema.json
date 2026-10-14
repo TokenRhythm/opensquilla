@@ -61,7 +61,18 @@
         "version": { "type": ["string", "null"] }, "author": { "type": ["string", "null"] },
         "source": { "type": "string" }, "trust_level": { "type": "string" },
         "identifier": { "type": "string" }, "installReference": { "type": "string" },
-        "installed": { "type": "boolean" }
+        "installed": { "type": "boolean" },
+        "license": { "type": "string" },
+        "homepage": { "type": "string" },
+        "upstream_url": { "type": "string" },
+        "origin_source": { "type": "string" },
+        "signature_status": { "type": "string" },
+        "content_hash": { "type": "string" },
+        "category": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "downloads": { "type": "integer" },
+        "installs": { "type": "integer" },
+        "icon_url": { "type": "string" }
       }
     },
     "Result": {

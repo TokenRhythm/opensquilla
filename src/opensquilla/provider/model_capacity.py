@@ -59,7 +59,7 @@ def sync_custom_capacity_endpoints(catalog: ModelCatalog, config: Any) -> None:
     if not callable(getattr(catalog, "set_live_provider_entries", None)):
         return
     identities = dict(getattr(catalog, "_capacity_endpoint_identities", {}))
-    for provider in ("custom", "custom_anthropic"):
+    for provider in ("custom", "custom_anthropic", "newapi"):
         identity = _endpoint_identity(config, provider)
         if identities.get(provider) != identity:
             catalog.set_live_provider_entries(provider, {})
@@ -78,7 +78,7 @@ def install_custom_capacity(
     provider: str,
     rows: Sequence[Mapping[str, Any]],
 ) -> None:
-    if provider not in {"custom", "custom_anthropic"}:
+    if provider not in {"custom", "custom_anthropic", "newapi"}:
         return
     identities = getattr(catalog, "_capacity_endpoint_identities", {})
     if identities.get(provider) != identity:

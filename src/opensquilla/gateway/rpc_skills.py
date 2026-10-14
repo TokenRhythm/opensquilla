@@ -1268,6 +1268,11 @@ async def _search_skill_catalog(
                 "origin_source": r.origin_source,
                 "signature_status": r.signature_status,
                 "content_hash": r.content_hash,
+                "category": r.category,
+                "tags": list(r.tags),
+                "downloads": r.downloads,
+                "installs": r.installs,
+                "icon_url": r.icon_url,
             }
             for r in results
         ],

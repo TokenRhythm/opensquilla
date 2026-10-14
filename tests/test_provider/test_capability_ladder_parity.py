@@ -201,6 +201,9 @@ _EXPECTED_CAPS: dict[tuple[str, str, str], tuple[bool, bool, bool, str]] = {
     ("custom", "seed-1-8-flash", ""): (False, True, False, "none"),
     ("custom", "model-x-thinking", ""): (False, True, False, "none"),
     ("custom", "gemini-2.5-flash", ""): (False, True, True, "none"),
+    # newapi: unqualified ids resolve through the same neutral ladder as
+    # `custom` (no provider branch in ModelCatalog for the newapi kind).
+    ("newapi", "totally-unknown-model-x1", ""): (False, True, False, "none"),
     ("custom", "gemini-3-pro-preview", ""): (False, True, True, "none"),
     ("custom", "o3-mini", ""): (False, True, False, "none"),
     ("custom", "gpt-5.5", ""): (False, True, True, "none"),
@@ -868,6 +871,7 @@ _EXPECTED_REQUIRES_API_KEY: dict[str, bool] = {
     "byteplus_coding_plan_anthropic": True,
     "custom": False,
     "custom_anthropic": False,
+    "newapi": True,
     "dashscope": True,
     "deepseek": True,
     "gemini": True,

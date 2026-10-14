@@ -93,7 +93,8 @@ export interface SkillCatalog {
   }): Promise<Skill>
   search(query: string, options?: {
     readonly limit?: number
-    readonly source?: string
+    /** `null` searches every configured source (market browse mode). */
+    readonly source?: string | null
     readonly signal?: AbortSignal
   }): Promise<SkillRegistrySearchResult>
   reload(options?: { readonly signal?: AbortSignal }): Promise<SkillReloadResult>

@@ -671,6 +671,23 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         ),
     ),
     "lm_studio": OpenAICompatPolicy(display_name="LM Studio"),
+    # new-api gateway epilogue: repeat choice-0 with an empty delta and
+    # ``usage: null`` after the terminal, then a choices-less usage trailer
+    # carrying billing/trace metadata. Mirrors TokenRhythm's observed trailer
+    # keys because this gateway fronts the same LiteLLM upstream.
+    "newapi": OpenAICompatPolicy(
+        display_name="new-api gateway",
+        allow_post_terminal_noop_choice=True,
+        allow_post_terminal_null_usage_noop_choice=True,
+        post_terminal_metadata_keys=frozenset(
+            {
+                "billing_pending",
+                "cost_cny",
+                "reasoning_available",
+                "trace_id",
+            }
+        ),
+    ),
     "ovms": OpenAICompatPolicy(display_name="OpenVINO Model Server"),
     "litellm_proxy": OpenAICompatPolicy(
         display_name="LiteLLM Proxy",

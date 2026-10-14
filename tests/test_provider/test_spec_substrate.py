@@ -24,6 +24,8 @@ _CATALOG_SOURCE_WAIVERS: frozenset[str] = frozenset(
         # serves; no models.dev source exists.
         "custom",
         "custom_anthropic",
+        # Self-hosted new-api gateway: model set = operator's channel mix.
+        "newapi",
         # Deployment-defined aggregation proxy: the model set is whatever
         # the operator's LiteLLM instance routes; no stable public catalog.
         "litellm_proxy",

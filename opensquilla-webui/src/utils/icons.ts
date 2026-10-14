@@ -12,6 +12,7 @@ export type IconName =
   | 'panel-left-open' | 'panel-left-close' | 'panel-right-open' | 'panel-right-close'
   | 'sidebar-visible' | 'sidebar-hidden'
   | 'clock' | 'microphone'
+  | 'store' | 'star'
   | 'cloud' | 'folder' | 'fileText' | 'fileCode' | 'image' | 'table' | 'externalLink'
   | 'keyboard' | 'languages' | 'shield' | 'lock'
   | 'target'
@@ -112,6 +113,8 @@ const ICONS: Record<IconName, IconDef> = {
   video:      { path: '<rect x="3" y="5" width="14" height="14" rx="2"/><path d="m17 10 4-2v8l-4-2z"/>', strokeWidth: 1.7 },
   pause:      { path: '<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>', strokeWidth: 1.7 },
   volume:     { path: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>', strokeWidth: 1.7 },
+  store:      { path: '<path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><path d="M3 6h18"/><path d="M16 10a4 4 0 0 1-8 0"/>', strokeWidth: 1.7 },
+  star:       { path: '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>', strokeWidth: 1.7 },
 };
 
 export function getIconSvg(name: IconName, size: number = 16): string {

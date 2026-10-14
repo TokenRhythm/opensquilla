@@ -127,6 +127,17 @@
           @keydown="onThreadScrollKeydown"
         >
         <div ref="threadHeaderRef" class="chat-thread__header">
+        <div
+          v-if="chatSpeedHasStarted"
+          class="chat-speed-card__float"
+          role="group"
+          :aria-label="'LLM \u901f\u5ea6\u5361\u7247'"
+        >
+          <ChatSpeedCard
+            :snapshot="chatSpeed.snapshot"
+            :has-started="true"
+          />
+        </div>
         <template v-if="isNewChatLanding">
           <div class="chat-landing-brand" :aria-label="t('chat.newChatBrand')">
             <EmptyStateChips
@@ -836,6 +847,7 @@ import {
   reuseArtifactPromptAnnotation,
 } from '@/workbench/promptAnnotations'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
+import ChatSpeedCard from '@/components/chat/ChatSpeedCard.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import UnifiedAssistantActivityTimeline from '@/components/chat/UnifiedAssistantActivityTimeline.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
@@ -1896,6 +1908,7 @@ const chatStream = useChatStream({
 })
 const {
   isStreaming,
+  speed: chatSpeed,
   streamArtifacts,
   streamBubble,
   streamHasVisibleOutput,
@@ -1923,6 +1936,14 @@ const {
   ensureInterruptBubble,
   completeReasoningPresentation,
 } = chatStream
+
+// Live LLM speed card. The tracker records a token on every text delta and the
+// card observes its snapshot on a fixed cadence, so the per-delta path stays
+// allocation-free. Shown while a round has started, pinned top-right over the
+// message thread without disturbing the message layout.
+const chatSpeedHasStarted = computed(() =>
+  chatSpeed.snapshot.value.total > 0 || chatSpeed.snapshot.value.running,
+)
 useBrowserAutomationState({
   native: platform.workbench.native,
   sessionKey,
@@ -7534,4 +7555,15 @@ watch(
   height: 1px;
   pointer-events: none;
 }
+
+.chat-speed-card__float {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 20;
+  pointer-events: auto;
+  /* Keep the widget from covering the transcript: it sits in the header band,
+     and the card itself collapses to a slim bar by default. */
+}
+.chat-thread { position: relative; }
 </style>

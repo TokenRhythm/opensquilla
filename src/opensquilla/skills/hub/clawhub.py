@@ -122,6 +122,20 @@ def _artifact_client_kwargs(url: str) -> dict[str, object]:
     return client_kwargs
 
 
+def _listing_count(value: object) -> int:
+    """Return a non-negative listing counter from a registry row field."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    if isinstance(value, str):
+        try:
+            return max(int(value.strip().replace(",", "")), 0)
+        except ValueError:
+            return 0
+    return 0
+
+
 @dataclass(frozen=True)
 class _ClawHubRef:
     slug: str
@@ -324,6 +338,11 @@ class ClawHubSource(SkillSource):
     async def search(self, query: str, limit: int = 20) -> list[SkillMeta]:
         import httpx
 
+        # The public search endpoint answers a blank keyword with zero rows;
+        # skip the round trip so market browse mode stays local and instant.
+        if not query.strip():
+            return []
+
         url = f"{self._base_url}/api/v1/search"
         try:
             async with httpx.AsyncClient(timeout=10, trust_env=_trust_env()) as client:
@@ -395,6 +414,8 @@ class ClawHubSource(SkillSource):
             identifier = install_ref
             if _parse_identifier(identifier) is None:
                 continue
+            raw_tags = item.get("tags")
+            icon_value = item.get("icon")
             meta = SkillMeta(
                 name=str(item.get("displayName") or item.get("name") or slug),
                 description=_registry_description(item),
@@ -405,8 +426,12 @@ class ClawHubSource(SkillSource):
                 identifier=identifier,
                 homepage=str(item.get("homepage") or ""),
                 license=str(item.get("license") or ""),
-                tags=list(item.get("tags") or []),
+                tags=[str(tag) for tag in raw_tags if isinstance(tag, (str, int))]
+                if isinstance(raw_tags, list)
+                else [],
                 canonical_identifier=identifier,
+                downloads=_listing_count(item.get("downloads")),
+                icon_url=str(icon_value) if isinstance(icon_value, str) else "",
             )
             results.append(meta)
             if meta.description:

@@ -46,12 +46,12 @@ function mount(component: typeof SkillsChannelsHubView) {
 }
 
 describe('route hub views', () => {
-  it('configures the two-tab Skills and Channels hub without monitor actions', () => {
+  it('configures the three-tab Skills, Market, and Channels hub without monitor actions', () => {
     const host = mount(SkillsChannelsHubView)
     const probe = host.querySelector('[data-testid="route-hub-probe"]')
 
-    expect(probe?.getAttribute('data-paths')).toBe('/skills,/channels')
-    expect(probe?.getAttribute('data-max')).toBe('2')
+    expect(probe?.getAttribute('data-paths')).toBe('/skills,/market,/channels')
+    expect(probe?.getAttribute('data-max')).toBe('3')
     expect(probe?.getAttribute('data-aria-label-key')).toBe('nav.skillsChannels')
     expect(probe?.getAttribute('data-mobile-equal')).toBe('true')
   })

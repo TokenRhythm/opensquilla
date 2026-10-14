@@ -39,6 +39,7 @@ import {
   splitTextByModelCallSegments,
 } from '@/utils/chat/modelCallSegments'
 import { useChatTurnLog } from '@/composables/chat/useChatTurnLog'
+import { useChatSpeedTracker } from '@/composables/chat/useChatSpeedTracker'
 import type { ReasoningBlock } from '@/types/turnlog'
 import { isLegacySilentSentinelOnly } from '@/utils/chat/silentSentinels'
 import { createClientMessageId } from '@/utils/chat/messageIdentity'
@@ -202,6 +203,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   const streamActivityTick = ref(0)
   let streamActivityTimer: ReturnType<typeof setInterval> | null = null
   const streamRound = ref(1)
+  const speed = useChatSpeedTracker()
   // Provider deltas can arrive tens of thousands of times per turn. Their
   // timestamp is sampled by the one-second activity clock; making every write
   // reactive invalidated the activity ribbon (and style) once per delta even
@@ -498,6 +500,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamRound.value = 1
     streamTaskClockIdentity = ''
     streamTurnStartedAt.value = restoredStartedAt || Date.now()
+    speed.startRound(streamTurnStartedAt.value)
     noteStreamSignal()
     streamBubble.value = true
     streamShowHeader.value = options.lastHeaderRole.value !== 'assistant'
@@ -604,6 +607,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       if (emptyStream) {
         streamBubble.value = false
         isStreaming.value = false
+        speed.endRound()
         resetStreamState()
         checkpointedRaw = ''
         checkpointedAcrossToolBoundary = false
@@ -644,6 +648,7 @@ export function useChatStream(options: UseChatStreamOptions) {
 
     streamBubble.value = false
     isStreaming.value = false
+    speed.endRound()
     resetStreamState()
     checkpointedRaw = ''
     checkpointedAcrossToolBoundary = false
@@ -1010,6 +1015,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       activeModelCallIteration = iteration
     }
     recordActivityPhase('Writing reply', `write:${streamRound.value}`)
+    speed.recordToken(Date.now())
     appendFrame({ kind: 'text', text: deltaText, presentation })
     scheduleRender()
   }
@@ -1559,6 +1565,7 @@ export function useChatStream(options: UseChatStreamOptions) {
 
   return {
     isStreaming,
+    speed,
     streamArtifacts,
     streamBubble,
     streamPreviewComplete,

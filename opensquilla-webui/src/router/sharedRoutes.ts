@@ -42,6 +42,8 @@ export const sharedRoutes: RouteRecordRaw[] = [
   // rail target while both canonical routes share the same kept-alive hub.
   { path: '/skills',    name: 'skills',    component: SkillsChannelsHubView, meta: { title: 'Skills', group: 'Work', icon: 'skills', nav: 'primary', navOrder: 40, navLabelKey: 'nav.skillsChannels', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'skills-channels-hub' } },
   { path: '/channels',  name: 'channels',  component: SkillsChannelsHubView, meta: { title: 'Channels', icon: 'channels', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'skills-channels-hub' } },
+  // The marketplace browse surface: third kept-alive tab of the Skills hub.
+  { path: '/market',    name: 'market',    component: SkillsChannelsHubView, meta: { title: 'Market', icon: 'store', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'skills-channels-hub' } },
   { path: '/cron',      name: 'cron',      component: CronView,      meta: { title: 'Cron', group: 'Work', icon: 'cron', nav: 'primary', navOrder: 50, platforms: ['web', 'desktop'], keepAlive: true } },
   { path: '/health', redirect: '/usage' },
 ]

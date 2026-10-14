@@ -128,6 +128,29 @@ per batch. Ordinary item failures do not roll back successful items or stop late
 items. A GitHub rate-limit response pauses the remaining references as not
 attempted and keeps them in the input for a later batch.
 
+## Browse the Skill Marketplace
+
+The Web UI hosts a marketplace tab beside Skills and Channels. It reads the same
+Community sources as `skills search` — ClawHub, SkillHub, and GitHub — through one
+aggregate view.
+
+Leaving the search box empty browses the shelf instead of returning nothing: each
+source that can answer a keywordless query lists its rows, and the ones that cannot
+return an empty page rather than an error. From there you can:
+
+- filter by the categories and labels the registries publish;
+- sort by relevance, download count, install count, or name;
+- open a card to preview the full description, provenance, license, trust level,
+  and content identifier before installing;
+- star skills into a favorites list. Favorites are an owner-local reading list
+  kept in this browser only: they survive reloads, sync across tabs, never reach
+  the Gateway, and do not install anything;
+- install in place, which reuses the same transaction, risk-scan confirmation,
+  progress reporting, retry, and rollback path as the Add Skill drawer.
+
+GitHub search needs a `GITHUB_TOKEN`; without it that source contributes no browse
+rows, and installing a GitHub skill by exact reference keeps working.
+
 ## Manage Skill Sources
 
 Custom source repositories are called taps:

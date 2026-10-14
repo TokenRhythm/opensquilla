@@ -575,6 +575,13 @@ class GitHubSource(SkillSource):
     async def search(self, query: str, limit: int = 20) -> list[SkillMeta]:
         import httpx
 
+        # Market browse mode sends a blank keyword so the registry sources can
+        # answer with their shelf listings. GitHub code search cannot serve a
+        # keywordless query (a bare qualifier set is rejected with 422), so an
+        # empty query is an empty answer instead of a doomed round trip.
+        if not query.strip():
+            return []
+
         # GitHub rejects unauthenticated code search outright, so without a token
         # this request cannot succeed — every Community search would spend a round
         # trip earning a 401 and then warn about it, while the results the user sees

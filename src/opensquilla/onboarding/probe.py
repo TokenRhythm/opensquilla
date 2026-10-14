@@ -1004,7 +1004,7 @@ async def discover_selectable_provider_models(
             catalog={"cacheHit": False, "stale": True, "lastSyncedAt": None},
         )
 
-    if provider_id in {"custom", "custom_anthropic"}:
+    if provider_id in {"custom", "custom_anthropic", "newapi"}:
         from opensquilla.provider.model_capacity import (
             custom_capacity_identity,
             install_custom_capacity,

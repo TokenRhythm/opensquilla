@@ -33,6 +33,12 @@ class SkillSearchProjection(TypedDict):
     origin_source: NotRequired[str]
     signature_status: NotRequired[str]
     content_hash: NotRequired[str]
+    # Marketplace browse metadata (additive; sources may leave these empty).
+    category: NotRequired[str]
+    tags: NotRequired[list[str]]
+    downloads: NotRequired[int]
+    installs: NotRequired[int]
+    icon_url: NotRequired[str]
 
 
 class SkillSearchDiagnostic(TypedDict, total=False):
