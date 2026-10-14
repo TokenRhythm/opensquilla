@@ -231,8 +231,10 @@ async function exportCanvas(mode: 'copy' | 'download' | 'html') {
   if (!canExport.value || !runtime) return
   const mounted = runtime
   const expectedScope = scope.value
+  const expectedReceiptVersion = receiptVersion.value
   const controller = new AbortController(); exportRequest = controller
-  const current = () => alive && !controller.signal.aborted && scope.value === expectedScope && runtime === mounted
+  const current = () => alive && !controller.signal.aborted && scope.value === expectedScope
+    && receiptVersion.value === expectedReceiptVersion && runtime === mounted
   const assertCurrent = () => {
     assertClipboardPreparationActive(controller.signal)
     if (!current()) throw new DOMException('Cancelled', 'AbortError')
