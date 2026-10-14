@@ -2387,10 +2387,6 @@ function desktopConsentMirrorPath(profile: DesktopProfilePaths, configRaw: strin
   return join(desktopTelemetryDirectory(profile, configRaw), 'desktop-consent-mirror.json')
 }
 
-function desktopEarlyTelemetrySpoolPath(profile: DesktopProfilePaths, configRaw: string | null): string {
-  return join(desktopTelemetryDirectory(profile, configRaw), 'desktop-early-spool')
-}
-
 function mirroredScopeConsent(
   scope: DesktopTelemetryConsent['reliability'],
   forcedOff: boolean,
@@ -2439,16 +2435,19 @@ async function syncDesktopConsentMirror(profile = activeDesktopProfile()): Promi
   const credential = credentialRaw === null
     ? null
     : normalizeDesktopCredential(JSON.parse(credentialRaw) as Partial<DesktopConnection>)
+  const telemetryDirectory = desktopTelemetryDirectory(profile, configRaw)
+  const spoolRoot = join(telemetryDirectory, 'desktop-early-spool')
+  const consentMirrorPath = join(telemetryDirectory, 'desktop-consent-mirror.json')
   desktopTelemetryRuntimeGate.openAfterConsentSync()
   desktopReliabilityTelemetry.synchronize({
-    spoolRoot: desktopEarlyTelemetrySpoolPath(profile, configRaw),
-    consentMirrorPath: desktopConsentMirrorPath(profile, configRaw),
+    spoolRoot,
+    consentMirrorPath,
   })
   desktopGrowthTelemetry.synchronize({
     profileKey: profile.home,
-    telemetryDirectory: desktopTelemetryDirectory(profile, configRaw),
-    spoolRoot: desktopEarlyTelemetrySpoolPath(profile, configRaw),
-    consentMirrorPath: desktopConsentMirrorPath(profile, configRaw),
+    telemetryDirectory,
+    spoolRoot,
+    consentMirrorPath,
   }, credential?.configAuthority === 'generated' ? credential.growthOnboardingReceipt : null)
   refreshDesktopReliabilityForegroundState()
 }

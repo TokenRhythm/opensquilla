@@ -1260,9 +1260,12 @@ def test_blocked_profile_consolidation_is_maintenance_until_primary_inspection()
         "desktopProfilesConsolidatedThisProcess = true"
     )
 
-    assert (
-        "const consolidationFailure = await consolidateLegacyRecoveryProfilesBeforeStartup()"
-        in startup_inspection
+    # Only proven healthy metadata may omit maintenance. The fallback still
+    # inspects the primary profile before deciding how to surface a failure.
+    assert re.search(
+        r"let consolidationFailure = metadata\.canSkipMaintenance\s*"
+        r"\? null\s*: await consolidateLegacyRecoveryProfilesBeforeStartup\(\)",
+        startup_inspection,
     )
     assert "let inspection = await inspectDesktopProfile(active)" in startup_inspection
     assert startup_inspection.index("let inspection = await inspectDesktopProfile(active)") < (

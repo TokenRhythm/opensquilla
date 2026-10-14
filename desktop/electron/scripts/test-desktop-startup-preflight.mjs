@@ -396,10 +396,47 @@ try {
   assert.equal(stateContext.configuredDesktopStateDirectory(external, `"state_dir" = ${tomlPath(externalState)}\n`), externalState)
   assert.equal(stateContext.configuredDesktopStateDirectory(relative, 'state_dir = """state"""\n'), join(relative.home, 'state'))
   assert.throws(() => stateContext.configuredDesktopStateDirectory(healthy, 'state_dir = ["wrong"]\n'))
+  // Synchronizing both telemetry consumers must not reparse TOML for each
+  // derived filename, or retain a previous config's external state directory.
+  const consentEnd = main.indexOf('async function runDesktopTelemetryConsentSideEffect', stateFunctionStart)
+  let syncConfig = ''
+  let parseCalls = 0
+  const mirrors = []
+  const reliabilityPaths = []
+  const growthPaths = []
+  const consent = () => ({ reliability: { enabled: null }, growth: { enabled: null } })
+  const consentContext = {
+    configuredDesktopDataDirectory, join,
+    parseToml: (raw) => { parseCalls++; return parseToml(raw) },
+    readOptionalDesktopText: async (path) => path === join(healthy.home, 'config.toml') ? syncConfig : null,
+    desktopTelemetryRuntimeGate: { close() {}, openAfterConsentSync() {} },
+    resolveDesktopTelemetryConsent: consent, emptyDesktopTelemetryConsent: consent,
+    CONSENT_MIRROR_SCHEMA_VERSION: 1,
+    writeConsentMirror: async (path) => { mirrors.push(path) },
+    desktopReliabilityTelemetry: { synchronize: (paths) => { reliabilityPaths.push(paths) } },
+    desktopGrowthTelemetry: { synchronize: (paths) => { growthPaths.push(paths) } },
+    refreshDesktopReliabilityForegroundState() {},
+  }
+  vm.createContext(consentContext)
+  vm.runInContext(main.slice(stateFunctionStart, consentEnd), consentContext)
+  for (const state of [externalState, join(healthy.home, 'state')]) {
+    syncConfig = `state_dir = ${tomlPath(state)}\n`
+    parseCalls = 0
+    await consentContext.syncDesktopConsentMirror(healthy)
+    const directory = join(state, 'telemetry')
+    const mirror = join(directory, 'desktop-consent-mirror.json')
+    assert.equal(parseCalls, 2, 'one path resolution per mirror write and consumer synchronization')
+    assert.equal(mirrors.at(-1), mirror)
+    assert.equal(reliabilityPaths.at(-1).consentMirrorPath, mirror)
+    assert.equal(growthPaths.at(-1).consentMirrorPath, mirror)
+    assert.equal(growthPaths.at(-1).telemetryDirectory, directory)
+    assert.equal(reliabilityPaths.at(-1).spoolRoot, join(directory, 'desktop-early-spool'))
+    assert.equal(growthPaths.at(-1).spoolRoot, join(directory, 'desktop-early-spool'))
+  }
   const start = main.indexOf('async function inspectActiveProfileBeforeStartup')
   const end = main.indexOf('async function openOrResumeDesktopApp', start)
   const body = main.slice(start, end)
-  async function startupCase(results, expected) {
+  async function startupCase(results, expected, consolidationFailure = null) {
     const calls = []
     const report = { outcome: 'ready', stable_code: 'canonical_workspace', allowed_actions: [] }
     const context = {
@@ -407,7 +444,8 @@ try {
       inspectDesktopStartupMetadata: () => results.shift(),
       app: { getPath: () => healthy.userData }, process: { env: {} }, join,
       resolvedPathsEqual: (a, b) => resolve(a) === resolve(b),
-      consolidateLegacyRecoveryProfilesBeforeStartup: async () => { calls.push('consolidate'); return null },
+      consolidateLegacyRecoveryProfilesBeforeStartup: async () => { calls.push('consolidate'); return consolidationFailure },
+      deferProfileConsolidationMaintenance: () => { calls.push('defer') },
       liveLifecycleOwnedGatewayProcesses: () => [],
       recoverVerifiedOrphanGatewayBeforeSpawn: async () => { calls.push('orphan') },
       inspectDesktopProfile: async () => { calls.push('inspect'); return report },
@@ -427,13 +465,16 @@ try {
   await startupCase([eligible, eligible], ['orphan'])
   await startupCase([{ canSkipMaintenance: false }], ['consolidate', 'orphan', 'inspect'])
   await startupCase([eligible, { canSkipMaintenance: false }], ['orphan', 'consolidate', 'inspect'])
+  // Historical maintenance findings must not block a healthy primary profile.
+  await startupCase([{ canSkipMaintenance: false }], ['consolidate', 'orphan', 'inspect', 'defer'],
+    { outcome: 'blocked', stable_code: 'synthetic_historical_warning' })
   assert.equal(configuredDesktopDataDirectory(healthy.home, 'state', 'state'), join(healthy.home, 'state'))
   if (process.platform !== 'win32') {
     assert.equal(configuredDesktopDataDirectory(healthy.home, 'link/../state', 'state'), null)
     assert.equal(configuredDesktopDataDirectory(healthy.home, '~/link/../state', 'state'), null)
     assert.equal(configuredDesktopDataDirectory(healthy.home, '//server/state', 'state'), null)
   }
-  console.log(JSON.stringify({ ok: true, metadataCases: assertions, coordinatorCases: 3, sqliteContentReads: 0 }))
+  console.log(JSON.stringify({ ok: true, metadataCases: assertions, coordinatorCases: 4, telemetryPathCases: 2, sqliteContentReads: 0 }))
 } finally {
   const resolvedRoot = resolve(root)
   assert.ok(resolvedRoot.startsWith(resolve(tmpdir()) + (process.platform === 'win32' ? '\\' : '/')))
