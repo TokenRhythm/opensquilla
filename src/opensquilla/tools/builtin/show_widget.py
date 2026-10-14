@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from opensquilla.artifact_session.errors import ArtifactConflictError
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.tools.registry import tool
 from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
@@ -16,7 +17,8 @@ from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
         "Show an interactive visual inline in the conversation using the "
         "generative-frame widget contract. Provide a short title "
         "and an HTML fragment or standalone SVG in widget_code. The host snapshots "
-        "the widget as an immutable Visualize Artifact for reloads and remote clients. "
+        "the widget as an internal immutable Visualize Artifact for reloads and remote clients. "
+        "Showing the same title replaces that widget. "
         "This tool does not write a workspace HTML file. Use open_workspace_preview "
         "when the user asks for an editable or multi-file webpage."
     ),
@@ -81,9 +83,89 @@ async def show_widget(
             widget_code=widget_code,
             loading_messages=loading_messages,
         )
-    except (TypeError, ValueError) as exc:
+    except (ArtifactConflictError, TypeError, ValueError) as exc:
         raise ToolError(f"SHOW_WIDGET_FAILED: {exc}") from exc
     return json.dumps(result, ensure_ascii=False)
 
 
-__all__ = ["show_widget"]
+@tool(
+    name="edit_widget",
+    description=(
+        "Change a widget already shown in the conversation using exact string "
+        "replacements applied in order to its latest code. Every old_string must "
+        "match exactly once; if any replacement fails, no change is applied. "
+        "Use show_widget to create a missing widget."
+    ),
+    params={
+        "title": {
+            "type": "string",
+            "description": (
+                "The exact short title used by show_widget for this conversation widget."
+            ),
+        },
+        "edits": {
+            "type": "array",
+            "description": "One or more exact replacements, applied in order.",
+            "minItems": 1,
+            "maxItems": 32,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text copied from the widget's latest code.",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Replacement text.",
+                    },
+                },
+                "required": ["old_string", "new_string"],
+                "additionalProperties": False,
+            },
+        },
+        "expected_version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional version fence from the latest widget receipt.",
+        },
+    },
+    required=["title", "edits"],
+    owner_only=True,
+    plan_access=PlanAccess.READ_ONLY,
+    cancellation_policy="must_settle",
+    sandbox=SandboxToolDescriptor.artifact(kind="artifact.preview"),
+)
+async def edit_widget(
+    title: str,
+    edits: list[dict[str, str]],
+    expected_version: int | None = None,
+) -> str:
+    """Apply exact replacements to the latest persisted widget revision."""
+    context = current_tool_context.get()
+    adopter = getattr(context, "generated_artifact_adopter", None) if context else None
+    edit = getattr(adopter, "edit_widget", None) if adopter else None
+    if context is None or not callable(edit):
+        raise ToolError(
+            "EDIT_WIDGET_UNAVAILABLE: This session has no authenticated Visualize Artifact "
+            "publisher. Use show_widget to create a widget when available."
+        )
+    if not isinstance(edits, list) or not edits or len(edits) > 32:
+        raise ToolError("EDIT_WIDGET_INVALID_EDITS: provide one to 32 replacements")
+    if expected_version is not None and (
+        type(expected_version) is not int or expected_version < 1
+    ):
+        raise ToolError("EDIT_WIDGET_INVALID_VERSION: expected_version must be positive")
+    try:
+        result: dict[str, Any] = await edit(
+            context,
+            title=title,
+            edits=edits,
+            expected_version=expected_version,
+        )
+    except (ArtifactConflictError, TypeError, ValueError) as exc:
+        raise ToolError(f"EDIT_WIDGET_FAILED: {exc}") from exc
+    return json.dumps(result, ensure_ascii=False)
+
+
+__all__ = ["show_widget", "edit_widget"]

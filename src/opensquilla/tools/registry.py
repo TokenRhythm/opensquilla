@@ -48,6 +48,7 @@ DEFAULT_MODEL_TOOL_NAMES: frozenset[str] = frozenset(
         "video_status",
         "list_dir",
         "open_workspace_preview",
+        "edit_widget",
         "show_widget",
         "pdf",
         # ``process`` is the management half of ``exec_command``.  Keep it

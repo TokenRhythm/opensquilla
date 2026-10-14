@@ -7,7 +7,7 @@ import pytest
 from opensquilla.artifact_session import ArtifactSessionService
 from opensquilla.artifacts import ArtifactStore
 from opensquilla.gateway.generated_artifact_adoption import GeneratedArtifactAdopter
-from opensquilla.tools.builtin.show_widget import show_widget
+from opensquilla.tools.builtin.show_widget import edit_widget, show_widget
 from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import CallerKind, ToolContext, ToolError, current_tool_context
 
@@ -44,12 +44,24 @@ async def _call(context: ToolContext, **kwargs):
         current_tool_context.reset(token)
 
 
+async def _call_edit(context: ToolContext, **kwargs):
+    token = current_tool_context.set(context)
+    try:
+        return json.loads(await edit_widget(**kwargs))
+    finally:
+        current_tool_context.reset(token)
+
+
 def test_show_widget_is_model_visible_and_schema_matches_upstream_contract():
     registry = get_default_registry()
     registered = registry.get("show_widget")
     assert registered is not None
     assert {"title", "widget_code", "loading_messages"} <= set(registered.spec.parameters)
     assert registered.spec.required == ["title", "widget_code"]
+    edit_registered = registry.get("edit_widget")
+    assert edit_registered is not None
+    assert {"title", "edits", "expected_version"} <= set(edit_registered.spec.parameters)
+    assert edit_registered.spec.required == ["title", "edits"]
 
 
 async def test_show_widget_publishes_immutable_artifact_receipt(widget_context):
@@ -72,6 +84,21 @@ async def test_show_widget_publishes_immutable_artifact_receipt(widget_context):
     assert head.revision.revision_id == result["revisionId"]
     assert head.revision.artifact_sha256 == result["sha256"]
     assert head.revision.artifact_id == result["artifactId"]
+
+
+async def test_show_widget_same_title_reuses_document_and_increments_version(widget_context):
+    context, adopter = widget_context
+    first = await _call(context, title="capacity", widget_code="<p>one</p>")
+    second = await _call(context, title="capacity", widget_code="<p>two</p>")
+    assert second["documentId"] == first["documentId"]
+    assert second["widgetId"] == first["widgetId"]
+    assert second["version"] == 2
+    documents = await adopter.service.list_documents(
+        session_key=context.session_key, session_id=context.session_id,
+    )
+    assert len(documents) == 1
+    revisions = await adopter.service.list_revisions(first["documentId"])
+    assert len(revisions) == 2
 
 
 @pytest.mark.parametrize(
@@ -99,3 +126,46 @@ async def test_show_widget_rejects_guest_or_unbound_context(widget_context):
     context.guest_safe = True
     with pytest.raises(ToolError, match="context"):
         await _call(context, title="capacity", widget_code="<p>ok</p>")
+
+
+async def test_edit_widget_applies_exact_replacements_and_preserves_document(widget_context):
+    context, adopter = widget_context
+    first = await _call(context, title="capacity", widget_code="<button>Go</button>")
+    edited = await _call_edit(
+        context,
+        title="capacity",
+        edits=[{"old_string": ">Go<", "new_string": ">Run<"}],
+        expected_version=first["version"],
+    )
+    assert edited["ok"] is True
+    assert edited["documentId"] == first["documentId"]
+    assert edited["version"] == first["version"] + 1
+    assert edited["applied"] == 1
+    _, payload, _ = adopter.store.read_verified_material(
+        edited["artifactId"], session_id=context.session_id,
+    )
+    assert b">Run<" in payload
+    assert len(await adopter.service.list_documents(
+        session_key=context.session_key, session_id=context.session_id,
+    )) == 1
+
+
+async def test_edit_widget_rejects_ambiguous_or_stale_replacements(widget_context):
+    context, _ = widget_context
+    first = await _call(context, title="capacity", widget_code="<p>x x</p>")
+    await _call(context, title="capacity", widget_code="<p>x x y</p>")
+    token = current_tool_context.set(context)
+    try:
+        with pytest.raises(ToolError, match="exactly once"):
+            await edit_widget(
+                title="capacity",
+                edits=[{"old_string": "x", "new_string": "y"}],
+            )
+        with pytest.raises(ToolError, match="version conflict"):
+            await edit_widget(
+                title="capacity",
+                edits=[{"old_string": ">", "new_string": ">"}],
+                expected_version=first["version"],
+            )
+    finally:
+        current_tool_context.reset(token)
