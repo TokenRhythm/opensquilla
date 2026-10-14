@@ -86,7 +86,7 @@
           <span class="msg-media-card__name">{{ artifactFileTitle(artifact) }}</span>
           <span class="msg-media-card__meta">{{ artifactFileSubtitle(artifact) }}</span>
           <span class="msg-media-card__spacer" />
-          <ImageCopyActions v-if="!shareMode" :source="{ kind: 'artifact', artifact }" :session-key="sessionKey" />
+          <ImageCopyActions v-if="!shareMode" :source="{ kind: 'artifact', artifact }" :session-key="sessionKey" :source-menu="false" />
           <ResourceActionsMenu v-if="!shareMode" :artifact="artifact" :session-key="sessionKey" :previewable="false" native-open-media-only trigger />
           <button
             type="button"

@@ -134,13 +134,36 @@ describe('ChatArtifactList native HTML open', () => {
   })
 
   it.each([
-    ['image.png', 'image/png'], ['audio.mp3', 'audio/mpeg'], ['video.mp4', 'video/mp4'],
+    ['image.png', 'image/png'], ['drawing.svg', 'image/svg+xml'], ['audio.mp3', 'audio/mpeg'], ['video.mp4', 'video/mp4'],
   ])('keeps the new %s file menu out of share mode', async (name, mime) => {
     const { app, el } = await mountList({ http: httpTransportTestDouble(), isOwner: false, shareMode: true,
       artifact: { id: 'shared-media', name, mime } })
     expect(el.querySelector('.resource-actions-trigger')).toBeNull()
+    expect(el.querySelector('[data-testid="image-copy-more"]')).toBeNull()
     expect(el.querySelector('button[aria-label^="Download"]')).not.toBeNull()
     app.unmount()
+  })
+
+  it.each(['web', 'desktop'] as const)('keeps SVG copying in a single file menu on %s', async platform => {
+    platformState.id = platform
+    const artifact = { id: 'svg-card', name: 'drawing.svg', mime: 'image/svg+xml' }
+    const onDownload = vi.fn()
+    const { app, el } = await mountList({ http: httpTransportTestDouble(), isOwner: false, artifact, onDownload })
+    try {
+      expect(el.querySelector('.msg-media-card')).not.toBeNull()
+      expect(el.querySelectorAll('[data-testid="copy-image"]')).toHaveLength(1)
+      expect(el.querySelectorAll('button[aria-haspopup="menu"]')).toHaveLength(1)
+      expect(el.querySelector('[data-testid="image-copy-more"]')).toBeNull()
+      el.querySelector<HTMLButtonElement>('.resource-actions-trigger')!.click()
+      await settle()
+      const items = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      expect(items.filter(item => item.textContent?.trim() === i18n.global.t('imageClipboard.copySource'))).toHaveLength(1)
+      expect(items.some(item => item.textContent?.trim() === i18n.global.t('chat.download'))).toBe(true)
+      el.querySelector<HTMLButtonElement>('.msg-media-card__download')!.click()
+      expect(onDownload).toHaveBeenCalledWith(artifact)
+    } finally {
+      app.unmount()
+    }
   })
 
   it('offers image copy for SVG delivered with a text MIME without changing its file presentation', async () => {
