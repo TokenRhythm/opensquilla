@@ -3,6 +3,14 @@
   "targets": [
     {
       "kind": "method",
+      "wireName": "sessions.messages.search",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "turns.receipt.get",
       "roles": [
         "params",

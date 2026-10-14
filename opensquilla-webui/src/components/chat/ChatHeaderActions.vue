@@ -2,6 +2,7 @@
   <div
     ref="rootRef"
     class="chat-header"
+    :class="{ 'chat-header--finding': findState?.open }"
     :data-layout="layout"
     data-testid="chat-header-actions"
   >
@@ -11,6 +12,17 @@
     </div>
 
     <span class="chat-header__spacer" aria-hidden="true"></span>
+
+    <ChatFindBar
+      v-if="findState?.open"
+      ref="findBarRef"
+      class="chat-header__find"
+      v-bind="findState"
+      @update:query="emit('update-find-query', $event)"
+      @search="emit('search-find', $event)"
+      @navigate="emit('navigate-find', $event)"
+      @close="emit('close-find')"
+    />
 
     <div v-if="layout === 'wide' && deliverableCount > 0" class="chat-header__actions">
       <button
@@ -101,6 +113,18 @@
         @keydown="onMenuKeydown"
       >
         <button
+          v-if="findState"
+          type="button"
+          class="chat-header__menu-item"
+          role="menuitem"
+          data-testid="chat-session-action-find"
+          @click="invoke('find', true)"
+        >
+          <Icon name="search" :size="16" />
+          <span>{{ t('chat.find.label') }}</span>
+          <kbd class="chat-header__shortcut">{{ findShortcutLabel }}</kbd>
+        </button>
+        <button
           v-if="menuActions.includes('deliverables')"
           type="button"
           class="chat-header__menu-item topbar-state topbar-state--deliverables"
@@ -154,6 +178,8 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ChatFindBar from './ChatFindBar.vue'
+import type { ChatRouteHeaderFindState } from '@/composables/chat/useChatRouteHeaderBridge'
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useChatTopbarPopoverCoordination } from '@/composables/useChatTopbarPopoverCoordinator'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
@@ -162,8 +188,9 @@ import {
   type SessionHeaderLayout,
 } from '@/utils/headerLayout'
 import type { IconName } from '@/utils/icons'
+import { isMacPlatform } from '@/utils/browser'
 
-type Action = 'deliverables' | 'share' | 'copy-session-link'
+type Action = 'deliverables' | 'share' | 'copy-session-link' | 'find'
 
 const COARSE_POINTER_QUERY = '(pointer: coarse)'
 
@@ -176,12 +203,18 @@ const props = defineProps<{
   hasNewDeliverable: boolean
   shareMode: boolean
   shareableMessageCount: number
+  findState?: ChatRouteHeaderFindState | null
 }>()
 
 const emit = defineEmits<{
   'open-deliverables': []
   'start-share': []
   'copy-session-link': []
+  'open-find': []
+  'update-find-query': [query: string]
+  'search-find': [query: string]
+  'navigate-find': [direction: 'previous' | 'next']
+  'close-find': []
 }>()
 
 const { t } = useI18n()
@@ -191,6 +224,8 @@ const menuTriggerRef = ref<HTMLButtonElement | null>(null)
 const menuRef = ref<HTMLDivElement | null>(null)
 const primaryActionRef = ref<HTMLButtonElement | null>(null)
 const wideDeliverablesRef = ref<HTMLButtonElement | null>(null)
+const findBarRef = ref<{ focus: () => void } | null>(null)
+const findShortcutLabel = isMacPlatform() ? '⌘F' : 'Ctrl+F'
 const layout = ref<SessionHeaderLayout>('wide')
 const menuOpen = ref(false)
 useChatTopbarPopoverCoordination('session-actions', menuOpen)
@@ -238,6 +273,7 @@ function actionForElement(element: Element | null): Action | null {
   if (testId === 'chat-session-action-deliverables') return 'deliverables'
   if (testId === 'chat-session-action-share') return 'share'
   if (testId === 'chat-session-action-copy') return 'copy-session-link'
+  if (testId === 'chat-session-action-find') return 'find'
   return null
 }
 
@@ -263,10 +299,15 @@ function syncLayout() {
   const restoreHeaderFocus = Boolean(
     activeElement instanceof Node && rootRef.value?.contains(activeElement),
   )
+  const findHadFocus = activeElement instanceof Element && Boolean(activeElement.closest('.chat-find-bar'))
   layout.value = next
   menuOpen.value = false
   if (restoreHeaderFocus) {
     void nextTick(() => {
+      if (findHadFocus && props.findState?.open) {
+        findBarRef.value?.focus()
+        return
+      }
       if (focusedAction && focusAction(focusedAction)) return
       if (next !== 'wide') {
         menuTriggerRef.value?.focus()
@@ -318,6 +359,7 @@ function invoke(action: Action, fromMenu = false) {
   if (action === 'deliverables') emit('open-deliverables')
   if (action === 'share') emit('start-share')
   if (action === 'copy-session-link') emit('copy-session-link')
+  if (action === 'find') emit('open-find')
 }
 
 function onMenuKeydown(event: KeyboardEvent) {
@@ -344,6 +386,10 @@ function onMenuKeydown(event: KeyboardEvent) {
 }
 
 function focusAction(action: Action): boolean {
+  if (action === 'find' && props.findState?.open && findBarRef.value) {
+    findBarRef.value.focus()
+    return true
+  }
   const direct = action === 'deliverables'
     ? wideDeliverablesRef.value
     : menuTriggerRef.value
@@ -446,6 +492,15 @@ defineExpose({ focusAction, closeMenu })
 .chat-header__spacer {
   flex: 1 1 auto;
   min-width: 0;
+}
+
+.chat-header__find { flex: 0 1 320px; }
+.chat-header--finding .chat-header__identity { flex-shrink: 2; }
+.chat-header__shortcut {
+  margin-inline-start: auto;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--fs-xs);
 }
 
 .chat-header__copy-live {
@@ -684,6 +739,9 @@ defineExpose({ focusAction, closeMenu })
 }
 
 @media (max-width: 480px) {
+  .chat-header--finding .chat-header__identity,
+  .chat-header--finding .chat-header__spacer { display: none; }
+  .chat-header__find { flex-grow: 1; }
   .chat-header__menu {
     left: var(--sp-3);
     max-width: none;

@@ -228,7 +228,18 @@
               "type": "boolean"
             }
           }
+        },
+        "anchor_message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
         }
+      },
+      "not": {
+        "required": [
+          "anchor_message_id",
+          "cursor"
+        ]
       }
     },
     "Result": {

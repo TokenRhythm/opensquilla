@@ -221,9 +221,15 @@
           :has-new-deliverable="chatRouteHeaderHasNewDeliverable"
           :share-mode="chatRouteHeaderShareMode"
           :shareable-message-count="chatRouteHeaderShareableMessageCount"
+          :find-state="chatRouteHeaderFindState"
           @open-deliverables="chatRouteHeader.invoke('openDeliverables')"
           @start-share="chatRouteHeader.invoke('startShare')"
           @copy-session-link="chatRouteHeader.invoke('copySessionLink')"
+          @open-find="chatRouteHeader.invoke('openFind')"
+          @update-find-query="chatRouteHeader.invoke('updateFindQuery', $event)"
+          @search-find="chatRouteHeader.invoke('searchFind', $event)"
+          @navigate-find="chatRouteHeader.invoke('navigateFind', $event)"
+          @close-find="chatRouteHeader.invoke('closeFind')"
         />
       </div>
       <div class="topbar-right">
@@ -535,6 +541,7 @@ const {
   hasNewDeliverable: chatRouteHeaderHasNewDeliverable,
   shareMode: chatRouteHeaderShareMode,
   shareableMessageCount: chatRouteHeaderShareableMessageCount,
+  findState: chatRouteHeaderFindState,
 } = chatRouteHeader.model
 const chatHeaderActionsRef = ref<ChatRouteHeaderHostHandle | null>(null)
 watch(chatHeaderActionsRef, host => chatRouteHeader.setHost(host), { flush: 'sync' })
@@ -1736,6 +1743,9 @@ watch(
 )
 
 function handleKeydown(e: KeyboardEvent) {
+  // Scoped handlers (chat find, editors and IME input) own consumed keys even
+  // when a user has rebound a global action to the same combination.
+  if (e.defaultPrevented) return
   // Chord bindings carry the primary modifier as Cmd on Apple platforms and Ctrl
   // elsewhere — and require the other modifier to be absent — so we never match
   // macOS' Ctrl+K (emacs kill-to-end-of-line inside text fields). preventDefault

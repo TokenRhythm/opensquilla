@@ -1020,7 +1020,7 @@
       "lifecycle": "stable",
       "name": "sessions.history.page.v2",
       "schema": "sessions/sessions-history-page-v2.schema.json",
-      "schemaSha256": "6443b687c27f4c15234c470adbea1f265ba8ed1e12210680121919f6ef77e82d"
+      "schemaSha256": "45c47f6c8e439b2bc0f7fc0a12a7dca8d75e54a35a18eaa6b53959adf3d86675"
     },
     {
       "lifecycle": "stable",
@@ -1039,6 +1039,12 @@
       "name": "sessions.messages.resume",
       "schema": "sessions/sessions-messages-resume.schema.json",
       "schemaSha256": "2d136da239eea4653bcd3973e946c76d2a1278698977a9f085e89ea48696f4f8"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.messages.search",
+      "schema": "sessions/sessions-messages-search.schema.json",
+      "schemaSha256": "55962df1536e3825ed02072099eb930c65759ea5a2fe480a0beb268895db3cad"
     },
     {
       "lifecycle": "stable",
@@ -1428,10 +1434,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "37fd3b6d8b66a0ca3a2a60372cf16cf9b4ad7fd9d3766f6720a4c7932fc35253",
-    "methodCount": 209,
-    "schemaCount": 219,
-    "schemaTreeSha256": "bdac486e23d89b7d13a7911095165934fe9b6affb5bf5d970f45e4927ce91fe4",
+    "generatorSha256": "d90cbe7f1e51a940bb5592645b0c0563ec1409e97202800ad26e0a4e0ddb00d5",
+    "methodCount": 210,
+    "schemaCount": 220,
+    "schemaTreeSha256": "3ddf0bc24232c219ddf583473bd36b66741d3c818b1f3043a8f58623da53a8f2",
     "toolchains": {
       "legacyTypes": {
         "python": {

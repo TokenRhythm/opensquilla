@@ -217,7 +217,7 @@
           <span class="msg-file-chip__name">{{ localPathName(path) }}</span>
         </span>
       </div>
-      <div v-if="visibleMessageText" class="msg-user-bubble">
+      <div v-if="visibleMessageText" class="msg-user-bubble" data-chat-find-body>
         {{ visibleMessageText }}
       </div>
       <span v-if="isGoalSource" class="msg-user-goal-origin" role="status">

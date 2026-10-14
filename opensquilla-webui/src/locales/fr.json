@@ -3542,6 +3542,22 @@
     }
   },
   "chat": {
+    "find": {
+      "label": "Rechercher dans la conversation",
+      "placeholder": "Rechercher dans la conversation…",
+      "previous": "Résultat précédent (Maj+Entrée)",
+      "next": "Résultat suivant (Entrée)",
+      "close": "Fermer la recherche (Échap)",
+      "loading": "Recherche dans la conversation…",
+      "noResults": "Aucun résultat",
+      "error": "Recherche indisponible. Appuyez sur Entrée pour réessayer.",
+      "count": "{current} sur {total}",
+      "partial": "{current} sur {total} — résultats partiels ; Suivant poursuit après les résultats chargés",
+      "incomplete": "{current} sur {total} — certains contenus sont indisponibles",
+      "retry": "Réessayer",
+      "historyContext": "Messages autour du résultat de recherche",
+      "returnToConversation": "Revenir à la conversation"
+    },
     "diagram": {
       "failed": "Impossible d’afficher le diagramme · source conservée",
       "limited": "Diagramme trop grand · source conservée",

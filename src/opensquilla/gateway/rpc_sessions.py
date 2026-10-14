@@ -2828,6 +2828,43 @@ _handle_sessions_list_contract = register_sessions_list_contract(
 )
 
 
+async def _handle_sessions_messages_search(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.gateway.adapters._generated_contract_bindings import (
+        validate_generated_contract_params,
+    )
+    from opensquilla.history_cursor import HistoryCursorInvalidatedError
+    from opensquilla.session.message_search import search_session_messages
+
+    values = validate_generated_contract_params('sessions.messages.search', params, strict=True)
+    key = _require_key(values)
+    identity = await _snapshot_session_identity(ctx, key)
+    session_id, epoch = identity
+    if session_id is None or epoch is None:
+        raise RpcHandlerError('NOT_FOUND', 'Session not found', accepted=False)
+    if (values.get('session_id', session_id) != session_id
+            or values.get('session_epoch', epoch) != epoch):
+        raise RpcHandlerError('REBASE_REQUIRED', 'Session identity changed', accepted=False)
+    storage = get_session_storage(getattr(ctx, 'session_manager', None))
+    if storage is None:
+        raise RpcUnavailableError('Session storage unavailable')
+    try:
+        result = await search_session_messages(
+            storage, key=key, session_id=session_id, session_epoch=epoch,
+            query=values['query'], cursor=values.get('cursor'), limit=values.get('limit', 50),
+        )
+    except HistoryCursorInvalidatedError as exc:
+        raise RpcHandlerError('HISTORY_STALE', str(exc), accepted=False) from exc
+    if await _snapshot_session_identity(ctx, key) != identity:
+        raise RpcHandlerError('REBASE_REQUIRED', 'Session identity changed', accepted=False)
+    return result
+
+
+_handle_sessions_messages_search_contract = register_connection_recovery_contract(
+    _d, 'sessions.messages.search', _handle_sessions_messages_search,
+    internal_error=RpcHandlerError, guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
     """Search sessions by title and by transcript content.
 
@@ -4922,6 +4959,37 @@ async def _handle_sessions_history_page_v2(params: dict | None, ctx: RpcContext)
         params.get("cursor"), key=key, session_id=session_id,
         session_epoch=int(session_epoch), direction=direction,
     )
+    anchor_message_id = params.get('anchor_message_id')
+    anchor_has_successor = False
+    if anchor_message_id is not None:
+        if (not isinstance(anchor_message_id, str) or not anchor_message_id
+                or params.get('cursor') is not None):
+            raise ValueError(
+                'anchor_message_id must be nonempty and cannot be combined with cursor'
+            )
+        storage = get_session_storage(getattr(ctx, 'session_manager', None))
+        if storage is None:
+            raise RpcUnavailableError('Session storage unavailable')
+        anchors = await storage.read_message_search_rows(
+            session_id, message_id=anchor_message_id, descending=True, limit=1,
+        )
+        if not anchors:
+            raise RpcHandlerError(
+                'HISTORY_STALE', 'Search message no longer exists', accepted=False,
+            )
+        anchor = anchors[0]
+        successors = await storage.read_message_search_rows(
+            session_id, after=(anchor['created_at'], anchor['entry_id']),
+            limit=1, visible_only=False,
+        )
+        # Existing before-pages are exclusive. The real next row is a valid
+        # membership-checked cursor, making this page end at the hit without
+        # inventing an anchor or loading all intervening history.
+        direction = 'before'
+        anchor_has_successor = bool(successors)
+        legacy_cursor = (
+            f"{successors[0]['created_at']}|{successors[0]['entry_id']}" if successors else None
+        )
     limit = min(256, max(1, int(params.get("target_items") or 64)))
     legacy_params: dict[str, Any] = {
         "sessionKey": key,
@@ -4974,6 +5042,16 @@ async def _handle_sessions_history_page_v2(params: dict | None, ctx: RpcContext)
             )
         return f"{int(timestamp)}|{int(transcript_id)}"
 
+    if anchor_message_id is not None and items:
+        # Include both navigation cursors in the budget before choosing the
+        # anchored suffix. Appending this metadata afterwards could reject a
+        # page that should have fitted after dropping one older context item.
+        result['after_cursor'] = _v2_cursor_encode(
+            key=key, session_id=session_id, session_epoch=int(session_epoch),
+            direction='after', cursor=boundary(items[-1], 'after'),
+        )
+        result['has_more_after'] = anchor_has_successor
+
     # Walk from the requested edge: newest suffix for before, oldest prefix
     # for after. Serialize each item once, including its semantic metadata.
     bounded: list[dict[str, Any]] = []
@@ -5024,6 +5102,13 @@ async def _handle_sessions_history_page_v2(params: dict | None, ctx: RpcContext)
     )
     result[f"has_more_{direction}"] = bool(legacy.get("has_more")) or truncated_by_bytes
     result["complete_for_requested_window"] = not truncated_by_bytes
+    if anchor_message_id is not None:
+        if not any(item['message_id'] == anchor_message_id for item in bounded):
+            raise RpcHandlerError(
+                'HISTORY_STALE', 'Search message changed during navigation', accepted=False,
+            )
+        if await _snapshot_session_identity(ctx, key) != (session_id, session_epoch):
+            raise RpcHandlerError('REBASE_REQUIRED', 'Session identity changed', accepted=False)
     if (
         len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         > target_bytes

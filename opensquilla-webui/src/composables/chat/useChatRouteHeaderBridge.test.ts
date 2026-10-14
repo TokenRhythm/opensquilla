@@ -6,6 +6,7 @@ import {
   type ChatRouteHeaderBridge,
   type ChatRouteHeaderCommands,
   type ChatRouteHeaderModel,
+  type ChatRouteHeaderFindState,
 } from './useChatRouteHeaderBridge'
 
 let mountedRoot: HTMLElement | null = null
@@ -61,6 +62,46 @@ function owner(title: string): {
 }
 
 describe('chat route header bridge', () => {
+  it('keeps optional find capability absent for existing header owners', () => {
+    const bridge = createBridge()
+    const current = owner('old')
+    bridge.register(current.model, current.commands)
+    expect(bridge.model.findState.value).toBeNull()
+    expect(() => bridge.invoke('openFind')).not.toThrow()
+    expect(() => bridge.invoke('searchFind', 'needle')).not.toThrow()
+  })
+
+  it('routes find state and typed commands only to the currently registered session', () => {
+    const bridge = createBridge()
+    const first = owner('first')
+    first.commands.searchFind = vi.fn()
+    const stale = bridge.register(first.model, first.commands)
+    const current = owner('current')
+    const findState = ref<ChatRouteHeaderFindState>({
+      open: true, query: 'needle', resultQuery: 'needle', matchCount: 12, activeMatch: 3,
+      status: 'ready', focusSequence: 2, complete: false, coverageComplete: true,
+    })
+    current.model.findState = findState
+    current.commands.updateFindQuery = vi.fn()
+    current.commands.searchFind = vi.fn()
+    current.commands.navigateFind = vi.fn()
+    current.commands.closeFind = vi.fn()
+    const registration = bridge.register(current.model, current.commands)
+    expect(stale.release()).toBe(false)
+    expect(bridge.model.findState.value).toBe(findState.value)
+    bridge.invoke('updateFindQuery', 'next')
+    bridge.invoke('searchFind', 'next')
+    bridge.invoke('navigateFind', 'previous')
+    bridge.invoke('closeFind')
+    expect(current.commands.updateFindQuery).toHaveBeenCalledWith('next')
+    expect(current.commands.searchFind).toHaveBeenCalledWith('next')
+    expect(current.commands.navigateFind).toHaveBeenCalledWith('previous')
+    expect(current.commands.closeFind).toHaveBeenCalledOnce()
+    expect(first.commands.searchFind).not.toHaveBeenCalled()
+    registration.release()
+    expect(bridge.model.findState.value).toBeNull()
+  })
+
   it('exposes the same draft session while the landing header is hidden and after materialization', () => {
     const bridge = createBridge()
     const draft = owner('draft')

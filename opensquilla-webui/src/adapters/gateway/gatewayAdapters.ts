@@ -77,6 +77,8 @@ import { createSessionReadLifecycleFactory } from '@/modules/sessionReadLifecycl
 import { createV4SessionReadPort } from './sessionReadPortV4'
 import type { SessionInspection } from '@/modules/sessionInspection'
 import { createV4SessionInspection } from './sessionInspectionV4'
+import type { SessionMessageSearch } from '@/modules/sessionMessageSearch'
+import { createV4SessionMessageSearch } from './sessionMessageSearchV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
   & Parameters<typeof createV4GatewayAccess>[0]
@@ -87,6 +89,7 @@ export interface GatewayAdapters {
   readonly conversationEvents: ConversationEvents
   readonly sessionReadLifecycleFactory: SessionReadLifecycleFactory
   readonly sessionInspection: SessionInspection
+  readonly sessionMessageSearch: SessionMessageSearch
   readonly sessionDirectory: SessionDirectory
   readonly sessionDirectoryChanges: SessionDirectoryChanges
   readonly sessionLifecycle: SessionLifecycle
@@ -161,6 +164,7 @@ export function createGatewayAdapters(
     gatewayAccess,
     conversationEvents,
     sessionReadLifecycleFactory,
+    sessionMessageSearch: createV4SessionMessageSearch(transports.rpc),
     sessionInspection: createV4SessionInspection(
       transports.rpc,
       { concurrentHistoryReads },

@@ -3542,6 +3542,22 @@
     }
   },
   "chat": {
+    "find": {
+      "label": "会話内を検索",
+      "placeholder": "会話の内容を検索…",
+      "previous": "前の一致（Shift+Enter）",
+      "next": "次の一致（Enter）",
+      "close": "検索を閉じる（Esc）",
+      "loading": "会話を検索中…",
+      "noResults": "一致なし",
+      "error": "検索できません。Enterで再試行してください。",
+      "count": "{total} 件中 {current} 件目",
+      "partial": "{total} 件中 {current} 件目 — 一部の結果です。最後の結果で「次へ」を押すと検索を続けます",
+      "incomplete": "{total} 件中 {current} 件目 — 一部の内容は検索できません",
+      "retry": "再試行",
+      "historyContext": "検索結果の前後のメッセージを表示中",
+      "returnToConversation": "会話に戻る"
+    },
     "diagram": {
       "failed": "図を描画できませんでした · ソースを保持",
       "limited": "図が大きすぎます · ソースを保持",

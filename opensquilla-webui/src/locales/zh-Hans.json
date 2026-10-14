@@ -3624,6 +3624,22 @@
     }
   },
   "chat": {
+    "find": {
+      "label": "在对话中查找",
+      "placeholder": "搜索对话内容…",
+      "previous": "上一个匹配项（Shift+Enter）",
+      "next": "下一个匹配项（Enter）",
+      "close": "关闭查找（Esc）",
+      "loading": "正在查找对话…",
+      "noResults": "没有匹配项",
+      "error": "暂时无法查找，按 Enter 重试。",
+      "count": "第 {current} 项，共 {total} 项",
+      "partial": "第 {current} 项，共 {total} 项（部分结果）；到达末项后按下一项继续查找",
+      "incomplete": "第 {current} 项，共 {total} 项，部分内容暂不可检索",
+      "retry": "重试",
+      "historyContext": "正在查看搜索结果附近的历史消息",
+      "returnToConversation": "返回当前对话"
+    },
     "diagram": {
       "failed": "图表未能渲染 · 已保留源码",
       "limited": "图表过大 · 已保留源码",

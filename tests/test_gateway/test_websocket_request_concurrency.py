@@ -56,8 +56,9 @@ def test_only_explicit_valid_probe_modes_are_detached(method: str) -> None:
 
 
 @pytest.mark.parametrize("fallback", [False, True], ids=["aiosqlite", "sqlite3-fallback"])
+@pytest.mark.parametrize("search_method", ["sessions.search", "sessions.messages.search"])
 async def test_search_cancel_interrupts_sqlite_and_reuses_reader(
-    tmp_path: Any, monkeypatch: Any, fallback: bool,
+    tmp_path: Any, monkeypatch: Any, fallback: bool, search_method: str,
 ) -> None:
     from opensquilla.compat import aiosqlite
     from opensquilla.session.models import SessionNode, TranscriptEntry
@@ -110,11 +111,11 @@ async def test_search_cancel_interrupts_sqlite_and_reuses_reader(
 
     class Dispatcher:
         def list_methods(self) -> list[str]:
-            return ["sessions.search", "chat.history", "noop"]
+            return [search_method, "chat.history", "noop"]
 
         async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
             nonlocal budget
-            if method == "sessions.search":
+            if method == search_method:
                 if req_id == "slow":
                     budget = current_read_budget()
                 try:
@@ -149,10 +150,10 @@ async def test_search_cancel_interrupts_sqlite_and_reuses_reader(
 
     frames = [_CONNECT_FRAME]
     frames += [json.dumps({"type": "req", "id": ident, "method": method, "params": {}})
-               for ident, method in [("slow", "sessions.search"), ("quick", "noop")]]
+               for ident, method in [("slow", search_method), ("quick", "noop")]]
     frames += [json.dumps({"type": "cancel", "id": "slow"})]
     frames += [json.dumps({"type": "req", "id": ident, "method": method, "params": {}})
-               for ident, method in [("again", "sessions.search"), ("history", "chat.history")]]
+               for ident, method in [("again", search_method), ("history", "chat.history")]]
     ws = _HistoryWebSocket(frames, Dispatcher(), before_frame=before_frame, after_frames=finish)
     try:
         await asyncio.wait_for(handle_ws_connection(
@@ -162,8 +163,8 @@ async def test_search_cancel_interrupts_sqlite_and_reuses_reader(
         assert "slow" not in responses
         assert responses["again"]["payload"] == {"count": 1}
         assert responses["history"]["payload"] == {"count": 1}
-        assert "sessions.search" in ws.hello()["policy"]["cancellable_request_methods"]
-        assert "sessions.search" in ws.hello()["policy"]["concurrent_optional_read_methods"]
+        assert search_method in ws.hello()["policy"]["cancellable_request_methods"]
+        assert search_method in ws.hello()["policy"]["concurrent_optional_read_methods"]
         assert storage._recovery_read_pool.physical_count == 1
     finally:
         await asyncio.wait_for(storage.close(), 2)
@@ -535,6 +536,7 @@ async def test_explicit_provider_probe_cancel_closes_stream_and_does_not_block_s
         "onboarding.llmProfile.draft.probe",
         "onboarding.llmProfile.probe",
         "onboarding.provider.probe",
+        "sessions.messages.search",
         "sessions.search",
     ]
     assert ws.close_codes == []
@@ -1257,6 +1259,7 @@ async def test_webui_bootstrap_optional_reads_do_not_reject_catalog_or_block_int
         "sandbox.runtime.status",
         "sessions.list",
         "sessions.messages.hydrate",
+        "sessions.messages.search",
         "sessions.search",
         "turns.receipt.get",
         "usage.status",
@@ -1628,6 +1631,7 @@ async def test_detached_hydrate_does_not_block_session_subscription_handoff(
         "sandbox.runtime.status",
         "sessions.list",
         "sessions.messages.hydrate",
+        "sessions.messages.search",
         "sessions.search",
         "turns.receipt.get",
         "usage.status",

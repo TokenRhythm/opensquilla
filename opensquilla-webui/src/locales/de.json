@@ -3542,6 +3542,22 @@
     }
   },
   "chat": {
+    "find": {
+      "label": "Im Gespräch suchen",
+      "placeholder": "Gespräch durchsuchen…",
+      "previous": "Vorheriger Treffer (Umschalt+Enter)",
+      "next": "Nächster Treffer (Enter)",
+      "close": "Suche schließen (Esc)",
+      "loading": "Gespräch wird durchsucht…",
+      "noResults": "Keine Treffer",
+      "error": "Suche nicht verfügbar. Mit Enter erneut versuchen.",
+      "count": "{current} von {total}",
+      "partial": "{current} von {total} – Teilergebnisse; Weiter sucht nach den geladenen Treffern weiter",
+      "incomplete": "{current} von {total} – einige Inhalte sind nicht verfügbar",
+      "retry": "Erneut versuchen",
+      "historyContext": "Nachrichten rund um einen Suchtreffer",
+      "returnToConversation": "Zurück zum Gespräch"
+    },
     "diagram": {
       "failed": "Diagramm konnte nicht gerendert werden · Quelltext beibehalten",
       "limited": "Diagramm zu groß · Quelltext beibehalten",

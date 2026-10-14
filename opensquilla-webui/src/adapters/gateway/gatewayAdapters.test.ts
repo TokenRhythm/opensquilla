@@ -44,6 +44,7 @@ describe('Gateway Adapter composition', () => {
       'gatewayAccess',
       'conversationEvents',
       'sessionReadLifecycleFactory',
+      'sessionMessageSearch',
       'sessionInspection',
       'sessionDirectory',
       'sessionDirectoryChanges',

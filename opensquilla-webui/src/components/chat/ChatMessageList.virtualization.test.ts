@@ -143,6 +143,86 @@ afterEach(() => {
 })
 
 describe('ChatMessageList long-history virtualization', () => {
+  it('captures a detached reading anchor and a bounded set of measured row sizes', async () => {
+    const { api, container } = await mountList({ followLiveEdge: false, sessionKey: 'session-a' })
+    container.scrollTop = 940.25
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    const saved = api.captureViewport!()
+    expect(saved.scrollTop).toBe(940.25)
+    expect(saved.width).toBe(800)
+    expect(saved.followLiveEdge).toBe(false)
+    expect(saved.anchor).toEqual({ key: 'message-10', intraOffset: 0.25 })
+    expect(saved.rows.length).toBeGreaterThan(0)
+    expect(saved.rows.length).toBeLessThanOrEqual(201)
+    expect(saved.rows.find(row => row.key === 'message-10')?.size).toBe(94)
+    container.scrollTop = 1_900
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    expect(saved.scrollTop).toBe(940.25)
+    expect(saved.anchor?.key).toBe('message-10')
+  })
+
+  it('restores a followed live edge using the current height instead of its stale absolute offset', async () => {
+    const { api, container } = await mountList({ followLiveEdge: true })
+    const saved = api.captureViewport!()
+    expect(saved.followLiveEdge).toBe(true)
+    Object.defineProperty(container, 'scrollHeight', { configurable: true, value: 21_000 })
+    container.scrollTop = 0
+    api.restoreViewport!(saved)
+    expect(container.scrollTop).toBe(21_000 - container.clientHeight)
+  })
+
+  it('uses the restored offset when row measurement arrives before its native scroll event', async () => {
+    const { api, container, host } = await mountList({
+      messages: Array.from({ length: 40 }, (_, index) => message(index)), followLiveEdge: false,
+    })
+    container.scrollTop = 977
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    const saved = api.captureViewport!()
+    // Reused thread now carries the shorter session's offset in both the DOM
+    // and TanStack. Its delayed RO delivery can beat the restore scroll event.
+    container.scrollTop = 205
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    api.restoreViewport!(saved)
+    expect(container.scrollTop).toBe(977)
+    const row = host.querySelector<HTMLElement>('[data-chat-message-index="0"]')!
+    row.getBoundingClientRect = () => ({ height: 95 } as DOMRect)
+    resize(row) // Deliberately no native scroll notification after restoration.
+    expect(container.scrollTop).toBe(978)
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    expect(api.captureViewport!().anchor).toEqual(saved.anchor)
+  })
+
+  it('retires pending remeasurement of the previous position when restoring a saved viewport', async () => {
+    const { api, container } = await mountList({ followLiveEdge: false })
+    container.scrollTop = 977
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    const saved = api.captureViewport!()
+    container.scrollTop = 205
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    api.remeasure()
+    api.restoreViewport!(saved)
+    await nextTick()
+    await new Promise(resolve => window.requestAnimationFrame(resolve))
+    await nextTick()
+    expect(container.scrollTop).toBe(977)
+  })
+
+  it('falls back to a non-negative saved position if the keyed row was removed', async () => {
+    const { api, container } = await mountList({ followLiveEdge: false })
+    const saved = api.captureViewport!()
+    api.restoreViewport!({ ...saved, scrollTop: 500, anchor: { key: 'removed-message', intraOffset: 42 } })
+    expect(container.scrollTop).toBe(500)
+    api.restoreViewport!({ ...saved, scrollTop: -30, anchor: null })
+    expect(container.scrollTop).toBe(0)
+  })
+
   it('settles clamped short-transcript measurements without idle frame polling', async () => {
     vi.useFakeTimers({ toFake: ['requestAnimationFrame', 'cancelAnimationFrame'] })
     try {

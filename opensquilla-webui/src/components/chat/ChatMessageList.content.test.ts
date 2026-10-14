@@ -1,8 +1,9 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createApp, h, nextTick, reactive, type App } from 'vue'
+import { createApp, h, nextTick, reactive, ref, type App } from 'vue'
 import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
+import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 import { ContentRangeCache } from '@/utils/chat/contentRangeCache'
 import { projectAssistantActivity } from '@/utils/chat/assistantActivity'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
@@ -52,12 +53,13 @@ async function mountList(messages: ChatRenderedMessage[] = [assistant()], render
     toolGroupStatusText: () => '', toolStatusText: () => '', toolSecondaryText: () => '',
     copyMessage: async () => true, downloadAttachment: async () => true,
   })
-  const app = createApp({ setup: () => () => h(ChatMessageList, props, trailing ? { trailing } : undefined) })
+  const list = ref<ChatMessageListVirtualizer | null>(null)
+  const app = createApp({ setup: () => () => h(ChatMessageList, { ...props, ref: list }, trailing ? { trailing } : undefined) })
   app.use(i18n)
   app.mount(host)
   apps.push(app)
   await nextTick()
-  return { host, props }
+  return { host, props, list }
 }
 
 async function retry(host: HTMLElement, selector = '[data-testid="chat-history-content-hydration"] button') {
@@ -83,6 +85,47 @@ afterEach(() => {
 })
 
 describe('ChatMessageList inline history content', () => {
+  it('waits for an automatic pending body read before returning the hydrated find target', async () => {
+    let resolveBody!: (text: string) => void
+    const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay')
+      .mockImplementation(() => new Promise(resolve => { resolveBody = resolve }))
+    const { host, list } = await mountList()
+    await settleHydration()
+    const settled = vi.fn()
+    const target = list.value!.ensureMessageContentVisible!(0).then(value => { settled(); return value })
+    await settleHydration()
+    expect(read).toHaveBeenCalledOnce()
+    expect(settled).not.toHaveBeenCalled()
+    expect(host.querySelector('[data-testid="assistant-body"]')?.textContent).toBe('Preview')
+    resolveBody('Full answer containing the searched phrase')
+    const element = await target
+    expect(read).toHaveBeenCalledOnce()
+    expect(element?.textContent).toBe('Full answer containing the searched phrase')
+    expect(element?.isConnected).toBe(true)
+  })
+
+  it('releases an awaiting find target on session cancellation even when the old transport never settles', async () => {
+    const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay')
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValueOnce('New session answer')
+    const { host, props, list } = await mountList()
+    const oldSignal = read.mock.calls[0]![1]!.signal!
+    const settled = vi.fn()
+    const oldTarget = list.value!.ensureMessageContentVisible!(0).then(value => { settled(value); return value })
+    await settleHydration()
+    expect(settled).not.toHaveBeenCalled()
+    props.sessionKey = 'agent:main:webchat:new-find-session'
+    props.messages = [assistant({ contentRef: { ...assistant().contentRef!, sessionKey: props.sessionKey } })]
+    await settleHydration()
+    expect(oldSignal.aborted).toBe(true)
+    expect(settled).toHaveBeenCalledWith(null)
+    expect(await oldTarget).toBeNull()
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(host.querySelector('[data-testid="assistant-body"]')?.textContent).toBe('New session answer')
+    expect((await list.value!.ensureMessageContentVisible!(0))?.textContent).toBe('New session answer')
+    expect(read).toHaveBeenCalledTimes(2)
+  })
+
   it('makes cached historical rows inert without disabling fresh live controls in the trailing slot', async () => {
     const approve = vi.fn()
     const { host, props } = await mountList([assistant({ previewComplete: true })], value => value,

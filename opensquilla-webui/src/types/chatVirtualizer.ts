@@ -1,8 +1,19 @@
 import type { ScrollToOptions } from '@tanstack/vue-virtual'
 
+/** Presentation geometry only; no navigation or task authority is restored. */
+export interface ChatViewportSnapshot {
+  scrollTop: number
+  width: number
+  followLiveEdge: boolean
+  anchor: { key: string; intraOffset: number } | null
+  rows: Array<{ key: string; size: number }>
+}
+
 /** Product-facing operations; measurement and range state belong to TanStack. */
 export interface ChatMessageListVirtualizer {
   ensureMessageVisible: (index: number) => Promise<HTMLElement | null>
+  ensureMessageContentVisible?: (index: number) => Promise<HTMLElement | null>
+  messageBodyText?: (index: number) => string
   releaseEnsuredMessage: (index?: number) => void
   messageIndexAtOffset: (offset: number) => number | null
   scrollToMessage: (index: number, options?: ScrollToOptions) => void
@@ -15,4 +26,6 @@ export interface ChatMessageListVirtualizer {
   geometryVersion: () => number
   remeasure: () => void
   isVirtualized: () => boolean
+  captureViewport?: () => ChatViewportSnapshot
+  restoreViewport?: (snapshot: ChatViewportSnapshot) => void
 }

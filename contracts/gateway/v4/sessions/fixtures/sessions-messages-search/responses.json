@@ -1,0 +1,126 @@
+{
+  "format_version": 1,
+  "kind": "response",
+  "cases": [
+    {
+      "id": "response.complete",
+      "coverage": "response.complete",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "response.complete",
+        "ok": true,
+        "payload": {
+          "session_id": "session-fixture",
+          "session_epoch": 2,
+          "query": "中文🙂",
+          "matches": [
+            {
+              "message_id": "message-fixture",
+              "entry_cursor": "1000|12",
+              "content_revision": 3,
+              "offset_utf16": 7,
+              "length_utf16": 4,
+              "snippet": "之前的中文🙂内容"
+            }
+          ],
+          "next_cursor": null,
+          "complete": true,
+          "coverage_complete": true,
+          "scanned_entries": 20,
+          "unavailable_entries": 0
+        }
+      }
+    },
+    {
+      "id": "response.continuation",
+      "coverage": "response.continuation",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "response.continuation",
+        "ok": true,
+        "payload": {
+          "session_id": "session-fixture",
+          "session_epoch": 2,
+          "query": "中文🙂",
+          "matches": [
+            {
+              "message_id": "message-fixture",
+              "entry_cursor": "1000|12",
+              "content_revision": 3,
+              "offset_utf16": 7,
+              "length_utf16": 4,
+              "snippet": "之前的中文🙂内容"
+            }
+          ],
+          "next_cursor": "opaque:next",
+          "complete": false,
+          "coverage_complete": true,
+          "scanned_entries": 20,
+          "unavailable_entries": 0
+        }
+      }
+    },
+    {
+      "id": "response.partial-coverage",
+      "coverage": "response.partial-coverage",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "response.partial-coverage",
+        "ok": true,
+        "payload": {
+          "session_id": "session-fixture",
+          "session_epoch": 2,
+          "query": "中文🙂",
+          "matches": [
+            {
+              "message_id": "message-fixture",
+              "entry_cursor": "1000|12",
+              "content_revision": 3,
+              "offset_utf16": 7,
+              "length_utf16": 4,
+              "snippet": "之前的中文🙂内容"
+            }
+          ],
+          "next_cursor": null,
+          "complete": true,
+          "coverage_complete": false,
+          "scanned_entries": 20,
+          "unavailable_entries": 1
+        }
+      }
+    },
+    {
+      "id": "response.negative-offset",
+      "coverage": "response.negative-offset",
+      "expectation": "reject",
+      "wire": {
+        "type": "res",
+        "id": "response.negative-offset",
+        "ok": true,
+        "payload": {
+          "session_id": "session-fixture",
+          "session_epoch": 2,
+          "query": "中文🙂",
+          "matches": [
+            {
+              "message_id": "message-fixture",
+              "entry_cursor": "1000|12",
+              "content_revision": 3,
+              "offset_utf16": -1,
+              "length_utf16": 4,
+              "snippet": "之前的中文🙂内容"
+            }
+          ],
+          "next_cursor": null,
+          "complete": true,
+          "coverage_complete": true,
+          "scanned_entries": 20,
+          "unavailable_entries": 0
+        }
+      }
+    }
+  ]
+}

@@ -21,7 +21,7 @@
       @action="handleWorkspaceFileAction"
     />
     <ResourceActionsMenu ref="fileMenu" :session-key="sessionKey" @open="emit('openResource', $event)" />
-    <div v-if="part.html" ref="rootEl" class="msg-ai-text" v-html="part.html" />
+    <div v-if="part.html" ref="rootEl" class="msg-ai-text" data-chat-find-body v-html="part.html" />
     <p v-if="unmentionedPreviews.length" class="workspace-preview-fallback">
       <span>{{ t('workbench.artifactDocument.preview') }}: </span>
       <template v-for="(preview, index) in unmentionedPreviews" :key="workspacePreviewIdentity(preview)">

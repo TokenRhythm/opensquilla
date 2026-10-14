@@ -162,7 +162,7 @@
           {{ t('chat.noMessagesYet') }}
         </div>
         <HistoryLoadSentinel
-          v-if="!isNewChatLanding && !forkTransition && !historyState.sessionMissing"
+          v-if="!isNewChatLanding && !forkTransition && !findContextMessages && !historyState.sessionMissing"
           :scroll-container="threadRef"
           :has-more="historyState.hasMore"
           :loading="historyState.loadingEarlier"
@@ -185,11 +185,19 @@
           :aria-hidden="forkTransition ? 'true' : undefined"
           :data-preview-session="forkTransition?.parentKey"
         >
+        <div v-if="findContextMessages" class="chat-find-context" role="status">
+          <span>{{ t('chat.find.historyContext') }}</span>
+          <button type="button" @click="chatFind.close()">{{ t('chat.find.returnToConversation') }}</button>
+        </div>
+        <div v-if="findPresentation.sourceSnippet.value" class="chat-find-context" role="status">
+          <span>{{ findPresentation.sourceSnippet.value }}</span>
+        </div>
         <ChatMessageList
           ref="messageListRef"
           :bottom-padding="24"
           :layout-header="threadHeaderRef"
-          :messages="forkTransition?.previewMessages || visibleRenderedMessages"
+          :messages="forkTransition?.previewMessages || findDisplayMessages"
+          :find-fallback-index="findPresentation.fallbackIndex.value"
           :session-key="forkTransition?.parentKey || sessionKey"
           :content-cache-scope="deliveryIdentity"
           :content-cache-generation="sessionViewCache.generation.value"
@@ -224,8 +232,8 @@
           :plan-presentations="planPresentations"
           :plan-presentation-available="planPresentationAvailable"
           :plan-presentation-pending="planPresentationPending"
-          :is-streaming="isStreaming"
-          :follow-live-edge="autoScroll"
+          :is-streaming="!findContextMessages && isStreaming"
+          :follow-live-edge="!chatFind.open.value && autoScroll"
           :scroll-epoch="scrollEpoch"
           :goal="currentGoalRun"
           :goal-elapsed="goalLastElapsed"
@@ -264,7 +272,7 @@
           <template #router-strip="{ message: msg }">
             <RouterFxStrip v-if="shouldRenderRouterStrip(msg)" :message="msg" />
           </template>
-          <template #trailing>
+          <template v-if="!findContextMessages" #trailing>
 
         <!-- Manual or turn-boundary compaction has no assistant turn to own
              it. Keep one quiet transcript maintenance row instead of a
@@ -502,7 +510,7 @@
         </div>
         </div>
         <ConversationMinimap
-          v-if="!isNewChatLanding && !shareMode && !forkTransition"
+          v-if="!isNewChatLanding && !shareMode && !forkTransition && !findContextMessages"
           ref="conversationMinimapRef"
           :messages="visibleRenderedMessages"
           :scroll-container="threadRef"
@@ -889,6 +897,10 @@ import { useChatCompaction } from '@/composables/chat/useChatCompaction'
 import { useChatComposerShortcuts } from '@/composables/chat/useChatComposerShortcuts'
 import { useDeliverableUpdateIndicator } from '@/composables/chat/useDeliverableUpdateIndicator'
 import { useChatRouteHeaderBridge } from '@/composables/chat/useChatRouteHeaderBridge'
+import { useChatFind } from '@/composables/chat/useChatFind'
+import { useChatFindPresentation } from '@/composables/chat/useChatFindPresentation'
+import { isChatFindShortcut } from '@/utils/chat/chatFindShortcut'
+import { SESSION_MESSAGE_SEARCH_KEY } from '@/modules/sessionMessageSearch'
 import {
   goalHasRenderedTerminalAnchor,
   goalStatusIsTerminal,
@@ -1579,6 +1591,7 @@ const selectedSkills = ref<SelectedSkillRef[]>([])
 const composerRevision = ref(0)
 const aborted = ref(false)
 const autoScroll = ref(true)
+const findOwnsViewport = ref(false)
 // Every session gets a monotonically increasing scroll epoch. Any queued
 // layout/render callback from an older epoch must become a no-op; the DOM node
 // for the thread is intentionally reused so focus and native scrolling remain
@@ -2526,6 +2539,16 @@ const sessionCreationRouterPresentation = computed(() => (
   projectSessionCreationRouterPresentation(renderedMessages.value, isStreaming.value)
 ))
 const visibleRenderedMessages = computed(() => sessionCreationRouterPresentation.value.messages)
+const findContextMessages = ref<ChatMessage[] | null>(null)
+const findContextRendered = useChatRenderedMessages({
+  messages: computed(() => findContextMessages.value ?? []),
+  sessionKey, routerSlots, routerModels, routerTierConfigs,
+  routerVisualEffectsEnabled, routerVisualMode,
+  renderMarkdown, stripGeneratedArtifactMarkers, stripTimePrefix,
+  isSubagentCompletionMessage, timeTranslator: t,
+})
+const findDisplayMessages = computed(() => findContextMessages.value
+  ? findContextRendered.renderedMessages.value : visibleRenderedMessages.value)
 
 function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
   // Always surface the router strip — the live ensemble strip is the primary
@@ -2596,6 +2619,30 @@ const {
   markSessionMissing,
   cleanup: cleanupHistory,
 } = chatHistory
+const sessionMessageSearch = inject(SESSION_MESSAGE_SEARCH_KEY, null)
+const findPresentation = useChatFindPresentation({
+  sessionKey,
+  source: sessionMessageSearch,
+  messages: visibleRenderedMessages,
+  displayMessages: findDisplayMessages,
+  contextMessages: findContextMessages,
+  project: chatHistory.projectHistoryPage,
+  list: messageListRef,
+  thread: threadRef,
+  autoScroll,
+  focusComposer: () => composerRef.value?.focusTextarea(),
+})
+const chatFind = useChatFind({
+  sessionKey,
+  foregroundBusy: preserveHistoryLiveTail,
+  identity: computed(() => JSON.stringify([deliveryIdentity.value, currentEpoch.value])),
+  search: sessionMessageSearch,
+  onOpen: findPresentation.capture,
+  onReset: restore => { void findPresentation.reset(restore) },
+  onClear: findPresentation.clear,
+  onSelect: findPresentation.select,
+})
+watch(chatFind.open, value => { findOwnsViewport.value = value }, { flush: 'sync' })
 watch(() => historyState.value.sessionMissing, missing => {
   if (missing) sessionViewCache.invalidate(sessionKey.value)
 }, { flush: 'sync' })
@@ -3903,6 +3950,7 @@ async function onComposerSend() {
   // Serialize session-routing and plan mutations before accepting another
   // composer turn, so the send cannot race either CAS update.
   if (modelRoutingMutationBusy.value || planModeBusy.value) return
+  const returnToLiveOnAccepted = chatFind.captureAcceptedSend(jumpToLatest)
   // Goal draft mode: the composer text is the durable objective and the set
   // mutation atomically accepts its first ordinary user turn.
   if (goalDraftArmed.value) {
@@ -3911,6 +3959,7 @@ async function onComposerSend() {
     const submittedRevision = composerRevision.value
     const started = await startGoal(goalText)
     if (!started) return
+    returnToLiveOnAccepted()
     disarmGoalMode()
     if (composerRevision.value === submittedRevision) inputText.value = ''
     autoResizeTextarea()
@@ -3918,7 +3967,7 @@ async function onComposerSend() {
   }
   const target = replanTarget.value
   if (!target) {
-    onSend({ resumeQueueOnSuccess: !isStopPending.value })
+    onSend({ resumeQueueOnSuccess: !isStopPending.value, onAccepted: returnToLiveOnAccepted })
     return
   }
   const prompt = inputText.value.trim()
@@ -3926,6 +3975,7 @@ async function onComposerSend() {
   const submittedRevision = composerRevision.value
   const accepted = await chatPlans.revise({ ...target, prompt })
   if (!accepted) return
+  returnToLiveOnAccepted()
   if (composerRevision.value === submittedRevision) {
     inputText.value = ''
     autoResizeTextarea()
@@ -3956,9 +4006,11 @@ async function sendPendingMessage(pendingUiId: string) {
   if (!candidate || candidate.steerAttempt) return
   const item = beginPendingDelivery(pendingUiId)
   if (!item) return
+  const returnToLiveOnAccepted = chatFind.captureAcceptedSend(jumpToLatest)
   let outcome: ChatSendOutcome = 'retryable_failure'
   try {
     outcome = await sendQueuedFollowup(item, ownerSessionKey, preDispatchGuard)
+    if (outcome === 'accepted') returnToLiveOnAccepted()
   } finally {
     settlePendingDelivery(item, outcome)
   }
@@ -3980,9 +4032,11 @@ async function steerPendingMessage(pendingUiId: string) {
   if (!item) return
   if (candidate?.steerAttempt) pendingSteerClicks.add(candidate)
 
+  const returnToLiveOnAccepted = chatFind.captureAcceptedSend(jumpToLatest)
   let outcome: ChatSendOutcome = 'retryable_failure'
   try {
     outcome = await sendQueuedSteer(item)
+    if (outcome === 'accepted') returnToLiveOnAccepted()
   } finally {
     settlePendingDelivery(item, outcome)
     pendingSteerClicks.delete(item)
@@ -5907,17 +5961,24 @@ const chatRouteHeaderRegistration = chatRouteHeader.register({
   hasNewDeliverable,
   shareMode,
   shareableMessageCount,
+  findState: chatFind.state,
 }, {
   openDeliverables,
   startShare: startShareMode,
   copySessionLink,
   restoreComposerFocus: () => composerRef.value?.focusTextarea(),
+  openFind: openChatFind,
+  updateFindQuery: chatFind.updateQuery,
+  searchFind: query => { void chatFind.search(query) },
+  navigateFind: chatFind.navigate,
+  closeFind: () => chatFind.close(),
 })
 
 /* ── Share export ──────────────────────────────────────────────────── */
 
 function startShareMode() {
   if (shareableMessageCount.value === 0) return
+  if (chatFind.open.value) chatFind.close()
   shareMode.value = true
   selectedShareMessageIds.value = new Set()
   nextTick(() => shareBannerRef.value?.focus())
@@ -6067,6 +6128,7 @@ function scrollToBottom() {
       || !threadRef.value
       || !bottomSentinelRef.value
       || !autoScroll.value
+      || findOwnsViewport.value
     ) return
     messageListRef.value?.scrollToEnd({ behavior: 'auto' })
   })
@@ -6510,6 +6572,7 @@ watch(showJumpToLatest, showing => {
 }, { flush: 'sync' })
 
 function jumpToLatest() {
+  if (chatFind.open.value) chatFind.close(false)
   conversationMinimapRef.value?.cancelNavigation()
   cancelActiveThreadNavigation()
   historyNavigationScrollLock.finish()
@@ -6660,9 +6723,24 @@ function onDocumentPaste(e: ClipboardEvent) {
 /* ── Document keydown (ESC) ────────────────────────────────────────── */
 
 function onDocumentKeydown(e: KeyboardEvent) {
-  if (e.key !== 'Escape') return
   if (e.defaultPrevented) return
+  if (e.isComposing || e.keyCode === 229) return
   if (hasOpenDialogLayer()) return
+  if (isChatFindShortcut(e)) {
+    const target = e.target instanceof Element ? e.target : null
+    // Editors and artifact/embedded document surfaces retain their own find.
+    if (isNewChatLanding.value || forkTransition.value || shareMode.value
+      || target?.closest('.monaco-editor,.cm-editor,[data-workbench-surface],#workbench-panel,iframe')) return
+    e.preventDefault()
+    if (!e.repeat) openChatFind()
+    return
+  }
+  if (e.key !== 'Escape') return
+  if (chatFind.open.value) {
+    e.preventDefault()
+    chatFind.close()
+    return
+  }
 
   // The share preview modal owns Escape while it is open: it closes only the
   // preview (share mode stays active) via its own handler, so bail here and let
@@ -6692,6 +6770,11 @@ function onDocumentKeydown(e: KeyboardEvent) {
     e.preventDefault()
     popAllPendingIntoComposer()
   }
+}
+
+function openChatFind() {
+  if (isNewChatLanding.value || forkTransition.value || shareMode.value) return
+  chatFind.show()
 }
 
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
@@ -7576,6 +7659,24 @@ watch(
 <style scoped src="../styles/chat-view.css"></style>
 
 <style scoped>
+.chat-find-context {
+  display: flex;
+  width: var(--chat-col);
+  margin-inline: auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-2) 0;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+.chat-find-context button {
+  flex-shrink: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+}
 
 /* No shared sr-only utility exists in this repo (each component scopes its
    own), so the completion announcer's clip-out lives here: zero visual

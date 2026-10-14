@@ -1737,6 +1737,16 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     loadEarlierPending = false
   }
 
+  // Find uses a bounded, independent history window. Reuse exactly the normal
+  // display projection without installing it into the live session or retiring
+  // any task owner from this older snapshot.
+  function projectHistoryPage(data: SessionReadHistoryPage): ChatMessage[] {
+    const summaryIds = summaryCompactionIds(data)
+    return attachHistoryTurnOutcomes(
+      (data.messages ?? []).map(message => mapHistoryMessage(message, summaryIds)), data,
+    )
+  }
+
   function reconcileHydratedContent(
     message: Pick<ChatMessage, 'messageId' | 'contentRef' | 'contentRevision'>,
     text: string,
@@ -1751,6 +1761,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     loadHistory,
     reconcileHistory,
     reconcileHydratedContent,
+    projectHistoryPage,
     loadEarlierHistory,
     retryHistory,
     markSessionMissing,

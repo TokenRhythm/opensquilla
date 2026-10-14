@@ -134,6 +134,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.get": READ_SCOPE,
     SESSIONS_LIST_METHOD: READ_SCOPE,
     SESSIONS_SEARCH_METHOD: READ_SCOPE,
+    "sessions.messages.search": READ_SCOPE,
     "sessions.preview": READ_SCOPE,
     SESSIONS_RESOLVE_METHOD: READ_SCOPE,
     "sessions.bootstrap": READ_SCOPE,

@@ -249,11 +249,13 @@ function projectV2HistoryMessage(item: HistoryV2Item, key: string, index: number
   })
 }
 
-function projectV2History(
-  result: HistoryV2Result,
+export function projectV2History(
+  value: unknown,
   key: string,
   direction: 'latest' | 'before' | 'after',
 ): SessionReadHistoryPage {
+  if (!validateSessionsHistoryPageV2Result(value)) throw new TypeError('Invalid history page projection')
+  const result = value as HistoryV2Result
   const hasMore = direction === 'after' ? result.has_more_after : result.has_more_before
   return Object.freeze({
     messages: Object.freeze(result.items.map((item, index) => projectV2HistoryMessage(item, key, index))),

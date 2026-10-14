@@ -100,6 +100,42 @@ describe('decideSendResponseSession', () => {
   })
 })
 
+describe('explicit send scroll ownership', () => {
+  it('notifies an explicit UI callback only after durable admission without changing automatic sends', async () => {
+    const h = queuedSendHarness(), accepted = vi.fn()
+    let accept!: (response: TurnSendResponse) => void
+    h.commands.send.mockImplementationOnce(() => new Promise(resolve => { accept = resolve }))
+    const sending = h.api.onSend({ onAccepted: accepted })
+    await vi.waitFor(() => expect(h.commands.send).toHaveBeenCalledOnce())
+    expect(accepted).not.toHaveBeenCalled()
+    accept({ taskId: 'explicit-task' })
+    await sending
+    expect(accepted).toHaveBeenCalledOnce()
+    h.options.inputText.value = 'automatic follow-up'
+    await h.api.onSend()
+    expect(accepted).toHaveBeenCalledOnce()
+  })
+
+  it('does not notify an explicit UI callback for a rejected send', async () => {
+    const h = queuedSendHarness(), accepted = vi.fn()
+    h.commands.send.mockRejectedValueOnce(new TurnCommandError('rejected', 'synthetic refusal', 'REFUSED', false, true))
+    await h.api.onSend({ onAccepted: accepted })
+    expect(accepted).not.toHaveBeenCalled()
+  })
+
+  it('follows the new user turn even when the stream reducer does not change scroll intent', async () => {
+    const h = queuedSendHarness()
+    expect(h.options.autoScroll.value).toBe(false)
+    await h.api.onSend()
+    expect(h.commands.send).toHaveBeenCalledOnce()
+    expect(h.options.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'user', text: 'unrelated composer draft' }),
+    ]))
+    expect(h.options.autoScroll.value).toBe(true)
+    expect(h.options.scrollToBottom).toHaveBeenCalled()
+  })
+})
+
 function savedDelivery(id: string, overrides: Partial<DeliveryWalRecord> = {}): DeliveryWalRecord {
   return {
     schemaVersion: 2, ownerRequestId: id, deliveryIdentity: 'identity-A',
@@ -345,17 +381,20 @@ describe('explicit composer activity restores queue sending after acceptance', (
     const enqueue = vi.fn(() => new Promise<boolean>(resolve => { save = resolve }))
     const resume = vi.fn()
     const capture = vi.fn(() => resume)
+    const accepted = vi.fn()
     const h = queuedSendHarness({ enqueuePendingInput: enqueue, capturePendingAutoSendResume: capture,
       ...(mode === 'offline' ? { offlineQueueIdentity: ref('synthetic-identity') } : {}),
     })
     h.options.stream.isStreaming.value = mode === 'busy'
-    const sending = h.api.onSend({ resumeQueueOnSuccess: true })
+    const sending = h.api.onSend({ resumeQueueOnSuccess: true, onAccepted: accepted })
     await vi.waitFor(() => expect(enqueue).toHaveBeenCalledOnce())
     expect(capture).toHaveBeenCalledOnce()
     expect(resume).not.toHaveBeenCalled()
+    expect(accepted).not.toHaveBeenCalled()
     save(true)
     await sending
     expect(resume).toHaveBeenCalledOnce()
+    expect(accepted).toHaveBeenCalledOnce()
     expect(h.commands.send).not.toHaveBeenCalled()
   })
 
@@ -381,6 +420,7 @@ describe('explicit composer activity restores queue sending after acceptance', (
 
   it('does not resume the queue after an accepted composer Steer', async () => {
     const resume = vi.fn()
+    const accepted = vi.fn()
     const h = queuedSendHarness({ capturePendingAutoSendResume: () => resume,
       busySendMode: ref('steer'), activeStreamTaskId: ref('running-task'),
       activeSteerCapability: ref({ mode: 'same_turn', expected_turn_id: 'running-task', input_kinds: ['text'] }),
@@ -388,10 +428,11 @@ describe('explicit composer activity restores queue sending after acceptance', (
         attachments: [], intent: null, steerAttempt: { request: payload.request, phase: payload.phase || 'submitting' } }),
     })
     h.options.stream.isStreaming.value = true
-    await h.api.onSend({ resumeQueueOnSuccess: true })
+    await h.api.onSend({ resumeQueueOnSuccess: true, onAccepted: accepted })
     expect(h.commands.steer).toHaveBeenCalledOnce()
     expect(h.commands.send).not.toHaveBeenCalled()
     expect(resume).not.toHaveBeenCalled()
+    expect(accepted).toHaveBeenCalledOnce()
   })
 
   it('resumes before a fork transfers its response-owned queue to the child', async () => {

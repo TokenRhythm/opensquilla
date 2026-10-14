@@ -2273,6 +2273,8 @@ export function useChatSend(options: UseChatSendOptions) {
     textOverride?: string
     cancelIfComposerChanged?: boolean
     resumeQueueOnSuccess?: boolean
+    /** Invocation-owned UI response; automatic sends leave it unset. */
+    onAccepted?: () => void
     preflightGuard?: () => boolean
   }
 
@@ -2296,8 +2298,11 @@ export function useChatSend(options: UseChatSendOptions) {
     composerSubmissions.set(token, { sessionKey: key, identity, snapshot: captureComposerSnapshot() })
     composerSubmissionVersion.value += 1
     try {
-      const onAccepted = invocation.resumeQueueOnSuccess
+      const resumeQueue = invocation.resumeQueueOnSuccess
         ? options.capturePendingAutoSendResume?.() : undefined
+      const onAccepted = invocation.onAccepted
+        ? () => { resumeQueue?.(); invocation.onAccepted?.() }
+        : resumeQueue
       return await sendComposerInput(invocation, onAccepted)
     } finally {
       composerSubmissions.delete(token)
@@ -2532,7 +2537,10 @@ export function useChatSend(options: UseChatSendOptions) {
             composerSnapshot.forkBeforeMessageId,
           )
         ) {
-          await dispatchSteerV2(text, { composerSnapshot })
+          const outcome = await dispatchSteerV2(text, { composerSnapshot })
+          // A Steer can return the explicit sender to its live turn without
+          // granting permission to resume unrelated queued follow-ups.
+          if (outcome === 'accepted') invocation.onAccepted?.()
           return
         }
         // Surface a full queue instead of silently dropping the send: the draft is

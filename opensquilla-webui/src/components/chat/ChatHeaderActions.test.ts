@@ -4,9 +4,10 @@ import { createApp, nextTick, type App, type ComponentPublicInstance } from 'vue
 import { createI18n } from 'vue-i18n'
 
 import ChatHeaderActions from './ChatHeaderActions.vue'
+import type { ChatRouteHeaderFindState } from '@/composables/chat/useChatRouteHeaderBridge'
 
 type LayoutName = 'wide' | 'compact' | 'tight'
-type Action = 'deliverables' | 'share' | 'copy-session-link'
+type Action = 'deliverables' | 'share' | 'copy-session-link' | 'find'
 
 type HeaderInstance = ComponentPublicInstance & {
   focusAction: (action: Action) => boolean
@@ -33,6 +34,12 @@ const messages = {
     share: 'Share',
     shareSelectHint: 'Select messages to share',
     shareSendFirst: 'Send a message first to share',
+    find: {
+      label: 'Find in conversation', placeholder: 'Search conversation content', previous: 'Previous match',
+      next: 'Next match', close: 'Close find', loading: 'Searching', noResults: 'No matches', error: 'Search failed',
+      count: '{current} of {total}', partial: '{current} of {total}, searching older messages',
+      incomplete: '{current} of {total}, some content unavailable',
+    },
   },
 }
 
@@ -119,13 +126,18 @@ function setCoarsePointer(matches: boolean) {
 
 async function mountHeader(
   width: number,
-  overrides: Partial<typeof BASE_PROPS> = {},
+  overrides: Partial<typeof BASE_PROPS> & { findState?: ChatRouteHeaderFindState } = {},
 ) {
   headerWidth = width
   const handlers = {
     deliverables: vi.fn(),
     share: vi.fn(),
     copyLink: vi.fn(),
+    openFind: vi.fn(),
+    updateFindQuery: vi.fn(),
+    searchFind: vi.fn(),
+    navigateFind: vi.fn(),
+    closeFind: vi.fn(),
   }
   const el = document.createElement('div')
   document.body.appendChild(el)
@@ -135,6 +147,11 @@ async function mountHeader(
     onOpenDeliverables: handlers.deliverables,
     onStartShare: handlers.share,
     onCopySessionLink: handlers.copyLink,
+    onOpenFind: handlers.openFind,
+    onUpdateFindQuery: handlers.updateFindQuery,
+    onSearchFind: handlers.searchFind,
+    onNavigateFind: handlers.navigateFind,
+    onCloseFind: handlers.closeFind,
   })
   app.use(createI18n({
     legacy: false,
@@ -666,5 +683,43 @@ describe('ChatHeaderActions', () => {
     const tight = await mountHeader(120)
     expect(tight.instance.focusAction('deliverables')).toBe(true)
     expect(document.activeElement).toBe(trigger(tight.el))
+  })
+
+  it('shows one find menu action with its shortcut and keeps it separate from the inline search field', async () => {
+    const findState: ChatRouteHeaderFindState = {
+      open: false, query: '', resultQuery: '', matchCount: 0, activeMatch: 0,
+      status: 'idle', focusSequence: 0, complete: true,
+    }
+    const { el, handlers } = await mountHeader(800, { findState })
+    expect(el.querySelector('.chat-find-bar')).toBeNull()
+    await openMenu(el)
+    const action = el.querySelector<HTMLButtonElement>('[data-testid="chat-session-action-find"]')!
+    expect(action.textContent).toContain('Find in conversation')
+    expect(action.querySelector('kbd')?.textContent).toMatch(/Ctrl\+F|⌘F/)
+    action.click()
+    await flush()
+    expect(handlers.openFind).toHaveBeenCalledOnce()
+    expect(el.querySelector('[role="menu"]')).toBeNull()
+    expect(handlers.copyLink).not.toHaveBeenCalled()
+  })
+
+  it('preserves focused find text and forwards navigation when the header changes layout', async () => {
+    const findState: ChatRouteHeaderFindState = {
+      open: true, query: 'needle', resultQuery: 'needle', matchCount: 12, activeMatch: 3,
+      status: 'ready', focusSequence: 1, complete: true,
+    }
+    const { el, handlers, instance, observer } = await mountHeader(800, { findState })
+    const input = el.querySelector<HTMLInputElement>('.chat-find-bar input')!
+    expect(input.value).toBe('needle')
+    expect(instance.focusAction('find')).toBe(true)
+    expect(document.activeElement).toBe(input)
+    resizeHeader(400, observer)
+    await flushAnimationFrame()
+    expect(document.activeElement).toBe(input)
+    expect(input.value).toBe('needle')
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true }))
+    expect(handlers.navigateFind).toHaveBeenCalledWith('previous')
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    expect(handlers.closeFind).toHaveBeenCalledOnce()
   })
 })

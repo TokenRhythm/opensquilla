@@ -3625,6 +3625,22 @@
     }
   },
   "chat": {
+    "find": {
+      "label": "Find in conversation",
+      "placeholder": "Search conversation…",
+      "previous": "Previous match (Shift+Enter)",
+      "next": "Next match (Enter)",
+      "close": "Close find (Esc)",
+      "loading": "Searching conversation…",
+      "noResults": "No matches",
+      "error": "Unable to search. Press Enter to retry.",
+      "count": "{current} of {total}",
+      "partial": "{current} of {total} — partial results; Next continues beyond loaded matches",
+      "incomplete": "{current} of {total} — some content is unavailable",
+      "retry": "Retry",
+      "historyContext": "Showing context around a search result",
+      "returnToConversation": "Return to conversation"
+    },
     "diagram": {
       "failed": "Could not render diagram · source retained",
       "limited": "Diagram too large · source retained",

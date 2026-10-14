@@ -14,6 +14,19 @@ export type ChatRouteHeaderAction =
   | 'deliverables'
   | 'share'
   | 'copy-session-link'
+  | 'find'
+
+export interface ChatRouteHeaderFindState {
+  open: boolean
+  query: string
+  resultQuery: string
+  matchCount: number
+  activeMatch: number
+  status: 'idle' | 'loading' | 'ready' | 'error'
+  focusSequence: number
+  complete: boolean
+  coverageComplete?: boolean
+}
 
 export interface ChatRouteHeaderModel {
   sessionKey: Readonly<Ref<string>>
@@ -27,6 +40,7 @@ export interface ChatRouteHeaderModel {
   hasNewDeliverable: Readonly<Ref<boolean>>
   shareMode: Readonly<Ref<boolean>>
   shareableMessageCount: Readonly<Ref<number>>
+  findState?: Readonly<Ref<ChatRouteHeaderFindState>>
 }
 
 export interface ChatRouteHeaderCommands {
@@ -34,6 +48,11 @@ export interface ChatRouteHeaderCommands {
   startShare: () => void
   copySessionLink: () => void
   restoreComposerFocus: () => void
+  openFind?: () => void
+  updateFindQuery?: (query: string) => void
+  searchFind?: (query: string) => void
+  navigateFind?: (direction: 'previous' | 'next') => void
+  closeFind?: () => void
 }
 
 export interface ChatRouteHeaderHostHandle {
@@ -60,6 +79,7 @@ export interface ChatRouteHeaderBridge {
     hasNewDeliverable: ComputedRef<boolean>
     shareMode: ComputedRef<boolean>
     shareableMessageCount: ComputedRef<number>
+    findState: ComputedRef<ChatRouteHeaderFindState | null>
   }
   register: (
     model: ChatRouteHeaderModel,
@@ -69,7 +89,10 @@ export interface ChatRouteHeaderBridge {
   setHost: (host: ChatRouteHeaderHostHandle | null) => void
   focusAction: (action: ChatRouteHeaderAction) => boolean
   closeMenu: () => void
-  invoke: (command: keyof ChatRouteHeaderCommands) => void
+  invoke: <K extends keyof ChatRouteHeaderCommands>(
+    command: K,
+    ...args: Parameters<NonNullable<ChatRouteHeaderCommands[K]>>
+  ) => void
 }
 
 interface ChatRouteHeaderOwner {
@@ -95,9 +118,9 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
 
   function ownerValue<K extends keyof ChatRouteHeaderModel>(
     key: K,
-    fallback: ChatRouteHeaderModel[K]['value'],
-  ): ChatRouteHeaderModel[K]['value'] {
-    return activeOwner.value?.model[key].value ?? fallback
+    fallback: NonNullable<ChatRouteHeaderModel[K]>['value'],
+  ): NonNullable<ChatRouteHeaderModel[K]>['value'] {
+    return activeOwner.value?.model[key]?.value ?? fallback
   }
 
   function closeMenu() {
@@ -138,6 +161,7 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
       hasNewDeliverable: computed(() => ownerValue('hasNewDeliverable', false)),
       shareMode: computed(() => ownerValue('shareMode', false)),
       shareableMessageCount: computed(() => ownerValue('shareableMessageCount', 0)),
+      findState: computed(() => activeOwner.value?.model.findState?.value ?? null),
     },
     register(model, commands) {
       closeMenu()
@@ -157,8 +181,9 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
     },
     focusAction: action => focusActionForOwner(action),
     closeMenu,
-    invoke(command) {
-      activeOwner.value?.commands[command]?.()
+    invoke(command, ...args) {
+      const handler = activeOwner.value?.commands[command] as ((...values: typeof args) => void) | undefined
+      handler?.(...args)
     },
   }
 

@@ -27,9 +27,10 @@ describe('ChatView scroll ownership wiring', () => {
   it('uses the same projected message indexes for the list and minimap', () => {
     const list = chatViewSource.slice(chatViewSource.indexOf('<ChatMessageList'), chatViewSource.indexOf('</ChatMessageList>'))
     const minimap = chatViewSource.slice(chatViewSource.indexOf('<ConversationMinimap'), chatViewSource.indexOf('@navigate-end="onHistoryNavigateEnd"'))
-    expect(list).toContain(':messages="forkTransition?.previewMessages || visibleRenderedMessages"')
+    expect(list).toContain(':messages="forkTransition?.previewMessages || findDisplayMessages"')
     expect(minimap).toContain(':messages="visibleRenderedMessages"')
     expect(minimap).toContain(':virtualizer="messageListRef"')
+    expect(minimap).toContain('!findContextMessages')
   })
 
   it('invalidates deferred work and pins a switched session only once', () => {
