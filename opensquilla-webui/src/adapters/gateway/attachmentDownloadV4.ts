@@ -25,8 +25,12 @@ export async function downloadRetainedAttachment(
     const connection = await platform.gateway.getConnection()
     if (connection.status !== 'ready' || !connection.instanceId) throw new Error('Gateway unavailable')
     if (request.signal?.aborted) throw new DOMException('Aborted', 'AbortError')
-    return (await platform.files.saveAttachment({ gatewayInstanceId: connection.instanceId,
-      sessionKey, sha256: attachment.sha256_ref!.toLowerCase(), name })).status
+    // Only owned Gateway launches expose the instance token required by native saving.
+    // External Gateways use the authenticated HTTP transport below.
+    if (connection.authToken) {
+      return (await platform.files.saveAttachment({ gatewayInstanceId: connection.instanceId,
+        sessionKey, sha256: attachment.sha256_ref!.toLowerCase(), name })).status
+    }
   }
   return saveByteStream(name, async () => {
     const response = await http.requestBinary(path, { sessionKey, signal: request.signal, timeoutMs: 0 })

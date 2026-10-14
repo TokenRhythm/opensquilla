@@ -10,7 +10,7 @@ import { ARTIFACT_WORKBENCH_KEY, type ArtifactContentAccess, type ArtifactWorkbe
 const mocks = vi.hoisted(() => ({
   open: vi.fn(), copy: vi.fn(),
   saveAttachment: vi.fn().mockResolvedValue({ status: 'saved' }),
-  connection: vi.fn().mockResolvedValue({ status: 'ready', instanceId: 'gateway-one' }),
+  connection: vi.fn().mockResolvedValue({ status: 'ready', instanceId: 'gateway-one', authToken: 'owned-instance-token' }),
   requestBinary: vi.fn(),
 }))
 vi.mock('@/stores/app', () => ({ useAppStore: () => ({ features: { artifactWorkbench: true } }) }))
@@ -47,10 +47,20 @@ function mount(readAttachmentPreview: ArtifactContentAccess['readAttachmentPrevi
   return host
 }
 beforeEach(() => vi.clearAllMocks())
-afterEach(() => { apps.splice(0).forEach(app => app.unmount()); setActivePinia(undefined); document.body.innerHTML = '' })
+afterEach(() => { apps.splice(0).forEach(app => app.unmount()); setActivePinia(undefined); document.body.innerHTML = ''; vi.unstubAllGlobals() })
 
 describe('legacy file detail recovery actions', () => {
-  it('reveals actions only after recovery, then downloads by native SHA without reading the preview again', async () => {
+  it.each(['owned', 'external'] as const)('reveals recovered file actions and downloads from an %s Gateway without another preview read', async gateway => {
+    mocks.connection.mockResolvedValue({ status: 'ready', instanceId: 'gateway-one',
+      authToken: gateway === 'owned' ? 'owned-instance-token' : null })
+    const originalBytes = new TextEncoder().encode('<!doctype html>\n<main>Complete original historical file</main>')
+    const target = { write: vi.fn().mockResolvedValue(undefined), close: vi.fn().mockResolvedValue(undefined), abort: vi.fn() }
+    const picker = vi.fn().mockResolvedValue({ createWritable: async () => target })
+    vi.stubGlobal('showSaveFilePicker', picker)
+    mocks.requestBinary.mockResolvedValue({ stream: () => new ReadableStream({ start(controller) {
+      controller.enqueue(originalBytes)
+      controller.close()
+    } }) })
     let resolve!: (value: Awaited<ReturnType<NonNullable<ArtifactContentAccess['readAttachmentPreview']>>>) => void
     const read = vi.fn<NonNullable<ArtifactContentAccess['readAttachmentPreview']>>()
       .mockReturnValue(new Promise(done => { resolve = done }))
@@ -74,11 +84,22 @@ describe('legacy file detail recovery actions', () => {
     expect(mocks.open).toHaveBeenCalledWith(expect.objectContaining({ kind: 'write', path: 'games/snake.html', truncated: true }),
       expect.objectContaining({ sessionKey: 'session-a', toolId: 'saved-write-call', fileSnapshot: snapshot }))
     host.querySelector<HTMLButtonElement>('[data-testid="activity-tool-detail-download"]')!.click()
-    await vi.waitFor(() => expect(mocks.saveAttachment).toHaveBeenCalledWith({
-      gatewayInstanceId: 'gateway-one', sessionKey: 'session-a', sha256: snapshot.legacy_ref!.sha256, name: 'snake.html',
-    }))
+    if (gateway === 'owned') {
+      await vi.waitFor(() => expect(mocks.saveAttachment).toHaveBeenCalledWith({
+        gatewayInstanceId: 'gateway-one', sessionKey: 'session-a', sha256: snapshot.legacy_ref!.sha256, name: 'snake.html',
+      }))
+      expect(mocks.requestBinary).not.toHaveBeenCalled()
+      expect(picker).not.toHaveBeenCalled()
+    } else {
+      await vi.waitFor(() => expect(target.close).toHaveBeenCalledOnce())
+      expect(mocks.requestBinary).toHaveBeenCalledExactlyOnceWith(
+        `/api/v1/attachments/${snapshot.legacy_ref!.sha256}?messageId=saved-assistant-message&toolUseId=saved-write-call`,
+        expect.objectContaining({ sessionKey: 'session-a', timeoutMs: 0 }))
+      expect(target.write).toHaveBeenCalledExactlyOnceWith(originalBytes)
+      expect(target.abort).not.toHaveBeenCalled()
+      expect(mocks.saveAttachment).not.toHaveBeenCalled()
+    }
     expect(read).toHaveBeenCalledTimes(1)
-    expect(mocks.requestBinary).not.toHaveBeenCalled()
     expect(mocks.copy).not.toHaveBeenCalled()
   })
 
