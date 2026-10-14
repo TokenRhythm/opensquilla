@@ -1,0 +1,121 @@
+Generated from generative-frame 0.0.5 (MIT), adapted for OpenSquilla.
+Copyright (c) 2026 AgentbaseAI Inc. See LICENSE.generative-frame.txt and upstream-guidance.json.
+Do not edit this generated file; run npm run visualize:guidance:write in opensquilla-webui.
+
+# Widgets
+
+A widget is a visual published inside the conversation using the OpenSquilla publication contract in SKILL.md. The host displays the registered HTML revision in an isolated frame. Use widgets when a picture, chart, diagram, or control explains something better than prose; keep explanations, caveats, and conclusions in your chat reply, not inside the widget.
+
+## Format
+
+- Write an HTML fragment: no `<!doctype>`, `<html>`, `<head>`, or `<body>`. Code that starts with `<svg` is treated as a standalone SVG; give it a `viewBox` and no fixed `height`.
+- The inline frame is often about 680px wide but must also fit a 360px phone; measure its actual container and let content determine its height. Never set a fixed height or `100vh` on the outermost element, and do not use `position: fixed` or `sticky` at the top level.
+- The background is transparent and the host already pads the frame. Do not add an outer background, border, margin, or padding around the whole widget; cards and panels inside it are fine.
+- Keep headings inside the widget short (a few words). One widget answers one question; make a second widget rather than a tabbed super-widget.
+
+## Document order
+
+- Write one short `<style>` block first, then markup from top to bottom, then all `<script>` elements last.
+- The host loads a complete immutable revision; scripts run once in document order. The markup must already make sense before any script runs: headings, labels, and containers first, with explicit heights for anything a script fills in (a chart canvas wrapper, a D3 mount point) so the layout does not jump.
+- Prefer inline `style` attributes or simple class rules; avoid content that only appears after JavaScript runs, such as hidden tabs, carousels, or `display: none` sections that a script reveals.
+- Avoid large shadows, blurs, `backdrop-filter`, and big gradients. They add visual noise and rendering cost; use flat fills and 1px borders.
+- Scripts can run directly at the end of the widget; waiting for `DOMContentLoaded` also works but is unnecessary.
+
+## Theme
+
+Style everything with these CSS variables. The host keeps them in sync with its own theme and switches light and dark live, so a widget that only uses tokens always matches.
+
+| Token | Use for |
+| --- | --- |
+| `--color-background` | the host page behind the widget; for knockouts only, the widget itself stays transparent |
+| `--color-surface` | cards, panels, popovers |
+| `--color-surface-muted` | wells, table stripes, hover fills, code blocks |
+| `--color-text` | body text, headings, primary values |
+| `--color-text-muted` | labels, secondary text, axis titles |
+| `--color-text-subtle` | captions, tick labels, placeholders, disabled |
+| `--color-border` | hairlines, dividers, card outlines, gridlines |
+| `--color-border-strong` | inputs, emphasized outlines, focus-adjacent edges |
+| `--color-accent` | primary actions, selection, the one highlighted series |
+| `--color-accent-text` | text and icons placed on --color-accent |
+| `--color-danger` | errors, destructive actions, negative deltas |
+| `--color-success` | success, positive deltas |
+| `--color-warning` | warnings, pending states |
+| `--color-info` | neutral notices, links inside callouts |
+| `--chart-1` | first categorical series |
+| `--chart-2` | second categorical series |
+| `--chart-3` | third categorical series |
+| `--chart-4` | fourth categorical series |
+| `--chart-5` | fifth categorical series |
+| `--chart-6` | sixth categorical series |
+| `--font-sans` | all UI text |
+| `--font-mono` | code, tabular identifiers |
+| `--radius-sm` | chips, inputs, small buttons |
+| `--radius-md` | buttons, cards |
+| `--radius-lg` | large panels, dialogs |
+
+- Plain elements are already styled to match the host: headings, paragraphs, links, tables, `button`, `input`, `select`, `textarea`, checkboxes, and ranges. Only add CSS for layout and for what you change.
+- Hardcode a color only for data encodings the tokens cannot express, and check that it reads on both light and dark backgrounds.
+- Canvas-based libraries cannot read CSS variables. Resolve them with `getComputedStyle(document.documentElement).getPropertyValue("--chart-1").trim()`, and redraw when the window fires `themechange`.
+- Use `--font-sans` for all text; never load a font just for decoration.
+
+## Libraries and network
+
+- Shared CDN origins for external scripts, stylesheets, images, fonts, and media: none. The font-specific exceptions below add access only to their resource type.
+- Extra font stylesheets load only from: nowhere. These origins do not allow scripts, images, or font files.
+- Extra font files load only from: nowhere. These origins do not allow scripts, stylesheets, or images.
+- Inline scripts and styles, `data:` fonts, and `data:`/`blob:` images and media are allowed. External resource URLs must match the corresponding resource allowlist. When no external resource origins are configured, inline everything.
+- `fetch`, XHR, and WebSocket are blocked. Embed the data in the script as literals.
+- No external library URL is available. Use native SVG/Canvas/DOM, or a permitted library whose exact code is already embedded in the self-contained file; never invent a CDN or assume a global library exists. The complete file must stay under 1 MiB.
+- `eval` and `new Function` are blocked; avoid libraries that compile templates or expressions at runtime.
+- Form submissions cannot navigate. Handle `submit` in JavaScript and call `preventDefault()`.
+- Do not use localStorage, sessionStorage, cookies, local file paths or external frames. Restore and save UI state with `window.opensquillaVisualize.getState()` and `.setState(value)` as described in SKILL.md.
+
+## Host API
+
+- Use only `window.opensquillaVisualize`: `ready`, `getState()`, `setState(value)`, and optional `setContext(value)`; see SKILL.md for the exact contract.
+- Local controls calculate, filter, select, navigate or animate locally. Do not generate a generic continue-discussion button or call legacy `sendPrompt` in new visuals.
+- Only when the task calls for subsequent model work, publish a useful selection with `setContext({ summary, data?, suggestedPrompt? })`. This prepares context, not a message. The host owns the action that adds it to an editable chat draft; the user sends that draft.
+- `setContext(null)` clears the prepared selection. Await its acknowledgement before reporting that context is available; never claim a message was sent.
+- The window fires `themechange` when the host theme changes; resolve CSS tokens again when repainting Canvas.
+- Do not call tools, navigate to external links, request credentials, or create your own expand/reload/export controls. The host supplies canvas controls.
+
+## Accessibility
+
+- HTML widgets begin with a visually hidden heading that names the widget: `<h2 class="sr-only">Monthly revenue by region</h2>`.
+- SVG widgets use `role="img"` on the root with `<title>` and `<desc>` as its first children.
+- Never encode meaning with color alone; pair it with a label, sign, icon, or pattern. Keep text at 12px or larger and at readable contrast.
+- Interactive parts are real `<button>`, `<input>`, `<select>`, or `<a>` elements with visible labels, reachable by keyboard.
+- Motion is optional decoration. Keep it short, and skip it when `prefers-reduced-motion` is set.
+
+## Editing and errors
+
+- To change an existing visual, edit its source file and call `open_workspace_preview(path=..., presentation="inline")` again. Use the exact new marker for the new immutable revision; registration alone does not verify rendering or interaction.
+- When a render reports errors, fix their cause rather than wrapping code in `try`/`catch`.
+
+## Platform: desktop
+
+- The frame is about 680px wide. Up to three columns fit; collapse to one column below 480px with a media query.
+- Hover can add detail (tooltips, highlights) but must never be the only way to reach information.
+- Charts read well between 240px and 360px tall.
+
+## Before sending
+
+- Fragment or single `<svg>`, with style, then markup, then scripts.
+- Every color, font, and radius comes from a token, or is a deliberate data color that works in both themes.
+- Every external resource or request uses its allowed origins; embed data when network requests are blocked.
+- Fixed-height containers for script-drawn content; no fixed height on the outer element.
+- An accessible name: hidden `<h2>` for HTML, `<title>` and `<desc>` for SVG.
+
+## Modules
+
+Read the relevant generated reference through `skill_view(name="visualize", file_path="references/guidance-MODULE.txt")`. Choose and combine modules from the index in SKILL.md; these are design capabilities, not fixed templates.
+
+## Platform: mobile
+
+- The frame is about 360px wide. Use a single column and stack anything that would sit side by side.
+- Make every tap target at least 44px tall, and never hide an action behind hover.
+- Use 16px text in inputs so the browser does not zoom on focus.
+- Turn wide tables into stacked cards, or put them in a horizontally scrolling container.
+- Keep charts at most 240px tall and limit them to the few series that matter.
+
+For dense diagrams or long labels, reflow or show a focused view at phone widths; do not shrink a desktop SVG until text becomes unreadable.

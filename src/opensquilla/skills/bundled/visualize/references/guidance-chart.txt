@@ -1,0 +1,16 @@
+Generated from generative-frame 0.0.5 (MIT), adapted for OpenSquilla.
+Copyright (c) 2026 AgentbaseAI Inc. See LICENSE.generative-frame.txt and upstream-guidance.json.
+Do not edit this generated file; run npm run visualize:guidance:write in opensquilla-webui.
+
+## Module: chart
+
+- Pick the form from the question: compare categories with bars (horizontal when labels are long), show change over time with lines, show composition with stacked bars (a pie only for 2–4 parts), show distribution with a histogram, show relationship with a scatter.
+- Small, simple charts (up to about a dozen bars, a sparkline, a single line) are best as hand-written SVG: they need no external library.
+- For richer charts use responsive SVG/Canvas. Chart.js-specific advice below applies only if its permitted code is already embedded in the file; the host does not preload Chart.js and external scripts are unavailable.
+- Wrap the canvas in a fixed-height box so space is reserved before the script runs: `<div style="position:relative;height:280px"><canvas id="c" aria-label="…" role="img"></canvas></div>`, and set `responsive: true, maintainAspectRatio: false`.
+- Put the title and a one-line subtitle in HTML above the chart, not in the Chart.js title plugin, so labels are available before a chart script runs.
+- Read colors from tokens in the script and apply them to `Chart.defaults` (`color`, `borderColor`, `font.family`) and to each dataset (`--chart-1`, `--chart-2`, …). On `themechange`, re-read them, update the chart's options and datasets, and call `chart.update()`.
+- Label axes with units, format ticks with `Intl.NumberFormat` (compact notation for large numbers), and start bar axes at zero.
+- Sort categorical bars by value unless the categories have a natural order. Use a legend only for two or more series; direct labels are better when there is room.
+- Keep animation short (`animation: { duration: 300 }`) or off; never loop it.
+- Embed the data as a literal array in the script; nothing can be fetched.

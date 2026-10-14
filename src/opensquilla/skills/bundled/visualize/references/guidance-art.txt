@@ -1,0 +1,11 @@
+Generated from generative-frame 0.0.5 (MIT), adapted for OpenSquilla.
+Copyright (c) 2026 AgentbaseAI Inc. See LICENSE.generative-frame.txt and upstream-guidance.json.
+Do not edit this generated file; run npm run visualize:guidance:write in opensquilla-webui.
+
+## Module: art
+
+- Illustrations are SVG with a `viewBox`, built in layers (background, midground, foreground) as `<g>` groups so the stream paints back to front.
+- Use a small palette: tokens, or a deliberate palette that reads on both light and dark. If the piece needs its own backdrop, draw it as a rounded `<rect>` instead of relying on the page.
+- Generative pieces use a canvas sized by `devicePixelRatio` and a seeded random generator; draw once, or animate with `requestAnimationFrame` and stop under `prefers-reduced-motion`.
+- Keep SVG under roughly 2,000 elements; use canvas for particle-heavy work, since every SVG node has to stream.
+- Explanatory drawings (anatomy, mechanisms, scenes) label their parts with leader lines and text, not a separate legend.

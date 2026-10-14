@@ -27,7 +27,9 @@ One restrained local title and a small selection legend are usually enough.
 Prefer host theme tokens, a transparent canvas, and selected-node contrast to
 many nested cards. Only add zoom/pan when the relationship density warrants it.
 
-An explicit "Explain this path" action should call sendPrompt with the selected
-node and named relationship, through the existing host confirmation/draft flow.
+Selection reveals the relationship locally; do not add a generic follow-up
+button. Only when further model investigation is part of the requested workflow,
+prepare the selected node and named relationship using the optional setContext
+contract in SKILL.md. The host supplies the conversation action.
 Check keyboard selection, visible edge updates, reload restoration, and a 360 px
 view. A graph should reveal structure before the user operates any controls.

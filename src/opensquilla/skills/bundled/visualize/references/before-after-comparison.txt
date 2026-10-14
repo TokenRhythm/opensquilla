@@ -23,5 +23,7 @@ an accessible before/after switch that preserves the current event index.
 Keep controls outside the regions that change height to avoid accidental jumps.
 
 Check first/last steps, keyboard stepping, pause/reset, and restored selections.
-An optional follow-up action describes the exact step and displayed difference
-in a proposed conversation draft. It must not send the chat automatically.
+Exploring the difference is a complete local interaction. Do not add a generic
+follow-up button. If the requested task includes later model investigation,
+prepare the exact step and displayed difference using optional setContext in
+SKILL.md; the host owns the conversation action and nothing sends automatically.

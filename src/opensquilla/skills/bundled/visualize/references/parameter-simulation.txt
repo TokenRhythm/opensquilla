@@ -27,14 +27,10 @@ An implementation sketch (adapt the range, DOM and labels to the actual task):
     dailyRate: clamp(saved?.dailyRate, 100, 5000, 800)
   };
   // On each input: update state, redraw using state, then visual.setState(state).
-  // Connect this handler to the visible follow-up button:
-  function proposeFollowUp() {
-    visual.sendPrompt(`Explain an estimate for ${state.people} people over ` +
-      `${state.days} days at ${state.dailyRate} per person per day.`);
-  }
-
-The follow-up call above belongs inside a click/submit handler, never startup.
-It proposes a host-confirmed draft; it does not send automatically.
+The inputs and linked result are a complete interaction; no continue-discussion
+button is needed. If the user's task explicitly includes subsequent analysis of
+chosen conditions, read the optional setContext contract in SKILL.md and expose
+that selection to the host. Preparing conditions never sends a message.
 
 Check: 3 x 10 x 800 = 24000; changing days to 20 gives 48000. Restore after
 reload and confirm all inputs/results agree. Reset returns inputs, chart and

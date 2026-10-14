@@ -1,0 +1,13 @@
+Generated from generative-frame 0.0.5 (MIT), adapted for OpenSquilla.
+Copyright (c) 2026 AgentbaseAI Inc. See LICENSE.generative-frame.txt and upstream-guidance.json.
+Do not edit this generated file; run npm run visualize:guidance:write in opensquilla-webui.
+
+## Module: interactive
+
+- Lay out controls first and output after them, so the widget explains itself before any script runs.
+- Use native controls with visible labels: `<input type="range">` with an `<output>` showing its value, `<select>`, checkboxes, and buttons. Keep it to about five controls.
+- Hold state in one object and write a single `render()` that updates the DOM from it. Call `render()` once at the end of the script so the initial state paints, then on every `input` event.
+- Start from defaults that already show something meaningful; the first paint should answer the question before anyone touches a control.
+- Animate with `requestAnimationFrame`, pause when the widget is off screen (`IntersectionObserver`), and offer a pause button for anything that moves continuously.
+- Use a seeded random generator when results should be reproducible.
+- Keep parameter changes and results local. Do not add a generic continue-discussion or submit-to-chat button. If the requested workflow includes subsequent model work, use optional `setContext` from SKILL.md; the host presents the chat action.

@@ -62,8 +62,13 @@ dependency from [assistant-ui](https://github.com/assistant-ui/assistant-ui),
 maintained by AgentbaseAI Inc. Both packages are MIT licensed. Their identical
 license text, reproduced from the installed packages' LICENSE files, follows.
 OpenSquilla owns the Vue host, restricted bridge, Artifact integration and
-Visualize skill. The skill and its examples are original OpenSquilla content;
-they do not incorporate Codex skill text or claim to reproduce Codex internals.
+Visualize host contract. The skill's generated `references/guidance-*.txt` files
+derive from the MIT-licensed `generative-frame` 0.0.5 model guidance and preserve
+its copyright notice. `upstream-guidance.json` records the exact source and
+compiled-input hashes, generation configuration, and local adaptations; the
+full MIT license is distributed beside the skill as `LICENSE.generative-frame.txt`.
+The OpenSquilla host contract and three optional examples are original content.
+They do not incorporate Codex skill text or claim to reproduce Codex internals.
 
 ```text
 MIT License
