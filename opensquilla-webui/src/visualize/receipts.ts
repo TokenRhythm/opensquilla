@@ -50,6 +50,10 @@ export function splitVisualizeBody(html: string, receipts: readonly VisualizeRec
     } else if (!receipt) pending += element?.outerHTML ?? (node.textContent ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
   }
   flush()
-  if (fallback) for (const receipt of receipts) if (!used.has(receipt.marker)) result.push({ key: receipt.marker, receipt })
+  // Explicit placement chooses the published versions that belong in the
+  // answer. A model may publish, inspect, and replace a draft in one turn;
+  // appending every unreferenced receipt would resurrect those older drafts.
+  // Retain the legacy fallback only when no authorized marker was placed.
+  if (fallback && used.size === 0) for (const receipt of receipts) result.push({ key: receipt.marker, receipt })
   return result
 }

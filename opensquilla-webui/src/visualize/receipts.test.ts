@@ -22,4 +22,17 @@ describe('Visualize authorized receipts and body placement', () => {
     expect(parts.filter(part => part.receipt)).toHaveLength(1)
     expect(splitVisualizeBody(html, visualizeReceipts([call]), false).filter(part => part.receipt)).toHaveLength(0)
   })
+  it('shows only the explicitly selected publication after a draft was republished', () => {
+    const latest = { ...receipt, documentId: 'doc_latest', revisionId: 'rev_latest', marker: 'visualize:doc_latest:rev_latest' }
+    const receipts = visualizeReceipts([call, { ...call, toolId: 'call_2', result: JSON.stringify(latest) }])
+    const parts = splitVisualizeBody(`<p>Updated</p><p><code>${latest.marker}</code></p><p>Use this version.</p>`, receipts)
+    expect(parts.filter(part => part.receipt).map(part => part.receipt?.marker)).toEqual([latest.marker])
+    expect(parts.map(part => part.receipt ? 'canvas' : part.html)).toEqual(['<p>Updated</p>', 'canvas', '<p>Use this version.</p>'])
+    expect(splitVisualizeBody(`<p><code>${receipt.marker}</code></p><p><code>${latest.marker}</code></p>`, receipts)
+      .filter(part => part.receipt)).toHaveLength(2)
+  })
+  it('does not let an unauthorized marker suppress successful receipt fallback', () => {
+    const parts = splitVisualizeBody('<p><code>visualize:doc_unknown:rev_unknown</code></p>', visualizeReceipts([call]))
+    expect(parts.filter(part => part.receipt).map(part => part.receipt?.marker)).toEqual([receipt.marker])
+  })
 })
