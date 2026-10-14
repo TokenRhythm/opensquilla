@@ -90,6 +90,7 @@ export async function mountVisualize(container: HTMLElement, options: VisualizeR
   let presentation: VisualizePresentation = { mode: 'inline' }
   let contentSize: VisualizeSize = { width: 0, height: MIN_HEIGHT }
   let sizeFrame: number | undefined
+  let cancelLayoutBarrier: (() => void) | undefined
   let lastLimit = MAX_HEIGHT
   let lastMode: VisualizePresentation['mode'] = 'inline'
   let lastOverflow = 'hidden'
@@ -126,6 +127,7 @@ export async function mountVisualize(container: HTMLElement, options: VisualizeR
     disposed = true
     options.signal?.removeEventListener('abort', dispose)
     if (sizeFrame !== undefined) view.cancelAnimationFrame(sizeFrame)
+    cancelLayoutBarrier?.()
     widget?.dispose()
   }
   widget = createWidget({
@@ -172,8 +174,44 @@ export async function mountVisualize(container: HTMLElement, options: VisualizeR
     await waitForPhase(widget.ready, options.signal, 'connection')
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError')
     widget.write(bridge + options.html)
-    const result = await waitForPhase(widget.end(), options.signal, 'render')
-    if (result.blank) throw new Error('The canvas produced no visible content')
+    const finishRender = async () => {
+      let result = await widget!.end()
+      if (disposed || options.signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+      const frameRect = widget!.iframe?.getBoundingClientRect()
+      const containerRect = container.getBoundingClientRect()
+      // A new iframe inside a changing modal can finish its scripts before
+      // Chromium lays out its document, despite the host frame having size.
+      // Re-measure once after host layout; never re-run the generated code.
+      if (result.blank && !result.errorCount && !firstError
+        && (result.size.width < 2 || result.size.height < 2)
+        && frameRect && frameRect.width >= 2 && frameRect.height >= 2
+        && containerRect.width >= 2 && containerRect.height >= 2) {
+        await new Promise<void>((resolve, reject) => {
+          const frame = view.requestAnimationFrame(() => {
+            cancelLayoutBarrier = undefined
+            if (disposed || options.signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return }
+            widget!.iframe?.getBoundingClientRect()
+            resolve()
+          })
+          cancelLayoutBarrier = () => {
+            cancelLayoutBarrier = undefined
+            view.cancelAnimationFrame(frame)
+            reject(new DOMException('Aborted', 'AbortError'))
+          }
+        })
+        if (disposed || options.signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+        const inspection = await widget!.inspect()
+        result = { size: inspection.size, blank: inspection.blank, errorCount: inspection.errors.length }
+      }
+      return result
+    }
+    // end, the layout barrier and inspection share this single phase budget.
+    const result = await waitForPhase(finishRender(), options.signal, 'render')
+    if (result.blank) {
+      const frameRect = widget.iframe?.getBoundingClientRect()
+      const containerRect = container.getBoundingClientRect()
+      throw new Error(`The canvas produced no visible content (root=${result.size.width}x${result.size.height}; iframe=${frameRect?.width ?? 0}x${frameRect?.height ?? 0}; container=${containerRect.width}x${containerRect.height}; iframeHeight=${widget.iframe?.style.height ?? ''}; mode=${presentation.mode}; errors=${result.errorCount})`)
+    }
     if (result.errorCount) throw firstError ?? new Error('The canvas reported a rendering error')
     if (validSize(result.size)) contentSize = result.size
     applySize()

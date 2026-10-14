@@ -14,7 +14,7 @@ let host: HTMLDivElement
 let frame: HTMLIFrameElement
 let config: CreateWidgetOptions
 let options: VisualizeRuntimeOptions
-let widget: Pick<WidgetHandle, 'ready' | 'iframe' | 'write' | 'end' | 'dispose' | 'setTheme' | 'setContext'>
+let widget: Pick<WidgetHandle, 'ready' | 'iframe' | 'write' | 'end' | 'inspect' | 'dispose' | 'setTheme' | 'setContext'>
 
 beforeEach(() => {
   vi.useFakeTimers()
@@ -27,6 +27,7 @@ beforeEach(() => {
   widget = {
     ready: Promise.resolve(), iframe: frame, write: vi.fn(),
     end: vi.fn(async (): Promise<EndResult> => ({ blank: false, errorCount: 0, size: { width: 640, height: 450 } })),
+    inspect: vi.fn(async () => ({ kind: 'html' as const, ended: true, code: options.html, blank: false, errors: [], console: [], size: { width: 640, height: 450 } })),
     dispose: vi.fn(() => frame.remove()), setTheme: vi.fn(), setContext: vi.fn(),
   }
   driver.create.mockImplementation((value: CreateWidgetOptions) => { config = value; host.append(frame); return widget })
@@ -198,6 +199,73 @@ describe('generative-frame host adapter', () => {
     })
     await expect(mountVisualize(host, options)).rejects.toThrow('missing renderChart')
     expect(widget.dispose).toHaveBeenCalledTimes(2)
+    expect(widget.inspect).not.toHaveBeenCalled()
+  })
+
+  function visibleHost() {
+    vi.spyOn(host, 'getBoundingClientRect').mockReturnValue({ width: 640, height: 120 } as DOMRect)
+    vi.spyOn(frame, 'getBoundingClientRect').mockReturnValue({ width: 640, height: 120 } as DOMRect)
+  }
+
+  it('re-measures an unlaid-out guest after host layout without rendering the code twice', async () => {
+    visibleHost()
+    vi.mocked(widget.end).mockResolvedValue({ blank: true, errorCount: 0, size: { width: 0, height: 0 } })
+    const mounting = mountVisualize(host, options)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(widget.inspect).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(16)
+    const runtime = await mounting
+    expect(widget.inspect).toHaveBeenCalledTimes(1)
+    expect(driver.create).toHaveBeenCalledTimes(1)
+    expect(widget.write).toHaveBeenCalledTimes(1)
+    expect(widget.end).toHaveBeenCalledTimes(1)
+    expect(frame.style.height).toBe('450px')
+    expect(config.initialState).toEqual({ value: 3 })
+    runtime.dispose()
+  })
+
+  it('still rejects content that remains blank after the one layout inspection', async () => {
+    visibleHost()
+    vi.mocked(widget.end).mockResolvedValue({ blank: true, errorCount: 0, size: { width: 0, height: 0 } })
+    vi.mocked(widget.inspect).mockResolvedValue({ kind: 'html', ended: true, code: '', blank: true, errors: [], console: [], size: { width: 640, height: 16 } })
+    const rejected = expect(mountVisualize(host, options)).rejects.toThrow('no visible content')
+    await vi.advanceTimersByTimeAsync(16)
+    await rejected
+    expect(widget.inspect).toHaveBeenCalledTimes(1)
+    expect(widget.dispose).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not re-inspect a laid-out blank document', async () => {
+    visibleHost()
+    vi.mocked(widget.end).mockResolvedValue({ blank: true, errorCount: 0, size: { width: 640, height: 16 } })
+    await expect(mountVisualize(host, options)).rejects.toThrow('no visible content')
+    expect(widget.inspect).not.toHaveBeenCalled()
+  })
+
+  it('cancels a pending layout barrier without inspecting a disposed guest', async () => {
+    visibleHost()
+    const controller = new AbortController()
+    vi.mocked(widget.end).mockResolvedValue({ blank: true, errorCount: 0, size: { width: 0, height: 0 } })
+    const rejected = expect(mountVisualize(host, { ...options, signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
+    await vi.advanceTimersByTimeAsync(0)
+    controller.abort()
+    await rejected
+    await vi.advanceTimersByTimeAsync(16)
+    expect(widget.inspect).not.toHaveBeenCalled()
+    expect(widget.dispose).toHaveBeenCalledTimes(1)
+  })
+
+  it('shares the original render deadline with layout and inspection', async () => {
+    visibleHost()
+    vi.mocked(widget.end).mockImplementation(() => new Promise(resolve => setTimeout(() => resolve({ blank: true, errorCount: 0, size: { width: 0, height: 0 } }), 14_000)))
+    vi.mocked(widget.inspect).mockImplementation(() => new Promise(() => {}))
+    const rejected = expect(mountVisualize(host, options)).rejects.toThrow('render timed out')
+    await vi.advanceTimersByTimeAsync(14_016)
+    expect(widget.inspect).toHaveBeenCalledTimes(1)
+    expect(widget.dispose).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(984)
+    await rejected
+    expect(widget.dispose).toHaveBeenCalledTimes(1)
   })
 
   it('bounds a render that never finishes and disposes its frame', async () => {
