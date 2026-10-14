@@ -38,12 +38,15 @@ function harness() {
     preview: vi.fn(async () => ({ resource, preview: { resource: resource.resource, launchUrl: '/original', mode: 'local-renderer' } })),
   }
   const openItem = vi.fn(() => true), legacy = vi.fn(() => true), pushToast = vi.fn()
+  const workspacePreviewOpening = { open: vi.fn() }
+  const catalog = { get: vi.fn<(key: string, id: string) => Promise<ArtifactPayload | null>>(async () => null) }
   const dependencies = {
     sessionKey, currentEpoch, attachmentWorkbenchPreviewEnabled, workbenchEnabled,
     sessionArtifacts: { value: [artifact] }, workbenchResourcesStore: services,
+    artifactWorkbench: { artifacts: catalog },
     workbenchStore: { openItem }, openLegacyArtifactWorkbench: legacy,
     artifactPreviewItemForExplicitOpen: (value: unknown) => value,
-    platform: { capabilities: {}, workbench: {} }, workspacePreviewOpening: { open: vi.fn() },
+    platform: { capabilities: {}, workbench: {} }, workspacePreviewOpening,
     artifactImageLightbox: { open: vi.fn() }, focusInlineDeliverable: vi.fn(() => true),
     artifactCategory, isInlineMediaArtifact, isOfficeArtifact, artifactWorkbenchPreviewKind, isOfficePreviewFormat,
     artifactPayloadFromRevision, createWorkbenchResourceRef, workbenchResourceKey,
@@ -56,11 +59,57 @@ function harness() {
     openArtifact(artifact: ArtifactPayload): boolean
     openDeliverableWorkbenchResource(artifact: ArtifactPayload): Promise<void>
   }
-  return { api, artifact, resource, current, revision, services, openItem, legacy, pushToast,
+  return { api, artifact, resource, current, revision, services, openItem, legacy, pushToast, workspacePreviewOpening, catalog,
     sessionKey, currentEpoch, attachmentWorkbenchPreviewEnabled, workbenchEnabled }
 }
 
 describe('chat Office card document opening', () => {
+  it('routes an older internal HTML artifact into the canonical opener before any metadata await', () => {
+    const h = harness()
+    const artifact: ArtifactPayload = {
+      id: h.artifact.id, kind: 'artifact_ref', name: '公司介绍.html', mime: 'text/html',
+      size: 23367, session_id: 'persisted-session-id', source: 'workspace-preview',
+      download_url: `/api/v1/artifacts/${h.artifact.id}`,
+    }
+    expect(h.api.openArtifact(artifact)).toBe(true)
+    // The helper owns metadata lookup and request ordering together. The
+    // persisted card has neither documentId nor the transient action session.
+    expect(h.workspacePreviewOpening.open).toHaveBeenCalledOnce()
+    expect(h.workspacePreviewOpening.open).toHaveBeenCalledWith({ artifactId: artifact.id }, 'session-a', undefined)
+    expect(h.catalog.get).not.toHaveBeenCalled()
+    expect(h.services.resolve).not.toHaveBeenCalled()
+    expect(h.services.openCurrent).not.toHaveBeenCalled()
+    expect(h.openItem).not.toHaveBeenCalled()
+    expect(h.legacy).not.toHaveBeenCalled()
+  })
+
+  it('uses an explicit document identity without metadata lookup or a legacy internal-artifact fallback', async () => {
+    const h = harness()
+    const artifact = { ...h.artifact, name: '公司介绍.html', mime: 'text/html', source: 'workspace-preview',
+      documentId: 'doc_current', previewPagePath: 'pages/company.html' }
+    await h.api.openDeliverableWorkbenchResource(artifact)
+    expect(h.catalog.get).not.toHaveBeenCalled()
+    expect(h.workspacePreviewOpening.open).toHaveBeenCalledWith('doc_current', 'session-a', 'pages/company.html')
+    expect(h.services.resolve).not.toHaveBeenCalled()
+    expect(h.services.openCurrent).not.toHaveBeenCalled()
+    expect(h.openItem).not.toHaveBeenCalled()
+    expect(h.legacy).not.toHaveBeenCalled()
+  })
+
+  it.each(['session-a', 'session-b'])('preserves the original workspace action session %s and child page', expectedSessionKey => {
+    const h = harness()
+    expect(h.api.openArtifact({
+      source: 'workspace-preview', documentId: 'doc_site', session_key: expectedSessionKey,
+      name: '公司介绍.html', mime: 'text/html', previewPagePath: 'pages/company.html',
+    })).toBe(true)
+    // A stale action must reach the existing helper with its original session,
+    // so that helper can reject it instead of opening in the current session.
+    expect(h.workspacePreviewOpening.open).toHaveBeenCalledWith('doc_site', expectedSessionKey, 'pages/company.html')
+    expect(h.services.resolve).not.toHaveBeenCalled()
+    expect(h.openItem).not.toHaveBeenCalled()
+    expect(h.legacy).not.toHaveBeenCalled()
+  })
+
   it.each(['docx', 'pptx', 'xlsx', 'html'])('opens %s through the canonical document and retains revision/hash', async extension => {
     const h = harness(), artifact = { ...h.artifact, name: `计划.${extension}` }
     expect(h.api.openArtifact(artifact)).toBe(true)

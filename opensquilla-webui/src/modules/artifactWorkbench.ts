@@ -94,6 +94,7 @@ export interface ArtifactDocumentChange {
 }
 
 export interface ArtifactCatalog {
+  get(sessionKey: string, artifactId: string, signal?: AbortSignal): Promise<ArtifactPayload | null>
   listSession(
     sessionKey: string,
     options?: { readonly limit?: number; readonly signal?: AbortSignal },

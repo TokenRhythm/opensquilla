@@ -5483,6 +5483,15 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
     return
   }
   try {
+    // Persisted workspace cards can reference an internal historical revision.
+    // Resolve its owning document instead of treating it as a public delivery.
+    if (artifact.source === 'workspace-preview') {
+      await workspacePreviewOpening.open(
+        documentId || { artifactId }, key,
+        typeof artifact.previewPagePath === 'string' ? artifact.previewPagePath : undefined,
+      )
+      return
+    }
     const ref = documentId
       ? createWorkbenchResourceRef('document', documentId)
       : createWorkbenchResourceRef('deliverable', artifactId)
@@ -5601,6 +5610,7 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
   sessionKey,
   currentEpoch,
   enabled: attachmentWorkbenchPreviewEnabled,
+  getArtifact: (key, artifactId) => artifactWorkbench.artifacts.get(key, artifactId),
   resolve: (key, resource) => workbenchResourcesStore.resolve(key, resource),
   openCurrent: (key, resource) => workbenchResourcesStore.openCurrent(key, resource),
   show: (current, key, previewPagePath) => {
@@ -5627,7 +5637,9 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
 })
 
 function openArtifact(artifact: ArtifactPayload): boolean {
-  if (artifact.source === 'workspace-preview') {
+  // Persisted artifacts also carry this provenance. Only id-less workspace
+  // actions already carry the document/session identity needed by this helper.
+  if (artifact.source === 'workspace-preview' && !artifact.id) {
     void workspacePreviewOpening.open(
       typeof artifact.documentId === 'string' ? artifact.documentId : '',
       artifact.session_key || '',

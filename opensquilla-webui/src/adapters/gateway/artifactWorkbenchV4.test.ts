@@ -53,6 +53,34 @@ function harness(responses: unknown[], supported = true) {
 }
 
 describe('ArtifactWorkbench v4 Adapter', () => {
+  it('reads scoped artifact metadata without dropping its canonical document identity', async () => {
+    const metadata = { ...artifact('old-revision'), source: 'workspace-preview', documentId: 'doc_current' }
+    const { workbench, request } = harness([{ artifact: metadata }])
+    const signal = new AbortController().signal
+    await expect(workbench.artifacts.get('session-a', metadata.id, signal)).resolves.toEqual(metadata)
+    expect(request).toHaveBeenCalledWith('artifacts.get', {
+      sessionKey: 'session-a', artifactId: metadata.id,
+    }, expect.objectContaining({ signal, timeoutAction: 'reject', abortAction: 'reject' }))
+  })
+
+  it.each([{}, { artifact: null }, { artifact: artifact('wrong-id') }])(
+    'rejects malformed or mismatched metadata: %j', async response => {
+      const { workbench } = harness([response])
+      await expect(workbench.artifacts.get('session-a', 'expected-id')).rejects.toThrow('identity contract')
+    },
+  )
+
+  it('preserves metadata failures and treats only method absence as compatibility', async () => {
+    const { workbench, request, markUnsupported } = harness([])
+    const unavailable = Object.assign(new Error('temporarily unavailable'), { code: 'UNAVAILABLE' })
+    request.mockRejectedValueOnce(unavailable)
+    await expect(workbench.artifacts.get('session-a', 'old-revision')).rejects.toBe(unavailable)
+    expect(markUnsupported).not.toHaveBeenCalled()
+    request.mockRejectedValueOnce(Object.assign(new Error('method not found'), { code: 'METHOD_NOT_FOUND' }))
+    await expect(workbench.artifacts.get('session-a', 'old-revision')).resolves.toBeNull()
+    expect(markUnsupported).toHaveBeenCalledWith('artifacts.get')
+  })
+
   it('binds preview loading to its private HTTP dependency', async () => {
     const { requestBinary, workbench } = harness([])
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:preview')

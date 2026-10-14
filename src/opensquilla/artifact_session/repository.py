@@ -1009,6 +1009,37 @@ class ArtifactSessionRepository:
         async with self._read_transaction("get_document") as conn:
             return await self._get_document_on_conn(conn, document_id)
 
+    async def get_document_for_artifact(
+        self,
+        *,
+        session_key: str,
+        session_id: str,
+        artifact_id: str,
+    ) -> Document | None:
+        """Find a revision's unique document without adopting or changing it."""
+
+        async with self._read_transaction("get_document_for_artifact") as conn:
+            rows = await _fetchall(
+                conn,
+                """
+                SELECT DISTINCT document.document_id
+                FROM artifact_documents AS document
+                JOIN artifact_revisions AS revision
+                  ON revision.document_id = document.document_id
+                WHERE document.session_key = ?
+                  AND document.session_id = ?
+                  AND revision.artifact_id = ?
+                ORDER BY document.document_id
+                LIMIT 2
+                """,
+                (session_key, session_id, artifact_id),
+            )
+            if len(rows) > 1:
+                raise ArtifactConflictError("artifact is already adopted by multiple documents")
+            if not rows:
+                return None
+            return await self._get_document_on_conn(conn, str(rows[0]["document_id"]))
+
     async def get_document_head(
         self,
         document_id: str,

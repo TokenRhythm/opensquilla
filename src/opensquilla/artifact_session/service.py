@@ -191,6 +191,19 @@ class ArtifactSessionService:
     async def get_document(self, document_id: str) -> Document:
         return await self.repository.get_document(_required(document_id, "document_id"))
 
+    async def get_document_for_artifact(
+        self,
+        *,
+        session_key: str,
+        session_id: str,
+        artifact_id: str,
+    ) -> Document | None:
+        return await self.repository.get_document_for_artifact(
+            session_key=_required(session_key, "session_key"),
+            session_id=_required(session_id, "session_id"),
+            artifact_id=_required(artifact_id, "artifact_id"),
+        )
+
     async def get_document_head(
         self,
         document_id: str,

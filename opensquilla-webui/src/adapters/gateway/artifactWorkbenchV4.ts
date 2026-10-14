@@ -13,6 +13,8 @@ import {
   ARTIFACTS_LIST_METHOD,
 } from '@/contracts/generated/v4/artifactsList'
 import { validateArtifactsListResult } from '@/contracts/generated/v4/artifactsListValidators.mjs'
+import { ARTIFACTS_GET_METHOD, type Result as ArtifactGetResult } from '@/contracts/generated/v4/artifactsGet'
+import { validateResult as validateArtifactGetResult } from '@/contracts/generated/v4/artifactsGetValidators.mjs'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { createV4ArtifactDocuments } from './artifactDocumentsV4'
 import { createV4WorkbenchResources } from './workbenchResourcesV4'
@@ -107,6 +109,25 @@ function catalogError(
 
 function createV4ArtifactCatalog(rpc: RpcTransport): ArtifactCatalog {
   return {
+    async get(sessionKey, artifactId, signal) {
+      await rpc.ready({ signal, timeoutMs: 10_000, timeoutAction: 'reject', abortAction: 'reject' })
+      if (!rpc.supports(ARTIFACTS_GET_METHOD)) return null
+      try {
+        const response = await rpc.request<ArtifactGetResult>(
+          ARTIFACTS_GET_METHOD,
+          { sessionKey, artifactId },
+          { signal, timeoutMs: 10_000, timeoutAction: 'reject', abortAction: 'reject' },
+        )
+        if (!validateArtifactGetResult(response) || response.artifact.id !== artifactId) {
+          throw new Error('Artifact metadata response violated its v4 identity contract')
+        }
+        return response.artifact as ArtifactPayload
+      } catch (error) {
+        if (!methodNotFound(error)) throw error
+        rpc.markUnsupported(ARTIFACTS_GET_METHOD)
+        return null
+      }
+    },
     async listSession(sessionKey, options = {}) {
       try {
         await rpc.ready({
