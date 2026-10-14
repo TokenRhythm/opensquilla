@@ -12,7 +12,7 @@ provenance:
 metadata:
   opensquilla:
     requires_tools:
-      - open_workspace_preview
+      - show_widget
 ---
 
 # Interactive visuals in conversation
@@ -56,10 +56,13 @@ and the three optional examples below are OpenSquilla content.
 
 ## Fit the conversation
 
-Default to a compact HTML fragment with its own styles and scripts, saved as a
-UTF-8 `.html` file. Full HTML documents remain supported for existing canvases
-or tasks that need them. The host supplies the isolated frame and its controls;
-fragments do not need `html`, `head`, `body`, or a second page shell.
+Default to a compact HTML fragment with its own styles and scripts and call
+`show_widget(title="short_title", widget_code="...")` to place it directly in
+the conversation. Full HTML documents and workspace files remain supported for
+existing canvases or tasks that need them. The host supplies the isolated frame
+and its controls; fragments do not need `html`, `head`, `body`, or a second page
+shell. Use `open_workspace_preview` only when the user asks for an editable
+source file, a downloadable webpage, a multi-file bundle, or a workbench page.
 
 Let the surrounding answer introduce and explain the visual. Use a small local
 title only when it helps. Avoid repeating the answer's title inside a large hero,
@@ -85,16 +88,24 @@ catalog or required templates. Read only the relevant example via `skill_view`:
 
 ## Publish the exact result
 
-Create the self-contained file in the current workspace, then call
-`open_workspace_preview(path="relative/path.html", presentation="inline")`.
-After a successful `inline-ready` result, place its exact `marker` in a standalone
-inline-code paragraph between the relevant explanatory paragraphs. For example:
+For a pure in-chat visual, call `show_widget` with the exact HTML fragment or
+standalone SVG. It returns an immutable Visualize Artifact receipt. Place its
+exact `marker` in a standalone inline-code paragraph between the relevant
+explanatory paragraphs. For example:
 
 `visualize:doc_example:rev_example`
 
 Use only the marker returned by the tool; do not invent IDs. The tool does not
 finish the response. Continue explaining what the user can try and what it means.
-An update must call the tool again to capture a new immutable version.
+An update should call `show_widget` again with the complete updated widget; the
+first adapter stores a new immutable receipt for each call. Do not assume that
+reusing a title edits an existing Artifact yet.
+
+When a file or bundle is required, create the self-contained file in the current
+workspace, then call
+`open_workspace_preview(path="relative/path.html", presentation="inline")`.
+Use the exact marker from that result as above. This path remains the supported
+one for source delivery and multi-file resources.
 When creating several examples, give each a separate file and include each final
 marker beside its explanation. Do not overwrite all examples into one file.
 

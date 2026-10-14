@@ -89,7 +89,7 @@ Style everything with these CSS variables. The host keeps them in sync with its 
 
 ## Editing and errors
 
-- To change an existing visual, edit its source file and call `open_workspace_preview(path=..., presentation="inline")` again. Use the exact new marker for the new immutable revision; registration alone does not verify rendering or interaction.
+- To change a direct in-chat visual, call `show_widget` again with the complete updated fragment and use the exact new marker from its receipt. For a file-backed visual, edit its source file and call `open_workspace_preview(path=..., presentation="inline")` again. Registration alone does not verify rendering or interaction.
 - When a render reports errors, fix their cause rather than wrapping code in `try`/`catch`.
 
 ## Platform: desktop

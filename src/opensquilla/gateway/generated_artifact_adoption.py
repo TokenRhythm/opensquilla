@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -30,6 +31,9 @@ from opensquilla.tools.types import ToolContext, current_tool_context
 
 ArtifactStateEmitter = Callable[[dict[str, Any]], Awaitable[None]]
 log = logging.getLogger(__name__)
+
+_VISUALIZE_WIDGET_MAX_BYTES = 1024 * 1024
+_VISUALIZE_WIDGET_TITLE_MAX_CHARS = 128
 
 
 @dataclass(slots=True)
@@ -59,6 +63,107 @@ class GeneratedArtifactAdopter:
                 (self.session_key, self.session_id),
             )
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def publish_widget(
+        self,
+        context: ToolContext,
+        *,
+        title: str,
+        widget_code: str,
+        loading_messages: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Persist a ``generative-frame`` widget as an inline Visualize receipt.
+
+        ``show_widget`` is a model-facing convenience API.  The browser still
+        consumes an immutable Artifact document so reconnects, session changes,
+        and remote clients do not depend on an in-memory tool registry or a
+        browser-side streamed tool call.
+
+        The first adapter intentionally publishes one new Document per call.
+        Same-title replacement and ``edit_widget`` need a durable title index
+        and compare-and-swap revision protocol, so they remain a follow-up.
+        """
+        if (
+            not isinstance(context, ToolContext)
+            or current_tool_context.get() is not context
+            or not context.is_owner
+            or context.guest_safe
+            or context.session_key != self.session_key
+            or context.session_id != self.session_id
+        ):
+            raise ValueError("show_widget context no longer matches the admitted session")
+
+        normalized_title = " ".join(title.split()) if isinstance(title, str) else ""
+        if not normalized_title:
+            raise ValueError("show_widget title must be a nonempty short label")
+        if len(normalized_title) > _VISUALIZE_WIDGET_TITLE_MAX_CHARS:
+            raise ValueError("show_widget title exceeds the 128 character limit")
+        if not isinstance(widget_code, str) or not widget_code.strip():
+            raise ValueError("show_widget widget_code must be a nonempty HTML fragment or SVG")
+        payload = widget_code.encode("utf-8")
+        if len(payload) > _VISUALIZE_WIDGET_MAX_BYTES:
+            raise ValueError("show_widget widget_code exceeds the 1 MiB limit")
+
+        from opensquilla.gateway.visualize_html import validate_visualize_html
+
+        # This catches truncation, NULs, Markdown fences and malformed raw text
+        # before an immutable revision is created.  It deliberately does not
+        # claim that browser scripts/layout or semantic calculations succeeded.
+        await asyncio.to_thread(validate_visualize_html, payload)
+
+        # Artifact names are transport metadata, not the model-facing title.
+        # Keep a readable slug while hashing the original label to avoid
+        # collisions for non-ASCII or punctuation-only titles.
+        slug = re.sub(r"[^A-Za-z0-9_-]+", "-", normalized_title).strip("-_")
+        slug = (slug or "widget")[:64]
+        title_hash = hashlib.sha256(normalized_title.encode("utf-8")).hexdigest()[:8]
+        name = f"{slug}-{title_hash}.html"
+        ref = await asyncio.to_thread(
+            self.store.publish_bytes,
+            payload,
+            session_id=self.session_id,
+            session_key=self.session_key,
+            name=name,
+            mime="text/html",
+            source="show-widget",
+            visibility="internal",
+        )
+        commit = await self.service.create_document(
+            session_key=self.session_key,
+            session_id=self.session_id,
+            name=name,
+            kind=ArtifactKind.HTML,
+            initial_artifact=ArtifactBlobRef(
+                artifact_id=ref.id,
+                sha256=ref.sha256,
+                filename=ref.name,
+                media_type=ref.mime,
+                byte_size=ref.size,
+            ),
+            actor=Actor(kind=ActorKind.SYSTEM, actor_id="visualize"),
+            validate_session=self.validate_session,
+        )
+        document_id = commit.document.document_id
+        revision_id = commit.revision.revision_id
+        result: dict[str, Any] = {
+            "ok": True,
+            "title": normalized_title,
+            "previewStatus": "inline-ready",
+            "presentation": "inline",
+            "documentId": document_id,
+            "revisionId": revision_id,
+            "artifactId": ref.id,
+            "name": ref.name,
+            "mime": ref.mime,
+            "sha256": ref.sha256,
+            "size": ref.size,
+            "marker": f"visualize:{document_id}:{revision_id}",
+            "renderStatus": "not-observed",
+            "version": 1,
+        }
+        if loading_messages is not None:
+            result["loadingMessages"] = list(loading_messages)
+        return result
 
     async def open_workspace_preview(
         self, context: ToolContext, *, path: str, bundle: str | None = None,
