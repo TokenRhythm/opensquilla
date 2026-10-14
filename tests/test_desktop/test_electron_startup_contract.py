@@ -869,11 +869,11 @@ def test_boot_and_native_window_backgrounds_match_control_ui_theme_tokens() -> N
     light_tokens = _read("opensquilla-webui/src/themes/light/tokens.css")
     dark_tokens = _read("opensquilla-webui/src/themes/dark/tokens.css")
 
-    assert "--bg: #F7F7F8;" in light_tokens
+    assert "--bg: #FAFAFA;" in light_tokens
     assert "--bg: #18181A;" in dark_tokens
-    assert "--bg: #F7F7F8;" in boot_html
+    assert "--bg: #FAFAFA;" in boot_html
     assert "--bg: #18181A;" in boot_html
-    assert "const DESKTOP_LIGHT_BACKGROUND_COLOR = '#F7F7F8'" in main_ts
+    assert "const DESKTOP_LIGHT_BACKGROUND_COLOR = '#FAFAFA'" in main_ts
     assert "const DESKTOP_DARK_BACKGROUND_COLOR = '#18181A'" in main_ts
     assert main_ts.count("backgroundColor: desktopWindowBackgroundColor()") == 1
     assert "const backgroundColor = desktopWindowBackgroundColor()" in main_ts
@@ -2197,11 +2197,11 @@ def test_desktop_mock_update_flow_is_nonblocking_until_renderer_downloads() -> N
     mock_flow = _section(
         main_ts,
         "async function runMockUpdateFlow",
-        "async function downloadDesktopUpdate",
+        "function downloadDesktopUpdate",
     )
     mock_download = _section(
         main_ts,
-        "async function downloadDesktopUpdate",
+        "function downloadDesktopUpdate",
         "function initAutoUpdater",
     )
     apply_update = _section(
@@ -2240,7 +2240,7 @@ def test_desktop_update_actions_are_guarded_against_reentry() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     download_update = _section(
         main_ts,
-        "async function downloadDesktopUpdate",
+        "function downloadDesktopUpdate",
         "function initAutoUpdater",
     )
     check_update = _section(
@@ -2259,6 +2259,10 @@ def test_desktop_update_actions_are_guarded_against_reentry() -> None:
         "// Lets the gateway-served Control UI",
     )
 
+    assert "if (desktopUpdateDownloadTask)" in download_update
+    assert "return desktopUpdateDownloadTask" in download_update
+    assert "Promise.resolve().then(() => runDesktopUpdateDownload(origin))" in download_update
+    assert "desktopUpdateDownloadTask = task" in download_update
     assert "updateDownloadInProgress" in download_update
     assert "manualInstallerActionInProgress" in download_update
     assert "updateApplying" in download_update
@@ -2361,16 +2365,19 @@ def test_silent_startup_update_error_is_not_published_as_visible_error() -> None
         "async function runMockUpdateFlow",
     )
 
-    assert (
-        "const shouldNotify = desktopUpdateCheckScheduler.consumeManualRequest() || "
-        "updateDownloadInProgress"
-    ) in show_error
-    assert "if (!shouldNotify)" in show_error
+    # Automatic discovery failures restore the quiet state. Download failures
+    # retain diagnostics, and joining a background flight can promote it to user intent.
+    assert "const wasDownload = desktopUpdateDownloadOrigin !== null" in show_error
+    assert "const shouldNotify = desktopUpdateCheckScheduler.consumeManualRequest()" in show_error
+    assert "|| desktopUpdateDownloadOrigin === 'user'" in show_error
+    assert "if (!shouldNotify && !wasDownload)" in show_error
     assert "desktopUpdateCandidate = silentFallback.candidate" in show_error
     assert "status: silentFallback.state.status" in show_error
     assert "status: downloadedUpdateVersion ? 'downloaded' : 'idle'" in show_error
     assert "error: null" in show_error
-    assert show_error.index("if (!shouldNotify)") < show_error.index("status: 'error'")
+    assert show_error.index("if (!shouldNotify && !wasDownload)") < show_error.index(
+        "status: 'error'",
+    )
 
 
 def test_apply_downloaded_update_waits_for_actual_gateway_exit_before_install() -> None:

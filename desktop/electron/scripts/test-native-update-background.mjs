@@ -75,7 +75,10 @@ function fixture(options = {}) {
     desktopUpdateDownloadTask: null, desktopUpdateDownloadOrigin: null,
     updateApplying: false, updateDownloadInProgress: false, manualInstallerActionInProgress: false,
     isQuitting: false, desktopWriters: { closed: false }, mockDownloadedUpdate: false,
-    resolveDesktopUpdate: async () => ({ candidate, source: 'oss', fallbackUsed: false }),
+    resolveDesktopUpdate: async () => {
+      if (options.discoveryError) throw new UpdateChannelError('source_unreachable', 'synthetic discovery offline')
+      return { candidate, source: 'oss', fallbackUsed: false }
+    },
     configureDesktopUpdateFeed: resolved => calls.feeds.push(resolved.source),
     probeDesktopUpdateSource: async () => {}, rememberSuccessfulUpdateSource: () => {},
     desktopReliabilityTelemetry: { recordUpdateResult: event => calls.telemetry.push(event) },
@@ -135,6 +138,7 @@ await check('native 100 percent progress does not imply readiness before verifie
   assert.equal(f.state().status, 'downloading')
   const task = f.context.desktopUpdateDownloadTask
   assert.equal(f.subject.downloadDesktopUpdate(), task)
+  assert.equal(f.context.desktopUpdateDownloadOrigin, 'user')
   release()
   await task
   assert.equal(f.state().status, 'downloaded')
@@ -146,6 +150,8 @@ await check('background download failure retains diagnostics and clears its flig
   await f.subject.checkForUpdates(false)
   await f.context.desktopUpdateDownloadTask
   assert.equal(f.state().status, 'error')
+  assert.equal(typeof f.state().error, 'string')
+  assert.notEqual(f.state().errorCode, null)
   assert.equal(f.context.desktopUpdateDownloadTask, null)
   assert.equal(f.context.desktopUpdateDownloadOrigin, null)
   assert.equal(f.calls.installs, 0)
@@ -153,5 +159,16 @@ await check('background download failure retains diagnostics and clears its flig
   await f.subject.checkForUpdates(false)
   await f.context.desktopUpdateDownloadTask
   assert.equal(f.state().status, 'downloaded')
+})
+await check('automatic discovery errors stay silent while user checks publish diagnostics', async () => {
+  for (const manual of [false, true]) {
+    const f = fixture({ discoveryError: true })
+    await f.subject.checkForUpdates(manual)
+    assert.equal(f.state().status, manual ? 'error' : 'idle')
+    assert.equal(f.state().errorCode, manual ? 'source_unreachable' : null)
+    assert.equal(f.calls.states.some(state => state.status === 'error'), manual)
+    assert.equal(f.calls.downloads, 0)
+    assert.equal(f.calls.installs, 0)
+  }
 })
 console.log(`Native background update checks passed: ${passed} (production functions; controlled updater boundary, no installation).`)
