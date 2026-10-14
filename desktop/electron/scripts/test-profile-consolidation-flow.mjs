@@ -69,6 +69,13 @@ async function pathExists(path) {
   }
 }
 
+async function prepareIsolatedHome(isolatedHome) {
+  await Promise.all([
+    mkdir(join(isolatedHome, 'AppData', 'Roaming'), { recursive: true }),
+    mkdir(join(isolatedHome, 'AppData', 'Local', 'Temp'), { recursive: true }),
+  ])
+}
+
 function launchEnvironment(isolatedHome, sourceEnvironment = process.env) {
   const inherited = { ...sourceEnvironment }
   for (const name of Object.keys(inherited)) {
@@ -87,6 +94,10 @@ function launchEnvironment(isolatedHome, sourceEnvironment = process.env) {
     ...inherited,
     HOME: isolatedHome,
     USERPROFILE: isolatedHome,
+    APPDATA: join(isolatedHome, 'AppData', 'Roaming'),
+    LOCALAPPDATA: join(isolatedHome, 'AppData', 'Local'),
+    TEMP: join(isolatedHome, 'AppData', 'Local', 'Temp'),
+    TMP: join(isolatedHome, 'AppData', 'Local', 'Temp'),
     OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
     OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
     OPENSQUILLA_USER_STATE_DIR: join(isolatedHome, 'user-state'),
@@ -370,7 +381,7 @@ async function closeActiveApp(phase, { failOnError = true } = {}) {
 
 try {
   await mkdir(userData, { recursive: true })
-  await mkdir(isolatedHome, { recursive: true })
+  await prepareIsolatedHome(isolatedHome)
   await createLegacyRecovery({
     userData,
     recoveryId: olderRecoveryId,
@@ -618,7 +629,7 @@ try {
   const configOnlyHome = join(root, 'config-only-home')
   const configOnlyPrimaryHome = join(configOnlyUserData, 'opensquilla')
   await mkdir(configOnlyUserData, { recursive: true })
-  await mkdir(configOnlyHome, { recursive: true })
+  await prepareIsolatedHome(configOnlyHome)
   await createLegacyRecovery({
     userData: configOnlyUserData,
     recoveryId: configOnlyRecoveryId,
@@ -672,7 +683,7 @@ try {
     'desktop-credential.json',
   )
   await mkdir(credentialOnlyUserData, { recursive: true })
-  await mkdir(credentialOnlyHome, { recursive: true })
+  await prepareIsolatedHome(credentialOnlyHome)
   await createLegacyRecovery({
     userData: credentialOnlyUserData,
     recoveryId: credentialOnlyRecoveryId,
@@ -737,7 +748,7 @@ try {
   const invalidHome = join(root, 'invalid-credential-home')
   const invalidPrimaryHome = join(invalidUserData, 'opensquilla')
   await mkdir(invalidUserData, { recursive: true })
-  await mkdir(invalidHome, { recursive: true })
+  await prepareIsolatedHome(invalidHome)
   await createLegacyRecovery({
     userData: invalidUserData,
     recoveryId: invalidCredentialRecoveryId,

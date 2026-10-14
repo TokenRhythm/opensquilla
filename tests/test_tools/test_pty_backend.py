@@ -10,6 +10,8 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
+import traceback
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -61,9 +63,24 @@ async def test_windows_pty_reads_ready_bytes_without_executor_capacity(monkeypat
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["kill", "timeout", "eof"])
 @pytest.mark.parametrize("detached", [False, True])
-async def test_real_pty_cleans_descendant_tree(action, detached, tmp_path) -> None:
+async def test_real_pty_cleans_descendant_tree(
+    action, detached, tmp_path, monkeypatch, request,
+) -> None:
     from opensquilla.process_tree import _strict_process_start_identity
 
+    launch_errors: list[str] = []
+    original_spawn = shell.spawn_pty
+
+    def observe_spawn(*args, **kwargs):
+        try:
+            return original_spawn(*args, **kwargs)
+        except Exception as exc:
+            # The tool envelope intentionally flattens launch failures. Retain
+            # their causal chain here so native CI failures remain diagnosable.
+            launch_errors.append("".join(traceback.format_exception(exc)))
+            raise
+
+    monkeypatch.setattr(shell, "spawn_pty", observe_spawn)
     child_pid = tmp_path / "child.pid"
     child = tmp_path / "child.py"
     child.write_text(
@@ -85,6 +102,24 @@ async def test_real_pty_cleans_descendant_tree(action, detached, tmp_path) -> No
     )
     argv = [sys.executable, str(parent)]
     command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    timeout_ready = asyncio.Event()
+    timed_waits = []
+    if action == "timeout":
+        original_wait = shell._wait_bg_process
+
+        async def wait_after_child_observed(owned_session, timeout):
+            if (
+                owned_session.session_key == "test:pty-tree"
+                and owned_session.task_id == "pty-timeout"
+                and timeout == 3
+            ):
+                timed_waits.append(owned_session)
+                # Start the real timeout after the fixture holds proof of the
+                # descendant, rather than racing its PID/TTY publication.
+                await timeout_ready.wait()
+            return await original_wait(owned_session, timeout)
+
+        monkeypatch.setattr(shell, "_wait_bg_process", wait_after_child_observed)
     token = current_tool_context.set(ToolContext(
         is_owner=True, caller_kind=CallerKind.CLI, session_key="test:pty-tree",
         task_id=f"pty-{action}",
@@ -100,6 +135,10 @@ async def test_real_pty_cleans_descendant_tree(action, detached, tmp_path) -> No
             runtime=None, io_mode="pty",
         )
         execution_id = shell._session_id_from_start_result(result)
+        if not execution_id and launch_errors:
+            request.node.add_report_section(
+                "call", "native PTY launch exception chain", "\n".join(launch_errors),
+            )
         assert execution_id, result
         session = shell._bg_sessions[execution_id]
         assert session.io_mode_used == "pty", result
@@ -125,9 +164,13 @@ async def test_real_pty_cleans_descendant_tree(action, detached, tmp_path) -> No
             kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
             child_handle = kernel32.OpenProcess(0x00100000, False, child_process)
             assert child_handle
+        timeout_ready.set()
         if action != "timeout":
             await shell.process(action, execution_id=execution_id)
         await asyncio.wait_for(asyncio.shield(session.collector_task), timeout=10)
+        if action == "timeout":
+            assert timed_waits == [session]
+            assert session.timed_out
         assert "TTY=True" in shell._bg_rendered_output(session)
         assert session.process_tree is not None and session.process_tree.durable
         assert not session.process_tree.is_active()
@@ -144,21 +187,53 @@ async def test_real_pty_cleans_descendant_tree(action, detached, tmp_path) -> No
         else:
             assert _strict_process_start_identity(child_process) != child_identity
     finally:
+        failure = sys.exception()
+        cleanup_failure = None
+
+        def retain_cleanup_failure(stage, exc):
+            nonlocal cleanup_failure
+            primary = failure if failure is not None else cleanup_failure
+            if primary is None:
+                cleanup_failure = exc
+            else:
+                primary.add_note(f"PTY fixture {stage} also failed: {type(exc).__name__}: {exc}")
+
+        # A failed readiness assertion must not leave the collector waiting
+        # on a fixture barrier while its owned process tree is cleaned up.
+        timeout_ready.set()
         if session is not None:
-            await shell._terminate_bg_session(session)
-            if session.collector_task is not None:
-                await asyncio.wait_for(asyncio.shield(session.collector_task), timeout=5)
-            shell._bg_sessions.pop(session.session_id, None)
-        if (
-            child_process is not None
-            and _strict_process_start_identity(child_process) == child_identity
-        ):
-            import signal
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(child_process, signal.SIGTERM)
-        if kernel32 is not None and child_handle is not None:
-            kernel32.CloseHandle(child_handle)
+            try:
+                await shell._terminate_bg_session(session)
+            except BaseException as exc:
+                retain_cleanup_failure("termination", exc)
+            try:
+                if session.collector_task is not None:
+                    await asyncio.wait_for(asyncio.shield(session.collector_task), timeout=5)
+                assert session.done, "PTY fixture collector did not finalize its session"
+                assert session.process_tree is None or not session.process_tree.is_active(), (
+                    "PTY fixture still owns a live process tree"
+                )
+                shell._bg_sessions.pop(session.session_id, None)
+            except BaseException as exc:
+                retain_cleanup_failure("collector drain", exc)
+        try:
+            if (
+                child_process is not None and child_identity is not None
+                and _strict_process_start_identity(child_process) == child_identity
+            ):
+                import signal
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(child_process, signal.SIGTERM)
+        except BaseException as exc:
+            retain_cleanup_failure("descendant cleanup", exc)
+        try:
+            if kernel32 is not None and child_handle is not None:
+                kernel32.CloseHandle(child_handle)
+        except BaseException as exc:
+            retain_cleanup_failure("handle close", exc)
         current_tool_context.reset(token)
+        if failure is None and cleanup_failure is not None:
+            raise cleanup_failure
 
 
 class _RawPty:
@@ -189,6 +264,142 @@ class _RawPty:
 
     def wait(self) -> int:
         return 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_stage", "close_fails", "finalize_fails", "tree_active"),
+    [
+        (None, False, False, False),
+        (None, True, False, False),
+        ("drain", True, False, False),
+        ("process", True, False, False),
+        ("cancel", True, False, False),
+        (None, True, True, False),
+        (None, False, True, False),
+        (None, True, False, True),
+    ],
+    ids=["normal", "close", "drain-close", "process-close", "cancel-close", "close-finalize",
+         "finalize", "close-with-owned-descendants"],
+)
+async def test_pty_collector_finalizes_after_reader_close_failure(
+    monkeypatch, failure_stage, close_fails, finalize_fails, tree_active,
+) -> None:
+    reader = SimpleNamespace(
+        ident=1, join=Mock(), is_alive=Mock(return_value=close_fails),
+    )
+    raw = SimpleNamespace(
+        returncode=0, _reader_stop=threading.Event(), _thread=reader,
+        fileobj=SimpleNamespace(shutdown=Mock(), close=Mock()),
+        _server=SimpleNamespace(shutdown=Mock(), close=Mock()),
+    )
+    handle = pty_backend.PtyHandle(raw, "windows")
+    owner = SimpleNamespace(
+        is_active=Mock(return_value=tree_active), start_completion_monitor=Mock(),
+    )
+    capture = shell.BoundedOutputCapture()
+    finish = AsyncMock(wraps=capture.finish_async)
+    release = Mock(wraps=capture.release_preview)
+    monkeypatch.setattr(capture, "finish_async", finish)
+    monkeypatch.setattr(capture, "release_preview", release)
+    monkeypatch.setattr(shell.BoundedOutputCapture, "create", AsyncMock(return_value=capture))
+    monkeypatch.setattr(shell, "spawn_pty", Mock(return_value=handle))
+    monkeypatch.setattr(shell, "capture_process_tree_owner", lambda *args, **kwargs: owner)
+    monkeypatch.setattr(shell, "_prepare_shell_runtime", AsyncMock(return_value={}))
+    monkeypatch.setattr(shell, "_append_windows_app_alias_path", lambda *args, **kwargs: None)
+    monkeypatch.setattr(shell, "_runtime_unavailable_envelope", lambda *args, **kwargs: None)
+    primary = (
+        asyncio.CancelledError("synthetic caller cancellation") if failure_stage == "cancel"
+        else RuntimeError(f"synthetic {failure_stage} failure") if failure_stage else None
+    )
+    monkeypatch.setattr(shell, "_wait_bg_process", AsyncMock(
+        return_value=True, side_effect=primary if failure_stage in {"process", "cancel"} else None,
+    ))
+    terminate = AsyncMock()
+    monkeypatch.setattr(shell, "terminate_pty", terminate)
+
+    async def drain(*args):
+        capture.feed(b"retained PTY tail")
+        if failure_stage == "drain":
+            raise primary
+
+    monkeypatch.setattr(shell, "_read_bg_output", drain)
+    finalize_error = OSError("synthetic finalization failure")
+    real_finalize = shell._finalize_bg_session_async
+
+    async def finalize(session):
+        await real_finalize(session)
+        if finalize_fails:
+            raise finalize_error
+
+    monkeypatch.setattr(shell, "_finalize_bg_session_async", finalize)
+    session = None
+    token = current_tool_context.set(None)
+    try:
+        result = await shell._start_host_background_process(
+            "synthetic-no-native-launch", cwd=None, effective_timeout=1,
+            runtime=None, env={}, io_mode="pty", notify_on_exit=True,
+        )
+        session = shell._bg_sessions[shell._session_id_from_start_result(result)]
+        sync_cleanup = Mock()
+        async_cleanup = AsyncMock()
+        completion = Mock()
+        session.cleanup_callbacks.append(sync_cleanup)
+        session.async_cleanup_callbacks.append(async_cleanup)
+        session.runtime_event_callback = completion
+        if primary is not None or close_fails or finalize_fails:
+            expected_type = type(primary) if primary is not None else (
+                pty_backend.PtyBackendError if close_fails else OSError
+            )
+            with pytest.raises(expected_type) as failure:
+                async with asyncio.timeout(2):
+                    await session.collector_task
+            if primary is not None:
+                assert failure.value is primary
+            elif close_fails:
+                assert str(failure.value) == "PTY reader did not stop"
+                assert failure.value.handle is handle
+            else:
+                assert failure.value is finalize_error
+            notes = "\n".join(getattr(failure.value, "__notes__", ()))
+            if primary is not None and close_fails:
+                assert (
+                    "PTY reader close also failed: PtyBackendError: PTY reader did not stop"
+                ) in notes
+            if close_fails and finalize_fails:
+                assert (
+                    "session finalization also failed: OSError: synthetic finalization failure"
+                ) in notes
+        else:
+            await asyncio.wait_for(asyncio.shield(session.collector_task), timeout=2)
+
+        # No subsequent process(wait/kill) repairs the session before these checks.
+        assert session.done and shell._session_result_ready(session)
+        assert session.returncode == 0 and session.ended_at is not None
+        assert capture.finished
+        assert "retained PTY tail" in capture.preview()
+        finish.assert_awaited_once()
+        release.assert_called_once()
+        sync_cleanup.assert_called_once()
+        async_cleanup.assert_awaited_once()
+        completion.assert_called_once()
+        assert completion.call_args.args[0]["name"] == "process.completed"
+        assert session.process_tree is owner
+        assert owner.is_active() is tree_active
+        assert raw._reader_stop.is_set()
+        reader.join.assert_called_once_with(timeout=1)
+        raw.fileobj.close.assert_called_once()
+        raw._server.close.assert_called_once()
+        if failure_stage not in {"process", "cancel"}:
+            terminate.assert_awaited_once_with(handle, close_reader=False)
+    finally:
+        if session is not None:
+            if not session.collector_task.done():
+                session.collector_task.cancel()
+            with contextlib.suppress(BaseException):
+                await session.collector_task
+            shell._bg_sessions.pop(session.session_id, None)
+        current_tool_context.reset(token)
 
 
 @pytest.mark.platform_pty

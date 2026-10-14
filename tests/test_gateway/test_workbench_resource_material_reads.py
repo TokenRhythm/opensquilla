@@ -8,6 +8,7 @@ import pytest
 
 import opensquilla.gateway.rpc_artifact_editing as editing
 import opensquilla.gateway.workbench_resource_runtime as runtime
+import tests.test_gateway.test_rpc_workbench_resources as resource_tests
 from opensquilla.artifact_session import (
     Actor,
     ActorKind,
@@ -17,7 +18,6 @@ from opensquilla.artifact_session import (
 )
 from opensquilla.artifacts import ArtifactStore
 from opensquilla.office_format import OFFICE_MIMES
-from tests.test_gateway import test_rpc_workbench_resources as resource_tests
 from tests.test_office_format import office_package
 
 SESSION_KEY = resource_tests.SESSION_KEY

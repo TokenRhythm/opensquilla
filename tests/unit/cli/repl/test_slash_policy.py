@@ -94,6 +94,7 @@ def test_destructive_set_matches_plan_lock() -> None:
         "/exit",
         "/quit",
         "/exit  ",
+        " /exit ",
     ],
 )
 def test_classify_exit(command: str) -> None:

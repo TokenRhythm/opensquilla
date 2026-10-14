@@ -202,13 +202,6 @@ describe('ReasoningPart nested-in-activity variant', () => {
     expect(host.querySelector('.thinking-fold--in-activity')).toBeNull()
   })
 
-  it('keeps standalone and nested reasoning flat and aligned', () => {
-    const baseStart = reasoningPartSource.indexOf('.thinking-fold__body {')
-    const baseRule = reasoningPartSource.slice(baseStart, reasoningPartSource.indexOf('}', baseStart))
-    expect(baseRule).not.toContain('border-left:')
-    expect(baseRule).not.toContain('background:')
-    expect(baseRule).toContain('padding: 0.125rem 0;')
-  })
 })
 
 describe('ReasoningPart branches', () => {

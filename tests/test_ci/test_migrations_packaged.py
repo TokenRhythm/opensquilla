@@ -12,15 +12,39 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import tomllib
 import zipfile
+from email.parser import BytesParser
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
 
 from scripts.verify_webui_artifact import MANIFEST_NAME
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SYNTHETIC_JS = b"window.__opensquillaPackagingProbe = true;\n"
+
+
+def _run_install_probe(
+    command: list[str], *, timeout: float, env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    if timeout <= 0:
+        raise subprocess.TimeoutExpired(command, timeout=0)
+    try:
+        return subprocess.run(
+            command, cwd=REPO_ROOT, check=True, capture_output=True, text=True,
+            timeout=timeout, env=env,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        for name in ("stdout", "stderr"):
+            output = getattr(exc, name, None)
+            if output:
+                if isinstance(output, bytes):
+                    output = output.decode("utf-8", errors="replace")
+                exc.add_note(f"wheel installation {name}:\n{output[-6000:]}")
+        raise
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv not on PATH")
@@ -35,6 +59,19 @@ def test_wheel_contains_migrations_and_webui_artifact(
         packaged_runtime_catalog = wheel.read(
             "opensquilla/runtime_packs/runtime-pack-catalog.json"
         )
+        metadata_names = [
+            name for name in names
+            if name.count("/") == 1 and name.endswith(".dist-info/METADATA")
+        ]
+        assert len(metadata_names) == 1, metadata_names
+        metadata = BytesParser().parsebytes(wheel.read(metadata_names[0]))
+
+    # Locked dependency preparation must not hide a wheel that dropped a base
+    # dependency declaration (including its version, extras, or marker).
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    expected = {Requirement(value) for value in project["project"]["dependencies"]}
+    declared = {Requirement(value) for value in metadata.get_all("Requires-Dist", [])}
+    assert expected <= declared, sorted(str(value) for value in expected - declared)
 
     assert any(n.endswith("opensquilla/_migrations/V010__meta_skill_runs.py") for n in names), (
         f"V010 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
@@ -123,35 +160,61 @@ def test_installed_wheel_resolves_migrations(
 ) -> None:
     """An installed wheel resolves both the historical and latest migration."""
     venv_dir = tmp_path / "venv"
-    subprocess.run(
+    _run_install_probe(
         ["uv", "venv", str(venv_dir), "--python", sys.executable],
-        cwd=REPO_ROOT,
-        check=True,
-        capture_output=True,
         timeout=120,
     )
     py = venv_dir / ("Scripts" if os.name == "nt" else "bin") / (
         "python.exe" if os.name == "nt" else "python"
     )
 
-    # Use uv's installer against the fresh interpreter instead of seeding pip
-    # and then invoking a second resolver. This keeps the clean-install
-    # contract while reusing the hosted runner's uv cache; Windows Defender
-    # otherwise scans the same dependency wheels twice.
-    subprocess.run(
-        ["uv", "pip", "install", "--python", str(py), str(isolated_core_wheel)],
-        check=True,
-        capture_output=True,
+    # The preceding locked development sync supplies the dependency cache.
+    # Keep this a fresh, complete installation, but resolve against that same
+    # lock rather than downloading newer dependencies during an offline test.
+    constraints = tmp_path / "locked-core.txt"
+    _run_install_probe(
+        [
+            "uv", "export", "--locked", "--offline", "--no-dev", "--no-emit-project",
+            "--no-hashes", "--output-file", str(constraints),
+        ],
+        timeout=60,
+    )
+    # A locked sync caches wheel contents, but need not cache every registry
+    # metadata response used by a second pip resolution. Install from the lock
+    # first; the wheel's normal resolver can then use installed metadata. Both
+    # phases and the dependency check share the original 300-second budget.
+    install_deadline = time.monotonic() + 300
+    _run_install_probe(
+        [
+            "uv", "sync", "--locked", "--offline", "--no-dev", "--no-default-groups",
+            "--no-install-project", "--python", str(py),
+        ],
         timeout=300,
+        env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(venv_dir)},
+    )
+    _run_install_probe(
+        [
+            "uv", "pip", "install", "--offline", "--python", str(py),
+            "--constraint", str(constraints), str(isolated_core_wheel),
+        ],
+        timeout=install_deadline - time.monotonic(),
+    )
+    _run_install_probe(
+        ["uv", "pip", "check", "--python", str(py)],
+        timeout=install_deadline - time.monotonic(),
     )
 
     result = subprocess.run(
         [
             str(py),
+            "-I",
             "-c",
             (
+                "import sys; from pathlib import Path;"
                 "from opensquilla.gateway.boot import _resolve_migrations_dir;"
                 " d = _resolve_migrations_dir();"
+                " assert d.is_relative_to(Path(sys.prefix)),"
+                "        f'resolver escaped installed environment: {d}';"
                 " assert (d / 'V010__meta_skill_runs.py').exists(),"
                 "        f'V010 missing in {d}';"
                 " assert (d / 'V021__usage_ledger.py').exists(),"

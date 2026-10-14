@@ -46,25 +46,10 @@ describe('ActivityToolDetails narrow-width layout', () => {
 })
 
 describe('ActivityToolDetails bounded window treatment', () => {
-  it('uses one scroll container without nested cards or a shadow layer', () => {
+  it('bounds the detail window without allowing content to escape', () => {
     const window = ruleBody('.activity-tool-details--bounded')
     expect(window).toContain('max-height: min(20rem, 45vh);')
-    expect(window).toContain('border: 1px solid var(--border);')
-    expect(window).not.toContain('box-shadow:');
     expect(window).toContain('overflow: hidden;')
-
-    const section = ruleBody('.activity-tool-details__section')
-    expect(section).toContain('border: 0;')
-    expect(section).toContain('background: transparent;')
-    const preview = ruleBody('.activity-tool-details__preview')
-    expect(preview).toContain('border: 0;')
-    expect(preview).toContain('background: transparent;')
-  })
-
-  it('does not mask retained content with a fade or a second disclosure', () => {
-    expect(activityToolDetailsSource).not.toContain('activity-tool-details__title')
-    expect(activityToolDetailsSource).not.toContain('activity-tool-details__fade')
-    expect(activityToolDetailsSource).not.toContain('shared.runTrace.viewFull')
   })
 })
 

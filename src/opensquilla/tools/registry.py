@@ -373,6 +373,7 @@ class ToolRegistry:
         calling support.
         """
 
+        authorized = [self._model_definition_for(definition) for definition in authorized]
         authorized_by_name = {definition.name: definition for definition in authorized}
         # Embedded/custom registries may intentionally omit the discovery
         # gateway. Hiding their complete surface would leave the model no path
@@ -464,6 +465,36 @@ class ToolRegistry:
             if isinstance(namespace_schema, dict):
                 namespace_schema["enum"] = ["builtin", *namespaces]
         return definitions
+
+    @staticmethod
+    def _model_definition_for(definition: ToolDefinition) -> ToolDefinition:
+        if definition.name != "web_search":
+            return definition
+
+        model_definition = definition.model_copy(deep=True)
+        provider_schema = model_definition.input_schema.properties.get("provider")
+        if not isinstance(provider_schema, dict):
+            return model_definition
+        provider_ids = provider_schema.get("enum")
+        if not isinstance(provider_ids, list):
+            return model_definition
+
+        from opensquilla.search.runtime_config import get_resolved_search_runtime
+
+        runtime = get_resolved_search_runtime()
+        provider_schema["enum"] = [
+            provider_id
+            for provider_id in provider_ids
+            if isinstance(provider_id, str)
+            and (
+                provider_id == "auto"
+                or (
+                    (provider_config := runtime.providers.get(provider_id)) is not None
+                    and provider_config.available
+                )
+            )
+        ]
+        return model_definition
 
     async def list_tools(
         self,

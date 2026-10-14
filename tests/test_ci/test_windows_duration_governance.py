@@ -5,6 +5,7 @@ import runpy
 import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -302,14 +303,104 @@ def test_duration_builder_requires_all_ten_execution_shards(tmp_path: Path) -> N
         load_run_directory(tmp_path / "run-500")
 
 
-def test_duration_builder_rejects_worker_count_drift(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mutation", ["workers", "marker_base", "legacy_and_filtered"])
+def test_duration_builder_rejects_execution_drift(tmp_path: Path, mutation: str) -> None:
     observations = _partitioned_observations(tmp_path)
-    observations[1].execution_by_shard["core-1"]["parallel"]["workers"] = 4
+    if mutation == "workers":
+        observations[1].execution_by_shard["core-1"]["parallel"]["workers"] = 4
+    else:
+        for index, observation in enumerate(observations):
+            if mutation == "legacy_and_filtered" and index == 0:
+                continue
+            base = "not llm" if mutation == "marker_base" and index == 1 else "not stress"
+            for execution in observation.execution_by_shard.values():
+                execution["parallel"]["marker"] = f"({base}) and (not ci_serial)"
+                execution["serial"]["marker"] = f"({base}) and (ci_serial)"
     with pytest.raises(ValueError, match="execution configuration differs"):
         build_duration_payload(
             observations, expected_assignment_sha256="b" * 64,
             expected_partition_sha256="e" * 64,
         )
+
+
+@pytest.mark.parametrize("marker", [
+    None,
+    "",
+    "not stress and not llm and not live_search and not live_skill_hub and not live_channel "
+    "and not webui_browser and not tui_real_terminal and not local_golden "
+    "and not agent_context_boundary and not llm_router_acc",
+], ids=["default", "explicit-all", "ci-offline"])
+def test_duration_builder_consumes_runner_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str | None,
+) -> None:
+    runner = runpy.run_path(".github/scripts/windows_test_shards.py")
+    write_metadata = runner["_write_run_metadata"]
+    assignment = runner["assignment_snapshot_fingerprint"]()
+    partition = runner["partition_snapshot_fingerprint"]()
+    observations = []
+    for index in range(3):
+        run_dir = _write_run(
+            tmp_path, run_id=600 + index, sha="a" * 40,
+            assignment_sha256=assignment,
+            seconds={path: float(index + 1) for path in FILES_BY_SHARD.values()},
+            partitioned=True,
+        )
+        # Simulate only the CI process environment, without changing os.name
+        # globally or depending on the host running this governance test.
+        environment = {
+            "GITHUB_RUN_ID": str(600 + index), "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_SHA": "a" * 40, "RUNNER_OS": "Windows",
+            "RUNNER_ARCH": "X64", "ImageOS": "win25", "ImageVersion": "test",
+        }
+        monkeypatch.setitem(
+            write_metadata.__globals__, "os", SimpleNamespace(name="nt", environ=environment),
+        )
+        for metadata_path in run_dir.rglob("windows-shard-metadata.json"):
+            previous = json.loads(metadata_path.read_text(encoding="utf-8"))
+            write_metadata(
+                metadata_path, previous["shard"], tuple(previous["test_files"]),
+                parallel_workers=3, marker_expression=marker,
+            )
+        observations.append(load_run_directory(run_dir))
+
+    payload = build_duration_payload(
+        observations, expected_assignment_sha256=assignment,
+        expected_partition_sha256=partition,
+    )
+    assert len(payload["weights_seconds"]) == 10
+    base = "not stress" if marker is None else marker
+    for execution in payload["source_runs"][0]["execution"].values():
+        assert execution["parallel"]["marker"] == (
+            f"({base}) and (not ci_serial)" if base else "not ci_serial"
+        )
+        assert execution["serial"]["marker"] == (
+            f"({base}) and (ci_serial)" if base else "ci_serial"
+        )
+
+
+@pytest.mark.parametrize(("parallel", "serial"), [
+    ("(not stress) and (not ci_serial)", "(not llm) and (ci_serial)"),
+    ("(not stress) and (ci_serial)", "(not stress) and (not ci_serial)"),
+    ("(not stress) and (not ci_serial)", "ci_serial"),
+    ("not ci_serial", "(not stress) and (ci_serial)"),
+    ("() and (not ci_serial)", "() and (ci_serial)"),
+    (None, "ci_serial"),
+    ("not ci_serial", ["ci_serial"]),
+])
+def test_duration_builder_rejects_mismatched_phase_markers(
+    tmp_path: Path, parallel: object, serial: object,
+) -> None:
+    run_dir = _write_run(
+        tmp_path, run_id=700, sha="a" * 40, assignment_sha256="b" * 64,
+        seconds={path: 1.0 for path in FILES_BY_SHARD.values()}, partitioned=True,
+    )
+    metadata_path = next(run_dir.rglob("windows-shard-metadata.json"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["execution"]["parallel"]["marker"] = parallel
+    metadata["execution"]["serial"]["marker"] = serial
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid execution configuration"):
+        load_run_directory(run_dir)
 
 
 def test_duration_builder_rejects_stale_partition_evidence(tmp_path: Path) -> None:

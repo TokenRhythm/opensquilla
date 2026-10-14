@@ -189,7 +189,7 @@
         v-if="panelComponent(item)"
         :ref="panelRefSetter(item)"
         v-bind="panelProps(item, active, false)"
-        @workbench-event="handlePanelEvent(item, $event)"
+        v-on="{ 'workbench-event': panelEventHandler(item) }"
       />
       <div v-else class="app-workbench__unsupported">
         {{ t('workbench.empty') }}
@@ -202,7 +202,7 @@
         v-if="panelComponent(item)"
         :ref="panelRefSetter(item)"
         v-bind="panelProps(item, active, true)"
-        @workbench-event="handlePanelEvent(item, $event)"
+        v-on="{ 'workbench-event': panelEventHandler(item) }"
       />
     </template>
   </WorkbenchHost>
@@ -250,6 +250,7 @@ import {
   fileActionArtifactFromWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
   navigationArtifactsFromWorkbenchItem,
+  preparedPreviewFromWorkbenchItem,
   previewableNavigationArtifactsFromWorkbenchItem,
   requestInitialSectionForWorkbenchItem,
   sessionKeyFromWorkbenchItem,
@@ -400,7 +401,14 @@ const nativeSnapshotUrl = computed(() => {
 })
 function thumbnailFingerprint(item: WorkbenchItem) {
   const artifact = artifactFromWorkbenchItem(item)
-  return [artifact?.revisionId, artifact?.sha256, artifact?.download_url, artifact?.previewPagePath].join(':')
+  const prepared = preparedPreviewFromWorkbenchItem(item)
+  // Mutable documents render the store's head without replacing their tab item.
+  // Prepared attachment/deliverable previews remain pinned to their own bytes.
+  const workspace = artifact && !(prepared && prepared.resource.type !== 'document')
+    ? artifactDocuments.snapshot(artifact, sessionKeyFromWorkbenchItem(item)).workspace
+    : null
+  const head = workspace?.source === 'document-api' ? workspace.headArtifact : artifact
+  return [head?.revisionId, head?.sha256, head?.download_url, head?.revision_download_url, artifact?.previewPagePath].join(':')
 }
 function tabInfo(item: WorkbenchItem) {
   void thumbnailVersion.value
@@ -1094,6 +1102,16 @@ function setPanelHandle(item: WorkbenchItem, value: unknown) {
 
 function panelRefSetter(item: WorkbenchItem): (value: unknown) => void {
   return value => setPanelHandle(item, value)
+}
+
+function panelEventHandler(item: WorkbenchItem) {
+  const renderedFingerprint = thumbnailFingerprint(item)
+  return (event: WorkbenchComponentEvent) => {
+    // Store updates precede Vue's prop update. A pending old renderer can still
+    // emit in that gap, so bind its image to the revision rendered by this slot.
+    if (event.type === 'preview-thumbnail' && renderedFingerprint !== thumbnailFingerprint(item)) return
+    handlePanelEvent(item, event)
+  }
 }
 
 function handlePanelEvent(item: WorkbenchItem, event: WorkbenchComponentEvent) {

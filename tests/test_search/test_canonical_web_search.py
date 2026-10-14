@@ -44,6 +44,9 @@ async def test_default_search_does_not_fetch_short_provider_content() -> None:
 
     payload = await run_canonical_web_search(
         SearchOptions(query="default fetch boundary", provider="tavily"),
+        runtime=resolve_search_runtime(
+            SearchRuntimeConfig(provider="tavily", api_key="synthetic-search-key")
+        ),
         provider_factory=lambda name: ShortContentProvider(),
         fetcher=unexpected_fetch,
     )
@@ -60,6 +63,9 @@ async def test_attached_fetch_rejects_error_text(status, error) -> None:
 
     payload = await run_canonical_web_search(
         SearchOptions(query=f"invalid fetch {status} {error}", fetch_top_k=1, provider="tavily"),
+        runtime=resolve_search_runtime(
+            SearchRuntimeConfig(provider="tavily", api_key="synthetic-search-key")
+        ),
         provider_factory=lambda name: ShortContentProvider(),
         fetcher=fetch,
     )
@@ -83,6 +89,9 @@ async def test_canonical_and_discover_retry_contract(kind, retryable, allowed) -
 
     payload = await run_canonical_web_search(
         SearchOptions(query=f"retry {kind} {retryable}", provider="tavily"),
+        runtime=resolve_search_runtime(
+            SearchRuntimeConfig(provider="tavily", api_key="synthetic-search-key")
+        ),
         provider_factory=lambda name: FailingProvider(),
     )
     assert payload["retry_allowed"] is allowed
@@ -454,6 +463,9 @@ async def test_canonical_web_search_dedupes_and_uses_provider_content_without_fe
 async def test_canonical_web_search_primary_auth_failure_does_not_silent_fallback() -> None:
     payload = await run_canonical_web_search(
         SearchOptions(query="python release", provider="tavily"),
+        runtime=resolve_search_runtime(
+            SearchRuntimeConfig(provider="tavily", api_key="synthetic-search-key")
+        ),
         provider_factory=lambda name: AuthFailProvider(),
     )
 
@@ -547,6 +559,9 @@ async def test_canonical_web_search_configured_auth_failure_does_not_fallback_or
 async def test_canonical_web_search_public_error_message_is_sanitized() -> None:
     payload = await run_canonical_web_search(
         SearchOptions(query="q", provider="tavily", fetch_top_k=0),
+        runtime=resolve_search_runtime(
+            SearchRuntimeConfig(provider="tavily", api_key="synthetic-search-key")
+        ),
         provider_factory=lambda name: SensitiveErrorProvider(),
     )
 
@@ -1203,12 +1218,18 @@ async def test_canonical_web_search_caches_complete_payload_for_repeated_request
     )
     first = await run_canonical_web_search(
         options,
+        runtime=resolve_search_runtime(
+            SearchRuntimeConfig(provider="tavily", api_key="synthetic-search-key")
+        ),
         provider_factory=lambda name: CountingShortProvider(provider_calls),
         fetcher=fetcher,
         use_cache=True,
     )
     second = await run_canonical_web_search(
         options,
+        runtime=resolve_search_runtime(
+            SearchRuntimeConfig(provider="tavily", api_key="synthetic-search-key")
+        ),
         provider_factory=lambda name: CountingShortProvider(provider_calls),
         fetcher=fetcher,
         use_cache=True,

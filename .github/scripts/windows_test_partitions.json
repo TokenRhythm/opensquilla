@@ -1439,6 +1439,7 @@
       "tests/test_gateway/test_steer_restart_recovery.py",
       "tests/test_gateway/test_subagent_announce_group_wake.py",
       "tests/test_gateway/test_task_progress_projection.py",
+      "tests/test_gateway/test_task_runtime_cancellation_settlement.py",
       "tests/test_gateway/test_task_runtime_wait_slots.py",
       "tests/test_gateway/test_title_read_failures.py",
       "tests/test_gateway/test_turn_ingress_rpc.py",

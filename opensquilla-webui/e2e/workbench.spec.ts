@@ -48,7 +48,6 @@ async function installWorkbenchGateway(
   requests: Map<string, number> = new Map(),
   artifacts = ARTIFACTS,
   sends: Record<string, unknown>[] = [],
-  delayedDrafts?: { requested: boolean; release?: () => void },
   delayedSkills?: { requested: boolean; release?: () => void },
   browserCandidates: Record<string, unknown> = BROWSER_SKILL_CANDIDATES,
 ) {
@@ -123,32 +122,11 @@ async function installWorkbenchGateway(
       const method = String(frame.method || '')
       if (method === 'connect') {
         ws.send(helloOkResponse({
-          features: { methods: [
-            'skills.candidates',
-            ...(delayedDrafts ? ['meta.drafts.list'] : []),
-          ] },
+          features: { methods: ['skills.candidates'] },
           auth: {
           principal: { isOwner: true, authenticated: true, authState: 'authenticated' },
           runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' },
         } }))
-        return
-      }
-      if (method === 'meta.drafts.list') {
-        const reply = () => ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: true,
-          payload: { durable: true, drafts: [{
-            sessionKey: 'agent:main:webchat:old-unfinished-draft', clientRequestId: 'synthetic-draft',
-            name: 'meta-example', launchText: '/meta run meta-example',
-            createdAt: 1_800_000_000, expiresAt: 2_000_000_000, sessionExists: false,
-          }] },
-        }))
-        const params = frame.params as Record<string, unknown> | undefined
-        if (delayedDrafts && params?.agentId && !delayedDrafts.requested) {
-          delayedDrafts.requested = true
-          delayedDrafts.release = reply
-        } else {
-          ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: true,
-            payload: { durable: true, drafts: [] } }))
-        }
         return
       }
       if (method === 'chat.send') {
@@ -532,7 +510,7 @@ test.describe('Application Workbench', () => {
     const browserCandidates: Record<string, unknown> = {
       generation: 1, candidates: [...BROWSER_SKILL_CANDIDATES.candidates],
     }
-    await installWorkbenchGateway(page, requests, [], [], undefined, undefined, browserCandidates)
+    await installWorkbenchGateway(page, requests, [], [], undefined, browserCandidates)
     await openNewWorkbenchDraft(page)
 
     await page.getByRole('button', { name: 'Add', exact: true }).click()
@@ -564,7 +542,7 @@ test.describe('Application Workbench', () => {
     await page.addInitScript(() => {
       window.OPENSQUILLA_FEATURES = { ...(window.OPENSQUILLA_FEATURES || {}), artifactWorkbench: true }
     })
-    await installWorkbenchGateway(page, new Map(), [], sends, undefined, delayedSkills)
+    await installWorkbenchGateway(page, new Map(), [], sends, delayedSkills)
     await openNewWorkbenchDraft(page)
 
     const composer = page.locator('.chat-textarea')
@@ -593,7 +571,7 @@ test.describe('Application Workbench', () => {
     await page.addInitScript(() => {
       window.OPENSQUILLA_FEATURES = { ...(window.OPENSQUILLA_FEATURES || {}), artifactWorkbench: true }
     })
-    await installWorkbenchGateway(page, new Map(), [], sends, undefined, delayedSkills)
+    await installWorkbenchGateway(page, new Map(), [], sends, delayedSkills)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
 
     const composer = page.locator('.chat-textarea')
@@ -612,93 +590,106 @@ test.describe('Application Workbench', () => {
     await expect(page.getByTestId('selected-skills')).toHaveCount(0)
   })
 
-  test('opens manual browser tabs from a fresh draft and preserves their owner on first send', async ({ page }) => {
-    const sends: Record<string, unknown>[] = []
-    const delayedDrafts: { requested: boolean; release?: () => void } = { requested: false }
-    await installDesktopWorkbenchV2Bridge(page)
-    await page.addInitScript(() => {
-      window.OPENSQUILLA_FEATURES = { ...(window.OPENSQUILLA_FEATURES || {}), artifactWorkbench: true }
-    })
-    await installWorkbenchGateway(page, new Map(), [], sends, delayedDrafts)
-    await page.goto(CONTROL_URL + 'chat/new')
-    const toggle = page.getByTestId('topbar-workbench-toggle')
-    const composer = page.locator('.chat-textarea')
-    const draft = 'Inspect the webpage already open beside this task.'
-    const revealBrowser = async () => {
+  for (const recoverDraft of [false, true]) {
+    test(`opens manual browser tabs from a ${recoverDraft ? 'recovered' : 'fresh'} draft and preserves their owner on first send`, async ({ page }) => {
+      const sends: Record<string, unknown>[] = []
+      const recoveredKey = 'agent:main:webchat:recovered-browser-draft'
+      const draft = 'Inspect the webpage already open beside this task.'
+      await installDesktopWorkbenchV2Bridge(page)
+      await page.addInitScript(() => {
+        window.OPENSQUILLA_FEATURES = { ...(window.OPENSQUILLA_FEATURES || {}), artifactWorkbench: true }
+      })
+      await page.addInitScript(({ recoverDraft, recoveredKey, draft }) => {
+        // Only the recent draft pointer restores a cold /chat/new owner; an
+        // unrelated saved composer must not claim a freshly opened task.
+        localStorage.setItem(`opensquilla.chat.draft:${recoveredKey}`, draft)
+        if (recoverDraft) localStorage.setItem('opensquilla.chat.recent-draft-session', recoveredKey)
+      }, { recoverDraft, recoveredKey, draft })
+      await installWorkbenchGateway(page, new Map(), [], sends)
+      // Gateway rewrites entry assets to root-relative URLs. Raw Vite preview
+      // serves ./assets even for deep links; emulate only that server behavior
+      // so this remains a cold entry, not an explicit New task handoff.
+      await page.route('**/control/chat/new', async route => {
+        const response = await route.fetch()
+        await route.fulfill({ response, body: (await response.text()).replaceAll('="./assets/', '="/control/assets/') })
+      })
+      await page.goto(CONTROL_URL + 'chat/new')
+      const toggle = page.getByTestId('topbar-workbench-toggle')
+      const composer = page.locator('.chat-textarea')
+      const revealBrowser = async () => {
+        await toggle.click()
+        await expect(composer).toHaveValue(draft)
+      }
+      await expect(toggle).toBeVisible()
+      await expect(composer).toHaveValue(recoverDraft ? draft : '')
+      if (!recoverDraft) await composer.fill(draft)
+      await revealBrowser()
+      const workbench = page.getByTestId('workbench-host')
+      const start = workbench.getByTestId('browser-start')
+      await expect(start).toBeVisible()
+      const address = start.getByRole('textbox', { name: 'Web address' })
+      await address.fill('javascript:alert(1)')
+      await start.getByRole('button', { name: 'Go', exact: true }).click()
+      await expect(start.getByRole('alert')).toHaveText('Enter a valid HTTP or HTTPS web address.')
+      const creates = () => page.evaluate(() => (window as unknown as {
+        __opensquillaNativeWorkbenchProbe: { createRequests: Array<{
+          surfaceId: string; payload: { url: string; scopeId: string }
+        }> }
+      }).__opensquillaNativeWorkbenchProbe.createRequests)
+      expect(await creates()).toHaveLength(0)
+      await address.fill('localhost:18807/check')
+      await start.getByRole('button', { name: 'Go', exact: true }).click()
+      await expect(workbench.getByRole('tab')).toHaveCount(1)
+      await expect.poll(creates).toHaveLength(1)
+      const first = (await creates())[0]!
+      expect(first.payload.url).toBe('http://localhost:18807/check')
+      expect(first.payload.scopeId).toMatch(/^agent:main:webchat:/)
+      if (recoverDraft) expect(first.payload.scopeId).toBe(recoveredKey)
+      else expect(first.payload.scopeId).not.toBe(recoveredKey)
+      await expect(page.locator('.chat-thread')).toHaveAttribute('data-session-key', first.payload.scopeId)
+
       await toggle.click()
+      await expect(workbench).toBeHidden()
+      await revealBrowser()
+      await expect(workbench).toBeVisible()
+      await expect(workbench.getByRole('tab')).toHaveCount(1)
+      expect(await creates()).toHaveLength(1)
+      expect((await creates())[0]!.surfaceId).toBe(first.surfaceId)
+
+      await workbench.getByTestId('workbench-new-browser-tab').click()
+      await expect(start).toBeVisible()
+      await expect(workbench.getByRole('tab')).toHaveCount(1)
+      await address.fill('localhost:18807/check')
+      await start.getByRole('button', { name: 'Go', exact: true }).click()
+      await expect(workbench.getByRole('tab')).toHaveCount(2)
+      await expect.poll(creates).toHaveLength(2)
+      expect((await creates())[1]!.surfaceId).not.toBe(first.surfaceId)
+      expect((await creates())[1]!.payload.scopeId).toBe(first.payload.scopeId)
+
       await expect(composer).toHaveValue(draft)
-    }
-    await expect(toggle).toBeVisible()
-    await composer.fill(draft)
-    await revealBrowser()
-    const workbench = page.getByTestId('workbench-host')
-    const start = workbench.getByTestId('browser-start')
-    await expect(start).toBeVisible()
-    const address = start.getByRole('textbox', { name: 'Web address' })
-    await address.fill('javascript:alert(1)')
-    await start.getByRole('button', { name: 'Go', exact: true }).click()
-    await expect(start.getByRole('alert')).toHaveText('Enter a valid HTTP or HTTPS web address.')
-    const creates = () => page.evaluate(() => (window as unknown as {
-      __opensquillaNativeWorkbenchProbe: { createRequests: Array<{
-        surfaceId: string; payload: { url: string; scopeId: string }
-      }> }
-    }).__opensquillaNativeWorkbenchProbe.createRequests)
-    expect(await creates()).toHaveLength(0)
-    await address.fill('localhost:18807/check')
-    await start.getByRole('button', { name: 'Go', exact: true }).click()
-    await expect(workbench.getByRole('tab')).toHaveCount(1)
-    await expect.poll(creates).toHaveLength(1)
-    const first = (await creates())[0]!
-    expect(first.payload.url).toBe('http://localhost:18807/check')
-    expect(first.payload.scopeId).toMatch(/^agent:main:webchat:/)
-    await expect.poll(() => delayedDrafts.requested).toBe(true)
-    delayedDrafts.release!()
-    await page.evaluate(() => new Promise<void>(resolve => {
-      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
-    }))
-    await expect(page.locator('.chat-thread')).toHaveAttribute('data-session-key', first.payload.scopeId)
+      await page.locator('.chat-send-btn[aria-label="Send"]').click()
+      await expect.poll(() => sends.length).toBe(1)
+      expect(sends[0]!.sessionKey).toBe(first.payload.scopeId)
+      await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(first.payload.scopeId)
+      await expect(workbench.getByRole('tab')).toHaveCount(2)
+      expect(await creates()).toHaveLength(2)
 
-    await toggle.click()
-    await expect(workbench).toBeHidden()
-    await revealBrowser()
-    await expect(workbench).toBeVisible()
-    await expect(workbench.getByRole('tab')).toHaveCount(1)
-    expect(await creates()).toHaveLength(1)
-    expect((await creates())[0]!.surfaceId).toBe(first.surfaceId)
-
-    await workbench.getByTestId('workbench-new-browser-tab').click()
-    await expect(start).toBeVisible()
-    await expect(workbench.getByRole('tab')).toHaveCount(1)
-    await address.fill('localhost:18807/check')
-    await start.getByRole('button', { name: 'Go', exact: true }).click()
-    await expect(workbench.getByRole('tab')).toHaveCount(2)
-    await expect.poll(creates).toHaveLength(2)
-    expect((await creates())[1]!.surfaceId).not.toBe(first.surfaceId)
-    expect((await creates())[1]!.payload.scopeId).toBe(first.payload.scopeId)
-
-    await expect(composer).toHaveValue(draft)
-    await page.locator('.chat-send-btn[aria-label="Send"]').click()
-    await expect.poll(() => sends.length).toBe(1)
-    expect(sends[0]!.sessionKey).toBe(first.payload.scopeId)
-    await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(first.payload.scopeId)
-    await expect(workbench.getByRole('tab')).toHaveCount(2)
-    expect(await creates()).toHaveLength(2)
-
-    await workbench.getByRole('button', { name: 'Close tab: localhost', exact: true }).last().click()
-    await workbench.getByTestId('workbench-new-browser-tab').click()
-    await start.getByRole('button', { name: 'Reopen closed tab' }).click()
-    await expect(workbench.getByRole('tab')).toHaveCount(2)
-    await workbench.getByRole('button', { name: 'Close tab: localhost', exact: true }).last().click()
-    await workbench.getByRole('button', { name: 'Close tab: localhost', exact: true }).click()
-    await expect(start).toBeVisible()
-    await expect(toggle).toHaveAttribute('aria-expanded', 'true')
-    await start.getByRole('button', { name: 'Reopen closed tab' }).click()
-    await expect(workbench.getByRole('tab')).toHaveCount(1)
-    await page.getByRole('button', { name: 'New task', exact: true }).click()
-    await expect(start).toBeVisible()
-    await expect(workbench.getByRole('tab')).toHaveCount(0)
-    await expect(toggle).toBeVisible()
-  })
+      await workbench.getByRole('button', { name: 'Close tab: localhost', exact: true }).last().click()
+      await workbench.getByTestId('workbench-new-browser-tab').click()
+      await start.getByRole('button', { name: 'Reopen closed tab' }).click()
+      await expect(workbench.getByRole('tab')).toHaveCount(2)
+      await workbench.getByRole('button', { name: 'Close tab: localhost', exact: true }).last().click()
+      await workbench.getByRole('button', { name: 'Close tab: localhost', exact: true }).click()
+      await expect(start).toBeVisible()
+      await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+      await start.getByRole('button', { name: 'Reopen closed tab' }).click()
+      await expect(workbench.getByRole('tab')).toHaveCount(1)
+      await page.getByRole('button', { name: 'New task', exact: true }).click()
+      await expect(start).toBeVisible()
+      await expect(workbench.getByRole('tab')).toHaveCount(0)
+      await expect(toggle).toBeVisible()
+    })
+  }
 
   test('reopens retained agent pages after collapse and task changes', async ({ page }) => {
     await installDesktopWorkbenchV2Bridge(page)
@@ -1180,8 +1171,10 @@ test.describe('Application Workbench', () => {
     const workbench = page.getByTestId('workbench-host')
     await expect(workbench).toBeVisible()
     await expect(workbench).toHaveAttribute('role', 'complementary')
-    await expect(workbench.locator('.workbench-host__single-title'))
-      .toContainText('demo.html')
+    const resourceTabs = workbench.getByRole('tablist', { name: 'Open workbench items', exact: true })
+    await expect(resourceTabs.getByRole('tab', { name: 'demo.html', exact: true }))
+      .toHaveAttribute('aria-selected', 'true')
+    await expect(resourceTabs.getByRole('tab')).toHaveCount(1)
     await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
     await expect(workbench.locator('.artifact-preview__frame--html')).toBeVisible()
     expect(requests.get('/api/v1/artifacts/workbench-demo')).toBeGreaterThanOrEqual(1)
@@ -1355,7 +1348,10 @@ test.describe('Application Workbench', () => {
     await open.click()
     await expect(workbench).toBeVisible()
     await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
-    await expect(workbench.locator('.workbench-host__tabs')).toHaveCount(0)
+    const resourceTabs = workbench.getByRole('tablist', { name: 'Open workbench items', exact: true })
+    await expect(resourceTabs.getByRole('tab')).toHaveCount(1)
+    await expect(resourceTabs.getByRole('tab', { name: 'notes.txt', exact: true }))
+      .toHaveAttribute('aria-selected', 'true')
 
     await workbench.getByRole('button', { name: 'Collapse workbench' }).click()
     await expect(workbench).toBeHidden()

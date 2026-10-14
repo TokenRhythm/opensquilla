@@ -77,7 +77,27 @@ class _RealIngressStack:
     release_handler: asyncio.Event
     received_runs: list[Any]
 
-    async def wait_until_running(self) -> None:
+    def timeout_diagnostics(self, task_id: str | None, phase: str) -> str:
+        states = {
+            key: {
+                "status": str(task.status),
+                "done": task.done.is_set(),
+                "terminal_settling": task.terminal_settling,
+                "terminal_closing": task.terminal_closing,
+            }
+            for key, task in self.runtime._tasks.items()
+        }
+        drivers = {
+            key: [repr(driver) for driver in tasks]
+            for key, tasks in self.runtime._driver_tasks_by_session.items()
+        }
+        return (
+            f"durable task timeout: task_id={task_id}; phase={phase}; "
+            f"received_task_ids={[run.task_id for run in self.received_runs]}; "
+            f"task_states={states}; drivers={drivers}"
+        )
+
+    async def wait_until_running(self, task_id: str | None = None) -> None:
         # Activation persists task status and transcript context before calling
         # the handler. SQLite I/O is setup, not a two-second functional contract.
         try:
@@ -85,10 +105,20 @@ class _RealIngressStack:
                 self.handler_started.wait(), timeout=_DURABLE_PHASE_GUARD_SECONDS,
             )
         except TimeoutError as exc:
-            states = {key: task.status for key, task in self.runtime._tasks.items()}
             raise TimeoutError(
-                f"durable handler readiness timed out; task_states={states}"
+                "durable handler readiness timed out; "
+                + self.timeout_diagnostics(task_id, "handler readiness")
             ) from exc
+        if task_id is not None:
+            received_ids = [run.task_id for run in self.received_runs]
+            assert received_ids and received_ids[-1] == task_id, received_ids
+
+    async def wait_for_terminal(self, task_id: str, *, timeout: float) -> AgentTaskRecord:
+        try:
+            return await self.runtime.wait(task_id, timeout=timeout)
+        except TimeoutError as exc:
+            exc.add_note(self.timeout_diagnostics(task_id, "terminal"))
+            raise
 
 
 @asynccontextmanager
@@ -283,6 +313,9 @@ async def test_reset_drains_real_task_runtime_while_provider_is_blocked(
         turn_runner = BlockingProviderTurnRunner()
 
         async def provider_turn_handler(run: Any) -> None:
+            stack.received_runs.append(run)
+            stack.handler_started.set()
+            await stack.release_handler.wait()
             await dispatch_task_runtime_turn(
                 run,
                 config=stack.context.config,
@@ -303,7 +336,15 @@ async def test_reset_drains_real_task_runtime_while_provider_is_blocked(
             stack.context,
         )
         assert accepted.ok is True
-        await asyncio.wait_for(provider_started.wait(), timeout=2.0)
+        await stack.wait_until_running(accepted.payload["task_id"])
+        stack.release_handler.set()
+        try:
+            await asyncio.wait_for(provider_started.wait(), timeout=2.0)
+        except TimeoutError as exc:
+            exc.add_note(stack.timeout_diagnostics(
+                accepted.payload["task_id"], "provider readiness",
+            ))
+            raise
 
         reset_task = asyncio.create_task(
             get_dispatcher().dispatch(
@@ -729,7 +770,7 @@ async def test_owner_web_turn_receives_narrow_generated_artifact_adopter(
             stack.context,
         )
         assert response.error is None, response.error
-        await stack.wait_until_running()
+        await stack.wait_until_running(response.payload["task_id"])
 
         runtime_task = stack.runtime._tasks[response.payload["task_id"]]
         adopter = runtime_task.envelope.runtime_services.get("generated_artifact_adopter")
@@ -740,7 +781,7 @@ async def test_owner_web_turn_receives_narrow_generated_artifact_adopter(
         assert context.generated_artifact_adopter is adopter
 
         stack.release_handler.set()
-        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+        await stack.wait_for_terminal(response.payload["task_id"], timeout=2.0)
 
 
 @pytest.mark.asyncio
@@ -773,7 +814,7 @@ async def test_chat_send_first_ordinary_turn_schedules_auto_title_once(
             stack.context,
         )
         assert response.error is None, response.error
-        await stack.wait_until_running()
+        await stack.wait_until_running(response.payload["task_id"])
         assert len(scheduled_titles) == 1
         assert scheduled_titles[0][0][2] == "Name this ordinary first turn."
         assert scheduled_titles[0][1]["enabled"] is True
@@ -789,7 +830,7 @@ async def test_chat_send_first_ordinary_turn_schedules_auto_title_once(
         assert len(scheduled_titles) == 1
 
         stack.release_handler.set()
-        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+        await stack.wait_for_terminal(response.payload["task_id"], timeout=2.0)
 
 
 @pytest.mark.parametrize("queued", [False, True])
@@ -2080,9 +2121,9 @@ async def test_sessions_send_replay_exposes_terminal_task_status(tmp_path: Path)
         first = await get_dispatcher().dispatch(
             "rpc-terminal-first", "sessions.send", params, stack.context
         )
-        await stack.wait_until_running()
+        await stack.wait_until_running(first.payload["task_id"])
         stack.release_handler.set()
-        terminal = await stack.runtime.wait(first.payload["task_id"], timeout=2.0)
+        terminal = await stack.wait_for_terminal(first.payload["task_id"], timeout=2.0)
 
         replay = await get_dispatcher().dispatch(
             "rpc-terminal-replay", "sessions.send", params, stack.context
@@ -2793,7 +2834,7 @@ async def test_public_send_continues_automation_session_with_queue_and_replay(
             stack.context,
         )
         assert first.ok is True
-        await stack.wait_until_running()
+        await stack.wait_until_running(first.payload["task_id"])
 
         params = {
             key_field: cron_key,
@@ -2816,9 +2857,23 @@ async def test_public_send_continues_automation_session_with_queue_and_replay(
         assert pending.details["session_id"] == session.session_id
         assert pending.details["session_epoch"] == session.epoch
 
+        first_task_id = first.payload["task_id"]
+        second_task_id = second.payload["task_id"]
+        assert stack.received_runs[0].task_id == first_task_id
+        # The shared event currently describes the first handler. Clear it
+        # before releasing that handler so the next signal belongs to the
+        # queued task, whose durable activation is a separate readiness phase.
+        stack.handler_started.clear()
         stack.release_handler.set()
-        for accepted in (first, second):
-            terminal = await stack.runtime.wait(accepted.payload["task_id"], timeout=2.0)
+        for task_id in (first_task_id, second_task_id):
+            if task_id == second_task_id:
+                await stack.wait_until_running(second_task_id)
+                assert [run.task_id for run in stack.received_runs] == [
+                    first_task_id, second_task_id,
+                ]
+            # Keep both terminal-settlement budgets, including the first
+            # task's durable writes, unchanged.
+            terminal = await stack.wait_for_terminal(task_id, timeout=2.0)
             assert str(terminal.status) == "succeeded"
         assert len(stack.received_runs) == 2
         for run in stack.received_runs:
@@ -2968,6 +3023,8 @@ async def test_sessions_send_recovers_tool_and_provider_failures_before_one_comm
 
         async def turn_handler(run: Any) -> None:
             stack.received_runs.append(run)
+            stack.handler_started.set()
+            await stack.release_handler.wait()
             await dispatch_task_runtime_turn(
                 run,
                 config=stack.context.config,
@@ -2989,13 +3046,16 @@ async def test_sessions_send_recovers_tool_and_provider_failures_before_one_comm
             stack.context,
         )
         assert accepted.ok is True
+        await stack.wait_until_running(accepted.payload["task_id"])
+        stack.release_handler.set()
         try:
             try:
                 await asyncio.wait_for(retry_wait_started.wait(), timeout=3.0)
             except TimeoutError as exc:
                 raise AssertionError(
                     f"Retry wait not reached: provider calls={len(requests)}, "
-                    f"tool paths={tool_paths}, events={[name for name, _ in emitted]}"
+                    f"tool paths={tool_paths}, events={[name for name, _ in emitted]}; "
+                    + stack.timeout_diagnostics(accepted.payload["task_id"], "retry readiness")
                 ) from exc
             running = await stack.storage.get_agent_task(accepted.payload["task_id"])
             assert running is not None and running.status == AgentTaskStatus.RUNNING
@@ -3012,7 +3072,7 @@ async def test_sessions_send_recovers_tool_and_provider_failures_before_one_comm
             assert retry_waits[0]["retry_limit"] == 0
         finally:
             release_retry.set()
-        terminal = await stack.runtime.wait(accepted.payload["task_id"], timeout=3.0)
+        terminal = await stack.wait_for_terminal(accepted.payload["task_id"], timeout=3.0)
 
         assert terminal.status == AgentTaskStatus.SUCCEEDED
         assert len(requests) == 4
@@ -3068,6 +3128,8 @@ async def test_sessions_send_replays_accepted_budget_failure_without_new_task_or
 
         async def turn_handler(run: Any) -> None:
             stack.received_runs.append(run)
+            stack.handler_started.set()
+            await stack.release_handler.wait()
             await dispatch_task_runtime_turn(
                 run,
                 config=stack.context.config,
@@ -3087,7 +3149,9 @@ async def test_sessions_send_replays_accepted_budget_failure_without_new_task_or
             "rpc-budget-first", "sessions.send", params, stack.context,
         )
         assert first.ok is True
-        terminal = await stack.runtime.wait(first.payload["task_id"], timeout=2.0)
+        await stack.wait_until_running(first.payload["task_id"])
+        stack.release_handler.set()
+        terminal = await stack.wait_for_terminal(first.payload["task_id"], timeout=2.0)
         assert terminal.status == AgentTaskStatus.FAILED
         before_replay = _table_counts(stack.db_path)
         transcript = await stack.storage.get_transcript(stack.session_id)

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import ast
+import copy
 import hashlib
 import json
 import re
 import runpy
+import shlex
 import subprocess
+import tomllib
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -148,9 +153,54 @@ def test_nsis_smoke_keeps_exactly_the_two_upgrade_and_two_fresh_cases() -> None:
         MODULE["windows_nsis_upgrade_cells"]("smkoe")
 
 
-@pytest.fixture
-def suite_config() -> dict[str, Any]:
+@pytest.fixture(scope="module")
+def _validated_suite_config() -> dict[str, Any]:
+    # Repository-wide input validation is invariant during this module. Loader
+    # rejection tests below still call load_config directly on their own files.
     return load_config(CONFIG_PATH, repo=Path.cwd())
+
+
+@pytest.fixture
+def suite_config(_validated_suite_config: dict[str, Any]) -> dict[str, Any]:
+    # Cases may extend nested patterns or populate lazy assignment maps.
+    return copy.deepcopy(_validated_suite_config)
+
+
+@pytest.fixture(scope="module")
+def _real_repo_dependency_snapshot(
+    _validated_suite_config: dict[str, Any],
+) -> tuple[Path, frozenset[str], dict[str, frozenset[str]]]:
+    # Only the explicitly opted-in routing cases share this read-only tree.
+    # Build its graph with the real reader/parser once, without a production cache.
+    repo = Path.cwd().resolve()
+    governed = frozenset(MODULE["_windows_test_assignments"](
+        copy.deepcopy(_validated_suite_config)
+    ))
+    graph = MODULE["_build_test_reverse_dependencies"](
+        repo=repo, ref=None, governed_paths=governed,
+    )
+    return repo, governed, graph
+
+
+@pytest.fixture
+def _reuse_real_repo_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    _real_repo_dependency_snapshot: tuple[Path, frozenset[str], dict[str, frozenset[str]]],
+) -> None:
+    snapshot_repo, snapshot_governed, graph = _real_repo_dependency_snapshot
+    original = plan_changes.__globals__["_build_test_reverse_dependencies"]
+
+    def dependencies(
+        *, repo: Path, ref: str | None, governed_paths: Iterable[str],
+    ) -> dict[str, frozenset[str]]:
+        governed = frozenset(governed_paths)
+        if repo.resolve() == snapshot_repo and ref is None and governed == snapshot_governed:
+            return dict(graph)
+        return original(repo=repo, ref=ref, governed_paths=governed)
+
+    monkeypatch.setitem(
+        plan_changes.__globals__, "_build_test_reverse_dependencies", dependencies,
+    )
 
 
 def _plan(
@@ -173,6 +223,107 @@ def _write_test_module(root: Path, path: str, source: str = "") -> None:
     candidate = root / path
     candidate.parent.mkdir(parents=True, exist_ok=True)
     candidate.write_text(source, encoding="utf-8")
+
+
+def test_stress_coverage_tracks_runtime_changes_and_full_fallback(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    affected = (
+        "src/opensquilla/gateway/task_runtime.py",
+        "src/opensquilla/session/stream.py",
+        "src/opensquilla/engine/outcome.py",
+        "src/opensquilla/provider/types.py",
+        "tests/test_gateway/test_task_runtime_terminal_cleanup.py",
+        "tests/conftest.py",
+        "uv.lock",
+        ".ci/run-all",
+        "unknown/new-runtime.py",
+    )
+    unrelated = (
+        "docs/ci-guide.md",
+        "opensquilla-webui/src/views/SettingsView.vue",
+        "tests/test_provider_ensemble.py",
+    )
+    for path in (*affected, *unrelated):
+        plan = _plan(tmp_path, suite_config, path)
+        assert ("python-stress" in plan["required_suites"]) is (path in affected), path
+        if path in affected:
+            assert _platform_cells(plan, "python-stress") == {("ubuntu-latest", "stress")}
+
+
+def test_stress_inventory_cannot_disappear_between_default_and_dedicated_lanes(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    import yaml
+
+    jobs = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))["jobs"]
+    job = jobs["python-stress"]
+    command = next(step["run"] for step in job["steps"] if "pytest" in step.get("run", ""))
+    args = shlex.split(command)
+    targets = {arg for arg in args if arg.startswith("tests/")}
+    assert args[args.index("-m") + 1] == "stress"
+    assert args[args.index("-n") + 1] == "0"
+    assert "'python-stress'" in job["if"]
+    assert not job.get("continue-on-error", False)
+
+    # Admission rule: use pytest.mark.stress (decorator or pytestmark), and
+    # register every marked file in both execution and change-based selection.
+    marked = set()
+    for path in Path("tests").rglob("test_*.py"):
+        source = path.read_text(encoding="utf-8")
+        if "stress" not in source:
+            continue
+        if any(
+            isinstance(node, ast.Attribute) and node.attr == "stress"
+            and isinstance(node.value, ast.Attribute) and node.value.attr == "mark"
+            for node in ast.walk(ast.parse(source))
+        ):
+            marked.add(path.as_posix())
+    assert marked == targets, "every stress file needs an explicit CI target"
+    for target in marked:
+        assert "python-stress" in _plan(tmp_path, suite_config, target)["required_suites"]
+
+    settings = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    default_args = shlex.split(settings["tool"]["pytest"]["ini_options"]["addopts"])
+    assert default_args[default_args.index("-m") + 1] == "not stress"
+    for job_id in ("ubuntu-quality", "ubuntu-full", "windows-full"):
+        commands = "\n".join(step.get("run", "") for step in jobs[job_id]["steps"])
+        expressions = re.findall(r'markers="([^"]+)"', commands)
+        assert expressions and all("not stress" in expression for expression in expressions)
+    targeted = next(
+        step["run"] for step in jobs["ubuntu-quality"]["steps"]
+        if step.get("name") == "Test targeted PR suite"
+    )
+    assert (
+        "tests/test_ci/test_plan_ci.py::"
+        "test_stress_inventory_cannot_disappear_between_default_and_dedicated_lanes"
+    ) in targeted
+
+
+def test_browser_capacity_selection_preserves_ui_and_full_coverage(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    for path in (
+        "opensquilla-webui/src/views/SettingsView.vue",
+        "opensquilla-webui/e2e/sidebar-virtualization.spec.ts",
+        "opensquilla-webui/e2e/long-task-resilience.spec.ts",
+        "opensquilla-webui/package-lock.json", "uv.lock", ".ci/run-all",
+        "unknown/runtime-input",
+    ):
+        plan = _plan(tmp_path, suite_config, path)
+        assert {"frontend-artifact", "webui-chat-recovery", "webui-capacity"} <= set(
+            plan["required_suites"]
+        ), path
+        assert _platform_cells(plan, "webui-capacity") == {
+            ("ubuntu-22.04", "chromium-capacity"),
+        }
+    for path in ("src/opensquilla/gateway/app.py", "desktop/electron/src/main.ts"):
+        plan = _plan(tmp_path, suite_config, path)
+        assert "webui-chat-recovery" in plan["required_suites"], path
+        assert "webui-capacity" not in plan["required_suites"], path
+    assert "webui-capacity" not in _plan(
+        tmp_path, suite_config, "docs/ci-guide.md",
+    )["required_suites"]
 
 
 def _matrix(plan: dict[str, Any]) -> set[tuple[str, str]]:
@@ -303,21 +454,25 @@ def test_ordinary_python_change_selects_targets_without_full_fallback(
 
 def test_pr_1347_test_only_change_uses_exact_targets_and_windows_shards(
     suite_config: dict[str, Any],
+    _reuse_real_repo_dependencies: None,
 ) -> None:
     paths = [
         "tests/test_gateway/test_rpc_sessions.py",
         "tests/test_desktop/test_onboarding_main_process_flow_contract.py",
         "tests/test_recovery/test_recovery_cmd.py",
     ]
-    importing_consumer = "tests/test_gateway/test_p1a_exact_abort_contract.py"
+    importing_consumers = [
+        "tests/test_gateway/test_p1a_exact_abort_contract.py",
+        "tests/test_gateway/test_task_runtime_cancellation_settlement.py",
+    ]
 
     plan = plan_changes(paths, repo=Path.cwd(), config=suite_config)
 
     assert plan["full_fallback"] is False
-    assert plan["python_targets"] == sorted([*paths, importing_consumer])
+    assert plan["python_targets"] == sorted([*paths, *importing_consumers])
     assert plan["python_matrix"] == {
         "ubuntu": [],
-        "windows": _windows_partitions_for(*paths, importing_consumer),
+        "windows": _windows_partitions_for(*paths, *importing_consumers),
     }
     assert plan["desktop_matrix"] == []
     assert set(plan["required_suites"]) == {
@@ -1443,9 +1598,11 @@ def test_python_dependency_changes_select_reviewed_full_ecosystem_coverage(
         "macos-recovery",
         "managed-toolchain",
         "python-full",
+        "python-stress",
         "readme-locale",
         "release-packaging",
         "skill-hub",
+        "webui-capacity",
         "webui-chat-recovery",
         "wheel-webui-roundtrip",
         "windows-high-risk",
@@ -1497,6 +1654,7 @@ def test_webui_dependency_changes_stay_in_webui_ecosystem(
         "frontend-artifact",
         "frontend-validation",
         "readme-locale",
+        "webui-capacity",
         "webui-chat-recovery",
         "wheel-webui-roundtrip",
         "windows-nsis-regression",
@@ -1630,7 +1788,7 @@ def test_skill_hub_inputs_select_all_three_contract_platforms(
     ],
 )
 def test_skill_hub_related_test_change_keeps_three_platform_suite(
-    suite_config: dict[str, Any], path: str
+    suite_config: dict[str, Any], path: str, _reuse_real_repo_dependencies: None,
 ) -> None:
     plan = plan_changes(
         [path],
@@ -2089,10 +2247,31 @@ def test_readme_locale_inputs_cover_the_executed_node_contract(
         "opensquilla-webui/.node-version",
         "opensquilla-webui/package.json",
         "opensquilla-webui/scripts/check-readme-locales.mjs",
-        "opensquilla-webui/src/components/LanguageSwitcher.vue",
+        "opensquilla-webui/src/components/settings/SettingsLanguageControl.vue",
         "opensquilla-webui/src/i18n/index.ts",
     } <= inputs
     assert "scripts/check_readme_locale_parity.py" not in inputs
+    assert "opensquilla-webui/src/components/LanguageSwitcher.vue" not in inputs
+
+
+def test_readme_locale_digest_tracks_current_language_control(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    relative = "opensquilla-webui/src/components/settings/SettingsLanguageControl.vue"
+    source = tmp_path / relative
+    source.parent.mkdir(parents=True)
+    source.write_text("const LOCALE_LABELS = { en: 'English' }\n", encoding="utf-8")
+    first = _plan(tmp_path, suite_config, relative)
+
+    source.write_text("const LOCALE_LABELS = { en: 'Changed' }\n", encoding="utf-8")
+    second = _plan(tmp_path, suite_config, relative)
+
+    assert "readme-locale" in first["required_suites"]
+    assert (
+        first["suite_execution_digests"]["readme-locale"]
+        != second["suite_execution_digests"]["readme-locale"]
+    )
+    assert first["plan_digest"] != second["plan_digest"]
 
 
 def test_release_packaging_inputs_cover_root_readmes(
@@ -2160,10 +2339,11 @@ def test_config_accepts_repository_wide_recursive_wildcard(
     tmp_path: Path,
 ) -> None:
     value = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    value["suites"]["python-full"]["execution_inputs"] = ["**"]
+    patterns = ["**", "tests/test_c?/*.py", "tests/test_ci/test_[pw]*.py"]
+    value["suites"]["python-full"]["execution_inputs"] = patterns
     path = tmp_path / "suites.json"
     path.write_text(json.dumps(value), encoding="utf-8")
 
     loaded = load_config(path, repo=Path.cwd())
 
-    assert loaded["suites"]["python-full"]["execution_inputs"] == ["**"]
+    assert loaded["suites"]["python-full"]["execution_inputs"] == patterns

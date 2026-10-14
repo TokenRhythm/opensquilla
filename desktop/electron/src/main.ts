@@ -7348,7 +7348,9 @@ function dismissOnboardingFlow(flow: OnboardingFlow): void {
   const window = flow.window
   if (window && !window.isDestroyed()) window.close()
   resolve?.(null)
-  focusMainWindow()
+  // During app.quit(), the parent may have destroyed its webContents while
+  // still closing this child. Revealing that half-closed native window is unsafe.
+  if (!isQuitting && appExitPhase !== 'committed') focusMainWindow()
 }
 
 async function runOnboarding(): Promise<DesktopConnection | null> {
@@ -7568,9 +7570,15 @@ async function resolveGatewayRuntime(): Promise<RuntimeLaunch> {
     const detail = error instanceof Error ? error.message : String(error)
     throw new Error(`runtime_root_missing: ${detail}`)
   }
+  const entry = join(repoRoot, 'desktop', 'electron', 'scripts', 'gateway-entry.py')
+  if (!(await pathIsFile(entry))) {
+    throw new Error(`runtime_root_missing: Desktop Gateway entry not found at ${entry}`)
+  }
   return await validateGatewayRuntime({
     command: 'uv',
-    args: ['run', 'opensquilla', 'gateway', 'run'],
+    // Match the packaged dispatcher, including its lightweight offline recovery
+    // path, while continuing to execute Python from the selected checkout.
+    args: ['run', 'python', entry, 'gateway', 'run'],
     cwd: repoRoot,
     mode: 'dev',
   })

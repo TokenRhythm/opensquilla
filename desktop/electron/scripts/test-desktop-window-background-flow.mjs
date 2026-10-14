@@ -72,6 +72,7 @@ const userDataDir = join(isolationRoot, 'chromium-user-data')
 const isolatedHome = join(isolationRoot, 'home')
 const isolatedRoaming = join(isolationRoot, 'AppData', 'Roaming')
 const isolatedLocal = join(isolationRoot, 'AppData', 'Local')
+const isolatedTemp = join(isolatedLocal, 'Temp')
 let desktopApp
 let flowSucceeded = false
 let outage = false
@@ -274,6 +275,7 @@ try {
   await mkdir(isolatedHome, { recursive: true })
   await mkdir(isolatedRoaming, { recursive: true })
   await mkdir(isolatedLocal, { recursive: true })
+  await mkdir(isolatedTemp, { recursive: true })
   if (idleSend) syntheticProvider = await startSyntheticProvider()
 
   // Use a synthetic keyless profile so the lifecycle test reaches the Control
@@ -312,6 +314,11 @@ try {
       USERPROFILE: isolatedHome,
       APPDATA: isolatedRoaming,
       LOCALAPPDATA: isolatedLocal,
+      TEMP: isolatedTemp,
+      TMP: isolatedTemp,
+      TMPDIR: isolatedTemp,
+      OPENSQUILLA_USER_STATE_DIR: join(isolatedHome, 'user-state'),
+      OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1',
       OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
       OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
       OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',

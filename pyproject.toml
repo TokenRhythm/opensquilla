@@ -190,9 +190,13 @@ exclude = ["opensquilla-webui/public/music", "opensquilla-webui/public/music/**"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Capacity/soak checks run in the required python-stress CI suite. Explicit
+# `-m stress` (or `-m ''` for everything) overrides this local default.
+addopts = "-m 'not stress'"
 asyncio_mode = "auto"
 norecursedirs = ["tests/_private", "tests/fixtures", ".omx", ".codex", ".claude"]
 markers = [
+    "stress: capacity or soak tests run separately from ordinary offline regressions",
     "ci_serial: tests that must run outside the parallel CI pytest worker pool",
     "llm: marks tests that make real external model/provider API calls (deselect with '-m \"not llm\"')",
     "llm_smoke: low-cost live LLM smoke tests",

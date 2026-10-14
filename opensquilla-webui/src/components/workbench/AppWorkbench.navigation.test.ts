@@ -7,6 +7,7 @@ import en from '@/locales/en.json'
 import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
 import { useWorkbenchStore } from '@/workbench/store'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
+import { artifactDocumentWorkspaceKey, useArtifactDocumentsStore } from '@/stores/artifactDocuments'
 import { artifactFromWorkbenchItem, artifactWorkbenchItemId, createArtifactPreviewWorkbenchItem } from '@/workbench/artifactItems'
 import { createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvider'
 import { artifactProductClientError } from '@/utils/artifactProductErrors'
@@ -14,7 +15,7 @@ import type { ArtifactPayload } from '@/types/artifacts'
 import type { WorkbenchResource, WorkbenchResourceOpenResponse } from '@/types/workbenchResources'
 import AppWorkbench from './AppWorkbench.vue'
 
-const { pushToast } = vi.hoisted(() => ({ pushToast: vi.fn() }))
+const { pushToast, previewHarness } = vi.hoisted(() => ({ pushToast: vi.fn(), previewHarness: { enabled: false } }))
 vi.mock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast }) }))
 vi.mock('@/workbench/runtime', async importOriginal => ({
   ...await importOriginal<typeof import('@/workbench/runtime')>(),
@@ -24,10 +25,31 @@ vi.mock('@/workbench/runtime', async importOriginal => ({
 vi.mock('./WorkbenchHost.vue', async () => {
   const { defineComponent, h } = await import('vue')
   const { useWorkbenchStore } = await import('@/workbench/store')
-  return { default: defineComponent({ inheritAttrs: false, setup(_, { slots }) {
+  return { default: defineComponent({ inheritAttrs: false, props: ['tabInfo'], setup(props, { slots }) {
     const store = useWorkbenchStore()
-    return () => h('div', slots.toolbar?.({ item: store.items.find(item => item.id === store.activeItemId) || null }))
+    return () => h('div', [
+      slots.toolbar?.({ item: store.items.find(item => item.id === store.activeItemId) || null }),
+      ...(previewHarness.enabled ? store.items.flatMap(item => {
+        const info = (props.tabInfo as (item: unknown) => { thumbnailUrl?: string })(item)
+        return [
+          h('img', { 'data-tab-thumbnail': item.id, src: info.thumbnailUrl }),
+          slots.panel?.({ item, active: item.id === store.activeItemId }),
+        ]
+      }) : []),
+    ])
   } }) }
+})
+vi.mock('./ArtifactDocumentPanel.vue', async () => {
+  const { defineComponent, h } = await import('vue')
+  return { default: defineComponent({ inheritAttrs: false, props: ['artifact', 'documentSnapshot'],
+    emits: ['workbench-event'], setup(props, { emit }) {
+      return () => h('button', { 'data-capture-thumbnail': props.artifact?.id,
+        onClick: () => emit('workbench-event', { type: 'preview-thumbnail', payload: new Blob([
+          props.documentSnapshot?.workspace?.headArtifact?.revisionId || props.artifact?.revisionId || '',
+        ], { type: 'image/png' }) }),
+      }, 'Capture thumbnail')
+    },
+  }) }
 })
 vi.mock('@/components/ResourceActionsMenu.vue', () => ({ default: { render: () => null } }))
 
@@ -78,15 +100,78 @@ async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPay
     picker.dispatchEvent(new Event('change', { bubbles: true }))
     await flush()
   }
-  return { host, store, resources, item, resolve, openCurrent, select, choose }
+  return { host, store, resources, documents: useArtifactDocumentsStore(pinia), item, resolve, openCurrent, select, choose }
 }
 afterEach(() => {
   apps.splice(0).forEach(app => app.unmount())
   document.body.innerHTML = ''
   vi.restoreAllMocks(); pushToast.mockClear()
+  previewHarness.enabled = false
 })
 
 describe('AppWorkbench artifact navigation', () => {
+  it.each([false, true])('retires an Office thumbnail when its document head changes (inactive=%s)', async inactive => {
+    previewHarness.enabled = true
+    vi.spyOn(URL, 'createObjectURL').mockReturnValueOnce('blob:old-office').mockReturnValueOnce('blob:new-office')
+    const h = await mount()
+    const artifact = { ...target, documentId: 'office-doc', revisionId: 'revision-1', sha256: 'a'.repeat(64) }
+    const item = createArtifactPreviewWorkbenchItem({ artifact, nativeHtml: false, sessionKey: 'session-a' })
+    h.store.openItem(item)
+    const key = artifactDocumentWorkspaceKey(artifact, 'session-a')
+    const workspace = createLegacyArtifactWorkspace(artifact, 'session-a')
+    function installHead(revisionId: string, sha256: string) {
+      h.documents.snapshots[key] = { key, loaded: true, loading: false, stale: false, error: null,
+        workspace: { ...workspace, source: 'document-api',
+          document: { ...workspace.document, documentId: 'office-doc', headRevisionId: revisionId },
+          headArtifact: { ...artifact, revisionId, sha256 },
+        },
+      }
+    }
+    installHead('revision-1', 'a'.repeat(64)); await flush()
+    const capture = () => h.host.querySelector<HTMLButtonElement>(`[data-capture-thumbnail="${artifact.id}"]`)!.click()
+    const thumbnail = () => h.host.querySelector<HTMLImageElement>(`[data-tab-thumbnail="${item.id}"]`)!.getAttribute('src')
+    capture(); await flush()
+    expect(thumbnail()).toBe('blob:old-office')
+    if (inactive) { h.store.activateItem(h.item.id); await flush() }
+
+    // An old renderer can finish in the microtask window before Vue replaces
+    // its props. Those bytes must not be stored under the new head identity.
+    const oldRenderFinishes = Promise.resolve().then(capture)
+    installHead('revision-2', 'b'.repeat(64))
+    await oldRenderFinishes; await flush()
+    expect(artifactFromWorkbenchItem(h.store.items.find(candidate => candidate.id === item.id)!)).toMatchObject({ revisionId: 'revision-1' })
+    expect(thumbnail()).toBeNull()
+
+    h.store.activateItem(item.id); await flush()
+    capture(); await flush()
+    expect(thumbnail()).toBe('blob:new-office')
+  })
+
+  it('keeps an immutable Office preview thumbnail pinned when the related document head advances', async () => {
+    previewHarness.enabled = true
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:immutable-office')
+    const h = await mount()
+    const artifact = { ...target, documentId: 'office-doc', revisionId: 'revision-1', sha256: 'a'.repeat(64) }
+    const item = createArtifactPreviewWorkbenchItem({ artifact, nativeHtml: false, sessionKey: 'session-a',
+      preparedPreview: { protocolVersion: 1, mode: 'local-renderer', sandboxProfile: 'none', network: false,
+        resource: { type: 'deliverable', id: String(artifact.id) },
+        adapter: { id: 'silurus-office', version: '0.88.0', format: 'pptx' },
+      },
+    })
+    h.store.openItem(item); await flush()
+    h.host.querySelector<HTMLButtonElement>(`[data-capture-thumbnail="${artifact.id}"]`)!.click(); await flush()
+    const key = artifactDocumentWorkspaceKey(artifact, 'session-a')
+    const workspace = createLegacyArtifactWorkspace(artifact, 'session-a')
+    h.documents.snapshots[key] = { key, loaded: true, loading: false, stale: false, error: null,
+      workspace: { ...workspace, source: 'document-api',
+        document: { ...workspace.document, documentId: 'office-doc', headRevisionId: 'revision-2' },
+        headArtifact: { ...artifact, revisionId: 'revision-2', sha256: 'b'.repeat(64) },
+      },
+    }
+    await flush()
+    expect(h.host.querySelector<HTMLImageElement>(`[data-tab-thumbnail="${item.id}"]`)!.getAttribute('src')).toBe('blob:immutable-office')
+  })
+
   it('hides the switcher when the current canonical identity has no matching option', async () => {
     const h = await mount({ canonicalCurrent: true })
     expect(h.select()).toBeNull()

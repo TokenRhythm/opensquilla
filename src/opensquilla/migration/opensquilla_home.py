@@ -54,7 +54,7 @@ from opensquilla.migration.source_snapshot_windows import (
     copy_windows_snapshot_file,
     scan_windows_source_tree,
 )
-from opensquilla.paths import default_opensquilla_home
+from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.recovery.locking import (
     LegacyGatewayLock,
     LegacyGatewayLockFileSnapshot,
@@ -2115,9 +2115,12 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # Staging and atomic temporary names can exceed MAX_PATH even when the
+    # published receipt path fits. Keep this spelling local to filesystem I/O.
+    io_path = native_io_path(path)
+    io_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        prefix=f".{path.name}.", suffix=".tmp", dir=io_path.parent
     )
     temporary = Path(temporary_name)
     try:
@@ -2127,8 +2130,8 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
-        os.replace(_ext(temporary), _ext(path))
-        _fsync_directory(path.parent)
+        os.replace(temporary, io_path)
+        _fsync_directory(io_path.parent)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
@@ -3963,10 +3966,11 @@ class OpenSquillaHomeMigrator:
             current = staging
             for component in snapshot.destination_prefix.parts:
                 current /= component
+                io_current = native_io_path(current)
                 try:
-                    value = current.lstat()
+                    value = io_current.lstat()
                 except FileNotFoundError:
-                    current.mkdir()
+                    io_current.mkdir()
                     continue
                 try:
                     entry_type = _supported_entry_type(current, value)
@@ -3987,15 +3991,16 @@ class OpenSquillaHomeMigrator:
             if snapshot.destination_prefix != Path():
                 snapshot_destination = ensure_snapshot_destination(snapshot)
                 os.chmod(
-                    snapshot_destination,
+                    native_io_path(snapshot_destination),
                     (snapshot.root_mode & 0o777) | 0o700,
                 )
             for entry in snapshot.entries:
                 destination = staging / snapshot.destination_prefix / entry.relative
+                io_destination = native_io_path(destination)
                 if entry.entry_type == "directory":
-                    if destination.exists() or destination.is_symlink():
+                    if io_destination.exists() or io_destination.is_symlink():
                         try:
-                            destination_stat = destination.lstat()
+                            destination_stat = io_destination.lstat()
                             destination_type = _supported_entry_type(
                                 destination, destination_stat
                             )
@@ -4008,8 +4013,8 @@ class OpenSquillaHomeMigrator:
                                 f"source roots collide on a non-directory: {destination}"
                             )
                     else:
-                        destination.mkdir(parents=True, exist_ok=False)
-                    os.chmod(destination, (entry.mode & 0o777) | 0o700)
+                        io_destination.mkdir(parents=True, exist_ok=False)
+                    os.chmod(io_destination, (entry.mode & 0o777) | 0o700)
                     continue
 
                 if entry.entry_type == "symlink":
@@ -4021,7 +4026,7 @@ class OpenSquillaHomeMigrator:
                                 f"source roots contain conflicting links for {destination}"
                             )
                         continue
-                    if destination.exists() or destination.is_symlink():
+                    if io_destination.exists() or io_destination.is_symlink():
                         raise OSError(f"staging destination already exists: {destination}")
                     copied_target = _copy_snapshot_symlink_posix(
                         snapshot,
@@ -4029,7 +4034,7 @@ class OpenSquillaHomeMigrator:
                         destination,
                     )
                     if copied_target != entry.link_target:
-                        destination.unlink(missing_ok=True)
+                        io_destination.unlink(missing_ok=True)
                         raise OSError(f"source link changed while copied: {entry.source}")
                     copied_links[destination] = copied_target
                     continue
@@ -4045,13 +4050,13 @@ class OpenSquillaHomeMigrator:
                             f"source roots contain conflicting files for {destination}"
                         )
                     continue
-                if destination.exists() or destination.is_symlink():
+                if io_destination.exists() or io_destination.is_symlink():
                     raise OSError(f"staging destination already exists: {destination}")
                 copied_digest = _copy_snapshot_file(snapshot, entry, destination)
                 if copied_digest != entry.digest:
-                    destination.unlink(missing_ok=True)
+                    io_destination.unlink(missing_ok=True)
                     raise OSError(f"source file changed while copied: {entry.source}")
-                os.chmod(destination, (entry.mode & 0o777) | 0o600)
+                os.chmod(io_destination, (entry.mode & 0o777) | 0o600)
                 copied_files[destination] = copied_digest
 
     def _target_free_bytes(self) -> int:

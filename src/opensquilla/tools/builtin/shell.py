@@ -7844,6 +7844,15 @@ async def _start_host_background_process(
     async def _collect_host() -> None:
         process_exited = asyncio.Event()
         output_task = asyncio.create_task(_read_bg_output(session, process_exited))
+        failure: BaseException | None = None
+
+        def retain_failure(stage: str, exc: BaseException) -> None:
+            nonlocal failure
+            if failure is None:
+                failure = exc
+            else:
+                failure.add_note(f"{stage} also failed: {type(exc).__name__}: {exc}")
+
         try:
             completed = (
                 await _wait_exec_process(proc, effective_timeout)
@@ -7858,14 +7867,25 @@ async def _start_host_background_process(
                 # EOF/leader exit must not strand descendants that inherited
                 # the terminal. Keep ownership until the full tree is empty.
                 await terminate_pty(pty_handle, close_reader=False)
+        except BaseException as exc:
+            retain_failure("process collection", exc)
         finally:
             process_exited.set()
             try:
                 await output_task
-            finally:
+            except BaseException as exc:
+                retain_failure("output drain", exc)
+            try:
                 if pty_handle is not None:
                     await asyncio.to_thread(pty_handle.close_reader)
+            except BaseException as exc:
+                retain_failure("PTY reader close", exc)
+            try:
                 await _finalize_bg_session_async(session)
+            except BaseException as exc:
+                retain_failure("session finalization", exc)
+        if failure is not None:
+            raise failure
 
     session.collector_task = asyncio.create_task(_collect_host())
     return _background_process_result(session)

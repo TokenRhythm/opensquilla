@@ -24,7 +24,14 @@ const draft = 'Reply with the fixture confirmation. Do not call any tools.'
 const userDataRoot = await mkdtemp(join(tmpdir(), 'opensquilla-first-chat-'))
 const isolatedHome = join(userDataRoot, 'home')
 const userDataDir = join(userDataRoot, 'chromium-user-data')
-await mkdir(isolatedHome, { recursive: true })
+const appData = join(isolatedHome, 'AppData', 'Roaming')
+const localAppData = join(isolatedHome, 'AppData', 'Local')
+const localTemp = join(localAppData, 'Temp')
+await Promise.all([
+  mkdir(appData, { recursive: true }),
+  mkdir(localAppData, { recursive: true }),
+  mkdir(localTemp, { recursive: true }),
+])
 const requests = []
 const diagnostics = []
 const stages = []
@@ -101,6 +108,10 @@ const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !(
 )))
 Object.assign(env, {
   HOME: isolatedHome, USERPROFILE: isolatedHome,
+  APPDATA: appData, LOCALAPPDATA: localAppData,
+  TEMP: localTemp, TMP: localTemp,
+  OPENSQUILLA_USER_STATE_DIR: localAppData,
+  OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1',
   OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
   OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
   OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',

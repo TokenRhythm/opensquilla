@@ -4,12 +4,16 @@ import json
 import os
 import subprocess
 import sys
+import time
+from contextlib import suppress
+from functools import wraps
 from pathlib import Path
 
 import pytest
 
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+from opensquilla.tools import write_tracking
 from opensquilla.tools.builtin.code_exec import execute_code
 from opensquilla.tools.builtin.shell import exec_command
 from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
@@ -39,7 +43,9 @@ def _write_utf8_repro_command() -> str:
 
 
 @pytest.fixture
-def mutation_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def mutation_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest,
+):
     monkeypatch.setenv("PATH", str(Path(sys.executable).parent), prepend=os.pathsep)
     reset_runtime()
     workspace = tmp_path / "workspace"
@@ -63,6 +69,62 @@ def mutation_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         scratch_dir=str(scratch),
         session_key="agent:main:test",
         on_runtime_event=events.append,
+    )
+    probe_counts = {"git": 0, "snapshot": 0}
+
+    def observe_probe(kind, real_probe):
+        @wraps(real_probe)
+        def observed(*args, **kwargs):
+            probe_counts[kind] += 1
+            ordinal = probe_counts[kind]
+            started = time.perf_counter()
+            result = None
+            exception_type = None
+            try:
+                result = real_probe(*args, **kwargs)
+                return result
+            except BaseException as exc:
+                exception_type = type(exc).__name__[:80]
+                raise
+            finally:
+                # Pytest displays these call sections on failure. Keep the real
+                # Git deadline and results, and never expose paths or contents.
+                # Diagnostics must not replace a probe result or its exception.
+                if ordinal <= 4:
+                    with suppress(Exception):
+                        diagnostic = {
+                            "probe": kind,
+                            "ordinal": ordinal,
+                            "elapsed_seconds": round(time.perf_counter() - started, 6),
+                            "exception_type": exception_type,
+                        }
+                        if exception_type is None:
+                            if kind == "git":
+                                diagnostic.update(
+                                    state=result.state.value,
+                                    returncode=result.returncode,
+                                    stdout_bytes=len(result.stdout),
+                                    stderr_bytes=len(result.stderr),
+                                )
+                            else:
+                                diagnostic.update(
+                                    state=result.git_state.value,
+                                    observed=result.observed,
+                                    authoritative=result.authoritative,
+                                    skip_reason=result.skip_reason,
+                                    entry_count=len(result),
+                                )
+                        request.node.add_report_section(
+                            "call", f"workspace mutation {kind} probe {ordinal}",
+                            json.dumps(diagnostic, sort_keys=True),
+                        )
+
+        return observed
+
+    monkeypatch.setattr(write_tracking, "run_git", observe_probe("git", write_tracking.run_git))
+    monkeypatch.setattr(
+        write_tracking, "snapshot_workspace_mutations",
+        observe_probe("snapshot", write_tracking.snapshot_workspace_mutations),
     )
     token = current_tool_context.set(ctx)
     try:

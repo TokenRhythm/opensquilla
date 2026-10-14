@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import itertools
 import json
 import os
 import runpy
@@ -24,6 +25,7 @@ SHARD_NAMES: tuple[str, ...] = SHARD_MODULE["SHARD_NAMES"]
 WINDOWS_SHARD_NAMES: tuple[str, ...] = SHARD_MODULE["WINDOWS_SHARD_NAMES"]
 discover_test_files = SHARD_MODULE["discover_test_files"]
 files_for_shard = SHARD_MODULE["files_for_shard"]
+files_for_planned_windows_shards = SHARD_MODULE["files_for_planned_windows_shards"]
 historical_test_weights = SHARD_MODULE["historical_test_weights"]
 matching_specialized_shards = SHARD_MODULE["matching_specialized_shards"]
 assignment_governance = SHARD_MODULE["assignment_governance"]
@@ -44,6 +46,8 @@ validate_partition_payload = SHARD_MODULE["validate_partition_payload"]
 
 OFFLINE_MARKER_EXCLUSIONS = SHARD_MODULE["OFFLINE_MARKER_EXCLUSIONS"]
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    # Cancellation settlement uses the provisional floor until a Windows refresh.
+    "tests/test_gateway/test_task_runtime_cancellation_settlement.py",
     # Generator provenance checks use the provisional floor pending Windows samples.
     "tests/contracts/test_codegen_versions.py",
     # Security inventory, rendering, and functional probes use measured Windows
@@ -503,10 +507,6 @@ def test_native_attachment_runtime_parity_is_marked_ci_serial(function_name: str
 
 def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
-        Path("tests/test_ci/test_upgrade_baselines.py"),
-        "test_packaged_gateway_readiness_budget_and_terminal_errors",
-    )
-    assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_desktop/test_gateway_functional_probes.py"),
         "test_mcp_probe_uses_real_stdio_server_and_gateway",
     )
@@ -571,6 +571,18 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
 @pytest.mark.parametrize(
     ("test_file", "function_name"),
     [
+        (
+            "tests/test_tools/test_shell_blocking_launch.py",
+            "test_slow_native_launch_preserves_loop_and_ownership",
+        ),
+        (
+            "tests/test_tools/test_shell_blocking_launch.py",
+            "test_quiet_native_reader_is_reclaimed_after_initialization",
+        ),
+        (
+            "tests/test_tools/test_shell_blocking_launch.py",
+            "test_runner_shutdown_waits_for_native_launch_cleanup",
+        ),
         (
             "tests/test_gateway/test_plan_rpc.py",
             "test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn",
@@ -931,6 +943,7 @@ def test_windows_shard_responsibilities_cover_high_risk_surfaces() -> None:
     expected = {
         "tests/test_ci/test_router_artifact_manifest.py": "core",
         "tests/test_channels/test_feishu_sdk_websocket.py": "gateway-sqlite",
+        "tests/test_gateway/test_task_runtime_cancellation_settlement.py": "gateway-sqlite",
         "tests/test_gateway/test_task_runtime_terminal_cleanup.py": "gateway-sqlite",
         "tests/test_persistence/test_migrator.py": "gateway-sqlite",
         "tests/test_session/test_manager.py": "gateway-sqlite",
@@ -984,6 +997,51 @@ def test_windows_execution_partitions_cover_every_file_once_within_its_family() 
     for path, physical in assignments.items():
         assert shard_family(physical) == shard_for_test(path)
         assert windows_shard_for_test(path) == physical
+
+
+def test_planned_windows_inventory_preserves_owners_for_every_matrix_subset(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+    # One real governed path per physical owner is enough to exercise all 1,023
+    # nonempty plans without repeatedly scanning the full repository.
+    samples = {
+        shard: next(path for path, owner in partition_assignments().items() if owner == shard)
+        for shard in WINDOWS_SHARD_NAMES
+    }
+    for path in samples.values():
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.touch()
+    for size in range(1, len(WINDOWS_SHARD_NAMES) + 1):
+        for planned in itertools.combinations(WINDOWS_SHARD_NAMES, size):
+            selected = files_for_planned_windows_shards(tmp_path, planned[0], json.dumps(planned))
+            assert set(selected) == {samples[shard] for shard in planned}, planned
+
+
+@pytest.mark.parametrize("planned", [
+    "", "not-json", "null", "{}", "[]", '["core-1", "core-1"]',
+    '["core-1", "unknown"]', '["core-1", 1]', '["core-2"]', '["core"]',
+])
+def test_planned_windows_inventory_cli_rejects_invalid_proof_before_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], planned: str,
+) -> None:
+    args = SHARD_MODULE["_parser"]().parse_args([
+        "list", "core-1", "--root", str(tmp_path), "--planned-windows-shards", planned,
+    ])
+    with pytest.raises(ValueError):
+        args.handler(args)
+    assert capsys.readouterr().out == ""
+
+
+def test_planned_windows_inventory_cli_propagates_collection_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    args = SHARD_MODULE["_parser"]().parse_args([
+        "list", "core-1", "--root", str(tmp_path),
+        "--planned-windows-shards", '["core-1"]',
+    ])
+    with pytest.raises(ValueError, match="cannot read pytest collection contract"):
+        args.handler(args)
+    assert capsys.readouterr().out == ""
 
 
 def test_windows_partitions_stay_fixed_when_duration_weights_change(
@@ -1364,10 +1422,10 @@ def test_windows_shard_runner_preserves_failure_exit_and_summary(tmp_path: Path)
     assert metadata_payload["execution"] == {
         "parallel": {
             "dist": "loadfile",
-            "marker": "not ci_serial",
+            "marker": "(not stress) and (not ci_serial)",
             "workers": 4,
         },
-        "serial": {"marker": "ci_serial", "workers": 1},
+        "serial": {"marker": "(not stress) and (ci_serial)", "workers": 1},
     }
     assert len(metadata_payload["assignment_sha256"]) == 64
     text = summary.read_text(encoding="utf-8")
@@ -1665,12 +1723,19 @@ def test_windows_shard_runner_splits_parallel_and_serial_tests(tmp_path: Path) -
     assert metadata_payload["execution"]["parallel"]["workers"] == 2
 
 
-@pytest.mark.parametrize("selected_shard", ["core-1", "gateway-sqlite-3", "gateway-sqlite-4"])
+@pytest.mark.parametrize(("selected_shard", "marker_args", "expected_cases"), [
+    ("core-1", [], {"test_parallel", "test_serial"}),
+    ("gateway-sqlite-3", ["-m", ""], {
+        "test_parallel", "test_serial", "test_stress_parallel", "test_stress_serial",
+    }),
+    ("gateway-sqlite-4", ["-m", "stress"], {"test_stress_parallel", "test_stress_serial"}),
+])
 def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
-    tmp_path: Path, selected_shard: str,
+    tmp_path: Path, selected_shard: str, marker_args: list[str], expected_cases: set[str],
 ) -> None:
     (tmp_path / "pyproject.toml").write_text(
-        '[tool.pytest.ini_options]\nmarkers = ["ci_serial: serial CI contract"]\n',
+        '[tool.pytest.ini_options]\naddopts = "-m \'not stress\'"\n'
+        'markers = ["ci_serial: serial CI contract", "stress: capacity contract"]\n',
         encoding="utf-8",
     )
     family = shard_family(selected_shard)
@@ -1687,6 +1752,13 @@ def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
         "    assert os.environ.get('PYTEST_XDIST_WORKER', '').startswith('gw')\n\n"
         "@pytest.mark.ci_serial\n"
         "def test_serial():\n"
+        "    assert 'PYTEST_XDIST_WORKER' not in os.environ\n\n"
+        "@pytest.mark.stress\n"
+        "def test_stress_parallel():\n"
+        "    assert os.environ.get('PYTEST_XDIST_WORKER', '').startswith('gw')\n\n"
+        "@pytest.mark.stress\n"
+        "@pytest.mark.ci_serial\n"
+        "def test_stress_serial():\n"
         "    assert 'PYTEST_XDIST_WORKER' not in os.environ\n",
         encoding="utf-8-sig",
     )
@@ -1726,6 +1798,7 @@ def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
             "1",
             "--",
             "-q",
+            *marker_args,
         ],
         check=False,
         capture_output=True,
@@ -1737,11 +1810,12 @@ def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
     assert metadata["test_files"] == [selected_path]
     assert metadata["partition_sha256"] == partition_snapshot_fingerprint()
     assert metadata["family"] == family
+    base_marker = marker_args[1] if marker_args else "not stress"
+    for phase, selector in (("parallel", "not ci_serial"), ("serial", "ci_serial")):
+        expected_marker = f"({base_marker}) and ({selector})" if base_marker else selector
+        assert metadata["execution"][phase]["marker"] == expected_marker
     junit = ET.parse(reports / "junit.xml").getroot()
-    assert {test.get("name") for test in junit.iter("testcase")} == {
-        "test_parallel",
-        "test_serial",
-    }
+    assert {test.get("name") for test in junit.iter("testcase")} == expected_cases
     assert (reports / "junit.parallel.xml").is_file()
     assert (reports / "junit.serial.xml").is_file()
 

@@ -54,11 +54,11 @@ async def history(tmp_path):
         await storage.close()
 
 
-async def populate(manager, key, *, tokens=300):
+async def populate(manager, key, *, tokens=300, content_chars=500):
     for index in range(8):
         await manager.append_message(
             key, "user" if index % 2 == 0 else "assistant",
-            f"synthetic item {index} " + "x" * 500, token_count=tokens,
+            f"synthetic item {index} " + "x" * content_chars, token_count=tokens,
         )
     return list(await manager.get_transcript(key))
 
@@ -105,7 +105,9 @@ async def test_twenty_failed_turns_open_circuit_without_changing_durable_history
 
 async def test_soft_pressure_failure_keeps_full_history_without_window(history):
     _, manager, key, _ = history
-    entries = await populate(manager, key, tokens=100)
+    # Keep both tokenizer and fallback estimates below the persisted floor:
+    # soft pressure is 0.85 * 900 < 8 * 100 <= 900, even without tiktoken.
+    entries = await populate(manager, key, tokens=100, content_chars=100)
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
     prepared_window = await runner._maybe_preflight_compact(key, 900)
     assert manager.attempts == 1

@@ -51,13 +51,26 @@ async def _call(tmp_path, method, params, **context_options):
     )
 
 
+class _Checkpoint(threading.Event):
+    """Notify the loop without occupying the executor used by the RPC worker."""
+
+    def __init__(self):
+        super().__init__()
+        self._loop = asyncio.get_running_loop()
+        self.reached = asyncio.Event()
+
+    def set(self):
+        super().set()
+        self._loop.call_soon_threadsafe(self.reached.set)
+
+
 async def _wait(event):
-    assert await asyncio.to_thread(event.wait, 3), "worker did not reach checkpoint"
+    await asyncio.wait_for(event.reached.wait(), 3)
 
 
 @contextmanager
 def _writer(path, *, sql_started=None, loop_progress=None):
-    ready = threading.Event()
+    ready = _Checkpoint()
     release = threading.Event()
     released = threading.Event()
     errors = []
@@ -143,7 +156,7 @@ async def test_constructor_and_operation_run_off_loop_with_context(tmp_path, mon
 @pytest.mark.parametrize("method", ["create", "revoke"])
 async def test_loop_progresses_while_waiting_for_write_lock(tmp_path, monkeypatch, method):
     path, public_id = _seed(tmp_path)
-    started = threading.Event()
+    started = _Checkpoint()
     progress = threading.Event()
     _observe_writes(monkeypatch, started)
     heartbeat_before_release = []
@@ -228,7 +241,7 @@ async def test_create_returns_secret_once_and_revoke_is_durable(tmp_path):
 @pytest.mark.parametrize("method", ["create", "revoke"])
 async def test_repeated_cancellation_waits_for_one_committed_write(tmp_path, monkeypatch, method):
     path, public_id = _seed(tmp_path)
-    started = threading.Event()
+    started = _Checkpoint()
     calls = _observe_writes(monkeypatch, started)
     task = None
     try:
@@ -266,7 +279,7 @@ async def test_storage_failure_is_settled_without_retry(tmp_path, monkeypatch, c
     # Prepare the empty database before timing the failure/cancellation handshake.
     # Constructor execution on the worker is covered separately above.
     TokenStore(tmp_path / "sessions.db")
-    started = threading.Event()
+    started = _Checkpoint()
     release = threading.Event()
     calls = []
 

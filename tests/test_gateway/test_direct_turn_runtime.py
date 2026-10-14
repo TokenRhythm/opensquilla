@@ -195,10 +195,11 @@ async def _run_synthetic_direct_turn(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("heartbeat", [True, False], ids=["heartbeat-control", "inline-publish"])
 async def test_aborted_direct_turn_closes_real_runner_scopes(
-    tmp_path: Path,
     heartbeat: bool,
 ) -> None:
-    config = GatewayConfig(state_dir=str(tmp_path / "state"))
+    # Exercise real policy pinning with embedded defaults. Cold SQLite setup
+    # belongs to the policy tests, not this stream cancellation's 2s deadline.
+    config = GatewayConfig(state_dir=None)
     if not heartbeat:
         config.agent_stream_heartbeat_interval_seconds = 0
     profile = SimpleNamespace(
@@ -225,6 +226,8 @@ async def test_aborted_direct_turn_closes_real_runner_scopes(
             self.stream: AsyncIterator[AgentEvent] | None = None
 
         def run(self, *args: Any, **kwargs: Any) -> AsyncIterator[AgentEvent]:
+            assert kwargs["tool_context"].sandbox_policy.policy_version == 0
+            assert kwargs["tool_context"].sandbox_gateway_config is config
             # Retain the actual generator so GC cannot make a missed close pass.
             self.stream = super().run(*args, **kwargs)
             return self.stream
@@ -286,8 +289,10 @@ async def test_aborted_direct_turn_closes_real_runner_scopes(
 
 
 @pytest.mark.asyncio
-async def test_second_cancel_during_stream_close_preserves_direct_cleanup(tmp_path: Path) -> None:
-    config = GatewayConfig(state_dir=str(tmp_path / "state"))
+async def test_second_cancel_during_stream_close_preserves_direct_cleanup() -> None:
+    # Keep policy pinning, but exclude unrelated database creation from the
+    # first publication deadline before either cancellation is exercised.
+    config = GatewayConfig(state_dir=None)
     profile = SimpleNamespace(
         run_context=lambda: RunContext(run_mode=RunMode.SAFE),
         cleanup=Mock(),
@@ -305,6 +310,8 @@ async def test_second_cancel_during_stream_close_preserves_direct_cleanup(tmp_pa
         context_bound = True
 
         async def run(self, *args: Any, **kwargs: Any) -> AsyncIterator[AgentEvent]:
+            assert kwargs["tool_context"].sandbox_policy.policy_version == 0
+            assert kwargs["tool_context"].sandbox_gateway_config is config
             driver_tasks.append(asyncio.current_task())
             try:
                 yield TextDeltaEvent(text="synthetic partial answer")

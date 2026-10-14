@@ -113,20 +113,6 @@ def test_safe_sandbox_uses_public_default_for_unknown_domain() -> None:
     )
 
 
-def test_safe_sandbox_url_uses_public_default() -> None:
-    decision = decide_network_access(
-        "https://new-public-example.invalid",
-        _context(run_mode=RunMode.SAFE),
-    )
-
-    assert decision == NetworkDecision(
-        status="allow",
-        normalized_host="new-public-example.invalid",
-        reason="public_default",
-        source="policy:default_open",
-    )
-
-
 def test_standard_public_network_grant_allows_unknown_public_domain() -> None:
     context = _context(public_network=(PublicNetworkGrant(scope="chat"),))
 

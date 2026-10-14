@@ -417,9 +417,11 @@ _FIXED_PLATFORM_MATRIX: Final[dict[str, tuple[tuple[str, str], ...]]] = {
     ),
     "wheel-webui-roundtrip": (("ubuntu-latest", "package"),),
     "webui-chat-recovery": (("ubuntu-22.04", "chromium"),),
+    "webui-capacity": (("ubuntu-22.04", "chromium-capacity"),),
     "tui": (("ubuntu-latest", "default"),),
     "desktop-static": (("ubuntu-latest", "default"),),
     "python-targeted": (("ubuntu-latest", "targeted"),),
+    "python-stress": (("ubuntu-latest", "stress"),),
     "macos-recovery": (("macos-latest", "recovery"),),
     "release-packaging": (("ubuntu-latest", "default"),),
     "windows-nsis-regression": (
@@ -1501,10 +1503,21 @@ def _validate_execution_input_patterns(
     if not files:
         raise PlanError(f"cannot validate suite execution_inputs in empty repository {repo}")
 
+    file_set = set(files)
+    # Literal inputs are membership checks, not full repository glob scans.
+    # Share wildcard answers across suites within this validation only; later
+    # calls must observe newly added/deleted files and changed configuration.
+    matches: dict[str, bool] = {}
     unmatched: list[tuple[str, str]] = []
     for suite_id, raw_suite in sorted(config["suites"].items()):
         for pattern in raw_suite["execution_inputs"]:
-            if not any(_matches_input(path, pattern) for path in files):
+            if pattern not in matches:
+                matches[pattern] = (
+                    any(_matches_input(path, pattern) for path in files)
+                    if any(character in pattern for character in "*?[")
+                    else pattern in file_set
+                )
+            if not matches[pattern]:
                 unmatched.append((suite_id, pattern))
     if unmatched:
         details = ", ".join(
@@ -2139,6 +2152,37 @@ def plan_changes(
     elif "python-full" in suites:
         suites.discard("python-targeted")
         targets = {"tests"}
+
+    # Keep capacity checks out of ordinary shards/preflights, but require them
+    # for their runtime dependencies and every complete offline Python plan.
+    # Unknown paths and CI-policy changes still select full_suites above.
+    if "python-full" in suites or any(
+        path.startswith((
+            "src/opensquilla/gateway/", "src/opensquilla/session/",
+            "src/opensquilla/persistence/", "src/opensquilla/recovery/",
+            "src/opensquilla/safety/", "src/opensquilla/config/",
+            "src/opensquilla/contracts/",
+        )) or path in {
+            "src/opensquilla/provider/types.py",
+            "tests/test_gateway/test_task_runtime_terminal_cleanup.py",
+        }
+        for path in paths
+    ):
+        suites.add("python-stress")
+
+    # These synthetic renderer workloads depend on the WebUI and its fixtures.
+    # Backend/desktop-only recovery changes still run the ordinary browser
+    # contracts, including the 1,000-row pagination case, without repeating the
+    # 34,000-event flood and 3,000-row capacity case. Full/dependency plans stay
+    # conservative. Both browser phases share one runner and verified artifact.
+    if "webui-chat-recovery" in suites and (
+        full_fallback or any(
+            path.startswith("opensquilla-webui/")
+            or _dependency_domain(path) == "python"
+            for path in paths
+        )
+    ):
+        suites.add("webui-capacity")
 
     # Browser, Electron, and wheel consumers use the verified WebUI artifact.
     # Keep this dependency closure in the planner so a selected consumer can
