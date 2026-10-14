@@ -6,7 +6,7 @@ export interface ToolInputPreview {
   generationEpoch: number
   revision: number
   state: 'generating' | 'committed' | 'discarded'
-  toolName: 'write_file'
+  toolName: 'write_file' | 'execute_code'
   path: string
   content: string
   truncated: boolean

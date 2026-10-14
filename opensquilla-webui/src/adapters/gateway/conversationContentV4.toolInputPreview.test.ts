@@ -12,11 +12,11 @@ const project = (patch?: Record<string, unknown>) => projectConversationEvent(
   decodeConversationEvent('session.event.tool_input_preview', wire(patch)),
 )
 describe('tool input preview wire projection', () => {
-  it('projects the real wire contract as a typed bounded draft, never generic content', () => {
-    const event = project({ content: 'prefix🚀' + 'x'.repeat(65_535) })
+  it.each(['write_file', 'execute_code'])('projects %s as a typed bounded draft, never generic content', toolName => {
+    const event = project({ tool_name: toolName, path: toolName === 'execute_code' ? '' : 'a.html', content: 'prefix🚀' + 'x'.repeat(65_535) })
     expect(event).toMatchObject({ kind: 'known', semanticKind: 'tool-input-preview', payload: {
       task_id: 'task-1', generation_epoch: 0, toolInputPreview: { previewId: 'p1', attemptId: 'a1',
-        toolUseId: 'write-1', state: 'generating', content: 'x'.repeat(65_535), truncated: true },
+        toolUseId: 'write-1', toolName, state: 'generating', content: 'x'.repeat(65_535), truncated: true },
     } })
     expect(event).not.toHaveProperty('payload.content')
   })

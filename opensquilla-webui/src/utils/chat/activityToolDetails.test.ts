@@ -205,6 +205,16 @@ describe('retained typed tool history', () => {
     expect(activityToolCodeContent(view)).toBe('$ npm test\n\nstarted\nfull failure\n\nexit_code=2')
   })
 
+  it('retains authoritative execute_code source and output without a shell prompt', () => {
+    const view = projectActivityToolDetail(call({ name: 'execute_code',
+      inputRaw: JSON.stringify({ code: 'print("next")\napi_key = "secret"', command: 'unrelated' }),
+      result: JSON.stringify({ stdout: 'next', stderr: '', exit_code: 0 }),
+    }), 'command.run').codeView!
+    expect(view).toMatchObject({ language: 'python', command: 'print("next")\napi_key = [redacted]', output: 'next' })
+    expect(activityToolCodeContent(view)).toBe('print("next")\napi_key = [redacted]\n\nnext\n\nexit_code=0')
+    expect(view.unavailable).toBeUndefined()
+  })
+
   it('retains full structured command errors when no output stream contains the diagnostics', () => {
     const result = JSON.stringify({ exit_code: 1, error: `first error\nsecond detail\n${'diagnostic '.repeat(30)}last detail`, token: 'secret' })
     for (const isError of [true, false]) {

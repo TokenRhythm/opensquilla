@@ -249,11 +249,12 @@ function createHarness(options: {
   }
 }
 
-describe('live tool input preview delivery', () => {
+describe.each(['write_file', 'execute_code'] as const)('live %s input preview delivery', toolName => {
+  const path = toolName === 'write_file' ? 'page.html' : ''
   const draft = (patch: Record<string, unknown> = {}) => ({
     key: 'agent:main:test', task_id: 'task-live', turn_id: 'task-live', epoch: 0, stream_seq: 1,
     preview_id: 'p1', attempt_id: 'a1', tool_use_id: 'write-1', generation_epoch: 0,
-    revision: 1, state: 'generating', tool_name: 'write_file', path: 'page.html', content: '<html>', truncated: false,
+    revision: 1, state: 'generating', tool_name: toolName, path, content: '<html>', truncated: false,
     ...patch,
   })
   it('buffers until task acceptance, then rejects stale identities, duplicate cursor, replay, and cancellation', () => {
@@ -263,7 +264,7 @@ describe('live tool input preview delivery', () => {
       h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft())
       expect(h.stream.applyToolInputPreview).not.toHaveBeenCalled()
       h.api.bindActiveStreamTask('task-live')
-      expect(h.stream.applyToolInputPreview).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ content: '<html>', toolUseId: 'write-1' }), 1, false)
+      expect(h.stream.applyToolInputPreview).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ content: '<html>', toolUseId: 'write-1', toolName }), 1, false)
       h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft())
       for (const invalid of [{ key: 'other' }, { task_id: 'other', turn_id: 'other' }, { epoch: -1 }, { generation_epoch: 1 },
         { task_id: undefined, turn_id: undefined }, { stream_seq: undefined }]) {
@@ -303,7 +304,7 @@ describe('live tool input preview delivery', () => {
         semanticKind: 'tool-input-preview', payload: {
           key: h.sessionKey.value, task_id: 'task-live', turn_id: 'task-live', epoch: 0, stream_seq: 1, generation_epoch: 0,
           toolInputPreview: { previewId: 'p1', attemptId: 'a1', toolUseId: 'write-1', generationEpoch: 0,
-            revision: 1, state: 'generating', toolName: 'write_file', path: 'page.html', content: '<html>', truncated: false },
+            revision: 1, state: 'generating', toolName, path, content: '<html>', truncated: false },
         },
       }] })
       h.streamRuntime!.toggleToolItem('write-1', true)
@@ -317,7 +318,8 @@ describe('live tool input preview delivery', () => {
         expect(h.streamRuntime!.toolInputPreviews.value[0]?.state).toBe('committed')
         h.api.handlers.onWireEventFixture('session.event.tool_use_start', {
           key: h.sessionKey.value, task_id: 'task-live', turn_id: 'task-live', epoch: 0, stream_seq: 4,
-          generation_epoch: 0, id: 'write-1', name: 'write_file', arguments: { path: 'page.html', content: '<html>final' },
+          generation_epoch: 0, id: 'write-1', name: toolName,
+          arguments: toolName === 'write_file' ? { path, content: '<html>final' } : { code: '<html>final' },
         }, { replayed: true })
         await new Promise(resolve => setTimeout(resolve, 60))
         expect(h.streamRuntime!.toolInputPreviews.value).toEqual([])

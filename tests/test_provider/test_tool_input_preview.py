@@ -13,6 +13,7 @@ from opensquilla.provider.tool_input_preview import (
 from opensquilla.provider.types import (
     DoneEvent,
     ErrorEvent,
+    ProviderGenerationResetEvent,
     ToolInputPreviewEvent,
     ToolUseDeltaEvent,
     ToolUseEndEvent,
@@ -62,6 +63,71 @@ def test_partial_file_input_duplicate_fields_replace_and_memory_is_bounded() -> 
     assert parser.content_chars == PREVIEW_CONTENT_LIMIT * 3 + 4
 
 
+@pytest.mark.parametrize("fragment_size", [1, 3, 17, 4096])
+def test_partial_code_input_reads_only_real_top_level_code(fragment_size: int) -> None:
+    code = 'print("代码 😀")\n# "code":"literal"\\n'
+    payload = {
+        "nested": {"code": "not the code"}, "path": "private-path",
+        "content": "not file content", "code": code, "credentials": "not displayed",
+    }
+    source = json.dumps(payload, ensure_ascii=True)
+    parser = PartialFileInput("execute_code")
+    for offset in range(0, len(source), fragment_size):
+        parser.feed(source[offset:offset + fragment_size])
+        parser.content.encode("utf-8")
+    assert parser.content == code
+    assert parser.path == ""
+
+
+def test_code_drafts_throttle_flush_and_revoke_superseded_generation() -> None:
+    clock = [0.0]
+    drafts = FileInputDrafts(clock=lambda: clock[0])
+    drafts.observe(ToolUseStartEvent(tool_use_id="code", tool_name="execute_code"))
+    first = drafts.observe(ToolUseDeltaEvent(
+        tool_use_id="code", json_fragment='{"code":"print(',
+    ))[0]
+    assert first.tool_name == "execute_code" and first.path == ""
+    assert first.content == "print(" and first.state == "generating"
+    clock[0] = 0.5
+    assert not drafts.observe(ToolUseDeltaEvent(tool_use_id="code", json_fragment="1"))
+    clock[0] = 1.0
+    next_preview = drafts.observe(ToolUseDeltaEvent(tool_use_id="code", json_fragment=")"))[0]
+    assert next_preview.content == "print(1)"
+    final = drafts.observe(ToolUseEndEvent(
+        tool_use_id="code", tool_name="execute_code", arguments={"code": "print(1)\nprint(2)"},
+    ))[0]
+    assert final.content == "print(1)\nprint(2)" and final.state == "generating"
+    assert final.preview_id == first.preview_id
+    discarded = drafts.observe(ProviderGenerationResetEvent())[0]
+    assert discarded.state == "discarded" and discarded.content == ""
+    drafts.observe(ToolUseStartEvent(tool_use_id="code", tool_name="execute_code"))
+    replacement = drafts.observe(ToolUseDeltaEvent(
+        tool_use_id="code", json_fragment='{"code":"replacement',
+    ))[0]
+    assert replacement.attempt_id != first.attempt_id
+    assert replacement.preview_id != first.preview_id
+    assert replacement.content == "replacement"
+
+
+def test_interleaved_code_and_file_drafts_keep_content_and_budget_separate() -> None:
+    drafts = FileInputDrafts()
+    drafts.observe(ToolUseStartEvent(tool_use_id="code", tool_name="execute_code"))
+    drafts.observe(ToolUseStartEvent(tool_use_id="file", tool_name="write_file"))
+    code = drafts.observe(ToolUseDeltaEvent(
+        tool_use_id="code", json_fragment='{"code":"' + "x" * (PREVIEW_CONTENT_LIMIT + 9),
+    ))[0]
+    file = drafts.observe(ToolUseDeltaEvent(
+        tool_use_id="file", json_fragment='{"path":"x","content":"file only',
+    ))[0]
+    assert code.tool_name == "execute_code" and len(code.content) == PREVIEW_CONTENT_LIMIT
+    assert code.truncated and code.path == ""
+    assert file.tool_name == "write_file" and file.content == "file only"
+    assert code.preview_id != file.preview_id
+    discarded = drafts.observe(ErrorEvent(code="503"))
+    assert len(discarded) == 2
+    assert all(event.state == "discarded" and event.content == "" for event in discarded)
+
+
 def test_drafts_publish_first_content_then_throttle_and_flush_tail() -> None:
     clock = [0.0]
     drafts = FileInputDrafts(clock=lambda: clock[0])
@@ -78,14 +144,39 @@ def test_drafts_publish_first_content_then_throttle_and_flush_tail() -> None:
     second = drafts.observe(ToolUseDeltaEvent(tool_use_id="one", json_fragment=" third"))[0]
     assert second.content == "first second third"
     assert second.preview_id == first.preview_id and second.revision == 2
-    assert not drafts.observe(ToolUseDeltaEvent(tool_use_id="one", json_fragment=' last"}'))
-    tail = drafts.observe(ToolUseEndEvent(
+    tail = drafts.observe(ToolUseDeltaEvent(tool_use_id="one", json_fragment=' last"}'))[0]
+    assert not drafts.observe(ToolUseEndEvent(
         tool_use_id="one", tool_name="write_file", arguments={},
-    ))[0]
+    ))
     assert tail.content.endswith(" last") and tail.revision == 3
     discarded = drafts.observe(ErrorEvent(code="400"))[0]
     assert discarded.state == "discarded" and discarded.content == ""
     assert discarded.revision == 4
+
+
+@pytest.mark.parametrize("tool_name, prefix", [
+    ("write_file", '{"path":"a.py","content":"'),
+    ("execute_code", '{"code":"'),
+])
+def test_closed_string_flushes_tail_before_provider_finishes(tool_name, prefix) -> None:
+    clock = [0.0]
+    drafts = FileInputDrafts(clock=lambda: clock[0])
+    drafts.observe(ToolUseStartEvent(tool_use_id="input", tool_name=tool_name))
+    first = drafts.observe(ToolUseDeltaEvent(
+        tool_use_id="input", json_fragment=prefix + "print(",
+    ))[0]
+    clock[0] = 0.5
+    assert not drafts.observe(ToolUseDeltaEvent(tool_use_id="input", json_fragment="123"))
+    # Closing a JSON string is factual content availability even while the
+    # provider has not emitted tool end, finish_reason, or DoneEvent.
+    tail = drafts.observe(ToolUseDeltaEvent(tool_use_id="input", json_fragment=')"}'))[0]
+    assert tail.content == "print(123)"
+    assert tail.preview_id == first.preview_id and tail.revision == first.revision + 1
+    assert tail.tool_name == tool_name and tail.state == "generating"
+    assert not drafts.observe(ToolUseDeltaEvent(tool_use_id="input", json_fragment=" "))
+    # A complete source string still must disappear if its attempt fails.
+    discarded = drafts.observe(ErrorEvent(code="503"))[0]
+    assert discarded.state == "discarded" and discarded.content == ""
 
 
 def test_drafts_limit_tools_and_ignore_unrelated_arguments() -> None:

@@ -4092,6 +4092,12 @@
     "activityElapsed": "用时 {duration}",
     "activityDurationMinutes": "{minutes} 分 {seconds} 秒",
     "activity": {
+      "codeDraft": {
+        "generating": "正在准备代码",
+        "ready": "代码已准备",
+        "note": "生成中草稿 · 尚未执行",
+        "truncated": "草稿最新片段 · 尚未执行"
+      },
       "fileDraft": {
         "generating": "正在生成文件",
         "ready": "准备写入文件",

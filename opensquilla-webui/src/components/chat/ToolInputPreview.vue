@@ -18,24 +18,26 @@ const emit = defineEmits<{ toggleItem: [id: string, open: boolean] }>()
 const { t } = useI18n()
 const activityVisible = useActivityDisclosureVisibility()
 const stateId = computed(() => props.stateScope ? `${props.stateScope}:${props.preview.toolUseId}` : props.preview.toolUseId)
-const codeView = computed(() => ({ kind: 'write' as const, path: props.preview.path, content: props.preview.content }))
+const isCode = computed(() => props.preview.toolName === 'execute_code')
+const labelKey = computed(() => `chat.activity.${isCode.value ? 'codeDraft' : 'fileDraft'}`)
+const codeView = computed(() => ({ kind: 'write' as const, path: isCode.value ? 'execute_code' : props.preview.path, content: props.preview.content }))
 function toggle() { emit('toggleItem', stateId.value, !props.open) }
 </script>
 
 <template>
   <section class="tool-input-preview" data-testid="tool-input-preview" :data-preview-id="preview.previewId"
-    data-activity-entry="true" data-activity-type="file-draft" :data-activity-order="preview.activityOrder">
+    data-activity-entry="true" :data-activity-type="isCode ? 'code-draft' : 'file-draft'" :data-activity-order="preview.activityOrder">
     <button type="button" class="tool-input-preview__summary" :aria-expanded="open === true" @click="toggle">
       <ActivityMotion :active="executing === true && activityVisible && preview.state === 'generating'">
-        <Icon name="pencil" :size="14" aria-hidden="true" />
-        <span class="tool-input-preview__label">{{ t(preview.state === 'committed' ? 'chat.activity.fileDraft.ready' : 'chat.activity.fileDraft.generating') }}</span>
-        <span class="tool-input-preview__path" :title="preview.path">{{ activityDisplayPath(preview.path) }}</span>
+        <Icon :name="isCode ? 'terminal' : 'pencil'" :size="14" aria-hidden="true" />
+        <span class="tool-input-preview__label">{{ t(`${labelKey}.${preview.state === 'committed' ? 'ready' : 'generating'}`) }}</span>
+        <span v-if="!isCode" class="tool-input-preview__path" :title="preview.path">{{ activityDisplayPath(preview.path) }}</span>
       </ActivityMotion>
       <Icon class="tool-input-preview__chevron" :class="{ 'tool-input-preview__chevron--open': open }" name="chevronRight" :size="12" aria-hidden="true" />
     </button>
     <template v-if="open">
       <ActivityCodeDetails :view="codeView" draft :truncated="preview.truncated" />
-      <p class="tool-input-preview__note">{{ t(preview.truncated ? 'chat.activity.fileDraft.truncated' : 'chat.activity.fileDraft.note') }}</p>
+      <p class="tool-input-preview__note">{{ t(`${labelKey}.${preview.truncated ? 'truncated' : 'note'}`) }}</p>
     </template>
   </section>
 </template>

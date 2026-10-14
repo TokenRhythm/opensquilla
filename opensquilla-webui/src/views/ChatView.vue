@@ -4229,6 +4229,8 @@ const liveTimelineItems = computed(() => stripBackgroundProcessNoticeTimeline(
 ))
 const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value, {
   keepToolTurnTextInActivity: true,
+  toolInputPreviewOrder: Math.max(0, ...toolInputPreviews.value.map(preview => preview.activityOrder)),
+  renderActivityMarkdown: renderMarkdown,
 }))
 const liveAnswerPart = computed<Extract<ChatPart, { type: 'text' }> | null>(() => {
   const candidate = liveTimelineSplit.value.answerItem

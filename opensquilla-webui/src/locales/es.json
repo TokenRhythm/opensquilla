@@ -4008,6 +4008,12 @@
     "activityElapsed": "Tiempo empleado {duration}",
     "activityDurationMinutes": "{minutes} min {seconds} s",
     "activity": {
+      "codeDraft": {
+        "generating": "Preparando código",
+        "ready": "Código preparado",
+        "note": "Borrador en curso · El código aún no se ha ejecutado",
+        "truncated": "Último fragmento del borrador · El código aún no se ha ejecutado"
+      },
       "fileDraft": {
         "generating": "Generando archivo",
         "ready": "Preparando escritura",

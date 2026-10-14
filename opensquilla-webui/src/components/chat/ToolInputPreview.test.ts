@@ -60,3 +60,41 @@ it('keeps draft HTML inert, mounts code only when expanded, and uses the eventua
   await nextTick()
   expect(host.querySelector('code')).toBeNull()
 })
+
+it('streams actual execute_code text in the existing disclosure without claiming it executed', async () => {
+  i18n.global.locale.value = 'en'
+  const preview: LiveToolInputPreview = {
+    previewId: 'code-draft', attemptId: 'attempt-code', toolUseId: 'code-1', generationEpoch: 0,
+    activityOrder: 4, revision: 1, state: 'generating', toolName: 'execute_code', path: '',
+    content: 'print("<script>not executable</script>")', truncated: false,
+  }
+  const state = reactive({ preview, open: false, executing: true })
+  const choices: unknown[] = []
+  const host = document.createElement('div')
+  document.body.appendChild(host)
+  const app = createApp({ render: () => h(ToolInputPreview, { ...state, stateScope: 'turn-code',
+    onToggleItem: (id: string, open: boolean) => { choices.push([id, open]); state.open = open },
+  }) })
+  apps.push(app); app.use(i18n); app.mount(host)
+  const summary = host.querySelector<HTMLButtonElement>('button')!
+  expect(summary.textContent).toContain('Preparing code')
+  expect(host.querySelector('.tool-input-preview__path')).toBeNull()
+  expect(host.querySelector('code')).toBeNull()
+  summary.click()
+  await nextTick()
+  expect(choices).toEqual([['turn-code:code-1', true]])
+  const code = host.querySelector('code')!
+  expect(code.textContent).toBe(preview.content)
+  expect(host.querySelector('script')).toBeNull()
+  expect(host.textContent).toContain('Code has not been executed')
+  state.preview = { ...preview, revision: 2, content: preview.content + '\nprint("next")' }
+  await nextTick()
+  expect(host.querySelector('code')).toBe(code)
+  expect(code.textContent).toBe(state.preview.content)
+  state.preview = { ...state.preview, revision: 3, state: 'committed', truncated: true }
+  await nextTick()
+  expect(summary.textContent).toContain('Code prepared')
+  expect(host.querySelector('.activity-motion--active')).toBeNull()
+  expect(host.textContent).toContain('Latest draft content · Code has not been executed')
+  expect(host.querySelectorAll('button')).toHaveLength(1)
+})

@@ -13,6 +13,7 @@ export function useToolInputPreviews() {
     if (existingOnly && !previous) return false
     if (previous && (previous.attemptId !== preview.attemptId
       || previous.generationEpoch !== preview.generationEpoch || previous.toolUseId !== preview.toolUseId
+      || previous.toolName !== preview.toolName
       || previous.revision >= preview.revision || previous.state !== 'generating')) return false
     if (!previous && accepted.size >= 64) return false
     const bounded = boundedToolInputPreviewContent(preview.content)

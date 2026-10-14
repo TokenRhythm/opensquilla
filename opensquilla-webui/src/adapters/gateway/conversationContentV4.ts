@@ -471,7 +471,7 @@ function projectKnownConversationContent(
     const payload = projectConversationContent(rawPayload, semanticKind)
     const id = (value: unknown) => typeof value === 'string' && value.length > 0 && value.length <= 512
     if (id(raw.preview_id) && id(raw.attempt_id) && id(raw.tool_use_id)
-      && raw.tool_name === 'write_file'
+      && (raw.tool_name === 'write_file' || raw.tool_name === 'execute_code')
       && ['generating', 'committed', 'discarded'].includes(String(raw.state))
       && Number.isSafeInteger(raw.revision) && Number(raw.revision) > 0
       && Number.isSafeInteger(raw.generation_epoch) && Number(raw.generation_epoch) >= 0
@@ -481,7 +481,7 @@ function projectKnownConversationContent(
       payload.toolInputPreview = {
         previewId: String(raw.preview_id), attemptId: String(raw.attempt_id), toolUseId: String(raw.tool_use_id),
         generationEpoch: Number(raw.generation_epoch), revision: Number(raw.revision),
-        state: raw.state as 'generating' | 'committed' | 'discarded', toolName: 'write_file',
+        state: raw.state as 'generating' | 'committed' | 'discarded', toolName: raw.tool_name,
         path: raw.path, content: bounded.content, truncated: raw.truncated || bounded.truncated,
       }
     }

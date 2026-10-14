@@ -29,9 +29,16 @@ from opensquilla.provider import (
 class _Provider:
     provider_name = "openrouter"
 
-    def __init__(self, *, failed: bool = False, code: str = "400") -> None:
+    def __init__(
+        self, *, failed: bool = False, code: str = "400", tool_name: str = "write_file",
+    ) -> None:
         self.failed = failed
         self.code = code
+        self.tool_name = tool_name
+        self.arguments = (
+            {"code": "<html>hello</html>"} if tool_name == "execute_code"
+            else {"path": "example.html", "content": "<html>hello</html>"}
+        )
         self.calls = 0
         self.done_seen = False
 
@@ -41,23 +48,27 @@ class _Provider:
             yield TextDeltaEvent(text="done")
             yield DoneEvent()
             return
-        yield ToolUseStartEvent(tool_use_id="file", tool_name="write_file")
+        yield ToolUseStartEvent(tool_use_id="file", tool_name=self.tool_name)
         yield ToolUseDeltaEvent(
-            tool_use_id="file", json_fragment='{"path":"example.html","content":"<html>',
+            tool_use_id="file", json_fragment=(
+                '{"code":"<html>' if self.tool_name == "execute_code"
+                else '{"path":"example.html","content":"<html>'
+            ),
         )
         yield ToolUseDeltaEvent(tool_use_id="file", json_fragment='hello</html>"}')
         if self.failed:
             yield ErrorEvent(code=self.code)
             return
         yield ToolUseEndEvent(
-            tool_use_id="file", tool_name="write_file",
-            arguments={"path": "example.html", "content": "<html>hello</html>"},
+            tool_use_id="file", tool_name=self.tool_name, arguments=self.arguments,
         )
         self.done_seen = True
         yield DoneEvent(stop_reason="tool_calls")
 
 
-def _agent(provider: Any, executions: list[Any], context=None) -> Agent:
+def _agent(
+    provider: Any, executions: list[Any], context=None, *, tool_name="write_file",
+) -> Agent:
     async def handler(call):
         executions.append(call.arguments)
         return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="written")
@@ -66,7 +77,7 @@ def _agent(provider: Any, executions: list[Any], context=None) -> Agent:
         provider=provider,
         config=AgentConfig(max_provider_retries=0),
         tool_definitions=[ToolDefinition(
-            name="write_file", description="write a file", input_schema=ToolInputSchema(),
+            name=tool_name, description="test tool", input_schema=ToolInputSchema(),
         )],
         tool_handler=handler,
         execution_context=context,
@@ -76,8 +87,11 @@ def _agent(provider: Any, executions: list[Any], context=None) -> Agent:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("failed", [False, True])
-async def test_draft_precedes_commit_and_never_executes_failed_attempt(wrapped, failed) -> None:
-    provider = _Provider(failed=failed)
+@pytest.mark.parametrize("tool_name", ["write_file", "execute_code"])
+async def test_draft_precedes_commit_and_never_executes_failed_attempt(
+    wrapped, failed, tool_name,
+) -> None:
+    provider = _Provider(failed=failed, tool_name=tool_name)
 
     class _Selector:
         current_config = SimpleNamespace(provider="openrouter", model="test")
@@ -88,7 +102,7 @@ async def test_draft_precedes_commit_and_never_executes_failed_attempt(wrapped, 
     selected = _SelectorFallbackProvider(provider, _Selector()) if wrapped else provider
     executions = []
     events = []
-    async for event in _agent(selected, executions).run_turn("write a file"):
+    async for event in _agent(selected, executions, tool_name=tool_name).run_turn("prepare tool"):
         events.append(event)
         if isinstance(event, ToolInputPreviewEvent) and event.state == "generating":
             assert not provider.done_seen
@@ -98,20 +112,22 @@ async def test_draft_precedes_commit_and_never_executes_failed_attempt(wrapped, 
 
     previews = [event for event in events if isinstance(event, ToolInputPreviewEvent)]
     assert len({event.preview_id for event in previews}) == 1
+    assert all(event.tool_name == tool_name for event in previews)
     assert previews[0].content == "<html>"
     assert previews[-1].state == ("discarded" if failed else "committed")
     if failed:
         assert executions == [] and previews[-1].content == ""
         assert not any(isinstance(event, PublicToolStart) for event in events)
     else:
-        assert executions == [{"path": "example.html", "content": "<html>hello</html>"}]
+        assert executions == [provider.arguments]
         assert previews[-1].content == "<html>hello</html>"
         commit = next(index for index, event in enumerate(events) if event is previews[-1])
         assert isinstance(events[commit + 1], PublicToolStart)
 
 
 @pytest.mark.asyncio
-async def test_preview_emits_real_gateway_wire_and_snapshot_coalesces() -> None:
+@pytest.mark.parametrize("tool_name", ["write_file", "execute_code"])
+async def test_preview_emits_real_gateway_wire_and_snapshot_coalesces(tool_name) -> None:
     registry = SessionStreamRegistry()
     observed = []
 
@@ -120,6 +136,7 @@ async def test_preview_emits_real_gateway_wire_and_snapshot_coalesces() -> None:
             yield ToolInputPreviewEvent(
                 preview_id="draft", attempt_id="attempt", tool_use_id="file",
                 generation_epoch=0, revision=revision, path="a.txt", content=str(revision),
+                tool_name=tool_name,
             )
 
     async def emit(session_key, event_name, payload):
@@ -138,6 +155,7 @@ async def test_preview_emits_real_gateway_wire_and_snapshot_coalesces() -> None:
     assert len(drafts) == 1
     assert drafts[0].payload["revision"] == 19
     assert drafts[0].payload["content"] == "19"
+    assert drafts[0].payload["tool_name"] == tool_name
     assert "tool_results" not in json.dumps(drafts[0].payload)
     registry.record(
         "agent:main:webchat:draft", "session.event.done", {"task_id": "task"},
@@ -150,9 +168,12 @@ async def test_preview_emits_real_gateway_wire_and_snapshot_coalesces() -> None:
 
 
 @pytest.mark.asyncio
-async def test_selector_fallback_revokes_draft_and_reused_tool_id_gets_new_identity() -> None:
-    primary = _Provider(failed=True, code="503")
-    fallback = _Provider()
+@pytest.mark.parametrize("tool_name", ["write_file", "execute_code"])
+async def test_selector_fallback_revokes_draft_and_reused_tool_id_gets_new_identity(
+    tool_name,
+) -> None:
+    primary = _Provider(failed=True, code="503", tool_name=tool_name)
+    fallback = _Provider(tool_name=tool_name)
 
     class _Selector:
         current_config = SimpleNamespace(provider="openrouter", model="primary")
@@ -162,7 +183,7 @@ async def test_selector_fallback_revokes_draft_and_reused_tool_id_gets_new_ident
             return fallback
 
     executions = []
-    agent = _agent(_SelectorFallbackProvider(primary, _Selector()), executions)
+    agent = _agent(_SelectorFallbackProvider(primary, _Selector()), executions, tool_name=tool_name)
     events = [event async for event in agent.run_turn("write")]
     previews = [event for event in events if isinstance(event, ToolInputPreviewEvent)]
     discarded = next(event for event in previews if event.state == "discarded")
@@ -176,9 +197,11 @@ async def test_selector_fallback_revokes_draft_and_reused_tool_id_gets_new_ident
 
 
 @pytest.mark.asyncio
-async def test_closing_stream_during_preview_never_executes_tool() -> None:
+@pytest.mark.parametrize("tool_name", ["write_file", "execute_code"])
+async def test_closing_stream_during_preview_never_executes_tool(tool_name) -> None:
     executions = []
-    stream = _agent(_Provider(), executions).run_turn("write")
+    agent = _agent(_Provider(tool_name=tool_name), executions, tool_name=tool_name)
+    stream = agent.run_turn("prepare")
     async for event in stream:
         if isinstance(event, ToolInputPreviewEvent):
             break
@@ -188,7 +211,8 @@ async def test_closing_stream_during_preview_never_executes_tool() -> None:
 
 
 @pytest.mark.asyncio
-async def test_terminal_context_rejects_late_generating_preview() -> None:
+@pytest.mark.parametrize("tool_name", ["write_file", "execute_code"])
+async def test_terminal_context_rejects_late_generating_preview(tool_name) -> None:
     context = TurnExecutionContext.create(TurnIdentity("turn", "assistant", "draft-test"))
 
     class _CancelledProvider(_Provider):
@@ -200,7 +224,9 @@ async def test_terminal_context_rejects_late_generating_preview() -> None:
 
     executions = []
     events = [
-        event async for event in _agent(_CancelledProvider(), executions, context).run_turn("write")
+        event async for event in _agent(
+            _CancelledProvider(tool_name=tool_name), executions, context, tool_name=tool_name,
+        ).run_turn("prepare")
     ]
     generated = [
         event for event in events
@@ -247,7 +273,8 @@ async def test_selector_local_protocol_failure_discards_before_fallback_notice()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("patch", [
-    {"state": []}, {"generation_epoch": []}, {"revision": True}, {"content": "\ud800"},
+    {"state": []}, {"tool_name": []}, {"generation_epoch": []},
+    {"revision": True}, {"content": "\ud800"},
 ])
 async def test_malformed_optional_preview_cannot_break_the_real_answer(patch) -> None:
     class _MalformedPreview(_Provider):

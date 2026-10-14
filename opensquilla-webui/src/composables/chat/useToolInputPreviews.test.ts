@@ -17,6 +17,7 @@ describe('live tool input previews', () => {
     expect(store.accept(draft({ revision: 1, content: 'old' }), 9)).toBe(false)
     expect(store.accept(draft({ revision: 3, attemptId: 'other' }), 10)).toBe(false)
     expect(store.accept(draft({ revision: 3, generationEpoch: 1 }), 11)).toBe(false)
+    expect(store.accept(draft({ revision: 3, toolName: 'execute_code' }), 12)).toBe(false)
   })
   it.each(['discarded', 'committed'] as const)('never resurrects a %s preview', state => {
     const store = useToolInputPreviews()
@@ -56,6 +57,23 @@ describe('live tool input previews', () => {
     expect(store.accept(draft({ state: 'discarded', revision: 2, toolUseId: 'other' }), 2, true)).toBe(false)
     expect(store.previews.value).toHaveLength(1)
     expect(store.accept(draft({ state: 'discarded', revision: 2 }), 2, true)).toBe(true)
+    expect(store.previews.value).toEqual([])
+  })
+  it('keeps interleaved file/code drafts separate and hands off only the authoritative tool', () => {
+    const store = useToolInputPreviews()
+    const code = draft({ previewId: 'code', toolUseId: 'code-1', toolName: 'execute_code', path: '', content: 'print(' })
+    store.accept(draft(), 1)
+    store.accept(code, 2)
+    store.accept({ ...code, revision: 2, content: 'print(1)' }, 3)
+    expect(store.previews.value.map(item => [item.toolName, item.content, item.activityOrder])).toEqual([
+      ['write_file', '<html>', 1], ['execute_code', 'print(1)', 2],
+    ])
+    store.accept({ ...code, revision: 3, state: 'committed', content: '' }, 4)
+    expect(store.previews.value[1]?.content).toBe('print(1)')
+    store.handoff('code-1')
+    expect(store.previews.value.map(item => item.toolUseId)).toEqual(['tool-1'])
+    expect(store.accept({ ...code, revision: 4 }, 5)).toBe(false)
+    store.accept(draft({ revision: 2, state: 'discarded', content: '' }), 6)
     expect(store.previews.value).toEqual([])
   })
 })

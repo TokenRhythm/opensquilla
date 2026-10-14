@@ -59,10 +59,11 @@ describe('UnifiedAssistantActivityTimeline', () => {
     while (mounted.length) mounted.pop()?.unmount()
   })
 
-  it('keeps a manually expanded draft open when the real write tool replaces it', async () => {
+  it.each(['write_file', 'execute_code'] as const)('keeps a manually expanded draft open when the real %s replaces it', async toolName => {
+    const path = toolName === 'write_file' ? 'page.html' : ''
     const previews = ref<LiveToolInputPreview[]>([{
       previewId: 'p1', attemptId: 'a1', toolUseId: 'write-1', generationEpoch: 0, activityOrder: 2,
-      revision: 1, state: 'generating', toolName: 'write_file', path: 'page.html', content: '<html>draft', truncated: false,
+      revision: 1, state: 'generating', toolName, path, content: '<html>draft', truncated: false,
     }])
     const items = ref<ChatStreamTimelineItem[]>([])
     const choices = ref<Record<string, boolean>>({})
@@ -81,8 +82,8 @@ describe('UnifiedAssistantActivityTimeline', () => {
     await nextTick()
     expect(host.querySelector('code')?.textContent).toBe('<html>draft')
     expect(choices.value['turn-1:write-1']).toBe(true)
-    const call = { ...tool('write-1', 'write_file', 4), isRunning: true, status: '' as const,
-      inputRaw: JSON.stringify({ path: 'page.html', content: '<html>final' }) }
+    const call = { ...tool('write-1', toolName, 4), isRunning: true, status: '' as const,
+      inputRaw: JSON.stringify(toolName === 'write_file' ? { path, content: '<html>final' } : { code: '<html>final' }) }
     items.value = [group(call)]
     previews.value = []
     await nextTick()
@@ -90,6 +91,10 @@ describe('UnifiedAssistantActivityTimeline', () => {
     expect(host.querySelectorAll('[data-activity-type="segment"]')).toHaveLength(1)
     expect(host.querySelector('.tool-row')?.getAttribute('aria-expanded')).toBe('true')
     expect(host.querySelector('code')?.textContent).toContain('<html>final')
+    if (toolName === 'execute_code') {
+      expect(host.querySelector('.activity-code-details__title')?.textContent).toBe('Python')
+      expect(host.querySelector('.activity-code-details__prompt')).toBeNull()
+    }
   })
 
   it.each(['tool', 'reasoning'] as const)(

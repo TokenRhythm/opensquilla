@@ -4008,6 +4008,12 @@
     "activityElapsed": "所要時間 {duration}",
     "activityDurationMinutes": "{minutes} 分 {seconds} 秒",
     "activity": {
+      "codeDraft": {
+        "generating": "コードを準備中",
+        "ready": "コードを準備しました",
+        "note": "生成中の下書き · まだ実行されていません",
+        "truncated": "下書きの最新部分 · まだ実行されていません"
+      },
       "fileDraft": {
         "generating": "ファイルを生成中",
         "ready": "書き込みを準備中",

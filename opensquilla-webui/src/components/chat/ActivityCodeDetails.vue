@@ -40,7 +40,7 @@ function onPageKey(event: KeyboardEvent) {
 }
 const { t } = useI18n()
 const title = computed(() => props.view.kind === 'command'
-  ? 'Shell' : props.view.path?.replace(/\\/g, '/').split('/').pop() || t('shared.runTrace.sectionResult'))
+  ? (props.view.language === 'python' ? 'Python' : 'Shell') : props.view.path?.replace(/\\/g, '/').split('/').pop() || t('shared.runTrace.sectionResult'))
 const hasContent = computed(() => hasActivityToolCodeContent(props.view))
 const boundedParts = computed(() => {
   const value = props.view.kind === 'command' || props.view.error ? props.view.output : props.view.content
@@ -107,7 +107,7 @@ const diffLines = computed(() => source.value.split('\n').map(text => ({
     <div ref="viewport" class="activity-code-details__viewport" role="region" tabindex="0" :aria-label="title"
       @scroll.passive="checkScrollEnd" @wheel.passive="onWheel" @keydown="onPageKey">
       <template v-if="view.kind === 'command'">
-        <pre v-if="command" class="activity-code-details__command"><code><span class="activity-code-details__prompt" aria-hidden="true">$ </span>{{ command }}</code></pre>
+        <pre v-if="command" class="activity-code-details__command"><code><span v-if="view.language !== 'python'" class="activity-code-details__prompt" aria-hidden="true">$ </span>{{ command }}</code></pre>
         <pre v-if="source" class="activity-code-details__output"><code>{{ source }}</code></pre>
         <pre v-if="exitCode" class="activity-code-details__exit"><code>{{ exitCode }}</code></pre>
       </template>

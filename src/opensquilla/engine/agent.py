@@ -7867,7 +7867,7 @@ class Agent:
                                     continue
                                 if (
                                     not tools_supported_for_call
-                                    or raw_ev.tool_name != "write_file"
+                                    or raw_ev.tool_name not in ("write_file", "execute_code")
                                     or not isinstance(raw_ev.state, str)
                                     or raw_ev.state not in {"generating", "discarded"}
                                     or not isinstance(raw_ev.path, str)

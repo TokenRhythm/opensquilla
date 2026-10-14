@@ -4008,6 +4008,12 @@
     "activityElapsed": "Temps passé {duration}",
     "activityDurationMinutes": "{minutes} min {seconds} s",
     "activity": {
+      "codeDraft": {
+        "generating": "Préparation du code",
+        "ready": "Code préparé",
+        "note": "Brouillon en cours · Le code n’a pas encore été exécuté",
+        "truncated": "Dernier extrait du brouillon · Le code n’a pas encore été exécuté"
+      },
       "fileDraft": {
         "generating": "Génération du fichier",
         "ready": "Préparation de l’écriture",

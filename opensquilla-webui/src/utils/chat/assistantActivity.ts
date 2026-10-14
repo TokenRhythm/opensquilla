@@ -232,6 +232,10 @@ export interface LiveAssistantTimelineSplitOptions {
    * stream outside without relying on a timing heuristic.
    */
   keepToolTurnTextInActivity?: boolean
+  /** Latest real, revocable input draft; affects layout only, never tool execution. */
+  toolInputPreviewOrder?: number
+  /** Render an answer's raw text only when a later draft moves it into activity. */
+  renderActivityMarkdown?: (text: string) => string
 }
 
 export interface AssistantActivityProjection extends AssistantActivityTimelineProjection {
@@ -374,6 +378,23 @@ export function splitLiveAssistantTimeline(
   options: LiveAssistantTimelineSplitOptions = {},
 ): LiveAssistantTimelineSplit {
   const last = timeline[timeline.length - 1]
+  if (last?.type === 'text'
+    && Number.isSafeInteger(last.activityOrder) && Number(last.activityOrder) > 0
+    && Number.isSafeInteger(options.toolInputPreviewOrder)
+    && Number(options.toolInputPreviewOrder) > Number(last.activityOrder)) {
+    // A later real input draft must not appear above the text preceding it.
+    // Preserve the original order/presentation, without adding a tool boundary
+    // to the turn log. Revoking the draft restores normal answer placement.
+    const activityItems = timeline.slice()
+    if (!last.html && last.rawText && options.renderActivityMarkdown) {
+      // The live fold omits trailing answer HTML because StreamingTextPart
+      // normally renders its raw text. ActivityNarration needs a display copy.
+      activityItems[activityItems.length - 1] = {
+        ...last, html: options.renderActivityMarkdown(last.rawText),
+      }
+    }
+    return { activityItems, answerItem: null }
+  }
   if (
     options.keepToolTurnTextInActivity
     && timeline.some(item => item.type === 'tool-group')

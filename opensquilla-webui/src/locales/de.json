@@ -4008,6 +4008,12 @@
     "activityElapsed": "Zeitaufwand {duration}",
     "activityDurationMinutes": "{minutes} Min. {seconds} Sek.",
     "activity": {
+      "codeDraft": {
+        "generating": "Code wird vorbereitet",
+        "ready": "Code vorbereitet",
+        "note": "Live-Entwurf · Code wurde noch nicht ausgeführt",
+        "truncated": "Neuester Entwurfsausschnitt · Code wurde noch nicht ausgeführt"
+      },
       "fileDraft": {
         "generating": "Datei wird erstellt",
         "ready": "Schreiben wird vorbereitet",

@@ -1,4 +1,4 @@
-"""Bounded, revocable file drafts, separate from transactional tool events."""
+"""Bounded, revocable file/code drafts, separate from transactional tool events."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
-from typing import Any
+from typing import Any, Literal
 
 from .types import (
     DoneEvent,
@@ -28,16 +28,19 @@ PREVIEW_SEEN_TOOL_LIMIT = 64
 
 
 class PartialFileInput:
-    """Read only top-level string path/content using a streaming JSON lexer.
+    """Read only allowlisted top-level strings using a streaming JSON lexer.
 
     This is a display projection, not JSON validation or executable arguments.
     The provider's completed argument object remains the execution authority.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, tool_name: Literal["write_file", "execute_code"] = "write_file") -> None:
+        self.tool_name = tool_name
+        self.content_key = "code" if tool_name == "execute_code" else "content"
         self.path = ""
         self.content = ""
         self.content_chars = 0
+        self.content_complete = False
         self.path_complete = False
         self._depth = 0
         self._expect_key = False
@@ -100,6 +103,8 @@ class PartialFileInput:
                     elif self._role == "path":
                         self.path_complete = not self._token_overflow
                         self.path = self._token if self.path_complete else ""
+                    elif self._role == "content":
+                        self.content_complete = True
                 else:
                     decoded(char)
                 continue
@@ -109,7 +114,9 @@ class PartialFileInput:
                 self._token_overflow = False
                 self._role = (
                     "key" if self._depth == 1 and self._expect_key
-                    else self._key if self._depth == 1 and self._key in {"path", "content"}
+                    else "content" if self._depth == 1 and self._key == self.content_key
+                    else "path" if self._depth == 1 and self._key == "path"
+                    and self.tool_name == "write_file"
                     else "skip"
                 )
                 if self._role == "path":
@@ -118,6 +125,7 @@ class PartialFileInput:
                     self.content = ""
                     appended.clear()
                     self.content_chars = 0
+                    self.content_complete = False
             elif char in "{[":
                 self._depth += 1
                 if self._depth == 1:
@@ -160,10 +168,11 @@ class FileInputDrafts:
                 return []
             self._seen.add(tool_id)
             if (
-                event.tool_name == "write_file" and tool_id not in self._delegated
+                event.tool_name in ("write_file", "execute_code")
+                and tool_id not in self._delegated
                 and len(self._previews.keys() | self._inputs.keys()) < PREVIEW_ACTIVE_TOOL_LIMIT
             ):
-                self._inputs[tool_id] = PartialFileInput()
+                self._inputs[tool_id] = PartialFileInput(event.tool_name)
                 self._epochs[tool_id] = getattr(event, "generation_epoch", None)
             return []
         if isinstance(event, ToolUseDeltaEvent):
@@ -172,26 +181,32 @@ class FileInputDrafts:
             source = self._inputs.get(event.tool_use_id)
             if source is not None and isinstance(event.json_fragment, str):
                 source.feed(event.json_fragment)
-                return self._snapshot(event.tool_use_id)
+                # Once the real string closes, flush its tail even if the
+                # provider pauses before ToolUseEnd/finish_reason. This is
+                # still a revocable draft, not execution or argument commit.
+                return self._snapshot(event.tool_use_id, force=source.content_complete)
         if isinstance(event, ToolUseEndEvent):
             if not isinstance(event.tool_use_id, str):
                 return []
             source = self._inputs.get(event.tool_use_id)
-            if source is not None and event.tool_name == "write_file":
+            if source is not None and event.tool_name == source.tool_name:
                 arguments = event.arguments
                 if (
                     isinstance(arguments, dict)
-                    and isinstance(arguments.get("path"), str)
-                    and isinstance(arguments.get("content"), str)
-                    and 0 < len(arguments["path"]) <= PREVIEW_PATH_LIMIT
+                    and isinstance(arguments.get(source.content_key), str)
+                    and (source.tool_name == "execute_code" or (
+                        isinstance(arguments.get("path"), str)
+                        and 0 < len(arguments["path"]) <= PREVIEW_PATH_LIMIT
+                    ))
                 ):
                     # Providers may supply the final suffix only in the
                     # authoritative completed object. It is still a draft
                     # until Agent's transactional tool commit succeeds.
-                    source.path = arguments["path"]
-                    source.path_complete = True
-                    source.content = arguments["content"][-PREVIEW_CONTENT_LIMIT:]
-                    source.content_chars = len(arguments["content"])
+                    if source.tool_name == "write_file":
+                        source.path = arguments["path"]
+                        source.path_complete = True
+                    source.content = arguments[source.content_key][-PREVIEW_CONTENT_LIMIT:]
+                    source.content_chars = len(arguments[source.content_key])
             events = self._snapshot(event.tool_use_id, force=True)
             self._inputs.pop(event.tool_use_id, None)
             return events
@@ -209,8 +224,8 @@ class FileInputDrafts:
     def _snapshot(self, tool_id: str, *, force: bool = False) -> list[ToolInputPreviewEvent]:
         source = self._inputs.get(tool_id)
         if (
-            source is None or not source.path_complete
-            or not source.path or not source.content_chars
+            source is None or not source.content_chars
+            or (source.tool_name == "write_file" and (not source.path_complete or not source.path))
         ):
             return []
         previous = self._previews.get(tool_id)
@@ -228,6 +243,7 @@ class FileInputDrafts:
             generation_epoch=self._epochs.get(tool_id),
             tool_use_id=tool_id,
             revision=previous.revision + 1 if previous else 1,
+            tool_name=source.tool_name,
             path=source.path,
             content=source.content,
             truncated=source.content_chars > PREVIEW_CONTENT_LIMIT,

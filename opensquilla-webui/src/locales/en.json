@@ -4093,6 +4093,12 @@
     "activityElapsed": "Time spent {duration}",
     "activityDurationMinutes": "{minutes}m {seconds}s",
     "activity": {
+      "codeDraft": {
+        "generating": "Preparing code",
+        "ready": "Code prepared",
+        "note": "Live draft · Code has not been executed",
+        "truncated": "Latest draft content · Code has not been executed"
+      },
       "fileDraft": {
         "generating": "Generating file",
         "ready": "Preparing to write",

@@ -297,7 +297,7 @@ class ToolInputPreviewEvent:
     tool_use_id: str = ""
     revision: int = 0
     state: Literal["generating", "committed", "discarded"] = "generating"
-    tool_name: Literal["write_file"] = "write_file"
+    tool_name: Literal["write_file", "execute_code"] = "write_file"
     path: str = ""
     content: str = ""
     truncated: bool = False

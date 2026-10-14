@@ -472,7 +472,7 @@ export function activityToolCodeContent(view: ActivityToolCodeView): string {
   const command = isOmittedPayload(view.command) ? '' : view.command || ''
   const exit = view.exitCode !== undefined && !/^\s*exit[_ ]code\s*[:=]/im.test(content)
     ? `exit_code=${view.exitCode}` : ''
-  return [command ? `$ ${command}` : '', content, exit].filter(Boolean).join('\n\n')
+  return [command ? `${view.language === 'python' ? '' : '$ '}${command}` : '', content, exit].filter(Boolean).join('\n\n')
 }
 
 function partialPayload(value: string, record: Record<string, unknown> | null): boolean {
@@ -557,7 +557,8 @@ function commandCodeView(
   inputRecord: Record<string, unknown> | null,
   resultRecord: Record<string, unknown> | null,
 ): ActivityToolCodeView {
-  const command = stringField(inputRecord, ['command', 'cmd', 'script'])
+  const isPython = call.name === 'execute_code'
+  const command = stringField(inputRecord, isPython ? ['code'] : ['command', 'cmd', 'script'])
   const result = String(call.result || call.resultPreview || '')
   let output = result
   if (resultRecord) {
@@ -578,7 +579,7 @@ function commandCodeView(
   const unavailable = (!command && !output) || omittedCommand || omittedOutput
   const exitCode = activityExitCode(result)
   return {
-    kind: 'command', language: 'text',
+    kind: 'command', language: isPython ? 'python' : 'text',
     command: omittedCommand ? '' : redactActivityDetail(command || ''),
     output: omittedOutput ? '' : redactActivityDetail(output),
     ...(unavailable ? { unavailable: true } : {}),
