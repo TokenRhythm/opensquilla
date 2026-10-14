@@ -683,6 +683,12 @@ class ResourceProjection(TypedDict, total=False):
     mime: str | None
     size: int | None
     sha256: str | None
+    # Optional presentation semantics.  Internal inline Visualize documents
+    # remain addressable for recovery/download but are omitted from the Files
+    # inventory by the Workbench adapter.
+    source: str
+    visibility: str
+    presentation: str
 
 
 class BindingProjection(TypedDict, total=False):

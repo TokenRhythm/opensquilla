@@ -25,16 +25,13 @@ export function workbenchResourceKey(resource: WorkbenchResourceRef): string {
 /**
  * A show_widget Document is an internal recovery snapshot for the inline
  * Visualize canvas.  It remains addressable by its document identity, but it
- * is not a user-facing file and therefore must not appear in Files.  Keep the
- * source check as a compatibility fallback for gateways that predate the
- * explicit visibility field.
+ * is not a user-facing file and therefore must not appear in Files.  The
+ * explicit source namespace is the classification boundary; visibility and
+ * presentation describe how that resource is used but are not sufficient to
+ * hide an unrelated internal inline resource.
  */
 export function isInternalVisualizeResource(resource: WorkbenchResource): boolean {
   return resource.source?.split('_').join('-').startsWith('show-widget') === true
-    || (
-      resource.visibility === 'internal'
-      && resource.presentation === 'inline'
-    )
 }
 
 /**

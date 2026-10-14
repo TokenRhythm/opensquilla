@@ -87,10 +87,20 @@ describe('workbench resource items', () => {
     const workspaceFile = resource('document', 'workspace-doc')
     workspaceFile.source = 'workspace-preview'
     workspaceFile.visibility = 'internal'
+    const otherInlineInternal = resource('document', 'other-inline-doc')
+    otherInlineInternal.visibility = 'internal'
+    otherInlineInternal.presentation = 'inline'
 
     expect(isInternalVisualizeResource(widget)).toBe(true)
+    widget.source = 'show_widget:edit'
+    expect(isInternalVisualizeResource(widget)).toBe(true)
+    widget.source = 'show-widget'
     expect(isInternalVisualizeResource(workspaceFile)).toBe(false)
-    expect(canonicalWorkbenchResources([widget, workspaceFile])).toEqual([workspaceFile])
+    expect(isInternalVisualizeResource(otherInlineInternal)).toBe(false)
+    expect(canonicalWorkbenchResources([widget, workspaceFile, otherInlineInternal])).toEqual([
+      workspaceFile,
+      otherInlineInternal,
+    ])
   })
 
   it('does not disguise a bound attachment as its mutable Document head', () => {

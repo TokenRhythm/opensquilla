@@ -844,6 +844,17 @@ def _document_payload(
     # newer clients can offer targeted recovery/download actions.
     if semantics:
         payload.update(semantics)
+        if semantics.get("source") == "show-widget":
+            capabilities = payload.get("capabilities")
+            if isinstance(capabilities, dict):
+                capabilities.update({
+                    "selectionContext": False,
+                    "manualEdit": False,
+                    "agentEdit": False,
+                    "edit": False,
+                    "publish": False,
+                    "editReasonCode": "visualize_internal",
+                })
     return payload
 
 
@@ -1010,7 +1021,8 @@ async def _resource_inventory(
                 "document head integrity check failed",
                 operation="workbench.resources.list",
             )
-        semantics = _document_resource_semantics(
+        semantics = await asyncio.to_thread(
+            _document_resource_semantics,
             store,
             session_id=session_id,
             artifact_id=head.artifact_id,
@@ -1102,7 +1114,8 @@ async def _document_resource(
         document, head, binding=binding,
         publication=publications[0] if publications else None,
         trusted_capabilities=trusted, preview_pages=pages,
-        semantics=_document_resource_semantics(
+        semantics=await asyncio.to_thread(
+            _document_resource_semantics,
             materials.store,
             session_id=session_id,
             artifact_id=head.artifact_id,
@@ -1973,6 +1986,14 @@ async def _current_document_open_response(
         response["binding"] = _binding_payload(binding)
     if receipt is not None:
         response["receipt"] = receipt
+    # A show_widget Document is an inline recovery snapshot.  It is
+    # intentionally not an editable workspace file, so targeted open must not
+    # materialize a working copy merely because HTML is normally agent-editable.
+    if resource.get("source") == "show-widget":
+        response["disposition"] = "readonly"
+        response["resolution"] = {"status": "readonly"}
+        response["reasonCode"] = "visualize_internal"
+        return response
     if _format_profile(document.name, head.media_type).agent_editable:
         working = await ensure_document_working_files(
             ctx,

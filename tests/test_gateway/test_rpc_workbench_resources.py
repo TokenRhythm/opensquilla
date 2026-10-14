@@ -620,6 +620,23 @@ async def test_show_widget_document_is_recoverable_but_hidden_from_files_invento
     assert recovered.payload["resource"]["source"] == "show-widget"
     assert recovered.payload["resource"]["visibility"] == "internal"
     assert recovered.payload["resource"]["presentation"] == "inline"
+    assert recovered.payload["resource"]["capabilities"]["agentEdit"] is False
+    assert recovered.payload["resource"]["capabilities"]["edit"] is False
+    assert recovered.payload["resource"]["capabilities"]["publish"] is False
+
+    opened = await _dispatch(
+        env,
+        "workbench.resources.open",
+        {
+            "sessionKey": SESSION_KEY,
+            "resource": {"type": "document", "id": created.document.document_id},
+            "intent": "edit-current",
+        },
+    )
+    assert opened.error is None, opened.error
+    assert opened.payload["disposition"] == "readonly"
+    assert opened.payload["reasonCode"] == "visualize_internal"
+    assert "workingFile" not in opened.payload
 
 
 @pytest.mark.asyncio
