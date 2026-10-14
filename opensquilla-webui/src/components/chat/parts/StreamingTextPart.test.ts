@@ -6,6 +6,13 @@ import { createI18n } from 'vue-i18n'
 import StreamingTextPart from './StreamingTextPart.vue'
 import { useChatTextRendering, type RenderMarkdownOptions } from '@/composables/chat/useChatTextRendering'
 import hljs from 'highlight.js/lib/common'
+import type { VisualizeReceipt } from '@/visualize/types'
+import * as diagramRenderer from '@/utils/markdown/mermaidRenderer'
+
+vi.mock('@/components/chat/VisualizeCanvas.vue', () => ({ default: {
+  props: ['receipt', 'sessionKey'],
+  template: '<section class="test-canvas">{{ receipt.name }}</section>',
+} }))
 
 const apps: ReturnType<typeof createApp>[] = []
 
@@ -21,10 +28,10 @@ function mountI18n(app: ReturnType<typeof createApp>): void {
   app.use(createI18n({ legacy: false, missingWarn: false, messages: {} }))
 }
 
-function mountStream(raw: Ref<string>, renderMarkdown: (text: string, options?: RenderMarkdownOptions) => string): HTMLElement {
+function mountStream(raw: Ref<string>, renderMarkdown: (text: string, options?: RenderMarkdownOptions) => string, receipts?: Ref<VisualizeReceipt[]>): HTMLElement {
   const host = document.createElement('div')
   document.body.appendChild(host)
-  const app = createApp(defineComponent(() => () => h(StreamingTextPart, { rawText: raw.value, renderMarkdown })))
+  const app = createApp(defineComponent(() => () => h(StreamingTextPart, { rawText: raw.value, renderMarkdown, visualizeReceipts: receipts?.value })))
   mountI18n(app)
   app.mount(host)
   apps.push(app)
@@ -32,6 +39,104 @@ function mountStream(raw: Ref<string>, renderMarkdown: (text: string, options?: 
 }
 
 describe('StreamingTextPart', () => {
+  const receipt: VisualizeReceipt = {
+    callId: 'call_demo', documentId: 'doc_demo', revisionId: 'rev_demo', artifactId: 'artifact_demo',
+    name: 'demo.html', mime: 'text/html', sha256: 'a'.repeat(64), size: 10, marker: 'visualize:doc_demo:rev_demo',
+  }
+
+  it('keeps the incremental render, enhancement and split budgets with a canvas receipt', async () => {
+    const raw = ref('first\n\n')
+    const renderMarkdown = vi.fn((text: string, _options?: RenderMarkdownOptions) => `<pre><code>${text.trim()}</code></pre>`)
+    const parse = vi.spyOn(DOMParser.prototype, 'parseFromString')
+    const host = mountStream(raw, renderMarkdown, ref([receipt]))
+    await nextTick()
+    const firstBlock = host.querySelector('.streaming-rich-block')
+    expect(renderMarkdown).toHaveBeenCalledTimes(1)
+    expect(parse).toHaveBeenCalledTimes(1)
+    expect(host.querySelectorAll('.code-copy-btn')).toHaveLength(1)
+
+    raw.value += 'growing'
+    await nextTick()
+    raw.value += ' tail'
+    await nextTick()
+    expect(renderMarkdown).toHaveBeenCalledTimes(1)
+    expect(parse).toHaveBeenCalledTimes(1)
+    expect(host.querySelector('.streaming-rich-block')).toBe(firstBlock)
+    expect(host.querySelector('.streaming-tail')?.textContent).toBe('growing tail')
+
+    raw.value += '\n\n'
+    await nextTick()
+    expect(renderMarkdown).toHaveBeenCalledTimes(2)
+    expect(parse).toHaveBeenCalledTimes(2)
+    expect(host.querySelectorAll('.code-copy-btn')).toHaveLength(2)
+    expect(renderMarkdown.mock.calls.every(([, options]) => options?.cache === 'none' && options.budget)).toBe(true)
+    expect(renderMarkdown.mock.calls[1]?.[1]?.budget).toBe(renderMarkdown.mock.calls[0]?.[1]?.budget)
+  })
+
+  it('places each authorized canvas once among committed blocks and preserves it across appends', async () => {
+    const raw = ref(`Before\n\n\`${receipt.marker}\`\n\nMiddle\n\n\`${receipt.marker}\`\n\n`)
+    // Keep DOM shape deterministic: happy-dom's sanitizer strips the first
+    // fragment wrapper. The real renderer's budgets are exercised separately.
+    const renderMarkdown = (text: string) => text.includes(receipt.marker)
+      ? `<p><code>${receipt.marker}</code></p>` : `<p>${text.trim()}</p>\n`
+    const host = mountStream(raw, renderMarkdown, ref([receipt]))
+    await nextTick()
+    const canvas = host.querySelector('.test-canvas')
+    expect(host.querySelectorAll('.test-canvas')).toHaveLength(1)
+    expect(host.textContent).toMatch(/Before.*demo.html.*Middle/s)
+    expect(host.textContent).not.toContain(receipt.marker)
+    raw.value += 'After\n\n'
+    await nextTick()
+    expect(host.querySelector('.test-canvas')).toBe(canvas)
+    expect(host.textContent).toMatch(/Before.*demo.html.*Middle.*After/s)
+    raw.value = 'Replacement\n\n'
+    await nextTick()
+    expect(host.querySelector('.test-canvas')).toBeNull()
+    expect(host.textContent).toBe('Replacement\n')
+  })
+
+  it('handles late receipts without reparsing committed Markdown or losing code controls', async () => {
+    const restoreDiagrams = vi.spyOn(diagramRenderer, 'restoreMermaidSources')
+    const raw = ref(`\x60\x60\x60js\nconst value = 1\n\x60\x60\x60\n\n\`${receipt.marker}\`\n\n`)
+    const receipts = ref<VisualizeReceipt[]>([])
+    const renderMarkdown = vi.fn((text: string) => text.includes(receipt.marker)
+      ? `<p><code>${receipt.marker}</code></p>` : '<pre><code>const value = 1</code></pre>')
+    const host = mountStream(raw, renderMarkdown, receipts)
+    await nextTick()
+    expect(renderMarkdown).toHaveBeenCalledTimes(2)
+    expect(host.querySelectorAll('.code-copy-btn')).toHaveLength(1)
+    receipts.value = [receipt]
+    await nextTick()
+    expect(renderMarkdown).toHaveBeenCalledTimes(2)
+    expect(host.querySelectorAll('.code-copy-btn')).toHaveLength(1)
+    expect(host.querySelectorAll('.test-canvas')).toHaveLength(1)
+    expect(restoreDiagrams).toHaveBeenCalledTimes(1)
+    receipts.value = []
+    await nextTick()
+    expect(renderMarkdown).toHaveBeenCalledTimes(2)
+    expect(host.querySelector('.test-canvas')).toBeNull()
+    expect(host.querySelectorAll('.code-copy-btn')).toHaveLength(1)
+    expect(restoreDiagrams).toHaveBeenCalledTimes(2)
+  })
+
+  it('shares heavy-work limits and bounds an unfinished tail even with a canvas receipt', async () => {
+    const highlight = vi.spyOn(hljs, 'highlight').mockImplementation(() => { throw new Error('plain fallback') })
+    const raw = ref('')
+    const { renderMarkdown } = useChatTextRendering()
+    const host = mountStream(raw, renderMarkdown, ref([receipt]))
+    for (let index = 0; index < 40; index++) {
+      raw.value += `\x60\x60\x60js\nconst value${index} = ${index}\n\x60\x60\x60\n\n`
+      await nextTick()
+    }
+    expect(highlight).toHaveBeenCalledTimes(32)
+    expect(host.querySelectorAll('code')).toHaveLength(40)
+    raw.value += 'x'.repeat(24 * 1024)
+    await nextTick()
+    expect(highlight).toHaveBeenCalledTimes(32)
+    expect(host.querySelectorAll('.streaming-plain-block').length).toBeGreaterThan(0)
+    expect(host.querySelector('.streaming-tail')!.textContent!.length).toBeLessThanOrEqual(16 * 1024)
+  })
+
   it.each([
     ['shorter backtick fence', '````text\nbody\n```\n\nmore\n', '````\n\n'],
     ['different fence character', '```text\nbody\n~~~\n\nmore\n', '```\n\n'],

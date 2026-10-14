@@ -25,7 +25,7 @@ beforeEach(() => {
   host = document.createElement('div')
   frame = document.createElement('iframe')
   document.body.append(host)
-  options = { html: '<button>Explore</button>', theme: 'light', initialState: { value: 3 }, onPrompt: vi.fn(), onState: vi.fn(), onError: vi.fn(), onResize: vi.fn(), onDismiss: vi.fn(() => 'inline' as const), onPointerDown: vi.fn() }
+  options = { html: '<button>Explore</button>', theme: 'light', initialState: { value: 3 }, onPrompt: vi.fn(), onState: vi.fn(), onContext: vi.fn(() => true), onError: vi.fn(), onResize: vi.fn(), onDismiss: vi.fn(() => 'inline' as const), onPointerDown: vi.fn() }
   driver.decode.mockResolvedValue(new Blob(['validated pixels'], { type: 'image/png' }))
   widget = {
     ready: Promise.resolve(), iframe: frame, write: vi.fn(),
@@ -115,29 +115,49 @@ describe('generative-frame host adapter', () => {
     expect(options.onDismiss).toHaveBeenCalledTimes(2)
   })
 
-  it('accepts only the reserved pointer signal over the private RPC without forwarding model context', async () => {
+  it('keeps the reserved pointer signal distinct from context without forwarding to the model', async () => {
     const runtime = await mountVisualize(host, options)
-    expect(() => config.onUpdateModelContext?.({ type: 'opensquilla:pointerdown:v1', text: 'send this' })).toThrow('unavailable')
-    expect(() => config.onUpdateModelContext?.({ structuredContent: { ignored: true } })).toThrow('unavailable')
+    expect(() => config.onUpdateModelContext?.({ type: 'opensquilla:pointerdown:v1', text: 'send this' })).toThrow('Unsupported')
+    expect(() => config.onUpdateModelContext?.({ structuredContent: { ignored: true } })).toThrow('Unsupported')
     expect(options.onPointerDown).not.toHaveBeenCalled()
     config.onUpdateModelContext?.({ type: 'opensquilla:pointerdown:v1' })
     expect(options.onPointerDown).toHaveBeenCalledTimes(1)
     expect(options.onPrompt).not.toHaveBeenCalled()
     expect(options.onState).not.toHaveBeenCalled()
     runtime.dispose()
-    config.onUpdateModelContext?.({ type: 'opensquilla:pointerdown:v1' })
+    expect(() => config.onUpdateModelContext?.({ type: 'opensquilla:pointerdown:v1' })).toThrow('disposed')
     expect(options.onPointerDown).toHaveBeenCalledTimes(1)
+  })
+
+  it('acknowledges bounded condition updates and clear only in the current host session', async () => {
+    const runtime = await mountVisualize(host, options)
+    const context = { summary: '4 nights, total difference 600', data: { nights: 4, prices: [500, 350] }, suggestedPrompt: 'Compare these options' }
+    expect(config.onUpdateModelContext?.({ type: 'opensquilla:context:v1', context })).toEqual({ accepted: true })
+    expect(options.onContext).toHaveBeenCalledExactlyOnceWith(context)
+    expect(options.onPrompt).not.toHaveBeenCalled()
+    expect(options.onState).not.toHaveBeenCalled()
+    expect(config.onUpdateModelContext?.({ type: 'opensquilla:context:v1', context: null })).toEqual({ accepted: true })
+    expect(options.onContext).toHaveBeenLastCalledWith(null)
+    expect(() => config.onUpdateModelContext?.({ type: 'opensquilla:context:v1', context, send: true })).toThrow('Unsupported')
+    expect(() => config.onUpdateModelContext?.({ type: 'opensquilla:context:v1', context: { summary: '', data: {} } })).toThrow('summary')
+    vi.mocked(options.onContext!).mockReturnValue(false)
+    expect(() => config.onUpdateModelContext?.({ type: 'opensquilla:context:v1', context })).toThrow('session')
+    runtime.dispose()
+    expect(() => config.onUpdateModelContext?.({ type: 'opensquilla:context:v1', context })).toThrow('disposed')
   })
 
   it('bridges unhandled guest Escape after dispatch and respects generated controls', async () => {
     const runtime = await mountVisualize(host, options)
     const requestDisplayMode = vi.fn().mockResolvedValue({ mode: 'inline' })
     const updateModelContext = vi.fn().mockResolvedValue({})
-    const guest = Object.assign(new EventTarget(), { genframe: { context: { displayMode: 'inline' }, requestDisplayMode, updateModelContext } })
+    const guest = Object.assign(new EventTarget(), { opensquillaVisualize: undefined as unknown as { setContext(value: unknown): Promise<unknown> }, genframe: { context: { displayMode: 'inline' }, requestDisplayMode, updateModelContext } })
     const source = vi.mocked(widget.write).mock.calls[0]![0]
     const script = new DOMParser().parseFromString(source, 'text/html').querySelector('script')!.textContent!
     // Execute the exact guest bridge that is sent to the isolated document.
     new Function('window', script)(guest)
+    await guest.opensquillaVisualize.setContext({ summary: 'current selection' })
+    expect(updateModelContext).toHaveBeenLastCalledWith({ type: 'opensquilla:context:v1', context: { summary: 'current selection' } })
+    updateModelContext.mockClear()
     guest.dispatchEvent(new Event('pointerdown'))
     expect(updateModelContext).toHaveBeenCalledExactlyOnceWith({ type: 'opensquilla:pointerdown:v1' })
     guest.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }))

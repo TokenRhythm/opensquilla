@@ -18,7 +18,7 @@ import { visualizeSamples } from '@/visualize/samples'
 import { VISUALIZE_RUNTIME_LABEL as runtimeLabel } from '@/visualize/runtime'
 const { t } = useI18n()
 const draft = ref('')
-provide(VISUALIZE_CONVERSATION_KEY, { enabled: key => key === 'visualize-trial', draft(key, _receipt, text) {
+provide(VISUALIZE_CONVERSATION_KEY, { enabled: key => key === 'visualize-trial', attach: () => false, draft(key, _receipt, text) {
   if (key !== 'visualize-trial') return false
   draft.value = draft.value ? draft.value + '\n' + text : text
   return true

@@ -1,4 +1,4 @@
-import { nextTick, reactive, ref, toRaw } from 'vue'
+import { effectScope, nextTick, reactive, ref, toRaw, watch } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import {
@@ -8,6 +8,8 @@ import {
 import { useChatAttachments } from './useChatAttachments'
 import { useChatCompaction } from './useChatCompaction'
 import { useLocalPathDraft } from './useLocalPathDraft'
+import { useVisualizeDraft } from '@/visualize/useVisualizeDraft'
+import type { VisualizeReceipt } from '@/visualize/types'
 import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
 import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
 import type { PendingInputQueuePort } from '@/modules/pendingInputQueue'
@@ -930,6 +932,49 @@ describe('useChatPendingQueue delivery state', () => {
     expect(queue.pendingQueue.value[0]?.text).toBe('queued draft')
     queue.cleanup()
   })
+
+  it.each(['replace', 'remove', 'unchanged'] as const)(
+    'only consumes the submitted Visualize draft after delayed WAL persistence: %s',
+    async change => {
+      const { wal, records } = memoryWal()
+      const persist = vi.mocked(wal.put).getMockImplementation()!
+      let release!: () => void
+      vi.mocked(wal.put).mockImplementationOnce(record => new Promise<void>(resolve => {
+        release = () => { void persist(record).then(resolve) }
+      }))
+      const composerRevision = ref(0), deliveryIdentity = ref<string | null>('owner')
+      const h = makeQueue(undefined, () => true, {
+        pendingInputWal: wal, composerRevision, deliveryIdentity, connectionState: ref('disconnected'),
+      })
+      const scope = effectScope()
+      const draft = scope.run(() => {
+        const value = useVisualizeDraft({ sessionKey: h.sessionKey, deliveryIdentity,
+          generation: ref(0), available: () => true })
+        // Mirrors ChatView's synchronous composer revision for chip-only changes.
+        watch(value.snapshot, () => { composerRevision.value++ }, { flush: 'sync' })
+        return value
+      })!
+      const receipt = { documentId: 'doc', revisionId: 'rev', name: 'choices.html' } as VisualizeReceipt
+      try {
+        h.inputText.value = 'Explain this choice'
+        draft.attach(h.sessionKey.value, receipt, { summary: 'Original conditions', data: { selected: 'A' } })
+        const submitted = draft.capture()!
+        const queued = Promise.resolve(h.queue.enqueuePendingInput(submitted.message(h.inputText.value)))
+        if (change === 'replace') draft.attach(h.sessionKey.value, receipt, { summary: 'New conditions', data: { selected: 'B' } })
+        else if (change === 'remove') draft.clear()
+        release()
+        expect(await queued).toBe(true)
+        submitted.accepted()
+        expect(h.inputText.value).toBe(change === 'unchanged' ? '' : 'Explain this choice')
+        expect(draft.snapshot.value?.summary ?? null).toBe(change === 'replace' ? 'New conditions' : null)
+        const persisted = [...records.values()][0]!
+        expect(persisted.text).toContain('Original conditions')
+        expect(persisted.text).toContain('"selected":"A"')
+        expect(persisted.text).not.toContain('New conditions')
+        expect(persisted.text).not.toContain('"selected":"B"')
+      } finally { scope.stop(); h.queue.cleanup() }
+    },
+  )
 
   it('hydrates after the route supplies a session key post-setup', async () => {
     const delayedSessionKey = ref('')

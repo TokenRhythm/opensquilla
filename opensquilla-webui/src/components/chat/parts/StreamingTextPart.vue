@@ -1,20 +1,25 @@
 <template>
   <div ref="rootEl" class="msg-ai-text streaming-text-part">
-    <VisualizeBody v-if="visualizeReceipts?.length" :html="visualizeHtml" :receipts="visualizeReceipts" :session-key="sessionKey" :fallback="false" />
-    <template v-else v-for="block in committedBlocks" :key="block.key">
+    <template v-for="block in displayedBlocks" :key="block.key">
+      <VisualizeCanvas
+        v-if="block.kind === 'visualize'"
+        :receipt="block.receipt"
+        :session-key="sessionKey ?? ''"
+      />
       <div
-        v-if="block.kind === 'rich'"
+        v-else-if="block.kind === 'rich'"
         class="streaming-rich-block"
         v-html="block.html"
       />
       <span v-else class="streaming-plain-block">{{ block.text }}</span>
     </template>
-    <span v-if="tail && !visualizeReceipts?.length" class="streaming-tail">{{ tail }}</span>
+    <span v-if="tail" class="streaming-tail">{{ tail }}</span>
   </div>
 </template>
 
 <script setup lang="ts">
-import VisualizeBody from '@/components/chat/VisualizeBody.vue'
+import VisualizeCanvas from '@/components/chat/VisualizeCanvas.vue'
+import { splitVisualizeBody, type VisualizeBodySegment } from '@/visualize/receipts'
 import type { VisualizeReceipt } from '@/visualize/types'
 import { computed, ref, watch } from 'vue'
 import type { RenderMarkdownOptions } from '@/composables/chat/useChatTextRendering'
@@ -32,8 +37,6 @@ const props = defineProps<{
   renderMarkdown: (text: string, opts?: RenderMarkdownOptions) => string
 }>()
 
-const visualizeHtml = computed(() => props.visualizeReceipts?.length ? props.renderMarkdown(props.rawText) : '')
-
 interface RichBlock {
   key: string
   kind: 'rich'
@@ -47,6 +50,7 @@ interface PlainBlock {
 }
 
 type CommittedBlock = RichBlock | PlainBlock
+type DisplayedBlock = CommittedBlock | { key: string; kind: 'visualize'; receipt: VisualizeReceipt }
 
 // Rich Markdown blocks and bounded plain-text fallbacks share one ordered
 // sequence. A very long open block can be frozen as plain text and later close
@@ -57,12 +61,42 @@ const tail = ref('')
 const rootEl = ref<HTMLDivElement | null>(null)
 const resetEpoch = ref(0)
 let renderBudget = createMarkdownRenderBudget()
+const receiptVersion = computed(() => JSON.stringify(props.visualizeReceipts ?? []))
+const splitCache = new Map<string, { version: string; segments: VisualizeBodySegment[] }>()
+const displayedBlocks = computed<DisplayedBlock[]>(() => {
+  const displayed: DisplayedBlock[] = []
+  const used = new Set<string>()
+  for (const block of committedBlocks.value) {
+    if (block.kind !== 'rich' || !props.visualizeReceipts?.length) {
+      displayed.push(block)
+      continue
+    }
+    let cached = splitCache.get(block.key)
+    if (!cached || cached.version !== receiptVersion.value) {
+      cached = { version: receiptVersion.value, segments: splitVisualizeBody(block.html, props.visualizeReceipts, false) }
+      splitCache.set(block.key, cached)
+    }
+    for (const segment of cached.segments) {
+      if (segment.receipt) {
+        if (used.has(segment.receipt.marker)) continue
+        used.add(segment.receipt.marker)
+        displayed.push({ key: `${block.key}:${segment.key}`, kind: 'visualize', receipt: segment.receipt })
+      } else {
+        displayed.push({ key: `${block.key}:${segment.key}`, kind: 'rich', html: segment.html })
+      }
+    }
+  }
+  return displayed
+})
 
-useMarkdownEnhancements(rootEl, {
+const enhancements = useMarkdownEnhancements(rootEl, {
   version: () => committedBlocks.value.length,
   incremental: true,
   resetVersion: () => resetEpoch.value,
 })
+// A late receipt can split an already committed subtree. Restore existing
+// diagrams before re-admitting it; no Markdown parse or fresh render budget.
+watch(receiptVersion, () => enhancements.refresh(), { flush: 'post' })
 
 let acceptedRaw = ''
 let committedOffset = 0
@@ -81,6 +115,7 @@ function resetState(): void {
   displayMath = null
   resetEpoch.value += 1
   renderBudget = createMarkdownRenderBudget()
+  splitCache.clear()
 }
 
 function appendRichBlock(raw: string, endOffset: number): void {

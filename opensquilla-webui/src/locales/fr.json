@@ -1,5 +1,11 @@
 {
   "visualize": {
+    "askWithContext": "Poser une question avec ces conditions",
+    "contextAttached": "Conditions du canevas jointes",
+    "contextDetails": "Voir les conditions",
+    "contextRemove": "Retirer les conditions",
+    "contextSnapshotHint": "L’instantané des conditions au moment de l’ajout sera envoyé.",
+    "contextAttachFailed": "Impossible de joindre ces conditions. Reconnectez-vous et réessayez.",
     "actions": "Actions du canevas",
     "expandUnavailable": "Ce navigateur ne peut pas agrandir le canevas. Vous pouvez continuer à l'utiliser ici.",
     "repair": "Demander une réparation",

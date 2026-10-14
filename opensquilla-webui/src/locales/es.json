@@ -1,5 +1,11 @@
 {
   "visualize": {
+    "askWithContext": "Preguntar con estas condiciones",
+    "contextAttached": "Condiciones del lienzo adjuntas",
+    "contextDetails": "Ver condiciones",
+    "contextRemove": "Quitar condiciones",
+    "contextSnapshotHint": "Se enviará la instantánea de las condiciones al adjuntarlas.",
+    "contextAttachFailed": "No se pudieron adjuntar las condiciones. Reconecta y reintenta.",
     "actions": "Acciones del lienzo",
     "expandUnavailable": "Este navegador no puede ampliar el lienzo. Puedes seguir usándolo aquí.",
     "repair": "Solicitar reparación",

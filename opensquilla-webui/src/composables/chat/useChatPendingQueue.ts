@@ -1131,6 +1131,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const composerAttachments = snapshotComposerAttachments(options.pendingAttachments.value)
     const composerIntent = options.pendingSessionIntent.value
     const composerSessionKey = options.sessionKey.value
+    const composerRevision = options.composerRevision?.value
     const queued = enqueuePendingPayload({
       text,
       selectedSkills: copySelectedSkills(enqueueOptions?.selectedSkills ?? composerSkills),
@@ -1147,6 +1148,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const clearMatchingComposer = () => {
       if (
         options.sessionKey.value !== composerSessionKey
+        || options.composerRevision?.value !== composerRevision
         || options.inputText.value !== composerText
         || !sameSelectedSkills(options.selectedSkills?.value, composerSkills)
         || JSON.stringify(options.localPathReferences?.value ?? []) !== JSON.stringify(composerPaths)

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { nextTick, ref } from 'vue'
+import { effectScope, nextTick, ref } from 'vue'
 import type { ChatMessage, ChatPendingItem } from '@/types/chat'
 import { TurnCommandError, type TurnSendRequest, type TurnSendResponse, type TurnReceiptResult } from '@/modules/turnCommands'
 import { createPendingQueuePolicy } from '@/utils/chat/pendingQueuePolicy'
@@ -7,6 +7,9 @@ import { decideSendResponseSession, type UseChatSendOptions } from './useChatSen
 import { createChatSendHarness, memoryDeliveryWal } from './chatSendTestHarness'
 import { useChatSteerDelivery } from './useChatSteerDelivery'
 import type { DeliveryWalRecord } from '@/utils/chat/pendingInputWal'
+import { acceptsVisualizeContext, useVisualizeDraft } from '@/visualize/useVisualizeDraft'
+import type { VisualizeReceipt } from '@/visualize/types'
+import type { SlashCommandClassification } from './useChatSlashCommands'
 
 vi.mock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast: vi.fn() }) }))
 
@@ -53,6 +56,103 @@ function queuedSendHarness(overrides: Partial<UseChatSendOptions> = {}) {
   }
   return { ...createChatSendHarness(options), commands, policy, scope, pausePendingAutoSend }
 }
+
+describe('explicit composer context text', () => {
+  const contextualText = 'Explain this choice\n\nCanvas conditions · choices.html\nTwo selected items\n\n{"selected":["a","b"]}'
+  it.each([
+    { text: '//literal question', classification: 'registered', attached: true },
+    { text: '/unknown question', classification: 'unknown', attached: true },
+    { text: '/compact', classification: 'registered', attached: false },
+    { text: '/unknown question', classification: 'unavailable', attached: false },
+  ] as const)('preserves sender semantics for $text ($classification) with a canvas attachment', async ({ text, classification, attached }) => {
+    const classify = vi.fn(async (): Promise<SlashCommandClassification> => classification)
+    const execute = vi.fn(async () => true)
+    const h = queuedSendHarness({ inputText: ref(text), classifySlashCommand: classify, executeSlashCommand: execute })
+    const scope = effectScope()
+    const draft = scope.run(() => useVisualizeDraft({ sessionKey: h.options.sessionKey,
+      deliveryIdentity: h.options.deliveryIdentity!, generation: ref(0), available: () => true }))!
+    try {
+      draft.attach(h.options.sessionKey.value,
+        { documentId: 'doc', revisionId: 'rev', name: 'choices.html' } as VisualizeReceipt,
+        { summary: 'Selected A', data: { selected: 'A' } })
+      const context = draft.capture()!
+      const withContext = await acceptsVisualizeContext(text, classify)
+      expect(withContext).toBe(attached)
+      await h.api.onSend({
+        ...(withContext ? { composerText: text, textOverride: context.message(text), consumeComposerOnQueue: true } : {}),
+        onAccepted: () => { if (withContext) context.accepted() },
+      })
+      if (attached) {
+        expect(h.commands.send).toHaveBeenCalledOnce()
+        expect(h.commands.send.mock.calls[0]![0]).toMatchObject({
+          params: { message: context.message(text.startsWith('//') ? text.slice(1) : text) },
+        })
+        expect(execute).not.toHaveBeenCalled()
+        expect(draft.snapshot.value).toBeNull()
+      } else {
+        expect(h.commands.send).not.toHaveBeenCalled()
+        expect(execute).toHaveBeenCalledWith(text, classification)
+        expect(draft.snapshot.value?.summary).toBe('Selected A')
+      }
+      if (text.startsWith('//')) expect(classify).not.toHaveBeenCalled()
+    } finally { scope.stop() }
+  })
+
+  it('sends the attached snapshot through the ordinary command path and acknowledges only after acceptance', async () => {
+    const h = queuedSendHarness(), accepted = vi.fn()
+    const composerText = h.options.inputText.value
+    let accept!: (response: TurnSendResponse) => void
+    h.commands.send.mockImplementationOnce(() => new Promise(resolve => { accept = resolve }))
+    const pending = h.api.onSend({ textOverride: contextualText, composerText, consumeComposerOnQueue: true, onAccepted: accepted })
+    await vi.waitFor(() => expect(h.commands.send).toHaveBeenCalledOnce())
+    expect(h.commands.send.mock.calls[0]![0]).toMatchObject({ kind: 'new-turn', params: { message: contextualText } })
+    expect(accepted).not.toHaveBeenCalled()
+    accept({ taskId: 'context-task' }); await pending
+    expect(accepted).toHaveBeenCalledOnce()
+    expect(h.options.inputText.value).toBe('')
+  })
+
+  it('restores the editable question after rejection and keeps the context unacknowledged', async () => {
+    const h = queuedSendHarness(), accepted = vi.fn(), composerText = h.options.inputText.value
+    h.commands.send.mockRejectedValueOnce(new TurnCommandError('rejected', 'refusal', 'REFUSED', false, true))
+    await h.api.onSend({ textOverride: contextualText, composerText, consumeComposerOnQueue: true, onAccepted: accepted })
+    expect(h.options.inputText.value).toBe(composerText)
+    expect(accepted).not.toHaveBeenCalled()
+  })
+
+  it('uses the existing composer-consuming queue path only for explicit context submissions', async () => {
+    const payload = vi.fn(() => true)
+    const h = queuedSendHarness({ enqueuePendingPayload: payload })
+    h.options.stream.isStreaming.value = true
+    h.options.activeStreamTaskId.value = 'active-task'
+    const accepted = vi.fn()
+    await h.api.onSend({ textOverride: contextualText, composerText: h.options.inputText.value, consumeComposerOnQueue: true, onAccepted: accepted })
+    expect(h.options.enqueuePendingInput).toHaveBeenCalledWith(contextualText, undefined)
+    expect(payload).not.toHaveBeenCalled()
+    expect(accepted).toHaveBeenCalledOnce()
+    expect(h.commands.send).not.toHaveBeenCalled()
+  })
+
+  it('still preserves the composer for existing programmatic override calls', async () => {
+    const payload = vi.fn(() => true)
+    const h = queuedSendHarness({ enqueuePendingPayload: payload })
+    h.options.stream.isStreaming.value = true
+    h.options.activeStreamTaskId.value = 'active-task'
+    await h.api.onSend({ textOverride: contextualText })
+    expect(payload).toHaveBeenCalledOnce()
+    expect(h.options.enqueuePendingInput).not.toHaveBeenCalled()
+  })
+
+  it('does not submit a removed context after asynchronous preparation', async () => {
+    let current = true, release!: () => void
+    const prepare = new Promise<void>(resolve => { release = resolve })
+    const h = queuedSendHarness({ validateActiveProjectBeforeSend: async () => { await prepare; return null } })
+    const pending = h.api.onSend({ textOverride: contextualText, preflightGuard: () => current, consumeComposerOnQueue: true })
+    current = false; release(); await pending
+    expect(h.commands.send).not.toHaveBeenCalled()
+    expect(h.options.inputText.value).toBe('unrelated composer draft')
+  })
+})
 
 describe('decideSendResponseSession', () => {
   it('ignores a late response after the user navigated to another session', () => {

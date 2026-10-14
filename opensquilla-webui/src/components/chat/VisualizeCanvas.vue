@@ -1,5 +1,5 @@
 <template>
-  <div class="visualize-position" :style="expanded ? { height: `${inlineHeight}px` } : undefined">
+  <div class="visualize-position" data-chat-find-ignore :style="expanded ? { height: `${inlineHeight}px` } : undefined">
     <dialog ref="canvas" open class="visualize-canvas" :class="{ 'visualize-canvas--expanded': expanded }"
       :role="expanded ? 'dialog' : 'group'" :aria-modal="expanded || undefined" :aria-label="receipt.name"
       data-visualize-canvas @cancel.prevent="onEscape" @keydown.esc.stop.prevent="onEscape">
@@ -35,6 +35,12 @@
       <p v-else-if="loading" class="visualize-feedback" role="status">{{ t('visualize.loading') }}</p>
       <p v-if="expandUnavailable" class="visualize-feedback" role="status">{{ t('visualize.expandUnavailable') }}</p>
       <div ref="container" class="visualize-surface" :aria-busy="loading" />
+      <footer v-if="context" class="visualize-context">
+        <p class="visualize-context-summary">{{ context.summary }}</p>
+        <button type="button" :disabled="!canDraft || loading || Boolean(error)" @click="attachContext">{{ t('visualize.askWithContext') }}</button>
+        <p v-if="contextAttached" class="visualize-context-attached" role="status">{{ t('visualize.contextAttached') }}</p>
+        <p v-if="contextAttachFailed" class="visualize-context-attached" role="alert">{{ t('visualize.contextAttachFailed') }}</p>
+      </footer>
       <footer v-if="proposal" class="visualize-proposal">
         <p>{{ proposal }}</p>
         <div class="visualize-feedback-actions">
@@ -47,7 +53,7 @@
   </div>
 </template>
 <script setup lang="ts">
-import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue'
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { sha256 } from '@noble/hashes/sha2.js'
 import { bytesToHex } from '@noble/hashes/utils.js'
@@ -58,9 +64,10 @@ import { useToasts } from '@/composables/useToasts'
 import { downloadBlob } from '@/utils/browser'
 import { abortableClipboardPreparation, assertClipboardPreparationActive, ImageClipboardError, IMAGE_CLIPBOARD_PREPARATION_TIMEOUT_MS, writePreparedClipboard } from '@/utils/imageClipboard'
 import { getManifest } from '@/themes/registry'
-import { VISUALIZE_CONVERSATION_KEY, type VisualizeReceipt, type VisualizeRuntime } from '@/visualize/types'
+import { VISUALIZE_CONVERSATION_KEY, type VisualizeContext, type VisualizeReceipt, type VisualizeRuntime } from '@/visualize/types'
 import { VISUALIZE_MESSAGE_PIN_KEY } from '@/visualize/presentation'
 import { readVisualizeState, saveVisualizeState } from '@/visualize/state'
+import { normalizeVisualizeContext, readVisualizeContext, saveVisualizeContext } from '@/visualize/context'
 const props = defineProps<{ receipt: VisualizeReceipt; sessionKey: string; sampleHtml?: string }>()
 const { t } = useI18n()
 const { pushToast } = useToasts()
@@ -78,6 +85,9 @@ const container = ref<HTMLElement | null>(null)
 const loading = ref(true)
 const error = ref('')
 const proposal = ref('')
+const context = shallowRef<VisualizeContext | null>(null)
+const contextAttached = ref(false)
+const contextAttachFailed = ref(false)
 const drafted = ref(false)
 const expanded = ref(false)
 const menuOpen = ref(false)
@@ -97,6 +107,8 @@ let releasePin: (() => void) | undefined
 let restoreScroll: (() => void) | undefined
 let alive = false
 let exportRequest: AbortController | null = null
+let contextEncoding = 'null'
+let contextFeedbackTimer: ReturnType<typeof setTimeout> | undefined
 const theme = (): 'light' | 'dark' => {
   const themeId = container.value?.closest<HTMLElement>('[data-theme]')?.dataset.theme ?? document.documentElement.dataset.theme ?? ''
   const declared = getManifest(themeId)?.capabilities.colorScheme
@@ -268,6 +280,9 @@ async function reload() {
   const expectedScope = scope.value
   const current = () => alive && !controller.signal.aborted && expectedScope === scope.value
   loading.value = true; error.value = ''; proposal.value = ''; drafted.value = false
+  clearContextAttachmentFeedback()
+  context.value = readVisualizeContext(expectedScope); contextAttachFailed.value = false
+  contextEncoding = JSON.stringify(context.value)
   try {
     if (!container.value) return
     let html = props.sampleHtml
@@ -284,6 +299,19 @@ async function reload() {
     const mounted = await mountVisualize(container.value, { html, signal: controller.signal, initialState: readVisualizeState(expectedScope), theme: theme(),
       onPrompt(text) { if (current() && typeof text === 'string') { proposal.value = text.trim().slice(0, 4000); drafted.value = false } },
       onState(state) { if (current()) saveVisualizeState(expectedScope, state) },
+      onContext(value) {
+        if (!current()) return false
+        const normalized = normalizeVisualizeContext(value)
+        const encoded = JSON.stringify(normalized)
+        // Generated controls may publish on every render. Do not rewrite
+        // storage or erase an attachment acknowledgement for unchanged data.
+        if (normalized && encoded === contextEncoding) return true
+        saveVisualizeContext(expectedScope, normalized)
+        contextEncoding = encoded
+        clearContextAttachmentFeedback()
+        context.value = normalized; contextAttachFailed.value = false
+        return true
+      },
       onError(cause) { if (current()) error.value = diagnostic(cause) },
       onDismiss() {
         if (current()) onEscape()
@@ -299,6 +327,25 @@ async function reload() {
   } finally { if (current()) loading.value = false }
 }
 function reloadFromMenu() { closeMenu(true); void reload() }
+function clearContextAttachmentFeedback() {
+  if (contextFeedbackTimer !== undefined) clearTimeout(contextFeedbackTimer)
+  contextFeedbackTimer = undefined
+  contextAttached.value = false
+}
+function attachContext() {
+  if (!context.value || !canDraft.value || loading.value || error.value) return
+  const snapshot = normalizeVisualizeContext(context.value)
+  clearContextAttachmentFeedback()
+  try {
+    contextAttached.value = Boolean(snapshot && conversation?.attach(props.sessionKey, props.receipt, snapshot))
+    contextAttachFailed.value = !contextAttached.value
+    if (contextAttached.value) {
+      // The composer owns the actual chip lifecycle; this is a brief receipt
+      // of the click, not a permanent claim that a chip is still attached.
+      contextFeedbackTimer = setTimeout(clearContextAttachmentFeedback, 2000)
+    }
+  } catch { contextAttachFailed.value = true }
+}
 function acceptProposal() {
   if (!canDraft.value || !proposal.value) return
   if (conversation?.draft(props.sessionKey, props.receipt, proposal.value)) { proposal.value = ''; drafted.value = true }
@@ -316,9 +363,10 @@ onMounted(() => {
   window.addEventListener('blur', closeMenuOnFrameFocus)
   window.visualViewport?.addEventListener('resize', updatePresentation)
 })
-watch([proposal, error, loading], () => { void nextTick(updatePresentation) })
+watch([proposal, context, contextAttached, contextAttachFailed, error, loading], () => { void nextTick(updatePresentation) })
 watch(scope, () => { collapse(false); if (alive) void reload() })
 onBeforeUnmount(() => {
+  clearContextAttachmentFeedback()
   collapse(false); alive = false; cancelExport(); request?.abort(); runtime?.dispose(); observer?.disconnect()
   window.removeEventListener('resize', updatePresentation)
   document.removeEventListener('pointerdown', closeMenuOutside)
@@ -353,6 +401,10 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .visualize-error-detail { max-height: 120px; overflow: auto; color: var(--text-muted); font-size: var(--fs-sm); }
 .visualize-proposal { border-top: 1px solid var(--border); padding-bottom: calc(var(--sp-3) + env(safe-area-inset-bottom, 0px)); }
 .visualize-proposal > p { margin: 0 0 var(--sp-2); max-height: min(28dvh, 220px); overflow-y: auto; overscroll-behavior: contain; }
+.visualize-context { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); padding: var(--sp-3); border-top: 1px solid var(--border); }
+.visualize-context-summary { flex: 1 1 240px; min-width: 0; max-height: min(20dvh, 160px); margin: 0; overflow: auto; overflow-wrap: anywhere; }
+.visualize-context button { min-height: 44px; }
+.visualize-context-attached { width: 100%; margin: 0; color: var(--text-muted); font-size: var(--fs-sm); }
 .visualize-export-feedback { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-size: var(--fs-sm); }
 .visualize-export-feedback--error { color: var(--danger, var(--text)); }
 .visualize-canvas--expanded { position: fixed; inset: var(--sp-3); width: calc(100% - var(--sp-3) * 2); max-width: 1440px; max-height: calc(100dvh - var(--sp-3) * 2); margin: auto; overflow: auto; overscroll-behavior: contain; border-color: var(--border); background: var(--bg-surface); }
@@ -363,4 +415,5 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 }
 @media (pointer: coarse) { .visualize-icon { width: 44px; height: 44px; } }
 @media (max-width: 480px) { .visualize-proposal .visualize-feedback-actions button { flex: 1 1 0; min-width: 0; } }
+@media (max-width: 480px) { .visualize-context button { width: 100%; } }
 </style>

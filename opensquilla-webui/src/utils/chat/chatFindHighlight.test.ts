@@ -1,5 +1,9 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createApp, nextTick } from 'vue'
+import TextPart from '@/components/chat/parts/TextPart.vue'
+import i18n from '@/i18n'
+import type { VisualizeReceipt } from '@/visualize/types'
 import { CHAT_FIND_RANGE_LIMIT, collectChatFindRanges, createChatFindHighlighter } from './chatFindHighlight'
 
 afterEach(() => {
@@ -17,6 +21,25 @@ function message(html: string) {
 }
 
 describe('chat find highlights', () => {
+  it('searches both text segments around an actual canvas and excludes its host feedback', async () => {
+    const root = message('')
+    root.className = 'assistant-answer'
+    const receipt = { callId: 'call_find', documentId: 'doc_find', revisionId: 'rev_find', artifactId: 'artifact_find', name: 'alpha.html', mime: 'text/html', sha256: '0'.repeat(64), size: 10, marker: 'visualize:doc_find:rev_find' } as VisualizeReceipt
+    const app = createApp(TextPart, { sessionKey: 'session-find', visualizeReceipts: [receipt], part: {
+      type: 'text', key: 'find', rawText: '', html: '<p>alpha before</p><p><code>visualize:doc_find:rev_find</code></p><p>alpha after</p>',
+    } })
+    app.use(i18n); app.mount(root)
+    try {
+      await nextTick(); await nextTick()
+      expect(root.querySelector('[data-visualize-canvas]')).not.toBeNull()
+      const canvas = root.querySelector('[data-chat-find-ignore]')!
+      expect(canvas).not.toBeNull()
+      const feedback = document.createElement('p'); feedback.textContent = 'alpha host feedback'; canvas.append(feedback)
+      expect(collectChatFindRanges(root, 'alpha').map(range => range.startContainer.parentElement?.textContent)).toEqual(['alpha before', 'alpha after'])
+      expect(root.querySelectorAll('[data-chat-find-body]')).toHaveLength(1)
+    } finally { app.unmount() }
+  })
+
   it('searches marked message bodies without reasoning, tools or attachment labels', () => {
     const root = message('<div>alpha tool</div><details open><summary>alpha</summary>alpha reasoning</details><div data-chat-find-body><p>alpha正文</p></div><div>alpha附件</div>')
     expect(collectChatFindRanges(root, 'alpha').map(range => range.startContainer.parentElement?.textContent)).toEqual(['alpha正文'])

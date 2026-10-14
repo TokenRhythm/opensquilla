@@ -1,13 +1,14 @@
 // @vitest-environment happy-dom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, h, nextTick, reactive, ref, type App } from 'vue'
+import { createApp, h, inject, nextTick, onMounted, reactive, ref, type App } from 'vue'
 
 import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
 import type { ChatMessageListVirtualizer, ChatViewportSnapshot } from '@/types/chatVirtualizer'
 import { consumeProgrammaticScroll } from '@/utils/chat/scrollMutation'
 import ChatMessageList from './ChatMessageList.vue'
+import { VISUALIZE_MESSAGE_PIN_KEY } from '@/visualize/presentation'
 
 const apps: App<Element>[] = []
 let resizeObservers: { callback: ResizeObserverCallback; targets: Set<Element> }[] = []
@@ -62,6 +63,7 @@ async function mountList(options: {
   fitsViewport?: boolean
   restoredViewport?: ChatViewportSnapshot
   previewReadOnly?: boolean
+  onCanvasPin?: (release: () => void) => void
 } = {}) {
   const container = document.createElement('div')
   container.dataset.testScroll = 'true'
@@ -108,9 +110,17 @@ async function mountList(options: {
     downloadAttachment: async () => true,
   })
   const listRef = ref<ChatMessageListVirtualizer | null>(null)
+  const CanvasPinProbe = {
+    setup() {
+      const pins = inject(VISUALIZE_MESSAGE_PIN_KEY)!, el = ref<HTMLElement | null>(null)
+      onMounted(() => options.onCanvasPin?.(pins.pin(el.value!)))
+      return () => h('span', { ref: el }, 'Expanded canvas')
+    },
+  }
   const app = createApp({
     setup: () => () => h(ChatMessageList, { ...componentProps, ref: listRef },
-      options.trailing ? { trailing: () => h('div', 'Streaming answer') } : undefined),
+      { ...(options.trailing ? { trailing: () => h('div', 'Streaming answer') } : {}),
+        ...(options.onCanvasPin ? { 'router-strip': () => h(CanvasPinProbe) } : {}) }),
   })
   app.use(i18n)
   app.mount(host)
@@ -165,6 +175,25 @@ describe('ChatMessageList long-history virtualization', () => {
     await nextTick()
     expect(saved.scrollTop).toBe(940.25)
     expect(saved.anchor?.key).toBe('message-10')
+  })
+
+  it('retains both a cached viewport anchor and a separately expanded canvas in a virtualized transcript', async () => {
+    let releasePin!: () => void
+    const rows = Array.from({ length: 200 }, (_, index) => message(index))
+    rows[150]!.isRouterStrip = true
+    const { api, host, props } = await mountList({ messages: rows, forceMountMessageKeys: new Set(['message-150']),
+      onCanvasPin: release => { releasePin = release },
+    })
+    expect(api.isVirtualized()).toBe(true)
+    props.restoredViewport = { ...api.captureViewport!(), anchor: { key: 'message-100', intraOffset: 0 } }
+    props.previewReadOnly = true
+    props.forceMountMessageKeys = new Set()
+    await nextTick(); await nextTick()
+    expect(host.querySelector('[data-chat-message-key="message-100"]')?.getAttribute('data-chat-message-forced')).toBe('true')
+    expect(host.querySelector('[data-chat-message-key="message-150"]')?.getAttribute('data-chat-message-forced')).toBe('true')
+    releasePin(); await nextTick(); await nextTick()
+    expect(host.querySelector('[data-chat-message-key="message-150"]')).toBeNull()
+    expect(host.querySelector('[data-chat-message-key="message-100"]')).not.toBeNull()
   })
 
   it('restores the same keyed reading location after visiting another session and prepending history', async () => {

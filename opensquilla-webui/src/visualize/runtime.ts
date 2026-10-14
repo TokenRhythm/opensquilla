@@ -2,13 +2,14 @@ import { createWidget, defaultThemeTokens, type ThemeTokens, type WidgetHandle }
 import type { VisualizePresentation, VisualizeRuntime, VisualizeRuntimeOptions, VisualizeSize } from './types'
 import { abortableClipboardPreparation, assertClipboardPreparationActive } from '@/utils/imageClipboard'
 import { checkCaptureLayout, validateCapturePng, VisualizeCaptureError, VISUALIZE_CAPTURE_TIMEOUT_MS } from './png'
+import { normalizeVisualizeContext } from './context'
 
 export const VISUALIZE_RUNTIME_LABEL = 'A · generative-frame 0.0.5'
 const MIN_HEIGHT = 120
 const MAX_HEIGHT = 1200
 const MOUNT_PHASE_TIMEOUT = 15_000
 const bridge = `<script>
-window.opensquillaVisualize={ready:Promise.resolve(),getState:()=>window.genframe.state,setState:value=>window.genframe.setState(value),sendPrompt:text=>window.genframe.sendPrompt(String(text))};
+window.opensquillaVisualize={ready:Promise.resolve(),getState:()=>window.genframe.state,setState:value=>window.genframe.setState(value),setContext:value=>window.genframe.updateModelContext({type:'opensquilla:context:v1',context:value}),sendPrompt:text=>window.genframe.sendPrompt(String(text))};
 window.addEventListener('keydown',event=>{
   if(event.key!=='Escape'||event.isComposing||window.genframe.context.displayMode!=='fullscreen')return;
   // Let generated controls consume Escape before asking the host to collapse.
@@ -162,16 +163,22 @@ export async function mountVisualize(container: HTMLElement, options: VisualizeR
       }
       return { mode: presentation.mode === 'expanded' ? 'fullscreen' : 'inline' }
     },
-    // Use the existing private RPC port for this one host-owned UI signal.
-    // No model context is accepted or forwarded by this adapter.
+    // Both signals terminate at the host UI. Neither reaches the model or
+    // composer until a person explicitly attaches the displayed conditions.
     onUpdateModelContext(params) {
-      if (disposed) return {}
-      if (!params || typeof params !== 'object' || Array.isArray(params)
-        || Object.keys(params).length !== 1 || (params as { type?: unknown }).type !== 'opensquilla:pointerdown:v1') {
-        throw new Error('Model context updates are unavailable in this canvas')
+      if (disposed) throw new DOMException('Canvas disposed', 'AbortError')
+      if (!params || typeof params !== 'object' || Array.isArray(params)) throw new Error('Unsupported canvas context message')
+      const message = params as Record<string, unknown>
+      if (Object.keys(message).length === 1 && message.type === 'opensquilla:pointerdown:v1') {
+        options.onPointerDown?.()
+        return {}
       }
-      options.onPointerDown?.()
-      return {}
+      if (Object.keys(message).length !== 2 || message.type !== 'opensquilla:context:v1' || !Object.prototype.hasOwnProperty.call(message, 'context')) {
+        throw new Error('Unsupported canvas context message')
+      }
+      const context = normalizeVisualizeContext(message.context)
+      if (!options.onContext || !options.onContext(context)) throw new Error('Canvas context is no longer available in this session')
+      return { accepted: true }
     },
     onResize(size) {
       if (disposed || !validSize(size)) return

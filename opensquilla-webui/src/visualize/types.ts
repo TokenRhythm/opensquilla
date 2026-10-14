@@ -11,6 +11,12 @@ export interface VisualizeReceipt {
   size: number
   marker: string
 }
+export type VisualizeJson = null | boolean | number | string | VisualizeJson[] | { [key: string]: VisualizeJson }
+export interface VisualizeContext {
+  summary: string
+  data?: VisualizeJson
+  suggestedPrompt?: string
+}
 export interface VisualizeRuntimeOptions {
   signal?: AbortSignal
   html: string
@@ -18,6 +24,8 @@ export interface VisualizeRuntimeOptions {
   theme: 'light' | 'dark'
   onPrompt(text: string): void
   onState(state: unknown): void
+  /** Host-only context update. False means its owning session is no longer current. */
+  onContext?(context: VisualizeContext | null): boolean
   onError(error: unknown): void
   /** Dismiss host UI in order and return the actual remaining display mode. */
   onDismiss?(): 'inline' | 'fullscreen'
@@ -43,5 +51,7 @@ export type VisualizeMountOptions = VisualizeRuntimeOptions
 export interface VisualizeConversation {
   enabled(sessionKey: string): boolean
   draft(sessionKey: string, receipt: VisualizeReceipt, text: string): boolean
+  /** Explicit host click attaches conditions; guest updates never invoke it. */
+  attach(sessionKey: string, receipt: VisualizeReceipt, context: VisualizeContext): boolean
 }
 export const VISUALIZE_CONVERSATION_KEY: InjectionKey<VisualizeConversation> = Symbol('VisualizeConversation')

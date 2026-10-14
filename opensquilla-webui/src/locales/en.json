@@ -1,5 +1,11 @@
 {
   "visualize": {
+    "askWithContext": "Ask with these conditions",
+    "contextAttached": "Canvas conditions attached",
+    "contextDetails": "View conditions",
+    "contextRemove": "Remove conditions",
+    "contextSnapshotHint": "The attached snapshot of these conditions will be sent.",
+    "contextAttachFailed": "Could not attach these conditions. Reconnect and try again.",
     "actions": "Canvas actions",
     "expandUnavailable": "This browser cannot expand the canvas. You can continue using it here.",
     "repair": "Ask to repair",

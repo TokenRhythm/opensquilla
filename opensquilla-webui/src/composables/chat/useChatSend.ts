@@ -2271,11 +2271,15 @@ export function useChatSend(options: UseChatSendOptions) {
     bypassSlashCommand?: boolean
     composerText?: string
     textOverride?: string
+    /** An explicit composer attachment enriches text but still consumes the draft after queue persistence. */
+    consumeComposerOnQueue?: boolean
     cancelIfComposerChanged?: boolean
     resumeQueueOnSuccess?: boolean
     /** Invocation-owned UI response; automatic sends leave it unset. */
     onAccepted?: () => void
     preflightGuard?: () => boolean
+    /** Additional scope check that remains valid after the sender consumes the composer. */
+    preDispatchGuard?: () => boolean
   }
 
   function currentExactReplayAttempt(): SendAttempt | null {
@@ -2452,7 +2456,7 @@ export function useChatSend(options: UseChatSendOptions) {
         payload: payloadFromSnapshot(composerSnapshot),
         composerSnapshot,
         cancelIfComposerChanged: invocation.cancelIfComposerChanged,
-        preDispatchGuard: deliveryStillMatches,
+        preDispatchGuard: () => deliveryStillMatches() && invocation.preDispatchGuard?.() !== false,
         onAccepted,
       })
     }
@@ -2561,7 +2565,7 @@ export function useChatSend(options: UseChatSendOptions) {
             : {}),
         }
         const queued = await Promise.resolve(
-          composerChanged || invocation.textOverride !== undefined
+          composerChanged || (invocation.textOverride !== undefined && !invocation.consumeComposerOnQueue)
             ? options.enqueuePendingPayload?.({
               text: durableText,
               ...(composerSnapshot.selectedSkills.length ? { selectedSkills: composerSnapshot.selectedSkills } : {}),
@@ -2614,7 +2618,7 @@ export function useChatSend(options: UseChatSendOptions) {
       payload: payloadFromSnapshot(composerSnapshot),
       composerSnapshot,
       cancelIfComposerChanged: invocation.cancelIfComposerChanged,
-      preDispatchGuard: deliveryStillMatches,
+      preDispatchGuard: () => deliveryStillMatches() && invocation.preDispatchGuard?.() !== false,
       onAccepted,
     })
   }

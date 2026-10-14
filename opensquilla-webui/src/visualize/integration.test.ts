@@ -13,9 +13,10 @@ import { VISUALIZE_CONVERSATION_KEY, type VisualizeRuntimeOptions } from './type
 import { visualizeReceipts } from './receipts'
 import { VISUALIZE_MESSAGE_PIN_KEY } from './presentation'
 import type { ChatRenderedMessage, ChatToolCall } from '@/types/chat'
-import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
+import { useChatTextRendering, type RenderMarkdownOptions } from '@/composables/chat/useChatTextRendering'
 import * as themeRegistry from '@/themes/registry'
 import { downloadBlob } from '@/utils/browser'
+import { saveVisualizeContext } from './context'
 
 const mounts = vi.hoisted(() => [] as Array<{ options: VisualizeRuntimeOptions; dispose: ReturnType<typeof vi.fn>; setPresentation: ReturnType<typeof vi.fn>; capture: ReturnType<typeof vi.fn> }>)
 const toasts = vi.hoisted(() => vi.fn())
@@ -36,6 +37,7 @@ const receipt = visualizeReceipts([toolCall])[0]!
 const apps: App[] = []
 const fetched = vi.fn(async () => new Blob([html], { type: 'text/html' }))
 const drafted = vi.fn(() => true)
+const attached = vi.fn(() => true)
 const releasePin = vi.fn()
 const pin = vi.fn(() => releasePin)
 const gateway = reactive({ isAvailable: true, deliveryIdentity: 'user_test', subscriptionEpoch: 1 })
@@ -46,17 +48,68 @@ async function mount(render: () => ReturnType<typeof h>) {
   const app = createApp({ render }); apps.push(app); app.use(i18n)
   app.provide(ARTIFACT_WORKBENCH_KEY, { content: { fetchVisualize: fetched } } as unknown as ArtifactWorkbench)
   app.provide(GATEWAY_ACCESS_KEY, gateway as GatewayAccess)
-  app.provide(VISUALIZE_CONVERSATION_KEY, { enabled: key => key === 'session_test', draft: drafted })
+  app.provide(VISUALIZE_CONVERSATION_KEY, { enabled: key => key === 'session_test', draft: drafted, attach: attached })
   app.provide(VISUALIZE_MESSAGE_PIN_KEY, { pin })
   app.mount(host); await settle(); return { host, app }
 }
-afterEach(() => { apps.splice(0).forEach(app => app.unmount()); mounts.splice(0); document.body.replaceChildren(); sessionStorage.clear(); vi.clearAllMocks(); vi.unstubAllGlobals() })
+afterEach(() => { apps.splice(0).forEach(app => app.unmount()); mounts.splice(0); document.body.replaceChildren(); ['session_test', 'session_other'].forEach(key => saveVisualizeContext(JSON.stringify(['user_test', key, receipt.documentId, receipt.revisionId, receipt.callId]), null)); sessionStorage.clear(); vi.clearAllMocks(); vi.unstubAllGlobals() })
 
 describe('Visualize production chat components', () => {
+  it('only attaches conditions after the host action, persists them separately, and supports explicit clear', async () => {
+    const owner = reactive({ key: 'session_test' })
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: owner.key }))
+    expect(host.querySelector('.visualize-context')).toBeNull()
+    expect(host.querySelector('[data-chat-find-ignore]')).not.toBeNull()
+    const context = { summary: '4 nights, difference 600', data: { nights: 4, priceA: 500, priceB: 350 }, suggestedPrompt: 'Compare these hotels' }
+    expect(mounts[0]!.options.onContext?.(context)).toBe(true); await settle()
+    expect(host.textContent).toContain(context.summary)
+    expect(host.querySelector('.visualize-proposal')).toBeNull()
+    expect(attached).not.toHaveBeenCalled()
+    expect(drafted).not.toHaveBeenCalled()
+    ;[...host.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Ask with these conditions')!.click(); await settle()
+    expect(attached).toHaveBeenCalledExactlyOnceWith('session_test', receipt, context)
+    expect(host.textContent).toContain('Canvas conditions attached')
+    const writes = vi.spyOn(sessionStorage, 'setItem')
+    for (let i = 0; i < 100; i++) expect(mounts[0]!.options.onContext?.(context)).toBe(true)
+    await settle()
+    expect(writes).not.toHaveBeenCalled()
+    expect(host.textContent).toContain('Canvas conditions attached')
+    writes.mockRestore()
+    mounts[0]!.options.onState({ nights: 4 })
+    host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!.click(); await settle()
+    host.querySelector<HTMLButtonElement>('[role="menuitem"]')!.click(); await settle()
+    expect(mounts[1]!.options.initialState).toEqual({ nights: 4 })
+    expect(host.textContent).toContain(context.summary)
+    expect(attached).toHaveBeenCalledTimes(1)
+    const old = mounts[1]!
+    owner.key = 'session_other'; await settle()
+    expect(host.querySelector('.visualize-context')).toBeNull()
+    expect(old.options.onContext?.(context)).toBe(false)
+    expect(mounts[2]!.options.onContext?.(context)).toBe(true); await settle()
+    expect(mounts[2]!.options.onContext?.(null)).toBe(true); await settle()
+    expect(host.querySelector('.visualize-context')).toBeNull()
+    expect(attached).toHaveBeenCalledTimes(1)
+  })
+  it('reports a failed host attach without sending, confirming twice, or damaging the canvas', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    mounts[0]!.options.onContext?.({ summary: 'selected node', data: { id: 'n1' } }); await settle()
+    attached.mockReturnValueOnce(false)
+    ;[...host.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Ask with these conditions')!.click(); await settle()
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('Could not attach')
+    expect(drafted).not.toHaveBeenCalled()
+    expect(mounts[0]!.dispose).not.toHaveBeenCalled()
+    ;[...host.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Ask with these conditions')!.click(); await settle()
+    expect(host.querySelector('[role="alert"]')).toBeNull()
+    expect(host.textContent).toContain('Canvas conditions attached')
+  })
   it('renders live text/canvas/text and preserves the runtime while later text streams', async () => {
     const raw = reactive({ value: message().text! })
     const { renderMarkdown } = useChatTextRendering()
-    const { host } = await mount(() => h(StreamingTextPart, { rawText: raw.value, renderMarkdown, visualizeReceipts: [receipt], sessionKey: 'session_test' }))
+    // happy-dom drops the first sanitized fragment wrapper. An empty first
+    // paragraph protects each committed block's real P/PRE shape while still
+    // exercising the production Markdown renderer and strict marker admission.
+    const renderBlock = (text: string, options?: RenderMarkdownOptions) => renderMarkdown(`<p></p>\n\n${text}`, options)
+    const { host } = await mount(() => h(StreamingTextPart, { rawText: raw.value, renderMarkdown: renderBlock, visualizeReceipts: [receipt], sessionKey: 'session_test' }))
     expect(host.textContent).toMatch(/Before.*Rendered canvas.*After/s)
     expect(fetched).toHaveBeenCalledWith(expect.objectContaining({ sessionKey: 'session_test', documentId: 'doc_test', revisionId: 'rev_test' }))
     raw.value += '\n\nMore explanation'; await settle()

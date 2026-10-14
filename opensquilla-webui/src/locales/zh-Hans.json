@@ -1,5 +1,11 @@
 {
   "visualize": {
+    "askWithContext": "用这些条件提问",
+    "contextAttached": "已附加画布条件",
+    "contextDetails": "查看条件",
+    "contextRemove": "移除条件",
+    "contextSnapshotHint": "将发送附加时的条件快照。",
+    "contextAttachFailed": "无法附加这些条件，请重新连接后重试。",
     "actions": "画布操作",
     "expandUnavailable": "当前浏览器无法展开画布，可以继续在这里使用。",
     "repair": "请 AI 修复",

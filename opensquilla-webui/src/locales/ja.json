@@ -1,5 +1,11 @@
 {
   "visualize": {
+    "askWithContext": "この条件で質問する",
+    "contextAttached": "キャンバスの条件を添付しました",
+    "contextDetails": "条件を表示",
+    "contextRemove": "条件を削除",
+    "contextSnapshotHint": "添付時の条件のスナップショットを送信します。",
+    "contextAttachFailed": "条件を添付できませんでした。再接続してお試しください。",
     "actions": "キャンバス操作",
     "expandUnavailable": "このブラウザーではキャンバスを拡大できません。このまま使用できます。",
     "repair": "修復を依頼",

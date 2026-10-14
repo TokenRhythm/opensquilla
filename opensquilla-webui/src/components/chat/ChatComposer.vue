@@ -4,12 +4,13 @@
     class="chat-composer"
     :class="{
       'chat-composer--new-landing': isNewLanding,
-      'chat-composer--collapsed': collapsed && promptAnnotations.length === 0 && selectedSkills.length === 0,
+      'chat-composer--collapsed': collapsed && promptAnnotations.length === 0 && selectedSkills.length === 0 && !hasContext,
       'chat-composer--floating': floating,
       'chat-composer--docked': !floating,
     }"
   >
     <div class="chat-composer-inner">
+      <slot name="context" />
       <div v-if="attachments.length > 0 || localPaths.length > 0" class="chat-collapse-region">
         <div class="chat-attachments">
           <div
@@ -558,6 +559,8 @@ interface ChatComposerExpose {
 }
 
 const props = withDefaults(defineProps<{
+  /** Keep explicit message context visible when the floating input retracts. */
+  hasContext?: boolean
   selectedSkills?: readonly SelectedSkillRef[]
   attachments: Attachment[]
   localPaths?: readonly string[]

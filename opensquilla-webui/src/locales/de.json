@@ -1,5 +1,11 @@
 {
   "visualize": {
+    "askWithContext": "Mit diesen Bedingungen fragen",
+    "contextAttached": "Canvas-Bedingungen angehängt",
+    "contextDetails": "Bedingungen anzeigen",
+    "contextRemove": "Bedingungen entfernen",
+    "contextSnapshotHint": "Der beim Anhängen erfasste Stand dieser Bedingungen wird gesendet.",
+    "contextAttachFailed": "Bedingungen konnten nicht angehängt werden. Erneut verbinden und versuchen.",
     "actions": "Canvas-Aktionen",
     "expandUnavailable": "Dieser Browser kann die Ansicht nicht vergrößern. Sie können sie hier weiter verwenden.",
     "repair": "Reparatur anfragen",

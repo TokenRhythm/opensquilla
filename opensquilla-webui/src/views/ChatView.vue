@@ -440,7 +440,7 @@
             <div v-if="presentedLive.liveAnswerPart" class="live-answer">
               <StreamingTextPart
                 :raw-text="presentedLive.liveAnswerPart.rawText"
-                :visualize-receipts="liveVisualizeReceipts"
+                :visualize-receipts="presentedLive.liveVisualizeReceipts"
                 :session-key="sessionKey"
                 :render-markdown="renderMarkdown"
               />
@@ -707,6 +707,7 @@
       :project-status-message="activeProjectStatusMessage"
       :prompt-annotations="activePromptAnnotations"
       :selected-skills="selectedSkills"
+      :has-context="Boolean(visualizeDraft.snapshot.value)"
       :can-close-project="isDraftRoute() && pendingWorkspaceId !== null"
       :can-choose-project="gatewayAccess.canChooseProject"
       :plan-mode-available="planUiAvailable"
@@ -760,7 +761,11 @@
       @jump-prompt-annotation="jumpPromptAnnotation"
       @open-prompt-cache-keepalive="promptCacheKeepaliveOpen = true"
       @refresh-prompt-cache-keepalive="void refreshPromptCacheKeepaliveStatus()"
-    />
+    >
+      <template #context>
+        <VisualizeContextChip v-if="visualizeDraft.snapshot.value" :snapshot="visualizeDraft.snapshot.value" @remove="visualizeDraft.clear" />
+      </template>
+    </ChatComposer>
     <SandboxSetupDialog
       :open="composerSandboxSetupOpen"
       :pending="sandboxSetupPending"
@@ -869,6 +874,8 @@ import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
+import VisualizeContextChip from '@/components/chat/VisualizeContextChip.vue'
+import { acceptsVisualizeContext, useVisualizeDraft } from '@/visualize/useVisualizeDraft'
 import ChatModelSetupNotice from '@/components/chat/ChatModelSetupNotice.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
@@ -1980,6 +1987,10 @@ const sessionViewCache = useChatSessionViewCache({
   capturePresentation: captureSessionPresentation,
   captureViewport: captureSessionViewport,
 })
+const visualizeDraft = useVisualizeDraft({
+  sessionKey, deliveryIdentity, generation: sessionViewCache.generation,
+  available: key => visualizeConversationEnabled(key),
+})
 // Task events can confirm an owner before deferred session metadata arrives.
 // Keep that control fact separate from completion of the display snapshot.
 const presentationMetadataReady = ref(false)
@@ -2058,7 +2069,7 @@ const {
   prepareAttachmentsForSend,
 } = chatAttachments
 watch(
-  [inputText, composerText, localPaths, pendingAttachments, selectedSkills],
+  [inputText, composerText, localPaths, pendingAttachments, selectedSkills, visualizeDraft.snapshot],
   () => {
     composerRevision.value += 1
   },
@@ -3740,9 +3751,19 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   activateSlashCmd,
   popPendingTail,
   enqueuePendingInput: async text => {
+    const context = visualizeDraft.capture()
+    if (visualizeDraft.snapshot.value && !context) return false
+    const revision = composerRevision.value
+    if (context && !await acceptsVisualizeContext(text, classifySlashCommand)) return false
+    if (context && (!context.isCurrent() || composerRevision.value !== revision)) return false
     const resume = !isStopPending.value ? capturePendingAutoSendResume() : undefined
-    const queued = await enqueuePendingInput(text)
-    if (queued) resume?.()
+    const queued = await enqueuePendingInput(
+      context ? context.message(text, t('visualize.contextAttached')) : text,
+      undefined,
+      context && text.trim().startsWith('/') && !text.trim().startsWith('//')
+        ? { confirmedPlainText: true } : undefined,
+    )
+    if (queued) { context?.accepted(); resume?.() }
     return queued
   },
   sendCurrentInput: () => sendCurrentInput(),
@@ -4046,7 +4067,26 @@ async function onComposerSend() {
   }
   const target = replanTarget.value
   if (!target) {
-    onSend({ resumeQueueOnSuccess: !isStopPending.value, onAccepted: returnToLiveOnAccepted })
+    const context = visualizeDraft.capture()
+    // A visible attachment must not silently disappear from the submitted request
+    // during cached/read-only recovery. The normal Send gate owns the next retry.
+    if (visualizeDraft.snapshot.value && !context) return
+    const composer = inputText.value
+    const submittedRevision = composerRevision.value
+    // Only actual controls keep the attachment for a later question. Unknown
+    // slash text and the // escape are ordinary messages in the existing sender.
+    const withContext = context && await acceptsVisualizeContext(composer, classifySlashCommand)
+    if (context && (!context.isCurrent() || composerRevision.value !== submittedRevision)) return
+    void onSend({
+      resumeQueueOnSuccess: !isStopPending.value,
+      ...(withContext ? {
+        composerText: composer, textOverride: context.message(composer, t('visualize.contextAttached')),
+        consumeComposerOnQueue: true, cancelIfComposerChanged: true,
+        preflightGuard: context.isCurrent,
+        preDispatchGuard: context.isCurrent,
+      } : {}),
+      onAccepted: () => { if (withContext) context.accepted(); returnToLiveOnAccepted() },
+    })
     return
   }
   const prompt = inputText.value.trim()
@@ -4443,6 +4483,7 @@ function captureLivePresentation(key = sessionKey.value) {
     liveReasoningCollapseActive: liveReasoningCollapseActive.value,
     toolInputPreviews: toolInputPreviews.value,
     liveAnswerPart: liveAnswerPart.value,
+    liveVisualizeReceipts: visualizeReceipts(foldedTurn.value.toolCalls),
     liveCurrentPhaseCode: liveCurrentPhaseCode.value,
     liveArtifacts: liveArtifacts.value,
     livePendingInterruptParts: livePendingInterruptParts.value,
@@ -5173,16 +5214,28 @@ function applyLandingSuggestion(text: string) {
   sendComposerText(text)
 }
 
-const liveVisualizeReceipts = computed(() => visualizeReceipts(foldedTurn.value.toolCalls))
 function visualizeConversationEnabled(key: string) {
   return Boolean(key && key === sessionKey.value && gatewayAccess.isAvailable && !shareMode.value
+    && !sessionViewCache.showingPreview.value && sessionViewCache.ready.value
+    && !isSessionHydrating.value && taskOwnership.hydrationResolved.value
     && !forkTransition.value && !goalDraftArmed.value && !replanActive.value && !dockedPlanQuestionnaire.value)
 }
+watch([goalDraftArmed, replanActive, dockedPlanQuestionnaire], ([goal, replan, questionnaire]) => {
+  if (goal || replan || questionnaire) visualizeDraft.clear()
+})
 provide(VISUALIZE_CONVERSATION_KEY, {
   enabled: visualizeConversationEnabled,
+  attach(key, receipt, context) {
+    const attached = visualizeDraft.attach(key, receipt, context)
+    if (!attached) return false
+    if (!composerText.value.trim() && attached.suggestedPrompt) appendComposerText(attached.suggestedPrompt)
+    expandComposer()
+    nextTick(() => composerRef.value?.focusTextarea())
+    return true
+  },
   draft(key, receipt, text) {
     if (!visualizeConversationEnabled(key)) return false
-    appendComposerText(`[Visualize: ${receipt.name} · ${receipt.revisionId}]\n${text.slice(0, 4000)}`)
+    appendComposerText(`${receipt.name}\n${text.slice(0, 4000)}`)
     return true
   },
 })
