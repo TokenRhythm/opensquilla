@@ -180,6 +180,7 @@ async function reload() {
       onPrompt(text) { if (current() && typeof text === 'string') { proposal.value = text.trim().slice(0, 4000); drafted.value = false } },
       onState(state) { if (current()) saveVisualizeState(expectedScope, state) },
       onError(cause) { if (current()) error.value = diagnostic(cause) },
+      onCollapse() { if (current()) collapse() },
     })
     if (!current()) { mounted.dispose(); return }
     runtime = mounted

@@ -5,7 +5,18 @@ export const VISUALIZE_RUNTIME_LABEL = 'A · generative-frame 0.0.5'
 const MIN_HEIGHT = 120
 const MAX_HEIGHT = 1200
 const MOUNT_PHASE_TIMEOUT = 15_000
-const bridge = `<script>window.opensquillaVisualize={ready:Promise.resolve(),getState:()=>window.genframe.state,setState:value=>window.genframe.setState(value),sendPrompt:text=>window.genframe.sendPrompt(String(text))};</script>`
+const bridge = `<script>
+window.opensquillaVisualize={ready:Promise.resolve(),getState:()=>window.genframe.state,setState:value=>window.genframe.setState(value),sendPrompt:text=>window.genframe.sendPrompt(String(text))};
+window.addEventListener('keydown',event=>{
+  if(event.key!=='Escape'||event.isComposing||window.genframe.context.displayMode!=='fullscreen')return;
+  // Let generated controls consume Escape before asking the host to collapse.
+  setTimeout(()=>{
+    if(!event.defaultPrevented&&window.genframe.context.displayMode==='fullscreen'){
+      window.genframe.requestDisplayMode('inline').catch(()=>{});
+    }
+  },0);
+},true);
+</script>`
 
 // Resolve host values before crossing the opaque-origin boundary. Sending
 // var(--text) itself would leave it undefined in the generated document.
@@ -133,6 +144,15 @@ export async function mountVisualize(container: HTMLElement, options: VisualizeR
     onPrompt(text) { if (!disposed) options.onPrompt(text) },
     onWidgetState(state) { if (!disposed) options.onState(state) },
     onError(error) { if (!disposed) { const cause = renderingError(error); firstError ??= cause; options.onError(cause) } },
+    onRequestDisplayMode({ mode }) {
+      if (disposed) return { mode: 'inline' }
+      // Only host controls may expand a canvas; guests can request dismissal.
+      if (mode === 'inline' && presentation.mode === 'expanded' && options.onCollapse) {
+        options.onCollapse()
+        return { mode: 'inline' }
+      }
+      return { mode: presentation.mode === 'expanded' ? 'fullscreen' : 'inline' }
+    },
     onResize(size) {
       if (disposed || !validSize(size)) return
       contentSize = { width: size.width, height: size.height }

@@ -19,6 +19,8 @@ export interface VisualizeRuntimeOptions {
   onPrompt(text: string): void
   onState(state: unknown): void
   onError(error: unknown): void
+  /** A guest may dismiss a host-expanded canvas, but cannot expand it. */
+  onCollapse?(): void
   /** Unclamped content size, before the host applies the presentation limit. */
   onResize?(size: VisualizeSize): void
 }

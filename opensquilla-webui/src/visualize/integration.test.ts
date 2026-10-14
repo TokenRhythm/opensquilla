@@ -117,6 +117,35 @@ describe('Visualize production chat components', () => {
     expect(pin).not.toHaveBeenCalled()
     expect(mounts[0]!.dispose).not.toHaveBeenCalled()
   })
+  it('collapses on the current guest request without remounting and ignores an old scope', async () => {
+    const owner = reactive({ key: 'session_test' })
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: owner.key }))
+    const dialog = host.querySelector('dialog')!
+    const expand = host.querySelector<HTMLButtonElement>('[aria-label="Expand"]')!
+    const first = mounts[0]!
+    const surface = host.querySelector('.visualize-surface')!
+    const input = document.createElement('input'); input.value = 'keep selection'; surface.append(input)
+    expand.click(); await settle()
+    first.options.onCollapse?.(); await settle()
+    expect(dialog.getAttribute('aria-modal')).toBeNull()
+    expect(dialog.open).toBe(true)
+    expect(document.body.style.overflow).toBe('')
+    expect(document.activeElement).toBe(expand)
+    expect(surface.contains(input)).toBe(true)
+    expect(input.value).toBe('keep selection')
+    expect(mounts).toHaveLength(1)
+    expect(first.dispose).not.toHaveBeenCalled()
+    expect(first.setPresentation).toHaveBeenLastCalledWith(expect.objectContaining({ mode: 'inline' }))
+    expect(releasePin).toHaveBeenCalledTimes(1)
+    owner.key = 'session_other'; await settle()
+    expand.click(); await settle()
+    first.options.onCollapse?.(); await settle()
+    expect(dialog.getAttribute('aria-modal')).toBe('true')
+    expect(releasePin).toHaveBeenCalledTimes(1)
+    mounts[1]!.options.onCollapse?.(); await settle()
+    expect(dialog.getAttribute('aria-modal')).toBeNull()
+    expect(releasePin).toHaveBeenCalledTimes(2)
+  })
   it('only adds diagnostics to a repair draft after an explicit click', async () => {
     const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
     mounts[0]!.options.onError(new Error('Missing chart element')); await settle()

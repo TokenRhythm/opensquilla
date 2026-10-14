@@ -23,7 +23,7 @@ beforeEach(() => {
   host = document.createElement('div')
   frame = document.createElement('iframe')
   document.body.append(host)
-  options = { html: '<button>Explore</button>', theme: 'light', initialState: { value: 3 }, onPrompt: vi.fn(), onState: vi.fn(), onError: vi.fn(), onResize: vi.fn() }
+  options = { html: '<button>Explore</button>', theme: 'light', initialState: { value: 3 }, onPrompt: vi.fn(), onState: vi.fn(), onError: vi.fn(), onResize: vi.fn(), onCollapse: vi.fn() }
   widget = {
     ready: Promise.resolve(), iframe: frame, write: vi.fn(),
     end: vi.fn(async (): Promise<EndResult> => ({ blank: false, errorCount: 0, size: { width: 640, height: 450 } })),
@@ -90,6 +90,51 @@ describe('generative-frame host adapter', () => {
     expect(driver.create).toHaveBeenCalledTimes(1)
     expect(widget.write).toHaveBeenCalledTimes(1)
     expect(widget.dispose).not.toHaveBeenCalled()
+    runtime.dispose()
+  })
+
+  it('only accepts guest dismissal while expanded and ignores requests after disposal', async () => {
+    const runtime = await mountVisualize(host, options)
+    expect(config.onRequestDisplayMode?.({ mode: 'fullscreen' })).toEqual({ mode: 'inline' })
+    expect(config.onRequestDisplayMode?.({ mode: 'inline' })).toEqual({ mode: 'inline' })
+    expect(options.onCollapse).not.toHaveBeenCalled()
+    runtime.setPresentation({ mode: 'expanded', availableHeight: 500 })
+    expect(config.onRequestDisplayMode?.({ mode: 'pip' })).toEqual({ mode: 'fullscreen' })
+    expect(options.onCollapse).not.toHaveBeenCalled()
+    expect(config.onRequestDisplayMode?.({ mode: 'inline' })).toEqual({ mode: 'inline' })
+    expect(options.onCollapse).toHaveBeenCalledTimes(1)
+    runtime.dispose()
+    config.onRequestDisplayMode?.({ mode: 'inline' })
+    expect(options.onCollapse).toHaveBeenCalledTimes(1)
+  })
+
+  it('bridges unhandled guest Escape after dispatch and respects generated controls', async () => {
+    const runtime = await mountVisualize(host, options)
+    const requestDisplayMode = vi.fn().mockResolvedValue({ mode: 'inline' })
+    const guest = Object.assign(new EventTarget(), { genframe: { context: { displayMode: 'inline' }, requestDisplayMode } })
+    const source = vi.mocked(widget.write).mock.calls[0]![0]
+    const script = new DOMParser().parseFromString(source, 'text/html').querySelector('script')!.textContent!
+    // Execute the exact guest bridge that is sent to the isolated document.
+    new Function('window', script)(guest)
+    guest.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(requestDisplayMode).not.toHaveBeenCalled()
+    guest.genframe.context.displayMode = 'fullscreen'
+    guest.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', isComposing: true, cancelable: true }))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(requestDisplayMode).not.toHaveBeenCalled()
+    guest.addEventListener('keydown', event => event.preventDefault(), { once: true })
+    guest.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(requestDisplayMode).not.toHaveBeenCalled()
+    guest.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }))
+    expect(requestDisplayMode).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(requestDisplayMode).toHaveBeenCalledExactlyOnceWith('inline')
+    guest.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }))
+    guest.genframe.context.displayMode = 'inline'
+    await vi.advanceTimersByTimeAsync(0)
+    expect(requestDisplayMode).toHaveBeenCalledTimes(1)
     runtime.dispose()
   })
 
