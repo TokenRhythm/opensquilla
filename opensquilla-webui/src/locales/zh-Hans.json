@@ -14,6 +14,7 @@
     "reloadHint": "保留已保存的参数，重新加载画布。",
     "copyImage": "复制为图像",
     "downloadPng": "下载 PNG",
+    "downloadHtml": "下载 HTML",
     "exporting": "正在生成图像…",
     "downloadStarted": "已开始下载",
     "copyUnsupported": "当前环境无法复制图像，请使用“下载 PNG”。",

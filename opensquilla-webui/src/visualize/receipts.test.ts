@@ -50,6 +50,25 @@ describe('Visualize authorized receipts and body placement', () => {
     expect(visualizeReceipts([directCall])).toHaveLength(1)
   })
 
+  it('accepts edit_widget receipts and keeps only the latest revision for one widget', () => {
+    const initial = {
+      ...receipt, widgetId: 'budget', version: 1, action: 'show', visibility: 'internal',
+      documentId: 'doc_widget', revisionId: 'rev_one', marker: 'visualize:doc_widget:rev_one',
+    }
+    const edited = {
+      ...initial, action: 'edit', version: 2, revisionId: 'rev_two', marker: 'visualize:doc_widget:rev_two',
+    }
+    const show = { ...call, name: 'show_widget', toolId: 'show_widget_call', result: JSON.stringify(initial) } as ChatToolCall
+    const edit = { ...call, name: 'edit_widget', toolId: 'edit_widget_call', result: JSON.stringify(edited) } as ChatToolCall
+    const latest = visualizeReceipts([show, edit])
+    expect(latest).toHaveLength(1)
+    expect(latest[0]).toMatchObject({ widgetId: 'budget', action: 'edit', version: 2, revisionId: 'rev_two' })
+    expect(splitVisualizeBody(`<p><code>${edited.marker}</code></p>`, latest)[0]?.receipt).toMatchObject({ revisionId: 'rev_two' })
+    expect(splitVisualizeBody(`<p><code>${initial.marker}</code></p>`, latest)[0]?.receipt).toMatchObject({ revisionId: 'rev_two' })
+    const legacyShow = { ...show, result: JSON.stringify({ ...initial, widgetId: undefined, action: undefined }) } as ChatToolCall
+    expect(visualizeReceipts([legacyShow, edit])).toHaveLength(1)
+  })
+
   it('accepts size aliases but rejects an unfinalized or non-inline widget result', () => {
     const base = { documentId: 'doc_widget', revisionId: 'rev_widget', sha256: 'b'.repeat(64), marker: 'visualize:doc_widget:rev_widget' }
     const directCall = (payload: Record<string, unknown>) => ({ ...call, toolId: 'call_widget', name: 'show_widget', result: JSON.stringify(payload) } as ChatToolCall)

@@ -14,6 +14,7 @@
     "reloadHint": "保存済みのパラメーターを保持して再読み込みします。",
     "copyImage": "画像としてコピー",
     "downloadPng": "PNG をダウンロード",
+    "downloadHtml": "HTML をダウンロード",
     "exporting": "画像を準備中…",
     "downloadStarted": "ダウンロードを開始しました",
     "copyUnsupported": "この環境では画像をコピーできません。PNG をダウンロードしてください。",

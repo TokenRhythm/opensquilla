@@ -14,6 +14,7 @@
     "reloadHint": "Gespeicherte Parameter behalten und Canvas neu laden.",
     "copyImage": "Als Bild kopieren",
     "downloadPng": "PNG herunterladen",
+    "downloadHtml": "HTML herunterladen",
     "exporting": "Bild wird erstellt…",
     "downloadStarted": "Download gestartet",
     "copyUnsupported": "Bilder können hier nicht kopiert werden. Laden Sie stattdessen PNG herunter.",

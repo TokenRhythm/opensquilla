@@ -15,6 +15,7 @@
               <button type="button" role="menuitem" :disabled="loading || exportBusy" :title="t('visualize.reloadHint')" :aria-description="t('visualize.reloadHint')" @click="reloadFromMenu">{{ t('visualize.reload') }}</button>
               <button type="button" role="menuitem" :disabled="!canExport" @click="exportCanvas('copy')">{{ t('visualize.copyImage') }}</button>
               <button type="button" role="menuitem" :disabled="!canExport" @click="exportCanvas('download')">{{ t('visualize.downloadPng') }}</button>
+              <button type="button" role="menuitem" :disabled="!canDownloadHtml" @click="exportCanvas('html')">{{ t('visualize.downloadHtml') }}</button>
             </div>
           </div>
           <button ref="expandButton" type="button" class="visualize-icon" :aria-expanded="expanded"
@@ -97,9 +98,14 @@ const exportFailed = ref(false)
 const expandUnavailable = ref(false)
 const inlineHeight = ref(120)
 const isTopmost = useDialogLayer(expanded)
-const scope = computed(() => JSON.stringify([gateway?.deliveryIdentity, props.sessionKey, props.receipt.documentId, props.receipt.revisionId, props.receipt.callId]))
+// A revision changes after edit_widget, but saved interaction state belongs to
+// the widget/session rather than to one immutable source revision.
+const widgetIdentity = computed(() => props.receipt.widgetId || props.receipt.documentId)
+const scope = computed(() => JSON.stringify([gateway?.deliveryIdentity, props.sessionKey, widgetIdentity.value]))
+const receiptVersion = computed(() => JSON.stringify([props.receipt.documentId, props.receipt.revisionId, props.receipt.sha256, props.receipt.size, props.receipt.version]))
 const canDraft = computed(() => conversation?.enabled(props.sessionKey) ?? false)
 const canExport = computed(() => !loading.value && !error.value && !exportBusy.value)
+const canDownloadHtml = computed(() => canExport.value && Boolean(props.sampleHtml !== undefined || (props.sessionKey && gateway?.isAvailable && content?.fetchVisualize)))
 let runtime: VisualizeRuntime | null = null
 let request: AbortController | null = null
 let observer: MutationObserver | null = null
@@ -221,7 +227,7 @@ function cancelExport() {
   exportRequest?.abort(); exportRequest = null; exportBusy.value = false
   exportFeedback.value = ''; exportFailed.value = false
 }
-async function exportCanvas(mode: 'copy' | 'download') {
+async function exportCanvas(mode: 'copy' | 'download' | 'html') {
   if (!canExport.value || !runtime) return
   const mounted = runtime
   const expectedScope = scope.value
@@ -231,7 +237,8 @@ async function exportCanvas(mode: 'copy' | 'download') {
     assertClipboardPreparationActive(controller.signal)
     if (!current()) throw new DOMException('Cancelled', 'AbortError')
   }
-  const filename = `${(props.receipt.name.split(/[/\\]/).pop() ?? 'visualization').replace(/\.[^.]*$/, '').replace(/[<>:"|?*\u0000-\u001f]/g, '_') || 'visualization'}.png`
+  const baseName = (props.receipt.name.split(/[/\\]/).pop() ?? 'visualization').replace(/\.[^.]*$/, '').replace(/[<>:"|?*\u0000-\u001f]/g, '_') || 'visualization'
+  const filename = mode === 'html' ? `${baseName}.html` : `${baseName}.png`
   const timeout = setTimeout(() => controller.abort(new ImageClipboardError('timedOut')), IMAGE_CLIPBOARD_PREPARATION_TIMEOUT_MS)
   exportBusy.value = true; exportFeedback.value = ''; exportFailed.value = false
   closeMenu(true)
@@ -247,7 +254,20 @@ async function exportCanvas(mode: 'copy' | 'download') {
     } catch (cause) { preparationError = cause; throw cause }
   }
   try {
-    if (mode === 'copy') {
+    if (mode === 'html') {
+      assertCurrent()
+      let blob: Blob
+      if (props.sampleHtml !== undefined) {
+        blob = new Blob([props.sampleHtml], { type: 'text/html;charset=utf-8' })
+      } else {
+        if (!props.sessionKey || !gateway?.isAvailable || !content?.fetchVisualize) throw new Error(t('visualize.unavailable'))
+        blob = await content.fetchVisualize({ sessionKey: props.sessionKey, documentId: props.receipt.documentId, revisionId: props.receipt.revisionId, signal: controller.signal, maxBytes: 1024 * 1024 })
+        const bytes = new Uint8Array(await blob.arrayBuffer())
+        if (bytes.length !== props.receipt.size || bytesToHex(sha256(bytes)) !== props.receipt.sha256) throw new Error(t('visualize.integrity'))
+        blob = new Blob([bytes], { type: 'text/html;charset=utf-8' })
+      }
+      assertCurrent(); downloadBlob(blob, filename)
+    } else if (mode === 'copy') {
       // Invoke while still inside the user's click. ClipboardItem owns the
       // preparation promise, preserving activation in Safari and mobile Web.
       await abortableClipboardPreparation(writePreparedClipboard('image', prepare), controller.signal)
@@ -365,6 +385,9 @@ onMounted(() => {
 })
 watch([proposal, context, contextAttached, contextAttachFailed, error, loading], () => { void nextTick(updatePresentation) })
 watch(scope, () => { collapse(false); if (alive) void reload() })
+// Keep one Canvas instance when edit_widget advances the source revision. The
+// stable scope preserves saved state; this watcher refreshes only guest code.
+watch(receiptVersion, () => { if (alive) void reload() })
 onBeforeUnmount(() => {
   clearContextAttachmentFeedback()
   collapse(false); alive = false; cancelExport(); request?.abort(); runtime?.dispose(); observer?.disconnect()

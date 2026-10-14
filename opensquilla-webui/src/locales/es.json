@@ -14,6 +14,7 @@
     "reloadHint": "Conservar los parámetros guardados y recargar el lienzo.",
     "copyImage": "Copiar como imagen",
     "downloadPng": "Descargar PNG",
+    "downloadHtml": "Descargar HTML",
     "exporting": "Preparando imagen…",
     "downloadStarted": "Descarga iniciada",
     "copyUnsupported": "No se pueden copiar imágenes aquí. Descarga el PNG.",

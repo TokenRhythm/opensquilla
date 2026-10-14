@@ -14,6 +14,7 @@
     "reloadHint": "Retain saved parameters and reload the canvas.",
     "copyImage": "Copy as image",
     "downloadPng": "Download PNG",
+    "downloadHtml": "Download HTML",
     "exporting": "Preparing image…",
     "downloadStarted": "Download started",
     "copyUnsupported": "Image copying is unavailable here. Use Download PNG instead.",

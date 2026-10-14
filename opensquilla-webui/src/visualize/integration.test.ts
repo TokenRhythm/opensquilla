@@ -52,7 +52,10 @@ async function mount(render: () => ReturnType<typeof h>) {
   app.provide(VISUALIZE_MESSAGE_PIN_KEY, { pin })
   app.mount(host); await settle(); return { host, app }
 }
-afterEach(() => { apps.splice(0).forEach(app => app.unmount()); mounts.splice(0); document.body.replaceChildren(); ['session_test', 'session_other'].forEach(key => saveVisualizeContext(JSON.stringify(['user_test', key, receipt.documentId, receipt.revisionId, receipt.callId]), null)); sessionStorage.clear(); vi.clearAllMocks(); vi.unstubAllGlobals() })
+afterEach(() => { apps.splice(0).forEach(app => app.unmount()); mounts.splice(0); document.body.replaceChildren(); ['session_test', 'session_other'].forEach(key => {
+  saveVisualizeContext(JSON.stringify(['user_test', key, receipt.documentId]), null)
+  saveVisualizeContext(JSON.stringify(['user_test', key, receipt.documentId, receipt.revisionId, receipt.callId]), null)
+}); sessionStorage.clear(); vi.clearAllMocks(); vi.unstubAllGlobals() })
 
 describe('Visualize production chat components', () => {
   it('only attaches conditions after the host action, persists them separately, and supports explicit clear', async () => {
@@ -135,6 +138,18 @@ describe('Visualize production chat components', () => {
     expect(mounts[1]!.options.initialState).toEqual({ workers: 7 })
     mounts[0]!.options.onPrompt('stale proposal'); await settle()
     expect(document.body.textContent).not.toContain('stale proposal')
+  })
+  it('keeps widget state when an edit receipt advances the immutable revision', async () => {
+    const holder = reactive({ receipt: { ...receipt, widgetId: 'widget_state', version: 1 } })
+    const mounted = await mount(() => h(VisualizeCanvas, { receipt: holder.receipt, sessionKey: 'session_test' }))
+    mounts[0]!.options.onState({ selected: 'updated', count: 3 })
+    holder.receipt = { ...holder.receipt, action: 'edit', version: 2, revisionId: 'rev_edited', marker: 'visualize:doc_test:rev_edited' }
+    await settle()
+    expect(mounted.host.querySelector('[data-visualize-canvas]')).not.toBeNull()
+    expect(mounts).toHaveLength(2)
+    expect(mounts[0]!.dispose).toHaveBeenCalledOnce()
+    expect(mounts[1]!.options.initialState).toEqual({ selected: 'updated', count: 3 })
+    expect(fetched).toHaveBeenLastCalledWith(expect.objectContaining({ revisionId: 'rev_edited' }))
   })
   it('rejects content whose bytes differ from the pinned tool receipt', async () => {
     const { host } = await mount(() => h(VisualizeCanvas, { receipt: { ...receipt, sha256: 'b'.repeat(64) }, sessionKey: 'session_test' }))
@@ -324,6 +339,18 @@ describe('Visualize production chat components', () => {
     expect(mounts[0]!.dispose).not.toHaveBeenCalled()
     expect(drafted).not.toHaveBeenCalled()
   })
+  it('downloads the pinned HTML revision only after an explicit menu action', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    fetched.mockClear()
+    const actions = host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!
+    actions.click(); await settle()
+    const htmlDownload = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === 'Download HTML')!
+    expect(htmlDownload.disabled).toBe(false)
+    htmlDownload.click(); await settle()
+    expect(fetched).toHaveBeenCalledWith(expect.objectContaining({ sessionKey: 'session_test', documentId: receipt.documentId, revisionId: receipt.revisionId, maxBytes: 1024 * 1024 }))
+    expect(downloadBlob).toHaveBeenCalledWith(expect.objectContaining({ type: 'text/html;charset=utf-8' }), 'visual.html')
+    expect(host.querySelector('[data-visualize-canvas]')).not.toBeNull()
+  })
   it('drops a pending export when its owning session changes', async () => {
     const owner = reactive({ key: 'session_test' })
     const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: owner.key }))
@@ -353,7 +380,7 @@ describe('Visualize production chat components', () => {
     mounts[0]!.options.onError(new Error('canvas execution failed')); await settle()
     actions.click(); await settle()
     const items = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
-    expect(items.map(button => button.disabled)).toEqual([false, true, true])
+    expect(items.map(button => button.disabled)).toEqual([false, true, true, true])
     items[0]!.click(); await settle()
     expect(mounts).toHaveLength(2)
     expect(host.querySelector('[role="alert"]')).toBeNull()

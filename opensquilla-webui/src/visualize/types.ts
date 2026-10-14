@@ -2,6 +2,14 @@ import type { InjectionKey } from 'vue'
 
 export interface VisualizeReceipt {
   callId: string
+  /** Stable identity shared by show_widget and later edit_widget receipts. */
+  widgetId?: string
+  /** `show` publishes the initial code; `edit` advances the same widget. */
+  action?: 'show' | 'edit'
+  /** Monotonic widget code version, independent of the Artifact revision id. */
+  version?: number
+  /** Internal canvas artifacts are persisted for recovery but are not Files entries. */
+  visibility?: 'internal' | 'user'
   documentId: string
   revisionId: string
   artifactId: string

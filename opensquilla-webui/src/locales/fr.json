@@ -14,6 +14,7 @@
     "reloadHint": "Conserver les paramètres enregistrés et recharger le canevas.",
     "copyImage": "Copier comme image",
     "downloadPng": "Télécharger le PNG",
+    "downloadHtml": "Télécharger le HTML",
     "exporting": "Préparation de l’image…",
     "downloadStarted": "Téléchargement lancé",
     "copyUnsupported": "La copie d’image est indisponible ici. Téléchargez le PNG.",
