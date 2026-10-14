@@ -97,7 +97,7 @@
       "id": "base:immutable-edits",
       "matches": 1,
       "beforeSha256": "898432d196503c48cf5e36d875aa60f59a6683b1646f7e0cc6bba551ca9bc7cb",
-      "afterSha256": "c33d472f4a9c335868c04a773f782c727833dd091566ab70efa4932269fd682c"
+      "afterSha256": "d0721c81a08ca52f0ecd7338bb3d2eb88b4c413048aba665efaa3bfa84f58a6f"
     },
     {
       "id": "base:skill-module-routing",
@@ -169,7 +169,7 @@
   "outputs": [
     {
       "file": "references/guidance-base.txt",
-      "sha256TextLF": "e5dbc3609dbdb94ee03f28c0291bf6805ab20dc4383cc258ae153c03953842c3"
+      "sha256TextLF": "624fc5488a79928db51204a15aed6fd7e18f1579adeb402719aade55aae17dcb"
     },
     {
       "file": "references/guidance-diagram.txt",

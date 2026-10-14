@@ -72,7 +72,7 @@ export function adaptBase(raw, mobile, records = []) {
     '- Do not call tools, navigate to external links, request credentials, or create your own expand/reload/export controls. The host supplies canvas controls.',
   ].join('\n'), records)
   edit('To change a widget you already showed, call `edit_widget` with exact `old_string` → `new_string` replacements copied from its latest code. Each `old_string` must occur exactly once; include neighboring text to make it unique. Re-send the whole widget with `show_widget` under the same title only for broad rewrites.',
-    'To change a direct in-chat visual, call `show_widget` again with the complete updated fragment and use the exact new marker from its receipt. For a file-backed visual, edit its source file and call `open_workspace_preview(path=..., presentation="inline")` again. Registration alone does not verify rendering or interaction.', 'base:immutable-edits')
+    'To change a direct in-chat visual, call `edit_widget` with exact `old_string` → `new_string` replacements copied from its latest code. Each `old_string` must occur exactly once; include neighboring text to make it unique. Re-send the whole widget with `show_widget` under the same title only for broad rewrites. For a file-backed visual, edit its source file and call `open_workspace_preview(path=..., presentation="inline")` again. Registration alone does not verify rendering or interaction.', 'base:immutable-edits')
   const moduleStart = '\n\n## Modules\n\n'
   assert.equal(text.split(moduleStart).length - 1, 1, 'Missing or duplicate module index')
   const index = text.slice(text.indexOf(moduleStart))

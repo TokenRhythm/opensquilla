@@ -1,6 +1,6 @@
 <template>
   <section class="resource-collection" :aria-label="label">
-    <p v-if="resources.length === 0" class="resource-collection__empty">
+    <p v-if="visibleResources.length === 0" class="resource-collection__empty">
       {{ emptyLabel }}
     </p>
     <template v-for="group in groups" v-else :key="group.type">
@@ -81,6 +81,7 @@ import type {
 import { workbenchResourceRefId } from '@/types/workbenchResources'
 import type { IconName } from '@/utils/icons'
 import type { WorkbenchComponentEvent } from '@/workbench/types'
+import { isInternalVisualizeResource } from '@/workbench/workbenchResourceItems'
 
 const props = defineProps<{
   busyKey?: string
@@ -101,14 +102,20 @@ const emit = defineEmits<{
   workbenchEvent: [event: WorkbenchComponentEvent]
 }>()
 
+const visibleResources = computed(() => props.resources.filter(resource => (
+  !isInternalVisualizeResource(resource)
+)))
+
 const groups = computed(() => (
   (['files', 'links'] as const).map(type => ({
     type,
     label: props.groupLabels[type],
-    resources: props.resources.filter(resource => (
-      type === 'links'
-        ? resource.resource.type === 'url'
-        : resource.resource.type !== 'url'
+    resources: visibleResources.value.filter(resource => (
+      (
+        type === 'links'
+          ? resource.resource.type === 'url'
+          : resource.resource.type !== 'url'
+      )
     )),
   }))
 ))

@@ -781,6 +781,7 @@ def _document_payload(
     publication: DocumentPublication | None,
     trusted_capabilities: bool,
     preview_pages: list[str] | None = None,
+    semantics: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     profile = _format_profile(document.name, head.media_type)
     effective_editable = trusted_capabilities and profile.editable
@@ -801,7 +802,7 @@ def _document_payload(
     if publication is not None:
         relations["deliverableId"] = publication.deliverable_artifact_id
         relations["publishedRevisionId"] = publication.revision_id
-    return {
+    payload: dict[str, Any] = {
         "resource": _resource_ref_payload("document", document.document_id),
         "name": document.name,
         "mime": head.media_type,
@@ -834,6 +835,44 @@ def _document_payload(
         },
         "relations": relations,
         **({"previewPages": preview_pages} if preview_pages is not None else {}),
+    }
+    # A Visualize widget is persisted as a Document so the inline canvas can
+    # recover its exact immutable head after reload or from a remote client.
+    # That persistence is an implementation detail, however, and must not
+    # turn the generated HTML into a user-facing Files entry.  Keep this
+    # metadata explicit so older clients can conservatively hide it while
+    # newer clients can offer targeted recovery/download actions.
+    if semantics:
+        payload.update(semantics)
+    return payload
+
+
+def _document_resource_semantics(
+    store: ArtifactStore,
+    *,
+    session_id: str,
+    artifact_id: str,
+) -> dict[str, str]:
+    """Return product-facing semantics for a document's current head.
+
+    ``ArtifactStore`` visibility controls the byte store's public listing, but
+    a persisted widget also has an ArtifactSession Document.  The Workbench
+    inventory must therefore classify that Document separately.  The source
+    marker is retained on every immutable widget revision and is the stable
+    boundary between an inline Visualize widget and an explicit workspace
+    file.  Missing/corrupt material deliberately yields no special metadata;
+    the existing integrity/capability checks remain authoritative.
+    """
+    try:
+        ref = store.get_ref(session_id=session_id, artifact_id=artifact_id)
+    except (ArtifactError, OSError, ValueError):
+        return {}
+    if not ref.source.replace("_", "-").startswith("show-widget"):
+        return {}
+    return {
+        "source": "show-widget",
+        "visibility": "internal",
+        "presentation": "inline",
     }
 
 
@@ -971,6 +1010,16 @@ async def _resource_inventory(
                 "document head integrity check failed",
                 operation="workbench.resources.list",
             )
+        semantics = _document_resource_semantics(
+            store,
+            session_id=session_id,
+            artifact_id=head.artifact_id,
+        )
+        # ``show_widget`` Documents are durable recovery records for an inline
+        # canvas, not workspace files.  Keep targeted get/open available for
+        # the canvas, but exclude them from the default Files inventory.
+        if semantics.get("source") == "show-widget":
+            continue
         profile = _format_profile(document.name, head.media_type)
         trusted_capabilities = (
             profile.editable or profile.agent_editable or profile.selection_context
@@ -994,6 +1043,7 @@ async def _resource_inventory(
                 publication=latest_publication_by_document.get(document.document_id),
                 trusted_capabilities=trusted_capabilities,
                 preview_pages=preview_pages,
+                semantics=semantics,
             )
         )
     attachment_resources = [
@@ -1052,6 +1102,11 @@ async def _document_resource(
         document, head, binding=binding,
         publication=publications[0] if publications else None,
         trusted_capabilities=trusted, preview_pages=pages,
+        semantics=_document_resource_semantics(
+            materials.store,
+            session_id=session_id,
+            artifact_id=head.artifact_id,
+        ),
     ), binding
 
 

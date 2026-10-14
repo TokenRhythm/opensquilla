@@ -569,6 +569,60 @@ async def test_generated_artifact_adopter_emits_once_after_atomic_adoption(
 
 
 @pytest.mark.asyncio
+async def test_show_widget_document_is_recoverable_but_hidden_from_files_inventory(
+    resource_env,
+) -> None:
+    env = resource_env
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+    ref = env.store.publish_bytes(
+        b"<button>inline widget</button>",
+        session_id=env.session.session_id,
+        session_key=SESSION_KEY,
+        name="capacity-1234abcd.html",
+        mime="text/html",
+        source="show-widget",
+        visibility="internal",
+    )
+    created = await service.create_document(
+        session_key=SESSION_KEY,
+        session_id=env.session.session_id,
+        name=ref.name,
+        kind=ArtifactKind.HTML,
+        initial_artifact=ArtifactBlobRef(
+            artifact_id=ref.id,
+            sha256=ref.sha256,
+            filename=ref.name,
+            media_type=ref.mime,
+            byte_size=ref.size,
+        ),
+        actor=Actor(ActorKind.SYSTEM, "visualize"),
+    )
+    await service.close()
+
+    listed = await _dispatch(
+        env,
+        "workbench.resources.list",
+        {"sessionKey": SESSION_KEY, "types": ["document"]},
+    )
+    assert listed.error is None, listed.error
+    assert listed.payload["resources"] == []
+    assert listed.payload["totalCount"] == 0
+
+    recovered = await _dispatch(
+        env,
+        "workbench.resources.get",
+        {
+            "sessionKey": SESSION_KEY,
+            "resource": {"type": "document", "id": created.document.document_id},
+        },
+    )
+    assert recovered.error is None, recovered.error
+    assert recovered.payload["resource"]["source"] == "show-widget"
+    assert recovered.payload["resource"]["visibility"] == "internal"
+    assert recovered.payload["resource"]["presentation"] == "inline"
+
+
+@pytest.mark.asyncio
 async def test_resource_reads_do_not_change_sqlite_rows(resource_env) -> None:
     env = resource_env
     attachment = await _append_attachment(

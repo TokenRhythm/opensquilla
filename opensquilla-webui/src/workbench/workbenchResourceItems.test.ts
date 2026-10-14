@@ -8,6 +8,7 @@ import {
   resourceFromPreparedPreview,
   resourceUsesNativeHtmlPreview,
   resourcesFromWorkbenchItem,
+  isInternalVisualizeResource,
   workbenchResourceKey,
 } from './workbenchResourceItems'
 
@@ -76,6 +77,20 @@ describe('workbench resource items', () => {
       title: 'Workbench',
     })
     expect(resourcesFromWorkbenchItem(item)).toEqual([document, sameLookingUnbound])
+  })
+
+  it('keeps persisted inline Visualize widgets out of the Files projection', () => {
+    const widget = resource('document', 'widget-doc')
+    widget.source = 'show-widget'
+    widget.visibility = 'internal'
+    widget.presentation = 'inline'
+    const workspaceFile = resource('document', 'workspace-doc')
+    workspaceFile.source = 'workspace-preview'
+    workspaceFile.visibility = 'internal'
+
+    expect(isInternalVisualizeResource(widget)).toBe(true)
+    expect(isInternalVisualizeResource(workspaceFile)).toBe(false)
+    expect(canonicalWorkbenchResources([widget, workspaceFile])).toEqual([workspaceFile])
   })
 
   it('does not disguise a bound attachment as its mutable Document head', () => {

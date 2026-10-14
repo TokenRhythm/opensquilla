@@ -89,17 +89,21 @@ catalog or required templates. Read only the relevant example via `skill_view`:
 ## Publish the exact result
 
 For a pure in-chat visual, call `show_widget` with the exact HTML fragment or
-standalone SVG. It returns an immutable Visualize Artifact receipt. Place its
-exact `marker` in a standalone inline-code paragraph between the relevant
-explanatory paragraphs. For example:
+standalone SVG. It returns an internal immutable Visualize Artifact receipt for
+conversation recovery and remote clients; it is not a user-facing Files entry.
+Place its exact `marker` in a standalone inline-code paragraph between the
+relevant explanatory paragraphs. For example:
 
 `visualize:doc_example:rev_example`
 
 Use only the marker returned by the tool; do not invent IDs. The tool does not
 finish the response. Continue explaining what the user can try and what it means.
-An update should call `show_widget` again with the complete updated widget; the
-first adapter stores a new immutable receipt for each call. Do not assume that
-reusing a title edits an existing Artifact yet.
+For a targeted update, call `edit_widget` with exact `old_string` → `new_string`
+replacements copied from the latest widget code. Each old string must occur
+exactly once; include enough neighboring text to make it unique. This advances
+the same widget's immutable Artifact revision and keeps its conversation
+identity. Use `show_widget` again under the same title only for a broad rewrite
+or when the widget does not exist yet.
 
 When a file or bundle is required, create the self-contained file in the current
 workspace, then call
@@ -108,6 +112,10 @@ Use the exact marker from that result as above. This path remains the supported
 one for source delivery and multi-file resources.
 When creating several examples, give each a separate file and include each final
 marker beside its explanation. Do not overwrite all examples into one file.
+
+The host Canvas menu owns explicit exports such as Download HTML and Download
+PNG. Do not create a workspace HTML file merely to make a visual downloadable;
+the user can request an export from the inline Canvas when needed.
 
 `inline-ready` means the bytes were registered, not that a browser rendered them.
 `renderStatus: not-observed` is not a successful visual check. Before publishing,

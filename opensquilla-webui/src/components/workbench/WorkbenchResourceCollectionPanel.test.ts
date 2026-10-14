@@ -7,7 +7,10 @@ import type { WorkbenchResource } from '@/types/workbenchResources'
 import { createWorkbenchResourceRef } from '@/types/workbenchResources'
 import WorkbenchResourceCollectionPanel from './WorkbenchResourceCollectionPanel.vue'
 
-function resource(type: WorkbenchResource['resource']['type'], reasonCode?: string) {
+function resource(
+  type: WorkbenchResource['resource']['type'],
+  reasonCode?: string,
+): WorkbenchResource {
   return {
     resource: createWorkbenchResourceRef(type, `${type}-1`),
     name: `${type}.html`,
@@ -24,7 +27,7 @@ function resource(type: WorkbenchResource['resource']['type'], reasonCode?: stri
       reasonCode,
     },
     relations: {},
-  } satisfies WorkbenchResource
+  }
 }
 
 function mount(
@@ -125,6 +128,18 @@ describe('WorkbenchResourceCollectionPanel', () => {
     })
     expect(mounted.element.querySelector('[aria-label="Download attachment.html"]'))
       .not.toBeNull()
+    mounted.app.unmount()
+  })
+
+  it('does not render the persisted show_widget HTML as a Files row', () => {
+    const widget = resource('document')
+    widget.source = 'show-widget'
+    widget.visibility = 'internal'
+    widget.presentation = 'inline'
+    const mounted = mount([widget])
+
+    expect(mounted.element.textContent).toContain('Empty')
+    expect(mounted.element.textContent).not.toContain('document.html')
     mounted.app.unmount()
   })
 

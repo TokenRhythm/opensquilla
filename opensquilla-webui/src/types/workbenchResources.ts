@@ -80,6 +80,12 @@ export interface WorkbenchResource {
   resource: WorkbenchResourceRef
   name: string
   mime: string
+  /** Product-facing origin, e.g. the persisted inline Visualize widget. */
+  source?: string
+  /** Storage/projection visibility. Internal widgets stay out of Files. */
+  visibility?: 'listed' | 'internal' | string
+  /** Presentation surface requested by the producer, e.g. inline. */
+  presentation?: string
   size?: number
   sha256?: string
   createdAt?: number | string | null
