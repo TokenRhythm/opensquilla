@@ -91,7 +91,7 @@ SOFTWARE.
 
 ## Mermaid source HTML parsing
 
-The Web UI bundles [parse5](https://github.com/inikulin/parse5) 8.0.1 to inspect
+The Web UI bundles [`parse5`](https://github.com/inikulin/parse5) 8.0.1 to inspect
 Mermaid source as a plain HTML syntax tree without constructing browser DOM.
 Its [entities](https://github.com/fb55/entities) dependency is locked to 8.1.0.
 The following notices reproduce the license files from those npm packages.

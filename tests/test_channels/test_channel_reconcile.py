@@ -10,6 +10,8 @@ blast radius is that entry — never the gateway.
 from __future__ import annotations
 
 import asyncio
+import threading
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -82,7 +84,9 @@ def _entry(
 
 
 @pytest.fixture()
-def manager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ChannelManager:
+async def manager(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[ChannelManager]:
     def _build(entry: SimpleNamespace):
         if getattr(entry, "webhook", False):
             return _FakeWebhookAdapter(entry)
@@ -97,7 +101,14 @@ def manager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ChannelManager:
         session_manager=object(),
         config=SimpleNamespace(state_dir=str(tmp_path)),
     )
-    return mgr
+    # Concurrency deadlines below measure adapter/dispatch ordering, not cold
+    # SQLite schema/WAL initialization. Keep the real store and transport leases.
+    assert mgr._delivery_store is not None
+    try:
+        await mgr._delivery_store.open()
+        yield mgr
+    finally:
+        await _teardown(mgr)
 
 
 async def _teardown(mgr: ChannelManager) -> None:
@@ -120,6 +131,83 @@ def _bind_readiness(manager: ChannelManager):
         ))
 
     return services, admit
+
+
+async def test_cold_store_readiness_precedes_transport_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Cover the lazy-open path separately from the warmed concurrency fixture.
+    manager = ChannelManager.from_config(
+        [], turn_runner=object(), session_manager=object(),
+        config=SimpleNamespace(state_dir=str(tmp_path)),
+    )
+    store = manager._delivery_store
+    assert store is not None
+    assert store._open_task is None
+    loop = asyncio.get_running_loop()
+    prepared = asyncio.Event()
+    release = threading.Event()
+    real_factory = store._factory
+
+    def gated_factory(path):
+        # Complete physical initialization before timing the readiness handoff.
+        connection = real_factory(path)
+        loop.call_soon_threadsafe(prepared.set)
+        if not release.wait(5):
+            connection.close()
+            raise AssertionError("test did not release cold storage initialization")
+        return connection
+
+    monkeypatch.setattr(store, "_factory", gated_factory)
+    entry = _entry("cold")
+    adapter = _FakeAdapter(entry)
+    manager._install_adapter(entry, adapter)
+    services, admit = _bind_readiness(manager)
+    preparation = asyncio.create_task(prepared.wait())
+    start = asyncio.create_task(manager.start_all())
+    try:
+        # A factory exception finishes start with start_errors instead of ever
+        # setting prepared. Observe both so that setup cannot wait on a lost event.
+        await asyncio.wait((preparation, start), return_when=asyncio.FIRST_COMPLETED)
+        assert prepared.is_set(), manager.start_errors()
+        assert not start.done()
+        assert not adapter.started
+        assert not manager._transport_leases
+        assert not manager._lease_tasks
+        assert not manager._tasks
+        assert services.optional_services["channel:cold"]["status"] == "starting"
+        with pytest.raises(TaskDependencyError, match="dependency_starting"):
+            admit("cold")
+
+        release.set()
+        assert await asyncio.wait_for(start, timeout=5) == {"cold": True}
+        assert adapter.started
+        assert store._store is not None
+        lease = manager._transport_leases["cold"]
+        assert adapter._transport_fencing_token == lease.fencing_token
+        assert await store.acquire_transport_lease(
+            "fake", manager._transport_account_id("cold", adapter), "another-owner",
+        ) is None
+        assert not manager._lease_tasks["cold"].done()
+        assert not manager._tasks["cold"].done()
+        admit("cold")
+    finally:
+        release.set()
+        for task in (preparation, start):
+            if not task.done():
+                task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(preparation, start, return_exceptions=True), timeout=5,
+            )
+        finally:
+            await asyncio.wait_for(_teardown(manager), timeout=5)
+    assert adapter.stopped
+    assert not manager._transport_leases
+    assert not manager._lease_tasks
+    assert not manager._tasks
+    assert store._closed
+    assert store._executor._shutdown
 
 
 async def test_hot_add_publishes_readiness_before_dispatch(
