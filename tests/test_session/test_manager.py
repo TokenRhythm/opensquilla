@@ -681,13 +681,13 @@ async def test_existing_session_mutations_do_not_recreate_deleted_generation(
 ):
     key = "agent:main:generation-race"
     await manager.create(key)
-    original_upsert = manager._storage.upsert_session
+    original_patch = manager._storage.update_session_fields
 
-    async def delete_before_upsert(node, **kwargs):
+    async def delete_before_patch(session_key, fields, **kwargs):
         await manager._storage.delete_session(key)
-        return await original_upsert(node, **kwargs)
+        return await original_patch(session_key, fields, **kwargs)
 
-    monkeypatch.setattr(manager._storage, "upsert_session", delete_before_upsert)
+    monkeypatch.setattr(manager._storage, "update_session_fields", delete_before_patch)
 
     with pytest.raises(KeyError, match="Session generation changed"):
         if operation == "resume":
@@ -715,13 +715,13 @@ async def test_update_expected_owner_rejects_epoch_change_before_write(
 ):
     key = "agent:main:update-owner-race"
     admitted = await manager.create(key)
-    original_upsert = manager._storage.upsert_session
+    original_patch = manager._storage.update_session_fields
 
-    async def advance_epoch_before_upsert(node, **kwargs):
+    async def advance_epoch_before_patch(session_key, fields, **kwargs):
         await manager._storage.increment_epoch(key)
-        return await original_upsert(node, **kwargs)
+        return await original_patch(session_key, fields, **kwargs)
 
-    monkeypatch.setattr(manager._storage, "upsert_session", advance_epoch_before_upsert)
+    monkeypatch.setattr(manager._storage, "update_session_fields", advance_epoch_before_patch)
 
     with pytest.raises(KeyError, match="Session generation changed"):
         await manager.update(

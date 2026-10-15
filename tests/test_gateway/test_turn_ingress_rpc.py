@@ -22,6 +22,7 @@ from opensquilla.attachment_refs import (
     pending_chat_input_material_path,
     transcript_material_path,
 )
+from opensquilla.engine.types import DoneEvent, TextDeltaEvent
 from opensquilla.gateway.admission_input import decode_admit_turn
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.auth import Principal
@@ -40,6 +41,7 @@ from opensquilla.gateway.task_runtime import TaskRuntime
 from opensquilla.gateway.turn_ingress import request_fingerprint
 from opensquilla.gateway.uploads import UploadStore, get_upload_store, set_upload_store
 from opensquilla.paths import native_io_path
+from opensquilla.provider.selector import ProviderConfig
 from opensquilla.session.goals import GoalCommandRequest, StartGoalMutation, new_goal
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
@@ -785,23 +787,91 @@ async def test_owner_web_turn_receives_narrow_generated_artifact_adopter(
 
 
 @pytest.mark.asyncio
-async def test_chat_send_first_ordinary_turn_schedules_auto_title_once(
+@pytest.mark.parametrize("method", ["chat.send", "sessions.send"])
+@pytest.mark.parametrize("direct", [False, True], ids=["task-runtime", "direct"])
+async def test_first_turn_names_once_at_route_ready_without_blocking_answer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    direct: bool,
 ) -> None:
     async with _open_real_stack(tmp_path / "sessions.db") as stack:
         stack.context.config.naming.enabled = True
         await stack.manager.update(SESSION_KEY, display_name="WebChat")
-        scheduled_titles: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        route_waiting = asyncio.Event()
+        release_route = asyncio.Event()
+        naming_started = asyncio.Event()
+        release_naming = asyncio.Event()
+        naming_finished = asyncio.Event()
+        reply_finished = asyncio.Event()
+        scheduled_titles: list[dict[str, Any]] = []
+        selected = ProviderConfig(
+            "openai", "selected-model", api_key="synthetic-key",
+            base_url="https://synthetic.invalid/v1", extra_body={"nested": {"value": 1}},
+        )
 
-        def _record_auto_title(*args: Any, **kwargs: Any) -> None:
-            scheduled_titles.append((args, kwargs))
+        async def generate(_ctx: Any, _key: str, message: str, **kwargs: Any) -> None:
+            scheduled_titles.append({"message": message, **kwargs})
+            naming_started.set()
+            await release_naming.wait()
+            naming_finished.set()
 
         monkeypatch.setattr(
-            "opensquilla.gateway.rpc_sessions._schedule_auto_title",
-            _record_auto_title,
+            "opensquilla.gateway.rpc_sessions.generate_session_title", generate,
         )
+
+        class Runner:
+            async def run(
+                self, _message: str, _key: str, *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None, **kwargs: Any,
+            ):
+                assert expected_session_id == stack.session_id
+                assert expected_session_epoch == stack.session_epoch
+                route_waiting.set()
+                await release_route.wait()
+                ready = kwargs["on_initial_provider_ready"]
+                ready(selected)
+                selected.model = "later-fallback"
+                selected.extra_body["nested"]["value"] = 2
+                ready(selected)
+                yield TextDeltaEvent(text="reply starts")
+                await stack.release_handler.wait()
+                yield DoneEvent(text="reply finished")
+                reply_finished.set()
+
+        runner = Runner()
+        stack.context.turn_runner = runner
+
+        async def emit_event(*_args: Any) -> None:
+            return None
+
+        async def handler(run: Any) -> None:
+            stack.received_runs.append(run)
+            stack.handler_started.set()
+            await dispatch_task_runtime_turn(
+                run, config=stack.context.config, session_manager=stack.manager,
+                turn_runner=runner, event_emitter=emit_event,
+            )
+
+        stack.runtime._turn_handler = handler
+        if direct:
+            stack.context.task_runtime = None
+        else:
+            activate = stack.runtime.activate
+
+            async def checked_activate(reservation: Any, **kwargs: Any) -> Any:
+                assert await stack.storage.count_transcript_entries(stack.session_id) == 1
+                assert callable(reservation.runtime_task.envelope.runtime_services.get(
+                    "on_initial_provider_ready"
+                ))
+                assert "on_initial_provider_ready" not in reservation.runtime_task.envelope.metadata
+                assert scheduled_titles == []
+                return await activate(reservation, **kwargs)
+
+            monkeypatch.setattr(stack.runtime, "activate", checked_activate)
         params = {
+            "key": SESSION_KEY,
             "sessionKey": SESSION_KEY,
             "message": "Name this ordinary first turn.",
             "clientRequestId": "ordinary-first-turn-naming",
@@ -809,19 +879,38 @@ async def test_chat_send_first_ordinary_turn_schedules_auto_title_once(
 
         response = await get_dispatcher().dispatch(
             "rpc-ordinary-first-turn-naming",
-            "chat.send",
+            method,
             params,
             stack.context,
         )
         assert response.error is None, response.error
-        await stack.wait_until_running(response.payload["task_id"])
+        await asyncio.wait_for(route_waiting.wait(), timeout=10)
+        assert scheduled_titles == []
+        release_route.set()
+        await asyncio.wait_for(naming_started.wait(), timeout=10)
         assert len(scheduled_titles) == 1
-        assert scheduled_titles[0][0][2] == "Name this ordinary first turn."
-        assert scheduled_titles[0][1]["enabled"] is True
+        call = scheduled_titles[0]
+        assert call["message"] == "Name this ordinary first turn."
+        assert call["expected_session_id"] == stack.session_id
+        assert call["expected_session_epoch"] == stack.session_epoch
+        assert call["selected_provider_config"] is not selected
+        assert call["selected_provider_config"].model == "selected-model"
+        assert call["selected_provider_config"].api_key == "synthetic-key"
+        assert call["selected_provider_config"].extra_body == {"nested": {"value": 1}}
+        assert not reply_finished.is_set()
+        stack.release_handler.set()
+        if direct:
+            task = get_agent_task_registry().get(SESSION_KEY)
+            if task is not None:
+                await asyncio.wait_for(task, timeout=10)
+        else:
+            await stack.wait_for_terminal(response.payload["task_id"], timeout=10)
+        assert reply_finished.is_set()
+        assert not naming_finished.is_set()
 
         replay = await get_dispatcher().dispatch(
             "rpc-ordinary-first-turn-naming-replay",
-            "chat.send",
+            method,
             params,
             stack.context,
         )
@@ -829,8 +918,8 @@ async def test_chat_send_first_ordinary_turn_schedules_auto_title_once(
         assert replay.payload["replayed"] is True
         assert len(scheduled_titles) == 1
 
-        stack.release_handler.set()
-        await stack.wait_for_terminal(response.payload["task_id"], timeout=2.0)
+        release_naming.set()
+        await asyncio.wait_for(naming_finished.wait(), timeout=10)
 
 
 @pytest.mark.parametrize("queued", [False, True])
@@ -904,6 +993,9 @@ async def test_image_title_uses_user_text_and_preserves_default_or_manual_name(
         accepted = await dispatcher.dispatch("accept", method, params, stack.context)
         assert accepted.ok, accepted.error
         await stack.wait_until_running()
+        ready = stack.received_runs[0].envelope.runtime_services.get("on_initial_provider_ready")
+        if ready is not None:
+            ready(ProviderConfig("openai", "synthetic-model"))
         transcript = await stack.storage.get_canonical_transcript(stack.session_id)
         stored_input = json.loads(
             next(entry.content for entry in transcript if entry.role == "user")

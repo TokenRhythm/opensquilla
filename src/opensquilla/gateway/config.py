@@ -1541,9 +1541,10 @@ class SessionNamingConfig(BaseSettings):
 
     After the first user message, a one-shot LLM call summarizes it into a short
     title written to SessionNode.derived_title. Explicit ``model`` and ``tier``
-    settings override the mode-specific default: direct routing follows the
-    resolved session/provider model, while Router and Ensemble use the router's
-    default text tier.
+    settings override the selected physical deployment: routed turns reuse the
+    chosen model and Ensemble turns reuse their aggregator, through a separate
+    naming request. Legacy callers without a selected deployment retain their
+    mode-specific session/router default.
     """
 
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_NAMING_")

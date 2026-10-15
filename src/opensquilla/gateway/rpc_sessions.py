@@ -15,6 +15,7 @@ import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -487,7 +488,9 @@ def _emit_steer_metric(disposition: str, **labels: Any) -> None:
 
 
 if TYPE_CHECKING:
-    pass
+    from opensquilla.gateway.routing import RouteEnvelope
+    from opensquilla.gateway.task_runtime import TaskReservation
+    from opensquilla.provider.selector import ProviderConfig
 
 _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS = 2.0
 _ARTIFACT_STATE_EVENT_FIELDS = (
@@ -3274,6 +3277,8 @@ def _schedule_auto_title(
     enabled: bool,
     session_id: str | None = None,
     root_turn_id: str | None = None,
+    selected_provider_config: ProviderConfig | None = None,
+    expected_session_epoch: int | None = None,
 ) -> None:
     if not enabled:
         return
@@ -3297,9 +3302,52 @@ def _schedule_auto_title(
             key,
             first_message,
             provider_request_correlation=provider_request_correlation,
+            selected_provider_config=selected_provider_config,
+            expected_session_id=session_id,
+            expected_session_epoch=expected_session_epoch,
         ),
         name=f"session-title:{key}",
     )
+
+
+def _install_auto_title(
+    ctx: RpcContext,
+    route: RouteEnvelope,
+    key: str,
+    first_message: str,
+    *,
+    enabled: bool,
+    session_id: str,
+    session_epoch: int,
+    root_turn_id: str,
+    reservation: TaskReservation | None = None,
+) -> None:
+    """Install a process-local, one-shot handoff after durable acceptance."""
+    if not enabled:
+        return
+    consumed = False
+
+    def on_initial_provider_ready(provider_config: ProviderConfig) -> None:
+        nonlocal consumed
+        if consumed:
+            return
+        # Claim before copying or scheduling: retries/fallbacks cannot name twice.
+        consumed = True
+        _schedule_auto_title(
+            ctx,
+            key,
+            first_message,
+            enabled=True,
+            session_id=session_id,
+            root_turn_id=root_turn_id,
+            selected_provider_config=deepcopy(provider_config),
+            expected_session_epoch=session_epoch,
+        )
+
+    # TaskRuntime reserves its own envelope. Attach to that accepted instance,
+    # never to serialized metadata or a pre-reservation copy.
+    envelope = reservation.runtime_task.envelope if reservation is not None else route
+    envelope.runtime_services["on_initial_provider_ready"] = on_initial_provider_ready
 
 
 def _turn_source_scope(source_hint: dict[str, Any], ctx: RpcContext) -> str:
@@ -6661,7 +6709,7 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
         self._fork_session = partial(_fork_with_numbered_title, ctx)
         self._fork_title_allocation = partial(_fork_title_allocation_context, ctx)
         self._next_fork_title = partial(_next_fork_display_name, ctx)
-        self.schedule_auto_title = partial(_schedule_auto_title, ctx)
+        self.install_auto_title = partial(_install_auto_title, ctx)
         self.steer_metric = _emit_steer_metric
         self.positive_int = _coerce_positive_int
         self.workspace_error = partial(map_project_workspace_error, owner=self.is_owner)
