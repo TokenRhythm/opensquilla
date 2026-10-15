@@ -70,6 +70,10 @@ def test_docker_build_validates_generated_webui_before_python_packaging() -> Non
     )
     assert "--mount=type=cache,target=/root/.npm,sharing=locked npm ci" in dockerfile
     assert "RUN npm run build:artifact" in dockerfile
+    assert (
+        "COPY src/opensquilla/skills/bundled/visualize/ /build/src/opensquilla/skills/bundled/visualize/"
+        in dockerfile
+    ), "Docker's isolated WebUI builder must have the checked-in Visualize guidance inputs"
     assert "OPENSQUILLA_FORBID_PERSONAL_BGM" not in dockerfile
     assert "COPY hatch_build.py ./" in dockerfile
     assert "COPY scripts/verify_webui_artifact.py ./scripts/verify_webui_artifact.py" in dockerfile
