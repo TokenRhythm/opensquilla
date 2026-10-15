@@ -1619,6 +1619,10 @@ def build_task_runtime_run_kwargs(
         # Internal-only callback: the finalizer supplies the exact assistant
         # row/content to TaskRuntime for durable channel delivery.
         kwargs["assistant_message_sink"] = assistant_message_sink
+    runtime_services = getattr(getattr(run, "envelope", None), "runtime_services", {})
+    on_initial_provider_ready = runtime_services.get("on_initial_provider_ready")
+    if callable(on_initial_provider_ready):
+        kwargs["on_initial_provider_ready"] = on_initial_provider_ready
     return kwargs
 
 

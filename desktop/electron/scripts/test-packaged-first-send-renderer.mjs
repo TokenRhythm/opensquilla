@@ -366,6 +366,8 @@ try {
       GITHUB_ACTIONS: '0',
       OPENSQUILLA_LLM_CONTEXT_WINDOW_TOKENS: '131072',
       OPENSQUILLA_TESTING: '0',
+      // This gate counts main-turn requests to detect duplicate chat sends.
+      OPENSQUILLA_NAMING_ENABLED: 'false',
       NO_PROXY: '127.0.0.1,localhost,::1',
       no_proxy: '127.0.0.1,localhost,::1',
     },

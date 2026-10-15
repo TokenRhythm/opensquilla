@@ -84,7 +84,8 @@ async function launch(name) {
     args: ['--use-mock-keychain', `--user-data-dir=${plan.userDataDir}`],
     // This synthetic fixture enables existing payload-free transaction timings
     // (256 records per storage instance); SQL and probe budgets stay unchanged.
-    env: { ...env, OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain', OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1', OPENSQUILLA_RECOVERY_OFFLINE: '1', OPENSQUILLA_STORAGE_DIAGNOSTICS: '1', OPENSQUILLA_TESTING: '0', GITHUB_ACTIONS: '0', NO_PROXY: '127.0.0.1,localhost,::1', no_proxy: '127.0.0.1,localhost,::1' },
+    // Its strict provider accepts only the audited conversation/tool turns.
+    env: { ...env, OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain', OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1', OPENSQUILLA_RECOVERY_OFFLINE: '1', OPENSQUILLA_STORAGE_DIAGNOSTICS: '1', OPENSQUILLA_NAMING_ENABLED: 'false', OPENSQUILLA_TESTING: '0', GITHUB_ACTIONS: '0', NO_PROXY: '127.0.0.1,localhost,::1', no_proxy: '127.0.0.1,localhost,::1' },
     timeout: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + timeoutMs,
   })
   active = { app, name }

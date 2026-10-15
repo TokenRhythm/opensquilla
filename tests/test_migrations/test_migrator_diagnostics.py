@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-import logging
 import sqlite3
 from pathlib import Path
 
 import pytest
+import structlog
+from structlog.testing import capture_logs
 
 import opensquilla.persistence.migrator as migrator
+from opensquilla.observability.log_privacy import private_log_event
 from opensquilla.persistence.migrator import apply_pending
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
@@ -16,14 +18,17 @@ MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
 def test_fresh_database_migration_reports_each_blocking_phase(
     tmp_path: Path,
-    caplog,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    caplog.set_level(logging.DEBUG, logger="opensquilla.persistence.migrator")
-
-    applied = apply_pending(str(tmp_path / "sessions.db"), MIGRATIONS_DIR)
+    with capture_logs() as records:
+        # A fresh lazy logger also exercises the current processors when an
+        # earlier test has already bound the module's cached structlog logger.
+        monkeypatch.setattr(migrator, "_structured_log", structlog.get_logger(migrator.__name__))
+        applied = apply_pending(str(tmp_path / "sessions.db"), MIGRATIONS_DIR)
 
     assert applied
-    messages = [record.getMessage() for record in caplog.records]
+    projected = [private_log_event(None, "debug", record) for record in records]
+    messages = [record["event"] for record in projected]
     expected = [
         "migrator.backend_open_started",
         "migrator.backend_open_ready",
@@ -37,6 +42,9 @@ def test_fresh_database_migration_reports_each_blocking_phase(
     ]
     positions = [messages.index(message) for message in expected]
     assert positions == sorted(positions)
+    completed = projected[positions[-1]]
+    assert completed["count"] == len(applied)
+    assert completed["duration_ms"] >= 0
 
 
 def test_full_fresh_migration_audit_never_uses_fqdn(

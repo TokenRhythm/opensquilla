@@ -626,6 +626,7 @@ def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
     runtime_services.pop("suspend_compute_slot", None)
     runtime_services.pop("update_progress", None)
     runtime_services.pop("goal_context", None)
+    runtime_services.pop("on_initial_provider_ready", None)
     return replace(
         envelope,
         metadata=metadata,

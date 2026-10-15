@@ -14,6 +14,7 @@ import logging
 import os
 import socket
 import sqlite3
+import time
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -35,9 +36,8 @@ from opensquilla.migration_compatibility import (
 )
 
 log = logging.getLogger(__name__)
-#: Separate structured logger: migration-directory resolution emits an
-#: operator-facing event whose fields are asserted by contract tests, while the
-#: rest of this module logs through the standard library.
+#: Keep startup phase identifiers visible through the privacy log formatter,
+#: which deliberately discards arbitrary standard-library message text.
 _structured_log = structlog.get_logger(__name__)
 
 #: PROCESS_QUERY_LIMITED_INFORMATION — the minimal access right needed to
@@ -921,26 +921,26 @@ def _apply_pending_once(
     backup_db_path: Path | None = None,
     tighten_new_db: bool = False,
 ) -> list[str]:
-    log.debug("migrator.backend_open_started")
+    _structured_log.debug("migrator.backend_open_started")
     backend = get_backend(_to_yoyo_url(db_url))
     _bind_local_yoyo_audit_identity(backend)
-    log.debug("migrator.backend_open_ready")
+    _structured_log.debug("migrator.backend_open_ready")
     try:
         if tighten_new_db:
             _restrict_db_file_permissions(_sqlite_path_from_db_url(db_url))
         with _yoyo_utf8_open():
-            log.debug("migrator.discovery_started")
+            _structured_log.debug("migrator.discovery_started")
             migrations = _discover_migrations(migrations_dir)
-            log.debug("migrator.discovery_ready", extra={"count": len(migrations)})
+            _structured_log.debug("migrator.discovery_ready", count=len(migrations))
             # The pending plan MUST be computed inside yoyo's lock: yoyo's
             # apply path never re-checks appliedness, so a plan computed
             # before the lock can re-apply migrations a concurrent process
             # just finished — a ledger IntegrityError at best, silently
             # re-running recreate-and-copy migrations (dropping later-added
             # columns) at worst.
-            log.debug("migrator.lock_wait_started")
+            _structured_log.debug("migrator.lock_wait_started")
             with backend.lock():
-                log.debug("migrator.lock_acquired")
+                _structured_log.debug("migrator.lock_acquired")
                 marked_aliases = _mark_legacy_migration_aliases(backend, migrations)
                 if marked_aliases:
                     log.info(
@@ -950,16 +950,20 @@ def _apply_pending_once(
                 pending = backend.to_apply(migrations)
                 ids = [m.id for m in pending]
                 if not ids:
-                    log.debug("migrator.plan_ready", extra={"count": 0})
+                    _structured_log.debug("migrator.plan_ready", count=0)
                     return []
-                log.debug("migrator.plan_ready", extra={"count": len(ids)})
+                _structured_log.debug("migrator.plan_ready", count=len(ids))
                 if backup_db_path is not None:
-                    log.debug("migrator.snapshot_started")
+                    _structured_log.debug("migrator.snapshot_started")
                     _snapshot_before_apply(backup_db_path, ids[0])
-                    log.debug("migrator.snapshot_ready")
-                log.debug("migrator.apply_started", extra={"count": len(ids)})
+                    _structured_log.debug("migrator.snapshot_ready")
+                started = time.monotonic()
+                _structured_log.debug("migrator.apply_started", count=len(ids))
                 backend.apply_migrations(pending)
-                log.debug("migrator.apply_ready", extra={"count": len(ids)})
+                _structured_log.debug(
+                    "migrator.apply_ready", count=len(ids),
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
         return ids
     finally:
         # yoyo backends expose no close(); the connection object is the only

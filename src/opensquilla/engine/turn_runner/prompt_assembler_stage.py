@@ -22,8 +22,12 @@ future prompt-failure early-yield branch.
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+import structlog
 
 from opensquilla.provider.protocol import configured_provider_id
 from opensquilla.tools.types import is_goal_owned_main_default_turn
@@ -38,6 +42,7 @@ if TYPE_CHECKING:
     )
     from opensquilla.observability.decision_log import PipelineStepRecord
     from opensquilla.observability.prompt_report import PromptReport
+    from opensquilla.provider.selector import ProviderConfig
     from opensquilla.provider.types import ProviderRequestCorrelation
     from opensquilla.tools.types import ToolContext
 
@@ -315,6 +320,10 @@ class PromptAssemblerStageInput:
     expected_session_id: str | None = field(default=None, repr=False)
     expected_session_epoch: int | None = field(default=None, repr=False)
     provider_metadata: dict[str, Any] = field(default_factory=dict)
+    on_initial_provider_ready: Callable[[ProviderConfig], None] | None = field(
+        default=None,
+        repr=False,
+    )
 
 @dataclass(frozen=True)
 class PromptAssemblerStageOutput:
@@ -387,6 +396,8 @@ class PromptAssemblerStage:
       SessionManager read.
     - ``memory_fingerprint.memory_mode_fingerprint`` — config method call,
       defensive (port returns ``None`` to mean "skip").
+    - ``on_initial_provider_ready`` — optional synchronous observer of the
+      already-selected physical deployment; observer failures are logged only.
 
     Exception model: re-raises any exception from the ports. The harness
     catches it through the existing CancelledError / Exception terminal
@@ -641,6 +652,32 @@ class PromptAssemblerStage:
                     "router_image_capability_exhausted",
                 ):
                     turn.metadata.pop(key, None)
+        # 命名等辅助任务只消费首次已选定的物理部署；不能从展示用 model
+        # 重建凭据，也不能把 Ensemble 或后续 fallback 当作新的派发入口。
+        if inp.on_initial_provider_ready is not None and provider is not None:
+            from opensquilla.provider.selector import ProviderConfig
+            from opensquilla.provider.types import ChatConfig
+
+            try:
+                response_deployment = getattr(provider, "current_response_deployment", None)
+                if callable(response_deployment):
+                    _, deployment, _ = response_deployment(ChatConfig())
+                else:
+                    deployment = getattr(inp.cloned_selector, "current_config", None)
+                if isinstance(deployment, ProviderConfig):
+                    result = inp.on_initial_provider_ready(deployment)
+                    if inspect.isawaitable(result):
+                        close = getattr(result, "close", None)
+                        if callable(close):
+                            close()
+                        structlog.get_logger().warning(
+                            "turn_runner.initial_provider_ready_must_be_synchronous"
+                        )
+            except Exception as exc:  # auxiliary observers must not fail the turn
+                structlog.get_logger().warning(
+                    "turn_runner.initial_provider_ready_failed",
+                    error_type=type(exc).__name__,
+                )
         if inp.cloned_selector is not None:
             # Local import to avoid pulling _SelectorFallbackProvider name
             # into the stage's module-top namespace.

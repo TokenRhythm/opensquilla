@@ -164,6 +164,7 @@
           "_handle_sessions_send_contract",
           "_handle_sessions_steer_v2_contract",
           "_is_remote_web_guest",
+          "_install_auto_title",
           "_list_transcript_titles",
           "_read_transcript_title_inputs",
           "_model_value",
