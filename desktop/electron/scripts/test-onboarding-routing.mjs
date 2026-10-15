@@ -207,7 +207,7 @@ for (const superseded of [false, true]) {
       if (++attempts === 1) throw new routerProfiles.DesktopRoutingConfigurationError()
       return startup.gatewayState
     },
-    publishGatewayConnection() {}, desktopLog() {}, currentMainWindow: () => ({}),
+    publishGatewayConnection() {}, desktopLog() {}, desktopStartupLog() {}, currentMainWindow: () => ({}),
     restoreMainWindowToBootPage: async () => {
       events.push('boot')
       if (superseded) profile = 'replacement'
