@@ -96,8 +96,8 @@ catalog or required templates. Read only the relevant example via `skill_view`:
 For a pure in-chat visual, call `show_widget` with the exact HTML fragment or
 standalone SVG. It returns an internal immutable Visualize Artifact receipt for
 conversation recovery and remote clients; it is not a user-facing Files entry.
-Place its exact `marker` on its own line between the relevant explanatory
-paragraphs. For example:
+Place its returned `marker` between the relevant explanatory paragraphs using
+the system prompt's inline visual delivery format. For example:
 
 `visualize:doc_example:rev_example`
 

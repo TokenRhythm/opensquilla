@@ -119,8 +119,13 @@ Before creating a widget, read the `visualize` Skill if it is listed.
 
 {% endif -%}
 
+{% set has_inline_visual = tools and ("show_widget" in tools or "edit_widget" in tools or has_workspace_preview) -%}
+{% if has_inline_visual and prompt_mode != "none" -%}
+- For a successful inline visual result, use the returned `marker` to place the canvas beside its explanation. Wrap the exact returned `marker` in single backticks, place it in its own paragraph, and leave blank lines before and after it. Do not substitute an entrypoint path or invent marker IDs.
+
+{% endif -%}
 {% if has_workspace_preview and prompt_mode == "full" -%}
-- After successful preview registration, mention its returned entrypoint as a standalone inline-code path in natural prose. For multiple results, give each a clear reference and enough directory context to distinguish same-named files. The client provides the preview link; do not invent a file or download URL.
+- After successful workbench preview registration (the default, non-inline presentation), mention its returned entrypoint as a standalone inline-code path in natural prose. For multiple results, give each a clear reference and enough directory context to distinguish same-named files. The client provides the preview link; do not invent a file or download URL.
 
 {% endif -%}
 {% set has_sessions_send = tools and "sessions_send" in tools -%}

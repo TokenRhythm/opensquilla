@@ -363,21 +363,43 @@ def test_result_focused_response_guidance_is_scoped_to_full_mode(mode, tools) ->
 
 
 @pytest.mark.parametrize("preview_available", [True, False])
+@pytest.mark.parametrize("mode", ["full", "minimal", "none"])
 def test_preview_file_reference_guidance_requires_preview_capability(
-    preview_available: bool,
+    preview_available: bool, mode: str,
 ) -> None:
     tools = ["write_file", "publish_artifact"]
     if preview_available:
         tools.append("open_workspace_preview")
     prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="full"), tools=tools,
+        AgentProfile(agent_id="main", prompt_mode=mode), tools=tools,
     )
     guidance = "mention its returned entrypoint as a standalone inline-code path"
-    assert prompt.count(guidance) == int(preview_available)
-    if preview_available:
+    assert prompt.count(guidance) == int(preview_available and mode == "full")
+    if preview_available and mode == "full":
+        assert "workbench preview registration (the default, non-inline presentation)" in prompt
         assert "do not invent a file or download URL" in prompt
         assert "Do not publish an HTML deliverable unless the user explicitly asks" in prompt
         assert "same-named files" in prompt
+
+
+@pytest.mark.parametrize("mode", ["full", "minimal", "none"])
+@pytest.mark.parametrize("tools", [
+    [], ["write_file"], ["show_widget"], ["edit_widget"],
+    ["open_workspace_preview"], ["show_widget", "open_workspace_preview"],
+])
+def test_inline_visual_marker_format_requires_visible_capability(mode, tools) -> None:
+    prompt = assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode=mode), tools=tools,
+    )
+    enabled = mode != "none" and bool(
+        {"show_widget", "edit_widget", "open_workspace_preview"}.intersection(tools)
+    )
+    guidance = "Wrap the exact returned `marker` in single backticks"
+    assert prompt.count(guidance) == int(enabled)
+    if enabled:
+        assert "place it in its own paragraph" in prompt
+        assert "blank lines before and after it" in prompt
+        assert "Do not substitute an entrypoint path or invent marker IDs" in prompt
 
 
 def test_preview_output_format_has_one_owner_and_tool_keeps_readiness_boundary() -> None:
@@ -390,10 +412,16 @@ def test_preview_output_format_has_one_owner_and_tool_keeps_readiness_boundary()
     html_skill = Path("src/opensquilla/skills/bundled/html-coder/SKILL.md").read_text(
         encoding="utf-8",
     )
+    visualize_skill = Path("src/opensquilla/skills/bundled/visualize/SKILL.md").read_text(
+        encoding="utf-8",
+    )
 
     # Reply formatting belongs to the system prompt; the tool owns its contract
     # and the skill owns the site-building recipe, not duplicate delivery prose.
     assert "inline-code" not in description
+    assert "returns a marker rather than an entrypoint" in description
+    assert "system prompt's inline visual delivery format" in description
+    assert "system prompt's inline visual delivery format" in visualize_skill
     assert "inline-code" not in html_skill
     assert "immutable delivery snapshot" not in html_skill
     assert "publish_artifact" not in html_skill

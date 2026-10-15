@@ -18,12 +18,12 @@ from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
         "for preview and visual feedback. "
         "Keeps the original source files. This does not build, start a server, or end the turn. "
         "Omit bundle options when reopening an existing page to retain its collection scope. "
-        "Use presentation=inline for a self-contained Visualize HTML snapshot in chat; "
-        "place the returned marker on a standalone line in your response. "
+        "Use presentation=inline for a self-contained Visualize HTML snapshot in chat. "
+        "The inline result returns a marker rather than an entrypoint; follow the system "
+        "prompt's inline visual delivery format. "
         "previewStatus reports resource readiness, not confirmation that a client displayed it; "
         "renderStatus=not-observed means browser rendering and interaction have not been verified. "
-        "Correct HTML input errors and "
-        "publish again after edits."
+        "Correct HTML input errors and publish again after edits."
     ),
     params={
         "path": {"type": "string", "description": "HTML entry file in the active workspace."},
