@@ -30,6 +30,7 @@ def test_all_bundled_skills_have_complete_provenance(tmp_path: Path) -> None:
             "openclaw-derived",
             "clawhub-mit",
             "clawhub-mit0",
+            "opensquilla-adapted-generative-frame",
         }, skill.name
         assert provenance.maintained_by == "OpenSquilla", skill.name
         if provenance.origin == "bundled-derived":
@@ -44,6 +45,11 @@ def test_all_bundled_skills_have_complete_provenance(tmp_path: Path) -> None:
         elif provenance.origin == "clawhub-mit":
             assert provenance.upstream_url.startswith("https://clawhub.ai/"), skill.name
             assert provenance.license == "MIT", skill.name
+        elif provenance.origin == "opensquilla-adapted-generative-frame":
+            assert provenance.upstream_url == (
+                "https://github.com/assistant-ui/assistant-ui/tree/main/packages/generative-frame"
+            ), skill.name
+            assert provenance.license == "Apache-2.0 AND MIT", skill.name
         else:
             assert skill.name in ORIGINALS
             assert provenance.license == "Apache-2.0", skill.name
@@ -60,11 +66,16 @@ def test_third_party_notices_match_bundled_provenance(tmp_path: Path) -> None:
     )
     clawhub_mit = sorted(name for name, origin in skills.items() if origin == "clawhub-mit")
     clawhub_derived = sorted(name for name, origin in skills.items() if origin == "clawhub-mit0")
+    adapted = sorted(
+        name for name, origin in skills.items() if origin == "opensquilla-adapted-generative-frame"
+    )
 
     assert "## OpenClaw-derived bundled skill descriptors" in text
     assert "## OpenSquilla-original bundled skills" in text
     if clawhub_derived:
         assert "## ClawHub-derived bundled skill descriptors" in text
+    if adapted:
+        assert "## OpenSquilla-adapted bundled skills" in text
     if clawhub_mit:
         assert "## ClawHub MIT bundled skill descriptors" in text
     for name in derived:
@@ -76,6 +87,8 @@ def test_third_party_notices_match_bundled_provenance(tmp_path: Path) -> None:
     for name in clawhub_mit:
         assert f"- `{name}`" in text
     for name in clawhub_derived:
+        assert f"- `{name}`" in text
+    for name in adapted:
         assert f"- `{name}`" in text
 
     listed = {

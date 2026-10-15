@@ -1151,6 +1151,15 @@ are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 - `sub-agent`
 - `xlsx`
 
+## OpenSquilla-adapted bundled skills
+
+These bundled skill descriptors combine OpenSquilla-authored host guidance with
+adapted upstream material. The upstream license and source attribution are
+documented in the Inline Visualize frame runtime section above and shipped with
+the skill as `LICENSE.generative-frame.txt`:
+
+- `visualize`
+
 ## tokenjuice adapted reduction rules
 
 - Component: built-in tokenjuice tool-result projection backend and bundled
