@@ -59,15 +59,17 @@ test('post-insertion paste fallback attaches text before send', async ({ page })
   const textarea = page.locator('.chat-textarea')
   const instruction = 'Summarize the pasted text: '
   const pastedText = `${'fallback paste content\n'.repeat(900)}tail`
+  // Fill the contenteditable first so its logical model and caret reflect the
+  // browser's post-insertion state, then deliver the paste-shaped input event
+  // that the long-paste fallback consumes.
+  await textarea.fill(`${instruction}${pastedText}`)
   await textarea.evaluate((element, value) => {
-    const field = element as HTMLTextAreaElement
-    field.value = value
-    field.dispatchEvent(new InputEvent('input', {
+    element.dispatchEvent(new InputEvent('input', {
       bubbles: true,
       inputType: 'insertFromPaste',
-      data: value.slice(value.indexOf('fallback')),
+      data: value,
     }))
-  }, `${instruction}${pastedText}`)
+  }, pastedText)
 
   const chip = page.locator('.attachment-chip')
   await expect(chip).toHaveCount(1)

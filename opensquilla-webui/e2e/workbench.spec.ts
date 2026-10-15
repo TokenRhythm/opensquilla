@@ -6,6 +6,7 @@ import {
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+import { expectComposerValue } from './utils'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2eworkbench'
@@ -490,8 +491,8 @@ test.describe('Application Workbench', () => {
     await menu.getByRole('menuitem', { name: /^Browser Use\b/ }).click()
 
     await expect(menu).toBeHidden()
-    await expect(page.getByTestId('selected-skills')).toContainText('/browser-use')
-    await expect(composer).toHaveValue('Inspect the release notes in the browser.')
+    await expect(page.locator('.chat-inline-editor__skill[data-skill-id="skill:browser-use"]')).toContainText('browser-use')
+    await expectComposerValue(composer, 'Inspect the release notes in the browser.')
     await expect(composer).toBeFocused()
     await expect(page.getByRole('dialog', { name: 'Browser Use' })).toHaveCount(0)
     await page.locator('.chat-send-btn[aria-label="Send"]').click()
@@ -553,10 +554,10 @@ test.describe('Application Workbench', () => {
     await expect(page.locator('.chat-send-btn')).toBeDisabled()
     await composer.press('Enter')
     expect(sends).toHaveLength(0)
-    await expect(composer).toHaveValue('Inspect this page.')
+    await expectComposerValue(composer, 'Inspect this page.')
 
     delayedSkills.release?.()
-    await expect(page.getByTestId('selected-skills')).toContainText('/browser-use')
+    await expect(page.locator('.chat-inline-editor__skill[data-skill-id="skill:browser-use"]')).toContainText('browser-use')
     await page.locator('.chat-send-btn[aria-label="Send"]').click()
     await expect.poll(() => sends.length).toBe(1)
     expect(sends[0]?.selectedSkills).toEqual([{
@@ -587,7 +588,7 @@ test.describe('Application Workbench', () => {
     expect(sends[0]?.selectedSkills).toBeUndefined()
 
     delayedSkills.release?.()
-    await expect(page.getByTestId('selected-skills')).toHaveCount(0)
+    await expect(page.locator('.chat-inline-editor__skill[data-skill-id]')).toHaveCount(0)
   })
 
   for (const recoverDraft of [false, true]) {
