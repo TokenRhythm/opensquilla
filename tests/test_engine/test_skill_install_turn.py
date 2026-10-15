@@ -296,6 +296,7 @@ async def test_explicit_turn_deadline_cancels_install_and_preserves_receipt(setu
     import asyncio
 
     import opensquilla.engine.agent as agent_module
+    from opensquilla.provider.retry_after import ProviderRetryAfterCooldowns
 
     source, loader, ctx, calls, make_agent = setup
     fetch_started = asyncio.Event()
@@ -370,6 +371,9 @@ async def test_explicit_turn_deadline_cancels_install_and_preserves_receipt(setu
     # must not choose which cancellation path this test exercises.
     monkeypatch.setattr(agent, "_execute_tool", track_install)
     monkeypatch.setattr(agent_module, "asyncio", ControlledAsyncio())
+    # Provider admission checks the same turn deadline even without a cooldown.
+    cooldowns = ProviderRetryAfterCooldowns(clock=clock.time)
+    monkeypatch.setattr(agent_module, "provider_retry_after_cooldowns", lambda: cooldowns)
 
     async def collect_turn():
         return [event async for event in agent.run_turn("install demo")]
