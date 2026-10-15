@@ -942,7 +942,7 @@ test.describe('0.5.0 long-task resilience', () => {
         for (const entry of list.getEntries()) metrics.longTasksMs.push(entry.duration)
       }).observe({ type: 'longtask', buffered: true })
       document.addEventListener('input', event => {
-        if (!(event.target instanceof HTMLTextAreaElement)) return
+        if (!(event.target instanceof HTMLElement) || !event.target.matches('.chat-textarea')) return
         const startedAt = performance.now()
         requestAnimationFrame(() => metrics.inputPaintMs.push(performance.now() - startedAt))
       }, true)
