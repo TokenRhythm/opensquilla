@@ -88,6 +88,8 @@ async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('avai
     get availability() { return gatewayAvailability.value },
     isRuntimeStarting: false,
     connectionHealth: 'healthy',
+    canExecuteHost: true,
+    hostExecuteUnavailableReason: null,
     connectionError: null,
     requiresCredential: false,
     get isAvailable() { return gatewayAvailability.value === 'available' },

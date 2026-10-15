@@ -53,6 +53,8 @@ function accessFromRpc(rpc: ReturnType<typeof useRpcStore>): GatewayAccess {
     get connectionError() { return rpc.error },
     requiresCredential: false,
     get isAvailable() { return rpc.isConnected },
+    get canExecuteHost() { return false },
+    hostExecuteUnavailableReason: 'permission',
     get isLocalOwner() { return rpc.isLocalOwner },
     get isAuthenticated() { return rpc.isConnected },
     guestSessionOwnerId: null,

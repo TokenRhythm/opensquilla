@@ -1,4 +1,9 @@
-import type { WorkspaceFile, WorkspaceFilePage, WorkspaceFiles } from '@/modules/workspaceFiles'
+import type {
+  WorkspaceDirectoryEntry,
+  WorkspaceFile,
+  WorkspaceFilePage,
+  WorkspaceFiles,
+} from '@/modules/workspaceFiles'
 
 interface WorkspaceFileHttp {
   requestJson<T>(endpoint: string, options?:
@@ -91,6 +96,56 @@ export function createV4WorkspaceFiles(http: WorkspaceFileHttp): WorkspaceFiles 
           || Number(value.matchLine) > Number(value.totalLines)
         ))) throw new Error('Invalid workspace file search')
       return { relativePath: file.path, totalLines: Number(value.totalLines), matchLine: value.matchLine as number | null }
+    },
+    async listDir(sessionKey, path = '', cursor = '0', limit = 200, workspaceBinding = '', signal) {
+      if (!sessionKey || typeof path !== 'string' || path.length > 4096
+        || (path !== '' && !relativePath(path)) || !/^\d{1,12}$/.test(cursor)
+        || !Number.isSafeInteger(limit) || limit < 1 || limit > 200
+        || workspaceBinding.length > 512) throw new Error('Invalid workspace directory page')
+      const params = new URLSearchParams({ path, cursor, limit: String(limit) })
+      if (workspaceBinding) params.set('workspaceBinding', workspaceBinding)
+      const raw = await http.requestJson<unknown>(`/api/v1/workspace-files/list?${params}`, {
+        method: 'GET', sessionKey, signal,
+      })
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Invalid workspace directory page')
+      const value = raw as Record<string, unknown>
+      if (typeof value.workspaceBinding !== 'string' || !value.workspaceBinding || value.workspaceBinding.length > 512
+        || typeof value.relativePath !== 'string' || value.relativePath !== (path || '')
+        || !Array.isArray(value.entries) || (value.nextCursor !== null
+          && (typeof value.nextCursor !== 'string' || !/^\d{1,12}$/.test(value.nextCursor)))
+        || typeof value.hasMore !== 'boolean' || typeof value.truncated !== 'boolean') {
+        throw new Error('Invalid workspace directory page')
+      }
+      if (workspaceBinding && value.workspaceBinding !== workspaceBinding) throw new Error('Invalid workspace directory page')
+      const entries = value.entries.map((entry): WorkspaceDirectoryEntry => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('Invalid workspace directory entry')
+        const item = entry as Record<string, unknown>
+        if (typeof item.name !== 'string' || !item.name || item.name.length > 4096
+          || !relativePath(item.path) || item.name !== item.path.split('/').pop()
+          || item.path.split('/').slice(0, -1).join('/') !== (path || '')
+          || typeof item.type !== 'string'
+          || !['directory', 'file'].includes(item.type)
+          || typeof item.kind !== 'string' || !['directory', 'text', 'image', 'download'].includes(item.kind)
+          || typeof item.mime !== 'string' || typeof item.mtimeNs !== 'string'
+          || (item.size !== null && (!Number.isSafeInteger(item.size) || Number(item.size) < 0))) {
+          throw new Error('Invalid workspace directory entry')
+        }
+        if (item.type === 'directory' && item.kind !== 'directory') throw new Error('Invalid workspace directory entry')
+        if (item.type === 'file' && item.kind === 'directory') throw new Error('Invalid workspace directory entry')
+        return {
+          name: item.name, path: item.path, type: item.type as WorkspaceDirectoryEntry['type'],
+          kind: item.kind as WorkspaceDirectoryEntry['kind'], mime: item.mime,
+          size: item.size === null ? null : Number(item.size), mtimeNs: item.mtimeNs,
+        }
+      })
+      return {
+        workspaceBinding: value.workspaceBinding,
+        relativePath: value.relativePath,
+        entries,
+        nextCursor: value.nextCursor as string | null,
+        hasMore: value.hasMore,
+        truncated: value.truncated,
+      }
     },
   }
 }

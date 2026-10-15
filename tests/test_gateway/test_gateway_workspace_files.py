@@ -77,6 +77,46 @@ async def read_page(files, *, path="source.py", binding=None, start=1, end=200, 
     )
 
 
+async def list_dir(files, *, path="", binding="", cursor="0", limit=200, **kwargs):
+    params = {"path": path, "cursor": cursor, "limit": limit}
+    if binding:
+        params["workspaceBinding"] = binding
+    return await files.client.get("/api/v1/workspace-files/list", params=params, **kwargs)
+
+
+async def test_list_directory_is_paginated_sorted_and_hides_noisy_directories(files):
+    (files.root / "z.txt").write_text("z")
+    (files.root / "a.txt").write_text("a")
+    (files.root / "folder").mkdir()
+    (files.root / "folder" / "nested.py").write_text("pass\n")
+    (files.root / "node_modules").mkdir()
+    (files.root / "node_modules" / "dependency.js").write_text("ignored")
+    first = await list_dir(files, limit=2)
+    assert first.status_code == 200, first.text
+    envelope = first.json()
+    assert envelope["relativePath"] == ""
+    assert [entry["name"] for entry in envelope["entries"]] == ["folder", "a.txt"]
+    assert envelope["hasMore"] is True
+    assert envelope["entries"][0]["kind"] == "directory"
+    binding = envelope["workspaceBinding"]
+    second = await list_dir(files, binding=binding, cursor=envelope["nextCursor"], limit=2)
+    assert second.status_code == 200, second.text
+    assert [entry["name"] for entry in second.json()["entries"]] == ["z.txt"]
+    nested = await list_dir(files, path="folder", binding=binding)
+    assert [entry["path"] for entry in nested.json()["entries"]] == ["folder/nested.py"]
+    assert "node_modules" not in [
+        entry["name"] for entry in envelope["entries"] + second.json()["entries"]
+    ]
+
+
+async def test_list_directory_rejects_stale_binding_and_invalid_paging(files):
+    (files.root / "source.py").write_text("pass\n")
+    binding = (await list_dir(files)).json()["workspaceBinding"]
+    assert (await list_dir(files, binding="stale")).status_code == 404
+    assert (await list_dir(files, binding=binding, limit=201)).status_code == 400
+    assert (await list_dir(files, binding=binding, cursor="-1")).status_code == 400
+
+
 def metadata_headers(files, *, path: str, binding: str, session_key: str | None = None):
     key = session_key or files.session.session_key
     owner = files.app.state.desktop_gateway_ownership

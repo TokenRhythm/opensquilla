@@ -150,6 +150,7 @@ const recentlyActivatedProviderId = ref('')
 let recentlyActivatedTimer: ReturnType<typeof setTimeout> | null = null
 let activationFocus: { providerId: string; invoker: HTMLElement } | null = null
 const dialogInvoker = ref<HTMLElement | null>(null)
+let dialogGeneration = 0
 
 const selectedProviderLabel = computed(() => (
   props.panel.credentialPanel?.providerLabel || props.panel.providerSelected
@@ -207,16 +208,40 @@ const visibleConfiguredProviders = computed(() => (
 ))
 
 function chooseAddProvider(providerId: string) {
+  if (!addOpen.value || providerBusy.value || props.saving) return
   emit('addProvider', providerId)
+  // A cancelled draft may already have this provider selected. Opening the
+  // editor is an interaction, so it must not depend on that value changing.
+  addOpen.value = false
+  editorOpen.value = true
+  focusProviderEditor(true)
+}
+
+function focusProviderEditor(preferCredential = false) {
+  const generation = ++dialogGeneration
+  void nextTick(() => {
+    if (generation !== dialogGeneration || !editorOpen.value || addOpen.value) return
+    const credentialInput = preferCredential
+      ? editorDialogRef.value?.querySelector<HTMLInputElement>('input[name="setup_provider_api_key"]:not([disabled])')
+      : null
+    const target = credentialInput
+      ?? editorDialogRef.value?.querySelector<HTMLElement>('button, input, [tabindex]:not([tabindex="-1"])')
+    target?.scrollIntoView({ block: 'nearest' })
+    target?.focus({ preventScroll: true })
+  })
 }
 
 function closeAddPicker(restoreFocus = true) {
   if (!addOpen.value && !editorOpen.value) return
+  dialogGeneration += 1
   addOpen.value = false
   editorOpen.value = false
   if (restoreFocus) {
+    const generation = dialogGeneration
     const target = dialogInvoker.value ?? addButtonRef.value
-    void nextTick(() => target?.focus())
+    void nextTick(() => {
+      if (generation === dialogGeneration) target?.focus()
+    })
   }
   dialogInvoker.value = null
 }
@@ -236,6 +261,7 @@ function toggleAddPicker() {
     return
   }
   dialogInvoker.value = addButtonRef.value
+  dialogGeneration += 1
   addOpen.value = true
   editorOpen.value = true
 }
@@ -248,6 +274,7 @@ function selectConfigured(providerId: string) {
   editorOpen.value = true
   addOpen.value = false
   emit('selectConfiguredProvider', providerId)
+  focusProviderEditor()
 }
 
 function onEditorDialogKeydown(event: KeyboardEvent) {
@@ -354,22 +381,6 @@ const modelSectionDesc = computed(() => {
   return t('setup.provider.configuredModelDescFixed')
 })
 
-watch(() => props.panel.providerSelected, (value, previous) => {
-  if (!value || value === previous) return
-  const selectedFromPicker = addOpen.value
-  addOpen.value = false
-  if (selectedFromPicker) editorOpen.value = true
-  void nextTick(() => {
-    const credentialInput = selectedFromPicker
-      ? editorDialogRef.value?.querySelector<HTMLInputElement>('input[name="setup_provider_api_key"]:not([disabled])')
-      : null
-    const target = credentialInput
-      ?? editorDialogRef.value?.querySelector<HTMLElement>('button, input, [tabindex]:not([tabindex="-1"])')
-    target?.scrollIntoView({ block: 'nearest' })
-    target?.focus({ preventScroll: true })
-  })
-})
-
 const hasSavableProviderChange = computed(() => (
   Boolean(props.dirty)
   || Boolean(props.panel.imageGenerationOffer && props.panel.imageGenerationOptIn)
@@ -415,6 +426,7 @@ watch(activeConfiguredProviderId, (providerId, previousProviderId) => {
 })
 
 onBeforeUnmount(() => {
+  dialogGeneration += 1
   if (recentlyActivatedTimer) clearTimeout(recentlyActivatedTimer)
   activationFocus = null
 })

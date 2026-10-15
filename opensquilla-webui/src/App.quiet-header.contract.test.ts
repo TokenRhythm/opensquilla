@@ -27,4 +27,12 @@ describe('App status and navigation ownership', () => {
     expect(appSource).toContain('<WorkbenchToggle')
     expect(appSource).toContain('@open-deliverables="chatRouteHeader.invoke(\'openDeliverables\')"')
   })
+  it('keeps the empty Workbench entry available in remote WebUI without native browser surfaces', () => {
+    const toggle = appSource.match(/<WorkbenchToggle\b[\s\S]*?\/>/)?.[0]
+    expect(toggle).toBeDefined()
+    expect(toggle).toContain('allow-empty')
+    expect(toggle).toContain(':enabled="appStore.features.artifactWorkbench === true && isChatRoute"')
+    expect(toggle).not.toContain('hasNativeWorkbenchSurfaces')
+    expect(toggle).not.toMatch(/\bv-if=/)
+  })
 })

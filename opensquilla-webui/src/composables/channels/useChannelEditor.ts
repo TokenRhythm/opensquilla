@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, getCurrentScope, onScopeDispose, ref } from 'vue'
 import i18n from '@/i18n'
 import { errorMessage } from '@/composables/channels/shared'
 import { useSetupChannelsForm } from '@/composables/setup/useSetupChannelsForm'
@@ -69,7 +69,7 @@ export interface DraftProbeState {
 export type ChannelEditorPhase = 'idle' | 'loading' | 'active' | 'error'
 
 export interface ChannelSaveResult {
-  status: 'invalid' | 'probe-failed' | 'saved' | 'error'
+  status: 'invalid' | 'probe-failed' | 'saved' | 'error' | 'superseded'
   outcome?: ChannelSaveOutcome
   message?: string
 }
@@ -150,6 +150,31 @@ export function useChannelEditor(
   const probe = ref<DraftProbeState>({ phase: 'idle', rows: [] })
   const fieldErrors = ref<Record<string, string>>({})
   const saving = ref(false)
+  // Each opening is a new owner, even when reopening the same channel. Draft
+  // edits also invalidate probes/reseeds, while request ids keep an old
+  // completion from clearing the next operation's pending state.
+  let generation = 0
+  let draftRevision = 0
+  let probeRequest = 0
+  let saveRequest = 0
+  let disposed = false
+
+  function ownsDraft(owner: number, revision = draftRevision): boolean {
+    return !disposed && owner === generation && revision === draftRevision
+  }
+
+  function invalidateDraft(): number {
+    generation += 1
+    saveRequest += 1
+    saving.value = false
+    resetProbe()
+    return generation
+  }
+
+  if (getCurrentScope()) onScopeDispose(() => {
+    disposed = true
+    invalidateDraft()
+  })
 
   const spec = computed<ChannelEditorSpec | null>(
     () => catalog.value.find(s => s.type === entryType.value) || null,
@@ -161,7 +186,7 @@ export function useChannelEditor(
 
   async function ensureCatalog(refresh = false): Promise<ChannelEditorSpec[]> {
     const channels = await ensureChannelCatalog(setupCatalog, { refresh })
-    catalog.value = channels
+    if (!disposed) catalog.value = channels
     return channels
   }
 
@@ -185,9 +210,9 @@ export function useChannelEditor(
     try {
       await ensureCatalog()
     } catch (err) {
-      catalogError.value = errorMessage(err)
+      if (!disposed) catalogError.value = errorMessage(err)
     } finally {
-      catalogPending.value = false
+      if (!disposed) catalogPending.value = false
     }
   }
 
@@ -201,6 +226,7 @@ export function useChannelEditor(
   }
 
   function resetProbe(): void {
+    probeRequest += 1
     if (probe.value.phase !== 'idle') probe.value = { phase: 'idle', rows: [] }
   }
 
@@ -209,6 +235,16 @@ export function useChannelEditor(
    * (post-save baseline reset) without flashing the loading skeleton.
    */
   async function open(name: string, opts: { quiet?: boolean } = {}): Promise<void> {
+    const owner = invalidateDraft()
+    await loadEntry(name, owner, draftRevision, opts)
+  }
+
+  async function loadEntry(
+    name: string,
+    owner: number,
+    revision: number,
+    opts: { quiet?: boolean } = {},
+  ): Promise<void> {
     if (!opts.quiet) phase.value = 'loading'
     loadError.value = ''
     fieldErrors.value = {}
@@ -218,6 +254,7 @@ export function useChannelEditor(
         ensureCatalog(),
         channelAdministration.get(name),
       ])
+      if (!ownsDraft(owner, revision)) return
       const entry = res?.entry
       if (!entry) throw new Error(i18n.global.t('console.channels.editor.entryMissing', { name }))
       entryType.value = String(entry.type || '')
@@ -231,6 +268,7 @@ export function useChannelEditor(
       loadedName.value = name
       phase.value = 'active'
     } catch (err) {
+      if (!ownsDraft(owner, revision)) return
       phase.value = 'error'
       loadError.value = errorMessage(err)
     }
@@ -239,7 +277,11 @@ export function useChannelEditor(
   /** Restore the last-loaded server entry in place (Discard / Esc-cancel). */
   function discard(): void {
     const s = spec.value
+    // Esc can leave a deep-linked edit before its first read has completed.
+    // With no loaded draft to restore, that read still belongs to this channel
+    // and must be allowed to hydrate the now read-only configuration.
     if (!s || !loadedEntry.value) return
+    invalidateDraft()
     form.initFromEntry(s, loadedEntry.value, loadedSecretFields.value)
     fieldErrors.value = {}
     resetProbe()
@@ -259,6 +301,7 @@ export function useChannelEditor(
     type: string,
     opts: { existingNames?: string[] } = {},
   ): Promise<void> {
+    const owner = invalidateDraft()
     phase.value = 'loading'
     loadError.value = ''
     fieldErrors.value = {}
@@ -268,6 +311,7 @@ export function useChannelEditor(
     loadedSecretFields.value = []
     try {
       const channels = await ensureCatalog()
+      if (!ownsDraft(owner)) return
       entryType.value = type
       const found = channels.find(s => s.type === type) || null
       form.selectChannelType(type)
@@ -278,6 +322,7 @@ export function useChannelEditor(
       captureBaseline(found?.fields ?? [], seed ?? {})
       phase.value = 'active'
     } catch (err) {
+      if (!ownsDraft(owner)) return
       phase.value = 'error'
       loadError.value = errorMessage(err)
     }
@@ -285,6 +330,7 @@ export function useChannelEditor(
 
   /** Full clear when the selection changes or the aside closes. */
   function reset(): void {
+    invalidateDraft()
     phase.value = 'idle'
     loadedName.value = ''
     loadError.value = ''
@@ -298,6 +344,7 @@ export function useChannelEditor(
   }
 
   function updateField(name: string, value: unknown): void {
+    draftRevision += 1
     form.updateField(name, value)
     // A probe verdict describes the draft it ran against; any edit voids it.
     resetProbe()
@@ -309,11 +356,13 @@ export function useChannelEditor(
   }
 
   function replaceSecret(name: string): void {
+    draftRevision += 1
     form.replaceSecret(name)
     resetProbe()
   }
 
   function cancelSecretReplace(name: string): void {
+    draftRevision += 1
     form.cancelSecretReplace(name)
     resetProbe()
   }
@@ -360,10 +409,21 @@ export function useChannelEditor(
    */
   async function testDraft(opts: { fromSave?: boolean } = {}): Promise<boolean> {
     if (probe.value.phase === 'running') return false
+    return probeEntry(form.payload(), generation, draftRevision, opts)
+  }
+
+  async function probeEntry(
+    entry: Record<string, unknown>,
+    owner: number,
+    revision: number,
+    opts: { fromSave?: boolean } = {},
+  ): Promise<boolean> {
+    const request = ++probeRequest
     probe.value = { phase: 'running', rows: [] }
     const started = Date.now()
     try {
-      const res = await channelSetup.probeDraft(form.payload())
+      const res = await channelSetup.probeDraft(entry)
+      if (!ownsDraft(owner, revision) || request !== probeRequest) return false
       const rows: ProbeTranscriptRow[] = [
         { id: 'validate', tone: 'ok', text: i18n.global.t('console.channels.editor.probeValid') },
         ...(res?.warnings || []).map((text, index) => ({
@@ -381,6 +441,7 @@ export function useChannelEditor(
       }
       return true
     } catch (err) {
+      if (!ownsDraft(owner, revision) || request !== probeRequest) return false
       probe.value = {
         phase: 'done',
         ok: false,
@@ -392,20 +453,27 @@ export function useChannelEditor(
     }
   }
 
-  async function commit(entry: Record<string, unknown>): Promise<ChannelSaveResult> {
+  async function commit(
+    entry: Record<string, unknown>,
+    owner: number,
+    revision: number,
+    editing: boolean,
+  ): Promise<ChannelSaveResult> {
     try {
       const outcome = await channelSetup.upsert(entry)
-      if (form.isEditing.value) {
+      if (!ownsDraft(owner, revision)) return { status: 'superseded', outcome }
+      if (editing) {
         // Reseed from the server so a just-replaced secret flips back to its
         // masked row, the plaintext leaves memory, and the baseline resets.
-        await open(outcome.name || loadedName.value, { quiet: true })
+        await loadEntry(outcome.name || String(entry.name || ''), owner, revision, { quiet: true })
       } else {
         // Compose: the caller dismisses the takeover and selects the new
         // channel — no reseed, just drop the stale probe verdict.
         resetProbe()
       }
-      return { status: 'saved', outcome }
+      return { status: ownsDraft(owner, revision) ? 'saved' : 'superseded', outcome }
     } catch (err) {
+      if (!ownsDraft(owner, revision)) return { status: 'superseded' }
       return { status: 'error', message: errorMessage(err) }
     }
   }
@@ -413,6 +481,7 @@ export function useChannelEditor(
   /** Save = probe → upsert. A probe failure blocks with inline rows; the
    *  caller offers "Save anyway" (saveAnyway) — probing is advisory. */
   async function save(): Promise<ChannelSaveResult> {
+    if (saving.value || phase.value !== 'active' || disposed) return { status: 'superseded' }
     const missing = form.missingRequiredFields()
     if (missing.length > 0) {
       fieldErrors.value = Object.fromEntries(
@@ -421,21 +490,34 @@ export function useChannelEditor(
       return { status: 'invalid' }
     }
     fieldErrors.value = {}
+    const owner = generation
+    const revision = draftRevision
+    const entry = form.payload()
+    const editing = form.isEditing.value
+    const request = ++saveRequest
     saving.value = true
     try {
-      if (!(await testDraft({ fromSave: true }))) return { status: 'probe-failed' }
-      return await commit(form.payload())
+      const valid = await probeEntry(entry, owner, revision, { fromSave: true })
+      if (!ownsDraft(owner, revision)) return { status: 'superseded' }
+      if (!valid) return { status: 'probe-failed' }
+      return await commit(entry, owner, revision, editing)
     } finally {
-      saving.value = false
+      if (request === saveRequest) saving.value = false
     }
   }
 
   async function saveAnyway(): Promise<ChannelSaveResult> {
+    if (saving.value || phase.value !== 'active' || disposed) return { status: 'superseded' }
+    const owner = generation
+    const revision = draftRevision
+    const entry = form.payload()
+    const editing = form.isEditing.value
+    const request = ++saveRequest
     saving.value = true
     try {
-      return await commit(form.payload())
+      return await commit(entry, owner, revision, editing)
     } finally {
-      saving.value = false
+      if (request === saveRequest) saving.value = false
     }
   }
 

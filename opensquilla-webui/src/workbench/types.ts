@@ -18,9 +18,11 @@ export type WorkbenchPanelKind =
   | 'browser'
   | 'frontend-preview'
   | 'file'
+  | 'workspace-files'
   | 'tool-file-history'
   | 'diff'
   | 'terminal'
+  | 'assistant-chat'
 
 export type WorkbenchRetention = 'dispose-on-suspend' | 'keep-alive'
 

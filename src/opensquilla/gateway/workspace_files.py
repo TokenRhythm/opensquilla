@@ -43,6 +43,8 @@ MAX_TEXT_PAGE_LINES = 200
 MAX_TEXT_LINE_BYTES = 256 * 1024
 MAX_TEXT_PAGE_BYTES = 1024 * 1024
 MAX_TEXT_SEARCH_CHARS = 512
+MAX_DIRECTORY_PAGE_SIZE = 200
+MAX_DIRECTORY_ENTRIES = 100_000
 _READ_CHUNK_BYTES = 64 * 1024
 _WINDOWS = os.name == "nt"
 _MAX_REQUEST_BYTES = 64 * 1024
@@ -296,6 +298,178 @@ class WorkspaceFiles:
             "totalLines": total_lines,
             "matchLine": match_line,
         }
+
+    async def list_dir(
+        self,
+        session_key: str,
+        path: str,
+        binding: str,
+        cursor: int,
+        limit: int,
+    ) -> dict[str, Any]:
+        """List one directory page without exposing host paths.
+
+        The first request may omit the binding so the client can discover the
+        current workspace identity. Subsequent requests must echo it. The
+        directory is rescanned for every page; the bounded result and opaque
+        offset keep this endpoint stateless while the binding prevents pages
+        from crossing a workspace/epoch change.
+        """
+        workspace = await self.workspace(session_key)
+        if binding and binding != workspace.binding:
+            raise WorkspaceFileUnavailableError()
+        if cursor < 0 or limit < 1 or limit > MAX_DIRECTORY_PAGE_SIZE:
+            raise WorkspaceFileUnavailableError()
+        entries, truncated = await asyncio.to_thread(
+            _list_directory, workspace, path
+        )
+        if await self.workspace(session_key) != workspace:
+            raise WorkspaceFileUnavailableError()
+        page = entries[cursor:cursor + limit]
+        next_cursor = cursor + len(page) if cursor + len(page) < len(entries) else None
+        return {
+            "workspaceBinding": workspace.binding,
+            "relativePath": _directory_relative_path(workspace, path),
+            "entries": page,
+            "nextCursor": str(next_cursor) if next_cursor is not None else None,
+            "hasMore": next_cursor is not None,
+            "truncated": truncated,
+        }
+
+_NOISY_DIRECTORY_NAMES = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        "node_modules",
+        ".venv",
+        "venv",
+        "__pycache__",
+        "dist",
+        "build",
+        "out",
+        "coverage",
+        "target",
+        ".next",
+        ".nuxt",
+        ".turbo",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".gradle",
+    }
+)
+
+
+def _directory_relative_path(workspace: _Workspace, raw: str) -> str:
+    target = _directory(workspace, raw)
+    relative = target.relative_to(workspace.root).as_posix()
+    return "" if relative == "." else relative
+
+
+def _directory(workspace: _Workspace, raw: str) -> Path:
+    if len(raw) > 4096 or any(ord(char) < 32 for char in raw):
+        raise WorkspaceFileUnavailableError()
+    relative = raw.replace("\\", "/") or "."
+    requested = Path(relative)
+    if requested.is_absolute():
+        try:
+            relative = requested.relative_to(workspace.root).as_posix()
+        except ValueError as exc:
+            raise WorkspaceFileUnavailableError() from exc
+    target = checked_path(workspace.root, relative)
+    current = workspace.root
+    for part in target.relative_to(workspace.root).parts:
+        current /= part
+        if _is_reparse_point(current):
+            raise WorkspaceFileUnavailableError()
+    if (
+        decide_path_access(target, workspace=workspace.root, profile=workspace.profile).status
+        != "allowed"
+    ):
+        raise WorkspaceFileUnavailableError()
+    metadata = native_io_path(target).lstat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise WorkspaceFileUnavailableError()
+    return target
+
+
+def _list_directory(workspace: _Workspace, raw: str) -> tuple[list[dict[str, Any]], bool]:
+    target = _directory(workspace, raw)
+    entries: list[dict[str, Any]] = []
+    truncated = False
+    try:
+        iterator = os.scandir(native_io_path(target))
+        with iterator:
+            for entry in iterator:
+                name = entry.name
+                if not name or name in (".", ".."):
+                    continue
+                try:
+                    # ``native_io_path`` may use the Windows extended prefix
+                    # for the scandir handle. Build the logical child from
+                    # the already-normalized workspace path so policy checks
+                    # and ``relative_to`` see the same spelling as the root.
+                    child = target / name
+                    if _is_reparse_point(child):
+                        continue
+                    if (
+                        decide_path_access(
+                            child, workspace=workspace.root, profile=workspace.profile
+                        ).status
+                        != "allowed"
+                    ):
+                        continue
+                    info = entry.stat(follow_symlinks=False)
+                    is_directory = stat.S_ISDIR(info.st_mode)
+                    is_file = stat.S_ISREG(info.st_mode)
+                    if not is_directory and not is_file:
+                        continue
+                    if is_directory and name.casefold() in _NOISY_DIRECTORY_NAMES:
+                        continue
+                    relative = child.relative_to(workspace.root).as_posix()
+                    mime = artifact_mime_for_name(name)
+                    kind = (
+                        "directory"
+                        if is_directory
+                        else (
+                            "image"
+                            if mime in _IMAGE_MIMES
+                            else (
+                                "text"
+                                if (
+                                    child.suffix.lower() in _TEXT_SUFFIXES
+                                    or mime.startswith("text/")
+                                )
+                                else "download"
+                            )
+                        )
+                    )
+                    entries.append(
+                        {
+                            "name": name,
+                            "path": relative,
+                            "type": "directory" if is_directory else "file",
+                            "kind": kind,
+                            "mime": mime if not is_directory else "",
+                            "size": None if is_directory else info.st_size,
+                            "mtimeNs": str(info.st_mtime_ns),
+                        }
+                    )
+                    if len(entries) > MAX_DIRECTORY_ENTRIES:
+                        truncated = True
+                        break
+                except (OSError, ValueError):
+                    continue
+    except OSError as exc:
+        raise WorkspaceFileUnavailableError() from exc
+    entries.sort(
+        key=lambda value: (
+            0 if value["type"] == "directory" else 1,
+            str(value["name"]).casefold(),
+            value["path"],
+        )
+    )
+    return entries[:MAX_DIRECTORY_ENTRIES], truncated
 
 
 def _file(workspace: _Workspace, raw: str) -> tuple[Path, os.stat_result]:
@@ -627,6 +801,38 @@ def register_workspace_file_routes(
             return unavailable()
         return JSONResponse(result, headers=_HEADERS)
 
+    async def list_directory(request: Request) -> Response:
+        denied = await guard(request)
+        if denied is not None:
+            return denied
+        raw_cursor = request.query_params.get("cursor", "0")
+        raw_limit = request.query_params.get("limit", str(MAX_DIRECTORY_PAGE_SIZE))
+        if (
+            not raw_cursor.isdigit()
+            or not raw_limit.isdigit()
+            or len(raw_cursor) > 12
+            or len(raw_limit) > 4
+        ):
+            return JSONResponse({"code": "INVALID_REQUEST"}, status_code=400, headers=_HEADERS)
+        cursor = int(raw_cursor)
+        limit = int(raw_limit)
+        if limit < 1 or limit > MAX_DIRECTORY_PAGE_SIZE:
+            return JSONResponse({"code": "INVALID_REQUEST"}, status_code=400, headers=_HEADERS)
+        path = request.query_params.get("path", "")
+        if len(path) > 4096:
+            return JSONResponse({"code": "INVALID_REQUEST"}, status_code=400, headers=_HEADERS)
+        try:
+            result = await service.list_dir(
+                request.headers.get("x-opensquilla-session-key", ""),
+                path,
+                request.query_params.get("workspaceBinding", ""),
+                cursor,
+                limit,
+            )
+        except (OSError, ValueError, RpcHandlerError, ProjectWorkspaceStateError):
+            return unavailable()
+        return JSONResponse(result, headers=_HEADERS)
+
     async def metadata(request: Request) -> Response:
         denied = await guard(request)
         if denied is not None:
@@ -664,6 +870,7 @@ def register_workspace_file_routes(
             Route("/api/v1/workspace-files/content", content, methods=["GET"]),
             Route("/api/v1/workspace-files/page", page, methods=["GET"]),
             Route("/api/v1/workspace-files/search", search, methods=["GET"]),
+            Route("/api/v1/workspace-files/list", list_directory, methods=["GET"]),
             Route("/api/v1/workspace-files/metadata", metadata, methods=["GET"]),
         ]
     )

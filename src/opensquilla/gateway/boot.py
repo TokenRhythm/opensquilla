@@ -2456,6 +2456,25 @@ class GatewayServer:
             runtime_shutdown_clean = False
         skills_shutdown_clean = True
         try:
+            # PTYs are connection-owned native processes, so they need an
+            # explicit Gateway shutdown fence in addition to WebSocket
+            # transport cleanup. Terminate them before draining the longer
+            # task-runtime phase, while the absolute shutdown deadline still
+            # has bounded room for native process-tree teardown.
+            try:
+                from opensquilla.gateway.terminal_sessions import get_terminal_manager
+
+                terminal_manager = get_terminal_manager()
+
+                await asyncio.wait_for(
+                    terminal_manager.close_all(),
+                    timeout=remaining(2.0),
+                )
+            except TimeoutError:
+                log.warning("gateway.terminal_shutdown_timeout")
+            except Exception:
+                log.exception("gateway.terminal_shutdown_failed")
+
             # Fence optional integration startup before draining/stopping the
             # core.  Otherwise a late channel/MCP completion could race the
             # shutdown stop_all path and re-publish a stale ready state.

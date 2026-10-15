@@ -18,6 +18,7 @@ interface SkillDetailControllerOptions {
     instanceId?: string,
   ) => Promise<SkillDependencyInstallOutcome>
   closeDelayMs?: number
+  uninstallSkill?: (name: string, installId: string) => Promise<boolean>
 }
 
 export interface SkillDetailController {
@@ -28,6 +29,7 @@ export interface SkillDetailController {
   openSkill: (skill: Skill) => Promise<void>
   closeSkill: () => void
   installCurrentDependencies: (name: string, installId: string) => Promise<boolean>
+  uninstallCurrentSkill: (name: string, installId: string) => Promise<boolean>
 }
 
 function errorMessage(error: unknown): string {
@@ -201,6 +203,18 @@ export function useSkillDetailController(
     }
   }
 
+  async function uninstallCurrentSkill(name: string, installId: string): Promise<boolean> {
+    const skill = selectedSkill.value
+    if (!options.uninstallSkill || !skill || skill.name !== name
+      || (skill.install_id || '') !== installId) return false
+    const generation = requestGeneration
+    const identity = activeIdentity
+    const removed = await options.uninstallSkill(name, installId)
+    // Keep the mutation result, but only close the opening that initiated it.
+    if (removed && isCurrent(generation, identity)) closeSkill()
+    return removed
+  }
+
   onUnmounted(() => {
     requestGeneration += 1
     clearCloseTimer()
@@ -214,5 +228,6 @@ export function useSkillDetailController(
     openSkill,
     closeSkill,
     installCurrentDependencies,
+    uninstallCurrentSkill,
   }
 }

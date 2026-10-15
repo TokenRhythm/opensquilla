@@ -5,7 +5,7 @@
     :show-toolbar="Boolean(store.activeItem && (showArtifactNavigation(store.activeItem) || visiblePanelToolbarItems(store.activeItem).length))"
     @tab-menu="openTabMenu"
     :enabled="enabled"
-    :allow-empty="Boolean(nativeApi)"
+    :allow-empty="newPanelMenuVisible"
     :route-active="routeActive && store.activeSessionId === (sessionId || null)"
     :modal-blocked="modalBlocked"
     :native-blocked="surfaceBlocked"
@@ -43,17 +43,63 @@
     </template>
 
     <template #actions="{ item }">
-      <button
-        v-if="nativeApi && (!item || item.kind === 'browser')"
-        type="button"
-        class="app-workbench__action"
-        :aria-label="t('workbench.browser.newTab')"
-        :title="t('workbench.browser.newTab')"
-        data-testid="workbench-new-browser-tab"
-        @click="openBrowserStart"
+      <div
+        v-if="newPanelMenuVisible"
+        ref="newPanelMenuRoot"
+        class="app-workbench__new-panel-menu"
       >
-        <Icon name="plus" :size="16" aria-hidden="true" />
-      </button>
+        <button
+          ref="newPanelMenuTrigger"
+          type="button"
+          class="app-workbench__action"
+          :aria-label="t('workbench.newPanel.title')"
+          :title="t('workbench.newPanel.title')"
+          aria-haspopup="menu"
+          :aria-expanded="newPanelMenuOpen"
+          aria-controls="workbench-new-panel-menu"
+          data-testid="workbench-new-panel-trigger"
+          @click.stop="toggleNewPanelMenu"
+          @keydown.down.prevent="openNewPanelMenu('first')"
+          @keydown.up.prevent="openNewPanelMenu('last')"
+          @keydown.enter.prevent="toggleNewPanelMenu"
+          @keydown.space.prevent="toggleNewPanelMenu"
+        >
+          <Icon name="plus" :size="16" aria-hidden="true" />
+        </button>
+        <Teleport to="body">
+        <div
+          v-if="newPanelMenuOpen"
+          id="workbench-new-panel-menu"
+          ref="newPanelMenu"
+          class="app-workbench__new-panel-popover"
+          role="menu"
+          tabindex="-1"
+          :style="newPanelMenuStyle"
+          :aria-label="t('workbench.newPanel.title')"
+          data-testid="workbench-new-panel-menu-list"
+          @keydown="onNewPanelMenuKeydown"
+        >
+          <button
+            v-for="option in newPanelOptions"
+            :key="option.kind"
+            type="button"
+            role="menuitem"
+            class="app-workbench__new-panel-option"
+            :class="{ 'is-disabled': option.disabled }"
+            :data-panel-kind="option.kind"
+            :disabled="option.disabled"
+            :title="option.disabledReason || option.label"
+            @click="selectNewPanel(option)"
+          >
+            <Icon :name="option.icon" :size="16" aria-hidden="true" />
+            <span class="app-workbench__new-panel-option-copy">
+              <span>{{ option.label }}</span>
+              <small v-if="option.disabledReason">{{ option.disabledReason }}</small>
+            </span>
+          </button>
+        </div>
+        </Teleport>
+      </div>
       <button v-if="item" type="button" class="app-workbench__action"
         :aria-label="t('resourceActions.more')" :title="t('resourceActions.more')" aria-haspopup="menu"
         data-testid="workbench-tab-actions" @click="openTabMenu(item, $event)"
@@ -174,13 +220,35 @@
 
     <template #empty>
       <BrowserStartPanel
+        v-if="browserStartRequested"
         :key="`${sessionId}:${browserStartSequence}`"
-        :ready="Boolean(sessionId) && store.activeSessionId === sessionId"
+        :ready="canOpenBrowser"
         :can-reopen="store.closedBrowserItems.some(item => item.scope.type === 'session'
           && item.scope.id === sessionId)"
         @open="openBrowserUrl($event, true)"
         @reopen="reopenBrowser"
       />
+      <section v-else class="app-workbench__start" data-testid="workbench-start-panel">
+        <h2>{{ t('workbench.newPanel.title') }}</h2>
+        <div class="app-workbench__start-options">
+          <button
+            v-for="option in newPanelOptions"
+            :key="option.kind"
+            type="button"
+            class="app-workbench__new-panel-option app-workbench__start-option"
+            :data-panel-kind="option.kind"
+            :disabled="option.disabled"
+            :title="option.disabledReason || option.label"
+            @click="selectNewPanel(option)"
+          >
+            <Icon :name="option.icon" :size="20" aria-hidden="true" />
+            <span class="app-workbench__new-panel-option-copy">
+              <span>{{ option.label }}</span>
+              <small v-if="option.disabledReason">{{ option.disabledReason }}</small>
+            </span>
+          </button>
+        </div>
+      </section>
     </template>
 
     <template #panel="{ item, active }">
@@ -224,8 +292,9 @@ import {
 } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import type { IconName } from '@/utils/icons'
 import { useConfirm } from '@/composables/useConfirm'
-import { useNativeSurfaceOcclusionState } from '@/composables/useDialogA11y'
+import { useDialogLayer, useNativeSurfaceOcclusionState } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
 import { usePlatform } from '@/platform'
 import type { NativeWorkbenchSurfaceEvent } from '@/platform/types'
@@ -294,6 +363,9 @@ import {
 } from '@/workbench/promptAnnotations'
 import { PageAnnotationSendQueue } from '@/workbench/pageAnnotationSendQueue'
 import { useWorkbenchStore } from '@/workbench/store'
+import { createWorkspaceFilesWorkbenchItem } from '@/workbench/workspaceFileItems'
+import { createTerminalWorkbenchItem } from '@/workbench/terminalItems'
+import { createAssistantChatWorkbenchItem } from '@/workbench/assistantChatItems'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
 import type {
   NativeSurfaceRect,
@@ -311,8 +383,16 @@ import { requestNativeBrowserClose } from './browserCloseGuard'
 import { createWorkbenchResourceCollectionDefinition } from './workbenchResourceCollectionProvider'
 import { WORKSPACE_REFERENCES_KEY } from '@/modules/workspaceReferences'
 import { WORKSPACE_FILES_KEY } from '@/modules/workspaceFiles'
+import { TERMINAL_ACCESS_KEY } from '@/modules/terminal'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
+import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
+import { SESSION_READ_LIFECYCLE_FACTORY_KEY } from '@/modules/sessionReadLifecycle'
+import { TURN_COMMANDS_KEY } from '@/modules/turnCommands'
+import { CONVERSATION_EVENTS_KEY } from '@/modules/conversationEvents'
 import { createWorkspaceFileDefinition } from './workspaceFileProvider'
+import { createWorkspaceFilesWorkbenchDefinition } from './workspaceFilesWorkbenchProvider'
+import { createTerminalWorkbenchDefinition } from './terminalWorkbenchProvider'
+import { createAssistantChatWorkbenchDefinition } from './assistantChatWorkbenchProvider'
 import { createToolHistoryFileDefinition } from './toolHistoryFileProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
 import BrowserStartPanel from './BrowserStartPanel.vue'
@@ -328,6 +408,9 @@ const props = withDefaults(defineProps<{
   officePromptAnnotationsEnabled?: boolean
   routeActive?: boolean
   sessionId?: string
+  workspaceId?: string | null
+  workspaceReady?: boolean
+  workspaceResolved?: boolean
 }>(), {
   enabled: true,
   modalBlocked: false,
@@ -336,20 +419,115 @@ const props = withDefaults(defineProps<{
   officePromptAnnotationsEnabled: false,
   routeActive: false,
   sessionId: '',
+  workspaceId: null,
+  workspaceReady: false,
+  workspaceResolved: false,
 })
 
 const { t } = useI18n()
 const { confirm } = useConfirm()
 const { pushToast } = useToasts()
 const platform = usePlatform()
+const nativeApi = platform.workbench.native
 const store = useWorkbenchStore()
 const workspaceReferences = inject(WORKSPACE_REFERENCES_KEY, null)
 const workspaceFiles = inject(WORKSPACE_FILES_KEY, null)
+const terminal = inject(TERMINAL_ACCESS_KEY, null)
 const referenceGateway = inject(GATEWAY_ACCESS_KEY, null)
-watch(() => [referenceGateway?.subscriptionEpoch, referenceGateway?.availability, referenceGateway?.isLocalOwner], () => {
+const gateway = referenceGateway
+const assistantSessionLifecycle = inject(SESSION_LIFECYCLE_KEY, null)
+const assistantSessionReadFactory = inject(SESSION_READ_LIFECYCLE_FACTORY_KEY, null)
+const assistantTurnCommands = inject(TURN_COMMANDS_KEY, null)
+const assistantConversationEvents = inject(CONVERSATION_EVENTS_KEY, null)
+const assistantPortsAvailable = Boolean(assistantSessionLifecycle && assistantSessionReadFactory
+  && assistantTurnCommands && assistantConversationEvents)
+type NewPanelKind = 'browser' | 'workspace-files' | 'terminal' | 'assistant-chat'
+interface NewPanelOption {
+  kind: NewPanelKind
+  label: string
+  icon: IconName
+  disabled: boolean
+  disabledReason?: string
+}
+const newPanelMenuOpen = ref(false)
+const browserStartRequested = ref(false)
+const newPanelMenuTopmost = useDialogLayer(newPanelMenuOpen)
+const newPanelMenuRoot = ref<HTMLElement | null>(null)
+const newPanelMenu = ref<HTMLElement | null>(null)
+const newPanelMenuTrigger = ref<HTMLButtonElement | null>(null)
+const newPanelMenuStyle = ref({ left: '0px', top: '0px' })
+const sessionReady = computed(() => Boolean(props.sessionId && store.activeSessionId === props.sessionId))
+const gatewayAvailable = computed(() => Boolean(gateway?.availability === 'available'
+  && gateway.isAvailable && gateway.connectionHealth === 'healthy' && !gateway.isResuming
+  && (!gateway.connectionPhase || gateway.connectionPhase === 'healthy')))
+const gatewayCanExecuteHost = computed(() => gateway?.canExecuteHost === true)
+const canOpenBrowser = computed(() => Boolean(nativeApi && sessionReady.value))
+const canOpenWorkspaceFiles = computed(() => Boolean(workspaceFiles && props.workspaceId && props.workspaceReady
+  && sessionReady.value && gatewayAvailable.value && gateway?.isLocalOwner))
+const canOpenTerminal = computed(() => Boolean(terminal && sessionReady.value
+  && gatewayAvailable.value && gatewayCanExecuteHost.value))
+const canOpenAssistantChat = computed(() => Boolean(sessionReady.value && gatewayAvailable.value
+  && gateway?.deliveryIdentity && assistantPortsAvailable && props.workspaceResolved
+  && (!props.workspaceId || props.workspaceReady)))
+const newPanelMenuVisible = computed(() => Boolean(nativeApi || workspaceFiles || terminal || referenceGateway))
+
+function sessionUnavailableReason(): string {
+  return t('workbench.newPanel.requiresSession')
+}
+
+function gatewayUnavailableReason(): string {
+  return t('workbench.newPanel.requiresConnection')
+}
+
+const newPanelOptions = computed<NewPanelOption[]>(() => {
+  const sessionReason = sessionReady.value ? undefined : sessionUnavailableReason()
+  const options: NewPanelOption[] = [
+    {
+      kind: 'browser', label: t('workbench.newPanel.browser'), icon: 'languages',
+      disabled: !canOpenBrowser.value,
+      disabledReason: canOpenBrowser.value ? undefined
+        : sessionReason || t('workbench.newPanel.browserUnavailable'),
+    },
+    {
+      kind: 'workspace-files', label: t('workbench.newPanel.workspaceFiles'), icon: 'folder',
+      disabled: !canOpenWorkspaceFiles.value,
+      disabledReason: canOpenWorkspaceFiles.value ? undefined : sessionReason || (!gatewayAvailable.value
+        ? gatewayUnavailableReason() : t('workbench.newPanel.workspaceUnavailable')),
+    },
+    {
+      kind: 'terminal', label: t('workbench.newPanel.terminal'), icon: 'terminal',
+      disabled: !canOpenTerminal.value,
+      disabledReason: canOpenTerminal.value ? undefined : sessionReason
+        || (!gatewayAvailable.value || gateway?.hostExecuteUnavailableReason === 'disconnected'
+          ? gatewayUnavailableReason() : gateway?.hostExecuteUnavailableReason === 'permission'
+          ? t('workbench.newPanel.requiresHostExecute') : t('workbench.newPanel.terminalUnavailable')),
+    },
+    {
+      kind: 'assistant-chat', label: t('workbench.newPanel.assistantChat'), icon: 'chat',
+      disabled: !canOpenAssistantChat.value,
+      disabledReason: canOpenAssistantChat.value ? undefined : sessionReason
+        || (!gatewayAvailable.value ? gatewayUnavailableReason()
+          : !props.workspaceResolved || props.workspaceId && !props.workspaceReady
+            ? t('workbench.newPanel.workspaceUnavailable')
+            : t('workbench.newPanel.assistantUnavailable')),
+    },
+  ]
+  return options.filter(option => option.kind !== 'workspace-files' || Boolean(props.workspaceId))
+})
+watch(() => [referenceGateway?.subscriptionEpoch, referenceGateway?.availability,
+  referenceGateway?.isLocalOwner, referenceGateway?.deliveryIdentity], () => {
   // A filesystem snapshot is valid only for the connection that authorized it.
   for (const item of [...store.items]) {
-    if (item.kind === 'file' || item.kind === 'tool-file-history') store.closeItem(item.id, 'scope-changed')
+    if (item.kind === 'file' || item.kind === 'workspace-files' || item.kind === 'terminal'
+      || item.kind === 'assistant-chat' || item.kind === 'tool-file-history') store.closeItem(item.id, 'scope-changed')
+  }
+})
+watch(() => props.workspaceId, () => {
+  for (const item of [...store.items]) {
+    if (item.scope.type === 'session' && item.scope.id === props.sessionId
+      && ['workspace-files', 'terminal', 'assistant-chat'].includes(item.kind)) {
+      store.closeItem(item.id, 'scope-changed')
+    }
   }
 })
 const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
@@ -372,7 +550,6 @@ const baseOrigin = (() => {
   ) return 'opensquilla-app://desktop'
   return window.location.origin
 })()
-const nativeApi = platform.workbench.native
 const browserStartSequence = ref(0)
 const runtimeManager = new WorkbenchRuntimeManager(workbenchPanelRegistry, {
   nativeWorkbenchApi: nativeApi,
@@ -481,7 +658,19 @@ watch(() => store.items.map(item => item.id), ids => {
   nativeArtifactSnapshots.prune(new Set(ids))
   thumbnailVersion.value++
 })
-watch(() => store.activeSessionId, () => { tabMenu.value?.cancel(); menuItemId.value = null })
+watch(() => store.activeSessionId, () => {
+  tabMenu.value?.cancel()
+  menuItemId.value = null
+  closeNewPanelMenu()
+  browserStartRequested.value = false
+})
+watch(() => props.sessionId, () => { browserStartRequested.value = false })
+watch(() => store.visibleItems.length, (count, previous) => {
+  if (count === 0 && previous > 0) browserStartRequested.value = false
+})
+watch(() => [props.enabled, props.routeActive, props.modalBlocked, store.expanded], () => {
+  if (!props.enabled || !props.routeActive || props.modalBlocked || !store.expanded) closeNewPanelMenu()
+})
 let stopSurfaceEvents: (() => void) | null = null
 let stopArtifactEvents: (() => void) | null = null
 let detachRuntime: (() => Promise<void>) | null = null
@@ -519,6 +708,97 @@ function openExternalUrl(value: string) {
   if (opened) opened.opener = null
 }
 
+function newPanelMenuButtons(): HTMLButtonElement[] {
+  return [...(newPanelMenu.value?.querySelectorAll<HTMLButtonElement>(
+    'button:not(:disabled)',
+  ) || [])]
+}
+
+function focusNewPanelOption(position: 'first' | 'last' = 'first') {
+  const buttons = newPanelMenuButtons()
+  const target = buttons[position === 'last' ? buttons.length - 1 : 0] || newPanelMenu.value
+  target?.focus({ preventScroll: true })
+}
+
+function positionNewPanelMenu() {
+  const anchor = newPanelMenuTrigger.value?.getBoundingClientRect()
+  const menu = newPanelMenu.value
+  if (!anchor || !menu) return
+  const width = menu.getBoundingClientRect().width || 280
+  const height = menu.getBoundingClientRect().height
+  newPanelMenuStyle.value = {
+    left: `${Math.max(8, Math.min(anchor.right - width, window.innerWidth - width - 8))}px`,
+    top: `${Math.max(8, Math.min(anchor.bottom + 6, window.innerHeight - height - 8))}px`,
+  }
+}
+
+function openNewPanelMenu(position: 'first' | 'last' = 'first') {
+  if (!props.enabled || !props.routeActive || props.modalBlocked) return
+  tabMenu.value?.cancel()
+  hostHandle.value?.hideHover()
+  newPanelMenuOpen.value = true
+  void nextTick(() => {
+    if (!newPanelMenuOpen.value || !newPanelMenuTopmost.value) return
+    positionNewPanelMenu()
+    focusNewPanelOption(position)
+  })
+}
+
+function closeNewPanelMenu(restoreFocus = false) {
+  if (!newPanelMenuOpen.value) return
+  newPanelMenuOpen.value = false
+  if (restoreFocus) void nextTick(() => newPanelMenuTrigger.value?.focus())
+}
+
+function toggleNewPanelMenu() {
+  if (newPanelMenuOpen.value) closeNewPanelMenu()
+  else openNewPanelMenu()
+}
+
+function onNewPanelMenuKeydown(event: KeyboardEvent) {
+  if (!newPanelMenuTopmost.value) return
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    closeNewPanelMenu(true)
+    return
+  }
+  if (event.key === 'Tab') {
+    event.preventDefault()
+    closeNewPanelMenu(true)
+    return
+  }
+  const buttons = newPanelMenuButtons()
+  if (!buttons.length || !['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
+  event.preventDefault()
+  const index = buttons.indexOf(document.activeElement as HTMLButtonElement)
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1
+    : (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length
+  buttons[next]?.focus()
+}
+
+function onNewPanelOutside(event: PointerEvent) {
+  if (!newPanelMenuOpen.value) return
+  const target = event.target
+  if (target instanceof Node && (newPanelMenuRoot.value?.contains(target)
+    || newPanelMenu.value?.contains(target))) return
+  closeNewPanelMenu()
+}
+
+function onNewPanelViewportChange(event: Event) {
+  if (event.target instanceof Node && newPanelMenu.value?.contains(event.target)) return
+  closeNewPanelMenu()
+}
+
+function selectNewPanel(option: NewPanelOption) {
+  if (option.disabled || newPanelOptions.value.find(current => current.kind === option.kind)?.disabled !== false) return
+  closeNewPanelMenu()
+  if (option.kind === 'browser') openBrowserStart()
+  else if (option.kind === 'workspace-files') openWorkspaceFiles()
+  else if (option.kind === 'terminal') openTerminal()
+  else if (option.kind === 'assistant-chat') openAssistantChat()
+}
+
 function openBrowserUrl(value: string, newTab = false) {
   const sessionId = props.sessionId
   if (!sessionId || !nativeApi) {
@@ -552,8 +832,38 @@ function openBrowserUrl(value: string, newTab = false) {
 }
 
 function openBrowserStart() {
+  closeNewPanelMenu()
+  browserStartRequested.value = true
   browserStartSequence.value += 1
   store.openEmpty()
+}
+
+function openWorkspaceFiles() {
+  const sessionId = props.sessionId
+  if (!canOpenWorkspaceFiles.value) return
+  const item = { ...createWorkspaceFilesWorkbenchItem(sessionId), title: t('workbench.newPanel.workspaceFiles') }
+  if (!store.openItem(item)) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
+}
+
+function openTerminal() {
+  const sessionId = props.sessionId
+  if (!canOpenTerminal.value) return
+  const item = { ...createTerminalWorkbenchItem(sessionId), title: t('workbench.newPanel.terminal') }
+  if (!store.openItem(item)) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
+}
+
+function openAssistantChat() {
+  if (!canOpenAssistantChat.value) return
+  const item = createAssistantChatWorkbenchItem(props.sessionId,
+    props.workspaceReady ? props.workspaceId || undefined : undefined,
+    t('workbench.newPanel.assistantChat'))
+  if (!store.openItem(item)) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
 }
 
 function reopenBrowser() {
@@ -667,6 +977,23 @@ if (workspaceReferences || workspaceFiles) {
   workbenchPanelRegistry.register(createWorkspaceFileDefinition(
     workspaceReferences,
     workspaceFiles,
+    key => String(t(key)),
+  ), { replace: true })
+}
+if (workspaceFiles) {
+  workbenchPanelRegistry.register(createWorkspaceFilesWorkbenchDefinition(
+    workspaceFiles,
+    key => String(t(key)),
+  ), { replace: true })
+}
+if (terminal) {
+  workbenchPanelRegistry.register(createTerminalWorkbenchDefinition(
+    terminal,
+    key => String(t(key)),
+  ), { replace: true })
+}
+if (assistantPortsAvailable) {
+  workbenchPanelRegistry.register(createAssistantChatWorkbenchDefinition(
     key => String(t(key)),
   ), { replace: true })
 }
@@ -1054,7 +1381,7 @@ async function selectNavigationArtifact(
 }
 
 function panelHeader(item: WorkbenchItem | null): WorkbenchPanelHeader {
-  if (!item) return { title: '' }
+  if (!item) return { title: t('workbench.newPanel.title') }
   return workbenchPanelRegistry.resolve(item)?.getHeader?.(
     item,
     panelRenderState(
@@ -1499,6 +1826,9 @@ watch(
 )
 
 onMounted(() => {
+  document.addEventListener('pointerdown', onNewPanelOutside, true)
+  window.addEventListener('resize', onNewPanelViewportChange)
+  window.addEventListener('scroll', onNewPanelViewportChange, true)
   if (nativeApi) stopSurfaceEvents = nativeApi.onSurfaceEvent(onNativeSurfaceEvent)
   const documentChanges = artifactWorkbench.subscribeDocumentChanges(onArtifactState)
   stopArtifactEvents = () => documentChanges.close()
@@ -1516,6 +1846,10 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', onNewPanelOutside, true)
+  window.removeEventListener('resize', onNewPanelViewportChange)
+  window.removeEventListener('scroll', onNewPanelViewportChange, true)
+  closeNewPanelMenu()
   thumbnailCache.clear()
   nativeArtifactSnapshots.clear()
   artifactNavigationGeneration += 1
@@ -1592,6 +1926,105 @@ onBeforeUnmount(() => {
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
+}
+
+.app-workbench__new-panel-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.app-workbench__new-panel-popover {
+  position: fixed;
+  z-index: 10002;
+  display: flex;
+  box-sizing: border-box;
+  width: min(280px, calc(100vw - 16px));
+  max-height: calc(100dvh - 16px);
+  overflow-y: auto;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text);
+  box-shadow: var(--shadow-lg);
+}
+
+.app-workbench__new-panel-option {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: start;
+}
+
+.app-workbench__new-panel-option:not(:disabled):hover,
+.app-workbench__new-panel-option:focus-visible {
+  background: var(--bg-hover);
+  outline: 1px solid var(--accent);
+}
+
+.app-workbench__new-panel-option:disabled,
+.app-workbench__new-panel-option.is-disabled {
+  cursor: default;
+  color: var(--text-dim);
+}
+
+.app-workbench__new-panel-option-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  font-size: var(--fs-sm);
+}
+
+.app-workbench__new-panel-option-copy small {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+}
+
+.app-workbench__start {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-5);
+  overflow-y: auto;
+}
+
+.app-workbench__start h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--fs-lg);
+}
+
+.app-workbench__start-options {
+  display: grid;
+  width: 100%;
+  max-width: 520px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
+  gap: var(--sp-2);
+}
+
+.app-workbench__start-option {
+  min-height: 76px;
+  align-items: center;
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
 }
 
 .app-workbench__switcher {

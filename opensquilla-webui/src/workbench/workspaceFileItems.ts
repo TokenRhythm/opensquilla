@@ -2,6 +2,18 @@ import { normalizeWorkspaceFileReferenceV1, type WorkspaceFileReferenceV1 } from
 import type { WorkspaceFile } from '@/modules/workspaceFiles'
 import type { WorkbenchItem } from './types'
 
+export function createWorkspaceFilesWorkbenchItem(sessionKey: string): WorkbenchItem {
+  return {
+    id: `workspace-files:${sessionKey}`,
+    kind: 'workspace-files',
+    title: 'Workspace files',
+    scope: { type: 'session', id: sessionKey },
+    hostKind: 'dom',
+    retention: 'keep-alive',
+    payload: {},
+  }
+}
+
 export function createWorkspaceFileItem(sessionKey: string, reference: WorkspaceFileReferenceV1): WorkbenchItem {
   return {
     id: `file:${sessionKey}:${reference.scope.workspaceId ?? ''}:${reference.locator.relativePath}`,

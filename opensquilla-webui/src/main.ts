@@ -29,6 +29,7 @@ import { MIGRATION_OPERATIONS_KEY } from './modules/migrationOperations'
 import { WORKSPACE_CATALOG_KEY } from './modules/workspaceCatalog'
 import { WORKSPACE_REFERENCES_KEY } from './modules/workspaceReferences'
 import { WORKSPACE_FILES_KEY } from './modules/workspaceFiles'
+import { TERMINAL_ACCESS_KEY } from './modules/terminal'
 import { SANDBOX_RUNTIME_KEY } from './modules/sandboxRuntime'
 import { USAGE_REPORTING_KEY } from './modules/usageReporting'
 import { COMMAND_CATALOG_KEY } from './modules/commandCatalog'
@@ -148,6 +149,7 @@ app.provide(MIGRATION_OPERATIONS_KEY, gatewayAdapters.migrationOperations)
 app.provide(WORKSPACE_CATALOG_KEY, gatewayAdapters.workspaceCatalog)
 app.provide(WORKSPACE_REFERENCES_KEY, gatewayAdapters.workspaceReferences)
 app.provide(WORKSPACE_FILES_KEY, gatewayAdapters.workspaceFiles)
+app.provide(TERMINAL_ACCESS_KEY, gatewayAdapters.terminal)
 app.provide(SANDBOX_RUNTIME_KEY, gatewayAdapters.sandboxRuntime)
 app.provide(USAGE_REPORTING_KEY, gatewayAdapters.usageReporting)
 app.provide(COMMAND_CATALOG_KEY, gatewayAdapters.commandCatalog)

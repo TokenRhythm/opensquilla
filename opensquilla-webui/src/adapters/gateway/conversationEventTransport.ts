@@ -53,12 +53,72 @@ function rawSessionKey(payload: unknown): string | null {
   return null
 }
 
-/** Create the one WebSocket event listener used by the Conversation lane. */
+/** Share one physical listener across independently owned conversation views. */
 export function createConversationEventTransport(events: ConversationEventWireSource) {
   let detach: (() => void) | null = null
+  const consumers = new Map<symbol, ConversationEventTransportHandlers>()
 
-  function subscribe(handlers: ConversationEventTransportHandlers): () => void {
-    detach?.()
+  function dispatch(event: ConversationEvent) {
+    const results: unknown[] = []
+    let failure: unknown
+    let failed = false
+    for (const [id, consumer] of [...consumers]) {
+      if (!consumers.has(id)) continue
+      try {
+        const result = consumer.onEvent?.(event)
+        results.push(result instanceof Promise ? result.then(value => {
+          if (!consumers.has(id)) throw new Error('Conversation consumer was superseded.')
+          return value
+        }) : result)
+      } catch (error) {
+        // Still deliver to the other view; one broken observer must not stop
+        // the main conversation or manufacture flow-consumption evidence.
+        failed = true
+        failure = error
+      }
+    }
+    const classify = (values: unknown[]) => {
+      if (failed) throw failure
+      return values.includes('dirty') ? 'dirty' : values.includes('applied') ? 'applied' : undefined
+    }
+    return results.some(result => result instanceof Promise)
+      ? Promise.all(results).then(classify) : classify(results)
+  }
+
+  const handlers: ConversationEventTransportHandlers = {
+    onEvent: dispatch,
+    onConnectionState(state) {
+      for (const consumer of [...consumers.values()]) consumer.onConnectionState?.(state)
+    },
+    onDecodeError(error) {
+      for (const consumer of [...consumers.values()]) consumer.onDecodeError?.(error)
+    },
+    async onRecoveryRequired(scope) {
+      const owners = [...consumers].filter(([, consumer]) => consumer.onRecoveryRequired)
+      if (!owners.length) return false
+      const recover = async (request: typeof scope, every: boolean) => {
+        const results = await Promise.all(owners.map(async ([id, consumer]) => {
+          try {
+            const result = await consumer.onRecoveryRequired!(request)
+            return consumers.has(id) ? result : false
+          } catch { return false }
+        }))
+        // Keyed gaps can belong to either view. Global gaps must be recovered
+        // by every read owner; success for the main view cannot ACK a child gap.
+        if (every ? results.every(result => result === true) : results.some(result => result === true)) return true
+        if (every && results.some(result => result === false)) return false
+        if (results.some(result => typeof result === 'object' && result.retryable === false)) return { retryable: false } as const
+        return false
+      }
+      if (scope.global) return recover(scope, true)
+      if (!scope.keys.length) return false
+      const results = await Promise.all(scope.keys.map(key => recover({ keys: [key], global: false }, false)))
+      if (results.some(result => result === false)) return false
+      return results.every(result => result === true) ? true : { retryable: false }
+    },
+  }
+
+  function attach() {
     const onEvent = (
       rawEvent: unknown,
       rawPayload: unknown,
@@ -141,10 +201,20 @@ export function createConversationEventTransport(events: ConversationEventWireSo
       state.close()
       detach = null
     }
-    return detach
+  }
+
+  function subscribe(consumer: ConversationEventTransportHandlers): () => void {
+    const id = Symbol('conversation-consumer')
+    consumers.set(id, consumer)
+    if (!detach) attach()
+    return () => {
+      consumers.delete(id)
+      if (!consumers.size) detach?.()
+    }
   }
 
   function unsubscribe() {
+    consumers.clear()
     detach?.()
   }
 

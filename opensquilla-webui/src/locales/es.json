@@ -281,6 +281,28 @@
     "resize": "Cambiar el ancho del área de trabajo",
     "pixels": "píxeles",
     "empty": "No hay una vista previa disponible para este elemento.",
+    "assistantChat": {
+      "contextHint": "Conversación independiente para esta tarea. Comparte el espacio de trabajo sin copiar el historial. Muestra los últimos 100 mensajes.",
+      "empty": "Haz una pregunta adicional sin interrumpir la conversación principal.",
+      "you": "Tú",
+      "working": "Trabajando…",
+      "openFull": "Abrir conversación completa",
+      "preview": "Se muestra una vista previa limitada.",
+      "needsAttention": "Esta conversación requiere aprobación o más datos. Abre la conversación completa.",
+      "uncertain": "El envío aún no está confirmado. Actualiza el estado antes de volver a enviar.",
+      "refresh": "Actualizar estado",
+      "newConversation": "Crear nueva conversación",
+      "placeholder": "Pregunta al asistente…",
+      "send": "Enviar",
+      "stop": "Detener",
+      "loading": "Cargando…"
+    },
+    "newPanel": {
+      "title": "Nuevo panel", "browser": "Navegador", "workspaceFiles": "Archivos del espacio de trabajo", "terminal": "Terminal", "assistantChat": "Chat asistente",
+      "assistantUnavailable": "El chat asistente no está disponible para esta conexión",
+      "requiresSession": "Abre primero una sesión de chat", "requiresConnection": "Conéctate primero a una Gateway", "requiresHostExecute": "Se requiere el permiso host.execute",
+      "browserUnavailable": "El navegador lateral requiere OpenSquilla Desktop", "workspaceUnavailable": "Los archivos del espacio de trabajo no están disponibles aquí", "terminalUnavailable": "El terminal no está disponible aquí"
+    },
     "resources": {
       "title": "Archivos", "count": "Archivos ({count})", "empty": "Aún no hay archivos ni enlaces.",
       "groups": { "files": "Archivos", "links": "Enlaces", "attachments": "Archivos", "documents": "Archivos", "deliverables": "Archivos", "urls": "Enlaces" },
@@ -321,6 +343,24 @@
       "openSide": "Abrir en el navegador lateral",
       "failed": "El navegador lateral se detuvo",
       "failedDetail": "Vuelve a cargar el navegador aislado para continuar."
+    },
+    "workspaceFiles": {
+      "title": "Archivos del espacio de trabajo", "subtitle": "Explora el espacio de trabajo de la sesión actual", "open": "Archivos del espacio de trabajo",
+      "filter": "Filtrar archivos", "filterPlaceholder": "Filtrar archivos…", "refresh": "Actualizar", "loading": "Cargando archivos…",
+      "loadMore": "Cargar más", "expand": "Expandir carpeta", "collapse": "Contraer carpeta", "selectFile": "Selecciona un archivo para previsualizarlo.",
+      "unavailable": "Los archivos del espacio de trabajo no están disponibles para esta sesión.", "truncated": "Esta carpeta supera el límite seguro. Usa el filtro o abre una carpeta más específica."
+    },
+    "terminal": {
+      "title": "Terminal",
+      "subtitle": "Session terminal",
+      "open": "Terminal",
+      "starting": "Starting terminal…",
+      "input": "Terminal input",
+      "restart": "Restart",
+      "unavailable": "The terminal is unavailable for this session.",
+      "outputGap": "Terminal output was interrupted",
+      "exited": "Terminal exited",
+      "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
     },
     "artifactAnnotation": {
       "start": "Solicitar cambios",

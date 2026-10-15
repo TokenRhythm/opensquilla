@@ -281,6 +281,28 @@
     "resize": "ワークベンチの幅を変更",
     "pixels": "ピクセル",
     "empty": "この項目には利用できるプレビューがありません。",
+    "assistantChat": {
+      "contextHint": "このタスク専用の独立した補助会話です。履歴をコピーせず、ワークスペースを共有します。最新 100 件を表示します。",
+      "empty": "メインの会話を中断せずに、別の質問をしてください。",
+      "you": "あなた",
+      "working": "処理中…",
+      "openFull": "会話全体を開く",
+      "preview": "内容の一部をプレビュー表示しています。",
+      "needsAttention": "承認または追加の入力が必要です。会話全体を開いてください。",
+      "uncertain": "送信はまだ確認されていません。再送信する前に状態を更新してください。",
+      "refresh": "状態を更新",
+      "newConversation": "新しい会話を作成",
+      "placeholder": "アシスタントに質問…",
+      "send": "送信",
+      "stop": "停止",
+      "loading": "読み込み中…"
+    },
+    "newPanel": {
+      "title": "新しいパネル", "browser": "ブラウザ", "workspaceFiles": "ワークスペースファイル", "terminal": "ターミナル", "assistantChat": "アシスタントチャット",
+      "assistantUnavailable": "この接続ではアシスタントチャットを利用できません",
+      "requiresSession": "先にチャットセッションを開いてください", "requiresConnection": "先に Gateway に接続してください", "requiresHostExecute": "host.execute 権限が必要です",
+      "browserUnavailable": "サイドブラウザには OpenSquilla デスクトップが必要です", "workspaceUnavailable": "ここではワークスペースファイルを利用できません", "terminalUnavailable": "ここではターミナルを利用できません"
+    },
     "resources": {
       "title": "ファイル", "count": "ファイル（{count}）", "empty": "ファイルまたはリンクはまだありません。",
       "groups": { "files": "ファイル", "links": "リンク", "attachments": "ファイル", "documents": "ファイル", "deliverables": "ファイル", "urls": "リンク" },
@@ -321,6 +343,24 @@
       "openSide": "サイドブラウザーで開く",
       "failed": "サイドブラウザーが停止しました",
       "failedDetail": "隔離ブラウザーを再読み込みして続行してください。"
+    },
+    "workspaceFiles": {
+      "title": "ワークスペースのファイル", "subtitle": "現在のセッションのワークスペースを参照", "open": "ワークスペースのファイル",
+      "filter": "ファイルを絞り込む", "filterPlaceholder": "ファイルを絞り込む…", "refresh": "更新", "loading": "ファイルを読み込んでいます…",
+      "loadMore": "さらに読み込む", "expand": "フォルダーを展開", "collapse": "フォルダーを折りたたむ", "selectFile": "プレビューするファイルを選択してください。",
+      "unavailable": "このセッションではワークスペースのファイルを利用できません。", "truncated": "このフォルダーは安全な一覧上限を超えています。絞り込むか、より狭いフォルダーを開いてください。"
+    },
+    "terminal": {
+      "title": "Terminal",
+      "subtitle": "Session terminal",
+      "open": "Terminal",
+      "starting": "Starting terminal…",
+      "input": "Terminal input",
+      "restart": "Restart",
+      "unavailable": "The terminal is unavailable for this session.",
+      "outputGap": "Terminal output was interrupted",
+      "exited": "Terminal exited",
+      "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
     },
     "artifactAnnotation": {
       "start": "変更を依頼",

@@ -142,6 +142,12 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.processes.list": READ_SCOPE,
     "sessions.processes.log": READ_SCOPE,
     "sessions.processes.stop": WRITE_SCOPE,
+    # Connection-owned interactive PTY control. The handlers additionally
+    # require the principal's explicit host.execute capability.
+    "terminal.create": WRITE_SCOPE,
+    "terminal.write": WRITE_SCOPE,
+    "terminal.resize": WRITE_SCOPE,
+    "terminal.close": WRITE_SCOPE,
     "sessions.subscribe": READ_SCOPE,
     "sessions.unsubscribe": READ_SCOPE,
     "workspaces.list": READ_SCOPE,  # OpenSquilla-only; owner-guarded local paths.

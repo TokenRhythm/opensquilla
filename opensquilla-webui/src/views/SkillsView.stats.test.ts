@@ -22,6 +22,7 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
   const rpcCall = vi.fn(async (_method: string) => reloadResult)
   const ready = vi.fn(async () => {})
   const pushToast = vi.fn()
+  const uninstallSkill = vi.fn(async (_name: string, _installId: string) => true)
   const routeState = ref<{ query: { skill?: string } }>({ query: {} })
   const allSkills = ref<Array<{ name: string; active?: boolean; install_id?: string }>>([])
   const catalogLoading = ref(false)
@@ -42,11 +43,13 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
   vi.doMock('@/components/skills/SkillDetailDialog.vue', () => ({
     default: defineComponent({
       props: ['skill', 'canUseInTask', 'mutationDisabled', 'loadingContent'],
-      emits: ['useInTask', 'close'],
+      emits: ['useInTask', 'close', 'uninstall'],
       setup(props, { emit }) {
         return () => h('div', { 'data-testid': 'skill-detail-dialog' }, props.skill ? [
           props.canUseInTask ? h('button', { 'data-testid': 'use-skill', disabled: props.mutationDisabled || props.loadingContent, onClick: () => emit('useInTask', props.skill) }, 'Use in new task') : null,
           h('button', { 'data-testid': 'close-skill', onClick: () => emit('close') }, 'Close'),
+          h('button', { 'data-testid': 'uninstall-skill', onClick: () => emit('uninstall', props.skill.name, props.skill.install_id || '') }, 'Remove'),
+          h('span', { 'data-testid': 'selected-skill' }, props.skill.name),
         ] : [])
       },
     }),
@@ -141,7 +144,7 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
         retryQueueItem: vi.fn(async () => {}),
         clearInstallActivity: vi.fn(),
         installDeps: vi.fn(async () => true),
-        uninstallSkill: vi.fn(async () => true),
+        uninstallSkill,
       }
     },
   }))
@@ -217,6 +220,7 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     detail,
     push,
     listCandidates,
+    uninstallSkill,
   }
 }
 
@@ -239,6 +243,30 @@ afterEach(() => {
 })
 
 describe('SkillsView stats navigation', () => {
+  it.each(['first', 'second'])('keeps reopened %s detail visible after uninstalling the previous opening', async nextName => {
+    const state = await mountSkillsView()
+    let finish!: (value: boolean) => void
+    state.uninstallSkill.mockReturnValueOnce(new Promise<boolean>(resolve => { finish = resolve }))
+    state.allSkills.value = [
+      { name: 'first', install_id: 'install:first' },
+      { name: 'second', install_id: 'install:second' },
+    ]
+    state.routeState.value.query.skill = 'first'
+    await vi.waitFor(() => expect(state.el.querySelector('[data-testid="selected-skill"]')?.textContent).toBe('first'))
+    state.el.querySelector<HTMLButtonElement>('[data-testid="uninstall-skill"]')!.click()
+    expect(state.uninstallSkill).toHaveBeenCalledExactlyOnceWith('first', 'install:first')
+    state.el.querySelector<HTMLButtonElement>('[data-testid="close-skill"]')!.click()
+    state.routeState.value.query.skill = undefined
+    await state.nextTick()
+    state.routeState.value.query.skill = nextName
+    await vi.waitFor(() => expect(state.el.querySelector('[data-testid="selected-skill"]')?.textContent).toBe(nextName))
+    finish(true)
+    await state.nextTick()
+    await state.nextTick()
+    expect(state.el.querySelector('[data-testid="selected-skill"]')?.textContent).toBe(nextName)
+    state.app.unmount()
+  })
+
   it('distinguishes loading, a first-load failure, and stale catalog content', async () => {
     const state = await mountSkillsView()
     state.catalogHasLoaded.value = false

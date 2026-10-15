@@ -261,7 +261,7 @@ const {
   uninstallSkill,
 } = registry
 
-const skillDetail = useSkillDetailController({ catalog: skillCatalog, installDeps })
+const skillDetail = useSkillDetailController({ catalog: skillCatalog, installDeps, uninstallSkill })
 const {
   selectedSkill,
   selectedSkillLoading,
@@ -270,6 +270,7 @@ const {
   openSkill,
   closeSkill,
   installCurrentDependencies,
+  uninstallCurrentSkill,
 } = skillDetail
 
 const skillLaunchPending = ref(false)
@@ -432,8 +433,7 @@ async function installDepsAndMaybeClose(name: string, installId: string) {
 }
 
 async function uninstallSkillAndClose(name: string, installId: string) {
-  const removed = await uninstallSkill(name, installId)
-  if (removed) closeDialog()
+  await uninstallCurrentSkill(name, installId)
 }
 </script>
 
