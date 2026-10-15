@@ -19,9 +19,10 @@ from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
         "Keeps the original source files. This does not build, start a server, or end the turn. "
         "Omit bundle options when reopening an existing page to retain its collection scope. "
         "Use presentation=inline for a self-contained Visualize HTML snapshot in chat; "
-        "place the returned marker in a standalone inline-code paragraph of your response. "
-        "previewStatus reports resource readiness; renderStatus=not-observed means browser "
-        "rendering and interaction have not been verified. Correct HTML input errors and "
+        "place the returned marker on a standalone line in your response. "
+        "previewStatus reports resource readiness, not confirmation that a client displayed it; "
+        "renderStatus=not-observed means browser rendering and interaction have not been verified. "
+        "Correct HTML input errors and "
         "publish again after edits."
     ),
     params={
