@@ -159,9 +159,13 @@ PRODUCTION_HANDLER_NAMES = {
 def test_production_registry_uses_contract_wrappers_without_surface_drift() -> None:
     registry = get_dispatcher()
 
-    # V2 recovery, video discovery, and message search add eight methods to
-    # the previous 269-method surface.
-    assert len(registry.list_methods()) == 277
+    # V2 recovery, video discovery, message search, and the four interactive
+    # terminal methods add twelve methods to the previous 269-method surface.
+    assert len(registry.list_methods()) == 281
+    for method in ("terminal.create", "terminal.write", "terminal.resize", "terminal.close"):
+        terminal_entry = registry.get_entry(method)
+        assert terminal_entry is not None
+        assert terminal_entry.required_scope == "operator.write"
     assert registry.get_entry("sessions.messages.search") is not None
     assert registry.get_entry("onboarding.videoGeneration.models.discover") is not None
     for method in (

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, GuestRpcPolicyError
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
-from opensquilla.gateway.rpc_terminal import _handle_terminal_create
+from opensquilla.gateway.rpc_terminal import _handle_terminal_create, _handle_terminal_write
 
 
 def _principal(*, host_execute: bool) -> Principal:
@@ -61,6 +63,35 @@ async def test_terminal_create_rejects_http_and_absolute_cwd() -> None:
             websocket_context,
         )
     assert caught.value.code == "INVALID_REQUEST"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", [None, 42, False, {}, [], ""])
+async def test_terminal_write_rejects_invalid_data_before_manager_access(
+    monkeypatch: pytest.MonkeyPatch, data: object
+) -> None:
+    writer = AsyncMock(return_value={"accepted": True})
+    monkeypatch.setattr("opensquilla.gateway.rpc_terminal._MANAGER.write", writer)
+    context = RpcContext(conn_id="conn-1", principal=_principal(host_execute=True))
+
+    with pytest.raises(RpcHandlerError) as caught:
+        await _handle_terminal_write({"terminalId": "terminal-1", "data": data}, context)
+
+    assert caught.value.code == "INVALID_REQUEST"
+    writer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminal_write_preserves_valid_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    writer = AsyncMock(return_value={"accepted": True})
+    monkeypatch.setattr("opensquilla.gateway.rpc_terminal._MANAGER.write", writer)
+    context = RpcContext(conn_id="conn-1", principal=_principal(host_execute=True))
+    data = " echo \u2713\r"
+
+    assert await _handle_terminal_write(
+        {"terminalId": "terminal-1", "data": data}, context
+    ) == {"accepted": True}
+    writer.assert_awaited_once_with(terminal_id="terminal-1", conn_id="conn-1", data=data)
 
 
 def test_guest_policy_denies_all_terminal_control_methods() -> None:

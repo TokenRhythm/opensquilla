@@ -98,9 +98,12 @@ async def _handle_terminal_create(params: dict | None, ctx: RpcContext) -> dict[
             _MANAGER.schedule_close_connection(ctx.conn_id)
             raise RpcHandlerError("UNAUTHORIZED", "Connection is no longer active")
         if _MANAGER.claim_connection_cleanup(ctx.conn_id):
-            connection.add_transport_cleanup(
-                lambda conn_id=ctx.conn_id: _MANAGER.on_connection_cleanup(conn_id)
-            )
+            conn_id = ctx.conn_id
+
+            def close_connection_terminals() -> None:
+                _MANAGER.on_connection_cleanup(conn_id)
+
+            connection.add_transport_cleanup(close_connection_terminals)
     except TerminalSessionError as exc:
         raise _error(exc) from exc
     except WorkspaceFileUnavailableError as exc:
@@ -120,11 +123,16 @@ async def _handle_terminal_write(params: dict | None, ctx: RpcContext) -> dict[s
     terminal_id = values.get("terminalId")
     if not isinstance(terminal_id, str) or not terminal_id:
         raise RpcHandlerError("INVALID_REQUEST", "terminalId is required")
+    data = values.get("data")
+    if not isinstance(data, str) or not data:
+        raise RpcHandlerError(
+            "INVALID_REQUEST", "data must be a non-empty string", accepted=False
+        )
     try:
         return await _MANAGER.write(
             terminal_id=terminal_id,
             conn_id=ctx.conn_id,
-            data=values.get("data"),
+            data=data,
         )
     except TerminalSessionError as exc:
         raise _error(exc) from exc

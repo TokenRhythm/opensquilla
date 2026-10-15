@@ -150,8 +150,13 @@ registry = get_dispatcher()
 # Includes durable receipts and execution logs after workflow and agent admin retirement.
 # The v2 recovery contracts and video discovery add seven production methods.
 # Bounded in-conversation search adds sessions.messages.search.
+# Interactive terminals add create, write, resize, and close methods.
 # Keep the exact count so an unrelated RPC cannot slip into the registry.
-assert len(registry.list_methods()) == 277
+assert len(registry.list_methods()) == 281
+for method in ("terminal.create", "terminal.write", "terminal.resize", "terminal.close"):
+    terminal_entry = registry.get_entry(method)
+    assert terminal_entry is not None
+    assert terminal_entry.required_scope == "operator.write"
 search_entry = registry.get_entry("sessions.messages.search")
 assert search_entry is not None
 assert search_entry.required_scope == "operator.read"
