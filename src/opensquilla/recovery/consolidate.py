@@ -2577,13 +2577,32 @@ def _preserve_excluded_profile_data(
 ) -> None:
     state = profile.home / "state"
     if _lexists(state):
-        _preserve_conflict(
-            state,
-            staging,
-            profile.recovery_id,
-            Path("state"),
-            scope="profile",
-        )
+        relatives = [Path("state")]
+        state_stat = os.lstat(_native_io_path(state))
+        if not _is_link_or_reparse(state_stat) and stat.S_ISDIR(state_stat.st_mode):
+            with os.scandir(_native_io_path(state)) as entries:
+                names = sorted(entry.name for entry in entries)
+            if any(os.path.normcase(name) == "gateway.pid.lock" for name in names):
+                # This transaction holds the canonical legacy lock. Windows
+                # cannot copy its locked byte through a second handle. Omit it
+                # only from this extra copy; the complete original state is
+                # archived below while the same writer exclusion stays held.
+                _ensure_plain_directory(
+                    staging / "recovered-data" / profile.recovery_id / "profile" / "state"
+                )
+                relatives = [
+                    Path("state") / name
+                    for name in names
+                    if os.path.normcase(name) != "gateway.pid.lock"
+                ]
+        for relative in relatives:
+            _preserve_conflict(
+                profile.home / relative,
+                staging,
+                profile.recovery_id,
+                relative,
+                scope="profile",
+            )
     workspace = profile.home / "workspace"
     for relative in (
         Path("state") / "matrix",

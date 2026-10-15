@@ -4191,13 +4191,44 @@ class SessionStorage:
                 )
                 return existing
 
+            # Older recovery clones retained immutable baselines/events but
+            # cleared the global cutover. Bound the replacement by the earliest
+            # baseline OR live event: the first surviving baseline may itself
+            # be a later cumulative checkpoint. Cutting over again now would
+            # count those checkpoints as legacy usage. New clones keep state.
+            # Earlier-epoch live usage proves a checkpoint is post-cutover,
+            # including when its timestamp equals the first live event's.
+            async with conn.execute(
+                """
+                SELECT MIN(boundary) FROM (
+                    SELECT MIN(CASE WHEN EXISTS (
+                        SELECT 1 FROM usage_events AS event
+                        WHERE event.session_id = baseline.session_id
+                          AND event.session_epoch < baseline.session_epoch
+                          AND event.origin = 'live_provider'
+                    ) THEN MAX(0, baseline.captured_at_ms - 1)
+                      ELSE baseline.captured_at_ms END) AS boundary
+                    FROM usage_legacy_baselines AS baseline
+                    WHERE captured_at_ms = (
+                        SELECT MIN(captured_at_ms) FROM usage_legacy_baselines
+                    )
+                    UNION ALL
+                    SELECT MIN(started_at_ms) FROM usage_events
+                    WHERE origin = 'live_provider'
+                )
+                """
+            ) as cur:
+                retained_boundary = (await cur.fetchone())[0]
+            cutover_ms = (
+                captured_at_ms if retained_boundary is None else int(retained_boundary)
+            )
             await conn.execute(
                 """
                 INSERT INTO usage_ledger_state (
                     singleton_id, ledger_started_at_ms, backfill_status, updated_at_ms
                 ) VALUES (1, ?, 'pending', ?)
                 """,
-                (captured_at_ms, captured_at_ms),
+                (cutover_ms, captured_at_ms),
             )
             # One bounded INSERT...SELECT replaces a Python row loop and keeps
             # the pre-live cutover transaction short even for large histories.
@@ -4249,6 +4280,15 @@ class SessionStorage:
                                 estimated_cost_component_usd
                               ) AS row_anomalies
                     FROM sessions
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM usage_legacy_baselines AS baseline
+                        WHERE baseline.session_id = sessions.session_id
+                    )
+                    AND (? = 0 OR NOT EXISTS (
+                        SELECT 1 FROM usage_events AS event
+                        WHERE event.session_id = sessions.session_id
+                          AND event.origin = 'live_provider'
+                    ))
                 ), ranked AS (
                     SELECT
                         normalized.*,
@@ -4282,8 +4322,14 @@ class SessionStorage:
                 FROM ranked
                 WHERE baseline_rank = 1
                 """,
-                (captured_at_ms,),
+                (retained_boundary is not None, cutover_ms),
             )
+            if retained_boundary is not None:
+                # Missing later generations must be reconstructed from ledger
+                # ancestry, never totals already containing live usage.
+                await self._repair_post_cutover_usage_baselines_on_conn(
+                    conn, captured_at_ms=max(captured_at_ms, cutover_ms + 1),
+                )
             await conn.execute(
                 """
                 UPDATE usage_ledger_state
