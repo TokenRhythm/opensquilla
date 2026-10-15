@@ -12,6 +12,8 @@ export interface UseChatComposerShortcutsOptions {
   restoreInput?: (text: string, paths?: readonly string[]) => void
   /** Visible textarea body, when local references are kept outside the editor. */
   textareaText?: Ref<string>
+  /** Plain-text offsets from the active inline editor; null when it has no selection. */
+  getEditorSelection?: () => { start: number; end: number; length: number } | null
   composing: Ref<boolean>
   messages: Ref<ChatMessage[]>
   pendingQueue: Ref<ChatPendingItem[]>
@@ -87,8 +89,12 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
     if (
       (inputType === 'insertFromPaste' || inputType === 'insertFromPasteAsQuotation')
       && event
-      && event.target instanceof HTMLTextAreaElement
-      && options.handleLongPaste?.(event.target.value, event as InputEvent)
+      && options.handleLongPaste?.(
+        event.target instanceof HTMLTextAreaElement
+          ? event.target.value
+          : (options.textareaText ?? options.inputText).value,
+        event as InputEvent,
+      )
     ) return
     if (options.composing.value || (event && 'isComposing' in event && event.isComposing)) return
     options.handleSlashInput()
@@ -104,10 +110,13 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
     // short draft (pop) — and on Win/Linux, where Alt+Arrow has no native
     // binding, those boundaries are reached in the same common cases.
     const field = e.target instanceof HTMLTextAreaElement ? e.target : null
-    const caretAtStart = !!field && field.selectionStart === 0 && field.selectionEnd === 0
-    const caretAtEnd = !!field
-      && field.selectionStart === field.value.length
-      && field.selectionEnd === field.value.length
+    const selection = field
+      ? { start: field.selectionStart, end: field.selectionEnd, length: field.value.length }
+      : options.getEditorSelection?.()
+    const caretAtStart = !!selection && selection.start === 0 && selection.end === 0
+    const caretAtEnd = !!selection
+      && selection.start === selection.length
+      && selection.end === selection.length
 
     if (options.slashOpen.value) {
       if (e.key === 'ArrowDown') {

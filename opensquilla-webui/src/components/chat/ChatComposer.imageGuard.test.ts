@@ -110,7 +110,7 @@ describe('ChatComposer image-send guard', () => {
 
     const control = el.querySelector<HTMLElement>('.chat-send-control')!
     const tooltip = control.querySelector<HTMLElement>('.chat-send-tooltip')!
-    const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')!
+    const textarea = el.querySelector<HTMLDivElement>('.chat-inline-editor')!
     const send = control.querySelector<HTMLButtonElement>('.chat-send-btn')!
     expect(el.querySelector('.chat-composer-send-status')).toBeNull()
     expect(el.querySelector('.chat-composer-status-announcement')).toBeNull()
@@ -151,7 +151,7 @@ describe('ChatComposer image-send guard', () => {
     const control = el.querySelector<HTMLElement>('.chat-send-control')!
     const tooltip = control.querySelector<HTMLElement>('.chat-send-tooltip')!
     const send = control.querySelector<HTMLButtonElement>('.chat-send-btn')!
-    const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')!
+    const textarea = el.querySelector<HTMLDivElement>('.chat-inline-editor')!
     expect(control.tabIndex).toBe(0)
     expect(control.getAttribute('role')).toBe('group')
     expect(control.getAttribute('aria-describedby')).toBe(tooltip.id)
@@ -171,7 +171,7 @@ describe('ChatComposer image-send guard', () => {
     expect(escaped).toHaveBeenCalledOnce()
     send.click()
     expect(onSend).not.toHaveBeenCalled()
-    expect(textarea.value).toBe(BASE_PROPS.modelValue)
+    expect(textarea.textContent).toBe(BASE_PROPS.modelValue)
     app.unmount()
   })
 
@@ -233,7 +233,7 @@ describe('ChatComposer image-send guard', () => {
     { sendBlockedMessage: 'Wait for the session to reconnect.' },
   ])('dismisses a hovered send hint before Escape can reach the focused editor draft shortcut: %j', async restriction => {
     const clearDraft = vi.fn((event: KeyboardEvent) => {
-      if (event.key === 'Escape') (event.target as HTMLTextAreaElement).value = ''
+      if (event.key === 'Escape') (event.target as HTMLDivElement).textContent = ''
     })
     const el = document.createElement('div')
     document.body.appendChild(el)
@@ -250,7 +250,7 @@ describe('ChatComposer image-send guard', () => {
 
     const control = el.querySelector<HTMLElement>('.chat-send-control')!
     const tooltip = control.querySelector<HTMLElement>('.chat-send-tooltip')!
-    const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')!
+    const textarea = el.querySelector<HTMLDivElement>('.chat-inline-editor')!
     textarea.focus()
     control.dispatchEvent(new MouseEvent('mouseenter'))
     // happy-dom does not resolve :hover; expose the real tooltip for the capture handler.
@@ -263,13 +263,13 @@ describe('ChatComposer image-send guard', () => {
     expect(dismiss.defaultPrevented).toBe(true)
     expect(control.classList.contains('is-hint-dismissed')).toBe(true)
     expect(clearDraft).not.toHaveBeenCalled()
-    expect(textarea.value).toBe('Keep this unsent draft.')
+    expect(textarea.textContent).toBe('Keep this unsent draft.')
 
     const subsequent = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
     textarea.dispatchEvent(subsequent)
     expect(subsequent.defaultPrevented).toBe(false)
     expect(clearDraft).toHaveBeenCalledOnce()
-    expect(textarea.value).toBe('')
+    expect(textarea.textContent).toBe('')
     app.unmount()
   })
 
@@ -400,7 +400,7 @@ describe('ChatComposer selected skill queue controls', () => {
       })
       const control = el.querySelector<HTMLElement>('.chat-send-control')!
       const tooltip = control.querySelector<HTMLElement>('.chat-send-tooltip')!
-      const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')!
+      const textarea = el.querySelector<HTMLDivElement>('.chat-inline-editor')!
       const stop = el.querySelector<HTMLButtonElement>('.chat-send-btn.btn--danger')!
       const target = mode === 'hover' ? textarea : control
       target.focus()

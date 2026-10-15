@@ -4,11 +4,13 @@ import { createApp, defineComponent, h, nextTick, ref, type App } from 'vue'
 import i18n from '@/i18n'
 import { useChatComposerShortcuts } from '@/composables/chat/useChatComposerShortcuts'
 import ChatComposer from './ChatComposer.vue'
+import { editorSelection, setEditorSelection } from '@/utils/chat/inlineEditorDom'
 
 const mounted: App[] = []
 afterEach(() => {
   mounted.splice(0).forEach(app => app.unmount())
   document.body.innerHTML = ''
+  vi.restoreAllMocks()
 })
 
 async function setup(showSendBlockedTooltip = true) {
@@ -54,10 +56,10 @@ async function setup(showSendBlockedTooltip = true) {
   mounted.push(app)
   app.mount(host)
   await nextTick()
-  const textarea = host.querySelector<HTMLTextAreaElement>('.chat-textarea')!
+  const textarea = host.querySelector<HTMLDivElement>('.chat-inline-editor')!
   const control = host.querySelector<HTMLElement>('.chat-send-control')!
   textarea.focus()
-  textarea.setSelectionRange(5, 5)
+  setEditorSelection(textarea, 5, 5)
   function key(key: string, init: KeyboardEventInit = {}) {
     const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...init })
     textarea.dispatchEvent(event)
@@ -88,8 +90,8 @@ describe('blocked keyboard Send feedback', () => {
     expect(test.control.classList.contains('is-hint-requested')).toBe(true)
     expect(test.host.querySelector('.chat-send-tooltip')?.textContent).toBe(test.blocked.value)
     expect(test.send).not.toHaveBeenCalled()
-    expect(test.textarea.value).toBe('Keep this unsent draft.')
-    expect(test.textarea.selectionStart).toBe(5)
+    expect(test.textarea.textContent).toBe('Keep this unsent draft.')
+    expect(editorSelection(test.textarea)?.start).toBe(5)
     expect(document.activeElement).toBe(test.textarea)
 
     expect(test.key('Escape').defaultPrevented).toBe(true)
@@ -106,7 +108,7 @@ describe('blocked keyboard Send feedback', () => {
     const test = await setup()
     test.key('Enter')
     await nextTick()
-    test.textarea.value = 'Keep this revised draft.'
+    test.textarea.textContent = 'Keep this revised draft.'
     test.textarea.dispatchEvent(new Event('input', { bubbles: true }))
     await nextTick()
     expect(test.control.classList.contains('is-hint-requested')).toBe(false)
@@ -132,7 +134,13 @@ describe('blocked keyboard Send feedback', () => {
     await nextTick()
     expect(test.control.classList.contains('is-hint-requested')).toBe(false)
     expect(test.send).not.toHaveBeenCalled()
+    let time = 1000
+    vi.spyOn(performance, 'now').mockImplementation(() => time)
     test.textarea.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }))
+    expect(test.key('Enter').defaultPrevented).toBe(true)
+    await nextTick()
+    expect(test.control.classList.contains('is-hint-requested')).toBe(false)
+    time += 101
     test.key('Enter')
     await nextTick()
     expect(test.control.classList.contains('is-hint-requested')).toBe(true)

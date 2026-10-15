@@ -16,6 +16,18 @@ function isDraftLocalPaths(value: unknown, text: string): value is string[] {
     && composeLocalPathText(text, value).length <= MAX_DRAFT_CHARS
 }
 
+/** Editor-only metadata; stable skill identities remain the send contract. */
+function draftSkillPositions(value: unknown, text: string, skills: readonly SelectedSkillRef[]): Record<string, number> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const positions = value as Record<string, unknown>
+  return Object.fromEntries(skills.flatMap(skill => {
+    const position = Object.prototype.hasOwnProperty.call(positions, skill.instanceId)
+      ? positions[skill.instanceId] : undefined
+    return typeof position === 'number' && Number.isInteger(position) && position >= 0 && position <= text.length
+      ? [[skill.instanceId, position]] : []
+  }))
+}
+
 function draftKey(key: string): string {
   return DRAFT_KEY_PREFIX + key
 }
@@ -71,6 +83,7 @@ export interface UseChatDraftPersistenceOptions {
   sessionKey: Ref<string>
   inputText: Ref<string>
   selectedSkills?: Ref<SelectedSkillRef[]>
+  skillPositions?: Ref<Record<string, number>>
   localPaths?: Ref<string[]>
 }
 
@@ -96,7 +109,7 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
     options.sessionKey.value = key
   }
 
-  function saveDraft(key: string, text: string, selectedSkills: SelectedSkillRef[] = [], localPaths: readonly string[] = []): void {
+  function saveDraft(key: string, text: string, selectedSkills: SelectedSkillRef[] = [], localPaths: readonly string[] = [], skillPositions: Record<string, number> = {}): void {
     if (!key) return
     try {
       if (text || selectedSkills.length || localPaths.length) {
@@ -104,8 +117,12 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
         // limits; never silently drop just its referenced paths.
         const paths = isDraftLocalPaths(localPaths, text) ? [...localPaths] : []
         const trimmed = (paths.length ? text : composeLocalPathText(text, localPaths)).slice(0, MAX_DRAFT_CHARS)
+        const positions = draftSkillPositions(skillPositions, trimmed, selectedSkills)
         localStorage.setItem(draftKey(key), selectedSkills.length || paths.length
-          ? JSON.stringify({ version: 1, text: trimmed, selectedSkills, ...(paths.length ? { localPaths: paths } : {}) }) : trimmed)
+          ? JSON.stringify({ version: 1, text: trimmed, selectedSkills,
+            ...(paths.length ? { localPaths: paths } : {}),
+            ...(Object.keys(positions).length ? { skillPositions: positions } : {}),
+          }) : trimmed)
         localStorage.setItem(RECENT_DRAFT_SESSION_KEY, key)
       } else {
         localStorage.removeItem(draftKey(key))
@@ -120,8 +137,8 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
     return loadDraftPayload(key).text
   }
 
-  function loadDraftPayload(key: string): { text: string; selectedSkills: SelectedSkillRef[]; localPaths: string[] } {
-    const empty = { text: '', selectedSkills: [] as SelectedSkillRef[], localPaths: [] as string[] }
+  function loadDraftPayload(key: string): { text: string; selectedSkills: SelectedSkillRef[]; localPaths: string[]; skillPositions: Record<string, number> } {
+    const empty = { text: '', selectedSkills: [] as SelectedSkillRef[], localPaths: [] as string[], skillPositions: {} }
     if (!key) return empty
     try {
       const raw = localStorage.getItem(draftKey(key)) || ''
@@ -129,7 +146,8 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
         const value = JSON.parse(raw)
         if (value?.version === 1 && typeof value.text === 'string' && isSelectedSkills(value.selectedSkills)
           && (value.localPaths === undefined || isDraftLocalPaths(value.localPaths, value.text))) {
-          return { text: value.text, selectedSkills: copySelectedSkills(value.selectedSkills), localPaths: [...(value.localPaths ?? [])] }
+          return { text: value.text, selectedSkills: copySelectedSkills(value.selectedSkills), localPaths: [...(value.localPaths ?? [])],
+            skillPositions: draftSkillPositions(value.skillPositions, value.text, value.selectedSkills) }
         }
       } catch { /* Legacy plain-text draft. */ }
       return { ...empty, text: raw }
@@ -142,6 +160,7 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
     const saved = loadDraftPayload(key)
     options.inputText.value = options.localPaths ? saved.text : composeLocalPathText(saved.text, saved.localPaths)
     if (options.selectedSkills) options.selectedSkills.value = saved.selectedSkills
+    if (options.skillPositions) options.skillPositions.value = saved.skillPositions
     if (options.localPaths) options.localPaths.value = saved.localPaths
   }
 
@@ -193,11 +212,11 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
         // Read text at watcher execution, not at Hello: typing may continue
         // before Vue flushes. In-memory preservation also works without storage.
         clearDraft(previousKey)
-        saveDraft(key, options.inputText.value, options.selectedSkills?.value, options.localPaths?.value)
+        saveDraft(key, options.inputText.value, options.selectedSkills?.value, options.localPaths?.value, options.skillPositions?.value)
         return
       }
       if (previousKey && previousKey !== key) {
-        saveDraft(previousKey, options.inputText.value, options.selectedSkills?.value, options.localPaths?.value)
+        saveDraft(previousKey, options.inputText.value, options.selectedSkills?.value, options.localPaths?.value, options.skillPositions?.value)
         restoreDraft(key)
         return
       }
@@ -211,8 +230,8 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
   // Persist on every composer change for the CURRENT session. Empty text clears
   // the saved draft (the send path empties inputText, so this doubles as the
   // "sent → forget the draft" hook).
-  watch([options.inputText, () => options.selectedSkills?.value, () => options.localPaths?.value], ([text]) => {
-    saveDraft(options.sessionKey.value, text, options.selectedSkills?.value, options.localPaths?.value)
+  watch([options.inputText, () => options.selectedSkills?.value, () => options.localPaths?.value, () => options.skillPositions?.value], ([text]) => {
+    saveDraft(options.sessionKey.value, text, options.selectedSkills?.value, options.localPaths?.value, options.skillPositions?.value)
   }, { deep: true })
 
   return { saveDraft, loadDraft, clearDraft, discardRecentDraft, rebindCurrentDraft, consumeAcceptedDraft }

@@ -277,6 +277,7 @@ class _TurnRunnerPromptAssemblerAdapter(PromptAssemblerPort):
         bootstrap_context_mode: str | None,
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
+        webui_rendering: bool = False,
     ) -> str | tuple[str, str]:
         return self._runner._assemble_prompt(
             agent_id,
@@ -288,6 +289,7 @@ class _TurnRunnerPromptAssemblerAdapter(PromptAssemblerPort):
             bootstrap_context_mode=bootstrap_context_mode,
             fresh_user_session=fresh_user_session,
             workspace_dir=workspace_dir,
+            webui_rendering=webui_rendering,
         )
 
 class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
@@ -1487,12 +1489,16 @@ class _TurnRunnerSystemPromptRefreshAdapter(SystemPromptRefreshPort):
         session_key: str,
         bootstrap_context_mode: str | None,
     ) -> None:
+        from opensquilla.tools.types import CallerKind
+
+        tool_context = getattr(agent, "_tool_context", None)
         assembled = self._runner._assemble_prompt(
             agent_id,
             tool_defs,
             session_key=session_key,
             bootstrap_context_mode=(bootstrap_context_mode),
             workspace_dir=(getattr(agent.config, "workspace_dir", None)),
+            webui_rendering=(getattr(tool_context, "caller_kind", None) is CallerKind.WEB),
         )
         refreshed_prompt = (
             assembled[0] if isinstance(assembled, tuple) else assembled

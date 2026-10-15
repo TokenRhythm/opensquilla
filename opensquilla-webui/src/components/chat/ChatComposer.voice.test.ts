@@ -39,11 +39,11 @@ async function mount(overrides: Record<string, unknown> = {}) {
 // "unavailable" hint when gated — resolve both from i18n so the test never
 // hard-codes English copy.
 async function micButton(el: HTMLElement): Promise<HTMLButtonElement | null> {
-  const more = el.querySelector<HTMLButtonElement>(
-    `button[aria-label="${i18n.global.t('chrome.more')}"]`,
+  const add = el.querySelector<HTMLButtonElement>(
+    `button[aria-label="${i18n.global.t('chat.add')}"]`,
   )
-  expect(more).toBeTruthy()
-  more?.click()
+  expect(add).toBeTruthy()
+  add?.click()
   await nextTick()
   const ready = i18n.global.t('chat.recordVoice')
   const gated = i18n.global.t('chat.voiceUnavailableHint')
@@ -61,12 +61,12 @@ beforeEach(() => {
 describe('ChatComposer voice-input gate', () => {
   it('disables drafting and sending while a Plan questionnaire owns the input area', async () => {
     const { app, el } = await mount({ inputDisabled: true })
-    const textarea = el.querySelector<HTMLTextAreaElement>('textarea')
+    const textarea = el.querySelector<HTMLDivElement>('.chat-inline-editor')
     const send = el.querySelector<HTMLButtonElement>(
       `button[aria-label="${i18n.global.t('chat.send')}"]`,
     )
 
-    expect(textarea?.disabled).toBe(true)
+    expect(textarea?.getAttribute('contenteditable')).toBe('false')
     expect(send?.disabled).toBe(true)
     app.unmount()
   })

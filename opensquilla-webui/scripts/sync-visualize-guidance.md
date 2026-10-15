@@ -17,7 +17,14 @@ localStorage, the streaming lifecycle, or follow-up buttons inside individual
 modules. Those differences are narrow, exact-match replacements with one-match
 assertions. Every adaptation records before/after hashes in the manifest. Changes
 to the upstream headings or module framing fail instead of silently producing a
-partially compatible skill. Mobile rules are included along with desktop rules.
+partially compatible skill. The upstream desktop and mobile outputs are combined
+into one responsive-layout section: layout follows the actual container, while
+mobile reflow and compact-chart rules apply only at narrow widths. The 360px
+target is an acceptance viewport, not an assertion about the current frame or a
+default phone-device layout. Explicit phone-screen mockups retain the upstream
+360px device-frame option, bounded by the actual container. Primary text and
+controls use at least 14px, inputs use 16px, and 12px is reserved for captions.
+These local adaptations are recorded separately in the generated manifest.
 
 Run in `opensquilla-webui`:
 
@@ -53,6 +60,10 @@ collection and illustrations, including combinations and unseen subject matter.
 Separate local-only tasks (no invented chat action) from tasks that explicitly
 need later model work (optional context with accurate values and honest feedback).
 The presence of a button or an API call alone is not evidence of useful behavior.
-Check calculation units, state restoration, theme, keyboard and 360px layout as
-appropriate to each visual. Do not force every example to have reset, submit or
+Check calculation units, state restoration, theme, keyboard, inline and expanded
+desktop layout, and 360px layout as appropriate to each visual. Include an
+unspecified-device prototype that uses available width and an explicitly requested
+phone prototype that retains its device frame. Expansion changes the available
+layout space; it does not magnify a fixed-width design or its text.
+Do not force every example to have reset, submit or
 continue-discussion controls, or train the acceptance prompts around exact labels.

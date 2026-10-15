@@ -1,11 +1,9 @@
 import type { VisualizeContext, VisualizeJson } from './types'
+import { createVisualizeSnapshotStore, type VisualizeSnapshotRevision } from './snapshotStore'
 
 export const VISUALIZE_CONTEXT_MAX_BYTES = 8 * 1024
 export const VISUALIZE_CONTEXT_SUMMARY_MAX = 400
 export const VISUALIZE_CONTEXT_PROMPT_MAX = 2000
-const PREFIX = 'opensquilla.visualize-context.v1.'
-const LIMIT = 48
-const memory = new Map<string, VisualizeContext>()
 
 /** Copy bounded plain JSON before persisting it or adding it to a composer. */
 export function normalizeVisualizeContext(input: unknown): VisualizeContext | null {
@@ -46,25 +44,21 @@ export function normalizeVisualizeContext(input: unknown): VisualizeContext | nu
   return JSON.parse(encoded) as VisualizeContext
 }
 
-// Separate from the legacy state key: no wrapper is injected into guest state.
-export function readVisualizeContext(key: string): VisualizeContext | null {
-  if (memory.has(key)) return normalizeVisualizeContext(memory.get(key))
-  try {
-    const encoded = sessionStorage.getItem(PREFIX + key)
-    if (!encoded || encoded.length > VISUALIZE_CONTEXT_MAX_BYTES) return null
-    return normalizeVisualizeContext(JSON.parse(encoded))
-  } catch { return null }
+const snapshots = createVisualizeSnapshotStore<VisualizeContext | null>({
+  prefix: 'opensquilla.visualize-context.v2.', legacyPrefix: 'opensquilla.visualize-context.v1.',
+  maxValueLength: VISUALIZE_CONTEXT_MAX_BYTES, normalize: normalizeVisualizeContext,
+})
+
+export function hasNewerVisualizeContext(key: string, revision: VisualizeSnapshotRevision): boolean {
+  return snapshots.hasNewer(key, revision)
 }
 
-export function saveVisualizeContext(key: string, value: VisualizeContext | null): void {
+// Clearing conditions retains their host version fence; no wrapper reaches the guest.
+export function readVisualizeContext(key: string, revision?: VisualizeSnapshotRevision): VisualizeContext | null {
+  return snapshots.read(key, revision) ?? null
+}
+
+export function saveVisualizeContext(key: string, value: VisualizeContext | null, revision?: VisualizeSnapshotRevision): void {
   const context = normalizeVisualizeContext(value)
-  memory.delete(key)
-  if (context) memory.set(key, context)
-  while (memory.size > LIMIT) memory.delete(memory.keys().next().value!)
-  try {
-    if (context) sessionStorage.setItem(PREFIX + key, JSON.stringify(context))
-    else sessionStorage.removeItem(PREFIX + key)
-    const keys = Object.keys(sessionStorage).filter(value => value.startsWith(PREFIX))
-    for (const old of keys.slice(0, Math.max(0, keys.length - LIMIT))) if (old !== PREFIX + key) sessionStorage.removeItem(old)
-  } catch { /* Remote browser storage can be unavailable; the memory fallback remains bounded. */ }
+  snapshots.save(key, context, revision)
 }

@@ -26,6 +26,7 @@ const i18n = createI18n({
         composer: {
           contentGroup: 'Content',
           workStyleGroup: 'Work style',
+          pluginsGroup: 'Plugins',
           browserUse: 'Browser Use',
           browserUseDescription: 'Use the browser to complete a task',
         },
@@ -105,8 +106,10 @@ describe('ChatComposerAddMenu', () => {
     const { host } = mountMenu({ localPathsAvailable: true, localPathsDisabled: true })
     await nextTick()
     const items = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
-    expect(items[0].disabled).toBe(false)
-    expect(items[1].disabled).toBe(true)
+    const attach = items.find(item => item.textContent?.includes('Attach files'))
+    const local = items.find(item => item.textContent?.includes('Reference local path'))
+    expect(attach?.disabled).toBe(false)
+    expect(local?.disabled).toBe(true)
   })
   it('escapes the Composer stacking context and supports collision-aware placement', () => {
     expect(chatViewStyles).toContain('.chat-composer-dock > .chat-composer')
@@ -117,6 +120,10 @@ describe('ChatComposerAddMenu', () => {
     expect(addMenuSource).toContain('z-index: 30')
     expect(addMenuSource).toContain('--composer-add-menu-lift')
     expect(addMenuSource).toContain('avoidElement')
+    expect(addMenuSource).not.toContain('border-bottom: 1px solid var(--border)')
+    expect(addMenuSource).not.toContain('.composer-add-menu__search:focus-within')
+    expect(addMenuSource).toContain('box-shadow: none')
+    expect(addMenuSource).not.toContain('inset 0 -2px 0 var(--text-muted)')
   })
 
   it('lifts above the Goal boundary and remains stable when remeasured', () => {
@@ -148,20 +155,20 @@ describe('ChatComposerAddMenu', () => {
 
     const items = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
     expect(items.map(item => item.textContent?.trim())).toEqual([
-      'Attach files',
       'Plan modeTurn plan mode on',
       'Goal modeStart a long-running goal',
+      'Attach files',
     ])
 
-    items[1].click()
+    items[0].click()
     expect(activatePlanMode).toHaveBeenCalledOnce()
     expect(close).toHaveBeenCalledOnce()
 
-    items[2].click()
+    items[1].click()
     expect(activateGoalMode).toHaveBeenCalledOnce()
     expect(close).toHaveBeenCalledTimes(2)
 
-    items[0].click()
+    items[2].click()
     expect(attachFiles).toHaveBeenCalledOnce()
   })
 
@@ -169,9 +176,9 @@ describe('ChatComposerAddMenu', () => {
     const { host } = mountMenu()
     await nextTick()
     const groups = [...host.querySelectorAll('[role="group"]')]
-    expect(groups.map(group => group.getAttribute('aria-label'))).toEqual(['Content', 'Work style'])
-    expect(groups[0].querySelectorAll('[role="menuitem"]')).toHaveLength(1)
-    expect(groups[1].querySelectorAll('[role="menuitem"]')).toHaveLength(2)
+    expect(groups.map(group => group.getAttribute('aria-label'))).toEqual(['Work style', 'Content'])
+    expect(groups[0].querySelectorAll('[role="menuitem"]')).toHaveLength(2)
+    expect(groups[1].querySelectorAll('[role="menuitem"]')).toHaveLength(1)
 
     const unavailable = mountMenu({ planModeAvailable: false, goalModeAvailable: false }).host
     await nextTick()
@@ -179,18 +186,20 @@ describe('ChatComposerAddMenu', () => {
     expect(unavailable.textContent).not.toContain('Work style')
   })
 
-  it('offers Browser Use in Work style and emits the selection action', async () => {
+  it('offers Browser Use in Plugins and emits the selection action', async () => {
     const { host, selectBrowserUse, close } = mountMenu({ browserUseAvailable: true })
     await nextTick()
     const groups = [...host.querySelectorAll('[role="group"]')]
-    expect(groups[0]?.textContent).not.toContain('Browser Use')
-    expect(groups[1]?.textContent).toContain('Browser Use')
-    expect(groups[1]?.textContent).toContain('Use the browser to complete a task')
+    const plugins = groups.find(group => group.getAttribute('aria-label') === 'Plugins')!
+    const workStyle = groups.find(group => group.getAttribute('aria-label') === 'Work style')!
+    expect(plugins.textContent).toContain('Browser Use')
+    expect(workStyle.textContent).not.toContain('Browser Use')
+    expect(plugins.textContent).toContain('Use the browser to complete a task')
 
-    const item = [...groups[1]!.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+    const item = [...plugins.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
       .find(button => button.textContent?.includes('Browser Use'))
-    expect(item?.querySelector('.composer-add-menu__title')?.textContent).toBe('Browser Use[BETA]')
-    expect(item?.querySelector('.composer-add-menu__beta')?.textContent).toBe('[BETA]')
+    expect(item?.querySelector('.composer-capability__name')?.textContent).toBe('Browser Use[BETA]')
+    expect(item?.querySelector('.composer-capability__badge')?.textContent).toBe('[BETA]')
     item?.click()
     expect(selectBrowserUse).toHaveBeenCalledOnce()
     expect(close).toHaveBeenCalledOnce()
@@ -201,7 +210,7 @@ describe('ChatComposerAddMenu', () => {
     const { host } = mountMenu({ browserUseAvailable: true })
     await nextTick()
 
-    const title = host.querySelector('.composer-add-menu__beta')?.parentElement
+    const title = host.querySelector('.composer-capability__badge')?.parentElement
     expect(title?.textContent).toBe('浏览器操作[BETA]')
     expect(title?.closest('[role="menuitem"]')?.textContent).toContain('使用浏览器完成任务')
   })

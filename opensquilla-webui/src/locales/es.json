@@ -1,5 +1,11 @@
 {
   "visualize": {
+    "retryExport": "Reintentar",
+    "previousVersion": "Versión anterior {version}",
+    "previousCanvas": "Lienzo anterior",
+    "viewHistory": "Ver versión anterior",
+    "hideHistory": "Ocultar versión anterior",
+    "historyHint": "Las interacciones permanecen en esta versión anterior y no cambian el lienzo actual.",
     "askWithContext": "Preguntar con estas condiciones",
     "contextAttached": "Condiciones del lienzo adjuntas",
     "contextDetails": "Ver condiciones",
@@ -14,8 +20,8 @@
     "reloadHint": "Conservar los parámetros guardados y recargar el lienzo.",
     "copyImage": "Copiar como imagen",
     "downloadPng": "Descargar PNG",
-    "downloadHtml": "Descargar HTML",
-    "exporting": "Preparando imagen…",
+    "downloadHtml": "Descargar código HTML",
+    "exporting": "Preparando exportación…",
     "downloadStarted": "Descarga iniciada",
     "copyUnsupported": "No se pueden copiar imágenes aquí. Descarga el PNG.",
     "copyFailed": "No se pudo copiar el lienzo. Reintenta o descarga el PNG.",
@@ -4386,8 +4392,10 @@
       }
     },
     "composer": {
+      "searchCapabilities": "Buscar capacidades o acciones",
       "workStyleGroup": "Forma de trabajo",
       "contentGroup": "Contenido",
+      "pluginsGroup": "Plugins",
       "browserUse": "Browser Use",
       "browserUseDescription": "Completar una tarea en el navegador",
       "executionMode": "Modo de ejecución",

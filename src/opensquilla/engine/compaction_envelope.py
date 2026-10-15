@@ -12,7 +12,7 @@ from opensquilla.engine.collaboration_prompt import with_collaboration_instructi
 from opensquilla.engine.types import AgentConfig
 from opensquilla.provider.model_catalog import shared_catalog
 from opensquilla.provider.protocol import provider_metadata
-from opensquilla.tools.types import ToolContext
+from opensquilla.tools.types import CallerKind, ToolContext
 
 if TYPE_CHECKING:
     from opensquilla.engine.runtime import TurnRunner
@@ -72,6 +72,7 @@ def prepare_manual_compaction_envelope(
         session_key=ctx.session_key,
         extra_context=runner._extra_context_for_tool_context(ctx),
         workspace_dir=workspace_dir,
+        webui_rendering=ctx.caller_kind is CallerKind.WEB,
     )
     prompt = with_collaboration_instructions(prompt, ctx)
     config = runner._turn_config()

@@ -1,5 +1,11 @@
 {
   "visualize": {
+    "retryExport": "Erneut versuchen",
+    "previousVersion": "Frühere Version {version}",
+    "previousCanvas": "Früheres Canvas",
+    "viewHistory": "Frühere Version ansehen",
+    "hideHistory": "Frühere Version ausblenden",
+    "historyHint": "Interaktionen bleiben in dieser früheren Version und ändern das aktuelle Canvas nicht.",
     "askWithContext": "Mit diesen Bedingungen fragen",
     "contextAttached": "Canvas-Bedingungen angehängt",
     "contextDetails": "Bedingungen anzeigen",
@@ -14,8 +20,8 @@
     "reloadHint": "Gespeicherte Parameter behalten und Canvas neu laden.",
     "copyImage": "Als Bild kopieren",
     "downloadPng": "PNG herunterladen",
-    "downloadHtml": "HTML herunterladen",
-    "exporting": "Bild wird erstellt…",
+    "downloadHtml": "HTML-Quelltext herunterladen",
+    "exporting": "Export wird vorbereitet…",
     "downloadStarted": "Download gestartet",
     "copyUnsupported": "Bilder können hier nicht kopiert werden. Laden Sie stattdessen PNG herunter.",
     "copyFailed": "Canvas konnte nicht kopiert werden. Erneut versuchen oder PNG herunterladen.",
@@ -4386,8 +4392,10 @@
       }
     },
     "composer": {
+      "searchCapabilities": "Fähigkeiten oder Aktionen suchen",
       "workStyleGroup": "Arbeitsweise",
       "contentGroup": "Inhalt",
+      "pluginsGroup": "Plugins",
       "browserUse": "Browser Use",
       "browserUseDescription": "Eine Aufgabe im Browser erledigen",
       "executionMode": "Ausführungsmodus",

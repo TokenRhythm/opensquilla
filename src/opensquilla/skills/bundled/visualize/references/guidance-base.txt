@@ -9,7 +9,7 @@ A widget is a visual published inside the conversation using the OpenSquilla pub
 ## Format
 
 - Write an HTML fragment: no `<!doctype>`, `<html>`, `<head>`, or `<body>`. Code that starts with `<svg` is treated as a standalone SVG; give it a `viewBox` and no fixed `height`.
-- The inline frame is often about 680px wide but must also fit a 360px phone; measure its actual container and let content determine its height. Never set a fixed height or `100vh` on the outermost element, and do not use `position: fixed` or `sticky` at the top level.
+- Use the available container width and let content determine its height. Reflow when the frame is resized or expanded. A 360px width is a narrow-screen acceptance check, not the default or fixed widget width. Never set a fixed height or `100vh` on the outermost element, and do not use `position: fixed` or `sticky` at the top level.
 - The background is transparent and the host already pads the frame. Do not add an outer background, border, margin, or padding around the whole widget; cards and panels inside it are fine.
 - Keep headings inside the widget short (a few words). One widget answers one question; make a second widget rather than a tabbed super-widget.
 
@@ -83,7 +83,7 @@ Style everything with these CSS variables. The host keeps them in sync with its 
 
 - HTML widgets begin with a visually hidden heading that names the widget: `<h2 class="sr-only">Monthly revenue by region</h2>`.
 - SVG widgets use `role="img"` on the root with `<title>` and `<desc>` as its first children.
-- Never encode meaning with color alone; pair it with a label, sign, icon, or pattern. Keep text at 12px or larger and at readable contrast.
+- Never encode meaning with color alone; pair it with a label, sign, icon, or pattern. Keep readable contrast. Use the host's normal text size for main content and controls, at least 14px; reserve 12px for secondary captions. Reflow content instead of shrinking important text to fit.
 - Interactive parts are real `<button>`, `<input>`, `<select>`, or `<a>` elements with visible labels, reachable by keyboard.
 - Motion is optional decoration. Keep it short, and skip it when `prefers-reduced-motion` is set.
 
@@ -92,11 +92,19 @@ Style everything with these CSS variables. The host keeps them in sync with its 
 - To change a direct in-chat visual, call `edit_widget` with exact `old_string` → `new_string` replacements copied from its latest code. Each `old_string` must occur exactly once; include neighboring text to make it unique. Re-send the whole widget with `show_widget` under the same title only for broad rewrites. For a file-backed visual, edit its source file and call `open_workspace_preview(path=..., presentation="inline")` again. Registration alone does not verify rendering or interaction.
 - When a render reports errors, fix their cause rather than wrapping code in `try`/`catch`.
 
-## Platform: desktop
+## Responsive layout
 
-- The frame is about 680px wide. Up to three columns fit; collapse to one column below 480px with a media query.
+- Use fluid widths, flexbox or grid to make use of the actual frame. On wider frames, up to three columns can fit; collapse to one column below 480px with a media query.
 - Hover can add detail (tooltips, highlights) but must never be the only way to reach information.
 - Charts read well between 240px and 360px tall.
+
+- At narrow frame widths, including 360px, use a single column and stack anything that would sit side by side.
+- Make every tap target at least 44px tall, and never hide an action behind hover.
+- Use 16px text in inputs so the browser does not zoom on focus.
+- Turn wide tables into stacked cards, or put them in a horizontally scrolling container.
+- At narrow frame widths, keep charts at most 240px tall and limit them to the few series that matter.
+- For dense diagrams or long labels, reflow or show a focused view at phone widths; do not shrink a desktop SVG until text becomes unreadable.
+- Expansion provides more layout space; it does not magnify fixed-width content or increase its font size. Only an explicitly requested device mockup should retain a phone-sized frame.
 
 ## Before sending
 
@@ -109,13 +117,3 @@ Style everything with these CSS variables. The host keeps them in sync with its 
 ## Modules
 
 Read the relevant generated reference through `skill_view(name="visualize", file_path="references/guidance-MODULE.txt")`. Choose and combine modules from the index in SKILL.md; these are design capabilities, not fixed templates.
-
-## Platform: mobile
-
-- The frame is about 360px wide. Use a single column and stack anything that would sit side by side.
-- Make every tap target at least 44px tall, and never hide an action behind hover.
-- Use 16px text in inputs so the browser does not zoom on focus.
-- Turn wide tables into stacked cards, or put them in a horizontally scrolling container.
-- Keep charts at most 240px tall and limit them to the few series that matter.
-
-For dense diagrams or long labels, reflow or show a focused view at phone widths; do not shrink a desktop SVG until text becomes unreadable.

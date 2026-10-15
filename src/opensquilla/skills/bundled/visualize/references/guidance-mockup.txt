@@ -6,9 +6,9 @@ Do not edit this generated file; run npm run visualize:guidance:write in opensqu
 
 - Show the interface faithfully but neutrally: tokens for color and type, unless the user asked for a specific brand.
 - Use realistic content (names, numbers, dates) rather than placeholder text.
-- Frame phone screens as a 360px column with `--radius-lg` corners and a 1px border, centered; desktop screens can get a thin window bar.
+- Only when the user explicitly requests a phone-screen mockup, use a centered 360px device frame with `--radius-lg` corners, a 1px border and `max-width:100%`. Otherwise make the interface responsive to the actual container; narrow-screen support does not imply a phone mockup. Desktop screens can get a thin window bar.
 - Build layout with flexbox and grid. Draw icons as small inline SVGs with 1.5px strokes in `currentColor`; do not rely on icon fonts.
 - Light interactivity is welcome (tabs switch, toggles toggle), but the first paint shows the primary state without scripts.
 - When explaining a design, add small numbered callouts and describe them in your reply.
 
-Mockup actions demonstrate the depicted product locally. Do not turn a simulated product submit button into a real model request. Use max-width:100% for the phone frame so it still fits the actual container.
+Mockup actions demonstrate the depicted product locally. Do not turn a simulated product submit button into a real model request.

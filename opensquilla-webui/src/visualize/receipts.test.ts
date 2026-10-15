@@ -1,9 +1,13 @@
 // @vitest-environment happy-dom
 import { describe, expect, it } from 'vitest'
-import type { ChatToolCall } from '@/types/chat'
-import { parseVisualizeReceipt, splitVisualizeBody, visualizeReceipts } from './receipts'
+import type { ChatRenderedMessage, ChatToolCall } from '@/types/chat'
+import { parseVisualizeReceipt, splitVisualizeBody, visualizeReceipts, visualizeReceiptsFromMessage } from './receipts'
 const receipt = { previewStatus: 'inline-ready', presentation: 'inline', documentId: 'doc_123', revisionId: 'rev_123', artifactId: 'artifact_123', name: 'chart.html', mime: 'text/html', size: 100, sha256: 'a'.repeat(64), marker: 'visualize:doc_123:rev_123' }
 const call = { toolId: 'call_1', name: 'open_workspace_preview', status: 'success', isRunning: false, isError: false, result: JSON.stringify(receipt) } as ChatToolCall
+const widgetCall = (id: string, revision: string, version: number | undefined, action: 'show' | 'edit' = 'edit'): ChatToolCall => ({
+  ...call, toolId: id, name: action === 'edit' ? 'edit_widget' : 'show_widget',
+  result: JSON.stringify({ ...receipt, widgetId: 'budget', version, action, revisionId: revision, marker: `visualize:${receipt.documentId}:${revision}` }),
+})
 describe('Visualize authorized receipts and body placement', () => {
   it('requires a successful matching tool result, never a marker by itself', () => {
     expect(visualizeReceipts([{ ...call, isError: true }])).toEqual([])
@@ -67,6 +71,50 @@ describe('Visualize authorized receipts and body placement', () => {
     expect(splitVisualizeBody(`<p><code>${initial.marker}</code></p>`, latest)[0]?.receipt).toMatchObject({ revisionId: 'rev_two' })
     const legacyShow = { ...show, result: JSON.stringify({ ...initial, widgetId: undefined, action: undefined }) } as ChatToolCall
     expect(visualizeReceipts([legacyShow, edit])).toHaveLength(1)
+  })
+
+  it('keeps the greatest published version even when older edits arrive later', () => {
+    const first = widgetCall('show_one', 'rev_one', 1, 'show')
+    const second = widgetCall('edit_two', 'rev_two', 2)
+    const third = widgetCall('show_three', 'rev_three', 3, 'show')
+    for (const calls of [[first, third, second], [third, second, first], [second, first, third]]) {
+      expect(visualizeReceipts(calls)).toMatchObject([{ version: 3, revisionId: 'rev_three', callId: 'show_three' }])
+    }
+  })
+
+  it('keeps the first receipt on a version tie, including duplicate projections', () => {
+    const latest = widgetCall('edit_two', 'rev_two', 2)
+    const duplicate = { ...latest }
+    const conflictingTie = widgetCall('edit_same_version', 'rev_conflict', 2)
+    expect(visualizeReceipts([latest, duplicate, conflictingTie])).toMatchObject([
+      { version: 2, revisionId: 'rev_two', callId: 'edit_two' },
+    ])
+  })
+
+  it('does not let legacy unversioned edits replace a known version in either order', () => {
+    const legacy = widgetCall('legacy_edit', 'rev_legacy', undefined)
+    const versioned = widgetCall('show_two', 'rev_two', 2, 'show')
+    for (const calls of [[legacy, versioned], [versioned, legacy]]) {
+      expect(visualizeReceipts(calls)).toMatchObject([{ version: 2, revisionId: 'rev_two' }])
+    }
+  })
+
+  it('retains legacy call order without replaying duplicated older publications', () => {
+    const first = widgetCall('legacy_show', 'rev_one', undefined, 'show')
+    const second = widgetCall('legacy_edit', 'rev_two', undefined)
+    const third = widgetCall('legacy_rewrite', 'rev_three', undefined, 'show')
+    expect(visualizeReceipts([first, second, first])).toMatchObject([{ revisionId: 'rev_two' }])
+    expect(visualizeReceipts([first, second, third, first, second])).toMatchObject([{ revisionId: 'rev_three' }])
+  })
+
+  it.each([undefined, 3])('merges timeline and flat projections without a stale revision rollback (version %s)', version => {
+    const first = widgetCall('edit_one', 'rev_one', version === undefined ? undefined : 2)
+    const latest = widgetCall('edit_latest', 'rev_latest', version)
+    const message = {
+      timelineItems: [{ type: 'tool-group', group: { calls: [first, latest] } }],
+      toolCalls: [first, { ...latest }, first],
+    } as ChatRenderedMessage
+    expect(visualizeReceiptsFromMessage(message)).toMatchObject([{ revisionId: 'rev_latest', callId: 'edit_latest' }])
   })
 
   it('accepts size aliases but rejects an unfinalized or non-inline widget result', () => {

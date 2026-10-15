@@ -17,6 +17,9 @@ import { useChatTextRendering, type RenderMarkdownOptions } from '@/composables/
 import * as themeRegistry from '@/themes/registry'
 import { downloadBlob } from '@/utils/browser'
 import { saveVisualizeContext } from './context'
+import { readVisualizeState, saveVisualizeState } from './state'
+import { VISUALIZE_VERSIONS_KEY, type VisualizeVersions } from './versions'
+import { mountVisualize } from './runtime'
 
 const mounts = vi.hoisted(() => [] as Array<{ options: VisualizeRuntimeOptions; dispose: ReturnType<typeof vi.fn>; setPresentation: ReturnType<typeof vi.fn>; capture: ReturnType<typeof vi.fn> }>)
 const toasts = vi.hoisted(() => vi.fn())
@@ -43,13 +46,14 @@ const pin = vi.fn(() => releasePin)
 const gateway = reactive({ isAvailable: true, deliveryIdentity: 'user_test', subscriptionEpoch: 1 })
 const message = (): ChatRenderedMessage => ({ role: 'assistant', displayRole: 'assistant', roleLabel: 'Assistant', text: 'Before\n\n`' + payload.marker + '`\n\nAfter', timeStr: '', showHeader: false, toolCalls: [toolCall] })
 async function settle() { for (let i = 0; i < 12; i++) { await nextTick(); await new Promise(resolve => setTimeout(resolve, 0)) } }
-async function mount(render: () => ReturnType<typeof h>) {
+async function mount(render: () => ReturnType<typeof h>, versions?: VisualizeVersions) {
   const host = document.createElement('div'); document.body.append(host)
   const app = createApp({ render }); apps.push(app); app.use(i18n)
   app.provide(ARTIFACT_WORKBENCH_KEY, { content: { fetchVisualize: fetched } } as unknown as ArtifactWorkbench)
   app.provide(GATEWAY_ACCESS_KEY, gateway as GatewayAccess)
   app.provide(VISUALIZE_CONVERSATION_KEY, { enabled: key => key === 'session_test', draft: drafted, attach: attached })
   app.provide(VISUALIZE_MESSAGE_PIN_KEY, { pin })
+  if (versions) app.provide(VISUALIZE_VERSIONS_KEY, versions)
   app.mount(host); await settle(); return { host, app }
 }
 afterEach(() => { apps.splice(0).forEach(app => app.unmount()); mounts.splice(0); document.body.replaceChildren(); ['session_test', 'session_other'].forEach(key => {
@@ -309,11 +313,12 @@ describe('Visualize production chat components', () => {
     expect(write).toHaveBeenCalledOnce()
     expect(mounts[0]!.capture).not.toHaveBeenCalled()
     await settle()
-    expect(host.textContent).toContain('Preparing image')
+    expect(host.textContent).toContain('Preparing export')
     expect(toasts).not.toHaveBeenCalled()
     const png = new Blob(['captured pixels'], { type: 'image/png' }); resolveCapture(png); await settle()
     expect(await image).toBe(png)
-    expect(toasts).toHaveBeenCalledWith('Image copied', { tone: 'ok' })
+    expect(host.querySelector('.visualize-export-feedback')?.textContent).toBe('Image copied')
+    expect(toasts).not.toHaveBeenCalled()
     expect(host.querySelector('dialog')?.getAttribute('aria-modal')).toBeNull()
     expect(mounts).toHaveLength(1)
     expect(mounts[0]!.dispose).not.toHaveBeenCalled()
@@ -330,11 +335,12 @@ describe('Visualize production chat components', () => {
     mounts[0]!.capture.mockRejectedValueOnce(new Error('screenshot failed'))
     await download()
     expect(downloadBlob).not.toHaveBeenCalled()
-    expect(toasts).toHaveBeenLastCalledWith('Could not export the canvas. Try again.', { tone: 'danger' })
-    expect(host.querySelector('[role="alert"]')).toBeNull()
+    expect(host.querySelector('.visualize-export-error[role="alert"]')?.textContent).toContain('Could not export the canvas. Try again.')
+    expect(toasts).not.toHaveBeenCalled()
     await download()
     expect(downloadBlob).toHaveBeenCalledWith(expect.objectContaining({ type: 'image/png' }), 'visual.png')
-    expect(toasts).toHaveBeenLastCalledWith('Download started', { tone: 'ok' })
+    expect(host.querySelector('.visualize-export-feedback')?.textContent).toBe('Download started')
+    expect(host.querySelector('.visualize-export-error')).toBeNull()
     expect(mounts).toHaveLength(1)
     expect(mounts[0]!.dispose).not.toHaveBeenCalled()
     expect(drafted).not.toHaveBeenCalled()
@@ -344,7 +350,7 @@ describe('Visualize production chat components', () => {
     fetched.mockClear()
     const actions = host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!
     actions.click(); await settle()
-    const htmlDownload = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === 'Download HTML')!
+    const htmlDownload = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === 'Download HTML source')!
     expect(htmlDownload.disabled).toBe(false)
     htmlDownload.click(); await settle()
     expect(fetched).toHaveBeenCalledWith(expect.objectContaining({ sessionKey: 'session_test', documentId: receipt.documentId, revisionId: receipt.revisionId, maxBytes: 1024 * 1024 }))
@@ -362,7 +368,7 @@ describe('Visualize production chat components', () => {
     resolveCapture(new Blob(['old pixels'], { type: 'image/png' })); await settle()
     expect(downloadBlob).not.toHaveBeenCalled()
     expect(toasts).not.toHaveBeenCalled()
-    expect(host.textContent).not.toContain('Preparing image')
+    expect(host.textContent).not.toContain('Preparing export')
   })
   it('offers download after unsupported clipboard copying and disables export on a broken canvas', async () => {
     const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
@@ -371,7 +377,8 @@ describe('Visualize production chat components', () => {
     actions.click(); await settle()
     ;[...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === 'Copy as image')!.click(); await settle()
     expect(mounts[0]!.capture).not.toHaveBeenCalled()
-    expect(toasts).toHaveBeenLastCalledWith('Image copying is unavailable here. Use Download PNG instead.', { tone: 'danger' })
+    expect(host.querySelector('.visualize-export-error')?.textContent).toContain('Image copying is unavailable here. Use Download PNG instead.')
+    expect(toasts).not.toHaveBeenCalled()
     actions.click(); await settle()
     const download = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === 'Download PNG')!
     expect(download.disabled).toBe(false)
@@ -380,9 +387,164 @@ describe('Visualize production chat components', () => {
     mounts[0]!.options.onError(new Error('canvas execution failed')); await settle()
     actions.click(); await settle()
     const items = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
-    expect(items.map(button => button.disabled)).toEqual([false, true, true, true])
+    expect(items.map(button => button.disabled)).toEqual([false, true, true, false])
     items[0]!.click(); await settle()
     expect(mounts).toHaveLength(2)
     expect(host.querySelector('[role="alert"]')).toBeNull()
+  })
+
+  it('expires one local success notice, but never expires a later export failure', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    const flush = async () => { for (let i = 0; i < 12; i++) { await nextTick(); await vi.advanceTimersByTimeAsync(0) } }
+    const download = async () => {
+      host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!.click(); await flush()
+      ;[...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === 'Download PNG')!.click(); await flush()
+    }
+    vi.useFakeTimers()
+    try {
+      host.querySelector<HTMLButtonElement>('[aria-label="Expand"]')!.click(); await flush()
+      await download()
+      expect(host.querySelector('.visualize-export-feedback')?.closest('[aria-modal="true"]')).not.toBeNull()
+      expect(toasts).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(3001); await nextTick()
+      expect(host.querySelector('.visualize-export-feedback')).toBeNull()
+      await download()
+      mounts[0]!.capture.mockRejectedValueOnce(new Error('capture unavailable'))
+      await download()
+      await vi.advanceTimersByTimeAsync(3001); await nextTick()
+      expect(host.querySelector('.visualize-export-error')?.textContent).toContain('Could not export')
+      ;[...host.querySelectorAll<HTMLButtonElement>('.visualize-export-error button')].find(button => button.textContent === 'Dismiss')!.click()
+      await flush()
+      expect(host.querySelector('.visualize-export-error')).toBeNull()
+      expect(document.activeElement?.getAttribute('aria-label')).toBe('Canvas actions')
+    } finally { vi.useRealTimers() }
+  })
+
+  it('can download verified HTML source without a rendered runtime, but rejects corrupted source', async () => {
+    vi.mocked(mountVisualize).mockRejectedValueOnce(new Error('generated script failed'))
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    expect(mounts).toHaveLength(0)
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('generated script failed')
+    const download = async () => {
+      host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!.click(); await settle()
+      const button = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(item => item.textContent === 'Download HTML source')!
+      expect(button.disabled).toBe(false); button.click(); await settle()
+    }
+    await download()
+    expect(downloadBlob).toHaveBeenCalledOnce()
+    expect(await vi.mocked(downloadBlob).mock.calls[0]![0].text()).toBe(html)
+    fetched.mockResolvedValueOnce(new Blob(['corrupted source']))
+    await download()
+    expect(downloadBlob).toHaveBeenCalledOnce()
+    expect(host.querySelector('.visualize-export-error')?.textContent).toContain('Could not export')
+  })
+
+  it('cancels source download when the published revision changes', async () => {
+    const holder = reactive({ receipt: { ...receipt, widgetId: 'cancel_source_revision', version: 1 } })
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt: holder.receipt, sessionKey: 'session_test' }))
+    let resolveSource!: (value: Blob) => void
+    fetched.mockImplementationOnce(() => new Promise<Blob>(resolve => { resolveSource = resolve }))
+    host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!.click(); await settle()
+    ;[...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === 'Download HTML source')!.click(); await settle()
+    holder.receipt = { ...holder.receipt, version: 2, revisionId: 'rev_next' }; await settle()
+    resolveSource(new Blob([html])); await settle()
+    expect(downloadBlob).not.toHaveBeenCalled()
+    expect(host.querySelector('.visualize-export-feedback')).toBeNull()
+    expect(host.querySelector('.visualize-export-error')).toBeNull()
+  })
+
+  it('keeps the last surface height during reload and releases it after failure', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    const surface = host.querySelector<HTMLElement>('.visualize-surface')!
+    surface.getBoundingClientRect = () => ({ height: 680 } as DOMRect)
+    let rejectSource!: (reason: Error) => void
+    fetched.mockImplementationOnce(() => new Promise<Blob>((_, reject) => { rejectSource = reject }))
+    host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!.click(); await settle()
+    host.querySelector<HTMLButtonElement>('[role="menuitem"]')!.click(); await settle()
+    expect(surface.style.minHeight).toBe('680px')
+    expect(surface.getAttribute('aria-busy')).toBe('true')
+    expect(host.querySelector('.visualize-loading')).not.toBeNull()
+    rejectSource(new Error('offline')); await settle()
+    expect(surface.style.minHeight).toBe('')
+    expect(host.querySelector('.visualize-loading')).toBeNull()
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('offline')
+  })
+
+  it('keeps previous revisions collapsed and isolates their state and conditions from the current canvas', async () => {
+    const first = { ...receipt, widgetId: 'history_isolation', version: 1, revisionId: 'rev_history_1' }
+    const second = { ...first, version: 2, revisionId: 'rev_history_2' }
+    const latest = reactive({ receipt: second })
+    const versions: VisualizeVersions = {
+      latest: () => latest.receipt,
+      isHistorical: (_session, value) => value.version! < latest.receipt.version,
+    }
+    const old = await mount(() => h(VisualizeCanvas, { receipt: first, sessionKey: 'session_test' }), versions)
+    expect(old.host.textContent).toContain('Previous version 1')
+    expect(mounts).toHaveLength(0)
+    const current = await mount(() => h(VisualizeCanvas, { receipt: second, sessionKey: 'session_test' }), versions)
+    const active = mounts[0]!
+    active.options.onState({ price: 42 })
+    active.options.onContext?.({ summary: 'Current conditions', data: { price: 42 } })
+    ;[...old.host.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'View previous version')!.click(); await settle()
+    expect(mounts).toHaveLength(2)
+    expect(mounts[1]!.options.initialState).toBeUndefined()
+    mounts[1]!.options.onState({ incompatibleOldPrice: 1 })
+    mounts[1]!.options.onContext?.({ summary: 'Old conditions', data: { incompatibleOldPrice: 1 } })
+    mounts[1]!.options.onPrompt('Use old conditions'); await settle()
+    expect(old.host.querySelector('.visualize-context')).toBeNull()
+    expect(old.host.querySelector('.visualize-proposal')).toBeNull()
+    current.host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!.click(); await settle()
+    current.host.querySelector<HTMLButtonElement>('[role="menuitem"]')!.click(); await settle()
+    expect(mounts[2]!.options.initialState).toEqual({ price: 42 })
+    expect(current.host.textContent).toContain('Current conditions')
+    latest.receipt = { ...second, version: 3, revisionId: 'rev_history_3' }; await settle()
+    expect(current.host.textContent).toContain('Previous version 2')
+    expect(mounts[2]!.dispose).toHaveBeenCalled()
+    // A late callback from a just-superseded current frame cannot change v3.
+    mounts[2]!.options.onState({ stale: true })
+    mounts[2]!.options.onContext?.({ summary: 'Stale context' })
+    const newest = await mount(() => h(VisualizeCanvas, { receipt: latest.receipt, sessionKey: 'session_test' }), versions)
+    expect(mounts[3]!.options.initialState).toEqual({ price: 42 })
+    expect(newest.host.textContent).toContain('Current conditions')
+    expect(attached).not.toHaveBeenCalled()
+    expect(drafted).not.toHaveBeenCalled()
+  })
+
+  it('retires an already mounted previous revision when a newer canvas claims state without a message index', async () => {
+    const first = { ...receipt, widgetId: 'unindexed_version_advance', version: 1, revisionId: 'rev_unindexed_1' }
+    const second = { ...first, version: 2, revisionId: 'rev_unindexed_2' }
+    const key = JSON.stringify(['user_test', 'session_test', first.widgetId])
+    const old = await mount(() => h(VisualizeCanvas, { receipt: first, sessionKey: 'session_test' }))
+    const retired = mounts[0]!
+    retired.options.onState({ keep: 42 })
+    retired.options.onContext?.({ summary: 'Inherited conditions' })
+    const current = await mount(() => h(VisualizeCanvas, { receipt: second, sessionKey: 'session_test' }))
+    expect(mounts[1]!.options.initialState).toEqual({ keep: 42 })
+    expect(old.host.textContent).toContain('Previous version 1')
+    expect(old.host.querySelector('.visualize-history button')?.getAttribute('aria-expanded')).toBe('false')
+    expect(retired.dispose).toHaveBeenCalled()
+    retired.options.onState({ stale: true })
+    retired.options.onContext?.({ summary: 'Stale conditions' })
+    expect(readVisualizeState(key, second)).toEqual({ keep: 42 })
+    expect(current.host.textContent).toContain('Inherited conditions')
+  })
+
+  it('recognizes a previous revision from saved state even when the message version index was lost', async () => {
+    const newer = { ...receipt, widgetId: 'forgotten_version_index', version: 3, revisionId: 'rev_known_3' }
+    const older = { ...newer, version: 1, revisionId: 'rev_known_1' }
+    const key = JSON.stringify(['user_test', 'session_test', newer.widgetId])
+    saveVisualizeState(key, { keep: 42 }, newer)
+    saveVisualizeContext(key, { summary: 'Newer conditions' }, newer)
+    const old = await mount(() => h(VisualizeCanvas, { receipt: older, sessionKey: 'session_test' }))
+    expect(old.host.textContent).toContain('Previous version 1')
+    expect(mounts).toHaveLength(0)
+    ;[...old.host.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'View previous version')!.click(); await settle()
+    expect(mounts[0]!.options.initialState).toBeUndefined()
+    mounts[0]!.options.onState({ incompatible: 1 })
+    mounts[0]!.options.onContext?.({ summary: 'Must stay historical' })
+    const current = await mount(() => h(VisualizeCanvas, { receipt: newer, sessionKey: 'session_test' }))
+    expect(mounts[1]!.options.initialState).toEqual({ keep: 42 })
+    expect(readVisualizeState(key, newer)).toEqual({ keep: 42 })
+    expect(current.host.textContent).toContain('Newer conditions')
   })
 })

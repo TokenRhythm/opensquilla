@@ -1,5 +1,11 @@
 {
   "visualize": {
+    "retryExport": "再試行",
+    "previousVersion": "以前のバージョン {version}",
+    "previousCanvas": "以前のキャンバス",
+    "viewHistory": "以前のバージョンを表示",
+    "hideHistory": "以前のバージョンを閉じる",
+    "historyHint": "ここでの操作はこの以前のバージョンにのみ保存され、現在のキャンバスには影響しません。",
     "askWithContext": "この条件で質問する",
     "contextAttached": "キャンバスの条件を添付しました",
     "contextDetails": "条件を表示",
@@ -14,8 +20,8 @@
     "reloadHint": "保存済みのパラメーターを保持して再読み込みします。",
     "copyImage": "画像としてコピー",
     "downloadPng": "PNG をダウンロード",
-    "downloadHtml": "HTML をダウンロード",
-    "exporting": "画像を準備中…",
+    "downloadHtml": "HTML ソースをダウンロード",
+    "exporting": "エクスポートを準備中…",
     "downloadStarted": "ダウンロードを開始しました",
     "copyUnsupported": "この環境では画像をコピーできません。PNG をダウンロードしてください。",
     "copyFailed": "コピーできませんでした。再試行するか PNG をダウンロードしてください。",
@@ -4386,8 +4392,10 @@
       }
     },
     "composer": {
+      "searchCapabilities": "機能や操作を検索",
       "workStyleGroup": "作業方法",
       "contentGroup": "コンテンツ",
+      "pluginsGroup": "プラグイン",
       "browserUse": "Browser Use",
       "browserUseDescription": "ブラウザーでタスクを実行",
       "executionMode": "実行モード",

@@ -1,5 +1,11 @@
 {
   "visualize": {
+    "retryExport": "重试",
+    "previousVersion": "历史版本 {version}",
+    "previousCanvas": "历史画布",
+    "viewHistory": "查看历史版本",
+    "hideHistory": "收起历史版本",
+    "historyHint": "此处的交互仅保留在这个历史版本中，不会改变当前画布。",
     "askWithContext": "用这些条件提问",
     "contextAttached": "已附加画布条件",
     "contextDetails": "查看条件",
@@ -14,8 +20,8 @@
     "reloadHint": "保留已保存的参数，重新加载画布。",
     "copyImage": "复制为图像",
     "downloadPng": "下载 PNG",
-    "downloadHtml": "下载 HTML",
-    "exporting": "正在生成图像…",
+    "downloadHtml": "下载 HTML 源码",
+    "exporting": "正在准备导出…",
     "downloadStarted": "已开始下载",
     "copyUnsupported": "当前环境无法复制图像，请使用“下载 PNG”。",
     "copyFailed": "复制画布失败，请重试或下载 PNG。",
@@ -4470,8 +4476,10 @@
       }
     },
     "composer": {
+      "searchCapabilities": "搜索能力或操作",
       "workStyleGroup": "工作方式",
       "contentGroup": "内容",
+      "pluginsGroup": "插件",
       "browserUse": "浏览器操作",
       "browserUseDescription": "使用浏览器完成任务",
       "executionMode": "执行模式",

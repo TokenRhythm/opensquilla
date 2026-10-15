@@ -48,9 +48,9 @@ async function clickButton(el: HTMLElement, label: string) {
   await nextTick()
 }
 
-async function clickMoreAction(el: HTMLElement, label: string) {
-  await clickButton(el, 'More')
-  expectPopover(el, '.chat-more-actions-menu', true)
+async function clickAddAction(el: HTMLElement, label: string) {
+  await clickButton(el, 'Add')
+  expectPopover(el, '.composer-add-menu', true)
   await clickButton(el, label)
 }
 
@@ -64,6 +64,21 @@ beforeEach(() => {
 })
 
 describe('ChatComposer popovers', () => {
+  it('places composer utility actions under Add without a duplicate bottom More trigger', async () => {
+    const { app, el } = await mountComposer({
+      promptCacheKeepaliveAvailable: true,
+      promptCacheKeepaliveSessionReady: true,
+    })
+
+    expect(el.querySelector('button[aria-label="More"]')).toBeNull()
+    await clickButton(el, 'Add')
+    expect(el.querySelector('.composer-add-menu [aria-label="Record voice input"]')).toBeTruthy()
+    expect(el.querySelector('.composer-add-menu [aria-label="Export as Markdown"]')).toBeTruthy()
+    expect(el.querySelector('.composer-add-menu [data-testid="chat-composer-action-keepalive"]')).toBeTruthy()
+
+    app.unmount()
+  })
+
   it.each([
     { mode: 'off', pin: null, defaultModel: { model: 'base', provider: 'provider-a' }, label: 'Base model', badge: true },
     { mode: 'off', pin: { model: 'base', provider: 'provider-a' }, defaultModel: { model: 'base', provider: 'provider-a' }, label: 'Base model', badge: false },
@@ -211,7 +226,7 @@ describe('ChatComposer popovers', () => {
   it('requests expansion before pointer, focus, and input interactions', async () => {
     const expand = vi.fn()
     const { app, el } = await mountComposer({ collapsed: true, onExpand: expand })
-    const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')!
+    const textarea = el.querySelector<HTMLDivElement>('.chat-inline-editor')!
 
     pointerDown(textarea)
     textarea.focus()
@@ -225,21 +240,21 @@ describe('ChatComposer popovers', () => {
     const { app, el, vm } = await mountComposer()
     expect(vm.canCollapse()).toBe(true)
 
-    const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')!
+    const textarea = el.querySelector<HTMLDivElement>('.chat-inline-editor')!
     textarea.focus()
     expect(vm.canCollapse()).toBe(true)
     textarea.blur()
 
-    const more = el.querySelector<HTMLButtonElement>('button[aria-label="More"]')!
-    more.focus()
+    const add = el.querySelector<HTMLButtonElement>('button[aria-label="Add"]')!
+    add.focus()
     expect(vm.canCollapse()).toBe(false)
-    more.blur()
+    add.blur()
 
-    await clickButton(el, 'More')
+    await clickButton(el, 'Add')
     expect(vm.canCollapse()).toBe(false)
     pointerDown(document.body)
     await nextTick()
-    more.blur()
+    add.blur()
     expect(vm.canCollapse()).toBe(true)
     app.unmount()
   })
@@ -275,14 +290,14 @@ describe('ChatComposer popovers', () => {
     app.unmount()
   })
 
-  it('closes the more-actions menu on outside pointerdown', async () => {
+  it('closes the add menu on outside pointerdown', async () => {
     const { app, el } = await mountComposer()
 
-    await clickButton(el, 'More')
-    expectPopover(el, '.chat-more-actions-menu', true)
+    await clickButton(el, 'Add')
+    expectPopover(el, '.composer-add-menu', true)
     pointerDown(document.body)
     await nextTick()
-    expectPopover(el, '.chat-more-actions-menu', false)
+    expectPopover(el, '.composer-add-menu', false)
 
     app.unmount()
   })
@@ -302,15 +317,15 @@ describe('ChatComposer popovers', () => {
     app.unmount()
   })
 
-  it('keeps the more-actions menu open when clicking inside it', async () => {
+  it('keeps the add menu open when clicking inside it', async () => {
     const { app, el } = await mountComposer()
 
-    await clickButton(el, 'More')
-    const popover = el.querySelector<HTMLElement>('.chat-more-actions-menu')
+    await clickButton(el, 'Add')
+    const popover = el.querySelector<HTMLElement>('.composer-add-menu')
     expect(popover).toBeTruthy()
     if (popover) pointerDown(popover)
     await nextTick()
-    expectPopover(el, '.chat-more-actions-menu', true)
+    expectPopover(el, '.composer-add-menu', true)
 
     app.unmount()
   })
@@ -318,10 +333,10 @@ describe('ChatComposer popovers', () => {
   it('keeps only one composer popover open at a time', async () => {
     const { app, el } = await mountComposer()
 
-    await clickButton(el, 'More')
-    expectPopover(el, '.chat-more-actions-menu', true)
+    await clickButton(el, 'Add')
+    expectPopover(el, '.composer-add-menu', true)
     await clickButton(el, "Models & routing")
-    expectPopover(el, '.chat-more-actions-menu', false)
+    expectPopover(el, '.composer-add-menu', false)
     expectPopover(el, '.composer-model-routing', true)
     await clickButton(el, 'Execution mode: Safe')
     expectPopover(el, '.composer-model-routing', false)
@@ -380,7 +395,6 @@ describe('ChatComposer popovers', () => {
 
     const popovers = [
       ['Add', '.composer-add-menu'],
-      ['More', '.chat-more-actions-menu'],
       ["Models & routing", '.composer-model-routing'],
       ['Execution mode: Safe', '.composer-run-mode'],
     ] as const
@@ -398,7 +412,7 @@ describe('ChatComposer popovers', () => {
     // re-expanding keeps the menu closed
     props.collapsed = false
     await nextTick()
-    expectPopover(el, '.chat-more-actions-menu', false)
+    expectPopover(el, '.composer-add-menu', false)
 
     app.unmount()
   })
@@ -427,7 +441,7 @@ describe('ChatComposer popovers', () => {
     app.unmount()
   })
 
-  it('exports from the more-actions menu and closes the menu', async () => {
+  it('exports from the add menu and closes the menu', async () => {
     let exports = 0
     const el = document.createElement('div')
     document.body.appendChild(el)
@@ -455,16 +469,16 @@ describe('ChatComposer popovers', () => {
     app.mount(el)
     await nextTick()
 
-    await clickMoreAction(el, 'Export as Markdown')
+    await clickAddAction(el, 'Export as Markdown')
     expect(exports).toBe(1)
-    expectPopover(el, '.chat-more-actions-menu', false)
+    expectPopover(el, '.composer-add-menu', false)
 
     app.unmount()
   })
 
   it('shows keepalive only when supported and enables it after the session is materialized', async () => {
     const unsupported = await mountComposer()
-    await clickButton(unsupported.el, 'More')
+    await clickButton(unsupported.el, 'Add')
     expect(unsupported.el.querySelector('[data-testid="chat-composer-action-keepalive"]')).toBeNull()
     unsupported.app.unmount()
 
@@ -474,7 +488,7 @@ describe('ChatComposer popovers', () => {
       promptCacheKeepaliveSessionReady: false,
       onOpenPromptCacheKeepalive: openKeepalive,
     })
-    await clickButton(draft.el, 'More')
+    await clickButton(draft.el, 'Add')
     const disabledAction = draft.el.querySelector<HTMLButtonElement>(
       '[data-testid="chat-composer-action-keepalive"]',
     )
@@ -482,7 +496,7 @@ describe('ChatComposer popovers', () => {
     expect(disabledAction?.textContent).toContain('Available after the first message is sent')
     disabledAction?.click()
     expect(openKeepalive).not.toHaveBeenCalled()
-    expectPopover(draft.el, '.chat-more-actions-menu', true)
+    expectPopover(draft.el, '.composer-add-menu', true)
     draft.app.unmount()
 
     const ready = await mountComposer({
@@ -490,13 +504,13 @@ describe('ChatComposer popovers', () => {
       promptCacheKeepaliveSessionReady: true,
       onOpenPromptCacheKeepalive: openKeepalive,
     })
-    await clickMoreAction(ready.el, 'Prompt cache keepalive')
+    await clickAddAction(ready.el, 'Prompt cache keepalive')
     expect(openKeepalive).toHaveBeenCalledTimes(1)
-    expectPopover(ready.el, '.chat-more-actions-menu', false)
+    expectPopover(ready.el, '.composer-add-menu', false)
     ready.app.unmount()
   })
 
-  it('refreshes and shows the current keepalive state inside the existing menu', async () => {
+  it('refreshes and shows the current keepalive state inside the add menu', async () => {
     const refreshKeepalive = vi.fn()
     const { app, el } = await mountComposer({
       promptCacheKeepaliveAvailable: true,
@@ -519,7 +533,7 @@ describe('ChatComposer popovers', () => {
       onRefreshPromptCacheKeepalive: refreshKeepalive,
     })
 
-    await clickButton(el, 'More')
+    await clickButton(el, 'Add')
 
     expect(refreshKeepalive).toHaveBeenCalledTimes(1)
     const action = el.querySelector<HTMLButtonElement>(
@@ -527,9 +541,6 @@ describe('ChatComposer popovers', () => {
     )
     expect(action?.textContent).toContain('Scheduled')
     expect(action?.getAttribute('aria-label')).toBe('Prompt cache keepalive. Scheduled')
-    expect(
-      action?.querySelector('[data-state="scheduled"] .chat-more-actions-menu__status-dot'),
-    ).toBeTruthy()
     app.unmount()
   })
 })

@@ -71,8 +71,13 @@ and nearby controls; reveal secondary detail on selection. A simulation may
 need more space than a diagram: optimize for understanding, not a fixed layout.
 
 Use fluid widths, wrapping controls, touch-friendly targets, readable labels and
-keyboard access. Design for 360 px mobile width. For full documents include a
-viewport meta tag. Keep the background transparent unless a meaningful region
+keyboard access. Use the available container width and reflow when resized or
+expanded. Check that the result also works at 360 px; this is a narrow-screen
+acceptance width, not a fixed canvas width or a request for a phone mockup. Only
+use a phone-sized device frame when the user explicitly requests a phone-screen
+prototype. Keep main text and controls at the host's normal size, at least 14 px;
+use 16 px input text and reserve 12 px for secondary captions. For full documents
+include a viewport meta tag. Keep the background transparent unless a meaningful region
 needs contrast. Use the full host token table and native-control styles in the
 shared guidance; do not invent a separate palette or oversized primary buttons.
 The host handles frame spacing, expansion, reload and export controls.
@@ -110,8 +115,9 @@ workspace, then call
 `open_workspace_preview(path="relative/path.html", presentation="inline")`.
 Use the exact marker from that result as above. This path remains the supported
 one for source delivery and multi-file resources.
-When creating several examples, give each a separate file and include each final
-marker beside its explanation. Do not overwrite all examples into one file.
+For several file-backed examples, give each a separate file and include each final
+marker beside its explanation. For inline widgets, use a distinct title and the
+returned marker for each example; no workspace file is needed.
 
 The host Canvas menu owns explicit exports such as Download HTML and Download
 PNG. Do not create a workspace HTML file merely to make a visual downloadable;
@@ -161,9 +167,11 @@ successful restore. Save these on discrete user changes or pause, not every
 animation frame. Treat zero as a valid value and accept older snapshots with
 missing fields.
 Save after changes and after reset; saving only the selected tab is not
-enough when the user has adjusted parameters. Keep state under 16 KiB; it is
-scoped to this browser session and exact canvas version, not a shared database.
-It does not synchronize across devices or migrate automatically to a new version.
+enough when the user has adjusted parameters. Keep serialized state under 16,384
+JavaScript string code units. State belongs to the current browser session,
+account, conversation and stable widget identity; edits to that widget can restore
+the saved state. Validate older saved values when changing the state schema.
+State does not synchronize across devices and is not durable shared storage.
 
 Calculations, filtering, selection, highlighting, playback and ordinary prototype
 actions stay local. Do not add a generic "continue discussion" or submit-to-chat

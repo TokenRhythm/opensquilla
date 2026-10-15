@@ -224,6 +224,85 @@ describe('useChatDraftPersistence', () => {
 })
 
 describe('skill draft persistence', () => {
+  it('keeps inline positions with their own session through switching, rebinding and refresh', async () => {
+    const selectedSkills = ref([{ name: 'visualize', instanceId: 'skill:visualize', digest: 'a'.repeat(64) }])
+    const skillPositions = ref<Record<string, number>>({ 'skill:visualize': 2 })
+    const sessionKey = ref('agent:main:webchat:inline-one')
+    const inputText = ref('中文说明')
+    const scope = effectScope()
+    const api = scope.run(() => useChatDraftPersistence({ sessionKey, inputText, selectedSkills, skillPositions }))!
+    skillPositions.value = { 'skill:visualize': 1 }
+    await nextTick()
+    const saved = JSON.parse(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:inline-one')!)
+    expect(saved.skillPositions).toEqual({ 'skill:visualize': 1 })
+    expect(saved.selectedSkills[0]).toEqual({ name: 'visualize', instanceId: 'skill:visualize', digest: 'a'.repeat(64) })
+
+    sessionKey.value = 'agent:main:webchat:inline-two'
+    await nextTick()
+    expect(skillPositions.value).toEqual({})
+    inputText.value = '另一条草稿'
+    await nextTick()
+    sessionKey.value = 'agent:main:webchat:inline-one'
+    await nextTick()
+    expect(inputText.value).toBe('中文说明')
+    expect(skillPositions.value).toEqual({ 'skill:visualize': 1 })
+    api.rebindCurrentDraft('agent:main:webchat:inline-bound')
+    await nextTick()
+    expect(skillPositions.value).toEqual({ 'skill:visualize': 1 })
+    scope.stop()
+
+    const restoredPositions = ref<Record<string, number>>({})
+    const restoredScope = effectScope()
+    const restoredText = ref('')
+    const restoredSkills = ref<typeof selectedSkills.value>([])
+    restoredScope.run(() => useChatDraftPersistence({ sessionKey, inputText: restoredText,
+      selectedSkills: restoredSkills, skillPositions: restoredPositions }))
+    expect(restoredPositions.value).toEqual({ 'skill:visualize': 1 })
+    restoredText.value = ''
+    restoredSkills.value = []
+    restoredPositions.value = {}
+    await nextTick()
+    expect(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:inline-bound')).toBeNull()
+    restoredScope.stop()
+  })
+
+  it.each([undefined, null, [], { 'skill:visualize': -1 }, { 'skill:visualize': 5 },
+    { 'skill:visualize': 1.5 }, { 'skill:visualize': '2' }, { foreign: 2 }])(
+    'ignores invalid or legacy inline position metadata without losing the draft: %j', (skillPositions) => {
+      const sessionKey = ref('agent:main:webchat:inline-legacy')
+      const skill = { name: 'visualize', instanceId: 'skill:visualize', digest: 'a'.repeat(64) }
+      localStorage.setItem(`opensquilla.chat.draft:${sessionKey.value}`, JSON.stringify({ version: 1,
+        text: '中文说明', selectedSkills: [skill], skillPositions }))
+      const positions = ref<Record<string, number>>({})
+      const selected = ref<typeof skill[]>([])
+      const text = ref('')
+      const scope = effectScope()
+      scope.run(() => useChatDraftPersistence({ sessionKey, inputText: text, selectedSkills: selected, skillPositions: positions }))
+      expect(text.value).toBe('中文说明')
+      expect(selected.value).toEqual([skill])
+      expect(positions.value).toEqual({})
+      scope.stop()
+    },
+  )
+
+  it('saves only bounded positions for currently selected skill identities', async () => {
+    const skill = { name: 'visualize', instanceId: 'skill:visualize', digest: 'a'.repeat(64) }
+    const sessionKey = ref('agent:main:webchat:inline-valid')
+    const inputText = ref('说明')
+    const selectedSkills = ref([skill])
+    const skillPositions = ref<Record<string, number>>({ 'skill:visualize': 0, foreign: 1 })
+    const scope = effectScope()
+    scope.run(() => useChatDraftPersistence({ sessionKey, inputText, selectedSkills, skillPositions }))
+    skillPositions.value['skill:visualize'] = 2
+    await nextTick()
+    expect(JSON.parse(localStorage.getItem(`opensquilla.chat.draft:${sessionKey.value}`)!).skillPositions)
+      .toEqual({ 'skill:visualize': 2 })
+    skillPositions.value['skill:visualize'] = 3
+    await nextTick()
+    expect(JSON.parse(localStorage.getItem(`opensquilla.chat.draft:${sessionKey.value}`)!).skillPositions).toBeUndefined()
+    scope.stop()
+  })
+
   it('restores skill identity with its own session and preserves it through namespace binding', async () => {
     const selectedSkills = ref([{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }])
     const sessionKey = ref('agent:main:webchat:one')

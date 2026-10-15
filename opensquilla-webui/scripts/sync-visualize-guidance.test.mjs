@@ -99,3 +99,27 @@ test('all generated files carry source attribution and the complete MIT notice s
   const actual = normalizeText(await readFile(path.join(skillRoot, 'LICENSE.generative-frame.txt'), 'utf8'))
   assert.equal(actual, license)
 })
+
+test('responsive guidance separates narrow-view acceptance from an explicitly requested phone mockup', async () => {
+  const files = await buildGeneratedFiles()
+  const base = files.get('references/guidance-base.txt')
+  const mockup = files.get('references/guidance-mockup.txt')
+  assert.equal(base.split('## Responsive layout').length - 1, 1)
+  assert.doesNotMatch(base, /## Platform:|The frame is about \d+px wide/)
+  assert.match(base, /360px width is a narrow-screen acceptance check, not the default or fixed widget width/)
+  assert.match(base, /Reflow when the frame is resized or expanded/)
+  assert.match(base, /At narrow frame widths, including 360px, use a single column/)
+  assert.match(base, /At narrow frame widths, keep charts at most 240px tall/)
+  assert.match(base, /below 480px with a media query/)
+  assert.match(base, /at least 14px; reserve 12px for secondary captions/)
+  assert.match(base, /16px text in inputs/)
+  assert.match(mockup, /Only when the user explicitly requests a phone-screen mockup/)
+  assert.match(mockup, /centered 360px device frame/)
+  assert.match(mockup, /Otherwise make the interface responsive to the actual container/)
+  const manifest = JSON.parse(files.get('upstream-guidance.json'))
+  for (const id of ['base:conditional-mobile-width', 'base:conditional-mobile-chart', 'mockup:explicit-phone-frame']) {
+    const change = manifest.adaptations.find(record => record.id === id)
+    assert.ok(change, id)
+    assert.notEqual(change.beforeSha256, change.afterSha256, id)
+  }
+})

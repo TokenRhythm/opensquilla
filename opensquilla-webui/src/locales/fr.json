@@ -1,5 +1,11 @@
 {
   "visualize": {
+    "retryExport": "Réessayer",
+    "previousVersion": "Version précédente {version}",
+    "previousCanvas": "Canevas précédent",
+    "viewHistory": "Voir la version précédente",
+    "hideHistory": "Masquer la version précédente",
+    "historyHint": "Les interactions restent dans cette version précédente et ne modifient pas le canevas actuel.",
     "askWithContext": "Poser une question avec ces conditions",
     "contextAttached": "Conditions du canevas jointes",
     "contextDetails": "Voir les conditions",
@@ -14,8 +20,8 @@
     "reloadHint": "Conserver les paramètres enregistrés et recharger le canevas.",
     "copyImage": "Copier comme image",
     "downloadPng": "Télécharger le PNG",
-    "downloadHtml": "Télécharger le HTML",
-    "exporting": "Préparation de l’image…",
+    "downloadHtml": "Télécharger le code HTML",
+    "exporting": "Préparation de l’export…",
     "downloadStarted": "Téléchargement lancé",
     "copyUnsupported": "La copie d’image est indisponible ici. Téléchargez le PNG.",
     "copyFailed": "Impossible de copier le canevas. Réessayez ou téléchargez le PNG.",
@@ -4386,8 +4392,10 @@
       }
     },
     "composer": {
+      "searchCapabilities": "Rechercher une capacité ou une action",
       "workStyleGroup": "Méthode de travail",
       "contentGroup": "Contenu",
+      "pluginsGroup": "Plugins",
       "browserUse": "Browser Use",
       "browserUseDescription": "Accomplir une tâche dans le navigateur",
       "executionMode": "Mode d'exécution",

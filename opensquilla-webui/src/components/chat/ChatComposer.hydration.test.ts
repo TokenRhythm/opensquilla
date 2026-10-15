@@ -142,12 +142,12 @@ it('keeps Send disabled through a metadata failure and enables one click after a
     expect(project.status.value).toBe('error')
     expect(retryMetadata).not.toHaveBeenCalled()
     const button = el.querySelector<HTMLButtonElement>('.chat-send-btn')!
-    const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')!
+    const textarea = el.querySelector<HTMLDivElement>('.chat-inline-editor')!
     expect(button.disabled).toBe(true)
     expect(button.getAttribute('aria-busy')).toBe('false')
     expect(button.querySelector('.loading-spinner')).toBeNull()
-    expect(textarea.disabled).toBe(false)
-    textarea.value = 'Edited follow-up'
+    expect(textarea.getAttribute('contenteditable')).toBe('true')
+    textarea.textContent = 'Edited follow-up'
     textarea.dispatchEvent(new Event('input', { bubbles: true }))
     button.click()
     expect(onSend).not.toHaveBeenCalled()
@@ -185,7 +185,7 @@ it('preserves Stop while hydration blocks ordinary Send', async () => {
     expect(button.disabled).toBe(false)
     button.click()
     expect(onStop).toHaveBeenCalledOnce()
-    expect(el.querySelector<HTMLTextAreaElement>('.chat-textarea')!.disabled).toBe(false)
+    expect(el.querySelector<HTMLDivElement>('.chat-inline-editor')!.getAttribute('contenteditable')).toBe('true')
   } finally { app.unmount() }
 })
 

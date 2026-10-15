@@ -31,9 +31,9 @@ async function mountComposer() {
   app.use(i18n)
   const vm = app.mount(el) as unknown as { focusTextarea: (options?: { preserveFocus?: boolean }) => void }
   await nextTick()
-  const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')
+  const textarea = el.querySelector<HTMLDivElement>('.chat-inline-editor')
   expect(textarea).toBeTruthy()
-  return { app, textarea: textarea as HTMLTextAreaElement, vm }
+  return { app, textarea: textarea as HTMLDivElement, vm }
 }
 
 afterEach(() => {

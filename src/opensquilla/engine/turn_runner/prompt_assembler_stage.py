@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from opensquilla.provider.protocol import configured_provider_id
-from opensquilla.tools.types import is_goal_owned_main_default_turn
+from opensquilla.tools.types import CallerKind, is_goal_owned_main_default_turn
 
 if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.attachment_stage import (
@@ -159,6 +159,7 @@ class PromptAssemblerPort(Protocol):
         bootstrap_context_mode: str | None,
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
+        webui_rendering: bool = False,
     ) -> str | tuple[str, str]: ...
 
 @runtime_checkable
@@ -448,6 +449,9 @@ class PromptAssemblerStage:
             bootstrap_context_mode=(inp.bootstrap_context_mode),
             fresh_user_session=inp.fresh_user_session,
             workspace_dir=(getattr(inp.effective_tool_context, "workspace_dir", None)),
+            webui_rendering=(
+                getattr(inp.effective_tool_context, "caller_kind", None) is CallerKind.WEB
+            ),
         )
         from opensquilla.engine.collaboration_prompt import with_collaboration_instructions
         from opensquilla.token_estimation import estimate_tokens

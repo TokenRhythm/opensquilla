@@ -54,7 +54,7 @@ export function adaptBase(raw, mobile, records = []) {
   edit('A widget is a visual you place in the conversation by calling `show_widget`. Its `widget_code` streams into a sandboxed frame and renders element by element while you write it.',
     'A widget is a visual published inside the conversation using the OpenSquilla publication contract in SKILL.md. The host displays the registered HTML revision in an isolated frame.', 'base:publication')
   edit('The frame is about 680px wide and grows to the height of your content.',
-    'The inline frame is often about 680px wide but must also fit a 360px phone; measure its actual container and let content determine its height.', 'base:responsive-width')
+    'Use the available container width and let content determine its height. Reflow when the frame is resized or expanded. A 360px width is a narrow-screen acceptance check, not the default or fixed widget width.', 'base:responsive-width')
   edit('## Streaming order', '## Document order', 'base:document-order')
   edit('Scripts are held until the whole widget has arrived, then run once in document order.',
     'The host loads a complete immutable revision; scripts run once in document order.', 'base:complete-revision')
@@ -71,6 +71,8 @@ export function adaptBase(raw, mobile, records = []) {
     '- The window fires `themechange` when the host theme changes; resolve CSS tokens again when repainting Canvas.',
     '- Do not call tools, navigate to external links, request credentials, or create your own expand/reload/export controls. The host supplies canvas controls.',
   ].join('\n'), records)
+  edit('Keep text at 12px or larger and at readable contrast.',
+    'Keep readable contrast. Use the host\'s normal text size for main content and controls, at least 14px; reserve 12px for secondary captions. Reflow content instead of shrinking important text to fit.', 'base:readable-primary-text')
   edit('To change a widget you already showed, call `edit_widget` with exact `old_string` → `new_string` replacements copied from its latest code. Each `old_string` must occur exactly once; include neighboring text to make it unique. Re-send the whole widget with `show_widget` under the same title only for broad rewrites.',
     'To change a direct in-chat visual, call `edit_widget` with exact `old_string` → `new_string` replacements copied from its latest code. Each `old_string` must occur exactly once; include neighboring text to make it unique. Re-send the whole widget with `show_widget` under the same title only for broad rewrites. For a file-backed visual, edit its source file and call `open_workspace_preview(path=..., presentation="inline")` again. Registration alone does not verify rendering or interaction.', 'base:immutable-edits')
   const moduleStart = '\n\n## Modules\n\n'
@@ -83,9 +85,18 @@ export function adaptBase(raw, mobile, records = []) {
   const from = mobile.indexOf(mobileStart)
   const to = mobile.indexOf(mobileEnd, from)
   assert.ok(to > from)
-  const mobileSection = mobile.slice(from, to)
-  records.push({ id: 'base:include-upstream-mobile', matches: 1, beforeSha256: sha256(mobileSection), afterSha256: sha256(mobileSection) })
-  return `${text}\n\n${mobileSection}\n\nFor dense diagrams or long labels, reflow or show a focused view at phone widths; do not shrink a desktop SVG until text becomes unreadable.\n`
+  let mobileRules = replaceExactlyOnce(mobile.slice(from, to), mobileStart, '', 'base:mobile-rules-heading', records)
+  mobileRules = replaceExactlyOnce(mobileRules,
+    'The frame is about 360px wide. Use a single column and stack anything that would sit side by side.',
+    'At narrow frame widths, including 360px, use a single column and stack anything that would sit side by side.', 'base:conditional-mobile-width', records)
+  mobileRules = replaceExactlyOnce(mobileRules,
+    'Keep charts at most 240px tall and limit them to the few series that matter.',
+    'At narrow frame widths, keep charts at most 240px tall and limit them to the few series that matter.', 'base:conditional-mobile-chart', records)
+  edit('## Platform: desktop', '## Responsive layout', 'base:responsive-heading')
+  edit('The frame is about 680px wide. Up to three columns fit; collapse to one column below 480px with a media query.',
+    'Use fluid widths, flexbox or grid to make use of the actual frame. On wider frames, up to three columns can fit; collapse to one column below 480px with a media query.', 'base:responsive-columns')
+  edit(mobileEnd, `\n\n${mobileRules}\n- For dense diagrams or long labels, reflow or show a focused view at phone widths; do not shrink a desktop SVG until text becomes unreadable.\n- Expansion provides more layout space; it does not magnify fixed-width content or increase its font size. Only an explicitly requested device mockup should retain a phone-sized frame.\n\n## Before sending`, 'base:include-conditional-mobile')
+  return `${text}\n`
 }
 
 export function adaptModule(name, raw, records = []) {
@@ -105,8 +116,11 @@ export function adaptModule(name, raw, records = []) {
     edit('Offer follow-up questions through buttons that call `sendPrompt` with the current state described in words.',
       'Keep parameter changes and results local. Do not add a generic continue-discussion or submit-to-chat button. If the requested workflow includes subsequent model work, use optional `setContext` from SKILL.md; the host presents the chat action.', 'optional-model-context')
   } else if (name === 'mockup') {
-    text += '\n\nMockup actions demonstrate the depicted product locally. Do not turn a simulated product submit button into a real model request. Use max-width:100% for the phone frame so it still fits the actual container.\n'
-    records.push({ id: 'mockup:simulation-boundary', matches: 1, beforeSha256: sha256(raw), afterSha256: sha256(text) })
+    edit('Frame phone screens as a 360px column with `--radius-lg` corners and a 1px border, centered; desktop screens can get a thin window bar.',
+      'Only when the user explicitly requests a phone-screen mockup, use a centered 360px device frame with `--radius-lg` corners, a 1px border and `max-width:100%`. Otherwise make the interface responsive to the actual container; narrow-screen support does not imply a phone mockup. Desktop screens can get a thin window bar.', 'explicit-phone-frame')
+    const beforeBoundary = text
+    text += '\n\nMockup actions demonstrate the depicted product locally. Do not turn a simulated product submit button into a real model request.\n'
+    records.push({ id: 'mockup:simulation-boundary', matches: 1, beforeSha256: sha256(beforeBoundary), afterSha256: sha256(text) })
   } else if (name === 'elicitation') {
     edit('On submit: `preventDefault()`, validate and show messages next to the fields, then call `sendPrompt` once with a single readable line, for example `Trip preferences — Dates: 12–19 May · Budget: mid-range · Pace: relaxed`.',
       'Validate inputs and show messages next to the fields. If a local form submit is useful for validation, call `preventDefault()`. Publish valid task conditions with `await visual.setContext({ summary, data, suggestedPrompt })`; use a concise summary of the actual values and a task-specific suggestedPrompt. The host supplies the action that adds these conditions to the conversation. Do not duplicate it with a generic continue-discussion button.', 'collect-context')

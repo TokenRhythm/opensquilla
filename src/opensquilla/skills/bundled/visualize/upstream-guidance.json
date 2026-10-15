@@ -55,7 +55,7 @@
       "id": "base:responsive-width",
       "matches": 1,
       "beforeSha256": "effcdc20f1a331665a44542f2b9f599e379e5cafe37fcb08483ef986060d32c1",
-      "afterSha256": "a58a780d813cb917c0a7f6583737748b631694dfcb586d146874f5ea2a1feb14"
+      "afterSha256": "f4ce8e4fc14d5cceebb6bf19f494aac4f2ea9461818130c9aed9b45bf80e28cf"
     },
     {
       "id": "base:document-order",
@@ -94,6 +94,12 @@
       "afterSha256": "fb8fb0ce9654a12e15030e8fd1171e3871c8c0bb9c0f6a3a46ab9d41f1d8f24d"
     },
     {
+      "id": "base:readable-primary-text",
+      "matches": 1,
+      "beforeSha256": "968d57521f947b2cefcb41ec30f3e79246458a4aa5193fe30771b0131d5df570",
+      "afterSha256": "f18d7d3e4332c318a7ce503d1433d24e7f2ff16e82c6b6f3d498293e11f2257d"
+    },
+    {
       "id": "base:immutable-edits",
       "matches": 1,
       "beforeSha256": "898432d196503c48cf5e36d875aa60f59a6683b1646f7e0cc6bba551ca9bc7cb",
@@ -106,10 +112,40 @@
       "afterSha256": "cac7696ec0d43b1bf288538104822ae8f19dc53713098afb0f6146cf10d4dd5f"
     },
     {
-      "id": "base:include-upstream-mobile",
+      "id": "base:mobile-rules-heading",
       "matches": 1,
-      "beforeSha256": "7199e84bb7764d70f328044331b781536051a87e36ecf7129ecccfa0a9a856f1",
-      "afterSha256": "7199e84bb7764d70f328044331b781536051a87e36ecf7129ecccfa0a9a856f1"
+      "beforeSha256": "23934e6b2f37e9912f9c9cf18632b16656b5ff8855dc79d738ac4bac73f75ce2",
+      "afterSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "base:conditional-mobile-width",
+      "matches": 1,
+      "beforeSha256": "018445f4e312d760861d5cc07ce322abcf6f61838743f192a54ad9302f9b4c83",
+      "afterSha256": "d9a791175a8cf813f11052ff07f5765c56f2d35c09ab1dfb0b449c225887aa0b"
+    },
+    {
+      "id": "base:conditional-mobile-chart",
+      "matches": 1,
+      "beforeSha256": "fae89573c8632064ba49334e026ba0c140d09a80332ec228c97b0161fdca5c04",
+      "afterSha256": "c9daa99fb5f201c96db590c17080c0b1576d58d5b0715d4649ea8a44402006c4"
+    },
+    {
+      "id": "base:responsive-heading",
+      "matches": 1,
+      "beforeSha256": "3bbfa09911277d44a02dc0a7d0b6749ecacd4eaab7373a7f602a82a67ca4c749",
+      "afterSha256": "ae074988a91c582a3ddb757d62bef5c224ae1bed84037bf28f25411471ad2d3c"
+    },
+    {
+      "id": "base:responsive-columns",
+      "matches": 1,
+      "beforeSha256": "31cb6d1f31d227bfcb6b8afd899d469daf14f537142dc88a6090f0816614bdfd",
+      "afterSha256": "1e2ab8cf06f6147a6ef518a3b003d72f7e4a6e41e4322a32cddfa9ad13b14591"
+    },
+    {
+      "id": "base:include-conditional-mobile",
+      "matches": 1,
+      "beforeSha256": "6ec00d30902c78ecde8e06c0335d09f88ffe5d1d052892ce2aad78a0ae473acd",
+      "afterSha256": "38af1b29e6c1fc91ae7d80ada509008422438959eb01de4ef84115d016a7d922"
     },
     {
       "id": "diagram:layer-order",
@@ -148,10 +184,16 @@
       "afterSha256": "d9f0d7d43a116065c50c9cbd0d6252e2516d925b10ff8808d846c87a657c9942"
     },
     {
+      "id": "mockup:explicit-phone-frame",
+      "matches": 1,
+      "beforeSha256": "b5a4de1cbead63f32d7cb500408023a04d907c04a1e110208ccddcf9c74faf23",
+      "afterSha256": "91c63770bc74429848cdfa6398a185841213cdc86b6a967b636a5e5e6d50bb94"
+    },
+    {
       "id": "mockup:simulation-boundary",
       "matches": 1,
-      "beforeSha256": "ee791ed27d8ebd30f1616b4bc54bcae8fbee3a00767df45903e164de53480b66",
-      "afterSha256": "96c104f63dc425a10de4209fd93dfad6064db0a10447c6305680430ef9afec4c"
+      "beforeSha256": "2161278b92a394e1bf38b9d8a0aebe5281356f614a2a3d7ec5af5be9005f61df",
+      "afterSha256": "2f937386b54a42dc550feb8675f7a0d8708e5df3560d268d555c59460366f5db"
     },
     {
       "id": "elicitation:collect-context",
@@ -169,7 +211,7 @@
   "outputs": [
     {
       "file": "references/guidance-base.txt",
-      "sha256TextLF": "624fc5488a79928db51204a15aed6fd7e18f1579adeb402719aade55aae17dcb"
+      "sha256TextLF": "b3b7db1e08143b41c216ac6d65b2d0d11d7473194399d49dc3ff738a7f636fb2"
     },
     {
       "file": "references/guidance-diagram.txt",
@@ -189,7 +231,7 @@
     },
     {
       "file": "references/guidance-mockup.txt",
-      "sha256TextLF": "79d1d87a31e651e67abd82cc4d7a29ab8dd2f68b23a51fd13d9184db743b2afa"
+      "sha256TextLF": "dc5c8ed523642e5334b14830cd431193ab39cb5566bbc0b8406f22e06f6f09f0"
     },
     {
       "file": "references/guidance-elicitation.txt",

@@ -67,12 +67,20 @@ export function pastedTextAttachmentName(text: string, now = Date.now()): string
  */
 export function shouldCaptureFilePaste(
   target: EventTarget | null,
-  options: { composerTextareaFocused: boolean, dialogLayerOpen: boolean },
+  options: { composerTextareaFocused: boolean, dialogLayerOpen: boolean, composerEditor?: HTMLElement | null },
 ): boolean {
   if (options.dialogLayerOpen) return false
   if (target instanceof HTMLTextAreaElement) return options.composerTextareaFocused
   if (target instanceof HTMLInputElement) return false
-  if (target instanceof HTMLElement && target.isContentEditable) return false
+  if (target instanceof HTMLElement) {
+    // Inline capability references add child nodes to the composer. Only the
+    // exact supplied editor may claim their clipboard events; other editors
+    // and their descendants still own their pastes.
+    if (options.composerEditor && (target === options.composerEditor || options.composerEditor.contains(target))) {
+      return options.composerTextareaFocused
+    }
+    if (target.isContentEditable || target.closest('[contenteditable="true"], [contenteditable="plaintext-only"], [contenteditable=""]')) return false
+  }
   return true
 }
 

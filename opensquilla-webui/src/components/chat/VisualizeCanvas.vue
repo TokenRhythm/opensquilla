@@ -1,15 +1,22 @@
 <template>
   <div class="visualize-position" data-chat-find-ignore :style="expanded ? { height: `${inlineHeight}px` } : undefined">
-    <dialog ref="canvas" open class="visualize-canvas" :class="{ 'visualize-canvas--expanded': expanded }"
+    <div v-if="historical" class="visualize-history">
+      <span>{{ receipt.name }} · {{ receipt.version ? t('visualize.previousVersion', { version: receipt.version }) : t('visualize.previousCanvas') }}</span>
+      <button type="button" :aria-expanded="historyOpen" @click="toggleHistory">{{ t(historyOpen ? 'visualize.hideHistory' : 'visualize.viewHistory') }}</button>
+      <p v-if="historyOpen">{{ t('visualize.historyHint') }}</p>
+    </div>
+    <dialog v-show="!historical || historyOpen" ref="canvas" open class="visualize-canvas" :class="{ 'visualize-canvas--expanded': expanded }"
       :role="expanded ? 'dialog' : 'group'" :aria-modal="expanded || undefined" :aria-label="receipt.name"
       data-visualize-canvas @cancel.prevent="onEscape" @keydown.esc.stop.prevent="onEscape">
       <header class="visualize-toolbar">
         <span v-if="expanded" class="visualize-title" :title="receipt.name">{{ receipt.name }}</span>
-        <p v-if="exportBusy || exportFeedback" class="visualize-export-feedback" :class="{ 'visualize-export-feedback--error': exportFailed }" role="status" :title="exportBusy ? t('visualize.exporting') : exportFeedback">{{ exportBusy ? t('visualize.exporting') : exportFeedback }}</p>
+        <p v-if="exportBusy || (exportFeedback && !exportFailed)" class="visualize-export-feedback" role="status">{{ exportBusy ? t('visualize.exporting') : exportFeedback }}</p>
         <div class="visualize-actions">
           <div ref="menuAnchor" class="visualize-menu-anchor" @focusout="onMenuFocusOut">
             <button ref="menuButton" type="button" class="visualize-icon" :aria-label="t('visualize.actions')" :title="t('visualize.actions')"
-              aria-haspopup="menu" :aria-expanded="menuOpen" :aria-controls="menuId" @click="toggleMenu" @keydown.down.prevent="openMenu(true)" @keydown.up.prevent="openMenu(false)"><span aria-hidden="true">···</span></button>
+              aria-haspopup="menu" :aria-expanded="menuOpen" :aria-controls="menuId" @click="toggleMenu" @keydown.down.prevent="openMenu(true)" @keydown.up.prevent="openMenu(false)">
+              <svg class="visualize-more-icon" viewBox="0 0 20 20" aria-hidden="true"><circle cx="4" cy="10" r="1.25" /><circle cx="10" cy="10" r="1.25" /><circle cx="16" cy="10" r="1.25" /></svg>
+            </button>
             <div v-if="menuOpen" :id="menuId" ref="menu" class="visualize-menu" role="menu" :aria-label="t('visualize.actions')" @keydown="onMenuKeydown">
               <span class="visualize-menu-name" :title="receipt.name">{{ receipt.name }}</span>
               <button type="button" role="menuitem" :disabled="loading || exportBusy" :title="t('visualize.reloadHint')" :aria-description="t('visualize.reloadHint')" @click="reloadFromMenu">{{ t('visualize.reload') }}</button>
@@ -26,17 +33,25 @@
           </button>
         </div>
       </header>
+      <div v-if="exportFailed" class="visualize-export-error visualize-feedback" role="alert">
+        <p>{{ exportFeedback }}</p>
+        <div class="visualize-feedback-actions">
+          <button type="button" :disabled="lastExportMode === 'html' ? !canDownloadHtml : !canExport" @click="exportCanvas(lastExportMode)">{{ t('visualize.retryExport') }}</button>
+          <button v-if="lastExportMode === 'copy'" type="button" :disabled="!canExport" @click="exportCanvas('download')">{{ t('visualize.downloadPng') }}</button>
+          <button type="button" @click="dismissExportFeedback">{{ t('visualize.dismiss') }}</button>
+        </div>
+      </div>
       <div v-if="error" class="visualize-feedback" role="alert">
         <p>{{ t('visualize.error') }}</p><p class="visualize-error-detail">{{ error }}</p>
         <div class="visualize-feedback-actions">
-          <button type="button" @click="reload">{{ t('visualize.reload') }}</button>
+          <button type="button" @click="reload()">{{ t('visualize.reload') }}</button>
           <button v-if="canDraft" type="button" @click="draftRepair">{{ t('visualize.repair') }}</button>
         </div>
       </div>
-      <p v-else-if="loading" class="visualize-feedback" role="status">{{ t('visualize.loading') }}</p>
+      <p v-else-if="loading" class="visualize-feedback visualize-loading" role="status">{{ t('visualize.loading') }}</p>
       <p v-if="expandUnavailable" class="visualize-feedback" role="status">{{ t('visualize.expandUnavailable') }}</p>
-      <div ref="container" class="visualize-surface" :aria-busy="loading" />
-      <footer v-if="context" class="visualize-context">
+      <div ref="container" class="visualize-surface" :style="loading ? { minHeight: `${loadingHeight}px` } : undefined" :aria-busy="loading" />
+      <footer v-if="context && !historical" class="visualize-context">
         <p class="visualize-context-summary">{{ context.summary }}</p>
         <button type="button" :disabled="!canDraft || loading || Boolean(error)" @click="attachContext">{{ t('visualize.askWithContext') }}</button>
         <p v-if="contextAttached" class="visualize-context-attached" role="status">{{ t('visualize.contextAttached') }}</p>
@@ -61,21 +76,24 @@ import { bytesToHex } from '@noble/hashes/utils.js'
 import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { useDialogLayer } from '@/composables/useDialogA11y'
-import { useToasts } from '@/composables/useToasts'
 import { downloadBlob } from '@/utils/browser'
 import { abortableClipboardPreparation, assertClipboardPreparationActive, ImageClipboardError, IMAGE_CLIPBOARD_PREPARATION_TIMEOUT_MS, writePreparedClipboard } from '@/utils/imageClipboard'
 import { getManifest } from '@/themes/registry'
 import { VISUALIZE_CONVERSATION_KEY, type VisualizeContext, type VisualizeReceipt, type VisualizeRuntime } from '@/visualize/types'
 import { VISUALIZE_MESSAGE_PIN_KEY } from '@/visualize/presentation'
-import { readVisualizeState, saveVisualizeState } from '@/visualize/state'
-import { normalizeVisualizeContext, readVisualizeContext, saveVisualizeContext } from '@/visualize/context'
+import { VISUALIZE_VERSIONS_KEY } from '@/visualize/versions'
+import { hasNewerVisualizeState, readVisualizeState, saveVisualizeState } from '@/visualize/state'
+import { hasNewerVisualizeContext, normalizeVisualizeContext, readVisualizeContext, saveVisualizeContext } from '@/visualize/context'
 const props = defineProps<{ receipt: VisualizeReceipt; sessionKey: string; sampleHtml?: string }>()
 const { t } = useI18n()
-const { pushToast } = useToasts()
 const content = inject(ARTIFACT_WORKBENCH_KEY, null)?.content
 const gateway = inject(GATEWAY_ACCESS_KEY, null)
 const conversation = inject(VISUALIZE_CONVERSATION_KEY, null)
 const messagePins = inject(VISUALIZE_MESSAGE_PIN_KEY, null)
+const versions = inject(VISUALIZE_VERSIONS_KEY, null)
+const historical = computed(() => (versions?.isHistorical(props.sessionKey, props.receipt) ?? false)
+  || hasNewerVisualizeState(baseScope.value, props.receipt) || hasNewerVisualizeContext(baseScope.value, props.receipt))
+const historyOpen = ref(false)
 const canvas = ref<HTMLDialogElement | null>(null)
 const expandButton = ref<HTMLButtonElement | null>(null)
 const menuButton = ref<HTMLButtonElement | null>(null)
@@ -95,17 +113,21 @@ const menuOpen = ref(false)
 const exportBusy = ref(false)
 const exportFeedback = ref('')
 const exportFailed = ref(false)
+const lastExportMode = ref<'copy' | 'download' | 'html'>('download')
+const loadingHeight = ref(120)
 const expandUnavailable = ref(false)
 const inlineHeight = ref(120)
 const isTopmost = useDialogLayer(expanded)
 // A revision changes after edit_widget, but saved interaction state belongs to
 // the widget/session rather than to one immutable source revision.
 const widgetIdentity = computed(() => props.receipt.widgetId || props.receipt.documentId)
-const scope = computed(() => JSON.stringify([gateway?.deliveryIdentity, props.sessionKey, widgetIdentity.value]))
+const baseScope = computed(() => JSON.stringify([gateway?.deliveryIdentity, props.sessionKey, widgetIdentity.value]))
+const scope = computed(() => JSON.stringify([gateway?.deliveryIdentity, props.sessionKey, widgetIdentity.value,
+  ...(historical.value ? ['history', props.receipt.revisionId] : [])]))
 const receiptVersion = computed(() => JSON.stringify([props.receipt.documentId, props.receipt.revisionId, props.receipt.sha256, props.receipt.size, props.receipt.version]))
-const canDraft = computed(() => conversation?.enabled(props.sessionKey) ?? false)
+const canDraft = computed(() => !historical.value && (conversation?.enabled(props.sessionKey) ?? false))
 const canExport = computed(() => !loading.value && !error.value && !exportBusy.value)
-const canDownloadHtml = computed(() => canExport.value && Boolean(props.sampleHtml !== undefined || (props.sessionKey && gateway?.isAvailable && content?.fetchVisualize)))
+const canDownloadHtml = computed(() => !exportBusy.value && Boolean(props.sampleHtml !== undefined || (props.sessionKey && gateway?.isAvailable && content?.fetchVisualize)))
 let runtime: VisualizeRuntime | null = null
 let request: AbortController | null = null
 let observer: MutationObserver | null = null
@@ -115,6 +137,7 @@ let alive = false
 let exportRequest: AbortController | null = null
 let contextEncoding = 'null'
 let contextFeedbackTimer: ReturnType<typeof setTimeout> | undefined
+let exportFeedbackTimer: ReturnType<typeof setTimeout> | undefined
 const theme = (): 'light' | 'dark' => {
   const themeId = container.value?.closest<HTMLElement>('[data-theme]')?.dataset.theme ?? document.documentElement.dataset.theme ?? ''
   const declared = getManifest(themeId)?.capabilities.colorScheme
@@ -130,7 +153,7 @@ const diagnostic = (cause: unknown) => (cause instanceof Error ? cause.message :
 
 function updatePresentation() {
   const viewportHeight = window.visualViewport?.height ?? window.innerHeight
-  const extra = [...(canvas.value?.children ?? [])].filter(node => node !== container.value)
+  const extra = [...(canvas.value?.children ?? [])].filter(node => node !== container.value && !node.classList.contains('visualize-loading'))
     .reduce((height, node) => height + node.getBoundingClientRect().height, 0)
   runtime?.setPresentation({ mode: expanded.value ? 'expanded' : 'inline', availableHeight: Math.max(160, viewportHeight - extra - 48) })
 }
@@ -223,18 +246,27 @@ function closeMenuOnFrameFocus() {
   // when focus leaves this browser window, without stealing the next focus.
   closeMenu(false)
 }
-function cancelExport() {
-  exportRequest?.abort(); exportRequest = null; exportBusy.value = false
+function clearExportFeedback() {
+  if (exportFeedbackTimer !== undefined) clearTimeout(exportFeedbackTimer)
+  exportFeedbackTimer = undefined
   exportFeedback.value = ''; exportFailed.value = false
 }
+function dismissExportFeedback() {
+  clearExportFeedback()
+  menuButton.value?.focus({ preventScroll: true })
+}
+function cancelExport() {
+  exportRequest?.abort(); exportRequest = null; exportBusy.value = false
+  clearExportFeedback()
+}
 async function exportCanvas(mode: 'copy' | 'download' | 'html') {
-  if (!canExport.value || !runtime) return
+  if (mode === 'html' ? !canDownloadHtml.value : (!canExport.value || !runtime)) return
   const mounted = runtime
   const expectedScope = scope.value
   const expectedReceiptVersion = receiptVersion.value
   const controller = new AbortController(); exportRequest = controller
   const current = () => alive && !controller.signal.aborted && scope.value === expectedScope
-    && receiptVersion.value === expectedReceiptVersion && runtime === mounted
+    && receiptVersion.value === expectedReceiptVersion && (mode === 'html' || runtime === mounted)
   const assertCurrent = () => {
     assertClipboardPreparationActive(controller.signal)
     if (!current()) throw new DOMException('Cancelled', 'AbortError')
@@ -242,13 +274,13 @@ async function exportCanvas(mode: 'copy' | 'download' | 'html') {
   const baseName = (props.receipt.name.split(/[/\\]/).pop() ?? 'visualization').replace(/\.[^.]*$/, '').replace(/[<>:"|?*\u0000-\u001f]/g, '_') || 'visualization'
   const filename = mode === 'html' ? `${baseName}.html` : `${baseName}.png`
   const timeout = setTimeout(() => controller.abort(new ImageClipboardError('timedOut')), IMAGE_CLIPBOARD_PREPARATION_TIMEOUT_MS)
-  exportBusy.value = true; exportFeedback.value = ''; exportFailed.value = false
+  clearExportFeedback(); lastExportMode.value = mode; exportBusy.value = true
   closeMenu(true)
   let preparationError: unknown
   const prepare = async () => {
     try {
       assertCurrent()
-      const blob = await abortableClipboardPreparation(mounted.capture({ signal: controller.signal }), controller.signal)
+      const blob = await abortableClipboardPreparation(mounted!.capture({ signal: controller.signal }), controller.signal)
       assertCurrent()
       // capture() validates PNG pixels and bounds; the HTML receipt is never
       // used as a clipboard image descriptor or rasterized a second time.
@@ -279,15 +311,14 @@ async function exportCanvas(mode: 'copy' | 'download' | 'html') {
     }
     assertCurrent()
     exportFeedback.value = t(mode === 'copy' ? 'imageClipboard.copiedImage' : 'visualize.downloadStarted')
-    pushToast(exportFeedback.value, { tone: 'ok' })
+    exportFeedbackTimer = setTimeout(clearExportFeedback, 3000)
   } catch (cause) {
     const failure = preparationError ?? cause
-    if (alive && scope.value === expectedScope && exportRequest === controller
+    if (alive && scope.value === expectedScope && receiptVersion.value === expectedReceiptVersion && exportRequest === controller
       && !(failure instanceof DOMException && failure.name === 'AbortError')) {
       exportFailed.value = true
       exportFeedback.value = t(failure instanceof ImageClipboardError && failure.kind === 'unsupported'
         ? 'visualize.copyUnsupported' : mode === 'copy' ? 'visualize.copyFailed' : 'visualize.downloadFailed')
-      pushToast(exportFeedback.value, { tone: 'danger' })
     }
   } finally {
     clearTimeout(timeout); controller.abort()
@@ -295,16 +326,18 @@ async function exportCanvas(mode: 'copy' | 'download' | 'html') {
   }
 }
 
-async function reload() {
+async function reload(preserveHeight = true) {
   closeMenu(false); cancelExport()
+  loadingHeight.value = preserveHeight ? Math.max(120, container.value?.getBoundingClientRect().height ?? 0) : 120
   request?.abort(); runtime?.dispose(); runtime = null
   const controller = new AbortController(); request = controller
   const expectedScope = scope.value
   const current = () => alive && !controller.signal.aborted && expectedScope === scope.value
   loading.value = true; error.value = ''; proposal.value = ''; drafted.value = false
   clearContextAttachmentFeedback()
-  context.value = readVisualizeContext(expectedScope); contextAttachFailed.value = false
+  context.value = readVisualizeContext(expectedScope, props.receipt); contextAttachFailed.value = false
   contextEncoding = JSON.stringify(context.value)
+  if (historical.value && !historyOpen.value) { loading.value = false; return }
   try {
     if (!container.value) return
     let html = props.sampleHtml
@@ -318,9 +351,10 @@ async function reload() {
     if (!current()) return
     const { mountVisualize } = await import('@/visualize/runtime')
     if (!current()) return
-    const mounted = await mountVisualize(container.value, { html, signal: controller.signal, initialState: readVisualizeState(expectedScope), theme: theme(),
-      onPrompt(text) { if (current() && typeof text === 'string') { proposal.value = text.trim().slice(0, 4000); drafted.value = false } },
-      onState(state) { if (current()) saveVisualizeState(expectedScope, state) },
+    const sourceRevision = { version: props.receipt.version, revisionId: props.receipt.revisionId }
+    const mounted = await mountVisualize(container.value, { html, signal: controller.signal, initialState: readVisualizeState(expectedScope, sourceRevision), theme: theme(),
+      onPrompt(text) { if (current() && !historical.value && typeof text === 'string') { proposal.value = text.trim().slice(0, 4000); drafted.value = false } },
+      onState(state) { if (current()) saveVisualizeState(expectedScope, state, sourceRevision) },
       onContext(value) {
         if (!current()) return false
         const normalized = normalizeVisualizeContext(value)
@@ -328,7 +362,7 @@ async function reload() {
         // Generated controls may publish on every render. Do not rewrite
         // storage or erase an attachment acknowledgement for unchanged data.
         if (normalized && encoded === contextEncoding) return true
-        saveVisualizeContext(expectedScope, normalized)
+        saveVisualizeContext(expectedScope, normalized, sourceRevision)
         contextEncoding = encoded
         clearContextAttachmentFeedback()
         context.value = normalized; contextAttachFailed.value = false
@@ -347,6 +381,12 @@ async function reload() {
   } catch (cause) {
     if (current()) error.value = diagnostic(cause)
   } finally { if (current()) loading.value = false }
+}
+async function toggleHistory() {
+  if (expanded.value) collapse(false)
+  historyOpen.value = !historyOpen.value
+  await nextTick()
+  if (alive) void reload(false)
 }
 function reloadFromMenu() { closeMenu(true); void reload() }
 function clearContextAttachmentFeedback() {
@@ -385,11 +425,14 @@ onMounted(() => {
   window.addEventListener('blur', closeMenuOnFrameFocus)
   window.visualViewport?.addEventListener('resize', updatePresentation)
 })
-watch([proposal, context, contextAttached, contextAttachFailed, error, loading], () => { void nextTick(updatePresentation) })
-watch(scope, () => { collapse(false); if (alive) void reload() })
+watch([proposal, context, contextAttached, contextAttachFailed, error, loading, exportFailed, exportBusy, exportFeedback], () => { void nextTick(updatePresentation) })
 // Keep one Canvas instance when edit_widget advances the source revision. The
 // stable scope preserves saved state; this watcher refreshes only guest code.
-watch(receiptVersion, () => { if (alive) void reload() })
+watch([scope, receiptVersion], ([nextScope], [previousScope]) => {
+  const sameScope = nextScope === previousScope
+  if (!sameScope) { collapse(false); historyOpen.value = false }
+  if (alive) void reload(sameScope)
+})
 onBeforeUnmount(() => {
   clearContextAttachmentFeedback()
   collapse(false); alive = false; cancelExport(); request?.abort(); runtime?.dispose(); observer?.disconnect()
@@ -401,19 +444,24 @@ onBeforeUnmount(() => {
 </script>
 <style scoped>
 .visualize-position { margin: var(--sp-4) 0; min-width: 0; }
+.visualize-history { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-2); padding: var(--sp-2) 0; color: var(--text-muted); font-size: var(--fs-sm); }
+.visualize-history > span { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
+.visualize-history > button { min-height: 44px; background: transparent; }
+.visualize-history > p { flex-basis: 100%; margin: 0; }
 .visualize-canvas { position: relative; display: block; width: 100%; max-width: none; max-height: none; min-width: 0; margin: 0; padding: 0; border: 1px solid transparent; border-radius: var(--radius-lg); overflow: visible; color: var(--text); background: transparent; }
 .visualize-canvas:hover, .visualize-canvas:focus-within { border-color: var(--border); }
 .visualize-toolbar { display: flex; align-items: center; justify-content: flex-end; min-height: 32px; gap: var(--sp-2); padding: 0 var(--sp-2); color: var(--text-muted); font-size: var(--fs-sm); }
 .visualize-title { margin-right: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .visualize-actions, .visualize-feedback-actions { display: flex; flex-shrink: 0; gap: var(--sp-2); flex-wrap: wrap; }
+.visualize-actions { align-items: center; flex-wrap: nowrap; gap: var(--sp-1); }
 .visualize-feedback-actions button { min-height: 44px; }
 button { border: 1px solid var(--border); border-radius: var(--radius-control); color: var(--text); background: var(--bg-hover); padding: var(--sp-1) var(--sp-2); cursor: pointer; }
 button:disabled { opacity: 0.5; cursor: default; }
 button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.visualize-icon { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; border-color: transparent; background: transparent; color: var(--text-muted); }
-.visualize-icon:hover, .visualize-icon[aria-expanded="true"] { background: var(--bg-hover); color: var(--text); }
+.visualize-icon { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 32px; height: 32px; padding: 0; border-color: transparent; border-radius: var(--radius-full); background: transparent; color: var(--text-muted); }
+.visualize-icon[aria-haspopup="menu"][aria-expanded="true"] { background: color-mix(in srgb, var(--bg-hover) 65%, transparent); color: var(--text); }
 .visualize-icon svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
-.visualize-icon span { font-size: var(--fs-xl); line-height: 1; }
+.visualize-icon .visualize-more-icon { fill: currentColor; stroke: none; }
 .visualize-menu-anchor { position: relative; }
 .visualize-menu { position: absolute; z-index: var(--z-dropdown, 50); top: calc(100% + var(--sp-1)); right: 0; width: 260px; max-width: calc(100vw - var(--sp-6)); padding: var(--sp-1); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); color: var(--text); background: var(--bg-surface); font-size: var(--fs-sm); }
 .visualize-menu-name { display: block; min-width: 0; padding: var(--sp-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); }
@@ -423,6 +471,8 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .visualize-surface :deep(iframe) { display: block; width: 100%; border: 0; }
 .visualize-proposal, .visualize-feedback { margin: 0; padding: var(--sp-3); overflow-wrap: anywhere; }
 .visualize-feedback p { margin: 0 0 var(--sp-2); }
+.visualize-loading { position: absolute; top: 32px; inset-inline: 0; }
+.visualize-export-error { color: var(--danger, var(--text)); }
 .visualize-error-detail { max-height: 120px; overflow: auto; color: var(--text-muted); font-size: var(--fs-sm); }
 .visualize-proposal { border-top: 1px solid var(--border); padding-bottom: calc(var(--sp-3) + env(safe-area-inset-bottom, 0px)); }
 .visualize-proposal > p { margin: 0 0 var(--sp-2); max-height: min(28dvh, 220px); overflow-y: auto; overscroll-behavior: contain; }
@@ -431,14 +481,16 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .visualize-context button { min-height: 44px; }
 .visualize-context-attached { width: 100%; margin: 0; color: var(--text-muted); font-size: var(--fs-sm); }
 .visualize-export-feedback { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-size: var(--fs-sm); }
-.visualize-export-feedback--error { color: var(--danger, var(--text)); }
 .visualize-canvas--expanded { position: fixed; inset: var(--sp-3); width: calc(100% - var(--sp-3) * 2); max-width: 1440px; max-height: calc(100dvh - var(--sp-3) * 2); margin: auto; overflow: auto; overscroll-behavior: contain; border-color: var(--border); background: var(--bg-surface); }
 .visualize-canvas--expanded::backdrop { background: color-mix(in srgb, var(--text) 35%, transparent); }
 @media (hover: hover) and (pointer: fine) {
+  .visualize-icon:hover { background: color-mix(in srgb, var(--bg-hover) 65%, transparent); color: var(--text); }
   .visualize-canvas:not(.visualize-canvas--expanded) .visualize-actions { opacity: 0; }
   .visualize-canvas:hover .visualize-actions, .visualize-canvas:focus-within .visualize-actions { opacity: 1; }
 }
-@media (pointer: coarse) { .visualize-icon { width: 44px; height: 44px; } }
+@media (pointer: coarse), (max-width: 480px) { .visualize-icon { width: 44px; height: 44px; } }
+@media (pointer: coarse), (max-width: 480px) { .visualize-loading { top: 44px; } }
+@media (max-width: 480px) { .visualize-canvas:not(.visualize-canvas--expanded) .visualize-actions { opacity: 1; } }
 @media (max-width: 480px) { .visualize-proposal .visualize-feedback-actions button { flex: 1 1 0; min-width: 0; } }
 @media (max-width: 480px) { .visualize-context button { width: 100%; } }
 </style>

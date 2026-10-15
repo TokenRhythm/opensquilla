@@ -11,6 +11,8 @@
   >
     <div class="chat-composer-inner">
       <slot name="context" />
+      <slot name="palette" />
+      <div ref="inputPanelEl" class="chat-input-panel">
       <div v-if="attachments.length > 0 || localPaths.length > 0" class="chat-collapse-region">
         <div class="chat-attachments">
           <div
@@ -141,17 +143,6 @@
           </div>
         </div>
       </div>
-      <div v-if="selectedSkills.length" class="chat-selected-skills" data-testid="selected-skills">
-        <span class="chat-selected-skills__label">{{ t('chat.skillPalette.thisMessage') }}</span>
-        <span v-for="skill in selectedSkills" :key="skill.instanceId" class="attachment-chip">
-          <span class="attachment-chip__name">/{{ skill.name }}</span>
-          <button type="button" class="attachment-action attachment-remove" :aria-label="t('chat.skillPalette.remove', { name: skill.name })" @click="emit('removeSkill', skill.instanceId)">
-            <Icon name="x" :size="12" />
-          </button>
-        </span>
-        <span v-if="isStreaming" class="chat-selected-skills__label">{{ t('chat.skillPalette.queuedHint') }}</span>
-      </div>
-      <div class="chat-input-panel">
         <div v-if="replanActive" class="chat-collapse-region">
           <div
             class="chat-replan-draft"
@@ -175,21 +166,26 @@
           </div>
         </div>
         <div class="chat-input-wrap">
-          <textarea
-            ref="textareaEl"
+          <ChatInlineEditor
+            ref="inlineEditor"
             v-model="inputText"
             class="chat-textarea"
-            rows="1"
+            :draft-key="draftKey"
+            :selected-skills="selectedSkills"
+            :skill-positions="skillPositions"
             :placeholder="placeholder"
             :disabled="inputDisabled"
-            maxlength="100000"
             :aria-label="t('chat.messageToSend')"
             :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
+            :aria-controls="paletteOpen ? 'chat-slash-options' : undefined"
+            :aria-expanded="paletteOpen"
+            :aria-activedescendant="paletteOpen ? `chat-slash-option-${paletteActiveIndex}` : undefined"
             @beforeinput="emit('expand'); emit('beforeinput', $event)"
             @input="onTextareaInput"
             @keydown="emit('keydown', $event)"
-            @compositionstart="emit('compositionChange', true)"
-            @compositionend="emit('compositionChange', false)"
+            @composition-change="emit('compositionChange', $event)"
+            @positions-change="emit('positionsChange', $event)"
+            @remove-skill="emit('removeSkill', $event)"
             @pointerdown="emit('expand')"
             @focus="emit('expand')"
           />
@@ -197,7 +193,7 @@
         <div class="chat-collapse-region chat-collapse-region--footer">
           <div class="chat-input-footer">
           <div class="chat-input-actions chat-input-actions--left">
-            <div ref="addMenuAnchorEl" class="chat-settings-anchor">
+            <div ref="addMenuAnchorEl" class="chat-settings-anchor chat-add-menu-anchor">
               <button
                 class="btn btn--icon btn--ghost chat-plus-btn"
                 :class="{ 'is-active': addMenuOpen }"
@@ -211,6 +207,11 @@
               </button>
               <ChatComposerAddMenu
                 v-if="addMenuOpen"
+                :skills="skillPaletteItems"
+                :composer-element="inputPanelEl"
+                :skills-loading="skillsLoading"
+                :skills-error="skillsError"
+                :selected-skills="selectedSkills"
                 :avoid-element="addMenuAvoidElement"
                 :attachments-disabled="replanActive"
                 :browser-use-available="browserUseAvailable === true"
@@ -223,12 +224,26 @@
                 :plan-mode-active="collaborationMode === 'plan'"
                 :plan-mode-available="planModeAvailable === true"
                 :plan-mode-busy="planModeBusy === true || planModeDisabled === true"
+                :show-utility-actions="true"
+                :voice-busy="voiceBusy"
+                :voice-ready="voiceReady"
+                :voice-recording="voiceRecording"
+                :prompt-cache-keepalive-available="promptCacheKeepaliveAvailable"
+                :prompt-cache-keepalive-session-ready="promptCacheKeepaliveSessionReady"
+                :prompt-cache-keepalive-status="promptCacheKeepaliveStatus"
                 @activate-goal-mode="emit('armGoal')"
                 @activate-plan-mode="emit('setCollaborationMode', 'plan')"
                 @attach-files="onAttachFiles"
                 @select-browser-use="emit('selectBrowserUse')"
+                @choose-skill="chooseMenuSkill"
+                @retry-skills="emit('openAddMenu')"
                 @reference-local-paths="chooseLocalFilePaths?.()"
-                @close="addMenuOpen = false"
+                @voice-input="emit('voiceInput')"
+                @voice-setup="emit('voiceSetup')"
+                @export-markdown="emit('exportMarkdown')"
+                @open-prompt-cache-keepalive="emit('openPromptCacheKeepalive')"
+                @refresh-prompt-cache-keepalive="emit('refreshPromptCacheKeepalive')"
+                @close="closeAddMenu"
               />
             </div>
             <div
@@ -262,11 +277,12 @@
               "
               type="button"
               class="chat-project-choose"
+              :aria-label="t('workspaces.chooseProject')"
               :disabled="projectBindingBusy"
               @click="emit('chooseProject')"
             >
               <Icon name="folder" :size="15" />
-              <span>{{ t('workspaces.chooseProject') }}</span>
+              <span class="chat-project-choose__label">{{ t('workspaces.chooseProject') }}</span>
               <Icon class="chat-project-choose__chevron" name="chevronDown" :size="12" />
             </button>
 
@@ -316,75 +332,6 @@
               :applies-next-turn="planModeAppliesNextTurn === true"
               @set-mode="emit('setCollaborationMode', $event)"
             />
-            <div ref="moreActionsAnchorEl" class="chat-settings-anchor chat-more-actions-anchor">
-              <button
-                class="btn btn--icon btn--ghost chat-more-actions-btn"
-                :class="{ 'is-active': moreActionsOpen }"
-                :title="t('chrome.more')"
-                :aria-label="t('chrome.more')"
-                aria-haspopup="menu"
-                :aria-expanded="moreActionsOpen ? 'true' : 'false'"
-                @click="toggleMoreActions"
-              >
-                <Icon name="moreHorizontal" :size="18" />
-              </button>
-              <div
-                v-if="moreActionsOpen"
-                class="chat-more-actions-menu"
-                role="menu"
-                :aria-label="t('chrome.more')"
-              >
-                <button
-                  type="button"
-                  role="menuitem"
-                  :class="{ 'is-active': voiceRecording, 'chat-mic--needs-setup': !voiceReady }"
-                  :title="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
-                  :aria-label="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
-                  :disabled="voiceBusy"
-                  @click="triggerVoice"
-                >
-                  <Icon name="microphone" :size="16" />
-                  <span>{{ voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint') }}</span>
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  :aria-label="t('chat.exportMarkdown')"
-                  @click="exportConversation"
-                >
-                  <Icon name="download" :size="16" />
-                  <span>{{ t('chat.exportMarkdown') }}</span>
-                </button>
-                <button
-                  v-if="promptCacheKeepaliveAvailable"
-                  type="button"
-                  role="menuitem"
-                  data-testid="chat-composer-action-keepalive"
-                  :title="promptCacheKeepaliveSessionReady
-                    ? t('chat.promptCacheKeepalive.action')
-                    : t('chat.promptCacheKeepalive.unavailableHint')"
-                  :aria-label="promptCacheKeepaliveAriaLabel"
-                  :disabled="!promptCacheKeepaliveSessionReady"
-                  @click="openPromptCacheKeepalive"
-                >
-                  <Icon name="clock" :size="16" />
-                  <span class="chat-more-actions-menu__copy">
-                    <span>{{ t('chat.promptCacheKeepalive.action') }}</span>
-                    <small v-if="!promptCacheKeepaliveSessionReady">
-                      {{ t('chat.promptCacheKeepalive.unavailableHint') }}
-                    </small>
-                    <small
-                      v-else-if="promptCacheKeepaliveStatusText"
-                      class="chat-more-actions-menu__keepalive-status"
-                      :data-state="promptCacheKeepaliveStatus?.state"
-                    >
-                      <span class="chat-more-actions-menu__status-dot" aria-hidden="true" />
-                      {{ promptCacheKeepaliveStatusText }}
-                    </small>
-                  </span>
-                </button>
-              </div>
-            </div>
           </div>
           <div class="chat-input-actions chat-input-actions--right">
             <div
@@ -529,6 +476,8 @@ import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import type { IconName } from '@/utils/icons'
 import ChatComposerAddMenu from '@/components/chat/ChatComposerAddMenu.vue'
 import ChatComposerGoalMode from '@/components/chat/ChatComposerGoalMode.vue'
+import ChatInlineEditor from '@/components/chat/ChatInlineEditor.vue'
+import type { ChatSlashCommand } from '@/composables/chat/useChatSlashCommands'
 import ChatComposerModelRouting from '@/components/chat/ChatComposerModelRouting.vue'
 import ChatComposerPlanMode from '@/components/chat/ChatComposerPlanMode.vue'
 import ChatComposerRunMode from '@/components/chat/ChatComposerRunMode.vue'
@@ -539,8 +488,8 @@ import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { CollaborationMode } from '@/types/plans'
-import type { PromptCacheKeepaliveStatus } from '@/types/promptCacheKeepalive'
 import type { PromptAnnotation } from '@/types/promptAnnotations'
+import type { PromptCacheKeepaliveStatus } from '@/types/promptCacheKeepalive'
 import { promptAnnotationTargetLabel } from '@/utils/chat/promptAnnotationPresentation'
 import {
   PROMPT_ANNOTATION_MAX_BODY_LENGTH,
@@ -556,12 +505,22 @@ interface ChatComposerExpose {
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
   showSendBlockedHint: () => void
+  editorElement: () => HTMLElement | null
+  getSelection: () => { start: number; end: number; length: number }
+  setSelectionRange: (start: number, end: number) => void
 }
 
 const props = withDefaults(defineProps<{
   /** Keep explicit message context visible when the floating input retracts. */
   hasContext?: boolean
   selectedSkills?: readonly SelectedSkillRef[]
+  skillPositions?: Readonly<Record<string, number>>
+  draftKey?: string
+  skillPaletteItems?: ChatSlashCommand[]
+  skillsLoading?: boolean
+  skillsError?: string
+  paletteOpen?: boolean
+  paletteActiveIndex?: number
   attachments: Attachment[]
   localPaths?: readonly string[]
   chooseAttachments?: () => Promise<boolean>
@@ -645,6 +604,9 @@ const props = withDefaults(defineProps<{
   floating: false,
   promptAnnotations: () => [],
   selectedSkills: () => [],
+  skillPaletteItems: () => [],
+  skillPositions: () => ({}),
+  draftKey: '',
   localPaths: () => [],
 })
 
@@ -655,6 +617,8 @@ const emit = defineEmits<{
   input: [event: Event]
   keydown: [event: KeyboardEvent]
   removeSkill: [instanceId: string]
+  selectSkill: [command: ChatSlashCommand]
+  positionsChange: [positions: Record<string, number>]
   removeAttachment: [index: number]
   removeLocalPath: [index: number]
   retryAttachment: [index: number]
@@ -745,33 +709,11 @@ useDocumentEvent('keydown', event => {
 const inputText = defineModel<string>({ required: true })
 watch([sendControlHint, inputText], () => { sendHintRequested.value = false })
 const composerEl = ref<HTMLElement | null>(null)
-const textareaEl = ref<HTMLTextAreaElement | null>(null)
-
+const inputPanelEl = ref<HTMLElement | null>(null)
+const inlineEditor = ref<InstanceType<typeof ChatInlineEditor> | null>(null)
+const textareaEl = computed(() => inlineEditor.value?.element() ?? null)
 function onTextareaInput(event: Event) {
-  // vModelText skips model updates while the element's internal IME
-  // composition flag is set (`if (e.target.composing) return` in
-  // @vue/runtime-dom). On Windows a paste can land while that flag is
-  // stale after a composition round-trip, leaving the model — and the
-  // send button's readiness — out of sync with what the textarea shows.
-  //
-  // A paste handler cannot repair this: in real browsers the paste event
-  // fires BEFORE the default insertion mutates the DOM, so any handler
-  // (or nextTick scheduled from it) still reads the empty value. The
-  // input event with inputType "insertFromPaste" fires AFTER the browser
-  // has written the pasted text, so syncing the model from the DOM at
-  // that stage restores readiness even when vModelText skipped the
-  // update. This is a no-op whenever v-model already picked up the
-  // change.
-  if (event instanceof InputEvent && event.inputType === 'insertFromPaste') {
-    const field = event.currentTarget
-    if (field instanceof HTMLTextAreaElement
-      && field === textareaEl.value
-      && inputText.value !== field.value) {
-      inputText.value = field.value
-    }
-  }
-  // Keep parent input consumers (auto-resize, slash commands, draft state)
-  // downstream of the reconciliation so they observe the pasted model.
+  // The inline editor reconciles DOM text before notifying consumers.
   emit('input', event)
 }
 
@@ -805,7 +747,6 @@ function openModelSettings() {
   closeModelRouting(false)
   emit('openModelSettings')
 }
-const moreActionsOpen = ref(false)
 const editingAnnotationId = ref('')
 const annotationDraftBody = ref('')
 const annotationInputEl = ref<HTMLInputElement[] | null>(null)
@@ -839,18 +780,6 @@ function saveAnnotationEdit(annotationId: string) {
   emit('updatePromptAnnotation', annotationId, body)
   cancelAnnotationEdit()
 }
-const promptCacheKeepaliveStatusText = computed(() => {
-  const status = props.promptCacheKeepaliveStatus
-  if (!status || status.state === 'off') return ''
-  return t(`chat.promptCacheKeepalive.states.${status.state}`)
-})
-const promptCacheKeepaliveAriaLabel = computed(() => {
-  const action = t('chat.promptCacheKeepalive.action')
-  return promptCacheKeepaliveStatusText.value
-    ? `${action}. ${promptCacheKeepaliveStatusText.value}`
-    : action
-})
-
 // "NEW" badge on the routing control — the single-model AI router is now the
 // default, so flag it until the user first opens the control, then never again.
 const ROUTER_NEW_BADGE_KEY = 'opensquilla.composer.routerNewBadgeSeen'
@@ -870,13 +799,11 @@ const runModeOpen = ref(false)
 const addMenuAnchorEl = ref<HTMLElement | null>(null)
 const modelRoutingAnchorEl = ref<HTMLElement | null>(null)
 const runModeAnchorEl = ref<HTMLElement | null>(null)
-const moreActionsAnchorEl = ref<HTMLElement | null>(null)
 
 const anyPopoverOpen = computed(() =>
   addMenuOpen.value
   || modelRoutingOpen.value
-  || runModeOpen.value
-  || moreActionsOpen.value,
+  || runModeOpen.value,
 )
 
 function eventInsideRoot(event: PointerEvent, root: HTMLElement | null): boolean {
@@ -889,12 +816,6 @@ function eventInsideRoot(event: PointerEvent, root: HTMLElement | null): boolean
 function closeOpenPopoversFromOutside(event: PointerEvent) {
   if (addMenuOpen.value && !eventInsideRoot(event, addMenuAnchorEl.value)) {
     addMenuOpen.value = false
-  }
-  if (
-    moreActionsOpen.value &&
-    !eventInsideRoot(event, moreActionsAnchorEl.value)
-  ) {
-    moreActionsOpen.value = false
   }
   if (modelRoutingOpen.value && !eventInsideRoot(event, modelRoutingAnchorEl.value)
     && !eventInsideRoot(event, modelRoutingPanelRef.value?.element() ?? null)) {
@@ -924,7 +845,6 @@ function toggleModelRouting() {
     emit('refreshModels')
     addMenuOpen.value = false
     runModeOpen.value = false
-    moreActionsOpen.value = false
   }
 }
 
@@ -935,7 +855,6 @@ function toggleRunMode() {
     emit('refreshRunModeAvailability')
     addMenuOpen.value = false
     modelRoutingOpen.value = false
-    moreActionsOpen.value = false
   }
 }
 
@@ -947,7 +866,6 @@ function closeAllPopovers() {
   addMenuOpen.value = false
   modelRoutingOpen.value = false
   runModeOpen.value = false
-  moreActionsOpen.value = false
 }
 
 // The retract animation collapses the footer with overflow clipping; any open
@@ -956,50 +874,27 @@ function closeAllPopovers() {
 watch(() => props.collapsed, (collapsed) => {
   if (collapsed) closeAllPopovers()
 })
-
-function toggleMoreActions() {
-  moreActionsOpen.value = !moreActionsOpen.value
-  if (moreActionsOpen.value) {
-    addMenuOpen.value = false
-    modelRoutingOpen.value = false
-    runModeOpen.value = false
-    if (
-      props.promptCacheKeepaliveAvailable
-      && props.promptCacheKeepaliveSessionReady
-    ) {
-      emit('refreshPromptCacheKeepalive')
-    }
-  }
-}
+watch(() => props.paletteOpen, open => { if (open) closeAllPopovers() })
+watch(() => props.draftKey, closeAllPopovers)
 
 function toggleAddMenu() {
   addMenuOpen.value = !addMenuOpen.value
   if (addMenuOpen.value) {
     emit('openAddMenu')
-    moreActionsOpen.value = false
     modelRoutingOpen.value = false
     runModeOpen.value = false
   }
 }
 
-function triggerVoice() {
-  moreActionsOpen.value = false
-  if (props.voiceReady) {
-    emit('voiceInput')
-  } else {
-    emit('voiceSetup')
-  }
+function closeAddMenu() {
+  if (!addMenuOpen.value) return
+  addMenuOpen.value = false
+  nextTick(() => addMenuAnchorEl.value?.querySelector<HTMLButtonElement>('button')?.focus({ preventScroll: true }))
 }
 
-function exportConversation() {
-  moreActionsOpen.value = false
-  emit('exportMarkdown')
-}
-
-function openPromptCacheKeepalive() {
-  if (!props.promptCacheKeepaliveSessionReady) return
-  moreActionsOpen.value = false
-  emit('openPromptCacheKeepalive')
+function chooseMenuSkill(command: ChatSlashCommand) {
+  addMenuOpen.value = false
+  emit('selectSkill', command)
 }
 
 function attachmentCanPreview(att: Attachment): boolean {
@@ -1078,12 +973,7 @@ function isTextareaFocused(): boolean {
 }
 
 function resizeTextarea() {
-  nextTick(() => {
-    const ta = textareaEl.value
-    if (!ta) return
-    ta.style.height = 'auto'
-    ta.style.height = Math.min(ta.scrollHeight, 160) + 'px'
-  })
+  nextTick(() => inlineEditor.value?.resize())
 }
 
 defineExpose<ChatComposerExpose>({
@@ -1093,6 +983,9 @@ defineExpose<ChatComposerExpose>({
   isTextareaFocused,
   resizeTextarea,
   showSendBlockedHint,
+  editorElement: () => textareaEl.value,
+  getSelection: () => ({ ...(inlineEditor.value?.getSelection() ?? { start: inputText.value.length, end: inputText.value.length }), length: inputText.value.length }),
+  setSelectionRange: (start, end) => { inlineEditor.value?.setSelectionRange(start, end) },
 })
 </script>
 
@@ -1123,6 +1016,7 @@ defineExpose<ChatComposerExpose>({
 }
 
 .chat-composer-inner {
+  position: relative;
   width: min(100%, var(--composer-col, 800px));
   margin: 0 auto;
 }
@@ -1237,8 +1131,8 @@ defineExpose<ChatComposerExpose>({
 .chat-attachments {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.375rem;
-  margin-bottom: 0.5rem;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem 0;
 }
 
 .chat-prompt-annotations {
@@ -1371,26 +1265,16 @@ defineExpose<ChatComposerExpose>({
 
 }
 
-.chat-selected-skills {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.375rem;
-  padding: 0.5rem 0.75rem;
-}
-
-.chat-selected-skills__label {
-  color: var(--text-muted);
-  font-size: 0.75rem;
-}
-
 .attachment-chip {
-  display: inline-flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 0.375rem;
-  padding: 0.25rem 0.5rem;
-  max-width: min(100%, 360px);
-  background: var(--bg-elevated);
+  column-gap: 0.5rem;
+  row-gap: 0.125rem;
+  padding: 0.5rem 0.625rem;
+  max-width: min(100%, 280px);
+  min-width: 0;
+  background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   font-size: 0.8125rem;
@@ -1446,14 +1330,15 @@ button.attachment-chip__primary:focus-visible {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
-  height: 16px;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
   color: var(--text-muted);
 }
 
 .attachment-chip__thumb {
-  width: 16px;
-  height: 16px;
+  width: 24px;
+  height: 24px;
   border-radius: var(--radius-sm);
   object-fit: cover;
 }
@@ -1477,8 +1362,11 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .attachment-chip__meta {
+  grid-column: 1;
+  grid-row: 2;
+  padding-left: 30px;
   color: var(--text-dim);
-  font-size: 0.6875rem;
+  font-size: 0.75rem;
   min-width: 0;
   max-width: 150px;
   overflow: hidden;
@@ -1490,16 +1378,26 @@ button.attachment-chip__primary:focus-visible {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  flex: 0 0 16px;
+  flex: 0 0 28px;
   padding: 0;
-  width: 16px;
-  height: 16px;
+  width: 28px;
+  height: 28px;
   background: none;
   border: none;
   cursor: pointer;
   color: var(--text-muted);
   font-size: 0.875rem;
 }
+
+.attachment-chip > .attachment-remove {
+  grid-column: 2;
+  grid-row: 1 / 3;
+}
+.attachment-chip > .attachment-action:not(.attachment-remove) {
+  grid-column: 3;
+  grid-row: 1 / 3;
+}
+.attachment-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 .attachment-action:hover {
   color: var(--text);
@@ -1509,7 +1407,7 @@ button.attachment-chip__primary:focus-visible {
   container: chat-composer / inline-size;
   display: flex;
   flex-direction: column;
-  min-height: 128px;
+  min-height: 112px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-modal);
   background: var(--bg-surface);
@@ -1590,7 +1488,7 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-composer--new-landing .chat-input-panel {
-  min-height: 168px;
+  min-height: 132px;
   border-color: var(--border);
   border-radius: var(--radius-modal);
   box-shadow: var(--shadow-lg);
@@ -1717,88 +1615,7 @@ button.attachment-chip__primary:focus-visible {
   position: relative;
   display: inline-flex;
 }
-
-.chat-more-actions-menu {
-  position: absolute;
-  z-index: 20;
-  bottom: calc(100% + 0.5rem);
-  left: 0;
-  width: max-content;
-  min-width: 210px;
-  padding: 0.375rem;
-  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
-  border-radius: var(--radius-lg);
-  background: color-mix(in srgb, var(--bg-surface) 96%, transparent);
-  box-shadow: var(--shadow-lg);
-  backdrop-filter: blur(16px);
-}
-
-.chat-more-actions-menu button {
-  display: flex;
-  align-items: center;
-  width: 100%;
-  min-height: 36px;
-  gap: 0.625rem;
-  padding: 0.5rem 0.625rem;
-  border: 0;
-  border-radius: var(--radius-control);
-  background: transparent;
-  color: var(--text-muted);
-  font: inherit;
-  font-size: var(--fs-sm);
-  text-align: left;
-  cursor: pointer;
-}
-
-.chat-more-actions-menu button:hover,
-.chat-more-actions-menu button:focus-visible,
-.chat-more-actions-menu button.is-active {
-  outline: 0;
-  background: var(--bg-hover);
-  color: var(--text);
-}
-
-.chat-more-actions-menu button:disabled {
-  cursor: default;
-  opacity: var(--state-disabled-opacity);
-}
-
-.chat-more-actions-menu__copy,
-.chat-more-actions-menu__copy small {
-  display: block;
-}
-
-.chat-more-actions-menu__copy small {
-  margin-top: 2px;
-  color: var(--text-dim);
-  font-size: var(--fs-xs);
-}
-
-.chat-more-actions-menu__keepalive-status {
-  align-items: center;
-  display: flex !important;
-  gap: 0.375rem;
-}
-
-.chat-more-actions-menu__status-dot {
-  width: 0.375rem;
-  height: 0.375rem;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: var(--text-dim);
-}
-
-.chat-more-actions-menu__keepalive-status[data-state='scheduled']
-  .chat-more-actions-menu__status-dot,
-.chat-more-actions-menu__keepalive-status[data-state='probing']
-  .chat-more-actions-menu__status-dot {
-  background: var(--accent);
-}
-
-.chat-more-actions-menu__keepalive-status[data-state='stopped']
-  .chat-more-actions-menu__status-dot {
-  background: var(--danger);
-}
+.chat-add-menu-anchor { position: static; }
 
 .chat-input-actions--left {
   flex: 1 1 auto;
@@ -1826,127 +1643,33 @@ button.attachment-chip__primary:focus-visible {
   }
 }
 
-/* At genuinely narrow widths the touch targets cannot share one row. Give
-   both rows the same full width so the fallback remains aligned instead of
-   leaving the routing/send cluster floating on a separate edge. */
-@container chat-composer (max-width: 26rem) {
-  .chat-input-footer {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 0.375rem;
-  }
-
-  .chat-input-footer > .chat-input-actions {
-    width: 100%;
-    flex: 0 0 auto;
-  }
-
-  .chat-input-footer > .chat-input-actions--left {
-    flex-wrap: wrap;
-    row-gap: 0.25rem;
-  }
-
-  .chat-input-footer > .chat-input-actions--right {
-    align-self: stretch;
-    margin-left: 0;
-    justify-content: space-between;
-  }
-
-  .chat-input-footer .chat-more-actions-anchor {
-    margin-left: auto;
-  }
-
-  .chat-input-footer .chat-more-actions-menu {
-    right: 0;
-    left: auto;
-  }
-}
-
-/* Let the actual controls determine whether another row is needed. A short
-   model name fits beside the left actions even in a split chat column. */
-@container chat-composer (min-width: 26rem) and (max-width: 36rem) {
-  .chat-input-footer {
-    flex-wrap: wrap;
-    gap: 0.375rem;
-  }
-
-  .chat-input-footer > .chat-input-actions--left {
-    flex-wrap: wrap;
-    row-gap: 0.25rem;
-  }
-
-  .chat-input-footer > .chat-input-actions--right {
-    flex-grow: 1;
-    justify-content: space-between;
-    margin-left: 0;
-  }
-
-  .chat-input-footer .chat-more-actions-anchor {
-    margin-left: auto;
-  }
-
-  .chat-input-footer .chat-more-actions-menu {
-    right: 0;
-    left: auto;
-  }
-}
-
-/* Anchor More to the footer at narrow widths so the menu stays inside the
-   composer regardless of which row contains its trigger. */
+/* Fit the actual chat column, including split views. Keep the writing controls
+   on one baseline; shorten labels before introducing a second toolbar row. */
 @container chat-composer (max-width: 36rem) {
-  .chat-input-footer {
-    position: relative;
-  }
-
-  .chat-more-actions-anchor {
-    position: static;
-  }
-
-  .chat-more-actions-menu {
-    left: auto;
-    right: 0.625rem;
-    max-width: calc(100% - 1.25rem);
-    min-width: 0;
-  }
-
-  .chat-more-actions-menu button > span,
-  .chat-more-actions-menu__copy {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-}
-
-@container chat-composer (max-width: 22rem) {
-  .chat-input-footer {
-    gap: 0.25rem;
-    padding-inline: 0.25rem;
-  }
-
-  .chat-input-actions--left {
-    gap: 0;
-  }
-
-  .chat-input-actions--right {
-    gap: 0;
-  }
-
-  /* At this width the labels cannot coexist with the touch targets. Keep
-     their accessible names and titles, but let the controls collapse to
-     their icons so the ordinary composer still has one stable row. */
+  .chat-input-footer { gap: 0.25rem; position: static; padding-inline: 0.5rem; }
+  .chat-input-actions--left { flex: 0 1 auto; gap: 0; }
+  .chat-input-actions--right { flex: 1 1 auto; min-width: 0; gap: 0.25rem; }
   .chat-run-mode-btn__label,
-  .chat-model-routing-btn__label {
-    display: none;
-  }
-
-  .chat-run-mode-btn,
-  .chat-model-routing-btn {
-    gap: 0.25rem;
-    padding-inline: 0.25rem;
-  }
+  .chat-project-choose__label,
+  .chat-project-choose__chevron,
+  .chat-project-chip > span { display: none; }
+  .chat-project-choose, .chat-project-chip { padding-inline: 0.375rem; }
+  .chat-model-routing-anchor { max-width: min(12rem, 100%); }
+  .chat-model-routing-btn { min-width: 0; }
+  .chat-model-routing-btn__default,
+  .chat-model-routing-btn__new { display: none; }
 }
-
+@container chat-composer (max-width: 23rem) {
+  .chat-input-footer { padding-inline: 0.25rem; }
+  .chat-model-routing-btn__label { max-width: 6rem; }
+  .chat-model-routing-btn { gap: 0.25rem; padding-inline: 0.25rem; }
+  .chat-project-choose { max-width: 44px; overflow: hidden; }
+}
+@media (pointer: coarse) {
+  .chat-plus-btn, .chat-run-mode-btn, .chat-project-choose,
+  .attachment-action { min-width: 44px; min-height: 44px; }
+  .chat-textarea { font-size: 1rem; }
+}
 .chat-input-wrap {
   flex: 1;
   min-width: 0;
@@ -1970,8 +1693,8 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-composer--new-landing .chat-textarea {
-  min-height: 108px;
-  padding: 1.25rem 1.5rem 0.5rem;
+  min-height: 80px;
+  padding: 1rem 1.25rem 0.5rem;
   font-size: 1rem;
 }
 
@@ -2001,16 +1724,6 @@ button.attachment-chip__primary:focus-visible {
 .btn--ghost.is-active {
   background: color-mix(in srgb, var(--ok) 12%, var(--bg-surface));
   color: var(--ok);
-}
-
-/* Voice not configured: keep the button clickable (it routes to setup) but
-   dim it so it still reads as "not active"; brighten on hover to invite it. */
-.chat-mic--needs-setup {
-  opacity: var(--state-disabled-opacity);
-}
-
-.chat-mic--needs-setup:hover {
-  opacity: 1;
 }
 
 .chat-model-routing-btn {

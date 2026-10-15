@@ -70,14 +70,27 @@ export function visualizeReceipts(calls: readonly ChatToolCall[]): VisualizeRece
   // A widget edit creates a new immutable revision but must replace the same
   // inline canvas. Keep only the latest receipt per stable widget/document.
   const receipts = new Map<string, VisualizeReceipt>()
+  const seen = new Set<string>()
   for (const call of calls) {
     const receipt = parseVisualizeReceipt(call)
     if (!receipt) continue
+    // Timeline and flat tool-call projections can contain the same receipt.
+    // Do not replay an older legacy receipt at the end of the combined list.
+    const publication = JSON.stringify([receipt.callId, receipt.documentId, receipt.revisionId, receipt.version])
+    if (seen.has(publication)) continue
+    seen.add(publication)
     // The document is the durable identity and remains stable across the
     // legacy no-widgetId receipts as well as the new widget registry field.
     const identity = `document:${receipt.documentId}`
     const previous = receipts.get(identity)
-    if (!previous || (receipt.version ?? 0) >= (previous.version ?? 0) || receipt.action === 'edit') receipts.set(identity, receipt)
+    // A known version wins over legacy ordering, regardless of show/edit.
+    // Keep the first receipt on a version tie; duplicates cannot change it.
+    // Only wholly unversioned history falls back to the supplied call order.
+    if (!previous
+      || (receipt.version === undefined && previous.version === undefined)
+      || (receipt.version !== undefined && (previous.version === undefined || receipt.version > previous.version))) {
+      receipts.set(identity, receipt)
+    }
   }
   return [...receipts.values()]
 }

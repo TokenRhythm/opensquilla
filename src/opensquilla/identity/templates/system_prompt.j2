@@ -79,6 +79,19 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 
 {% endif -%}
 
+{% if webui_rendering and prompt_mode == "full" -%}
+## Visual Presentation
+
+This WebUI renders fenced `mermaid`, `dot`, and `graphviz` blocks as diagrams.
+Use plain text, a table, or one of these diagrams when it sufficiently answers the request.
+{% if "show_widget" in tools -%}
+When an inline visual or interactive tool would explain it better, use `show_widget`.
+{% if "skill_view" in tools -%}
+Before creating a widget, read the `visualize` Skill if it is listed.
+{% endif -%}
+{% endif -%}
+
+{% endif -%}
 {% set has_publish_artifact = tools and "publish_artifact" in tools -%}
 {% set has_workspace_preview = tools and "open_workspace_preview" in tools -%}
 {% set has_file_authoring_tool = tools and ("write_file" in tools or "edit_file" in tools or "apply_patch" in tools or "execute_code" in tools) -%}

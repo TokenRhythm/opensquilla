@@ -54,9 +54,9 @@ describe('ChatComposer AI disclaimer', () => {
     expect(note?.getAttribute('role')).toBe('note')
     expect(note?.textContent).toBe('AI can make mistakes. Verify important information.')
 
-    const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')!
+    const textarea = el.querySelector<HTMLDivElement>('.chat-inline-editor')!
     textarea.focus()
-    textarea.value = 'Keep this draft'
+    textarea.textContent = 'Keep this draft'
     textarea.dispatchEvent(new Event('input', { bubbles: true }))
     await nextTick()
     expect(state.draft).toBe('Keep this draft')
