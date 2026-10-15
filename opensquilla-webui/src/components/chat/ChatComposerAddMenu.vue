@@ -136,7 +136,10 @@ const pluginItems = computed<ComposerCapabilityItem[]>(() => {
   if (props.browserUseAvailable && !items.some(item => item.skillName === 'browser-use')) {
     items.unshift({ key: 'browser', label: t('chat.composer.browserUse'), description: t('chat.composer.browserUseDescription'), icon: 'languages', badge: '[BETA]', skillName: 'browser-use' })
   }
-  return items.filter(item => slashSearchRank(query.value, [item.label, item.skillName || item.key], [item.description || '']) >= 0)
+  return items.filter((item, index) => {
+    const command = (props.skills || []).find(candidate => (candidate.skill?.instanceId || candidate.cmd) === item.key)
+    return slashSearchRank(query.value, [item.label, item.skillName || item.key, ...(command?.aliases || [])], [item.description || '', ...(command?.searchDescriptions || [])]) >= 0 || (index === 0 && item.key === 'browser' && !query.value.trim())
+  })
 })
 const promptCacheKeepaliveStatusText = computed(() => {
   const status = props.promptCacheKeepaliveStatus

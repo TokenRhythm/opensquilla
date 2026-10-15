@@ -72,9 +72,9 @@ describe('shared composer capability menus', () => {
     const input = host.querySelector<HTMLInputElement>('input')!
     input.focus()
     key(input, 'ArrowDown')
-    expect(document.activeElement?.getAttribute('data-skill-name')).toBe('visualize')
-    key(document.activeElement!, 'ArrowDown')
     expect(document.activeElement?.textContent).toContain('Plan mode')
+    key(document.activeElement!, 'ArrowDown')
+    expect(document.activeElement?.textContent).toContain('Goal mode')
     expect(key(document.activeElement!, 'Tab').defaultPrevented).toBe(false)
     key(document.activeElement!, 'Escape')
     expect(close).toHaveBeenCalledOnce()
