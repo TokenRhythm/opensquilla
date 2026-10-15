@@ -33,6 +33,12 @@ if (!Number.isInteger(outageMs) || outageMs < 5_000 || outageMs > 600_000) {
   throw new Error('outage-ms must be an integer between 5000 and 600000')
 }
 
+async function composerValue(locator) {
+  return await locator.evaluate((element) => {
+    const value = element?.value
+    return typeof value === 'string' ? value : element?.textContent ?? ''
+  })
+}
 async function waitFor(check, label, timeoutMs = 60_000) {
   const startedAt = Date.now()
   let lastError
@@ -452,7 +458,7 @@ try {
     'preload system-resume bridge')
   await delay(6_000)
   assert.equal(page.url(), resumeUrl, 'resume must not navigate or reload')
-  assert.equal(await composer.inputValue(), draft, 'resume must preserve the unsent draft')
+  assert.equal(await composerValue(composer), draft, 'resume must preserve the unsent draft')
   continuityDiagnostics = await readContinuityObservation(page, desktopApp)
   assert.equal(continuityDiagnostics.renderer?.state.sameComposer, true, 'resume must preserve composer identity')
   assert.equal(continuityDiagnostics.renderer?.state.focusedComposer, true, 'resume must preserve composer focus')
@@ -489,7 +495,7 @@ try {
       await waitFor(async () => await page.locator('[data-testid="connection-status"].connecting, [data-testid="chat-system-status-trigger"].connecting').count() > 0,
         'native suspect UI projection', 3_000)
       const suspectObservedMs = Date.now() - wakeStarted
-      assert.equal(await composer.inputValue(), draft, 'suspect must preserve draft')
+      assert.equal(await composerValue(composer), draft, 'suspect must preserve draft')
       await waitFor(async () => acceptedSockets > acceptedBefore
         && (await readDiagnostics()).some(entry => entry.phase === 'first_successful_rpc'),
       'wake replacement first successful RPC', 15_000)
@@ -517,7 +523,7 @@ try {
       }
       assert.ok(Date.now() - wakeStarted < 25_000, 'wake recovery should fit the candidate budget plus handshake')
       assert.equal(page.url(), resumeUrl, 'wake recovery must not reload renderer')
-      assert.equal(await composer.inputValue(), draft)
+      assert.equal(await composerValue(composer), draft)
       assert.equal(await page.evaluate(() => window.__stabilityComposer === document.querySelector('.chat-textarea')), true)
       wakeBlackholeEvidence = {
         topology: 'loopback', faultLayer: 'application-frame-route', physicalSleep: false,
@@ -553,7 +559,7 @@ try {
       await routedServers.get(client)?.close({ code: 1013, reason: 'Isolated network interruption' })
     }
     await delay(outageMs)
-    assert.equal(await composer.inputValue(), draft, 'offline editing must preserve the draft')
+    assert.equal(await composerValue(composer), draft, 'offline editing must preserve the draft')
     outage = false
     const recoverStarted = Date.now()
     await page.evaluate(() => window.dispatchEvent(new Event('online')))
@@ -561,7 +567,7 @@ try {
       'automatic warm recovery with no user action', 30_000)
     warmRecoveryMs = Date.now() - recoverStarted
     assert.equal(page.url(), resumeUrl)
-    assert.equal(await composer.inputValue(), draft)
+    assert.equal(await composerValue(composer), draft)
     continuityDiagnostics = await readContinuityObservation(page, desktopApp)
     assert.equal(continuityDiagnostics.renderer?.state.sameComposer, true, 'actual reconnect must preserve composer identity')
     assert.equal(continuityDiagnostics.renderer?.state.focusedComposer, true, 'actual reconnect must preserve composer focus')
@@ -667,7 +673,7 @@ try {
       console.log(JSON.stringify({ event: 'desktop_idle_send_phase', phase: 'hidden', backgroundMs }))
       await delay(backgroundMs)
       hiddenIdleMs = Date.now() - hiddenStarted
-      assert.equal(await composer.inputValue(), draft, 'hidden idle must retain the draft')
+      assert.equal(await composerValue(composer), draft, 'hidden idle must retain the draft')
       outage = false
     }
 
@@ -699,7 +705,7 @@ try {
       const sendButton = page.locator('.chat-send-btn.btn--primary')
       await waitFor(async () => !await sendButton.isDisabled(), 'send after native background return', 30_000)
       idleRecoveryMs = Date.now() - revealStarted
-      assert.equal(await composer.inputValue(), draft, 'native return must retain the unsent draft')
+      assert.equal(await composerValue(composer), draft, 'native return must retain the unsent draft')
       assert.equal(await page.evaluate(() => window.__stabilityComposer === document.querySelector('.chat-textarea')), true)
       await sendButton.click()
       await waitFor(() => idleSendReceipt, 'real Gateway background-return admission')
@@ -709,7 +715,7 @@ try {
       )?.includes('Synthetic background recovery complete.'), 'synthetic provider response')
       assert.equal(sentIdleMessages, 1, 'background return must submit the draft exactly once')
       assert.equal(syntheticProvider.chatRequests(), 1, 'accepted send must reach the local provider once')
-      assert.equal(await composer.inputValue(), '', 'accepted send must clear the draft')
+      assert.equal(await composerValue(composer), '', 'accepted send must clear the draft')
     }
 
     await desktopApp.evaluate(({ app, BrowserWindow }) => {

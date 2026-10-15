@@ -6,6 +6,7 @@ import {
 } from '@playwright/test'
 import { writeFile } from 'node:fs/promises'
 import { helloOkResponse } from './support/gateway-fixture'
+import { expectComposerValue } from './utils'
 
 import {
   chatHistoryPayload,
@@ -1080,7 +1081,7 @@ test('workspace navigation keeps one transport while the target subscription rec
   const composer = page.locator('.chat-textarea')
   const sendButton = page.locator('.chat-send-btn.btn--primary')
   await composer.fill(PRESERVED_DRAFT)
-  await expect(composer).toHaveValue(PRESERVED_DRAFT)
+  await expectComposerValue(composer, PRESERVED_DRAFT)
   await expect(sendButton).toBeDisabled()
 
   sockets[0]!.send(eventFrame('session.event.text_delta', {
@@ -1093,13 +1094,13 @@ test('workspace navigation keeps one transport while the target subscription rec
   await expect(page.getByText(STALE_A_TEXT, { exact: true })).toHaveCount(0)
 
   await expect(liveRecovery).toBeVisible()
-  await expect(composer).toHaveValue(PRESERVED_DRAFT)
+  await expectComposerValue(composer, PRESERVED_DRAFT)
 
   release('sessions.messages.subscribe', SESSION_B, subscriptionPayload(SESSION_B))
 
   await expect(liveRecovery).toHaveCount(0)
   await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
-  await expect(composer).toHaveValue(PRESERVED_DRAFT)
+  await expectComposerValue(composer, PRESERVED_DRAFT)
   await expect(sendButton).toBeEnabled()
   expect(sockets).toHaveLength(1)
 

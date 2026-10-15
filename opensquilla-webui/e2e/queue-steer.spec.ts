@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import { expectComposerValue } from './utils'
 
 import {
   chatHistoryPayload,
@@ -550,7 +551,7 @@ test.describe('Queue/Steer composer semantics', () => {
     await expect(card).toHaveCount(0)
     await expect(userBubble).toHaveCount(1)
     await expect(userBubble.locator('.msg-user-steer-status--applied')).toHaveText(/^(Steer|引导)$/)
-    await expect(composer).toHaveValue(unrelatedDraft)
+    await expectComposerValue(composer, unrelatedDraft)
     expect(state.steerRequests).toHaveLength(2)
     expect(state.receiptRequests).toHaveLength(1)
     expect(state.chatSendCalls).toBe(0)
@@ -660,7 +661,7 @@ test.describe('Queue/Steer composer semantics', () => {
     await expect(card).toContainText(steerText)
     await expect(card.getByRole('button', { name: STEER_ACTION_NAME })).toBeEnabled()
     await expect(card.getByRole('button', { name: /Retry|重试/ })).toHaveCount(0)
-    await expect(page.getByRole('textbox', { name: MESSAGE_TEXTBOX_NAME })).toHaveValue('')
+    await expectComposerValue(page.getByRole('textbox', { name: MESSAGE_TEXTBOX_NAME }), '')
     expect(state.chatSendCalls).toBe(0)
   })
 })

@@ -29,6 +29,7 @@ const i18n = createI18n({
           pluginsGroup: 'Plugins',
           browserUse: 'Browser Use',
           browserUseDescription: 'Use the browser to complete a task',
+          searchCapabilities: 'Search capabilities or actions',
         },
         referenceLocalPaths: 'Reference local path (no upload)',
         referenceLocalPathsHint: 'Only inserts paths; permissions still apply.',

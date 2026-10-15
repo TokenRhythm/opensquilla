@@ -7,6 +7,7 @@ import {
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+import { expectComposerValue } from './utils'
 
 const SESSION = 'agent:main:webchat:e2e-send-lifecycle'
 const GENERATION = 'send-lifecycle-generation'
@@ -261,7 +262,7 @@ for (const status of ['succeeded', 'failed', 'cancelled'] as const) {
       status === 'succeeded' ? 'Completed' : status === 'failed' ? 'Failed' : 'Interrupted',
     )
     await expect(send).toBeEnabled()
-    await expect(input).toHaveValue('Synthetic next request without changing projects.')
+    await expectComposerValue(input, 'Synthetic next request without changing projects.')
     await send.click()
     await expect.poll(() => gateway.sends.length).toBe(2)
     expect(gateway.sends[1]).toMatchObject({
@@ -309,7 +310,7 @@ test('pending admission is visible and a rejected send restores an editable retr
   await expect(page.locator('.chat-thread .msg-error__text')).toHaveText('This request did not finish.')
   await expect(page.locator('body')).not.toContainText(REJECTION)
   await expect(page.locator('body')).not.toContainText('SYNTHETIC_ADMISSION_FAILURE')
-  await expect(input).toHaveValue('Synthetic request to retry.')
+  await expectComposerValue(input, 'Synthetic request to retry.')
   await expect(send).toBeEnabled()
   await expect(page.locator('.chat-composer-send-pending')).toHaveCount(0)
   await expect(page.locator('.chat-send-tooltip')).toHaveCount(0)
@@ -338,7 +339,7 @@ for (const { changeAuthority, reload, label } of [
     await expect(send).toBeEnabled()
     await send.click()
     await expect(page.locator('.chat-pending-save-status')).toContainText('Saved locally')
-    await expect(input).toHaveValue('')
+    await expectComposerValue(input, '')
     expect(gateway.sends).toHaveLength(0)
     expect(gateway.enqueues).toHaveLength(0)
 
@@ -416,7 +417,7 @@ test('unified slash selects bilingual skills lazily and shows real load receipts
   expect(gateway.candidateCalls()).toBe(1)
   await input.fill('Analyze /SPREADSHEET')
   await page.locator('[role="option"][data-skill-name="xlsx"]').click()
-  await expect(input).toHaveValue('Analyze ')
+  await expectComposerValue(input, 'Analyze ')
   await expect(page.getByTestId('selected-skills')).toContainText('xlsx')
   await expect(page.getByTestId('selected-skills')).toHaveCSS('display', 'flex')
   await expect(page.getByTestId('selected-skills')).toHaveCSS('flex-wrap', 'wrap')
@@ -463,10 +464,10 @@ test('skill drafts survive refresh and narrow palettes preserve the surrounding 
   expect(bounds!.x).toBeGreaterThanOrEqual(0)
   expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(360)
   await input.press('Enter')
-  await expect(input).toHaveValue('Analyze  carefully')
+  await expectComposerValue(input, 'Analyze  carefully')
   await page.reload()
   await expect(page.getByTestId('selected-skills')).toContainText('xlsx')
-  await expect(input).toHaveValue('Analyze  carefully')
+  await expectComposerValue(input, 'Analyze  carefully')
   expect(gateway.sends).toHaveLength(0)
   await page.getByRole('button', { name: 'Remove xlsx from this message' }).click()
   await expect(page.getByTestId('selected-skills')).toHaveCount(0)

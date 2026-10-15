@@ -19,6 +19,13 @@ import {
   electronProcessSnapshot,
 } from './packaged-first-send-cleanup.mjs'
 
+async function composerValue(locator) {
+  return await locator.evaluate((element) => {
+    const value = element?.value
+    return typeof value === 'string' ? value : element?.textContent ?? ''
+  })
+}
+
 const LONG_SESSION_MESSAGE_COUNT = 320
 const TERMINAL_RECOVERY_TIMEOUT_MS = 35_000
 const SESSION_RECOVERY_TIMEOUT_MS = 30_000
@@ -491,7 +498,7 @@ try {
   )
   assert.equal(await composer.isEditable(), true, 'composer must stay editable during recovery')
   await composer.fill(preservedDraft)
-  assert.equal(await composer.inputValue(), preservedDraft)
+  assert.equal(await composerValue(composer), preservedDraft)
   const recoveryUrl = page.url()
   const retainedComposer = await composer.elementHandle()
   assert.ok(retainedComposer, 'the existing composer must be mounted before recovery')
@@ -532,7 +539,7 @@ try {
   assert.ok(heldHistoryRequests > 0, 'history hang was not exercised')
   assert.ok(heldSubscribeRequests > 0, 'live subscription hang was not exercised')
   assert.equal(await composer.isEditable(), true)
-  assert.equal(await composer.inputValue(), preservedDraft)
+  assert.equal(await composerValue(composer), preservedDraft)
   assert.equal(await sendButton.isDisabled(), true, 'live degraded state must fail closed')
   assert.equal(await page.locator('[data-testid="chat-session-recovery-status"]').count(), 1,
     'concurrent domain failures must share one non-blocking recovery notice')
@@ -560,7 +567,7 @@ try {
     SESSION_RECOVERY_TIMEOUT_MS,
   )
 
-  assert.equal(await composer.inputValue(), preservedDraft)
+  assert.equal(await composerValue(composer), preservedDraft)
   assert.equal(await recoveredMessage.isVisible(), true)
   assert.equal(page.url(), recoveryUrl, 'automatic recovery must not navigate the page')
   assert.equal(await composer.evaluate((node, original) => node === original, retainedComposer), true,
@@ -611,7 +618,7 @@ try {
     }, 'the recovered session to consume a new live streamed reply', SESSION_RECOVERY_TIMEOUT_MS)
     assert.equal((await reply.innerText()).trim(), recoveredReply,
       'the streamed answer must contain the provider text exactly once')
-    assert.equal(await composer.inputValue(), '', 'only the explicit send may consume the draft')
+    assert.equal(await composerValue(composer), '', 'only the explicit send may consume the draft')
     provider.finish()
     await waitFor(async () => {
       if (await sendButton.isDisabled() || await reply.count() !== 1) return false

@@ -20,6 +20,13 @@ if (outputDir) await mkdir(outputDir, { recursive: true })
 const fixtureAnswer = 'FIRST_CHAT_LOCAL_FIXTURE_OK'
 const fixtureModel = 'gpt-4o-mini'
 const syntheticKey = 'sk-local-first-chat-fixture-only'
+async function composerValue(locator) {
+  return await locator.evaluate((element) => {
+    const value = element?.value
+    return typeof value === 'string' ? value : element?.textContent ?? ''
+  })
+}
+
 const draft = 'Reply with the fixture confirmation. Do not call any tools.'
 const userDataRoot = await mkdtemp(join(tmpdir(), 'opensquilla-first-chat-'))
 const isolatedHome = join(userDataRoot, 'home')
@@ -182,7 +189,7 @@ try {
   await settings.getByRole('button', { name: /^(Close|关闭)$/ }).click()
   await settings.waitFor({ state: 'hidden' })
   await notice.waitFor({ state: 'hidden', timeout: 30_000 })
-  assert.equal(await composer.inputValue(), draft, 'settings must retain the existing composer draft')
+  assert.equal(await composerValue(composer), draft, 'settings must retain the existing composer draft')
   await screenshot('03-configured-draft-preserved')
   complete('settings UI saves the local provider without a connection test and preserves the draft')
 

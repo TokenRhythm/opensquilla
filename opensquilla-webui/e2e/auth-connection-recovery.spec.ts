@@ -5,6 +5,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { helloOkResponse } from './support/gateway-fixture'
+import { expectComposerValue } from './utils'
 
 const TOKEN = 'synthetic-browser-gateway-token'
 
@@ -152,7 +153,7 @@ for (const lateHello of [false, true]) {
       }
       await expect.poll(() => wire.hellos.length).toBe(1)
       await expect(send).toBeEnabled()
-      await expect(input).toHaveValue('Synthetic guest draft retained through its first handshake.')
+      await expectComposerValue(input, 'Synthetic guest draft retained through its first handshake.')
       const owner = wire.hellos[0].principal.guestOwnerId
       expect(owner).toMatch(/^[0-9a-f]{64}$/)
       const subscriptions = () => wire.sent.filter(item => item.method === 'sessions.messages.subscribe')
@@ -165,7 +166,7 @@ for (const lateHello of [false, true]) {
       expect((await request.post(`${gateway.httpUrl}/reconnect`)).ok()).toBe(true)
       await expect.poll(() => wire.hellos.length).toBe(2)
       await expect(send).toBeEnabled()
-      await expect(input).toHaveValue('Synthetic guest draft retained through its first handshake.')
+      await expectComposerValue(input, 'Synthetic guest draft retained through its first handshake.')
       expect(subscriptions().at(-1)!.sessionKey).toBe(key)
       expect(wire.hellos[1].principal.guestOwnerId).toBe(owner)
       expect(wire.connections).toBe(2)

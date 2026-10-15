@@ -33,6 +33,13 @@ import {
 } from './packaged-first-send-evidence.mjs'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 
+async function composerValue(locator) {
+  return await locator.evaluate((element) => {
+    const value = element?.value
+    return typeof value === 'string' ? value : element?.textContent ?? ''
+  })
+}
+
 const DEFAULT_ITERATIONS = 20
 const SEND_TIMEOUT_MS = 45_000
 const INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS = DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + SEND_TIMEOUT_MS
@@ -464,7 +471,7 @@ try {
 
     const firstMessage = `Synthetic first send ${String(iteration).padStart(2, '0')}`
     await composer.fill(firstMessage)
-    assert.equal(await composer.inputValue(), firstMessage, 'first message must reach the composer before clicking send')
+    assert.equal(await composerValue(composer), firstMessage, 'first message must reach the composer before clicking send')
     const sendButton = page.locator('.chat-send-btn.btn--primary')
     await waitFor(async () => await sendButton.count() === 1 && !await sendButton.isDisabled(), 'enabled first send')
     const landingHeaderIdentity = await establishStableHeaderIdentity(header, iteration)
@@ -502,7 +509,7 @@ try {
 
     const followupMessage = `Synthetic follow-up ${String(iteration).padStart(2, '0')}`
     await composer.fill(followupMessage)
-    assert.equal(await composer.inputValue(), followupMessage, 'follow-up must reach the composer before clicking send')
+    assert.equal(await composerValue(composer), followupMessage, 'follow-up must reach the composer before clicking send')
     await page.locator('.chat-send-btn.btn--primary').click()
     await waitFor(
       () => observedChatSendCount(page, followupMessage).then(count => count === 1),

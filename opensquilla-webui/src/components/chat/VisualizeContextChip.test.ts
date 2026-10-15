@@ -22,7 +22,7 @@ it('shows, inspects and removes context without replacing the user question or h
   }, { context: () => h(VisualizeContextChip, { snapshot: context.value, onRemove: remove }) }) })
   apps.push(app); app.use(i18n); app.mount(host); await nextTick()
   expect(host.querySelector('.chat-composer--collapsed')).toBeNull()
-  expect(host.querySelector('textarea')?.value).toBe('Keep my existing question')
+  expect(host.querySelector<HTMLElement>('.chat-inline-editor')?.textContent).toBe('Keep my existing question')
   const chip = host.querySelector('[data-testid="visualize-context-chip"]')!
   const details = chip.querySelector<HTMLButtonElement>('button')!
   expect(details.getAttribute('aria-expanded')).toBe('false')

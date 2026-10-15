@@ -7,6 +7,7 @@ import {
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+import { expectComposerValue } from './utils'
 
 const SESSION = 'agent:main:webchat:legacy-ensemble-new-task'
 const TITLE = 'Synthetic legacy ensemble task'
@@ -255,7 +256,7 @@ test('New Task removes ensemble DOM after a late legacy progress from an earlier
       expect(draft.raw!.streaming).toBe(false)
     }
     await expect(page.locator('.router-fx')).toHaveCount(0)
-    await expect(page.locator('.chat-textarea')).toHaveValue('')
+    await expectComposerValue(page.locator('.chat-textarea'), '')
 
     // Release the previous task's actual outstanding history replies, then
     // deliver more old-session events after the draft has taken ownership.

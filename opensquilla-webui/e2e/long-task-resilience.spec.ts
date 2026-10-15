@@ -15,6 +15,7 @@ import {
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+import { expectComposerValue } from './utils'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-long-task-resilience'
@@ -370,7 +371,7 @@ test.describe('0.5.0 long-task resilience', () => {
     await expect(page.getByRole('button', { name: 'Stop current response' })).toHaveCount(0)
     await expect(page.locator('.assistant-activity--live')).toHaveCount(0)
     await expect(page.getByText('Working', { exact: true })).toHaveCount(0)
-    await expect(composer).toHaveValue(draft)
+    await expectComposerValue(composer, draft)
     expect(sends).toEqual([])
     expect(pushedEvents).not.toContain('session.event.done')
     expect(pushedEvents).not.toContain('task.succeeded')
@@ -521,7 +522,7 @@ test.describe('0.5.0 long-task resilience', () => {
     // Even a dispatched click bypassing the browser's disabled control must
     // not issue a cancellation without renewed server task ownership.
     await stop.dispatchEvent('click')
-    await expect(composer).toHaveValue('Draft retained while this session reconnects')
+    await expectComposerValue(composer, 'Draft retained while this session reconnects')
     expect(composerCommands).toEqual([])
 
     const release = releaseReplacementSubscription
@@ -529,7 +530,7 @@ test.describe('0.5.0 long-task resilience', () => {
     release()
     await expect(recoveringSession).toHaveCount(0, { timeout: 2_000 })
     await expect(stop).toBeEnabled()
-    await expect(page.locator('.chat-textarea')).toHaveValue('Draft retained while this session reconnects')
+    await expectComposerValue(page.locator('.chat-textarea'), 'Draft retained while this session reconnects')
 
     const firstTokenAt = performance.now()
     sockets[1]!.send(eventFrame('session.event.text_delta', {
@@ -1185,7 +1186,7 @@ test.describe('0.5.0 long-task resilience', () => {
     for (const sample of samples) {
       expectedDraft += sample
       await composer.pressSequentially(sample, { delay: 6 })
-      await expect(composer).toHaveValue(expectedDraft)
+      await expectComposerValue(composer, expectedDraft)
       await page.waitForTimeout(600)
     }
 
@@ -1286,7 +1287,7 @@ test.describe('0.5.0 long-task resilience', () => {
       text_snapshot: markdownPayload,
     })
     await terminalTyping
-    await expect(composer).toHaveValue(expectedDraft)
+    await expectComposerValue(composer, expectedDraft)
     await expect(page.locator('.streaming-text-part')).toHaveCount(0, { timeout: 10_000 })
     await page.waitForTimeout(500)
     const scrollTopAfterTerminal = await thread.evaluate(element => element.scrollTop)
@@ -1727,7 +1728,7 @@ test.describe('0.5.0 long-task resilience', () => {
     await composer.fill(queuedText)
     await composer.press('Enter')
     await expect(page.locator('.chat-pending-card').filter({ hasText: queuedText })).toBeVisible()
-    await expect(composer).toHaveValue('')
+    await expectComposerValue(composer, '')
     await expect.poll(() => enqueueCalls).toBe(1)
     await expect.poll(() => row?.message || '').toBe(queuedText)
     await expect.poll(() => row?.attachments.length || 0).toBe(1)

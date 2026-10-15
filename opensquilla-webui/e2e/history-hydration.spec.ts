@@ -6,6 +6,7 @@ import {
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+import { expectComposerValue } from './utils'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-history-hydration'
@@ -256,7 +257,7 @@ async function checkDelayedStartup(page: Page, detachedMetadata: boolean) {
   ).toBeVisible()
   await expect(composer).toBeEditable()
   await composer.fill('Draft remains editable while history loads.')
-  await expect(composer).toHaveValue('Draft remains editable while history loads.')
+  await expectComposerValue(composer, 'Draft remains editable while history loads.')
   await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled()
   await expect(page.locator('.chat-empty')).toHaveCount(0)
   // The surviving session menu must stay interactive while history hydrates.
@@ -274,7 +275,7 @@ async function checkDelayedStartup(page: Page, detachedMetadata: boolean) {
   await expect(page.getByText('Hydration complete.')).toBeVisible()
   await expect(hiddenRecovery).toHaveCount(0)
   await expect(page.getByTestId('history-load-sentinel')).toBeAttached()
-  await expect(composer).toHaveValue('')
+  await expectComposerValue(composer, '')
   await expect.poll(() => page.evaluate(() => {
     const state = (window as unknown as {
       __opensquillaHistoryHydrationTest?: { emptySeen?: boolean }
@@ -377,14 +378,14 @@ test('keeps timed-out optional metadata request-local and sends on the same sock
   await page.clock.runFor(10_100)
   expect(socketCount).toBe(1)
   await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
-  await expect(composer).toHaveValue('Send while optional metadata is unavailable.')
+  await expectComposerValue(composer, 'Send while optional metadata is unavailable.')
   await expect(composer).toBeFocused()
   await expect(send).toBeEnabled()
   await send.click()
 
   await expect.poll(() => chatSendSocket).toBe(1)
   expect(socketCount).toBe(1)
-  await expect(composer).toHaveValue('')
+  await expectComposerValue(composer, '')
 })
 
 test('recovers initial history failure automatically without stealing draft focus', async ({ page }) => {
@@ -475,13 +476,13 @@ test('recovers initial history failure automatically without stealing draft focu
   await expect(retrying).toContainText('Reloading conversation history…')
   await expect(thread).toHaveAttribute('aria-busy', 'false')
   await expect(composer).toBeFocused()
-  await expect(composer).toHaveValue('Keep editing while history recovers.')
+  await expectComposerValue(composer, 'Keep editing while history recovers.')
 
   releaseRetry?.()
   await expect(page.getByText('History recovered after retry.')).toBeVisible()
   await expect(retrying).toHaveCount(0)
   await expect(composer).toBeFocused()
-  await expect(composer).toHaveValue('Keep editing while history recovers.')
+  await expectComposerValue(composer, 'Keep editing while history recovers.')
   expect(socketCount).toBe(1)
 })
 
@@ -714,7 +715,7 @@ test('recovers stalled history and live hydration in place despite ongoing ticks
   await expect(thread).toHaveAttribute('aria-busy', 'false')
   await expect(composer).toBeEditable()
   await composer.fill('Keep this draft through timeout and reconnect.')
-  await expect(composer).toHaveValue('Keep this draft through timeout and reconnect.')
+  await expectComposerValue(composer, 'Keep this draft through timeout and reconnect.')
 
   faultInjected = true
   await disconnectSeedSocket?.()
@@ -752,7 +753,7 @@ test('recovers stalled history and live hydration in place despite ongoing ticks
   await expect(recoveryNotice.getByTestId('chat-session-recovery-dismiss')).toBeVisible()
   await expect(thread).toHaveAttribute('aria-busy', 'false')
   await expect(composer).toBeEditable()
-  await expect(composer).toHaveValue('Keep this draft through timeout and reconnect.')
+  await expectComposerValue(composer, 'Keep this draft through timeout and reconnect.')
   await expect(page.getByText(retainedTail)).toBeVisible()
   await expect(send).toBeDisabled()
   expect(socketCount).toBe(2)
@@ -772,14 +773,14 @@ test('recovers stalled history and live hydration in place despite ongoing ticks
   expect(recoveredHistorySocket).toBe(2)
   expect(recoveredHistoryWindows).toContainEqual({ requested: 200, returned: 200 })
   expect(recoveredHistoryWindows.every(window => window.returned <= window.requested)).toBe(true)
-  await expect(composer).toHaveValue('Keep this draft through timeout and reconnect.')
+  await expectComposerValue(composer, 'Keep this draft through timeout and reconnect.')
 
   expect(recoveredSubscribeSocket).toBe(2)
   expect(socketCount).toBe(2)
   await expect(recoveryNotice).toHaveCount(0)
   await expect(send).toBeEnabled()
   await expect(page.getByText(retainedTail)).toBeVisible()
-  await expect(composer).toHaveValue('Keep this draft through timeout and reconnect.')
+  await expectComposerValue(composer, 'Keep this draft through timeout and reconnect.')
   await expect(composer).toBeFocused()
   expect(reconnectMethods.filter(method => method === 'config.get')).toHaveLength(1)
   expect(reconnectMethods.indexOf('config.get')).toBeGreaterThan(reconnectMethods.indexOf('chat.history'))

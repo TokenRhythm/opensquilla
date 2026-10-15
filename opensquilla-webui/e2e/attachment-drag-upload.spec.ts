@@ -1,5 +1,6 @@
 import { expect, test, type Download, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import { expectComposerValue } from './utils'
 import {
   chatHistoryPayload,
   sessionMessagesHydratePayload,
@@ -520,7 +521,7 @@ test.describe('attachment drag upload', () => {
       await dropFiles(page, [{ name: 'draft.txt', type: 'text/plain', text: 'recover these attachment bytes' }])
       await expect(page.locator('.attachment-chip')).toContainText('draft.txt')
       if (newTask) {
-        await expect(page.locator('.chat-textarea')).toHaveValue('')
+        await expectComposerValue(page.locator('.chat-textarea'), '')
         await expect.poll(() => page.evaluate(() => window.history.state.draftHasAttachments)).toBe(true)
       }
       await expect(page.locator('.attachment-chip--busy')).toHaveCount(0)
@@ -709,7 +710,7 @@ test.describe('attachment drag upload', () => {
 
     await page.keyboard.press(shortcut)
     await expect(page).toHaveURL(draftUrl)
-    await expect(page.locator('.chat-textarea')).toHaveValue('')
+    await expectComposerValue(page.locator('.chat-textarea'), '')
     await expect(preview).toHaveCount(0)
     await expect(page.locator('.attachment-chip')).toHaveCount(0)
     await expect(page.locator('.chat-textarea')).toBeFocused()

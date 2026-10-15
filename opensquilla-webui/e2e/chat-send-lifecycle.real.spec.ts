@@ -1,4 +1,5 @@
 import { expect, test } from './real-gateway.fixture'
+import { expectComposerValue } from './utils'
 
 test('real Gateway accepts the next chat turn without changing sessions', async ({
   page,
@@ -29,7 +30,7 @@ test('real Gateway accepts the next chat turn without changing sessions', async 
   )
   await expect(stop).toHaveCount(0)
   await expect(send).toBeEnabled()
-  await expect(input).toHaveValue('Continue with a second synthetic chat turn.')
+  await expectComposerValue(input, 'Continue with a second synthetic chat turn.')
   const sessionUrl = page.url()
 
   await send.click()

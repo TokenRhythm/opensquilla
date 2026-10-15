@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { expectComposerValue } from './utils'
 
 const CONTROL_URL = '/control/chat/new'
 
@@ -24,7 +25,7 @@ test('clipboard paste restores send readiness after stale IME composition', asyn
   await textarea.dispatchEvent('compositionstart')
   await page.keyboard.press('ControlOrMeta+V')
 
-  await expect(textarea).toHaveValue(pastedText)
+  await expectComposerValue(textarea, pastedText)
   await expect(sendButton).toHaveClass(/is-ready/)
 })
 
@@ -45,7 +46,7 @@ test('long plain-text clipboard paste becomes a pasted-text attachment', async (
   const chip = page.locator('.attachment-chip')
   await expect(chip).toHaveCount(1)
   await expect(chip).toContainText('Pasted text')
-  await expect(textarea).toHaveValue('')
+  await expectComposerValue(textarea, '')
 })
 
 test('post-insertion paste fallback attaches text before send', async ({ page }) => {
@@ -71,5 +72,5 @@ test('post-insertion paste fallback attaches text before send', async ({ page })
   const chip = page.locator('.attachment-chip')
   await expect(chip).toHaveCount(1)
   await expect(chip).toContainText('Pasted text')
-  await expect(textarea).toHaveValue(instruction)
+  await expectComposerValue(textarea, instruction)
 })
