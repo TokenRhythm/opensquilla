@@ -83,4 +83,27 @@ describe('workspace files HTTP adapter', () => {
     http.requestJson.mockResolvedValue({ workspaceBinding: 'binding-A', files: [{ ...file, kind: 'image' }] })
     expect((await access.resolve('session-A', [file.requestedPath]))[0].kind).toBe('download')
   })
+
+  it('lists validated directory pages and carries the workspace binding forward', async () => {
+    const { access, http } = fixture()
+    http.requestJson.mockResolvedValue({
+      workspaceBinding: 'binding-A', relativePath: '', nextCursor: '2', hasMore: true, truncated: false,
+      entries: [{ name: 'src', path: 'src', type: 'directory', kind: 'directory', mime: '', size: null, mtimeNs: '1' }],
+    })
+    const page = await access.listDir!('session-A', '', '0', 1, '', new AbortController().signal)
+    expect(page.entries[0]).toMatchObject({ path: 'src', type: 'directory' })
+    const [endpoint, options] = http.requestJson.mock.calls[0]
+    expect(endpoint).toContain('/api/v1/workspace-files/list?')
+    expect(new URL(endpoint, 'https://gateway.test').searchParams.get('limit')).toBe('1')
+    expect(options).toMatchObject({ method: 'GET', sessionKey: 'session-A' })
+  })
+
+  it('rejects unsafe directory entries', async () => {
+    const { access, http } = fixture()
+    http.requestJson.mockResolvedValue({
+      workspaceBinding: 'binding-A', relativePath: '', nextCursor: null, hasMore: false, truncated: false,
+      entries: [{ name: 'bad', path: '../bad', type: 'file', kind: 'text', mime: 'text/plain', size: 1, mtimeNs: '1' }],
+    })
+    await expect(access.listDir!('session-A')).rejects.toThrow()
+  })
 })

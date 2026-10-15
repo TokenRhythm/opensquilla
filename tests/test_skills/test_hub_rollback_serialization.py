@@ -141,10 +141,48 @@ async def test_rollback_serializes_next_writer_and_committed_reader(
 
     monkeypatch.setattr(service._loader, "reload_verified", reject_first)
     monkeypatch.setattr(management, "recover_pending_skill_transaction", gated_recovery)
-    first_id, first = _start(service, operation)
-    pending = [first]
+    first_waiting, writer_waiting, reader_waiting = (
+        asyncio.Event(), asyncio.Event(), asyncio.Event()
+    )
+    acquire = service._mutation_lock.acquire
+    first_id = second_id = ""
+    acquired: list[str] = []
+
+    async def observe_acquire():
+        task = asyncio.current_task()
+        assert task is not None
+        name = task.get_name()
+        if name == f"skill-install-{first_id}":
+            first_waiting.set()
+        elif name == f"skill-install-{second_id}":
+            writer_waiting.set()
+        elif name == "committed-reader":
+            reader_waiting.set()
+        result = await acquire()
+        acquired.append(name)
+        return result
+
+    monkeypatch.setattr(service._mutation_lock, "acquire", observe_acquire)
+    pending = []
+    setup_lock_held = False
     try:
+        # Queue both real writers before starting the rollback gate's clock.
+        # Candidate/receipt I/O is preparation, not the contention under test.
+        await acquire()
+        setup_lock_held = True
+        first_id, first = _start(service, operation)
+        pending.append(first)
+        await asyncio.wait_for(first_waiting.wait(), 5)
+        second_id, second = _start(service, "install", "second")
+        pending.append(second)
+        await asyncio.wait_for(writer_waiting.wait(), 5)
+        assert acquired == []
+        assert not first.done() and not second.done()
+        service._mutation_lock.release()
+        setup_lock_held = False
+
         await _thread_started(postflight)
+        assert acquired == [f"skill-install-{first_id}"]
         owner = service.install_operations.tasks[("test-owner", first_id)]
         if cancelled:
             owner.cancel("original cancellation")
@@ -154,21 +192,6 @@ async def test_rollback_serializes_next_writer_and_committed_reader(
             owner.cancel("repeated cancellation")
             await asyncio.sleep(0)
             assert not owner.done()
-        writer_waiting, reader_waiting = asyncio.Event(), asyncio.Event()
-        acquire = service._mutation_lock.acquire
-        second_id = ""
-
-        async def observe_acquire():
-            task = asyncio.current_task()
-            if task.get_name() == f"skill-install-{second_id}":
-                writer_waiting.set()
-            elif task.get_name() == "committed-reader":
-                reader_waiting.set()
-            return await acquire()
-
-        monkeypatch.setattr(service._mutation_lock, "acquire", observe_acquire)
-        second_id, second = _start(service, "install", "second")
-
         async def read_committed():
             async with service.committed_store_read():
                 _assert_previous(service, loader, operation)
@@ -176,12 +199,12 @@ async def test_rollback_serializes_next_writer_and_committed_reader(
                 assert (loader.get_by_name("second") is not None) == (second_entry is not None)
 
         reader = asyncio.create_task(read_committed(), name="committed-reader")
-        pending.extend((second, reader))
-        await asyncio.wait_for(writer_waiting.wait(), 5)
+        pending.append(reader)
         await asyncio.wait_for(reader_waiting.wait(), 5)
         assert not reader.done(), "committed reads must wait for disk and catalog rollback"
         assert not second.done()
         assert service._mutation_lock.locked()
+        assert acquired == [f"skill-install-{first_id}"]
         assert loader._publication_barrier_depth == 1
         journal = SkillTransactionJournal.load(service.journal_path)
         assert journal is not None and journal.install_operation_id == first_id
@@ -200,6 +223,9 @@ async def test_rollback_serializes_next_writer_and_committed_reader(
         assert (service.managed_dir / "second" / "SKILL.md").is_file()
         assert Lockfile.load(service.lockfile_path).get("second") is not None
         assert loader.get_by_name("second") is not None
+        assert acquired == [
+            f"skill-install-{first_id}", f"skill-install-{second_id}", "committed-reader",
+        ]
         first_receipt = await service.install_operations.store.read_async("test-owner", first_id)
         second_receipt = await service.install_operations.store.read_async("test-owner", second_id)
         assert first_receipt["state"] == ("cancelled" if cancelled else "failed")
@@ -208,9 +234,12 @@ async def test_rollback_serializes_next_writer_and_committed_reader(
         assert not service._mutation_lock.locked()
         assert loader._publication_barrier_depth == 0
     finally:
+        if setup_lock_held:
+            service._mutation_lock.release()
         release_postflight.set()
         release_rollback.set()
-        await _drain(*pending)
+        if pending:
+            await _drain(*pending)
         assert await service.close(timeout=5)
 
 

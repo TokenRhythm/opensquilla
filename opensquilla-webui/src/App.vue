@@ -252,7 +252,6 @@
           @open-approval="openBlockedApprovalSession"
         />
         <WorkbenchToggle
-          v-if="platform.capabilities.hasNativeWorkbenchSurfaces"
           :enabled="appStore.features.artifactWorkbench === true && isChatRoute"
           allow-empty
           :session-id="workbenchSessionKey"
@@ -304,6 +303,12 @@
         :route-active="isChatRoute"
         :session-id="workbenchSessionKey"
         :modal-blocked="workbenchModalBlocked"
+        :workspace-id="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          ? chatRouteHeader.model.workspaceId.value : null"
+        :workspace-ready="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.workspaceReady.value"
+        :workspace-resolved="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.workspaceResolved.value"
       />
       <ArtifactImageLightbox />
     </div>
@@ -378,10 +383,12 @@
 
   <ProjectWorkspaceEditDialog
     v-if="gatewayAccess.canManageProjectWorkspaces"
+    :key="projectEditInstance"
     :open="Boolean(editingProject)"
+    :saving="projectEditSaving"
     :initial-name="editingProject?.name || ''"
     :path="editingProject?.path || ''"
-    @close="editingProjectId = ''"
+    @close="closeProjectEditor"
     @save="onProjectRename"
   />
 
@@ -458,6 +465,7 @@ import { useSessionTaskAttention } from './composables/useSessionTaskAttention'
 import { useToasts } from './composables/useToasts'
 import { useConfirm } from './composables/useConfirm'
 import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
+import { useProjectWorkspaceEditor } from './composables/useProjectWorkspaceEditor'
 import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
 import { bindDesktopSessionDeepLinks } from './app/desktopSessionDeepLinks'
@@ -658,7 +666,18 @@ const projectCreateBusy = ref(false)
 const projectCreateSourcePicking = ref(false)
 const projectCreateConfirming = ref(false)
 const projectSourcePickerOpen = ref(false)
-const editingProjectId = ref('')
+const {
+  workspaceId: editingProjectId,
+  saving: projectEditSaving,
+  instance: projectEditInstance,
+  open: openProjectEditor,
+  close: closeProjectEditor,
+  save: onProjectRename,
+} = useProjectWorkspaceEditor({
+  allowed: () => gatewayAccess.canManageProjectWorkspaces,
+  rename: (workspaceId, name) => projectWorkspaces.renameWorkspace(workspaceId, name),
+  onError: error => pushToast(t('workspaces.updateFailed', { error: errorMessage(error) }), { tone: 'danger' }),
+})
 const editingProject = computed(() =>
   editingProjectId.value
     ? projectWorkspaces.byId.value.get(editingProjectId.value) || null
@@ -678,7 +697,7 @@ watch(
     projectCreateSourcePicking.value = false
     projectCreateConfirming.value = false
     projectSourcePickerOpen.value = false
-    editingProjectId.value = ''
+    closeProjectEditor()
   },
 )
 const desktopUpdate = useDesktopUpdate()
@@ -1401,23 +1420,6 @@ async function onProjectPin(payload: { workspaceId: string; pinned: boolean }) {
   }
 }
 
-function openProjectEditor(workspaceId: string) {
-  if (!gatewayAccess.canManageProjectWorkspaces) return
-  editingProjectId.value = workspaceId
-}
-
-async function onProjectRename(name: string) {
-  if (!gatewayAccess.canManageProjectWorkspaces) return
-  const workspaceId = editingProjectId.value
-  if (!workspaceId) return
-  try {
-    await projectWorkspaces.renameWorkspace(workspaceId, name)
-    editingProjectId.value = ''
-  } catch (err) {
-    pushToast(t('workspaces.updateFailed', { error: errorMessage(err) }), { tone: 'danger' })
-  }
-}
-
 async function onProjectDeleteHistory(workspaceId: string) {
   if (!gatewayAccess.canManageProjectWorkspaces) return
   try {
@@ -1467,7 +1469,7 @@ async function onProjectRemove(workspaceId: string) {
   if (!approved) return
   try {
     await projectWorkspaces.removeWorkspace(workspaceId)
-    if (editingProjectId.value === workspaceId) editingProjectId.value = ''
+    if (editingProjectId.value === workspaceId) closeProjectEditor()
     if (
       $route.path === '/chat/new'
       && String($route.query.project || '') === workspaceId

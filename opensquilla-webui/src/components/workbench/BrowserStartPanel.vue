@@ -29,6 +29,14 @@
       <Icon name="refresh" :size="14" aria-hidden="true" />
       {{ t('workbench.browser.reopen') }}
     </button>
+    <button v-if="canOpenWorkspace" type="button" class="btn btn--ghost browser-start__workspace" @click="$emit('open-workspace')">
+      <Icon name="folder" :size="14" aria-hidden="true" />
+      {{ t('workspaceFiles.open') }}
+    </button>
+    <button v-if="canOpenTerminal" type="button" class="btn btn--ghost browser-start__workspace" @click="$emit('open-terminal')">
+      <Icon name="terminal" :size="14" aria-hidden="true" />
+      {{ t('terminal.open') }}
+    </button>
   </section>
 </template>
 
@@ -38,8 +46,11 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { normalizeBrowserAddress } from '@/workbench/browserItems'
 
-const props = defineProps<{ ready: boolean; canReopen: boolean }>()
-const emit = defineEmits<{ open: [url: string]; reopen: [] }>()
+const props = withDefaults(defineProps<{ ready: boolean; canReopen: boolean; canOpenWorkspace?: boolean; canOpenTerminal?: boolean }>(), {
+  canOpenWorkspace: false,
+  canOpenTerminal: false,
+})
+const emit = defineEmits<{ open: [url: string]; reopen: []; 'open-workspace': []; 'open-terminal': [] }>()
 const { t } = useI18n()
 const address = ref('')
 const invalid = ref(false)
@@ -112,5 +123,11 @@ onMounted(() => addressRef.value?.focus({ preventScroll: true }))
 
 .browser-start__error {
   color: var(--danger);
+}
+
+.browser-start__workspace {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
 }
 </style>

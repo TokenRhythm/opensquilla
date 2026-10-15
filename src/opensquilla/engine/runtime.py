@@ -5513,6 +5513,7 @@ class TurnRunner:
         expected_session_epoch: int | None = None,
         telemetry_surface: ClientSurface | None = None,
         telemetry_execution_mode: ExecutionMode | None = None,
+        on_initial_provider_ready: Callable[[ProviderConfig], None] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one public turn and publish exactly one content-free result fact."""
 
@@ -5579,6 +5580,7 @@ class TurnRunner:
                     assistant_message_id=assistant_message_id,
                     expected_session_id=expected_session_id,
                     expected_session_epoch=expected_session_epoch,
+                    on_initial_provider_ready=on_initial_provider_ready,
                 ),
             )
             async with contextlib.aclosing(stream):
@@ -5727,6 +5729,7 @@ class TurnRunner:
         assistant_message_id: str | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
+        on_initial_provider_ready: Callable[[ProviderConfig], None] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one agent turn with full orchestration.
 
@@ -5893,6 +5896,7 @@ class TurnRunner:
                             expected_session_id=expected_session_id,
                             expected_session_epoch=expected_session_epoch,
                             execution_context=execution_context,
+                            on_initial_provider_ready=on_initial_provider_ready,
                         ),
                     )
                     async with contextlib.aclosing(turn_stream):
@@ -5959,6 +5963,7 @@ class TurnRunner:
                                 expected_session_id=expected_session_id,
                                 expected_session_epoch=expected_session_epoch,
                                 execution_context=execution_context,
+                                on_initial_provider_ready=on_initial_provider_ready,
                             ),
                         )
                         async with contextlib.aclosing(turn_stream):
@@ -6008,6 +6013,7 @@ class TurnRunner:
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
         execution_context: TurnExecutionContext | None = None,
+        on_initial_provider_ready: Callable[[ProviderConfig], None] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         mark_current_turn_failure_stage(TurnFailureStage.TURN_SETUP)
         # Observability: bracket turn setup + stream loop with monotonic clock
@@ -6424,6 +6430,7 @@ class TurnRunner:
                         expected_session_id=expected_session_id,
                         expected_session_epoch=expected_session_epoch,
                         provider_request_correlation=provider_request_correlation,
+                        on_initial_provider_ready=on_initial_provider_ready,
                     )
                 )
                 if tool_context is not None and tool_context.selected_skills:
@@ -7505,6 +7512,7 @@ class TurnRunner:
                                 error_type=type(exc).__name__,
                             )
             if router_control_replay_event is not None:
+                # 首次部署通知已经消费；同一回合的路由重放不再派发辅助命名。
                 replay_stream = cast(
                     AsyncGenerator[AgentEvent, None],
                     self._run_turn(

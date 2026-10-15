@@ -17,6 +17,7 @@ function source() {
   return {
     state: 'disconnected' as 'disconnected' | 'connecting' | 'connected',
     health: 'healthy' as 'healthy' | 'suspect',
+    phase: undefined as 'healthy' | 'checking' | 'suspect' | 'reconnecting' | undefined,
     isResuming: false,
     resumeSource: null as 'desktop-resume' | null,
     error: null as string | null,
@@ -168,7 +169,7 @@ describe('createV4GatewayAccess', () => {
     raw.canManageProjectWorkspaces = true
     raw.canChooseProject = true
     raw.auth = {
-      principal: { authState: 'authenticated' },
+      principal: { authState: 'authenticated', capabilities: ['host.execute'] },
       runModePolicy: {
         allowedRunModes: ['safe', 'full'],
         defaultRunMode: 'safe',
@@ -188,6 +189,8 @@ describe('createV4GatewayAccess', () => {
     expect(access.availability).toBe('available')
     expect(access.connectionHealth).toBe('healthy')
     expect(access.isAuthenticated).toBe(true)
+    expect(access.canExecuteHost).toBe(true)
+    expect(access.hostExecuteUnavailableReason).toBeNull()
     expect(access.canChooseProject).toBe(true)
     expect(access.runModePolicy).toEqual({
       allowedRunModes: ['safe', 'full'],
@@ -223,6 +226,29 @@ describe('createV4GatewayAccess', () => {
     expect(access.availability).toBe('available')
     expect(access.isAvailable).toBe(true)
     expect(access.connectionHealth).toBe('suspect')
+    expect(access.canExecuteHost).toBe(false)
+    expect(access.hostExecuteUnavailableReason).toBe('disconnected')
+  })
+
+  it('fails closed for a connected principal without host execution authority', () => {
+    const raw = source()
+    raw.state = 'connected'
+    raw.auth = { principal: { authState: 'authenticated', capabilities: ['host.read'] } }
+    const access = createV4GatewayAccess(raw)
+
+    expect(access.canExecuteHost).toBe(false)
+    expect(access.hostExecuteUnavailableReason).toBe('permission')
+  })
+
+  it('does not expose host execution while a connected principal is awaiting a fresh Hello', () => {
+    const raw = source()
+    raw.state = 'connected'
+    raw.auth = { principal: { authState: 'authenticated', capabilities: ['host.execute'] } }
+    raw.phase = 'checking'
+    const access = createV4GatewayAccess(raw)
+
+    expect(access.canExecuteHost).toBe(false)
+    expect(access.hostExecuteUnavailableReason).toBe('disconnected')
   })
 
   it('projects a native resume as suspect until the transport confirms liveness', () => {

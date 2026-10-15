@@ -1,5 +1,6 @@
 import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, powerMonitor, protocol, safeStorage, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
+import { parse as parseToml } from 'smol-toml'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { createWriteStream, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs'
@@ -25,6 +26,7 @@ import {
   primaryProfilePaths,
   type DesktopProfilePaths,
 } from './desktop-profile-context.js'
+import { configuredDesktopDataDirectory, inspectDesktopStartupMetadata } from './desktop-startup-preflight.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
 import {
   acknowledgeDesktopActivation, clearDesktopActivationAcknowledgements,
@@ -2370,25 +2372,9 @@ function configuredDesktopStateDirectory(
   configRaw: string | null,
 ): string {
   if (configRaw !== null) {
-    for (const rawLine of configRaw.split(/\r?\n/)) {
-      if (/^\s*\[/.test(rawLine)) break
-      const match = rawLine.match(/^\s*state_dir\s*=\s*(["'])(.*?)\1\s*(?:#.*)?$/)
-      if (!match) continue
-      let configured = match[2] ?? ''
-      if (match[1] === '"') {
-        try {
-          const parsed: unknown = JSON.parse(`${match[1]}${configured}${match[1]}`)
-          if (typeof parsed === 'string') configured = parsed
-        } catch {
-          return join(profile.home, 'state')
-        }
-      }
-      if (configured === '~') configured = homedir()
-      else if (configured.startsWith('~/') || configured.startsWith('~\\')) {
-        configured = join(homedir(), configured.slice(2))
-      }
-      return resolve(profile.home, configured)
-    }
+    const configured = configuredDesktopDataDirectory(profile.home, parseToml(configRaw).state_dir, 'state')
+    if (!configured) throw new Error('The configured Desktop state directory is not a supported path.')
+    return configured
   }
   return join(profile.home, 'state')
 }
@@ -2399,10 +2385,6 @@ function desktopTelemetryDirectory(profile: DesktopProfilePaths, configRaw: stri
 
 function desktopConsentMirrorPath(profile: DesktopProfilePaths, configRaw: string | null): string {
   return join(desktopTelemetryDirectory(profile, configRaw), 'desktop-consent-mirror.json')
-}
-
-function desktopEarlyTelemetrySpoolPath(profile: DesktopProfilePaths, configRaw: string | null): string {
-  return join(desktopTelemetryDirectory(profile, configRaw), 'desktop-early-spool')
 }
 
 function mirroredScopeConsent(
@@ -2453,16 +2435,19 @@ async function syncDesktopConsentMirror(profile = activeDesktopProfile()): Promi
   const credential = credentialRaw === null
     ? null
     : normalizeDesktopCredential(JSON.parse(credentialRaw) as Partial<DesktopConnection>)
+  const telemetryDirectory = desktopTelemetryDirectory(profile, configRaw)
+  const spoolRoot = join(telemetryDirectory, 'desktop-early-spool')
+  const consentMirrorPath = join(telemetryDirectory, 'desktop-consent-mirror.json')
   desktopTelemetryRuntimeGate.openAfterConsentSync()
   desktopReliabilityTelemetry.synchronize({
-    spoolRoot: desktopEarlyTelemetrySpoolPath(profile, configRaw),
-    consentMirrorPath: desktopConsentMirrorPath(profile, configRaw),
+    spoolRoot,
+    consentMirrorPath,
   })
   desktopGrowthTelemetry.synchronize({
     profileKey: profile.home,
-    telemetryDirectory: desktopTelemetryDirectory(profile, configRaw),
-    spoolRoot: desktopEarlyTelemetrySpoolPath(profile, configRaw),
-    consentMirrorPath: desktopConsentMirrorPath(profile, configRaw),
+    telemetryDirectory,
+    spoolRoot,
+    consentMirrorPath,
   }, credential?.configAuthority === 'generated' ? credential.growthOnboardingReceipt : null)
   refreshDesktopReliabilityForegroundState()
 }
@@ -9657,6 +9642,7 @@ async function startGateway(): Promise<GatewayState> {
   })
 
   const gatewaySpawnRequestedAt = Date.now()
+  desktopStartupLog('gateway_spawn_requested', { port, runtimeMode: runtime.mode })
   const child = spawn(
     runtime.command,
     [...runtime.args, '--port', String(port), '--listen', '127.0.0.1', '--config', desktopConfigPath()],
@@ -9949,6 +9935,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     },
   })
   mainWindow = window
+  desktopStartupLog('window_created')
   installGatewayShutdownRequestInterceptor(window)
   trackDesktopReliabilityWindow(window)
   installDesktopZoomShortcuts(
@@ -10209,6 +10196,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
   }
 
   window.once('ready-to-show', () => {
+    desktopStartupLog('window_ready_to_show')
     if (!window.isDestroyed()) window.show()
   })
 
@@ -10397,8 +10385,11 @@ async function stopOwnedGatewayAndWait(): Promise<void> {
 }
 
 async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
-  const consolidationFailure = await consolidateLegacyRecoveryProfilesBeforeStartup()
   const active = activeDesktopProfile()
+  const metadata = inspectDesktopStartupMetadata(app.getPath('userData'), active.home)
+  let consolidationFailure = metadata.canSkipMaintenance
+    ? null
+    : await consolidateLegacyRecoveryProfilesBeforeStartup()
   // On a hard Electron crash, the Python Gateway can remain healthy and keep
   // the profile writer lease. Prove and stop that exact prior Desktop instance
   // before profile inspection; otherwise the inspector reports profile_lock_busy
@@ -10409,6 +10400,26 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     await recoverVerifiedOrphanGatewayBeforeSpawn(active)
   }
   recoveryOperationError = null
+  if (metadata.canSkipMaintenance) {
+    // Orphan drain can await another process. Re-check metadata afterwards so a
+    // transaction or config edit during that wait takes the original path.
+    const current = inspectDesktopStartupMetadata(app.getPath('userData'), active.home)
+    if (current.canSkipMaintenance) {
+      recoveryInspection = null
+      primaryRecoveryInspection = null
+      desktopGrowthTelemetry.observeProfileInspection({
+        profileKey: active.home,
+        stableCode: resolvedPathsEqual(current.workspaceDirectory, join(active.home, 'workspace'))
+          ? 'canonical_workspace' : 'configured_workspace',
+        importedOrMigrated: false,
+      })
+      desktopLog('desktop_profile_startup_fastpath', { maintenanceHelpersSkipped: true })
+      publishRecoveryState()
+      createApplicationMenu()
+      return true
+    }
+    consolidationFailure = await consolidateLegacyRecoveryProfilesBeforeStartup()
+  }
   let inspection = await inspectDesktopProfile(active)
   const growthInspection = {
     profileKey: active.home,
@@ -10591,7 +10602,23 @@ async function openOrResumeDesktopApp(): Promise<void> {
         await createMainWindow()
         focusMainWindow()
         observeDesktopStartupStage('profile-inspect', { operation: 'startup' })
-        const profileReady = await inspectActiveProfileBeforeStartup()
+        const profileInspectStartedAt = Date.now()
+        desktopStartupLog('profile_inspect_started')
+        let profileReady: boolean
+        try {
+          profileReady = await inspectActiveProfileBeforeStartup()
+        } catch (error) {
+          desktopStartupLog('profile_inspect_finished', {
+            ready: false,
+            failed: true,
+            durationMs: Math.max(0, Date.now() - profileInspectStartedAt),
+          })
+          throw error
+        }
+        desktopStartupLog('profile_inspect_finished', {
+          ready: profileReady,
+          durationMs: Math.max(0, Date.now() - profileInspectStartedAt),
+        })
         // Only trust config.state_dir after profile inspection/recovery has
         // bounded the active profile. Sync before publishing that inspection's
         // terminal result so existing opt-in users retain profile-start facts;
@@ -16288,6 +16315,7 @@ if (!gotSingleInstanceLock) {
   })
 
   void app.whenReady().then(async () => {
+    desktopStartupLog('app_ready')
     // An OS wake is an observation, not permission to restart or reload.
     const notifySystemResume = () => {
       for (const window of BrowserWindow.getAllWindows()) {

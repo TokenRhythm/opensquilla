@@ -133,7 +133,7 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Retire router learning status and training feedback (two generated methods).
 # Retire the three advanced agent administration methods.
 # Add video-generation model discovery without changing existing method names.
-RUNTIME_RPC_METHOD_BASELINE = 277
+RUNTIME_RPC_METHOD_BASELINE = 281
 RUNTIME_RPC_METHOD_DIGEST = "29b0b13c082534442371c559806c483c45d16be045f132a304fc328a6512f9ca"
 STATIC_RPC_DECORATOR_BASELINE = 63
 
@@ -1412,9 +1412,18 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
 
     registry = get_dispatcher()
     methods = registry.list_methods()
+    terminal_methods = {
+        "terminal.create", "terminal.write", "terminal.resize", "terminal.close",
+    }
+    assert terminal_methods.issubset(methods)
     assert len(methods) == RUNTIME_RPC_METHOD_BASELINE
     assert len(methods) == len(set(methods))
-    digest = hashlib.sha256(("\n".join(sorted(methods)) + "\n").encode()).hexdigest()
+    # The terminal vertical slice is intentionally additive to the frozen
+    # legacy inventory. Keep the historical digest meaningful while pinning
+    # the four new methods explicitly above.
+    digest = hashlib.sha256(
+        ("\n".join(sorted(set(methods) - terminal_methods)) + "\n").encode()
+    ).hexdigest()
     assert digest == RUNTIME_RPC_METHOD_DIGEST
 
     for method, scope in (

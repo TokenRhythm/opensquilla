@@ -322,6 +322,28 @@
     "resize": "Arbeitsbereich-Breite ändern",
     "pixels": "Pixel",
     "empty": "Für dieses Element ist keine Vorschau verfügbar.",
+    "assistantChat": {
+      "contextHint": "Ein eigenständiger Chat für diese Aufgabe. Teilt den Arbeitsbereich, ohne den Verlauf zu kopieren. Zeigt die letzten 100 Nachrichten.",
+      "empty": "Stelle eine Nebenfrage, ohne den Hauptchat zu unterbrechen.",
+      "you": "Du",
+      "working": "In Bearbeitung…",
+      "openFull": "Vollständigen Chat öffnen",
+      "preview": "Eine begrenzte Vorschau wird angezeigt.",
+      "needsAttention": "Dieser Chat benötigt eine Genehmigung oder weitere Eingaben. Öffne den vollständigen Chat.",
+      "uncertain": "Die Zustellung ist noch nicht bestätigt. Aktualisiere den Status vor dem erneuten Senden.",
+      "refresh": "Status aktualisieren",
+      "newConversation": "Neuen Chat erstellen",
+      "placeholder": "Assistenten fragen…",
+      "send": "Senden",
+      "stop": "Stoppen",
+      "loading": "Wird geladen…"
+    },
+    "newPanel": {
+      "title": "Neues Panel", "browser": "Browser", "workspaceFiles": "Arbeitsbereich-Dateien", "terminal": "Terminal", "assistantChat": "Assistenten-Chat",
+      "assistantUnavailable": "Der Assistenten-Chat ist für diese Verbindung nicht verfügbar",
+      "requiresSession": "Öffne zuerst eine Chat-Sitzung", "requiresConnection": "Verbinde dich zuerst mit einem Gateway", "requiresHostExecute": "Die Berechtigung host.execute ist erforderlich",
+      "browserUnavailable": "Der Seitenbrowser erfordert OpenSquilla Desktop", "workspaceUnavailable": "Arbeitsbereich-Dateien sind hier nicht verfügbar", "terminalUnavailable": "Das Terminal ist hier nicht verfügbar"
+    },
     "resources": {
       "title": "Dateien", "count": "Dateien ({count})", "empty": "Noch keine Dateien oder Links.",
       "groups": { "files": "Dateien", "links": "Links", "attachments": "Dateien", "documents": "Dateien", "deliverables": "Dateien", "urls": "Links" },
@@ -362,6 +384,24 @@
       "openSide": "Im Seitenbrowser öffnen",
       "failed": "Der Seitenbrowser wurde beendet",
       "failedDetail": "Lade den isolierten Browser neu, um fortzufahren."
+    },
+    "workspaceFiles": {
+      "title": "Arbeitsbereich-Dateien", "subtitle": "Arbeitsbereich der aktuellen Sitzung durchsuchen", "open": "Arbeitsbereich-Dateien",
+      "filter": "Arbeitsbereich-Dateien filtern", "filterPlaceholder": "Dateien filtern…", "refresh": "Aktualisieren", "loading": "Arbeitsbereich-Dateien werden geladen…",
+      "loadMore": "Mehr laden", "expand": "Ordner öffnen", "collapse": "Ordner schließen", "selectFile": "Datei zur Vorschau auswählen.",
+      "unavailable": "Arbeitsbereich-Dateien sind für diese Sitzung nicht verfügbar.", "truncated": "Dieser Ordner überschreitet das sichere Listenlimit. Filtere oder öffne einen engeren Ordner."
+    },
+    "terminal": {
+      "title": "Terminal",
+      "subtitle": "Session terminal",
+      "open": "Terminal",
+      "starting": "Starting terminal…",
+      "input": "Terminal input",
+      "restart": "Restart",
+      "unavailable": "The terminal is unavailable for this session.",
+      "outputGap": "Terminal output was interrupted",
+      "exited": "Terminal exited",
+      "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
     },
     "artifactAnnotation": {
       "start": "Änderung anfordern",

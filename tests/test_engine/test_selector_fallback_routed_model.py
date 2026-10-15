@@ -1458,13 +1458,13 @@ class _ChainSelector:
 
     def __init__(self, *, primary_fails: bool) -> None:
         self._primary_fails = primary_fails
-        self.current_config = SimpleNamespace(
+        self.current_config = ProviderConfig(
             provider="openrouter",
             model=PRIMARY_MODEL,
         )
         self._remaining_chain = [
             self.current_config,
-            SimpleNamespace(provider="openrouter", model=FALLBACK_MODEL),
+            ProviderConfig(provider="openrouter", model=FALLBACK_MODEL),
         ]
 
     def clone(self) -> _ChainSelector:
@@ -1474,14 +1474,14 @@ class _ChainSelector:
         if model == self.current_config.model:
             return
         previous_chain = list(self._remaining_chain)
-        self.current_config = SimpleNamespace(provider="openrouter", model=model)
+        self.current_config = ProviderConfig(provider="openrouter", model=model)
         self._remaining_chain = [self.current_config, *previous_chain]
 
     @property
     def active_provider_id(self) -> str:
         return str(self.current_config.provider)
 
-    def remaining_chain(self) -> list[SimpleNamespace]:
+    def remaining_chain(self) -> list[ProviderConfig]:
         return list(self._remaining_chain)
 
     def resolve(self) -> _ChainProvider:
@@ -3008,6 +3008,7 @@ async def _run_turn_events(
     primary_fails: bool,
     pending_input_provider: ListPendingInputProvider | None = None,
     model_catalog: ModelCatalog | None = None,
+    on_initial_provider_ready: Any = None,
 ) -> list[Any]:
     monkeypatch.setattr(TurnRunner, "_run_pipeline", _routed_pipeline_fake(PRIMARY_MODEL))
     runner = TurnRunner(
@@ -3022,6 +3023,7 @@ async def _run_turn_events(
             history_has_persisted_user=False,
             no_memory_capture=True,
             pending_input_provider=pending_input_provider,
+            on_initial_provider_ready=on_initial_provider_ready,
         )
     ]
 
@@ -3065,7 +3067,12 @@ def test_model_override_snapshots_selector_execution_candidates() -> None:
 async def test_precontent_fallback_keeps_one_route_decision_and_appends_execution_leg(
     monkeypatch: Any,
 ) -> None:
-    events = await _run_turn_events(monkeypatch, primary_fails=True)
+    initial_deployments: list[str] = []
+    events = await _run_turn_events(
+        monkeypatch,
+        primary_fails=True,
+        on_initial_provider_ready=lambda deployment: initial_deployments.append(deployment.model),
+    )
 
     router_events = [event for event in events if isinstance(event, RouterDecisionEvent)]
     assert len(router_events) == 1
@@ -3078,6 +3085,7 @@ async def test_precontent_fallback_keeps_one_route_decision_and_appends_executio
     done = done_events[0]
     assert done.model == FALLBACK_MODEL
     assert done.routed_model == FALLBACK_MODEL
+    assert initial_deployments == [PRIMARY_MODEL]
     assert done.route_plan is not None
     assert done.route_plan["model"] == PRIMARY_MODEL
     assert [leg["kind"] for leg in done.execution_legs] == [

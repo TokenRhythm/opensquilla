@@ -322,6 +322,28 @@
     "resize": "Redimensionner l’espace de travail",
     "pixels": "pixels",
     "empty": "Aucun aperçu n’est disponible pour cet élément.",
+    "assistantChat": {
+      "contextHint": "Une conversation indépendante pour cette tâche. Partage l’espace de travail sans copier l’historique. Affiche les 100 derniers messages.",
+      "empty": "Posez une question annexe sans interrompre la conversation principale.",
+      "you": "Vous",
+      "working": "En cours…",
+      "openFull": "Ouvrir la conversation complète",
+      "preview": "Un aperçu limité est affiché.",
+      "needsAttention": "Cette conversation nécessite une approbation ou des informations. Ouvrez la conversation complète.",
+      "uncertain": "La livraison n’est pas encore confirmée. Actualisez le statut avant de renvoyer.",
+      "refresh": "Actualiser le statut",
+      "newConversation": "Créer une conversation",
+      "placeholder": "Demander à l’assistant…",
+      "send": "Envoyer",
+      "stop": "Arrêter",
+      "loading": "Chargement…"
+    },
+    "newPanel": {
+      "title": "Nouveau panneau", "browser": "Navigateur", "workspaceFiles": "Fichiers de l’espace de travail", "terminal": "Terminal", "assistantChat": "Chat assistant",
+      "assistantUnavailable": "Le chat assistant n’est pas disponible pour cette connexion",
+      "requiresSession": "Ouvrez d’abord une session de chat", "requiresConnection": "Connectez-vous d’abord à une Gateway", "requiresHostExecute": "L’autorisation host.execute est requise",
+      "browserUnavailable": "Le navigateur latéral nécessite OpenSquilla Desktop", "workspaceUnavailable": "Les fichiers de l’espace de travail ne sont pas disponibles ici", "terminalUnavailable": "Le terminal n’est pas disponible ici"
+    },
     "resources": {
       "title": "Fichiers", "count": "Fichiers ({count})", "empty": "Aucun fichier ni lien pour le moment.",
       "groups": { "files": "Fichiers", "links": "Liens", "attachments": "Fichiers", "documents": "Fichiers", "deliverables": "Fichiers", "urls": "Liens" },
@@ -362,6 +384,24 @@
       "openSide": "Ouvrir dans le navigateur latéral",
       "failed": "Le navigateur latéral s’est arrêté",
       "failedDetail": "Rechargez le navigateur isolé pour continuer."
+    },
+    "workspaceFiles": {
+      "title": "Fichiers de l’espace de travail", "subtitle": "Parcourir l’espace de travail de la session actuelle", "open": "Fichiers de l’espace de travail",
+      "filter": "Filtrer les fichiers", "filterPlaceholder": "Filtrer les fichiers…", "refresh": "Actualiser", "loading": "Chargement des fichiers…",
+      "loadMore": "Charger davantage", "expand": "Développer le dossier", "collapse": "Réduire le dossier", "selectFile": "Sélectionnez un fichier à prévisualiser.",
+      "unavailable": "Les fichiers de l’espace de travail sont indisponibles pour cette session.", "truncated": "Ce dossier dépasse la limite sûre. Utilisez le filtre ou ouvrez un dossier plus précis."
+    },
+    "terminal": {
+      "title": "Terminal",
+      "subtitle": "Session terminal",
+      "open": "Terminal",
+      "starting": "Starting terminal…",
+      "input": "Terminal input",
+      "restart": "Restart",
+      "unavailable": "The terminal is unavailable for this session.",
+      "outputGap": "Terminal output was interrupted",
+      "exited": "Terminal exited",
+      "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
     },
     "artifactAnnotation": {
       "start": "Demander une modification",

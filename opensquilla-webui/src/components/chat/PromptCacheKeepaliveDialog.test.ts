@@ -1,12 +1,45 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick } from 'vue'
+import { createApp, h, nextTick, reactive } from 'vue'
 
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import { PROMPT_CACHE_LEASE_KEY } from '@/modules/promptCacheLease'
 import { promptCacheLeaseTestDouble } from '@/testing/conversationAncillary.test-helper'
 import PromptCacheKeepaliveDialog from './PromptCacheKeepaliveDialog.vue'
+import type { PromptCacheKeepaliveStatus } from '@/types/promptCacheKeepalive'
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
+const enabledStatus: PromptCacheKeepaliveStatus = {
+  enabled: true, ttlSeconds: 300, intervalSeconds: 240,
+  idleTimeoutSeconds: 3_600, idleExpiresAt: null, state: 'waiting',
+  reason: null, hasSnapshot: false, lastCacheHitTokens: 0,
+}
+
+async function mountChangingDialog(overrides: Parameters<typeof promptCacheLeaseTestDouble>[0]) {
+  const props = reactive({ open: true, sessionKey: 'session-a' })
+  const saved = vi.fn()
+  const closed = vi.fn()
+  const host = document.createElement('div')
+  document.body.appendChild(host)
+  const app = createApp({ render: () => h(PromptCacheKeepaliveDialog, {
+    ...props, onSaved: saved, onClose: closed,
+  }) })
+  app.use(i18n)
+  app.provide(PROMPT_CACHE_LEASE_KEY, promptCacheLeaseTestDouble(overrides))
+  app.mount(host)
+  await settle()
+  return { app, props, saved, closed }
+}
 
 async function settle() {
   await Promise.resolve()
@@ -23,6 +56,116 @@ beforeEach(() => {
 })
 
 describe('PromptCacheKeepaliveDialog', () => {
+  it.each(['success', 'error'])('keeps an edited reopened draft when an earlier load finishes with %s', async (outcome) => {
+    const first = deferred<PromptCacheKeepaliveStatus>()
+    const second = deferred<PromptCacheKeepaliveStatus>()
+    const status = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+    const { app, props } = await mountChangingDialog({ status })
+    try {
+      props.open = false
+      await settle()
+      props.open = true
+      await settle()
+      second.resolve(enabledStatus)
+      await settle()
+      const ttl = document.body.querySelector<HTMLInputElement>('[data-testid="prompt-cache-keepalive-ttl"]')!
+      ttl.value = '15'
+      ttl.dispatchEvent(new Event('input', { bubbles: true }))
+      await settle()
+
+      if (outcome === 'success') first.resolve({ ...enabledStatus, ttlSeconds: 1_200 })
+      else first.reject(new Error('Old request failed'))
+      await settle()
+      expect(document.body.querySelector<HTMLInputElement>('[data-testid="prompt-cache-keepalive-ttl"]')!.value).toBe('15')
+      expect(document.body.querySelector('.keepalive-dialog__error')).toBeNull()
+      expect(status).toHaveBeenCalledTimes(2)
+    } finally { app.unmount() }
+  })
+
+  it('keeps the new opening loading when an older request settles', async () => {
+    const first = deferred<PromptCacheKeepaliveStatus>()
+    const second = deferred<PromptCacheKeepaliveStatus>()
+    const { app, props } = await mountChangingDialog({
+      status: vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise),
+    })
+    try {
+      props.open = false
+      await settle()
+      props.open = true
+      await settle()
+      first.reject(new Error('Old request failed'))
+      await settle()
+      expect(document.body.querySelector('.keepalive-dialog__muted')).toBeTruthy()
+      expect(document.body.querySelector('[data-testid="prompt-cache-keepalive-ttl"]')).toBeNull()
+      expect(document.body.querySelector('.keepalive-dialog__error')).toBeNull()
+      expect(document.body.querySelector<HTMLButtonElement>('.btn--primary')!.disabled).toBe(true)
+      second.resolve(enabledStatus)
+      await settle()
+      expect(document.body.querySelector('.keepalive-dialog__muted')).toBeNull()
+    } finally { app.unmount() }
+  })
+
+  it('uses the new session policy when the previous session load finishes late', async () => {
+    const oldStatus = deferred<PromptCacheKeepaliveStatus>()
+    const status = vi.fn().mockReturnValueOnce(oldStatus.promise).mockResolvedValue(enabledStatus)
+    const setPolicy = vi.fn().mockResolvedValue(enabledStatus)
+    const { app, props } = await mountChangingDialog({ status, setPolicy })
+    try {
+      props.sessionKey = 'session-b'
+      await settle()
+      oldStatus.resolve({ ...enabledStatus, enabled: false, ttlSeconds: 600 })
+      await settle()
+      document.body.querySelector<HTMLButtonElement>('.btn--primary')!.click()
+      await settle()
+      expect(status.mock.calls).toEqual([['session-a'], ['session-b']])
+      expect(setPolicy).toHaveBeenCalledWith({
+        key: 'session-b', enabled: true, ttlSeconds: 300, idleTimeoutSeconds: 3_600,
+      })
+    } finally { app.unmount() }
+  })
+
+  it('does not close or unlock a new session dialog when an earlier save finishes', async () => {
+    const first = deferred<PromptCacheKeepaliveStatus>()
+    const second = deferred<PromptCacheKeepaliveStatus>()
+    const setPolicy = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+    const { app, props, closed, saved } = await mountChangingDialog({
+      status: vi.fn().mockResolvedValue(enabledStatus), setPolicy,
+    })
+    try {
+      document.body.querySelector<HTMLButtonElement>('.btn--primary')!.click()
+      await settle()
+      props.sessionKey = 'session-b'
+      await settle()
+      document.body.querySelector<HTMLButtonElement>('.btn--primary')!.click()
+      await settle()
+      first.resolve(enabledStatus)
+      await settle()
+      expect(closed).not.toHaveBeenCalled()
+      expect(saved).not.toHaveBeenCalled()
+      expect(document.body.querySelector<HTMLButtonElement>('.btn--primary')!.disabled).toBe(true)
+      expect(useToasts().toasts.value).toHaveLength(0)
+      second.resolve(enabledStatus)
+      await settle()
+      expect(closed).toHaveBeenCalledTimes(1)
+      expect(saved).toHaveBeenCalledWith({ sessionKey: 'session-b', status: enabledStatus })
+    } finally { app.unmount() }
+  })
+
+  it('does not emit save feedback after being unmounted', async () => {
+    const pending = deferred<PromptCacheKeepaliveStatus>()
+    const { app, closed, saved } = await mountChangingDialog({
+      status: vi.fn().mockResolvedValue(enabledStatus), setPolicy: vi.fn().mockReturnValue(pending.promise),
+    })
+    document.body.querySelector<HTMLButtonElement>('.btn--primary')!.click()
+    await settle()
+    app.unmount()
+    pending.resolve(enabledStatus)
+    await settle()
+    expect(closed).not.toHaveBeenCalled()
+    expect(saved).not.toHaveBeenCalled()
+    expect(useToasts().toasts.value).toHaveLength(0)
+  })
+
   it('explains the bounded plan and saves both timing values', async () => {
     const scheduledStatus = {
       enabled: true,

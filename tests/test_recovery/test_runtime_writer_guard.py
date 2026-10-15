@@ -49,7 +49,7 @@ def test_startup_timing_preserves_writer_guard_order_and_original_failure(
         engine, "ProfileOperationLock", lambda *_args, **_kwargs: lock("profile_lock"),
     )
     monkeypatch.setattr(engine, "LegacyGatewayLock", lambda *_args, **_kwargs: lock("legacy_lock"))
-    monkeypatch.setattr(engine, "inspect_profile", inspect)
+    monkeypatch.setattr(engine, "inspect_startup_profile", inspect)
 
     def run():
         with engine.guarded_desktop_profile(tmp_path):

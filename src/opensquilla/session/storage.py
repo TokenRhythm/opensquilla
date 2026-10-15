@@ -4191,13 +4191,44 @@ class SessionStorage:
                 )
                 return existing
 
+            # Older recovery clones retained immutable baselines/events but
+            # cleared the global cutover. Bound the replacement by the earliest
+            # baseline OR live event: the first surviving baseline may itself
+            # be a later cumulative checkpoint. Cutting over again now would
+            # count those checkpoints as legacy usage. New clones keep state.
+            # Earlier-epoch live usage proves a checkpoint is post-cutover,
+            # including when its timestamp equals the first live event's.
+            async with conn.execute(
+                """
+                SELECT MIN(boundary) FROM (
+                    SELECT MIN(CASE WHEN EXISTS (
+                        SELECT 1 FROM usage_events AS event
+                        WHERE event.session_id = baseline.session_id
+                          AND event.session_epoch < baseline.session_epoch
+                          AND event.origin = 'live_provider'
+                    ) THEN MAX(0, baseline.captured_at_ms - 1)
+                      ELSE baseline.captured_at_ms END) AS boundary
+                    FROM usage_legacy_baselines AS baseline
+                    WHERE captured_at_ms = (
+                        SELECT MIN(captured_at_ms) FROM usage_legacy_baselines
+                    )
+                    UNION ALL
+                    SELECT MIN(started_at_ms) FROM usage_events
+                    WHERE origin = 'live_provider'
+                )
+                """
+            ) as cur:
+                retained_boundary = (await cur.fetchone())[0]
+            cutover_ms = (
+                captured_at_ms if retained_boundary is None else int(retained_boundary)
+            )
             await conn.execute(
                 """
                 INSERT INTO usage_ledger_state (
                     singleton_id, ledger_started_at_ms, backfill_status, updated_at_ms
                 ) VALUES (1, ?, 'pending', ?)
                 """,
-                (captured_at_ms, captured_at_ms),
+                (cutover_ms, captured_at_ms),
             )
             # One bounded INSERT...SELECT replaces a Python row loop and keeps
             # the pre-live cutover transaction short even for large histories.
@@ -4249,6 +4280,15 @@ class SessionStorage:
                                 estimated_cost_component_usd
                               ) AS row_anomalies
                     FROM sessions
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM usage_legacy_baselines AS baseline
+                        WHERE baseline.session_id = sessions.session_id
+                    )
+                    AND (? = 0 OR NOT EXISTS (
+                        SELECT 1 FROM usage_events AS event
+                        WHERE event.session_id = sessions.session_id
+                          AND event.origin = 'live_provider'
+                    ))
                 ), ranked AS (
                     SELECT
                         normalized.*,
@@ -4282,8 +4322,14 @@ class SessionStorage:
                 FROM ranked
                 WHERE baseline_rank = 1
                 """,
-                (captured_at_ms,),
+                (retained_boundary is not None, cutover_ms),
             )
+            if retained_boundary is not None:
+                # Missing later generations must be reconstructed from ledger
+                # ancestry, never totals already containing live usage.
+                await self._repair_post_cutover_usage_baselines_on_conn(
+                    conn, captured_at_ms=max(captured_at_ms, cutover_ms + 1),
+                )
             await conn.execute(
                 """
                 UPDATE usage_ledger_state
@@ -5796,6 +5842,136 @@ class SessionStorage:
             )
             if int(cursor.rowcount or 0) == 0:
                 raise KeyError(f"Project workspace not found: {workspace_id}")
+
+    async def set_generated_title_if_unchanged(
+        self, expected_session: SessionNode, title: str,
+    ) -> bool:
+        """Update only the title, fencing reset, recreation and concurrent renames.
+
+        The caller checks title eligibility before passing its row snapshot. A
+        conditional update preserves unrelated fields without taking the runtime
+        session lock, which legacy turns can hold throughout a model request.
+        """
+        _validate_optional_session_owner(
+            session_id=expected_session.session_id,
+            session_epoch=expected_session.epoch,
+        )
+        async with self._write_transaction("set_generated_title_if_unchanged") as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE sessions SET derived_title = ?, updated_at = ?
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
+                  AND display_name IS ? AND derived_title IS ?
+                """,
+                (
+                    title,
+                    int(time.time() * 1000),
+                    canonicalize_session_key(expected_session.session_key),
+                    expected_session.session_id,
+                    expected_session.epoch,
+                    expected_session.display_name,
+                    expected_session.derived_title,
+                ),
+            )
+            return int(cursor.rowcount or 0) == 1
+
+    async def update_session_fields(
+        self,
+        session_key: str,
+        fields: Mapping[str, Any],
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> SessionNode:
+        """Atomically patch only the requested session columns.
+
+        This is the write path for mutable fields.  Unlike ``upsert_session`` it
+        never serializes a caller's whole ``SessionNode`` snapshot, so a stale
+        writer changing ``subject`` cannot restore an older ``derived_title``
+        (or any other column) over a newer update.
+        """
+        session_key = canonicalize_session_key(session_key)
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
+        model_fields = SessionNode.model_fields
+        updates = {
+            name: value
+            for name, value in fields.items()
+            if name in model_fields
+            and name not in {
+                "session_key",
+                "session_id",
+                "created_at",
+                "updated_at",
+                *_SESSION_DEDICATED_WRITER_COLUMNS,
+            }
+        }
+        assignments: list[str] = []
+        values: list[Any] = []
+        for name, value in updates.items():
+            if name == "epoch":
+                assignments.append("epoch = MAX(epoch, ?)")
+            else:
+                assignments.append(f"{name} = ?")
+            values.append(_serialize(value))
+        assignments.append("updated_at = ?")
+        values.append(_now_ms())
+
+        where = ["session_key = ?"]
+        where_values: list[Any] = [session_key]
+        if expected_session_id is not None:
+            where.append("session_id = ?")
+            where_values.append(expected_session_id)
+        if expected_session_epoch is not None:
+            where.append("epoch = ?")
+            where_values.append(expected_session_epoch)
+
+        async with self._write_transaction("update_session_fields") as conn:
+            previous_epoch: int | None = None
+            if "epoch" in updates:
+                async with conn.execute(
+                    "SELECT epoch FROM sessions WHERE session_key = ?",
+                    (session_key,),
+                ) as cur:
+                    previous = await cur.fetchone()
+                if previous is not None:
+                    previous_epoch = int(previous[0] or 0)
+            cursor = await conn.execute(
+                f"UPDATE sessions SET {', '.join(assignments)} "
+                f"WHERE {' AND '.join(where)}",  # noqa: S608 - identifiers are model fields above.
+                (*values, *where_values),
+            )
+            if int(cursor.rowcount or 0) != 1:
+                if expected_session_epoch is not None:
+                    await self._raise_stale_epoch(
+                        conn,
+                        session_key=session_key,
+                        expected_epoch=expected_session_epoch,
+                        expected_session_id=expected_session_id,
+                    )
+                if expected_session_id is not None:
+                    raise StaleEpochError(
+                        f"Session owner mismatch for {session_key}: expected {expected_session_id}"
+                    )
+                raise KeyError(f"Session not found: {session_key}")
+            async with conn.execute(
+                "SELECT * FROM sessions WHERE session_key = ?", (session_key,)
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_key}")
+            persisted = SessionNode(**_deserialize_row(dict(row)))
+            if (
+                previous_epoch is not None
+                and int(persisted.epoch or 0) != previous_epoch
+            ):
+                await self._ensure_usage_baseline_for_session_on_conn(
+                    conn,
+                    session_key=session_key,
+                )
+            return persisted
 
     async def bind_session_workspace(
         self,
@@ -16994,11 +17170,6 @@ class SessionStorage:
         )
         for row in prepared_tail:
             row["content_byte_length"] = _content_byte_length(row.get("content"))
-        prepared_node = (
-            (await asyncio.to_thread(_serialized_model_rows, [node]))[0]
-            if not preserve_surviving_rows else None
-        )
-
         async with self._write_transaction("rewrite_compacted_session") as conn:
             if expected_session_id is not None:
                 assert expected_session_epoch is not None
@@ -17173,25 +17344,33 @@ class SessionStorage:
                             "session changed while committing compaction metadata"
                         )
             else:
-                assert prepared_node is not None
-                node_data = prepared_node
-                node_cols = list(node_data.keys())
-                node_placeholders = ", ".join("?" for _ in node_cols)
-                node_updates: list[str] = []
-                for col in node_cols:
-                    if col == "session_key" or col in _SESSION_DEDICATED_WRITER_COLUMNS:
-                        continue
-                    if col == "epoch":
-                        node_updates.append("epoch = MAX(sessions.epoch, excluded.epoch)")
-                    else:
-                        node_updates.append(f"{col}=excluded.{col}")
-                node_values = [node_data[c] for c in node_cols]
-                await conn.execute(
-                    f"INSERT INTO sessions ({', '.join(node_cols)}) "
-                    f"VALUES ({node_placeholders}) "
-                    f"ON CONFLICT(session_key) DO UPDATE SET {', '.join(node_updates)}",
-                    node_values,
-                )
+                # The compatibility path has no source snapshot to CAS, but it
+                # still only owns compaction metadata.  Updating the full stale
+                # ``SessionNode`` here would restore unrelated fields such as a
+                # newer title, subject, or delivery context.
+                where = ["session_key = ?", "session_id = ?"]
+                owner_values: list[Any] = [node.session_key, node.session_id]
+                if expected_session_id is not None:
+                    assert expected_session_epoch is not None
+                    where.append("epoch = ?")
+                    owner_values.append(expected_session_epoch)
+                async with conn.execute(
+                    "UPDATE sessions "
+                    "SET compaction_count = MAX(compaction_count, ?), "
+                    "updated_at = MAX(updated_at, ?) "
+                    f"WHERE {' AND '.join(where)}",
+                    (node.compaction_count, node.updated_at, *owner_values),
+                ) as cur:
+                    if (cur.rowcount or 0) != 1:
+                        if expected_session_id is not None:
+                            assert expected_session_epoch is not None
+                            await self._raise_stale_epoch(
+                                conn,
+                                session_key=node.session_key,
+                                expected_epoch=expected_session_epoch,
+                                expected_session_id=expected_session_id,
+                            )
+                        raise KeyError(f"Session not found: {node.session_key}")
         return True
 
     @_serialized_read

@@ -3191,17 +3191,30 @@ def test_canonical_sessions_external_media_resume_rebuilds_transcript_remap(
     assert not (media / "transcripts" / "shared-media-id" / "attachment").exists()
 
 
+@pytest.mark.parametrize("active_writer", [False, True])
+@pytest.mark.parametrize(
+    "lock_name",
+    ["gateway.pid.lock", "GATEWAY.PID.LOCK"] if os.name == "nt" else ["gateway.pid.lock"],
+)
 def test_recovery_archive_finishes_while_legacy_exclusion_is_held(
     tmp_path: Path,
     monkeypatch,
+    active_writer: bool,
+    lock_name: str,
 ) -> None:
+    from opensquilla.recovery.atomic import profile_no_follow_manifest
+    from opensquilla.recovery.locking import (
+        acquire_gateway_legacy_lease,
+        release_gateway_legacy_lease,
+    )
+
     monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
     user_data = tmp_path / "user-data"
     primary = user_data / "opensquilla"
     (primary / "workspace").mkdir(parents=True)
     (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
     recovery_id = str(uuid.uuid4())
-    _recovery(
+    recovery = _recovery(
         user_data,
         recovery_id,
         config="recovery = true\n",
@@ -3211,6 +3224,18 @@ def test_recovery_archive_finishes_while_legacy_exclusion_is_held(
         extra_name="archive-order.txt",
         session_key="agent:main:archive-order",
     )
+    state = recovery / "opensquilla" / "state"
+    # Real gateways retain this byte-range lock file after clean shutdown.
+    (state / lock_name).write_bytes(b"\0retained runtime lock\n")
+    nested_lock = state / "nested" / "gateway.pid.lock"
+    nested_lock.parent.mkdir()
+    nested_lock.write_bytes(b"ordinary nested data\n")
+    source_manifest = profile_no_follow_manifest(recovery)
+    source_bytes = {
+        relative: _read_bytes(recovery / relative)
+        for relative, identity in source_manifest.items()
+        if stat.S_ISREG(identity.mode)
+    }
     consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
     original_acquire = consolidate_module.acquire_legacy_gateway_locks
     original_finish = consolidate_module._archive_and_finish
@@ -3241,9 +3266,66 @@ def test_recovery_archive_finishes_while_legacy_exclusion_is_held(
         checked_finish,
     )
 
+    if active_writer:
+        lease = acquire_gateway_legacy_lease(state)
+        assert lease is not None
+        try:
+            blocked = consolidate_recovery_profiles(user_data, primary)
+            assert blocked.outcome == "blocked"
+            assert blocked.stable_code == "legacy_gateway_running"
+        finally:
+            release_gateway_legacy_lease(lease)
+        assert {
+            relative: _read_bytes(recovery / relative) for relative in source_bytes
+        } == source_bytes
+        assert json.loads(
+            (user_data / ".opensquilla-profile-consolidation.json").read_text(encoding="utf-8")
+        )["phase"] == "prepared"
+
     result = consolidate_recovery_profiles(user_data, primary)
 
     assert result.outcome == "consolidated", result
+    assert result.backup_path is not None
+    archived = result.backup_path / "recovery-profiles" / recovery_id
+    assert set(profile_no_follow_manifest(archived)) == set(source_manifest)
+    assert {
+        relative: _read_bytes(archived / relative) for relative in source_bytes
+    } == source_bytes
+    preserved_state = primary / "recovered-data" / recovery_id / "profile" / "state"
+    assert not _is_file(preserved_state / lock_name)
+    assert _read_bytes(preserved_state / "nested" / "gateway.pid.lock") == (
+        b"ordinary nested data\n"
+    )
+    with contextlib.closing(sqlite3.connect(primary / "state" / "sessions.db")) as connection:
+        assert connection.execute(
+            "SELECT content FROM transcript_entries WHERE session_key = ?",
+            ("agent:main:archive-order",),
+        ).fetchone() == (recovery_id,)
+    assert consolidate_recovery_profiles(user_data, primary).outcome == "noop"
+
+
+def test_preserve_recovery_state_propagates_unrelated_copy_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+    home = tmp_path / "recovery" / "opensquilla"
+    state = home / "state"
+    state.mkdir(parents=True)
+    source = state / "saved-data.bin"
+    source.write_bytes(b"must remain available\n")
+    profile = consolidate_module._RecoveryProfile("recovery-id", home.parent, home, 1)
+    original_copy = consolidate_module.shutil.copy2
+
+    def fail_copy(source_path, *args, **kwargs):
+        if Path(source_path).name == source.name:
+            raise PermissionError(errno.EACCES, "unreadable saved data", str(source_path))
+        return original_copy(source_path, *args, **kwargs)
+
+    monkeypatch.setattr(consolidate_module.shutil, "copy2", fail_copy)
+    with pytest.raises(PermissionError, match="unreadable saved data"):
+        consolidate_module._preserve_excluded_profile_data(tmp_path / "staging", profile)
+    assert source.read_bytes() == b"must remain available\n"
 
 
 def test_missing_external_root_suffixes_are_created_after_prepared_journal(

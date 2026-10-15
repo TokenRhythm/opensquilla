@@ -1119,3 +1119,101 @@ async def test_collaboration_intent_stays_system_on_actual_wire_without_extra_ca
 
 # replace lint suppress
 _ = replace
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["direct", "router", "router_cross_provider", "explicit"])
+async def test_initial_provider_ready_uses_final_physical_deployment(mode, monkeypatch) -> None:
+    from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
+
+    primary = ProviderConfig(
+        "openai", "primary-model", api_key="synthetic-primary-key",
+        base_url="https://primary.invalid/v1", proxy="http://proxy.invalid",
+        provider_routing={"only": "primary"}, extra_body={"service_tier": "default"},
+    )
+    routed = ProviderConfig(
+        "anthropic" if mode == "router_cross_provider" else "openai",
+        "routed-model", api_key="synthetic-route-key",
+        base_url="https://route.invalid/v1", org_id="route-org",
+        provider_routing={"only": "route"}, extra_body={"route_option": True},
+    )
+    selector = ModelSelector(SelectorConfig(primary=primary))
+    selected_provider = _StubProvider("selected")
+    monkeypatch.setattr(selector, "resolve", lambda: selected_provider)
+    notifications = []
+
+    class RoutedPipeline:
+        async def run_pipeline(self, request):
+            assert notifications == []
+            if mode.startswith("router"):
+                request.cloned_selector.override_provider_config(routed)
+            return _make_turn(model="routed-model"), selected_provider
+
+    stage = _make_stage(executor=RoutedPipeline())
+    output = await stage.run(replace(
+        _make_input(
+            cloned_selector=selector,
+            model="explicit-model" if mode == "explicit" else None,
+        ),
+        on_initial_provider_ready=notifications.append,
+    ))
+    expected = (
+        replace(primary, model="explicit-model") if mode == "explicit"
+        else primary if mode == "direct" else routed
+    )
+    assert notifications == [expected]
+    assert notifications[0] is selector.current_config
+    assert type(output.require_output().provider).__name__ == "_SelectorFallbackProvider"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ready", [True, False])
+async def test_initial_provider_ready_uses_existing_ensemble_aggregator(ready, monkeypatch) -> None:
+    from opensquilla.provider.ensemble import EnsembleMemberConfig, EnsembleProvider
+    from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
+
+    primary = ProviderConfig("openai", "fixed-model", api_key="synthetic-fixed-key")
+    aggregator = ProviderConfig(
+        "anthropic", "aggregator-model", api_key="synthetic-aggregator-key",
+        base_url="https://aggregator.invalid", extra_body={"selected": True},
+    )
+    provider = EnsembleProvider(
+        profile_name="test",
+        proposers=[EnsembleMemberConfig(ProviderConfig("openai", "proposer-model"))],
+        aggregator=EnsembleMemberConfig(aggregator, ready=ready),
+    )
+
+    def no_chat(*args, **kwargs):
+        raise AssertionError("deployment notification must not execute Ensemble.chat")
+
+    monkeypatch.setattr(provider, "chat", no_chat)
+    notifications = []
+    stage = _make_stage(executor=_RecordingPipelineExecutor(turn=_make_turn(), provider=provider))
+    await stage.run(replace(
+        _make_input(cloned_selector=ModelSelector(SelectorConfig(primary=primary))),
+        on_initial_provider_ready=notifications.append,
+    ))
+    assert notifications == ([aggregator] if ready else [])
+
+
+@pytest.mark.asyncio
+async def test_initial_provider_ready_observer_failure_does_not_fail_turn() -> None:
+    from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
+
+    notifications = []
+
+    def observer(deployment):
+        notifications.append(deployment.model)
+        raise RuntimeError("synthetic observer failure")
+
+    stage = _make_stage(executor=_RecordingPipelineExecutor(
+        turn=_make_turn(), provider=_StubProvider("selected"),
+    ))
+    outcome = await stage.run(replace(
+        _make_input(cloned_selector=ModelSelector(SelectorConfig(
+            primary=ProviderConfig("openai", "primary-model"),
+        ))),
+        on_initial_provider_ready=observer,
+    ))
+    assert notifications == ["primary-model"]
+    assert outcome.require_output().resolved_model == "primary-model"

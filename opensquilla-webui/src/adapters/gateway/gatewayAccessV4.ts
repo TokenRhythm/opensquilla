@@ -5,6 +5,7 @@ import type {
   GatewayConnectionHealth,
   GatewayConnectionPhase,
   GatewayRunModePolicy,
+  HostExecuteUnavailableReason,
   SupportBundleUnavailableReason,
 } from '@/modules/gatewayAccess'
 import { SESSIONS_MESSAGES_HYDRATE_METHOD } from '@/contracts/generated/v4/sessionsMessagesHydrate'
@@ -190,6 +191,23 @@ function streamIdleTimeoutMs(policy: GatewayAccessSource['policy']): number | nu
     : null
 }
 
+function hostExecuteUnavailableReason(source: GatewayAccessSource): HostExecuteUnavailableReason {
+  // Terminal RPCs are connection-owned and require a live, healthy WebSocket.
+  // Keep the projection fail-closed while a new Hello is pending or transport
+  // recovery is still checking liveness.
+  if (
+    source.state !== 'connected' || source.health !== 'healthy' || source.isResuming
+    || (source.phase !== undefined && source.phase !== 'healthy')
+  ) return 'disconnected'
+  const principal = objectValue(source.auth?.principal)
+  // `_state=connected` can precede the Hello frame on a fresh socket. Treat
+  // that short bootstrap window as unavailable rather than as a permission
+  // denial so the menu does not flash an incorrect authorization message.
+  if (!principal) return 'disconnected'
+  const capabilities = authoritySet(principal?.capabilities)
+  return capabilities?.includes('host.execute') ? null : 'permission'
+}
+
 /** Project v4 transport/hello state into semantic application capabilities. */
 export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAccess {
   return {
@@ -226,6 +244,12 @@ export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAcces
     },
     get isAvailable() {
       return source.state === 'connected'
+    },
+    get canExecuteHost() {
+      return hostExecuteUnavailableReason(source) === null
+    },
+    get hostExecuteUnavailableReason() {
+      return hostExecuteUnavailableReason(source)
     },
     get isLocalOwner() {
       return source.isLocalOwner

@@ -17,7 +17,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import structlog
@@ -1479,18 +1479,79 @@ class SessionManager:
             with contextlib.suppress(OSError):
                 os.unlink(temporary_path)
 
+    async def _update_session_fields(
+        self,
+        session_key: str,
+        fields: dict[str, Any],
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        operation: str = "update",
+    ) -> SessionNode:
+        """Patch session columns without writing a stale full-row snapshot.
+
+        ``SessionStorage.update_session_fields`` is the production path.  The
+        fallback keeps small in-memory storage adapters used by integrations and
+        tests working until they adopt the field-patch API.
+        """
+        session_key = canonicalize_session_key(session_key)
+        patch = getattr(self._storage, "update_session_fields", None)
+        if callable(patch):
+            try:
+                return cast(
+                    SessionNode,
+                    await patch(
+                        session_key,
+                        fields,
+                        expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch,
+                    ),
+                )
+            except StaleEpochError as exc:
+                # Preserve the legacy manager contract for a generation that
+                # disappeared between the read and the conditional write.
+                if expected_session_id is not None:
+                    raise KeyError(f"Session generation changed: {session_key}") from exc
+                raise
+
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        _require_compatible_session_owner(
+            node,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation=operation,
+        )
+        for name, value in fields.items():
+            if hasattr(node, name) and name not in {
+                "session_key",
+                "session_id",
+                "created_at",
+                "updated_at",
+                "model_routing_mode",
+                "model_routing_revision",
+            }:
+                setattr(node, name, value)
+        node.updated_at = _now_ms()
+        owner: dict[str, Any] = {"expected_session_id": node.session_id}
+        if expected_session_epoch is not None:
+            owner["expected_session_epoch"] = expected_session_epoch
+        await self._storage.upsert_session(node, **owner)
+        return node
+
     async def resume(self, session_key: str) -> SessionNode:
         """Load an existing session; touch updated_at."""
         session_key = canonicalize_session_key(session_key)
         node = await self._storage.get_session(session_key)
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
-        node.updated_at = _now_ms()
-        await self._storage.upsert_session(
-            node,
+        return await self._update_session_fields(
+            session_key,
+            {},
             expected_session_id=node.session_id,
+            operation="resume",
         )
-        return node
 
     async def update(
         self,
@@ -1511,18 +1572,19 @@ class SessionManager:
             expected_session_epoch=expected_session_epoch,
             operation="update",
         )
-        for k, v in fields.items():
-            if hasattr(node, k):
-                setattr(node, k, v)
-        node.updated_at = _now_ms()
-        upsert_owner: dict[str, Any] = {"expected_session_id": node.session_id}
-        if expected_session_epoch is not None:
-            upsert_owner["expected_session_epoch"] = expected_session_epoch
-        await self._storage.upsert_session(
-            node,
-            **upsert_owner,
+        return await self._update_session_fields(
+            session_key,
+            fields,
+            expected_session_id=expected_session_id or node.session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation="update",
         )
-        return node
+
+    async def set_generated_title_if_unchanged(
+        self, expected_session: SessionNode, title: str,
+    ) -> bool:
+        """Commit a background title only to the session/title slot we inspected."""
+        return await self._storage.set_generated_title_if_unchanged(expected_session, title)
 
     async def finish(
         self,
@@ -1544,23 +1606,24 @@ class SessionManager:
             operation="finish",
         )
         now = _now_ms()
-        node.status = status
-        node.ended_at = now
-        node.updated_at = now
+        fields: dict[str, Any] = {
+            "status": status,
+            "ended_at": now,
+        }
         if node.started_at:
-            node.runtime_ms = now - node.started_at
-        upsert_owner: dict[str, Any] = {"expected_session_id": node.session_id}
-        if expected_session_epoch is not None:
-            upsert_owner["expected_session_epoch"] = expected_session_epoch
-        await self._storage.upsert_session(
-            node,
-            **upsert_owner,
+            fields["runtime_ms"] = now - node.started_at
+        persisted = await self._update_session_fields(
+            session_key,
+            fields,
+            expected_session_id=node.session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation="finish",
         )
         self.evict_session_runtime_state(
             session_key,
-            session_id=node.session_id,
+            session_id=persisted.session_id,
         )
-        return node
+        return persisted
 
     def evict_session_runtime_state(
         self,
@@ -4199,8 +4262,12 @@ class SessionManager:
         for entry in recent:
             await self._storage.append_transcript_entry(entry)
 
-        node.updated_at = _now_ms()
-        await self._storage.upsert_session(node)
+        await self._update_session_fields(
+            session_key,
+            {},
+            expected_session_id=node.session_id,
+            operation="truncate",
+        )
 
         return {"truncated": True, "before_count": before_count, "after_count": len(recent)}
 

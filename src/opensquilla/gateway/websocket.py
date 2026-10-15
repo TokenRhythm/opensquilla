@@ -301,7 +301,15 @@ _PROVIDER_PROBE_MODES: tuple[str, ...] = ("model", "reachability")
 _ACTIVE_PROVIDER_PROBE_LEASES: set[object] = set()
 _MAX_ACTIVE_PROVIDER_PROBES = 16
 _BASE_DETACHED_RPC_METHODS: frozenset[str] = frozenset(
-    {"skills.install"}
+    {
+        "skills.install",
+        # Terminal control is connection-local and must not queue behind a
+        # slow chat mutation or metadata read. The PTY and writer queues still
+        # provide their own bounded backpressure and teardown semantics.
+        "terminal.write",
+        "terminal.resize",
+        "terminal.close",
+    }
 ).union(
     _CONCURRENT_OPTIONAL_READ_METHODS,
 )
@@ -4104,6 +4112,8 @@ def _build_features(dispatcher: RpcDispatcher, *, principal: Principal | None = 
         "health",
         "heartbeat",
         "cron",
+        "terminal.output",
+        "terminal.exit",
         TURN_COMMITTED_EVENT,
     ]
     return FeaturesInfo(methods=methods, events=events)

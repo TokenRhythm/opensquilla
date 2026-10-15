@@ -1379,3 +1379,78 @@ def test_true_identifier_collision_still_renumbers_the_import(tmp_path: Path) ->
     assert rows["agent:alpha:main"] == "shared-identifier"
     assert rows["agent:beta:main"] == result.remapped_session_ids["shared-identifier"]
     assert len(set(rows.values())) == 2
+
+
+@pytest.mark.parametrize("existing_legacy_target", [False, True])
+async def test_merge_ledger_starts_without_resnapshotting_usage(
+    tmp_path: Path, existing_legacy_target: bool,
+) -> None:
+    from opensquilla.gateway.usage_query import query_usage_ledger
+    from opensquilla.session.models import SessionNode
+    from opensquilla.session.usage_ledger import UsageEventCompletion, UsageEventStart
+
+    source_path = tmp_path / "source.db"
+    target_path = tmp_path / "target.db"
+    key = "agent:main:history"
+    source = await SessionStorage.open(str(source_path))
+    try:
+        await source.upsert_session(
+            SessionNode(session_key=key, session_id="history", input_tokens=5, total_tokens=5)
+        )
+        await source.initialize_usage_ledger(100)
+        await source.start_usage_event(
+            UsageEventStart(
+                event_id="event", execution_id="execution", call_index=0,
+                session_id="history", started_at_ms=110,
+            )
+        )
+        await source.finalize_usage_event(
+            "event", UsageEventCompletion(completed_at_ms=120, input_tokens=10, total_tokens=10),
+        )
+        await source.reconcile_session_usage_totals_from_ledger(session_key=key, expected_epoch=0)
+        await source.advance_reset_epoch(key)
+        await source.update_usage_backfill_progress(status="complete", now_ms=150)
+        source_state = await source.get_usage_ledger_state()
+        source_baselines = await source.list_usage_legacy_baselines()
+        source_events = await source.query_usage_events(None, None)
+    finally:
+        await source.close()
+    source_bytes = source_path.read_bytes()
+
+    if existing_legacy_target:
+        target = await SessionStorage.open(str(target_path))
+        try:
+            await target.upsert_session(
+                SessionNode(
+                    session_key="agent:main:legacy", session_id="legacy",
+                    input_tokens=7, total_tokens=7,
+                )
+            )
+        finally:
+            await target.close()
+
+    result = merge_session_database(target_path, source_path, source_id="history-source")
+    assert result.imported_sessions == 1
+    assert source_path.read_bytes() == source_bytes
+    target = await SessionStorage.open(str(target_path))
+    try:
+        if not existing_legacy_target:
+            assert "usage_ledger_state" not in result.excluded_tables
+            assert await target.get_usage_ledger_state() == source_state
+        state = await target.initialize_usage_ledger(1_000)
+        assert state.ledger_started_at_ms == 100
+        assert await target.query_usage_events(None, None) == source_events
+        assert [
+            row for row in await target.list_usage_legacy_baselines()
+            if row.session_id == "history"
+        ] == source_baselines
+        historical = await target.get_session(key)
+        assert historical is not None
+        assert historical.total_tokens == 15
+        totals = (await query_usage_ledger(
+            target, {"range": {"preset": "all"}, "timezone": "UTC"}, now_ms=2_000,
+        ))["totals"]
+        assert totals["totalTokens"] == 15 + (7 if existing_legacy_target else 0)
+        assert await target.initialize_usage_ledger(3_000) == state
+    finally:
+        await target.close()

@@ -863,6 +863,20 @@ def test_startup_stage_telemetry_covers_each_process_boundary_without_granting_r
     assert "observed: false" in main_ts
 
 
+def test_startup_timeline_records_shell_profile_and_gateway_spawn_boundaries() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    for event in (
+        "app_ready",
+        "window_created",
+        "window_ready_to_show",
+        "profile_inspect_started",
+        "profile_inspect_finished",
+        "gateway_spawn_requested",
+    ):
+        assert f"desktopStartupLog('{event}'" in main_ts
+    assert "durationMs: Math.max(0, Date.now() - profileInspectStartedAt)" in main_ts
+
+
 def test_boot_and_native_window_backgrounds_match_control_ui_theme_tokens() -> None:
     boot_html = _read("desktop/electron/src/boot.html")
     main_ts = _read("desktop/electron/src/main.ts")
@@ -1260,9 +1274,12 @@ def test_blocked_profile_consolidation_is_maintenance_until_primary_inspection()
         "desktopProfilesConsolidatedThisProcess = true"
     )
 
-    assert (
-        "const consolidationFailure = await consolidateLegacyRecoveryProfilesBeforeStartup()"
-        in startup_inspection
+    # Only proven healthy metadata may omit maintenance. The fallback still
+    # inspects the primary profile before deciding how to surface a failure.
+    assert re.search(
+        r"let consolidationFailure = metadata\.canSkipMaintenance\s*"
+        r"\? null\s*: await consolidateLegacyRecoveryProfilesBeforeStartup\(\)",
+        startup_inspection,
     )
     assert "let inspection = await inspectDesktopProfile(active)" in startup_inspection
     assert startup_inspection.index("let inspection = await inspectDesktopProfile(active)") < (

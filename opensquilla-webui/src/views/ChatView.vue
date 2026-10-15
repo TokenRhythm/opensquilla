@@ -6224,6 +6224,10 @@ const {
 const chatRouteHeader = useChatRouteHeaderBridge()
 const chatRouteHeaderRegistration = chatRouteHeader.register({
   sessionKey,
+  workspaceId: boundWorkspaceId,
+  workspaceReady: computed(() => !isDraftSurface() && activeWorkspaceStatus.value === 'ready'),
+  workspaceResolved: computed(() => !isDraftSurface()
+    && ['none', 'ready', 'unavailable', 'removed'].includes(activeWorkspaceStatus.value)),
   visible: computed(() => !isNewChatLanding.value),
   title: currentChatTitle,
   optimisticTitle: computed(() => (

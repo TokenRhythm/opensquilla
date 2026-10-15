@@ -62,6 +62,24 @@ function owner(title: string): {
 }
 
 describe('chat route header bridge', () => {
+  it('fences workspace panel availability to the current registered session', () => {
+    const bridge = createBridge()
+    const project = owner('project')
+    project.model.workspaceId = ref('workspace-a')
+    project.model.workspaceReady = ref(true)
+    project.model.workspaceResolved = ref(true)
+    const previous = bridge.register(project.model, project.commands)
+    expect(bridge.model.workspaceId.value).toBe('workspace-a')
+    expect(bridge.model.workspaceReady.value).toBe(true)
+    expect(bridge.model.workspaceResolved.value).toBe(true)
+    const plain = owner('plain')
+    bridge.register(plain.model, plain.commands)
+    expect(previous.release()).toBe(false)
+    expect(bridge.model.workspaceId.value).toBeNull()
+    expect(bridge.model.workspaceReady.value).toBe(false)
+    expect(bridge.model.workspaceResolved.value).toBe(false)
+  })
+
   it('keeps optional find capability absent for existing header owners', () => {
     const bridge = createBridge()
     const current = owner('old')

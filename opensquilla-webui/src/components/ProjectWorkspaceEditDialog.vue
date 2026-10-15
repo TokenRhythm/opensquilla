@@ -12,7 +12,7 @@
         <h3 id="project-workspace-edit-title">{{ t('workspaces.editProject') }}</h3>
         <label>
           <span>{{ t('workspaces.projectName') }}</span>
-          <input ref="nameInputRef" v-model="name" maxlength="120" @keydown.enter.prevent="save" />
+          <input ref="nameInputRef" v-model="name" :disabled="saving" maxlength="120" @keydown.enter.prevent="save" />
         </label>
         <label>
           <span>{{ t('workspaces.projectPath') }}</span>
@@ -20,7 +20,7 @@
         </label>
         <footer>
           <button class="btn btn--ghost" @click="emit('close')">{{ t('common.cancel') }}</button>
-          <button class="btn btn--primary" :disabled="!name.trim()" @click="save">{{ t('common.save') }}</button>
+          <button class="btn btn--primary" :disabled="saving || !name.trim()" @click="save">{{ t('common.save') }}</button>
         </footer>
       </section>
     </div>
@@ -32,7 +32,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useDialogA11y } from '@/composables/useDialogA11y'
 
-const props = defineProps<{ open: boolean; initialName: string; path: string }>()
+const props = defineProps<{ open: boolean; initialName: string; path: string; saving?: boolean }>()
 const emit = defineEmits<{ close: []; save: [name: string] }>()
 const { t } = useI18n()
 const dialogRef = ref<HTMLElement | null>(null)
@@ -48,7 +48,7 @@ watch(() => props.open, async open => {
 
 function save() {
   const value = name.value.trim()
-  if (value) emit('save', value)
+  if (value && !props.saving) emit('save', value)
 }
 
 useDialogA11y(dialogRef, computed(() => props.open), () => emit('close'), {

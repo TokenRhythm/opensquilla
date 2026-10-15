@@ -618,14 +618,17 @@ class AdmissionPrimitives(Protocol):
     ) -> None: ...
 
 
-    def schedule_auto_title(
+    def install_auto_title(
         self,
+        route: AdmissionRouteEnvelope,
         session_key: str,
         message: str,
         *,
         enabled: bool,
-        session_id: str | None = None,
-        root_turn_id: str | None = None,
+        session_id: str,
+        session_epoch: int,
+        root_turn_id: str,
+        reservation: AdmissionReservation | None = None,
     ) -> None: ...
 
     async def publish_collaboration(

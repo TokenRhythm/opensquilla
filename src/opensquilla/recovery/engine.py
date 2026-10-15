@@ -807,13 +807,59 @@ def _database_safety_code(path: Path) -> str | None:
     return classify_migration_ledger(applied, known).code
 
 
-def _state_safety_code(state_dir: Path) -> str | None:
+def _database_path_safety_code(path: Path) -> str | None:
+    """Check bundle shapes and a bounded header without scanning SQLite pages."""
+    try:
+        metadata = tuple(_regular_source_stat(entry) for entry in _bundle_names(path))
+    except RecoveryError as exc:
+        return exc.stable_code
+    if metadata[0] is None:
+        return "state_database_unsafe_path" if any(metadata[1:]) else None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(_native_io_path(path), flags)
+        try:
+            before = PathIdentity.from_stat(os.fstat(descriptor))
+            if before.metadata_tuple() != PathIdentity.from_stat(metadata[0]).metadata_tuple():
+                return "state_database_changed"
+            header = os.read(descriptor, 100)
+            after = PathIdentity.from_stat(os.fstat(descriptor))
+        finally:
+            os.close(descriptor)
+        current_metadata = tuple(_regular_source_stat(entry) for entry in _bundle_names(path))
+    except RecoveryError as exc:
+        return exc.stable_code
+    except OSError:
+        return "state_database_unreadable"
+    if (
+        before.metadata_tuple() != after.metadata_tuple()
+        or any(
+            (PathIdentity.from_stat(previous).metadata_tuple() if previous is not None else None)
+            != (PathIdentity.from_stat(current).metadata_tuple() if current is not None else None)
+            for previous, current in zip(metadata, current_metadata, strict=True)
+        )
+    ):
+        return "state_database_changed"
+    # Empty databases and unfamiliar headers need the existing SQLite-aware
+    # inspector. Do not mistake an arbitrary regular file for a healthy store.
+    if len(header) != 100 or not header.startswith(b"SQLite format 3\x00"):
+        return "state_database_invalid"
+    return None
+
+
+def _state_safety_code(state_dir: Path, *, metadata_only: bool = False) -> str | None:
     try:
         state_before = PathIdentity.from_stat(_native_stat(state_dir))
     except OSError:
         return "effective_state_unreadable"
+    checker = _database_path_safety_code if metadata_only else _database_safety_code
     for database_name in ("sessions.db", "scheduler.db"):
-        code = _database_safety_code(state_dir / database_name)
+        code = checker(state_dir / database_name)
         if code is not None:
             return code
     try:
@@ -1903,6 +1949,42 @@ def inspect_profile(
 ) -> RecoveryReport:
     """Inspect a Desktop profile without creating or modifying any path."""
 
+    return _inspect_profile(
+        home,
+        profile_kind=profile_kind,
+        _ignore_transaction=_ignore_transaction,
+        _ignore_settings_transaction=_ignore_settings_transaction,
+    )
+
+
+def inspect_startup_profile(
+    home: str | Path | None = None,
+    *,
+    profile_kind: str | None = None,
+) -> RecoveryReport:
+    """Inspect healthy startup metadata without an offline database snapshot.
+
+    Runtime storage owns opening databases and rejecting newer schemas before
+    writes.  Startup retains the same config, path, layout, and transaction
+    classification as the offline inspector; unusual profiles still use that
+    full inspector.  This report is not a replacement for the complete
+    inspection/CAS required by explicit profile and settings mutations.
+    """
+    report = _inspect_profile(home, profile_kind=profile_kind, _metadata_only=True)
+    if report.outcome in {"ready", "recovery_profile"}:
+        return report
+    return inspect_profile(home, profile_kind=profile_kind)
+
+
+def _inspect_profile(
+    home: str | Path | None = None,
+    *,
+    profile_kind: str | None = None,
+    _ignore_transaction: bool = False,
+    _ignore_settings_transaction: bool = False,
+    _metadata_only: bool = False,
+) -> RecoveryReport:
+
     home_path = _resolved_home_path(home)
     kind = _profile_kind(profile_kind, home=home_path)
     if _home_is_unsafe(home_path):
@@ -2116,7 +2198,7 @@ def inspect_profile(
             effective_workspace=effective,
             allowed_actions=_RECOVERY_ACTIONS,
         )
-    state_code = _state_safety_code(state_candidate.path)
+    state_code = _state_safety_code(state_candidate.path, metadata_only=_metadata_only)
     if state_code is not None:
         return _report(
             home=home_path,
@@ -2475,7 +2557,7 @@ def choose_workspace(
 def guard_desktop_profile(home: str | Path | None = None) -> RecoveryReport | None:
     """Fail before runtime writes only for the two hard startup gates.
 
-    After the recovery-governance downgrade, ``inspect_profile`` returns
+    After the recovery-governance downgrade, profile inspection returns
     ``recovery_required`` only for a config authored by a newer build and for
     unsafe path shapes in an elevated Windows process. Every other finding is
     a warning: the profile starts and individual mutations fail closed on
@@ -2486,7 +2568,7 @@ def guard_desktop_profile(home: str | Path | None = None) -> RecoveryReport | No
     kind = _profile_kind(None, home=home_path)
     if kind not in _DESKTOP_PROFILE_KINDS:
         return None
-    report = inspect_profile(home_path, profile_kind=kind)
+    report = inspect_startup_profile(home_path, profile_kind=kind)
     if report.outcome == "recovery_required":
         raise RecoveryRequiredError(report)
     return report
@@ -2520,7 +2602,7 @@ def guarded_desktop_profile(
             # state/gateway.pid.lock, so a hard-gated Desktop profile must be
             # rejected before that compatibility write can happen.
             inspect_started = startup_phase_start("profile_inspect")
-            report = inspect_profile(home_path, profile_kind=kind)
+            report = inspect_startup_profile(home_path, profile_kind=kind)
             startup_phase_end("profile_inspect", inspect_started)
             if report.outcome == "recovery_required":
                 raise RecoveryRequiredError(report)
@@ -2536,5 +2618,6 @@ __all__ = [
     "guard_desktop_profile",
     "guarded_desktop_profile",
     "inspect_profile",
+    "inspect_startup_profile",
     "reconcile_profile",
 ]

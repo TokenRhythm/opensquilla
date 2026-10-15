@@ -801,7 +801,14 @@ def _snapshot_result(path: Path, source_id: str) -> SessionMergeResult:
 def _clear_excluded_operational_rows(path: Path) -> tuple[str, ...]:
     connection = sqlite3.connect(_native_io_path(path))
     try:
-        excluded = _excluded_tables(connection)
+        # This path clones the entire database into an absent target. Its usage
+        # cutover/cursor still describes exactly those copied ledger rows;
+        # clearing it would resnapshot live usage and duplicate legacy totals.
+        # Existing-target merges still exclude the source's global ledger state.
+        excluded = tuple(
+            table for table in _excluded_tables(connection)
+            if table != "usage_ledger_state"
+        )
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.execute("BEGIN IMMEDIATE")
         try:

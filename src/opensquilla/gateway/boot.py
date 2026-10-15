@@ -1619,6 +1619,10 @@ def build_task_runtime_run_kwargs(
         # Internal-only callback: the finalizer supplies the exact assistant
         # row/content to TaskRuntime for durable channel delivery.
         kwargs["assistant_message_sink"] = assistant_message_sink
+    runtime_services = getattr(getattr(run, "envelope", None), "runtime_services", {})
+    on_initial_provider_ready = runtime_services.get("on_initial_provider_ready")
+    if callable(on_initial_provider_ready):
+        kwargs["on_initial_provider_ready"] = on_initial_provider_ready
     return kwargs
 
 
@@ -2456,6 +2460,25 @@ class GatewayServer:
             runtime_shutdown_clean = False
         skills_shutdown_clean = True
         try:
+            # PTYs are connection-owned native processes, so they need an
+            # explicit Gateway shutdown fence in addition to WebSocket
+            # transport cleanup. Terminate them before draining the longer
+            # task-runtime phase, while the absolute shutdown deadline still
+            # has bounded room for native process-tree teardown.
+            try:
+                from opensquilla.gateway.terminal_sessions import get_terminal_manager
+
+                terminal_manager = get_terminal_manager()
+
+                await asyncio.wait_for(
+                    terminal_manager.close_all(),
+                    timeout=remaining(2.0),
+                )
+            except TimeoutError:
+                log.warning("gateway.terminal_shutdown_timeout")
+            except Exception:
+                log.exception("gateway.terminal_shutdown_failed")
+
             # Fence optional integration startup before draining/stopping the
             # core.  Otherwise a late channel/MCP completion could race the
             # shutdown stop_all path and re-publish a stale ready state.
@@ -4418,7 +4441,7 @@ async def start_gateway_server(
     # Keep it separate from gateway.pid so legacy CLI/readers retain their
     # exact schema. Electron supplies a separate userData control directory so
     # an external or intentionally missing runtime state_dir remains untouched.
-    # Cleanup is deliberately owned by cli.main.gateway_run:
+    # Cleanup is deliberately owned by the CLI gateway runner:
     # that outer boundary removes the record only *after* the profile writer
     # lock exits, so record disappearance is a safe restart signal.
     _desktop_gateway_ownership = None

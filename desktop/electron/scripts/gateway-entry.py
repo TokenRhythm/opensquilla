@@ -37,6 +37,15 @@ def _is_recovery_invocation(argv: list[str]) -> bool:
     return index is not None and argv[index] == "recovery"
 
 
+def _is_gateway_run_invocation(argv: list[str]) -> bool:
+    index = _top_level_command_index(argv)
+    return (
+        index is not None
+        and index + 1 < len(argv)
+        and argv[index:index + 2] == ["gateway", "run"]
+    )
+
+
 def _run_desktop_ca_probe() -> int:
     import ssl
 
@@ -341,6 +350,24 @@ if __name__ == "__main__":
         # dispatcher deliberately bypasses opensquilla.cli.main and dotenv.
         os.environ["OPENSQUILLA_RECOVERY_OFFLINE"] = "1"
         from opensquilla.cli.recovery_entry import app
+
+        app()
+        raise SystemExit(0)
+
+    if _is_gateway_run_invocation(sys.argv):
+        # Keep the Desktop Gateway path independent from the full CLI command
+        # registry. The shared runner still owns profile locks, ownership and
+        # shutdown semantics; only unrelated CLI imports move out of this path.
+        from opensquilla.startup_timing import startup_phase_end, startup_phase_start
+
+        _cli_import_started = startup_phase_start("cli_import")
+        try:
+            from opensquilla.cli.gateway_entry import app
+        except BaseException:
+            startup_phase_end("cli_import", _cli_import_started, failed=True)
+            raise
+        else:
+            startup_phase_end("cli_import", _cli_import_started)
 
         app()
         raise SystemExit(0)

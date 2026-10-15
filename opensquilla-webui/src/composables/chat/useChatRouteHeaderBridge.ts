@@ -30,6 +30,9 @@ export interface ChatRouteHeaderFindState {
 
 export interface ChatRouteHeaderModel {
   sessionKey: Readonly<Ref<string>>
+  workspaceId?: Readonly<Ref<string | null>>
+  workspaceReady?: Readonly<Ref<boolean>>
+  workspaceResolved?: Readonly<Ref<boolean>>
   visible: Readonly<Ref<boolean>>
   title: Readonly<Ref<string>>
   optimisticTitle: Readonly<Ref<string>>
@@ -69,6 +72,9 @@ export interface ChatRouteHeaderRegistration {
 export interface ChatRouteHeaderBridge {
   model: {
     sessionKey: ComputedRef<string>
+    workspaceId: ComputedRef<string | null>
+    workspaceReady: ComputedRef<boolean>
+    workspaceResolved: ComputedRef<boolean>
     visible: ComputedRef<boolean>
     title: ComputedRef<string>
     optimisticTitle: ComputedRef<string>
@@ -151,6 +157,9 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
   const bridge: ChatRouteHeaderBridge = {
     model: {
       sessionKey: computed(() => ownerValue('sessionKey', '')),
+      workspaceId: computed(() => activeOwner.value?.model.workspaceId?.value ?? null),
+      workspaceReady: computed(() => activeOwner.value?.model.workspaceReady?.value ?? false),
+      workspaceResolved: computed(() => activeOwner.value?.model.workspaceResolved?.value ?? false),
       visible: computed(() => ownerValue('visible', false)),
       title: computed(() => ownerValue('title', '')),
       optimisticTitle: computed(() => ownerValue('optimisticTitle', '')),
