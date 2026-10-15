@@ -1082,6 +1082,27 @@ def test_apply_pending_skips_backup_on_fresh_install(tmp_path: Path) -> None:
     assert list(tmp_path.glob("*.bak")) == []
 
 
+def test_migration_phases_survive_private_log_projection(tmp_path: Path) -> None:
+    from structlog.testing import capture_logs
+
+    from opensquilla.observability.log_privacy import private_log_event
+
+    migrations_dir = tmp_path / "migrations"
+    _write_demo_migration(migrations_dir, name="V001__fresh")
+    with capture_logs() as records:
+        apply_pending(str(tmp_path / "sessions.db"), migrations_dir)
+    projected = [private_log_event(None, "debug", record) for record in records]
+    events = [record["event"] for record in projected]
+    assert events == [
+        "migrator.backend_open_started", "migrator.backend_open_ready",
+        "migrator.discovery_started", "migrator.discovery_ready",
+        "migrator.lock_wait_started", "migrator.lock_acquired",
+        "migrator.plan_ready", "migrator.apply_started", "migrator.apply_ready",
+    ]
+    assert projected[-1]["count"] == 1
+    assert projected[-1]["duration_ms"] >= 0
+
+
 def test_apply_pending_backs_up_existing_db_before_applying(tmp_path: Path) -> None:
     migrations_dir = tmp_path / "migrations"
     _write_demo_migration(migrations_dir, name="V001__first")

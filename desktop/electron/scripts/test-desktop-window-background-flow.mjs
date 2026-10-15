@@ -324,6 +324,8 @@ try {
       OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
       OPENSQUILLA_AUTH_MODE: 'token',
       OPENSQUILLA_AUTH_TOKEN: 'synthetic-window-flow-operator-token',
+      // Keep the exactly-once user-send assertion independent of title requests.
+      OPENSQUILLA_NAMING_ENABLED: 'false',
       OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED: flowControl ? 'true' : 'false',
       ...(idleSend ? {
         // Match the synthetic first-send gate's model budget so bundled tool

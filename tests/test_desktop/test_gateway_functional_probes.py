@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import re
 import runpy
 import socket
 import sqlite3
@@ -13,12 +14,17 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import closing, contextmanager
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 ENTRY = Path(__file__).resolve().parents[2] / "desktop/electron/scripts/gateway-entry.py"
 MIGRATIONS_DIR = ENTRY.parents[3] / "migrations"
+# Match Desktop's bounded cold-start contract, including its late-ready window.
+# This transport smoke is not a separate 40-second performance gate.
+GATEWAY_STARTUP_TIMEOUT_SECONDS = 120
 
 
 def isolated_environment(tmp_path: Path) -> dict[str, str]:
@@ -74,7 +80,10 @@ def _gateway_startup_diagnostics(tmp_path: Path) -> str:
     except sqlite3.Error as exc:
         ledger = {"error_type": type(exc).__name__,
                   "error_code": getattr(exc, "sqlite_errorname", None)}
-    diagnostics.append(f"migration ledger: {json.dumps(ledger)}")
+    diagnostics.append(
+        "migration ledger (read-only diagnostic; a live migration may hold the writer lock): "
+        f"{json.dumps(ledger)}"
+    )
     return "\n\n".join(diagnostics)
 
 
@@ -112,18 +121,77 @@ def _running_gateway(tmp_path: Path, environment: dict[str, str]):
 
 
 def _wait_for_gateway_healthz(gateway: subprocess.Popen, port: int, tmp_path: Path) -> None:
-    deadline = time.monotonic() + 40
+    deadline = time.monotonic() + GATEWAY_STARTUP_TIMEOUT_SECONDS
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     while time.monotonic() < deadline:
         assert gateway.poll() is None, _gateway_startup_diagnostics(tmp_path)
         try:
-            with opener.open(f"http://127.0.0.1:{port}/healthz", timeout=1) as response:
-                if json.load(response).get("ok"):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            with opener.open(
+                f"http://127.0.0.1:{port}/healthz", timeout=min(1, remaining),
+            ) as response:
+                if json.load(response).get("ok") and time.monotonic() < deadline:
                     return
         except (OSError, urllib.error.URLError):
             pass
-        time.sleep(0.1)
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
     pytest.fail(_gateway_startup_diagnostics(tmp_path))
+
+
+def test_gateway_probe_matches_desktop_startup_budget() -> None:
+    lifecycle = ENTRY.parents[1] / "src" / "gateway-lifecycle.ts"
+    match = re.search(
+        r"export const DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS = ([\d_]+)",
+        lifecycle.read_text(encoding="utf-8"),
+    )
+    assert match is not None
+    assert int(match[1].replace("_", "")) == GATEWAY_STARTUP_TIMEOUT_SECONDS * 1000
+
+
+@pytest.mark.parametrize("ready_after", [45, GATEWAY_STARTUP_TIMEOUT_SECONDS, None])
+def test_gateway_probe_keeps_late_readiness_bounded(tmp_path, monkeypatch, ready_after):
+    clock = SimpleNamespace(now=0.0)
+
+    def advance(seconds):
+        clock.now += seconds
+
+    def probe(_url, *, timeout):
+        assert 0 < timeout <= min(1, GATEWAY_STARTUP_TIMEOUT_SECONDS - clock.now)
+        advance(timeout)
+        if ready_after is not None and clock.now >= ready_after:
+            return StringIO('{"ok": true}')
+        raise OSError("synthetic startup still in progress")
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(time, "sleep", advance)
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: SimpleNamespace(open=probe))
+    monkeypatch.setattr(
+        sys.modules[__name__], "_gateway_startup_diagnostics", lambda _: "synthetic timeout",
+    )
+    gateway = SimpleNamespace(poll=lambda: None)
+    if ready_after is None or ready_after >= GATEWAY_STARTUP_TIMEOUT_SECONDS:
+        with pytest.raises(pytest.fail.Exception, match="synthetic timeout"):
+            _wait_for_gateway_healthz(gateway, 1, tmp_path)
+        assert clock.now == GATEWAY_STARTUP_TIMEOUT_SECONDS
+    else:
+        _wait_for_gateway_healthz(gateway, 1, tmp_path)
+        assert ready_after <= clock.now < ready_after + 2
+
+
+def test_migration_busy_diagnostic_does_not_mean_migration_failed(tmp_path):
+    database = tmp_path / "profile" / "state" / "sessions.db"
+    database.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(database)) as writer:
+        writer.execute("CREATE TABLE _yoyo_migration (migration_id TEXT, applied_at_utc TEXT)")
+        writer.execute("BEGIN EXCLUSIVE")
+        writer.execute("INSERT INTO _yoyo_migration VALUES ('V001__synthetic', '2026-01-01')")
+        # The same healthy writer produces SQLITE_BUSY in the separate readonly
+        # diagnostic while committing a migration; it does not fail or roll back.
+        assert '"error_code": "SQLITE_BUSY"' in _gateway_startup_diagnostics(tmp_path)
+        writer.commit()
+    assert '"applied_count": 1' in _gateway_startup_diagnostics(tmp_path)
 
 
 def test_document_probe_extracts_text_and_renders_a_decodable_image(tmp_path: Path) -> None:

@@ -462,6 +462,7 @@ def test_pr_1347_test_only_change_uses_exact_targets_and_windows_shards(
         "tests/test_recovery/test_recovery_cmd.py",
     ]
     importing_consumers = [
+        "tests/test_gateway/test_auto_title_handoff.py",
         "tests/test_gateway/test_p1a_exact_abort_contract.py",
         "tests/test_gateway/test_task_runtime_cancellation_settlement.py",
     ]

@@ -17317,6 +17317,7 @@ class SessionStorage:
                 ) as cur:
                     if (cur.rowcount or 0) != 1:
                         if expected_session_id is not None:
+                            assert expected_session_epoch is not None
                             await self._raise_stale_epoch(
                                 conn,
                                 session_key=node.session_key,

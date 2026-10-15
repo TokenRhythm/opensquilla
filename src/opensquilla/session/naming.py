@@ -844,6 +844,8 @@ async def generate_session_title(
             return
 
         explicit_target = getattr(naming_cfg, "model", None) or getattr(naming_cfg, "tier", None)
+        provider: object | None
+        target: NamingTarget | None
         if selected_provider_config is not None and not explicit_target:
             from opensquilla.provider.selector import build_provider_from_config
 

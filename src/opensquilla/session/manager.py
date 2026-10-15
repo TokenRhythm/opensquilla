@@ -17,7 +17,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import structlog
@@ -1498,11 +1498,14 @@ class SessionManager:
         patch = getattr(self._storage, "update_session_fields", None)
         if callable(patch):
             try:
-                return await patch(
-                    session_key,
-                    fields,
-                    expected_session_id=expected_session_id,
-                    expected_session_epoch=expected_session_epoch,
+                return cast(
+                    SessionNode,
+                    await patch(
+                        session_key,
+                        fields,
+                        expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch,
+                    ),
                 )
             except StaleEpochError as exc:
                 # Preserve the legacy manager contract for a generation that
