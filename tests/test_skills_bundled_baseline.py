@@ -19,5 +19,5 @@ def test_bundled_skill_visibility_baseline_is_stable(tmp_path: Path) -> None:
     assert len(skills) == 11
     assert Counter(skill.visibility.value for skill in skills) == {
         "public": 10,
-        "experimental": 1,
+        "internal": 1,
     }
