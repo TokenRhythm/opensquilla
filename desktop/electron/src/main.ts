@@ -9642,6 +9642,7 @@ async function startGateway(): Promise<GatewayState> {
   })
 
   const gatewaySpawnRequestedAt = Date.now()
+  desktopStartupLog('gateway_spawn_requested', { port, runtimeMode: runtime.mode })
   const child = spawn(
     runtime.command,
     [...runtime.args, '--port', String(port), '--listen', '127.0.0.1', '--config', desktopConfigPath()],
@@ -9934,6 +9935,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     },
   })
   mainWindow = window
+  desktopStartupLog('window_created')
   installGatewayShutdownRequestInterceptor(window)
   trackDesktopReliabilityWindow(window)
   installDesktopZoomShortcuts(
@@ -10194,6 +10196,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
   }
 
   window.once('ready-to-show', () => {
+    desktopStartupLog('window_ready_to_show')
     if (!window.isDestroyed()) window.show()
   })
 
@@ -10599,7 +10602,23 @@ async function openOrResumeDesktopApp(): Promise<void> {
         await createMainWindow()
         focusMainWindow()
         observeDesktopStartupStage('profile-inspect', { operation: 'startup' })
-        const profileReady = await inspectActiveProfileBeforeStartup()
+        const profileInspectStartedAt = Date.now()
+        desktopStartupLog('profile_inspect_started')
+        let profileReady: boolean
+        try {
+          profileReady = await inspectActiveProfileBeforeStartup()
+        } catch (error) {
+          desktopStartupLog('profile_inspect_finished', {
+            ready: false,
+            failed: true,
+            durationMs: Math.max(0, Date.now() - profileInspectStartedAt),
+          })
+          throw error
+        }
+        desktopStartupLog('profile_inspect_finished', {
+          ready: profileReady,
+          durationMs: Math.max(0, Date.now() - profileInspectStartedAt),
+        })
         // Only trust config.state_dir after profile inspection/recovery has
         // bounded the active profile. Sync before publishing that inspection's
         // terminal result so existing opt-in users retain profile-start facts;
@@ -16296,6 +16315,7 @@ if (!gotSingleInstanceLock) {
   })
 
   void app.whenReady().then(async () => {
+    desktopStartupLog('app_ready')
     // An OS wake is an observation, not permission to restart or reload.
     const notifySystemResume = () => {
       for (const window of BrowserWindow.getAllWindows()) {

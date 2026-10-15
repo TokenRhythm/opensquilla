@@ -4441,7 +4441,7 @@ async def start_gateway_server(
     # Keep it separate from gateway.pid so legacy CLI/readers retain their
     # exact schema. Electron supplies a separate userData control directory so
     # an external or intentionally missing runtime state_dir remains untouched.
-    # Cleanup is deliberately owned by cli.main.gateway_run:
+    # Cleanup is deliberately owned by the CLI gateway runner:
     # that outer boundary removes the record only *after* the profile writer
     # lock exits, so record disappearance is a safe restart signal.
     _desktop_gateway_ownership = None

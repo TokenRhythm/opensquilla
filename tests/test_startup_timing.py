@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import io
 import json
+import os
 import runpy
 import sys
 import zipfile
@@ -163,7 +164,7 @@ def test_ca_failure_remains_packaging_error_and_is_not_logged(enabled, monkeypat
 
 
 @pytest.mark.parametrize("import_fails", [False, True])
-def test_packaged_entry_brackets_real_cli_import_without_running_gateway(
+def test_packaged_entry_brackets_full_cli_import_for_non_gateway_commands(
     enabled, monkeypatch, capsys, import_fails,
 ) -> None:
     sentinel = ImportError("secret import path")
@@ -179,7 +180,7 @@ def test_packaged_entry_brackets_real_cli_import_without_running_gateway(
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", intercept)
-    monkeypatch.setattr(sys, "argv", ["synthetic-gateway", "gateway", "run"])
+    monkeypatch.setattr(sys, "argv", ["synthetic-gateway", "diagnostics", "--help"])
     if import_fails:
         with pytest.raises(ImportError) as caught:
             runpy.run_path(str(ENTRY), run_name="__main__")
@@ -193,3 +194,123 @@ def test_packaged_entry_brackets_real_cli_import_without_running_gateway(
         ("cli_import", "start"),
         ("cli_import", "failed" if import_fails else "complete"),
     ]
+
+
+@pytest.mark.parametrize("import_fails", [False, True])
+def test_packaged_entry_routes_gateway_run_to_light_dispatcher(
+    enabled, monkeypatch, capsys, import_fails,
+) -> None:
+    sentinel = ImportError("secret import path")
+    original_import = builtins.__import__
+    calls = []
+
+    def intercept(name, *args, **kwargs):
+        if name == "opensquilla.cli.gateway_entry":
+            calls.append("gateway_entry")
+            if import_fails:
+                raise sentinel
+            return SimpleNamespace(app=lambda: calls.append("app"))
+        if name == "opensquilla.cli.main":
+            calls.append("full_cli")
+            raise AssertionError("gateway run must not import the full CLI")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", intercept)
+    monkeypatch.setattr(sys, "argv", ["synthetic-gateway", "gateway", "run"])
+    if import_fails:
+        with pytest.raises(ImportError) as caught:
+            runpy.run_path(str(ENTRY), run_name="__main__")
+        assert caught.value is sentinel
+        assert calls == ["gateway_entry"]
+    else:
+        with pytest.raises(SystemExit) as caught:
+            runpy.run_path(str(ENTRY), run_name="__main__")
+        assert caught.value.code == 0
+        assert calls == ["gateway_entry", "app"]
+
+    events = _events(capsys)
+    assert [(item["phase"], item["status"]) for item in events] == [
+        ("cli_import", "start"),
+        ("cli_import", "failed" if import_fails else "complete"),
+    ]
+
+
+def test_gateway_light_dispatcher_forwards_gateway_options(monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_RECOVERY_OFFLINE", "1")
+    # Track the callback's direct environment write so teardown restores it.
+    monkeypatch.setenv("OPENSQUILLA_PROFILE", "")
+    import opensquilla.cli.gateway_entry as gateway_entry
+
+    captured = {}
+
+    def fake_run_gateway_with_profile(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_runner.run_gateway_with_profile",
+        fake_run_gateway_with_profile,
+    )
+
+    from typer.testing import CliRunner
+
+    result = CliRunner().invoke(
+        gateway_entry.app,
+        [
+            "--profile",
+            "qa",
+            "gateway",
+            "run",
+            "--port",
+            "19999",
+            "--bind",
+            "127.0.0.2",
+            "--listen",
+            "127.0.0.3",
+            "--debug",
+            "--config",
+            "profile/config.toml",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert captured == {
+        "port": 19999,
+        "bind": "127.0.0.2",
+        "listen": "127.0.0.3",
+        "debug": True,
+        "config_path": "profile/config.toml",
+    }
+    assert os.environ["OPENSQUILLA_PROFILE"] == "qa"
+
+
+def test_gateway_light_dispatcher_keeps_busy_profile_marker_and_release(monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_RECOVERY_OFFLINE", "1")
+    from typer.testing import CliRunner
+
+    import opensquilla.cli.gateway_entry as gateway_entry
+    import opensquilla.gateway.desktop_ownership as ownership
+    import opensquilla.recovery as recovery
+    from opensquilla.recovery import ProfileLockBusyError
+
+    released = []
+
+    class BusyProfile:
+        def __enter__(self):
+            raise ProfileLockBusyError("private profile path")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(recovery, "guarded_desktop_profile", lambda **_kwargs: BusyProfile())
+    monkeypatch.setattr(
+        ownership,
+        "release_active_desktop_gateway_ownership",
+        lambda: released.append(True),
+    )
+
+    result = CliRunner().invoke(gateway_entry.app, ["gateway", "run"])
+
+    assert result.exit_code == 1
+    assert "OPENSQUILLA_PROFILE_IN_USE" in result.stdout
+    assert "private profile path" not in result.stdout
+    assert released == [True]

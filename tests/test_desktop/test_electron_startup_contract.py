@@ -863,6 +863,20 @@ def test_startup_stage_telemetry_covers_each_process_boundary_without_granting_r
     assert "observed: false" in main_ts
 
 
+def test_startup_timeline_records_shell_profile_and_gateway_spawn_boundaries() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    for event in (
+        "app_ready",
+        "window_created",
+        "window_ready_to_show",
+        "profile_inspect_started",
+        "profile_inspect_finished",
+        "gateway_spawn_requested",
+    ):
+        assert f"desktopStartupLog('{event}'" in main_ts
+    assert "durationMs: Math.max(0, Date.now() - profileInspectStartedAt)" in main_ts
+
+
 def test_boot_and_native_window_backgrounds_match_control_ui_theme_tokens() -> None:
     boot_html = _read("desktop/electron/src/boot.html")
     main_ts = _read("desktop/electron/src/main.ts")
