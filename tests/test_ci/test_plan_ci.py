@@ -367,6 +367,24 @@ def _windows_partitions_for(*paths: str) -> list[str]:
     return sorted({ownership[path] for path in paths})
 
 
+def test_desktop_native_platform_evidence_tracks_the_reusable_probe_matrix(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    import yaml
+
+    workflow_path = ".github/workflows/desktop-native-probes.yml"
+    native = yaml.safe_load(Path(workflow_path).read_text(encoding="utf-8"))["jobs"]["native"]
+    expected_native = {
+        (cell["os"], f"native-{cell['probe']}")
+        for cell in native["strategy"]["matrix"]["include"]
+    }
+    plan = _plan(tmp_path, suite_config, ".ci/run-all")
+
+    assert len(expected_native) == 10
+    assert _platform_cells(plan, "desktop-recovery-e2e") == _matrix(plan) | expected_native
+    assert workflow_path in suite_config["suites"]["desktop-recovery-e2e"]["execution_inputs"]
+
+
 @pytest.mark.parametrize("path", [
     "src/opensquilla/mcp/stdio.py",
     "src/opensquilla/mcp/sdk_client.py",

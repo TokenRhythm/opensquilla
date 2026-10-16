@@ -1003,9 +1003,10 @@ def test_windows_execution_partitions_cover_every_file_once_within_its_family() 
 
 def test_planned_windows_inventory_preserves_owners_for_matrix_subsets(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
-    # Exercise every singleton, pair, omitted-owner boundary, and the full plan.
-    # Enumerating every possible 20-cell subset would expand this into a million
-    # repeated inventory scans without adding a new selection boundary.
+    # Retain every nonempty plan over the original ten physical labels, then
+    # add every singleton, pair, omitted-owner boundary, and full twenty-cell
+    # plan. This preserves the original exhaustive check without expanding to
+    # a million inventory scans over all twenty-cell combinations.
     samples = {
         shard: next(path for path, owner in partition_assignments().items() if owner == shard)
         for shard in WINDOWS_SHARD_NAMES
@@ -1014,10 +1015,21 @@ def test_planned_windows_inventory_preserves_owners_for_matrix_subsets(tmp_path:
         target = tmp_path / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.touch()
+    legacy_shards = tuple(
+        f"{family}-{partition}"
+        for family in SHARD_NAMES
+        for partition in range(1, 5 if family == "gateway-sqlite" else 3)
+    )
+    plans = {
+        planned
+        for size in range(1, len(legacy_shards) + 1)
+        for planned in itertools.combinations(legacy_shards, size)
+    }
     for size in (1, 2, len(WINDOWS_SHARD_NAMES) - 1, len(WINDOWS_SHARD_NAMES)):
-        for planned in itertools.combinations(WINDOWS_SHARD_NAMES, size):
-            selected = files_for_planned_windows_shards(tmp_path, planned[0], json.dumps(planned))
-            assert set(selected) == {samples[shard] for shard in planned}, planned
+        plans.update(itertools.combinations(WINDOWS_SHARD_NAMES, size))
+    for planned in sorted(plans):
+        selected = files_for_planned_windows_shards(tmp_path, planned[0], json.dumps(planned))
+        assert set(selected) == {samples[shard] for shard in planned}, planned
 
 
 @pytest.mark.parametrize("planned", [

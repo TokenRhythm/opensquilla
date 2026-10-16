@@ -47,6 +47,54 @@ parallelism, candidate availability and failures with:
 python .github/scripts/compare_ci_timings.py BASELINE_DIR CANDIDATE_DIR --output-dir OUTPUT_DIR
 ```
 
+### First full-run observation (2026-10-17)
+
+Baseline [38952186289](https://github.com/TokenRhythm/opensquilla/actions/runs/38952186289)
+uses `3d6b8d01290674448406ada1303d98d98212cc9e`; candidate
+[38953206278](https://github.com/TokenRhythm/opensquilla/actions/runs/38953206278)
+uses `471280f59`. Both are first-attempt `workflow_dispatch` runs with the full
+NSIS profile, unchanged application/dependency inputs and the same offline
+markers. The dispatches started at 03:04:28 and 03:12:36 on October 17 in
+Asia/Shanghai. Wall time is trigger to the final completed job, including setup
+and aggregation. Suite finish times below use the same trigger-relative clock.
+
+| Metric | Baseline | Parallel candidate |
+| --- | ---: | ---: |
+| Complete CI wall time | 24:32 | 17:45 |
+| Peak / mean running jobs | 41 / 15.2 | 93 / 25.5 |
+| Executed jobs | 69 | 128 |
+| Summed runner time | 372:01 | 452:50 |
+| NSIS candidate available | 15:12 | 9:20 |
+| First NSIS acceptance starts | 15:14 | 9:22 |
+| Last NSIS acceptance finishes | 24:15 | 17:23 |
+| Ubuntu offline suite finishes | 11:54 | 6:06 |
+| Windows offline suite finishes | 18:05 | 12:35 |
+| Browser recovery/capacity finishes | 12:04 | 4:53 |
+
+Observed wall time fell by **407 seconds (27.6%)**. Candidate availability moved
+forward by 352 seconds. The retained baseline audit/first-send phase occupied
+192 seconds on the candidate-production path; the new installed security
+consumer completed successfully alongside upgrade tests. All NSIS jobs passed:
+22 baseline and 25 candidate, including aggregation. Summed runner time rose
+21.7%, reflecting the extra independent runner setup and duplicated preflights.
+
+Both workflow conclusions are **failure**: baseline has one failed Python shard
+plus aggregation; candidate has eight failed Python shards plus aggregation.
+All nine failed Python shard logs contain completed parallel and serial phase
+summaries; none ended at installation/preflight/collection or used dispatch
+bulk `--maxfail`. Baseline failed a Unicode message-search assertion. Candidate
+failures include stale CI structure assertions, a signing-cleanup test timeout,
+and a compaction-summary assertion. No failure was hidden or rerun to replace
+these samples. Normal dispatch-only skips are queue attestation and main canary.
+
+Follow-up test-only changes update the moved smoke/Contract owners and NSIS cell
+counts, and retain all 1,023 legacy partition-plan combinations in addition to
+new boundaries (1,199 unique plans). These changes were locally verified after
+the frozen timing run; they are not represented as a second remote measurement.
+This is one paired observation, not an estimate of stable CI latency. Runner
+images, hardware and cache contents were not experimentally fixed, and the
+slower installation cases remain the final critical path.
+
 ## Test cost and ownership
 
 The ordinary offline suite excludes `stress`. The required `python-stress` suite
