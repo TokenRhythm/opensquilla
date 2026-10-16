@@ -8125,6 +8125,7 @@ watch(
 )
 </script>
 
+<style scoped src="../styles/chat-assistant-row.css"></style>
 <style scoped src="../styles/chat-view.css"></style>
 
 <style scoped>

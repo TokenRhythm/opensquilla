@@ -1280,6 +1280,8 @@ function fmtUsd(value: number): string {
 
 </script>
 
+<style scoped src="../../styles/chat-assistant-row.css"></style>
+
 <style scoped>
 .assistant-activity-incomplete {
   margin: 0.375rem 0 0;
@@ -1293,17 +1295,6 @@ function fmtUsd(value: number): string {
   max-width: 100%;
   margin-inline: 0;
   box-sizing: border-box;
-}
-
-.msg-ai {
-  position: relative;
-  display: flex;
-  gap: 0.625rem;
-  width: var(--chat-col, min(calc(100% - 48px), 980px));
-  margin: 0 auto;
-  padding: 0.5rem 0;
-  align-items: flex-start;
-  max-width: calc(100% - 48px);
 }
 
 .msg-ai--share-mode {
@@ -1367,13 +1358,6 @@ function fmtUsd(value: number): string {
   .chat-share-picker {
     transition: none;
   }
-}
-
-.msg-ai-main {
-  flex: 1;
-  min-width: 0;
-  max-width: none;
-  padding-top: 0.0625rem;
 }
 
 .assistant-answer--separated {

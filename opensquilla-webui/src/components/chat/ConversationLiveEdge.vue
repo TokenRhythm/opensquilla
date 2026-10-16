@@ -170,3 +170,36 @@ const {
 } = toRefs(props)
 </script>
 
+<style scoped src="../../styles/chat-assistant-row.css"></style>
+
+<style scoped>
+/* Gateway-confirmed answer text streams in its final visual position. */
+.live-answer {
+  margin-top: 0;
+  padding-top: 0.5rem;
+  border-top: 0;
+}
+
+.stream-caret {
+  display: inline-block;
+  width: 0.5rem;
+  height: 1.05em;
+  margin-left: 1px;
+  vertical-align: text-bottom;
+  background: var(--accent);
+  border-radius: 1px; /* radius-allow: 1px stream caret geometry */
+  animation: stream-caret-blink 1s steps(2, start) infinite;
+}
+
+@keyframes stream-caret-blink {
+  0%, 50% { opacity: 1; }
+  50.01%, 100% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stream-caret {
+    animation: none;
+  }
+}
+</style>
+

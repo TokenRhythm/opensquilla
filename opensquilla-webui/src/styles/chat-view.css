@@ -400,24 +400,6 @@
   opacity: 0.55;
 }
 
-/* AI message */
-.msg-ai {
-  display: flex;
-  gap: 0.625rem;
-  width: var(--chat-col);
-  margin: 0 auto;
-  padding: 0.5rem 0;
-  align-items: flex-start;
-  max-width: calc(100% - 48px);
-}
-
-.msg-ai-main {
-  flex: 1;
-  min-width: 0;
-  max-width: none;
-  padding-top: 0.0625rem;
-}
-
 /* The thinking indicator reuses the run-state dot. */
 .stream-activity-dot {
   width: 0.375rem;
@@ -433,13 +415,6 @@
    (which read as a loading skeleton and added a second, desynced rhythm). */
 .activity-shimmer {
   color: var(--text-muted);
-}
-
-/* Gateway-confirmed answer text streams in its final visual position. */
-.live-answer {
-  margin-top: 0;
-  padding-top: 0.5rem;
-  border-top: 0;
 }
 
 /* ── Jump-to-latest pill (floats above the composer when scrolled up) ─── */
@@ -480,30 +455,10 @@
   transform: translateY(6px);
 }
 
-/* ── Streaming caret: blinking tail bar while output is still generating ─ */
-.stream-caret {
-  display: inline-block;
-  width: 0.5rem;
-  height: 1.05em;
-  margin-left: 1px;
-  vertical-align: text-bottom;
-  background: var(--accent);
-  border-radius: 1px; /* radius-allow: 1px stream caret geometry */
-  animation: stream-caret-blink 1s steps(2, start) infinite;
-}
-@keyframes stream-caret-blink {
-  0%, 50% { opacity: 1; }
-  50.01%, 100% { opacity: 0; }
-}
-
 @media (prefers-reduced-motion: reduce) {
   .plan-run-dock-enter-active,
   .plan-run-dock-leave-active {
     transition: none;
-  }
-
-  .stream-caret {
-    animation: none;
   }
 
   .jump-latest-enter-active,

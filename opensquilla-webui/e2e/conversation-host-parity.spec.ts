@@ -68,6 +68,26 @@ async function assertNoSettledExtras(host: Locator) {
   await expect(host.locator('.chat-stop-btn')).toBeEnabled()
 }
 
+async function assertLiveHistoryColumnAlignment(host: Locator) {
+  const history = host.getByTestId('chat-message-row').locator('.msg-ai').first()
+  const live = host.locator('.conversation-live-edge.msg-ai')
+  await expect(history).toBeVisible()
+  await expect(live).toBeVisible()
+  await expect(live.locator('.live-answer')).toBeVisible()
+  await expect.poll(async () => {
+    const [historyRow, historyBody, liveRow, liveBody, liveAnswer] = await Promise.all([
+      history.boundingBox(), history.locator('.msg-ai-main').boundingBox(),
+      live.boundingBox(), live.locator('.msg-ai-main').boundingBox(), live.locator('.live-answer').boundingBox(),
+    ])
+    if (!historyRow || !historyBody || !liveRow || !liveBody || !liveAnswer) return Infinity
+    return Math.max(
+      Math.abs(historyRow.x - liveRow.x), Math.abs(historyRow.width - liveRow.width),
+      Math.abs(historyBody.x - liveBody.x), Math.abs(historyBody.width - liveBody.width),
+      Math.abs(historyBody.x - liveAnswer.x), Math.abs(historyBody.width - liveAnswer.width),
+    )
+  }, { message: 'Live activity and answer must share the historical assistant content column' }).toBeLessThan(1)
+}
+
 async function equalizeConversationWidths(page: Page, main: Locator, side: Locator) {
   const separator = page.getByRole('separator', { name: 'Resize workbench', exact: true })
   await expect(separator).toBeVisible()
@@ -118,6 +138,54 @@ async function awaitStyleTransition(locator: Locator) {
 }
 
 test.describe('real routed main and workbench side conversation hosts', () => {
+  test('aligns live activity and answers with history in wide main and side panes', async ({ page }) => {
+    const gateway = await installGateway(page)
+    await page.setViewportSize({ width: 2200, height: 1100 })
+    await page.goto(`/control/chat?session=${encodeURIComponent(MAIN)}`)
+    const main = page.locator('#app-main .chat').first()
+    await expect(main).toContainText('Earlier main answer')
+    const streamActivity = (key: string) => {
+      gateway.emit(key, 'session.event.text_delta', { text: 'Checking the content column.', presentation: 'intermediate' })
+      gateway.emit(key, 'session.event.tool_use_start', { tool_use_id: 'column-read', tool_name: 'read_file', input: { path: 'README.md' } })
+      gateway.emit(key, 'session.event.text_delta', { text: 'The live answer stays in the same column.', presentation: 'answer' })
+    }
+    await send(main, 'Check the wide main column')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(1)
+    streamActivity(MAIN)
+    await assertLiveHistoryColumnAlignment(main)
+    expect((await main.locator('.conversation-live-edge.msg-ai').boundingBox())!.width).toBeLessThanOrEqual(800)
+
+    await page.getByTestId('topbar-workbench-toggle').click()
+    await page.getByRole('button', { name: 'Assistant chat', exact: true }).click()
+    const side = page.getByTestId('assistant-chat-panel')
+    await send(side, 'Create side history')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(2)
+    gateway.finish(SIDE, 'Earlier side answer')
+    await expect(side).toContainText('Earlier side answer')
+    await expect(side.locator('.chat-stop-btn')).toHaveCount(0)
+    await send(side, 'Check the side column')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(3)
+    streamActivity(SIDE)
+    for (const width of [2200, 1200]) {
+      await page.setViewportSize({ width, height: 1100 })
+      for (const host of [main, side]) await assertLiveHistoryColumnAlignment(host)
+    }
+    // Shrinking prioritizes main. Measure each visible mobile pane separately;
+    // two hidden zero-width columns must never satisfy this comparison.
+    await page.setViewportSize({ width: 390, height: 1100 })
+    await expect(side).not.toBeVisible()
+    await assertLiveHistoryColumnAlignment(main)
+    await page.getByTestId('topbar-workbench-toggle').click()
+    await expect(main).not.toBeVisible()
+    await assertLiveHistoryColumnAlignment(side)
+    for (const key of [MAIN, SIDE]) gateway.finish(key, 'Column check complete.')
+    for (const host of [main, side]) {
+      await expect(host.locator('.conversation-live-edge.msg-ai')).toHaveCount(0)
+      await expect(host.locator('.assistant-answer').last()).toContainText('Column check complete.')
+    }
+    expect(gateway.errors).toEqual([])
+  })
+
   test('explains temporary chat only while empty, preserves it on hide and ends it on tab close', async ({ page }) => {
     const gateway = await installGateway(page, false, false, true)
     const { main, side } = await openHosts(page)
