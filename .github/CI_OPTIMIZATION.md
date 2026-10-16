@@ -118,6 +118,75 @@ wall time and the interval from candidate availability to final acceptance, not
 upgrade job duration alone. Remote timing for this second experiment is recorded
 after the first complete run, including every failure.
 
+### Second full-run observation (2026-10-17)
+
+[38957580252](https://github.com/TokenRhythm/opensquilla/actions/runs/38957580252)
+ran `8706650addedead88e83da4f3cd085c33f8a9906`, first-attempt full
+`workflow_dispatch`, beginning at 03:48:07 Asia/Shanghai. Compare it with the
+17:45 sample above, not a successful-only subset. Application source and locked
+dependencies are unchanged. Both workflows concluded **failure**.
+
+| Metric | First parallel run | Second parallel run |
+| --- | ---: | ---: |
+| Complete CI wall time | 17:45 | 17:30 |
+| Executed / skipped jobs | 128 / 2 | 129 / 2 |
+| Peak / mean running jobs | 93 / 25.5 | 109 / 30.2 |
+| Summed runner time | 452:50 | 527:58 |
+| NSIS candidate available | 9:20 | 9:08 |
+| All 14 upgrade/fresh cases finish | 17:23 | 12:37 |
+| Startup compatibility group finishes | 15:56 | 14:16 |
+| NSIS aggregate finishes | 17:30 | 15:10 |
+| Windows desktop-installer-contracts-1 finishes | 12:35 | 17:17 |
+
+Total wall time improved by only **15 seconds (1.4%)**. The NSIS chain improved
+by **2:20**, but the final critical path moved to Windows
+`desktop-installer-contracts-1`. Its job grew from 11:48 to 16:42, although both
+runs completed the same 1,569 parallel passes/14 skips and two serial passes.
+The parallel phase grew from 549.95 to 820.23 seconds; serial time decreased
+from 68.77 to 65.20 seconds. The slowest durations concentrate in
+`tests/test_observability/test_bundle.py`; for example the `x-csrftoken` case
+grew from 7.99 to 57.28 seconds. This identifies the observed slowdown, not its
+root cause. Do not attribute it to the scheduling change or runner noise without
+isolating it.
+
+Both logs contain exactly the same 1,583 parallel `(result, nodeid)` pairs. All
+66 bundle cases run sequentially on worker `gw0`; their first-start to last-finish
+span grew from 526.03 to 799.47 seconds, accounting for the parallel-phase
+increase. The bundle test, implementation, dependency manifests, partition map
+and runner script have no changes between these samples. This is a concrete
+next partitioning candidate, while the reason for the per-case slowdown remains
+unverified.
+
+All **26 NSIS jobs passed**. Logs show all 12 old installations completed at
+2:43.5–4:42.7 while the candidate was still building; the producer itself took
+7:53 versus 7:52 previously. All 14 consumers verified the same artifact and
+producer attempt, then completed every expected phase and final `ok: true`.
+All four readlock cells exercised real exit 2, same-candidate recovery and
+retained interaction; both fresh cells completed first interaction. No timeout
+or unexpected exit supplied the timing gain. Startup jobs took 3:05 (Gateway)
+and 5:06 (Desktop), each retaining all seven configurations and two starts.
+The new NSIS tail is packaged-security, which passed in 5:54 and finished at
+15:05, followed by the aggregate at 15:10.
+
+Summed runner occupancy increased **16.6%**. The early acceptance VMs spent a
+combined **83:48** waiting for the candidate, which remains included in cost.
+Old installation durations also varied between samples, so the entire upgrade
+completion improvement cannot be attributed exclusively to overlap.
+
+The three failed test jobs all completed parallel and serial phases: Ubuntu
+and Windows desktop-installer-contracts-4 retain one stale artifact-download
+count assertion each; Windows gateway-sqlite-5 has telemetry profile-writer
+and SQLite-backend assertions. CI result correctly failed as the fourth failed
+job. None was rerun or suppressed. The stale count was corrected and locally
+retested after the frozen remote sample; that test-only correction is not a
+new remote measurement. Local regression recorded 565 passes and 17 skips,
+plus this corrected assertion's passing focused rerun; planner and candidate
+identity/phase-order checks also passed.
+
+Saved `round2-comparison/comparison.json`/`.md`, both paginated API snapshots,
+and `round2/nsis-stage-report.json` under `.cache/ci-timing` preserve the raw
+wall-time and per-case phase evidence.
+
 ## Test cost and ownership
 
 The ordinary offline suite excludes `stress`. The required `python-stress` suite

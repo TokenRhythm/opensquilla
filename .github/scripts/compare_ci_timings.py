@@ -81,7 +81,9 @@ def analyze(run: dict[str, Any], jobs: list[dict[str, Any]]) -> dict[str, Any]:
         None,
     )
     acceptance = [
-        row for row in rows if "upgrade-and-start (" in row["name"] or "/ Candidate " in row["name"]
+        row for row in rows
+        if "upgrade-and-start (" in row["name"] or "/ Candidate " in row["name"]
+        or row["name"].startswith("Windows NSIS acceptance / Installed frozen audit")
     ]
     return {
         "run_id": run["id"],

@@ -142,7 +142,9 @@ def test_required_artifact_downloads_share_a_bounded_hard_gate() -> None:
     }
     assert not guard.get("continue-on-error")
     assert "sleep" not in json.dumps(action)
-    for workflow, count in [("ci.yml", 8), ("windows-nsis-upgrade-regression.yml", 3)]:
+    # Early upgrade consumers now use the identity-bound wait helper; the two
+    # remaining NSIS composite downloads retain the original transfer gate.
+    for workflow, count in [("ci.yml", 8), ("windows-nsis-upgrade-regression.yml", 2)]:
         steps = [s for j in _workflow(workflow)["jobs"].values() for s in j.get("steps", [])]
         downloads = [s for s in steps
                      if s.get("uses") == "./.github/actions/download-required-artifact"]
