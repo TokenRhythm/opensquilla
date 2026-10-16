@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createApp, h, nextTick, reactive, shallowRef, type App } from 'vue'
+import { computed, createApp, defineComponent, h, nextTick, provide, reactive, shallowRef, type App } from 'vue'
 import { createPinia } from 'pinia'
 import i18n from '@/i18n'
 import { WORKSPACE_REFERENCES_KEY, WorkspaceReferenceError, type WorkspaceReferences } from '@/modules/workspaceReferences'
@@ -8,6 +8,8 @@ import type { WorkspaceFileReferenceV1 } from '@/types/references'
 import { useWorkbenchStore } from '@/workbench/store'
 import WorkspaceReferenceCard from './WorkspaceReferenceCard.vue'
 import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
+import { CONVERSATION_WORKBENCH_OWNER_KEY } from '@/modules/conversationPolicy'
+import { workspaceFileSessionKey } from '@/workbench/workspaceFileItems'
 
 const reference: WorkspaceFileReferenceV1 = {
   version: 1, kind: 'workspace_file', id: 'src/math.py', label: 'src/math.py:2-4',
@@ -41,6 +43,43 @@ const settle = async () => { await new Promise(resolve => setTimeout(resolve, 0)
 afterEach(() => { apps.splice(0).forEach(app => app.unmount()); document.body.innerHTML = '' })
 
 describe('WorkspaceReferenceCard', () => {
+  it('opens main and child references in one visible workbench while keeping their read authorities distinct', async () => {
+    const el = document.createElement('div')
+    document.body.append(el)
+    const pinia = createPinia()
+    const read = vi.fn<WorkspaceReferences['read']>(async (key, value) => ({
+      reference: { ...value, scope: { sessionKey: key, workspaceId: 'workspace' } }, content: `${key} content`,
+      relativePath: value.locator.relativePath, revision: 'file_1234567890abcdef',
+      totalLines: 1, startLine: 1, endLine: 1,
+    }))
+    const conversation = defineComponent({
+      props: { sessionKey: { type: String, required: true } },
+      setup(props) {
+        provide(CONVERSATION_WORKBENCH_OWNER_KEY, computed(() => 'parent'))
+        return () => h(WorkspaceReferenceCard, { sessionKey: props.sessionKey, reference })
+      },
+    })
+    const app = createApp({ render: () => h('div', [
+      h(conversation, { sessionKey: 'parent' }), h(conversation, { sessionKey: 'child' }),
+    ]) })
+    apps.push(app)
+    app.use(pinia).use(i18n).provide(WORKSPACE_REFERENCES_KEY, { read })
+    const store = useWorkbenchStore(pinia)
+    store.setSessionScope('parent')
+    app.mount(el)
+    const buttons = el.querySelectorAll<HTMLButtonElement>('.workspace-reference__open')
+    buttons[0]!.click()
+    await settle()
+    buttons[1]!.click()
+    await settle()
+    expect(read.mock.calls.map(([key]) => key)).toEqual(['parent', 'child'])
+    expect(store.visibleItems).toHaveLength(2)
+    expect(store.items.map(workspaceFileSessionKey)).toEqual(['parent', 'child'])
+    expect(store.activeItem?.scope).toEqual({ type: 'session', id: 'parent' })
+    expect(workspaceFileSessionKey(store.activeItem!)).toBe('child')
+    expect(new Set(store.items.map(item => item.id)).size).toBe(2)
+  })
+
   it('validates the file before opening a session-scoped Workbench descriptor without source contents', async () => {
     const resolved = { ...reference, scope: { sessionKey: 'task', workspaceId: 'workspace' } }
     const read = vi.fn().mockResolvedValue({ reference: resolved, content: 'private code' })
@@ -74,6 +113,19 @@ describe('WorkspaceReferenceCard', () => {
     finish({ reference })
     await settle()
     expect(ui.store.activeItem?.kind).toBe('file')
+  })
+
+  it('does not open a reference whose read finishes after navigation to another conversation', async () => {
+    let finish!: (value: unknown) => void
+    const ui = await mount(vi.fn<WorkspaceReferences['read']>(() => new Promise(resolve => { finish = resolve as typeof finish })))
+    ui.store.setSessionScope('task')
+    ui.el.querySelector<HTMLButtonElement>('.workspace-reference__open')!.click()
+    ui.store.setSessionScope(null)
+    finish({ reference })
+    await settle()
+    expect(ui.store.items).toEqual([])
+    expect(ui.store.activeSessionId).toBeNull()
+    expect(ui.store.expanded).toBe(false)
   })
 
   it('blocks a Gateway switch both during and after opening a reference', async () => {

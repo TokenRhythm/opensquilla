@@ -1,11 +1,12 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, h, nextTick, reactive } from 'vue'
+import { computed, createApp, h, nextTick, reactive } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import { createI18n } from 'vue-i18n'
 import type { ChatToolCallRenderItem } from '@/types/chat'
 import en from '@/locales/en.json'
 import { ARTIFACT_WORKBENCH_KEY, type ArtifactContentAccess, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
+import { CONVERSATION_WORKBENCH_OWNER_KEY } from '@/modules/conversationPolicy'
 
 const mocks = vi.hoisted(() => ({
   features: { artifactWorkbench: true },
@@ -26,11 +27,12 @@ function call(overrides: Partial<ChatToolCallRenderItem> = {}): ChatToolCallRend
     resultPreview: '', status: 'success', isRunning: false, isError: false, isOpen: true, ...overrides }
 }
 function mount(toolCall: ChatToolCallRenderItem, sessionKey: string | undefined = 'session-a', operationKey = 'file.write', pinia = true,
-  readAttachmentPreview?: ArtifactContentAccess['readAttachmentPreview']) {
+  readAttachmentPreview?: ArtifactContentAccess['readAttachmentPreview'], ownerSessionKey?: string) {
   const host = document.createElement('div')
   document.body.append(host)
   const app = createApp({ render: () => h(ActivityToolDetails, { call: toolCall, sessionKey, operationKey, label: 'Write file' }) })
   if (pinia) app.use(createPinia())
+  if (ownerSessionKey) app.provide(CONVERSATION_WORKBENCH_OWNER_KEY, computed(() => ownerSessionKey))
   if (readAttachmentPreview) app.provide(ARTIFACT_WORKBENCH_KEY, { content: { readAttachmentPreview, downloadAttachment: mocks.download } } as unknown as ArtifactWorkbench)
   app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
   app.mount(host)
@@ -41,6 +43,12 @@ beforeEach(() => { mocks.features.artifactWorkbench = true; vi.clearAllMocks(); 
 afterEach(() => { apps.splice(0).forEach(app => app.unmount()); setActivePinia(undefined); document.body.innerHTML = '' })
 
 describe('historical file action boundary', () => {
+  it.each(['parent', 'child'])('passes the resource identity of %s and its visible owner through the actual file click', sessionKey => {
+    const host = mount(call(), sessionKey, 'file.write', true, undefined, 'parent')
+    host.querySelector<HTMLButtonElement>('[data-testid="activity-code-open"]')!.click()
+    expect(mocks.open).toHaveBeenCalledWith(expect.objectContaining({ kind: 'write', path: 'a.ts' }),
+      expect.objectContaining({ sessionKey, ownerSessionKey: 'parent', toolId: 'actual-id' }))
+  })
   it('ignores duplicate download clicks and late failures after the displayed record changes', async () => {
     const snapshot = { kind: 'write' as const, path: 'large.ts', content: '', sha256_ref: 'a'.repeat(64), bytes: 8_000_000 }
     const read = vi.fn<NonNullable<ArtifactContentAccess['readAttachmentPreview']>>()

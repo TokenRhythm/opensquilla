@@ -261,7 +261,7 @@
           @content-hydrated="chatHistory.reconcileHydratedContent"
           :load-history-details="message => historyDetails.setExpanded(message.contentRef, true)"
           @show-tool-result="showToolResultModal"
-          @open-session="switchToSession"
+          @open-session="openReferencedSession"
           @resolve-interrupt="resolveInterrupt"
           @extend-interrupt="extendInterrupt"
           @clarify-submit="submitClarify"
@@ -2215,6 +2215,7 @@ const chatUsageWidget = useChatUsageWidget({
   usageReporting,
   readOptions: optionalSessionReadOptions,
   sessionKey,
+  connectionIdentity: () => JSON.stringify([deliveryIdentity.value, gatewayAccess.subscriptionEpoch, currentEpoch.value]),
   tokenVizEnabled: () => appStore.features.tokenViz,
 })
 const {
@@ -3393,6 +3394,17 @@ async function switchToSession(nextSessionKey: string) {
     await handleAuthoritativeSessionSubscription(nextSessionKey)
   }
   return outcome
+}
+
+async function openReferencedSession(nextSessionKey: string) {
+  if (chatViewDisposed || !nextSessionKey.trim()) return
+  // A side host remains bound to its leased child. References navigate the
+  // route-owned conversation instead of adopting a different execution owner.
+  if (props.embedded) {
+    await router.push({ path: '/chat', query: { session: nextSessionKey } })
+    return
+  }
+  await switchToSession(nextSessionKey)
 }
 
 function projectAcceptedGoalMessage({
@@ -5445,6 +5457,23 @@ async function downloadAttachment(attachment: DisplayAttachment): Promise<boolea
   return true
 }
 
+let workbenchPreviewRequest = 0
+watch([sessionKey, currentEpoch, deliveryIdentity, () => gatewayAccess.subscriptionEpoch], () => {
+  // Returning to the same values does not revive a request from the old owner.
+  workbenchPreviewRequest += 1
+}, { flush: 'sync' })
+
+function beginWorkbenchPreviewRequest(): () => boolean {
+  const key = sessionKey.value
+  const epoch = currentEpoch.value
+  const identity = deliveryIdentity.value
+  const subscriptionEpoch = gatewayAccess.subscriptionEpoch
+  const request = ++workbenchPreviewRequest
+  return () => !chatViewDisposed && chatViewActive && sessionKey.value === key
+    && currentEpoch.value === epoch && deliveryIdentity.value === identity
+    && gatewayAccess.subscriptionEpoch === subscriptionEpoch && request === workbenchPreviewRequest
+}
+
 async function attachmentWorkbenchResource(
   attachment: DisplayAttachment,
   key: string,
@@ -5473,16 +5502,10 @@ async function attachmentWorkbenchResource(
   return resource
 }
 
-let attachmentPreviewRequest = 0
 async function previewAttachmentResource(attachment: DisplayAttachment) {
   const key = sessionKey.value
-  const epoch = currentEpoch.value
-  const identity = deliveryIdentity.value
-  const subscriptionEpoch = gatewayAccess.subscriptionEpoch
-  const request = ++attachmentPreviewRequest
-  const isCurrent = () => !chatViewDisposed && chatViewActive && sessionKey.value === key
-    && currentEpoch.value === epoch && deliveryIdentity.value === identity
-    && gatewayAccess.subscriptionEpoch === subscriptionEpoch && request === attachmentPreviewRequest
+  const isCurrent = beginWorkbenchPreviewRequest()
+  if (!isCurrent()) return
   try {
     const resource = await attachmentWorkbenchResource(attachment, key, isCurrent)
     if (!resource || !isCurrent()) return
@@ -5770,8 +5793,8 @@ function openLegacyArtifactWorkbench(
 
 async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
   const key = sessionKey.value
-  const epoch = currentEpoch.value
-  const isCurrent = () => sessionKey.value === key && currentEpoch.value === epoch
+  const isCurrent = beginWorkbenchPreviewRequest()
+  if (!isCurrent()) return
   const artifactId = typeof artifact.id === 'string' ? artifact.id.trim() : ''
   const documentId = typeof artifact.documentId === 'string'
     ? artifact.documentId.trim()
@@ -5907,6 +5930,7 @@ async function resolveWorkspacePreviewResource(key: string, documentId: string) 
 const workspacePreviewOpening = useWorkspacePreviewOpening({
   sessionKey,
   currentEpoch,
+  beginRequest: beginWorkbenchPreviewRequest,
   enabled: attachmentWorkbenchPreviewEnabled,
   getArtifact: (key, artifactId) => artifactWorkbench.artifacts.get(key, artifactId),
   resolve: (key, resource) => workbenchResourcesStore.resolve(key, resource),
@@ -5916,7 +5940,7 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
     artifact.documentId = current.document.documentId
     artifact.revisionId = current.revision.revisionId
     if (previewPagePath) artifact.previewPagePath = previewPagePath
-    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    const item = artifactPreviewItemForExplicitOpen({
       artifact,
       initialSection: 'preview',
       navigationArtifacts: sessionArtifacts.value,
@@ -5924,7 +5948,12 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
       previewLeaseEligible: true,
       resourceIdentity: workbenchResourceKey(current.resource.resource),
       sessionKey: key,
-    }))
+    })
+    // A live result still registers its resource while its conversation is
+    // hidden, but must not take over another conversation or the new-chat page.
+    workbenchStore.openItem(item, {
+      activate: item.scope.type !== 'session' || item.scope.id === workbenchStore.activeSessionId,
+    })
   },
   onError: error => {
     const classified = classifyArtifactProductError(error)
@@ -5935,6 +5964,10 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
 })
 
 function openArtifact(artifact: ArtifactPayload): boolean {
+  // All file entry points share ordering, including synchronous legacy/media
+  // opens that must retire an older document request still awaiting transport.
+  const isCurrent = beginWorkbenchPreviewRequest()
+  if (!isCurrent()) return false
   // Persisted artifacts also carry this provenance. Only id-less workspace
   // actions already carry the document/session identity needed by this helper.
   if (artifact.source === 'workspace-preview' && !artifact.id) {

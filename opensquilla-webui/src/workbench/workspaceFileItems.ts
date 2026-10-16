@@ -14,15 +14,15 @@ export function createWorkspaceFilesWorkbenchItem(sessionKey: string): Workbench
   }
 }
 
-export function createWorkspaceFileItem(sessionKey: string, reference: WorkspaceFileReferenceV1): WorkbenchItem {
+export function createWorkspaceFileItem(sessionKey: string, reference: WorkspaceFileReferenceV1, ownerSessionKey = sessionKey): WorkbenchItem {
   return {
     id: `file:${sessionKey}:${reference.scope.workspaceId ?? ''}:${reference.locator.relativePath}`,
     kind: 'file',
     title: reference.locator.relativePath,
-    scope: { type: 'session', id: sessionKey },
+    scope: { type: 'session', id: ownerSessionKey },
     hostKind: 'dom',
     retention: 'dispose-on-suspend',
-    payload: { reference },
+    payload: { reference, sessionKey },
   }
 }
 

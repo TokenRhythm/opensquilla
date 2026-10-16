@@ -55,6 +55,42 @@ describe('workbench store', () => {
     store.closeItem('side')
     expect(lifecycle).toHaveBeenCalledWith(expect.objectContaining({ type: 'dispose', reason: 'closed' }))
   })
+
+  it.each([true, false])('registers a late background preview without changing the current pane (expanded=%s)', expanded => {
+    const store = useWorkbenchStore()
+    store.openItem({ ...item('side-a'), kind: 'assistant-chat' })
+    store.setSessionScope('session-b')
+    store.openItem(item('files-b', { type: 'session', id: 'session-b' }))
+    store.setExpanded(expanded)
+    const lifecycle = vi.fn()
+    store.onLifecycle(lifecycle)
+
+    const latePreview = item('late-preview-a')
+    expect(store.openItem(latePreview)).toBe(true)
+    expect(store.activeSessionId).toBe('session-b')
+    expect(store.activeItemId).toBe('files-b')
+    expect(store.expanded).toBe(expanded)
+    expect(store.items).toContainEqual(latePreview)
+    expect(store.visibleItems.map(entry => entry.id)).toEqual(['files-b'])
+    expect(lifecycle.mock.calls.map(([event]) => event.type)).toEqual(['open'])
+
+    store.setSessionScope('session-a')
+    expect(store.activeItemId).toBe('late-preview-a')
+    expect(store.visibleItems.map(entry => entry.id)).toEqual(['side-a', 'late-preview-a'])
+    expect(store.expanded).toBe(expanded)
+  })
+
+  it('keeps a background preview unselected on a new-chat page when activation is declined', () => {
+    const store = useWorkbenchStore()
+    store.setSessionScope(null)
+    store.openItem(item('late-preview-a'), { activate: false })
+    expect(store.activeSessionId).toBeNull()
+    expect(store.activeItemId).toBeNull()
+    expect(store.expanded).toBe(false)
+    expect(store.visibleItems).toEqual([])
+    store.setSessionScope('session-a')
+    expect(store.activeItemId).toBe('late-preview-a')
+  })
   it('maximizes without changing saved size or the active page lifecycle', () => {
     const store = useWorkbenchStore()
     store.openItem(browserItem('page', 'session-a'))

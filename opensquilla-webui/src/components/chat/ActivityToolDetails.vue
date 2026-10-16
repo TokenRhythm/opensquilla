@@ -103,6 +103,7 @@
 <script setup lang="ts">
 import { computed, inject, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { HISTORY_DETAILS_READY } from '@/modules/historyDetails'
+import { CONVERSATION_WORKBENCH_OWNER_KEY } from '@/modules/conversationPolicy'
 import { useI18n } from 'vue-i18n'
 import { getActivePinia } from 'pinia'
 import { useInlineExecutionLog } from '@/composables/chat/useInlineExecutionLog'
@@ -145,6 +146,7 @@ defineEmits<{
 
 const { locale, t } = useI18n()
 const historyDetailsReady = inject(HISTORY_DETAILS_READY, undefined)
+const workbenchOwner = inject(CONVERSATION_WORKBENCH_OWNER_KEY, null)
 const pinia = getActivePinia()
 const appStore = pinia ? useAppStore(pinia) : undefined
 const contentAccess = inject(ARTIFACT_WORKBENCH_KEY, null)?.content
@@ -186,6 +188,7 @@ async function openCodeView() {
   const view = projection.value.codeView
   if (!canOpenCodeView.value || !view) return
   openToolHistoryFile(view, { sessionKey: props.sessionKey!, toolId: props.call.toolId,
+    ...(workbenchOwner?.value ? { ownerSessionKey: workbenchOwner.value } : {}),
     recordKey: props.call.renderKey, title: props.label,
     ...(normalizeToolFileSnapshot(props.call.fileSnapshot) ? { fileSnapshot: normalizeToolFileSnapshot(props.call.fileSnapshot) } : {}) })
 }

@@ -112,7 +112,7 @@ describe('ChatView artifact preview routing', () => {
 
   it('treats every user open as a fresh section request without resetting on metadata refresh', () => {
     const explicitOpenCalls = chatViewSource.match(
-      /workbenchStore\.openItem\(artifactPreviewItemForExplicitOpen\(/g,
+      /artifactPreviewItemForExplicitOpen\(\{/g,
     ) || []
     const refreshStart = chatViewSource.indexOf('watch(sessionArtifacts, artifacts => {')
     const refreshEnd = chatViewSource.indexOf('\nfunction openLegacyArtifactWorkbench', refreshStart)

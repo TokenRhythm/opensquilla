@@ -150,7 +150,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       items.value.push(item)
       notify({ type: 'open', item })
     }
-    if (options.activate !== false) {
+    // Background conversations may finish a resource after navigation. Keep
+    // that resource on its owner's shelf without replacing the visible panel.
+    const matchesActiveSession = item.scope.type !== 'session'
+      || activeSessionId.value === null
+      || item.scope.id === activeSessionId.value
+    if (options.activate !== false && matchesActiveSession) {
       if (activeSessionId.value === null && item.scope.type === 'session') {
         activeSessionId.value = item.scope.id
       }
@@ -268,6 +273,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   function setSessionScope(sessionId: string | null) {
     if (activeSessionId.value === sessionId) return
+    const wasExpanded = expanded.value
     // Browser tabs represent live native pages. Keep them in the in-memory
     // workbench shelf while the user moves between chat sessions so returning
     // to the originating task can reveal the same page again. Side chats also
@@ -295,6 +301,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       }
     }
     activeSessionId.value = sessionId
+    // Retiring the old scope may temporarily leave it with no active panel.
+    // That cleanup must not turn a navigation to a retained panel into a user
+    // collapse. Do not expand a deliberately collapsed pane or an empty target.
+    if (wasExpanded && activeItem.value) setExpanded(true)
   }
 
   function setExpanded(next: boolean) {

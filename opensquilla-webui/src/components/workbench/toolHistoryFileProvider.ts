@@ -1,5 +1,5 @@
 import { copyTextWithFallback } from '@/utils/browser'
-import { downloadToolHistoryContent, toolHistoryFileFromItem } from '@/workbench/toolHistoryFileItems'
+import { downloadToolHistoryContent, toolHistoryFileFromItem, toolHistoryFileSessionKey } from '@/workbench/toolHistoryFileItems'
 import { normalizeToolFileSnapshot } from '@/utils/chat/toolFileSnapshot'
 import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
 import type { WorkbenchItem, WorkbenchPanelDefinition, WorkbenchPanelRuntime, WorkbenchRuntimeContext } from '@/workbench/types'
@@ -46,7 +46,7 @@ class ToolHistoryFileRuntime implements WorkbenchPanelRuntime {
       const snapshot = normalizeToolFileSnapshot(item.payload.fileSnapshot)
       const content = typeof item.payload.fullContent === 'string' ? item.payload.fullContent : view.content
       if (view.truncated && !snapshot && typeof item.payload.fullContent !== 'string') throw new Error('Full record is unavailable')
-      await downloadToolHistoryContent({ ...view, content }, { sessionKey: item.scope.id, fileSnapshot: snapshot }, this.contentAccess)
+      await downloadToolHistoryContent({ ...view, content }, { sessionKey: toolHistoryFileSessionKey(item), fileSnapshot: snapshot }, this.contentAccess)
     } catch {
       if (generation === this.generation && this.context.isItemOpen()) this.context.updateRenderState({ downloadError: true })
     }

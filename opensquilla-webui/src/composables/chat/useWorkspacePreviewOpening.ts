@@ -15,6 +15,7 @@ export function useWorkspacePreviewOpening(options: {
   sessionKey: Ref<string>
   currentEpoch: Ref<number>
   enabled: Ref<boolean>
+  beginRequest?: () => () => boolean
   getArtifact: (key: string, artifactId: string) => Promise<ArtifactPayload | null>
   resolve: (key: string, ref: WorkbenchResourceRef) => Promise<WorkbenchResource | null>
   openCurrent: (key: string, resource: WorkbenchResource) => Promise<WorkbenchResourceOpenResponse | null>
@@ -36,7 +37,10 @@ export function useWorkspacePreviewOpening(options: {
     const started = lifetime
     if (disposed || !key || expectedSessionKey !== key) return
     const request = ++openRequest
-    const isCurrent = () => lifetime === started && options.sessionKey.value === key && request === openRequest
+    const ownerIsCurrent = options.beginRequest?.() ?? (() => true)
+    const isCurrent = () => lifetime === started && options.sessionKey.value === key
+      && request === openRequest && ownerIsCurrent()
+    if (!isCurrent()) return
     const hasPage = (resource: WorkbenchResource) => previewPagePath === undefined
       || (isPreviewPagePath(previewPagePath) && resource.previewPages?.includes(previewPagePath))
     try {

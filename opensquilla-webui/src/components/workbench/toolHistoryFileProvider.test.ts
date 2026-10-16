@@ -54,6 +54,19 @@ describe('historical file provider', () => {
     expect(definition.getProps!(item, renderState()).view).toMatchObject({ content: '+preview', truncated: true })
     runtime.dispose!('closed')
   })
+  it('downloads a child record with child authority while presenting it under the parent', async () => {
+    const downloadAttachment = vi.fn().mockResolvedValue('saved')
+    const { runtime } = await setup({ downloadAttachment } as unknown as ArtifactContentAccess)
+    const fileSnapshot = { kind: 'write' as const, path: 'a.ts', content: '', sha256_ref: 'b'.repeat(64), bytes: 8_000_000 }
+    const item = createToolHistoryFileItem({ kind: 'write', path: 'a.ts', content: 'preview', truncated: true },
+      { sessionKey: 'child', ownerSessionKey: 'parent', toolId: 'child-read', fileSnapshot })!
+    expect(item.scope).toEqual({ type: 'session', id: 'parent' })
+    runtime.performAction!('download', item)
+    await vi.waitFor(() => expect(downloadAttachment).toHaveBeenCalledWith(
+      expect.objectContaining({ sha256_ref: fileSnapshot.sha256_ref }), { sessionKey: 'child' },
+    ))
+    runtime.dispose!('closed')
+  })
   it('coexists with current workspace files and renders the supplied record without filesystem requests', async () => {
     const { definition, item, renderState, runtime } = await setup()
     const read = vi.fn()

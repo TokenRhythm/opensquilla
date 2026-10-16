@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { effectScope, reactive, ref, watch, type EffectScope } from 'vue'
 import { transpileModule, ScriptTarget } from '@typescript/typescript6'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { artifactCategory, isInlineMediaArtifact, isOfficeArtifact } from '@/utils/chat/artifacts'
@@ -10,16 +11,24 @@ import chatViewSource from './ChatView.vue?raw'
 
 // Run the actual two entry functions with controlled boundary services. This
 // catches routing and async-session regressions without mounting the whole chat.
+const guardStart = chatViewSource.indexOf('let workbenchPreviewRequest = 0')
+const guardEnd = chatViewSource.indexOf('async function attachmentWorkbenchResource(', guardStart)
 const resourceStart = chatViewSource.indexOf('async function openDeliverableWorkbenchResource(')
 const resourceEnd = chatViewSource.indexOf('\nasync function resolveWorkspacePreviewResource(', resourceStart)
 const openStart = chatViewSource.indexOf('function openArtifact(')
 const openEnd = chatViewSource.indexOf('\nfunction closeDeliverables', openStart)
-const entrySource = transpileModule(`${chatViewSource.slice(resourceStart, resourceEnd)}\n${chatViewSource.slice(openStart, openEnd)}`, {
+const entrySource = transpileModule(`${chatViewSource.slice(guardStart, guardEnd)}\n${chatViewSource.slice(resourceStart, resourceEnd)}\n${chatViewSource.slice(openStart, openEnd)}`, {
   compilerOptions: { target: ScriptTarget.ES2022 },
 }).outputText
 
+const scopes: EffectScope[] = []
+afterEach(() => scopes.splice(0).forEach(scope => scope.stop()))
+
 function harness() {
-  const sessionKey = { value: 'session-a' }, currentEpoch = { value: 1 }
+  const scope = effectScope()
+  scopes.push(scope)
+  const sessionKey = ref('session-a'), currentEpoch = ref(1)
+  const deliveryIdentity = ref('gateway-a'), gatewayAccess = reactive({ subscriptionEpoch: 1 })
   const attachmentWorkbenchPreviewEnabled = { value: true }, workbenchEnabled = { value: true }
   const artifact = { id: 'published-ppt', name: '计划.pptx', sha256: 'a'.repeat(64) }
   const resource = { resource: createWorkbenchResourceRef('deliverable', artifact.id),
@@ -37,11 +46,13 @@ function harness() {
     importDocument: vi.fn(async () => ({ document, revision })),
     preview: vi.fn(async () => ({ resource, preview: { resource: resource.resource, launchUrl: '/original', mode: 'local-renderer' } })),
   }
-  const openItem = vi.fn(() => true), legacy = vi.fn(() => true), pushToast = vi.fn()
+  const openItem = vi.fn<(item: unknown) => boolean>(() => true), legacy = vi.fn(() => true), pushToast = vi.fn()
   const workspacePreviewOpening = { open: vi.fn() }
   const catalog = { get: vi.fn<(key: string, id: string) => Promise<ArtifactPayload | null>>(async () => null) }
   const dependencies = {
-    sessionKey, currentEpoch, attachmentWorkbenchPreviewEnabled, workbenchEnabled,
+    sessionKey, currentEpoch, deliveryIdentity, gatewayAccess, watch,
+    chatViewDisposed: false, chatViewActive: true,
+    attachmentWorkbenchPreviewEnabled, workbenchEnabled,
     sessionArtifacts: { value: [artifact] }, workbenchResourcesStore: services,
     artifactWorkbench: { artifacts: catalog },
     workbenchStore: { openItem }, openLegacyArtifactWorkbench: legacy,
@@ -55,12 +66,19 @@ function harness() {
     workbenchResourceUnavailableReasonKey: () => 'unsupported', workbenchResourceActionReasonCode: () => 'unsupported',
     t: (key: string) => key, pushToast,
   }
-  const api = new Function(...Object.keys(dependencies), `${entrySource}\nreturn { openArtifact, openDeliverableWorkbenchResource };`)(...Object.values(dependencies)) as {
+  const api = scope.run(() => new Function(...Object.keys(dependencies), `${entrySource}\nreturn {
+    openArtifact, openDeliverableWorkbenchResource,
+    dispose() { chatViewDisposed = true },
+    deactivate() { chatViewActive = false },
+  };`)(...Object.values(dependencies))) as {
     openArtifact(artifact: ArtifactPayload): boolean
     openDeliverableWorkbenchResource(artifact: ArtifactPayload): Promise<void>
+    dispose(): void
+    deactivate(): void
   }
   return { api, artifact, resource, current, revision, services, openItem, legacy, pushToast, workspacePreviewOpening, catalog,
-    sessionKey, currentEpoch, attachmentWorkbenchPreviewEnabled, workbenchEnabled }
+    sessionKey, currentEpoch, deliveryIdentity, gatewayAccess,
+    attachmentWorkbenchPreviewEnabled, workbenchEnabled }
 }
 
 describe('chat Office card document opening', () => {
@@ -162,19 +180,99 @@ describe('chat Office card document opening', () => {
     expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({ preparedPreview: expect.any(Object), previewLeaseEligible: false }))
   })
 
-  it.each(['session', 'epoch'] as const)('discards a completed open after the %s changes', async change => {
+  it.each(['session', 'epoch', 'gateway identity', 'connection epoch', 'disposed', 'inactive'] as const)(
+    'discards a completed open after the %s changes', async change => {
+      const h = harness()
+      let resolve!: (value: unknown) => void
+      h.services.openCurrent.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+      const pending = h.api.openDeliverableWorkbenchResource(h.artifact)
+      await vi.waitFor(() => expect(h.services.openCurrent).toHaveBeenCalled())
+      if (change === 'session') h.sessionKey.value = 'session-b'
+      else if (change === 'epoch') h.currentEpoch.value += 1
+      else if (change === 'gateway identity') h.deliveryIdentity.value = 'gateway-b'
+      else if (change === 'connection epoch') h.gatewayAccess.subscriptionEpoch += 1
+      else if (change === 'disposed') h.api.dispose()
+      else h.api.deactivate()
+      resolve(h.current); await pending
+      expect(h.openItem).not.toHaveBeenCalled()
+      expect(h.legacy).not.toHaveBeenCalled()
+      expect(h.pushToast).not.toHaveBeenCalled()
+      expect(h.services.importDocument).not.toHaveBeenCalled()
+    },
+  )
+
+  it('does not begin an open after the conversation has unmounted', async () => {
+    const h = harness()
+    h.api.dispose()
+    await h.api.openDeliverableWorkbenchResource(h.artifact)
+    expect(h.services.resolve).not.toHaveBeenCalled()
+    expect(h.openItem).not.toHaveBeenCalled()
+    expect(h.legacy).not.toHaveBeenCalled()
+  })
+
+  it.each(['session', 'epoch', 'gateway identity', 'connection epoch'] as const)(
+    'retires an older open when the %s changes and returns before resolution', async change => {
+      const h = harness()
+      let resolve!: (value: unknown) => void
+      h.services.openCurrent.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+      const pending = h.api.openDeliverableWorkbenchResource(h.artifact)
+      await vi.waitFor(() => expect(h.services.openCurrent).toHaveBeenCalledOnce())
+      if (change === 'session') {
+        h.sessionKey.value = 'session-b'; h.sessionKey.value = 'session-a'
+      } else if (change === 'epoch') {
+        h.currentEpoch.value = 2; h.currentEpoch.value = 1
+      } else if (change === 'gateway identity') {
+        h.deliveryIdentity.value = 'gateway-b'; h.deliveryIdentity.value = 'gateway-a'
+      } else {
+        h.gatewayAccess.subscriptionEpoch = 2; h.gatewayAccess.subscriptionEpoch = 1
+      }
+      resolve(h.current); await pending
+      expect(h.openItem).not.toHaveBeenCalled()
+      expect(h.legacy).not.toHaveBeenCalled()
+      expect(h.pushToast).not.toHaveBeenCalled()
+    },
+  )
+
+  it('does not reopen an older document when a later click finishes first', async () => {
+    const h = harness()
+    let resolve!: (value: unknown) => void
+    h.services.openCurrent.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+    const first = h.api.openDeliverableWorkbenchResource(h.artifact)
+    await vi.waitFor(() => expect(h.services.openCurrent).toHaveBeenCalledOnce())
+    const secondRevision = { ...h.revision, documentId: 'doc-second', revisionId: 'rev-second' }
+    const second = { ...h.current, revision: secondRevision, document: { documentId: 'doc-second' },
+      resource: { ...h.resource, resource: createWorkbenchResourceRef('document', 'doc-second') } }
+    h.services.openCurrent.mockResolvedValueOnce(second)
+    await h.api.openDeliverableWorkbenchResource({ ...h.artifact, id: 'second-ppt' })
+    resolve(h.current); await first
+    expect(h.openItem).toHaveBeenCalledOnce()
+    expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({ resourceIdentity: 'document:doc-second' }))
+    expect(h.legacy).not.toHaveBeenCalled()
+  })
+
+  it('keeps a newer workspace preview when an earlier public deliverable resolves late', async () => {
     const h = harness()
     let resolve!: (value: unknown) => void
     h.services.openCurrent.mockImplementationOnce(() => new Promise(done => { resolve = done }))
     const pending = h.api.openDeliverableWorkbenchResource(h.artifact)
-    await vi.waitFor(() => expect(h.services.openCurrent).toHaveBeenCalled())
-    if (change === 'session') h.sessionKey.value = 'session-b'
-    else h.currentEpoch.value += 1
+    await vi.waitFor(() => expect(h.services.openCurrent).toHaveBeenCalledOnce())
+    h.workspacePreviewOpening.open.mockImplementationOnce(() => h.openItem({ resourceIdentity: 'document:doc_new_site' }))
+    expect(h.api.openArtifact({ source: 'workspace-preview', documentId: 'doc_new_site',
+      session_key: 'session-a', name: 'new-site.html', mime: 'text/html' })).toBe(true)
     resolve(h.current); await pending
-    expect(h.openItem).not.toHaveBeenCalled()
-    expect(h.legacy).not.toHaveBeenCalled()
+    expect(h.openItem).toHaveBeenCalledOnce()
+    expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({ resourceIdentity: 'document:doc_new_site' }))
+  })
+
+  it('does not surface a late failure after its side conversation has closed', async () => {
+    const h = harness()
+    let reject!: (reason: unknown) => void
+    h.services.resolve.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail }))
+    const pending = h.api.openDeliverableWorkbenchResource(h.artifact)
+    h.api.dispose(); reject(new Error('Late failure')); await pending
+    expect(h.services.openCurrent).not.toHaveBeenCalled()
     expect(h.pushToast).not.toHaveBeenCalled()
-    expect(h.services.importDocument).not.toHaveBeenCalled()
+    expect(h.legacy).not.toHaveBeenCalled()
   })
 
   it('does not continue resolution or surface a stale error in a different session', async () => {

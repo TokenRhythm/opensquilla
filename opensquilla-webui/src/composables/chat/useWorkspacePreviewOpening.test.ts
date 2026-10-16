@@ -20,11 +20,12 @@ const historicalArtifact: ArtifactPayload = {
   id: 'art_historical', kind: 'artifact_ref', name: 'beijing-weather.html', mime: 'text/html',
   session_id: 'persisted-session-id', source: 'workspace-preview', documentId: 'doc_weather',
 }
-function setup() {
+function setup(beginRequest?: () => () => boolean) {
   const scope = effectScope()
   scopes.push(scope)
   const options = {
     sessionKey: ref('session-A'), currentEpoch: ref(0), enabled: ref(true),
+    beginRequest,
     getArtifact: vi.fn<(key: string, id: string) => Promise<ArtifactPayload | null>>().mockResolvedValue(historicalArtifact),
     resolve: vi.fn<() => Promise<WorkbenchResource | null>>().mockResolvedValue(resource),
     openCurrent: vi.fn<() => Promise<WorkbenchResourceOpenResponse | null>>().mockResolvedValue(current),
@@ -41,6 +42,26 @@ function deferred<T>() {
 afterEach(() => scopes.splice(0).forEach(scope => scope.stop()))
 
 describe('workspace preview canonical opening', () => {
+  it.each(['success', 'error'] as const)('does not override a newer public-file click with a late workspace %s', async result => {
+    let latest = 0
+    const beginRequest = () => {
+      const request = ++latest
+      return () => request === latest
+    }
+    const h = setup(beginRequest), pending = deferred<WorkbenchResource | null>()
+    h.resolve.mockReturnValueOnce(pending.promise)
+    const opening = h.api.open('doc_weather')
+    // The enclosing conversation uses this same fence for attachments and
+    // public deliverables, so a newer click invalidates this workspace read.
+    beginRequest()
+    if (result === 'success') pending.resolve(resource)
+    else pending.reject(new Error('Late workspace read'))
+    await opening
+    expect(h.openCurrent).not.toHaveBeenCalled()
+    expect(h.show).not.toHaveBeenCalled()
+    expect(h.onError).not.toHaveBeenCalled()
+  })
+
   it('maps an internal historical artifact to its document and opens the current revision', async () => {
     const h = setup()
     const latest = { ...current, revision: { revisionId: 'rev_latest', artifactId: 'art_latest' } } as WorkbenchResourceOpenResponse

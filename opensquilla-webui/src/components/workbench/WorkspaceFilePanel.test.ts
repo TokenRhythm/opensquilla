@@ -34,6 +34,48 @@ async function enter(input: HTMLInputElement, value: string) {
 }
 
 describe('workspace source panel', () => {
+  it('uses the shared sandboxed HTML preview and switches back to the existing source pages', async () => {
+    const browserSettings = (window as unknown as { happyDOM: { settings: { disableIframePageLoading: boolean } } }).happyDOM.settings
+    browserSettings.disableIframePageLoading = true
+    cleanups.push(() => { browserSettings.disableIframePageLoading = false })
+    const html = '<html><body><button onclick="this.textContent = \'Clicked\'">Run</button></body></html>'
+    const blob = new Blob([html], { type: 'text/html' })
+    blob.text = async () => html
+    const { el } = await mount({ previewBlob: blob, previewKind: 'html',
+      snapshot: { ...page(), relativePath: 'review.html', content: '<html>source page</html>' } })
+    await vi.waitFor(() => expect(el.querySelector('iframe')?.getAttribute('srcdoc')).toContain('Clicked'))
+    const frame = el.querySelector('iframe')!
+    expect(frame.getAttribute('sandbox')).toBe('allow-scripts')
+    expect(frame.getAttribute('srcdoc')).toContain("connect-src 'none'")
+    expect(el.querySelector('pre')).toBeNull()
+    const modes = [...el.querySelectorAll<HTMLButtonElement>('.workspace-file__modes button')]
+    modes.find(button => button.textContent === 'Source')!.click()
+    await nextTick()
+    expect(el.querySelector('iframe')).toBeNull()
+    expect(el.querySelector('pre')?.textContent).toContain('source page')
+    modes.find(button => button.textContent === 'Preview')!.click()
+    await vi.waitFor(() => expect(el.querySelector('iframe')).not.toBeNull())
+  })
+
+  it('never renders a partial HTML source page as a complete preview', async () => {
+    const { el } = await mount({ previewKind: 'html',
+      snapshot: { ...page(), relativePath: 'partial.html', content: '<html>Only first page' } })
+    expect(el.querySelector('iframe')).toBeNull()
+    expect(el.querySelector('.workspace-file__modes')).toBeNull()
+    expect(el.querySelector('pre')?.textContent).toContain('Only first page')
+  })
+
+  it('keeps source and paging usable with an explicit optional preview failure', async () => {
+    const { el, onEvent } = await mount({ previewKind: 'html', previewBlob: null,
+      previewErrorKey: 'workbench.artifactPreview.unsupported',
+      snapshot: { ...page(), relativePath: 'review.html', content: '<html>Authorized source page' } })
+    expect(el.querySelector('.workspace-file__status')?.textContent).toBe('Preview unavailable')
+    expect(el.querySelector('pre')?.textContent).toContain('Authorized source page')
+    expect(el.querySelector('iframe')).toBeNull()
+    el.querySelector<HTMLButtonElement>('.workspace-file__more')!.click()
+    expect(onEvent).toHaveBeenCalledWith({ type: 'workspace-file-page', payload: { startLine: 201 } })
+  })
+
   it('uses shared code headers and copies only source, releasing controls on source mode', async () => {
     const copy = vi.spyOn(browser, 'copyTextWithFallback').mockResolvedValue(undefined)
     const content = 'Example document.\n\n- First item\n  - Nested item\n\n```typescript\nconst value = "hello";\n```'

@@ -18,7 +18,10 @@ function createOwner() {
   const drafts = new Map<string, string>()
   const draftStorage: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> = {
     getItem: key => drafts.get(key) ?? null,
-    setItem: (key, value) => { if (closed) throw new Error('Side conversation is closed'); drafts.set(key, value) },
+    // Server close retires the owner before Vue unmounts the reader. Its final
+    // draft autosave is expected cleanup, and must neither revive data nor
+    // report a storage failure. Delivery writes below still reject retirement.
+    setItem: (key, value) => { if (!closed) drafts.set(key, value) },
     removeItem: key => { drafts.delete(key) },
   }
   const policy = createPendingQueuePolicy(draftStorage)
@@ -27,7 +30,7 @@ function createOwner() {
     load: scope => closed ? Promise.resolve([]) : attachmentMemory.load(scope),
     loadSnapshot: scope => closed ? Promise.resolve({ attachments: [] }) : attachmentMemory.loadSnapshot!(scope),
     save: async (scope, attachments, revision) => {
-      if (closed) throw new Error('Side conversation is closed')
+      if (closed) return
       await attachmentMemory.save(scope, attachments, revision)
     },
     consume: (scope, revision, indexes) => closed ? Promise.resolve(false) : attachmentMemory.consume!(scope, revision, indexes),

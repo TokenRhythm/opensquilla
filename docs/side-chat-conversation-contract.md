@@ -49,6 +49,10 @@ Routing metadata may coexist with an assistant answer. Rendering the route strip
 
 Side-created previews remain visible in the parent workbench but reads, edits and resource inventory are authorized using the child key. Resource identity and document/revision identity are retained independently of presentation scope. A deferred open from an old parent/child cannot open in a new conversation. Git operations remain out of scope.
 
+That ownership split applies to workspace reference cards and recorded tool-file previews as well as ordinary Markdown links and deliverables. Recorded-content downloads retain the child authorization; a visible parent scope is never substituted for a resource session. Background results may register a preview for their owner, but cannot activate or expand another conversation's workbench. Session reference cards navigate the main route without replacing the side owner's child identity.
+
+Attachment, deliverable and workspace-document opens share one request generation in each conversation. Later opens, session/epoch changes, Gateway changes and disposal retire earlier requests, including an identity that changes away and back. Usage reads use the same ownership principle: only the latest request for the current conversation scope can update its widget. These guards do not alter canonical usage receipts or the side lease.
+
 ## Verification boundary
 
 Parity acceptance must mount the real main route entry and `AssistantChatPanel`, including their shared `ChatView`, then drive the same semantic events and compare DOM at each turn boundary. A test that manually mounts the same transcript/composer under two policies is only a component test; it does not establish entry-point parity. Required scenarios include early routing, tool inputs/results, final-answer transition, source visibility, billing, approvals, resource actions, Stop, uncertain admission and history recovery. Separate owner tests cover first-send snapshot timing, remount/reconnect, explicit close, stale creation completions, authority isolation and bounded lease renewal.

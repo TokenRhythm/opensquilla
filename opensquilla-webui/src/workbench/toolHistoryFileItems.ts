@@ -16,6 +16,8 @@ export type ToolHistoryFileView = ActivityToolCodeView & {
 
 export interface ToolHistoryFileOptions {
   sessionKey: string
+  /** The visible conversation; resource reads still use sessionKey. */
+  ownerSessionKey?: string
   toolId: string
   recordKey?: string
   title?: string
@@ -73,10 +75,10 @@ export function createToolHistoryFileItem(
     id: `tool-file-history:${JSON.stringify([options.sessionKey, options.recordKey || options.toolId, view.kind])}`,
     kind: 'tool-file-history',
     title: view.path.replace(/\\/g, '/').split('/').pop() || options.title || view.path,
-    scope: { type: 'session', id: options.sessionKey },
+    scope: { type: 'session', id: options.ownerSessionKey || options.sessionKey },
     hostKind: 'dom',
     retention: 'dispose-on-suspend',
-    payload: { snapshot, toolId: options.toolId,
+    payload: { snapshot, toolId: options.toolId, sessionKey: options.sessionKey,
       ...(options.fileSnapshot ? { fileSnapshot: { ...options.fileSnapshot } } : {}),
       ...(preview.truncated ? { fullContent: view.content } : {}) },
   }
@@ -91,11 +93,18 @@ export function toolHistoryFileFromItem(item: WorkbenchItem): ToolHistoryFileVie
   return canOpenToolHistoryFile(view) ? view : null
 }
 
+export function toolHistoryFileSessionKey(item: WorkbenchItem): string {
+  if (item.scope.type !== 'session') return ''
+  return typeof item.payload.sessionKey === 'string' && item.payload.sessionKey.trim()
+    ? item.payload.sessionKey : item.scope.id
+}
+
 export function openToolHistoryFile(view: ActivityToolCodeView, options: ToolHistoryFileOptions): boolean {
   const item = createToolHistoryFileItem(view, options)
   const pinia = getActivePinia()
   if (!item || !pinia || useAppStore(pinia).features.artifactWorkbench !== true) return false
   const store = useWorkbenchStore(pinia)
-  if (store.activeSessionId && store.activeSessionId !== options.sessionKey) return false
+  const ownerSessionKey = options.ownerSessionKey || options.sessionKey
+  if ((options.ownerSessionKey || store.activeSessionId) && store.activeSessionId !== ownerSessionKey) return false
   return store.openItem(item)
 }

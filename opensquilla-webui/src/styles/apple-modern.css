@@ -58,8 +58,9 @@ select:focus,
   background: transparent !important;
 }
 
-.btn--ghost:not(:disabled):hover,
-.btn--icon:not(:disabled):hover {
+/* Icon geometry must not replace the primary or danger action's hover fill. */
+.btn--ghost:not(.btn--primary):not(.btn--danger):not(:disabled):hover,
+.btn--icon:not(.btn--primary):not(.btn--danger):not(:disabled):hover {
   background: var(--bg-hover) !important;
 }
 

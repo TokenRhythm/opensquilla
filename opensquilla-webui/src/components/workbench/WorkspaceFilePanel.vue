@@ -28,7 +28,10 @@
       <p v-else-if="noMatches" class="workspace-file__status" role="status">{{ t('workspaceReference.noMatches') }}</p>
       <p v-if="searchErrorKey" class="workspace-file__status" role="alert">{{ t(searchErrorKey) }}</p>
       <p v-if="copyErrorKey" class="workspace-file__status" role="alert">{{ t(copyErrorKey) }}</p>
-      <div v-if="mode === 'preview' && canPreview" ref="markdownPreview" class="workspace-file__markdown artifact-preview__markdown chat-markdown" v-html="markdownHtml" />
+      <p v-if="previewErrorKey" class="workspace-file__status" role="status">{{ t(previewErrorKey) }}</p>
+      <ResourcePreviewPanel v-if="mode === 'preview' && canPreviewResource && previewBlob"
+        :blob="previewBlob" :kind="previewKind!" :name="snapshot.relativePath" />
+      <div v-else-if="mode === 'preview' && canPreviewMarkdown" ref="markdownPreview" class="workspace-file__markdown artifact-preview__markdown chat-markdown" v-html="markdownHtml" />
       <pre v-else ref="source" class="workspace-file__source" tabindex="0" :aria-label="snapshot.relativePath"><code><span
         v-for="line in visibleLines" :key="line.number" class="workspace-file__line"
         :class="{ 'is-selected': Boolean(snapshot.reference) && line.number >= snapshot.startLine && line.number <= snapshot.endLine, 'is-match': line.match }"
@@ -52,6 +55,8 @@ import { renderMarkdownCore } from '@/utils/markdown/renderCore'
 import { useMarkdownEnhancements } from '@/composables/chat/useMarkdownEnhancements'
 import { highlightWorkspaceLines } from './workspaceSourceHighlight'
 import type { WorkspaceSourceSnapshot } from '@/modules/workspaceReferences'
+import type { ResourcePreviewKind } from '@/workbench/resourcePreview'
+import ResourcePreviewPanel from './ResourcePreviewPanel.vue'
 
 interface WorkspaceFileViewSnapshot {
   relativePath: string
@@ -66,6 +71,9 @@ interface WorkspaceFileViewSnapshot {
 
 const props = defineProps<{
   snapshot?: WorkspaceFileViewSnapshot | null
+  previewBlob?: Blob | null
+  previewKind?: ResourcePreviewKind
+  previewErrorKey?: string
   loading?: boolean
   errorKey?: string
   viewId?: number
@@ -84,10 +92,12 @@ const query = ref('')
 const jump = ref('')
 const toolsOpen = ref(false)
 const mode = ref<'preview' | 'source'>('preview')
-const canPreview = computed(() => Boolean(props.snapshot && !props.snapshot.reference
+const canPreviewMarkdown = computed(() => Boolean(props.snapshot && !props.snapshot.reference
   && /\.(md|markdown)$/i.test(props.snapshot.relativePath) && props.snapshot.startLine === 1
   && props.snapshot.endLine >= props.snapshot.totalLines && props.snapshot.content.length <= 128_000))
-const markdownHtml = computed(() => canPreview.value && mode.value === 'preview'
+const canPreviewResource = computed(() => Boolean(props.previewBlob && props.previewKind === 'html' && !props.snapshot?.reference))
+const canPreview = computed(() => canPreviewMarkdown.value || canPreviewResource.value)
+const markdownHtml = computed(() => canPreviewMarkdown.value && mode.value === 'preview'
   ? renderMarkdownCore(props.snapshot!.content, { images: 'placeholder' }) : '')
 useMarkdownEnhancements(markdownPreview, { version: () => markdownHtml.value })
 const searchedQuery = ref('')

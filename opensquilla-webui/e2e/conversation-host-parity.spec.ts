@@ -1,8 +1,9 @@
 import { expect, test, type Locator, type Page, type WebSocketRoute } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
-import { writeFile } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
 import {
   chatHistoryPayload, sessionMessagesHydratePayload, sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
@@ -13,6 +14,7 @@ import {
 // nor its renderer is stubbed or manually reconstructed for a policy comparison.
 const MAIN = 'agent:main:webchat:host-parity'
 const SIDE = 'agent:main:sidechat:host-parity'
+const OTHER = 'agent:main:webchat:other-parity'
 const NOW = Date.now()
 // Match the registry's drop-a-folder manifest discovery, so new value themes
 // automatically join the real-host visual parity matrix.
@@ -28,7 +30,7 @@ const registeredThemes = readdirSync(themeDirectory, { withFileTypes: true }).fi
     return [id]
   }).sort()
 type Wire = Record<string, unknown>
-type Request = { type: string; id: string; method: string; params?: Wire }
+type Request = { type: string; id: string; method: string; params?: Wire; nonce?: string }
 type Stream = { sequence: number; task: string | null; lastTask: Wire | null; history: Wire[]; events: Array<{ event: string; payload: Wire }> }
 const logs = new WeakMap<Page, { requests: Request[]; errors: string[]; consoleWarnings: string[] }>()
 
@@ -40,7 +42,7 @@ test.afterEach(async ({ page }, info) => {
   }
 })
 
-async function installGateway(page: Page, eventBeforeAck = false, routingConflict = false, delayCreate = false) {
+async function installGateway(page: Page, eventBeforeAck = false, routingConflict = false, delayCreate = false, modernSnapshots = false) {
   const requests: Request[] = []
   const errors: string[] = []
   const consoleWarnings: string[] = []
@@ -61,9 +63,19 @@ async function installGateway(page: Page, eventBeforeAck = false, routingConflic
     return stream
   }
   let socket: WebSocketRoute
+  let connection = 0
+  const snapshotInstalls: Array<{ key: string; connection: number; id: string }> = []
   let taskCounter = 0
   let pendingApprovals: Wire[] = []
   const approvalResolutions: Wire[] = []
+  const failedApprovals = new Set<string>()
+  const pendingInputs = new Map<string, Wire[]>()
+  const heldClarifications = new Map<string, { key: string; reply: (accepted: boolean) => void }>()
+  const deniedFiles = new Set<string>()
+  const documents = new Map<string, { resource: Wire; document: Wire; revision: Wire; artifact: Wire }>()
+  const deferredResources = new Set<string>()
+  const heldResourceResolves = new Map<string, () => void>()
+  let includeOtherSession = false
   const fileRequests: Array<{ sessionKey: string; path: string; action: string }> = []
   const heldAcks: Array<() => void> = []
   let heldCreate: (() => void) | null = null
@@ -81,9 +93,10 @@ async function installGateway(page: Page, eventBeforeAck = false, routingConflic
     return { stream_generation: `generation-${key}`, current_stream_seq: stream.sequence,
       run_status: stream.task ? 'running' : 'idle', epoch: 1,
       active_task: stream.task ? { task_id: stream.task, status: 'running' } : null,
-      tasks: stream.task ? [{ task_id: stream.task, status: 'running' }] : [], last_task: stream.lastTask }
+      tasks: stream.task ? [{ task_id: stream.task, status: 'running' }] : [], last_task: stream.lastTask,
+      pendingUserInputs: pendingInputs.get(key) ?? [] }
   }
-  const finish = (key: string, text = 'Final answer.', status = 'succeeded', tools: Wire[] = [], usageOverride: Wire = {}) => {
+  const finish = (key: string, text = 'Final answer.', status = 'succeeded', tools: Wire[] = [], usageOverride: Wire = {}, artifacts: Wire[] = []) => {
     const stream = get(key)
     const task = stream.task
     if (!task) throw new Error(`No accepted turn for ${key}`)
@@ -91,7 +104,7 @@ async function installGateway(page: Page, eventBeforeAck = false, routingConflic
       model: 'synthetic/test-model', ...usageOverride }
     stream.history.push({ role: 'assistant', id: `answer-${task}`, message_id: `answer-${task}`,
       turn_id: task, timestamp: NOW + 5_000, text, tool_calls: tools,
-      usage, model: usage.model })
+      usage, model: usage.model, artifacts })
     emit(key, 'session.event.done', { text_snapshot: text, reason: status === 'cancelled' ? 'cancelled' : 'completed',
       usage })
     emit(key, `task.${status}`, { status, terminal_reason: status === 'cancelled' ? 'user_abort' : status })
@@ -107,12 +120,21 @@ async function installGateway(page: Page, eventBeforeAck = false, routingConflic
   })
   await page.emulateMedia({ reducedMotion: 'reduce' })
   await page.route('**/api/**', route => route.fulfill({ json: {} }))
+  // Production asks Gateway for this static URL. Vite preview otherwise
+  // proxies it to an absent default Gateway; serve the actual built bytes.
+  await page.route('**/control/static/dist/opensquilla-mark.png', route => route.fulfill({
+    contentType: 'image/png', path: fileURLToPath(new URL('../dist/opensquilla-mark.png', import.meta.url)),
+  }))
   await page.route('**/api/approvals', route => route.fulfill({ json: {
     pending: pendingApprovals, mode: 'prompt', allowPatterns: [], denyPatterns: [],
   } }))
   await page.route('**/api/approvals/resolve', async route => {
     const body = route.request().postDataJSON() as Wire
     approvalResolutions.push(body)
+    if (failedApprovals.has(String(body.id))) {
+      await route.fulfill({ status: 503, json: { error: 'Approval service temporarily unavailable' } })
+      return
+    }
     pendingApprovals = pendingApprovals.filter(item => item.id !== body.id)
     await route.fulfill({ json: { id: body.id, mode: 'prompt', resolved: true, approved: body.approved,
       resolution: body.approved ? 'approved' : 'denied', deadline: null, consumed: false, pending: false } })
@@ -130,27 +152,97 @@ async function installGateway(page: Page, eventBeforeAck = false, routingConflic
     const sessionKey = route.request().headers()['x-opensquilla-session-key'] || ''
     const path = new URL(route.request().url()).searchParams.get('path') || ''
     fileRequests.push({ sessionKey, path, action: 'content' })
+    if (deniedFiles.has(`${sessionKey}:${path}`)) return route.fulfill({ status: 403, json: { error: 'Child resource access denied' } })
+    const authority = sessionKey === SIDE ? 'Side resource authority' : 'Main resource authority'
     return route.fulfill({ contentType: 'text/plain', body: path.endsWith('.html')
-      ? '<h1>Parity HTML document</h1>' : 'export const parity = true;' })
+      ? `<h1>Parity HTML document</h1><p>${authority}</p><button onclick="this.textContent = 'Clicked once'">Try interaction</button>`
+      : `export const parity = true;\n// ${authority}` })
   })
+  await page.route('**/api/v1/artifact-documents/**', route => route.fulfill({ contentType: 'text/html', body: '<h1>Canonical child preview</h1>' }))
+  await page.route('**/api/v1/artifacts/*/preview-leases', route => {
+    const artifactId = new URL(route.request().url()).pathname.split('/').at(-2)!
+    return route.fulfill({ status: 201, json: { version: 1, lease_id: `lease-${artifactId}`, effective_mode: 'offline',
+      launch_url: `/api/v1/artifact-preview/${artifactId}/index.html`, entrypoint: 'index.html',
+      expires_at: new Date(Date.now() + 3_600_000).toISOString(), preview_origin: null, idle_timeout_seconds: 3600,
+      source: { kind: 'single_file', collection_status: 'not_applicable', file_count: 1, total_bytes: 32, warning_codes: [] } } })
+  })
+  await page.route('**/api/v1/artifact-preview/**', route => route.fulfill({ contentType: 'text/html', body: '<h1>Canonical child preview</h1>' }))
+  await page.route('**/api/v1/artifact-preview-leases/**', route => route.fulfill({ status: 204 }))
   await page.routeWebSocket(/\/ws$/, ws => {
     socket = ws
+    const connectionId = ++connection
+    const deliveryEpoch = `host-parity-delivery-${connectionId}`
+    let nextDelivery = 0
+    let acknowledged = 0
+    const snapshots = new Map<string, { id: string; key: string; bytes: Buffer; sequence: number }>()
     ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
     ws.onMessage(raw => {
       const frame = JSON.parse(String(raw)) as Request
-      if (frame.type === 'ping') { ws.send(JSON.stringify({ type: 'pong' })); return }
+      if (frame.type === 'ping') { ws.send(JSON.stringify({ type: 'pong', nonce: frame.nonce })); return }
       if (frame.type !== 'req') return
       requests.push(frame)
       const key = String(frame.params?.key ?? frame.params?.sessionKey ?? frame.params?.session_key ?? MAIN)
       const stream = get(key)
       const respond = (payload: unknown) => ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload }))
       if (frame.method === 'connect') {
-        ws.send(helloOkResponse({ features: { methods: [
+        ws.send(helloOkResponse({
+          ...(modernSnapshots ? { server: { conn_id: `host-parity-${connectionId}` }, policy: {
+            transport_probe_nonce: true,
+            transport_flow: { delivery_epoch: deliveryEpoch, window_frames: 128, window_bytes: 4 * 1024 * 1024 },
+          } } : {}),
+          features: { methods: [
           'sessions.messages.subscribe', 'sessions.messages.hydrate', 'sessions.messages.snapshot',
           'sessions.messages.unsubscribe', 'sessions.sidechat.create', 'sessions.sidechat.close',
-          'sessions.routing.get', 'sessions.routing.set', 'chat.send', 'chat.abort',
+          'sessions.routing.get', 'sessions.routing.set', 'chat.send', 'chat.abort', 'chat.clarify_submit',
+          'artifacts.get', 'workbench.resources.list', 'workbench.resources.get', 'workbench.resources.open',
+          'artifacts.documents.get', 'artifacts.revisions.list', 'artifacts.changes.list',
+          'workspaces.references.read',
           'sandbox.setup.status', 'sandbox.capability.status',
+          ...(modernSnapshots ? ['sessions.messages.snapshot.read', 'sessions.messages.resume',
+            'sessions.messages.snapshot.release', 'transport.flow.update'] : []),
         ] }, auth: { runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' } } }))
+        return
+      }
+      if (modernSnapshots && frame.method === 'sessions.messages.snapshot.read') {
+        const revision = String(frame.params?.sync_revision)
+        const owner = `${key}:${revision}`
+        let snapshot = snapshots.get(owner)
+        if (!snapshot) {
+          const value = sessionMessagesSnapshotPayload(key, { stream_generation: `generation-${key}`,
+            current_stream_seq: stream.sequence, task_id: stream.task,
+            events: stream.task ? stream.events.filter(event => event.event.startsWith('session.event.')) : [] })
+          snapshot = { id: `host-snapshot-${connectionId}-${snapshots.size + 1}`, key,
+            bytes: Buffer.from(JSON.stringify(value)), sequence: stream.sequence }
+          snapshots.set(owner, snapshot)
+        }
+        const index = Number(frame.params?.segment_index ?? 0), size = 192 * 1024
+        respond({ key, sync_revision: revision, snapshot_id: snapshot.id, segment_index: index,
+          segment_count: Math.ceil(snapshot.bytes.length / size), byte_length: snapshot.bytes.length,
+          encoding: 'base64-json-utf8', data: snapshot.bytes.subarray(index * size, (index + 1) * size).toString('base64'),
+          stream_generation: `generation-${key}`, current_stream_seq: snapshot.sequence,
+          task_id: stream.task, session_id: null, session_epoch: 1,
+          delivery: { delivery_epoch: deliveryEpoch, delivery_id: ++nextDelivery } })
+        return
+      }
+      if (modernSnapshots && frame.method === 'transport.flow.update') {
+        acknowledged = Math.max(acknowledged, Number(frame.params?.ack_delivery_id ?? 0))
+        respond({ delivery_epoch: deliveryEpoch, ack_delivery_id: acknowledged, dirty_keys: [], global_dirty: false })
+        return
+      }
+      if (modernSnapshots && frame.method === 'sessions.messages.resume') {
+        const snapshot = snapshots.get(`${key}:${frame.params?.sync_revision}`)
+        if (!snapshot || snapshot.id !== frame.params?.snapshot_id) {
+          ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: false, error: {
+            code: 'SNAPSHOT_STALE', message: 'Snapshot installation is no longer available', retryable: false } }))
+          return
+        }
+        snapshotInstalls.push({ key, connection: connectionId, id: snapshot.id })
+        respond({ ...frame.params, session_id: null, session_epoch: 1, replay_to_seq: frame.params?.stream_seq })
+        return
+      }
+      if (modernSnapshots && frame.method === 'sessions.messages.snapshot.release') {
+        snapshots.delete(`${key}:${frame.params?.sync_revision}`)
+        respond({ ...frame.params, retired: true })
         return
       }
       if (frame.method === 'sessions.sidechat.create') {
@@ -184,6 +276,39 @@ async function installGateway(page: Page, eventBeforeAck = false, routingConflic
         if (stream.task) finish(key, 'Interrupted answer.', 'cancelled')
         return
       }
+      if (frame.method === 'chat.clarify_submit') {
+        const requestId = String(frame.params?.requestId ?? frame.params?.request_id)
+        heldClarifications.set(requestId, { key, reply: accepted => {
+          pendingInputs.set(key, [])
+          ws.send(JSON.stringify(accepted
+            ? { type: 'res', id: frame.id, ok: true, payload: { resolved: true, request_id: requestId } }
+            : { type: 'res', id: frame.id, ok: false, error: { code: 'USER_INPUT_EXPIRED', message: 'The user-input request is no longer available.' } }))
+        } })
+        return
+      }
+      if (['workbench.resources.get', 'workbench.resources.open'].includes(frame.method)) {
+        const ref = frame.params?.resourceRef as Wire
+        const id = String(ref?.documentId ?? ref?.artifactId ?? ref?.id)
+        const document = documents.get(`${key}:${id}`)
+        if (!document) { respond({ resource: null }); return }
+        const reply = () => respond(frame.method === 'workbench.resources.get' ? { resource: document.resource }
+          : { disposition: 'document', resolution: { status: 'current' }, ...document, materialized: false })
+        if (frame.method === 'workbench.resources.get' && deferredResources.has(`${key}:${id}`)) heldResourceResolves.set(`${key}:${id}`, reply)
+        else reply()
+        return
+      }
+      const canonicalDocument = documents.get(`${key}:${frame.params?.documentId}`)
+      if (canonicalDocument && frame.method === 'artifacts.documents.get') { respond({ document: canonicalDocument.document }); return }
+      if (canonicalDocument && frame.method === 'artifacts.revisions.list') { respond({ revisions: [canonicalDocument.revision] }); return }
+      if (frame.method === 'artifacts.changes.list') { respond({ changeSets: [] }); return }
+      if (frame.method === 'workspaces.references.read') {
+        const reference = frame.params?.reference as Wire
+        const locator = reference.locator as Wire
+        respond({ reference, relativePath: locator.relativePath, revision: (reference.state as Wire).revision,
+          content: key === SIDE ? 'const sideReference = 1;' : 'const mainReference = 1;', totalLines: 1,
+          startLine: locator.startLine, endLine: locator.endLine })
+        return
+      }
       if (frame.method === 'approvals.resolve') {
         pendingApprovals = pendingApprovals.filter(item => item.id !== frame.params?.id)
         respond({ ok: true })
@@ -206,8 +331,10 @@ async function installGateway(page: Page, eventBeforeAck = false, routingConflic
           capabilities: ['filesystem', 'network', 'process'] },
         'sessions.list': { sessions: [{ key: MAIN, title: 'Main parity conversation', sessionKind: 'chat',
           surface: 'webchat', conversationKind: 'direct', effectiveAgentId: 'main', updatedAt: NOW,
-          messageCount: get(MAIN).history.length, status: 'ok', runStatus: get(MAIN).task ? 'running' : 'idle' }], count: 1, ts: NOW, has_more: false },
-        'sessions.resolve': { key, sessionId: key === MAIN ? 'main-id' : 'side-session-id' },
+          messageCount: get(MAIN).history.length, status: 'ok', runStatus: get(MAIN).task ? 'running' : 'idle' },
+          ...(includeOtherSession ? [{ key: OTHER, title: 'Other parity conversation', sessionKind: 'chat', surface: 'webchat',
+            conversationKind: 'direct', effectiveAgentId: 'main', updatedAt: NOW, messageCount: get(OTHER).history.length, status: 'ok', runStatus: 'idle' }] : [])], count: includeOtherSession ? 2 : 1, ts: NOW, has_more: false },
+        'sessions.resolve': { session_key: key, session_id: key === MAIN ? 'main-id' : key === SIDE ? 'side-session-id' : 'other-session-id' },
         'chat.history': chatHistoryPayload(stream.history),
         'sessions.messages.subscribe': sessionMessagesSubscribePayload(key, metadata(key)),
         'sessions.messages.hydrate': sessionMessagesHydratePayload(key, metadata(key)),
@@ -216,11 +343,54 @@ async function installGateway(page: Page, eventBeforeAck = false, routingConflic
         'sessions.messages.unsubscribe': { subscribed: false },
         'sessions.subscribe': { subscribed: true },
         'usage.status': { sessions: [] },
+        'workbench.resources.list': { resources: [], totalCount: 0, pageSize: 200, returnedCount: 0, hasMore: false, nextCursor: null },
       }
       respond(payloads[frame.method] ?? {})
     })
   })
-  return { requests, errors, emit, finish, approvalResolutions, fileRequests,
+  return { requests, errors, consoleWarnings, emit, finish, approvalResolutions, fileRequests, snapshotInstalls,
+    failApproval: (id: string, fail: boolean) => fail ? failedApprovals.add(id) : failedApprovals.delete(id),
+    denyFile: (key: string, path: string, deny: boolean) => deny ? deniedFiles.add(`${key}:${path}`) : deniedFiles.delete(`${key}:${path}`),
+    enableOtherSession: () => {
+      includeOtherSession = true
+      get(OTHER).history = [{ role: 'assistant', text: '[Other resource](other.ts)', id: 'other-answer', timestamp: NOW }]
+    },
+    registerDocument: (key: string, documentId: string, name: string) => {
+      const revisionId = `rev-${documentId}`, artifactId = `art-${documentId}`
+      const document = { documentId, headRevisionId: revisionId, name, sessionKey: key, kind: 'html',
+        latestDownloadUrl: `/api/v1/artifact-documents/${documentId}`, capabilities: { download: true, preview: true, revisions: true, source: false } }
+      const revision = { revisionId, documentId, artifactId, filename: name, mediaType: 'text/html', byteSize: 4096,
+        artifactSha256: 'b'.repeat(64), downloadUrl: `/api/v1/artifact-documents/${documentId}?revisionId=${revisionId}` }
+      const resource = { resource: { type: 'document', documentId }, name, mime: 'text/html', sha256: 'b'.repeat(64), size: 4096,
+        downloadUrl: document.latestDownloadUrl, capabilities: { preview: true, download: true, edit: false },
+        relations: { documentId, headRevisionId: revisionId, headArtifactId: artifactId } }
+      const artifact = { id: artifactId, documentId, name, mime: 'text/html', size: 4096, download_url: revision.downloadUrl }
+      documents.set(`${key}:${documentId}`, { document, revision, resource, artifact })
+      return artifact
+    },
+    deferResource: (key: string, id: string) => deferredResources.add(`${key}:${id}`),
+    releaseResource: (key: string, id: string) => {
+      const identity = `${key}:${id}`
+      const release = heldResourceResolves.get(identity)
+      if (!release) throw new Error(`No pending resource resolve: ${identity}`)
+      heldResourceResolves.delete(identity)
+      deferredResources.delete(identity)
+      release()
+    },
+    requestInput: (key: string) => {
+      const request = { kind: 'user_input', paused: true, request_id: `clarify-${key}`,
+        run_id: get(key).task, step: 'clarify', clarify_schema: { intro: 'One detail is required.',
+          fields: [{ name: 'topic', prompt: 'Project topic', type: 'string', required: true }] } }
+      pendingInputs.set(key, [request])
+      emit(key, 'session.event.tool_result', { tool_use_id: 'call-questionnaire', name: 'request_user_input', result: JSON.stringify(request) })
+      return request
+    },
+    answerInput: (key: string, accepted: boolean) => {
+      const pending = heldClarifications.get(`clarify-${key}`)
+      if (!pending || pending.key !== key) throw new Error(`No submitted clarification for ${key}`)
+      pending.reply(accepted)
+      heldClarifications.delete(`clarify-${key}`)
+    },
     appendHistory: (key: string, message: Wire) => get(key).history.push({
       turn_id: get(key).task, timestamp: NOW + 2_000, ...message,
     }),
@@ -246,6 +416,7 @@ async function openHosts(page: Page) {
   await page.goto(`/control/chat?session=${encodeURIComponent(MAIN)}`)
   const main = page.locator('#app-main .chat').first()
   await expect(main).toContainText('Earlier main answer')
+  await expect.poll(() => page.locator('.sidebar-brand-mark').evaluate(image => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0)
   await page.getByTestId('topbar-workbench-toggle').click()
   await page.getByRole('button', { name: 'Assistant chat', exact: true }).click()
   const side = page.getByTestId('assistant-chat-panel')
@@ -258,6 +429,13 @@ function composer(host: Locator) {
   return host.getByRole('textbox', { name: 'Message to send', exact: true })
 }
 
+async function captureReview(page: Page, name: string) {
+  // These images show real production UI with the explicitly synthetic Gateway.
+  const directory = new URL('../../../../.tmp/main-side-review-20261016/automated-screenshots/', import.meta.url)
+  await mkdir(directory, { recursive: true })
+  await page.screenshot({ path: fileURLToPath(new URL(`${name}.png`, directory)), fullPage: true })
+}
+
 async function send(host: Locator, text: string) {
   await composer(host).fill(text)
   await host.getByRole('button', { name: 'Send', exact: true }).click()
@@ -267,6 +445,7 @@ async function assertNoSettledExtras(host: Locator) {
   await expect(host.locator('.sources-row')).toHaveCount(0)
   await expect(host.locator('.conversation-live-edge .msg-ai-footer')).toHaveCount(0)
   await expect(host.locator('.chat-stop-btn')).toBeVisible()
+  await expect(host.locator('.chat-stop-btn')).toBeEnabled()
 }
 
 async function equalizeConversationWidths(page: Page, main: Locator, side: Locator) {
@@ -740,6 +919,35 @@ test.describe('real routed main and workbench side conversation hosts', () => {
       await expect(host.locator('.conversation-live-edge')).toContainText('Final answer.')
       await assertNoSettledExtras(host)
     }
+    const stopControls = () => page.locator('.chat-stop-btn').evaluateAll(elements => elements.map(element => ({
+      disabled: (element as HTMLButtonElement).disabled, busy: element.getAttribute('aria-busy'), hover: element.matches(':hover'),
+      background: getComputedStyle(element).backgroundColor, color: getComputedStyle(element).color,
+    })))
+    const stopBeforePointerReset = await stopControls()
+    for (const host of [main, side]) {
+      const stop = host.locator('.chat-stop-btn')
+      await stop.hover()
+      await expect(stop).toBeEnabled()
+      await awaitStyleTransition(stop)
+      // Normalize the actual theme token and computed paint through Canvas's
+      // CSS color parser without changing or stubbing the rendered button.
+      const paint = await stop.evaluate(element => {
+        const context = document.createElement('canvas').getContext('2d')!
+        const style = getComputedStyle(element)
+        context.fillStyle = style.getPropertyValue('--danger-fill').trim()
+        const expected = context.fillStyle
+        context.fillStyle = style.backgroundColor
+        return { actual: context.fillStyle, expected }
+      })
+      expect(paint.actual).toBe(paint.expected)
+    }
+    await captureReview(page, '07-side-stop-hover-enabled')
+    await page.mouse.move(0, 0)
+    for (const host of [main, side]) await awaitStyleTransition(host.locator('.chat-stop-btn'))
+    const stopAfterPointerReset = await stopControls()
+    console.log('Stop controls before/after pointer reset', JSON.stringify({ before: stopBeforePointerReset, after: stopAfterPointerReset }))
+    expect(stopAfterPointerReset[0]).toEqual(stopAfterPointerReset[1])
+    await captureReview(page, '01-main-side-running')
     for (const key of [MAIN, SIDE]) gateway.finish(key, 'Final answer.', 'succeeded', [
       { type: 'text', text: 'Checking sources.' }, tool, { type: 'text', text: 'Final answer.' },
     ])
@@ -753,9 +961,11 @@ test.describe('real routed main and workbench side conversation hosts', () => {
       await expect(host.locator('.msg-meta-popover').last()).toContainText('test-model')
       await expect(host.locator('.msg-meta-popover').last()).toContainText('120')
       await expect(host.locator('.msg-meta-popover').last()).toContainText('30')
+      if (host === side) await captureReview(page, '03-side-settled-usage')
       await host.getByRole('button', { name: 'Usage details', exact: true }).last().click()
       await host.getByRole('button', { name: 'Models & routing', exact: true }).click()
       await expect(page.getByRole('menuitemradio', { name: /Intelligent model routing/ })).toBeVisible()
+      if (host === side) await captureReview(page, '04-side-routing-menu')
       await page.keyboard.press('Escape')
     }
     expect(await main.locator('.sources-row').textContent()).toBe(await side.locator('.sources-row').textContent())
@@ -771,8 +981,8 @@ test.describe('real routed main and workbench side conversation hosts', () => {
     expect(gateway.errors).toEqual([])
   })
 
-  test('preserves both live readers on reconnect and closes only the side owner', async ({ page }) => {
-    const gateway = await installGateway(page)
+  for (const modernSnapshots of [false, true]) test(`preserves both ${modernSnapshots ? 'modern segmented' : 'legacy'} live readers on reconnect and closes only the side owner`, async ({ page }) => {
+    const gateway = await installGateway(page, false, false, false, modernSnapshots)
     const { main, side } = await openHosts(page)
     await send(main, 'Main recovery turn')
     await send(side, 'Side recovery turn')
@@ -789,6 +999,11 @@ test.describe('real routed main and workbench side conversation hosts', () => {
       await expect(host.locator('.chat-stop-btn')).toBeEnabled()
       await expect(host.locator('.conversation-live-edge')).not.toContainText('Retained across reconnect.Retained across reconnect.')
     }
+    if (modernSnapshots) {
+      await expect.poll(() => [...new Set(gateway.snapshotInstalls.filter(install => install.connection === 2).map(install => install.key))].sort())
+        .toEqual([MAIN, SIDE].sort())
+      expect(gateway.requests.filter(request => request.method === 'sessions.messages.snapshot')).toHaveLength(0)
+    }
     expect(gateway.requests.filter(request => request.method === 'chat.send')).toHaveLength(2)
     expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.create')).toHaveLength(1)
     await page.getByTestId('topbar-workbench-toggle').click()
@@ -798,14 +1013,23 @@ test.describe('real routed main and workbench side conversation hosts', () => {
     expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.create')).toHaveLength(1)
     await side.locator('.chat-stop-btn').click()
     await expect(side.locator('.chat-stop-btn')).toHaveCount(0)
+    await composer(main).fill('Main draft survives closing the side')
+    await composer(side).fill('Unsent dirty side draft at disposal')
     await page.getByRole('button', { name: 'Close tab: Assistant chat', exact: true }).click()
     await expect(side).toHaveCount(0)
     await expect.poll(() => gateway.requests.filter(request => request.method === 'sessions.sidechat.close').length).toBe(1)
     expect(gateway.requests.find(request => request.method === 'sessions.sidechat.close')?.params?.key).toBe(SIDE)
     await expect(main.locator('.chat-stop-btn')).toBeVisible()
+    gateway.emit(MAIN, 'session.event.text_delta', { text: ' Main continued after side close.' })
+    await expect(main.locator('.conversation-live-edge')).toContainText('Main continued after side close.')
+    await expect(composer(main)).toHaveText('Main draft survives closing the side')
+    await expect(page.getByText('Side conversation is closed', { exact: true })).toHaveCount(0)
     expect(new URL(page.url()).searchParams.get('session')).toBe(MAIN)
     gateway.finish(MAIN)
     await expect(main.locator('.chat-stop-btn')).toHaveCount(0)
+    if (modernSnapshots) {
+      expect(gateway.consoleWarnings.filter(message => /Snapshot installation is no longer available|Snapshot invalidated by a newer delivery gap/.test(message))).toEqual([])
+    }
     expect(gateway.errors).toEqual([])
   })
 
@@ -828,6 +1052,7 @@ test.describe('real routed main and workbench side conversation hosts', () => {
       await expect(host.getByRole('button', { name: 'Allow once', exact: true })).toBeVisible()
     }
     expect(await main.getByTestId('approval-card').textContent()).toBe(await side.getByTestId('approval-card').textContent())
+    await captureReview(page, '02-main-side-approval')
     await side.getByRole('button', { name: 'Allow once', exact: true }).click()
     await expect.poll(() => gateway.approvalResolutions.length).toBe(1)
     expect(gateway.approvalResolutions[0]).toMatchObject({ id: 'approval-1', approved: true })
@@ -855,12 +1080,358 @@ test.describe('real routed main and workbench side conversation hosts', () => {
         const link = host.getByRole('link', { name: `Open ${path}`, exact: true })
         await expect(link).toBeVisible()
         await link.click()
-        await expect(page.getByTestId('workspace-file-panel')).toContainText(text)
+        const panel = page.getByTestId('workspace-file-panel')
+        const authority = key === SIDE ? 'Side resource authority' : 'Main resource authority'
+        const otherAuthority = key === SIDE ? 'Main resource authority' : 'Side resource authority'
+        if (path === 'demo.html') {
+          // Use the ordinary transcript link, not a canonical artifact card or
+          // a reconstructed preview component. Both hosts must reach the same
+          // interactive HTML renderer and retain their own read authority.
+          const frame = panel.frameLocator('.resource-preview[data-preview-kind="html"] iframe')
+          await expect(frame.getByRole('heading', { name: text })).toBeVisible()
+          await expect(frame.locator('body')).toContainText(authority)
+          await expect(frame.locator('body')).not.toContainText(otherAuthority)
+          await expect(panel.locator('.resource-preview iframe')).toHaveAttribute('sandbox', 'allow-scripts')
+          await frame.getByRole('button', { name: 'Try interaction', exact: true }).click()
+          await expect(frame.getByRole('button', { name: 'Clicked once', exact: true })).toBeVisible()
+          if (key === SIDE) await captureReview(page, '05-side-html-file-preview')
+          await panel.getByRole('button', { name: 'Source', exact: true }).click()
+          await expect(panel.locator('.workspace-file__source')).toContainText(text)
+          await expect(panel.locator('.workspace-file__source')).toContainText(authority)
+          await expect(panel.locator('.workspace-file__source')).not.toContainText(otherAuthority)
+          await panel.getByRole('button', { name: 'Preview', exact: true }).click()
+          await expect(frame.getByRole('heading', { name: text })).toBeVisible()
+        } else {
+          await expect(panel).toContainText(text)
+          await expect(panel).toContainText(authority)
+          await expect(panel).not.toContainText(otherAuthority)
+        }
         expect(gateway.fileRequests.some(request => request.sessionKey === key && request.path === path && request.action === 'content')).toBe(true)
         expect(new URL(page.url()).searchParams.get('session')).toBe(MAIN)
         await expect(page.getByRole('tab', { name: 'Assistant chat', exact: true })).toBeVisible()
       }
     }
+    expect(gateway.errors).toEqual([])
+  })
+
+  test('keeps prior settled sources and footers stable throughout a second running turn', async ({ page }) => {
+    const gateway = await installGateway(page)
+    const { main, side } = await openHosts(page)
+    const tool = { type: 'tool_use', tool_use_id: 'first-source', name: 'web_fetch', input: { url: 'https://example.com/first' },
+      result: JSON.stringify({ url: 'https://example.com/first', title: 'First source', content: 'First body' }), execution_status: { status: 'success' } }
+    for (const host of [main, side]) await send(host, 'First research turn')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(2)
+    for (const key of [MAIN, SIDE]) gateway.finish(key, 'First settled answer.', 'succeeded', [tool])
+    const counts = []
+    for (const host of [main, side]) {
+      await expect(host.locator('.chat-stop-btn')).toHaveCount(0)
+      await expect(host.locator('.sources-row')).toHaveCount(1)
+      await expect(host.locator('.msg-ai-footer').last()).toBeVisible()
+      counts.push(await host.locator('.msg-ai-footer').count())
+      await send(host, 'Second research turn')
+    }
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(4)
+    const secondTool = { ...tool, tool_use_id: 'second-source', input: { url: 'https://example.com/second' },
+      result: JSON.stringify({ url: 'https://example.com/second', title: 'Second source', content: 'Second body' }) }
+    for (const key of [MAIN, SIDE]) {
+      gateway.emit(key, 'session.event.text_delta', { text: 'Second ongoing commentary.', presentation: 'intermediate' })
+      gateway.emit(key, 'session.event.tool_use_start', { tool_use_id: secondTool.tool_use_id, tool_name: secondTool.name, input: secondTool.input })
+      gateway.emit(key, 'session.event.tool_result', { ...secondTool, tool_name: secondTool.name })
+      gateway.emit(key, 'session.event.text_delta', { text: 'Second answer still streaming.', presentation: 'answer' })
+    }
+    for (const [index, host] of [main, side].entries()) {
+      await expect(host.locator('.conversation-live-edge')).toContainText('Second answer still streaming.')
+      await expect(host.locator('.sources-row')).toHaveCount(1)
+      await expect(host.locator('.msg-ai-footer')).toHaveCount(counts[index])
+      await expect(host.locator('.chat-stop-btn')).toBeVisible()
+    }
+    for (const key of [MAIN, SIDE]) gateway.finish(key, 'Second answer completed.', 'succeeded', [secondTool])
+    for (const [index, host] of [main, side].entries()) {
+      await expect(host.locator('.sources-row')).toHaveCount(2)
+      await expect(host.locator('.msg-ai-footer')).toHaveCount(counts[index]! + 1)
+      await expect(host.locator('.chat-stop-btn')).toHaveCount(0)
+    }
+    expect(gateway.errors).toEqual([])
+  })
+
+  test('retains a failed denial for retry and isolates allow versus deny between actual hosts', async ({ page }) => {
+    const gateway = await installGateway(page)
+    const { main, side } = await openHosts(page)
+    await send(main, 'Main approval')
+    await send(side, 'Side approval')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(2)
+    const approvals = [MAIN, SIDE].map((key, index) => ({ id: `denial-${index}`, namespace: 'exec', sessionKey: key,
+      toolName: 'shell', command: 'echo approval-check', args: { command: 'echo approval-check' }, displayKind: 'run_command', displayTarget: 'echo approval-check' }))
+    gateway.pendingApprovals(approvals)
+    for (const approval of approvals) gateway.emit(approval.sessionKey, 'exec.approval.requested', { ...approval, approval_id: approval.id, tool_name: approval.toolName })
+    gateway.failApproval('denial-1', true)
+    await side.getByRole('button', { name: 'Deny', exact: true }).click()
+    await expect(side.getByTestId('approval-card').getByRole('alert')).toBeVisible()
+    await expect(side.getByRole('button', { name: 'Deny', exact: true })).toBeEnabled()
+    await expect(main.getByTestId('approval-card')).toBeVisible()
+    expect(gateway.approvalResolutions).toHaveLength(1)
+    expect(gateway.approvalResolutions[0]).toMatchObject({ id: 'denial-1', approved: false })
+    gateway.failApproval('denial-1', false)
+    await side.getByRole('button', { name: 'Deny', exact: true }).click()
+    await expect(side.getByTestId('approval-card')).toHaveCount(0)
+    await expect(main.getByTestId('approval-card')).toBeVisible()
+    await main.getByRole('button', { name: 'Allow once', exact: true }).click()
+    await expect(main.getByTestId('approval-card')).toHaveCount(0)
+    expect(gateway.approvalResolutions.map(item => ({ id: item.id, approved: item.approved }))).toEqual([
+      { id: 'denial-1', approved: false }, { id: 'denial-1', approved: false }, { id: 'denial-0', approved: true },
+    ])
+    expect(gateway.requests.filter(request => request.method === 'chat.send')).toHaveLength(2)
+    expect(gateway.requests.filter(request => request.method === 'chat.abort')).toHaveLength(0)
+    expect(gateway.errors).toEqual([])
+  })
+
+  for (const accepted of [true, false]) test(`waits for clarification ACK and isolates ${accepted ? 'accepted' : 'expired'} side replies`, async ({ page }) => {
+    const gateway = await installGateway(page)
+    const { main, side } = await openHosts(page)
+    await send(main, 'Main needs detail')
+    await send(side, 'Side needs detail')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(2)
+    gateway.requestInput(MAIN)
+    const sideRequest = gateway.requestInput(SIDE)
+    for (const host of [main, side]) await expect(host.getByTestId('clarify-card')).toBeVisible()
+    const mainField = main.getByTestId('clarify-card').locator('.clarify-field__input')
+    const sideField = side.getByTestId('clarify-card').locator('.clarify-field__input')
+    expect(await mainField.getAttribute('aria-labelledby')).not.toBe(await sideField.getAttribute('aria-labelledby'))
+    await sideField.fill('Side-only topic')
+    await sideField.press('Escape')
+    expect(gateway.requests.filter(request => request.method === 'chat.abort')).toHaveLength(0)
+    await side.getByRole('button', { name: 'Send reply', exact: true }).click()
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.clarify_submit').length).toBe(1)
+    await expect(side.getByTestId('clarify-submit-status')).toBeVisible()
+    await expect(side.getByTestId('clarify-outcome')).toHaveCount(0)
+    await expect(mainField).toBeEnabled()
+    await expect(mainField).toHaveValue('')
+    const submission = gateway.requests.find(request => request.method === 'chat.clarify_submit')?.params
+    expect(submission).toMatchObject({ sessionKey: SIDE, requestId: `clarify-${SIDE}`, fields: { topic: 'Side-only topic' } })
+    gateway.answerInput(SIDE, accepted)
+    await expect(side.getByTestId('clarify-outcome')).toContainText(accepted ? 'Reply received' : 'Question expired')
+    await expect(side.getByTestId('clarify-card')).toHaveCount(0)
+    gateway.emit(SIDE, 'session.event.tool_result', { tool_use_id: 'call-questionnaire', name: 'request_user_input', result: JSON.stringify(sideRequest) })
+    gateway.emit(SIDE, 'session.event.text_delta', { text: 'Clarification replay boundary.' })
+    await expect(side.locator('.conversation-live-edge')).toContainText('Clarification replay boundary.')
+    await expect(side.getByTestId('clarify-card')).toHaveCount(0)
+    await expect(main.getByTestId('clarify-card')).toBeVisible()
+    await mainField.fill('Main-only topic')
+    await main.getByRole('button', { name: 'Send reply', exact: true }).click()
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.clarify_submit').length).toBe(2)
+    gateway.answerInput(MAIN, true)
+    await expect(main.getByTestId('clarify-outcome')).toContainText('Reply received')
+    expect(gateway.requests.filter(request => request.method === 'chat.send')).toHaveLength(2)
+    expect(gateway.errors).toEqual([])
+  })
+
+  test('shows child resource denial without falling back to main content and recovers on explicit reopen', async ({ page }) => {
+    const gateway = await installGateway(page)
+    const { main, side } = await openHosts(page)
+    const text = '[Code file](denied.ts)'
+    await send(main, 'Main resource')
+    await send(side, 'Side resource')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(2)
+    for (const key of [MAIN, SIDE]) gateway.finish(key, text)
+    await main.getByRole('link', { name: 'Open denied.ts', exact: true }).click()
+    await expect(page.getByTestId('workspace-file-panel')).toContainText('Main resource authority')
+    await page.getByRole('button', { name: 'Close tab: denied.ts', exact: true }).click()
+    gateway.denyFile(SIDE, 'denied.ts', true)
+    const requestsBefore = gateway.fileRequests.length
+    await side.getByRole('link', { name: 'Open denied.ts', exact: true }).click()
+    await expect(page.getByTestId('workspace-file-panel').getByRole('alert')).toBeVisible()
+    await captureReview(page, '06-side-resource-access-error')
+    await expect(page.getByTestId('workspace-file-panel')).not.toContainText('Main resource authority')
+    expect(gateway.fileRequests.slice(requestsBefore).filter(request => request.action === 'content').map(request => request.sessionKey)).toEqual([SIDE])
+    expect(new URL(page.url()).searchParams.get('session')).toBe(MAIN)
+    await page.getByRole('button', { name: 'Close tab: denied.ts', exact: true }).click()
+    gateway.denyFile(SIDE, 'denied.ts', false)
+    await side.getByRole('link', { name: 'Open denied.ts', exact: true }).click()
+    await expect(page.getByTestId('workspace-file-panel')).toContainText('Side resource authority')
+    await expect(page.getByTestId('workspace-file-panel').getByRole('alert')).toHaveCount(0)
+    expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.create')).toHaveLength(1)
+    expect(gateway.errors).toEqual([])
+  })
+
+  test('does not open a child resource after its owning side tab closes during resolution', async ({ page }) => {
+    const gateway = await installGateway(page)
+    const { main, side } = await openHosts(page)
+    await send(side, 'Resolve slowly')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(1)
+    const artifact = gateway.registerDocument(SIDE, 'doc_delayed', 'delayed.html')
+    gateway.finish(SIDE, 'A generated HTML file.', 'succeeded', [], {}, [artifact])
+    gateway.deferResource(SIDE, 'doc_delayed')
+    await side.getByRole('button', { name: 'Open delayed.html', exact: true }).click()
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'workbench.resources.get').length).toBe(1)
+    await page.getByRole('button', { name: 'Close tab: Assistant chat', exact: true }).click()
+    await expect(side).toHaveCount(0)
+    gateway.releaseResource(SIDE, 'doc_delayed')
+    // A new main turn provides an observed render/event boundary after the late
+    // response, rather than accepting an immediate negative DOM assertion.
+    await send(main, 'Main remains usable')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(2)
+    gateway.emit(MAIN, 'session.event.text_delta', { text: 'Main continues after child close.' })
+    await expect(main.locator('.conversation-live-edge')).toContainText('Main continues after child close.')
+    await expect(page.getByRole('tab', { name: 'delayed.html', exact: true })).toHaveCount(0)
+    await expect(page.getByTestId('workspace-file-panel')).toHaveCount(0)
+    expect(gateway.requests.filter(request => request.method === 'workbench.resources.open')).toHaveLength(0)
+    expect(gateway.errors).toEqual([])
+  })
+
+  test('registers a hidden side preview without stealing another conversation workbench', async ({ page }) => {
+    const gateway = await installGateway(page)
+    gateway.enableOtherSession()
+    const { side } = await openHosts(page)
+    await send(side, 'Generate a background HTML preview')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(1)
+    gateway.registerDocument(SIDE, 'doc_background', 'background.html')
+    gateway.deferResource(SIDE, 'doc_background')
+    const result = { documentId: 'doc_background', resourceId: 'document:doc_background', entrypoint: '/task/background.html', previewStatus: 'ready' }
+    gateway.emit(SIDE, 'session.event.tool_use_start', { tool_use_id: 'background-preview', tool_name: 'open_workspace_preview', input: { path: 'background.html' } })
+    gateway.emit(SIDE, 'session.event.tool_result', { tool_use_id: 'background-preview', name: 'open_workspace_preview', result: JSON.stringify(result) })
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'workbench.resources.get').length).toBeGreaterThan(0)
+    await page.getByRole('button', { name: 'Other parity conversation', exact: true }).click()
+    await expect(page.locator('.topbar')).toContainText('Other parity conversation')
+    await page.locator('#app-main').getByRole('link', { name: 'Open other.ts', exact: true }).click()
+    await expect(page.getByRole('tab', { name: 'other.ts', exact: true })).toHaveAttribute('aria-selected', 'true')
+    await expect(page.getByTestId('workspace-file-panel')).toContainText('Main resource authority')
+    const panelText = await page.getByTestId('workspace-file-panel').textContent()
+    gateway.releaseResource(SIDE, 'doc_background')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'workbench.resources.open').length).toBe(1)
+    // A foreground turn confirms that the background open response has reached
+    // the live app before checking the selected panel and its contents.
+    const other = page.locator('#app-main .chat').first()
+    await send(other, 'Continue in the other conversation')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(2)
+    gateway.emit(OTHER, 'session.event.text_delta', { text: 'Other conversation stays in control.' })
+    await expect(other.locator('.conversation-live-edge')).toContainText('Other conversation stays in control.')
+    await expect(page.getByRole('tab', { name: 'other.ts', exact: true })).toHaveAttribute('aria-selected', 'true')
+    await expect(page.getByTestId('workspace-file-panel')).toHaveText(panelText!)
+    await expect(page.getByRole('tab', { name: 'background.html', exact: true })).toHaveCount(0)
+    await page.getByRole('button', { name: 'Main parity conversation', exact: true }).click()
+    await expect(page.getByRole('tab', { name: 'background.html', exact: true })).toBeVisible()
+    await page.getByRole('tab', { name: 'background.html', exact: true }).click()
+    await expect(page.frameLocator('.artifact-preview__frame--html').getByRole('heading', { name: 'Canonical child preview', exact: true })).toBeVisible()
+    expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.close')).toHaveLength(0)
+    expect(gateway.errors).toEqual([])
+  })
+
+  test('navigates session references through the main route without replacing the side child identity', async ({ page }) => {
+    const gateway = await installGateway(page)
+    gateway.enableOtherSession()
+    const { main, side } = await openHosts(page)
+    for (const host of [main, side]) await send(host, 'Find the other conversation')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(2)
+    const reference = { version: 1, kind: 'session', id: OTHER, label: 'Other parity conversation',
+      scope: { sessionKey: OTHER }, state: { available: true, runStatus: null }, capabilities: { open: true, copy: true } }
+    const tool = { type: 'tool_use', tool_use_id: 'find-session', name: 'session_search', input: { query: 'other' },
+      result: JSON.stringify({ results: [{ reference }] }), execution_status: { status: 'success' } }
+    for (const key of [MAIN, SIDE]) gateway.finish(key, 'This is the related conversation.', 'succeeded', [tool])
+    await composer(side).fill('Side draft survives reference navigation')
+    for (const host of [main, side]) {
+      const card = host.getByTestId('session-reference-card')
+      await expect(card).toBeEnabled()
+      await card.click()
+      await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(OTHER)
+      await expect(page.locator('.topbar')).toContainText('Other parity conversation')
+      await expect(side).not.toBeVisible()
+      await page.getByRole('button', { name: 'Main parity conversation', exact: true }).click()
+      await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(MAIN)
+      await expect(side.getByTestId('session-reference-card')).toBeVisible()
+      await expect(composer(side)).toHaveText('Side draft survives reference navigation')
+    }
+    await side.getByRole('button', { name: 'Send', exact: true }).click()
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(3)
+    expect(gateway.requests.filter(request => request.method === 'chat.send').at(-1)?.params?.sessionKey).toBe(SIDE)
+    expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.create')).toHaveLength(1)
+    expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.close')).toHaveLength(0)
+    expect(gateway.errors).toEqual([])
+  })
+
+  for (const kind of ['workspace-reference', 'historical-tool-file'] as const) test(`opens ${kind} from both transcripts with parent panel ownership and child read authority`, async ({ page }) => {
+    const gateway = await installGateway(page)
+    const { main, side } = await openHosts(page)
+    for (const host of [main, side]) await send(host, 'Inspect a source file')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(2)
+    for (const key of [MAIN, SIDE]) {
+      const reference = { version: 1, kind: 'workspace_file', id: 'reference.ts', label: 'reference.ts:1',
+        scope: { sessionKey: key, workspaceId: 'workspace' }, locator: { relativePath: 'reference.ts', startLine: 1, endLine: 1 },
+        state: { available: true, revision: 'file_1234567890abcdef' }, capabilities: { open: true, copy: true } }
+      const tool = kind === 'workspace-reference'
+        ? { type: 'tool_use', tool_use_id: 'read-reference', name: 'read_source', input: { path: 'reference.ts' },
+            result: JSON.stringify({ status: 'success', reference }), execution_status: { status: 'success' } }
+        : { type: 'tool_use', tool_use_id: 'write-history', name: 'write_file',
+            input: { path: 'history.ts', content: key === SIDE ? 'const sideHistory = 1;' : 'const mainHistory = 1;' },
+            result: 'File written successfully.', execution_status: { status: 'success' } }
+      const { result, execution_status, ...start } = tool
+      const complete = { type: 'tool_result', tool_use_id: tool.tool_use_id, name: tool.name, result, execution_status,
+        ...(kind === 'historical-tool-file' ? { file_snapshot: { kind: 'write', path: 'history.ts',
+          content: key === SIDE ? 'const sideHistory = 1;' : 'const mainHistory = 1;' } } : {}) }
+      gateway.emit(key, 'session.event.tool_use_start', { tool_use_id: tool.tool_use_id, tool_name: tool.name, input: tool.input })
+      gateway.emit(key, 'session.event.tool_result', complete)
+      gateway.finish(key, 'Source inspection complete.', 'succeeded', [start, complete])
+    }
+    for (const [host, key] of [[main, MAIN], [side, SIDE]] as const) {
+      await page.getByRole('tab', { name: 'Assistant chat', exact: true }).click()
+      if (kind === 'workspace-reference') {
+        await host.getByTestId('workspace-reference-card').locator('.workspace-reference__open').click()
+        await expect(page.getByTestId('workspace-file-panel')).toContainText(key === SIDE ? 'const sideReference = 1;' : 'const mainReference = 1;')
+        expect(gateway.requests.filter(request => request.method === 'workspaces.references.read').at(-1)?.params?.sessionKey).toBe(key)
+      } else {
+        await host.getByRole('button', { name: /^Time spent/ }).click()
+        await host.locator('.tool-row[aria-expanded="false"]').click()
+        await host.getByTestId('activity-code-open').click()
+        await expect(page.getByTestId('historical-tool-file-panel')).toContainText(key === SIDE ? 'const sideHistory = 1;' : 'const mainHistory = 1;')
+      }
+      expect(new URL(page.url()).searchParams.get('session')).toBe(MAIN)
+      await expect(page.getByRole('tab', { name: 'Assistant chat', exact: true })).toBeVisible()
+      await captureReview(page, `${kind}-${key === SIDE ? 'side' : 'main'}`)
+      // A parent-owned file remains part of this workbench after returning to
+      // the assistant tab; it must not disappear in a hidden child scope.
+      const fileTab = page.getByRole('tab', { name: kind === 'workspace-reference' ? 'reference.ts' : 'history.ts', exact: true })
+      await expect(fileTab).toHaveAttribute('aria-selected', 'true')
+      await page.getByRole('tab', { name: 'Assistant chat', exact: true }).click()
+      await expect(fileTab).toBeVisible()
+      await fileTab.click()
+      await expect(fileTab).toHaveAttribute('aria-selected', 'true')
+      await page.getByRole('button', { name: `Close tab: ${kind === 'workspace-reference' ? 'reference.ts' : 'history.ts'}`, exact: true }).click()
+    }
+    expect(gateway.errors).toEqual([])
+  })
+
+  test('pastes Chinese text through the focused side editor without changing the main draft or duplicating delivery', async ({ page, context }) => {
+    const gateway = await installGateway(page)
+    const { main, side } = await openHosts(page)
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+    const prompt = [
+      '请先检查主会话的上下文，再说明这份 HTML 产物的布局、交互和下一步修改建议。不要立即修改文件。',
+      '这次需要验证主会话和辅助对话同时打开时的完整交互。请保留主会话已有的草稿和执行状态，辅助对话中的输入、澄清和审批应当只属于当前辅助会话。',
+      '检查页面标题、代码引用、可预览文件和生成产物的操作是否一致；说明哪些结果已经由实际执行验证，哪些仍然需要后续测试。',
+      '如果需要进一步信息，先提出一个明确的问题并等待回复。完成分析后给出简洁结论，不要重复这段输入，不要创建额外任务。',
+    ].join('\n\n')
+    const mainDraft = '主会话独立草稿：请保留此内容。'
+    // Use the browser clipboard and native keyboard paste, not locator.fill or
+    // a dispatched synthetic input: document capture and the inline editor's
+    // actual paste/selection/execCommand handlers all participate.
+    for (const expectedMain of ['', mainDraft]) {
+      await composer(main).fill(expectedMain)
+      await composer(side).fill('')
+      await page.evaluate(text => navigator.clipboard.writeText(text), prompt)
+      await composer(side).click()
+      await page.keyboard.press('Control+V')
+      await expect(composer(side)).toHaveText(prompt, { useInnerText: true })
+      await expect(composer(main)).toHaveText(expectedMain)
+      await expect(composer(side)).toBeFocused()
+    }
+    await side.getByRole('button', { name: 'Send', exact: true }).click()
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(1)
+    expect(gateway.requests.find(request => request.method === 'chat.send')?.params).toMatchObject({ sessionKey: SIDE, message: prompt })
+    gateway.finish(SIDE, '已检查这份产物。')
+    await expect(side).toContainText('已检查这份产物。')
+    await expect(composer(side)).toHaveText('')
+    await expect(composer(main)).toHaveText(mainDraft)
+    expect(gateway.requests.filter(request => request.method === 'chat.send')).toHaveLength(1)
+    expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.create')).toHaveLength(1)
     expect(gateway.errors).toEqual([])
   })
 

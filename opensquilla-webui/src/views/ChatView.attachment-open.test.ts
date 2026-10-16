@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { effectScope, reactive, ref, watch, type EffectScope } from 'vue'
 import { transpileModule, ScriptTarget } from '@typescript/typescript6'
 import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
 import { artifactPayloadFromWorkbenchResource, resourceFromPreparedPreview, workbenchResourceKey } from '@/workbench/workbenchResourceItems'
@@ -6,15 +7,20 @@ import chatViewSource from './ChatView.vue?raw'
 
 // Execute the production entry points with delayed transport boundaries. This
 // verifies session ownership at every await without a whole-app fixture.
-const start = chatViewSource.indexOf('async function attachmentWorkbenchResource(')
+const start = chatViewSource.indexOf('let workbenchPreviewRequest = 0')
 const end = chatViewSource.indexOf('\nasync function editAttachmentResource(', start)
 const entrySource = transpileModule(chatViewSource.slice(start, end), {
   compilerOptions: { target: ScriptTarget.ES2022 },
 }).outputText
 
+const scopes: EffectScope[] = []
+afterEach(() => scopes.splice(0).forEach(scope => scope.stop()))
+
 function harness() {
-  const sessionKey = { value: 'main-a' }, currentEpoch = { value: 1 }, deliveryIdentity = { value: 'gateway-a' }
-  const gatewayAccess = { subscriptionEpoch: 1 }
+  const scope = effectScope()
+  scopes.push(scope)
+  const sessionKey = ref('main-a'), currentEpoch = ref(1), deliveryIdentity = ref('gateway-a')
+  const gatewayAccess = reactive({ subscriptionEpoch: 1 })
   const attachment = { attachmentId: 'input-1', name: 'input.html', mime: 'text/html' }
   const resource = { resource: { type: 'attachment', attachmentId: 'input-1', id: 'input-1' }, name: 'input.html', mime: 'text/html',
     sha256: 'a'.repeat(64), capabilities: { preview: true, edit: true }, relations: {} }
@@ -30,7 +36,7 @@ function harness() {
   }
   const openItem = vi.fn(), pushToast = vi.fn()
   const dependencies = {
-    sessionKey, currentEpoch, deliveryIdentity, gatewayAccess, chatViewDisposed: false, chatViewActive: true,
+    sessionKey, currentEpoch, deliveryIdentity, gatewayAccess, watch, chatViewDisposed: false, chatViewActive: true,
     workbenchResourcesEnabled: { value: true }, workbenchEnabled: { value: true }, workbenchResourcesStore: services,
     workbenchStore: { openItem }, artifactPreviewItemForExplicitOpen: (item: unknown) => item,
     platform: { capabilities: {}, workbench: {} }, artifactPayloadFromRevision, artifactPayloadFromWorkbenchResource,
@@ -38,7 +44,7 @@ function harness() {
     classifyArtifactProductError: () => ({ messageKey: 'error', fallbackMessage: 'Unavailable' }),
     workbenchResourceUnavailableReasonKey: () => 'unavailable', workbenchResourceActionReasonCode: () => 'unavailable',
   }
-  const api = new Function(...Object.keys(dependencies), `${entrySource}\nreturn { previewAttachmentResource };`)(...Object.values(dependencies)) as {
+  const api = scope.run(() => new Function(...Object.keys(dependencies), `${entrySource}\nreturn { previewAttachmentResource };`)(...Object.values(dependencies))) as {
     previewAttachmentResource(value: typeof attachment): Promise<void>
   }
   return { api, attachment, resource, current, prepared, document, revision, services, openItem, pushToast,

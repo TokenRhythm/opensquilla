@@ -6,6 +6,11 @@ export interface InlineSnapshot {
   offsets: WeakMap<Node, number[]>
 }
 
+function isEmptyBlockLine(node: Node | null): boolean {
+  return node instanceof HTMLElement && /^(DIV|P|LI)$/.test(node.tagName)
+    && node.childNodes.length === 1 && node.firstChild instanceof HTMLBRElement
+}
+
 export function readInlineEditor(root: HTMLElement): InlineSnapshot {
   let text = ''
   const positions: Record<string, number> = {}
@@ -34,7 +39,13 @@ export function readInlineEditor(root: HTMLElement): InlineSnapshot {
     const boundaries = [text.length]
     for (const child of node.childNodes) {
       if (child instanceof HTMLElement && /^(DIV|P|LI)$/.test(child.tagName)
-        && text.length && !text.endsWith('\n')) text += '\n'
+        && ((text.length && !text.endsWith('\n')) || isEmptyBlockLine(child.previousSibling))) {
+        // Chromium's native insertText/paste represents an empty line as
+        // <div><br></div>. Its BR is only a caret placeholder, but the next
+        // block still starts a new line even when the previous separator is
+        // already a newline (or this was the first, empty line).
+        text += '\n'
+      }
       boundaries[boundaries.length - 1] = text.length
       visit(child)
       boundaries.push(text.length)

@@ -3,6 +3,7 @@ import { WorkspaceReferenceError, type WorkspaceReferences } from '@/modules/wor
 import { normalizeWorkspaceFileReferenceV1 } from '@/types/references'
 import { createResolvedWorkspaceFileItem, createWorkspaceFileItem } from '@/workbench/workspaceFileItems'
 import type { WorkspaceFile, WorkspaceFiles } from '@/modules/workspaceFiles'
+import { WorkspaceFilesChangedError } from '@/modules/workspaceFiles'
 import { copyTextWithFallback } from '@/utils/browser'
 import type { WorkbenchItem } from '@/workbench/types'
 import { WorkbenchPanelRegistry, WorkbenchRuntimeManager } from '@/workbench/runtime'
@@ -27,6 +28,21 @@ async function setup(read: WorkspaceReferences['read']) {
   return { item, runtime, state: () => state }
 }
 describe('workspace file runtime', () => {
+  it('revalidates a child reference with child authority while showing it in the parent workspace', async () => {
+    const read = vi.fn().mockResolvedValue({ content: 'child record', reference })
+    const item = createWorkspaceFileItem('child', reference, 'parent')
+    const state: Record<string, unknown> = {}
+    const definition = createWorkspaceFileDefinition({ read }, key => key)
+    const runtime = await definition.createRuntime!(item, {
+      getRenderState: () => state, updateRenderState: patch => Object.assign(state, patch),
+      isItemOpen: () => true, setExpanded: vi.fn(), reportError: vi.fn(),
+    })
+    expect(item.scope).toEqual({ type: 'session', id: 'parent' })
+    await runtime.activate!(item)
+    expect(read).toHaveBeenCalledWith('child', reference, expect.any(AbortSignal))
+    expect(state.snapshot).toMatchObject({ content: 'child record' })
+    runtime.dispose!('closed')
+  })
   it('loads a resolved workspace text file with line metadata', async () => {
     const file: WorkspaceFile = {
       requestedPath: '_img/build.py', path: '_img/build.py', name: 'build.py', mime: 'text/x-python',
@@ -173,6 +189,80 @@ async function setupFile(overrides: Partial<WorkspaceFiles> = {}, inputFile = fi
 }
 
 describe('paged source operations', () => {
+  it('previews a complete ordinary HTML file with child authority and preserves its paged source', async () => {
+    const htmlFile: WorkspaceFile = { ...file, requestedPath: 'review.html', path: 'review.html', name: 'review.html',
+      mime: 'text/html', size: 1200 }
+    const blob = new Blob(['<html><body>complete document<button>Run</button></body></html>'])
+    const read = vi.fn().mockResolvedValue(blob)
+    const f = await setupFile({ read }, htmlFile, 'parent')
+    expect(f.state).toMatchObject({ previewKind: 'html', previewBlob: blob, snapshot: { startLine: 1, paged: true } })
+    expect(read).toHaveBeenCalledWith('task', htmlFile, expect.any(AbortSignal))
+    expect(f.item.scope).toEqual({ type: 'session', id: 'parent' })
+    f.event('workspace-file-page', { startLine: 201 })
+    await vi.waitFor(() => expect(f.state.snapshot).toMatchObject({ startLine: 201 }))
+    expect(read).toHaveBeenCalledOnce()
+    expect(f.state.previewBlob).toBe(blob)
+    f.runtime.dispose!('closed')
+    expect(f.state.previewBlob).toBeNull()
+  })
+
+  it('retains the authorized source page when the optional HTML preview read fails and retries on refresh', async () => {
+    const htmlFile: WorkspaceFile = { ...file, name: 'review.html', path: 'review.html', mime: 'text/html', size: 100 }
+    const blob = new Blob(['<button>Run</button>'])
+    const read = vi.fn().mockRejectedValueOnce(new Error('Network unavailable')).mockResolvedValue(blob)
+    const f = await setupFile({ read }, htmlFile)
+    expect(f.state).toMatchObject({ errorKey: '', previewBlob: null,
+      previewErrorKey: 'workbench.artifactPreview.unsupported', snapshot: { paged: true, startLine: 1 } })
+    f.runtime.performAction!('refresh', f.item)
+    await vi.waitFor(() => expect(f.state.previewBlob).toBe(blob))
+    expect(f.state).toMatchObject({ errorKey: '', previewErrorKey: '', snapshot: { startLine: 1 } })
+    f.runtime.dispose!('closed')
+    expect(f.state).toMatchObject({ previewBlob: null, previewErrorKey: '', snapshot: null })
+  })
+
+  it('does not retain source contradicted by a newer revision during the optional HTML read', async () => {
+    const htmlFile: WorkspaceFile = { ...file, name: 'review.html', path: 'review.html', mime: 'text/html', size: 100 }
+    const f = await setupFile({ read: vi.fn().mockRejectedValue(new WorkspaceFilesChangedError()) }, htmlFile)
+    expect(f.state).toMatchObject({ previewBlob: null, snapshot: null, errorKey: 'workbench.workspaceFiles.changed' })
+    f.runtime.dispose!('closed')
+  })
+
+  it('reuses the bounded full read for nonpaged HTML instead of fetching the file twice', async () => {
+    const htmlFile: WorkspaceFile = { ...file, requestedPath: 'review.htm', path: 'review.htm', name: 'review.htm',
+      mime: 'text/html', size: 100, textPaging: false }
+    const blob = new Blob(['<button>Run</button>'])
+    const read = vi.fn().mockResolvedValue(blob)
+    const f = await setupFile({ read }, htmlFile)
+    expect(f.state.previewBlob).toBe(blob)
+    expect(f.state.snapshot).toMatchObject({ content: '<button>Run</button>' })
+    expect(read).toHaveBeenCalledOnce()
+    f.runtime.dispose!('closed')
+  })
+
+  it('keeps oversized HTML in bounded source pages without fetching an unbounded preview', async () => {
+    const htmlFile: WorkspaceFile = { ...file, name: 'large.html', path: 'large.html', mime: 'text/html' }
+    const f = await setupFile({}, htmlFile)
+    expect(f.state.snapshot).toMatchObject({ paged: true })
+    expect(f.state.previewBlob).toBeNull()
+    expect(f.read).not.toHaveBeenCalled()
+    f.runtime.dispose!('closed')
+  })
+
+  it('discards a pending full HTML preview when its tab closes', async () => {
+    const htmlFile: WorkspaceFile = { ...file, name: 'review.html', path: 'review.html', mime: 'text/html', size: 100 }
+    const blob = new Blob(['<button>Run</button>'])
+    const read = vi.fn().mockResolvedValue(blob)
+    const f = await setupFile({ read }, htmlFile)
+    const pending = deferred<Blob>()
+    read.mockReturnValueOnce(pending.promise)
+    f.runtime.performAction!('refresh', f.item)
+    await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(2))
+    f.runtime.dispose!('closed')
+    pending.resolve(blob)
+    await Promise.resolve()
+    expect(f.state).toMatchObject({ previewBlob: null, snapshot: null, loading: false })
+  })
+
   it('keeps paging, search and copy authorized by the child when its tab is visible under the parent', async () => {
     const search = vi.fn(async () => ({ relativePath: file.path, totalLines: 450, matchLine: 445 }))
     const f = await setupFile({ search }, file, 'parent')
