@@ -6,7 +6,66 @@ import httpx
 
 from opensquilla.sandbox.types import SandboxBackendError
 from opensquilla.tools.envelope import build_tool_failure_envelope
-from opensquilla.tools.types import RetryableToolInputError, SafeToolError
+from opensquilla.tools.types import (
+    RetryableToolInputError,
+    SafeToolError,
+    ToolError,
+)
+
+
+def test_tool_error_message_is_exposed_instead_of_generic_internal_error() -> None:
+    """ToolError carries a user-authored input error that must not be swallowed."""
+    envelope = build_tool_failure_envelope(
+        ToolError("job_id required for add"),
+        "cron",
+    )
+
+    assert envelope["status"] == "error"
+    assert envelope["error_class"] == "ToolError"
+    assert envelope["user_message"] == "job_id required for add"
+    assert "internal error" not in envelope["user_message"]
+
+
+def test_tool_error_traceback_frames_are_stripped_from_message() -> None:
+    """A traceback leaked into a ToolError message must still be sanitised."""
+    message = (
+        '  File "C:\\\\repo\\\\src\\\\opensquilla\\\\tools\\\\builtin\\\\admin.py", '
+        "line 357, in <module>\n"
+        "    raise ToolError(\"'schedule' and 'task' required for add\")"
+    )
+    envelope = build_tool_failure_envelope(ToolError(message), "cron")
+
+    assert "File" not in envelope["user_message"]
+    assert "line 357" not in envelope["user_message"]
+    assert "required for add" in envelope["user_message"]
+
+
+def test_tool_error_long_message_is_truncated() -> None:
+    """Long ToolError messages are truncated like other sanitised messages."""
+    envelope = build_tool_failure_envelope(
+        ToolError("x" * 2000),
+        "cron",
+    )
+
+    assert len(envelope["user_message"]) <= 500
+
+
+def test_empty_tool_error_message_falls_back_to_generic() -> None:
+    """An empty ToolError message still yields a generic, tool-naming line."""
+    envelope = build_tool_failure_envelope(ToolError("   "), "cron")
+
+    assert "internal error" in envelope["user_message"]
+    assert "'cron'" in envelope["user_message"]
+
+
+def test_safe_tool_error_still_prefers_curated_message() -> None:
+    """SafeToolError (subclass of ToolError) keeps its curated message."""
+    envelope = build_tool_failure_envelope(
+        SafeToolError("curated user guidance"),
+        "write_file",
+    )
+
+    assert envelope["user_message"] == "curated user guidance"
 
 
 def test_type_error_tool_failure_is_model_retriable_without_raw_traceback() -> None:
