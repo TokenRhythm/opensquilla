@@ -219,11 +219,13 @@ export interface ChatRouterCell {
   tiers: string[]
   displayName: string
   model?: string
+  provider?: string
   executionKind?: 'single_model' | 'ensemble'
 }
 
 export interface ChatRouterTierConfig {
   model: string
+  provider?: string
   /** Accepted from legacy snapshots, not used to determine capability. */
   supportsImage?: boolean
   imageOnly: boolean

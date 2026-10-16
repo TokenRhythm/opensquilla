@@ -36,10 +36,12 @@ const EFFECTIVE_CAPABILITIES_BY_MODE: ModelRoutingCapabilitiesByMode = {
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
-  const promise = new Promise<T>((res) => {
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
     resolve = res
+    reject = rej
   })
-  return { promise, resolve }
+  return { promise, resolve, reject }
 }
 
 function createHarness(options: {
@@ -147,6 +149,7 @@ function routingCalls(rpc: ReturnType<typeof createHarness>['rpc']) {
 }
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
 })
@@ -292,6 +295,372 @@ describe('useChatFeatureToggles router visual effects', () => {
       variant: 'default',
     }))
     expect(source).not.toContain('SavingsFX')
+  })
+})
+
+describe('useChatFeatureToggles tier refresh', () => {
+  function prepareRefreshEvents() {
+    vi.useFakeTimers()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    vi.stubGlobal('window', {
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+  }
+
+  function configFor(prefix: string) {
+    return {
+      squilla_router: {
+        enabled: true,
+        rollout_phase: 'full',
+        tiers: {
+          c3: { model: `${prefix}-quality` },
+          c1: { model: `${prefix}-balanced` },
+          c0: { model: `${prefix}-fast` },
+          c2: { model: `${prefix}-reasoning` },
+        },
+      },
+    }
+  }
+
+  it('refreshes saved tier models in the retained chat without a focus or visibility event', async () => {
+    prepareRefreshEvents()
+    const { api, emitRouting, rpc } = createHarness({
+      configGetResults: [configFor('original'), configFor('replacement')],
+      routingGetResults: [{ mode: 'router' }, { mode: 'router' }],
+    })
+    await api.loadFeatureToggles()
+    const cleanup = api.bindFeatureRefresh()
+
+    emitRouting({ mode: 'router' })
+    await vi.advanceTimersByTimeAsync(120)
+
+    expect(rpc.call.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(2)
+    expect(api.routerSlots.value).toEqual(['c0', 'c1', 'c2', 'c3'])
+    expect(api.routerModels.value).toEqual({
+      c0: 'replacement-fast',
+      c1: 'replacement-balanced',
+      c2: 'replacement-reasoning',
+      c3: 'replacement-quality',
+    })
+    expect(api.routerTierConfigs.value.c2?.model).toBe('replacement-reasoning')
+    cleanup()
+  })
+
+  it('keeps explicit providers for tiers using the same model name', async () => {
+    const { api } = createHarness({ configGetResults: [{ squilla_router: {
+      enabled: true,
+      rollout_phase: 'full',
+      tiers: {
+        c0: { provider: ' Provider_A ', model: 'shared-model' },
+        c1: { provider: 'Provider_B', model: 'shared-model' },
+        c2: { model: 'unassigned-model' },
+      },
+    } }] })
+    await api.loadFeatureToggles()
+
+    expect(api.routerTierConfigs.value.c0?.provider).toBe('provider_a')
+    expect(api.routerTierConfigs.value.c1?.provider).toBe('provider_b')
+    expect(api.routerTierConfigs.value.c2).not.toHaveProperty('provider')
+  })
+
+  it.each([true, false])('prefers canonical tiers over legacy aliases with canonical-first=%s', async (canonicalFirst) => {
+    const canonical = { c0: { provider: 'provider_a', model: 'canonical-fast' } }
+    const legacy = { t0: { provider: 'provider_b', model: 'retired-fast' } }
+    const { api } = createHarness({ configGetResults: [{ squilla_router: {
+      tiers: canonicalFirst ? { ...canonical, ...legacy } : { ...legacy, ...canonical },
+    } }] })
+    await api.loadFeatureToggles()
+
+    expect(api.routerSlots.value).toEqual(['c0'])
+    expect(api.routerModels.value).toEqual({ c0: 'canonical-fast' })
+    expect(api.routerTierConfigs.value.c0?.provider).toBe('provider_a')
+  })
+
+  it('retires a pending pre-save config read before the event refresh debounce expires', async () => {
+    prepareRefreshEvents()
+    const staleConfig = deferred<Record<string, unknown>>()
+    const { api, emitRouting, rpc } = createHarness({
+      configGetResults: [configFor('original'), staleConfig.promise, configFor('replacement')],
+      routingGetResults: [{ mode: 'router' }, { mode: 'direct' }],
+    })
+    await api.loadFeatureToggles()
+    const cleanup = api.bindFeatureRefresh()
+    const staleLoad = api.loadFeatureToggles()
+
+    emitRouting({
+      mode: 'direct',
+      capabilities_by_mode: CAPABILITIES_BY_MODE,
+      image_input: CAPABILITIES_BY_MODE.direct.image_input,
+    })
+    staleConfig.resolve(configFor('stale'))
+    await staleLoad
+
+    expect(api.modelRoutingMode.value).toBe('off')
+    expect(api.routerModels.value.c2).toBe('original-reasoning')
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(EFFECTIVE_CAPABILITIES_BY_MODE)
+    expect(rpc.call.mock.calls.filter(([method]) => method === 'models.routing.get')).toHaveLength(1)
+
+    await vi.advanceTimersByTimeAsync(120)
+    expect(api.routerModels.value.c2).toBe('replacement-reasoning')
+    expect(api.modelRoutingMode.value).toBe('off')
+    cleanup()
+  })
+
+  it('preserves event mode and capabilities while tier refresh waits for optional usage', async () => {
+    prepareRefreshEvents()
+    const usage = deferred<void>()
+    const { api, emitRouting, loadCurrentSessionUsage } = createHarness({
+      configGetResults: [configFor('replacement')],
+      routingGetResults: [{
+        mode: 'ensemble',
+        selection_mode: 'custom_b5',
+        capabilities_by_mode: CAPABILITIES_BY_MODE,
+        image_input: CAPABILITIES_BY_MODE.ensemble.image_input,
+      }],
+    })
+    loadCurrentSessionUsage.mockImplementation(() => usage.promise)
+    const cleanup = api.bindFeatureRefresh()
+
+    emitRouting({
+      mode: 'ensemble',
+      selection_mode: 'custom_b5',
+      capabilities_by_mode: CAPABILITIES_BY_MODE,
+      image_input: CAPABILITIES_BY_MODE.ensemble.image_input,
+    })
+    await vi.advanceTimersByTimeAsync(120)
+
+    expect(api.routerModels.value.c2).toBe('replacement-reasoning')
+    expect(api.modelRoutingMode.value).toBe('llm_ensemble')
+    expect(api.llmEnsembleSelectionMode.value).toBe('custom_b5')
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(EFFECTIVE_CAPABILITIES_BY_MODE)
+    usage.resolve()
+    await vi.advanceTimersByTimeAsync(0)
+    cleanup()
+  })
+
+  it('preserves a newer routing event when an earlier mutation fails', async () => {
+    prepareRefreshEvents()
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const mutation = deferred<Record<string, unknown>>()
+    const { api, emitRouting } = createHarness({
+      configGetResults: [configFor('original')],
+      routingGetResults: [{ mode: 'router' }],
+      patchResults: [mutation.promise],
+    })
+    await api.loadFeatureToggles()
+    const cleanup = api.bindFeatureRefresh()
+    const pending = api.setModelRoutingMode('off')
+    emitRouting({
+      mode: 'ensemble',
+      selection_mode: 'custom_b5',
+      capabilities_by_mode: CAPABILITIES_BY_MODE,
+      image_input: CAPABILITIES_BY_MODE.ensemble.image_input,
+    })
+    mutation.reject(new Error('earlier mutation failed'))
+    await pending
+
+    expect(api.modelRoutingMode.value).toBe('llm_ensemble')
+    expect(api.llmEnsembleSelectionMode.value).toBe('custom_b5')
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(EFFECTIVE_CAPABILITIES_BY_MODE)
+    cleanup()
+  })
+
+  it('coalesces rapid routing events and cancels pending refreshes on cleanup', async () => {
+    prepareRefreshEvents()
+    const { api, emitRouting, rpc } = createHarness({
+      configGetResults: [configFor('replacement')],
+      routingGetResults: [{ mode: 'direct' }],
+    })
+    const cleanup = api.bindFeatureRefresh()
+    emitRouting({ mode: 'router' })
+    emitRouting({ mode: 'direct' })
+    await vi.advanceTimersByTimeAsync(120)
+
+    expect(rpc.call.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(1)
+    expect(api.modelRoutingMode.value).toBe('off')
+    emitRouting({ mode: 'ensemble' })
+    cleanup()
+    await vi.advanceTimersByTimeAsync(120)
+    expect(rpc.call.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(1)
+  })
+
+  it('does not carry scheduled refresh work into a new connection', async () => {
+    prepareRefreshEvents()
+    const scope = effectScope()
+    try {
+      const connectionEpoch = ref(1)
+      const { api, emitRouting, rpc } = scope.run(() => createHarness({ connectionEpoch }))!
+      const cleanup = api.bindFeatureRefresh()
+      emitRouting({ mode: 'router' })
+      connectionEpoch.value = 2
+      await vi.advanceTimersByTimeAsync(120)
+
+      expect(rpc.call).not.toHaveBeenCalled()
+      expect(api.modelRoutingMode.value).toBe('off')
+      cleanup()
+    } finally {
+      scope.stop()
+    }
+  })
+
+  it('ignores an in-flight tier refresh after cleanup', async () => {
+    prepareRefreshEvents()
+    const config = deferred<Record<string, unknown>>()
+    const syncHistory = vi.fn()
+    const { api, emitRouting, rpc } = createHarness({ configGetResults: [config.promise] })
+    const cleanup = api.bindFeatureRefresh(syncHistory)
+    emitRouting({ mode: 'router' })
+    await vi.advanceTimersByTimeAsync(120)
+    expect(rpc.call.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(1)
+    const syncsBeforeCleanup = syncHistory.mock.calls.length
+
+    cleanup()
+    config.resolve(configFor('retired'))
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(api.routerModels.value).toEqual({})
+    expect(syncHistory).toHaveBeenCalledTimes(syncsBeforeCleanup)
+    expect(rpc.call.mock.calls.filter(([method]) => method === 'models.routing.get')).toHaveLength(0)
+  })
+})
+
+describe('useChatFeatureToggles connection lifecycle', () => {
+  it('does not issue feature reads or mutations while the connection is unavailable', async () => {
+    const { api, rpc } = createHarness({ connectionAvailable: ref(false) })
+    await api.loadFeatureToggles()
+    await api.setModelRoutingMode('llm_ensemble')
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('clears routing state on connection loss and ignores a late routing response', async () => {
+    const scope = effectScope()
+    try {
+      const connectionEpoch = ref(1)
+      const connectionAvailable = ref(true)
+      const pendingRouting = deferred<Record<string, unknown>>()
+      const { api, rpc } = scope.run(() => createHarness({
+        connectionEpoch,
+        connectionAvailable,
+        configGetResults: [{ squilla_router: {
+          enabled: true,
+          rollout_phase: 'full',
+          tiers: { c0: { model: 'original-fast' } },
+        } }],
+        routingGetResults: [pendingRouting.promise],
+      }))!
+      const load = api.loadFeatureToggles()
+      await vi.waitFor(() => {
+        expect(rpc.call.mock.calls.filter(([method]) => method === 'models.routing.get')).toHaveLength(1)
+      })
+      expect(api.routerModels.value.c0).toBe('original-fast')
+
+      connectionAvailable.value = false
+      expect(api.routerSlots.value).toEqual([])
+      expect(api.routerModels.value).toEqual({})
+      expect(api.routerTierConfigs.value).toEqual({})
+      pendingRouting.resolve({
+        mode: 'ensemble',
+        capabilities_by_mode: CAPABILITIES_BY_MODE,
+        image_input: CAPABILITIES_BY_MODE.ensemble.image_input,
+      })
+      await load
+
+      expect(api.modelRoutingMode.value).toBe('off')
+      expect(api.modelRoutingCapabilitiesByMode.value).toBeNull()
+      expect(api.globalImageInputAdmission.value).toBe('unknown')
+    } finally {
+      scope.stop()
+    }
+  })
+
+  it('rejects old tier config after the connection epoch changes without starting a new read', async () => {
+    const scope = effectScope()
+    try {
+      const connectionEpoch = ref(1)
+      const pendingConfig = deferred<Record<string, unknown>>()
+      const { api, rpc } = scope.run(() => createHarness({
+        connectionEpoch,
+        configGetResults: [pendingConfig.promise],
+      }))!
+      const load = api.loadFeatureToggles()
+      connectionEpoch.value = 2
+      pendingConfig.resolve({ squilla_router: {
+        enabled: true,
+        rollout_phase: 'full',
+        tiers: { c0: { model: 'retired-fast' } },
+      } })
+      await load
+
+      expect(api.routerModels.value).toEqual({})
+      expect(api.modelRoutingMode.value).toBe('off')
+      expect(rpc.call.mock.calls.map(([method]) => method)).toEqual(['config.get'])
+    } finally {
+      scope.stop()
+    }
+  })
+
+  it('does not restore a previous connection capability matrix after a transient routing failure', async () => {
+    const scope = effectScope()
+    try {
+      const connectionEpoch = ref(1)
+      const { api } = scope.run(() => createHarness({
+        connectionEpoch,
+        configGetResults: [{}, { squilla_router: {
+          enabled: true,
+          rollout_phase: 'full',
+          tiers: { c0: { model: 'replacement-fast' } },
+        } }],
+        routingGetResults: [{
+          mode: 'ensemble',
+          selection_mode: 'custom_b5',
+          capabilities_by_mode: CAPABILITIES_BY_MODE,
+          image_input: CAPABILITIES_BY_MODE.ensemble.image_input,
+        }, new Error('routing unavailable')],
+      }))!
+      await api.loadFeatureToggles()
+      expect(api.modelRoutingMode.value).toBe('llm_ensemble')
+      connectionEpoch.value = 2
+      await api.loadFeatureToggles()
+
+      expect(api.modelRoutingMode.value).toBe('squilla_router')
+      expect(api.routerModels.value.c0).toBe('replacement-fast')
+      expect(api.llmEnsembleSelectionMode.value).toBe('')
+      expect(api.modelRoutingCapabilitiesByMode.value).toBeNull()
+      expect(api.globalImageInputAdmission.value).toBe('unknown')
+    } finally {
+      scope.stop()
+    }
+  })
+
+  it.each(['success', 'failure'])('ignores an old routing mutation %s after reconnect', async (outcome) => {
+    const scope = effectScope()
+    try {
+      const connectionEpoch = ref(1)
+      const mutation = deferred<Record<string, unknown>>()
+      const { api, rpc } = scope.run(() => createHarness({
+        connectionEpoch,
+        configGetResults: [{}],
+        routingGetResults: [{ mode: 'router' }],
+        patchResults: [mutation.promise],
+      }))!
+      await api.loadFeatureToggles()
+      const pending = api.setModelRoutingMode('llm_ensemble')
+      connectionEpoch.value = 2
+      if (outcome === 'success') mutation.resolve({})
+      else mutation.reject(new Error('old connection request failed'))
+      await pending
+
+      expect(api.modelRoutingMode.value).toBe('off')
+      expect(api.modelRoutingSettingsBusy.value).toBe(false)
+      expect(rpc.call.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(1)
+    } finally {
+      scope.stop()
+    }
   })
 })
 

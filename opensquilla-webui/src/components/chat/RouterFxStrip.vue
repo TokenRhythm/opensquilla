@@ -202,9 +202,12 @@ const executionDiffersFromRoute = computed(() => Boolean(
 ))
 const executionCellIndex = computed(() => {
   if (!executionDiffersFromRoute.value) return -1
-  return gridCells.value.findIndex(cell => (
+  const matches = gridCells.value.flatMap((cell, index) => (
     cell.kind === 'real' && String(cell.model || '').trim() === executionModel.value
+      ? [index] : []
   ))
+  // Model-only execution evidence cannot identify one of several deployments.
+  return matches.length === 1 ? matches[0]! : -1
 })
 const winnerIndex = computed(() => (
   executionDiffersFromRoute.value ? executionCellIndex.value : routeWinnerIndex.value
