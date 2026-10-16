@@ -254,4 +254,9 @@ async def scenario(directory: Path, fault: str) -> None:
 
 
 if __name__ == "__main__":
+    # The parent reads UTF-8; redirected Windows streams otherwise use the locale.
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+    print("probe_stdout_utf8=\u2713", flush=True)
+    print("probe_stderr_utf8=\u2713", file=sys.stderr, flush=True)
     asyncio.run(scenario(Path(sys.argv[1]), sys.argv[2]))

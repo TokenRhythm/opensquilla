@@ -253,13 +253,19 @@ async def test_optional_dependency_does_not_block_independent_restart_input(tmp_
 _DEFERRED_PROBE = Path(__file__).with_name("fixtures") / "steer_restart_deferred_probe.py"
 
 
-def test_resumed_post_reservation_error_releases_lease_without_busy_retry(tmp_path: Path) -> None:
+def test_resumed_post_reservation_error_releases_lease_without_busy_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # This correctness scenario owns real SQLite writes, not a two-second SLO.
     # The existing process watchdog bounds cold setup and then all execution /
     # cleanup, including a stuck task or native SQLite thread.
+    # Exercise the redirected stream encoding used by Windows CI explicitly.
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
     result = run_sqlite_probe(tmp_path, _DEFERRED_PROBE, ("none",))
     assert result.timed_out is None, result.output
     assert result.returncode == 0, result.output
+    assert "probe_stdout_utf8=\u2713" in result.output
+    assert "probe_stderr_utf8=\u2713" in result.output
     assert "phase=cleanup-complete" in result.output
     assert "steer_restart_deferred_contract=passed" in result.output
 
