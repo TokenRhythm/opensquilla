@@ -2631,20 +2631,28 @@ const chatHistory = useChatHistory({
   scrollToBottom,
   onHistoryInstalled: sessionViewCache.historyInstalled,
   initialWindowSize: () => sessionViewCache.showingPreview.value ? sessionViewCache.messages.value.length : 0,
-  onTerminalTask: outcome => {
+  onTerminalTask: (outcome, { historyInstalled }) => {
     const taskId = outcome.taskId || ''
     if (!taskId) return
     const ownsLiveStream = activeStreamTaskId.value === taskId
     const ownsRunStatus = chatTaskId(runStatus.value.task) === taskId
-    if (sessionViewCache.presentation.value?.stoppableTaskId === taskId) {
-      // Durable completion supersedes the cached in-progress picture, even if
-      // transport recovery has not installed a new live snapshot yet.
+    if (historyInstalled && sessionViewCache.presentation.value?.stoppableTaskId === taskId) {
+      // The terminal fact settles controls immediately, but a failed or partial
+      // history bridge must not discard the last readable presentation.
       sessionViewCache.retirePreview(sessionKey.value)
     }
+    if (historyInstalled) return
     // An older finished turn does not resolve the current owner's hydration.
     taskOwnership.noteTerminal(taskId, ownsLiveStream || ownsRunStatus)
     if (ownsLiveStream) {
-      resetStreamLiveTurnState()
+      const messageCount = messages.value.length
+      chatStream.endStreaming(['cancelled', 'abandoned', 'interrupted'].includes(outcome.status)
+        ? { reason: 'aborted' } : undefined)
+      const completedAssistant = messages.value[messageCount]
+      if (completedAssistant?.role === 'assistant') {
+        completedAssistant.turnId = outcome.turnId
+        completedAssistant.turnOutcome = outcome
+      }
       activeStreamTaskId.value = outcome.status === 'cancelled'
         ? STOPPED_STREAM_TASK_ID
         : FINISHED_STREAM_TASK_ID

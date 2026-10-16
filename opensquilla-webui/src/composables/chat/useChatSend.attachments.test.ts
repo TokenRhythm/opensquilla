@@ -3547,10 +3547,7 @@ describe('useChatSend attachment payloads', () => {
     expect(options.inputText.value).toBe('')
     expect(pendingSessionIntent.value).toBe('NEW')
     expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
-    expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
-      role: 'error',
-      text: 'This request did not finish.',
-    })
+    expect(options.messages.value.filter(message => message.role === 'error')).toEqual([])
 
     await flushDelivery()
     await api.onSend()

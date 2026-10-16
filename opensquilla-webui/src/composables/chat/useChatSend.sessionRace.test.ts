@@ -11,7 +11,8 @@ import { acceptsVisualizeContext, useVisualizeDraft } from '@/visualize/useVisua
 import type { VisualizeReceipt } from '@/visualize/types'
 import type { SlashCommandClassification } from './useChatSlashCommands'
 
-vi.mock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast: vi.fn() }) }))
+const { pushToast } = vi.hoisted(() => ({ pushToast: vi.fn() }))
+vi.mock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast }) }))
 
 function queuedSendHarness(overrides: Partial<UseChatSendOptions> = {}) {
   const messages = ref<ChatMessage[]>([])
@@ -56,6 +57,213 @@ function queuedSendHarness(overrides: Partial<UseChatSendOptions> = {}) {
   }
   return { ...createChatSendHarness(options), commands, policy, scope, pausePendingAutoSend }
 }
+
+describe('ordinary send recovery stays separate from rendering', () => {
+  it('keeps a running turn after navigating A, sending in B, and returning before A ACK', async () => {
+    const h = queuedSendHarness()
+    const sessionA = h.options.sessionKey.value
+    let acceptA!: (response: TurnSendResponse) => void
+    h.commands.send.mockImplementationOnce(() => new Promise(resolve => { acceptA = resolve }))
+    const sendingA = h.api.onSend()
+    await vi.waitFor(() => expect(h.commands.send).toHaveBeenCalledOnce())
+
+    // Session switching resets render ownership; the ChatView itself is reused.
+    h.options.sessionKey.value = 'agent:main:webchat:B'
+    h.options.messages.value = []
+    h.options.stream.isStreaming.value = false
+    h.options.activeStreamTaskId.value = ''
+    h.options.activeStreamSessionKey.value = ''
+    h.options.inputText.value = 'message in B'
+    await h.api.onSend()
+
+    h.options.sessionKey.value = sessionA
+    const visibleAnswer: ChatMessage = { role: 'assistant', text: 'A is still answering', ts: '2026-01-01T00:00:00Z' }
+    h.options.messages.value = [visibleAnswer]
+    h.options.inputText.value = 'new draft in A'
+    h.options.stream.isStreaming.value = true
+    h.options.activeStreamTaskId.value = 'running-A'
+    h.options.activeStreamSessionKey.value = sessionA
+    vi.mocked(h.options.scheduleHistorySync).mockClear()
+    acceptA({ taskId: 'running-A', sessionKey: sessionA, taskStatus: 'running' })
+    await sendingA
+    await h.options.durableDelivery.wake()
+
+    expect(h.commands.send).toHaveBeenCalledTimes(2)
+    expect(h.commands.cancel).not.toHaveBeenCalled()
+    expect(h.options.messages.value).toEqual([visibleAnswer])
+    expect(h.options.inputText.value).toBe('new draft in A')
+    expect(h.options.activeStreamTaskId.value).toBe('running-A')
+    expect(h.options.scheduleHistorySync).toHaveBeenCalled()
+  })
+
+  it('quietly reconciles a lost ACK without resending or replacing a newer draft and answer', async () => {
+    pushToast.mockClear()
+    const h = queuedSendHarness()
+    let rejectSend!: (error: Error) => void
+    let acceptReceipt!: (response: TurnReceiptResult) => void
+    h.commands.send.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectSend = reject }))
+    h.commands.lookupReceipt.mockImplementation(() => new Promise(resolve => { acceptReceipt = resolve }))
+    const sending = h.api.onSend()
+    await vi.waitFor(() => expect(h.commands.send).toHaveBeenCalledOnce())
+    const originalRequest = h.commands.send.mock.calls[0]![0]
+    h.options.inputText.value = 'draft typed while waiting'
+    h.options.messages.value.push({ role: 'assistant', text: 'already received output', ts: '2026-01-01T00:00:00Z' })
+    rejectSend(new TurnCommandError('transport', 'synthetic ACK loss', undefined, null))
+    await sending
+    await vi.waitFor(() => expect(h.commands.lookupReceipt).toHaveBeenCalledOnce())
+    acceptReceipt({ status: 'found', response: { taskId: 'original-task', taskStatus: 'running' } })
+    await h.options.durableDelivery.wake()
+
+    expect(h.commands.send).toHaveBeenCalledOnce()
+    expect(h.commands.lookupReceipt).toHaveBeenCalledWith(
+      { kind: 'send', request: originalRequest }, expect.objectContaining({ signal: expect.anything() }),
+    )
+    expect(h.options.durableDelivery.snapshots()[0]?.phase).toBe('accepted')
+    expect(h.options.inputText.value).toBe('draft typed while waiting')
+    expect(h.options.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'assistant', text: 'already received output' }),
+    ]))
+    expect(pushToast).not.toHaveBeenCalled()
+    expect(h.options.messages.value.filter(message => message.role === 'error')).toEqual([])
+  })
+
+  it('keeps an unresolved request checkable after the receipt budget without claiming failure or resending', async () => {
+    vi.useFakeTimers()
+    pushToast.mockClear()
+    const h = queuedSendHarness()
+    try {
+      h.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'synthetic ACK loss', undefined, null))
+      await h.api.onSend()
+      await vi.advanceTimersByTimeAsync(6_000)
+      await h.options.durableDelivery.wake()
+      expect(h.commands.lookupReceipt).toHaveBeenCalledTimes(4)
+      expect(h.api.deliveryRecoveryEntries.value).toEqual([
+        expect.objectContaining({ phase: 'unknown', waitReason: 'budget' }),
+      ])
+      expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(true)
+      expect(h.api.acceptanceStopAvailableForCurrentSession.value).toBe(true)
+      expect(pushToast).not.toHaveBeenCalled()
+      expect(h.options.messages.value.filter(message => message.role === 'error')).toEqual([])
+
+      h.commands.lookupReceipt.mockResolvedValue({ status: 'found', response: { taskId: 'original-task' } })
+      await h.api.checkDelivery(h.api.deliveryRecoveryEntries.value[0]!.id)
+      expect(h.commands.send).toHaveBeenCalledOnce()
+      expect(h.api.deliveryRecoveryEntries.value).toEqual([])
+    } finally {
+      h.options.durableDelivery.dispose()
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps an unsupported receipt checkable without claiming failure or resending', async () => {
+    pushToast.mockClear()
+    const h = queuedSendHarness()
+    h.commands.supportsReceiptLookup = () => false
+    h.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'synthetic ACK loss', undefined, null))
+    await h.api.onSend()
+    await h.options.durableDelivery.wake()
+
+    expect(h.commands.send).toHaveBeenCalledOnce()
+    expect(h.api.deliveryRecoveryEntries.value).toEqual([
+      expect.objectContaining({ phase: 'unknown', waitReason: 'receipt-unsupported' }),
+    ])
+    expect(h.api.acceptanceStopAvailableForCurrentSession.value).toBe(true)
+    expect(h.options.messages.value.some(message => message.role === 'user')).toBe(true)
+    expect(pushToast).not.toHaveBeenCalled()
+
+    await h.api.checkDelivery(h.api.deliveryRecoveryEntries.value[0]!.id)
+    expect(h.commands.send).toHaveBeenCalledOnce()
+  })
+
+  it('restores the draft and reports an offline failure proven to precede dispatch', async () => {
+    pushToast.mockClear()
+    const h = queuedSendHarness()
+    const draft = h.options.inputText.value
+    h.commands.send.mockRejectedValueOnce(new TurnCommandError('unavailable', 'offline before transport', undefined, false, true))
+    await h.api.onSend()
+
+    expect(h.options.inputText.value).toBe(draft)
+    expect(h.commands.lookupReceipt).not.toHaveBeenCalled()
+    expect(pushToast).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ tone: 'danger' }))
+    expect(h.options.messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+  })
+
+  it('preserves a pre-ACK Stop through another session send and cancels only the original task', async () => {
+    const acceptanceStopPending = ref(false)
+    const h = queuedSendHarness({ acceptanceStopPending })
+    const sessionA = h.options.sessionKey.value
+    let acceptA!: (response: TurnSendResponse) => void
+    h.commands.send.mockImplementationOnce(() => new Promise(resolve => { acceptA = resolve }))
+    const sendingA = h.api.onSend()
+    await vi.waitFor(() => expect(h.commands.send).toHaveBeenCalledOnce())
+    h.api.onStop()
+
+    h.options.sessionKey.value = 'agent:main:webchat:B'
+    // Match the session runtime's visible-state reset; the durable request
+    // retains A's Stop independently of this latch.
+    acceptanceStopPending.value = false
+    h.options.messages.value = []
+    h.options.activeStreamTaskId.value = ''
+    h.options.activeStreamSessionKey.value = ''
+    h.options.stream.isStreaming.value = false
+    h.options.inputText.value = 'message in B'
+    await h.api.onSend()
+
+    h.options.sessionKey.value = sessionA
+    const visibleAnswer: ChatMessage = { role: 'assistant', text: 'A partial output', ts: '2026-01-01T00:00:00Z' }
+    h.options.messages.value = [visibleAnswer]
+    h.options.inputText.value = 'new draft in A'
+    acceptA({ taskId: 'original-A-task', sessionKey: sessionA, taskStatus: 'running' })
+    await sendingA
+    await h.options.durableDelivery.wake()
+
+    await vi.waitFor(() => expect(h.commands.cancel).toHaveBeenCalledExactlyOnceWith({
+      sessionKey: sessionA, taskId: 'original-A-task', source: 'webui_stop', scope: 'task',
+    }, expect.anything()))
+    expect(h.commands.send).toHaveBeenCalledTimes(2)
+    expect(h.options.inputText.value).toBe('new draft in A')
+    expect(h.options.messages.value).toEqual([visibleAnswer])
+  })
+
+  it('preserves a newer draft and output when the receipt resolves immediately after ACK loss', async () => {
+    pushToast.mockClear()
+    const h = queuedSendHarness()
+    let rejectSend!: (error: Error) => void
+    h.commands.send.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectSend = reject }))
+    h.commands.lookupReceipt.mockResolvedValue({
+      status: 'found', response: { taskId: 'original-task', taskStatus: 'running' },
+    })
+    const sending = h.api.onSend()
+    await vi.waitFor(() => expect(h.commands.send).toHaveBeenCalledOnce())
+    h.options.inputText.value = 'draft typed while waiting'
+    h.options.messages.value.push({ role: 'assistant', text: 'already received output', ts: '2026-01-01T00:00:00Z' })
+    rejectSend(new TurnCommandError('transport', 'synthetic ACK loss', undefined, null))
+    await sending
+    await h.options.durableDelivery.wake()
+
+    expect(h.options.durableDelivery.snapshots()[0]?.phase).toBe('accepted')
+    expect(h.options.inputText.value).toBe('draft typed while waiting')
+    expect(h.options.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'assistant', text: 'already received output' }),
+    ]))
+    expect(h.commands.send).toHaveBeenCalledOnce()
+    expect(h.commands.cancel).not.toHaveBeenCalled()
+    expect(pushToast).not.toHaveBeenCalled()
+    expect(h.api.deliveryRecoveryEntries.value).toEqual([])
+  })
+
+  it('still restores a definitely rejected draft and reports the failure', async () => {
+    pushToast.mockClear()
+    const h = queuedSendHarness()
+    const draft = h.options.inputText.value
+    h.commands.send.mockRejectedValueOnce(new TurnCommandError('rejected', 'synthetic refusal', 'REFUSED', false, true))
+    await h.api.onSend()
+    expect(h.options.inputText.value).toBe(draft)
+    expect(h.commands.lookupReceipt).not.toHaveBeenCalled()
+    expect(pushToast).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ tone: 'danger' }))
+    expect(h.options.messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+  })
+})
 
 describe('explicit composer context text', () => {
   const contextualText = 'Explain this choice\n\nCanvas conditions · choices.html\nTwo selected items\n\n{"selected":["a","b"]}'

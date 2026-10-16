@@ -664,7 +664,8 @@ export interface UseChatHistoryOptions {
   canApplyViewportCorrection?: () => boolean
   stripTimePrefix: (text: string) => string
   scrollToBottom: () => void
-  onTerminalTask?: (outcome: ChatTurnOutcome) => void
+  /** Terminal facts settle controls before a read can replace their visible output. */
+  onTerminalTask?: (outcome: ChatTurnOutcome, context: { historyInstalled: boolean }) => void
   /** A current canonical page has been installed; display-only previews may retire. */
   onHistoryInstalled?: (key: string) => void
   /** Display-only window size; does not restore pagination or replay cursors. */
@@ -765,17 +766,20 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     sessionMissing: false,
   })
 
-  function notifyTerminalTasks(data: SessionReadHistoryPage) {
-    if (!options.onTerminalTask) return
-    for (const raw of data.turnOutcomes) {
-      const outcome = normalizeTurnOutcome(turnOutcomeRecord(raw))
-      if (
+  function terminalOutcomes(data: SessionReadHistoryPage): ChatTurnOutcome[] {
+    return data.turnOutcomes
+      .map(raw => normalizeTurnOutcome(turnOutcomeRecord(raw)))
+      .filter((outcome): outcome is ChatTurnOutcome => Boolean(
         outcome?.taskId
         && ['succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted']
           .includes(outcome.status.toLowerCase())
-      ) {
-        options.onTerminalTask(outcome)
-      }
+      ))
+  }
+
+  function notifyTerminalTasks(data: SessionReadHistoryPage, historyInstalled = false) {
+    if (!options.onTerminalTask) return
+    for (const outcome of terminalOutcomes(data)) {
+      options.onTerminalTask(outcome, { historyInstalled })
     }
   }
 
@@ -1212,25 +1216,58 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         }
       }
 
-      if (canonicalAvailable !== false) notifyTerminalTasks(data)
+      const terminalHistoryPages: SessionReadHistoryPage[] = []
+      if (canonicalAvailable !== false) {
+        terminalHistoryPages.push(data)
+        notifyTerminalTasks(data)
+      }
 
       const summaryIds = summaryCompactionIds(data)
       let mapped = attachHistoryTurnOutcomes(
         msgs.map(message => mapHistoryMessage(message, summaryIds)),
         data,
       )
-      const previousMessages = crossedSession ? [] : options.messages.value
-      const previousMaintenance = previousMessages.filter(message => (
-        isHistoryMaintenance(message)
-        && (!params.replaceCanonicalWindow || message.restoredFromHistory !== true)
-      ))
-      const previousTranscript = previousMessages.filter(message => (
-        !isHistoryMaintenance(message)
-        && (
-          !params.replaceCanonicalWindow
-          || (message.restoredFromHistory !== true && !message.terminalNotice)
-        )
-      ))
+      const retainLocalTerminalOutcomes = () => {
+        if (crossedSession) return
+        const outcomesByTurn = new Map(terminalHistoryPages.flatMap(page =>
+          terminalOutcomes(page).map(outcome => [outcome.turnId, outcome] as const),
+        ))
+        const turnsByMessageId = new Map(terminalHistoryPages.flatMap(page =>
+          page.messages.map(message => [
+            message.messageId || message.id,
+            historyTurnId(message.turnContext),
+          ] as const),
+        ))
+        // Done/lifecycle events can detach the answer before history sees its
+        // terminal fact. Keep that fact on exact local identities now, including
+        // if this bridge fails or a later latest window no longer includes it.
+        for (const message of options.messages.value) {
+          if (message.restoredFromHistory === true) continue
+          const turnId = message.turnId
+            || (message.messageId ? turnsByMessageId.get(message.messageId) : undefined)
+          const outcome = turnId ? outcomesByTurn.get(turnId) : undefined
+          if (!outcome) continue
+          message.turnId = turnId
+          if (!message.turnOutcome?.taskId) message.turnOutcome = outcome
+        }
+      }
+      const previousProjection = () => {
+        const previousMessages = crossedSession ? [] : options.messages.value
+        return {
+          previousMaintenance: previousMessages.filter(message => (
+            isHistoryMaintenance(message)
+            && (!params.replaceCanonicalWindow || message.restoredFromHistory !== true)
+          )),
+          previousTranscript: previousMessages.filter(message => (
+            !isHistoryMaintenance(message)
+            && (
+              !params.replaceCanonicalWindow
+              || (message.restoredFromHistory !== true && !message.terminalNotice)
+            )
+          )),
+        }
+      }
+      let { previousMaintenance, previousTranscript } = previousProjection()
       const maintenanceMessages = compactionSummaryMessages(data)
       let historyData = data
       let bridgeContinuationNeeded = false
@@ -1241,6 +1278,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         && !historyWindowsOverlap(previousTranscript, mapped)
       if (needsForwardBridge) {
         bridgeAttempted = true
+        retainLocalTerminalOutcomes()
         failedHistoryRequest = { kind: 'bridge', key }
         historyState.value = {
           ...historyState.value,
@@ -1297,7 +1335,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             return { ok: false }
           }
 
+          terminalHistoryPages.push(bridgeData)
           notifyTerminalTasks(bridgeData)
+          retainLocalTerminalOutcomes()
 
           const page = attachHistoryTurnOutcomes(
             bridgeData.messages.map(message =>
@@ -1353,6 +1393,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           canonicalAvailable: true,
           canonicalComplete: bridgeComplete,
         }
+        // Bridging yielded after capturing its anchor. A new user input or
+        // terminal stream can arrive meanwhile; merge against the current view,
+        // not the pre-bridge copy, under the same session/lease request fence.
+        const currentProjection = previousProjection()
+        previousMaintenance = currentProjection.previousMaintenance
+        previousTranscript = currentProjection.previousTranscript
       }
 
       if (canonicalAvailable !== false || confirmedEmptyDraft) failedHistoryRequest = null
@@ -1405,7 +1451,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           options.lastHeaderRole.value = ''
           options.lastHeaderDay.value = ''
         }
-        if (canonicalAvailable !== false || confirmedEmptyDraft) options.onHistoryInstalled?.(key)
+        if (canonicalAvailable !== false || confirmedEmptyDraft) {
+          for (const page of terminalHistoryPages) notifyTerminalTasks(page, true)
+          options.onHistoryInstalled?.(key)
+        }
         acknowledgePreservedLocalTail()
         flushPendingHistorySync()
         return { ok: true }
@@ -1436,6 +1485,30 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         } else {
           nextMessages = refreshedWindow
         }
+        if (bridgeContinuationNeeded) {
+          // A latest-page terminal can settle execution before these bounded
+          // bridge pages reach its output. Keep that detached local turn (even
+          // after a successor starts) until the canonical replacement arrives.
+          const pendingTurns = new Set(previousTranscript.filter(message =>
+            message.restoredFromHistory !== true && message.turnOutcome?.taskId,
+          ).map(message => message.turnId).filter(Boolean))
+          const installedIndex = (message: ChatMessage) => nextMessages.findIndex(candidate =>
+            messageKey(candidate) === messageKey(message)
+            // The existing canonical merge preserves clientId after proving
+            // that a legacy row without a durable id is the same assistant.
+            || Boolean(message.clientId && candidate.clientId === message.clientId),
+          )
+          for (let index = 0; index < previousTranscript.length; index++) {
+            const message = previousTranscript[index]!
+            if (message.restoredFromHistory === true || !pendingTurns.has(message.turnId)) continue
+            if (installedIndex(message) >= 0) continue
+            const successor = previousTranscript.slice(index + 1).find(candidate =>
+              installedIndex(candidate) >= 0,
+            )
+            const insertAt = successor ? installedIndex(successor) : nextMessages.length
+            nextMessages.splice(insertAt, 0, message)
+          }
+        }
         nextMessages = preserveAcceptedEnsembleRouterRows(
           previousTranscript,
           nextMessages,
@@ -1454,7 +1527,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
       options.lastHeaderRole.value = ''
       options.lastHeaderDay.value = ''
-      if (!params.prepend && canonicalAvailable !== false) options.onHistoryInstalled?.(key)
+      if (!params.prepend && canonicalAvailable !== false && !bridgeContinuationNeeded) {
+        for (const page of terminalHistoryPages) notifyTerminalTasks(page, true)
+        options.onHistoryInstalled?.(key)
+      }
 
       // The list virtualizer owns prepend/reflow geometry. History only
       // preserves the user's live-edge intent across its async data commit.
