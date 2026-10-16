@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,17 +46,35 @@ async def offline_uploads(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-def expire_shutdown_deadline(monkeypatch: pytest.MonkeyPatch):
+async def expire_shutdown_deadline(monkeypatch: pytest.MonkeyPatch):
     # This fixture tests cancellation consequences, NOT deadline arithmetic or
     # real timer delivery. Those remain covered by test_shutdown_deadlines and
     # the isolated real-timer/SQLite probes below.
     contexts: list[tuple[float, asyncio.Timeout]] = []
     installed = asyncio.Event()
+    real_loop = asyncio.get_running_loop()
+    shutdown_now = real_loop.time()
+
+    class ShutdownClockLoop:
+        def time(self) -> float:
+            return shutdown_now
+
+        def __getattr__(self, name):
+            return getattr(real_loop, name)
+
+    # close() also checks time before entering timeout_at. Control both views
+    # of the deadline so preemption cannot skip the cancellation under test.
+    # The real event loop, SQLite workers and wait_for watchdogs keep running.
+    shutdown_loop = ShutdownClockLoop()
+
+    def controlled_get_running_loop():
+        running_loop = asyncio.get_running_loop()
+        return shutdown_loop if running_loop is real_loop else running_loop
 
     def controlled_timeout_at(deadline: float) -> asyncio.Timeout:
         assert math.isfinite(deadline)
         assert deadline <= (
-            asyncio.get_running_loop().time() + runtime_module.SHUTDOWN_UPLOAD_TIMEOUT_SECONDS
+            shutdown_now + runtime_module.SHUTDOWN_UPLOAD_TIMEOUT_SECONDS
         )
         # Drive the real asyncio cancellation after the intended upload state
         # is reached, independently of SQLite or worker scheduling latency.
@@ -67,7 +86,10 @@ def expire_shutdown_deadline(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         runtime_module,
         "asyncio",
-        SimpleNamespace(**(vars(asyncio) | {"timeout_at": controlled_timeout_at})),
+        SimpleNamespace(**(vars(asyncio) | {
+            "get_running_loop": controlled_get_running_loop,
+            "timeout_at": controlled_timeout_at,
+        })),
     )
 
     async def expire(
@@ -510,9 +532,10 @@ async def test_close_uploads_records_created_after_empty_startup_cycle(
 
 @pytest.mark.parametrize("start_upload", [False, True], ids=["final-flush", "in-flight"])
 @pytest.mark.parametrize("cancel_close", [False, True], ids=["deadline", "caller-cancel"])
+@pytest.mark.parametrize("pause_before_guard", [False, True], ids=["ready", "preempted"])
 async def test_close_cancels_stalled_upload_and_preserves_unacknowledged_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_uploads, cancel_close: bool,
-    start_upload: bool, expire_shutdown_deadline,
+    start_upload: bool, pause_before_guard: bool, expire_shutdown_deadline,
 ) -> None:
     entered = asyncio.Event()
     cancelled = asyncio.Event()
@@ -534,6 +557,18 @@ async def test_close_cancels_stalled_upload_and_preserves_unacknowledged_event(
             await asyncio.wait_for(entered.wait(), timeout=1)
         assert (runtime._upload_task is not None) is start_upload
         monkeypatch.setattr(runtime_module, "SHUTDOWN_UPLOAD_TIMEOUT_SECONDS", 0.05)
+        if pause_before_guard:
+            prepare_shutdown = runtime.prepare_shutdown
+
+            def preempted_shutdown():
+                prepare_shutdown()
+                # Model OS preemption after creating the guard but before it
+                # can run. This is fault injection, not a readiness wait.
+                started = time.monotonic()
+                time.sleep(0.1)
+                assert time.monotonic() - started > 0.05
+
+            monkeypatch.setattr(runtime, "prepare_shutdown", preempted_shutdown)
         closing = asyncio.create_task(runtime.close())
         if not start_upload:
             await asyncio.wait_for(entered.wait(), timeout=1)
