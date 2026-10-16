@@ -115,7 +115,7 @@ const FINE_INPUT_QUERY = '(any-hover: hover), (any-pointer: fine)'
 interface ConversationTurn {
   key: string
   sourceIndex: number
-  controlId: string
+  controlId: string | undefined
   preview: string
   time: string
   attachmentCount: number
@@ -186,7 +186,7 @@ const turns = computed<ConversationTurn[]>(() => {
     return {
       key: chatMessageKey(message, sourceIndex),
       sourceIndex,
-      controlId: `chat-turn-${sourceIndex}`,
+      controlId: props.virtualizer?.messageAnchorId(sourceIndex),
       preview,
       time: message.timeStr || '',
       attachmentCount: message.attachments?.length || 0,
@@ -237,7 +237,10 @@ function markerStyle(index: number): Record<string, string> {
 }
 
 function turnElement(sourceIndex: number): HTMLElement | null {
-  return props.scrollContainer?.querySelector<HTMLElement>('#chat-turn-' + sourceIndex) ?? null
+  const container = props.scrollContainer
+  const id = props.virtualizer?.messageAnchorId(sourceIndex)
+  const target = id && container?.ownerDocument.getElementById(id)
+  return target && container?.contains(target) ? target : null
 }
 
 function updateOverflowState() {

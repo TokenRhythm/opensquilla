@@ -163,7 +163,7 @@
           v-else-if="preview.kind.value === 'html' && !nativeHtml"
           :key="htmlFrameGeneration"
           ref="previewFrameRef"
-          class="artifact-preview__frame artifact-preview__frame--html"
+          class="artifact-preview__frame artifact-preview__frame--html html-preview-frame"
           :src="preview.objectUrl.value"
           :title="t('chat.previewOf', { title: artifactFileTitle(artifact) })"
           tabindex="0"
@@ -533,6 +533,7 @@ defineExpose({
 })
 </script>
 
+<style scoped src="@/styles/html-preview-frame.css"></style>
 <style scoped>
 .artifact-preview {
   display: flex;
@@ -733,7 +734,6 @@ defineExpose({
   padding: 7px 14px;
 }
 
-.artifact-preview__frame--html,
 .artifact-preview__native-slot {
   background: var(--bg-surface);
 }

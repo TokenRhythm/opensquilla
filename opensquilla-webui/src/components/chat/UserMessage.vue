@@ -287,6 +287,7 @@ import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import { isImageAttachmentMime, isImageDisplayAttachment } from '@/utils/chat/attachments'
 import { ARTIFACT_WORKBENCH_KEY, type ArtifactPreviewController } from '@/modules/artifactWorkbench'
+import { attachmentImagePreviewKey, type AttachmentImagePreviewSource } from '@/composables/chat/useArtifactImageLightbox'
 import { artifactUsesWorkbenchPreview } from '@/utils/workbench/artifactPreview'
 import { fileTypeLabel } from '@/utils/fileType'
 import { localPathName, localPathPresentation } from '@/types/localPathReferences'
@@ -326,7 +327,7 @@ const emit = defineEmits<{
   edit: [message: ChatRenderedMessage]
   editAttachment: [attachment: DisplayAttachment]
   previewAttachment: [attachment: DisplayAttachment]
-  previewImage: [attachment: DisplayAttachment]
+  previewImage: [attachment: DisplayAttachment, preview?: AttachmentImagePreviewSource]
   toggleShare: [messageId: string]
   reusePromptAnnotation: [annotation: PromptAnnotationSnapshot]
 }>()
@@ -441,7 +442,7 @@ function remoteImagePreview(attachment: DisplayAttachment): boolean {
 }
 
 function attachmentPreviewKey(attachment: DisplayAttachment): string {
-  return JSON.stringify([props.sessionKey, attachment.renderKey, attachment.download_url, attachment.sha256_ref])
+  return attachmentImagePreviewKey(attachment, props.sessionKey || '')
 }
 
 function attachmentPreviewController(attachment: DisplayAttachment): ArtifactPreviewController | undefined {
@@ -452,6 +453,7 @@ function attachmentPreviewController(attachment: DisplayAttachment): ArtifactPre
     const sessionKey = props.sessionKey
     controller = artifactWorkbench.previews.create({
       fullSize: false,
+      retainLoadedBlob: true,
       maxBytes: IMAGE_PREVIEW_MAX_BYTES,
       loadBlob: async signal => {
         const result = await artifactWorkbench.content.fetchAttachment(attachment, {
@@ -591,7 +593,15 @@ function attachmentUnavailableReason(attachment: DisplayAttachment): string {
 function previewImage(attachment: DisplayAttachment, event: MouseEvent) {
   // Establish the return target even when pointer clicks do not focus buttons.
   if (event.currentTarget instanceof HTMLElement) event.currentTarget.focus({ preventScroll: true })
-  emit('previewImage', attachment)
+  const key = attachmentPreviewKey(attachment)
+  const preview = attachmentPreviews.get(key)
+  const source: AttachmentImagePreviewSource | undefined = preview?.readLoadedBlob() ? {
+    key,
+    readBlob: () => attachmentPreviews.get(key) === preview && attachmentPreviewKey(attachment) === key
+      ? preview.readLoadedBlob() : null,
+  } : undefined
+  if (source) emit('previewImage', attachment, source)
+  else emit('previewImage', attachment)
 }
 
 function activateAttachment(attachment: DisplayAttachment, event: MouseEvent) {

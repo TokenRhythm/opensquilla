@@ -354,6 +354,7 @@ describe('ChatMessageList long-history virtualization', () => {
 
     const target = await api.ensureMessageVisible(150)
     expect(target?.id).toMatch(/^chat-turn-.+-150$/)
+    expect(target?.id).toBe(api.messageAnchorId(150))
     expect(host.querySelector('[data-chat-message-index="150"]')).toBeTruthy()
     expect(host.querySelectorAll('[data-testid="chat-message-row"]').length).toBeLessThanOrEqual(30)
 

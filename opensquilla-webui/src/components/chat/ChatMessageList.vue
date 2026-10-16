@@ -69,7 +69,7 @@
         />
         <UserMessage
           v-else-if="messages[entry.index].displayRole === 'user'"
-          :id="`${turnAnchorPrefix}-${entry.index}`"
+          :id="messageAnchorId(entry.index)"
           :data-chat-turn-key="chatMessageKey(messages[entry.index], entry.index)"
           tabindex="-1"
           :message="hydratedMessage(messages[entry.index], entry.index)"
@@ -91,7 +91,9 @@
           @edit="$emit('editMessage', $event)"
           @edit-attachment="$emit('editAttachment', $event)"
           @preview-attachment="$emit('previewAttachment', $event)"
-          @preview-image="$emit('previewImage', $event, messages[entry.index].attachments || [])"
+          @preview-image="(attachment, preview) => preview
+            ? $emit('previewImage', attachment, messages[entry.index].attachments || [], preview)
+            : $emit('previewImage', attachment, messages[entry.index].attachments || [])"
           @reuse-prompt-annotation="$emit('reusePromptAnnotation', $event)"
           @toggle-share="$emit('toggleShareMessage', $event)"
         />
@@ -313,7 +315,7 @@ const emit = defineEmits<{
   editMessage: [message: ChatRenderedMessage]
   editAttachment: [attachment: import('@/types/chat').DisplayAttachment]
   previewAttachment: [attachment: import('@/types/chat').DisplayAttachment]
-  previewImage: [attachment: import('@/types/chat').DisplayAttachment, attachments: import('@/types/chat').DisplayAttachment[]]
+  previewImage: [attachment: import('@/types/chat').DisplayAttachment, attachments: import('@/types/chat').DisplayAttachment[], preview?: import('@/composables/chat/useArtifactImageLightbox').AttachmentImagePreviewSource]
   reusePromptAnnotation: [annotation: PromptAnnotationSnapshot]
   regenerateMessage: [
     message: ChatRenderedMessage,
@@ -346,6 +348,7 @@ const MESSAGE_GAP_PX = 4
 const { t } = useI18n()
 const listInstanceId = useId()
 const turnAnchorPrefix = computed(() => `chat-turn-${encodeURIComponent(props.sessionKey || 'unbound')}-${listInstanceId}`)
+const messageAnchorId = (index: number) => `${turnAnchorPrefix.value}-${index}`
 const policy = useConversationPolicy()
 
 function forwardSystemRetry(
@@ -1302,6 +1305,7 @@ function syncPreference(event: StorageEvent) {
 }
 
 defineExpose<ChatMessageListVirtualizer>({
+  messageAnchorId,
   ensureMessageVisible,
   ensureMessageContentVisible,
   messageBodyText: index => props.messages[index] ? hydratedMessage(props.messages[index], index).text : '',

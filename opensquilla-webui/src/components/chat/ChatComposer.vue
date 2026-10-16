@@ -1943,6 +1943,8 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-stop-btn {
+  /* Cancellation stays a full-size target even when labels collapse. */
+  --composer-control-size: 44px;
   min-width: 44px;
   min-height: 44px;
 }

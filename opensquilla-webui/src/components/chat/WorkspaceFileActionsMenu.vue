@@ -35,7 +35,7 @@ let showId = 0
 let invoker: HTMLElement | null = null
 
 const title = computed(() => selected.value?.path || selected.value?.name || '')
-const canOpenInWorkbench = computed(() => props.workbenchAvailable && selected.value?.kind === 'text')
+const canOpenInWorkbench = computed(() => props.workbenchAvailable && Boolean(selected.value))
 
 function close() {
   showId++

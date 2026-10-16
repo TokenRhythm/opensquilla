@@ -10,6 +10,17 @@ import type { ArtifactPayload } from '@/types/artifacts'
 import type { DisplayAttachment } from '@/types/chat'
 import { isImageDisplayAttachment } from '@/utils/chat/attachments'
 
+/** A handoff from the current thumbnail owner, never a persisted/shared cache. */
+export interface AttachmentImagePreviewSource {
+  readonly key: string
+  readBlob(): Blob | null
+}
+
+export function attachmentImagePreviewKey(attachment: DisplayAttachment, sessionKey: string): string {
+  return JSON.stringify([sessionKey, attachment.renderKey, attachment.download_url,
+    attachment.sha256_ref, attachment.fileSnapshotRef, attachment.mime])
+}
+
 export type ImageLightboxItem =
   | { kind: 'artifact', artifact: ArtifactPayload }
   | { kind: 'attachment', attachment: DisplayAttachment }
@@ -21,6 +32,7 @@ export interface ArtifactImageLightboxRequest {
   /** Visible conversation owner; side resource reads still use sessionKey. */
   ownerSessionKey?: string
   invoker: HTMLElement | null
+  attachmentPreview?: AttachmentImagePreviewSource
 }
 
 export interface ArtifactImageLightboxOpenRequest {
@@ -36,6 +48,7 @@ export interface ArtifactImageLightboxController {
   openAttachments(request: {
     attachment: DisplayAttachment
     navigationAttachments: readonly DisplayAttachment[]
+    attachmentPreview?: AttachmentImagePreviewSource
     sessionKey: string
     ownerSessionKey?: string
   }): void
@@ -67,6 +80,7 @@ export function provideArtifactImageLightbox(): ArtifactImageLightboxController 
       if (!isImageDisplayAttachment(nextRequest.attachment)) return
       request.value = {
         image: { kind: 'attachment', attachment: nextRequest.attachment },
+        attachmentPreview: nextRequest.attachmentPreview,
         navigationImages: nextRequest.navigationAttachments
           .filter(isImageDisplayAttachment)
           .map(attachment => ({ kind: 'attachment', attachment })),

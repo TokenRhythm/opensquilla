@@ -117,6 +117,7 @@ export function createArtifactPreview(
   // null progress = indeterminate (no Content-Length); 0–100 otherwise.
   const progress = ref<number | null>(null)
   const objectUrl = shallowRef<string>('')
+  let loadedBlob: Blob | null = null
 
   const timeoutMs = options.timeoutMs ?? 30000
   const maxRetries = options.maxRetries ?? 2
@@ -206,6 +207,7 @@ export function createArtifactPreview(
 
       const nextUrl = URL.createObjectURL(blob)
       setObjectUrl(nextUrl)
+      loadedBlob = options.retainLoadedBlob ? blob : null
       progress.value = 100
       state.value = 'loaded'
     } catch (err) {
@@ -288,6 +290,7 @@ export function createArtifactPreview(
       try { URL.revokeObjectURL(objectUrl.value) } catch {}
     }
     objectUrl.value = ''
+    loadedBlob = null
     state.value = 'idle'
     errorCode.value = null
     progress.value = null
@@ -299,7 +302,11 @@ export function createArtifactPreview(
     release()
   }
 
-  return { state, errorCode, progress, objectUrl, load, retry, observe, release, dispose }
+  function readLoadedBlob(): Blob | null {
+    return !disposed && state.value === 'loaded' ? loadedBlob : null
+  }
+
+  return { state, errorCode, progress, objectUrl, readLoadedBlob, load, retry, observe, release, dispose }
 }
 
 /**

@@ -119,11 +119,10 @@ interface ApprovalResolveResponse {
  */
 /**
  * The slice of the live-turn stream the approvals composable drives: it appends
- * interrupt frames into the turn log and opens a render bubble for approvals that
- * arrive with no live turn streaming.
+ * interrupt frames into the turn log. Execution ownership stays with task events,
+ * even when an approval arrives before a live turn or during recovery.
  */
 export interface ApprovalsStreamSurface {
-  isStreaming: Ref<boolean>
   appendInterruptFrame: (input: {
     interruptKind: 'approval' | 'clarify'
     approvalId: string
@@ -131,7 +130,6 @@ export interface ApprovalsStreamSurface {
     at: number
     activityOrder?: number
   }) => void
-  ensureInterruptBubble: () => void
 }
 
 export interface UseChatApprovalsOptions {
@@ -642,9 +640,9 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     return interruptNamespaces.get(id) || 'exec'
   }
 
-  // Append an approval interrupt frame onto the live turn, opening a render
-  // bubble first when no turn is streaming (queued/background/reload). Remembers
-  // the namespace for resolve, seeds an empty interruptState entry, and dedups in
+  // Approval cards render independently of an executing turn: a recovered or
+  // standalone approval must not create a fake run or elapsed clock. Remember
+  // the namespace for resolve, seed an empty interruptState entry, and dedup in
   // the fold by approvalId — so a re-broadcast or hydration backfill merges richer
   // args/warning rather than duplicating the part.
   function appendApprovalInterrupt(data: InterruptApprovalData, event?: ApprovalEvent) {
@@ -660,7 +658,6 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     if (!interruptState.value.has(merged.approvalId)) {
       setInterruptState(merged.approvalId, {})
     }
-    if (!stream.isStreaming.value) stream.ensureInterruptBubble()
     stream.appendInterruptFrame({
       interruptKind: 'approval',
       approvalId: merged.approvalId,
@@ -713,7 +710,6 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       step: request.step,
     }
     if (!interruptState.value.has(key)) setInterruptState(key, {})
-    if (!stream.isStreaming.value) stream.ensureInterruptBubble()
     stream.appendInterruptFrame({
       interruptKind: 'clarify',
       approvalId: key,
@@ -970,7 +966,6 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       // racing snapshot still contains its pre-submit pending record.
       if (!sameRequest || !clarifyBusy.value) resetClarifyPresentation()
       if (!interruptState.value.has(key)) setInterruptState(key, {})
-      if (!stream.isStreaming.value) stream.ensureInterruptBubble()
       stream.appendInterruptFrame({
         interruptKind: 'clarify',
         approvalId: key,

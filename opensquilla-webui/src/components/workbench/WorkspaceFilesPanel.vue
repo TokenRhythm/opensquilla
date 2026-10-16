@@ -75,13 +75,14 @@
       <WorkspaceFilePanel
         v-if="selected && (previewKind === 'source' || sourceMode)"
         v-bind="previewState"
+        :mime="resolvedFile?.mime || selected.mime"
         @workbench-event="handlePreviewEvent"
       />
       <ResourcePreviewPanel v-else-if="selected && previewBlob" :key="previewState.viewId" :blob="previewBlob" :kind="previewKind" :name="selected.name" />
       <div v-else-if="selected" class="workspace-files__binary-preview">
         <p v-if="previewState.loading" role="status">{{ t('workbench.workspaceFiles.loading') }}</p>
         <p v-else-if="previewState.errorKey" role="alert">{{ t(previewState.errorKey) }}</p>
-        <p v-else>{{ t('workspaceReference.unsupported') }} · {{ selected.mime || selected.kind }}</p>
+        <p v-else>{{ t('workbench.artifactPreview.unsupported') }} · {{ selected.mime || selected.kind }}</p>
       </div>
       <div v-else-if="rootError" class="workspace-files__empty" role="alert">
         <p>{{ t('workbench.workspaceFiles.rootUnavailable') }}</p>
@@ -100,6 +101,7 @@ import WorkspaceFilePanel from './WorkspaceFilePanel.vue'
 import ResourcePreviewPanel from './ResourcePreviewPanel.vue'
 import WorkspaceResourceActions from './WorkspaceResourceActions.vue'
 import { resourcePreviewKind, resourcePreviewLimit } from '@/workbench/resourcePreview'
+import { completeWorkspaceMarkdown, isWorkspaceMarkdown, WORKSPACE_MARKDOWN_PREVIEW_LIMIT } from '@/workbench/workspaceTextPreview'
 import { WORKSPACE_FILES_KEY, WorkspaceFilesChangedError, WorkspaceTextLimitError, type WorkspaceDirectoryEntry, type WorkspaceFile, type WorkspaceFilePage, type WorkspaceRoot } from '@/modules/workspaceFiles'
 import { getIconSvg } from '@/utils/icons'
 import { copyTextWithFallback } from '@/utils/browser'
@@ -129,17 +131,18 @@ interface DirectoryState {
 }
 const directories = reactive(new Map<string, DirectoryState>())
 const previewState = reactive<{
-  snapshot: WorkspaceFilePage & { paged: true; focusLine?: number } | null
+  snapshot: WorkspaceFilePage & { paged?: boolean; focusLine?: number } | null
   viewId: number
   loading: boolean
   errorKey: string
+  previewErrorKey: string
   searchStatus: 'idle' | 'searching' | 'found' | 'not-found'
   searchErrorKey: string
   searchQuery: string
   copying: boolean
   copied: boolean
   copyErrorKey: string
-}>({ snapshot: null, viewId: 0, loading: false, errorKey: '', searchStatus: 'idle', searchErrorKey: '', searchQuery: '', copying: false, copied: false, copyErrorKey: '' })
+}>({ snapshot: null, viewId: 0, loading: false, errorKey: '', previewErrorKey: '', searchStatus: 'idle', searchErrorKey: '', searchQuery: '', copying: false, copied: false, copyErrorKey: '' })
 const previewBlob = shallowRef<Blob | null>(null)
 const sourceMode = ref(false)
 const previewKind = computed(() => selected.value ? resourcePreviewKind(selected.value) : 'unsupported')
@@ -257,6 +260,7 @@ function resetPreview() {
   previewState.snapshot = null
   previewState.loading = false
   previewState.errorKey = ''
+  previewState.previewErrorKey = ''
   previewState.searchErrorKey = ''
   previewState.searchStatus = 'idle'
   previewState.searchQuery = ''
@@ -323,23 +327,47 @@ async function activate(entry: WorkspaceDirectoryEntry, asSource = false) {
     if (isCurrentPreview(request)) { previewState.errorKey = fileError(error); previewState.loading = false }
     return
   }
+  if (!asSource && entry.kind === 'text' && isWorkspaceMarkdown(entry)) {
+    if ((entry.size || 0) <= WORKSPACE_MARKDOWN_PREVIEW_LIMIT) {
+      try {
+        const blob = await files.read(request.sessionKey, fileFor(entry), request.controller.signal)
+        const snapshot = await completeWorkspaceMarkdown(entry.path, blob)
+        if (!isCurrentPreview(request)) return
+        previewState.snapshot = snapshot
+        previewState.loading = false
+        return
+      } catch (error) {
+        if (!isCurrentPreview(request)) return
+        if (error instanceof WorkspaceFilesChangedError) {
+          previewState.errorKey = fileError(error); previewState.loading = false; return
+        }
+        previewState.previewErrorKey = error instanceof Error && error.message === 'workbench.artifactPreview.tooLarge'
+          ? error.message : 'workbench.artifactPreview.unsupported'
+      }
+    } else previewState.previewErrorKey = 'workbench.artifactPreview.tooLarge'
+  }
   if (!asSource && previewKind.value !== 'source' && previewKind.value !== 'unsupported' && files?.read) {
     previewState.loading = true
     try {
-      if ((entry.size || 0) > resourcePreviewLimit(previewKind.value)) throw new Error('Preview size limit')
+      if ((entry.size || 0) > resourcePreviewLimit(previewKind.value)) throw new Error('workbench.artifactPreview.tooLarge')
       const blob = await files.read(request.sessionKey, fileFor(entry), request.controller.signal)
-      if (blob.size > resourcePreviewLimit(previewKind.value)) throw new Error('Preview size limit')
+      if (blob.size > resourcePreviewLimit(previewKind.value)) throw new Error('workbench.artifactPreview.tooLarge')
       if (isCurrentPreview(request)) previewBlob.value = blob
     } catch (error) {
-      if (isCurrentPreview(request)) previewState.errorKey = fileError(error)
+      if (!isCurrentPreview(request)) return
+      if (entry.kind === 'text' && !(error instanceof WorkspaceFilesChangedError)) {
+        sourceMode.value = true
+        previewState.previewErrorKey = error instanceof Error && error.message === 'workbench.artifactPreview.tooLarge'
+          ? error.message : 'workbench.artifactPreview.unsupported'
+      } else previewState.errorKey = fileError(error)
     } finally {
       if (isCurrentPreview(request)) previewState.loading = false
     }
-    return
+    if (!sourceMode.value) return
   }
   if (entry.kind !== 'text' || !files?.readPage) {
     previewState.loading = false
-    previewState.errorKey = 'workspaceReference.unsupported'
+    previewState.errorKey = entry.kind === 'text' ? 'workspaceReference.unsupported' : 'workbench.artifactPreview.unsupported'
     return
   }
   previewState.loading = true
@@ -354,6 +382,7 @@ async function activate(entry: WorkspaceDirectoryEntry, asSource = false) {
 }
 
 function fileError(error: unknown) {
+  if (error instanceof Error && error.message === 'workbench.artifactPreview.tooLarge') return error.message
   if (error instanceof WorkspaceTextLimitError) return error.limit === 'line'
     ? 'workbench.workspaceFiles.textLineLimit' : 'workbench.workspaceFiles.textPageLimit'
   return error instanceof WorkspaceFilesChangedError ? 'workbench.workspaceFiles.changed' : 'workbench.workspaceFiles.unavailable'

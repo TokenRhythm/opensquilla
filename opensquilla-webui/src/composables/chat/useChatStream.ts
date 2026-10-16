@@ -352,7 +352,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   let lastFlushAt = 0
   let renderDirty = false
 
-  function resetStreamState() {
+  function resetStreamState(preservePendingInterrupts = false) {
     toolInputDrafts.clear()
     acceptedActivityStartedAt = 0
     activeModelCallId = ''
@@ -364,7 +364,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     // A steer checkpoint deliberately resets only the current visible segment;
     // checkpointedRaw remains available to de-duplicate an authoritative
     // whole-turn final snapshot.
-    resetLog()
+    resetLog({ preservePendingInterrupts })
   }
 
   function noteStreamSignal() {
@@ -465,6 +465,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     activityStartedAt?: number | string | null,
     recordInitialActivity = true,
   ) {
+    const preservePendingInterrupts = !isStreaming.value
     checkpointedRaw = ''
     checkpointedAcrossToolBoundary = false
     activeStreamTurnId = ''
@@ -480,7 +481,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         ? { ...activeTask, status: 'running' }
         : { status: 'running' },
     })
-    resetStreamState()
+    resetStreamState(preservePendingInterrupts)
     const restoredStartedAt = normalizedTaskStartedAt(activityStartedAt) ?? 0
     setAcceptedActivityStartedAt(restoredStartedAt || undefined)
     streamRound.value = 1
@@ -884,7 +885,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     clearRenderTimer()
   }
 
-  function resetLiveTurnState() {
+  function resetLiveTurnState(resetOptions: { preservePendingInterrupts?: boolean } = {}) {
     // Session switches can happen while a render frame or fallback timer is
     // waiting to flush the previous live turn. Cancel it before clearing the
     // stream state so the old session cannot request a scroll in the next
@@ -895,7 +896,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     clearStreamIdleTimer()
     streamIdlePausedForApproval.value = false
     isStreaming.value = false
-    resetStreamState()
+    resetStreamState(resetOptions.preservePendingInterrupts)
     streamBubble.value = false
     checkpointedRaw = ''
     checkpointedAcrossToolBoundary = false
@@ -1410,20 +1411,6 @@ export function useChatStream(options: UseChatStreamOptions) {
     scheduleRender()
   }
 
-  // Open a render bubble for an interrupt that arrived with no live turn
-  // streaming (a queued/background turn, or a reload that recovered a pending
-  // approval). This is deliberately lighter than startStreaming(): it does NOT
-  // reset the log or the activity refs, so an interrupt frame appended right
-  // after it survives. The turn stays open because an unresolved approval pauses
-  // the idle timer, so the fold-driven activity surface keeps rendering the part.
-  function ensureInterruptBubble() {
-    if (streamBubble.value) return
-    if (!streamTurnStartedAt.value) streamTurnStartedAt.value = Date.now()
-    streamBubble.value = true
-    streamShowHeader.value = options.lastHeaderRole.value !== 'assistant'
-    isStreaming.value = true
-  }
-
   function reconcileCheckpointedText(
     finalText: string,
     modelCallSegments: ChatModelCallSegment[] | null | undefined,
@@ -1603,7 +1590,6 @@ export function useChatStream(options: UseChatStreamOptions) {
     appendInterruptFrame,
     recordActivityPhase,
     setAcceptedActivityStartedAt,
-    ensureInterruptBubble,
     reconcileFinalText,
     resetStreamIdleTimer,
     setStreamConnectionAvailable,

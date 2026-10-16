@@ -94,6 +94,63 @@ async function search(el: HTMLElement, query: string) {
 }
 
 describe('workspace source preview limits', () => {
+  it('preserves MIME-only Markdown preview without duplicating resource actions', async () => {
+    const files = fixture()
+    files.listDir.mockResolvedValue(listing([{ ...entry('REPORT'), mime: 'text/markdown' }]))
+    files.resolve.mockResolvedValue([{ requestedPath: 'REPORT', path: 'REPORT', name: 'REPORT',
+      mime: 'text/markdown', kind: 'text', size: 100, workspaceBinding: 'binding-a', revision: 'revision-a' }])
+    const content = '# MIME document\nBody'
+    const blob = new Blob([content])
+    blob.arrayBuffer = async () => new TextEncoder().encode(content).buffer
+    files.read.mockResolvedValue(blob)
+    const { el } = await mount(files)
+    await select(el, 'REPORT')
+    await vi.waitFor(() => expect(el.querySelector('.workspace-file__markdown')?.textContent).toContain('MIME document'))
+    expect(el.querySelectorAll('.workspace-resource-actions')).toHaveLength(1)
+    expect(files.readPage).not.toHaveBeenCalled()
+  })
+
+  it('defaults long bounded Markdown to a complete preview and retains source pagination', async () => {
+    const files = fixture()
+    files.listDir.mockResolvedValue(listing([entry('report.md')]))
+    const content = '# Full report\n' + 'A paragraph.\n\n'.repeat(250) + '## Final section'
+    const blob = new Blob([content])
+    blob.arrayBuffer = async () => new TextEncoder().encode(content).buffer
+    files.read.mockResolvedValue(blob)
+    const { el } = await mount(files)
+    await select(el, 'report.md')
+    await vi.waitFor(() => expect(el.querySelector('.workspace-file__markdown')?.textContent).toContain('Final section'))
+    expect(files.readPage).not.toHaveBeenCalled()
+    const source = [...el.querySelectorAll<HTMLButtonElement>('.workspace-file__modes button')].find(button => button.textContent === 'Source')!
+    source.click(); await nextTick()
+    expect(el.querySelectorAll('[data-line]')).toHaveLength(200)
+    el.querySelector<HTMLButtonElement>('.workspace-file__more')!.click(); await nextTick()
+    expect(el.querySelector('[data-line="201"]')).not.toBeNull()
+    expect(files.readPage).not.toHaveBeenCalled()
+  })
+
+  it.each(['oversized', 'offline'])('shows explicit %s Markdown fallback while keeping source and actions usable', async scenario => {
+    const files = fixture()
+    files.listDir.mockResolvedValue(listing([{ ...entry('report.md'), size: scenario === 'oversized' ? 200_000 : 100 }]))
+    files.read.mockRejectedValue(new Error('offline'))
+    const { el } = await mount(files)
+    await select(el, 'report.md')
+    expect(el.querySelector('.workspace-file__status')?.textContent).toContain(scenario === 'offline' ? 'Preview unavailable' : 'too large')
+    expect(el.querySelector('.workspace-file__source')).not.toBeNull()
+    expect(el.querySelector('.workspace-resource-actions')).not.toBeNull()
+    if (scenario === 'oversized') expect(files.read).not.toHaveBeenCalled()
+  })
+
+  it('does not show an older Markdown source page after a stale complete read', async () => {
+    const files = fixture()
+    files.listDir.mockResolvedValue(listing([entry('report.md')]))
+    files.read.mockRejectedValue(new WorkspaceFilesChangedError())
+    const { el } = await mount(files)
+    await select(el, 'report.md')
+    expect(el.querySelector('[role="alert"]')?.textContent).toContain('changed')
+    expect(files.readPage).not.toHaveBeenCalled()
+  })
+
   it.each([
     ['line', 'A line in this file is too long for the preview'],
     ['page', 'This section is too large for the preview'],

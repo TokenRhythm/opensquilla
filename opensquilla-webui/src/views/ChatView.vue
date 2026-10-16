@@ -906,7 +906,7 @@ import { useSandboxReadinessRefresh } from '@/composables/chat/useSandboxReadine
 import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
 import { useChatTurnAnnouncement } from '@/composables/chat/useChatTurnAnnouncement'
-import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
+import { useArtifactImageLightbox, type AttachmentImagePreviewSource } from '@/composables/chat/useArtifactImageLightbox'
 import { useChatPlans } from '@/composables/chat/useChatPlans'
 import { PLAN_CENTER_KEY, type PlanCenter } from '@/modules/planCenter'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
@@ -1949,7 +1949,6 @@ const {
   foldedTurn,
   toolInputPreviews,
   appendInterruptFrame,
-  ensureInterruptBubble,
 } = chatStream
 // Register departure capture before session-scoped routing/live reset watchers.
 // Only display data is retained; subscription, ownership and approvals recover
@@ -4228,7 +4227,7 @@ const chatApprovals = useChatApprovals({
   gatewayAvailability: computed(() => gatewayAccess.availability),
   sessionKey,
   runStatus,
-  stream: { isStreaming, appendInterruptFrame, ensureInterruptBubble },
+  stream: { appendInterruptFrame },
   interruptState,
   onSnapshotCount: count => { if (!props.embedded) appStore.setApprovalCount(count) },
 })
@@ -5429,10 +5428,11 @@ function subagentBody(text: string): string {
 
 /* ── Artifacts ─────────────────────────────────────────────────────── */
 
-function previewImageAttachment(attachment: DisplayAttachment, attachments: readonly DisplayAttachment[]) {
+function previewImageAttachment(attachment: DisplayAttachment, attachments: readonly DisplayAttachment[], preview?: AttachmentImagePreviewSource) {
   artifactImageLightbox.openAttachments({
     attachment,
     navigationAttachments: attachments,
+    attachmentPreview: preview,
     sessionKey: sessionKey.value,
     ownerSessionKey: workbenchOwnerKey.value,
   })
@@ -5445,7 +5445,7 @@ function previewPendingImage(attachment: Attachment) {
     // Drafts have a provisional runtime key before a session exists in the URL.
     // Keep local previews owned by the visible route used by App's dialog guard.
     sessionKey: readSessionFromUrl(),
-    ownerSessionKey: workbenchOwnerKey.value,
+    ownerSessionKey: props.workbenchOwnerSessionKey || readSessionFromUrl(),
   })
 }
 

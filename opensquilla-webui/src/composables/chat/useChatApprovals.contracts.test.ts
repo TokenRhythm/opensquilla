@@ -97,9 +97,7 @@ async function harness(statusResult: unknown = { found: true, pending: true, res
     sessionKey: ref('agent:main:web'),
     runStatus: ref({ status: 'idle', label: '', task: null }),
     stream: {
-      isStreaming: ref(false),
       appendInterruptFrame,
-      ensureInterruptBubble: vi.fn(),
     },
     interruptState,
   }))!

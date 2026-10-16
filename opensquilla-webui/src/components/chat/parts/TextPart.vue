@@ -131,7 +131,7 @@ function applyWorkspaceFiles(root: HTMLElement, scope: string) {
 }
 
 function openWorkspaceFile(file: WorkspaceFile) {
-  if (file.kind === 'text' && workspaceWorkbenchAvailable.value && props.sessionKey && workbench) {
+  if (workspaceWorkbenchAvailable.value && props.sessionKey && workbench) {
     const item = createResolvedWorkspaceFileItem(props.sessionKey, file, workbenchOwner?.value || props.sessionKey)
     if (workbench.openItem(item)) {
       if (workbench.activeItemId === item.id) workbench.requestReveal()

@@ -104,7 +104,7 @@ function onMediaError(event: Event) {
     <OfficePreviewPanel v-else-if="isOfficePreviewFormat(kind) && data" :data="data" :format="kind" />
     <PdfResourcePreview v-else-if="kind === 'pdf' && data" :data="data" :name="name" />
     <img v-else-if="kind === 'image' && url" :key="url" :src="url" :alt="name" decoding="async" @error="onMediaError" />
-    <iframe v-else-if="kind === 'html' && html" :srcdoc="html" :title="name" sandbox="allow-scripts" referrerpolicy="no-referrer" />
+    <iframe v-else-if="kind === 'html' && html" class="html-preview-frame" :srcdoc="html" :title="name" sandbox="allow-scripts" referrerpolicy="no-referrer" />
     <audio v-else-if="kind === 'audio' && url" :key="url" ref="media" :src="url" controls preload="metadata" @error="onMediaError" />
     <video v-else-if="kind === 'video' && url" :key="url" ref="media" :src="url" controls preload="metadata" @error="onMediaError" />
     <template v-else-if="kind === 'csv'">
@@ -121,6 +121,7 @@ function onMediaError(event: Event) {
   </section>
 </template>
 
+<style scoped src="@/styles/html-preview-frame.css"></style>
 <style scoped>
 .resource-preview { display: flex; flex: 1; flex-direction: column; min-height: 0; min-width: 0; overflow: auto; background: var(--bg-surface); }
 .resource-preview > iframe { border: 0; width: 100%; flex: 1; min-height: 300px; }

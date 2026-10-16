@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { markRaw, ref, shallowRef } from 'vue'
+import { markRaw, ref, shallowRef, watch } from 'vue'
 
 import type { WorkbenchResourceProvider } from '@/modules/artifactWorkbench'
 import type {
@@ -153,6 +153,19 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     promise: Promise<WorkbenchResourceOpenResponse | null>
   }>()
   const mutationRequestIds = new PendingMutationRequestIds(64)
+
+  // A session may request its inventory before Hello advertises the resource
+  // methods. Retry that deferred read when the same provider becomes available;
+  // unchanged/empty artifact history must not leave attachments download-only.
+  // Cleared sessions are absent here, and load retains the normal request fences.
+  watch(() => provider.value?.available() === true, available => {
+    if (!available) return
+    for (const current of Object.values(snapshots.value)) {
+      if (current.loaded && !current.available && !current.loading) {
+        void load(current.sessionKey, true).catch(() => undefined)
+      }
+    }
+  })
 
   async function runRecoverableMutation<
     T,

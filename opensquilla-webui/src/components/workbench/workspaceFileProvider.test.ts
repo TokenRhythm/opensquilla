@@ -3,7 +3,7 @@ import { WorkspaceReferenceError, type WorkspaceReferences } from '@/modules/wor
 import { normalizeWorkspaceFileReferenceV1 } from '@/types/references'
 import { createResolvedWorkspaceFileItem, createWorkspaceFileItem } from '@/workbench/workspaceFileItems'
 import type { WorkspaceFile, WorkspaceFiles } from '@/modules/workspaceFiles'
-import { WorkspaceFilesChangedError } from '@/modules/workspaceFiles'
+import { WorkspaceFilesChangedError, WorkspaceTextLimitError } from '@/modules/workspaceFiles'
 import { copyTextWithFallback } from '@/utils/browser'
 import type { WorkbenchItem } from '@/workbench/types'
 import { WorkbenchPanelRegistry, WorkbenchRuntimeManager } from '@/workbench/runtime'
@@ -189,6 +189,91 @@ async function setupFile(overrides: Partial<WorkspaceFiles> = {}, inputFile = fi
 }
 
 describe('paged source operations', () => {
+  it('keeps a complete HTML preview usable when the source line exceeds its separate paging limit', async () => {
+    const resource: WorkspaceFile = { ...file, name: 'long-line.html', path: 'long-line.html', mime: 'text/html', size: 400_000 }
+    const blob = new Blob(['<html><body>Complete preview</body></html>'])
+    const f = await setupFile({ read: vi.fn().mockResolvedValue(blob),
+      readPage: vi.fn().mockRejectedValue(new WorkspaceTextLimitError('line')) }, resource)
+    expect(f.state).toMatchObject({ previewBlob: blob, snapshot: null, errorKey: '', previewErrorKey: 'workbench.workspaceFiles.textLineLimit' })
+    f.runtime.dispose!('closed')
+  })
+
+  it('does not show a blank panel when both source pagination and full preview are unavailable', async () => {
+    const resource: WorkspaceFile = { ...file, name: 'long-line.html', path: 'long-line.html', mime: 'text/html', size: 400_000 }
+    const f = await setupFile({ read: vi.fn().mockRejectedValue(new Error('offline')),
+      readPage: vi.fn().mockRejectedValue(new WorkspaceTextLimitError('line')) }, resource)
+    expect(f.state).toMatchObject({ previewBlob: null, snapshot: null, errorKey: 'workspaceReference.unsupported', loading: false })
+    f.runtime.dispose!('closed')
+  })
+
+  it.each([
+    ['report.pdf', 'application/pdf', 'download', 'pdf'],
+    ['report.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'download', 'docx'],
+    ['song.mp3', 'audio/mpeg', 'download', 'audio'],
+    ['clip.mp4', 'video/mp4', 'download', 'video'],
+    ['photo.png', 'image/png', 'image', 'image'],
+  ] as const)('opens %s through the shared renderer with child authority and resource actions', async (name, mime, kind, previewKind) => {
+    const resource: WorkspaceFile = { ...file, path: name, name, mime, kind, size: 100 }
+    const blob = new Blob(['authorized bytes'])
+    const read = vi.fn().mockResolvedValue(blob)
+    const f = await setupFile({ read }, resource, 'parent')
+    expect(f.state).toMatchObject({ snapshot: null, previewBlob: blob, previewKind, errorKey: '' })
+    expect(read).toHaveBeenCalledWith('task', resource, expect.any(AbortSignal))
+    expect(f.readPage).not.toHaveBeenCalled()
+    f.runtime.dispose!('closed')
+    expect(f.state.previewBlob).toBeNull()
+  })
+
+  it('reads the complete CSV for its table while retaining source pagination', async () => {
+    const resource: WorkspaceFile = { ...file, path: 'data.tsv', name: 'data.tsv', mime: 'text/tab-separated-values', size: 100 }
+    const blob = new Blob(['id\tvalue\n1\t中文\n'])
+    const f = await setupFile({ read: vi.fn().mockResolvedValue(blob) }, resource)
+    expect(f.state).toMatchObject({ previewKind: 'csv', previewBlob: blob, snapshot: { paged: true } })
+    f.runtime.dispose!('closed')
+  })
+
+  it('previews a small Markdown document beyond 200 lines completely, without fetching partial pages', async () => {
+    const content = '# Full report\n' + 'paragraph\n'.repeat(450)
+    const resource: WorkspaceFile = { ...file, path: 'report.md', name: 'report.md', mime: 'text/markdown', size: content.length }
+    const f = await setupFile({ read: vi.fn().mockResolvedValue(new Blob([content])) }, resource)
+    expect(f.state.snapshot).toMatchObject({ content, startLine: 1, endLine: 451, totalLines: 451 })
+    expect(f.state.snapshot).not.toHaveProperty('paged')
+    expect(f.readPage).not.toHaveBeenCalled()
+    f.runtime.dispose!('closed')
+  })
+
+  it.each(['large', 'read-failure', 'oversized-response'])('keeps bounded Markdown source with explicit %s preview fallback', async scenario => {
+    const resource: WorkspaceFile = { ...file, path: 'report.md', name: 'report.md', mime: 'text/markdown', size: scenario === 'large' ? 200_000 : 100 }
+    const read = scenario === 'read-failure' ? vi.fn().mockRejectedValue(new Error('offline'))
+      : vi.fn().mockResolvedValue(new Blob(['x'.repeat(128_001)]))
+    const f = await setupFile({ read }, resource)
+    expect(f.state.snapshot).toMatchObject({ paged: true })
+    expect(f.state.previewErrorKey).toBe(scenario === 'read-failure' ? 'workbench.artifactPreview.unsupported' : 'workbench.artifactPreview.tooLarge')
+    if (scenario === 'large') expect(read).not.toHaveBeenCalled()
+    f.runtime.dispose!('closed')
+  })
+
+  it('rejects stale Markdown instead of falling back to an inconsistent source snapshot', async () => {
+    const resource: WorkspaceFile = { ...file, path: 'report.md', name: 'report.md', mime: 'text/markdown', size: 100 }
+    const f = await setupFile({ read: vi.fn().mockRejectedValue(new WorkspaceFilesChangedError()) }, resource)
+    expect(f.state).toMatchObject({ snapshot: null, errorKey: 'workbench.workspaceFiles.changed' })
+    expect(f.readPage).not.toHaveBeenCalled()
+    f.runtime.dispose!('closed')
+  })
+
+  it('does not read oversized or unsupported binaries merely to show an unavailable preview', async () => {
+    for (const resource of [
+      { ...file, name: 'huge.pdf', mime: 'application/pdf', kind: 'download' as const, size: 31 * 1024 * 1024 },
+      { ...file, name: 'archive.zip', mime: 'application/zip', kind: 'download' as const, size: 100 },
+    ]) {
+      const f = await setupFile({}, resource)
+      expect(f.read).not.toHaveBeenCalled()
+      expect(f.readPage).not.toHaveBeenCalled()
+      expect(f.state.errorKey).toBe(resource.name.endsWith('pdf') ? 'workbench.artifactPreview.tooLarge' : 'workbench.artifactPreview.unsupported')
+      f.runtime.dispose!('closed')
+    }
+  })
+
   it('previews a complete ordinary HTML file with child authority and preserves its paged source', async () => {
     const htmlFile: WorkspaceFile = { ...file, requestedPath: 'review.html', path: 'review.html', name: 'review.html',
       mime: 'text/html', size: 1200 }

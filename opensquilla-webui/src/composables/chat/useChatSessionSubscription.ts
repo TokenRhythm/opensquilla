@@ -238,10 +238,12 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     // reset may release that latch.  Its idempotent replay must still inherit
     // the Stop intent and abort the exact accepted task once the receipt exists.
     applySessionRunState(effectiveSource)
-    // A pending inline interrupt is newer, stronger evidence than an idle
-    // subscription snapshot that raced with the approval request.
+    // Preserve an existing execution interrupted by a request that raced an
+    // idle snapshot. A standalone/recovered approval is not itself evidence
+    // of execution and must not manufacture a running task or elapsed clock.
     if (
       options.hasActiveInterrupt.value
+      && options.isStreaming.value
       && !LIVE_RUN_STATES.includes(options.runStatus.value.status)
     ) {
       options.runStatus.value = options.sessionRunStatus({

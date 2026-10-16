@@ -251,6 +251,8 @@ export type ArtifactPreviewOptions = {
   maxBytes?: number
   requireSameOrigin?: boolean
   acceptBlob?: (blob: Blob) => boolean
+  /** Retain validated bytes only for the lifetime of this preview owner. */
+  retainLoadedBlob?: boolean
 } & (
   | { artifact: () => ArtifactPayload; loadBlob?: never }
   | { artifact?: never; loadBlob: (signal: AbortSignal) => Promise<Blob> }
@@ -261,6 +263,8 @@ export interface ArtifactPreviewController {
   errorCode: Ref<ArtifactPreviewErrorCode>
   progress: Ref<number | null>
   objectUrl: ShallowRef<string>
+  /** Null unless explicitly retained, loaded, and not released/disposed. */
+  readLoadedBlob(): Blob | null
   load(): void
   retry(): void
   observe(el: Element | null): void

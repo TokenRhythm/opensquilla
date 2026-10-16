@@ -125,6 +125,7 @@
         >
           <Icon :name="store.maximized ? 'collapse' : 'expand'" :size="17" aria-hidden="true" />
         </button>
+        <slot name="collapse-control">
         <button
           v-if="layoutMode === 'split' && !allowEmpty"
           ref="closeButtonRef"
@@ -136,6 +137,7 @@
         >
           <Icon name="panel-right-close" :size="17" aria-hidden="true" />
         </button>
+        </slot>
       </div>
     </header>
     <div v-if="showToolbar" class="workbench-host__toolbar">
@@ -628,6 +630,14 @@ function emitSurfaceRect() {
   })
 }
 
+function focusReturnUnlessOwned() {
+  // App may have just moved the focused pane toggle into this chrome. Preserve
+  // that explicit focus handoff instead of replacing it with the Back button.
+  if (document.activeElement instanceof HTMLElement
+    && hostRef.value?.contains(document.activeElement)) return
+  returnButtonRef.value?.focus({ preventScroll: true })
+}
+
 watch(layoutMode, mode => {
   const focused = typeof document !== 'undefined' ? document.activeElement : null
   const focusWasInMain = focused instanceof Element && Boolean(focused.closest('.app-chat-pane'))
@@ -636,7 +646,7 @@ watch(layoutMode, mode => {
   if (mode === 'main-only' && focusWasInWorkbench) {
     void nextTick(() => emit('focus-return'))
   } else if (mode === 'single-pane' && focusWasInMain) {
-    void nextTick(() => returnButtonRef.value?.focus({ preventScroll: true }))
+    void nextTick(focusReturnUnlessOwned)
   } else if (mode === 'split' && focusWasOnReturn) {
     void nextTick(() => hostRef.value?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus({ preventScroll: true }))
   }
@@ -677,7 +687,7 @@ watch([hostRef, surfaceRef], () => {
 
 watch(shouldRender, (visible, previous) => {
   if (visible && !previous && layoutMode.value === 'single-pane') {
-    void nextTick(() => returnButtonRef.value?.focus({ preventScroll: true }))
+    void nextTick(focusReturnUnlessOwned)
   }
 })
 
@@ -774,6 +784,13 @@ onBeforeUnmount(() => {
 .workbench-presence-leave-active:not(.workbench-host--native) > .workbench-host__surface {
   width: var(--workbench-width);
   flex-shrink: 0;
+}
+/* Content can keep its settled width during the reveal, but the pane's chrome
+   stays anchored to its outer edge so its collapse control never slides offscreen. */
+.workbench-host--layout-motion > .workbench-host__chrome,
+.workbench-presence-enter-active > .workbench-host__chrome,
+.workbench-presence-leave-active > .workbench-host__chrome {
+  align-self: flex-end;
 }
 .workbench-presence-enter-from,
 .workbench-presence-leave-to { flex-basis: 0; width: 0; opacity: 0; }
@@ -928,7 +945,13 @@ onBeforeUnmount(() => {
 }
 
 /* Keep tabs and actions on one aligned row. Rare actions live in the menu. */
-.workbench-host__tab-close { opacity: 0; width: 24px; }
+.workbench-host__tab-close {
+  opacity: 0;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+  border-radius: var(--radius-xs);
+}
 .workbench-host__tab-wrap:hover .workbench-host__tab-close,
 .workbench-host__tab-wrap:focus-within .workbench-host__tab-close { opacity: 1; }
 .workbench-host__tab-spinner { flex: 0 0 auto; animation: workbench-tab-spin 1s linear infinite; }

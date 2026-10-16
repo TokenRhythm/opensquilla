@@ -40,6 +40,7 @@ function setup() {
   threadElement.scrollTop = 412
   const releaseHandoff = vi.fn()
   const list = {
+    messageAnchorId: (index: number) => `find-turn-${index}`,
     ensureMessageVisible: vi.fn<(index: number) => Promise<HTMLElement | null>>().mockResolvedValue(root),
     releaseEnsuredMessage: vi.fn(), messageIndexAtOffset: vi.fn(() => 0), scrollToMessage: vi.fn(),
     scrollToEnd: vi.fn(), getDistanceFromEnd: vi.fn(() => 200), hasPendingLayout: vi.fn(() => false),

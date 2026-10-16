@@ -253,8 +253,9 @@
           @open-approval="openBlockedApprovalSession"
         />
         <WorkbenchToggle
+          v-if="!workbenchToggleInPanel"
           :enabled="appStore.features.artifactWorkbench === true && isChatRoute"
-          :presentation-visible="workbenchVisible && effectiveWorkbenchLayout !== 'main-only'"
+          :presentation-visible="false"
           allow-empty
           :session-id="workbenchSessionKey"
           :blocked="workbenchModalBlocked"
@@ -324,7 +325,18 @@
           && chatRouteHeader.model.workspaceReady.value"
         :workspace-resolved="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
           && chatRouteHeader.model.workspaceResolved.value"
-      />
+      >
+        <template #collapse-control>
+          <WorkbenchToggle
+            v-if="workbenchToggleInPanel"
+            :enabled="appStore.features.artifactWorkbench === true && isChatRoute"
+            :presentation-visible="true"
+            allow-empty
+            :session-id="workbenchSessionKey"
+            :blocked="workbenchModalBlocked"
+          />
+        </template>
+      </AppWorkbench>
       <ArtifactImageLightbox />
     </div>
   </div>
@@ -638,6 +650,17 @@ const effectiveWorkbenchLayout = computed(() => workbenchLayoutMode({
 }))
 const workbenchSinglePane = computed(() => workbenchVisible.value
   && effectiveWorkbenchLayout.value === 'single-pane')
+// The pane owns its collapse affordance. When responsive layout yields back to
+// the conversation, its expand affordance returns to the main header instead.
+const workbenchToggleInPanel = computed(() => workbenchVisible.value
+  && effectiveWorkbenchLayout.value !== 'main-only')
+watch(workbenchToggleInPanel, () => {
+  if (!(document.activeElement instanceof HTMLElement)
+    || !document.activeElement.matches('[data-testid="topbar-workbench-toggle"]')) return
+  void nextTick(() => workspaceRef.value?.querySelector<HTMLElement>(
+    '[data-testid="topbar-workbench-toggle"]',
+  )?.focus({ preventScroll: true }))
+})
 const workbenchMotionEnabled = ref(false)
 const workbenchLayoutMotion = ref(false)
 const mainPaneHidden = computed(() => workbenchSinglePane.value && !workbenchLayoutMotion.value)

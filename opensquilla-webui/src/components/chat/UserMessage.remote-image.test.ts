@@ -13,6 +13,7 @@ import { reconcileHistoryMessages } from '@/utils/chat/historyMerge'
 import { useChatRenderedMessages } from '@/composables/chat/useChatRenderedMessages'
 import { httpBinaryResponse, httpTransportTestDouble, type TestHttpTransport } from '@/testing/httpTransport.test-helper'
 import UserMessage from './UserMessage.vue'
+import type { AttachmentImagePreviewSource } from '@/composables/chat/useArtifactImageLightbox'
 
 const apps: App[] = []
 const sessionKey = 'agent:main:webchat:synthetic-image'
@@ -36,13 +37,14 @@ async function mount(initial = message()) {
   const current = ref(initial)
   const session = ref(sessionKey)
   const downloadAttachment = vi.fn(async () => true)
+  const previewImage = vi.fn<(attachment: DisplayAttachment, source?: AttachmentImagePreviewSource) => void>()
   const host = document.createElement('div')
   document.body.append(host)
   const app = createApp({ setup: () => () => h(UserMessage, {
     message: current.value, sessionKey: session.value, shareMode: false,
     shareSelected: false, shareMessageId: 'user-1',
     stripTimePrefix: (value: string) => value,
-    copyMessage: async () => true, downloadAttachment,
+    copyMessage: async () => true, downloadAttachment, onPreviewImage: previewImage,
   }) })
   const http = httpTransportTestDouble({ requestBinary })
   app.provide(ARTIFACT_WORKBENCH_KEY, {
@@ -52,7 +54,7 @@ async function mount(initial = message()) {
   app.mount(host)
   apps.push(app)
   await nextTick()
-  return { current, session, host, downloadAttachment, unmount: () => {
+  return { current, session, host, downloadAttachment, previewImage, unmount: () => {
     apps.splice(apps.indexOf(app), 1)
     app.unmount()
   } }
@@ -76,6 +78,21 @@ afterEach(() => {
 })
 
 describe('UserMessage remote attachment thumbnails', () => {
+  it.each(['session', 'attachment', 'unmount'])('hands off only its current validated bytes and retires them after %s', async change => {
+    const view = await mount()
+    await vi.waitFor(() => expect(view.host.querySelector('img.msg-thumb')).not.toBeNull())
+    view.host.querySelector<HTMLButtonElement>('[aria-label="Open synthetic.png"]')!.click()
+    const [image, source] = view.previewImage.mock.calls[0]
+    expect(image.download_url).toBe(imageUrl)
+    expect(await source!.readBlob()!.text()).toBe('synthetic image')
+    expect(requestBinary).toHaveBeenCalledOnce()
+    if (change === 'session') view.session.value = 'another-session'
+    else if (change === 'attachment') view.current.value = message({ attachments: [attachment({ download_url: imageUrl.replace('r1', 'r2') })] })
+    else view.unmount()
+    await nextTick()
+    expect(source!.readBlob()).toBeNull()
+  })
+
   it.each([false, true])('shows canonical missing metadata with usable URL=%s without revoking read actions', async hasUrl => {
     const missing = normalizeDisplayAttachments([{ name: 'synthetic.png', mime: 'image/png',
       missing_reason: 'attachment preview unavailable', ...(hasUrl ? { download_url: imageUrl } : {}),

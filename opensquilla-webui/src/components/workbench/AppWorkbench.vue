@@ -31,6 +31,9 @@
     @focus-return="restoreWorkbenchFocus"
     @surface-rect="onSurfaceRect"
   >
+    <template v-if="$slots['collapse-control']" #collapse-control>
+      <slot name="collapse-control" />
+    </template>
     <template #title="{ item }">
       <span class="app-workbench__identity">
         <Icon
@@ -1584,16 +1587,24 @@ function performPanelSelection(
 
 function restoreWorkbenchFocus() {
   void nextTick(() => {
-    const candidates = document.querySelectorAll<HTMLElement>([
+    // Query in preference order: a combined selector sorts by DOM position,
+    // which lets an earlier Deliverables button steal the pane toggle's focus.
+    const selectors = [
       '[data-testid="topbar-workbench-toggle"]',
       '[data-testid="chat-session-action-workbench"]',
       '[data-testid="chat-header-primary-action"][data-action="workbench"]',
       '[data-testid="chat-session-action-deliverables"]',
       '[data-testid="chat-header-primary-action"][data-action="deliverables"]',
       '.chat-textarea',
-    ].join(','))
-    const target = [...candidates].find(element => element.getClientRects().length > 0)
-    target?.focus({ preventScroll: true })
+    ]
+    for (const selector of selectors) {
+      const target = [...document.querySelectorAll<HTMLElement>(selector)].find(element =>
+        element.getClientRects().length > 0 && !element.closest('[inert], [aria-hidden="true"]')
+        && !element.matches(':disabled'))
+      if (!target) continue
+      target.focus({ preventScroll: true })
+      return
+    }
   })
 }
 

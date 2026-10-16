@@ -11,6 +11,8 @@ export interface ChatViewportSnapshot {
 
 /** Product-facing operations; measurement and range state belong to TanStack. */
 export interface ChatMessageListVirtualizer {
+  /** Unique to this rendered list, including when a main and side coexist. */
+  messageAnchorId: (index: number) => string
   ensureMessageVisible: (index: number) => Promise<HTMLElement | null>
   ensureMessageContentVisible?: (index: number) => Promise<HTMLElement | null>
   messageBodyText?: (index: number) => string

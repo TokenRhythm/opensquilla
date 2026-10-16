@@ -29,7 +29,7 @@ function harness() {
       sessionKey, approvalCenter: center, conversationEvents: events.events, gatewayAvailability: ref('available'),
       clarificationSubmission: { submit } as never, interruptState: state,
       runStatus: ref({ status: 'idle', label: '', task: null }),
-      stream: { isStreaming: ref(true), appendInterruptFrame: append, ensureInterruptBubble: vi.fn() },
+      stream: { appendInterruptFrame: append },
     }))!
     const unsubscribe = api.subscribe()
     cleanups.push(() => { unsubscribe(); api.cleanup(); scope.stop() })

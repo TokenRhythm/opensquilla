@@ -47,6 +47,32 @@ beforeEach(() => {
 afterEach(() => { apps.splice(0).forEach(app => app.unmount()); document.body.innerHTML = ''; vi.restoreAllMocks() })
 
 describe('TextPart workspace files', () => {
+  it.each(['main', 'side'])('opens non-text document/media links from %s in the shared Workbench rather than the limited modal', async kind => {
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const store = useWorkbenchStore(pinia)
+    const openItem = vi.spyOn(store, 'openItem').mockReturnValue(true)
+    const sessionKey = kind === 'main' ? 'parent' : 'child'
+    const resources: WorkspaceFile[] = [
+      ['report.pdf', 'application/pdf'], ['report.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+      ['song.mp3', 'audio/mpeg'], ['clip.mp4', 'video/mp4'],
+    ].map(([name, mime]) => ({ ...file, requestedPath: name!, path: name!, name: name!, mime: mime!, kind: 'download' }))
+    const read = vi.fn()
+    const { root } = await mount({ resolve: vi.fn().mockResolvedValue(resources), read }, true, {
+      sessionKey, ownerSessionKey: 'parent', text: resources.map(resource => `[${resource.name}](${resource.path})`).join('\n\n'),
+    })
+    await vi.waitFor(() => expect(root.querySelectorAll('button.workspace-file-link')).toHaveLength(4))
+    for (const [index, link] of [...root.querySelectorAll<HTMLButtonElement>('button.workspace-file-link')].entries()) {
+      link.click()
+      expect(openItem).toHaveBeenLastCalledWith(expect.objectContaining({
+        scope: { type: 'session', id: 'parent' }, payload: { file: resources[index], sessionKey },
+      }))
+    }
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    expect(read).not.toHaveBeenCalled()
+    setActivePinia(undefined)
+  })
+
   it.each(['main', 'side'])('resolves relative Markdown in the %s session and opens under its visible owner', async kind => {
     const pinia = createPinia()
     setActivePinia(pinia)

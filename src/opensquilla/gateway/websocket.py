@@ -1628,6 +1628,15 @@ class WsConnection:
             or flow.dirty_revision(key) != dirty_revision
         ):
             raise SnapshotTransferError("SNAPSHOT_STALE")
+        pending = self._pending_replays.get(key)
+        if pending is not None and pending.transfer is transfer:
+            # A lost resume reply does not retire its bounded replay. Reusing
+            # the exact installation keeps its ACK owner and progress; starting
+            # again would duplicate the first batch and fill a v2 lane window.
+            # The identity/dirty checks above still fence obsolete receipts.
+            if pending.params != params or pending.dirty_revision != dirty_revision:
+                raise SnapshotTransferError("SNAPSHOT_STALE")
+            return dict(pending.proof)
         replay = get_session_streams().replay(
             key, params["stream_seq"], params["stream_generation"],
         )

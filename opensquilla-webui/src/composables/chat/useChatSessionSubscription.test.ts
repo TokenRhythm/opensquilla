@@ -654,6 +654,21 @@ describe('useChatSessionSubscription domain lease', () => {
     expect(subject.onAuthoritativeIdle).toHaveBeenCalledOnce()
   })
 
+  it('keeps a standalone approval actionable without promoting idle metadata into execution', async () => {
+    const subject = harness(leaseFixture().lease, {
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(true),
+    })
+
+    await expect(subject.api.subscribeSession()).resolves.toMatchObject({ authoritative: true, live: true })
+
+    expect(subject.startStreaming).not.toHaveBeenCalled()
+    expect(subject.resetStreamLiveTurnState).not.toHaveBeenCalled()
+    expect(subject.runStatus.value.status).toBe('idle')
+    expect(subject.isStreaming.value).toBe(false)
+    expect(subject.activeStreamTaskId.value).toBe('')
+  })
+
   it('clears a stale exact Stop after a complete current idle read, without requiring its terminal row', async () => {
     const taskOwnership = useChatTaskOwnership()
     taskOwnership.noteRunning('task-A')

@@ -1,7 +1,7 @@
 <template>
   <template v-for="segment in segments" :key="segment.key">
     <VisualizeCanvas v-if="segment.receipt" :receipt="segment.receipt" :session-key="sessionKey" />
-    <div v-else v-html="segment.html" />
+    <div v-else class="visualize-body__text" v-html="segment.html" />
   </template>
 </template>
 <script setup lang="ts">

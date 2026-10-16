@@ -25,6 +25,7 @@ import { useChatPlans } from './useChatPlans'
 import { useChatCompaction } from './useChatCompaction'
 import { useChatStream } from './useChatStream'
 import type { SkillLoadReceipt } from '@/types/skillLoads'
+import type { InterruptViewState } from '@/types/parts'
 import { isVisibleActivityStatusStep, projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
 
 function createHarness(options: {
@@ -1220,6 +1221,39 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
 })
 
 describe('useChatRpcEventHandlers live snapshot restoration', () => {
+  it.each([false, true])('retains pending approvals across same-session snapshot replacement (running=%s)', running => {
+    const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map([
+      ['pending-approval', { resolution: null, busy: false, error: '' }],
+      ['settled-approval', { resolution: 'denied', busy: false, error: '' }],
+    ]))
+    const stream = useChatStream({
+      messages: ref<ChatMessage[]>([]), lastHeaderRole: ref(''), aborted: ref(false), autoScroll: ref(false),
+      interruptState, applySessionRunState: vi.fn(), renderMarkdown: text => text,
+      stripDirectiveTags: text => text, stripGeneratedArtifactMarkers: text => text, scrollToBottom: vi.fn(),
+    })
+    const h = createHarness({ stream })
+    try {
+      for (const approvalId of ['pending-approval', 'settled-approval']) {
+        stream.appendInterruptFrame({ interruptKind: 'approval', approvalId, at: Date.now(), data: {
+          approvalId, namespace: 'exec', toolName: 'shell', command: 'echo marker',
+          approvalKind: '', args: null, warning: '', agent: 'main', sessionKey: h.sessionKey.value, deadline: 0,
+        } })
+      }
+      h.api.restoreLiveTurnSnapshot({
+        sessionKey: h.sessionKey.value, taskId: running ? 'restored-task' : null,
+        events: running ? [{ semanticKind: 'text-delta', payload: {
+          key: h.sessionKey.value, task_id: 'restored-task', text: 'restored answer',
+        } }] : [],
+      })
+      expect(stream.foldedTurn.value.parts.filter(part => part.type === 'interrupt'))
+        .toMatchObject([{ approval: { approvalId: 'pending-approval' }, resolution: null }])
+      expect(stream.isStreaming.value).toBe(running)
+      // Session retirement remains a full reset, never a cross-session carry.
+      stream.resetLiveTurnState()
+      expect(stream.foldedTurn.value.parts).toEqual([])
+    } finally { h.stop(); stream.cleanup() }
+  })
+
   it.each(['state-changed', 'thinking-delta', 'run-heartbeat', 'text-delta'] as const)(
     'preserves a detached reader when an early %s event opens the live reducer', semanticKind => {
       const autoScroll = ref(false)

@@ -112,7 +112,7 @@ export interface ChatRpcStreamApi {
     finalText: string | null | undefined,
     modelCallSegments?: ChatModelCallSegment[] | null,
   ) => void
-  resetLiveTurnState?: () => void
+  resetLiveTurnState?: (options?: { preservePendingInterrupts?: boolean }) => void
   resetAnswerGeneration?: (options?: {
     textSnapshot?: string
     preserveCompletedTools?: boolean
@@ -901,7 +901,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     recoveryDirty = false
 
     steerDelivery.resetTransientBoundaries()
-    stream.resetLiveTurnState?.()
+    // Approval hydration is independent of this session's live snapshot and
+    // may finish first. Replacing the stream projection must not discard an
+    // actionable request; session/epoch retirement still uses a full reset.
+    stream.resetLiveTurnState?.({ preservePendingInterrupts: true })
     clearLiveThinking()
     clearGenerationTracking()
     pendingTerminalEvents.clear()
@@ -2258,6 +2261,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       eventKind === 'approval-requested'
     ) {
       if (!isCurrentSessionPayload(payloadObj)) return
+      // Approval requests can exist independently of a running conversation
+      // (for example a recovered request in the approval queue). They own an
+      // interrupt, not a task. Only mark an existing execution as interrupted;
+      // otherwise an unscoped request leaves the composer locked forever after
+      // resolution, since no task terminal event will follow it.
+      if (!stream.isStreaming.value && !options.taskOwnership?.runningTaskId.value) return
+      if (!isCurrentTaskPayload(payloadObj)) return
       options.applySessionRunState({
         run_status: 'approval_pending',
         active_task: { ...(payloadObj || {}), status: 'approval_pending' },

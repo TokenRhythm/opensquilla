@@ -99,9 +99,13 @@
 :is(.msg-ai-text, .activity-narration) h6,
 .inspect-msg__text h6 { font-size: 0.9em; color: var(--text-muted); }
 
-/* The surrounding activity/answer owns separation between semantic blocks. */
+/* The surrounding activity/answer owns separation between semantic blocks.
+   Visualize wraps settled prose segments; keep the outer prose boundary
+   identical to streaming text without removing spacing around inner canvases. */
+.msg-ai-text > .visualize-body__text:first-child > :first-child,
 :is(.msg-ai-text, .activity-narration) > :first-child,
 .inspect-msg__text > :first-child { margin-top: 0; }
+.msg-ai-text > .visualize-body__text:last-child > :last-child,
 :is(.msg-ai-text, .activity-narration) > :last-child { margin-bottom: 0; }
 
 /* KaTeX rendered math — match message text color and keep wide formulas usable. */

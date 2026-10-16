@@ -18,6 +18,40 @@ afterEach(() => {
 })
 
 describe('createArtifactPreview', () => {
+  it('retains validated bytes only when requested and clears them on release or disposal', async () => {
+    const blob = new Blob(['image'], { type: 'image/png' })
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:retained-preview')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    const http = httpTransport(vi.fn())
+    const retained = createArtifactPreview(http, {
+      loadBlob: async () => blob, retainLoadedBlob: true, acceptBlob: value => value.type === 'image/png',
+    })
+    expect(retained.readLoadedBlob()).toBeNull()
+    retained.load()
+    await vi.waitFor(() => expect(retained.state.value).toBe('loaded'))
+    expect(retained.readLoadedBlob()).toBe(blob)
+    retained.release()
+    expect(retained.readLoadedBlob()).toBeNull()
+    retained.load()
+    await vi.waitFor(() => expect(retained.state.value).toBe('loaded'))
+    retained.dispose()
+    expect(retained.readLoadedBlob()).toBeNull()
+
+    const ordinary = createArtifactPreview(http, { loadBlob: async () => blob })
+    ordinary.load()
+    await vi.waitFor(() => expect(ordinary.state.value).toBe('loaded'))
+    expect(ordinary.readLoadedBlob()).toBeNull()
+    ordinary.dispose()
+
+    const rejected = createArtifactPreview(http, {
+      loadBlob: async () => blob, retainLoadedBlob: true, acceptBlob: () => false,
+    })
+    rejected.load()
+    await vi.waitFor(() => expect(rejected.state.value).toBe('error'))
+    expect(rejected.readLoadedBlob()).toBeNull()
+    rejected.dispose()
+  })
+
   it('derives the sanitized endpoint and scope for the private transport', async () => {
     const blob = new Blob(['image-bytes'], { type: 'image/png' })
     const response: TestHttpBinaryResponse = {

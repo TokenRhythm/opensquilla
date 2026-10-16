@@ -1,12 +1,13 @@
 import type { WorkspaceReferences } from '@/modules/workspaceReferences'
 import { WorkspaceReferenceError, workspaceReferenceErrorKey } from '@/modules/workspaceReferences'
 import type { WorkspaceFiles } from '@/modules/workspaceFiles'
-import { WorkspaceFilesChangedError } from '@/modules/workspaceFiles'
+import { WorkspaceFilesChangedError, WorkspaceTextLimitError } from '@/modules/workspaceFiles'
 import { workspaceFilePayload, workspaceFileReference, workspaceFileSessionKey } from '@/workbench/workspaceFileItems'
 import type { WorkbenchItem, WorkbenchPanelDefinition, WorkbenchPanelRuntime, WorkbenchRuntimeContext } from '@/workbench/types'
 import WorkspaceFilePanel from './WorkspaceFilePanel.vue'
 import { copyTextWithFallback } from '@/utils/browser'
 import { resourcePreviewKind, resourcePreviewLimit } from '@/workbench/resourcePreview'
+import { completeWorkspaceMarkdown, isWorkspaceMarkdown, WORKSPACE_MARKDOWN_PREVIEW_LIMIT } from '@/workbench/workspaceTextPreview'
 
 interface WorkspaceFileViewSnapshot {
   relativePath: string
@@ -174,6 +175,9 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
   }
   private errorKey(error: unknown) {
     if (error instanceof WorkspaceFilesChangedError) return 'workbench.workspaceFiles.changed'
+    if (error instanceof WorkspaceTextLimitError) return error.limit === 'line'
+      ? 'workbench.workspaceFiles.textLineLimit' : 'workbench.workspaceFiles.textPageLimit'
+    if (error instanceof Error && ['workbench.artifactPreview.tooLarge', 'workbench.artifactPreview.unsupported'].includes(error.message)) return error.message
     return error instanceof Error && error.message.startsWith('workspaceReference.')
       ? error.message : workspaceReferenceErrorKey(error)
   }
@@ -184,10 +188,13 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
     const reference = workspaceFileReference(item)
     const file = workspaceFilePayload(item)
     const previewKind = file ? resourcePreviewKind(file) : 'source'
-    const canPreviewHtml = file && previewKind === 'html' && file.size <= resourcePreviewLimit('html')
-    let previewBlob = !reset && canPreviewHtml
+    const richPreview = previewKind !== 'source' && previewKind !== 'unsupported'
+    const canPreviewResource = file && richPreview && file.size <= resourcePreviewLimit(previewKind)
+    const markdown = file?.kind === 'text' && isWorkspaceMarkdown(file)
+    let previewBlob = !reset && canPreviewResource
       ? this.context.getRenderState().previewBlob as Blob | null : null
-    let previewErrorKey = file && previewKind === 'html' && !canPreviewHtml
+    let previewErrorKey = file && ((richPreview && !canPreviewResource)
+      || (markdown && file.size > WORKSPACE_MARKDOWN_PREVIEW_LIMIT))
       ? 'workbench.artifactPreview.tooLarge' : ''
     this.context.updateRenderState({ loading: false, errorKey: '', snapshot: null, copying: false,
       previewBlob, previewKind, previewErrorKey,
@@ -201,23 +208,47 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
     this.pending = request
     this.context.updateRenderState({ loading: true })
     try {
-      let snapshot: WorkspaceFileViewSnapshot
+      let snapshot: WorkspaceFileViewSnapshot | null = null
       if (reference && this.references) {
         snapshot = await this.references.read(workspaceFileSessionKey(item), reference, request.signal)
       } else if (file && this.files) {
-        if (file.kind !== 'text') throw new Error('workspaceReference.unsupported')
-        if (file.textPaging === true && this.files.readPage) {
-          snapshot = { ...(await this.files.readPage(
-            workspaceFileSessionKey(item), file, requestedStartLine, requestedStartLine + 199, request.signal,
-          )), paged: true, ...(focusLine ? { focusLine } : {}) }
+        if (file.kind !== 'text') {
+          if (!richPreview) throw new Error('workbench.artifactPreview.unsupported')
+          if (!canPreviewResource) throw new Error('workbench.artifactPreview.tooLarge')
+          previewBlob = await this.files.read(workspaceFileSessionKey(item), file, request.signal)
+          if (previewBlob.size > resourcePreviewLimit(previewKind)) throw new Error('workbench.artifactPreview.tooLarge')
+        } else if (markdown && file.size <= WORKSPACE_MARKDOWN_PREVIEW_LIMIT) {
+          try {
+            const blob = await this.files.read(workspaceFileSessionKey(item), file, request.signal)
+            snapshot = await completeWorkspaceMarkdown(file.path, blob)
+          } catch (error) {
+            if (!this.current(request)) return
+            if (error instanceof WorkspaceFilesChangedError || error instanceof WorkspaceReferenceError) throw error
+            previewErrorKey = error instanceof Error && error.message === 'workbench.artifactPreview.tooLarge'
+              ? error.message : 'workbench.artifactPreview.unsupported'
+          }
+        }
+        if (!this.current(request)) return
+        if (file.kind === 'text' && !snapshot && file.textPaging === true && this.files.readPage) {
+          try {
+            snapshot = { ...(await this.files.readPage(
+              workspaceFileSessionKey(item), file, requestedStartLine, requestedStartLine + 199, request.signal,
+            )), paged: true, ...(focusLine ? { focusLine } : {}) }
+          } catch (error) {
+            // Source-line limits must not prevent a bounded complete HTML/CSV
+            // preview that works through the workspace tree. Authority failures
+            // still reject both presentations.
+            if (!canPreviewResource || !(error instanceof WorkspaceTextLimitError)) throw error
+            previewErrorKey = this.errorKey(error)
+          }
           if (!this.current(request)) return
-          // A source page is not a complete HTML document. Obtain the same
+          // A source page is not a complete document/table. Obtain the same
           // bounded full resource used by the workspace tree's shared preview.
-          if (canPreviewHtml && !previewBlob) {
+          if (canPreviewResource && !previewBlob) {
             try {
               const blob = await this.files.read(workspaceFileSessionKey(item), file, request.signal)
               if (!this.current(request)) return
-              if (blob.size <= resourcePreviewLimit('html')) previewBlob = blob
+              if (blob.size <= resourcePreviewLimit(previewKind)) previewBlob = blob
               else previewErrorKey = 'workbench.artifactPreview.tooLarge'
             } catch (error) {
               if (!this.current(request)) return
@@ -228,9 +259,10 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
               previewErrorKey = 'workbench.artifactPreview.unsupported'
             }
           }
-        } else {
+          if (!snapshot && !previewBlob) throw new Error('workspaceReference.unsupported')
+        } else if (file.kind === 'text' && !snapshot) {
           // Hosts without text paging retain the bounded, small-file fallback.
-          const limit = canPreviewHtml ? resourcePreviewLimit('html') : 2 * 1024 * 1024
+          const limit = canPreviewResource ? resourcePreviewLimit(previewKind) : 2 * 1024 * 1024
           if (file.size > limit) throw new Error('workspaceReference.unsupported')
           const blob = await this.files.read(workspaceFileSessionKey(item), file, request.signal)
           if (!this.current(request)) return
@@ -238,7 +270,7 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
           const content = await decodeText(blob)
           const totalLines = lineCount(content)
           snapshot = { relativePath: file.path, content, totalLines, startLine: 1, endLine: totalLines }
-          if (canPreviewHtml) previewBlob = blob
+          if (canPreviewResource) previewBlob = blob
         }
       } else {
         throw new Error('workspaceReference.unavailable')
@@ -280,13 +312,14 @@ export function createWorkspaceFileDefinition(
       return {
         title: file?.name || item.title,
         subtitle: file
-          ? `${file.path} · ${formatType(file)} · ${formatSize(file.size)} · ${t('workspaceReference.readonly')}`
+          ? `${file.path} · ${formatType(file)} · ${formatSize(file.size)}${file.kind === 'text' ? ` · ${t('workspaceReference.readonly')}` : ''}`
           : t('workspaceReference.readonly'),
         icon: 'fileText',
       }
     },
     getToolbarItems: () => [{ kind: 'action', id: 'refresh', icon: 'refresh', label: t('workspaceReference.refresh') }],
-    getProps: (_item, state) => ({ ...state.runtimeState }),
+    getProps: (item, state) => ({ ...state.runtimeState,
+      file: workspaceFilePayload(item), sessionKey: workspaceFileSessionKey(item) }),
     createRuntime: (_item, context) => new WorkspaceFileRuntime(references, files, context),
   }
 }

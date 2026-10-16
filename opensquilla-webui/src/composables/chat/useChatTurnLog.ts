@@ -113,13 +113,21 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
     triggerSnapshot()
   }
 
-  function resetLog() {
+  function resetLog(optionsArg: { preservePendingInterrupts?: boolean } = {}) {
+    // Approval recovery can precede the first task event. Starting that task
+    // must not discard its still-actionable cards; settled cards and ordinary
+    // content belong to the previous turn and are cleared normally.
+    const pendingInterrupts = optionsArg.preservePendingInterrupts
+      ? acceptedFrames.filter(frame => frame.kind === 'interrupt'
+        && !options.interruptState?.value.get(frame.approvalId)?.resolution)
+      : []
     accumulator.reset()
     acceptedFrames = []
     appendIndex = 0
     acceptedActivityOrder = undefined
     snapshotDirty = true
     publishPending = false
+    for (const frame of pendingInterrupts) appendFrame(frame)
     refreshSnapshot()
     triggerSnapshot()
   }

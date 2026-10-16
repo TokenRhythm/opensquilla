@@ -1,7 +1,14 @@
 <template>
   <div class="workspace-file" data-testid="workspace-file-panel">
+    <div v-if="file && sessionKey" class="workspace-file__actions">
+      <WorkspaceResourceActions :session-key="sessionKey" :file="file" />
+    </div>
     <p v-if="loading" role="status">{{ t('workspaceReference.loading') }}</p>
-    <p v-else-if="errorKey" role="alert">{{ t(errorKey) }}</p>
+    <p v-else-if="errorKey" role="alert">{{ t(errorKey === 'workbench.artifactPreview.tooLarge' ? 'workbench.artifactPreview.tooLargeDetail' : errorKey) }}</p>
+    <template v-else-if="!snapshot && previewBlob && previewKind">
+      <p v-if="previewErrorKey" class="workspace-file__status" role="status">{{ t(previewErrorKey) }}</p>
+      <ResourcePreviewPanel :blob="previewBlob" :kind="previewKind" :name="file?.name || ''" />
+    </template>
     <template v-else-if="snapshot">
       <div class="workspace-file__toolbar">
         <div v-if="canPreview" class="workspace-file__modes">
@@ -28,7 +35,7 @@
       <p v-else-if="noMatches" class="workspace-file__status" role="status">{{ t('workspaceReference.noMatches') }}</p>
       <p v-if="searchErrorKey" class="workspace-file__status" role="alert">{{ t(searchErrorKey) }}</p>
       <p v-if="copyErrorKey" class="workspace-file__status" role="alert">{{ t(copyErrorKey) }}</p>
-      <p v-if="previewErrorKey" class="workspace-file__status" role="status">{{ t(previewErrorKey) }}</p>
+      <p v-if="previewErrorKey" class="workspace-file__status" role="status">{{ t(previewErrorKey === 'workbench.artifactPreview.tooLarge' ? 'workbench.artifactPreview.tooLargeDetail' : previewErrorKey) }}</p>
       <ResourcePreviewPanel v-if="mode === 'preview' && canPreviewResource && previewBlob"
         :blob="previewBlob" :kind="previewKind!" :name="snapshot.relativePath" />
       <div v-else-if="mode === 'preview' && canPreviewMarkdown" ref="markdownPreview" class="workspace-file__markdown artifact-preview__markdown chat-markdown" v-html="markdownHtml" />
@@ -56,7 +63,10 @@ import { useMarkdownEnhancements } from '@/composables/chat/useMarkdownEnhanceme
 import { highlightWorkspaceLines } from './workspaceSourceHighlight'
 import type { WorkspaceSourceSnapshot } from '@/modules/workspaceReferences'
 import type { ResourcePreviewKind } from '@/workbench/resourcePreview'
+import type { WorkspaceFile } from '@/modules/workspaceFiles'
+import { isWorkspaceMarkdown, WORKSPACE_MARKDOWN_PREVIEW_LIMIT } from '@/workbench/workspaceTextPreview'
 import ResourcePreviewPanel from './ResourcePreviewPanel.vue'
+import WorkspaceResourceActions from './WorkspaceResourceActions.vue'
 
 interface WorkspaceFileViewSnapshot {
   relativePath: string
@@ -70,6 +80,9 @@ interface WorkspaceFileViewSnapshot {
 }
 
 const props = defineProps<{
+  file?: WorkspaceFile | null
+  mime?: string
+  sessionKey?: string
   snapshot?: WorkspaceFileViewSnapshot | null
   previewBlob?: Blob | null
   previewKind?: ResourcePreviewKind
@@ -93,9 +106,10 @@ const jump = ref('')
 const toolsOpen = ref(false)
 const mode = ref<'preview' | 'source'>('preview')
 const canPreviewMarkdown = computed(() => Boolean(props.snapshot && !props.snapshot.reference
-  && /\.(md|markdown)$/i.test(props.snapshot.relativePath) && props.snapshot.startLine === 1
-  && props.snapshot.endLine >= props.snapshot.totalLines && props.snapshot.content.length <= 128_000))
-const canPreviewResource = computed(() => Boolean(props.previewBlob && props.previewKind === 'html' && !props.snapshot?.reference))
+  && isWorkspaceMarkdown({ name: props.snapshot.relativePath, mime: props.file?.mime || props.mime || '' }) && props.snapshot.startLine === 1
+  && props.snapshot.endLine >= props.snapshot.totalLines && props.snapshot.content.length <= WORKSPACE_MARKDOWN_PREVIEW_LIMIT))
+const canPreviewResource = computed(() => Boolean(props.previewBlob && props.previewKind
+  && !['source', 'unsupported'].includes(props.previewKind) && !props.snapshot?.reference))
 const canPreview = computed(() => canPreviewMarkdown.value || canPreviewResource.value)
 const markdownHtml = computed(() => canPreviewMarkdown.value && mode.value === 'preview'
   ? renderMarkdownCore(props.snapshot!.content, { images: 'placeholder' }) : '')
@@ -223,6 +237,7 @@ function copyContents() {
 <style scoped>
 .workspace-file { display: flex; flex-direction: column; height: 100%; min-width: 0; min-height: 0; overflow: hidden; background: var(--bg-surface); color: var(--text); }
 .workspace-file > p { padding: 12px; }
+.workspace-file__actions { display: flex; justify-content: flex-end; padding: 4px 12px; border-bottom: 1px solid var(--border); }
 .workspace-file__toolbar, .workspace-file__find, .workspace-file__footer { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; padding: 4px 12px; border-bottom: 1px solid var(--border); }
 .workspace-file__toolbar { min-height: 32px; }
 .workspace-file__spacer { flex: 1; }

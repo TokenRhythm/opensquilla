@@ -236,6 +236,75 @@ async def test_v2_replay_batches_converge_from_lane_delivery_ack(v2_connection):
     assert v2_connection.installed_snapshot_proof(receipt(payload)) is not None
 
 
+@pytest.fixture(params=["connection", "v2_connection"])
+def resumable_connection(request):
+    return request.getfixturevalue(request.param)
+
+
+async def test_pending_resume_retry_preserves_replay_owner_and_batch_progress(
+    resumable_connection,
+):
+    conn = resumable_connection
+    key = f"agent:main:resume-retry-{conn.conn_id}"
+    subscribe(conn, key)
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    for index in range(17):
+        get_session_streams().record(key, "session.event.text_delta", {"text": str(index)})
+    first = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert first.ok, first.error
+    pending = conn._pending_replays[key]
+    batch_count = 0
+    while key in conn._pending_replays:
+        await asyncio.sleep(0.01)
+        ids = set(pending.pending_delivery_ids)
+        batch_index = pending.batch_index
+        # Simulate an observer retry after a missing/late control reply, both
+        # before the first ACK and after later batches have started.
+        repeated = await request(conn, "sessions.messages.resume", receipt(payload))
+        assert repeated.ok, repeated.error
+        assert repeated.payload == first.payload
+        assert conn._pending_replays[key] is pending
+        assert pending.pending_delivery_ids == ids
+        assert pending.batch_index == batch_index
+        end = max(ids)
+        if conn._session_flow_v2_enabled:
+            lane_epoch = conn._flow.deliveries[end].lane_epoch
+            update = await request(conn, "transport.sessionFlow.update.v2", {
+                "connection_epoch": conn._flow.epoch,
+                "consumed": [{"subscription_epoch": lane_epoch, "through_delivery_id": end}],
+                "staged_recovery": [], "discarded_lanes": [],
+            })
+        else:
+            update = await request(conn, "transport.flow.update", {
+                "delivery_epoch": conn._flow.epoch, "ack_delivery_id": end,
+            })
+        assert update.ok, update.error
+        batch_count += 1
+        assert batch_count <= 3
+    assert batch_count == 3
+    assert conn.installed_snapshot_proof(receipt(payload)) == first.payload
+    replayed = [frame for frame in conn.ws.frames if frame.get("meta", {}).get("replayed")]
+    assert len(replayed) == 17
+
+
+async def test_pending_resume_retry_does_not_bypass_new_dirty_barrier(resumable_connection):
+    conn = resumable_connection
+    key = f"agent:main:resume-retry-dirty-{conn.conn_id}"
+    subscribe(conn, key)
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    get_session_streams().record(key, "session.event.text_delta", {"text": "tail"})
+    first = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert first.ok, first.error
+    pending = conn._pending_replays[key]
+    conn._mark_flow_dirty({"session_key": key})
+    repeated = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert not repeated.ok and repeated.error.code == "SNAPSHOT_STALE"
+    assert conn._pending_replays[key] is pending
+    assert conn.installed_snapshot_proof(receipt(payload)) is None
+
+
 async def test_replay_final_cas_rejects_output_arriving_during_consumption(
     connection, monkeypatch,
 ):

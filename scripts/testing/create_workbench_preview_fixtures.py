@@ -19,10 +19,12 @@ import importlib.util
 import io
 import json
 import math
+import os
 import shutil
 import struct
 import subprocess
 import wave
+import xml.etree.ElementTree as ET
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -87,10 +89,12 @@ def make_text(g: Gallery) -> None:
     g.text(
         "02-long-report.md",
         "\n".join(sections),
-        "source-paged",
+        "markdown",
         "text/markdown",
-        "Long Markdown tests source pagination and Unicode across page boundaries.",
-        limits="More than 200 lines; current UI uses paged source instead of partial Markdown.",
+        "Long Markdown defaults to a complete preview; Source retains pagination "
+        "and Unicode across page boundaries.",
+        limits="More than 200 lines but below the 128 KB full-Markdown render budget; "
+        "no partial rendered document.",
     )
     g.text(
         "03-data.json",
@@ -303,11 +307,46 @@ def make_images(g: Gallery) -> None:
     )
 
 
-def make_pdf(g: Gallery) -> None:
+def make_pdf(g: Gallery, font_path: Path | None = None) -> None:
     if not g.dependency("reportlab"):
         return
     from reportlab.lib.colors import HexColor
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFError, TTFont
     from reportlab.pdfgen import canvas
+
+    # A base PDF font silently replaces CJK characters with square glyphs.
+    # Embed an installed font for the Unicode probe; never download fonts.
+    candidates = (
+        [font_path]
+        if font_path
+        else [
+            Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts/simhei.ttf",
+            Path("/usr/share/fonts/truetype/arphic/ukai.ttc"),
+        ]
+    )
+    unicode_font = None
+    probe = "合成报告：中文分页测试"
+    for candidate in candidates:
+        if candidate is None or not candidate.is_file():
+            continue
+        try:
+            font = TTFont("FixtureCJK", str(candidate))
+            if not all(ord(char) in font.face.charWidths for char in probe):
+                continue
+            pdfmetrics.registerFont(font)
+            unicode_font = font.fontName
+            break
+        except (OSError, ValueError, TTFError):
+            continue
+    if not unicode_font:
+        g.skipped.append(
+            {
+                "producer": "pdf-cjk-probe",
+                "reason": "No installed embeddable CJK font; "
+                "pass --pdf-font to enable Unicode coverage",
+            }
+        )
 
     path = g.directory / "25-multipage.pdf"
     pdf = canvas.Canvas(str(path), pagesize=(595, 842), invariant=1)
@@ -319,6 +358,10 @@ def make_pdf(g: Gallery) -> None:
         pdf.drawString(
             48, 735, "All data is synthetic. Test page navigation, zoom and text selection."
         )
+        if unicode_font:
+            pdf.setFont(unicode_font, 14)
+            pdf.drawString(48, 710, probe)
+            pdf.setFont("Helvetica", 12)
         for row in range(12):
             y = 680 - row * 37
             pdf.setFillColor(HexColor("#eeeeee" if row % 2 == 0 else "#ffffff"))
@@ -333,10 +376,52 @@ def make_pdf(g: Gallery) -> None:
         path.name,
         "pdf",
         "application/pdf",
-        "Three pages with selectable text, zebra table and vector graphic.",
+        "Three pages with intrinsic selectable text, zebra table and vector graphic. "
+        + (
+            "Embedded CJK font: Chinese probe must render without square replacement glyphs."
+            if unicode_font
+            else "CJK coverage unavailable; see skipped producers."
+        ),
         limits="Offline PDF.js current-page rendering with pagination; "
         "visual fidelity is verified separately. Download remains available.",
     )
+
+
+def cache_synthetic_workbook_formulas(path: Path) -> None:
+    """Cache this fixture's known SUM results; this is not a formula evaluator.
+
+    openpyxl writes formulas with empty caches. Read-only viewers legitimately
+    render those cells blank until Excel recalculates them, masking whether the
+    preview can display cached formula values. Preserve formulas and add only the
+    four results computed from the synthetic numeric inputs.
+    """
+    sheet_path = "xl/worksheets/sheet1.xml"
+    namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    ns = {"s": namespace}
+    output = io.BytesIO()
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(output, "w") as destination:
+        sheet = ET.fromstring(source.read(sheet_path))
+        for row in range(2, 6):
+            cell = sheet.find(f".//s:c[@r='D{row}']", ns)
+            if cell is None or cell.findtext("s:f", namespaces=ns) != f"SUM(B{row}:C{row})":
+                raise ValueError(f"Unexpected synthetic formula in D{row}")
+            values = [
+                sheet.findtext(f".//s:c[@r='{column}{row}']/s:v", namespaces=ns) for column in "BC"
+            ]
+            if any(value is None for value in values):
+                raise ValueError(f"Missing synthetic formula input in row {row}")
+            cached = cell.find("s:v", ns)
+            if cached is None:
+                cached = ET.SubElement(cell, f"{{{namespace}}}v")
+            cached.text = str(sum(int(value) for value in values if value is not None))
+        for entry in source.infolist():
+            content = (
+                ET.tostring(sheet, encoding="utf-8", xml_declaration=True)
+                if entry.filename == sheet_path
+                else source.read(entry)
+            )
+            destination.writestr(entry, content)
+    path.write_bytes(output.getvalue())
 
 
 def make_office(g: Gallery) -> None:
@@ -458,8 +543,13 @@ def make_office(g: Gallery) -> None:
         notes.merge_cells("A1:D1")
         notes["A1"] = "合成多工作表测试 — Synthetic fixture"
         notes["A3"] = "Cells beginning with = below are intentional spreadsheet formulas."
-        notes["A4"] = "Formula caching and recalculation depend on the preview library."
-        workbook.save(g.directory / "28-workbook.xlsx")
+        notes["A4"] = "Summary formulas include known cached values: 46, 69, 92, 115."
+        notes["A5"] = (
+            "Read-only preview displays cached results; live recalculation is not required."
+        )
+        workbook_path = g.directory / "28-workbook.xlsx"
+        workbook.save(workbook_path)
+        cache_synthetic_workbook_formulas(workbook_path)
         g.add(
             "28-workbook.xlsx",
             "office",
@@ -467,8 +557,8 @@ def make_office(g: Gallery) -> None:
             "Three sheets: styled table, formulas, chart, dates, freeze panes "
             "and Unicode sheet name.",
             limits=(
-                "Formula cached results are absent in generated openpyxl files; "
-                "do not require Excel calculation parity."
+                "Summary D2:D5 must display cached formula results 46, 69, 92, 115. "
+                "Live formula recalculation and Excel calculation parity are not required."
             ),
         )
 
@@ -641,13 +731,15 @@ def make_invalid_payloads(g: Gallery) -> None:
         )
 
 
-def generate(output: Path, ffmpeg: str | None = None) -> dict[str, Any]:
+def generate(
+    output: Path, ffmpeg: str | None = None, pdf_font: Path | None = None
+) -> dict[str, Any]:
     # No overwrite option: a new directory is cheap and cannot erase user data.
     output.mkdir(parents=True, exist_ok=False)
     gallery = Gallery(output)
     make_text(gallery)
     make_images(gallery)
-    make_pdf(gallery)
+    make_pdf(gallery, pdf_font)
     make_office(gallery)
     make_media(gallery, ffmpeg)
     make_downloads(gallery)
@@ -687,8 +779,11 @@ def main() -> None:
         default=shutil.which("ffmpeg"),
         help="Optional FFmpeg executable; detected from PATH by default",
     )
+    parser.add_argument(
+        "--pdf-font", type=Path, help="Installed TTF/TTC with CJK glyphs to embed in the PDF probe"
+    )
     args = parser.parse_args()
-    manifest = generate(args.output.resolve(), args.ffmpeg)
+    manifest = generate(args.output.resolve(), args.ffmpeg, args.pdf_font)
     print(
         json.dumps(
             {

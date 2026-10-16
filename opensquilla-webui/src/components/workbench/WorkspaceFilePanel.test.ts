@@ -34,6 +34,32 @@ async function enter(input: HTMLInputElement, value: string) {
 }
 
 describe('workspace source panel', () => {
+  it('renders binary media with no source controls and preserves standalone actions on preview errors', async () => {
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:audio-test')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(() => {})
+    const { el, state } = await mount({
+      file: { requestedPath: 'song.mp3', path: 'song.mp3', name: 'song.mp3', mime: 'audio/mpeg',
+        size: 100, kind: 'download', workspaceBinding: 'binding', revision: 'revision' },
+      sessionKey: 'child', snapshot: null, previewBlob: new Blob(['media']), previewKind: 'audio',
+    })
+    await vi.waitFor(() => expect(el.querySelector('audio[controls]')).not.toBeNull())
+    expect(el.querySelector('.workspace-file__source, .workspace-file__modes, .workspace-file__footer')).toBeNull()
+    expect(el.querySelector('.workspace-resource-actions')).not.toBeNull()
+    state.errorKey = 'workspaceReference.unavailable'
+    await nextTick()
+    expect(el.querySelector('[role="alert"]')).not.toBeNull()
+    expect(el.querySelector('.workspace-resource-actions')).not.toBeNull()
+  })
+
+  it('keeps explicit Markdown line references in source even when complete text is available', async () => {
+    const { el } = await mount({ snapshot: { relativePath: 'README.md', content: '# Title\nDetails',
+      startLine: 1, endLine: 2, totalLines: 2, reference: {} as WorkspaceSourceSnapshot['reference'] } })
+    expect(el.querySelector('.workspace-file__markdown, .workspace-file__modes')).toBeNull()
+    expect(el.querySelector('.workspace-file__source')?.textContent).toContain('# Title')
+  })
+
   it('uses the shared sandboxed HTML preview and switches back to the existing source pages', async () => {
     const browserSettings = (window as unknown as { happyDOM: { settings: { disableIframePageLoading: boolean } } }).happyDOM.settings
     browserSettings.disableIframePageLoading = true
