@@ -1,6 +1,6 @@
-# Channel acceptance and restart-recovery test contracts
+# SQLite acceptance and recovery test contracts
 
-The two scenarios below verify cancellation ownership and restart recovery with
+The scenarios below verify cancellation ownership, restart recovery and workspace rejection with
 real SQLite. Their former two-second waits also measured database and runner
 speed, without a corresponding two-second product deadline. This change removes
 that test-only completion limit; it does not change a production timeout or
@@ -15,6 +15,14 @@ identify the physical cause of the earlier CI delays.
   notification wait. A later notification must produce one successful execution
   and the original durable task records, with no autonomous retry or leaked
   resident reservation.
+- `test_fork_revalidates_file_replacement_after_durable_acceptance` replaces the
+  project directory with a file only after the original acceptance commits.
+  It awaits the exact registered direct task and verifies no runner call, one
+  durable workspace error and one error terminal, then drains the owned registry
+  tasks and closes/joins the real SQLite resources. Its shared two-second helper
+  and all other project-workspace scenarios remain unchanged. Controls inject
+  slow real commits, stale-context validation bypass, duplicate error writes,
+  noncompletion at error persistence and noncompletion while closing SQLite.
 
 Each scenario owns one Python child and its SQLite/worker threads. The existing
 `tests/helpers/sqlite_process_probe.py` gives cold setup one bounded startup
