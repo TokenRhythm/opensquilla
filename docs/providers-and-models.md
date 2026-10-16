@@ -46,6 +46,7 @@ Direct provider examples:
 opensquilla configure provider --provider openai --model gpt-5.4-mini --api-key-env OPENAI_API_KEY
 opensquilla configure provider --provider anthropic --model claude-sonnet-4-5 --api-key-env ANTHROPIC_API_KEY
 opensquilla configure provider --provider gemini --model gemini-2.5-flash --api-key-env GEMINI_API_KEY
+opensquilla configure provider --provider requesty --model openai/gpt-4o-mini --api-key-env REQUESTY_API_KEY
 opensquilla configure provider --provider ollama --model llama3.1
 ```
 
@@ -90,9 +91,10 @@ This build exposes onboarding support for:
 - Baidu Qianfan
 - Volcengine Ark
 
-The provider registry may contain additional compatible providers for advanced
-or self-hosted setups. Use `opensquilla providers list` on your install for the
-current catalog.
+The provider registry also carries experimental OpenAI-compatible providers
+such as Requesty (`requesty`, `REQUESTY_API_KEY`, `https://router.requesty.ai/v1`)
+for advanced or self-hosted setups. Use `opensquilla providers list` on your
+install for the current catalog.
 
 ### OpenAI: `openai` vs `openai_responses`
 

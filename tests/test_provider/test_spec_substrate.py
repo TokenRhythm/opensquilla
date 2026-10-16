@@ -36,6 +36,9 @@ _CATALOG_SOURCE_WAIVERS: frozenset[str] = frozenset(
         # Hosted aggregator with no models.dev source mapped; the vendored
         # snapshot has never carried aihubmix rows.
         "aihubmix",
+        # Hosted aggregator with no models.dev source mapped; the vendored
+        # snapshot has never carried requesty rows.
+        "requesty",
         # Hosted aggregator not on models.dev; per-model metadata ships as
         # catalog_overrides.toml corrections. Mapping family sources
         # (deepseek, zhipuai, ...) here would vendor entire foreign tables
