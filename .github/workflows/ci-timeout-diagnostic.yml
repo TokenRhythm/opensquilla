@@ -1,0 +1,373 @@
+# Isolated diagnostic branch only. This does not replace or rerun PR 1921 CI.
+name: Windows timeout investigation
+'on':
+  push:
+    branches:
+    - diagnostics/1921-windows-timeouts-20261016
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CI_OPTIMIZATION_MODE: enforce
+  OPENSQUILLA_TESTING: 'true'
+jobs:
+  windows-timeout-investigation:
+    name: Timeout investigation (${{ matrix.shard }})
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - shard: core-2
+          workers: 4
+          plugin: opensquilla_ci_channel_timeout
+        - shard: gateway-sqlite-3
+          workers: 3
+          plugin: opensquilla_ci_gateway_timeout
+    env:
+      UV_PYTHON: 3.12.10
+      PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}/.github/scripts/timeout_diagnostics
+      OPENSQUILLA_TURN_CALL_LOG: '0'
+    steps:
+    - name: Prepare diagnostic report
+      shell: bash
+      run: |
+        set -euo pipefail
+        report_dir="${RUNNER_TEMP}/ci-timeout-reports/${{ matrix.shard }}"
+        mkdir -p "${report_dir}"
+        printf 'CI_REPORT_DIR=%s\n' "${report_dir}" >> "${GITHUB_ENV}"
+        {
+          printf 'runner_os=%s\n' "${RUNNER_OS}"
+          printf 'runner_arch=%s\n' "${RUNNER_ARCH}"
+          printf 'commit_sha=%s\n' "${GITHUB_SHA}"
+          printf 'run_attempt=%s\n' "${GITHUB_RUN_ATTEMPT}"
+          printf 'shard=%s\n' "${{ matrix.shard }}"
+        } > "${report_dir}/environment.txt"
+        printf 'pytest_status=not_started\n' > "${report_dir}/first-failure.txt"
+    - name: Check out repository
+      uses: actions/checkout@v4
+      with:
+        lfs: true
+        persist-credentials: false
+    - name: Configure runtime directories
+      shell: bash
+      run: |
+        printf 'OPENSQUILLA_STATE_DIR=%s/opensquilla-state\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+        printf 'OPENSQUILLA_LOG_DIR=%s/opensquilla-logs\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+        printf 'OPENSQUILLA_TIMEOUT_DIAG_DIR=%s/ci-timeout-diag/${{ matrix.shard }}\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22.23.3
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.12.10
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
+        version: 0.13.1
+    - name: Resolve native Git Bash
+      shell: pwsh
+      run: |
+        $candidates = @(
+          (Get-Command bash.exe -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Source -First 1),
+          "$env:ProgramFiles\Git\bin\bash.exe",
+          "$env:ProgramFiles\Git\usr\bin\bash.exe",
+          "${env:ProgramFiles(x86)}\Git\bin\bash.exe",
+          "${env:ProgramFiles(x86)}\Git\usr\bin\bash.exe",
+          "$env:LOCALAPPDATA\Programs\Git\bin\bash.exe",
+          "$env:LOCALAPPDATA\Programs\Git\usr\bin\bash.exe"
+        ) | Where-Object {
+          $_ -and (Test-Path -LiteralPath $_)
+        } | Select-Object -Unique
+
+        $probe = 'test -n "$BASH_VERSION" && case "$(uname -s 2>/dev/null)" in Linux*) exit 42;; esac && echo OPENSQUILLA_BASH_OK'
+        $diagnostics = [System.Collections.Generic.List[string]]::new()
+        foreach ($bash in $candidates) {
+          $output = (& $bash -lc $probe 2>&1 | Out-String).Trim()
+          $exitCode = $LASTEXITCODE
+          $diagnostics.Add("$bash => exit=$exitCode output=$output")
+          if ($exitCode -eq 0 -and $output -match 'OPENSQUILLA_BASH_OK') {
+            "OPENSQUILLA_BASH=$bash" |
+              Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            if ($env:CI_REPORT_DIR) {
+              "bash=$bash" |
+                Out-File -FilePath (Join-Path $env:CI_REPORT_DIR 'environment.txt') -Encoding utf8 -Append
+            }
+            exit 0
+          }
+        }
+
+        if ($env:CI_REPORT_DIR) {
+          "bash_candidates=$($candidates -join ';')" |
+            Out-File -FilePath (Join-Path $env:CI_REPORT_DIR 'environment.txt') -Encoding utf8 -Append
+          $diagnostics |
+            Out-File -FilePath (Join-Path $env:CI_REPORT_DIR 'bash-probe.txt') -Encoding utf8
+        }
+        throw "No verified native Git Bash found. Candidates: $($candidates -join '; ')"
+    - name: Verify PowerShell 7 for native shell contracts
+      if: ${{ matrix.shard == 'core' || startsWith(matrix.shard, 'core-') }}
+      shell: pwsh
+      run: |
+        if ($PSVersionTable.PSVersion.Major -lt 7) {
+          throw "Native shell contracts require PowerShell 7"
+        }
+        Get-Command pwsh -CommandType Application -ErrorAction Stop | Out-Null
+    - name: Set up Bun
+      if: ${{ startsWith(matrix.shard, 'core-') }}
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version-file: src/opensquilla/cli/tui/opentui/package/.bun-version
+    - name: Install OpenTUI host dependencies
+      if: ${{ startsWith(matrix.shard, 'core-') }}
+      shell: bash
+      run: bun install --frozen-lockfile --cwd=src/opensquilla/cli/tui/opentui/package
+    - name: Install dependencies
+      shell: bash
+      run: uv sync --extra dev --extra recommended --extra mcp --frozen
+    - name: Record tool versions
+      shell: bash
+      run: |
+        set -euo pipefail
+        {
+          python --version
+          uv --version
+          uv run pytest --version
+          node --version
+          node -p 'process.execPath'
+        } >> "${CI_REPORT_DIR}/environment.txt" 2>&1
+        uv run python -c "import asyncio, importlib.metadata, json, platform, sqlite3, sys, time; print(json.dumps({'python':sys.version,'sqlite':sqlite3.sqlite_version,'platform':platform.platform(),'clock_monotonic':vars(time.get_clock_info('monotonic')),'clock_perf_counter':vars(time.get_clock_info('perf_counter')),'loop_policy':type(asyncio.get_event_loop_policy()).__name__,'plugins':{name:importlib.metadata.version(name) for name in ['pytest','pytest-asyncio','pytest-xdist','anyio','syrupy','typeguard']}},indent=2))" >> "${CI_REPORT_DIR}/environment.txt" 2>&1
+    - name: Record Windows resource configuration
+      shell: pwsh
+      run: |
+        $inventory = [ordered]@{
+          os = Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber,OSArchitecture,TotalVisibleMemorySize
+          cpu = Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors
+          disks = Get-CimInstance Win32_DiskDrive | Select-Object Model,InterfaceType,MediaType,Size
+          image_os = $env:ImageOS
+          image_version = $env:ImageVersion
+        }
+        $inventory | ConvertTo-Json -Depth 5 | Out-File -FilePath (Join-Path $env:CI_REPORT_DIR 'windows-resource-configuration.json') -Encoding utf8
+    - name: Preflight offline test environment
+      shell: bash
+      env:
+        PLANNED_WINDOWS_SHARDS: '["core-1","core-2","gateway-sqlite-1","gateway-sqlite-2","gateway-sqlite-3","gateway-sqlite-4","recovery-migration-1","recovery-migration-2","desktop-installer-contracts-1","desktop-installer-contracts-2"]'
+      run: |
+        set -euo pipefail
+        uv run python -c "import pathlib, subprocess, sys, opensquilla; print('cwd:', pathlib.Path.cwd().resolve()); print('git:', subprocess.check_output(['git', 'rev-parse', '--show-toplevel', 'HEAD'], text=True).strip()); print('python:', sys.executable); print('package:', pathlib.Path(opensquilla.__file__).resolve())"
+        regression_args=()
+        shard="${{ matrix.shard }}"
+        family="${shard%-*}"
+        if [[ "${family}" == "desktop-installer-contracts" ]]; then
+          # Retain regression smoke for sibling partitions in this family.
+          regression_args+=(
+            tests/test_ci/test_architecture_import_contracts.py
+            tests/test_engine/turn_runner/test_stage_test_boundaries.py
+            tests/test_engine/test_runtime_artifacts.py
+            tests/test_engine/test_tool_concurrency.py
+            tests/test_engine/test_tokenjuice_tool_result_projection.py
+            tests/test_tools/test_tool_upgrade_compatibility.py
+            tests/test_gateway/test_goal_rpc.py
+            tests/test_tools/test_dispatch_legacy_coverage.py
+            tests/unit/cli/repl/test_slash_bridge.py
+          )
+        elif [[ "${family}" == "recovery-migration" ]]; then
+          regression_args+=(
+            tests/test_sandbox/test_windows_shell_process_runtime.py
+            tests/test_live_long_task_case_driver.py
+            tests/test_ci/test_upgrade_baselines.py
+            tests/test_engine/test_runtime_router_fallback.py
+          )
+        elif [[ "${family}" == "core" ]]; then
+          regression_args+=(
+            tests/test_cli/test_chat_cmd.py
+            tests/test_ci/test_windows_signatures.py
+            tests/test_tools/test_shell_process_isolation.py
+            tests/test_engine/test_cancelled_turn_segments.py
+            tests/test_tools/test_shell_workdir.py
+            tests/test_sandbox/test_shell_code_network_hints.py
+            tests/test_tools/test_shell_runtime_preflight.py
+            tests/test_tools/test_shell_blocking_launch.py
+            tests/test_ci/test_rpc_architecture_contracts.py
+            tests/test_skills/test_hub_management_service.py
+          )
+        elif [[ "${family}" == "gateway-sqlite" ]]; then
+          regression_args+=(
+            tests/test_gateway/test_native_attachment_import.py
+            tests/test_gateway/test_recovery_scheduler.py
+            tests/test_gateway/test_goal_user_input.py
+            tests/test_gateway/test_manual_compaction_contract.py
+            tests/test_gateway/test_sandbox_token_rpc_workers.py
+            tests/test_live_provider_profile_gateway_e2e.py
+          )
+        fi
+        # Preserve the original incident plan for preflight filtering.
+        # The diagnostic matrix runs only the two affected physical shards.
+        # Invalid/missing plans or failed inventory must stop before filtering.
+        if (( ${#regression_args[@]} )); then
+          owned_files=$(uv run python .github/scripts/windows_test_shards.py list "${shard}" --planned-windows-shards "${PLANNED_WINDOWS_SHARDS}" | tr -d '\r')
+          sibling_regressions=()
+          for path in "${regression_args[@]}"; do
+            if ! grep -Fxq -- "${path}" <<< "${owned_files}"; then
+              sibling_regressions+=("${path}")
+            fi
+          done
+          regression_args=("${sibling_regressions[@]}")
+        fi
+        # Windows workers hit access violations during timed stack dumps.
+        # Related frame-race report: python/cpython#140815. Disable only
+        # this diagnostic timer; keep fatal-error handling enabled.
+        uv run pytest \
+          tests/test_sandbox/test_trusted_sandbox_execution.py \
+          tests/test_tools/test_approval_unification.py \
+          tests/test_live_multi_provider_matrix.py \
+          tests/test_live_provider_profile_smoke.py \
+          "${regression_args[@]}" \
+          -vv --tb=short -o faulthandler_timeout=0 --maxfail=3 \
+          2>&1 | tee "${CI_REPORT_DIR}/preflight.log"
+    - name: Observe original Windows shard
+      shell: pwsh
+      run: |
+        $testScriptPath = Join-Path $env:CI_REPORT_DIR 'run-shard.sh'
+        $testScript = @'
+        set -euo pipefail
+        markers="not stress and not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
+        # Match the original PR/merge-group maxfail setting.
+        maxfail_args=(--maxfail=3)
+
+        worker_args=(--workers=${{ matrix.workers }})
+
+        # Pass the same timer override to both parallel and serial phases.
+        uv run python .github/scripts/windows_test_shards.py run \
+          "${{ matrix.shard }}" \
+          --junit "${CI_REPORT_DIR}/junit.xml" \
+          --summary "${CI_REPORT_DIR}/first-failure.txt" \
+          --metadata "${CI_REPORT_DIR}/windows-shard-metadata.json" \
+          "${worker_args[@]}" \
+          -- \
+          -p "${{ matrix.plugin }}" \
+          -vv --tb=short -o faulthandler_timeout=0 \
+          -m "${markers}" \
+          --durations=50 \
+          "${maxfail_args[@]}" \
+          2>&1 | tee "${CI_REPORT_DIR}/pytest.log"
+        '@
+        [System.IO.File]::WriteAllText($testScriptPath, $testScript, [System.Text.UTF8Encoding]::new($false))
+        $counterStop = Join-Path $env:CI_REPORT_DIR 'resource-sampler.stop'
+        $counterOutput = Join-Path $env:CI_REPORT_DIR 'windows-resource-samples.json'
+        $counterScript = Join-Path $env:GITHUB_WORKSPACE '.github/scripts/timeout_diagnostics/windows_resource_sampler.ps1'
+        $sampler = $null
+        $testExit = 1
+        try {
+          try {
+            $sampler = Start-Process -FilePath (Get-Command pwsh -CommandType Application).Source -WindowStyle Hidden -PassThru -ArgumentList @(
+              '-NoProfile', '-NonInteractive', '-File', "`"$counterScript`"",
+              '-StopFile', "`"$counterStop`"", '-OutputFile', "`"$counterOutput`""
+            ) -RedirectStandardOutput (Join-Path $env:CI_REPORT_DIR 'resource-sampler.stdout.log') -RedirectStandardError (Join-Path $env:CI_REPORT_DIR 'resource-sampler.stderr.log')
+          } catch {
+            $_.Exception.Message | Out-File -LiteralPath (Join-Path $env:CI_REPORT_DIR 'resource-sampler-start-error.txt') -Encoding utf8
+          }
+          & $env:OPENSQUILLA_BASH --noprofile --norc $testScriptPath
+          $testExit = $LASTEXITCODE
+        } finally {
+          [System.IO.File]::WriteAllText($counterStop, 'stop')
+          if ($null -ne $sampler -and -not $sampler.HasExited) {
+            if (-not $sampler.WaitForExit(10000)) {
+              $sampler.Kill()
+              $sampler.WaitForExit()
+              'Sampler did not stop within 10 seconds; stopped the owned child process.' |
+                Out-File -FilePath (Join-Path $env:CI_REPORT_DIR 'resource-sampler-cleanup.txt') -Encoding utf8
+            }
+          }
+        }
+        exit $testExit
+    - name: Report diagnostic completeness
+      if: ${{ always() }}
+      shell: pwsh
+      env:
+        DIAGNOSTIC_SHARD: ${{ matrix.shard }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $reportDirectory = Join-Path $env:RUNNER_TEMP "ci-timeout-reports/$env:DIAGNOSTIC_SHARD"
+        $traceDirectory = Join-Path $env:RUNNER_TEMP "ci-timeout-diag/$env:DIAGNOSTIC_SHARD"
+        New-Item -ItemType Directory -Force -Path $reportDirectory | Out-Null
+        $issues = [System.Collections.Generic.List[string]]::new()
+        $details = [System.Collections.Generic.List[string]]::new()
+        $target = if ($env:DIAGNOSTIC_SHARD -eq 'core-2') {
+          'tests/test_channels/test_channel_storage_worker.py::test_submitted_accept_cancellation_still_hands_off_exactly_once'
+        } else {
+          'tests/test_gateway/test_steer_restart_deferred.py::test_resumed_post_reservation_error_releases_lease_without_busy_retry'
+        }
+        try {
+          $foundTarget = $false
+          $traceFiles = @(Get-ChildItem -LiteralPath $traceDirectory -Filter '*.json' -File -ErrorAction SilentlyContinue)
+          foreach ($traceFile in $traceFiles) {
+            $trace = Get-Content -LiteralPath $traceFile.FullName -Raw | ConvertFrom-Json -AsHashtable
+            if ($trace['target'] -ne $target -and $trace['nodeid'] -ne $target) { continue }
+            $foundTarget = $true
+            $details.Add("trace=$($traceFile.Name) test_failed=$($trace['failed'])")
+            if ($trace['enabled'] -ne $true) { $issues.Add('probe enabled state missing or false') }
+            if (-not $trace.ContainsKey('diagnostic_errors') -or @($trace['diagnostic_errors']).Count -ne 0) {
+              $issues.Add('probe diagnostic_errors missing or nonempty')
+            }
+            if ($trace['patches_restored'] -ne $true) { $issues.Add('probe patches were not confirmed restored') }
+            if ($env:DIAGNOSTIC_SHARD -eq 'core-2' -and $trace['watchdog_stopped'] -ne $true) {
+              $issues.Add('channel watchdog was not confirmed stopped')
+            }
+            if ($env:DIAGNOSTIC_SHARD -eq 'gateway-sqlite-3' -and $trace['sampling_stopped'] -ne $true) {
+              $issues.Add('gateway sampling was not confirmed stopped')
+            }
+          }
+          if (-not $foundTarget) {
+            $issues.Add('target probe artifact missing; setup, collection or maxfail may have prevented execution')
+          }
+          foreach ($requiredReport in @('junit.xml', 'pytest.log', 'windows-shard-metadata.json')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $reportDirectory $requiredReport))) {
+              $issues.Add("missing original shard report: $requiredReport")
+            }
+          }
+          $junitPath = Join-Path $reportDirectory 'junit.xml'
+          if (Test-Path -LiteralPath $junitPath) {
+            [xml]$junit = Get-Content -LiteralPath $junitPath -Raw
+            $targetClass, $targetName = $target -split '::', 2
+            $targetClass = $targetClass.Replace('/', '.').Replace('.py', '')
+            $targetResults = @($junit.SelectNodes('//testcase') | Where-Object {
+              $_.classname -eq $targetClass -and $_.name -eq $targetName
+            })
+            if ($targetResults.Count -ne 1 -or $null -ne $targetResults[0].skipped) {
+              $issues.Add('JUnit does not confirm exactly one unskipped target execution')
+            } else { $details.Add('junit_target_executed=true') }
+          }
+          $samplerPath = Join-Path $reportDirectory 'windows-resource-samples.json'
+          if (Test-Path -LiteralPath $samplerPath) {
+            $samplerResult = Get-Content -LiteralPath $samplerPath -Raw | ConvertFrom-Json -AsHashtable
+            $details.Add("resource_samples=$(@($samplerResult['samples']).Count) stop_reason=$($samplerResult['stop_reason'])")
+            if (@($samplerResult['diagnostic_errors']).Count -ne 0 -or @($samplerResult['samples']).Count -eq 0) {
+              $issues.Add('host resource counter samples unavailable or incomplete')
+            }
+          } else { $issues.Add('host resource counter artifact missing') }
+        } catch {
+          $issues.Add('completeness inspection failed: ' + $_.Exception.Message)
+        }
+        $status = if ($issues.Count -eq 0) { 'COMPLETE' } else { 'INCOMPLETE' }
+        $lines = @("diagnostic_status=$status", "shard=$env:DIAGNOSTIC_SHARD", "target=$target") + $details.ToArray() + $issues.ToArray()
+        $lines | Out-File -LiteralPath (Join-Path $reportDirectory 'diagnostic-completeness.txt') -Encoding utf8
+        "### Timeout diagnostic completeness: $env:DIAGNOSTIC_SHARD ($status)" | Out-File -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+        $lines | ForEach-Object { "- $_" } | Out-File -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+        if ($issues.Count -gt 0) { Write-Output '::warning::Diagnostic evidence is incomplete; retain the original pytest result and inspect diagnostic-completeness.txt.' }
+    - name: Preserve timeout investigation evidence
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: timeout-investigation-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          ${{ runner.temp }}/ci-timeout-reports/${{ matrix.shard }}/
+          ${{ runner.temp }}/ci-timeout-diag/${{ matrix.shard }}/
+        if-no-files-found: error
+        retention-days: 14
