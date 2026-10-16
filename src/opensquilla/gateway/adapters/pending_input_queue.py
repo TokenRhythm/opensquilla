@@ -359,6 +359,10 @@ class GatewayPendingInputQueueAdapter:
                     "PENDING_INPUT_CONFLICT",
                     "A pending input id was reused for different content",
                 ),
+                "session-unavailable": (
+                    "PENDING_SESSION_UNAVAILABLE",
+                    "This conversation no longer accepts queued messages",
+                ),
             }
             code, message = codes[exc.reason]
             return RpcHandlerError(

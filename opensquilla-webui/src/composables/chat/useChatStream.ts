@@ -1,4 +1,4 @@
-import { compactionSkippedProviderFailure } from '@/utils/chat/compactionStatus'
+import { compactionActivityStatus } from '@/utils/chat/conversationActivity'
 import type { ProviderRecovery } from '@/types/parts'
 import { providerRecoveryIdentity } from '@/utils/chat/providerRecovery'
 import type {
@@ -435,41 +435,9 @@ export function useChatStream(options: UseChatStreamOptions) {
 
   function recordCompactionActivity(payload: ConversationCompactionContent) {
     noteStreamSignal()
-    const rawStatus = String(payload.status || '').toLowerCase()
-    const state = compactionSkippedProviderFailure(rawStatus, payload.reason || payload.skip_reason, payload.compactionFailure?.failureKind)
-      ? 'failed'
-      : rawStatus === 'skipped'
-      ? 'skipped'
-      : rawStatus === 'stale'
-        ? 'stale'
-        : rawStatus === 'cancelled'
-          ? 'cancelled'
-          : ['completed', 'emergency_ephemeral'].includes(rawStatus)
-            ? 'completed'
-            : ['failed', 'error', 'timed_out'].includes(rawStatus)
-              ? 'failed'
-              : 'running'
     const id = String(payload.compaction_id || 'current')
     const previous = foldedTurn.value.statusHistory.find(entry => entry.category === 'maintenance' && entry.id === id)
-    const recovery = state === 'running' ? payload.compactionRecovery ?? (previous?.state === 'running' ? previous.providerRecovery : undefined) : undefined
-    appendFrame({
-      kind: 'status',
-      action: 'context_compaction',
-      label: '',
-      at: Number(payload.emitted_at || payload.started_at || Date.now()),
-      id,
-      category: 'maintenance',
-      state,
-      source: String(payload.source || 'automatic'),
-      durability: rawStatus === 'emergency_ephemeral'
-        ? 'request_scoped'
-        : String(payload.durability || ''),
-      detail: String(payload.detail || payload.phase || ''),
-      reason: String(payload.reason || payload.skip_reason || ''),
-      providerRecovery: recovery,
-      httpStatus: state === 'failed' ? payload.compactionFailure?.httpStatus : state === 'running' ? recovery?.httpStatus : undefined,
-      failureKind: state === 'failed' ? payload.compactionFailure?.failureKind : undefined,
-    })
+    appendFrame({ kind: 'status', ...compactionActivityStatus(payload, previous) })
     scheduleRender()
   }
 

@@ -12,6 +12,7 @@ import type {
 } from '@/types/artifactDocuments'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { isOfficeArtifact } from '@/utils/chat/artifacts'
+import { isSourceTextFile } from '@/utils/textFilePreview'
 
 export type { ArtifactDocumentProvider } from '@/modules/artifactWorkbench'
 export { isOfficeArtifact } from '@/utils/chat/artifacts'
@@ -108,6 +109,7 @@ function legacyPreviewAvailable(artifact: ArtifactPayload): boolean {
     || mime === 'application/xhtml+xml'
     || mime === 'text/markdown'
     || mime === 'text/plain'
+    || isSourceTextFile(String(artifact.name || ''), mime)
     || ['htm', 'html', 'xhtml', 'pdf', 'md', 'markdown', 'txt', 'log'].includes(ext)
 }
 

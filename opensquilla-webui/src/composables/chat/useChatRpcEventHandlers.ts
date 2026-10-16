@@ -1,6 +1,6 @@
 import { compactionSkippedProviderFailure } from '@/utils/chat/compactionStatus'
 import type { ProviderRecovery } from '@/types/parts'
-import { normalizeProviderRecovery } from '@/utils/chat/providerRecovery'
+import { providerActivityStatus } from '@/utils/chat/conversationActivity'
 import { mergeSkillLoad, skillLoadsFromSegments, type SkillLoadReceipt } from '@/types/skillLoads'
 import type {
   ConversationAnswerReset,
@@ -243,26 +243,6 @@ const MAX_TRACKED_COMMITTED_TURNS = 64
 const TURN_COMMIT_TIMEOUT_MS = 5_000
 const SERVER_CLOCK_TOLERANCE_MS = 5_000
 const MAX_TRUSTED_REASONING_AGE_MS = 60 * 60 * 1_000
-const PROVIDER_ACTIVITY_PHASES = new Set([
-  'requesting',
-  'reasoning',
-  'retry_wait',
-  'retrying',
-  'fallback',
-])
-const PROVIDER_ACTIVITY_REASONS = new Set([
-  'initial',
-  'rate_limited',
-  'provider_overloaded',
-  'transport_transient',
-  'reasoning_only',
-  'empty_response',
-  'stream_incomplete',
-  'invalid_response',
-  'context_overflow',
-  'unknown',
-])
-
 const COMPACTION_TERMINAL_STATUSES = new Set([
   'completed',
   'skipped',
@@ -1746,12 +1726,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
   }
 
-  function providerActivityCounter(raw: unknown, maximum: number): number {
-    const value = Number(raw)
-    if (!Number.isFinite(value)) return 0
-    return Math.min(maximum, Math.max(0, Math.floor(value)))
-  }
-
   function handleRpcProviderActivity(payload: ConversationProviderActivity) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
@@ -1760,20 +1734,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
 
-    const phase = String(payload.phase || '')
-    const reason = String(payload.reason || 'unknown')
-    if (!PROVIDER_ACTIVITY_PHASES.has(phase)) return
-    const safeReason = PROVIDER_ACTIVITY_REASONS.has(reason) ? reason : 'unknown'
-    const attempt = providerActivityCounter(payload.retry_attempt, 10_000)
-    const limit = providerActivityCounter(payload.retry_limit, 10_000)
-    const retryAfterMs = providerActivityCounter(payload.retry_after_ms, 900_000)
-    const retryAfterSeconds = Math.ceil(retryAfterMs / 1000)
-    const recovery = normalizeProviderRecovery({
-      phase, reason: safeReason, activity_id: payload.activity_id, started_at: payload.started_at,
-      retry_attempt: payload.retry_attempt, retry_limit: payload.retry_limit, retry_after_ms: payload.retry_after_ms,
-      http_status: payload.httpStatus,
-      model: payload.model, from_model: payload.from_model,
-    })
+    const status = providerActivityStatus(payload)
+    if (!status) return
     const model = String(payload.model || '').trim()
     const turnId = String(payload.turn_id || payload.task_id || '').trim() || undefined
 
@@ -1782,28 +1744,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     options.markEnsembleHandoff(turnId)
     if (model) options.updateRouterExecutionModel?.(model, turnId)
 
-    if (phase === 'requesting') {
-      recordActivityPhase('Waiting for model', 'provider:requesting', recovery)
-    } else if (phase === 'reasoning') {
-      recordActivityPhase('Thinking deeply', 'provider:reasoning', recovery)
-    } else if (phase === 'retry_wait' && safeReason === 'rate_limited') {
-      recordActivityPhase(
-        `Rate limited · ${retryAfterSeconds}s`,
-        `provider:rate_limited:${retryAfterSeconds}`, recovery,
-      )
-    } else if (phase === 'retry_wait') {
-      recordActivityPhase(
-        `Waiting to retry · ${retryAfterSeconds}s`,
-        `provider:retry_wait:${retryAfterSeconds}`, recovery,
-      )
-    } else if (phase === 'retrying') {
-      recordActivityPhase(
-        limit > 0 ? `Retrying ${attempt}/${limit}` : `Retrying · attempt ${attempt}`,
-        `provider:retrying:${attempt}:${limit}`, recovery,
-      )
-    } else if (phase === 'fallback') {
-      recordActivityPhase('Switching to backup model', 'provider:fallback', recovery)
-    }
+    recordActivityPhase(status.label, status.action, status.providerRecovery)
   }
 
   function handleRpcCompaction(payload: ConversationCompactionContent, meta: ConversationEventContext = {}) {

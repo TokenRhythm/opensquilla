@@ -1,7 +1,7 @@
 import type { WorkspaceReferences } from '@/modules/workspaceReferences'
 import { workspaceReferenceErrorKey } from '@/modules/workspaceReferences'
 import type { WorkspaceFiles } from '@/modules/workspaceFiles'
-import { workspaceFilePayload, workspaceFileReference } from '@/workbench/workspaceFileItems'
+import { workspaceFilePayload, workspaceFileReference, workspaceFileSessionKey } from '@/workbench/workspaceFileItems'
 import type { WorkbenchItem, WorkbenchPanelDefinition, WorkbenchPanelRuntime, WorkbenchRuntimeContext } from '@/workbench/types'
 import WorkspaceFilePanel from './WorkspaceFilePanel.vue'
 import { copyTextWithFallback } from '@/utils/browser'
@@ -122,7 +122,7 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
       // Page snapshots are never used as the complete file's clipboard content.
       let content = snapshot.content
       if (file && this.files) {
-        const blob = await this.files.read(item.scope.id, file, request.signal)
+        const blob = await this.files.read(workspaceFileSessionKey(item), file, request.signal)
         if (!this.current(request)) return
         content = await decodeText(blob)
       }
@@ -152,14 +152,14 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
       if (!this.files?.search || !this.files.readPage || file.textPaging !== true) {
         throw new Error('workspaceReference.unavailable')
       }
-      const result = await this.files.search(item.scope.id, file, query, request.signal)
+      const result = await this.files.search(workspaceFileSessionKey(item), file, query, request.signal)
       if (!this.current(request)) return
       if (result.matchLine === null) {
         this.context.updateRenderState({ searchStatus: 'not-found' })
         return
       }
       const startLine = Math.floor((result.matchLine - 1) / 200) * 200 + 1
-      const page = await this.files.readPage(item.scope.id, file, startLine, startLine + 199, request.signal)
+      const page = await this.files.readPage(workspaceFileSessionKey(item), file, startLine, startLine + 199, request.signal)
       if (!this.current(request)) return
       this.context.updateRenderState({
         snapshot: { ...page, paged: true, focusLine: result.matchLine }, searchStatus: 'found',
@@ -193,17 +193,17 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
     try {
       let snapshot: WorkspaceFileViewSnapshot
       if (reference && this.references) {
-        snapshot = await this.references.read(item.scope.id, reference, request.signal)
+        snapshot = await this.references.read(workspaceFileSessionKey(item), reference, request.signal)
       } else if (file && this.files) {
         if (file.kind !== 'text') throw new Error('workspaceReference.unsupported')
         if (file.textPaging === true && this.files.readPage) {
           snapshot = { ...(await this.files.readPage(
-            item.scope.id, file, requestedStartLine, requestedStartLine + 199, request.signal,
+            workspaceFileSessionKey(item), file, requestedStartLine, requestedStartLine + 199, request.signal,
           )), paged: true, ...(focusLine ? { focusLine } : {}) }
         } else {
           // Hosts without text paging retain the bounded, small-file fallback.
           if (file.size > 2 * 1024 * 1024) throw new Error('workspaceReference.unsupported')
-          const blob = await this.files.read(item.scope.id, file, request.signal)
+          const blob = await this.files.read(workspaceFileSessionKey(item), file, request.signal)
           if (!this.current(request)) return
           if (blob.size > 2 * 1024 * 1024) throw new Error('workspaceReference.unsupported')
           const content = await decodeText(blob)

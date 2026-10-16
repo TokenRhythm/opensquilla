@@ -1335,6 +1335,22 @@
         "params",
         "result"
       ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.sidechat.create",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.sidechat.close",
+      "roles": [
+        "params",
+        "result"
+      ]
     }
   ]
 }

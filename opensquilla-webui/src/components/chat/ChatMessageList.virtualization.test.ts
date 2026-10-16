@@ -353,7 +353,7 @@ describe('ChatMessageList long-history virtualization', () => {
     const { api, host } = await mountList()
 
     const target = await api.ensureMessageVisible(150)
-    expect(target?.id).toBe('chat-turn-150')
+    expect(target?.id).toMatch(/^chat-turn-.+-150$/)
     expect(host.querySelector('[data-chat-message-index="150"]')).toBeTruthy()
     expect(host.querySelectorAll('[data-testid="chat-message-row"]').length).toBeLessThanOrEqual(30)
 
@@ -376,7 +376,7 @@ describe('ChatMessageList long-history virtualization', () => {
     props.messages = [message(-1), ...props.messages]
     const target = await pending
     expect(target?.dataset.chatTurnKey).toBe('message-150')
-    expect(target?.id).toBe('chat-turn-151')
+    expect(target?.id).toMatch(/^chat-turn-.+-151$/)
   })
 
   it('does not hand an old-session destination to a replacement session', async () => {

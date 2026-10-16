@@ -427,8 +427,11 @@ class RpcRegistry:
             )
 
         try:
+            from opensquilla.gateway.sidechat_policy import enforce_sidechat_command
             from opensquilla.runtime_packs import runtime_pack_state_scope
             from opensquilla.skills.toolchains.manager import managed_toolchain_state_scope
+
+            params = await enforce_sidechat_command(method, params, ctx)
 
             configured_state_dir = getattr(ctx.config, "state_dir", None)
             with (

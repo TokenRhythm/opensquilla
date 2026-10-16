@@ -55,6 +55,40 @@ afterEach(() => {
 })
 
 describe('createArtifactPreviewResource', () => {
+  it.each([
+    ['app.js', 'text/javascript', 'export const text = "<script>not executed</script>"'],
+    ['app.ts', 'application/octet-stream', 'const count: number = 1'],
+    ['data.json', 'application/json', '{"message":"你好"}'],
+    ['main.py', 'text/x-python', 'print("hello")'],
+    ['query.sql', 'application/sql', 'SELECT 1;'],
+    ['config.yaml', 'application/yaml', 'enabled: true'],
+    ['style.css', 'text/css', 'body { color: red; }'],
+  ])('loads %s through the authenticated text controller without a browser surface', async (name, mime, source) => {
+    const requestBinary = vi.fn().mockResolvedValue(response(source, mime))
+    const objectUrl = vi.fn()
+    const controller = createArtifactPreviewResource(httpTransport(requestBinary), {
+      artifact: () => artifact({ name, mime }), sessionKey: () => 'side-child', createObjectUrl: objectUrl,
+    })
+    await controller.load()
+    expect(controller.state.value).toBe('ready')
+    expect(controller.kind.value).toBe('text')
+    expect(controller.text.value).toBe(source)
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/artifacts/artifact-1', expect.objectContaining({ sessionKey: 'side-child' }))
+    expect(objectUrl).not.toHaveBeenCalled()
+    controller.dispose()
+  })
+
+  it('rejects binary bytes disguised as a generic code file', async () => {
+    const controller = createArtifactPreviewResource(httpTransport(vi.fn().mockResolvedValue(
+      response(new Uint8Array([80, 75, 0, 1, 255]), 'application/octet-stream'),
+    )), { artifact: () => artifact({ name: 'app.js', mime: 'application/octet-stream' }) })
+    await controller.load()
+    expect(controller.state.value).toBe('error')
+    expect(controller.errorCode.value).toBe('invalid-content')
+    expect(controller.text.value).toBe('')
+    controller.dispose()
+  })
+
   it('rejects an untrusted revision preview URL without falling back to the mutable head', async () => {
     const requestBinary = vi.fn()
     const controller = createArtifactPreviewResource(httpTransport(requestBinary), { artifact: () => artifact({

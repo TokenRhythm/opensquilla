@@ -66,6 +66,10 @@ function ensureSanitizers(): boolean {
       data.keepAttr = isSafeMarkdownImageSource(data.attrValue)
     } else if (tag === 'a' && data.attrName === 'href') {
       data.keepAttr = isSafeMarkdownLinkSource(data.attrValue)
+    } else if (data.attrName === 'data-workspace-path') {
+      // An inert candidate, never an href or authorization. TextPart resolves
+      // it against the current session before installing a file action.
+      data.keepAttr = tag === 'a' && workspaceFilePath(data.attrValue) !== null
     } else if (data.attrName === 'align') {
       data.keepAttr = (tag === 'th' || tag === 'td') && /^(left|center|right)$/.test(data.attrValue)
     } else if (data.attrName === 'start') {
@@ -109,7 +113,7 @@ function sanitizeMarkdown(html: string): string {
     ALLOWED_TAGS: ['p', 'br', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 'blockquote', 'pre', 'code', 'strong', 'em', 'del', 'a', 'img', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'div', 'span', 'sup', 'input'],
     ALLOWED_ATTR: ['href', 'title', 'alt', 'src', 'loading', 'decoding', 'referrerpolicy', 'target', 'rel', 'class', 'align', 'type', 'data-workspace-path', 'checked', 'disabled', 'start', 'role', 'tabindex', 'data-markdown-image', 'data-markdown-image-alt', 'data-markdown-footnote', 'data-markdown-footnote-ref', 'data-markdown-footnote-back', 'data-markdown-footnotes'],
     ALLOW_DATA_ATTR: false,
-    ADD_URI_SAFE_ATTR: ['align', 'type', 'start', 'tabindex', 'data-markdown-image', 'data-markdown-image-alt', 'data-markdown-footnote', 'data-markdown-footnote-ref', 'data-markdown-footnote-back', 'data-markdown-footnotes'],
+    ADD_URI_SAFE_ATTR: ['align', 'type', 'start', 'tabindex', 'data-workspace-path', 'data-markdown-image', 'data-markdown-image-alt', 'data-markdown-footnote', 'data-markdown-footnote-ref', 'data-markdown-footnote-back', 'data-markdown-footnotes'],
     ALLOWED_URI_REGEXP: /^(?:https?|mailto):/i,
   })
   // A malfunctioning DOM must not cause another raw-HTML render. Validate

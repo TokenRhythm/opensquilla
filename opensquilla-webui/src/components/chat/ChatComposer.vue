@@ -176,10 +176,10 @@
             :placeholder="placeholder"
             :disabled="inputDisabled"
             :aria-label="t('chat.messageToSend')"
-            :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
-            :aria-controls="paletteOpen ? 'chat-slash-options' : undefined"
+            :aria-describedby="sendControlHint ? sendTooltipId : undefined"
+            :aria-controls="paletteOpen ? paletteId || 'chat-slash-options' : undefined"
             :aria-expanded="paletteOpen"
-            :aria-activedescendant="paletteOpen ? `chat-slash-option-${paletteActiveIndex}` : undefined"
+            :aria-activedescendant="paletteOpen ? `${paletteId || 'chat-slash'}-option-${paletteActiveIndex}` : undefined"
             @beforeinput="emit('expand'); emit('beforeinput', $event)"
             @input="onTextareaInput"
             @keydown="emit('keydown', $event)"
@@ -218,11 +218,11 @@
                 :local-paths-available="localPathsAvailable"
                 :local-paths-disabled="replanActive || inputDisabled || localPathsBusy"
                 :goal-mode-active="goalDraftArmed"
-                :goal-mode-available="goalModeAvailable === true"
+                :goal-mode-available="policy.goal && goalModeAvailable === true"
                 :goal-mode-busy="goalModeBusy === true"
                 :goal-mode-existing="goalModeExisting === true"
                 :plan-mode-active="collaborationMode === 'plan'"
-                :plan-mode-available="planModeAvailable === true"
+                :plan-mode-available="policy.plan && planModeAvailable === true"
                 :plan-mode-busy="planModeBusy === true || planModeDisabled === true"
                 :show-utility-actions="true"
                 :voice-busy="voiceBusy"
@@ -231,8 +231,8 @@
                 :prompt-cache-keepalive-available="promptCacheKeepaliveAvailable"
                 :prompt-cache-keepalive-session-ready="promptCacheKeepaliveSessionReady"
                 :prompt-cache-keepalive-status="promptCacheKeepaliveStatus"
-                @activate-goal-mode="emit('armGoal')"
-                @activate-plan-mode="emit('setCollaborationMode', 'plan')"
+                @activate-goal-mode="policy.goal && emit('armGoal')"
+                @activate-plan-mode="policy.plan && emit('setCollaborationMode', 'plan')"
                 @attach-files="onAttachFiles"
                 @select-browser-use="emit('selectBrowserUse')"
                 @choose-skill="chooseMenuSkill"
@@ -298,7 +298,7 @@
                 aria-haspopup="dialog"
                 :aria-expanded="runModeOpen ? 'true' : 'false'"
                 :aria-disabled="runModeLocked ? 'true' : 'false'"
-                :aria-describedby="runModeLocked ? 'chat-run-mode-lock-tip' : undefined"
+                :aria-describedby="runModeLocked ? runModeLockTooltipId : undefined"
                 :disabled="runModeLocked"
                 @click="toggleRunMode"
               >
@@ -307,7 +307,7 @@
               </button>
               <span
                 v-if="runModeLocked"
-                id="chat-run-mode-lock-tip"
+                :id="runModeLockTooltipId"
                 class="chat-run-mode-lock-tip"
                 role="tooltip"
               >{{ runModeLockMessage }}</span>
@@ -321,10 +321,12 @@
               />
             </div>
             <ChatComposerGoalMode
+              v-if="policy.goal"
               :active="goalDraftArmed"
               @disarm="emit('disarmGoal')"
             />
             <ChatComposerPlanMode
+              v-if="policy.plan"
               :available="planModeAvailable === true"
               :mode="collaborationMode || 'default'"
               :busy="planModeBusy === true"
@@ -406,7 +408,7 @@
               :tabindex="sendControlHint ? 0 : undefined"
               :role="sendControlHint ? 'group' : undefined"
               :aria-label="sendControlHint ? t('chat.send') : undefined"
-              :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
+              :aria-describedby="sendControlHint ? sendTooltipId : undefined"
               @mouseenter="sendHintDismissed = false"
               @focusin="sendHintDismissed = false"
               @pointerdown="focusSendHint"
@@ -436,7 +438,7 @@
                 :title="sendBlockedMessage || sendPending || sendDisabled || sessionRoutingBusy || inputDisabled ? undefined
                   : showSkillQueueSend ? t('chat.sendQueues') : sendButtonTitle"
                 :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
-                :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
+                :aria-describedby="sendControlHint ? sendTooltipId : undefined"
                 :aria-busy="sendPending || sessionRoutingBusy ? 'true' : 'false'"
                 :disabled="sendPending || sendDisabled || Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
                 @click="emit('send')"
@@ -446,7 +448,7 @@
               </button>
               <span
                 v-if="sendControlHint"
-                id="chat-composer-send-tooltip"
+                :id="sendTooltipId"
                 class="chat-send-tooltip"
                 role="tooltip"
               >{{ sendControlHint }}</span>
@@ -468,8 +470,9 @@
 </template>
 
 <script setup lang="ts">
+import { useConversationPolicy } from '@/modules/conversationPolicy'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
@@ -520,6 +523,7 @@ const props = withDefaults(defineProps<{
   skillsLoading?: boolean
   skillsError?: string
   paletteOpen?: boolean
+  paletteId?: string
   paletteActiveIndex?: number
   attachments: Attachment[]
   localPaths?: readonly string[]
@@ -653,6 +657,10 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const composerId = useId()
+const sendTooltipId = `chat-composer-send-tooltip-${composerId}`
+const runModeLockTooltipId = `chat-run-mode-lock-tip-${composerId}`
+const policy = useConversationPolicy()
 const runModeLabel = computed(() => t(
   props.runMode === 'full' ? 'chat.composer.runModeFull' : 'chat.composer.runModeSafe',
 ))

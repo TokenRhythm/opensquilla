@@ -1,29 +1,22 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import * as Vue from 'vue'
-import { compile } from '@vue/compiler-dom'
 import { createPinia } from 'pinia'
 import i18n from '@/i18n'
-import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
+import ConversationLiveEdge from '@/components/chat/ConversationLiveEdge.vue'
 import AssistantMessage from '@/components/chat/AssistantMessage.vue'
-import UnifiedAssistantActivityTimeline from '@/components/chat/UnifiedAssistantActivityTimeline.vue'
 import { useChatStream } from '@/composables/chat/useChatStream'
 import { useChatRenderedMessages } from '@/composables/chat/useChatRenderedMessages'
 import { useChatToolDisclosureScope } from '@/composables/chat/useChatToolDisclosureScope'
 import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
-import { projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
+import {
+  canMergeAssistantActivityOrder,
+  projectAssistantActivityTimeline,
+  splitLiveAssistantTimeline,
+} from '@/utils/chat/assistantActivity'
 import { FINISHED_STREAM_TASK_ID, PENDING_STREAM_TASK_ID } from '@/utils/chat/streamEvents'
 import type { ChatMessage, ChatRunStatus } from '@/types/chat'
-import chatViewSource from './ChatView.vue?raw'
-
-// Compile the actual live disclosure opening tag. A manually reconstructed
-// props object would miss the wiring omission that caused this regression.
-const liveOpening = chatViewSource.match(/<ActivityDisclosure\b[^>]*>/)?.[0]
-if (!liveOpening) throw new Error('ChatView live activity disclosure is missing')
-const liveRender = new Function('Vue', compile(
-  `${liveOpening}<span>Live process</span></ActivityDisclosure>`, { mode: 'function', prefixIdentifiers: true },
-).code)(Vue) as Vue.RenderFunction
 const cleanups: Array<() => void> = []
 
 function mountTurn(initialTaskId = 'accepted-turn', seed?: (stream: ReturnType<typeof useChatStream>) => void, finalText = 'Ready.') {
@@ -54,22 +47,37 @@ function mountTurn(initialTaskId = 'accepted-turn', seed?: (stream: ReturnType<t
       migrateScope: stream.migrateToolDisclosureScope,
     })
     toolStateScope = disclosure.stateScope
-    const LiveTurn = Vue.defineComponent({
-      components: { ActivityDisclosure },
-      setup: () => ({
-        presentedLive: Vue.computed(() => ({
-          liveActivityContinuityKey: disclosure.activityContinuityKey.value,
-          liveActivityExecuting: false, liveActivityStepCount: 1,
-          liveActivityFailureCount: 0, liveActivityPhaseLabel: 'Working', streamTurnElapsed: '',
-          liveActivityPhaseAnnouncement: '', liveActivityWaiting: false, streamActivityStale: false,
-          queued: false,
-        })),
-      }),
-      render: liveRender,
-    })
     const Host = Vue.defineComponent({
       setup: () => () => {
-        if (stream.isStreaming.value && stream.streamBubble.value) return Vue.h(LiveTurn)
+        if (stream.isStreaming.value && stream.streamBubble.value) {
+          const fold = stream.foldedTurn.value
+          const split = splitLiveAssistantTimeline(fold.timelineItems, {
+            keepToolTurnTextInActivity: true,
+            renderActivityMarkdown: text => text,
+          })
+          const projection = projectAssistantActivityTimeline(split.activityItems, {
+            lifecycle: 'working', statusHistory: fold.statusHistory,
+          })
+          // Mount the real live component. Its ActivityDisclosure must hand
+          // the explicit choice to the settled renderer via the same key.
+          return Vue.h(ConversationLiveEdge, {
+            visible: true, sessionKey: sessionKey.value,
+            continuityKey: disclosure.activityContinuityKey.value,
+            executing: false, stepCount: fold.toolCalls.length,
+            failureCount: fold.toolCalls.filter(call => call.isError).length,
+            phaseLabel: 'Working', elapsedLabel: '', stale: false,
+            hasUnifiedActivityOrder: canMergeAssistantActivityOrder(
+              projection.statusSteps, fold.reasoningBlocks, split.activityItems,
+            ),
+            displayProjection: projection, timelineItems: split.activityItems,
+            reasoningBlocks: fold.reasoningBlocks, toolStateScope: disclosure.stateScope.value,
+            answerPart: split.answerItem ? { rawText: split.answerItem.rawText || '' } : null,
+            renderMarkdown: text => text,
+            isToolGroupOpen: stream.isToolGroupOpen, isToolItemOpen: stream.isToolItemOpen,
+            toolGroupStatusText: () => '', toolStatusText: () => '', toolSecondaryText: () => '',
+            onToggleGroup: stream.toggleToolGroup, onToggleItem: stream.toggleToolItem,
+          })
+        }
         const message = renderedMessages.value[renderedMessages.value.length - 1]
         if (!message || message.displayRole !== 'assistant') return null
         return Vue.h(AssistantMessage, {
@@ -216,26 +224,9 @@ describe('ChatView live activity to canonical history handoff', () => {
 
     const liveFold = api.stream.foldedTurn.value
     expect(new Set(liveFold.toolCalls.map(call => call.groupId)).size).toBe(1)
-    const liveHost = document.createElement('div')
-    document.body.appendChild(liveHost)
-    const liveApp = Vue.createApp({
-      render: () => Vue.h(UnifiedAssistantActivityTimeline, {
-        projection: projectAssistantActivityTimeline(liveFold.timelineItems, {
-          lifecycle: 'working', statusHistory: liveFold.statusHistory, endedAt: 80_000,
-        }),
-        timelineItems: liveFold.timelineItems.filter(item => item.type !== 'text'),
-        reasoningBlocks: liveFold.reasoningBlocks,
-        isToolGroupOpen: () => undefined, isToolItemOpen: () => undefined,
-        toolGroupStatusText: () => '', toolStatusText: () => '', toolSecondaryText: () => '',
-      }),
-    })
-    liveApp.use(i18n)
-    liveApp.mount(liveHost)
-    cleanups.push(() => { liveApp.unmount(); liveHost.remove() })
-    await Vue.nextTick()
     const entryOrders = (host: HTMLElement) => [...host.querySelectorAll('[data-activity-entry="true"]')]
       .map(node => Number(node.getAttribute('data-activity-order')))
-    const liveOrders = entryOrders(liveHost)
+    const liveOrders = entryOrders(api.host)
     expect(liveOrders).toEqual([10, 20, 21, 30, 40, 50, 60, 70])
 
     api.settle()

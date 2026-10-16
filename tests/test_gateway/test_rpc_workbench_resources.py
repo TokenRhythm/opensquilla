@@ -277,6 +277,101 @@ async def _dispatch(env, method: str, params: dict[str, object]):
     return await get_dispatcher().dispatch(f"test:{method}", method, params, env.ctx)
 
 
+@pytest.mark.asyncio
+async def test_fork_history_preview_opens_own_copy_without_rewriting_transcript(resource_env):
+    env = resource_env
+    workspace = Path(env.config.workspace_dir)
+    workspace.mkdir()
+    (workspace / "game.html").write_text("<h1>Inherited game</h1>", encoding="utf-8")
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+    adopter = GeneratedArtifactAdopter(
+        service=service, store=env.store, session_key=SESSION_KEY,
+        session_id=env.session.session_id, workspace=str(workspace),
+    )
+    context = ToolContext(
+        is_owner=True, session_key=SESSION_KEY, session_id=env.session.session_id,
+        workspace_dir=str(workspace),
+    )
+    token = current_tool_context.set(context)
+    try:
+        registered = await adopter.open_workspace_preview(context, path="game.html", bundle="none")
+    finally:
+        current_tool_context.reset(token)
+    segments = [
+        {"type": "tool_use", "name": "open_workspace_preview", "id": "preview-call",
+         "input": {"path": "game.html"}},
+        {"type": "tool_result", "name": "open_workspace_preview", "tool_use_id": "preview-call",
+         "result": json.dumps(registered), "is_error": False},
+    ]
+    # Failed, malformed and unrelated actions must not acquire a document alias.
+    invalid_results = [
+        {**registered, "error": "failed"},
+        {**registered, "previewStatus": "failed"},
+        {**registered, "resourceId": "document:doc_unrelated"},
+        {**registered, "open": {"resourceId": "document:doc_unrelated"}},
+        {**registered, "documentId": "doc_unknown", "resourceId": "document:doc_unknown",
+         "open": {"resourceId": "document:doc_unknown"}},
+    ]
+    for index, result in enumerate(invalid_results):
+        segments.extend([
+            {**segments[0], "id": f"invalid-{index}"},
+            {**segments[1], "tool_use_id": f"invalid-{index}", "result": json.dumps(result)},
+        ])
+    await env.manager.append_message(
+        SESSION_KEY, "assistant", "Preview: game.html", tool_calls=segments,
+    )
+    child_key = "agent:main:webchat:preview-fork"
+    child = await env.manager.branch(SESSION_KEY, child_key, fork_transcript=True)
+    child_documents = await service.list_documents(
+        session_key=child_key, session_id=child.session_id,
+    )
+    assert len(child_documents) == 1
+    child_document = child_documents[0]
+    assert child_document.document_id != registered["documentId"]
+
+    # This is a read-time projection: an already-created fork is repaired without
+    # rewriting its model history or changing the parent's source identity.
+    parent_history = await _dispatch(env, "chat.history", {"sessionKey": SESSION_KEY})
+    history = await _dispatch(env, "chat.history", {"sessionKey": child_key})
+    assert parent_history.error is None, parent_history.error
+    assert history.error is None, history.error
+    assert parent_history.payload["messages"][0]["tool_calls"] == segments
+    projected_segments = history.payload["messages"][0]["tool_calls"]
+    projected = json.loads(projected_segments[1]["result"])
+    assert projected["documentId"] == child_document.document_id
+    assert projected["revisionId"] == child_document.head_revision_id
+    assert projected["resourceId"] == f"document:{child_document.document_id}"
+    assert projected["open"]["resourceId"] == projected["resourceId"]
+    assert projected["entrypoint"] == registered["entrypoint"]
+    assert projected_segments[2:] == segments[2:]
+    stored = await env.manager.get_transcript(child_key)
+    assert stored[0].tool_calls == segments
+
+    for method in ("workbench.resources.get", "workbench.resources.open"):
+        rejected = await _dispatch(env, method, {
+            "sessionKey": child_key,
+            "resourceRef": {"type": "document", "documentId": registered["documentId"]},
+        })
+        assert rejected.error is not None
+        assert rejected.error.code == "DOCUMENT_UNAVAILABLE"
+        opened = await _dispatch(env, method, {
+            "sessionKey": child_key,
+            "resourceRef": {"type": "document", "documentId": projected["documentId"]},
+        })
+        assert opened.error is None, opened.error
+        if method.endswith(".open"):
+            assert opened.payload["document"]["id"] == child_document.document_id
+        else:
+            assert (
+                opened.payload["resource"]["resource"]["documentId"] == child_document.document_id
+            )
+    source = await _dispatch(env, "artifacts.source.read", {
+        "sessionKey": child_key, "documentId": projected["documentId"],
+    })
+    assert source.error is None, source.error
+    await service.close()
+
+
 @pytest.mark.parametrize("bundle_mode", ["directory", "none"])
 async def test_preview_pages_discovery_and_member_open_do_not_create_deliveries(
     resource_env, bundle_mode,

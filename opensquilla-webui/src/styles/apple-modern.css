@@ -22,7 +22,7 @@ body::before {
 }
 
 /* Controls: filled surfaces carry hierarchy; outlines are reserved for focus. */
-input:not([type="radio"]):not([type="checkbox"]),
+input:not([type="radio"]):not([type="checkbox"]):not(.workspace-files__filter-input),
 textarea,
 select,
 .control-input {
@@ -33,7 +33,7 @@ select,
   padding: 9px 13px;
 }
 
-input:not([type="radio"]):not([type="checkbox"]):focus,
+input:not([type="radio"]):not([type="checkbox"]):not(.workspace-files__filter-input):focus,
 textarea:focus,
 select:focus,
 .control-input:focus {

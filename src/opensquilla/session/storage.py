@@ -6249,6 +6249,31 @@ class SessionStorage:
             raise cancellation
         return operation.result()
 
+    async def insert_session(self, node: SessionNode) -> bool:
+        """Insert a new identity only if its key is still absent at commit.
+
+        Turn admission may commit after an earlier runtime-lock-protected
+        absence check. This write must never replace that admission's owner.
+        """
+        node.session_key = canonicalize_session_key(node.session_key)
+        node.agent_id = normalize_agent_id(node.agent_id)
+        data = node.model_dump()
+        columns = list(data)
+        sql = (
+            f"INSERT INTO sessions ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)}) "
+            "ON CONFLICT(session_key) DO NOTHING"
+        )
+        async with self._write_transaction("insert_session") as conn:
+            values = [_serialize(data[column]) for column in columns]
+            async with conn.execute(sql, values) as cursor:
+                inserted = cursor.rowcount == 1
+            if inserted:
+                await self._ensure_usage_baseline_for_session_on_conn(
+                    conn, session_key=node.session_key,
+                )
+        return inserted
+
     async def upsert_session(
         self,
         node: SessionNode,
@@ -6418,6 +6443,25 @@ class SessionStorage:
             return SessionNode(**_deserialize_row(dict(row)))
 
     @_serialized_read
+    async def list_open_sidechats(self) -> list[SessionNode]:
+        async with self.conn.execute(
+            "SELECT * FROM sessions WHERE "
+            "json_extract(origin, '$.sidechat.state') IN ('preparing','ready','closing')",
+        ) as cur:
+            rows = await cur.fetchall()
+        return [SessionNode(**_deserialize_row(dict(row))) for row in rows]
+
+    @_serialized_read
+    async def list_sidechat_children(self, parent_key: str) -> list[SessionNode]:
+        async with self.conn.execute(
+            "SELECT * FROM sessions WHERE parent_session_key = ? "
+            "AND json_extract(origin, '$.sidechat') IS NOT NULL",
+            (canonicalize_session_key(parent_key),),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [SessionNode(**_deserialize_row(dict(row))) for row in rows]
+
+    @_serialized_read
     async def list_sessions(
         self,
         agent_id: str | None = None,
@@ -6428,6 +6472,8 @@ class SessionStorage:
         guest_owner_id: str | None = None,
     ) -> list[SessionNode]:
         clauses: list[str] = []
+        if spawned_by is None:
+            clauses.append("json_extract(sessions.origin, '$.sidechat') IS NULL")
         params: list[Any] = []
         if agent_id is not None:
             clauses.append("sessions.agent_id = ?")
@@ -6501,7 +6547,7 @@ class SessionStorage:
         """Return a stable keyset page in the same order as ``list_sessions``."""
 
         page_limit = max(1, int(limit))
-        clauses: list[str] = []
+        clauses: list[str] = ["json_extract(sessions.origin, '$.sidechat') IS NULL"]
         params: list[Any] = []
         if guest_owner_id is not None:
             owner_id = str(guest_owner_id).strip().lower()
@@ -6780,7 +6826,7 @@ class SessionStorage:
 
     @_serialized_read
     async def count_sessions(self, guest_owner_id: str | None = None) -> int:
-        where = ""
+        where = "WHERE json_extract(origin, '$.sidechat') IS NULL"
         params: tuple[str, ...] = ()
         if guest_owner_id is not None:
             owner_id = str(guest_owner_id).strip().lower()
@@ -8490,7 +8536,7 @@ class SessionStorage:
     ) -> None:
         async with conn.execute(
             """
-            SELECT collaboration_mode
+            SELECT collaboration_mode, origin
             FROM sessions
             WHERE session_key = ? AND session_id = ? AND epoch = ?
             """,
@@ -8501,6 +8547,11 @@ class SessionStorage:
             raise GoalConflictError(
                 "SESSION_GENERATION_CHANGED",
                 "The session generation changed before Goal admission",
+                current=goal,
+            )
+        if isinstance(json.loads(row["origin"] or "{}").get("sidechat"), dict):
+            raise GoalConflictError(
+                "SIDECHAT_UNSUPPORTED", "Goals are unavailable in a side conversation",
                 current=goal,
             )
         if str(row["collaboration_mode"]) != CollaborationMode.DEFAULT.value:
@@ -12497,6 +12548,9 @@ class SessionStorage:
         )
         now = _now_ms()
         async with self._write_transaction("enqueue_pending_chat_input") as conn:
+            from opensquilla.session.sidechat import assert_pending_admission
+
+            await assert_pending_admission(conn, session_key)
             dispatch_receipts = (
                 await self._find_pending_chat_input_dispatch_receipts(
                     conn,
@@ -13517,6 +13571,45 @@ class SessionStorage:
 
         pending_dispatch_client_message_id: str | None = None
         async with self._write_transaction("accept_turn") as conn:
+            async with conn.execute(
+                "SELECT origin FROM sessions WHERE session_key = ?", (entry.session_key,),
+            ) as sidechat_cursor:
+                sidechat_row = await sidechat_cursor.fetchone()
+            if sidechat_row is not None:
+                origin = json.loads(sidechat_row["origin"] or "{}")
+                sidechat = origin.get("sidechat")
+                if isinstance(sidechat, dict):
+                    from opensquilla.session.sidechat import SidechatAdmissionRejectedError
+
+                    if (
+                        sidechat.get("state") != "ready"
+                        or int(sidechat.get("leaseExpiresAt", 0)) <= int(time.time() * 1000)
+                    ):
+                        raise SidechatAdmissionRejectedError(
+                            "Side conversation is closed or not ready"
+                        )
+                    async with conn.execute(
+                        "SELECT session_id, epoch FROM sessions WHERE session_key = ?",
+                        (sidechat["parentKey"],),
+                    ) as parent_cursor:
+                        parent_row = await parent_cursor.fetchone()
+                    if (
+                        parent_row is None
+                        or parent_row["session_id"] != sidechat["parentSessionId"]
+                        or parent_row["epoch"] != sidechat["parentEpoch"]
+                    ):
+                        raise SidechatAdmissionRejectedError("Side conversation parent changed")
+                    # Ordinary turns always carry an optional current-Goal probe.
+                    # Side conversations cannot own Goals, so suppress that probe;
+                    # only an actual Goal mutation is forbidden.
+                    if isinstance(goal_mutation, ClaimCurrentGoalMutation):
+                        goal_mutation = None
+                    if (
+                        goal_mutation is not None or plan_run is not None or reset_from_session_id
+                    ):
+                        raise SidechatAdmissionRejectedError(
+                            "Side conversations do not support Goals, Plan runs or reset"
+                        )
             selected = await self._select_turn_ingress_receipt(
                 conn,
                 source_scope=source_scope,
@@ -15927,6 +16020,7 @@ class SessionStorage:
                 FROM transcript_entries
                 WHERE session_id = ?
                   AND EXISTS (SELECT 1 FROM cursor_anchor)
+                  AND COALESCE(json_extract(turn_context, '$.visibility'), '') != 'model-only'
                   {active_cursor_clause}
                 ORDER BY created_at {direction}, id {direction}
                 LIMIT ?
@@ -15961,6 +16055,7 @@ class SessionStorage:
                 FROM compacted_transcript_entries
                 WHERE session_id = ?
                   AND EXISTS (SELECT 1 FROM cursor_anchor)
+                  AND COALESCE(json_extract(turn_context, '$.visibility'), '') != 'model-only'
                   {archived_cursor_clause}
                 ORDER BY
                     created_at {direction},
@@ -16106,6 +16201,86 @@ class SessionStorage:
         """Return whether every current compaction has a complete raw archive."""
         coverage = await self.get_canonical_transcript_coverage(session_id)
         return coverage.canonical_complete
+
+    async def is_display_transcript_complete(self, session_id: str) -> bool:
+        """Prove coverage after an immutable model-only inheritance boundary.
+
+        This is not a provider replay/fork proof. A parent may have incomplete
+        legacy replay while every row of the child's visible conversation is
+        retained. Conversely, every child-owned compaction must still have its
+        full archive, even when it also archived model-only inherited rows.
+        """
+        rows = await self._read_history_query(
+            """
+            WITH target AS (
+                SELECT session_id, origin, compaction_count
+                FROM sessions WHERE session_id = ?
+            ), summaries AS (
+                SELECT s.* FROM session_summaries AS s, target
+                WHERE s.session_id = target.session_id AND s.id > COALESCE(
+                    json_extract(target.origin,
+                      '$.sidechat.displayHistory.inheritedSummaryThroughId'), 0)
+            ), archives AS (
+                SELECT a.* FROM compacted_transcript_entries AS a, target
+                WHERE a.session_id = target.session_id AND a.id > COALESCE(
+                    json_extract(target.origin,
+                      '$.sidechat.displayHistory.inheritedArchiveThroughId'), 0)
+            )
+            SELECT target.origin, target.compaction_count,
+                (SELECT COUNT(*) FROM session_summaries
+                    WHERE session_id = target.session_id) AS total_summary_count,
+                (SELECT COUNT(*) FROM compacted_transcript_entries
+                    WHERE session_id = target.session_id) AS total_archived_count,
+                (SELECT COUNT(*) FROM summaries) AS summary_count,
+                (SELECT COALESCE(SUM(removed_count), 0) FROM summaries) AS removed_count,
+                (SELECT COUNT(*) FROM archives) AS archived_count,
+                (SELECT COUNT(*) FROM archives
+                    WHERE original_entry_id IS NULL) AS missing_ids,
+                (SELECT COUNT(*) FROM summaries AS summary WHERE
+                    summary.compaction_id IS NULL
+                    OR (summary.removed_count = 0 AND summary.covered_through_id > 0)
+                    OR (SELECT COUNT(*) FROM archives
+                        WHERE compaction_id = summary.compaction_id)
+                        != summary.removed_count) AS mismatched_summaries
+            FROM target
+            """,
+            (session_id,),
+            operation="display_canonical_coverage",
+        )
+        if not rows:
+            return False
+        row = rows[0]
+        origin = json.loads(row["origin"] or "{}")
+        metadata = origin.get("sidechat") if isinstance(origin, dict) else None
+        if not isinstance(metadata, dict):
+            return await self.is_canonical_transcript_complete(session_id)
+        proof = metadata.get("displayHistory")
+        if proof is None:
+            # Older side snapshots recorded no display boundary. Only the
+            # absence of *all* compaction evidence proves their visible history;
+            # do not infer a baseline from the parent's current mutable state.
+            return (
+                int(row["compaction_count"] or 0) == 0
+                and int(row["total_summary_count"] or 0) == 0
+                and int(row["total_archived_count"] or 0) == 0
+            )
+        fields = (
+            "inheritedCompactionCount", "inheritedSummaryThroughId", "inheritedArchiveThroughId",
+        )
+        if (
+            not isinstance(proof, dict)
+            or proof.get("version") != 1
+            or any(type(proof.get(name)) is not int or proof[name] < 0 for name in fields)
+        ):
+            return False
+        local_compactions = int(row["compaction_count"] or 0) - proof["inheritedCompactionCount"]
+        return (
+            local_compactions >= 0
+            and int(row["summary_count"] or 0) == local_compactions
+            and int(row["removed_count"] or 0) == int(row["archived_count"] or 0)
+            and int(row["missing_ids"] or 0) == 0
+            and int(row["mismatched_summaries"] or 0) == 0
+        )
 
     async def copy_compacted_transcript_entries(
         self,
@@ -17794,6 +17969,12 @@ class SessionStorage:
         if session_id:
             sql += "AND t.session_id = ? "
             params.append(session_id)
+        else:
+            sql += (
+                "AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.session_key=t.session_key "
+                "AND json_extract(s.origin, '$.sidechat') IS NOT NULL) "
+            )
+        sql += "AND COALESCE(json_extract(t.turn_context, '$.visibility'), '') != 'model-only' "
         sql += "ORDER BY f.rank LIMIT ?"
         params.append(limit)
 
@@ -17883,7 +18064,7 @@ class SessionStorage:
             return []
         col = (lambda c: f"py_lower({c})") if self._needs_unicode_fold(query) else (lambda c: c)
         cols = ("display_name", "derived_title", "subject", "label")
-        clauses: list[str] = []
+        clauses: list[str] = ["json_extract(origin, '$.sidechat') IS NULL"]
         params: list[Any] = []
         for token in tokens:
             clauses.append("(" + " OR ".join(f"{col(c)} LIKE ? ESCAPE '\\'" for c in cols) + ")")
@@ -17927,6 +18108,13 @@ class SessionStorage:
         if session_id:
             where += " AND session_id = ?"
             params.append(session_id)
+        else:
+            where += (
+                " AND NOT EXISTS (SELECT 1 FROM sessions s "
+                "WHERE s.session_key=transcript_entries.session_key "
+                "AND json_extract(s.origin, '$.sidechat') IS NOT NULL)"
+            )
+        where += " AND COALESCE(json_extract(turn_context, '$.visibility'), '') != 'model-only'"
         params.append(limit)
         params.extend([first_term.lower(), first_term.lower(), len(first_term) + 81])
         # Materialize only the selected IDs before reading excerpts. Otherwise

@@ -1,5 +1,5 @@
 <template>
-  <div id="chat-slash-options" ref="rootRef" class="chat-slash" :style="availableHeight === null ? undefined : { maxHeight: `${availableHeight}px` }"
+  <div :id="paletteId || 'chat-slash-options'" ref="rootRef" class="chat-slash" :style="availableHeight === null ? undefined : { maxHeight: `${availableHeight}px` }"
     role="listbox" :aria-label="t('chat.skillPalette.title')" @keydown="onKeydown">
     <div class="chat-slash-list">
       <div v-for="group in groups" :key="group.key" role="group" :aria-label="t(`chat.skillPalette.${group.kind}`)">
@@ -21,7 +21,7 @@ import type { ChatSlashCommand } from '@/composables/chat/useChatSlashCommands'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import ComposerCapabilityList, { composerCapabilityIcon, type ComposerCapabilityItem } from './ComposerCapabilityList.vue'
 
-const props = defineProps<{ items: ChatSlashCommand[]; activeIndex: number; loading: boolean; error: string;
+const props = defineProps<{ items: ChatSlashCommand[]; activeIndex: number; loading: boolean; error: string; paletteId?: string;
   selectedSkills?: readonly SelectedSkillRef[]; composerElement?: HTMLElement | null }>()
 const emit = defineEmits<{ choose: [command: ChatSlashCommand]; close: [] }>()
 const { t } = useI18n()
@@ -62,7 +62,7 @@ const groups = computed(() => {
     const kind = command.kind || 'command'
     if (result[result.length - 1]?.kind !== kind) result.push({ key: `${kind}:${index}`, kind, items: [] })
     const skill = command.skill
-    result[result.length - 1]!.items.push({ key: String(index), id: `chat-slash-option-${index}`, label: kind === 'command' ? command.cmd : command.label,
+    result[result.length - 1]!.items.push({ key: String(index), id: `${props.paletteId || 'chat-slash'}-option-${index}`, label: kind === 'command' ? command.cmd : command.label,
       description: command.desc, icon: kind === 'command' ? 'terminal' : composerCapabilityIcon(skill?.name || command.name), command: kind === 'command',
       status: status(command), title: skill?.reason, skillName: skill?.name, active: index === props.activeIndex,
       selected: Boolean(skill && props.selectedSkills?.some(selected => selected.instanceId === skill.instanceId && selected.digest === skill.digest)) })

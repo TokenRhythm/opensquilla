@@ -23,6 +23,40 @@ export interface SessionProjectWorkspaceMetadata {
   projectWorkspace?: ActiveProjectWorkspaceSnapshot | null
 }
 
+/** Hydration may intentionally defer filesystem validation to the workspace API. */
+export async function applySessionProjectWorkspaceMetadata(options: {
+  state: ReturnType<typeof useActiveProjectWorkspace>
+  sessionKey: string
+  generation: number
+  metadata: SessionProjectWorkspaceMetadata & { projectWorkspaceDeferred?: boolean }
+  cachedWorkspace?: ActiveProjectWorkspaceSnapshot | null
+  loadWorkspaces: () => Promise<readonly ActiveProjectWorkspaceSnapshot[]>
+  isCurrent: () => boolean
+}): Promise<void> {
+  if (!options.isCurrent()) return
+  const { state, sessionKey, generation, metadata } = options
+  const deferred = Boolean(metadata.projectWorkspaceDeferred && metadata.workspaceId && !metadata.projectWorkspace)
+  const known = state.activeWorkspace.value?.id === metadata.workspaceId
+    ? state.activeWorkspace.value : options.cachedWorkspace?.id === metadata.workspaceId
+      ? options.cachedWorkspace : null
+  if (!state.applySessionSnapshot(sessionKey, generation, {
+    ...metadata,
+    projectWorkspace: metadata.projectWorkspace || (deferred ? known : null),
+  }) || !deferred) return
+  try {
+    const workspaces = await options.loadWorkspaces()
+    if (!options.isCurrent()) return
+    const workspace = workspaces.find(item => item.id === metadata.workspaceId)
+      || (known ? { ...known, available: false, removed: true } : null)
+    state.applySessionSnapshot(sessionKey, generation, {
+      workspaceId: metadata.workspaceId,
+      projectWorkspace: workspace,
+    })
+  } catch {
+    if (options.isCurrent()) state.failSessionResolution(sessionKey, generation)
+  }
+}
+
 export function createDraftProjectHydrationGuard() {
   let generation = 0
   let activeController: AbortController | null = null
@@ -102,10 +136,13 @@ export function useActiveProjectWorkspace() {
     if (pendingWorkspaceId.value === workspaceId) pendingWorkspaceId.value = null
   }
 
-  function beginSessionResolution(sessionKey: string): number {
+  function beginSessionResolution(sessionKey: string, preserveCurrent = false): number {
     sessionGeneration += 1
     resolvingSessionKey = sessionKey
     pendingWorkspaceId.value = null
+    // Same-key draft materialization has already validated this project. Keep
+    // its panel identity while refreshing the newly durable session metadata.
+    if (preserveCurrent) return sessionGeneration
     boundWorkspaceId.value = null
     activeWorkspace.value = null
     status.value = 'resolving'

@@ -19,6 +19,11 @@ export interface PersistSessionOptions {
   source?: string
 }
 
+export interface ChatSessionRouteHost {
+  /** An embedded conversation never owns the browser route or active-session pointer. */
+  embedded?: boolean
+}
+
 export interface ResolveInitialSessionOptions {
   recoverDraft?: boolean
   scopedDraft?: ScopedDraftHistoryState | null
@@ -80,6 +85,7 @@ function readStoredSession(): string {
 export function useChatSessionRoute(
   sessionKey: Ref<string>,
   guestSessionOwnerId: () => string | null = () => null,
+  host: ChatSessionRouteHost = {},
 ) {
   const route = useRoute()
   const router = useRouter()
@@ -99,6 +105,7 @@ export function useChatSessionRoute(
   }
 
   function rebindFreshDraftSession(rebind: (key: string) => void): boolean {
+    if (host.embedded) return false
     const key = sessionKey.value
     if (!key || key !== freshDraftSessionKey || readSessionFromUrl()) return false
     const next = inGuestNamespace(key)
@@ -121,6 +128,7 @@ export function useChatSessionRoute(
     })
 
     sessionKey.value = next
+    if (host.embedded) return
     writeStoredSession(sessionKey.value)
     if (options.updateRoute === false) return
     if (readSessionFromUrl() === sessionKey.value) return
@@ -128,23 +136,23 @@ export function useChatSessionRoute(
   }
 
   function isDraftRoute(): boolean {
-    return route.path === DRAFT_CHAT_PATH
+    return !host.embedded && route.path === DRAFT_CHAT_PATH
   }
 
   function hasLegacyNewChatQuery(): boolean {
-    return route.query.newChat === '1' || route.query.new === '1'
+    return !host.embedded && (route.query.newChat === '1' || route.query.new === '1')
   }
 
   function readSessionFromUrl(): string {
-    return routeStringParam(route.query.session)
+    return host.embedded ? sessionKey.value : routeStringParam(route.query.session)
   }
 
   function readAgentFromUrl(): string {
-    return routeStringParam(route.query.agent)
+    return host.embedded ? agentIdFromSessionKey(sessionKey.value) : routeStringParam(route.query.agent)
   }
 
   function readProjectFromUrl(): string {
-    return routeStringParam(route.query.project)
+    return host.embedded ? '' : routeStringParam(route.query.project)
   }
 
   function draftAgentId(): string {
@@ -156,6 +164,7 @@ export function useChatSessionRoute(
     projectId?: string | null
     replace?: boolean
   } = {}) {
+    if (host.embedded) return
     const agent = options.agentId || readAgentFromUrl()
     const project = options.projectId === undefined
       ? readProjectFromUrl()
@@ -173,6 +182,7 @@ export function useChatSessionRoute(
 
   /** Change only this draft's project, including its reload recovery scope. */
   async function replaceDraftProject(projectId: string | null): Promise<boolean> {
+    if (host.embedded) return false
     if (!isDraftRoute() || !sessionKey.value) return false
     const key = sessionKey.value
     const agentId = draftAgentId()
@@ -212,6 +222,12 @@ export function useChatSessionRoute(
   function resolveInitialSession(
     options: ResolveInitialSessionOptions = {},
   ): InitialSessionResolution {
+    if (host.embedded) return {
+      sessionKey: sessionKey.value,
+      hasUrlSession: false,
+      draft: false,
+      recoveredDraft: false,
+    }
     const urlSession = readSessionFromUrl()
     if (urlSession) {
       freshDraftSessionKey = ''

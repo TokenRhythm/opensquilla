@@ -69,6 +69,38 @@ async function setup(showSendBlockedTooltip = true) {
 }
 
 describe('blocked keyboard Send feedback', () => {
+  it('binds each simultaneous composer to its own send and run-mode descriptions', async () => {
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp(defineComponent({ setup: () => () => h('div', ['main', 'side'].map(owner =>
+      h(ChatComposer, {
+        modelValue: owner, attachments: [], busySendMode: 'queue', hasSendContent: true,
+        isStreaming: false, canStop: false, isNewLanding: false,
+        placeholder: owner, sendButtonTitle: 'Send', sendBlockedMessage: `${owner} reconnecting`,
+        runMode: 'safe', allowedRunModes: ['safe', 'full'], runModeLocked: true,
+        runModeLockMessage: `${owner} mode locked`, sessionRoutingMode: 'off',
+        sessionRoutingBusy: false, voiceBusy: false, voiceRecording: false, voiceReady: false,
+      }),
+    )) })).use(i18n)
+    mounted.push(app)
+    app.mount(host)
+    await nextTick()
+    const composers = [...host.querySelectorAll<HTMLElement>('.chat-composer')]
+    expect(composers).toHaveLength(2)
+    const ids = [...host.querySelectorAll<HTMLElement>('[id]')].map(element => element.id)
+    expect(new Set(ids).size).toBe(ids.length)
+    for (const [index, composer] of composers.entries()) {
+      const owner = index === 0 ? 'main' : 'side'
+      const described = [...composer.querySelectorAll('[aria-describedby]')]
+      expect(described.length).toBeGreaterThan(0)
+      for (const control of described) {
+        const description = document.getElementById(control.getAttribute('aria-describedby')!)
+        expect(composer.contains(description)).toBe(true)
+        expect(description?.textContent).toContain(owner)
+      }
+    }
+  })
+
   it('does not duplicate an inline explanation when Enter attempts a blocked send', async () => {
     const test = await setup(false)
     test.key('Enter')

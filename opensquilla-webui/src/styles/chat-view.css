@@ -6,9 +6,9 @@
   overflow: hidden;
   background: var(--bg-surface);
   color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-sm);
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
   /* Prose, activity and input share one readable column. Wide code stays
      inside its own scrollable detail instead of stretching the transcript. */
   --composer-col: 800px;

@@ -1,6 +1,7 @@
 import { renderMarkdownCore } from '@/utils/markdown/renderCore'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { artifactExtension, artifactMime, artifactName } from '@/utils/chat/artifacts'
+import { isSourceTextFile, isSourceTextMime } from '@/utils/textFilePreview'
 
 // Markdown previews share parsing, sanitization, budgets and escaped-source
 // failure isolation with chat. Resource transport stays in the workbench.
@@ -57,6 +58,7 @@ export function artifactWorkbenchPreviewKind(
   if (mime === 'text/markdown') return 'markdown'
   if (mime === 'text/plain' || mime === 'text/x-log') return 'text'
   if (mime.startsWith('image/')) return 'image'
+  if (isSourceTextFile(artifactName(artifact), mime)) return 'text'
 
   if (!mime || mime === 'application/octet-stream') {
     if (isOfficePreviewFormat(extension)) return extension
@@ -91,7 +93,7 @@ export function responseMatchesArtifactPreviewKind(
   if (kind === 'html') return mime === 'text/html' || mime === 'application/xhtml+xml'
   if (kind === 'pdf') return mime === 'application/pdf'
   if (kind === 'markdown') return mime === 'text/markdown' || mime === 'text/plain'
-  if (kind === 'text') return mime === 'text/plain' || mime === 'text/x-log'
+  if (kind === 'text') return mime === 'text/plain' || mime === 'text/x-log' || isSourceTextMime(mime)
   if (kind === 'image') return mime.startsWith('image/')
   if (isOfficePreviewFormat(kind)) return mime === OFFICE_PREVIEW_MIMES[kind]
   return false

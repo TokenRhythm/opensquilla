@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import i18n from '@/i18n'
 import WorkspaceFilePanel from './WorkspaceFilePanel.vue'
 import type { WorkspaceSourceSnapshot } from '@/modules/workspaceReferences'
+import * as browser from '@/utils/browser'
 
 type ComponentProps = InstanceType<typeof WorkspaceFilePanel>['$props']
 type PanelProps = { -readonly [Key in keyof ComponentProps]: ComponentProps[Key] }
@@ -11,11 +12,12 @@ const cleanups: (() => void)[] = []
 afterEach(() => { cleanups.splice(0).forEach(cleanup => cleanup()); vi.restoreAllMocks() })
 async function mount(props: PanelProps) {
   const el = document.createElement('div')
+  document.body.append(el)
   const state = reactive(props)
   const onEvent = vi.fn()
   const app = createApp({ render: () => h(WorkspaceFilePanel, { ...state, 'onWorkbench-event': onEvent }) })
   app.use(i18n).mount(el)
-  cleanups.push(() => app.unmount())
+  cleanups.push(() => { app.unmount(); el.remove() })
   await nextTick()
   return { el, state, onEvent }
 }
@@ -32,6 +34,55 @@ async function enter(input: HTMLInputElement, value: string) {
 }
 
 describe('workspace source panel', () => {
+  it('uses shared code headers and copies only source, releasing controls on source mode', async () => {
+    const copy = vi.spyOn(browser, 'copyTextWithFallback').mockResolvedValue(undefined)
+    const content = 'Example document.\n\n- First item\n  - Nested item\n\n```typescript\nconst value = "hello";\n```'
+    const totalLines = content.split('\n').length
+    const { el } = await mount({ snapshot: { relativePath: 'README.md', content, totalLines, startLine: 1, endLine: totalLines } })
+    const preview = el.querySelector('.workspace-file__markdown')!
+    const pre = preview.querySelector('pre.code-block.markdown-code-block')!
+    expect(pre).not.toBeNull()
+    expect(pre.querySelector(':scope > .code-lang')?.textContent).toBe('typescript')
+    expect(pre.querySelector(':scope > code')?.textContent).toBe('const value = "hello";')
+    expect(preview.querySelector('ul > li > ul > li')?.textContent).toBe('Nested item')
+    const button = pre.querySelector<HTMLButtonElement>('.code-copy-btn')!
+    button.click()
+    await vi.waitFor(() => expect(copy).toHaveBeenCalledExactlyOnceWith('const value = "hello";'))
+    expect(pre.querySelectorAll('.code-copy-btn')).toHaveLength(1)
+
+    const source = [...el.querySelectorAll<HTMLButtonElement>('button')].find(candidate => candidate.textContent === 'Source')!
+    source.click(); await nextTick()
+    expect(el.querySelector('.workspace-file__markdown')).toBeNull()
+    button.click()
+    expect(copy).toHaveBeenCalledTimes(1)
+
+    const previewButton = [...el.querySelectorAll<HTMLButtonElement>('button')].find(candidate => candidate.textContent === 'Preview')!
+    previewButton.click(); await nextTick()
+    expect(el.querySelectorAll('pre.code-block.markdown-code-block')).toHaveLength(1)
+    expect(el.querySelectorAll('.code-copy-btn')).toHaveLength(1)
+  })
+
+  it('previews complete Markdown safely and switches to highlighted source', async () => {
+    const { el, state } = await mount({ snapshot: { relativePath: 'README.md', content: '# Read me\nA short document.', totalLines: 2, startLine: 1, endLine: 2 } })
+    expect(el.querySelector('.workspace-file__markdown p')?.textContent).toBe('A short document.')
+    expect(el.querySelector('.workspace-file__markdown')?.textContent).toContain('Read me')
+    state.snapshot = { ...state.snapshot!, content: '# Read me\n<script>alert(1)</script>' }
+    await nextTick()
+    expect(el.querySelector('script')).toBeNull()
+    expect(el.querySelector('pre')).toBeNull()
+    const source = [...el.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Source')!
+    source.click()
+    await nextTick()
+    expect(el.querySelectorAll('[data-line]')).toHaveLength(2)
+    expect(el.querySelector('pre')?.textContent).toContain('<script>alert(1)</script>')
+  })
+
+  it('keeps partial Markdown pages in source mode instead of showing an incomplete document', async () => {
+    const { el } = await mount({ snapshot: { ...page(), relativePath: 'large.md', content: '# Partial document' } })
+    expect(el.querySelector('h1')).toBeNull()
+    expect(el.querySelector('pre')).not.toBeNull()
+    expect(el.querySelector('.workspace-file__find')?.getAttribute('style')).toContain('display: none')
+  })
   it('renders source as text and highlights the exact inclusive reference line range', async () => {
     const { el } = await mount({ snapshot: {
       relativePath: 'src/sample.py', content: 'one\n<script>alert(1)</script>\nthree\nfour\n',
@@ -129,7 +180,7 @@ describe('workspace source panel', () => {
 
   it('delegates whole-file copy to its runtime and surfaces pending/failure state', async () => {
     const { el, state, onEvent } = await mount({ snapshot: page() })
-    const copy = [...el.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent?.includes('Copy file contents'))!
+    const copy = el.querySelector<HTMLButtonElement>('button[aria-label="Copy file contents"]')!
     copy.click()
     expect(onEvent).toHaveBeenLastCalledWith({ type: 'workspace-file-copy' })
     state.copying = true

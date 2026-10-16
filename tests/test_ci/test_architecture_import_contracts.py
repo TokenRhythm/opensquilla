@@ -257,6 +257,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("session", "memory"),
     ("session", "persistence"),
     ("session", "provider"),
+    # Side conversation snapshots reuse the sandbox owner's validated grant
+    # projection, so parent once/temporary authorization is never duplicated.
+    ("session", "sandbox"),
     ("session", "tools"),
     ("skills", "engine"),
     ("skills", "gateway"),

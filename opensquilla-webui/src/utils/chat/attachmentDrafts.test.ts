@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, expect, it } from 'vitest'
 
-import { attachmentDraftPayloadBytes } from './attachmentDrafts'
+import { attachmentDraftPayloadBytes, ATTACHMENT_DRAFT_TTL_MS, createMemoryAttachmentDraftStore } from './attachmentDrafts'
 
 const MiB = 1024 * 1024
 const workspaceFile = {
@@ -46,5 +46,58 @@ describe('attachment draft payload accounting', () => {
       expect(() => attachmentDraftPayloadBytes([{ name: `invalid-${index}.bin`,
         mime: 'application/octet-stream', size: 0, workspaceFile: ref }])).toThrow(/reference is invalid/)
     }
+  })
+})
+
+describe('ephemeral attachment drafts use the shared storage contract', () => {
+  const scope = { identity: 'side-owner', sessionKey: 'child' }
+  const attachment = { kind: 'workspace' as const, local_id: 7, name: workspaceFile.name, mime: workspaceFile.mime, size: workspaceFile.size, workspaceFile }
+
+  it('isolates scope and returns copies through the same bounded restoration codec', async () => {
+    const store = createMemoryAttachmentDraftStore()
+    await store.save(scope, [attachment], 'r1')
+    const loaded = await store.loadSnapshot!(scope)
+    expect(loaded.revision).toBe('r1')
+    expect(loaded.attachments[0].workspaceFile).toEqual(workspaceFile)
+    loaded.attachments[0].workspaceFile!.name = 'modified.bin'
+    expect((await store.load(scope))[0].workspaceFile?.name).toBe(workspaceFile.name)
+    expect(await store.load({ ...scope, identity: 'other-owner' })).toEqual([])
+  })
+
+  it('retains file bytes without preserving a browser object URL', async () => {
+    const store = createMemoryAttachmentDraftStore()
+    await store.save(scope, [{ kind: 'inline', local_id: 1, name: 'note.txt', mime: 'text/plain', data: btoa('draft') }], 'r1')
+    const [restored] = await store.load(scope)
+    expect(restored.kind).toBe('failed') // goes through the shared upload preparation on restoration
+    expect(await restored.file?.text()).toBe('draft')
+    expect(restored.dataUrl).toBeUndefined()
+  })
+
+  it('consumes only the acknowledged revision and leaves a newer draft untouched', async () => {
+    const store = createMemoryAttachmentDraftStore()
+    await store.save(scope, [attachment], 'old')
+    await store.save(scope, [attachment, { ...attachment, local_id: 8, name: 'second.bin' }], 'new')
+    expect(await store.consume!(scope, 'old', [0])).toBe(false)
+    expect((await store.load(scope))).toHaveLength(2)
+    expect(await store.consume!(scope, 'new', [0])).toBe(true)
+    expect((await store.load(scope))).toHaveLength(1)
+    expect((await store.loadSnapshot!(scope)).revision).not.toBe('new')
+  })
+
+  it('expires retained drafts and drops all bytes when their owner closes', async () => {
+    let now = 1000
+    const store = createMemoryAttachmentDraftStore(() => now)
+    await store.save(scope, [attachment], 'r1')
+    now += ATTACHMENT_DRAFT_TTL_MS
+    expect(await store.load(scope)).toEqual([])
+    await store.save(scope, [attachment], 'r2')
+    store.clear()
+    expect(await store.load(scope)).toEqual([])
+  })
+
+  it('applies the same validation to unsafe workspace references', async () => {
+    const store = createMemoryAttachmentDraftStore()
+    await expect(store.save(scope, [{ ...attachment, workspaceFile: { ...workspaceFile, relativePath: '../private.txt' } }])).rejects.toThrow('reference is invalid')
+    expect(await store.load(scope)).toEqual([])
   })
 })

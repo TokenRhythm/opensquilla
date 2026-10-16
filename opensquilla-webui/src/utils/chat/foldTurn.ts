@@ -26,6 +26,8 @@ import {
 import { segmentsToTimelineItems } from '@/utils/chat/segmentsToTimelineItems'
 import { toParts, type ToPartsInterrupt } from '@/utils/chat/toParts'
 import { toSources } from '@/utils/chat/toSources'
+import { reconcileTextSnapshot } from '@/utils/chat/textSnapshot'
+export { reconcileTextSnapshot, type ReconciledTextSnapshot } from '@/utils/chat/textSnapshot'
 
 export interface FoldedTurn {
   // The SAME render surface the legacy live refs expose, rebuilt from frames.
@@ -72,55 +74,6 @@ function markPreToolNarration(segments: ChatStreamSegment[], calls: ChatToolCall
 
 /** One ordered interrupt accumulated by the fold, keyed by approvalId. */
 type FoldedInterrupt = ToPartsInterrupt
-
-export interface ReconciledTextSnapshot {
-  rawText: string
-  segments: ChatStreamSegment[]
-  changed: boolean
-}
-
-/**
- * Apply an authoritative terminal text snapshot without losing tool history.
- *
- * A strict extension is still an ordinary answer suffix and therefore stays
- * after the last streamed answer segment. A conflicting snapshot supersedes
- * streamed answer text, but keeps tool groups and intermediate commentary in
- * arrival order before the canonical answer. An empty snapshot intentionally
- * clears answer text while retaining that work history.
- */
-export function reconcileTextSnapshot(
-  segments: ChatStreamSegment[],
-  accumulatedText: string,
-  snapshot: string,
-): ReconciledTextSnapshot {
-  if (snapshot === accumulatedText) {
-    return { rawText: accumulatedText, segments, changed: false }
-  }
-
-  if (accumulatedText && snapshot.startsWith(accumulatedText)) {
-    const suffix = snapshot.slice(accumulatedText.length)
-    const next = segments.slice()
-    const last = next[next.length - 1]
-    if (last?.type === 'text' && last.presentation !== 'intermediate') {
-      next[next.length - 1] = {
-        ...last,
-        raw: `${last.raw || ''}${suffix}`,
-        dirty: true,
-      }
-    } else {
-      next.push({ type: 'text', raw: suffix, html: '', dirty: true, presentation: 'answer' })
-    }
-    return { rawText: snapshot, segments: next, changed: true }
-  }
-
-  const next = segments.filter(segment => (
-    segment.type !== 'text' || segment.presentation === 'intermediate'
-  ))
-  if (snapshot) {
-    next.push({ type: 'text', raw: snapshot, html: '', dirty: true, presentation: 'answer' })
-  }
-  return { rawText: snapshot, segments: next, changed: true }
-}
 
 // A later requested-frame for the same approvalId (a re-broadcast or the
 // hydration backfill that carries args/warning) merges richer fields onto the

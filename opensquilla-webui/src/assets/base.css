@@ -58,7 +58,7 @@ body::before {
 a { color: var(--accent); text-decoration: none; }
 a:hover { color: var(--accent-hover); }
 
-input:not([type="radio"]):not([type="checkbox"]), textarea, select {
+input:not([type="radio"]):not([type="checkbox"]):not(.workspace-files__filter-input), textarea, select {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
@@ -69,7 +69,7 @@ input:not([type="radio"]):not([type="checkbox"]), textarea, select {
   outline: none;
   transition: border-color var(--transition), box-shadow var(--transition);
 }
-input:not([type="radio"]):not([type="checkbox"]):focus, textarea:focus, select:focus {
+input:not([type="radio"]):not([type="checkbox"]):not(.workspace-files__filter-input):focus, textarea:focus, select:focus {
   border-color: var(--accent);
   box-shadow: var(--focus-ring);
 }
@@ -1861,12 +1861,6 @@ pre {
   border-radius: 0;
   box-shadow: none;
   overflow: hidden;
-}
-
-.main .content--chat .chat {
-  border: 0;
-  border-radius: 0;
-  box-shadow: none;
 }
 
 .approval-inline {

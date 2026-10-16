@@ -5,6 +5,7 @@ import i18n from '@/i18n'
 import type { DisplayAttachment } from '@/types/chat'
 import {
   provideArtifactImageLightbox,
+  closeImageLightboxOutsideSession,
   type ArtifactImageLightboxController,
 } from '@/composables/chat/useArtifactImageLightbox'
 import { downloadBlob } from '@/utils/browser'
@@ -76,6 +77,32 @@ afterEach(() => {
 })
 
 describe('shared image preview', () => {
+  it('keeps side images visible under the parent while fetching with child authorization', async () => {
+    mount()
+    requestBinary.mockResolvedValue(httpBinaryResponse('generated', { contentType: 'image/png' }))
+    const artifact = { id: 'side-image', name: 'side.png', mime: 'image/png' }
+    controller.open({ artifact, navigationArtifacts: [artifact], sessionKey: 'side-child', ownerSessionKey: 'main-parent' })
+    closeImageLightboxOutsideSession(controller, 'main-parent', true)
+    await vi.waitFor(() => expect(displayedImage()?.alt).toBe('side.png'))
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/artifacts/side-image', expect.objectContaining({ sessionKey: 'side-child' }))
+    closeImageLightboxOutsideSession(controller, 'another-main', true)
+    await nextTick()
+    expect(controller.request.value).toBeNull()
+    expect(displayedImage()).toBeNull()
+  })
+
+  it('applies the same parent owner boundary to side image attachments', async () => {
+    mount()
+    const image = attachment('side-local')
+    controller.openAttachments({ attachment: image, navigationAttachments: [image], sessionKey: 'side-child', ownerSessionKey: 'main-parent' })
+    closeImageLightboxOutsideSession(controller, 'main-parent', true)
+    await vi.waitFor(() => expect(displayedImage()?.alt).toBe('side-local.png'))
+    expect(controller.request.value?.sessionKey).toBe('side-child')
+    closeImageLightboxOutsideSession(controller, 'main-parent', false)
+    await nextTick()
+    expect(displayedImage()).toBeNull()
+  })
+
   it.each(['', 'application/octet-stream'])('previews a local image with inferred MIME when File.type is %j', async type => {
     mount()
     const image = attachment('inferred', {

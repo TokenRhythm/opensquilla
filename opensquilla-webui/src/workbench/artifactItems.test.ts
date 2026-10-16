@@ -11,6 +11,7 @@ import {
   preparedPreviewFromWorkbenchItem,
   previewableNavigationArtifactsFromWorkbenchItem,
   requestInitialSectionForWorkbenchItem,
+  sessionKeyFromWorkbenchItem,
 } from './artifactItems'
 
 const artifact: ArtifactPayload = {
@@ -41,6 +42,18 @@ describe('artifact Workbench items', () => {
     expect(second).toBe(first)
     expect(first).not.toContain('agent:main')
     expect(first).not.toContain('artifact-1')
+  })
+
+  it('keeps side preview visibility scoped to the parent but reads authorized by the child', () => {
+    const item = createArtifactPreviewWorkbenchItem({
+      artifact: { ...artifact, documentId: 'doc_side' },
+      nativeHtml: false,
+      sessionKey: 'agent:main:sidechat:child',
+      resourceIdentity: 'document:doc_side',
+    })
+    const parentScoped = { ...item, scope: { type: 'session' as const, id: 'agent:main:webchat:parent' } }
+
+    expect(sessionKeyFromWorkbenchItem(parentScoped)).toBe('agent:main:sidechat:child')
   })
 
   it('does not alias distinct legacy artifacts that collided under the old 32-bit key', () => {

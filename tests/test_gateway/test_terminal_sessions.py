@@ -515,3 +515,96 @@ async def test_real_terminal_natural_exit_releases_connection_slot(tmp_path):
         for session in tuple(manager._sessions.values()):
             session.handle.raw._opensquilla_process_tree_owner.start_completion_monitor()
         await manager.close_all()
+
+
+@pytest.mark.asyncio
+async def test_terminal_cancel_during_partial_spawn_cleanup_releases_create_slot(
+    tmp_path, monkeypatch
+):
+    handle = _FakeHandle()
+    cleanup_started = asyncio.Event()
+    cleanup_completed = asyncio.Event()
+    cleanup_calls = 0
+
+    def spawn(*_args, **_kwargs):
+        raise terminal_sessions.PtyBackendError(
+            "reader setup failed", started=True, handle=handle,
+        )
+
+    async def terminate(value):
+        nonlocal cleanup_calls
+        assert value is handle
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            cleanup_started.set()
+            await asyncio.Event().wait()
+        handle.terminated = True
+        cleanup_completed.set()
+
+    monkeypatch.setattr(terminal_sessions, "spawn_pty", spawn)
+    monkeypatch.setattr(terminal_sessions, "terminate_pty", terminate)
+    manager = terminal_sessions.TerminalManager(send_event=lambda *_args: None)
+    task = asyncio.create_task(manager.create(
+        conn_id="conn-cancel-cleanup", session_key="agent:main:webchat:failed",
+        workspace_service=_WorkspaceService(tmp_path), cwd="", command=None,
+        cols=80, rows=24,
+    ))
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(cleanup_completed.wait(), timeout=1)
+    assert handle.terminated is True
+    assert cleanup_calls == 2
+    assert manager._sessions == {}
+    assert manager._creating == {}
+
+
+
+@pytest.mark.asyncio
+async def test_terminal_reader_failure_terminates_live_shell_before_wait(
+    tmp_path, monkeypatch
+):
+    handle = _FakeHandle()
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    events = []
+
+    async def read(*_args):
+        raise terminal_sessions.PtyBackendError("PTY reader disconnected", started=True)
+
+    async def terminate(value):
+        assert value is handle
+        handle.terminated = True
+
+    async def wait(*_args):
+        wait_started.set()
+        await release_wait.wait()
+        return 143
+
+    async def send(event, payload):
+        events.append((event, payload))
+        return True
+
+    monkeypatch.setattr(terminal_sessions, "spawn_pty", lambda *args, **kwargs: handle)
+    monkeypatch.setattr(terminal_sessions, "read_pty", read)
+    monkeypatch.setattr(terminal_sessions, "terminate_pty", terminate)
+    monkeypatch.setattr(terminal_sessions, "wait_pty", wait)
+    manager = terminal_sessions.TerminalManager(send_event=send)
+    created = await manager.create(
+        conn_id="conn-reader-error", session_key="agent:main:webchat:reader",
+        workspace_service=_WorkspaceService(tmp_path), cwd="", command=None,
+        cols=80, rows=24,
+    )
+    task = manager._sessions[created["terminalId"]].reader_task
+    try:
+        await asyncio.wait_for(wait_started.wait(), timeout=1)
+        # A broken output stream does not imply the shell has exited. Waiting
+        # on that live process before terminating it strands the PTY forever.
+        assert handle.terminated is True
+    finally:
+        release_wait.set()
+        await asyncio.wait_for(task, timeout=1)
+    assert manager._sessions == {}
+    assert [kind for kind, _ in events] == ["terminal.exit"]
+    assert events[0][1]["reason"] == "reader_error"

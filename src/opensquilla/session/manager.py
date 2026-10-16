@@ -1104,13 +1104,21 @@ class SessionManager:
         self,
         session_key: str,
         agent_id: str = "main",
+        *,
+        reuse_existing: bool = False,
         **kwargs: Any,
     ) -> SessionNode:
-        """Create a new session entry. Raises ValueError if key already exists."""
+        """Create a session; optional reuse atomically preserves a same-key winner.
+
+        Callers using reuse must validate the returned winner's bindings. The
+        default keeps the historical duplicate rejection/create behavior.
+        """
         session_key = canonicalize_session_key(session_key)
         agent_id = normalize_agent_id(agent_id)
         existing = await self._storage.get_session(session_key)
         if existing is not None:
+            if reuse_existing:
+                return existing
             raise ValueError(f"Session already exists: {session_key}")
 
         node = self._build_session_node(
@@ -1119,19 +1127,28 @@ class SessionManager:
             **self._prepare_new_session_kwargs(kwargs),
         )
         preparation = await self._prepare_execution_workspace(node)
-        if preparation is None:
-            await self._storage.upsert_session(node)
+
+        async def persist() -> SessionNode:
+            if reuse_existing:
+                inserted = await self._storage.insert_session(node)
+                if not inserted:
+                    winner = await self._storage.get_session(session_key)
+                    if winner is None:
+                        raise KeyError(f"Session disappeared during creation: {session_key}")
+                    return winner
+            else:
+                await self._storage.upsert_session(node)
+            if preparation is not None:
+                preparation.mark_committed(node.session_id)
             return node
 
-        async def persist() -> None:
-            await self._storage.upsert_session(node)
-            preparation.mark_committed(node.session_id)
+        if preparation is None:
+            return await persist()
 
         try:
-            await _settle_workspace_operation(persist())
+            return await _settle_workspace_operation(persist())
         finally:
             await preparation.close()
-        return node
 
     async def get_or_create(
         self,
@@ -1882,6 +1899,33 @@ class SessionManager:
             invalid_turn_ids=frozenset(invalid_turn_ids),
         )
 
+    async def create_sidechat(self, parent_session_key: str, client_request_id: str) -> SessionNode:
+        """Create/recover an idempotent parent snapshot without inheriting runtime work."""
+        from opensquilla.session.sidechat import (
+            create_snapshot,
+            finish_preparation,
+            sidechat_metadata,
+        )
+
+        parent_session_key = canonicalize_session_key(parent_session_key)
+        await self.get_session_routing(
+            parent_session_key, fallback_mode=self._default_model_routing_mode(),
+        )
+        child = await create_snapshot(self._storage, parent_session_key, client_request_id)
+        metadata = sidechat_metadata(child)
+        assert metadata is not None
+        if metadata["state"] == "ready":
+            return child
+        parent = await self._storage.get_session(parent_session_key)
+        if parent is None or parent.session_id != metadata["parentSessionId"]:
+            raise ValueError("Parent conversation changed while preparing side conversation")
+        await self._copy_fork_materials(parent.session_id, child.session_id, child.session_key)
+        # Side conversations are ephemeral.  They can inspect the inherited
+        # workspace through the normal scoped runtime, but must not receive a
+        # second mutable working-file tree or worktree attachment binding.
+        # Transcript attachment references remain immutable context only.
+        return await finish_preparation(self._storage, child)
+
     async def branch(
         self,
         parent_session_key: str,
@@ -1945,6 +1989,10 @@ class SessionManager:
         parent = await self._storage.get_session(parent_session_key)
         if parent is None:
             raise KeyError(f"Parent session not found: {parent_session_key}")
+        from opensquilla.session.sidechat import sidechat_metadata
+
+        if sidechat_metadata(parent) is not None:
+            raise ValueError("Side conversations cannot be forked")
         # A fork must never inherit a legacy NULL into the future.  Resolve the
         # parent under its durable row first, then give the child an independent
         # CAS generation for its copied concrete selection.
@@ -2512,9 +2560,16 @@ class SessionManager:
                 parent = await self._storage.get_session(child.parent_session_key or "")
                 if parent is not None and parent.session_id == source_session_id:
                     entries = await self._storage.get_canonical_transcript(target_session_id)
-                    await self._fork_attachment_working_files(
-                        parent, child, allowed_hashes=_fork_material_references(entries)[0],
-                    )
+                    # Ephemeral side conversations deliberately retain only
+                    # immutable attachment references.  Do not materialize a
+                    # second mutable working-file tree for them; regular
+                    # user-visible forks still receive the normal copy.
+                    from opensquilla.session.sidechat import sidechat_metadata
+
+                    if sidechat_metadata(child) is None:
+                        await self._fork_attachment_working_files(
+                            parent, child, allowed_hashes=_fork_material_references(entries)[0],
+                        )
                     current = await self._storage.get_session(target_session_key)
                     if current is None:
                         raise StaleEpochError("Fork target disappeared before material settlement")
@@ -3207,12 +3262,27 @@ class SessionManager:
             after=after,
             content_mode=content_mode,
         )
-        canonical_complete = await self._storage.is_canonical_transcript_complete(node.session_id)
+        from opensquilla.session.sidechat import sidechat_metadata
+
+        canonical_complete = (
+            await self._storage.is_display_transcript_complete(node.session_id)
+            if sidechat_metadata(node) is not None
+            else await self._storage.is_canonical_transcript_complete(node.session_id)
+        )
         return CanonicalTranscriptPage(
             entries=entries,
             has_more=has_more,
             canonical_complete=canonical_complete,
         )
+
+    async def get_display_summaries(self, session_key: str) -> list[SessionSummary]:
+        """Display only checkpoints produced by this side conversation itself."""
+        from opensquilla.session.sidechat import sidechat_metadata
+
+        summaries = await self.get_summaries(session_key)
+        node = await self._storage.get_session(session_key)
+        inherited_ids = set((sidechat_metadata(node) or {}).get("inheritedSummaryIds", ()))
+        return [summary for summary in summaries if summary.id not in inherited_ids]
 
     async def get_summaries(
         self,

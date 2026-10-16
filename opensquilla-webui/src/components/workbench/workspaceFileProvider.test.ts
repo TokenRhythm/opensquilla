@@ -151,7 +151,7 @@ function deferred<T>() {
   const promise = new Promise<T>(finish => { resolve = finish })
   return { promise, resolve }
 }
-async function setupFile(overrides: Partial<WorkspaceFiles> = {}, inputFile = file) {
+async function setupFile(overrides: Partial<WorkspaceFiles> = {}, inputFile = file, ownerSessionKey = 'task') {
   const state: Record<string, unknown> = {}
   const read = vi.fn().mockResolvedValue(new Blob(['entire file\nincluding other pages\n']))
   const readPage = vi.fn(async (_session: string, _file: WorkspaceFile, startLine: number) => ({
@@ -160,7 +160,7 @@ async function setupFile(overrides: Partial<WorkspaceFiles> = {}, inputFile = fi
     startLine, endLine: Math.min(startLine + 199, 450), totalLines: 450,
   }))
   const access: WorkspaceFiles = { read, readPage, resolve: vi.fn(), ...overrides }
-  const item = createResolvedWorkspaceFileItem('task', inputFile)
+  const item = createResolvedWorkspaceFileItem('task', inputFile, ownerSessionKey)
   const runtime = await createWorkspaceFileDefinition(null, access, key => key).createRuntime!(item, {
     getRenderState: () => state,
     updateRenderState: patch => Object.assign(state, patch),
@@ -173,6 +173,24 @@ async function setupFile(overrides: Partial<WorkspaceFiles> = {}, inputFile = fi
 }
 
 describe('paged source operations', () => {
+  it('keeps paging, search and copy authorized by the child when its tab is visible under the parent', async () => {
+    const search = vi.fn(async () => ({ relativePath: file.path, totalLines: 450, matchLine: 445 }))
+    const f = await setupFile({ search }, file, 'parent')
+    expect(f.item.scope).toEqual({ type: 'session', id: 'parent' })
+    expect(f.readPage).toHaveBeenCalledWith('task', file, 1, 200, expect.any(AbortSignal))
+    f.event('workspace-file-page', { startLine: 201 })
+    await vi.waitFor(() => expect(f.state.snapshot).toMatchObject({ startLine: 201 }))
+    expect(f.readPage).toHaveBeenLastCalledWith('task', file, 201, 400, expect.any(AbortSignal))
+    f.event('workspace-file-search', { query: 'needle' })
+    await vi.waitFor(() => expect(f.state.searchStatus).toBe('found'))
+    expect(search).toHaveBeenCalledWith('task', file, 'needle', expect.any(AbortSignal))
+    expect(f.readPage).toHaveBeenLastCalledWith('task', file, 401, 600, expect.any(AbortSignal))
+    f.event('workspace-file-copy')
+    await vi.waitFor(() => expect(f.state.copied).toBe(true))
+    expect(f.read).toHaveBeenCalledWith('task', file, expect.any(AbortSignal))
+    f.runtime.dispose!('closed')
+  })
+
   it('uses one full-file search request then fetches and focuses only the matched page', async () => {
     const pending = deferred<{ relativePath: string; totalLines: number; matchLine: number | null }>()
     const search = vi.fn(() => pending.promise)

@@ -7,6 +7,59 @@ test.beforeEach(async ({ page }) => {
   await page.goto('/__richtext-core-fixture')
 })
 
+test('workspace Markdown links retain inert candidates and only resolved files become actions', async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    const renderPath = '/src/utils/markdown/renderCore.ts'
+    const filesPath = '/src/utils/chat/workspaceFiles.ts'
+    const { renderMarkdownCore } = await import(renderPath)
+    const { workspaceFileCandidates, decorateWorkspaceFileLinks } = await import(filesPath)
+    const root = document.createElement('div')
+    root.innerHTML = renderMarkdownCore('[打开游戏](flappy-bird.html) [missing](missing.html) [outside](../private.html)')
+    document.body.append(root)
+    const before = { candidates: workspaceFileCandidates(root), hrefs: root.querySelectorAll('[href]').length,
+      actions: root.querySelectorAll('button, [role="link"]').length }
+    const opened: string[] = []
+    // Only the current-session resolver's result is offered to the decorator.
+    decorateWorkspaceFileLinks(root, [{ requestedPath: 'flappy-bird.html', path: 'flappy-bird.html',
+      name: 'flappy-bird.html', kind: 'text', mime: 'text/html', size: 24, workspaceBinding: 'validated-child-binding' }],
+    file => opened.push(file.workspaceBinding), file => file.name)
+    root.querySelector<HTMLButtonElement>('button')?.click()
+    return { before, opened, actions: root.querySelectorAll('button').length,
+      label: root.querySelector('button')?.textContent, remaining: workspaceFileCandidates(root), hrefs: root.querySelectorAll('[href]').length }
+  })
+  expect(result.before).toEqual({ candidates: ['flappy-bird.html', 'missing.html', '../private.html'], hrefs: 0, actions: 0 })
+  expect(result.opened).toEqual(['validated-child-binding'])
+  expect(result.actions).toBe(1)
+  expect(result.label).toBe('打开游戏')
+  expect(result.remaining).toEqual(['missing.html', '../private.html'])
+  expect(result.hrefs).toBe(0)
+  expect(page.url()).toMatch(/\/__richtext-core-fixture$/)
+})
+
+test('workspace candidates do not widen protocol, markup or relative navigation privileges', async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    const renderPath = '/src/utils/markdown/renderCore.ts'
+    const filesPath = '/src/utils/chat/workspaceFiles.ts'
+    const { renderMarkdownCore } = await import(renderPath)
+    const { workspaceFileCandidates } = await import(filesPath)
+    const root = document.createElement('div')
+    root.innerHTML = renderMarkdownCore([
+      '[javascript](javascript:evil.html)', '[data](data:text/html,evil.html)',
+      '[file](file:///private.html)', '[network](//evil.invalid/page.html)',
+      '[query](page.html?download=1)', '[public](https://example.com/page.html)',
+      '<a data-workspace-path="javascript:evil.html" href="javascript:evil.html">forged</a>',
+      '<span data-workspace-path="game.html">wrong element</span>',
+      '<a data-workspace-path="bad&quot;&gt;&lt;img src=x&gt;.html" onclick="alert(1)">markup</a>',
+    ].join('\n\n'))
+    return { candidates: workspaceFileCandidates(root),
+      hrefs: Array.from(root.querySelectorAll('a[href]')).map(node => node.getAttribute('href')),
+      dangerous: root.querySelectorAll('script, img, [onclick], span[data-workspace-path]').length }
+  })
+  expect(result.candidates).toEqual([])
+  expect(result.hrefs).toEqual(['https://example.com/page.html'])
+  expect(result.dangerous).toBe(0)
+})
+
 test('math keeps root/overbrace paths and accessible MathML while supporting numeric and parenthesized expressions', async ({ page }) => {
   const result = await page.evaluate(async () => {
     const path = '/src/utils/markdown/renderCore.ts'

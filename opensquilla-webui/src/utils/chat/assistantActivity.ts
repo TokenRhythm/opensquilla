@@ -13,6 +13,7 @@ import {
   compactionSkippedLabelCode,
 } from '@/utils/chat/compactionStatus'
 import { activityToolName, isAnswerTransparentControlTool } from '@/utils/chat/toolDisplay'
+import { readableTextAggregate } from '@/utils/chat/textAggregate'
 
 type TextPart = Extract<ChatPart, { type: 'text' }>
 
@@ -254,6 +255,7 @@ export interface AssistantActivityProjection extends AssistantActivityTimelinePr
 
 export type AssistantAnswerSource =
   | 'canonical'
+  | 'live-timeline'
   | 'explicit-presentation'
   | 'terminal-timeline-boundary'
   | 'terminal-control-boundary'
@@ -378,6 +380,9 @@ export function splitLiveAssistantTimeline(
   options: LiveAssistantTimelineSplitOptions = {},
 ): LiveAssistantTimelineSplit {
   const last = timeline[timeline.length - 1]
+  if (last?.type === 'text' && last.presentation === 'intermediate') {
+    return { activityItems: timeline.slice(), answerItem: null }
+  }
   if (last?.type === 'text'
     && Number.isSafeInteger(last.activityOrder) && Number(last.activityOrder) > 0
     && Number.isSafeInteger(options.toolInputPreviewOrder)
@@ -512,16 +517,6 @@ function normalizedComparableText(value: string): string {
 interface TimelineTextAggregates {
   compact: string
   readable: string
-}
-
-function readableTextAggregate(chunks: string[]): string {
-  let readable = chunks[0] || ''
-  for (const chunk of chunks.slice(1)) {
-    readable += /\s$/u.test(readable) || /^\s/u.test(chunk)
-      ? chunk
-      : `\n\n${chunk}`
-  }
-  return readable
 }
 
 function timelineTextAggregates(
@@ -759,6 +754,19 @@ export function resolveAssistantAnswer(
   timeline: ChatStreamTimelineItem[] = message.timelineItems ?? [],
   lifecycle: AssistantActivityLifecycle = 'settled',
 ): AssistantAnswerResolution {
+  const markedLiveTimeline = timeline.every(item => item.type !== 'text'
+    || item.presentation === 'intermediate' || item.presentation === 'answer')
+  if (message.isStreaming && timeline.length && markedLiveTimeline && (lifecycle === 'working' || lifecycle === 'answering')) {
+    // The side surface renders the shared AssistantMessage during streaming.
+    // Use the main live edge's exact split: canonical text may include every
+    // pre-tool narration and must never be treated as a second live answer.
+    // Unmarked legacy/partial history keeps the existing fail-open path.
+    const live = splitLiveAssistantTimeline(timeline, {
+      keepToolTurnTextInActivity: true,
+      toolInputPreviewOrder: Math.max(0, ...(message.toolInputPreviews || []).map(preview => preview.activityOrder)),
+    })
+    return { text: live.answerItem?.rawText || '', source: 'live-timeline', activityItems: live.activityItems }
+  }
   const visibleTimeline = timeline.filter(
     item => !isSuccessfulAnswerTransparentControlGroup(item),
   )
@@ -1400,10 +1408,12 @@ export function projectAssistantActivity(
   const hasTimelineText = timeline.some(item => item.type === 'text')
   const hasCanonicalAnswer = Boolean(answerResolution.text.trim())
   const canSeparateActivity = hasCanonicalAnswer
+    || answerResolution.source === 'live-timeline'
     || answerResolution.source === 'explicit-no-answer'
     || !hasTimelineText
   const hasStructuralAnswerBoundary =
-    answerResolution.source === 'explicit-presentation'
+    answerResolution.source === 'live-timeline'
+    || answerResolution.source === 'explicit-presentation'
     || answerResolution.source === 'terminal-control-boundary'
     || answerResolution.source === 'terminal-timeline-boundary'
   const rawActivityItems = canSeparateActivity

@@ -4890,6 +4890,29 @@ async def start_gateway_server(
     from opensquilla.tools.builtin.sessions import set_task_runtime
 
     set_task_runtime(task_runtime)
+    from opensquilla.gateway.auth import Principal
+    from opensquilla.gateway.rpc import RpcContext
+    from opensquilla.gateway.sidechat_leases import restore_sidechat_leases
+
+    sidechat_context = RpcContext(
+        conn_id="sidechat-lease-recovery",
+        principal=Principal(
+            role="operator", scopes=frozenset({"operator.admin"}),
+            is_owner=True, authenticated=True,
+        ),
+        config=config, session_manager=svc.session_manager,
+        turn_runner=turn_runner, task_runtime=task_runtime,
+    )
+
+    async def close_recovered_sidechat(key: str) -> object:
+        response = await get_dispatcher().dispatch(
+            f"sidechat-recovery:{key}", "sessions.sidechat.close", {"key": key}, sidechat_context,
+        )
+        if not response.ok:
+            raise RuntimeError("Side conversation cleanup is still draining")
+        return response.payload
+
+    await restore_sidechat_leases(sidechat_context, close_recovered_sidechat)
     recover_stranded_steers = getattr(task_runtime, "recover_stranded_steers", None)
     if callable(recover_stranded_steers):
         steer_recovery = await recover_stranded_steers()

@@ -3,13 +3,13 @@
     <header class="terminal-panel__status" role="status" aria-live="polite">
       <span class="terminal-panel__dot" :class="`is-${state}`" aria-hidden="true" />
       <span>{{ stateLabel }}</span>
-      <span v-if="lastSeq > 0" class="terminal-panel__seq">#{{ lastSeq }}</span>
+      <span v-if="cwdPath" class="terminal-panel__cwd" :title="cwdPath">{{ cwdLabel }}</span>
       <button v-if="state === 'exited' || state === 'error'" type="button" class="btn btn--ghost" @click.stop="restart">
         {{ t('workbench.terminal.restart') }}
       </button>
     </header>
-    <div ref="surface" class="terminal-panel__surface" :aria-label="t('workbench.terminal.input')" />
     <p v-if="errorMessage" class="terminal-panel__error" role="alert">{{ errorMessage }}</p>
+    <div ref="surface" class="terminal-panel__surface" :aria-label="t('workbench.terminal.input')" />
   </section>
 </template>
 
@@ -19,9 +19,10 @@ import { useI18n } from 'vue-i18n'
 import { Terminal as XTerm } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
-import { TERMINAL_ACCESS_KEY, type TerminalAccess } from '@/modules/terminal'
+import { TERMINAL_ACCESS_KEY, normalizeTerminalTarget, terminalTargetKey, type TerminalAccess, type TerminalExit, type TerminalOutput, type TerminalTarget } from '@/modules/terminal'
+import { readTerminalTheme } from './terminalTheme'
 
-const props = defineProps<{ sessionKey: string }>()
+const props = defineProps<{ sessionKey?: string; target?: TerminalTarget }>()
 const { t } = useI18n()
 const terminal = inject<TerminalAccess | null>(TERMINAL_ACCESS_KEY, null)
 const surface = ref<HTMLElement | null>(null)
@@ -29,9 +30,16 @@ const state = ref<'starting' | 'running' | 'exited' | 'error'>('starting')
 const errorMessage = ref('')
 const lastSeq = ref(0)
 const terminalId = ref('')
+const cwdPath = ref('')
+const cwdLabel = computed(() => {
+  const segments = cwdPath.value.split(/[\\/]/).filter(Boolean)
+  return segments[segments.length - 1] || cwdPath.value
+})
+const target = computed(() => normalizeTerminalTarget(props.target ?? { kind: 'session', sessionKey: props.sessionKey }))
 let stopOutput: (() => void) | null = null
 let stopExit: (() => void) | null = null
 let resizeObserver: ResizeObserver | null = null
+let themeObserver: MutationObserver | null = null
 let resizeTimer: ReturnType<typeof setTimeout> | null = null
 let mounted = true
 let writeQueue = Promise.resolve()
@@ -47,11 +55,9 @@ function append(text: string) { xterm?.write(text) }
 
 function focusInput() { xterm?.focus() }
 
-function cssColor(name: 'backgroundColor' | 'color', fallback: string) {
-  const node = surface.value
-  const style = node ? getComputedStyle(name === 'backgroundColor' ? (node.parentElement ?? node) : node) : null
-  const value = style?.[name].trim() || ''
-  return value || fallback
+function refreshTheme() {
+  // Updating options recolors the existing buffer without recreating the PTY.
+  if (xterm && surface.value) xterm.options.theme = readTerminalTheme(surface.value)
 }
 
 function write(data: string) {
@@ -85,18 +91,22 @@ function scheduleResize() {
 }
 
 async function start() {
-  if (!terminal || !props.sessionKey) { state.value = 'error'; errorMessage.value = t('workbench.terminal.unavailable'); return }
-  state.value = 'starting'; errorMessage.value = ''; lastSeq.value = 0; lastResize = ''
+  const requestedTarget = target.value
+  if (!terminal || !requestedTarget) { state.value = 'error'; errorMessage.value = t('workbench.terminal.unavailable'); return }
+  state.value = 'starting'; errorMessage.value = ''; lastSeq.value = 0; lastResize = ''; cwdPath.value = ''
   xterm?.dispose(); xterm = null; fitAddon = null; stopData?.(); stopData = null
   if (surface.value) {
     xterm = new XTerm({
       cursorBlink: true,
+      cursorStyle: 'bar',
+      cursorWidth: 2,
+      fontFamily: getComputedStyle(surface.value).fontFamily,
+      fontSize: 13,
+      lineHeight: 1.35,
+      minimumContrastRatio: 4.5,
       scrollback: 5_000,
       convertEol: true,
-      theme: {
-        background: cssColor('backgroundColor', 'transparent'),
-        foreground: cssColor('color', 'currentColor'),
-      },
+      theme: readTerminalTheme(surface.value),
     })
     fitAddon = new FitAddon()
     xterm.loadAddon(fitAddon)
@@ -107,37 +117,59 @@ async function start() {
     stopData = () => dataSubscription.dispose()
   }
   stopOutput?.(); stopExit?.()
-  stopOutput = terminal.onOutput(event => {
-    if (event.sessionKey && event.sessionKey !== props.sessionKey) return
-    // The PTY reader starts immediately after create commits ownership. Keep
-    // a same-session first frame while the create response is in flight so an
-    // initial shell prompt cannot be lost on a busy remote connection.
-    if (!terminalId.value && state.value === 'starting' && event.sessionKey === props.sessionKey) {
-      terminalId.value = event.terminalId
+  // Shell output can beat the create response. Buffer matching-target frames
+  // until its terminalId is known: two panels may create the same target, so
+  // adopting the first arriving terminalId would bind one panel to the other.
+  const earlyFrames: Array<TerminalOutput | TerminalExit> = []
+  const droppedTerminals = new Set<string>()
+  let earlyChars = 0
+  const matchesTarget = (event: TerminalOutput | TerminalExit) => {
+    const eventTarget = event.target ?? (event.sessionKey ? { kind: 'session' as const, sessionKey: event.sessionKey } : null)
+    return eventTarget ? terminalTargetKey(eventTarget) === terminalTargetKey(requestedTarget) : false
+  }
+  const queueEarly = (event: TerminalOutput | TerminalExit) => {
+    if (!matchesTarget(event)) return
+    earlyFrames.push(event)
+    earlyChars += 'data' in event ? event.data.length : 0
+    while (earlyFrames.length > 256 || earlyChars > 256 * 1024) {
+      const removed = earlyFrames.shift()!
+      earlyChars -= 'data' in removed ? removed.data.length : 0
+      droppedTerminals.add(removed.terminalId)
     }
+  }
+  const applyOutput = (event: TerminalOutput) => {
+    if ((event.target || event.sessionKey) && !matchesTarget(event)) return
     if (event.terminalId !== terminalId.value || event.seq <= lastSeq.value) return
     if (lastSeq.value && event.seq > lastSeq.value + 1) append(`\r\n[${t('workbench.terminal.outputGap')}]\r\n`)
     lastSeq.value = event.seq
     append(event.data)
-  })
-  stopExit = terminal.onExit(event => {
-    if (event.sessionKey && event.sessionKey !== props.sessionKey) return
-    if (!terminalId.value && state.value === 'starting' && event.sessionKey === props.sessionKey) {
-      terminalId.value = event.terminalId
-    }
+  }
+  const applyExit = (event: TerminalExit) => {
+    if ((event.target || event.sessionKey) && !matchesTarget(event)) return
     if (event.terminalId !== terminalId.value || event.seq < lastSeq.value) return
     lastSeq.value = Math.max(lastSeq.value, event.seq)
     state.value = 'exited'
     append(`\r\n[${t('workbench.terminal.exited')}${event.exitCode === null ? '' : `: ${event.exitCode}`} ]\r\n`)
+  }
+  stopOutput = terminal.onOutput(event => {
+    if (!terminalId.value && state.value === 'starting') queueEarly(event)
+    else applyOutput(event)
+  })
+  stopExit = terminal.onExit(event => {
+    if (!terminalId.value && state.value === 'starting') queueEarly(event)
+    else applyExit(event)
   })
   try {
-    const handle = await terminal.create(props.sessionKey, { cols: 100, rows: 30 })
+    const handle = await terminal.create(props.target ? requestedTarget : props.sessionKey!, { cols: 100, rows: 30 })
     if (!mounted) { await terminal.close(handle.terminalId, 'component-unmount').catch(() => {}); return }
-    if (terminalId.value && terminalId.value !== handle.terminalId) {
-      await terminal.close(handle.terminalId, 'duplicate-create').catch(() => {})
-      return
-    }
     terminalId.value = handle.terminalId
+    cwdPath.value = handle.cwdPath ?? ''
+    if (droppedTerminals.has(handle.terminalId)) append(`\r\n[${t('workbench.terminal.outputGap')}]\r\n`)
+    for (const event of earlyFrames) {
+      if ('data' in event) applyOutput(event)
+      else applyExit(event)
+    }
+    earlyFrames.length = 0
     if (state.value === 'starting') state.value = 'running'
     await nextTick(focusInput)
     scheduleResize()
@@ -157,12 +189,15 @@ async function restart() {
 onMounted(() => {
   mounted = true
   if (typeof ResizeObserver !== 'undefined') { resizeObserver = new ResizeObserver(scheduleResize); if (surface.value) resizeObserver.observe(surface.value) }
+  themeObserver = new MutationObserver(refreshTheme)
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'class', 'style'] })
   void start()
 })
 onBeforeUnmount(() => {
   mounted = false
   if (resizeTimer !== null) clearTimeout(resizeTimer)
   resizeObserver?.disconnect()
+  themeObserver?.disconnect()
   stopOutput?.(); stopExit?.()
   stopData?.(); xterm?.dispose(); xterm = null
   if (terminalId.value && terminal) void terminal.close(terminalId.value, 'component-unmount').catch(() => {})
@@ -170,14 +205,14 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
-.terminal-panel { display:flex; min-height:0; flex:1; flex-direction:column; background:var(--bg); color:var(--text); font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }
-.terminal-panel__status { display:flex; align-items:center; gap:8px; min-height:34px; padding:0 12px; border-bottom:1px solid var(--border); color:var(--text-dim); font:var(--fs-sm) var(--font-sans); }
+.terminal-panel { display:flex; min-height:0; flex:1; flex-direction:column; background:var(--bg); color:var(--text); font-family:var(--font-mono); }
+.terminal-panel__status { display:flex; flex-shrink:0; align-items:center; gap:7px; min-height:28px; padding:0 16px; border-bottom:1px solid var(--border); color:var(--text-muted); font:12px var(--font-sans); }
 .terminal-panel__status .btn { margin-left:auto; }
-.terminal-panel__dot { width:8px; height:8px; border-radius:50%; background:var(--text-muted); }
+.terminal-panel__cwd { margin-left:auto; max-width:60%; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; color:var(--text-dim); }
+.terminal-panel__dot { width:6px; height:6px; border-radius:50%; background:var(--text-muted); }
 .terminal-panel__dot.is-running { background:var(--ok); }.terminal-panel__dot.is-error { background:var(--danger); }.terminal-panel__dot.is-exited { background:var(--warn); }
-.terminal-panel__seq { margin-left:auto; font-size:11px; opacity:.7; }
-.terminal-panel__surface { min-height:0; flex:1; overflow:hidden; padding:12px; }
+.terminal-panel__surface { min-height:0; flex:1; overflow:hidden; padding:14px 16px; }
 .terminal-panel__surface :deep(.xterm) { height:100%; }
 .terminal-panel__surface :deep(.xterm-viewport) { overflow-y:auto !important; }
-.terminal-panel__error { margin:0; padding:8px 12px; color:var(--danger); border-top:1px solid var(--danger); font:var(--fs-sm) var(--font-sans); }
+.terminal-panel__error { flex-shrink:0; max-height:8rem; overflow:auto; overflow-wrap:anywhere; white-space:pre-wrap; margin:0; padding:8px 12px; color:var(--danger); border-bottom:1px solid var(--danger); font:var(--fs-sm) var(--font-sans); }
 </style>

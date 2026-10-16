@@ -249,6 +249,7 @@
       </button>
       <span class="msg-copy-live" aria-live="polite">{{ copyLiveText }}</span>
       <button
+        v-if="editAvailable !== false"
         type="button"
         class="msg-action"
         :class="{ 'msg-action--disabled': isStreaming }"
@@ -286,6 +287,7 @@ import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import { isImageAttachmentMime, isImageDisplayAttachment } from '@/utils/chat/attachments'
 import { ARTIFACT_WORKBENCH_KEY, type ArtifactPreviewController } from '@/modules/artifactWorkbench'
+import { artifactUsesWorkbenchPreview } from '@/utils/workbench/artifactPreview'
 import { fileTypeLabel } from '@/utils/fileType'
 import { localPathName, localPathPresentation } from '@/types/localPathReferences'
 import {
@@ -301,7 +303,7 @@ import {
 const { t } = useI18n()
 const artifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY, null)
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   message: ChatRenderedMessage
   sessionKey?: string
   shareMode: boolean
@@ -312,12 +314,13 @@ const props = defineProps<{
   downloadAttachment: (attachment: DisplayAttachment) => Promise<boolean>
   showTurnOutcome?: boolean
   isStreaming?: boolean
+  editAvailable?: boolean
   isGoalSource?: boolean
   canReusePromptAnnotations?: boolean
   workbenchResourcePreviewEnabled?: boolean
   workbenchResourceEditEnabled?: boolean
   workbenchAttachmentResources?: ReadonlyMap<string, WorkbenchResource>
-}>()
+}>(), { editAvailable: true })
 
 const emit = defineEmits<{
   edit: [message: ChatRenderedMessage]
@@ -537,10 +540,7 @@ function attachmentMeta(attachment: DisplayAttachment): string {
 
 function workbenchAttachment(attachment: DisplayAttachment): boolean {
   if (!attachment.attachmentId) return false
-  const mime = attachment.mime.split(';', 1)[0].trim().toLowerCase()
-  const name = attachment.name.trim().toLowerCase()
-  return mime === 'text/html' || mime === 'application/xhtml+xml'
-    || name.endsWith('.html') || name.endsWith('.htm') || name.endsWith('.xhtml')
+  return artifactUsesWorkbenchPreview({ name: attachment.name, mime: attachment.mime })
 }
 
 function workbenchAttachmentResource(attachment: DisplayAttachment): WorkbenchResource | null {

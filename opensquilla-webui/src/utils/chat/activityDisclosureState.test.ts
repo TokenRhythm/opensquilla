@@ -6,6 +6,7 @@ import {
   readAssistantActivityDuration,
   readAssistantActivityExpansion,
   readAssistantActivityManualChoice,
+  releaseAssistantActivitySession,
   writeAssistantActivityDuration,
   writeAssistantActivityExpansion,
 } from './activityDisclosureState'
@@ -15,6 +16,39 @@ const key = (session: string, turn = 'turn') => JSON.stringify([session, 'assist
 beforeEach(() => clearAssistantActivityExpansionState())
 
 describe('retained session activity choices', () => {
+  it('keeps main and side activity live independently through mount, reset, and close', () => {
+    const main = Symbol('main')
+    const side = Symbol('side')
+    activateAssistantActivitySession('main', 'gateway-one', main)
+    writeAssistantActivityExpansion(key('main'), false, '', true)
+    writeAssistantActivityDuration(key('main'), 17)
+    activateAssistantActivitySession('side', 'gateway-one', side)
+    writeAssistantActivityExpansion(key('side'), true, '', true)
+    writeAssistantActivityDuration(key('side'), 9)
+    expect(readAssistantActivityManualChoice(key('main'))).toBe(false)
+    expect(readAssistantActivityDuration(key('main'))).toBe(17)
+    clearAssistantActivityExpansionState('side')
+    expect(readAssistantActivityDuration(key('main'))).toBe(17)
+    activateAssistantActivitySession('side-two', 'gateway-one', side)
+    releaseAssistantActivitySession(side)
+    expect(readAssistantActivityManualChoice(key('main'))).toBe(false)
+    expect(readAssistantActivityDuration(key('main'))).toBe(17)
+    releaseAssistantActivitySession(main)
+  })
+
+  it('retiring one owner does not discard a session still mounted by another owner', () => {
+    const first = Symbol('first')
+    const second = Symbol('second')
+    activateAssistantActivitySession('shared', 'gateway-one', first)
+    writeAssistantActivityDuration(key('shared'), 33)
+    activateAssistantActivitySession('shared', 'gateway-one', second)
+    activateAssistantActivitySession('other', 'gateway-one', first)
+    expect(readAssistantActivityDuration(key('shared'))).toBe(33)
+    releaseAssistantActivitySession(first)
+    releaseAssistantActivitySession(second)
+    expect(readAssistantActivityDuration(key('shared'))).toBe(0)
+  })
+
   it('restores only manual choices across A/B/A and never restores elapsed or automatic live state', () => {
     activateAssistantActivitySession('a', 'gateway-one')
     const continuity = assistantActivityContinuityKey('a', 'turn')

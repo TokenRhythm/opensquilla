@@ -1650,6 +1650,25 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded')).toBe('false')
   })
 
+  it.each([false, true])('retains the same activity node and manual expanded=%s choice when streaming settles', async expanded => {
+    const message = reactive(baseMessage({ isStreaming: true, timelineItems: successfulTimeline(), meta: usageMeta() }))
+    const el = mountMessage(message)
+    await nextTick()
+    const activity = el.querySelector('.assistant-activity')
+    const liveToggle = el.querySelector<HTMLButtonElement>('.assistant-activity__live-head')!
+    liveToggle.click(); await nextTick()
+    if (expanded) { liveToggle.click(); await nextTick() }
+    expect(liveToggle.getAttribute('aria-expanded')).toBe(String(expanded))
+    expect(el.querySelector('.msg-ai-footer')).toBeNull()
+
+    message.isStreaming = false
+    await nextTick()
+    expect(el.querySelector('.assistant-activity')).toBe(activity)
+    expect(el.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded')).toBe(String(expanded))
+    expect(el.querySelector('.assistant-activity__body')?.getAttribute('aria-hidden')).toBe(String(!expanded))
+    expect(el.querySelector('.msg-ai-footer')).not.toBeNull()
+  })
+
   it.each(['collapsed', 'expanded'] as const)(
     'loads file details only inside visible activity and preserves manual choices with %s preference',
     async mode => {

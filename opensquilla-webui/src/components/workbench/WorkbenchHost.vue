@@ -344,7 +344,7 @@ function onHoverEscape(event: KeyboardEvent) {
 const mountedItems = computed(() => {
   const visibleIds = new Set(store.visibleItems.map(item => item.id))
   return store.items.filter(item => visibleIds.has(item.id)
-    || item.kind === 'browser' && item.retention === 'keep-alive')
+    || ['browser', 'assistant-chat'].includes(item.kind) && item.retention === 'keep-alive')
 })
 
 const measuredAvailableWidth = computed(() => {

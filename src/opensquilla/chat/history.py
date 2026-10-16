@@ -505,6 +505,13 @@ def transcript_entries_to_chat_messages(
         raise ValueError("preview_bytes must be an integer")
     if preview_bytes <= 0:
         raise ValueError("preview_bytes must be positive")
+    entries = [
+        entry for entry in entries
+        if not (
+            isinstance(getattr(entry, "turn_context", None), dict)
+            and entry.turn_context.get("visibility") == "model-only"
+        )
+    ]
     selected = entries[-limit:] if limit is not None else entries
     context_entries = [
         *([previous_entry] if previous_entry is not None else []),

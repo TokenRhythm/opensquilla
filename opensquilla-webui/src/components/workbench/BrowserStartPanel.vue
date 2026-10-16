@@ -31,11 +31,11 @@
     </button>
     <button v-if="canOpenWorkspace" type="button" class="btn btn--ghost browser-start__workspace" @click="$emit('open-workspace')">
       <Icon name="folder" :size="14" aria-hidden="true" />
-      {{ t('workspaceFiles.open') }}
+      {{ t('workbench.workspaceFiles.open') }}
     </button>
     <button v-if="canOpenTerminal" type="button" class="btn btn--ghost browser-start__workspace" @click="$emit('open-terminal')">
       <Icon name="terminal" :size="14" aria-hidden="true" />
-      {{ t('terminal.open') }}
+      {{ t('workbench.terminal.open') }}
     </button>
   </section>
 </template>

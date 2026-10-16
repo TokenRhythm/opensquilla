@@ -671,6 +671,22 @@ class ArtifactSessionService:
             session_id=_required(session_id, "session_id"),
         )
 
+    async def resolve_fork_document_heads(
+        self,
+        *,
+        session_key: str,
+        session_id: str,
+        source_document_ids: Sequence[str],
+    ) -> dict[str, CommitResult]:
+        return await self.repository.resolve_fork_document_heads(
+            session_key=_required(session_key, "session_key"),
+            session_id=_required(session_id, "session_id"),
+            source_document_ids=tuple(
+                _required(document_id, "source_document_id")
+                for document_id in source_document_ids
+            ),
+        )
+
     async def fork_session_heads(
         self,
         *,

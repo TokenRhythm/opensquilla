@@ -4,6 +4,7 @@ import type {
 } from './transportTypes'
 import type { PlanCardActionTarget, PlanRevisionRequest } from '@/types/plans'
 import type { PlanCenter, PlanEvent, PlanMutationResult } from '@/modules/planCenter'
+import { PlanModeConflictError } from '@/modules/planCenter'
 import { PLANS_SET_MODE_METHOD } from '@/contracts/generated/v4/plansSetMode'
 import { validateResult as validateSetModeResult } from '@/contracts/generated/v4/plansSetModeValidators.mjs'
 import { PLANS_REVISE_METHOD } from '@/contracts/generated/v4/plansRevise'
@@ -83,8 +84,19 @@ export function createV4PlanCenter(transport: PlanTransport, events: PlanEvents)
         && transport.supports(PLANS_IMPLEMENT_METHOD)
         && transport.supports(PLANS_CANCEL_RUN_METHOD)
     },
-    setMode(sessionKey, mode, expectedRevision, options) {
-      return requestResult(transport, PLANS_SET_MODE_METHOD, validateSetModeResult, { sessionKey, mode, expectedRevision }, options?.signal)
+    async setMode(sessionKey, mode, expectedRevision, options) {
+      try {
+        return await requestResult(transport, PLANS_SET_MODE_METHOD, validateSetModeResult, { sessionKey, mode, expectedRevision }, options?.signal)
+      } catch (error) {
+        const source = object(error)
+        const current = object(object(source.details).collaboration)
+        if (source.code === 'COLLABORATION_CHANGED'
+          && (current.mode === 'default' || current.mode === 'plan')
+          && typeof current.revision === 'number' && Number.isInteger(current.revision) && current.revision >= 0) {
+          throw new PlanModeConflictError({ mode: current.mode, revision: current.revision }, error)
+        }
+        throw error
+      }
     },
     revise(sessionKey, request: PlanRevisionRequest, clientRequestId, options) {
       return requestResult(transport, PLANS_REVISE_METHOD, validateReviseResult, {

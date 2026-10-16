@@ -1,3 +1,4 @@
+import { stripChatTimePrefix } from '@/utils/chat/timePrefix'
 import { renderMarkdownCore, type MarkdownCoreOptions } from '@/utils/markdown/renderCore'
 import { sanitizeAssistantPresentationText } from '@/utils/chat/silentSentinels'
 import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
@@ -10,7 +11,6 @@ import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentine
 
 const DIRECTIVE_TAG_RE = /\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*/g
 const GENERATED_ARTIFACT_MARKER_RE = /(?:^|\s*)\[generated artifact omitted:\s*[^\]\n]+?\]\s*/gi
-const TIME_PREFIX_RE = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+\-]\d{2}:\d{2} (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Za-z0-9_+\-/]+\]\n/
 
 const MARKDOWN_CACHE_MAX_BYTES = 8 * 1024 * 1024
 // Count source and HTML as UTF-16 below. A 128 KiB answer therefore needs more
@@ -37,7 +37,7 @@ export function useChatTextRendering() {
   }
 
   function stripTimePrefix(text: string): string {
-    return typeof text === 'string' ? text.replace(TIME_PREFIX_RE, '') : text
+    return stripChatTimePrefix(text)
   }
 
   function renderMarkdown(text: string, opts?: RenderMarkdownOptions): string {

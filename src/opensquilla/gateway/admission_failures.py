@@ -15,6 +15,7 @@ from opensquilla.application.admission_failures import (
     AdmissionTaskCollectionUnavailableError,
 )
 from opensquilla.session.plans import PlanConflictError, PlanRunConflictError
+from opensquilla.session.sidechat import SidechatAdmissionRejectedError
 from opensquilla.session.storage import (
     PendingChatInputConflictError,
     PlanImplementationSessionBusyError,
@@ -27,6 +28,10 @@ from opensquilla.session.storage import (
 
 def admission_failure(error: Exception) -> Exception | None:
     """Preserve failure identity and retry facts without exposing native models."""
+    if isinstance(error, SidechatAdmissionRejectedError):
+        from opensquilla.application.admission_errors import AdmissionError
+
+        return AdmissionError("INVALID_REQUEST", str(error), accepted=False, retryable=False)
     if isinstance(error, StorageBusyError):
         return AdmissionStorageBusyError(
             error.operation,

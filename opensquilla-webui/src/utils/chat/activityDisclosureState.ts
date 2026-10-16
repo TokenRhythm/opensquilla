@@ -10,8 +10,10 @@ let expansionVersion = 0
 const manualChoicesBySession = new Map<string, Map<string, ExpansionState>>()
 const MAX_RETAINED_SESSIONS = 6
 const MAX_MANUAL_CHOICES_PER_SESSION = 256
-let activeSessionKey = ''
-let activeScope: string | null = null
+interface ActivityOwner { sessionKey: string; scope: string | null }
+const DEFAULT_OWNER = Symbol('route-activity-owner')
+const activeOwners = new Map<symbol, ActivityOwner>()
+const retainedScopes = new Map<string, string>()
 
 function keyBelongsToSession(key: string, sessionKey: string): boolean {
   try {
@@ -22,34 +24,81 @@ function keyBelongsToSession(key: string, sessionKey: string): boolean {
   }
 }
 
-/** Preserve explicit reader choices, never elapsed time or automatic live state. */
-export function activateAssistantActivitySession(sessionKey: string, scope: string | null | undefined): void {
-  const nextScope = scope || null
-  if (nextScope === activeScope && sessionKey === activeSessionKey) return
-  if (nextScope !== activeScope || !nextScope) {
-    clearAssistantActivityExpansionState()
-  } else if (activeSessionKey) {
-    const choices = [...expandedByKey].filter(([key, state]) => state.manual
-      && keyBelongsToSession(key, activeSessionKey))
-      .sort((a, b) => a[1].version - b[1].version)
-      .slice(-MAX_MANUAL_CHOICES_PER_SESSION)
-    manualChoicesBySession.delete(activeSessionKey)
-    if (choices.length) manualChoicesBySession.set(activeSessionKey, new Map(choices))
+function clearLiveSession(sessionKey: string): void {
+  for (const key of expandedByKey.keys()) {
+    if (keyBelongsToSession(key, sessionKey)) expandedByKey.delete(key)
   }
-  expandedByKey.clear()
-  durationByKey.clear()
-  activeScope = nextScope
-  activeSessionKey = sessionKey
-  const choices = nextScope ? manualChoicesBySession.get(sessionKey) : undefined
+  for (const key of durationByKey.keys()) {
+    if (keyBelongsToSession(key, sessionKey)) durationByKey.delete(key)
+  }
+}
+
+function retireInactiveSession(previous: ActivityOwner, preserve: boolean): void {
+  const { sessionKey, scope } = previous
+  if ([...activeOwners.values()].some(owner => owner.sessionKey === sessionKey)) return
+  const choices = preserve && scope
+    ? [...expandedByKey].filter(([key, state]) => state.manual && keyBelongsToSession(key, sessionKey))
+      .sort((a, b) => a[1].version - b[1].version).slice(-MAX_MANUAL_CHOICES_PER_SESSION)
+    : []
+  manualChoicesBySession.delete(sessionKey)
+  if (choices.length && scope) {
+    manualChoicesBySession.set(sessionKey, new Map(choices))
+    retainedScopes.set(sessionKey, scope)
+  } else retainedScopes.delete(sessionKey)
+  clearLiveSession(sessionKey)
+}
+
+/**
+ * Each mounted conversation owns its active session independently. Navigation
+ * retires only that owner's previous session, never a simultaneously visible
+ * main/side surface. Inactive retention keeps only explicit reader choices.
+ */
+export function activateAssistantActivitySession(
+  sessionKey: string,
+  scope: string | null | undefined,
+  ownerToken = DEFAULT_OWNER,
+): void {
+  const nextScope = scope || null
+  const previous = activeOwners.get(ownerToken)
+  if (previous?.scope === nextScope && previous.sessionKey === sessionKey) return
+  activeOwners.delete(ownerToken)
+  if (previous) {
+    retireInactiveSession(previous, previous.scope === nextScope)
+    if (previous.scope !== nextScope) {
+      // Retained choices from this authenticated namespace must not survive
+      // a delivery identity change. Other mounted owners remain untouched.
+      for (const [key, retainedScope] of retainedScopes) {
+        if (retainedScope === previous.scope) {
+          manualChoicesBySession.delete(key)
+          retainedScopes.delete(key)
+        }
+      }
+    }
+  }
+  const alreadyActive = [...activeOwners.values()].some(owner => owner.sessionKey === sessionKey
+    && owner.scope === nextScope)
+  activeOwners.set(ownerToken, { sessionKey, scope: nextScope })
+  if (alreadyActive) return
+  clearLiveSession(sessionKey)
+  const choices = nextScope && retainedScopes.get(sessionKey) === nextScope
+    ? manualChoicesBySession.get(sessionKey) : undefined
   // The active session is kept in the ordinary live map; the bounded cache
   // contains only inactive sessions. Reading a session refreshes its LRU age.
   manualChoicesBySession.delete(sessionKey)
+  retainedScopes.delete(sessionKey)
   if (choices) for (const [key, state] of choices) expandedByKey.set(key, state)
   while (manualChoicesBySession.size >= MAX_RETAINED_SESSIONS) {
     const oldest = manualChoicesBySession.keys().next().value
     if (oldest === undefined) break
     manualChoicesBySession.delete(oldest)
+    retainedScopes.delete(oldest)
   }
+}
+
+export function releaseAssistantActivitySession(ownerToken = DEFAULT_OWNER): void {
+  const previous = activeOwners.get(ownerToken)
+  activeOwners.delete(ownerToken)
+  if (previous) retireInactiveSession(previous, true)
 }
 
 export function assistantActivityContinuityKey(sessionKey: string, turnKey: string): string {
@@ -125,16 +174,13 @@ export function writeAssistantActivityDuration(
 export function clearAssistantActivityExpansionState(sessionKey?: string): void {
   if (sessionKey !== undefined) {
     manualChoicesBySession.delete(sessionKey)
-    for (const key of expandedByKey.keys()) {
-      if (keyBelongsToSession(key, sessionKey)) expandedByKey.delete(key)
-    }
-    for (const key of durationByKey.keys()) {
-      if (keyBelongsToSession(key, sessionKey)) durationByKey.delete(key)
-    }
+    retainedScopes.delete(sessionKey)
+    clearLiveSession(sessionKey)
     return
   }
   expandedByKey.clear()
   durationByKey.clear()
   manualChoicesBySession.clear()
+  retainedScopes.clear()
   expansionVersion = 0
 }

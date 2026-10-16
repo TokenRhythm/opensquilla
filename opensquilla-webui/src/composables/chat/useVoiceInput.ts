@@ -254,6 +254,7 @@ export function useVoiceInput(transcription: AudioTranscription) {
     voiceBusy,
     voiceRecording,
     toggleVoiceInput,
+    cancel: cancelRecording,
     cleanup,
   }
 }

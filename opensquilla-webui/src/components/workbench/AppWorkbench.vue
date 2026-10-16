@@ -347,7 +347,7 @@ import {
 } from '@/workbench/resourceCapabilityPresentation'
 import {
   artifactPayloadFromWorkbenchResource,
-  createResourceCollectionWorkbenchItem,
+  refreshResourceCollectionWorkbenchItem,
   resourceFromPreparedPreview,
   resourceUsesNativeHtmlPreview,
   resourceCollectionWorkbenchItemId,
@@ -364,8 +364,10 @@ import {
 import { PageAnnotationSendQueue } from '@/workbench/pageAnnotationSendQueue'
 import { useWorkbenchStore } from '@/workbench/store'
 import { createWorkspaceFilesWorkbenchItem } from '@/workbench/workspaceFileItems'
+import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
 import { createTerminalWorkbenchItem } from '@/workbench/terminalItems'
 import { createAssistantChatWorkbenchItem } from '@/workbench/assistantChatItems'
+import { closeAssistantChatOwner } from '@/modules/assistantChat'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
 import type {
   NativeSurfaceRect,
@@ -408,6 +410,10 @@ const props = withDefaults(defineProps<{
   officePromptAnnotationsEnabled?: boolean
   routeActive?: boolean
   sessionId?: string
+  conversationStarted?: boolean
+  sessionDurable?: boolean
+  sessionPreparable?: boolean
+  prepareSession?: (expectedSessionKey: string) => Promise<string | null>
   workspaceId?: string | null
   workspaceReady?: boolean
   workspaceResolved?: boolean
@@ -419,6 +425,9 @@ const props = withDefaults(defineProps<{
   officePromptAnnotationsEnabled: false,
   routeActive: false,
   sessionId: '',
+  conversationStarted: false,
+  sessionDurable: false,
+  sessionPreparable: false,
   workspaceId: null,
   workspaceReady: false,
   workspaceResolved: false,
@@ -457,17 +466,23 @@ const newPanelMenu = ref<HTMLElement | null>(null)
 const newPanelMenuTrigger = ref<HTMLButtonElement | null>(null)
 const newPanelMenuStyle = ref({ left: '0px', top: '0px' })
 const sessionReady = computed(() => Boolean(props.sessionId && store.activeSessionId === props.sessionId))
+const preparingPanel = ref(false)
+let panelOpeningGeneration = 0
+const canPrepareSession = computed(() => sessionReady.value
+  && (props.sessionDurable || props.sessionPreparable && Boolean(props.prepareSession)))
 const gatewayAvailable = computed(() => Boolean(gateway?.availability === 'available'
   && gateway.isAvailable && gateway.connectionHealth === 'healthy' && !gateway.isResuming
   && (!gateway.connectionPhase || gateway.connectionPhase === 'healthy')))
 const gatewayCanExecuteHost = computed(() => gateway?.canExecuteHost === true)
 const canOpenBrowser = computed(() => Boolean(nativeApi && sessionReady.value))
 const canOpenWorkspaceFiles = computed(() => Boolean(workspaceFiles && props.workspaceId && props.workspaceReady
-  && sessionReady.value && gatewayAvailable.value && gateway?.isLocalOwner))
+  && canPrepareSession.value && gatewayAvailable.value && gateway?.isLocalOwner))
 const canOpenTerminal = computed(() => Boolean(terminal && sessionReady.value
+  && props.workspaceResolved && (!props.workspaceId || props.workspaceReady)
   && gatewayAvailable.value && gatewayCanExecuteHost.value))
-const canOpenAssistantChat = computed(() => Boolean(sessionReady.value && gatewayAvailable.value
+const canOpenAssistantChat = computed(() => Boolean(sessionReady.value && props.sessionDurable && props.conversationStarted && gatewayAvailable.value
   && gateway?.deliveryIdentity && assistantPortsAvailable && props.workspaceResolved
+  && (!assistantSessionLifecycle?.supportsSidechat || assistantSessionLifecycle.supportsSidechat())
   && (!props.workspaceId || props.workspaceReady)))
 const newPanelMenuVisible = computed(() => Boolean(nativeApi || workspaceFiles || terminal || referenceGateway))
 
@@ -500,7 +515,8 @@ const newPanelOptions = computed<NewPanelOption[]>(() => {
       disabledReason: canOpenTerminal.value ? undefined : sessionReason
         || (!gatewayAvailable.value || gateway?.hostExecuteUnavailableReason === 'disconnected'
           ? gatewayUnavailableReason() : gateway?.hostExecuteUnavailableReason === 'permission'
-          ? t('workbench.newPanel.requiresHostExecute') : t('workbench.newPanel.terminalUnavailable')),
+          ? t('workbench.newPanel.requiresHostExecute') : !props.workspaceResolved || props.workspaceId && !props.workspaceReady
+            ? t('workbench.newPanel.workspaceNotReady') : t('workbench.newPanel.terminalUnavailable')),
     },
     {
       kind: 'assistant-chat', label: t('workbench.newPanel.assistantChat'), icon: 'chat',
@@ -508,24 +524,37 @@ const newPanelOptions = computed<NewPanelOption[]>(() => {
       disabledReason: canOpenAssistantChat.value ? undefined : sessionReason
         || (!gatewayAvailable.value ? gatewayUnavailableReason()
           : !props.workspaceResolved || props.workspaceId && !props.workspaceReady
-            ? t('workbench.newPanel.workspaceUnavailable')
+            ? t('workbench.newPanel.workspaceNotReady')
             : t('workbench.newPanel.assistantUnavailable')),
     },
   ]
-  return options.filter(option => option.kind !== 'workspace-files' || Boolean(props.workspaceId))
+  return options.filter(option => (option.kind !== 'workspace-files' || Boolean(props.workspaceId))
+    && (option.kind !== 'assistant-chat' || props.sessionDurable && props.conversationStarted))
+    .map(option => preparingPanel.value ? { ...option, disabled: true,
+      disabledReason: t('workbench.newPanel.preparing') } : option)
 })
+watch(() => [props.sessionId, props.workspaceId, props.routeActive, props.enabled, props.modalBlocked, store.expanded,
+  gateway?.subscriptionEpoch, gateway?.deliveryIdentity, gatewayAvailable.value], () => {
+  panelOpeningGeneration += 1
+  preparingPanel.value = false
+}, { flush: 'sync' })
 watch(() => [referenceGateway?.subscriptionEpoch, referenceGateway?.availability,
-  referenceGateway?.isLocalOwner, referenceGateway?.deliveryIdentity], () => {
+  referenceGateway?.isLocalOwner, referenceGateway?.deliveryIdentity], (next, previous) => {
   // A filesystem snapshot is valid only for the connection that authorized it.
   for (const item of [...store.items]) {
     if (item.kind === 'file' || item.kind === 'workspace-files' || item.kind === 'terminal'
-      || item.kind === 'assistant-chat' || item.kind === 'tool-file-history') store.closeItem(item.id, 'scope-changed')
+      || item.kind === 'tool-file-history'
+      || item.kind === 'assistant-chat' && previous && next[3] !== previous[3]) store.closeItem(item.id, 'scope-changed')
   }
 })
-watch(() => props.workspaceId, () => {
+// Durability gates creation, not the lifetime of an existing side chat.
+// ChatView changes its draft flag before publishing the next session key, and
+// the route-header bridge also defaults to false while an owner is loading.
+// Scope switching hides retained side chats; only explicit close retires them.
+watch(() => props.workspaceId, (_next, _previous) => {
   for (const item of [...store.items]) {
     if (item.scope.type === 'session' && item.scope.id === props.sessionId
-      && ['workspace-files', 'terminal', 'assistant-chat'].includes(item.kind)) {
+      && ['workspace-files', 'terminal'].includes(item.kind)) {
       store.closeItem(item.id, 'scope-changed')
     }
   }
@@ -790,13 +819,36 @@ function onNewPanelViewportChange(event: Event) {
   closeNewPanelMenu()
 }
 
-function selectNewPanel(option: NewPanelOption) {
+async function selectNewPanel(option: NewPanelOption) {
+  if (!props.routeActive || !props.enabled || props.modalBlocked || !store.expanded) return
   if (option.disabled || newPanelOptions.value.find(current => current.kind === option.kind)?.disabled !== false) return
   closeNewPanelMenu()
-  if (option.kind === 'browser') openBrowserStart()
-  else if (option.kind === 'workspace-files') openWorkspaceFiles()
-  else if (option.kind === 'terminal') openTerminal()
-  else if (option.kind === 'assistant-chat') openAssistantChat()
+  if (option.kind === 'browser') { openBrowserStart(); return }
+  // A PTY or an empty side chat is not a durable main-chat session.
+  if (option.kind === 'terminal') { openTerminal(); return }
+  if (option.kind === 'assistant-chat') { openAssistantChat(); return }
+  const sourceSession = props.sessionId
+  const sourceWorkspace = props.workspaceId
+  const sourceEpoch = gateway?.subscriptionEpoch
+  const sourceIdentity = gateway?.deliveryIdentity
+  const generation = ++panelOpeningGeneration
+  const isCurrent = () => generation === panelOpeningGeneration && props.routeActive && props.enabled && !props.modalBlocked
+    && props.sessionId === sourceSession && props.workspaceId === sourceWorkspace
+    && gateway?.subscriptionEpoch === sourceEpoch && gateway?.deliveryIdentity === sourceIdentity
+    && gatewayAvailable.value && store.expanded
+  preparingPanel.value = true
+  try {
+    const key = props.sessionDurable ? sourceSession : await props.prepareSession?.(sourceSession)
+    await nextTick()
+    if (!key || key !== sourceSession || !isCurrent() || !props.sessionDurable) return
+    closeNewPanelMenu()
+    if (option.kind === 'workspace-files') openWorkspaceFiles()
+  } catch (error) {
+    if (isCurrent()) pushToast(error instanceof Error ? error.message : t('workbench.newPanel.prepareFailed'),
+      { tone: 'danger', duration: 6000 })
+  } finally {
+    if (generation === panelOpeningGeneration) preparingPanel.value = false
+  }
 }
 
 function openBrowserUrl(value: string, newTab = false) {
@@ -851,7 +903,9 @@ function openWorkspaceFiles() {
 function openTerminal() {
   const sessionId = props.sessionId
   if (!canOpenTerminal.value) return
-  const item = { ...createTerminalWorkbenchItem(sessionId), title: t('workbench.newPanel.terminal') }
+  const item = { ...createTerminalWorkbenchItem(sessionId, props.workspaceId
+    ? { kind: 'project', workspaceId: props.workspaceId }
+    : { kind: 'default-agent', agentId: agentIdFromSessionKey(sessionId) }), title: t('workbench.newPanel.terminal') }
   if (!store.openItem(item)) {
     pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
   }
@@ -1018,7 +1072,7 @@ const stopPromptAnnotationLifecycle = store.onLifecycle(event => {
 })
 
 function resourceSessionKey(item: WorkbenchItem): string {
-  return item.scope.type === 'session' ? item.scope.id : ''
+  return sessionKeyFromWorkbenchItem(item)
 }
 
 function openResourceArtifact(
@@ -1027,9 +1081,10 @@ function openResourceArtifact(
   sessionKey: string,
   preparedPreview?: WorkbenchPreviewDescriptor,
   initialSection: 'preview' | 'source' = 'preview',
+  ownerItem?: WorkbenchItem,
 ) {
   const nativeArtifact = resourceUsesNativeHtmlPreview(resource)
-  store.openItem(artifactPreviewItemForExplicitOpen({
+  const previewItem = artifactPreviewItemForExplicitOpen({
     artifact,
     initialSection,
     nativeHtml: Boolean(
@@ -1041,7 +1096,11 @@ function openResourceArtifact(
     previewLeaseEligible: nativeArtifact,
     resourceIdentity: workbenchResourceKey(resource.resource),
     sessionKey,
-  }))
+    ...(ownerItem ? { navigationArtifacts: navigationArtifactsFromWorkbenchItem(ownerItem) } : {}),
+  })
+  // Side resources are authorized by the child, but every tab opened from
+  // their preview stays visible in the owning parent's Workbench.
+  store.openItem(ownerItem ? { ...previewItem, scope: ownerItem.scope } : previewItem)
 }
 
 async function openWorkbenchResource(
@@ -1058,7 +1117,7 @@ async function openWorkbenchResource(
     const artifact = artifactPayloadFromRevision(current.revision)
     artifact.documentId = current.document.documentId
     artifact.revisionId = current.revision.revisionId
-    openResourceArtifact(current.resource, artifact, sessionKey)
+    openResourceArtifact(current.resource, artifact, sessionKey, undefined, 'preview', item)
     return
   }
   if (!current && resource.resource.type === 'document') {
@@ -1066,6 +1125,9 @@ async function openWorkbenchResource(
       resource,
       artifactPayloadFromWorkbenchResource(resource),
       sessionKey,
+      undefined,
+      'preview',
+      item,
     )
     return
   }
@@ -1075,7 +1137,7 @@ async function openWorkbenchResource(
     && resource.capabilities.edit
     && resource.sha256
   ) {
-    await importWorkbenchResourceForSession(resource, sessionKey, isCurrent)
+    await importWorkbenchResourceForSession(resource, sessionKey, isCurrent, item)
     return
   }
   const readonlyResource = current?.resource || resource
@@ -1104,6 +1166,9 @@ async function openWorkbenchResource(
       readonlyResource,
       artifactPayloadFromWorkbenchResource(readonlyResource),
       sessionKey,
+      undefined,
+      'preview',
+      item,
     )
     return
   }
@@ -1115,6 +1180,8 @@ async function openWorkbenchResource(
     artifactPayloadFromWorkbenchResource(resolved),
     sessionKey,
     resolved.resource.type === 'document' ? undefined : preview?.preview,
+    'preview',
+    item,
   )
 }
 
@@ -1122,6 +1189,7 @@ async function importWorkbenchResourceForSession(
   resource: WorkbenchResource,
   sessionKey: string,
   isCurrent: () => boolean = () => true,
+  ownerItem?: WorkbenchItem,
 ) {
   if (!isCurrent()) return
   const imported = await workbenchResources.importDocument(sessionKey, resource)
@@ -1154,7 +1222,7 @@ async function importWorkbenchResourceForSession(
       headArtifactId: imported.revision.artifactId,
       source: resource.resource,
     },
-  }, artifact, sessionKey)
+  }, artifact, sessionKey, undefined, 'preview', ownerItem)
 }
 
 async function publishWorkbenchResource(
@@ -1217,12 +1285,13 @@ async function downloadWorkbenchResource(
 
 function refreshResourceCollectionItem(sessionKey: string) {
   const itemId = resourceCollectionWorkbenchItemId(sessionKey)
-  if (!store.items.some(item => item.id === itemId)) return
-  store.updateItem(createResourceCollectionWorkbenchItem({
-    resources: workbenchResources.navigationResources(sessionKey),
-    sessionKey,
-    title: t('workbench.resources.title'),
-  }))
+  const existing = store.items.find(item => item.id === itemId)
+  if (!existing) return
+  store.updateItem(refreshResourceCollectionWorkbenchItem(
+    existing,
+    workbenchResources.navigationResources(sessionKey),
+    t('workbench.resources.title'),
+  ))
 }
 
 async function refreshArtifactDocumentItem(
@@ -1335,12 +1404,13 @@ async function selectNavigationArtifact(
   select.value = item.id
   const navigationArtifacts = navigationArtifactsFromWorkbenchItem(item)
   const sessionKey = sessionKeyFromWorkbenchItem(item)
+  const visibleSessionKey = item.scope.type === 'session' ? item.scope.id : ''
   const navigationGeneration = ++artifactNavigationGeneration
   const scopeGeneration = scopeChangeGeneration
   const isCurrent = () => navigationGeneration === artifactNavigationGeneration
     && scopeGeneration === scopeChangeGeneration
-    && props.routeActive && props.sessionId === sessionKey
-    && store.activeSessionId === sessionKey && store.activeItemId === item.id
+    && props.routeActive && props.sessionId === visibleSessionKey
+    && store.activeSessionId === visibleSessionKey && store.activeItemId === item.id
     && store.items.some(candidate => candidate.id === item.id)
   if (!isCurrent()) return
   const kind = artifactWorkbenchPreviewKind(artifact)
@@ -1370,7 +1440,7 @@ async function selectNavigationArtifact(
     }
   }
   if (!isCurrent()) return
-  store.openItem(artifactPreviewItemForExplicitOpen({
+  const previewItem = artifactPreviewItemForExplicitOpen({
     artifact,
     navigationArtifacts,
     nativeHtml: Boolean(
@@ -1378,7 +1448,8 @@ async function selectNavigationArtifact(
       && platform.workbench.native,
     ),
     sessionKey,
-  }))
+  })
+  store.openItem({ ...previewItem, scope: item.scope })
 }
 
 function panelHeader(item: WorkbenchItem | null): WorkbenchPanelHeader {
@@ -1760,6 +1831,17 @@ async function beforeCloseItem(
   item: WorkbenchItem,
   options?: WorkbenchBeforeCloseOptions,
 ): Promise<boolean> {
+  if (item.kind === 'assistant-chat' && item.scope.type === 'session') {
+    if (!assistantSessionLifecycle || !gateway?.deliveryIdentity) return false
+    try {
+      await closeAssistantChatOwner({ identity: gateway.deliveryIdentity, parentKey: item.scope.id,
+        ownerId: String(item.payload.ownerId || item.id), lifecycle: assistantSessionLifecycle })
+      return true
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : t('workbench.assistantChat.unavailable'), { tone: 'danger', duration: 9000 })
+      return false
+    }
+  }
   const nativeClose = await requestNativeBrowserClose(item, nativeApi)
   if (nativeClose !== null) return nativeClose
   const accepted = await runtimeManager.beforeClose(item, options)
@@ -1777,7 +1859,7 @@ async function setSessionScopeSafely(sessionId: string | null) {
   const previousSessionId = store.activeSessionId
   if (previousSessionId === sessionId) return
   const staleItems = store.items.filter(item =>
-    item.scope.type === 'session' && item.scope.id !== sessionId && item.kind !== 'browser')
+    item.scope.type === 'session' && item.scope.id !== sessionId && item.kind !== 'browser' && item.kind !== 'assistant-chat')
   for (const item of staleItems) {
     if (!await beforeCloseItem(item) || generation !== scopeChangeGeneration) return
   }
@@ -1848,6 +1930,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  panelOpeningGeneration += 1
   document.removeEventListener('pointerdown', onNewPanelOutside, true)
   window.removeEventListener('resize', onNewPanelViewportChange)
   window.removeEventListener('scroll', onNewPanelViewportChange, true)

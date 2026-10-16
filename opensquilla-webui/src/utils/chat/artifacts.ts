@@ -1,6 +1,7 @@
 import type { ArtifactPayload } from '@/types/artifacts'
 import type { IconName } from '@/utils/icons'
 import { fileTypeLabel } from '@/utils/fileType'
+import { isSourceTextFile } from '@/utils/textFilePreview'
 
 const ARTIFACT_MIME_CATEGORIES: Record<string, string> = {
   'application/json': 'data', 'application/ndjson': 'data', 'application/pdf': 'document',
@@ -51,6 +52,7 @@ export function artifactCategory(artifact: ArtifactPayload): string {
   if (mime.startsWith('audio/')) return 'audio'
   if (mime.startsWith('video/')) return 'video'
   if (ARTIFACT_MIME_CATEGORIES[mime]) return ARTIFACT_MIME_CATEGORIES[mime]
+  if (isSourceTextFile(artifactName(artifact), mime)) return 'code'
   if (!mime || mime === 'application/octet-stream') {
     const ext = artifactExtension(artifactName(artifact))
     if (ARTIFACT_EXTENSION_CATEGORIES[ext]) return ARTIFACT_EXTENSION_CATEGORIES[ext]
@@ -111,11 +113,12 @@ export function artifactFileSubtitle(artifact: ArtifactPayload): string {
 
 /**
  * Previewable types get an Open affordance: images plus documents
- * (pdf / html / markdown / plain text). Data and code are download-only.
+ * (pdf / html / markdown / plain text) and supported source text files.
  */
 export function canPreview(artifact: ArtifactPayload): boolean {
   const cat = artifactCategory(artifact)
   return cat === 'visual' || cat === 'document'
+    || isSourceTextFile(artifactName(artifact), artifactMime(artifact))
 }
 
 export function artifactMeta(artifact: ArtifactPayload): string {

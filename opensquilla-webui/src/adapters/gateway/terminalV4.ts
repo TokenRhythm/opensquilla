@@ -1,4 +1,4 @@
-import type { TerminalAccess, TerminalCreateOptions, TerminalExit, TerminalHandle, TerminalOutput } from '@/modules/terminal'
+import { normalizeTerminalTarget, type TerminalAccess, type TerminalCreateOptions, type TerminalExit, type TerminalHandle, type TerminalOutput, type TerminalTarget } from '@/modules/terminal'
 import type { TransportCallOptions, TransportEventHandler } from './transportTypes'
 
 interface RpcTransport {
@@ -44,11 +44,13 @@ function parseCreate(value: unknown): TerminalHandle {
   const source = record(value)
   const terminalId = text(source?.terminalId ?? source?.terminal_id)
   const sessionKey = text(source?.sessionKey ?? source?.session_key)
+  const target = normalizeTerminalTarget(source?.target)
+  const cwdPath = text(source?.cwdPath ?? source?.cwd_path)
   const cols = positiveInt(source?.cols)
   const rows = positiveInt(source?.rows)
   const shell = text(source?.shell)
-  if (!terminalId || !sessionKey || !cols || !rows || !shell) throw new Error('terminal.create returned an invalid response')
-  return { terminalId, sessionKey, cols, rows, shell }
+  if (!terminalId || (!sessionKey && !target) || (source?.target !== undefined && !target) || !cols || !rows || !shell) throw new Error('terminal.create returned an invalid response')
+  return { terminalId, ...(sessionKey ? { sessionKey } : {}), ...(target ? { target } : {}), ...(cwdPath ? { cwdPath } : {}), cols, rows, shell }
 }
 
 function parseWrite(value: unknown) {
@@ -82,17 +84,21 @@ function parseOutput(value: unknown): TerminalOutput | null {
   const source = record(value)
   const terminalId = text(source?.terminalId ?? source?.terminal_id)
   const sessionKey = text(source?.sessionKey ?? source?.session_key)
+  const target = normalizeTerminalTarget(source?.target)
+  if (source?.target !== undefined && !target) return null
   const seq = source?.seq
   const data = source?.data
   if (!terminalId || typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 0 || typeof data !== 'string') return null
   if (source?.encoding !== undefined && source.encoding !== 'utf8') return null
-  return { terminalId, ...(sessionKey ? { sessionKey } : {}), seq, data, encoding: 'utf8' }
+  return { terminalId, ...(sessionKey ? { sessionKey } : {}), ...(target ? { target } : {}), seq, data, encoding: 'utf8' }
 }
 
 function parseExit(value: unknown): TerminalExit | null {
   const source = record(value)
   const terminalId = text(source?.terminalId ?? source?.terminal_id)
   const sessionKey = text(source?.sessionKey ?? source?.session_key)
+  const target = normalizeTerminalTarget(source?.target)
+  if (source?.target !== undefined && !target) return null
   const seq = source?.seq
   const exitCode = source?.exitCode ?? source?.exit_code
   const signal = source?.signal
@@ -105,6 +111,7 @@ function parseExit(value: unknown): TerminalExit | null {
   return {
     terminalId,
     ...(sessionKey ? { sessionKey } : {}),
+    ...(target ? { target } : {}),
     seq,
     exitCode: normalizedExitCode,
     signal: signal === undefined ? null : signal,
@@ -114,12 +121,12 @@ function parseExit(value: unknown): TerminalExit | null {
 
 export function createV4TerminalAccess(rpc: RpcTransport, events: EventTransport): TerminalAccess {
   return {
-    async create(sessionKey: string, options: TerminalCreateOptions = {}, signal?: AbortSignal) {
-      const key = sessionKey.trim()
-      if (!key) throw new Error('terminal session key is required')
+    async create(requestedTarget: string | TerminalTarget, options: TerminalCreateOptions = {}, signal?: AbortSignal) {
+      const target = normalizeTerminalTarget(typeof requestedTarget === 'string' ? { kind: 'session', sessionKey: requestedTarget } : requestedTarget)
+      if (!target) throw new Error('a valid terminal target is required')
       await rpc.ready({ signal })
       return parseCreate(await rpc.request(METHODS.create, {
-        sessionKey: key,
+        ...(typeof requestedTarget === 'string' && target.kind === 'session' ? { sessionKey: target.sessionKey } : { target }),
         ...(options.cols !== undefined ? { cols: options.cols } : {}),
         ...(options.rows !== undefined ? { rows: options.rows } : {}),
         ...(options.cwd ? { cwd: options.cwd } : {}),

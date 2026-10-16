@@ -72,13 +72,15 @@ function opened(artifact = target): WorkbenchResourceOpenResponse {
 }
 async function flush() { for (let i = 0; i < 8; i += 1) { await Promise.resolve(); await nextTick() } }
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done }); return { promise, resolve } }
-async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPayload; resourcesEnabled?: boolean } = {}) {
+async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPayload; resourcesEnabled?: boolean; resourceSessionKey?: string } = {}) {
   const nextArtifact = options.target || target
+  const resourceSessionKey = options.resourceSessionKey || 'session-a'
   const pinia = createPinia()
   const store = useWorkbenchStore(pinia)
   store.setSessionScope('session-a')
-  const item = createArtifactPreviewWorkbenchItem({ artifact: current, nativeHtml: false, sessionKey: 'session-a',
-    navigationArtifacts: [current, nextArtifact], ...(options.canonicalCurrent ? { resourceIdentity: 'document:current-doc' } : {}) })
+  const item = { ...createArtifactPreviewWorkbenchItem({ artifact: current, nativeHtml: false, sessionKey: resourceSessionKey,
+    navigationArtifacts: [current, nextArtifact], ...(options.canonicalCurrent ? { resourceIdentity: 'document:current-doc' } : {}) }),
+    scope: { type: 'session', id: 'session-a' } as const }
   store.openItem(item)
   const resources = useWorkbenchResourcesStore(pinia)
   const resolve = vi.spyOn(resources, 'resolve').mockResolvedValue(resource(nextArtifact))
@@ -96,7 +98,7 @@ async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPay
   const select = () => host.querySelector<HTMLSelectElement>('[data-testid="workbench-artifact-switcher"]')
   const choose = async () => {
     const picker = select()!
-    picker.value = artifactWorkbenchItemId('session-a', nextArtifact)
+    picker.value = artifactWorkbenchItemId(resourceSessionKey, nextArtifact)
     picker.dispatchEvent(new Event('change', { bubbles: true }))
     await flush()
   }
@@ -110,6 +112,63 @@ afterEach(() => {
 })
 
 describe('AppWorkbench artifact navigation', () => {
+  it.each([target, { id: 'side-html', name: 'side.html', mime: 'text/html' }])(
+    'navigates side $name using child authorization while retaining parent visibility', async artifact => {
+      const child = 'agent:main:sidechat:child'
+      const h = await mount({ target: artifact, resourceSessionKey: child })
+      await h.choose()
+      expect(h.resolve).toHaveBeenCalledWith(child, { type: 'deliverable', id: artifact.id, artifactId: artifact.id })
+      expect(h.openCurrent).toHaveBeenCalledWith(child, resource(artifact))
+      const active = h.store.activeItem!
+      expect(active.scope).toEqual({ type: 'session', id: 'session-a' })
+      expect(active.payload.sessionKey).toBe(child)
+      expect(artifactFromWorkbenchItem(active)).toMatchObject({ id: 'canonical-head', documentId: 'canonical-doc' })
+      expect(h.store.visibleItems).toContainEqual(active)
+      expect(h.store.activeSessionId).toBe('session-a')
+    },
+  )
+
+  it('keeps child authorization and parent visibility on legacy side preview navigation', async () => {
+    const child = 'agent:main:sidechat:child'
+    const h = await mount({ resourceSessionKey: child })
+    h.resolve.mockResolvedValueOnce(null)
+    await h.choose()
+    expect(h.store.activeItemId).toBe(artifactWorkbenchItemId(child, target))
+    expect(h.store.activeItem?.scope).toEqual({ type: 'session', id: 'session-a' })
+    expect(h.store.activeItem?.payload.sessionKey).toBe(child)
+  })
+
+  it('keeps side preview scope after importing an editable delivery', async () => {
+    const child = 'agent:main:sidechat:child'
+    const h = await mount({ resourceSessionKey: child })
+    const result = opened()
+    if (result.disposition !== 'document') throw new Error('Expected document fixture')
+    h.openCurrent.mockResolvedValueOnce(null)
+    const imported = vi.spyOn(h.resources, 'importDocument').mockResolvedValue({
+      document: result.document, revision: result.revision,
+    } as Awaited<ReturnType<typeof h.resources.importDocument>>)
+    await h.choose()
+    expect(imported).toHaveBeenCalledWith(child, resource())
+    expect(h.store.activeItem?.payload.sessionKey).toBe(child)
+    expect(h.store.activeItem?.scope).toEqual({ type: 'session', id: 'session-a' })
+  })
+
+  it.each(['close origin', 'change session'] as const)(
+    'drops side navigation after %s while the child resource is resolving', async invalidation => {
+      const h = await mount({ resourceSessionKey: 'agent:main:sidechat:child' })
+      const pending = deferred<WorkbenchResource | null>()
+      h.resolve.mockReturnValueOnce(pending.promise)
+      await h.choose()
+      expect(h.resolve).toHaveBeenCalledTimes(1)
+      if (invalidation === 'close origin') h.store.closeItem(h.item.id)
+      else h.store.setSessionScope('session-b')
+      pending.resolve(resource()); await flush()
+      expect(h.openCurrent).not.toHaveBeenCalled()
+      expect(h.store.items).toHaveLength(0)
+      expect(pushToast).not.toHaveBeenCalled()
+    },
+  )
+
   it.each([false, true])('retires an Office thumbnail when its document head changes (inactive=%s)', async inactive => {
     previewHarness.enabled = true
     vi.spyOn(URL, 'createObjectURL').mockReturnValueOnce('blob:old-office').mockReturnValueOnce('blob:new-office')

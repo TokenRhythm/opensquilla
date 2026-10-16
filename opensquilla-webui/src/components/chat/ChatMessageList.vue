@@ -69,7 +69,7 @@
         />
         <UserMessage
           v-else-if="messages[entry.index].displayRole === 'user'"
-          :id="`chat-turn-${entry.index}`"
+          :id="`${turnAnchorPrefix}-${entry.index}`"
           :data-chat-turn-key="chatMessageKey(messages[entry.index], entry.index)"
           tabindex="-1"
           :message="hydratedMessage(messages[entry.index], entry.index)"
@@ -82,6 +82,7 @@
           :session-key="sessionKey"
           :show-turn-outcome="shouldShowTurnOutcome(entry.index)"
           :is-streaming="isStreaming"
+          :edit-available="policy.edit && messageEditingAvailable"
           :is-goal-source="isGoalSource(messages[entry.index])"
           :can-reuse-prompt-annotations="canReusePromptAnnotations === true"
           :workbench-resource-preview-enabled="workbenchResourcePreviewEnabled === true"
@@ -118,19 +119,19 @@
           :workbench-enabled="workbenchEnabled"
           :artifact-navigation-items="artifactNavigationItems"
           :copy-message="copyMessage"
-          :regenerate-available="assistantRegenerateAvailable(entry.index)"
-          :is-tip="isForkableAssistant(entry.index)"
+          :regenerate-available="policy.retry && regenerationAvailable !== false && assistantRegenerateAvailable(entry.index)"
+          :is-tip="policy.fork && forkAvailable !== false && isForkableAssistant(entry.index)"
           :fork-busy="forkBusy"
           :plan-action-pending="planActionPending"
-          :plan-actions-disabled="planActionsDisabled"
+          :plan-actions-disabled="!policy.plan || planActionsDisabled"
           :plan-presentations="planPresentations"
-          :plan-presentation-available="planPresentationAvailable && !shareMode"
+          :plan-presentation-available="policy.plan && planPresentationAvailable && !shareMode"
           :plan-presentation-pending="planPresentationPending"
           :show-turn-outcome="shouldShowTurnOutcome(entry.index)"
           :has-error-notice="hasTurnErrorNotice(entry.index)"
           :goal-outcome="goalOutcomeFor(messages[entry.index], entry.index)"
           :goal-elapsed="goalElapsed"
-          :goal-removable="goalRemovable && !shareMode"
+          :goal-removable="policy.goal && goalRemovable && !shareMode"
           :goal-busy="goalBusy"
           :resolve-session-availability="resolveSessionAvailability"
           :resolve-workspace-preview-resource="resolveWorkspacePreviewResource"
@@ -184,6 +185,7 @@
 
 <script setup lang="ts">
 import SkillLoadStatus from './SkillLoadStatus.vue'
+import { useConversationPolicy } from '@/modules/conversationPolicy'
 import {
   computed,
   inject,
@@ -193,6 +195,7 @@ import {
   onUpdated,
   reactive,
   ref,
+  useId,
   useSlots,
   watch,
   type ComponentPublicInstance,
@@ -237,7 +240,7 @@ import {
 import { defaultRangeExtractor, elementScroll, measureElement as measureVirtualElement, observeElementOffset, observeElementRect, useVirtualizer, type Rect, type ScrollToOptions, type Virtualizer } from '@tanstack/vue-virtual'
 import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   messages: ChatRenderedMessage[]
   liveVisualizePublications?: VisualizeLivePublications
   findFallbackIndex?: number
@@ -245,6 +248,9 @@ const props = defineProps<{
   previewReadOnly?: boolean
   loadHistoryDetails?: (message: ChatRenderedMessage) => Promise<void>
   shareMode: boolean
+  messageEditingAvailable?: boolean
+  regenerationAvailable?: boolean
+  forkAvailable?: boolean
   selectedMessageIds: Set<string>
   stripTimePrefix: (text: string) => string
   renderMarkdown: (text: string) => string
@@ -301,7 +307,7 @@ const props = defineProps<{
   bottomPadding?: number
   /** Identity of the live/status slot, stable across stream updates. */
   trailingKey?: string
-}>()
+}>(), { messageEditingAvailable: true, regenerationAvailable: true, forkAvailable: true })
 
 const emit = defineEmits<{
   editMessage: [message: ChatRenderedMessage]
@@ -338,16 +344,20 @@ const emit = defineEmits<{
 const VIRTUALIZATION_STORAGE_KEY = 'opensquilla.chat.virtualizeHistory'
 const MESSAGE_GAP_PX = 4
 const { t } = useI18n()
+const listInstanceId = useId()
+const turnAnchorPrefix = computed(() => `chat-turn-${encodeURIComponent(props.sessionKey || 'unbound')}-${listInstanceId}`)
+const policy = useConversationPolicy()
 
 function forwardSystemRetry(
   message: ChatRenderedMessage,
   settle: (accepted: boolean) => void,
 ) {
+  if (!policy.value.retry || props.regenerationAvailable === false) { settle(false); return }
   emit('regenerateMessage', message, settle)
 }
 
 function sandboxResumeAvailable(message: ChatRenderedMessage): boolean {
-  return Boolean(props.sessionKey && props.sandboxResumeTurnId
+  return Boolean(policy.value.retry && props.sessionKey && props.sandboxResumeTurnId
     && !props.shareMode && !props.forkBusy && !props.isStreaming
     && sandboxResumeMessageTurnId(message) === props.sandboxResumeTurnId)
 }
@@ -408,7 +418,7 @@ function shouldShowTurnOutcome(index: number): boolean {
 function usageBarrierRetryAvailable(index: number): boolean {
   const message = props.messages[index]
   return Boolean(
-    message
+    policy.value.retry && props.regenerationAvailable !== false && message
     && isUsageAccountingBarrierMessage(message)
     && strictUsageBarrierRetryUserMessageIndex(props.messages, index, message) >= 0,
   )

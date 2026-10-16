@@ -39,6 +39,22 @@ beforeEach(() => {
 })
 
 describe('workbench store', () => {
+  it('hides side chats on parent navigation and resumes the same tab without disposing its owner', () => {
+    const store = useWorkbenchStore()
+    const side: WorkbenchItem = { ...item('side'), kind: 'assistant-chat' }
+    store.openItem(side)
+    const lifecycle = vi.fn()
+    store.onLifecycle(lifecycle)
+    store.setSessionScope('session-b')
+    expect(store.visibleItems).toEqual([])
+    expect(store.items).toContainEqual(side)
+    expect(lifecycle.mock.calls.some(([event]) => event.type === 'dispose')).toBe(false)
+    store.setSessionScope('session-a')
+    expect(store.activeItemId).toBe('side')
+    expect(store.visibleItems).toContainEqual(side)
+    store.closeItem('side')
+    expect(lifecycle).toHaveBeenCalledWith(expect.objectContaining({ type: 'dispose', reason: 'closed' }))
+  })
   it('maximizes without changing saved size or the active page lifecycle', () => {
     const store = useWorkbenchStore()
     store.openItem(browserItem('page', 'session-a'))

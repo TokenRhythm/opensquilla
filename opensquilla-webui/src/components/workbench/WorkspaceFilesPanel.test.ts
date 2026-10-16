@@ -1,61 +1,73 @@
 // @vitest-environment happy-dom
-import { createApp, h, nextTick, reactive } from 'vue'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import i18n from '@/i18n'
-import { WORKSPACE_FILES_KEY, type WorkspaceDirectoryEntry, type WorkspaceDirectoryPage, type WorkspaceFilePage, type WorkspaceFiles, type WorkspaceFileSearch } from '@/modules/workspaceFiles'
-import { copyTextWithFallback } from '@/utils/browser'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createApp, h, nextTick, reactive, type ComputedRef } from 'vue'
+import { createI18n } from 'vue-i18n'
+import en from '@/locales/en.json'
+import zhHans from '@/locales/zh-Hans.json'
+import { WORKSPACE_FILES_KEY, WorkspaceFilesChangedError, WorkspaceTextLimitError, type WorkspaceDirectoryEntry, type WorkspaceDirectoryPage, type WorkspaceFilePage, type WorkspaceFiles, type WorkspaceFileSearch } from '@/modules/workspaceFiles'
 import WorkspaceFilesPanel from './WorkspaceFilesPanel.vue'
 
-vi.mock('@/utils/browser', () => ({ copyTextWithFallback: vi.fn(async () => true) }))
+const clipboard = vi.hoisted(() => vi.fn(async (_text: string) => true))
+vi.mock('@/utils/browser', () => ({ copyTextWithFallback: clipboard }))
+vi.mock('@tanstack/vue-virtual', async () => {
+  const { computed } = await import('vue')
+  return {
+    useVirtualizer: (options: ComputedRef<{ count: number; getItemKey(index: number): string | number }>) => computed(() => ({
+      getVirtualItems: () => Array.from({ length: options.value.count }, (_, index) => ({ index, key: options.value.getItemKey(index), start: index * 28 })),
+      getTotalSize: () => options.value.count * 28,
+      measure: vi.fn(),
+    })),
+  }
+})
 
 const cleanups: Array<() => void> = []
-beforeEach(() => {
-  // Happy DOM has no layout; give the real virtualizer a visible viewport.
-  vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(600)
-  vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(320)
-})
-afterEach(() => { cleanups.splice(0).forEach(cleanup => cleanup()); vi.restoreAllMocks(); vi.clearAllMocks() })
+afterEach(() => { cleanups.splice(0).forEach(cleanup => cleanup()); vi.clearAllMocks() })
 
 function deferred<T>() {
   let resolve!: (value: T) => void
-  let reject!: (reason?: unknown) => void
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => { resolve = resolvePromise; reject = rejectPromise })
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
   return { promise, resolve, reject }
 }
 
-async function flush() {
-  for (let index = 0; index < 5; index++) await nextTick()
-}
-
 function entry(path: string, directory = false): WorkspaceDirectoryEntry {
-  return { path, name: path, type: directory ? 'directory' : 'file', kind: directory ? 'directory' : 'text', mime: directory ? '' : 'text/plain', size: 1000, mtimeNs: '1' }
+  const parts = path.split('/')
+  return { path, name: parts[parts.length - 1]!, type: directory ? 'directory' : 'file', kind: directory ? 'directory' : 'text', mime: directory ? '' : 'text/plain', size: directory ? null : 100, mtimeNs: '1' }
 }
 
-function directoryPage(entries = [entry('a.txt'), entry('b.txt')], workspaceBinding = 'binding-a'): WorkspaceDirectoryPage {
-  return { workspaceBinding, relativePath: '', entries, hasMore: false, nextCursor: null, truncated: false }
+function listing(entries: WorkspaceDirectoryEntry[], path = '', binding = 'binding-a'): WorkspaceDirectoryPage {
+  return { workspaceBinding: binding, relativePath: path, entries, nextCursor: null, hasMore: false, truncated: false }
 }
 
-function page(path = 'a.txt', startLine = 1, content = `${path} page ${startLine}`): WorkspaceFilePage {
-  return { relativePath: path, content, startLine, endLine: startLine + 199, totalLines: 600 }
+function page(path: string, content: string, startLine = 1): WorkspaceFilePage {
+  return { relativePath: path, content, startLine, endLine: startLine + 199, totalLines: 400 }
 }
 
-function access() {
-  return {
-    resolve: vi.fn<WorkspaceFiles['resolve']>(async () => []),
-    read: vi.fn<WorkspaceFiles['read']>(async () => new Blob(['contents'])),
-    readPage: vi.fn<NonNullable<WorkspaceFiles['readPage']>>(async (_session, file, start) => page(file.path, start)),
-    search: vi.fn<NonNullable<WorkspaceFiles['search']>>(async (_session, file) => ({ relativePath: file.path, totalLines: 600, matchLine: 201 })),
-    listDir: vi.fn<NonNullable<WorkspaceFiles['listDir']>>(async () => directoryPage()),
+function fixture() {
+  const files = {
+    resolve: vi.fn<WorkspaceFiles['resolve']>(),
+    listDir: vi.fn<NonNullable<WorkspaceFiles['listDir']>>(async () => listing([entry('a.ts'), entry('b.ts')])),
+    readPage: vi.fn<NonNullable<WorkspaceFiles['readPage']>>(async (_session, file, start) => page(file.path, `content ${file.path} ${start}`, start)),
+    read: vi.fn<WorkspaceFiles['read']>(async () => new Blob(['whole file'])),
+    search: vi.fn<NonNullable<WorkspaceFiles['search']>>(async (_session, file) => ({ relativePath: file.path, totalLines: 400, matchLine: 201 })),
   }
+  files.resolve.mockImplementation(async (_session, paths) => {
+    const latest = await files.listDir.mock.results[files.listDir.mock.results.length - 1]?.value as WorkspaceDirectoryPage | undefined
+    return paths.map(path => ({ requestedPath: path, path, name: path.split('/').pop()!, kind: 'text', mime: 'text/plain', size: 100,
+      workspaceBinding: latest?.workspaceBinding || 'binding-a', revision: 'revision-a' }))
+  })
+  return files
 }
 
-async function mount(files: WorkspaceFiles) {
+async function flush() { await new Promise(resolve => setTimeout(resolve, 0)); await nextTick() }
+
+async function mount(files: WorkspaceFiles, locale: 'en' | 'zh-Hans' = 'en') {
   const el = document.createElement('div')
   document.body.append(el)
   const state = reactive({ sessionKey: 'session-a' })
   const app = createApp({ render: () => h(WorkspaceFilesPanel, state) })
   app.provide(WORKSPACE_FILES_KEY, files)
-  app.use(i18n).mount(el)
+  app.use(createI18n({ legacy: false, locale, messages: { en, 'zh-Hans': zhHans } })).mount(el)
   let mounted = true
   const unmount = () => { if (mounted) app.unmount(); mounted = false; el.remove() }
   cleanups.push(unmount)
@@ -65,9 +77,288 @@ async function mount(files: WorkspaceFiles) {
 
 async function select(el: HTMLElement, path: string) {
   const label = [...el.querySelectorAll<HTMLElement>('.workspace-files__name')].find(node => node.title === path)
-  expect(label, `tree entry ${path}`).toBeDefined()
+  expect(label, `file tree should contain ${path}`).toBeDefined()
   label!.click()
   await flush()
+}
+
+async function search(el: HTMLElement, query: string) {
+  el.querySelector<HTMLButtonElement>('.workspace-file__toolbar button[aria-label="Search source"]')!.click()
+  await nextTick()
+  const input = el.querySelector<HTMLInputElement>('.workspace-file__find input[type="search"]')!
+  input.value = query
+  input.dispatchEvent(new Event('input', { bubbles: true }))
+  await nextTick()
+  input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+  await flush()
+}
+
+describe('workspace source preview limits', () => {
+  it.each([
+    ['line', 'A line in this file is too long for the preview'],
+    ['page', 'This section is too large for the preview'],
+  ] as const)('shows actionable %s limit feedback while preserving file actions and the usable tree', async (limit, message) => {
+    const files = fixture()
+    files.readPage.mockRejectedValueOnce(new WorkspaceTextLimitError(limit))
+    const { el } = await mount(files)
+    await select(el, 'a.ts')
+    expect(el.querySelector('[role="alert"]')?.textContent).toContain(message)
+    expect(el.textContent).toContain('Download the file or open it in another application')
+    expect(el.textContent).not.toContain('Workspace files are unavailable')
+    expect(el.querySelector('.workspace-resource-actions')).not.toBeNull()
+    await select(el, 'b.ts')
+    expect(el.querySelector('[role="alert"]')).toBeNull()
+    expect(el.textContent).toContain('content b.ts')
+  })
+})
+
+describe('workspace file filter toolbar', () => {
+  it.each([
+    ['en', 'Search files', 'Filters files already loaded in this tree'],
+    ['zh-Hans', '搜索文件', '仅筛选文件树中已加载的文件'],
+  ] as const)('keeps the %s input label short and exposes the accurate filtering scope', async (locale, placeholder, help) => {
+    const { el } = await mount(fixture(), locale)
+    // Layout is visually checked in the real browser. This guards the narrow
+    // toolbar's short label and separate icon-only action without fake geometry.
+    el.style.width = '150px'
+    const toolbar = el.querySelector('.workspace-files__tree-toolbar')!
+    const input = toolbar.querySelector<HTMLInputElement>('input[type="search"]')!
+    expect(input.classList.contains('workspace-files__filter-input')).toBe(true)
+    expect(input.placeholder).toBe(placeholder)
+    expect(input.getAttribute('aria-label')).toBe(placeholder)
+    expect(input.title).toBe(help)
+    expect(document.getElementById(input.getAttribute('aria-describedby')!)?.textContent).toBe(help)
+    expect(toolbar.querySelector('.workspace-files__filter-icon[aria-hidden="true"] svg')).not.toBeNull()
+    expect(toolbar.querySelector('.workspace-files__filter-clear')).toBeNull()
+    const refresh = toolbar.querySelector<HTMLButtonElement>('.workspace-files__refresh')!
+    expect(refresh.parentElement).toBe(toolbar)
+    expect(refresh.textContent?.trim()).toBe('')
+    expect(refresh.getAttribute('aria-label')).toBeTruthy()
+  })
+
+  it('clears a query from its button and returns keyboard focus without fetching extra directories', async () => {
+    const files = fixture()
+    const { el } = await mount(files)
+    const input = el.querySelector<HTMLInputElement>('.workspace-files__filter input')!
+    input.value = 'a.ts'; input.dispatchEvent(new Event('input', { bubbles: true })); await flush()
+    expect([...el.querySelectorAll<HTMLElement>('.workspace-files__name')].map(node => node.title)).toEqual(['a.ts'])
+    const clear = el.querySelector<HTMLButtonElement>('button[aria-label="Clear file search"]')!
+    clear.focus(); clear.click(); await flush()
+    expect(document.activeElement).toBe(input)
+    expect(input.value).toBe('')
+    expect(el.querySelector('.workspace-files__filter-clear')).toBeNull()
+    expect([...el.querySelectorAll<HTMLElement>('.workspace-files__name')].map(node => node.title)).toEqual(['a.ts', 'b.ts'])
+    expect(files.listDir).toHaveBeenCalledOnce()
+    expect(files.search).not.toHaveBeenCalled()
+  })
+
+  it('uses Escape to clear a query while leaving an empty-input Escape available to the surrounding panel', async () => {
+    const { el } = await mount(fixture())
+    const input = el.querySelector<HTMLInputElement>('.workspace-files__filter input')!
+    const parentKeydown = vi.fn()
+    el.addEventListener('keydown', parentKeydown)
+    input.focus()
+    input.value = 'missing'; input.dispatchEvent(new Event('input', { bubbles: true })); await flush()
+    const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+    input.dispatchEvent(escape); await flush()
+    expect(escape.defaultPrevented).toBe(true)
+    expect(parentKeydown).not.toHaveBeenCalled()
+    expect(input.value).toBe('')
+    expect(document.activeElement).toBe(input)
+    const emptyEscape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+    input.dispatchEvent(emptyEscape)
+    expect(emptyEscape.defaultPrevented).toBe(false)
+    expect(parentKeydown).toHaveBeenCalledOnce()
+  })
+
+  it('keeps refresh distinct from filtering and disabled while the directory request is pending', async () => {
+    const files = fixture()
+    const pending = deferred<WorkspaceDirectoryPage>()
+    files.listDir.mockReturnValueOnce(pending.promise)
+    const { el } = await mount(files)
+    const refresh = el.querySelector<HTMLButtonElement>('.workspace-files__tree-toolbar .workspace-files__refresh')!
+    expect(refresh.disabled).toBe(true)
+    pending.resolve(listing([entry('ready.ts')])); await flush()
+    expect(refresh.disabled).toBe(false)
+    refresh.click(); await flush()
+    expect(files.listDir).toHaveBeenCalledTimes(2)
+    expect(files.search).not.toHaveBeenCalled()
+  })
+})
+
+describe('workspace files panel request ownership', () => {
+  it('retains file actions for unsupported binary formats without reading them as text', async () => {
+    const files = fixture()
+    files.listDir.mockResolvedValue(listing([{ ...entry('bundle.zip'), kind: 'download', mime: 'application/zip' }]))
+    const { el } = await mount(files)
+    await select(el, 'bundle.zip')
+    expect(files.read).not.toHaveBeenCalled()
+    expect(files.readPage).not.toHaveBeenCalled()
+    expect(el.querySelector('.workspace-files__binary-preview [role="alert"]')).not.toBeNull()
+    expect(el.querySelector('.workspace-resource-actions')).not.toBeNull()
+  })
+  it('rejects an oversized image before downloading preview bytes but preserves file actions', async () => {
+    const files = fixture()
+    files.listDir.mockResolvedValue(listing([{ ...entry('large.png'), kind: 'image', mime: 'image/png', size: 30 * 1024 * 1024 + 1 }]))
+    const { el } = await mount(files)
+    await select(el, 'large.png')
+    expect(files.read).not.toHaveBeenCalled()
+    expect(el.querySelector('.workspace-files__binary-preview [role="alert"]')).not.toBeNull()
+    expect(el.querySelector('.workspace-resource-actions')).not.toBeNull()
+  })
+  it('aborts a pending binary preview and ignores its late response after selecting source', async () => {
+    const files = fixture()
+    files.listDir.mockResolvedValue(listing([{ ...entry('photo.webp'), kind: 'image', mime: 'image/webp' }, entry('current.ts')]))
+    const pending = deferred<Blob>()
+    files.read.mockReturnValueOnce(pending.promise)
+    const { el } = await mount(files)
+    await select(el, 'photo.webp')
+    const signal = files.read.mock.calls[0]![2]!
+    await select(el, 'current.ts')
+    expect(signal.aborted).toBe(true)
+    pending.resolve(new Blob(['old image'])); await flush()
+    expect(el.querySelector('pre')?.getAttribute('aria-label')).toBe('current.ts')
+    expect(el.querySelector('.resource-preview')).toBeNull()
+  })
+  it('keeps pages pinned and requires reload after a file change', async () => {
+    const files = fixture()
+    const { el } = await mount(files)
+    await select(el, 'a.ts')
+    files.readPage.mockRejectedValueOnce(new WorkspaceFilesChangedError())
+    el.querySelector<HTMLButtonElement>('.workspace-file__footer .workspace-file__more')!.click(); await flush()
+    expect(files.readPage).toHaveBeenLastCalledWith('session-a', expect.objectContaining({ revision: 'revision-a' }), 201, 400, expect.any(AbortSignal))
+    expect(el.textContent).toContain('The file changed')
+    expect(files.resolve).toHaveBeenCalledTimes(1)
+  })
+  it.each(['success', 'failure'] as const)('ignores an old session directory %s after switching sessions', async outcome => {
+    const files = fixture()
+    const old = deferred<WorkspaceDirectoryPage>()
+    files.listDir.mockReturnValueOnce(old.promise)
+    files.listDir.mockResolvedValueOnce(listing([entry('new.ts')], '', 'binding-b'))
+    const { el, state } = await mount(files)
+    state.sessionKey = 'session-b'
+    await flush()
+    if (outcome === 'success') old.resolve(listing([entry('stale.ts')]))
+    else old.reject(new Error('late old-session failure'))
+    await flush()
+    expect(el.querySelector('.workspace-files__tree')?.textContent).toContain('new.ts')
+    expect(el.querySelector('.workspace-files__tree')?.textContent).not.toContain('stale.ts')
+    expect(el.querySelector('[role="alert"]')).toBeNull()
+    await select(el, 'new.ts')
+    expect(files.readPage).toHaveBeenCalledWith('session-b', expect.objectContaining({ path: 'new.ts', workspaceBinding: 'binding-b' }), 1, 200, expect.any(AbortSignal))
+  })
+
+  it('fences old results when a session is left and reopened before its first response', async () => {
+    const files = fixture()
+    const old = deferred<WorkspaceDirectoryPage>()
+    files.listDir.mockReturnValueOnce(old.promise)
+    files.listDir.mockResolvedValueOnce(listing([entry('b.ts')]))
+    files.listDir.mockResolvedValueOnce(listing([entry('fresh-a.ts')], '', 'binding-fresh'))
+    const { el, state } = await mount(files)
+    state.sessionKey = 'session-b'; await flush()
+    state.sessionKey = 'session-a'; await flush()
+    old.resolve(listing([entry('old-a.ts')], '', 'binding-old')); await flush()
+    expect(el.querySelector('.workspace-files__tree')?.textContent).toContain('fresh-a.ts')
+    expect(el.querySelector('.workspace-files__tree')?.textContent).not.toContain('old-a.ts')
+    await select(el, 'fresh-a.ts')
+    expect(files.readPage).toHaveBeenLastCalledWith('session-a', expect.objectContaining({ workspaceBinding: 'binding-fresh' }), 1, 200, expect.any(AbortSignal))
+  })
+
+  it('keeps a different selected file when an earlier page finishes', async () => {
+    const files = fixture()
+    const { el } = await mount(files)
+    await select(el, 'a.ts')
+    const pending = deferred<WorkspaceFilePage>()
+    files.readPage.mockReturnValueOnce(pending.promise)
+    el.querySelector<HTMLButtonElement>('.workspace-file__footer .workspace-file__more')!.click()
+    await nextTick()
+    await select(el, 'b.ts')
+    pending.resolve(page('a.ts', 'stale next page', 201)); await flush()
+    expect(el.querySelector('pre')?.getAttribute('aria-label')).toBe('b.ts')
+    expect(el.querySelector('pre')?.textContent).toContain('content b.ts 1')
+    expect(el.textContent).not.toContain('stale next page')
+  })
+
+  it('does not issue a search-page read after the selected file has changed', async () => {
+    const files = fixture()
+    const { el } = await mount(files)
+    await select(el, 'a.ts')
+    const pending = deferred<Awaited<ReturnType<NonNullable<WorkspaceFiles['search']>>>>()
+    files.search.mockReturnValueOnce(pending.promise)
+    await search(el, 'needle')
+    await select(el, 'b.ts')
+    pending.resolve({ relativePath: 'a.ts', totalLines: 400, matchLine: 201 }); await flush()
+    expect(files.readPage).toHaveBeenCalledTimes(2)
+    expect(el.querySelector('pre')?.getAttribute('aria-label')).toBe('b.ts')
+  })
+
+  it('discards a search-result page already in flight when the selected file changes', async () => {
+    const files = fixture()
+    const { el } = await mount(files)
+    await select(el, 'a.ts')
+    const pending = deferred<WorkspaceFilePage>()
+    files.readPage.mockReturnValueOnce(pending.promise)
+    await search(el, 'needle')
+    expect(files.readPage).toHaveBeenLastCalledWith('session-a', expect.objectContaining({ path: 'a.ts' }), 201, 400, expect.any(AbortSignal))
+    await select(el, 'b.ts')
+    pending.resolve(page('a.ts', 'stale search result', 201)); await flush()
+    expect(el.querySelector('pre')?.getAttribute('aria-label')).toBe('b.ts')
+    expect(el.textContent).not.toContain('stale search result')
+  })
+
+  it('cancels a pending whole-file copy when selection changes', async () => {
+    const files = fixture()
+    const { el } = await mount(files)
+    await select(el, 'a.ts')
+    const pending = deferred<Blob>()
+    files.read.mockReturnValueOnce(pending.promise)
+    el.querySelector<HTMLButtonElement>('button[aria-label="Copy file contents"]')!.click()
+    await nextTick()
+    await select(el, 'b.ts')
+    pending.resolve(new Blob(['stale clipboard contents'])); await flush()
+    expect(clipboard).not.toHaveBeenCalled()
+    expect(el.querySelector<HTMLButtonElement>('button[aria-label="Copy file contents"]')?.disabled).toBe(false)
+  })
+
+  it('filters by a loaded descendant even after its nonmatching parent is collapsed', async () => {
+    const files = fixture()
+    files.listDir.mockResolvedValueOnce(listing([entry('src', true), entry('unrelated.ts')]))
+    files.listDir.mockResolvedValueOnce(listing([entry('src/needle.ts'), entry('src/other.ts')], 'src'))
+    const { el } = await mount(files)
+    await select(el, 'src')
+    expect(el.querySelector('.workspace-files__tree')?.textContent).toContain('needle.ts')
+    await select(el, 'src')
+    expect(el.querySelector('.workspace-files__tree')?.textContent).not.toContain('needle.ts')
+    const input = el.querySelector<HTMLInputElement>('.workspace-files__filter input')!
+    input.value = 'needle'
+    input.dispatchEvent(new Event('input', { bubbles: true })); await flush()
+    expect([...el.querySelectorAll<HTMLElement>('.workspace-files__name')].map(node => node.title)).toEqual(['src', 'src/needle.ts'])
+    expect(files.listDir).toHaveBeenCalledTimes(2)
+  })
+})
+
+// Upstream cancellation and loaded-tree contracts remain valid for unified previews.
+function directoryPage(entries = [entry('a.txt'), entry('b.txt')], workspaceBinding = 'binding-a'): WorkspaceDirectoryPage {
+  return { workspaceBinding, relativePath: '', entries, hasMore: false, nextCursor: null, truncated: false }
+}
+
+function upstreamPage(path = 'a.txt', startLine = 1, content = `${path} page ${startLine}`): WorkspaceFilePage {
+  return { relativePath: path, content, startLine, endLine: startLine + 199, totalLines: 600 }
+}
+
+function access() {
+  const files = {
+    resolve: vi.fn<WorkspaceFiles['resolve']>(async (_session, paths) => paths.map(path => ({ requestedPath: path, path, name: path, kind: 'text', mime: 'text/plain', size: 1000, workspaceBinding: 'binding-a' }))),
+    read: vi.fn<WorkspaceFiles['read']>(async () => new Blob(['contents'])),
+    readPage: vi.fn<NonNullable<WorkspaceFiles['readPage']>>(async (_session, file, start) => upstreamPage(file.path, start)),
+    search: vi.fn<NonNullable<WorkspaceFiles['search']>>(async (_session, file) => ({ relativePath: file.path, totalLines: 600, matchLine: 201 })),
+    listDir: vi.fn<NonNullable<WorkspaceFiles['listDir']>>(async () => directoryPage()),
+  }
+  files.resolve.mockImplementation(async (_session, paths) => {
+    const latest = await files.listDir.mock.results[files.listDir.mock.results.length - 1]?.value as WorkspaceDirectoryPage | undefined
+    return paths.map(path => ({ requestedPath: path, path, name: path, kind: 'text', mime: 'text/plain', size: 1000, workspaceBinding: latest?.workspaceBinding || 'binding-a' }))
+  })
+  return files
 }
 
 async function nextPage(el: HTMLElement) {
@@ -76,7 +367,11 @@ async function nextPage(el: HTMLElement) {
 }
 
 async function query(el: HTMLElement, value: string, submit = true) {
-  const input = el.querySelector<HTMLInputElement>('.workspace-file input[type="search"]')!
+  if (!el.querySelector('.workspace-file__find')) {
+    el.querySelector<HTMLButtonElement>('.workspace-file__toolbar button[aria-label="Search source"]')!.click()
+    await nextTick()
+  }
+  const input = el.querySelector<HTMLInputElement>('.workspace-file__find input[type="search"]')!
   input.value = value
   input.dispatchEvent(new Event('input'))
   await nextTick()
@@ -116,7 +411,7 @@ describe('WorkspaceFilesPanel tree filtering', () => {
 
     await filterTree(el, '')
     expect(treePaths(el)).toEqual(originalPaths)
-    expect(el.querySelectorAll('[aria-expanded="true"]')).toHaveLength(2)
+    expect(el.querySelectorAll('[role="treeitem"][aria-expanded="true"]')).toHaveLength(2)
     expect(el.querySelector('.is-selected .workspace-files__name')?.getAttribute('title')).toBe('src/lib/answer.txt')
     expect(el.querySelector('pre')?.getAttribute('aria-label')).toBe('src/lib/answer.txt')
     expect(files.listDir).toHaveBeenCalledTimes(3)
@@ -162,13 +457,13 @@ describe('WorkspaceFilesPanel request ownership', () => {
     const signal = files.readPage.mock.calls[1]![4]!
     await select(el, nextPath)
     expect(signal.aborted).toBe(true)
-    if (outcome === 'resolve') pendingPage.resolve(page('a.txt', 201, 'stale page'))
+    if (outcome === 'resolve') pendingPage.resolve(upstreamPage('a.txt', 201, 'stale page'))
     else pendingPage.reject(new Error('old failure'))
     await flush()
     expect(el.querySelector('.workspace-file [role="status"]')).not.toBeNull()
     expect(el.querySelector('.workspace-file pre')).toBeNull()
     expect(el.querySelector('[role="alert"]')).toBeNull()
-    nextSelection.resolve(page(nextPath, 1, 'current selection'))
+    nextSelection.resolve(upstreamPage(nextPath, 1, 'current selection'))
     await flush()
     expect(el.querySelector('pre')?.textContent).toContain('current selection')
     expect(el.textContent).not.toContain('stale page')
@@ -198,7 +493,7 @@ describe('WorkspaceFilesPanel request ownership', () => {
     await query(el, 'needle')
     expect(files.readPage).toHaveBeenCalledTimes(2)
     await select(el, 'b.txt')
-    if (outcome === 'resolve') searchPage.resolve(page('a.txt', 201, 'stale search page'))
+    if (outcome === 'resolve') searchPage.resolve(upstreamPage('a.txt', 201, 'stale search page'))
     else searchPage.reject(new Error('old search failure'))
     await flush()
     expect(el.querySelector('pre')?.getAttribute('aria-label')).toBe('b.txt')
@@ -231,7 +526,7 @@ describe('WorkspaceFilesPanel request ownership', () => {
     await query(el, 'old query')
     files.search.mockResolvedValueOnce({ relativePath: 'a.txt', totalLines: 600, matchLine: 401 })
     await query(el, 'new query')
-    oldPage.resolve(page('a.txt', 201, 'old query match'))
+    oldPage.resolve(upstreamPage('a.txt', 201, 'old query match'))
     await flush()
     expect(el.querySelector('pre')?.textContent).toContain('a.txt page 401')
     expect(el.querySelector('[aria-current="location"]')?.getAttribute('data-line')).toBe('401')
@@ -252,7 +547,7 @@ describe('WorkspaceFilesPanel request ownership', () => {
     await flush()
     expect(el.querySelector('.workspace-file [role="status"]')).not.toBeNull()
     expect(el.querySelector('[role="alert"]')).toBeNull()
-    pendingPage.resolve(page('a.txt', 201))
+    pendingPage.resolve(upstreamPage('a.txt', 201))
     await flush()
     expect(el.querySelector('pre')?.textContent).toContain('a.txt page 201')
   })
@@ -302,13 +597,13 @@ describe('WorkspaceFilesPanel request ownership', () => {
     files.read.mockReturnValueOnce(pendingCopy.promise)
     const { el } = await mount(files)
     await select(el, 'a.txt')
-    const copy = [...el.querySelectorAll<HTMLButtonElement>('.workspace-file__tool')].find(button => button.textContent?.includes('Copy file contents'))!
+    const copy = el.querySelector<HTMLButtonElement>('button[aria-label="Copy file contents"]')!
     copy.click()
     await select(el, 'b.txt')
     pendingCopy.resolve(new Blob(['old contents']))
     await flush()
     expect(files.read.mock.calls[0]![2]!.aborted).toBe(true)
-    expect(copyTextWithFallback).not.toHaveBeenCalled()
+    expect(clipboard).not.toHaveBeenCalled()
     expect(el.querySelector('pre')?.getAttribute('aria-label')).toBe('b.txt')
   })
 
@@ -317,6 +612,7 @@ describe('WorkspaceFilesPanel request ownership', () => {
     const pendingDirectory = deferred<WorkspaceDirectoryPage>()
     const pendingPreview = deferred<WorkspaceFilePage>()
     files.listDir.mockResolvedValueOnce(directoryPage([entry('folder', true), entry('a.txt')])).mockReturnValueOnce(pendingDirectory.promise)
+    files.resolve.mockResolvedValueOnce([{ requestedPath: 'a.txt', path: 'a.txt', name: 'a.txt', kind: 'text', mime: 'text/plain', size: 1000, workspaceBinding: 'binding-a' }])
     files.readPage.mockReturnValueOnce(pendingPreview.promise)
     const { el, unmount } = await mount(files)
     await select(el, 'folder')
@@ -325,7 +621,7 @@ describe('WorkspaceFilesPanel request ownership', () => {
     expect(files.listDir.mock.calls[1]![5]!.aborted).toBe(true)
     expect(files.readPage.mock.calls[0]![4]!.aborted).toBe(true)
     pendingDirectory.resolve(directoryPage([]))
-    pendingPreview.resolve(page())
+    pendingPreview.resolve(upstreamPage())
     await flush()
     expect(el.childElementCount).toBe(0)
   })

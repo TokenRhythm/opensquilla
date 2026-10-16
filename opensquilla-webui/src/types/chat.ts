@@ -845,6 +845,8 @@ export interface ChatCreatedSessionLink {
 }
 
 export interface ChatRenderedMessage {
+  /** Ephemeral input drafts, attached by the live owner only; absent in history. */
+  toolInputPreviews?: import('./toolInputPreview').LiveToolInputPreview[]
   id?: string
   clientId?: string
   sourceIndex?: number

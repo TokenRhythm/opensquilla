@@ -603,6 +603,9 @@ export function createArtifactPreviewResource(
         await prepareMarkdownImages(markdownImageWork, controller.signal)
         if (disposed || suspended || run !== generation) return
       } else if (nextKind === 'text') {
+        // Generic transport MIME may accompany a .js/.json/etc filename. Do
+        // not present a binary payload as source solely because of that name.
+        if (bytes.includes(0)) throw new ArtifactPreviewInvalidContentError()
         text.value = new TextDecoder().decode(bytes)
         state.value = 'ready'
       } else {

@@ -94,6 +94,20 @@ export function resourcesFromWorkbenchItem(
     : []
 }
 
+/** Refresh inventory without changing the visible owner or resource authority. */
+export function refreshResourceCollectionWorkbenchItem(
+  item: WorkbenchItem,
+  resources: readonly WorkbenchResource[],
+  title: string,
+): WorkbenchItem {
+  if (item.kind !== 'resource-collection') return item
+  return {
+    ...item,
+    title,
+    payload: { ...item.payload, resources: canonicalWorkbenchResources(resources) },
+  }
+}
+
 /**
  * Adapts a read-only Workbench projection to the existing preview renderer.
  * The resource identity remains separate from the ArtifactStore identity;

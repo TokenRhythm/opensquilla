@@ -70,7 +70,7 @@ function record(value: unknown): Record<string, unknown> | null {
     : null
 }
 
-function parseCapabilitiesByMode(value: unknown): ModelRoutingCapabilitiesByMode | null {
+export function parseCapabilitiesByMode(value: unknown): ModelRoutingCapabilitiesByMode | null {
   const source = record(value)
   if (!source) return null
 
@@ -105,7 +105,7 @@ const IMAGE_DEGRADATION_REASONS = new Set([
   'router_image_route_unavailable',
 ])
 
-function effectiveImageAdmission(
+export function effectiveImageAdmission(
   admission: ImageInputAdmission,
   reason: string,
 ): ImageInputAdmission {

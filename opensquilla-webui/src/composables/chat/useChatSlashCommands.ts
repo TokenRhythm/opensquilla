@@ -63,14 +63,16 @@ const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
 ])
 
 export interface UseChatSlashCommandsOptions {
-  skillCatalog?: SkillCatalog
+  skillCatalog?: Pick<SkillCatalog, 'supportsCandidates' | 'listCandidates' | 'subscribeInvalidation'>
+  /** Policy filters both menu selection and explicitly typed commands. */
+  commandAllowed?: (command: ChatSlashCommand) => boolean
   selectedSkills?: Ref<SelectedSkillRef[]>
   getCaret?: () => number
   setCaret?: (position: number) => void
   onSelectSkill?: (skill: SelectedSkillRef, position: number) => void
   manageSkill?: (name: string) => void
   commandCatalog: CommandCatalog
-  usageReporting: UsageReporting
+  usageReporting: Pick<UsageReporting, 'status'>
   sessionMaintenance: SessionMaintenance
   catalogCallOptions?: UsageReportingRequestOptions
   inputText: Ref<string>
@@ -198,6 +200,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   const commandCatalog = options.commandCatalog
   const usageReporting = options.usageReporting
   const maintenance = options.sessionMaintenance
+  const allowed = (command: ChatSlashCommand) => options.commandAllowed?.(command) !== false
   const slashOpen = ref(false)
   const slashIdx = ref(0)
   const slashCmds = ref<ChatSlashCommand[]>([])
@@ -258,7 +261,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   function updatePalette() {
     if (!queryRange) return
     const query = queryRange.query
-    const commands = slashCmds.value.filter(isMenuCommand).map(command => ({
+    const commands = slashCmds.value.filter(isMenuCommand).filter(allowed).map(command => ({
       ...withLiveDescription(command), searchDescriptions: [command.desc], kind: 'command' as const,
     }))
     const skills = skillPaletteItems.value
@@ -353,6 +356,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       const query = val.slice(1).toLowerCase()
       const matches = slashCmds.value
         .filter(isMenuCommand)
+        .filter(allowed)
         .filter(command =>
           slashCommandKeys(command).some(key => key.slice(1).startsWith(query)),
         )
@@ -435,6 +439,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   }
 
   function completeSlashCmd(cmd: ChatSlashCommand) {
+    if (cmd.kind !== 'skill' && !allowed(cmd)) return
     if (cmd.kind === 'skill' && cmd.skill && queryRange) {
       const skill = cmd.skill
       if (skill.disabled || !skill.ready) {
@@ -486,6 +491,11 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   }
 
   function selectSlashCmd(cmd: ChatSlashCommand, args = '') {
+    if (!allowed(cmd)) {
+      closeSlashMenu()
+      options.notify(i18n.global.t('chat.slashCommands.unknown', { command: cmd.cmd }))
+      return
+    }
     const action = cmd?.execution?.action || cmd.cmd || cmd.name
     if (options.selectedSkills?.value.length) {
       options.notify(i18n.global.t('chat.skillPalette.commandWithSkills'))
@@ -718,9 +728,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     if (!slashCatalogLoaded.value) await loadSlashCommands()
     if (!slashCatalogLoaded.value) return 'unavailable'
     const commandKey = slashCommandKey(text)
-    return slashCmds.value.some(command => slashCommandKeys(command).includes(commandKey))
-      ? 'registered'
-      : 'unknown'
+    const command = slashCmds.value.find(command => slashCommandKeys(command).includes(commandKey))
+    return command ? allowed(command) ? 'registered' : 'unavailable' : 'unknown'
   }
 
   return {

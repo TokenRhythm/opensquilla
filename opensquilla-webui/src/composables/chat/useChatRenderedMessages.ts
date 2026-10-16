@@ -496,8 +496,13 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         if (stripItem) {
           upsertRouterStrip(result, stripItem, turnRouterIndexes, turnRouterOrder)
         }
-        prevRole = ''
-        continue
+        // A decision control row has no conversational body. A live/settled
+        // assistant row may carry the same receipt alongside text, tools and
+        // billing; rendering its route must not discard those capabilities.
+        if (msg.provenanceKind === 'router_decision' || msg.role !== 'assistant') {
+          prevRole = ''
+          continue
+        }
       }
 
       const hasTurnUsage = Boolean(routerUsageFromMessage(msg))
@@ -1897,6 +1902,14 @@ function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall
     if (resultStr) {
       item.result = resultStr
       item.resultPreview = truncate(resultStr, 200)
+      item.status = isError ? 'error' : 'success'
+    }
+    // Persisted history without execution metadata stays settled. A live
+    // conversation projection uses the same renderer and carries an explicit
+    // running receipt until the tool-result arrives, including empty results.
+    if (executionStatus === 'running' || executionStatus === 'pending') item.isRunning = true
+    if (['done', 'success', 'completed', 'error', 'timeout', 'cancelled'].includes(executionStatus) || String(tc.type) === 'tool_result') {
+      item.isRunning = false
       item.status = isError ? 'error' : 'success'
     }
     if (tc.sources !== undefined) item.sources = tc.sources

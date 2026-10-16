@@ -302,6 +302,14 @@
         :office-prompt-annotations-enabled="appStore.features.officePromptAnnotations === true"
         :route-active="isChatRoute"
         :session-id="workbenchSessionKey"
+        :session-durable="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.sessionDurable.value"
+        :session-preparable="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.sessionPreparable.value"
+        :conversation-started="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.sessionDurable.value && chatRouteHeader.model.visible.value
+          && chatRouteHeader.model.shareableMessageCount.value > 0"
+        :prepare-session="chatRouteHeader.prepareWorkbenchSession"
         :modal-blocked="workbenchModalBlocked"
         :workspace-id="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
           ? chatRouteHeader.model.workspaceId.value : null"
@@ -455,7 +463,7 @@ import { hasOpenDialogLayer } from './composables/useDialogA11y'
 import {
   provideChatTopbarPopoverCoordinator,
 } from './composables/useChatTopbarPopoverCoordinator'
-import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
+import { provideArtifactImageLightbox, closeImageLightboxOutsideSession } from './composables/chat/useArtifactImageLightbox'
 import {
   provideChatRouteHeaderBridge,
   type ChatRouteHeaderHostHandle,
@@ -826,13 +834,10 @@ watch(
   [
     currentSessionKey,
     isChatRoute,
-    () => artifactImageLightbox.request.value?.sessionKey || '',
+    () => artifactImageLightbox.request.value?.ownerSessionKey || artifactImageLightbox.request.value?.sessionKey || '',
   ],
   ([sessionKey, chatRouteActive]) => {
-    const request = artifactImageLightbox.request.value
-    if (request && (!chatRouteActive || request.sessionKey !== sessionKey)) {
-      artifactImageLightbox.close()
-    }
+    closeImageLightboxOutsideSession(artifactImageLightbox, sessionKey, chatRouteActive)
   },
   { flush: 'sync' },
 )

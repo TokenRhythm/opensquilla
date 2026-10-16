@@ -53,6 +53,7 @@ import WorkspaceFilePreview from '@/components/chat/WorkspaceFilePreview.vue'
 import WorkspaceFileActionsMenu from '@/components/chat/WorkspaceFileActionsMenu.vue'
 import { WORKSPACE_FILES_KEY, type WorkspaceFile } from '@/modules/workspaceFiles'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
+import { CONVERSATION_WORKBENCH_OWNER_KEY } from '@/modules/conversationPolicy'
 import { clearWorkspaceFileLinks, decorateWorkspaceFileLinks, workspaceFileCandidates } from '@/utils/chat/workspaceFiles'
 import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
 import type { ArtifactPayload } from '@/types/artifacts'
@@ -102,6 +103,7 @@ const pinia = props.preferWorkspaceWorkbench ? getActivePinia() : undefined
 const workbench = pinia ? useWorkbenchStore(pinia) : null
 const workspaceFiles = inject(WORKSPACE_FILES_KEY, null)
 const gateway = inject(GATEWAY_ACCESS_KEY, null)
+const workbenchOwner = inject(CONVERSATION_WORKBENCH_OWNER_KEY, null)
 const selectedWorkspaceFile = shallowRef<WorkspaceFile | null>(null)
 const workspaceWorkbenchAvailable = computed(() => Boolean(
   props.preferWorkspaceWorkbench && workbench,
@@ -112,7 +114,7 @@ const nativeWorkspaceActionsAvailable = computed(() => platform.id === 'desktop'
   && Boolean(platform.gateway.getConnection)
   && Boolean(gateway?.isLocalOwner && gateway.isAvailable))
 const workspaceFileScope = computed(() => JSON.stringify([
-  props.sessionKey, gateway?.deliveryIdentity, gateway?.subscriptionEpoch,
+  props.sessionKey, workbenchOwner?.value, gateway?.deliveryIdentity, gateway?.subscriptionEpoch,
   gateway?.isLocalOwner, gateway?.isAvailable,
 ]))
 let fileRequest: AbortController | null = null
@@ -130,7 +132,7 @@ function applyWorkspaceFiles(root: HTMLElement, scope: string) {
 
 function openWorkspaceFile(file: WorkspaceFile) {
   if (file.kind === 'text' && workspaceWorkbenchAvailable.value && props.sessionKey && workbench?.openItem(
-    createResolvedWorkspaceFileItem(props.sessionKey, file),
+    createResolvedWorkspaceFileItem(props.sessionKey, file, workbenchOwner?.value || props.sessionKey),
   )) { selectedWorkspaceFile.value = null; return }
   selectedWorkspaceFile.value = file
 }

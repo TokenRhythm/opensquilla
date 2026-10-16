@@ -11,7 +11,10 @@ import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDiscl
 import ActivityDisclosure from './ActivityDisclosure.vue'
 import AssistantActivityTimeline from './AssistantActivityTimeline.vue'
 import UnifiedAssistantActivityTimeline from './UnifiedAssistantActivityTimeline.vue'
+import ConversationLiveEdge from './ConversationLiveEdge.vue'
 import chatViewSource from '@/views/ChatView.vue?raw'
+import liveEdgeSource from './ConversationLiveEdge.vue?raw'
+import activityBodySource from './ConversationActivityBody.vue?raw'
 
 const apps: App[] = []
 const now = Date.now()
@@ -143,11 +146,36 @@ describe('one owner for the current provider wait', () => {
   })
 
   it('keeps provider waits in both ChatView display projections while tool previews replace only their preparation step', () => {
+    expect(chatViewSource.match(/<ConversationLiveEdge\b[^>]*>/)?.[0])
+      .toContain(':display-projection="presentedLive.liveActivityDisplayProjection"')
+    expect(liveEdgeSource.match(/<ConversationActivityBody\b[^>]*>/)?.[0])
+      .toContain(':display-projection="displayProjection"')
     for (const name of ['UnifiedAssistantActivityTimeline', 'AssistantActivityTimeline']) {
-      const opening = chatViewSource.match(new RegExp(`<${name}\\b[^>]*>`))?.[0]
-      expect(opening).toContain(':projection="presentedLive.liveActivityDisplayProjection"')
+      const opening = activityBodySource.match(new RegExp(`<${name}\\b[^>]*>`))?.[0]
+      expect(opening).toContain(':projection="displayProjection"')
     }
     expect(chatViewSource).toContain("!(step.isCurrent && step.label.code === 'chat.activity.lifecycle.preparingToolCall')")
     expect(chatViewSource).not.toContain('withoutHeaderProviderWait')
+  })
+
+  it.each([true, false])('keeps one provider wait through the shared live edge (ordered=%s)', async ordered => {
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const projection = projectAssistantActivityTimeline([], { lifecycle: 'working', statusHistory: [waitStep()] })
+    const app = createApp({ render: () => h(ConversationLiveEdge, {
+      visible: true, sessionKey: 'provider-wait', continuityKey: `wait-${ordered}`, executing: true,
+      stepCount: 1, failureCount: 0, phaseLabel: 'Working', elapsedLabel: '21s', stale: false,
+      hasUnifiedActivityOrder: ordered, displayProjection: projection,
+      renderMarkdown: (text: string) => text,
+      isToolGroupOpen: () => undefined, isToolItemOpen: () => undefined,
+      toolGroupStatusText: () => '', toolStatusText: () => '', toolSecondaryText: () => '',
+    }) })
+    apps.push(app)
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+    expect(host.querySelectorAll('.assistant-activity-status__row')).toHaveLength(1)
+    expect(host.textContent?.match(/HTTP 429/g)).toHaveLength(1)
+    expect(host.querySelector('.assistant-activity__live-head')?.textContent).not.toContain('HTTP 429')
   })
 })

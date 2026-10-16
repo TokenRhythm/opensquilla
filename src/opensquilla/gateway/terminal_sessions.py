@@ -3,7 +3,7 @@
 The Gateway deliberately keeps the native PTY behind the existing
 ``opensquilla.tools.pty_backend`` adapter.  This module owns only the public
 session lifecycle: a terminal is bound to one WebSocket connection, one
-session key and the workspace binding captured when it was created.  Output
+explicit directory target and the workspace binding captured when it was created. Output
 is sent as bounded, sequenced events; there is no unbounded replay buffer.
 """
 
@@ -60,13 +60,14 @@ SendEvent = Callable[[str, dict[str, Any]], Awaitable[bool]]
 class TerminalSession:
     terminal_id: str
     conn_id: str
-    session_key: str
+    session_key: str | None
     workspace_binding: str
     workspace_service: Any
     handle: PtyHandle
     cwd: str
     cols: int
     rows: int
+    target: dict[str, str] | None = None
     seq: int = 0
     closing: bool = False
     close_reason: str | None = None
@@ -179,12 +180,13 @@ class TerminalManager:
         self,
         *,
         conn_id: str,
-        session_key: str,
+        session_key: str | None,
         workspace_service: Any,
         cwd: str,
         command: str | None,
         cols: int,
         rows: int,
+        target: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         async with self._lock:
             owned_count = sum(1 for item in self._sessions.values() if item.conn_id == conn_id)
@@ -244,22 +246,27 @@ class TerminalManager:
             self._release_create_slot(conn_id)
             raise
         except PtyBackendError as exc:
-            self._release_create_slot(conn_id)
             # Some native backends can fail after creating the child and return
             # the live handle with ``started=True``.  Reap that process tree
             # before projecting the failure to RPC; otherwise a rejected create
             # can strand a shell that has no terminal identity to close later.
-            if exc.started and exc.handle is not None:
-                try:
-                    capture_process_tree_owner(
-                        exc.handle.raw, isolated=True,
-                    ).start_completion_monitor()
-                    await terminate_pty(exc.handle)
-                except asyncio.CancelledError:
-                    self._schedule_handle_cleanup(exc.handle)
-                    raise
-                except Exception:
-                    pass
+            try:
+                if exc.started and exc.handle is not None:
+                    try:
+                        capture_process_tree_owner(
+                            exc.handle.raw, isolated=True,
+                        ).start_completion_monitor()
+                        await terminate_pty(exc.handle)
+                    except asyncio.CancelledError:
+                        self._schedule_handle_cleanup(exc.handle)
+                        raise
+                    except Exception:
+                        pass
+            finally:
+                # Cancellation can arrive during failed-spawn cleanup too.
+                # Native ownership transfers to the cleanup task, but the RPC
+                # must always release its connection's pending-create slot.
+                self._release_create_slot(conn_id)
             raise TerminalSessionError("TERMINAL_UNAVAILABLE", str(exc)) from exc
         except Exception as exc:
             self._release_create_slot(conn_id)
@@ -275,13 +282,23 @@ class TerminalManager:
             cwd=resolved_cwd,
             cols=cols,
             rows=rows,
+            target=dict(target) if target is not None else (
+                {"kind": "session", "sessionKey": session_key} if session_key else None
+            ),
         )
         registered = False
         try:
-            # Native spawn runs without an event loop in a worker. Attach the
-            # owner status reader here so natural exit can release a POSIX
-            # anchor and Windows completion can retire the owner record.
+            # Native spawn runs in a worker without a running event loop.
+            # Start the owner monitor here before validating or publishing the
+            # handle so natural exit and failed publication both release it.
             capture_process_tree_owner(handle.raw, isolated=True).start_completion_monitor()
+            # Native spawning can outlive a project removal or configuration
+            # change. Do not publish a PTY after its target has changed.
+            current = await workspace_service.workspace(session_key)
+            if current.binding != workspace.binding:
+                raise TerminalSessionError(
+                    "TERMINAL_STALE", "The terminal working directory changed"
+                )
             async with self._lock:
                 # Recheck after the potentially slow native spawn. A
                 # concurrent create cannot use the race to exceed the
@@ -305,11 +322,19 @@ class TerminalManager:
         self._release_create_slot(conn_id)
         return {
             "terminalId": terminal_id,
-            "sessionKey": session_key,
+            **self._target_metadata(session),
             "cwd": resolved_cwd,
+            "cwdPath": str(directory),
             "cols": cols,
             "rows": rows,
             "shell": "powershell" if os.name == "nt" else "posix",
+        }
+
+    @staticmethod
+    def _target_metadata(session: TerminalSession) -> dict[str, Any]:
+        return {
+            **({"sessionKey": session.session_key} if session.session_key is not None else {}),
+            **({"target": dict(session.target)} if session.target is not None else {}),
         }
 
     async def _ensure_current(self, session: TerminalSession) -> None:
@@ -420,7 +445,7 @@ class TerminalManager:
                         "terminal.output",
                         {
                             "terminalId": session.terminal_id,
-                            "sessionKey": session.session_key,
+                            **self._target_metadata(session),
                             "seq": session.seq,
                             "data": text,
                             "encoding": "utf8",
@@ -439,6 +464,16 @@ class TerminalManager:
         except Exception:
             session.closing = True
             session.close_reason = session.close_reason or "reader_error"
+            # Losing the reader does not mean its shell has exited. Reap the
+            # process before wait_pty below; later close requests see closing
+            # and only await this task, so they cannot rescue a live shell.
+            try:
+                await terminate_pty(session.handle)
+            except asyncio.CancelledError:
+                self._schedule_handle_cleanup(session.handle)
+                raise
+            except Exception:
+                self._schedule_handle_cleanup(session.handle)
         finally:
             # Flush a partial UTF-8 code point once the PTY reaches EOF. This
             # avoids replacing a split multibyte character twice across reads.
@@ -450,7 +485,7 @@ class TerminalManager:
                         "terminal.output",
                         {
                             "terminalId": session.terminal_id,
-                            "sessionKey": session.session_key,
+                            **self._target_metadata(session),
                             "seq": session.seq,
                             "data": tail,
                             "encoding": "utf8",
@@ -468,7 +503,7 @@ class TerminalManager:
                     "terminal.exit",
                     {
                         "terminalId": session.terminal_id,
-                        "sessionKey": session.session_key,
+                        **self._target_metadata(session),
                         "seq": session.seq,
                         "exitCode": returncode,
                         "signal": None,

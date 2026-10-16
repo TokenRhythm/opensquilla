@@ -62,6 +62,7 @@
         "model": { "type": ["string", "null"] },
         "kind": { "type": ["string", "null"] },
         "sessionKind": { "type": ["string", "null"] },
+        "session_key": { "type": "string", "description": "Owner-only WebUI draft identity. Requires kind webchat and no initial message. Compatible retries preserve the existing session without updating it." },
         "workspaceId": { "type": ["string", "null"] },
         "workspace_id": { "type": ["string", "null"] },
         "provider": { "type": ["string", "null"] },

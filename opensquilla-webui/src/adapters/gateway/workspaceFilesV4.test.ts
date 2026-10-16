@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createV4WorkspaceFiles } from './workspaceFilesV4'
+import { HttpTransportError } from './privateHttpTransport'
+import { WorkspaceFilesChangedError, WorkspaceTextLimitError, type WorkspaceRootScope } from '@/modules/workspaceFiles'
 
 function fixture() {
   const file = { requestedPath: 'outputs/中文 图.svg', path: 'outputs/中文 图.svg', name: '中文 图.svg',
@@ -10,6 +12,86 @@ function fixture() {
 }
 
 describe('workspace files HTTP adapter', () => {
+  const root = { kind: 'workspace-root' as const, name: '中文 项目', path: 'C:\\Projects\\中文 项目', workspaceBinding: 'a'.repeat(64) }
+  it('opens project roots without a session and never submits a host path', async () => {
+    const { access, http } = fixture()
+    const signal = new AbortController().signal
+    http.requestJson.mockResolvedValueOnce(root)
+    const resolved = await access.root!({ projectId: 'project-a' }, signal)
+    expect(http.requestJson).toHaveBeenLastCalledWith('/api/v1/workspace-files/root?projectId=project-a', {
+      method: 'GET', sessionKey: undefined, signal,
+    })
+    http.requestJson.mockResolvedValueOnce({ available: true, host: 'gateway', apps: [{ id: 'reveal', label: 'Show in folder' }] })
+    await access.rootApps!({ projectId: 'project-a' }, signal)
+    expect(http.requestJson).toHaveBeenLastCalledWith('/api/v1/workspace-files/apps?projectId=project-a', {
+      method: 'GET', sessionKey: undefined, signal,
+    })
+    http.requestJson.mockResolvedValueOnce({ ok: true, host: 'gateway', appId: 'reveal' })
+    await access.openRoot!({ projectId: 'project-a' }, resolved, 'reveal', signal)
+    expect(http.requestJson).toHaveBeenLastCalledWith('/api/v1/workspace-files/open-root', {
+      method: 'POST', sessionKey: undefined, signal,
+      json: { workspaceBinding: root.workspaceBinding, projectId: 'project-a', appId: 'reveal' },
+    })
+  })
+  it('binds session-root opening to the session and preserves unavailable catalog reasons', async () => {
+    const { access, http } = fixture()
+    http.requestJson.mockResolvedValueOnce(root)
+    await access.root!({ sessionKey: 'session-a' })
+    expect(http.requestJson).toHaveBeenLastCalledWith('/api/v1/workspace-files/root', {
+      method: 'GET', sessionKey: 'session-a', signal: undefined,
+    })
+    http.requestJson.mockResolvedValueOnce({ available: false, host: 'gateway', apps: [], reason: 'remote-client' })
+    expect(await access.rootApps!({ sessionKey: 'session-a' })).toMatchObject({ available: false, reason: 'remote-client' })
+    http.requestJson.mockResolvedValueOnce({ ok: true, host: 'gateway', appId: 'vscode' })
+    await access.openRoot!({ sessionKey: 'session-a' }, root, 'vscode')
+    expect(http.requestJson).toHaveBeenLastCalledWith('/api/v1/workspace-files/open-root', {
+      method: 'POST', sessionKey: 'session-a', signal: undefined, json: { workspaceBinding: root.workspaceBinding, appId: 'vscode' },
+    })
+  })
+  it.each([{}, { projectId: '' }, { projectId: '../a' }, { projectId: 'a', sessionKey: 'session-a' }, { sessionKey: '\n' }])('rejects ambiguous or invalid root scope %j', async invalid => {
+    const { access, http } = fixture()
+    const scope = invalid as unknown as WorkspaceRootScope
+    await expect(access.root!(scope)).rejects.toThrow()
+    await expect(access.rootApps!(scope)).rejects.toThrow()
+    await expect(access.openRoot!(scope, root, 'reveal')).rejects.toThrow()
+    expect(http.requestJson).not.toHaveBeenCalled()
+  })
+  it.each([{ kind: 'workspace-file' }, { workspaceBinding: '' }, { path: 'https://untrusted.test' }, { path: 'relative' }, { path: 'C:\\bad\npath' }])('rejects malformed root descriptors %j', async patch => {
+    const { access, http } = fixture()
+    http.requestJson.mockResolvedValueOnce({ ...root, ...patch })
+    await expect(access.root!({ sessionKey: 'session-a' })).rejects.toThrow()
+  })
+  it('does not treat rejected or mismatched root launches as success', async () => {
+    const { access, http } = fixture()
+    http.requestJson.mockResolvedValueOnce({ ok: true, host: 'gateway', appId: 'default' })
+    await expect(access.openRoot!({ projectId: 'a' }, root, 'reveal')).rejects.toThrow()
+    http.requestJson.mockRejectedValueOnce(new HttpTransportError('http-status', 'changed', 409))
+    await expect(access.openRoot!({ projectId: 'a' }, root, 'reveal')).rejects.toBeInstanceOf(WorkspaceFilesChangedError)
+  })
+  it.each(['line', 'page'] as const)('translates the %s preview bound without calling the workspace unavailable', async limit => {
+    const { access, http, file } = fixture()
+    const [resolved] = await access.resolve('session-A', [file.path])
+    http.requestJson.mockRejectedValue(new HttpTransportError('http-status', 'size limit', 413, { code: 'WORKSPACE_TEXT_LIMIT', limit }))
+    await expect(access.readPage!('session-A', resolved, 1, 200)).rejects.toMatchObject({ name: 'WorkspaceTextLimitError', limit })
+    await expect(access.search!('session-A', resolved, 'x')).rejects.toBeInstanceOf(WorkspaceTextLimitError)
+  })
+  it.each([undefined, { code: 'OTHER_LIMIT', limit: 'line' }, { code: 'WORKSPACE_TEXT_LIMIT', limit: 'unknown' }])('does not guess at an unrelated 413 response %j', async payload => {
+    const { access, http, file } = fixture()
+    const [resolved] = await access.resolve('session-A', [file.path])
+    const error = new HttpTransportError('http-status', 'size limit', 413, payload)
+    http.requestJson.mockRejectedValue(error)
+    await expect(access.readPage!('session-A', resolved, 1, 200)).rejects.toBe(error)
+  })
+  it('pins reads to resolved versions and exposes a domain conflict instead of mixed content', async () => {
+    const { access, http, file } = fixture()
+    http.requestJson.mockResolvedValue({ workspaceBinding: 'binding-A', files: [{ ...file, revision: 'rev-a' }] })
+    const [resolved] = await access.resolve('session-A', [file.path])
+    await access.read('session-A', resolved)
+    expect(new URL(http.requestBlob.mock.calls[0][0], 'https://gateway.test').searchParams.get('expectedRevision')).toBe('rev-a')
+    http.requestJson.mockRejectedValue(new HttpTransportError('http-status', 'changed', 409, { code: 'WORKSPACE_FILE_CHANGED' }))
+    await expect(access.readPage!('session-A', resolved, 1, 200)).rejects.toBeInstanceOf(WorkspaceFilesChangedError)
+    expect(new URL(http.requestJson.mock.calls[http.requestJson.mock.calls.length - 1]![0], 'https://gateway.test').searchParams.get('expectedRevision')).toBe('rev-a')
+  })
   it('resolves and reads only through authenticated, session-bound endpoints', async () => {
     const { access, http, file } = fixture()
     const signal = new AbortController().signal

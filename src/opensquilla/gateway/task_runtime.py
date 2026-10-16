@@ -5581,6 +5581,22 @@ class TaskRuntime:
         current = await get_session(envelope.session_key)
         if current is None or getattr(current, "session_id", None) != session_id:
             return False
+        from opensquilla.session.sidechat import sidechat_metadata
+
+        metadata = sidechat_metadata(current)
+        if metadata is not None:
+            if (
+                metadata.get("state") != "ready"
+                or int(metadata.get("leaseExpiresAt", 0)) <= int(time.time() * 1000)
+            ):
+                return False
+            parent = await get_session(metadata["parentKey"])
+            if (
+                parent is None
+                or parent.session_id != metadata["parentSessionId"]
+                or parent.epoch != metadata["parentEpoch"]
+            ):
+                return False
         session_epoch = getattr(envelope, "session_epoch", None)
         if session_epoch is None:
             return True

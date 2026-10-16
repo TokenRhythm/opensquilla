@@ -42,10 +42,22 @@ function validDraftSessionKey(key: string): boolean {
     && markerIndex + marker.length < key.length
 }
 
-function clearRecentDraftPointer(key?: string): void {
+export type ChatDraftStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
+
+/** A temporary conversation keeps drafts only for its mounted owner lifetime. */
+export function createMemoryChatDraftStorage(): ChatDraftStorage {
+  const drafts = new Map<string, string>()
+  return {
+    getItem: key => drafts.get(key) ?? null,
+    setItem: (key, value) => { drafts.set(key, value) },
+    removeItem: key => { drafts.delete(key) },
+  }
+}
+
+function clearRecentDraftPointer(key?: string, storage: ChatDraftStorage | null = localStorage): void {
   try {
-    const current = localStorage.getItem(RECENT_DRAFT_SESSION_KEY)
-    if (!key || current === key) localStorage.removeItem(RECENT_DRAFT_SESSION_KEY)
+    const current = storage?.getItem(RECENT_DRAFT_SESSION_KEY)
+    if (!key || current === key) storage?.removeItem(RECENT_DRAFT_SESSION_KEY)
   } catch {
     // Storage can be unavailable in private or restricted contexts.
   }
@@ -85,6 +97,8 @@ export interface UseChatDraftPersistenceOptions {
   selectedSkills?: Ref<SelectedSkillRef[]>
   skillPositions?: Ref<Record<string, number>>
   localPaths?: Ref<string[]>
+  /** Undefined uses durable browser drafts; null disables persistence. */
+  storage?: ChatDraftStorage | null
 }
 
 /**
@@ -99,6 +113,7 @@ export interface UseChatDraftPersistenceOptions {
  */
 export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions) {
   let pendingRebind: { from: string; to: string } | null = null
+  const draftStorage = () => options.storage === undefined ? localStorage : options.storage
 
   /** Move one proven fresh draft without loading another session's composer. */
   function rebindCurrentDraft(key: string): void {
@@ -112,21 +127,23 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
   function saveDraft(key: string, text: string, selectedSkills: SelectedSkillRef[] = [], localPaths: readonly string[] = [], skillPositions: Record<string, number> = {}): void {
     if (!key) return
     try {
+      const storage = draftStorage()
+      if (!storage) return
       if (text || selectedSkills.length || localPaths.length) {
         // Keep the existing capped text fallback if a draft outgrows metadata
         // limits; never silently drop just its referenced paths.
         const paths = isDraftLocalPaths(localPaths, text) ? [...localPaths] : []
         const trimmed = (paths.length ? text : composeLocalPathText(text, localPaths)).slice(0, MAX_DRAFT_CHARS)
         const positions = draftSkillPositions(skillPositions, trimmed, selectedSkills)
-        localStorage.setItem(draftKey(key), selectedSkills.length || paths.length
+        storage.setItem(draftKey(key), selectedSkills.length || paths.length
           ? JSON.stringify({ version: 1, text: trimmed, selectedSkills,
             ...(paths.length ? { localPaths: paths } : {}),
             ...(Object.keys(positions).length ? { skillPositions: positions } : {}),
           }) : trimmed)
-        localStorage.setItem(RECENT_DRAFT_SESSION_KEY, key)
+        storage.setItem(RECENT_DRAFT_SESSION_KEY, key)
       } else {
-        localStorage.removeItem(draftKey(key))
-        clearRecentDraftPointer(key)
+        storage.removeItem(draftKey(key))
+        clearRecentDraftPointer(key, storage)
       }
     } catch {
       // Ignore storage failures in private or restricted contexts.
@@ -141,7 +158,7 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
     const empty = { text: '', selectedSkills: [] as SelectedSkillRef[], localPaths: [] as string[], skillPositions: {} }
     if (!key) return empty
     try {
-      const raw = localStorage.getItem(draftKey(key)) || ''
+      const raw = draftStorage()?.getItem(draftKey(key)) || ''
       try {
         const value = JSON.parse(raw)
         if (value?.version === 1 && typeof value.text === 'string' && isSelectedSkills(value.selectedSkills)
@@ -182,8 +199,9 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
   function clearDraft(key: string): void {
     if (!key) return
     try {
-      localStorage.removeItem(draftKey(key))
-      clearRecentDraftPointer(key)
+      const storage = draftStorage()
+      storage?.removeItem(draftKey(key))
+      clearRecentDraftPointer(key, storage)
     } catch {
       // Ignore.
     }
@@ -191,9 +209,10 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
 
   function discardRecentDraft(): void {
     try {
-      const key = localStorage.getItem(RECENT_DRAFT_SESSION_KEY) || ''
-      if (validDraftSessionKey(key)) localStorage.removeItem(draftKey(key))
-      localStorage.removeItem(RECENT_DRAFT_SESSION_KEY)
+      const storage = draftStorage()
+      const key = storage?.getItem(RECENT_DRAFT_SESSION_KEY) || ''
+      if (validDraftSessionKey(key)) storage?.removeItem(draftKey(key))
+      storage?.removeItem(RECENT_DRAFT_SESSION_KEY)
     } catch {
       // Ignore storage failures in private or restricted contexts.
     }

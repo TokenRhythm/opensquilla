@@ -32,16 +32,22 @@ export function createWorkspaceFileItem(sessionKey: string, reference: Workspace
  * and binding opaque to the Workbench payload; no host filesystem path is
  * exposed to the renderer.
  */
-export function createResolvedWorkspaceFileItem(sessionKey: string, file: WorkspaceFile): WorkbenchItem {
+export function createResolvedWorkspaceFileItem(sessionKey: string, file: WorkspaceFile, ownerSessionKey = sessionKey): WorkbenchItem {
   return {
     id: `file:${sessionKey}:${file.workspaceBinding}:${file.path}`,
     kind: 'file',
     title: file.path,
-    scope: { type: 'session', id: sessionKey },
+    scope: { type: 'session', id: ownerSessionKey },
     hostKind: 'dom',
     retention: 'dispose-on-suspend',
-    payload: { file },
+    payload: { file, sessionKey },
   }
+}
+
+export function workspaceFileSessionKey(item: WorkbenchItem): string {
+  if (item.scope.type !== 'session') return ''
+  return typeof item.payload.sessionKey === 'string' && item.payload.sessionKey.trim()
+    ? item.payload.sessionKey : item.scope.id
 }
 
 export function workspaceFileReference(item: WorkbenchItem): WorkspaceFileReferenceV1 | null {

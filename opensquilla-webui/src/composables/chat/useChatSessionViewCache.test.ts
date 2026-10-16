@@ -224,6 +224,108 @@ interface Presentation {
   live: { text: string; thinking: string[] }
   model: string
 }
+
+function unprovenIdentityHarness() {
+  const scope = effectScope()
+  const sessionKey = ref('A')
+  const deliveryIdentity = ref<string | null>(null)
+  const messages = ref<ChatMessage[]>([row('a')])
+  let authority: object | null = {}
+  const cache = scope.run(() => useChatSessionViewCache({
+    sessionKey, deliveryIdentity, messages, waitForLive: true,
+    currentReadAuthority: () => authority,
+  }))!
+  return {
+    scope, cache, sessionKey, deliveryIdentity, messages,
+    replaceAuthority: (next: object | null = {}) => { authority = next },
+  }
+}
+
+describe('useChatSessionViewCache first delivery proof', () => {
+  it.each([
+    ['history', 'live', 0], ['history', 'live', 1], ['history', 'live', 2],
+    ['live', 'history', 0], ['live', 'history', 1], ['live', 'history', 2],
+  ] as const)('keeps current read receipts with %s then %s and proof after %s installs', (first, second, proofAfter) => {
+    const h = unprovenIdentityHarness()
+    h.cache.beginLiveRead('A')
+    h.cache.observeEpoch('A', 1)
+    const install = (phase: 'history' | 'live') => phase === 'history'
+      ? h.cache.historyInstalled('A') : h.cache.liveInstalled('A')
+    if (proofAfter === 0) h.deliveryIdentity.value = 'gateway-one:owner'
+    install(first)
+    expect(h.cache.ready.value).toBe(false)
+    if (proofAfter === 1) h.deliveryIdentity.value = 'gateway-one:owner'
+    install(second)
+    if (proofAfter === 2) h.deliveryIdentity.value = 'gateway-one:owner'
+    expect(h.cache.ready.value).toBe(true)
+    expect(h.cache.showingPreview.value).toBe(false)
+    // The retained epoch remains part of the same authority, so a real reset
+    // still invalidates both barriers after the initial identity is proven.
+    const generation = h.cache.generation.value
+    h.cache.observeEpoch('A', 1)
+    expect(h.cache.generation.value).toBe(generation)
+    h.cache.observeEpoch('A', 2)
+    expect(h.cache.ready.value).toBe(false)
+    expect(h.cache.generation.value).toBe(generation + 1)
+    h.scope.stop()
+  })
+
+  it.each([false, true])('rejects receipts from a replaced or missing read lease (missing=%s)', missing => {
+    const h = unprovenIdentityHarness()
+    h.cache.historyInstalled('A')
+    h.cache.liveInstalled('A')
+    expect(h.cache.ready.value).toBe(true)
+    h.replaceAuthority(missing ? null : {})
+    h.deliveryIdentity.value = 'gateway-one:owner'
+    expect(h.cache.ready.value).toBe(false)
+    h.scope.stop()
+  })
+
+  it('adopts only the matching half when the read lease changes between receipts', () => {
+    const h = unprovenIdentityHarness()
+    h.cache.historyInstalled('A')
+    h.replaceAuthority()
+    h.cache.liveInstalled('A')
+    h.deliveryIdentity.value = 'gateway-one:owner'
+    expect(h.cache.ready.value).toBe(false)
+    h.cache.historyInstalled('A')
+    expect(h.cache.ready.value).toBe(true)
+    h.scope.stop()
+  })
+
+  it.each(['history', 'live'] as const)('does not bless a non-authoritative %s receipt when identity arrives', phase => {
+    const h = unprovenIdentityHarness()
+    h.cache.historyInstalled('A', phase !== 'history')
+    h.cache.liveInstalled('A', phase !== 'live')
+    h.deliveryIdentity.value = 'gateway-one:owner'
+    expect(h.cache.ready.value).toBe(false)
+    if (phase === 'history') h.cache.historyInstalled('A')
+    else h.cache.liveInstalled('A')
+    expect(h.cache.ready.value).toBe(true)
+    h.scope.stop()
+  })
+
+  it('requires new receipts after revocation and a second proof even if reads finish while unproven', () => {
+    const h = unprovenIdentityHarness()
+    h.cache.historyInstalled('A')
+    h.cache.liveInstalled('A')
+    h.deliveryIdentity.value = 'gateway-one:owner'
+    expect(h.cache.ready.value).toBe(true)
+    h.deliveryIdentity.value = null
+    expect(h.cache.ready.value).toBe(false)
+    h.replaceAuthority()
+    h.cache.historyInstalled('A')
+    h.cache.liveInstalled('A')
+    h.deliveryIdentity.value = 'gateway-two:owner'
+    expect(h.cache.ready.value).toBe(false)
+    h.cache.historyInstalled('A')
+    expect(h.cache.ready.value).toBe(false)
+    h.cache.liveInstalled('A')
+    expect(h.cache.ready.value).toBe(true)
+    h.scope.stop()
+  })
+})
+
 interface Viewport {
   scrollTop: number
   anchor?: string

@@ -102,6 +102,47 @@ async def test_channel_rejected_first_turn_removes_uncommitted_workspace(
 
 
 @pytest.mark.asyncio
+async def test_atomic_create_reuse_preserves_winner_and_removes_losing_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with SessionStorage(tmp_path / "create-race.db") as storage:
+        factory = build_execution_workspace_factory(
+            _managed_config(tmp_path), profile_home=tmp_path,
+        )
+        manager = SessionManager(storage, execution_workspace_factory=factory)
+        independent_writer = SessionManager(storage, execution_workspace_factory=factory)
+        prepare = manager._prepare_execution_workspace
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        losing_root: Path | None = None
+
+        async def pause_after_allocation(node: Any) -> Any:
+            nonlocal losing_root
+            preparation = await prepare(node)
+            losing_root = Path(node.execution_workspace["root"])
+            entered.set()
+            await release.wait()
+            return preparation
+
+        monkeypatch.setattr(manager, "_prepare_execution_workspace", pause_after_allocation)
+        operation = asyncio.create_task(manager.create(NEW_KEY, reuse_existing=True))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            assert losing_root is not None and losing_root.is_dir()
+            winner = await independent_writer.create(NEW_KEY)
+        finally:
+            release.set()
+        returned = await operation
+        persisted = await storage.get_session(NEW_KEY)
+        winner_root = Path(winner.execution_workspace["root"])
+        assert returned.session_id == persisted.session_id == winner.session_id
+        assert returned.execution_workspace == winner.execution_workspace
+        assert winner_root.is_dir()
+        assert not losing_root.exists()
+        assert _roots(tmp_path) == [winner_root]
+
+
+@pytest.mark.asyncio
 async def test_direct_create_failure_removes_uncommitted_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

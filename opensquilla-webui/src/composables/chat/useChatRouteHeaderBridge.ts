@@ -30,6 +30,8 @@ export interface ChatRouteHeaderFindState {
 
 export interface ChatRouteHeaderModel {
   sessionKey: Readonly<Ref<string>>
+  sessionDurable?: Readonly<Ref<boolean>>
+  sessionPreparable?: Readonly<Ref<boolean>>
   workspaceId?: Readonly<Ref<string | null>>
   workspaceReady?: Readonly<Ref<boolean>>
   workspaceResolved?: Readonly<Ref<boolean>>
@@ -47,6 +49,7 @@ export interface ChatRouteHeaderModel {
 }
 
 export interface ChatRouteHeaderCommands {
+  prepareWorkbenchSession?: (expectedSessionKey: string) => Promise<string | null>
   openDeliverables: () => void
   startShare: () => void
   copySessionLink: () => void
@@ -72,6 +75,8 @@ export interface ChatRouteHeaderRegistration {
 export interface ChatRouteHeaderBridge {
   model: {
     sessionKey: ComputedRef<string>
+    sessionDurable: ComputedRef<boolean>
+    sessionPreparable: ComputedRef<boolean>
     workspaceId: ComputedRef<string | null>
     workspaceReady: ComputedRef<boolean>
     workspaceResolved: ComputedRef<boolean>
@@ -95,6 +100,7 @@ export interface ChatRouteHeaderBridge {
   setHost: (host: ChatRouteHeaderHostHandle | null) => void
   focusAction: (action: ChatRouteHeaderAction) => boolean
   closeMenu: () => void
+  prepareWorkbenchSession: (expectedSessionKey: string) => Promise<string | null>
   invoke: <K extends keyof ChatRouteHeaderCommands>(
     command: K,
     ...args: Parameters<NonNullable<ChatRouteHeaderCommands[K]>>
@@ -157,6 +163,8 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
   const bridge: ChatRouteHeaderBridge = {
     model: {
       sessionKey: computed(() => ownerValue('sessionKey', '')),
+      sessionDurable: computed(() => activeOwner.value?.model.sessionDurable?.value ?? false),
+      sessionPreparable: computed(() => activeOwner.value?.model.sessionPreparable?.value ?? false),
       workspaceId: computed(() => activeOwner.value?.model.workspaceId?.value ?? null),
       workspaceReady: computed(() => activeOwner.value?.model.workspaceReady?.value ?? false),
       workspaceResolved: computed(() => activeOwner.value?.model.workspaceResolved?.value ?? false),
@@ -190,6 +198,17 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
     },
     focusAction: action => focusActionForOwner(action),
     closeMenu,
+    async prepareWorkbenchSession(expectedSessionKey) {
+      const owner = activeOwner.value
+      if (!owner || !expectedSessionKey || owner.model.sessionKey.value !== expectedSessionKey) return null
+      const key = owner.commands.prepareWorkbenchSession
+        ? await owner.commands.prepareWorkbenchSession(expectedSessionKey)
+        : owner.model.sessionDurable?.value ? expectedSessionKey : null
+      // A delayed create belongs to the initiating route owner. A replacement
+      // ChatView must never receive its panel, even if it happens to share a key.
+      return activeOwner.value === owner && key === owner.model.sessionKey.value
+        && owner.model.sessionDurable?.value ? key : null
+    },
     invoke(command, ...args) {
       const handler = activeOwner.value?.commands[command] as ((...values: typeof args) => void) | undefined
       handler?.(...args)

@@ -1,445 +1,308 @@
-import { describe, expect, it, vi } from 'vitest'
-import { assistantChatBindingKey, createAssistantChat } from './assistantChat'
-import { conversationEventSessionKey, type ConversationEvent, type ConversationEvents } from './conversationEvents'
-import { createConversationEventHub } from './conversationEventHub'
-import { createConversationEventTransport } from '@/adapters/gateway/conversationEventTransport'
-import { InMemorySessionReadPortAdapter } from '@/adapters/inMemory/sessionReadPortInMemory'
-import { createSessionReadLifecycleFactory } from './sessionReadLifecycle'
-import type { TransportGapHandler } from '@/adapters/gateway/transportTypes'
-import type { ConversationEventSourceHandlers } from './conversationEventHub'
-import { SessionReadSessionMissingError, type SessionReadLease, type SessionReadLive, type SessionReadHistoryPage, type SessionReadMetadata } from './sessionReadLifecycle'
-import { TurnCommandError, type TurnCommands } from './turnCommands'
-
-type Mutable<T> = { -readonly [K in keyof T]: T[K] }
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { effectScope, nextTick, ref } from 'vue'
+import { assistantChatBindingKey, closeAssistantChatOwner, createAssistantChatOwner, type AssistantChatOwnerOptions, type AssistantChatOwnerState } from './assistantChat'
+import { assistantChatPendingOwner } from './assistantChatPendingOwner'
+import { SessionLifecycleError, type SidechatSession } from './sessionLifecycle'
+import { useChatDraftPersistence } from '@/composables/chat/useChatDraftPersistence'
 
 let sequence = 0
-function fixture(sharedEvents?: ConversationEvents) {
-  const values = new Map<string, string>()
-  const storage = { getItem: (key: string) => values.get(key) || null, setItem: (key: string, value: string) => { values.set(key, value) }, removeItem: (key: string) => { values.delete(key) } }
-  let handlers: ConversationEventSourceHandlers<ConversationEvent> | undefined
+const cleanup: (() => Promise<void>)[] = []
+afterEach(async () => {
+  for (const close of cleanup.splice(0)) await close()
+  vi.useRealTimers()
+})
+
+function fixture() {
+  const id = ++sequence
   let current = true
-  const live = { sessionKey: 'child', activity: 'idle', snapshot: null, initialMetadata: { epoch: 1 }, confirmInstalled: vi.fn(), assertInstalledCurrent: vi.fn() } as unknown as Mutable<SessionReadLive>
-  const history = { messages: [], hasMore: false } as unknown as Mutable<SessionReadHistoryPage>
-  const metadata = { sessionKey: 'child', workspaceId: 'workspace', epoch: 1, pendingUserInputs: [], runStatus: 'idle', lastTask: null, activeTask: null } as unknown as Mutable<SessionReadMetadata>
-  const close = vi.fn(async () => {})
-  const lease = { live: Promise.resolve(live), criticalRequestsQueued: Promise.resolve(), metadata: Promise.resolve(metadata), retryMetadata: vi.fn(async () => metadata), history: { latest: vi.fn(async () => history) }, reconcile: vi.fn(async () => live), close } as unknown as Mutable<SessionReadLease>
-  const create = vi.fn(async () => ({ key: 'child', sessionId: 'child-id' }))
-  const send = vi.fn(async (..._args: Parameters<TurnCommands['send']>) => ({ ok: true }))
-  const cancel = vi.fn(async () => ({ aborted: true }))
-  const lookupReceipt = vi.fn(async () => ({ status: 'not-found' as const }))
-  const readMessageText = vi.fn(async (_message: unknown, _signal: AbortSignal) => '')
-  const readFixture = { sessionKey: 'child', metadata, latestHistory: history, live: {
-    ...live, initialMetadata: metadata, activeTaskId: null, snapshotCursor: null,
-    cursor: { sessionKey: 'child', sessionEpoch: 1, streamGeneration: 'generation', currentStreamSeq: 0, replayComplete: true, replayGapReason: null },
-  }, liveError: undefined as Error | undefined }
-  const adapter = new InMemorySessionReadPortAdapter([readFixture])
-  const options = {
-    parentKey: `parent-${++sequence}`, identity: 'identity-a', workspaceId: 'workspace',
-    isCurrent: () => current, generation: () => 1,
-    lifecycle: { create, fork: vi.fn(), rename: vi.fn(), remove: vi.fn() },
-    reads: sharedEvents ? createSessionReadLifecycleFactory(adapter) : { create: () => ({ open: vi.fn(() => lease), current: () => lease }) },
-    commands: { send, cancel, steer: vi.fn(), supports: () => true, lookupReceipt },
-    events: sharedEvents || { subscribe: (value: ConversationEventSourceHandlers<ConversationEvent>) => { handlers = value; return vi.fn() } },
-    readMessageText,
-    storage, title: 'Assistant chat', onChange: vi.fn(),
+  let available = true
+  const child: SidechatSession = {
+    key: `child-${id}`, sessionId: `child-id-${id}`, parentKey: `parent-${id}`,
+    inherited: { model: 'parent-model', provider: 'provider', reasoningLevel: 'high', modelRoutingMode: 'auto', modelRoutingRevision: 2, runMode: 'safe' },
   }
-  const controller = createAssistantChat(options)
-  const emit = (kind: string, text?: string, key = 'child', epoch = 1, streamGeneration = 'generation', extra: Record<string, unknown> = {}) => handlers?.onEvent?.({ kind: 'conversation', event: {
-    kind: 'known', semanticKind: kind, sessionKey: key, taskId: 'task', turnId: 'turn',
-    streamGeneration, streamSeq: ++sequence, connectionSeq: null, generationEpoch: null,
-    meta: {}, payload: { key, epoch, assistant_message_id: 'answer', text, ...extra },
-  } } as ConversationEvent)
-  return { controller, options, values, create, send, cancel, lookupReceipt, readMessageText, live, history, metadata, lease, close, emit, readFixture, adapter, expire: () => { current = false } }
+  const createSidechat = vi.fn(async () => child)
+  const closeSidechat = vi.fn(async () => ({ key: child.key, closed: true as const }))
+  const options: AssistantChatOwnerOptions = {
+    parentKey: child.parentKey, ownerId: `owner-${id}`, identity: 'authority-a',
+    isCurrent: () => current, ownerAvailable: () => available,
+    lifecycle: { create: vi.fn(), fork: vi.fn(), rename: vi.fn(), remove: vi.fn(), createSidechat, closeSidechat },
+    onChange: vi.fn<(state: AssistantChatOwnerState) => void>(),
+  }
+  const owner = createAssistantChatOwner(options)
+  cleanup.push(async () => { owner.dispose(); closeSidechat.mockResolvedValue({ key: child.key, closed: true }); await closeAssistantChatOwner(options).catch(() => {}) })
+  return { owner, options, child, createSidechat, closeSidechat,
+    expire: () => { current = false }, setAvailable: (value: boolean) => { available = value } }
 }
 
-describe('assistant side conversation lifecycle', () => {
-  it('leaves global recovery to the main read until a child exists, and after closing', async () => {
-    let gap!: TransportGapHandler
-    const transport = createConversationEventTransport({
-      subscribe: () => ({ close() {} }),
-      subscribeGap: handler => { gap = handler; return { close() {} } },
-    })
-    const main = createConversationEventHub(transport, { sessionKey: conversationEventSessionKey })
-    main.prepareReadRetirement('main')
-    const recoverMain = vi.fn(async () => true)
-    main.observeRecoveryRequired(recoverMain)
-    const f = fixture(transport)
-    await f.controller.restore()
-    await expect(gap({ global: true })).resolves.toBe(true)
-    expect(f.create).not.toHaveBeenCalled()
-    await f.controller.send('question')
-    f.readFixture.liveError = new Error('child reconciliation failed')
-    await expect(gap({ global: true })).resolves.toBe(false)
-    expect(f.controller.state.error).toBe('child reconciliation failed')
-    f.readFixture.liveError = undefined
-    await expect(gap({ global: true })).resolves.toBe(true)
-    await f.controller.close()
-    expect(f.adapter.activeLeaseCount).toBe(0)
-    await expect(gap({ global: true })).resolves.toBe(true)
-    expect(recoverMain).toHaveBeenCalledTimes(4)
-    main.dispose()
-  })
-
-  it('reconciles streamed full text against the current canonical body instead of installing its preview', async () => {
+describe('side owner lifecycle around the shared chat runtime', () => {
+  it('does not take a snapshot or create a child merely by opening/restoring an empty panel', () => {
     const f = fixture()
-    await f.controller.send('question')
-    const sharedPrefix = 'a'.repeat(16 * 1024)
-    f.emit('text-delta', sharedPrefix + 'old streamed suffix')
-    f.emit('turn-completed')
-    f.history.messages = [{ id: 'answer', messageId: 'answer', role: 'assistant', text: sharedPrefix,
-      previewComplete: false, contentRevision: 'r1', contentRef: {
-        version: 1, sessionKey: 'child', sessionId: 'physical-child', messageId: 'answer',
-        view: 'display', revision: 'r1', byteLength: 20000,
-      } }] as never
-    f.readMessageText.mockResolvedValue(sharedPrefix + 'canonical suffix')
-    f.emit('turn-committed')
-    await f.controller.refresh()
-    expect(f.readMessageText).toHaveBeenCalledOnce()
-    expect(f.controller.state.messages[0]).toMatchObject({ text: sharedPrefix + 'canonical suffix', previewComplete: true, contentRevision: 'r1' })
-    await f.controller.refresh()
-    expect(f.readMessageText).toHaveBeenCalledOnce()
-    f.history.messages = f.history.messages.map(row => ({ ...row, contentRevision: 'r2', contentRef: { ...row.contentRef!, revision: 'r2' } }))
-    f.readMessageText.mockResolvedValue(sharedPrefix + 'revised canonical suffix')
-    await f.controller.refresh()
-    expect(f.readMessageText).toHaveBeenCalledTimes(2)
-    expect(f.controller.state.messages[0]?.text).toBe(sharedPrefix + 'revised canonical suffix')
-    await f.controller.close()
-  })
-
-  it('retains preview identity on reopen without automatically fetching historical bodies', async () => {
-    const f = fixture()
-    f.values.set(assistantChatBindingKey(f.options.identity, f.options.parentKey), 'child')
-    const contentRef = { version: 1, sessionKey: 'child', sessionId: 'physical-child', messageId: 'answer', view: 'display', revision: 'r1', byteLength: 20000 }
-    f.history.messages = [{ id: 'answer', messageId: 'answer', role: 'assistant', text: 'bounded preview', previewComplete: false,
-      contentRef, contentRevision: 'r1', contentAvailability: 'ready' }] as never
-    await f.controller.restore()
-    expect(f.controller.state.messages[0]).toMatchObject({ previewComplete: false, contentRef, contentRevision: 'r1', contentAvailability: 'ready' })
-    expect(f.readMessageText).not.toHaveBeenCalled()
-    await f.controller.close()
-  })
-
-  it.each(['missing-reference', 'preparing', 'oversized', 'failed-read'])('keeps an explicit canonical preview without an old suffix when hydration is %s', async reason => {
-    const f = fixture()
-    await f.controller.send('question')
-    f.emit('text-delta', 'shared prefix plus stale streamed suffix')
-    const contentRef = { version: 1, sessionKey: 'child', sessionId: 'physical-child', messageId: 'answer', view: 'display', revision: 'r2', byteLength: reason === 'oversized' ? 1024 * 1024 : 20000 }
-    f.history.messages = [{ id: 'answer', messageId: 'answer', role: 'assistant', text: 'shared prefix', previewComplete: false,
-      contentRevision: 'r2', contentRef: reason === 'missing-reference' ? undefined : contentRef,
-      contentAvailability: reason === 'preparing' ? 'preparing' : 'ready' }] as never
-    f.readMessageText.mockRejectedValue(new Error('content unavailable'))
-    await f.controller.refresh()
-    expect(f.controller.state.messages[0]).toMatchObject({ text: 'shared prefix', previewComplete: false, contentRevision: 'r2' })
-    expect(f.readMessageText).toHaveBeenCalledTimes(reason === 'failed-read' ? 1 : 0)
-    await f.controller.close()
-  })
-
-  it('cancels an in-flight body read on close and never installs its late result', async () => {
-    const f = fixture()
-    await f.controller.send('question')
-    f.emit('text-delta', 'full streamed body')
-    f.history.messages = [{ id: 'answer', messageId: 'answer', role: 'assistant', text: 'full', previewComplete: false,
-      contentRef: { version: 1, sessionKey: 'child', sessionId: 'physical-child', messageId: 'answer', view: 'display', revision: 'r1', byteLength: 20000 } }] as never
-    let finish!: (text: string) => void
-    f.readMessageText.mockImplementation(async () => new Promise(resolve => { finish = resolve }))
-    const refresh = f.controller.refresh()
-    await vi.waitFor(() => expect(f.readMessageText).toHaveBeenCalledOnce())
-    const signal = f.readMessageText.mock.calls[0]![1]
-    await f.controller.close()
-    expect(signal.aborted).toBe(true)
-    const calls = f.options.onChange.mock.calls.length
-    finish('late canonical text')
-    await refresh
-    expect(f.options.onChange).toHaveBeenCalledTimes(calls)
-    expect(f.controller.state.messages.some(row => row.text === 'late canonical text')).toBe(false)
-  })
-
-  it('gates a new send while canonical body reconciliation is installing', async () => {
-    const f = fixture()
-    await f.controller.send('question')
-    f.emit('text-delta', 'full streamed body')
-    f.emit('turn-completed')
-    f.history.messages = [{ id: 'answer', messageId: 'answer', role: 'assistant', text: 'full', previewComplete: false,
-      contentRef: { version: 1, sessionKey: 'child', sessionId: 'physical-child', messageId: 'answer', view: 'display', revision: 'r1', byteLength: 20000 } }] as never
-    let finish!: (text: string) => void
-    f.readMessageText.mockImplementation(async () => new Promise(resolve => { finish = resolve }))
-    const refresh = f.controller.refresh()
-    await vi.waitFor(() => expect(f.readMessageText).toHaveBeenCalledOnce())
-    expect(f.controller.state.phase).toBe('loading')
-    expect(await f.controller.send('next draft')).toBe(false)
-    expect(f.send).toHaveBeenCalledOnce()
-    finish('canonical body')
-    await refresh
-    expect(await f.controller.send('next draft')).toBe(true)
-    expect(f.controller.state.messages.map(row => row.text)).toEqual(['canonical body', 'next draft'])
-    await f.controller.close()
-  })
-
-  it('leaves loading on a failed manual refresh and requires a successful retry before sending', async () => {
-    const f = fixture()
-    await f.controller.send('question')
-    f.emit('turn-completed')
-    vi.mocked(f.lease.reconcile).mockRejectedValueOnce(new Error('reconcile unavailable'))
-    await expect(f.controller.refresh()).rejects.toThrow('reconcile unavailable')
-    expect(f.controller.state.phase).toBe('error')
-    expect(f.controller.state.error).toBe('reconcile unavailable')
-    expect(await f.controller.send('next draft')).toBe(false)
-    await f.controller.refresh()
-    expect(f.controller.state.phase).toBe('ready')
-    expect(await f.controller.send('next draft')).toBe(true)
-    await f.controller.close()
-  })
-
-  it('limits automatic reconciliation to one bounded body and rejects an oversized result', async () => {
-    const f = fixture()
-    await f.controller.send('question')
-    for (const id of ['first', 'second']) f.emit('text-delta', 'complete streamed answer', 'child', 1, 'generation', { assistant_message_id: id })
-    f.history.messages = ['first', 'second'].map(id => ({ id, messageId: id, role: 'assistant', text: 'preview', previewComplete: false,
-      contentRef: { version: 1, sessionKey: 'child', sessionId: 'physical-child', messageId: id, view: 'display', revision: 'r1', byteLength: 20000 },
-    })) as never
-    f.readMessageText.mockResolvedValue('a'.repeat(512 * 1024 + 1))
-    await f.controller.refresh()
-    expect(f.readMessageText).toHaveBeenCalledOnce()
-    expect(f.readMessageText.mock.calls[0]![0]).toMatchObject({ id: 'second' })
-    expect(f.controller.state.messages.map(row => ({ text: row.text, complete: row.previewComplete }))).toEqual([
-      { text: 'preview', complete: false }, { text: 'preview', complete: false },
-    ])
-    await f.controller.close()
-  })
-
-  it('re-reads canonical history when a newer commit arrives during body hydration', async () => {
-    const f = fixture()
-    await f.controller.send('question')
-    f.emit('text-delta', 'complete streamed answer')
-    const row = { id: 'answer', messageId: 'answer', role: 'assistant', text: 'preview', previewComplete: false,
-      contentRevision: 'r1', contentRef: { version: 1, sessionKey: 'child', sessionId: 'physical-child', messageId: 'answer', view: 'display', revision: 'r1', byteLength: 20000 } }
-    f.history.messages = [row] as never
-    let finish!: (text: string) => void
-    f.readMessageText.mockImplementationOnce(async () => new Promise(resolve => { finish = resolve }))
-    const refresh = f.controller.refresh()
-    await vi.waitFor(() => expect(f.readMessageText).toHaveBeenCalledOnce())
-    f.history.messages = [{ ...row, contentRevision: 'r2', contentRef: { ...row.contentRef, revision: 'r2' } }] as never
-    f.readMessageText.mockResolvedValue('latest canonical revision')
-    f.emit('turn-committed')
-    finish('earlier canonical revision')
-    await refresh
-    await vi.waitFor(() => expect(f.controller.state.messages[0]?.text).toBe('latest canonical revision'))
-    expect(f.readMessageText).toHaveBeenCalledTimes(2)
-    await f.controller.close()
-  })
-
-  it('creates lazily and shares only the workspace without forking history', async () => {
-    const f = fixture()
-    await f.controller.restore()
-    expect(f.create).not.toHaveBeenCalled()
-    expect(await f.controller.send('hello')).toBe(true)
-    expect(f.create).toHaveBeenCalledWith({ title: 'Assistant chat', workspaceId: 'workspace' })
+    expect(f.owner.restore()).toBeNull()
+    expect(f.createSidechat).not.toHaveBeenCalled()
+    expect(f.options.lifecycle.create).not.toHaveBeenCalled()
     expect(f.options.lifecycle.fork).not.toHaveBeenCalled()
-    expect(f.send.mock.calls[0]?.[0]).toMatchObject({ kind: 'new-turn', params: { sessionKey: 'child', message: 'hello' } })
-    expect([...f.values.values()]).toEqual(['child'])
-    await f.controller.close()
+    expect(f.owner.state).toEqual({ child: null, preparing: false, closing: false, error: '', requiresNewSession: false })
   })
 
-  it('puts the user before an early streamed answer and does not revive completed turns on ACK', async () => {
+  it('freezes inheritance at the first explicit preparation and retains the child identity', async () => {
     const f = fixture()
-    f.send.mockImplementation(async () => {
-      f.emit('text-delta', 'answer')
-      f.emit('turn-completed')
-      return { ok: true }
-    })
-    await f.controller.send('question')
-    expect(f.controller.state.messages.map(row => row.role)).toEqual(['user', 'assistant'])
-    expect(f.controller.state.phase).toBe('ready')
-    await f.controller.close()
+    f.child.inherited.model = 'model-at-first-send'
+    expect(await f.owner.prepare()).toEqual(f.child)
+    expect(f.createSidechat).toHaveBeenCalledExactlyOnceWith({ parentKey: f.options.parentKey, clientRequestId: f.options.ownerId })
+    expect(await f.owner.prepare()).toBe(f.child)
+    expect(f.createSidechat).toHaveBeenCalledTimes(1)
+    expect(f.owner.state.child?.inherited.model).toBe('model-at-first-send')
   })
 
-  it('reuses the child after closing without cancelling or deleting it', async () => {
+  it('coalesces preparation across overlapping adapters for the same owner', async () => {
     const f = fixture()
-    await f.controller.send('question')
-    await f.controller.close()
-    expect(f.close).toHaveBeenCalledOnce()
-    expect(f.cancel).not.toHaveBeenCalled()
+    let release!: (child: SidechatSession) => void
+    f.createSidechat.mockImplementationOnce(() => new Promise(resolve => { release = resolve }))
+    const first = f.owner.prepare()
+    const next = createAssistantChatOwner(f.options)
+    const second = next.prepare()
+    expect(f.createSidechat).toHaveBeenCalledTimes(1)
+    release(f.child)
+    expect(await first).toBe(f.child)
+    expect(await second).toBe(f.child)
+    next.dispose()
+  })
+
+  it('retains child and owner-owned draft across adapter disposal/remount without closing it', async () => {
+    const f = fixture()
+    await f.owner.prepare()
+    const memory = assistantChatPendingOwner(f.owner.binding)
+    memory.draftStorage.setItem('draft', 'unfinished question')
+    f.owner.dispose()
+    const restored = createAssistantChatOwner(f.options)
+    expect(restored.state.child).toBe(f.child)
+    expect(assistantChatPendingOwner(restored.binding).draftStorage.getItem('draft')).toBe('unfinished question')
+    expect(f.createSidechat).toHaveBeenCalledTimes(1)
+    expect(f.closeSidechat).not.toHaveBeenCalled()
     expect(f.options.lifecycle.remove).not.toHaveBeenCalled()
-    const reopened = createAssistantChat(f.options)
-    await reopened.restore()
-    expect(reopened.state.childKey).toBe('child')
-    expect(f.create).toHaveBeenCalledOnce()
-    await reopened.close()
+    restored.dispose()
   })
 
-  it('fences another session and all late events after a parent/epoch change', async () => {
+  it('retains an unsent draft across reader remount and first child preparation, then clears the accepted composer', async () => {
     const f = fixture()
-    await f.controller.send('question')
-    f.emit('text-delta', 'wrong task', 'parent')
-    f.expire()
-    f.emit('text-delta', 'late answer')
-    expect(f.controller.state.messages.map(row => row.text)).toEqual(['question'])
-    expect(await f.controller.send('late send')).toBe(false)
-    await f.controller.close()
+    const mountDraft = (binding: string) => {
+      const scope = effectScope()
+      const inputText = ref('')
+      const localPaths = ref<string[]>([])
+      const sessionKey = ref(binding)
+      const storage = assistantChatPendingOwner(binding).draftStorage
+      const api = scope.run(() => useChatDraftPersistence({ sessionKey, inputText, localPaths, storage }))!
+      return { scope, inputText, localPaths, api }
+    }
+    const initial = mountDraft(f.owner.binding)
+    initial.inputText.value = 'Explain this file'
+    initial.localPaths.value = ['C:/project/readme.md']
+    await nextTick()
+    expect(f.createSidechat).not.toHaveBeenCalled()
+    initial.scope.stop()
+    f.owner.dispose()
+
+    // Switching to a file tab retires only the reader, including before any
+    // child session exists. Both adapters retain the same draft owner.
+    const restored = createAssistantChatOwner(f.options)
+    const draft = mountDraft(restored.binding)
+    expect(restored.state.child).toBeNull()
+    expect(draft.inputText.value).toBe('Explain this file')
+    expect(draft.localPaths.value).toEqual(['C:/project/readme.md'])
+
+    await restored.prepare()
+    await nextTick()
+    expect(restored.state.child?.key).toBe(f.child.key)
+    expect(draft.inputText.value).toBe('Explain this file')
+    expect(draft.api.loadDraft(restored.binding)).toBe('Explain this file')
+    expect(draft.api.loadDraft(f.child.key)).toBe('')
+
+    // The shared send path clears the accepted composer; persistence consumes
+    // the same stable owner record rather than leaving a pre-child draft.
+    draft.inputText.value = ''
+    draft.localPaths.value = []
+    await nextTick()
+    expect(draft.api.loadDraft(restored.binding)).toBe('')
+    draft.scope.stop()
+    restored.dispose()
+    const afterAccepted = mountDraft(restored.binding)
+    expect(afterAccepted.inputText.value).toBe('')
+    expect(afterAccepted.localPaths.value).toEqual([])
+    afterAccepted.scope.stop()
   })
 
-  it('does not send a turn after creation completes for a superseded owner', async () => {
+  it('does not expose an asynchronous child to a retired adapter but lets its owner restore it', async () => {
     const f = fixture()
-    f.create.mockImplementation(async () => { f.expire(); return { key: 'child', sessionId: 'child-id' } })
-    expect(await f.controller.send('question')).toBe(false)
-    expect(f.send).not.toHaveBeenCalled()
-    expect([...f.values.values()]).toEqual(['child'])
-    await f.controller.close()
+    let release!: (child: SidechatSession) => void
+    f.createSidechat.mockImplementationOnce(() => new Promise(resolve => { release = resolve }))
+    const preparing = f.owner.prepare()
+    f.owner.dispose()
+    release(f.child)
+    expect(await preparing).toBeNull()
+    const next = createAssistantChatOwner(f.options)
+    expect(next.restore()).toBe(f.child)
+    expect(f.createSidechat).toHaveBeenCalledTimes(1)
+    next.dispose()
   })
 
-  it('keeps a created child when localStorage writes fail', async () => {
+  it('does not return an asynchronously created child after its parent/authority scope changes', async () => {
     const f = fixture()
-    f.options.storage.setItem = () => { throw new Error('storage disabled') }
-    await f.controller.send('question')
-    await f.controller.close()
-    const reopened = createAssistantChat(f.options)
-    await reopened.restore()
-    expect(reopened.state.childKey).toBe('child')
-    expect(f.create).toHaveBeenCalledOnce()
-    await reopened.close()
+    f.createSidechat.mockImplementationOnce(async () => { f.expire(); return f.child })
+    expect(await f.owner.prepare()).toBeNull()
+    expect(f.owner.state.child).toBeNull()
   })
 
-  it('requires explicit replacement when a saved child has been deleted', async () => {
+  it.each(['parent-key', 'other-parent', 'empty-key'])('rejects an invalid child identity (%s)', async shape => {
     const f = fixture()
-    f.values.set(assistantChatBindingKey(f.options.identity, f.options.parentKey), 'child')
-    f.lease.live = Promise.reject(new SessionReadSessionMissingError('missing child'))
-    await f.controller.restore()
-    expect(f.controller.state.requiresNewSession).toBe(true)
-    expect(await f.controller.send('question')).toBe(false)
-    expect(f.create).not.toHaveBeenCalled()
-    await f.controller.close()
-  })
-
-  it('does not treat history refresh as proof of uncertain delivery', async () => {
-    const f = fixture()
-    f.send.mockRejectedValue(new TurnCommandError('transport', 'lost response'))
-    await f.controller.send('question')
-    expect(f.controller.state.uncertainDelivery).toBe(true)
-    await f.controller.refresh()
-    expect(f.lookupReceipt).toHaveBeenCalledOnce()
-    expect(f.controller.state.uncertainDelivery).toBe(true)
-    expect(await f.controller.send('question')).toBe(false)
-    expect(f.send).toHaveBeenCalledOnce()
-    await f.controller.close()
-  })
-
-  it('does not duplicate durable text when the active snapshot overlaps it', async () => {
-    const f = fixture()
-    f.history.messages = [{ id: 'answer', messageId: 'answer', role: 'assistant', text: 'hello' }] as never
-    f.live.snapshot = { sessionKey: 'child', taskId: 'task', events: [{ semanticKind: 'text-delta', payload: { assistant_message_id: 'answer', text: 'hello' } }] }
-    f.values.set(assistantChatBindingKey(f.options.identity, f.options.parentKey), 'child')
-    await f.controller.restore()
-    expect(f.controller.state.messages.map(row => row.text)).toEqual(['hello'])
-    await f.controller.close()
-  })
-
-  it('uses a distinct persisted namespace for each Gateway authority and parent', () => {
-    expect(assistantChatBindingKey('A', 'parent')).not.toBe(assistantChatBindingKey('B', 'parent'))
-    expect(assistantChatBindingKey('A', 'parent')).not.toBe(assistantChatBindingKey('A', 'other'))
-    expect(assistantChatBindingKey('private-token-context', 'parent')).not.toContain('private-token-context')
-  })
-
-  it('rejects a stale session epoch after installing current metadata', async () => {
-    const f = fixture()
-    await f.controller.send('question')
-    f.emit('text-delta', 'stale', 'child', 0)
-    expect(f.controller.state.messages.map(row => row.text)).toEqual(['question'])
-    await f.controller.close()
-  })
-
-  it('refreshes canonical history on a stream-generation replacement instead of concatenating', async () => {
-    const f = fixture()
-    await f.controller.send('question')
-    f.emit('text-delta', 'first')
-    f.history.messages = [{ id: 'answer', messageId: 'answer', role: 'assistant', text: 'replacement' }] as never
-    f.live.snapshot = { sessionKey: 'child', taskId: 'task', streamGeneration: 'replacement', currentStreamSeq: 10000, events: [] }
-    f.emit('text-delta', 'duplicate suffix', 'child', 1, 'replacement')
-    await f.controller.refresh()
-    expect(f.controller.state.messages.map(row => row.text)).toEqual(['replacement'])
-    await f.controller.close()
-  })
-
-  it('does not classify an explicit rejection as uncertain delivery', async () => {
-    const f = fixture()
-    f.send.mockResolvedValue({ ok: false })
-    await f.controller.send('question')
-    expect(f.controller.state.uncertainDelivery).toBe(false)
-    expect(f.controller.state.messages).toEqual([])
-    await f.controller.close()
-  })
-
-  it('requires explicit replacement when the persisted child workspace differs', async () => {
-    const f = fixture()
-    f.lease.metadata = Promise.resolve({ workspaceId: 'other' }) as never
-    f.values.set(assistantChatBindingKey(f.options.identity, f.options.parentKey), 'child')
-    await f.controller.restore()
-    expect(f.controller.state.requiresNewSession).toBe(true)
-    expect(await f.controller.send('question')).toBe(false)
-    expect(f.send).not.toHaveBeenCalled()
-    await f.controller.close()
-  })
-
-  it('reports rejected metadata reads without sending or leaking an unhandled promise', async () => {
-    const f = fixture()
-    f.lease.metadata = Promise.reject(new Error('read unavailable'))
-    f.values.set(assistantChatBindingKey(f.options.identity, f.options.parentKey), 'child')
-    await f.controller.restore()
-    expect(f.controller.state.error).toBe('read unavailable')
-    expect(f.send).not.toHaveBeenCalled()
-    await f.controller.close()
-  })
-
-  it.each(['pending-input', 'approval-status', 'active-task-status'])('restores attention from full metadata: %s', async kind => {
-    const f = fixture()
-    f.values.set(assistantChatBindingKey(f.options.identity, f.options.parentKey), 'child')
-    if (kind === 'pending-input') f.metadata.pendingUserInputs = [{ id: 'clarification' }]
-    if (kind === 'approval-status') f.metadata.runStatus = 'approval_pending'
-    if (kind === 'active-task-status') f.metadata.activeTask = { status: 'approval_pending' }
-    await f.controller.restore()
-    expect(f.controller.state.needsAttention).toBe(true)
-    await f.controller.refresh()
-    expect(f.controller.state.needsAttention).toBe(true)
-    await f.controller.close()
-  })
-
-  it.each(['last-task', 'history-outcome'])('restores a failed turn after a refresh or reopen: %s', async source => {
-    const f = fixture()
-    f.values.set(assistantChatBindingKey(f.options.identity, f.options.parentKey), 'child')
-    if (source === 'last-task') f.metadata.lastTask = { status: 'failed', turn_outcome: { terminal_message: 'Provider unavailable' } }
-    else f.history.turnOutcomes = [{ status: 'failed', finishedAt: 10, outcome: { terminalMessage: 'Provider unavailable' } }] as never
-    await f.controller.restore()
-    expect(f.controller.state.phase).toBe('error')
-    expect(f.controller.state.error).toBe('Provider unavailable')
-    f.emit('turn-committed')
-    await f.controller.refresh()
-    expect(f.controller.state.error).toBe('Provider unavailable')
-    await f.controller.close()
-  })
-
-  it('does not allow a second send while the first admission ACK is pending after early completion', async () => {
-    const f = fixture()
-    let acknowledge!: (value: { ok: boolean }) => void
-    f.send.mockImplementation(async () => {
-      f.emit('turn-completed')
-      return await new Promise<{ ok: boolean }>(resolve => { acknowledge = resolve })
+    f.createSidechat.mockResolvedValue({ ...f.child,
+      key: shape === 'parent-key' ? f.options.parentKey : shape === 'empty-key' ? '' : f.child.key,
+      parentKey: shape === 'other-parent' ? 'different-parent' : f.options.parentKey,
     })
-    const first = f.controller.send('first')
-    await vi.waitFor(() => expect(acknowledge).toBeTypeOf('function'))
-    expect(f.controller.state.phase).toBe('ready')
-    expect(await f.controller.send('second')).toBe(false)
-    expect(f.send).toHaveBeenCalledOnce()
-    acknowledge({ ok: true })
-    await first
-    await f.controller.close()
+    expect(await f.owner.prepare()).toBeNull()
+    expect(f.owner.state.requiresNewSession).toBe(true)
+    expect(f.owner.state.child).toBeNull()
   })
 
-  it('shows attention immediately for authoritative live clarification and clears its resolved result', async () => {
+  it('keeps a transient preparation failure retryable with the same idempotent owner request', async () => {
     const f = fixture()
-    await f.controller.send('question')
-    const request = { kind: 'user_input', paused: true, request_id: 'input-1', clarify_schema: { fields: [{ name: 'answer', type: 'string', prompt: 'Which one?' }] } }
-    f.emit('tool-result', undefined, 'child', 1, 'generation', { approvalResult: request })
-    expect(f.controller.state.needsAttention).toBe(true)
-    f.emit('tool-result', undefined, 'child', 1, 'generation', { approvalResult: { kind: 'user_input', paused: false, request_id: 'input-1', status: 'answered' } })
-    expect(f.controller.state.needsAttention).toBe(false)
-    await f.controller.close()
+    f.createSidechat.mockRejectedValueOnce(new Error('Gateway unavailable'))
+    expect(await f.owner.prepare()).toBeNull()
+    expect(f.owner.state).toMatchObject({ preparing: false, requiresNewSession: false, error: 'Gateway unavailable' })
+    expect(await f.owner.prepare()).toBe(f.child)
+    expect(f.createSidechat.mock.calls[0]).toEqual(f.createSidechat.mock.calls[1])
+    expect(f.owner.state.error).toBe('')
+  })
+
+  it('permanently fences an explicitly closed empty owner without creating a child', async () => {
+    const f = fixture()
+    await closeAssistantChatOwner(f.options)
+    expect(await f.owner.prepare()).toBeNull()
+    const next = createAssistantChatOwner(f.options)
+    expect(await next.prepare()).toBeNull()
+    expect(f.createSidechat).not.toHaveBeenCalled()
+    expect(f.closeSidechat).not.toHaveBeenCalled()
+    next.dispose()
+  })
+
+  it('awaits authoritative close and clears ephemeral data only after success', async () => {
+    const f = fixture()
+    await f.owner.prepare()
+    const memory = assistantChatPendingOwner(f.owner.binding)
+    memory.draftStorage.setItem('draft', 'text')
+    let release!: () => void
+    f.closeSidechat.mockImplementationOnce(() => new Promise(resolve => { release = () => resolve({ key: f.child.key, closed: true }) }))
+    const closing = closeAssistantChatOwner(f.options)
+    expect(f.owner.state.closing).toBe(true)
+    expect(f.options.onChange).toHaveBeenLastCalledWith(expect.objectContaining({ closing: true }))
+    expect(await f.owner.prepare()).toBeNull()
+    expect(memory.isClosed()).toBe(false)
+    release(); await closing
+    expect(f.owner.state.closing).toBe(true)
+    expect(memory.isClosed()).toBe(true)
+    expect(memory.draftStorage.getItem('draft')).toBeNull()
+  })
+
+  it('waits for in-flight creation before explicit close and never hands it to the pending sender', async () => {
+    const f = fixture()
+    let release!: (child: SidechatSession) => void
+    f.createSidechat.mockImplementationOnce(() => new Promise(resolve => { release = resolve }))
+    const preparing = f.owner.prepare()
+    const closing = closeAssistantChatOwner(f.options)
+    release(f.child)
+    expect(await preparing).toBeNull()
+    await closing
+    expect(f.closeSidechat).toHaveBeenCalledExactlyOnceWith({ key: f.child.key })
+  })
+
+  it('retains a failed close for explicit retry rather than losing its child', async () => {
+    const f = fixture()
+    await f.owner.prepare()
+    const memory = assistantChatPendingOwner(f.owner.binding)
+    f.closeSidechat.mockRejectedValueOnce(new Error('close failed'))
+    await expect(closeAssistantChatOwner(f.options)).rejects.toThrow('close failed')
+    expect(f.owner.state.closing).toBe(false)
+    expect(f.options.onChange).toHaveBeenLastCalledWith(expect.objectContaining({ closing: false }))
+    expect(memory.isClosed()).toBe(false)
+    expect(await f.owner.prepare()).toBe(f.child)
+    await closeAssistantChatOwner(f.options)
+    expect(f.closeSidechat).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects an incorrect close receipt without clearing the owner', async () => {
+    const f = fixture()
+    await f.owner.prepare()
+    f.closeSidechat.mockResolvedValueOnce({ key: 'wrong-child', closed: true })
+    await expect(closeAssistantChatOwner(f.options)).rejects.toThrow('Gateway did not close')
+    expect(await f.owner.prepare()).toBe(f.child)
+  })
+
+  it('uses isolated namespaces for authorities, parents and tabs without exposing authority text', () => {
+    const key = assistantChatBindingKey('private-authority', 'parent', 'tab-a')
+    expect(key).not.toContain('private-authority')
+    expect(key).not.toBe(assistantChatBindingKey('other', 'parent', 'tab-a'))
+    expect(key).not.toBe(assistantChatBindingKey('private-authority', 'other', 'tab-a'))
+    expect(key).not.toBe(assistantChatBindingKey('private-authority', 'parent', 'tab-b'))
+  })
+
+  it('renews a hidden owner independently of its chat reader until explicit close', async () => {
+    vi.useFakeTimers()
+    const f = fixture()
+    await f.owner.prepare()
+    f.owner.dispose()
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(f.createSidechat).toHaveBeenCalledTimes(2)
+    await closeAssistantChatOwner(f.options)
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(f.createSidechat).toHaveBeenCalledTimes(2)
+  })
+
+  it('preserves the original inheritance when an idempotent renewal returns newer parent settings', async () => {
+    vi.useFakeTimers()
+    const f = fixture()
+    await f.owner.prepare()
+    f.createSidechat.mockResolvedValue({ ...f.child, inherited: { ...f.child.inherited, model: 'new-parent-model' } })
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(f.owner.state.child?.inherited.model).toBe('parent-model')
+  })
+
+  it.each(['not-found', 'forbidden', 'invalid', 'unsupported'] as const)('retires ownership on terminal renewal rejection %s', async code => {
+    vi.useFakeTimers()
+    const f = fixture()
+    await f.owner.prepare()
+    f.createSidechat.mockRejectedValue(new SessionLifecycleError(code, 'owner rejected'))
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(f.owner.state).toMatchObject({ requiresNewSession: true, error: 'owner rejected' })
+    expect(await f.owner.prepare()).toBeNull()
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(f.createSidechat).toHaveBeenCalledTimes(2)
+    f.owner.dispose()
+    const restored = createAssistantChatOwner(f.options)
+    expect(restored.state.requiresNewSession).toBe(true)
+    expect(await restored.prepare()).toBeNull()
+    restored.dispose()
+  })
+
+  it('bounds transient renewal failures to the owner lease and clears memory on expiry', async () => {
+    vi.useFakeTimers()
+    const f = fixture()
+    await f.owner.prepare()
+    const memory = assistantChatPendingOwner(f.owner.binding)
+    f.createSidechat.mockRejectedValue(new Error('temporary network failure'))
+    await vi.advanceTimersByTimeAsync(10 * 60_000)
+    expect(f.owner.state.requiresNewSession).toBe(true)
+    expect(memory.isClosed()).toBe(true)
+    const count = f.createSidechat.mock.calls.length
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(f.createSidechat).toHaveBeenCalledTimes(count)
+  })
+
+  it('does not renew against an unavailable authority and expires instead of changing owner', async () => {
+    vi.useFakeTimers()
+    const f = fixture()
+    await f.owner.prepare()
+    f.setAvailable(false)
+    await vi.advanceTimersByTimeAsync(10 * 60_000)
+    expect(f.createSidechat).toHaveBeenCalledTimes(1)
+    expect(f.owner.state.requiresNewSession).toBe(true)
   })
 })

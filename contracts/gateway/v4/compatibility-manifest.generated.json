@@ -990,7 +990,7 @@
       "lifecycle": "stable",
       "name": "sessions.create",
       "schema": "sessions/sessions-create.schema.json",
-      "schemaSha256": "4e80959cb02d29321fe6ad59516f542cc9bc941c891770fba7528edcce1e57de"
+      "schemaSha256": "dfb7034ecd271fe9b9287cb7a7bb097d63556b728060089b81443715a7447570"
     },
     {
       "lifecycle": "stable",
@@ -1222,6 +1222,18 @@
     },
     {
       "lifecycle": "stable",
+      "name": "sessions.sidechat.close",
+      "schema": "sessions/sessions-sidechat-close.schema.json",
+      "schemaSha256": "0c61626faafc3591d8c9a13bc6544ef6b95c4ae99d1785c24426397791632fc9"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.sidechat.create",
+      "schema": "sessions/sessions-sidechat-create.schema.json",
+      "schemaSha256": "11190c35d9f028eab73d6a4bd2d5c50d90e2e25c8ae8dc221370d5835bcaea9e"
+    },
+    {
+      "lifecycle": "stable",
       "name": "sessions.steer.v2",
       "schema": "conversation/sessions-steer-v2.schema.json",
       "schemaSha256": "401d8083f726a85011ca7c660392614b5241201aeb64507edfc4f02572b4d174"
@@ -1434,10 +1446,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "423b20c18eaa9f088b45555a72f0c833a38374d02b02356990ff4f6f8f15619c",
-    "methodCount": 210,
-    "schemaCount": 220,
-    "schemaTreeSha256": "3ddf0bc24232c219ddf583473bd36b66741d3c818b1f3043a8f58623da53a8f2",
+    "generatorSha256": "18bb70b7c66f57d67b05f28204a1b2df237a428936f9ee6c53dfa0c1d3e376dd",
+    "methodCount": 212,
+    "schemaCount": 222,
+    "schemaTreeSha256": "31684b504437706d1c3ca3e587229b28b3a975aff4b4f453fed3410a98409ba8",
     "toolchains": {
       "legacyTypes": {
         "python": {

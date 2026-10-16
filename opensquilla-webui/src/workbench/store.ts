@@ -270,12 +270,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (activeSessionId.value === sessionId) return
     // Browser tabs represent live native pages. Keep them in the in-memory
     // workbench shelf while the user moves between chat sessions so returning
-    // to the originating task can reveal the same page again. Other
-    // session-scoped panels still follow the existing disposal contract.
+    // to the originating task can reveal the same page again. Side chats also
+    // remain parent-scoped: navigation hides them, only explicit close ends them.
     closeMatchingItems(
       item => item.scope.type === 'session'
         && item.scope.id !== sessionId
-        && item.kind !== 'browser',
+        && item.kind !== 'browser' && item.kind !== 'assistant-chat',
       'scope-changed',
     )
     const active = activeItem.value

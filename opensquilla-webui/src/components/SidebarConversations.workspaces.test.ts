@@ -93,6 +93,7 @@ function i18n() {
           pin: 'Pin project',
           unpin: 'Unpin project',
           editProject: 'Edit project',
+          openDirectory: 'Open in file manager',
           deleteHistory: 'Delete project task history',
           removeProject: 'Remove project',
           menuDeleteHistory: 'Delete history',
@@ -749,13 +750,13 @@ describe('SidebarConversations project workspaces', () => {
     await nextTick()
     const menu = document.body.querySelector<HTMLElement>('.sidebar-project-menu')
     expect(menu?.classList.contains('sidebar-row-menu')).toBe(true)
-    expect(menu?.querySelectorAll('.sidebar-row-menu__item')).toHaveLength(4)
+    expect(menu?.querySelectorAll('.sidebar-row-menu__item')).toHaveLength(5)
     expect(menu?.style.left).toBe('196px')
     expect(menu?.style.transform).toBe('none')
     expect(
       Array.from(menu?.querySelectorAll('.sidebar-row-menu__item') || [])
         .map(item => item.textContent?.trim()),
-    ).toEqual(['Pin project', 'Edit project', 'Delete history', 'Remove'])
+    ).toEqual(['Pin project', 'Edit project', 'Open in file manager', 'Delete history', 'Remove'])
     expect(
       menu?.querySelector('[data-project-action="delete-history"]')
         ?.classList.contains('sidebar-row-menu__item--danger'),

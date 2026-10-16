@@ -9,4 +9,13 @@ describe('terminal Workbench items', () => {
     expect(first.id).toBe(second.id)
     expect(first.payload).toEqual({ sessionKey: 'session-a' })
   })
+
+  it('keeps UI scope separate from the standalone execution target', () => {
+    const item = createTerminalWorkbenchItem('draft-a', { kind: 'default-agent', agentId: 'main' })
+    const project = createTerminalWorkbenchItem('draft-a', { kind: 'project', workspaceId: 'project-a' })
+    expect(item.scope).toEqual({ type: 'session', id: 'draft-a' })
+    expect(item.payload).toEqual({ target: { kind: 'default-agent', agentId: 'main' } })
+    expect(project.id).not.toBe(item.id)
+    expect(createTerminalWorkbenchItem('draft-b', { kind: 'default-agent', agentId: 'main' }).id).not.toBe(item.id)
+  })
 })

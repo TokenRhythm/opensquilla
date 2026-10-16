@@ -6,6 +6,6 @@ export function createAssistantChatWorkbenchDefinition(t: (key: string) => strin
     kind: 'assistant-chat', component: AssistantChatPanel,
     supports: item => item.kind === 'assistant-chat' && item.scope.type === 'session',
     getHeader: () => ({ title: t('workbench.newPanel.assistantChat'), icon: 'chat' }),
-    getProps: item => ({ parentSessionKey: item.scope.type === 'session' ? item.scope.id : '', workspaceId: item.payload.workspaceId }),
+    getProps: item => ({ parentSessionKey: item.scope.type === 'session' ? item.scope.id : '', workspaceId: item.payload.workspaceId, ownerId: item.payload.ownerId || item.id }),
   }
 }

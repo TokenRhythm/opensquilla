@@ -29,6 +29,10 @@ import {
   type SessionsForkThroughTurnResult,
 } from '@/contracts/generated/v4/sessionsForkThroughTurn'
 import { validateSessionsForkThroughTurnResult } from '@/contracts/generated/v4/sessionsForkThroughTurnValidators.mjs'
+import { SESSIONS_SIDECHAT_CREATE_METHOD, type SessionsSidechatCreateResult } from '@/contracts/generated/v4/sessionsSidechatCreate'
+import { validateSessionsSidechatCreateParams, validateSessionsSidechatCreateResult } from '@/contracts/generated/v4/sessionsSidechatCreateValidators.mjs'
+import { SESSIONS_SIDECHAT_CLOSE_METHOD, type SessionsSidechatCloseResult } from '@/contracts/generated/v4/sessionsSidechatClose'
+import { validateSessionsSidechatCloseParams, validateSessionsSidechatCloseResult } from '@/contracts/generated/v4/sessionsSidechatCloseValidators.mjs'
 import type {
   CreatedSession,
   ForkedSession,
@@ -112,6 +116,7 @@ function responseError(message: string): SessionLifecycleError {
 function createParams(request: SessionCreateRequest | undefined): SessionsCreateParams {
   const params: SessionsCreateParams = {}
   if (!request) return params
+  if (request.sessionKey !== undefined) params.session_key = request.sessionKey
   if (request.agentId !== undefined) params.agentId = request.agentId
   if (request.kind !== undefined) params.kind = request.kind
   if (request.workspaceId !== undefined) params.workspaceId = request.workspaceId
@@ -134,6 +139,38 @@ export function createV4SessionLifecycle(
   transport: SessionLifecycleTransport,
 ): SessionLifecycle {
   return {
+    supportsSidechat: () => transport.supports?.(SESSIONS_SIDECHAT_CREATE_METHOD) !== false
+      && transport.supports?.(SESSIONS_SIDECHAT_CLOSE_METHOD) !== false,
+    async createSidechat(request) {
+      try {
+        const params = { parentKey: request.parentKey, clientRequestId: request.clientRequestId }
+        if (!validateSessionsSidechatCreateParams(params)) throw new SessionLifecycleError('invalid', 'Invalid side conversation parent or owner')
+        const raw = await transport.request<SessionsSidechatCreateResult>(SESSIONS_SIDECHAT_CREATE_METHOD,
+          params, optionsFor(request.signal))
+        if (!validateSessionsSidechatCreateResult(raw) || !raw.key.trim() || raw.key === request.parentKey || raw.parentKey !== request.parentKey) {
+          throw responseError('Side conversation creation did not confirm its parent')
+        }
+        return raw
+      } catch (error) {
+        if (isAbort(error, request.signal)) throw error
+        throw lifecycleError(error)
+      }
+    },
+    async closeSidechat(request) {
+      try {
+        const params = { key: request.key }
+        if (!validateSessionsSidechatCloseParams(params)) throw new SessionLifecycleError('invalid', 'Invalid side conversation identity')
+        const raw = await transport.request<SessionsSidechatCloseResult>(SESSIONS_SIDECHAT_CLOSE_METHOD,
+          params, optionsFor(request.signal))
+        if (!validateSessionsSidechatCloseResult(raw) || raw.key !== request.key || raw.closed !== true) {
+          throw responseError('Side conversation close was not acknowledged')
+        }
+        return { key: raw.key, closed: true }
+      } catch (error) {
+        if (isAbort(error, request.signal)) throw error
+        throw lifecycleError(error)
+      }
+    },
     async create(request: SessionCreateRequest = {}): Promise<CreatedSession> {
       try {
         const raw = await transport.request<SessionsCreateResult>(

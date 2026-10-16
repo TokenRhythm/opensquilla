@@ -15,7 +15,8 @@ from opensquilla.gateway.terminal_sessions import (
     _dimension,
     get_terminal_manager,
 )
-from opensquilla.gateway.workspace_files import WorkspaceFiles, WorkspaceFileUnavailableError
+from opensquilla.gateway.terminal_targets import TerminalTargetResolver, parse_terminal_target
+from opensquilla.gateway.workspace_files import WorkspaceFileUnavailableError
 from opensquilla.sandbox.run_mode_policy import principal_has_host_execute
 
 _d = get_dispatcher()
@@ -54,9 +55,10 @@ async def _handle_terminal_create(params: dict | None, ctx: RpcContext) -> dict[
             "INVALID_REQUEST", "Interactive terminals require a WebSocket connection"
         )
     values = _params(params)
-    session_key = values.get("sessionKey", values.get("key"))
-    if not isinstance(session_key, str) or not session_key.strip():
-        raise RpcHandlerError("INVALID_REQUEST", "sessionKey is required")
+    try:
+        target = parse_terminal_target(values)
+    except ValueError as exc:
+        raise RpcHandlerError("INVALID_REQUEST", str(exc), accepted=False) from exc
     cwd = values.get("cwd", "")
     if cwd is None:
         cwd = ""
@@ -80,11 +82,12 @@ async def _handle_terminal_create(params: dict | None, ctx: RpcContext) -> dict[
         command = values.get("command", values.get("shell"))
         if command is not None:
             command = _command(command)
-        service = WorkspaceFiles(ctx.config, ctx.session_manager)
+        service = TerminalTargetResolver(ctx.config, ctx.session_manager, target)
         result = await _MANAGER.create(
             conn_id=ctx.conn_id,
-            session_key=session_key,
+            session_key=target.session_key,
             workspace_service=service,
+            target=target.payload(),
             cwd=cwd,
             command=command,
             cols=cols,
@@ -109,7 +112,7 @@ async def _handle_terminal_create(params: dict | None, ctx: RpcContext) -> dict[
     except WorkspaceFileUnavailableError as exc:
         raise RpcHandlerError(
             "WORKSPACE_UNAVAILABLE",
-            "The session workspace is unavailable",
+            "The terminal working directory is unavailable",
             accepted=False,
         ) from exc
     except (ValueError, OSError) as exc:

@@ -133,7 +133,7 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Retire router learning status and training feedback (two generated methods).
 # Retire the three advanced agent administration methods.
 # Add video-generation model discovery without changing existing method names.
-RUNTIME_RPC_METHOD_BASELINE = 281
+RUNTIME_RPC_METHOD_BASELINE = 283
 RUNTIME_RPC_METHOD_DIGEST = "29b0b13c082534442371c559806c483c45d16be045f132a304fc328a6512f9ca"
 STATIC_RPC_DECORATOR_BASELINE = 63
 
@@ -1415,15 +1415,16 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     terminal_methods = {
         "terminal.create", "terminal.write", "terminal.resize", "terminal.close",
     }
+    sidechat_methods = {"sessions.sidechat.create", "sessions.sidechat.close"}
     assert terminal_methods.issubset(methods)
+    assert sidechat_methods.issubset(methods)
     assert len(methods) == RUNTIME_RPC_METHOD_BASELINE
     assert len(methods) == len(set(methods))
-    # The terminal vertical slice is intentionally additive to the frozen
+    # The terminal and sidechat slices are intentionally additive to the frozen
     # legacy inventory. Keep the historical digest meaningful while pinning
-    # the four new methods explicitly above.
-    digest = hashlib.sha256(
-        ("\n".join(sorted(set(methods) - terminal_methods)) + "\n").encode()
-    ).hexdigest()
+    # new methods explicitly above.
+    legacy_methods = set(methods) - terminal_methods - sidechat_methods
+    digest = hashlib.sha256(("\n".join(sorted(legacy_methods)) + "\n").encode()).hexdigest()
     assert digest == RUNTIME_RPC_METHOD_DIGEST
 
     for method, scope in (
@@ -1432,6 +1433,8 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         ("sessions.processes.log", "operator.read"),
         ("sessions.processes.stop", "operator.write"),
         ("turns.receipt.get", "operator.read"),
+        ("sessions.sidechat.create", "operator.write"),
+        ("sessions.sidechat.close", "operator.write"),
     ):
         process_entry = registry.get_entry(method)
         assert process_entry is not None

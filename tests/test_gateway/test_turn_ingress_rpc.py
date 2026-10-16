@@ -1964,6 +1964,324 @@ async def test_prompt_annotation_attachment_rule_runs_after_receipt_replay(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,key_field", [("chat.send", "sessionKey"), ("sessions.send", "key")]
+)
+async def test_sidechat_composer_send_reaches_real_durable_admission(
+    tmp_path: Path, method: str, key_field: str,
+) -> None:
+    from opensquilla.chat.history import transcript_entries_to_chat_messages
+
+    async with _open_real_stack(tmp_path / "sidechat-send.db") as stack:
+        await stack.manager.append_message(SESSION_KEY, "user", "Parent marker: cedar-428")
+        child = await stack.manager.create_sidechat(SESSION_KEY, "side-composer")
+        params = {
+            key_field: child.session_key,
+            "message": "What is the parent marker?",
+            "clientRequestId": "side-composer-turn",
+            "clientMessageId": "side-composer-message",
+            "surfaceId": "web:sidechat",
+            "intent": "continue",
+            "_source": {"runMode": "full_access"},
+        }
+        response = await get_dispatcher().dispatch("side-send", method, params, stack.context)
+        assert response.ok, response.error
+        assert response.payload["accepted"] is True
+        await stack.wait_until_running()
+        task = await stack.storage.get_agent_task(response.payload["task_id"])
+        assert stack.received_runs[0].no_memory_capture is True
+        assert task.session_key == child.session_key
+        assert task.details["session_id"] == child.session_id
+        assert task.details.get("goal_id") is None
+        entries = await stack.manager.get_transcript(child.session_key)
+        assert any("cedar-428" in entry.content for entry in entries)
+        visible = transcript_entries_to_chat_messages(entries)
+        assert len(visible) == 1
+        assert visible[0]["text"] == "What is the parent marker?"
+        replay = await get_dispatcher().dispatch("side-replay", method, params, stack.context)
+        assert replay.ok, replay.error
+        assert replay.payload["replayed"] is True
+        assert replay.payload["task_id"] == response.payload["task_id"]
+
+
+@pytest.mark.asyncio
+async def test_sidechat_pending_composer_keeps_capture_and_lifecycle_guards(tmp_path: Path) -> None:
+    async with _open_real_stack(tmp_path / "sidechat-pending.db") as stack:
+        await stack.manager.append_message(SESSION_KEY, "user", "Parent reference")
+        child = await stack.manager.create_sidechat(SESSION_KEY, "pending-owner")
+        staged = await get_dispatcher().dispatch(
+            "stage", "sessions.pending_inputs.enqueue",
+            {
+                "key": child.session_key, "message": "Queued side question",
+                "clientRequestId": "pending-side-turn", "clientMessageId": "pending-side-message",
+                "pendingInputId": "side-pending-input", "noMemoryCapture": False,
+                "_source": {"no_memory_capture": False},
+            },
+            stack.context,
+        )
+        assert staged.ok, staged.error
+        accepted = await get_dispatcher().dispatch(
+            "dispatch", "sessions.pending_inputs.dispatch",
+            {
+                "key": child.session_key, "pendingInputId": "side-pending-input",
+                "clientRequestId": "pending-side-turn",
+                "requestFingerprint": staged.payload["requestFingerprint"],
+            },
+            stack.context,
+        )
+        assert accepted.ok, accepted.error
+        await stack.wait_until_running()
+        assert stack.received_runs[0].no_memory_capture is True
+
+
+@pytest.mark.asyncio
+async def test_sidechat_close_after_attachment_staging_reclaims_rejected_pending_material(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway.pending_input_primitives import GatewayPendingInputPrimitives
+    from opensquilla.session.sidechat import set_state
+
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(tmp_path / "sidechat-enqueue-close-race.db") as stack:
+            await stack.manager.append_message(SESSION_KEY, "user", "Parent reference")
+            child = await stack.manager.create_sidechat(SESSION_KEY, "attachment-race-owner")
+            payload = b"staged before the side panel closes\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            file_uuid = await upload_store.put("queued.txt", "text/plain", payload)
+            pending_id = "side-close-staged-attachment"
+            owner_path = pending_chat_input_material_path(
+                Path(stack.context.config.attachments.media_root or ""),
+                child.session_id, pending_id, digest,
+            )
+            staged = asyncio.Event()
+            continue_enqueue = asyncio.Event()
+            original_stage = GatewayPendingInputPrimitives.stage_attachments
+
+            async def hold_after_staging(self, *args, **kwargs):
+                result = await original_stage(self, *args, **kwargs)
+                staged.set()
+                await continue_enqueue.wait()
+                return result
+
+            monkeypatch.setattr(
+                GatewayPendingInputPrimitives, "stage_attachments", hold_after_staging,
+            )
+            enqueue = asyncio.create_task(get_dispatcher().dispatch(
+                "side-attachment-close-race", "sessions.pending_inputs.enqueue",
+                {
+                    "key": child.session_key, "message": "Use this attachment",
+                    "pendingInputId": pending_id, "clientRequestId": "side-close-request",
+                    "clientMessageId": "side-close-message",
+                    "attachments": [{
+                        "type": "text/plain", "mime": "text/plain", "name": "queued.txt",
+                        "file_uuid": file_uuid,
+                    }],
+                },
+                stack.context,
+            ))
+            try:
+                await asyncio.wait_for(staged.wait(), timeout=_DURABLE_PHASE_GUARD_SECONDS)
+                assert native_io_path(owner_path).read_bytes() == payload
+                await set_state(stack.storage, child.session_key, "closing")
+            finally:
+                continue_enqueue.set()
+            response = await asyncio.wait_for(enqueue, timeout=_DURABLE_PHASE_GUARD_SECONDS)
+
+            assert not response.ok
+            assert response.error.code == "PENDING_SESSION_UNAVAILABLE"
+            assert response.error.accepted is False
+            assert response.error.retryable is False
+            assert await stack.storage.get_pending_chat_input(pending_id) is None
+            assert not native_io_path(owner_path.parent).exists()
+            # Rejection did not consume the source upload or accept a turn.
+            assert file_uuid in upload_store._entries
+            assert not stack.received_runs
+            assert await stack.storage.get_session(SESSION_KEY) is not None
+    finally:
+        set_upload_store(original_store)
+
+
+@pytest.mark.asyncio
+async def test_sidechat_close_cancels_queued_child_without_parent_run(tmp_path: Path) -> None:
+    async with _open_real_stack(tmp_path / "sidechat-close.db") as stack:
+        parent_turn = await get_dispatcher().dispatch(
+            "parent-send", "sessions.send",
+            {
+                "key": SESSION_KEY, "message": "Parent request", "clientRequestId": "parent-run",
+            },
+            stack.context,
+        )
+        assert parent_turn.ok, parent_turn.error
+        await stack.wait_until_running()
+        child = await stack.manager.create_sidechat(SESSION_KEY, "closing-panel")
+        child_turn = await get_dispatcher().dispatch(
+            "child-send", "sessions.send",
+            {
+                "key": child.session_key, "message": "Side question",
+                "clientRequestId": "child-run",
+            },
+            stack.context,
+        )
+        assert child_turn.ok, child_turn.error
+        worker = await stack.manager.create(
+            "agent:main:subagent:side-owned-worker",
+            spawned_by=child.session_key,
+            parent_session_key=child.session_key,
+        )
+        worker_turn = await get_dispatcher().dispatch(
+            "worker-send", "sessions.send",
+            {
+                "key": worker.session_key, "message": "Side-owned delegated work",
+                "clientRequestId": "worker-run",
+            },
+            stack.context,
+        )
+        assert worker_turn.ok, worker_turn.error
+        closed = await get_dispatcher().dispatch(
+            "close", "sessions.sidechat.close", {"key": child.session_key}, stack.context,
+        )
+        assert closed.ok, closed.error
+        assert closed.payload["closed"] is True
+        child_task = await stack.storage.get_agent_task(child_turn.payload["task_id"])
+        worker_task = await stack.storage.get_agent_task(worker_turn.payload["task_id"])
+        parent_task = await stack.storage.get_agent_task(parent_turn.payload["task_id"])
+        assert child_task.status == AgentTaskStatus.CANCELLED
+        assert worker_task.status == AgentTaskStatus.CANCELLED
+        assert parent_task.status == AgentTaskStatus.RUNNING
+        rejected = await get_dispatcher().dispatch(
+            "late-send", "sessions.send",
+            {
+                "key": child.session_key, "message": "Too late",
+                "clientRequestId": "closed-panel-send",
+            },
+            stack.context,
+        )
+        assert not rejected.ok
+        assert rejected.error.accepted is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_first_cleanup", [False, True])
+async def test_sidechat_close_cleans_queued_material_and_retries_without_parent_damage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_first_cleanup: bool,
+) -> None:
+    from opensquilla.gateway import rpc_sessions
+    from opensquilla.session.sidechat import sidechat_metadata
+
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(tmp_path / "sidechat-queued-material-close.db") as stack:
+            await stack.manager.append_message(SESSION_KEY, "user", "Parent reference")
+            child = await stack.manager.create_sidechat(SESSION_KEY, "queued-material-owner")
+            payload = b"same bytes have separate parent and side private owners\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            media_root = Path(stack.context.config.attachments.media_root or "")
+            paths = {}
+            for name, key, session_id in (
+                ("parent", SESSION_KEY, stack.session_id),
+                ("side", child.session_key, child.session_id),
+            ):
+                file_uuid = await upload_store.put("queued.txt", "text/plain", payload)
+                pending_id = f"{name}-queued-material"
+                result = await get_dispatcher().dispatch(
+                    f"enqueue-{name}", "sessions.pending_inputs.enqueue",
+                    {
+                        "key": key, "message": "Use the attachment", "pendingInputId": pending_id,
+                        "clientRequestId": f"{name}-request", "clientMessageId": f"{name}-message",
+                        "attachments": [{
+                            "type": "text/plain", "mime": "text/plain", "name": "queued.txt",
+                            "file_uuid": file_uuid,
+                        }],
+                    }, stack.context,
+                )
+                assert result.ok, result.error
+                paths[name] = native_io_path(pending_chat_input_material_path(
+                    media_root, session_id, pending_id, digest,
+                ))
+                assert paths[name].read_bytes() == payload
+
+            original_cleanup = rpc_sessions.cleanup_pending_chat_input_material
+            remaining_failures = int(fail_first_cleanup)
+
+            def fail_side_cleanup_once(**kwargs):
+                nonlocal remaining_failures
+                if kwargs["session_id"] == child.session_id and remaining_failures:
+                    remaining_failures -= 1
+                    raise PermissionError("simulated temporary material lock")
+                return original_cleanup(**kwargs)
+
+            monkeypatch.setattr(
+                rpc_sessions, "cleanup_pending_chat_input_material", fail_side_cleanup_once,
+            )
+            response = await get_dispatcher().dispatch(
+                "close-side-material", "sessions.sidechat.close", {"key": child.session_key},
+                stack.context,
+            )
+            assert await stack.storage.list_pending_chat_inputs(child.session_key) == []
+            assert len(await stack.storage.list_pending_chat_inputs(SESSION_KEY)) == 1
+            assert paths["parent"].read_bytes() == payload
+            current = await stack.storage.get_session(child.session_key)
+            if fail_first_cleanup:
+                from opensquilla.gateway.sidechat_leases import _leases, restore_sidechat_leases
+
+                assert not response.ok
+                assert response.error.code == "UNAVAILABLE"
+                assert sidechat_metadata(current)["state"] == "closing"
+                assert paths["side"].read_bytes() == payload
+                assert sidechat_metadata(current)["pendingMaterialCleanup"][0][
+                    "pendingInputId"
+                ] == "side-queued-material"
+                # Restart restoration must discover the still-closing child.
+                # Its existing lease worker retries the real close handler
+                # without a frontend or a pending row to supply material scope.
+                async def close(key):
+                    return await rpc_sessions._handle_sessions_sidechat_close(
+                        {"key": key}, stack.context,
+                    )
+
+                await restore_sidechat_leases(stack.context, close)
+                await asyncio.wait_for(
+                    _leases[(id(stack.storage), child.session_key)],
+                    timeout=_DURABLE_PHASE_GUARD_SECONDS,
+                )
+                current = await stack.storage.get_session(child.session_key)
+            else:
+                assert response.ok, response.error
+                assert response.payload["closed"] is True
+            assert sidechat_metadata(current)["state"] == "closed"
+            assert "pendingMaterialCleanup" not in sidechat_metadata(current)
+            assert not paths["side"].parent.exists()
+            assert paths["parent"].read_bytes() == payload
+            assert await stack.storage.get_pending_chat_input("parent-queued-material") is not None
+            assert not stack.received_runs
+    finally:
+        set_upload_store(original_store)
+
+
+@pytest.mark.asyncio
+async def test_sidechat_restart_recovery_rejects_changed_parent(tmp_path: Path) -> None:
+    async with _open_real_stack(tmp_path / "sidechat-restart-parent.db") as stack:
+        await stack.manager.append_message(SESSION_KEY, "user", "Parent reference")
+        child = await stack.manager.create_sidechat(SESSION_KEY, "restart-owner")
+        envelope = RouteEnvelope(
+            source_kind=SourceKind.WEB,
+            source_name="webchat",
+            agent_id="main",
+            session_key=child.session_key,
+            session_id=child.session_id,
+            session_epoch=child.epoch,
+        )
+        assert await stack.runtime._recovered_route_owner_is_current(envelope)
+        await stack.storage.increment_epoch(SESSION_KEY)
+        assert not await stack.runtime._recovered_route_owner_is_current(envelope)
+
+
+@pytest.mark.asyncio
 async def test_sessions_send_atomically_accepts_message_task_and_receipt(tmp_path: Path) -> None:
     async with _open_real_stack(tmp_path / "sessions.db") as stack:
         response = await get_dispatcher().dispatch(

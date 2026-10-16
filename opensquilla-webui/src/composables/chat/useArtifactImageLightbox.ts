@@ -18,6 +18,8 @@ export interface ArtifactImageLightboxRequest {
   image: ImageLightboxItem
   navigationImages: readonly ImageLightboxItem[]
   sessionKey: string
+  /** Visible conversation owner; side resource reads still use sessionKey. */
+  ownerSessionKey?: string
   invoker: HTMLElement | null
 }
 
@@ -25,6 +27,7 @@ export interface ArtifactImageLightboxOpenRequest {
   artifact: ArtifactPayload
   navigationArtifacts: readonly ArtifactPayload[]
   sessionKey: string
+  ownerSessionKey?: string
 }
 
 export interface ArtifactImageLightboxController {
@@ -34,6 +37,7 @@ export interface ArtifactImageLightboxController {
     attachment: DisplayAttachment
     navigationAttachments: readonly DisplayAttachment[]
     sessionKey: string
+    ownerSessionKey?: string
   }): void
   show(image: ImageLightboxItem): void
   updateNavigation(navigationArtifacts: readonly ArtifactPayload[], sessionKey: string): void
@@ -53,6 +57,7 @@ export function provideArtifactImageLightbox(): ArtifactImageLightboxController 
         image: { kind: 'artifact', artifact: nextRequest.artifact },
         navigationImages: nextRequest.navigationArtifacts.map(artifact => ({ kind: 'artifact', artifact })),
         sessionKey: nextRequest.sessionKey,
+        ...(nextRequest.ownerSessionKey ? { ownerSessionKey: nextRequest.ownerSessionKey } : {}),
         invoker: document.activeElement instanceof HTMLElement
           ? document.activeElement
           : null,
@@ -66,6 +71,7 @@ export function provideArtifactImageLightbox(): ArtifactImageLightboxController 
           .filter(isImageDisplayAttachment)
           .map(attachment => ({ kind: 'attachment', attachment })),
         sessionKey: nextRequest.sessionKey,
+        ...(nextRequest.ownerSessionKey ? { ownerSessionKey: nextRequest.ownerSessionKey } : {}),
         invoker: document.activeElement instanceof HTMLElement ? document.activeElement : null,
       }
     },
@@ -93,10 +99,24 @@ export function provideArtifactImageLightbox(): ArtifactImageLightboxController 
   return controller
 }
 
+export function closeImageLightboxOutsideSession(
+  controller: ArtifactImageLightboxController, sessionKey: string, chatRouteActive: boolean,
+) {
+  const request = controller.request.value
+  if (request && (!chatRouteActive || (request.ownerSessionKey || request.sessionKey) !== sessionKey)) {
+    controller.close()
+  }
+}
+
 export function useArtifactImageLightbox(): ArtifactImageLightboxController {
   const controller = inject(artifactImageLightboxKey, null)
   if (!controller) {
     throw new Error('Artifact image lightbox controller is not provided')
   }
   return controller
+}
+
+/** Optional embedding variant for Workbench panels mounted outside ChatView. */
+export function useOptionalArtifactImageLightbox(): ArtifactImageLightboxController | null {
+  return inject(artifactImageLightboxKey, null)
 }
