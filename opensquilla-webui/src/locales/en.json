@@ -330,6 +330,8 @@
     "pixels": "pixels",
     "empty": "No preview is available for this item.",
     "assistantChat": {
+      "temporaryHint": "This is a temporary chat and won’t appear in your history. Closing this tab, refreshing the page, or closing the app ends access to this chat.",
+      "temporaryKeepHint": "Collapsing the sidebar keeps this chat available.",
       "contextHint": "A short-lived side conversation that inherits this session's context and shares its workspace. Its history is scoped to this panel.",
       "empty": "Ask a side question without interrupting the main conversation.",
       "you": "You",

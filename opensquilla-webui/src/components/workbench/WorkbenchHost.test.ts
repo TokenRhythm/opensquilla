@@ -231,6 +231,25 @@ describe('WorkbenchHost', () => {
     expect(document.activeElement).toBe(button)
   })
 
+  it('uses the conversation canvas only while the assistant chat tab is active', async () => {
+    const mounted = await mountHost(1200)
+    const panel = mounted.host.querySelector<HTMLElement>('[data-testid="workbench-host"]')!
+    expect(panel.classList.contains('workbench-host--conversation')).toBe(false)
+
+    mounted.store.openItem({ ...item('side'), kind: 'assistant-chat' })
+    await nextTick()
+    expect(panel.classList.contains('workbench-host--conversation')).toBe(true)
+
+    mounted.store.openItem({ ...item('browser', 'native-webcontents'), kind: 'browser' })
+    await nextTick()
+    expect(panel.classList.contains('workbench-host--conversation')).toBe(false)
+    expect(mounted.host.querySelector('.workbench-host__surface--native')).not.toBeNull()
+
+    mounted.store.activateItem('side')
+    await nextTick()
+    expect(panel.classList.contains('workbench-host--conversation')).toBe(true)
+  })
+
   it('keeps the mobile dialog free of a redundant maximize button', async () => {
     const mounted = await mountHost(600)
     expect(mounted.host.querySelector('[data-testid="workbench-maximize"]')).toBeNull()

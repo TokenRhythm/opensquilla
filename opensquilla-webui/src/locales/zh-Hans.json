@@ -329,6 +329,8 @@
     "pixels": "像素",
     "empty": "此项目没有可用的预览。",
     "assistantChat": {
+      "temporaryHint": "这是临时聊天，不会出现在历史记录中。关闭此标签页、刷新页面或关闭应用后将无法恢复。",
+      "temporaryKeepHint": "收起侧栏不会结束聊天。",
       "contextHint": "这是继承当前 session 上下文的短期辅助对话，共享同一工作区；历史只在此面板内保留。",
       "empty": "在这里提出旁支问题，不打断主对话。",
       "you": "你",

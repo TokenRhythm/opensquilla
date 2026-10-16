@@ -329,6 +329,8 @@
     "pixels": "Pixel",
     "empty": "Für dieses Element ist keine Vorschau verfügbar.",
     "assistantChat": {
+      "temporaryHint": "Dies ist ein temporärer Chat, der nicht im Verlauf erscheint. Nach dem Schließen dieses Tabs oder der App oder dem Neuladen der Seite ist er nicht wiederherstellbar.",
+      "temporaryKeepHint": "Beim Einklappen der Seitenleiste bleibt dieser Chat erhalten.",
       "contextHint": "Ein eigenständiger Chat für diese Aufgabe. Teilt den Arbeitsbereich, ohne den Verlauf zu kopieren. Zeigt die letzten 100 Nachrichten.",
       "empty": "Stelle eine Nebenfrage, ohne den Hauptchat zu unterbrechen.",
       "you": "Du",

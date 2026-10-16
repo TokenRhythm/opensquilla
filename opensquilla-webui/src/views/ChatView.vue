@@ -108,6 +108,7 @@
           class="chat-thread"
           :data-session-key="sessionKey"
           :class="{
+            'chat-thread--temporary-empty': showTemporaryConversationEmpty,
             'chat-thread--reading-history': !autoScroll,
             'chat-thread--nonvirtualized': messageListRef && !messageListRef.isVirtualized(),
           }"
@@ -150,8 +151,14 @@
           @dismiss="chatSessionBootstrap.dismissRecoveryNotice()"
           @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
         />
+        <div v-if="showTemporaryConversationEmpty" class="chat-temporary-empty" data-testid="temporary-conversation-empty">
+          <Icon name="chat" :size="32" aria-hidden="true" />
+          <h2>{{ t('workbench.newPanel.assistantChat') }}</h2>
+          <p>{{ t('workbench.assistantChat.temporaryHint') }}</p>
+          <p class="chat-temporary-empty__keep">{{ t('workbench.assistantChat.temporaryKeepHint') }}</p>
+        </div>
         <div
-          v-if="!forkTransition && showConfirmedEmptySession"
+          v-else-if="!forkTransition && showConfirmedEmptySession"
           class="chat-empty"
         >
           {{ t('chat.noMessagesYet') }}
@@ -4854,6 +4861,11 @@ const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession
   messageCount: messages.value.length,
   initialHistoryStatus: historyState.value.initialLoadStatus,
 }))
+
+const showTemporaryConversationEmpty = computed(() => conversationPolicy.value.kind === 'side'
+  && !props.ownerBlocked && !forkTransition.value && !preparingHostSession.value
+  && messages.value.length === 0 && !isStreaming.value && pendingQueue.value.length === 0
+  && (!sessionKey.value || showConfirmedEmptySession.value))
 
 const composerPlaceholder = computed(() => {
   if (dockedPlanQuestionnaire.value) return t('chat.clarify.answerPlanQuestionnaire')

@@ -5,7 +5,10 @@
     id="workbench-panel"
     ref="hostRef"
     class="workbench-host"
-    :class="`workbench-host--${layoutMode}`"
+    :class="[
+      `workbench-host--${layoutMode}`,
+      { 'workbench-host--conversation': activeItem?.kind === 'assistant-chat' },
+    ]"
     :style="hostStyle"
     :role="layoutMode === 'mobile-dialog' ? 'dialog' : 'complementary'"
     :aria-modal="layoutMode === 'mobile-dialog' ? 'true' : undefined"
@@ -679,6 +682,12 @@ onBeforeUnmount(() => {
   border-inline-start: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
+}
+
+/* A conversation uses the same canvas as the routed chat, including its
+   transparent tab chrome. Other tools retain their own workbench ground. */
+.workbench-host--conversation {
+  background: var(--bg-surface);
 }
 
 /* Keep the split resizer's chat-side hit area outside the clipped workbench.

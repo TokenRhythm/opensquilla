@@ -75,6 +75,6 @@ onBeforeUnmount(() => { revision++; owner?.dispose(); owner = null })
 </script>
 
 <style scoped>
-.assistant-chat-panel { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
+.assistant-chat-panel { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg-surface); }
 .assistant-chat-panel__notice { flex-shrink: 0; margin: 8px 16px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-md); color: var(--text-muted); font-size: var(--fs-xs); overflow-wrap: anywhere; }
 </style>

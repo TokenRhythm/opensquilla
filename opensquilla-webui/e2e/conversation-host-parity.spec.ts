@@ -1,6 +1,7 @@
 import { expect, test, type Locator, type Page, type WebSocketRoute } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
 import { writeFile } from 'node:fs/promises'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import {
   chatHistoryPayload, sessionMessagesHydratePayload, sessionMessagesSnapshotPayload,
@@ -13,6 +14,19 @@ import {
 const MAIN = 'agent:main:webchat:host-parity'
 const SIDE = 'agent:main:sidechat:host-parity'
 const NOW = Date.now()
+// Match the registry's drop-a-folder manifest discovery, so new value themes
+// automatically join the real-host visual parity matrix.
+const themeDirectory = new URL('../src/themes/', import.meta.url)
+const registeredThemes = readdirSync(themeDirectory, { withFileTypes: true }).filter(entry => entry.isDirectory())
+  .flatMap(entry => {
+    const manifestPath = new URL(`${entry.name}/manifest.ts`, themeDirectory)
+    if (!existsSync(manifestPath)) return []
+    const manifest = readFileSync(manifestPath, 'utf8')
+    if (!/kind:\s*['"]value['"]/.test(manifest)) return []
+    const id = manifest.match(/\bid:\s*['"]([^'"]+)['"]/)?.[1]
+    if (!id) throw new Error(`Theme manifest has no literal id: ${entry.name}`)
+    return [id]
+  }).sort()
 type Wire = Record<string, unknown>
 type Request = { type: string; id: string; method: string; params?: Wire }
 type Stream = { sequence: number; task: string | null; lastTask: Wire | null; history: Wire[]; events: Array<{ event: string; payload: Wire }> }
@@ -255,7 +269,169 @@ async function assertNoSettledExtras(host: Locator) {
   await expect(host.locator('.chat-stop-btn')).toBeVisible()
 }
 
+async function equalizeConversationWidths(page: Page, main: Locator, side: Locator) {
+  const separator = page.getByRole('separator', { name: 'Resize workbench', exact: true })
+  await expect(separator).toBeVisible()
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const [left, right, handle] = await Promise.all([
+      main.boundingBox(), side.locator('.chat').boundingBox(), separator.boundingBox(),
+    ])
+    if (!left || !right || !handle) throw new Error('Both conversation frames and their resize handle must be visible')
+    if (Math.abs(left.width - right.width) < 2) return
+    const startX = handle.x + handle.width / 2
+    const y = handle.y + Math.min(120, handle.height / 2)
+    await page.mouse.move(startX, y)
+    await page.mouse.down()
+    await page.mouse.move(startX - (left.width - right.width) / 2, y, { steps: 4 })
+    await page.mouse.up()
+  }
+  await expect.poll(async () => Math.abs((await main.boundingBox())!.width - (await side.locator('.chat').boundingBox())!.width)).toBeLessThan(2)
+}
+
+async function semanticStyle(locator: Locator) {
+  return locator.evaluate(element => {
+    const properties = ['background-color', 'background-image', 'color', 'font-family', 'font-size', 'font-weight',
+      'font-style', 'line-height', 'letter-spacing', 'text-transform', 'border-top-width', 'border-right-width',
+      'border-bottom-width', 'border-left-width', 'border-top-color', 'border-radius', 'box-shadow',
+      'outline-width', 'outline-color', 'outline-style', 'outline-offset', 'padding-top', 'padding-right',
+      'padding-bottom', 'padding-left']
+    const style = getComputedStyle(element)
+    const styles = Object.fromEntries(properties.map(property => [property, style.getPropertyValue(property)]))
+    let backdrop: Element | null = element
+    let effectiveBackground = ''
+    while (backdrop) {
+      const background = getComputedStyle(backdrop).backgroundColor
+      if (background !== 'rgba(0, 0, 0, 0)' && background !== 'transparent') {
+        effectiveBackground = background
+        break
+      }
+      backdrop = backdrop.parentElement
+    }
+    return { ...styles, effectiveBackground }
+  })
+}
+
+async function awaitStyleTransition(locator: Locator) {
+  await locator.evaluate(async element => {
+    await Promise.all(element.getAnimations().filter(animation => animation.effect?.getComputedTiming().endTime !== Infinity)
+      .map(animation => animation.finished.catch(() => undefined)))
+  })
+}
+
 test.describe('real routed main and workbench side conversation hosts', () => {
+  test('explains temporary chat only while empty, preserves it on hide and ends it on tab close', async ({ page }) => {
+    const gateway = await installGateway(page, false, false, true)
+    const { main, side } = await openHosts(page)
+    const hint = side.getByTestId('temporary-conversation-empty')
+    await expect(hint).toBeVisible()
+    await expect(hint).toContainText('This is a temporary chat and won’t appear in your history.')
+    await expect(hint).toContainText('Closing this tab, refreshing the page, or closing the app ends access to this chat.')
+    await expect(hint).toContainText('Collapsing the sidebar keeps this chat available.')
+    await expect(main.getByTestId('temporary-conversation-empty')).toHaveCount(0)
+    await composer(side).fill('Retained temporary draft')
+    await page.getByTestId('topbar-workbench-toggle').click()
+    await expect(side).not.toBeVisible()
+    await page.getByTestId('topbar-workbench-toggle').click()
+    await expect(hint).toBeVisible()
+    await expect(composer(side)).toHaveText('Retained temporary draft')
+    expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.create')).toHaveLength(0)
+    await side.getByRole('button', { name: 'Send', exact: true }).click()
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'sessions.sidechat.create').length).toBe(1)
+    await expect(hint).toHaveCount(0)
+    gateway.releaseCreate()
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(1)
+    gateway.finish(SIDE, 'Temporary answer remains while collapsed.')
+    await expect(side).toContainText('Temporary answer remains while collapsed.')
+    await expect(hint).toHaveCount(0)
+    await page.getByTestId('topbar-workbench-toggle').click()
+    await expect(side).not.toBeVisible()
+    expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.close')).toHaveLength(0)
+    await page.getByTestId('topbar-workbench-toggle').click()
+    await expect(side).toContainText('Temporary answer remains while collapsed.')
+    await expect(hint).toHaveCount(0)
+    expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.create')).toHaveLength(1)
+    await page.getByRole('button', { name: 'Close tab: Assistant chat', exact: true }).click()
+    await expect(side).toHaveCount(0)
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'sessions.sidechat.close').length).toBe(1)
+    expect(gateway.requests.find(request => request.method === 'sessions.sidechat.close')?.params?.key).toBe(SIDE)
+    expect(new URL(page.url()).searchParams.get('session')).toBe(MAIN)
+    expect(gateway.errors).toEqual([])
+  })
+
+  for (const theme of registeredThemes) for (const viewportWidth of [1200, 1800]) {
+    test(`matches main and side semantic styles in ${theme} at ${viewportWidth}px`, async ({ page }, info) => {
+      const gateway = await installGateway(page)
+      await page.setViewportSize({ width: viewportWidth, height: 1100 })
+      await page.addInitScript(theme => {
+        if (window === window.top) localStorage.setItem('opensquilla-theme', theme)
+      }, theme)
+      const { main, side } = await openHosts(page)
+      // 1200px with navigation expanded intentionally uses an overlay. Collapse
+      // navigation through the real control to exercise two compact split panes.
+      if (viewportWidth === 1200) await page.getByRole('button', { name: 'Collapse sidebar', exact: true }).click()
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+      // Initial loading includes the real theme's lazy world stylesheet/fonts.
+      await page.waitForLoadState('networkidle')
+      await page.evaluate(() => document.fonts.ready)
+      await equalizeConversationWidths(page, main, side)
+      const observations: Array<{ part: string; main: unknown; side: unknown }> = []
+      const compare = async (part: string, left: Locator, right: Locator) => {
+        await expect(left).toBeVisible()
+        await expect(right).toBeVisible()
+        const expected = await semanticStyle(left)
+        await expect.poll(() => semanticStyle(right), { message: `${theme} ${viewportWidth}px ${part}` }).toEqual(expected)
+        observations.push({ part, main: expected, side: await semanticStyle(right) })
+      }
+      await composer(main).fill('The same composer content')
+      await composer(side).fill('The same composer content')
+      await page.locator('.topbar h1').click()
+      await compare('conversation frame', main, side.locator('.chat'))
+      await compare('composer frame', main.locator('.chat-composer'), side.locator('.chat-composer'))
+      await compare('composer input panel', main.locator('.chat-input-panel'), side.locator('.chat-input-panel'))
+      await compare('editor typography', composer(main), composer(side))
+      const mainHeader = await semanticStyle(page.locator('.topbar'))
+      const sideHeader = await semanticStyle(page.locator('.workbench-host__chrome'))
+      expect(sideHeader.effectiveBackground, `${theme} workbench header background`).toBe(mainHeader.effectiveBackground)
+      observations.push({ part: 'header effective background', main: mainHeader.effectiveBackground, side: sideHeader.effectiveBackground })
+      await composer(main).focus()
+      await awaitStyleTransition(main.locator('.chat-input-panel'))
+      const mainFocused = { panel: await semanticStyle(main.locator('.chat-input-panel')), editor: await semanticStyle(composer(main)) }
+      await composer(side).focus()
+      await awaitStyleTransition(side.locator('.chat-input-panel'))
+      await expect.poll(async () => ({ panel: await semanticStyle(side.locator('.chat-input-panel')),
+        editor: await semanticStyle(composer(side)) }), { message: `${theme} equal-width focus styles` }).toEqual(mainFocused)
+      observations.push({ part: 'focused composer', main: mainFocused,
+        side: { panel: await semanticStyle(side.locator('.chat-input-panel')), editor: await semanticStyle(composer(side)) } })
+      await send(main, 'Show the same themed answer')
+      await send(side, 'Show the same themed answer')
+      await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(2)
+      for (const key of [MAIN, SIDE]) {
+        gateway.emit(key, 'session.event.text_delta', { text: 'Checking shared evidence.', presentation: 'intermediate' })
+        gateway.emit(key, 'session.event.tool_use_start', { tool_use_id: 'theme-web', tool_name: 'web_fetch', input: { url: 'https://example.com/theme' } })
+      }
+      for (const selector of ['.conversation-live-edge', '.assistant-activity--live', '.assistant-activity__live-head', '.tool-row']) {
+        await compare(`live ${selector}`, main.locator(selector).last(), side.locator(selector).last())
+      }
+      await compare('user message', main.locator('.msg-user-bubble').last(), side.locator('.msg-user-bubble').last())
+      const answer = '**Themed answer**\n\nThe same readable body and [evidence](https://example.com/theme).'
+      const tool = { type: 'tool_use', tool_use_id: 'theme-web', name: 'web_fetch', input: { url: 'https://example.com/theme' },
+        result: JSON.stringify({ url: 'https://example.com/theme', title: 'Theme evidence', content: 'Evidence body' }), execution_status: { status: 'success' } }
+      for (const key of [MAIN, SIDE]) {
+        gateway.emit(key, 'session.event.tool_result', { ...tool, tool_name: tool.name })
+        gateway.emit(key, 'session.event.text_delta', { text: answer, presentation: 'answer' })
+        gateway.finish(key, answer, 'succeeded', [{ type: 'text', text: 'Checking shared evidence.' }, tool, { type: 'text', text: answer }])
+      }
+      for (const host of [main, side]) await expect(host.locator('.chat-stop-btn')).toHaveCount(0)
+      for (const selector of ['.assistant-answer', '.assistant-answer p', '.assistant-activity--settled', '.assistant-activity__summary', '.sources-row', '.msg-ai-footer']) {
+        await compare(`settled ${selector}`, main.locator(selector).last(), side.locator(selector).last())
+      }
+      const styleEvidence = info.outputPath('theme-semantic-style-parity.json')
+      await writeFile(styleEvidence, JSON.stringify({ theme, viewportWidth, observations }, null, 2))
+      await info.attach('theme-semantic-style-parity', { path: styleEvidence, contentType: 'application/json' })
+      expect(gateway.errors).toEqual([])
+    })
+  }
+
   test('preserves each accepted router card when an earlier call receipt settles after a later route', async ({ page }) => {
     const gateway = await installGateway(page)
     const { main, side } = await openHosts(page)

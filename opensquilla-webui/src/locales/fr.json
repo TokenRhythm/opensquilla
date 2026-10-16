@@ -329,6 +329,8 @@
     "pixels": "pixels",
     "empty": "Aucun aperçu n’est disponible pour cet élément.",
     "assistantChat": {
+      "temporaryHint": "Cette conversation est temporaire et n’apparaît pas dans l’historique. Fermer cet onglet ou l’application, ou actualiser la page, la rend inaccessible.",
+      "temporaryKeepHint": "Réduire la barre latérale conserve cette conversation.",
       "contextHint": "Une conversation indépendante pour cette tâche. Partage l’espace de travail sans copier l’historique. Affiche les 100 derniers messages.",
       "empty": "Posez une question annexe sans interrompre la conversation principale.",
       "you": "Vous",

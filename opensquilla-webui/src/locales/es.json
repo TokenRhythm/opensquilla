@@ -329,6 +329,8 @@
     "pixels": "píxeles",
     "empty": "No hay una vista previa disponible para este elemento.",
     "assistantChat": {
+      "temporaryHint": "Este chat es temporal y no aparecerá en tu historial. Si cierras esta pestaña o la aplicación, o recargas la página, no podrás recuperarlo.",
+      "temporaryKeepHint": "Contraer la barra lateral conserva este chat.",
       "contextHint": "Conversación independiente para esta tarea. Comparte el espacio de trabajo sin copiar el historial. Muestra los últimos 100 mensajes.",
       "empty": "Haz una pregunta adicional sin interrumpir la conversación principal.",
       "you": "Tú",

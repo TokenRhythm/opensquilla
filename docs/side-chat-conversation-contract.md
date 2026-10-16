@@ -2,6 +2,8 @@
 
 Side chat is the ordinary conversation experience with a different session owner and an explicit capability policy. It is not a separate agent mode. This document freezes the creation and presentation semantics for the shared-surface refactor.
 
+The empty side surface explains that it is temporary, absent from ordinary history, and cannot be reopened after its tab is closed, the page is refreshed, or the application is closed. Collapsing the workbench is explicitly distinguished from closing it. This notice disappears once sending starts; it is not a permanent extra status bar. It describes UI access, not deletion of canonical billing or execution records.
+
 ## Context and lifecycle
 
 - Opening a side panel is read-only. It does not allocate a child, capture context, create a workspace, or start a model turn. A new-chat landing page cannot create a side chat without a started parent conversation.
