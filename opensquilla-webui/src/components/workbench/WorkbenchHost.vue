@@ -9,6 +9,7 @@
     :class="[
       `workbench-host--${layoutMode}`,
       { 'workbench-host--conversation': activeItem?.kind === 'assistant-chat',
+        'workbench-host--empty': !activeItem,
         'workbench-host--native': activeItem?.hostKind === 'native-webcontents',
         'workbench-host--direct': !motionEnabled || resizeActive,
         'workbench-host--layout-motion': animateLayout && !resizeActive },
@@ -747,9 +748,10 @@ onBeforeUnmount(() => {
   color: var(--text);
 }
 
-/* A conversation uses the same canvas as the routed chat, including its
-   transparent tab chrome. Other tools retain their own workbench ground. */
-.workbench-host--conversation {
+/* Keep the launcher and conversation on the same canvas when changing
+   sessions. Document and browser tools retain their own workbench ground. */
+.workbench-host--conversation,
+.workbench-host--empty {
   background: var(--bg-surface);
 }
 

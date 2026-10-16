@@ -31,6 +31,7 @@ export interface ChatRouteHeaderFindState {
 export interface ChatRouteHeaderModel {
   sessionKey: Readonly<Ref<string>>
   sessionDurable?: Readonly<Ref<boolean>>
+  sessionLoading?: Readonly<Ref<boolean>>
   sessionPreparable?: Readonly<Ref<boolean>>
   workspaceId?: Readonly<Ref<string | null>>
   workspaceReady?: Readonly<Ref<boolean>>
@@ -76,6 +77,7 @@ export interface ChatRouteHeaderBridge {
   model: {
     sessionKey: ComputedRef<string>
     sessionDurable: ComputedRef<boolean>
+    sessionLoading: ComputedRef<boolean>
     sessionPreparable: ComputedRef<boolean>
     workspaceId: ComputedRef<string | null>
     workspaceReady: ComputedRef<boolean>
@@ -164,6 +166,7 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
     model: {
       sessionKey: computed(() => ownerValue('sessionKey', '')),
       sessionDurable: computed(() => activeOwner.value?.model.sessionDurable?.value ?? false),
+      sessionLoading: computed(() => activeOwner.value?.model.sessionLoading?.value ?? false),
       sessionPreparable: computed(() => activeOwner.value?.model.sessionPreparable?.value ?? false),
       workspaceId: computed(() => activeOwner.value?.model.workspaceId?.value ?? null),
       workspaceReady: computed(() => activeOwner.value?.model.workspaceReady?.value ?? false),

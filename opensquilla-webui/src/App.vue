@@ -310,6 +310,8 @@
         :office-prompt-annotations-enabled="appStore.features.officePromptAnnotations === true"
         :route-active="isChatRoute"
         :session-id="workbenchSessionKey"
+        :session-loading="chatRouteHeader.model.sessionKey.value !== workbenchSessionKey
+          || chatRouteHeader.model.sessionLoading.value"
         :session-durable="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
           && chatRouteHeader.model.sessionDurable.value"
         :session-preparable="chatRouteHeader.model.sessionKey.value === workbenchSessionKey

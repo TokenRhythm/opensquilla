@@ -125,6 +125,24 @@ describe('chat route header bridge', () => {
     expect(bridge.model.workspaceResolved.value).toBe(false)
   })
 
+  it('projects loading only from the active route owner', () => {
+    const bridge = createBridge()
+    const first = owner('first')
+    const loading = ref(true)
+    first.model.sessionLoading = loading
+    const stale = bridge.register(first.model, first.commands)
+    expect(bridge.model.sessionLoading.value).toBe(true)
+    loading.value = false
+    expect(bridge.model.sessionLoading.value).toBe(false)
+    const replacement = owner('replacement')
+    replacement.model.sessionLoading = ref(true)
+    bridge.register(replacement.model, replacement.commands)
+    expect(stale.release()).toBe(false)
+    expect(bridge.model.sessionLoading.value).toBe(true)
+    bridge.clear()
+    expect(bridge.model.sessionLoading.value).toBe(false)
+  })
+
   it('keeps optional find capability absent for existing header owners', () => {
     const bridge = createBridge()
     const current = owner('old')

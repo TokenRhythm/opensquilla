@@ -80,6 +80,7 @@ async function mount(options: { native?: boolean; workspace?: boolean; assistant
     isLocalOwner: true, isAuthenticated: true, subscriptionEpoch: 1, deliveryIdentity: 'verified-connection-a',
   } as GatewayMenuFixture)
   const props = reactive({ sessionId: 'session-a', routeActive: true, conversationStarted: true, sessionDurable: true, sessionPreparable: true,
+    sessionLoading: false,
     enabled: true, modalBlocked: false,
     prepareSession: undefined as ((key: string) => Promise<string | null>) | undefined,
     workspaceId: options.workspace === false ? null : 'workspace-a', workspaceReady: true, workspaceResolved: true })
@@ -223,6 +224,94 @@ describe('AppWorkbench new panel menu interaction', () => {
     const terminal = start.querySelector<HTMLButtonElement>('[data-panel-kind="terminal"]')!
     expect(terminal.disabled).toBe(true)
     expect(terminal.querySelector('small')?.textContent).toBe(key('requiresHostExecute'))
+  })
+
+  it.each(['history-first', 'workspace-first'] as const)(
+    'keeps launcher entries stable and disabled until the next session resolves (%s)', async order => {
+      const harness = await mount({ native: false })
+      harness.store.closeAllItems()
+      harness.store.openEmpty()
+      await settle()
+      const start = harness.host.querySelector('[data-testid="workbench-start-panel"]')!
+      const cards = () => [...start.querySelectorAll<HTMLButtonElement>('[data-panel-kind]')]
+      const initial = cards()
+      harness.props.sessionId = 'session-b'
+      harness.props.sessionLoading = true
+      harness.props.workspaceResolved = false
+      harness.props.workspaceReady = false
+      harness.props.workspaceId = null
+      harness.props.conversationStarted = false
+      await settle()
+      expect(cards()).toEqual(initial)
+      expect(start.getAttribute('aria-busy')).toBe('true')
+      for (const card of cards()) { expect(card.disabled).toBe(true); card.click() }
+      expect(harness.store.items).toHaveLength(0)
+      let historyResolved = false
+      const resolveHistory = () => {
+        historyResolved = true
+        harness.props.conversationStarted = true
+        harness.props.sessionLoading = !harness.props.workspaceResolved
+      }
+      const resolveWorkspace = () => {
+        harness.props.workspaceResolved = true
+        harness.props.workspaceReady = true
+        harness.props.workspaceId = 'workspace-b'
+        harness.props.sessionLoading = !historyResolved
+      }
+      ;(order === 'history-first' ? resolveHistory : resolveWorkspace)()
+      await settle()
+      expect(cards()).toEqual(initial)
+      expect(cards().every(card => card.disabled)).toBe(true)
+      ;(order === 'history-first' ? resolveWorkspace : resolveHistory)()
+      await settle()
+      expect(cards()).toEqual(initial)
+      expect(start.getAttribute('aria-busy')).toBe('false')
+      const files = cards().find(card => card.dataset.panelKind === 'workspace-files')!
+      expect(files.disabled).toBe(false)
+      files.click()
+      await settle()
+      expect(harness.store.activeItem?.scope).toEqual({ type: 'session', id: 'session-b' })
+    },
+  )
+
+  it('drops inapplicable entries after resolving an empty non-project session', async () => {
+    const harness = await mount({ native: false })
+    harness.store.closeAllItems()
+    harness.store.openEmpty()
+    harness.props.sessionId = 'empty-session'
+    harness.props.sessionLoading = true
+    harness.props.workspaceResolved = false
+    harness.props.workspaceId = null
+    harness.props.conversationStarted = false
+    await settle()
+    const start = harness.host.querySelector('[data-testid="workbench-start-panel"]')!
+    expect(start.querySelectorAll('[data-panel-kind]')).toHaveLength(4)
+    harness.props.sessionLoading = false
+    harness.props.workspaceResolved = true
+    await settle()
+    expect([...start.querySelectorAll<HTMLElement>('[data-panel-kind]')].map(card => card.dataset.panelKind))
+      .toEqual(['browser', 'terminal'])
+    expect(harness.lifecycle.createSidechat).not.toHaveBeenCalled()
+  })
+
+  it('restores independent browser access when workspace resolution fails', async () => {
+    const harness = await mount()
+    harness.props.sessionLoading = true
+    harness.props.workspaceResolved = false
+    harness.props.workspaceReady = false
+    await harness.open()
+    expect(option('browser')?.disabled).toBe(true)
+    // Failure ends loading without granting workspace or host access.
+    harness.props.sessionLoading = false
+    await settle()
+    expect(option('browser')?.disabled).toBe(false)
+    for (const kind of ['workspace-files', 'terminal', 'assistant-chat'] as const) {
+      expect(option(kind)?.disabled).toBe(true)
+    }
+    option('browser')!.click()
+    await settle()
+    expect(harness.host.querySelector('[data-testid="browser-start"]')).not.toBeNull()
+    expect(harness.lifecycle.createSidechat).not.toHaveBeenCalled()
   })
 
   it('shows the URL form only after choosing Browser and restores cards when its last tab closes', async () => {

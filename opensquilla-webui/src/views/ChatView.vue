@@ -6375,6 +6375,10 @@ const chatRouteHeaderRegistration = props.embedded
   : chatRouteHeader.register({
   sessionKey,
   sessionDurable: computed(() => !isDraftSurface()),
+  // Bootstrap owns whether a history read is needed (materialized drafts skip
+  // it). A failed workspace lookup is settled, not an endless loading state.
+  sessionLoading: computed(() => activeWorkspaceStatus.value === 'resolving'
+    || !isDraftSurface() && ['idle', 'loading'].includes(chatSessionBootstrap.historyPhase.value)),
   sessionPreparable: workbenchSessionPreparation.canPrepare,
   workspaceId: boundWorkspaceId,
   workspaceReady: computed(() => activeWorkspaceStatus.value === 'ready'),

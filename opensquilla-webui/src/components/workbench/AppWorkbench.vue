@@ -239,7 +239,7 @@
         @open="openBrowserUrl($event, true)"
         @reopen="reopenBrowser"
       />
-      <section v-else class="app-workbench__start" data-testid="workbench-start-panel">
+      <section v-else class="app-workbench__start" data-testid="workbench-start-panel" :aria-busy="panelContextLoading">
         <h2>{{ t('workbench.newPanel.title') }}</h2>
         <div class="app-workbench__start-options">
           <button
@@ -429,6 +429,7 @@ const props = withDefaults(defineProps<{
   sessionId?: string
   conversationStarted?: boolean
   sessionDurable?: boolean
+  sessionLoading?: boolean
   sessionPreparable?: boolean
   prepareSession?: (expectedSessionKey: string) => Promise<string | null>
   workspaceId?: string | null
@@ -444,6 +445,7 @@ const props = withDefaults(defineProps<{
   sessionId: '',
   conversationStarted: false,
   sessionDurable: false,
+  sessionLoading: false,
   sessionPreparable: false,
   workspaceId: null,
   workspaceReady: false,
@@ -503,6 +505,21 @@ const canOpenAssistantChat = computed(() => Boolean(sessionReady.value && props.
   && (!props.workspaceId || props.workspaceReady)))
 const newPanelMenuVisible = computed(() => Boolean(nativeApi || workspaceFiles || terminal || referenceGateway))
 
+const panelContextLoading = computed(() => !sessionReady.value || props.sessionLoading)
+// A pending session has unknown capabilities, not fewer capabilities. Preserve
+// the last settled entry positions while resolving the next session; these are
+// presentation keys only and never grant access to the previous session.
+const settledPanelKinds = ref<NewPanelKind[] | null>(null)
+const visiblePanelKinds = computed<NewPanelKind[]>(() => [
+  'browser',
+  ...(props.workspaceId ? ['workspace-files' as const] : []),
+  'terminal',
+  ...(props.sessionDurable && props.conversationStarted ? ['assistant-chat' as const] : []),
+])
+watch([panelContextLoading, visiblePanelKinds], ([loading, kinds]) => {
+  if (!loading) settledPanelKinds.value = kinds
+}, { immediate: true })
+
 function sessionUnavailableReason(): string {
   return t('workbench.newPanel.requiresSession')
 }
@@ -545,9 +562,10 @@ const newPanelOptions = computed<NewPanelOption[]>(() => {
             : t('workbench.newPanel.assistantUnavailable')),
     },
   ]
-  return options.filter(option => (option.kind !== 'workspace-files' || Boolean(props.workspaceId))
-    && (option.kind !== 'assistant-chat' || props.sessionDurable && props.conversationStarted))
-    .map(option => preparingPanel.value ? { ...option, disabled: true,
+  const kinds = panelContextLoading.value && settledPanelKinds.value
+    ? settledPanelKinds.value : visiblePanelKinds.value
+  return options.filter(option => kinds.includes(option.kind))
+    .map(option => preparingPanel.value || panelContextLoading.value ? { ...option, disabled: true,
       disabledReason: t('workbench.newPanel.preparing') } : option)
 })
 watch(() => [props.sessionId, props.workspaceId, props.routeActive, props.enabled, props.modalBlocked, store.expanded,
@@ -2154,18 +2172,23 @@ onBeforeUnmount(() => {
 .app-workbench__start-options {
   display: grid;
   width: 100%;
-  max-width: 520px;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
-  gap: var(--sp-2);
+  max-width: 380px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--sp-3);
 }
 
 .app-workbench__start-option {
-  min-height: 76px;
+  min-height: 68px;
   align-items: center;
   padding: var(--sp-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--bg-surface);
+}
+
+.app-workbench__start-option .app-workbench__new-panel-option-copy {
+  /* Fit the label and one-line pending hint inside the same 68px card. */
+  line-height: 1.4;
 }
 
 .app-workbench__switcher {
