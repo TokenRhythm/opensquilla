@@ -998,6 +998,9 @@ function activateAttachment(attachment: DisplayAttachment, event: MouseEvent) {
 }
 
 .msg-user-actions {
+  /* Paragraph selections must not copy toolbar icons into clipboard HTML. */
+  -webkit-user-select: none;
+  user-select: none;
   display: flex;
   gap: 0.125rem;
   margin-top: 0.125rem;
