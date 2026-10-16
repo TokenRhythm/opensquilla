@@ -4484,6 +4484,15 @@
       "sendingContinuing": "Sending reply · continuing run…"
     },
     "slashCommands": {
+      "side": {
+        "closed": "The original side chat was closed. Your draft was kept. Edit the command before sending again to start a new side chat.",
+        "description": "Open temporary side chat · /btw is an alias",
+        "nested": "Side chats cannot open another side chat. Your draft was kept.",
+        "attachments": "This shortcut accepts plain text only. Your attachments, references and draft were kept. Open a side chat to add them there.",
+        "unavailable": "Side chat is unavailable for this conversation right now. Your draft was kept.",
+        "requiresStarted": "Send the first message in the main conversation before opening a side chat.",
+        "failed": "The side chat has not confirmed this message. Your draft was kept; retry here or continue in the side chat."
+      },
       "unknown": "Unknown command {command}. Keep editing, or use // to send it as text.",
       "goal": {
         "usage": "Use /goal <objective> or /goal set <objective>, or use status, edit, pause, resume, or clear.",

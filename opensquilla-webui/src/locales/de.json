@@ -4381,6 +4381,15 @@
       "sendingContinuing": "Antwort wird gesendet · Ausführung wird fortgesetzt…"
     },
     "slashCommands": {
+      "side": {
+        "closed": "Der ursprüngliche Seitenchat wurde geschlossen. Der Entwurf wurde behalten. Bearbeite den Befehl vor dem erneuten Senden, um einen neuen Seitenchat zu starten.",
+        "description": "Temporären Seitenchat öffnen · Alias /btw",
+        "nested": "Ein Seitenchat kann keinen weiteren Seitenchat öffnen. Der Entwurf wurde behalten.",
+        "attachments": "Dieser Kurzbefehl unterstützt nur Text. Anhänge, Verweise und Entwurf wurden behalten. Öffne einen Seitenchat, um sie hinzuzufügen.",
+        "unavailable": "Der Seitenchat ist für diese Unterhaltung derzeit nicht verfügbar. Der Entwurf wurde behalten.",
+        "requiresStarted": "Sende zuerst die erste Nachricht im Hauptchat, bevor du einen Seitenchat öffnest.",
+        "failed": "Der Seitenchat hat den Empfang noch nicht bestätigt. Der Entwurf wurde behalten. Versuche es hier erneut oder fahre im Seitenchat fort."
+      },
       "unknown": "Unbekannter Befehl {command}. Bearbeite ihn weiter oder verwende //, um ihn als Text zu senden.",
       "goal": {
         "usage": "Verwende /goal <Ziel> oder /goal set <Ziel> sowie status, edit, pause, resume oder clear.",

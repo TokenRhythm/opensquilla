@@ -1,7 +1,7 @@
 <template>
   <section class="assistant-chat-panel" data-testid="assistant-chat-panel">
     <p v-if="state.error" class="assistant-chat-panel__notice" role="alert">{{ state.error }}</p>
-    <ChatView :key="ownerScope" embedded
+    <ChatView ref="chatView" :key="ownerScope" embedded
       :session-key-override="state.child?.key || ''"
       :policy="SIDE_CONVERSATION_POLICY"
       :workbench-owner-session-key="parentSessionKey"
@@ -25,8 +25,11 @@ import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 import { SIDE_CONVERSATION_POLICY } from '@/modules/conversationPolicy'
 import { assistantChatBindingKey, createAssistantChatOwner, type AssistantChatOwnerState } from '@/modules/assistantChat'
 import { assistantChatPendingOwner } from '@/modules/assistantChatPendingOwner'
+import type { SideChatLaunchHandle, SideChatLaunchRequest } from '@/modules/sideChatLauncher'
 
 const props = defineProps<{ parentSessionKey: string; workspaceId?: string; ownerId: string }>()
+const chatView = shallowRef<SideChatLaunchHandle | null>(null)
+defineExpose({ launchSideChat: (request: SideChatLaunchRequest) => chatView.value?.launchSideChat(request) ?? Promise.resolve(false) })
 const gateway = inject(GATEWAY_ACCESS_KEY, null)
 const lifecycle = inject(SESSION_LIFECYCLE_KEY, null)
 const lastIdentity = shallowRef(gateway?.deliveryIdentity || '')

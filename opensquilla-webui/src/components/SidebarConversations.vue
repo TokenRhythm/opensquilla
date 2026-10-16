@@ -1926,7 +1926,7 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
           </div>
       </div>
       <div
-        v-if="loadingMore || loadMoreError || (!hasMore && totalRows > 0)"
+        v-if="loadingMore || loadMoreError"
         class="sidebar-history-page-state"
         role="status"
       >
@@ -1939,7 +1939,6 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
         >
           {{ t('shared.errorState.retry') }}
         </button>
-        <span v-else>{{ t('shared.sidebar.allLoaded') }}</span>
       </div>
     </div>
     <Teleport to="body">

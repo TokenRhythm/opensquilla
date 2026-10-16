@@ -2004,6 +2004,25 @@ button.tool-row:hover {
   color: var(--text-muted);
 }
 
+/* Chat activity uses text affordances, including a non-color keyboard cue.
+   Keep the card hover used by the standalone run trace out of this surface. */
+.tool-timeline--activity button.tool-row:hover {
+  background: transparent;
+}
+
+.tool-timeline--activity button.tool-row:hover .tool-row__label,
+.tool-timeline--activity button.tool-row:hover .tool-row__arg,
+.tool-timeline--activity button.tool-row:focus-visible .tool-row__label,
+.tool-timeline--activity button.tool-row:focus-visible .tool-row__arg {
+  color: var(--text);
+}
+
+.tool-timeline--activity button.tool-row:focus-visible .tool-row__label,
+.tool-timeline--activity button.tool-row:focus-visible .tool-row__arg {
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
 .tool-timeline--activity .tool-row__elapsed,
 .tool-timeline--activity .tool-row--running .tool-row__elapsed {
   padding: 0;

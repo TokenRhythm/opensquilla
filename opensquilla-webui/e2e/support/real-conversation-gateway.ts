@@ -50,6 +50,8 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
   const fileRequests: Array<{ sessionKey: string; path: string; action: string }> = []
   const heldAcks: Array<() => void> = []
   let heldCreate: (() => void) | null = null
+  let failNextCreate = false
+  const rejectedNextSends = new Set<string>()
   const emit = (key: string, event: string, payload: Wire = {}) => {
     const stream = get(key)
     const envelope = { event, payload: { key, session_key: key, task_id: stream.task,
@@ -248,6 +250,12 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
         return
       }
       if (frame.method === 'sessions.sidechat.create') {
+        if (failNextCreate) {
+          failNextCreate = false
+          ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: false,
+            error: { code: 'INTERNAL_ERROR', message: 'Synthetic side creation failure' } }))
+          return
+        }
         const completeCreate = () => respond({ key: SIDE, parentKey: frame.params?.parentKey, sessionId: 'side-session-id',
           inherited: { model: null, provider: null, reasoningLevel: null, modelRoutingMode: 'direct',
             modelRoutingRevision: 1, runMode: 'safe' } })
@@ -262,6 +270,12 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
         return
       }
       if (frame.method === 'chat.send') {
+        if (rejectedNextSends.delete(key)) {
+          ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: false,
+            error: { code: 'SYNTHETIC_ADMISSION_FAILURE', message: 'Synthetic send was not admitted',
+              accepted: false, retryable: true } }))
+          return
+        }
         stream.task = `task-${++taskCounter}`
         stream.events = []
         stream.history.push({ role: 'user', text: frame.params?.message, id: `user-${stream.task}`,
@@ -412,6 +426,8 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
       } }))
     },
     releaseCreate: () => { heldCreate?.(); heldCreate = null },
+    failNextSideCreate: () => { failNextCreate = true },
+    rejectNextSend: (key: string) => { rejectedNextSends.add(key) },
     releaseAcks: () => heldAcks.splice(0).forEach(release => release()),
     pendingApprovals: (items: Wire[]) => { pendingApprovals = items },
     reconnect: () => socket.close({ code: 1012, reason: 'Synthetic reconnect' }) }

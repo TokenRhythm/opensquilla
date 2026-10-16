@@ -4483,6 +4483,15 @@
       "sendingContinuing": "正在发送回复 · 继续运行…"
     },
     "slashCommands": {
+      "side": {
+        "closed": "原侧边聊天已关闭，已保留草稿。请修改命令后再发送，以创建新的侧边聊天。",
+        "description": "打开临时侧边聊天 · /btw 为同义命令",
+        "nested": "侧边聊天不能再创建侧边聊天，已保留草稿。",
+        "attachments": "此快捷命令暂只支持纯文本，附件、引用和草稿均已保留。请打开侧边聊天后再添加。",
+        "unavailable": "当前会话暂时无法打开侧边聊天，已保留草稿。",
+        "requiresStarted": "请先在主会话发送第一条消息，再打开侧边聊天。",
+        "failed": "侧边聊天尚未确认收到消息，已保留草稿。可在此重试或继续操作侧边聊天。"
+      },
       "unknown": "未知命令 {command}。请继续编辑，或使用 // 将其作为普通文本发送。",
       "goal": {
         "usage": "使用 /goal <目标> 或 /goal set <目标>，也可使用 status、edit、pause、resume、clear。",

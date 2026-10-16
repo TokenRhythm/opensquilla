@@ -861,15 +861,16 @@ defineExpose({ element: () => rootRef.value })
 }
 .routing-search:focus-within {
   border-color: var(--accent);
-  box-shadow: var(--focus-ring);
 }
 .routing-search input[type='text'],
 .routing-search input[type='text']:focus {
   min-width: 0;
   width: 100%;
   height: 100%;
+  min-height: 0;
   padding: 0;
   border: 0;
+  border-radius: 0;
   outline: 0;
   box-shadow: none;
   background: transparent;

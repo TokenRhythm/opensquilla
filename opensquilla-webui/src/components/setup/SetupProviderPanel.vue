@@ -21,6 +21,7 @@ import type { ProviderProbeMode } from '@/modules/setupWorkflow'
 import { parseContextWindowInput } from '@/composables/setup/useSettingsPromotedForm'
 import { localizedRelativeTime } from '@/utils/messageTime'
 import { modelCatalogFeedbackKey } from '@/utils/modelCatalogFeedback'
+import { useDialogLayer } from '@/composables/useDialogA11y'
 
 const { t, locale } = useI18n()
 
@@ -139,6 +140,9 @@ const emit = defineEmits<{
 const addOpen = ref(false)
 
 const editorOpen = ref(false)
+// This editor is teleported outside Settings. Register its existing keyboard
+// trap so the Settings dialog does not reclaim Tab focus behind the editor.
+const editorIsTopmost = useDialogLayer(editorOpen)
 const listExpanded = ref(false)
 const openProviderMenuId = ref('')
 const addButtonRef = ref<HTMLButtonElement | null>(null)
@@ -278,6 +282,7 @@ function selectConfigured(providerId: string) {
 }
 
 function onEditorDialogKeydown(event: KeyboardEvent) {
+  if (!editorIsTopmost.value) return
   if (event.key === 'Escape') {
     event.preventDefault()
     event.stopPropagation()

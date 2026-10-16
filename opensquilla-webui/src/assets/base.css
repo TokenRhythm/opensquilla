@@ -58,7 +58,10 @@ body::before {
 a { color: var(--accent); text-decoration: none; }
 a:hover { color: var(--accent-hover); }
 
-input:not([type="radio"]):not([type="checkbox"]):not(.workspace-files__filter-input), textarea, select {
+/* Element defaults stay below component rules. A compound field owns its
+   focus boundary on the wrapper and resets its inner input without having to
+   compete with a growing list of global :not() exceptions. */
+:where(input:not([type="radio"]):not([type="checkbox"]), textarea, select) {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
@@ -69,9 +72,10 @@ input:not([type="radio"]):not([type="checkbox"]):not(.workspace-files__filter-in
   outline: none;
   transition: border-color var(--transition), box-shadow var(--transition);
 }
-input:not([type="radio"]):not([type="checkbox"]):not(.workspace-files__filter-input):focus, textarea:focus, select:focus {
-  border-color: var(--accent);
-  box-shadow: var(--focus-ring);
+:where(input:not([type="radio"]):not([type="checkbox"]), textarea, select):focus {
+  outline: 1px solid var(--accent);
+  outline-offset: 0;
+  box-shadow: none;
 }
 input[type="radio"], input[type="checkbox"] {
   accent-color: var(--accent);

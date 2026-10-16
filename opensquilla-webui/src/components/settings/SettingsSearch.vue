@@ -106,8 +106,7 @@ function onFocusOut(event: FocusEvent) {
 <style scoped>
 .settings-search { align-items: center; display: flex; flex: 1 1 220px; gap: 8px; max-width: 360px; min-width: 0; position: relative; }
 .settings-search > .icon { left: 10px; pointer-events: none; position: absolute; color: var(--text-dim); }
-.settings-search input[type="search"] { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-md); color: var(--text); font: inherit; font-size: var(--fs-sm); min-height: 40px; padding: 8px 10px 8px 32px; width: 100%; }
-.settings-search input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.settings-search input[type="search"] { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-control); color: var(--text); font: inherit; font-size: var(--fs-sm); min-height: 40px; padding: 8px 10px 8px 32px; width: 100%; }
 .settings-search__results { background: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: var(--shadow-lg); left: 0; max-height: min(45vh, 340px); overflow-y: auto; padding: 4px; position: absolute; right: 0; top: calc(100% + 6px); z-index: 5; }
 .settings-search__result { align-items: center; background: transparent; border: 0; border-radius: var(--radius-sm); color: var(--text); cursor: pointer; display: flex; font: inherit; gap: 10px; min-height: 44px; padding: 8px; text-align: left; width: 100%; }
 .settings-search__result:hover, .settings-search__result:focus-visible { background: var(--bg-hover); outline: 2px solid var(--accent); outline-offset: -2px; }

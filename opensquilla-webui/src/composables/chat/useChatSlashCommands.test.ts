@@ -173,6 +173,44 @@ describe('useChatSlashCommands compaction lifecycle', () => {
   })
 })
 
+describe('local side chat command palette', () => {
+  it('has one primary entry searchable by its alias before the remote catalog loads', async () => {
+    const run = vi.fn(async () => true)
+    const { api, inputText, rpc } = harness(false, [], Promise.resolve(), undefined, { sideChat: { run } })
+    for (const query of ['/si', '/btw']) {
+      inputText.value = query
+      api.handleSlashInput()
+      expect(api.filteredSlashCmds.value.filter(command => command.execution?.action === 'workbench.openSideChat')).toHaveLength(1)
+      expect(api.filteredSlashCmds.value[0]?.cmd).toBe('/side')
+    }
+    await expect(api.classifySlashCommand('/btw question')).resolves.toBe('registered')
+    await expect(api.executeSlashCommand('/btw question')).resolves.toBe(true)
+    expect(run).toHaveBeenCalledWith('/btw question')
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('completes only the leading token and preserves all prose after the caret', () => {
+    const run = vi.fn(async () => true)
+    const { api, inputText } = harness(false, [], Promise.resolve(), undefined, { sideChat: { run }, getCaret: () => 3 })
+    inputText.value = '/si keep this question\nincluding this line'
+    api.handleSlashInput()
+    api.completeSlashCmd(api.filteredSlashCmds.value[0]!)
+    expect(run).toHaveBeenCalledWith('/side keep this question\nincluding this line')
+    expect(inputText.value).toBe('/si keep this question\nincluding this line')
+  })
+
+  it('filters recursive side creation while retaining explicit command classification', async () => {
+    const run = vi.fn(async () => true)
+    const { api, inputText } = harness(false, [], Promise.resolve(), undefined, {
+      sideChat: { run }, commandAllowed: command => command.execution?.action !== 'workbench.openSideChat',
+    })
+    inputText.value = '/btw'
+    api.handleSlashInput()
+    expect(api.filteredSlashCmds.value).toEqual([])
+    await expect(api.classifySlashCommand('/btw question')).resolves.toBe('unavailable')
+  })
+})
+
 describe('useChatSlashCommands plan compatibility', () => {
   it('allows command completion with skill tags but blocks direct menu execution', async () => {
     const skill = { name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }

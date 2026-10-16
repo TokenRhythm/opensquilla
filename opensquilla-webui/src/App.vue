@@ -507,6 +507,7 @@ import { isMacPlatform } from './utils/browser'
 import { useShortcutsStore } from './stores/shortcuts'
 import { bindingMatches, formatBinding } from './utils/keychord'
 import { SIDEBAR_MIN_WIDTH, type SidebarWidthPreference } from './utils/sidebarLayout'
+import { provideSideChatLauncher } from '@/modules/sideChatLauncher'
 import { sidebarSessionOrderKeys } from './utils/sidebarDisplayProjection'
 import {
   dispatchLocalSessionsDeleted,
@@ -576,6 +577,7 @@ provideChatTopbarPopoverCoordinator(
   topbarPopoverCoordinationEnabled,
 )
 const chatRouteHeader = provideChatRouteHeaderBridge()
+provideSideChatLauncher()
 const {
   sessionKey: chatRouteHeaderSessionKey,
   visible: chatRouteHeaderVisible,

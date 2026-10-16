@@ -174,7 +174,7 @@ defineExpose({ focus: () => input.value?.focus({ preventScroll: true }) })
   height: 36px;
   padding: 0 var(--sp-2);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-control);
   background: var(--bg-elevated);
   color: var(--text);
   box-shadow: var(--shadow-sm);
@@ -189,6 +189,7 @@ defineExpose({ focus: () => input.value?.focus({ preventScroll: true }) })
   min-height: 0;
   padding: 0 var(--sp-1);
   border: 0;
+  border-radius: 0;
   outline: none;
   background: transparent;
   color: var(--text);

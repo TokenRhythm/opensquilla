@@ -22,9 +22,7 @@ body::before {
 }
 
 /* Controls: filled surfaces carry hierarchy; outlines are reserved for focus. */
-input:not([type="radio"]):not([type="checkbox"]):not(.workspace-files__filter-input),
-textarea,
-select,
+:where(input:not([type="radio"]):not([type="checkbox"]), textarea, select),
 .control-input {
   background: var(--bg-surface-2);
   border-color: transparent;
@@ -33,13 +31,13 @@ select,
   padding: 9px 13px;
 }
 
-input:not([type="radio"]):not([type="checkbox"]):not(.workspace-files__filter-input):focus,
-textarea:focus,
-select:focus,
+:where(input:not([type="radio"]):not([type="checkbox"]), textarea, select):focus,
 .control-input:focus {
   background: var(--bg-surface);
   border-color: transparent;
-  box-shadow: var(--focus-ring);
+  outline: 1px solid var(--accent);
+  outline-offset: 0;
+  box-shadow: none;
 }
 
 .btn {
@@ -368,17 +366,21 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 }
 
 .sidebar-task-search:focus-within {
-  box-shadow: var(--focus-ring);
+  outline: 1px solid var(--accent);
+  outline-offset: 0;
 }
 
 .sidebar-task-search input {
   background: transparent;
   border: 0;
+  border-radius: 0;
+  box-shadow: none;
   color: var(--sidebar-text-strong);
   flex: 1;
   font: inherit;
   font-size: var(--fs-xs);
   min-width: 0;
+  min-height: 0;
   outline: 0;
   padding: 0;
 }

@@ -84,7 +84,6 @@ function reset() {
 .model-capacity-fields__input input { width: 100%; max-width: none; box-sizing: border-box; padding-inline-end: 54px; background: var(--bg-surface); border: 1px solid var(--border-strong); }
 .model-capacity-fields__input input::placeholder { color: var(--text); opacity: 1; }
 .model-capacity-fields__input input:not(:disabled):hover { border-color: var(--text-muted); }
-.model-capacity-fields__input input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .model-capacity-fields__input input[aria-invalid="true"] { border-color: var(--danger); }
 .model-capacity-fields__unit { position: absolute; inset-inline-end: var(--sp-2); top: 50%; transform: translateY(-50%); color: var(--text-muted); font-size: var(--fs-xs); pointer-events: none; }
 .model-capacity-fields__unsaved { color: var(--accent); }

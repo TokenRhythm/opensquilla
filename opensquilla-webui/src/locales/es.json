@@ -4381,6 +4381,15 @@
       "sendingContinuing": "Enviando respuesta · continuando la ejecución…"
     },
     "slashCommands": {
+      "side": {
+        "closed": "El chat lateral original se cerró. Se conservó tu borrador. Edita el comando antes de enviarlo de nuevo para crear otro chat lateral.",
+        "description": "Abrir chat lateral temporal · alias /btw",
+        "nested": "Un chat lateral no puede abrir otro. Se conservó el borrador.",
+        "attachments": "Este atajo solo admite texto. Se conservaron los adjuntos, las referencias y el borrador. Abre un chat lateral para añadirlos.",
+        "unavailable": "El chat lateral no está disponible para esta conversación. Se conservó el borrador.",
+        "requiresStarted": "Envía el primer mensaje en la conversación principal antes de abrir un chat lateral.",
+        "failed": "El chat lateral aún no ha confirmado la recepción. Se conservó el borrador. Reintenta aquí o continúa en el chat lateral."
+      },
       "unknown": "Comando desconocido {command}. Sigue editándolo o usa // para enviarlo como texto.",
       "goal": {
         "usage": "Usa /goal <objetivo> o /goal set <objetivo>; adminístralo con status, edit, pause, resume o clear.",

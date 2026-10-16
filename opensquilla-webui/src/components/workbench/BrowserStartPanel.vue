@@ -109,16 +109,11 @@ onMounted(() => addressRef.value?.focus({ preventScroll: true }))
   flex: 1;
   padding: 0 var(--sp-3);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-control);
   background: var(--bg-elevated);
   color: var(--text);
   font: inherit;
   font-size: var(--fs-sm);
-}
-
-.browser-start__address:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
 }
 
 .browser-start__error {

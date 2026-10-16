@@ -33,6 +33,7 @@ export function useConversationPolicy() {
 }
 
 export function conversationSlashActionAllowed(policy: Readonly<ConversationPolicy>, action: string): boolean {
+  if (['/side', '/btw', 'workbench.openSideChat'].includes(action)) return policy.kind === 'main'
   if (['/fork', 'fork_session', 'sessions.fork'].includes(action)) return policy.fork
   if (['/plan', 'plans.setMode', 'plans.toggleMode'].includes(action)) return policy.plan
   if (['/goal', 'goal.set'].includes(action)) return policy.goal

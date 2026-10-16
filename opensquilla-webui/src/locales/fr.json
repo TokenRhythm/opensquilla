@@ -4381,6 +4381,15 @@
       "sendingContinuing": "Envoi de la réponse · poursuite de l'exécution…"
     },
     "slashCommands": {
+      "side": {
+        "closed": "Le chat latéral d’origine a été fermé. Votre brouillon est conservé. Modifiez la commande avant de la renvoyer pour créer un nouveau chat latéral.",
+        "description": "Ouvrir un chat latéral temporaire · alias /btw",
+        "nested": "Un chat latéral ne peut pas en ouvrir un autre. Brouillon conservé.",
+        "attachments": "Ce raccourci accepte uniquement du texte. Pièces jointes, références et brouillon conservés. Ouvrez un chat latéral pour les ajouter.",
+        "unavailable": "Le chat latéral est indisponible pour cette conversation. Brouillon conservé.",
+        "requiresStarted": "Envoyez le premier message de la conversation principale avant d’ouvrir un chat latéral.",
+        "failed": "La réception du message n’est pas encore confirmée. Brouillon conservé. Réessayez ici ou continuez dans le chat latéral."
+      },
       "unknown": "Commande inconnue {command}. Continuez à la modifier ou utilisez // pour l’envoyer comme texte.",
       "goal": {
         "usage": "Utilisez /goal <objectif> ou /goal set <objectif>, puis status, edit, pause, resume ou clear.",

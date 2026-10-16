@@ -200,6 +200,8 @@ interface SendAttempt {
   acceptanceInFlight?: boolean
   acceptedSessionKey?: string
   onAccepted?: () => void
+  /** Original delivery owner; retained when a manual retry replaces its UI callback. */
+  onDeliveryAccepted?: () => void
   stopOwner?: symbol
 }
 
@@ -264,6 +266,7 @@ interface DispatchSendOptions {
   /** Queue permission remains revocable while the durable owner prepares admission. */
   beforeDispatch?: () => boolean
   onAccepted?: () => void
+  onDeliveryAccepted?: () => void
   /** Require a non-replayable WAL preparation that is armed immediately before RPC. */
   requirePreparedHandoff?: boolean
   /** Stable cross-tab identity for one protocol-owned replay. */
@@ -1209,8 +1212,11 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function notifySendAccepted(attempt: SendAttempt) {
+    const onDeliveryAccepted = attempt.onDeliveryAccepted
     const onAccepted = attempt.onAccepted
+    attempt.onDeliveryAccepted = undefined
     attempt.onAccepted = undefined
+    onDeliveryAccepted?.()
     onAccepted?.()
   }
 
@@ -2263,6 +2269,8 @@ export function useChatSend(options: UseChatSendOptions) {
     resumeQueueOnSuccess?: boolean
     /** Invocation-owned UI response; automatic sends leave it unset. */
     onAccepted?: () => void
+    /** Delivery-owned response; follows this immutable attempt through manual/receipt retries. */
+    onDeliveryAccepted?: () => void
     preflightGuard?: () => boolean
     /** Additional scope check that remains valid after the sender consumes the composer. */
     preDispatchGuard?: () => boolean
@@ -2359,6 +2367,7 @@ export function useChatSend(options: UseChatSendOptions) {
         idempotentReplay: true,
         preDispatchGuard: deliveryStillMatches,
         onAccepted,
+        onDeliveryAccepted: invocation.onDeliveryAccepted,
       })
     }
 
@@ -2444,6 +2453,7 @@ export function useChatSend(options: UseChatSendOptions) {
         cancelIfComposerChanged: invocation.cancelIfComposerChanged,
         preDispatchGuard: () => deliveryStillMatches() && invocation.preDispatchGuard?.() !== false,
         onAccepted,
+        onDeliveryAccepted: invocation.onDeliveryAccepted,
       })
     }
 
@@ -2606,6 +2616,7 @@ export function useChatSend(options: UseChatSendOptions) {
       cancelIfComposerChanged: invocation.cancelIfComposerChanged,
       preDispatchGuard: () => deliveryStillMatches() && invocation.preDispatchGuard?.() !== false,
       onAccepted,
+      onDeliveryAccepted: invocation.onDeliveryAccepted,
     })
   }
 
@@ -3133,6 +3144,7 @@ export function useChatSend(options: UseChatSendOptions) {
         requestSessionKey,
         deliveryIdentity: requestDeliveryIdentity,
         onAccepted: sendOpts.onAccepted,
+        onDeliveryAccepted: sendOpts.onDeliveryAccepted,
         draftIds: [...attemptAnnotationDraftIds],
         promptAnnotations: sentSnapshots,
         pageContext: attemptPageContext,

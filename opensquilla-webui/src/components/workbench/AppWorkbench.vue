@@ -303,6 +303,7 @@ import {
 } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import { useSideChatLauncher, type SideChatLaunchHandle, type SideChatLaunchRequest } from '@/modules/sideChatLauncher'
 import type { IconName } from '@/utils/icons'
 import { useConfirm } from '@/composables/useConfirm'
 import { useDialogLayer, useNativeSurfaceOcclusionState } from '@/composables/useDialogA11y'
@@ -458,6 +459,10 @@ const { pushToast } = useToasts()
 const platform = usePlatform()
 const nativeApi = platform.workbench.native
 const store = useWorkbenchStore()
+const sideChatLauncher = useSideChatLauncher()
+const sideChatHandles = new Map<string, SideChatLaunchHandle>()
+const sideChatLaunchItems = new Map<string, { itemId: string; isCurrent(): boolean }>()
+const releaseSideChatLauncher = sideChatLauncher?.register(launchSideChatCommand)
 const workspaceReferences = inject(WORKSPACE_REFERENCES_KEY, null)
 const workspaceFiles = inject(WORKSPACE_FILES_KEY, null)
 const terminal = inject(TERMINAL_ACCESS_KEY, null)
@@ -968,16 +973,50 @@ function openTerminal() {
   }
 }
 
-function openAssistantChat() {
-  if (!canOpenAssistantChat.value) return
+function openAssistantChat(): WorkbenchItem | null {
+  if (!canOpenAssistantChat.value) return null
   const item = createAssistantChatWorkbenchItem(props.sessionId,
     props.workspaceReady ? props.workspaceId || undefined : undefined,
     t('workbench.newPanel.assistantChat'))
   if (!store.openItem(item)) {
     pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+    return null
   } else {
     store.requestReveal()
   }
+  return item
+}
+
+async function launchSideChatCommand(request: SideChatLaunchRequest): Promise<boolean> {
+  const workspaceId = props.workspaceId
+  const current = () => request.isCurrent() && props.routeActive && props.enabled && !props.modalBlocked
+    && request.parentKey === props.sessionId && props.workspaceId === workspaceId
+    && sessionReady.value && !panelContextLoading.value && canOpenAssistantChat.value
+  if (!props.sessionDurable || !props.conversationStarted) throw new Error(t('chat.slashCommands.side.requiresStarted'))
+  if (!current()) throw new Error(t('chat.slashCommands.side.unavailable'))
+  // The parent retains only its current hand-off. Discard superseded drafts,
+  // while keeping the current closed-tab tombstone so uncertain delivery can
+  // never silently become a second child send.
+  for (const [id, launch] of sideChatLaunchItems) {
+    if (!launch.isCurrent()) sideChatLaunchItems.delete(id)
+  }
+  let itemId = sideChatLaunchItems.get(request.requestId)?.itemId
+  if (itemId && !store.items.some(item => item.id === itemId)) throw new Error(t('chat.slashCommands.side.closed'))
+  if (!itemId) {
+    const item = openAssistantChat()
+    if (!item) return false
+    itemId = item.id
+    sideChatLaunchItems.set(request.requestId, { itemId, isCurrent: request.isCurrent })
+  } else {
+    store.activateItem(itemId)
+    store.setExpanded(true)
+    store.requestReveal()
+  }
+  closeNewPanelMenu()
+  await nextTick()
+  if (!current()) return false
+  const accepted = await sideChatHandles.get(itemId)?.launchSideChat({ ...request, isCurrent: current }) ?? false
+  return accepted
 }
 
 function reopenBrowser() {
@@ -1561,6 +1600,11 @@ function isActiveAnnotationToolbarItem(toolbarItem: WorkbenchToolbarItem): boole
 }
 
 function setPanelHandle(item: WorkbenchItem, value: unknown) {
+  if (item.kind === 'assistant-chat') {
+    if (value && typeof (value as SideChatLaunchHandle).launchSideChat === 'function') {
+      sideChatHandles.set(item.id, value as SideChatLaunchHandle)
+    } else sideChatHandles.delete(item.id)
+  }
   runtimeManager.setComponentHandle(item, value)
 }
 
@@ -2004,6 +2048,9 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  releaseSideChatLauncher?.()
+  sideChatHandles.clear()
+  sideChatLaunchItems.clear()
   panelOpeningGeneration += 1
   document.removeEventListener('pointerdown', onNewPanelOutside, true)
   window.removeEventListener('resize', onNewPanelViewportChange)

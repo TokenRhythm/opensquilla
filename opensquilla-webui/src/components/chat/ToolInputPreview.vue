@@ -52,7 +52,13 @@ function toggle() { emit('toggleItem', stateId.value, !props.open) }
 .tool-input-preview__summary:hover .tool-input-preview__chevron,
 .tool-input-preview__summary:focus-visible .tool-input-preview__chevron { opacity: 1; }
 .tool-input-preview__chevron--open { transform: rotate(90deg); }
-.tool-input-preview__summary:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.tool-input-preview__summary:hover .tool-input-preview__label,
+.tool-input-preview__summary:hover .tool-input-preview__path,
+.tool-input-preview__summary:focus-visible .tool-input-preview__label,
+.tool-input-preview__summary:focus-visible .tool-input-preview__path { color: var(--text); }
+.tool-input-preview__summary:focus-visible { outline: none; box-shadow: none; }
+.tool-input-preview__summary:focus-visible .tool-input-preview__label,
+.tool-input-preview__summary:focus-visible .tool-input-preview__path { text-decoration: underline; text-underline-offset: 0.2em; }
 .tool-input-preview__note { margin: 0.375rem 0; font-size: 0.75rem; color: var(--text-dim); }
 @media (pointer: coarse) { .tool-input-preview__summary { min-height: 2.75rem; } }
 </style>

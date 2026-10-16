@@ -431,6 +431,25 @@ describe('explicit send scroll ownership', () => {
     expect(accepted).not.toHaveBeenCalled()
   })
 
+  it('retains the original delivery observer when a manual retry replaces its UI callback', async () => {
+    const h = queuedSendHarness()
+    const delivered = vi.fn(), originalUi = vi.fn(), retryUi = vi.fn()
+    h.commands.send.mockRejectedValueOnce(new TurnCommandError('rejected', 'synthetic refusal', 'REFUSED', false, true))
+    await h.api.onSend({ onDeliveryAccepted: delivered, onAccepted: originalUi })
+    const originalRequestId = h.commands.send.mock.calls[0]![0].params.clientRequestId
+    expect(delivered).not.toHaveBeenCalled()
+    expect(h.options.inputText.value).toBe('unrelated composer draft')
+    await h.api.onSend({ onAccepted: retryUi })
+    expect(h.commands.send).toHaveBeenCalledTimes(2)
+    expect(h.commands.send.mock.calls[1]![0].params.clientRequestId).toBe(originalRequestId)
+    expect(delivered).toHaveBeenCalledOnce()
+    expect(originalUi).not.toHaveBeenCalled()
+    expect(retryUi).toHaveBeenCalledOnce()
+    h.options.inputText.value = 'a separate later message'
+    await h.api.onSend()
+    expect(delivered).toHaveBeenCalledOnce()
+  })
+
   it('follows the new user turn even when the stream reducer does not change scroll intent', async () => {
     const h = queuedSendHarness()
     expect(h.options.autoScroll.value).toBe(false)

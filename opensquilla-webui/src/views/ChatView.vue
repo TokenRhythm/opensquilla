@@ -1129,6 +1129,8 @@ import {
 } from '@/utils/chat/chatScrollOwnership'
 import { activateAssistantActivitySession, releaseAssistantActivitySession, assistantActivityContinuityKey, clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import { LOCAL_SESSIONS_DELETED_EVENT, localSessionsDeletedDetail } from '@/utils/sessionSync'
+import { parseSideChatCommand, useSideChatLauncher, type SideChatLaunchRequest } from '@/modules/sideChatLauncher'
+import { useSideChatCommand } from '@/composables/chat/useSideChatCommand'
 import { stripBackgroundProcessNoticeTimeline } from '@/utils/chat/backgroundProcessNotice'
 import {
   resolveChatHistoryRecoveryState,
@@ -3623,7 +3625,18 @@ const goalOutcomeHasMessageAnchor = computed(() => (
   goalHasRenderedTerminalAnchor(goalOutcomeGoal.value, renderedMessages.value)
 ))
 
+const sideChatCommand = useSideChatCommand({
+  launcher: useSideChatLauncher(), inputText: composerText, sessionKey, revision: composerRevision,
+  identity: () => gatewayAccess.deliveryIdentity,
+  allowed: () => conversationSlashActionAllowed(conversationPolicy.value, 'workbench.openSideChat'),
+  active: () => !chatViewDisposed && chatViewActive && !props.ownerBlocked,
+  hasAttachments: () => pendingAttachments.value.length > 0 || selectedSkills.value.length > 0
+    || localPaths.value.length > 0 || sendableAnnotationDraftIds.value.length > 0
+    || Boolean(visualizeDraft.snapshot.value) || goalDraftArmed.value || Boolean(replanTarget.value),
+  notify: message => pushToast(message, { duration: 6000 }), translate: key => t(key), resized: autoResizeTextarea,
+})
 const chatSlashCommands = useChatSlashCommands({
+  sideChat: sideChatCommand,
   commandAllowed: command => conversationSlashActionAllowed(conversationPolicy.value, command.execution?.action || command.cmd),
   skillCatalog,
   selectedSkills,
@@ -3980,6 +3993,10 @@ watch(
 async function onSend(
   sendOptions?: Parameters<typeof dispatchCurrentInput>[0],
 ): Promise<void> {
+  if (!sendOptions?.bypassSlashCommand && parseSideChatCommand(composerText.value)) {
+    await sideChatCommand.run(composerText.value)
+    return
+  }
   if (browserUseSelectionPending.value) return
   if (props.ownerBlocked) return
   if (props.embedded && !sessionKey.value) {
@@ -4019,6 +4036,52 @@ async function onSend(
   }
   await dispatchCurrentInput(sendOptions)
 }
+
+// Both ordinary side typing and a slash-command hand-off use this view's one
+// sender/receipt ledger. A retry keeps the same child and its recovered attempt.
+const sideLaunchAccepted = new Set<string>()
+const sideLaunchPending = new Map<string, Promise<boolean>>()
+async function launchSideChat(request: SideChatLaunchRequest): Promise<boolean> {
+  if (!props.embedded || props.workbenchOwnerSessionKey !== request.parentKey || !request.isCurrent()
+    || chatViewDisposed || props.ownerBlocked) return false
+  if (sideLaunchAccepted.has(request.requestId)) return true
+  if (!request.text) {
+    await nextTick()
+    if (!request.isCurrent()) return false
+    composerRef.value?.focusTextarea()
+    return true
+  }
+  const pending = sideLaunchPending.get(request.requestId)
+  if (pending) return pending
+  const hasExtraDraftContent = () => pendingAttachments.value.length > 0 || selectedSkills.value.length > 0
+    || localPaths.value.length > 0 || sendableAnnotationDraftIds.value.length > 0
+    || Boolean(visualizeDraft.snapshot.value) || goalDraftArmed.value || Boolean(replanTarget.value)
+  if (hasExtraDraftContent()) return false
+  if (composerText.value && composerText.value !== request.text) return false
+  composerText.value = request.text
+  autoResizeTextarea()
+  composerRef.value?.focusTextarea()
+  // Restoring equivalent empty draft collections is not a user edit.
+  // Track semantic draft changes here, permanently fencing even an
+  // edit-then-undo, before the shared sender takes its own immutable snapshot.
+  let childDraftChanged = false
+  const stopDraftWatch = watch([composerText, hasExtraDraftContent], () => {
+    if (composerText.value !== request.text || hasExtraDraftContent()) childDraftChanged = true
+  }, { flush: 'sync' })
+  const draftIsCurrent = () => request.isCurrent() && !childDraftChanged
+    && composerText.value === request.text && !hasExtraDraftContent()
+  const sending = (async () => {
+    await nextTick()
+    if (!draftIsCurrent()) return false
+    await onSend({ bypassSlashCommand: true, cancelIfComposerChanged: true,
+      preflightGuard: draftIsCurrent, preDispatchGuard: request.isCurrent,
+      onDeliveryAccepted: () => { sideLaunchAccepted.add(request.requestId) } })
+    return sideLaunchAccepted.has(request.requestId)
+  })().finally(() => { stopDraftWatch(); sideLaunchPending.delete(request.requestId) })
+  sideLaunchPending.set(request.requestId, sending)
+  return sending
+}
+defineExpose({ launchSideChat })
 sendCurrentInput = onSend
 
 function flushPendingAutoSend(targetSessionKey: string): boolean {
@@ -4099,6 +4162,7 @@ watch(composerSameTurnSteerAvailable, (available) => {
 })
 
 async function onComposerSend() {
+  if (parseSideChatCommand(composerText.value)) { await sideChatCommand.run(composerText.value); return }
   // All composer submission modes, including keyboard-driven plan revision,
   // share the same fail-closed delivery gate.
   if (composerSendBlockedMessage.value) {
