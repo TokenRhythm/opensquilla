@@ -469,7 +469,16 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("size_mib", [0, 48, 50])
+@pytest.mark.parametrize(
+    "size_mib",
+    [
+        0,
+        # Large real Gateway uploads and persistence writes must not compete
+        # with the shared CI worker pool's disk I/O.
+        pytest.param(48, marks=pytest.mark.ci_serial),
+        pytest.param(50, marks=pytest.mark.ci_serial),
+    ],
+)
 async def test_current_turn_pdf_is_materialized_to_workspace_path(
     _e2e_stack: dict[str, Any],
     size_mib: int,
@@ -577,7 +586,15 @@ async def test_current_turn_inline_pdf_is_materialized_to_workspace_path(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("size_mib", [0, 50])
+@pytest.mark.parametrize(
+    "size_mib",
+    [
+        0,
+        # Keep large historical materialization outside the shared CI worker
+        # pool while retaining its terminal-event and task-drain deadlines.
+        pytest.param(50, marks=pytest.mark.ci_serial),
+    ],
+)
 async def test_historical_pdf_followup_materializes_path_from_sha256_ref(
     _e2e_stack: dict[str, Any],
     size_mib: int,

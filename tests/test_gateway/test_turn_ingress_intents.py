@@ -108,7 +108,8 @@ async def _open_intent_stack(db_path: Path) -> AsyncIterator[_IntentStack]:
         for reservations in list(runtime._reservations_by_session.values()):
             for reservation in list(reservations):
                 await runtime.abort_reservation(reservation)
-        await runtime.shutdown(cancel=True, timeout=2.0)
+        # Settle durable activation writes before closing their storage connection.
+        await runtime.shutdown(cancel=True, timeout=15.0)
         await storage.close()
 
 
@@ -1058,7 +1059,13 @@ async def test_reset_cannot_overtake_a_committed_continue_before_activation(
         assert reset_request is not None
         reset_response = await asyncio.wait_for(reset_request, timeout=4.0)
         assert reset_response.ok is True
-        await stack.wait_until_running()
+        # Activation persists task state before handler entry. Check completed
+        # execution without imposing a two-second deadline on those disk writes.
+        stack.release_handler.set()
+        reset_terminal = await stack.runtime.wait(
+            str(reset_response.payload["task_id"]), timeout=15.0,
+        )
+        assert str(reset_terminal.status) == "succeeded"
         assert [run.message for run in stack.handler_runs] == ["reset turn"]
 
 

@@ -106,6 +106,9 @@ def _assert_previous(service, loader, operation):
         assert skill is not None and "Old instructions." in skill.content
 
 
+# Exercise real receipt, journal and catalog writes with concurrent owners while
+# keeping the bounded thread gates isolated from unrelated CI filesystem load.
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("operation", ["install", "update", "uninstall"])
 @pytest.mark.parametrize("cancelled", [False, True])
 @pytest.mark.parametrize("fallback", [False, True])
