@@ -149,12 +149,6 @@
           @dismiss="chatSessionBootstrap.dismissRecoveryNotice()"
           @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
         />
-        <ChatDeliveryRecoveryStatus
-          v-if="!forkTransition"
-          :entries="chatSend.deliveryRecoveryEntries.value"
-          :checking-ids="chatSend.checkingDeliveryIds.value"
-          @check="chatSend.checkDelivery"
-        />
         <div
           v-if="!forkTransition && showConfirmedEmptySession"
           class="chat-empty"
@@ -645,6 +639,12 @@
       />
     </div>
 
+    <ChatDeliveryRecoveryStatus
+      v-if="!forkTransition && !shareMode"
+      :entries="chatSend.deliveryRecoveryEntries.value"
+      :checking-ids="chatSend.checkingDeliveryIds.value"
+      @check="chatSend.checkDelivery"
+    />
     <ChatModelSetupNotice v-if="!shareMode" />
     <ChatComposer
       ref="composerRef"
@@ -2631,28 +2631,20 @@ const chatHistory = useChatHistory({
   scrollToBottom,
   onHistoryInstalled: sessionViewCache.historyInstalled,
   initialWindowSize: () => sessionViewCache.showingPreview.value ? sessionViewCache.messages.value.length : 0,
-  onTerminalTask: (outcome, { historyInstalled }) => {
+  onTerminalTask: outcome => {
     const taskId = outcome.taskId || ''
     if (!taskId) return
     const ownsLiveStream = activeStreamTaskId.value === taskId
     const ownsRunStatus = chatTaskId(runStatus.value.task) === taskId
-    if (historyInstalled && sessionViewCache.presentation.value?.stoppableTaskId === taskId) {
-      // The terminal fact settles controls immediately, but a failed or partial
-      // history bridge must not discard the last readable presentation.
+    if (sessionViewCache.presentation.value?.stoppableTaskId === taskId) {
+      // Durable completion supersedes the cached in-progress picture, even if
+      // transport recovery has not installed a new live snapshot yet.
       sessionViewCache.retirePreview(sessionKey.value)
     }
-    if (historyInstalled) return
     // An older finished turn does not resolve the current owner's hydration.
     taskOwnership.noteTerminal(taskId, ownsLiveStream || ownsRunStatus)
     if (ownsLiveStream) {
-      const messageCount = messages.value.length
-      chatStream.endStreaming(['cancelled', 'abandoned', 'interrupted'].includes(outcome.status)
-        ? { reason: 'aborted' } : undefined)
-      const completedAssistant = messages.value[messageCount]
-      if (completedAssistant?.role === 'assistant') {
-        completedAssistant.turnId = outcome.turnId
-        completedAssistant.turnOutcome = outcome
-      }
+      resetStreamLiveTurnState()
       activeStreamTaskId.value = outcome.status === 'cancelled'
         ? STOPPED_STREAM_TASK_ID
         : FINISHED_STREAM_TASK_ID

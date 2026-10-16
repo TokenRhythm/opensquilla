@@ -3397,11 +3397,6 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (stoppedByUser) {
           observePendingAcceptance(attempt)
-        } else if (options.sessionKey.value === requestSessionKey) {
-          // Another session's send can replace this view's render token while
-          // its ACK is pending. Losing render ownership is not a Stop intent;
-          // reconcile the accepted task without cancelling background work.
-          options.scheduleHistorySync()
         }
         if (
           stoppedByUser

@@ -92,6 +92,198 @@ async function visibleFailures(page: Page): Promise<string[]> {
   }).__sessionReliabilityFailures)
 }
 
+/** Passive observation only: healthy requests, acknowledgements and events
+ * travel over the production socket without a route or a response shim. */
+function observeHealthyAdmission(page: Page) {
+  const sends: Send[] = []
+  const aborts: Request[] = []
+  const receipts: Request[] = []
+  const startedAt = performance.now()
+  const timings: Array<{ event: string; elapsedMs: number }> = []
+  const mark = (event: string) => timings.push({ event, elapsedMs: performance.now() - startedAt })
+  page.on('websocket', socket => {
+    const pending = new Map<string, Send>()
+    socket.on('framesent', ({ payload }) => {
+      const frame = JSON.parse(String(payload)) as Request
+      if (frame.type !== 'req') return
+      if (frame.method === 'chat.send') {
+        const send = { request: frame }
+        sends.push(send)
+        pending.set(frame.id, send)
+        mark(`send-${sends.length}`)
+      }
+      if (frame.method === 'chat.abort') aborts.push(frame)
+      if (frame.method.includes('receipt')) receipts.push(frame)
+    })
+    socket.on('framereceived', ({ payload }) => {
+      const frame = JSON.parse(String(payload)) as Record<string, unknown>
+      const send = frame.type === 'res' ? pending.get(String(frame.id)) : undefined
+      if (!send) return
+      send.acknowledgement = frame
+      pending.delete(String(frame.id))
+      mark(`ack-${sends.indexOf(send) + 1}`)
+    })
+  })
+  return { sends, aborts, receipts, timings, mark }
+}
+
+test('healthy consecutive turns preserve answers and the next draft through A → B → A and reload', async ({
+  page, isolatedRealGateway,
+}, testInfo) => {
+  test.setTimeout(120_000)
+  await observeVisibleFailures(page)
+  await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+  const network = observeHealthyAdmission(page)
+  const rendererErrors: string[] = []
+  page.on('pageerror', error => rendererErrors.push(error.message))
+  await page.goto(`${isolatedRealGateway.controlUrl}chat?session=${encodeURIComponent(SESSION_A)}`)
+  const input = page.locator('.chat-textarea')
+  const send = page.locator('.chat-send-btn[aria-label="Send"]')
+  const stop = page.getByRole('button', { name: 'Stop current response', exact: true })
+  const recovery = page.getByTestId('chat-delivery-recovery')
+  const firstPrompt = 'Complete this ordinary first turn without an admission fault.'
+  const secondPrompt = 'Continue this same conversation with an ordinary second turn.'
+  const firstAnswer = 'Task one completed after the lifecycle checks.'
+  const secondAnswer = 'Task two completed after Goal removal.'
+  const answer = (text: string) => page.locator('.msg-ai').filter({ hasText: text })
+
+  await input.fill(firstPrompt)
+  await expect(recovery).toHaveCount(0)
+  await expect(send).toBeEnabled()
+  await send.click()
+  await expect.poll(() => network.sends[0]?.acknowledgement?.ok).toBe(true)
+  await expect.poll(async () => (await isolatedRealGateway.readProviderCalls()).length).toBe(1)
+  await expect(stop).toBeVisible()
+  await expect(recovery).toHaveCount(0)
+  await input.fill(secondPrompt)
+  network.mark('release-first-provider')
+  await isolatedRealGateway.releaseFirstTask()
+  await expect(answer(firstAnswer)).toBeVisible({ timeout: 30_000 })
+  await expect(stop).toHaveCount(0)
+  await expectComposerValue(input, secondPrompt)
+  network.mark('first-answer-visible')
+  await expect(send).toBeEnabled()
+  await send.click()
+  await expect.poll(() => network.sends[1]?.acknowledgement?.ok).toBe(true)
+  await expect.poll(async () => (await isolatedRealGateway.readProviderCalls()).length).toBe(2)
+  await expect(stop).toBeVisible()
+  const draft = 'Keep this unsent next draft after completion, navigation and reload.'
+  await input.fill(draft)
+  await expect(recovery).toHaveCount(0)
+  await page.locator(`[data-session-key="${SESSION_B}"] .sidebar-history-item`).click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SESSION_B)
+  await expectComposerValue(input, '')
+  await expect(stop).toHaveCount(0)
+  await expect(recovery).toHaveCount(0)
+  await page.locator(`[data-session-key="${SESSION_A}"] .sidebar-history-item`).click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SESSION_A)
+  await expect(answer(firstAnswer)).toBeVisible()
+  await expectComposerValue(input, draft)
+  await expect(stop).toBeVisible()
+  await expect(recovery).toHaveCount(0)
+  expect(network.aborts).toEqual([])
+  network.mark('release-second-provider')
+  await isolatedRealGateway.releaseSecondTask()
+  await expect(answer(secondAnswer)).toBeVisible({ timeout: 30_000 })
+  await expect(stop).toHaveCount(0)
+  await expect(recovery).toHaveCount(0)
+  await expectComposerValue(input, draft)
+  network.mark('second-answer-visible')
+
+  await page.locator(`[data-session-key="${SESSION_B}"] .sidebar-history-item`).click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SESSION_B)
+  await expectComposerValue(input, '')
+  await page.locator(`[data-session-key="${SESSION_A}"] .sidebar-history-item`).click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SESSION_A)
+  await expect(answer(firstAnswer)).toHaveCount(1)
+  await expect(answer(secondAnswer)).toHaveCount(1)
+  await expectComposerValue(input, draft)
+  expect(await visibleFailures(page)).toEqual([])
+  await page.reload()
+  await expect(answer(firstAnswer)).toBeVisible({ timeout: 30_000 })
+  await expect(answer(secondAnswer)).toBeVisible()
+  await expect(answer(firstAnswer)).toHaveCount(1)
+  await expect(answer(secondAnswer)).toHaveCount(1)
+  await expect(page.locator('.msg-user').filter({ hasText: firstPrompt })).toHaveCount(1)
+  await expect(page.locator('.msg-user').filter({ hasText: secondPrompt })).toHaveCount(1)
+  await expectComposerValue(input, draft)
+  await expect(send).toBeEnabled()
+  await expect(stop).toHaveCount(0)
+  await expect(recovery).toHaveCount(0)
+  network.mark('answers-and-draft-restored')
+
+  expect(network.sends.map(item => item.request.params?.sessionKey)).toEqual([SESSION_A, SESSION_A])
+  expect(network.aborts).toEqual([])
+  expect(network.receipts).toEqual([])
+  const providerCalls = await isolatedRealGateway.readProviderCalls()
+  expect(providerCalls.map(call => call.callNumber)).toEqual([1, 2])
+  expect(providerCalls[1]?.firstReplyInAssistantHistory).toBe(true)
+  expect(await visibleFailures(page)).toEqual([])
+  expect(rendererErrors).toEqual([])
+  await page.screenshot({ path: testInfo.outputPath('healthy-consecutive-turns-after-reload.png') })
+  const evidencePath = testInfo.outputPath('healthy-consecutive-turns.json')
+  await writeFile(evidencePath, JSON.stringify({ userAgent: await page.evaluate(() => navigator.userAgent),
+    sends: network.sends, aborts: network.aborts, receipts: network.receipts,
+    providerCalls, timings: network.timings }, null, 2))
+  await testInfo.attach('healthy-consecutive-turns', { path: evidencePath, contentType: 'application/json' })
+})
+
+test('healthy explicit Stop cancels only its accepted task and preserves the next draft after reload', async ({
+  page, isolatedRealGateway,
+}, testInfo) => {
+  test.setTimeout(90_000)
+  await observeVisibleFailures(page)
+  await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+  const network = observeHealthyAdmission(page)
+  const rendererErrors: string[] = []
+  page.on('pageerror', error => rendererErrors.push(error.message))
+  await page.goto(`${isolatedRealGateway.controlUrl}chat?session=${encodeURIComponent(SESSION_B)}`)
+  const input = page.locator('.chat-textarea')
+  const send = page.locator('.chat-send-btn[aria-label="Send"]')
+  const stop = page.getByRole('button', { name: 'Stop current response', exact: true })
+  const recovery = page.getByTestId('chat-delivery-recovery')
+  const prompt = 'Wait for my explicit Stop on this ordinary accepted task.'
+  const draft = 'This next draft is unsent and must survive my explicit Stop.'
+  await input.fill(prompt)
+  await expect(recovery).toHaveCount(0)
+  await expect(send).toBeEnabled()
+  await send.click()
+  await expect.poll(() => network.sends[0]?.acknowledgement?.ok).toBe(true)
+  await expect.poll(async () => (await isolatedRealGateway.readProviderCalls()).length).toBe(1)
+  await expect(stop).toBeVisible()
+  await expect(recovery).toHaveCount(0)
+  await input.fill(draft)
+  await stop.click()
+  await expect.poll(() => network.aborts.length).toBe(1)
+  await expect(stop).toHaveCount(0, { timeout: 15_000 })
+  await expectComposerValue(input, draft)
+  await expect(recovery).toHaveCount(0)
+  expect(await visibleFailures(page)).toEqual([])
+  await page.reload()
+  await expectComposerValue(input, draft)
+  await expect(page.locator('.msg-user').filter({ hasText: prompt })).toHaveCount(1)
+  await expect(stop).toHaveCount(0)
+  await expect(send).toBeEnabled()
+  await expect(recovery).toHaveCount(0)
+
+  expect(network.sends.map(item => item.request.params?.sessionKey)).toEqual([SESSION_B])
+  expect(network.aborts.map(item => item.params?.sessionKey)).toEqual([SESSION_B])
+  const accepted = network.sends[0]!.acknowledgement?.payload as Record<string, unknown>
+  expect(accepted.task_id).toEqual(expect.any(String))
+  expect(network.aborts[0]!.params?.taskId).toBe(accepted.task_id)
+  expect(network.receipts).toEqual([])
+  const providerCalls = await isolatedRealGateway.readProviderCalls()
+  expect(providerCalls.map(call => call.callNumber)).toEqual([1])
+  expect(await visibleFailures(page)).toEqual([])
+  expect(rendererErrors).toEqual([])
+  await page.screenshot({ path: testInfo.outputPath('healthy-explicit-stop-after-reload.png') })
+  const evidencePath = testInfo.outputPath('healthy-explicit-stop.json')
+  await writeFile(evidencePath, JSON.stringify({ userAgent: await page.evaluate(() => navigator.userAgent),
+    sends: network.sends, aborts: network.aborts, receipts: network.receipts,
+    providerCalls, timings: network.timings }, null, 2))
+  await testInfo.attach('healthy-explicit-stop', { path: evidencePath, contentType: 'application/json' })
+})
+
 test('late acceptance after A → B send → A never cancels the accepted A task', async ({
   page, isolatedRealGateway,
 }, testInfo) => {

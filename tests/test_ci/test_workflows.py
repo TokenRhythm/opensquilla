@@ -2530,7 +2530,7 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "queue-steer.spec.ts",
         "session-created-card.spec.ts",
         "session-chat-reliability.real.spec.ts",
-        "session-history-bridge-reliability.spec.ts",
+        "session-delivery-feedback.spec.ts",
         "session-switch-transport.spec.ts",
         "share.spec.ts",
         "user-message-newlines.spec.ts",

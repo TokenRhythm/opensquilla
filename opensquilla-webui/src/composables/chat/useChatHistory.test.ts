@@ -3469,7 +3469,7 @@ describe('useChatHistory optimistic local rows', () => {
     expect(onTerminalTask).toHaveBeenCalledWith(expect.objectContaining({
       taskId: 'task-cancelled',
       status: 'cancelled',
-    }), { historyInstalled: true })
+    }))
   })
 
   it('restores usage barrier activity and its retryable error from terminal history', async () => {

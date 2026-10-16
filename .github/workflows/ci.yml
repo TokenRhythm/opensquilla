@@ -912,7 +912,7 @@ jobs:
           user-message-newlines.spec.ts
           session-created-card.spec.ts
           session-chat-reliability.real.spec.ts
-          session-history-bridge-reliability.spec.ts
+          session-delivery-feedback.spec.ts
           session-switch-transport.spec.ts
           new-task-ensemble-race.spec.ts
           ensemble-new-task-legacy-turn.spec.ts
