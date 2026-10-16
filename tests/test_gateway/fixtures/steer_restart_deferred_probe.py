@@ -162,7 +162,11 @@ async def scenario(directory: Path, fault: str) -> None:
             with patch.object(storage.conn, "commit", delayed_commit):
                 result = await original_terminal(*args, **kwargs)
             assert commits == 1, "slow control did not preserve one real terminal commit"
-            assert time.monotonic() - started >= 2.1
+            # asyncio timers may wake within one clock-resolution tick early.
+            # Prove that the old two-second guard is exceeded, not timer precision.
+            elapsed = time.monotonic() - started
+            print(f"terminal_commit_elapsed_seconds={elapsed:.6f}", flush=True)
+            assert elapsed > 2.0, "slow control did not exceed the old two-second guard"
             return result
         return await original_terminal(*args, **kwargs)
 
