@@ -360,12 +360,16 @@ def test_windows_acceptance_checks_out_and_verifies_the_callers_immutable_candid
     verify_name = "Verify fresh first interaction or retained upgrade and restart"
     verify = next(s for s in jobs["upgrade-and-start"]["steps"] if s.get("name") == verify_name)
     assert "(git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA" in verify["run"]
-    assert "$manifest.sourceSha -ne (git rev-parse HEAD).Trim()" in verify["run"]
-    assert "$manifest.installerSha256" in verify["run"]
+    assert "needs" not in jobs["upgrade-and-start"]
+    assert "'--candidate-artifact-name', 'nsis-regression-installer'" in verify["run"]
+    assert "'--candidate-source-sha', $env:GITHUB_SHA" in verify["run"]
+    assert verify["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert _workflow("windows-nsis-upgrade-regression.yml")["permissions"]["actions"] == "read"
     policy = json.loads(Path(".github/ci/trust-policy.v1.json").read_text(encoding="utf-8"))
     assert {
         ".github/workflows/windows-nsis-upgrade-regression.yml",
         ".github/scripts/verify-nsis-upgrade-regression.py",
+        ".github/scripts/wait_ci_candidate.py",
     } <= set(policy["merge_critical_inputs"])
 
 

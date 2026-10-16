@@ -109,7 +109,7 @@ def test_native_acceptance_evidence_covers_the_actual_reusable_matrix(
     ))["jobs"]["candidate-probe"]
     expected.update((probes["runs-on"], f"candidate-{probe}")
                     for probe in probes["strategy"]["matrix"]["probe"])
-    assert len(expected) == count + 10
+    assert len(expected) == count + 11
     for path in paths:
         plan = _plan(tmp_path, suite_config, path)
         assert plan["windows_nsis_profile"] == profile
@@ -135,7 +135,7 @@ def test_installer_and_historical_data_changes_keep_all_upgrade_cases(
 ) -> None:
     plan = _plan(tmp_path, suite_config, "opensquilla-webui/package-lock.json", path)
     assert plan["windows_nsis_profile"] == "full"
-    assert len(_platform_cells(plan, "windows-nsis-regression")) == 24
+    assert len(_platform_cells(plan, "windows-nsis-regression")) == 25
 
 
 @pytest.mark.parametrize("path", [
@@ -159,7 +159,7 @@ def test_uncertain_and_explicit_full_plans_never_downgrade_native_acceptance(
     plan = _plan(tmp_path, suite_config, *paths)
     assert plan["full_fallback"] is True
     assert plan["windows_nsis_profile"] == "full"
-    assert len(_platform_cells(plan, "windows-nsis-regression")) == 24
+    assert len(_platform_cells(plan, "windows-nsis-regression")) == 25
 
 
 def test_nsis_smoke_keeps_exactly_the_two_upgrade_and_two_fresh_cases() -> None:

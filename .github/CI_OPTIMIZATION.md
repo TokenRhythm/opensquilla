@@ -95,6 +95,29 @@ This is one paired observation, not an estimate of stable CI latency. Runner
 images, hardware and cache contents were not experimentally fixed, and the
 slower installation cases remain the final critical path.
 
+### Overlapping baseline installation and independent startup checks
+
+Upgrade VMs now begin alongside the NSIS producer. Each audit installs and
+verifies the pinned old release, retained synthetic profile and registry state
+on its own VM, then waits for the candidate without acquiring the fault lock.
+The wait binds the artifact archive digest, installer and manifest to the
+checked-out source, workflow, run and successful producer attempt. A failed-only
+rerun may reuse its exact earlier successful producer; a failed current producer
+cannot fall back. Producer failure fails the audit. The wait retains the existing
+60-minute producer budget; the consumer job contains that wait plus its original
+45-minute acceptance budget. Installer and interaction deadlines are unchanged.
+
+Gateway and Desktop startup compatibility run on independent VMs. Both original
+seven-configuration, two-start harnesses are unchanged. Each consumer retains
+installation, candidate identity, optional signing verification and uninstallation.
+Full/smoke evidence now requires 25/15 cells; omitting either startup cell fails
+attestation. Fresh installs and all fourteen full-profile upgrade cases remain.
+
+Runner durations now include explicit waiting for the candidate. Compare total
+wall time and the interval from candidate availability to final acceptance, not
+upgrade job duration alone. Remote timing for this second experiment is recorded
+after the first complete run, including every failure.
+
 ## Test cost and ownership
 
 The ordinary offline suite excludes `stress`. The required `python-stress` suite

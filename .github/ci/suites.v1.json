@@ -244,6 +244,7 @@
         ".github/actions/download-required-artifact/action.yml",
         ".github/scripts/audit_dependencies.py",
         ".github/scripts/verify-nsis-upgrade-regression.py",
+        ".github/scripts/wait_ci_candidate.py",
         ".github/scripts/verify-packaged-ownership-long-paths.py",
         ".github/scripts/verify-packaged-startup-compatibility.py",
         ".github/scripts/verify-packaged-v054-upgrade.py",

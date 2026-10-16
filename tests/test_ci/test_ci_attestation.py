@@ -724,8 +724,8 @@ def test_validate_candidate_rejects_self_reported_incomplete_suite_coverage(
 
 
 @pytest.mark.parametrize(("changed", "case_count"), [
-    ("opensquilla-webui/package-lock.json", 14),
-    ("desktop/electron/package-lock.json", 24),
+    ("opensquilla-webui/package-lock.json", 15),
+    ("desktop/electron/package-lock.json", 25),
 ])
 def test_exact_dependency_evidence_cannot_omit_native_acceptance_or_one_install_case(
     tmp_path: Path, changed: str, case_count: int,
@@ -748,7 +748,10 @@ def test_exact_dependency_evidence_cannot_omit_native_acceptance_or_one_install_
         "current_pull_request": {"number": 42, **event["pull_request"]}, "repo": repo,
     }
     validate_candidate(attestation=evidence, **arguments)
-    for mutation in ("omitted-suite", "omitted-fresh", "changed-execution", "changed-profile"):
+    for mutation in (
+        "omitted-suite", "omitted-fresh", "omitted-startup-gateway", "omitted-startup-desktop",
+        "changed-execution", "changed-profile",
+    ):
         tampered = json.loads(json.dumps(evidence))
         if mutation == "omitted-suite":
             tampered["successful_suites"].remove(suite)
@@ -759,11 +762,16 @@ def test_exact_dependency_evidence_cannot_omit_native_acceptance_or_one_install_
             tampered["platform_matrix"] = [c for c in tampered["platform_matrix"]
                                             if not (c["suite"] == suite
                                                     and c["shard"] == "fresh-custom-fresh")]
+        elif mutation.startswith("omitted-startup-"):
+            omitted = "candidate-startup-compat-" + mutation.removeprefix("omitted-startup-")
+            tampered["platform_matrix"] = [c for c in tampered["platform_matrix"]
+                                            if not (c["suite"] == suite
+                                                    and c["shard"] == omitted)]
         elif mutation == "changed-profile":
             full = MODULE["_plan_paths"](repo, [".ci/run-all"])
             other = (
                 [c for c in full["platform_matrix"] if c["suite"] == suite]
-                if case_count == 14 else [
+                if case_count == 15 else [
                     c for c in evidence["platform_matrix"]
                     if c["suite"] == suite and c["shard"] != "0.5.3-default-readlock"
                 ]
@@ -1236,7 +1244,7 @@ def test_partial_queue_supplements_only_invalidated_allowlisted_suites(
     assert "windows-nsis-regression" in plan["required_suites"]
     native_cells = [c for c in plan["platform_matrix"]
                     if c["suite"] == "windows-nsis-regression"]
-    assert len(native_cells) == 24
+    assert len(native_cells) == 25
     assert plan["windows_nsis_profile"] == "full"
 
 

@@ -18,6 +18,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -207,6 +208,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: nsis-regression-installer
+          overwrite: true
           path: |
             dist/desktop-electron/OpenSquilla-*-win-x64.exe
             dist/desktop-electron/audit-candidate.json
@@ -373,13 +375,15 @@ jobs:
           retention-days: 14
 
   upgrade-and-start:
-    needs: build
     runs-on: windows-2022
-    timeout-minutes: 45
+    # The original 60-minute producer wait now happens inside this VM. Keep
+    # the existing 45-minute acceptance budget in addition to that wait.
+    timeout-minutes: 105
     strategy:
       fail-fast: false
-      # Each acceptance case owns a hosted VM and only reads the built installer.
-      # Let all cases start once that immutable candidate is available.
+      # Each case prepares its real baseline on its own hosted VM while build
+      # runs. The audit waits for this run/attempt's verified immutable candidate
+      # on that same VM before injecting faults or starting an upgrade.
       matrix:
         # PR smoke: four cases. Installer/migration changes, fail-closed plans,
         # nightly and standalone manual runs retain all fourteen cases.
@@ -436,27 +440,16 @@ jobs:
             Write-Warning "Transient GitHub release download failure; retrying attempt $($attempt + 1) of 3"
             Start-Sleep -Seconds (5 * $attempt)
           }
-      - uses: ./.github/actions/download-required-artifact
-        with:
-          name: nsis-regression-installer
-          path: candidate
       - name: Verify fresh first interaction or retained upgrade and restart
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $candidate = @(Get-ChildItem candidate -Filter '*.exe' -File)
-          if ($candidate.Count -ne 1) { throw 'Unexpected candidate installer count' }
-          $manifest = Get-Content candidate/audit-candidate.json -Raw | ConvertFrom-Json
           if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA) { throw 'Acceptance checkout mismatch' }
-          if ($manifest.sourceSha -ne (git rev-parse HEAD).Trim()) { throw 'Candidate source mismatch' }
-          if ((Get-FileHash -LiteralPath $candidate[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.installerSha256) { throw 'Candidate hash mismatch' }
           $arguments = @('.github/scripts/verify-nsis-upgrade-regression.py',
-            '--candidate-installer', $candidate[0].FullName, '--candidate-version', $manifest.version,
+            '--candidate-artifact-name', 'nsis-regression-installer',
             '--case', '${{ matrix.scenario }}', '--install-path', '${{ matrix.install-path }}',
-            '--candidate-source-sha', $manifest.sourceSha,
-            '--candidate-installer-sha256', $manifest.installerSha256,
-            '--candidate-asar-sha256', $manifest.asarSha256,
-            '--candidate-executable-sha256', $manifest.executableSha256,
-            '--candidate-dependency-inventory-sha256', $manifest.dependencyInventorySha256,
+            '--candidate-source-sha', $env:GITHUB_SHA,
             '--evidence-root', (Join-Path $env:RUNNER_TEMP 'nsis-regression-evidence'))
           if ('${{ matrix.scenario }}' -ne 'fresh') {
             $old = @(Get-ChildItem old -Filter '*.exe' -File)
@@ -471,7 +464,8 @@ jobs:
           name: nsis-${{ matrix.baseline }}-${{ matrix.install-path }}-${{ matrix.scenario }}
           path: |
             ${{ runner.temp }}/nsis-regression-evidence/
-            candidate/audit-candidate.json
+            !${{ runner.temp }}/nsis-regression-evidence/candidate/**
+            ${{ runner.temp }}/nsis-regression-evidence/candidate/audit-candidate.json
           if-no-files-found: warn
           retention-days: 14
   candidate-probes:

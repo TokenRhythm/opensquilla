@@ -445,7 +445,8 @@ _FIXED_PLATFORM_MATRIX: Final[dict[str, tuple[tuple[str, str], ...]]] = {
         ("windows-2022", "wheelhouse-core"),
         ("windows-2022", "wheelhouse-recommended"),
         *(("windows-2022", f"candidate-{probe}")
-          for probe in ("startup-compat", "ownership", "migration", "session")),
+          for probe in ("startup-compat-gateway", "startup-compat-desktop",
+                        "ownership", "migration", "session")),
     ),
     "skill-hub": (
         ("ubuntu-latest", "default"),

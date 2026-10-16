@@ -409,12 +409,17 @@ def test_nsis_matrix_adds_only_two_fresh_cells_with_shared_candidate_binding():
     baseline_branch = "if ('${{ matrix.scenario }}' -ne 'fresh')"
     assert baseline_branch in verify
     assert verify.index(baseline_branch) < verify.index("'--baseline-installer'")
+    assert "needs" not in job
+    assert "'--candidate-artifact-name', 'nsis-regression-installer'" in verify
+    assert "'--candidate-source-sha', $env:GITHUB_SHA" in verify
+    audit_source = (SCRIPTS / "verify-nsis-upgrade-regression.py").read_text(encoding="utf-8")
     for binding in (
         "sourceSha", "installerSha256", "asarSha256", "executableSha256",
         "dependencyInventorySha256",
     ):
-        assert f"$manifest.{binding}" in verify
-    assert "Candidate source mismatch" in verify and "Candidate hash mismatch" in verify
+        assert f"'{binding}'" in audit_source
+    assert "Candidate source mismatch" in audit_source
+    assert "Candidate installer differs from the pinned build manifest" in audit_source
     assert "& python @arguments" in verify and "if ($LASTEXITCODE -ne 0) { throw" in verify
 
 

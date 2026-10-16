@@ -105,6 +105,10 @@ def analyze(run: dict[str, Any], jobs: list[dict[str, Any]]) -> dict[str, Any]:
         "nsis_last_acceptance_finish_seconds": max(
             (row["finish_seconds"] for row in acceptance), default=None
         ),
+        "nsis_after_candidate_seconds": (
+            max(row["finish_seconds"] for row in acceptance) - build["finish_seconds"]
+            if build and acceptance else None
+        ),
         "failures": failures,
         "jobs": sorted(rows, key=lambda row: row["seconds"], reverse=True),
     }
@@ -155,8 +159,10 @@ def compare(baseline: dict[str, Any], candidate: dict[str, Any]) -> str:
         ("Summed runner time", "summed_job_seconds"),
         ("Median job-created to start (seconds)", "median_created_to_start_seconds"),
         ("NSIS candidate ready", "nsis_candidate_ready_seconds"),
-        ("NSIS first acceptance starts", "nsis_first_acceptance_start_seconds"),
+        ("NSIS first acceptance job starts (including preparation/wait)",
+         "nsis_first_acceptance_start_seconds"),
         ("NSIS last acceptance attempt finishes", "nsis_last_acceptance_finish_seconds"),
+        ("NSIS acceptance time after candidate ready", "nsis_after_candidate_seconds"),
     ]
     for label, key in metrics:
         vals = [sample[key] for sample in (baseline, candidate)]
