@@ -923,6 +923,17 @@ jobs:
           --project=chromium
           --workers=2
 
+      - name: Run production-dist message clipboard contracts serially
+        working-directory: opensquilla-webui
+        # Native copy/paste shares the OS clipboard. Keep this dedicated config
+        # separate from the parallel browser suite and preserve first-failure evidence.
+        run: >-
+          npm run test:e2e:message-copy --
+          --workers=1
+          --retries=0
+          --trace=retain-on-failure
+          --output=test-results/message-copy
+
       # Keep absolute performance gates isolated from other renderer processes.
       - name: Run production-dist long-list virtualization contracts
         working-directory: opensquilla-webui
