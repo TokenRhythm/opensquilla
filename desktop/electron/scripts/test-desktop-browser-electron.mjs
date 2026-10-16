@@ -343,7 +343,23 @@ try {
   },origin)
   assert.notEqual(replacement.targetRef,first.targetRef)
   assert.equal((await invoke({operation:'screenshot',targetRef:first.targetRef})).status,404)
-  assert.equal((await invoke({operation:'open',url:'file:///synthetic/denied.html'})).status,409)
+  const targetsBeforeInvalidUrls = (await invoke({operation:'list'})).targets
+  for (const url of ['synthetic.test', 'https://', 'file:///synthetic/denied.html',
+    'about:blank#fragment', 'https://synthetic-user:synthetic-secret@synthetic.test/']) {
+    for (const targetRef of [undefined, replacement.targetRef]) {
+      const failure = await invoke({operation:'open',url,targetRef})
+      assert.equal(failure.status,400)
+      assert.equal(failure.code,'INVALID_REQUEST')
+      assert.equal(failure.phase,'argument_validation')
+      assert.equal(failure.contractVersion,1)
+      assert.equal(failure.outcome,'not_started')
+      assert.equal(failure.retryable,false)
+      assert.deepEqual(failure.issues,[{field:'url',rule:'enum',expected:'supported_value'}])
+      assert.equal(JSON.stringify(failure).includes(url),false)
+    }
+  }
+  assert.deepEqual((await invoke({operation:'list'})).targets,targetsBeforeInvalidUrls,
+    'invalid URLs must neither create pages nor navigate retained targets')
   const foregroundBeforeOpen = await app.evaluate(() => {
     const { manager, owner } = globalThis.browserFixture
     const record = manager.surfaces.get(manager.activeSurfaceId)
