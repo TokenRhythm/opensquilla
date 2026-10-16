@@ -181,7 +181,7 @@ try {
     toolParams('browser_observe', { targetRef: 'opaque-primary-target', observationMode: 'invalid' }),
     toolParams('browser_observe', { targetRef: 'opaque-primary-target', observationMode: ['auto'] }),
     toolParams('browser_observe', { targetRef: 'opaque-primary-target', observationMode: 'hybrid' }),
-    toolParams('browser_open', {}),
+    toolParams('browser_navigate', { targetRef: 'opaque-primary-target' }),
     toolParams('browser_act', { targetRef: 'opaque-primary-target', action: 'click' }),
     toolParams('browser_act', { targetRef: 'opaque-primary-target', action: 'scroll', direction: 'down', amount: 1.5 }),
     toolParams('browser_handle_dialog', { targetRef: 'opaque-primary-target', dialogId: 'dialog-1', accept: 'yes' }),
@@ -191,6 +191,34 @@ try {
     toolParams('unknown_tool'),
   ]) assert.equal((await rpc('tools/call', params)).error.code, -32602)
   assert.equal(calls.length, beforeInvalid, 'invalid metadata and model arguments must never execute')
+
+  const invalidUrlSession = 'synthetic-invalid-url-session'
+  for (const url of ['synthetic.test', 'https://', 'file:///synthetic.html', 'javascript:0',
+    'data:text/html,synthetic', 'about:config', 'about:blank#fragment', 'about:blank?query',
+    'https://synthetic-user:synthetic-secret@synthetic.test/']) {
+    const failure = await call('browser_open', { url }, invalidUrlSession, 'correctable-url')
+    assert.equal(failure.error.code, -32602)
+    assert.deepEqual(failure.error.data, { code: 'INVALID_REQUEST', phase: 'argument_validation',
+      contractVersion: 1, outcome: 'not_started', retryable: false,
+      issues: [{ field: 'url', rule: 'enum', expected: 'supported_value' }] })
+    assert.equal(JSON.stringify(failure).includes(url), false, 'URL diagnostics must not echo submitted addresses or credentials')
+  }
+  assert.equal(count(invalidUrlSession), 0, 'invalid URLs must be rejected before creating a tab')
+  const correctedUrl = await call('browser_open', { url: 'https://synthetic.test/' }, invalidUrlSession, 'correctable-url')
+  assert.equal(correctedUrl.result.isError, false, 'URL validation must not consume recovery budgets or operation receipts')
+  assert.equal(count(invalidUrlSession), 1)
+
+  for (const args of [{}, { url: 'about:blank' }]) {
+    const session = `synthetic-blank-session-${requestId}`
+    const params = toolParams('browser_open', args, session, 'blank-open')
+    const opened = await rpc('tools/call', params)
+    assert.equal(opened.result.isError, false)
+    assert.equal(opened.result.structuredContent.targetRef, targetFor(session))
+    assert.equal(calls.at(-1).url, 'about:blank')
+    assert.equal(calls.at(-1).targetRef, undefined)
+    assert.deepEqual((await rpc('tools/call', params)).result, opened.result)
+    assert.equal(count(session), 1, 'replaying a blank open must not create a duplicate tab')
+  }
 
   const invalidArguments = await call('browser_act', { targetRef: 'opaque-primary-target', action: 'hold', ref: 'e1' })
   assert.deepEqual(invalidArguments.error.data, { code: 'INVALID_REQUEST', phase: 'argument_validation',

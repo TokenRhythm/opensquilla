@@ -106,6 +106,49 @@ async function mountWorkbench() {
 }
 
 describe('AppWorkbench retained browser session isolation', () => {
+  it('adopts an agent-opened blank target, navigates it from the address bar and closes it', async () => {
+    const harness = await mountWorkbench()
+    vi.mocked(harness.api.createSurface).mockClear()
+    harness.pages.set('blank-target', { url: 'about:blank', form: '', loggedIn: false, visible: false })
+    await harness.emit({ version: 2, surfaceId: 'blank-target', type: 'browser-opened', detail: {
+      sessionKey: 'session-a', url: 'about:blank', title: 'about:blank', targetRef: 'page-blank',
+    } })
+
+    expect(harness.store.activeItem).toMatchObject({ id: 'blank-target', title: 'New tab',
+      payload: { initialUrl: 'about:blank', adoptedNativeSurface: true, targetRef: 'page-blank' } })
+    expect(harness.visibleLayers()).toEqual(['blank-target'])
+    expect(harness.pages.get('blank-target')?.visible).toBe(true)
+    expect(harness.api.createSurface).not.toHaveBeenCalled()
+    const panel = harness.element.querySelector<HTMLElement>('[data-workbench-item-id="blank-target"]')!
+    const address = panel.querySelector<HTMLInputElement>('.browser-preview__address')!
+    const nativeSlot = panel.querySelector('[data-workbench-native-surface-slot]')
+    expect(nativeSlot).not.toBeNull()
+    expect(address.value).toBe('')
+    expect(address.placeholder).toBe('Enter a URL, e.g. example.com')
+    expect(panel.querySelector<HTMLButtonElement>('button[aria-label="Open externally"]')?.disabled).toBe(true)
+
+    address.value = 'example.test/next'
+    address.dispatchEvent(new Event('input', { bubbles: true }))
+    panel.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await settle()
+    expect(harness.api.navigateSurface).toHaveBeenCalledWith({ version: 2,
+      surfaceId: 'blank-target', action: 'navigate', url: 'https://example.test/next' })
+    await harness.emit({ version: 2, surfaceId: 'blank-target', type: 'navigation-state', detail: {
+      sessionKey: 'session-a', url: 'https://example.test/next', targetRef: 'page-blank', loading: false,
+    } })
+    expect(address.value).toBe('https://example.test/next')
+    expect(panel.querySelector('[data-workbench-native-surface-slot]')).toBe(nativeSlot)
+    expect(harness.store.activeItem).toMatchObject({ id: 'blank-target', title: 'example.test',
+      payload: { initialUrl: 'https://example.test/next', targetRef: 'page-blank' } })
+    expect(harness.api.createSurface).not.toHaveBeenCalled()
+
+    await harness.emit({ version: 2, surfaceId: 'blank-target', type: 'browser-closed', detail: {
+      sessionKey: 'session-a', targetRef: 'page-blank',
+    } })
+    expect(harness.store.items.some(item => item.id === 'blank-target')).toBe(false)
+    expect(harness.api.destroySurface).toHaveBeenCalledWith('blank-target')
+  })
+
   it('switches through the mounted scope watcher without closing or recreating dirty pages', async () => {
     const harness = await mountWorkbench()
     const pageA = harness.pages.get('page-a')!

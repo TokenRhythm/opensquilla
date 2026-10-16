@@ -124,6 +124,8 @@ describe('Office adapter public selection lifecycle', () => {
     const h = await harness('pptx')
     vendor.callbacks.onHyperlinkClick?.({ kind: 'external', url: 'https://example.com' })
     expect(open).toHaveBeenCalledTimes(1)
+    vendor.callbacks.onHyperlinkClick?.({ kind: 'external', url: 'about:blank' })
+    expect(open).toHaveBeenCalledTimes(1)
     h.session.setSelectionMode(true)
     vendor.callbacks.onHyperlinkClick?.({ kind: 'external', url: 'https://example.com' })
     expect(open).toHaveBeenCalledTimes(1)

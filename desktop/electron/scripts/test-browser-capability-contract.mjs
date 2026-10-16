@@ -8,6 +8,17 @@ const batch = action => parseDesktopBrowserRequest({ ...target, operation: 'batc
 const inspect = fields => parseDesktopBrowserRequest({ ...target, operation: 'snapshot', ...fields })
 const rejected = operation => assert.throws(operation, error => error.code === 'INVALID_REQUEST')
 
+const open = fields => parseDesktopBrowserRequest({ sessionKey: target.sessionKey, operation: 'open', ...fields })
+assert.equal(open({}).url, 'about:blank')
+assert.equal(open({ url: 'about:blank' }).url, 'about:blank')
+assert.equal(open({ contextTargetRef: target.targetRef }).url, 'about:blank')
+assert.equal(open({ url: 'https://synthetic.test/' }).url, 'https://synthetic.test/')
+rejected(() => open({ targetRef: target.targetRef }))
+const openSchema = browserToolDefinitions.find(tool => tool.name === 'browser_open').inputSchema
+const navigateSchema = browserToolDefinitions.find(tool => tool.name === 'browser_navigate').inputSchema
+assert.equal(openSchema.required.includes('url'), false)
+assert.deepEqual(navigateSchema.required, ['targetRef', 'url'])
+
 // A press with a duration is a hold, not an accidental delay before an ordinary click.
 assert.equal(act({ action: 'click', ref: 'e1', button: 'right' }).button, 'right')
 assert.equal(act({ action: 'hold', ref: 'e1', durationMs: 3000 }).durationMs, 3000)
@@ -77,6 +88,14 @@ const diagnostic = (request, field, rule, expected) => assert.throws(
   },
 )
 diagnostic({ operation: 'act', targetRef: target.targetRef, action: 'click' }, 'ref', 'required', 'present')
+diagnostic({ operation: 'open', targetRef: target.targetRef }, 'url', 'required', 'present')
+diagnostic({ operation: 'open', url: '' }, 'url', 'range', 'within_bounds')
+diagnostic({ operation: 'open', url: null }, 'url', 'type', 'string')
+for (const url of ['synthetic.test', 'https://', ' ', 'file:///synthetic.html', 'javascript:0',
+  'data:text/html,synthetic', 'about:config', 'about:blank#fragment', 'about:blank?query',
+  'https://synthetic-user:synthetic-secret@synthetic.test/']) {
+  diagnostic({ operation: 'open', url }, 'url', 'enum', 'supported_value')
+}
 diagnostic({ operation: 'dialog', targetRef: target.targetRef, dialogId: 'dialog', accept: 'yes' }, 'accept', 'type', 'boolean')
 diagnostic({ operation: 'act', targetRef: target.targetRef, action: 'hold', ref: 'e1', durationMs: 10001 }, 'durationMs', 'range', 'within_bounds')
 diagnostic({ operation: 'tab', targetRef: target.targetRef, tabAction: 'erase' }, 'tabAction', 'enum', 'supported_value')

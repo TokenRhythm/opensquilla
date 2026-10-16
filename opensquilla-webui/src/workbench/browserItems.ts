@@ -17,6 +17,7 @@ function urlDigest(value: string): string {
 }
 
 export function normalizeBrowserUrl(value: string): string {
+  if (value === 'about:blank') return value
   const trimmed = value.trim()
   if (!trimmed || trimmed.length > 8192 || /[\u0000-\u001f\u007f]/.test(trimmed)) return ''
   try {
@@ -57,7 +58,7 @@ export function createBrowserWorkbenchItem(options: {
     id: `browser:${urlDigest(scopeId)}:${urlDigest(url)}${options.instanceId
       ? `:${urlDigest(options.instanceId)}` : ''}`,
     kind: 'browser',
-    title: parsed.hostname,
+    title: parsed.hostname || url,
     scope: { type: 'session', id: scopeId },
     hostKind: 'native-webcontents',
     retention: 'keep-alive',

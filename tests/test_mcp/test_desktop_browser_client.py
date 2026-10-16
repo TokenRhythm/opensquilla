@@ -342,6 +342,48 @@ def catalog_entry(name):
     }
 
 
+@pytest.mark.parametrize("requires_url", [False, True], ids=["optional-url", "older-client"])
+async def test_open_uses_discovered_url_requirement(browser, monkeypatch, requires_url):
+    client = DesktopBrowserMCPClient(browser)
+    calls = []
+    entries = [catalog_entry(name) for name in sorted(BROWSER_MCP_REQUIRED_TOOLS)]
+    open_schema = next(entry for entry in entries if entry["name"] == "browser_open")
+    open_schema["inputSchema"] = {
+        "type": "object", "properties": {"url": {"type": "string"}},
+        "required": ["url"] if requires_url else [], "additionalProperties": False,
+    }
+
+    async def respond(method, params, **kwargs):
+        calls.append((method, params))
+        if method == "initialize":
+            return {"result": {"protocolVersion": "2025-06-18"}}
+        if method == "tools/list":
+            return {"result": {"tools": entries}}
+        return {"result": {"content": [{"type": "text", "text": "opened"}]}}
+
+    monkeypatch.setattr(client, "_request", respond)
+    registry = ToolRegistry()
+    try:
+        await register_client_tools(client, registry, spec_transform=browser_tool_policy)
+        definition = next(
+            item for item in registry.to_tool_definitions(context(browser))
+            if item.name == "mcp__desktop-browser__browser_open"
+        )
+        assert definition.input_schema.required == (["url"] if requires_url else [])
+        handler = build_tool_handler(registry, context(browser))
+        omitted = await handler(ToolCall("open-blank", definition.name, {}))
+        assert omitted.is_error is requires_url
+        dispatched = [params for method, params in calls if method == "tools/call"]
+        assert [item["arguments"] for item in dispatched] == ([] if requires_url else [{}])
+        explicit = await handler(ToolCall(
+            "open-url", definition.name, {"url": "https://example.test/"},
+        ))
+        assert not explicit.is_error
+        assert calls[-1][1]["arguments"] == {"url": "https://example.test/"}
+    finally:
+        await close_active_clients(owner="desktop-browser")
+
+
 @pytest.mark.parametrize("optional", [set(), {"browser_observe"}, BROWSER_MCP_OPTIONAL_TOOLS])
 async def test_catalog_negotiates_old_and_optional_tools(browser, monkeypatch, optional):
     client = DesktopBrowserMCPClient(browser)
@@ -619,6 +661,44 @@ def diagnostic_input_schema():
             }},
         },
     }
+
+
+async def test_open_url_validation_preserves_pre_execution_diagnostics(browser):
+    error = argument_validation_error()
+    issue = {"field": "url", "rule": "enum", "expected": "supported_value"}
+    error["data"]["issues"] = [issue]
+    requests = []
+
+    async def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={
+            "jsonrpc": "2.0", "id": json.loads(request.content)["id"], "error": error,
+        })
+
+    client = DesktopBrowserMCPClient(browser)
+    client._tool_schemas["browser_open"] = {
+        "type": "object", "properties": {"url": {"type": "string"}}, "required": [],
+    }
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    token = current_tool_context.set(context(browser))
+    call_token = current_mcp_call_context.set(MCPCallContext("invalid-open-url"))
+    try:
+        result = await client.call_tool("browser_open", {"url": "about:blank#invalid"})
+        assert result.is_error
+        assert result.structured_content == {
+            **error["data"], "ok": False, "message": result.structured_content["message"],
+        }
+        assert result.structured_content["issues"] == [issue]
+        assert result.structured_content["outcome"] == "not_started"
+        assert result.structured_content["retryable"] is False
+        assert result.content == json.dumps(result.structured_content)
+        assert "about:blank#invalid" not in result.content
+        assert "synthetic-private-response" not in result.content
+        assert len(requests) == 1
+    finally:
+        current_tool_context.reset(token)
+        current_mcp_call_context.reset(call_token)
+        await client.close()
 
 
 @pytest.mark.parametrize(

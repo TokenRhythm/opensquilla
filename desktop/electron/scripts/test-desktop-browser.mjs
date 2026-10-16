@@ -5,6 +5,7 @@ import { DesktopBrowserError, DesktopBrowserServer, parseDesktopBrowserRequest, 
 
 const audit = []
 let calls = 0
+let latestRequest
 let interrupted = false
 let started
 const slowStarted = new Promise(resolve => { started = resolve })
@@ -16,6 +17,7 @@ const diagnosticDetails = {
 }
 const server = new DesktopBrowserServer(async (request, signal) => {
   calls++
+  latestRequest = request
   if (request.sessionKey === 'synthetic-diagnostic-session') {
     throw new DesktopBrowserError('NAVIGATION_FAILED', 'Synthetic navigation failure.', 409, diagnosticDetails)
   }
@@ -94,6 +96,25 @@ try {
   for (const forbidden of [token, 'synthetic-diagnostic-session', diagnosticUrl, 'synthetic-navigation-secret']) {
     assert.equal(JSON.stringify(audit).includes(forbidden), false, 'diagnostic details must not leak into audit events')
   }
+  const beforeInvalidUrls = calls
+  for (const url of ['synthetic.test', 'https://', 'file:///synthetic.html', 'about:blank#fragment',
+    'https://synthetic-user:synthetic-secret@synthetic.test/']) {
+    const rejectedUrl = await invoke({ ...payload, operation: 'open', url })
+    assert.equal(rejectedUrl.status, 400)
+    const failure = await rejectedUrl.json()
+    assert.equal(failure.code, 'INVALID_REQUEST')
+    assert.equal(failure.phase, 'argument_validation')
+    assert.equal(failure.outcome, 'not_started')
+    assert.equal(failure.retryable, false)
+    assert.deepEqual(failure.issues, [{ field: 'url', rule: 'enum', expected: 'supported_value' }])
+    assert.equal(JSON.stringify(failure).includes(url), false)
+  }
+  const missingNavigationUrl = await invoke({ ...payload, operation: 'open', targetRef: 'synthetic-target' })
+  assert.equal(missingNavigationUrl.status, 400)
+  assert.equal(calls, beforeInvalidUrls)
+  assert.equal((await invoke({ ...payload, operation: 'open' })).status, 200)
+  assert.equal(latestRequest.url, 'about:blank')
+  assert.equal(latestRequest.targetRef, undefined)
   // A client that disconnects while uploading must not leave an operation running.
   await new Promise(resolve => {
     const client = httpRequest(endpoint, { method: 'POST', headers: { ...headers, 'Content-Length': '100' } })
