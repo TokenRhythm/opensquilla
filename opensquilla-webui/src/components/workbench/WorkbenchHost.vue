@@ -56,6 +56,7 @@
         <Icon name="chevronLeft" :size="17" aria-hidden="true" />
         <span>{{ returnLabel }}</span>
       </button>
+      <div class="workbench-host__tab-region">
       <div
         v-if="showTabStrip"
         ref="tabsRef"
@@ -107,6 +108,10 @@
         <slot name="title" :item="activeItem">
           <span class="workbench-host__title">{{ activeItem?.title }}</span>
         </slot>
+      </div>
+      <div v-if="$slots['tab-actions']" class="workbench-host__tab-actions">
+        <slot name="tab-actions" :item="activeItem" />
+      </div>
       </div>
 
       <div class="workbench-host__actions">
@@ -836,10 +841,24 @@ onBeforeUnmount(() => {
   justify-content: flex-end; gap: var(--sp-1); min-height: 42px; padding: 4px var(--sp-3);
   border-block-end: 1px solid var(--border); box-sizing: border-box; }
 
+.workbench-host__tab-region {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 1 1 auto;
+  gap: var(--sp-1);
+}
+
+.workbench-host__tab-actions {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
 .workbench-host__tabs {
   display: flex;
   min-width: 0;
-  flex: 1;
+  flex: 0 1 auto;
   gap: 2px;
   overflow-x: auto;
   scrollbar-width: none;
@@ -953,6 +972,7 @@ onBeforeUnmount(() => {
   border-radius: var(--radius-xs);
 }
 .workbench-host__tab-wrap:hover .workbench-host__tab-close,
+.workbench-host__tab-wrap:only-child .workbench-host__tab-close,
 .workbench-host__tab-wrap:focus-within .workbench-host__tab-close { opacity: 1; }
 .workbench-host__tab-spinner { flex: 0 0 auto; animation: workbench-tab-spin 1s linear infinite; }
 @keyframes workbench-tab-spin { to { transform: rotate(360deg); } }

@@ -51,7 +51,7 @@
       </span>
     </template>
 
-    <template #actions="{ item }">
+    <template #tab-actions>
       <div
         v-if="newPanelMenuVisible"
         ref="newPanelMenuRoot"
@@ -109,6 +109,8 @@
         </div>
         </Teleport>
       </div>
+    </template>
+    <template #actions="{ item }">
       <button v-if="item" type="button" class="app-workbench__action"
         :aria-label="t('resourceActions.more')" :title="t('resourceActions.more')" aria-haspopup="menu"
         data-testid="workbench-tab-actions" @click="openTabMenu(item, $event)"
