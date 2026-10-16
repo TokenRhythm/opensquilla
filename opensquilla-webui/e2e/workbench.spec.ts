@@ -713,6 +713,70 @@ test.describe('Application Workbench', () => {
     })
   }
 
+  for (const recovered of [false, true]) {
+    test(`New panel stays anchored through pane animation and unrelated scroll (recovered=${recovered})`, async ({ page }) => {
+      const draft = Array.from({ length: 40 }, (_, index) => `Draft line ${index} must remain intact`).join('\n')
+      await page.setViewportSize({ width: 1440, height: 900 })
+      await installDesktopWorkbenchV2Bridge(page)
+      await page.addInitScript(({ recovered, draft }) => {
+        window.OPENSQUILLA_FEATURES = { ...(window.OPENSQUILLA_FEATURES || {}), artifactWorkbench: true }
+        if (recovered) {
+          const key = 'agent:main:webchat:recovered-menu-scroll'
+          localStorage.setItem(`opensquilla.chat.draft:${key}`, draft)
+          localStorage.setItem('opensquilla.chat.recent-draft-session', key)
+        }
+      }, { recovered, draft })
+      await installWorkbenchGateway(page, new Map(), [])
+      await page.goto(CONTROL_URL + 'chat/new')
+      await expect(page.locator('.topbar')).toHaveAttribute('data-connection-state', 'connected')
+      const composer = page.locator('.chat-textarea')
+      if (!recovered) await composer.fill(draft)
+      await expectComposerValue(composer, draft)
+      const thread = page.locator('.chat-thread')
+      const sessionKey = await thread.getAttribute('data-session-key')
+      // Real unsent draft content makes the independent editor scrollable;
+      // its scroll must not dismiss pane actions or lose the draft/focus.
+      await expect.poll(() => composer.evaluate(element => element.scrollHeight > element.clientHeight)).toBe(true)
+      await page.getByTestId('topbar-workbench-toggle').click()
+      const host = page.getByTestId('workbench-host')
+      const trigger = page.getByTestId('workbench-new-panel-trigger')
+      await trigger.click()
+      const menu = page.getByTestId('workbench-new-panel-menu-list')
+      await expect(menu).toBeVisible()
+      const browser = menu.locator('[data-panel-kind="browser"]')
+      await expect(browser).toBeFocused()
+      const assertAnchored = async () => {
+        await expect.poll(() => host.evaluate(element => element.getAnimations()
+          .every(animation => animation.playState === 'finished' || animation.playState === 'idle'))).toBe(true)
+        await expect.poll(() => page.evaluate(() => {
+          const trigger = document.querySelector('[data-testid="workbench-new-panel-trigger"]')!.getBoundingClientRect()
+          const menu = document.querySelector('[data-testid="workbench-new-panel-menu-list"]')?.getBoundingClientRect()
+          if (!menu) return false
+          const left = Math.max(8, Math.min(trigger.right - menu.width, innerWidth - menu.width - 8))
+          const top = Math.max(8, Math.min(trigger.bottom + 6, innerHeight - menu.height - 8))
+          return Math.abs(menu.left - left) <= 1 && Math.abs(menu.top - top) <= 1
+            && menu.left >= 8 && menu.right <= innerWidth - 8
+            && menu.top >= 8 && menu.bottom <= innerHeight - 8
+        })).toBe(true)
+      }
+      await assertAnchored()
+      await composer.evaluate(element => new Promise<void>(resolve => {
+        element.addEventListener('scroll', () => resolve(), { once: true })
+        element.scrollTop = element.scrollTop === 40 ? 80 : 40
+      }))
+      await expect.poll(() => composer.evaluate(element => element.scrollTop)).toBeGreaterThan(0)
+      await expect(menu).toBeVisible()
+      await expect(browser).toBeFocused()
+      await expectComposerValue(composer, draft)
+      await expect(thread).toHaveAttribute('data-session-key', sessionKey || '')
+      await page.setViewportSize({ width: 1360, height: 860 })
+      await assertAnchored()
+      await expect(browser).toBeFocused()
+      await browser.click()
+      await expect(page.getByTestId('browser-start')).toBeVisible()
+    })
+  }
+
   test('reopens retained agent pages after collapse and task changes', async ({ page }) => {
     await installDesktopWorkbenchV2Bridge(page)
     await openWorkbenchSession(page)

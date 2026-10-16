@@ -138,6 +138,49 @@ async function awaitStyleTransition(locator: Locator) {
 }
 
 test.describe('real routed main and workbench side conversation hosts', () => {
+  for (const kind of ['main', 'side'] as const) {
+    test(`${kind} Stop remains directly clickable with a visible failure toast`, async ({ page }, info) => {
+      const gateway = await installGateway(page, false, false, false, false, { audioConfigured: true })
+      await page.addInitScript(() => {
+        Object.defineProperty(window, 'MediaRecorder', { value: undefined, configurable: true })
+      })
+      await page.setViewportSize({ width: 1440, height: 900 })
+      await page.goto(`/control/chat?session=${encodeURIComponent(MAIN)}`)
+      const main = page.locator('#app-main .chat').first()
+      await expect(main).toContainText('Earlier main answer')
+      let host = main
+      if (kind === 'side') {
+        await page.getByTestId('topbar-workbench-toggle').click()
+        await page.getByRole('button', { name: 'Assistant chat', exact: true }).click()
+        host = page.getByTestId('assistant-chat-panel')
+      }
+      await send(host, `Keep ${kind} running while a notification is visible`)
+      await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(1)
+      const stop = host.getByRole('button', { name: 'Stop current response', exact: true })
+      await expect(stop).toBeVisible()
+      // Real shared-composer action, with only the external browser capability
+      // removed. No injected toast, manually reconstructed host or forced click.
+      await host.getByRole('button', { name: 'Add', exact: true }).click()
+      await page.getByRole('menuitem', { name: 'Record voice input', exact: true }).click()
+      const toast = page.getByTestId('toast').filter({ hasText: 'Voice input is not supported in this browser' })
+      await expect(toast).toBeVisible()
+      expect(await stop.evaluate(element => {
+        const rect = element.getBoundingClientRect()
+        const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
+        return hit === element || element.contains(hit)
+      }), 'Visible notification must leave the actual Stop hit target uncovered').toBe(true)
+      await page.screenshot({ path: info.outputPath(`${kind}-toast-stop.png`) })
+      await stop.click()
+      await expect(toast).toBeVisible()
+      await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.abort').length).toBe(1)
+      expect(gateway.requests.find(request => request.method === 'chat.abort')?.params)
+        .toMatchObject({ sessionKey: kind === 'main' ? MAIN : SIDE })
+      await expect(stop).toHaveCount(0)
+      await expect(host).toContainText('Interrupted answer.')
+      expect(gateway.errors).toEqual([])
+    })
+  }
+
   test('aligns live activity and answers with history in wide main and side panes', async ({ page }) => {
     const gateway = await installGateway(page)
     await page.setViewportSize({ width: 2200, height: 1100 })

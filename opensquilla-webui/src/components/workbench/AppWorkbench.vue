@@ -832,8 +832,22 @@ function onNewPanelOutside(event: PointerEvent) {
 }
 
 function onNewPanelViewportChange(event: Event) {
-  if (event.target instanceof Node && newPanelMenu.value?.contains(event.target)) return
-  closeNewPanelMenu()
+  if (!newPanelMenuOpen.value) return
+  const anchor = newPanelMenuTrigger.value
+  if (!anchor?.isConnected) {
+    closeNewPanelMenu()
+    return
+  }
+  // Capture also sees transcript/editor/tab-list scrolling. Those independent
+  // surfaces do not move this menu's anchor. Even the pane's opening animation
+  // can scroll an ancestor after the + click; keep the menu and track its anchor.
+  if (event.type === 'scroll' && event.target instanceof Node && !event.target.contains(anchor)) return
+  const rect = anchor.getBoundingClientRect()
+  if (rect.width <= 0 || rect.height <= 0) {
+    closeNewPanelMenu()
+    return
+  }
+  positionNewPanelMenu()
 }
 
 async function selectNewPanel(option: NewPanelOption) {

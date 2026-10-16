@@ -3,7 +3,6 @@
     name="toast-stack"
     tag="div"
     class="toast-host"
-    :class="{ 'toast-host--above-tabbar': mobileTabbarVisible }"
     aria-live="polite"
     data-testid="toast-host"
   >
@@ -48,8 +47,6 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useToasts, type ToastItem } from '@/composables/useToasts'
 
-defineProps<{ mobileTabbarVisible?: boolean }>()
-
 const { t } = useI18n()
 const { toasts, dismissToast, pauseToast, resumeToast, runToastAction } = useToasts()
 
@@ -76,13 +73,22 @@ watchPostEffect(() => {
 
 <style scoped>
 .toast-host {
+  /* One viewport-owned stack for every conversation. Keep the lower half
+     available to composers and Stop, including a resized workbench pane. */
   position: fixed;
-  right: var(--sp-4);
-  bottom: calc(var(--sp-4) + env(safe-area-inset-bottom, 0px));
+  top: calc(56px + env(safe-area-inset-top, 0px));
+  inset-inline: var(--sp-4);
+  width: min(392px, calc(100% - 2 * var(--sp-4)));
+  max-height: max(56px, calc(50dvh - 56px - env(safe-area-inset-top, 0px)));
+  margin-inline: auto;
+  padding: var(--sp-2);
+  box-sizing: border-box;
+  overflow: auto;
+  overscroll-behavior: contain;
   z-index: 1000;
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
+  align-items: stretch;
   gap: var(--sp-2);
   pointer-events: none;
 }
@@ -90,9 +96,9 @@ watchPostEffect(() => {
 .toast {
   position: relative;
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   gap: var(--sp-2);
-  max-width: 360px;
   padding: 11px 12px 11px 14px;
   overflow: hidden;
   border: 1px solid var(--border);
@@ -188,8 +194,8 @@ watchPostEffect(() => {
 }
 
 .toast-stack-leave-active {
-  position: absolute;
-  right: 0;
+  /* Retain its slot until the fade ends so the bounded stack does not clip
+     the last departing notice as soon as it leaves the queue. */
   transition:
     opacity var(--dur-fast) var(--ease-in),
     transform var(--dur-fast) var(--ease-in);
@@ -213,18 +219,4 @@ watchPostEffect(() => {
   }
 }
 
-@media (max-width: 768px) {
-  .toast-host {
-    left: var(--sp-4);
-    align-items: stretch;
-  }
-
-  .toast-host--above-tabbar {
-    bottom: calc(var(--mobile-tabbar-h) + env(safe-area-inset-bottom, 0px) + var(--sp-4));
-  }
-
-  .toast {
-    max-width: none;
-  }
-}
 </style>

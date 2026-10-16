@@ -380,7 +380,7 @@
   </nav>
 
   <Teleport to="body">
-    <ToastHost :mobile-tabbar-visible="!mobileKeyboardOpen" />
+    <ToastHost />
   </Teleport>
 
   <ConfirmModal />

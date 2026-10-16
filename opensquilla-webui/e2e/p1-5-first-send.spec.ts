@@ -962,16 +962,14 @@ test.describe('durable handoff and pending order release gate', () => {
     await expect(page.locator('.topbar[data-connection-state="connected"]')).toHaveCount(0)
     await expect.poll(async () => (await readDelivery()).record.phase).toBe('unknown')
     expect((await readDelivery()).record.response).toBeUndefined()
-    // ACK loss surfaces a transient failure toast above the composer. Dismiss
-    // it through its real button before pressing Stop: the pointer left on Send
-    // also pauses the toast while it overlaps that location.
+    // A transient transport toast must leave Stop directly clickable. Do not
+    // dismiss it or wait for its lifetime to expire before requesting Stop.
     const lostAckToast = page.getByTestId('toast').filter({ hasText: 'This request did not finish.' })
     await expect(lostAckToast).toBeVisible()
-    await lostAckToast.getByRole('button', { name: 'Dismiss notification', exact: true }).click()
-    await expect(lostAckToast).toHaveCount(0)
     const stopButton = page.getByRole('button', { name: 'Stop current response', exact: true })
     await expect(stopButton).toBeVisible()
     await stopButton.click()
+    await expect(lostAckToast).toBeVisible()
     await expect.poll(async () => (await readDelivery()).record.stop).toMatchObject({ requested: true })
     const originalRecord = (await readDelivery()).record
     expect(originalRecord.stop?.completed).not.toBe(true)

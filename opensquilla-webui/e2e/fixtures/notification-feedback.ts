@@ -37,7 +37,6 @@ await setTheme(query.get('theme') ?? 'light')
 
 const calls = reactive({ approve: 0, setAdmin: 0, actions: 0, runNow: 0 })
 const destination = ref('尚未打开任务')
-const mobileKeyboardOpen = ref(false)
 const actionMode = ref<'success' | 'reject' | 'stale' | 'pending'>('success')
 let resolveAction: ((value: ToastActionResult) => void) | undefined
 let rejectAction: ((reason: Error) => void) | undefined
@@ -125,7 +124,6 @@ const Preview = defineComponent({
     }
     const api = {
       setTheme, clear, showAction, emitFinished, runOrder, runReminderOrder,
-      setMobileKeyboardOpen: (value: boolean) => { mobileKeyboardOpen.value = value },
       setMemberReadFailure: (value: boolean) => { memberReadFailure = value },
       notify: (message: string, tone: ToastTone = 'info', duration = 5000, dedupeKey?: string) => pushToast(message, { tone, duration, dedupeKey }),
       resolveAction: (ok = true) => { resolveAction?.(ok); resolveAction = undefined },
@@ -161,9 +159,7 @@ const Preview = defineComponent({
       h('h2', '成员已批准、管理员授权失败'),
       h(ChannelMembersPanel, { members, channelName: 'ops' }),
       h('output', { 'data-testid': 'fixture-calls' }, `批准 ${calls.approve} 次；授权 ${calls.setAdmin} 次；通知操作 ${calls.actions} 次`),
-      // Same prop contract as App; the real tab bar/viewport integration is
-      // separately exercised through App in notification-feedback.spec.ts.
-      h(ToastHost, { mobileTabbarVisible: !mobileKeyboardOpen.value }), h(ConfirmModal),
+      h(ToastHost), h(ConfirmModal),
     ])
   },
 })

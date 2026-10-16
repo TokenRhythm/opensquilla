@@ -31,7 +31,7 @@ vi.mock('./WorkbenchHost.vue', async () => {
   return { default: defineComponent({ inheritAttrs: false, props: { beforeCloseItem: Function }, setup(props, { slots, expose }) {
     const store = useWorkbenchStore()
     expose({ hideHover() {} })
-    return () => h('section', [slots.actions?.({ item: store.activeItem }), !store.activeItem ? slots.empty?.() : null,
+    return () => h('section', [slots['tab-actions']?.({ item: store.activeItem }), slots.actions?.({ item: store.activeItem }), !store.activeItem ? slots.empty?.() : null,
       h('button', { 'data-testid': 'close-active-panel', onClick: async () => {
         const item = store.activeItem
         if (item && await props.beforeCloseItem?.(item)) store.closeItem(item.id)
@@ -442,6 +442,69 @@ describe('AppWorkbench new panel menu interaction', () => {
     await settle()
     expect(option('assistant-chat')?.disabled).toBe(false)
   })
+
+  it('keeps the menu open while independent transcript, editor, tabs or menu content scroll', async () => {
+    const harness = await mount()
+    await harness.open()
+    const openMenu = menu()!
+    for (const tag of ['div', 'textarea', 'nav']) {
+      const unrelated = document.createElement(tag)
+      harness.host.append(unrelated)
+      unrelated.dispatchEvent(new Event('scroll'))
+      await settle()
+      expect(menu()).toBe(openMenu)
+    }
+    openMenu.dispatchEvent(new Event('scroll'))
+    await settle()
+    expect(menu()).toBe(openMenu)
+    expect(harness.store.activeSessionId).toBe('session-a')
+  })
+
+  it('repositions on anchor-ancestor scroll and viewport resize without dismissing', async () => {
+    const harness = await mount()
+    let anchorRight = 340
+    let anchorBottom = 50
+    vi.spyOn(harness.trigger(), 'getBoundingClientRect').mockImplementation(() => ({
+      x: anchorRight - 30, y: anchorBottom - 30, left: anchorRight - 30, top: anchorBottom - 30,
+      width: 30, height: 30, right: anchorRight, bottom: anchorBottom, toJSON: () => ({}),
+    }))
+    await harness.open()
+    const openMenu = menu()!
+    vi.spyOn(openMenu, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, left: 0, top: 0, width: 280, height: 160, right: 280, bottom: 160, toJSON: () => ({}),
+    })
+    harness.host.dispatchEvent(new Event('scroll'))
+    await settle()
+    expect(menu()).toBe(openMenu)
+    expect(openMenu.style.left).toBe('60px')
+    expect(openMenu.style.top).toBe('56px')
+    anchorRight = window.innerWidth + 100
+    anchorBottom = window.innerHeight - 10
+    window.dispatchEvent(new Event('resize'))
+    await settle()
+    expect(menu()).toBe(openMenu)
+    expect(openMenu.style.left).toBe(`${window.innerWidth - 280 - 8}px`)
+    expect(openMenu.style.top).toBe(`${window.innerHeight - 160 - 8}px`)
+    expect(document.activeElement).toBe(option('browser'))
+    harness.trigger().remove()
+    window.dispatchEvent(new Event('resize'))
+    await settle()
+    expect(menu()).toBeNull()
+  })
+
+  it.each(['session', 'route', 'collapse', 'blocked'] as const)(
+    'still dismisses on %s ownership or visibility changes', async change => {
+      const harness = await mount()
+      await harness.open()
+      expect(menu()).not.toBeNull()
+      if (change === 'session') harness.props.sessionId = 'session-b'
+      if (change === 'route') harness.props.routeActive = false
+      if (change === 'collapse') harness.store.setExpanded(false)
+      if (change === 'blocked') harness.props.modalBlocked = true
+      await settle()
+      expect(menu()).toBeNull()
+    },
+  )
 
   it('navigates by keyboard and restores focus after dismissal while occluding native surfaces', async () => {
     const harness = await mount()

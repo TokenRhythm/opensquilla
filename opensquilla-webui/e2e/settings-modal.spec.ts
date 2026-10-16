@@ -149,9 +149,13 @@ test.describe('Settings modal', () => {
       aboveModal: true,
     })
 
+    // A notification must not cover the modal's close control. Keep it visible
+    // while clicking Close; the body portal must survive the modal unmount.
+    await dialog(page).getByRole('button', { name: 'Close', exact: true }).click()
+    await expect(dialog(page)).toBeHidden()
+    await expect(toast).toBeVisible()
     await toast.getByRole('button', { name: 'Dismiss notification' }).click()
     await expect(toast).toHaveCount(0)
-    await expect(dialog(page)).toBeVisible()
   })
 
   test('rail switches sections, marks the active tab, and syncs the URL with replace', async ({ page }) => {

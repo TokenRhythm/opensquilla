@@ -13,7 +13,7 @@ type Stream = { sequence: number; task: string | null; lastTask: Wire | null; hi
 export const logs = new WeakMap<Page, { requests: Request[]; errors: string[]; consoleWarnings: string[] }>()
 
 export async function installGateway(page: Page, eventBeforeAck = false, routingConflict = false, delayCreate = false, modernSnapshots = false,
-  options: { workspace?: boolean; terminal?: boolean; locale?: string; modelName?: string } = {}) {
+  options: { workspace?: boolean; terminal?: boolean; locale?: string; modelName?: string; audioConfigured?: boolean } = {}) {
   const requests: Request[] = []
   const errors: string[] = []
   const consoleWarnings: string[] = []
@@ -328,7 +328,7 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
         'sessions.routing.get': { key, mode: 'direct', revision: 1, source: 'session', initialized: true, appliesTo: 'next_accepted_turn',
           ...(options.modelName ? { modelSelection: { model: options.modelName, provider: 'synthetic' } } : {}) },
         'sessions.routing.set': { key, mode: frame.params?.mode ?? 'direct', revision: 2, source: 'session', initialized: true, appliesTo: 'next_accepted_turn' },
-        'onboarding.status': { audioConfigured: false, configured: true },
+        'onboarding.status': { audioConfigured: options.audioConfigured ?? false, configured: true },
         'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
         'sandbox.setup.status': { state: 'ready', platform: 'linux', message: 'Synthetic sandbox ready', requiresAdmin: false },
         'sandbox.capability.status': { available: true, backend: 'bubblewrap', platform: 'linux', code: 'ready',

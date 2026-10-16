@@ -404,6 +404,14 @@ export async function acknowledgeTopbarDeliverables(page: Page, count: number) {
   const header = page.getByTestId('chat-header-actions')
   await expect(header.locator('.chat-header__count-badge').first())
     .toHaveText(count > 99 ? '99+' : String(count))
+  const readGeometry = () => page.evaluate(() => {
+    const selectors = ['.topbar', '[data-testid="chat-header-actions"]']
+    return selectors.flatMap(selector => {
+      const bounds = document.querySelector(selector)!.getBoundingClientRect()
+      return [bounds.x, bounds.y, bounds.width, bounds.height]
+    })
+  })
+  const originalGeometry = await readGeometry()
   const layout = await header.getAttribute('data-layout')
   if (layout === 'wide') {
     await page.getByTestId('chat-session-action-deliverables').click()
@@ -424,7 +432,14 @@ export async function acknowledgeTopbarDeliverables(page: Page, count: number) {
   await workbench.locator('.workbench-host__tab-wrap').hover()
   await workbench.locator('.workbench-host__tab-close').click()
   await expect(workbench).toBeHidden()
-  await expect(header).toHaveAttribute('data-layout', layout!)
+  // Opening the panel crosses layout thresholds. The 544–576px hysteresis
+  // band can legitimately return compact after starting wide at the exact
+  // same width; pin the restored geometry and let the original visual/target
+  // assertions verify the final controls without equating pre/post layout names.
+  await expect.poll(async () => {
+    const restoredGeometry = await readGeometry()
+    return Math.max(...restoredGeometry.map((value, index) => Math.abs(value - originalGeometry[index]!)))
+  }).toBeLessThanOrEqual(1)
   await expect(header.locator('.chat-header__new-badge, .chat-header__new-dot')).toHaveCount(0)
   await page.mouse.move(0, page.viewportSize()!.height - 1)
   await waitForTopbarStable(page)
