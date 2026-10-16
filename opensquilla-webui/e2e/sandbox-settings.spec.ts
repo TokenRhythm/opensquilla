@@ -10,15 +10,17 @@ test('Web Settings opens the Sandbox overview and file-safety details', async ({
   const settings = page.getByRole('dialog', { name: 'Settings' })
   await expect(settings).toBeVisible()
 
-  const sandboxTab = settings.getByRole('tab', { name: 'Sandbox', exact: true })
+  const sandboxTab = settings.getByRole('tab', { name: /^Security & Privacy:/ })
   await expect(sandboxTab).toBeVisible()
   await sandboxTab.click()
-  await expect(page).toHaveURL(/\/settings\/sandbox$/)
+  await expect(page).toHaveURL(/\/settings\/securityPrivacy$/)
 
   await expect(page.getByTestId('sandbox-overview')).toBeVisible()
   await expect(page.getByTestId('sandbox-safe-mode')).toBeVisible()
   await expect(page.getByTestId('sandbox-full-mode')).toBeVisible()
-  await expect(page.locator('.sandbox-settings__status')).toBeVisible()
+  // WebUI exposes readiness without claiming the isolated host has native Safe installed.
+  const safeAvailable = await page.getByTestId('sandbox-safe-mode').isEnabled()
+  await expect(page.locator('.sandbox-settings__status')).toHaveCount(safeAvailable ? 1 : 0)
 
   await page.getByTestId('sandbox-open-files').click()
   await expect(page.getByTestId('sandbox-detail')).toBeVisible()

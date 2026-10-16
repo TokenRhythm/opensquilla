@@ -1,4 +1,6 @@
 import { test, expect, type Page, type Route } from '@playwright/test'
+import { chatHistoryPayload } from './support/session-read-fixtures'
+import { installSidebarFixture } from './support/sidebar-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2eshareimage'
@@ -20,61 +22,33 @@ const PNG_MAGENTA = Buffer.from(
   'base64',
 )
 
-// Seed one finished assistant turn that carries a single image artifact with a
-// thumbnail variant, rewriting chat.history in flight.
+// Use a complete synthetic conversation; this key is not owned by a real Gateway.
 async function seedHistory(page: Page) {
-  await page.routeWebSocket(/\/ws$/, ws => {
-    const server = ws.connectToServer()
-    const historyIds = new Set<string>()
-    ws.onMessage(message => {
-      try {
-        const frame = JSON.parse(String(message))
-        if (frame?.type === 'req' && frame.method === 'chat.history') {
-          historyIds.add(String(frame.id))
-        }
-      } catch {}
-      server.send(message)
-    })
-    server.onMessage(message => {
-      try {
-        const frame = JSON.parse(String(message))
-        if (frame?.type === 'res' && frame.id !== undefined && historyIds.has(String(frame.id))) {
-          historyIds.delete(String(frame.id))
-          frame.ok = true
-          delete frame.error
-          frame.payload = {
-            messages: [
-              {
-                role: 'user',
-                text: '画一张蚂蚁搬砖',
-                id: 'msg-share-img-user',
-                timestamp: Math.floor(Date.now() / 1000) - 120,
-              },
-              {
-                role: 'assistant',
-                text: 'Here is the image.',
-                id: 'msg-share-img-assistant',
-                timestamp: Math.floor(Date.now() / 1000) - 60,
-                artifacts: [
-                  {
-                    id: 'art-share-img',
-                    name: 'render.png',
-                    mime: 'image/png',
-                    size: 744448,
-                    download_url: '/api/v1/artifacts/art-share-img',
-                    thumbnail_url: '/api/v1/artifacts/art-share-img?variant=thumb',
-                  },
-                ],
-              },
-            ],
-            has_more: false,
-          }
-          ws.send(JSON.stringify(frame))
-          return
-        }
-      } catch {}
-      ws.send(message)
-    })
+  await installSidebarFixture(page, {
+    'chat.history': chatHistoryPayload([
+      {
+        role: 'user',
+        text: '画一张蚂蚁搬砖',
+        id: 'msg-share-img-user',
+        timestamp: Math.floor(Date.now() / 1000) - 120,
+      },
+      {
+        role: 'assistant',
+        text: 'Here is the image.',
+        id: 'msg-share-img-assistant',
+        timestamp: Math.floor(Date.now() / 1000) - 60,
+        artifacts: [
+          {
+            id: 'art-share-img',
+            name: 'render.png',
+            mime: 'image/png',
+            size: 744448,
+            download_url: '/api/v1/artifacts/art-share-img',
+            thumbnail_url: '/api/v1/artifacts/art-share-img?variant=thumb',
+          },
+        ],
+      },
+    ]),
   })
 }
 

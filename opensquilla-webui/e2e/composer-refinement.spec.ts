@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 import { installSidebarFixture } from './support/sidebar-fixture'
+import { expectComposerValue } from './utils'
 import {
   chatHistoryPayload,
   sessionMessagesHydratePayload,
@@ -87,6 +88,21 @@ async function openSplitComposer(page: Page, theme: string) {
   await page.locator('.msg-artifact-chip').getByRole('button', { name: 'Open notes.txt', exact: true }).click()
   await expect(page.getByTestId('workbench-host')).toBeVisible()
   await expect(page.locator('.artifact-preview__text')).toContainText('Synthetic workbench document')
+  // The document reveal can choose its initial split width. Exercise the real
+  // divider to keep this test's deliberately constrained 520px composer.
+  await expect.poll(() => page.getByTestId('workbench-host').evaluate(host => (
+    Math.abs(host.getBoundingClientRect().width - parseFloat((host as HTMLElement).style.getPropertyValue('--workbench-width')))
+  ))).toBeLessThanOrEqual(1)
+  const panelWidth = (await page.locator('.chat-input-panel').boundingBox())!.width
+  const divider = page.getByRole('separator', { name: 'Resize workbench', exact: true })
+  const dividerBox = (await divider.boundingBox())!
+  const dividerX = dividerBox.x + dividerBox.width / 2
+  const dividerY = dividerBox.y + dividerBox.height / 2
+  await page.mouse.move(dividerX, dividerY)
+  await page.mouse.down()
+  await page.mouse.move(dividerX - (panelWidth - 520), dividerY, { steps: 8 })
+  await page.mouse.up()
+  await expect.poll(async () => Math.round((await page.locator('.chat-input-panel').boundingBox())!.width)).toBe(520)
   return { sends: () => sends, aborts: () => aborts }
 }
 
@@ -123,15 +139,15 @@ test('ordinary Escape preserves the displayed and persisted draft across reload'
   })).toBe(draft)
 
   await textarea.press('Escape')
-  await expect(textarea).toHaveValue(draft)
+  await expectComposerValue(textarea, draft)
   await page.reload()
-  await expect(textarea).toHaveValue(draft)
+  await expectComposerValue(textarea, draft)
 
   await page.locator('.chat-run-mode-btn').click()
   await expect(page.locator('.composer-run-mode')).toBeVisible()
   await page.keyboard.press('Escape')
   await expect(page.locator('.composer-run-mode')).toHaveCount(0)
-  await expect(textarea).toHaveValue(draft)
+  await expectComposerValue(textarea, draft)
 })
 
 for (const { width, locale } of [
@@ -142,7 +158,8 @@ for (const { width, locale } of [
   test(`ordinary composer keeps separate hit targets and usable popovers at ${width}px in ${locale}`, async ({ page }, testInfo) => {
     await page.setViewportSize({ width, height: 940 })
     await openComposer(page, locale)
-    const controls = ['.chat-plus-btn', '.chat-project-choose', '.chat-run-mode-btn', '.chat-more-actions-btn', '.chat-model-routing-btn']
+    await page.locator('.chat-textarea').fill('Check every composer control without sending.')
+    const controls = ['.chat-plus-btn', '.chat-project-choose', '.chat-run-mode-btn', '.chat-model-routing-btn', '.chat-send-btn']
     const geometry = await page.locator('.chat-input-footer').evaluate((footer, selectors) => {
       const buttons = selectors.map(selector => footer.querySelector<HTMLElement>(selector)).filter((element): element is HTMLElement => Boolean(element))
       return buttons.map(button => {
@@ -175,13 +192,13 @@ for (const { width, locale } of [
     await expect(page.locator('.composer-run-mode')).toBeVisible()
     await page.keyboard.press('Escape')
     await expect(page.locator('.composer-run-mode')).toHaveCount(0)
-    await page.locator('.chat-more-actions-btn').click()
-    const menu = page.locator('.chat-more-actions-menu')
+    await page.locator('.chat-plus-btn').click()
+    const menu = page.locator('.composer-add-menu')
     await expect(menu).toBeVisible()
     const menuBox = await menu.boundingBox()
     expect(menuBox!.x).toBeGreaterThanOrEqual(0)
     expect(menuBox!.x + menuBox!.width).toBeLessThanOrEqual(width)
-    await page.locator('.chat-more-actions-btn').click()
+    await page.locator('.chat-plus-btn').click()
     await expect(menu).toHaveCount(0)
     await page.locator('.chat-model-routing-btn').click()
     await expect(page.locator('.composer-model-routing')).toBeVisible()
@@ -202,7 +219,7 @@ for (const theme of ['dark', 'light', 'miami']) {
 
     await page.locator('.chat-textarea').fill('Continue the synthetic review.')
     await expect(page.locator('.chat-send-btn')).toBeEnabled()
-    const selectors = ['.chat-plus-btn', '.chat-run-mode-btn', '.chat-more-actions-btn', '.chat-model-routing-btn']
+    const selectors = ['.chat-plus-btn', '.chat-run-mode-btn', '.chat-model-routing-btn']
     const before = await toolbarGeometry(page, [...selectors, '.chat-send-btn'])
     const centers = before.map(box => (box.top + box.bottom) / 2)
     expect(Math.max(...centers) - Math.min(...centers)).toBeLessThanOrEqual(5)
@@ -226,7 +243,7 @@ for (const theme of ['dark', 'light', 'miami']) {
   })
 }
 
-test('520px new-task composer wraps the longer controls without losing the right-edge action', async ({ page }, testInfo) => {
+test('520px new-task composer compacts longer controls without losing the right-edge action', async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 568, height: 940 })
   await openComposer(page)
   // Use the real responsive layout to match the split-chat composer width;
@@ -234,17 +251,19 @@ test('520px new-task composer wraps the longer controls without losing the right
   const initialWidth = (await page.locator('.chat-input-panel').boundingBox())!.width
   await page.setViewportSize({ width: Math.round(568 + 520 - initialWidth), height: 940 })
   await expect.poll(async () => Math.round((await page.locator('.chat-input-panel').boundingBox())!.width)).toBe(520)
+  await page.locator('.chat-textarea').fill('Check compact toolbar without sending.')
   const geometry = await toolbarGeometry(page, [
     '.chat-plus-btn', '.chat-project-choose', '.chat-run-mode-btn',
-    '.chat-more-actions-btn', '.chat-model-routing-btn', '.chat-send-btn',
+    '.chat-model-routing-btn', '.chat-send-btn',
   ])
   const permission = geometry.find(box => box.name === '.chat-run-mode-btn')!
   const model = geometry.find(box => box.name === '.chat-model-routing-btn')!
   const send = geometry.find(box => box.name === '.chat-send-btn')!
-  expect(model.top).toBeGreaterThanOrEqual(permission.bottom)
+  await expect(page.locator('.chat-input-footer')).toHaveAttribute('data-composer-density', 'compact')
+  expect(Math.abs((model.top + model.bottom) / 2 - (permission.top + permission.bottom) / 2)).toBeLessThanOrEqual(5)
   const rightEdge = await page.locator('.chat-input-footer').evaluate(footer => (
     footer.getBoundingClientRect().right - parseFloat(getComputedStyle(footer).paddingRight)
   ))
   expect(Math.abs(send.right - rightEdge)).toBeLessThanOrEqual(2)
-  await page.screenshot({ path: testInfo.outputPath('new-task-520-wrapped.png') })
+  await page.screenshot({ path: testInfo.outputPath('new-task-520-compact.png') })
 })

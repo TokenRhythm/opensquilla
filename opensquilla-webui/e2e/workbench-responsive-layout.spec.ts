@@ -110,6 +110,22 @@ async function expectLayout(page: Page, expectedMode?: 'split' | 'main-only' | '
   const g = await geometry(page)
   expect(g.mode).toBe(expectedMode ?? (g.workspace.width < 841 ? 'main-only' : 'split'))
   expect(g.appMode).toBe(g.mode)
+  const toggle = page.getByTestId('topbar-workbench-toggle')
+  await expect(toggle).toHaveCount(1)
+  const toggleHost = g.mode === 'main-only' ? page.locator('.topbar')
+    : page.locator('.workbench-host__chrome')
+  await expect(toggleHost.getByTestId('topbar-workbench-toggle')).toBeVisible()
+  if (g.mode !== 'main-only') {
+    const toggleBounds = (await toggle.boundingBox())!
+    expect(g.host.right - (toggleBounds.x + toggleBounds.width)).toBeLessThanOrEqual(16)
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+    const close = page.locator('.workbench-host__tab-wrap.is-active .workbench-host__tab-close')
+    if (await close.count()) {
+      const box = (await close.boundingBox())!
+      expect(box.width).toBe(24)
+      expect(box.height).toBe(24)
+    }
+  }
   if (g.mode === 'main-only') await expect(page.getByTestId('topbar-workbench-toggle')).toHaveAttribute('aria-expanded', 'false')
   return g
 }
@@ -176,11 +192,15 @@ async function sampleTransition(page: Page, action: () => Promise<unknown>) {
         const host = document.querySelector<HTMLElement>('[data-testid="workbench-host"]')
         const workspace = document.querySelector<HTMLElement>('.app-workspace')!.getBoundingClientRect()
         const a = pane.getBoundingClientRect(), b = host?.getBoundingClientRect()
+        const toggle = document.querySelector<HTMLElement>('[data-testid="topbar-workbench-toggle"]')!
+        const toggleRect = toggle.getBoundingClientRect()
         samples.push({ time: performance.now() - start, paneVisible: getComputedStyle(pane).display !== 'none',
           paneLeft: a.left, paneRight: a.right, paneWidth: a.width,
           hostVisible: Boolean(host && getComputedStyle(host).display !== 'none'), leaving: Boolean(host?.classList.contains('workbench-presence-leave-active')),
           hostLeft: b?.left ?? 0, hostRight: b?.right ?? 0, hostWidth: b?.width ?? 0,
-          workspaceLeft: workspace.left, workspaceRight: workspace.right, scrollWidth: document.documentElement.scrollWidth, viewportWidth: innerWidth })
+          workspaceLeft: workspace.left, workspaceRight: workspace.right, scrollWidth: document.documentElement.scrollWidth, viewportWidth: innerWidth,
+          toggleInPanel: Boolean(toggle.closest('[data-testid="workbench-host"]')),
+          toggleRight: toggleRect.right, toggleLeft: toggleRect.left })
         if (performance.now() - start < 450) requestAnimationFrame(read)
         else resolve(samples)
       }
@@ -197,6 +217,10 @@ async function sampleTransition(page: Page, action: () => Promise<unknown>) {
       if (sample.paneVisible && sample.paneWidth > 1) expect(sample.hostLeft, JSON.stringify(sample)).toBeGreaterThanOrEqual(Number(sample.paneRight) - 1)
     }
     expect(sample.scrollWidth).toBeLessThanOrEqual(Number(sample.viewportWidth) + 1)
+    if (sample.toggleInPanel && Number(sample.hostWidth) >= 48) {
+      expect(sample.toggleRight).toBeLessThanOrEqual(Number(sample.hostRight) + 1)
+      expect(Number(sample.hostRight) - Number(sample.toggleRight)).toBeLessThanOrEqual(16)
+    }
   }
   return samples
 }
@@ -210,6 +234,46 @@ function expectTrackMotion(samples: Array<Record<string, number | boolean>>, fro
 }
 
 test.describe('actual App responsive workbench layout', () => {
+  test('moves the single pane toggle with its header and preserves keyboard focus and side state', async ({ page }) => {
+    const gateway = await prepare(page)
+    const artifact = gateway.registerDocument(MAIN, 'doc_toggle_focus', 'focus.html')
+    gateway.appendHistory(MAIN, { role: 'assistant', id: 'toggle-focus-artifact', text: 'A completed deliverable.', artifacts: [artifact] })
+    await page.reload()
+    await expect(page.getByTestId('chat-session-action-deliverables')).toBeVisible()
+    const toggle = page.getByTestId('topbar-workbench-toggle')
+    await expect(page.locator('.topbar').getByTestId('topbar-workbench-toggle')).toBeVisible()
+    await toggle.focus()
+    await toggle.press('Enter')
+    await expectLayout(page, 'split')
+    await expect(toggle).toBeFocused()
+    await openPanel(page, 'assistant-chat')
+    await editor(side(page)).fill('Draft survives moving the pane toggle')
+    await toggle.focus()
+    await toggle.press('Enter')
+    await expect(page.getByTestId('workbench-host')).not.toBeVisible()
+    await expect(page.locator('.topbar').getByTestId('topbar-workbench-toggle')).toBeFocused()
+    await toggle.press('Enter')
+    await expectLayout(page, 'split')
+    await expect(toggle).toBeFocused()
+    await expect(editor(side(page))).toHaveText('Draft survives moving the pane toggle')
+    await page.setViewportSize({ width: 840, height: 950 })
+    await expectLayout(page, 'main-only')
+    await expect(toggle).toBeFocused()
+    await page.setViewportSize({ width: 390, height: 950 })
+    await toggle.press('Enter')
+    await expectLayout(page, 'single-pane')
+    await expect(toggle).toBeFocused()
+    await toggle.press('Enter')
+    await expect(page.getByTestId('workbench-host')).not.toBeVisible()
+    await expect(page.locator('.topbar').getByTestId('topbar-workbench-toggle')).toBeFocused()
+    await page.setViewportSize({ width: 1600, height: 950 })
+    await toggle.press('Enter')
+    await expectLayout(page, 'split')
+    await expect(editor(side(page))).toHaveText('Draft survives moving the pane toggle')
+    expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.close' || request.method === 'chat.abort')).toHaveLength(0)
+    expect(gateway.errors).toEqual([])
+  })
+
   test('keeps navigation open at 1200px without overlaying the main conversation', async ({ page }) => {
     const gateway = await prepare(page)
     await openPanel(page, 'assistant-chat')
@@ -563,6 +627,77 @@ test.describe('actual App responsive workbench layout', () => {
     await expectLayout(page)
   })
 
+  for (const theme of ['light', 'dark']) test(`${theme} keeps a single tab close visible and places Add immediately after tabs until overflow`, async ({ page }) => {
+    const gateway = await prepare(page, theme)
+    await showSidebar(page, false)
+    await openPanel(page, 'html')
+    const host = page.getByTestId('workbench-host')
+    const add = page.getByTestId('workbench-new-panel-trigger')
+    const tabs = host.getByRole('tab')
+    const tabGeometry = () => host.evaluate(element => {
+      const strip = element.querySelector<HTMLElement>('[role="tablist"]')!
+      const region = element.querySelector<HTMLElement>('.workbench-host__tab-region')!
+      const last = strip.querySelector<HTMLElement>('.workbench-host__tab-wrap:last-child')!
+      const add = element.querySelector<HTMLElement>('[data-testid="workbench-new-panel-trigger"]')!
+      const actions = element.querySelector<HTMLElement>('.workbench-host__actions')!
+      const s = strip.getBoundingClientRect(), r = region.getBoundingClientRect()
+      const l = last.getBoundingClientRect(), a = add.getBoundingClientRect(), end = actions.getBoundingClientRect()
+      return { overflow: strip.scrollWidth > strip.clientWidth + 1, lastRight: l.right,
+        stripRight: s.right, regionRight: r.right, addLeft: a.left, addRight: a.right, actionsLeft: end.left,
+        rowAligned: Math.abs((a.top + a.bottom) / 2 - (s.top + s.bottom) / 2) <= 1,
+        inViewport: a.left >= 0 && a.right <= innerWidth,
+      }
+    })
+    const expectAddPosition = async (overflow: boolean) => {
+      await expect.poll(async () => {
+        const g = await tabGeometry()
+        const edge = overflow ? g.stripRight : g.lastRight
+        return g.overflow === overflow && g.addLeft >= edge - 1 && g.addLeft - edge <= 8
+          && g.addRight <= g.actionsLeft && g.addRight <= g.regionRight + 1
+          && (!overflow || g.regionRight - g.addRight <= 1) && g.rowAligned && g.inViewport
+      }).toBe(true)
+    }
+    const expectSingleClose = async () => {
+      await expect(tabs).toHaveCount(1)
+      await editor(main(page)).focus()
+      await page.mouse.move(0, 0)
+      const close = host.locator('.workbench-host__tab-close')
+      await expect(close).toHaveCSS('opacity', '1')
+      await expect(close).toHaveCSS('border-radius', '4px')
+      const box = (await close.boundingBox())!
+      expect(box.width).toBe(24)
+      expect(box.height).toBe(24)
+    }
+    await expectSingleClose()
+    await expectAddPosition(false)
+    await openPanel(page, 'code')
+    await expect(tabs).toHaveCount(2)
+    await expectAddPosition(false)
+    for (const kind of ['terminal', 'assistant-chat', 'workspace-files'] as const) await openPanel(page, kind)
+    await expect(tabs).toHaveCount(5)
+    await page.setViewportSize({ width: 390, height: 950 })
+    await expectLayout(page, 'main-only')
+    await page.getByTestId('topbar-workbench-toggle').click()
+    await expectLayout(page, 'single-pane')
+    await expectAddPosition(true)
+    await add.focus()
+    await page.keyboard.press('Enter')
+    await expect(page.getByTestId('workbench-new-panel-menu-list')).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(add).toBeFocused()
+    await page.setViewportSize({ width: 1600, height: 950 })
+    await expectLayout(page, 'split')
+    for (let count = 5; count > 1; count -= 1) {
+      const close = host.locator('.workbench-host__tab-close').last()
+      await close.hover()
+      await close.click()
+      await expect(tabs).toHaveCount(count - 1)
+    }
+    await expectSingleClose()
+    await expectAddPosition(false)
+    expect(gateway.requests.filter(request => request.method === 'chat.abort')).toHaveLength(0)
+  })
+
   test('keeps the selected right tab visible as a multi-tab workspace shrinks', async ({ page }) => {
     const gateway = await prepare(page)
     for (const kind of ['html', 'code', 'terminal', 'assistant-chat'] as const) await openPanel(page, kind)
@@ -581,6 +716,15 @@ test.describe('actual App responsive workbench layout', () => {
         const active = element.querySelector('[role="tab"][aria-selected="true"]')!.getBoundingClientRect()
         return active.left >= tabs.left - 1 && active.right <= tabs.right + 1
       }), { message: 'The active tab must remain inside the visible tab strip after narrowing' }).toBe(true)
+      const close = page.locator('.workbench-host__tab-wrap.is-active .workbench-host__tab-close')
+      for (const activate of [() => close.hover(), () => close.focus()]) {
+        await activate()
+        await expect(close).toHaveCSS('opacity', '1')
+        await expect(close).toHaveCSS('border-radius', '4px')
+        const bounds = (await close.boundingBox())!
+        expect(bounds.width).toBe(24)
+        expect(bounds.height).toBe(24)
+      }
       await expect(editor(side(page))).toHaveText('Retain the active side draft')
       if (width < 841) {
         await page.getByTestId('workbench-return-chat').click()

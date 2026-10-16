@@ -18,6 +18,7 @@ type Request = { id: string; method: string; params?: Record<string, unknown>; t
 const SKILL = { name: 'xlsx', instanceId: 'skill:tables', digest: 'a'.repeat(64) }
 async function installGateway(page: Page, holdFirstSend = false, serverQueue = false, skills = false) {
   let candidateCalls = 0
+  let pendingListCalls = 0
   let skillReceipts: Array<Record<string, unknown>> = []
   const sends: Array<Record<string, unknown>> = []
   const enqueues: Array<Record<string, unknown>> = []
@@ -162,6 +163,7 @@ async function installGateway(page: Page, holdFirstSend = false, serverQueue = f
         finish('cancelled')
         return
       }
+      if (frame.method === 'sessions.pending_inputs.list') pendingListCalls += 1
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
         'commands.list_for_surface': { commands: [] },
@@ -196,6 +198,7 @@ async function installGateway(page: Page, holdFirstSend = false, serverQueue = f
   return {
     sends, aborts, finish, enqueues, dispatches,
     candidateCalls: () => candidateCalls,
+    pendingListCalls: () => pendingListCalls,
     loadSkill: (source: 'user' | 'auto' = 'user') => {
       if (!activeTask) throw new Error('No active synthetic task')
       const receipt = { ...SKILL, source, status: 'loaded', turnId: activeTask.task_id }
@@ -333,6 +336,8 @@ for (const { changeAuthority, reload, label } of [
     await openChat(page)
     const input = page.locator('.chat-textarea')
     const send = page.locator('.chat-send-btn[aria-label="Send"]')
+    // Connection readiness does not await durable identity hashing / WAL hydration.
+    await expect.poll(gateway.pendingListCalls).toBeGreaterThan(0)
     gateway.disconnect()
     await expect(page.locator('.topbar[data-connection-state="connected"]')).toHaveCount(0)
     await input.fill('Synthetic never-sent offline draft.')
@@ -368,6 +373,8 @@ test('a new browser tab recovers the original identity and durable offline draft
   test.skip(process.env.OPENSQUILLA_E2E_NATIVE_DESKTOP === '1', 'Browser tab replacement uses a browser context')
   const gateway = await installGateway(page, false, true)
   await openChat(page)
+  // The server queue read proves the identity required by this offline scenario.
+  await expect.poll(gateway.pendingListCalls).toBeGreaterThan(0)
   gateway.disconnect()
   await expect(page.locator('.topbar[data-connection-state="connected"]')).toHaveCount(0)
   await page.locator('.chat-textarea').fill('Synthetic durable draft for a replacement tab.')

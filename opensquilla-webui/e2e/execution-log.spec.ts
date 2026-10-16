@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { createHash } from 'node:crypto'
 import { helloOkResponse } from './support/gateway-fixture'
 import {
   chatHistoryPayload,
@@ -10,12 +11,19 @@ import {
 const SESSION_KEY = 'agent:main:webchat:e2e-execution-log'
 const HANDLE = `tr-${'a'.repeat(32)}`
 const PREFIX_LENGTH = 9 * 1024 * 1024
-const MIDDLE = 'MIDDLE_ERROR: 故障🙂\n'
-const LOG = 'x'.repeat(PREFIX_LENGTH) + MIDDLE + 'z'.repeat(14000)
+const MIDDLE = '🙂\nMIDDLE_ERROR: 故障\n'
 const PREVIEW = 'Execution failed. Output preview only.'
 
-async function mockExecutionLog(page: Page) {
+async function mockExecutionLog(page: Page, options: { large?: boolean; holdFirstPage?: boolean } = {}) {
   const offsets: number[] = []
+  // Put an astral character exactly at the first page boundary. Newlines keep
+  // the ordinary log within the inline rendering budget, independently of the
+  // separate >8 MiB download case below.
+  const prefix = options.large ? 'x'.repeat(PREFIX_LENGTH) : `${'x'.repeat(79)}\n`.repeat(149) + 'x'.repeat(79)
+  const tail = MIDDLE + (options.large ? 'z'.repeat(14000) : `${'z'.repeat(79)}\n`.repeat(175))
+  const log = prefix + tail
+  const tailPoints = Array.from(tail)
+  let firstReply: (() => void) | undefined
   await page.addInitScript(() => window.localStorage.setItem('opensquilla-locale', 'en'))
   await page.routeWebSocket(/\/ws$/, ws => {
     ws.onMessage(message => {
@@ -32,6 +40,7 @@ async function mockExecutionLog(page: Page) {
             tool_calls: [{
               tool_use_id: 'execution-call', name: 'exec', groupId: 'execution-group',
               input: { command: 'synthetic-test' }, result: PREVIEW,
+              result_truncated: true, result_original_chars: prefix.length + tailPoints.length,
               execution_log_handle: HANDLE, is_error: true, execution_status: { status: 'error' },
             }],
             timeline: [{ type: 'tool-group', groupId: 'execution-group' }],
@@ -48,17 +57,18 @@ async function mockExecutionLog(page: Page) {
           offsets.push(start)
           // The backend indexes Unicode code points; an astral character must not
           // move the next page by two positions as a JavaScript string would.
-          const prefix = 'x'.repeat(Math.min(12000, Math.max(0, PREFIX_LENGTH - start)))
-          const suffixOffset = Math.max(0, start - PREFIX_LENGTH)
-          const content = prefix + Array.from(LOG.slice(PREFIX_LENGTH))
-            .slice(suffixOffset, suffixOffset + 12000 - prefix.length).join('')
+          const head = prefix.slice(start, start + 12000)
+          const suffixOffset = Math.max(0, start - prefix.length)
+          const content = head + tailPoints.slice(suffixOffset, suffixOffset + 12000 - head.length).join('')
           const end = start + Array.from(content).length
-          const total = LOG.length - 1
-          reply({
+          const total = prefix.length + tailPoints.length
+          const sendPage = () => reply({
             storage_kind: 'execution_log', handle: HANDLE, offset: start, content,
             returned_chars: Array.from(content).length, chars: total,
             next_offset: end < total ? end : null, complete: true,
           })
+          if (options.holdFirstPage && offsets.length === 1) firstReply = sendPage
+          else sendPage()
           return
         }
         default: reply({})
@@ -66,46 +76,83 @@ async function mockExecutionLog(page: Page) {
     })
     ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
   })
-  return offsets
+  return { offsets, log, releaseFirstPage: () => firstReply?.() }
 }
 
-test('execution logs are fetched by page independently of the model result preview', async ({ page, context }) => {
-  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
-  const offsets = await mockExecutionLog(page)
-  await page.goto(`/control/chat?session=${encodeURIComponent(SESSION_KEY)}`)
+async function expandExecution(page: Page) {
   const activity = page.getByTestId('assistant-activity')
   await expect(activity).toBeVisible()
-  await expect(activity.locator('.assistant-activity__summary')).toContainText('Completed')
   await activity.locator('.assistant-activity__summary').click()
   const row = activity.locator('.tool-row').first()
   await expect(row).toBeVisible()
   if (await row.getAttribute('aria-expanded') !== 'true') await row.click()
-  await activity.locator('.activity-tool-details__view, .activity-tool-details__hit-target, .activity-tool-details__fallback').first().click()
-  const modal = page.locator('.tool-sheet')
-  await expect(modal).toBeVisible()
-  await expect(modal.locator('.tool-sheet__pre')).toContainText(PREVIEW)
+  return activity
+}
+
+test('execution logs page inline without losing Unicode or confusing the retained model preview', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+  const { offsets, log, releaseFirstPage } = await mockExecutionLog(page, { holdFirstPage: true })
+  await page.goto(`/control/chat?session=${encodeURIComponent(SESSION_KEY)}`)
   expect(offsets).toHaveLength(0)
-  await modal.getByRole('button', { name: 'View execution log', exact: true }).click()
-  await expect(modal.locator('[role="status"]')).toContainText('Characters 1–12000')
-  await modal.getByRole('spinbutton').fill(String(PREFIX_LENGTH))
-  await modal.getByRole('button', { name: 'Go', exact: true }).click()
-  const visible = modal.locator('.tool-sheet__pre')
+  const activity = await expandExecution(page)
+  const visible = activity.locator('.activity-code-details__output')
+  await expect.poll(() => offsets).toEqual([0])
+  await expect(visible).toContainText(PREVIEW)
+  releaseFirstPage()
+  await expect(visible).toHaveText(Array.from(log).slice(0, 12000).join(''))
+  await expect(visible).not.toContainText(PREVIEW)
+  const viewport = activity.locator('.activity-code-details__viewport')
+  await viewport.focus()
+  await viewport.press('Control+End')
+  await expect.poll(() => offsets).toEqual([0, 12000])
   await expect(visible).toContainText(MIDDLE)
-  expect(Array.from(await visible.textContent() || '').length).toBe(12000)
-  await modal.getByRole('button', { name: 'Copy this page', exact: true }).click()
-  const visibleText = await visible.textContent() || ''
+  await activity.getByTestId('activity-tool-detail-copy').click()
+  await expect.poll(() => offsets).toEqual([0, 12000, 24000])
+  await expect(visible).toHaveText(log)
+  await expect(activity.getByTestId('activity-tool-detail-copy')).toHaveAttribute('aria-label', 'Copied')
+  const visibleText = `$ synthetic-test\n\n${log}`
   // Windows' native clipboard represents line breaks as CRLF. Keep the
   // returned bytes exact; only the expected platform representation changes.
   const windowsClipboard = await page.evaluate(() => navigator.platform.startsWith('Win'))
   const expectedClipboard = windowsClipboard ? visibleText.replace(/\r?\n/g, '\r\n') : visibleText
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(expectedClipboard)
-  await modal.getByRole('button', { name: 'Next', exact: true }).click()
-  await expect(visible).not.toContainText(MIDDLE)
-  await expect(modal.getByRole('button', { name: 'Next', exact: true })).toBeDisabled()
-  expect(offsets).toEqual([0, PREFIX_LENGTH, PREFIX_LENGTH + 12000])
-  await modal.getByRole('button', { name: 'Tool result', exact: true }).click()
-  await expect(visible).toContainText(PREVIEW)
-  await expect(visible).not.toContainText(MIDDLE)
+  await viewport.focus()
+  await viewport.press('Control+End')
+  expect(offsets).toEqual([0, 12000, 24000])
+  await expect(page.locator('.tool-sheet')).toHaveCount(0)
+})
+
+test('oversized execution logs remain bounded inline and download the complete retained bytes', async ({ page }) => {
+  const { offsets, log } = await mockExecutionLog(page, { large: true })
+  // File-picker interaction is native and cannot be driven by Playwright.
+  // Capture only that boundary; real UI, RPC pagination and stream writer run.
+  await page.addInitScript(() => {
+    const capture = { name: '', digest: '', bytes: 0, closed: false, aborted: false }
+    Object.assign(window, { executionDownload: capture, showSaveFilePicker: async ({ suggestedName }: { suggestedName: string }) => {
+      capture.name = suggestedName
+      const chunks: Uint8Array[] = []
+      return { createWritable: async () => ({
+        write: async (chunk: Uint8Array) => { chunks.push(chunk); capture.bytes += chunk.length },
+        close: async () => {
+          const bytes = await new Blob(chunks).arrayBuffer()
+          capture.digest = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)))
+            .map(value => value.toString(16).padStart(2, '0')).join('')
+          capture.closed = true
+        },
+        abort: async () => { capture.aborted = true },
+      }) }
+    } })
+  })
+  await page.goto(`/control/chat?session=${encodeURIComponent(SESSION_KEY)}`)
+  const activity = await expandExecution(page)
+  await expect(activity.getByTestId('tool-content-truncated')).toBeVisible()
+  expect((await activity.locator('.activity-code-details__output').textContent())?.length).toBeLessThanOrEqual(8192)
+  await activity.getByTestId('activity-tool-detail-download').click()
+  await expect.poll(() => page.evaluate(() => (window as unknown as { executionDownload: { closed: boolean } }).executionDownload.closed)).toBe(true)
+  const saved = await page.evaluate(() => (window as unknown as { executionDownload: Record<string, unknown> }).executionDownload)
+  expect(saved).toEqual({ name: 'command-output.txt', digest: createHash('sha256').update(log).digest('hex'), bytes: Buffer.byteLength(log), closed: true, aborted: false })
+  expect(offsets).toEqual([0, ...Array.from({ length: Math.ceil((log.length - 1) / 12000) }, (_, index) => index * 12000)])
+  expect((await activity.locator('.activity-code-details__output').textContent())?.length).toBeLessThanOrEqual(8192)
 })
 
 test('shows PTY fallback in the collapsed activity row', async ({ page }) => {
@@ -163,13 +210,10 @@ test('shows PTY fallback in the collapsed activity row', async ({ page }) => {
   await row.click()
   await expect(activity.locator('.activity-tool-details__execution-io'))
     .toContainText('TTY unavailable; using a regular pipe')
-  await activity.locator('.activity-tool-details__view, .activity-tool-details__hit-target, .activity-tool-details__fallback').first().click()
-  const modal = page.locator('.tool-sheet')
-  await expect(modal).toBeVisible()
-  await expect(modal.locator('.tool-sheet__execution-io'))
-    .toContainText('TTY unavailable; using a regular pipe')
-  await expect(modal.locator('.tool-sheet__execution-io-reason'))
+  await expect(activity.locator('.activity-tool-details__execution-io-reason'))
     .toContainText('PTY backend unavailable')
+  await expect(activity.locator('.activity-code-details__output')).toHaveText('pipe output')
+  await expect(page.locator('.tool-sheet')).toHaveCount(0)
   await page.screenshot({ path: 'output/playwright/execution-io-fallback.png', fullPage: true })
   expect(pageErrors).toEqual([])
 })

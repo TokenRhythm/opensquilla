@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { expectComposerValue } from './utils'
 
 // Native Chromium rendering of the production notice/composer components.
 // Transport transitions are fixture-controlled; real Gateway acceptance is separate.
@@ -19,14 +20,14 @@ for (const seconds of [1, 3]) {
     await expect(page.locator('.chat-send-btn')).toBeDisabled()
     await expect(page.getByTestId('evidence')).toContainText('实际连接：connected', { timeout: 6_000 })
     await expect(page.getByTestId('evidence')).toContainText('顶栏提示出现：0 次；聊天提示出现：0 次')
-    await expect(draft).toHaveValue('Draft retained while reconnecting')
+    await expectComposerValue(draft, 'Draft retained while reconnecting')
     await expect(page.locator('.chat-send-btn')).toBeEnabled()
   })
 }
 
 test('persistent failure reveals recovery controls; recovery removes them without losing the draft', async ({ page }, testInfo) => {
   const draft = page.locator('.chat-textarea')
-  const text = await draft.inputValue()
+  const text = await draft.evaluate(element => String((element as HTMLElement & { value: string }).value))
   await page.getByRole('button', { name: '持续断线', exact: true }).click()
   await expect(page.getByTestId('connection-status')).toHaveCount(0)
   await expect(page.getByTestId('chat-session-recovery-status')).toHaveCount(0)
@@ -38,7 +39,7 @@ test('persistent failure reveals recovery controls; recovery removes them withou
   await page.getByRole('button', { name: '恢复连接', exact: true }).click()
   await expect(page.getByTestId('connection-status')).toHaveCount(0)
   await expect(page.getByTestId('chat-session-recovery-status')).toHaveCount(0)
-  await expect(draft).toHaveValue(text)
+  await expectComposerValue(draft, text)
 })
 
 test('a rejected recovery or attempted blocked send gives immediate, local feedback', async ({ page }, testInfo) => {

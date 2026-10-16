@@ -224,5 +224,5 @@ test('Gateway logs load once on open and once per refresh, without polling while
   await page.getByRole('dialog', { name: 'Settings', exact: true })
     .getByRole('button', { name: 'Close', exact: true }).click()
   await page.clock.runFor(1_000)
-  await expect(page).toHaveURL(/\/chat$/)
+  await expect(page).toHaveURL(/\/chat\/new$/)
 })

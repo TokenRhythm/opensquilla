@@ -339,6 +339,21 @@ async function installMockGateway(
         ws.send(successResponse(frame.id, committedHistory(state, frame.params || {})))
         return
       }
+      if (method === 'sessions.list') {
+        // A committed admission is discoverable after a full App reload too.
+        // Keep the directory consistent with the transcript/task fixture.
+        const sessions = [...new Set(state.turns.map(turn => turn.sessionKey))].map(key => {
+          const turns = state.turns.filter(turn => turn.sessionKey === key)
+          return {
+            key, title: turns[0]!.message, sessionKind: 'chat', surface: 'webchat',
+            conversationKind: 'direct', effectiveAgentId: 'main',
+            updatedAt: turns.at(-1)!.createdAt, messageCount: turns.length,
+            status: 'ok', runStatus: committedMetadata(state, key).run_status,
+          }
+        })
+        ws.send(successResponse(frame.id, { sessions, count: sessions.length, ts: 1_800_000_000, has_more: false }))
+        return
+      }
       if (method === 'turns.receipt.get') {
         const params = frame.params || {}
         state.receiptQueries.push(params)
@@ -947,6 +962,13 @@ test.describe('durable handoff and pending order release gate', () => {
     await expect(page.locator('.topbar[data-connection-state="connected"]')).toHaveCount(0)
     await expect.poll(async () => (await readDelivery()).record.phase).toBe('unknown')
     expect((await readDelivery()).record.response).toBeUndefined()
+    // ACK loss surfaces a transient failure toast above the composer. Dismiss
+    // it through its real button before pressing Stop: the pointer left on Send
+    // also pauses the toast while it overlaps that location.
+    const lostAckToast = page.getByTestId('toast').filter({ hasText: 'This request did not finish.' })
+    await expect(lostAckToast).toBeVisible()
+    await lostAckToast.getByRole('button', { name: 'Dismiss notification', exact: true }).click()
+    await expect(lostAckToast).toHaveCount(0)
     const stopButton = page.getByRole('button', { name: 'Stop current response', exact: true })
     await expect(stopButton).toBeVisible()
     await stopButton.click()
@@ -972,45 +994,34 @@ test.describe('durable handoff and pending order release gate', () => {
     await page.locator('a[href$="/usage"]').first().click()
     await expect(page).toHaveURL(/\/usage(?:\?|$)/)
     await expect(page.locator('.chat')).toHaveCount(0)
-    const notice = page.getByTestId('delivery-recovery-notice')
-    await expect(notice).toBeVisible()
-    // ACK loss surfaces the existing transient failure toast. A user can
-    // dismiss it before using the bottom recovery notice; keep real clicks.
-    const lostAckToast = page.getByTestId('toast').filter({ hasText: 'The task did not finish. Please try again later.' })
-    await expect(lostAckToast).toBeVisible()
-    await lostAckToast.getByRole('button', { name: 'Dismiss notification', exact: true }).click()
-    await expect(lostAckToast).toHaveCount(0)
-    await notice.getByRole('button', { name: 'View details', exact: true }).click({ timeout: 5_000 })
-    await expect(notice).toContainText('Stop will continue after the original task is confirmed.')
-    const noticeScreenshot = testInfo.outputPath('usage-expanded-delivery-notice.png')
-    await page.screenshot({ path: noticeScreenshot })
-    await testInfo.attach('Usage delivery actions after chat unmount', {
-      path: noticeScreenshot, contentType: 'image/png',
-    })
-    // Use the same App and unresolved delivery at a narrow viewport. Close the
-    // real sidebar before it becomes a modal drawer; do not remove overlays.
+    // The actual App owner finishes its finite not-found round after ChatView
+    // has unmounted. #1862 removed the global recovery panel; presentation is
+    // session-local, while recovery and its lease still belong to the App.
+    await expect(page.getByTestId('delivery-recovery-notice')).toHaveCount(0)
+    await expect.poll(() => gateway.receiptQueries.length, { timeout: 10_000 }).toBe(4)
+    await expect.poll(async () => (await readDelivery()).record.lease?.expiresAt).toBe(0)
+    expect((await readDelivery()).record.lease?.owner).toBe(initialOwner)
+    const originalSessionButton = page.locator(`.sidebar-history-row[data-session-key="${sessionKey}"] .sidebar-history-item`)
+    await originalSessionButton.click()
+    await expect(page).toHaveURL(url => url.pathname.endsWith('/chat') && url.searchParams.get('session') === sessionKey)
+    await expectSingletonChat(page)
+    const notice = page.getByTestId('chat-delivery-recovery')
+    await expect(notice).toContainText('Message status needs confirmation')
+    await expect(notice).toContainText(text)
+    await expect(notice).toContainText('Automatic checks have paused.')
+    // The existing session card is the discoverable manual recovery entry.
+    // Exercise its real narrow-screen hit target without issuing another read.
     await page.getByTestId('sidebar-toggle-expanded').click()
     await page.setViewportSize({ width: 390, height: 844 })
-    await notice.getByRole('button', { name: 'Hide details', exact: true }).click({ timeout: 5_000 })
-    await notice.getByRole('button', { name: 'View details', exact: true }).click({ timeout: 5_000 })
-    await expect(notice).toContainText('Stop will continue after the original task is confirmed.')
-    await notice.getByRole('button', { name: 'Open conversation', exact: true }).click({ trial: true, timeout: 5_000 })
-    const mobileNoticeScreenshot = testInfo.outputPath('usage-mobile-expanded-delivery-notice.png')
+    await notice.getByRole('button', { name: 'Check delivery status', exact: true }).click({ trial: true, timeout: 5_000 })
+    await expect.poll(() => page.locator('#app-main').evaluate(element => element.getBoundingClientRect().x)).toBe(0)
+    const mobileNoticeScreenshot = testInfo.outputPath('chat-mobile-delivery-recovery.png')
     await page.screenshot({ path: mobileNoticeScreenshot })
-    await testInfo.attach('Narrow Usage recovery controls remain reachable', {
+    await testInfo.attach('Narrow session recovery controls remain reachable', {
       path: mobileNoticeScreenshot, contentType: 'image/png',
     })
     await page.setViewportSize({ width: 1440, height: 900 })
     await page.getByTestId('sidebar-toggle-collapsed').click()
-    // The actual App owner finishes its finite not-found round after ChatView
-    // has unmounted. Its lease stays with the same owner, and is released.
-    await expect.poll(() => gateway.receiptQueries.length, { timeout: 10_000 }).toBe(4)
-    await expect.poll(async () => (await readDelivery()).record.lease?.expiresAt).toBe(0)
-    await expect(notice).toContainText('Automatic checks have paused.')
-    expect((await readDelivery()).record.lease?.owner).toBe(initialOwner)
-    await notice.getByRole('button', { name: 'Open conversation', exact: true }).click()
-    await expect(page).toHaveURL(url => url.pathname.endsWith('/chat') && url.searchParams.get('session') === sessionKey)
-    await expectSingletonChat(page)
     expect(gateway.connectionCount).toBe(connectedBeforeNavigation)
     expect((await readDelivery()).record.lease?.owner).toBe(initialOwner)
     expect((await readDelivery()).record.stop?.requested).toBe(true)
@@ -1025,7 +1036,7 @@ test.describe('durable handoff and pending order release gate', () => {
     gateway.holdReceiptReplies()
     await page.reload()
     await expect.poll(() => gateway.waitingHandshakeCount).toBe(1)
-    await expect(page.getByTestId('delivery-recovery-notice')).toBeVisible()
+    await expect(page.locator('.chat')).toHaveCount(0)
     const unconfirmed = await readDelivery()
     expect(unconfirmed.count).toBe(1)
     expect(unconfirmed.record).toMatchObject({ ownerRequestId: requestId, phase: 'unknown',
@@ -1036,7 +1047,7 @@ test.describe('durable handoff and pending order release gate', () => {
 
     // Same authenticated Gateway + account; the already committed receipt now
     // becomes available. Keep the read pending to observe real single-flight
-    // and lease ownership while the global notice also requests a recheck.
+    // and lease ownership while the session-local action requests a recheck.
     state.handoffTargets[requestId] = sessionKey
     gateway.releaseConnections()
     await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
@@ -1046,11 +1057,14 @@ test.describe('durable handoff and pending order release gate', () => {
     expect(replacementRecord.lease?.owner).not.toBe(initialOwner)
     expect(replacementRecord.lease!.epoch).toBeGreaterThan(originalRecord.lease!.epoch)
     expect(replacementRecord.lease!.expiresAt).toBeGreaterThan(Date.now())
-    const replacementNotice = page.getByTestId('delivery-recovery-notice')
-    await replacementNotice.getByRole('button', { name: 'View details', exact: true }).click({ timeout: 5_000 })
-    await replacementNotice.getByRole('button', { name: 'Check again', exact: true }).click()
+    await originalSessionButton.click()
+    await expect(page).toHaveURL(url => url.pathname.endsWith('/chat') && url.searchParams.get('session') === sessionKey)
+    await expectSingletonChat(page)
+    const replacementNotice = page.getByTestId('chat-delivery-recovery')
+    await expect(replacementNotice).toContainText(text)
+    await replacementNotice.getByRole('button', { name: 'Check delivery status', exact: true }).click()
     await expect.poll(async () => (await readDelivery()).record.revision).toBeGreaterThan(replacementRecord.revision)
-    await expect(replacementNotice.getByRole('button', { name: 'Check again', exact: true })).toBeEnabled()
+    await expect(replacementNotice.getByRole('button', { name: 'Check delivery status', exact: true })).toBeEnabled()
     expect(gateway.socketCount).toBe(1)
     expect(gateway.receiptInFlight).toBe(1)
     expect(gateway.receiptQueries).toHaveLength(5)

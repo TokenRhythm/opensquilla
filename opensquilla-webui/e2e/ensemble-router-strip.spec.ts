@@ -1,5 +1,9 @@
 import { expect, test, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload, sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload, sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-ensemble-router'
@@ -114,13 +118,14 @@ async function mockEnsembleHistory(page: Page, complexity: Complexity) {
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
+        const key = String(frame.params?.key || frame.params?.sessionKey || '')
         if (method === 'connect') {
           ws.send(helloOkResponse())
           return
         }
         const payloads: Record<string, unknown> = {
           'agents.list': { agents: [] },
-          'chat.history': { messages: messagesFor(complexity), has_more: false },
+          'chat.history': chatHistoryPayload(messagesFor(complexity)),
           'commands.list_for_surface': { commands: [] },
           'config.get': {
             squilla_router: { enabled: true, rollout_phase: 'full', tiers: {} },
@@ -129,12 +134,9 @@ async function mockEnsembleHistory(page: Page, complexity: Complexity) {
             skills: {},
           },
           'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-          'sessions.messages.subscribe': {
-            subscribed: true,
-            replay_complete: true,
-            current_stream_seq: 0,
-            run_status: 'idle',
-          },
+          'sessions.messages.subscribe': sessionMessagesSubscribePayload(key),
+          'sessions.messages.snapshot': sessionMessagesSnapshotPayload(key),
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(key),
           'usage.status': { sessions: [] },
         }
 
@@ -161,6 +163,7 @@ async function mockStreamingEnsembleRun(page: Page) {
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
+        const key = String(frame.params?.key || frame.params?.sessionKey || '')
         if (method === 'connect') {
           ws.send(helloOkResponse())
           return
@@ -196,7 +199,7 @@ async function mockStreamingEnsembleRun(page: Page) {
         }
         const payloads: Record<string, unknown> = {
           'agents.list': { agents: [] },
-          'chat.history': { messages: [], has_more: false },
+          'chat.history': chatHistoryPayload(),
           'commands.list_for_surface': { commands: [] },
           'config.get': {
             squilla_router: { enabled: true, rollout_phase: 'full', tiers: {} },
@@ -205,12 +208,9 @@ async function mockStreamingEnsembleRun(page: Page) {
             skills: {},
           },
           'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-          'sessions.messages.subscribe': {
-            subscribed: true,
-            replay_complete: true,
-            current_stream_seq: 0,
-            run_status: 'idle',
-          },
+          'sessions.messages.subscribe': sessionMessagesSubscribePayload(key),
+          'sessions.messages.snapshot': sessionMessagesSnapshotPayload(key),
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(key),
           'usage.status': { sessions: [] },
         }
 
@@ -239,6 +239,7 @@ async function mockStreamingEnsembleWithProgress(page: Page) {
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
+        const key = String(frame.params?.key || frame.params?.sessionKey || '')
         if (method === 'connect') {
           ws.send(helloOkResponse())
           return
@@ -264,7 +265,7 @@ async function mockStreamingEnsembleWithProgress(page: Page) {
         }
         const payloads: Record<string, unknown> = {
           'agents.list': { agents: [] },
-          'chat.history': { messages: [], has_more: false },
+          'chat.history': chatHistoryPayload(),
           'commands.list_for_surface': { commands: [] },
           'config.get': {
             squilla_router: { enabled: true, rollout_phase: 'full', tiers: {} },
@@ -273,7 +274,9 @@ async function mockStreamingEnsembleWithProgress(page: Page) {
             skills: {},
           },
           'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-          'sessions.messages.subscribe': { subscribed: true, replay_complete: true, current_stream_seq: 0, run_status: 'idle' },
+          'sessions.messages.subscribe': sessionMessagesSubscribePayload(key),
+          'sessions.messages.snapshot': sessionMessagesSnapshotPayload(key),
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(key),
           'usage.status': { sessions: [] },
         }
         ws.send(wsResponse(String(frame.id), payloads[method] ?? {}))
@@ -316,6 +319,7 @@ async function mockControlledEnsembleLifecycle(page: Page) {
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
+        const key = String(frame.params?.key || frame.params?.sessionKey || '')
         if (method === 'connect') {
           ws.send(helloOkResponse({
             policy: { webui_stream_idle_grace_ms: 1_260_000 },
@@ -348,7 +352,7 @@ async function mockControlledEnsembleLifecycle(page: Page) {
         }
         const payloads: Record<string, unknown> = {
           'agents.list': { agents: [] },
-          'chat.history': { messages: [], has_more: false },
+          'chat.history': chatHistoryPayload(),
           'commands.list_for_surface': { commands: [] },
           'config.get': {
             squilla_router: { enabled: true, rollout_phase: 'full', tiers: {} },
@@ -357,9 +361,9 @@ async function mockControlledEnsembleLifecycle(page: Page) {
             skills: {},
           },
           'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-          'sessions.messages.subscribe': {
-            subscribed: true, replay_complete: true, current_stream_seq: 0, run_status: 'idle',
-          },
+          'sessions.messages.subscribe': sessionMessagesSubscribePayload(key),
+          'sessions.messages.snapshot': sessionMessagesSnapshotPayload(key),
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(key),
           'usage.status': { sessions: [] },
         }
         ws.send(wsResponse(String(frame.id), payloads[method] ?? {}))
@@ -409,6 +413,7 @@ async function mockEnsembleScrollRetention(page: Page) {
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
+        const key = String(frame.params?.key || frame.params?.sessionKey || '')
         if (method === 'connect') {
           ws.send(helloOkResponse())
           return
@@ -440,7 +445,7 @@ async function mockEnsembleScrollRetention(page: Page) {
         }
         const payloads: Record<string, unknown> = {
           'agents.list': { agents: [] },
-          'chat.history': { messages: [], has_more: false },
+          'chat.history': chatHistoryPayload(),
           'commands.list_for_surface': { commands: [] },
           'config.get': {
             squilla_router: { enabled: true, rollout_phase: 'full', tiers: {} },
@@ -449,7 +454,9 @@ async function mockEnsembleScrollRetention(page: Page) {
             skills: {},
           },
           'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-          'sessions.messages.subscribe': { subscribed: true, replay_complete: true, current_stream_seq: 0, run_status: 'idle' },
+          'sessions.messages.subscribe': sessionMessagesSubscribePayload(key),
+          'sessions.messages.snapshot': sessionMessagesSnapshotPayload(key),
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(key),
           'usage.status': { sessions: [] },
         }
         ws.send(wsResponse(String(frame.id), payloads[method] ?? {}))
@@ -540,6 +547,8 @@ test('a tiny upward wheel pauses an active stream until the reader returns', asy
   await thread.hover({ position: { x: 120, y: 120 } })
   await page.mouse.wheel(0, -8)
   await expect(latest).toBeVisible()
+  // Wheel intent updates synchronously; native scrolling commits on a later frame.
+  await expect.poll(() => threadMetrics(page).then(metrics => metrics.gap)).toBeGreaterThan(2)
   const paused = await threadMetrics(page)
   expect(paused.gap).toBeGreaterThan(2)
   expect(paused.gap).toBeLessThan(60)
@@ -601,7 +610,7 @@ test('ensemble routing reveals members incrementally from ensemble_progress even
   await expect(inspector.locator('.router-fx-inspector__row[data-status="running"] .router-fx-inspector__spin')).toHaveCount(1)
 })
 
-test('ensemble lifecycle replaces telemetry pending immediately and completes after aggregation', async ({ page }) => {
+test('ensemble lifecycle replaces telemetry pending immediately and settles only after turn completion', async ({ page }) => {
   const lifecycle = await mockControlledEnsembleLifecycle(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY))
   await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
@@ -664,8 +673,10 @@ test('ensemble lifecycle replaces telemetry pending immediately and completes af
   })
   await expect(inspector.locator('.router-fx-inspector__row[data-status="done"]')).toHaveCount(4)
   await expect(inspector).toContainText('12s')
-  await expect(strip.locator('[data-testid="router-ensemble-toggle"]')).toHaveAttribute('aria-busy', 'false')
-  await expect(strip.locator('.router-fx-ensemble__scan')).toHaveCount(0)
+  // Aggregator telemetry can finish before the turn continues into fallback.
+  // Only the terminal done event may settle the enclosing turn.
+  await expect(strip.locator('[data-testid="router-ensemble-toggle"]')).toHaveAttribute('aria-busy', 'true')
+  await expect(strip.locator('.router-fx-ensemble__scan')).toBeVisible()
 
   lifecycle.emit('session.event.text_delta', { text: 'Lifecycle answer complete.' })
   lifecycle.emit('session.event.done', {
@@ -681,6 +692,8 @@ test('ensemble lifecycle replaces telemetry pending immediately and completes af
     },
   })
   await expect(page.locator('.chat-thread')).toContainText('Lifecycle answer complete.')
+  await expect(strip.locator('[data-testid="router-ensemble-toggle"]')).toHaveAttribute('aria-busy', 'false')
+  await expect(strip.locator('.router-fx-ensemble__scan')).toHaveCount(0)
   await expect(strip.locator('[data-testid="router-ensemble-toggle"]')).toContainText('3 candidates synthesized')
   await expect(strip.locator('[data-testid="router-ensemble-toggle"]'))
     .toHaveAttribute('aria-expanded', 'true')
@@ -707,6 +720,7 @@ async function mockEnsembleModeWithTierDecision(page: Page) {
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
+        const key = String(frame.params?.key || frame.params?.sessionKey || '')
         if (method === 'connect') { ws.send(helloOkResponse()); return }
         if (method === 'chat.send') {
           ws.send(wsResponse(String(frame.id), { accepted: true, session: TIER_SESSION_KEY, task_id: 'tier-task', stream_seq: 1 }))
@@ -722,7 +736,7 @@ async function mockEnsembleModeWithTierDecision(page: Page) {
         }
         const payloads: Record<string, unknown> = {
           'agents.list': { agents: [] },
-          'chat.history': { messages: [], has_more: false },
+          'chat.history': chatHistoryPayload(),
           'commands.list_for_surface': { commands: [] },
           'config.get': {
             squilla_router: {
@@ -737,7 +751,9 @@ async function mockEnsembleModeWithTierDecision(page: Page) {
             permissions: {}, skills: {},
           },
           'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-          'sessions.messages.subscribe': { subscribed: true, replay_complete: true, current_stream_seq: 0, run_status: 'idle' },
+          'sessions.messages.subscribe': sessionMessagesSubscribePayload(key),
+          'sessions.messages.snapshot': sessionMessagesSnapshotPayload(key),
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(key),
           'usage.status': { sessions: [] },
         }
         ws.send(wsResponse(String(frame.id), payloads[method] ?? {}))
@@ -774,6 +790,7 @@ test('ensemble inspector stays open while the answer keeps streaming', async ({ 
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
+        const key = String(frame.params?.key || frame.params?.sessionKey || '')
         if (method === 'connect') { ws.send(helloOkResponse()); return }
         if (method === 'chat.send') {
           ws.send(wsResponse(String(frame.id), { accepted: true, session: KEY, task_id: 'persist-task', stream_seq: 1 }))
@@ -792,11 +809,13 @@ test('ensemble inspector stays open while the answer keeps streaming', async ({ 
         }
         const payloads: Record<string, unknown> = {
           'agents.list': { agents: [] },
-          'chat.history': { messages: [], has_more: false },
+          'chat.history': chatHistoryPayload(),
           'commands.list_for_surface': { commands: [] },
           'config.get': { squilla_router: { enabled: true, rollout_phase: 'full', tiers: {} }, llm_ensemble: { enabled: true }, permissions: {}, skills: {} },
           'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-          'sessions.messages.subscribe': { subscribed: true, replay_complete: true, current_stream_seq: 0, run_status: 'idle' },
+          'sessions.messages.subscribe': sessionMessagesSubscribePayload(key),
+          'sessions.messages.snapshot': sessionMessagesSnapshotPayload(key),
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(key),
           'usage.status': { sessions: [] },
         }
         ws.send(wsResponse(String(frame.id), payloads[method] ?? {}))
@@ -860,19 +879,20 @@ test('live ensemble strip disables all animation under prefers-reduced-motion', 
 })
 
 for (const complexity of ['simple', 'medium', 'complex'] as const) {
-  test(`completed ensemble trace stays in assistant meta for ${complexity} prompts`, async ({ page }) => {
+  test(`completed ensemble trace stays settled with usage details for ${complexity} prompts`, async ({ page }) => {
     await mockEnsembleHistory(page, complexity)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(`${SESSION_KEY}-${complexity}`))
     await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
-    await expect(page.locator('.router-fx[data-panel="llm-ensemble"]')).toHaveCount(0)
+    // Finished runs keep their routing provenance, without live animation.
+    const strip = page.locator('.router-fx[data-panel="llm-ensemble"]')
+    await expect(strip).toHaveAttribute('data-settled', 'true')
+    await expect(strip.locator('.router-fx-ensemble__scan')).toHaveCount(0)
 
     const assistant = page.locator('.msg-ai').first()
-    await expect(assistant.locator('.msg-meta__ensemble')).toContainText('Ensemble · 3 models')
-    await expect(assistant).not.toContainText('qwen3.7-plus')
-    await expect(assistant).not.toContainText('kimi-k2.6')
-
-    await assistant.locator('.msg-meta__more-btn').click()
+    await expect(assistant.locator('.msg-meta__ensemble')).toHaveCount(0)
+    await expect(assistant.locator('.msg-meta-popover')).toHaveCount(0)
+    await assistant.getByRole('button', { name: 'Usage details', exact: true }).click()
 
     const details = assistant.locator('.msg-meta-popover')
     await expect(details).toBeVisible()

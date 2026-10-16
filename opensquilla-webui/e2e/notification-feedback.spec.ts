@@ -321,7 +321,7 @@ test('real App clears the 360px tab bar and reacts to the existing keyboard visi
   await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'zh-Hans'))
   await page.goto('/control/chat/new')
   await expect(page.locator('.chat-textarea')).toBeVisible()
-  await page.locator('.chat-more-actions-btn').click()
+  await page.getByRole('button', { name: '添加', exact: true }).click()
   await page.getByRole('menuitem', { name: '录制语音输入', exact: true }).click()
   const toast = page.getByTestId('toast')
   const host = page.getByTestId('toast-host')

@@ -402,6 +402,13 @@ async function openNewWorkbenchDraft(page: Page) {
   await expect(page).toHaveURL(/\/chat\/new/)
 }
 
+async function openBrowserPanel(page: Page) {
+  await page.getByTestId('workbench-new-panel-trigger').click()
+  await page.getByTestId('workbench-new-panel-menu-list')
+    .locator('[data-panel-kind="browser"]').click()
+  await expect(page.getByTestId('browser-start')).toBeVisible()
+}
+
 async function tabUntilFocused(page: Page, target: Locator, attempts = 8) {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     await page.keyboard.press('Tab')
@@ -487,8 +494,9 @@ test.describe('Application Workbench', () => {
     const menu = page.getByRole('menu', { name: 'Add', exact: true })
     const groups = menu.getByRole('group')
     await expect(groups.first()).not.toContainText('Browser Use')
-    await expect(groups.last()).toContainText('Browser Use')
-    await menu.getByRole('menuitem', { name: /^Browser Use\b/ }).click()
+    await expect(menu.getByRole('group', { name: 'Plugins', exact: true })
+      .locator('[data-skill-name="browser-use"]')).toBeVisible()
+    await menu.locator('[data-skill-name="browser-use"]').click()
 
     await expect(menu).toBeHidden()
     await expect(page.locator('.chat-inline-editor__skill[data-skill-id="skill:browser-use"]')).toContainText('browser-use')
@@ -502,7 +510,7 @@ test.describe('Application Workbench', () => {
     }])
   })
 
-  test('hides the Browser Use shortcut when its required tools are unavailable', async ({ page }) => {
+  test('marks Browser Use unavailable and refuses selection when required tools are unavailable', async ({ page }) => {
     const requests = new Map<string, number>()
     await installDesktopWorkbenchV2Bridge(page)
     await page.addInitScript(() => {
@@ -518,7 +526,7 @@ test.describe('Application Workbench', () => {
     await expect.poll(() => requests.get('skills.candidates')).toBe(1)
     const addButton = page.getByRole('button', { name: 'Add', exact: true })
     let menu = page.getByRole('menu', { name: 'Add', exact: true })
-    await expect(menu.getByRole('menuitem', { name: /^Browser Use\b/ })).toBeVisible()
+    await expect(menu.locator('[data-skill-name="browser-use"]')).toBeVisible()
     await addButton.click()
     browserCandidates.candidates = [{
       ...BROWSER_SKILL_CANDIDATES.candidates[0],
@@ -529,14 +537,16 @@ test.describe('Application Workbench', () => {
     await addButton.click()
     await expect.poll(() => requests.get('skills.candidates')).toBe(2)
     menu = page.getByRole('menu', { name: 'Add', exact: true })
-    await expect(menu.getByRole('menuitem', { name: /^Browser Use\b/ })).toHaveCount(0)
+    await expect(menu.locator('[data-skill-name="browser-use"]')).toContainText('Required tools unavailable')
+    await menu.locator('[data-skill-name="browser-use"]').click()
+    await expect(page.locator('.chat-inline-editor__skill[data-skill-id]')).toHaveCount(0)
 
     await page.locator('.chat-textarea').fill('/browser-use')
     await expect(page.getByRole('option', { name: /browser-use/ }))
       .toContainText('Required tools unavailable')
   })
 
-  test('keeps the draft unsent while Browser Use selection is pending', async ({ page }) => {
+  test('keeps the draft and candidate selection unchanged while the Add catalog refresh is pending', async ({ page }) => {
     const sends: Record<string, unknown>[] = []
     const delayedSkills: { requested: boolean; release?: () => void } = { requested: false }
     await installDesktopWorkbenchV2Bridge(page)
@@ -549,14 +559,20 @@ test.describe('Application Workbench', () => {
     const composer = page.locator('.chat-textarea')
     await composer.fill('Inspect this page.')
     await page.getByRole('button', { name: 'Add', exact: true }).click()
-    await page.getByRole('menuitem', { name: /^Browser Use\b/ }).click()
+    const addButton = page.getByRole('button', { name: 'Add', exact: true })
+    await expect(page.locator('[data-skill-name="browser-use"]')).toBeVisible()
+    await addButton.click()
+    await addButton.click()
     await expect.poll(() => delayedSkills.requested).toBe(true)
-    await expect(page.locator('.chat-send-btn')).toBeDisabled()
-    await composer.press('Enter')
+    // Refresh invalidates stale candidates. A pending catalog must not select
+    // a capability or send the draft by itself.
+    await expect(page.locator('[data-skill-name="browser-use"]')).toHaveCount(0)
+    await expect(page.getByRole('menu', { name: 'Add', exact: true }).getByRole('status')).toBeVisible()
     expect(sends).toHaveLength(0)
     await expectComposerValue(composer, 'Inspect this page.')
 
     delayedSkills.release?.()
+    await page.getByRole('menu', { name: 'Add', exact: true }).locator('[data-skill-name="browser-use"]').click()
     await expect(page.locator('.chat-inline-editor__skill[data-skill-id="skill:browser-use"]')).toContainText('browser-use')
     await page.locator('.chat-send-btn[aria-label="Send"]').click()
     await expect.poll(() => sends.length).toBe(1)
@@ -565,7 +581,7 @@ test.describe('Application Workbench', () => {
     }])
   })
 
-  test('a pending Browser Use lookup does not block sending in another task', async ({ page }) => {
+  test('a pending Add catalog lookup does not block sending or select a skill in another task', async ({ page }) => {
     const sends: Record<string, unknown>[] = []
     const delayedSkills: { requested: boolean; release?: () => void } = { requested: false }
     await installDesktopWorkbenchV2Bridge(page)
@@ -577,7 +593,10 @@ test.describe('Application Workbench', () => {
 
     const composer = page.locator('.chat-textarea')
     await page.getByRole('button', { name: 'Add', exact: true }).click()
-    await page.getByRole('menuitem', { name: /^Browser Use\b/ }).click()
+    const addButton = page.getByRole('button', { name: 'Add', exact: true })
+    await expect(page.locator('[data-skill-name="browser-use"]')).toBeVisible()
+    await addButton.click()
+    await addButton.click()
     await expect.poll(() => delayedSkills.requested).toBe(true)
     await page.getByRole('button', { name: 'New task', exact: true }).click()
     await expect(page).toHaveURL(/\/chat\/new/)
@@ -619,15 +638,16 @@ test.describe('Application Workbench', () => {
       const composer = page.locator('.chat-textarea')
       const revealBrowser = async () => {
         await toggle.click()
-        await expect(composer).toHaveValue(draft)
+        await expectComposerValue(composer, draft)
       }
       await expect(toggle).toBeVisible()
-      await expect(composer).toHaveValue(recoverDraft ? draft : '')
+      await expectComposerValue(composer, recoverDraft ? draft : '')
       if (!recoverDraft) await composer.fill(draft)
       await revealBrowser()
       const workbench = page.getByTestId('workbench-host')
       const start = workbench.getByTestId('browser-start')
-      await expect(start).toBeVisible()
+      await expect(workbench.getByTestId('workbench-start-panel')).toBeVisible()
+      await openBrowserPanel(page)
       const address = start.getByRole('textbox', { name: 'Web address' })
       await address.fill('javascript:alert(1)')
       await start.getByRole('button', { name: 'Go', exact: true }).click()
@@ -657,7 +677,7 @@ test.describe('Application Workbench', () => {
       expect(await creates()).toHaveLength(1)
       expect((await creates())[0]!.surfaceId).toBe(first.surfaceId)
 
-      await workbench.getByTestId('workbench-new-browser-tab').click()
+      await openBrowserPanel(page)
       await expect(start).toBeVisible()
       await expect(workbench.getByRole('tab')).toHaveCount(1)
       await address.fill('localhost:18807/check')
@@ -667,7 +687,7 @@ test.describe('Application Workbench', () => {
       expect((await creates())[1]!.surfaceId).not.toBe(first.surfaceId)
       expect((await creates())[1]!.payload.scopeId).toBe(first.payload.scopeId)
 
-      await expect(composer).toHaveValue(draft)
+      await expectComposerValue(composer, draft)
       await page.locator('.chat-send-btn[aria-label="Send"]').click()
       await expect.poll(() => sends.length).toBe(1)
       expect(sends[0]!.sessionKey).toBe(first.payload.scopeId)
@@ -676,17 +696,18 @@ test.describe('Application Workbench', () => {
       expect(await creates()).toHaveLength(2)
 
       await workbench.getByRole('button', { name: 'Close tab: localhost', exact: true }).last().click()
-      await workbench.getByTestId('workbench-new-browser-tab').click()
+      await openBrowserPanel(page)
       await start.getByRole('button', { name: 'Reopen closed tab' }).click()
       await expect(workbench.getByRole('tab')).toHaveCount(2)
       await workbench.getByRole('button', { name: 'Close tab: localhost', exact: true }).last().click()
       await workbench.getByRole('button', { name: 'Close tab: localhost', exact: true }).click()
-      await expect(start).toBeVisible()
+      await expect(workbench.getByTestId('workbench-start-panel')).toBeVisible()
+      await openBrowserPanel(page)
       await expect(toggle).toHaveAttribute('aria-expanded', 'true')
       await start.getByRole('button', { name: 'Reopen closed tab' }).click()
       await expect(workbench.getByRole('tab')).toHaveCount(1)
       await page.getByRole('button', { name: 'New task', exact: true }).click()
-      await expect(start).toBeVisible()
+      await expect(workbench.getByTestId('workbench-start-panel')).toBeVisible()
       await expect(workbench.getByRole('tab')).toHaveCount(0)
       await expect(toggle).toBeVisible()
     })
@@ -716,7 +737,8 @@ test.describe('Application Workbench', () => {
     const workbench = page.getByTestId('workbench-host')
     const reopen = page.getByTestId('topbar-workbench-toggle')
     await expect(workbench).toBeVisible()
-    await expect(page.locator('.topbar-right').getByTestId('topbar-workbench-toggle')).toBeVisible()
+    await expect(workbench.getByTestId('topbar-workbench-toggle')).toBeVisible()
+    await expect(page.locator('.topbar-right').getByTestId('topbar-workbench-toggle')).toHaveCount(0)
     await expect(page.getByTestId('workbench-reopen-browser')).toHaveCount(0)
     await expect(reopen).toHaveAttribute('aria-label', 'Collapse workbench')
     await expect(page.getByRole('button', { name: 'Collapse workbench', exact: true })).toHaveCount(1)
@@ -729,7 +751,7 @@ test.describe('Application Workbench', () => {
     await expect.poll(counts).toMatchObject({ creates: 0, destroyed: [] })
 
     await page.getByRole('button', { name: 'New task', exact: true }).click()
-    await expect(workbench.getByTestId('browser-start')).toBeVisible()
+    await expect(workbench.getByTestId('workbench-start-panel')).toBeVisible()
     await expect(reopen).toBeVisible()
     await expect(workbench.getByRole('tab')).toHaveCount(0)
     await expect.poll(counts).toMatchObject({ creates: 0, destroyed: [] })
@@ -749,7 +771,8 @@ test.describe('Application Workbench', () => {
     await expect(workbench).toBeVisible()
     await expect.poll(counts).toMatchObject({ creates: 0, destroyed: ['browser-second'] })
     await workbench.getByRole('button', { name: 'Close tab: Browser cart', exact: true }).click()
-    await expect(workbench.getByTestId('browser-start')).toBeVisible()
+    await expect(workbench.getByTestId('workbench-start-panel')).toBeVisible()
+    await openBrowserPanel(page)
     await expect(reopen).toBeVisible()
     await workbench.getByRole('button', { name: 'Reopen closed tab', exact: true }).click()
     await expect(workbench).toBeVisible()
@@ -878,6 +901,12 @@ test.describe('Application Workbench', () => {
 
       const resizer = page.getByTestId('workbench-resizer')
       await expect(resizer).toBeVisible()
+      // The default width can already equal the main-pane-preserving maximum.
+      // Start at the public keyboard minimum so this drag measures widening.
+      await resizer.press('Home')
+      const minimumWidth = Number(await resizer.getAttribute('aria-valuemin'))
+      await expect(resizer).toHaveAttribute('aria-valuenow', String(minimumWidth))
+      await expect.poll(async () => Math.round((await workbench.boundingBox())?.width || 0)).toBe(minimumWidth)
       const workbenchBox = await workbench.boundingBox()
       const resizerBox = await resizer.boundingBox()
       expect(workbenchBox).not.toBeNull()
@@ -1212,8 +1241,8 @@ test.describe('Application Workbench', () => {
   test('download-only deliverables remain downloadable and open in the Deliverables drawer', async ({ page }) => {
     const downloadOnlyArtifacts = [{
       id: 'workbench-data',
-      name: 'data.json',
-      mime: 'application/json',
+      name: 'archive.bin',
+      mime: 'application/octet-stream',
       size: 24,
       download_url: '/api/v1/artifacts/workbench-data',
     }]
@@ -1226,10 +1255,10 @@ test.describe('Application Workbench', () => {
     await deliverables.click()
     const drawer = page.getByRole('dialog', { name: 'Deliverables (1)' })
     await expect(drawer).toBeVisible()
-    await expect(drawer.getByRole('button', { name: /Open data\.json/ })).toBeVisible()
+    await expect(drawer.getByRole('button', { name: /Open archive\.bin/ })).toBeVisible()
     await expect(workbench).toHaveCount(0)
-    await expect(page.locator('.msg-artifact-chip', { hasText: 'data.json' })
-      .getByRole('button', { name: 'Download data.json' })).toBeVisible()
+    await expect(page.locator('.msg-artifact-chip', { hasText: 'archive.bin' })
+      .getByRole('button', { name: 'Download archive.bin' })).toBeVisible()
   })
 
   test('the compact switcher lists every deliverable without eagerly fetching PPTX', async ({ page }) => {
@@ -1320,8 +1349,9 @@ test.describe('Application Workbench', () => {
     await expect(workbench).toBeVisible()
     await expect(workbench.locator('.artifact-preview__frame--html')).toBeVisible()
     const switcher = workbench.getByTestId('workbench-artifact-switcher')
-    await expect(switcher.locator('option')).toHaveCount(3)
+    await expect(switcher.locator('option')).toHaveCount(4)
     await expect(switcher.locator('option')).toHaveText([
+      'data.json',
       'deck.pptx',
       'notes.txt',
       'demo.html',
@@ -1362,7 +1392,7 @@ test.describe('Application Workbench', () => {
     await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
   })
 
-  test('mobile HTML preview enters the dialog Tab order and bridges Escape', async ({ page }) => {
+  test('mobile HTML preview enters the single-pane Tab order and bridges Escape', async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 667 })
     await openWorkbenchSession(page)
 
@@ -1371,25 +1401,25 @@ test.describe('Application Workbench', () => {
 
     const workbench = page.getByTestId('workbench-host')
     await expect(workbench).toBeVisible()
-    await expect(workbench).toHaveAttribute('role', 'dialog')
-    await expect(workbench).toHaveAttribute('aria-modal', 'true')
+    await expect(workbench).toHaveAttribute('role', 'complementary')
+    await expect(workbench).toHaveAttribute('data-layout-mode', 'single-pane')
+    await expect(workbench).not.toHaveAttribute('aria-modal')
+    await expect(page.locator('.app-chat-pane')).toHaveAttribute('inert', '')
+    await expect(page.locator('.app-chat-pane')).toBeHidden()
     await expect(workbench).toHaveCSS('width', '375px')
     const mobileFrame = workbench.locator('.artifact-preview__frame--html')
     await expect(mobileFrame).not.toHaveAttribute('aria-hidden', 'true')
     await expect(mobileFrame).toHaveAttribute('tabindex', '0')
     await expect(mobileFrame).toHaveCSS('pointer-events', 'auto')
 
-    await expect(
-      workbench.locator('.workbench-host__actions')
-        .getByRole('button', { name: 'Collapse workbench' }),
-    ).toBeFocused()
+    await expect(workbench.getByTestId('workbench-return-chat')).toBeFocused()
     await tabUntilFocused(page, mobileFrame)
 
     // The opaque sandbox cannot bubble key events to the parent document.
     // Its injected bridge posts a narrow Escape message instead.
     await page.keyboard.press('Escape')
     await expect(workbench).toBeHidden()
-    await expect(page.getByTestId('chat-header-primary-action')).toBeFocused()
+    await expect(page.getByTestId('topbar-workbench-toggle')).toBeFocused()
   })
 
   test('mobile PDF preview offers a focus-revealed exit after the browser viewer', async ({ page }) => {
@@ -1411,13 +1441,11 @@ test.describe('Application Workbench', () => {
     const workbench = page.getByTestId('workbench-host')
     const pdfFrame = workbench.locator('.artifact-preview__frame--pdf')
     const frameExit = workbench.locator('.artifact-preview__frame-exit')
-    await expect(workbench).toHaveAttribute('role', 'dialog')
+    await expect(workbench).toHaveAttribute('role', 'complementary')
+    await expect(workbench).toHaveAttribute('data-layout-mode', 'single-pane')
     await expect(pdfFrame).toHaveAttribute('tabindex', '0')
 
-    await expect(
-      workbench.locator('.workbench-host__actions')
-        .getByRole('button', { name: 'Collapse workbench' }),
-    ).toBeFocused()
+    await expect(workbench.getByTestId('workbench-return-chat')).toBeFocused()
     await tabUntilFocused(page, pdfFrame)
 
     // Chromium's built-in PDF viewer owns its document and cannot receive our
@@ -1434,7 +1462,7 @@ test.describe('Application Workbench', () => {
     expect(exitBox!.y).toBeGreaterThanOrEqual(pdfBox!.y + pdfBox!.height)
     await page.keyboard.press('Enter')
     await expect(workbench).toBeHidden()
-    await expect(deliverables).toBeFocused()
+    await expect(page.getByTestId('topbar-workbench-toggle')).toBeFocused()
   })
 
   test('mobile image cards keep using the transcript Lightbox outside Workbench navigation', async ({ page }) => {

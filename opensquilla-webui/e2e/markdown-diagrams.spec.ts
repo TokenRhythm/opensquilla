@@ -196,7 +196,7 @@ test('retains visible source for incomplete, invalid, and excessive diagram bloc
     '```mermaid\ngraph TD\n  Pending --> Complete',
   ].join('\n\n')
   const answer = await openFixture(page, text)
-  const blocks = answer.locator('.msg-ai-text > pre, .msg-ai-text > .mermaid-error')
+  const blocks = answer.locator('.visualize-body__text > pre, .visualize-body__text > .mermaid-error')
   await expect(blocks).toHaveCount(4)
   for (const index of [0, 1, 2]) {
     const block = blocks.nth(index)

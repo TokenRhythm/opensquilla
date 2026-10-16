@@ -10,6 +10,7 @@ declare global {
   interface Window {
     __shareBrandDraws: BrandDraw[]
     __shareBrandClipboardWrites: number
+    __shareBrandPreviewBlobs: Map<string, Blob>
   }
 }
 
@@ -26,6 +27,20 @@ async function openBrandFixture(page: Page) {
   await page.addInitScript(() => {
     window.__shareBrandDraws = []
     window.__shareBrandClipboardWrites = 0
+    // Observe the current synthetic preview bytes without fetching blob: URLs.
+    // The production Gateway intentionally excludes them from connect-src.
+    window.__shareBrandPreviewBlobs = new Map()
+    const createObjectURL = URL.createObjectURL.bind(URL)
+    const revokeObjectURL = URL.revokeObjectURL.bind(URL)
+    URL.createObjectURL = object => {
+      const url = createObjectURL(object)
+      if (object instanceof Blob) window.__shareBrandPreviewBlobs.set(url, object)
+      return url
+    }
+    URL.revokeObjectURL = url => {
+      window.__shareBrandPreviewBlobs.delete(url)
+      revokeObjectURL(url)
+    }
     const drawImage = CanvasRenderingContext2D.prototype.drawImage
     CanvasRenderingContext2D.prototype.drawImage = function (...args: unknown[]) {
       Reflect.apply(drawImage, this, args)
@@ -77,7 +92,8 @@ test.describe('Share brand pixels with real Gateway images', () => {
         const digest = async (data: Uint8Array | Uint8ClampedArray) => Array.from(
           new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(data))),
         ).map(byte => byte.toString(16).padStart(2, '0')).join('')
-        const blob = await (await fetch(image.src)).blob()
+        const blob = window.__shareBrandPreviewBlobs.get(image.src)
+        if (!blob) throw new Error('The visible share preview has no current Blob')
         const canvas = document.createElement('canvas')
         canvas.width = image.naturalWidth
         canvas.height = image.naturalHeight

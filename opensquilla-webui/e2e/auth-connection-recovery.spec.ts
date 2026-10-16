@@ -303,19 +303,25 @@ test('keeps connection settings navigation when a policy close settles the initi
     })
   })
   const connection = page.locator('.topbar')
-  await page.route(/\/(?:assets\/ChatView-[^/]+\.js|src\/views\/ChatView\.vue)(?:\?.*)?$/, async route => {
-    // Give the draft a connected bootstrap rather than an immediate offline result.
-    await expect(connection).toHaveAttribute('data-connection-state', 'connected')
-    await route.continue()
-  })
   await page.route(/\/(?:assets\/SettingsView-[^/]+\.js|src\/views\/web\/SettingsView\.vue)(?:\?.*)?$/, async route => {
     // Reproduce a slow first load of Settings while the initial draft completes.
     socket.close({ code: 1008, reason: 'origin_policy_rejected' })
     await expect(connection).toHaveAttribute('data-connection-state', 'disconnected')
     await route.continue()
   })
-  await page.goto('/control/sessions')
+  // Establish the connection before mounting ChatView. A cold entry can
+  // canonicalize its offline bootstrap before the later held subscription,
+  // which does not exercise a pending initial draft at all. A native Back
+  // navigation from Usage gives both dev and built bundles the same ordering.
+  await page.goto('/control/usage')
+  await expect(connection).toHaveAttribute('data-connection-state', 'connected')
+  await page.evaluate(() => {
+    history.replaceState(null, '', '/control/chat')
+    history.pushState(null, '', '/control/usage')
+  })
+  await page.goBack()
   await expect.poll(() => subscribed).toBe(true)
+  await expect(connection).toHaveAttribute('data-connection-state', 'connected')
   await expect(page).toHaveURL(/\/control\/chat$/)
   await page.locator('.sidebar-foot button[data-icon="settings"]').click()
   await page.getByRole('tab', { name: /^Gateway:/ }).click()

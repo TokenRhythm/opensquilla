@@ -7,7 +7,8 @@ test('desktop to narrow Settings keeps the Interface detail and reading position
   await page.emulateMedia({ reducedMotion: 'reduce' })
   await page.setViewportSize({ width: 1280, height: 720 })
   await page.goto('/control/settings/interface')
-  const dialog = page.getByRole('dialog', { name: 'Settings' })
+  const dialog = page.locator('.settings-modal[role="dialog"]')
+  await expect(dialog).toHaveAccessibleName('Settings')
   const rail = dialog.locator('.settings-rail')
   const selected = rail.locator('#settings-rail-interface')
   const search = dialog.getByRole('searchbox')
@@ -22,6 +23,7 @@ test('desktop to narrow Settings keeps the Interface detail and reading position
   expect(scrollBefore).toBeGreaterThan(0)
 
   await page.setViewportSize({ width: 390, height: 720 })
+  await expect(dialog).toHaveAccessibleName('Interface')
   await expect(rail).toBeHidden()
   await expect(panel).toBeVisible()
   await expect(dialog.getByRole('button', { name: 'Back to settings categories' })).toBeVisible()
@@ -34,6 +36,7 @@ test('desktop to narrow Settings keeps the Interface detail and reading position
   await page.screenshot({ path: testInfo.outputPath('settings-interface-narrow.png'), fullPage: true })
 
   await page.setViewportSize({ width: 1280, height: 720 })
+  await expect(dialog).toHaveAccessibleName('Settings')
   await expect(rail).toHaveAttribute('aria-orientation', 'vertical')
   await expect(selected).toHaveAttribute('aria-selected', 'true')
   await expect(search).toBeFocused()

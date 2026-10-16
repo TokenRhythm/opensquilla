@@ -1,78 +1,51 @@
 import { test, expect, type Page } from '@playwright/test'
+import { chatHistoryPayload } from './support/session-read-fixtures'
+import { installSidebarFixture } from './support/sidebar-fixture'
 
 const CONTROL_URL = '/control/'
 const LIVE = process.env.OPENSQUILLA_E2E_LIVE === '1'
 const SESSION_KEY = 'agent:main:webchat:e2edonecard'
 
-// Seed a finished turn through the real WS pipeline: the page talks to the
-// real gateway, but chat.history responses are rewritten in flight so a
-// deliverable-bearing assistant turn renders without a live agent run.
+// Use a complete synthetic conversation; this key is not owned by a real Gateway.
 async function seedHistoryWithDeliverable(page: Page) {
-  await page.routeWebSocket(/\/ws$/, ws => {
-    const server = ws.connectToServer()
-    const historyIds = new Set<string>()
-    ws.onMessage(message => {
-      try {
-        const frame = JSON.parse(String(message))
-        if (frame?.type === 'req' && frame.method === 'chat.history') {
-          historyIds.add(String(frame.id))
-        }
-      } catch {}
-      server.send(message)
-    })
-    server.onMessage(message => {
-      try {
-        const frame = JSON.parse(String(message))
-        if (frame?.type === 'res' && frame.id !== undefined && historyIds.has(String(frame.id))) {
-          historyIds.delete(String(frame.id))
-          frame.ok = true
-          delete frame.error
-          frame.payload = {
-            messages: [
-              {
-                role: 'user',
-                text: 'Save a short report for me.',
-                id: 'msg-e2e-done-user',
-                timestamp: Math.floor(Date.now() / 1000) - 120,
-              },
-              {
-                role: 'assistant',
-                text: 'No deliverable on this turn.',
-                id: 'msg-e2e-done-plain',
-                timestamp: Math.floor(Date.now() / 1000) - 90,
-                usage: { model: 'openai/gpt-test', input_tokens: 40, output_tokens: 12, cost_usd: 0.0004 },
-              },
-              {
-                role: 'assistant',
-                text: 'Saved the report.',
-                id: 'msg-e2e-done-artifact',
-                timestamp: Math.floor(Date.now() / 1000) - 60,
-                artifacts: [
-                  { id: 'art-e2e-done-1', name: 'report.csv', mime: 'text/csv', size: 2048 },
-                ],
-                tool_calls: [
-                  {
-                    tool_use_id: 'tool-e2e-done-search',
-                    name: 'web_search',
-                    input: { query: 'renewable energy report' },
-                    result: JSON.stringify({
-                      results: [
-                        { title: 'Renewable energy outlook', url: 'https://example.com/outlook' },
-                      ],
-                    }),
-                  },
-                ],
-                usage: { model: 'openai/gpt-test', input_tokens: 120, output_tokens: 60, cost_usd: 0.0012 },
-              },
-            ],
-            has_more: false,
-          }
-          ws.send(JSON.stringify(frame))
-          return
-        }
-      } catch {}
-      ws.send(message)
-    })
+  await installSidebarFixture(page, {
+    'chat.history': chatHistoryPayload([
+      {
+        role: 'user',
+        text: 'Save a short report for me.',
+        id: 'msg-e2e-done-user',
+        timestamp: Math.floor(Date.now() / 1000) - 120,
+      },
+      {
+        role: 'assistant',
+        text: 'No deliverable on this turn.',
+        id: 'msg-e2e-done-plain',
+        timestamp: Math.floor(Date.now() / 1000) - 90,
+        usage: { model: 'openai/gpt-test', input_tokens: 40, output_tokens: 12, cost_usd: 0.0004 },
+      },
+      {
+        role: 'assistant',
+        text: 'Saved the report.',
+        id: 'msg-e2e-done-artifact',
+        timestamp: Math.floor(Date.now() / 1000) - 60,
+        artifacts: [
+          { id: 'art-e2e-done-1', name: 'report.csv', mime: 'text/csv', size: 2048 },
+        ],
+        tool_calls: [
+          {
+            tool_use_id: 'tool-e2e-done-search',
+            name: 'web_search',
+            input: { query: 'renewable energy report' },
+            result: JSON.stringify({
+              results: [
+                { title: 'Renewable energy outlook', url: 'https://example.com/outlook' },
+              ],
+            }),
+          },
+        ],
+        usage: { model: 'openai/gpt-test', input_tokens: 120, output_tokens: 60, cost_usd: 0.0012 },
+      },
+    ]),
   })
 }
 
@@ -101,7 +74,9 @@ test.describe('Deliverable endings', () => {
 
     const messageMain = block.locator('..')
     const receipt = messageMain.locator(':scope > .msg-ai-footer')
-    await expect(receipt.locator('.msg-ai-meta .msg-meta__cost')).toContainText('$')
+    await receipt.getByRole('button', { name: 'Usage details', exact: true }).click()
+    await expect(receipt.locator('.msg-meta-popover')).toContainText('$')
+    await page.keyboard.press('Escape')
 
     // The old outer card is gone: the artifact chip owns the only visible frame.
     const surface = await block.evaluate(el => {

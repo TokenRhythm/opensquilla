@@ -1,5 +1,6 @@
 import { test, expect, type Page } from '@playwright/test'
-import { helloOkResponse } from './support/gateway-fixture'
+import { chatHistoryPayload } from './support/session-read-fixtures'
+import { installSidebarFixture } from './support/sidebar-fixture'
 
 const CONTROL_URL = '/control/'
 const LIVE = process.env.OPENSQUILLA_E2E_LIVE === '1'
@@ -8,139 +9,84 @@ const RESEARCH_SESSION_KEY = 'agent:main:webchat:e2eresearchsources'
 async function openFirstAssistantActivity(page: Page) {
   const activity = page.locator('.msg-ai .assistant-activity').first()
   await expect(activity).toBeVisible({ timeout: 10000 })
-  await expect(activity).not.toHaveAttribute('open', '')
-  await activity.locator('summary').press('Enter')
-  await expect(activity).toHaveAttribute('open', '')
+  const disclosure = activity.locator('.assistant-activity__summary')
+  await expect(disclosure).toHaveAttribute('aria-expanded', 'false')
+  await disclosure.press('Enter')
+  await expect(disclosure).toHaveAttribute('aria-expanded', 'true')
   return activity
 }
 
 async function seedSearchHistory(page: Page, toolName: string) {
-  await page.routeWebSocket(/\/ws$/, ws => {
-    ws.onMessage(message => {
-      let frame: Record<string, unknown>
-      try {
-        frame = JSON.parse(String(message)) as Record<string, unknown>
-      } catch {
-        return
-      }
-      if (frame?.type !== 'req' || frame.id === undefined) return
-      if (frame.method === 'connect') {
-        ws.send(helloOkResponse())
-        return
-      }
-      if (frame?.type === 'req' && frame.method === 'chat.history') {
-        ws.send(JSON.stringify({
-          type: 'res',
-          id: frame.id,
-          ok: true,
-          payload: {
-            messages: [
-              {
-                role: 'assistant',
-                text: 'The answer cites the research result.',
-                id: 'msg-e2e-research-source',
-                timestamp: Math.floor(Date.now() / 1000) - 60,
-                tool_calls: [
-                  {
-                    tool_use_id: 'tool-e2e-research-source',
-                    name: toolName,
-                    input: { query: 'OpenSquilla web search' },
-                    result: JSON.stringify({
-                      ok: true,
-                      results: [
-                        {
-                          title: 'OpenSquilla Search Notes',
-                          url: 'https://example.com/opensquilla-search',
-                          domain: 'example.com',
-                          provider: 'tavily',
-                          excerpt: 'Compact citation-ready excerpt.',
-                          fetched: true,
-                        },
-                      ],
-                    }),
-                    status: 'success',
-                  },
-                ],
-              },
-            ],
-            has_more: false,
+  await installSidebarFixture(page, { 'chat.history': chatHistoryPayload([
+      {
+        role: 'assistant',
+        text: 'The answer cites the research result.',
+        id: 'msg-e2e-research-source',
+        timestamp: Math.floor(Date.now() / 1000) - 60,
+        tool_calls: [
+          {
+            tool_use_id: 'tool-e2e-research-source',
+            name: toolName,
+            input: { query: 'OpenSquilla web search' },
+            result: JSON.stringify({
+              ok: true,
+              results: [
+                {
+                  title: 'OpenSquilla Search Notes',
+                  url: 'https://example.com/opensquilla-search',
+                  domain: 'example.com',
+                  provider: 'tavily',
+                  excerpt: 'Compact citation-ready excerpt.',
+                  fetched: true,
+                },
+              ],
+            }),
+            status: 'success',
           },
-        }))
-        return
-      }
-      ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: {} }))
-    })
-    ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
-  })
+        ],
+      },
+    ]) })
 }
 
 async function seedPersistedSearchSourcesHistory(page: Page) {
-  await page.routeWebSocket(/\/ws$/, ws => {
-    ws.onMessage(message => {
-      let frame: Record<string, unknown>
-      try {
-        frame = JSON.parse(String(message)) as Record<string, unknown>
-      } catch {
-        return
-      }
-      if (frame?.type !== 'req' || frame.id === undefined) return
-      if (frame.method === 'connect') {
-        ws.send(helloOkResponse())
-        return
-      }
-      if (frame?.type === 'req' && frame.method === 'chat.history') {
-        ws.send(JSON.stringify({
-          type: 'res',
-          id: frame.id,
-          ok: true,
-          payload: {
-            messages: [
+  await installSidebarFixture(page, { 'chat.history': chatHistoryPayload([
+      {
+        role: 'assistant',
+        text: 'The answer cites the persisted source.',
+        id: 'msg-e2e-persisted-source',
+        timestamp: Math.floor(Date.now() / 1000) - 60,
+        tool_calls: [
+          {
+            tool_use_id: 'tool-e2e-persisted-source',
+            name: 'web_search',
+            input: { query: 'OpenSquilla persisted source' },
+            sources: [
               {
-                role: 'assistant',
-                text: 'The answer cites the persisted source.',
-                id: 'msg-e2e-persisted-source',
-                timestamp: Math.floor(Date.now() / 1000) - 60,
-                tool_calls: [
-                  {
-                    tool_use_id: 'tool-e2e-persisted-source',
-                    name: 'web_search',
-                    input: { query: 'OpenSquilla persisted source' },
-                    sources: [
-                      {
-                        title: 'OpenSquilla Persisted Source',
-                        url: 'https://example.com/opensquilla-persisted-source',
-                        domain: 'example.com',
-                        provider: 'duckduckgo',
-                        fetched: true,
-                      },
-                    ],
-                    result: JSON.stringify({
-                      ok: true,
-                      results: [
-                        {
-                          title: 'Truncated fallback source',
-                          url: 'https://example.com/opensquilla-persisted-sour…',
-                          domain: 'example.com',
-                          provider: 'duckduckgo',
-                          excerpt: 'Compacted persisted result with a dead-link URL.',
-                          fetched: true,
-                        },
-                      ],
-                    }),
-                    status: 'success',
-                  },
-                ],
+                title: 'OpenSquilla Persisted Source',
+                url: 'https://example.com/opensquilla-persisted-source',
+                domain: 'example.com',
+                provider: 'duckduckgo',
+                fetched: true,
               },
             ],
-            has_more: false,
+            result: JSON.stringify({
+              ok: true,
+              results: [
+                {
+                  title: 'Truncated fallback source',
+                  url: 'https://example.com/opensquilla-persisted-sour…',
+                  domain: 'example.com',
+                  provider: 'duckduckgo',
+                  excerpt: 'Compacted persisted result with a dead-link URL.',
+                  fetched: true,
+                },
+              ],
+            }),
+            status: 'success',
           },
-        }))
-        return
-      }
-      ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: {} }))
-    })
-    ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
-  })
+        ],
+      },
+    ]) })
 }
 
 test.describe('Sources row and thinking disclosure', () => {

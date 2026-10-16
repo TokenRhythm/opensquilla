@@ -637,7 +637,9 @@ test.describe('Settings modal', () => {
     const expanded = dialog(page).getByRole('radio', { name: 'Expanded by default', exact: true })
     await expect(collapsed).toBeChecked()
 
-    await expanded.click()
+    // The native input is a focusable 1px radio; its visible label is the
+    // pointer target, while checked-state assertions stay on the real input.
+    await expanded.locator('..').click()
     await expect(expanded).toBeChecked()
     await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()
     expect(await page.evaluate(() => (
@@ -649,7 +651,7 @@ test.describe('Settings modal', () => {
     await expect(dialog(page)).toBeVisible()
     await expect(dialog(page).getByRole('radio', { name: 'Expanded by default', exact: true })).toBeChecked()
 
-    await dialog(page).getByRole('radio', { name: 'Collapsed by default', exact: true }).click()
+    await dialog(page).getByRole('radio', { name: 'Collapsed by default', exact: true }).locator('..').click()
   })
 
   test('Advanced client experiments still apply instantly without a dirty bar', async ({ page }) => {

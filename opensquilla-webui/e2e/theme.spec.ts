@@ -147,7 +147,7 @@ test.describe('Theme engine (P0)', () => {
 
     expect(darkRadius).toBe(lightRadius)
     expect(darkFs).toBe(lightFs)
-    expect(darkRadius).toBe('8px') // the ladder's control tier, unchanged by P0
+    expect(darkRadius).toBe('10px') // Current shared foundation control tier.
   })
 
   test('Settings exposes all registered themes while the topbar stays quiet', async ({ page }) => {

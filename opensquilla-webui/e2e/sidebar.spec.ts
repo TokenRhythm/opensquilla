@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
+import { installSidebarFixture, SIDEBAR_SESSIONS } from './support/sidebar-fixture'
 
 const CONTROL_URL = '/control/'
 const RAW_KEY_PATTERN = /agent:[a-z0-9_-]+:[a-z0-9_-]+:/i
@@ -134,8 +135,14 @@ test.describe('Sidebar', () => {
     await expect(sidebar).not.toHaveClass(/docked/)
     await expect(page.getByTestId('sidebar-toggle-collapsed')).toBeFocused()
     await page.setViewportSize({ width: 1024, height: 768 })
-    await expect(sidebar).not.toHaveClass(/docked/)
-    await expect(page.getByTestId('sidebar-resizer')).toHaveCount(0)
+    // Responsive hiding is presentation-only; expanding restores the user's
+    // desktop preference instead of persisting the phone drawer's closed state.
+    await expect(sidebar).toHaveClass(/docked/)
+    await expect(page.getByTestId('sidebar-resizer')).toBeVisible()
+    await expect.poll(width).toBe(324)
+    await expect.poll(() => page.evaluate(() => JSON.parse(
+      localStorage.getItem('opensquilla.sidebar.width.v1') || '{}',
+    ).width)).toBe(360)
   })
 
   test('touch phone landscape uses a fixed drawer with no resize handle', async ({ browser }) => {
@@ -175,7 +182,7 @@ test.describe('Sidebar', () => {
     await expect(page.getByTestId('sidebar-toggle-collapsed')).toBeFocused()
 
     await page.getByTestId('sidebar-toggle-collapsed').click()
-    await page.locator('.sidebar-brand-link').click()
+    await page.locator('.sidebar').getByRole('link', { name: 'View usage', exact: true }).click()
     await expect(sidebar).not.toHaveClass(/docked/)
     await expect(page.getByTestId('sidebar-toggle-collapsed')).toBeFocused()
 
@@ -300,44 +307,36 @@ test.describe('Sidebar', () => {
     await expect(sidebar).not.toHaveClass(/docked/)
   })
 
-  test('Recents renders collapsible family groups (or onboarding when empty)', async ({ page }) => {
+  test('Recents renders collapsible family groups when several families exist', async ({ page }) => {
+    const sessions = [
+      ...SIDEBAR_SESSIONS.slice(0, 2),
+      { ...SIDEBAR_SESSIONS[2], key: 'agent:main:cron:sidebar-automation',
+        title: 'Scheduled review', sessionKind: 'cron', surface: 'cron' },
+    ]
+    await installSidebarFixture(page, {
+      'sessions.list': { sessions, count: sessions.length, ts: 1_800_000_000, has_more: false },
+    })
     await openControl(page)
-
-    await expect(page.locator('.sidebar-recents-eyebrow')).toHaveText('Recents')
+    await expect(page.locator('[data-sidebar-zone-heading="recents"]'))
+      .toContainText('Recents')
 
     const sidebarText = await page.locator('.sidebar').innerText()
     expect(sidebarText).not.toMatch(RAW_KEY_PATTERN)
     expect(sidebarText).not.toMatch(UUID_PATTERN)
-
-    const titles = page.locator('.sidebar-history-title')
-    if ((await titles.count()) === 0) {
-      // First-run empty state: the onboarding panel replaces the list.
-      await expect(page.locator('.sidebar-onboarding')).toBeVisible()
-      await expect(
-        page.locator('.sidebar-onboarding').getByRole('button', { name: 'Start a chat' }),
-      ).toBeVisible()
-      return
-    }
-
-    // Conversations exist: Recents renders collapsible family groups, each with
-    // an expandable header and a per-section count.
-    const groups = page.locator('.sidebar-group')
-    expect(await groups.count()).toBeGreaterThan(0)
-    await expect(groups.first().locator('.sidebar-group__count')).toBeVisible()
-
-    // The header actually toggles: aria-expanded flips and the body visibility
-    // follows. Assert the behavior, not just the attribute's presence.
-    const header = groups.first().locator('.sidebar-group__header')
-    const body = groups.first().locator('.sidebar-group__body')
-    const startedExpanded = (await header.getAttribute('aria-expanded')) === 'true'
+    const group = page.locator('.sidebar-group[data-family="automations"]')
+    const header = group.locator('.sidebar-group__header')
+    await expect(header).toBeVisible()
+    await expect(header.locator('.sidebar-group__count')).toHaveText('1')
+    await expect(header).toHaveAttribute('aria-expanded', 'true')
+    await expect(group.locator('.sidebar-history-row')).toHaveCount(1)
     await header.click()
-    await expect(header).toHaveAttribute('aria-expanded', String(!startedExpanded))
-    if (startedExpanded) await expect(body).toBeHidden()
-    else await expect(body).toBeVisible()
-    await header.click() // restore
-    await expect(header).toHaveAttribute('aria-expanded', String(startedExpanded))
+    await expect(header).toHaveAttribute('aria-expanded', 'false')
+    await expect(group.locator('.sidebar-history-row')).toHaveCount(0)
+    await header.click()
+    await expect(header).toHaveAttribute('aria-expanded', 'true')
+    await expect(group.locator('.sidebar-history-row')).toHaveCount(1)
 
-    for (const title of await titles.allInnerTexts()) {
+    for (const title of await page.locator('.sidebar-history-title').allInnerTexts()) {
       expect(title.trim().length).toBeGreaterThan(0)
       expect(title).not.toMatch(RAW_KEY_PATTERN)
       expect(title).not.toMatch(UUID_PATTERN)
@@ -445,12 +444,15 @@ test.describe('Sidebar', () => {
     }
   })
 
-  test('Ctrl+K starts a new chat instantly', async ({ page }) => {
+  test('Ctrl+K opens command search and its New task action starts a draft', async ({ page }) => {
     await openControl(page)
 
-    // Ctrl+K is the keyboard twin of the primary "New chat" button: it lands on
-    // the draft route immediately against the preferred agent, with no picker.
     await page.keyboard.press('Control+k')
+    const search = page.getByRole('dialog', { name: 'Search and go to' })
+    await expect(search).toBeVisible()
+    await search.getByRole('combobox').fill('New task')
+    await search.getByRole('option', { name: 'New task', exact: true }).click()
+    await expect(search).toBeHidden()
 
     await expect(page).toHaveURL(/\/chat\/new\?agent=[a-z0-9_-]+$/i)
     await expect(page.getByRole('dialog', { name: 'New chat' })).toHaveCount(0)

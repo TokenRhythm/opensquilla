@@ -1,11 +1,16 @@
 import { test, expect, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import { pdfFixture } from './support/office-fixtures'
 import {
   chatHistoryPayload,
   sessionMessagesHydratePayload,
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+
+// Native PDF preview requires full Chromium rather than the headless shell.
+// Browser-scoped fixtures must be configured at file scope.
+test.use({ channel: 'chromium' })
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2eartifactcard'
@@ -187,7 +192,7 @@ async function openSeeded(page: Page) {
       return route.fulfill({
         status: 200,
         contentType: 'application/pdf',
-        body: '%PDF-1.4\n%%EOF',
+        body: pdfFixture(),
       })
     }
     return route.fulfill({ status: 200, contentType: 'image/png', body: PNG_1x1 })
@@ -280,31 +285,40 @@ test.describe('Artifact deliverable cards', () => {
     expect(requested.some(url => url.includes('art-card-img') && url.includes('variant=thumb'))).toBe(true)
   })
 
-  test('previewable file card opens the Workbench without downloading', async ({ page }) => {
-    await openSeeded(page)
+  test.describe('native PDF preview', () => {
+    test('previewable file card opens the Workbench without downloading', async ({ page }) => {
+      await openSeeded(page)
+      expect(await page.evaluate(() => navigator.pdfViewerEnabled)).toBe(true)
 
-    const pdfCard = page.locator('.msg-artifact-chip', { hasText: 'report-q2.pdf' })
-    await expect(pdfCard).toBeVisible()
-    // Clean meta uses the type pill and size, no doubled category.
-    await expect(pdfCard.locator('.msg-artifact-kind')).toHaveText('PDF')
-    await expect(pdfCard.locator('.msg-artifact-size')).toHaveText('184 KB')
+      const pdfCard = page.locator('.msg-artifact-chip', { hasText: 'report-q2.pdf' })
+      await expect(pdfCard).toBeVisible()
+      // Clean meta uses the type pill and size, no doubled category.
+      await expect(pdfCard.locator('.msg-artifact-kind')).toHaveText('PDF')
+      await expect(pdfCard.locator('.msg-artifact-size')).toHaveText('184 KB')
 
-    // Open and Download are separate, separately labelled controls.
-    const openBtn = pdfCard.getByRole('button', { name: 'Open report-q2.pdf' })
-    const downloadBtn = pdfCard.getByRole('button', { name: 'Download report-q2.pdf' })
-    await expect(openBtn).toBeVisible()
-    await expect(downloadBtn).toBeVisible()
+      // Open and Download are separate, separately labelled controls.
+      const openBtn = pdfCard.getByRole('button', { name: 'Open report-q2.pdf' })
+      const downloadBtn = pdfCard.getByRole('button', { name: 'Download report-q2.pdf' })
+      await expect(openBtn).toBeVisible()
+      await expect(downloadBtn).toBeVisible()
 
-    let popupCount = 0
-    page.on('popup', () => { popupCount += 1 })
-    await openBtn.click()
-    const workbench = page.getByTestId('workbench-host')
-    await expect(workbench).toBeVisible()
-    await expect(workbench).toHaveAttribute('role', 'complementary')
-    await expect(workbench.getByRole('tab', { name: 'report-q2.pdf', exact: true })).toBeVisible()
-    await expect(workbench.getByRole('tab', { name: 'report-q2.pdf', exact: true })).toHaveAttribute('aria-selected', 'true')
-    await expect(workbench.locator('.artifact-preview__frame--pdf')).toBeVisible()
-    expect(popupCount).toBe(0)
+      let popupCount = 0
+      let downloadCount = 0
+      page.on('popup', () => { popupCount += 1 })
+      page.on('download', () => { downloadCount += 1 })
+      await openBtn.click()
+      const workbench = page.getByTestId('workbench-host')
+      await expect(workbench).toBeVisible()
+      await expect(workbench).toHaveAttribute('role', 'complementary')
+      await expect(workbench.getByRole('tab', { name: 'report-q2.pdf', exact: true })).toBeVisible()
+      await expect(workbench.getByRole('tab', { name: 'report-q2.pdf', exact: true })).toHaveAttribute('aria-selected', 'true')
+      await expect(workbench.locator('.artifact-preview__frame--pdf')).toBeVisible()
+      await expect(workbench.locator('.artifact-preview__frame--pdf'))
+        .toHaveAttribute('src', /^blob:.*#zoom=page-width&view=FitH$/)
+      await expect(workbench.getByRole('alert')).toHaveCount(0)
+      expect(popupCount).toBe(0)
+      expect(downloadCount).toBe(0)
+    })
   })
 
   test('CSV file card exposes Office Open and a separate Download control', async ({ page }) => {
@@ -320,15 +334,34 @@ test.describe('Artifact deliverable cards', () => {
 
   test('download-only file card has a Download control and no Open', async ({ page }) => {
     await seedHistory(page, {
-      artifacts: [{ id: 'art-card-json', name: 'pricing.json', mime: 'application/json', size: 12288 }],
+      artifacts: [{ id: 'art-card-binary', name: 'opaque.bin', mime: 'application/octet-stream', size: 12288 }],
     })
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
 
-    const dataCard = page.locator('.msg-artifact-chip', { hasText: 'pricing.json' })
+    const dataCard = page.locator('.msg-artifact-chip', { hasText: 'opaque.bin' })
     await expect(dataCard).toBeVisible()
-    await expect(dataCard.locator('.msg-artifact-kind')).toHaveText('JSON')
-    await expect(dataCard.getByRole('button', { name: 'Open pricing.json' })).toHaveCount(0)
-    await expect(dataCard.getByRole('button', { name: 'Download pricing.json' })).toBeVisible()
+    await expect(dataCard.locator('.msg-artifact-kind')).toHaveText('BIN')
+    await expect(dataCard.getByRole('button', { name: 'Open opaque.bin' })).toHaveCount(0)
+    await expect(dataCard.getByRole('button', { name: 'Download opaque.bin' })).toBeVisible()
+  })
+
+  test('JSON opens as source text and retains its separate Download control', async ({ page }) => {
+    const source = '{"currency":"USD","price":42}'
+    await page.route('**/api/v1/artifacts/art-card-json', route => route.fulfill({
+      status: 200, contentType: 'application/json', body: source,
+    }))
+    await seedHistory(page, {
+      artifacts: [{ id: 'art-card-json', name: 'pricing.json', mime: 'application/json', size: source.length }],
+    })
+    await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+    const card = page.locator('.msg-artifact-chip', { hasText: 'pricing.json' })
+    await expect(card.locator('.msg-artifact-kind')).toHaveText('JSON')
+    await expect(card.getByRole('button', { name: 'Download pricing.json' })).toBeVisible()
+    const downloads: unknown[] = []
+    page.on('download', download => downloads.push(download))
+    await card.getByRole('button', { name: 'Open pricing.json' }).click()
+    await expect(page.getByTestId('workbench-host').locator('.artifact-preview__text')).toHaveText(source)
+    expect(downloads).toHaveLength(0)
   })
 
   for (const workspacePreview of [false, true]) {
@@ -445,7 +478,8 @@ test.describe('Artifact deliverable cards', () => {
     } else expect(htmlContentRequestCount).toBe(2)
     expect(browserDownloadCount).toBe(1)
 
-    await workbench.locator('.workbench-host__chrome').getByRole('button', { name: 'Collapse workbench' }).click()
+    await expect(page.getByTestId('topbar-workbench-toggle')).toHaveAccessibleName('Collapse workbench')
+    await page.getByTestId('topbar-workbench-toggle').click()
     await expect(workbench).not.toBeVisible()
     await htmlCard.locator('.msg-artifact-body').click()
     await expect(workbench).toBeVisible()

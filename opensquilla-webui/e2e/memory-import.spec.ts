@@ -181,7 +181,7 @@ test('imports a profile through analysis, diff confirmation, and a recoverable r
   const gateway = await installImportGateway(page)
 
   await page.goto(CONTROL_URL + 'settings/memory')
-  const dialog = page.getByRole('dialog', { name: 'Settings' })
+  const dialog = page.getByRole('dialog', { name: 'Memory & Export', exact: true })
   const panel = dialog.getByTestId('settings-memory-panel')
   await expect(panel).toBeVisible({ timeout: 15000 })
   await expect(panel.getByRole('heading', { name: 'Import memory from another AI' })).toBeVisible()

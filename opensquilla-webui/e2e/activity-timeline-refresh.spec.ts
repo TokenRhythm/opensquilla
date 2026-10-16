@@ -297,14 +297,36 @@ async function semanticActivity(page: Page): Promise<SemanticRow[]> {
   }))
 }
 
+async function expectDurableActivity(page: Page) {
+  const timeline = page.getByTestId('assistant-unified-activity-timeline')
+  await expect(timeline.locator('[data-activity-type="reasoning"]')).toHaveCount(2)
+  for (const [id, text] of [['reasoning-1', 'Think one'], ['reasoning-2', 'Think two']]) {
+    const row = timeline.locator(`[data-activity-id="${id}"]`)
+    const disclosure = row.locator('details')
+    await expect(disclosure).toHaveCount(1)
+    if (await disclosure.getAttribute('open') === null) await disclosure.locator('summary').click()
+    await expect(disclosure.locator('.thinking-fold__body')).toBeVisible()
+    await expect(disclosure.locator('.thinking-fold__body')).toHaveText(text)
+  }
+  await expect(timeline.locator('.activity-narration')).toHaveText('Inspect.')
+  const tool = timeline.locator('[data-activity-id="tool:tool-1"]')
+  await expect(tool).toHaveCount(1)
+  await expect(tool).toContainText('Read skill')
+  await expect(tool.locator('.tool-row')).not.toHaveClass(/tool-row--(?:running|error)/)
+  await expect(page.locator('.assistant-answer')).toHaveCount(1)
+  await expect(page.locator('.assistant-answer')).toHaveText('Final answer.')
+  await expect(timeline).not.toContainText('Final answer.')
+}
+
 test('replays Activity exactly across active reload, terminal reloads, and restart', async ({ page }) => {
   const gateway = await installGatewayFixture(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
   await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
 
   const activeBefore = await semanticActivity(page)
-  // Live mode intentionally retains only the current routine phase; settled
-  // history restores every completed provider/write phase.
+  // Only the current routine phase is visible live. The snapshot below still
+  // retains completed provider/write boundaries for timing; terminal UI hides
+  // those routine rows while preserving the actual reasoning, narration and work.
   expect(activeBefore.map(row => row.order)).toEqual([6, 31, 41, 52, 60])
   await page.reload()
   const activeAfter = await semanticActivity(page)
@@ -313,16 +335,19 @@ test('replays Activity exactly across active reload, terminal reloads, and resta
   gateway.settle()
   await page.reload()
   const settled = await semanticActivity(page)
-  expect(settled.map(row => row.order)).toEqual([4, 6, 31, 31, 41, 50, 52, 60])
-  await expect(page.locator('.assistant-answer')).toHaveText('Final answer.')
-  await expect(page.getByTestId('assistant-unified-activity-timeline')).not.toContainText(
-    'Final answer.',
-  )
+  expect(settled.map(row => ({ order: row.order, type: row.type }))).toEqual([
+    { order: 6, type: 'reasoning' },
+    { order: 31, type: 'segment' },
+    { order: 41, type: 'segment' },
+    { order: 52, type: 'reasoning' },
+  ])
+  await expectDurableActivity(page)
 
   await page.reload()
   expect(await semanticActivity(page)).toEqual(settled)
+  await expectDurableActivity(page)
   gateway.restart()
   await page.reload()
   expect(await semanticActivity(page)).toEqual(settled)
-  await expect(page.locator('.assistant-answer')).toHaveCount(1)
+  await expectDurableActivity(page)
 })

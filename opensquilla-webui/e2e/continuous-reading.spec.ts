@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page } from '@playwright/test'
 import { fileURLToPath } from 'node:url'
+import { createHash } from 'node:crypto'
 import { validateChatHistoryResult } from '../src/contracts/generated/v4/chatHistoryValidators.mjs'
 import { activitySnapshotMatchesMessage, normalizeActivitySnapshot } from '../src/utils/chat/activitySnapshot'
 import type { ChatMessage } from '../src/types/chat'
@@ -21,14 +22,19 @@ test.beforeAll(() => {
   })).toBe(true)
 })
 
-async function openFixture(page: Page, theme: 'miami' | 'light' | 'dark' = 'miami', history = continuousHistory) {
+async function openFixture(page: Page, theme: 'miami' | 'light' | 'dark' = 'miami', history = continuousHistory, documents: Record<string, string> = {}) {
   const payloads: Record<string, unknown> = { ...continuousPayloads, 'chat.history': history }
   await page.addInitScript(selectedTheme => {
     localStorage.setItem('opensquilla-locale', 'zh-Hans')
     localStorage.setItem('opensquilla-theme', selectedTheme)
     localStorage.removeItem('opensquilla.appearance.toolDetails.v1')
   }, theme)
-  await page.route('**/api/**', route => route.fulfill({ json: {} }))
+  await page.route('**/api/**', route => {
+    const documentId = new URL(route.request().url()).pathname.split('/').pop()!
+    return documents[documentId]
+      ? route.fulfill({ contentType: 'text/html', body: documents[documentId] })
+      : route.fulfill({ json: {} })
+  })
   await page.route('**/opensquilla-mark.png', route => route.fulfill({
     path: fileURLToPath(new URL('../../src/opensquilla/gateway/static/img/opensquilla-mark.png', import.meta.url)), contentType: 'image/png',
   }))
@@ -74,7 +80,7 @@ async function assertActivityHeaderBoundary(answer: Locator, expanded: boolean) 
     const activityRect = node.closest('.assistant-activity')!.getBoundingClientRect()
     const button = node.querySelector('button')!.getBoundingClientRect()
     const inner = node.parentElement!.querySelector('.assistant-activity__body-inner')!.getBoundingClientRect()
-    const answer = node.parentElement!.parentElement!.querySelector('.assistant-answer .msg-ai-text > :first-child')!.getBoundingClientRect()
+    const answer = node.parentElement!.parentElement!.querySelector('.assistant-answer .msg-ai-text p')!.getBoundingClientRect()
     return {
       width: headerRect.width, activityWidth: activityRect.width,
       left: headerRect.left, activityLeft: activityRect.left,
@@ -166,7 +172,7 @@ for (const width of [1440, 1280, 390]) {
 test('prose retains readable spacing while metadata stays secondary and output stays bounded', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 })
   const answer = await openFixture(page)
-  const paragraphs = answer.locator('.assistant-answer .msg-ai-text > p')
+  const paragraphs = answer.locator('.assistant-answer .msg-ai-text p')
   const bounds = await paragraphs.evaluateAll(nodes => nodes.slice(0, 2).map(node => {
     const rect = node.getBoundingClientRect()
     return { top: rect.top, bottom: rect.bottom, fontSize: parseFloat(getComputedStyle(node).fontSize) }
@@ -189,7 +195,7 @@ test('prose retains readable spacing while metadata stays secondary and output s
     const narration = [...root.querySelectorAll('.activity-narration')].map(node => node.getBoundingClientRect())
     const tools = [...root.querySelectorAll('.tool-row[aria-expanded]')].map(node => node.getBoundingClientRect())
     const conclusion = root.querySelector('.assistant-answer')!.getBoundingClientRect()
-    const firstParagraph = root.querySelector('.assistant-answer .msg-ai-text > p')!.getBoundingClientRect()
+    const firstParagraph = root.querySelector('.assistant-answer .msg-ai-text p')!.getBoundingClientRect()
     const reasoning = root.querySelector('.thinking-fold__summary')!.getBoundingClientRect()
     return { narrationToWrite: tools[0]!.top - narration[0]!.bottom,
       writeToNarration: narration[1]!.top - tools[0]!.bottom,
@@ -304,3 +310,39 @@ for (const theme of ['miami', 'light', 'dark'] as const) {
     await assertNoPageOverflow(page)
   })
 }
+
+
+test('settled mixed prose and canvases reset only the outer reading boundaries', async ({ page }) => {
+  const history = structuredClone(continuousHistory)
+  const html = '<!doctype html><html><body>Mixed reading canvas</body></html>'
+  const receipts = [1, 2].map(index => ({
+    documentId: `doc_reading_${index}`, revisionId: 'rev_reading', artifactId: `reading_${index}`,
+    widgetId: `reading_${index}`, version: 1, name: `reading-${index}.html`, mime: 'text/html',
+    size: Buffer.byteLength(html), sha256: createHash('sha256').update(html).digest('hex'),
+    marker: `visualize:doc_reading_${index}:rev_reading`,
+  }))
+  const prose = ['连续阅读验收完成。首段。', '中间段落保留上下间距。', '尾段。']
+  const message = history.messages[1] as Record<string, unknown>
+  message.text = `${prose[0]}\n\n\`${receipts[0]!.marker}\`\n\n${prose[1]}\n\n\`${receipts[1]!.marker}\`\n\n${prose[2]}`
+  message.tool_calls = receipts.flatMap((receipt, index) => [
+    { type: 'tool_use', tool_use_id: `reading-${index}`, name: 'show_widget', input: { title: receipt.name } },
+    { type: 'tool_result', tool_use_id: `reading-${index}`, name: 'show_widget', result: JSON.stringify(receipt) },
+  ])
+  for (const outcome of history.turn_outcomes as Array<Record<string, unknown>>) delete outcome.activity_snapshot
+  const answer = await openFixture(page, 'dark', history, Object.fromEntries(receipts.map(receipt => [receipt.documentId, html])))
+  const body = answer.locator('.assistant-answer .msg-ai-text')
+  await expect(body.locator('[data-visualize-canvas]')).toHaveCount(2)
+  for (const canvas of await body.locator('[data-visualize-canvas]').all()) {
+    await expect(canvas.frameLocator('iframe').getByText('Mixed reading canvas')).toBeVisible()
+  }
+  const segments = body.locator(':scope > .visualize-body__text')
+  await expect(segments).toHaveCount(3)
+  const margins = await segments.evaluateAll(nodes => nodes.map(node => {
+    const first = getComputedStyle(node.firstElementChild!)
+    const last = getComputedStyle(node.lastElementChild!)
+    return [parseFloat(first.marginTop), parseFloat(last.marginBottom)]
+  }))
+  expect(margins).toEqual([[0, 12], [12, 12], [12, 0]])
+  await assertActivityHeaderBoundary(answer, false)
+  await assertNoPageOverflow(page)
+})

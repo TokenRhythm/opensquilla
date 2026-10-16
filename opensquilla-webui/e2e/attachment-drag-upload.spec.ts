@@ -64,16 +64,16 @@ async function mockRpc(page: Page, capturedSends: CapturedSend[], options: MockR
           : {}
         if (method === 'connect') {
           ws.send(helloOkResponse({
-            auth: { principal: { isOwner: true, authenticated: true, authState: 'authenticated',
-              ...(options.durableDraftIdentity ? { role: 'operator',
-                scopes: ['operator.read', 'operator.write'], capabilities: ['chat.read', 'chat.write'] } : {}),
-            } },
+            // The helper supplies a complete authenticated principal by default.
+            // Explicit null is the protocol representation of missing identity proof.
+            ...(options.durableDraftIdentity === false ? { auth: null } : {}),
           }))
           return
         }
         if (method === 'chat.send') {
           const params = (frame.params || {}) as CapturedSend
           capturedSends.push(params)
+          const taskId = `attachment-task-${capturedSends.length}`
           if (options.replayHistoryAfterSend) {
             const messageIndex = capturedSends.length
             historyMessages.splice(0, historyMessages.length, {
@@ -88,11 +88,15 @@ async function mockRpc(page: Page, capturedSends: CapturedSend[], options: MockR
           ws.send(wsResponse(String(frame.id), {
             sessionKey: params.sessionKey,
             status: 'accepted',
+            task_id: taskId,
           }))
           if (options.replayHistoryAfterSend) {
             ws.send(wsEvent('session.event.done', {
               key: params.sessionKey || '',
               sessionKey: params.sessionKey || '',
+              task_id: taskId,
+              turn_id: taskId,
+              reason: 'completed',
               status: 'succeeded',
               stream_generation: 'e2e-stream-generation',
               stream_seq: capturedSends.length,
