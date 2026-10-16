@@ -42,6 +42,14 @@ function deferred<T>() {
 afterEach(() => scopes.splice(0).forEach(scope => scope.stop()))
 
 describe('workspace preview canonical opening', () => {
+  it('reports a rejected panel presentation as unsuccessful after resource resolution', async () => {
+    const h = setup()
+    h.show.mockReturnValue(false)
+    expect(await h.api.open('doc_weather')).toBe(false)
+    expect(h.show).toHaveBeenCalledOnce()
+    expect(h.onError).not.toHaveBeenCalled()
+  })
+
   it.each(['success', 'error'] as const)('does not override a newer public-file click with a late workspace %s', async result => {
     let latest = 0
     const beginRequest = () => {
@@ -66,7 +74,8 @@ describe('workspace preview canonical opening', () => {
     const h = setup()
     const latest = { ...current, revision: { revisionId: 'rev_latest', artifactId: 'art_latest' } } as WorkbenchResourceOpenResponse
     h.openCurrent.mockResolvedValue(latest)
-    await h.api.open({ artifactId: 'art_historical' }, 'session-A')
+    const opened = await h.api.open({ artifactId: 'art_historical' }, 'session-A')
+    expect(opened).toBe(true)
     expect(h.getArtifact).toHaveBeenCalledWith('session-A', 'art_historical')
     expect(h.resolve).toHaveBeenCalledWith('session-A', {
       type: 'document', documentId: 'doc_weather', id: 'doc_weather',
@@ -85,7 +94,8 @@ describe('workspace preview canonical opening', () => {
         ...(failure === 'wrong-artifact' ? { id: 'art_unrelated' } : {}),
         ...(failure === 'wrong-source' ? { source: 'upload' } : {}),
       })
-      await h.api.open({ artifactId: 'art_historical' }, 'session-A')
+      const opened = await h.api.open({ artifactId: 'art_historical' }, 'session-A')
+      expect(opened).not.toBe(true)
       expect(h.onError).toHaveBeenCalledOnce()
       expect(h.resolve).not.toHaveBeenCalled()
       expect(h.openCurrent).not.toHaveBeenCalled()

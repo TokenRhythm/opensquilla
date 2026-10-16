@@ -17,7 +17,10 @@ const resourceStart = chatViewSource.indexOf('async function openDeliverableWork
 const resourceEnd = chatViewSource.indexOf('\nasync function resolveWorkspacePreviewResource(', resourceStart)
 const openStart = chatViewSource.indexOf('function openArtifact(')
 const openEnd = chatViewSource.indexOf('\nfunction closeDeliverables', openStart)
-const entrySource = transpileModule(`${chatViewSource.slice(guardStart, guardEnd)}\n${chatViewSource.slice(resourceStart, resourceEnd)}\n${chatViewSource.slice(openStart, openEnd)}`, {
+const explicitStart = chatViewSource.indexOf('function openWorkbenchItemExplicit(')
+const explicitEnd = chatViewSource.indexOf('\nfunction artifactPreviewItemForExplicitOpen(', explicitStart)
+const workspaceExplicitStart = chatViewSource.indexOf('async function openWorkspacePreviewExplicit(')
+const entrySource = transpileModule(`${chatViewSource.slice(explicitStart, explicitEnd)}\n${chatViewSource.slice(workspaceExplicitStart, openStart)}\n${chatViewSource.slice(guardStart, guardEnd)}\n${chatViewSource.slice(resourceStart, resourceEnd)}\n${chatViewSource.slice(openStart, openEnd)}`, {
   compilerOptions: { target: ScriptTarget.ES2022 },
 }).outputText
 
@@ -46,7 +49,7 @@ function harness() {
     importDocument: vi.fn(async () => ({ document, revision })),
     preview: vi.fn(async () => ({ resource, preview: { resource: resource.resource, launchUrl: '/original', mode: 'local-renderer' } })),
   }
-  const openItem = vi.fn<(item: unknown) => boolean>(() => true), legacy = vi.fn(() => true), pushToast = vi.fn()
+  const openItem = vi.fn<(item: unknown) => boolean>(() => true), requestReveal = vi.fn(), legacy = vi.fn(() => true), pushToast = vi.fn()
   const workspacePreviewOpening = { open: vi.fn() }
   const catalog = { get: vi.fn<(key: string, id: string) => Promise<ArtifactPayload | null>>(async () => null) }
   const dependencies = {
@@ -55,7 +58,8 @@ function harness() {
     attachmentWorkbenchPreviewEnabled, workbenchEnabled,
     sessionArtifacts: { value: [artifact] }, workbenchResourcesStore: services,
     artifactWorkbench: { artifacts: catalog },
-    workbenchStore: { openItem }, openLegacyArtifactWorkbench: legacy,
+    workbenchStore: { openItem, requestReveal, activeSessionId: 'session-a' }, openLegacyArtifactWorkbench: legacy,
+    workbenchOwnerKey: sessionKey,
     artifactPreviewItemForExplicitOpen: (value: unknown) => value,
     platform: { capabilities: {}, workbench: {} }, workspacePreviewOpening,
     artifactImageLightbox: { open: vi.fn() }, focusInlineDeliverable: vi.fn(() => true),
@@ -76,12 +80,26 @@ function harness() {
     dispose(): void
     deactivate(): void
   }
-  return { api, artifact, resource, current, revision, services, openItem, legacy, pushToast, workspacePreviewOpening, catalog,
+  return { api, artifact, resource, current, revision, services, openItem, requestReveal, legacy, pushToast, workspacePreviewOpening, catalog,
     sessionKey, currentEpoch, deliveryIdentity, gatewayAccess,
     attachmentWorkbenchPreviewEnabled, workbenchEnabled }
 }
 
 describe('chat Office card document opening', () => {
+  it.each([true, false, undefined])('reveals an explicit workspace preview only after successful opening (%s)', async opened => {
+    const h = harness()
+    h.workspacePreviewOpening.open.mockResolvedValue(opened)
+    await h.api.openDeliverableWorkbenchResource({ ...h.artifact, source: 'workspace-preview', documentId: 'doc_current' })
+    expect(h.requestReveal).toHaveBeenCalledTimes(opened ? 1 : 0)
+  })
+
+  it('does not reveal a resource if the workbench rejects the open', async () => {
+    const h = harness()
+    h.openItem.mockReturnValue(false)
+    await h.api.openDeliverableWorkbenchResource(h.artifact)
+    expect(h.requestReveal).not.toHaveBeenCalled()
+  })
+
   it('routes an older internal HTML artifact into the canonical opener before any metadata await', () => {
     const h = harness()
     const artifact: ArtifactPayload = {

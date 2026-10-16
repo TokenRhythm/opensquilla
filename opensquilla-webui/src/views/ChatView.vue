@@ -1309,6 +1309,14 @@ let optionalRpcAdmissionGeneration = 0
 const appStore = useAppStore()
 const workbenchStore = useWorkbenchStore()
 
+function openWorkbenchItemExplicit(item: Parameters<typeof workbenchStore.openItem>[0]): boolean {
+  const opened = workbenchStore.openItem(item)
+  // Late resource reads can register on a background owner's shelf. They must
+  // not reveal an unrelated foreground tab on a constrained screen.
+  if (opened && workbenchStore.activeItemId === item.id) workbenchStore.requestReveal()
+  return opened
+}
+
 function artifactPreviewItemForExplicitOpen(
   options: Parameters<typeof createArtifactPreviewWorkbenchItem>[0],
 ) {
@@ -5515,7 +5523,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       const artifact = artifactPayloadFromRevision(current.revision)
       artifact.documentId = current.document.documentId
       artifact.revisionId = current.revision.revisionId
-      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
         artifact,
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -5529,7 +5537,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       return
     }
     if (!current && resource.resource.type === 'document') {
-      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
         artifact: artifactPayloadFromWorkbenchResource(resource),
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -5556,7 +5564,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       const artifact = artifactPayloadFromRevision(imported.revision)
       artifact.documentId = imported.document.documentId
       artifact.revisionId = imported.revision.revisionId
-      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
         artifact,
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -5585,7 +5593,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
     )
     if (!preview || !isCurrent()) return
     const preparedResource = resourceFromPreparedPreview(preview)
-    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
       artifact: artifactPayloadFromWorkbenchResource(preparedResource),
       initialSection: 'preview',
       nativeHtml: false,
@@ -5686,7 +5694,7 @@ async function openDeliverables() {
           title: t('workbench.resources.title'),
         })
         item.scope = { type: 'session', id: visibleOwnerKey }
-        workbenchStore.openItem(item)
+        openWorkbenchItemExplicit(item)
         return
       }
     } catch {
@@ -5711,6 +5719,7 @@ async function openDeliverables() {
     if (recentPreview) {
       workbenchStore.activateItem(recentPreview.id)
       workbenchStore.setExpanded(true)
+      workbenchStore.requestReveal()
       return
     }
 
@@ -5779,7 +5788,7 @@ function openLegacyArtifactWorkbench(
   artifact: ArtifactPayload,
   initialSection: 'preview' | 'source' = 'preview',
 ): boolean {
-  return workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+  return openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
     artifact,
     initialSection,
     navigationArtifacts: sessionArtifacts.value,
@@ -5807,7 +5816,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
     // Persisted workspace cards can reference an internal historical revision.
     // Resolve its owning document instead of treating it as a public delivery.
     if (artifact.source === 'workspace-preview') {
-      await workspacePreviewOpening.open(
+      await openWorkspacePreviewExplicit(
         documentId || { artifactId }, key,
         typeof artifact.previewPagePath === 'string' ? artifact.previewPagePath : undefined,
       )
@@ -5828,7 +5837,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       const currentArtifact = artifactPayloadFromRevision(current.revision)
       currentArtifact.documentId = current.document.documentId
       currentArtifact.revisionId = current.revision.revisionId
-      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
         artifact: currentArtifact,
         initialSection: 'preview',
         navigationArtifacts: sessionArtifacts.value,
@@ -5863,7 +5872,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       const importedArtifact = artifactPayloadFromRevision(imported.revision)
       importedArtifact.documentId = imported.document.documentId
       importedArtifact.revisionId = imported.revision.revisionId
-      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
         artifact: importedArtifact,
         initialSection: 'preview',
         navigationArtifacts: sessionArtifacts.value,
@@ -5897,7 +5906,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       return
     }
     const preparedResource = resourceFromPreparedPreview(preview)
-    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
       artifact: artifactPayloadFromWorkbenchResource(preparedResource),
       navigationArtifacts: sessionArtifacts.value,
       nativeHtml: false,
@@ -5951,7 +5960,7 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
     })
     // A live result still registers its resource while its conversation is
     // hidden, but must not take over another conversation or the new-chat page.
-    workbenchStore.openItem(item, {
+    return workbenchStore.openItem(item, {
       activate: item.scope.type !== 'session' || item.scope.id === workbenchStore.activeSessionId,
     })
   },
@@ -5963,6 +5972,14 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
   },
 })
 
+async function openWorkspacePreviewExplicit(...args: Parameters<typeof workspacePreviewOpening.open>) {
+  const owner = workbenchOwnerKey.value
+  const opened = await workspacePreviewOpening.open(...args)
+  if (opened && owner === workbenchOwnerKey.value && owner === workbenchStore.activeSessionId) {
+    workbenchStore.requestReveal()
+  }
+}
+
 function openArtifact(artifact: ArtifactPayload): boolean {
   // All file entry points share ordering, including synchronous legacy/media
   // opens that must retire an older document request still awaiting transport.
@@ -5971,7 +5988,7 @@ function openArtifact(artifact: ArtifactPayload): boolean {
   // Persisted artifacts also carry this provenance. Only id-less workspace
   // actions already carry the document/session identity needed by this helper.
   if (artifact.source === 'workspace-preview' && !artifact.id) {
-    void workspacePreviewOpening.open(
+    void openWorkspacePreviewExplicit(
       typeof artifact.documentId === 'string' ? artifact.documentId : '',
       artifact.session_key || '',
       typeof artifact.previewPagePath === 'string' ? artifact.previewPagePath : undefined,

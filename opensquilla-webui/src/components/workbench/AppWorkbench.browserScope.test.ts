@@ -78,7 +78,9 @@ async function mountWorkbench() {
   const store = useWorkbenchStore(pinia)
   store.setSessionScope('session-a')
   store.openItem(browser('page-a', 'session-a'))
-  const props = reactive({ routeActive: true, sessionId: 'session-a' })
+  // The 600px rectangle above describes the native slot, not its workspace.
+  // Scope isolation is exercised in split view; narrow visibility is explicit.
+  const props = reactive({ routeActive: true, sessionId: 'session-a', availableWidth: 1200 })
   const element = document.createElement('div')
   document.body.append(element)
   const app = createApp({ render: () => h(AppWorkbench, props) })
@@ -147,6 +149,33 @@ describe('AppWorkbench retained browser session isolation', () => {
     } })
     expect(harness.store.items.some(item => item.id === 'blank-target')).toBe(false)
     expect(harness.api.destroySurface).toHaveBeenCalledWith('blank-target')
+  })
+
+  it('hides a narrow native page without closing or recreating its retained session', async () => {
+    const harness = await mountWorkbench()
+    const page = harness.pages.get('page-a')!
+    page.form = 'synthetic retained input'
+    page.loggedIn = true
+    const lifecycle = vi.fn()
+    const unsubscribe = harness.store.onLifecycle(lifecycle)
+    expect(page.visible).toBe(true)
+
+    harness.props.availableWidth = 600
+    await settle()
+    expect(page.visible).toBe(false)
+    expect(harness.store.expanded).toBe(true)
+    expect(harness.store.hostAvailable).toBe(true)
+    expect(harness.pages.get('page-a')).toBe(page)
+    expect(harness.api.navigateSurface).not.toHaveBeenCalled()
+    expect(harness.api.destroySurface).not.toHaveBeenCalled()
+
+    harness.props.availableWidth = 1200
+    await settle()
+    expect(harness.pages.get('page-a')).toBe(page)
+    expect(page).toMatchObject({ form: 'synthetic retained input', loggedIn: true, visible: true })
+    expect(harness.api.createSurface).toHaveBeenCalledOnce()
+    expect(lifecycle).not.toHaveBeenCalled()
+    unsubscribe()
   })
 
   it('switches through the mounted scope watcher without closing or recreating dirty pages', async () => {

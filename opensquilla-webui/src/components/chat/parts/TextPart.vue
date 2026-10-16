@@ -131,9 +131,14 @@ function applyWorkspaceFiles(root: HTMLElement, scope: string) {
 }
 
 function openWorkspaceFile(file: WorkspaceFile) {
-  if (file.kind === 'text' && workspaceWorkbenchAvailable.value && props.sessionKey && workbench?.openItem(
-    createResolvedWorkspaceFileItem(props.sessionKey, file, workbenchOwner?.value || props.sessionKey),
-  )) { selectedWorkspaceFile.value = null; return }
+  if (file.kind === 'text' && workspaceWorkbenchAvailable.value && props.sessionKey && workbench) {
+    const item = createResolvedWorkspaceFileItem(props.sessionKey, file, workbenchOwner?.value || props.sessionKey)
+    if (workbench.openItem(item)) {
+      if (workbench.activeItemId === item.id) workbench.requestReveal()
+      selectedWorkspaceFile.value = null
+      return
+    }
+  }
   selectedWorkspaceFile.value = file
 }
 

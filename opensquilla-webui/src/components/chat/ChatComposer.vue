@@ -838,15 +838,68 @@ function closeOpenPopoversFromOutside(event: PointerEvent) {
   }
 }
 
+let popoverOwnerObserver: MutationObserver | null = null
+
+function hiddenPopoverAncestor(element: HTMLElement | null): HTMLElement | null {
+  for (let current = element; current; current = current.parentElement) {
+    if (current.hasAttribute('inert') || current.hidden
+      || current.getAttribute('aria-hidden') === 'true'
+      || current.style.display === 'none') return current
+  }
+  return null
+}
+
+function closePopoversForHiddenOwner() {
+  const hiddenOwner = hiddenPopoverAncestor(composerEl.value)
+  if (!hiddenOwner || !anyPopoverOpen.value) return
+  const focused = document.activeElement
+  // Routing is teleported outside the pane; the host's normal focus-return
+  // cannot detect that its menu still owns focus after the pane becomes inert.
+  const transferFocus = focused instanceof HTMLElement && (
+    hiddenOwner.contains(focused)
+    || modelRoutingPanelRef.value?.element()?.contains(focused)
+  )
+  closeAllPopovers()
+  if (!transferFocus) return
+  void nextTick(() => {
+    const current = document.activeElement
+    // Respect a host/dialog that already moved focus to a visible control.
+    if (current !== focused && current !== document.body && current?.isConnected) return
+    const candidates = document.querySelectorAll<HTMLElement>([
+      '[data-testid="workbench-return-chat"]',
+      '[data-testid="topbar-workbench-toggle"]',
+      '[data-testid="chat-session-action-workbench"]',
+      '.chat-inline-editor',
+    ].join(','))
+    const target = [...candidates].find(element => !hiddenPopoverAncestor(element)
+      && element.getClientRects().length > 0 && !element.matches(':disabled'))
+    target?.focus({ preventScroll: true })
+  })
+}
+
 watch(anyPopoverOpen, (open) => {
+  popoverOwnerObserver?.disconnect()
+  popoverOwnerObserver = null
   if (open) {
     document.addEventListener('pointerdown', closeOpenPopoversFromOutside, true)
+    // Observe only the owning ancestor chain, and only while a menu is open.
+    // Main and side panes stay mounted when hidden, so unmount hooks alone do
+    // not close their inline or teleported menus.
+    popoverOwnerObserver = new MutationObserver(closePopoversForHiddenOwner)
+    for (let owner = composerEl.value; owner; owner = owner.parentElement) {
+      popoverOwnerObserver.observe(owner, {
+        attributes: true,
+        attributeFilter: ['inert', 'hidden', 'aria-hidden', 'style'],
+      })
+    }
+    closePopoversForHiddenOwner()
   } else {
     document.removeEventListener('pointerdown', closeOpenPopoversFromOutside, true)
   }
 }, { immediate: true })
 
 onBeforeUnmount(() => {
+  popoverOwnerObserver?.disconnect()
   document.removeEventListener('pointerdown', closeOpenPopoversFromOutside, true)
 })
 

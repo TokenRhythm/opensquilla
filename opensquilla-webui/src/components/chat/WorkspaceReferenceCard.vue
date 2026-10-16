@@ -107,7 +107,8 @@ async function open() {
       || gateway?.subscriptionEpoch !== gatewayEpoch
       || (gateway && gateway.loadConnectionEndpoint() !== referenceGatewayEndpoint)
     ) return
-    store.openItem(createWorkspaceFileItem(sessionKey, snapshot.reference, ownerSessionKey))
+    const item = createWorkspaceFileItem(sessionKey, snapshot.reference, ownerSessionKey)
+    if (store.openItem(item) && store.activeItemId === item.id) store.requestReveal()
   } catch (error) {
     if (!attempt.signal.aborted) errorKey.value = workspaceReferenceErrorKey(error)
   } finally {

@@ -51,7 +51,7 @@
         :disabled="modalBlocked"
         :aria-label="returnLabel"
         data-testid="workbench-return-chat"
-        @click="collapseWorkbench"
+        @click="returnToChat"
       >
         <Icon name="chevronLeft" :size="17" aria-hidden="true" />
         <span>{{ returnLabel }}</span>
@@ -283,6 +283,7 @@ const props = withDefaults(defineProps<{
 })
 
 const emit = defineEmits<{
+  'return-chat': []
   collapsed: []
   emptied: []
   'focus-return': []
@@ -403,15 +404,14 @@ const effectiveWidth = computed(() => previewWidth.value ?? workbenchEffectiveWi
 const hostStyle = computed(() => ({
   '--workbench-width': `${leavingWidth.value ?? effectiveWidth.value}px`,
 }))
-const shouldRender = computed(() =>
+// Automatic space saving must not run suspend/dispose lifecycle hooks. Native
+// surface visibility is published separately from the retained runtime.
+const runtimeAvailable = computed(() =>
   props.enabled && props.routeActive && store.expanded
   && (activeItem.value !== null || props.allowEmpty))
+const shouldRender = computed(() => runtimeAvailable.value && layoutMode.value !== 'main-only')
 const shouldMount = computed(() =>
   props.enabled && (mountedItems.value.length > 0 || props.allowEmpty && store.expanded))
-const runtimeAvailable = computed(() =>
-  props.enabled
-  && props.routeActive
-  && shouldRender.value)
 const hoverTopmost = useDialogLayer(hoverOpen)
 
 function commitWidth(width: number) {
@@ -427,6 +427,15 @@ function resetWidth() {
 function collapseWorkbench() {
   store.setExpanded(false)
   emit('collapsed')
+}
+
+function returnToChat() {
+  if (!store.maximized && measuredAvailableWidth.value < WORKBENCH_SPLIT_MIN_WIDTH) {
+    emit('return-chat')
+    emit('focus-return')
+    return
+  }
+  collapseWorkbench()
 }
 
 function toggleMaximized() {
@@ -598,7 +607,7 @@ function emitSurfaceRect() {
   const element = activeLayer?.querySelector<HTMLElement>(
     '[data-workbench-native-surface-slot]',
   )
-  if (!element || !runtimeAvailable.value) {
+  if (!element || !shouldRender.value) {
     nativeBackdropStyle.value = { display: 'none' }
     emit('surface-rect', hiddenRect(activeNativeId))
     return
@@ -623,7 +632,10 @@ watch(layoutMode, mode => {
   const focused = typeof document !== 'undefined' ? document.activeElement : null
   const focusWasInMain = focused instanceof Element && Boolean(focused.closest('.app-chat-pane'))
   const focusWasOnReturn = focused === returnButtonRef.value
-  if (mode === 'single-pane' && focusWasInMain) {
+  const focusWasInWorkbench = focused instanceof Element && Boolean(hostRef.value?.contains(focused))
+  if (mode === 'main-only' && focusWasInWorkbench) {
+    void nextTick(() => emit('focus-return'))
+  } else if (mode === 'single-pane' && focusWasInMain) {
     void nextTick(() => returnButtonRef.value?.focus({ preventScroll: true }))
   } else if (mode === 'split' && focusWasOnReturn) {
     void nextTick(() => hostRef.value?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus({ preventScroll: true }))

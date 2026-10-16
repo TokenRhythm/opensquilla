@@ -254,6 +254,7 @@
         />
         <WorkbenchToggle
           :enabled="appStore.features.artifactWorkbench === true && isChatRoute"
+          :presentation-visible="workbenchVisible && effectiveWorkbenchLayout !== 'main-only'"
           allow-empty
           :session-id="workbenchSessionKey"
           :blocked="workbenchModalBlocked"
@@ -294,6 +295,7 @@
       </main>
       </div>
       <AppWorkbench
+        @return-chat="narrowWorkbenchRequested = false"
         :available-width="workspaceAvailableWidth"
         :layout-mode="effectiveWorkbenchLayout"
         :motion-enabled="workbenchMotionEnabled"
@@ -458,7 +460,7 @@ import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import WorkbenchToggle from './components/workbench/WorkbenchToggle.vue'
 import { useWorkbenchStore } from './workbench/store'
-import { workbenchLayoutMode, workbenchShouldYieldSidebar } from './workbench/layout'
+import { WORKBENCH_SPLIT_MIN_WIDTH, workbenchLayoutMode, workbenchShouldYieldSidebar } from './workbench/layout'
 import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useDesktopUpdatePresentation } from './composables/useDesktopUpdatePresentation'
 import { useSidebarLayout } from './composables/useSidebarLayout'
@@ -617,9 +619,22 @@ const effectiveSidebarOpen = computed(() => isSidebarDrawer.value
 const workspaceAvailableWidth = computed(() => measuredWorkspaceWidth.value > 0
   ? measuredWorkspaceWidth.value
   : Math.max(0, shellWidth.value - (effectiveSidebarOpen.value && !isSidebarDrawer.value ? sidebarEffectiveWidth.value : 0)))
+// Responsive hiding is presentation only. Do not close a child or overwrite
+// the user's expanded/width preference when the primary conversation needs space.
+const narrowWorkbenchRequested = ref(false)
+const workbenchConstrained = computed(() => workspaceAvailableWidth.value < WORKBENCH_SPLIT_MIN_WIDTH)
+watch(workbenchConstrained, () => { narrowWorkbenchRequested.value = false }, { flush: 'sync' })
+watch(() => workbenchStore.revealRequestId, () => {
+  if (workbenchConstrained.value) narrowWorkbenchRequested.value = true
+}, { flush: 'sync' })
+watch(() => workbenchStore.activeSessionId, () => { narrowWorkbenchRequested.value = false })
+watch(() => workbenchStore.expanded, expanded => {
+  if (!expanded) narrowWorkbenchRequested.value = false
+}, { flush: 'sync' })
 const effectiveWorkbenchLayout = computed(() => workbenchLayoutMode({
   availableWidth: workspaceAvailableWidth.value,
   maximized: workbenchStore.maximized,
+  explicitReveal: narrowWorkbenchRequested.value,
 }))
 const workbenchSinglePane = computed(() => workbenchVisible.value
   && effectiveWorkbenchLayout.value === 'single-pane')

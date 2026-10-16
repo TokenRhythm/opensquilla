@@ -84,26 +84,33 @@ async function geometry(page: Page) {
     }
     return { workspace: rect(workspace), pane: rect(pane), host: rect(host),
       hidden: getComputedStyle(pane).display === 'none', inert: pane.inert, ariaHidden: pane.getAttribute('aria-hidden'),
+      hostHidden: getComputedStyle(host).display === 'none', hostInert: host.inert, hostAriaHidden: host.getAttribute('aria-hidden'),
       mode: host.dataset.layoutMode, appMode: workspace.dataset.workbenchLayout,
       viewport: { width: innerWidth, height: innerHeight }, scrollWidth: document.documentElement.scrollWidth }
   })
 }
 
-async function expectLayout(page: Page, forceSingle = false) {
-  await expect(page.getByTestId('workbench-host')).toBeVisible()
+async function expectLayout(page: Page, expectedMode?: 'split' | 'main-only' | 'single-pane') {
+  // Automatic width changes prioritize the main conversation. Only an explicit
+  // user open/maximize may present the right pane alone on a narrow viewport.
+  await expect(page.getByTestId('workbench-host')).toBeAttached()
   await expect.poll(async () => {
     const g = await geometry(page)
-    const single = forceSingle || g.workspace.width < 841
+    const mode = expectedMode ?? (g.workspace.width < 841 ? 'main-only' : 'split')
     const inWorkspace = g.host.left >= g.workspace.left - 1 && g.host.right <= g.workspace.right + 1
       && g.host.bottom <= g.viewport.height + 1 && g.host.top >= g.workspace.top - 1
-    const geometryOK = single
-      ? g.hidden && g.inert && g.ariaHidden === 'true' && Math.abs(g.host.width - g.workspace.width) <= 1
-      : !g.hidden && !g.inert && g.pane.width >= 479 && g.host.width >= 359 && g.host.left >= g.pane.right - 1
-    return inWorkspace && geometryOK && g.scrollWidth <= g.viewport.width + 1
-  }, { message: 'Visible chat and workbench must partition the available workspace without covering each other' }).toBe(true)
+    const geometryOK = mode === 'main-only'
+      ? !g.hidden && !g.inert && g.hostHidden && g.hostInert && g.hostAriaHidden === 'true'
+        && Math.abs(g.pane.width - g.workspace.width) <= 1
+      : inWorkspace && !g.hostHidden && !g.hostInert && (mode === 'single-pane'
+        ? g.hidden && g.inert && g.ariaHidden === 'true' && Math.abs(g.host.width - g.workspace.width) <= 1
+        : !g.hidden && !g.inert && g.pane.width >= 479 && g.host.width >= 359 && g.host.left >= g.pane.right - 1)
+    return geometryOK && g.mode === mode && g.appMode === mode && g.scrollWidth <= g.viewport.width + 1
+  }, { message: 'Automatic shrink must keep main usable; explicit right-pane views must stay within the workspace' }).toBe(true)
   const g = await geometry(page)
-  expect(g.mode).toBe(forceSingle || g.workspace.width < 841 ? 'single-pane' : 'split')
+  expect(g.mode).toBe(expectedMode ?? (g.workspace.width < 841 ? 'main-only' : 'split'))
   expect(g.appMode).toBe(g.mode)
+  if (g.mode === 'main-only') await expect(page.getByTestId('topbar-workbench-toggle')).toHaveAttribute('aria-expanded', 'false')
   return g
 }
 
@@ -214,20 +221,31 @@ test.describe('actual App responsive workbench layout', () => {
     await screenshot(page, 'after-1200-navigation-split.png')
     await page.setViewportSize({ width: 1000, height: 950 })
     await showSidebar(page, true)
-    await expectLayout(page, true)
-    await expectComposerControls(side(page))
+    await expectLayout(page, 'main-only')
+    await expectComposerControls(main(page))
     await expect(page.getByTestId('sidebar-toggle-expanded')).toBeVisible()
     expect(gateway.errors).toEqual([])
   })
 
   for (const kind of ['assistant-chat', 'workspace-files', 'html', 'code', 'terminal'] as const) {
-    test(`${kind} uses the same split and single-pane boundaries without leaving the workspace`, async ({ page }) => {
+    test(`${kind} yields to main on automatic shrink and restores its split when widened`, async ({ page }) => {
       const gateway = await prepare(page)
       await openPanel(page, kind)
+      const htmlFrame = page.getByTestId('workspace-file-panel').locator('iframe')
+      const htmlFrameHandle = kind === 'html' ? await htmlFrame.elementHandle() : null
+      const htmlFrameSource = kind === 'html' ? await htmlFrame.getAttribute('src') : null
+      if (kind === 'html') await page.getByTestId('workspace-file-panel').frameLocator('iframe')
+        .getByRole('button', { name: 'Try interaction', exact: true }).click()
       await showSidebar(page, false)
       for (const width of [1200, 960, 842, 841, 840, 721, 720, 480, 390, 841, 1200]) {
         await setAvailableWidth(page, width)
         await expectLayout(page)
+        if (kind === 'html') {
+          expect(await htmlFrame.evaluate((element, original) => element === original, htmlFrameHandle)).toBe(true)
+          expect(await htmlFrame.getAttribute('src')).toBe(htmlFrameSource)
+          await expect(page.getByTestId('workspace-file-panel').frameLocator('iframe')
+            .getByRole('button', { name: 'Clicked once', exact: true, includeHidden: true })).toHaveText('Clicked once')
+        }
       }
       expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.close' || request.method === 'chat.abort')).toHaveLength(0)
       if (kind === 'terminal') expect(gateway.requests.filter(request => request.method === 'terminal.create')).toHaveLength(1)
@@ -238,6 +256,8 @@ test.describe('actual App responsive workbench layout', () => {
   test('keeps the same drafts and executions through drag, navigation, resize and return-to-chat', async ({ page }) => {
     const gateway = await prepare(page)
     await openPanel(page, 'assistant-chat')
+    const retainedMainEditor = await editor(main(page)).elementHandle()
+    const retainedSideEditor = await editor(side(page)).elementHandle()
     for (const host of [main(page), side(page)]) {
       await editor(host).fill('Keep running during layout changes')
       await host.getByRole('button', { name: 'Send', exact: true }).click()
@@ -274,18 +294,27 @@ test.describe('actual App responsive workbench layout', () => {
       await setAvailableWidth(page, width)
       await expectLayout(page)
     }
-    await screenshot(page, 'after-390-single-pane-running.png')
-    await page.getByTestId('workbench-return-chat').click()
-    await expect(page.getByTestId('workbench-host')).not.toBeVisible()
+    await screenshot(page, 'after-390-main-priority-running.png')
     await expect(editor(main(page))).toHaveText('Main unsent draft')
     await expect(main(page).locator('.chat-stop-btn')).toBeEnabled()
+    gateway.emit(SIDE, 'session.event.text_delta', { text: 'Side execution progressed while automatically hidden.' })
+    gateway.emit(MAIN, 'session.event.text_delta', { text: 'Main remains live while the right pane yields.' })
+    await expect(main(page).locator('.conversation-live-edge')).toContainText('Main remains live while the right pane yields.')
     await page.getByTestId('topbar-workbench-toggle').click()
-    await expectLayout(page)
+    await expectLayout(page, 'single-pane')
     await expect(editor(side(page))).toHaveText('Side unsent draft')
+    await expect(side(page).locator('.conversation-live-edge')).toContainText('Side execution progressed while automatically hidden.')
+    await page.getByTestId('workbench-return-chat').click()
+    await expectLayout(page, 'main-only')
+    await expect(editor(main(page))).toHaveText('Main unsent draft')
+    // Return only ends the temporary narrow presentation. The user's original
+    // split preference and the same side child must return on widening.
     await setAvailableWidth(page, 1400)
     await expectLayout(page)
     await expect(main(page).locator('.chat-stop-btn')).toBeEnabled()
     await expect(side(page).locator('.chat-stop-btn')).toBeEnabled()
+    expect(await editor(main(page)).evaluate((element, original) => element === original, retainedMainEditor)).toBe(true)
+    expect(await editor(side(page)).evaluate((element, original) => element === original, retainedSideEditor)).toBe(true)
     expect(await page.evaluate(() => localStorage.getItem('opensquilla.workbench.width.v1'))).toBe(preferred)
     expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.create')).toHaveLength(1)
     expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.close' || request.method === 'chat.abort')).toHaveLength(0)
@@ -328,6 +357,139 @@ test.describe('actual App responsive workbench layout', () => {
     expect(gateway.errors).toEqual([])
   })
 
+  for (const [name, trigger, popup] of [
+    ['model routing', '.chat-model-routing-btn', '.composer-model-routing'],
+    ['permissions', '.chat-run-mode-btn', '.composer-run-mode'],
+    ['add', '.chat-plus-btn', '.composer-add-menu'],
+  ] as const) test(`closes the side ${name} menu when its owner becomes hidden by automatic shrink`, async ({ page }) => {
+    const gateway = await prepare(page)
+    await openPanel(page, 'assistant-chat')
+    await editor(side(page)).fill('Side draft survives hidden popover cleanup')
+    await side(page).locator(trigger).click()
+    await expect(page.locator(popup)).toBeVisible()
+    await page.setViewportSize({ width: 390, height: 950 })
+    await expectLayout(page, 'main-only')
+    await expect(page.locator(popup)).toHaveCount(0)
+    await expect(side(page).locator(trigger)).toHaveAttribute('aria-expanded', 'false')
+    await expect.poll(() => page.evaluate(() => Boolean(document.activeElement?.closest('.app-chat-pane'))), {
+      message: 'Closing a hidden owner menu must leave focus in the visible main conversation',
+    }).toBe(true)
+    await page.setViewportSize({ width: 1600, height: 950 })
+    await expectLayout(page, 'split')
+    await expect(page.locator(popup)).toHaveCount(0)
+    await expect(editor(side(page))).toHaveText('Side draft survives hidden popover cleanup')
+    expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.close' || request.method === 'chat.abort')).toHaveLength(0)
+    expect(gateway.errors).toEqual([])
+  })
+
+  test('closes the main model menu when its owner becomes hidden by explicit right-pane reveal', async ({ page }) => {
+    const gateway = await prepare(page)
+    await openPanel(page, 'assistant-chat')
+    await page.setViewportSize({ width: 390, height: 950 })
+    await expectLayout(page, 'main-only')
+    await editor(main(page)).fill('Main draft survives explicit reveal')
+    await main(page).locator('.chat-model-routing-btn').click()
+    await expect(page.locator('.composer-model-routing')).toBeVisible()
+    await page.getByTestId('topbar-workbench-toggle').focus()
+    await page.getByTestId('topbar-workbench-toggle').press('Enter')
+    await expectLayout(page, 'single-pane')
+    await expect(page.locator('.composer-model-routing')).toHaveCount(0)
+    await expect(main(page).locator('.chat-model-routing-btn')).toHaveAttribute('aria-expanded', 'false')
+    await expect.poll(() => page.evaluate(() => Boolean(document.activeElement?.closest('[data-testid="workbench-host"]')))).toBe(true)
+    await page.getByTestId('workbench-return-chat').click()
+    await expectLayout(page, 'main-only')
+    await expect(page.locator('.composer-model-routing')).toHaveCount(0)
+    await expect(editor(main(page))).toHaveText('Main draft survives explicit reveal')
+    expect(gateway.errors).toEqual([])
+  })
+
+  test('keeps main first on shrink and reveals a narrow panel only for explicit user intent', async ({ page }) => {
+    const gateway = await prepare(page)
+    await openPanel(page, 'assistant-chat')
+    await editor(main(page)).fill('Main draft remains available')
+    await editor(side(page)).fill('Side draft remains mounted')
+    await editor(side(page)).focus()
+    await page.setViewportSize({ width: 840, height: 950 })
+    await expectLayout(page, 'main-only')
+    await expect(editor(main(page))).toBeVisible()
+    await expect.poll(() => page.evaluate(() => Boolean(document.activeElement?.closest('.app-chat-pane'))), {
+      message: 'Focus must leave the automatically hidden right pane and return to the main conversation',
+    }).toBe(true)
+    await page.getByTestId('topbar-workbench-toggle').click()
+    await expectLayout(page, 'single-pane')
+    for (const width of [720, 390]) {
+      await page.setViewportSize({ width, height: 950 })
+      await expectLayout(page, 'single-pane')
+      await expect(editor(side(page))).toHaveText('Side draft remains mounted')
+      await expectComposerControls(side(page))
+    }
+    // Widening ends the temporary reveal. A subsequent automatic shrink once
+    // again chooses main, rather than carrying a stale right-pane preference.
+    await page.setViewportSize({ width: 841, height: 950 })
+    await expectLayout(page, 'split')
+    await page.setViewportSize({ width: 390, height: 950 })
+    await expectLayout(page, 'main-only')
+    await expectComposerControls(main(page))
+    await openPanel(page, 'html')
+    await expectLayout(page, 'single-pane')
+    await page.getByTestId('workbench-return-chat').click()
+    await expectLayout(page, 'main-only')
+    await expect(editor(main(page))).toHaveText('Main draft remains available')
+    await page.setViewportSize({ width: 1200, height: 950 })
+    await expectLayout(page, 'split')
+    await expect(page.getByTestId('workspace-file-panel').frameLocator('iframe').getByRole('heading', { name: 'Parity HTML document' })).toBeVisible()
+    expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.close' || request.method === 'chat.abort')).toHaveLength(0)
+    expect(gateway.errors).toEqual([])
+  })
+
+  test('registers an agent-opened artifact on narrow screens without replacing the main conversation', async ({ page }) => {
+    const gateway = await prepare(page)
+    await page.setViewportSize({ width: 390, height: 950 })
+    await editor(main(page)).fill('Generate a background HTML preview')
+    await main(page).getByRole('button', { name: 'Send', exact: true }).click()
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(1)
+    gateway.registerDocument(MAIN, 'doc_narrow_background', 'background.html')
+    const result = { documentId: 'doc_narrow_background', resourceId: 'document:doc_narrow_background', entrypoint: '/task/background.html', previewStatus: 'ready' }
+    gateway.emit(MAIN, 'session.event.tool_use_start', { tool_use_id: 'background-preview', tool_name: 'open_workspace_preview', input: { path: 'background.html' } })
+    gateway.emit(MAIN, 'session.event.tool_result', { tool_use_id: 'background-preview', name: 'open_workspace_preview', result: JSON.stringify(result) })
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'workbench.resources.open').length).toBe(1)
+    gateway.emit(MAIN, 'session.event.text_delta', { text: 'Main remains visible after the artifact is ready.' })
+    await expect(main(page).locator('.conversation-live-edge')).toContainText('Main remains visible after the artifact is ready.')
+    await expectLayout(page, 'main-only')
+    await editor(main(page)).fill('Keep typing while the preview is retained')
+    await expect(editor(main(page))).toBeFocused()
+    await page.getByTestId('topbar-workbench-toggle').click()
+    await expectLayout(page, 'single-pane')
+    await expect(page.frameLocator('.artifact-preview__frame--html').getByRole('heading', { name: 'Canonical child preview', exact: true })).toBeVisible()
+    await page.getByTestId('workbench-return-chat').click()
+    await expectLayout(page, 'main-only')
+    await expect(editor(main(page))).toHaveText('Keep typing while the preview is retained')
+    expect(gateway.requests.filter(request => request.method === 'chat.abort')).toHaveLength(0)
+    expect(gateway.errors).toEqual([])
+  })
+
+  test('preserves a user-maximized right pane when resizing to a narrow viewport', async ({ page }) => {
+    const gateway = await prepare(page)
+    await openPanel(page, 'assistant-chat')
+    await editor(side(page)).fill('Explicit fullscreen draft')
+    await page.getByTestId('workbench-maximize').click()
+    await expectLayout(page, 'single-pane')
+    for (const width of [840, 390, 1300]) {
+      await page.setViewportSize({ width, height: 950 })
+      await expectLayout(page, 'single-pane')
+      await expect(editor(side(page))).toHaveText('Explicit fullscreen draft')
+    }
+    await page.getByTestId('workbench-maximize').click()
+    await expectLayout(page, 'split')
+    await page.getByTestId('workbench-maximize').click()
+    await page.setViewportSize({ width: 390, height: 950 })
+    await expectLayout(page, 'single-pane')
+    await page.getByTestId('workbench-return-chat').click()
+    await expect(editor(main(page))).toBeVisible()
+    await expect(page.getByTestId('workbench-host')).not.toBeVisible()
+    expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.close' || request.method === 'chat.abort')).toHaveLength(0)
+  })
+
   test('partitions every animation frame through open, maximize, restore and maximized collapse', async ({ page }) => {
     await prepare(page)
     await page.emulateMedia({ reducedMotion: 'no-preference' })
@@ -336,7 +498,7 @@ test.describe('actual App responsive workbench layout', () => {
     const splitWidth = (await page.getByTestId('workbench-host').boundingBox())!.width
     expectTrackMotion(opening, 0, splitWidth)
     const maximizing = await sampleTransition(page, () => page.getByTestId('workbench-maximize').click())
-    await expectLayout(page, true)
+    await expectLayout(page, 'single-pane')
     const fullWidth = (await page.getByTestId('workbench-host').boundingBox())!.width
     expectTrackMotion(maximizing, splitWidth, fullWidth)
     const restoring = await sampleTransition(page, () => page.getByTestId('workbench-maximize').click())
@@ -356,7 +518,7 @@ test.describe('actual App responsive workbench layout', () => {
     await prepare(page)
     await openPanel(page, 'assistant-chat')
     await page.getByTestId('workbench-maximize').click()
-    await expectLayout(page, true)
+    await expectLayout(page, 'single-pane')
     const reducedDurations = await page.getByTestId('workbench-host').evaluate(element =>
       getComputedStyle(element).transitionDuration.split(',').map(value => Number.parseFloat(value)))
     // The global reduced-motion kill switch is 0.01ms !important, not 0s.
@@ -390,8 +552,7 @@ test.describe('actual App responsive workbench layout', () => {
     expect(await page.evaluate(() => Object.fromEntries(Object.entries(localStorage).filter(([key]) => /sidebar/i.test(key))))).toEqual(before)
     for (const width of [842, 841, 840, 839, 767, 390]) {
       await page.setViewportSize({ width, height: 950 })
-      if (width >= 841) await expect(page.getByTestId('sidebar-toggle-collapsed')).toBeVisible()
-      else await expect(page.getByTestId('workbench-return-chat')).toBeVisible()
+      await expect(page.getByTestId('sidebar-toggle-collapsed')).toBeVisible()
       await expect(page.locator('#sidebar-nav')).toHaveAttribute('inert', '')
       await expectLayout(page)
       expect(await page.evaluate(() => Object.fromEntries(Object.entries(localStorage).filter(([key]) => /sidebar/i.test(key))))).toEqual(before)
@@ -410,12 +571,21 @@ test.describe('actual App responsive workbench layout', () => {
     for (const width of [1200, 840, 390, 1200]) {
       await page.setViewportSize({ width, height: 950 })
       await expectLayout(page)
+      if (width < 841) {
+        await expect(editor(main(page))).toBeVisible()
+        await page.getByTestId('topbar-workbench-toggle').click()
+        await expectLayout(page, 'single-pane')
+      }
       await expect.poll(() => page.getByTestId('workbench-host').evaluate(element => {
         const tabs = element.querySelector('[role="tablist"]')!.getBoundingClientRect()
         const active = element.querySelector('[role="tab"][aria-selected="true"]')!.getBoundingClientRect()
         return active.left >= tabs.left - 1 && active.right <= tabs.right + 1
       }), { message: 'The active tab must remain inside the visible tab strip after narrowing' }).toBe(true)
       await expect(editor(side(page))).toHaveText('Retain the active side draft')
+      if (width < 841) {
+        await page.getByTestId('workbench-return-chat').click()
+        await expectLayout(page, 'main-only')
+      }
     }
     expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.close' || request.method === 'chat.abort')).toHaveLength(0)
   })
@@ -446,6 +616,9 @@ test.describe('actual App responsive workbench layout', () => {
     await expectLayout(page)
     await setAvailableWidth(page, 840)
     await expectLayout(page)
+    await expectComposerControls(main(page))
+    await page.getByTestId('topbar-workbench-toggle').click()
+    await expectLayout(page, 'single-pane')
     await expectComposerControls(side(page))
   })
 

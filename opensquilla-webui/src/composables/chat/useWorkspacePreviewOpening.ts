@@ -19,7 +19,7 @@ export function useWorkspacePreviewOpening(options: {
   getArtifact: (key: string, artifactId: string) => Promise<ArtifactPayload | null>
   resolve: (key: string, ref: WorkbenchResourceRef) => Promise<WorkbenchResource | null>
   openCurrent: (key: string, resource: WorkbenchResource) => Promise<WorkbenchResourceOpenResponse | null>
-  show: (current: CurrentDocument, key: string, previewPagePath?: string) => void
+  show: (current: CurrentDocument, key: string, previewPagePath?: string) => boolean | void
   onError: (error: unknown) => void
 }) {
   let lifetime = 0
@@ -79,8 +79,10 @@ export function useWorkspacePreviewOpening(options: {
         || !current.resource.capabilities.preview || !hasPage(current.resource)) {
         throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
       }
-      if (previewPagePath === undefined) options.show(current, key)
-      else options.show(current, key, previewPagePath)
+      const shown = previewPagePath === undefined
+        ? options.show(current, key)
+        : options.show(current, key, previewPagePath)
+      return shown !== false
     } catch (error) {
       if (isCurrent()) options.onError(error)
     }

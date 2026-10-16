@@ -39,6 +39,27 @@ beforeEach(() => {
 })
 
 describe('workbench store', () => {
+  it('separates explicit reveal intent from activation, lifecycle, width, and persistence', () => {
+    const store = useWorkbenchStore()
+    store.openItem(item('side'))
+    store.setWidth(614)
+    const savedWidth = localStorage.getItem(WORKBENCH_WIDTH_STORAGE_KEY)
+    const lifecycle = vi.fn()
+    store.onLifecycle(lifecycle)
+    expect(store.revealRequestId).toBe(0)
+    store.requestReveal()
+    store.requestReveal()
+    expect(store.revealRequestId).toBe(2)
+    expect(store.activeItemId).toBe('side')
+    expect(store.expanded).toBe(true)
+    expect(store.maximized).toBe(false)
+    expect(localStorage.getItem(WORKBENCH_WIDTH_STORAGE_KEY)).toBe(savedWidth)
+    expect(localStorage.length).toBe(1)
+    expect(lifecycle).not.toHaveBeenCalled()
+    store.openItem(item('automatic-resource'))
+    expect(store.revealRequestId).toBe(2)
+  })
+
   it('hides side chats on parent navigation and resumes the same tab without disposing its owner', () => {
     const store = useWorkbenchStore()
     const side: WorkbenchItem = { ...item('side'), kind: 'assistant-chat' }

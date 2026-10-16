@@ -9,7 +9,9 @@ import chatViewSource from './ChatView.vue?raw'
 // verifies session ownership at every await without a whole-app fixture.
 const start = chatViewSource.indexOf('let workbenchPreviewRequest = 0')
 const end = chatViewSource.indexOf('\nasync function editAttachmentResource(', start)
-const entrySource = transpileModule(chatViewSource.slice(start, end), {
+const explicitStart = chatViewSource.indexOf('function openWorkbenchItemExplicit(')
+const explicitEnd = chatViewSource.indexOf('\nfunction artifactPreviewItemForExplicitOpen(', explicitStart)
+const entrySource = transpileModule(`${chatViewSource.slice(explicitStart, explicitEnd)}\n${chatViewSource.slice(start, end)}`, {
   compilerOptions: { target: ScriptTarget.ES2022 },
 }).outputText
 
@@ -34,11 +36,11 @@ function harness() {
     resolve: vi.fn(async (): Promise<unknown> => resource), openCurrent: vi.fn(async (): Promise<unknown> => current),
     importDocument: vi.fn(async (): Promise<unknown> => ({ document, revision })), preview: vi.fn(async (): Promise<unknown> => prepared),
   }
-  const openItem = vi.fn(), pushToast = vi.fn()
+  const openItem = vi.fn(() => true), requestReveal = vi.fn(), pushToast = vi.fn()
   const dependencies = {
     sessionKey, currentEpoch, deliveryIdentity, gatewayAccess, watch, chatViewDisposed: false, chatViewActive: true,
     workbenchResourcesEnabled: { value: true }, workbenchEnabled: { value: true }, workbenchResourcesStore: services,
-    workbenchStore: { openItem }, artifactPreviewItemForExplicitOpen: (item: unknown) => item,
+    workbenchStore: { openItem, requestReveal }, artifactPreviewItemForExplicitOpen: (item: unknown) => item,
     platform: { capabilities: {}, workbench: {} }, artifactPayloadFromRevision, artifactPayloadFromWorkbenchResource,
     resourceFromPreparedPreview, workbenchResourceKey, t: (key: string) => key, pushToast,
     classifyArtifactProductError: () => ({ messageKey: 'error', fallbackMessage: 'Unavailable' }),
@@ -47,11 +49,18 @@ function harness() {
   const api = scope.run(() => new Function(...Object.keys(dependencies), `${entrySource}\nreturn { previewAttachmentResource };`)(...Object.values(dependencies))) as {
     previewAttachmentResource(value: typeof attachment): Promise<void>
   }
-  return { api, attachment, resource, current, prepared, document, revision, services, openItem, pushToast,
+  return { api, attachment, resource, current, prepared, document, revision, services, openItem, requestReveal, pushToast,
     sessionKey, currentEpoch, deliveryIdentity, gatewayAccess }
 }
 
 describe('main attachment preview session ownership', () => {
+  it('does not reveal the workbench if the panel could not be opened', async () => {
+    const h = harness()
+    h.openItem.mockReturnValue(false)
+    await h.api.previewAttachmentResource(h.attachment)
+    expect(h.requestReveal).not.toHaveBeenCalled()
+  })
+
   it('opens the current document with the captured main session and preview lease', async () => {
     const h = harness()
     await h.api.previewAttachmentResource(h.attachment)
@@ -59,6 +68,7 @@ describe('main attachment preview session ownership', () => {
     expect(h.services.openCurrent).toHaveBeenCalledWith('main-a', h.resource)
     expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({ sessionKey: 'main-a', previewLeaseEligible: true,
       resourceIdentity: 'document:doc_input', artifact: expect.objectContaining({ documentId: 'doc_input', revisionId: 'rev_input' }) }))
+    expect(h.requestReveal).toHaveBeenCalledOnce()
   })
 
   it.each(['load', 'resolve', 'openCurrent', 'importDocument', 'preview'] as const)(
@@ -76,6 +86,7 @@ describe('main attachment preview session ownership', () => {
         ? { document: h.document, revision: h.revision } : boundary === 'preview' ? h.prepared : h.resource)
       await pending
       expect(h.openItem).not.toHaveBeenCalled()
+      expect(h.requestReveal).not.toHaveBeenCalled()
       expect(h.pushToast).not.toHaveBeenCalled()
     },
   )

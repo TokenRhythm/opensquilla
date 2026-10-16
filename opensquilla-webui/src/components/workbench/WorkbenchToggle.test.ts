@@ -12,7 +12,8 @@ const apps: App[] = []
 
 async function mount() {
   const pinia = createPinia()
-  const props = reactive({ enabled: true, sessionId: 'session-a', blocked: false, allowEmpty: false })
+  const props = reactive({ enabled: true, sessionId: 'session-a', blocked: false, allowEmpty: false,
+    presentationVisible: undefined as boolean | undefined })
   const root = document.createElement('div')
   document.body.appendChild(root)
   const app = createApp(defineComponent(() => () => h(WorkbenchToggle, props)))
@@ -29,6 +30,42 @@ afterEach(() => {
 })
 
 describe('Workbench toolbar toggle', () => {
+  it('reveals a constrained but retained pane instead of collapsing the stored open preference', async () => {
+    const { store, props, button } = await mount()
+    const item = createBrowserWorkbenchItem({ scopeId: 'session-a', url: 'https://example.test/' })!
+    store.openItem(item)
+    props.presentationVisible = false
+    await nextTick()
+    expect(button().getAttribute('aria-expanded')).toBe('false')
+    expect(button().getAttribute('aria-label')).toBe('workbench.expand')
+    const lifecycle = vi.fn()
+    store.onLifecycle(lifecycle)
+    button().click()
+    expect(store.expanded).toBe(true)
+    expect(store.maximized).toBe(false)
+    expect(store.items).toHaveLength(1)
+    expect(store.activeItemId).toBe(item.id)
+    expect(store.revealRequestId).toBe(1)
+    expect(lifecycle.mock.calls.every(([event]) => event.type === 'resume')).toBe(true)
+    props.presentationVisible = true
+    await nextTick()
+    expect(button().getAttribute('aria-expanded')).toBe('true')
+    button().click()
+    expect(store.expanded).toBe(false)
+    expect(store.revealRequestId).toBe(1)
+  })
+
+  it('reveals an empty workbench from the narrow-screen entry without a selected resource', async () => {
+    const { store, props, button } = await mount()
+    props.allowEmpty = true
+    props.presentationVisible = false
+    await nextTick()
+    button().click()
+    expect(store.expanded).toBe(true)
+    expect(store.revealRequestId).toBe(1)
+    expect(store.items).toEqual([])
+  })
+
   it('opens and collapses an empty desktop workbench before any page exists', async () => {
     const { store, props, button } = await mount()
     props.allowEmpty = true

@@ -11,12 +11,12 @@ import {
 } from './layout'
 
 describe('workbench layout', () => {
-  it('uses one content pane below the exact non-overlapping split budget', () => {
+  it('prioritizes main chat below the exact non-overlapping split budget', () => {
     expect(workbenchLayoutMode({ availableWidth: 1280 })).toBe('split')
     expect(workbenchLayoutMode({ availableWidth: 841 })).toBe('split')
-    expect(workbenchLayoutMode({ availableWidth: 840 })).toBe('single-pane')
-    expect(workbenchLayoutMode({ availableWidth: 390 })).toBe('single-pane')
-    expect(workbenchLayoutMode({ availableWidth: Number.NaN })).toBe('single-pane')
+    expect(workbenchLayoutMode({ availableWidth: 840 })).toBe('main-only')
+    expect(workbenchLayoutMode({ availableWidth: 390 })).toBe('main-only')
+    expect(workbenchLayoutMode({ availableWidth: Number.NaN })).toBe('main-only')
   })
 
   it('reserves 480px for chat plus the divider before sizing the pane', () => {
@@ -26,19 +26,26 @@ describe('workbench layout', () => {
     expect(workbenchDynamicMax(841)).toBe(360)
   })
 
-  it('uses the same content-only single pane for maximize and constrained width', () => {
+  it('only replaces main chat after explicit reveal or maximization', () => {
     expect(workbenchLayoutMode({ availableWidth: 1280, maximized: true })).toBe('single-pane')
     expect(workbenchLayoutMode({ availableWidth: 720, maximized: true })).toBe('single-pane')
+    expect(workbenchLayoutMode({ availableWidth: 720, explicitReveal: true })).toBe('single-pane')
+    expect(workbenchLayoutMode({ availableWidth: 390, explicitReveal: true })).toBe('single-pane')
+    expect(workbenchLayoutMode({ availableWidth: 841, explicitReveal: true })).toBe('split')
+    expect(workbenchLayoutMode({ availableWidth: 1280, explicitReveal: true })).toBe('split')
     const preference = { version: 1 as const, width: 614, source: 'user' as const }
     expect(workbenchEffectiveWidth(preference, 'single-pane', 1280)).toBe(1280)
     expect(workbenchEffectiveWidth(preference, 'split', 1280)).toBe(614)
     expect(workbenchEffectiveWidth(preference, 'single-pane', Number.NaN)).toBe(0)
+    expect(workbenchEffectiveWidth(preference, 'main-only', 720)).toBe(0)
   })
 
   it('preserves the user split width through narrow layout and restoration', () => {
     const preference = { version: 1 as const, width: 600, source: 'user' as const }
     expect(workbenchEffectiveWidth(preference, 'split', 1081)).toBe(600)
+    expect(workbenchEffectiveWidth(preference, 'main-only', 500)).toBe(0)
     expect(workbenchEffectiveWidth(preference, 'single-pane', 500)).toBe(500)
+    expect(workbenchEffectiveWidth(preference, 'main-only', 500)).toBe(0)
     expect(workbenchEffectiveWidth(preference, 'split', 1200)).toBe(600)
     expect(preference.width).toBe(600)
   })

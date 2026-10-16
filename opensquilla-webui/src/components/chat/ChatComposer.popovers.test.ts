@@ -303,6 +303,69 @@ describe('ChatComposer popovers', () => {
   })
 
   it.each([
+    ['Models & routing', '.composer-model-routing', 'inert'],
+    ['Execution mode: Safe', '.composer-run-mode', 'aria-hidden'],
+    ['Add', '.composer-add-menu', 'hidden'],
+    ['Models & routing', '.composer-model-routing', 'style'],
+  ])('closes %s when its retained owner becomes %s and returns focus to the visible pane', async (label, selector, attribute) => {
+    const { app, el } = await mountComposer()
+    const visiblePane = document.createElement('div')
+    const returnButton = document.createElement('button')
+    returnButton.dataset.testid = 'topbar-workbench-toggle'
+    returnButton.getClientRects = () => [new DOMRect(0, 0, 32, 32)] as unknown as DOMRectList
+    visiblePane.appendChild(returnButton)
+    document.body.appendChild(visiblePane)
+
+    await clickButton(el, label)
+    const menu = document.querySelector<HTMLElement>(selector)!
+    const focused = menu.querySelector<HTMLElement>('input, button') ?? menu
+    focused.focus()
+    expect(document.activeElement).toBe(focused)
+
+    el.setAttribute(attribute, attribute === 'style' ? 'display: none' : 'true')
+    await vi.waitFor(() => {
+      expectPopover(el, selector, false)
+      expect(document.activeElement).toBe(returnButton)
+    })
+    el.removeAttribute(attribute)
+    await nextTick()
+    expectPopover(el, selector, false)
+    app.unmount()
+  })
+
+  it('moves focus from the main pane to the visible workbench when a keyboard reveal hides its owner', async () => {
+    const { app, el } = await mountComposer()
+    const mainToggle = document.createElement('button')
+    el.appendChild(mainToggle)
+    const returnButton = document.createElement('button')
+    returnButton.dataset.testid = 'workbench-return-chat'
+    returnButton.getClientRects = () => [new DOMRect(0, 0, 32, 32)] as unknown as DOMRectList
+    document.body.appendChild(returnButton)
+    await clickButton(el, 'Models & routing')
+    // Keyboard focus can leave the teleported menu for a main-pane header
+    // before Enter opens the right pane; that hidden header also needs return.
+    mainToggle.focus()
+    el.setAttribute('inert', '')
+    await vi.waitFor(() => {
+      expectPopover(el, '.composer-model-routing', false)
+      expect(document.activeElement).toBe(returnButton)
+    })
+    app.unmount()
+  })
+
+  it('does not steal focus already moved outside the hidden owner', async () => {
+    const { app, el } = await mountComposer()
+    const dialogButton = document.createElement('button')
+    document.body.appendChild(dialogButton)
+    await clickButton(el, 'Models & routing')
+    dialogButton.focus()
+    el.setAttribute('inert', '')
+    await vi.waitFor(() => expectPopover(el, '.composer-model-routing', false))
+    expect(document.activeElement).toBe(dialogButton)
+    app.unmount()
+  })
+
+  it.each([
     ["Models & routing", '.composer-model-routing'],
     ['Execution mode: Safe', '.composer-run-mode'],
   ])('closes %s on outside pointerdown', async (label, selector) => {

@@ -26,6 +26,7 @@
     :pixels-label="t('workbench.pixels')"
     :before-close-item="beforeCloseItem"
     @collapsed="restoreWorkbenchFocus"
+    @return-chat="emit('return-chat')"
     @emptied="restoreWorkbenchFocus"
     @focus-return="restoreWorkbenchFocus"
     @surface-rect="onSurfaceRect"
@@ -408,6 +409,7 @@ import { copyTextWithFallback, downloadBlob } from '@/utils/browser'
 import { createTabThumbnailCache } from '@/workbench/tabThumbnailCache'
 import { createNativeTabSnapshots } from './nativeTabSnapshots'
 
+const emit = defineEmits<{ 'return-chat': [] }>()
 const props = withDefaults(defineProps<{
   enabled?: boolean
   availableWidth?: number
@@ -887,10 +889,13 @@ function openBrowserUrl(value: string, newTab = false) {
   if (retained && !newTab) {
     store.activateItem(retained.id)
     store.setExpanded(true)
+    store.requestReveal()
     return
   }
   if (!store.openItem(item)) {
     pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  } else {
+    store.requestReveal()
   }
 }
 
@@ -899,6 +904,7 @@ function openBrowserStart() {
   browserStartRequested.value = true
   browserStartSequence.value += 1
   store.openEmpty()
+  store.requestReveal()
 }
 
 function openWorkspaceFiles() {
@@ -907,6 +913,8 @@ function openWorkspaceFiles() {
   const item = { ...createWorkspaceFilesWorkbenchItem(sessionId), title: t('workbench.newPanel.workspaceFiles') }
   if (!store.openItem(item)) {
     pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  } else {
+    store.requestReveal()
   }
 }
 
@@ -918,6 +926,8 @@ function openTerminal() {
     : { kind: 'default-agent', agentId: agentIdFromSessionKey(sessionId) }), title: t('workbench.newPanel.terminal') }
   if (!store.openItem(item)) {
     pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  } else {
+    store.requestReveal()
   }
 }
 
@@ -928,6 +938,8 @@ function openAssistantChat() {
     t('workbench.newPanel.assistantChat'))
   if (!store.openItem(item)) {
     pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  } else {
+    store.requestReveal()
   }
 }
 
@@ -943,6 +955,8 @@ function reopenBrowser() {
     ...(source ? { contextTargetRef: source.payload.targetRef } : {}) } }
   if (!store.openItem(reopened)) {
     pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  } else {
+    store.requestReveal()
   }
 }
 
@@ -961,6 +975,7 @@ function onBrowserWorkbenchOpen(event: Event) {
   if (retained) {
     store.activateItem(retained.id)
     store.setExpanded(true)
+    store.requestReveal()
     void nextTick(() => {
       document.querySelector<HTMLInputElement>(
         `[data-workbench-item-id="${CSS.escape(retained.id)}"] .browser-preview__address`,
@@ -1110,7 +1125,8 @@ function openResourceArtifact(
   })
   // Side resources are authorized by the child, but every tab opened from
   // their preview stays visible in the owning parent's Workbench.
-  store.openItem(ownerItem ? { ...previewItem, scope: ownerItem.scope } : previewItem)
+  const opened = store.openItem(ownerItem ? { ...previewItem, scope: ownerItem.scope } : previewItem)
+  if (opened && store.activeItemId === previewItem.id) store.requestReveal()
 }
 
 async function openWorkbenchResource(
@@ -1459,7 +1475,9 @@ async function selectNavigationArtifact(
     ),
     sessionKey,
   })
-  store.openItem({ ...previewItem, scope: item.scope })
+  if (store.openItem({ ...previewItem, scope: item.scope }) && store.activeItemId === previewItem.id) {
+    store.requestReveal()
+  }
 }
 
 function panelHeader(item: WorkbenchItem | null): WorkbenchPanelHeader {
@@ -1672,10 +1690,11 @@ async function activatePromptAnnotationItem(
 ) {
   detail.acknowledge?.()
   const item = promptAnnotationItem(detail)
-  if (!item) return null
+  if (!item || (item.scope.type === 'session' && item.scope.id !== store.activeSessionId)) return null
+  if (!store.activateItem(item.id) || store.activeItemId !== item.id) return null
   artifactPromptAnnotations.setActiveDocument(detail.sessionKey, detail.documentId)
-  store.activateItem(item.id)
   store.setExpanded(true)
+  store.requestReveal()
   await nextTick()
   await runtimeManager.flush(item.id)
   for (let attempt = 0; attempt < 30; attempt += 1) {

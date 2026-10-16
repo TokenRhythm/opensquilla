@@ -7,7 +7,7 @@ export const WORKBENCH_MAX_VIEWPORT_RATIO = 0.7
 export const WORKBENCH_DIVIDER_WIDTH = 1
 export const WORKBENCH_SPLIT_MIN_WIDTH = WORKBENCH_CHAT_MIN_WIDTH + WORKBENCH_MIN_WIDTH + WORKBENCH_DIVIDER_WIDTH
 
-export type WorkbenchLayoutMode = 'split' | 'single-pane'
+export type WorkbenchLayoutMode = 'split' | 'main-only' | 'single-pane'
 export type WorkbenchWidthSource = 'default' | 'user'
 
 export interface WorkbenchWidthPreference {
@@ -19,6 +19,7 @@ export interface WorkbenchWidthPreference {
 export interface WorkbenchLayoutInput {
   availableWidth: number
   maximized?: boolean
+  explicitReveal?: boolean
 }
 
 function finiteDimension(value: number): number {
@@ -85,7 +86,8 @@ export function parseWorkbenchWidthPreference(
 
 export function workbenchLayoutMode(input: WorkbenchLayoutInput): WorkbenchLayoutMode {
   const width = finiteDimension(input.availableWidth)
-  if (input.maximized || width < WORKBENCH_SPLIT_MIN_WIDTH) return 'single-pane'
+  if (input.maximized) return 'single-pane'
+  if (width < WORKBENCH_SPLIT_MIN_WIDTH) return input.explicitReveal ? 'single-pane' : 'main-only'
   return 'split'
 }
 
@@ -103,7 +105,8 @@ export function workbenchDynamicMax(availableWidth: number): number {
 
 /**
  * Resolve the visual width without mutating the saved split preference.
- * A constrained content area uses one pane in normal layout flow.
+ * A constrained content area keeps the main conversation unless the user
+ * explicitly asks to inspect the right pane.
  */
 export function workbenchEffectiveWidth(
   preference: WorkbenchWidthPreference,
@@ -112,6 +115,7 @@ export function workbenchEffectiveWidth(
 ): number {
   const normalized = normalizeWorkbenchWidthPreference(preference)
   const width = finiteDimension(availableWidth)
+  if (mode === 'main-only') return 0
   if (mode === 'single-pane') return width
   const preferredWidth = normalized.source === 'default'
     ? Math.round(width / 2)

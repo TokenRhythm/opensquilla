@@ -38,6 +38,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const activeItemId = ref<string | null>(null)
   const expanded = ref(false)
   const maximized = ref(false)
+  // Transient presentation intent from an explicit user action. It never
+  // changes panel ownership, retention, width preference, or execution state.
+  const revealRequestId = ref(0)
   const hostAvailable = ref(true)
   const widthPreference = ref<WorkbenchWidthPreference>(hydrateWidthPreference())
   const activeSessionId = ref<string | null>(null)
@@ -334,6 +337,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     setMaximized(!maximized.value)
   }
 
+  function requestReveal() {
+    revealRequestId.value += 1
+  }
+
   function setHostAvailable(next: boolean) {
     if (hostAvailable.value === next) return
     if (!next && expanded.value) suspendItem(activeItem.value)
@@ -387,6 +394,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     activeSessionId,
     expanded,
     maximized,
+    revealRequestId,
     hostAvailable,
     widthPreference,
     isVisible,
@@ -407,6 +415,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     toggleExpanded,
     setMaximized,
     toggleMaximized,
+    requestReveal,
     setHostAvailable,
     setWidth,
     resetWidth,

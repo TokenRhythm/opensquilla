@@ -106,5 +106,7 @@ export function openToolHistoryFile(view: ActivityToolCodeView, options: ToolHis
   const store = useWorkbenchStore(pinia)
   const ownerSessionKey = options.ownerSessionKey || options.sessionKey
   if ((options.ownerSessionKey || store.activeSessionId) && store.activeSessionId !== ownerSessionKey) return false
-  return store.openItem(item)
+  const opened = store.openItem(item)
+  if (opened && store.activeItemId === item.id) store.requestReveal()
+  return opened
 }
