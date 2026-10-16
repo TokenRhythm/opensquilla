@@ -683,11 +683,11 @@ async def test_concurrent_plan_implement_returns_typed_conflict_and_one_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    entered = asyncio.Event()
     release = asyncio.Event()
+    handled: list[str] = []
 
-    async def handler(_run: TaskRun) -> None:
-        entered.set()
+    async def handler(run: TaskRun) -> None:
+        handled.append(run.task_id)
         await release.wait()
 
     monkeypatch.setattr(
@@ -730,9 +730,13 @@ async def test_concurrent_plan_implement_returns_typed_conflict_and_one_run(
         tasks = await stack.storage.list_agent_tasks(SOURCE_KEY)
         assert len(tasks) == 1
 
-        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        # Admission and activation persist real SQLite state before the handler
+        # starts. Wait for the completed turn with a bounded integration budget
+        # so loaded workers can finish those writes and finalization.
         release.set()
-        await stack.runtime.wait(accepted[0]["turn_id"], timeout=2.0)
+        terminal = await stack.runtime.wait(accepted[0]["turn_id"], timeout=15.0)
+        assert terminal.status == AgentTaskStatus.SUCCEEDED
+        assert handled == [accepted[0]["turn_id"]]
 
 
 @pytest.mark.asyncio
