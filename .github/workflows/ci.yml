@@ -426,14 +426,129 @@ jobs:
           overwrite: true
 
   frontend-check:
-    name: Frontend tests and package validation
+    name: Frontend type and architecture checks
+    needs: [plan-ci]
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Run frontend type checks
+        working-directory: opensquilla-webui
+        run: npm run typecheck
+
+  frontend-unit-tests:
+    name: Frontend unit tests (${{ matrix.shard }}/4)
+    needs: [plan-ci]
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Prepare pinned offline Office preview assets
+        working-directory: opensquilla-webui
+        run: npm run prepare:office-assets
+
+      - name: Run frontend unit tests
+        working-directory: opensquilla-webui
+        run: npm run test:unit -- --shard=${{ matrix.shard }}/4
+
+  gateway-contract-linux:
+    name: Gateway Contract determinism (Linux)
+    needs: [plan-ci]
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Set up Python for Contract generation
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv for Contract generation
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned Contract generators
+        run: python scripts/contracts/prepare_codegen_toolchains.py
+
+      - name: Verify deterministic Contract generation
+        shell: bash
+        run: |
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check-determinism --jobs 4
+
+      - name: Run real Gateway Contract toolchain integration
+        env:
+          OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION: "1"
+          PYTHONPATH: "${{ github.workspace }}:${{ github.workspace }}/src"
+        run: >-
+          uv run --no-sync pytest -q
+          --confcutdir=tests/contracts
+          tests/contracts
+
+      - name: Write Linux Gateway Contract hash manifest
+        run: >-
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py
+          --hash-manifest "${RUNNER_TEMP}/gateway-contract-hashes.json"
+
+      - name: Upload Linux Gateway Contract hash manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-contract-hashes-linux
+          path: ${{ runner.temp }}/gateway-contract-hashes.json
+          if-no-files-found: error
+          retention-days: 31
+          overwrite: true
+
+  wheel-webui-roundtrip:
+    name: Frontend sdist-to-wheel round trip
     needs: [plan-ci, frontend-artifact]
-    if: >-
-      ${{ !cancelled()
-          && needs.plan-ci.result == 'success'
-          && needs.frontend-artifact.result == 'success'
-          && (contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation')
-              || contains(fromJSON(needs.plan-ci.outputs.required_suites), 'wheel-webui-roundtrip')) }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'wheel-webui-roundtrip') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -453,92 +568,21 @@ jobs:
           cache: npm
           cache-dependency-path: opensquilla-webui/package-lock.json
 
-      - name: Install frontend dependencies
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        working-directory: opensquilla-webui
-        run: npm ci
-
-      - name: Prepare pinned offline Office preview assets
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        working-directory: opensquilla-webui
-        run: npm run prepare:office-assets
-
       - name: Stage verified frontend artifact for Python consumers
         working-directory: opensquilla-webui
         run: node scripts/stage-dist.mjs
 
-      - name: Set up Python for Contract generation
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Set up uv for Contract generation
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-
-      - name: Install pinned Contract generators
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        run: python scripts/contracts/prepare_codegen_toolchains.py
-
-      - name: Verify deterministic Contract generation
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        shell: bash
-        run: |
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check-determinism --jobs 4
-
-      - name: Run real Gateway Contract toolchain integration
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        env:
-          OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION: "1"
-          PYTHONPATH: "${{ github.workspace }}:${{ github.workspace }}/src"
-        run: >-
-          uv run --no-sync pytest -q
-          --confcutdir=tests/contracts
-          tests/contracts
-
-      - name: Write Linux Gateway Contract hash manifest
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        run: >-
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py
-          --hash-manifest "${RUNNER_TEMP}/gateway-contract-hashes.json"
-
-      - name: Upload Linux Gateway Contract hash manifest
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: gateway-contract-hashes-linux
-          path: ${{ runner.temp }}/gateway-contract-hashes.json
-          if-no-files-found: error
-          retention-days: 31
-          overwrite: true
-
-      - name: Run frontend type checks
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        working-directory: opensquilla-webui
-        run: npm run typecheck
-
-      - name: Run frontend unit tests
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        working-directory: opensquilla-webui
-        run: npm run test:unit
-
       - name: Set up Python
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'wheel-webui-roundtrip') }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Set up uv
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'wheel-webui-roundtrip') }}
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
       - name: Verify sdist-to-wheel frontend artifact round trip
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'wheel-webui-roundtrip') }}
         shell: bash
         run: |
           package_dir="${RUNNER_TEMP}/webui-package"
@@ -675,22 +719,6 @@ jobs:
           uv run --no-sync pytest -q --confcutdir=tests/contracts tests/contracts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Verify every Windows Contract role in a separate output tree
-        shell: pwsh
-        env:
-          NODE_PATH: ${{ github.workspace }}/opensquilla-webui/node_modules
-        run: |
-          npm --prefix opensquilla-webui run test:contract-tooling
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $verificationRoot = Join-Path $env:RUNNER_TEMP ("gateway-verification-" + [guid]::NewGuid())
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --write-determinism --jobs 4 --profile verification --output-root $verificationRoot
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node scripts/contracts/verify_gateway_validator_profiles.mjs --verification-root $verificationRoot
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $verificationManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-verification-hashes-windows.json"
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --hash-manifest $verificationManifest --profile verification --output-root $verificationRoot
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
       - name: Write Windows Gateway Contract hash manifest
         shell: pwsh
         run: |
@@ -707,6 +735,62 @@ jobs:
           retention-days: 31
           overwrite: true
 
+  gateway-contract-verification-windows:
+    name: Complete Gateway Contract verification (Windows)
+    needs: [plan-ci]
+    if: >-
+      ${{ !cancelled()
+          && needs.plan-ci.result == 'success'
+          && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+    runs-on: windows-latest
+    # Real-toolchain generation scales with the complete Contract inventory.
+    # Start the complete Windows checks independently of Linux producers; the
+    # required comparison job joins both platforms after their manifests exist.
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned Contract generators
+        run: python scripts/contracts/prepare_codegen_toolchains.py
+
+      - name: Verify every Windows Contract role in a separate output tree
+        shell: pwsh
+        env:
+          NODE_PATH: ${{ github.workspace }}/opensquilla-webui/node_modules
+        run: |
+          npm --prefix opensquilla-webui run test:contract-tooling
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $verificationRoot = Join-Path $env:RUNNER_TEMP ("gateway-verification-" + [guid]::NewGuid())
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --write-determinism --jobs 4 --profile verification --output-root $verificationRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/contracts/verify_gateway_validator_profiles.mjs --verification-root $verificationRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $verificationManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-verification-hashes-windows.json"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --hash-manifest $verificationManifest --profile verification --output-root $verificationRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Upload Windows verification hash manifest
         uses: actions/upload-artifact@v4
         with:
@@ -718,13 +802,14 @@ jobs:
 
   gateway-contract-compare:
     name: Gateway Contract cross-platform hashes
-    needs: [plan-ci, frontend-check, gateway-contract-verification-linux, gateway-contract-windows]
+    needs: [plan-ci, gateway-contract-linux, gateway-contract-verification-linux, gateway-contract-windows, gateway-contract-verification-windows]
     if: >-
       ${{ !cancelled()
           && needs.plan-ci.result == 'success'
-          && needs.frontend-check.result == 'success'
+          && needs.gateway-contract-linux.result == 'success'
           && needs.gateway-contract-verification-linux.result == 'success'
           && needs.gateway-contract-windows.result == 'success'
+          && needs.gateway-contract-verification-windows.result == 'success'
           && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -772,15 +857,17 @@ jobs:
             "${RUNNER_TEMP}/gateway-contract-verification-hashes-windows/gateway-contract-verification-hashes-windows.json"
 
   webui-chat-recovery:
-    name: WebUI chat recovery
+    name: WebUI chat recovery (${{ matrix.suite }})
     needs: [plan-ci, frontend-artifact]
-    outputs:
-      capacity_result: ${{ steps.webui-capacity.outcome }}
     if: ${{ !cancelled() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'webui-chat-recovery') }}
     # Use a runner that permits the real unprivileged Bubblewrap sandbox without
     # changing host security policy. Migrate before Ubuntu 22.04 retires in April 2027.
     runs-on: ubuntu-22.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [general-1, general-2, general-3, general-4, clipboard, virtualization]
     env:
       OPENSQUILLA_WEBUI_BASE_URL: http://127.0.0.1:18791
       OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI: gateway
@@ -821,7 +908,7 @@ jobs:
         # admission contract here before a new tag can escape both phases.
         run: >-
           uv run --no-sync pytest
-          tests/test_ci/test_workflows.py::test_browser_capacity_phase_cannot_be_skipped_behind_a_green_browser_job
+          tests/test_ci/test_webui_browser_suites.py
           -q
 
       - name: Install and verify Linux guest sandbox
@@ -885,45 +972,17 @@ jobs:
           key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright-browser.outputs.revision }}
 
       - name: Run production-dist chat and Goal recovery browser contracts
+        if: ${{ startsWith(matrix.suite, 'general-') }}
         working-directory: opensquilla-webui
-        run: >-
-          npm run test:e2e --
-          assistant-activity.spec.ts
-          auth-connection-recovery.spec.ts
-          chat-send-lifecycle.spec.ts
-          chat-send-lifecycle.real.spec.ts
-          cross-window-sync.real.spec.ts
-          composer-paste.spec.ts
-          durable-delivery.spec.ts
-          history-content-reading.spec.ts
-          history-hydration.spec.ts
-          http-delivery.spec.ts
-          idle-chat-recovery.spec.ts
-          modern-session-recovery.spec.ts
-          provider-error-experience.spec.ts
-          retired-bgm-upgrade.spec.ts
-          support-bundle.spec.ts
-          console-clarity.spec.ts
-          mobile-tabs.spec.ts
-          header-responsive.spec.ts
-          topbar-global-controls.spec.ts
-          topbar-visual.spec.ts
-          router-physical-model.spec.ts
-          user-message-newlines.spec.ts
-          session-created-card.spec.ts
-          session-switch-transport.spec.ts
-          new-task-ensemble-race.spec.ts
-          ensemble-new-task-legacy-turn.spec.ts
-          goal-mode.spec.ts
-          plan-questionnaire-lifecycle.spec.ts
-          plan-presentation.spec.ts
-          task-progress.spec.ts
-          queue-steer.spec.ts
-          share.spec.ts
-          --project=chromium
-          --workers=2
+        shell: bash
+        run: |
+          set -euo pipefail
+          python ../.github/scripts/webui_browser_suites.py "${{ matrix.suite }}" > "${RUNNER_TEMP}/browser-specs.txt"
+          mapfile -t specs < "${RUNNER_TEMP}/browser-specs.txt"
+          npm run test:e2e -- "${specs[@]}" --project=chromium --workers=2
 
       - name: Run production-dist message clipboard contracts serially
+        if: ${{ matrix.suite == 'clipboard' }}
         working-directory: opensquilla-webui
         # Native copy/paste shares the OS clipboard. Keep this dedicated config
         # separate from the parallel browser suite and preserve first-failure evidence.
@@ -934,31 +993,150 @@ jobs:
           --trace=retain-on-failure
           --output=test-results/message-copy
 
-      # Keep absolute performance gates isolated from other renderer processes.
+
       - name: Run production-dist long-list virtualization contracts
+        if: ${{ matrix.suite == 'virtualization' }}
         working-directory: opensquilla-webui
+        shell: bash
+        # This runner owns the absolute performance gates without other suites.
+        run: |
+          set -euo pipefail
+          python ../.github/scripts/webui_browser_suites.py virtualization > "${RUNNER_TEMP}/browser-specs.txt"
+          mapfile -t specs < "${RUNNER_TEMP}/browser-specs.txt"
+          npm run test:e2e -- "${specs[@]}" --project=chromium --workers=1 --retries=0 --grep-invert=@capacity --output=test-results/virtualization
+
+      - name: Upload chat recovery evidence
+        id: chat-traces
+        continue-on-error: true
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: webui-chat-recovery-${{ matrix.suite }}-attempt-${{ github.run_attempt }}
+          path: opensquilla-webui/test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Warn if chat-traces upload failed
+        if: ${{ !cancelled() && steps.chat-traces.outcome == 'failure' }}
+        shell: bash
+        run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
+
+  webui-capacity:
+    name: WebUI renderer capacity
+    needs: [plan-ci, frontend-artifact]
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'webui-capacity') }}
+    # Use a runner that permits the real unprivileged Bubblewrap sandbox without
+    # changing host security policy. Migrate before Ubuntu 22.04 retires in April 2027.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      OPENSQUILLA_WEBUI_BASE_URL: http://127.0.0.1:18791
+      OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI: gateway
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download verified frontend artifact
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: opensquilla-webui-dist
+          path: opensquilla-webui/dist/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: 'npm'
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install Gateway dependencies
+        run: uv sync --frozen
+
+      - name: Validate renderer capacity inventory
+        id: capacity-inventory
+        # Pure WebUI plans do not select Python shards. Run the existing
+        # admission contract here before a new tag can escape both phases.
         run: >-
-          npm run test:e2e --
-          chat-virtualization.spec.ts
-          conversation-minimap.spec.ts
-          floating-composer.spec.ts
-          long-task-resilience.spec.ts
-          native-gateway.spec.ts
-          sidebar-drag.spec.ts
-          sidebar-hover-geometry.spec.ts
-          sidebar-virtualization.spec.ts
-          --project=chromium
-          --workers=1
-          --retries=0
-          --grep-invert=@capacity
-          --output=test-results/virtualization
+          uv run --no-sync pytest
+          tests/test_ci/test_webui_browser_suites.py
+          -q
+
+      - name: Install and verify Linux guest sandbox
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          bwrap --version
+          # Exercise the real unprivileged namespace boundary. Keep host
+          # AppArmor and sysctl restrictions intact; a denial must fail here.
+          bwrap --unshare-user --unshare-net --ro-bind / / --proc /proc /bin/true
+          uv run python - <<'PY'
+          import json
+          from dataclasses import asdict
+          from opensquilla.sandbox.backend.linux_readiness import probe_bwrap
+
+          probe = probe_bwrap()
+          print(json.dumps(asdict(probe), sort_keys=True))
+          if not probe.available or not probe.supports_perms:
+              raise SystemExit("Linux guest sandbox preflight failed: " + probe.message)
+          PY
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Prepare pinned offline Office preview assets
+        # Isolated real-Gateway fixtures start Vite directly and use source assets.
+        working-directory: opensquilla-webui
+        run: |
+          npm run prepare:office-assets
+          npm run prepare:office-assets -- --offline
+
+      - name: Stage verified frontend artifact for Gateway
+        working-directory: opensquilla-webui
+        run: node scripts/stage-dist.mjs
+
+      - name: Resolve Playwright browser revision
+        id: playwright-browser
+        shell: bash
+        run: |
+          revision="$(node -e "const b=require('./opensquilla-webui/node_modules/playwright-core/browsers.json').browsers.find((item)=>item.name==='chromium'); if(!b)process.exit(2); process.stdout.write(b.revision)")"
+          printf 'revision=%s\n' "${revision}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore Playwright browser
+        id: playwright-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright-browser.outputs.revision }}
+
+      - name: Install Chromium
+        working-directory: opensquilla-webui
+        run: npx playwright install --with-deps chromium
+
+      - name: Seed Playwright browser cache from nightly main
+        if: ${{ github.event_name == 'schedule' && steps.playwright-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright-browser.outputs.revision }}
 
       - name: Run production-dist renderer capacity contracts
         id: webui-capacity
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'webui-capacity') }}
         working-directory: opensquilla-webui
-        # Reuse the installed browser and verified artifact; the aggregate gate
-        # checks this outcome separately, so a planned-but-skipped phase fails.
+        # A dedicated runner isolates absolute thresholds; the aggregate gate
+        # requires this whole job whenever the capacity suite is planned.
         run: >-
           npm run test:e2e --
           long-task-resilience.spec.ts
@@ -975,7 +1153,7 @@ jobs:
         if: ${{ failure() || steps.webui-capacity.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
-          name: webui-chat-recovery-attempt-${{ github.run_attempt }}
+          name: webui-capacity-attempt-${{ github.run_attempt }}
           # Successful capacity runs retain only the small metric reports.
           # Failures still preserve the complete first-failure trace tree.
           path: |
@@ -1338,7 +1516,9 @@ jobs:
           markers="not stress and not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
 
           worker_args=()
-          if [[ "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
+          family="${{ matrix.shard }}"
+          family="${family%-*}"
+          if [[ "${family}" == "gateway-sqlite" ]]; then
             # Gateway tests start subprocesses and touch shared SQLite/logging
             # state.  Match the bounded Windows shard fan-out instead of
             # letting the Ubuntu default start four competing workers.
@@ -1924,6 +2104,12 @@ jobs:
         shell: bash
         run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
 
+  desktop-native-probes:
+    name: Desktop native platform probes
+    needs: plan-ci
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'desktop-recovery-e2e') }}
+    uses: ./.github/workflows/desktop-native-probes.yml
+
   desktop-recovery-e2e:
     # Every matrix cell gets a fresh hosted runner.  Keep ownership and the
     # heavier workbench cell separate on both Windows and macOS so process,
@@ -2017,132 +2203,6 @@ jobs:
       - name: Install Python dependencies
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
-
-      - name: Verify recommended PTY and managed execution on the native platform
-        if: ${{ matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          # This probe fails when the recommended backend is absent; the
-          # optional-dependency skip in the core pytest suite cannot mask it.
-          pty_probe_log="${CI_REPORT_DIR}/pty-capability.log"
-          set +e
-          uv run --no-sync python desktop/electron/scripts/gateway-entry.py --_desktop-pty-probe \
-            2>&1 | tee "${pty_probe_log}"
-          pty_probe_statuses=("${PIPESTATUS[@]}")
-          set -e
-          if [[ "${pty_probe_statuses[1]}" -ne 0 ]]; then
-            exit "${pty_probe_statuses[1]}"
-          fi
-          if [[ "${pty_probe_statuses[0]}" -ne 0 ]]; then
-            expected_pty_timeout='{"probe": "opensquilla-desktop-pty", "available": false, "ioMode": "error", "reason": "PTY probe timed out"}'
-            mapfile -t pty_probe_lines < "${pty_probe_log}"
-            first_pty_line="${pty_probe_lines[0]-}"
-            if [[ "${RUNNER_OS}" != "Windows" ]] ||
-               [[ "${#pty_probe_lines[@]}" -ne 1 ]] ||
-               [[ "${first_pty_line%$'\r'}" != "${expected_pty_timeout}" ]]; then
-              exit "${pty_probe_statuses[0]}"
-            fi
-            printf '%s\n' 'Retrying the transient Windows PTY timeout once.'
-            uv run --no-sync python \
-              desktop/electron/scripts/gateway-entry.py --_desktop-pty-probe \
-              2>&1 | tee "${CI_REPORT_DIR}/pty-capability-attempt-2.log"
-          fi
-          uv run --no-sync pytest \
-            tests/test_tools/test_shell_process_isolation.py::test_unified_exec_real_pty_reports_tty_and_accepts_input \
-            -vv --tb=short \
-            2>&1 | tee "${CI_REPORT_DIR}/pty-managed-execution.log"
-
-      - name: Verify MCP transports and Desktop bridge on the native platform
-        if: ${{ matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          uv run --no-sync pytest \
-            tests/test_mcp tests/test_mcp_server \
-            tests/test_desktop/test_gateway_functional_probes.py::test_gateway_fresh_profile_reaches_healthz \
-            tests/test_desktop/test_gateway_functional_probes.py::test_mcp_probe_uses_real_stdio_server_and_gateway \
-            -vv --tb=short \
-            2>&1 | tee "${CI_REPORT_DIR}/mcp-transports.log"
-
-      - name: Verify the frozen production MCP probe and bridge
-        if: ${{ matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          uv sync --extra dev --extra recommended --extra mcp --group desktop-build --frozen
-          uv run --no-sync python desktop/electron/scripts/verify-mcp-frozen.py \
-            --output-dir "${CI_REPORT_DIR}/mcp-frozen" \
-            2>&1 | tee "${CI_REPORT_DIR}/mcp-frozen.log"
-
-      - name: Build production Docker image and verify MCP
-        if: ${{ runner.os == 'Linux' && (matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all') }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          git lfs pull --include="src/opensquilla/squilla_router/models/v4.2_phase3_inference/**"
-          mcp_image="opensquilla-mcp-ci:${GITHUB_SHA}"
-          docker build --file Dockerfile --tag "${mcp_image}" . \
-            2>&1 | tee "${CI_REPORT_DIR}/mcp-docker-build.log"
-          docker image inspect --format '{{json .Size}}' "${mcp_image}" \
-            | tee "${CI_REPORT_DIR}/mcp-docker-size-bytes.json"
-          docker run --rm -i --entrypoint python \
-            --mount "type=bind,source=${GITHUB_WORKSPACE}/tests/test_mcp/fixtures,target=/mcp-fixtures,readonly" \
-            "${mcp_image}" - <<'PY' 2>&1 | tee "${CI_REPORT_DIR}/mcp-docker-smoke.log"
-          import asyncio
-          import json
-          import sys
-          from importlib.metadata import requires, version
-
-          from packaging.requirements import Requirement
-
-          from mcp import Client
-          from mcp_types import LATEST_PROTOCOL_VERSION
-
-          from opensquilla.mcp.stdio import MCPStdioClient
-          from opensquilla.mcp.types import MCPServerConfig
-          from opensquilla.mcp_server import create_mcp_server
-
-          def check_sdk_version():
-              sdk_version = version("mcp")
-              sdk_requirement = next(
-                  dependency
-                  for dependency in map(Requirement, requires("opensquilla") or ())
-                  if dependency.name == "mcp"
-              )
-              assert sdk_version in sdk_requirement.specifier, sdk_version
-              return sdk_version
-
-          async def check():
-              sdk_version = check_sdk_version()
-              async with Client(create_mcp_server(), mode="auto") as server:
-                  assert server.protocol_version == LATEST_PROTOCOL_VERSION
-                  tools = sorted(tool.name for tool in (await server.list_tools()).tools)
-              assert tools == sorted([
-                  "conversations_list", "session_resolve", "messages_read",
-                  "messages_send", "events_wait", "transcript_export",
-              ]), tools
-              for fixture, arguments, tool in [
-                  ("fastmcp_server.py", [], "ping"),
-                  ("legacy_server.py", ["normal"], "echo"),
-              ]:
-                  client = MCPStdioClient(MCPServerConfig(
-                      name="container-probe", transport="stdio", command=sys.executable,
-                      args=["-u", "/mcp-fixtures/" + fixture, *arguments],
-                      tool_timeout_seconds=10,
-                  ))
-                  try:
-                      await client.connect()
-                      assert [item.name for item in await client.list_tools()] == [tool]
-                      result = await client.call_tool(tool, {"text": "container-mcp"})
-                      assert not result.is_error and result.content == "container-mcp"
-                  finally:
-                      await client.close()
-              print(json.dumps({"sdkVersion": sdk_version, "tools": tools,
-                                "stdioPeers": ["modern", "legacy"]}))
-
-          asyncio.run(asyncio.wait_for(check(), timeout=60))
-          PY
 
       - name: Install Desktop dependencies
         working-directory: desktop/electron
@@ -2937,11 +2997,12 @@ jobs:
 
   windows-nsis-regression:
     name: Windows NSIS acceptance
-    needs: plan-ci
-    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'windows-nsis-regression') }}
+    needs: [plan-ci, frontend-artifact]
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'windows-nsis-regression') }}
     uses: ./.github/workflows/windows-nsis-upgrade-regression.yml
     with:
       acceptance_profile: ${{ needs.plan-ci.outputs.windows_nsis_profile }}
+      frontend_artifact_name: opensquilla-webui-dist
 
   ci-result:
     name: CI result
@@ -2953,10 +3014,15 @@ jobs:
       - readme-locale-check
       - frontend-artifact
       - frontend-check
+      - frontend-unit-tests
+      - gateway-contract-linux
+      - wheel-webui-roundtrip
       - gateway-contract-verification-linux
       - gateway-contract-windows
+      - gateway-contract-verification-windows
       - gateway-contract-compare
       - webui-chat-recovery
+      - webui-capacity
       - tui-check
       - desktop-check
       - ubuntu-quality
@@ -2965,6 +3031,7 @@ jobs:
       - windows-full
       - macos-recovery
       - desktop-recovery-e2e
+      - desktop-native-probes
       - skill-hub
       - release-packaging
       - managed-toolchain-artifacts
@@ -3062,8 +3129,12 @@ jobs:
           RESULT_README_LOCALE: ${{ needs.readme-locale-check.result }}
           RESULT_FRONTEND_ARTIFACT: ${{ needs.frontend-artifact.result }}
           RESULT_FRONTEND: ${{ needs.frontend-check.result }}
+          RESULT_FRONTEND_UNIT: ${{ needs.frontend-unit-tests.result }}
+          RESULT_CONTRACT_LINUX: ${{ needs.gateway-contract-linux.result }}
+          RESULT_WHEEL_WEBUI: ${{ needs.wheel-webui-roundtrip.result }}
           RESULT_CONTRACT_VERIFICATION_LINUX: ${{ needs.gateway-contract-verification-linux.result }}
           RESULT_CONTRACT_WINDOWS: ${{ needs.gateway-contract-windows.result }}
+          RESULT_CONTRACT_VERIFICATION_WINDOWS: ${{ needs.gateway-contract-verification-windows.result }}
           RESULT_CONTRACT_COMPARE: ${{ needs.gateway-contract-compare.result }}
           RESULT_TUI: ${{ needs.tui-check.result }}
           RESULT_DESKTOP: ${{ needs.desktop-check.result }}
@@ -3073,8 +3144,9 @@ jobs:
           RESULT_WINDOWS_FULL: ${{ needs.windows-full.result }}
           RESULT_MACOS_RECOVERY: ${{ needs.macos-recovery.result }}
           RESULT_DESKTOP_RECOVERY_E2E: ${{ needs.desktop-recovery-e2e.result }}
+          RESULT_DESKTOP_NATIVE: ${{ needs.desktop-native-probes.result }}
           RESULT_WEBUI_CHAT_RECOVERY: ${{ needs.webui-chat-recovery.result }}
-          RESULT_WEBUI_CAPACITY: ${{ needs.webui-chat-recovery.outputs.capacity_result || 'skipped' }}
+          RESULT_WEBUI_CAPACITY: ${{ needs.webui-capacity.result }}
           RESULT_SKILL_HUB: ${{ needs.skill-hub.result }}
           RESULT_WINDOWS_NSIS: ${{ needs.windows-nsis-regression.result }}
           RESULT_RELEASE: ${{ needs.release-packaging.result }}

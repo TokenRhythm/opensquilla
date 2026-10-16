@@ -24,7 +24,7 @@ SHARD_NAMES: Final[tuple[str, ...]] = (
 WINDOWS_SHARD_NAMES: Final[tuple[str, ...]] = tuple(
     f"{family}-{partition}"
     for family in SHARD_NAMES
-    for partition in range(1, 5 if family == "gateway-sqlite" else 3)
+    for partition in range(1, 9 if family == "gateway-sqlite" else 5)
 )
 METADATA_NAME: Final[str] = "windows-shard-metadata.json"
 JUNIT_NAME: Final[str] = "junit.xml"

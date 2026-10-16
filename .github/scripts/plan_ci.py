@@ -411,21 +411,37 @@ _FIXED_PLATFORM_MATRIX: Final[dict[str, tuple[tuple[str, str], ...]]] = {
     "frontend-artifact": (("ubuntu-latest", "artifact"),),
     "frontend-validation": (
         ("ubuntu-latest", "validation"),
+        *(("ubuntu-latest", f"unit-{shard}") for shard in range(1, 5)),
+        ("ubuntu-latest", "contract-production"),
         ("ubuntu-latest", "contract-verification"),
-        ("windows-latest", "contract-determinism"),
+        ("windows-latest", "contract-production"),
+        ("windows-latest", "contract-verification"),
         ("ubuntu-latest", "contract-compare"),
     ),
     "wheel-webui-roundtrip": (("ubuntu-latest", "package"),),
-    "webui-chat-recovery": (("ubuntu-22.04", "chromium"),),
+    "webui-chat-recovery": (
+        *(("ubuntu-22.04", f"general-{shard}") for shard in range(1, 5)),
+        ("ubuntu-22.04", "clipboard"),
+        ("ubuntu-22.04", "virtualization"),
+    ),
     "webui-capacity": (("ubuntu-22.04", "chromium-capacity"),),
     "tui": (("ubuntu-latest", "default"),),
     "desktop-static": (("ubuntu-latest", "default"),),
+    "desktop-recovery-e2e": (
+        *((os_name, f"native-{probe}")
+          for os_name in ("ubuntu-latest", "macos-latest", "windows-latest")
+          for probe in ("pty", "mcp", "frozen")),
+        ("ubuntu-latest", "native-docker"),
+    ),
     "python-targeted": (("ubuntu-latest", "targeted"),),
     "python-stress": (("ubuntu-latest", "stress"),),
     "macos-recovery": (("macos-latest", "recovery"),),
     "release-packaging": (("ubuntu-latest", "default"),),
     "windows-nsis-regression": (
         ("windows-2022", "build"),
+        ("windows-2022", "windows-webui-build"),
+        ("windows-2022", "windows-package-contracts"),
+        ("windows-2022", "packaged-security"),
         ("windows-2022", "wheelhouse-core"),
         ("windows-2022", "wheelhouse-recommended"),
         *(("windows-2022", f"candidate-{probe}")
@@ -437,12 +453,15 @@ _FIXED_PLATFORM_MATRIX: Final[dict[str, tuple[tuple[str, str], ...]]] = {
         ("windows-latest", "default"),
     ),
     "managed-toolchain": (
-        ("ubuntu-24.04", "linux-x64"),
-        ("ubuntu-24.04-arm", "linux-arm64"),
-        ("ubuntu-24.04", "linux-musl-x64"),
-        ("macos-15", "darwin-arm64"),
-        ("macos-15-intel", "darwin-x64"),
-        ("windows-2022", "windows-x64"),
+        *((os_name, f"{platform_name}-{component}")
+          for os_name, platform_name in (
+              ("ubuntu-24.04", "linux-x64"),
+              ("ubuntu-24.04-arm", "linux-arm64"),
+              ("macos-15", "darwin-arm64"),
+              ("macos-15-intel", "darwin-x64"),
+              ("windows-2022", "windows-x64"),
+          ) for component in ("paper-tex", "media-ffmpeg")),
+        ("ubuntu-24.04", "linux-musl-x64-paper-tex"),
     ),
 }
 
@@ -667,6 +686,11 @@ def load_config(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
             raise PlanError("full_desktop_matrix contains duplicate cells")
         seen_cells.add(key)
 
+    python_families = _require_string_list(
+        value.get("python_shard_families"), "python_shard_families"
+    )
+    if not python_families or len(set(python_families)) != len(python_families):
+        raise PlanError("python_shard_families must contain unique responsibility families")
     python_matrix = value.get("full_python_matrix")
     if not isinstance(python_matrix, dict) or set(python_matrix) != {
         "ubuntu",
@@ -680,14 +704,24 @@ def load_config(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
         )
         if not shards:
             raise PlanError(f"full_python_matrix {platform_name} must not be empty")
-
-    expected_windows = {
-        f"{family}-{partition}"
-        for family in python_matrix["ubuntu"]
-        for partition in range(1, 5 if family == "gateway-sqlite" else 3)
-    }
-    if set(python_matrix["windows"]) != expected_windows:
-        raise PlanError("Windows matrix must define four gateway shards and two per other family")
+        if len(set(shards)) != len(shards):
+            raise PlanError(f"full_python_matrix {platform_name} contains duplicate cells")
+        by_family: dict[str, set[int]] = {family: set() for family in python_families}
+        for shard in shards:
+            family, separator, partition = shard.rpartition("-")
+            if (
+                not separator or family not in by_family or not partition.isdecimal()
+                or partition.startswith("0")
+            ):
+                raise PlanError(f"invalid physical Python shard: {shard!r}")
+            by_family[family].add(int(partition))
+        if any(
+            not partitions or partitions != set(range(1, len(partitions) + 1))
+            for partitions in by_family.values()
+        ):
+            raise PlanError(
+                f"full_python_matrix {platform_name} must partition every responsibility family"
+            )
 
     assignments_path = value.get(_WINDOWS_ASSIGNMENTS_CONFIG_KEY)
     if (
@@ -1003,7 +1037,7 @@ def _windows_test_assignments(config: Mapping[str, Any]) -> Mapping[str, str]:
         raise PlanError("Windows test assignment path was not loaded with the contract")
     assignments = _load_windows_test_assignments(
         assignments_path,
-        allowed_shards=set(config["full_python_matrix"]["ubuntu"]),
+        allowed_shards=set(config["python_shard_families"]),
     )
     partitions_path = config.get(_WINDOWS_PARTITIONS_PATH_KEY)
     if not isinstance(partitions_path, Path):
@@ -1615,7 +1649,7 @@ def _execution_matrices(
     for shard in targeted_windows_shards:
         if shard in config["full_python_matrix"]["windows"]:
             physical_windows_shards.add(shard)
-        elif shard in config["full_python_matrix"]["ubuntu"]:
+        elif shard in config["python_shard_families"]:
             physical_windows_shards.update(
                 physical for physical in config["full_python_matrix"]["windows"]
                 if physical.rsplit("-", 1)[0] == shard
@@ -2192,6 +2226,7 @@ def plan_changes(
             "webui-chat-recovery",
             "desktop-recovery-e2e",
             "wheel-webui-roundtrip",
+            "windows-nsis-regression",
         }
     ):
         suites.add("frontend-artifact")

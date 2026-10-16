@@ -284,22 +284,22 @@ def _partitioned_observations(tmp_path: Path) -> list[Any]:
     ]
 
 
-def test_duration_builder_requires_all_ten_execution_shards(tmp_path: Path) -> None:
+def test_duration_builder_requires_all_twenty_execution_shards(tmp_path: Path) -> None:
     observations = _partitioned_observations(tmp_path)
     payload = build_duration_payload(
         observations, expected_assignment_sha256="b" * 64,
         expected_partition_sha256="e" * 64,
     )
-    assert len(payload["weights_seconds"]) == 10
+    assert len(payload["weights_seconds"]) == 20
     catalog = json.loads(Path(".github/ci/suites.v1.json").read_text(encoding="utf-8"))
     assert tuple(catalog["full_python_matrix"]["windows"]) == DURATION_MODULE["WINDOWS_SHARD_NAMES"]
     assert all(value == {"parallel": 2.0, "serial": 0.0}
                for value in payload["phase_weights_seconds"].values())
-    assert len(payload["source_runs"][0]["execution"]) == 10
+    assert len(payload["source_runs"][0]["execution"]) == 20
     metadata_path = (tmp_path / "run-500" / "windows-high-risk-gateway-sqlite-4-attempt-1"
                      / "windows-shard-metadata.json")
     metadata_path.unlink()
-    with pytest.raises(ValueError, match="expected 10 Windows shard metadata"):
+    with pytest.raises(ValueError, match="expected 20 Windows shard metadata"):
         load_run_directory(tmp_path / "run-500")
 
 
@@ -367,7 +367,7 @@ def test_duration_builder_consumes_runner_metadata(
         observations, expected_assignment_sha256=assignment,
         expected_partition_sha256=partition,
     )
-    assert len(payload["weights_seconds"]) == 10
+    assert len(payload["weights_seconds"]) == 20
     base = "not stress" if marker is None else marker
     for execution in payload["source_runs"][0]["execution"].values():
         assert execution["parallel"]["marker"] == (

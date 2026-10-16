@@ -382,10 +382,14 @@ def _partial_env() -> dict[str, str]:
     }
 
 
-def test_partial_gate_keeps_shared_frontend_job_and_requires_full_coverage() -> None:
+def test_partial_gate_keeps_wheel_job_and_skips_reused_frontend_checks() -> None:
     env = _partial_env()
-    assert env["RESULT_FRONTEND"] == "success"  # Wheel roundtrip still runs.
+    assert env["RESULT_WHEEL_WEBUI"] == "success"
+    assert env["RESULT_FRONTEND"] == "skipped"
+    assert env["RESULT_FRONTEND_UNIT"] == "skipped"
+    assert env["RESULT_CONTRACT_LINUX"] == "skipped"
     assert env["RESULT_CONTRACT_WINDOWS"] == "skipped"
+    assert env["RESULT_CONTRACT_VERIFICATION_WINDOWS"] == "skipped"
     assert env["RESULT_CONTRACT_COMPARE"] == "skipped"
     assert check_ci_results(env) == []
 
@@ -403,6 +407,9 @@ def test_partial_gate_keeps_shared_frontend_job_and_requires_full_coverage() -> 
     ("RESULT_WINDOWS_NSIS", "cancelled"), ("RESULT_WINDOWS_NSIS", ""),
     ("QUEUE_REUSED_SUITES", '["frontend-validation","windows-nsis-regression"]'),
     ("RESULT_FRONTEND", "failure"), ("RESULT_CONTRACT_WINDOWS", "failure"),
+    ("RESULT_FRONTEND_UNIT", "failure"), ("RESULT_CONTRACT_LINUX", "failure"),
+    ("RESULT_CONTRACT_VERIFICATION_WINDOWS", "failure"),
+    ("RESULT_WHEEL_WEBUI", "failure"), ("RESULT_DESKTOP_NATIVE", "failure"),
     ("RESULT_CONTRACT_COMPARE", "failure"),
     ("RESULT_PLANNER", "cancelled"),
     ("QUEUE_PARTIAL", ""), ("QUEUE_PARTIAL", "false"), ("QUEUE_PARTIAL", "invalid"),
@@ -435,16 +442,20 @@ def test_partial_gate_rejects_omitted_windows_acceptance() -> None:
     assert any("partition" in error for error in check_ci_results(env))
 
 
+@pytest.mark.parametrize("variable", [
+    "RESULT_CONTRACT_VERIFICATION_LINUX", "RESULT_CONTRACT_VERIFICATION_WINDOWS",
+])
 @pytest.mark.parametrize("result", ["skipped", "failure", "cancelled", ""])
-def test_frontend_requires_complete_verification_profile(result: str) -> None:
+def test_frontend_requires_complete_verification_profile(variable: str, result: str) -> None:
     env = _env_for(BASELINE_SUITES | {"frontend-validation"})
-    env["RESULT_CONTRACT_VERIFICATION_LINUX"] = result
+    env[variable] = result
     assert any("Complete Gateway Contract verification" in error for error in check_ci_results(env))
 
 
 def test_wheel_only_does_not_require_verification_profile() -> None:
     env = _env_for(BASELINE_SUITES | {"wheel-webui-roundtrip"})
     assert env["RESULT_CONTRACT_VERIFICATION_LINUX"] == "skipped"
+    assert env["RESULT_CONTRACT_VERIFICATION_WINDOWS"] == "skipped"
     assert check_ci_results(env) == []
 
 
@@ -566,22 +577,36 @@ def test_ci_result_gate_requires_both_python_full_jobs() -> None:
     assert any("Ubuntu full test matrix" in error for error in errors)
 
 
-@pytest.mark.parametrize("suite", ["frontend-validation", "wheel-webui-roundtrip"])
-def test_ci_result_gate_requires_shared_frontend_check_for_each_consumer(suite: str) -> None:
+@pytest.mark.parametrize("suite,variable", [
+    ("frontend-validation", "RESULT_FRONTEND"),
+    ("frontend-validation", "RESULT_FRONTEND_UNIT"),
+    ("frontend-validation", "RESULT_CONTRACT_LINUX"),
+    ("wheel-webui-roundtrip", "RESULT_WHEEL_WEBUI"),
+    ("desktop-recovery-e2e", "RESULT_DESKTOP_NATIVE"),
+])
+@pytest.mark.parametrize("result", ["skipped", "failure", "cancelled", "", None])
+def test_ci_result_gate_requires_each_independent_consumer_check(
+    suite: str, variable: str, result: str | None,
+) -> None:
     env = _env_for(BASELINE_SUITES | {suite})
-    env["RESULT_FRONTEND"] = "skipped"
+    if result is None:
+        env.pop(variable)
+    else:
+        env[variable] = result
 
     errors = check_ci_results(env)
 
-    assert any("Frontend validation and wheel WebUI roundtrip" in error for error in errors)
+    assert any(JOB_RESULT_LABELS[variable] in error and "success" in error for error in errors)
 
 
-def test_ci_result_gate_accepts_one_shared_frontend_check_for_both_suites() -> None:
+def test_ci_result_gate_accepts_independent_frontend_and_wheel_checks_for_both_suites() -> None:
     env = _env_for(
         BASELINE_SUITES | {"frontend-validation", "wheel-webui-roundtrip"}
     )
 
     assert env["RESULT_FRONTEND"] == "success"
+    assert env["RESULT_FRONTEND_UNIT"] == "success"
+    assert env["RESULT_WHEEL_WEBUI"] == "success"
     assert check_ci_results(env) == []
 
 

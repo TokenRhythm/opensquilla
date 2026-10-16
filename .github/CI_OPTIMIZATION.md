@@ -15,6 +15,38 @@ Times are operational targets, not timeouts. High-risk pull requests intentional
 slower. Provider-live, credential, and external-network tests remain excluded from required
 CI and retain their existing live markers.
 
+## Parallel-runner timing experiment
+
+The `integration/ci-parallel-timing` experiment keeps every existing check and
+uses the same product revision as its baseline. Both branches run a complete
+`workflow_dispatch` matrix. Failures remain failures and are recorded beside
+execution time; there are no new assertion retries, skips, or relaxed gates.
+A failed run that executes less work is not accepted as evidence of a speedup.
+
+Ubuntu and Windows offline tests each use 20 physical partitions, preserving
+responsibility families, marker filters, `ci_serial`, and per-runner worker
+limits. Frontend type checks, four unit shards, and each Contract profile run
+independently. Browser recovery uses four ordinary shards and separate clipboard,
+virtualization and capacity runners. Desktop native/frozen/Docker probes run
+independently of the Electron recovery matrix. Managed toolchain components
+also use separate native VMs.
+
+The NSIS candidate consumes the verified shared WebUI artifact; an independent
+Windows job retains the complete native frontend build. Candidate identities are
+recorded before consumers begin. Packaged dependency auditing, frozen Gateway
+smoke and first interaction install and verify that exact installer on another
+runner, concurrently with all upgrade cases and candidate probes. The final
+acceptance requires every result. Gateway input hashing and freeze ordering are
+unchanged.
+
+Save each run API response as `run.json` and every jobs API page as `jobs.json`
+(a JSON array of pages when paginated), then compare trigger-to-final-job time,
+parallelism, candidate availability and failures with:
+
+```sh
+python .github/scripts/compare_ci_timings.py BASELINE_DIR CANDIDATE_DIR --output-dir OUTPUT_DIR
+```
+
 ## Test cost and ownership
 
 The ordinary offline suite excludes `stress`. The required `python-stress` suite
@@ -68,13 +100,12 @@ builder without this snapshot. The production planner has no persistent cache.
 
 ### Browser behavior and capacity
 
-The existing browser job runs ordinary virtualization/recovery cases with
-`--grep-invert=@capacity`, and a separately gated `webui-capacity` phase runs
-`--grep=@capacity`. Both phases keep one worker and zero retries and share the
-already-installed browser and verified production artifact. No additional
-runner/dependency installation is introduced. The capacity step's own outcome
-is exported to `CI result`: a green browser job cannot hide a planned capacity
-step that failed, was cancelled, or was skipped.
+Ordinary virtualization/recovery cases use `--grep-invert=@capacity`, while
+the independently gated `webui-capacity` job uses `--grep=@capacity`. These
+runners each retain one worker and zero retries and consume the same verified
+production artifact. Capacity owns its browser installation and isolated VM;
+its job result is required by `CI result`, so ordinary browser success cannot
+hide planned capacity work that failed, was cancelled, or was skipped.
 
 The long-list selection partitions into 52 ordinary cases and two capacity
 cases: the 34,000-event flood and the 3,000-row sidebar. All assertions and
@@ -88,7 +119,7 @@ still run the ordinary browser contracts without repeating these synthetic
 renderer workloads. New capacity-tagged specs must be listed in the executable
 capacity step and admitted by the planner. Local unfiltered Playwright commands
 continue to run both tiers; no global default hides the capacity cases.
-The browser job runs the existing capacity-inventory contract before browser
+Every browser lane runs the capacity-inventory contract before browser
 installation, using its already-installed Python dependencies. This admission
 also runs for pure WebUI plans that do not select a Python test shard, so an
 unregistered capacity tag fails before either browser phase can omit it.

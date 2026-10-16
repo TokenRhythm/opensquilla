@@ -11,6 +11,10 @@ on:
         description: 'smoke: current legacy baseline and fresh installs; full: all historical fault cases'
         type: string
         default: full
+      frontend_artifact_name:
+        description: 'Optional verified frontend artifact from this run; empty builds the WebUI locally'
+        type: string
+        default: ''
   workflow_dispatch:
 
 permissions:
@@ -21,6 +25,83 @@ env:
   PYTHONUNBUFFERED: '1'
 
 jobs:
+  windows-webui-build:
+    name: Complete WebUI build on Windows
+    # The shared artifact shortens candidate production; retain the independent
+    # Windows npm/typecheck/Vite build contract before acceptance can pass.
+    if: ${{ (inputs.frontend_artifact_name || '') != '' }}
+    runs-on: windows-2022
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+      - name: Build and verify complete WebUI
+        working-directory: opensquilla-webui
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI npm ci failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI build failed' }
+          npm run verify:release-dist
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI verification failed' }
+          node scripts/stage-dist.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI staging failed' }
+
+  windows-package-contracts:
+    name: Windows installer and packaged-probe contracts
+    runs-on: windows-2022
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+          cache: npm
+          cache-dependency-path: desktop/electron/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify native installer and packaged-probe contracts
+        working-directory: desktop/electron
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Electron npm ci failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Electron build failed' }
+          npm run test:nsis-upgrade
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS template and native environment tests failed' }
+          npm run test:installer-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Visible installer progress contract failed' }
+          node ../../.github/scripts/verify-sandbox-package.mjs --source
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime catalog verification failed' }
+          node scripts/test-packaged-first-send-cleanup.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged cleanup contract failed' }
+          node --test scripts/test-packaged-first-send-evidence.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged renderer evidence contract failed' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nsis-native-environment-evidence
+          path: ${{ runner.temp }}/nsis-upgrade-native-*/
+          if-no-files-found: warn
+          retention-days: 14
+
   build:
     runs-on: windows-2022
     timeout-minutes: 60
@@ -60,6 +141,7 @@ jobs:
           git lfs pull --include='src/opensquilla/squilla_router/models/**'
           if ($LASTEXITCODE -ne 0) { throw 'Router LFS fetch failed' }
       - name: Build and verify complete WebUI
+        if: ${{ (inputs.frontend_artifact_name || '') == '' }}
         working-directory: opensquilla-webui
         run: |
           npm ci
@@ -70,53 +152,35 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'WebUI verification failed' }
           node scripts/stage-dist.mjs
           if ($LASTEXITCODE -ne 0) { throw 'WebUI staging failed' }
+      - name: Download verified shared WebUI
+        if: ${{ (inputs.frontend_artifact_name || '') != '' }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: ${{ inputs.frontend_artifact_name }}
+          path: opensquilla-webui/dist/
+      - name: Verify shared WebUI on Windows and stage it for Gateway
+        if: ${{ (inputs.frontend_artifact_name || '') != '' }}
+        working-directory: opensquilla-webui
+        run: |
+          node scripts/verify-dist.mjs dist
+          if ($LASTEXITCODE -ne 0) { throw 'Shared WebUI verification failed' }
+          node scripts/stage-dist.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Shared WebUI staging failed' }
       - name: Build complete unsigned Windows package
         working-directory: desktop/electron
         run: |
           npm ci
           if ($LASTEXITCODE -ne 0) { throw 'Electron npm ci failed' }
-          npm run test:nsis-upgrade
-          if ($LASTEXITCODE -ne 0) { throw 'NSIS template and native environment tests failed' }
-          npm run test:installer-progress
-          if ($LASTEXITCODE -ne 0) { throw 'Visible installer progress contract failed' }
-          node ../../.github/scripts/verify-sandbox-package.mjs --source
-          if ($LASTEXITCODE -ne 0) { throw 'Runtime catalog verification failed' }
           npm run build:gateway
           if ($LASTEXITCODE -ne 0) { throw 'Gateway build failed' }
           npm run build
           if ($LASTEXITCODE -ne 0) { throw 'Electron build failed' }
-          node scripts/test-packaged-first-send-cleanup.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'Packaged cleanup contract failed' }
-          node --test scripts/test-packaged-first-send-evidence.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'Packaged renderer evidence contract failed' }
           npm run verify:prepared
           if ($LASTEXITCODE -ne 0) { throw 'Prepared package verification failed' }
           node -e "const b=require('electron-builder'); b.build({targets:b.Platform.WINDOWS.createTarget('nsis'),publish:'never',config:{win:{signExecutable:false},forceCodeSigning:false}}).catch(e=>{console.error(e);process.exitCode=1})"
           if ($LASTEXITCODE -ne 0) { throw 'NSIS build failed' }
           npm run verify:package
           if ($LASTEXITCODE -ne 0) { throw 'Package verification failed' }
-      - name: Audit frozen dependencies and verify packaged first interaction
-        env:
-          OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: '1'
-          OPENSQUILLA_SMOKE_PROVISION_SANDBOX: '1'
-          OPENSQUILLA_FIRST_SEND_TRACE_PATH: ${{ runner.temp }}/security-first-send-trace.zip
-        run: |
-          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
-            throw 'Windows Safe provisioning requires a disposable GitHub-hosted runner.'
-          }
-          # Select the disposable runner's real user profile; the child validates its SID.
-          $env:OPENSQUILLA_SMOKE_SANDBOX_PROFILE_ROOT = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.opensquilla'
-          $inventory = 'dist/desktop-electron/win-unpacked/resources/runtime/gateway/dependency-inventory.json'
-          python .github/scripts/audit_dependencies.py --repo . --python-only --python-inventory $inventory --output-dir "$env:RUNNER_TEMP/frozen-dependency-audit"
-          if ($LASTEXITCODE -ne 0) { throw 'Frozen dependency audit failed' }
-          Push-Location desktop/electron
-          try {
-            npm run verify:gateway-smoke -- --provision-windows-sandbox
-            if ($LASTEXITCODE -ne 0) { throw 'Frozen Gateway smoke failed' }
-            node scripts/test-packaged-first-send-renderer.mjs --executable "$env:GITHUB_WORKSPACE/dist/desktop-electron/win-unpacked/OpenSquilla.exe" --user-data-dir "$env:RUNNER_TEMP/security-first-send" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/security-first-send-report.log"
-            $probeExitCode = $LASTEXITCODE
-            if ($probeExitCode -ne 0) { throw "Packaged first interaction failed with exit code $probeExitCode" }
-          } finally { Pop-Location }
       - name: Record exact candidate identities
         run: |
           $root = Join-Path $PWD 'dist/desktop-electron'
@@ -150,18 +214,104 @@ jobs:
             dist/desktop-electron/win-unpacked/resources/runtime/gateway/gateway-build.json
           if-no-files-found: error
           retention-days: 14
+  packaged-security:
+    name: Installed frozen audit, Gateway smoke, and first interaction
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+          cache: npm
+          cache-dependency-path: desktop/electron/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Prepare packaged-client interaction probe
+        working-directory: desktop/electron
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Probe npm ci failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Probe build failed' }
+      - uses: ./.github/actions/download-required-artifact
+        with:
+          name: nsis-regression-installer
+          path: candidate
+      - name: Audit frozen dependencies and verify packaged first interaction
+        env:
+          OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: '1'
+          OPENSQUILLA_SMOKE_PROVISION_SANDBOX: '1'
+          OPENSQUILLA_FIRST_SEND_TRACE_PATH: ${{ runner.temp }}/security-first-send-trace.zip
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
+            throw 'Windows Safe provisioning requires a disposable GitHub-hosted runner.'
+          }
+          if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA) { throw 'Acceptance checkout mismatch' }
+          $candidate = @(Get-ChildItem candidate -Filter 'OpenSquilla-*-win-x64.exe' -File)
+          if ($candidate.Count -ne 1) { throw 'Expected exactly one candidate installer' }
+          $package = Get-Content desktop/electron/package.json -Raw | ConvertFrom-Json
+          $identityArgs = @('--installer', $candidate[0].FullName,
+            '--manifest', 'candidate/audit-candidate.json', '--source-sha', $env:GITHUB_SHA,
+            '--workflow-sha', $env:GITHUB_WORKFLOW_SHA, '--expected-version', $package.version)
+          python .github/scripts/windows_candidate_identity.py @identityArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate provenance verification failed' }
+          # Install the exact uploaded candidate, rather than rebuilding or
+          # transferring a second unpacked payload. The normal smoke discovery
+          # path then selects this installed bundle with fallback forbidden.
+          $installRoot = Join-Path $PWD 'dist/desktop-electron/win-unpacked'
+          if (Test-Path -LiteralPath $installRoot) { throw 'Security probe requires a fresh install root' }
+          New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
+          $installed = $false
+          try {
+            $install = Start-Process -FilePath $candidate[0].FullName -ArgumentList '/S', "/D=$installRoot" -WindowStyle Hidden -PassThru
+            if (-not $install.WaitForExit(180000)) { throw 'Candidate installation deadline exceeded' }
+            if ($install.ExitCode -ne 0) { throw "Candidate installer exit $($install.ExitCode)" }
+            $installed = $true
+            $installedVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $installRoot 'OpenSquilla.exe')).ProductVersion
+            python .github/scripts/windows_candidate_identity.py @identityArgs --root $installRoot --installed-version $installedVersion
+            if ($LASTEXITCODE -ne 0) { throw 'Installed candidate bytes differ from the manifest' }
+            # Select the disposable runner's real user profile; the child validates its SID.
+            $env:OPENSQUILLA_SMOKE_SANDBOX_PROFILE_ROOT = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.opensquilla'
+            $inventory = Join-Path $installRoot 'resources/runtime/gateway/dependency-inventory.json'
+            python .github/scripts/audit_dependencies.py --repo . --python-only --python-inventory $inventory --output-dir "$env:RUNNER_TEMP/frozen-dependency-audit"
+            if ($LASTEXITCODE -ne 0) { throw 'Frozen dependency audit failed' }
+            Push-Location desktop/electron
+            try {
+              npm run verify:gateway-smoke -- --provision-windows-sandbox
+              if ($LASTEXITCODE -ne 0) { throw 'Frozen Gateway smoke failed' }
+              node scripts/test-packaged-first-send-renderer.mjs --executable "$env:GITHUB_WORKSPACE/dist/desktop-electron/win-unpacked/OpenSquilla.exe" --user-data-dir "$env:RUNNER_TEMP/security-first-send" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/security-first-send-report.log"
+              $probeExitCode = $LASTEXITCODE
+              if ($probeExitCode -ne 0) { throw "Packaged first interaction failed with exit code $probeExitCode" }
+            } finally { Pop-Location }
+          } finally {
+            if ($installed) {
+              $uninstallers = @(Get-ChildItem -LiteralPath $installRoot -Filter 'Uninstall*.exe' -File)
+              if ($uninstallers.Count -ne 1) { throw 'Expected exactly one candidate uninstaller' }
+              $uninstall = Start-Process -FilePath $uninstallers[0].FullName -ArgumentList '/S' -WindowStyle Hidden -PassThru
+              if (-not $uninstall.WaitForExit(120000)) { throw 'Candidate uninstall deadline exceeded' }
+              if ($uninstall.ExitCode -ne 0) { throw "Candidate uninstaller exit $($uninstall.ExitCode)" }
+            }
+          }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: frozen-dependency-audit
-          path: ${{ runner.temp }}/frozen-dependency-audit/
-          if-no-files-found: warn
-          retention-days: 14
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: nsis-native-environment-evidence
-          path: ${{ runner.temp }}/nsis-upgrade-native-*/
+          path: |
+            ${{ runner.temp }}/frozen-dependency-audit/
+            candidate/audit-candidate.json
           if-no-files-found: warn
           retention-days: 14
       - uses: actions/upload-artifact@v4
@@ -173,6 +323,7 @@ jobs:
             ${{ runner.temp }}/security-first-send-trace.zip
             ${{ runner.temp }}/security-first-send/logs/desktop.log*
             ${{ runner.temp }}/security-first-send/first-send-main-console.jsonl
+            candidate/audit-candidate.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -335,7 +486,7 @@ jobs:
 
   acceptance-result:
     name: Windows NSIS acceptance result
-    needs: [build, wheelhouse-security, upgrade-and-start, candidate-probes]
+    needs: [build, windows-webui-build, windows-package-contracts, packaged-security, wheelhouse-security, upgrade-and-start, candidate-probes]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -351,12 +502,24 @@ jobs:
           WHEELHOUSE_RESULT: ${{ needs.wheelhouse-security.result }}
           UPGRADE_RESULT: ${{ needs.upgrade-and-start.result }}
           PROBE_RESULT: ${{ needs.candidate-probes.result }}
+          WINDOWS_WEBUI_RESULT: ${{ needs.windows-webui-build.result }}
+          PACKAGE_CONTRACT_RESULT: ${{ needs.windows-package-contracts.result }}
+          PACKAGED_SECURITY_RESULT: ${{ needs.packaged-security.result }}
+          FRONTEND_ARTIFACT_NAME: ${{ inputs.frontend_artifact_name || '' }}
         shell: bash
         run: |
           set -euo pipefail
-          for result in "${BUILD_RESULT}" "${WHEELHOUSE_RESULT}" "${UPGRADE_RESULT}" "${PROBE_RESULT}"; do
+          for result in "${BUILD_RESULT}" "${WHEELHOUSE_RESULT}" "${UPGRADE_RESULT}" "${PROBE_RESULT}" "${PACKAGED_SECURITY_RESULT}" "${PACKAGE_CONTRACT_RESULT}"; do
             if [[ "${result}" != "success" ]]; then
               echo "ERROR: every Windows acceptance job must succeed; got ${result:-missing}." >&2
               exit 1
             fi
           done
+          expected_webui_result=skipped
+          if [[ -n "${FRONTEND_ARTIFACT_NAME}" ]]; then
+            expected_webui_result=success
+          fi
+          if [[ "${WINDOWS_WEBUI_RESULT}" != "${expected_webui_result}" ]]; then
+            echo "ERROR: Windows WebUI build must be ${expected_webui_result}; got ${WINDOWS_WEBUI_RESULT:-missing}." >&2
+            exit 1
+          fi

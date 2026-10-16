@@ -20,8 +20,12 @@ JOB_RESULT_LABELS: Final[dict[str, str]] = {
     "RESULT_WORKFLOW_LINT": "Workflow lint",
     "RESULT_README_LOCALE": "README locale parity",
     "RESULT_FRONTEND_ARTIFACT": "Frontend artifact",
-    "RESULT_FRONTEND": "Frontend validation and wheel WebUI roundtrip",
+    "RESULT_FRONTEND": "Frontend type checks",
+    "RESULT_FRONTEND_UNIT": "Frontend unit test matrix",
+    "RESULT_WHEEL_WEBUI": "Wheel WebUI roundtrip",
+    "RESULT_CONTRACT_LINUX": "Gateway Contract production on Linux",
     "RESULT_CONTRACT_WINDOWS": "Gateway Contract determinism on Windows",
+    "RESULT_CONTRACT_VERIFICATION_WINDOWS": "Complete Gateway Contract verification on Windows",
     "RESULT_CONTRACT_VERIFICATION_LINUX": "Complete Gateway Contract verification on Linux",
     "RESULT_CONTRACT_COMPARE": "Gateway Contract cross-platform hashes",
     "RESULT_TUI": "OpenTUI package tests",
@@ -32,6 +36,7 @@ JOB_RESULT_LABELS: Final[dict[str, str]] = {
     "RESULT_WINDOWS_FULL": "Windows high-risk matrix",
     "RESULT_MACOS_RECOVERY": "macOS profile recovery and native no-replace tests",
     "RESULT_DESKTOP_RECOVERY_E2E": "Desktop recovery E2E matrix",
+    "RESULT_DESKTOP_NATIVE": "Desktop native platform probes",
     "RESULT_WEBUI_CHAT_RECOVERY": "WebUI chat recovery browser contracts",
     "RESULT_WEBUI_CAPACITY": "WebUI capacity browser contracts",
     "RESULT_RELEASE": "Release packaging contracts",
@@ -70,11 +75,16 @@ KNOWN_SUITES: Final[frozenset[str]] = frozenset(
 # accepting a planner suite that the aggregate gate does not understand.
 SUITE_RESULT_REQUIREMENTS: Final[dict[str, tuple[str, ...]]] = {
     "dependency-audit": ("RESULT_DEPENDENCY_AUDIT",),
-    "desktop-recovery-e2e": ("RESULT_DESKTOP_RECOVERY_E2E",),
+    "desktop-recovery-e2e": ("RESULT_DESKTOP_RECOVERY_E2E", "RESULT_DESKTOP_NATIVE"),
     "desktop-static": ("RESULT_DESKTOP",),
     "frontend-artifact": ("RESULT_FRONTEND_ARTIFACT",),
     "frontend-validation": (
-        "RESULT_FRONTEND", "RESULT_CONTRACT_WINDOWS", "RESULT_CONTRACT_VERIFICATION_LINUX",
+        "RESULT_FRONTEND",
+        "RESULT_FRONTEND_UNIT",
+        "RESULT_CONTRACT_LINUX",
+        "RESULT_CONTRACT_WINDOWS",
+        "RESULT_CONTRACT_VERIFICATION_LINUX",
+        "RESULT_CONTRACT_VERIFICATION_WINDOWS",
         "RESULT_CONTRACT_COMPARE",
     ),
     "macos-recovery": ("RESULT_MACOS_RECOVERY",),
@@ -86,9 +96,9 @@ SUITE_RESULT_REQUIREMENTS: Final[dict[str, tuple[str, ...]]] = {
     "release-packaging": ("RESULT_RELEASE",),
     "skill-hub": ("RESULT_SKILL_HUB",),
     "tui": ("RESULT_TUI",),
-    "webui-capacity": ("RESULT_WEBUI_CHAT_RECOVERY", "RESULT_WEBUI_CAPACITY"),
+    "webui-capacity": ("RESULT_WEBUI_CAPACITY",),
     "webui-chat-recovery": ("RESULT_WEBUI_CHAT_RECOVERY",),
-    "wheel-webui-roundtrip": ("RESULT_FRONTEND",),
+    "wheel-webui-roundtrip": ("RESULT_WHEEL_WEBUI",),
     "windows-high-risk": ("RESULT_WINDOWS_FULL",),
     "windows-nsis-regression": ("RESULT_WINDOWS_NSIS",),
     "workflow-lint": ("RESULT_WORKFLOW_LINT",),
@@ -130,9 +140,7 @@ def _read_required_suites(env: Mapping[str, str], errors: list[str]) -> set[str]
     required_suites = set(value)
     missing_baseline = sorted(BASELINE_SUITES - required_suites)
     if missing_baseline:
-        errors.append(
-            "Suite planner omitted baseline suites: " + ", ".join(missing_baseline)
-        )
+        errors.append("Suite planner omitted baseline suites: " + ", ".join(missing_baseline))
     return required_suites
 
 
@@ -204,9 +212,7 @@ def _full_queue_suites() -> set[str]:
     return set(json.loads(manifest.read_text(encoding="utf-8"))["full_suites"])
 
 
-def _check_partial_coverage(
-    env: Mapping[str, str], executed: set[str], errors: list[str]
-) -> None:
+def _check_partial_coverage(env: Mapping[str, str], executed: set[str], errors: list[str]) -> None:
     """A partial run still owes EVERY full-matrix suite, by proof or execution."""
     if env.get("GITHUB_EVENT_NAME") != "merge_group":
         errors.append("Partial evidence is valid only for merge_group.")
@@ -214,14 +220,16 @@ def _check_partial_coverage(
         errors.append("Partial evidence verifier must succeed.")
     if env.get("QUEUE_CANARY_RESULT") != "success":
         errors.append("Partial queue combined-tree canary must succeed.")
-    if not env.get("QUEUE_SOURCE_RUN_ID", "").isdigit() or int(
-        env.get("QUEUE_SOURCE_RUN_ID", "0")
-    ) <= 0:
+    if (
+        not env.get("QUEUE_SOURCE_RUN_ID", "").isdigit()
+        or int(env.get("QUEUE_SOURCE_RUN_ID", "0")) <= 0
+    ):
         errors.append("Partial evidence source run is missing.")
     try:
         reused = json.loads(env.get("QUEUE_REUSED_SUITES", ""))
         if (
-            not isinstance(reused, list) or not reused
+            not isinstance(reused, list)
+            or not reused
             or any(not isinstance(suite, str) for suite in reused)
             or reused != sorted(set(reused))
             or not set(reused) <= {"frontend-validation", "tui"}

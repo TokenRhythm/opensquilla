@@ -39,7 +39,7 @@ SHARD_NAMES: Final[tuple[str, ...]] = (
 WINDOWS_SHARD_NAMES: Final[tuple[str, ...]] = tuple(
     f"{family}-{partition}"
     for family in SHARD_NAMES
-    for partition in range(1, 5 if family == "gateway-sqlite" else 3)
+    for partition in range(1, 9 if family == "gateway-sqlite" else 5)
 )
 DEFAULT_PARALLEL_WORKERS: Final[int] = 4
 _CORE_WHEEL_FIXTURE: Final[str] = "isolated_core_wheel"
@@ -534,7 +534,15 @@ def validated_files_for_shard(root: Path, shard: str) -> tuple[str, ...]:
     discovered = set(discover_test_files(root))
     names = WINDOWS_SHARD_NAMES if shard in WINDOWS_SHARD_NAMES else SHARD_NAMES
     shard_family(shard)
-    by_shard = {name: set(files_for_shard(root, name)) for name in names}
+    selector = windows_shard_for_test if shard in WINDOWS_SHARD_NAMES else shard_for_test
+    by_shard: dict[str, set[str]] = {name: set() for name in names}
+    # Validate the full inventory in one pass. More physical partitions must
+    # not multiply repository scans in every matrix cell.
+    for path in discovered:
+        owner = selector(path)
+        if owner not in by_shard:
+            raise ValueError(f"Windows test file has an unknown shard owner: {path}: {owner}")
+        by_shard[owner].add(path)
     assigned = set().union(*by_shard.values())
     assignment_count = sum(len(paths) for paths in by_shard.values())
     if assigned != discovered or assignment_count != len(discovered):

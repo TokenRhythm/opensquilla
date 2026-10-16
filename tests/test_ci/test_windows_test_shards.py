@@ -983,26 +983,29 @@ def test_windows_execution_partitions_cover_every_file_once_within_its_family() 
     physical_files = {
         shard: set(validated_files_for_shard(root, shard)) for shard in WINDOWS_SHARD_NAMES
     }
-    assert len(physical_files) == 10
+    assert len(physical_files) == 20
     catalog = json.loads(Path(".github/ci/suites.v1.json").read_text(encoding="utf-8"))
     assert tuple(catalog["full_python_matrix"]["windows"]) == WINDOWS_SHARD_NAMES
+    assert tuple(catalog["full_python_matrix"]["ubuntu"]) == WINDOWS_SHARD_NAMES
+    assert tuple(catalog["python_shard_families"]) == SHARD_NAMES
     assert all(physical_files.values())
     assert set().union(*physical_files.values()) == discovered
     assert sum(map(len, physical_files.values())) == len(discovered)
     for family in SHARD_NAMES:
         family_files = [paths for shard, paths in physical_files.items()
                         if shard_family(shard) == family]
-        assert len(family_files) == (4 if family == "gateway-sqlite" else 2)
+        assert len(family_files) == (8 if family == "gateway-sqlite" else 4)
         assert set().union(*family_files) == set(files_for_shard(root, family))
     for path, physical in assignments.items():
         assert shard_family(physical) == shard_for_test(path)
         assert windows_shard_for_test(path) == physical
 
 
-def test_planned_windows_inventory_preserves_owners_for_every_matrix_subset(tmp_path: Path) -> None:
+def test_planned_windows_inventory_preserves_owners_for_matrix_subsets(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
-    # One real governed path per physical owner is enough to exercise all 1,023
-    # nonempty plans without repeatedly scanning the full repository.
+    # Exercise every singleton, pair, omitted-owner boundary, and the full plan.
+    # Enumerating every possible 20-cell subset would expand this into a million
+    # repeated inventory scans without adding a new selection boundary.
     samples = {
         shard: next(path for path, owner in partition_assignments().items() if owner == shard)
         for shard in WINDOWS_SHARD_NAMES
@@ -1011,7 +1014,7 @@ def test_planned_windows_inventory_preserves_owners_for_every_matrix_subset(tmp_
         target = tmp_path / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.touch()
-    for size in range(1, len(WINDOWS_SHARD_NAMES) + 1):
+    for size in (1, 2, len(WINDOWS_SHARD_NAMES) - 1, len(WINDOWS_SHARD_NAMES)):
         for planned in itertools.combinations(WINDOWS_SHARD_NAMES, size):
             selected = files_for_planned_windows_shards(tmp_path, planned[0], json.dumps(planned))
             assert set(selected) == {samples[shard] for shard in planned}, planned
@@ -1075,12 +1078,12 @@ def test_windows_new_file_fallback_is_stable_and_keeps_environment_family() -> N
         assert shard_family(shard) == shard_for_test(path)
 
 
-def test_gateway_new_file_fallback_uses_all_four_partitions() -> None:
+def test_gateway_new_file_fallback_uses_all_eight_partitions() -> None:
     paths = [f"tests/test_gateway/test_new_partition_fallback_{index}.py"
-             for index in range(32)]
+             for index in range(64)]
     assert not set(paths).intersection(partition_assignments())
     assert {windows_shard_for_test(path) for path in paths} == {
-        f"gateway-sqlite-{partition}" for partition in range(1, 5)
+        f"gateway-sqlite-{partition}" for partition in range(1, 9)
     }
 
 
