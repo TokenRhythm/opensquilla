@@ -5,6 +5,11 @@
     :show-toolbar="Boolean(store.activeItem && (showArtifactNavigation(store.activeItem) || visiblePanelToolbarItems(store.activeItem).length))"
     @tab-menu="openTabMenu"
     :enabled="enabled"
+    :available-width="availableWidth"
+    :layout-mode="layoutMode"
+    :motion-enabled="motionEnabled"
+    :animate-layout="animateLayout"
+    :return-label="t('workbench.returnToChat')"
     :allow-empty="newPanelMenuVisible"
     :route-active="routeActive && store.activeSessionId === (sessionId || null)"
     :modal-blocked="modalBlocked"
@@ -397,6 +402,7 @@ import { createTerminalWorkbenchDefinition } from './terminalWorkbenchProvider'
 import { createAssistantChatWorkbenchDefinition } from './assistantChatWorkbenchProvider'
 import { createToolHistoryFileDefinition } from './toolHistoryFileProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
+import type { WorkbenchLayoutMode } from '@/workbench/layout'
 import BrowserStartPanel from './BrowserStartPanel.vue'
 import { copyTextWithFallback, downloadBlob } from '@/utils/browser'
 import { createTabThumbnailCache } from '@/workbench/tabThumbnailCache'
@@ -404,6 +410,10 @@ import { createNativeTabSnapshots } from './nativeTabSnapshots'
 
 const props = withDefaults(defineProps<{
   enabled?: boolean
+  availableWidth?: number
+  layoutMode?: WorkbenchLayoutMode
+  motionEnabled?: boolean
+  animateLayout?: boolean
   modalBlocked?: boolean
   workbenchResourcesEnabled?: boolean
   promptAnnotationsEnabled?: boolean

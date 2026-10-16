@@ -318,6 +318,7 @@
     },
     "title": "Workbench",
     "expand": "Open workbench",
+    "returnToChat": "Back to chat",
     "collapse": "Collapse workbench",
     "maximize": "Maximize workbench",
     "restore": "Restore workbench",

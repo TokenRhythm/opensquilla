@@ -191,7 +191,7 @@
           />
         </div>
         <div class="chat-collapse-region chat-collapse-region--footer">
-          <div class="chat-input-footer">
+          <div ref="toolbarEl" class="chat-input-footer">
           <div class="chat-input-actions chat-input-actions--left">
             <div ref="addMenuAnchorEl" class="chat-settings-anchor chat-add-menu-anchor">
               <button
@@ -278,6 +278,7 @@
               type="button"
               class="chat-project-choose"
               :aria-label="t('workspaces.chooseProject')"
+              :title="t('workspaces.chooseProject')"
               :disabled="projectBindingBusy"
               @click="emit('chooseProject')"
             >
@@ -356,10 +357,10 @@
               >
                 <Icon v-if="sessionRoutingMode === 'squilla_router'" name="router" :size="17" />
                 <Icon v-else-if="sessionRoutingMode === 'llm_ensemble'" name="fork" :size="17" />
-                <span v-else class="chat-model-routing-btn__dot" aria-hidden="true" />
+                <Icon v-else name="agents" :size="17" aria-hidden="true" />
                 <span class="chat-model-routing-btn__label">{{ modelRoutingTriggerLabel }}</span>
                 <span v-if="modelRoutingUsesDefault" class="chat-model-routing-btn__default">{{ t('chat.newTaskModel.defaultBadge') }}</span>
-                <Icon name="chevronDown" :size="12" />
+                <Icon class="chat-model-routing-btn__chevron" name="chevronDown" :size="12" />
                 <span
                   v-if="showRouterNewBadge"
                   class="chat-model-routing-btn__new"
@@ -475,6 +476,7 @@ import type { SelectedSkillRef } from '@/types/selectedSkills'
 import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import { useComposerToolbarFit } from '@/composables/chat/useComposerToolbarFit'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import type { IconName } from '@/utils/icons'
 import ChatComposerAddMenu from '@/components/chat/ChatComposerAddMenu.vue'
@@ -718,6 +720,8 @@ const inputText = defineModel<string>({ required: true })
 watch([sendControlHint, inputText], () => { sendHintRequested.value = false })
 const composerEl = ref<HTMLElement | null>(null)
 const inputPanelEl = ref<HTMLElement | null>(null)
+const toolbarEl = ref<HTMLElement | null>(null)
+useComposerToolbarFit(toolbarEl, inputPanelEl)
 const inlineEditor = ref<InstanceType<typeof ChatInlineEditor> | null>(null)
 const textareaEl = computed(() => inlineEditor.value?.element() ?? null)
 function onTextareaInput(event: Event) {
@@ -1644,35 +1648,6 @@ button.attachment-chip__primary:focus-visible {
   max-width: 14rem;
 }
 
-/* The stop target needs more room than the send target in narrow composers. */
-@container chat-composer (max-width: 26rem) {
-  .chat-input-footer:has(.chat-stop-btn) .chat-run-mode-btn__label {
-    display: none;
-  }
-}
-
-/* Fit the actual chat column, including split views. Keep the writing controls
-   on one baseline; shorten labels before introducing a second toolbar row. */
-@container chat-composer (max-width: 36rem) {
-  .chat-input-footer { gap: 0.25rem; position: static; padding-inline: 0.5rem; }
-  .chat-input-actions--left { flex: 0 1 auto; gap: 0; }
-  .chat-input-actions--right { flex: 1 1 auto; min-width: 0; gap: 0.25rem; }
-  .chat-run-mode-btn__label,
-  .chat-project-choose__label,
-  .chat-project-choose__chevron,
-  .chat-project-chip > span { display: none; }
-  .chat-project-choose, .chat-project-chip { padding-inline: 0.375rem; }
-  .chat-model-routing-anchor { max-width: min(12rem, 100%); }
-  .chat-model-routing-btn { min-width: 0; }
-  .chat-model-routing-btn__default,
-  .chat-model-routing-btn__new { display: none; }
-}
-@container chat-composer (max-width: 23rem) {
-  .chat-input-footer { padding-inline: 0.25rem; }
-  .chat-model-routing-btn__label { max-width: 6rem; }
-  .chat-model-routing-btn { gap: 0.25rem; padding-inline: 0.25rem; }
-  .chat-project-choose { max-width: 44px; overflow: hidden; }
-}
 @media (pointer: coarse) {
   .chat-plus-btn, .chat-run-mode-btn, .chat-project-choose,
   .attachment-action { min-width: 44px; min-height: 44px; }
@@ -1771,22 +1746,6 @@ button.attachment-chip__primary:focus-visible {
   white-space: nowrap;
   font-size: var(--fs-xs);
   text-align: left;
-}
-
-.chat-model-routing-btn__dot {
-  flex: 0 0 17px;
-  width: 17px;
-  height: 17px;
-  display: grid;
-  place-items: center;
-}
-
-.chat-model-routing-btn__dot::before {
-  content: "";
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--accent);
 }
 
 .chat-model-routing-btn__default {
@@ -2017,6 +1976,85 @@ button.attachment-chip__primary:focus-visible {
 .chat-send-btn[aria-busy='true']:disabled {
   cursor: progress;
   opacity: 1;
+}
+
+/* Density is measured once for the entire toolbar against its own input panel.
+   Only presentation changes: menus, focus targets and accessible names survive. */
+.chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) {
+  --composer-control-size: 34px;
+  gap: 0.25rem;
+  padding-inline: 0.5rem;
+}
+
+.chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) .chat-input-actions--left {
+  flex: 0 1 auto;
+}
+
+.chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) :is(
+  .chat-run-mode-btn__label, .chat-project-choose__label, .chat-project-choose__chevron,
+  .chat-project-chip__name, .chat-project-chip__status,
+  .chat-model-routing-btn__default, .chat-model-routing-btn__new
+) {
+  display: none;
+}
+
+.chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) :deep(:is(
+  .composer-goal-mode__label, .composer-plan-mode__label, .composer-plan-mode__next
+)) {
+  display: none;
+}
+
+.chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) :is(
+  .chat-plus-btn, .chat-run-mode-btn, .chat-project-choose, .chat-send-btn
+) {
+  flex: 0 0 var(--composer-control-size);
+  width: var(--composer-control-size);
+  height: var(--composer-control-size);
+  min-width: var(--composer-control-size);
+  min-height: var(--composer-control-size);
+  padding: 0;
+  gap: 0;
+  justify-content: center;
+}
+
+.chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) .chat-project-chip {
+  gap: 0.25rem;
+  padding-inline: 0.375rem;
+  flex-shrink: 0;
+}
+
+.chat-input-footer[data-composer-density='compact'] .chat-model-routing-anchor {
+  max-width: 12rem;
+}
+
+.chat-input-footer[data-composer-density='icons'] {
+  /* Only an extremely narrow host or several active mode chips need a second
+     row. Keep every action usable rather than clipping or shrinking icons. */
+  flex-wrap: wrap;
+}
+
+.chat-input-footer[data-composer-density='icons'] .chat-input-actions--right,
+.chat-input-footer[data-composer-density='icons'] .chat-model-routing-anchor {
+  flex: 0 0 auto;
+}
+
+.chat-input-footer[data-composer-density='icons'] :is(.chat-model-routing-btn__label, .chat-model-routing-btn__chevron) {
+  display: none;
+}
+
+.chat-input-footer[data-composer-density='icons'] .chat-model-routing-btn {
+  width: var(--composer-control-size);
+  height: var(--composer-control-size);
+  min-width: var(--composer-control-size);
+  min-height: var(--composer-control-size);
+  padding: 0;
+  gap: 0;
+}
+
+@media (pointer: coarse) {
+  .chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) {
+    --composer-control-size: 44px;
+  }
 }
 
 @keyframes spin {

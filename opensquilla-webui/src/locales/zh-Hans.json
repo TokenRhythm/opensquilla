@@ -317,6 +317,7 @@
     },
     "title": "工作区",
     "expand": "展开工作区",
+    "returnToChat": "返回聊天",
     "collapse": "收起工作区",
     "maximize": "最大化工作区",
     "restore": "还原工作区",

@@ -1,4 +1,5 @@
 <template>
+  <Transition name="workbench-presence" :css="motionEnabled && !resizeActive" @after-leave="leavingWidth = null">
   <aside
     v-if="shouldMount"
     v-show="shouldRender"
@@ -7,14 +8,17 @@
     class="workbench-host"
     :class="[
       `workbench-host--${layoutMode}`,
-      { 'workbench-host--conversation': activeItem?.kind === 'assistant-chat' },
+      { 'workbench-host--conversation': activeItem?.kind === 'assistant-chat',
+        'workbench-host--native': activeItem?.hostKind === 'native-webcontents',
+        'workbench-host--direct': !motionEnabled || resizeActive,
+        'workbench-host--layout-motion': animateLayout && !resizeActive },
     ]"
     :style="hostStyle"
-    :role="layoutMode === 'mobile-dialog' ? 'dialog' : 'complementary'"
-    :aria-modal="layoutMode === 'mobile-dialog' ? 'true' : undefined"
+    role="complementary"
+    :data-layout-mode="layoutMode"
     :aria-label="ariaLabel"
-    :aria-hidden="modalBlocked ? 'true' : undefined"
-    :inert="modalBlocked ? true : undefined"
+    :aria-hidden="modalBlocked || !shouldRender ? 'true' : undefined"
+    :inert="modalBlocked || !shouldRender ? true : undefined"
     data-testid="workbench-host"
   >
     <WorkbenchResizer
@@ -27,19 +31,34 @@
       :aria-label="resizeLabel"
       :unit-label="pixelsLabel"
       aria-controls="app-main workbench-panel"
+      @resize-start="resizeActive = true"
       @preview="previewWidth = $event"
       @commit="commitWidth"
       @reset="resetWidth"
       @cancel="previewWidth = null"
-      @resize-end="previewWidth = null"
+      @resize-end="previewWidth = null; resizeActive = false"
     />
 
     <header
       class="workbench-host__chrome"
       :class="{ 'workbench-host__chrome--browser': activeItem?.kind === 'browser' }"
     >
+      <button
+        v-if="layoutMode === 'single-pane'"
+        ref="returnButtonRef"
+        class="workbench-host__return-button"
+        type="button"
+        :disabled="modalBlocked"
+        :aria-label="returnLabel"
+        data-testid="workbench-return-chat"
+        @click="collapseWorkbench"
+      >
+        <Icon name="chevronLeft" :size="17" aria-hidden="true" />
+        <span>{{ returnLabel }}</span>
+      </button>
       <div
         v-if="showTabStrip"
+        ref="tabsRef"
         class="workbench-host__tabs"
         role="tablist"
         :aria-label="openItemsLabel"
@@ -93,7 +112,7 @@
       <div class="workbench-host__actions">
         <slot name="actions" :item="activeItem" />
         <button
-          v-if="layoutMode !== 'mobile-dialog'"
+          v-if="measuredAvailableWidth >= WORKBENCH_SPLIT_MIN_WIDTH"
           ref="maximizeButtonRef"
           class="workbench-host__icon-button"
           type="button"
@@ -107,7 +126,7 @@
           <Icon :name="store.maximized ? 'collapse' : 'expand'" :size="17" aria-hidden="true" />
         </button>
         <button
-          v-if="layoutMode === 'mobile-dialog' || !allowEmpty"
+          v-if="layoutMode === 'split' && !allowEmpty"
           ref="closeButtonRef"
           class="workbench-host__icon-button"
           type="button"
@@ -178,6 +197,7 @@
         alt="" aria-hidden="true" draggable="false" />
     </section>
   </aside>
+  </Transition>
   <Teleport to="body">
     <div v-if="hoveredItem && shouldRender && !modalBlocked" :id="hoverCardId" ref="hoverCardRef"
       class="workbench-tab-preview" role="tooltip" :style="hoverStyle"
@@ -201,9 +221,10 @@ import {
   useId,
 } from 'vue'
 import Icon from '@/components/Icon.vue'
-import { useDialogA11y, useDialogLayer } from '@/composables/useDialogA11y'
+import { useDialogLayer } from '@/composables/useDialogA11y'
 import {
   WORKBENCH_MIN_WIDTH,
+  WORKBENCH_SPLIT_MIN_WIDTH,
   defaultWorkbenchWidthPreference,
   workbenchDynamicMax,
   workbenchEffectiveWidth,
@@ -226,7 +247,10 @@ const props = withDefaults(defineProps<{
   showToolbar?: boolean
   tabInfo?: (item: WorkbenchItem) => { subtitle?: string; thumbnailUrl?: string; loading?: boolean }
   availableWidth?: number
-  coarseOnly?: boolean
+  layoutMode?: WorkbenchLayoutMode
+  motionEnabled?: boolean
+  animateLayout?: boolean
+  returnLabel?: string
   ariaLabel?: string
   emptyLabel?: string
   openItemsLabel?: string
@@ -243,7 +267,10 @@ const props = withDefaults(defineProps<{
   routeActive: true,
   modalBlocked: false,
   availableWidth: undefined,
-  coarseOnly: undefined,
+  layoutMode: undefined,
+  motionEnabled: false,
+  animateLayout: false,
+  returnLabel: 'Back to chat',
   ariaLabel: 'Workbench',
   emptyLabel: 'No preview is available for this item.',
   openItemsLabel: 'Open workbench items',
@@ -266,17 +293,19 @@ const emit = defineEmits<{
 
 const store = useWorkbenchStore()
 const hostRef = ref<HTMLElement | null>(null)
+const tabsRef = ref<HTMLElement | null>(null)
 const surfaceRef = ref<HTMLElement | null>(null)
 const resizerRef = ref<WorkbenchResizerHandle | null>(null)
+const returnButtonRef = ref<HTMLButtonElement | null>(null)
 const closeButtonRef = ref<HTMLButtonElement | null>(null)
 const maximizeButtonRef = ref<HTMLButtonElement | null>(null)
 const viewportWidth = ref(typeof window === 'undefined' ? 0 : window.innerWidth)
 const containerWidth = ref(0)
-const containerRect = ref({ top: 0, right: viewportWidth.value, height: 0 })
-const detectedCoarseOnly = ref(false)
 const previewWidth = ref<number | null>(null)
-let coarseQuery: MediaQueryList | null = null
+const resizeActive = ref(false)
+const leavingWidth = ref<number | null>(null)
 let surfaceObserver: ResizeObserver | null = null
+let tabsObserver: ResizeObserver | null = null
 let containerObserver: ResizeObserver | null = null
 let surfaceMutationObserver: MutationObserver | null = null
 let rectFrame = 0
@@ -355,9 +384,8 @@ const measuredAvailableWidth = computed(() => {
   if (typeof supplied === 'number' && Number.isFinite(supplied)) return supplied
   return containerWidth.value > 0 ? containerWidth.value : viewportWidth.value
 })
-const layoutMode = computed(() => workbenchLayoutMode({
+const layoutMode = computed(() => props.layoutMode ?? workbenchLayoutMode({
   availableWidth: measuredAvailableWidth.value,
-  coarseOnly: props.coarseOnly ?? detectedCoarseOnly.value,
   maximized: store.maximized,
 }))
 const dynamicMaximumWidth = computed(() =>
@@ -373,13 +401,7 @@ const effectiveWidth = computed(() => previewWidth.value ?? workbenchEffectiveWi
   measuredAvailableWidth.value,
 ))
 const hostStyle = computed(() => ({
-  '--workbench-width': `${effectiveWidth.value}px`,
-  '--workbench-container-top': `${containerRect.value.top}px`,
-  '--workbench-container-end': `${Math.max(
-    0,
-    viewportWidth.value - containerRect.value.right,
-  )}px`,
-  '--workbench-container-height': `${containerRect.value.height}px`,
+  '--workbench-width': `${leavingWidth.value ?? effectiveWidth.value}px`,
 }))
 const shouldRender = computed(() =>
   props.enabled && props.routeActive && store.expanded
@@ -390,20 +412,7 @@ const runtimeAvailable = computed(() =>
   props.enabled
   && props.routeActive
   && shouldRender.value)
-const mobileDialogOpen = computed(() =>
-  shouldRender.value && layoutMode.value === 'mobile-dialog')
-
 const hoverTopmost = useDialogLayer(hoverOpen)
-
-useDialogA11y(
-  hostRef,
-  mobileDialogOpen,
-  collapseWorkbench,
-  {
-    initialFocus: closeButtonRef,
-    occludesNativeSurface: false,
-  },
-)
 
 function commitWidth(width: number) {
   previewWidth.value = null
@@ -497,12 +506,26 @@ function measureContainer() {
   if (!parent) return
   const rect = parent.getBoundingClientRect()
   containerWidth.value = Math.max(0, rect.width || parent.clientWidth)
-  containerRect.value = {
-    top: rect.top,
-    right: rect.right,
-    height: rect.height || parent.clientHeight,
-  }
+
 }
+
+function revealActiveTab() {
+  const strip = tabsRef.value
+  const active = strip?.querySelector<HTMLElement>('.workbench-host__tab-wrap.is-active')
+  if (!strip || !active || !shouldRender.value) return
+  const viewport = strip.getBoundingClientRect()
+  const tab = active.getBoundingClientRect()
+  if (viewport.width <= 0) return
+  // Scroll this strip only: scrollIntoView can also move the transcript/page.
+  if (tab.right > viewport.right) strip.scrollLeft += tab.right - viewport.right
+  else if (tab.left < viewport.left) strip.scrollLeft += tab.left - viewport.left
+}
+
+watch([tabsRef, () => activeItem.value?.id, shouldRender], () => {
+  tabsObserver?.disconnect()
+  if (tabsRef.value) tabsObserver?.observe(tabsRef.value)
+  void nextTick(revealActiveTab)
+}, { flush: 'post' })
 
 function reconnectSurfaceObserver() {
   surfaceObserver?.disconnect()
@@ -547,10 +570,6 @@ function onSurfaceMutation(records: MutationRecord[]) {
   if (!nativeSlotChanged) return
   reconnectSurfaceObserver()
   scheduleSurfaceRect()
-}
-
-function updateCoarseOnly(event: MediaQueryListEvent | MediaQueryList) {
-  detectedCoarseOnly.value = event.matches
 }
 
 function scheduleSurfaceRect() {
@@ -601,6 +620,14 @@ function emitSurfaceRect() {
 }
 
 watch(layoutMode, mode => {
+  const focused = typeof document !== 'undefined' ? document.activeElement : null
+  const focusWasInMain = focused instanceof Element && Boolean(focused.closest('.app-chat-pane'))
+  const focusWasOnReturn = focused === returnButtonRef.value
+  if (mode === 'single-pane' && focusWasInMain) {
+    void nextTick(() => returnButtonRef.value?.focus({ preventScroll: true }))
+  } else if (mode === 'split' && focusWasOnReturn) {
+    void nextTick(() => hostRef.value?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus({ preventScroll: true }))
+  }
   resizerRef.value?.cancel()
   previewWidth.value = null
   emit('layout-change', mode)
@@ -615,7 +642,19 @@ watch(runtimeAvailable, available => {
 watch(() => props.modalBlocked, blocked => { if (blocked) hideHover(); void nextTick(scheduleSurfaceRect) })
 watch(() => props.nativeBlocked, () => void nextTick(scheduleSurfaceRect))
 watch(() => store.activeSessionId, hideHover)
-watch(shouldRender, visible => { if (!visible) hideHover() })
+watch(shouldRender, (visible, previous) => {
+  if (visible) leavingWidth.value = null
+  else {
+    hideHover()
+    // setExpanded(false) also clears maximized in the same transaction. Read
+    // the last painted track before Vue patches it, not its new split target.
+    if (previous && props.motionEnabled) {
+      const renderedWidth = hostRef.value?.getBoundingClientRect().width
+      const previousTarget = Number.parseFloat(hostRef.value?.style.getPropertyValue('--workbench-width') || '')
+      leavingWidth.value = renderedWidth || (Number.isFinite(previousTarget) ? previousTarget : null)
+    }
+  }
+})
 watch(() => activeItem.value?.id, () => void nextTick(scheduleSurfaceRect))
 watch(() => activeItem.value?.hostKind, () => void nextTick(scheduleSurfaceRect))
 watch(effectiveWidth, scheduleSurfaceRect)
@@ -625,8 +664,8 @@ watch([hostRef, surfaceRef], () => {
 }, { flush: 'post' })
 
 watch(shouldRender, (visible, previous) => {
-  if (visible && !previous && layoutMode.value === 'mobile-dialog') {
-    void nextTick(() => closeButtonRef.value?.focus({ preventScroll: true }))
+  if (visible && !previous && layoutMode.value === 'single-pane') {
+    void nextTick(() => returnButtonRef.value?.focus({ preventScroll: true }))
   }
 })
 
@@ -634,17 +673,14 @@ onMounted(() => {
   document.addEventListener('keydown', onHoverEscape, true)
   window.addEventListener('resize', updateViewportWidth)
   window.addEventListener('scroll', measureContainer, true)
-  coarseQuery = window.matchMedia?.('(pointer: coarse) and (hover: none)') ?? null
-  if (coarseQuery) {
-    updateCoarseOnly(coarseQuery)
-    coarseQuery.addEventListener?.('change', updateCoarseOnly)
-  }
   if (typeof ResizeObserver !== 'undefined') {
     surfaceObserver = new ResizeObserver(scheduleSurfaceRect)
     containerObserver = new ResizeObserver(() => {
       measureContainer()
       scheduleSurfaceRect()
     })
+    tabsObserver = new ResizeObserver(revealActiveTab)
+    if (tabsRef.value) tabsObserver.observe(tabsRef.value)
   }
   if (typeof MutationObserver !== 'undefined') {
     surfaceMutationObserver = new MutationObserver(onSurfaceMutation)
@@ -658,8 +694,8 @@ onBeforeUnmount(() => {
   document.removeEventListener('keydown', onHoverEscape, true)
   window.removeEventListener('resize', updateViewportWidth)
   window.removeEventListener('scroll', measureContainer, true)
-  coarseQuery?.removeEventListener?.('change', updateCoarseOnly)
   surfaceObserver?.disconnect()
+  tabsObserver?.disconnect()
   containerObserver?.disconnect()
   surfaceMutationObserver?.disconnect()
   if (rectFrame) cancelAnimationFrame(rectFrame)
@@ -698,31 +734,63 @@ onBeforeUnmount(() => {
   overflow: visible;
 }
 
-.workbench-host--overlay {
-  position: fixed;
-  z-index: 220;
-  inset:
-    var(--workbench-container-top)
-    var(--workbench-container-end)
-    auto
-    auto;
-  max-width: calc(100vw - var(--workbench-container-end) - 24px);
-  height: var(--workbench-container-height);
-}
-
-.workbench-host--maximized {
-  flex: 1 1 0;
-  width: 100%;
+.workbench-host--single-pane {
   border-inline-start: 0;
 }
 
-.workbench-host--mobile-dialog {
-  position: fixed;
-  z-index: 500;
-  inset: 0;
-  width: 100%;
-  height: 100dvh;
-  border-inline-start: 0;
+/* Opening and closing share one flow track with the chat. Keep DOM content
+   at its destination width while revealing it, so icons/text never scale or
+   wrap through tiny intermediate widths. Native content keeps real slot bounds. */
+.workbench-host--layout-motion,
+.workbench-presence-enter-active,
+.workbench-presence-leave-active {
+  flex-grow: 0;
+  flex-basis: var(--workbench-width);
+  width: var(--workbench-width);
+  overflow: hidden;
+  transition: width var(--dur-base) var(--ease-standard),
+    flex-basis var(--dur-base) var(--ease-standard), opacity var(--dur-base) var(--ease-standard);
+}
+.workbench-host--layout-motion > .workbench-host__chrome,
+.workbench-host--layout-motion > .workbench-host__toolbar,
+.workbench-host--layout-motion:not(.workbench-host--native) > .workbench-host__surface,
+.workbench-presence-enter-active > .workbench-host__chrome,
+.workbench-presence-leave-active > .workbench-host__chrome,
+.workbench-presence-enter-active > .workbench-host__toolbar,
+.workbench-presence-leave-active > .workbench-host__toolbar,
+.workbench-presence-enter-active:not(.workbench-host--native) > .workbench-host__surface,
+.workbench-presence-leave-active:not(.workbench-host--native) > .workbench-host__surface {
+  width: var(--workbench-width);
+  flex-shrink: 0;
+}
+.workbench-presence-enter-from,
+.workbench-presence-leave-to { flex-basis: 0; width: 0; opacity: 0; }
+.workbench-presence-leave-active { pointer-events: none; }
+.workbench-host--direct { transition: none; }
+
+.workbench-host__return-button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  max-width: 45%;
+  min-height: 30px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.workbench-host__return-button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workbench-host__return-button:hover { background: var(--bg-hover); }
+.workbench-host__return-button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+@media (prefers-reduced-motion: reduce) {
+  .workbench-host--layout-motion,
+  .workbench-presence-enter-active,
+  .workbench-presence-leave-active { transition: none; }
 }
 
 .workbench-host__chrome {
@@ -757,7 +825,7 @@ onBeforeUnmount(() => {
   min-width: 0;
   flex: 0 0 auto;
   width: max-content;
-  max-width: 200px;
+  max-width: min(200px, 100%);
   align-items: center;
   color: var(--text-dim);
 }

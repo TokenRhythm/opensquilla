@@ -317,6 +317,7 @@
     },
     "title": "Espace de travail",
     "expand": "Ouvrir l’espace de travail",
+    "returnToChat": "Retour à la discussion",
     "collapse": "Réduire l’espace de travail",
     "maximize": "Agrandir l’espace de travail",
     "restore": "Restaurer l’espace de travail",

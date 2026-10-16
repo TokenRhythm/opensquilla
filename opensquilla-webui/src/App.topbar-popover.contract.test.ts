@@ -17,7 +17,7 @@ describe('App topbar popover contract', () => {
     const keydownEnd = appSource.indexOf('function errorMessage', keydownStart)
     const keydown = appSource.slice(keydownStart, keydownEnd)
     const layerGuard = keydown.indexOf("e.key === 'Escape' && hasOpenDialogLayer()")
-    const drawerFallback = keydown.indexOf("e.key === 'Escape' && appStore.sidebarOpen")
+    const drawerFallback = keydown.indexOf("e.key === 'Escape' && effectiveSidebarOpen.value")
 
     expect(layerGuard).toBeGreaterThan(-1)
     expect(drawerFallback).toBeGreaterThan(layerGuard)

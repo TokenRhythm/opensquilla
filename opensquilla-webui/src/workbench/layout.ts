@@ -4,10 +4,10 @@ export const WORKBENCH_DEFAULT_WIDTH = 520
 export const WORKBENCH_MIN_WIDTH = 360
 export const WORKBENCH_CHAT_MIN_WIDTH = 480
 export const WORKBENCH_MAX_VIEWPORT_RATIO = 0.7
-export const WORKBENCH_SPLIT_MIN_WIDTH = 960
-export const WORKBENCH_MOBILE_MAX_WIDTH = 720
+export const WORKBENCH_DIVIDER_WIDTH = 1
+export const WORKBENCH_SPLIT_MIN_WIDTH = WORKBENCH_CHAT_MIN_WIDTH + WORKBENCH_MIN_WIDTH + WORKBENCH_DIVIDER_WIDTH
 
-export type WorkbenchLayoutMode = 'split' | 'overlay' | 'maximized' | 'mobile-dialog'
+export type WorkbenchLayoutMode = 'split' | 'single-pane'
 export type WorkbenchWidthSource = 'default' | 'user'
 
 export interface WorkbenchWidthPreference {
@@ -18,7 +18,6 @@ export interface WorkbenchWidthPreference {
 
 export interface WorkbenchLayoutInput {
   availableWidth: number
-  coarseOnly?: boolean
   maximized?: boolean
 }
 
@@ -86,9 +85,7 @@ export function parseWorkbenchWidthPreference(
 
 export function workbenchLayoutMode(input: WorkbenchLayoutInput): WorkbenchLayoutMode {
   const width = finiteDimension(input.availableWidth)
-  if (input.coarseOnly || width <= WORKBENCH_MOBILE_MAX_WIDTH) return 'mobile-dialog'
-  if (input.maximized) return 'maximized'
-  if (width < WORKBENCH_SPLIT_MIN_WIDTH) return 'overlay'
+  if (input.maximized || width < WORKBENCH_SPLIT_MIN_WIDTH) return 'single-pane'
   return 'split'
 }
 
@@ -99,14 +96,14 @@ export function workbenchDynamicMax(availableWidth: number): number {
     WORKBENCH_MIN_WIDTH,
     Math.min(
       width * WORKBENCH_MAX_VIEWPORT_RATIO,
-      width - WORKBENCH_CHAT_MIN_WIDTH,
+      width - WORKBENCH_CHAT_MIN_WIDTH - WORKBENCH_DIVIDER_WIDTH,
     ),
   ))
 }
 
 /**
- * Resolve the visual width without mutating the saved preference. Overlay and
- * mobile modes deliberately do not overwrite the desktop split preference.
+ * Resolve the visual width without mutating the saved split preference.
+ * A constrained content area uses one pane in normal layout flow.
  */
 export function workbenchEffectiveWidth(
   preference: WorkbenchWidthPreference,
@@ -115,10 +112,7 @@ export function workbenchEffectiveWidth(
 ): number {
   const normalized = normalizeWorkbenchWidthPreference(preference)
   const width = finiteDimension(availableWidth)
-  if (mode === 'mobile-dialog' || mode === 'maximized') return width
-  if (mode === 'overlay') {
-    return Math.min(normalized.width, Math.max(0, width - 24))
-  }
+  if (mode === 'single-pane') return width
   const preferredWidth = normalized.source === 'default'
     ? Math.round(width / 2)
     : normalized.width
@@ -127,4 +121,16 @@ export function workbenchEffectiveWidth(
     WORKBENCH_MIN_WIDTH,
     workbenchDynamicMax(width),
   )
+}
+
+/** Budget against the outer shell, never the width changed by this decision. */
+export function workbenchShouldYieldSidebar(input: {
+  shellWidth: number
+  sidebarWidth: number
+  workbenchExpanded: boolean
+  sidebarDrawer: boolean
+}): boolean {
+  const shellWidth = finiteDimension(input.shellWidth)
+  return input.workbenchExpanded && !input.sidebarDrawer
+    && shellWidth - finiteDimension(input.sidebarWidth) < WORKBENCH_SPLIT_MIN_WIDTH
 }

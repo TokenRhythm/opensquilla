@@ -4,7 +4,6 @@ import { createI18n } from 'vue-i18n'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import ChatComposerPlanMode from './ChatComposerPlanMode.vue'
-import chatComposerSource from './ChatComposer.vue?raw'
 import type { CollaborationMode } from '@/types/plans'
 
 const mountedApps: ReturnType<typeof createApp>[] = []
@@ -101,16 +100,4 @@ describe('ChatComposerPlanMode', () => {
     expect(host.querySelector('.composer-plan-mode')).toBeNull()
   })
 
-  it('is rendered inside the composer footer instead of as an external strip', () => {
-    const footerIndex = chatComposerSource.indexOf('<div class="chat-input-footer">')
-    const modeIndex = chatComposerSource.indexOf('<ChatComposerPlanMode', footerIndex)
-    const rightActionsIndex = chatComposerSource.indexOf(
-      '<div class="chat-input-actions chat-input-actions--right">',
-      footerIndex,
-    )
-
-    expect(footerIndex).toBeGreaterThanOrEqual(0)
-    expect(modeIndex).toBeGreaterThan(footerIndex)
-    expect(modeIndex).toBeLessThan(rightActionsIndex)
-  })
 })

@@ -51,6 +51,7 @@ async function mountHost(
   }
   document.body.appendChild(host)
   const pinia = createPinia()
+  const width = ref(availableWidth)
   const routeActive = ref(true)
   const modalBlocked = ref(false)
   const onSurfaceRect = vi.fn()
@@ -58,7 +59,7 @@ async function mountHost(
   const Root = defineComponent(() => () => h(
     WorkbenchHost,
     {
-      availableWidth,
+      availableWidth: width.value,
       modalBlocked: modalBlocked.value,
       onSurfaceRect,
       onFocusReturn,
@@ -82,7 +83,7 @@ async function mountHost(
   store.openItem(item('one'))
   app.mount(host)
   await nextTick()
-  return { host, modalBlocked, onSurfaceRect, onFocusReturn, routeActive, store }
+  return { host, modalBlocked, onSurfaceRect, onFocusReturn, routeActive, store, width }
 }
 
 async function mountHostWithDeferredNativeSlot(resizeWithMaximization = false) {
@@ -212,7 +213,7 @@ describe('WorkbenchHost', () => {
     await nextTick()
     await nextTick()
 
-    expect(panel.classList.contains('workbench-host--maximized')).toBe(true)
+    expect(panel.classList.contains('workbench-host--single-pane')).toBe(true)
     expect(panel.style.getPropertyValue('--workbench-width')).toBe('1200px')
     expect(mounted.host.querySelector('[data-testid="workbench-resizer"]')).toBeNull()
     expect(mounted.host.querySelector('[data-testid="panel-one"]')).toBe(content)
@@ -250,10 +251,10 @@ describe('WorkbenchHost', () => {
     expect(panel.classList.contains('workbench-host--conversation')).toBe(true)
   })
 
-  it('keeps the mobile dialog free of a redundant maximize button', async () => {
+  it('keeps a constrained single pane free of a redundant maximize button', async () => {
     const mounted = await mountHost(600)
     expect(mounted.host.querySelector('[data-testid="workbench-maximize"]')).toBeNull()
-    expect(mounted.host.querySelector('[aria-label="Collapse workbench"]')).not.toBeNull()
+    expect(mounted.host.querySelector('[data-testid="workbench-return-chat"]')).not.toBeNull()
   })
 
   it('remeasures the existing native page after maximize and restore', async () => {
@@ -446,76 +447,80 @@ describe('WorkbenchHost', () => {
     expect(mounted.host.querySelector('[data-testid="panel-page-a"]')).toBeNull()
   })
 
-  it('uses a non-modal overlay before switching to a mobile dialog', async () => {
-    const overlay = await mountHost(800)
-    const overlayPanel = overlay.host.querySelector<HTMLElement>('[data-testid="workbench-host"]')!
-    expect(overlayPanel.getAttribute('role')).toBe('complementary')
-    expect(overlayPanel.getAttribute('aria-modal')).toBeNull()
-    expect(overlayPanel.classList.contains('workbench-host--overlay')).toBe(true)
-    expect(overlay.host.querySelector('[data-testid="workbench-resizer"]')).toBeNull()
-
-    const mobile = await mountHost(600)
-    const mobilePanel = mobile.host.querySelector<HTMLElement>('[data-testid="workbench-host"]')!
-    expect(mobilePanel.getAttribute('role')).toBe('dialog')
-    expect(mobilePanel.getAttribute('aria-modal')).toBe('true')
-    expect(mobilePanel.classList.contains('workbench-host--mobile-dialog')).toBe(true)
-    mobilePanel.dispatchEvent(new KeyboardEvent('keydown', {
-      key: 'Escape',
-      bubbles: true,
-      cancelable: true,
-    }))
-    expect(mobile.store.expanded).toBe(false)
+  it('uses a non-modal content pane at every width below the split budget', async () => {
+    for (const width of [840, 800, 600, 390]) {
+      const mounted = await mountHost(width)
+      const panel = mounted.host.querySelector<HTMLElement>('[data-testid="workbench-host"]')!
+      expect(panel.getAttribute('role')).toBe('complementary')
+      expect(panel.getAttribute('aria-modal')).toBeNull()
+      expect(panel.dataset.layoutMode).toBe('single-pane')
+      expect(panel.classList.contains('workbench-host--single-pane')).toBe(true)
+      expect(panel.style.getPropertyValue('--workbench-width')).toBe(`${width}px`)
+      expect(mounted.host.querySelector('[data-testid="workbench-resizer"]')).toBeNull()
+      expect(mounted.host.querySelector('[data-testid="workbench-return-chat"]')).not.toBeNull()
+    }
+    const split = await mountHost(841)
+    expect(split.host.querySelector('[data-testid="workbench-resizer"]')).not.toBeNull()
+    expect(split.host.querySelector('[data-testid="workbench-return-chat"]')).toBeNull()
   })
 
-  it('owns the global mobile dialog, traps focus, closes on Escape, and restores its invoker', async () => {
+  it('returns to chat without a modal trap or closing the mounted child item', async () => {
     const mounted = await mountMobileHostFromInvoker()
     const trigger = mounted.host.querySelector<HTMLButtonElement>('#workbench-invoker')!
     trigger.focus()
     trigger.click()
     await nextTick()
     await nextTick()
-
     const panel = mounted.host.querySelector<HTMLElement>('[data-testid="workbench-host"]')!
-    const collapse = panel.querySelector<HTMLButtonElement>(
-      '[aria-label="Collapse workbench"]',
-    )!
-
-    expect(panel.getAttribute('role')).toBe('dialog')
-    expect(hasOpenDialogLayer()).toBe(true)
-    expect(document.activeElement).toBe(collapse)
-    expect(panel.querySelectorAll('[aria-label="Collapse workbench"]')).toHaveLength(1)
-
-    const tab = new KeyboardEvent('keydown', {
-      key: 'Tab',
-      bubbles: true,
-      cancelable: true,
-    })
-    document.dispatchEvent(tab)
-    expect(tab.defaultPrevented).toBe(true)
-    expect(document.activeElement).toBe(panel.querySelector('[role="tab"]'))
-
-    document.dispatchEvent(new KeyboardEvent('keydown', {
-      key: 'Escape',
-      bubbles: true,
-      cancelable: true,
-    }))
-    await nextTick()
-
-    expect(mounted.store.expanded).toBe(false)
+    const back = panel.querySelector<HTMLButtonElement>('[data-testid="workbench-return-chat"]')!
+    const layer = panel.querySelector('[data-workbench-item-id="one"]')
+    expect(panel.getAttribute('role')).toBe('complementary')
     expect(hasOpenDialogLayer()).toBe(false)
-    // Focus restoration runs after the close flush has released inert DOM.
+    expect(document.activeElement).toBe(back)
+    back.click()
     await nextTick()
-    expect(document.activeElement).toBe(trigger)
+    expect(mounted.store.expanded).toBe(false)
+    expect(mounted.store.activeItemId).toBe('one')
+    expect(mounted.store.items).toHaveLength(1)
+    expect(panel.querySelector('[data-workbench-item-id="one"]')).toBe(layer)
+    expect(panel.hasAttribute('inert')).toBe(true)
+    expect(panel.style.display).toBe('none')
+    trigger.click()
+    await nextTick()
+    expect(panel.querySelector('[data-workbench-item-id="one"]')).toBe(layer)
+  })
+
+  it.each<WorkbenchItem['kind']>([
+    'assistant-chat', 'terminal', 'workspace-files', 'file', 'artifact-preview', 'browser',
+  ])('keeps %s identity and mounted content through split/single-pane resizing', async kind => {
+    const mounted = await mountHost(1200, undefined, true)
+    mounted.store.openItem({ ...item('responsive'), kind })
+    mounted.store.setWidth(600)
+    await nextTick()
+    const panel = mounted.host.querySelector<HTMLElement>('[data-testid="workbench-host"]')!
+    const content = mounted.host.querySelector('[data-testid="panel-responsive"]')
+    const events: string[] = []
+    const unsubscribe = mounted.store.onLifecycle(event => events.push(event.type))
+    mounted.width.value = 840
+    await nextTick()
+    expect(panel.dataset.layoutMode).toBe('single-pane')
+    expect(mounted.host.querySelector('[data-testid="panel-responsive"]')).toBe(content)
+    mounted.width.value = 1200
+    await nextTick()
+    expect(panel.dataset.layoutMode).toBe('split')
+    expect(panel.style.getPropertyValue('--workbench-width')).toBe('600px')
+    expect(mounted.store.activeItemId).toBe('responsive')
+    expect(mounted.host.querySelector('[data-testid="panel-responsive"]')).toBe(content)
+    expect(events).toEqual([])
+    unsubscribe()
   })
 
   it('measures the workspace parent when no width override is supplied', async () => {
     const mounted = await mountHost(undefined, 820)
     await nextTick()
     const panel = mounted.host.querySelector<HTMLElement>('[data-testid="workbench-host"]')!
-
-    expect(panel.classList.contains('workbench-host--overlay')).toBe(true)
-    expect(panel.style.getPropertyValue('--workbench-container-top')).toBe('48px')
-    expect(panel.style.getPropertyValue('--workbench-container-height')).toBe('700px')
+    expect(panel.dataset.layoutMode).toBe('single-pane')
+    expect(panel.style.getPropertyValue('--workbench-width')).toBe('820px')
   })
 
   it('renders a dedicated native surface slot without putting handles in Pinia', async () => {
