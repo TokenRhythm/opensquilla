@@ -460,6 +460,8 @@ async def test_terminal_failed_spawn_cleanup_cancellation_releases_create_slot(
         await asyncio.gather(*manager._cleanup_tasks)
 
 
+# Native console exit must not compete with unrelated parallel worker I/O.
+@pytest.mark.ci_serial
 @pytest.mark.platform_pty
 @pytest.mark.asyncio
 async def test_real_terminal_natural_exit_releases_connection_slot(tmp_path):
@@ -482,7 +484,24 @@ async def test_real_terminal_natural_exit_releases_connection_slot(tmp_path):
             cols=80, rows=24,
         )
         session = manager._sessions[created["terminalId"]]
-        await asyncio.wait_for(asyncio.shield(session.reader_task), timeout=8)
+        reader_task = session.reader_task
+        assert reader_task is not None
+        try:
+            await asyncio.wait_for(asyncio.shield(reader_task), timeout=8)
+        except TimeoutError as exc:
+            event_names = [event for event, _payload in events[-8:]]
+            completed_output = "terminal-completed" in "".join(
+                payload["data"] for event, payload in events if event == "terminal.output"
+            )
+            reader_stack = [
+                f"{frame.f_code.co_name}:{frame.f_lineno}"
+                for frame in reader_task.get_stack(limit=3)
+            ]
+            exc.add_note(
+                f"events={event_names!r}; completed_output={completed_output}; "
+                f"reader_done={reader_task.done()}; reader_stack={reader_stack!r}"
+            )
+            raise
         output = "".join(payload["data"] for event, payload in events if event == "terminal.output")
         assert "terminal-completed" in output
         assert events[-1][0] == "terminal.exit"
