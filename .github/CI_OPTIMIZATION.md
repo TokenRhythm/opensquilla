@@ -397,6 +397,72 @@ The comparison baseline is run `39013705315` at
 Windows profiles cleanup failure. The experiment uses a full remote
 `workflow_dispatch` and preserves its first-attempt result regardless of failure.
 
+The candidate is [run 39018293735](https://github.com/TokenRhythm/opensquilla/actions/runs/39018293735)
+at `0b610ad969761405b57b9378be972183dd969531`, attempt 1, from
+2026-10-17 08:41:14 UTC through the final job at 08:55:08 UTC.
+
+| Metric | Previous run | Six independent profile jobs |
+| --- | ---: | ---: |
+| Complete CI wall time | 14:41 | 13:54 |
+| Executed jobs / planned skips | 134 / 2 | 141 / 2 |
+| Peak simultaneous jobs | 111 | 120 |
+| Summed runner time | 472:59 | 523:51 |
+| Median job-created to start | 2 s | 2 s |
+| Original Windows profiles owner job | 13:20 | 2:49 |
+| Longest job among the original owner and six scripts | 13:20 | 3:56 |
+| All Windows profiles jobs finish, from run creation | 14:30 | 4:55 |
+| First Electron script start through last script end | 550.776 s | 184.236 s |
+| Cumulative six-script execution time | 550.275 s | 387.033 s |
+| Summed Windows profiles job runner time, excluding coverage gate | 13:20 | 15:33 |
+| NSIS build job | 5:11 | 7:57 |
+| NSIS candidate ready, from run creation | 6:20 | 8:56 |
+| Last NSIS acceptance finishes | 10:46 | 13:38 |
+| Windows gateway-sqlite-5 job | 8:19, passed | 13:12, failed |
+
+| Unchanged Electron script | Previous seconds / result | Candidate seconds / result | Candidate job |
+| --- | ---: | ---: | ---: |
+| onboarding-flow | 140.319 / passed | 90.391 / passed | 2:20 |
+| onboarding-first-chat | 22.135 / passed | 22.599 / passed | 1:15 |
+| profile-consolidation-flow | 92.824 / passed | 79.654 / passed | 2:29 |
+| primary-repair-accessibility | 17.671 / passed | 15.579 / passed | 1:22 |
+| profile-import-flow | 170.881 / passed | 164.961 / passed | 3:56 |
+| desktop-cleanup-flow | 106.444 / failed | 13.848 / passed | 1:22 |
+
+All six jobs started at +0:59 on six distinct Windows runners. Their actual
+script execution intervals overlap with peak concurrency six, compared with
+one previously. All six scripts passed exactly once. Downloaded manifests and
+telemetry match the measured SHA/run/attempt, canonical LF hashes match all six
+baseline script contents, and the original owner has zero Electron records.
+The original browser session-hang, modern-session and Router steps all passed,
+taking 76 / 12 / 13 seconds versus 107 / 19 / 21 seconds previously. The required
+coverage job passed at +9:07 after the existing Desktop matrix completed.
+
+The final 143 jobs comprise 139 successes, two planned skips and two failures.
+NSIS passed all 26 jobs. The Windows `gateway-sqlite-5` parallel phase reported
+one failed / 1,518 passed / 6 skipped in 631.25 seconds; its serial phase still
+ran and passed all seven cases in 61.86 seconds. The failure was
+`test_literal_unicode_code_fences_scope_and_utf16[aiosqlite]` in
+`tests/test_session/test_message_search.py`. It was not retried or repaired;
+the required `CI result` gate retained that failure. This is a completed-run
+timing comparison, not a successful full-regression benchmark.
+
+The observed overall reduction is 47 seconds (5.3%). Profiles is no longer on
+the final path: all seven participating Windows jobs finish 575 seconds earlier
+than their previous owner. The remaining tail is NSIS frozen audit / Gateway
+smoke / first interaction finishing at +13:38, Windows gateway-sqlite-5 at
++13:39, NSIS aggregation at +13:43 and the final gate at +13:54. NSIS candidate
+availability moved 156 seconds later despite unchanged build implementation.
+These runs do not establish the cause of that variation. The old cleanup
+failure versus the new pass also changes script work, separately from overlap.
+Do not attribute the entire timing difference to the scheduler change.
+
+Independent runners add preparation work: the seven profiles jobs consume
+933 runner-seconds versus 800 previously, before the coverage gate. Total
+runner time rose by 50:52 (10.8%), including unrelated NSIS and Python timing
+changes. Raw API snapshots, seven execution reports, remote coverage proof,
+SQLite failure log and comparisons are saved under `.cache/ci-timing/round5/`
+and `.cache/ci-timing/round5-comparison/`. No merge into `main` was performed.
+
 ## Test cost and ownership
 
 The ordinary offline suite excludes `stress`. The required `python-stress` suite
