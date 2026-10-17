@@ -1437,6 +1437,7 @@ def test_windows_shard_runner_preserves_failure_exit_and_summary(tmp_path: Path)
     assert metadata_payload["execution"] == {
         "parallel": {
             "dist": "loadfile",
+            "item_parallel_files": [],
             "marker": "(not stress) and (not ci_serial)",
             "workers": 4,
         },
@@ -1449,6 +1450,98 @@ def test_windows_shard_runner_preserves_failure_exit_and_summary(tmp_path: Path)
     assert "serial_pytest_exit_code=5" in text
     assert "junit_status=failed" in text
     assert "synthetic shard failure" in text
+
+
+@pytest.mark.parametrize("fail_case", [False, True])
+def test_audited_bundle_cases_overlap_without_splitting_other_files(
+    tmp_path: Path, fail_case: bool,
+) -> None:
+    """Exercise the real runner, worker scheduling, serial phase and failure gate."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\nmarkers = ["ci_serial: serial CI contract"]\n',
+        encoding="utf-8",
+    )
+    audited_path = "tests/test_observability/test_bundle.py"
+    ordinary_path = next(
+        path for path, owner in partition_assignments().items()
+        if owner == "desktop-installer-contracts-1" and path != audited_path
+    )
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    common = (
+        "import json, os, time\n"
+        "from pathlib import Path\n"
+        "import pytest\n"
+        "EVIDENCE = Path(os.environ['EVIDENCE_DIR'])\n"
+        "WORKER = os.environ.get('PYTEST_XDIST_WORKER')\n"
+    )
+    bundle = tmp_path / audited_path
+    bundle.parent.mkdir(parents=True)
+    bundle.write_text(
+        common
+        + "@pytest.mark.parametrize('case', range(6))\n"
+        "def test_parallel(case):\n"
+        "    assert WORKER is not None\n"
+        "    (EVIDENCE / f'bundle-{case}.json').write_text(json.dumps(WORKER))\n"
+        "    (EVIDENCE / f'worker-{WORKER}.ready').write_text('ready')\n"
+        "    deadline = time.monotonic() + 20\n"
+        "    while len(list(EVIDENCE.glob('worker-*.ready'))) < 2:\n"
+        "        assert time.monotonic() < deadline, 'audited cases did not overlap'\n"
+        "        time.sleep(0.01)\n"
+        "    assert not (case == 3 and os.environ['FAIL_CASE'] == '1'), 'synthetic failure'\n"
+        "@pytest.mark.ci_serial\n"
+        "def test_serial():\n"
+        "    assert WORKER is None\n"
+        "    assert len(list(EVIDENCE.glob('bundle-*.json'))) == 6\n"
+        "    (EVIDENCE / 'serial.txt').write_text('completed')\n",
+        encoding="utf-8",
+    )
+    ordinary = tmp_path / ordinary_path
+    ordinary.parent.mkdir(parents=True, exist_ok=True)
+    ordinary.write_text(
+        common
+        + "@pytest.mark.parametrize('case', range(3))\n"
+        "def test_keeps_file_group(case):\n"
+        "    assert WORKER is not None\n"
+        "    (EVIDENCE / f'ordinary-{case}.json').write_text(json.dumps(WORKER))\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    for key in (
+        "PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT", "PYTEST_XDIST_TESTRUNUID",
+        "OPENSQUILLA_PYTEST_XDIST_SCOPE", "OPENSQUILLA_TEST_CORE_WHEEL",
+        "OPENSQUILLA_TEST_CORE_WHEEL_SHA256",
+    ):
+        env.pop(key, None)
+    env.update(EVIDENCE_DIR=str(evidence), FAIL_CASE=str(int(fail_case)))
+    reports = tmp_path / "reports"
+    result = subprocess.run(
+        [
+            sys.executable, str(SHARD_SCRIPT.resolve()), "run",
+            "desktop-installer-contracts-1", "--root", str(tmp_path),
+            "--junit", str(reports / "junit.xml"),
+            "--summary", str(reports / "summary.txt"),
+            "--metadata", str(reports / "metadata.json"),
+            "--workers", "2", "--", "-q", "-o", "addopts=",
+        ],
+        env=env, text=True, capture_output=True, check=False, timeout=90,
+    )
+    assert result.returncode == int(fail_case), result.stdout + result.stderr
+    bundle_workers = [json.loads(path.read_text()) for path in evidence.glob("bundle-*.json")]
+    assert len(bundle_workers) == 6
+    assert len(set(bundle_workers)) == 2
+    ordinary_workers = [json.loads(path.read_text()) for path in evidence.glob("ordinary-*.json")]
+    assert len(ordinary_workers) == 3
+    assert len(set(ordinary_workers)) == 1
+    assert (evidence / "serial.txt").read_text() == "completed"
+    cases = list(ET.parse(reports / "junit.xml").getroot().iter("testcase"))
+    assert len(cases) == 10
+    assert sum(case.find("failure") is not None for case in cases) == int(fail_case)
+    metadata = json.loads((reports / "metadata.json").read_text())
+    assert metadata["execution"]["parallel"]["item_parallel_files"] == [audited_path]
+    summary = (reports / "summary.txt").read_text()
+    assert f"parallel_pytest_exit_code={int(fail_case)}" in summary
+    assert "serial_pytest_exit_code=0" in summary
 
 
 def test_windows_shard_runner_uses_argfile_for_large_file_selection() -> None:

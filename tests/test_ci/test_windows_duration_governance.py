@@ -303,11 +303,17 @@ def test_duration_builder_requires_all_twenty_execution_shards(tmp_path: Path) -
         load_run_directory(tmp_path / "run-500")
 
 
-@pytest.mark.parametrize("mutation", ["workers", "marker_base", "legacy_and_filtered"])
+@pytest.mark.parametrize("mutation", [
+    "workers", "marker_base", "legacy_and_filtered", "item_parallel_files",
+])
 def test_duration_builder_rejects_execution_drift(tmp_path: Path, mutation: str) -> None:
     observations = _partitioned_observations(tmp_path)
     if mutation == "workers":
         observations[1].execution_by_shard["core-1"]["parallel"]["workers"] = 4
+    elif mutation == "item_parallel_files":
+        observations[1].execution_by_shard["core-1"]["parallel"]["item_parallel_files"] = [
+            "tests/test_core_1.py",
+        ]
     else:
         for index, observation in enumerate(observations):
             if mutation == "legacy_and_filtered" and index == 0:
@@ -321,6 +327,75 @@ def test_duration_builder_rejects_execution_drift(tmp_path: Path, mutation: str)
             observations, expected_assignment_sha256="b" * 64,
             expected_partition_sha256="e" * 64,
         )
+
+
+@pytest.mark.parametrize("item_parallel", [False, True])
+def test_duration_builder_normalizes_item_parallel_policy(
+    tmp_path: Path, item_parallel: bool,
+) -> None:
+    observations = []
+    for index in range(3):
+        run_dir = _write_run(
+            tmp_path, run_id=800 + index, sha="a" * 40,
+            assignment_sha256="b" * 64,
+            seconds={path: float(index + 1) for path in FILES_BY_SHARD.values()},
+            partitioned=True,
+        )
+        for metadata_path in run_dir.rglob("windows-shard-metadata.json"):
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if item_parallel and metadata["shard"] == "core-1":
+                metadata["execution"]["parallel"]["item_parallel_files"] = metadata[
+                    "test_files"
+                ]
+            elif index > 0:
+                # Legacy missing policy and a new explicit empty policy have
+                # exactly the same whole-file scheduling semantics.
+                metadata["execution"]["parallel"]["item_parallel_files"] = []
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        observations.append(load_run_directory(run_dir))
+
+    payload = build_duration_payload(
+        observations, expected_assignment_sha256="b" * 64,
+        expected_partition_sha256="e" * 64,
+    )
+    for source_run in payload["source_runs"]:
+        for shard, execution in source_run["execution"].items():
+            assert execution["parallel"]["item_parallel_files"] == (
+                ["tests/test_core_1.py"] if item_parallel and shard == "core-1" else []
+            )
+
+
+@pytest.mark.parametrize("policy", [
+    None,
+    False,
+    "tests/test_core_1.py",
+    {},
+    [None],
+    ["tests/test_core_1.py", "tests/test_core_1.py"],
+    ["tests/test_other.py", "tests/test_core_1.py"],
+    ["tests/../test_escape.py"],
+    ["tests\\test_core_1.py"],
+    ["/tests/test_core_1.py"],
+    ["tests/helper.py"],
+    ["tests/test_core_1.txt"],
+    ["tests/test_other.py"],
+])
+def test_duration_builder_rejects_invalid_item_parallel_policy(
+    tmp_path: Path, policy: object,
+) -> None:
+    run_dir = _write_run(
+        tmp_path, run_id=850, sha="a" * 40, assignment_sha256="b" * 64,
+        seconds={path: 1.0 for path in FILES_BY_SHARD.values()}, partitioned=True,
+    )
+    metadata_path = (
+        run_dir / "windows-high-risk-core-1-attempt-1" / "windows-shard-metadata.json"
+    )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["execution"]["parallel"]["item_parallel_files"] = policy
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="item_parallel_files|test path"):
+        load_run_directory(run_dir)
 
 
 @pytest.mark.parametrize("marker", [

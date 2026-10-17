@@ -54,9 +54,15 @@ def _load_json(path: Path) -> object:
         raise ValueError(f"cannot read JSON metadata from {path}") from exc
 
 
-def _validated_test_files(raw: object, *, metadata_path: Path) -> tuple[str, ...]:
-    if not isinstance(raw, list) or not raw:
-        raise ValueError(f"missing test_files in {metadata_path}")
+def _validated_test_files(
+    raw: object,
+    *,
+    metadata_path: Path,
+    field_name: str = "test_files",
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    if not isinstance(raw, list) or (not raw and not allow_empty):
+        raise ValueError(f"invalid or missing {field_name} in {metadata_path}")
     files: list[str] = []
     for raw_path in raw:
         if not isinstance(raw_path, str):
@@ -64,6 +70,8 @@ def _validated_test_files(raw: object, *, metadata_path: Path) -> tuple[str, ...
         path = PurePosixPath(raw_path).as_posix()
         if (
             path != raw_path
+            or "\\" in path
+            or ".." in PurePosixPath(path).parts
             or not path.startswith("tests/")
             or not PurePosixPath(path).name.startswith("test_")
             or not path.endswith(".py")
@@ -71,7 +79,7 @@ def _validated_test_files(raw: object, *, metadata_path: Path) -> tuple[str, ...
             raise ValueError(f"invalid test path in {metadata_path}: {raw_path!r}")
         files.append(path)
     if files != sorted(files) or len(files) != len(set(files)):
-        raise ValueError(f"test_files must be unique and sorted in {metadata_path}")
+        raise ValueError(f"{field_name} must be unique and sorted in {metadata_path}")
     return tuple(files)
 
 
@@ -229,7 +237,10 @@ def load_run_directory(run_dir: Path) -> RunObservation:
         serial = execution["serial"]
         if (
             not isinstance(parallel, dict)
-            or set(parallel) != {"workers", "dist", "marker"}
+            or set(parallel) not in (
+                {"workers", "dist", "marker"},
+                {"workers", "dist", "marker", "item_parallel_files"},
+            )
             or type(parallel.get("workers")) is not int
             or parallel["workers"] < 1
             or parallel.get("dist") != "loadfile"
@@ -240,7 +251,19 @@ def load_run_directory(run_dir: Path) -> RunObservation:
             or not _matching_phase_markers(parallel.get("marker"), serial.get("marker"))
         ):
             raise ValueError(f"invalid execution configuration in {metadata_path}")
-        execution_by_shard[str(shard)] = execution
+        item_parallel_files = _validated_test_files(
+            parallel.get("item_parallel_files", []),
+            metadata_path=metadata_path,
+            field_name="item_parallel_files",
+            allow_empty=True,
+        )
+        # Older runners always used whole-file scheduling. Normalize that
+        # implicit policy so explicit [] remains comparable, while an audited
+        # per-item override changes the execution provenance used below.
+        execution_by_shard[str(shard)] = {
+            "parallel": {**parallel, "item_parallel_files": list(item_parallel_files)},
+            "serial": serial,
+        }
         expected_runtime_keys = {
             "python_version",
             "runner_os",
@@ -273,6 +296,8 @@ def load_run_directory(run_dir: Path) -> RunObservation:
         elif runtime_compatibility != common_runtime_compatibility:
             raise ValueError(f"inconsistent runtime compatibility metadata in {run_dir}")
         files = _validated_test_files(payload.get("test_files"), metadata_path=metadata_path)
+        if not set(item_parallel_files).issubset(files):
+            raise ValueError(f"item_parallel_files must be within test_files in {metadata_path}")
         overlap = all_files.intersection(files)
         if overlap:
             sample = sorted(overlap)[:3]

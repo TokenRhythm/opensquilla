@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from functools import cache
 from pathlib import Path, PurePosixPath
-from typing import Final
+from typing import Any, Final
 
 # Skill manifests fingerprint complete bundled trees.  Keep imports performed
 # by this runner and both pytest phases from creating derived files in those
@@ -42,6 +42,12 @@ WINDOWS_SHARD_NAMES: Final[tuple[str, ...]] = tuple(
     for partition in range(1, 9 if family == "gateway-sqlite" else 5)
 )
 DEFAULT_PARALLEL_WORKERS: Final[int] = 4
+# Audited function-scoped synthetic homes/configs allow independent cases in
+# this file to share the existing worker pool. Every other file retains xdist's
+# loadfile grouping, and ci_serial tests still run in their separate phase.
+ITEM_PARALLEL_FILES: Final[frozenset[str]] = frozenset(
+    {"tests/test_observability/test_bundle.py"}
+)
 _CORE_WHEEL_FIXTURE: Final[str] = "isolated_core_wheel"
 _CORE_WHEEL_ENV: Final[str] = "OPENSQUILLA_TEST_CORE_WHEEL"
 _CORE_WHEEL_SHA_ENV: Final[str] = "OPENSQUILLA_TEST_CORE_WHEEL_SHA256"
@@ -113,6 +119,32 @@ _HARD_PINNED_SHARDS: Final[dict[str, str]] = {
 _DURATION_FILE: Final[Path] = Path(__file__).with_name("windows_test_durations.json")
 _ASSIGNMENT_FILE: Final[Path] = Path(__file__).with_name("windows_test_assignments.json")
 _PARTITION_FILE: Final[Path] = Path(__file__).with_name("windows_test_partitions.json")
+
+
+def pytest_xdist_make_scheduler(config: Any, log: Any) -> Any:
+    """Split only audited files into cases while preserving file isolation."""
+
+    if config.getoption("dist", default=None) != "loadfile":
+        return None
+
+    # Keep report/list/metadata operations independent of pytest and xdist.
+    from xdist.scheduler.loadfile import LoadFileScheduling
+
+    class AuditedItemScheduling(LoadFileScheduling):
+        def _split_scope(self, nodeid: str) -> str:
+            if nodeid.split("::", 1)[0] in ITEM_PARALLEL_FILES:
+                return nodeid
+            return super()._split_scope(nodeid)
+
+    return AuditedItemScheduling(config, log)
+
+
+# Equivalent to pytest.hookimpl, without importing pytest for the runner's
+# read-only inventory commands. xdist's default scheduler hook is trylast.
+pytest_xdist_make_scheduler.pytest_impl = {  # type: ignore[attr-defined]
+    "tryfirst": True,
+    "optionalhook": True,
+}
 
 
 # These files are excluded from offline CI by its marker expression.
@@ -648,6 +680,7 @@ def _write_run_metadata(
             "parallel": {
                 "workers": parallel_workers,
                 "dist": "loadfile",
+                "item_parallel_files": sorted(ITEM_PARALLEL_FILES.intersection(files)),
                 "marker": _phase_marker(marker_expression, "not ci_serial"),
             },
             "serial": {
@@ -840,9 +873,10 @@ def _run_pytest_subprocess(root: Path, pytest_args: list[str], *, phase: str) ->
 
     environment = os.environ.copy()
     root_text = str(root)
+    script_directory = str(Path(__file__).resolve().parent)
     existing_pythonpath = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = os.pathsep.join(
-        value for value in (root_text, existing_pythonpath) if value
+        value for value in (script_directory, root_text, existing_pythonpath) if value
     )
     started_at = time.monotonic()
     result = subprocess.run(
@@ -1088,6 +1122,8 @@ def _run(args: argparse.Namespace) -> int:
                 str(args.workers),
                 "--dist",
                 "loadfile",
+                "-p",
+                "windows_test_shards",
                 file_selection_arg,
                 f"--junitxml={parallel_junit}",
             ]
@@ -1095,6 +1131,12 @@ def _run(args: argparse.Namespace) -> int:
                 f"Running parallel bulk phase with {args.workers} workers "
                 "(--dist loadfile; excludes ci_serial)"
             )
+            item_parallel_files = sorted(ITEM_PARALLEL_FILES.intersection(files))
+            if item_parallel_files:
+                print(
+                    "Audited files distributed by individual test case: "
+                    + ", ".join(item_parallel_files)
+                )
             parallel_exit_code = _run_pytest_subprocess(
                 root,
                 parallel_args,

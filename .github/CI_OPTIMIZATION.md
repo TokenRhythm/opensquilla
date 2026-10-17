@@ -187,6 +187,35 @@ Saved `round2-comparison/comparison.json`/`.md`, both paginated API snapshots,
 and `round2/nsis-stage-report.json` under `.cache/ci-timing` preserve the raw
 wall-time and per-case phase evidence.
 
+### Third experiment: audited bundle case scheduling
+
+The second run's longest successful job was Windows
+`desktop-installer-contracts-1` (16:42, finishing at +17:17). Its 66
+`tests/test_observability/test_bundle.py` cases occupied one `loadfile` worker
+for 13:19, versus 8:46 in the first experiment. The source and case inventory
+were unchanged; the reason for the per-case runtime variation is not established.
+
+The bundle isolation audit found function-scoped synthetic config, home,
+SQLite database and ZIP paths. Doctor collection uses a unique temporary
+config copy, migration locks are keyed by database path, and the parent pytest
+configuration already scopes runtime roots by run and worker. The tests that
+patch `json.dumps`, doctor collection, or migration helpers must use separate
+processes rather than concurrent threads. All real collectors, migrations,
+assertions, parameters and the original 66 node IDs remain unchanged.
+
+The shard runner explicitly loads an xdist scheduler that splits only this
+audited file into individual case scopes. Every other file retains `loadfile`
+grouping. Windows desktop still uses two workers and Ubuntu desktop four;
+physical job counts, `ci_serial`, marker filters and failure gates are unchanged.
+Run metadata records the selected `item_parallel_files`, and duration provenance
+rejects pooling observations with different scheduling policies. Behavioral
+contracts verify overlapping cases, whole-file grouping elsewhere, exact-once
+execution and preservation of the serial phase after an injected failure.
+
+The comparison baseline is the complete first attempt of run `38957580252`
+(17:30). Record the new first-attempt result, all failure/coverage evidence,
+critical path and summed runner time before claiming a measured speedup.
+
 ## Test cost and ownership
 
 The ordinary offline suite excludes `stress`. The required `python-stress` suite
