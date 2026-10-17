@@ -51,3 +51,10 @@ The runner also checks native visibility, focus, modal ownership, show events,
 and placement inside the owner's display. Native bounds and event receipts are
 saved alongside the rendered geometry, so a rendered screenshot alone cannot
 satisfy the visibility checks.
+
+The repeated-menu cancellation case injects a lost click acknowledgement only
+after a real button click. Its result explicitly records
+`lateClickAckFaultInjected`; this tests the exception branch, not a naturally
+observed macOS protocol race. A target-closed click error is accepted only with
+a fresh, matching decision IPC receipt from that exact dialog, while the host
+remains alive. All cancellation and retained-draft assertions still run.

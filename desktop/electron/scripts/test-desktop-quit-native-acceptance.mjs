@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
+import { completeClosingDialogClick } from './fixtures/desktop-quit-acceptance/dialog-click.mjs'
 
 const manual = process.argv.includes('--manual')
 const themesOnly = process.argv.includes('--themes-only')
@@ -54,12 +55,40 @@ try {
     for (const page of nativeApp.windows()) if (await page.title() === 'OpenSquilla PR1793 Acceptance') return page
     return null
   }, 'acceptance controller')
+  const nativeProcess = nativeApp.process()
+  const isApplicationRunning = () => !controller.isClosed()
+    && nativeProcess.exitCode === null && nativeProcess.signalCode === null
+  async function clickClosingButton(page, selector, injectLateAck = false) {
+    const expectedResponse = { '#keep': 'cancel', '#background': 'background', '#confirm': 'confirm' }[selector]
+    assert.ok(expectedResponse, 'the closing button has an explicit production response')
+    const dialogWebContentsId = (await nativeDialogState(page)).webContentsId
+    const receiptOptions = { dialogWebContentsId, expectedResponse,
+      readDecisionReceipts: async () => (await state()).dialogResponseReceipts }
+    let injected = false
+    await completeClosingDialogClick({
+      page, isApplicationRunning, ...receiptOptions,
+      click: async () => {
+        const click = () => page.locator(selector).click()
+        if (!injectLateAck) return await click()
+        // A deterministic fixture fault: the real click and production decision
+        // finish first, then only its protocol acknowledgement is reported lost.
+        await completeClosingDialogClick({ page, click, isApplicationRunning, ...receiptOptions })
+        await waitFor(() => page.isClosed(), 'the real click closes its confirmation before ACK fault injection')
+        const error = new Error('locator.click: Target page, context or browser has been closed')
+        error.log = ['  - performing click action']
+        injected = true
+        throw error
+      },
+    })
+    if (injectLateAck) assert.equal(injected, true, 'the late click ACK fault was actually injected')
+  }
   const state = () => controller.evaluate(() => window.quitAcceptance.snapshot())
   const command = (action, options) => controller.evaluate(([name, payload]) => window.quitAcceptance.command(name, payload), [action, options])
   const nativeDialogState = async page => {
     const handle = await nativeApp.browserWindow(page)
     try {
-      const native = await handle.evaluate(window => ({ id: window.id, visible: window.isVisible(), focused: window.isFocused(),
+      const native = await handle.evaluate(window => ({ id: window.id, webContentsId: window.webContents.id,
+        visible: window.isVisible(), focused: window.isFocused(),
         modal: window.isModal(), enabled: window.isEnabled(), opacity: window.getOpacity(), bounds: window.getBounds(),
         contentBounds: window.getContentBounds(), parentEnabled: window.getParentWindow()?.isEnabled() ?? null,
         parentBounds: window.getParentWindow()?.getBounds() ?? null }))
@@ -126,11 +155,16 @@ try {
       && value.taskAlive && value.ticks > 0 && value.pages === 1 && !value.confirmationPending && value.phase === 'running' }, 'fresh synthetic session')
     await controller.locator('#behavior').selectOption(behavior)
   }
-  async function canceled(label, click = '#keep') {
+  async function canceled(label, click = '#keep', injectLateAck = false) {
     const prompt = await dialog()
-    await prompt.locator(click).click()
+    await clickClosingButton(prompt, click, injectLateAck)
     await waitFor(async () => !(await state()).confirmationPending, label)
     const value = await state()
+    assert.equal(value.ownerVisible, true, `${label}: the owner remains visible`)
+    assert.equal(value.phase, 'running', `${label}: the app remains running`)
+    assert.equal(value.quitConfirmed, false, `${label}: quit was not authorized`)
+    assert.equal(value.writerClosed, false, `${label}: writer admission remains open`)
+    assert.equal(value.ledger.acceptedExit, 0, `${label}: no exit was accepted`)
     assert.equal(value.pages, 1, `${label}: page retained`)
     assert.equal(value.taskAlive, true, `${label}: actual synthetic process retained`)
     assert.equal(value.ledger.drain, 0, `${label}: no cleanup started`)
@@ -220,7 +254,7 @@ try {
         await controller.locator('#closeMain').click()
         prompt = await dialog()
         await prompt.locator('#remember').check()
-        await prompt.locator('#background').click()
+        await clickClosingButton(prompt, '#background')
         await waitFor(async () => { const value = await state(); return !value.confirmationPending && !value.ownerVisible }, 'remember background')
         value = await state()
         assert.equal(value.behavior, 'background')
@@ -237,9 +271,9 @@ try {
       prompt = await dialog()
       assert.equal(await prompt.locator('#background').count(), 0, 'real Quit has the unified two-choice dialog')
       await screenshot(prompt, 'quit-active-pages')
-      value = await canceled('cancel repeated menu Quit')
+      value = await canceled('cancel repeated menu Quit', '#keep', true)
       assert.equal(value.dialogCount, 1, 'repeated quits share one decision')
-      results.push({ name: 'menu-quit-cancel-single-flight', passed: true })
+      results.push({ name: 'menu-quit-cancel-single-flight', passed: true, lateClickAckFaultInjected: true })
 
       for (const activity of ['idle', 'unknown']) {
         await reset('ask')
@@ -267,7 +301,7 @@ try {
       await controller.locator('#holdWriter').click()
       await controller.locator('#quit').click()
       prompt = await dialog()
-      await prompt.locator('#confirm').click()
+      await clickClosingButton(prompt, '#confirm')
       await waitFor(async () => (await state()).phase === 'deferred', 'accepted decision waits for profile writer')
       assert.equal((await state()).pages, 1)
       await command('add-page')
@@ -284,7 +318,7 @@ try {
       await controller.locator('#cleanupFailure').check()
       await controller.locator('#quit').click()
       prompt = await dialog()
-      await prompt.locator('#confirm').click()
+      await clickClosingButton(prompt, '#confirm')
       await waitFor(async () => (await state()).phase === 'failed', 'failed cleanup keeps recoverable fixture alive')
       value = await state()
       assert.equal(value.taskAlive, true)
@@ -330,7 +364,7 @@ try {
         await controller.locator('#closeMain').click()
         prompt = await dialog()
         await prompt.locator('#remember').check()
-        await prompt.locator('#confirm').click()
+        await clickClosingButton(prompt, '#confirm')
         await waitFor(async () => (await state()).ledger.acceptedExit === 1, 'Ask Quit reaches the production exit boundary')
         value = await state()
         assert.equal(value.behavior, 'quit')

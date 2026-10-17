@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { runInNewContext } from 'node:vm'
 import ts from '@typescript/typescript6'
+import { completeClosingDialogClick } from './fixtures/desktop-quit-acceptance/dialog-click.mjs'
 
 import {
   buildDesktopQuitDialogHtml,
@@ -23,6 +24,49 @@ for (const invalid of [
 ]) assert.equal(parseDesktopQuitDialogResponse(invalid), null)
 assert.equal(parseDesktopQuitDialogResponse('confirm '), null)
 assert.equal(parseDesktopQuitDialogResponse(null), null)
+
+const closedClickMessage = 'locator.click: Target page, context or browser has been closed'
+function clickFailure(message = closedClickMessage, dispatched = true) {
+  const error = new Error(message)
+  error.log = [dispatched ? '  - performing click action' : '  - waiting for locator(\'#keep\')']
+  return error
+}
+async function checkClickFailure({ initiallyClosed = false, closes = true, running = true,
+  error = clickFailure(), allowed = false, expectedResponse = 'cancel',
+  beforeReceipts = [{ sequence: 1, webContentsId: 41, response: 'cancel' }],
+  newReceipts = [{ sequence: 2, webContentsId: 41, response: 'cancel' }], receiptReadFailsAfterClick = false }) {
+  let closed = initiallyClosed
+  let clicks = 0
+  let receipts = beforeReceipts
+  const action = completeClosingDialogClick({
+    page: { isClosed: () => closed }, isApplicationRunning: () => running,
+    dialogWebContentsId: 41, expectedResponse,
+    readDecisionReceipts: async () => {
+      if (clicks && receiptReadFailsAfterClick) throw new Error('controller unexpectedly closed')
+      return receipts
+    },
+    click: async () => { clicks += 1; closed = closes; receipts = [...beforeReceipts, ...newReceipts]; throw error },
+  })
+  if (allowed) await action
+  else await assert.rejects(action, actual => actual === error, 'preserve the original click failure')
+  assert.equal(clicks, 1, 'the helper never retries a click')
+}
+await checkClickFailure({ allowed: true })
+await checkClickFailure({ error: clickFailure('locator.click: Timeout 10000ms exceeded') })
+await checkClickFailure({ closes: false })
+await checkClickFailure({ initiallyClosed: true })
+await checkClickFailure({ running: false })
+await checkClickFailure({ error: clickFailure(closedClickMessage, false) })
+const messageOnlyClickFailure = new Error(`${closedClickMessage}\nCall log:\n  - performing click action`)
+await checkClickFailure({ error: messageOnlyClickFailure, allowed: true })
+await checkClickFailure({ error: new Error(closedClickMessage) })
+await checkClickFailure({ newReceipts: [] }) // Native close fallback is not a button decision.
+await checkClickFailure({ newReceipts: [{ sequence: 2, webContentsId: 99, response: 'cancel' }] })
+await checkClickFailure({ newReceipts: [{ sequence: 2, webContentsId: 41, response: 'confirm' }] })
+await checkClickFailure({ newReceipts: [{ sequence: 1, webContentsId: 41, response: 'cancel' }] })
+await checkClickFailure({ receiptReadFailsAfterClick: true })
+for (const response of ['background', 'confirm']) await checkClickFailure({ allowed: true, expectedResponse: response,
+  newReceipts: [{ sequence: 2, webContentsId: 41, response }] })
 
 const html = buildDesktopQuitDialogHtml({
   lang: 'zh-Hans',

@@ -59,8 +59,20 @@ const settings = { behavior: 'ask', locale: 'en', theme: 'light', activity: 'act
   manualNativeErrors: process.argv.includes('--manual-native-errors') }
 const logs = []
 const nativeWindowEvents = []
+const dialogResponseReceipts = []
+let dialogResponseSequence = 0
 const ledger = { hide: 0, quitRequests: 0, drain: 0, acceptedExit: 0, errorBoxes: [], savedPreferences: [], dialogWindows: [] }
-const persistEvents = () => writeFileSync(join(profile, 'events.json'), JSON.stringify({ ledger, logs, nativeWindowEvents }, null, 2))
+const persistEvents = () => writeFileSync(join(profile, 'events.json'), JSON.stringify({ ledger, logs, nativeWindowEvents, dialogResponseReceipts }, null, 2))
+// Observe real preload IPC before the production listener can close its sender.
+// Recording only the production parser's accepted decisions excludes malformed
+// messages; no fixture command fabricates a response or clicks a confirmation.
+ipcMain.on('desktop:quit-dialog-response', (event, value) => {
+  const response = parseDesktopQuitDialogResponse(value)
+  if (!response) return
+  dialogResponseReceipts.push({ sequence: ++dialogResponseSequence, webContentsId: event.sender.id, response })
+  if (dialogResponseReceipts.length > 80) dialogResponseReceipts.shift()
+  persistEvents()
+})
 const log = (event, detail = {}) => {
   logs.push({ event, ...detail })
   if (logs.length > 100) logs.shift()
@@ -112,7 +124,8 @@ function snapshot() {
     writerActive: env?.desktopWriters.activeCount, writerClosed: env?.desktopWriters.closed,
     confirmationPending: env?.quitConfirmationPromise !== null,
     ownerVisible: Boolean(owner && !owner.isDestroyed() && owner.isVisible()), dialogCount, ledger, logs: logs.slice(-8),
-    nativeWindows: BrowserWindow.getAllWindows().map(nativeWindowState), nativeWindowEvents: nativeWindowEvents.slice(-80) }
+    nativeWindows: BrowserWindow.getAllWindows().map(nativeWindowState), nativeWindowEvents: nativeWindowEvents.slice(-80),
+    dialogResponseReceipts }
 }
 function renderOwner() {
   if (!owner || owner.isDestroyed() || owner.webContents.isDestroyed()) return
