@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Stable shared Ubuntu and Windows execution partitions within four unchanged responsibility families. Gateway/SQLite has eight partitions; every other family has four. Historical source_runs, seed_allocation and gateway_sqlite_repartition below describe earlier layouts. current_repartition records the allocation seed for this twenty-partition snapshot, not measured runtime or speedup. New files use the SHA-256 path fallback within their family until reviewed into this snapshot.",
+  "description": "Stable shared Ubuntu and Windows execution partitions within four unchanged responsibility families. Gateway/SQLite has eight partitions; every other family has four. Historical source_runs, seed_allocation and gateway_sqlite_repartition below describe earlier layouts. current_repartition records the allocation seed for this twenty-partition snapshot, not measured runtime or speedup. New files use the SHA-256 path fallback within their family until reviewed into this snapshot. Windows-only gateway-sqlite-9..11 use the reviewed whole-file windows_overrides overlay from shared gateway-sqlite-5; Ubuntu and new-file fallback retain the shared twenty-partition map.",
   "source_runs": [
     {
       "id": 35246780003,
@@ -2475,5 +2475,89 @@
       "desktop-installer-contracts-3": 171.545,
       "desktop-installer-contracts-4": 171.544
     }
+  },
+  "windows_overrides": {
+    "gateway-sqlite-9": [
+      "tests/functional/test_gateway_attachment_history_e2e.py",
+      "tests/test_attachment_workspace.py",
+      "tests/test_cli/test_agent_cmd.py",
+      "tests/test_gateway/test_artifact_product_errors.py",
+      "tests/test_gateway/test_bundle_routes.py",
+      "tests/test_gateway/test_config_secret_inheritance.py",
+      "tests/test_gateway/test_p1a_exact_abort_contract.py",
+      "tests/test_gateway/test_prompt_annotations.py",
+      "tests/test_gateway/test_recovery_scheduler.py",
+      "tests/test_gateway/test_rpc_onboarding_errors.py",
+      "tests/test_gateway/test_rpc_sessions_attachments.py",
+      "tests/test_gateway/test_session_model_routing.py",
+      "tests/test_gateway/test_sessions_bootstrap_history_characterization.py",
+      "tests/test_gateway/test_task_runtime_terminal_message.py",
+      "tests/test_gateway/test_tree_cancellation_successor.py",
+      "tests/test_gateway/test_turn_ingress_fork.py",
+      "tests/test_persistence/test_turn_error_writer.py",
+      "tests/test_readme_links.py",
+      "tests/test_session/test_compaction_dispatcher.py",
+      "tests/test_session/test_compaction_lifecycle.py",
+      "tests/test_session/test_compaction_media_budget.py",
+      "tests/test_session/test_epoch_no_rollback.py"
+    ],
+    "gateway-sqlite-10": [
+      "tests/contracts/test_sessions_resolve_contract.py",
+      "tests/test_application/test_conversation_runtime.py",
+      "tests/test_compat/test_aiosqlite.py",
+      "tests/test_gateway/test_admission_preparation.py",
+      "tests/test_gateway/test_artifacts_download.py",
+      "tests/test_gateway/test_channel_dispatch_ghost_turn.py",
+      "tests/test_gateway/test_config_path_expansion.py",
+      "tests/test_gateway/test_force_reset_drain.py",
+      "tests/test_gateway/test_rpc_channels.py",
+      "tests/test_gateway/test_session_model_selection_rpc.py",
+      "tests/test_gateway/test_task_runtime_storage_contention.py",
+      "tests/test_gateway/test_turn_admission_composition.py",
+      "tests/test_gateway/test_usage_query.py",
+      "tests/test_gateway/test_websocket_handshake.py",
+      "tests/test_health/test_evaluator_tier_provider_mismatch.py",
+      "tests/test_observability/test_decision_log_cost_source.py",
+      "tests/test_runtime_packs/test_catalog.py",
+      "tests/test_scheduler/test_startup_catchup_every.py",
+      "tests/test_search/test_normalize.py",
+      "tests/test_search/test_search_availability.py",
+      "tests/test_session/test_message_search.py",
+      "tests/test_session/test_storage_transaction_timing.py"
+    ],
+    "gateway-sqlite-11": [
+      "tests/test_channels/test_feishu_reactions.py",
+      "tests/test_engine/test_router_budget_gate.py",
+      "tests/test_engine/turn_runner/test_input_stage_snapshot.py",
+      "tests/test_gateway/test_channel_notices.py",
+      "tests/test_gateway/test_content_read_route.py",
+      "tests/test_gateway/test_goal_plan_rpc_admission.py",
+      "tests/test_gateway/test_health_view_static.py",
+      "tests/test_gateway/test_metrics_counters.py",
+      "tests/test_gateway/test_plan_cancel_tree.py",
+      "tests/test_gateway/test_rpc_chat_branch_edit.py",
+      "tests/test_gateway/test_rpc_tools_visibility.py",
+      "tests/test_gateway/test_task_runtime_cancellation_settlement.py",
+      "tests/test_gateway/test_windows_long_media_paths.py",
+      "tests/test_gateway/test_working_file_actions.py",
+      "tests/test_gateway/test_workspace_references.py",
+      "tests/test_onboarding/test_channel_specs.py",
+      "tests/test_persistence/test_product_retirement.py",
+      "tests/test_scheduler/test_current_target_fallback.py",
+      "tests/test_scheduler/test_schedule_normalizer.py",
+      "tests/test_search/test_iqs_provider.py",
+      "tests/test_search/test_search_max_results_contract.py",
+      "tests/test_session/test_compaction_revision_admission.py",
+      "tests/test_session/test_naming_refusal.py"
+    ]
+  },
+  "windows_override_source": {
+    "run_id": 39018293735,
+    "sha": "0b610ad969761405b57b9378be972183dd969531",
+    "shard": "gateway-sqlite-5",
+    "evidence_kind": "single_run_whole_file_allocation_seed",
+    "source_file_count": 92,
+    "source_case_count": 1532,
+    "note": "Testcase duration sums are allocation weights, not predicted wall time or measured speedup. All seven ci_serial cases remain in gateway-sqlite-5."
   }
 }

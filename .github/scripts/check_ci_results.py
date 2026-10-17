@@ -117,7 +117,7 @@ WINDOWS_BUNDLE_RESULTS: Final[frozenset[str]] = frozenset(
 WINDOWS_PHYSICAL_SHARDS: Final[frozenset[str]] = frozenset(
     f"{family}-{partition}"
     for family in ("core", "gateway-sqlite", "recovery-migration", "desktop-installer-contracts")
-    for partition in range(1, 9 if family == "gateway-sqlite" else 5)
+    for partition in range(1, 12 if family == "gateway-sqlite" else 5)
 )
 WINDOWS_PROFILES_SHARDS: Final[frozenset[str]] = frozenset({
     "profiles-onboarding-flow",

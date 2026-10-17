@@ -25,6 +25,9 @@ _WINDOWS_ASSIGNMENTS_PATH_KEY: Final = "_windows_test_assignments_path"
 _LOADED_WINDOWS_ASSIGNMENTS_KEY: Final = "_loaded_windows_test_assignments"
 _WINDOWS_PARTITIONS_CONFIG_KEY: Final = "windows_test_partitions"
 _WINDOWS_PARTITIONS_PATH_KEY: Final = "_windows_test_partitions_path"
+_WINDOWS_GATEWAY_SPLIT_SHARDS: Final[frozenset[str]] = frozenset(
+    f"gateway-sqlite-{partition}" for partition in range(9, 12)
+)
 _MACOS_RECOVERY_TEST_INPUTS_KEY: Final = "macos_recovery_test_inputs"
 _MERGE_CRITICAL_INPUTS_KEY: Final = "_merge_critical_inputs"
 WINDOWS_PROFILES_SHARDS: Final[tuple[str, ...]] = (
@@ -449,7 +452,8 @@ _FIXED_PLATFORM_MATRIX: Final[dict[str, tuple[tuple[str, str], ...]]] = {
         ("windows-2022", "build"),
         ("windows-2022", "windows-webui-build"),
         ("windows-2022", "windows-package-contracts"),
-        ("windows-2022", "packaged-security"),
+        *(("windows-2022", f"packaged-security-{check}")
+          for check in ("dependency-audit", "gateway-smoke", "first-interaction")),
         ("windows-2022", "wheelhouse-core"),
         ("windows-2022", "wheelhouse-recommended"),
         *(("windows-2022", f"candidate-{probe}")
@@ -614,8 +618,9 @@ def _load_windows_test_partitions(
     if not isinstance(value, dict) or value.get("schema_version") != 1:
         raise PlanError("unsupported Windows test partition schema")
     partitions = value.get("partitions")
-    if not isinstance(partitions, dict) or set(partitions) != allowed_shards:
-        raise PlanError("Windows test partitions must define every physical shard exactly once")
+    shared_shards = allowed_shards - _WINDOWS_GATEWAY_SPLIT_SHARDS
+    if not isinstance(partitions, dict) or set(partitions) != shared_shards:
+        raise PlanError("Windows test partitions must define every shared shard exactly once")
     physical: dict[str, str] = {}
     for shard, raw_paths in partitions.items():
         paths = _require_string_list(raw_paths, f"Windows partition {shard!r}")
@@ -638,8 +643,30 @@ def _load_windows_test_partitions(
             if family is not None and shard.rsplit("-", 1)[0] != family:
                 raise PlanError(f"Windows test partition changed family ownership: {test_path}")
             physical[test_path] = str(shard)
+    overrides = value.get("windows_overrides")
+    if (
+        not _WINDOWS_GATEWAY_SPLIT_SHARDS <= allowed_shards
+        or not isinstance(overrides, dict)
+        or set(overrides) != _WINDOWS_GATEWAY_SPLIT_SHARDS
+    ):
+        raise PlanError("Windows overrides must define gateway-sqlite-9 through 11 exactly once")
+    moved: set[str] = set()
+    for shard, raw_paths in overrides.items():
+        paths = _require_string_list(raw_paths, f"Windows override {shard!r}")
+        if paths != sorted(set(paths)):
+            raise PlanError(f"Windows override paths must be unique and sorted: {shard}")
+        for test_path in paths:
+            if test_path in moved:
+                raise PlanError(f"duplicate Windows override: {test_path}")
+            if physical.get(test_path) != "gateway-sqlite-5":
+                raise PlanError(
+                    f"Windows override must retain gateway-sqlite-5 ownership: {test_path}"
+                )
+            moved.add(test_path)
+            physical[test_path] = shard
     partitions_by_family: dict[str, list[str]] = {}
-    for shard in sorted(allowed_shards):
+    # Keep the shared fallback stable: only explicitly reviewed files move.
+    for shard in sorted(shared_shards):
         partitions_by_family.setdefault(shard.rsplit("-", 1)[0], []).append(shard)
     return {
         test_path: physical.get(test_path)
@@ -737,6 +764,12 @@ def load_config(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
             raise PlanError(
                 f"full_python_matrix {platform_name} must partition every responsibility family"
             )
+    ubuntu_shards = set(python_matrix["ubuntu"])
+    if (
+        ubuntu_shards & _WINDOWS_GATEWAY_SPLIT_SHARDS
+        or set(python_matrix["windows"]) != ubuntu_shards | _WINDOWS_GATEWAY_SPLIT_SHARDS
+    ):
+        raise PlanError("full_python_matrix must retain the three Windows-only Gateway partitions")
 
     assignments_path = value.get(_WINDOWS_ASSIGNMENTS_CONFIG_KEY)
     if (

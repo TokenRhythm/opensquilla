@@ -23,6 +23,7 @@ SHARD_MODULE: dict[str, Any] = runpy.run_path(
 )
 SHARD_NAMES: tuple[str, ...] = SHARD_MODULE["SHARD_NAMES"]
 WINDOWS_SHARD_NAMES: tuple[str, ...] = SHARD_MODULE["WINDOWS_SHARD_NAMES"]
+SHARED_SHARD_NAMES: tuple[str, ...] = SHARD_MODULE["SHARED_SHARD_NAMES"]
 discover_test_files = SHARD_MODULE["discover_test_files"]
 files_for_shard = SHARD_MODULE["files_for_shard"]
 files_for_planned_windows_shards = SHARD_MODULE["files_for_planned_windows_shards"]
@@ -404,7 +405,7 @@ def test_only_fixture_consuming_shards_prebuild_the_core_wheel(
     consumers = {
         shard_family(shard)
         for shard in shard_names
-        if requires_isolated_core_wheel(root, files_for_shard(root, shard))
+        if requires_isolated_core_wheel(root, files_for_shard(root, shard, platform="windows"))
     }
 
     assert consumers == {"core", "desktop-installer-contracts"}
@@ -981,12 +982,13 @@ def test_windows_execution_partitions_cover_every_file_once_within_its_family() 
     assignments = partition_assignments()
     assert set(assignments) <= discovered
     physical_files = {
-        shard: set(validated_files_for_shard(root, shard)) for shard in WINDOWS_SHARD_NAMES
+        shard: set(validated_files_for_shard(root, shard, platform="windows"))
+        for shard in WINDOWS_SHARD_NAMES
     }
-    assert len(physical_files) == 20
+    assert len(physical_files) == 23
     catalog = json.loads(Path(".github/ci/suites.v1.json").read_text(encoding="utf-8"))
     assert tuple(catalog["full_python_matrix"]["windows"]) == WINDOWS_SHARD_NAMES
-    assert tuple(catalog["full_python_matrix"]["ubuntu"]) == WINDOWS_SHARD_NAMES
+    assert tuple(catalog["full_python_matrix"]["ubuntu"]) == SHARED_SHARD_NAMES
     assert tuple(catalog["python_shard_families"]) == SHARD_NAMES
     assert all(physical_files.values())
     assert set().union(*physical_files.values()) == discovered
@@ -994,21 +996,23 @@ def test_windows_execution_partitions_cover_every_file_once_within_its_family() 
     for family in SHARD_NAMES:
         family_files = [paths for shard, paths in physical_files.items()
                         if shard_family(shard) == family]
-        assert len(family_files) == (8 if family == "gateway-sqlite" else 4)
+        assert len(family_files) == (11 if family == "gateway-sqlite" else 4)
         assert set().union(*family_files) == set(files_for_shard(root, family))
     for path, physical in assignments.items():
         assert shard_family(physical) == shard_for_test(path)
-        assert windows_shard_for_test(path) == physical
+        expected = SHARD_MODULE["windows_partition_overrides"]().get(path, physical)
+        assert windows_shard_for_test(path) == expected
 
 
 def test_planned_windows_inventory_preserves_owners_for_matrix_subsets(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
     # Retain every nonempty plan over the original ten physical labels, then
-    # add every singleton, pair, omitted-owner boundary, and full twenty-cell
+    # add every singleton, pair, omitted-owner boundary, and full matrix
     # plan. This preserves the original exhaustive check without expanding to
-    # a million inventory scans over all twenty-cell combinations.
+    # a million inventory scans over all matrix combinations.
+    effective = {**partition_assignments(), **SHARD_MODULE["windows_partition_overrides"]()}
     samples = {
-        shard: next(path for path, owner in partition_assignments().items() if owner == shard)
+        shard: next(path for path, owner in effective.items() if owner == shard)
         for shard in WINDOWS_SHARD_NAMES
     }
     for path in samples.values():
@@ -1062,7 +1066,7 @@ def test_planned_windows_inventory_cli_propagates_collection_failure(
 def test_windows_partitions_stay_fixed_when_duration_weights_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assignments = dict(partition_assignments())
+    assignments = {**partition_assignments(), **SHARD_MODULE["windows_partition_overrides"]()}
     before = partition_snapshot_fingerprint()
 
     def unexpected_weight_access() -> dict[str, float]:
@@ -1097,6 +1101,113 @@ def test_gateway_new_file_fallback_uses_all_eight_partitions() -> None:
     assert {windows_shard_for_test(path) for path in paths} == {
         f"gateway-sqlite-{partition}" for partition in range(1, 9)
     }
+    assert all(
+        windows_shard_for_test(path)
+        == SHARD_MODULE["execution_shard_for_test"](path, platform="ubuntu")
+        for path in paths
+    )
+
+
+def test_windows_gateway_overlay_preserves_source_inventory_and_ubuntu_snapshot() -> None:
+    root = Path.cwd()
+    source = "gateway-sqlite-5"
+    extras = SHARD_MODULE["WINDOWS_EXTRA_SHARD_NAMES"]
+    original = set(validated_files_for_shard(root, source, platform="ubuntu"))
+    groups = {shard: set(validated_files_for_shard(root, shard, platform="windows"))
+              for shard in (source, *extras)}
+    source_snapshot = {path for path, shard in partition_assignments().items() if shard == source}
+    assert len(source_snapshot) == 92
+    assert [len(groups[shard] & source_snapshot) for shard in (source, *extras)] == [25, 22, 22, 23]
+    assert set().union(*groups.values()) == original
+    assert sum(map(len, groups.values())) == len(original)
+    serial_files = {
+        "tests/functional/test_gateway_stop_process_tree_e2e.py",
+        "tests/test_gateway/test_manual_compaction_contract.py",
+        "tests/test_gateway/test_plan_rpc.py",
+    }
+    assert serial_files <= groups[source]
+    # This is the actual round-5 partition hash, before the Windows-only move.
+    assert partition_snapshot_fingerprint(platform="ubuntu") == (
+        "0591c1457e43e3cb61ae8d367ff02757692644f1cd4356754282cca9a9dc4f71"
+    )
+    assert partition_snapshot_fingerprint() != partition_snapshot_fingerprint(platform="ubuntu")
+    for shard in SHARED_SHARD_NAMES:
+        if shard != source:
+            assert files_for_shard(root, shard, platform="windows") == files_for_shard(
+                root, shard, platform="ubuntu",
+            )
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing_target", "unknown_target", "wrong_source", "new_file", "duplicate",
+    "duplicate_within", "unsorted", "not_list", "non_string",
+])
+def test_windows_gateway_overlay_rejects_invalid_ownership(mutation: str) -> None:
+    payload = json.loads(Path(".github/scripts/windows_test_partitions.json").read_text())
+    overrides = payload["windows_overrides"]
+    if mutation == "missing_target":
+        del overrides["gateway-sqlite-9"]
+    elif mutation == "unknown_target":
+        overrides["gateway-sqlite-12"] = overrides.pop("gateway-sqlite-9")
+    elif mutation == "wrong_source":
+        overrides["gateway-sqlite-9"] = payload["partitions"]["gateway-sqlite-4"][:1]
+    elif mutation == "new_file":
+        overrides["gateway-sqlite-9"] = ["tests/test_gateway/test_new_unreviewed.py"]
+    elif mutation == "duplicate":
+        overrides["gateway-sqlite-10"] = overrides["gateway-sqlite-9"][:1]
+    elif mutation == "duplicate_within":
+        overrides["gateway-sqlite-9"] = overrides["gateway-sqlite-9"][:1] * 2
+    elif mutation == "unsorted":
+        overrides["gateway-sqlite-9"].reverse()
+    elif mutation == "not_list":
+        overrides["gateway-sqlite-9"] = {}
+    elif mutation == "non_string":
+        overrides["gateway-sqlite-9"] = [None]
+    with pytest.raises(ValueError, match="windows_overrides"):
+        validate_partition_payload(payload)
+
+
+@pytest.mark.parametrize("host,target", [("Windows", "windows"), ("Linux", "ubuntu")])
+def test_execution_inventory_uses_native_or_explicit_platform(
+    host: str, target: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selector = SHARD_MODULE["execution_shard_for_test"]
+    monkeypatch.setattr(selector.__globals__["platform"], "system", lambda: host)
+    path, destination = next(iter(SHARD_MODULE["windows_partition_overrides"]().items()))
+    assert selector(path) == (destination if target == "windows" else "gateway-sqlite-5")
+    assert windows_shard_for_test(path) == destination
+    assert selector(path, platform="ubuntu") == "gateway-sqlite-5"
+    assert selector(path, platform="windows") == destination
+    for getter in (files_for_shard, validated_files_for_shard):
+        with pytest.raises(ValueError, match="Windows-only shard"):
+            getter(Path.cwd(), destination, platform="ubuntu")
+
+
+@pytest.mark.parametrize("target", ["windows", "ubuntu"])
+def test_planned_cli_uses_target_platform_for_overlay_owners(
+    target: str, capsys: pytest.CaptureFixture[str],
+) -> None:
+    path, destination = next(iter(SHARD_MODULE["windows_partition_overrides"]().items()))
+    shard = destination if target == "windows" else "gateway-sqlite-5"
+    args = SHARD_MODULE["_parser"]().parse_args([
+        "list", shard, "--platform", target, "--planned-windows-shards", json.dumps([shard]),
+    ])
+    assert args.handler(args) == 0
+    assert path in capsys.readouterr().out.splitlines()
+
+
+def test_overlay_change_is_bound_to_windows_partition_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = partition_snapshot_fingerprint()
+    ubuntu = partition_snapshot_fingerprint(platform="ubuntu")
+    overlay = dict(SHARD_MODULE["windows_partition_overrides"]())
+    overlay.pop(next(iter(overlay)))
+    monkeypatch.setitem(
+        partition_snapshot_fingerprint.__globals__, "windows_partition_overrides", lambda: overlay,
+    )
+    assert partition_snapshot_fingerprint() != before
+    assert partition_snapshot_fingerprint(platform="ubuntu") == ubuntu
 
 
 @pytest.mark.parametrize(
@@ -1110,7 +1221,7 @@ def test_gateway_new_file_fallback_uses_all_eight_partitions() -> None:
     ],
 )
 def test_windows_partition_snapshot_rejects_invalid_coverage(case: str, message: str) -> None:
-    partitions: dict[str, list[str]] = {shard: [] for shard in WINDOWS_SHARD_NAMES}
+    partitions: dict[str, list[str]] = {shard: [] for shard in SHARED_SHARD_NAMES}
     if case == "missing_partition":
         del partitions["core-2"]
     elif case == "duplicate_file":
@@ -1131,13 +1242,14 @@ def test_windows_physical_metadata_binds_both_family_and_partition_snapshots(
 ) -> None:
     write_metadata = SHARD_MODULE["_write_run_metadata"]
     path = tmp_path / "metadata.json"
-    write_metadata(path, "gateway-sqlite-2", (), parallel_workers=3)
+    write_metadata(path, "gateway-sqlite-2", (), parallel_workers=3, execution_platform="windows")
     physical = json.loads(path.read_text(encoding="utf-8"))
     assert physical["shard"] == "gateway-sqlite-2"
     assert physical["family"] == "gateway-sqlite"
     assert physical["partition_sha256"] == partition_snapshot_fingerprint()
     assert physical["assignment_sha256"] == assignment_snapshot_fingerprint()
     assert physical["execution"]["parallel"]["workers"] == 3
+    assert physical["execution_shards"] == list(WINDOWS_SHARD_NAMES)
 
     write_metadata(path, "gateway-sqlite", (), parallel_workers=2)
     family = json.loads(path.read_text(encoding="utf-8"))
@@ -1231,7 +1343,9 @@ def test_platform_matrix_requires_explicit_bundle_delegation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run = SHARD_MODULE["_run"]
-    monkeypatch.setitem(run.__globals__, "validated_files_for_shard", lambda *_: ("test.py",))
+    monkeypatch.setitem(
+        run.__globals__, "validated_files_for_shard", lambda *_, **__: ("test.py",),
+    )
     with pytest.raises(ValueError, match="requires --delegate-bundle"):
         run(SimpleNamespace(
             root=tmp_path, shard="core-1", delegate_bundle=False,
@@ -1250,7 +1364,7 @@ def test_bundle_delegation_changes_only_explicit_runner_execution(
         source = tmp_path / relative
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_text("def test_case(): pass\n", encoding="utf-8")
-    monkeypatch.setitem(run.__globals__, "validated_files_for_shard", lambda *_: files)
+    monkeypatch.setitem(run.__globals__, "validated_files_for_shard", lambda *_, **__: files)
     monkeypatch.setattr(run.__globals__["platform"], "system", lambda: "Windows")
     selections: list[tuple[str, ...]] = []
 

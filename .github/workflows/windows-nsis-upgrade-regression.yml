@@ -217,10 +217,15 @@ jobs:
           if-no-files-found: error
           retention-days: 14
   packaged-security:
-    name: Installed frozen audit, Gateway smoke, and first interaction
-    needs: build
+    name: Installed packaged ${{ matrix.probe }}
     runs-on: windows-2022
-    timeout-minutes: 30
+    # Prepare each independent harness while the exact candidate is built.
+    # Preserve the producer's 60-minute wait plus the existing 30-minute probe budget.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        probe: [dependency-audit, gateway-smoke, first-interaction]
     defaults:
       run:
         shell: pwsh
@@ -247,12 +252,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Probe npm ci failed' }
           npm run build
           if ($LASTEXITCODE -ne 0) { throw 'Probe build failed' }
-      - uses: ./.github/actions/download-required-artifact
-        with:
-          name: nsis-regression-installer
-          path: candidate
-      - name: Audit frozen dependencies and verify packaged first interaction
+      - name: Wait for and verify the exact NSIS candidate
         env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .github/scripts/nsis_packaged_proof.py wait --destination candidate
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate producer or immutable artifact verification failed' }
+      - name: Verify independent installed packaged check
+        env:
+          PACKAGED_PROBE: ${{ matrix.probe }}
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: '1'
           OPENSQUILLA_SMOKE_PROVISION_SANDBOX: '1'
           OPENSQUILLA_FIRST_SEND_TRACE_PATH: ${{ runner.temp }}/security-first-send-trace.zip
@@ -262,66 +270,123 @@ jobs:
             throw 'Windows Safe provisioning requires a disposable GitHub-hosted runner.'
           }
           if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA) { throw 'Acceptance checkout mismatch' }
+          if ($env:PACKAGED_PROBE -cnotin @('dependency-audit', 'gateway-smoke', 'first-interaction')) {
+            throw 'Unknown installed packaged check'
+          }
           $candidate = @(Get-ChildItem candidate -Filter 'OpenSquilla-*-win-x64.exe' -File)
           if ($candidate.Count -ne 1) { throw 'Expected exactly one candidate installer' }
           $package = Get-Content desktop/electron/package.json -Raw | ConvertFrom-Json
           $identityArgs = @('--installer', $candidate[0].FullName,
             '--manifest', 'candidate/audit-candidate.json', '--source-sha', $env:GITHUB_SHA,
             '--workflow-sha', $env:GITHUB_WORKFLOW_SHA, '--expected-version', $package.version)
-          python .github/scripts/windows_candidate_identity.py @identityArgs
-          if ($LASTEXITCODE -ne 0) { throw 'Candidate provenance verification failed' }
+          $proofRoot = Join-Path $env:RUNNER_TEMP "nsis-packaged-proof/$env:PACKAGED_PROBE"
+          New-Item -ItemType Directory -Path $proofRoot -Force | Out-Null
+          $proof = [ordered]@{
+            schema_version = 1; probe = $env:PACKAGED_PROBE; success = $false
+            identity = [ordered]@{
+              GITHUB_SHA = $env:GITHUB_SHA; GITHUB_WORKFLOW_SHA = $env:GITHUB_WORKFLOW_SHA
+              GITHUB_RUN_ID = $env:GITHUB_RUN_ID; GITHUB_RUN_ATTEMPT = $env:GITHUB_RUN_ATTEMPT
+            }
+            runner = @{ os = $env:RUNNER_OS; environment = $env:RUNNER_ENVIRONMENT }
+            candidate = Get-Content candidate/audit-candidate.json -Raw | ConvertFrom-Json
+            installedIdentity = $null; stages = @()
+          }
+          $state = @{ installed = $false; checkPassed = $false }
+          function Invoke-ProofStage([string]$Name, [scriptblock]$Action) {
+            $stage = [ordered]@{ stage = $Name; startedAt = [DateTimeOffset]::UtcNow.ToString('o'); status = 'running' }
+            $proof.stages += $stage
+            try { & $Action; $stage.status = 'passed' }
+            catch { $stage.status = 'failed'; $stage.error = $_.Exception.Message; throw }
+            finally { $stage.finishedAt = [DateTimeOffset]::UtcNow.ToString('o') }
+          }
           # Install the exact uploaded candidate, rather than rebuilding or
           # transferring a second unpacked payload. The normal smoke discovery
           # path then selects this installed bundle with fallback forbidden.
           $installRoot = Join-Path $PWD 'dist/desktop-electron/win-unpacked'
           if (Test-Path -LiteralPath $installRoot) { throw 'Security probe requires a fresh install root' }
           New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
-          $installed = $false
           try {
-            $install = Start-Process -FilePath $candidate[0].FullName -ArgumentList '/S', "/D=$installRoot" -WindowStyle Hidden -PassThru
-            if (-not $install.WaitForExit(180000)) { throw 'Candidate installation deadline exceeded' }
-            if ($install.ExitCode -ne 0) { throw "Candidate installer exit $($install.ExitCode)" }
-            $installed = $true
-            $installedVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $installRoot 'OpenSquilla.exe')).ProductVersion
-            python .github/scripts/windows_candidate_identity.py @identityArgs --root $installRoot --installed-version $installedVersion
-            if ($LASTEXITCODE -ne 0) { throw 'Installed candidate bytes differ from the manifest' }
-            # Select the disposable runner's real user profile; the child validates its SID.
-            $env:OPENSQUILLA_SMOKE_SANDBOX_PROFILE_ROOT = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.opensquilla'
-            $inventory = Join-Path $installRoot 'resources/runtime/gateway/dependency-inventory.json'
-            python .github/scripts/audit_dependencies.py --repo . --python-only --python-inventory $inventory --output-dir "$env:RUNNER_TEMP/frozen-dependency-audit"
-            if ($LASTEXITCODE -ne 0) { throw 'Frozen dependency audit failed' }
-            Push-Location desktop/electron
-            try {
-              npm run verify:gateway-smoke -- --provision-windows-sandbox
-              if ($LASTEXITCODE -ne 0) { throw 'Frozen Gateway smoke failed' }
-              node scripts/test-packaged-first-send-renderer.mjs --executable "$env:GITHUB_WORKSPACE/dist/desktop-electron/win-unpacked/OpenSquilla.exe" --user-data-dir "$env:RUNNER_TEMP/security-first-send" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/security-first-send-report.log"
-              $probeExitCode = $LASTEXITCODE
-              if ($probeExitCode -ne 0) { throw "Packaged first interaction failed with exit code $probeExitCode" }
-            } finally { Pop-Location }
+            Invoke-ProofStage 'installer-identity' {
+              python .github/scripts/windows_candidate_identity.py @identityArgs
+              if ($LASTEXITCODE -ne 0) { throw 'Candidate provenance verification failed' }
+            }
+            Invoke-ProofStage 'install' {
+              $install = Start-Process -FilePath $candidate[0].FullName -ArgumentList '/S', "/D=$installRoot" -WindowStyle Hidden -PassThru
+              if (-not $install.WaitForExit(180000)) { throw 'Candidate installation deadline exceeded' }
+              if ($install.ExitCode -ne 0) { throw "Candidate installer exit $($install.ExitCode)" }
+              $state.installed = $true
+            }
+            Invoke-ProofStage 'installed-identity' {
+              $installedVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $installRoot 'OpenSquilla.exe')).ProductVersion
+              $proof.installedIdentity = python .github/scripts/windows_candidate_identity.py @identityArgs --root $installRoot --installed-version $installedVersion | ConvertFrom-Json
+              if ($LASTEXITCODE -ne 0) { throw 'Installed candidate bytes differ from the manifest' }
+            }
+            Invoke-ProofStage 'check' {
+              switch ($env:PACKAGED_PROBE) {
+                'dependency-audit' {
+                  $inventory = Join-Path $installRoot 'resources/runtime/gateway/dependency-inventory.json'
+                  python .github/scripts/audit_dependencies.py --repo . --python-only --python-inventory $inventory --output-dir "$proofRoot/dependency-audit"
+                  if ($LASTEXITCODE -ne 0) { throw 'Frozen dependency audit failed' }
+                }
+                'gateway-smoke' {
+                  # Select the disposable runner's real user profile; the child validates its SID.
+                  $env:OPENSQUILLA_SMOKE_SANDBOX_PROFILE_ROOT = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.opensquilla'
+                  Push-Location desktop/electron
+                  try {
+                    npm run verify:gateway-smoke -- --provision-windows-sandbox 2>&1 | Tee-Object -FilePath "$proofRoot/gateway-smoke.log"
+                    if ($LASTEXITCODE -ne 0) { throw 'Frozen Gateway smoke failed' }
+                  } finally { Pop-Location }
+                }
+                'first-interaction' {
+                  Push-Location desktop/electron
+                  try {
+                    node scripts/test-packaged-first-send-renderer.mjs --executable "$env:GITHUB_WORKSPACE/dist/desktop-electron/win-unpacked/OpenSquilla.exe" --user-data-dir "$env:RUNNER_TEMP/security-first-send" 2>&1 | Tee-Object -FilePath "$proofRoot/first-send.log"
+                    $probeExitCode = $LASTEXITCODE
+                    if ($probeExitCode -ne 0) { throw "Packaged first interaction failed with exit code $probeExitCode" }
+                  } finally { Pop-Location }
+                }
+              }
+            }
+            $state.checkPassed = $true
           } finally {
-            if ($installed) {
-              $uninstallers = @(Get-ChildItem -LiteralPath $installRoot -Filter 'Uninstall*.exe' -File)
-              if ($uninstallers.Count -ne 1) { throw 'Expected exactly one candidate uninstaller' }
-              $uninstall = Start-Process -FilePath $uninstallers[0].FullName -ArgumentList '/S' -WindowStyle Hidden -PassThru
-              if (-not $uninstall.WaitForExit(120000)) { throw 'Candidate uninstall deadline exceeded' }
-              if ($uninstall.ExitCode -ne 0) { throw "Candidate uninstaller exit $($uninstall.ExitCode)" }
+            try {
+              if ($state.installed) {
+                Invoke-ProofStage 'uninstall' {
+                  $uninstallers = @(Get-ChildItem -LiteralPath $installRoot -Filter 'Uninstall*.exe' -File)
+                  if ($uninstallers.Count -ne 1) { throw 'Expected exactly one candidate uninstaller' }
+                  $uninstall = Start-Process -FilePath $uninstallers[0].FullName -ArgumentList '/S' -WindowStyle Hidden -PassThru
+                  if (-not $uninstall.WaitForExit(120000)) { throw 'Candidate uninstall deadline exceeded' }
+                  if ($uninstall.ExitCode -ne 0) { throw "Candidate uninstaller exit $($uninstall.ExitCode)" }
+                }
+                $proof.success = $state.checkPassed
+              }
+            } finally {
+              $proof | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath (Join-Path $proofRoot 'packaged-proof.json') -Encoding utf8
             }
           }
-      - uses: actions/upload-artifact@v4
+      - name: Upload required installed packaged execution proof
+        uses: actions/upload-artifact@v4
         if: always()
+        with:
+          name: nsis-packaged-proof-${{ matrix.probe }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nsis-packaged-proof/${{ matrix.probe }}/
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && matrix.probe == 'dependency-audit' }}
         with:
           name: frozen-dependency-audit
           path: |
-            ${{ runner.temp }}/frozen-dependency-audit/
+            ${{ runner.temp }}/nsis-packaged-proof/dependency-audit/dependency-audit/
             candidate/audit-candidate.json
           if-no-files-found: warn
           retention-days: 14
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ always() && matrix.probe == 'first-interaction' }}
         with:
           name: packaged-first-send-evidence
           path: |
-            ${{ runner.temp }}/security-first-send-report.log
+            ${{ runner.temp }}/nsis-packaged-proof/first-interaction/first-send.log
             ${{ runner.temp }}/security-first-send-trace.zip
             ${{ runner.temp }}/security-first-send/logs/desktop.log*
             ${{ runner.temp }}/security-first-send/first-send-main-console.jsonl
@@ -490,7 +555,48 @@ jobs:
         run: |
           echo 'ERROR: cancelled Windows acceptance cannot pass.' >&2
           exit 1
+      - uses: actions/checkout@v4
+        if: ${{ !cancelled() }}
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        if: ${{ !cancelled() }}
+        with:
+          python-version: '3.12'
+      - name: Download installed dependency audit proof
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: nsis-packaged-proof-dependency-audit-attempt-${{ github.run_attempt }}
+          path: packaged-proofs/dependency-audit
+      - name: Download installed Gateway smoke proof
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: nsis-packaged-proof-gateway-smoke-attempt-${{ github.run_attempt }}
+          path: packaged-proofs/gateway-smoke
+      - name: Download installed first interaction proof
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: nsis-packaged-proof-first-interaction-attempt-${{ github.run_attempt }}
+          path: packaged-proofs/first-interaction
+      - name: Verify all three installed packaged checks against one candidate
+        if: ${{ !cancelled() }}
+        run: >-
+          python .github/scripts/nsis_packaged_proof.py verify
+          --reports-dir packaged-proofs --output packaged-coverage.json
+      - name: Upload installed packaged coverage proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nsis-packaged-coverage-attempt-${{ github.run_attempt }}
+          path: packaged-coverage.json
+          if-no-files-found: error
+          retention-days: 14
       - name: Require every packaged acceptance job
+        if: ${{ !cancelled() }}
         env:
           BUILD_RESULT: ${{ needs.build.result }}
           WHEELHOUSE_RESULT: ${{ needs.wheelhouse-security.result }}

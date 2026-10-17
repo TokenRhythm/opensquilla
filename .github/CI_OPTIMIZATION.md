@@ -463,6 +463,50 @@ changes. Raw API snapshots, seven execution reports, remote coverage proof,
 SQLite failure log and comparisons are saved under `.cache/ci-timing/round5/`
 and `.cache/ci-timing/round5-comparison/`. No merge into `main` was performed.
 
+### Sixth experiment: installed NSIS checks and the slow Gateway partition
+
+The baseline is run `39018293735`, attempt 1, at
+`0b610ad969761405b57b9378be972183dd969531`: 13:54 overall. Its NSIS build
+took 7:57, including approximately 190 seconds of PyInstaller work. The NSIS
+installer consumes that frozen payload, so their dependency is retained.
+
+The installed packaged check previously used 4:40 after the build: approximately
+44 seconds of preparation, 56 seconds of installation and identity checks, then
+8 seconds of frozen dependency audit, 85 seconds of Gateway/Safe smoke and
+78 seconds of first interaction. These three checks now run on three independent
+Windows runners. Each prepares its harness alongside the candidate build, waits
+for that exact candidate and installs it locally. Installation, byte identity,
+the assigned check and uninstallation remain sequential within each cell.
+The existing smoke and first-send scripts are unchanged; first-send retains all
+20 iterations and 40 sends. Required proof artifacts verify all three distinct
+checks, their successful cleanup, the same five candidate hashes and current
+source/workflow/run/attempt. The existing NSIS result gate verifies the proof.
+
+The old Windows `gateway-sqlite-5` job took 13:12. Its parallel phase ran 1,525
+cases in 631.25 seconds, followed by seven serial cases in 61.86 seconds.
+The 92 whole files now have four disjoint Windows owners: `gateway-sqlite-5`
+(25 files / 431 baseline cases), `gateway-sqlite-9` (22 / 378),
+`gateway-sqlite-10` (22 / 320), and `gateway-sqlite-11` (23 / 403).
+Their union retains all 1,532 baseline cases. The three files containing the
+seven `ci_serial` cases remain in the original owner. File-level xdist isolation,
+three workers per Gateway cell, markers, failure results and assertion deadlines
+are unchanged. One preflight owner is elected among the selected four cells,
+including targeted plans that omit the original cell.
+
+A Windows-only ownership overlay preserves Ubuntu's original twenty partitions
+and the existing eight-way fallback for newly discovered Gateway files. The
+Windows matrix has 23 Python partitions. Static contracts reject overlap and
+ownership outside the former partition; planned-cell and attestation gates
+require the three additional cells when selected. Duration metadata records the
+full 23-cell inventory so incomplete evidence cannot masquerade as a historical
+twenty-cell sample. Historical governed durations are unchanged: the failed
+baseline supplies allocation weights only, not a new measured performance claim.
+
+The experiment runs full remote CI once and compares all completed jobs even
+if they fail. Raw JUnit case identities, serial ownership, three NSIS proofs,
+candidate availability, post-candidate acceptance time and total runner time
+are compared separately from overall elapsed time.
+
 ## Test cost and ownership
 
 The ordinary offline suite excludes `stress`. The required `python-stress` suite

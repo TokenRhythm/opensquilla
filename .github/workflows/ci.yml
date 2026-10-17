@@ -1538,6 +1538,7 @@ jobs:
 
           uv run python .github/scripts/windows_test_shards.py run \
             "${{ matrix.shard }}" \
+            --platform ubuntu \
             --junit "${CI_REPORT_DIR}/junit.xml" \
             --summary "${CI_REPORT_DIR}/first-failure.txt" \
             "${worker_args[@]}" \
@@ -1790,6 +1791,17 @@ jobs:
           }
 
       - name: Preflight offline test environment
+        # The four replacements for the former gateway-sqlite-5 share one
+        # preflight owner, including targeted plans that omit the original cell.
+        if: >-
+          ${{
+            !contains(fromJSON('["gateway-sqlite-9","gateway-sqlite-10","gateway-sqlite-11"]'), matrix.shard) ||
+            (!contains(fromJSON(needs.plan-ci.outputs.python_matrix).windows, 'gateway-sqlite-5') &&
+              (matrix.shard == 'gateway-sqlite-9' ||
+                (!contains(fromJSON(needs.plan-ci.outputs.python_matrix).windows, 'gateway-sqlite-9') &&
+                  (matrix.shard == 'gateway-sqlite-10' ||
+                    !contains(fromJSON(needs.plan-ci.outputs.python_matrix).windows, 'gateway-sqlite-10')))))
+          }}
         shell: bash
         env:
           PLANNED_WINDOWS_SHARDS: ${{ toJSON(fromJSON(needs.plan-ci.outputs.python_matrix).windows) }}
@@ -1846,7 +1858,7 @@ jobs:
           # sibling smoke only when its owner is absent from this partial plan.
           # Invalid/missing plans or failed inventory must stop before filtering.
           if (( ${#regression_args[@]} )); then
-            owned_files=$(uv run python .github/scripts/windows_test_shards.py list "${shard}" --planned-windows-shards "${PLANNED_WINDOWS_SHARDS}" | tr -d '\r')
+            owned_files=$(uv run python .github/scripts/windows_test_shards.py list "${shard}" --platform windows --planned-windows-shards "${PLANNED_WINDOWS_SHARDS}" | tr -d '\r')
             sibling_regressions=()
             for path in "${regression_args[@]}"; do
               if ! grep -Fxq -- "${path}" <<< "${owned_files}"; then
@@ -1904,6 +1916,7 @@ jobs:
           # Pass the same timer override to both parallel and serial phases.
           uv run python .github/scripts/windows_test_shards.py run \
             "${{ matrix.shard }}" \
+            --platform windows \
             --junit "${CI_REPORT_DIR}/junit.xml" \
             --summary "${CI_REPORT_DIR}/first-failure.txt" \
             --metadata "${CI_REPORT_DIR}/windows-shard-metadata.json" \

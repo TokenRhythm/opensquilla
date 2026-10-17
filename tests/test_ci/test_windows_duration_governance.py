@@ -41,9 +41,13 @@ def _write_run(
     image_versions: dict[str, str] | None = None,
     duplicate_core_node_in: str | None = None,
     partitioned: bool = False,
+    legacy_partitioned: bool = False,
 ) -> Path:
     run_dir = root / f"run-{run_id}"
     shard_names = DURATION_MODULE["WINDOWS_SHARD_NAMES"] if partitioned else SHARD_NAMES
+    if legacy_partitioned:
+        assert partitioned
+        shard_names = DURATION_MODULE["SHARED_SHARD_NAMES"]
     for shard in shard_names:
         family = shard.rsplit("-", 1)[0] if partitioned else shard
         attempt = (attempts or {}).get(shard, 1)
@@ -77,6 +81,8 @@ def _write_run(
         }
         if partitioned:
             metadata["partition_sha256"] = "e" * 64
+            if not legacy_partitioned:
+                metadata["execution_shards"] = list(shard_names)
         (shard_dir / "windows-shard-metadata.json").write_text(
             json.dumps(metadata), encoding="utf-8"
         )
@@ -284,23 +290,62 @@ def _partitioned_observations(tmp_path: Path) -> list[Any]:
     ]
 
 
-def test_duration_builder_requires_all_twenty_execution_shards(tmp_path: Path) -> None:
+def test_duration_builder_requires_all_twenty_three_execution_shards(tmp_path: Path) -> None:
     observations = _partitioned_observations(tmp_path)
     payload = build_duration_payload(
         observations, expected_assignment_sha256="b" * 64,
         expected_partition_sha256="e" * 64,
     )
-    assert len(payload["weights_seconds"]) == 20
+    assert len(payload["weights_seconds"]) == 23
     catalog = json.loads(Path(".github/ci/suites.v1.json").read_text(encoding="utf-8"))
     assert tuple(catalog["full_python_matrix"]["windows"]) == DURATION_MODULE["WINDOWS_SHARD_NAMES"]
     assert all(value == {"parallel": 2.0, "serial": 0.0}
                for value in payload["phase_weights_seconds"].values())
-    assert len(payload["source_runs"][0]["execution"]) == 20
+    assert len(payload["source_runs"][0]["execution"]) == 23
     metadata_path = (tmp_path / "run-500" / "windows-high-risk-gateway-sqlite-4-attempt-1"
                      / "windows-shard-metadata.json")
     metadata_path.unlink()
-    with pytest.raises(ValueError, match="expected 20 Windows shard metadata"):
+    with pytest.raises(ValueError, match="expected 23 Windows shard metadata"):
         load_run_directory(tmp_path / "run-500")
+
+
+def test_duration_builder_reads_legacy_twenty_shards_without_new_declaration(
+    tmp_path: Path,
+) -> None:
+    directory = _write_run(
+        tmp_path, run_id=501, sha="a" * 40, assignment_sha256="b" * 64,
+        seconds={path: 1.0 for path in FILES_BY_SHARD.values()},
+        partitioned=True, legacy_partitioned=True,
+    )
+    observation = load_run_directory(directory)
+    assert set(observation.files_by_shard) == set(DURATION_MODULE["SHARED_SHARD_NAMES"])
+    assert len(observation.node_ids) == 20
+
+
+@pytest.mark.parametrize("mutation", ["omit_all_extra", "missing_declaration", "old_inventory"])
+def test_duration_builder_rejects_incomplete_new_matrix(
+    tmp_path: Path, mutation: str,
+) -> None:
+    directory = _write_run(
+        tmp_path, run_id=502, sha="a" * 40, assignment_sha256="b" * 64,
+        seconds={path: 1.0 for path in FILES_BY_SHARD.values()}, partitioned=True,
+    )
+    if mutation == "omit_all_extra":
+        for part in range(9, 12):
+            path = directory / f"windows-high-risk-gateway-sqlite-{part}-attempt-1"
+            (path / "windows-shard-metadata.json").unlink()
+        message = "expected 23 Windows shard metadata"
+    else:
+        path = next(directory.rglob("windows-shard-metadata.json"))
+        payload = json.loads(path.read_text())
+        if mutation == "missing_declaration":
+            payload.pop("execution_shards")
+        else:
+            payload["execution_shards"] = list(DURATION_MODULE["SHARED_SHARD_NAMES"])
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        message = "execution_shards inventory"
+    with pytest.raises(ValueError, match=message):
+        load_run_directory(directory)
 
 
 def _write_delegated_bundle_run(root: Path, run_id: int = 700) -> Path:
@@ -355,7 +400,7 @@ def test_duration_builder_consumes_all_four_delegated_bundle_reports(tmp_path: P
         for index in range(3)
     ]
     bundle = DURATION_MODULE["BUNDLE_TEST_FILE"]
-    assert all(len(run.node_ids) == 86 for run in observations)
+    assert all(len(run.node_ids) == 89 for run in observations)
     assert all(run.file_seconds[bundle] == 132.0 for run in observations)
     assert bundle in observations[0].files_by_shard["desktop-installer-contracts-1"]
     payload = build_duration_payload(
@@ -365,7 +410,7 @@ def test_duration_builder_consumes_all_four_delegated_bundle_reports(tmp_path: P
     assert payload["weights_seconds"][bundle] == 132.0
     assert payload["phase_weights_seconds"][bundle] == {"parallel": 132.0, "serial": 0.0}
     source = payload["source_runs"][0]
-    assert all(len(source[field]) == 24 for field in ("execution", "attempts", "image_versions"))
+    assert all(len(source[field]) == 27 for field in ("execution", "attempts", "image_versions"))
     assert source["execution"]["bundle-1"]["workers"] == 1
 
 
@@ -558,6 +603,7 @@ def test_duration_builder_consumes_runner_metadata(
             write_metadata(
                 metadata_path, previous["shard"], tuple(previous["test_files"]),
                 parallel_workers=3, marker_expression=marker,
+                execution_platform="windows",
             )
         observations.append(load_run_directory(run_dir))
 
@@ -565,7 +611,7 @@ def test_duration_builder_consumes_runner_metadata(
         observations, expected_assignment_sha256=assignment,
         expected_partition_sha256=partition,
     )
-    assert len(payload["weights_seconds"]) == 20
+    assert len(payload["weights_seconds"]) == 23
     base = "not stress" if marker is None else marker
     for execution in payload["source_runs"][0]["execution"].values():
         assert execution["parallel"]["marker"] == (

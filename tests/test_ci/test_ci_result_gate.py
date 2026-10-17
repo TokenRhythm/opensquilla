@@ -629,7 +629,10 @@ def test_ci_result_gate_accepts_independent_frontend_and_wheel_checks_for_both_s
     assert check_ci_results(env) == []
 
 
-@pytest.mark.parametrize("owner", ["core-1", "desktop-installer-contracts-2"])
+@pytest.mark.parametrize("owner", [
+    "core-1", "desktop-installer-contracts-2",
+    "gateway-sqlite-9", "gateway-sqlite-10", "gateway-sqlite-11",
+])
 def test_windows_plan_without_bundle_owner_requires_both_bundle_jobs_skipped(owner: str) -> None:
     env = _env_for(BASELINE_SUITES | {"windows-high-risk"})
     env["PLANNED_PYTHON_MATRIX"] = json.dumps({"ubuntu": [], "windows": [owner]})
@@ -662,6 +665,8 @@ def test_partial_windows_owner_plan_requires_bundle_execution_and_coverage() -> 
     '{"ubuntu":[],"windows":["core"]}',
     '{"ubuntu":[],"windows":["bundle-1"]}',
     '{"ubuntu":[],"windows":["desktop-installer-contracts-5"]}',
+    '{"ubuntu":[],"windows":["gateway-sqlite-12"]}',
+    '{"ubuntu":[],"windows":["gateway-sqlite-9","gateway-sqlite-9"]}',
     '{"ubuntu":[],"windows":[false]}', '{"ubuntu":[],"windows":[{}]}',
     '{"ubuntu":[],"windows":["core-1"],"unknown":[]}',
 ])

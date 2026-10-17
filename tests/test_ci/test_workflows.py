@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import itertools
 import json
 import os
 import re
@@ -149,9 +150,9 @@ def test_required_artifact_downloads_share_a_bounded_hard_gate() -> None:
     }
     assert not guard.get("continue-on-error")
     assert "sleep" not in json.dumps(action)
-    # Early upgrade consumers now use the identity-bound wait helper; the two
-    # remaining NSIS composite downloads retain the original transfer gate.
-    for workflow, count in [("ci.yml", 19), ("windows-nsis-upgrade-regression.yml", 2)]:
+    # Early installed-package consumers use the identity-bound wait helper;
+    # the shared frontend and three required proofs retain the transfer gate.
+    for workflow, count in [("ci.yml", 19), ("windows-nsis-upgrade-regression.yml", 4)]:
         steps = [s for j in _workflow(workflow)["jobs"].values() for s in j.get("steps", [])]
         downloads = [s for s in steps
                      if s.get("uses") == "./.github/actions/download-required-artifact"]
@@ -362,7 +363,8 @@ def test_windows_frontend_platform_proof_is_required_only_for_shared_artifacts(
 
 def test_windows_acceptance_checks_out_and_verifies_the_callers_immutable_candidate() -> None:
     jobs = _workflow("windows-nsis-upgrade-regression.yml")["jobs"]
-    for name in ("build", "wheelhouse-security", "upgrade-and-start"):
+    for name in ("build", "wheelhouse-security", "upgrade-and-start", "packaged-security",
+                 "acceptance-result"):
         checkout = next(s for s in jobs[name]["steps"] if s.get("uses") == "actions/checkout@v4")
         assert checkout["with"]["ref"] == "${{ github.sha }}"
         assert checkout["with"]["persist-credentials"] is False
@@ -379,7 +381,101 @@ def test_windows_acceptance_checks_out_and_verifies_the_callers_immutable_candid
         ".github/workflows/windows-nsis-upgrade-regression.yml",
         ".github/scripts/verify-nsis-upgrade-regression.py",
         ".github/scripts/wait_ci_candidate.py",
+        ".github/scripts/nsis_packaged_proof.py",
     } <= set(policy["merge_critical_inputs"])
+
+
+def test_installed_nsis_checks_use_three_independent_vms_and_early_preparation() -> None:
+    job = _workflow("windows-nsis-upgrade-regression.yml")["jobs"]["packaged-security"]
+    assert job["runs-on"] == "windows-2022"
+    assert job["strategy"] == {
+        "fail-fast": False,
+        "matrix": {"probe": ["dependency-audit", "gateway-smoke", "first-interaction"]},
+    }
+    assert "needs" not in job and "if" not in job
+    assert job["timeout-minutes"] == 90  # Original 30-minute probe plus 60-minute producer wait.
+    steps = job["steps"]
+    prepare = next(s for s in steps if s.get("name") == "Prepare packaged-client interaction probe")
+    wait = next(s for s in steps if s.get("name") == "Wait for and verify the exact NSIS candidate")
+    check = next(s for s in steps if s.get("name") == "Verify independent installed packaged check")
+    assert steps.index(prepare) < steps.index(wait) < steps.index(check)
+    assert "npm ci" in prepare["run"] and "npm run build" in prepare["run"]
+    assert "if" not in prepare and "if" not in wait and "if" not in check
+    assert wait["env"] == {"GH_TOKEN": "${{ github.token }}"}
+    assert (
+        "python .github/scripts/nsis_packaged_proof.py wait --destination candidate" in wait["run"]
+    )
+    assert "if ($LASTEXITCODE -ne 0) { throw" in wait["run"]
+    assert check["env"]["PACKAGED_PROBE"] == "${{ matrix.probe }}"
+    assert check["env"]["OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE"] == "1"
+    assert check["env"]["OPENSQUILLA_SMOKE_PROVISION_SANDBOX"] == "1"
+    commands = check["run"]
+    assert commands.count("Invoke-ProofStage 'check'") == 1
+    assert commands.count("switch ($env:PACKAGED_PROBE)") == 1
+    assert "-cnotin @('dependency-audit', 'gateway-smoke', 'first-interaction')" in commands
+    for command in (
+        "python .github/scripts/audit_dependencies.py --repo . --python-only --python-inventory",
+        "npm run verify:gateway-smoke -- --provision-windows-sandbox",
+        "node scripts/test-packaged-first-send-renderer.mjs --executable",
+    ):
+        assert commands.count(command) == 1
+    assert "--iterations" not in commands
+    first_send = Path("desktop/electron/scripts/test-packaged-first-send-renderer.mjs").read_text(
+        encoding="utf-8",
+    )
+    assert "const DEFAULT_ITERATIONS = 20" in first_send
+    assert "'resources/runtime/gateway/dependency-inventory.json'" in commands
+    assert "--root $installRoot --installed-version $installedVersion" in commands
+    assert "(git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA" in commands
+    assert "$env:RUNNER_ENVIRONMENT -ne 'github-hosted'" in commands
+    assert "Candidate installation deadline exceeded" in commands
+    assert "WaitForExit(180000)" in commands and "WaitForExit(120000)" in commands
+    assert commands.count("-WindowStyle Hidden -PassThru") == 2
+    assert "finally {" in commands and "Invoke-ProofStage 'uninstall'" in commands
+
+
+def test_nsis_aggregate_requires_each_mode_execution_proof_and_original_job_results() -> None:
+    jobs = _workflow("windows-nsis-upgrade-regression.yml")["jobs"]
+    upload = next(s for s in jobs["packaged-security"]["steps"]
+                  if s.get("name") == "Upload required installed packaged execution proof")
+    assert upload["if"] == "always()"
+    assert upload["with"]["name"] == (
+        "nsis-packaged-proof-${{ matrix.probe }}-attempt-${{ github.run_attempt }}"
+    )
+    assert upload["with"]["if-no-files-found"] == "error"
+    assert upload["with"]["path"] == (
+        "${{ runner.temp }}/nsis-packaged-proof/${{ matrix.probe }}/"
+    )
+    steps = jobs["acceptance-result"]["steps"]
+    downloads = [s for s in steps
+                 if s.get("uses") == "./.github/actions/download-required-artifact"]
+    assert len(downloads) == 3
+    assert {s["with"]["name"] for s in downloads} == {
+        f"nsis-packaged-proof-{mode}-attempt-${{{{ github.run_attempt }}}}"
+        for mode in ("dependency-audit", "gateway-smoke", "first-interaction")
+    }
+    assert {s["with"]["path"] for s in downloads} == {
+        f"packaged-proofs/{mode}"
+        for mode in ("dependency-audit", "gateway-smoke", "first-interaction")
+    }
+    verify = next(s for s in steps if s.get("name") ==
+                  "Verify all three installed packaged checks against one candidate")
+    assert "python .github/scripts/nsis_packaged_proof.py verify" in verify["run"]
+    assert "--reports-dir packaged-proofs --output packaged-coverage.json" in verify["run"]
+    assert all(steps.index(s) < steps.index(verify) for s in downloads)
+    for step in [*downloads, verify, steps[-1]]:
+        assert step["if"] == "${{ !cancelled() }}"
+        assert not step.get("continue-on-error")
+    coverage = next(s for s in steps if s.get("name") == "Upload installed packaged coverage proof")
+    assert coverage["with"]["if-no-files-found"] == "error"
+    assert coverage["with"]["name"] == "nsis-packaged-coverage-attempt-${{ github.run_attempt }}"
+    assert coverage["with"]["path"] == "packaged-coverage.json"
+    assert steps[-1]["env"]["PACKAGED_SECURITY_RESULT"] == "${{ needs.packaged-security.result }}"
+    diagnostics = {s["with"]["name"]: s for s in jobs["packaged-security"]["steps"]
+                   if s.get("uses") == "actions/upload-artifact@v4"}
+    for artifact, mode in (("frozen-dependency-audit", "dependency-audit"),
+                           ("packaged-first-send-evidence", "first-interaction")):
+        assert diagnostics[artifact]["if"] == f"${{{{ always() && matrix.probe == '{mode}' }}}}"
 
 
 def test_dependency_audit_runs_outside_planner_and_reuse_on_every_ci_trigger() -> None:
@@ -3861,10 +3957,10 @@ def test_windows_preflight_selects_regressions_for_physical_partitions(family, s
         # Stub only process execution. Use the real assignment inventory and
         # Windows CRLF output to exercise the workflow's filtering shell.
         script = '''uv() {
-          [[ "$#" == 7 && "$1" == run && "$2" == python &&
+          [[ "$#" == 9 && "$1" == run && "$2" == python &&
              "$3" == .github/scripts/windows_test_shards.py && "$4" == list &&
-             "$5" == "$EXPECTED_SHARD" && "$6" == --planned-windows-shards &&
-             "$7" == "$EXPECTED_PLAN" ]] || return 96
+             "$5" == "$EXPECTED_SHARD" && "$6" == --platform && "$7" == windows &&
+             "$8" == --planned-windows-shards && "$9" == "$EXPECTED_PLAN" ]] || return 96
           printf '%s' "$OWNED_TEST_FILES"
         }
         ''' + selector.replace("${{ matrix.shard }}", shard)
@@ -3930,9 +4026,41 @@ _GATEWAY_REGRESSION_FILES = {
 def test_gateway_preflight_regressions_keep_one_main_windows_partition():
     runner = runpy.run_path(".github/scripts/windows_test_shards.py")
     partitions = [
-        runner["files_for_shard"](Path.cwd(), shard)
+        runner["files_for_shard"](Path.cwd(), shard, platform="windows")
         for shard in runner["WINDOWS_SHARD_NAMES"]
         if shard.startswith("gateway-sqlite-")
     ]
     for path in _GATEWAY_REGRESSION_FILES:
         assert sum(path in files for files in partitions) == 1, path
+
+
+def test_gateway_split_elects_exactly_one_preflight_owner_for_every_partial_plan():
+    steps = _workflow("ci.yml")["jobs"]["windows-full"]["steps"]
+    preflight = next(s for s in steps if s.get("name") == "Preflight offline test environment")
+    expression = preflight["if"].removeprefix("${{").removesuffix("}}").strip()
+    # Evaluate the actual workflow condition over all nonempty selections. The
+    # substitutions cover only this bounded expression, never an external file.
+    expression = expression.replace(
+        "fromJSON(needs.plan-ci.outputs.python_matrix).windows", "planned"
+    ).replace("matrix.shard", "shard")
+    expression = expression.replace("&&", " and ").replace("||", " or ").replace("!", " not ")
+    split = ["gateway-sqlite-5", "gateway-sqlite-9", "gateway-sqlite-10", "gateway-sqlite-11"]
+    for size in range(1, len(split) + 1):
+        for selection in itertools.combinations(split, size):
+            planned = [*selection, "core-1", "gateway-sqlite-6"]
+            selected = [shard for shard in planned if eval(  # noqa: S307
+                f"({expression})", {"__builtins__": {}, "fromJSON": json.loads,
+                             "contains": lambda items, item: item in items},
+                {"planned": planned, "shard": shard},
+            )]
+            assert selected == [selection[0], "core-1", "gateway-sqlite-6"]
+
+
+@pytest.mark.parametrize("job_name,platform", [
+    ("windows-full", "windows"), ("ubuntu-full", "ubuntu"),
+])
+def test_offline_runner_uses_explicit_platform_ownership(job_name, platform):
+    steps = _workflow("ci.yml")["jobs"][job_name]["steps"]
+    commands = [s["run"] for s in steps if "windows_test_shards.py run" in s.get("run", "")]
+    assert len(commands) == 1
+    assert f"--platform {platform}" in commands[0]

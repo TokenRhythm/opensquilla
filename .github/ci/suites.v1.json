@@ -185,6 +185,9 @@
       "gateway-sqlite-6",
       "gateway-sqlite-7",
       "gateway-sqlite-8",
+      "gateway-sqlite-9",
+      "gateway-sqlite-10",
+      "gateway-sqlite-11",
       "recovery-migration-1",
       "recovery-migration-2",
       "recovery-migration-3",
@@ -267,6 +270,7 @@
       "execution_inputs": [
         ".github/actions/download-required-artifact/action.yml",
         ".github/scripts/audit_dependencies.py",
+        ".github/scripts/nsis_packaged_proof.py",
         ".github/scripts/verify-nsis-upgrade-regression.py",
         ".github/scripts/wait_ci_candidate.py",
         ".github/scripts/verify-packaged-ownership-long-paths.py",

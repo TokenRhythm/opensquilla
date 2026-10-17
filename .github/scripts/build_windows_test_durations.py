@@ -21,10 +21,15 @@ SHARD_NAMES: Final[tuple[str, ...]] = (
     "recovery-migration",
     "desktop-installer-contracts",
 )
-WINDOWS_SHARD_NAMES: Final[tuple[str, ...]] = tuple(
+SHARED_SHARD_NAMES: Final[tuple[str, ...]] = tuple(
     f"{family}-{partition}"
     for family in SHARD_NAMES
     for partition in range(1, 9 if family == "gateway-sqlite" else 5)
+)
+WINDOWS_SHARD_NAMES: Final[tuple[str, ...]] = tuple(
+    f"{family}-{partition}"
+    for family in SHARD_NAMES
+    for partition in range(1, 12 if family == "gateway-sqlite" else 5)
 )
 METADATA_NAME: Final[str] = "windows-shard-metadata.json"
 JUNIT_NAME: Final[str] = "junit.xml"
@@ -177,7 +182,24 @@ def load_run_directory(run_dir: Path) -> RunObservation:
         isinstance(payload, dict) and payload.get("shard") in WINDOWS_SHARD_NAMES
         for payload in payloads
     )
-    shard_names = WINDOWS_SHARD_NAMES if physical else SHARD_NAMES
+    declared = [payload.get("execution_shards") for payload in payloads
+                if isinstance(payload, dict)]
+    if any(value is not None for value in declared):
+        # Every new report declares the full native matrix, including targeted
+        # runs. Removing all three added reports must not look like an old full
+        # twenty-shard run. Legacy evidence without this field stays readable.
+        if not physical or any(value != list(WINDOWS_SHARD_NAMES) for value in declared):
+            raise ValueError("inconsistent or invalid Windows execution_shards inventory")
+        shard_names = WINDOWS_SHARD_NAMES
+    elif physical:
+        extra_names = set(WINDOWS_SHARD_NAMES) - set(SHARED_SHARD_NAMES)
+        has_extra = any(
+            isinstance(payload, dict) and payload.get("shard") in extra_names
+            for payload in payloads
+        )
+        shard_names = WINDOWS_SHARD_NAMES if has_extra else SHARED_SHARD_NAMES
+    else:
+        shard_names = SHARD_NAMES
     if len(metadata_paths) != len(shard_names):
         raise ValueError(
             f"expected {len(shard_names)} Windows shard metadata files in {run_dir}, "

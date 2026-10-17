@@ -9,6 +9,7 @@
     ".github/scripts/bundle_test_shards.py",
     ".github/scripts/check_ci_results.py",
     ".github/scripts/ci_attestation.py",
+    ".github/scripts/nsis_packaged_proof.py",
     ".github/scripts/plan_ci.py",
     ".github/scripts/prepare-electron.mjs",
     ".github/scripts/test-prepare-electron.mjs",
