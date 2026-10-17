@@ -53,6 +53,7 @@ class ProviderSetupSpec:
 
 _PROVIDER_LABELS: dict[str, str] = {
     "openrouter": "OpenRouter",
+    "opper": "Opper",
     "openai": "OpenAI",
     "azure": "Azure OpenAI",
     "anthropic": "Anthropic",

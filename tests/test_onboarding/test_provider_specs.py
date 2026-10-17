@@ -81,7 +81,7 @@ EXPECTED_EXPERIMENTAL = {
     "minimax_coding_anthropic", "minimax_cn", "minimax_global", "mimo_openai",
     "mimo_anthropic", "mistral", "groq", "aihubmix", "vllm", "custom",
     "custom_anthropic",
-    "lm_studio", "siliconflow", "ovms", "litellm_proxy", "openai_codex",
+    "lm_studio", "siliconflow", "opper", "ovms", "litellm_proxy", "openai_codex",
     "volcengine_coding_plan", "volcengine_coding_plan_anthropic",
     "byteplus_coding_plan", "byteplus_coding_plan_anthropic",
     "tencent_tokenhub", "tencent_tokenhub_anthropic", "tencent_tokenhub_intl",
