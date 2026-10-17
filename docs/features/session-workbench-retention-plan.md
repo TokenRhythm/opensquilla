@@ -1,7 +1,7 @@
 # 会话切换与工作台状态保留开发计划
 
 - 日期：2026-10-17
-- 状态：多 agent review 与架构收敛已完成；首批导航保留、文件树/代码/Markdown 恢复已实现并完成浏览器验收，其余阶段按下文顺序继续
+- 状态：导航保留、普通文档阅读恢复、聊天切换安全改进、终端消费背压与原生页面准入已分批实现；后台 dispatcher、隐藏 side reader 释放和跨类型压力验收尚未完成，详见本轮实施记录
 - 适用范围：OpenSquilla WebUI 与 Windows Electron 客户端
 
 OpenSquilla 应让用户在多个会话间切换后，继续使用原来的标签、阅读位置和输入草稿，同时让已提交的任务继续执行。实现这一体验，需要分别管理用户工作状态、后台业务状态和页面占用的资源。标签仍然存在，不应要求整个页面始终在内存中运行。
@@ -248,14 +248,84 @@ P2 可按 provider 拆分小 PR；P3 的 owner 交接与 side reader 回收必�
 - 真实 Gateway 与合成文件实测连续 4 轮 A→B→A：保留 3 个标签、文件模式/查询/过滤/滚动位置、side 未发送草稿；child 只创建 1 次，导航关闭次数 0，无 page error。另在最终构建的内置浏览器手动操作入口，确认代码标签与搜索恢复；截图和录屏单独留档。
 - 本地旧 18799 地址实际读取原工作区的生成资产，曾使构建验收误跑旧界面。已将新构建逐文件校验并更新至该地址，保留旧哈希资产供已打开页面使用；未重启 Gateway、未修改测试 profile 或原工作区的受版本管理修改。
 
-下一批仍按依赖顺序推进：
+首批尚未覆盖的文档状态、元数据缓存、旧重排等待、终端背压及原生准入在下述第二批继续实现。首批记录是历史证据，当前完成范围以下表为准。
 
-1. 完成 P2 的文档/资源元数据有界缓存、资源集合视图 owner 分离，以及 PDF、Office、媒体的专用阅读状态；不丢未保存内容或在途发布动作。
-2. 完成 P3 的轻量队列调度 owner 交接，再回收隐藏 side reader。现有 main parked 与隐藏 side 的行为本批保持不变，旧重排 RPC 等待仍需处理。
-3. 完成 P4 的终端 detach/attach、屏幕回放与背压，以及浏览器 operation lease 和安全准入。浏览器 `browser-opened` 接管已存在 target，不能直接拒绝而留下孤儿页面。
-4. 在 P5 汇总 resident/restoring/disposing 的资源成本、压力回落、跨窗口及 Windows Electron 实测。
+### 2026-10-17 本轮实施与独立 review
 
-特别限制：普通 HTML iframe 被回收后，其 JS、表单和游戏内存尚不承诺恢复；原生交互 HTML 通过受保护驻留保留。浏览器、隐藏 side reader、资源集合视图，以及 `artifactDocuments` / `workbenchResources` 的元数据仍有后续资源管理工作，本版不能宣称客户端总内存已受硬上限约束。WebUI 测试也不代替 Windows Electron 的真实 WebContents、PTY 与进程工作集验收。
+本轮优先消除切换时丢状态、等待旧请求及后台无界输出的问题。以下是已落入代码的行为，不把目标架构中的后台调度或自动回收视为已完成。
+
+| 阶段 | 当前进度 | 尚未完成的条件 |
+| --- | --- | --- |
+| P0 | 导航/收起/关闭契约和真实 App 入口用例已建立 | 跨类型冷暖切换 P50/P95、客户端工作集等完整资源基线未建立 |
+| P1 | session 标签、活动项、布局偏好、轻状态恢复与 generation 门控已接入；普通导航不关闭 owner | 当前恢复队列只覆盖已迁移的读取路径，并非所有重实例的统一预算 |
+| P2 | 文件树、代码、Markdown、PDF、Office、媒体及资源集合的轻状态恢复与可重建元数据缓存已扩展 | 编辑器任意 dirty 工作状态和全部文档格式保真不在本次阅读恢复承诺内；真实 Office 文件的复杂排版仍需专项验收 |
+| P3 | 草稿 owner 竞态、旧 reorder 阻塞导航、展示缓存捕获开销与隐藏聊天视觉更新已处理 | app 级后台 dispatcher、main/side 自动队列一致性、隐藏 side reader/DOM 释放未启用 |
+| P4 | 保留现有终端实例并增加消费背压；原生浏览器/交互预览增加创建至销毁的准入预约 | 终端 detach/attach、完整屏幕 checkpoint 和 xterm 回收未实现；未知网页无损冷恢复未承诺 |
+| P5 | 本轮运行受影响的单元、RPC、真实 App fixture 和部分原生 Electron 定向验收 | 全局资源压力、双窗口调度竞争、最终 main 同步后的 CI 与发布验收尚需单独记录 |
+
+#### P2：文档、媒体与资源集合
+
+| 已完成 | 实现及限制 |
+| --- | --- |
+| 文档元数据缓存 | `artifactDocuments` 的可回收缓存最多 32 项、2 MiB JSON UTF-16 估算；`workbenchResources` 最多 12 个 session 库存、2 MiB。同一个 LRU 仅回收可重建元数据；打开的 document descriptor、活动库存以及 pending/inflight/unknown mutation owner 受保护，保护项允许超预算 |
+| 请求代际 | 移除永久累积的 generation tombstone，使用当前 AbortController 对象身份丢弃迟到结果；不能由旧请求覆盖新身份缓存 |
+| 资源集合 owner 与视图分离 | 标签只保存 session 身份和 count，不复制整份库存。隐藏时释放列表 renderer；返回重新读取 store 或冷加载。滚动 checkpoint、loading/error/retry 保留；在途 open/import/publish 由独立轻 owner 持有，busy 期间不能关闭或重复提交 |
+| PDF 与 Office 阅读恢复 | 保存 page/sheet、zoom 和 scroll，绑定 session/workspace/revision。artifact PDF 与工作区 PDF 共用 `PdfResourcePreview`，移除独立 native iframe/dataURL 分支；离开时释放 canvas/worker/viewer 和可重读 bytes，旧 ArrayBuffer/Blob 的事件不能污染新文件 |
+| 媒体与批注 | 保存媒体 `currentTime`，恢复保持暂停；Office 批注草稿继续由原 draft store 持有，仅释放 overlay editor。该变化不增加直接写回文档的权限或新的保存路径 |
+
+以上缓存的字节估算和实例释放只覆盖接入的 provider，不等于客户端总 heap 上限。普通 HTML 的 JS/表单状态不属于 JSON 阅读 checkpoint；原生交互 HTML 的驻留策略保持不变。任意 Office 未保存编辑和超大文件保真需要各自 owner 与平台专项验收。
+
+#### P3：切换关键路径和聊天 owner
+
+| 已完成 | 实现及限制 |
+| --- | --- |
+| 导航不等待旧 reorder | `useChatPendingQueue` 按 `(sessionKey, deliveryIdentity)` 保存重排事务。切换直接显示目标会话；旧 WAL/RPC 只结算原队列，不等待其完成，不重发未知结果的 reorder |
+| 身份切换和迟到回执 | RPC 前后与 WAL 返回后核对原身份；旧未知事务继续保留，新身份不继承其全局重排屏障。返回原身份后通过权威 list 对账，只调整原事务捕获的行，保留其他身份已恢复的行 |
+| 草稿不被同 tick 导航覆盖 | draft 的 session owner watcher 同步切换归属，再执行已排队的文本持久化。测试覆盖编辑 A 后立即导航，不把 A 的文本保存到 B；storage、side 临时性和发送后消费草稿的规则不变 |
+| 展示缓存先检查预算 | 仍为最多 6 个 session、8 MiB 序列化内容、每个末尾 200 条消息；在 stringify 前检查字节、20,000 个值节点、20,000 次对象属性访问、32 层深度。超大工具结果不再先完整编码；不可安全序列化的数据只跳过可重建展示缓存，不删除草稿、WAL 或权威消息 |
+| 隐藏 side 的视觉工作减少 | 同一个 ChatView 接收显式可见性。隐藏时停界面用时/思考时钟和自动滚动，增量渲染使用 250ms 后台节奏；返回按原时间戳追平。事件 reader、审批、队列、续租与业务 owner 仍保留，不宣称隐藏时零 CPU |
+
+未知结果的旧 reorder 仍属于需要保护的业务状态，因此不受普通展示缓存 LRU 淘汰。事务按 owner 隔离不等于其未决数量有硬上限；后续 owner 交接需要继续保留或权威收敛这些事务，不能靠删除屏障降低内存。
+
+接近 8 MiB 上限的合法展示缓存仍会在离开时同步检查与 clone。本轮避免的是先无界序列化再判断预算，尚未以真实浏览器延迟证明大缓存切换无卡顿；这项测量及是否进一步移出导航关键路径保留在 P5。
+
+**后台 dispatcher 与隐藏 side 释放的协议门槛尚未满足：**
+
+1. 当前 [`DispatchPendingInput`](../../src/opensquilla/application/pending_input_queue.py) 请求包含 session、pending item、client request、fingerprint 和 source scope，没有调用者捕获的 queue-head revision 或 pause/stop generation。`dispatch()` 读取最新行后以该行最新 revision 构造 `PendingInputGuard`；它提供单行身份/幂等保护，不能证明调用者选择的那一行在队列重排后仍是允许派发的队首。
+2. 当前 [`pendingQueuePolicy`](../../opensquilla-webui/src/utils/chat/pendingQueuePolicy.ts) 保存浏览器本地暂停代次。该机制不能作为跨客户端的服务端原子暂停权威。不能把 app 单例或收到终态摘要视为跨窗口自动派发许可。
+3. [`useChatSend.sendQueuedItem`](../../opensquilla-webui/src/composables/chat/useChatSend.ts) 仍显式绑定当前 session，并校验工作区、路由、附件准备、压缩、handoff 与命令行为。直接把现有组合函数常驻全局，或删除当前 session 校验，会把错误的环境用于后台发送。
+4. 必须先明确队列头版本、暂停/停止代次与既有 admission/WAL 的原子校验，再提取唯一轻量调度 owner。unknown receipt、草稿和临时附件移交完成后，才允许退休 side reader。沿用现有 event hub、lease、cursor 和 ACK，不增加原始事件监听器或另一套 reducer。
+
+因此本轮 **main 切走后的队列仍 parked，隐藏 side 保留现有业务派发行为**；未以局部开关假装两者已统一。已接受任务仍由 Gateway 继续运行。主/side 共用的 ChatView、首次有效发送建立 child 上下文快照、side 续租、显式关闭、刷新/退出边界全部保持不变。
+
+#### P4：终端与原生交互页面
+
+终端在 session 切换时保留同一 xterm 和 PTY，隐藏时继续消费输出；只暂停光标闪烁、无意义 resize 和焦点动作，返回不抢主会话输入焦点。保留实例本身能维持 alternate screen、光标和终端模式，**这不是屏幕 checkpoint/detach/attach 已实现的证据**。显式关闭、restart、连接断开仍按原服务端所有权规则清理终端；不新增跨连接或退出后的 PTY 保活承诺。
+
+新客户端协商 `consumed-v1`，仅在 `xterm.write` 完成回调后累计提交 `terminals.consume` 游标。前端只有一个在途累计消费请求；未知回执重试同一累计游标，不复制输出历史。服务端按 connection owner 校验，达到 128 KiB 输出高水位或 256 个在途 frame 后暂停读取 PTY，降至 32 KiB 与低 frame 水位再继续；保留原生管道背压。水位包含分块越界余量，不是整个 PTY 或客户端 heap 的绝对字节上限。未协商的旧客户端继续原协议。
+
+原生 manager 现在限制最多 8 个 browser 页面、4 个交互 preview，并为 creating/resident/disposing 预约容量；这与终端每连接最多 4 个的现有准入分别计数。达到容量时拒绝新增，已有页面的表单、JavaScript 和 agent target 保持不变。popup 在许可与实际分配处检查容量，拒绝未接管 guest；同 ID 替换跨旧页面清理持有预约，旧 contents 未真正销毁时不创建新 renderer。异常分配及关闭中的预约等到实际 `destroyed` 后释放。
+
+这些是实例数量与输出窗口限制，**不是 JS heap、Chromium 进程工作集或客户端总内存硬预算**。本轮没有按 URL 重建未知网页，也没有将隐藏侧边聊天或终端加入自动销毁策略。普通 WebUI HTML iframe 若被重建，任意 JS、游戏及未保存表单内存仍不承诺恢复；原生页面通过保守驻留保留这些状态。
+
+#### 本轮证据与未验证边界
+
+- P3 queue/runtime/隐藏展示的定向组合 140 项通过；draft/path 44 项通过；view cache/budget 53 项通过。独立 review 后增加 exact-owner 延迟回执修复，重跑 queue/stop 两组共 113 项通过；数字有覆盖重叠，不相加为独立用例总数。
+- 新的队列测试分别阻塞 commit 和 recovery list，并让独立 server fixture 已提交重排但响应丢失；验证新身份可对账、晚到旧结果不写当前 WAL、返回原身份恢复且不重发 reorder。documents 与 terminal agent 的后续只读 review 均未发现剩余阻塞项。
+- 真实 App 入口的 terminal alternate-screen/隐藏消费/B 草稿返回，以及同一任务内编辑后立即导航的草稿 case 共 2 项通过。截图人工查看、浏览器录频已保存于集成工作树 `.tmp/queue-draft-final/`；此类测试使用可控 Gateway fixture，不冒充真实 provider 或打包客户端验收。
+- P2 阅读/元数据定向 10 文件 162 项通过；artifact 相关旧测试已按新导航保留和共享 PDF 契约更新，相关 72 项复验通过；最终资源组件 5 文件 103 项通过（包含冷资源集合重新加载）。这些组合存在覆盖重叠。日志分别为 `.tmp/p2-reading-tests.log`、`.tmp/p2-artifact-retest.log`、`.tmp/p2-resource-final-tests.log`。
+- P2 真实 App 入口 fixture：工作区 PDF/DOCX/PPTX/XLSX 共 4 项、artifact 对应 4 项 A→B→A 通过，检查离开后 DOM 释放、返回位置与缩放、没有额外 side create/close/abort；artifact PDF 的真实 canvas/worker 关闭释放另 1 项通过。日志 `.tmp/p2-reading-e2e.log`、`.tmp/p2-artifact-retention-e2e.log`、`.tmp/p2-artifact-pdf-e2e.log`，同名目录保存 PNG/WebM。人工查看 PPTX/PDF 截图后修复 PDF flex 宽度问题，最终单项复验通过并查看 PNG，记录为 `.tmp/p2-artifact-pdf-final.log` 与同名目录；P2 最终 typecheck wrapper exit 0，记录 `.tmp/p2-final-typecheck.log`。
+- 媒体时间恢复目前是组件定向测试证据；真实音视频、大型 Office、Windows 原生文件预览与进程工作集仍需实测，不能由可控 RPC + 真实 Vue/parser/canvas 的入口测试推定。
+- 终端前端 consumption/panel/adapter 定向 17 项、后端 terminal sessions/RPC 39 项通过，相关 4 文件 ruff 与 RPC boundary guard 通过。新 Gateway 18819 的真实 Windows PTY 实测：131,363 bytes / 35 frames 后触发背压，500ms 不再增长；Ctrl-C 后 372ms 出现新 PowerShell prompt，随后 marker 命令成功、seq 连续并观察到 close/exit。原工作树记录为 `.tmp/session-retention-final-20261017/terminal-native-result.json`。实际 App+xterm fixture 的 alternate-screen A→B 隐藏输出→A 保留同一 DOM/屏幕，退出后恢复 normal buffer；修复草稿后的完整通过记录为集成工作树 `.tmp-queue-draft-final.log`，PNG/WebM 位于 `.tmp/queue-draft-final/workbench-session-launcher-ba1d1-put-across-session-switches-chromium/`。真实 PTY 与 fixture UI 是不同证据，尚未证明原生终端 UI 或打包安装体验；旧 18799 未协商 `consumed-v1` 时使用兼容分支。
+- 原生 TS 构建和 native contract 通过；受影响的现有 desktop-browser Electron 测试及附加 retention 测试通过。后者以真实 WebContents 验证 6 轮切换保留表单/JS/target、8 页准入覆盖 popup/创建/清理/替换、失败 close 的同 ID 替换返回 `RESOURCE_RELEASING`、实际销毁前不释放旧 slot、重试成功及最终预算清空。日志在原工作树 `.tmp/session-retention-final-20261017/native-browser-final.log`。该证据不包含多小时负载或真实用户网站的内存曲线。
+- 没有因单项修改重跑全量前后端测试；最终 main 同步、PR/CI 状态由集成记录另行更新。
+
+#### 剩余开发的最短依赖序列
+
+1. 先固定并实现后台派发的权威协议：队首/队列版本、pause/stop generation、unknown receipt 与现有幂等 admission 的原子检查。用双窗口竞争、重排后旧选择、暂停后迟到派发测试证明不会发送错误行；不要先卸载 side。
+2. 从现有 pending queue / durable delivery / WAL / send 路径提取轻量 app owner，显式传入所属工作区、路由和附件准备上下文。完成主/side 交接与行为一致性，再释放隐藏 side reader/DOM，返回沿原 reader 协议恢复。
+3. 只有确实需要释放 xterm 时再实现有版本的完整屏幕 checkpoint、连续增量与 attach/detach；当前保留实例和消费背压可独立交付。浏览器继续保守驻留，不把任意网页冷恢复作为该步骤的前提。
+4. 汇总已迁移 provider 的 resident/restoring/disposing 成本，做连续切换、断线和资源压力验收；记录暖/冷返回耗时、后台 CPU、worker/WebContents/PTY buffer 与工作集。通过后再调预算参数或扩大自动回收类型，最终以 CI 与平台验收完成 P5。
 
 建议开发入口补充：
 

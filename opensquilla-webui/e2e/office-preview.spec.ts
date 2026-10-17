@@ -6,8 +6,7 @@ import { resolve, extname, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { docxFixture, pptxFixture, xlsxFixture, pdfFixture, officeHash } from './support/office-fixtures'
 
-// The headless shell has no native PDF viewer. Use the full browser so the
-// native preview contract is exercised without overriding capability detection.
+// Use Chromium for the PDF/Office canvas and worker lifecycle contracts.
 test.use({channel: 'chromium'})
 
 // Real production Vue components, binary controller, Silurus parsers/renderers,
@@ -246,15 +245,13 @@ test('DOCX Chinese native drag selection reaches the modification request', asyn
   expect(JSON.stringify(selection)).toContain('中文')
 })
 
-test('PDF retains the native iframe and never initializes an Office worker', async ({context}) => {
+test('PDF uses the shared canvas renderer and releases its worker on close', async ({context}) => {
   const page = await prepare(context)
-  expect(await page.evaluate(() => navigator.pdfViewerEnabled)).toBe(true)
   await open(page, 'pdf')
-  const frame = page.locator('iframe.artifact-preview__frame--pdf')
-  await expect(frame).toBeVisible()
-  await expect(frame).toHaveAttribute('src', /^blob:.*#zoom=page-width&view=FitH$/)
-  await expect(page.locator('canvas')).toHaveCount(0)
-  expect(await page.evaluate(() => (window as any).__officeWorkers)).toBe(0)
+  await expect(page.locator('.pdf-preview canvas')).toBeVisible()
+  await expect(page.locator('iframe')).toHaveCount(0)
+  await page.evaluate(() => (window as any).officeFixture.close())
+  await expect.poll(() => page.evaluate(() => (window as any).__officeWorkers)).toBe(0)
   expect(await page.evaluate(() => Array.from(document.fonts).length)).toBe(0)
 })
 

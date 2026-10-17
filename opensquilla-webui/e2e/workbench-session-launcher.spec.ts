@@ -3,6 +3,7 @@ import { helloOkResponse } from './support/gateway-fixture'
 import { chatHistoryPayload, sessionMessagesHydratePayload, sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload } from './support/session-read-fixtures'
 import { expectComposerValue } from './utils'
+import { docxFixture, pdfFixture, pptxFixture, xlsxFixture } from './support/office-fixtures'
 
 test.use({ video: process.env.OPENSQUILLA_RETENTION_RECORD ? 'on' : 'retain-on-failure' })
 
@@ -10,13 +11,16 @@ const A = 'agent:main:webchat:launcher-a'
 const B = 'agent:main:webchat:launcher-b'
 type Wire = Record<string, unknown>
 
-async function installLauncherGateway(page: Page, projectA: boolean, projectB = projectA) {
+async function installLauncherGateway(page: Page, projectA: boolean, projectB = projectA, artifacts: Wire[] = []) {
   const requests: Array<{ method: string; key: string; params?: Wire }> = []
   const materializedProjects = new Set<string>()
   let holdMetadata = true
   let holdHistory = true
   const metadataReplies: Array<() => void> = []
   const historyReplies: Array<() => void> = []
+  let emitTerminalOutput: (data: string) => void = () => { throw new Error('Terminal is not connected') }
+  let terminalTarget: unknown
+  let terminalSeq = 0
   const workspace = { id: 'launcher-project', name: 'Launcher project', path: 'C:/fixtures/launcher',
     available: true, removed: false, taskCount: 2, pinned: false }
   const project = (key: string) => materializedProjects.has(key) || (key === A ? projectA : key === B && projectB)
@@ -24,7 +28,7 @@ async function installLauncherGateway(page: Page, projectA: boolean, projectB = 
     projectWorkspace: project(key) ? workspace : null })
   const history = (key: string) => chatHistoryPayload([A, B].includes(key) ? [
     { id: `${key}-user`, role: 'user', text: `Question ${key === A ? 'A' : 'B'}`, timestamp: 1_800_000_000 },
-    { id: `${key}-answer`, role: 'assistant', text: `Answer ${key === A ? 'A' : 'B'} is ready.`, timestamp: 1_800_000_001 },
+    { id: `${key}-answer`, role: 'assistant', text: `Answer ${key === A ? 'A' : 'B'} is ready.`, timestamp: 1_800_000_001, artifacts: key === A ? artifacts : [] },
   ] : [])
   await page.addInitScript(() => {
     localStorage.setItem('opensquilla-locale', 'en')
@@ -41,6 +45,9 @@ async function installLauncherGateway(page: Page, projectA: boolean, projectB = 
     kind: 'workspace-root', name: workspace.name, path: workspace.path, workspaceBinding: 'a'.repeat(64),
   } }))
   await page.routeWebSocket(/\/ws$/, ws => {
+    emitTerminalOutput = data => ws.send(JSON.stringify({ type: 'event', event: 'terminal.output', payload: {
+      terminalId: 'launcher-pty', target: terminalTarget, seq: ++terminalSeq, data, encoding: 'utf8',
+    } }))
     ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
     ws.onMessage(raw => {
       const frame = JSON.parse(String(raw)) as { type: string; id: string; method: string; params?: Wire; nonce?: string }
@@ -53,7 +60,7 @@ async function installLauncherGateway(page: Page, projectA: boolean, projectB = 
         ws.send(helloOkResponse({ features: { methods: ['sessions.messages.subscribe', 'sessions.messages.hydrate',
           'sessions.messages.snapshot', 'sessions.messages.unsubscribe', 'sessions.sidechat.create',
           'sessions.sidechat.close', 'sessions.create', 'sessions.routing.get', 'workspaces.list', 'workspaces.open',
-          'terminal.create', 'terminal.resize', 'terminal.close'] },
+          'terminal.create', 'terminal.resize', 'terminal.close', 'terminal.consume', 'terminal.write'] },
         auth: { principal: { capabilities: ['chat.read', 'chat.write', 'host.execute'] },
           runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' } } }))
         return
@@ -63,6 +70,15 @@ async function installLauncherGateway(page: Page, projectA: boolean, projectB = 
         respond({ key, sessionId: `fixture-${key}` })
         return
       }
+      if (frame.method === 'terminal.create') {
+        terminalTarget = frame.params?.target ?? { kind: 'session', sessionKey: key }
+        respond({ terminalId: 'launcher-pty', target: terminalTarget, cols: 100, rows: 30, shell: 'fixture', outputFlowControl: 'consumed-v1' })
+        return
+      }
+      if (frame.method === 'terminal.consume') { respond({ terminalId: 'launcher-pty', consumedSeq: frame.params?.seq }); return }
+      if (frame.method === 'terminal.resize') { respond({ terminalId: 'launcher-pty', cols: frame.params?.cols, rows: frame.params?.rows }); return }
+      if (frame.method === 'terminal.close') { respond({ terminalId: 'launcher-pty', closed: true }); return }
+      if (frame.method === 'terminal.write') { respond({ terminalId: 'launcher-pty', accepted: true, bytes: String(frame.params?.data || '').length }); return }
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] }, 'commands.list_for_surface': { commands: [] },
         'config.get': { squilla_router: { enabled: false, tiers: {} }, permissions: {}, skills: {} },
@@ -89,10 +105,76 @@ async function installLauncherGateway(page: Page, projectA: boolean, projectB = 
     })
   })
   return { requests,
+    terminalOutput: (data: string) => emitTerminalOutput(data),
     releaseMetadata: () => { holdMetadata = false; metadataReplies.splice(0).forEach(reply => reply()) },
     releaseHistory: () => { holdHistory = false; historyReplies.splice(0).forEach(reply => reply()) },
   }
 }
+
+test('terminal preserves alternate screen and consumes hidden output across session switches', async ({ page }, info) => {
+  const gateway = await installLauncherGateway(page, false)
+  gateway.releaseMetadata(); gateway.releaseHistory()
+  await openLauncher(page, 3)
+  await page.getByTestId('workbench-start-panel').locator('[data-panel-kind="terminal"]').click()
+  const terminal = page.getByTestId('terminal-panel')
+  await expect(terminal).toContainText('Connected')
+  const rows = terminal.locator('.xterm-rows')
+  gateway.terminalOutput('NORMAL-BASE\r\n\x1b[?1049h\x1b[2J\x1b[HALT-BEFORE')
+  await expect(rows).toContainText('ALT-BEFORE')
+  const original = await terminal.elementHandle()
+  await page.getByRole('button', { name: 'Launcher task B', exact: true }).click()
+  await expect(page.locator('#app-main .chat')).toContainText('Answer B is ready.')
+  await expect(terminal).toBeHidden()
+  const hiddenResizeCount = gateway.requests.filter(request => request.method === 'terminal.resize').length
+  // This updates the real xterm parser while its renderer is hidden. It must
+  // consume the frame, retain alternate-screen mode, and leave B interactive.
+  gateway.terminalOutput('\x1b[HALT-HIDDEN')
+  await expect.poll(() => gateway.requests.filter(request => request.method === 'terminal.consume').at(-1)?.params?.seq).toBe(2)
+  expect(gateway.requests.filter(request => request.method === 'terminal.resize')).toHaveLength(hiddenResizeCount)
+  const composer = page.locator('#app-main .chat-textarea')
+  await composer.fill('Unsent B draft')
+  await page.getByRole('button', { name: 'Launcher task A', exact: true }).click()
+  await expect(terminal).toBeVisible()
+  await expect(rows).toContainText('ALT-HIDDEN')
+  expect(await original!.evaluate(node => node === document.querySelector('[data-testid="terminal-panel"]'))).toBe(true)
+  expect(gateway.requests.filter(request => request.method === 'terminal.create')).toHaveLength(1)
+  expect(gateway.requests.filter(request => request.method === 'terminal.close')).toHaveLength(0)
+  await page.screenshot({ path: info.outputPath('terminal-restored-alternate-screen.png') })
+  gateway.terminalOutput('\x1b[?1049l')
+  await expect(rows).toContainText('NORMAL-BASE')
+  await expect(rows).not.toContainText('ALT-HIDDEN')
+  await page.getByRole('button', { name: 'Launcher task B', exact: true }).click()
+  await expectComposerValue(composer, 'Unsent B draft')
+  expect(gateway.requests.filter(request => request.method === 'terminal.close')).toHaveLength(0)
+  await original!.dispose()
+})
+
+test('a committed editor input and immediate navigation preserve both session drafts', async ({ page }, info) => {
+  const gateway = await installLauncherGateway(page, false)
+  gateway.releaseMetadata(); gateway.releaseHistory()
+  await page.goto(`/control/chat?session=${A}`)
+  await expect(page.locator('#app-main .chat')).toContainText('Answer A is ready.')
+  await page.getByRole('button', { name: 'Launcher task B', exact: true }).click()
+  await expect(page.locator('#app-main .chat')).toContainText('Answer B is ready.')
+  const composer = page.locator('#app-main .chat-textarea')
+  await composer.fill('Existing B draft')
+  await expectComposerValue(composer, 'Existing B draft')
+  await page.getByRole('button', { name: 'Launcher task A', exact: true }).click()
+  await expect(page.locator('#app-main .chat')).toContainText('Answer A is ready.')
+  // Same-task input/navigation reproduces a final editor commit racing route
+  // ownership, without writing app state or storage from the fixture.
+  await page.getByRole('button', { name: 'Launcher task B', exact: true }).evaluate(button => {
+    const editor = document.querySelector<HTMLElement>('#app-main .chat-textarea')!
+    editor.textContent = 'Latest A edit'
+    editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: 'Latest A edit' }))
+    button.click()
+  })
+  await expect(page.locator('#app-main .chat')).toContainText('Answer B is ready.')
+  await expectComposerValue(composer, 'Existing B draft')
+  await page.getByRole('button', { name: 'Launcher task A', exact: true }).click()
+  await expectComposerValue(composer, 'Latest A edit')
+  await page.screenshot({ path: info.outputPath('main-draft-owner-restored.png') })
+})
 
 async function openLauncher(page: Page, count: number) {
   await page.setViewportSize({ width: 1440, height: 960 })
@@ -229,6 +311,98 @@ test('project draft materialization through Files does not leave the reopened pa
 })
 
 test.describe('session workbench retention', () => {
+  for (const format of ['pdf', 'docx', 'pptx', 'xlsx'] as const) {
+    test(`restores artifact ${format} reader through the real session entry`, async ({ page }, info) => {
+      const bytes = { pdf: pdfFixture, docx: docxFixture, pptx: pptxFixture, xlsx: xlsxFixture }[format]()
+      const mime = { pdf: 'application/pdf', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }[format]
+      const name = `artifact-retained.${format}`
+      const gateway = await installLauncherGateway(page, true, true, [{ id: 'retained-document', name, mime,
+        size: bytes.length, download_url: '/api/v1/artifacts/retained-document' }])
+      gateway.releaseMetadata(); gateway.releaseHistory()
+      let reads = 0
+      await page.route('**/api/v1/artifacts/retained-document**', route => {
+        reads++; return route.fulfill({ contentType: mime, body: bytes })
+      })
+      const errors: string[] = []
+      page.on('pageerror', error => errors.push(error.message))
+      await page.setViewportSize({ width: 1440, height: 960 })
+      await page.goto('/control/chat?session=' + encodeURIComponent(A))
+      await page.locator('.msg-artifact-body').filter({ hasText: name }).click()
+      const reader = page.locator(format === 'pdf' ? '.pdf-preview' : '.office-preview')
+      await expect(reader.getByRole('button', { name: 'Zoom in', exact: true })).toBeEnabled()
+      if (format !== 'pdf') {
+        await reader.getByRole('button', { name: 'Next', exact: true }).click()
+        await expect(reader.locator('.office-preview__position')).toHaveText('2 / 2')
+      }
+      await reader.getByRole('button', { name: 'Zoom in', exact: true }).click()
+      const zoom = reader.locator(format === 'pdf' ? '.pdf-preview__fit' : '.office-preview__zoom')
+      if (format !== 'xlsx') await expect(zoom).toHaveValue('manual')
+      await page.getByRole('button', { name: 'Launcher task B', exact: true }).click()
+      await expect(page.locator('#app-main .chat:visible')).toContainText('Answer B is ready.')
+      await expect(reader).toHaveCount(0)
+      await page.getByRole('button', { name: 'Launcher task A', exact: true }).click()
+      await expect(reader.getByRole('button', { name: 'Zoom in', exact: true })).toBeEnabled()
+      if (format !== 'pdf') await expect(reader.locator('.office-preview__position')).toHaveText('2 / 2')
+      if (format !== 'xlsx') await expect(zoom).toHaveValue('manual')
+      expect(reads).toBeGreaterThan(1)
+      expect(errors).toEqual([])
+      await page.screenshot({ path: info.outputPath(`artifact-${format}-reader-restored.png`) })
+      expect(gateway.requests.filter(request => /sessions.sidechat.(create|close)|chat.abort|chat.cancel/.test(request.method))).toHaveLength(0)
+    })
+  }
+  for (const format of ['pdf', 'docx', 'pptx', 'xlsx'] as const) {
+    test(`restores ${format} reading position after disposing the old session reader`, async ({ page }, info) => {
+      const gateway = await installLauncherGateway(page, true)
+      gateway.releaseMetadata(); gateway.releaseHistory()
+      const bytes = { pdf: pdfFixture, docx: docxFixture, pptx: pptxFixture, xlsx: xlsxFixture }[format]()
+      const mime = { pdf: 'application/pdf', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }[format]
+      const name = `retained.${format}`
+      await page.route('**/api/v1/workspace-files/list?**', route => route.fulfill({ json: {
+        workspaceBinding: 'launcher-project', relativePath: '', nextCursor: null, hasMore: false, truncated: false,
+        entries: [{ name, path: name, type: 'file', kind: 'download', mime, size: bytes.length, mtimeNs: '123' }],
+      } }))
+      await page.route('**/api/v1/workspace-files/resolve', route => route.fulfill({ json: {
+        workspaceBinding: 'launcher-project', files: [{ requestedPath: name, path: name, name,
+          mime, size: bytes.length, kind: 'download', revision: 'reading-v1' }],
+      } }))
+      let reads = 0
+      await page.route('**/api/v1/workspace-files/content?**', route => {
+        reads++
+        return route.fulfill({ contentType: mime, body: bytes })
+      })
+      const errors: string[] = []
+      page.on('pageerror', error => errors.push(error.message))
+      const { host } = await openLauncher(page, 4)
+      await host.locator('[data-panel-kind="workspace-files"]').click()
+      const files = page.getByTestId('workspace-files-panel')
+      await files.getByRole('treeitem', { name, exact: true }).click()
+      const reader = files.locator(format === 'pdf' ? '.pdf-preview' : '.office-preview')
+      await expect(reader.getByRole('button', { name: 'Zoom in', exact: true })).toBeEnabled()
+      if (format !== 'pdf') {
+        await reader.getByRole('button', { name: 'Next', exact: true }).click()
+        await expect(reader.locator('.office-preview__position')).toHaveText('2 / 2')
+      }
+      await reader.getByRole('button', { name: 'Zoom in', exact: true }).click()
+      const zoom = format === 'pdf' ? reader.locator('.pdf-preview__fit') : reader.locator('.office-preview__zoom')
+      const expectedZoom = format === 'xlsx' ? null : await zoom.inputValue()
+      if (expectedZoom) expect(expectedZoom).toBe('manual')
+      await page.getByRole('button', { name: 'Launcher task B', exact: true }).click()
+      await expect(page.locator('#app-main .chat:visible')).toContainText('Answer B is ready.')
+      await expect(reader).toHaveCount(0)
+      await page.getByRole('button', { name: 'Launcher task A', exact: true }).click()
+      await expect(reader.getByRole('button', { name: 'Zoom in', exact: true })).toBeEnabled()
+      if (format !== 'pdf') await expect(reader.locator('.office-preview__position')).toHaveText('2 / 2')
+      if (expectedZoom) await expect(zoom).toHaveValue(expectedZoom)
+      expect(reads).toBeGreaterThan(1)
+      expect(errors).toEqual([])
+      await page.screenshot({ path: info.outputPath(`${format}-reader-restored.png`) })
+      expect(gateway.requests.filter(request => /sessions.sidechat.(create|close)|chat.abort|chat.cancel/.test(request.method))).toHaveLength(0)
+    })
+  }
   test('restores files, reading state and side draft through the real A B A entry without retaining file DOM', async ({ page }, info) => {
     const gateway = await installLauncherGateway(page, true)
     gateway.releaseMetadata()
