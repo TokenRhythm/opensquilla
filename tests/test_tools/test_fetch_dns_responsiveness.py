@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import socket
 import threading
+from concurrent.futures import Future
 
 import httpx
 import pytest
@@ -12,7 +13,7 @@ import pytest
 from opensquilla.provider import image_generation
 from opensquilla.skills.hub import clawhub
 from opensquilla.skills.hub.source import SkillSourceFetchError, SourceResolution
-from opensquilla.tools import ssrf
+from opensquilla.tools import fetch_work, ssrf
 from opensquilla.tools.builtin import media
 from opensquilla.tools.types import ToolError
 
@@ -97,8 +98,20 @@ async def test_slow_fetch_dns_keeps_loop_responsive_and_abandons_request(
     for module in (media, image_generation, clawhub):
         monkeypatch.setattr(module, "_trust_env", lambda: True)
     monkeypatch.setattr(httpx, "AsyncClient", connect)
+    preparation_timeouts = []
     if action == "timeout":
         set_timeout(0.05)
+        real_timeout = asyncio.timeout
+
+        def preparation_timeout(delay):
+            # This case needs running work. Queue cancellation before worker
+            # admission is covered separately below, without a deferred clock.
+            deadline = real_timeout(None if delay == 0.05 else delay)
+            if delay == 0.05:
+                preparation_timeouts.append(deadline)
+            return deadline
+
+        monkeypatch.setattr(asyncio, "timeout", preparation_timeout)
     task = asyncio.create_task(fetch())
     try:
         await wait_event(entered)
@@ -110,6 +123,8 @@ async def test_slow_fetch_dns_keeps_loop_responsive_and_abandons_request(
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(task, timeout=0.5)
         else:
+            assert len(preparation_timeouts) == 1
+            preparation_timeouts[0].reschedule(asyncio.get_running_loop().time() + 0.05)
             with pytest.raises(error_type) as failure:
                 await asyncio.wait_for(task, timeout=0.5)
             assert not isinstance(failure.value, TimeoutError)
@@ -118,9 +133,63 @@ async def test_slow_fetch_dns_keeps_loop_responsive_and_abandons_request(
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
-        await wait_event(ended)
+        if entered.is_set():
+            await wait_event(ended)
     await asyncio.sleep(0.01)
     assert requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["cancel", "timeout"])
+async def test_fetch_cancelled_before_worker_admission_never_starts_request(
+    fetch_url, monkeypatch, action,
+):
+    fetch, set_timeout, error_type = fetch_url
+    submitted = asyncio.Event()
+    queued = []
+    dns_calls = []
+    requests = []
+
+    def submit(function, *args):
+        future = Future()
+        queued.append((future, function, args))
+        submitted.set()
+        return future
+
+    def dns(*args, **kwargs):
+        dns_calls.append(args)
+        raise AssertionError("cancelled queued work must not resolve DNS")
+
+    def connect(**kwargs):
+        requests.append(kwargs)
+        raise AssertionError("cancelled queued work must not reach HTTP")
+
+    monkeypatch.setattr(fetch_work._blocking_executor, "submit", submit)
+    monkeypatch.setattr(socket, "getaddrinfo", dns)
+    monkeypatch.setattr(httpx, "AsyncClient", connect)
+    if action == "timeout":
+        set_timeout(0.05)
+    task = asyncio.create_task(fetch())
+    try:
+        await asyncio.wait_for(submitted.wait(), timeout=2)
+        if action == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=0.5)
+        else:
+            with pytest.raises(error_type) as failure:
+                await asyncio.wait_for(task, timeout=0.5)
+            assert not isinstance(failure.value, TimeoutError)
+        assert len(queued) == 1
+        assert queued[0][0].cancelled()
+        # Exercise the real late-worker boundary after the caller has left.
+        fetch_work._FetchWorkers._run(queued[0])
+        assert dns_calls == []
+        assert requests == []
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
