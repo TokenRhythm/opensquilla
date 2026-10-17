@@ -66,9 +66,9 @@ const log = (event, detail = {}) => {
   if (logs.length > 100) logs.shift()
   persistEvents()
 }
-const pageServer = createServer((request, response) => {
+const pageServer = createServer((_request, response) => {
   response.setHeader('content-type', 'text/html; charset=utf-8')
-  response.end(`<!doctype html><title>Unsaved local page ${request.url}</title><style>body{font:16px 'Segoe UI',sans-serif;padding:28px;background:#eef2ff;color:#1e293b}textarea{display:block;width:90%;height:150px;margin-top:16px;font:inherit;padding:12px}p{max-width:650px}</style><h1>Unsaved local acceptance page</h1><p>This page is served only on this fixture's loopback server. Its textarea has a real beforeunload handler. Canceling quit must preserve the same document and value.</p><textarea aria-label="Unsaved note">Do not lose this draft — 验收草稿</textarea><script>window.addEventListener('beforeunload',event=>{event.preventDefault();event.returnValue='Unsaved fixture draft'})</script>`)
+  response.end(`<!doctype html><title>Unsaved local page</title><style>body{font:16px 'Segoe UI',sans-serif;padding:28px;background:#eef2ff;color:#1e293b}textarea{display:block;width:90%;height:150px;margin-top:16px;font:inherit;padding:12px}p{max-width:650px}</style><h1>Unsaved local acceptance page</h1><p>This page is served only on this fixture's loopback server. Its textarea has a real beforeunload handler. Canceling quit must preserve the same document and value.</p><textarea aria-label="Unsaved note">Do not lose this draft — 验收草稿</textarea><script>window.addEventListener('beforeunload',event=>{event.preventDefault();event.returnValue='Unsaved fixture draft'})</script>`)
 })
 await new Promise(resolve => pageServer.listen(0, '127.0.0.1', resolve))
 const pageOrigin = `http://127.0.0.1:${pageServer.address().port}`

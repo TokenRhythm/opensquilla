@@ -72,7 +72,17 @@ try {
       if (page.isClosed()) continue
       if (await page.locator('#confirm').count()) {
         await page.locator('#confirm').waitFor({ state: 'visible' })
-        const native = await waitFor(async () => { const value = await nativeDialogState(page); return value.visible && value.focused ? value : null }, 'the real native dialog is visible and focused')
+        const { native, events, ready, shown } = await waitFor(async () => {
+          const native = await nativeDialogState(page)
+          const events = (await state()).nativeWindowEvents.filter(entry => entry.id === native.id)
+          const ready = events.findIndex(entry => entry.event === 'ready-to-show')
+          const shown = events.findIndex(entry => entry.event === 'show' && entry.visible)
+          // AppKit can make the window focused before Electron emits `show`.
+          // Wait for both native state and receipts within the same deadline.
+          if (!native.visible || !native.focused || ready < 0 || shown <= ready
+            || !events.some(entry => entry.event === 'focus' && entry.focused)) return null
+          return { native, events, ready, shown }
+        }, 'the real native dialog is visible and focused with ready/show/focus receipts')
         assert.equal(native.modal, true)
         assert.equal(native.enabled, true)
         assert.equal(native.parentEnabled, false, 'the native owner is disabled while its modal is open')
@@ -87,9 +97,6 @@ try {
           && bounds.x + bounds.width <= workArea.x + workArea.width
           && bounds.y + bounds.height <= workArea.y + workArea.height,
         'the complete native dialog remains inside its display work area')
-        const events = (await state()).nativeWindowEvents.filter(entry => entry.id === native.id)
-        const ready = events.findIndex(entry => entry.event === 'ready-to-show')
-        const shown = events.findIndex(entry => entry.event === 'show' && entry.visible)
         assert.ok(ready >= 0 && shown > ready, 'production ready-to-show causes an actual native show event')
         assert.ok(events.some(entry => entry.event === 'focus' && entry.focused), 'the native window receives focus')
         return page

@@ -74,7 +74,7 @@ function runDialog(documentHtml) {
     }
     elements.set(id, element)
   }
-  runInNewContext(documentHtml.match(/<script>([\s\S]*?)<\/script>/)[1], {
+  runInNewContext(documentHtml.match(/<script>([\s\S]*?)<\/script>/i)[1], {
     document, window: { opensquillaDesktop: { quitDialogRespond: value => sent.push(JSON.parse(JSON.stringify(value))) },
       addEventListener: (name, handler) => keys.set(name, handler) },
   })
