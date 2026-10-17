@@ -2144,6 +2144,8 @@ def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
             str(SHARD_SCRIPT.resolve()),
             "run",
             selected_shard,
+            "--platform",
+            "windows",
             "--root",
             str(tmp_path),
             "--junit",

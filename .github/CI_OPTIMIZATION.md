@@ -507,6 +507,92 @@ if they fail. Raw JUnit case identities, serial ownership, three NSIS proofs,
 candidate availability, post-candidate acceptance time and total runner time
 are compared separately from overall elapsed time.
 
+The measured candidate is [run 39021418415](https://github.com/TokenRhythm/opensquilla/actions/runs/39021418415)
+at `f71cc5d801fe675760f4dad0f9764c11a5935630`, attempt 1, from
+2026-10-17 09:30:52 UTC through the final job at 09:42:48 UTC.
+
+| Metric | Previous run | Independent Gateway / installed NSIS checks |
+| --- | ---: | ---: |
+| Complete CI wall time | 13:54 | 11:56 |
+| Executed jobs / planned skips | 141 / 2 | 146 / 2 |
+| Peak simultaneous jobs | 120 | 120 |
+| Mean simultaneous jobs | 37.7 | 43.9 |
+| Summed runner time | 523:51 | 524:13 |
+| Median job-created to start | 2 s | 2 s |
+| Former gateway-sqlite-5 work, longest participating job | 13:12 | 6:00 |
+| All four Gateway owners finish, from run creation | 13:39 | 6:27 |
+| Summed Gateway owner runner time | 13:12 | 14:03 |
+| NSIS build job | 7:57 | 6:32 |
+| NSIS candidate ready, from run creation | 8:56 | 7:44 |
+| Installed audit / smoke / first interaction all finish | 13:38 | 9:59 |
+| Candidate ready to all three installed checks finishing | 4:42 | 2:15 |
+| Last NSIS acceptance finishes | 13:38 | 11:28 |
+| Candidate ready to last NSIS acceptance finishing | 4:42 | 3:44 |
+| Candidate ready to final CI result | 4:58 | 4:12 |
+
+Peak concurrency 120 occurred at +1:18 (09:32:10 UTC). The improvement comes
+from shorter long-running branches and higher average concurrency, not a higher
+observed concurrency ceiling. These measurements do not establish a GitHub
+account or runner-pool concurrency limit.
+
+| Gateway owner | Files / cases | Job time | Parallel phase | Serial phase |
+| --- | ---: | ---: | ---: | ---: |
+| gateway-sqlite-5 | 25 / 431 | 6:00 | 216.756 s, 424 cases | 52.826 s, 7 cases |
+| gateway-sqlite-9 | 22 / 378 | 2:43 | 95.811 s, 378 cases | 14.814 s, 0 cases |
+| gateway-sqlite-10 | 22 / 320 | 2:34 | 93.876 s, 320 cases | 12.596 s, 0 cases |
+| gateway-sqlite-11 | 23 / 403 | 2:46 | 103.286 s, 403 cases | 13.362 s, 0 cases |
+
+The four jobs started at +0:27/+0:28 on four distinct Windows runners. Their
+downloaded JUnit identities exactly match all 1,532 baseline cases in 92 files,
+with no missing, added or duplicate cases. All seven serial identities remain
+in the original owner; the same six cases remain skipped. The outcome is
+1,526 passed / 6 skipped. The only outcome change is the previously failing
+message-search Unicode case passing; its source is unchanged. Empty serial
+phases still collect the selected files and confirm that no serial cases exist.
+
+All three installed NSIS jobs passed on three distinct Windows runners. Their
+proofs and the remote aggregate coverage artifact bind the current run/attempt,
+the same five candidate hashes, successful installed-byte verification, each
+assigned check exactly once and successful uninstall. First interaction still
+completes 20 iterations / 40 sends. Dependency audit, Gateway/Safe smoke and
+first interaction took 7.110 / 64.164 / 66.377 seconds respectively. Their
+overlapping execution window was 70.660 seconds versus 137.651 summed seconds.
+All 28 NSIS jobs passed.
+
+The final 148 jobs comprise 144 successes, two planned skips and two failures.
+Ubuntu `recovery-migration-1` failed three parametrizations of
+`test_windows_physical_runner_selects_partition_and_preserves_both_phases`:
+the fixture used native Ubuntu execution but still asserted the Windows
+partition hash. Actual Ubuntu ownership retained the baseline hash; the
+parallel and serial phases both completed. The required `CI result` gate kept
+this failure. A subsequent two-line test-only correction supplies explicit
+`--platform windows`; seven related local tests pass. That correction is not
+part of the measured SHA and has not received another full remote run. No
+product failure was retried or repaired, and the original measurement remains
+attempt 1 with its failure conclusion.
+
+The observed wall-time reduction is 1:58 (14.1%). Gateway's longest job falls
+by 7:12 and the installed NSIS tail after candidate readiness falls by 2:27.
+The final path now ends with `startup-compat-gateway` at +11:28, just after the
+0.5.3 custom long-path upgrade at +11:20. NSIS aggregation finishes at +11:42,
+then the required CI gate at +11:56. These existing gates still validate all
+planned work.
+
+Candidate availability is also 72 seconds earlier, while the unchanged build
+job itself is 85 seconds faster. PyInstaller took approximately 151 seconds
+versus 190 previously, and NSIS installer generation about 96 versus 111.
+Neither build implementation changed. Time after candidate availability through
+the final CI result improves by 46 seconds; the other probes and aggregation
+bound the overall gain. This single failed-versus-failed run comparison includes
+runner/build variation and changed test outcomes, so the full 14.1% must not be
+attributed solely to the scheduling edits. Summed runner time changes by only
++0:22 overall, despite the extra isolated installations and early-waiting jobs.
+
+Paginated API snapshots, four Gateway reports, exact case comparisons, three
+NSIS execution proofs, remote coverage proof, build/failure logs and timing
+comparisons are saved under `.cache/ci-timing/round6/` and
+`.cache/ci-timing/round6-comparison/`. No merge into `main` was performed.
+
 ## Test cost and ownership
 
 The ordinary offline suite excludes `stress`. The required `python-stress` suite
