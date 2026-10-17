@@ -39,6 +39,7 @@ JOB_RESULT_LABELS: Final[dict[str, str]] = {
     "RESULT_MACOS_RECOVERY": "macOS profile recovery and native no-replace tests",
     "RESULT_DESKTOP_RECOVERY_E2E": "Desktop recovery E2E matrix",
     "RESULT_DESKTOP_NATIVE": "Desktop native platform probes",
+    "RESULT_WINDOWS_PROFILES_COVERAGE": "Windows profiles exact-once coverage",
     "RESULT_WEBUI_CHAT_RECOVERY": "WebUI chat recovery browser contracts",
     "RESULT_WEBUI_CAPACITY": "WebUI capacity browser contracts",
     "RESULT_RELEASE": "Release packaging contracts",
@@ -77,7 +78,9 @@ KNOWN_SUITES: Final[frozenset[str]] = frozenset(
 # accepting a planner suite that the aggregate gate does not understand.
 SUITE_RESULT_REQUIREMENTS: Final[dict[str, tuple[str, ...]]] = {
     "dependency-audit": ("RESULT_DEPENDENCY_AUDIT",),
-    "desktop-recovery-e2e": ("RESULT_DESKTOP_RECOVERY_E2E", "RESULT_DESKTOP_NATIVE"),
+    "desktop-recovery-e2e": (
+        "RESULT_DESKTOP_RECOVERY_E2E", "RESULT_DESKTOP_NATIVE", "RESULT_WINDOWS_PROFILES_COVERAGE",
+    ),
     "desktop-static": ("RESULT_DESKTOP",),
     "frontend-artifact": ("RESULT_FRONTEND_ARTIFACT",),
     "frontend-validation": (
@@ -116,6 +119,50 @@ WINDOWS_PHYSICAL_SHARDS: Final[frozenset[str]] = frozenset(
     for family in ("core", "gateway-sqlite", "recovery-migration", "desktop-installer-contracts")
     for partition in range(1, 9 if family == "gateway-sqlite" else 5)
 )
+WINDOWS_PROFILES_SHARDS: Final[frozenset[str]] = frozenset({
+    "profiles-onboarding-flow",
+    "profiles-onboarding-first-chat",
+    "profiles-profile-consolidation-flow",
+    "profiles-primary-repair-accessibility",
+    "profiles-profile-import-flow",
+    "profiles-desktop-cleanup-flow",
+})
+DESKTOP_MATRIX_CELLS: Final[frozenset[tuple[str, str]]] = frozenset(
+    (os_name, shard)
+    for os_name in ("ubuntu-latest", "macos-latest", "windows-latest")
+    for shard in ("profiles", "ownership", "workbench")
+) | frozenset(("windows-latest", shard) for shard in WINDOWS_PROFILES_SHARDS)
+
+
+def _windows_profiles_required(env: Mapping[str, str], errors: list[str]) -> bool:
+    """Require the complete delegated Windows flow set and its original owner."""
+
+    try:
+        matrix = json.loads(env.get("PLANNED_DESKTOP_MATRIX", ""))
+        if not isinstance(matrix, list) or not matrix:
+            raise ValueError("missing Desktop matrix")
+        cells: set[tuple[str, str]] = set()
+        for cell in matrix:
+            if (
+                not isinstance(cell, dict)
+                or set(cell) != {"os", "shard"}
+                or not all(isinstance(value, str) for value in cell.values())
+            ):
+                raise ValueError("invalid Desktop cell")
+            key = (cell["os"], cell["shard"])
+            if key not in DESKTOP_MATRIX_CELLS or key in cells:
+                raise ValueError("unknown or duplicate Desktop cell")
+            cells.add(key)
+        expected = {("windows-latest", shard) for shard in WINDOWS_PROFILES_SHARDS}
+        has_owner = ("windows-latest", "profiles") in cells
+        if has_owner and not expected <= cells:
+            raise ValueError("incomplete Windows profiles delegation")
+        if not has_owner and expected & cells:
+            raise ValueError("Windows profiles delegation has no browser/router owner")
+    except (ValueError, TypeError):
+        errors.append("Planned Desktop matrix is missing, malformed, or incomplete.")
+        return True
+    return has_owner
 
 
 def _windows_bundle_required(env: Mapping[str, str], errors: list[str]) -> bool:
@@ -234,6 +281,8 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
     }
     if "windows-high-risk" in required_suites and not _windows_bundle_required(env, errors):
         required_results.difference_update(WINDOWS_BUNDLE_RESULTS)
+    if "desktop-recovery-e2e" in required_suites and not _windows_profiles_required(env, errors):
+        required_results.discard("RESULT_WINDOWS_PROFILES_COVERAGE")
     for variable, label in JOB_RESULT_LABELS.items():
         _require_exact_result(
             env,

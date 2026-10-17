@@ -21,6 +21,10 @@ WORKFLOW_DIR = Path(".github/workflows")
 PR_TARGET_VALIDATOR = Path(".github/scripts/validate-pr-target-branch.sh")
 PR_BODY_LINT = Path(".github/scripts/validate_pr_body.py")
 TEST_PATH_RE = re.compile(r"tests/[A-Za-z0-9_./-]+\.py")
+WINDOWS_PROFILE_CASES = (
+    "onboarding-flow", "onboarding-first-chat", "profile-consolidation-flow",
+    "primary-repair-accessibility", "profile-import-flow", "desktop-cleanup-flow",
+)
 
 
 @lru_cache(maxsize=32)
@@ -118,8 +122,11 @@ def test_local_diagnostic_generation_remains_required(tmp_path: Path, step_id: s
     assert steps.index(check) < steps.index(upload)
     assert "if" not in check  # Normal success path; earlier test/setup failures stay red.
     assert not check.get("continue-on-error")
-    env = {**os.environ, "CI_REPORT_DIR": tmp_path.as_posix()}
-    command = [_bash_executable(), "-euo", "pipefail", "-c", check["run"]]
+    env = {**os.environ, "CI_REPORT_DIR": tmp_path.as_posix(), "RUNNER_OS": "Windows"}
+    command = [
+        _bash_executable(), "-euo", "pipefail", "-c",
+        check["run"].replace("${{ matrix.shard }}", "ownership"),
+    ]
     assert subprocess.run(command, env=env, capture_output=True).returncode != 0
     for name in re.findall(r'CI_REPORT_DIR\}/([^"\n]+)', check["run"]):
         (tmp_path / name).write_text("generated report\n", encoding="utf-8")
@@ -144,7 +151,7 @@ def test_required_artifact_downloads_share_a_bounded_hard_gate() -> None:
     assert "sleep" not in json.dumps(action)
     # Early upgrade consumers now use the identity-bound wait helper; the two
     # remaining NSIS composite downloads retain the original transfer gate.
-    for workflow, count in [("ci.yml", 12), ("windows-nsis-upgrade-regression.yml", 2)]:
+    for workflow, count in [("ci.yml", 19), ("windows-nsis-upgrade-regression.yml", 2)]:
         steps = [s for j in _workflow(workflow)["jobs"].values() for s in j.get("steps", [])]
         downloads = [s for s in steps
                      if s.get("uses") == "./.github/actions/download-required-artifact"]
@@ -831,6 +838,7 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     assert set(jobs["plan-ci"]["outputs"]) == {
         "required_suites",
         "desktop_matrix",
+        "windows_profiles_split",
         "python_matrix",
         "platform_matrix",
         "windows_nsis_profile",
@@ -1954,6 +1962,7 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "windows-bundle-coverage",
         "macos-recovery",
         "desktop-recovery-e2e",
+        "windows-profiles-coverage",
         "desktop-native-probes",
         "skill-hub",
         "release-packaging",
@@ -1988,6 +1997,12 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
     )
     assert gate_step["env"]["RESULT_DESKTOP_RECOVERY_E2E"] == (
         "${{ needs.desktop-recovery-e2e.result }}"
+    )
+    assert gate_step["env"]["RESULT_WINDOWS_PROFILES_COVERAGE"] == (
+        "${{ needs.windows-profiles-coverage.result }}"
+    )
+    assert gate_step["env"]["PLANNED_DESKTOP_MATRIX"] == (
+        "${{ needs.plan-ci.outputs.desktop_matrix }}"
     )
     assert gate_step["env"]["RESULT_MANAGED_TOOLCHAIN_ARTIFACTS"] == (
         "${{ needs.managed-toolchain-artifacts.result }}"
@@ -2024,6 +2039,8 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "PLANNED_PYTHON_MATRIX",
         "RESULT_MACOS_RECOVERY",
         "RESULT_DESKTOP_RECOVERY_E2E",
+        "RESULT_WINDOWS_PROFILES_COVERAGE",
+        "PLANNED_DESKTOP_MATRIX",
         "RESULT_DESKTOP_NATIVE",
         "RESULT_WEBUI_CHAT_RECOVERY",
         "RESULT_WEBUI_CAPACITY",
@@ -2254,6 +2271,184 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         if step.get("name") == "Run desktop unit tests"
     )
     assert "node scripts/test-ci-case-telemetry.mjs" in desktop_unit["run"]
+
+
+def test_windows_profile_split_keeps_shared_setup_and_original_browser_router_checks() -> None:
+    job = _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]
+    steps = {step["name"]: step for step in job["steps"] if "name" in step}
+    assert job["needs"] == ["plan-ci", "frontend-artifact"]
+    assert job["strategy"]["fail-fast"] is False
+    for name in (
+        "Download verified frontend artifact", "Install Python dependencies",
+        "Install Desktop dependencies", "Prepare and verify pinned Electron binary",
+        "Stage verified frontend artifact for Desktop", "Build Desktop TypeScript",
+    ):
+        assert "if" not in steps[name], f"dedicated profile runners need {name}"
+        assert not steps[name].get("continue-on-error")
+    browser_condition = (
+        "${{ (runner.os == 'Windows' || runner.os == 'macOS') && "
+        "matrix.shard == 'profiles' }}"
+    )
+    for name in (
+        "Run cross-platform production-dist browser session hang contract",
+        "Run cross-platform modern session recovery contracts",
+        "Restore Playwright browser", "Install WebUI recovery browser",
+    ):
+        assert steps[name]["if"] == browser_condition
+    router = steps["Verify compiled Desktop Router against Gateway provider mutations"]
+    assert router["if"] == "${{ !startsWith(matrix.shard, 'profiles-') }}"
+    assert router["env"]["OPENSQUILLA_REQUIRE_DESKTOP_ROUTER_BRIDGE"] == "1"
+    assert "test_router_provider_bridge.py" in router["run"]
+    assert "test_router_catalog_generation.py" in router["run"]
+    native = steps["Test native Windows audit write-view contracts"]
+    assert native["if"] == "${{ runner.os == 'Windows' && matrix.shard == 'ownership' }}"
+    assert "test_windows_signed_update_audit.py" in native["run"]
+    flow = steps["Run compiled Desktop recovery flows"]
+    assert flow["env"]["PLANNED_DESKTOP_MATRIX"] == (
+        "${{ needs.plan-ci.outputs.desktop_matrix }}"
+    )
+    assert "windows_profile_cases.py select" in flow["run"]
+    assert '--planned-desktop-matrix "${PLANNED_DESKTOP_MATRIX}"' in flow["run"]
+    assert flow["run"].count('for entry in "${entries[@]}"') == 1
+    assert flow["run"].count('run_case "${name}" "${script}" 1') == 1
+
+
+@pytest.mark.parametrize("runner_os,shard,selected,expected", [
+    ("Windows", "profiles", "", ()),
+    *[("Windows", f"profiles-{case}", f"{case}:scripts/test-{case}.mjs", (case,))
+      for case in WINDOWS_PROFILE_CASES],
+    ("macOS", "profiles", "", WINDOWS_PROFILE_CASES),
+    ("Linux", "all", "", (
+        "profile-consolidation-flow", "primary-repair-accessibility", "profile-import-flow",
+        "desktop-cleanup-flow", "gateway-ownership", "gateway-orphan-recovery-flow",
+        "window-background-flow", "theme-flow", "native-workbench-surface",
+        "desktop-zoom-shortcuts", "native-workbench-v2", "desktop-browser",
+        "desktop-browser-electron", "live-html-business", "unsafe-legacy-recovery-no-write",
+    )),
+])
+def test_profile_dispatcher_selects_independent_cases_without_duplicate_legacy_runs(
+    tmp_path: Path, runner_os: str, shard: str, selected: str, expected: tuple[str, ...],
+) -> None:
+    flow = next(s["run"] for s in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+                if s.get("name") == "Run compiled Desktop recovery flows")
+    selection = flow[flow.index("select_windows_profile_cases() {"):]
+    selection = selection.split('for entry in "${entries[@]}"', 1)[0]
+    selection = selection.replace("${{ matrix.shard }}", shard)
+    # Substitute only the independently tested native selector. Execute the
+    # actual workflow dispatcher/arg handling, including Windows CRLF output.
+    script = '''python() {
+      [[ "$1" == '../../.github/scripts/windows_profile_cases.py' ]]
+      [[ "$2" == 'select' && "$3" == '--shard' && "$4" == "$TEST_SHARD" ]]
+      [[ "$5" == '--planned-desktop-matrix' && "$6" == "$PLANNED_DESKTOP_MATRIX" ]]
+      [[ "$7" == '--report-dir' && "$8" == "$CI_REPORT_DIR" ]]
+      printf 'selector-called\\n' >&2
+      if [[ -n "$SELECTED_ENTRY" ]]; then printf '%s\\r\\n' "$SELECTED_ENTRY"; fi
+    }
+    ''' + selection + '\nfor entry in "${entries[@]}"; do printf "%s\\n" "$entry"; done\n'
+    result = subprocess.run(
+        [_bash_executable(), "-euo", "pipefail", "-c", script],
+        env={**os.environ, "CI_REPORT_DIR": tmp_path.as_posix(), "RUNNER_OS": runner_os,
+             "TEST_SHARD": shard, "SELECTED_ENTRY": selected,
+             "PLANNED_DESKTOP_MATRIX": '[{"os":"windows-latest","shard":"profiles"}]'},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    specialized_scripts = {
+        "gateway-ownership": "desktop-gateway-ownership",
+        "gateway-orphan-recovery-flow": "desktop-gateway-orphan-recovery-flow",
+        "window-background-flow": "desktop-window-background-flow",
+        "theme-flow": "desktop-theme-flow",
+        "native-workbench-surface": "native-workbench-surface-electron",
+        "native-workbench-v2": "native-workbench-v2-electron",
+    }
+    assert result.stdout.splitlines() == [
+        f"{case}:scripts/test-{specialized_scripts.get(case, case)}.mjs" for case in expected
+    ]
+    assert result.stderr.count("selector-called") == (1 if runner_os == "Windows" else 0)
+    if runner_os == "Windows":
+        assert b"\r" not in (tmp_path / "profile-entries.txt").read_bytes()
+
+
+def test_profile_selector_failure_cannot_turn_into_an_empty_successful_owner(
+    tmp_path: Path,
+) -> None:
+    flow = next(s["run"] for s in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+                if s.get("name") == "Run compiled Desktop recovery flows")
+    selection = flow[flow.index("select_windows_profile_cases() {"):]
+    selection = selection.split('for entry in "${entries[@]}"', 1)[0]
+    selection = selection.replace("${{ matrix.shard }}", "profiles")
+    result = subprocess.run(
+        [_bash_executable(), "-euo", "pipefail", "-c",
+         'python() { return 2; }\n' + selection + '\nprintf "UNSAFE_CONTINUATION\\n"\n'],
+        env={**os.environ, "CI_REPORT_DIR": tmp_path.as_posix(), "RUNNER_OS": "Windows",
+             "PLANNED_DESKTOP_MATRIX": "[]"},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0
+    assert "UNSAFE_CONTINUATION" not in result.stdout
+
+
+def test_zero_electron_owner_still_requires_a_manifest_and_telemetry_file(tmp_path: Path) -> None:
+    step = next(s for s in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+                if s.get("name") == "Check local desktop-summary files")
+    for name in ("environment.txt", "first-failure.txt"):
+        (tmp_path / name).write_text("retained required checks completed\n", encoding="utf-8")
+    telemetry = tmp_path / "desktop-e2e-cases.jsonl"
+    telemetry.touch()
+    command = [_bash_executable(), "-euo", "pipefail", "-c",
+               step["run"].replace("${{ matrix.shard }}", "profiles")]
+    env = {**os.environ, "CI_REPORT_DIR": tmp_path.as_posix(), "RUNNER_OS": "Windows"}
+    assert subprocess.run(command, env=env, capture_output=True).returncode != 0
+    (tmp_path / "windows-profile-manifest.json").write_text('{"selected": []}', encoding="utf-8")
+    assert subprocess.run(command, env=env, capture_output=True).returncode == 0
+    telemetry.unlink()
+    assert subprocess.run(command, env=env, capture_output=True).returncode != 0
+
+
+def test_windows_profile_coverage_requires_all_seven_artifacts_and_gates_ci() -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    producer = jobs["desktop-recovery-e2e"]
+    coverage = jobs["windows-profiles-coverage"]
+    assert coverage["needs"] == ["plan-ci", "desktop-recovery-e2e"]
+    assert "!cancelled()" in coverage["if"]
+    assert "needs.plan-ci.outputs.windows_profiles_split == 'true'" in coverage["if"]
+    assert "needs.desktop-recovery-e2e.result == 'success'" not in coverage["if"]
+    required = next(s for s in producer["steps"]
+                    if s.get("name") == "Upload required Windows profiles execution evidence")
+    assert "always()" in required["if"] and "runner.os == 'Windows'" in required["if"]
+    assert "matrix.shard == 'profiles'" in required["if"]
+    assert "startsWith(matrix.shard, 'profiles-')" in required["if"]
+    assert not required.get("continue-on-error")
+    assert required["with"]["if-no-files-found"] == "error"
+    assert required["with"]["name"] == (
+        "windows-profiles-${{ matrix.shard }}-attempt-${{ github.run_attempt }}"
+    )
+    for filename in (
+        "windows-profile-manifest.json", "desktop-e2e-cases.jsonl", "first-failure.txt",
+    ):
+        assert filename in required["with"]["path"]
+    downloads = [s for s in coverage["steps"]
+                 if s.get("uses") == "./.github/actions/download-required-artifact"]
+    shards = ("profiles", *(f"profiles-{case}" for case in WINDOWS_PROFILE_CASES))
+    assert len(downloads) == len(shards) == 7
+    assert {s["with"]["name"] for s in downloads} == {
+        f"windows-profiles-{shard}-attempt-${{{{ github.run_attempt }}}}" for shard in shards
+    }
+    assert len({s["with"]["path"] for s in downloads}) == 7
+    assert all(s["if"] == "${{ !cancelled() }}" and not s.get("continue-on-error")
+               for s in downloads)
+    verify = next(s for s in coverage["steps"]
+                  if s.get("name") == "Verify all six Windows profile scripts execute exactly once")
+    assert verify["if"] == "${{ !cancelled() }}"
+    assert "windows_profile_cases.py verify" in verify["run"]
+    assert "--reports-dir" in verify["run"]
+    assert not verify.get("continue-on-error")
+    upload = next(s for s in coverage["steps"]
+                  if s.get("name") == "Upload Windows profiles coverage proof")
+    assert upload["if"] == "${{ always() }}"
+    assert upload["with"]["if-no-files-found"] == "error"
+    assert not upload.get("continue-on-error")
+    assert "windows-profiles-coverage" in jobs["ci-result"]["needs"]
 
 
 @pytest.mark.parametrize("line_ending", ("\n", "\r\n"), ids=("lf", "crlf"))

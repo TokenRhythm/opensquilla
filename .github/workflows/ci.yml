@@ -184,6 +184,7 @@ jobs:
     outputs:
       required_suites: ${{ steps.plan.outputs.required_suites }}
       desktop_matrix: ${{ steps.plan.outputs.desktop_matrix }}
+      windows_profiles_split: ${{ steps.plan.outputs.windows_profiles_split }}
       python_matrix: ${{ steps.plan.outputs.python_matrix }}
       platform_matrix: ${{ steps.plan.outputs.platform_matrix }}
       windows_nsis_profile: ${{ steps.plan.outputs.windows_nsis_profile }}
@@ -292,6 +293,11 @@ jobs:
                   elif isinstance(value, (dict, list)):
                       value = json.dumps(value, sort_keys=True, separators=(",", ":"))
                   handle.write(f"{key}={value}\n")
+              windows_profiles_split = any(
+                  cell == {"os": "windows-latest", "shard": "profiles"}
+                  for cell in plan["desktop_matrix"]
+              )
+              handle.write(f"windows_profiles_split={str(windows_profiles_split).lower()}\n")
           PY
 
       - name: Report test timing coverage
@@ -2446,6 +2452,9 @@ jobs:
         run: npm run build
 
       - name: Verify compiled Desktop Router against Gateway provider mutations
+        # Keep these checks in their original cells; dedicated profile scripts
+        # reuse the compiled Desktop but do not duplicate the Router tests.
+        if: ${{ !startsWith(matrix.shard, 'profiles-') }}
         env:
           OPENSQUILLA_REQUIRE_DESKTOP_ROUTER_BRIDGE: '1'
         run: uv run --no-sync pytest -q tests/test_desktop/test_router_provider_bridge.py tests/test_desktop/test_router_catalog_generation.py
@@ -2454,6 +2463,7 @@ jobs:
         working-directory: desktop/electron
         shell: bash
         env:
+          PLANNED_DESKTOP_MATRIX: ${{ needs.plan-ci.outputs.desktop_matrix }}
           OPENSQUILLA_DESKTOP_CONSOLIDATION_SCREENSHOT: ${{ runner.temp }}/desktop-recovery-e2e/consolidated-primary.png
           OPENSQUILLA_DESKTOP_IMPORT_SCREENSHOT_DIR: ${{ runner.temp }}/desktop-recovery-e2e/profile-import-screenshots
         run: |
@@ -2690,6 +2700,14 @@ jobs:
           PY
           }
 
+          select_windows_profile_cases() {
+            python ../../.github/scripts/windows_profile_cases.py select \
+              --shard "${{ matrix.shard }}" \
+              --planned-desktop-matrix "${PLANNED_DESKTOP_MATRIX}" \
+              --report-dir "${CI_REPORT_DIR}" | tr -d '\r' > "${CI_REPORT_DIR}/profile-entries.txt"
+            mapfile -t entries < "${CI_REPORT_DIR}/profile-entries.txt"
+          }
+
           case "${{ matrix.shard }}" in
             all)
               entries=(
@@ -2717,14 +2735,23 @@ jobs:
               fi
               ;;
             profiles)
-              entries=(
-                'onboarding-flow:scripts/test-onboarding-flow.mjs'
-                'onboarding-first-chat:scripts/test-onboarding-first-chat.mjs'
-                'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs'
-                'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs'
-                'profile-import-flow:scripts/test-profile-import-flow.mjs'
-                'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs'
-              )
+              if [[ "${RUNNER_OS}" == "Windows" ]]; then
+                # Browser/Router checks remain here. The validated six cells
+                # own the Electron scripts on separate Windows runners.
+                select_windows_profile_cases
+              else
+                entries=(
+                  'onboarding-flow:scripts/test-onboarding-flow.mjs'
+                  'onboarding-first-chat:scripts/test-onboarding-first-chat.mjs'
+                  'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs'
+                  'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs'
+                  'profile-import-flow:scripts/test-profile-import-flow.mjs'
+                  'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs'
+                )
+              fi
+              ;;
+            profiles-*)
+              select_windows_profile_cases
               ;;
             ownership)
               entries=(
@@ -2824,7 +2851,24 @@ jobs:
           set -euo pipefail
           test -s "${CI_REPORT_DIR}/environment.txt"
           test -s "${CI_REPORT_DIR}/first-failure.txt"
-          test -s "${CI_REPORT_DIR}/desktop-e2e-cases.jsonl"
+          if [[ "${RUNNER_OS}" == "Windows" && "${{ matrix.shard }}" == 'profiles' ]]; then
+            test -s "${CI_REPORT_DIR}/windows-profile-manifest.json"
+            test -f "${CI_REPORT_DIR}/desktop-e2e-cases.jsonl"
+          else
+            test -s "${CI_REPORT_DIR}/desktop-e2e-cases.jsonl"
+          fi
+
+      - name: Upload required Windows profiles execution evidence
+        if: ${{ always() && runner.os == 'Windows' && (matrix.shard == 'profiles' || startsWith(matrix.shard, 'profiles-')) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-profiles-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/desktop-recovery-e2e/windows-profile-manifest.json
+            ${{ runner.temp }}/desktop-recovery-e2e/desktop-e2e-cases.jsonl
+            ${{ runner.temp }}/desktop-recovery-e2e/first-failure.txt
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload Desktop recovery summary
         id: desktop-summary
@@ -2870,6 +2914,79 @@ jobs:
         if: ${{ !cancelled() && steps.desktop-failure.outcome == 'failure' }}
         shell: bash
         run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
+
+  windows-profiles-coverage:
+    name: Windows profiles exact-once coverage
+    needs: [plan-ci, desktop-recovery-e2e]
+    if: >-
+      ${{ !cancelled() && needs.plan-ci.result == 'success'
+          && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'desktop-recovery-e2e')
+          && needs.plan-ci.outputs.windows_profiles_split == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download Windows profiles evidence
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-profiles-profiles-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-reports/profiles
+      - name: Download Windows profiles-onboarding-flow evidence
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-profiles-profiles-onboarding-flow-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-reports/profiles-onboarding-flow
+      - name: Download Windows profiles-onboarding-first-chat evidence
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-profiles-profiles-onboarding-first-chat-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-reports/profiles-onboarding-first-chat
+      - name: Download Windows profiles-profile-consolidation-flow evidence
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-profiles-profiles-profile-consolidation-flow-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-reports/profiles-profile-consolidation-flow
+      - name: Download Windows profiles-primary-repair-accessibility evidence
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-profiles-profiles-primary-repair-accessibility-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-reports/profiles-primary-repair-accessibility
+      - name: Download Windows profiles-profile-import-flow evidence
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-profiles-profiles-profile-import-flow-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-reports/profiles-profile-import-flow
+      - name: Download Windows profiles-desktop-cleanup-flow evidence
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-profiles-profiles-desktop-cleanup-flow-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-reports/profiles-desktop-cleanup-flow
+      - name: Verify all six Windows profile scripts execute exactly once
+        if: ${{ !cancelled() }}
+        run: >-
+          python .github/scripts/windows_profile_cases.py verify
+          --reports-dir "${{ runner.temp }}/windows-profiles-reports"
+          --output "${{ runner.temp }}/windows-profiles-coverage.json"
+      - name: Upload Windows profiles coverage proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-profiles-coverage-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-coverage.json
+          if-no-files-found: error
+          retention-days: 14
 
   skill-hub:
     name: skill-hub-contract (${{ matrix.os }})
@@ -3155,6 +3272,7 @@ jobs:
       - windows-bundle-coverage
       - macos-recovery
       - desktop-recovery-e2e
+      - windows-profiles-coverage
       - desktop-native-probes
       - skill-hub
       - release-packaging
@@ -3271,6 +3389,8 @@ jobs:
           PLANNED_PYTHON_MATRIX: ${{ needs.plan-ci.outputs.python_matrix }}
           RESULT_MACOS_RECOVERY: ${{ needs.macos-recovery.result }}
           RESULT_DESKTOP_RECOVERY_E2E: ${{ needs.desktop-recovery-e2e.result }}
+          RESULT_WINDOWS_PROFILES_COVERAGE: ${{ needs.windows-profiles-coverage.result }}
+          PLANNED_DESKTOP_MATRIX: ${{ needs.plan-ci.outputs.desktop_matrix }}
           RESULT_DESKTOP_NATIVE: ${{ needs.desktop-native-probes.result }}
           RESULT_WEBUI_CHAT_RECOVERY: ${{ needs.webui-chat-recovery.result }}
           RESULT_WEBUI_CAPACITY: ${{ needs.webui-capacity.result }}

@@ -25,6 +25,11 @@ plan_changes = MODULE["plan_changes"]
 
 CONFIG_PATH = Path(".github/ci/suites.v1.json")
 TRUST_POLICY_PATH = Path(".github/ci/trust-policy.v1.json")
+WINDOWS_PROFILES_SHARDS = {
+    "profiles-onboarding-flow", "profiles-onboarding-first-chat",
+    "profiles-profile-consolidation-flow", "profiles-primary-repair-accessibility",
+    "profiles-profile-import-flow", "profiles-desktop-cleanup-flow",
+}
 MERGE_CRITICAL_INPUTS = json.loads(TRUST_POLICY_PATH.read_text(encoding="utf-8"))[
     "merge_critical_inputs"
 ]
@@ -1305,8 +1310,59 @@ def test_desktop_domain_selects_only_its_windows_shard(
         ("macos-latest", windows_shard),
         ("ubuntu-latest", windows_shard),
         ("windows-latest", windows_shard),
-    }
+    } | ({("windows-latest", shard) for shard in WINDOWS_PROFILES_SHARDS}
+         if windows_shard == "profiles" else set())
     assert reason in plan["reason_codes"]
+
+
+@pytest.mark.parametrize("suffix,os_scope", [
+    ("", set()), ("-windows", {"windows-latest"}),
+    ("-macos", {"macos-latest"}), ("-linux", {"ubuntu-latest"}),
+])
+def test_profile_targeted_closure_splits_only_windows(
+    tmp_path: Path, suite_config: dict[str, Any], suffix: str, os_scope: set[str],
+) -> None:
+    path = f"desktop/electron/scripts/test-profile-import-flow{suffix}.mjs"
+    plan = _plan(tmp_path, suite_config, path)
+    platforms = os_scope or {"windows-latest", "macos-latest", "ubuntu-latest"}
+    expected = {(platform, "profiles") for platform in platforms}
+    if "windows-latest" in platforms:
+        expected.update(("windows-latest", shard) for shard in WINDOWS_PROFILES_SHARDS)
+    assert _matrix(plan) == expected
+    assert expected <= _platform_cells(plan, "desktop-recovery-e2e")
+
+
+def test_windows_profiles_executor_change_requires_fresh_full_desktop_evidence(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    relative = ".github/scripts/windows_profile_cases.py"
+    dependency = tmp_path / relative
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("first\n", encoding="utf-8")
+    first = _plan(tmp_path, suite_config, relative)
+    dependency.write_text("second\n", encoding="utf-8")
+    second = _plan(tmp_path, suite_config, relative)
+    assert first["full_fallback"] is True
+    assert first["reason_codes"] == ["ci_policy_changed"]
+    assert first["required_suites"] == sorted(suite_config["full_suites"])
+    assert first["suite_execution_digests"]["desktop-recovery-e2e"] != (
+        second["suite_execution_digests"]["desktop-recovery-e2e"]
+    )
+
+
+@pytest.mark.parametrize("omitted", ["profiles", *sorted(WINDOWS_PROFILES_SHARDS)])
+def test_full_desktop_contract_rejects_an_incomplete_windows_profile_split(
+    tmp_path: Path, omitted: str,
+) -> None:
+    value = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    value["full_desktop_matrix"] = [
+        cell for cell in value["full_desktop_matrix"]
+        if cell != {"os": "windows-latest", "shard": omitted}
+    ]
+    path = tmp_path / "suites.v1.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(PlanError, match="Windows profiles"):
+        load_config(path)
 
 
 def test_full_desktop_matrix_keeps_macos_ownership_and_workbench_isolated(
@@ -1320,6 +1376,10 @@ def test_full_desktop_matrix_keeps_macos_ownership_and_workbench_isolated(
 
     assert macos_cells == {"profiles", "ownership", "workbench"}
     assert "ownership-workbench" not in macos_cells
+    assert {
+        cell["shard"] for cell in suite_config["full_desktop_matrix"]
+        if cell["os"] == "windows-latest"
+    } == {"profiles", "ownership", "workbench"} | WINDOWS_PROFILES_SHARDS
 
 
 def test_windows_specific_platform_change_stays_on_windows(

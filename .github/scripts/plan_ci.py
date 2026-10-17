@@ -27,6 +27,14 @@ _WINDOWS_PARTITIONS_CONFIG_KEY: Final = "windows_test_partitions"
 _WINDOWS_PARTITIONS_PATH_KEY: Final = "_windows_test_partitions_path"
 _MACOS_RECOVERY_TEST_INPUTS_KEY: Final = "macos_recovery_test_inputs"
 _MERGE_CRITICAL_INPUTS_KEY: Final = "_merge_critical_inputs"
+WINDOWS_PROFILES_SHARDS: Final[tuple[str, ...]] = (
+    "profiles-onboarding-flow",
+    "profiles-onboarding-first-chat",
+    "profiles-profile-consolidation-flow",
+    "profiles-primary-repair-accessibility",
+    "profiles-profile-import-flow",
+    "profiles-desktop-cleanup-flow",
+)
 
 _DOC_EXACT: Final = {
     "CHANGELOG.md",
@@ -686,6 +694,12 @@ def load_config(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
         if key in seen_cells:
             raise PlanError("full_desktop_matrix contains duplicate cells")
         seen_cells.add(key)
+    split_profiles = {("windows-latest", shard) for shard in WINDOWS_PROFILES_SHARDS}
+    if ("windows-latest", "profiles") in seen_cells:
+        if not split_profiles <= seen_cells:
+            raise PlanError("Windows profiles owner requires all six independent flow cells")
+    elif split_profiles & seen_cells:
+        raise PlanError("Windows profiles flow cells require their browser/router owner")
 
     python_families = _require_string_list(
         value.get("python_shard_families"), "python_shard_families"
@@ -2238,6 +2252,11 @@ def plan_changes(
         suites.add("frontend-artifact")
 
     required_suites = sorted(suites)
+    # Windows keeps the browser/router contracts in their original owner;
+    # each audited Electron script gets its own hosted runner. Preserve every
+    # internal launch/restart/recovery sequence inside the unchanged scripts.
+    if ("windows-latest", "profiles") in desktop_cells:
+        desktop_cells.update(("windows-latest", shard) for shard in WINDOWS_PROFILES_SHARDS)
     windows_nsis_profile = "full" if full_fallback or windows_nsis_full else "smoke"
     python_matrix, platform_matrix = _execution_matrices(
         required_suites,

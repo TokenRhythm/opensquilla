@@ -112,6 +112,30 @@
     },
     {
       "os": "windows-latest",
+      "shard": "profiles-onboarding-flow"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-onboarding-first-chat"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-profile-consolidation-flow"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-primary-repair-accessibility"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-profile-import-flow"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-desktop-cleanup-flow"
+    },
+    {
+      "os": "windows-latest",
       "shard": "ownership"
     },
     {
@@ -362,6 +386,7 @@
     },
     "desktop-recovery-e2e": {
       "execution_inputs": [
+        ".github/scripts/windows_profile_cases.py",
         ".github/workflows/desktop-native-probes.yml",
         ".dockerignore",
         "Dockerfile",

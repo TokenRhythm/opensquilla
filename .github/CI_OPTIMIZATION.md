@@ -364,6 +364,39 @@ comparisons are under `.cache/ci-timing/round4/` and
 `.cache/ci-timing/round4-comparison/`. Results remain on the experiment branch;
 no merge into `main` was performed.
 
+### Fifth experiment: independent Windows profile scripts
+
+The six Electron scripts formerly executed sequentially in Windows `profiles`
+now run in six independent `desktop-recovery-e2e` matrix cells. Their names are
+`profiles-onboarding-flow`, `profiles-onboarding-first-chat`,
+`profiles-profile-consolidation-flow`, `profiles-primary-repair-accessibility`,
+`profiles-profile-import-flow`, and `profiles-desktop-cleanup-flow`. Every cell
+retains the original staged frontend, Python dependencies, compiled Desktop and
+prepared Electron setup. The original Windows `profiles` cell retains both
+browser contracts and its Router tests; the new cells do not duplicate those
+checks. Linux and macOS selection is unchanged.
+
+The six scripts and telemetry wrapper are unchanged. Each creates isolated
+temporary profiles; some use fixed ports within the isolated runner. Internal
+import, shutdown, restart and recovery sequences remain serial. No deadlines,
+assertions, retries or failure handling are relaxed.
+
+The planner closes every Windows profiles selection over all six execution
+cells. A required coverage job verifies seven identity-bound reports: the
+original owner executes zero of the six scripts, and each dedicated runner
+executes its assigned script once. Reports preserve the script inventory and
+hashes, run/SHA/attempt, telemetry status and exit result. Missing, duplicate,
+skipped or inconsistent evidence fails the aggregate gate. Script failures
+remain failures of the Desktop matrix, independently of complete invocation
+coverage. This proves execution of each script, not completion of every
+assertion inside a failing script. As with the bundle proof, a repeated
+experiment needs all participating jobs from the same attempt.
+
+The comparison baseline is run `39013705315` at
+`802b98244c48feed53dc295f39af9bf8a33ff720`: 14:41 overall, including the retained
+Windows profiles cleanup failure. The experiment uses a full remote
+`workflow_dispatch` and preserves its first-attempt result regardless of failure.
+
 ## Test cost and ownership
 
 The ordinary offline suite excludes `stress`. The required `python-stress` suite

@@ -366,6 +366,10 @@ def _env_for(suites: set[str]) -> dict[str, str]:
                 if "windows-high-risk" in suites else []
             ),
         }),
+        "PLANNED_DESKTOP_MATRIX": json.dumps([
+            {"os": os_name, "shard": shard}
+            for os_name, shard in sorted(GATE_MODULE["DESKTOP_MATRIX_CELLS"])
+        ] if "desktop-recovery-e2e" in suites else []),
     }
     env.update(
         {
@@ -420,6 +424,8 @@ def test_partial_gate_keeps_wheel_job_and_skips_reused_frontend_checks() -> None
     ("RESULT_FRONTEND_UNIT", "failure"), ("RESULT_CONTRACT_LINUX", "failure"),
     ("RESULT_CONTRACT_VERIFICATION_WINDOWS", "failure"),
     ("RESULT_WHEEL_WEBUI", "failure"), ("RESULT_DESKTOP_NATIVE", "failure"),
+    ("RESULT_WINDOWS_PROFILES_COVERAGE", "failure"),
+    ("RESULT_WINDOWS_PROFILES_COVERAGE", "skipped"),
     ("RESULT_CONTRACT_COMPARE", "failure"),
     ("RESULT_PLANNER", "cancelled"),
     ("QUEUE_PARTIAL", ""), ("QUEUE_PARTIAL", "false"), ("QUEUE_PARTIAL", "invalid"),
@@ -593,6 +599,7 @@ def test_ci_result_gate_requires_both_python_full_jobs() -> None:
     ("frontend-validation", "RESULT_CONTRACT_LINUX"),
     ("wheel-webui-roundtrip", "RESULT_WHEEL_WEBUI"),
     ("desktop-recovery-e2e", "RESULT_DESKTOP_NATIVE"),
+    ("desktop-recovery-e2e", "RESULT_WINDOWS_PROFILES_COVERAGE"),
     ("windows-high-risk", "RESULT_WINDOWS_BUNDLE"),
     ("windows-high-risk", "RESULT_WINDOWS_BUNDLE_COVERAGE"),
 ])
@@ -678,6 +685,60 @@ def test_windows_gate_physical_shards_match_planner_manifest() -> None:
     assert GATE_MODULE["WINDOWS_PHYSICAL_SHARDS"] == set(
         manifest["full_python_matrix"]["windows"]
     )
+    assert GATE_MODULE["DESKTOP_MATRIX_CELLS"] == {
+        (cell["os"], cell["shard"]) for cell in manifest["full_desktop_matrix"]
+    }
+
+
+@pytest.mark.parametrize("os_name,shard", [
+    ("macos-latest", "profiles"), ("ubuntu-latest", "profiles"),
+    ("windows-latest", "ownership"), ("windows-latest", "workbench"),
+])
+def test_non_windows_profiles_plan_skips_the_windows_coverage_job(os_name: str, shard: str) -> None:
+    env = _env_for(BASELINE_SUITES | {"desktop-recovery-e2e"})
+    env["PLANNED_DESKTOP_MATRIX"] = json.dumps([{"os": os_name, "shard": shard}])
+    env["RESULT_WINDOWS_PROFILES_COVERAGE"] = "skipped"
+    assert check_ci_results(env) == []
+    env["RESULT_WINDOWS_PROFILES_COVERAGE"] = "success"
+    assert any("Windows profiles" in error and "skipped" in error
+               for error in check_ci_results(env))
+
+
+def test_targeted_windows_profiles_requires_browser_owner_six_flows_and_coverage() -> None:
+    env = _env_for(BASELINE_SUITES | {"desktop-recovery-e2e"})
+    matrix = [{"os": "windows-latest", "shard": shard} for shard in (
+        "profiles", *sorted(GATE_MODULE["WINDOWS_PROFILES_SHARDS"]),
+    )]
+    env["PLANNED_DESKTOP_MATRIX"] = json.dumps(matrix)
+    assert check_ci_results(env) == []
+    for omitted in matrix:
+        altered = {**env, "PLANNED_DESKTOP_MATRIX": json.dumps([
+            cell for cell in matrix if cell != omitted
+        ])}
+        assert any("Planned Desktop matrix" in error for error in check_ci_results(altered))
+
+
+@pytest.mark.parametrize("raw", [
+    None, "", "not-json", "null", "{}", "[]", "[{}]", "[null]",
+    '[{"os":"windows-latest","shard":"profiles"}]',
+    '[{"os":"macos-latest","shard":"profiles-onboarding-flow"}]',
+    '[{"os":"windows-latest","shard":"profiles-onboarding-flow"}]',
+    '[{"os":"windows-latest","shard":"profiles-unknown"}]',
+    '[{"os":"windows-latest","shard":false}]',
+    '[{"os":"windows-latest","shard":"ownership","unknown":0}]',
+    '[{"os":"windows-latest","shard":"ownership"},'
+    '{"os":"windows-latest","shard":"ownership"}]',
+])
+def test_profiles_gate_rejects_missing_malformed_or_partial_desktop_plan(raw: str | None) -> None:
+    env = _env_for(BASELINE_SUITES | {"desktop-recovery-e2e"})
+    if raw is None:
+        env.pop("PLANNED_DESKTOP_MATRIX")
+    else:
+        env["PLANNED_DESKTOP_MATRIX"] = raw
+    assert any("Planned Desktop matrix" in error for error in check_ci_results(env))
+    env["RESULT_WINDOWS_PROFILES_COVERAGE"] = "skipped"
+    assert any("Windows profiles" in error and "success" in error
+               for error in check_ci_results(env))
 
 
 def test_frontend_validation_requires_windows_contract_determinism() -> None:

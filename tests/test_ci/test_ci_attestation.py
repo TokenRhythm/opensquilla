@@ -609,6 +609,7 @@ def test_validate_candidate_rejects_non_green_or_mismatched_runs(tmp_path: Path)
         ("platform-matrix", "platform matrix"),
         ("legacy-windows-matrix", "platform matrix"),
         ("missing-windows-bundle-cell", "platform matrix"),
+        ("missing-windows-profile-flow", "platform matrix"),
         ("missing-contract-comparison", "platform matrix"),
     ),
 )
@@ -662,6 +663,13 @@ def test_validate_candidate_rejects_independent_evidence_contract_mismatches(
     elif mismatch == "missing-windows-bundle-cell":
         omitted = {
             "suite": "windows-high-risk", "os": "windows-latest", "shard": "bundle-4",
+        }
+        assert omitted in tampered["platform_matrix"]
+        tampered["platform_matrix"].remove(omitted)
+    elif mismatch == "missing-windows-profile-flow":
+        omitted = {
+            "suite": "desktop-recovery-e2e", "os": "windows-latest",
+            "shard": "profiles-desktop-cleanup-flow",
         }
         assert omitted in tampered["platform_matrix"]
         tampered["platform_matrix"].remove(omitted)
