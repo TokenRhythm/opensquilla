@@ -5371,7 +5371,15 @@ provide(VISUALIZE_CONVERSATION_KEY, {
   },
   draft(key, receipt, text) {
     if (!visualizeConversationEnabled(key)) return false
-    appendComposerText(`${receipt.name}\n${text.slice(0, 4000)}`)
+    const draft = `${receipt.name}\n${text.slice(0, 4000)}`
+    // Idempotent while the exact block is still in this session's composer.
+    // Clearing/sending it permits another explicit request, even after remount.
+    const presented = localPathPresentation(draft).text.trim()
+    if (!composerText.value.includes(presented)) appendComposerText(draft)
+    expandComposer()
+    nextTick(() => {
+      if (visualizeConversationEnabled(key)) composerRef.value?.focusTextarea()
+    })
     return true
   },
 })

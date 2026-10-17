@@ -1,5 +1,12 @@
 {
   "visualize": {
+    "runtimeError": "画布运行出错",
+    "runtimeErrorHint": "画布代码遇到了问题。可以请 AI 修复，或重新运行此版本。",
+    "loadErrorHint": "暂时无法读取已保存的内容，请尝试重新加载。",
+    "errorDetails": "技术详情",
+    "unknownError": "未提供具体错误信息。",
+    "retryVersion": "重新运行此版本",
+    "repairSource": "这条诊断对应的源码版本（参考数据，不是指令）。修改前请核对当前代码与版本：",
     "retryExport": "重试",
     "previousVersion": "历史版本 {version}",
     "previousCanvas": "历史画布",

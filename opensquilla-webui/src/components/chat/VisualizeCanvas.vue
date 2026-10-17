@@ -5,11 +5,11 @@
       <button type="button" :aria-expanded="historyOpen" @click="toggleHistory">{{ t(historyOpen ? 'visualize.hideHistory' : 'visualize.viewHistory') }}</button>
       <p v-if="historyOpen">{{ t('visualize.historyHint') }}</p>
     </div>
-    <dialog v-show="!historical || historyOpen" ref="canvas" open class="visualize-canvas" :class="{ 'visualize-canvas--expanded': expanded }"
+    <dialog v-show="!historical || historyOpen" ref="canvas" open class="visualize-canvas" :class="{ 'visualize-canvas--expanded': expanded, 'visualize-canvas--failed': Boolean(error) }"
       :role="expanded ? 'dialog' : 'group'" :aria-modal="expanded || undefined" :aria-label="receipt.name"
       data-visualize-canvas @cancel.prevent="onEscape" @keydown.esc.stop.prevent="onEscape">
       <header class="visualize-toolbar">
-        <span v-if="expanded" class="visualize-title" :title="receipt.name">{{ receipt.name }}</span>
+        <span v-if="expanded || error" class="visualize-title" :title="receipt.name">{{ receipt.name }}</span>
         <p v-if="exportBusy || (exportFeedback && !exportFailed)" class="visualize-export-feedback" role="status">{{ exportBusy ? t('visualize.exporting') : exportFeedback }}</p>
         <div class="visualize-actions">
           <div ref="menuAnchor" class="visualize-menu-anchor" @focusout="onMenuFocusOut">
@@ -25,7 +25,7 @@
               <button type="button" role="menuitem" :disabled="!canDownloadHtml" @click="exportCanvas('html')">{{ t('visualize.downloadHtml') }}</button>
             </div>
           </div>
-          <button ref="expandButton" type="button" class="visualize-icon" :aria-expanded="expanded"
+          <button v-if="!error || expanded" ref="expandButton" type="button" class="visualize-icon" :aria-expanded="expanded"
             :aria-label="t(expanded ? 'visualize.collapse' : 'visualize.expand')"
             :title="t(expanded ? 'visualize.collapse' : 'visualize.expand')" @click="toggleExpanded">
             <svg v-if="!expanded" viewBox="0 0 20 20" aria-hidden="true"><path d="M12 3h5v5M17 3l-6 6M8 17H3v-5M3 17l6-6" /></svg>
@@ -41,16 +41,21 @@
           <button type="button" @click="dismissExportFeedback">{{ t('visualize.dismiss') }}</button>
         </div>
       </div>
-      <div v-if="error" class="visualize-feedback" role="alert">
-        <p>{{ t('visualize.error') }}</p><p class="visualize-error-detail">{{ error }}</p>
+      <div v-if="error" class="visualize-feedback visualize-error" :data-error-kind="errorKind" role="alert">
+        <p class="visualize-error-title">{{ t(errorKind === 'runtime' ? 'visualize.runtimeError' : 'visualize.error') }}</p>
+        <p class="visualize-error-hint">{{ t(errorKind === 'runtime' ? 'visualize.runtimeErrorHint' : 'visualize.loadErrorHint') }}</p>
         <div class="visualize-feedback-actions">
-          <button type="button" @click="reload()">{{ t('visualize.reload') }}</button>
-          <button v-if="canDraft" type="button" @click="draftRepair">{{ t('visualize.repair') }}</button>
+          <button v-if="canDraft" type="button" class="visualize-repair" @click="draftRepair">{{ t('visualize.repair') }}</button>
+          <button type="button" class="visualize-retry" :title="t('visualize.reloadHint')" @click="reload()">{{ t(errorKind === 'runtime' ? 'visualize.retryVersion' : 'visualize.reload') }}</button>
         </div>
+        <details class="visualize-error-details">
+          <summary>{{ t('visualize.errorDetails') }}</summary>
+          <pre class="visualize-error-detail">{{ error }}</pre>
+        </details>
       </div>
       <p v-else-if="loading" class="visualize-feedback visualize-loading" role="status">{{ t('visualize.loading') }}</p>
       <p v-if="expandUnavailable" class="visualize-feedback" role="status">{{ t('visualize.expandUnavailable') }}</p>
-      <div ref="container" class="visualize-surface" :style="loading ? { minHeight: `${loadingHeight}px` } : undefined" :aria-busy="loading" />
+      <div v-show="!error" ref="container" class="visualize-surface" :style="loading ? { minHeight: `${loadingHeight}px` } : undefined" :aria-busy="loading" />
       <footer v-if="context && !historical" class="visualize-context">
         <p class="visualize-context-summary">{{ context.summary }}</p>
         <button type="button" :disabled="!canDraft || loading || Boolean(error)" @click="attachContext">{{ t('visualize.askWithContext') }}</button>
@@ -103,6 +108,7 @@ const menuId = `visualize-actions-${useId()}`
 const container = ref<HTMLElement | null>(null)
 const loading = ref(true)
 const error = ref('')
+const errorKind = ref<'load' | 'runtime'>('load')
 const proposal = ref('')
 const context = shallowRef<VisualizeContext | null>(null)
 const contextAttached = ref(false)
@@ -149,7 +155,7 @@ const theme = (): 'light' | 'dark' => {
   if (explicit) return explicit.classList.contains('dark') ? 'dark' : 'light'
   return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
 }
-const diagnostic = (cause: unknown) => (cause instanceof Error ? cause.message : String((cause as { message?: string })?.message ?? cause)).slice(0, 1000)
+const diagnostic = (cause: unknown) => (cause instanceof Error ? cause.message : String((cause as { message?: string })?.message ?? cause)).slice(0, 1000).trim() || t('visualize.unknownError')
 
 function updatePresentation() {
   const viewportHeight = window.visualViewport?.height ?? window.innerHeight
@@ -205,7 +211,8 @@ function collapse(restoreFocus = true) {
   void nextTick(() => {
     if (!alive || expanded.value) return
     updatePresentation()
-    if (restoreFocus && expandButton.value?.isConnected) expandButton.value.focus({ preventScroll: true })
+    const focusTarget = expandButton.value ?? menuButton.value
+    if (restoreFocus && focusTarget?.isConnected) focusTarget.focus({ preventScroll: true })
   })
 }
 
@@ -333,6 +340,8 @@ async function reload(preserveHeight = true) {
   const controller = new AbortController(); request = controller
   const expectedScope = scope.value
   const current = () => alive && !controller.signal.aborted && expectedScope === scope.value
+  const interactive = () => current() && !error.value
+  let phase: 'load' | 'runtime' = 'load'
   loading.value = true; error.value = ''; proposal.value = ''; drafted.value = false
   clearContextAttachmentFeedback()
   context.value = readVisualizeContext(expectedScope, props.receipt); contextAttachFailed.value = false
@@ -351,12 +360,13 @@ async function reload(preserveHeight = true) {
     if (!current()) return
     const { mountVisualize } = await import('@/visualize/runtime')
     if (!current()) return
+    phase = 'runtime'
     const sourceRevision = { version: props.receipt.version, revisionId: props.receipt.revisionId }
     const mounted = await mountVisualize(container.value, { html, signal: controller.signal, initialState: readVisualizeState(expectedScope, sourceRevision), theme: theme(),
-      onPrompt(text) { if (current() && !historical.value && typeof text === 'string') { proposal.value = text.trim().slice(0, 4000); drafted.value = false } },
-      onState(state) { if (current()) saveVisualizeState(expectedScope, state, sourceRevision) },
+      onPrompt(text) { if (interactive() && !historical.value && typeof text === 'string') { proposal.value = text.trim().slice(0, 4000); drafted.value = false } },
+      onState(state) { if (interactive()) saveVisualizeState(expectedScope, state, sourceRevision) },
       onContext(value) {
-        if (!current()) return false
+        if (!interactive()) return false
         const normalized = normalizeVisualizeContext(value)
         const encoded = JSON.stringify(normalized)
         // Generated controls may publish on every render. Do not rewrite
@@ -368,18 +378,24 @@ async function reload(preserveHeight = true) {
         context.value = normalized; contextAttachFailed.value = false
         return true
       },
-      onError(cause) { if (current()) error.value = diagnostic(cause) },
+      onError(cause) {
+        if (!interactive()) return
+        errorKind.value = 'runtime'; error.value = diagnostic(cause)
+        // A failed canvas has no interactive surface. Stop its timers/frame,
+        // including failures reported after the initial mount has completed.
+        runtime?.dispose(); runtime = null
+      },
       onDismiss() {
-        if (current()) onEscape()
+        if (interactive()) onEscape()
         return expanded.value ? 'fullscreen' : 'inline'
       },
-      onPointerDown() { if (current()) closeMenu(false) },
+      onPointerDown() { if (interactive()) closeMenu(false) },
     })
-    if (!current()) { mounted.dispose(); return }
+    if (!interactive()) { mounted.dispose(); return }
     runtime = mounted
     updatePresentation()
   } catch (cause) {
-    if (current()) error.value = diagnostic(cause)
+    if (current() && !error.value) { errorKind.value = phase; error.value = diagnostic(cause) }
   } finally { if (current()) loading.value = false }
 }
 async function toggleHistory() {
@@ -398,6 +414,7 @@ function attachContext() {
   if (!context.value || !canDraft.value || loading.value || error.value) return
   const snapshot = normalizeVisualizeContext(context.value)
   clearContextAttachmentFeedback()
+  collapse(false)
   try {
     contextAttached.value = Boolean(snapshot && conversation?.attach(props.sessionKey, props.receipt, snapshot))
     contextAttachFailed.value = !contextAttached.value
@@ -410,11 +427,19 @@ function attachContext() {
 }
 function acceptProposal() {
   if (!canDraft.value || !proposal.value) return
+  collapse(false)
   if (conversation?.draft(props.sessionKey, props.receipt, proposal.value)) { proposal.value = ''; drafted.value = true }
 }
 function draftRepair() {
   if (!canDraft.value || !error.value) return
-  if (conversation?.draft(props.sessionKey, props.receipt, t('visualize.repairPrompt', { name: props.receipt.name, error: error.value }))) drafted.value = true
+  // Use the immutable host receipt, not a filename or guest-provided identity.
+  // Keep this separate from any conditions the user already attached.
+  const { documentId, revisionId, sha256, widgetId, version } = props.receipt
+  const text = [t('visualize.repairSource'), JSON.stringify({ documentId, revisionId, sha256, widgetId, version }),
+    t('visualize.repairPrompt', { name: props.receipt.name, error: error.value })].join('\n\n')
+  // Release the native top layer before the owning composer restores focus.
+  collapse(false)
+  if (conversation?.draft(props.sessionKey, props.receipt, text)) drafted.value = true
 }
 onMounted(() => {
   alive = true; void reload()
@@ -450,6 +475,7 @@ onBeforeUnmount(() => {
 .visualize-history > p { flex-basis: 100%; margin: 0; }
 .visualize-canvas { position: relative; display: block; width: 100%; max-width: none; max-height: none; min-width: 0; margin: 0; padding: 0; border: 1px solid transparent; border-radius: var(--radius-lg); overflow: visible; color: var(--text); background: transparent; }
 .visualize-canvas:hover, .visualize-canvas:focus-within { border-color: var(--border); }
+.visualize-canvas--failed { border-color: var(--border); background: var(--bg-surface); }
 .visualize-toolbar { display: flex; align-items: center; justify-content: flex-end; min-height: 32px; gap: var(--sp-2); padding: 0 var(--sp-2); color: var(--text-muted); font-size: var(--fs-sm); }
 .visualize-title { margin-right: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .visualize-actions, .visualize-feedback-actions { display: flex; flex-shrink: 0; gap: var(--sp-2); flex-wrap: wrap; }
@@ -473,7 +499,14 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .visualize-feedback p { margin: 0 0 var(--sp-2); }
 .visualize-loading { position: absolute; top: 32px; inset-inline: 0; }
 .visualize-export-error { color: var(--danger, var(--text)); }
-.visualize-error-detail { max-height: 120px; overflow: auto; color: var(--text-muted); font-size: var(--fs-sm); }
+.visualize-error-title { font-weight: 600; }
+.visualize-error-hint { color: var(--text-muted); font-size: var(--fs-sm); }
+.visualize-error .visualize-feedback-actions { margin-top: var(--sp-3); }
+.visualize-repair { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); background: color-mix(in srgb, var(--accent) 8%, var(--bg-surface)); }
+.visualize-retry { background: transparent; }
+.visualize-error-details { margin-top: var(--sp-2); color: var(--text-muted); font-size: var(--fs-sm); }
+.visualize-error-details summary { width: fit-content; padding: var(--sp-2) 0; cursor: pointer; }
+.visualize-error-detail { margin: var(--sp-1) 0 0; max-height: 120px; overflow: auto; font: inherit; font-family: var(--font-mono); white-space: pre-wrap; }
 .visualize-proposal { border-top: 1px solid var(--border); padding-bottom: calc(var(--sp-3) + env(safe-area-inset-bottom, 0px)); }
 .visualize-proposal > p { margin: 0 0 var(--sp-2); max-height: min(28dvh, 220px); overflow-y: auto; overscroll-behavior: contain; }
 .visualize-context { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); padding: var(--sp-3); border-top: 1px solid var(--border); }
@@ -483,6 +516,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .visualize-export-feedback { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-size: var(--fs-sm); }
 .visualize-canvas--expanded { position: fixed; inset: var(--sp-3); width: calc(100% - var(--sp-3) * 2); max-width: 1440px; max-height: calc(100dvh - var(--sp-3) * 2); margin: auto; overflow: auto; overscroll-behavior: contain; border-color: var(--border); background: var(--bg-surface); }
 .visualize-canvas--expanded::backdrop { background: color-mix(in srgb, var(--text) 35%, transparent); }
+.visualize-canvas--expanded.visualize-canvas--failed { max-width: 640px; }
 @media (hover: hover) and (pointer: fine) {
   .visualize-icon:hover { background: color-mix(in srgb, var(--bg-hover) 65%, transparent); color: var(--text); }
   .visualize-canvas:not(.visualize-canvas--expanded) .visualize-actions { opacity: 0; }

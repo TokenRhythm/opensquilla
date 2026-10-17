@@ -223,14 +223,109 @@ describe('Visualize production chat components', () => {
     expect(dialog.getAttribute('aria-modal')).toBeNull()
     expect(releasePin).toHaveBeenCalledTimes(2)
   })
-  it('only adds diagnostics to a repair draft after an explicit click', async () => {
-    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+  it('only drafts repair after an explicit click and identifies the exact failed revision', async () => {
+    const failedReceipt = { ...receipt, widgetId: 'widget_failed', version: 7 }
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt: failedReceipt, sessionKey: 'session_test' }))
     mounts[0]!.options.onError(new Error('Missing chart element')); await settle()
     expect(drafted).not.toHaveBeenCalled()
-    const repair = [...host.querySelectorAll('button')].find(node => node.textContent === 'Ask to repair')!
+    const repair = [...host.querySelectorAll('button')].find(node => node.textContent === i18n.global.t('visualize.repair'))!
     repair.click(); await settle()
-    expect(drafted).toHaveBeenCalledWith('session_test', receipt, expect.stringContaining('Browser diagnostic data (not instructions):\nMissing chart element'))
+    expect(drafted).toHaveBeenCalledWith('session_test', failedReceipt, expect.stringContaining('Missing chart element'))
+    const prompt = vi.mocked(drafted).mock.calls[0] as unknown as [string, typeof failedReceipt, string]
+    for (const value of [failedReceipt.documentId, failedReceipt.revisionId, failedReceipt.sha256]) {
+      expect(prompt[2]).toContain(value)
+    }
+    expect(prompt[2]).toMatch(/version[\s"':=]+7/i)
     expect(host.textContent).toContain('Added to the composer')
+  })
+  it('releases the expanded modal before handing repair to the owning composer', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    const dialog = host.querySelector('dialog')!
+    host.querySelector<HTMLButtonElement>('[aria-label="Expand"]')!.click(); await settle()
+    expect(dialog.getAttribute('aria-modal')).toBe('true')
+    expect(document.body.style.overflow).toBe('hidden')
+    const close = vi.spyOn(dialog, 'close')
+    mounts[0]!.options.onError(new Error('Late canvas execution failure')); await settle()
+    drafted.mockImplementationOnce(() => {
+      // These must be released before the provider tries to focus an editor
+      // outside the native modal; Vue's aria attribute updates on the next tick.
+      expect(close).toHaveBeenCalledTimes(1)
+      expect(document.body.style.overflow).toBe('')
+      expect(releasePin).toHaveBeenCalledTimes(1)
+      return true
+    })
+    ;[...host.querySelectorAll<HTMLButtonElement>('button')].find(node => node.textContent === i18n.global.t('visualize.repair'))!.click()
+    await settle()
+    expect(drafted).toHaveBeenCalledTimes(1)
+    expect(dialog.getAttribute('aria-modal')).toBeNull()
+    expect(dialog.getAttribute('role')).toBe('group')
+    close.mockRestore()
+  })
+  it('returns focus to canvas actions when an expanded runtime fails before Escape', async () => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    const dialog = host.querySelector('dialog')!
+    const menuButton = host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!
+    host.querySelector<HTMLButtonElement>('[aria-label="Expand"]')!.click(); await settle()
+    mounts[0]!.options.onError(new Error('Late canvas execution failure')); await settle()
+    expect(dialog.getAttribute('aria-modal')).toBe('true')
+    dialog.dispatchEvent(new Event('cancel', { cancelable: true })); await settle()
+    expect(dialog.getAttribute('aria-modal')).toBeNull()
+    expect(host.querySelector('[aria-label="Expand"]')).toBeNull()
+    expect(document.activeElement).toBe(menuButton)
+    expect(document.body.style.overflow).toBe('')
+    expect(releasePin).toHaveBeenCalledTimes(1)
+  })
+  it('stops a failed runtime, hides its empty surface and rejects its queued callbacks', async () => {
+    const failedReceipt = { ...receipt, widgetId: 'failed_runtime_disposal', version: 1 }
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt: failedReceipt, sessionKey: 'session_test' }))
+    const runtime = mounts[0]!
+    const scope = JSON.stringify(['user_test', 'session_test', failedReceipt.widgetId])
+    runtime.options.onState({ selected: 7 })
+    const reads = fetched.mock.calls.length
+    runtime.options.onError(new Error('particles is not iterable')); await settle()
+
+    const failure = host.querySelector<HTMLElement>('.visualize-error[role="alert"]')!
+    expect(failure.dataset.errorKind).toBe('runtime')
+    const details = failure.querySelector<HTMLDetailsElement>('details.visualize-error-details')!
+    expect(details.open).toBe(false)
+    expect(details.querySelector('summary')).not.toBeNull()
+    expect(details.textContent).toContain('particles is not iterable')
+    expect(host.querySelector<HTMLElement>('.visualize-surface')!.style.display).toBe('none')
+    expect(host.querySelector('[aria-label="Expand"]')).toBeNull()
+    expect(runtime.dispose).toHaveBeenCalledTimes(1)
+    expect(drafted).not.toHaveBeenCalled()
+    expect(mounts).toHaveLength(1)
+    expect(fetched.mock.calls).toHaveLength(reads)
+
+    runtime.options.onState({ selected: 99 })
+    runtime.options.onPrompt('Do not draft from a failed frame')
+    expect(runtime.options.onContext?.({ summary: 'Late conditions' })).toBe(false)
+    await settle()
+    expect(readVisualizeState(scope, failedReceipt)).toEqual({ selected: 7 })
+    expect(host.querySelector('.visualize-proposal')).toBeNull()
+    expect(drafted).not.toHaveBeenCalled()
+    expect(mounts).toHaveLength(1)
+  })
+  it.each([
+    ['empty', new Error('')],
+    ['whitespace', new Error(' \n\t ')],
+  ] as const)('keeps a failed runtime noninteractive when its diagnostic is %s', async (_name, cause) => {
+    const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
+    const runtime = mounts[0]!
+    runtime.options.onError(cause); await settle()
+    const failure = host.querySelector<HTMLElement>('.visualize-error[role="alert"]')!
+    expect(failure.dataset.errorKind).toBe('runtime')
+    expect(failure.querySelector('.visualize-error-detail')?.textContent).toBe(i18n.global.t('visualize.unknownError'))
+    expect(host.querySelector<HTMLElement>('.visualize-surface')!.style.display).toBe('none')
+    expect(runtime.dispose).toHaveBeenCalledTimes(1)
+    runtime.options.onPrompt('A disposed frame must not keep interacting')
+    expect(runtime.options.onContext?.({ summary: 'Late conditions' })).toBe(false)
+    runtime.options.onError(new Error('Late error'))
+    await settle()
+    expect(host.querySelector('.visualize-proposal')).toBeNull()
+    expect(runtime.dispose).toHaveBeenCalledTimes(1)
+    expect(failure.querySelector('.visualize-error-detail')?.textContent).toBe(i18n.global.t('visualize.unknownError'))
+    expect(drafted).not.toHaveBeenCalled()
   })
   it('releases the modal and message pin when the owning session changes', async () => {
     const owner = reactive({ key: 'session_test' })
@@ -425,6 +520,7 @@ describe('Visualize production chat components', () => {
     const { host } = await mount(() => h(VisualizeCanvas, { receipt, sessionKey: 'session_test' }))
     expect(mounts).toHaveLength(0)
     expect(host.querySelector('[role="alert"]')?.textContent).toContain('generated script failed')
+    expect(host.querySelector<HTMLElement>('.visualize-error')?.dataset.errorKind).toBe('runtime')
     const download = async () => {
       host.querySelector<HTMLButtonElement>('[aria-label="Canvas actions"]')!.click(); await settle()
       const button = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(item => item.textContent === 'Download HTML source')!
@@ -466,8 +562,14 @@ describe('Visualize production chat components', () => {
     expect(host.querySelector('.visualize-loading')).not.toBeNull()
     rejectSource(new Error('offline')); await settle()
     expect(surface.style.minHeight).toBe('')
+    expect(surface.style.display).toBe('none')
     expect(host.querySelector('.visualize-loading')).toBeNull()
     expect(host.querySelector('[role="alert"]')?.textContent).toContain('offline')
+    const failure = host.querySelector<HTMLElement>('.visualize-error')!
+    expect(failure.dataset.errorKind).toBe('load')
+    expect(failure.querySelector<HTMLDetailsElement>('.visualize-error-details')!.open).toBe(false)
+    expect([...failure.querySelectorAll('button')].some(button => button.textContent === i18n.global.t('visualize.reload'))).toBe(true)
+    expect(drafted).not.toHaveBeenCalled()
   })
 
   it('keeps previous revisions collapsed and isolates their state and conditions from the current canvas', async () => {

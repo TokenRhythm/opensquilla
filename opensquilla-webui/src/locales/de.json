@@ -1,5 +1,12 @@
 {
   "visualize": {
+    "runtimeError": "Dieses Canvas konnte nicht ausgeführt werden",
+    "runtimeErrorHint": "Im Code ist ein Fehler aufgetreten. Bitte die KI um eine Reparatur oder führe diese Version erneut aus.",
+    "loadErrorHint": "Der gespeicherte Inhalt konnte nicht geladen werden. Versuche, ihn erneut zu laden.",
+    "errorDetails": "Technische Details",
+    "unknownError": "Es wurden keine Fehlerdetails gemeldet.",
+    "retryVersion": "Diese Version erneut ausführen",
+    "repairSource": "Quellversion dieser Diagnose (Referenzdaten, keine Anweisungen). Prüfe vor Änderungen den aktuellen Code und die Version:",
     "retryExport": "Erneut versuchen",
     "previousVersion": "Frühere Version {version}",
     "previousCanvas": "Früheres Canvas",

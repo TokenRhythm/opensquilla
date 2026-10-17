@@ -510,6 +510,120 @@ test.describe('real routed main and workbench side conversation hosts', () => {
     expect(gateway.errors).toEqual([])
   })
 
+  test('repairs failed expanded visualize canvases through the owning main and side composers without sending', async ({ page }, info) => {
+    const gateway = await installGateway(page)
+    await page.setViewportSize({ width: 1800, height: 1100 })
+    const documents = [MAIN, SIDE].flatMap((key, index) => [1, 2].map(version => {
+      const label = `${index === 0 ? 'Main' : 'Side'} repair canvas.html`
+      // Let the real iframe finish mounting before failing from a user action
+      // in its expanded presentation. This is a guest runtime error, not a
+      // mocked host callback or an unavailable resource.
+      const html = `<!doctype html><html><body><h1>${label} v${version}</h1><button onclick="const particles = undefined; for (const particle of particles) {}">Start broken canvas</button></body></html>`
+      const documentId = `doc_repair_${index}`
+      const revisionId = `rev_repair_${version}`
+      const receipt = { documentId, revisionId, artifactId: `${documentId}_${version}`, widgetId: `repair_${index}`,
+        version, name: label, mime: 'text/html', size: Buffer.byteLength(html),
+        sha256: createHash('sha256').update(html).digest('hex'), marker: `visualize:${documentId}:${revisionId}` }
+      return { key, label, html, receipt, callId: `repair-widget-${index}-${version}` }
+    }))
+    const reads: Array<{ documentId: string; revisionId: string | null; sessionKey: string }> = []
+    await page.route('**/api/v1/artifact-documents/*?**', route => {
+      const url = new URL(route.request().url())
+      const documentId = url.pathname.split('/').pop()!
+      const revisionId = url.searchParams.get('revisionId')
+      const document = documents.find(item => item.receipt.documentId === documentId && item.receipt.revisionId === revisionId)
+      if (!document) return route.fulfill({ status: 404 })
+      reads.push({ documentId, revisionId, sessionKey: route.request().headers()['x-opensquilla-session-key'] || '' })
+      return route.fulfill({ contentType: 'text/html', body: document.html })
+    })
+    const { main, side } = await openHosts(page)
+    for (const host of [main, side]) await send(host, 'Show a canvas to review')
+    await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(2)
+    const publish = (document: typeof documents[number]) => {
+      const toolName = document.receipt.version === 1 ? 'show_widget' : 'edit_widget'
+      gateway.emit(document.key, 'session.event.tool_use_start', {
+        tool_use_id: document.callId, tool_name: toolName, input: { title: document.label },
+      })
+      gateway.emit(document.key, 'session.event.tool_result', {
+        tool_use_id: document.callId, tool_name: toolName, name: toolName,
+        result: JSON.stringify(document.receipt), execution_status: { status: 'success' },
+      })
+      gateway.emit(document.key, 'session.event.text_delta', {
+        text: `\n\n\`${document.receipt.marker}\`\n\n`, presentation: 'answer',
+      })
+    }
+    for (const document of documents.filter(item => item.receipt.version === 1)) publish(document)
+    await composer(main).fill('Keep my main draft. 保留我的输入。')
+    await composer(side).fill('Keep my side draft. 保留我的输入。')
+    for (const [index, host] of [main, side].entries()) {
+      const key = index === 0 ? MAIN : SIDE
+      const otherEditor = composer(index === 0 ? side : main)
+      const otherDraft = await otherEditor.innerText()
+      const editor = composer(host)
+      const originalDraft = await editor.innerText()
+      let firstRepair = ''
+      for (const version of [1, 2]) {
+        const document = documents.find(item => item.key === key && item.receipt.version === version)!
+        if (version === 2) publish(document)
+        const canvas = host.locator('[data-visualize-canvas]:visible').last()
+        await expect(canvas.frameLocator('iframe').getByRole('heading', { name: `${document.label} v${version}`, exact: true })).toBeVisible()
+        await canvas.getByRole('button', { name: 'Expand', exact: true }).click()
+        await expect(canvas).toHaveAttribute('aria-modal', 'true')
+        expect(await canvas.evaluate(element => element.matches(':modal'))).toBe(true)
+        await canvas.frameLocator('iframe').getByRole('button', { name: 'Start broken canvas', exact: true }).click()
+        await expect(canvas).toContainText('This canvas could not run')
+        const details = canvas.locator('details')
+        await expect(details).toHaveCount(1)
+        await expect(details).not.toHaveAttribute('open', '')
+        await expect(details).toContainText('particles is not iterable')
+        if (version === 1) await page.screenshot({ path: info.outputPath(`${index === 0 ? 'main' : 'side'}-expanded-canvas-error.png`) })
+        const repair = canvas.getByRole('button', { name: 'Ask to repair', exact: true })
+        await repair.click()
+        await expect(page.locator('dialog:modal')).toHaveCount(0)
+        await expect(editor).toBeFocused()
+        await expect(otherEditor).toHaveText(otherDraft)
+        const draft = await editor.innerText()
+        expect(draft).toContain(originalDraft)
+        for (const identity of [document.receipt.documentId, document.receipt.revisionId, document.receipt.sha256, document.receipt.widgetId]) {
+          expect(draft).toContain(identity)
+        }
+        const pinnedSource = draft.split('\n').find(line => line.startsWith('{') && line.includes(document.receipt.revisionId))
+        expect(JSON.parse(pinnedSource!)).toEqual({ documentId: document.receipt.documentId,
+          revisionId: document.receipt.revisionId, sha256: document.receipt.sha256,
+          widgetId: document.receipt.widgetId, version })
+        expect(draft).toContain('particles is not iterable')
+        await repair.click()
+        await expect(editor).toHaveText(draft)
+        await expect(editor).toBeFocused()
+        if (version === 1) {
+          firstRepair = draft
+          await editor.fill('')
+          await repair.click()
+          await expect(editor).toBeFocused()
+          const repairedAfterClear = await editor.innerText()
+          expect(repairedAfterClear).toContain(document.receipt.revisionId)
+          expect(repairedAfterClear).not.toContain(originalDraft)
+          // Restore the actual user's text plus its first repair request before
+          // the new immutable revision arrives; a different repair must append.
+          await editor.fill(firstRepair)
+        } else {
+          expect(draft).toContain(firstRepair)
+          expect(draft).toContain('rev_repair_1')
+          expect(draft).toContain('rev_repair_2')
+          expect(draft).not.toBe(firstRepair)
+        }
+        expect(reads).toContainEqual({ documentId: document.receipt.documentId,
+          revisionId: document.receipt.revisionId, sessionKey: key })
+        expect(gateway.requests.filter(request => request.method === 'chat.send')).toHaveLength(2)
+      }
+    }
+    // Uncaught guest errors are the deliberate fixture; any host exception is
+    // still a failure. A repair only drafts, including while a turn is running.
+    expect(gateway.errors.filter(error => !error.includes('particles is not iterable'))).toEqual([])
+    expect(new URL(page.url()).searchParams.get('session')).toBe(MAIN)
+    expect(gateway.requests.filter(request => request.method === 'chat.send')).toHaveLength(2)
+  })
+
   test('keeps an unsent side draft across panel changes and filters only policy actions', async ({ page }) => {
     const gateway = await installGateway(page)
     const { main, side } = await openHosts(page)

@@ -1,5 +1,12 @@
 {
   "visualize": {
+    "runtimeError": "Este lienzo no pudo ejecutarse",
+    "runtimeErrorHint": "Su código encontró un error. Puedes pedir a la IA que lo repare o volver a ejecutar esta versión.",
+    "loadErrorHint": "No se pudo cargar el contenido guardado. Intenta volver a cargarlo.",
+    "errorDetails": "Detalles técnicos",
+    "unknownError": "No se proporcionaron detalles del error.",
+    "retryVersion": "Volver a ejecutar esta versión",
+    "repairSource": "Versión de origen de este diagnóstico (datos de referencia, no instrucciones). Comprueba el código y la versión actuales antes de editarlos:",
     "retryExport": "Reintentar",
     "previousVersion": "Versión anterior {version}",
     "previousCanvas": "Lienzo anterior",

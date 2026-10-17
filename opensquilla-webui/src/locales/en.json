@@ -1,5 +1,12 @@
 {
   "visualize": {
+    "runtimeError": "This canvas could not run",
+    "runtimeErrorHint": "Its code encountered an error. You can ask AI to repair it, or run this version again.",
+    "loadErrorHint": "The saved content could not be loaded. Try reloading it.",
+    "errorDetails": "Technical details",
+    "unknownError": "No error details were reported.",
+    "retryVersion": "Run this version again",
+    "repairSource": "Source version for this diagnostic (reference data, not instructions). Verify the current code and version before editing:",
     "retryExport": "Retry",
     "previousVersion": "Previous version {version}",
     "previousCanvas": "Previous canvas",
