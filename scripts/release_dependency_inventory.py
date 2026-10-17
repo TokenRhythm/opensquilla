@@ -11,6 +11,8 @@ import os
 import re
 import tomllib
 from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from email.parser import BytesParser
 from pathlib import Path
 from typing import Any
@@ -86,14 +88,50 @@ def file_key(path: Path) -> str:
     return os.path.normcase(str(path.resolve()))
 
 
+def worker_count(value: str | int) -> int:
+    count = int(value)
+    if not 1 <= count <= 4:
+        raise ValueError("Inventory workers must be between 1 and 4")
+    return count
+
+
 def frozen_packages(
     repo: Path,
     analysis: Path,
     versions: dict[str, set[str]],
     distributions: Iterable[Any] | None = None,
+    *,
+    workers: int = 1,
+) -> list[dict[str, Any]]:
+    workers = worker_count(workers)
+    # Keep release callers serial by default. Parallel workers only read paths
+    # and file bytes; ordered map results preserve package/file ownership order.
+    context = ThreadPoolExecutor(max_workers=workers) if workers > 1 else nullcontext()
+    with context as pool:
+        return _frozen_packages(
+            repo, analysis, versions, distributions, map if pool is None else pool.map,
+            parallel=pool is not None,
+        )
+
+
+def _frozen_packages(
+    repo: Path,
+    analysis: Path,
+    versions: dict[str, set[str]],
+    distributions: Iterable[Any] | None,
+    ordered_map: Any,
+    *,
+    parallel: bool,
 ) -> list[dict[str, Any]]:
     packages: dict[str, dict[str, Any]] = {}
     owners: dict[str, list[tuple[str, str]]] = {}
+
+    owner_inputs: list[tuple[Path, str, str]] = []
+
+    def resolve_owner(item: tuple[Path, str, str]) -> tuple[str, str, str]:
+        path, name, relative = item
+        return file_key(path), name, relative
+
     for distribution in (
         importlib.metadata.distributions() if distributions is None else distributions
     ):
@@ -105,35 +143,63 @@ def frozen_packages(
                 raise ValueError(f"Conflicting installed distribution versions: {name}")
             continue
         packages[name] = {"name": name, "version": version, "bundled": False, "files": []}
-        for relative in distribution.files or ():
-            path = Path(distribution.locate_file(relative))
-            owners.setdefault(file_key(path), []).append((name, str(relative).replace("\\", "/")))
+        files = (
+            (Path(distribution.locate_file(relative)), name, str(relative).replace("\\", "/"))
+            for relative in distribution.files or ()
+        )
+        if parallel:
+            owner_inputs.extend(files)
+        else:
+            for key, owner_name, relative in map(resolve_owner, files):
+                owners.setdefault(key, []).append((owner_name, relative))
+
+    # One ordered batch avoids per-distribution thread scheduling overhead.
+    # Metadata and lock/duplicate-version validation above stay on this thread.
+    if parallel:
+        for key, name, relative in ordered_map(resolve_owner, owner_inputs):
+            owners.setdefault(key, []).append((name, relative))
 
     records = list(toc_records(ast.literal_eval(analysis.read_text(encoding="utf-8"))))
     if not records:
         raise ValueError("PyInstaller analysis contains no collected file records")
     recorded: set[tuple[str, str, str]] = set()
     source_root = (repo / "src").resolve()
-    for module, filename, kind in records:
+    def resolve_record(record: tuple[str, str, str]):
+        module, filename, kind = record
         if not filename:
-            continue
+            return None
         path = Path(filename).resolve()
-        matches = owners.get(file_key(path), [])
-        if not matches and path.is_relative_to(source_root):
-            matches = [("opensquilla", str(path.relative_to(source_root)).replace("\\", "/"))]
-        if not matches and "site-packages" in path.parts:
-            raise ValueError(f"Collected dependency has no distribution ownership: {filename}")
-        for name, relative in matches:
-            if name not in packages:
-                raise ValueError(f"Missing installed distribution metadata for {name}")
-            key = (name, relative, kind)
-            if key in recorded:
+        return module, filename, kind, path, file_key(path)
+
+    def pending_files():
+        for resolved in ordered_map(resolve_record, records):
+            if resolved is None:
                 continue
-            recorded.add(key)
-            packages[name]["bundled"] = True
-            packages[name]["files"].append({
-                "path": relative, "module": module, "kind": kind, "sha256": digest(path),
-            })
+            module, filename, kind, path, source_key = resolved
+            matches = owners.get(source_key, [])
+            if not matches and path.is_relative_to(source_root):
+                matches = [("opensquilla", str(path.relative_to(source_root)).replace("\\", "/"))]
+            if not matches and "site-packages" in path.parts:
+                raise ValueError(f"Collected dependency has no distribution ownership: {filename}")
+            for name, relative in matches:
+                if name not in packages:
+                    raise ValueError(f"Missing installed distribution metadata for {name}")
+                key = (name, relative, kind)
+                if key in recorded:
+                    continue
+                recorded.add(key)
+                yield name, relative, module, kind, path
+
+    def hash_record(item):
+        name, relative, module, kind, path = item
+        return name, {"path": relative, "module": module, "kind": kind, "sha256": digest(path)}
+
+    # Finish path resolution before starting the hash batch, so the same pool
+    # does not contend between two independent ordered-map queues.
+    pending = list(pending_files()) if parallel else pending_files()
+    for name, record in ordered_map(hash_record, pending):
+        packages[name]["bundled"] = True
+        packages[name]["files"].append(record)
     if not any(p["bundled"] and p["name"] != "opensquilla" for p in packages.values()):
         raise ValueError("PyInstaller inventory contains no bundled third-party dependencies")
     return [packages[name] for name in sorted(packages)]
@@ -147,6 +213,10 @@ def main() -> None:
     parser.add_argument("--analysis", type=Path)
     parser.add_argument("--profile", default="desktop")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--workers", type=worker_count, default=1,
+        help="Frozen inventory read workers, 1..4 (default: 1; wheelhouse remains serial)",
+    )
     args = parser.parse_args()
     repo = args.repo.resolve()
     versions = locked_versions(repo)
@@ -157,7 +227,7 @@ def main() -> None:
     else:
         if args.analysis is None:
             parser.error("--analysis is required for a frozen package")
-        packages = frozen_packages(repo, args.analysis, versions)
+        packages = frozen_packages(repo, args.analysis, versions, workers=args.workers)
     result = {
         "schemaVersion": 1, "kind": args.kind, "profile": args.profile,
         "lockSha256": digest(repo / "uv.lock"), "packages": packages,

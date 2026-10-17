@@ -51,6 +51,7 @@ def test_native_acceptance_tracks_dependency_and_probe_changes_without_running_f
         "desktop/electron/scripts/fixtures/packaged-retained-interaction/provider.mjs",
         "desktop/electron/scripts/e2e-shutdown-helpers.mjs",
         "desktop/electron/scripts/build-gateway.mjs",
+        ".github/scripts/build-ci-nsis.mjs",
         "desktop/electron/scripts/gateway-integrity.mjs",
         "scripts/release_dependency_inventory.py", "scripts/build_wheelhouse_zip.py",
         ".github/scripts/verify-nsis-upgrade-regression.py",

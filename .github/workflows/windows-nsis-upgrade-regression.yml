@@ -95,6 +95,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Packaged cleanup contract failed' }
           node --test scripts/test-packaged-first-send-evidence.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Packaged renderer evidence contract failed' }
+          node --test ../../.github/scripts/test-build-ci-nsis.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Concurrent NSIS build verification contract failed' }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -178,10 +180,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Electron build failed' }
           npm run verify:prepared
           if ($LASTEXITCODE -ne 0) { throw 'Prepared package verification failed' }
-          node -e "const b=require('electron-builder'); b.build({targets:b.Platform.WINDOWS.createTarget('nsis'),publish:'never',config:{win:{signExecutable:false},forceCodeSigning:false}}).catch(e=>{console.error(e);process.exitCode=1})"
-          if ($LASTEXITCODE -ne 0) { throw 'NSIS build failed' }
-          npm run verify:package
-          if ($LASTEXITCODE -ne 0) { throw 'Package verification failed' }
+          # The wrapper runs the complete npm run verify:package once, after
+          # application preparation, overlapping only the remaining NSIS work.
+          node ../../.github/scripts/build-ci-nsis.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS build or package verification failed' }
       - name: Record exact candidate identities
         run: |
           $root = Join-Path $PWD 'dist/desktop-electron'
@@ -209,11 +211,15 @@ jobs:
         with:
           name: nsis-regression-installer
           overwrite: true
+          # The installer is already compressed. This changes the transfer ZIP
+          # only; the installer bytes and their identity checks stay intact.
+          compression-level: 0
           path: |
             dist/desktop-electron/OpenSquilla-*-win-x64.exe
             dist/desktop-electron/audit-candidate.json
             dist/desktop-electron/win-unpacked/resources/runtime/gateway/dependency-inventory.json
             dist/desktop-electron/win-unpacked/resources/runtime/gateway/gateway-build.json
+            dist/desktop-electron/nsis-build-timing.json
           if-no-files-found: error
           retention-days: 14
   packaged-security:

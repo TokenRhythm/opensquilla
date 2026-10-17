@@ -593,6 +593,64 @@ NSIS execution proofs, remote coverage proof, build/failure logs and timing
 comparisons are saved under `.cache/ci-timing/round6/` and
 `.cache/ci-timing/round6-comparison/`. No merge into `main` was performed.
 
+### Seventh experiment: repeated baseline and NSIS build overlap
+
+The control revision is `647816f3a51d6878a00fd88af672b72964782b44`, including
+the sixth experiment's explicit Windows-platform fixture correction. Collect
+three independent full `workflow_dispatch` runs at that revision before
+pushing the candidate. Run the three candidate samples sequentially at one
+fixed candidate revision as well: the branch concurrency policy cancels an
+older overlapping dispatch. Preserve first-attempt failures and compare the
+median and range, not just the fastest sample. Record overall CI, candidate
+availability, NSIS build phases and the acceptance tail separately, because
+another Windows test partition can determine the final completion time.
+
+The candidate preserves PyInstaller's clean build, hidden imports, collected
+data, source provenance and all frozen-package checks. Fresh hosted runners
+do not supply a reusable PyInstaller analysis cache, so removing `--clean`
+alone is not a supported performance improvement. Stage logs distinguish
+preparation, PyInstaller, UI externalization, dependency inventory and build
+provenance. The inventory uses four read workers on Windows: resolve installed
+file paths and TOC paths in ordered read batches, attribute ownership and
+deduplicate on the main thread, then hash bytes in a separate ordered batch. Lock validation,
+multi-owner attribution, duplicate handling and output order are retained.
+The CLI defaults to one worker; wheelhouse inventory remains serial.
+
+The normal unsigned NSIS target is still built once. The CI wrapper starts
+the unchanged `npm run verify:package` once at the existing `afterSign`
+boundary, after application preparation and update-configuration generation,
+while NSIS completes compression and installer generation. Commands inside
+the verifier retain their original order and failure behavior. Both branches
+settle before candidate identities are recorded or artifacts are uploaded;
+either failure rejects the build. A separate directory/prepackaged build is
+not used because it would change generation of the NSIS update configuration.
+
+The wrapper rejects a missing, duplicate or unexpected platform/architecture/
+target boundary and an existing configured `afterSign` hook. Before and after
+the overlap it compares fourteen critical source/package identity files,
+including the ASAR, executable, update configuration, Gateway executable,
+dependency inventory and runtime/build manifests. These are critical identity
+hashes, not a claim of a complete-tree snapshot: NSIS still adds `elevate.exe`
+after this boundary. Existing prepared and packaged verification retains all
+its model, migration, UI and runtime checks. A run/attempt/SHA-bound JSON
+timing record includes invocation counts, both results and hashes. The wrapper
+is a merge-critical CI input, so previous policy evidence cannot attest it.
+
+Installer compression and differential-update settings are unchanged. Only
+the outer Actions transfer ZIP uses compression level zero, avoiding a second
+compression pass without transforming the generated installer bytes.
+The artifact retains its existing name and four required files and adds the
+small timing record. All existing 148 planned jobs and 28 NSIS jobs retain
+their ownership; the wrapper's positive/negative contracts run inside the
+existing Windows package-contract job.
+
+The local inventory comparison checks complete byte-identical JSON against
+the original serial implementation. Its representative installed-package
+fixture is not a release-lock validation or a remote performance sample.
+Remote build logs, exact executed-job inventories and all six run identities
+are required for the final comparison; do not infer an overall speedup from
+the inventory microbenchmark or package-verification overlap alone.
+
 ## Test cost and ownership
 
 The ordinary offline suite excludes `stress`. The required `python-stress` suite
