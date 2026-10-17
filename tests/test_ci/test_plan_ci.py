@@ -25,6 +25,11 @@ plan_changes = MODULE["plan_changes"]
 
 CONFIG_PATH = Path(".github/ci/suites.v1.json")
 TRUST_POLICY_PATH = Path(".github/ci/trust-policy.v1.json")
+WINDOWS_PROFILES_SHARDS = {
+    "profiles-onboarding-flow", "profiles-onboarding-first-chat",
+    "profiles-profile-consolidation-flow", "profiles-primary-repair-accessibility",
+    "profiles-profile-import-flow", "profiles-desktop-cleanup-flow",
+}
 MERGE_CRITICAL_INPUTS = json.loads(TRUST_POLICY_PATH.read_text(encoding="utf-8"))[
     "merge_critical_inputs"
 ]
@@ -46,6 +51,7 @@ def test_native_acceptance_tracks_dependency_and_probe_changes_without_running_f
         "desktop/electron/scripts/fixtures/packaged-retained-interaction/provider.mjs",
         "desktop/electron/scripts/e2e-shutdown-helpers.mjs",
         "desktop/electron/scripts/build-gateway.mjs",
+        ".github/scripts/build-ci-nsis.mjs",
         "desktop/electron/scripts/gateway-integrity.mjs",
         "scripts/release_dependency_inventory.py", "scripts/build_wheelhouse_zip.py",
         ".github/scripts/verify-nsis-upgrade-regression.py",
@@ -95,7 +101,17 @@ def test_native_acceptance_evidence_covers_the_actual_reusable_matrix(
          for item in matrix["include"]}
     assert len(cases) == count
     assert {"fresh-default-fresh", "fresh-custom-fresh"} <= cases
-    expected = {(jobs["build"]["runs-on"], "build")}
+    expected = {
+        (jobs["build"]["runs-on"], "build"),
+        ("windows-2022", "windows-webui-build"),
+        ("windows-2022", "windows-package-contracts"),
+    }
+    security = jobs["packaged-security"]
+    assert security["strategy"]["matrix"]["probe"] == [
+        "dependency-audit", "gateway-smoke", "first-interaction",
+    ]
+    expected.update((security["runs-on"], f"packaged-security-{probe}")
+                    for probe in security["strategy"]["matrix"]["probe"])
     expected.update((jobs["wheelhouse-security"]["runs-on"], f"wheelhouse-{profile}")
                     for profile in jobs["wheelhouse-security"]["strategy"]["matrix"]["profile"])
     expected.update((jobs["upgrade-and-start"]["runs-on"], case) for case in cases)
@@ -104,7 +120,7 @@ def test_native_acceptance_evidence_covers_the_actual_reusable_matrix(
     ))["jobs"]["candidate-probe"]
     expected.update((probes["runs-on"], f"candidate-{probe}")
                     for probe in probes["strategy"]["matrix"]["probe"])
-    assert len(expected) == count + 7
+    assert len(expected) == count + 13
     for path in paths:
         plan = _plan(tmp_path, suite_config, path)
         assert plan["windows_nsis_profile"] == profile
@@ -130,7 +146,21 @@ def test_installer_and_historical_data_changes_keep_all_upgrade_cases(
 ) -> None:
     plan = _plan(tmp_path, suite_config, "opensquilla-webui/package-lock.json", path)
     assert plan["windows_nsis_profile"] == "full"
-    assert len(_platform_cells(plan, "windows-nsis-regression")) == 21
+    assert len(_platform_cells(plan, "windows-nsis-regression")) == 27
+
+
+@pytest.mark.parametrize("path", [
+    ".github/scripts/verify-release-profile-preservation.py",
+    "scripts/build_wheelhouse_zip.py",
+    "desktop/electron/scripts/test-nsis-upgrade.mjs",
+])
+def test_script_only_native_acceptance_includes_its_frontend_artifact(
+    tmp_path: Path, suite_config: dict[str, Any], path: str,
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert "windows-nsis-regression" in plan["required_suites"]
+    assert "frontend-artifact" in plan["required_suites"]
 
 
 @pytest.mark.parametrize("paths", [(), (".ci/run-all",), ("unclassified.file",), ("../unsafe",)])
@@ -140,7 +170,7 @@ def test_uncertain_and_explicit_full_plans_never_downgrade_native_acceptance(
     plan = _plan(tmp_path, suite_config, *paths)
     assert plan["full_fallback"] is True
     assert plan["windows_nsis_profile"] == "full"
-    assert len(_platform_cells(plan, "windows-nsis-regression")) == 21
+    assert len(_platform_cells(plan, "windows-nsis-regression")) == 27
 
 
 def test_nsis_smoke_keeps_exactly_the_two_upgrade_and_two_fresh_cases() -> None:
@@ -345,7 +375,28 @@ def _windows_partitions_for(*paths: str) -> list[str]:
     ownership = {
         path: shard for shard, files in snapshot["partitions"].items() for path in files
     }
+    ownership.update({
+        path: shard for shard, files in snapshot["windows_overrides"].items() for path in files
+    })
     return sorted({ownership[path] for path in paths})
+
+
+def test_desktop_native_platform_evidence_tracks_the_reusable_probe_matrix(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    import yaml
+
+    workflow_path = ".github/workflows/desktop-native-probes.yml"
+    native = yaml.safe_load(Path(workflow_path).read_text(encoding="utf-8"))["jobs"]["native"]
+    expected_native = {
+        (cell["os"], f"native-{cell['probe']}")
+        for cell in native["strategy"]["matrix"]["include"]
+    }
+    plan = _plan(tmp_path, suite_config, ".ci/run-all")
+
+    assert len(expected_native) == 10
+    assert _platform_cells(plan, "desktop-recovery-e2e") == _matrix(plan) | expected_native
+    assert workflow_path in suite_config["suites"]["desktop-recovery-e2e"]["execution_inputs"]
 
 
 @pytest.mark.parametrize("path", [
@@ -528,8 +579,8 @@ def test_test_only_change_selects_one_physical_windows_partition(
 
 
 @pytest.mark.parametrize(("family", "partitions"), [
-    ("gateway-sqlite", 4), ("core", 2), ("recovery-migration", 2),
-    ("desktop-installer-contracts", 2),
+    ("gateway-sqlite", 11), ("core", 4), ("recovery-migration", 4),
+    ("desktop-installer-contracts", 4),
 ])
 def test_windows_family_request_expands_only_its_physical_cells(
     suite_config: dict[str, Any], family: str, partitions: int,
@@ -538,12 +589,53 @@ def test_windows_family_request_expands_only_its_physical_cells(
         ["windows-high-risk"], set(), {family}, False, suite_config
     )
 
-    expected = [f"{family}-{partition}" for partition in range(1, partitions + 1)]
+    expected = sorted(f"{family}-{partition}" for partition in range(1, partitions + 1))
     assert python == {"ubuntu": [], "windows": expected}
     assert platforms == [
         {"suite": "windows-high-risk", "os": "windows-latest", "shard": shard}
-        for shard in expected
+        for shard in sorted(expected + (
+            ["bundle-1", "bundle-2", "bundle-3", "bundle-4"]
+            if family == "desktop-installer-contracts" else []
+        ))
     ]
+
+
+@pytest.mark.parametrize("shards,expected_bundle", [
+    ({"desktop-installer-contracts-1"}, {"bundle-1", "bundle-2", "bundle-3", "bundle-4"}),
+    ({"core-1", "desktop-installer-contracts-1"},
+     {"bundle-1", "bundle-2", "bundle-3", "bundle-4"}),
+    ({"desktop-installer-contracts-2"}, set()),
+    ({"core-1", "gateway-sqlite-1"}, set()),
+])
+def test_windows_bundle_cells_follow_the_exact_physical_owner(
+    suite_config: dict[str, Any], shards: set[str], expected_bundle: set[str],
+) -> None:
+    python, platforms = MODULE["_execution_matrices"](
+        ["windows-high-risk"], set(), shards, False, suite_config,
+    )
+    assert python == {"ubuntu": [], "windows": sorted(shards)}
+    assert platforms == [
+        {"suite": "windows-high-risk", "os": "windows-latest", "shard": shard}
+        for shard in sorted(shards | expected_bundle)
+    ]
+
+
+def test_bundle_only_change_selects_owner_and_all_four_windows_consumers(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    path = "tests/test_observability/test_bundle.py"
+    _write_test_module(tmp_path, path)
+    plan = plan_changes([path], repo=tmp_path, config=suite_config)
+    assert plan["full_fallback"] is False
+    assert plan["python_targets"] == [path]
+    assert plan["python_matrix"] == {
+        "ubuntu": [], "windows": ["desktop-installer-contracts-1"],
+    }
+    assert _platform_cells(plan, "windows-high-risk") == {
+        ("windows-latest", "desktop-installer-contracts-1"),
+        ("windows-latest", "bundle-1"), ("windows-latest", "bundle-2"),
+        ("windows-latest", "bundle-3"), ("windows-latest", "bundle-4"),
+    }
 
 
 def test_windows_partition_fallback_matches_execution_selector(
@@ -551,18 +643,19 @@ def test_windows_partition_fallback_matches_execution_selector(
 ) -> None:
     selector = runpy.run_path(".github/scripts/windows_test_shards.py")
     paths = [f"tests/test_gateway/test_new_partition_fallback_{index}.py"
-             for index in range(32)]
+             for index in range(64)]
     snapshot = tmp_path / "partitions.json"
     snapshot.write_text(json.dumps({
         "schema_version": 1,
-        "partitions": {shard: [] for shard in suite_config["full_python_matrix"]["windows"]},
+        "partitions": {shard: [] for shard in suite_config["full_python_matrix"]["ubuntu"]},
+        "windows_overrides": {f"gateway-sqlite-{part}": [] for part in range(9, 12)},
     }))
     actual = MODULE["_load_windows_test_partitions"](
         snapshot, assignments={path: "gateway-sqlite" for path in paths},
         allowed_shards=set(suite_config["full_python_matrix"]["windows"]),
     )
     assert actual == {path: selector["windows_shard_for_test"](path) for path in paths}
-    assert set(actual.values()) == {f"gateway-sqlite-{partition}" for partition in range(1, 5)}
+    assert set(actual.values()) == {f"gateway-sqlite-{partition}" for partition in range(1, 9)}
 
 
 @pytest.mark.parametrize("invalid", ["missing-cell", "duplicate-file", "wrong-family"])
@@ -571,7 +664,7 @@ def test_windows_partition_contract_rejects_incomplete_or_ambiguous_ownership(
 ) -> None:
     path = "tests/test_gateway/test_rpc_sessions.py"
     partitions = {
-        shard: [] for shard in suite_config["full_python_matrix"]["windows"]
+        shard: [] for shard in suite_config["full_python_matrix"]["ubuntu"]
     }
     partitions["gateway-sqlite-1"] = [path]
     if invalid == "missing-cell":
@@ -582,12 +675,97 @@ def test_windows_partition_contract_rejects_incomplete_or_ambiguous_ownership(
         partitions["gateway-sqlite-1"] = []
         partitions["core-1"] = [path]
     snapshot = tmp_path / "partitions.json"
-    snapshot.write_text(json.dumps({"schema_version": 1, "partitions": partitions}))
+    snapshot.write_text(json.dumps({
+        "schema_version": 1, "partitions": partitions,
+        "windows_overrides": {f"gateway-sqlite-{part}": [] for part in range(9, 12)},
+    }))
 
     with pytest.raises(PlanError):
         MODULE["_load_windows_test_partitions"](
             snapshot,
             assignments={path: "gateway-sqlite"},
+            allowed_shards=set(suite_config["full_python_matrix"]["windows"]),
+        )
+
+
+@pytest.mark.parametrize("partition,path", [
+    (5, "tests/test_gateway/test_channel_administration_application.py"),
+    (9, "tests/test_gateway/test_artifact_product_errors.py"),
+    (10, "tests/test_gateway/test_admission_preparation.py"),
+    (11, "tests/test_gateway/test_channel_notices.py"),
+])
+def test_gateway_split_test_change_selects_only_its_windows_owner(
+    tmp_path: Path, suite_config: dict[str, Any], partition: int, path: str,
+) -> None:
+    snapshot = json.loads(Path(suite_config["windows_test_partitions"]).read_text(encoding="utf-8"))
+    moved = {path for paths in snapshot["windows_overrides"].values() for path in paths}
+    owner = f"gateway-sqlite-{partition}"
+    paths = (sorted(set(snapshot["partitions"][owner]) - moved) if partition == 5
+             else snapshot["windows_overrides"][owner])
+    assert path in paths
+    _write_test_module(tmp_path, path)
+    plan = plan_changes([path], repo=tmp_path, config=suite_config)
+    assert plan["full_fallback"] is False
+    assert plan["python_targets"] == [path]
+    assert plan["python_matrix"] == {"ubuntu": [], "windows": [owner]}
+    assert _platform_cells(plan, "windows-high-risk") == {("windows-latest", owner)}
+
+
+def test_full_plan_adds_only_three_windows_gateway_cells(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    plan = _plan(tmp_path, suite_config, ".ci/run-all")
+    ubuntu = set(plan["python_matrix"]["ubuntu"])
+    windows = set(plan["python_matrix"]["windows"])
+    assert len(ubuntu) == 20
+    assert len(windows) == 23
+    assert windows - ubuntu == {f"gateway-sqlite-{part}" for part in range(9, 12)}
+    assert ubuntu <= windows
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing-map", "invalid-map", "missing-target", "unknown-target", "invalid-path-list",
+    "duplicate-path", "duplicate-target-path", "wrong-owner", "unknown-path", "unsorted",
+])
+def test_windows_gateway_override_rejects_invalid_or_ambiguous_ownership(
+    tmp_path: Path, suite_config: dict[str, Any], mutation: str,
+) -> None:
+    first = "tests/test_gateway/test_overlay_a.py"
+    second = "tests/test_gateway/test_overlay_b.py"
+    other = "tests/test_gateway/test_overlay_other.py"
+    partitions = {shard: [] for shard in suite_config["full_python_matrix"]["ubuntu"]}
+    partitions["gateway-sqlite-5"] = [first, second]
+    partitions["gateway-sqlite-1"] = [other]
+    overrides: dict[str, Any] = {f"gateway-sqlite-{part}": [] for part in range(9, 12)}
+    overrides["gateway-sqlite-9"] = [first]
+    payload: dict[str, Any] = {
+        "schema_version": 1, "partitions": partitions, "windows_overrides": overrides,
+    }
+    if mutation == "missing-map":
+        del payload["windows_overrides"]
+    elif mutation == "invalid-map":
+        payload["windows_overrides"] = []
+    elif mutation == "missing-target":
+        del overrides["gateway-sqlite-11"]
+    elif mutation == "unknown-target":
+        overrides["gateway-sqlite-12"] = []
+    elif mutation == "invalid-path-list":
+        overrides["gateway-sqlite-9"] = first
+    elif mutation == "duplicate-path":
+        overrides["gateway-sqlite-9"] = [first, first]
+    elif mutation == "duplicate-target-path":
+        overrides["gateway-sqlite-10"] = [first]
+    elif mutation == "wrong-owner":
+        overrides["gateway-sqlite-9"] = [other]
+    elif mutation == "unknown-path":
+        overrides["gateway-sqlite-9"] = ["tests/test_gateway/test_unreviewed_overlay.py"]
+    else:
+        overrides["gateway-sqlite-9"] = [second, first]
+    path = tmp_path / "partitions.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(PlanError, match="Windows override"):
+        MODULE["_load_windows_test_partitions"](
+            path, assignments={p: "gateway-sqlite" for p in (first, second, other)},
             allowed_shards=set(suite_config["full_python_matrix"]["windows"]),
         )
 
@@ -896,7 +1074,9 @@ def test_generic_webui_change_does_not_wake_desktop_matrix(
     assert "desktop-recovery-e2e" not in plan["required_suites"]
     assert plan["desktop_matrix"] == []
     assert _platform_cells(plan, "webui-chat-recovery") == {
-        ("ubuntu-22.04", "chromium")
+        *(("ubuntu-22.04", f"general-{shard}") for shard in range(1, 5)),
+        ("ubuntu-22.04", "clipboard"),
+        ("ubuntu-22.04", "virtualization"),
     }
     assert plan["reason_codes"] == ["webui_changed"]
 
@@ -1125,7 +1305,7 @@ def test_native_shell_changes_require_all_three_platforms(
         plan["required_suites"]
     )
     expected_windows = (
-        ["core-1"] if path.startswith("tests/")
+        _windows_partitions_for(path) if path.startswith("tests/")
         else suite_config["full_python_matrix"]["windows"]
     )
     assert plan["python_matrix"]["windows"] == expected_windows
@@ -1225,8 +1405,59 @@ def test_desktop_domain_selects_only_its_windows_shard(
         ("macos-latest", windows_shard),
         ("ubuntu-latest", windows_shard),
         ("windows-latest", windows_shard),
-    }
+    } | ({("windows-latest", shard) for shard in WINDOWS_PROFILES_SHARDS}
+         if windows_shard == "profiles" else set())
     assert reason in plan["reason_codes"]
+
+
+@pytest.mark.parametrize("suffix,os_scope", [
+    ("", set()), ("-windows", {"windows-latest"}),
+    ("-macos", {"macos-latest"}), ("-linux", {"ubuntu-latest"}),
+])
+def test_profile_targeted_closure_splits_only_windows(
+    tmp_path: Path, suite_config: dict[str, Any], suffix: str, os_scope: set[str],
+) -> None:
+    path = f"desktop/electron/scripts/test-profile-import-flow{suffix}.mjs"
+    plan = _plan(tmp_path, suite_config, path)
+    platforms = os_scope or {"windows-latest", "macos-latest", "ubuntu-latest"}
+    expected = {(platform, "profiles") for platform in platforms}
+    if "windows-latest" in platforms:
+        expected.update(("windows-latest", shard) for shard in WINDOWS_PROFILES_SHARDS)
+    assert _matrix(plan) == expected
+    assert expected <= _platform_cells(plan, "desktop-recovery-e2e")
+
+
+def test_windows_profiles_executor_change_requires_fresh_full_desktop_evidence(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    relative = ".github/scripts/windows_profile_cases.py"
+    dependency = tmp_path / relative
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("first\n", encoding="utf-8")
+    first = _plan(tmp_path, suite_config, relative)
+    dependency.write_text("second\n", encoding="utf-8")
+    second = _plan(tmp_path, suite_config, relative)
+    assert first["full_fallback"] is True
+    assert first["reason_codes"] == ["ci_policy_changed"]
+    assert first["required_suites"] == sorted(suite_config["full_suites"])
+    assert first["suite_execution_digests"]["desktop-recovery-e2e"] != (
+        second["suite_execution_digests"]["desktop-recovery-e2e"]
+    )
+
+
+@pytest.mark.parametrize("omitted", ["profiles", *sorted(WINDOWS_PROFILES_SHARDS)])
+def test_full_desktop_contract_rejects_an_incomplete_windows_profile_split(
+    tmp_path: Path, omitted: str,
+) -> None:
+    value = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    value["full_desktop_matrix"] = [
+        cell for cell in value["full_desktop_matrix"]
+        if cell != {"os": "windows-latest", "shard": omitted}
+    ]
+    path = tmp_path / "suites.v1.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(PlanError, match="Windows profiles"):
+        load_config(path)
 
 
 def test_full_desktop_matrix_keeps_macos_ownership_and_workbench_isolated(
@@ -1240,6 +1471,10 @@ def test_full_desktop_matrix_keeps_macos_ownership_and_workbench_isolated(
 
     assert macos_cells == {"profiles", "ownership", "workbench"}
     assert "ownership-workbench" not in macos_cells
+    assert {
+        cell["shard"] for cell in suite_config["full_desktop_matrix"]
+        if cell["os"] == "windows-latest"
+    } == {"profiles", "ownership", "workbench"} | WINDOWS_PROFILES_SHARDS
 
 
 def test_windows_specific_platform_change_stays_on_windows(
@@ -1512,7 +1747,7 @@ def test_high_risk_changes_fail_closed_to_full_plan(
     assert _platform_cells(plan, "windows-high-risk") == {
         ("windows-latest", shard)
         for shard in suite_config["full_python_matrix"]["windows"]
-    }
+    } | {("windows-latest", f"bundle-{partition}") for partition in range(1, 5)}
     assert reason in plan["reason_codes"]
 
 
@@ -1631,8 +1866,11 @@ def test_python_dependency_changes_select_reviewed_full_ecosystem_coverage(
     assert {"src/opensquilla/__init__.py", "src/opensquilla/contracts/**"} <= contract_inputs
     assert _platform_cells(plan, "frontend-validation") == {
         ("ubuntu-latest", "validation"),
+        *(("ubuntu-latest", f"unit-{shard}") for shard in range(1, 5)),
+        ("ubuntu-latest", "contract-production"),
         ("ubuntu-latest", "contract-verification"),
-        ("windows-latest", "contract-determinism"),
+        ("windows-latest", "contract-production"),
+        ("windows-latest", "contract-verification"),
         ("ubuntu-latest", "contract-compare"),
     }
 
@@ -2229,6 +2467,47 @@ def test_config_rejects_unknown_full_suite(tmp_path: Path) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
     with pytest.raises(PlanError, match="unknown suites"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing-family", "duplicate-cell", "unknown-family", "missing-partition",
+    "legacy-family-cell",
+])
+def test_python_execution_matrix_rejects_incomplete_physical_partitions(
+    tmp_path: Path, mutation: str,
+) -> None:
+    value = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    cells = value["full_python_matrix"]["ubuntu"]
+    if mutation == "missing-family":
+        cells[:] = [cell for cell in cells if not cell.startswith("core-")]
+    elif mutation == "duplicate-cell":
+        cells.append(cells[0])
+    elif mutation == "unknown-family":
+        cells.append("unknown-1")
+    elif mutation == "missing-partition":
+        cells.remove("gateway-sqlite-2")
+    else:
+        cells[0] = "core"
+    path = tmp_path / "suites.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(PlanError, match="physical Python shard|duplicates|partition every"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("mutation", ["missing-windows-split", "ubuntu-split"])
+def test_python_matrix_requires_the_windows_only_gateway_split(
+    tmp_path: Path, mutation: str,
+) -> None:
+    value = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    if mutation == "missing-windows-split":
+        value["full_python_matrix"]["windows"].remove("gateway-sqlite-11")
+    else:
+        value["full_python_matrix"]["ubuntu"].append("gateway-sqlite-9")
+    path = tmp_path / "suites.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(PlanError, match="three Windows-only Gateway partitions"):
         load_config(path)
 
 

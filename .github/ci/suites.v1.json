@@ -84,7 +84,15 @@
   "full_desktop_matrix": [
     {
       "os": "ubuntu-latest",
-      "shard": "all"
+      "shard": "profiles"
+    },
+    {
+      "os": "ubuntu-latest",
+      "shard": "ownership"
+    },
+    {
+      "os": "ubuntu-latest",
+      "shard": "workbench"
     },
     {
       "os": "macos-latest",
@@ -101,6 +109,30 @@
     {
       "os": "windows-latest",
       "shard": "profiles"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-onboarding-flow"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-onboarding-first-chat"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-profile-consolidation-flow"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-primary-repair-accessibility"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-profile-import-flow"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-desktop-cleanup-flow"
     },
     {
       "os": "windows-latest",
@@ -111,24 +143,59 @@
       "shard": "workbench"
     }
   ],
+  "python_shard_families": [
+    "core",
+    "gateway-sqlite",
+    "recovery-migration",
+    "desktop-installer-contracts"
+  ],
   "full_python_matrix": {
     "ubuntu": [
-      "core",
-      "gateway-sqlite",
-      "recovery-migration",
-      "desktop-installer-contracts"
-    ],
-    "windows": [
       "core-1",
       "core-2",
+      "core-3",
+      "core-4",
       "gateway-sqlite-1",
       "gateway-sqlite-2",
       "gateway-sqlite-3",
       "gateway-sqlite-4",
+      "gateway-sqlite-5",
+      "gateway-sqlite-6",
+      "gateway-sqlite-7",
+      "gateway-sqlite-8",
       "recovery-migration-1",
       "recovery-migration-2",
+      "recovery-migration-3",
+      "recovery-migration-4",
       "desktop-installer-contracts-1",
-      "desktop-installer-contracts-2"
+      "desktop-installer-contracts-2",
+      "desktop-installer-contracts-3",
+      "desktop-installer-contracts-4"
+    ],
+    "windows": [
+      "core-1",
+      "core-2",
+      "core-3",
+      "core-4",
+      "gateway-sqlite-1",
+      "gateway-sqlite-2",
+      "gateway-sqlite-3",
+      "gateway-sqlite-4",
+      "gateway-sqlite-5",
+      "gateway-sqlite-6",
+      "gateway-sqlite-7",
+      "gateway-sqlite-8",
+      "gateway-sqlite-9",
+      "gateway-sqlite-10",
+      "gateway-sqlite-11",
+      "recovery-migration-1",
+      "recovery-migration-2",
+      "recovery-migration-3",
+      "recovery-migration-4",
+      "desktop-installer-contracts-1",
+      "desktop-installer-contracts-2",
+      "desktop-installer-contracts-3",
+      "desktop-installer-contracts-4"
     ]
   },
   "desktop_groups": {
@@ -203,7 +270,9 @@
       "execution_inputs": [
         ".github/actions/download-required-artifact/action.yml",
         ".github/scripts/audit_dependencies.py",
+        ".github/scripts/nsis_packaged_proof.py",
         ".github/scripts/verify-nsis-upgrade-regression.py",
+        ".github/scripts/wait_ci_candidate.py",
         ".github/scripts/verify-packaged-ownership-long-paths.py",
         ".github/scripts/verify-packaged-startup-compatibility.py",
         ".github/scripts/verify-packaged-v054-upgrade.py",
@@ -284,6 +353,8 @@
     },
     "webui-capacity": {
       "execution_inputs": [
+        ".github/scripts/webui_browser_suites.py",
+        "tests/test_ci/test_webui_browser_suites.py",
         "opensquilla-webui/**",
         "pyproject.toml",
         "uv.lock",
@@ -293,6 +364,8 @@
     },
     "webui-chat-recovery": {
       "execution_inputs": [
+        ".github/scripts/webui_browser_suites.py",
+        "tests/test_ci/test_webui_browser_suites.py",
         "opensquilla-webui/e2e/**",
         "opensquilla-webui/src/**",
         "src/opensquilla/gateway/**",
@@ -317,6 +390,8 @@
     },
     "desktop-recovery-e2e": {
       "execution_inputs": [
+        ".github/scripts/windows_profile_cases.py",
+        ".github/workflows/desktop-native-probes.yml",
         ".dockerignore",
         "Dockerfile",
         ".github/scripts/verify-windows-native-write-view.mjs",

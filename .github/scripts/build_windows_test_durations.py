@@ -21,14 +21,22 @@ SHARD_NAMES: Final[tuple[str, ...]] = (
     "recovery-migration",
     "desktop-installer-contracts",
 )
+SHARED_SHARD_NAMES: Final[tuple[str, ...]] = tuple(
+    f"{family}-{partition}"
+    for family in SHARD_NAMES
+    for partition in range(1, 9 if family == "gateway-sqlite" else 5)
+)
 WINDOWS_SHARD_NAMES: Final[tuple[str, ...]] = tuple(
     f"{family}-{partition}"
     for family in SHARD_NAMES
-    for partition in range(1, 5 if family == "gateway-sqlite" else 3)
+    for partition in range(1, 12 if family == "gateway-sqlite" else 5)
 )
 METADATA_NAME: Final[str] = "windows-shard-metadata.json"
 JUNIT_NAME: Final[str] = "junit.xml"
 PROVISIONAL_FLOOR_SECONDS: Final[float] = 0.01
+BUNDLE_TEST_FILE: Final[str] = "tests/test_observability/test_bundle.py"
+BUNDLE_OWNER: Final[str] = "desktop-installer-contracts-1"
+BUNDLE_SHARDS: Final[tuple[str, ...]] = tuple(f"bundle-{part}" for part in range(1, 5))
 
 
 @dataclass(frozen=True)
@@ -54,9 +62,15 @@ def _load_json(path: Path) -> object:
         raise ValueError(f"cannot read JSON metadata from {path}") from exc
 
 
-def _validated_test_files(raw: object, *, metadata_path: Path) -> tuple[str, ...]:
-    if not isinstance(raw, list) or not raw:
-        raise ValueError(f"missing test_files in {metadata_path}")
+def _validated_test_files(
+    raw: object,
+    *,
+    metadata_path: Path,
+    field_name: str = "test_files",
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    if not isinstance(raw, list) or (not raw and not allow_empty):
+        raise ValueError(f"invalid or missing {field_name} in {metadata_path}")
     files: list[str] = []
     for raw_path in raw:
         if not isinstance(raw_path, str):
@@ -64,6 +78,8 @@ def _validated_test_files(raw: object, *, metadata_path: Path) -> tuple[str, ...
         path = PurePosixPath(raw_path).as_posix()
         if (
             path != raw_path
+            or "\\" in path
+            or ".." in PurePosixPath(path).parts
             or not path.startswith("tests/")
             or not PurePosixPath(path).name.startswith("test_")
             or not path.endswith(".py")
@@ -71,7 +87,7 @@ def _validated_test_files(raw: object, *, metadata_path: Path) -> tuple[str, ...
             raise ValueError(f"invalid test path in {metadata_path}: {raw_path!r}")
         files.append(path)
     if files != sorted(files) or len(files) != len(set(files)):
-        raise ValueError(f"test_files must be unique and sorted in {metadata_path}")
+        raise ValueError(f"{field_name} must be unique and sorted in {metadata_path}")
     return tuple(files)
 
 
@@ -166,7 +182,24 @@ def load_run_directory(run_dir: Path) -> RunObservation:
         isinstance(payload, dict) and payload.get("shard") in WINDOWS_SHARD_NAMES
         for payload in payloads
     )
-    shard_names = WINDOWS_SHARD_NAMES if physical else SHARD_NAMES
+    declared = [payload.get("execution_shards") for payload in payloads
+                if isinstance(payload, dict)]
+    if any(value is not None for value in declared):
+        # Every new report declares the full native matrix, including targeted
+        # runs. Removing all three added reports must not look like an old full
+        # twenty-shard run. Legacy evidence without this field stays readable.
+        if not physical or any(value != list(WINDOWS_SHARD_NAMES) for value in declared):
+            raise ValueError("inconsistent or invalid Windows execution_shards inventory")
+        shard_names = WINDOWS_SHARD_NAMES
+    elif physical:
+        extra_names = set(WINDOWS_SHARD_NAMES) - set(SHARED_SHARD_NAMES)
+        has_extra = any(
+            isinstance(payload, dict) and payload.get("shard") in extra_names
+            for payload in payloads
+        )
+        shard_names = WINDOWS_SHARD_NAMES if has_extra else SHARED_SHARD_NAMES
+    else:
+        shard_names = SHARD_NAMES
     if len(metadata_paths) != len(shard_names):
         raise ValueError(
             f"expected {len(shard_names)} Windows shard metadata files in {run_dir}, "
@@ -182,6 +215,7 @@ def load_run_directory(run_dir: Path) -> RunObservation:
     execution_by_shard: dict[str, dict[str, object]] = {}
     partition_hashes: set[str] = set()
     all_files: set[str] = set()
+    bundle_delegated = False
     for metadata_path, payload in zip(metadata_paths, payloads, strict=True):
         if not isinstance(payload, dict) or payload.get("schema_version") != 1:
             raise ValueError(f"unsupported Windows shard metadata in {metadata_path}")
@@ -211,6 +245,13 @@ def load_run_directory(run_dir: Path) -> RunObservation:
             raise ValueError(f"invalid assignment_sha256 in {metadata_path}")
         if shard not in shard_names or shard in files_by_shard:
             raise ValueError(f"invalid or duplicate shard in {metadata_path}")
+        delegation = payload.get("delegated_case_files", [])
+        if delegation != []:
+            if not physical or shard != BUNDLE_OWNER or delegation != [
+                {"path": BUNDLE_TEST_FILE, "shards": list(BUNDLE_SHARDS)}
+            ]:
+                raise ValueError(f"invalid delegated_case_files in {metadata_path}")
+            bundle_delegated = True
         if physical:
             partition_hash = payload.get("partition_sha256")
             if (
@@ -229,7 +270,10 @@ def load_run_directory(run_dir: Path) -> RunObservation:
         serial = execution["serial"]
         if (
             not isinstance(parallel, dict)
-            or set(parallel) != {"workers", "dist", "marker"}
+            or set(parallel) not in (
+                {"workers", "dist", "marker"},
+                {"workers", "dist", "marker", "item_parallel_files"},
+            )
             or type(parallel.get("workers")) is not int
             or parallel["workers"] < 1
             or parallel.get("dist") != "loadfile"
@@ -240,7 +284,19 @@ def load_run_directory(run_dir: Path) -> RunObservation:
             or not _matching_phase_markers(parallel.get("marker"), serial.get("marker"))
         ):
             raise ValueError(f"invalid execution configuration in {metadata_path}")
-        execution_by_shard[str(shard)] = execution
+        item_parallel_files = _validated_test_files(
+            parallel.get("item_parallel_files", []),
+            metadata_path=metadata_path,
+            field_name="item_parallel_files",
+            allow_empty=True,
+        )
+        # Older runners always used whole-file scheduling. Normalize that
+        # implicit policy so explicit [] remains comparable, while an audited
+        # per-item override changes the execution provenance used below.
+        execution_by_shard[str(shard)] = {
+            "parallel": {**parallel, "item_parallel_files": list(item_parallel_files)},
+            "serial": serial,
+        }
         expected_runtime_keys = {
             "python_version",
             "runner_os",
@@ -273,6 +329,8 @@ def load_run_directory(run_dir: Path) -> RunObservation:
         elif runtime_compatibility != common_runtime_compatibility:
             raise ValueError(f"inconsistent runtime compatibility metadata in {run_dir}")
         files = _validated_test_files(payload.get("test_files"), metadata_path=metadata_path)
+        if not set(item_parallel_files).issubset(files):
+            raise ValueError(f"item_parallel_files must be within test_files in {metadata_path}")
         overlap = all_files.intersection(files)
         if overlap:
             sample = sorted(overlap)[:3]
@@ -289,6 +347,16 @@ def load_run_directory(run_dir: Path) -> RunObservation:
     if set(files_by_shard) != set(shard_names) or common is None:
         raise ValueError(f"incomplete Windows shard set in {run_dir}")
 
+    if bundle_delegated:
+        if BUNDLE_TEST_FILE in all_files:
+            raise ValueError("delegated bundle file is also assigned to a normal Windows shard")
+        all_files.add(BUNDLE_TEST_FILE)
+        files_by_shard[BUNDLE_OWNER] = tuple(sorted(
+            (*files_by_shard[BUNDLE_OWNER], BUNDLE_TEST_FILE)
+        ))
+    elif any(run_dir.rglob("bundle-shard-*.json")):
+        raise ValueError("bundle shard reports lack an explicit owner delegation")
+
     module_index = _module_index(all_files)
     node_ids: set[str] = set()
     file_seconds: dict[str, float] = defaultdict(float)
@@ -297,6 +365,8 @@ def load_run_directory(run_dir: Path) -> RunObservation:
         nodes, shard_seconds = _parse_junit(
             junit_by_shard[shard], module_index, node_ids
         )
+        if bundle_delegated and BUNDLE_TEST_FILE in shard_seconds:
+            raise ValueError("delegated bundle cases also ran in a normal Windows shard")
         node_ids.update(nodes)
         for path, seconds in shard_seconds.items():
             file_seconds[path] += seconds
@@ -322,6 +392,54 @@ def load_run_directory(run_dir: Path) -> RunObservation:
                     rel_tol=1e-9, abs_tol=1e-6,
                 ):
                     raise ValueError(f"phase JUnit duration differs from merged report: {path}")
+
+    if bundle_delegated:
+        helper = runpy.run_path(str(Path(__file__).with_name("bundle_test_shards.py")))
+        identity = {
+            "GITHUB_RUN_ID": str(common[0]), "GITHUB_SHA": common[1],
+            "GITHUB_RUN_ATTEMPT": str(attempts_by_shard[BUNDLE_OWNER]),
+        }
+        try:
+            proof = helper["verify_reports"](run_dir, expected_identity=identity)
+        except (ValueError, KeyError, TypeError, OSError, ET.ParseError) as exc:
+            raise ValueError(
+                "delegated bundle requires four complete, matching execution reports: "
+                f"{exc}"
+            ) from exc
+        if proof["outcomes"].get("failed", 0):
+            raise ValueError("delegated bundle JUnit report is not successful")
+        bundle_seconds = 0.0
+        for report_path in sorted(run_dir.rglob("bundle-shard-*.json")):
+            report = _load_json(report_path)
+            assert isinstance(report, dict)  # verify_reports validated the schema.
+            runtime = report.get("runtime")
+            compatibility = common_runtime_compatibility or {}
+            if (
+                not isinstance(runtime, dict)
+                or set(runtime) != {*compatibility, "image_version"}
+                or any(
+                    value is not None and not isinstance(value, str) for value in runtime.values()
+                )
+                or {key: value for key, value in runtime.items() if key != "image_version"}
+                != compatibility
+            ):
+                raise ValueError(f"incompatible delegated bundle runtime in {report_path}")
+            part = f"bundle-{report['shard']}"
+            _, seconds = _parse_junit(
+                report_path.with_name(str(report["junit"])), module_index, node_ids,
+            )
+            if set(seconds) != {BUNDLE_TEST_FILE}:
+                raise ValueError("delegated bundle JUnit contains an unexpected test file")
+            bundle_seconds += seconds[BUNDLE_TEST_FILE]
+            attempts_by_shard[part] = int(identity["GITHUB_RUN_ATTEMPT"])
+            image_versions_by_shard[part] = runtime["image_version"]
+            execution_by_shard[part] = {
+                "case_file": BUNDLE_TEST_FILE, "workers": 1,
+                "partition": int(report["shard"]), "partition_count": 4,
+                "selection": "sorted-nodeid-modulo", "dist": "no",
+            }
+        file_seconds[BUNDLE_TEST_FILE] = bundle_seconds
+        file_phase_seconds[BUNDLE_TEST_FILE] = {"parallel": bundle_seconds, "serial": 0.0}
 
     return RunObservation(
         run_id=common[0],
@@ -414,14 +532,15 @@ def build_duration_payload(
             "id": run.run_id,
             "sha": run.sha,
             "attempts": {
-                shard: run.attempts_by_shard[shard] for shard in sorted(run.files_by_shard)
+                shard: run.attempts_by_shard[shard] for shard in sorted(run.attempts_by_shard)
             },
             "assignment_sha256": run.assignment_sha256,
             "partition_sha256": run.partition_sha256,
             "execution": run.execution_by_shard,
             "runtime_compatibility": run.runtime_compatibility,
             "image_versions": {
-                shard: run.image_versions_by_shard[shard] for shard in sorted(run.files_by_shard)
+                shard: run.image_versions_by_shard[shard]
+                for shard in sorted(run.image_versions_by_shard)
             },
             "node_count": len(run.node_ids),
             "weighted_file_count": len(run.file_seconds),

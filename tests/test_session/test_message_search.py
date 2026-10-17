@@ -67,17 +67,47 @@ async def archive(store, mid, *, delete=True):
             await conn.execute("DELETE FROM transcript_entries WHERE message_id = ?", (mid,))
 
 
-async def test_literal_unicode_code_fences_scope_and_utf16(storage):
+async def test_literal_unicode_code_fences_scope_and_utf16(storage, monkeypatch):
+    # Search may yield at its time budget even for tiny fixtures. Force a
+    # message-boundary page here so semantic checks also consume empty pages.
+    monkeypatch.setattr(message_search, "MAX_SCAN_ENTRIES", 1)
     await add(storage, '😀ALPHA 中文 alpha\n```python\nprint("中文")\n```', "match")
     await add(storage, "中文 alpha", "foreign", sid="foreign")
     await add(storage, "中文 alpha", "tool", role="tool")
-    await add(storage, "visible body", "thinking", reasoning_content="中文 alpha")
-    result = await search(storage, "alpha")
+    await add(storage, "visible body", "thinking", timestamp=9, reasoning_content="中文 alpha")
+
+    async def complete_search(query):
+        matches, pages, cursors = [], [], set()
+        cursor = None
+        while True:
+            page = await search(storage, query, cursor=cursor)
+            pages.append(page)
+            # Only two visible rows belong to this session. Bound the test's
+            # continuation loop without imposing a machine-speed requirement.
+            assert len(pages) <= 2
+            assert page["complete"] == (page["next_cursor"] is None)
+            matches.extend(page["matches"])
+            if page["complete"]:
+                break
+            cursor = page["next_cursor"]
+            assert cursor and cursor not in cursors
+            cursors.add(cursor)
+        assert len(pages) == 2
+        assert pages[0]["matches"] == [] and not pages[0]["complete"]
+        identities = [
+            (hit["message_id"], hit["entry_cursor"], hit["content_revision"],
+             hit["offset_utf16"], hit["length_utf16"])
+            for hit in matches
+        ]
+        assert len(identities) == len(set(identities))
+        return {**page, "matches": matches}
+
+    result = await complete_search("alpha")
     assert [hit["message_id"] for hit in result["matches"]] == ["match", "match"]
     assert [hit["offset_utf16"] for hit in result["matches"]] == [2, 11]
     assert all(hit["length_utf16"] == 5 for hit in result["matches"])
-    assert len((await search(storage, "中文"))["matches"]) == 2
-    assert not (await search(storage, ".*"))["matches"]
+    assert len((await complete_search("中文"))["matches"]) == 2
+    assert not (await complete_search(".*"))["matches"]
     assert result["complete"] and result["next_cursor"] is None
 
 

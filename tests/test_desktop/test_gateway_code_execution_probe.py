@@ -130,7 +130,7 @@ def test_packaged_smoke_requires_safe_success_and_explicit_windows_provisioning(
     ("workflow_name", "job_name"),
     [
         ("wheelhouse-release.yml", "build-desktop-windows"),
-        ("windows-nsis-upgrade-regression.yml", "build"),
+        ("windows-nsis-upgrade-regression.yml", "packaged-security"),
     ],
 )
 def test_windows_safe_smoke_selects_the_hosted_runners_canonical_profile(
@@ -148,6 +148,11 @@ def test_windows_safe_smoke_selects_the_hosted_runners_canonical_profile(
     assert step.get("shell", job.get("defaults", {}).get("run", {}).get("shell")) == "pwsh"
     script = step["run"]
     guard = "if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') {"
+    if job_name == "packaged-security":
+        guard = (
+            "if ($env:GITHUB_ACTIONS -ne 'true' -or "
+            "$env:RUNNER_ENVIRONMENT -ne 'github-hosted') {"
+        )
     refusal = "throw 'Windows Safe provisioning requires a disposable GitHub-hosted runner.'"
     target = (
         "$env:OPENSQUILLA_SMOKE_SANDBOX_PROFILE_ROOT = "
