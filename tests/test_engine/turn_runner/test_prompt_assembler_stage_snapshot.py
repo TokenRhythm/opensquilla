@@ -184,6 +184,7 @@ def _patch_assemble_prompt(runner, base_prompt, prompt_metadata):
         self, agent_id, tool_defs, *, session_key=None, semantic_message=None,
         extra_context=None, prompt_metadata=None, bootstrap_context_mode=None,
         fresh_user_session=False, workspace_dir=None, webui_rendering=False,
+        project_rules_snapshot=None, include_project_rules=True,
         persistence_tools=None,
     ):  # noqa: ARG001
         if prompt_metadata is not None:

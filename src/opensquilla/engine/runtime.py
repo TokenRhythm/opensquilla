@@ -201,6 +201,12 @@ from opensquilla.execution_status import (
     normalize_execution_status,
 )
 from opensquilla.git_runtime import git_run_mode_scope
+from opensquilla.identity.project_instructions import (
+    SOURCE_TOOLS,
+    ProjectInitRequest,
+    ProjectRulesSnapshot,
+    load_project_rules,
+)
 from opensquilla.observability.decision_log import (
     DecisionEntry,
     PipelineStepRecord,
@@ -6028,6 +6034,8 @@ class TurnRunner:
         expected_session_epoch: int | None = None,
         execution_context: TurnExecutionContext | None = None,
         on_initial_provider_ready: Callable[[ProviderConfig], None] | None = None,
+        project_init: ProjectInitRequest | None = None,
+        project_rules_snapshot: ProjectRulesSnapshot | None = None,
     ) -> AsyncIterator[AgentEvent]:
         mark_current_turn_failure_stage(TurnFailureStage.TURN_SETUP)
         # Observability: bracket turn setup + stream loop with monotonic clock
@@ -6173,12 +6181,19 @@ class TurnRunner:
                     session_key=session_key,
                     tool_context=tool_context,
                     session_append=session_append,
+                    project_init=project_init,
                 )
             )
             runtime_message = input_out.runtime_message
             semantic_input = input_out.semantic_input
             extra_prompt_context = input_out.extra_prompt_context
             normalization_metadata = input_out.normalization_metadata
+            project_init = input_out.project_init
+            if project_init is not None and tool_context is not None:
+                tool_context = replace(
+                    tool_context,
+                    surfaced_tools=set(tool_context.surfaced_tools or ()) | SOURCE_TOOLS,
+                )
 
             async def _load_turn_transcript() -> Sequence[Any]:
                 if self._session_manager is None:
@@ -6302,6 +6317,11 @@ class TurnRunner:
             tool_handler = pt_out.tool_handler
             tool_context = pt_out.effective_tool_context
             tool_metadata = pt_out.tool_metadata
+            if project_init is not None:
+                authorized = getattr(tool_context, "authorized_tool_names", None)
+                if authorized is None:
+                    authorized = frozenset(tool.name for tool in tool_defs)
+                runtime_message += "\n\n" + project_init.render(authorized)
             skill_catalog = pt_out.skill_catalog
 
             # Uploaded attachments have already crossed the controlled ingress
@@ -6407,6 +6427,19 @@ class TurnRunner:
 
             with bind_usage_accounting_scope(turn_usage_scope):
                 mark_current_turn_failure_stage(TurnFailureStage.PROMPT_ASSEMBLY)
+                workspace_dir = getattr(tool_context, "workspace_dir", None)
+                if (
+                    project_rules_snapshot is None and workspace_dir
+                    and bootstrap_context_mode not in {"stateless", "heartbeat_light"}
+                ):
+                    project_rules_snapshot = load_project_rules(
+                        workspace_dir,
+                        per_file_max_chars=self._resolve_bootstrap_max_chars(),
+                        total_max_chars=self._resolve_bootstrap_total_max_chars(),
+                        injection_scan_mode=getattr(
+                            getattr(self._config, "safety", None), "injection_scan_mode", "report",
+                        ),
+                    )
                 prompt_assembly = self._prompt_assembler_stage.run(
                     PromptAssemblerStageInput(
                         runtime_message=runtime_message,
@@ -6445,6 +6478,7 @@ class TurnRunner:
                         expected_session_epoch=expected_session_epoch,
                         provider_request_correlation=provider_request_correlation,
                         on_initial_provider_ready=on_initial_provider_ready,
+                        project_rules_snapshot=project_rules_snapshot,
                     )
                 )
                 if tool_context is not None and tool_context.selected_skills:
@@ -7565,6 +7599,8 @@ class TurnRunner:
                         expected_session_id=expected_session_id,
                         expected_session_epoch=expected_session_epoch,
                         execution_context=execution_context,
+                        project_init=project_init,
+                        project_rules_snapshot=project_rules_snapshot,
                     ),
                 )
                 async with contextlib.aclosing(replay_stream):
@@ -9530,6 +9566,8 @@ class TurnRunner:
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
         webui_rendering: bool = False,
+        project_rules_snapshot: ProjectRulesSnapshot | None = None,
+        include_project_rules: bool = True,
         persistence_tools: frozenset[str] | None = None,
     ) -> str | tuple[str, str]:
         """Assemble identity system prompt via Jinja2 template.
@@ -9610,6 +9648,26 @@ class TurnRunner:
                     report=list(visible_bootstrap_report),
                 )
         memory_source_dir = self._resolve_memory_source_dir(agent_id)
+        if (
+            project_rules_snapshot is None and workspace_dir and include_project_rules
+            and bootstrap_context_mode not in {"stateless", "heartbeat_light"}
+        ):
+            project_rules_snapshot = load_project_rules(
+                workspace_dir,
+                per_file_max_chars=self._resolve_bootstrap_max_chars(),
+                total_max_chars=self._resolve_bootstrap_total_max_chars(),
+                injection_scan_mode=getattr(
+                    getattr(self._config, "safety", None), "injection_scan_mode", "report",
+                ),
+            )
+        if (
+            project_rules_snapshot is not None
+            and project_rules_snapshot.includes_file(bootstrap_workspace_dir / "AGENTS.md")
+        ):
+            workspace_files.pop("AGENTS.md", None)
+            visible_bootstrap_report = [
+                report for report in visible_bootstrap_report if report.filename != "AGENTS.md"
+            ]
         stateless_prompt = bootstrap_context_mode in {
             "stateless",
             "stateless_keep_project_rules",
@@ -9717,6 +9775,10 @@ class TurnRunner:
         # Render them into the dynamic suffix instead so the base hash
         # stays stable across those rotations.
         dynamic_blocks: list[str] = []
+        if include_project_rules and project_rules_snapshot is not None:
+            project_rules_block = project_rules_snapshot.render()
+            if project_rules_block:
+                dynamic_blocks.append(project_rules_block)
         volatile_block = self._render_volatile_block(
             daily_notes=daily,
             workspace_files=workspace_files,

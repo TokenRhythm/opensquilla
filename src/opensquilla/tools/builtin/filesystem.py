@@ -1878,7 +1878,8 @@ async def read_file(
     description=(
         "Read a UTF-8 workspace source line range and return a JSON revision receipt. "
         "Use the returned revision as edit_source.expected_revision before editing "
-        "that file. Returned lines are plain text without read_file line-number prefixes."
+        "that file. Returned lines are plain text without read_file line-number prefixes. "
+        "An empty file returns range [0, 0], total_lines 0, and a valid revision."
     ),
     params={
         "path": {
@@ -1944,8 +1945,11 @@ async def read_source(path: str, start_line: int = 1, end_line: int | None = Non
         p,
         operation="read_source",
         offset=receipt["range"][0],
-        limit=receipt["range"][1] - receipt["range"][0] + 1,
-        complete=(receipt["range"][0] == 1 and receipt["range"][1] == receipt["total_lines"]),
+        limit=(receipt["range"][1] - receipt["range"][0] + 1 if receipt["total_lines"] else 0),
+        complete=(
+            receipt["total_lines"] == 0
+            or receipt["range"][0] == 1 and receipt["range"][1] == receipt["total_lines"]
+        ),
     )
     return json.dumps(receipt, ensure_ascii=False)
 
@@ -3000,6 +3004,7 @@ async def edit_file(
             "type": "array",
             "description": (
                 "Non-overlapping inclusive line-range edits against the revision. "
+                "For an empty file, use one edit with start_line=0 and end_line=0. "
                 "Each replacement is complete source text for that range."
             ),
             "items": {

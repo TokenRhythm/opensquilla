@@ -1,5 +1,5 @@
 import i18n, { loadLocaleMessages } from '@/i18n'
-import { ref, watch } from 'vue'
+import { nextTick, ref, watch } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { useChatSlashCommands, type UseChatSlashCommandsOptions } from './useChatSlashCommands'
@@ -21,6 +21,48 @@ function deferred() {
   })
   return { promise, resolve }
 }
+
+const initCatalogCommand = {
+  name: '/init', aliases: [], category: 'turn', busy_policy: 'next_turn', presentation: 'turn',
+  execution: { kind: 'local', action: 'project.init' },
+}
+
+describe('project initialization command intent', () => {
+  it('requires catalog support and resolves only an explicitly typed init command', async () => {
+    const { api } = harness(false, [initCatalogCommand])
+    await expect(api.classifySlashCommand('/init keep existing sections')).resolves.toBe('registered')
+    expect(api.resolveTurnCommand('/init keep existing sections')).toEqual({ name: 'project.init', args: 'keep existing sections' })
+    expect(api.resolveTurnCommand('//init')).toBeNull()
+    expect(api.resolveTurnCommand('Please explain /init')).toBeNull()
+    expect(api.resolveTurnCommand('> /init')).toBeNull()
+  })
+
+  it('keeps init unavailable on an older Gateway instead of sending ordinary text', async () => {
+    const { api, inputText, notify } = harness(false)
+    inputText.value = '/init'
+    await expect(api.classifySlashCommand('/init')).resolves.toBe('unavailable')
+    await expect(api.executeSlashCommand('/init')).resolves.toBe(true)
+    expect(notify).toHaveBeenCalledWith(i18n.global.t('chat.slashCommands.initUnavailable'))
+    expect(inputText.value).toBe('/init')
+  })
+
+  it('does not treat an init action without ordinary-turn scheduling evidence as supported', async () => {
+    const { api } = harness(false, [{ ...initCatalogCommand, category: undefined }])
+    await expect(api.supportsTurnCommand({ name: 'project.init', args: '' })).resolves.toBe(false)
+  })
+
+  it('invalidates command support when the Gateway scope changes', async () => {
+    const scope = ref('profile-a')
+    const { api, rpc } = harness(false, [initCatalogCommand], Promise.resolve(), undefined, { catalogScope: () => scope.value })
+    await api.loadSlashCommands()
+    expect(api.resolveTurnCommand('/init')).not.toBeNull()
+    scope.value = 'profile-b'
+    await nextTick()
+    expect(api.resolveTurnCommand('/init')).toBeNull()
+    rpc.call.mockResolvedValue({ commands: [] })
+    await expect(api.supportsTurnCommand({ name: 'project.init', args: '' })).resolves.toBe(false)
+  })
+})
 
 function harness(
   planModeAvailable: boolean,

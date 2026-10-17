@@ -3851,6 +3851,7 @@
       "continue": "Continue",
       "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
       "commandDescriptions": {
+        "init": "Create or improve project instructions from the current project",
         "new": "Start a new chat",
         "compact": "Shorten the current context",
         "goal": "Set a long-running goal",
@@ -4512,6 +4513,7 @@
       "sendingContinuing": "Sending reply · continuing run…"
     },
     "slashCommands": {
+      "initUnavailable": "This Gateway does not support project initialization. Update it and try again. Your draft was kept.",
       "side": {
         "closed": "The original side chat was closed. Your draft was kept. Edit the command before sending again to start a new side chat.",
         "description": "Open temporary side chat · /btw is an alias",

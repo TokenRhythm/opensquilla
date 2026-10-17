@@ -3,15 +3,16 @@ import { copyLocalPathReferences } from '@/types/localPathReferences'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
 import type { Attachment } from '@/types/chat'
+import { copyTurnCommand, isProjectInitTurnCommand, type ProjectInitTurnCommand } from '@/types/turnCommand'
 import { snapshotAttachment } from './attachments'
 import type {
   TurnCancelRequest, TurnReceiptRequest, TurnSendParams, TurnSendResponse, TurnSteerResponse,
 } from '@/modules/turnCommands'
 
 const DATABASE_NAME = 'opensquilla-chat-pending-inputs'
-// Older clients opening v2 must fail with VersionError, never replay v3 data
-// without the identity fence or delete the database to repair that error.
-const DATABASE_VERSION = 3
+// Older clients must fail with VersionError rather than replay queued turns
+// after dropping their explicit command intent. Upgrading keeps both stores.
+const DATABASE_VERSION = 4
 const STORE_NAME = 'pending_chat_inputs'
 const HANDOFF_STORE_NAME = 'response_handoffs'
 
@@ -29,6 +30,7 @@ export interface PendingInputWalRecord {
   clientRequestId: string
   clientMessageId: string
   text: string
+  turnCommand?: ProjectInitTurnCommand
   localPathReferences?: string[]
   /** Annotation batch retained across IndexedDB/WAL queue recovery. */
   draftIds?: string[]
@@ -239,6 +241,7 @@ function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord
     && typeof record.clientMessageId === 'string'
     && record.clientMessageId.length > 0
     && typeof record.text === 'string'
+    && (record.turnCommand === undefined || isProjectInitTurnCommand(record.turnCommand))
     && (record.deliveryIdentity === undefined || (
       typeof record.deliveryIdentity === 'string'
       && record.deliveryIdentity.length > 0
@@ -341,6 +344,7 @@ function cloneRecord(record: PendingInputWalRecord): PendingInputWalRecord {
   const { promptAnnotationIds, ...current } = record
   return {
     ...current,
+    ...(record.turnCommand ? { turnCommand: copyTurnCommand(record.turnCommand) } : {}),
     ...(promptAnnotationIds?.length ? { retiredAnnotationInput: true } : {}),
     ...(record.pageContext ? { pageContext: normalizePageContext(record.pageContext)! } : {}),
     ...(record.selectedSkills ? { selectedSkills: copySelectedSkills(record.selectedSkills) } : {}),

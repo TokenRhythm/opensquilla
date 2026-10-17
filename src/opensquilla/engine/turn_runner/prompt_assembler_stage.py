@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.transcript_snapshot import (
         TurnTranscriptSnapshot,
     )
+    from opensquilla.identity.project_instructions import ProjectRulesSnapshot
     from opensquilla.observability.decision_log import PipelineStepRecord
     from opensquilla.observability.prompt_report import PromptReport
     from opensquilla.provider.selector import ProviderConfig
@@ -165,6 +166,7 @@ class PromptAssemblerPort(Protocol):
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
         webui_rendering: bool = False,
+        project_rules_snapshot: ProjectRulesSnapshot | None = None,
         persistence_tools: frozenset[str] | None = None,
     ) -> str | tuple[str, str]: ...
 
@@ -322,6 +324,7 @@ class PromptAssemblerStageInput:
     expected_session_id: str | None = field(default=None, repr=False)
     expected_session_epoch: int | None = field(default=None, repr=False)
     provider_metadata: dict[str, Any] = field(default_factory=dict)
+    project_rules_snapshot: ProjectRulesSnapshot | None = field(default=None, repr=False)
     on_initial_provider_ready: Callable[[ProviderConfig], None] | None = field(
         default=None,
         repr=False,
@@ -457,6 +460,8 @@ class PromptAssemblerStage:
             if authorized_tools is not None else None
         )
         prompt_options: dict[str, Any] = {}
+        if inp.project_rules_snapshot is not None:
+            prompt_options["project_rules_snapshot"] = inp.project_rules_snapshot
         if persistence_tools is not None:
             prompt_options["persistence_tools"] = persistence_tools
         base_prompt = self._prompt_assembler.assemble_prompt(

@@ -3850,6 +3850,7 @@
       "continue": "继续",
       "commandWithSkills": "已选择的技能仅用于普通消息；请移除技能标签后执行命令。",
       "commandDescriptions": {
+        "init": "根据当前项目创建或完善项目指南",
         "new": "新建聊天",
         "compact": "压缩当前对话上下文",
         "goal": "设置持续执行的目标",
@@ -4511,6 +4512,7 @@
       "sendingContinuing": "正在发送回复 · 继续运行…"
     },
     "slashCommands": {
+      "initUnavailable": "此 Gateway 不支持项目初始化。请更新后重试，草稿已保留。",
       "side": {
         "closed": "原侧边聊天已关闭，已保留草稿。请修改命令后再发送，以创建新的侧边聊天。",
         "description": "打开临时侧边聊天 · /btw 为同义命令",

@@ -3750,6 +3750,7 @@
       "continue": "Continue",
       "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
       "commandDescriptions": {
+        "init": "Crear o mejorar las instrucciones a partir del proyecto actual",
         "new": "Iniciar un chat nuevo",
         "compact": "Reducir el contexto actual",
         "goal": "Establecer un objetivo continuo",
@@ -4409,6 +4410,7 @@
       "sendingContinuing": "Enviando respuesta · continuando la ejecución…"
     },
     "slashCommands": {
+      "initUnavailable": "Este Gateway no admite la inicialización de proyectos. Actualícelo e inténtelo de nuevo. Se conservó el borrador.",
       "side": {
         "closed": "El chat lateral original se cerró. Se conservó tu borrador. Edita el comando antes de enviarlo de nuevo para crear otro chat lateral.",
         "description": "Abrir chat lateral temporal · alias /btw",

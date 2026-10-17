@@ -8,6 +8,8 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "src" / "opensquilla"
 
 APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
+    # Transport-neutral command intent is a lower-level value contract.
+    ("application", "contracts"),
     # Snapshot retention names ToolContext only under TYPE_CHECKING; runtime
     # snapshot imports remain independent of the tools package.
     ("file_snapshot.py", "tools"),

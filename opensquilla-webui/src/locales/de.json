@@ -3750,6 +3750,7 @@
       "continue": "Continue",
       "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
       "commandDescriptions": {
+        "init": "Projektanweisungen aus dem aktuellen Projekt erstellen oder verbessern",
         "new": "Neuen Chat starten",
         "compact": "Aktuellen Kontext kürzen",
         "goal": "Langfristiges Ziel festlegen",
@@ -4409,6 +4410,7 @@
       "sendingContinuing": "Antwort wird gesendet · Ausführung wird fortgesetzt…"
     },
     "slashCommands": {
+      "initUnavailable": "Dieses Gateway unterstützt keine Projektinitialisierung. Aktualisieren Sie es und versuchen Sie es erneut. Ihr Entwurf wurde beibehalten.",
       "side": {
         "closed": "Der ursprüngliche Seitenchat wurde geschlossen. Der Entwurf wurde behalten. Bearbeite den Befehl vor dem erneuten Senden, um einen neuen Seitenchat zu starten.",
         "description": "Temporären Seitenchat öffnen · Alias /btw",

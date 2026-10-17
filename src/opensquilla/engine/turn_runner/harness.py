@@ -278,9 +278,12 @@ class _TurnRunnerPromptAssemblerAdapter(PromptAssemblerPort):
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
         webui_rendering: bool = False,
+        project_rules_snapshot: Any = None,
         persistence_tools: frozenset[str] | None = None,
     ) -> str | tuple[str, str]:
         prompt_options: dict[str, Any] = {}
+        if project_rules_snapshot is not None:
+            prompt_options["project_rules_snapshot"] = project_rules_snapshot
         if persistence_tools is not None:
             prompt_options["persistence_tools"] = persistence_tools
         return self._runner._assemble_prompt(
@@ -1516,6 +1519,7 @@ class _TurnRunnerSystemPromptRefreshAdapter(SystemPromptRefreshPort):
             bootstrap_context_mode=(bootstrap_context_mode),
             workspace_dir=(getattr(agent.config, "workspace_dir", None)),
             webui_rendering=(getattr(tool_context, "caller_kind", None) is CallerKind.WEB),
+            include_project_rules=False,
             **prompt_options,
         )
         refreshed_prompt = (

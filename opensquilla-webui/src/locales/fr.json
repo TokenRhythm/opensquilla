@@ -3750,6 +3750,7 @@
       "continue": "Continue",
       "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
       "commandDescriptions": {
+        "init": "Créer ou améliorer les consignes à partir du projet actuel",
         "new": "Démarrer une discussion",
         "compact": "Réduire le contexte actuel",
         "goal": "Définir un objectif durable",
@@ -4409,6 +4410,7 @@
       "sendingContinuing": "Envoi de la réponse · poursuite de l'exécution…"
     },
     "slashCommands": {
+      "initUnavailable": "Ce Gateway ne prend pas en charge l’initialisation de projets. Mettez-le à jour et réessayez. Votre brouillon a été conservé.",
       "side": {
         "closed": "Le chat latéral d’origine a été fermé. Votre brouillon est conservé. Modifiez la commande avant de la renvoyer pour créer un nouveau chat latéral.",
         "description": "Ouvrir un chat latéral temporaire · alias /btw",

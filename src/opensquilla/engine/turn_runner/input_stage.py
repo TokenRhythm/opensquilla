@@ -15,6 +15,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from opensquilla.contracts.turn_commands import normalize_turn_command
+from opensquilla.identity.project_instructions import ProjectInitRequest
+
 if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.outcome import StageOutcome
     from opensquilla.session.models import TranscriptEntry
@@ -85,6 +88,7 @@ class InputStageInput:
     session_key: str
     tool_context: ToolContext | None
     session_append: SessionAppendPort | None
+    project_init: ProjectInitRequest | None = None
 
 @dataclass(frozen=True)
 class InputStageOutput:
@@ -108,6 +112,7 @@ class InputStageOutput:
     extra_prompt_context: dict[str, str] | None
     persisted_entry: TranscriptEntry | None = None
     normalization_metadata: dict[str, Any] | None = None
+    project_init: ProjectInitRequest | None = None
 
     def to_outcome(self) -> StageOutcome[InputStageOutput]:
         """Wrap this output as a non-terminal ``StageOutcome``.
@@ -128,9 +133,10 @@ class InputStageOutput:
 class InputStage:
     """Normalize the user/system input and (optionally) persist it.
 
-    Stable boundary: runs ONCE per turn, before provider resolution. Pure
-    with respect to its inputs except for the optional
-    ``session_append.append_message`` call.
+    Stable boundary: runs ONCE per turn, before provider resolution. An
+    explicit project-init command captures its candidate and prompt template
+    once; the optional ``session_append.append_message`` call persists the
+    original input.
     """
 
     name = "input_stage"
@@ -144,6 +150,21 @@ class InputStage:
             inp.semantic_message if inp.semantic_message is not None else inp.message
         )
         extra_prompt_context: dict[str, str] | None = None
+        project_init = inp.project_init
+        command = normalize_turn_command((inp.input_provenance or {}).get("turn_command"))
+        if (
+            project_init is None
+            and inp.input_mode == "user"
+            and command is not None
+        ):
+            from opensquilla.tools.path_policy import resolve_bound_workspace
+
+            workspace = resolve_bound_workspace(
+                getattr(inp.tool_context, "workspace_dir", None),
+            )
+            if workspace is None:
+                raise ValueError("/init requires a bound project workspace")
+            project_init = ProjectInitRequest.capture(workspace, command["args"])
 
         if inp.input_mode == "system_event":
             runtime_message = f"[INTERNAL SYSTEM EVENT]\n{inp.message}"
@@ -205,4 +226,5 @@ class InputStage:
             extra_prompt_context=extra_prompt_context,
             persisted_entry=persisted_entry,
             normalization_metadata=normalization_metadata,
+            project_init=project_init,
         )

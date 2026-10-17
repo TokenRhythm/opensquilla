@@ -3750,6 +3750,7 @@
       "continue": "Continue",
       "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
       "commandDescriptions": {
+        "init": "現在のプロジェクトを調べてガイドを作成・改善する",
         "new": "新しいチャットを開始",
         "compact": "現在の文脈を圧縮",
         "goal": "継続的な目標を設定",
@@ -4409,6 +4410,7 @@
       "sendingContinuing": "返信を送信中 · 実行を継続中…"
     },
     "slashCommands": {
+      "initUnavailable": "この Gateway はプロジェクト初期化に対応していません。更新して再試行してください。下書きは保持されました。",
       "side": {
         "closed": "元のサイドチャットは閉じられました。下書きは保持されています。新しいサイドチャットを開始するには、コマンドを編集して再送信してください。",
         "description": "一時サイドチャットを開く · /btw は別名です",

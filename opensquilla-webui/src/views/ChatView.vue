@@ -2102,6 +2102,7 @@ const chatPendingQueue = useChatPendingQueue({
   pendingQueuePolicy: props.pendingQueuePolicy,
   pendingInputQueue,
   connectionState: gatewayConnectionState,
+  supportsTurnCommand: command => chatSlashCommands.supportsTurnCommand(command),
   deliveryIdentity,
   composerRevision,
   prepareAttachmentsForSend,
@@ -3638,6 +3639,7 @@ const sideChatCommand = useSideChatCommand({
   notify: message => pushToast(message, { duration: 6000 }), translate: key => t(key), resized: autoResizeTextarea,
 })
 const chatSlashCommands = useChatSlashCommands({
+  catalogScope: () => JSON.stringify([gatewayAccess.deliveryIdentity, gatewayAccess.subscriptionEpoch]),
   sideChat: sideChatCommand,
   commandAllowed: command => conversationSlashActionAllowed(conversationPolicy.value, command.execution?.action || command.cmd),
   skillCatalog,
@@ -3844,6 +3846,7 @@ const chatSend = useChatSend({
   },
   activeSteerCapability,
   inputText,
+  commandText: composerText,
   messages,
   sessionKey,
   pendingQueueOwnerContext,
@@ -3970,6 +3973,8 @@ const chatSend = useChatSend({
   classifySlashCommand,
   executeSlashCommand,
   isPlanModeCommand,
+  resolveTurnCommand: chatSlashCommands.resolveTurnCommand,
+  supportsTurnCommand: chatSlashCommands.supportsTurnCommand,
   closeSlashMenu,
   autoResizeTextarea,
   scrollToBottom,

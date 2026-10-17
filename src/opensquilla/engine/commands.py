@@ -347,6 +347,15 @@ _COMMANDS: tuple[CommandDef, ...] = (
         presentation=CommandPresentation.NOTICE,
         order=70,
     ),
+    CommandDef(
+        name="/init",
+        usage="/init [instructions]",
+        description="Analyze this project and create or improve its instructions.",
+        execution={_W: _local("project.init")},
+        category=CommandCategory.TURN,
+        busy_policy=CommandBusyPolicy.NEXT_TURN,
+        presentation=CommandPresentation.TURN,
+    ),
     # ---- TUI + Channel ----------------------------------------------------
     CommandDef(
         name="/help",
