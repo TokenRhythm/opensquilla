@@ -332,8 +332,10 @@ All 26 NSIS jobs succeeded. The Windows profiles recovery job failed its last
 `desktop-cleanup-flow` script, and `CI result` retained that failure. Its six
 Desktop scripts were attempted sequentially; the cleanup helper reported
 `cleanup_inventory_stale` and the test later timed out waiting for post-exit
-completion. The failed script did not reach all its subsequent assertions.
-This experiment records the first failure and does not retry or fix it.
+completion. All six scripts ran; the final cleanup success condition was not
+satisfied. The six-script step grew from 429 to 551 seconds, including cleanup
+growing from 12.070 to 106.444 seconds. This experiment records the first failure
+and does not retry or fix it.
 
 The observed whole-run reduction is 126 seconds (12.5%), while the original
 bundle-owning job shrank by 682 seconds (70.2%). These are different measures:
