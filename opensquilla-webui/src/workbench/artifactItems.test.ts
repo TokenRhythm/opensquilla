@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ArtifactPayload } from '@/types/artifacts'
+import { createResourceCollectionWorkbenchItem } from './workbenchResourceItems'
 import {
   artifactFromWorkbenchItem,
   fileActionArtifactFromWorkbenchItem,
@@ -54,6 +55,15 @@ describe('artifact Workbench items', () => {
     const parentScoped = { ...item, scope: { type: 'session' as const, id: 'agent:main:webchat:parent' } }
 
     expect(sessionKeyFromWorkbenchItem(parentScoped)).toBe('agent:main:sidechat:child')
+  })
+
+  it('keeps collection authority explicit and preserves legacy scope fallbacks', () => {
+    const item = createResourceCollectionWorkbenchItem({ resources: [], sessionKey: 'child', title: 'Files' })
+    item.scope = { type: 'session', id: 'parent' }
+    expect(sessionKeyFromWorkbenchItem(item)).toBe('child')
+    expect(sessionKeyFromWorkbenchItem({ ...item, payload: {} })).toBe('parent')
+    expect(sessionKeyFromWorkbenchItem({ ...item, payload: { sessionKey: '  ' } })).toBe('parent')
+    expect(sessionKeyFromWorkbenchItem(null)).toBe('')
   })
 
   it('does not alias distinct legacy artifacts that collided under the old 32-bit key', () => {

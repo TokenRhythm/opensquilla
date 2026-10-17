@@ -42,7 +42,7 @@
 
 将“当前工作文件”“可变文档 head”“已发布交付”“固定历史 revision”明确建模。`auto` 打开可以沿后端明确关系指向工作文档，但历史版本和原始交付下载不能悄悄追随最新 head。外部文件变化或文件替换必须重新验证映射和 revision。
 
-显示归属与读取授权分开：side 文件可以显示在父会话的工作台，但仍使用 child 的资源权限和 sessionKey。审查发现 `sessionKeyFromWorkbenchItem` 对 collection 的 payload 与父 scope 组合存在需验证的风险；这是后续专项验证项，不代表本轮已复现或修复 side 库存串读。
+显示归属与读取授权分开：side 文件可以显示在父会话的工作台，但仍使用 child 的资源权限和 sessionKey。Draft PR 前专项验证已复现 `sessionKeyFromWorkbenchItem` 遗漏 collection 导致读取父库存的回归，现已在既有 kind 判断中补齐；真实宿主测试验证列表、load/retain、打开和下载均使用 child，预览仍显示在父工作台。这不是后端权限绕过的证明，也不改变既有权限。
 
 ### 2. 一个打开协调入口，各格式保留 adapter
 
@@ -87,7 +87,7 @@ HTML 精确 DOM 选择目前要求 desktop native surface 的协议 3/4 和 IPC�
 
 ### ZCode
 
-- 路径：`C:/code/reference/ZCode`；SHA：`29628c9acdb81b703bbd4080c207a0e7ce5e276e`。
+- 本地 reference 对应 [ZCode 固定版本](https://github.com/zai-org/ZCode/tree/29628c9acdb81b703bbd4080c207a0e7ce5e276e)，Apache-2.0；仅参考源码分析，没有移植其代码。
 - `packages/ui/src/lib/workspaceSidePane.ts:943-981,1499-1507`：目前对 PPTX / media 做了归一，渲染 source 类型不等于资源身份；按 sourceKey 和 ownerTaskId 复用。diff 不应仅按路径去重。
 - `packages/ui/src/hooks/useAppPanels.ts:322-345`：workspace 与 owner 共同参与面板恢复。
 - `packages/ui/src/app-shell/WorkspaceShellLayout.tsx:1257-1288` 与 `packages/ui/src/lib/workflowArtifactOpen.ts:17-28` 仍有不同的聊天路径 / artifact 打开链；`packages/ui/src/workspace-file-tree/WorkspaceFileTree.tsx:538-554` 从文件树打开 CodeViewer，而聊天 HTML 可进入浏览器，不能宣称它已将四个入口全部统一。
@@ -98,7 +98,7 @@ HTML 精确 DOM 选择目前要求 desktop native surface 的协议 3/4 和 IPC�
 
 ### DeepSeek harness
 
-- 路径：`C:/code/reference/deepseek-harness`；SHA：`d347e703908d0406b7a7ef80e3a0e594d86b2215`（`dsh-0.1.3-alpha.1`）。
+- 本地 reference 对应 [DeepSeek harness 固定版本](https://github.com/deepseek-ai/deepseek-harness/tree/d347e703908d0406b7a7ef80e3a0e594d86b2215)（`dsh-0.1.3-alpha.1`），MIT；仅参考源码分析，没有移植其代码。
 - `packages/client/ui-chat/src/client/apply.ts:122-127` → `packages/api/session-controller/src/index.ts:269-299`：统一 openFile / openWorkspacePath 动作。
 - `packages/client/ui-deliverables/src/client/index.ts:82-91`：内联引用和 ProducedFiles chips 共用选择器与 openFile；产物源自成功文件操作的事实。
 - `packages/client/ui-deliverables/src/client/turn-deliverables.ts:34-58,105-120` 的工具白名单并不覆盖所有 shell / 转换 / Code Dispatch 子调用；OpenSquilla 应继续使用自己的权威 artifact/document 记录。

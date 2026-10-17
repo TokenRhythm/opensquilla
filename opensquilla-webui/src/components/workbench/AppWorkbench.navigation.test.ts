@@ -127,40 +127,59 @@ afterEach(() => {
 })
 
 describe('AppWorkbench artifact navigation', () => {
-  it.each([target, { id: 'listed-html', name: 'listed.html', mime: 'text/html' }])(
-    'opens listed $name through the mounted panel and workbench runtime', async artifact => {
+  it.each([target, { id: 'listed-html', name: 'listed.html', mime: 'text/html' }].flatMap(artifact =>
+    ['session-a', 'agent:main:sidechat:child'].map(resourceSessionKey => ({ artifact, name: artifact.name, resourceSessionKey })),
+  ))(
+    'opens listed $name with $resourceSessionKey authority through the mounted panel', async ({ artifact, resourceSessionKey }) => {
       previewHarness.enabled = true
       previewHarness.runtime = true
       const h = await mount({ target: artifact })
       const listed = resource(artifact)
+      // A side collection is visible in the parent, but must never render or
+      // read the parent's inventory. Keep different records in both stores.
       h.resources.snapshots['session-a'] = {
         sessionKey: 'session-a', available: true, loading: false, loaded: true,
+        error: null, resources: [resource({ id: 'parent-only', name: 'parent-only.html', mime: 'text/html' })], totalCount: 1,
+      }
+      h.resources.snapshots[resourceSessionKey] = {
+        sessionKey: resourceSessionKey, available: true, loading: false, loaded: true,
         error: null, resources: [listed], totalCount: 1,
       }
+      const load = vi.spyOn(h.resources, 'load')
+      const retain = vi.spyOn(h.resources, 'retain')
       const collection = createResourceCollectionWorkbenchItem({
-        sessionKey: 'session-a', title: 'Files', resources: [listed],
+        sessionKey: resourceSessionKey, title: 'Files', resources: [listed],
       })
+      collection.scope = { type: 'session', id: 'session-a' }
       h.store.openItem(collection)
       await flush()
       const entry = h.host.querySelector<HTMLButtonElement>('.resource-collection__open')
       expect(entry?.textContent).toContain(artifact.name)
+      expect(h.host.querySelector('.resource-collection')?.textContent).not.toContain('parent-only.html')
+      await vi.waitFor(() => expect(load).toHaveBeenCalledWith(resourceSessionKey))
+      expect(retain).toHaveBeenCalledWith(resourceSessionKey)
+      expect(load.mock.calls.every(([key]) => key === resourceSessionKey)).toBe(true)
+      expect(retain.mock.calls.every(([key]) => key === resourceSessionKey)).toBe(true)
       vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:download')
       vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
       h.host.querySelector<HTMLButtonElement>(`[aria-label="Download ${artifact.name}"]`)!.click()
       await flush()
-      await vi.waitFor(() => expect(h.fetchArtifact).toHaveBeenCalledWith(expect.objectContaining({ id: artifact.id }), { sessionKey: 'session-a' }))
+      await vi.waitFor(() => expect(h.fetchArtifact).toHaveBeenCalledWith(expect.objectContaining({ id: artifact.id }), { sessionKey: resourceSessionKey }))
+      expect(h.resolve).toHaveBeenCalledWith(resourceSessionKey, listed.resource)
       expect(h.store.activeItemId).toBe(collection.id)
 
       h.openCurrent.mockRejectedValueOnce(artifactProductClientError('PERMISSION_DENIED'))
       entry!.click()
       await flush()
-      expect(h.openCurrent).toHaveBeenCalledWith('session-a', listed)
+      expect(h.openCurrent).toHaveBeenCalledWith(resourceSessionKey, listed)
       expect(h.host.querySelector('[role="alert"]')?.textContent).toContain(en.workbench.artifactErrors.permissionDenied)
       expect(h.store.activeItemId).toBe(collection.id)
       h.host.querySelector<HTMLButtonElement>(`[aria-label="${en.workbench.resources.retry}"]`)!.click()
       await flush()
       expect(h.openCurrent).toHaveBeenCalledTimes(2)
       expect(h.store.activeItem?.kind).toBe('artifact-preview')
+      expect(h.store.activeItem?.scope).toEqual({ type: 'session', id: 'session-a' })
+      expect(h.store.activeItem?.payload.sessionKey).toBe(resourceSessionKey)
       expect(artifactFromWorkbenchItem(h.store.activeItem!)).toMatchObject({
         id: 'canonical-head', documentId: 'canonical-doc', revisionId: 'revision-head',
       })

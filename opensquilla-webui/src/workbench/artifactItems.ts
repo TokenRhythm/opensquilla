@@ -265,11 +265,11 @@ export function previewableNavigationArtifactsFromWorkbenchItem(
 
 export function sessionKeyFromWorkbenchItem(item: WorkbenchItem | null): string {
   if (!item || item.scope.type !== 'session') return ''
-  // A side-chat preview is visible in the parent workbench scope, while its
+  // A side-chat preview or collection is visible in the parent scope, while its
   // document bytes remain authorized against the ephemeral child session.
   // Keep those identities separate: scope controls visibility/lifetime and
   // payload.sessionKey controls artifact/resource reads.
-  if ((item.kind === 'artifact-preview' || item.kind === 'file') && typeof item.payload.sessionKey === 'string'
+  if ((item.kind === 'artifact-preview' || item.kind === 'file' || item.kind === 'resource-collection') && typeof item.payload.sessionKey === 'string'
     && item.payload.sessionKey.trim()) return item.payload.sessionKey
   return item.scope.id
 }
