@@ -396,7 +396,7 @@
     :busy="projectCreateBusy"
     :source-picking="projectCreateSourcePicking"
     :creation-available="gatewayAccess.canCreateProjectWorkspace === true"
-    :host-name="projectWorkspaces.creationDefaults.value?.hostName || gatewayAccess.connectedGatewayHost || undefined"
+    :host-name="projectWorkspaces.creationDefaults.value?.hostName || undefined"
     :host-platform="projectWorkspaces.creationDefaults.value?.platform"
     :error="projectCreateError"
     @update:name="projectCreateName = $event"
@@ -1479,7 +1479,10 @@ watch(projectWorkspaces.creationDefaults, defaults => {
 })
 
 watch(() => [gatewayAccess.deliveryIdentity, gatewayAccess.loadConnectionEndpoint(), gatewayAccess.subscriptionEpoch],
-  resetProjectCreator)
+  () => {
+    resetProjectCreator()
+    if (gatewayAccess.canManageProjectWorkspaces) scheduleSessionRefresh()
+  })
 
 function closeProjectCreator() {
   if (projectCreateBusy.value) return
