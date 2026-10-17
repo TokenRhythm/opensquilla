@@ -227,13 +227,20 @@ async def test_quit_cancels_other_tasks_while_one_intent_write_is_blocked():
 
 
 @pytest.mark.asyncio
-async def test_blocked_goal_pause_does_not_delay_quit_cancellation(monkeypatch):
+@pytest.mark.parametrize("runtime_residual", [False, True], ids=["goal-only", "runtime-residual"])
+async def test_blocked_goal_pause_does_not_delay_quit_cancellation(monkeypatch, runtime_residual):
     from opensquilla.gateway import boot
 
     cancelled = asyncio.Event()
     started = asyncio.Event()
+    goal_entered = asyncio.Event()
     goal_release = asyncio.Event()
+    write_blocked = asyncio.Event()
+    write_release = asyncio.Event()
+    runtime_finished = asyncio.Event()
     services_closed = asyncio.Event()
+    runtime_results = []
+    close_tasks = []
 
     async def handler(_run):
         started.set()
@@ -243,14 +250,40 @@ async def test_blocked_goal_pause_does_not_delay_quit_cancellation(monkeypatch):
             cancelled.set()
             raise
 
-    runtime = TaskRuntime(storage=_Storage(), turn_handler=handler)
+    storage = _Storage()
+    runtime = TaskRuntime(storage=storage, turn_handler=handler)
     await runtime.enqueue(_envelope(), "synthetic work")
     await asyncio.wait_for(started.wait(), 1)
-    request = ShutdownRequest("quit", time.monotonic() + 0.05)
+    update = storage.update_agent_task
+
+    async def controlled_update(task_id, **fields):
+        if runtime_residual and "status" in fields:
+            write_blocked.set()
+            await write_release.wait()
+        await update(task_id, **fields)
+
+    async def pause_goals():
+        goal_entered.set()
+        await goal_release.wait()
+
+    runtime_shutdown = runtime.shutdown
+
+    async def observe_runtime_shutdown(**kwargs):
+        result = await runtime_shutdown(**kwargs)
+        runtime_results.append(result)
+        runtime_finished.set()
+        return result
+
+    monkeypatch.setattr(storage, "update_agent_task", controlled_update)
+    monkeypatch.setattr(runtime, "shutdown", observe_runtime_shutdown)
+    # Infinity is only the unarmed fixture phase, bounded by the 1 s setup
+    # barrier below. The real shared 50 ms deadline starts after we establish
+    # whether the goal alone is blocked or runtime settlement is blocked too.
+    request = ShutdownRequest("quit", float("inf"))
     runtime.close_admission(request)
     services = SimpleNamespace(
         task_runtime=runtime,
-        goal_service=SimpleNamespace(prepare_shutdown=AsyncMock(side_effect=goal_release.wait)),
+        goal_service=SimpleNamespace(prepare_shutdown=AsyncMock(side_effect=pause_goals)),
         close=AsyncMock(side_effect=lambda: services_closed.set()),
     )
     server = GatewayServer(
@@ -261,13 +294,49 @@ async def test_blocked_goal_pause_does_not_delay_quit_cancellation(monkeypatch):
         broadcast=AsyncMock(), all=lambda: [],
     ))
     monkeypatch.setattr(server, "_stop_owned_processes", AsyncMock())
-    result = await asyncio.wait_for(server.close("desktop_quit"), 0.5)
-    assert cancelled.is_set()
-    assert not result.clean
-    services.close.assert_not_awaited()
-    server._pid_lock.release.assert_not_called()
-    goal_release.set()
-    await asyncio.wait_for(services_closed.wait(), 1)
+    close_impl = server._close_impl
+
+    async def observe_close_impl(*args, **kwargs):
+        close_tasks.append(asyncio.current_task())
+        return await close_impl(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_close_impl", observe_close_impl)
+    closing = asyncio.create_task(server.close("desktop_quit"))
+    try:
+        async with asyncio.timeout(1):
+            await goal_entered.wait()
+            if runtime_residual:
+                await write_blocked.wait()
+            else:
+                await runtime_finished.wait()
+                assert runtime_results[0].clean
+        assert cancelled.is_set()
+        assert not goal_release.is_set()
+        request.update("quit", 50)
+        result = await asyncio.wait_for(asyncio.shield(closing), 0.5)
+        assert not result.clean
+        services.close.assert_not_awaited()
+        server._pid_lock.release.assert_not_called()
+        await asyncio.wait_for(runtime_finished.wait(), 1)
+        assert runtime_results[0].clean is (not runtime_residual)
+        goal_release.set()
+        write_release.set()
+        await asyncio.wait_for(asyncio.shield(close_tasks[0]), 1)
+        if runtime_residual:
+            services.close.assert_not_awaited()
+        else:
+            await asyncio.wait_for(services_closed.wait(), 1)
+            services.close.assert_awaited_once()
+        server._pid_lock.release.assert_not_called()
+    finally:
+        goal_release.set()
+        write_release.set()
+        # Wake every unarmed wait even when an admission assertion failed.
+        request.update("quit", 0)
+        pending = [closing, *close_tasks]
+        if runtime._shutdown_task is not None:
+            pending.append(runtime._shutdown_task)
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), 1)
 
 
 @pytest.mark.asyncio
