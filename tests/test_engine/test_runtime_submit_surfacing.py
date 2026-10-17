@@ -41,6 +41,42 @@ def _runner_with_repository_allowlist() -> TurnRunner:
     return runner
 
 
+@pytest.mark.parametrize(
+    ("side", "profile", "denied", "guest", "expected"),
+    [
+        (True, "full", False, False, True),
+        (True, "coding", False, False, True),
+        (False, "full", False, False, False),
+        (True, "minimal", False, False, False),
+        (True, "full", True, False, False),
+        (True, "full", False, True, False),
+    ],
+)
+def test_side_history_surfacing_preserves_authorized_tool_scope(
+    side: bool, profile: str, denied: bool, guest: bool, expected: bool,
+) -> None:
+    runner = TurnRunner(provider_selector=None, config=GatewayConfig(tools={"profile": profile}))
+    runner._tool_registry = get_default_registry()
+    runner._session_manager = object()
+    ctx = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        session_key="agent:main:sidechat:history" if side else "agent:main:webchat:history",
+        denied_tools={"sessions_history"} if denied else set(),
+        guest_safe=guest,
+    )
+
+    definitions, _handler = runner._build_tools(ctx)
+
+    assert ("sessions_history" in {tool.name for tool in definitions}) is expected
+    if side and not expected:
+        assert "sessions_history" not in ctx.authorized_tool_names
+    if not side:
+        # Ordinary chats retain the existing tool_search discovery path.
+        assert "sessions_history" in ctx.authorized_tool_names
+    assert "sessions_history" not in DEFAULT_MODEL_TOOL_NAMES
+
+
 @pytest.mark.parametrize("retired_value", [None, "", "off", "on", "1"])
 def test_retired_submit_env_does_not_expand_repository_tool_surface(
     tmp_path: Path,

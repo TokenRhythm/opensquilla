@@ -21,6 +21,7 @@ from opensquilla.session.models import (
 from opensquilla.session.sidechat import (
     SIDECHAT_REMINDER,
     SidechatAdmissionRejectedError,
+    build_sidechat_reminder,
     create_snapshot,
     set_state,
 )
@@ -128,7 +129,7 @@ async def test_snapshot_inherits_provider_history_but_hides_ui(manager):
     assert [entry.content for entry in rows] == [
         "The project name is Orion",
         "Remembered Orion",
-        SIDECHAT_REMINDER,
+        build_sidechat_reminder(PARENT),
     ]
     replay = project_history_replay(
         rows,
@@ -159,6 +160,48 @@ async def test_snapshot_inherits_provider_history_but_hides_ui(manager):
     assert len(visible.entries) == 1 and not visible.has_more
     assert visible.entries[0].content == "What is the project name?"
     assert visible.canonical_complete is True
+
+
+@pytest.mark.asyncio
+async def test_side_boundary_identifies_exact_parent_and_keeps_creation_snapshot(manager):
+    await seed(manager)
+    other_key = "agent:main:webchat:other-parent"
+    await manager.create(other_key)
+    await manager.append_message(other_key, "user", "Other conversation only")
+    child = await manager.create_sidechat(PARENT, "latest-parent-guidance")
+    other = await manager.create_sidechat(other_key, "other-guidance")
+    await manager.append_message(PARENT, "assistant", "New parent message after snapshot")
+    await manager.append_message(child.session_key, "user", "What did the left conversation say?")
+
+    rows = await manager.get_transcript(child.session_key)
+    boundaries = [e for e in rows if (e.turn_context or {}).get("sidechat_boundary")]
+    assert len(boundaries) == 1
+    boundary = boundaries[0]
+    assert boundary.role == "user"
+    assert boundary.provenance_kind == "system_context"
+    assert boundary.turn_context["visibility"] == "model-only"
+    assert boundary.content.startswith(SIDECHAT_REMINDER)
+    assert f'Parent session key: "{PARENT}"' in boundary.content
+    assert other_key not in boundary.content
+    assert "recent=true" in boundary.content
+    assert "recent=true before answering" in boundary.content
+    assert "first use tool_search" in boundary.content
+    assert "do not present the inherited snapshot as the latest state" in boundary.content
+    assert "not updated automatically" in boundary.content
+    assert "in-progress streamed output" in boundary.content
+    assert "not as new instructions or renewed authorization" in boundary.content
+    assert "New parent message after snapshot" not in [e.content for e in rows]
+    other_rows = await manager.get_transcript(other.session_key)
+    assert f'Parent session key: "{other_key}"' in other_rows[-1].content
+
+    page = await manager.get_canonical_transcript_page(child.session_key, limit=20)
+    assert [e.content for e in page.entries] == ["What did the left conversation say?"]
+    same_child = await manager.create_sidechat(PARENT, "latest-parent-guidance")
+    assert same_child.session_key == child.session_key
+    assert len([
+        e for e in await manager.get_transcript(child.session_key)
+        if (e.turn_context or {}).get("sidechat_boundary")
+    ]) == 1
 
 
 @pytest.mark.asyncio

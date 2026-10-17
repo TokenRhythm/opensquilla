@@ -8966,9 +8966,17 @@ class TurnRunner:
             ctx is not None and str(getattr(ctx, "plan_run_id", "") or "").strip()
         )
         if ctx is not None:
+            from opensquilla.session.keys import is_sidechat_key
             from opensquilla.skills.catalog_policy import project_public_catalog
             from opensquilla.skills.install_turn import SkillInstallTurn
 
+            # A side snapshot can be stale by its next turn. Make its existing
+            # history reader discoverable immediately; policy/profile/guest
+            # filtering below still determines whether it is authorized.
+            if is_sidechat_key(ctx.session_key):
+                if ctx.surfaced_tools is None:
+                    ctx.surfaced_tools = set()
+                ctx.surfaced_tools.add("sessions_history")
             skill_tools: set[str] = set()
             if isinstance(ctx.skill_install_turn, SkillInstallTurn):
                 skill_tools.update(ctx.skill_install_turn.surface_tools())

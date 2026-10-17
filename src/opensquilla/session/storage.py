@@ -672,6 +672,15 @@ _BOUNDED_USER_ENVELOPE_SQL = user_display_envelope_sql()
 _BOUNDED_TRANSCRIPT_TRUNCATED_SQL = (
     f"length(substr(content, ({_BOUNDED_TRANSCRIPT_CHARS_SQL}) + 1, 1)) > 0"
 )
+# Model history tools need only visible text, never attachment bytes or the
+# execution payload. Extract envelope text in SQLite before crossing to Python.
+_TOOL_HISTORY_PREVIEW_CHARS = 4096
+_TOOL_HISTORY_TEXT_SQL = f"""CASE WHEN role = 'user' AND json_valid(content) THEN CASE
+    WHEN json_type(content, '$.display_text') = 'text'
+      OR json_type(content, '$.attachments') = 'array'
+      THEN COALESCE({USER_DISPLAY_TEXT_SQL}, '')
+    WHEN json_type(content) = 'array' THEN '[Structured message omitted]'
+    ELSE content END ELSE content END"""
 # Session-directory titles are a convenience field.  Never make startup
 # inspect a large transcript body just to derive one.  New rows carry exact
 # metadata; legacy rows remain pending until the maintenance backfill.
@@ -15928,8 +15937,8 @@ class SessionStorage:
         an anchor in this session; missing, foreign, or deleted anchors fail
         instead of becoming an unpositioned latest read.
         """
-        if content_mode not in {"full", "bounded"}:
-            raise ValueError("content_mode must be 'full' or 'bounded'")
+        if content_mode not in {"full", "bounded", "tool_preview"}:
+            raise ValueError("content_mode must be 'full', 'bounded' or 'tool_preview'")
         page_size = max(1, int(limit))
         fetch_size = page_size + 1
         # SQLite performs the substring before the row crosses the Python
@@ -15939,6 +15948,32 @@ class SessionStorage:
         truncated_sql = "0" if content_mode == "full" else _BOUNDED_TRANSCRIPT_TRUNCATED_SQL
         replay_sql = "assistant_replay" if content_mode == "full" else "NULL"
         envelope_sql = "NULL" if content_mode == "full" else _BOUNDED_USER_ENVELOPE_SQL
+        tool_preview = content_mode == "tool_preview"
+        if tool_preview:
+            content_sql = f"substr(({_TOOL_HISTORY_TEXT_SQL}), 1, {_TOOL_HISTORY_PREVIEW_CHARS})"
+            truncated_sql = (
+                f"length(substr(({_TOOL_HISTORY_TEXT_SQL}), "
+                f"{_TOOL_HISTORY_PREVIEW_CHARS + 1}, 1)) > 0"
+                " OR CASE WHEN role = 'user' AND json_valid(content) "
+                "THEN json_type(content) = 'array' ELSE 0 END"
+            )
+            envelope_sql = "NULL"
+        details_sql = (
+            "NULL AS tool_calls, NULL AS tool_call_id, NULL AS reasoning_content, "
+            "NULL AS assistant_replay, NULL AS turn_usage, NULL AS turn_context"
+            if tool_preview else
+            f"tool_calls, tool_call_id, reasoning_content, {replay_sql} AS assistant_replay, "
+            "turn_usage, turn_context"
+        )
+        provenance_sql = (
+            "NULL AS provenance_kind, NULL AS provenance_origin_session_id, "
+            "NULL AS provenance_source_session_key, NULL AS provenance_source_channel, "
+            "NULL AS provenance_source_tool"
+            if tool_preview else
+            "provenance_kind, provenance_origin_session_id, provenance_source_session_key, "
+            "provenance_source_channel, provenance_source_tool"
+        )
+        visible_roles_sql = "AND role IN ('user', 'assistant')" if tool_preview else ""
 
         cursor = before
         ascending = False
@@ -16003,24 +16038,16 @@ class SessionStorage:
                     content_byte_length,
                     content_revision,
                     'active' AS content_source,
-                    tool_calls,
-                    tool_call_id,
-                    reasoning_content,
-                    {replay_sql} AS assistant_replay,
-                    turn_usage,
-                    turn_context,
+                    {details_sql},
                     created_at,
                     token_count,
-                    provenance_kind,
-                    provenance_origin_session_id,
-                    provenance_source_session_key,
-                    provenance_source_channel,
-                    provenance_source_tool,
+                    {provenance_sql},
                     schema_version
                 FROM transcript_entries
                 WHERE session_id = ?
                   AND EXISTS (SELECT 1 FROM cursor_anchor)
                   AND COALESCE(json_extract(turn_context, '$.visibility'), '') != 'model-only'
+                  {visible_roles_sql}
                   {active_cursor_clause}
                 ORDER BY created_at {direction}, id {direction}
                 LIMIT ?
@@ -16038,24 +16065,16 @@ class SessionStorage:
                     content_byte_length,
                     content_revision,
                     'compacted' AS content_source,
-                    tool_calls,
-                    tool_call_id,
-                    reasoning_content,
-                    {replay_sql} AS assistant_replay,
-                    turn_usage,
-                    turn_context,
+                    {details_sql},
                     created_at,
                     token_count,
-                    provenance_kind,
-                    provenance_origin_session_id,
-                    provenance_source_session_key,
-                    provenance_source_channel,
-                    provenance_source_tool,
+                    {provenance_sql},
                     schema_version
                 FROM compacted_transcript_entries
                 WHERE session_id = ?
                   AND EXISTS (SELECT 1 FROM cursor_anchor)
                   AND COALESCE(json_extract(turn_context, '$.visibility'), '') != 'model-only'
+                  {visible_roles_sql}
                   {archived_cursor_clause}
                 ORDER BY
                     created_at {direction},

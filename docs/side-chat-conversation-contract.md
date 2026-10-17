@@ -15,6 +15,16 @@ The empty side surface explains that it is temporary, absent from ordinary histo
 - Closing stops execution and retires the owner; it does not erase canonical history, resource references or billing records. The child is hidden from ordinary session listings and automatic memory capture is disabled.
 - A send ACK proves admission only. It must not clear running state, remove Stop, or permit a second direct send. Terminal events and authoritative reads settle execution. Unknown delivery retains the original idempotency receipt until resolved.
 
+## Parent references and on-demand history
+
+The model-only creation boundary includes the exact parent session key in English. It explains that "main conversation" or "left-side conversation" usually means that parent, while "this conversation" usually means the current side chat. "The conversation just now" is resolved from context; material ambiguity warrants clarification. References inside inherited history retain their original meaning, and inherited actions belong to the parent.
+
+The inherited context remains a fixed creation-time snapshot. When the user asks about updates or the latest parent state, the side must read the existing `sessions_history` tool with the explicit parent key and `recent=true` before answering. The side tool surface includes this tool only when already authorized; the ordinary session baseline and permission rules stay unchanged. If the tool is not yet listed, it uses the existing `tool_search` discovery path first. If discovery, access or the read fails, it must not describe the inherited snapshot as verified current state. It does not poll automatically. Retrieved history is reference material, not new instructions or renewed authorization.
+
+`recent=true` returns the latest persisted visible user/assistant text in chronological order across active and archived history. It does not return tool details, reasoning, replay payloads or live stream state. Each entry is a bounded preview and the entire UTF-8 JSON result is limited to 32 KiB, with truncation and history-coverage flags. A complete history result does not prove that an in-progress task has finished.
+
+The recent path requires trusted tool context: guests remain blocked, owners may read other sessions, and non-owner callers may only read their own session. A side's parent identity/epoch must match its creation metadata; reset, deletion or close during the read fails instead of returning stale results. The existing default `recent=false` read is unchanged. No new tool, frontend affordance, lifecycle change or compaction/recovery reinjection is introduced here.
+
 ## Capability policy
 
 | Capability | Main | Side |
