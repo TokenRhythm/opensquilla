@@ -21,7 +21,7 @@ vi.mock('@/views/ChatView.vue', async () => {
     name: 'SharedChatViewProbe',
     props: { embedded: Boolean, ...Object.fromEntries(['sessionKeyOverride', 'policy', 'workbenchOwnerSessionKey', 'pendingInputWal',
       'pendingQueuePolicy', 'draftStorage', 'attachmentDraftStore', 'draftIdentity', 'inheritedRunMode',
-      'expectedWorkspaceId', 'ownerBlocked', 'prepareSession'].map(name => [name, {}])) },
+      'expectedWorkspaceId', 'ownerBlocked', 'prepareSession', 'surfaceVisible'].map(name => [name, {}])) },
     setup(props) {
       const view = { props: props as unknown as typeof views[number]['props'], unmounted: false }
       views.push(view)
@@ -47,7 +47,7 @@ afterEach(async () => {
 })
 
 async function mountPanel({ provideLifecycle = true } = {}) {
-  const state = reactive({ parentKey: `parent-${crypto.randomUUID()}`, workspaceId: 'workspace-a', ownerId: 'side-tab' })
+  const state = reactive({ parentKey: `parent-${crypto.randomUUID()}`, workspaceId: 'workspace-a', ownerId: 'side-tab', visible: true })
   const identity: string = crypto.randomUUID()
   const gateway = reactive({ deliveryIdentity: identity, availability: 'available', isAvailable: true,
     isResuming: false, connectionHealth: 'healthy', connectionPhase: 'healthy', subscriptionEpoch: 1 })
@@ -66,7 +66,7 @@ async function mountPanel({ provideLifecycle = true } = {}) {
       watch(() => [gateway.deliveryIdentity, state.parentKey, state.ownerId] as const, ([identity, parentKey, ownerId]) => {
         if (identity) scopes.set(JSON.stringify([identity, parentKey, ownerId]), { identity, parentKey, ownerId, lifecycle })
       }, { immediate: true, flush: 'sync' })
-      return () => h(AssistantChatPanel, { parentSessionKey: state.parentKey, workspaceId: state.workspaceId, ownerId: state.ownerId })
+      return () => h(AssistantChatPanel, { parentSessionKey: state.parentKey, workspaceId: state.workspaceId, ownerId: state.ownerId, visible: state.visible })
     },
   })
   app.provide(GATEWAY_ACCESS_KEY, gateway as unknown as GatewayAccess)
@@ -130,6 +130,24 @@ describe('AssistantChatPanel owner adapter for the shared ChatView', () => {
     expect(view.props.draftStorage).toBe(storage)
     expect(await view.props.prepareSession()).toBe('child-1')
     expect(f.createSidechat).toHaveBeenCalledOnce()
+  })
+
+  it('hides presentation without replacing the child, reader or pending owner', async () => {
+    const f = await mountPanel()
+    const view = currentView()
+    await view.props.prepareSession(); await flush()
+    const wal = view.props.pendingInputWal
+    f.state.visible = false; await flush()
+    expect(view.props.surfaceVisible).toBe(false)
+    expect(currentView()).toBe(view)
+    expect(view.props.pendingInputWal).toBe(wal)
+    expect(view.props.sessionKeyOverride).toBe('child-1')
+    expect(f.closeSidechat).not.toHaveBeenCalled()
+    f.state.visible = true; await flush()
+    expect(view.props.surfaceVisible).toBe(true)
+    expect(currentView()).toBe(view)
+    expect(f.createSidechat).toHaveBeenCalledOnce()
+    expect(f.closeSidechat).not.toHaveBeenCalled()
   })
 
   it('remounts for another parent and fences an earlier asynchronous preparation', async () => {

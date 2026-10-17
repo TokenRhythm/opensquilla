@@ -1,5 +1,5 @@
 import { effectScope, ref } from 'vue'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { ChatMessage } from '@/types/chat'
 import { useChatSessionViewCache } from './useChatSessionViewCache'
 
@@ -214,6 +214,37 @@ describe('useChatSessionViewCache', () => {
     expect(h.cache.showingPreview.value).toBe(false)
     h.install('A', [row('oversized', 'x'.repeat(500))])
     h.switchTo('C')
+    h.switchTo('A')
+    expect(h.cache.showingPreview.value).toBe(false)
+    h.scope.stop()
+  })
+
+  it('rejects huge tool content before capturing or serializing the rest of a departing view', () => {
+    const scope = effectScope()
+    const sessionKey = ref('A')
+    const messages = ref<ChatMessage[]>([row('huge', 'x'.repeat(2 * 1024 * 1024))])
+    const presentation = vi.fn(() => ({ text: 'live tail' }))
+    const viewport = vi.fn(() => ({ anchor: 'huge' }))
+    const cache = scope.run(() => useChatSessionViewCache({
+      sessionKey, deliveryIdentity: ref('owner'), messages, maxBytes: 1024,
+      capturePresentation: presentation, captureViewport: viewport,
+    }))!
+    cache.historyInstalled('A')
+    sessionKey.value = 'B'
+    expect(presentation).not.toHaveBeenCalled()
+    expect(viewport).not.toHaveBeenCalled()
+    expect(messages.value[0]!.text).toHaveLength(2 * 1024 * 1024)
+    messages.value = []
+    sessionKey.value = 'A'
+    expect(cache.showingPreview.value).toBe(false)
+    scope.stop()
+  })
+
+  it('falls back to authoritative history for cyclic presentation without blocking navigation', () => {
+    const h = harness()
+    const malformed = h.messages.value[0] as ChatMessage & { nested?: unknown }
+    malformed.nested = malformed
+    expect(() => h.switchTo('B')).not.toThrow()
     h.switchTo('A')
     expect(h.cache.showingPreview.value).toBe(false)
     h.scope.stop()

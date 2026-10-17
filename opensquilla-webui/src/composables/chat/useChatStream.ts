@@ -99,6 +99,8 @@ export interface UseChatStreamOptions {
   lastHeaderRole: Ref<string>
   aborted: Ref<boolean>
   autoScroll: Ref<boolean>
+  /** Renderer visibility only: hiding a panel never stops its business owner. */
+  presentationVisible?: Readonly<Ref<boolean>>
   runStatus?: Ref<ChatRunStatus>
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
   renderMarkdown: (
@@ -150,6 +152,7 @@ export function resolvedStreamIdleTimeoutMs(value: number | null | undefined): n
 }
 
 export function useChatStream(options: UseChatStreamOptions) {
+  const presentationVisible = () => options.presentationVisible?.value !== false
   const isStreaming = ref(false)
   const toolInputDrafts = useToolInputPreviews()
   const stopDraftAbortWatch = watch(options.aborted, aborted => { if (aborted) toolInputDrafts.clear() }, { flush: 'sync' })
@@ -415,7 +418,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       // the same frame clock even when no text/tool delta follows it.
       scheduleRender()
     }
-    if (!streamActivityTimer) {
+    if (presentationVisible() && !streamActivityTimer) {
       streamActivityTimer = setInterval(() => {
         streamActivityTick.value++
       }, 1000)
@@ -628,7 +631,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       // measured height after the final stream flush. Pin once after Vue's
       // settled render (and TextPart's post-flush decoration), while preserving
       // the existing autoScroll guard for readers who moved away from the edge.
-      if (options.autoScroll.value) options.scrollToBottom()
+      if (presentationVisible() && options.autoScroll.value) options.scrollToBottom()
     }
 
     streamBubble.value = false
@@ -1015,9 +1018,10 @@ export function useChatStream(options: UseChatStreamOptions) {
   function scheduleRender() {
     renderDirty = true
     if (renderRaf !== null || renderFallbackTimer !== null) return
-    // rAF is throttled/paused in background tabs — fall back to a timer there so
-    // streamed output still lands while the tab is hidden.
-    if (typeof document !== 'undefined' && document.hidden) {
+    // Use the same bounded background cadence for an obscured workbench panel
+    // and a hidden browser tab. Keep publishing the shared projection so its
+    // business owner stays current, without parsing on every display frame.
+    if (!presentationVisible() || (typeof document !== 'undefined' && document.hidden)) {
       renderFallbackTimer = setTimeout(runFlush, HIDDEN_FLUSH_FALLBACK_MS)
       return
     }
@@ -1055,7 +1059,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     // Clearing on tool-start receipt would briefly leave neither row visible.
     for (const call of foldedTurn.value.toolCalls) toolInputDrafts.handoff(call.toolId)
     renderDirty = false
-    if (options.autoScroll.value) options.scrollToBottom()
+    if (presentationVisible() && options.autoScroll.value) options.scrollToBottom()
   }
 
   function visibleFlushIntervalMs(): number {
@@ -1077,7 +1081,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       if (streamBubble.value) return
       thinkingVisible.value = true
       updateThinkingText()
-      thinkingTimer = setInterval(updateThinkingText, 1000)
+      if (presentationVisible()) thinkingTimer = setInterval(updateThinkingText, 1000)
     }, THINKING_DELAY_MS)
   }
 
@@ -1177,6 +1181,31 @@ export function useChatStream(options: UseChatStreamOptions) {
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', handleVisibilityChange)
   }
+
+  const stopPresentationWatch = options.presentationVisible
+    ? watch(options.presentationVisible, visible => {
+      if (streamActivityTimer) clearInterval(streamActivityTimer)
+      if (thinkingTimer) clearInterval(thinkingTimer)
+      streamActivityTimer = null
+      thinkingTimer = null
+      if (renderDirty) {
+        cancelRenderSchedule()
+        scheduleRender()
+      }
+      if (!visible) return
+      // Clocks use original timestamps, so a hidden interval needs no ticks.
+      // Only refresh presentation; keep stream/queue/approval ownership intact.
+      streamActivityTick.value++
+      if (isStreaming.value) {
+        streamActivityTimer = setInterval(() => { streamActivityTick.value++ }, 1000)
+      }
+      if (thinkingVisible.value) {
+        updateThinkingText()
+        if (thinkingVisible.value) thinkingTimer = setInterval(updateThinkingText, 1000)
+      }
+      if (options.autoScroll.value) options.scrollToBottom()
+    }, { flush: 'sync' })
+    : undefined
 
   // The server-stamped tool start time (epoch ms), or null when absent/invalid.
   // 0 is the backend's "unstamped" sentinel and is treated as absent.
@@ -1540,6 +1569,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   }
 
   function cleanup() {
+    stopPresentationWatch?.()
     stopDraftAbortWatch()
     toolInputDrafts.clear()
     clearRenderTimer()

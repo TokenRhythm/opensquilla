@@ -153,6 +153,22 @@ describe('useChatDraftPersistence', () => {
     expect(inputText.value).toBe('draft for B')
   })
 
+  it('binds an edit to its outgoing owner before same-tick navigation restores the target draft', async () => {
+    const sessionKey = ref('agent:main:webchat:a')
+    const inputText = ref('')
+    const { api, scope } = mount(sessionKey, inputText)
+    api.saveDraft('agent:main:webchat:b', 'Existing B draft')
+    inputText.value = 'Latest A edit'
+    sessionKey.value = 'agent:main:webchat:b'
+    await nextTick()
+    expect(inputText.value).toBe('Existing B draft')
+    expect(api.loadDraft('agent:main:webchat:a')).toBe('Latest A edit')
+    sessionKey.value = 'agent:main:webchat:a'
+    await nextTick()
+    expect(inputText.value).toBe('Latest A edit')
+    scope.stop()
+  })
+
   it('clears the persisted draft once the composer is emptied (after send)', async () => {
     const sessionKey = ref('agent:main:webchat:a')
     const inputText = ref('')

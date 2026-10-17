@@ -1,5 +1,6 @@
 import { computed, onScopeDispose, ref, shallowRef, watch, type Ref } from 'vue'
 import type { ChatMessage } from '@/types/chat'
+import { createChatViewCaptureBudget } from './chatViewCaptureBudget'
 
 interface ViewSnapshot<Presentation, Viewport> {
   messages: ChatMessage[]
@@ -57,17 +58,19 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
 
   function capture(key: string) {
     if (!installed || !options.deliveryIdentity.value || !key) return
+    remove(key)
+    if (maxSessions <= 0) return
     // Clone once on departure: mutable live/history objects cannot change a
     // detached view, and serialization accounts for nested tool/reasoning data.
     const retainedMessages = options.messages.value.slice(-maxMessages)
-    const serialized = JSON.stringify({
-      messages: retainedMessages,
-      presentation: options.capturePresentation?.(key),
-      viewport: options.captureViewport?.(retainedMessages),
-    })
-    const bytes = new TextEncoder().encode(serialized).byteLength
-    remove(key)
-    if (bytes > maxBytes || maxSessions <= 0) return
+    const budget = createChatViewCaptureBudget(maxBytes)
+    if (!budget.include('messages', retainedMessages)) return
+    const presentation = options.capturePresentation?.(key)
+    if (!budget.include('presentation', presentation)) return
+    const viewport = options.captureViewport?.(retainedMessages)
+    if (!budget.include('viewport', viewport)) return
+    const serialized = JSON.stringify({ messages: retainedMessages, presentation, viewport })
+    const bytes = budget.bytes
     snapshots.set(key, { ...JSON.parse(serialized), bytes, epoch })
     totalBytes += bytes
     while (snapshots.size > maxSessions || totalBytes > maxBytes) {

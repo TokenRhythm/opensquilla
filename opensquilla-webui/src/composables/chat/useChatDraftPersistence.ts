@@ -243,7 +243,10 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
       if (options.inputText.value || options.selectedSkills?.value.length || options.localPaths?.value.length) return
       restoreDraft(key)
     },
-    { immediate: true },
+    // Bind draft ownership before queued input-save watchers or route resets
+    // run. Otherwise an edit followed by navigation in the same tick can save
+    // A's text under B's key and overwrite B before its draft is restored.
+    { immediate: true, flush: 'sync' },
   )
 
   // Persist on every composer change for the CURRENT session. Empty text clears

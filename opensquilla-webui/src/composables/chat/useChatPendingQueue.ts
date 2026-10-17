@@ -1,7 +1,7 @@
 import { copySelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
 import { copyLocalPathReferences, localPathPresentation } from '@/types/localPathReferences'
 import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
-import { computed, nextTick, ref, toRaw, watch, type Ref } from 'vue'
+import { computed, nextTick, ref, shallowReactive, toRaw, watch, type Ref } from 'vue'
 import type {
   Attachment,
   ChatPendingItem,
@@ -46,9 +46,14 @@ function normalizeAnnotationDraftIds(
 type PendingReorderMode = 'local' | 'server'
 
 interface PendingReorderSnapshot {
+  sessionKey: string
+  deliveryIdentity: string | null
   mode: PendingReorderMode
   originalOrder: string[]
   expectedWalRevisions: Record<string, number>
+  started?: boolean
+  commit?: Promise<void>
+  deferredHydrate?: boolean
 }
 
 interface ComposerAttachmentSnapshotEntry {
@@ -183,13 +188,23 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     void queuePolicyRevision.value
     return queuePolicy.read(queueScope()).paused
   })
+  // A reorder belongs to its queue, not to whichever composer is visible when
+  // IndexedDB/RPC completes. Keep only the small transaction here; navigating
+  // away never has to await it or keep the old transcript reader alive.
+  const pendingReorders = shallowReactive(new Map<string, PendingReorderSnapshot>())
+  const reorderOwnerKey = (sessionKey: string, identity = options.deliveryIdentity?.value ?? null) => (
+    JSON.stringify([sessionKey, identity])
+  )
+  const activeReorder = () => pendingReorders.get(reorderOwnerKey(options.sessionKey.value))
+  const isReordering = computed(() => Boolean(activeReorder()))
   const parkedQueues: ParkedPendingQueueCache = new ParkedPendingQueueCache({
     unwrapObject: toRaw,
     isPinned: item => Boolean(item.steerAttempt || item.deliveryState
       || item.ownerRequestId || item.pendingPersistenceState === 'cancelling' || (item.pendingInputId && (
         locallyCreatingIds.has(item.pendingInputId) || stagingOperations.has(item.pendingInputId)
         || cancellationOperations.has(item.pendingInputId)
-      )) || pendingQueue.value.some(active => toRaw(active) === toRaw(item))),
+      )) || [...pendingReorders.values()].some(reorder => reorder.sessionKey === item.ownerSessionKey)
+      || pendingQueue.value.some(active => toRaw(active) === toRaw(item))),
     isUrlRetained: url => [options.pendingAttachments.value,
       ...pendingQueue.value.map(item => item.attachments),
       ...[...parkedQueues.values()].flat().map(item => item.attachments),
@@ -197,10 +212,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   })
   let pendingDrainTimer: ReturnType<typeof setTimeout> | null = null
   let deferredDrainRequested = false
-  const isReordering = ref(false)
-  let reorderSnapshot: PendingReorderSnapshot | null = null
-  let reorderCommitPromise: Promise<void> | null = null
-  let deferredHydrateSession = ''
   let hydrateGeneration = 0
   let disposed = false
   const stagingOperations = new Map<string, Promise<void>>()
@@ -307,12 +318,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   if (options.connectionState) {
     watch(options.connectionState, state => {
       if (state !== 'connected') return
-      if (isReordering.value && reorderSnapshot?.mode === 'server') {
-        void recoverServerReorder().then(recovered => {
-          if (recovered) finishPendingReorder()
-        })
-        return
-      }
       void hydratePendingQueue(options.sessionKey.value)
     })
   }
@@ -796,8 +801,16 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   async function hydratePendingQueue(sessionKey = options.sessionKey.value): Promise<void> {
     const wal = options.pendingInputWal
     if (!wal || !sessionKey || disposed) return
-    if (isReordering.value) {
-      deferredHydrateSession = sessionKey
+    const reorder = pendingReorders.get(reorderOwnerKey(sessionKey))
+    if (reorder) {
+      reorder.deferredHydrate = true
+      // Unknown server outcomes stay blocked while hidden. A return/reconnect
+      // may reconcile that same owner, never retry the reorder or dispatch it.
+      if (reorder.started && !reorder.commit && reorder.mode === 'server') {
+        reorder.commit = recoverServerReorder(reorder).then(recovered => {
+          if (recovered) finishPendingReorder(reorder)
+        }).finally(() => { reorder.commit = undefined })
+      }
       return
     }
     const generation = ++hydrateGeneration
@@ -1476,14 +1489,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function switchPendingQueue(
     targetSessionKey: string,
     shouldCommit: () => boolean = () => true,
-    handoffSignal?: AbortSignal,
+    _handoffSignal?: AbortSignal,
   ): void | Promise<void> {
-    if (reorderCommitPromise) {
-      return reorderCommitPromise.then(() => {
-        if (disposed || !shouldCommit()) return
-        return switchPendingQueue(targetSessionKey, shouldCommit, handoffSignal)
-      })
-    }
     if (disposed || !shouldCommit()) return
     cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
@@ -1625,7 +1632,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     handoffSignal?: AbortSignal,
   ) {
     if (disposed) return
-    if (reorderCommitPromise) await reorderCommitPromise
+    const reorderCommit = activeReorder()?.commit
+    if (reorderCommit) await reorderCommit
     else cancelPendingReorder()
     if (disposed || !shouldCommit()) return
     const sourceSessionKey = options.sessionKey.value
@@ -2051,26 +2059,57 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return pendingReorderMode() !== null
   }
 
-  function restorePendingOrder(orderedIds: string[]) {
-    const byId = new Map(
-      pendingQueue.value.map(item => [item.pendingInputId || '', item]),
-    )
-    if (orderedIds.some(id => !byId.has(id))) return
-    pendingQueue.value = orderedIds.map(id => byId.get(id)!)
+  function reorderContainer(snapshot: PendingReorderSnapshot): ChatPendingItem[] {
+    return snapshot.sessionKey === options.sessionKey.value
+      ? pendingQueue.value
+      : parkedQueues.get(snapshot.sessionKey) || []
   }
 
-  function finishPendingReorder() {
-    reorderSnapshot = null
-    isReordering.value = false
-    const hydrateSession = deferredHydrateSession
-    deferredHydrateSession = ''
-    if (hydrateSession) void hydratePendingQueue(hydrateSession)
-    flushDeferredPendingDrain()
+  function reorderItems(snapshot: PendingReorderSnapshot): ChatPendingItem[] {
+    const ids = new Set(snapshot.originalOrder)
+    return reorderContainer(snapshot).filter(item => ids.has(item.pendingInputId || ''))
+  }
+
+  function ownsReorder(snapshot: PendingReorderSnapshot): boolean {
+    return !disposed && pendingReorders.get(reorderOwnerKey(snapshot.sessionKey, snapshot.deliveryIdentity)) === snapshot
+  }
+
+  function canApplyServerReorder(snapshot: PendingReorderSnapshot): boolean {
+    return ownsReorder(snapshot) && snapshot.deliveryIdentity === (options.deliveryIdentity?.value ?? null)
+  }
+
+  function restorePendingOrder(snapshot: PendingReorderSnapshot, orderedIds: string[]) {
+    const queue = reorderItems(snapshot)
+    const byId = new Map(
+      queue.map(item => [item.pendingInputId || '', item]),
+    )
+    if (orderedIds.some(id => !byId.has(id))) return
+    const container = reorderContainer(snapshot)
+    let next = 0
+    // A different delivery identity may have hydrated its own rows while this
+    // owner was hidden. Reorder only the captured rows, retaining every other row.
+    for (let index = 0; index < container.length; index++) {
+      if (byId.has(container[index]!.pendingInputId || '')) container[index] = byId.get(orderedIds[next++]!)!
+    }
+  }
+
+  function finishPendingReorder(snapshot: PendingReorderSnapshot) {
+    if (!ownsReorder(snapshot)) return
+    pendingReorders.delete(reorderOwnerKey(snapshot.sessionKey, snapshot.deliveryIdentity))
+    if (snapshot.sessionKey === options.sessionKey.value
+      && snapshot.deliveryIdentity === (options.deliveryIdentity?.value ?? null)) {
+      if (snapshot.deferredHydrate) void hydratePendingQueue(snapshot.sessionKey)
+      flushDeferredPendingDrain()
+    }
+    parkedQueues.trim()
   }
 
   async function applyServerReorderItems(
+    snapshot: PendingReorderSnapshot,
     items: PendingInputServerItem[],
   ): Promise<void> {
+    if (!canApplyServerReorder(snapshot)) return
+    const queue = reorderItems(snapshot)
     const byId = new Map(
       items.map(item => [item.pendingInputId, item]),
     )
@@ -2079,26 +2118,27 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       .sort((left, right) => Number(left.position) - Number(right.position))
       .map(item => item.pendingInputId)
     if (
-      orderedIds.length !== pendingQueue.value.length
-      || orderedIds.some(id => !id || !byId.has(id))
+      orderedIds.length !== queue.length
+      || new Set(orderedIds).size !== orderedIds.length
+      || queue.some(item => !byId.has(item.pendingInputId || ''))
     ) throw new Error('Gateway returned an incomplete pending order')
-    restorePendingOrder(orderedIds)
-    for (const item of pendingQueue.value) {
+    restorePendingOrder(snapshot, orderedIds)
+    for (const item of queue) {
       const serverItem = byId.get(item.pendingInputId || '')!
       item.pendingPosition = Number(serverItem.position)
       item.pendingServerRevision = Number(serverItem.revision)
       item.pendingWalRevision = (item.pendingWalRevision ?? 0) + 1
     }
-    const cacheCommits = pendingQueue.value.map(item => ({
+    const cacheCommits = queue.map(item => ({
       item, snapshot: parkedQueues.snapshotForCommit(item),
     }))
     if (!options.pendingInputWal?.putMany) {
-      for (const item of pendingQueue.value) {
+      for (const item of queue) {
         await options.pendingInputWal?.put(walRecordForItem(item, 'staged'))
       }
     } else {
       await options.pendingInputWal.putMany(
-        pendingQueue.value.map(item => walRecordForItem(item, 'staged')),
+        queue.map(item => walRecordForItem(item, 'staged')),
       )
     }
     if (options.pendingInputWal) {
@@ -2106,21 +2146,23 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
   }
 
-  async function recoverServerReorder(): Promise<boolean> {
-    if (!pendingInputQueue || !supportsServerQueue()) return false
-    const expectedOrder = pendingQueue.value.map(item => item.pendingInputId)
+  async function recoverServerReorder(snapshot: PendingReorderSnapshot): Promise<boolean> {
+    if (!pendingInputQueue || !supportsServerQueue() || !canApplyServerReorder(snapshot)) return false
+    const expectedOrder = reorderItems(snapshot).map(item => item.pendingInputId)
     try {
-      const response = { items: await pendingInputQueue.list(options.sessionKey.value) }
+      const response = { items: await pendingInputQueue.list(snapshot.sessionKey) }
+      if (!canApplyServerReorder(snapshot)) return false
       const items = Array.isArray(response.items) ? response.items : []
       const serverOrder = items
         .slice()
         .sort((left, right) => Number(left.position) - Number(right.position))
         .map(item => item.pendingInputId)
-      await applyServerReorderItems(items)
+      await applyServerReorderItems(snapshot, items)
+      if (!canApplyServerReorder(snapshot)) return false
       if (serverOrder.some((id, index) => id !== expectedOrder[index])) {
         options.onPendingPersistenceError?.('order_conflict')
       }
-      broadcastChange(options.sessionKey.value)
+      broadcastChange(snapshot.sessionKey)
       return true
     } catch {
       return false
@@ -2134,22 +2176,26 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       || !pendingQueue.value[index]
     ) return false
     cancelPendingDrainTimer()
+    // A list/WAL read admitted before the drag cannot overwrite the newly
+    // captured order or revisions while its transaction is committing.
+    hydrateGeneration += 1
     const mode = pendingReorderMode()!
-    reorderSnapshot = {
+    pendingReorders.set(reorderOwnerKey(options.sessionKey.value), {
+      sessionKey: options.sessionKey.value,
+      deliveryIdentity: options.deliveryIdentity?.value ?? null,
       mode,
       originalOrder: pendingQueue.value.map(item => item.pendingInputId!),
       expectedWalRevisions: Object.fromEntries(
         pendingQueue.value.map(item => [item.pendingInputId!, item.pendingWalRevision!]),
       ),
-    }
-    isReordering.value = true
+    })
     return true
   }
 
   function reorderPendingItem(fromIndex: number, toIndex: number): boolean {
     if (
       !isReordering.value
-      || !reorderSnapshot
+      || activeReorder()?.started
       || fromIndex === toIndex
       || fromIndex < 0
       || toIndex < 0
@@ -2162,69 +2208,79 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return true
   }
 
-  async function commitPendingReorder() {
-    const snapshot = reorderSnapshot
-    if (!isReordering.value || !snapshot) return
-    const orderedIds = pendingQueue.value.map(item => item.pendingInputId!)
+  async function commitPendingReorder(snapshot: PendingReorderSnapshot) {
+    if (!ownsReorder(snapshot)) return
+    const queue = reorderItems(snapshot)
+    const orderedIds = queue.map(item => item.pendingInputId!)
     if (orderedIds.every((id, index) => id === snapshot.originalOrder[index])) {
-      finishPendingReorder()
+      finishPendingReorder(snapshot)
       return
     }
     if (snapshot.mode === 'local') {
       try {
         const result = await options.pendingInputWal!.commitOrder!(
-          options.sessionKey.value,
+          snapshot.sessionKey,
           orderedIds,
           snapshot.expectedWalRevisions,
         )
+        if (!ownsReorder(snapshot)) return
         const byId = new Map(result.records.map(record => [record.pendingInputId, record]))
-        for (const item of pendingQueue.value) {
+        for (const item of queue) {
           const record = byId.get(item.pendingInputId!)!
           item.pendingPosition = record.position
           item.pendingWalRevision = record.walRevision
           parkedQueues.rememberCommitted(item, parkedQueues.snapshotForCommit(item))
         }
-        broadcastChange(options.sessionKey.value)
+        broadcastChange(snapshot.sessionKey)
       } catch {
-        finishPendingReorder()
-        await hydratePendingQueue(options.sessionKey.value)
+        if (!ownsReorder(snapshot)) return
+        // Keep the original owner for reconciliation. If it is hidden, the
+        // next visit hydrates the original queue from its authoritative WAL.
+        snapshot.deferredHydrate = true
+        finishPendingReorder(snapshot)
         options.onPendingPersistenceError?.('wal_failed')
         return
       }
-      finishPendingReorder()
+      finishPendingReorder(snapshot)
       return
     }
     try {
       const response = await pendingInputQueue!.reorder({
-          key: options.sessionKey.value,
-          items: pendingQueue.value.map(item => ({
+          key: snapshot.sessionKey,
+          items: queue.map(item => ({
             pendingInputId: item.pendingInputId,
             expectedRevision: item.pendingServerRevision,
           })),
         })
-      await applyServerReorderItems(Array.isArray(response.items) ? response.items : [])
-      broadcastChange(options.sessionKey.value)
-      finishPendingReorder()
+      if (!canApplyServerReorder(snapshot)) return
+      await applyServerReorderItems(snapshot, Array.isArray(response.items) ? response.items : [])
+      if (!canApplyServerReorder(snapshot)) return
+      broadcastChange(snapshot.sessionKey)
+      finishPendingReorder(snapshot)
     } catch {
       // An unknown RPC result may have committed. Keep the delivery barrier
       // until an authoritative list proves which order won.
-      if (await recoverServerReorder()) finishPendingReorder()
-      else options.onPendingPersistenceError?.('server_rejected')
+      if (await recoverServerReorder(snapshot)) finishPendingReorder(snapshot)
+      else if (canApplyServerReorder(snapshot)) options.onPendingPersistenceError?.('server_rejected')
     }
   }
 
   function endPendingReorder(): Promise<void> {
-    if (reorderCommitPromise) return reorderCommitPromise
-    reorderCommitPromise = commitPendingReorder().finally(() => {
-      reorderCommitPromise = null
+    const snapshot = activeReorder()
+    if (!snapshot) return Promise.resolve()
+    if (snapshot.commit) return snapshot.commit
+    snapshot.started = true
+    snapshot.commit = commitPendingReorder(snapshot).finally(() => {
+      snapshot.commit = undefined
     })
-    return reorderCommitPromise
+    return snapshot.commit
   }
 
   function cancelPendingReorder() {
-    if (reorderCommitPromise) return
-    if (reorderSnapshot) restorePendingOrder(reorderSnapshot.originalOrder)
-    finishPendingReorder()
+    const snapshot = activeReorder()
+    if (!snapshot || snapshot.started) return
+    restorePendingOrder(snapshot, snapshot.originalOrder)
+    finishPendingReorder(snapshot)
   }
 
   function cancelPendingDrainTimer() {
@@ -2242,6 +2298,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function cleanup() {
     cancelPendingReorder()
     disposed = true
+    pendingReorders.clear()
     hydrateGeneration += 1
     clearPendingDrainAfterTerminalTimer()
     parkedQueues.dispose()

@@ -2653,7 +2653,7 @@ describe('useChatPendingQueue delivery state', () => {
     reloaded.queue.cleanup()
   })
 
-  it('does not switch a pending queue after a delayed handoff is superseded', async () => {
+  it('switches immediately while the old queue owns a delayed WAL reorder', async () => {
     const { records, wal } = memoryWal()
     let releaseCommit: (() => void) | undefined
     vi.mocked(wal.commitOrder!).mockImplementation(async (
@@ -2691,21 +2691,176 @@ describe('useChatPendingQueue delivery state', () => {
     expect(source.queue.beginPendingReorder(1)).toBe(true)
     expect(source.queue.reorderPendingItem(1, 0)).toBe(true)
     const reorder = source.queue.endPendingReorder()
-    let current = true
+    const originalSession = source.sessionKey.value
     const handoff = source.queue.switchPendingQueue(
       'agent:main:webchat:B',
-      () => current,
+      () => true,
     )
-
-    current = false
+    expect(handoff).toBeUndefined()
+    source.sessionKey.value = 'agent:main:webchat:B'
+    expect(source.queue.isReordering.value).toBe(false)
+    source.inputText.value = 'B draft stays untouched'
+    expect(source.queue.pendingQueue.value).toEqual([])
+    await source.queue.enqueuePendingPayload({ text: 'B follow-up' })
     await Promise.resolve()
     expect(releaseCommit).toBeTypeOf('function')
     releaseCommit?.()
     await reorder
-    await handoff
-
+    expect(source.queue.pendingQueue.value.map(item => item.text)).toEqual(['B follow-up'])
+    expect(source.inputText.value).toBe('B draft stays untouched')
+    source.queue.switchPendingQueue(originalSession)
+    source.sessionKey.value = originalSession
+    await source.queue.hydratePendingQueue(originalSession)
     expect(source.queue.pendingQueue.value.map(item => item.text)).toEqual(['B', 'A'])
+    expect(source.queue.isReordering.value).toBe(false)
     source.queue.cleanup()
+  })
+
+  it.each(['accepted', 'unknown'] as const)('pins a %s server reorder to its original queue across A to B to A', async outcome => {
+    const sessionA = 'agent:main:webchat:test'
+    const sessionB = 'agent:main:webchat:B'
+    const initial = ['A1', 'A2', 'B1', 'B2'].map((text, index): PendingInputWalRecord => ({
+      schemaVersion: 1, pendingInputId: `pending-${text}`, sessionKey: index < 2 ? sessionA : sessionB,
+      clientRequestId: `request-${text}`, clientMessageId: `message-${text}`,
+      text, attachments: [], intent: null, state: 'staged', mayHaveServerCopy: true,
+      requestFingerprint: `fingerprint-${text}`, serverRevision: 1,
+      position: index % 2, walRevision: 1, createdAt: index + 1, updatedAt: index + 1,
+    }))
+    const { wal, records } = memoryWal(initial)
+    let resolveA!: () => void
+    let rejectA!: () => void
+    let unavailableA = false
+    const serverRows = (key: string) => [...records.values()].filter(row => row.sessionKey === key)
+      .sort((a, b) => (a.position || 0) - (b.position || 0)).map(row => ({
+        pendingInputId: row.pendingInputId, clientRequestId: row.clientRequestId,
+        clientMessageId: row.clientMessageId, message: row.text, attachments: [],
+        requestFingerprint: row.requestFingerprint, revision: row.serverRevision, position: row.position,
+      }))
+    const queuePort: PendingInputQueuePort = {
+      supportsQueue: () => true, supportsReorder: () => true,
+      enqueue: vi.fn(async () => ({})), cancel: vi.fn(async () => {}),
+      list: vi.fn(async key => {
+        if (key === sessionA && unavailableA) throw new Error('offline after ambiguous result')
+        return serverRows(key)
+      }),
+      reorder: vi.fn(async (request: Parameters<PendingInputQueuePort['reorder']>[0]) => {
+        if (request.key === sessionA) await new Promise<void>((resolve, reject) => {
+          resolveA = resolve
+          rejectA = () => reject(new Error('lost reorder response'))
+        })
+        return { items: request.items.map((item, position) => ({
+          ...serverRows(request.key).find(row => row.pendingInputId === item.pendingInputId)!,
+          position, revision: item.expectedRevision! + 1,
+        })) }
+      }),
+    }
+    const source = makeQueue(undefined, () => false, {
+      pendingInputWal: wal, pendingInputQueue: queuePort, connectionState: ref('connected'),
+    })
+    try {
+      await source.queue.hydratePendingQueue()
+      expect(source.queue.beginPendingReorder(1)).toBe(true)
+      source.queue.reorderPendingItem(1, 0)
+      const oldCommit = source.queue.endPendingReorder()
+      expect(source.queue.switchPendingQueue(sessionB)).toBeUndefined()
+      source.sessionKey.value = sessionB
+      await source.queue.hydratePendingQueue(sessionB)
+      expect(source.queue.pendingQueue.value.map(row => row.text)).toEqual(['B1', 'B2'])
+      expect(source.queue.beginPendingReorder(1)).toBe(true)
+      source.queue.reorderPendingItem(1, 0)
+      await source.queue.endPendingReorder()
+      expect(source.queue.pendingQueue.value.map(row => row.text)).toEqual(['B2', 'B1'])
+      if (outcome === 'accepted') resolveA()
+      else { unavailableA = true; rejectA() }
+      await oldCommit
+      expect(source.queue.pendingQueue.value.map(row => row.text)).toEqual(['B2', 'B1'])
+      expect(source.queue.isReordering.value).toBe(false)
+      source.queue.switchPendingQueue(sessionA)
+      source.sessionKey.value = sessionA
+      if (outcome === 'unknown') {
+        expect(source.queue.isReordering.value).toBe(true)
+        expect(source.queue.beginPendingDelivery(pendingUiId(source.queue, 0))).toBeNull()
+        unavailableA = false
+      }
+      await source.queue.hydratePendingQueue(sessionA)
+      await vi.waitFor(() => expect(source.queue.isReordering.value).toBe(false))
+      expect(source.queue.pendingQueue.value.map(row => row.text)).toEqual(
+        outcome === 'accepted' ? ['A2', 'A1'] : ['A1', 'A2'],
+      )
+      expect(queuePort.reorder).toHaveBeenCalledTimes(2)
+    } finally { source.queue.cleanup() }
+  })
+
+  it.each(['commit', 'recovery'] as const)('fences a delayed %s response across delivery identities without blocking the new owner', async stage => {
+    const session = 'agent:main:webchat:test'
+    const identity = ref<string | null>('gateway-a')
+    const initial = ['A1', 'A2'].map((text, position): PendingInputWalRecord => ({
+      schemaVersion: 1, pendingInputId: text, sessionKey: session,
+      clientRequestId: `request-${text}`, clientMessageId: `message-${text}`,
+      text, attachments: [], intent: null, state: 'staged', mayHaveServerCopy: true,
+      deliveryIdentity: 'gateway-a', requestFingerprint: `fingerprint-${text}`,
+      serverRevision: 1, position, walRevision: 1, createdAt: position + 1, updatedAt: position + 1,
+    }))
+    const { wal, records } = memoryWal(initial)
+    const serverRow = (text: string, position: number, revision = 1) => ({
+      pendingInputId: text, clientRequestId: `request-${text}`, clientMessageId: `message-${text}`,
+      message: text, attachments: [], requestFingerprint: `fingerprint-${text}`, position, revision,
+    })
+    // Authoritative Gateway rows are separate from WAL: the reorder commits even
+    // when its response is lost, and returning to that owner must reconcile it.
+    let ownerRows = [serverRow('A1', 0), serverRow('A2', 1)]
+    let release!: () => void
+    let attempted = false
+    let held = false
+    const port: PendingInputQueuePort = {
+      supportsQueue: () => true, supportsReorder: () => true,
+      enqueue: vi.fn(async () => ({})), cancel: vi.fn(async () => {}),
+      list: vi.fn(async () => {
+        if (identity.value === 'gateway-b') return [serverRow('B1', 0)]
+        const captured = structuredClone(ownerRows)
+        if (stage === 'recovery' && attempted && !held) {
+          held = true
+          await new Promise<void>(resolve => { release = resolve })
+        }
+        return captured
+      }),
+      reorder: vi.fn(async () => {
+        attempted = true
+        ownerRows = [serverRow('A2', 0, 2), serverRow('A1', 1, 2)]
+        if (stage === 'recovery') throw new Error('committed but response lost')
+        await new Promise<void>(resolve => { release = resolve })
+        return { items: structuredClone(ownerRows) }
+      }),
+    }
+    const source = makeQueue(undefined, () => true, {
+      pendingInputWal: wal, pendingInputQueue: port, connectionState: ref('connected'), deliveryIdentity: identity,
+    })
+    try {
+      await source.queue.hydratePendingQueue()
+      expect(source.queue.beginPendingReorder(1)).toBe(true)
+      source.queue.reorderPendingItem(1, 0)
+      const oldCommit = source.queue.endPendingReorder()
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+      identity.value = 'gateway-b'
+      await nextTick()
+      await source.queue.hydratePendingQueue()
+      expect(source.queue.isReordering.value).toBe(false)
+      expect(source.queue.pendingQueue.value.some(item => item.text === 'B1')).toBe(true)
+      release()
+      await oldCommit
+      expect(records.get('A1')?.serverRevision).toBe(1)
+      expect(records.get('A2')?.serverRevision).toBe(1)
+      expect(source.queue.isReordering.value).toBe(false)
+      identity.value = 'gateway-a'
+      await nextTick()
+      await source.queue.hydratePendingQueue()
+      await vi.waitFor(() => expect(source.queue.isReordering.value).toBe(false))
+      expect(records.get('A1')?.serverRevision).toBe(2)
+      expect(records.get('A2')?.serverRevision).toBe(2)
+      expect(source.queue.pendingQueue.value.filter(item => item.text.startsWith('A')).map(item => item.text)).toEqual(['A2', 'A1'])
+      expect(source.queue.pendingQueue.value.some(item => item.text === 'B1')).toBe(true)
+      expect(port.reorder).toHaveBeenCalledTimes(1)
+    } finally { source.queue.cleanup() }
   })
 
   it('does not accept a durable response handoff after navigation supersedes it', async () => {

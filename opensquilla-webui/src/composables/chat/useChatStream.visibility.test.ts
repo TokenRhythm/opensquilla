@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ref, watchSyncEffect } from 'vue'
+import { ref, watchSyncEffect, type Ref } from 'vue'
 import { useChatStream } from './useChatStream'
 import type { ChatMessage, ChatRunStatus } from '@/types/chat'
 
@@ -48,10 +48,11 @@ describe('stream rendering across visibility changes', () => {
     for (const callback of pending) callback(performance.now())
   }
 
-  function createStream() {
+  function createStream(presentationVisible?: Ref<boolean>) {
     const messages = ref<ChatMessage[]>([])
     const scroll = vi.fn()
     stream = useChatStream({
+      presentationVisible,
       messages, lastHeaderRole: ref(''), aborted: ref(false), autoScroll: ref(true),
       runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
       applySessionRunState: vi.fn(), renderMarkdown: (text: string) => text,
@@ -137,5 +138,53 @@ describe('stream rendering across visibility changes', () => {
     expect(published()).toBe('')
     expect(frames.size).toBe(0)
     expect(listeners.has('visibilitychange')).toBe(false)
+  })
+
+  it('parks hidden panel clocks and scrolling without stopping its stream owner', () => {
+    const visible = ref(true)
+    const { api, messages, scroll, published } = createStream(visible)
+    api.appendDelta('before ')
+    runFrame()
+    const runningTimers = vi.getTimerCount()
+    visible.value = false
+    expect(vi.getTimerCount()).toBe(runningTimers - 1)
+    const elapsed = api.streamTurnElapsed.value
+    scroll.mockClear()
+    vi.advanceTimersByTime(5_000)
+    expect(api.streamTurnElapsed.value).toBe(elapsed)
+    api.appendDelta('while hidden')
+    expect(frames.size).toBe(0)
+    expect(published()).toBe('before ')
+    vi.advanceTimersByTime(250)
+    expect(published()).toBe('before while hidden')
+    expect(api.isStreaming.value).toBe(true)
+    expect(scroll).not.toHaveBeenCalled()
+    visible.value = true
+    expect(api.streamTurnElapsed.value).not.toBe(elapsed)
+    expect(scroll).toHaveBeenCalledTimes(1)
+    visible.value = false
+    api.endStreaming()
+    expect(messages.value.some(message => message.text === 'before while hidden')).toBe(true)
+    expect(scroll).toHaveBeenCalledTimes(1)
+    expect(api.isStreaming.value).toBe(false)
+  })
+
+  it('does not start a hidden panel thinking clock and catches up on return', () => {
+    const visible = ref(false)
+    const { api } = createStream(visible)
+    api.showThinkingIndicator()
+    vi.advanceTimersByTime(400)
+    expect(api.thinkingVisible.value).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+    vi.advanceTimersByTime(4_000)
+    visible.value = true
+    expect(api.thinkingText.value).toContain('4s')
+    expect(vi.getTimerCount()).toBe(1)
+    visible.value = false
+    expect(vi.getTimerCount()).toBe(0)
+    vi.advanceTimersByTime(60_000)
+    visible.value = true
+    expect(api.thinkingVisible.value).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
   })
 })

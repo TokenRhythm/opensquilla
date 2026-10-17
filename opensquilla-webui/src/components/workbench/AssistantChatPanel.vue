@@ -2,6 +2,7 @@
   <section class="assistant-chat-panel" data-testid="assistant-chat-panel">
     <p v-if="state.error" class="assistant-chat-panel__notice" role="alert">{{ state.error }}</p>
     <ChatView ref="chatView" :key="ownerScope" embedded
+      :surface-visible="visible !== false"
       :session-key-override="state.child?.key || ''"
       :policy="SIDE_CONVERSATION_POLICY"
       :workbench-owner-session-key="parentSessionKey"
@@ -27,7 +28,7 @@ import { assistantChatBindingKey, createAssistantChatOwner, type AssistantChatOw
 import { assistantChatPendingOwner } from '@/modules/assistantChatPendingOwner'
 import type { SideChatLaunchHandle, SideChatLaunchRequest } from '@/modules/sideChatLauncher'
 
-const props = defineProps<{ parentSessionKey: string; workspaceId?: string; ownerId: string }>()
+const props = defineProps<{ parentSessionKey: string; workspaceId?: string; ownerId: string; visible?: boolean }>()
 const chatView = shallowRef<SideChatLaunchHandle | null>(null)
 defineExpose({ launchSideChat: (request: SideChatLaunchRequest) => chatView.value?.launchSideChat(request) ?? Promise.resolve(false) })
 const gateway = inject(GATEWAY_ACCESS_KEY, null)

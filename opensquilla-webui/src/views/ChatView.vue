@@ -1165,6 +1165,7 @@ type Message = ChatMessage
 // differences concern identity/lifetime only, never event folding or rendering.
 const props = defineProps<{
   embedded?: boolean
+  surfaceVisible?: boolean
   sessionKeyOverride?: string
   policy?: Readonly<ConversationPolicy>
   workbenchOwnerSessionKey?: string
@@ -1179,6 +1180,7 @@ const props = defineProps<{
   expectedWorkspaceId?: string | null
 }>()
 const conversationPolicy = computed(() => props.policy ?? MAIN_CONVERSATION_POLICY)
+const surfaceVisible = computed(() => props.surfaceVisible !== false)
 const workbenchOwnerKey = computed(() => props.workbenchOwnerSessionKey || sessionKey.value)
 const preparingHostSession = ref(false)
 const workspaceBindingMismatch = ref(false)
@@ -1909,6 +1911,7 @@ const {
 const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
 
 const chatStream = useChatStream({
+  presentationVisible: surfaceVisible,
   messages,
   lastHeaderRole,
   aborted,
@@ -6617,6 +6620,7 @@ function shareTitle(): string {
 /* ── Streaming ─────────────────────────────────────────────────────── */
 
 function scrollToBottom() {
+  if (!surfaceVisible.value) return
   const epoch = scrollEpoch.value
   const key = sessionKey.value
   nextTick(() => {
@@ -6625,6 +6629,7 @@ function scrollToBottom() {
     // Re-check here so that queued automatic scrolls never override that choice.
     if (
       epoch !== scrollEpoch.value
+      || !surfaceVisible.value
       || key !== sessionKey.value
       || !threadRef.value
       || !bottomSentinelRef.value
