@@ -224,7 +224,7 @@ import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
 import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
-import { captureVisibleTextScrollAnchor, restoreTextScrollAnchor, type TextScrollAnchor } from '@/utils/chat/scrollAnchor'
+import { captureElementScrollAnchor, captureVisibleTextScrollAnchor, restoreElementScrollAnchor, restoreTextScrollAnchor, type ElementScrollAnchor, type TextScrollAnchor } from '@/utils/chat/scrollAnchor'
 import { readDistanceFromEnd, remeasureVirtualizer, type VirtualizerAnchor } from '@/utils/virtualizerLayout'
 import type { ChatViewportSnapshot } from '@/types/chatVirtualizer'
 import { sandboxResumeMessageTurnId } from '@/utils/chat/sandboxResumeGuard'
@@ -452,7 +452,9 @@ let cancelledSeek = false
 let nativeSmoothSeek = false
 let liveEdgeSeek = false
 const layoutPending = ref(false)
+let restoringFlowLayout = false
 let readingTextAnchor: { key: string; anchor: TextScrollAnchor } | null = null
+let readingElementAnchor: { key: string; anchor: ElementScrollAnchor } | null = null
 let readingAnchor: VirtualizerAnchor | null = null
 let readingPosition = -1
 const activeNavigation = ref<{ key: string; options: ScrollToOptions } | null>(null)
@@ -766,10 +768,15 @@ function updateSizeAdjustmentPolicy(
   instance: Virtualizer<HTMLElement, HTMLElement>,
   repeatedObservation = false,
 ) {
+  // Fully mounted rows already reflow in native document order. Their DOM
+  // anchor owns a width change; estimate/size corrections must not race it.
+  const flowReflow = !virtualizationEnabled.value && (restoringFlowLayout || (
+    layoutWidth > 0 && Math.abs((listRootRef.value?.getBoundingClientRect().width ?? layoutWidth) - layoutWidth) > 0.5
+  ))
   // Core only caches an initial size when it differs from the estimate. A
   // repeated observation of the same DOM row is still a resize even when that
   // first size happened to equal its estimate. No sizes/keys are stored here.
-  instance.shouldAdjustScrollPositionOnItemSizeChange = scrollHandoff.value ? () => false : (
+  instance.shouldAdjustScrollPositionOnItemSizeChange = scrollHandoff.value || flowReflow ? () => false : (
     activeNavigation.value || layoutPending.value || repeatedObservation
   ) ? (item, _delta, current) => item.end <= (current.scrollOffset ?? 0) : undefined
 }
@@ -1099,6 +1106,7 @@ function cancelScroll() {
   layoutPending.value = false
   layoutAnchorKey.value = null
   readingTextAnchor = null
+  readingElementAnchor = null
   readingAnchor = null
   readingPosition = -1
   // Do not write the current scrollTop here: Chromium may already have applied
@@ -1189,7 +1197,7 @@ function rememberReadingAnchor() {
     || Math.abs(root.getBoundingClientRect().width - layoutWidth) > 0.5) return
   const offset = container.scrollTop
   const item = virtualizer.value.getVirtualItemForOffset(offset)
-  if (!item) { readingAnchor = null; return }
+  if (!item) { readingAnchor = null; readingElementAnchor = null; return }
   let anchor = item
   // A small leftover tail is not the reader's primary content. Anchor the
   // next complete row, while near-boundary and oversized-message reads keep
@@ -1201,6 +1209,9 @@ function rememberReadingAnchor() {
     )) ?? item
   }
   readingAnchor = { key: anchor.key, intraOffset: offset - anchor.start }
+  const elementAnchor = !virtualizationEnabled.value
+    ? captureElementScrollAnchor(container, messageRow(anchor.index)) : null
+  readingElementAnchor = elementAnchor ? { key: String(anchor.key), anchor: elementAnchor } : null
 }
 
 function captureReadingText() {
@@ -1244,6 +1255,40 @@ function preserveLayoutChange(applyLayoutChange?: () => void) {
       }
       layoutPending.value = false
     })
+    return
+  }
+  if (!virtualizationEnabled.value) {
+    // All rows exist: keep their actual position in this layout, without
+    // clearing sizes and seeking through estimated offsets across frames.
+    const instance = virtualizer.value
+    restoringFlowLayout = true
+    updateSizeAdjustmentPolicy(instance)
+    try {
+      applyLayoutChange?.()
+      // Refresh the mounted sizes while the DOM anchor owns scroll. Later RO
+      // notifications then see the same sizes instead of compensating twice.
+      if (!applyLayoutChange) {
+        const sizes = Array.from(listRootRef.value?.querySelectorAll<HTMLElement>(':scope > [data-index]') ?? [],
+          row => ({ index: Number(row.dataset.index), height: row.getBoundingClientRect().height }))
+        for (const row of sizes) instance.resizeItem(row.index, row.height)
+      }
+      if (props.followLiveEdge) instance.scrollToEnd()
+      else {
+        const anchor = readingElementAnchor
+        const row = anchor ? messageRow(messageKeys.value.indexOf(anchor.key)) : null
+        const restored = (textAnchor && restoreTextScrollAnchor(textAnchor.anchor, row))
+          || restoreElementScrollAnchor(anchor?.anchor ?? null, row)
+        if (restored) stopScrollReconciliation()
+      }
+      synchronizeScrollOffset?.()
+    } finally {
+      restoringFlowLayout = false
+      layoutPending.value = false
+      updateSizeAdjustmentPolicy(instance)
+      readingPosition = -1
+      rememberReadingAnchor()
+      captureReadingText()
+    }
     return
   }
   void remeasureVirtualizer(virtualizer.value, {

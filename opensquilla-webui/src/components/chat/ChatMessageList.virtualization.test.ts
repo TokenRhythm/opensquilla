@@ -836,28 +836,41 @@ describe('ChatMessageList long-history virtualization', () => {
         : row ? index * 94 + (index > 10 ? extra : 0) - offset : 0
       return { top, bottom: top + height, height, width } as DOMRect
     })
-    const { container, host } = await mountList({
+    const { container, host, api } = await mountList({
       messages: Array.from({ length: 48 }, (_, index) => message(index)), followLiveEdge: false,
     })
     container.scrollTop = 1_010 // Row 10 is mostly clipped; row 11 starts 24px below the fold.
     container.dispatchEvent(new Event('scroll'))
     await nextTick() // Reflow immediately, without waiting for scroll-idle/text anchoring.
+    const writes: number[] = []
+    let currentTop = container.scrollTop
+    Object.defineProperty(container, 'scrollTop', {
+      configurable: true, get: () => currentTop,
+      set: (top: number) => { currentTop = top; writes.push(top) },
+    })
     width = 600
     resize(host.querySelector('.chat-message-list')!)
     resize(host.querySelector('[data-chat-message-index="10"]')!)
+    expect(container.scrollTop).toBe(1_052)
     await nextTick()
     await nextTick()
     await new Promise(resolve => window.requestAnimationFrame(resolve))
     await nextTick()
     expect(container.scrollTop).toBe(1_052)
+    expect(writes.every(top => top === 1_052)).toBe(true)
+    expect(api.captureViewport!().rows.find(row => row.key === 'message-10')?.size).toBe(136)
+    writes.length = 0
     width = 800
     resize(host.querySelector('.chat-message-list')!)
     resize(host.querySelector('[data-chat-message-index="10"]')!)
+    expect(container.scrollTop).toBe(1_010)
     await nextTick()
     await nextTick()
     await new Promise(resolve => window.requestAnimationFrame(resolve))
     await nextTick()
     expect(container.scrollTop).toBe(1_010)
+    expect(writes.every(top => top === 1_010)).toBe(true)
+    expect(api.captureViewport!().rows.find(row => row.key === 'message-10')?.size).toBe(94)
   })
 
   it('keeps an oversized current row even when a complete following row is visible', async () => {
