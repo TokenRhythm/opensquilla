@@ -1029,7 +1029,8 @@ function focusTextarea(options?: { preserveFocus?: boolean }) {
   }
   if (!canFocus()) return
   nextTick(() => {
-    if (canFocus()) textareaEl.value?.focus()
+    // The editor owns selection restoration across menu focus and token updates.
+    if (canFocus()) inlineEditor.value?.focus()
   })
 }
 
