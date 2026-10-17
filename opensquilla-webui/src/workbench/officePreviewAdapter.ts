@@ -51,7 +51,7 @@ export interface OfficePreviewOptions {
 function openHyperlink(target: { kind: string; url?: string }) {
   if (target.kind !== 'external' || !target.url) return
   const url = normalizeBrowserUrl(target.url)
-  if (!url) return
+  if (!url || url === 'about:blank') return
   const opened = window.open(url, '_blank', 'noopener,noreferrer')
   if (opened) opened.opener = null
 }

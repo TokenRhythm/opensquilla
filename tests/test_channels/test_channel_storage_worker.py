@@ -25,6 +25,9 @@ from opensquilla.channels.types import (
     IncomingMessage,
     OutgoingMessage,
 )
+from tests.helpers.sqlite_process_probe import run_sqlite_probe
+
+_ACCEPT_CANCEL_PROBE = Path(__file__).parent / "fixtures" / "channel_accept_cancel_probe.py"
 
 
 def message(event: str = "one") -> IncomingMessage:
@@ -159,21 +162,52 @@ async def test_queue_capacity_and_cancel_before_submission(gated):
     assert not {"queued", "waiting"} & {name for name, _ in events}
 
 
-async def test_submitted_accept_cancellation_still_hands_off_exactly_once(gated):
-    worker, _, gate, entered = await gated("after_accept")
-    queue = asyncio.Queue()
-    task = asyncio.create_task(worker.enqueue("channel", message(), queue))
-    await until(entered.is_set)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    gate.set()
-    await until(lambda: queue.qsize() == 1)
-    assert await worker.enqueue("channel", message(), queue) is False
-    assert queue.qsize() == 1
-    await worker.close()
-    with sqlite3.connect(worker.path) as conn:
-        assert conn.execute("SELECT state FROM channel_ingress").fetchone() == ("accepted",)
+def test_submitted_accept_cancellation_still_hands_off_exactly_once(tmp_path, monkeypatch):
+    # This is an ordering/durability contract, not a two-second disk-latency SLO.
+    # The child uses real SQLite and event barriers; its watchdog includes cleanup.
+    # Exercise the redirected stream encoding used by Windows CI explicitly.
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+    result = run_sqlite_probe(tmp_path, _ACCEPT_CANCEL_PROBE, ("none",))
+    assert result.timed_out is None, result.output
+    assert result.returncode == 0, result.output
+    assert "probe_stdout_utf8=\u2713" in result.output
+    assert "probe_stderr_utf8=\u2713" in result.output
+    assert "accept_cancel_contract=passed" in result.output
+    assert "phase=worker-threads-stopped" in result.output
+
+
+def test_accept_cancel_probe_allows_slow_commit(tmp_path):
+    result = run_sqlite_probe(tmp_path, _ACCEPT_CANCEL_PROBE, ("slow-commit",))
+    assert result.timed_out is None, result.output
+    assert result.returncode == 0, result.output
+    assert "synthetic_commit_delay_seconds=2.1" in result.output
+    assert "accept_cancel_contract=passed" in result.output
+
+
+@pytest.mark.parametrize(("fault", "failure"), [
+    ("duplicate-handoff", "AssertionError: accepted event was handed off more than once"),
+    ("early-error", "RuntimeError: injected accept submission failure"),
+])
+def test_accept_cancel_probe_rejects_broken_contracts(tmp_path, fault, failure):
+    result = run_sqlite_probe(tmp_path, _ACCEPT_CANCEL_PROBE, (fault,))
+    assert result.timed_out is None, result.output
+    assert result.returncode != 0, result.output
+    assert f"fault={fault}" in result.output.splitlines()
+    assert result.output.rstrip().splitlines()[-1] == failure, result.output
+    assert "phase=worker-threads-stopped" in result.output
+    assert "accept_cancel_contract=passed" not in result.output
+
+
+def test_accept_cancel_probe_watchdog_stops_noncooperative_worker(tmp_path):
+    result = run_sqlite_probe(
+        tmp_path, _ACCEPT_CANCEL_PROBE, ("hang-handoff",),
+        ready_signal="CHANNEL_ACCEPT_HANG_READY", execution_seconds=2,
+    )
+    assert result.timed_out == "execution/cleanup", result.output
+    assert result.returncode != 0, result.output
+    assert "phase=noncooperative-accept-thread" in result.output
+    assert f"probe_pid={result.pid}" in result.output.splitlines()
+    assert "accept_cancel_contract=passed" not in result.output
 
 
 async def test_waiting_parameters_and_handoff_are_snapshots(gated):

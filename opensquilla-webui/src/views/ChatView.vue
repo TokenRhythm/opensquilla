@@ -149,12 +149,6 @@
           @dismiss="chatSessionBootstrap.dismissRecoveryNotice()"
           @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
         />
-        <ChatDeliveryRecoveryStatus
-          v-if="!forkTransition"
-          :entries="chatSend.deliveryRecoveryEntries.value"
-          :checking-ids="chatSend.checkingDeliveryIds.value"
-          @check="chatSend.checkDelivery"
-        />
         <div
           v-if="!forkTransition && showConfirmedEmptySession"
           class="chat-empty"
@@ -645,6 +639,12 @@
       />
     </div>
 
+    <ChatDeliveryRecoveryStatus
+      v-if="!forkTransition && !shareMode"
+      :entries="chatSend.deliveryRecoveryEntries.value"
+      :checking-ids="chatSend.checkingDeliveryIds.value"
+      @check="chatSend.checkDelivery"
+    />
     <ChatModelSetupNotice v-if="!shareMode" />
     <ChatComposer
       ref="composerRef"

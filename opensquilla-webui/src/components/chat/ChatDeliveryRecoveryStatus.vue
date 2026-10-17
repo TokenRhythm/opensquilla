@@ -15,7 +15,7 @@ const { t } = useI18n()
     <li v-for="(entry, index) in entries" :key="entry.id" class="chat-delivery-recovery__item">
       <div class="chat-delivery-recovery__copy" role="status" aria-live="polite">
         <strong>{{ t('deliveryRecovery.sessionTitle') }}</strong>
-        <span class="chat-delivery-recovery__preview">{{ entry.preview || t('deliveryRecovery.messageNumber', { number: index + 1 }) }}</span>
+        <span v-if="entries.length > 1" class="chat-delivery-recovery__preview">{{ entry.preview || t('deliveryRecovery.messageNumber', { number: index + 1 }) }}</span>
         <span>{{ t(`deliveryRecovery.reason.${entry.waitReason || (entry.stopPending ? 'stop' : 'pending')}`) }}</span>
       </div>
       <button
@@ -38,17 +38,18 @@ const { t } = useI18n()
   box-sizing: border-box;
   flex: 0 0 auto;
   list-style: none;
-  margin: var(--sp-2) auto;
-  max-width: min(calc(100% - 32px), 680px);
+  margin: 0 auto var(--sp-2);
+  max-height: min(160px, 20vh);
+  overflow-y: auto;
   padding: 0;
-  width: 100%;
+  width: min(calc(100% - 48px), var(--composer-col, 820px));
 }
 
 .chat-delivery-recovery__item {
   align-items: center;
-  background: color-mix(in srgb, var(--warn) 8%, var(--bg-surface));
-  border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border));
-  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   color: var(--text-muted);
   display: flex;
   font-size: var(--fs-xs);

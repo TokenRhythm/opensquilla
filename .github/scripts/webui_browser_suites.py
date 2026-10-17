@@ -39,6 +39,8 @@ GENERAL_SPECS = (
     "task-progress.spec.ts",
     "queue-steer.spec.ts",
     "share.spec.ts",
+    "session-chat-reliability.real.spec.ts",
+    "session-delivery-feedback.spec.ts",
 )
 GENERAL_SHARDS = tuple(f"general-{index}" for index in range(1, 5))
 VIRTUALIZATION_SPECS = (

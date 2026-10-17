@@ -53,6 +53,7 @@ import {
   type NativeWorkbenchSurfaceRectRequest,
 } from './native-workbench-surface-contract.js'
 import { DesktopBrowserError, type DesktopBrowserOperation, type DesktopBrowserRequest } from './desktop-browser.js'
+import { BROWSER_BLANK_URL } from './browser-action-contract.js'
 import { BrowserPlaywrightDriver } from './browser-playwright.js'
 import { BrowserPointerController } from './browser-pointer-controller.js'
 import { BrowserManagedDownloads } from './browser-managed-downloads.js'
@@ -1277,9 +1278,9 @@ export class NativeWorkbenchSurfaceManager {
   /** Recover the retained document after a navigation ended before committing. */
   private restoreBrowserDocumentAfterAbortedNavigation(record: NativeWorkbenchSurfaceRecord): boolean {
     if (record.disposed || record.contents.isDestroyed()) return false
-    const currentUrl = this.httpUrl(record.contents.getURL())?.href
+    const currentUrl = this.browserDocumentUrl(record.contents.getURL())
     const previous = record.browserPreviousDocument
-    if (previous && currentUrl && currentUrl === this.httpUrl(previous.url)?.href) {
+    if (previous && currentUrl && currentUrl === this.browserDocumentUrl(previous.url)) {
       record.documentUrl = currentUrl!
       record.browserDocumentReady = previous.ready
       record.browserNavigationStopped = previous.stopped
@@ -1288,7 +1289,7 @@ export class NativeWorkbenchSurfaceManager {
     } else if (currentUrl) record.documentUrl = currentUrl
     if (record.browserDocumentReady) this.emit(record, 'ready')
     this.emitNavigationState(record)
-    return Boolean(previous && currentUrl && currentUrl === this.httpUrl(previous.url)?.href)
+    return Boolean(previous && currentUrl && currentUrl === this.browserDocumentUrl(previous.url))
   }
 
   private restoreBrowserDocumentAfterDownload(record: NativeWorkbenchSurfaceRecord): void {
@@ -1304,7 +1305,7 @@ export class NativeWorkbenchSurfaceManager {
       return
     }
     if (!previous || record.contents.isLoadingMainFrame()
-      || this.httpUrl(record.contents.getURL())?.href !== this.httpUrl(previous.url)?.href) return
+      || this.browserDocumentUrl(record.contents.getURL()) !== this.browserDocumentUrl(previous.url)) return
     if (this.restoreBrowserDocumentAfterAbortedNavigation(record)) record.browserDownloadNavigation = undefined
   }
 
@@ -1960,7 +1961,7 @@ export class NativeWorkbenchSurfaceManager {
     return {
       targetRef: record.targetRef, surfaceId: record.id, sessionKey: record.scopeId,
       url: record.browserNavigationError?.url || record.browserDownloadedDocument?.url
-        || this.httpUrl(record.contents.getURL())?.href || record.documentUrl,
+        || this.browserDocumentUrl(record.contents.getURL()) || record.documentUrl,
       title: record.browserDownloadedDocument ? `Download: ${record.browserDownloadedDocument.name}`
         : record.contents.getTitle(), kind: record.kind,
       active: this.activeSurfaceId === record.id,
@@ -2319,7 +2320,7 @@ export class NativeWorkbenchSurfaceManager {
         && record.kind !== 'artifact-html').map(record => this.describeBrowserRecord(record)) }
     }
     if (request.operation === 'open' && !request.targetRef) {
-      const url = parseNativeWorkbenchNavigationUrl(request.url)
+      const url = parseNativeWorkbenchNavigationUrl(request.url ?? BROWSER_BLANK_URL)
       if (this.isPrivilegedGatewayTarget(url)) throw new DesktopBrowserError('NAVIGATION_BLOCKED', 'This URL is unavailable inside isolated previews.')
       const surfaceId = `browser-${randomUUID()}`
       const result = await this.createSurface({ version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
@@ -5104,7 +5105,7 @@ export class NativeWorkbenchSurfaceManager {
           }
         }
         record.browserNavigationStopped = false
-        if (record.kind === 'url-preview' && this.httpUrl(_targetUrl)) {
+        if (record.kind === 'url-preview' && this.browserDocumentUrl(_targetUrl)) {
           record.browserNavigationError = undefined
           record.documentUrl = _targetUrl
         }
@@ -5128,12 +5129,12 @@ export class NativeWorkbenchSurfaceManager {
           record.initialDocumentCommitted = true
         }
         if (isMainFrame && record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION) {
-          const committed = record.kind === 'url-preview' && this.httpUrl(targetUrl)
-          if (committed && this.v2TopLevelNavigationAllowed(record, committed.href)) {
+          const committed = record.kind === 'url-preview' && this.browserDocumentUrl(targetUrl)
+          if (committed && this.v2TopLevelNavigationAllowed(record, committed)) {
             // A redirect commits a different URL from did-start-navigation's
             // request. Future retained-document snapshots must describe the
             // loaded page, including authenticated login redirect landings.
-            record.documentUrl = committed.href
+            record.documentUrl = committed
             record.initialDocumentCommitted = true
           }
           record.browserPreviousDocument = undefined
@@ -5224,7 +5225,7 @@ export class NativeWorkbenchSurfaceManager {
     contents.on('did-navigate-in-page', (_event, targetUrl, isMainFrame) => {
       if (!isMainFrame) return
       if ((record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION)) {
-        if (record.kind === 'url-preview' && this.httpUrl(targetUrl)) record.documentUrl = targetUrl
+        if (record.kind === 'url-preview' && this.browserDocumentUrl(targetUrl)) record.documentUrl = targetUrl
         record.annotationDocumentGeneration += 1
         this.invalidateBrowserAnchors(record)
         void this.cancelAnnotationInteraction(record, 'surface-navigation', true)
@@ -5347,6 +5348,10 @@ export class NativeWorkbenchSurfaceManager {
     }
   }
 
+  private browserDocumentUrl(value: string): string | undefined {
+    return value === BROWSER_BLANK_URL ? value : this.httpUrl(value)?.href
+  }
+
   private externalProtocolUrl(value: string): URL | null {
     if (value.length > 8192) return null
     try {
@@ -5409,6 +5414,7 @@ export class NativeWorkbenchSurfaceManager {
     record: NativeWorkbenchSurfaceRecord,
     targetUrl: string,
   ): boolean {
+    if (targetUrl === BROWSER_BLANK_URL) return record.kind === 'url-preview' && record.mode === 'full'
     try {
       const target = new URL(targetUrl)
       if (target.protocol !== 'http:' && target.protocol !== 'https:') return false

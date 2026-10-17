@@ -244,7 +244,7 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
     }
     if (action === 'open-external') {
       const current = String(this.context.getRenderState().currentUrl || '')
-      if (normalizeBrowserUrl(current)) this.options.openExternal(current)
+      if (current !== 'about:blank' && normalizeBrowserUrl(current)) this.options.openExternal(current)
       return
     }
     if (!native?.navigateSurface) {
@@ -610,7 +610,8 @@ export function createBrowserWorkbenchDefinition(
     supports: item => item.kind === 'browser' && Boolean(browserUrlFromWorkbenchItem(item)),
     getHeader: (item, state) => ({
       icon: 'languages',
-      title: String(state.runtimeState.pageTitle || item.title),
+      title: (state.runtimeState.currentUrl || browserUrlFromWorkbenchItem(item)) === 'about:blank'
+        ? options.t('workbench.browser.newTab') : String(state.runtimeState.pageTitle || item.title),
       subtitle: String(state.runtimeState.currentUrl || browserUrlFromWorkbenchItem(item)),
     }),
     getProps: (_item, state) => ({

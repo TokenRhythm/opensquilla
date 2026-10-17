@@ -2002,20 +2002,6 @@ export function useChatSend(options: UseChatSendOptions) {
     return true
   }
 
-  function abortStaleAcceptedTask(
-    response: TurnSendResponse | null | undefined,
-    requestSessionKey: string,
-  ) {
-    if (disposed || options.sessionKey.value !== requestSessionKey) return
-    const taskId = acceptedTaskId(response)
-    if (!taskId) return
-    void options.turnCommands.cancel({
-      sessionKey: response?.sessionKey || requestSessionKey,
-      taskId,
-      source: 'webui_stale_send',
-    }).catch(() => {})
-  }
-
   async function dispatchSteerV2(
     text: string,
     optionsForSteer: {
@@ -3411,8 +3397,6 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (stoppedByUser) {
           observePendingAcceptance(attempt)
-        } else {
-          abortStaleAcceptedTask(res, requestSessionKey)
         }
         if (
           stoppedByUser
@@ -3689,7 +3673,14 @@ export function useChatSend(options: UseChatSendOptions) {
       if (disposed) return acceptedError ? 'accepted' : 'retryable_failure'
       rememberRetryableAttempt(true)
       if (stoppedBeforeAdmission) return retainStoppedDraft()
-      if (!preserveComposer && !acceptedError && !sendOpts.suppressRejectedFailureMessage) {
+      // Transient delivery failures are still owned by receipt recovery. Its
+      // request-scoped check action survives the budget; do not claim a turn
+      // failed while it may be running. Domain rejections can omit accepted,
+      // so keep their actionable feedback even when admission is unknown.
+      const recoveringDelivery = !acceptedError && commandError?.retryable !== false
+        && ['transport', 'timeout', 'aborted', 'session-changed', 'unavailable'].includes(commandError?.kind || '')
+        && (hasUnknownAcceptance(err) || attempt.requiresIdempotentReplay === true)
+      if (!recoveringDelivery && !preserveComposer && !acceptedError && !sendOpts.suppressRejectedFailureMessage) {
         const restoredSnapshot = captureComposerSnapshot()
         const separateExplicitDraft = explicitComposerChanged(attempt)
           || (options.selectedSkills?.value.length
@@ -3779,7 +3770,7 @@ export function useChatSend(options: UseChatSendOptions) {
           } } : {}),
         })
       }
-      if (acceptedError || !sendOpts.suppressRejectedFailureMessage) {
+      if (!recoveringDelivery && (acceptedError || !sendOpts.suppressRejectedFailureMessage)) {
         options.messages.value.push({
           role: 'error',
           text: sendFailureMessage(err),

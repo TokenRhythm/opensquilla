@@ -26,6 +26,18 @@ describe('browser Workbench items', () => {
     expect(first.scope).toEqual(second.scope)
   })
 
+  it('retains the exact blank document as a browser target without accepting other internal URLs', () => {
+    const item = createBrowserWorkbenchItem({ scopeId: 'session-a', url: 'about:blank' })!
+    expect(item).toMatchObject({ kind: 'browser', hostKind: 'native-webcontents',
+      title: 'about:blank', payload: { initialUrl: 'about:blank' } })
+    expect(browserUrlFromWorkbenchItem(item)).toBe('about:blank')
+    for (const url of ['about:blank#fragment', 'about:blank?query', 'about:srcdoc',
+      'about:config', 'ABOUT:blank', ' about:blank ', 'file:///tmp/page.html', 'data:text/html,blank']) {
+      expect(normalizeBrowserUrl(url)).toBe('')
+      expect(createBrowserWorkbenchItem({ scopeId: 'session-a', url })).toBeNull()
+    }
+  })
+
   it('accepts only credential-free HTTP(S) entry URLs', () => {
     expect(normalizeBrowserUrl('https://example.com/path')).toBe('https://example.com/path')
     expect(normalizeBrowserUrl('file:///etc/passwd')).toBe('')

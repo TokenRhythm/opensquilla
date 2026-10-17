@@ -609,7 +609,7 @@ const tabMenuActions = computed(() => {
     actions.push(
       { id: loading ? 'stop' : 'reload', label: t(loading ? 'workbench.browser.stop' : 'workbench.refresh') },
       { id: 'copy-link', label: t('workbench.tabs.copyLink'), disabled: !url },
-      { id: 'open-external', label: t('workbench.openExternal'), disabled: !url },
+      { id: 'open-external', label: t('workbench.openExternal'), disabled: !url || url === 'about:blank' },
     )
   } else {
     const refresh = panelToolbarItems(item).find(action => action.kind === 'action' && action.id === 'refresh')
@@ -703,7 +703,7 @@ function confirmWorkbenchPermission(request: {
 
 function openExternalUrl(value: string) {
   const url = normalizeBrowserUrl(value)
-  if (!url || typeof window === 'undefined') return
+  if (!url || url === 'about:blank' || typeof window === 'undefined') return
   const opened = window.open(url, '_blank', 'noopener,noreferrer')
   if (opened) opened.opener = null
 }
@@ -811,6 +811,7 @@ function openBrowserUrl(value: string, newTab = false) {
     instanceId: createClientRequestId(),
   })
   if (!item) return
+  if (item.payload.initialUrl === 'about:blank') item.title = t('workbench.browser.newTab')
   const source = store.findMostRecentItem(candidate => candidate.kind === 'browser'
     && candidate.scope.type === 'session' && candidate.scope.id === sessionId
     && typeof candidate.payload.targetRef === 'string')
@@ -1517,7 +1518,7 @@ function onNativeSurfaceEvent(event: NativeWorkbenchSurfaceEvent) {
     const item = createBrowserWorkbenchItem({ scopeId: detail.sessionKey, url: detail.url })
     if (!item) return
     item.id = event.surfaceId
-    item.title = detail.title || item.title
+    item.title = detail.url === 'about:blank' ? t('workbench.browser.newTab') : detail.title || item.title
     item.payload = { ...item.payload, adoptedNativeSurface: true, targetRef: detail.targetRef,
       ...(detail.navigationError ? { navigationError: detail.navigationError } : {}) }
     store.openItem(item, { activate: props.enabled && props.routeActive
@@ -1536,7 +1537,8 @@ function onNativeSurfaceEvent(event: NativeWorkbenchSurfaceEvent) {
     if (item?.kind === 'browser' && url) {
       store.updateItem({
         ...item,
-        title: event.detail.title || item.title,
+        title: url === 'about:blank' ? t('workbench.browser.newTab') : event.detail.title
+          || (item.payload.initialUrl === 'about:blank' ? new URL(url).hostname : item.title),
         payload: { ...item.payload, initialUrl: url,
           ...(event.detail.targetRef ? { targetRef: event.detail.targetRef } : {}),
           ...(event.detail.navigationError !== undefined ? { navigationError: event.detail.navigationError } : {}) },

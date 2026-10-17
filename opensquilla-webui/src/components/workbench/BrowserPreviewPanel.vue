@@ -37,6 +37,7 @@
         spellcheck="false"
         :aria-label="t('workbench.browser.address')"
         :aria-invalid="invalidAddress || undefined"
+        :placeholder="t('workbench.browser.addressPlaceholder')"
         @input="onAddressInput"
       >
       <button type="submit" class="btn btn--ghost">
@@ -54,6 +55,7 @@
         type="button"
         class="btn btn--icon btn--ghost"
         :aria-label="t('workbench.openExternal')"
+        :disabled="currentUrl === 'about:blank'"
         @click="emitAction('open-external')"
       >
         <Icon name="externalLink" :size="15" />
@@ -221,7 +223,8 @@ const emit = defineEmits<{
   'workbench-event': [event: WorkbenchComponentEvent]
 }>()
 const { t } = useI18n()
-const address = ref(props.currentUrl)
+const displayAddress = (url: string) => url === 'about:blank' ? '' : url
+const address = ref(displayAddress(props.currentUrl))
 const invalidAddress = ref(false)
 let addressRevision = 0
 let addressIsDraft = false
@@ -250,7 +253,7 @@ const findCount = computed(() => props.findMatches === null || findText.value !=
 
 watch(() => props.currentUrl, value => {
   if (addressIsDraft && (!submittedAddress || submittedAddress.revision !== addressRevision)) return
-  address.value = value
+  address.value = displayAddress(value)
   addressIsDraft = false
   invalidAddress.value = false
 })
@@ -258,7 +261,7 @@ watch(() => props.currentUrl, value => {
 watch(() => props.navigationAddressSequence, () => {
   if (!submittedAddress || submittedAddress.requestId !== props.navigationAddressRequestId) return
   if (submittedAddress.revision === addressRevision) {
-    address.value = props.currentUrl
+    address.value = displayAddress(props.currentUrl)
     addressIsDraft = false
     invalidAddress.value = false
   }

@@ -15,7 +15,39 @@ Times are operational targets, not timeouts. High-risk pull requests intentional
 slower. Provider-live, credential, and external-network tests remain excluded from required
 CI and retain their existing live markers.
 
-## Parallel-runner timing experiment
+## Final parallel-validation scope
+
+The final PR keeps the measured parallelization below. It does not add another
+optimization experiment. The implementation measured at `dbf2a87` is retained;
+integration with `main` also retains its newly added chat reliability and
+delivery-feedback browser checks in the general browser shards.
+
+| Area | Final ownership | Coverage boundary |
+| --- | --- | --- |
+| Frontend and Gateway Contract | Independent type checks, four unit shards, platform Contract generation/verification and a shared frontend artifact producer | Consumers still wait for required verified artifacts; cross-platform hashes retain their aggregate gate |
+| Offline Python | Twenty Ubuntu and twenty-three Windows physical partitions | Every selected file has one owner; file grouping, `ci_serial`, worker limits and platform-specific coverage remain |
+| Browser and desktop probes | Four general browser shards, separate clipboard/virtualization/capacity owners, independent native/frozen/Docker probes and managed toolchains | Preserve test parameters, markers and internal lifecycle order |
+| Windows bundle and profiles | Four bundle runners for the original 66 cases; six independent profile-script runners plus the original browser/router owner | Required coverage gates reject missing, duplicate, skipped or wrong-run execution evidence |
+| Windows Gateway storage | Former `gateway-sqlite-5` files distributed across four owners | Preserve all 92 original files and the seven serial cases; Ubuntu ownership remains unchanged |
+| NSIS acceptance | Old-version preparation overlaps candidate construction; installed audit/smoke/interaction and Gateway/Desktop startup checks have separate owners | Bind exact candidate identity before installation; retain recovery, restart, cleanup, signing checks and failure propagation |
+| NSIS candidate build | Original package verification overlaps normal installer generation; outer Actions ZIP uses compression level zero | Keep the full PyInstaller invocation and installer compression; require both branches to finish and critical identity hashes to match |
+
+Planner selection, `CI result`, required evidence and merge-critical trust inputs
+cover all new owners. There are no new assertion retries, failure allowances or
+test-deadline extensions. Some NSIS consumer job budgets now include the existing
+producer-wait budget; internal installation, uninstall and probe deadlines remain
+unchanged. The shared startup-probe workflow is also used by signed release and
+fault-injection workflows, so unsigned CI evidence is not signed-release proof.
+
+The four-worker dependency-inventory experiment was withdrawn. Further startup
+case splitting, earlier candidate-probe preparation, PyInstaller caching and
+installer-compression changes are outside this PR. The observed full CI median
+is 13:24 in the final three-run sample; the last build comparison observes a
+27-second overall median difference against its repeated baseline.
+The earlier 24:32 initial run is a single historical observation, not a repeated
+control for a claim of stable end-to-end percentage improvement.
+
+## Parallel-runner measurement history
 
 The `integration/ci-parallel-timing` experiment keeps every existing check and
 uses the same product revision as its baseline. Both branches run a complete
@@ -23,21 +55,21 @@ uses the same product revision as its baseline. Both branches run a complete
 execution time; there are no new assertion retries, skips, or relaxed gates.
 A failed run that executes less work is not accepted as evidence of a speedup.
 
-Ubuntu and Windows offline tests each use 20 physical partitions, preserving
-responsibility families, marker filters, `ci_serial`, and per-runner worker
-limits. Frontend type checks, four unit shards, and each Contract profile run
-independently. Browser recovery uses four ordinary shards and separate clipboard,
+Ubuntu and Windows offline tests use 20 and 23 physical partitions respectively,
+preserving responsibility families, marker filters, `ci_serial`, and per-runner
+worker limits. Frontend type checks, four unit shards, and each Contract profile
+run independently. Browser recovery uses four ordinary shards and separate clipboard,
 virtualization and capacity runners. Desktop native/frozen/Docker probes run
 independently of the Electron recovery matrix. Managed toolchain components
 also use separate native VMs.
 
 The NSIS candidate consumes the verified shared WebUI artifact; an independent
 Windows job retains the complete native frontend build. Candidate identities are
-recorded before consumers begin. Packaged dependency auditing, frozen Gateway
-smoke and first interaction install and verify that exact installer on another
-runner, concurrently with all upgrade cases and candidate probes. The final
-acceptance requires every result. Gateway input hashing and freeze ordering are
-unchanged.
+recorded before installation consumers proceed. Packaged dependency auditing,
+frozen Gateway smoke and first interaction each install and verify that exact
+installer on a separate runner, concurrently with upgrade cases and candidate
+probes. The final acceptance requires every result. Gateway input hashing and
+freeze ordering are unchanged.
 
 Save each run API response as `run.json` and every jobs API page as `jobs.json`
 (a JSON array of pages when paginated), then compare trigger-to-final-job time,

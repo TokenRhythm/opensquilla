@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 from contextlib import closing
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ import pytest
 from opensquilla.sandbox import run_context, run_context_service, user_grants
 from opensquilla.sandbox.run_context import DomainGrant, RunContext
 from opensquilla.sandbox.run_mode import RunMode
+from tests.helpers.sqlite_process_probe import run_sqlite_probe
 
 
 class SessionManager:
@@ -145,71 +147,83 @@ async def test_service_write_lock_does_not_block_event_loop(tmp_path, monkeypatc
 
 @pytest.mark.parametrize("failure", [False, True])
 @pytest.mark.parametrize("cancel_all", [False, True])
-async def test_cancelled_post_persist_write_settles_and_rolls_back_on_failure(
+def test_cancelled_post_persist_write_settles_and_rolls_back_on_failure(
     tmp_path, monkeypatch, failure, cancel_all,
 ):
-    manager = SessionManager(tmp_path, chat_grant=True)
-    write_started = threading.Event()
-    release = threading.Event()
-    rollback_started = asyncio.Event()
-    rollback_release = asyncio.Event()
-    original_upsert = user_grants.upsert_domain_grant
-    calls = []
+    # The outer process bounds actual writes and cleanup without a third
+    # cancellation from wait_for changing the owner's expected CancelledError.
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+    result = run_sqlite_probe(
+        tmp_path, _GRANTS_CANCELLATION_PROBE, (str(int(failure)), str(int(cancel_all)), "none"),
+    )
+    assert result.timed_out is None, result.output
+    assert result.returncode == 0, result.output
+    assert "probe_stdout_utf8=\u2713" in result.output
+    assert "probe_stderr_utf8=\u2713" in result.output
+    assert "phase=cleanup-complete" in result.output
+    assert "grants_cancellation_contract=passed" in result.output
 
-    async def pause_rollback():
-        if len(manager.updates) == 2:
-            rollback_started.set()
-            await rollback_release.wait()
 
-    manager.update_hook = pause_rollback
+_GRANTS_CANCELLATION_PROBE = (
+    Path(__file__).with_name("fixtures") / "user_grants_cancellation_probe.py"
+)
 
-    def upsert(payload):
-        assert threading.get_ident() != manager.loop_thread
-        calls.append("write")
-        write_started.set()
-        assert release.wait(3)
-        if failure:
-            raise sqlite3.OperationalError("synthetic grant write failure")
-        original_upsert(payload)
 
-    monkeypatch.setattr(user_grants, "upsert_domain_grant", upsert)
-    existing_tasks = asyncio.all_tasks()
-    task = asyncio.create_task(add_domain(manager, tmp_path))
-    try:
-        await started(write_started)
-        assert len(manager.updates) == 1
-        assert manager.node.origin != manager.initial_origin
-        if cancel_all:
-            # Model shutdown cancelling both the request and any child operations.
-            # The pytest driver and unrelated pre-existing tasks remain untouched.
-            for _ in range(2):
-                for pending in asyncio.all_tasks() - existing_tasks:
-                    pending.cancel()
-                await asyncio.sleep(0)
-                assert not task.done()
-        else:
-            await cancel_twice(task)
-        release.set()
-        if failure:
-            await asyncio.wait_for(rollback_started.wait(), 3)
-            await cancel_twice(task)
-            rollback_release.set()
-        with pytest.raises(asyncio.CancelledError) as error:
-            await asyncio.wait_for(task, 3)
-        if failure:
-            assert isinstance(error.value.__cause__, sqlite3.OperationalError)
-            assert manager.node.origin == manager.initial_origin
-            assert len(manager.updates) == 2
-        else:
-            assert len(manager.updates) == 1
-    finally:
-        release.set()
-        rollback_release.set()
-        await asyncio.gather(task, return_exceptions=True)
+def test_grants_cancellation_probe_preserves_slow_real_commit(tmp_path):
+    result = run_sqlite_probe(tmp_path, _GRANTS_CANCELLATION_PROBE, ("0", "0", "slow-commit"))
+    assert result.timed_out is None, result.output
+    assert result.returncode == 0, result.output
+    assert "grant_commit_delay=3.1" in result.output
+    assert "phase=cleanup-complete" in result.output
+    assert "grants_cancellation_contract=passed" in result.output
 
-    assert calls == ["write"]
-    domains = user_grants.load_user_grants_payload()["domains"]
-    assert [grant["domain"] for grant in domains] == ([] if failure else ["example.com"])
+
+@pytest.mark.parametrize(("fault", "failure"), [
+    ("duplicate-write", "user grant was written more than once"),
+    ("leak-connection", "user-grant database connection was not released"),
+])
+def test_grants_cancellation_probe_rejects_broken_contracts(tmp_path, fault, failure):
+    result = run_sqlite_probe(tmp_path, _GRANTS_CANCELLATION_PROBE, ("0", "0", fault))
+    assert result.timed_out is None, result.output
+    assert result.returncode != 0, result.output
+    assert f"fault={fault}" in result.output.splitlines(), result.output
+    assert "phase=cleanup-complete" in result.output
+    assert result.output.rstrip().splitlines()[-1] == f"AssertionError: {failure}", result.output
+    assert "grants_cancellation_contract=passed" not in result.output
+
+
+def test_grants_cancellation_probe_bounds_noncooperative_worker(tmp_path):
+    result = run_sqlite_probe(
+        tmp_path, _GRANTS_CANCELLATION_PROBE, ("0", "0", "hang-commit"),
+        ready_signal="GRANTS_COMMIT_HANG_ENTERED", execution_seconds=2,
+    )
+    assert result.timed_out == "execution/cleanup", result.output
+    assert result.returncode != 0, result.output
+    assert "fault=hang-commit" in result.output.splitlines(), result.output
+    assert "phase=owner-cancellation-verified" in result.output.splitlines(), result.output
+    assert "phase=grant-commit-blocked" in result.output.splitlines(), result.output
+    assert "GRANTS_COMMIT_HANG_ENTERED" in result.output.splitlines(), result.output
+    assert "phase=cleanup-complete" not in result.output
+    assert "grants_cancellation_contract=passed" not in result.output
+
+
+def test_grants_cancellation_probe_preserves_failure_before_commit(tmp_path):
+    result = run_sqlite_probe(
+        tmp_path, _GRANTS_CANCELLATION_PROBE, ("0", "0", "hang-commit-with-prior-error"),
+        ready_signal="GRANTS_COMMIT_HANG_ENTERED", execution_seconds=2,
+    )
+    assert result.timed_out is None, result.output
+    assert result.returncode != 0, result.output
+    assert "fault=hang-commit-with-prior-error" in result.output.splitlines(), result.output
+    assert "phase=grant-write-held" in result.output.splitlines(), result.output
+    assert "phase=grant-commit-entered" in result.output.splitlines(), result.output
+    assert "phase=grant-commit-completed" in result.output.splitlines(), result.output
+    assert "phase=cleanup-complete" in result.output
+    assert result.output.rstrip().splitlines()[-1] == (
+        "RuntimeError: prior failure must not become an expected grant commit hang"
+    ), result.output
+    assert "GRANTS_COMMIT_HANG_ENTERED" not in result.output
+    assert "grants_cancellation_contract=passed" not in result.output
 
 
 async def test_session_persist_failure_does_not_submit_user_store_write(tmp_path, monkeypatch):

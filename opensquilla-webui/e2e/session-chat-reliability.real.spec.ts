@@ -1,0 +1,511 @@
+import type { Page } from '@playwright/test'
+import { writeFile } from 'node:fs/promises'
+import { expect, test } from './real-gateway.fixture'
+import { expectComposerValue } from './utils'
+
+type Request = { type: string; id: string; method: string; params?: Record<string, unknown> }
+type Send = { request: Request; acknowledgement?: Record<string, unknown> }
+type RecoveryRead = {
+  connection: number
+  sent: number
+  received?: number
+  request: Request
+  response?: Record<string, unknown>
+}
+const SESSION_A = 'agent:main:webchat:e2e-late-ack-a'
+const SESSION_B = 'agent:main:webchat:e2e-late-ack-b'
+const RECOVERY_READ_METHODS = new Set([
+  'sessions.messages.subscribe', 'sessions.messages.snapshot.read', 'sessions.messages.hydrate',
+  'sessions.history.page.v2', 'sessions.read.open.v2', 'sessions.read.state.v2', 'sessions.read.install.v2',
+])
+
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : {}
+}
+
+test.use({
+  isolatedRealGatewayInitialSessionKeys: [SESSION_A, SESSION_B],
+  isolatedRealGatewayNativeDesktop: true,
+})
+
+/** A network fault proxy, not a synthetic Gateway: production RPC, receipts,
+ * SQLite and TaskRuntime execute every request against the isolated fixture. */
+async function interceptAdmission(page: Page, fault: 'hold-first-ack' | 'lose-first-ack') {
+  const sends: Send[] = []
+  const aborts: Request[] = []
+  const receipts: Request[] = []
+  const recoveryReads: RecoveryRead[] = []
+  let release: (() => void) | null = null
+  let releaseOnSubscription = ''
+  let acknowledgementDelivered = 0
+  let connections = 0
+  let order = 0
+  await page.routeWebSocket(/\/ws$/, browser => {
+    const connection = ++connections
+    const server = browser.connectToServer()
+    const pending = new Map<string, Send>()
+    const pendingReads = new Map<string, RecoveryRead>()
+    browser.onMessage(raw => {
+      const frame = JSON.parse(String(raw)) as Request
+      if (frame.type === 'req') {
+        const sent = ++order
+        if (frame.method === 'chat.send') {
+          const send = { request: frame }
+          sends.push(send)
+          pending.set(frame.id, send)
+        }
+        if (frame.method === 'chat.abort') aborts.push(frame)
+        if (frame.method.includes('receipt')) receipts.push(frame)
+        if (RECOVERY_READ_METHODS.has(frame.method) || frame.method === 'turns.receipt.get') {
+          const read = { connection, sent, request: frame }
+          recoveryReads.push(read)
+          pendingReads.set(frame.id, read)
+        }
+        if (frame.method === 'sessions.messages.subscribe'
+          && frame.params?.key === releaseOnSubscription) {
+          // This request proves the reused view has returned to A. Deliver its
+          // held ACK before forwarding the new read, so that read's history and
+          // final install acknowledgement form a causal recovery barrier.
+          if (!release) throw new Error('The real Gateway has not acknowledged the first send')
+          const publish = release
+          release = null
+          releaseOnSubscription = ''
+          acknowledgementDelivered = ++order
+          publish()
+        }
+      }
+      server.send(raw)
+    })
+    server.onMessage(raw => {
+      const frame = JSON.parse(String(raw)) as Record<string, unknown>
+      const read = frame.type === 'res' ? pendingReads.get(String(frame.id)) : undefined
+      if (read) {
+        pendingReads.delete(String(frame.id))
+        read.response = frame
+        read.received = ++order
+      }
+      const send = frame.type === 'res' ? pending.get(String(frame.id)) : undefined
+      if (send) {
+        pending.delete(String(frame.id))
+        send.acknowledgement = frame
+        if (send === sends[0]) {
+          if (fault === 'hold-first-ack') release = () => browser.send(raw)
+          else {
+            // The response proves the Gateway handled the original request.
+            // Drop only its acknowledgement, then break the physical socket.
+            browser.close({ code: 1012, reason: 'Synthetic lost admission acknowledgement' })
+            server.close({ code: 1012, reason: 'Synthetic lost admission acknowledgement' })
+          }
+          return
+        }
+      }
+      browser.send(raw)
+    })
+  })
+  return {
+    sends, aborts, receipts, recoveryReads,
+    connections: () => connections,
+    checkpoint: () => order,
+    releaseFirstAcknowledgementOnSubscription(key: string) {
+      releaseOnSubscription = key
+    },
+    recoveryState(key: string, after: number, accepted: Record<string, unknown>) {
+      const reads = recoveryReads.filter(read => read.connection === connections && read.sent > after)
+      const sessionReads = reads.filter(read => read.request.params?.key === key)
+      const latest = (method: string) => sessionReads.filter(read => read.request.method === method).at(-1)
+      const payload = (read: RecoveryRead | undefined) => read?.response?.ok === true
+        ? record(read.response.payload) : {}
+      const subscription = latest('sessions.messages.subscribe')
+      const history = latest('sessions.history.page.v2')
+      const hydration = latest('sessions.messages.hydrate')
+      const lease = latest('sessions.read.open.v2')
+      const installation = sessionReads.filter(read => read.request.method === 'sessions.read.install.v2'
+        && read.request.params?.lease_id === payload(lease).lease_id
+        && typeof read.request.params?.ack_through_seq === 'number').at(-1)
+      const receipt = reads.filter(read => read.request.method === 'turns.receipt.get'
+        && record(read.request.params?.originalRequest).clientRequestId === accepted.clientRequestId
+        && payload(read).status === 'found'
+        && record(payload(read).receipt).taskId === accepted.task_id).at(-1)
+      const acceptanceObserved = fault === 'lose-first-ack' ? receipt?.received : acknowledgementDelivered
+      const historyItems = payload(history).items
+      return {
+        acceptanceKnown: Boolean(acceptanceObserved),
+        subscribed: payload(subscription).subscribed === true && payload(subscription).replay_complete === true,
+        canonicalUser: Boolean(history && subscription && acceptanceObserved
+          && history.sent > subscription.sent && history.sent > acceptanceObserved
+          && payload(history).canonical_available === true && Array.isArray(historyItems)
+          && historyItems.some(item => record(item).role === 'user'
+            && record(item).message_id === accepted.user_message_id)),
+        ownershipHydrated: Boolean(hydration && subscription && hydration.sent > subscription.sent
+          && payload(hydration).hydration_complete === true
+          && record(payload(hydration).active_task).task_id === accepted.task_id
+          && payload(hydration).run_status === 'running'),
+        installed: Boolean(lease && installation && subscription && lease.sent > subscription.sent
+          && payload(installation).status === 'installed'),
+        pendingReads: sessionReads.filter(read => !read.response).length,
+      }
+    },
+  }
+}
+
+async function waitForRecoveredSession(
+  page: Page,
+  network: Awaited<ReturnType<typeof interceptAdmission>>,
+  key: string,
+  after: number,
+) {
+  const accepted = record(network.sends[0]?.acknowledgement?.payload)
+  expect(accepted.task_id).toEqual(expect.any(String))
+  expect(accepted.user_message_id).toEqual(expect.any(String))
+  const ready = { acceptanceKnown: true, subscribed: true, canonicalUser: true,
+    ownershipHydrated: true, installed: true, pendingReads: 0 }
+  await expect.poll(() => network.recoveryState(key, after, accepted), { timeout: 30_000 }).toEqual(ready)
+  // These renderer assertions follow the RPC installation proof: Stop alone
+  // can appear before the history/recovery promises finish.
+  await expect(page.locator(`.msg-user[data-message-id="${accepted.user_message_id}"]`)).toHaveCount(1)
+  await expect(page.getByRole('button', { name: 'Stop current response', exact: true })).toBeEnabled()
+  await expect.poll(() => network.recoveryState(key, after, accepted)).toEqual(ready)
+}
+
+async function observeVisibleFailures(page: Page) {
+  await page.addInitScript(() => {
+    const failures: string[] = []
+    Object.defineProperty(window, '__sessionReliabilityFailures', { value: failures })
+    const observe = () => {
+      for (const node of document.querySelectorAll('.toast--danger, .chat-thread .msg-error__text')) {
+        const text = node.textContent?.trim()
+        if (text && !failures.includes(text)) failures.push(text)
+      }
+    }
+    new MutationObserver(observe).observe(document, {
+      subtree: true, childList: true, characterData: true, attributes: true,
+    })
+  })
+}
+
+async function visibleFailures(page: Page): Promise<string[]> {
+  return page.evaluate(() => (window as unknown as {
+    __sessionReliabilityFailures: string[]
+  }).__sessionReliabilityFailures)
+}
+
+/** Passive observation only: healthy requests, acknowledgements and events
+ * travel over the production socket without a route or a response shim. */
+function observeHealthyAdmission(page: Page) {
+  const sends: Send[] = []
+  const aborts: Request[] = []
+  const receipts: Request[] = []
+  const startedAt = performance.now()
+  const timings: Array<{ event: string; elapsedMs: number }> = []
+  const mark = (event: string) => timings.push({ event, elapsedMs: performance.now() - startedAt })
+  page.on('websocket', socket => {
+    const pending = new Map<string, Send>()
+    socket.on('framesent', ({ payload }) => {
+      const frame = JSON.parse(String(payload)) as Request
+      if (frame.type !== 'req') return
+      if (frame.method === 'chat.send') {
+        const send = { request: frame }
+        sends.push(send)
+        pending.set(frame.id, send)
+        mark(`send-${sends.length}`)
+      }
+      if (frame.method === 'chat.abort') aborts.push(frame)
+      if (frame.method.includes('receipt')) receipts.push(frame)
+    })
+    socket.on('framereceived', ({ payload }) => {
+      const frame = JSON.parse(String(payload)) as Record<string, unknown>
+      const send = frame.type === 'res' ? pending.get(String(frame.id)) : undefined
+      if (!send) return
+      send.acknowledgement = frame
+      pending.delete(String(frame.id))
+      mark(`ack-${sends.indexOf(send) + 1}`)
+    })
+  })
+  return { sends, aborts, receipts, timings, mark }
+}
+
+test('healthy consecutive turns preserve answers and the next draft through A → B → A and reload', async ({
+  page, isolatedRealGateway,
+}, testInfo) => {
+  test.setTimeout(120_000)
+  await observeVisibleFailures(page)
+  await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+  const network = observeHealthyAdmission(page)
+  const rendererErrors: string[] = []
+  page.on('pageerror', error => rendererErrors.push(error.message))
+  await page.goto(`${isolatedRealGateway.controlUrl}chat?session=${encodeURIComponent(SESSION_A)}`)
+  const input = page.locator('.chat-textarea')
+  const send = page.locator('.chat-send-btn[aria-label="Send"]')
+  const stop = page.getByRole('button', { name: 'Stop current response', exact: true })
+  const recovery = page.getByTestId('chat-delivery-recovery')
+  const firstPrompt = 'Complete this ordinary first turn without an admission fault.'
+  const secondPrompt = 'Continue this same conversation with an ordinary second turn.'
+  const firstAnswer = 'Task one completed after the lifecycle checks.'
+  const secondAnswer = 'Task two completed after Goal removal.'
+  const answer = (text: string) => page.locator('.msg-ai').filter({ hasText: text })
+
+  await input.fill(firstPrompt)
+  await expect(recovery).toHaveCount(0)
+  await expect(send).toBeEnabled()
+  await send.click()
+  await expect.poll(() => network.sends[0]?.acknowledgement?.ok).toBe(true)
+  await expect.poll(async () => (await isolatedRealGateway.readProviderCalls()).length).toBe(1)
+  await expect(stop).toBeVisible()
+  await expect(recovery).toHaveCount(0)
+  await input.fill(secondPrompt)
+  network.mark('release-first-provider')
+  await isolatedRealGateway.releaseFirstTask()
+  await expect(answer(firstAnswer)).toBeVisible({ timeout: 30_000 })
+  await expect(stop).toHaveCount(0)
+  await expectComposerValue(input, secondPrompt)
+  network.mark('first-answer-visible')
+  await expect(send).toBeEnabled()
+  await send.click()
+  await expect.poll(() => network.sends[1]?.acknowledgement?.ok).toBe(true)
+  await expect.poll(async () => (await isolatedRealGateway.readProviderCalls()).length).toBe(2)
+  await expect(stop).toBeVisible()
+  const draft = 'Keep this unsent next draft after completion, navigation and reload.'
+  await input.fill(draft)
+  await expect(recovery).toHaveCount(0)
+  await page.locator(`[data-session-key="${SESSION_B}"] .sidebar-history-item`).click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SESSION_B)
+  await expectComposerValue(input, '')
+  await expect(stop).toHaveCount(0)
+  await expect(recovery).toHaveCount(0)
+  await page.locator(`[data-session-key="${SESSION_A}"] .sidebar-history-item`).click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SESSION_A)
+  await expect(answer(firstAnswer)).toBeVisible()
+  await expectComposerValue(input, draft)
+  await expect(stop).toBeVisible()
+  await expect(recovery).toHaveCount(0)
+  expect(network.aborts).toEqual([])
+  network.mark('release-second-provider')
+  await isolatedRealGateway.releaseSecondTask()
+  await expect(answer(secondAnswer)).toBeVisible({ timeout: 30_000 })
+  await expect(stop).toHaveCount(0)
+  await expect(recovery).toHaveCount(0)
+  await expectComposerValue(input, draft)
+  network.mark('second-answer-visible')
+
+  await page.locator(`[data-session-key="${SESSION_B}"] .sidebar-history-item`).click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SESSION_B)
+  await expectComposerValue(input, '')
+  await page.locator(`[data-session-key="${SESSION_A}"] .sidebar-history-item`).click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SESSION_A)
+  await expect(answer(firstAnswer)).toHaveCount(1)
+  await expect(answer(secondAnswer)).toHaveCount(1)
+  await expectComposerValue(input, draft)
+  expect(await visibleFailures(page)).toEqual([])
+  await page.reload()
+  await expect(answer(firstAnswer)).toBeVisible({ timeout: 30_000 })
+  await expect(answer(secondAnswer)).toBeVisible()
+  await expect(answer(firstAnswer)).toHaveCount(1)
+  await expect(answer(secondAnswer)).toHaveCount(1)
+  await expect(page.locator('.msg-user').filter({ hasText: firstPrompt })).toHaveCount(1)
+  await expect(page.locator('.msg-user').filter({ hasText: secondPrompt })).toHaveCount(1)
+  await expectComposerValue(input, draft)
+  await expect(send).toBeEnabled()
+  await expect(stop).toHaveCount(0)
+  await expect(recovery).toHaveCount(0)
+  network.mark('answers-and-draft-restored')
+
+  expect(network.sends.map(item => item.request.params?.sessionKey)).toEqual([SESSION_A, SESSION_A])
+  expect(network.aborts).toEqual([])
+  expect(network.receipts).toEqual([])
+  const providerCalls = await isolatedRealGateway.readProviderCalls()
+  expect(providerCalls.map(call => call.callNumber)).toEqual([1, 2])
+  expect(providerCalls[1]?.firstReplyInAssistantHistory).toBe(true)
+  expect(await visibleFailures(page)).toEqual([])
+  expect(rendererErrors).toEqual([])
+  await page.screenshot({ path: testInfo.outputPath('healthy-consecutive-turns-after-reload.png') })
+  const evidencePath = testInfo.outputPath('healthy-consecutive-turns.json')
+  await writeFile(evidencePath, JSON.stringify({ userAgent: await page.evaluate(() => navigator.userAgent),
+    sends: network.sends, aborts: network.aborts, receipts: network.receipts,
+    providerCalls, timings: network.timings }, null, 2))
+  await testInfo.attach('healthy-consecutive-turns', { path: evidencePath, contentType: 'application/json' })
+})
+
+test('healthy explicit Stop cancels only its accepted task and preserves the next draft after reload', async ({
+  page, isolatedRealGateway,
+}, testInfo) => {
+  test.setTimeout(90_000)
+  await observeVisibleFailures(page)
+  await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+  const network = observeHealthyAdmission(page)
+  const rendererErrors: string[] = []
+  page.on('pageerror', error => rendererErrors.push(error.message))
+  await page.goto(`${isolatedRealGateway.controlUrl}chat?session=${encodeURIComponent(SESSION_B)}`)
+  const input = page.locator('.chat-textarea')
+  const send = page.locator('.chat-send-btn[aria-label="Send"]')
+  const stop = page.getByRole('button', { name: 'Stop current response', exact: true })
+  const recovery = page.getByTestId('chat-delivery-recovery')
+  const prompt = 'Wait for my explicit Stop on this ordinary accepted task.'
+  const draft = 'This next draft is unsent and must survive my explicit Stop.'
+  await input.fill(prompt)
+  await expect(recovery).toHaveCount(0)
+  await expect(send).toBeEnabled()
+  await send.click()
+  await expect.poll(() => network.sends[0]?.acknowledgement?.ok).toBe(true)
+  await expect.poll(async () => (await isolatedRealGateway.readProviderCalls()).length).toBe(1)
+  await expect(stop).toBeVisible()
+  await expect(recovery).toHaveCount(0)
+  await input.fill(draft)
+  await stop.click()
+  await expect.poll(() => network.aborts.length).toBe(1)
+  await expect(stop).toHaveCount(0, { timeout: 15_000 })
+  await expectComposerValue(input, draft)
+  await expect(recovery).toHaveCount(0)
+  expect(await visibleFailures(page)).toEqual([])
+  await page.reload()
+  await expectComposerValue(input, draft)
+  await expect(page.locator('.msg-user').filter({ hasText: prompt })).toHaveCount(1)
+  await expect(stop).toHaveCount(0)
+  await expect(send).toBeEnabled()
+  await expect(recovery).toHaveCount(0)
+
+  expect(network.sends.map(item => item.request.params?.sessionKey)).toEqual([SESSION_B])
+  expect(network.aborts.map(item => item.params?.sessionKey)).toEqual([SESSION_B])
+  const accepted = network.sends[0]!.acknowledgement?.payload as Record<string, unknown>
+  expect(accepted.task_id).toEqual(expect.any(String))
+  expect(network.aborts[0]!.params?.taskId).toBe(accepted.task_id)
+  expect(network.receipts).toEqual([])
+  const providerCalls = await isolatedRealGateway.readProviderCalls()
+  expect(providerCalls.map(call => call.callNumber)).toEqual([1])
+  expect(await visibleFailures(page)).toEqual([])
+  expect(rendererErrors).toEqual([])
+  await page.screenshot({ path: testInfo.outputPath('healthy-explicit-stop-after-reload.png') })
+  const evidencePath = testInfo.outputPath('healthy-explicit-stop.json')
+  await writeFile(evidencePath, JSON.stringify({ userAgent: await page.evaluate(() => navigator.userAgent),
+    sends: network.sends, aborts: network.aborts, receipts: network.receipts,
+    providerCalls, timings: network.timings }, null, 2))
+  await testInfo.attach('healthy-explicit-stop', { path: evidencePath, contentType: 'application/json' })
+})
+
+test('late acceptance after A → B send → A preserves the task through recovery before completion', async ({
+  page, isolatedRealGateway,
+}, testInfo) => {
+  test.setTimeout(120_000)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+  const network = await interceptAdmission(page, 'hold-first-ack')
+  const rendererErrors: string[] = []
+  page.on('pageerror', error => rendererErrors.push(error.message))
+  // Both sessions are already materialized. Every transition stays on the
+  // same /chat route name, so ChatView and its pending-send owner are reused.
+  await page.goto(`${isolatedRealGateway.controlUrl}chat?session=${encodeURIComponent(SESSION_A)}`)
+  const input = page.locator('.chat-textarea')
+  const send = page.locator('.chat-send-btn[aria-label="Send"]')
+  const stop = page.getByRole('button', { name: 'Stop current response', exact: true })
+  await input.fill('Keep the first accepted session running while its acknowledgement is delayed.')
+  await expect(send).toBeEnabled()
+  await send.click()
+  await expect.poll(() => network.sends[0]?.acknowledgement?.ok).toBe(true)
+  await expect.poll(async () => (await isolatedRealGateway.readProviderCalls()).length).toBe(1)
+  const firstSession = String(network.sends[0]!.request.params?.sessionKey)
+  expect(firstSession).toBe(SESSION_A)
+
+  await page.locator(`[data-session-key="${SESSION_B}"] .sidebar-history-item`).click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SESSION_B)
+  await input.fill('Run a second session while the first response acknowledgement is delayed.')
+  await expect(send).toBeEnabled()
+  await send.click()
+  await expect.poll(() => network.sends.length).toBe(2)
+  const secondSession = String(network.sends[1]!.request.params?.sessionKey)
+  expect(secondSession).toBe(SESSION_B)
+  await expect(stop).toBeVisible()
+  await input.fill('The second session draft must survive navigation.')
+
+  const returnToA = network.checkpoint()
+  network.releaseFirstAcknowledgementOnSubscription(firstSession)
+  await page.locator(`[data-session-key="${firstSession}"] .sidebar-history-item`).click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(firstSession)
+  await expect(stop).toBeVisible()
+  // Scope this admission regression to completion after real recovery. The
+  // independently reproduced baseline history-before-done duplication during
+  // recovery is outside this test; no result/uniqueness assertion is relaxed.
+  await waitForRecoveredSession(page, network, firstSession, returnToA)
+  await isolatedRealGateway.releaseFirstTask()
+  await expect(page.locator('.msg-ai').filter({ hasText: 'Task one completed after the lifecycle checks.' }))
+    .toBeVisible({ timeout: 30_000 })
+  await expect(page.locator('.msg-ai').filter({ hasText: 'Task one completed after the lifecycle checks.' }))
+    .toHaveCount(1)
+  expect(network.aborts).toEqual([])
+  expect(network.sends).toHaveLength(2)
+  await expect(stop).toHaveCount(0)
+
+  // A shared provider may serialize its held streams; acceptance of B is
+  // sufficient for the navigation race, and B can run after A completes.
+  await expect.poll(async () => (await isolatedRealGateway.readProviderCalls()).length,
+    { timeout: 30_000 }).toBe(2)
+
+  // Explicit Stop must retain its authority after stale-ACK cancellation is removed.
+  await page.locator(`[data-session-key="${secondSession}"] .sidebar-history-item`).click()
+  await expect(stop).toBeVisible()
+  await expectComposerValue(input, 'The second session draft must survive navigation.')
+  await stop.click()
+  await expect.poll(() => network.aborts.length).toBe(1)
+  expect(network.aborts[0]!.params?.sessionKey).toBe(secondSession)
+  expect(network.aborts[0]!.params?.taskId).toBe(record(network.sends[1]!.acknowledgement?.payload).task_id)
+  await expect(stop).toHaveCount(0, { timeout: 15_000 })
+  expect((await isolatedRealGateway.readProviderCalls()).map(call => call.callNumber)).toEqual([1, 2])
+  expect(rendererErrors).toEqual([])
+  await page.screenshot({ path: testInfo.outputPath('late-ack-navigation-explicit-stop.png') })
+  const evidencePath = testInfo.outputPath('admission-network-observations.json')
+  await writeFile(evidencePath, JSON.stringify({ userAgent: await page.evaluate(() => navigator.userAgent),
+    sends: network.sends, aborts: network.aborts, recoveryReads: network.recoveryReads,
+    providerCalls: await isolatedRealGateway.readProviderCalls() }, null, 2))
+  await testInfo.attach('admission-network-observations', { path: evidencePath, contentType: 'application/json' })
+})
+
+test('a lost acceptance acknowledgement recovers by receipt before completion without false failure or duplicate execution', async ({
+  page, isolatedRealGateway,
+}, testInfo) => {
+  test.setTimeout(90_000)
+  await observeVisibleFailures(page)
+  await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+  const network = await interceptAdmission(page, 'lose-first-ack')
+  const rendererErrors: string[] = []
+  page.on('pageerror', error => rendererErrors.push(error.message))
+  await page.goto(`${isolatedRealGateway.controlUrl}chat/new`)
+  const input = page.locator('.chat-textarea')
+  const send = page.locator('.chat-send-btn[aria-label="Send"]')
+  const prompt = 'Recover this one accepted request after losing its acknowledgement.'
+  await input.fill(prompt)
+  await expect(send).toBeEnabled()
+  const beforeSend = network.checkpoint()
+  await send.click()
+  await expect.poll(() => network.sends[0]?.acknowledgement?.ok).toBe(true)
+  await expect.poll(() => network.connections()).toBeGreaterThan(1)
+  await expect.poll(() => network.receipts.length).toBeGreaterThan(0)
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Stop current response', exact: true })).toBeVisible()
+  const draft = 'Preserve my next message while the accepted request recovers.'
+  await input.fill(draft)
+  // Keep the next draft editable during unknown acceptance, then prove that
+  // receipt, ownership, canonical history and live installation have recovered
+  // before the provider completes. Completion-during-recovery is a separate,
+  // confirmed baseline defect rather than the scope of this admission test.
+  const requestSession = String(network.sends[0]!.request.params?.sessionKey)
+  await waitForRecoveredSession(page, network, requestSession, beforeSend)
+  await expectComposerValue(input, draft)
+  await isolatedRealGateway.releaseFirstTask()
+  await expect(page.locator('.msg-ai').filter({ hasText: 'Task one completed after the lifecycle checks.' }))
+    .toBeVisible({ timeout: 30_000 })
+  await expect(page.locator('.msg-ai').filter({ hasText: 'Task one completed after the lifecycle checks.' }))
+    .toHaveCount(1)
+  await expect(page.locator('.msg-user').filter({ hasText: prompt })).toHaveCount(1)
+  await expectComposerValue(input, draft)
+  await expect(send).toBeEnabled()
+  expect(network.sends).toHaveLength(1)
+  expect(network.aborts).toEqual([])
+  expect((await isolatedRealGateway.readProviderCalls()).map(call => call.callNumber)).toEqual([1])
+  expect(await visibleFailures(page)).toEqual([])
+  expect(rendererErrors).toEqual([])
+  await page.screenshot({ path: testInfo.outputPath('lost-ack-recovered-without-false-failure.png') })
+  const evidencePath = testInfo.outputPath('lost-ack-recovery.json')
+  await writeFile(evidencePath, JSON.stringify({ userAgent: await page.evaluate(() => navigator.userAgent),
+    sends: network.sends, receipts: network.receipts, recoveryReads: network.recoveryReads,
+    connections: network.connections(), failures: await visibleFailures(page),
+    providerCalls: await isolatedRealGateway.readProviderCalls() }, null, 2))
+  await testInfo.attach('lost-ack-recovery', { path: evidencePath, contentType: 'application/json' })
+})
