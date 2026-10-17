@@ -303,6 +303,129 @@ def test_duration_builder_requires_all_twenty_execution_shards(tmp_path: Path) -
         load_run_directory(tmp_path / "run-500")
 
 
+def _write_delegated_bundle_run(root: Path, run_id: int = 700) -> Path:
+    run_dir = _write_run(
+        root, run_id=run_id, sha="a" * 40, assignment_sha256="b" * 64,
+        seconds={path: 1.0 for path in FILES_BY_SHARD.values()}, partitioned=True,
+    )
+    owner_path = (run_dir / "windows-high-risk-desktop-installer-contracts-1-attempt-1"
+                  / "windows-shard-metadata.json")
+    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    bundle = DURATION_MODULE["BUNDLE_TEST_FILE"]
+    owner["delegated_case_files"] = [{
+        "path": bundle, "shards": list(DURATION_MODULE["BUNDLE_SHARDS"]),
+    }]
+    owner_path.write_text(json.dumps(owner), encoding="utf-8")
+    helper = runpy.run_path(".github/scripts/bundle_test_shards.py")
+    inventory = [f"{bundle}::test_case[{index:02d}]" for index in range(66)]
+    for part in range(1, 5):
+        directory = run_dir / f"windows-bundle-{part}"
+        directory.mkdir()
+        selected = helper["partition_nodeids"](inventory, part)
+        junit = directory / f"bundle-shard-{part}.xml"
+        report = {
+            "schema_version": 1, "shard": part, "shard_count": 4, "expected_count": 66,
+            "identity": {"GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": str(run_id),
+                         "GITHUB_RUN_ATTEMPT": "1"},
+            "runtime": owner["runtime"], "inventory": inventory,
+            "inventory_sha256": helper["inventory_digest"](inventory),
+            "selected": selected, "started": selected,
+            "phases": [
+                {"nodeid": nodeid, "when": when, "outcome": "passed"}
+                for nodeid in selected for when in ("setup", "call", "teardown")
+            ],
+            "errors": [], "pytest_exit_code": 0, "junit": junit.name,
+        }
+        junit.with_suffix(".json").write_text(json.dumps(report), encoding="utf-8")
+        suite = ET.Element("testsuite", tests=str(len(selected)), failures="0", errors="0")
+        for nodeid in selected:
+            case = ET.SubElement(
+                suite, "testcase", classname=_classname(bundle),
+                name=nodeid.split("::", 1)[1], time="2.0",
+            )
+            properties = ET.SubElement(case, "properties")
+            ET.SubElement(properties, "property", name="bundle_nodeid", value=nodeid)
+        ET.ElementTree(suite).write(junit, encoding="utf-8")
+    return run_dir
+
+
+def test_duration_builder_consumes_all_four_delegated_bundle_reports(tmp_path: Path) -> None:
+    observations = [
+        load_run_directory(_write_delegated_bundle_run(tmp_path, 700 + index))
+        for index in range(3)
+    ]
+    bundle = DURATION_MODULE["BUNDLE_TEST_FILE"]
+    assert all(len(run.node_ids) == 86 for run in observations)
+    assert all(run.file_seconds[bundle] == 132.0 for run in observations)
+    assert bundle in observations[0].files_by_shard["desktop-installer-contracts-1"]
+    payload = build_duration_payload(
+        observations, expected_assignment_sha256="b" * 64,
+        expected_partition_sha256="e" * 64,
+    )
+    assert payload["weights_seconds"][bundle] == 132.0
+    assert payload["phase_weights_seconds"][bundle] == {"parallel": 132.0, "serial": 0.0}
+    source = payload["source_runs"][0]
+    assert all(len(source[field]) == 24 for field in ("execution", "attempts", "image_versions"))
+    assert source["execution"]["bundle-1"]["workers"] == 1
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing_report", "missing_junit", "wrong_run", "wrong_attempt", "wrong_runtime",
+    "missing_runtime", "duplicate_report", "duplicate_normal_owner", "missing_delegation",
+    "partial_delegation", "wrong_delegator", "incomplete_execution", "failed_case",
+])
+def test_duration_builder_rejects_incomplete_or_incompatible_bundle_evidence(
+    tmp_path: Path, mutation: str,
+) -> None:
+    run_dir = _write_delegated_bundle_run(tmp_path)
+    owner_path = (run_dir / "windows-high-risk-desktop-installer-contracts-1-attempt-1"
+                  / "windows-shard-metadata.json")
+    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    path = run_dir / "windows-bundle-1" / "bundle-shard-1.json"
+    report = json.loads(path.read_text(encoding="utf-8"))
+    if mutation == "missing_report":
+        path.unlink()
+    elif mutation == "missing_junit":
+        path.with_suffix(".xml").unlink()
+    elif mutation == "wrong_run":
+        report["identity"]["GITHUB_RUN_ID"] = "999"
+    elif mutation == "wrong_attempt":
+        report["identity"]["GITHUB_RUN_ATTEMPT"] = "2"
+    elif mutation == "wrong_runtime":
+        report["runtime"]["python_version"] = "3.11.0"
+    elif mutation == "missing_runtime":
+        report.pop("runtime")
+    elif mutation == "duplicate_report":
+        path.with_name("bundle-shard-duplicate.json").write_text(
+            json.dumps(report), encoding="utf-8",
+        )
+    elif mutation == "duplicate_normal_owner":
+        owner["test_files"].append(DURATION_MODULE["BUNDLE_TEST_FILE"])
+        owner["test_files"].sort()
+    elif mutation == "missing_delegation":
+        owner.pop("delegated_case_files")
+    elif mutation == "partial_delegation":
+        owner["delegated_case_files"][0]["shards"].pop()
+    elif mutation == "wrong_delegator":
+        other_path = run_dir / "windows-high-risk-core-1-attempt-1" / owner_path.name
+        other = json.loads(other_path.read_text(encoding="utf-8"))
+        other["delegated_case_files"] = owner.pop("delegated_case_files")
+        other_path.write_text(json.dumps(other), encoding="utf-8")
+    elif mutation == "incomplete_execution":
+        report["started"].pop()
+    elif mutation == "failed_case":
+        report["phases"][1]["outcome"] = "failed"
+        report["pytest_exit_code"] = 1
+        junit = ET.parse(path.with_suffix(".xml"))
+        ET.SubElement(next(junit.iter("testcase")), "failure", message="test failed")
+        junit.write(path.with_suffix(".xml"), encoding="utf-8")
+    if mutation != "missing_report":
+        path.write_text(json.dumps(report), encoding="utf-8")
+    owner_path.write_text(json.dumps(owner), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_run_directory(run_dir)
+
+
 @pytest.mark.parametrize("mutation", [
     "workers", "marker_base", "legacy_and_filtered", "item_parallel_files",
 ])

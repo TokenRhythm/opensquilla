@@ -1146,6 +1146,142 @@ def test_windows_physical_metadata_binds_both_family_and_partition_snapshots(
     assert "family" not in family
 
 
+def _bundle_platform_matrix() -> list[dict[str, str]]:
+    return [
+        {"suite": "windows-high-risk", "os": "windows-latest", "shard": shard}
+        for shard in (SHARD_MODULE["BUNDLE_OWNER"], *SHARD_MODULE["BUNDLE_SHARDS"])
+    ]
+
+
+def test_bundle_delegation_is_explicit_and_preserves_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delegate = SHARD_MODULE["_delegate_bundle_files"]
+    monkeypatch.setattr(delegate.__globals__["platform"], "system", lambda: "Windows")
+    owner = SHARD_MODULE["BUNDLE_OWNER"]
+    original = validated_files_for_shard(Path.cwd(), owner)
+    bundle = SHARD_MODULE["BUNDLE_TEST_FILE"]
+    matrix = _bundle_platform_matrix()
+    # The full platform plan also contains Ubuntu and unrelated platform suites.
+    matrix.append({"suite": "python-full", "os": "ubuntu-latest", "shard": owner})
+    executed = delegate(original, owner, json.dumps(matrix))
+    assert set(original) - set(executed) == {bundle}
+    assert len(executed) == len(original) - 1
+    assert validated_files_for_shard(Path.cwd(), owner) == original
+    assert bundle in files_for_shard(Path.cwd(), owner)
+
+    metadata_path = tmp_path / "metadata.json"
+    SHARD_MODULE["_write_run_metadata"](
+        metadata_path, owner, executed, parallel_workers=2, delegate_bundle=True,
+    )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert bundle not in metadata["test_files"]
+    assert metadata["execution"]["parallel"]["item_parallel_files"] == []
+    assert metadata["delegated_case_files"] == [{
+        "path": bundle, "shards": ["bundle-1", "bundle-2", "bundle-3", "bundle-4"],
+    }]
+
+
+@pytest.mark.parametrize("mutation", [
+    "linux", "wrong_owner", "missing_file", "missing_matrix", "invalid_json",
+    "object_matrix", "missing_part", "duplicate_part", "wrong_suite", "wrong_os",
+    "extra_part", "missing_owner", "malformed_cell", "non_string_shard",
+])
+def test_bundle_delegation_rejects_incomplete_native_plan(
+    monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    delegate = SHARD_MODULE["_delegate_bundle_files"]
+    monkeypatch.setattr(
+        delegate.__globals__["platform"], "system",
+        lambda: "Linux" if mutation == "linux" else "Windows",
+    )
+    owner = SHARD_MODULE["BUNDLE_OWNER"]
+    files = (SHARD_MODULE["BUNDLE_TEST_FILE"], "tests/test_other.py")
+    matrix: Any = _bundle_platform_matrix()
+    if mutation == "wrong_owner":
+        owner = "core-1"
+    elif mutation == "missing_file":
+        files = ("tests/test_other.py",)
+    elif mutation == "object_matrix":
+        matrix = {"include": matrix}
+    elif mutation == "missing_part":
+        matrix.pop()
+    elif mutation == "duplicate_part":
+        matrix.append(dict(matrix[-1]))
+    elif mutation == "wrong_suite":
+        matrix[-1]["suite"] = "python-full"
+    elif mutation == "wrong_os":
+        matrix[-1]["os"] = "ubuntu-latest"
+    elif mutation == "extra_part":
+        matrix.append({"suite": "windows-high-risk", "os": "windows-latest", "shard": "bundle-5"})
+    elif mutation == "missing_owner":
+        matrix.pop(0)
+    elif mutation == "malformed_cell":
+        matrix[-1].pop("os")
+    elif mutation == "non_string_shard":
+        matrix[-1]["shard"] = []
+    raw = None if mutation == "missing_matrix" else json.dumps(matrix)
+    if mutation == "invalid_json":
+        raw = "{"
+    with pytest.raises(ValueError):
+        delegate(files, owner, raw)
+
+
+def test_platform_matrix_requires_explicit_bundle_delegation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = SHARD_MODULE["_run"]
+    monkeypatch.setitem(run.__globals__, "validated_files_for_shard", lambda *_: ("test.py",))
+    with pytest.raises(ValueError, match="requires --delegate-bundle"):
+        run(SimpleNamespace(
+            root=tmp_path, shard="core-1", delegate_bundle=False,
+            planned_platform_matrix=json.dumps(_bundle_platform_matrix()),
+        ))
+
+
+@pytest.mark.parametrize("delegate_bundle", [False, True])
+def test_bundle_delegation_changes_only_explicit_runner_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delegate_bundle: bool,
+) -> None:
+    run = SHARD_MODULE["_run"]
+    bundle = SHARD_MODULE["BUNDLE_TEST_FILE"]
+    files = (bundle, "tests/test_other.py")
+    for relative in files:
+        source = tmp_path / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("def test_case(): pass\n", encoding="utf-8")
+    monkeypatch.setitem(run.__globals__, "validated_files_for_shard", lambda *_: files)
+    monkeypatch.setattr(run.__globals__["platform"], "system", lambda: "Windows")
+    selections: list[tuple[str, ...]] = []
+
+    def fake_pytest(root: Path, arguments: list[str], *, phase: str) -> int:
+        argfile = Path(next(arg[1:] for arg in arguments if arg.startswith("@")))
+        selected = tuple(argfile.read_text(encoding="utf-8").splitlines())
+        selections.append(selected)
+        junit = Path(next(
+            arg.split("=", 1)[1] for arg in arguments if arg.startswith("--junitxml=")
+        ))
+        suite = ET.Element("testsuite", tests="1" if phase == "parallel" else "0")
+        if phase == "parallel":
+            ET.SubElement(suite, "testcase", classname="tests.test_other", name="test_case")
+        ET.ElementTree(suite).write(junit, encoding="utf-8")
+        return 0 if phase == "parallel" else 5
+
+    monkeypatch.setitem(run.__globals__, "_run_pytest_subprocess", fake_pytest)
+    metadata = tmp_path / "reports" / "metadata.json"
+    assert run(SimpleNamespace(
+        root=tmp_path, shard=SHARD_MODULE["BUNDLE_OWNER"], delegate_bundle=delegate_bundle,
+        planned_platform_matrix=json.dumps(_bundle_platform_matrix()) if delegate_bundle else None,
+        junit=metadata.with_name("junit.xml"), summary=metadata.with_name("summary.txt"),
+        metadata=metadata, workers=2, pytest_args=[],
+    )) == 0
+    expected = ("tests/test_other.py",) if delegate_bundle else files
+    assert selections == [expected, expected]
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert payload["test_files"] == list(expected)
+    assert bool(payload.get("delegated_case_files")) == delegate_bundle
+
+
 def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
     baseline, assignments, guardrails, overrides = assignment_governance()
     report = assignment_governance_summary(Path.cwd())

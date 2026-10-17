@@ -34,6 +34,8 @@ JOB_RESULT_LABELS: Final[dict[str, str]] = {
     "RESULT_UBUNTU_FULL": "Ubuntu full test matrix",
     "RESULT_PYTHON_STRESS": "Python capacity and soak tests",
     "RESULT_WINDOWS_FULL": "Windows high-risk matrix",
+    "RESULT_WINDOWS_BUNDLE": "Windows bundle test matrix",
+    "RESULT_WINDOWS_BUNDLE_COVERAGE": "Windows bundle exact-once coverage",
     "RESULT_MACOS_RECOVERY": "macOS profile recovery and native no-replace tests",
     "RESULT_DESKTOP_RECOVERY_E2E": "Desktop recovery E2E matrix",
     "RESULT_DESKTOP_NATIVE": "Desktop native platform probes",
@@ -99,10 +101,45 @@ SUITE_RESULT_REQUIREMENTS: Final[dict[str, tuple[str, ...]]] = {
     "webui-capacity": ("RESULT_WEBUI_CAPACITY",),
     "webui-chat-recovery": ("RESULT_WEBUI_CHAT_RECOVERY",),
     "wheel-webui-roundtrip": ("RESULT_WHEEL_WEBUI",),
-    "windows-high-risk": ("RESULT_WINDOWS_FULL",),
+    "windows-high-risk": (
+        "RESULT_WINDOWS_FULL", "RESULT_WINDOWS_BUNDLE", "RESULT_WINDOWS_BUNDLE_COVERAGE",
+    ),
     "windows-nsis-regression": ("RESULT_WINDOWS_NSIS",),
     "workflow-lint": ("RESULT_WORKFLOW_LINT",),
 }
+
+WINDOWS_BUNDLE_RESULTS: Final[frozenset[str]] = frozenset(
+    {"RESULT_WINDOWS_BUNDLE", "RESULT_WINDOWS_BUNDLE_COVERAGE"}
+)
+WINDOWS_PHYSICAL_SHARDS: Final[frozenset[str]] = frozenset(
+    f"{family}-{partition}"
+    for family in ("core", "gateway-sqlite", "recovery-migration", "desktop-installer-contracts")
+    for partition in range(1, 9 if family == "gateway-sqlite" else 5)
+)
+
+
+def _windows_bundle_required(env: Mapping[str, str], errors: list[str]) -> bool:
+    """Validate the physical owner plan before accepting delegated coverage."""
+
+    try:
+        matrix = json.loads(env.get("PLANNED_PYTHON_MATRIX", ""))
+        if not isinstance(matrix, dict) or set(matrix) != {"ubuntu", "windows"}:
+            raise ValueError("missing Python matrix keys")
+        windows = matrix["windows"]
+        if (
+            not isinstance(windows, list)
+            or not windows
+            or any(not isinstance(shard, str) for shard in windows)
+            or len(windows) != len(set(windows))
+            or not set(windows) <= WINDOWS_PHYSICAL_SHARDS
+        ):
+            raise ValueError("invalid Windows physical shards")
+    except (ValueError, TypeError):
+        errors.append("Planned Python Windows matrix is missing, malformed, or incomplete.")
+        # Preserve mandatory results on invalid input; no missing plan may
+        # authorize skipping either the test matrix or its exact-once proof.
+        return True
+    return "desktop-installer-contracts-1" in windows
 
 
 def _require_exact_result(
@@ -195,6 +232,8 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
         for suite in required_suites & KNOWN_SUITES
         for variable in SUITE_RESULT_REQUIREMENTS.get(suite, ())
     }
+    if "windows-high-risk" in required_suites and not _windows_bundle_required(env, errors):
+        required_results.difference_update(WINDOWS_BUNDLE_RESULTS)
     for variable, label in JOB_RESULT_LABELS.items():
         _require_exact_result(
             env,

@@ -269,6 +269,35 @@ Cached API snapshots, logs, JUnit artifacts and generated comparisons are under
 `.cache/ci-timing/round3/` and `.cache/ci-timing/round3-comparison/`. The experiment
 remains on its integration branch and is not merged into `main`.
 
+### Fourth experiment: four independent Windows bundle runners
+
+The 66 audited bundle cases now run on four independent `windows-latest` jobs,
+directly after planning, with one serial pytest process per runner. Sorting the
+complete nodeid inventory and selecting ordinal modulo four produces partitions
+of 17 / 17 / 16 / 16. The original Windows owner delegates only this file when
+the plan contains all four dedicated execution cells. Ubuntu retains its
+existing execution policy. The test file, collectors and assertions are unchanged.
+
+Every partition records the complete inventory, selected cases, pytest starts,
+setup/call/teardown outcomes, JUnit nodeids and source/run/attempt identity. A
+required coverage job verifies matching inventories and exactly-once execution
+of all 66 cases; missing reports, duplicate execution, skips and interrupted
+execution fail this check. Test failures retain their failing exit status and
+are independently required by `CI result`. The planner, attestation matrix and
+Windows duration collector include the four new execution cells. Duration
+collection preserves the original logical file owner and validates all four
+runner reports before accepting observations.
+
+Reports are bound to one attempt. Use a full rerun when repeating this
+experiment: rerunning only failed jobs cannot reuse successful siblings'
+earlier-attempt reports and will fail the coverage check.
+
+Local native Windows execution passed all four original partitions with no
+missing, duplicate or skipped cases. The common inventory SHA256 is
+`6535ae7967674409913f926191f538106e70ad2a937cc6dcb0eec187f7177c9f`.
+Remote first-attempt timing is compared with run `39011651281` (16:47), using
+run creation through the last executed job's completion, irrespective of failures.
+
 ## Test cost and ownership
 
 The ordinary offline suite excludes `stress`. The required `python-stress` suite

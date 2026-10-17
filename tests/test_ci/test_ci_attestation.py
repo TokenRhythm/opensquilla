@@ -608,6 +608,7 @@ def test_validate_candidate_rejects_non_green_or_mismatched_runs(tmp_path: Path)
         ("execution-digest", "execution digest"),
         ("platform-matrix", "platform matrix"),
         ("legacy-windows-matrix", "platform matrix"),
+        ("missing-windows-bundle-cell", "platform matrix"),
         ("missing-contract-comparison", "platform matrix"),
     ),
 )
@@ -658,6 +659,12 @@ def test_validate_candidate_rejects_independent_evidence_contract_mismatches(
         tampered["platform_matrix"] = sorted(
             cells, key=lambda cell: (cell["suite"], cell["os"], cell["shard"])
         )
+    elif mismatch == "missing-windows-bundle-cell":
+        omitted = {
+            "suite": "windows-high-risk", "os": "windows-latest", "shard": "bundle-4",
+        }
+        assert omitted in tampered["platform_matrix"]
+        tampered["platform_matrix"].remove(omitted)
     elif mismatch == "missing-contract-comparison":
         tampered["platform_matrix"] = [
             cell for cell in tampered["platform_matrix"]

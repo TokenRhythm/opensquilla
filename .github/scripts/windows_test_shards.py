@@ -48,6 +48,9 @@ DEFAULT_PARALLEL_WORKERS: Final[int] = 4
 ITEM_PARALLEL_FILES: Final[frozenset[str]] = frozenset(
     {"tests/test_observability/test_bundle.py"}
 )
+BUNDLE_TEST_FILE: Final[str] = "tests/test_observability/test_bundle.py"
+BUNDLE_OWNER: Final[str] = "desktop-installer-contracts-1"
+BUNDLE_SHARDS: Final[tuple[str, ...]] = tuple(f"bundle-{part}" for part in range(1, 5))
 _CORE_WHEEL_FIXTURE: Final[str] = "isolated_core_wheel"
 _CORE_WHEEL_ENV: Final[str] = "OPENSQUILLA_TEST_CORE_WHEEL"
 _CORE_WHEEL_SHA_ENV: Final[str] = "OPENSQUILLA_TEST_CORE_WHEEL_SHA256"
@@ -650,6 +653,42 @@ def _inventory_fingerprint(files: tuple[str, ...]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _delegate_bundle_files(
+    files: tuple[str, ...], shard: str, planned_platform_matrix: str | None,
+) -> tuple[str, ...]:
+    """Exclude bundle only after verifying its four native Windows owners."""
+
+    if platform.system() != "Windows":
+        raise ValueError("--delegate-bundle requires native Windows")
+    if shard != BUNDLE_OWNER or BUNDLE_TEST_FILE not in files:
+        raise ValueError(f"--delegate-bundle requires the bundle owner {BUNDLE_OWNER}")
+    try:
+        planned = json.loads(planned_platform_matrix or "null")
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid --planned-platform-matrix JSON") from exc
+    if not isinstance(planned, list) or not planned:
+        raise ValueError("--delegate-bundle requires a planned platform matrix list")
+    cells: list[tuple[str, str, str]] = []
+    for cell in planned:
+        if not isinstance(cell, dict) or any(
+            not isinstance(cell.get(key), str) or not cell[key].strip()
+            for key in ("suite", "os", "shard")
+        ):
+            raise ValueError("malformed planned platform matrix cell")
+        cells.append((cell["suite"], cell["os"], cell["shard"]))
+    if len(cells) != len(set(cells)):
+        raise ValueError("duplicate planned platform matrix cell")
+    expected = {("windows-high-risk", "windows-latest", part) for part in BUNDLE_SHARDS}
+    actual = {cell for cell in cells if cell[2].startswith("bundle-")}
+    owner = ("windows-high-risk", "windows-latest", BUNDLE_OWNER)
+    if actual != expected or owner not in cells:
+        raise ValueError(
+            "bundle delegation requires the Windows owner and exactly bundle-1..4 "
+            "in windows-high-risk on windows-latest"
+        )
+    return tuple(path for path in files if path != BUNDLE_TEST_FILE)
+
+
 def _write_run_metadata(
     path: Path,
     shard: str,
@@ -657,6 +696,7 @@ def _write_run_metadata(
     *,
     parallel_workers: int,
     marker_expression: str | None = None,
+    delegate_bundle: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -692,6 +732,10 @@ def _write_run_metadata(
     if shard in WINDOWS_SHARD_NAMES:
         payload["family"] = shard_family(shard)
         payload["partition_sha256"] = partition_snapshot_fingerprint()
+    if delegate_bundle:
+        payload["delegated_case_files"] = [
+            {"path": BUNDLE_TEST_FILE, "shards": list(BUNDLE_SHARDS)}
+        ]
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -1073,6 +1117,12 @@ def _run(args: argparse.Namespace) -> int:
 
     root = args.root.resolve()
     files = validated_files_for_shard(root, args.shard)
+    delegate_bundle = getattr(args, "delegate_bundle", False)
+    planned_platform_matrix = getattr(args, "planned_platform_matrix", None)
+    if delegate_bundle:
+        files = _delegate_bundle_files(files, args.shard, planned_platform_matrix)
+    elif planned_platform_matrix is not None:
+        raise ValueError("--planned-platform-matrix requires --delegate-bundle")
     args.junit.parent.mkdir(parents=True, exist_ok=True)
     args.summary.parent.mkdir(parents=True, exist_ok=True)
     args.summary.write_text("pytest_status=started\n", encoding="utf-8")
@@ -1084,6 +1134,7 @@ def _run(args: argparse.Namespace) -> int:
             files,
             parallel_workers=args.workers,
             marker_expression=marker_expression,
+            delegate_bundle=delegate_bundle,
         )
     if not files:
         error = ValueError(f"Windows shard {args.shard!r} has no tests")
@@ -1282,6 +1333,14 @@ def _parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--junit", type=Path, required=True)
     run_parser.add_argument("--summary", type=Path, required=True)
     run_parser.add_argument("--metadata", type=Path)
+    run_parser.add_argument(
+        "--delegate-bundle", action="store_true",
+        help="delegate bundle cases to four explicitly planned native Windows jobs",
+    )
+    run_parser.add_argument(
+        "--planned-platform-matrix",
+        help="JSON platform matrix proving all four delegated bundle jobs are required",
+    )
     run_parser.add_argument(
         "--workers",
         type=_positive_int,

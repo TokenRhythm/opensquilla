@@ -1863,6 +1863,8 @@ jobs:
 
       - name: Test Windows shard
         shell: bash
+        env:
+          PLANNED_PLATFORM_MATRIX: ${{ needs.plan-ci.outputs.platform_matrix }}
         run: |
           set -euo pipefail
           markers="not stress and not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
@@ -1873,6 +1875,10 @@ jobs:
 
           shard="${{ matrix.shard }}"
           family="${shard%-*}"
+          delegate_args=()
+          if [[ "${shard}" == "desktop-installer-contracts-1" ]]; then
+            delegate_args+=(--delegate-bundle --planned-platform-matrix "${PLANNED_PLATFORM_MATRIX}")
+          fi
           worker_args=()
           if [[ "${family}" == "recovery-migration" ||
                 "${family}" == "gateway-sqlite" ||
@@ -1896,6 +1902,7 @@ jobs:
             --summary "${CI_REPORT_DIR}/first-failure.txt" \
             --metadata "${CI_REPORT_DIR}/windows-shard-metadata.json" \
             "${worker_args[@]}" \
+            "${delegate_args[@]}" \
             -- \
             -vv --tb=short -o faulthandler_timeout=0 \
             -m "${markers}" \
@@ -1940,6 +1947,121 @@ jobs:
         if: ${{ !cancelled() && steps.windows-report.outcome == 'failure' }}
         shell: bash
         run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
+
+  windows-bundle:
+    name: Windows bundle (${{ matrix.shard }}/4)
+    needs: plan-ci
+    if: >-
+      ${{ !cancelled() && needs.plan-ci.result == 'success'
+          && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'windows-high-risk')
+          && contains(fromJSON(needs.plan-ci.outputs.python_matrix).windows, 'desktop-installer-contracts-1') }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      UV_PYTHON: "3.12"
+      PYTHONPATH: ${{ github.workspace }}
+      OPENSQUILLA_TURN_CALL_LOG: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          persist-credentials: false
+      - name: Configure runtime directories
+        shell: bash
+        run: |
+          printf 'OPENSQUILLA_STATE_DIR=%s/opensquilla-state\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'OPENSQUILLA_LOG_DIR=%s/opensquilla-logs\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.3'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        shell: bash
+        run: uv sync --extra dev --extra recommended --extra mcp --frozen
+      - name: Test bundle partition
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bundle-report"
+          uv run python .github/scripts/bundle_test_shards.py run \
+            --shard "${{ matrix.shard }}" \
+            --output-dir "${RUNNER_TEMP}/bundle-report" \
+            2>&1 | tee "${RUNNER_TEMP}/bundle-report/pytest.log"
+      - name: Upload required bundle report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bundle-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/bundle-report/*.json
+            ${{ runner.temp }}/bundle-report/*.xml
+            ${{ runner.temp }}/bundle-report/pytest.log
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-bundle-coverage:
+    name: Windows bundle coverage
+    needs: [plan-ci, windows-bundle]
+    if: >-
+      ${{ !cancelled() && needs.plan-ci.result == 'success'
+          && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'windows-high-risk')
+          && contains(fromJSON(needs.plan-ci.outputs.python_matrix).windows, 'desktop-installer-contracts-1') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download bundle partition 1
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-bundle-1-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bundle-reports/1
+      - name: Download bundle partition 2
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-bundle-2-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bundle-reports/2
+      - name: Download bundle partition 3
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-bundle-3-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bundle-reports/3
+      - name: Download bundle partition 4
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-bundle-4-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bundle-reports/4
+      - name: Verify all bundle cases execute exactly once
+        if: ${{ !cancelled() }}
+        run: >-
+          python .github/scripts/bundle_test_shards.py verify
+          --reports-dir "${{ runner.temp }}/bundle-reports"
+          --output "${{ runner.temp }}/bundle-coverage.json"
+      - name: Upload bundle coverage proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bundle-coverage-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bundle-coverage.json
+          if-no-files-found: error
+          retention-days: 14
 
   macos-recovery:
     name: macOS profile recovery and native no-replace (3.12)
@@ -3029,6 +3151,8 @@ jobs:
       - ubuntu-full
       - python-stress
       - windows-full
+      - windows-bundle
+      - windows-bundle-coverage
       - macos-recovery
       - desktop-recovery-e2e
       - desktop-native-probes
@@ -3142,6 +3266,9 @@ jobs:
           RESULT_UBUNTU_FULL: ${{ needs.ubuntu-full.result }}
           RESULT_PYTHON_STRESS: ${{ needs.python-stress.result }}
           RESULT_WINDOWS_FULL: ${{ needs.windows-full.result }}
+          RESULT_WINDOWS_BUNDLE: ${{ needs.windows-bundle.result }}
+          RESULT_WINDOWS_BUNDLE_COVERAGE: ${{ needs.windows-bundle-coverage.result }}
+          PLANNED_PYTHON_MATRIX: ${{ needs.plan-ci.outputs.python_matrix }}
           RESULT_MACOS_RECOVERY: ${{ needs.macos-recovery.result }}
           RESULT_DESKTOP_RECOVERY_E2E: ${{ needs.desktop-recovery-e2e.result }}
           RESULT_DESKTOP_NATIVE: ${{ needs.desktop-native-probes.result }}

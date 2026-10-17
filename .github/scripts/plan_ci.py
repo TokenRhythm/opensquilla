@@ -1698,6 +1698,11 @@ def _execution_matrices(
             ("windows-high-risk", "windows-latest", shard)
             for shard in python_matrix["windows"]
         )
+        if "desktop-installer-contracts-1" in python_matrix["windows"]:
+            cells.update(
+                ("windows-high-risk", "windows-latest", f"bundle-{partition}")
+                for partition in range(1, 5)
+            )
     missing = sorted(
         suites
         - set(_FIXED_PLATFORM_MATRIX)

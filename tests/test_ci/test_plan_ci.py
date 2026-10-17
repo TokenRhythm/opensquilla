@@ -579,8 +579,49 @@ def test_windows_family_request_expands_only_its_physical_cells(
     assert python == {"ubuntu": [], "windows": expected}
     assert platforms == [
         {"suite": "windows-high-risk", "os": "windows-latest", "shard": shard}
-        for shard in expected
+        for shard in sorted(expected + (
+            ["bundle-1", "bundle-2", "bundle-3", "bundle-4"]
+            if family == "desktop-installer-contracts" else []
+        ))
     ]
+
+
+@pytest.mark.parametrize("shards,expected_bundle", [
+    ({"desktop-installer-contracts-1"}, {"bundle-1", "bundle-2", "bundle-3", "bundle-4"}),
+    ({"core-1", "desktop-installer-contracts-1"},
+     {"bundle-1", "bundle-2", "bundle-3", "bundle-4"}),
+    ({"desktop-installer-contracts-2"}, set()),
+    ({"core-1", "gateway-sqlite-1"}, set()),
+])
+def test_windows_bundle_cells_follow_the_exact_physical_owner(
+    suite_config: dict[str, Any], shards: set[str], expected_bundle: set[str],
+) -> None:
+    python, platforms = MODULE["_execution_matrices"](
+        ["windows-high-risk"], set(), shards, False, suite_config,
+    )
+    assert python == {"ubuntu": [], "windows": sorted(shards)}
+    assert platforms == [
+        {"suite": "windows-high-risk", "os": "windows-latest", "shard": shard}
+        for shard in sorted(shards | expected_bundle)
+    ]
+
+
+def test_bundle_only_change_selects_owner_and_all_four_windows_consumers(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    path = "tests/test_observability/test_bundle.py"
+    _write_test_module(tmp_path, path)
+    plan = plan_changes([path], repo=tmp_path, config=suite_config)
+    assert plan["full_fallback"] is False
+    assert plan["python_targets"] == [path]
+    assert plan["python_matrix"] == {
+        "ubuntu": [], "windows": ["desktop-installer-contracts-1"],
+    }
+    assert _platform_cells(plan, "windows-high-risk") == {
+        ("windows-latest", "desktop-installer-contracts-1"),
+        ("windows-latest", "bundle-1"), ("windows-latest", "bundle-2"),
+        ("windows-latest", "bundle-3"), ("windows-latest", "bundle-4"),
+    }
 
 
 def test_windows_partition_fallback_matches_execution_selector(
@@ -1551,7 +1592,7 @@ def test_high_risk_changes_fail_closed_to_full_plan(
     assert _platform_cells(plan, "windows-high-risk") == {
         ("windows-latest", shard)
         for shard in suite_config["full_python_matrix"]["windows"]
-    }
+    } | {("windows-latest", f"bundle-{partition}") for partition in range(1, 5)}
     assert reason in plan["reason_codes"]
 
 

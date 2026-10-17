@@ -144,7 +144,7 @@ def test_required_artifact_downloads_share_a_bounded_hard_gate() -> None:
     assert "sleep" not in json.dumps(action)
     # Early upgrade consumers now use the identity-bound wait helper; the two
     # remaining NSIS composite downloads retain the original transfer gate.
-    for workflow, count in [("ci.yml", 8), ("windows-nsis-upgrade-regression.yml", 2)]:
+    for workflow, count in [("ci.yml", 12), ("windows-nsis-upgrade-regression.yml", 2)]:
         steps = [s for j in _workflow(workflow)["jobs"].values() for s in j.get("steps", [])]
         downloads = [s for s in steps
                      if s.get("uses") == "./.github/actions/download-required-artifact"]
@@ -1751,6 +1751,59 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "'managed-toolchain'" in artifact_e2e["if"]
 
 
+def test_windows_bundle_runs_on_four_independent_runners_with_required_coverage() -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    bundle = jobs["windows-bundle"]
+    proof = jobs["windows-bundle-coverage"]
+    assert bundle["needs"] == "plan-ci"
+    assert bundle["runs-on"] == "windows-latest"
+    assert bundle["strategy"] == {"fail-fast": False, "matrix": {"shard": [1, 2, 3, 4]}}
+    for job in (bundle, proof):
+        assert "'windows-high-risk'" in job["if"]
+        assert "fromJSON(needs.plan-ci.outputs.python_matrix).windows" in job["if"]
+        assert "'desktop-installer-contracts-1'" in job["if"]
+        assert "!cancelled()" in job["if"]
+        assert not job.get("continue-on-error")
+        assert all(not step.get("continue-on-error") for step in job["steps"])
+    run = next(step["run"] for step in bundle["steps"]
+               if step.get("name") == "Test bundle partition")
+    assert "bundle_test_shards.py run" in run
+    assert '--shard "${{ matrix.shard }}"' in run
+    assert "--maxfail" not in run
+    assert "set -euo pipefail" in run
+    upload = next(step for step in bundle["steps"]
+                  if step.get("uses") == "actions/upload-artifact@v4")
+    assert upload["if"] == "${{ always() }}"
+    assert upload["with"]["if-no-files-found"] == "error"
+    assert proof["needs"] == ["plan-ci", "windows-bundle"]
+    assert proof["runs-on"] == "ubuntu-latest"
+    transfers = [step["with"]["name"] for step in proof["steps"]
+                 if step.get("uses") == "./.github/actions/download-required-artifact"]
+    assert transfers == [f"windows-bundle-{index}-attempt-${{{{ github.run_attempt }}}}"
+                         for index in range(1, 5)]
+    assert any("bundle_test_shards.py verify" in step.get("run", "")
+               for step in proof["steps"])
+    main_step = next(step for step in jobs["windows-full"]["steps"]
+                     if step.get("name") == "Test Windows shard")
+    assert main_step["env"]["PLANNED_PLATFORM_MATRIX"] == (
+        "${{ needs.plan-ci.outputs.platform_matrix }}"
+    )
+    assert 'if [[ "${shard}" == "desktop-installer-contracts-1" ]]' in main_step["run"]
+    assert '--delegate-bundle --planned-platform-matrix "${PLANNED_PLATFORM_MATRIX}"' in (
+        main_step["run"]
+    )
+    assert "delegate-bundle" not in json.dumps(jobs["ubuntu-full"])
+    gate = next(step for step in jobs["ci-result"]["steps"]
+                if step.get("name") == "Check required CI results")
+    for variable, job in (
+        ("RESULT_WINDOWS_BUNDLE", "windows-bundle"),
+        ("RESULT_WINDOWS_BUNDLE_COVERAGE", "windows-bundle-coverage"),
+    ):
+        assert job in jobs["ci-result"]["needs"]
+        assert gate["env"][variable] == "${{ needs." + job + ".result }}"
+    assert gate["env"]["PLANNED_PYTHON_MATRIX"] == "${{ needs.plan-ci.outputs.python_matrix }}"
+
+
 def test_gateway_contract_hashes_are_compared_between_linux_and_windows() -> None:
     jobs = _workflow("ci.yml")["jobs"]
     linux_steps = jobs["gateway-contract-linux"]["steps"]
@@ -1897,6 +1950,8 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "ubuntu-full",
         "python-stress",
         "windows-full",
+        "windows-bundle",
+        "windows-bundle-coverage",
         "macos-recovery",
         "desktop-recovery-e2e",
         "desktop-native-probes",
@@ -1964,6 +2019,9 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "RESULT_UBUNTU_FULL",
         "RESULT_PYTHON_STRESS",
         "RESULT_WINDOWS_FULL",
+        "RESULT_WINDOWS_BUNDLE",
+        "RESULT_WINDOWS_BUNDLE_COVERAGE",
+        "PLANNED_PYTHON_MATRIX",
         "RESULT_MACOS_RECOVERY",
         "RESULT_DESKTOP_RECOVERY_E2E",
         "RESULT_DESKTOP_NATIVE",
