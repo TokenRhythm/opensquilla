@@ -596,14 +596,15 @@ comparisons are saved under `.cache/ci-timing/round6/` and
 ### Seventh experiment: repeated baseline and NSIS build overlap
 
 The control revision is `647816f3a51d6878a00fd88af672b72964782b44`, including
-the sixth experiment's explicit Windows-platform fixture correction. Collect
-three independent full `workflow_dispatch` runs at that revision before
-pushing the candidate. Run the three candidate samples sequentially at one
-fixed candidate revision as well: the branch concurrency policy cancels an
-older overlapping dispatch. Preserve first-attempt failures and compare the
-median and range, not just the fastest sample. Record overall CI, candidate
-availability, NSIS build phases and the acceptance tail separately, because
-another Windows test partition can determine the final completion time.
+the sixth experiment's explicit Windows-platform fixture correction. Three
+independent full `workflow_dispatch` runs completed at that revision before
+the candidate was pushed. After two exploratory pilots, three final samples
+ran at `dbf2a87a4f8cf0750c22858575a623ae5f745c2d`. All runs were sequential,
+first attempts: the branch concurrency policy cancels an older overlapping
+dispatch. Preserve failures and compare the median and range, not just the
+fastest sample. Overall CI, candidate availability, NSIS build phases and the
+acceptance tail are separate measurements because another Windows partition
+can determine the final completion time.
 
 The candidate preserves PyInstaller's clean build, hidden imports, collected
 data, source provenance and all frozen-package checks. Fresh hosted runners
@@ -655,8 +656,104 @@ failed in both Ubuntu and Windows core-4 cells; all jobs remained selected.
 The final revision declares both the wrapper and its contract script. These
 pilot failures are not attributed to runner noise or counted as successful
 CI. Remote build logs, exact executed-job inventories and all six baseline/
-final run identities are required for the final comparison; do not infer an
-overall speedup from package-verification overlap alone.
+final run identities are retained for the final comparison; package-verification
+overlap alone does not establish an overall speedup.
+
+#### Measured three-run comparison
+
+The six measured runs completed on 2026-10-17. Wall time is workflow creation
+through the last completed job, including both result gates. Candidate readiness
+is the successful build job's completion, consistently on both sides. The tail
+ends at the last NSIS acceptance job, before aggregation. The two pilots,
+[39026009116](https://github.com/TokenRhythm/opensquilla/actions/runs/39026009116)
+(12:57) and
+[39026858454](https://github.com/TokenRhythm/opensquilla/actions/runs/39026858454)
+(12:36), remain separate and do not enter the final median.
+Each metric is summarized independently; median stage durations are not
+additive and cannot reconstruct the median wall time.
+
+| Sample | Full CI | NSIS build | Candidate ready | Acceptance tail | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| [Baseline 1](https://github.com/TokenRhythm/opensquilla/actions/runs/39023086585) | 13:51 | 5:13 | +6:19 | 4:29 | Success |
+| [Baseline 2](https://github.com/TokenRhythm/opensquilla/actions/runs/39024029276) | 13:38 | 8:21 | +9:26 | 3:43 | Failure |
+| [Baseline 3](https://github.com/TokenRhythm/opensquilla/actions/runs/39024945736) | 13:58 | 8:04 | +9:19 | 4:13 | Success |
+| [Final 1](https://github.com/TokenRhythm/opensquilla/actions/runs/39027814952) | 13:44 | 7:14 | +8:19 | 5:03 | Success |
+| [Final 2](https://github.com/TokenRhythm/opensquilla/actions/runs/39028735868) | 13:24 | 7:18 | +8:26 | 4:30 | Success |
+| [Final 3](https://github.com/TokenRhythm/opensquilla/actions/runs/39029656442) | 13:20 | 7:26 | +8:34 | 4:21 | Failure |
+
+| Median metric | Baseline | Final | Observed difference |
+| --- | ---: | ---: | ---: |
+| Full CI | 13:51 | 13:24 | 27 s shorter (3.2%) |
+| Full CI range | 13:38-13:58 | 13:20-13:44 | Ranges overlap |
+| NSIS build job | 8:04 | 7:18 | 46 s shorter (9.5%) |
+| Candidate ready | +9:19 | +8:26 | 53 s earlier |
+| Acceptance after candidate | 4:13 | 4:30 | 17 s longer |
+| PyInstaller log interval | 188.886 s | 191.481 s | 2.595 s longer |
+| NSIS target to blockmap log interval | 112.084 s | 120.937 s | 8.853 s longer |
+| Package verification log interval | 44.241 s | 61.210 s | 16.969 s longer, now overlapped |
+| Artifact upload step | 12 s | 4 s | 8 s shorter |
+| Summed runner time | 553:06 | 537:11 | 15:55 shorter (2.9%) |
+
+The outer transfer ZIP's median size rises from 351,853,112 to 357,450,248
+bytes (1.6%). Installer compression settings remain unchanged; this is the
+transfer-size tradeoff for removing the second compression pass.
+
+The three proofs record 58.480, 61.532 and 62.277 seconds of actual verification
+overlap. Every proof binds source/workflow SHA, run and attempt; calls the
+boundary and verifier exactly once; reports both branches successful; and
+matches all fourteen before/after critical hashes. These measured overlaps are
+not counterfactual net savings: the concurrent verifier itself takes longer,
+NSIS generation varies, and setup/upload costs also change. PyInstaller was
+not accelerated. Its first final run spent approximately 160 of 189 seconds
+between Analysis and PYZ, versus about seven seconds creating PYZ. Removing
+clean-build or dependency coverage is not justified by these measurements.
+
+With the retained scheduling change and outer ZIP setting, the measured build
+median is 46 seconds lower, but full CI improves by only 27 seconds. All three
+final runs end on `startup-compat-desktop`, at +13:22, +12:56 and +12:55 before
+result gates.
+Its job takes 301, 268 and 258 seconds, versus a baseline median of 251 seconds.
+In final 1, the extra time is concentrated in checkout, Node/npm cache setup,
+and the installation/installed-identity interval; its seven Electron cases
+take less time than the baseline median. Cache hits were present, and the logs
+do not establish a runner-resource root cause. A later experiment could move
+candidate-probe harness preparation before candidate availability, retaining
+the exact-candidate wait and installation/check ordering. This was not changed
+within the fixed-revision three-run sample.
+
+All six executed-job name multisets are identical: 146 executed jobs and the
+same two planned conditional skips. All 28 NSIS jobs succeed in every run.
+The workflow's job owners, matrices, dependencies and selection conditions are
+unchanged. Existing package-verification commands and the PyInstaller argument
+array are intact; sixteen wrapper contracts add coverage. The comparison
+requires all API pages, distinct first-attempt runs, one SHA per group and all
+three valid final build proofs. Job identity alone is not proof that every test
+inside a failed job completed, so the final failures were checked separately.
+
+Baseline 2 retains the Windows core-2 capture-lease assertion failure and the
+Gateway-3 wrong-task settlement timeout. Final 3 retains two failures and the
+result gate's failure: core-4's image DNS timeout case observes an already-ended
+task at its `assert not task.done()` check; Gateway-2's natural terminal-exit
+test times out waiting eight seconds for its reader. The affected source/tests
+are unchanged by this experiment. Against successful final 2, the failed jobs'
+JUnit identity multisets match exactly: core-4 parallel 2,872 cases plus 38
+serial cases, Gateway-2 parallel 1,973 plus 20 serial cases. Both phases finish
+without early termination; only one outcome in each parallel phase changes to
+failure. The trust-policy closure test passes. No failure was retried, skipped,
+given a longer deadline or replaced by a faster sample.
+
+Both groups have two successful runs and one failed run. Three samples show a
+modest observed median improvement, not a long-term guarantee of 27 seconds
+saved per run or a stable minute of end-to-end savings. Baseline 1's much faster
+build remains in the data; its unrelated Windows recovery partition determines
+the overall finish. No account concurrency-limit test was performed.
+
+Raw API snapshots, build/failure logs, JUnit comparisons, proof records and
+phase summaries are retained under `.cache/ci-timing/round7-baseline/`,
+`.cache/ci-timing/round7-candidate/`, `.cache/ci-timing/round7-final/` and
+`.cache/ci-timing/round7-final-comparison/`. The measured code SHA is `dbf2a87`;
+the later report-only commit does not change that measured implementation.
+No merge into `main` was performed.
 
 ## Test cost and ownership
 
