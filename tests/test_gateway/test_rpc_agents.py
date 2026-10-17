@@ -12,8 +12,84 @@ class _FailingModelSelector:
         raise RuntimeError("provider unavailable")
 
 
-def _ctx(config: GatewayConfig, registry: AgentRegistry) -> RpcContext:
+def _ctx(config: GatewayConfig, registry: AgentRegistry | None) -> RpcContext:
     return RpcContext(conn_id="test", config=config, agent_registry=registry)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_enabled", [False, True])
+async def test_agent_file_rpc_reads_do_not_create_missing_workspace(tmp_path, registry_enabled):
+    workspace = tmp_path / "missing" / "workspace"
+    cfg = GatewayConfig(workspace_dir=str(workspace))
+    registry = AgentRegistry(cfg, persist_changes=False) if registry_enabled else None
+    ctx = _ctx(cfg, registry)
+    dispatcher = get_dispatcher()
+
+    listed = await dispatcher.dispatch("list", "agents.files.list", {"agentId": "main"}, ctx)
+    read = await dispatcher.dispatch(
+        "read", "agents.files.get", {"agentId": "main", "name": "AGENTS.md"}, ctx,
+    )
+
+    assert listed.error is None
+    assert listed.payload["files"]
+    assert all(item["status"] == "missing" for item in listed.payload["files"])
+    assert read.error is not None
+    assert not workspace.parent.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_enabled", [False, True])
+@pytest.mark.parametrize("agents_content", [b"", b"# Project rules\r\nKeep existing rules.\r\n"])
+async def test_agent_file_rpc_reads_preserve_workspace(tmp_path, registry_enabled, agents_content):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    originals = {"AGENTS.md": agents_content, "custom.txt": b"User content\x00"}
+    for name, content in originals.items():
+        (workspace / name).write_bytes(content)
+    cfg = GatewayConfig(workspace_dir=str(workspace))
+    registry = AgentRegistry(cfg, persist_changes=False) if registry_enabled else None
+    ctx = _ctx(cfg, registry)
+    dispatcher = get_dispatcher()
+
+    listed = await dispatcher.dispatch("list", "agents.files.list", {"agentId": "main"}, ctx)
+    read = await dispatcher.dispatch(
+        "read", "agents.files.get", {"agentId": "main", "name": "AGENTS.md"}, ctx,
+    )
+
+    assert listed.error is None
+    entries = {item["name"]: item for item in listed.payload["files"]}
+    assert entries["AGENTS.md"]["status"] == "present"
+    assert entries["SOUL.md"]["status"] == "missing"
+    assert read.error is None
+    assert read.payload["content"] == agents_content.decode().replace("\r\n", "\n")
+    assert {path.name: path.read_bytes() for path in workspace.iterdir()} == originals
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_enabled", [False, True])
+@pytest.mark.parametrize("existing", [False, True])
+async def test_agent_file_rpc_set_creates_only_requested_file(tmp_path, registry_enabled, existing):
+    workspace = tmp_path / "missing" / "workspace"
+    originals = {"AGENTS.md": b"", "custom.txt": b"Keep this file\r\n"} if existing else {}
+    if existing:
+        workspace.mkdir(parents=True)
+        for name, content in originals.items():
+            (workspace / name).write_bytes(content)
+    cfg = GatewayConfig(workspace_dir=str(workspace))
+    registry = AgentRegistry(cfg, persist_changes=False) if registry_enabled else None
+
+    response = await get_dispatcher().dispatch(
+        "write", "agents.files.set",
+        {"agentId": "main", "name": "USER.md", "content": "Name: Mira\n"},
+        _ctx(cfg, registry),
+    )
+
+    assert response.error is None
+    assert response.payload == {"name": "USER.md", "path": "USER.md", "size": 11}
+    assert {path.name for path in workspace.iterdir()} == {*originals, "USER.md"}
+    for name, content in originals.items():
+        assert (workspace / name).read_bytes() == content
+    assert (workspace / "USER.md").read_text(encoding="utf-8") == "Name: Mira\n"
 
 
 @pytest.mark.asyncio

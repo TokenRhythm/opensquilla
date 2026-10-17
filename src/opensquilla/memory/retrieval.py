@@ -8,7 +8,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .source_paths import is_searchable_source_path
+from .io_worker import run_memory_io
+from .source_paths import (
+    is_legacy_memory_capture,
+    is_legacy_memory_capture_candidate,
+    is_legacy_memory_capture_file,
+    is_searchable_source_path,
+)
 from .store import LongTermMemoryStore
 from .types import (
     MemorySearchOpts,
@@ -169,6 +175,7 @@ class MemoryRetriever:
         source_weights: dict[MemorySource, float] | None = None,
         sync_manager: Any | None = None,
         effective_metadata: dict[str, str] | None = None,
+        workspace_dir: str | Path | None = None,
     ) -> None:
         self._store = store
         self._temporal_decay_enabled = temporal_decay_enabled
@@ -180,6 +187,33 @@ class MemoryRetriever:
         self._source_weights = source_weights or {MemorySource.sessions: 0.92}
         self._sync_manager = sync_manager
         self._effective_metadata = dict(effective_metadata or {})
+        self._workspace_dir = (
+            Path(workspace_dir).expanduser().resolve() if workspace_dir is not None else None
+        )
+
+    def _excluded_legacy_paths(self, paths: set[str]) -> set[str]:
+        """Defend searches even when stale-index cleanup has failed.
+
+        Only historical candidate locations need a bounded prefix read. An
+        inaccessible candidate cannot be verified as curated and stays hidden
+        until it can be read again; ordinary archive notes remain searchable.
+        """
+        root = self._workspace_dir
+        if root is None:
+            return set()
+        excluded: set[str] = set()
+        for relative_path in paths:
+            if not is_legacy_memory_capture_candidate(relative_path):
+                continue
+            path = root / relative_path
+            try:
+                if not path.resolve().is_relative_to(root):
+                    excluded.add(relative_path)
+                elif is_legacy_memory_capture_file(path, relative_path=relative_path):
+                    excluded.add(relative_path)
+            except (OSError, ValueError):
+                excluded.add(relative_path)
+        return excluded
 
     async def search(
         self,
@@ -201,6 +235,20 @@ class MemoryRetriever:
             text_weight=self._text_weight,
             source=source_filter,
         )
+
+        excluded_paths: set[str] = set()
+        if self._workspace_dir is not None:
+            excluded_paths.update(await run_memory_io(
+                self._excluded_legacy_paths,
+                {r.path for r in raw_results if r.source == MemorySource.memory},
+            ))
+        else:
+            excluded_paths.update(
+                r.path for r in raw_results
+                if r.source == MemorySource.memory and r.start_line == 1
+                and is_legacy_memory_capture(r.path, r.text or r.snippet)
+            )
+        raw_results = [r for r in raw_results if r.path not in excluded_paths]
 
         if self._temporal_decay_enabled:
             unique_paths = list({r.path for r in raw_results})

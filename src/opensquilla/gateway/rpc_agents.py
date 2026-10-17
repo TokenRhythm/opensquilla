@@ -22,7 +22,6 @@ from opensquilla.gateway.rpc import (
 from opensquilla.identity.bootstrap import (
     CORE_BOOTSTRAP_TEMPLATE_FILENAMES,
     RETIRED_WORKSPACE_FILENAMES,
-    ensure_agent_workspace,
 )
 from opensquilla.session.keys import normalize_agent_id
 
@@ -47,7 +46,7 @@ def _workspace_file_root(ctx: RpcContext, agent_id: str) -> Path | None:
     config = getattr(ctx, "config", None)
     if not getattr(config, "workspace_dir", None):
         return None
-    return ensure_agent_workspace(resolve_agent_workspace_dir(agent_id, config)).workspace_dir
+    return resolve_agent_workspace_dir(agent_id, config).expanduser()
 
 
 def _validate_workspace_file_name(name: str) -> str:
@@ -155,6 +154,7 @@ def _write_workspace_agent_file(root: Path, name: str, content: Any) -> dict[str
     safe_name, path = _resolve_workspace_agent_file(root, name)
     text = content if isinstance(content, str) else str(content)
     data = text.encode("utf-8")
+    root.mkdir(parents=True, exist_ok=True)
     fd = _open_workspace_agent_file_for_write(path)
     try:
         _validate_safe_file_stat(os.fstat(fd))

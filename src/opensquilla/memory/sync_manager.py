@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,11 @@ from typing import Any
 import structlog
 
 from .io_worker import await_settled, run_memory_io
-from .source_paths import is_memory_source_path
+from .source_paths import (
+    is_legacy_memory_capture,
+    is_legacy_memory_capture_file,
+    is_memory_source_path,
+)
 from .store import LongTermMemoryStore
 from .types import MemorySource
 
@@ -70,6 +75,7 @@ class MemorySyncManager:
         ttl_days: int = 0,
         ttl_sweep_interval_minutes: float = 0.0,
         session_indexer: Any | None = None,
+        maintenance_allowed: Callable[[], bool] | None = None,
     ) -> None:
         self._store = store
         self._workspace_dir = Path(workspace_dir).expanduser().resolve()
@@ -80,12 +86,14 @@ class MemorySyncManager:
         self._ttl_days = ttl_days
         self._ttl_sweep_interval_minutes = ttl_sweep_interval_minutes
         self._session_indexer = session_indexer
+        self._maintenance_allowed = maintenance_allowed or (lambda: True)
         self._session_search_synced = False
 
         self._dirty = False
         self._warmed_sessions: set[str] = set()
         self._delta = SessionDeltaTracker()
         self._mtimes: dict[str, float] = {}
+        self._index_paths_reconciled = False
         self._pending_changes: set[str] = set()
         self._pending_deletes: set[str] = set()
         self._last_change_time: float = 0.0
@@ -217,6 +225,7 @@ class MemorySyncManager:
         if (
             is_search_reason
             and not self._dirty
+            and self._index_paths_reconciled
             and not force
             and not session_delta_pending
             and (self._session_indexer is None or self._session_search_synced)
@@ -259,7 +268,7 @@ class MemorySyncManager:
             # index I/O yields. Preserve them alongside unfinished file work.
             self._dirty = bool(
                 self._pending_changes or self._pending_deletes or session_sync_failed
-                or revision != self._change_revision
+                or revision != self._change_revision or not self._index_paths_reconciled
             )
 
         if revision == self._change_revision and (reason == "session-delta" or (
@@ -305,6 +314,13 @@ class MemorySyncManager:
                     rel = path.relative_to(self._workspace_dir).as_posix()
                     if not is_memory_source_path(rel):
                         continue
+                    try:
+                        if is_legacy_memory_capture_file(path, relative_path=rel):
+                            continue
+                    except OSError:
+                        # An unreadable candidate must not retain generated raw
+                        # content in the curated index. A later scan can retry.
+                        continue
                     result[rel] = path.stat().st_mtime
         return result
 
@@ -348,6 +364,26 @@ class MemorySyncManager:
             for path in set(self._mtimes) - set(current):
                 deletes.add(path)
 
+            # _mtimes starts empty after restart. Reconcile the durable index
+            # too, including raw captures deliberately left in their old place.
+            if not self._index_paths_reconciled or force:
+                list_paths = getattr(self._store, "list_paths", None)
+                if callable(list_paths):
+                    try:
+                        indexed = await list_paths(source=MemorySource.memory)
+                        if not self._accepts_generation(generation):
+                            return set()
+                        deletes.update(
+                            path for path in indexed
+                            if is_memory_source_path(path) and path not in current
+                        )
+                        self._index_paths_reconciled = True
+                    except Exception:
+                        self._index_paths_reconciled = False
+                        logger.warning("sync_manager.index_reconcile_failed")
+                else:
+                    self._index_paths_reconciled = True
+
             self._mtimes = current
             self._pending_changes.difference_update(changes)
             self._pending_deletes.difference_update(deletes)
@@ -377,6 +413,13 @@ class MemorySyncManager:
                     if not self._accepts_generation(generation):
                         return failed_deletes
                     if content is not None:
+                        if is_legacy_memory_capture(rel_path, content):
+                            # The source may have changed since the scan. Remove
+                            # only derived rows, never move or rewrite the file.
+                            await self._store.remove_file(rel_path)
+                            self._mtimes.pop(rel_path, None)
+                            remaining_changes.discard(rel_path)
+                            continue
                         n = await self._store.index_file(
                             path=rel_path,
                             content=content,
@@ -511,6 +554,8 @@ class MemorySyncManager:
         """
         from opensquilla.memory.retention import prune_expired_memory_files
 
+        if not self._maintenance_allowed():
+            return
         generation = self._generation
         operation = asyncio.create_task(prune_expired_memory_files(
             memory_dir=self._memory_dir,
@@ -518,6 +563,7 @@ class MemorySyncManager:
             ttl_days=self._ttl_days,
             workspace_dir=self._workspace_dir,
             debounce_seconds=self._debounce_seconds + 0.5,
+            maintenance_allowed=self._maintenance_allowed,
         ))
         try:
             result = await await_settled(operation)
