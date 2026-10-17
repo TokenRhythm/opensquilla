@@ -177,24 +177,24 @@ async function checkPlacement({ owner, area = { x: 0, y: 0, width: 1920, height:
     assert.deepEqual(displays, [])
   }
   assert.equal(child.shown, 1)
-  assert.deepEqual(child.getContentSize(), [560, 420], 'The visible viewport retains the requested content size')
-  assert.deepEqual(child.resizes, sheetHeightLoss ? [[560, 420]] : [],
+  assert.deepEqual(child.getContentSize(), [520, 288], 'The visible viewport retains the requested content size')
+  assert.deepEqual(child.resizes, sheetHeightLoss ? [[520, 288]] : [],
     'Only an actual native size change needs correction; do not hardcode titlebar pixels')
   ipcMain.emit('desktop:quit-dialog-response', { sender: child.webContents }, 'cancel')
   assert.deepEqual(await result, { response: 'cancel', remember: false })
 }
 
-await checkPlacement({ owner: { x: 460, y: 80, width: 980, height: 720 }, expected: [670, 230] })
+await checkPlacement({ owner: { x: 460, y: 80, width: 980, height: 720 }, expected: [690, 296] })
 await checkPlacement({ owner: { x: -1200, y: -800, width: 980, height: 720 }, expected: [0, 0] })
-await checkPlacement({ owner: { x: 2300, y: 1100, width: 980, height: 720 }, expected: [1360, 660] })
+await checkPlacement({ owner: { x: 2300, y: 1100, width: 980, height: 720 }, expected: [1400, 792] })
 await checkPlacement({ owner: { x: -1900, y: 80, width: 980, height: 720 },
-  area: { x: -1920, y: 0, width: 1920, height: 1080 }, expected: [-1690, 230] })
+  area: { x: -1920, y: 0, width: 1920, height: 1080 }, expected: [-1670, 296] })
 await checkPlacement({ owner: { x: 460, y: 80, width: 980, height: 720 }, destroyed: true })
 await checkPlacement({ owner: { x: 460, y: 80, width: 980, height: 720 }, destroyBeforeReady: true })
 await checkPlacement({})
 for (const sheetHeightLoss of [0, 32, 48]) {
   await checkPlacement({ platform: 'darwin', sheetHeightLoss,
-    owner: { x: 460, y: 80, width: 980, height: 720 }, expected: [670, 230] })
+    owner: { x: 460, y: 80, width: 980, height: 720 }, expected: [690, 296] })
 }
 
 console.log('desktop quit dialog tests passed, including parent-relative and offscreen placement')

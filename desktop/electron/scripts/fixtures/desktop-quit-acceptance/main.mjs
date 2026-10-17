@@ -214,11 +214,12 @@ async function command(action, options = {}) {
   else if (action === 'repeat-quit') { for (let index = 0; index < 4; index += 1) env.app.quit() }
   else if (action === 'signal') env.shutdownFromSignal()
   else if (action === 'add-page') await addPage()
+  else if (action === 'remove-pages') await manager.destroyAll()
   else if (action === 'navigate-page') { const record = pages().at(-1); if (record) await record.contents.loadURL(`${pageOrigin}/navigation-${Date.now()}`) }
   else if (action === 'hold-writer') { if (!finishWriter) finishWriter = env.desktopWriters.begin('isolated acceptance writer') }
   else if (action === 'finish-writer') { finishWriter?.(); finishWriter = null }
   else if (action === 'long-copy') {
-    const copy = runInContext(`({title:desktopT('quit.title'),message:desktopT('quit.unknown'),detail:desktopT('quit.detail')+'\\n\\n'+desktopT('quit.pagesDetail').replace('{count}','888888888'),keepRunning:desktopT('quit.keepRunning'),confirm:desktopT('quit.confirm')})`, env)
+    const copy = runInContext(`({title:desktopT('quit.title'),message:desktopT('quit.unknown'),detail:desktopT('quit.pagesDetail').replace('{count}','888888888'),keepRunning:desktopT('quit.keepRunning'),confirm:desktopT('quit.confirm')})`, env)
     void env.showDesktopQuitConfirmation({ ...copy, parent: owner }).then(result => log('fixture_long_copy_decision', { result }))
   } else if (action === 'reset') {
     resetting = true

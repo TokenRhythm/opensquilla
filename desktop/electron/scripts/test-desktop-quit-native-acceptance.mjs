@@ -7,6 +7,7 @@ import { _electron as electron } from 'playwright'
 
 const manual = process.argv.includes('--manual')
 const themesOnly = process.argv.includes('--themes-only')
+const locales = ['en', 'zh', 'ja', 'fr', 'de', 'es']
 const supportsBackgroundClose = process.platform === 'win32' || process.platform === 'darwin'
 const notApplicable = supportsBackgroundClose ? [] : [{
   feature: 'X background, three-choice Ask and remembered close preference',
@@ -170,7 +171,7 @@ try {
       results.push({ name: 'linux-X-quit-policy', passed: true })
     }
 
-    for (const locale of ['en', 'zh']) for (const theme of ['light', 'dark']) {
+    for (const locale of locales) for (const theme of ['light', 'dark']) {
       await reset('ask')
       await controller.locator('#locale').selectOption(locale)
       await controller.locator('#theme').selectOption(theme)
@@ -291,7 +292,7 @@ try {
       assert.equal(value.ledger.errorBoxes[0].native, false, 'automated error box is explicitly adapted; manual mode supports the real native box')
       results.push({ name: 'failed-cleanup-state', passed: true, nativeErrorBoxTested: false })
 
-      for (const locale of ['en', 'zh']) {
+      for (const locale of locales) {
         await reset('ask')
         await controller.locator('#locale').selectOption(locale)
         await controller.locator('#longCopy').click()
@@ -300,6 +301,27 @@ try {
         await pressClosingKey(prompt, 'Escape')
         await waitFor(async () => (await state()).logs.some(entry => entry.event === 'fixture_long_copy_decision'), 'longest-copy Escape')
         results.push({ name: `longest-copy-${locale}`, passed: true })
+      }
+
+      for (const locale of ['en', 'zh']) {
+        for (const entry of supportsBackgroundClose ? ['closeMain', 'quit'] : ['quit']) {
+          await reset('ask')
+          await command('remove-pages')
+          await controller.locator('#locale').selectOption(locale)
+          await controller.locator('#activity').selectOption('unknown')
+          await controller.locator(`#${entry}`).click()
+          prompt = await dialog()
+          assert.equal(await prompt.locator('#detail').count(), 0, 'no page warning without open pages')
+          assert.equal(await prompt.locator('[role="dialog"]').getAttribute('aria-describedby'), 'message')
+          await screenshot(prompt, `${entry}-no-pages-${locale}`)
+          await pressClosingKey(prompt, 'Escape')
+          await waitFor(async () => !(await state()).confirmationPending, 'cancel without open pages')
+          const value = await state()
+          assert.equal(value.taskAlive, true)
+          assert.equal(value.pages, 0)
+          assert.equal(value.ledger.drain, 0)
+          results.push({ name: `${entry}-no-pages-${locale}`, passed: true })
+        }
       }
 
       if (supportsBackgroundClose) {

@@ -232,7 +232,8 @@ for (const activity of ['idle', 'active', 'unknown']) {
     assert.equal(h.quitDialogOptions.keepRunning, 'closePrompt.cancel')
     assert.equal(h.quitDialogOptions.remember, 'closePrompt.remember')
     assert.ok(h.quitDialogOptions.detail.includes('quit.pagesDetail'))
-    if (activity !== 'idle') assert.ok(h.quitDialogOptions.detail.includes('quit.detail'))
+    assert.equal(h.quitDialogOptions.message,
+      activity === 'idle' ? 'closePrompt.message' : `closePrompt.${activity}`)
     assert.equal(h.remainingPages, 2)
     assert.equal(h.env.desktopWriters.closed, false)
     h.handlers.handleMainWindowClose(h.window, h.closeEvent())
@@ -296,7 +297,7 @@ for (const response of ['background', 'confirm']) {
   h.handlers.holdQuitForTaskConfirmation(h.closeEvent())
   await until(() => h.shownQuitDialog === 1)
   assert.equal(h.quitDialogOptions.background, undefined)
-  assert.ok(h.quitDialogOptions.detail.includes('quit.detail'))
+  assert.equal(h.quitDialogOptions.message, 'quit.active')
   assert.ok(h.quitDialogOptions.detail.includes('quit.pagesDetail'))
   await settleConfirmation(h, false)
   assert.equal(h.remainingPages, 2)

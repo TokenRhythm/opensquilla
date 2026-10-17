@@ -44,6 +44,9 @@ records the production error-box copy without opening an OS modal;
 **Stop fixture** reaps the retained child and closes only this fixture. The
 automated runner also does this in its finalizer. Screenshots and geometry
 records are produced from actual confirmation BrowserWindows, not HTML mocks.
+The compact dialog is checked in English, Chinese, Japanese, French, German
+and Spanish, in both themes, plus long page counts and dialogs without pages.
+Empty page warnings are omitted, including their accessibility references.
 The runner also checks native visibility, focus, modal ownership, show events,
 and placement inside the owner's display. Native bounds and event receipts are
 saved alongside the rendered geometry, so a rendered screenshot alone cannot

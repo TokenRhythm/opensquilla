@@ -7,7 +7,7 @@
 <h1>OpenSquilla PR1793 Acceptance</h1>
 <p class="scope">Isolated native fixture. Production close/quit handlers, dialogs and browser-page manager. The ticking task and Gateway activity/cleanup adapters are synthetic.</p>
 <label>Close preference<select id="behavior"><option value="ask">Ask</option><option value="background">Run in background</option><option value="quit">Quit</option></select></label>
-<label>Language<select id="locale"><option value="en">English</option><option value="zh">中文</option></select></label>
+<label>Language<select id="locale"><option value="en">English</option><option value="zh">中文</option><option value="ja">日本語</option><option value="fr">Français</option><option value="de">Deutsch</option><option value="es">Español</option></select></label>
 <label>Theme<select id="theme"><option value="light">Light</option><option value="dark">Dark</option><option value="system">System</option></select></label>
 <label>Task activity<select id="activity"><option value="active">Active ticking process</option><option value="idle">Idle</option><option value="unknown">Unknown</option></select></label>
 <label>Simulate cleanup failure<input id="cleanupFailure" type="checkbox"></label>
@@ -17,7 +17,7 @@
 <button id="quit" data-action="quit">Menu Quit</button><button id="repeatQuit" data-action="repeat-quit">Quit × 4</button>
 <button id="addPage" data-action="add-page">Add unsaved page</button><button id="navigatePage" data-action="navigate-page">Navigate page</button>
 <button id="holdWriter" data-action="hold-writer">Hold profile writer</button><button id="finishWriter" data-action="finish-writer">Finish writer</button>
-<button id="signal" data-action="signal">Signal quit</button><button id="longCopy" data-action="long-copy">Longest EN/CN copy</button>
+<button id="signal" data-action="signal">Signal quit</button><button id="longCopy" data-action="long-copy">Longest localized copy</button>
 <button id="reset" data-action="reset">Reset synthetic session</button><button id="stopFixture" data-action="stop-fixture">Stop fixture</button>
 </div>
 <div id="error" role="status"></div><pre id="state" aria-label="Live acceptance state">Starting…</pre>
