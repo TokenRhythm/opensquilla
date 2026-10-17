@@ -126,6 +126,90 @@ async def test_terminal_manager_emits_bounded_ordered_output_and_exit(tmp_path, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("chunk_size", [1, terminal_sessions.MAX_OUTPUT_BYTES])
+async def test_terminal_output_waits_for_consumption_with_bounded_window_and_close(
+    tmp_path, monkeypatch, chunk_size,
+):
+    handle = _FakeHandle()
+    events = []
+    reads = 0
+    reached_window = asyncio.Event()
+    expected_frames = min(
+        terminal_sessions.MAX_OUTPUT_IN_FLIGHT_FRAMES,
+        terminal_sessions.OUTPUT_HIGH_WATER_BYTES // chunk_size,
+    )
+
+    async def read(_handle, size):
+        nonlocal reads
+        reads += 1
+        return b"x" * min(size, chunk_size)
+
+    async def send(event, payload):
+        events.append((event, payload))
+        if event == "terminal.output" and payload["seq"] >= expected_frames:
+            reached_window.set()
+        return True
+
+    async def terminate(_handle):
+        handle.terminated = True
+
+    monkeypatch.setattr(terminal_sessions, "spawn_pty", lambda *args, **kwargs: handle)
+    monkeypatch.setattr(terminal_sessions, "read_pty", read)
+    monkeypatch.setattr(terminal_sessions, "wait_pty", lambda *_args: _done_wait())
+    monkeypatch.setattr(terminal_sessions, "terminate_pty", terminate)
+    manager = terminal_sessions.TerminalManager(send_event=send)
+    created = await manager.create(
+        conn_id="conn-1", session_key="session-a", workspace_service=_WorkspaceService(tmp_path),
+        cwd="", command=None, cols=80, rows=24, output_flow_control=True,
+    )
+    assert created["outputFlowControl"] == "consumed-v1"
+    terminal_id = created["terminalId"]
+    session = manager._sessions[terminal_id]
+    await asyncio.wait_for(reached_window.wait(), timeout=1)
+    await asyncio.sleep(0)
+    assert reads == expected_frames
+    assert len(session.output_in_flight) == expected_frames
+    assert session.output_in_flight_bytes == expected_frames * chunk_size
+    assert not handle.terminated
+
+    with pytest.raises(terminal_sessions.TerminalSessionError, match="another connection"):
+        await manager.consume(terminal_id=terminal_id, conn_id="conn-2", seq=1)
+    with pytest.raises(terminal_sessions.TerminalSessionError, match="not emitted"):
+        await manager.consume(terminal_id=terminal_id, conn_id="conn-1", seq=expected_frames + 1)
+    # Partial credits do not resume until the low watermark is reached.
+    await manager.consume(terminal_id=terminal_id, conn_id="conn-1", seq=1)
+    await asyncio.sleep(0)
+    assert reads == expected_frames
+    received = await manager.consume(terminal_id=terminal_id, conn_id="conn-1", seq=expected_frames)
+    assert received["consumedSeq"] == expected_frames
+    await asyncio.sleep(0)
+    assert reads == 2 * expected_frames
+    assert len(session.output_in_flight) == expected_frames
+    assert session.output_in_flight_bytes <= terminal_sessions.OUTPUT_HIGH_WATER_BYTES
+    # A stale retry cannot release new credits.
+    await manager.consume(terminal_id=terminal_id, conn_id="conn-1", seq=expected_frames)
+    await asyncio.sleep(0)
+    assert reads == 2 * expected_frames
+    # Closing a socket wakes the paused pump and keeps the existing teardown.
+    await asyncio.wait_for(manager.close_connection("conn-1"), timeout=1)
+    assert handle.terminated
+    assert terminal_id not in manager._sessions
+    assert events[-1][0] == "terminal.exit"
+    assert events[-1][1]["reason"] == "connection_closed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seq", [True, 0, -1, 1.5, None, 2**53])
+async def test_terminal_consumption_rejects_invalid_cursors(seq):
+    async def send(*_args):
+        return True
+
+    manager = terminal_sessions.TerminalManager(send_event=send)
+    with pytest.raises(terminal_sessions.TerminalSessionError, match="positive safe integer"):
+        await manager.consume(terminal_id="missing", conn_id="conn-1", seq=seq)
+
+
+@pytest.mark.asyncio
 async def test_terminal_manager_enforces_owner_and_workspace_binding(tmp_path, monkeypatch):
     handle = _FakeHandle()
     service = _WorkspaceService(tmp_path)

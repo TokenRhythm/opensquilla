@@ -14,15 +14,16 @@
 </template>
 
 <script setup lang="ts">
-import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Terminal as XTerm } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { TERMINAL_ACCESS_KEY, normalizeTerminalTarget, terminalTargetKey, type TerminalAccess, type TerminalExit, type TerminalOutput, type TerminalTarget } from '@/modules/terminal'
 import { readTerminalTheme } from './terminalTheme'
+import { createTerminalConsumption } from '@/modules/terminalConsumption'
 
-const props = defineProps<{ sessionKey?: string; target?: TerminalTarget }>()
+const props = withDefaults(defineProps<{ sessionKey?: string; target?: TerminalTarget; visible?: boolean }>(), { visible: true })
 const { t } = useI18n()
 const terminal = inject<TerminalAccess | null>(TERMINAL_ACCESS_KEY, null)
 const surface = ref<HTMLElement | null>(null)
@@ -48,16 +49,23 @@ let fitAddon: FitAddon | null = null
 let stopData: (() => void) | null = null
 let fitting = false
 let lastResize = ''
+let consumption: ReturnType<typeof createTerminalConsumption> | null = null
 
 const stateLabel = computed(() => t(`workbench.terminal.state.${state.value}`))
 
-function append(text: string) { xterm?.write(text) }
+function append(text: string, seq?: number) {
+  const owner = consumption
+  // Hidden terminals still parse into their bounded screen/scrollback model.
+  // xterm's IntersectionObserver suspends painting for display:none panels;
+  // stopping parsing instead would strand PTY flow control or lose VT modes.
+  xterm?.write(text, seq ? () => owner?.consumed(seq) : undefined)
+}
 
-function focusInput() { xterm?.focus() }
+function focusInput() { if (props.visible) xterm?.focus() }
 
 function refreshTheme() {
   // Updating options recolors the existing buffer without recreating the PTY.
-  if (xterm && surface.value) xterm.options.theme = readTerminalTheme(surface.value)
+  if (props.visible && xterm && surface.value) xterm.options.theme = readTerminalTheme(surface.value)
 }
 
 function write(data: string) {
@@ -73,12 +81,12 @@ function write(data: string) {
 }
 
 function scheduleResize() {
-  if (resizeTimer !== null) return
+  if (!props.visible || resizeTimer !== null) return
   resizeTimer = setTimeout(() => {
     resizeTimer = null
     const id = terminalId.value
     const node = surface.value
-    if (!id || !node || !terminal || state.value !== 'running') return
+    if (!props.visible || !id || !node || !terminal || state.value !== 'running') return
     fitting = true
     try { fitAddon?.fit() } finally { fitting = false }
     const cols = Math.max(1, Math.min(400, xterm?.cols || 100))
@@ -94,10 +102,11 @@ async function start() {
   const requestedTarget = target.value
   if (!terminal || !requestedTarget) { state.value = 'error'; errorMessage.value = t('workbench.terminal.unavailable'); return }
   state.value = 'starting'; errorMessage.value = ''; lastSeq.value = 0; lastResize = ''; cwdPath.value = ''
+  consumption?.dispose(); consumption = null
   xterm?.dispose(); xterm = null; fitAddon = null; stopData?.(); stopData = null
   if (surface.value) {
     xterm = new XTerm({
-      cursorBlink: true,
+      cursorBlink: props.visible,
       cursorStyle: 'bar',
       cursorWidth: 2,
       fontFamily: getComputedStyle(surface.value).fontFamily,
@@ -111,7 +120,7 @@ async function start() {
     fitAddon = new FitAddon()
     xterm.loadAddon(fitAddon)
     xterm.open(surface.value)
-    fitAddon.fit()
+    if (props.visible) fitAddon.fit()
     const dataSubscription = xterm.onData(write)
     xterm.onResize(() => { if (!fitting) scheduleResize() })
     stopData = () => dataSubscription.dispose()
@@ -131,7 +140,9 @@ async function start() {
     if (!matchesTarget(event)) return
     earlyFrames.push(event)
     earlyChars += 'data' in event ? event.data.length : 0
-    while (earlyFrames.length > 256 || earlyChars > 256 * 1024) {
+    // Four terminals may concurrently target this workspace. Keep at most all
+    // four negotiated windows until create identifies this panel's owner.
+    while (earlyFrames.length > 4 * 256 || earlyChars > 4 * 176 * 1024) {
       const removed = earlyFrames.shift()!
       earlyChars -= 'data' in removed ? removed.data.length : 0
       droppedTerminals.add(removed.terminalId)
@@ -142,7 +153,7 @@ async function start() {
     if (event.terminalId !== terminalId.value || event.seq <= lastSeq.value) return
     if (lastSeq.value && event.seq > lastSeq.value + 1) append(`\r\n[${t('workbench.terminal.outputGap')}]\r\n`)
     lastSeq.value = event.seq
-    append(event.data)
+    append(event.data, event.seq)
   }
   const applyExit = (event: TerminalExit) => {
     if ((event.target || event.sessionKey) && !matchesTarget(event)) return
@@ -160,9 +171,20 @@ async function start() {
     else applyExit(event)
   })
   try {
-    const handle = await terminal.create(props.target ? requestedTarget : props.sessionKey!, { cols: 100, rows: 30 })
+    const handle = await terminal.create(props.target ? requestedTarget : props.sessionKey!, {
+      cols: 100, rows: 30,
+      ...(terminal.consume ? { outputFlowControl: 'consumed-v1' as const } : {}),
+    })
     if (!mounted) { await terminal.close(handle.terminalId, 'component-unmount').catch(() => {}); return }
     terminalId.value = handle.terminalId
+    if (handle.outputFlowControl === 'consumed-v1' && terminal.consume) {
+      const consume = terminal.consume.bind(terminal)
+      consumption = createTerminalConsumption((seq, signal) => consume(handle.terminalId, seq, signal), error => {
+        if (!mounted || terminalId.value !== handle.terminalId) return
+        state.value = 'error'
+        errorMessage.value = error instanceof Error ? error.message : String(error)
+      })
+    }
     cwdPath.value = handle.cwdPath ?? ''
     if (droppedTerminals.has(handle.terminalId)) append(`\r\n[${t('workbench.terminal.outputGap')}]\r\n`)
     for (const event of earlyFrames) {
@@ -180,11 +202,23 @@ async function start() {
 }
 
 async function restart() {
+  consumption?.dispose(); consumption = null
   const old = terminalId.value
   terminalId.value = ''
   if (old && terminal) await terminal.close(old, 'restart').catch(() => {})
   await start()
 }
+
+watch(() => props.visible, async visible => {
+  if (resizeTimer !== null) { clearTimeout(resizeTimer); resizeTimer = null }
+  if (xterm) xterm.options.cursorBlink = visible
+  if (!visible) { xterm?.blur(); return }
+  await nextTick()
+  if (!mounted || !props.visible) return
+  refreshTheme()
+  scheduleResize()
+  // Returning to a tab must not steal focus from the main chat composer.
+})
 
 onMounted(() => {
   mounted = true
@@ -199,6 +233,7 @@ onBeforeUnmount(() => {
   resizeObserver?.disconnect()
   themeObserver?.disconnect()
   stopOutput?.(); stopExit?.()
+  consumption?.dispose(); consumption = null
   stopData?.(); xterm?.dispose(); xterm = null
   if (terminalId.value && terminal) void terminal.close(terminalId.value, 'component-unmount').catch(() => {})
 })

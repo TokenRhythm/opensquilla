@@ -26,6 +26,19 @@ function fixture() {
 }
 
 describe('terminal Gateway adapter', () => {
+  it('negotiates parser consumption credits and validates their response', async () => {
+    const h = fixture()
+    h.rpc.request.mockResolvedValueOnce({ terminalId: 'pty-1', sessionKey: 'session-a', cols: 80, rows: 24, shell: 'bash', outputFlowControl: 'consumed-v1' })
+    await expect(h.access.create('session-a', { outputFlowControl: 'consumed-v1' })).resolves.toMatchObject({ outputFlowControl: 'consumed-v1' })
+    expect(h.rpc.request.mock.calls[0]?.[1]).toMatchObject({ outputFlowControl: 'consumed-v1' })
+    h.rpc.request.mockResolvedValueOnce({ terminalId: 'pty-1', consumedSeq: 9 })
+    await expect(h.access.consume!('pty-1', 9)).resolves.toEqual({ terminalId: 'pty-1', consumedSeq: 9 })
+    expect(h.rpc.request.mock.calls[1]?.slice(0, 2)).toEqual(['terminal.consume', { terminalId: 'pty-1', seq: 9 }])
+    h.rpc.request.mockResolvedValueOnce({ terminalId: 'other', consumedSeq: 10 })
+    await expect(h.access.consume!('pty-1', 10)).rejects.toThrow('invalid response')
+    await expect(h.access.consume!('pty-1', 0)).rejects.toThrow('invalid terminal.consume')
+  })
+
   it.each<TerminalTarget>([
     { kind: 'default-agent', agentId: 'main' },
     { kind: 'project', workspaceId: 'project-a' },

@@ -26,7 +26,10 @@ def _principal(*, host_execute: bool) -> Principal:
 
 def test_terminal_methods_are_registered_with_operator_write() -> None:
     dispatcher = get_dispatcher()
-    for method in ("terminal.create", "terminal.write", "terminal.resize", "terminal.close"):
+    for method in (
+        "terminal.create", "terminal.write", "terminal.resize",
+        "terminal.close", "terminal.consume",
+    ):
         entry = dispatcher.get_entry(method)
         assert entry is not None
         assert entry.required_scope == "operator.write"
@@ -109,7 +112,10 @@ def test_guest_policy_denies_all_terminal_control_methods() -> None:
         guest_session_key="osqg_" + "A" * 43,
     )
     context = RpcContext(conn_id="guest", principal=guest)
-    for method in ("terminal.create", "terminal.write", "terminal.resize", "terminal.close"):
+    for method in (
+        "terminal.create", "terminal.write", "terminal.resize",
+        "terminal.close", "terminal.consume",
+    ):
         with pytest.raises(GuestRpcPolicyError):
             GuestRpcPolicy.authorize(method, {}, context)
 
@@ -158,6 +164,26 @@ async def test_terminal_create_routes_default_target_without_a_chat(tmp_path, mo
     assert received["session_key"] is None
     assert received["target"] == {"kind": "default-agent", "agentId": "main"}
     assert result["cwdPath"] == str(tmp_path.resolve())
+    assert received["output_flow_control"] is False
+
+
+@pytest.mark.asyncio
+async def test_terminal_consume_requires_host_execute_and_preserves_connection_owner(monkeypatch):
+    consume = AsyncMock(return_value={"terminalId": "term-a", "consumedSeq": 8})
+    monkeypatch.setattr(rpc_terminal, "_MANAGER", SimpleNamespace(consume=consume))
+    with pytest.raises(RpcHandlerError) as caught:
+        await rpc_terminal._handle_terminal_consume(
+            {"terminalId": "term-a", "seq": 8},
+            RpcContext(conn_id="conn-1", principal=_principal(host_execute=False)),
+        )
+    assert caught.value.code == "UNAUTHORIZED"
+    consume.assert_not_awaited()
+    result = await rpc_terminal._handle_terminal_consume(
+        {"terminalId": "term-a", "seq": 8},
+        RpcContext(conn_id="conn-1", principal=_principal(host_execute=True)),
+    )
+    assert result == {"terminalId": "term-a", "consumedSeq": 8}
+    consume.assert_awaited_once_with(terminal_id="term-a", conn_id="conn-1", seq=8)
 
 
 

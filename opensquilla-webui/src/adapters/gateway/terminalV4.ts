@@ -15,6 +15,7 @@ const METHODS = {
   write: 'terminal.write',
   resize: 'terminal.resize',
   close: 'terminal.close',
+  consume: 'terminal.consume',
   output: 'terminal.output',
   exit: 'terminal.exit',
 } as const
@@ -50,7 +51,8 @@ function parseCreate(value: unknown): TerminalHandle {
   const rows = positiveInt(source?.rows)
   const shell = text(source?.shell)
   if (!terminalId || (!sessionKey && !target) || (source?.target !== undefined && !target) || !cols || !rows || !shell) throw new Error('terminal.create returned an invalid response')
-  return { terminalId, ...(sessionKey ? { sessionKey } : {}), ...(target ? { target } : {}), ...(cwdPath ? { cwdPath } : {}), cols, rows, shell }
+  return { terminalId, ...(sessionKey ? { sessionKey } : {}), ...(target ? { target } : {}), ...(cwdPath ? { cwdPath } : {}), cols, rows, shell,
+    ...(source?.outputFlowControl === 'consumed-v1' ? { outputFlowControl: 'consumed-v1' as const } : {}) }
 }
 
 function parseWrite(value: unknown) {
@@ -131,6 +133,7 @@ export function createV4TerminalAccess(rpc: RpcTransport, events: EventTransport
         ...(options.rows !== undefined ? { rows: options.rows } : {}),
         ...(options.cwd ? { cwd: options.cwd } : {}),
         ...(options.shell ? { shell: options.shell } : {}),
+        ...(options.outputFlowControl ? { outputFlowControl: options.outputFlowControl } : {}),
       }, requestOptions(signal)))
     },
     async write(terminalId: string, data: string, signal?: AbortSignal) {
@@ -146,6 +149,13 @@ export function createV4TerminalAccess(rpc: RpcTransport, events: EventTransport
         throw new Error('invalid terminal.close input')
       }
       return parseClose(await rpc.request(METHODS.close, { terminalId, reason: reason.slice(0, 128) }, requestOptions(signal)))
+    },
+    async consume(terminalId: string, seq: number, signal?: AbortSignal) {
+      if (!terminalId || !Number.isSafeInteger(seq) || seq < 1) throw new Error('invalid terminal.consume input')
+      const source = record(await rpc.request(METHODS.consume, { terminalId, seq }, requestOptions(signal)))
+      const consumedSeq = positiveInt(source?.consumedSeq)
+      if (source?.terminalId !== terminalId || consumedSeq === null || consumedSeq < seq) throw new Error('terminal.consume returned an invalid response')
+      return { terminalId, consumedSeq }
     },
     onOutput(handler) {
       const subscription = events.subscribe(METHODS.output, (payload: unknown) => {

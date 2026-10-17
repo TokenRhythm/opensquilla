@@ -148,6 +148,7 @@ METHOD_SCOPES: dict[str, str] = {
     "terminal.write": WRITE_SCOPE,
     "terminal.resize": WRITE_SCOPE,
     "terminal.close": WRITE_SCOPE,
+    "terminal.consume": WRITE_SCOPE,
     "sessions.subscribe": READ_SCOPE,
     "sessions.unsubscribe": READ_SCOPE,
     "workspaces.list": READ_SCOPE,  # OpenSquilla-only; owner-guarded local paths.

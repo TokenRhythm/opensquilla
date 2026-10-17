@@ -1,0 +1,61 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createTerminalConsumption } from './terminalConsumption'
+
+afterEach(() => vi.useRealTimers())
+
+describe('terminal consumption credits', () => {
+  it('coalesces consumed cursors and keeps only one in-flight RPC', async () => {
+    vi.useFakeTimers()
+    let resolve!: () => void
+    const send = vi.fn((_seq: number, _signal: AbortSignal) => new Promise<void>(done => { resolve = done }))
+    const owner = createTerminalConsumption(send)
+    for (let seq = 1; seq <= 200; seq++) owner.consumed(seq)
+    await vi.advanceTimersByTimeAsync(16)
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(send.mock.calls[0]?.[0]).toBe(200)
+    for (let seq = 201; seq <= 400; seq++) owner.consumed(seq)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(send).toHaveBeenCalledTimes(1)
+    resolve()
+    await vi.advanceTimersByTimeAsync(16)
+    expect(send).toHaveBeenCalledTimes(2)
+    expect(send.mock.calls[1]?.[0]).toBe(400)
+    owner.dispose()
+    expect(send.mock.calls[1]?.[1].aborted).toBe(true)
+  })
+
+  it('retries unknown receipts without growing an output or promise queue', async () => {
+    vi.useFakeTimers()
+    const send = vi.fn().mockRejectedValueOnce(new Error('timeout')).mockResolvedValue(undefined)
+    const owner = createTerminalConsumption(send)
+    owner.consumed(10)
+    await vi.advanceTimersByTimeAsync(16)
+    owner.consumed(12)
+    await vi.advanceTimersByTimeAsync(249)
+    expect(send).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(send).toHaveBeenCalledTimes(2)
+    expect(send.mock.calls[1]?.[0]).toBe(12)
+    owner.consumed(11)
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(send).toHaveBeenCalledTimes(2)
+    owner.dispose()
+    owner.consumed(13)
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(send).toHaveBeenCalledTimes(2)
+  })
+
+  it('retires consumption when the connection no longer owns the PTY', async () => {
+    vi.useFakeTimers()
+    const failure = Object.assign(new Error('Terminal session belongs to another connection'), { code: 'UNAUTHORIZED' })
+    const send = vi.fn().mockRejectedValue(failure)
+    const onOwnerLost = vi.fn()
+    const owner = createTerminalConsumption(send, onOwnerLost)
+    owner.consumed(1)
+    await vi.advanceTimersByTimeAsync(16)
+    expect(onOwnerLost).toHaveBeenCalledExactlyOnceWith(failure)
+    owner.consumed(2)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(send).toHaveBeenCalledTimes(1)
+  })
+})

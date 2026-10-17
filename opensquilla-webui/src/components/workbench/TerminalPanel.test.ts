@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createApp, h, nextTick } from 'vue'
+import { createApp, h, nextTick, reactive } from 'vue'
 import { createI18n } from 'vue-i18n'
 import type { ITerminalOptions } from '@xterm/xterm'
 import en from '@/locales/en.json'
@@ -9,7 +9,7 @@ import TerminalPanel from './TerminalPanel.vue'
 import { createTerminalWorkbenchDefinition } from './terminalWorkbenchProvider'
 import { createTerminalWorkbenchItem } from '@/workbench/terminalItems'
 
-const terminalInstances = vi.hoisted(() => [] as Array<{ options: ITerminalOptions; writes: string[]; disposed: boolean }>)
+const terminalInstances = vi.hoisted(() => [] as Array<{ options: ITerminalOptions; writes: string[]; disposed: boolean; focus: ReturnType<typeof vi.fn>; blur: ReturnType<typeof vi.fn>; callbacks: Array<() => void> }>)
 
 vi.mock('@xterm/xterm', () => {
   class Terminal {
@@ -17,12 +17,14 @@ vi.mock('@xterm/xterm', () => {
     rows = 24
     writes: string[] = []
     disposed = false
+    callbacks: Array<() => void> = []
     constructor(public options: ITerminalOptions) { terminalInstances.push(this) }
     private dataHandler: ((value: string) => void) | null = null
     open() {}
     loadAddon() {}
-    focus() {}
-    write(value: string) { this.writes.push(value) }
+    focus = vi.fn()
+    blur = vi.fn()
+    write(value: string, callback?: () => void) { this.writes.push(value); if (callback) this.callbacks.push(callback) }
     onData(handler: (value: string) => void) { this.dataHandler = handler; return { dispose: () => { this.dataHandler = null } } }
     onResize() { return { dispose: () => undefined } }
     dispose() { this.disposed = true }
@@ -35,7 +37,7 @@ vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit() {} } }))
 const cleanups: Array<() => void> = []
 afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); terminalInstances.length = 0; vi.restoreAllMocks() })
 
-function mountTerminal(access: TerminalAccess, props: { sessionKey?: string; target?: TerminalTarget } = { sessionKey: 'session-a' }) {
+function mountTerminal(access: TerminalAccess, props: { sessionKey?: string; target?: TerminalTarget; visible?: boolean } = { sessionKey: 'session-a' }) {
   const element = document.createElement('div')
   document.body.append(element)
   const app = createApp({ render: () => h(TerminalPanel, props) })
@@ -47,6 +49,45 @@ function mountTerminal(access: TerminalAccess, props: { sessionKey?: string; tar
 }
 
 describe('TerminalPanel', () => {
+  it('keeps the hidden parser and PTY, acknowledges consumption and avoids focus theft on return', async () => {
+    let outputHandler!: (event: TerminalOutput) => void
+    const access: TerminalAccess = {
+      create: vi.fn(async () => ({ terminalId: 'pty-hidden', sessionKey: 'session-a', cols: 80, rows: 24, shell: 'bash', outputFlowControl: 'consumed-v1' as const })),
+      consume: vi.fn(async (_id, seq) => ({ terminalId: 'pty-hidden', consumedSeq: seq })),
+      write: vi.fn(async () => ({ terminalId: 'pty-hidden', accepted: true, bytes: 1 })),
+      resize: vi.fn(async () => ({ terminalId: 'pty-hidden', cols: 80, rows: 24 })),
+      close: vi.fn(async () => ({ terminalId: 'pty-hidden', closed: true })),
+      onOutput: vi.fn(handler => { outputHandler = handler; return () => undefined }),
+      onExit: vi.fn(() => () => undefined),
+    }
+    const props = reactive({ sessionKey: 'session-a', visible: true })
+    mountTerminal(access, props)
+    await nextTick(); await new Promise(resolve => setTimeout(resolve, 0)); await nextTick()
+    const instance = terminalInstances[0]!
+    expect(access.create).toHaveBeenCalledWith('session-a', { cols: 100, rows: 30, outputFlowControl: 'consumed-v1' })
+    const focusCalls = instance.focus.mock.calls.length
+    props.visible = false
+    await nextTick()
+    expect(instance.options.cursorBlink).toBe(false)
+    expect(instance.blur).toHaveBeenCalledOnce()
+    outputHandler({ terminalId: 'pty-hidden', seq: 1, data: '\x1b[?1049hfullscreen', encoding: 'utf8' })
+    expect(instance.writes).toEqual(['\x1b[?1049hfullscreen'])
+    expect(access.consume).not.toHaveBeenCalled()
+    instance.callbacks.shift()?.()
+    await new Promise(resolve => setTimeout(resolve, 25))
+    expect(access.consume).toHaveBeenCalledWith('pty-hidden', 1, expect.any(AbortSignal))
+    await new Promise(resolve => setTimeout(resolve, 90))
+    expect(access.resize).not.toHaveBeenCalled()
+    expect(access.close).not.toHaveBeenCalled()
+    props.visible = true
+    await nextTick(); await nextTick()
+    expect(instance.options.cursorBlink).toBe(true)
+    expect(instance.focus).toHaveBeenCalledTimes(focusCalls)
+    expect(instance.disposed).toBe(false)
+    expect(terminalInstances).toHaveLength(1)
+    expect(access.create).toHaveBeenCalledTimes(1)
+  })
+
   it('opens a standalone target and only replays its own early output', async () => {
     const target: TerminalTarget = { kind: 'project', workspaceId: 'project-a' }
     const item = createTerminalWorkbenchItem('draft-a', target)
@@ -61,7 +102,8 @@ describe('TerminalPanel', () => {
       onExit: vi.fn(() => () => undefined),
     }
     const definition = createTerminalWorkbenchDefinition(access, key => key)
-    expect(definition.getProps?.(item, { active: true, hostAvailable: true, nativeSurface: false, runtimeState: {} })).toEqual({ target })
+    expect(definition.getProps?.(item, { active: true, hostAvailable: true, nativeSurface: false, runtimeState: {} })).toEqual({ target, visible: true })
+    expect(definition.getProps?.(item, { active: true, visible: false, hostAvailable: true, nativeSurface: false, runtimeState: {} })).toEqual({ target, visible: false })
     const { element } = mountTerminal(access, { target })
     expect(access.create).toHaveBeenCalledWith(target, { cols: 100, rows: 30 })
     outputHandler({ terminalId: 'other-same-target', target, seq: 1, data: 'wrong shell', encoding: 'utf8' })

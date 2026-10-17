@@ -66,6 +66,7 @@ GUEST_RPC_DENYLIST = frozenset(
         "terminal.write",
         "terminal.resize",
         "terminal.close",
+        "terminal.consume",
     }
 )
 

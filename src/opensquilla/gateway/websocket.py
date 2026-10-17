@@ -309,6 +309,7 @@ _BASE_DETACHED_RPC_METHODS: frozenset[str] = frozenset(
         "terminal.write",
         "terminal.resize",
         "terminal.close",
+        "terminal.consume",
     }
 ).union(
     _CONCURRENT_OPTIONAL_READ_METHODS,

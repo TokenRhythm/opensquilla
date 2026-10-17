@@ -27,6 +27,7 @@ export interface TerminalCreateOptions {
   rows?: number
   cwd?: string
   shell?: string
+  outputFlowControl?: 'consumed-v1'
 }
 
 export interface TerminalHandle {
@@ -37,6 +38,7 @@ export interface TerminalHandle {
   cols: number
   rows: number
   shell: string
+  outputFlowControl?: 'consumed-v1'
 }
 
 export interface TerminalOutput {
@@ -63,6 +65,8 @@ export interface TerminalAccess {
   write(terminalId: string, data: string, signal?: AbortSignal): Promise<{ terminalId: string; accepted: boolean; bytes: number }>
   resize(terminalId: string, cols: number, rows: number, signal?: AbortSignal): Promise<{ terminalId: string; cols: number; rows: number }>
   close(terminalId: string, reason?: string, signal?: AbortSignal): Promise<{ terminalId: string; closed: boolean }>
+  /** Acknowledge xterm parser consumption, never mere event receipt. */
+  consume?(terminalId: string, seq: number, signal?: AbortSignal): Promise<{ terminalId: string; consumedSeq: number }>
   onOutput(handler: (event: TerminalOutput) => void): () => void
   onExit(handler: (event: TerminalExit) => void): () => void
 }

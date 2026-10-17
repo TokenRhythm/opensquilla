@@ -11,9 +11,12 @@ export function createTerminalWorkbenchDefinition(
     component: TerminalPanel,
     supports: item => item.kind === 'terminal' && item.scope.type === 'session' && Boolean(terminal),
     getHeader: () => ({ title: t('workbench.terminal.title'), subtitle: t('workbench.terminal.subtitle'), icon: 'terminal' }),
-    getProps: (item: WorkbenchItem) => {
+    getProps: (item: WorkbenchItem, state) => {
       const target = normalizeTerminalTarget(item.payload.target)
-      return target ? { target } : { sessionKey: item.scope.type === 'session' ? item.scope.id : '' }
+      return {
+        ...(target ? { target } : { sessionKey: item.scope.type === 'session' ? item.scope.id : '' }),
+        visible: state.visible ?? (state.active && state.hostAvailable),
+      }
     },
   }
 }
