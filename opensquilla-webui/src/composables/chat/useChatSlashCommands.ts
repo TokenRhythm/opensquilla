@@ -93,9 +93,6 @@ export interface UseChatSlashCommandsOptions {
   ) => void
   showCompactionToast: (payload: Record<string, unknown>, meta?: Record<string, unknown>) => void
   notify: (message: string) => void
-  // Send the optional text after "/plan" through the normal composer path so
-  // attachments, intent, optimistic rendering, and retry restoration are kept.
-  dispatchPlanPrompt: (prompt: string, composerText: string) => void
   activatePlanMode?: () => boolean | Promise<boolean>
   planModeAvailable?: () => boolean
   // Arm the goal composer: selecting /goal switches the composer into goal
@@ -110,6 +107,17 @@ export interface UseChatSlashCommandsOptions {
 }
 
 export type SlashCommandClassification = 'registered' | 'unknown' | 'unavailable'
+
+export type SlashCommandExecution = boolean | {
+  kind: 'composer-prompt'
+  prompt: string
+  composerText: string
+}
+
+function isPlanModeAction(command: ChatSlashCommand): boolean {
+  const action = command.execution?.action || command.cmd || command.name
+  return action === 'plans.toggleMode' || action === 'plans.setMode' || action === '/plan'
+}
 
 function slashCommandKey(value: string): string {
   const raw = String(value || '').trim().split(/\s+/, 1)[0].toLowerCase()
@@ -516,30 +524,13 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     }
     const action = cmd?.execution?.action || cmd.cmd || cmd.name
     if (action === 'workbench.openSideChat') { void options.sideChat?.run(`/side ${args}`); return }
-    if (options.selectedSkills?.value.length) {
+    if (options.selectedSkills?.value.length && !isPlanModeAction(cmd)) {
       options.notify(i18n.global.t('chat.skillPalette.commandWithSkills'))
       return
     }
 
-    if (
-      action === 'plans.toggleMode'
-      || action === 'plans.setMode'
-      || action === '/plan'
-    ) {
-      closeSlashMenu()
-      const originalInput = options.inputText.value
-      const planPrompt = String(args || '').trim()
-      const submissionText = options.submissionText ?? options.inputText
-      const originalSubmission = submissionText.value
-      void Promise.resolve(options.activatePlanMode?.() ?? false).then((accepted) => {
-        if (!accepted || options.inputText.value !== originalInput || submissionText.value !== originalSubmission) return
-        if (planPrompt) {
-          options.dispatchPlanPrompt(planPrompt, originalSubmission)
-          return
-        }
-        options.inputText.value = ''
-        options.autoResizeTextarea()
-      })
+    if (isPlanModeAction(cmd)) {
+      void executePlanModeCommand(args)
       return
     }
     if (action === 'goal.set' || action === '/goal') {
@@ -717,10 +708,36 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     }
   }
 
+  async function executePlanModeCommand(args: string): Promise<SlashCommandExecution> {
+    closeSlashMenu()
+    const originalSession = options.sessionKey.value
+    const originalInput = options.inputText.value
+    const submissionText = options.submissionText ?? options.inputText
+    const originalSubmission = submissionText.value
+    const accepted = await (options.activatePlanMode?.() ?? false)
+    if (!accepted || options.sessionKey.value !== originalSession
+      || options.inputText.value !== originalInput || submissionText.value !== originalSubmission) return true
+    const prompt = args.trim()
+    if (prompt) {
+      // The active sender owns this continuation, including its draft snapshot,
+      // deduplication token, attachments, and acceptance callbacks.
+      return { kind: 'composer-prompt', prompt, composerText: originalSubmission }
+    }
+    options.inputText.value = ''
+    options.autoResizeTextarea()
+    return true
+  }
+
+  function isPlanModeCommand(text: string): boolean {
+    const key = slashCommandKey(text)
+    const command = availableCommands.value.find(candidate => slashCommandKeys(candidate).includes(key))
+    return Boolean(command && allowed(command) && isPlanModeAction(command))
+  }
+
   async function executeSlashCommand(
     text: string,
     knownClassification?: SlashCommandClassification,
-  ): Promise<boolean> {
+  ): Promise<SlashCommandExecution> {
     if (options.sideChat && parseSideChatCommand(text)) return options.sideChat.run(text)
     const classification = knownClassification ?? await classifySlashCommand(text)
     const trimmed = text.trim()
@@ -740,6 +757,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       closeSlashMenu()
       return false
     }
+    if (allowed(cmd) && isPlanModeAction(cmd)) return executePlanModeCommand(args)
     selectSlashCmd(cmd, args)
     return true
   }
@@ -775,5 +793,6 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     selectSlashCmd,
     classifySlashCommand,
     executeSlashCommand,
+    isPlanModeCommand,
   }
 }

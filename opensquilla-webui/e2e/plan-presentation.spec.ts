@@ -16,6 +16,7 @@ async function installGateway(
   page: Page,
   status: 'queued' | 'running',
   steps: RunStep[] = [{ stepId: 'inspect', title: 'Inspect', status: 'in_progress' }],
+  locale = 'en',
 ) {
   let dismissed = false
   let presentationRevision = 0
@@ -47,7 +48,7 @@ async function installGateway(
   const presentations = () => presentationRevision
     ? [{ revisionId: REVISION, dismissed, stateRevision: presentationRevision }]
     : []
-  await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+  await page.addInitScript(value => localStorage.setItem('opensquilla-locale', value), locale)
   await page.route('**/api/approvals', route => route.fulfill({ json: { mode: 'prompt', pending: [] } }))
   await page.route('**/api/elevated-mode', route => route.fulfill({ json: { enabled: false } }))
   await page.route('**/api/system/update', route => route.fulfill({ json: {} }))
@@ -145,6 +146,61 @@ async function installGateway(
       settle()
     },
   }
+}
+
+for (const width of [1600, 390]) {
+  test(`Chinese plan header stays readable and operable in a narrow conversation at ${width}px`, { tag: '@plan-goal-runtime' }, async ({ page }) => {
+    await page.setViewportSize({ width, height: 950 })
+    await installGateway(page, 'running', Array.from({ length: 8 }, (_, index) => ({
+      stepId: `inspect-${index}`, title: `核验第 ${index + 1} 项实现要求与验收结果`, status: 'pending',
+    })), 'zh-Hans')
+    await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
+    const card = page.locator(`[data-plan-revision-id="${REVISION}"]`)
+    await expect(card).toBeVisible()
+
+    if (width > 640) {
+      // Reproduce a narrow container at a wide desktop viewport through the
+      // real workbench split. A mobile-only media query cannot cover this.
+      if (await page.getByTestId('sidebar-toggle-expanded').getAttribute('aria-expanded') !== 'true') {
+        await page.getByTestId('sidebar-toggle-collapsed').click()
+      }
+      await page.getByTestId('topbar-workbench-toggle').click()
+      const divider = page.getByRole('separator', { name: '调整工作区宽度', exact: true })
+      await expect(divider).toBeVisible()
+      await divider.press('End')
+      await expect.poll(async () => (await card.boundingBox())?.width ?? Infinity).toBeLessThan(450)
+    }
+
+    await expect(card.locator('.plan-card__eyebrow')).toHaveText('实施方案')
+    await expect.poll(() => card.evaluate(element => {
+      const header = element.querySelector<HTMLElement>('.plan-card__header')!
+      const label = header.querySelector<HTMLElement>('.plan-card__eyebrow')!
+      const icon = header.querySelector<HTMLElement>('.plan-card__icon')!
+      const labelBounds = label.getBoundingClientRect()
+      const headerBounds = header.getBoundingClientRect()
+      const controls = [...header.querySelectorAll<HTMLElement>('.plan-card__header-actions > *')]
+        .map(control => control.getBoundingClientRect())
+      const items = [labelBounds, icon.getBoundingClientRect(), ...controls]
+      return labelBounds.height <= parseFloat(getComputedStyle(label).lineHeight) + 1
+        && icon.getBoundingClientRect().width >= 16
+        && controls.every(control => control.left >= headerBounds.left - 1 && control.right <= headerBounds.right + 1)
+        && items.every((control, index) => items.slice(index + 1).every(other =>
+          Math.min(control.right, other.right) - Math.max(control.left, other.left) <= 1
+          || Math.min(control.bottom, other.bottom) - Math.max(control.top, other.top) <= 1))
+    }), { message: 'The label stays on one line and header controls fit without overlapping' }).toBe(true)
+
+    if (width > 640) {
+      await expect.poll(() => card.locator('.plan-card__revision').evaluate(element =>
+        element.clientWidth > 0 && element.scrollWidth > element.clientWidth)).toBe(true)
+    }
+
+    const disclosure = card.locator('.plan-card__disclosure')
+    await expect(disclosure).toBeVisible()
+    await disclosure.click()
+    await expect(disclosure).toHaveAttribute('aria-expanded', 'true')
+    await card.getByRole('button', { name: '隐藏计划', exact: true }).click()
+    await expect(card.getByRole('button', { name: '显示计划', exact: true })).toBeVisible()
+  })
 }
 
 for (const completedCount of [0, 1, 4]) {
