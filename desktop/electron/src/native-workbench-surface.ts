@@ -675,6 +675,11 @@ export interface NativeWorkbenchSurfaceManagerOptions {
   permissionTimeoutMs?: number
 }
 
+export interface NativeWorkbenchBrowserTabsCloseOptions {
+  /** Obtain consent for this exact batch before any native page close. */
+  confirm?(snapshot: { readonly tabCount: number }): boolean | Promise<boolean>
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -3875,27 +3880,32 @@ export class NativeWorkbenchSurfaceManager {
       && !record.disposed && !record.contents.isDestroyed())
   }
 
-  async closeBrowserTabs(): Promise<boolean> {
-    if (this.browserTabsClosePromise) return this.browserTabsClosePromise
+  async closeBrowserTabs(options: NativeWorkbenchBrowserTabsCloseOptions = {}): Promise<boolean> {
+    if (this.browserTabsClosePromise) {
+      // A caller with its own confirmation cannot borrow another operation's
+      // decision, which may cover a reload rather than the application's quit.
+      return options.confirm ? false : this.browserTabsClosePromise
+    }
     // Individual native closes are destructive even for clean documents. The
     // batch must obtain one decision before admitting any of them.
     const closing = Promise.resolve().then(async () => {
       const records = [...this.surfaces.values()].filter(record => record.kind === 'url-preview'
         && !record.disposed && !record.contents.isDestroyed())
-      if (!records.length) return true
+      if (!records.length && !options.confirm) return true
       if (records.some(record => record.browserClosePromise || record.owner.isDestroyed())) return false
       const snapshot = records.map(record => ({ record, url: record.contents.getURL(),
         generation: record.annotationDocumentGeneration }))
       const chinese = app.getLocale().toLowerCase().startsWith('zh')
-      const approved = dialog.showMessageBoxSync(records[0]!.owner, {
-        type: 'question',
-        buttons: chinese ? ['保留网页', '关闭所有网页'] : ['Keep pages', 'Close all pages'],
-        title: chinese ? '关闭所有网页？' : 'Close all pages?',
-        message: chinese
-          ? `关闭所有会话的 ${records.length} 个网页，网页中未保存的内容可能丢失。`
-          : `Close ${records.length} web pages across all sessions? Unsaved changes in these pages may be lost.`,
-        defaultId: 0, cancelId: 0, noLink: true,
-      }) === 1
+      const approved = options.confirm ? await options.confirm({ tabCount: snapshot.length })
+        : dialog.showMessageBoxSync(records[0]!.owner, {
+          type: 'question',
+          buttons: chinese ? ['保留网页', '关闭所有网页'] : ['Keep pages', 'Close all pages'],
+          title: chinese ? '关闭所有网页？' : 'Close all pages?',
+          message: chinese
+            ? `关闭所有会话的 ${records.length} 个网页，网页中未保存的内容可能丢失。`
+            : `Close ${records.length} web pages across all sessions? Unsaved changes in these pages may be lost.`,
+          defaultId: 0, cancelId: 0, noLink: true,
+        }) === 1
       if (!approved) return false
       const unchanged = (entry: typeof snapshot[number]) => !entry.record.disposed
         && !entry.record.contents.isDestroyed() && this.surfaces.get(entry.record.id) === entry.record

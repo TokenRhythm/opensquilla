@@ -395,6 +395,18 @@ for (const terminationResult of [false, true]) {
   assert.deepEqual(prompts, ['active', 'unknown'], 'unknown activity requires explicit confirmation')
 }
 
+// Browser-only quits still require consent even with an idle Gateway.
+for (const accepted of [false, true]) {
+  const confirmation = new DesktopQuitConfirmation()
+  const prompts = []
+  assert.equal(await confirmation.request({
+    check: async () => 'idle',
+    confirmWhenIdle: true,
+    confirm: async state => { prompts.push(state); return accepted },
+  }), accepted)
+  assert.deepEqual(prompts, ['idle'])
+}
+
 for (const failurePhase of ['check', 'confirm']) {
   const confirmation = new DesktopQuitConfirmation()
   const expectedError = new Error(`synthetic ${failurePhase} failure`)

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>OpenSquilla PR1793 Acceptance</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<style>
+:root{font:14px/1.5 "Segoe UI",sans-serif;color-scheme:light dark}body{margin:0;padding:22px;background:Canvas;color:CanvasText}h1{font-size:21px;margin:0 0 8px}.scope{color:#6b7280;font-size:12px;margin:0 0 18px}label{display:flex;justify-content:space-between;gap:12px;margin:10px 0}select,button{font:inherit;padding:7px 10px;border:1px solid #94a3b8;border-radius:7px}button{cursor:pointer;background:ButtonFace;color:ButtonText}.buttons{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:16px 0}#state{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 Consolas,monospace;border:1px solid #94a3b8;border-radius:8px;padding:12px;max-height:340px;overflow:auto}#error{color:#ef4444;white-space:pre-wrap}fieldset{border:1px solid #94a3b8;border-radius:8px;margin:16px 0;padding:10px}legend{font-weight:600}input[type=checkbox]{width:18px;height:18px}
+</style></head><body>
+<h1>OpenSquilla PR1793 Acceptance</h1>
+<p class="scope">Isolated native fixture. Production close/quit handlers, dialogs and browser-page manager. The ticking task and Gateway activity/cleanup adapters are synthetic.</p>
+<label>Close preference<select id="behavior"><option value="ask">Ask</option><option value="background">Run in background</option><option value="quit">Quit</option></select></label>
+<label>Language<select id="locale"><option value="en">English</option><option value="zh">中文</option></select></label>
+<label>Theme<select id="theme"><option value="light">Light</option><option value="dark">Dark</option><option value="system">System</option></select></label>
+<label>Task activity<select id="activity"><option value="active">Active ticking process</option><option value="idle">Idle</option><option value="unknown">Unknown</option></select></label>
+<label>Simulate cleanup failure<input id="cleanupFailure" type="checkbox"></label>
+<label>Use real OS error box<input id="manualNativeErrors" type="checkbox"></label>
+<div class="buttons">
+<button id="closeMain" data-action="close-main">Click app X</button><button id="showMain" data-action="show-main">Reveal app</button>
+<button id="quit" data-action="quit">Menu Quit</button><button id="repeatQuit" data-action="repeat-quit">Quit × 4</button>
+<button id="addPage" data-action="add-page">Add unsaved page</button><button id="navigatePage" data-action="navigate-page">Navigate page</button>
+<button id="holdWriter" data-action="hold-writer">Hold profile writer</button><button id="finishWriter" data-action="finish-writer">Finish writer</button>
+<button id="signal" data-action="signal">Signal quit</button><button id="longCopy" data-action="long-copy">Longest EN/CN copy</button>
+<button id="reset" data-action="reset">Reset synthetic session</button><button id="stopFixture" data-action="stop-fixture">Stop fixture</button>
+</div>
+<div id="error" role="status"></div><pre id="state" aria-label="Live acceptance state">Starting…</pre>
+<script>
+const api=window.quitAcceptance
+async function command(action,options){try{document.getElementById('error').textContent='';return await api.command(action,options)}catch(error){document.getElementById('error').textContent=String(error)}}
+document.querySelectorAll('[data-action]').forEach(button=>button.onclick=()=>command(button.dataset.action))
+for(const id of ['behavior','locale','theme','activity','cleanupFailure','manualNativeErrors'])document.getElementById(id).onchange=()=>command('configure',{[id]:document.getElementById(id).type==='checkbox'?document.getElementById(id).checked:document.getElementById(id).value})
+setInterval(async()=>{try{const state=await api.snapshot();document.getElementById('state').textContent=JSON.stringify(state,null,2);for(const id of ['behavior','locale','theme','activity','cleanupFailure','manualNativeErrors']){const input=document.getElementById(id);if(document.activeElement===input)continue;if(input.type==='checkbox')input.checked=Boolean(state[id]);else input.value=state[id]}}catch{}},250)
+</script></body></html>

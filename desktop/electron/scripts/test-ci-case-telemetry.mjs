@@ -23,7 +23,7 @@ import {
   requestElectronQuitWithConfirmation,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
-import { buildDesktopQuitDialogHtml } from '../dist/desktop-quit-dialog.js'
+import { buildDesktopQuitDialogHtml, parseDesktopQuitDialogResponse } from '../dist/desktop-quit-dialog.js'
 import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
 import { captureFirstSendDiagnostic } from './packaged-first-send-cleanup.mjs'
 
@@ -41,7 +41,7 @@ try {
   for (const mode of ['confirm', 'missing-window', 'missing-exit', 'early-exit', 'already-exited', 'wrong-window', 'click-failed']) {
     const calls = []
     const child = new EventEmitter()
-    Object.assign(child, { exitCode: mode === 'already-exited' ? 0 : null, signalCode: null })
+    Object.assign(child, { pid: process.pid, exitCode: mode === 'already-exited' ? 0 : null, signalCode: null })
     const app = new EventEmitter()
     app.process = () => child
     app.close = () => assert.fail('expected confirmation must precede Playwright app.close')
@@ -56,17 +56,20 @@ try {
     assert.equal(scriptStart.length, 2, 'the generated quit document must have one script')
     const scriptEnd = scriptStart[1].split('</script>')
     assert.equal(scriptEnd.length, 2, 'the generated quit script must have a closing tag')
+    const buttons = new Map(['keep', 'confirm'].map(id => [id, {
+      addEventListener: (event, callback) => listeners.set(`${id}:${event}`, callback),
+      focus() {}, disabled: false,
+    }]))
     runInNewContext(scriptEnd[0], {
       document: {
-        getElementById: id => ({
-          addEventListener: (event, callback) => listeners.set(`${id}:${event}`, callback),
-          focus() {},
-        }),
+        getElementById: id => buttons.get(id) ?? null,
+        querySelectorAll: selector => { assert.equal(selector, 'button'); return [...buttons.values()] },
       },
       window: {
         addEventListener() {},
         opensquillaDesktop: { quitDialogRespond: response => {
-          calls.push(`ipc:${response}`)
+          assert.equal(response.remember, false)
+          calls.push(`ipc:${parseDesktopQuitDialogResponse(response)}`)
           if (mode !== 'missing-exit') {
             child.exitCode = 0
             child.emit('exit', 0)
@@ -131,32 +134,59 @@ try {
   }
 
   {
-    const child = new EventEmitter()
-    Object.assign(child, { exitCode: null, signalCode: null, killed: false })
-    child.kill = signal => {
-      child.signalCode = signal
-      child.killed = true
-      child.emit('exit', null, signal)
-    }
-    const app = new EventEmitter()
-    app.process = () => child
-    app.evaluate = async callback => callback({ app: { quit() {} } })
-    let sharedSignal
-    const result = await closeElectronWithDeadline({
-      app, phase: 'synthetic-missing-quit-dialog', timeoutMs: 25, emit() {},
-      requestClose: options => {
-        sharedSignal = options.signal
-        assert.equal(options.timeoutMs, 25)
-        return requestElectronQuitWithConfirmation(app, options)
-      },
+    // A missing expected dialog still exercises real cleanup. The strict
+    // shutdown helper must only force a process this test actually spawned.
+    const child = spawn(process.execPath, ['-e', `
+      process.on('disconnect', () => process.exit(0));
+      process.send({ type: 'ready', pid: process.pid });
+      setInterval(() => {}, 1000);
+    `], {
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+      detached: process.platform !== 'win32',
+      windowsHide: true,
     })
-    assert.equal(result.closed, false, 'a missing expected prompt must remain a failure')
-    assert.equal(result.closeErrorCode, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
-    assert.equal(sharedSignal.aborted, true)
-    assert.equal(child.killed, true)
-    assert.equal(app.listenerCount('window'), 0)
-    assert.equal(child.listenerCount('exit'), 0)
-    assert.equal(getEventListeners(sharedSignal, 'abort').length, 0)
+    const childClosed = new Promise(resolveClose => child.once('close', resolveClose))
+    try {
+      const [ready] = await once(child, 'message', { signal: AbortSignal.timeout(5_000) })
+      assert.deepEqual(ready, { type: 'ready', pid: child.pid })
+      const exitListeners = child.listenerCount('exit')
+      const app = new EventEmitter()
+      app.process = () => child
+      app.evaluate = async callback => callback({ app: { quit() {} } })
+      let sharedSignal
+      const result = await closeElectronWithDeadline({
+        app, phase: 'synthetic-missing-quit-dialog', timeoutMs: 25, emit() {},
+        requestClose: options => {
+          sharedSignal = options.signal
+          assert.equal(options.timeoutMs, 25)
+          return requestElectronQuitWithConfirmation(app, options)
+        },
+      })
+      const supportsOwnedTreeReaping = ['win32', 'linux'].includes(process.platform)
+      assert.equal(result.closed, false, 'a missing expected prompt must remain a failure')
+      assert.equal(result.closeErrorCode, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
+      assert.equal(sharedSignal.aborted, true)
+      assert.equal(result.forcedExitSucceeded, supportsOwnedTreeReaping)
+      assert.equal(result.processTreeReaped, supportsOwnedTreeReaping)
+      assert.equal(child.exitCode !== null || child.signalCode !== null, supportsOwnedTreeReaping)
+      assert.equal(app.listenerCount('window'), 0)
+      assert.equal(child.listenerCount('exit'), exitListeners)
+      assert.equal(getEventListeners(sharedSignal, 'abort').length, 0)
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      let closeTimer
+      try {
+        await Promise.race([
+          childClosed,
+          new Promise((_, reject) => {
+            closeTimer = setTimeout(() => reject(new Error('Owned missing-dialog fixture did not close')), 5_000)
+          }),
+        ])
+      } finally {
+        clearTimeout(closeTimer)
+      }
+    }
+    assert.throws(() => process.kill(child.pid, 0), { code: 'ESRCH' })
   }
 
   for (const scheme of [

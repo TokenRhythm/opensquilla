@@ -5,7 +5,8 @@ export type DesktopQuitActivity = 'idle' | 'active' | 'unknown'
 
 export interface DesktopQuitConfirmationOptions {
   check(): Promise<DesktopQuitActivity>
-  confirm(state: Exclude<DesktopQuitActivity, 'idle'>): Promise<boolean>
+  confirmWhenIdle?: boolean
+  confirm(state: DesktopQuitActivity): Promise<boolean>
 }
 
 /** Coalesce one activity check and prompt without committing the application's exit. */
@@ -16,7 +17,7 @@ export class DesktopQuitConfirmation {
     if (this.pending) return this.pending
     const pending = Promise.resolve()
       .then(() => options.check())
-      .then(state => state === 'idle' ? true : options.confirm(state))
+      .then(state => state === 'idle' && !options.confirmWhenIdle ? true : options.confirm(state))
       .finally(() => { this.pending = null })
     this.pending = pending
     return pending

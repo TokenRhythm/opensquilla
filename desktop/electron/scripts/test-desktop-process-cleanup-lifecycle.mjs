@@ -7,6 +7,7 @@ import ts from '@typescript/typescript6'
 import {
   DESKTOP_QUIT_TERMINATION_MS, DesktopQuitBudget, DesktopQuitConfirmation, quitGatewayWithinBudget,
 } from '../dist/desktop-quit.js'
+import { DesktopWriterAdmission } from '../dist/desktop-writer-admission.js'
 import { stopAndJoinLifecycleProcesses } from '../dist/gateway-lifecycle.js'
 import {
   evaluateFirstSendEvidence, parseEvidenceLog, summarizeDesktopLog,
@@ -73,7 +74,7 @@ function harness({ exited = false, platform = 'darwin', complete = true } = {}) 
   const env = {
     process: { platform },
     DesktopQuitBudget, DESKTOP_QUIT_TERMINATION_MS,
-    isQuitting: false, updateApplying: false, gatewayStoppingProcesses: new Set([child]),
+    appExitPhase: 'running', isQuitting: false, updateApplying: false, gatewayStoppingProcesses: new Set([child]),
     gatewayProcess: child, gatewayState: { owned: true }, stopAndJoinLifecycleProcesses,
     restartAllowed: true, transitionGatewayConnection: () => order.push('profile-error'),
     cancelGatewayUnexpectedExitRestart() {}, desktopStartupLog() {},
@@ -94,9 +95,15 @@ function harness({ exited = false, platform = 'darwin', complete = true } = {}) 
     quitConfirmed: false, quitFromSignal: false, quitConfirmationPromise: null,
     quitConfirmationWantsExit: false, systemSessionEnding: false,
     desktopQuitConfirmation: new DesktopQuitConfirmation(),
+    desktopWriters: new DesktopWriterAdmission(), quitWriterAdmission: null,
+    waitForDesktopWriterOperations: () => env.desktopWriters.waitForAtMost(0),
+    nativeWorkbenchSurfaces: {
+      hasBrowserTabs: () => false,
+      closeBrowserTabs: async ({ confirm }) => await confirm({ tabCount: 0 }),
+    },
     currentMainWindow: () => null, currentOnboardingWindow: () => null,
     desktopT: key => key, app: { quit: () => order.push('quit-confirmed') },
-    showDesktopQuitConfirmation: async () => false,
+    showDesktopQuitConfirmation: async () => ({ response: 'cancel', remember: false }),
     readVerifiedDesktopGatewayActivity: async () => ({ kind: 'ok', activeCount: 0 }),
     cleanupDesktopProcessTrees: async options => {
       assert.equal(options.launch, launch, 'use retained launch authority, never the current profile')

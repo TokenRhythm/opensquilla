@@ -1296,6 +1296,7 @@ jobs:
           node scripts/test-desktop-window-lifecycle.mjs
           node scripts/test-desktop-quit.mjs
           node scripts/test-desktop-close-confirmation.mjs
+          node scripts/test-browser-quit-confirmation.mjs
           node scripts/test-desktop-quit-failure.mjs
           node scripts/test-desktop-quit-dialog.mjs
           node scripts/test-desktop-process-cleanup.mjs
@@ -2740,6 +2741,7 @@ jobs:
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'desktop-quit-interaction:scripts/test-desktop-quit-native-acceptance.mjs'
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
@@ -2780,6 +2782,7 @@ jobs:
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'desktop-quit-interaction:scripts/test-desktop-quit-native-acceptance.mjs'
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
               )
               ;;
@@ -2788,6 +2791,7 @@ jobs:
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'desktop-quit-interaction:scripts/test-desktop-quit-native-acceptance.mjs'
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'

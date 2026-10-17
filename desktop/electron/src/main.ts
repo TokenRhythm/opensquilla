@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, powerMonitor, protocol, safeStorage, shell, Tray } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, powerMonitor, protocol, safeStorage, screen, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { parse as parseToml } from 'smol-toml'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
@@ -32,6 +32,7 @@ import {
   DESKTOP_QUIT_TERMINATION_MS,
   DesktopQuitBudget,
   DesktopQuitConfirmation,
+  type DesktopQuitActivity,
   quitGatewayWithinBudget,
 } from './desktop-quit.js'
 import {
@@ -41,6 +42,7 @@ import {
 import {
   buildDesktopQuitDialogHtml,
   parseDesktopQuitDialogResponse,
+  type DesktopQuitDialogDecision,
 } from './desktop-quit-dialog.js'
 import {
   acknowledgeDesktopActivation, clearDesktopActivationAcknowledgements,
@@ -641,7 +643,7 @@ let appExitPhase: DesktopExitPhase = 'running'
 let systemSessionEnding = false
 let windowsSessionEndPreviousPhase: DesktopExitPhase | null = null
 let windowsSessionEndResetTimer: NodeJS.Timeout | null = null
-let mainWindowClosePrompt: Promise<void> | null = null
+let mainWindowClosePrompt: Promise<DesktopQuitDialogDecision> | null = null
 let pendingDesktopDeepLinkOpen = false
 let pendingDesktopSessionKey: string | null = null
 let desktopDeepLinkActivationReady = false
@@ -3843,6 +3845,9 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'quit.active': 'There are unfinished tasks.',
     'quit.unknown': 'OpenSquilla could not check whether tasks are still running.',
     'quit.detail': 'Quitting will stop tasks and try to save the replies and execution records received so far.',
+    'quit.pages': 'There are open web pages.',
+    'quit.pagesDetail': 'Quitting will close all open web pages across sessions ({count}). Unsaved changes in these pages may be lost.',
+    'quit.confirmPages': 'Quit',
     'quit.keepRunning': 'Keep Running',
     'quit.confirm': 'Stop Tasks and Quit',
     'quit.exiting': 'Quitting OpenSquilla…',
@@ -3860,7 +3865,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'tray.backgroundDetail': 'Tasks, schedules, and connected channels continue in the background. Open or quit OpenSquilla from the system tray.',
     'closePrompt.title': 'Close OpenSquilla?',
     'closePrompt.message': 'What should happen when the main window closes?',
-    'closePrompt.detail': 'Background mode keeps tasks, schedules, and connected channels running. Explicit Quit safely stops the local runtime.',
+    'closePrompt.detail': 'Background mode keeps tasks and web pages running.',
     'closePrompt.background': 'Keep running in background',
     'closePrompt.quit': 'Quit OpenSquilla',
     'closePrompt.cancel': 'Cancel',
@@ -3999,6 +4004,9 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'quit.active': '当前还有未完成的任务。',
     'quit.unknown': '暂时无法确认是否还有任务正在运行。',
     'quit.detail': '退出将停止任务，并尝试保存已收到的回复和执行记录。',
+    'quit.pages': '当前还有打开的网页。',
+    'quit.pagesDetail': '退出将关闭所有会话的 {count} 个网页，网页中未保存的内容可能丢失。',
+    'quit.confirmPages': '退出',
     'quit.keepRunning': '继续运行',
     'quit.confirm': '停止任务并退出',
     'quit.exiting': '正在退出 OpenSquilla…',
@@ -4016,7 +4024,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'tray.backgroundDetail': '任务、定时任务和已连接渠道会继续在后台运行。可从系统托盘打开或退出 OpenSquilla。',
     'closePrompt.title': '关闭 OpenSquilla？',
     'closePrompt.message': '关闭主窗口时要执行什么操作？',
-    'closePrompt.detail': '后台模式会继续运行任务、定时任务和已连接渠道；显式退出会安全停止本地运行时。',
+    'closePrompt.detail': '后台运行会保留任务和打开的网页。',
     'closePrompt.background': '继续在后台运行',
     'closePrompt.quit': '退出 OpenSquilla',
     'closePrompt.cancel': '取消',
@@ -4155,7 +4163,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'tray.backgroundDetail': 'タスク、スケジュール、接続済みチャンネルはバックグラウンドで続行します。システムトレイから開くか終了できます。',
     'closePrompt.title': 'OpenSquilla を閉じますか？',
     'closePrompt.message': 'メインウィンドウを閉じるときの動作を選択してください。',
-    'closePrompt.detail': 'バックグラウンドモードではタスク、スケジュール、接続済みチャンネルが継続します。明示的に終了するとローカルランタイムを安全に停止します。',
+    'closePrompt.detail': 'バックグラウンドではタスクと開いているページを維持します。',
     'closePrompt.background': 'バックグラウンドで続行',
     'closePrompt.quit': 'OpenSquilla を終了',
     'closePrompt.cancel': 'キャンセル',
@@ -4291,7 +4299,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'tray.backgroundDetail': 'Les tâches, planifications et canaux connectés continuent en arrière-plan. Ouvrez ou quittez OpenSquilla depuis la zone de notification.',
     'closePrompt.title': 'Fermer OpenSquilla ?',
     'closePrompt.message': 'Que doit-il se passer à la fermeture de la fenêtre principale ?',
-    'closePrompt.detail': 'Le mode arrière-plan maintient les tâches, planifications et canaux connectés. Quitter explicitement arrête le runtime local en toute sécurité.',
+    'closePrompt.detail': 'Les tâches et les pages restent actives en arrière-plan.',
     'closePrompt.background': 'Continuer en arrière-plan',
     'closePrompt.quit': 'Quitter OpenSquilla',
     'closePrompt.cancel': 'Annuler',
@@ -4427,7 +4435,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'tray.backgroundDetail': 'Aufgaben, Zeitpläne und verbundene Kanäle laufen im Hintergrund weiter. Öffnen oder beenden Sie OpenSquilla über den Infobereich.',
     'closePrompt.title': 'OpenSquilla schließen?',
     'closePrompt.message': 'Was soll beim Schließen des Hauptfensters geschehen?',
-    'closePrompt.detail': 'Im Hintergrundmodus laufen Aufgaben, Zeitpläne und verbundene Kanäle weiter. Beim expliziten Beenden wird die lokale Laufzeit sicher gestoppt.',
+    'closePrompt.detail': 'Aufgaben und geöffnete Webseiten laufen im Hintergrund weiter.',
     'closePrompt.background': 'Im Hintergrund weiter ausführen',
     'closePrompt.quit': 'OpenSquilla beenden',
     'closePrompt.cancel': 'Abbrechen',
@@ -4563,7 +4571,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'tray.backgroundDetail': 'Las tareas, programaciones y canales conectados continúan en segundo plano. Abre o cierra OpenSquilla desde la bandeja del sistema.',
     'closePrompt.title': '¿Cerrar OpenSquilla?',
     'closePrompt.message': '¿Qué debe ocurrir al cerrar la ventana principal?',
-    'closePrompt.detail': 'El modo en segundo plano mantiene las tareas, programaciones y canales conectados. Salir explícitamente detiene el entorno local de forma segura.',
+    'closePrompt.detail': 'Las tareas y páginas siguen activas en segundo plano.',
     'closePrompt.background': 'Seguir ejecutando en segundo plano',
     'closePrompt.quit': 'Salir de OpenSquilla',
     'closePrompt.cancel': 'Cancelar',
@@ -5380,54 +5388,25 @@ function registerDesktopDeepLinkProtocolClient(): void {
   }
 }
 
-async function promptForMainWindowClose(window: BrowserWindow): Promise<void> {
+async function promptForMainWindowClose(
+  window: BrowserWindow,
+  activity: DesktopQuitActivity,
+  tabCount: number,
+): Promise<DesktopQuitDialogDecision> {
   if (mainWindowClosePrompt) return await mainWindowClosePrompt
-  const canFinishClose = (): boolean => !window.isDestroyed() && appExitPhase === 'running'
-    && !quitConfirmationWantsExit && !quitConfirmed && !systemSessionEnding && !updateApplying
-  mainWindowClosePrompt = (async () => {
-    const result = await dialog.showMessageBox(window, {
-      type: 'question',
-      title: desktopT('closePrompt.title'),
-      message: desktopT('closePrompt.message'),
-      detail: desktopT('closePrompt.detail'),
-      buttons: [
-        desktopT('closePrompt.background'),
-        desktopT('closePrompt.quit'),
-        desktopT('closePrompt.cancel'),
-      ],
-      defaultId: 0,
-      cancelId: 2,
-      checkboxLabel: desktopT('closePrompt.remember'),
-      checkboxChecked: false,
-      noLink: true,
-    })
-    if (!canFinishClose()) return
-    if (result.response === 0) {
-      if (result.checkboxChecked) {
-        await saveDesktopPreferences({
-          mainWindowCloseBehavior: 'background',
-        }).catch((error) => {
-          desktopLog('desktop_preferences_save_failed', {
-            error: error instanceof Error ? error.message : String(error),
-          })
-        })
-      }
-      if (canFinishClose()) hideMainWindow(window)
-      return
-    }
-    if (result.response === 1) {
-      if (result.checkboxChecked) {
-        await saveDesktopPreferences({
-          mainWindowCloseBehavior: 'quit',
-        }).catch((error) => {
-          desktopLog('desktop_preferences_save_failed', {
-            error: error instanceof Error ? error.message : String(error),
-          })
-        })
-      }
-      if (canFinishClose()) app.quit()
-    }
-  })().finally(() => {
+  const pagesDetail = tabCount > 0
+    ? desktopT('quit.pagesDetail').replace('{count}', String(tabCount)) : ''
+  mainWindowClosePrompt = showDesktopQuitConfirmation({
+    parent: window,
+    title: desktopT('closePrompt.title'),
+    message: desktopT(activity === 'idle' ? 'closePrompt.message' : activity === 'active' ? 'quit.active' : 'quit.unknown'),
+    detail: [desktopT('closePrompt.detail'),
+      activity !== 'idle' ? desktopT('quit.detail') : '', pagesDetail].filter(Boolean).join('\n\n'),
+    keepRunning: desktopT('closePrompt.cancel'),
+    background: desktopT('closePrompt.background'),
+    confirm: desktopT(activity === 'idle' ? 'closePrompt.quit' : 'quit.confirm'),
+    remember: desktopT('closePrompt.remember'),
+  }).finally(() => {
     mainWindowClosePrompt = null
   })
   return await mainWindowClosePrompt
@@ -5455,16 +5434,15 @@ function handleMainWindowClose(window: BrowserWindow, event: Electron.Event): vo
     app.quit()
     return
   }
-  const closeIdleWindow = (): void | Promise<void> => {
+  if (action === 'hide') {
+    // Closing to the background preserves tasks and pages, regardless of
+    // whether the Gateway is busy or temporarily unavailable. A protected
+    // update or confirmed quit still owns the visible progress window.
     if (window.isDestroyed() || systemSessionEnding || updateApplying || quitConfirmed) return
-    if (action === 'hide') hideMainWindow(window)
-    else return promptForMainWindowClose(window)
+    hideMainWindow(window)
+    return
   }
-  // Keep the parent visible until its owned Gateway reports idle. Active (or
-  // unknown) work uses the same confirmation as a tray/menu Quit, irrespective
-  // of the idle-window background preference.
-  if (appExitPhase === 'running' && holdQuitForTaskConfirmation(event, closeIdleWindow)) return
-  closeIdleWindow()
+  if (appExitPhase === 'running') holdQuitForTaskConfirmation(event, window)
 }
 
 function reloadDesktopWindow(ignoreCache: boolean): void {
@@ -16097,11 +16075,13 @@ async function showDesktopQuitConfirmation(options: {
   detail: string
   keepRunning: string
   confirm: string
-}): Promise<boolean> {
+  background?: string
+  remember?: string
+}): Promise<DesktopQuitDialogDecision> {
   const parent = options.parent && !options.parent.isDestroyed() ? options.parent : undefined
   const confirmationWindow = new BrowserWindow({
-    width: 500,
-    height: 300,
+    width: options.background ? 560 : 500,
+    height: options.background ? 420 : options.detail.includes('\n\n') ? 340 : 300,
     useContentSize: true,
     resizable: false,
     minimizable: false,
@@ -16122,29 +16102,44 @@ async function showDesktopQuitConfirmation(options: {
       sandbox: true,
     },
   })
-  let resolve!: (accepted: boolean) => void
-  const resultPromise = new Promise<boolean>(accept => { resolve = accept })
+  let resolve!: (decision: DesktopQuitDialogDecision) => void
+  const resultPromise = new Promise<DesktopQuitDialogDecision>(accept => { resolve = accept })
   let settled = false
-  const settle = (accepted: boolean): void => {
+  const settle = (decision: DesktopQuitDialogDecision): void => {
     if (settled) return
     settled = true
     if (!confirmationWindow.isDestroyed()) confirmationWindow.close()
-    resolve(accepted)
+    resolve(decision)
   }
   const responseListener = (event: Electron.IpcMainEvent, value: unknown): void => {
     if (event.sender.id !== confirmationWindow.webContents.id) return
     const response = parseDesktopQuitDialogResponse(value)
-    if (response) settle(response === 'confirm')
+    if (!response || (response === 'background' && !options.background)) return
+    const remember = Boolean(options.remember) && typeof value === 'object' && value !== null
+      && 'remember' in value && value.remember === true
+    settle({ response, remember })
   }
   ipcMain.on('desktop:quit-dialog-response', responseListener)
   confirmationWindow.on('closed', () => {
     ipcMain.removeListener('desktop:quit-dialog-response', responseListener)
-    settle(false)
+    settle({ response: 'cancel', remember: false })
   })
   confirmationWindow.webContents.on('will-navigate', event => event.preventDefault())
   confirmationWindow.once('ready-to-show', () => {
     if (!confirmationWindow.isDestroyed()) {
-      confirmationWindow.center()
+      if (parent && !parent.isDestroyed()) {
+        const owner = parent.getBounds()
+        const bounds = confirmationWindow.getBounds()
+        const area = screen.getDisplayMatching(owner).workArea
+        // Keep the decision visibly attached to its parent, including when the
+        // parent straddles displays or has been moved partly off screen.
+        const x = Math.round(owner.x + (owner.width - bounds.width) / 2)
+        const y = Math.round(owner.y + (owner.height - bounds.height) / 2)
+        confirmationWindow.setPosition(
+          Math.max(area.x, Math.min(x, area.x + Math.max(0, area.width - bounds.width))),
+          Math.max(area.y, Math.min(y, area.y + Math.max(0, area.height - bounds.height))),
+        )
+      } else confirmationWindow.center()
       confirmationWindow.show()
       confirmationWindow.focus()
     }
@@ -16156,100 +16151,178 @@ async function showDesktopQuitConfirmation(options: {
       detail: options.detail,
       keepRunning: options.keepRunning,
       confirm: options.confirm,
+      background: options.background,
+      remember: options.remember,
     })
     await confirmationWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
   } catch (error) {
     desktopLog('quit_confirmation_window_failed', { error: String(error) })
-    settle(false)
+    settle({ response: 'cancel', remember: false })
   }
   return await resultPromise
 }
 
 function holdQuitForTaskConfirmation(
   event: Electron.Event,
-  onIdleClose?: () => void | Promise<void>,
+  closeWindow?: BrowserWindow,
 ): boolean {
-  if (quitConfirmed || quitFromSignal) return false
+  if (quitConfirmed) return false
   if (quitConfirmationPromise) {
     event.preventDefault()
-    // A tray/menu Quit during an idle-window check must still exit, rather
-    // than inherit that window's background-close preference.
-    if (!onIdleClose) quitConfirmationWantsExit = true
+    // A tray/menu Quit queued during the close choice must not inherit a
+    // background decision while its preference write is still pending.
+    if (!closeWindow) quitConfirmationWantsExit = true
     return true
   }
   const children = [...new Set([
     ...liveLifecycleOwnedGatewayProcesses(), ...gatewayProcessCleanupContexts.keys(),
   ])]
-  if (children.length === 0) return false
+  const hasPages = nativeWorkbenchSurfaces.hasBrowserTabs()
+  if (!closeWindow && (!children.length || quitFromSignal) && !hasPages
+    && desktopWriters.activeCount === 0) return false
   event.preventDefault()
-  quitConfirmationWantsExit = !onIdleClose
-  let idle = false
+  quitConfirmationWantsExit = !closeWindow
   let retryQuit = false
+  let confirmationWriterAdmission: symbol | null = null
+  let waitingForWriters = false
+  const abandonQuit = (): void => {
+    if (confirmationWriterAdmission && quitWriterAdmission === confirmationWriterAdmission) {
+      const otherOwner = desktopWriters.hasOtherOwner(confirmationWriterAdmission)
+      desktopWriters.reopen(confirmationWriterAdmission)
+      quitWriterAdmission = null
+      if (waitingForWriters && !otherOwner && !isQuitting && systemSessionEnding
+        && !updateApplying && windowsSessionEndPreviousPhase === 'deferred') {
+        // A canceled Windows shutdown must not restore a quit attempt whose
+        // writer token and pending continuation have already been released.
+        windowsSessionEndPreviousPhase = 'running'
+      }
+      if (waitingForWriters && !otherOwner && !isQuitting && !systemSessionEnding
+        && !updateApplying && appExitPhase === 'deferred') {
+        setAppExitPhase('running', 'quit page snapshot changed while waiting for writers')
+      }
+    }
+    if (!isQuitting && !systemSessionEnding && !updateApplying && appExitPhase === 'running') {
+      quitConfirmed = false
+      quitFromSignal = false
+    }
+  }
+  const checkActivity = async (): Promise<DesktopQuitActivity> => {
+    // Signals retain the legacy task drain policy, but still need page consent.
+    if (quitFromSignal) return 'idle'
+    const activity = await Promise.all([...new Set([
+      ...liveLifecycleOwnedGatewayProcesses(), ...gatewayProcessCleanupContexts.keys(),
+    ])].map(async child => {
+      const exited = hasGatewayProcessExited(child)
+      if (exited) {
+        // Join verification already owned by a successful restart.
+        await gatewayProcessCleanupOperations.get(child)?.promise
+      }
+      const retainedScope = gatewayProcessCleanupContexts.has(child)
+      const record = exited ? null : ownedGatewayRecord(child)
+      const result = exited
+        ? retainedScope ? { kind: 'unreachable' as const } : { kind: 'ok' as const, activeCount: 0 }
+        : record ? await readVerifiedDesktopGatewayActivity(record, { timeoutMs: 1_000 })
+          : { kind: 'unreachable' as const }
+      desktopLog('quit_gateway_activity_checked', {
+        pid: Number.isSafeInteger(child.pid) ? child.pid : null,
+        kind: result.kind,
+        activeCount: result.kind === 'ok' ? result.activeCount : null,
+        ownershipMatched: exited ? null : record !== null,
+        retainedScope,
+        exited,
+        gatewayStatus: gatewayState.status,
+      })
+      return result
+    }))
+    if (activity.some(result => result.kind === 'ok' && result.activeCount > 0)) return 'active'
+    return activity.every(result => result.kind === 'ok') ? 'idle' : 'unknown'
+  }
   quitConfirmationPromise = (async () => {
-    const accepted = await desktopQuitConfirmation.request({
-      check: async () => {
-        const activity = await Promise.all(children.map(async child => {
-          const exited = hasGatewayProcessExited(child)
-          if (exited) {
-            // A known successful restart already owns bounded verification.
-            // Join that proof instead of calling its retired scope active work.
-            await gatewayProcessCleanupOperations.get(child)?.promise
-          }
-          const retainedScope = gatewayProcessCleanupContexts.has(child)
-          const record = exited ? null : ownedGatewayRecord(child)
-          const result = exited
-            ? retainedScope ? { kind: 'unreachable' as const } : { kind: 'ok' as const, activeCount: 0 }
-            : record ? await readVerifiedDesktopGatewayActivity(record, { timeoutMs: 1_000 })
-              : { kind: 'unreachable' as const }
-          desktopLog('quit_gateway_activity_checked', {
-            pid: Number.isSafeInteger(child.pid) ? child.pid : null,
-            kind: result.kind,
-            activeCount: result.kind === 'ok' ? result.activeCount : null,
-            ownershipMatched: exited ? null : record !== null,
-            retainedScope,
-            exited,
-            gatewayStatus: gatewayState.status,
-          })
-          return result
-        }))
-        if (activity.some(result => result.kind === 'ok' && result.activeCount > 0)) return 'active'
-        idle = activity.every(result => result.kind === 'ok')
-        return idle ? 'idle' : 'unknown'
-      },
-      confirm: async state => {
-        if (systemSessionEnding || updateApplying) return false
-        desktopLog('quit_confirmation_required', { activity: state })
-        const window = currentMainWindow() ?? currentOnboardingWindow()
-        if (window) {
-          if (window.isMinimized()) window.restore()
-          window.show()
-        }
-        return await showDesktopQuitConfirmation({
-          parent: window ?? undefined,
-          title: desktopT('quit.title'),
-          message: desktopT(state === 'active' ? 'quit.active' : 'quit.unknown'),
-          detail: desktopT('quit.detail'),
-          keepRunning: desktopT('quit.keepRunning'),
-          confirm: desktopT('quit.confirm'),
+    let closeDecision: DesktopQuitDialogDecision | null = null
+    // Capture exact page/document identities before asking about task and page
+    // interruption together. Cancel closes nothing; accepted pages use the same
+    // snapshot and unload grants without a second bulk-close prompt.
+    const accepted = await nativeWorkbenchSurfaces.closeBrowserTabs({
+      confirm: async ({ tabCount }) => {
+        if (systemSessionEnding || updateApplying || isQuitting) return false
+        const decision = await desktopQuitConfirmation.request({
+          check: checkActivity,
+          confirmWhenIdle: Boolean(closeWindow) || tabCount > 0,
+          confirm: async state => {
+            if (systemSessionEnding || updateApplying) return false
+            desktopLog('quit_confirmation_required', { activity: state })
+            const window = closeWindow ?? currentMainWindow() ?? currentOnboardingWindow()
+            if (window) {
+              if (window.isMinimized()) window.restore()
+              window.show()
+            }
+            if (closeWindow) {
+              closeDecision = await promptForMainWindowClose(closeWindow, state, tabCount)
+              return closeDecision.response === 'confirm'
+            }
+            const pagesDetail = tabCount > 0
+              ? desktopT('quit.pagesDetail').replace('{count}', String(tabCount)) : ''
+            const result = await showDesktopQuitConfirmation({
+              parent: window ?? undefined,
+              title: desktopT('quit.title'),
+              message: desktopT(state === 'idle' ? 'quit.pages' : state === 'active' ? 'quit.active' : 'quit.unknown'),
+              detail: [state !== 'idle' ? desktopT('quit.detail') : '', pagesDetail].filter(Boolean).join('\n\n'),
+              keepRunning: desktopT('quit.keepRunning'),
+              confirm: desktopT(state === 'idle' ? 'quit.confirmPages' : 'quit.confirm'),
+            })
+            return result.response === 'confirm'
+          },
         })
+        if (systemSessionEnding || updateApplying || isQuitting || closeWindow?.isDestroyed()) return false
+        // Remembering a close choice is an ordinary protected preference write.
+        // Complete it before closing writer admission or applying the choice.
+        const chosen = closeDecision as DesktopQuitDialogDecision | null
+        if (chosen && chosen.response !== 'cancel' && chosen.remember) {
+          await saveDesktopPreferences({
+            mainWindowCloseBehavior: chosen.response === 'background' ? 'background' : 'quit',
+          }).catch(error => {
+            desktopLog('desktop_preferences_save_failed', {
+              error: error instanceof Error ? error.message : String(error),
+            })
+          })
+        }
+        if (systemSessionEnding || updateApplying || isQuitting || closeWindow?.isDestroyed()) return false
+        if (chosen?.response === 'background' && closeWindow) {
+          if (quitConfirmationWantsExit) retryQuit = true
+          else if (appExitPhase === 'running') hideMainWindow(closeWindow)
+          return false
+        }
+        if (!decision || systemSessionEnding || updateApplying || isQuitting) return false
+        // Keep the original page snapshot through protected writes as well.
+        // Once this wait finishes, no new writer can reopen a gap between page
+        // validation/close and the committed Gateway drain.
+        if (!quitWriterAdmission) {
+          quitWriterAdmission = desktopWriters.close('quit')
+          confirmationWriterAdmission = quitWriterAdmission
+        }
+        if (desktopWriters.activeCount > 0) {
+          waitingForWriters = true
+          setAppExitPhase('deferred', 'waiting for desktop writers')
+          desktopLog('quit_deferred_for_profile_writer', { activeWriters: desktopWriters.activeCount })
+          await waitForDesktopWriterOperations()
+        }
+        return !systemSessionEnding && !updateApplying && !isQuitting
       },
     })
     if (!accepted) {
+      abandonQuit()
       desktopLog('quit_cancelled_by_user')
       return
     }
-    if (systemSessionEnding || updateApplying) return
-    if (idle && onIdleClose && !quitConfirmationWantsExit) {
-      await onIdleClose()
-      // A Quit queued while the idle preference dialog/save was pending must
-      // recheck activity: new work may have started since the initial check.
-      retryQuit = quitConfirmationWantsExit
+    if (systemSessionEnding || updateApplying) {
+      abandonQuit()
       return
     }
     quitConfirmed = true
     desktopLog('quit_confirmed')
     app.quit()
   })().catch(error => {
+    abandonQuit()
     desktopLog('quit_confirmation_failed', { error: String(error) })
   }).finally(() => {
     quitConfirmationPromise = null
@@ -16490,30 +16563,7 @@ function showDesktopQuitFailure(): void {
   )
 }
 
-let browserQuitClosePromise: Promise<boolean> | null = null
 app.on('before-quit', (event) => {
-  if (!systemSessionEnding && !updateApplying && nativeWorkbenchSurfaces.hasBrowserTabs()) {
-    event.preventDefault()
-    if (!browserQuitClosePromise) {
-      const abandonBrowserQuit = (): void => {
-        browserQuitClosePromise = null
-        // A canceled browser close abandons this request's task confirmation
-        // and signal policy. Do not reset a newer authoritative exit.
-        if (!isQuitting && appExitPhase === 'running') {
-          quitConfirmed = false
-          quitFromSignal = false
-        }
-      }
-      browserQuitClosePromise = nativeWorkbenchSurfaces.closeBrowserTabs()
-      void browserQuitClosePromise.then(accepted => {
-        if (accepted) {
-          browserQuitClosePromise = null
-          app.quit()
-        } else abandonBrowserQuit()
-      }, abandonBrowserQuit)
-    }
-    return
-  }
   // Windows session shutdown cannot wait on our normal asynchronous quit
   // drain. Let the OS-owned close proceed and synchronously signal the current
   // child so the window can never be converted back into background mode.

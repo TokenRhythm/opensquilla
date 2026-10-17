@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import ts from '@typescript/typescript6'
 
 import { DesktopQuitConfirmation } from '../dist/desktop-quit.js'
+import { DesktopWriterAdmission } from '../dist/desktop-writer-admission.js'
 import { mainWindowCloseAction } from '../dist/desktop-window-lifecycle.js'
 
 // Extract the production handlers from the compiled main process. This keeps
@@ -52,13 +53,17 @@ async function until(predicate, message = 'condition did not settle') {
   assert.fail(message)
 }
 
-function createScenario({ platform = 'darwin', behavior = 'background', activity = 'idle' } = {}) {
+function createScenario({ platform = 'darwin', behavior = 'background', activity = 'idle', pages = 0 } = {}) {
   const events = []
   const logs = []
+  const saves = []
   const activityResult = deferred()
   const dialogResult = deferred()
   const quitDialogResult = deferred()
   const saveResult = deferred()
+  let remainingPages = pages
+  let pageCloseRequests = 0
+  let quitDialogOptions
   let activityChecks = 0
   let hidden = 0
   let quit = 0
@@ -67,6 +72,7 @@ function createScenario({ platform = 'darwin', behavior = 'background', activity
   let preventions = 0
   let windowDestroyed = false
   let activityState = activity
+  let closeBehavior = behavior
   let savePending = false
   const window = {
     isDestroyed: () => windowDestroyed,
@@ -79,6 +85,11 @@ function createScenario({ platform = 'darwin', behavior = 'background', activity
   const child = { pid: 54321 }
   const env = {
     appExitPhase: 'running',
+    isQuitting: false,
+    desktopWriters: new DesktopWriterAdmission(),
+    quitWriterAdmission: null,
+    setAppExitPhase: phase => { env.appExitPhase = phase },
+    waitForDesktopWriterOperations: () => env.desktopWriters.waitForAtMost(0),
     systemSessionEnding: false,
     updateApplying: false,
     quitConfirmed: false,
@@ -96,7 +107,7 @@ function createScenario({ platform = 'darwin', behavior = 'background', activity
     currentOnboardingWindow: () => null,
     focusOnboardingWindow: () => events.push('focus-onboarding'),
     hideMainWindow: () => { hidden += 1; events.push('hidden') },
-    loadDesktopPreferencesRecord: () => ({ value: { main_window_close_behavior: behavior } }),
+    loadDesktopPreferencesRecord: () => ({ value: { main_window_close_behavior: closeBehavior } }),
     mainWindowCloseAction,
     desktopT: key => key,
     dialog: {
@@ -105,10 +116,12 @@ function createScenario({ platform = 'darwin', behavior = 'background', activity
         return await dialogResult.promise
       },
     },
-    saveDesktopPreferences: async () => {
+    saveDesktopPreferences: async request => {
+      saves.push(request.mainWindowCloseBehavior)
       savePending = true
       await saveResult.promise
       savePending = false
+      closeBehavior = request.mainWindowCloseBehavior
       return {}
     },
     app: { quit: () => { quit += 1; events.push('quit') } },
@@ -125,9 +138,21 @@ function createScenario({ platform = 'darwin', behavior = 'background', activity
         ? { kind: 'unreachable' }
         : { kind: 'ok', activeCount: activityState === 'active' ? 1 : 0 }
     },
-    showDesktopQuitConfirmation: async () => {
+    showDesktopQuitConfirmation: async options => {
+      quitDialogOptions = options
       shownQuitDialog += 1
-      return await quitDialogResult.promise
+      const answer = await quitDialogResult.promise
+      return typeof answer === 'boolean'
+        ? { response: answer ? 'confirm' : 'cancel', remember: false } : answer
+    },
+    nativeWorkbenchSurfaces: {
+      hasBrowserTabs: () => remainingPages > 0,
+      closeBrowserTabs: async ({ confirm }) => {
+        pageCloseRequests += 1
+        if (!await confirm({ tabCount: remainingPages })) return false
+        remainingPages = 0
+        return true
+      },
     },
     desktopQuitConfirmation: new DesktopQuitConfirmation(),
   }
@@ -142,6 +167,9 @@ function createScenario({ platform = 'darwin', behavior = 'background', activity
     quitDialogResult,
     saveResult,
     setActivity: value => { activityState = value },
+    get remainingPages() { return remainingPages },
+    get pageCloseRequests() { return pageCloseRequests },
+    get quitDialogOptions() { return quitDialogOptions },
     get activityChecks() { return activityChecks },
     get hidden() { return hidden },
     get quit() { return quit },
@@ -151,6 +179,7 @@ function createScenario({ platform = 'darwin', behavior = 'background', activity
     get savePending() { return savePending },
     events,
     logs,
+    saves,
   }
 }
 
@@ -160,194 +189,219 @@ async function settleConfirmation(scenario, answer) {
   await flush()
 }
 
-// Activity diagnostics distinguish an unmatched launch from a verified busy or
-// unreachable Gateway without retaining process-control authority or paths.
-for (const mode of ['active', 'unknown', 'unmatched']) {
-  const scenario = createScenario({ activity: mode })
-  const secret = 'synthetic-private-value'
-  scenario.env.ownedGatewayRecord = () => mode === 'unmatched' ? null : {
-    instance_nonce: secret, profile_fingerprint: secret, path: secret,
-  }
-  scenario.handlers.holdQuitForTaskConfirmation(scenario.closeEvent())
-  await until(() => scenario.shownQuitDialog === 1)
-  assert.deepEqual(scenario.logs, [{
-    event: 'quit_gateway_activity_checked', pid: 54321,
-    kind: mode === 'active' ? 'ok' : 'unreachable',
-    activeCount: mode === 'active' ? 1 : null,
-    ownershipMatched: mode !== 'unmatched', retainedScope: false, exited: false,
-    gatewayStatus: 'ready',
-  }, { event: 'quit_confirmation_required', activity: mode === 'active' ? 'active' : 'unknown' }])
-  assert.ok(!JSON.stringify(scenario.logs).includes(secret))
-  await settleConfirmation(scenario, false)
-}
-
-// Active work keeps the parent visible until the interruption prompt resolves.
+// Background closure hides immediately, including active/unknown work and open
+// browser pages. It never needs consent to stop or discard either resource.
 for (const platform of ['darwin', 'win32']) {
-  const scenario = createScenario({ platform, activity: 'pending' })
-  const event = scenario.closeEvent()
-  scenario.handlers.handleMainWindowClose(scenario.window, event)
-  assert.equal(scenario.hidden, 0, `${platform}: close must not hide while checking activity`)
-  assert.ok(scenario.preventions >= 1)
-  scenario.activityResult.resolve({ kind: 'ok', activeCount: 1 })
-  await until(() => scenario.shownQuitDialog === 1)
-  assert.equal(scenario.hidden, 0, `${platform}: active task prompt must keep window visible`)
-  scenario.handlers.handleMainWindowClose(scenario.window, scenario.closeEvent())
-  await flush()
-  assert.equal(scenario.hidden, 0, `${platform}: repeated close must not hide an open prompt`)
-  assert.equal(scenario.shownQuitDialog, 1)
-  assert.equal(scenario.activityChecks, 1)
-  await settleConfirmation(scenario, false)
-  assert.equal(scenario.hidden, 0, `${platform}: cancelling interruption must keep window visible`)
-  assert.equal(scenario.quit, 0)
-}
-
-// Acceptance commits the same normal app.quit path exactly once, including
-// repeated native closes and a tray/menu Quit arriving during the check.
-for (const activity of ['active', 'unknown']) {
-  const scenario = createScenario({ activity: 'pending' })
-  scenario.handlers.handleMainWindowClose(scenario.window, scenario.closeEvent())
-  scenario.handlers.handleMainWindowClose(scenario.window, scenario.closeEvent())
-  const trayEvent = scenario.closeEvent()
-  scenario.handlers.holdQuitForTaskConfirmation(trayEvent)
-  scenario.setActivity(activity)
-  scenario.activityResult.resolve(activity === 'active'
-    ? { kind: 'ok', activeCount: 1 } : { kind: 'unreachable' })
-  await until(() => scenario.shownQuitDialog === 1)
-  assert.equal(scenario.activityChecks, 1, `${activity}: activity check should be single-flight`)
-  await settleConfirmation(scenario, true)
-  assert.equal(scenario.quit, 1, `${activity}: accepted prompt should quit once`)
-  assert.equal(scenario.hidden, 0)
-}
-
-// A retired root cannot prove its independent tools are idle.
-{
-  const scenario = createScenario({ activity: 'idle' })
-  const retired = {}
-  scenario.env.liveLifecycleOwnedGatewayProcesses = () => []
-  scenario.env.hasGatewayProcessExited = () => true
-  scenario.env.gatewayProcessCleanupContexts.set(retired, { instanceNonce: 'synthetic-retired-scope' })
-  scenario.handlers.holdQuitForTaskConfirmation(scenario.closeEvent())
-  await until(() => scenario.shownQuitDialog === 1)
-  assert.equal(scenario.activityChecks, 0, 'a dead root cannot prove its independent tools are idle')
-  assert.equal(scenario.hidden, 0)
-  assert.equal(scenario.quit, 0)
-  await settleConfirmation(scenario, false)
-  assert.equal(scenario.quit, 0, 'uncertain retained work requires interruption confirmation')
-}
-
-// An idle runtime preserves the configured close behavior.
-{
-  const scenario = createScenario({ behavior: 'background', activity: 'idle' })
-  const retired = {}
-  const proof = deferred()
-  scenario.env.hasGatewayProcessExited = value => value === retired
-  scenario.env.gatewayProcessCleanupContexts.set(retired, { instanceNonce: 'synthetic-clean-restart' })
-  scenario.env.gatewayProcessCleanupOperations.set(retired, {
-    promise: proof.promise.then(() => { scenario.env.gatewayProcessCleanupContexts.delete(retired); return true }),
-  })
-  scenario.handlers.handleMainWindowClose(scenario.window, scenario.closeEvent())
-  await flush()
-  assert.equal(scenario.shownQuitDialog, 0, 'a clean restart joins its pending verification')
-  proof.resolve()
-  await until(() => scenario.hidden === 1)
-  assert.equal(scenario.shownQuitDialog, 0)
-  assert.equal(scenario.quit, 0, 'an idle post-restart close keeps the background preference')
-}
-
-// An idle runtime preserves the configured close behavior.
-{
-  const background = createScenario({ behavior: 'background', activity: 'idle' })
-  background.handlers.handleMainWindowClose(background.window, background.closeEvent())
-  await until(() => background.hidden === 1)
-  assert.equal(background.shownQuitDialog, 0)
-  assert.equal(background.quit, 0)
-
-  const ask = createScenario({ behavior: 'ask', activity: 'idle' })
-  ask.handlers.handleMainWindowClose(ask.window, ask.closeEvent())
-  await until(() => ask.shownCloseDialog === 1)
-  assert.equal(ask.hidden, 0)
-  ask.dialogResult.resolve({ response: 2, checkboxChecked: false })
-  await until(() => ask.env.quitConfirmationPromise === null)
-  assert.equal(ask.hidden, 0)
-  assert.equal(ask.quit, 0)
-}
-
-// A tray Quit arriving while a native close is checking idle work escalates to
-// quit and must not open the close-preference dialog or hide the parent first.
-{
-  const scenario = createScenario({ behavior: 'ask', activity: 'pending' })
-  scenario.handlers.handleMainWindowClose(scenario.window, scenario.closeEvent())
-  scenario.handlers.holdQuitForTaskConfirmation(scenario.closeEvent())
-  scenario.activityResult.resolve({ kind: 'ok', activeCount: 0 })
-  await until(() => scenario.quit === 1)
-  assert.equal(scenario.shownCloseDialog, 0)
-  assert.equal(scenario.hidden, 0)
-}
-
-// A preference write that is pending when tray Quit arrives cannot apply a
-// stale hide/quit decision. The quit path is retried after the write settles.
-{
-  const scenario = createScenario({ behavior: 'ask', activity: 'pending' })
-  let quitRequests = 0
-  let shutdowns = 0
-  scenario.env.app.quit = () => {
-    quitRequests += 1
-    if (!scenario.handlers.holdQuitForTaskConfirmation(scenario.closeEvent())) shutdowns += 1
+  for (const activity of ['idle', 'active', 'unknown', 'pending']) {
+    const h = createScenario({ platform, activity, pages: 2 })
+    h.handlers.handleMainWindowClose(h.window, h.closeEvent())
+    assert.equal(h.hidden, 1)
+    assert.equal(h.activityChecks, 0)
+    assert.equal(h.pageCloseRequests, 0)
+    assert.equal(h.shownQuitDialog, 0)
+    assert.equal(h.remainingPages, 2)
+    assert.equal(h.quit, 0)
+    assert.equal(h.env.desktopWriters.closed, false)
   }
-  scenario.handlers.handleMainWindowClose(scenario.window, scenario.closeEvent())
-  scenario.activityResult.resolve({ kind: 'ok', activeCount: 0 })
-  await until(() => scenario.shownCloseDialog === 1)
-  scenario.dialogResult.resolve({ response: 0, checkboxChecked: true })
-  await until(() => scenario.savePending)
-  scenario.env.app.quit()
-  scenario.setActivity('active')
-  scenario.saveResult.resolve()
-  await until(() => scenario.shownQuitDialog === 1)
-  assert.equal(scenario.activityChecks, 2, 'queued Quit must recheck after a preference write')
-  assert.equal(quitRequests, 2, 'the queued Quit should resume once after the preference write')
-  assert.equal(shutdowns, 0, 'fresh active work must await interruption confirmation')
-  assert.ok(scenario.events.includes('show'))
-  assert.equal(scenario.hidden, 0)
-  await settleConfirmation(scenario, false)
-  assert.equal(shutdowns, 0, 'cancelling the fresh interruption prompt must prevent shutdown')
-  assert.equal(scenario.env.quitConfirmed, false)
-  assert.equal(scenario.hidden, 0)
 }
 
-// Unsupported platforms still take the direct quit path; OS session ending
-// bypasses policy and allows native closure.
+// Ask uses one close-choice dialog for every task state. Its Quit choice is
+// already the task/page consent; Background and Cancel keep all pages intact.
+for (const owner of ['update', 'confirmed-quit']) {
+  const h = createScenario({ platform: 'win32', activity: 'active', pages: 2 })
+  if (owner === 'update') {
+    h.env.updateApplying = true
+    h.env.appExitPhase = 'deferred'
+  } else {
+    h.env.quitConfirmed = true
+    h.env.appExitPhase = 'draining'
+  }
+  h.handlers.handleMainWindowClose(h.window, h.closeEvent())
+  assert.equal(h.hidden, 0, `${owner}: preserve the protected operation's visible progress`)
+  assert.equal(h.pageCloseRequests, 0)
+  assert.equal(h.activityChecks, 0)
+  assert.equal(h.shownQuitDialog, 0)
+}
+
+for (const activity of ['idle', 'active', 'unknown']) {
+  for (const response of ['cancel', 'background', 'confirm']) {
+    const h = createScenario({ behavior: 'ask', activity, pages: 2 })
+    h.handlers.handleMainWindowClose(h.window, h.closeEvent())
+    await until(() => h.shownQuitDialog === 1)
+    assert.equal(h.quitDialogOptions.background, 'closePrompt.background')
+    assert.equal(h.quitDialogOptions.keepRunning, 'closePrompt.cancel')
+    assert.equal(h.quitDialogOptions.remember, 'closePrompt.remember')
+    assert.ok(h.quitDialogOptions.detail.includes('quit.pagesDetail'))
+    if (activity !== 'idle') assert.ok(h.quitDialogOptions.detail.includes('quit.detail'))
+    assert.equal(h.remainingPages, 2)
+    assert.equal(h.env.desktopWriters.closed, false)
+    h.handlers.handleMainWindowClose(h.window, h.closeEvent())
+    await flush()
+    assert.equal(h.shownQuitDialog, 1, 'Repeated X shares the pending decision')
+    await settleConfirmation(h, { response, remember: false })
+    assert.equal(h.shownQuitDialog, 1, 'Ask Quit must not prompt for task interruption again')
+    assert.equal(h.shownCloseDialog, 0, 'The old native close-preference dialog is not used')
+    assert.equal(h.quit, response === 'confirm' ? 1 : 0)
+    assert.equal(h.remainingPages, response === 'confirm' ? 0 : 2)
+    assert.equal(h.hidden, response === 'background' ? 1 : 0)
+    assert.deepEqual(h.saves, [])
+    assert.equal(h.env.desktopWriters.closed, response === 'confirm')
+  }
+}
+
+// Ask also offers all choices with no owned Gateway and no open pages.
 {
-  const linux = createScenario({ platform: 'linux', behavior: 'background', activity: 'active' })
+  const h = createScenario({ behavior: 'ask' })
+  h.env.liveLifecycleOwnedGatewayProcesses = () => []
+  h.handlers.handleMainWindowClose(h.window, h.closeEvent())
+  await until(() => h.shownQuitDialog === 1)
+  await settleConfirmation(h, { response: 'cancel', remember: true })
+  assert.deepEqual(h.saves, [], 'Cancel never changes the close preference')
+  assert.equal(h.quit, 0)
+}
+
+// Remembering Background or Quit completes its protected write before the
+// window hides, pages close, or quit admission is fenced.
+for (const response of ['background', 'confirm']) {
+  const h = createScenario({ behavior: 'ask', activity: 'active', pages: 2 })
+  h.handlers.handleMainWindowClose(h.window, h.closeEvent())
+  await until(() => h.shownQuitDialog === 1)
+  h.quitDialogResult.resolve({ response, remember: true })
+  await until(() => h.savePending)
+  assert.equal(h.remainingPages, 2)
+  assert.equal(h.hidden, 0)
+  assert.equal(h.quit, 0)
+  assert.equal(h.env.desktopWriters.closed, false)
+  h.saveResult.resolve()
+  await until(() => h.env.quitConfirmationPromise === null)
+  assert.deepEqual(h.saves, [response === 'background' ? 'background' : 'quit'])
+  assert.equal(h.hidden, response === 'background' ? 1 : 0)
+  assert.equal(h.quit, response === 'confirm' ? 1 : 0)
+  assert.equal(h.shownQuitDialog, 1)
+  if (response === 'background') {
+    h.handlers.handleMainWindowClose(h.window, h.closeEvent())
+    assert.equal(h.hidden, 2, 'A remembered Background choice hides the next X without another dialog')
+    assert.equal(h.shownQuitDialog, 1)
+  }
+}
+
+// Configured Quit routes X through the same explicit app.quit entry point.
+{
+  const h = createScenario({ platform: 'win32', behavior: 'quit', activity: 'active', pages: 2 })
+  h.handlers.handleMainWindowClose(h.window, h.closeEvent())
+  assert.equal(h.quit, 1)
+  assert.equal(h.hidden, 0)
+  assert.equal(h.pageCloseRequests, 0)
+  // before-quit then obtains the one risk decision before changing resources.
+  h.handlers.holdQuitForTaskConfirmation(h.closeEvent())
+  await until(() => h.shownQuitDialog === 1)
+  assert.equal(h.quitDialogOptions.background, undefined)
+  assert.ok(h.quitDialogOptions.detail.includes('quit.detail'))
+  assert.ok(h.quitDialogOptions.detail.includes('quit.pagesDetail'))
+  await settleConfirmation(h, false)
+  assert.equal(h.remainingPages, 2)
+  assert.equal(h.quit, 1)
+}
+
+// Diagnostics distinguish launch mismatches and unavailable activity without
+// retaining private launch values. A dead scope cannot prove its tools idle.
+for (const mode of ['active', 'unknown', 'unmatched', 'retired']) {
+  const h = createScenario({ activity: mode === 'active' ? 'active' : 'idle' })
+  const secret = 'synthetic-private-value'
+  h.env.ownedGatewayRecord = () => mode === 'unmatched' ? null : { instance_nonce: secret }
+  if (mode === 'unknown') h.setActivity('unknown')
+  if (mode === 'retired') {
+    const retired = { pid: 54322 }
+    h.env.gatewayProcessCleanupContexts.set(retired, { instanceNonce: secret })
+    h.env.hasGatewayProcessExited = child => child === retired
+  }
+  h.handlers.holdQuitForTaskConfirmation(h.closeEvent())
+  await until(() => h.shownQuitDialog === 1)
+  assert.ok(!JSON.stringify(h.logs).includes(secret))
+  assert.equal(h.logs.find(entry => entry.event === 'quit_confirmation_required').activity,
+    mode === 'active' ? 'active' : 'unknown')
+  await settleConfirmation(h, false)
+  assert.equal(h.quit, 0)
+}
+
+// Pages require consent even without an owned Gateway. Signals preserve their
+// legacy task policy while still warning before discarding browser pages.
+for (const signal of [false, true]) {
+  const h = createScenario({ pages: 2 })
+  if (!signal) h.env.liveLifecycleOwnedGatewayProcesses = () => []
+  h.env.quitFromSignal = signal
+  h.handlers.holdQuitForTaskConfirmation(h.closeEvent())
+  await until(() => h.shownQuitDialog === 1)
+  assert.equal(h.activityChecks, 0)
+  await settleConfirmation(h, false)
+  assert.equal(h.remainingPages, 2)
+  assert.equal(h.quit, 0)
+  assert.equal(h.env.quitFromSignal, false)
+}
+
+// A later explicit Quit queued during a remembered Background choice needs a
+// fresh activity check; the stale Background decision must not hide the parent.
+{
+  const h = createScenario({ behavior: 'ask', activity: 'idle', pages: 2 })
+  let quitRequests = 0, shutdowns = 0, nextPrompts = 0
+  const nextAnswer = deferred()
+  h.env.app.quit = () => {
+    quitRequests++
+    if (!h.handlers.holdQuitForTaskConfirmation(h.closeEvent())) shutdowns++
+  }
+  h.handlers.handleMainWindowClose(h.window, h.closeEvent())
+  await until(() => h.shownQuitDialog === 1)
+  h.quitDialogResult.resolve({ response: 'background', remember: true })
+  await until(() => h.savePending)
+  h.env.showDesktopQuitConfirmation = () => { nextPrompts++; return nextAnswer.promise }
+  h.env.app.quit()
+  h.setActivity('active')
+  h.saveResult.resolve()
+  await until(() => nextPrompts === 1)
+  assert.equal(h.activityChecks, 2)
+  assert.equal(quitRequests, 2)
+  assert.equal(h.hidden, 0)
+  assert.equal(shutdowns, 0)
+  nextAnswer.resolve({ response: 'cancel', remember: false })
+  await until(() => h.env.quitConfirmationPromise === null)
+  assert.equal(h.remainingPages, 2)
+  assert.equal(shutdowns, 0)
+}
+
+// System/update ownership supersedes a pending dialog or preference write.
+for (const owner of ['system', 'update', 'destroyed']) {
+  for (const phase of ['dialog', 'remember']) {
+    const h = createScenario({ behavior: 'ask', activity: 'active', pages: 2 })
+    h.handlers.handleMainWindowClose(h.window, h.closeEvent())
+    await until(() => h.shownQuitDialog === 1)
+    if (phase === 'remember') {
+      h.quitDialogResult.resolve({ response: 'background', remember: true })
+      await until(() => h.savePending)
+    }
+    if (owner === 'system') h.env.systemSessionEnding = true
+    else if (owner === 'update') h.env.updateApplying = true
+    else h.window.isDestroyed = () => true
+    if (phase === 'dialog') h.quitDialogResult.resolve({ response: 'confirm', remember: false })
+    else h.saveResult.resolve()
+    await until(() => h.env.quitConfirmationPromise === null)
+    assert.equal(h.hidden, 0)
+    assert.equal(h.quit, 0)
+    assert.equal(h.remainingPages, 2)
+  }
+}
+
+// Unsupported background platforms retain their quit policy; OS session ending
+// permits native closure without another desktop decision.
+{
+  const linux = createScenario({ platform: 'linux', activity: 'active' })
   linux.handlers.handleMainWindowClose(linux.window, linux.closeEvent())
   assert.equal(linux.quit, 1)
-  assert.equal(linux.preventions, 1)
-
-  const ending = createScenario({ platform: 'darwin', behavior: 'ask', activity: 'active' })
+  assert.equal(linux.hidden, 0)
+  const ending = createScenario({ behavior: 'ask', activity: 'active' })
   ending.env.systemSessionEnding = true
-  const event = ending.closeEvent()
-  ending.handlers.handleMainWindowClose(ending.window, event)
+  ending.handlers.handleMainWindowClose(ending.window, ending.closeEvent())
   assert.equal(ending.preventions, 0)
-  assert.equal(ending.hidden, 0)
-  assert.equal(ending.quit, 0)
+  assert.equal(ending.shownQuitDialog, 0)
 }
 
-// A recovered live Gateway does not prove that an earlier hard-crashed POSIX
-// launch has no remaining tools. Its retained scope still requires consent.
-{
-  const scenario = createScenario({ platform: 'darwin', activity: 'idle' })
-  const crashedChild = { pid: 54322 }
-  scenario.env.gatewayProcessCleanupContexts.set(crashedChild, { synthetic: true })
-  scenario.env.hasGatewayProcessExited = child => child === crashedChild
-  scenario.handlers.holdQuitForTaskConfirmation(scenario.closeEvent())
-  await until(() => scenario.shownQuitDialog === 1)
-  assert.deepEqual(scenario.logs.find(record => record.pid === crashedChild.pid), {
-    event: 'quit_gateway_activity_checked', pid: 54322, kind: 'unreachable', activeCount: null,
-    ownershipMatched: null, retainedScope: true, exited: true, gatewayStatus: 'ready',
-  })
-  assert.equal(scenario.quit, 0)
-  assert.equal(scenario.hidden, 0)
-  await settleConfirmation(scenario, true)
-  assert.equal(scenario.quit, 1)
-}
-
-console.log('desktop close confirmation checks passed')
+console.log('Desktop close confirmation checks passed: background hides; Ask and Quit share one task/page decision.')

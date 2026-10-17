@@ -150,6 +150,20 @@ if (!process.versions.electron) {
       assert.equal(trustedUnloads, 0, 'A cancelled batch never starts native closes')
       assert.equal(await owner.webContents.executeJavaScript('window.controlState'), 'retained')
 
+      let quitDecisions = 0
+      const beforeQuitCancelPrompts = confirmations
+      assert.equal(await manager.closeBrowserTabs({ confirm: ({ tabCount }) => {
+        quitDecisions++
+        assert.equal(tabCount, 3)
+        return false
+      } }), false)
+      assert.equal(quitDecisions, 1, 'The unified quit decision replaces the separate page decision')
+      assert.equal(confirmations, beforeQuitCancelPrompts, 'No additional bulk page prompt follows quit cancellation')
+      assert.equal(manager.surfaces.size, 3)
+      assert.equal(await record.contents.executeJavaScript('window.pageState'), 'retained')
+      assert.equal(await cleanRecord.contents.executeJavaScript('window.cleanState'), 'retained')
+      assert.equal(trustedUnloads, 0, 'Canceled unified quit must not invoke any native beforeunload handler')
+
       const beforeConcurrent = confirmations
       const concurrent = await Promise.all([manager.closeBrowserTabs(), manager.closeBrowserTabs()])
       assert.deepEqual(concurrent, [false, false])
@@ -218,7 +232,24 @@ if (!process.versions.electron) {
       assert.equal(manager.surfaces.size, 0)
       await until(() => trustedUnloads === 3, 'trusted beforeunload handlers during approved close')
       assert.ok(confirmations >= 2)
-      console.log('Browser host navigation passed: batch cancellation retains every clean/dirty page; concurrent and changed batches are guarded; approved reload runs trusted handlers and cleans up.')
+
+      const quitPage = await call({ operation: 'open', url: `${origin}/page` })
+      const quitRecord = [...manager.surfaces.values()].find(value => value.targetRef === quitPage.targetRef)
+      const quitObserved = await call({ operation: 'observe', targetRef: quitPage.targetRef })
+      await call({ operation: 'act', targetRef: quitPage.targetRef, action: 'click',
+        ref: quitObserved.observation.refs.find(value => value.name === 'Arm unsaved state').ref })
+      await call({ operation: 'open', url: `${origin}/clean` })
+      dialog.showMessageBoxSync = () => assert.fail('Unified quit must not show another bulk or per-page prompt')
+      assert.equal(await manager.closeBrowserTabs({ confirm: ({ tabCount }) => {
+        quitDecisions++
+        assert.equal(tabCount, 2)
+        return true
+      } }), true)
+      assert.equal(quitDecisions, 2, 'Accepted unified quit obtains one fresh decision')
+      assert.equal(quitRecord.contents.isDestroyed(), true)
+      assert.equal(manager.surfaces.size, 0)
+      await until(() => trustedUnloads === 4, 'trusted beforeunload handler during unified quit')
+      console.log('Browser host navigation passed: canceled reload/quit retains clean and dirty pages; changed batches are guarded; approved reload/quit runs trusted handlers without duplicate decisions.')
     } catch (error) {
       exitCode = 1
       console.error(error)

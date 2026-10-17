@@ -97,7 +97,11 @@ const destroyWindowsTray = () => { windowsTray = null }
 const artifactPreviewLeaseBroker = {
   clear: () => {}, revokeAll: async () => {}, shutdown: async () => {},
 }
-const nativeWorkbenchSurfaces = { hasBrowserTabs: () => false, destroyAll: async () => {} }
+const nativeWorkbenchSurfaces = {
+  hasBrowserTabs: () => false,
+  closeBrowserTabs: async ({ confirm }) => await confirm({ tabCount: 0 }),
+  destroyAll: async () => {},
+}
 const desktopBrowser = { close: async () => {} }
 const desktopT = key => ({
   'update.signatureUnavailable': 'Windows could not verify the installer signature. Try again.',
