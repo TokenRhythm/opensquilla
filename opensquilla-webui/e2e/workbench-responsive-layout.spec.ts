@@ -627,7 +627,7 @@ test.describe('actual App responsive workbench layout', () => {
     await expectLayout(page)
   })
 
-  for (const theme of ['light', 'dark']) test(`${theme} keeps a single tab close visible and places Add immediately after tabs until overflow`, async ({ page }) => {
+  for (const theme of ['light', 'dark']) test(`${theme} keeps the active tab close visible and places Add immediately after tabs until overflow`, async ({ page }) => {
     const gateway = await prepare(page, theme)
     await showSidebar(page, false)
     await openPanel(page, 'html')
@@ -657,21 +657,33 @@ test.describe('actual App responsive workbench layout', () => {
           && (!overflow || g.regionRight - g.addRight <= 1) && g.rowAligned && g.inViewport
       }).toBe(true)
     }
-    const expectSingleClose = async () => {
-      await expect(tabs).toHaveCount(1)
+    const expectActiveClose = async () => {
       await editor(main(page)).focus()
       await page.mouse.move(0, 0)
-      const close = host.locator('.workbench-host__tab-close')
+      const close = host.locator('.workbench-host__tab-wrap.is-active .workbench-host__tab-close')
       await expect(close).toHaveCSS('opacity', '1')
       await expect(close).toHaveCSS('border-radius', '4px')
       const box = (await close.boundingBox())!
       expect(box.width).toBe(24)
       expect(box.height).toBe(24)
     }
-    await expectSingleClose()
+    await expect(tabs).toHaveCount(1)
+    await expectActiveClose()
     await expectAddPosition(false)
     await openPanel(page, 'code')
     await expect(tabs).toHaveCount(2)
+    await expectActiveClose()
+    const inactive = host.locator('.workbench-host__tab-wrap:not(.is-active)')
+    const inactiveClose = inactive.locator('.workbench-host__tab-close')
+    await expect(inactiveClose).toHaveCSS('opacity', '0')
+    await inactive.hover()
+    await expect(inactiveClose).toHaveCSS('opacity', '1')
+    await page.mouse.move(0, 0)
+    await inactive.getByRole('tab').focus()
+    await expect(inactiveClose).toHaveCSS('opacity', '1')
+    await tabs.first().click()
+    await expectActiveClose()
+    await expect(inactiveClose).toHaveCSS('opacity', '0')
     await expectAddPosition(false)
     for (const kind of ['terminal', 'assistant-chat', 'workspace-files'] as const) await openPanel(page, kind)
     await expect(tabs).toHaveCount(5)
@@ -693,7 +705,7 @@ test.describe('actual App responsive workbench layout', () => {
       await close.click()
       await expect(tabs).toHaveCount(count - 1)
     }
-    await expectSingleClose()
+    await expectActiveClose()
     await expectAddPosition(false)
     expect(gateway.requests.filter(request => request.method === 'chat.abort')).toHaveLength(0)
   })

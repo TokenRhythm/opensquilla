@@ -974,7 +974,7 @@ onBeforeUnmount(() => {
   border-radius: var(--radius-xs);
 }
 .workbench-host__tab-wrap:hover .workbench-host__tab-close,
-.workbench-host__tab-wrap:only-child .workbench-host__tab-close,
+.workbench-host__tab-wrap.is-active .workbench-host__tab-close,
 .workbench-host__tab-wrap:focus-within .workbench-host__tab-close { opacity: 1; }
 .workbench-host__tab-spinner { flex: 0 0 auto; animation: workbench-tab-spin 1s linear infinite; }
 @keyframes workbench-tab-spin { to { transform: rotate(360deg); } }
