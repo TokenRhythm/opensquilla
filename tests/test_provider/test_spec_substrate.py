@@ -41,6 +41,9 @@ _CATALOG_SOURCE_WAIVERS: frozenset[str] = frozenset(
         # (deepseek, zhipuai, ...) here would vendor entire foreign tables
         # with the origin providers' prices under this id.
         "tokenrhythm",
+        # Tsubasa's public aliases have no models.dev provider source;
+        # service-specific limits and capabilities live in catalog_overrides.toml.
+        "tsubasa",
         # Qwen Token Plan's exact subscription allowlist and service-specific
         # limits ship in catalog_overrides.toml. Importing the general
         # Alibaba catalog would expose models outside the subscription.
