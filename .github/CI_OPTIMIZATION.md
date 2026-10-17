@@ -298,6 +298,70 @@ missing, duplicate or skipped cases. The common inventory SHA256 is
 Remote first-attempt timing is compared with run `39011651281` (16:47), using
 run creation through the last executed job's completion, irrespective of failures.
 
+The candidate is [run 39013705315](https://github.com/TokenRhythm/opensquilla/actions/runs/39013705315)
+at `802b98244c48feed53dc295f39af9bf8a33ff720`, a full `workflow_dispatch`, attempt 1.
+It ran from 2026-10-17 07:27:35 UTC through the final job at 07:42:16 UTC.
+
+| Metric | Previous run | Four independent bundle jobs |
+| --- | ---: | ---: |
+| Complete CI wall time | 16:47 | 14:41 |
+| Executed jobs / planned skips | 129 / 2 | 134 / 2 |
+| Peak simultaneous jobs | 105 | 111 |
+| Summed runner time | 512:21 | 472:59 |
+| Median job-created to start | 2 s | 2 s |
+| Original Windows owner job | 16:11 | 4:49 |
+| Original owner parallel pytest | 827.41 s | 148.67 s |
+| Original owner serial pytest | 62.58 s | 62.09 s |
+| Bundle cumulative JUnit case time | 1345.202 s | 56.614 s |
+| Bundle median JUnit case time | 21.42 s | 0.3755 s |
+| NSIS candidate ready, from run creation | 9:00 | 6:20 |
+| Last NSIS acceptance finishes | 14:10 | 10:46 |
+| Windows profiles recovery job | 11:03, passed | 13:20, failed |
+
+All four bundle jobs started at +0:27 on distinct Windows runners. Their job
+durations were 53 / 63 / 61 / 65 seconds; recorded pytest execution durations
+were 10.578 / 16.938 / 15.782 / 15.688 seconds. All four jobs finished by +1:33,
+and the required coverage check passed at +1:45. All 66 cases passed exactly
+once and their inventory matches the previous run. The original owner contains
+zero bundle cases; its remaining 1,519 nodeids, outcomes and execution phases
+match the previous run exactly (1,503 passed / 14 skipped parallel, 2 passed
+serial). No test assertions or collectors were removed.
+
+The final run has 136 jobs: 132 successful, two planned skips, and two failures.
+All 26 NSIS jobs succeeded. The Windows profiles recovery job failed its last
+`desktop-cleanup-flow` script, and `CI result` retained that failure. Its six
+Desktop scripts were attempted sequentially; the cleanup helper reported
+`cleanup_inventory_stale` and the test later timed out waiting for post-exit
+completion. The failed script did not reach all its subsequent assertions.
+This experiment records the first failure and does not retry or fix it.
+
+The observed whole-run reduction is 126 seconds (12.5%), while the original
+bundle-owning job shrank by 682 seconds (70.2%). These are different measures:
+the new final bottleneck is Windows profiles recovery, which finishes at
++14:30 before the final result gate. NSIS also finished earlier without changes
+to its implementation in this experiment. The failed candidate is therefore a
+timing observation, not proof of a successful full regression run or a stable
+12.5% speedup attributable solely to bundle partitioning.
+
+The unexpectedly large per-case reduction is concentrated in the 55 tests that
+call `_make_home()`: their cumulative JUnit time falls from 1344.576 to 56.519
+seconds. That helper creates synthetic files and applies SQLite migrations;
+the other 11 cases take 0.626 and 0.095 seconds respectively. Source, tests,
+conftest, dependencies, Python 3.12.10 and Windows image 20261007.264.1 are
+unchanged. Dedicated fresh processes, a single worker per runner, and explicit
+pytest basetemp beneath `RUNNER_TEMP` changed together; the old default temp
+path was not recorded. No profile isolates database I/O, storage placement or
+same-VM contention, so the cause of the prior fixture-related long tail remains
+unproven.
+
+The remaining profiles job has two browser contracts and six sequential
+Desktop scripts. They are the next candidates for runner-level separation,
+retaining each script's internal import/reopen/recovery sequence. This round
+does not change them. Cached API snapshots, execution reports, JUnit, logs and
+comparisons are under `.cache/ci-timing/round4/` and
+`.cache/ci-timing/round4-comparison/`. Results remain on the experiment branch;
+no merge into `main` was performed.
+
 ## Test cost and ownership
 
 The ordinary offline suite excludes `stress`. The required `python-stress` suite
