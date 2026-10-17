@@ -213,8 +213,61 @@ contracts verify overlapping cases, whole-file grouping elsewhere, exact-once
 execution and preservation of the serial phase after an injected failure.
 
 The comparison baseline is the complete first attempt of run `38957580252`
-(17:30). Record the new first-attempt result, all failure/coverage evidence,
-critical path and summed runner time before claiming a measured speedup.
+(17:30). The candidate is the complete first attempt of
+[run 39011651281](https://github.com/TokenRhythm/opensquilla/actions/runs/39011651281),
+testing `067a6c66920244024bdab66028f0a2b48ab3d9d4` with `workflow_dispatch`.
+It started at 2026-10-17 06:54:40 UTC and its last job completed at 07:11:27 UTC.
+
+| Measurement | Second experiment | Third experiment |
+| --- | ---: | ---: |
+| Complete CI wall time | 17:30 | 16:47 |
+| Executed / skipped jobs | 129 / 2 | 129 / 2 |
+| Executed job conclusions | 125 success, 4 failure | 129 success |
+| Peak running jobs | 109 | 105 |
+| Summed runner time | 527:58 | 512:21 |
+| Windows desktop1 job duration | 16:42 | 16:11 |
+| Windows desktop1 parallel pytest phase | 820.23 s | 827.41 s |
+| Windows desktop1 serial pytest phase | 65.20 s | 62.58 s |
+| Windows bundle logged execution interval | 799.47 s | 684.76 s |
+| Windows bundle cases per worker | 66 / 0 | 34 / 32 |
+| Windows bundle cumulative JUnit case time | 797.205 s | 1345.202 s |
+| Windows bundle median case time | 10.1275 s | 21.42 s |
+| Ubuntu desktop1 parallel pytest phase | 73.11 s | 57.93 s |
+| Ubuntu bundle logged execution interval | 19.59 s | 8.41 s |
+| NSIS candidate ready | +9:08 | +9:00 |
+| NSIS acceptance aggregate completes | +15:10 | +14:15 |
+
+Both platform logs retain exactly the same 1,583 parallel and two serial
+node IDs and results as their respective baselines, including all 66 passing
+bundle cases with no duplicates. Windows has 1,569 passed / 14 skipped in its
+parallel phase; Ubuntu has 1,576 passed / seven skipped. The two serial cases
+pass on both platforms. The full workflow job-name multiset is also identical,
+and all 26 NSIS jobs pass. The candidate includes the already recorded
+`f16731a68` stale artifact-count contract fix; the all-green conclusion is not
+evidence that the scheduler fixed prior failures.
+
+**The observed 43-second (4.1%) workflow improvement does not establish a
+Windows pytest speedup.** The critical job's API test step grows from 887 to
+890 seconds. Preparation before that step falls from 109 to 74 seconds, the
+job starts ten seconds earlier, cleanup adds one second, and the final result
+gate saves two seconds. Those differences account for the overall reduction.
+The unchanged setup steps, especially Node setup (26 to eight seconds), explain
+most of the shorter job; they were not optimized by this commit.
+
+The scheduler does distribute bundle cases, but xdist's existing largest-scope
+ordering places the new singleton scopes behind larger files. The first bundle
+case starts 22.33 seconds after the old test step begins versus 143.36 seconds
+in the candidate. Its execution interval shrinks by 114.71 seconds, while that
+later start and increased per-case time absorb the benefit. Cumulative case
+time includes overlapping execution and must not be interpreted as wall time.
+These two runs do not distinguish same-VM resource contention from other runner
+variation; no CPU/disk profile was captured. Independent Windows runner shards
+are the next useful controlled comparison, with exact-once case ownership and
+the same real collectors and assertions retained.
+
+Cached API snapshots, logs, JUnit artifacts and generated comparisons are under
+`.cache/ci-timing/round3/` and `.cache/ci-timing/round3-comparison/`. The experiment
+remains on its integration branch and is not merged into `main`.
 
 ## Test cost and ownership
 
