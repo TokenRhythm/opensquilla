@@ -9,7 +9,7 @@ export function createWorkspaceFilesWorkbenchItem(sessionKey: string): Workbench
     title: 'Workspace files',
     scope: { type: 'session', id: sessionKey },
     hostKind: 'dom',
-    retention: 'keep-alive',
+    retention: 'dispose-on-suspend',
     payload: {},
   }
 }

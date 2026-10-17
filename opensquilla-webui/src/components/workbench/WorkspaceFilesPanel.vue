@@ -1,24 +1,24 @@
 <template>
-  <div class="workspace-files" :class="{ 'is-tree-hidden': !treeVisible }" data-testid="workspace-files-panel">
+  <div class="workspace-files" :class="{ 'is-tree-hidden': !treeVisible }" data-testid="workspace-files-panel" @pointerdown.capture="interactionEpoch++" @keydown.capture="interactionEpoch++" @wheel.capture.passive="interactionEpoch++">
     <aside v-show="treeVisible" class="workspace-files__tree" :aria-label="t('workbench.newPanel.workspaceFiles')">
       <div class="workspace-files__tree-toolbar">
         <div class="workspace-files__filter">
           <span class="workspace-files__filter-icon" aria-hidden="true" v-html="getIconSvg('search', 14)" />
           <input ref="filterInput" v-model="filter" class="workspace-files__filter-input" type="search" :placeholder="t('workbench.workspaceFiles.filterPlaceholder')"
             :aria-label="t('workbench.workspaceFiles.filterPlaceholder')" :aria-describedby="filterHelpId" :title="t('workbench.workspaceFiles.filter')"
-            autocomplete="off" spellcheck="false" @keydown="onFilterKeydown" />
+            autocomplete="off" spellcheck="false" maxlength="512" :disabled="runtimeReady === false || initializing" @keydown="onFilterKeydown" />
           <button v-if="filter" type="button" class="workspace-files__filter-clear"
             :aria-label="t('workbench.workspaceFiles.clearFilter')" :title="t('workbench.workspaceFiles.clearFilter')"
             @pointerdown.prevent @click="clearFilter"><span aria-hidden="true" v-html="getIconSvg('x', 12)" /></button>
           <span :id="filterHelpId" class="sr-only">{{ t('workbench.workspaceFiles.filter') }}</span>
         </div>
-        <button type="button" class="workspace-files__refresh" :disabled="loading" :aria-label="t('workbench.workspaceFiles.refresh')" :title="t('workbench.workspaceFiles.refresh')" @click="refresh">
+        <button type="button" class="workspace-files__refresh" :disabled="loading || runtimeReady === false" :aria-label="t('workbench.workspaceFiles.refresh')" :title="t('workbench.workspaceFiles.refresh')" @click="refresh()">
           <span v-html="getIconSvg('refresh', 14)" />
         </button>
       </div>
       <p v-if="treeError" class="workspace-files__message" role="alert">{{ treeError }}</p>
       <p v-else-if="loading && !flatNodes.length" class="workspace-files__message" role="status">{{ t('workbench.workspaceFiles.loading') }}</p>
-      <div ref="treeScroll" class="workspace-files__tree-scroll" role="tree" @scroll="virtualizer.measure">
+      <div ref="treeScroll" class="workspace-files__tree-scroll" role="tree" @scroll="onTreeScroll">
         <div class="workspace-files__tree-spacer" :style="{ height: `${virtualizer.getTotalSize()}px` }">
           <div
             v-for="row in virtualRows"
@@ -76,6 +76,7 @@
         v-if="selected && (previewKind === 'source' || sourceMode)"
         v-bind="previewState"
         :mime="resolvedFile?.mime || selected.mime"
+        :reading-state="previewReading"
         @workbench-event="handlePreviewEvent"
       />
       <ResourcePreviewPanel v-else-if="selected && previewBlob" :key="previewState.viewId" :blob="previewBlob" :kind="previewKind" :name="selected.name" />
@@ -86,7 +87,7 @@
       </div>
       <div v-else-if="rootError" class="workspace-files__empty" role="alert">
         <p>{{ t('workbench.workspaceFiles.rootUnavailable') }}</p>
-        <button type="button" class="workspace-files__mode" @click="refresh">{{ t('workbench.workspaceFiles.retryRoot') }}</button>
+        <button type="button" class="workspace-files__mode" @click="refresh()">{{ t('workbench.workspaceFiles.retryRoot') }}</button>
       </div>
       <p v-else class="workspace-files__empty">{{ t('workbench.workspaceFiles.selectFile') }}</p>
     </section>
@@ -105,8 +106,10 @@ import { completeWorkspaceMarkdown, isWorkspaceMarkdown, WORKSPACE_MARKDOWN_PREV
 import { WORKSPACE_FILES_KEY, WorkspaceFilesChangedError, WorkspaceTextLimitError, type WorkspaceDirectoryEntry, type WorkspaceFile, type WorkspaceFilePage, type WorkspaceRoot } from '@/modules/workspaceFiles'
 import { getIconSvg } from '@/utils/icons'
 import { copyTextWithFallback } from '@/utils/browser'
+import { workspaceFilesReadingState, workspaceReadingIdentity, workspaceReadingState, type WorkspaceFilesReadingState, type WorkspaceReadingState } from './workspaceReadingState'
 
-const props = defineProps<{ sessionKey: string }>()
+const props = withDefaults(defineProps<{ sessionKey: string; runtimeReady?: boolean; readingState?: WorkspaceFilesReadingState; runRestore?: (task: () => Promise<void>) => Promise<void> }>(), { runtimeReady: true })
+const emit = defineEmits<{ 'workbench-event': [event: { type: string; payload?: unknown }] }>()
 const { t } = useI18n()
 const files = inject(WORKSPACE_FILES_KEY, null)
 const treeScroll = ref<HTMLElement | null>(null)
@@ -114,7 +117,8 @@ const filter = ref('')
 const filterInput = ref<HTMLInputElement | null>(null)
 const filterHelpId = useId()
 const treeVisible = ref(true)
-const loading = computed(() => [...directories.values()].some(state => state.loading))
+const initializing = ref(false)
+const loading = computed(() => initializing.value || [...directories.values()].some(state => state.loading))
 const treeError = ref('')
 const selected = ref<WorkspaceDirectoryEntry | null>(null)
 const resolvedFile = shallowRef<WorkspaceFile | null>(null)
@@ -145,6 +149,14 @@ const previewState = reactive<{
 }>({ snapshot: null, viewId: 0, loading: false, errorKey: '', previewErrorKey: '', searchStatus: 'idle', searchErrorKey: '', searchQuery: '', copying: false, copied: false, copyErrorKey: '' })
 const previewBlob = shallowRef<Blob | null>(null)
 const sourceMode = ref(false)
+const previewReading = shallowRef<WorkspaceReadingState>()
+let savedPreviewReading: WorkspaceReadingState | undefined
+let interactionEpoch = 0
+let restoring = false
+let treeTop = 0
+let desiredCounts: Record<string, number> = {}
+let mounted = false
+let initialized = false
 const previewKind = computed(() => selected.value ? resourcePreviewKind(selected.value) : 'unsupported')
 interface PreviewRequest {
   controller: AbortController
@@ -164,7 +176,10 @@ const flatNodes = computed(() => {
     || (entry.type === 'directory' && Boolean(directories.get(entry.path)?.hasMore || directories.get(entry.path)?.entries.some(matchesLoaded)))
   const append = (path: string, depth: number) => {
     const state = directories.get(path)
-    if (!state) return
+    if (!state) {
+      if (expanded.has(path)) rows.push({ key: `more:${path}`, kind: 'more', depth, directoryPath: path })
+      return
+    }
     for (const entry of state.entries) {
       if (query && !matchesLoaded(entry)) continue
       rows.push({ key: `entry:${entry.path}`, kind: 'entry', entry, depth, directoryPath: path })
@@ -187,6 +202,25 @@ const virtualRows = computed(() => virtualizer.value.getVirtualItems().map(item 
   ...flatNodes.value[item.index]!, start: item.start,
 })))
 const truncated = computed(() => [...directories.values()].some(state => state.truncated))
+
+function saveReading() {
+  if (restoring || !binding.value) return
+  const reading: WorkspaceFilesReadingState = {
+    sessionKey: props.sessionKey, binding: binding.value, expanded: [...expanded],
+    loadedCounts: { ...desiredCounts, ...Object.fromEntries([...directories].map(([path, state]) => [path, Math.max(desiredCounts[path] ?? 0, state.entries.length)])) },
+    filter: filter.value, treeVisible: treeVisible.value, treeTop,
+    selectedPath: selected.value?.path ?? '', sourceMode: sourceMode.value,
+    selectedIdentity: resolvedFile.value ? workspaceReadingIdentity(props.sessionKey, resolvedFile.value) : '',
+    reading: savedPreviewReading,
+  }
+  emit('workbench-event', { type: 'workspace-files-reading-state', payload: reading })
+}
+function onTreeScroll() {
+  treeTop = treeScroll.value?.scrollTop ?? 0
+  virtualizer.value.measure()
+  saveReading()
+}
+watch([filter, treeVisible, sourceMode, () => [...expanded], selected, resolvedFile], saveReading, { flush: 'post' })
 
 function clearFilter() {
   filter.value = ''
@@ -295,7 +329,7 @@ async function loadDirectory(path: string, append = false) {
     if (!append) directories.delete(path)
     treeError.value = t('workbench.workspaceFiles.unavailable')
   } finally {
-    if (isCurrent()) state.loading = false
+    if (isCurrent()) { state.loading = false; saveReading() }
   }
 }
 
@@ -308,10 +342,12 @@ async function toggle(entry: WorkspaceDirectoryEntry) {
   if (!directories.has(entry.path)) await loadDirectory(entry.path)
 }
 
-async function activate(entry: WorkspaceDirectoryEntry, asSource = false) {
+async function activate(entry: WorkspaceDirectoryEntry, asSource = false, restore?: WorkspaceFilesReadingState) {
   if (entry.type === 'directory') { await toggle(entry); return }
   selected.value = entry
   sourceMode.value = asSource
+  previewReading.value = undefined
+  savedPreviewReading = undefined
   resetPreview()
   resolvedFile.value = null
   if (!files) return
@@ -323,6 +359,10 @@ async function activate(entry: WorkspaceDirectoryEntry, asSource = false) {
     const match = matches.find(file => file.path === entry.path && file.workspaceBinding === binding.value)
     if (!match) throw new Error('File unavailable')
     resolvedFile.value = match
+    if (restore?.selectedIdentity === workspaceReadingIdentity(request.sessionKey, match)) {
+      previewReading.value = restore.reading
+      savedPreviewReading = restore.reading
+    }
   } catch (error) {
     if (isCurrentPreview(request)) { previewState.errorKey = fileError(error); previewState.loading = false }
     return
@@ -372,7 +412,8 @@ async function activate(entry: WorkspaceDirectoryEntry, asSource = false) {
   }
   previewState.loading = true
   try {
-    const page = await files.readPage(request.sessionKey, fileFor(entry), 1, 200, request.controller.signal)
+    const startLine = previewReading.value?.startLine ?? 1
+    const page = await files.readPage(request.sessionKey, fileFor(entry), startLine, startLine + 199, request.controller.signal)
     if (isCurrentPreview(request)) previewState.snapshot = { ...page, paged: true }
   } catch (error) {
     if (isCurrentPreview(request)) previewState.errorKey = fileError(error)
@@ -395,6 +436,11 @@ function toggleSource() {
 async function handlePreviewEvent(event: { type: string; payload?: unknown }) {
   const entry = selected.value
   const value = event.payload && typeof event.payload === 'object' ? event.payload as Record<string, unknown> : {}
+  if (event.type === 'workspace-file-reading-state') {
+    savedPreviewReading = workspaceReadingState(value)
+    saveReading()
+    return
+  }
   if (!entry || entry.type !== 'file' || entry.kind !== 'text' || !files) return
   const file = fileFor(entry)
   const sessionKey = props.sessionKey
@@ -450,7 +496,11 @@ async function handlePreviewEvent(event: { type: string; payload?: unknown }) {
   }
 }
 
-async function refresh() {
+async function refresh(restore = false) {
+  const saved = restore ? workspaceFilesReadingState(props.readingState) : undefined
+  const epoch = interactionEpoch
+  restoring = Boolean(saved)
+  desiredCounts = {}
   directoryRequest.abort()
   directoryRequest = new AbortController()
   treeError.value = ''
@@ -464,6 +514,8 @@ async function refresh() {
   expanded.clear()
   binding.value = ''
   directories.clear()
+  previewReading.value = undefined
+  savedPreviewReading = undefined
   const rootRequest = rootAbort
   if (files?.root) {
     try {
@@ -474,12 +526,65 @@ async function refresh() {
       if (!rootRequest.signal.aborted && rootRequest === rootAbort) rootError.value = true
     }
   }
-  if (!rootRequest.signal.aborted && rootRequest === rootAbort) await loadDirectory('')
+  const current = () => !rootRequest.signal.aborted && rootRequest === rootAbort
+  if (current()) await loadDirectory('')
+  if (current() && saved?.sessionKey === props.sessionKey && saved.binding === binding.value && epoch === interactionEpoch) {
+    desiredCounts = saved.loadedCounts
+    filter.value = saved.filter
+    treeVisible.value = saved.treeVisible
+    if (current() && epoch === interactionEpoch && saved.selectedPath && files) {
+      // Resolve again with current authority; saved metadata is never a read handle.
+      try {
+        const matches = await files.resolve(props.sessionKey, [saved.selectedPath], rootRequest.signal)
+        if (current() && epoch === interactionEpoch) {
+          const file = matches.find(file => file.path === saved.selectedPath && file.workspaceBinding === binding.value)
+          if (file) await activate({ ...file, type: 'file', mtimeNs: '' }, saved.sourceMode, saved)
+        }
+      } catch { /* A removed file leaves a usable tree, with no stale preview. */ }
+    }
+    // The document returns first. Bound directory replay independently: huge
+    // trees retain their expansion intent and expose Load more for cold rows.
+    const paths = [...saved.expanded].sort((a, b) => {
+      const aSelected = saved.selectedPath.startsWith(`${a}/`)
+      const bSelected = saved.selectedPath.startsWith(`${b}/`)
+      return Number(bSelected) - Number(aSelected) || a.split('/').length - b.split('/').length
+    })
+    if (current() && epoch === interactionEpoch) paths.forEach(path => expanded.add(path))
+    let pageBudget = 8
+    for (const path of ['', ...paths]) {
+      if (!current() || epoch !== interactionEpoch || pageBudget <= 0) break
+      if (path) { pageBudget--; await loadDirectory(path) }
+      const count = saved.loadedCounts[path] ?? 200
+      while (pageBudget > 0 && current() && epoch === interactionEpoch && directories.get(path)?.hasMore && (directories.get(path)?.entries.length ?? 0) < count) {
+        const before = directories.get(path)?.entries.length
+        pageBudget--
+        await loadDirectory(path, true)
+        if (directories.get(path)?.entries.length === before) break
+      }
+    }
+    await nextTick()
+    if (current() && epoch === interactionEpoch && treeScroll.value) {
+      treeTop = saved.treeTop
+      treeScroll.value.scrollTop = treeTop
+      virtualizer.value.measure()
+    }
+  }
+  if (current()) { restoring = false; saveReading() }
 }
 
 watch(() => props.sessionKey, () => { void refresh() }, { flush: 'sync' })
-onMounted(() => { void refresh(); void nextTick(() => virtualizer.value.measure()) })
-onBeforeUnmount(() => { directoryRequest.abort(); rootAbort?.abort(); resetPreview() })
+function initialize() {
+  // The host can mount its lightweight shell before the asynchronous runtime
+  // factory has published the checkpoint. Never overwrite it with an empty
+  // tree loaded before that handoff completes.
+  if (!mounted || initialized || props.runtimeReady === false) return
+  initialized = true
+  initializing.value = true
+  void (props.runRestore ? props.runRestore(() => refresh(true)) : refresh(true)).finally(() => { initializing.value = false })
+}
+watch(() => props.runtimeReady, initialize, { flush: 'post' })
+onMounted(() => { mounted = true; initialize(); void nextTick(() => virtualizer.value.measure()) })
+onBeforeUnmount(() => { mounted = false; directoryRequest.abort(); rootAbort?.abort(); resetPreview() })
 </script>
 
 <style scoped>

@@ -28,6 +28,43 @@ async function setup(read: WorkspaceReferences['read']) {
   return { item, runtime, state: () => state }
 }
 describe('workspace file runtime', () => {
+  it('restores only bounded reading hints after release, rereading with child authority', async () => {
+    const file: WorkspaceFile = { requestedPath: 'large.ts', path: 'large.ts', name: 'large.ts', mime: 'text/typescript',
+      size: 1000, kind: 'text', workspaceBinding: 'binding-a', revision: 'rev-a', textPaging: true }
+    const item = createResolvedWorkspaceFileItem('child', file, 'parent')
+    const readPage = vi.fn(async (_session: string, _file: WorkspaceFile, startLine: number) => ({
+      relativePath: file.path, content: 'authorized source', totalLines: 800, startLine, endLine: startLine + 199,
+    }))
+    const definition = createWorkspaceFileDefinition(null, { resolve: vi.fn(), read: vi.fn(), readPage }, key => key)
+    let saved: Readonly<Record<string, unknown>> = {}
+    const make = async () => {
+      const state: Record<string, unknown> = {}
+      const runtime = await definition.createRuntime!(item, {
+        getRenderState: () => state, updateRenderState: patch => Object.assign(state, patch),
+        getViewState: () => saved, saveViewState: value => { saved = value },
+        isItemOpen: () => true, setExpanded: vi.fn(), reportError: vi.fn(),
+      })
+      return { state, runtime }
+    }
+    const first = await make()
+    first.runtime.activate!(item)
+    await vi.waitFor(() => expect(first.state.snapshot).toBeTruthy())
+    first.runtime.handleComponentEvent!({ type: 'workspace-file-reading-state', payload: {
+      mode: 'source', query: 'needle', startLine: 401, focusLine: 450, sourceTop: 600, sourceLeft: 30,
+      content: 'must not retain', blob: new Blob(['must not retain']),
+    } }, item)
+    first.runtime.suspend!(item)
+    expect(first.state.snapshot).toBeNull()
+    expect(JSON.stringify(saved)).not.toContain('must not retain')
+    const second = await make()
+    second.runtime.activate!(item)
+    await vi.waitFor(() => expect(second.state.snapshot).toMatchObject({ startLine: 401 }))
+    expect(readPage).toHaveBeenLastCalledWith('child', file, 401, 600, expect.any(AbortSignal))
+    expect(second.state.readingState).toMatchObject({ query: 'needle', sourceTop: 600, sourceLeft: 30 })
+    second.runtime.update!({ ...item, payload: { ...item.payload, file: { ...file, revision: 'rev-b' } } })
+    await vi.waitFor(() => expect(second.state.snapshot).toMatchObject({ startLine: 1 }))
+    expect(second.state.readingState).toBeUndefined()
+  })
   it('revalidates a child reference with child authority while showing it in the parent workspace', async () => {
     const read = vi.fn().mockResolvedValue({ content: 'child record', reference })
     const item = createWorkspaceFileItem('child', reference, 'parent')
@@ -516,7 +553,7 @@ describe('source runtime manager cancellation', () => {
     expect(manager.hasRuntime(item.id)).toBe(false)
     pending.resolve({ relativePath: file.path, content: 'obsolete source', startLine: 1, endLine: 1, totalLines: 1 })
     await Promise.resolve()
-    expect(manager.getRenderState(item.id).snapshot).toBeNull()
+    expect(manager.getRenderState(item.id)).toEqual({})
     await manager.disposeAll()
   })
 
@@ -555,7 +592,7 @@ describe('source runtime manager cancellation', () => {
     await Promise.resolve()
     expect(decode).not.toHaveBeenCalled()
     expect(copyTextWithFallback).not.toHaveBeenCalled()
-    expect(manager.getRenderState(item.id)).toMatchObject({ snapshot: null, copying: false, copied: false })
+    expect(manager.getRenderState(item.id)).toEqual({})
     await manager.disposeAll()
   })
 

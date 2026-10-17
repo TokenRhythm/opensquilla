@@ -1,5 +1,5 @@
 <template>
-  <div class="workspace-file" data-testid="workspace-file-panel">
+  <div class="workspace-file" data-testid="workspace-file-panel" @pointerdown.capture="interactionEpoch++" @keydown.capture="interactionEpoch++" @wheel.capture.passive="interactionEpoch++">
     <div v-if="file && sessionKey" class="workspace-file__actions">
       <WorkspaceResourceActions :session-key="sessionKey" :file="file" />
     </div>
@@ -38,8 +38,8 @@
       <p v-if="previewErrorKey" class="workspace-file__status" role="status">{{ t(previewErrorKey === 'workbench.artifactPreview.tooLarge' ? 'workbench.artifactPreview.tooLargeDetail' : previewErrorKey) }}</p>
       <ResourcePreviewPanel v-if="mode === 'preview' && canPreviewResource && previewBlob"
         :blob="previewBlob" :kind="previewKind!" :name="snapshot.relativePath" />
-      <div v-else-if="mode === 'preview' && canPreviewMarkdown" ref="markdownPreview" class="workspace-file__markdown artifact-preview__markdown chat-markdown" v-html="markdownHtml" />
-      <pre v-else ref="source" class="workspace-file__source" tabindex="0" :aria-label="snapshot.relativePath"><code><span
+      <div v-else-if="mode === 'preview' && canPreviewMarkdown" ref="markdownPreview" class="workspace-file__markdown artifact-preview__markdown chat-markdown" @scroll.passive="saveScroll" v-html="markdownHtml" />
+      <pre v-else ref="source" class="workspace-file__source" tabindex="0" :aria-label="snapshot.relativePath" @scroll.passive="saveScroll"><code><span
         v-for="line in visibleLines" :key="line.number" class="workspace-file__line"
         :class="{ 'is-selected': Boolean(snapshot.reference) && line.number >= snapshot.startLine && line.number <= snapshot.endLine, 'is-match': line.match }"
         :data-line="line.number" :aria-current="line.number === focusLine ? 'location' : undefined"
@@ -67,6 +67,7 @@ import type { WorkspaceFile } from '@/modules/workspaceFiles'
 import { isWorkspaceMarkdown, WORKSPACE_MARKDOWN_PREVIEW_LIMIT } from '@/workbench/workspaceTextPreview'
 import ResourcePreviewPanel from './ResourcePreviewPanel.vue'
 import WorkspaceResourceActions from './WorkspaceResourceActions.vue'
+import { workspaceReadingState, type WorkspaceReadingState } from './workspaceReadingState'
 
 interface WorkspaceFileViewSnapshot {
   relativePath: string
@@ -96,6 +97,7 @@ const props = defineProps<{
   searchStatus?: 'idle' | 'searching' | 'found' | 'not-found'
   searchQuery?: string
   searchErrorKey?: string
+  readingState?: WorkspaceReadingState
 }>()
 const emit = defineEmits<{ 'workbench-event': [event: { type: string; payload?: unknown }] }>()
 const { t } = useI18n()
@@ -105,6 +107,12 @@ const query = ref('')
 const jump = ref('')
 const toolsOpen = ref(false)
 const mode = ref<'preview' | 'source'>('preview')
+let interactionEpoch = 0
+let restoreEpoch = 0
+let restoreReading = true
+let sourceTop = 0
+let sourceLeft = 0
+let markdownTop = 0
 const canPreviewMarkdown = computed(() => Boolean(props.snapshot && !props.snapshot.reference
   && isWorkspaceMarkdown({ name: props.snapshot.relativePath, mime: props.file?.mime || props.mime || '' }) && props.snapshot.startLine === 1
   && props.snapshot.endLine >= props.snapshot.totalLines && props.snapshot.content.length <= WORKSPACE_MARKDOWN_PREVIEW_LIMIT))
@@ -152,19 +160,65 @@ const visibleLines = computed(() => lines.value.slice(windowStart.value, windowE
 const rangeStart = computed(() => props.snapshot?.reference ? props.snapshot.startLine : visibleLines.value[0]?.number ?? 1)
 const rangeEnd = computed(() => props.snapshot?.reference ? props.snapshot.endLine : visibleLines.value[visibleLines.value.length - 1]?.number ?? 1)
 watch(() => props.viewId, () => {
-  query.value = ''
-  jump.value = ''
+  const saved = workspaceReadingState(props.readingState)
+  query.value = saved?.query ?? ''
+  jump.value = saved?.jump ?? ''
   searchedQuery.value = ''
-  mode.value = 'preview'
-  toolsOpen.value = false
-})
+  mode.value = saved?.mode ?? 'preview'
+  toolsOpen.value = saved?.toolsOpen ?? false
+  sourceTop = saved?.sourceTop ?? 0
+  sourceLeft = saved?.sourceLeft ?? 0
+  markdownTop = saved?.markdownTop ?? 0
+  restoreReading = true
+  restoreEpoch = interactionEpoch
+}, { immediate: true })
 watch(() => props.snapshot, async snapshot => {
   if (!snapshot) return
-  focusLine.value = snapshot.focusLine ?? snapshot.startLine
-  windowStart.value = snapshot.paged ? 0 : Math.max(0, focusLine.value - 41)
+  const interrupted = restoreReading && restoreEpoch !== interactionEpoch
+  const saved = restoreReading && !interrupted ? workspaceReadingState(props.readingState) : undefined
+  restoreReading = false
+  const epoch = interactionEpoch
+  if (saved) {
+    mode.value = saved.mode
+    query.value = saved.query
+    jump.value = saved.jump
+    toolsOpen.value = saved.toolsOpen
+    sourceTop = saved.sourceTop
+    sourceLeft = saved.sourceLeft
+    markdownTop = saved.markdownTop
+  }
+  focusLine.value = Math.min(snapshot.totalLines, saved?.focusLine ?? snapshot.focusLine ?? snapshot.startLine)
+  windowStart.value = snapshot.paged ? 0 : Math.min(Math.max(0, lines.value.length - 1), saved?.windowStart ?? Math.max(0, focusLine.value - 41))
   await nextTick()
-  if (props.snapshot === snapshot) scrollToLine(focusLine.value)
+  if (props.snapshot !== snapshot || epoch !== interactionEpoch || interrupted) return
+  if (saved) restoreScroll()
+  else scrollToLine(focusLine.value)
+  saveReading()
 }, { immediate: true })
+
+function restoreScroll() {
+  if (source.value) { source.value.scrollTop = sourceTop; source.value.scrollLeft = sourceLeft }
+  if (markdownPreview.value) markdownPreview.value.scrollTop = markdownTop
+}
+function saveScroll() {
+  if (source.value) { sourceTop = source.value.scrollTop; sourceLeft = source.value.scrollLeft }
+  if (markdownPreview.value) markdownTop = markdownPreview.value.scrollTop
+  saveReading()
+}
+function saveReading() {
+  if (!props.snapshot || props.loading) return
+  emit('workbench-event', { type: 'workspace-file-reading-state', payload: {
+    mode: mode.value, query: query.value, jump: jump.value, toolsOpen: toolsOpen.value,
+    startLine: props.snapshot.startLine, focusLine: focusLine.value, windowStart: windowStart.value,
+    sourceTop, sourceLeft, markdownTop,
+  } satisfies WorkspaceReadingState })
+}
+watch([mode, query, jump, toolsOpen, focusLine, windowStart], saveReading, { flush: 'post' })
+watch(mode, async () => {
+  const epoch = interactionEpoch
+  await nextTick()
+  if (epoch === interactionEpoch) restoreScroll()
+})
 
 function scrollToLine(line: number) {
   source.value?.querySelector(`[data-line="${line}"]`)?.scrollIntoView?.({ block: 'center' })

@@ -17,10 +17,11 @@ import { workbenchPanelRegistry } from '@/workbench/registry'
 import AppWorkbench from './AppWorkbench.vue'
 import { createAssistantChatOwner } from '@/modules/assistantChat'
 
+const pushToast = vi.hoisted(() => vi.fn())
 const platform = vi.hoisted(() => ({ current: {} as Platform }))
 vi.mock('@/platform', () => ({ usePlatform: () => platform.current }))
 vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string) => key }) }))
-vi.mock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast: vi.fn() }) }))
+vi.mock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast }) }))
 vi.mock('@/composables/useConfirm', () => ({ useConfirm: () => ({ confirm: vi.fn(async () => true) }) }))
 vi.mock('@/components/ResourceActionsMenu.vue', () => ({ default: { render: () => null } }))
 // Keep the actual actions slot, event listeners, store and permission decisions;
@@ -59,7 +60,7 @@ const menu = () => document.querySelector<HTMLElement>('[data-testid="workbench-
 const option = (kind: PanelKind) => menu()?.querySelector<HTMLButtonElement>(`[data-panel-kind="${kind}"]`) ?? null
 async function settle() { for (let index = 0; index < 5; index++) { await Promise.resolve(); await nextTick() } }
 
-beforeEach(() => { localStorage.clear(); workbenchPanelRegistry.clear() })
+beforeEach(() => { localStorage.clear(); workbenchPanelRegistry.clear(); pushToast.mockClear() })
 afterEach(async () => {
   apps.splice(0).forEach(app => app.unmount())
   await settle()
@@ -426,6 +427,40 @@ describe('AppWorkbench new panel menu interaction', () => {
     expect(harness.trigger()).not.toBeNull()
   })
 
+  it.each([true, false])('reports native artifact admission from any producer without stealing focus (activate=%s)', async activate => {
+    const harness = await mount()
+    const native = (index: number) => ({ id: `native-preview-${index}`, kind: 'artifact-preview' as const,
+      title: 'Interactive preview', scope: { type: 'session' as const, id: 'session-a' },
+      hostKind: 'native-webcontents' as const, retention: 'keep-alive' as const, payload: {} })
+    for (let index = 0; index < 4; index += 1) harness.store.openItem(native(index), { activate: false })
+    // Simulates both explicit main/side opens and background agent-produced
+    // previews: all enter the store, so none can bypass the shared notification.
+    expect(harness.store.openItem(native(4), { activate })).toBe(false)
+    await settle()
+    expect(harness.store.items).toHaveLength(5)
+    expect(harness.store.activeItemId).toBe('existing-panel')
+    expect(pushToast).toHaveBeenCalledExactlyOnceWith('workbench.nativePreview.capacityReached',
+      { tone: 'warn', duration: 9000 })
+    expect(harness.store.openItem({ ...native(0), title: 'Updated preview' })).toBe(true)
+    expect(pushToast).toHaveBeenCalledTimes(1)
+  })
+
+  it('explains terminal capacity without discarding retained sessions or opening a broken tab', async () => {
+    const harness = await mount()
+    for (let index = 0; index < 4; index += 1) {
+      harness.store.openItem({ id: `retained-terminal-${index}`, kind: 'terminal', title: 'Terminal',
+        scope: { type: 'session', id: `old-session-${index}` }, hostKind: 'dom',
+        retention: 'keep-alive', payload: {} }, { activate: false })
+    }
+    await harness.open()
+    option('terminal')!.click()
+    await settle()
+    expect(harness.store.items).toHaveLength(5)
+    expect(harness.store.activeItemId).toBe('existing-panel')
+    expect(pushToast).toHaveBeenCalledWith('workbench.terminal.capacityReached',
+      { tone: 'warn', duration: 6000 })
+  })
+
   it('opens an assistant panel scoped to the parent without changing the main conversation', async () => {
     const harness = await mount()
     const parentKey = harness.store.activeSessionId
@@ -447,6 +482,35 @@ describe('AppWorkbench new panel menu interaction', () => {
     await settle()
     expect(harness.store.activeItemId).not.toBe(panelId)
     expect(harness.store.items.filter(item => item.kind === 'assistant-chat')).toHaveLength(2)
+  })
+
+  it('retains workspace tools across unresolved navigation and restores the original owner', async () => {
+    const harness = await mount()
+    for (const kind of ['workspace-files', 'terminal'] as const) {
+      await harness.open()
+      option(kind)!.click()
+      await settle()
+    }
+    const terminalId = harness.store.activeItemId
+    const retainedIds = harness.store.items.map(item => item.id)
+    harness.props.sessionId = 'session-b'
+    harness.props.workspaceResolved = false
+    harness.props.workspaceId = null
+    await settle()
+    harness.props.workspaceId = 'workspace-b'
+    harness.props.workspaceResolved = true
+    await settle()
+    expect(harness.store.items.map(item => item.id)).toEqual(retainedIds)
+    harness.props.sessionId = 'session-a'
+    harness.props.workspaceResolved = false
+    harness.props.workspaceId = null
+    await settle()
+    expect(harness.store.activeItemId).toBe(terminalId)
+    harness.props.workspaceId = 'workspace-a'
+    harness.props.workspaceResolved = true
+    await settle()
+    expect(harness.store.items.map(item => item.id)).toEqual(retainedIds)
+    expect(harness.store.activeItemId).toBe(terminalId)
   })
 
   it('retires workspace-bound panels when the parent changes workspace', async () => {

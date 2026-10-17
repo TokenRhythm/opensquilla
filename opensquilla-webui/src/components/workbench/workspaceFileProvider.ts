@@ -8,6 +8,7 @@ import WorkspaceFilePanel from './WorkspaceFilePanel.vue'
 import { copyTextWithFallback } from '@/utils/browser'
 import { resourcePreviewKind, resourcePreviewLimit } from '@/workbench/resourcePreview'
 import { completeWorkspaceMarkdown, isWorkspaceMarkdown, WORKSPACE_MARKDOWN_PREVIEW_LIMIT } from '@/workbench/workspaceTextPreview'
+import { workspaceReadingIdentity, workspaceReadingState } from './workspaceReadingState'
 
 interface WorkspaceFileViewSnapshot {
   relativePath: string
@@ -55,25 +56,55 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
   private pendingCopy: AbortController | null = null
   private copyTimer: ReturnType<typeof setTimeout> | null = null
   private viewId = 0
+  private restoring = false
+  private restoreEpoch = 0
   constructor(
     private readonly references: WorkspaceReferences | null,
     private readonly files: WorkspaceFiles | null,
     private readonly context: WorkbenchRuntimeContext,
   ) {}
   // Network work must not block the manager queue that delivers cancellation.
-  activate(item: WorkbenchItem) { void this.load(item, 1, undefined, true) }
+  activate(item: WorkbenchItem) { this.restore(item) }
   resume(item: WorkbenchItem) {
     const state = this.context.getRenderState()
-    if (!state.snapshot && !state.loading && !state.errorKey) void this.load(item, 1, undefined, true)
+    if (!this.restoring && !state.snapshot && !state.loading && !state.errorKey) this.restore(item)
   }
-  update(item: WorkbenchItem) { void this.load(item, 1, undefined, true) }
+  update(item: WorkbenchItem) { this.restore(item) }
+  private identity(item: WorkbenchItem) {
+    const file = workspaceFilePayload(item)
+    return file ? workspaceReadingIdentity(workspaceFileSessionKey(item), file)
+      : JSON.stringify([workspaceFileSessionKey(item), workspaceFileReference(item)])
+  }
+  private restore(item: WorkbenchItem) {
+    const epoch = ++this.restoreEpoch
+    this.restoring = true
+    const saved = this.context.getViewState?.()
+    const readingState = saved?.identity === this.identity(item) ? workspaceReadingState(saved.reading) : undefined
+    this.context.updateRenderState({ readingState })
+    const load = async () => {
+      if (epoch === this.restoreEpoch) await this.load(item, readingState?.startLine ?? 1, readingState?.focusLine, true)
+    }
+    void (this.context.runRestore ? this.context.runRestore(load) : load()).finally(() => {
+      if (epoch === this.restoreEpoch) this.restoring = false
+    })
+  }
   performAction(action: string, item: WorkbenchItem) {
-    if (action === 'refresh') void this.load(item, 1, undefined, true)
+    if (action === 'refresh') {
+      this.restoreEpoch++
+      this.restoring = false
+      this.context.updateRenderState({ readingState: undefined })
+      void this.load(item, 1, undefined, true)
+    }
   }
   handleComponentEvent(event: { type: string; payload?: unknown }, item: WorkbenchItem) {
     if (item.scope.type !== 'session') return
     const payload = event.payload
     const value = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
+    if (event.type === 'workspace-file-reading-state') {
+      const reading = workspaceReadingState(value)
+      if (reading) this.context.saveViewState?.({ identity: this.identity(item), reading })
+      return
+    }
     if (event.type === 'workspace-file-page') {
       const startLine = Number(value.startLine)
       const focusLine = Number(value.focusLine)
@@ -103,6 +134,8 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
     this.copyTimer = null
   }
   suspend() {
+    this.restoreEpoch++
+    this.restoring = false
     this.pending?.abort()
     this.pending = null
     this.cancelCopy()

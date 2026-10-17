@@ -34,6 +34,34 @@ async function enter(input: HTMLInputElement, value: string) {
 }
 
 describe('workspace source panel', () => {
+  it('restores source search and scrolling without moving keyboard focus', async () => {
+    const { el, onEvent } = await mount({ snapshot: page(201, 400), readingState: {
+      mode: 'source', query: 'line 250', jump: '250', toolsOpen: true, startLine: 201, focusLine: 250,
+      windowStart: 0, sourceTop: 400, sourceLeft: 25, markdownTop: 0,
+    } })
+    const source = el.querySelector<HTMLElement>('.workspace-file__source')!
+    expect(source.scrollTop).toBe(400)
+    expect(source.scrollLeft).toBe(25)
+    expect(el.querySelector<HTMLInputElement>('input[type="search"]')?.value).toBe('line 250')
+    expect(document.activeElement).not.toBe(source)
+    source.scrollTop = 650
+    source.dispatchEvent(new Event('scroll'))
+    expect(onEvent).toHaveBeenLastCalledWith(expect.objectContaining({
+      type: 'workspace-file-reading-state', payload: expect.objectContaining({ sourceTop: 650 }),
+    }))
+  })
+
+  it('does not apply an old scroll restore after user interaction during loading', async () => {
+    const { el, state } = await mount({ snapshot: null, loading: true, readingState: {
+      mode: 'source', query: '', jump: '', toolsOpen: false, startLine: 201, focusLine: 250,
+      windowStart: 0, sourceTop: 400, sourceLeft: 25, markdownTop: 0,
+    } })
+    el.querySelector('.workspace-file')!.dispatchEvent(new Event('pointerdown', { bubbles: true }))
+    state.loading = false
+    state.snapshot = page(201, 400)
+    await nextTick(); await nextTick()
+    expect(el.querySelector<HTMLElement>('.workspace-file__source')?.scrollTop).toBe(0)
+  })
   it('renders binary media with no source controls and preserves standalone actions on preview errors', async () => {
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:audio-test')
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})

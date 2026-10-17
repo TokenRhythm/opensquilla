@@ -4,6 +4,8 @@ import { chatHistoryPayload, sessionMessagesHydratePayload, sessionMessagesSnaps
   sessionMessagesSubscribePayload } from './support/session-read-fixtures'
 import { expectComposerValue } from './utils'
 
+test.use({ video: process.env.OPENSQUILLA_RETENTION_RECORD ? 'on' : 'retain-on-failure' })
+
 const A = 'agent:main:webchat:launcher-a'
 const B = 'agent:main:webchat:launcher-b'
 type Wire = Record<string, unknown>
@@ -224,4 +226,71 @@ test('project draft materialization through Files does not leave the reopened pa
   await expect(menu.locator('[data-panel-kind="assistant-chat"]')).toHaveCount(0)
   expect(gateway.requests.filter(request => request.key === draftKey && request.method === 'chat.history')).toHaveLength(0)
   expect(gateway.requests.filter(request => ['chat.send', 'sessions.sidechat.create'].includes(request.method))).toHaveLength(0)
+})
+
+test.describe('session workbench retention', () => {
+  test('restores files, reading state and side draft through the real A B A entry without retaining file DOM', async ({ page }, info) => {
+    const gateway = await installLauncherGateway(page, true)
+    gateway.releaseMetadata()
+    gateway.releaseHistory()
+    const content = '# Retained document\n\n' + Array.from({ length: 100 }, (_, index) =>
+      `Reading line ${index + 1}: keep this workspace document and its reading position.`).join('\n\n')
+    let contentReads = 0
+    await page.route('**/api/v1/workspace-files/resolve', route => route.fulfill({ json: {
+      workspaceBinding: 'launcher-project', files: [{ requestedPath: 'welcome.md', path: 'welcome.md',
+        name: 'welcome.md', mime: 'text/markdown', size: content.length, kind: 'text', revision: 'retention-v1' }],
+    } }))
+    await page.route('**/api/v1/workspace-files/content?**', route => {
+      contentReads += 1
+      return route.fulfill({ contentType: 'text/markdown', body: content })
+    })
+    const { host } = await openLauncher(page, 4)
+    await host.locator('[data-panel-kind="workspace-files"]').click()
+    const files = page.getByTestId('workspace-files-panel')
+    await files.getByRole('treeitem', { name: 'welcome.md' }).click()
+    const document = files.getByTestId('workspace-file-panel')
+    await expect(document).toContainText('Retained document')
+    await document.getByRole('button', { name: 'Source', exact: true }).click()
+    await document.getByRole('button', { name: 'Search source', exact: true }).click()
+    await document.locator('input[type="search"]').fill('Reading line')
+    await files.locator('.workspace-files__filter-input').fill('welcome')
+    const source = document.locator('.workspace-file__source')
+    await source.hover()
+    await page.mouse.wheel(0, 480)
+    await expect.poll(() => source.evaluate(element => element.scrollTop)).toBeGreaterThan(100)
+    const readingTop = await source.evaluate(element => element.scrollTop)
+
+    await page.getByTestId('workbench-new-panel-trigger').click()
+    await page.getByTestId('workbench-new-panel-menu-list').locator('[data-panel-kind="assistant-chat"]').click()
+    const side = page.getByTestId('assistant-chat-panel')
+    await side.locator('.chat-textarea').fill('Unsent side draft stays with A')
+    const tabs = host.getByRole('tablist', { name: 'Open workbench items', exact: true })
+    await tabs.getByRole('tab', { name: 'Workspace files', exact: true }).click()
+    await expect(files).toBeVisible()
+    await expect(document.getByRole('button', { name: 'Source', exact: true })).toHaveAttribute('aria-pressed', 'true')
+    await expect(document.locator('input[type="search"]')).toHaveValue('Reading line')
+
+    await page.getByRole('button', { name: 'Launcher task B', exact: true }).click()
+    await expect(page.locator('#app-main .chat:visible')).toContainText('Answer B is ready.')
+    await expect(files).toHaveCount(0)
+    await expect(side).toBeHidden()
+    await page.locator('#app-main .chat-textarea:visible').fill('Independent main draft in B')
+    await expectComposerValue(page.locator('#app-main .chat-textarea:visible'), 'Independent main draft in B')
+
+    await page.getByRole('button', { name: 'Launcher task A', exact: true }).click()
+    await expect(page.locator('#app-main .chat:visible')).toContainText('Answer A is ready.')
+    await expect(files).toBeVisible()
+    await expect(tabs.getByRole('tab')).toHaveCount(2)
+    await expect(files.locator('.workspace-files__filter-input')).toHaveValue('welcome')
+    await expect(files.getByRole('treeitem', { name: 'welcome.md' })).toHaveAttribute('aria-selected', 'true')
+    await expect(document.getByRole('button', { name: 'Source', exact: true })).toHaveAttribute('aria-pressed', 'true')
+    await expect(document.locator('input[type="search"]')).toHaveValue('Reading line')
+    await expect.poll(() => source.evaluate(element => element.scrollTop)).toBeCloseTo(readingTop, 0)
+    expect(contentReads).toBeGreaterThan(1)
+    await page.screenshot({ path: info.outputPath('files-restored.png') })
+    await tabs.getByRole('tab', { name: 'Assistant chat', exact: true }).click()
+    await expectComposerValue(side.locator('.chat-textarea'), 'Unsent side draft stays with A')
+    expect(gateway.requests.filter(request => /sessions.sidechat.(create|close)|chat.abort|chat.cancel/.test(request.method))).toHaveLength(0)
+    await page.screenshot({ path: info.outputPath('side-draft-restored.png') })
+  })
 })

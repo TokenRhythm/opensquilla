@@ -382,11 +382,11 @@ function onHoverEscape(event: KeyboardEvent) {
     hideHover()
   }
 }
-const mountedItems = computed(() => {
-  const visibleIds = new Set(store.visibleItems.map(item => item.id))
-  return store.items.filter(item => visibleIds.has(item.id)
-    || ['browser', 'assistant-chat'].includes(item.kind) && item.retention === 'keep-alive')
-})
+// Retention describes the owner's ability to detach, not its session visibility.
+// Browser/side/terminal owners remain mounted until their explicit close path;
+// recoverable providers only mount the currently active renderer.
+const mountedItems = computed(() => store.items.filter(item =>
+  item.retention === 'keep-alive' || item.id === activeItem.value?.id))
 
 const measuredAvailableWidth = computed(() => {
   const supplied = props.availableWidth

@@ -450,7 +450,7 @@ describe('WorkbenchHost', () => {
     expect(mounted.host.querySelector('[data-testid="panel-page-a"]')).toBe(page)
     expect(layer.style.display).not.toBe('none')
     expect(layer.hasAttribute('inert')).toBe(false)
-    expect(mounted.host.querySelector('[role="tab"]')?.textContent).toContain('page-a')
+    expect(mounted.host.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain('page-a')
 
     mounted.store.activateItem('page-b')
     await nextTick()
@@ -461,6 +461,52 @@ describe('WorkbenchHost', () => {
     mounted.store.closeItem('page-a')
     await nextTick()
     expect(mounted.host.querySelector('[data-testid="panel-page-a"]')).toBeNull()
+  })
+
+  it('retains terminal owners across navigation and collapse without remounting', async () => {
+    const mounted = await mountHost(1200, undefined, true)
+    mounted.store.closeItem('one')
+    mounted.store.openItem({ ...item('terminal-a'), kind: 'terminal' })
+    await nextTick()
+    const terminal = mounted.host.querySelector('[data-testid="panel-terminal-a"]')!
+    const layer = mounted.host.querySelector<HTMLElement>('[data-workbench-item-id="terminal-a"]')!
+    mounted.store.setSessionScope('other-session')
+    await nextTick()
+    expect(mounted.host.querySelector('[data-testid="panel-terminal-a"]')).toBe(terminal)
+    expect(layer.style.display).toBe('none')
+    expect(layer.hasAttribute('inert')).toBe(true)
+    mounted.store.setSessionScope('session')
+    await nextTick()
+    expect(mounted.host.querySelector('[data-testid="panel-terminal-a"]')).toBe(terminal)
+    expect(layer.style.display).not.toBe('none')
+    mounted.store.setExpanded(false)
+    await nextTick()
+    expect(mounted.host.querySelector('[data-testid="panel-terminal-a"]')).toBe(terminal)
+    mounted.store.closeItem('terminal-a')
+    await nextTick()
+    expect(mounted.host.querySelector('[data-testid="panel-terminal-a"]')).toBeNull()
+  })
+
+  it('keeps descriptors but mounts only one recoverable renderer across many sessions', async () => {
+    const mounted = await mountHost(1200, undefined, true)
+    mounted.store.closeItem('one')
+    for (let index = 0; index < 12; index += 1) {
+      mounted.store.setSessionScope(`session-${index}`)
+      mounted.store.openItem({ ...item(`file-${index}`, 'dom', 'dispose-on-suspend'),
+        kind: 'file', scope: { type: 'session', id: `session-${index}` } })
+      await nextTick()
+      expect(mounted.host.querySelectorAll('[data-workbench-item-id]')).toHaveLength(1)
+    }
+    expect(mounted.store.items).toHaveLength(12)
+    mounted.store.setSessionScope('session-0')
+    await nextTick()
+    expect(mounted.host.querySelector('[data-testid="panel-file-0"]')).not.toBeNull()
+    expect(mounted.host.querySelector('[data-testid="panel-file-11"]')).toBeNull()
+    expect(mounted.store.visibleItems.map(entry => entry.id)).toEqual(['file-0'])
+    mounted.store.setExpanded(false)
+    await nextTick()
+    expect(mounted.host.querySelectorAll('[data-workbench-item-id]')).toHaveLength(0)
+    expect(mounted.store.items).toHaveLength(12)
   })
 
   it('keeps main chat foreground at every width below the split budget', async () => {

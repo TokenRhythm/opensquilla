@@ -6,6 +6,10 @@ import en from '@/locales/en.json'
 import zhHans from '@/locales/zh-Hans.json'
 import { WORKSPACE_FILES_KEY, WorkspaceFilesChangedError, WorkspaceTextLimitError, type WorkspaceDirectoryEntry, type WorkspaceDirectoryPage, type WorkspaceFilePage, type WorkspaceFiles, type WorkspaceFileSearch } from '@/modules/workspaceFiles'
 import WorkspaceFilesPanel from './WorkspaceFilesPanel.vue'
+import type { WorkspaceFilesReadingState } from './workspaceReadingState'
+import { createWorkspaceFilesWorkbenchDefinition } from './workspaceFilesWorkbenchProvider'
+import { createWorkspaceFilesWorkbenchItem } from '@/workbench/workspaceFileItems'
+import { WorkbenchPanelRegistry, WorkbenchRuntimeManager } from '@/workbench/runtime'
 
 const clipboard = vi.hoisted(() => vi.fn(async (_text: string) => true))
 vi.mock('@/utils/browser', () => ({ copyTextWithFallback: clipboard }))
@@ -61,18 +65,20 @@ function fixture() {
 
 async function flush() { await new Promise(resolve => setTimeout(resolve, 0)); await nextTick() }
 
-async function mount(files: WorkspaceFiles, locale: 'en' | 'zh-Hans' = 'en') {
+async function mount(files: WorkspaceFiles, locale: 'en' | 'zh-Hans' = 'en', readingState?: WorkspaceFilesReadingState,
+  handleEvent?: (event: { type: string; payload?: unknown }) => void, runtimeReady = true) {
   const el = document.createElement('div')
   document.body.append(el)
-  const state = reactive({ sessionKey: 'session-a' })
-  const app = createApp({ render: () => h(WorkspaceFilesPanel, state) })
+  const state = reactive({ sessionKey: 'session-a', readingState, runtimeReady })
+  const onEvent = vi.fn(handleEvent)
+  const app = createApp({ render: () => h(WorkspaceFilesPanel, { ...state, 'onWorkbench-event': onEvent }) })
   app.provide(WORKSPACE_FILES_KEY, files)
   app.use(createI18n({ legacy: false, locale, messages: { en, 'zh-Hans': zhHans } })).mount(el)
   let mounted = true
   const unmount = () => { if (mounted) app.unmount(); mounted = false; el.remove() }
   cleanups.push(unmount)
   await flush()
-  return { el, state, unmount }
+  return { el, state, unmount, onEvent }
 }
 
 async function select(el: HTMLElement, path: string) {
@@ -94,6 +100,113 @@ async function search(el: HTMLElement, query: string) {
 }
 
 describe('workspace source preview limits', () => {
+  it('waits for a late runtime checkpoint instead of replacing it with an empty tree', async () => {
+    const files = fixture()
+    const { el, state, onEvent } = await mount(files, 'en', undefined, undefined, false)
+    expect(files.listDir).not.toHaveBeenCalled()
+    expect(onEvent).not.toHaveBeenCalled()
+    state.readingState = { sessionKey: 'session-a', binding: 'binding-a', expanded: [], loadedCounts: {}, filter: 'a.ts',
+      treeVisible: true, treeTop: 0, selectedPath: 'a.ts', sourceMode: true,
+      selectedIdentity: JSON.stringify(['session-a', 'binding-a', 'a.ts', 'revision-a', 100]),
+      reading: { mode: 'source', query: 'needle', jump: '', toolsOpen: true, startLine: 201, focusLine: 230, windowStart: 0, sourceTop: 400, sourceLeft: 0, markdownTop: 0 } }
+    state.runtimeReady = true
+    await vi.waitFor(() => expect(el.querySelector('.workspace-file__source')?.textContent).toContain('content a.ts 201'))
+    expect(el.querySelector<HTMLInputElement>('.workspace-files__filter-input')?.value).toBe('a.ts')
+    expect(el.querySelector<HTMLInputElement>('.workspace-file__find input[type="search"]')?.value).toBe('needle')
+    expect(el.querySelector<HTMLElement>('.workspace-file__source')?.scrollTop).toBe(400)
+  })
+
+  it('returns the selected document before bounded directory replay and keeps cold expansion intent', async () => {
+    const files = fixture()
+    const paths = Array.from({ length: 20 }, (_, index) => `dir-${index}`)
+    const calls: string[] = []
+    files.listDir.mockImplementation(async (_session, path = '') => {
+      calls.push(`list:${path}`)
+      return path ? listing([], path) : listing([entry('a.ts'), ...paths.map(path => entry(path, true))])
+    })
+    files.readPage.mockImplementation(async (_session, file, start) => { calls.push('document'); return page(file.path, 'selected document', start) })
+    const saved: WorkspaceFilesReadingState = { sessionKey: 'session-a', binding: 'binding-a', expanded: paths, loadedCounts: {}, filter: '',
+      treeVisible: true, treeTop: 0, selectedPath: 'a.ts', sourceMode: true,
+      selectedIdentity: JSON.stringify(['session-a', 'binding-a', 'a.ts', 'revision-a', 100]) }
+    const { el, onEvent } = await mount(files, 'en', saved)
+    await vi.waitFor(() => expect(el.querySelector('.workspace-file__source')?.textContent).toContain('selected document'))
+    expect(calls.indexOf('document')).toBeLessThan(calls.indexOf('list:dir-0'))
+    expect(files.listDir).toHaveBeenCalledTimes(9)
+    expect(el.querySelectorAll('.workspace-files__row.is-more')).toHaveLength(12)
+    const checkpoints = onEvent.mock.calls.filter(([event]) => event.type === 'workspace-files-reading-state')
+    expect((checkpoints[checkpoints.length - 1]![0].payload as WorkspaceFilesReadingState).expanded).toHaveLength(20)
+  })
+  it('checkpoints through the real runtime manager before releasing a file tree', async () => {
+    const files = fixture()
+    const registry = new WorkbenchPanelRegistry()
+    registry.register(createWorkspaceFilesWorkbenchDefinition(files, key => key))
+    const reportError = vi.fn()
+    const manager = new WorkbenchRuntimeManager(registry, { onError: reportError })
+    const item = createWorkspaceFilesWorkbenchItem('session-a')
+    manager.handle({ type: 'open', item }); manager.handle({ type: 'activate', item }); manager.handle({ type: 'resume', item })
+    await manager.flush()
+    const first = await mount(files, 'en', undefined, event => manager.handleComponentEvent(item, event))
+    await manager.flush()
+    expect(reportError).not.toHaveBeenCalled()
+    await select(first.el, 'a.ts')
+    await search(first.el, 'needle')
+    await manager.flush()
+    expect(reportError).not.toHaveBeenCalled()
+    manager.handle({ type: 'suspend', item })
+    first.unmount()
+    await manager.flush()
+    expect(manager.getRenderState(item.id)).toEqual({})
+    manager.handle({ type: 'activate', item }); manager.handle({ type: 'resume', item })
+    await manager.flush()
+    const saved = manager.getRenderState(item.id).readingState as WorkspaceFilesReadingState
+    expect(saved).toMatchObject({ selectedPath: 'a.ts', reading: { query: 'needle', startLine: 201 } })
+    const second = await mount(files, 'en', saved)
+    await vi.waitFor(() => expect(second.el.querySelector('.workspace-file__source')?.textContent).toContain('content a.ts 201'))
+    await manager.disposeAll()
+  })
+  it('restores expanded tree, selection, search and source page after the DOM was released', async () => {
+    const files = fixture()
+    files.listDir.mockImplementation(async (_session, path = '') => path === 'src'
+      ? listing([entry('src/a.ts')], path) : listing([entry('src', true)]))
+    const first = await mount(files)
+    await select(first.el, 'src')
+    await select(first.el, 'src/a.ts')
+    await search(first.el, 'needle')
+    const source = first.el.querySelector<HTMLElement>('.workspace-file__source')!
+    source.scrollTop = 350
+    source.dispatchEvent(new Event('scroll'))
+    const tree = first.el.querySelector<HTMLElement>('.workspace-files__tree-scroll')!
+    tree.scrollTop = 48
+    tree.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    const checkpoints = first.onEvent.mock.calls.filter(([event]) => event.type === 'workspace-files-reading-state')
+    const saved = checkpoints[checkpoints.length - 1]![0].payload as WorkspaceFilesReadingState
+    expect(saved).toMatchObject({ selectedPath: 'src/a.ts', expanded: ['src'], treeTop: 48, reading: { query: 'needle', startLine: 201, sourceTop: 350 } })
+    expect(JSON.stringify(saved)).not.toContain('content src/a.ts')
+    first.unmount()
+    const second = await mount(files, 'en', saved)
+    await vi.waitFor(() => expect(second.el.querySelector('.workspace-file__source')?.textContent).toContain('content src/a.ts 201'))
+    expect(second.el.querySelector('.workspace-files__row.is-selected')?.textContent).toContain('a.ts')
+    expect(second.el.querySelector<HTMLInputElement>('.workspace-file__find input[type="search"]')?.value).toBe('needle')
+    expect(second.el.querySelector<HTMLElement>('.workspace-file__source')?.scrollTop).toBe(350)
+    expect(second.el.querySelector<HTMLElement>('.workspace-files__tree-scroll')?.scrollTop).toBe(48)
+    expect(files.resolve).toHaveBeenCalledWith('session-a', ['src/a.ts'], expect.any(AbortSignal))
+  })
+
+  it('drops stale reading positions when the workspace binding or file revision changed', async () => {
+    const files = fixture()
+    const saved: WorkspaceFilesReadingState = { sessionKey: 'session-a', binding: 'binding-a', expanded: [], loadedCounts: {},
+      filter: '', treeVisible: true, treeTop: 0, selectedPath: 'a.ts', sourceMode: false,
+      selectedIdentity: JSON.stringify(['session-a', 'binding-a', 'a.ts', 'old-revision', 100]),
+      reading: { mode: 'source', query: 'old', jump: '', toolsOpen: true, startLine: 201, focusLine: 220, windowStart: 0, sourceTop: 400, sourceLeft: 0, markdownTop: 0 } }
+    const { el } = await mount(files, 'en', saved)
+    await vi.waitFor(() => expect(el.querySelector('.workspace-file__source')?.textContent).toContain('content a.ts 1'))
+    expect(el.querySelector<HTMLInputElement>('.workspace-file__find input[type="search"]')?.value).toBe('')
+    expect(files.readPage).toHaveBeenLastCalledWith('session-a', expect.objectContaining({ revision: 'revision-a' }), 1, 200, expect.any(AbortSignal))
+    const other = await mount(files, 'en', { ...saved, binding: 'obsolete-binding' })
+    expect(other.el.querySelector('.workspace-file__source')).toBeNull()
+    expect(other.el.querySelector('.workspace-files__row.is-selected')).toBeNull()
+  })
   it('preserves MIME-only Markdown preview without duplicating resource actions', async () => {
     const files = fixture()
     files.listDir.mockResolvedValue(listing([{ ...entry('REPORT'), mime: 'text/markdown' }]))

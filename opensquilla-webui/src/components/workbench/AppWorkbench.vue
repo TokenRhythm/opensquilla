@@ -459,6 +459,14 @@ const { pushToast } = useToasts()
 const platform = usePlatform()
 const nativeApi = platform.workbench.native
 const store = useWorkbenchStore()
+// Every producer uses the same admission boundary, including automatic agent
+// artifacts and main/side file links that do not pass through this component.
+const stopAdmissionNotifications = store.onAdmissionRejected(rejection => {
+  if (rejection.reason === 'native-preview-capacity') {
+    pushToast(t('workbench.nativePreview.capacityReached', { limit: rejection.limit }),
+      { tone: 'warn', duration: 9000 })
+  }
+})
 const sideChatLauncher = useSideChatLauncher()
 const sideChatHandles = new Map<string, SideChatLaunchHandle>()
 const sideChatLaunchItems = new Map<string, { itemId: string; isCurrent(): boolean }>()
@@ -591,14 +599,25 @@ watch(() => [referenceGateway?.subscriptionEpoch, referenceGateway?.availability
 // ChatView changes its draft flag before publishing the next session key, and
 // the route-header bridge also defaults to false while an owner is loading.
 // Scope switching hides retained side chats; only explicit close retires them.
-watch(() => props.workspaceId, (_next, _previous) => {
-  for (const item of [...store.items]) {
-    if (item.scope.type === 'session' && item.scope.id === props.sessionId
-      && ['workspace-files', 'terminal'].includes(item.kind)) {
-      store.closeItem(item.id, 'scope-changed')
+const resolvedWorkspaceBindings = new Map<string, string | null>()
+watch(() => [props.sessionId, props.workspaceId, props.workspaceResolved] as const,
+  ([sessionId, workspaceId, resolved]) => {
+    if (!sessionId || !resolved) return
+    const binding = workspaceId || null
+    const hadBinding = resolvedWorkspaceBindings.has(sessionId)
+    const previousBinding = resolvedWorkspaceBindings.get(sessionId)
+    resolvedWorkspaceBindings.set(sessionId, binding)
+    if (!hadBinding || previousBinding === binding) return
+    // Only a resolved rebinding of this owner invalidates its tools. Visiting
+    // another session (including its unresolved loading phase) is not rebinding.
+    for (const item of [...store.items]) {
+      if (item.scope.type === 'session' && item.scope.id === sessionId
+        && ['workspace-files', 'terminal'].includes(item.kind)) {
+        store.closeItem(item.id, 'scope-changed')
+      }
     }
-  }
-})
+  }, { immediate: true })
+
 const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
 if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 const artifactWorkbench = injectedArtifactWorkbench
@@ -967,7 +986,7 @@ function openTerminal() {
     ? { kind: 'project', workspaceId: props.workspaceId }
     : { kind: 'default-agent', agentId: agentIdFromSessionKey(sessionId) }), title: t('workbench.newPanel.terminal') }
   if (!store.openItem(item)) {
-    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+    pushToast(t('workbench.terminal.capacityReached'), { tone: 'warn', duration: 6000 })
   } else {
     store.requestReveal()
   }
@@ -1972,21 +1991,12 @@ async function beforeCloseItem(
   return accepted
 }
 
-async function setSessionScopeSafely(sessionId: string | null) {
-  const generation = ++scopeChangeGeneration
-  const previousSessionId = store.activeSessionId
-  if (previousSessionId === sessionId) return
-  const staleItems = store.items.filter(item =>
-    item.scope.type === 'session' && item.scope.id !== sessionId && item.kind !== 'browser' && item.kind !== 'assistant-chat')
-  for (const item of staleItems) {
-    if (!await beforeCloseItem(item) || generation !== scopeChangeGeneration) return
-  }
-  if (generation !== scopeChangeGeneration) return
+function setSessionScopeSafely(sessionId: string | null) {
+  if (store.activeSessionId === sessionId) return
+  scopeChangeGeneration += 1
+  // A scope switch is a presentation transaction, not a close transaction.
+  // Retained items still own their document/resource snapshots and authorization.
   store.setSessionScope(sessionId)
-  if (previousSessionId) {
-    artifactDocuments.clearSession(previousSessionId)
-    workbenchResources.clearSession(previousSessionId)
-  }
   if (props.workbenchResourcesEnabled && sessionId) {
     void workbenchResources.load(sessionId, true).then(() => {
       refreshResourceCollectionItem(sessionId)
@@ -2060,6 +2070,7 @@ onBeforeUnmount(() => {
   nativeArtifactSnapshots.clear()
   artifactNavigationGeneration += 1
   stopPromptAnnotationLifecycle()
+  stopAdmissionNotifications()
   pageAnnotationSendQueue.clear()
   if (pageAnnotationSendRetryTimer) clearTimeout(pageAnnotationSendRetryTimer)
   pageAnnotationSendRetryTimer = null

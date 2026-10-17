@@ -96,9 +96,9 @@ describe('workbench store', () => {
     expect(lifecycle.mock.calls.map(([event]) => event.type)).toEqual(['open'])
 
     store.setSessionScope('session-a')
-    expect(store.activeItemId).toBe('late-preview-a')
+    expect(store.activeItemId).toBe('side-a')
     expect(store.visibleItems.map(entry => entry.id)).toEqual(['side-a', 'late-preview-a'])
-    expect(store.expanded).toBe(expanded)
+    expect(store.expanded).toBe(true)
   })
 
   it('keeps a background preview unselected on a new-chat page when activation is declined', () => {
@@ -112,6 +112,87 @@ describe('workbench store', () => {
     store.setSessionScope('session-a')
     expect(store.activeItemId).toBe('late-preview-a')
   })
+  it('restores each session selection, expansion and preferred width independently', () => {
+    const store = useWorkbenchStore()
+    store.openItem(item('a-first'))
+    store.openItem(item('a-last'))
+    store.activateItem('a-first')
+    store.setWidth(614)
+    store.setMaximized(true)
+    const events: string[] = []
+    store.onLifecycle(event => events.push(`${event.type}:${event.item.id}`))
+
+    store.setSessionScope('session-b')
+    expect(store.expanded).toBe(false)
+    expect(store.maximized).toBe(false)
+    store.openItem(item('b', { type: 'session', id: 'session-b' }))
+    store.setWidth(432)
+    store.setExpanded(false)
+    store.setSessionScope('session-a')
+    expect(store.activeItemId).toBe('a-first')
+    expect(store.visibleItems.map(entry => entry.id)).toEqual(['a-first', 'a-last'])
+    expect(store.expanded).toBe(true)
+    expect(store.widthPreference.width).toBe(614)
+    expect(store.maximized).toBe(false)
+    expect(events.some(event => event.startsWith('dispose:'))).toBe(false)
+    expect(store.activateItem('b')).toBe(false)
+    expect(store.activeItemId).toBe('a-first')
+
+    store.setSessionScope('session-b')
+    expect(store.activeItemId).toBe('b')
+    expect(store.expanded).toBe(false)
+    expect(store.widthPreference.width).toBe(432)
+  })
+
+  it('restores a deliberately empty start page instead of choosing a background tab', () => {
+    const store = useWorkbenchStore()
+    store.openItem(item('a'))
+    store.openEmpty()
+    store.setSessionScope('session-b')
+    store.openItem(item('late-a'))
+    store.setSessionScope('session-a')
+    expect(store.activeItemId).toBeNull()
+    expect(store.expanded).toBe(true)
+    expect(store.visibleItems).toHaveLength(2)
+  })
+
+  it('falls back safely when an inactive session selected tab was explicitly closed', () => {
+    const store = useWorkbenchStore()
+    store.openItem(item('a-first'))
+    store.openItem(item('a-last'))
+    store.setSessionScope('session-b')
+    store.closeItem('a-last')
+    store.setSessionScope('session-a')
+    expect(store.activeItemId).toBe('a-first')
+    expect(store.expanded).toBe(true)
+    store.reset()
+    store.setSessionScope('session-a')
+    expect(store.activeItemId).toBeNull()
+    expect(store.expanded).toBe(false)
+  })
+
+  it('protects retained terminals while enforcing the existing four-terminal admission limit', () => {
+    const store = useWorkbenchStore()
+    const terminal = (index: number): WorkbenchItem => ({
+      ...item(`terminal-${index}`, { type: 'session', id: `session-${index}` }),
+      kind: 'terminal',
+    })
+    for (let index = 0; index < 4; index += 1) {
+      store.setSessionScope(`session-${index}`)
+      expect(store.openItem(terminal(index))).toBe(true)
+    }
+    const events = vi.fn()
+    store.onLifecycle(events)
+    expect(store.openItem(terminal(4))).toBe(false)
+    expect(events).not.toHaveBeenCalled()
+    expect(store.items).toHaveLength(4)
+    store.setSessionScope('session-0')
+    expect(store.openItem(terminal(0))).toBe(true)
+    store.closeItem('terminal-1')
+    expect(store.openItem(terminal(4), { activate: false })).toBe(true)
+    expect(store.items).toHaveLength(4)
+  })
+
   it('maximizes without changing saved size or the active page lifecycle', () => {
     const store = useWorkbenchStore()
     store.openItem(browserItem('page', 'session-a'))
@@ -172,7 +253,7 @@ describe('workbench store', () => {
     store.setSessionScope('different-draft')
     expect(store.activeItem).toBeNull()
     expect(store.visibleItems).toEqual([])
-    expect(store.expanded).toBe(true)
+    expect(store.expanded).toBe(false)
   })
 
   it('deduplicates resources and activates the existing identity', () => {
@@ -230,7 +311,7 @@ describe('workbench store', () => {
     )).toBeNull()
   })
 
-  it.each(['dom', 'native-webcontents'] as const)(
+  it.each(['dom'] as const)(
     'keeps %s tabs available when opening more previews from a collapsed pane',
     hostKind => {
       const store = useWorkbenchStore()
@@ -268,32 +349,64 @@ describe('workbench store', () => {
       if (event.type === 'dispose') disposed.push(`${event.item.id}:${event.reason}`)
     })
     store.openItem(item('document'))
-    for (let index = 0; index < 12; index += 1) {
+    for (let index = 0; index < 8; index += 1) {
       store.openItem({
         ...item(`native-${index}`),
         kind: index % 2 === 0 ? 'artifact-preview' : 'browser',
         hostKind: 'native-webcontents',
       })
     }
-    expect(store.items).toHaveLength(13)
+    expect(store.items).toHaveLength(9)
     expect(disposed).toEqual([])
 
-    store.closeItem('native-11')
-    expect(store.items).toHaveLength(12)
-    expect(store.activeItemId).toBe('native-10')
-    expect(disposed).toEqual(['native-11:closed'])
+    store.closeItem('native-7')
+    expect(store.items).toHaveLength(8)
+    expect(store.activeItemId).toBe('native-6')
+    expect(disposed).toEqual(['native-7:closed'])
 
     store.setSessionScope('session-b')
     expect(store.items.map(candidate => candidate.id)).toEqual([
-      'native-1', 'native-3', 'native-5', 'native-7', 'native-9',
+      'document', ...Array.from({ length: 7 }, (_, index) => `native-${index}`),
     ])
     expect(store.visibleItems).toEqual([])
     expect(store.activeItemId).toBeNull()
-    expect(disposed).toEqual([
-      'native-11:closed',
-      'document:scope-changed',
-      ...Array.from({ length: 6 }, (_, index) => `native-${index * 2}:scope-changed`),
-    ])
+    expect(disposed).toEqual(['native-7:closed'])
+  })
+
+  it('bounds new interactive native artifact owners without evicting or blocking existing tabs', () => {
+    const store = useWorkbenchStore()
+    const native = (index: number): WorkbenchItem => ({
+      ...item(`native-artifact-${index}`, { type: 'session', id: `session-${index}` }),
+      hostKind: 'native-webcontents',
+    })
+    for (let index = 0; index < 4; index += 1) {
+      store.setSessionScope(`session-${index}`)
+      expect(store.openItem(native(index))).toBe(true)
+    }
+    const rejected = vi.fn()
+    const lifecycle = vi.fn()
+    const stop = store.onAdmissionRejected(rejected)
+    store.onLifecycle(lifecycle)
+    const selected = store.activeItemId
+    expect(store.openItem(native(4), { activate: false })).toBe(false)
+    expect(rejected).toHaveBeenCalledExactlyOnceWith({
+      reason: 'native-preview-capacity', item: native(4), limit: 4,
+    })
+    expect(lifecycle).not.toHaveBeenCalled()
+    expect(store.activeItemId).toBe(selected)
+    expect(store.items).toHaveLength(4)
+    store.setSessionScope('session-0')
+    expect(store.openItem({ ...native(0), title: 'Updated revision' })).toBe(true)
+    expect(store.activeItem?.title).toBe('Updated revision')
+    expect(rejected).toHaveBeenCalledTimes(1)
+    expect(store.openItem(item('ordinary-code'))).toBe(true)
+    expect(store.openItem(browserItem('agent-browser', 'session-0'))).toBe(true)
+    store.closeItem('native-artifact-1')
+    expect(store.openItem(native(4), { activate: false })).toBe(true)
+    expect(store.items.filter(entry => entry.kind === 'artifact-preview' && entry.hostKind === 'native-webcontents')).toHaveLength(4)
+    stop()
+    expect(store.openItem(native(5))).toBe(false)
+    expect(rejected).toHaveBeenCalledTimes(1)
   })
 
   it('adopts native browser pages beyond eight retained tabs across sessions', () => {
@@ -350,7 +463,7 @@ describe('workbench store', () => {
     expect(store.items[0]?.payload).toEqual({ artifactIds: ['a', 'b'] })
   })
 
-  it('disposes stale session items without touching workspace or app items', () => {
+  it('retains session tabs while workspace and app tabs remain available', () => {
     const store = useWorkbenchStore()
     const events: string[] = []
     store.onLifecycle(event => {
@@ -365,12 +478,9 @@ describe('workbench store', () => {
 
     store.setSessionScope('new')
 
-    expect(store.items.map(candidate => candidate.id)).toEqual(['workspace', 'global'])
-    expect(events).toEqual([
-      'old-a:scope-changed',
-      'old-b:scope-changed',
-      'activate:global',
-    ])
+    expect(store.items.map(candidate => candidate.id)).toEqual(['workspace', 'global', 'old-a', 'old-b'])
+    expect(store.visibleItems.map(candidate => candidate.id)).toEqual(['workspace', 'global'])
+    expect(events).toEqual(['activate:global'])
   })
 
   it('retains native browser pages across session switches and reselects them on return', () => {

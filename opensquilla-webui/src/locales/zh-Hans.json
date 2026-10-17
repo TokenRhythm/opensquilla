@@ -456,9 +456,13 @@
       "input": "终端输入",
       "restart": "重新启动",
       "unavailable": "当前会话的终端不可用。",
+      "capacityReached": "已保留 4 个终端。请返回现有终端，或关闭一个后再新建。",
       "outputGap": "终端输出出现中断",
       "exited": "终端已退出",
       "state": { "starting": "启动中", "running": "已连接", "exited": "已退出", "error": "不可用" }
+    },
+    "nativePreview": {
+      "capacityReached": "已保留 4 个交互预览。请返回已有预览，或关闭一个后再打开新预览。"
     },
     "artifactAnnotation": {
       "start": "请求修改",
