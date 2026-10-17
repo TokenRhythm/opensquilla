@@ -13,7 +13,6 @@ from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig
 from opensquilla.identity.bootstrap import (
     CORE_BOOTSTRAP_TEMPLATE_FILENAMES,
     RETIRED_WORKSPACE_FILENAMES,
-    ensure_agent_workspace,
 )
 from opensquilla.identity.parser import parse_identity
 from opensquilla.session.keys import normalize_agent_id
@@ -107,11 +106,9 @@ class AgentRegistry:
     async def get_identity(self, agent_id: str) -> dict[str, Any]:
         """Return parsed public identity fields without mutating the workspace.
 
-        Unlike the general agent-file APIs, this read path deliberately does
-        not call :func:`ensure_agent_workspace`: identity decoration is used by
-        read-scoped RPCs and must not seed files as a side effect.  The shared
-        hardened reader still rejects escaping paths, symlinks, non-regular
-        files, and hardlinks.
+        Like the general agent-file read APIs, identity decoration must not
+        initialize missing directories or files. The shared hardened reader
+        still rejects escaping paths, symlinks, non-regular files, and hardlinks.
         """
 
         normalized = normalize_agent_id(agent_id)
@@ -133,6 +130,7 @@ class AgentRegistry:
         safe_name, path = self._resolve_workspace_agent_file(root, name)
         text = content if isinstance(content, str) else str(content)
         data = text.encode("utf-8")
+        root.mkdir(parents=True, exist_ok=True)
         fd = self._open_workspace_agent_file_for_write(path)
         try:
             self._validate_safe_file_stat(os.fstat(fd))
@@ -223,7 +221,7 @@ class AgentRegistry:
 
     def _workspace_root(self, agent_id: str) -> Path:
         normalized = normalize_agent_id(agent_id)
-        return ensure_agent_workspace(self.get_agent_workspace(normalized)).workspace_dir
+        return self.get_agent_workspace(normalized).expanduser()
 
     @staticmethod
     def _workspace_file_entry(root: Path, name: str) -> dict[str, Any]:

@@ -78,14 +78,14 @@ async def test_file_rpc_contract_and_no_default_upgrade_on_reads(
 @pytest.mark.parametrize("locked", [False, True])
 def test_startup_upgrade_uses_profile_lease_not_external_state(tmp_path, monkeypatch, locked):
     home = tmp_path / "profile"
-    root = tmp_path / "workspace"
+    root = home / "workspace"
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
     ensure_agent_workspace(root)
     originals = {}
     for name in ("AGENTS", "SOUL"):
         originals[name] = (FIXTURES / f"{name}.txt").read_bytes()
         (root / f"{name}.md").write_bytes(originals[name])
-    cfg = GatewayConfig(workspace_dir=str(root), state_dir=str(tmp_path / "external-state"))
+    cfg = GatewayConfig(state_dir=str(tmp_path / "external-state"))
     if locked:
         with ProfileOperationLock(home):
             _ensure_configured_agent_workspaces(cfg)
@@ -97,7 +97,7 @@ def test_startup_upgrade_uses_profile_lease_not_external_state(tmp_path, monkeyp
         assert not list(root.rglob("*.bak"))
 
 
-def test_shared_workspace_is_upgraded_once_and_disabled_agent_is_not_scanned(
+def test_shared_custom_workspace_is_not_upgraded_and_disabled_agent_is_not_scanned(
     tmp_path,
     monkeypatch,
 ):
@@ -118,5 +118,6 @@ def test_shared_workspace_is_upgraded_once_and_disabled_agent_is_not_scanned(
         ],
     )
     _ensure_configured_agent_workspaces(cfg)
-    assert calls == [root]
+    assert calls == []
+    assert not root.exists()
     assert not (tmp_path / "disabled").exists()

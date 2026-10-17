@@ -21,6 +21,7 @@ Usage (multi-agent routing):
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -84,6 +85,7 @@ async def _prune_expired_files(
     ttl_days: int,
     *,
     workspace_dir: str | None = None,
+    maintenance_allowed: Callable[[], bool] | None = None,
 ) -> None:
     """In-line TTL prune used by ``memory_save``.
 
@@ -102,6 +104,7 @@ async def _prune_expired_files(
         store=store,
         ttl_days=ttl_days,
         workspace_dir=Path(workspace_dir) if workspace_dir else None,
+        maintenance_allowed=maintenance_allowed,
     )
 
 
@@ -329,12 +332,15 @@ def create_memory_tools(
     on_memory_write: Any | None = None,
     memory_source: str = "state",
     workspace_base: str | None = None,
+    maintenance_allowed: Callable[[str, Path, Path | None], bool] | None = None,
 ) -> None:
     """Register memory tools. Accepts either a single store or a dict keyed by agent_id.
 
     Backward-compatible: a single store/retriever is auto-wrapped into ``{"main": ...}``.
     When dicts are provided, the active agent_id (from ToolContext via contextvar) selects
     the correct store, retriever, and memory directory at call time.
+    ``maintenance_allowed`` classifies the resolved source, not the task workspace.
+    Without an ownership policy, workspace sources receive no implicit retention.
     """
     # Normalize to dict form
     if not isinstance(stores, dict):
@@ -347,6 +353,7 @@ def create_memory_tools(
         retriever: MemoryRetriever
         memory_dir: str | None
         workspace_dir: str | None
+        maintenance_allowed: Callable[[], bool]
 
     def _resolve() -> ResolvedAgent:
         """Pick the store/retriever/memory_dir/workspace_dir for the current agent_id."""
@@ -388,6 +395,23 @@ def create_memory_tools(
         else:
             md = memory_dir
             wd = memory_dir  # fallback: use memory_dir as workspace in test/legacy mode
+        source_root, notes_root = wd, md
+
+        def allow_maintenance() -> bool:
+            allowed = memory_source == "state"
+            if maintenance_allowed is not None:
+                allowed = bool(source_root) and maintenance_allowed(
+                    agent_id, Path(source_root), Path(notes_root) if notes_root else None,
+                )
+            if allowed and ctx and ctx.workspace_dir:
+                from opensquilla.memory.source_protection import paths_overlap
+
+                # A save authorizes its target, not deletion of other project files.
+                allowed = not any(
+                    paths_overlap(root, ctx.workspace_dir)
+                    for root in (source_root, notes_root) if root is not None
+                )
+            return allowed
         # These paths stay inside the tool closures. Keep user-facing results
         # relative while bypassing legacy Windows MAX_PATH for every read,
         # write, rollback, retention, and delete operation.
@@ -395,7 +419,10 @@ def create_memory_tools(
 
         md = str(_native_io_path(md)) if md is not None else None
         wd = str(_native_io_path(wd)) if wd is not None else None
-        return ResolvedAgent(store=s, retriever=r, memory_dir=md, workspace_dir=wd)
+        return ResolvedAgent(
+            store=s, retriever=r, memory_dir=md, workspace_dir=wd,
+            maintenance_allowed=allow_maintenance,
+        )
 
     @dataclass(frozen=True)
     class PlannedWrite:
@@ -442,12 +469,18 @@ def create_memory_tools(
         return redact_memory_text(content)
 
     async def _maybe_prune(r: ResolvedAgent) -> None:
-        if memory_config and getattr(memory_config, "entry_ttl_days", 0) > 0 and r.memory_dir:
+        if (
+            r.maintenance_allowed()
+            and memory_config
+            and getattr(memory_config, "entry_ttl_days", 0) > 0
+            and r.memory_dir
+        ):
             await _prune_expired_files(
                 r.memory_dir,
                 r.store,
                 memory_config.entry_ttl_days,
                 workspace_dir=r.workspace_dir,
+                maintenance_allowed=r.maintenance_allowed,
             )
 
     async def _enforce_size_limits(

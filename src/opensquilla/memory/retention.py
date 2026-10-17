@@ -11,6 +11,7 @@ Used by:
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,7 @@ async def prune_expired_memory_files(
     exempt_dot_prefix_dirs: bool = True,
     cap_per_sweep: int = 200,
     debounce_seconds: float = 2.0,
+    maintenance_allowed: Callable[[], bool] | None = None,
 ) -> PruneResult:
     """Remove memory files older than ``ttl_days``. Returns counts.
 
@@ -181,6 +183,8 @@ async def prune_expired_memory_files(
         except ValueError:
             # Symlink or odd path that escapes workspace — skip.
             continue
+        if maintenance_allowed is not None and not maintenance_allowed():
+            break
         try:
             path.unlink()
         except FileNotFoundError:

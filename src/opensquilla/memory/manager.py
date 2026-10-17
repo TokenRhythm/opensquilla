@@ -31,6 +31,8 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from .source_paths import is_legacy_raw_fallback, is_legacy_turn_capture
+
 if TYPE_CHECKING:
     from opensquilla.gateway.config import GatewayConfig
 
@@ -75,14 +77,8 @@ class MemoryDegradation:
 # moved into ``.raw_fallbacks/`` (dot-prefix sidecar excluded by sync_manager)
 # so they don't keep contaminating retrieval after the fix.
 _LEGACY_RAW_FALLBACK_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-(reset|compact)-\d+\.md$")
-_RAW_FALLBACK_HEADER_PREFIX = "# Raw flush ("
 _RAW_FALLBACK_SIDECAR = ".raw_fallbacks"
 _RAW_FALLBACK_MIGRATION_MARKER = ".migrated"
-_LEGACY_TURN_CAPTURE_REQUIRED_MARKERS = (
-    "# Turn Capture",
-    "- source_kind: turn_capture",
-    "- schema: turn-capture-v1",
-)
 
 
 def _migrate_legacy_raw_fallbacks(memory_dir: str | Path) -> int:
@@ -122,7 +118,7 @@ def _migrate_legacy_raw_fallbacks(memory_dir: str | Path) -> int:
                     error=str(exc),
                 )
                 continue
-            if not first.startswith(_RAW_FALLBACK_HEADER_PREFIX):
+            if not is_legacy_raw_fallback(entry, first):
                 continue
             try:
                 shutil.move(str(entry), str(sidecar / entry.name))
@@ -159,7 +155,8 @@ def _migrate_legacy_raw_fallbacks(memory_dir: str | Path) -> int:
 
 def _is_legacy_turn_capture_file(path: Path) -> bool:
     try:
-        sample = path.read_text(encoding="utf-8", errors="replace")[:1000]
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            sample = handle.read(1000)
     except OSError as exc:
         log.warning(
             "memory_manager.turn_archive_migration_read_failed",
@@ -167,7 +164,7 @@ def _is_legacy_turn_capture_file(path: Path) -> bool:
             error=str(exc),
         )
         return False
-    return all(marker in sample for marker in _LEGACY_TURN_CAPTURE_REQUIRED_MARKERS)
+    return is_legacy_turn_capture(sample)
 
 
 def _unique_destination(path: Path) -> Path:
@@ -461,6 +458,7 @@ async def build_memory_managers(
     from .embedding_resolver import create_embedding_provider, resolve_memory_embedding
     from .retrieval import MemoryRetriever
     from .session_source import SessionSourceIndexer
+    from .source_protection import policy_for_storage
     from .store import LongTermMemoryStore
     from .sync_manager import MemorySyncManager
     from .turn_capture import TurnCaptureService
@@ -479,8 +477,11 @@ async def build_memory_managers(
         reason=embedding_decision.reason,
     )
 
-    # One-time legacy data migration (no-op if already migrated)
-    maybe_migrate_legacy_memory("data")
+    maintenance_policy = policy_for_storage(config, session_storage)
+    if maintenance_policy.legacy_data_migration_allowed("data"):
+        maybe_migrate_legacy_memory("data")
+    elif Path("data/memory.db").is_file():
+        log.info("memory_manager.legacy_data_migration_skipped", reason="unowned_cwd_data")
 
     # ── Atomic per-agent build, with cleanup on failure ───────────────
     # Unlike the original boot.py which populated module-scope dicts that
@@ -527,19 +528,34 @@ async def build_memory_managers(
             native_memory_dir = _native_io_path(logical_memory_dir)
             native_agent_workspace = _native_io_path(agent_workspace)
             native_turns_dir = _native_io_path(db_path.parent / "turns")
-            native_memory_dir.mkdir(parents=True, exist_ok=True)
-            native_agent_workspace.mkdir(parents=True, exist_ok=True)
+            def maintenance_allowed(
+                aid: str = agent_id,
+                root: Path = agent_workspace,
+                notes: Path = logical_memory_dir,
+            ) -> bool:
+                return maintenance_policy.allows(aid, root, notes)
+            if maintenance_allowed():
+                native_memory_dir.mkdir(parents=True, exist_ok=True)
+                native_agent_workspace.mkdir(parents=True, exist_ok=True)
 
             # One-shot migration: legacy raw-dump fallback files used to be
             # written under canonical ``memory/`` and got picked up by the
             # sync scanner, polluting retrieval. Move them into the
             # ``.raw_fallbacks/`` sidecar BEFORE sync_manager starts so the
             # next scan drops their indexed rows naturally.
-            _migrate_legacy_raw_fallbacks(native_memory_dir)
-            migrated_turn_archives = _migrate_legacy_turn_archives(
-                native_memory_dir,
-                native_turns_dir,
-            )
+            migrated_turn_archives: tuple[str, ...] = ()
+            if maintenance_allowed():
+                _migrate_legacy_raw_fallbacks(native_memory_dir)
+                migrated_turn_archives = _migrate_legacy_turn_archives(
+                    native_memory_dir,
+                    native_turns_dir,
+                )
+            else:
+                log.info(
+                    "memory_manager.source_maintenance_skipped",
+                    agent_id=agent_id,
+                    reason="project_source_overlap",
+                )
             for rel_path in migrated_turn_archives:
                 try:
                     await in_flight_store.remove_file(rel_path)
@@ -569,6 +585,7 @@ async def build_memory_managers(
                 ttl_days=int(getattr(cfg, "entry_ttl_days", 0) or 0),
                 ttl_sweep_interval_minutes=getattr(cfg, "ttl_sweep_interval_minutes", 0.0),
                 session_indexer=session_indexer,
+                maintenance_allowed=maintenance_allowed,
             )
             await in_flight_sync.start()
 
@@ -590,6 +607,7 @@ async def build_memory_managers(
                 text_weight=effective_text_weight,
                 sync_manager=in_flight_sync,
                 effective_metadata=retrieval_metadata,
+                workspace_dir=native_agent_workspace,
             )
 
             turn_capture = TurnCaptureService(
