@@ -25,11 +25,11 @@ delivery-feedback browser checks in the general browser shards.
 | Area | Final ownership | Coverage boundary |
 | --- | --- | --- |
 | Frontend and Gateway Contract | Independent type checks, four unit shards, platform Contract generation/verification and a shared frontend artifact producer | Consumers still wait for required verified artifacts; cross-platform hashes retain their aggregate gate |
-| Offline Python | Twenty Ubuntu and twenty-three Windows physical partitions | Every selected file has one owner; file grouping, `ci_serial`, worker limits and platform-specific coverage remain |
+| Offline Python | Twenty Ubuntu and twenty-three Windows physical partitions | Whole-file ownership remains outside the explicitly delegated bundle cases; selected case identities have disjoint owners, with `ci_serial`, worker limits and platform-specific coverage preserved |
 | Browser and desktop probes | Four general browser shards, separate clipboard/virtualization/capacity owners, independent native/frozen/Docker probes and managed toolchains | Preserve test parameters, markers and internal lifecycle order |
 | Windows bundle and profiles | Four bundle runners for the original 66 cases; six independent profile-script runners plus the original browser/router owner | Required coverage gates reject missing, duplicate, skipped or wrong-run execution evidence |
 | Windows Gateway storage | Former `gateway-sqlite-5` files distributed across four owners | Preserve all 92 original files and the seven serial cases; Ubuntu ownership remains unchanged |
-| NSIS acceptance | Old-version preparation overlaps candidate construction; installed audit/smoke/interaction and Gateway/Desktop startup checks have separate owners | Bind exact candidate identity before installation; retain recovery, restart, cleanup, signing checks and failure propagation |
+| NSIS acceptance | Old-version preparation overlaps candidate construction; installed audit/smoke/interaction and Gateway/Desktop startup checks have separate owners | Bind exact candidate identity before candidate installation; retain recovery, restart, cleanup, signing checks and failure propagation |
 | NSIS candidate build | Original package verification overlaps normal installer generation; outer Actions ZIP uses compression level zero | Keep the full PyInstaller invocation and installer compression; require both branches to finish and critical identity hashes to match |
 
 Planner selection, `CI result`, required evidence and merge-critical trust inputs
@@ -46,6 +46,34 @@ is 13:24 in the final three-run sample; the last build comparison observes a
 27-second overall median difference against its repeated baseline.
 The earlier 24:32 initial run is a single historical observation, not a repeated
 control for a claim of stable end-to-end percentage improvement.
+
+### Final integration validation
+
+The final integrated implementation is `7bd28401b92d8a044d945b0bea5d4bfdb52b3bdb`,
+including `main` at `5b25bd9da8095e813f0881d3b78d90924241c475`.
+[Full CI run 39031321257](https://github.com/TokenRhythm/opensquilla/actions/runs/39031321257)
+completed in **13:31**, with 146 executed jobs and the same two conditional skips.
+All 28 NSIS jobs passed. The build took 7:24; its overlap proof confirms one
+`afterSign` hook, one verifier invocation, matching source/workflow/run/attempt
+identity, and fourteen unchanged critical file hashes.
+
+The full workflow failed, and `CI result` correctly retained two test failures:
+
+- `gateway-sqlite-10`: the message-search first-page completion assertion failed.
+  All 320 case identities were present (319 passed, one failed). Source has a
+  100ms pagination budget, but this run does not establish a resource root cause.
+- `gateway-sqlite-1`: the checkpoint rewrite call sequence was `[3, 3]`, rather
+  than `[3, 1, 3]`. All 1,780 selected case identities were present (1,777 passed,
+  one failed, two existing POSIX skips), with disjoint parallel/serial ownership.
+  The same case passed in all three measured candidate runs; the cause of this
+  budget/call-path assertion failure remains unconfirmed.
+
+Related product and test sources are unchanged from the integrated `main`.
+That alone does not rule out scheduling or execution-order effects. No rerun,
+retry, skip, deadline increase or assertion weakening was used to clear these
+failures. This is the reviewable PR version, not a green merge candidate. This
+integration run uses a different source revision and is not added to the earlier
+three-versus-three timing comparison.
 
 ## Parallel-runner measurement history
 
