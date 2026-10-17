@@ -2266,6 +2266,8 @@ export function useChatSend(options: UseChatSendOptions) {
     textOverride?: string
     /** An explicit composer attachment enriches text but still consumes the draft after queue persistence. */
     consumeComposerOnQueue?: boolean
+    /** A mode command's prompt belongs to a new turn, even if work starts during activation. */
+    requireNewTurn?: boolean
     cancelIfComposerChanged?: boolean
     resumeQueueOnSuccess?: boolean
     /** Invocation-owned UI response; automatic sends leave it unset. */
@@ -2527,6 +2529,7 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (
           options.busySendMode.value === 'steer'
+          && !invocation.requireNewTurn
           && !composerSnapshot.pageContext
           && composerSnapshot.selectedSkills.length === 0
           && !options.taskOwnership?.stopRequestedTaskId.value
@@ -2617,6 +2620,7 @@ export function useChatSend(options: UseChatSendOptions) {
           textOverride: handled.prompt,
           consumeComposerOnQueue: true,
           cancelIfComposerChanged: true,
+          requireNewTurn: true,
         }, onAccepted)
       }
       if (handled) return

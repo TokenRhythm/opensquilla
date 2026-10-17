@@ -3443,6 +3443,71 @@ describe('useChatSend attachment payloads', () => {
     expect(harness.options.messages.value).toEqual([])
   })
 
+  it.each(['steer', 'queue'] as const)('queues Plan prose for the next turn when work starts during mode activation (%s preference)', async busySendMode => {
+    const harness = makeOptions({
+      ...sameTurnSteerOptions('remote-default-turn'),
+      inputText: ref('/plan inspect the runtime'),
+      busySendMode: ref<BusySendMode>(busySendMode),
+    })
+    const { options, api, stream, rpc } = harness
+    options.pendingQueueOwnerContext.value = { sessionKey: options.sessionKey.value, ownerRequestId: 'plan-queue-owner' }
+    const pending = useChatPendingQueue({
+      sessionKey: options.sessionKey, inputText: options.inputText,
+      ownerContext: options.pendingQueueOwnerContext,
+      pendingAttachments: options.pendingAttachments, pendingSessionIntent: options.pendingSessionIntent,
+      isStreaming: stream.isStreaming, isBlocked: () => true,
+      autoResizeTextarea: vi.fn(), sendCurrentInput: vi.fn(), resetInputHistory: vi.fn(),
+      hasComposer: () => true, pendingInputWal: options.pendingInputWal,
+    })
+    options.enqueuePendingInput = vi.fn(pending.enqueuePendingInput)
+    let finishMode!: (accepted: boolean) => void
+    const { activatePlanMode } = connectPlanCommands(harness, () => new Promise<boolean>(resolve => { finishMode = resolve }))
+    const onAccepted = vi.fn()
+    const onDeliveryAccepted = vi.fn()
+    const resumeQueue = vi.fn()
+    options.capturePendingAutoSendResume = vi.fn(() => resumeQueue)
+    try {
+      const sending = api.onSend({ onAccepted, onDeliveryAccepted, resumeQueueOnSuccess: true })
+      await vi.waitFor(() => expect(activatePlanMode).toHaveBeenCalledOnce())
+      stream.isStreaming.value = true
+      finishMode(true)
+      await sending
+
+      expect(rpc.call).not.toHaveBeenCalled()
+      expect(options.enqueuePendingInput).toHaveBeenCalledExactlyOnceWith('inspect the runtime', { ownerRequestId: 'plan-queue-owner' })
+      expect(pending.pendingQueue.value).toMatchObject([{
+        text: 'inspect the runtime', ownerRequestId: 'plan-queue-owner', ownerSessionKey: options.sessionKey.value,
+      }])
+      expect(options.inputText.value).toBe('')
+      expect(onAccepted).toHaveBeenCalledOnce()
+      expect(resumeQueue).toHaveBeenCalledOnce()
+      expect(onDeliveryAccepted).not.toHaveBeenCalled()
+    } finally {
+      pending.cleanup()
+    }
+  })
+
+  it('retains Plan prose when the next-turn queue rejects it after work starts during activation', async () => {
+    const harness = makeOptions({
+      ...sameTurnSteerOptions('remote-default-turn'),
+      inputText: ref('/plan inspect the runtime'), busySendMode: ref<BusySendMode>('steer'),
+      enqueuePendingInput: vi.fn(() => false),
+    })
+    let finishMode!: (accepted: boolean) => void
+    const { activatePlanMode } = connectPlanCommands(harness, () => new Promise<boolean>(resolve => { finishMode = resolve }))
+    const onAccepted = vi.fn()
+    const sending = harness.api.onSend({ onAccepted })
+    await vi.waitFor(() => expect(activatePlanMode).toHaveBeenCalledOnce())
+    harness.stream.isStreaming.value = true
+    finishMode(true)
+    await sending
+
+    expect(harness.rpc.call).not.toHaveBeenCalled()
+    expect(harness.options.enqueuePendingInput).toHaveBeenCalledExactlyOnceWith('inspect the runtime', undefined)
+    expect(harness.options.inputText.value).toBe('/plan inspect the runtime')
+    expect(onAccepted).not.toHaveBeenCalled()
+  })
+
   it.each(['edited-back', 'attachment', 'skill', 'workspace', 'session', 'identity', 'queue-owner'] as const)(
     'cancels the original Plan send when its %s changes during mode activation', async scenario => {
       const composerRevision = ref(0)
