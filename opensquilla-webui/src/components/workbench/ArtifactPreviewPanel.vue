@@ -200,7 +200,7 @@ import {
   artifactIconName,
 } from '@/utils/chat/artifacts'
 import { applyMarkdownImageResources, createMarkdownImageResolver } from '@/utils/workbench/markdownImageResources'
-import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE, isOfficePreviewFormat } from '@/utils/workbench/artifactPreview'
+import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE, artifactWorkbenchPreviewKind, isOfficePreviewFormat } from '@/utils/workbench/artifactPreview'
 import { useMarkdownEnhancements } from '@/composables/chat/useMarkdownEnhancements'
 
 const props = withDefaults(defineProps<{
@@ -311,14 +311,19 @@ const resourceSignature = computed(() => [
   props.artifact.size || '',
   props.sessionKey,
   props.baseOrigin,
-  props.nativeHtml ? 'native' : 'web',
-  props.previewBlocked ? 'blocked' : 'unblocked',
-  props.previewCollectionStatus,
-  props.previewErrorMessage,
-  props.previewLaunchUrl,
-  props.previewMode,
-  props.previewNetworkAllowed ? 'network' : 'no-network',
-  props.previewSandboxProfile,
+  // Preview preferences may arrive after the reader mounts. They affect HTML
+  // execution/leases, not PDF/Office bytes; including them for every kind
+  // cancels and downloads the same binary again when offline becomes full.
+  ...(artifactWorkbenchPreviewKind(props.artifact) === 'html' ? [
+    props.nativeHtml ? 'native' : 'web',
+    props.previewBlocked ? 'blocked' : 'unblocked',
+    props.previewCollectionStatus,
+    props.previewErrorMessage,
+    props.previewLaunchUrl,
+    props.previewMode,
+    props.previewNetworkAllowed ? 'network' : 'no-network',
+    props.previewSandboxProfile,
+  ] : []),
 ].join('\u0000'))
 
 let loadedResourceSignature: string | null = null

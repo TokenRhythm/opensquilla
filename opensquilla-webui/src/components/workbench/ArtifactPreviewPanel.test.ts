@@ -85,6 +85,41 @@ afterEach(() => {
 })
 
 describe('ArtifactPreviewPanel', () => {
+  it.each(['pdf', 'docx', 'pptx', 'xlsx'] as const)('does not reload %s for HTML preferences but still reloads a new revision', async format => {
+    const mime = format === 'pdf' ? 'application/pdf' : OFFICE_PREVIEW_MIMES[format]
+    vi.mocked(createOfficePreviewSession).mockResolvedValue({
+      goTo: vi.fn(), getPageSize: vi.fn(() => null), getNotes: vi.fn(() => null), renderThumbnail: vi.fn(), fitPage: vi.fn(),
+      destroy: vi.fn(), previous: vi.fn(), next: vi.fn(), resize: vi.fn(), fitWidth: vi.fn(), zoomIn: vi.fn(), zoomOut: vi.fn(),
+      setSelectionMode: vi.fn(), clearSelection: vi.fn(),
+    })
+    const requestBinary = vi.fn(async () => httpBinaryResponse(new Uint8Array([1, 2, 3, 4]), { contentType: mime }))
+    const selected = artifact({ name: `reader.${format}`, mime, revisionId: 'original' })
+    const mounted = mountPanel({ artifact: selected, previewMode: 'offline' }, httpTransportTestDouble({ requestBinary }))
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledOnce()
+    mounted.update({ previewMode: 'full', previewNetworkAllowed: false, previewSandboxProfile: 'opaque-offline' })
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledOnce()
+    mounted.update({ artifact: { ...selected, revisionId: 'updated' } })
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledTimes(2)
+    mounted.unmount()
+  })
+
+  it('continues reloading HTML when its execution mode changes', async () => {
+    const requestBinary = vi.fn(async () => httpBinaryResponse('<!doctype html><p>Mode change</p>', { contentType: 'text/html' }))
+    const onNativeHtmlReady = vi.fn()
+    const mounted = mountPanel({ artifact: artifact(), nativeHtml: true, previewMode: 'offline', onNativeHtmlReady },
+      httpTransportTestDouble({ requestBinary }))
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledOnce()
+    expect(onNativeHtmlReady).toHaveBeenCalledOnce()
+    mounted.update({ previewMode: 'full' })
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledTimes(2)
+    expect(onNativeHtmlReady).toHaveBeenCalledTimes(2)
+    mounted.unmount()
+  })
   it.each([
     { surface: 'Web iframe', nativeHtml: false, source: 'partial lease', lease: true },
     { surface: 'Desktop native', nativeHtml: true, source: 'partial lease', lease: true },

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { writeFile } from 'node:fs/promises'
 import { helloOkResponse } from './support/gateway-fixture'
 import { chatHistoryPayload, sessionMessagesHydratePayload, sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload } from './support/session-read-fixtures'
@@ -10,6 +11,59 @@ test.use({ video: process.env.OPENSQUILLA_RETENTION_RECORD ? 'on' : 'retain-on-f
 const A = 'agent:main:webchat:launcher-a'
 const B = 'agent:main:webchat:launcher-b'
 type Wire = Record<string, unknown>
+
+type ReaderResourceSample = {
+  workers: { active: number; created: number; terminated: number }
+  resizeObservers: number
+  readerDom: number
+}
+
+async function installReaderResourceProbe(page: Page) {
+  await page.addInitScript(() => {
+    const workers = { active: 0, created: 0, terminated: 0 }
+    let resizeObservers = 0
+    const WorkerClass = window.Worker
+    window.Worker = class extends WorkerClass {
+      private retired = false
+      constructor(url: string | URL, options?: WorkerOptions) {
+        super(url, options)
+        workers.active++; workers.created++
+      }
+      terminate() {
+        if (!this.retired) { this.retired = true; workers.active--; workers.terminated++ }
+        super.terminate()
+      }
+    }
+    const ObserverClass = window.ResizeObserver
+    window.ResizeObserver = class extends ObserverClass {
+      private targets = new Set<Element>()
+      observe(target: Element, options?: ResizeObserverOptions) {
+        if (!this.targets.size) resizeObservers++
+        this.targets.add(target)
+        super.observe(target, options)
+      }
+      unobserve(target: Element) {
+        if (this.targets.delete(target) && !this.targets.size) resizeObservers--
+        super.unobserve(target)
+      }
+      disconnect() {
+        if (this.targets.size) resizeObservers--
+        this.targets.clear()
+        super.disconnect()
+      }
+    }
+    Object.defineProperty(window, '__retentionReaderResources', { get: () => ({
+      workers: { ...workers }, resizeObservers,
+      readerDom: document.querySelectorAll('.pdf-preview, .office-preview').length,
+    }) })
+  })
+}
+
+function readerResourceSample(page: Page): Promise<ReaderResourceSample> {
+  return page.evaluate(() => (window as unknown as {
+    __retentionReaderResources: ReaderResourceSample
+  }).__retentionReaderResources)
+}
 
 async function installLauncherGateway(page: Page, projectA: boolean, projectB = projectA, artifacts: Wire[] = []) {
   const requests: Array<{ method: string; key: string; params?: Wire }> = []
@@ -313,6 +367,8 @@ test('project draft materialization through Files does not leave the reopened pa
 test.describe('session workbench retention', () => {
   for (const format of ['pdf', 'docx', 'pptx', 'xlsx'] as const) {
     test(`restores artifact ${format} reader through the real session entry`, async ({ page }, info) => {
+      await installReaderResourceProbe(page)
+      const cycles = Math.max(1, Math.min(20, Number.parseInt(process.env.OPENSQUILLA_RETENTION_CYCLES || '1', 10) || 1))
       const bytes = { pdf: pdfFixture, docx: docxFixture, pptx: pptxFixture, xlsx: xlsxFixture }[format]()
       const mime = { pdf: 'application/pdf', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
@@ -322,16 +378,25 @@ test.describe('session workbench retention', () => {
         size: bytes.length, download_url: '/api/v1/artifacts/retained-document' }])
       gateway.releaseMetadata(); gateway.releaseHistory()
       let reads = 0
+      const binaryRequests: Array<{ method: string; path: string }> = []
       await page.route('**/api/v1/artifacts/retained-document**', route => {
+        const url = new URL(route.request().url())
+        binaryRequests.push({ method: route.request().method(), path: url.pathname + url.search })
         reads++; return route.fulfill({ contentType: mime, body: bytes })
       })
+      await page.route('**/opensquilla-mark.png', route => route.fulfill({ contentType: 'image/png', body: Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64',
+      ) }))
       const errors: string[] = []
       page.on('pageerror', error => errors.push(error.message))
       await page.setViewportSize({ width: 1440, height: 960 })
       await page.goto('/control/chat?session=' + encodeURIComponent(A))
+      const initialResources = await readerResourceSample(page)
+      const openStarted = Date.now()
       await page.locator('.msg-artifact-body').filter({ hasText: name }).click()
       const reader = page.locator(format === 'pdf' ? '.pdf-preview' : '.office-preview')
       await expect(reader.getByRole('button', { name: 'Zoom in', exact: true })).toBeEnabled()
+      const firstOpenMs = Date.now() - openStarted
       if (format !== 'pdf') {
         await reader.getByRole('button', { name: 'Next', exact: true }).click()
         await expect(reader.locator('.office-preview__position')).toHaveText('2 / 2')
@@ -339,16 +404,45 @@ test.describe('session workbench retention', () => {
       await reader.getByRole('button', { name: 'Zoom in', exact: true }).click()
       const zoom = reader.locator(format === 'pdf' ? '.pdf-preview__fit' : '.office-preview__zoom')
       if (format !== 'xlsx') await expect(zoom).toHaveValue('manual')
-      await page.getByRole('button', { name: 'Launcher task B', exact: true }).click()
-      await expect(page.locator('#app-main .chat:visible')).toContainText('Answer B is ready.')
-      await expect(reader).toHaveCount(0)
-      await page.getByRole('button', { name: 'Launcher task A', exact: true }).click()
-      await expect(reader.getByRole('button', { name: 'Zoom in', exact: true })).toBeEnabled()
-      if (format !== 'pdf') await expect(reader.locator('.office-preview__position')).toHaveText('2 / 2')
-      if (format !== 'xlsx') await expect(zoom).toHaveValue('manual')
-      expect(reads).toBeGreaterThan(1)
+      const activeBaseline = await readerResourceSample(page)
+      const initialReads = reads
+      expect(initialReads).toBe(1)
+      let inactiveBaseline: ReaderResourceSample | undefined
+      const samples: Array<{ cycle: number; awayMs: number; returnMs: number; reads: number; readDelta: number;
+        inactive: ReaderResourceSample; active: ReaderResourceSample }> = []
+      for (let cycle = 1; cycle <= cycles; cycle++) {
+        const awayStarted = Date.now()
+        await page.getByRole('button', { name: 'Launcher task B', exact: true }).click()
+        await expect(page.locator('#app-main .chat:visible')).toContainText('Answer B is ready.')
+        await expect(reader).toHaveCount(0)
+        await expect.poll(async () => (await readerResourceSample(page)).workers.active).toBe(initialResources.workers.active)
+        const inactive = await readerResourceSample(page)
+        const awayMs = Date.now() - awayStarted
+        inactiveBaseline ??= inactive
+        expect(inactive.resizeObservers).toBe(inactiveBaseline.resizeObservers)
+        const readsBeforeReturn = reads
+        const returnStarted = Date.now()
+        await page.getByRole('button', { name: 'Launcher task A', exact: true }).click()
+        await expect(reader.getByRole('button', { name: 'Zoom in', exact: true })).toBeEnabled()
+        if (format !== 'pdf') await expect(reader.locator('.office-preview__position')).toHaveText('2 / 2')
+        if (format !== 'xlsx') await expect(zoom).toHaveValue('manual')
+        const active = await readerResourceSample(page)
+        samples.push({ cycle, awayMs, returnMs: Date.now() - returnStarted, reads, readDelta: reads - readsBeforeReturn, inactive, active })
+        expect(reads - readsBeforeReturn).toBe(1)
+        expect(active.readerDom).toBe(1)
+        expect(active.workers.active).toBe(activeBaseline.workers.active)
+        expect(active.resizeObservers).toBe(activeBaseline.resizeObservers)
+      }
+      expect(reads).toBe(initialReads * (cycles + 1))
       expect(errors).toEqual([])
+      await page.mouse.move(10, 10)
       await page.screenshot({ path: info.outputPath(`artifact-${format}-reader-restored.png`) })
+      // This is click-to-assertion latency in the controlled browser fixture,
+      // not a performance gate or a heap measurement. Every return rebuilds
+      // a disposed reader; JS modules and HTTP browser caches are already warm.
+      await writeFile(info.outputPath(`artifact-${format}-retention-metrics.json`), JSON.stringify({
+        format, cycles, firstOpenMs, initialResources, activeBaseline, initialReads, reads, binaryRequests, errors, samples,
+      }, null, 2))
       expect(gateway.requests.filter(request => /sessions.sidechat.(create|close)|chat.abort|chat.cancel/.test(request.method))).toHaveLength(0)
     })
   }

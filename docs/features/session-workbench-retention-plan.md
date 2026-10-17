@@ -315,8 +315,8 @@ P2 可按 provider 拆分小 PR；P3 的 owner 交接与 side reader 回收必�
 - 真实 App 入口的 terminal alternate-screen/隐藏消费/B 草稿返回，以及同一任务内编辑后立即导航的草稿 case 共 2 项通过。截图人工查看、浏览器录频已保存于集成工作树 `.tmp/queue-draft-final/`；此类测试使用可控 Gateway fixture，不冒充真实 provider 或打包客户端验收。
 - P2 阅读/元数据定向 10 文件 162 项通过；artifact 相关旧测试已按新导航保留和共享 PDF 契约更新，相关 72 项复验通过；最终资源组件 5 文件 103 项通过（包含冷资源集合重新加载）。这些组合存在覆盖重叠。日志分别为 `.tmp/p2-reading-tests.log`、`.tmp/p2-artifact-retest.log`、`.tmp/p2-resource-final-tests.log`。
 - P2 真实 App 入口 fixture：工作区 PDF/DOCX/PPTX/XLSX 共 4 项、artifact 对应 4 项 A→B→A 通过，检查离开后 DOM 释放、返回位置与缩放、没有额外 side create/close/abort；artifact PDF 的真实 canvas/worker 关闭释放另 1 项通过。日志 `.tmp/p2-reading-e2e.log`、`.tmp/p2-artifact-retention-e2e.log`、`.tmp/p2-artifact-pdf-e2e.log`，同名目录保存 PNG/WebM。人工查看 PPTX/PDF 截图后修复 PDF flex 宽度问题，最终单项复验通过并查看 PNG，记录为 `.tmp/p2-artifact-pdf-final.log` 与同名目录；P2 最终 typecheck wrapper exit 0，记录 `.tmp/p2-final-typecheck.log`。
-- 媒体时间恢复目前是组件定向测试证据；真实音视频、大型 Office、Windows 原生文件预览与进程工作集仍需实测，不能由可控 RPC + 真实 Vue/parser/canvas 的入口测试推定。
-- 终端前端 consumption/panel/adapter 定向 17 项、后端 terminal sessions/RPC 39 项通过，相关 4 文件 ruff 与 RPC boundary guard 通过。新 Gateway 18819 的真实 Windows PTY 实测：131,363 bytes / 35 frames 后触发背压，500ms 不再增长；Ctrl-C 后 372ms 出现新 PowerShell prompt，随后 marker 命令成功、seq 连续并观察到 close/exit。原工作树记录为 `.tmp/session-retention-final-20261017/terminal-native-result.json`。实际 App+xterm fixture 的 alternate-screen A→B 隐藏输出→A 保留同一 DOM/屏幕，退出后恢复 normal buffer；修复草稿后的完整通过记录为集成工作树 `.tmp-queue-draft-final.log`，PNG/WebM 位于 `.tmp/queue-draft-final/workbench-session-launcher-ba1d1-put-across-session-switches-chromium/`。真实 PTY 与 fixture UI 是不同证据，尚未证明原生终端 UI 或打包安装体验；旧 18799 未协商 `consumed-v1` 时使用兼容分支。
+- 媒体恢复先由组件定向测试覆盖；最终构建另用真实 Gateway 点击 MP3 合成样例，解码后暂停于 2.472149 秒，切走时 audio DOM 为 0，返回后仍暂停于同一时间。视频、大型 Office、Windows 原生文件预览与进程工作集仍需进一步实测，不能由可控 RPC + 真实 Vue/parser/canvas 的入口测试推定。
+- 终端前端 consumption/panel/adapter 定向 17 项、后端 terminal sessions/RPC 39 项通过，相关 4 文件 ruff 与 RPC boundary guard 通过。新 Gateway 18819 的真实 Windows PTY 实测：131,363 bytes / 35 frames 后触发背压，500ms 不再增长；Ctrl-C 后 372ms 出现新 PowerShell prompt，随后 marker 命令成功、seq 连续并观察到 close/exit。原工作树记录为 `.tmp/session-retention-final-20261017/terminal-native-result.json`。实际 App+xterm fixture 的 alternate-screen A→B 隐藏输出→A 保留同一 DOM/屏幕，退出后恢复 normal buffer；修复草稿后的完整通过记录为原工作树 `.tmp/session-retention-final-20261017/queue-logs/.tmp-queue-draft-final.log`，PNG/WebM 位于 `.tmp/queue-draft-final/workbench-session-launcher-ba1d1-put-across-session-switches-chromium/`。真实 PTY 与 fixture UI 是不同证据，尚未证明原生终端 UI 或打包安装体验；旧 18799 未协商 `consumed-v1` 时使用兼容分支。
 - 原生 TS 构建和 native contract 通过；受影响的现有 desktop-browser Electron 测试及附加 retention 测试通过。后者以真实 WebContents 验证 6 轮切换保留表单/JS/target、8 页准入覆盖 popup/创建/清理/替换、失败 close 的同 ID 替换返回 `RESOURCE_RELEASING`、实际销毁前不释放旧 slot、重试成功及最终预算清空。日志在原工作树 `.tmp/session-retention-final-20261017/native-browser-final.log`。该证据不包含多小时负载或真实用户网站的内存曲线。
 - 没有因单项修改重跑全量前后端测试；最终 main 同步、PR/CI 状态由集成记录另行更新。
 
@@ -333,6 +333,16 @@ P2 可按 provider 拆分小 PR；P3 的 owner 交接与 side reader 回收必�
 - [文件 provider](../../opensquilla-webui/src/components/workbench/workspaceFileProvider.ts)：读取取消、模式和阅读状态恢复。
 - [事件传输](../../opensquilla-webui/src/adapters/gateway/conversationEventTransport.ts) 与 [事件 hub](../../opensquilla-webui/src/modules/conversationEventHub.ts)：保持 owner、退役和 ACK 契约。
 - [终端 RPC](../../src/opensquilla/gateway/rpc_terminal.py)：区分视图 detach 与连接清理，不移除连接授权校验。
+
+### 2026-10-17 集成与真实 Gateway 复验
+
+- 已将此前 15 个提交与本轮 5 个提交重放到 `origin/main@5b25bd9da`，包含 #1921 发送恢复与 #1924 空白浏览器页。原分支备份为 `integration/retention-before-main-20261017`。`range-diff` 中 17 个补丁相同，3 个仅作冲突整合；独立审查确认上游变化完整保留。
+- 手工冲突保留 main 在 composer 前的唯一发送恢复提示、side 临时空态、空白页与窄屏两个测试、以及 native 空白 URL 与资源预约测试。同步后定向 5 文件 86 项通过，Vue 类型检查、native 构建/contract 与真实 Electron browser/retention 再验通过。
+- 最终 WebUI 已构建并校验资源，在原测试 Gateway 18799 上不重启服务、不强制刷新用户已有标签更新。真实 UI 点击验证 PDF 第 2 页/165% 缩放、Word 第 2/2 页、多标签选中状态、MP3 暂停位置，以及未发送 side 草稿在 A→B→A 后恢复。side 验收草稿已清理；没有向模型发出验收请求。
+- 最终构建另做 PDF/PPTX 各 10 轮、共 20 轮切换：每轮可见 reader DOM/Worker 为 1/1，隐藏为 0/0，活跃 ResizeObserver 固定 13/9，没有随轮次增长。PDF 首开 512ms、返回中位 304ms（163–341ms）；PPTX 首开 984ms、返回中位 295ms（279–320ms）。这是可控 App fixture 的点击到断言可用时间，含自动化开销；返回重建 reader，仅模块/HTTP 缓存已暖，不能外推真实大文件、P95、CPU 或进程工作集。
+- 该压力测试发现并修复实际重复下载：runtime 的 HTML 偏好从 offline 初始化为 full，会让 PDF/Office 通用资源 signature 触发第二次 GET。现在仅 HTML 将执行模式、网络和 lease 字段计入该 signature，完整资源身份/revision/hash/URL/session 校验保留。27 项组件测试覆盖非 HTML 不因偏好重复读、新 revision 仍重读、HTML 模式仍重载；最终 20 轮严格验证每挂载 1 GET，每格式 11 次挂载共 11 GET。最终日志和截图录屏在集成树 `.tmp/p5-reader-pressure-fixed*`，汇总 `.tmp/p5-reader-pressure-summary.json`；最后构建日志为 `.tmp/p5-final-artifact-build.log`。
+- 18799 保留原 Gateway 进程以保护现有会话；新终端消费协议由使用当前 Python 源码的隔离 Gateway 18819 实测。前端对旧 Gateway 的兼容路径与新协议证据分开记录。
+- 原工作区 157 个已有脏文件 SHA-256 全部不变。本轮仅修改集成工作树；日志、截图、录屏和 commit 清单保存在原工作树 `.tmp/session-retention-final-20261017/` 及集成树 `.tmp/p2-*`、`.tmp/queue-draft-final/`。本地尚未 push 或创建 PR，CI 尚未执行；首次交付范围不等于全部 P0–P5 完成。
 
 ## 验收与交付要求
 
