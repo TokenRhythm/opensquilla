@@ -7,6 +7,7 @@ import { createOfficePreviewSession, type OfficePreviewOptions } from '@/workben
 import type { OfficeSelection } from '@/types/officeSelection'
 import type { OfficePreviewFormat } from '@/utils/workbench/artifactPreview'
 import en from '@/locales/en.json'
+import type { ResourceReadingState } from './resourceReadingState'
 
 vi.mock('@/workbench/officePreviewAdapter', () => ({ createOfficePreviewSession: vi.fn() }))
 vi.mock('./OfficePageNavigator.vue', async () => {
@@ -27,7 +28,7 @@ const resize = vi.fn()
 const setSelectionMode = vi.fn()
 const clearSelection = vi.fn()
 const goTo = vi.fn()
-const fitPage = vi.fn(), fitWidth = vi.fn()
+const fitPage = vi.fn(), fitWidth = vi.fn(), setScale = vi.fn()
 const title: OfficeSelection = { format: 'pptx', kind: 'element', slideIndex: 0, shapeId: '4', text: '中文标题', truncated: false }
 async function flush() { await Promise.resolve(); await nextTick(); await nextTick() }
 
@@ -36,12 +37,12 @@ beforeEach(() => {
   resize.mockClear()
   setSelectionMode.mockClear()
   clearSelection.mockClear()
-  goTo.mockReset(); fitPage.mockReset(); fitWidth.mockReset()
+  goTo.mockReset(); fitPage.mockReset(); fitWidth.mockReset(); setScale.mockReset()
   vi.mocked(createOfficePreviewSession).mockImplementation(async options => {
     sessions.push(options)
     options.onLocation(0, 2)
     goTo.mockImplementation(async index => options.onLocation(index, 2))
-    return { destroy: vi.fn(), previous: vi.fn(), next: vi.fn(), fitWidth, fitPage, goTo,
+    return { destroy: vi.fn(), previous: vi.fn(), next: vi.fn(), fitWidth, fitPage, goTo, setScale,
       getPageSize: () => ({ width: 960, height: 540 }), renderThumbnail: vi.fn(),
       getNotes: (index: number) => options.format === 'pptx' ? ['中文演讲者备注\n第二段 <script>不会执行</script>', '第二页备注'][index] || null : null,
       zoomIn: vi.fn(), zoomOut: vi.fn(), resize, setSelectionMode, clearSelection }
@@ -54,10 +55,10 @@ beforeEach(() => {
 })
 afterEach(() => { cleanups.splice(0).forEach(cleanup => cleanup()); vi.unstubAllGlobals(); vi.clearAllMocks() })
 
-async function mount(format: OfficePreviewFormat = 'pptx', annotationEnabled = true) {
+async function mount(format: OfficePreviewFormat = 'pptx', annotationEnabled = true, readingState?: ResourceReadingState) {
   const host = document.createElement('div')
   document.body.append(host)
-  const state = reactive({ data: new ArrayBuffer(1), format, annotationEnabled, suspended: false })
+  const state = reactive({ data: new ArrayBuffer(1), format, annotationEnabled, suspended: false, readingState })
   const request = vi.fn()
   const app = createApp({ render: () => h(OfficePreviewPanel, { ...state, onSelectionRequest: request }) })
   app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
@@ -69,6 +70,15 @@ async function mount(format: OfficePreviewFormat = 'pptx', annotationEnabled = t
 }
 
 describe('Office request-change entry', () => {
+  it.each(['docx', 'pptx', 'xlsx'] as const)('restores %s page or sheet and zoom without reactivating selection', async format => {
+    const panel = await mount(format, true, { page: 1, mode: 'manual', scale: 1.75, top: 88, left: 20, time: 0 })
+    await flush(); await flush()
+    expect(goTo).toHaveBeenCalledWith(1)
+    expect(setScale).toHaveBeenCalledWith(1.75)
+    expect(panel.host.querySelector<HTMLElement>('.office-preview__viewport')?.scrollTop).toBe(88)
+    expect(panel.host.querySelector('.office-preview__guide')).toBeNull()
+    expect(setSelectionMode).not.toHaveBeenCalledWith(true)
+  })
   it.each(['docx', 'pptx', 'xlsx'] as const)('offers an explicit %s entry before selection without submitting an empty request', async format => {
     const h = await mount(format)
     expect(h.button().textContent).toContain(en.workbench.office.requestChange)

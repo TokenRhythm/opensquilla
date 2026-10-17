@@ -364,6 +364,7 @@
       "unavailableReasons": { "htmlEncodingUnsupported": "Dieses HTML ist kein gültiges UTF-8 und kann nicht sicher angezeigt oder bearbeitet werden.", "htmlValidationFailed": "Dieses HTML konnte nicht für eine sichere Vorschau oder Bearbeitung validiert werden.", "htmlEditTooLarge": "Dieses HTML ist für die Bearbeitung in der App zu groß. Es kann weiterhin heruntergeladen werden.", "htmlPreviewTooLarge": "Dieses HTML ist für eine sichere Vorschau in der App zu groß. Es kann weiterhin heruntergeladen werden.", "officeAdapterNotAvailable": "Die Office-Bearbeitung ist noch nicht verfügbar.", "unsupported": "Diese Aktion ist für diese Ressource nicht verfügbar." }
     },
     "browser": {
+      "capacityReached": "Es sind bereits acht Browser-Tabs geöffnet. Kehre zu einem vorhandenen Tab zurück oder schließe einen, bevor du einen weiteren öffnest.",
       "newTab": "Neuer Tab",
       "startHint": "Öffne eine Webseite neben dieser Aufgabe.",
       "addressPlaceholder": "URL eingeben, z. B. example.com",

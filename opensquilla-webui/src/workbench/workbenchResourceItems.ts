@@ -72,9 +72,9 @@ export function createResourceCollectionWorkbenchItem(options: {
     title: options.title,
     scope: { type: 'session', id: options.sessionKey },
     hostKind: 'dom',
-    retention: 'keep-alive',
+    retention: 'dispose-on-suspend',
     payload: {
-      resources,
+      resourceCount: resources.length,
       sessionKey: options.sessionKey,
     },
   }
@@ -104,7 +104,7 @@ export function refreshResourceCollectionWorkbenchItem(
   return {
     ...item,
     title,
-    payload: { ...item.payload, resources: canonicalWorkbenchResources(resources) },
+    payload: { sessionKey: item.payload.sessionKey, resourceCount: canonicalWorkbenchResources(resources).length },
   }
 }
 

@@ -149,6 +149,8 @@ export interface WorkbenchPanelRuntime {
 
 export interface WorkbenchPanelRenderState {
   active: boolean
+  /** Selection is retained while collapsed; visible also reflects host presence. */
+  visible?: boolean
   hostAvailable: boolean
   nativeSurface: boolean
   runtimeState: Readonly<Record<string, unknown>>

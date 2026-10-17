@@ -364,6 +364,7 @@
       "unavailableReasons": { "htmlEncodingUnsupported": "Este HTML no es UTF-8 válido y no se puede previsualizar ni editar de forma segura.", "htmlValidationFailed": "No se pudo validar este HTML para una vista previa o edición seguras.", "htmlEditTooLarge": "Este HTML es demasiado grande para editarlo en la aplicación. Aún puedes descargarlo.", "htmlPreviewTooLarge": "Este HTML es demasiado grande para previsualizarlo de forma segura. Aún puedes descargarlo.", "officeAdapterNotAvailable": "La edición de Office aún no está disponible.", "unsupported": "Esta acción no está disponible para este recurso." }
     },
     "browser": {
+      "capacityReached": "Ya hay ocho pestañas del navegador abiertas. Vuelve a una existente o cierra una antes de abrir otra.",
       "newTab": "Nueva pestaña",
       "startHint": "Abre una página web junto a esta tarea.",
       "addressPlaceholder": "Introduce una URL, p. ej. example.com",

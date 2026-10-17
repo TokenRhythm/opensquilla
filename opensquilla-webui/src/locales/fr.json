@@ -364,6 +364,7 @@
       "unavailableReasons": { "htmlEncodingUnsupported": "Ce HTML n’est pas un UTF-8 valide et ne peut pas être prévisualisé ou modifié en toute sécurité.", "htmlValidationFailed": "Ce HTML n’a pas pu être validé pour une prévisualisation ou une modification sûre.", "htmlEditTooLarge": "Ce HTML est trop volumineux pour être modifié dans l’application. Vous pouvez toujours le télécharger.", "htmlPreviewTooLarge": "Ce HTML est trop volumineux pour être prévisualisé en toute sécurité. Vous pouvez toujours le télécharger.", "officeAdapterNotAvailable": "L’édition Office n’est pas encore disponible.", "unsupported": "Cette action n’est pas disponible pour cette ressource." }
     },
     "browser": {
+      "capacityReached": "Huit onglets du navigateur sont déjà ouverts. Revenez à un onglet existant ou fermez-en un avant d’en ouvrir un autre.",
       "newTab": "Nouvel onglet",
       "startHint": "Ouvrez une page web à côté de cette tâche.",
       "addressPlaceholder": "Saisissez une URL, par ex. example.com",

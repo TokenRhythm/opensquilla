@@ -138,6 +138,7 @@
         :show-header="showHeader"
         :suspended="suspended || activeTab !== 'preview'"
         :office-annotation-enabled="officeAnnotationEnabled"
+        :reading-state="previewReading?.identity === artifactReadingIdentity(headArtifact, sessionKey) ? previewReading.reading : undefined"
         @workbench-event="forwardWorkbenchEvent"
       />
     </div>
@@ -289,6 +290,7 @@ import type {
 import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
 import ArtifactSourcePreview from './ArtifactSourcePreview.vue'
 import ArtifactPreviewPanel from './ArtifactPreviewPanel.vue'
+import { artifactReadingIdentity, type ArtifactReadingCheckpoint } from './resourceReadingState'
 
 type DocumentTab = 'preview' | 'source' | 'versions' | 'changes'
 type PreviewHandle = { reload: () => Promise<void> }
@@ -317,6 +319,7 @@ const props = withDefaults(defineProps<{
   sessionKey?: string
   showHeader?: boolean
   suspended?: boolean
+  previewReading?: ArtifactReadingCheckpoint
   officeAnnotationEnabled?: boolean
   annotationFallback?: {
     annotationId: string

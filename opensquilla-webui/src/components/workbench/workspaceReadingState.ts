@@ -1,4 +1,5 @@
 import type { WorkspaceFile } from '@/modules/workspaceFiles'
+import { resourceReadingState, type ResourceReadingState } from './resourceReadingState'
 
 /** Reading hints only: never content, resource handles, or read authority. */
 export interface WorkspaceReadingState {
@@ -12,6 +13,7 @@ export interface WorkspaceReadingState {
   sourceTop: number
   sourceLeft: number
   markdownTop: number
+  resource?: ResourceReadingState
 }
 
 const boundedNumber = (value: unknown, fallback: number, maximum = Number.MAX_SAFE_INTEGER) =>
@@ -31,6 +33,7 @@ export function workspaceReadingState(value: unknown): WorkspaceReadingState | u
     sourceTop: boundedNumber(state.sourceTop, 0),
     sourceLeft: boundedNumber(state.sourceLeft, 0),
     markdownTop: boundedNumber(state.markdownTop, 0),
+    ...(resourceReadingState(state.resource) ? { resource: resourceReadingState(state.resource) } : {}),
   }
 }
 

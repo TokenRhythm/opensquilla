@@ -79,7 +79,7 @@
         :reading-state="previewReading"
         @workbench-event="handlePreviewEvent"
       />
-      <ResourcePreviewPanel v-else-if="selected && previewBlob" :key="previewState.viewId" :blob="previewBlob" :kind="previewKind" :name="selected.name" />
+      <ResourcePreviewPanel v-else-if="selected && previewBlob" :key="previewState.viewId" :blob="previewBlob" :kind="previewKind" :name="selected.name" :reading-state="previewReading?.resource" @reading-state="saveResourceReading" />
       <div v-else-if="selected" class="workspace-files__binary-preview">
         <p v-if="previewState.loading" role="status">{{ t('workbench.workspaceFiles.loading') }}</p>
         <p v-else-if="previewState.errorKey" role="alert">{{ t(previewState.errorKey) }}</p>
@@ -100,6 +100,7 @@ import { useI18n } from 'vue-i18n'
 import { useVirtualizer } from '@tanstack/vue-virtual'
 import WorkspaceFilePanel from './WorkspaceFilePanel.vue'
 import ResourcePreviewPanel from './ResourcePreviewPanel.vue'
+import type { ResourceReadingState } from './resourceReadingState'
 import WorkspaceResourceActions from './WorkspaceResourceActions.vue'
 import { resourcePreviewKind, resourcePreviewLimit } from '@/workbench/resourcePreview'
 import { completeWorkspaceMarkdown, isWorkspaceMarkdown, WORKSPACE_MARKDOWN_PREVIEW_LIMIT } from '@/workbench/workspaceTextPreview'
@@ -433,6 +434,11 @@ function toggleSource() {
   if (selected.value) void activate(selected.value, !sourceMode.value)
 }
 
+function saveResourceReading(resource: ResourceReadingState, blob: Blob) {
+  if (blob !== previewBlob.value) return
+  savedPreviewReading = workspaceReadingState({ ...savedPreviewReading, resource })
+  saveReading()
+}
 async function handlePreviewEvent(event: { type: string; payload?: unknown }) {
   const entry = selected.value
   const value = event.payload && typeof event.payload === 'object' ? event.payload as Record<string, unknown> : {}

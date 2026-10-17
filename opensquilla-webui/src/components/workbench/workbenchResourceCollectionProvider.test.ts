@@ -55,6 +55,51 @@ function harness() {
 }
 
 describe('Workbench resource collection provider', () => {
+  it('releases inventory leases and reloads a cold collection from its small descriptor', async () => {
+    const { item, context, state, calls } = harness()
+    let inventory: WorkbenchResource[] = []
+    let complete!: () => void
+    const load = vi.fn(() => new Promise<void>(resolve => { complete = () => { inventory = [attachment]; resolve() } }))
+    const release = vi.fn()
+    const retain = vi.fn(() => release)
+    const definition = createWorkbenchResourceCollectionDefinition({ ...calls, load, retain,
+      resources: () => inventory, pushError: vi.fn(), t: key => key })
+    expect(item.payload).not.toHaveProperty('resources')
+    const first = await definition.createRuntime!(item, context)
+    await first.activate?.(item)
+    expect(state.inventoryLoading).toBe(true)
+    complete(); await Promise.resolve(); await Promise.resolve()
+    expect(definition.getProps?.(item, { active: true, hostAvailable: true, nativeSurface: false, runtimeState: state })).toMatchObject({ resources: [attachment] })
+    await first.dispose?.('suspended')
+    expect(release).toHaveBeenCalledOnce()
+    inventory = []
+    const second = await definition.createRuntime!(item, context)
+    await second.activate?.(item)
+    expect(load).toHaveBeenCalledTimes(2)
+    expect(retain).toHaveBeenCalledTimes(2)
+    complete(); await Promise.resolve(); await Promise.resolve()
+    await second.dispose?.('closed')
+  })
+  it('keeps the operation owner after releasing the reader and reflects completion in the rebuilt reader', async () => {
+    const { calls, context, definition, item } = harness()
+    let finish!: () => void
+    calls.open.mockImplementation(() => new Promise(resolve => { finish = () => resolve(undefined) }))
+    const first = await definition.createRuntime!(item, context)
+    const opening = first.handleComponentEvent?.({ type: 'resource-open', payload: attachment }, item)
+    expect(await definition.beforeClose?.(item)).toBe(false)
+    await first.dispose?.('suspended')
+    const restored: Record<string, unknown> = {}
+    const second = await definition.createRuntime!(item, { ...context,
+      getRenderState: () => restored, updateRenderState: patch => Object.assign(restored, patch),
+      getViewState: () => ({ top: 120 }) })
+    expect(restored.resourceBusyKey).toBe('attachment:att_fixture')
+    expect(restored.collectionTop).toBe(120)
+    await second.handleComponentEvent?.({ type: 'resource-open', payload: attachment }, item)
+    expect(calls.open).toHaveBeenCalledOnce()
+    finish(); await opening
+    expect(restored.resourceBusyKey).toBe('')
+    expect(await definition.beforeClose?.(item)).toBe(true)
+  })
   it('presents non-previewable binary files as downloads but readonly HTML as openable', () => {
     const { definition, item } = harness()
     const presentation = {

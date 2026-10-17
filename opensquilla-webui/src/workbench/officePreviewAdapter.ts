@@ -28,6 +28,7 @@ export interface OfficePreviewSession {
   fitWidth(): void | Promise<void>
   zoomIn(): void | Promise<void>
   zoomOut(): void | Promise<void>
+  setScale?(scale: number): void | Promise<void>
   resize(): void | Promise<void>
 }
 export interface OfficePreviewOptions {
@@ -264,6 +265,8 @@ export async function createOfficePreviewSession(options: OfficePreviewOptions):
         await resize(); reportView()
       },
       fitWidth: () => fit('width'), fitPage: () => fit('page'),
+      setScale: scale => Number.isFinite(scale)
+        ? zoom(() => viewer!.setScale(Math.max(0.1, Math.min(10, scale)))) : undefined,
       zoomIn: () => zoom(() => viewer!.zoomIn()), zoomOut: () => zoom(() => viewer!.zoomOut()) }
   } catch (error) {
     destroy()

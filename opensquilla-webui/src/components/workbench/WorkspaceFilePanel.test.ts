@@ -34,6 +34,25 @@ async function enter(input: HTMLInputElement, value: string) {
 }
 
 describe('workspace source panel', () => {
+  it('restores media paused and captures playhead without requiring a text snapshot', async () => {
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:audio-restore')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(() => {})
+    const { el, onEvent } = await mount({ snapshot: null, previewBlob: new Blob(['media']), previewKind: 'audio',
+      readingState: { mode: 'preview', query: '', jump: '', toolsOpen: false, startLine: 1, focusLine: 1,
+        windowStart: 0, sourceTop: 0, sourceLeft: 0, markdownTop: 0,
+        resource: { page: 0, mode: 'width', scale: 1, top: 0, left: 0, time: 12 } } })
+    await vi.waitFor(() => expect(el.querySelector('audio')).not.toBeNull())
+    const media = el.querySelector('audio')!
+    Object.defineProperty(media, 'duration', { value: 60 })
+    media.dispatchEvent(new Event('loadedmetadata'))
+    expect(media.currentTime).toBe(12)
+    expect(media.autoplay).toBe(false)
+    media.currentTime = 24; media.dispatchEvent(new Event('timeupdate'))
+    expect(onEvent).toHaveBeenLastCalledWith(expect.objectContaining({ type: 'workspace-file-reading-state',
+      payload: expect.objectContaining({ resource: expect.objectContaining({ time: 24 }) }) }))
+  })
   it('restores source search and scrolling without moving keyboard focus', async () => {
     const { el, onEvent } = await mount({ snapshot: page(201, 400), readingState: {
       mode: 'source', query: 'line 250', jump: '250', toolsOpen: true, startLine: 201, focusLine: 250,

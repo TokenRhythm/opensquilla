@@ -26,6 +26,10 @@ import { ARTIFACT_DOCUMENT_RPC_METHODS, createRpcArtifactDocumentProvider } from
 import officeRevisionWire from '@/testing/fixtures/officeRevisionPreview/wire.json'
 
 vi.mock('@/workbench/officePreviewAdapter', () => ({ createOfficePreviewSession: vi.fn() }))
+vi.mock('./PdfResourcePreview.vue', () => ({ __esModule: true, default: {
+  props: ['data', 'name'], setup: (props: { data: ArrayBuffer }) =>
+    () => h('div', { 'data-testid': 'shared-pdf', 'data-bytes': props.data.byteLength }),
+} }))
 
 function artifact(overrides: Partial<ArtifactPayload> = {}): ArtifactPayload {
   return {
@@ -332,7 +336,7 @@ describe('ArtifactPreviewPanel', () => {
     mounted.unmount()
   })
 
-  it('opens PDFs fitted to the panel width without disabling frame interaction', async () => {
+  it('uses the shared interactive PDF renderer with authorized bytes', async () => {
     const onWorkbenchEvent = vi.fn()
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank?pdf-preview')
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
@@ -349,30 +353,13 @@ describe('ArtifactPreviewPanel', () => {
     }, http)
     await settlePreview()
 
-    const frame = mounted.element.querySelector<HTMLIFrameElement>(
-      '.artifact-preview__frame--pdf',
-    )!
-    expect(frame.getAttribute('src')).toBe(
-      'about:blank?pdf-preview#zoom=page-width&view=FitH',
-    )
-    expect(frame.getAttribute('aria-hidden')).toBeNull()
-    expect(frame.getAttribute('tabindex')).toBe('0')
-    expect(frame.classList.contains('is-mobile-inert')).toBe(false)
-
-    const frameExit = mounted.element.querySelector<HTMLButtonElement>(
-      '.artifact-preview__frame-exit',
-    )!
-    expect(frame.compareDocumentPosition(frameExit) & Node.DOCUMENT_POSITION_FOLLOWING)
-      .toBeTruthy()
-    expect(frameExit.textContent?.trim()).toBe('Collapse workbench')
-    frameExit.focus()
-    expect(document.activeElement).toBe(frameExit)
-    frameExit.click()
-    expect(onWorkbenchEvent).toHaveBeenCalledWith({ type: 'request-collapse' })
+    await vi.waitFor(() => expect(mounted.element.querySelector('[data-testid=shared-pdf]')).not.toBeNull())
+    expect(mounted.element.querySelector('iframe')).toBeNull()
+    expect(mounted.element.querySelector('[data-testid=shared-pdf]')?.getAttribute('data-bytes')).toBe('4')
     mounted.unmount()
   })
 
-  it('shows a useful fallback when the browser disables inline PDF viewing', async () => {
+  it('keeps PDF previews available when the browser disables its native plugin', async () => {
     const descriptor = Object.getOwnPropertyDescriptor(window.navigator, 'pdfViewerEnabled')
     Object.defineProperty(window.navigator, 'pdfViewerEnabled', {
       configurable: true,
@@ -391,9 +378,9 @@ describe('ArtifactPreviewPanel', () => {
       }, http)
       await settlePreview()
 
-      expect(mounted.element.querySelector('.artifact-preview__frame--pdf')).toBeNull()
-      expect(mounted.element.querySelector('[role="alert"]')?.textContent)
-        .toContain(en.workbench.artifactPreview.pdfViewerUnavailable)
+      await vi.waitFor(() => expect(mounted.element.querySelector('[data-testid=shared-pdf]')).not.toBeNull())
+      expect(mounted.element.querySelector('iframe')).toBeNull()
+      expect(mounted.element.querySelector('[role="alert"]')).toBeNull()
       mounted.unmount()
     } finally {
       if (descriptor) Object.defineProperty(window.navigator, 'pdfViewerEnabled', descriptor)

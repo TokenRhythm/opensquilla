@@ -23,9 +23,10 @@ const TERMINAL_ITEM_LIMIT = 4
 // new protected preview owners instead of evicting existing user work. This is
 // an admission count, not a heap limit or a cap on adopted browser targets.
 const NATIVE_ARTIFACT_ITEM_LIMIT = 4
+const BROWSER_ITEM_LIMIT = 8
 
 interface WorkbenchAdmissionRejection {
-  reason: 'native-preview-capacity'
+  reason: 'native-preview-capacity' | 'browser-capacity'
   item: WorkbenchItem
   limit: number
 }
@@ -182,6 +183,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   function openItem(item: WorkbenchItem, options: { activate?: boolean } = {}): boolean {
     const existing = items.value.some(candidate => candidate.id === item.id)
+    // Adoption describes a target already admitted by the native host. Refusing
+    // it here would strand the page without a tab or an explicit close action.
+    if (!existing && item.kind === 'browser' && item.payload.adoptedNativeSurface !== true
+      && items.value.filter(candidate => candidate.kind === 'browser').length >= BROWSER_ITEM_LIMIT) {
+      return rejectAdmission({ reason: 'browser-capacity', item, limit: BROWSER_ITEM_LIMIT })
+    }
     if (!existing && item.kind === 'artifact-preview' && item.hostKind === 'native-webcontents'
       && items.value.filter(candidate => candidate.kind === 'artifact-preview'
         && candidate.hostKind === 'native-webcontents').length >= NATIVE_ARTIFACT_ITEM_LIMIT) {

@@ -49,8 +49,9 @@ describe('workbench resource items', () => {
     expect(refreshed.id).toBe(item.id)
     expect(refreshed.scope).toEqual({ type: 'session', id: 'agent:main:webchat:parent' })
     expect(refreshed.payload.sessionKey).toBe(child)
-    expect(resourcesFromWorkbenchItem(refreshed)).toEqual([after])
-    expect(resourcesFromWorkbenchItem(item)).toEqual([before])
+    expect(refreshed.payload.resourceCount).toBe(1)
+    expect(refreshed.payload.resources).toBeUndefined()
+    expect(item.payload.resources).toBeUndefined()
   })
 
   it('keeps same-name resources distinct by typed stable identity', () => {
@@ -63,7 +64,8 @@ describe('workbench resource items', () => {
       title: 'Workbench',
     })
 
-    expect(resourcesFromWorkbenchItem(item)).toEqual([attachment, document, deliverable])
+    expect(item.payload.resourceCount).toBe(3)
+    expect(resourcesFromWorkbenchItem(item)).toEqual([])
     expect(new Set([
       workbenchResourceKey(attachment.resource),
       workbenchResourceKey(document.resource),
@@ -91,7 +93,8 @@ describe('workbench resource items', () => {
       sessionKey: 'agent:main:webchat:test',
       title: 'Workbench',
     })
-    expect(resourcesFromWorkbenchItem(item)).toEqual([document, sameLookingUnbound])
+    expect(item.payload.resourceCount).toBe(2)
+    expect(item.payload.resources).toBeUndefined()
   })
 
   it('keeps persisted inline Visualize widgets out of the Files projection', () => {

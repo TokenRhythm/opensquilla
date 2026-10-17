@@ -373,6 +373,7 @@
       "unavailableReasons": { "htmlEncodingUnsupported": "This HTML is not valid UTF-8 and cannot be previewed or edited safely.", "htmlValidationFailed": "This HTML could not be validated for safe preview or editing.", "htmlEditTooLarge": "This HTML is too large to edit in the app. You can still download it.", "htmlPreviewTooLarge": "This HTML is too large to preview safely in the app. You can still download it.", "officeAdapterNotAvailable": "Office editing is not available yet.", "unsupported": "This action is not available for this resource." }
     },
     "browser": {
+      "capacityReached": "Eight browser tabs are already open. Return to an existing tab or close one before opening another.",
       "newTab": "New tab",
       "startHint": "Open a webpage alongside this task.",
       "addressPlaceholder": "Enter a URL, e.g. example.com",

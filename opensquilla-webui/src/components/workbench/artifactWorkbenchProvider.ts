@@ -59,6 +59,7 @@ import type {
   NativeWorkbenchSurfaceRectRequest,
 } from '@/platform/types'
 import ArtifactDocumentPanel from './ArtifactDocumentPanel.vue'
+import { artifactReadingCheckpoint } from './resourceReadingState'
 
 type Translate = (key: string, params?: Record<string, unknown>) => string
 
@@ -381,6 +382,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       && isActiveDocumentArtifactCandidate(artifact),
     )
     this.context.updateRenderState({
+      previewReading: artifactReadingCheckpoint(this.context.getViewState?.().previewReading),
       effectiveMode: this.mode,
       missingResources: false,
       nativeSurfaceState: 'loading',
@@ -491,6 +493,14 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
 
   async handleComponentEvent(event: WorkbenchComponentEvent, item: WorkbenchItem) {
     this.item = item
+    if (event.type === 'artifact-reading-state') {
+      const previewReading = artifactReadingCheckpoint(event.payload)
+      if (previewReading) {
+        this.context.saveViewState?.({ ...this.context.getViewState?.(), previewReading })
+        this.context.updateRenderState({ previewReading })
+      }
+      return
+    }
     if (event.type === 'office-annotation-selected') {
       await this.createOfficeAnnotation(event)
       return
@@ -3158,6 +3168,7 @@ export function createArtifactWorkbenchDefinitions(
       getHeader: artifactHeader,
       getToolbarItems: (item, state) => artifactToolbarItems(item, state, options),
       getProps: (item, state) => ({
+        previewReading: artifactReadingCheckpoint(state.runtimeState.previewReading),
         artifact: artifactFromWorkbenchItem(item),
         documentActions: (() => {
           if (isPreparedImmutableResourcePreview(item)) return undefined

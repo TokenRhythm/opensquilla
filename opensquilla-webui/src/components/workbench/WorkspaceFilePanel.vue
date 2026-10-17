@@ -7,7 +7,7 @@
     <p v-else-if="errorKey" role="alert">{{ t(errorKey === 'workbench.artifactPreview.tooLarge' ? 'workbench.artifactPreview.tooLargeDetail' : errorKey) }}</p>
     <template v-else-if="!snapshot && previewBlob && previewKind">
       <p v-if="previewErrorKey" class="workspace-file__status" role="status">{{ t(previewErrorKey) }}</p>
-      <ResourcePreviewPanel :blob="previewBlob" :kind="previewKind" :name="file?.name || ''" />
+      <ResourcePreviewPanel :blob="previewBlob" :kind="previewKind" :name="file?.name || ''" :reading-state="resourceReading" @reading-state="saveResourceReading" />
     </template>
     <template v-else-if="snapshot">
       <div class="workspace-file__toolbar">
@@ -37,7 +37,7 @@
       <p v-if="copyErrorKey" class="workspace-file__status" role="alert">{{ t(copyErrorKey) }}</p>
       <p v-if="previewErrorKey" class="workspace-file__status" role="status">{{ t(previewErrorKey === 'workbench.artifactPreview.tooLarge' ? 'workbench.artifactPreview.tooLargeDetail' : previewErrorKey) }}</p>
       <ResourcePreviewPanel v-if="mode === 'preview' && canPreviewResource && previewBlob"
-        :blob="previewBlob" :kind="previewKind!" :name="snapshot.relativePath" />
+        :blob="previewBlob" :kind="previewKind!" :name="snapshot.relativePath" :reading-state="resourceReading" @reading-state="saveResourceReading" />
       <div v-else-if="mode === 'preview' && canPreviewMarkdown" ref="markdownPreview" class="workspace-file__markdown artifact-preview__markdown chat-markdown" @scroll.passive="saveScroll" v-html="markdownHtml" />
       <pre v-else ref="source" class="workspace-file__source" tabindex="0" :aria-label="snapshot.relativePath" @scroll.passive="saveScroll"><code><span
         v-for="line in visibleLines" :key="line.number" class="workspace-file__line"
@@ -68,6 +68,7 @@ import { isWorkspaceMarkdown, WORKSPACE_MARKDOWN_PREVIEW_LIMIT } from '@/workben
 import ResourcePreviewPanel from './ResourcePreviewPanel.vue'
 import WorkspaceResourceActions from './WorkspaceResourceActions.vue'
 import { workspaceReadingState, type WorkspaceReadingState } from './workspaceReadingState'
+import type { ResourceReadingState } from './resourceReadingState'
 
 interface WorkspaceFileViewSnapshot {
   relativePath: string
@@ -113,6 +114,7 @@ let restoreReading = true
 let sourceTop = 0
 let sourceLeft = 0
 let markdownTop = 0
+const resourceReading = ref<ResourceReadingState>()
 const canPreviewMarkdown = computed(() => Boolean(props.snapshot && !props.snapshot.reference
   && isWorkspaceMarkdown({ name: props.snapshot.relativePath, mime: props.file?.mime || props.mime || '' }) && props.snapshot.startLine === 1
   && props.snapshot.endLine >= props.snapshot.totalLines && props.snapshot.content.length <= WORKSPACE_MARKDOWN_PREVIEW_LIMIT))
@@ -169,6 +171,7 @@ watch(() => props.viewId, () => {
   sourceTop = saved?.sourceTop ?? 0
   sourceLeft = saved?.sourceLeft ?? 0
   markdownTop = saved?.markdownTop ?? 0
+  resourceReading.value = saved?.resource
   restoreReading = true
   restoreEpoch = interactionEpoch
 }, { immediate: true })
@@ -206,12 +209,17 @@ function saveScroll() {
   saveReading()
 }
 function saveReading() {
-  if (!props.snapshot || props.loading) return
+  if ((!props.snapshot && !props.previewBlob) || props.loading) return
   emit('workbench-event', { type: 'workspace-file-reading-state', payload: {
     mode: mode.value, query: query.value, jump: jump.value, toolsOpen: toolsOpen.value,
-    startLine: props.snapshot.startLine, focusLine: focusLine.value, windowStart: windowStart.value,
-    sourceTop, sourceLeft, markdownTop,
+    startLine: props.snapshot?.startLine ?? 1, focusLine: focusLine.value, windowStart: windowStart.value,
+    sourceTop, sourceLeft, markdownTop, resource: resourceReading.value,
   } satisfies WorkspaceReadingState })
+}
+function saveResourceReading(state: ResourceReadingState, blob: Blob) {
+  if (blob !== props.previewBlob) return
+  resourceReading.value = state
+  saveReading()
 }
 watch([mode, query, jump, toolsOpen, focusLine, windowStart], saveReading, { flush: 'post' })
 watch(mode, async () => {

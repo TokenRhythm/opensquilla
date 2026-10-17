@@ -6,6 +6,7 @@ import type { PDFDocumentLoadingTask, PDFDocumentProxy, PDFPageProxy, RenderTask
 import PdfResourcePreview from './PdfResourcePreview.vue'
 import { createPdfLoadingTask, PDF_MAX_CANVAS_PIXELS, PDF_MAX_CANVAS_SIDE } from '@/workbench/pdfPreview'
 import en from '@/locales/en.json'
+import type { ResourceReadingState } from './resourceReadingState'
 
 vi.mock('@/workbench/pdfPreview', async importOriginal => ({
   ...await importOriginal<typeof import('@/workbench/pdfPreview')>(), createPdfLoadingTask: vi.fn(),
@@ -27,15 +28,16 @@ function pdfDocument(count = 3): PDFDocumentProxy { return { numPages: count, ge
 function loadingTask(promise = Promise.resolve(pdfDocument())): PDFDocumentLoadingTask {
   return { promise, destroy } as unknown as PDFDocumentLoadingTask
 }
-async function mount() {
+async function mount(readingState?: ResourceReadingState) {
   const host = document.createElement('div'); document.body.append(host)
-  const state = reactive({ data: new ArrayBuffer(5), name: 'Example.pdf' })
-  const app = createApp({ render: () => h(PdfResourcePreview, state) })
+  const state = reactive({ data: new ArrayBuffer(5), name: 'Example.pdf', readingState })
+  const reading = vi.fn()
+  const app = createApp({ render: () => h(PdfResourcePreview, { ...state, onReadingState: reading }) })
   app.use(createI18n({ legacy: false, locale: 'en', messages: { en } })); app.mount(host)
   const unmount = () => { app.unmount(); host.remove() }
   cleanups.push(unmount); await flush()
   const button = (label: string) => host.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)!
-  return { host, state, unmount, button }
+  return { host, state, unmount, button, reading }
 }
 beforeEach(() => {
   pageCleanup = vi.fn(); renderPage = vi.fn().mockImplementation(() => ({ promise: Promise.resolve(), cancel: vi.fn() }))
@@ -54,6 +56,16 @@ beforeEach(() => {
 afterEach(() => { cleanups.splice(0).forEach(cleanup => cleanup()); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.clearAllMocks() })
 
 describe('PDF resource preview', () => {
+  it('restores the bounded page, manual zoom and scroll in a rebuilt reader', async () => {
+    const panel = await mount({ page: 1, mode: 'manual', scale: 1.5, top: 123, left: 18, time: 0 })
+    expect(getPage).toHaveBeenCalledWith(2)
+    expect(panel.host.querySelector('canvas')?.style.width).toBe('900px')
+    const viewport = panel.host.querySelector<HTMLElement>('.pdf-preview__viewport')!
+    expect(viewport.scrollTop).toBe(123)
+    expect(viewport.scrollLeft).toBe(18)
+    viewport.scrollTop = 321; viewport.dispatchEvent(new Event('scroll'))
+    expect(panel.reading).toHaveBeenLastCalledWith(expect.objectContaining({ page: 1, mode: 'manual', scale: 1.5, top: 321 }), panel.state.data)
+  })
   it('renders only the current page and supports bounded direct navigation', async () => {
     const panel = await mount()
     expect(getPage.mock.calls).toEqual([[1]])

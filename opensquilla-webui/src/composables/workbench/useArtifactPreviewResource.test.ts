@@ -352,7 +352,8 @@ describe('createArtifactPreviewResource', () => {
     )
     expect(controller.state.value).toBe('ready')
     if (mime === 'application/pdf') {
-      expect(controller.objectUrl.value).toMatch(/^data:application\/pdf;base64,JVBERg==$/)
+      expect(controller.objectUrl.value).toBe('')
+      expect(controller.binary?.value?.byteLength).toBe(4)
       expect(createObjectUrl).not.toHaveBeenCalled()
     }
   })
@@ -513,7 +514,7 @@ describe('createArtifactPreviewResource', () => {
     expect(controller.errorCode.value).toBe('integrity-error')
   })
 
-  it('uses an application/pdf Blob for generic PDF responses', async () => {
+  it('provides verified PDF bytes to the shared renderer for generic responses', async () => {
     const observed: { blob?: Blob } = {}
     const controller = createArtifactPreviewResource(httpTransport(vi.fn().mockResolvedValue(response(
       new Uint8Array([0x25, 0x50, 0x44, 0x46]),
@@ -533,11 +534,12 @@ describe('createArtifactPreviewResource', () => {
     await controller.load()
 
     expect(controller.state.value).toBe('ready')
-    expect(controller.objectUrl.value).toBe('blob:pdf-preview')
-    expect(observed.blob?.type).toBe('application/pdf')
+    expect(controller.objectUrl.value).toBe('')
+    expect(controller.binary?.value?.byteLength).toBe(4)
+    expect(observed.blob).toBeUndefined()
   })
 
-  it('uses a data URL for PDF previews in the Electron custom renderer origin', async () => {
+  it('uses the same binary PDF path in the Electron custom renderer origin without base64 copies', async () => {
     const createObjectUrl = vi.fn(() => 'blob:should-not-be-used')
     const controller = createArtifactPreviewResource(httpTransport(vi.fn().mockResolvedValue(response(
       new Uint8Array([0x25, 0x50, 0x44, 0x46]),
@@ -552,7 +554,8 @@ describe('createArtifactPreviewResource', () => {
     await controller.load()
 
     expect(controller.state.value).toBe('ready')
-    expect(controller.objectUrl.value).toMatch(/^data:application\/pdf;base64,JVBERg==$/)
+    expect(controller.objectUrl.value).toBe('')
+    expect(controller.binary?.value?.byteLength).toBe(4)
     expect(createObjectUrl).not.toHaveBeenCalled()
   })
 

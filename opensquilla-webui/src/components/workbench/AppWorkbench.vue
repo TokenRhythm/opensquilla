@@ -310,7 +310,7 @@ import { useDialogLayer, useNativeSurfaceOcclusionState } from '@/composables/us
 import { useToasts } from '@/composables/useToasts'
 import { usePlatform } from '@/platform'
 import type { NativeWorkbenchSurfaceEvent } from '@/platform/types'
-import { useArtifactDocumentsStore } from '@/stores/artifactDocuments'
+import { artifactDocumentWorkspaceKey, useArtifactDocumentsStore } from '@/stores/artifactDocuments'
 import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
 import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
@@ -464,6 +464,9 @@ const store = useWorkbenchStore()
 const stopAdmissionNotifications = store.onAdmissionRejected(rejection => {
   if (rejection.reason === 'native-preview-capacity') {
     pushToast(t('workbench.nativePreview.capacityReached', { limit: rejection.limit }),
+      { tone: 'warn', duration: 9000 })
+  } else if (rejection.reason === 'browser-capacity') {
+    pushToast(t('workbench.browser.capacityReached', { limit: rejection.limit }),
       { tone: 'warn', duration: 9000 })
   }
 })
@@ -624,6 +627,32 @@ const artifactWorkbench = injectedArtifactWorkbench
 const artifactDocuments = useArtifactDocumentsStore()
 const artifactPromptAnnotations = useArtifactPromptAnnotationsStore()
 const workbenchResources = useWorkbenchResourcesStore()
+// Metadata is reconstructible; open document owners and displayed inventories
+// are not cache entries. Keep their heads while hidden edits/actions are alive.
+const metadataOwners = new Map<string, () => void>()
+watch(() => [store.items, store.activeSessionId] as const, () => {
+  const wanted = new Set<string>()
+  for (const item of store.items) {
+    const artifact = artifactFromWorkbenchItem(item)
+    if (!artifact) continue
+    const sessionKey = sessionKeyFromWorkbenchItem(item)
+    const key = `document:${artifactDocumentWorkspaceKey(artifact, sessionKey)}`
+    wanted.add(key)
+    if (!metadataOwners.has(key)) metadataOwners.set(key, artifactDocuments.retain(artifact, sessionKey))
+  }
+  const sessionKey = store.activeSessionId || ''
+  if (sessionKey) {
+    const key = `inventory:${sessionKey}`
+    wanted.add(key)
+    if (!metadataOwners.has(key)) metadataOwners.set(key, workbenchResources.retain(sessionKey))
+  }
+  for (const [key, release] of metadataOwners) {
+    if (wanted.has(key)) continue
+    metadataOwners.delete(key)
+    release()
+  }
+}, { immediate: true, flush: 'sync' })
+onBeforeUnmount(() => { for (const release of metadataOwners.values()) release(); metadataOwners.clear() })
 const artifactDocumentProvider = artifactWorkbench.documents
 artifactDocuments.setProvider(artifactDocumentProvider)
 const workbenchResourceProvider = artifactWorkbench.resources
@@ -1136,6 +1165,12 @@ for (const definition of createArtifactWorkbenchDefinitions({
   workbenchPanelRegistry.register(definition, { replace: true })
 }
 workbenchPanelRegistry.register(createWorkbenchResourceCollectionDefinition({
+  resources: item => workbenchResources.navigationResources(resourceSessionKey(item)),
+  load: async item => {
+    const snapshot = await workbenchResources.load(resourceSessionKey(item))
+    if (snapshot.error) throw new Error(snapshot.error)
+  },
+  retain: item => workbenchResources.retain(resourceSessionKey(item)),
   download: downloadWorkbenchResource,
   open: openWorkbenchResource,
   publish: publishWorkbenchResource,
@@ -1474,6 +1509,7 @@ function panelRenderState(
 ): WorkbenchPanelRenderState {
   return {
     active,
+    visible: active && store.isVisible,
     hostAvailable: store.hostAvailable,
     nativeSurface,
     runtimeState: runtimeManager.getRenderState(item.id),

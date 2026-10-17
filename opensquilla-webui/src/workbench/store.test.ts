@@ -437,6 +437,28 @@ describe('workbench store', () => {
     expect(disposed).toEqual([])
   })
 
+  it('limits new browsers across sessions without evicting or blocking return and adoption', () => {
+    const store = useWorkbenchStore()
+    for (let index = 0; index < 8; index++) {
+      expect(store.openItem(browserItem(`web-${index}`, `session-${index}`), { activate: false })).toBe(true)
+    }
+    const rejected = vi.fn()
+    const events = vi.fn()
+    store.onAdmissionRejected(rejected)
+    store.onLifecycle(events)
+    expect(store.openItem(browserItem('overflow', 'session-9'))).toBe(false)
+    expect(rejected).toHaveBeenCalledWith(expect.objectContaining({ reason: 'browser-capacity', limit: 8 }))
+    expect(events).not.toHaveBeenCalled()
+    store.setSessionScope('session-0')
+    expect(store.openItem(browserItem('web-0', 'session-0'))).toBe(true)
+    expect(store.activeItemId).toBe('web-0')
+    expect(store.items).toHaveLength(8)
+    store.closeItem('web-1')
+    expect(store.openItem(browserItem('new-after-close', 'session-0'))).toBe(true)
+    expect(store.items).toHaveLength(8)
+    expect(store.openItem(item('ordinary-file'))).toBe(true)
+  })
+
   it('bounds the closed browser history independently of live tabs', () => {
     const store = useWorkbenchStore()
     for (let index = 0; index < 10; index += 1) {

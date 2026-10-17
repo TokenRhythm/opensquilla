@@ -364,6 +364,7 @@
       "unavailableReasons": { "htmlEncodingUnsupported": "この HTML は有効な UTF-8 ではないため、安全にプレビューまたは編集できません。", "htmlValidationFailed": "この HTML は安全なプレビューまたは編集の検証に失敗しました。", "htmlEditTooLarge": "この HTML はアプリ内で編集するには大きすぎます。ダウンロードは引き続き可能です。", "htmlPreviewTooLarge": "この HTML はアプリ内で安全にプレビューするには大きすぎます。ダウンロードは引き続き可能です。", "officeAdapterNotAvailable": "Office の編集機能はまだ利用できません。", "unsupported": "この操作はこのリソースでは利用できません。" }
     },
     "browser": {
+      "capacityReached": "すでに 8 つのブラウザータブが開いています。既存のタブに戻るか、1 つ閉じてから新しく開いてください。",
       "newTab": "新しいタブ",
       "startHint": "このタスクの横にウェブページを開きます。",
       "addressPlaceholder": "URL を入力（例：example.com）",

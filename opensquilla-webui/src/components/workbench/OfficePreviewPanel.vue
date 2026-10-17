@@ -57,7 +57,7 @@
       <OfficePageNavigator v-if="paged && session && total" :id="navigatorId"
         :session="session" :total="total" :active="page" :format="format as 'docx' | 'pptx'"
         :collapsed="!navigatorExpanded" @thumbnail="emit('thumbnail', $event)" @navigate="goTo" @close="navigatorPreference = false" @expand="navigatorPreference = true" />
-      <div ref="viewport" class="office-preview__viewport" :class="{ 'office-preview__viewport--paged': paged }">
+      <div ref="viewport" class="office-preview__viewport" :class="{ 'office-preview__viewport--paged': paged }" @scroll.passive="saveReading">
         <div class="office-preview__reading" :class="{ 'office-preview__reading--slides': format === 'pptx' }">
           <div ref="container" class="office-preview__canvas" />
           <section v-if="format === 'pptx' && notes" class="office-preview__notes" :style="notesStyle" :aria-label="t('workbench.office.speakerNotes')">
@@ -79,11 +79,12 @@ import OfficePageNavigator from './OfficePageNavigator.vue'
 import type { OfficePreviewFormat } from '@/utils/workbench/artifactPreview'
 import type { OfficeSelection } from '@/types/officeSelection'
 import { createOfficePreviewSession, type OfficePreviewSession } from '@/workbench/officePreviewAdapter'
+import { resourceReadingState, type ResourceReadingState } from './resourceReadingState'
 
-const props = withDefaults(defineProps<{ data: ArrayBuffer; format: OfficePreviewFormat; annotationEnabled?: boolean; suspended?: boolean }>(), {
+const props = withDefaults(defineProps<{ data: ArrayBuffer; format: OfficePreviewFormat; annotationEnabled?: boolean; suspended?: boolean; readingState?: ResourceReadingState }>(), {
   annotationEnabled: false, suspended: false,
 })
-const emit = defineEmits<{ 'selection-request': [selection: OfficeSelection]; loading: []; ready: []; error: [error: Error]; thumbnail: [blob: Blob] }>()
+const emit = defineEmits<{ 'selection-request': [selection: OfficeSelection]; loading: []; ready: []; error: [error: Error]; thumbnail: [blob: Blob]; 'reading-state': [state: ResourceReadingState, data: ArrayBuffer] }>()
 const { t } = useI18n()
 const panel = ref<HTMLElement | null>(null)
 const container = ref<HTMLElement | null>(null)
@@ -109,7 +110,13 @@ const selectionHint = computed(() => t({
 const loading = ref(false), failure = ref(false), page = ref(0), total = ref(0)
 let controller: AbortController | null = null
 let generation = 0
+let readingData: ArrayBuffer | null = null
 let observer: ResizeObserver | null = null
+function saveReading() {
+  if (!session.value || !readingData || readingData !== props.data || loading.value || failure.value) return
+  emit('reading-state', { page: page.value, mode: viewMode.value, scale: scale.value,
+    top: viewport.value?.scrollTop ?? 0, left: viewport.value?.scrollLeft ?? 0, time: 0 }, readingData)
+}
 function exitSelectionMode(event?: Event) {
   if (choosing.value && event?.type === 'keydown') {
     event.preventDefault()
@@ -139,6 +146,7 @@ function stop() {
   controller = null
   session.value?.destroy()
   session.value = null
+  readingData = null
   selection.value = null
   choosing.value = false
   loading.value = false
@@ -150,6 +158,7 @@ async function start() {
   const run = generation
   controller = new AbortController()
   const signal = controller.signal
+  const data = props.data
   loading.value = true
   emit('loading')
   failure.value = false
@@ -158,7 +167,7 @@ async function start() {
   try {
     const created = await createOfficePreviewSession({ container: container.value, viewportElement: viewport.value || undefined,
       viewportBottomInset: props.format === 'pptx' ? 112 : 0,
-      data: props.data, format: props.format, signal,
+      data, format: props.format, signal,
       onView: state => {
         if (run !== generation) return
         viewMode.value = state.mode; scale.value = state.scale; renderedWidth.value = state.width
@@ -185,13 +194,23 @@ async function start() {
     })
     if (run !== generation) { created.destroy(); return }
     session.value = created
+    readingData = data
+    const saved = resourceReadingState(props.readingState)
+    if (saved) {
+      await created.goTo(Math.min(saved.page, Math.max(0, total.value - 1)))
+      if (run !== generation) return
+      if (saved.mode === 'manual') await created.setScale?.(saved.scale)
+      else await (saved.mode === 'page' ? created.fitPage() : created.fitWidth())
+      if (run !== generation) return
+      if (viewport.value) { viewport.value.scrollTop = saved.top; viewport.value.scrollLeft = saved.left }
+    }
     if (!failure.value) emit('ready')
   } catch (error) {
     if (run === generation && !signal.aborted) {
       failure.value = true
       emit('error', error instanceof Error ? error : new Error(String(error)))
     }
-  } finally { if (run === generation) loading.value = false }
+  } finally { if (run === generation) { loading.value = false; saveReading() } }
 }
 async function navigate(action: 'previous' | 'next' | 'zoomIn' | 'zoomOut' | 'fitWidth' | 'fitPage' | 'resize') {
   const run = generation
@@ -199,6 +218,7 @@ async function navigate(action: 'previous' | 'next' | 'zoomIn' | 'zoomOut' | 'fi
   try {
     await session.value?.[action]()
     if (run === generation && (action === 'previous' || action === 'next')) viewport.value?.scrollTo({ top: 0, left: 0 })
+    if (run === generation) saveReading()
   } catch (error) {
     if (run !== generation) return
     failure.value = true
@@ -218,6 +238,7 @@ async function goTo(index: number) {
   try {
     await session.value.goTo(index)
     if (run === generation) viewport.value?.scrollTo({ top: 0, left: 0 })
+    if (run === generation) saveReading()
   } catch (error) {
     if (run !== generation) return
     failure.value = true; exitSelectionMode()
@@ -245,7 +266,7 @@ onMounted(() => {
     if (panel.value) observer.observe(panel.value)
   }
 })
-onBeforeUnmount(() => { observer?.disconnect(); stop() })
+onBeforeUnmount(() => { saveReading(); observer?.disconnect(); stop() })
 </script>
 
 <style scoped>

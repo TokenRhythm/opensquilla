@@ -164,7 +164,8 @@ describe('AppWorkbench artifact navigation', () => {
       else h.store.setSessionScope('session-b')
       pending.resolve(resource()); await flush()
       expect(h.openCurrent).not.toHaveBeenCalled()
-      expect(h.store.items).toHaveLength(0)
+      expect(h.store.items.map(item => item.id)).toEqual(invalidation === 'close origin' ? [] : [h.item.id])
+      expect(h.store.visibleItems).toHaveLength(0)
       expect(pushToast).not.toHaveBeenCalled()
     },
   )
@@ -285,7 +286,8 @@ describe('AppWorkbench artifact navigation', () => {
     else h.store.setSessionScope('session-b')
     pending.resolve(resource()); await flush()
     expect(h.openCurrent).not.toHaveBeenCalled()
-    expect(h.store.items).toHaveLength(0)
+    expect(h.store.items.map(item => item.id)).toEqual(invalidation === 'close origin' ? [] : [h.item.id])
+    expect(h.store.visibleItems).toHaveLength(0)
     expect(pushToast).not.toHaveBeenCalled()
   })
 
